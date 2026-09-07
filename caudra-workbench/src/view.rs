@@ -17,6 +17,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::editor::{DiffKind, Editor, Tab, VisualRow, render};
 use crate::fs::tree::{GitMark, Row as TreeRow};
+use crate::menu::{Item, Menu};
 use crate::scm::graph::Rail;
 use crate::scm::repo::{Change, Commit};
 use crate::scm::tree::{Dir, SEPARATOR};
@@ -107,10 +108,19 @@ const PALETTE_ROWS: usize = 10;
 /// The query row and the rule under the list.
 const PALETTE_CHROME: u16 = 2;
 const HORIZONTAL: &str = "\u{2500}";
+const MENU_GAP: &str = " ";
+/// A column of air either side of the widest label.
+const MENU_PADDING: u16 = 2;
+/// The rules over and under the items.
+const MENU_CHROME: u16 = 2;
 const UNSAVED_QUESTION: &str = " has unsaved changes";
 const REVERT_QUESTION: &str = "Discard changes to ";
 const ONE_FILE: &str = " file?";
 const MANY_FILES: &str = " files?";
+const DELETE_QUESTION: &str = "Delete ";
+const ONE_PATH: &str = "?";
+const WITH_MORE: &str = " and the ";
+const MORE_PATHS: &str = " paths under it?";
 /// A rule, the question, the answers, and a rule under them.
 const CONFIRM_ROWS: u16 = 4;
 /// One column of air either side of the widest row.
@@ -140,6 +150,67 @@ impl Workbench {
         }
         self.render_editor(buf, panes.editor);
         self.render_status(buf, panes.status);
+        self.render_menu(buf, area);
+    }
+
+    /// The context menu, drawn over every pane because it can be asked for in
+    /// any of them. The dialog is painted inside the editor and still wins,
+    /// since a menu never opens while a question is standing.
+    fn render_menu(&mut self, buf: &mut Surface, area: Rect) {
+        let Some(menu) = &self.menu else {
+            self.panes.menu = Rect::default();
+            return;
+        };
+        let panel = menu_panel(menu, area);
+        chrome::fill(buf, panel, self.styles.background);
+        let [top, rows, bottom] = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Min(0),
+            Constraint::Length(1),
+        ])
+        .areas(panel);
+        for rule in [top, bottom] {
+            chrome::render_line(
+                buf,
+                rule,
+                Line::from(Span::styled(
+                    HORIZONTAL.repeat(rule.width as usize),
+                    self.styles.border,
+                )),
+            );
+        }
+
+        let pointed = self.hovered_row(rows);
+        let inner = (rows.width as usize).saturating_sub(MENU_GAP.len());
+        for (offset, item) in menu.items().iter().enumerate().take(rows.height as usize) {
+            let line = match item {
+                Item::Separator => Line::from(Span::styled(
+                    HORIZONTAL.repeat(rows.width as usize),
+                    self.styles.border,
+                )),
+                Item::Action(action) => {
+                    let chosen = offset == menu.selected_index();
+                    let mut style = match chosen {
+                        true => self.styles.selected,
+                        false => self.styles.text,
+                    };
+                    if pointed == Some(offset) && !chosen {
+                        style = style.patch(self.styles.hover);
+                    }
+                    chrome::status_line(
+                        vec![Span::styled(
+                            format!("{MENU_GAP}{}", chrome::fit(action.label(), inner)),
+                            style,
+                        )],
+                        Vec::new(),
+                        rows.width,
+                        style,
+                    )
+                }
+            };
+            chrome::render_line(buf, line_at(rows, offset), line);
+        }
+        self.panes.menu = rows;
     }
 
     fn render_sidebar(&mut self, buf: &mut Surface, area: Rect) {
@@ -620,6 +691,20 @@ impl Workbench {
                 };
                 format!("{REVERT_QUESTION}{covered}{noun}")
             }
+            Ask::Delete(under) => self.delete_question(under),
+        }
+    }
+
+    /// Names what goes, relative to the project so a deep path is still one
+    /// line, and counts what goes with it when it is a folder.
+    fn delete_question(&self, under: usize) -> String {
+        let Some(path) = self.tree.selected().map(|row| row.path.clone()) else {
+            return String::new();
+        };
+        let named = path.strip_prefix(&self.root).unwrap_or(&path).display();
+        match under {
+            0 => format!("{DELETE_QUESTION}{named}{ONE_PATH}"),
+            _ => format!("{DELETE_QUESTION}{named}{WITH_MORE}{under}{MORE_PATHS}"),
         }
     }
 
@@ -835,6 +920,9 @@ impl Workbench {
 
     /// The one-line field under the editor, when something is asking for input.
     fn prompt(&self) -> Option<(String, String)> {
+        if let Some(input) = &self.input {
+            return Some((input.kind.label().to_owned(), input.value.clone()));
+        }
         if let Some(input) = &self.goto {
             return Some((GOTO_PROMPT.to_owned(), input.clone()));
         }
@@ -1062,6 +1150,25 @@ pub(crate) fn toggle_at(column: u16, origin: u16) -> Option<Toggle> {
         left -= width;
     }
     None
+}
+
+/// Where the context menu lands: under and to the right of the cell it was
+/// asked for, pulled back inside the frame when it would run off the side, and
+/// flipped over that cell when there is no room for it underneath.
+fn menu_panel(menu: &Menu, area: Rect) -> Rect {
+    let width = (menu.width() as u16 + MENU_PADDING).min(area.width);
+    let height = (menu.items().len() as u16 + MENU_CHROME).min(area.height);
+    let (column, row) = menu.at();
+    let below = row.saturating_add(1);
+    Rect {
+        x: column.clamp(area.x, area.right().saturating_sub(width)),
+        y: match below.saturating_add(height) <= area.bottom() {
+            true => below,
+            false => row.saturating_sub(height).max(area.y),
+        },
+        width,
+        height,
+    }
 }
 
 /// Whether `column` is on the sidebar header's button, which sits at the right

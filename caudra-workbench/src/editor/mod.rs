@@ -125,6 +125,15 @@ impl Tab {
         }
     }
 
+    /// Points the tab at where its file went. The language is read from the
+    /// name, so a rename that changes the extension changes the highlighting
+    /// with it.
+    pub fn rename(&mut self, path: &Path, theme_generation: u64) {
+        self.title = title_of(path);
+        self.highlighter = ViewportHighlighter::new(&path.to_string_lossy(), theme_generation);
+        self.path = path.to_path_buf();
+    }
+
     pub fn is_editable(&self) -> bool {
         self.notice.is_none() && self.diff_kinds.is_none()
     }
@@ -536,6 +545,31 @@ impl Editor {
         let tab = self.tabs.remove(self.active);
         self.active = self.active.min(self.tabs.len().saturating_sub(1));
         Some(tab)
+    }
+
+    /// Follows a path that moved, taking the tabs under a folder that moved
+    /// along with it.
+    pub fn rename(&mut self, from: &Path, to: &Path, theme_generation: u64) {
+        for tab in &mut self.tabs {
+            let Ok(rest) = tab.path.clone().strip_prefix(from).map(Path::to_path_buf) else {
+                continue;
+            };
+            let moved = match rest.as_os_str().is_empty() {
+                true => to.to_path_buf(),
+                false => to.join(rest),
+            };
+            tab.rename(&moved, theme_generation);
+        }
+    }
+
+    /// Closes every tab the test picks out. What was active stays active when
+    /// it survived, so closing tabs elsewhere does not move the reader.
+    pub fn close_where(&mut self, doomed: &dyn Fn(&Tab) -> bool) {
+        let active = self.tabs.get(self.active).map(|tab| tab.path.clone());
+        self.tabs.retain(|tab| !doomed(tab));
+        self.active = active
+            .and_then(|path| self.tabs.iter().position(|tab| tab.path == path))
+            .unwrap_or_else(|| self.active.min(self.tabs.len().saturating_sub(1)));
     }
 
     pub fn select(&mut self, index: usize) {

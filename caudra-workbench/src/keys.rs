@@ -120,6 +120,9 @@ pub const GROW_SIDEBAR: Bind = leader!(KeyCode::Char('='), "=");
 pub const SHRINK_SECTION: Bind = leader!(KeyCode::Up, "↑");
 pub const GROW_SECTION: Bind = leader!(KeyCode::Down, "↓");
 pub const NEXT_FIELD: Bind = leader!(KeyCode::Char('i'), "i");
+/// `m` belongs to the host's model picker, which stays reachable while the
+/// workbench is up.
+pub const MENU: Bind = leader!(KeyCode::Char('.'), ".");
 pub const TOGGLE_CASE: Bind = leader!(KeyCode::Char('c'), "c");
 pub const TOGGLE_WORD: Bind = leader!(KeyCode::Char('w'), "w");
 pub const TOGGLE_REGEX: Bind = leader!(KeyCode::Char('r'), "r");
@@ -179,6 +182,7 @@ pub const LEADER_BINDS: &[Bind] = &[
     SHRINK_SECTION,
     GROW_SECTION,
     NEXT_FIELD,
+    MENU,
     TOGGLE_CASE,
     TOGGLE_WORD,
     TOGGLE_REGEX,

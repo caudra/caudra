@@ -121,6 +121,7 @@ Leader chords are written as two keys below, and every one of them is reachable 
 | `Ctrl+P` | Open a file by name |
 | `F5` | Reread the tree and the repository |
 | `Ctrl+X Enter` | Send the file or selection to the composer |
+| `Ctrl+X .` | Open the context menu for the row or tab under the cursor |
 
 ## Context-Specific
 

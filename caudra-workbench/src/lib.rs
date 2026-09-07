@@ -11,6 +11,7 @@ mod chrome;
 mod editor;
 mod fs;
 pub mod keys;
+mod menu;
 mod pointer;
 mod quick_open;
 mod scm;
@@ -33,8 +34,10 @@ use serde::{Deserialize, Serialize};
 use editor::Editor;
 use editor::Tab;
 use editor::buffer::Cursor;
+use fs::ops;
 use fs::tree::Tree;
 use fs::watch::Watch;
+use menu::{Action as MenuAction, Menu, Target};
 use pointer::Clicks;
 use quick_open::QuickOpen;
 use scm::{MIN_SECTION_ROWS, Scm, Section};
@@ -64,7 +67,11 @@ const WORKING: &str = "worktree";
 const SAVE_LABEL: &str = "Save";
 const DISCARD_LABEL: &str = "Don't Save";
 const REVERT_LABEL: &str = "Discard";
+const DELETE_LABEL: &str = "Delete";
 const CANCEL_LABEL: &str = "Cancel";
+const RENAME_PROMPT: &str = "Rename: ";
+const NEW_FILE_PROMPT: &str = "New file: ";
+const NEW_FOLDER_PROMPT: &str = "New folder: ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -183,6 +190,8 @@ struct PaneRects {
     palette: Rect,
     /// The unsaved-changes dialog's button row, empty when it is closed.
     confirm: Rect,
+    /// The context menu's items, empty when it is closed.
+    menu: Rect,
     /// The buffer's own rows and columns, with the tab bar, the gutter and any
     /// open find bar already taken out.
     text: Rect,
@@ -218,17 +227,22 @@ enum Ask {
     /// A folder or a whole section was asked to throw its working tree edits
     /// away, which no arming on the row itself is careful enough to cover.
     Revert,
+    /// The explorer was asked to remove a path. Nothing here can put it back,
+    /// so the count of what goes with it is part of the question. The count is
+    /// taken once, when the question goes up, rather than on every frame that
+    /// paints it.
+    Delete(usize),
 }
 
 impl Ask {
     const CLOSE_ANSWERS: [Choice; 3] = [Choice::Save, Choice::Discard, Choice::Cancel];
-    const REVERT_ANSWERS: [Choice; 2] = [Choice::Discard, Choice::Cancel];
+    const DISCARD_ANSWERS: [Choice; 2] = [Choice::Discard, Choice::Cancel];
 
     /// The answers on offer, in the order they are painted and measured.
     fn answers(self) -> &'static [Choice] {
         match self {
             Ask::Close => &Self::CLOSE_ANSWERS,
-            Ask::Revert => &Self::REVERT_ANSWERS,
+            Ask::Revert | Ask::Delete(_) => &Self::DISCARD_ANSWERS,
         }
     }
 }
@@ -248,6 +262,7 @@ impl Choice {
             (Choice::Save, _) => SAVE_LABEL,
             (Choice::Discard, Ask::Close) => DISCARD_LABEL,
             (Choice::Discard, Ask::Revert) => REVERT_LABEL,
+            (Choice::Discard, Ask::Delete(_)) => DELETE_LABEL,
             (Choice::Cancel, _) => CANCEL_LABEL,
         }
     }
@@ -281,6 +296,35 @@ impl Confirm {
         Self {
             choice: answers[reached.min(answers.len() - 1)],
             ..self
+        }
+    }
+}
+
+/// A name the workbench is waiting for, and what it will do with it. It is
+/// typed into the status row, where a question about a path can be read beside
+/// the tree that answers it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Input {
+    kind: InputKind,
+    /// What the answer is about: the path being renamed, or the folder a new
+    /// path lands in.
+    at: PathBuf,
+    value: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputKind {
+    Rename,
+    NewFile,
+    NewFolder,
+}
+
+impl InputKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Rename => RENAME_PROMPT,
+            Self::NewFile => NEW_FILE_PROMPT,
+            Self::NewFolder => NEW_FOLDER_PROMPT,
         }
     }
 }
@@ -352,6 +396,15 @@ pub struct Workbench {
     /// about is not kept: whatever raised it selected its target first, and the
     /// dialog is modal, so nothing can move the cursor underneath it.
     confirm: Option<Confirm>,
+    /// The context menu, which does keep what it was opened on. Any other
+    /// input closes it, so what it names cannot move underneath it.
+    menu: Option<Menu>,
+    /// The name the workbench is waiting to be given, if it asked for one.
+    input: Option<Input>,
+    /// What a batch close still has to get through, last one first so the next
+    /// is a pop. Paths rather than indices, because every close renumbers the
+    /// tabs behind it.
+    closing: Vec<PathBuf>,
     flash: Option<String>,
 }
 
@@ -385,6 +438,9 @@ impl Workbench {
             clipboard: String::new(),
             goto: None,
             confirm: None,
+            menu: None,
+            input: None,
+            closing: Vec::new(),
             flash: None,
         }
     }
@@ -580,7 +636,11 @@ impl Workbench {
                 self.drag_from = at;
                 self.drag_at = at;
                 let clicks = self.clicks.press(at, Instant::now());
-                self.press(at, clicks);
+                return self.press(at, clicks);
+            }
+            MouseEventKind::Down(MouseButton::Right) => {
+                self.hover = Some(at);
+                self.open_menu_at(at);
                 return WorkbenchAction::Consumed;
             }
             MouseEventKind::Down(MouseButton::Middle) => {
@@ -657,7 +717,7 @@ impl Workbench {
 
     /// A left press, told how many landed on this cell in a row. The panes are
     /// tried in painting order, so the palette gets the press it is covering.
-    fn press(&mut self, at: (u16, u16), clicks: u8) {
+    fn press(&mut self, at: (u16, u16), clicks: u8) -> WorkbenchAction {
         let position = at.into();
         if let Some(confirm) = self.confirm {
             if self.panes.confirm.contains(position)
@@ -665,13 +725,16 @@ impl Workbench {
             {
                 self.resolve(confirm.ask, choice);
             }
-            return;
+            return WorkbenchAction::Consumed;
+        }
+        if self.menu.is_some() {
+            return self.press_menu(at);
         }
         if self.palette.is_open() {
             if self.panes.palette.contains(position) {
                 self.open_palette_row((at.1 - self.panes.palette.y) as usize);
             }
-            return;
+            return WorkbenchAction::Consumed;
         }
         if self
             .panes
@@ -679,14 +742,14 @@ impl Workbench {
             .is_some_and(|rect| rect.contains(position))
         {
             self.drag = Drag::Separator;
-            return;
+            return WorkbenchAction::Consumed;
         }
         if self.panes.tabs.contains(position) {
             self.focus = Focus::Editor;
             if let Some(hit) = view::tab_at(&self.editor, at.0, self.panes.tabs) {
                 self.hit_tab(hit);
             }
-            return;
+            return WorkbenchAction::Consumed;
         }
         if self.panes.header.contains(position) {
             if let Some(view) = view::header_at(at.0, self.panes.header.x) {
@@ -703,7 +766,7 @@ impl Workbench {
                 self.focus = Focus::Sidebar;
                 self.press_header_button();
             }
-            return;
+            return WorkbenchAction::Consumed;
         }
         if self.panes.toggles.contains(position) {
             if let Some(toggle) = view::toggle_at(at.0, self.panes.toggles.x) {
@@ -714,18 +777,295 @@ impl Workbench {
                     Toggle::Regex => self.search.toggle_regex(),
                 }
             }
-            return;
+            return WorkbenchAction::Consumed;
         }
         if self.sidebar == SidebarView::SourceControl && self.press_scm(at) {
-            return;
+            return WorkbenchAction::Consumed;
         }
         if self.panes.rows.contains(position) {
             self.press_row((at.1 - self.panes.rows.y) as usize, clicks);
-            return;
+            return WorkbenchAction::Consumed;
         }
         if self.panes.text.contains(position) {
             self.press_text(at, clicks);
         }
+        WorkbenchAction::Consumed
+    }
+
+    /// Opens the menu on whatever the right button came down over. A press
+    /// anywhere with nothing to offer takes down whatever was open, so the
+    /// button never leaves a menu standing over nothing.
+    fn open_menu_at(&mut self, at: (u16, u16)) {
+        self.menu = None;
+        if self.confirm.is_some() || self.palette.is_open() {
+            return;
+        }
+        let position = at.into();
+        if self.panes.tabs.contains(position) {
+            let Some(hit) = view::tab_at(&self.editor, at.0, self.panes.tabs) else {
+                return;
+            };
+            self.focus = Focus::Editor;
+            self.menu = self
+                .editor
+                .tabs()
+                .get(hit.index)
+                .map(|tab| Menu::for_tab(tab, hit.index, at));
+            return;
+        }
+        if self.sidebar != SidebarView::Explorer || !self.panes.rows.contains(position) {
+            return;
+        }
+        let row = self.tree.scroll() + (at.1 - self.panes.rows.y) as usize;
+        self.tree.select_index(row);
+        // Selecting refuses a row past the end, so the air under a short tree
+        // opens nothing rather than a menu for whatever was last selected.
+        if self.tree.selected_index() != row {
+            return;
+        }
+        self.focus = Focus::Sidebar;
+        self.menu = self.tree.selected().map(|row| Menu::for_row(row, at));
+    }
+
+    /// The menu for wherever the cursor already is, which is how the keyboard
+    /// reaches it.
+    fn open_menu(&mut self) {
+        self.menu = None;
+        if self.confirm.is_some() {
+            return;
+        }
+        match self.focus {
+            Focus::Sidebar if self.sidebar == SidebarView::Explorer => {
+                let rows = self.panes.rows;
+                let offset = self
+                    .tree
+                    .selected_index()
+                    .saturating_sub(self.tree.scroll());
+                let at = (rows.x, rows.y + offset as u16);
+                self.menu = self.tree.selected().map(|row| Menu::for_row(row, at));
+            }
+            Focus::Editor => {
+                let index = self.editor.active_index();
+                let at = (self.panes.tabs.x, self.panes.tabs.y);
+                self.menu = self
+                    .editor
+                    .tabs()
+                    .get(index)
+                    .map(|tab| Menu::for_tab(tab, index, at));
+            }
+            _ => {}
+        }
+    }
+
+    /// A press while the menu is up. Anything off the panel takes it down and
+    /// is swallowed, so the press that dismisses a menu never also acts on
+    /// what is underneath it.
+    fn press_menu(&mut self, at: (u16, u16)) -> WorkbenchAction {
+        let Some(menu) = self.menu.take() else {
+            return WorkbenchAction::Consumed;
+        };
+        if !self.panes.menu.contains(at.into()) {
+            return WorkbenchAction::Consumed;
+        }
+        let offset = (at.1 - self.panes.menu.y) as usize;
+        match menu.action_at(offset) {
+            Some(action) => self.run_menu(action, menu.target()),
+            None => WorkbenchAction::Consumed,
+        }
+    }
+
+    /// Takes the answer under the menu's own cursor, which is what `Enter`
+    /// does.
+    fn take_menu(&mut self) -> WorkbenchAction {
+        let Some(menu) = self.menu.take() else {
+            return WorkbenchAction::Consumed;
+        };
+        match menu.selected() {
+            Some(action) => self.run_menu(action, menu.target()),
+            None => WorkbenchAction::Consumed,
+        }
+    }
+
+    fn run_menu(&mut self, action: MenuAction, target: &Target) -> WorkbenchAction {
+        match target {
+            Target::Row(path) => self.run_on_row(action, path.clone()),
+            Target::Tab(index) => self.run_on_tab(action, *index),
+        }
+    }
+
+    fn run_on_row(&mut self, action: MenuAction, path: PathBuf) -> WorkbenchAction {
+        match action {
+            MenuAction::Open => self.open_path(&path),
+            MenuAction::CopyPath => return self.copy(path.display().to_string()),
+            MenuAction::CopyRelative => {
+                return self.copy(self.relative(&path).display().to_string());
+            }
+            MenuAction::SendToComposer => {
+                return WorkbenchAction::SendToComposer(format!(
+                    "@{}",
+                    self.relative(&path).display()
+                ));
+            }
+            MenuAction::Rename => self.ask_for_name(InputKind::Rename, path),
+            MenuAction::NewFile => self.ask_for_name(InputKind::NewFile, self.holder(&path)),
+            MenuAction::NewFolder => self.ask_for_name(InputKind::NewFolder, self.holder(&path)),
+            MenuAction::Delete => {
+                self.confirm = Some(Confirm {
+                    ask: Ask::Delete(ops::count_under(&path)),
+                    choice: Choice::Cancel,
+                });
+            }
+            // Every other action belongs to the tab menu, which no row opens.
+            _ => {}
+        }
+        WorkbenchAction::Consumed
+    }
+
+    /// Where something new made from `path` lands: inside a folder, and beside
+    /// a file.
+    fn holder(&self, path: &Path) -> PathBuf {
+        match path.is_dir() {
+            true => path.to_path_buf(),
+            false => path.parent().unwrap_or(&self.root).to_path_buf(),
+        }
+    }
+
+    /// Puts the question in the status row. A rename starts from the name it
+    /// already has, since most renames change part of one.
+    fn ask_for_name(&mut self, kind: InputKind, at: PathBuf) {
+        let value = match kind {
+            InputKind::Rename => at
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
+            _ => String::new(),
+        };
+        self.input = Some(Input { kind, at, value });
+    }
+
+    /// Acts on the name that was typed. A refusal keeps the question up with
+    /// what was typed still in it, so a near miss can be corrected rather than
+    /// retyped.
+    fn commit_input(&mut self) {
+        let Some(input) = self.input.clone() else {
+            return;
+        };
+        let done = match input.kind {
+            InputKind::Rename => self.rename_path(&input.at, &input.value),
+            InputKind::NewFile => ops::create_file(&input.at, &input.value).map(|path| {
+                self.open_path(&path);
+            }),
+            InputKind::NewFolder => ops::create_dir(&input.at, &input.value).map(|path| {
+                self.tree.reveal(&path);
+            }),
+        };
+        match done {
+            Ok(()) => {
+                self.input = None;
+                self.reread();
+            }
+            Err(error) => self.flash = Some(error.to_string()),
+        }
+    }
+
+    /// Renames a path and takes the tabs with it, including every tab under a
+    /// folder that moved.
+    fn rename_path(&mut self, path: &Path, name: &str) -> Result<(), ops::OpsError> {
+        let moved = ops::rename(path, name)?;
+        self.editor.rename(path, &moved, self.theme_generation);
+        self.tree.reload();
+        self.tree.reveal(&moved);
+        Ok(())
+    }
+
+    /// Reads the project again after the workbench itself changed it. The
+    /// watcher would catch up on its own, and waiting for it leaves the tree
+    /// showing a path that is no longer there.
+    fn reread(&mut self) {
+        self.tree.reload();
+        self.scm.refresh();
+        self.palette.invalidate();
+        self.apply_marks();
+    }
+
+    fn run_on_tab(&mut self, action: MenuAction, index: usize) -> WorkbenchAction {
+        let Some(path) = self.editor.tabs().get(index).map(|tab| tab.path.clone()) else {
+            return WorkbenchAction::Consumed;
+        };
+        match action {
+            MenuAction::Close => self.close_at(index),
+            MenuAction::KeepOpen => {
+                if let Some(tab) = self.editor.tabs_mut().get_mut(index) {
+                    tab.preview = false;
+                }
+            }
+            MenuAction::Save => {
+                self.editor.select(index);
+                self.save_active();
+            }
+            MenuAction::RevealInExplorer => {
+                self.sidebar = SidebarView::Explorer;
+                self.sidebar_collapsed = false;
+                self.focus = Focus::Sidebar;
+                self.tree.reveal(&path);
+            }
+            MenuAction::CopyPath => return self.copy(path.display().to_string()),
+            MenuAction::CopyRelative => {
+                return self.copy(self.relative(&path).display().to_string());
+            }
+            MenuAction::CloseOthers => self.close_many(self.tab_paths(|at| at != index)),
+            MenuAction::CloseRight => self.close_many(self.tab_paths(|at| at > index)),
+            MenuAction::CloseAll => self.close_many(self.tab_paths(|_| true)),
+            // Nothing saved can raise a question, so this one needs no queue.
+            MenuAction::CloseSaved => {
+                self.editor.close_where(&|tab| !tab.is_dirty());
+                self.reveal_active();
+            }
+            // Every other action belongs to the explorer's menu, which no tab
+            // opens.
+            _ => {}
+        }
+        WorkbenchAction::Consumed
+    }
+
+    /// The paths of the tabs a batch close covers, read before anything closes
+    /// because closing renumbers what is left.
+    fn tab_paths(&self, covered: impl Fn(usize) -> bool) -> Vec<PathBuf> {
+        self.editor
+            .tabs()
+            .iter()
+            .enumerate()
+            .filter(|(at, _)| covered(*at))
+            .map(|(_, tab)| tab.path.clone())
+            .collect()
+    }
+
+    /// Closes a list of tabs, stopping at the first that has to ask about
+    /// unsaved work. The rest wait until that question is answered.
+    fn close_many(&mut self, doomed: Vec<PathBuf>) {
+        self.closing = doomed;
+        self.closing.reverse();
+        self.close_next();
+    }
+
+    fn close_next(&mut self) {
+        while let Some(path) = self.closing.pop() {
+            let Some(index) = self.editor.tabs().iter().position(|tab| tab.path == path) else {
+                continue;
+            };
+            self.close_at(index);
+            if self.confirm.is_some() {
+                return;
+            }
+        }
+    }
+
+    /// Puts `text` on the system clipboard and keeps a copy for the buffer's
+    /// own paste, the same as letting go of a selection does.
+    fn copy(&mut self, text: String) -> WorkbenchAction {
+        self.clipboard = text.clone();
+        WorkbenchAction::Copy(text)
     }
 
     /// A press somewhere in the source control pane. Reports whether it landed
@@ -1081,9 +1421,16 @@ impl Workbench {
             return WorkbenchAction::Passthrough;
         }
         self.flash = None;
-        // The close dialog is guarding unsaved work, so it answers even before
-        // the leader. It is the only thing here that does.
+        // The name prompt and the close dialog answer even before the leader:
+        // one is taking typing, the other is guarding unsaved work. They are
+        // the only things here that do.
+        if let Some(action) = self.input_key(key) {
+            return action;
+        }
         if let Some(action) = self.confirm_key(key) {
+            return action;
+        }
+        if let Some(action) = self.menu_key(key) {
             return action;
         }
         // The leader is otherwise unconditional. Gating it on a selection left
@@ -1186,6 +1533,10 @@ impl Workbench {
         }
         if keys::CUT_CHORD.matches(key) {
             return self.cut();
+        }
+        if keys::MENU.matches(key) {
+            self.open_menu();
+            return WorkbenchAction::Consumed;
         }
         if keys::TOGGLE_HIDDEN.matches(key) {
             self.show_hidden = !self.show_hidden;
@@ -1416,6 +1767,40 @@ impl Workbench {
                     self.resolve(confirm.ask, *picked);
                 }
             }
+            _ => {}
+        }
+        Some(WorkbenchAction::Consumed)
+    }
+
+    /// The context menu holds every key while it is up, for the same reason
+    /// the dialog does: it is a question, and the pane behind it is not
+    /// listening.
+    fn menu_key(&mut self, key: KeyEvent) -> Option<WorkbenchAction> {
+        let menu = self.menu.as_mut()?;
+        match key.code {
+            KeyCode::Esc => self.menu = None,
+            KeyCode::Up => menu.step(-1),
+            KeyCode::Down => menu.step(1),
+            KeyCode::Home => menu.select_first(),
+            KeyCode::End => menu.select_last(),
+            KeyCode::Enter => return Some(self.take_menu()),
+            _ => {}
+        }
+        Some(WorkbenchAction::Consumed)
+    }
+
+    /// The name prompt is modal while it is up: it is one field, and the keys
+    /// it does not take would otherwise reach the tree behind it.
+    fn input_key(&mut self, key: KeyEvent) -> Option<WorkbenchAction> {
+        self.input.as_ref()?;
+        let typing = (key.modifiers - KeyModifiers::SHIFT).is_empty();
+        match key.code {
+            KeyCode::Esc => self.input = None,
+            KeyCode::Enter => self.commit_input(),
+            KeyCode::Backspace => {
+                self.input.as_mut()?.value.pop();
+            }
+            KeyCode::Char(typed) if typing => self.input.as_mut()?.value.push(typed),
             _ => {}
         }
         Some(WorkbenchAction::Consumed)
@@ -1806,20 +2191,61 @@ impl Workbench {
         match ask {
             Ask::Close => self.resolve_close(choice),
             Ask::Revert => self.resolve_revert(choice),
+            Ask::Delete(_) => self.resolve_delete(choice),
         }
+    }
+
+    /// The path is the tree's own selection, which the menu landed on before
+    /// it opened and the dialog has held still ever since.
+    fn resolve_delete(&mut self, choice: Choice) {
+        let Some(path) = self.tree.selected().map(|row| row.path.clone()) else {
+            return;
+        };
+        if choice != Choice::Discard {
+            return;
+        }
+        match ops::delete(&path) {
+            Ok(()) => {
+                self.close_tabs_under(&path);
+                self.reread();
+            }
+            Err(error) => self.flash = Some(error.to_string()),
+        }
+    }
+
+    /// A path that is gone takes its tabs with it. A tab with unsaved edits
+    /// stays and flies the conflict instead, because throwing that work away
+    /// is not part of what was asked.
+    fn close_tabs_under(&mut self, path: &Path) {
+        for tab in self.editor.tabs_mut() {
+            if tab.path.starts_with(path) && tab.is_dirty() {
+                tab.conflict = true;
+            }
+        }
+        self.editor
+            .close_where(&|tab| tab.path.starts_with(path) && !tab.is_dirty());
+        self.reveal_active();
     }
 
     /// A save that fails keeps the tab open with the reason in the status row,
     /// because throwing the buffer away after failing to write it is the one
     /// outcome nobody asked for.
     fn resolve_close(&mut self, choice: Choice) {
-        match choice {
-            Choice::Cancel => return,
-            Choice::Save if !self.save_active() => return,
-            _ => {}
+        let closing = match choice {
+            Choice::Cancel => false,
+            Choice::Save => self.save_active(),
+            Choice::Discard => true,
+        };
+        if !closing {
+            // Whatever stopped this tab stops the batch behind it: carrying on
+            // would ask the same question about the next tab and read this
+            // answer as covering that one too.
+            self.closing.clear();
+            return;
         }
         self.editor.close_active();
         self.reveal_active();
+        self.close_next();
     }
 
     fn resolve_revert(&mut self, choice: Choice) {
@@ -2057,8 +2483,9 @@ mod tests {
     use super::{
         Ask, Choice, Confirm, Cursor, DEFAULT_SIDEBAR_WIDTH, DISCARD_LABEL, Drag,
         EDGE_SCROLL_LINES, Focus, Layout, MAX_SIDEBAR_WIDTH, MIN_EDITOR_WIDTH, MIN_SECTION_ROWS,
-        MIN_SIDEBAR_WIDTH, SCROLL_COLUMNS, SCROLL_LINES, ScmLayout, Section, SidebarView, Toggle,
-        Workbench, WorkbenchAction, WorkbenchStyles, keys, layout, layout_sections, scm,
+        MIN_SIDEBAR_WIDTH, MenuAction, SCROLL_COLUMNS, SCROLL_LINES, ScmLayout, Section,
+        SidebarView, Target, Toggle, Workbench, WorkbenchAction, WorkbenchStyles, keys, layout,
+        layout_sections, scm,
     };
     use crate::chrome::{ELLIPSIS, SCROLLBAR_THUMB};
     use crate::editor::{VisualRow, render};
@@ -2167,6 +2594,28 @@ mod tests {
     const NESTED_ADDED_LINE: &str = "two";
     const ASKED_TOO_LATE: &str = "a bulk discard ran before the question about it was answered";
     const OVER_REACHED: &str = "the discard reached past the rows the cursor covered";
+    const NO_MENU: &str = "nothing opened a menu where one was asked for";
+    const MENU_STUCK: &str = "the menu is still up after a press somewhere else";
+    const WRONG_TARGET: &str = "the menu is offering to act on something else";
+    const PATH_UNCOPIED: &str = "the path the menu copied never reached the host";
+    const NOT_RENAMED: &str = "the file is not where the rename said it would be";
+    const RENAMED_OVER: &str = "a rename wrote over a path that was already there";
+    const TAB_LEFT_BEHIND: &str = "the tab is still on a path that has moved or gone";
+    const PROMPT_GONE: &str = "a refused name took the question down with it";
+    const NO_REASON: &str = "a refusal said nothing about why";
+    const NOT_MADE: &str = "the path the name asked for is not there";
+    const DELETED_UNASKED: &str = "a path was removed before the question about it was answered";
+    const NOT_COUNTED: &str = "the question does not say what the delete covers";
+    const WRONG_TABS: &str = "the close left the strip showing something else";
+    const QUEUE_RAN_ON: &str = "a batch close carried on past the question in front of it";
+    const QUEUE_STALLED: &str = "the tabs behind the answered question were never closed";
+    /// The file [`project`] opens, and the folder beside it.
+    const OPENED_FILE: &str = "a.txt";
+    const NESTED_DIR: &str = "sub";
+    const RENAMED_FILE: &str = "renamed.txt";
+    const MADE_NAME: &str = "made.txt";
+    /// One keystroke of unsaved work, which is what makes a close ask.
+    const EDIT: char = 'X';
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -2217,6 +2666,51 @@ mod tests {
 
     fn middle_click(column: u16, row: u16) -> MouseEvent {
         mouse(MouseEventKind::Down(MouseButton::Middle), column, row)
+    }
+
+    fn right_click(column: u16, row: u16) -> MouseEvent {
+        mouse(MouseEventKind::Down(MouseButton::Right), column, row)
+    }
+
+    /// Takes `action` from the menu that is up, which is what pressing its row
+    /// of the panel does.
+    fn menu_action(workbench: &mut Workbench, action: MenuAction) -> WorkbenchAction {
+        let target = workbench.menu.as_ref().expect(NO_MENU).target().clone();
+        workbench.menu = None;
+        workbench.run_menu(action, &target)
+    }
+
+    /// Answers the question in the status row with `name`, over whatever it
+    /// was given to start from.
+    fn answer_prompt(workbench: &mut Workbench, name: &str) {
+        while workbench
+            .input
+            .as_ref()
+            .is_some_and(|input| !input.value.is_empty())
+        {
+            workbench.handle_key(key(KeyCode::Backspace));
+        }
+        for typed in name.chars() {
+            workbench.handle_key(key(KeyCode::Char(typed)));
+        }
+        workbench.handle_key(key(KeyCode::Enter));
+    }
+
+    fn open_titles(workbench: &Workbench) -> Vec<String> {
+        workbench
+            .editor
+            .tabs()
+            .iter()
+            .map(|tab| tab.title.clone())
+            .collect()
+    }
+
+    /// Leaves unsaved work in the tab at `index`, which is what makes a close
+    /// of it stop and ask.
+    fn edit_tab(workbench: &mut Workbench, index: usize) {
+        workbench.editor.select(index);
+        workbench.focus = Focus::Editor;
+        workbench.handle_key(key(KeyCode::Char(EDIT)));
     }
 
     /// Paints one frame, which is also what fills in the pane geometry the
@@ -5058,5 +5552,249 @@ mod tests {
             before,
             "{WRONG_HOVER}"
         );
+    }
+
+    #[test]
+    fn a_right_press_opens_the_menu_for_the_row_it_lands_on() {
+        let (dir, mut workbench) = project();
+        select_file(&dir, &mut workbench);
+        paint(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        let rows = workbench.panes.rows;
+
+        workbench.handle_mouse(right_click(rows.x, rows.y));
+
+        let menu = workbench.menu.as_ref().expect(NO_MENU);
+        assert_eq!(
+            menu.target(),
+            &Target::Row(dir.path().join(NESTED_DIR)),
+            "{WRONG_TARGET}"
+        );
+    }
+
+    #[test]
+    fn the_menu_key_opens_over_the_cursor() {
+        let (dir, mut workbench) = project();
+        select_file(&dir, &mut workbench);
+
+        workbench.handle_leader(press(keys::MENU));
+
+        let menu = workbench.menu.as_ref().expect(NO_MENU);
+        assert_eq!(
+            menu.target(),
+            &Target::Row(dir.path().join(OPENED_FILE)),
+            "{WRONG_TARGET}"
+        );
+    }
+
+    #[test]
+    fn a_press_off_the_panel_only_takes_the_menu_down() {
+        let (dir, mut workbench) = project();
+        select_file(&dir, &mut workbench);
+        paint(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        let rows = workbench.panes.rows;
+        workbench.handle_mouse(right_click(rows.x, rows.y));
+        paint(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        let text = workbench.panes.text;
+
+        workbench.handle_mouse(click(text.x, text.y));
+
+        assert!(workbench.menu.is_none(), "{MENU_STUCK}");
+        assert_eq!(workbench.focus, Focus::Sidebar, "{MODAL_LEAKED}");
+    }
+
+    #[test_case(MenuAction::CopyPath, false ; "the whole path")]
+    #[test_case(MenuAction::CopyRelative, true ; "and the one the project sees")]
+    fn a_copy_hands_the_host_the_path(action: MenuAction, relative: bool) {
+        let (dir, mut workbench) = project();
+        select_file(&dir, &mut workbench);
+        workbench.handle_leader(press(keys::MENU));
+
+        let copied = menu_action(&mut workbench, action);
+
+        let path = match relative {
+            true => PathBuf::from(OPENED_FILE),
+            false => dir.path().join(OPENED_FILE),
+        };
+        assert_eq!(
+            copied,
+            WorkbenchAction::Copy(path.display().to_string()),
+            "{PATH_UNCOPIED}"
+        );
+    }
+
+    #[test]
+    fn a_rename_moves_the_file_and_takes_its_tab_with_it() {
+        let (dir, mut workbench) = project();
+        open_file(&dir, &mut workbench);
+        workbench.focus = Focus::Sidebar;
+        workbench.handle_leader(press(keys::MENU));
+        menu_action(&mut workbench, MenuAction::Rename);
+
+        answer_prompt(&mut workbench, RENAMED_FILE);
+
+        assert!(dir.path().join(RENAMED_FILE).is_file(), "{NOT_RENAMED}");
+        assert!(!dir.path().join(OPENED_FILE).exists(), "{NOT_RENAMED}");
+        let tab = workbench.editor.active().expect(NO_TAB);
+        assert_eq!(tab.path, dir.path().join(RENAMED_FILE), "{TAB_LEFT_BEHIND}");
+        assert_eq!(tab.title, RENAMED_FILE, "{TAB_LEFT_BEHIND}");
+    }
+
+    /// The name is still there to be corrected, because retyping a long one
+    /// over a typo is the worst way to answer a refusal.
+    #[test]
+    fn a_name_that_is_taken_is_refused_and_left_in_the_box() {
+        let (dir, mut workbench) = project();
+        select_file(&dir, &mut workbench);
+        workbench.handle_leader(press(keys::MENU));
+        menu_action(&mut workbench, MenuAction::Rename);
+
+        answer_prompt(&mut workbench, NESTED_DIR);
+
+        assert!(dir.path().join(OPENED_FILE).is_file(), "{RENAMED_OVER}");
+        let input = workbench.input.as_ref().expect(PROMPT_GONE);
+        assert_eq!(input.value, NESTED_DIR, "{PROMPT_GONE}");
+        assert!(workbench.flash.is_some(), "{NO_REASON}");
+    }
+
+    #[test_case(MenuAction::NewFile, true ; "a new file is a file")]
+    #[test_case(MenuAction::NewFolder, false ; "and a new folder is a folder")]
+    fn something_new_lands_beside_the_row_it_was_asked_from(action: MenuAction, file: bool) {
+        let (dir, mut workbench) = project();
+        select_file(&dir, &mut workbench);
+        workbench.handle_leader(press(keys::MENU));
+        menu_action(&mut workbench, action);
+
+        answer_prompt(&mut workbench, MADE_NAME);
+
+        let made = dir.path().join(MADE_NAME);
+        assert_eq!(made.is_file(), file, "{NOT_MADE}");
+        assert_eq!(made.is_dir(), !file, "{NOT_MADE}");
+        assert_eq!(
+            workbench.editor.active().map(|tab| tab.path.clone()),
+            file.then(|| made.clone()),
+            "{NOT_MADE}"
+        );
+    }
+
+    #[test]
+    fn a_new_path_lands_inside_the_folder_it_was_asked_from() {
+        let (dir, mut workbench) = project();
+        workbench.handle_leader(press(keys::MENU));
+        menu_action(&mut workbench, MenuAction::NewFile);
+
+        answer_prompt(&mut workbench, MADE_NAME);
+
+        assert!(
+            dir.path().join(NESTED_DIR).join(MADE_NAME).is_file(),
+            "{NOT_MADE}"
+        );
+    }
+
+    #[test_case(OPENED_FILE, 0 ; "a file goes on its own")]
+    #[test_case(NESTED_DIR, 1 ; "a folder says what goes with it")]
+    fn a_delete_asks_before_it_takes_the_path(name: &str, under: usize) {
+        let (dir, mut workbench) = project();
+        workbench.tree.reveal(&dir.path().join(name));
+        workbench.handle_leader(press(keys::MENU));
+
+        menu_action(&mut workbench, MenuAction::Delete);
+
+        assert!(dir.path().join(name).exists(), "{DELETED_UNASKED}");
+        assert_eq!(asked(&workbench).ask, Ask::Delete(under), "{NOT_COUNTED}");
+
+        workbench.handle_key(key(KeyCode::Char(Choice::Discard.accelerator())));
+
+        assert!(!dir.path().join(name).exists(), "{ANSWER_IGNORED}");
+    }
+
+    #[test]
+    fn a_delete_takes_the_tabs_that_were_on_it() {
+        let (dir, mut workbench) = project();
+        open_file(&dir, &mut workbench);
+        workbench.focus = Focus::Sidebar;
+        workbench.handle_leader(press(keys::MENU));
+        menu_action(&mut workbench, MenuAction::Delete);
+
+        workbench.handle_key(key(KeyCode::Char(Choice::Discard.accelerator())));
+
+        assert!(workbench.editor.tabs().is_empty(), "{TAB_LEFT_BEHIND}");
+    }
+
+    /// Nothing here can put the file back, so the work in the tab is all that
+    /// is left of it.
+    #[test]
+    fn a_delete_keeps_an_edited_tab_and_flies_the_conflict() {
+        let (dir, mut workbench) = project();
+        open_file(&dir, &mut workbench);
+        workbench.handle_key(key(KeyCode::Char(EDIT)));
+        workbench.focus = Focus::Sidebar;
+        workbench.handle_leader(press(keys::MENU));
+        menu_action(&mut workbench, MenuAction::Delete);
+
+        workbench.handle_key(key(KeyCode::Char(Choice::Discard.accelerator())));
+
+        let tab = workbench.editor.active().expect(NO_TAB);
+        assert!(tab.conflict, "{NO_CONFLICT}");
+        assert!(tab.is_dirty(), "{LOST_EDIT}");
+    }
+
+    #[test_case(MenuAction::CloseOthers, &["file1.txt"] ; "others leaves the one it was asked from")]
+    #[test_case(MenuAction::CloseRight, &["file0.txt", "file1.txt"] ; "to the right keeps what is left of it")]
+    #[test_case(MenuAction::CloseAll, &[] ; "all leaves nothing")]
+    fn a_batch_close_covers_what_it_names(action: MenuAction, left: &[&str]) {
+        let (_dir, mut workbench) = many_tabs(3);
+
+        workbench.run_menu(action, &Target::Tab(1));
+
+        assert_eq!(open_titles(&workbench), left, "{WRONG_TABS}");
+        assert_eq!(workbench.confirm, None, "{POINTLESS_QUESTION}");
+    }
+
+    #[test]
+    fn close_saved_leaves_the_tab_with_work_in_it() {
+        let (_dir, mut workbench) = many_tabs(3);
+        edit_tab(&mut workbench, 1);
+
+        workbench.run_menu(MenuAction::CloseSaved, &Target::Tab(1));
+
+        assert_eq!(open_titles(&workbench), ["file1.txt"], "{WRONG_TABS}");
+        assert_eq!(workbench.confirm, None, "{POINTLESS_QUESTION}");
+    }
+
+    #[test]
+    fn a_batch_close_stops_at_unsaved_work_and_carries_on_once_answered() {
+        let (_dir, mut workbench) = many_tabs(3);
+        edit_tab(&mut workbench, 1);
+
+        workbench.run_menu(MenuAction::CloseAll, &Target::Tab(0));
+
+        assert_eq!(
+            open_titles(&workbench),
+            ["file1.txt", "file2.txt"],
+            "{QUEUE_RAN_ON}"
+        );
+        assert_eq!(asked(&workbench).ask, Ask::Close, "{NOT_ASKED}");
+
+        workbench.handle_key(key(KeyCode::Char(Choice::Discard.accelerator())));
+
+        assert!(open_titles(&workbench).is_empty(), "{QUEUE_STALLED}");
+    }
+
+    /// The answer was about the tab in front, and the tabs behind it were
+    /// never asked about.
+    #[test]
+    fn cancelling_one_close_drops_the_rest_of_the_batch() {
+        let (_dir, mut workbench) = many_tabs(3);
+        edit_tab(&mut workbench, 1);
+        workbench.run_menu(MenuAction::CloseAll, &Target::Tab(0));
+
+        workbench.handle_key(key(KeyCode::Char(Choice::Cancel.accelerator())));
+
+        assert_eq!(
+            open_titles(&workbench),
+            ["file1.txt", "file2.txt"],
+            "{QUEUE_RAN_ON}"
+        );
+        assert!(workbench.closing.is_empty(), "{QUEUE_RAN_ON}");
     }
 }

@@ -967,6 +967,12 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::All,
     },
     Keybind {
+        label: KeyLabel::Single(wb::MENU.label),
+        description: "Open the context menu for the row or tab under the cursor",
+        context: KeybindContext::Workbench,
+        platform: Platform::All,
+    },
+    Keybind {
         label: KeyLabel::Single(wb::TOGGLE_HIDDEN.label),
         description: "Show hidden files",
         context: KeybindContext::WorkbenchExplorer,

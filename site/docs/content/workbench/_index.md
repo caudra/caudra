@@ -42,6 +42,7 @@ The workbench takes the mouse the way an IDE does.
 | Click a tab | Switch to it |
 | Click the `×` on a tab | Close it |
 | Middle-click a tab | Close it |
+| Right-click a row or a tab | Open its [context menu](#context-menu) |
 | Click `FILES`, `GIT`, or `FIND` | Switch the sidebar view |
 | Click `FOLD` | Fold the explorer back to its top level |
 | Click `TREE` or `FLAT` | Switch how source control lists paths |
@@ -63,6 +64,20 @@ In source control, in search, and in the `Ctrl+P` file picker, one click does wh
 Whatever the pointer rests on is highlighted, so you can see what a click would hit. A row that is already selected is left as it is.
 
 A pane whose content runs past its bottom gives up its last column to a scrollbar, so you can see how much is off screen. Panes that fit keep their full width, and setting `ui.scrollbar` to `false` turns the bars off here as it does everywhere else. The bar is a marker rather than a handle: use the wheel or the arrow keys to move.
+
+## Context menu
+
+Right-click a row in the explorer or a tab in the strip to open a menu for it. `Ctrl+X .` opens the same menu over whatever the cursor is already on. Arrow keys walk it, `Home` and `End` jump to either end, `Enter` takes the highlighted item, and `Esc` closes it. A press off the panel closes the menu and is swallowed, so the press that dismisses a menu does not also act on what is under it.
+
+An explorer row offers Open, New File, New Folder, Copy Path, Copy Relative Path, Send to Composer, Rename, and Delete. A folder has no Open, because pressing one expands it. Something new lands inside the folder you asked from, and beside the file you asked from.
+
+Rename, New File, and New Folder ask for a name in the status row, and a rename starts from the name the path already has. `Enter` commits and `Esc` cancels. A name that is empty, holds a path separator, or is already taken is refused with the reason in the status row, and what you typed stays in the box to be corrected.
+
+Delete is permanent, with no trash to recover from. The question says what goes: the path itself, and for a folder the number of paths under it, counting the ones the repository ignores. `D` deletes and `C` cancels. Tabs on a deleted path close with it. A tab holding unsaved edits stays open and raises a conflict instead, so the work is still there to save somewhere else.
+
+A tab offers Close, Close Others, Close to the Right, Close Saved, and Close All, along with Keep Open for a preview tab, Save for a tab with unsaved edits, and Reveal in Explorer. A diff tab has no file behind it, so it offers none of the items that name one.
+
+A batch close stops at the first tab with unsaved changes and asks about that tab alone. Answering the question carries on through the rest. Cancelling it, or a save that fails, drops the tabs still queued behind it.
 
 ## Explorer
 
