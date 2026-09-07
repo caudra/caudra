@@ -261,6 +261,11 @@ pub struct SessionMeta {
     pub structured_permission_rules: Vec<PermissionRuleRecord>,
     #[serde(default)]
     pub context_size: u32,
+    /// Completed exchanges over the session's whole life. Counted rather than
+    /// derived because compaction replaces the history it would be derived
+    /// from.
+    #[serde(default)]
+    pub turns: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_draft: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

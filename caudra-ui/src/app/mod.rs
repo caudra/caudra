@@ -2828,6 +2828,7 @@ impl App {
                 ChatEventResult::Done => {
                     self.status_bar.clear_flash();
                     if !self.goal_deferred {
+                        self.state.turns += 1;
                         self.terminalize_turn(MISSING_TOOL_COMPLETION);
                         self.preserve_all_unconsumed_steers();
                         self.chat_index.clear();

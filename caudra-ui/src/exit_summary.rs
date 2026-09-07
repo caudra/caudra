@@ -6,8 +6,7 @@
 use std::fmt::Write;
 use std::time::Duration;
 
-use caudra_agent::tools::humanize_duration;
-use caudra_providers::{HistoryItemKind, TokenUsage, UserOrigin};
+use caudra_providers::TokenUsage;
 use caudra_storage::id::CaudraId;
 
 use crate::AppSession;
@@ -32,10 +31,18 @@ const LABEL_CONTINUE: &str = "Continue";
 const LABEL_SAVED: &str = "Saved";
 
 const SEPARATOR: &str = " · ";
-const NOUN_MESSAGE: &str = "message";
+const NOUN_TURN: &str = "turn";
 const NOUN_OTHER_SESSION: &str = "other session";
 const RESUME_PREFIX: &str = "Resume session: ";
 const RESUME_COMMAND: &str = "caudra -s";
+
+const DAY_SECONDS: u64 = 86_400;
+const HOUR_SECONDS: u64 = 3_600;
+const MINUTE_SECONDS: u64 = 60;
+const UNIT_DAY: &str = "d";
+const UNIT_HOUR: &str = "h";
+const UNIT_MINUTE: &str = "m";
+const UNIT_SECOND: &str = "s";
 
 /// The focused session as the exiting run left it: what it was, what it spent,
 /// and how to get back into it.
@@ -45,14 +52,14 @@ pub struct ExitSummary {
     model: String,
     usage: TokenUsage,
     cost: Option<f64>,
-    messages: usize,
+    turns: u64,
     run_time: Duration,
     other_sessions: usize,
 }
 
 impl ExitSummary {
-    /// Reads the session after shutdown checkpointed it, so the usage here is
-    /// the same total that landed on disk.
+    /// Reads the session after shutdown checkpointed it, so the usage and the
+    /// turn count here are the same totals that landed on disk.
     pub fn new(session: &AppSession, run_time: Duration, other_sessions: usize) -> Self {
         Self {
             id: session.id,
@@ -66,11 +73,7 @@ impl ExitSummary {
                 .values()
                 .filter_map(|usage| usage.cost)
                 .reduce(|total, cost| total + cost),
-            messages: session
-                .messages()
-                .iter()
-                .filter(|item| is_message(&item.kind))
-                .count(),
+            turns: session.meta.turns,
             run_time,
             other_sessions,
         }
@@ -107,13 +110,9 @@ impl ExitSummary {
     }
 
     fn session_row(&self) -> String {
-        match self.messages {
+        match self.turns {
             0 => self.title.clone(),
-            count => format!(
-                "{}{SEPARATOR}{}",
-                self.title,
-                pluralize(count, NOUN_MESSAGE)
-            ),
+            count => format!("{}{SEPARATOR}{}", self.title, pluralize(count, NOUN_TURN)),
         }
     }
 
@@ -121,12 +120,36 @@ impl ExitSummary {
         format!(
             "{}{SEPARATOR}{}",
             self.model,
-            humanize_duration(self.run_time)
+            format_run_time(self.run_time)
         )
     }
 
     fn saved_row(&self) -> String {
-        pluralize(self.other_sessions, NOUN_OTHER_SESSION)
+        pluralize(self.other_sessions as u64, NOUN_OTHER_SESSION)
+    }
+}
+
+/// The two coarsest units the run reached. A wall clock carries nanosecond
+/// precision that nobody exiting a session wants to read.
+fn format_run_time(run_time: Duration) -> String {
+    let seconds = run_time.as_secs();
+    let (days, hours) = (seconds / DAY_SECONDS, seconds % DAY_SECONDS / HOUR_SECONDS);
+    let (minutes, rest) = (
+        seconds % HOUR_SECONDS / MINUTE_SECONDS,
+        seconds % MINUTE_SECONDS,
+    );
+    match (days, hours, minutes) {
+        (0, 0, 0) => format!("{rest}{UNIT_SECOND}"),
+        (0, 0, _) => two_units(minutes, UNIT_MINUTE, rest, UNIT_SECOND),
+        (0, _, _) => two_units(hours, UNIT_HOUR, minutes, UNIT_MINUTE),
+        _ => two_units(days, UNIT_DAY, hours, UNIT_HOUR),
+    }
+}
+
+fn two_units(major: u64, major_unit: &str, minor: u64, minor_unit: &str) -> String {
+    match minor {
+        0 => format!("{major}{major_unit}"),
+        minor => format!("{major}{major_unit} {minor}{minor_unit}"),
     }
 }
 
@@ -134,19 +157,7 @@ fn push_row(out: &mut String, label: &str, value: &str) {
     writeln!(out, "  {DIM}{label:<LABEL_WIDTH$}{RESET}{value}").unwrap();
 }
 
-/// Tool calls, results and reasoning are history items too, and counting them
-/// would report a number many times what the transcript shows.
-fn is_message(kind: &HistoryItemKind) -> bool {
-    matches!(
-        kind,
-        HistoryItemKind::User {
-            origin: UserOrigin::Turn,
-            ..
-        } | HistoryItemKind::AssistantText { .. }
-    )
-}
-
-fn pluralize(count: usize, noun: &str) -> String {
+fn pluralize(count: u64, noun: &str) -> String {
     match count {
         1 => format!("1 {noun}"),
         count => format!("{count} {noun}s"),
@@ -182,7 +193,7 @@ mod tests {
             model: MODEL.into(),
             usage,
             cost,
-            messages: 48,
+            turns: 48,
             run_time: RUN_TIME,
             other_sessions: 0,
         }
@@ -229,13 +240,26 @@ mod tests {
         assert!(!spent().banner().contains(LABEL_SAVED), "{NO_OTHERS}");
     }
 
-    #[test_case(0  => TITLE.to_string()                            ; "an_untouched_session_is_just_its_title")]
-    #[test_case(1  => format!("{TITLE}{SEPARATOR}1 message")       ; "a_single_message_reads_singular")]
-    #[test_case(48 => format!("{TITLE}{SEPARATOR}48 messages")     ; "more_messages_read_plural")]
-    fn session_row_counts_the_transcript(messages: usize) -> String {
+    #[test_case(0  => TITLE.to_string()                        ; "an_untouched_session_is_just_its_title")]
+    #[test_case(1  => format!("{TITLE}{SEPARATOR}1 turn")      ; "a_single_turn_reads_singular")]
+    #[test_case(48 => format!("{TITLE}{SEPARATOR}48 turns")    ; "more_turns_read_plural")]
+    fn session_row_counts_the_exchanges(turns: u64) -> String {
         let mut summary = spent();
-        summary.messages = messages;
+        summary.turns = turns;
         summary.session_row()
+    }
+
+    /// The reported case: an `Instant::elapsed()` carries nanoseconds, and the
+    /// summary must not spell every one of them out.
+    #[test_case(45_361_273_567_127 => "12h 36m" ; "a_long_run_drops_its_nanoseconds")]
+    #[test_case(0                  => "0s"      ; "an_instant_run_still_reads_as_a_duration")]
+    #[test_case(45_000_000_000     => "45s"     ; "under_a_minute_is_seconds")]
+    #[test_case(150_000_000_000    => "2m 30s"  ; "minutes_keep_their_seconds")]
+    #[test_case(5_400_000_000_000  => "1h 30m"  ; "hours_drop_to_minutes")]
+    #[test_case(7_200_000_000_000  => "2h"      ; "a_round_hour_is_one_unit")]
+    #[test_case(93_600_000_000_000 => "1d 2h"   ; "past_a_day_reads_in_days")]
+    fn format_run_time_keeps_the_two_coarsest_units(nanos: u64) -> String {
+        format_run_time(Duration::from_nanos(nanos))
     }
 
     #[test]

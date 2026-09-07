@@ -5,7 +5,10 @@ use caudra_agent::prompt::profile::{BUILTIN_PROFILE_NAME, SystemPromptProfile};
 use caudra_agent::{GoalHandle, GoalResult};
 use caudra_config::{Effect, ModelPolicy};
 use caudra_providers::provider::adjust_model;
-use caudra_providers::{Model, ThinkingConfig, Timeouts, TokenUsage, settle_session};
+use caudra_providers::{
+    HistoryItem, HistoryItemKind, Model, ThinkingConfig, Timeouts, TokenUsage, UserOrigin,
+    settle_session,
+};
 use caudra_storage::StateDir;
 use caudra_storage::sessions::{StoredEffect, StoredMode, StoredRule};
 
@@ -23,6 +26,9 @@ pub(crate) struct SessionState {
     /// re-price history at today's rates. `None` while nothing was priced.
     pub cost: Option<f64>,
     pub context_size: u32,
+    /// Survives compaction, which throws away the history a count could
+    /// otherwise be derived from.
+    pub turns: u64,
     pub mode: Mode,
     pub plan: PlanState,
     pub warnings: Vec<String>,
@@ -91,6 +97,13 @@ impl SessionState {
         let token_usage = session.token_usage;
         let cost = settle_session(&token_usage, session.usage_by_model_mut(), &model, fast);
         let context_size = session.meta.context_size;
+        // Sessions saved before the counter existed, and every headless run,
+        // carry a zero: recover what the surviving history still shows rather
+        // than reporting nothing.
+        let turns = match session.meta.turns {
+            0 => counted_turns(session.messages()),
+            turns => turns,
+        };
         let goal = GoalHandle::restored(session.meta.active_goal.as_deref());
         if let Some(stored) = session.meta.goal_result.as_ref() {
             goal.restore_finished(GoalResult {
@@ -125,6 +138,7 @@ impl SessionState {
             token_usage,
             cost,
             context_size,
+            turns,
             mode,
             plan,
             warnings,
@@ -145,6 +159,28 @@ impl SessionState {
         self.session_mut().set_model(model.spec());
         self.model = model.clone();
     }
+}
+
+/// A user turn expands to one item per text and image block, so the group is
+/// the exchange. Groups are contiguous, which is what lets this dedupe against
+/// the previous one instead of collecting every id.
+fn counted_turns(items: &[HistoryItem]) -> u64 {
+    let mut turns = 0;
+    let mut counted = None;
+    for item in items {
+        let user_turn = matches!(
+            item.kind,
+            HistoryItemKind::User {
+                origin: UserOrigin::Turn,
+                ..
+            }
+        );
+        if user_turn && counted != Some(item.group_id) {
+            turns += 1;
+            counted = Some(item.group_id);
+        }
+    }
+    turns
 }
 
 impl From<Mode> for StoredMode {
@@ -216,7 +252,9 @@ pub(crate) fn stored_to_rules(stored: &[StoredRule]) -> Vec<caudra_config::Permi
 mod tests {
     use super::*;
     use crate::components::{test_model, test_pricing};
-    use caudra_providers::{FastPricing, ModelPricing};
+    use caudra_providers::{
+        ContentBlock, FastPricing, ImageMediaType, ImageSource, Message, ModelPricing, Role,
+    };
     use caudra_storage::thinking::StoredThinking;
     use std::collections::HashMap;
     use test_case::test_case;
@@ -235,6 +273,9 @@ mod tests {
     const FAST_INPUT_RATE: f64 = 6.0;
     const UNRESOLVABLE_MODEL: &str = "a-model-no-table-has-ever-heard-of";
     const FAST_FLAG_LOST: &str = "the model has fast pricing, so the flag must survive as stored";
+    const IMAGE_DATA: &str = "iVBORw0KGgo=";
+    const ITEMS_PER_TURN: &str = "the fixture must spread each exchange over several items";
+    const TURNS_NOT_ITEMS: &str = "an exchange is one turn however many items it expands to";
 
     fn resumed(session: AppSession, model: &Model) -> SessionState {
         let tmp = tempfile::tempdir().unwrap();
@@ -408,5 +449,52 @@ mod tests {
             ThinkingConfig::Adaptive,
             "resumed thinking config should be preserved when the model supports it",
         );
+    }
+
+    /// An answer split around a tool call arrives as several text blocks.
+    fn split_answer() -> Message {
+        Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Text {
+                    text: "before the tool".into(),
+                },
+                ContentBlock::Text {
+                    text: "after the tool".into(),
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
+    fn two_turn_history() -> Vec<HistoryItem> {
+        crate::history_items(&[
+            Message::user_with_images(
+                "look at this".into(),
+                vec![ImageSource::new(ImageMediaType::Png, Arc::from(IMAGE_DATA))],
+            ),
+            split_answer(),
+            Message::observation("a file changed on disk".into()),
+            Message::user("and again".into()),
+            split_answer(),
+        ])
+    }
+
+    /// A prompt with an image expands to a text item and an image item, and an
+    /// answer to one item per block, so items badly overstate the exchanges.
+    #[test]
+    fn counted_turns_counts_exchanges_not_items() {
+        let items = two_turn_history();
+        assert!(items.len() > 4, "{ITEMS_PER_TURN}");
+        assert_eq!(counted_turns(&items), 2, "{TURNS_NOT_ITEMS}");
+    }
+
+    #[test_case(0  => 2  ; "a_session_saved_before_the_counter_recovers_it_from_history")]
+    #[test_case(97 => 97 ; "a_stored_count_outlives_the_history_compaction_dropped")]
+    fn resume_restores_the_turn_count(stored: u64) -> u64 {
+        let mut session = AppSession::new("test-model", "/tmp");
+        session.replace_messages(two_turn_history());
+        session.meta.turns = stored;
+        resumed(session, &test_model()).turns
     }
 }

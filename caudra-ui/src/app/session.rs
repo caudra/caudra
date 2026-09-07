@@ -247,6 +247,7 @@ impl App {
             session_rules: rules_to_stored(&self.permissions.session_rules_snapshot()),
             structured_permission_rules: self.permissions.structured_conversation_rules_snapshot(),
             context_size: state.context_size,
+            turns: state.turns,
             input_draft: (!draft.is_empty()).then_some(draft.text),
             input_draft_images: self
                 .input_box

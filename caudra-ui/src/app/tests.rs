@@ -601,6 +601,27 @@ fn reset_session_clears_exit_request_source() {
     assert!(app.last_exit.is_none());
 }
 
+const TURNS_UNCOUNTED: &str = "a finished exchange must move the session's turn counter";
+const TURNS_UNSAVED: &str = "the exit summary reads the counter off the session, so it must be saved";
+
+/// Compaction discards the history a count could be derived from, so the
+/// exit summary reads a stored counter instead. A deferred goal keeps the
+/// turn open, and its extra `Done` must not bill the same exchange twice.
+#[test_case(false, 1 ; "a_finished_turn_counts_once")]
+#[test_case(true,  0 ; "a_deferred_goal_leaves_the_turn_open")]
+fn completed_turns_reach_the_stored_counter(deferred: bool, expected: u64) {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    app.goal_deferred = deferred;
+
+    end_turn(&mut app);
+    app.checkpoint();
+
+    assert_eq!(app.state.turns, expected, "{TURNS_UNCOUNTED}");
+    assert_eq!(app.state.session.meta.turns, expected, "{TURNS_UNSAVED}");
+}
+
 #[test]
 fn toggle_mode_state_machine() {
     let tab = |app: &mut App| app.update(Msg::Key(key(KeyCode::Tab)));
