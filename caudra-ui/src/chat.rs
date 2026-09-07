@@ -35,7 +35,7 @@ pub(crate) const ERROR_TEXT: &str = "Error";
 pub(crate) const CANCELLED_TEXT: &str = "Cancelled";
 /// One notice per streak: a wedged model can spend twenty nudges, and twenty
 /// identical bubbles bury the conversation they are about.
-const NUDGE_TEXT: &str = "Model stalled after tool calls, nudging...";
+const NUDGE_TEXT: &str = "Model ended turn without a response, nudging...";
 
 pub enum ChatEventResult {
     Continue,

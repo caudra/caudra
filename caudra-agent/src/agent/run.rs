@@ -57,10 +57,16 @@ const TOOL_RESULT_BLOCK_FRAMING: &str = r#"{"type":"tool_result","tool_use_id":"
 const TOOL_RESULT_ERROR_FRAMING: &str = r#"{"is_error":true}"#;
 const IMAGE_BLOCK_FRAMING: &str =
     r#"{"type":"image","source":{"type":"base64","media_type":"","data":""}}"#;
-const NUDGE_PROMPT: &str = "You just executed tool calls but returned an empty response. Please process the tool results above and continue with the task.";
+const NUDGE_PROMPT: &str = "You just executed tool calls but returned an empty response. Please process the tool results above and continue with the task. Always end your turn with a text response.";
+/// Nothing is pending, so this asks for the closing response the system
+/// prompt requires rather than for tool results to be processed.
+const IDLE_NUDGE_PROMPT: &str = "You ended your turn without a response. Continue the task, and always end your turn with a text response summarizing what you did.";
 /// A model that stalls once often stalls again on the retry, so it gets
 /// plenty of chances before the turn ends empty handed.
 const MAX_NUDGES: u32 = 20;
+/// With no tool results to resume from there is nothing to salvage, so a
+/// model that answers nothing twice is finished rather than wedged.
+const MAX_IDLE_NUDGES: u32 = 2;
 /// Counted over non-padding messages.
 const RECENT_TOOL_WINDOW: usize = 5;
 /// Without this note a cancelled reply replays in history as a finished
@@ -976,21 +982,28 @@ impl<'h> Agent<'h> {
     /// response needs assistant padding; retained reasoning already occupies
     /// that turn and must not be followed by another assistant message.
     fn recover_stalled_turn(&mut self, pad_empty_response: bool) -> Result<bool, AgentError> {
+        let after_tools = self.history.has_recent_tool_results(RECENT_TOOL_WINDOW);
         let nudges = self.history.recent_nudges();
-        let nudge = nudges < MAX_NUDGES && self.history.has_recent_tool_results(RECENT_TOOL_WINDOW);
         if pad_empty_response {
             self.push_assistant_message(Message::empty_marker());
         }
-        if !nudge {
+        if nudges >= if after_tools { MAX_NUDGES } else { MAX_IDLE_NUDGES } {
             return Ok(false);
         }
 
         warn!(
             nudges = nudges + 1,
-            "empty response after tool calls, nudging model to continue"
+            after_tools, "turn ended without a response, nudging model to continue"
         );
         self.event_tx.send(AgentEvent::Nudge)?;
-        self.history.push(Message::synthetic(NUDGE_PROMPT.into()));
+        self.history.push(Message::synthetic(
+            if after_tools {
+                NUDGE_PROMPT
+            } else {
+                IDLE_NUDGE_PROMPT
+            }
+            .into(),
+        ));
         Ok(true)
     }
 
@@ -2935,8 +2948,21 @@ mod tests {
             empty_response(),
             text_response(StopReason::EndTurn),
         ],
-        1, 0
-        ; "no_nudge_without_recent_tools"
+        2, 1
+        ; "nudge_without_recent_tools"
+    )]
+    #[test_case(
+        vec![
+            thinking_response(),
+            text_response(StopReason::EndTurn),
+        ],
+        2, 1
+        ; "nudge_on_thinking_only_without_tools"
+    )]
+    #[test_case(
+        (0..=MAX_IDLE_NUDGES).map(|_| empty_response()).collect(),
+        MAX_IDLE_NUDGES + 1, MAX_IDLE_NUDGES as usize
+        ; "gives_up_after_max_idle_nudges"
     )]
     fn nudge_behavior(responses: Vec<StreamResponse>, expected_turns: u32, expected_nudges: usize) {
         smol::block_on(async {
