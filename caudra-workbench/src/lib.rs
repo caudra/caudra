@@ -616,6 +616,20 @@ impl Workbench {
     /// last frame recorded. Anything outside a pane is left alone.
     pub fn handle_mouse(&mut self, event: MouseEvent) -> WorkbenchAction {
         let at = (event.column, event.row);
+        // The panel is anchored to a cell, so anything that could move what is
+        // under it takes it down first. A press is left to `press_menu`, and a
+        // right press re-anchors it somewhere else.
+        if self.menu.is_some()
+            && !matches!(
+                event.kind,
+                MouseEventKind::Moved
+                    | MouseEventKind::Down(MouseButton::Left)
+                    | MouseEventKind::Down(MouseButton::Right)
+            )
+        {
+            self.menu = None;
+            return WorkbenchAction::Consumed;
+        }
         let delta = match event.kind {
             MouseEventKind::ScrollUp => -SCROLL_LINES,
             MouseEventKind::ScrollDown => SCROLL_LINES,
@@ -861,17 +875,22 @@ impl Workbench {
     /// is swallowed, so the press that dismisses a menu never also acts on
     /// what is underneath it.
     fn press_menu(&mut self, at: (u16, u16)) -> WorkbenchAction {
-        let Some(menu) = self.menu.take() else {
+        let Some(menu) = &self.menu else {
             return WorkbenchAction::Consumed;
         };
         if !self.panes.menu.contains(at.into()) {
+            self.menu = None;
             return WorkbenchAction::Consumed;
         }
         let offset = (at.1 - self.panes.menu.y) as usize;
-        match menu.action_at(offset) {
-            Some(action) => self.run_menu(action, menu.target()),
-            None => WorkbenchAction::Consumed,
-        }
+        // A rule between groups is part of the panel, so a press on one leaves
+        // the menu standing rather than punishing a near miss.
+        let Some(action) = menu.action_at(offset) else {
+            return WorkbenchAction::Consumed;
+        };
+        let target = menu.target().clone();
+        self.menu = None;
+        self.run_menu(action, &target)
     }
 
     /// Takes the answer under the menu's own cursor, which is what `Enter`
@@ -2483,17 +2502,19 @@ mod tests {
     use super::{
         Ask, Choice, Confirm, Cursor, DEFAULT_SIDEBAR_WIDTH, DISCARD_LABEL, Drag,
         EDGE_SCROLL_LINES, Focus, Layout, MAX_SIDEBAR_WIDTH, MIN_EDITOR_WIDTH, MIN_SECTION_ROWS,
-        MIN_SIDEBAR_WIDTH, MenuAction, SCROLL_COLUMNS, SCROLL_LINES, ScmLayout, Section,
-        SidebarView, Target, Toggle, Workbench, WorkbenchAction, WorkbenchStyles, keys, layout,
-        layout_sections, scm,
+        MIN_SIDEBAR_WIDTH, MenuAction, NEW_FILE_PROMPT, SCROLL_COLUMNS, SCROLL_LINES, ScmLayout,
+        Section, SidebarView, Target, Toggle, Workbench, WorkbenchAction, WorkbenchStyles, keys,
+        layout, layout_sections, scm,
     };
     use crate::chrome::{ELLIPSIS, SCROLLBAR_THUMB};
     use crate::editor::{VisualRow, render};
     use crate::fs::tree::GitMark;
+    use crate::menu::Item as MenuItem;
     use crate::search;
     use crate::view::{
-        Control, MORE_LEFT, MORE_RIGHT, NOT_A_REPOSITORY, OPEN_MARK, REVERT_MARK, STAGE_MARK,
-        TabHit, UNSTAGE_MARK, button_at, confirm_at, header_at, tab_at, toggle_at, visible_range,
+        CARET, Control, MENU_HINTS, MORE_LEFT, MORE_RIGHT, NAME_HINTS, NOT_A_REPOSITORY, OPEN_MARK,
+        REVERT_MARK, STAGE_MARK, TabHit, UNSTAGE_MARK, button_at, confirm_at, header_at, tab_at,
+        toggle_at, visible_range,
     };
     use crossterm::event::{
         KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -2609,6 +2630,9 @@ mod tests {
     const WRONG_TABS: &str = "the close left the strip showing something else";
     const QUEUE_RAN_ON: &str = "a batch close carried on past the question in front of it";
     const QUEUE_STALLED: &str = "the tabs behind the answered question were never closed";
+    const MENU_GONE: &str = "a press inside the panel took the menu down";
+    const WRONG_PROMPT: &str = "the field under the editor is not showing what is being typed";
+    const WRONG_HINT: &str = "the status bar is not offering what the next key will reach";
     /// The file [`project`] opens, and the folder beside it.
     const OPENED_FILE: &str = "a.txt";
     const NESTED_DIR: &str = "sub";
@@ -5773,6 +5797,160 @@ mod tests {
             ["file1.txt", "file2.txt"],
             "{QUEUE_RAN_ON}"
         );
+        assert_eq!(asked(&workbench).ask, Ask::Close, "{NOT_ASKED}");
+
+        workbench.handle_key(key(KeyCode::Char(Choice::Discard.accelerator())));
+
+        assert!(open_titles(&workbench).is_empty(), "{QUEUE_STALLED}");
+    }
+
+    /// The row of the panel an action was painted on, found the way the
+    /// pointer finds it.
+    fn menu_row(workbench: &Workbench, action: MenuAction) -> u16 {
+        let menu = workbench.menu.as_ref().expect(NO_MENU);
+        let offset = menu
+            .items()
+            .iter()
+            .position(|item| *item == MenuItem::Action(action))
+            .expect("the action in the menu");
+        workbench.panes.menu.y + offset as u16
+    }
+
+    /// Opens the menu on the first tree row and paints it, so the panel has
+    /// geometry for a press to land on.
+    fn open_row_menu(dir: &TempDir, workbench: &mut Workbench) {
+        select_file(dir, workbench);
+        workbench.handle_leader(press(keys::MENU));
+        paint(workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+    }
+
+    #[test]
+    fn a_press_on_a_row_of_the_panel_takes_that_action() {
+        let (dir, mut workbench) = project();
+        open_row_menu(&dir, &mut workbench);
+        let row = menu_row(&workbench, MenuAction::CopyPath);
+
+        let copied = workbench.handle_mouse(click(workbench.panes.menu.x, row));
+
+        assert_eq!(
+            copied,
+            WorkbenchAction::Copy(dir.path().join(OPENED_FILE).display().to_string()),
+            "{PATH_UNCOPIED}"
+        );
+        assert!(workbench.menu.is_none(), "{MENU_STUCK}");
+    }
+
+    /// A rule is part of the panel, so hitting one is a near miss rather than
+    /// a change of mind.
+    #[test]
+    fn a_press_on_a_rule_leaves_the_menu_standing() {
+        let (dir, mut workbench) = project();
+        open_row_menu(&dir, &mut workbench);
+        let rule = workbench
+            .menu
+            .as_ref()
+            .expect(NO_MENU)
+            .items()
+            .iter()
+            .position(|item| *item == MenuItem::Separator)
+            .expect("a rule between two groups") as u16;
+
+        workbench.handle_mouse(click(workbench.panes.menu.x, workbench.panes.menu.y + rule));
+
+        assert!(workbench.menu.is_some(), "{MENU_GONE}");
+    }
+
+    #[test_case(true ; "a wheel would scroll what the panel is anchored to")]
+    #[test_case(false ; "and a middle press would close a tab behind it")]
+    fn the_menu_goes_down_before_the_pointer_reaches_the_panes(scrolled: bool) {
+        let (_dir, mut workbench) = many_tabs(2);
+        workbench.focus = Focus::Editor;
+        workbench.handle_leader(press(keys::MENU));
+        paint(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        let tabs = workbench.panes.tabs;
+
+        match scrolled {
+            true => workbench.handle_mouse(wheel(tabs.x, tabs.bottom())),
+            false => workbench.handle_mouse(middle_click(tabs.x, tabs.y)),
+        };
+
+        assert!(workbench.menu.is_none(), "{MENU_STUCK}");
+        assert_eq!(workbench.editor.tabs().len(), 2, "{MODAL_LEAKED}");
+    }
+
+    /// Whatever is standing over the panes is what the next key reaches, so
+    /// the status bar has to be talking about that rather than the pane under
+    /// it.
+    #[test]
+    fn the_status_bar_offers_the_menu_and_then_the_name_it_asks_for() {
+        let (dir, mut workbench) = project();
+        open_row_menu(&dir, &mut workbench);
+
+        assert!(
+            draw(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT).contains(MENU_HINTS[0].1),
+            "{WRONG_HINT}"
+        );
+
+        menu_action(&mut workbench, MenuAction::Rename);
+
+        assert!(
+            draw(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT).contains(NAME_HINTS[0].1),
+            "{WRONG_HINT}"
+        );
+    }
+
+    #[test]
+    fn esc_takes_the_menu_down() {
+        let (dir, mut workbench) = project();
+        open_row_menu(&dir, &mut workbench);
+
+        workbench.handle_key(key(KeyCode::Esc));
+
+        assert!(workbench.menu.is_none(), "{MENU_STUCK}");
+    }
+
+    /// A menu over a standing question would offer answers to a question
+    /// nobody could see.
+    #[test]
+    fn no_menu_opens_while_a_dialog_is_up() {
+        let (dir, mut workbench) = project();
+        open_file(&dir, &mut workbench);
+        workbench.handle_key(key(KeyCode::Char(EDIT)));
+        workbench.handle_leader(press(keys::CLOSE_TAB));
+
+        workbench.handle_leader(press(keys::MENU));
+
+        assert!(workbench.menu.is_none(), "{MODAL_LEAKED}");
+    }
+
+    #[test]
+    fn the_name_being_typed_is_painted_with_a_caret_after_it() {
+        let (dir, mut workbench) = project();
+        select_file(&dir, &mut workbench);
+        workbench.handle_leader(press(keys::MENU));
+        menu_action(&mut workbench, MenuAction::NewFile);
+        for typed in MADE_NAME.chars() {
+            workbench.handle_key(key(KeyCode::Char(typed)));
+        }
+
+        let frame = draw(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+
+        assert!(
+            frame.contains(&format!("{NEW_FILE_PROMPT}{MADE_NAME}{CARET}")),
+            "{WRONG_PROMPT}"
+        );
+    }
+
+    #[test]
+    fn a_batch_close_asks_about_every_tab_that_has_work_in_it() {
+        let (_dir, mut workbench) = many_tabs(3);
+        edit_tab(&mut workbench, 1);
+        edit_tab(&mut workbench, 2);
+
+        workbench.run_menu(MenuAction::CloseAll, &Target::Tab(0));
+        workbench.handle_key(key(KeyCode::Char(Choice::Discard.accelerator())));
+
+        assert_eq!(open_titles(&workbench), ["file2.txt"], "{QUEUE_STALLED}");
         assert_eq!(asked(&workbench).ask, Ask::Close, "{NOT_ASKED}");
 
         workbench.handle_key(key(KeyCode::Char(Choice::Discard.accelerator())));

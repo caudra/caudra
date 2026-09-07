@@ -41,7 +41,7 @@ const TRUNCATED: &str = " (truncated)";
 const CASE_TOGGLE: &str = "Aa";
 const WORD_TOGGLE: &str = "ab";
 const REGEX_TOGGLE: &str = ".*";
-const CARET: &str = "\u{2588}";
+pub(crate) const CARET: &str = "\u{2588}";
 const ENTER_LABEL: &str = "Enter";
 const SUMMARY_GAP: &str = " ";
 /// The two-column rail down the left of the graph. A commit on the chain of
@@ -126,6 +126,10 @@ const CONFIRM_ROWS: u16 = 4;
 /// One column of air either side of the widest row.
 const CONFIRM_PADDING: u16 = 1;
 const CONFIRM_HINTS: [(&str, &str); 2] = [(ENTER_LABEL, "choose"), (keys::CLOSE.label, "cancel")];
+pub(crate) const MENU_HINTS: [(&str, &str); 2] =
+    [(ENTER_LABEL, "take"), (keys::CLOSE.label, "close")];
+pub(crate) const NAME_HINTS: [(&str, &str); 2] =
+    [(ENTER_LABEL, "confirm"), (keys::CLOSE.label, "cancel")];
 
 /// One of the search view's three buttons.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -528,8 +532,8 @@ impl Workbench {
         self.panes.tabs = tabs;
         self.render_tabs(buf, tabs);
         self.render_body(buf, body);
-        if let Some((label, input)) = prompt {
-            self.render_prompt(buf, bar, &label, &input);
+        if let Some((label, input, caret)) = prompt {
+            self.render_prompt(buf, bar, &label, &input, caret);
         }
         self.render_palette(buf, area);
         self.render_confirm(buf, area);
@@ -814,11 +818,14 @@ impl Workbench {
         self.scrollbar(buf, bar, lines, first);
     }
 
-    fn render_prompt(&self, buf: &mut Surface, area: Rect, label: &str, input: &str) {
-        let mut left = vec![
-            Span::styled(label.to_owned(), self.styles.accent),
-            Span::styled(input.to_owned(), self.styles.text),
-        ];
+    fn render_prompt(&self, buf: &mut Surface, area: Rect, label: &str, input: &str, caret: bool) {
+        let mut left = vec![Span::styled(label.to_owned(), self.styles.accent)];
+        if !input.is_empty() {
+            left.push(Span::styled(input.to_owned(), self.styles.text));
+        }
+        if caret {
+            left.push(Span::styled(CARET, self.styles.cursor));
+        }
         let right = match self.editor.active().map(|tab| &tab.find) {
             Some(find) if find.is_open() && !find.query().is_empty() => match find.position() {
                 Some((at, total)) => vec![Span::styled(format!("{at}/{total}"), self.styles.dim)],
@@ -826,9 +833,6 @@ impl Workbench {
             },
             _ => Vec::new(),
         };
-        if left[1].content.is_empty() {
-            left.pop();
-        }
         chrome::render_line(
             buf,
             area,
@@ -871,9 +875,17 @@ impl Workbench {
     }
 
     /// What the status bar offers, which is whatever the focused pane can do.
+    /// Anything standing over the panes answers first, since that is what the
+    /// next key will reach.
     fn status_hints(&self) -> Vec<(&'static str, &'static str)> {
+        if self.input.is_some() {
+            return NAME_HINTS.to_vec();
+        }
         if self.confirm.is_some() {
             return CONFIRM_HINTS.to_vec();
+        }
+        if self.menu.is_some() {
+            return MENU_HINTS.to_vec();
         }
         if self.focus == Focus::Sidebar && self.sidebar == SidebarView::SourceControl {
             let other = match self.scm.is_flat() {
@@ -918,17 +930,20 @@ impl Workbench {
         ]
     }
 
-    /// The one-line field under the editor, when something is asking for input.
-    fn prompt(&self) -> Option<(String, String)> {
+    /// The one-line field under the editor, when something is asking for
+    /// input, and whether it carries a caret. A name is the only one of these
+    /// with no other sign on screen that it is being typed into: find marks its
+    /// matches and go-to-line takes digits alone.
+    fn prompt(&self) -> Option<(String, String, bool)> {
         if let Some(input) = &self.input {
-            return Some((input.kind.label().to_owned(), input.value.clone()));
+            return Some((input.kind.label().to_owned(), input.value.clone(), true));
         }
         if let Some(input) = &self.goto {
-            return Some((GOTO_PROMPT.to_owned(), input.clone()));
+            return Some((GOTO_PROMPT.to_owned(), input.clone(), false));
         }
         let find = &self.editor.active()?.find;
         find.is_open()
-            .then(|| (FIND_PROMPT.to_owned(), find.query().to_owned()))
+            .then(|| (FIND_PROMPT.to_owned(), find.query().to_owned(), false))
     }
 }
 
@@ -1744,12 +1759,14 @@ mod tests {
 
     use ratatui::layout::Rect;
 
+    use super::menu_panel;
     use super::{
         CHANGE_TRAILING, Control, Editor, Focus, GitMark, ScmRow, Section, SidebarView, Style, Tab,
         TabHit, Toggle, TreeRow, Workbench, WorkbenchStyles, control_at, header_at, keys,
         scm_controls, scroll_column, tab_at, toggle_at, tree_row, tree_style, visible_range,
     };
     use crate::fs::tree::EntryKind;
+    use crate::menu::Menu;
 
     const WRONG_TAB: &str = "the column does not fall on the tab the strip painted there";
     const WRONG_CONTROL: &str = "the column does not fall on the control the row painted there";
@@ -1760,8 +1777,19 @@ mod tests {
     const WRONG_HINT: &str = "the status bar is not offering what the focused pane needs most";
     const WRONG_PAINT: &str = "the row is not painted the way its standing asks for";
     const WRONG_GUIDES: &str = "the rules down the indent are not drawn as chrome";
+    const PANEL_MISPLACED: &str = "the panel is not where the cell it was asked for puts it";
+    const PANEL_OFF_FRAME: &str = "the panel ran off the frame it was given";
     const TREE_NAME: &str = "a.rs";
     const TREE_WIDTH: u16 = 40;
+    /// Room for the longest menu either target builds, with edges close enough
+    /// to reach. Away from the origin, so a clamp that forgets where the frame
+    /// starts is caught.
+    const FRAME: Rect = Rect {
+        x: 3,
+        y: 2,
+        width: 40,
+        height: 20,
+    };
 
     /// Wide enough for every tab the cases open, so only the ones that ask for
     /// a narrow strip have to say so.
@@ -2032,5 +2060,47 @@ mod tests {
 
         assert_eq!(line.spans[0].style, styles.border, "{WRONG_GUIDES}");
         assert_eq!(line.spans[1].style, styles.text, "{WRONG_PAINT}");
+    }
+
+    fn menu(at: (u16, u16)) -> Menu {
+        Menu::for_row(&entry(EntryKind::File, 0), at)
+    }
+
+    #[test]
+    fn the_panel_hangs_under_the_cell_it_was_asked_for() {
+        let panel = menu_panel(&menu((4, 2)), FRAME);
+
+        assert_eq!((panel.x, panel.y), (4, 3), "{PANEL_MISPLACED}");
+    }
+
+    /// A row near the bottom is where a menu is asked for most, since that is
+    /// where a long tree ends.
+    #[test]
+    fn a_panel_with_no_room_under_it_stands_over_the_cell_instead() {
+        let anchor = FRAME.bottom() - 1;
+
+        let panel = menu_panel(&menu((4, anchor)), FRAME);
+
+        assert_eq!(panel.bottom(), anchor, "{PANEL_MISPLACED}");
+        assert!(panel.y >= FRAME.y, "{PANEL_OFF_FRAME}");
+    }
+
+    #[test]
+    fn a_panel_asked_for_at_the_right_edge_is_pulled_back_inside() {
+        let panel = menu_panel(&menu((FRAME.right() - 2, 0)), FRAME);
+
+        assert_eq!(panel.right(), FRAME.right(), "{PANEL_OFF_FRAME}");
+        assert!(panel.x >= FRAME.x, "{PANEL_OFF_FRAME}");
+    }
+
+    /// Every label has to fit, or the menu says something other than what it
+    /// does.
+    #[test]
+    fn the_panel_is_wide_enough_for_the_longest_label() {
+        let menu = menu((0, 0));
+
+        let panel = menu_panel(&menu, FRAME);
+
+        assert!(panel.width as usize > menu.width(), "{PANEL_MISPLACED}");
     }
 }
