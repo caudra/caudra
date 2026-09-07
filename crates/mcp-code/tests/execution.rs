@@ -95,7 +95,7 @@ async fn run(group: &CodeToolGroup, code: &str) -> Value {
 
 async fn run_with(group: &CodeToolGroup, arguments: Value) -> Value {
     let result = group
-        .dispatch("code_execution", arguments, CancellationToken::new())
+        .dispatch("python_execution", arguments, CancellationToken::new())
         .await
         .expect("tool is claimed by this group")
         .expect("dispatch does not fault");
@@ -754,7 +754,7 @@ async fn rejects_input_outside_the_advertised_schema() {
     ] {
         let result = group
             .dispatch(
-                "code_execution",
+                "python_execution",
                 arguments.clone(),
                 CancellationToken::new(),
             )

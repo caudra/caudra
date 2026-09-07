@@ -1,6 +1,6 @@
 # workcell-mcp-code
 
-`workcell-mcp-code` implements Workcell's `code_execution` MCP tool. It evaluates a bounded Python
+`workcell-mcp-code` implements Workcell's `python_execution` MCP tool. It evaluates a bounded Python
 snippet in a separate [Monty](https://github.com/pydantic/monty) worker process, returns the value of
 the final expression as JSON alongside captured output, and converts interpreter failures into a
 structured taxonomy with guidance aimed at an agent rather than a human reading a traceback.

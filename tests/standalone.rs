@@ -1019,7 +1019,7 @@ fn code_worker() -> Option<std::path::PathBuf> {
 /// variable, so the skip only applies to a local checkout that has not run `make code-worker`.
 #[cfg(unix)]
 #[tokio::test]
-async fn stdio_serves_the_full_catalog_including_code_execution() {
+async fn stdio_serves_the_full_catalog_including_python_execution() {
     let Some(worker) = code_worker() else {
         eprintln!(
             "skipping: no `monty` worker found. Run `make code-worker` or set WORKCELL_MCP_CODE_WORKER."
@@ -1033,7 +1033,7 @@ async fn stdio_serves_the_full_catalog_including_code_execution() {
             ToolGroup::Files,
             ToolGroup::Web,
             ToolGroup::Shell,
-            ToolGroup::Code,
+            ToolGroup::PythonExecution,
         ],
         ServerBehavior {
             expose_execution_environment: true,
@@ -1082,7 +1082,7 @@ async fn stdio_serves_the_full_catalog_including_code_execution() {
         .iter()
         .map(|tool| tool["name"].as_str().unwrap())
         .collect::<Vec<_>>();
-    // Catalog order is a compatibility contract; `code_execution` sits after `shell`.
+    // Catalog order is a compatibility contract; `python_execution` sits after `shell`.
     assert_eq!(
         names,
         [
@@ -1096,7 +1096,7 @@ async fn stdio_serves_the_full_catalog_including_code_execution() {
             "websearch",
             "webfetch",
             "shell",
-            "code_execution",
+            "python_execution",
             "execution_environment",
         ]
     );
@@ -1106,7 +1106,7 @@ async fn stdio_serves_the_full_catalog_including_code_execution() {
         &mcp_request(
             3,
             "tools/call",
-            json!({"name": "code_execution", "arguments": {"code": "sum([1, 2, 3, 4])"}}),
+            json!({"name": "python_execution", "arguments": {"code": "sum([1, 2, 3, 4])"}}),
         ),
     )
     .await;
@@ -1121,7 +1121,7 @@ async fn stdio_serves_the_full_catalog_including_code_execution() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|tool| tool["name"] == "code_execution")
+        .find(|tool| tool["name"] == "python_execution")
         .expect("code tool listed");
     assert_eq!(code_tool["annotations"]["readOnlyHint"], json!(true));
     assert_eq!(code_tool["annotations"]["openWorldHint"], json!(false));

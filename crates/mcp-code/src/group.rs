@@ -34,7 +34,7 @@ use crate::{
 };
 
 #[cfg(feature = "mcp")]
-const TOOL_NAME: &str = "code_execution";
+const TOOL_NAME: &str = "python_execution";
 /// Name shown in tracebacks the caller sees. It is not a real path and never touches a filesystem.
 const SCRIPT_NAME: &str = "snippet.py";
 

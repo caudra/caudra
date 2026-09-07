@@ -83,7 +83,7 @@ pub fn specs() -> Vec<ToolSpec> {
     // accurate: without mounts or host functions the interpreter reaches no file, socket, or
     // environment value. They are still presentation hints; the isolation is enforced by the worker.
     vec![ToolSpec::new(
-        "code_execution",
+        "python_execution",
         Some("Execute Python code"),
         DESCRIPTION,
         schema.as_object().expect("schema object").clone(),
@@ -93,8 +93,8 @@ pub fn specs() -> Vec<ToolSpec> {
             idempotent_hint: Some(false),
             open_world_hint: Some(false),
         },
-        "code.result.v1",
-        "code.execution.v1",
+        "python.result.v1",
+        "python.execution.v1",
     )]
 }
 
@@ -132,7 +132,7 @@ mod tests {
     fn uses_standard_presentation_key() {
         let tools = catalog();
         let specs = specs();
-        assert_eq!(tools[0].name, "code_execution");
+        assert_eq!(tools[0].name, "python_execution");
         let description = tools[0].description.as_deref().expect("tool description");
         assert!(description.contains("No filesystem, no network"));
         assert!(description.contains("Prefer this over the shell tool"));
@@ -143,11 +143,11 @@ mod tests {
         );
         assert_eq!(
             tools[0].meta.as_ref().unwrap().0[PRESENTATION_KEY],
-            "code.result.v1"
+            "python.result.v1"
         );
         assert_eq!(specs[0].name, tools[0].name);
         assert_eq!(specs[0].input_schema, *tools[0].input_schema);
-        assert_eq!(specs[0].contract_id, "code.execution.v1");
+        assert_eq!(specs[0].contract_id, "python.execution.v1");
     }
 
     #[test]

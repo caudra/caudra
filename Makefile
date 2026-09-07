@@ -182,7 +182,7 @@ docker-smoke: docker-build
 	@output=$$(printf '%s\n' \
 		'{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"container-smoke","version":"1"}}}' \
 		'{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}' \
-		'{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"code_execution","arguments":{"code":"sum([1, 2, 3, 4])"}}}' \
+		'{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"python_execution","arguments":{"code":"sum([1, 2, 3, 4])"}}}' \
 		| $(DOCKER) run --rm --interactive "$(IMAGE):$(TAG)" --tool-group code); \
 	printf '%s\n' "$$output" | grep -q '"outcome":"completed".*"result":10' \
 		|| { printf '%s\n' 'packaged code execution failed'; exit 2; }

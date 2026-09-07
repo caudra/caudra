@@ -21,7 +21,10 @@ pub enum ToolGroup {
     Files,
     Web,
     Shell,
-    Code,
+    // clap derives kebab-case value names, which would spell this `python-execution`. The group
+    // selector matches the tool it exposes, so it is named explicitly.
+    #[value(name = "python_execution")]
+    PythonExecution,
     Transfer,
 }
 
@@ -32,7 +35,7 @@ impl ToolGroup {
             Self::Files => "files",
             Self::Web => "web",
             Self::Shell => "shell",
-            Self::Code => "code",
+            Self::PythonExecution => "python_execution",
             Self::Transfer => "transfer",
         }
     }
@@ -258,7 +261,7 @@ pub enum CliError {
     InvalidProxy,
     ProxyOptionRequiresWeb,
     ShellOptionRequiresShell,
-    CodeOptionRequiresCode,
+    CodeOptionRequiresPythonExecution,
     HttpOptionRequiresHttp,
     InvalidAllowedHost,
     TransferRequiresHttp,
@@ -271,7 +274,7 @@ impl fmt::Display for CliError {
         formatter.write_str(match self {
             Self::InvalidEnvironment => "Workcell environment configuration is invalid",
             Self::InvalidToolGroup => {
-                "WORKCELL_MCP_TOOL_GROUPS must contain only files, web, shell, code, and transfer"
+                "WORKCELL_MCP_TOOL_GROUPS must contain only files, web, shell, python_execution, and transfer"
             }
             Self::DuplicateToolGroup => "each tool group may be selected only once",
             Self::RootRequired => "files, shell, and transfer tools require a root directory",
@@ -291,8 +294,8 @@ impl fmt::Display for CliError {
             Self::ShellOptionRequiresShell => {
                 "--shell-policy, --yolo, and --no-shell-output-filter require the shell tool group"
             }
-            Self::CodeOptionRequiresCode => {
-                "--code-worker, --code-worker-cache, and --no-code-type-check require the code tool group"
+            Self::CodeOptionRequiresPythonExecution => {
+                "--code-worker, --code-worker-cache, and --no-code-type-check require the python_execution tool group"
             }
             Self::HttpOptionRequiresHttp => "HTTP options require --transport http",
             Self::InvalidAllowedHost => {
@@ -344,7 +347,7 @@ impl RawOptions {
                     ToolGroup::Files,
                     ToolGroup::Web,
                     ToolGroup::Shell,
-                    ToolGroup::Code,
+                    ToolGroup::PythonExecution,
                 ],
             }
         } else {
@@ -500,13 +503,13 @@ impl RawOptions {
         {
             return Err(CliError::ShellOptionRequiresShell);
         }
-        if !groups.contains(&ToolGroup::Code)
+        if !groups.contains(&ToolGroup::PythonExecution)
             && (explicit_code_options
                 || code_worker.is_some()
                 || code_worker_cache.is_some()
                 || !code_type_check)
         {
-            return Err(CliError::CodeOptionRequiresCode);
+            return Err(CliError::CodeOptionRequiresPythonExecution);
         }
         if transport == Transport::Stdio && (explicit_http_options || http_token_file.is_some()) {
             return Err(CliError::HttpOptionRequiresHttp);
@@ -663,7 +666,7 @@ fn parse_groups(value: &str) -> Result<Vec<ToolGroup>, CliError> {
             "files" => Ok(ToolGroup::Files),
             "web" => Ok(ToolGroup::Web),
             "shell" => Ok(ToolGroup::Shell),
-            "code" => Ok(ToolGroup::Code),
+            "python_execution" => Ok(ToolGroup::PythonExecution),
             "transfer" => Ok(ToolGroup::Transfer),
             _ => Err(CliError::InvalidToolGroup),
         })
@@ -993,7 +996,7 @@ mod tests {
     }
 
     #[test]
-    fn code_worker_cache_requires_code_and_is_redacted() {
+    fn code_worker_cache_requires_python_and_is_redacted() {
         let environment = StartupEnvironment::load(None).unwrap();
         let without_code = RawOptions::try_parse_from([
             "workcell-mcp",
@@ -1005,13 +1008,13 @@ mod tests {
         .unwrap();
         assert_eq!(
             without_code.resolve(&environment).unwrap_err(),
-            CliError::CodeOptionRequiresCode
+            CliError::CodeOptionRequiresPythonExecution
         );
 
         let with_code = RawOptions::try_parse_from([
             "workcell-mcp",
             "--tool-group",
-            "code",
+            "python_execution",
             "--code-worker-cache",
             "/private/cache",
         ])
@@ -1026,7 +1029,7 @@ mod tests {
     }
 
     #[test]
-    fn code_worker_cache_environment_requires_code() {
+    fn code_worker_cache_environment_requires_python() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = directory.path().join("server.env");
         std::fs::write(&path, "WORKCELL_MCP_CODE_WORKER_CACHE=/private/cache\n")
@@ -1036,7 +1039,7 @@ mod tests {
 
         assert_eq!(
             raw.resolve(&environment).unwrap_err(),
-            CliError::CodeOptionRequiresCode
+            CliError::CodeOptionRequiresPythonExecution
         );
     }
 }

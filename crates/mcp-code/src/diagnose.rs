@@ -138,7 +138,7 @@ fn module_guidance(detail: &str) -> String {
 /// Guidance for a name the subset does not provide.
 fn undefined_name_guidance(detail: &str) -> String {
     format!(
-        "Undefined name. Note that {} are not implemented, and nothing persists between code_execution calls. ({detail})",
+        "Undefined name. Note that {} are not implemented, and nothing persists between python_execution calls. ({detail})",
         withheld_builtins!()
     )
 }
@@ -162,7 +162,7 @@ fn untyped_name_guidance(name: &str) -> String {
 /// Guidance for an attempt to reach the host.
 fn isolation_guidance(detail: &str) -> String {
     format!(
-        "code_execution has no filesystem, network, or environment access. Read or write files with the file tools, fetch URLs with webfetch, or use the shell tool when host access is genuinely required. ({detail})"
+        "python_execution has no filesystem, network, or environment access. Read or write files with the file tools, fetch URLs with webfetch, or use the shell tool when host access is genuinely required. ({detail})"
     )
 }
 

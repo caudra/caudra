@@ -143,7 +143,7 @@ impl WorkcellServer {
             None
         };
         // Building the group starts a worker, so a missing or unrunnable binary fails here.
-        let code = if groups.contains(&ToolGroup::Code) {
+        let code = if groups.contains(&ToolGroup::PythonExecution) {
             Some(Arc::new(
                 CodeToolGroup::new(tools.code)
                     .await
@@ -599,7 +599,7 @@ mod tests {
         .into_iter()
         .map(|tool| tool.name.to_string())
         .collect::<Vec<_>>();
-        // Order is a compatibility contract. `code_execution` follows `shell` so the documented
+        // Order is a compatibility contract. `python_execution` follows `shell` so the documented
         // files/web/shell prefix is unchanged, the server-only transfer tools follow it, and the
         // host-owned disclosure tool stays last.
         assert_eq!(
@@ -615,7 +615,7 @@ mod tests {
                 "websearch",
                 "webfetch",
                 "shell",
-                "code_execution",
+                "python_execution",
                 "file_download",
                 "file_upload",
                 "execution_environment",

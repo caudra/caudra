@@ -64,12 +64,12 @@ sequenceDiagram
 | Files | `index` | Bounded source skeletons and deterministic directory listings. |
 | Web | `websearch`, `webfetch` | Search defaults to credential-free Exa; fetch applies SSRF and response bounds. |
 | Shell | `shell` | Applies immutable command policy, then executes with ordered progress and a cleaned environment. |
-| Code | `code_execution` | Runs a Python snippet in a separate worker process with no filesystem, network, or environment access. |
+| Python execution | `python_execution` | Runs a Python snippet in a separate worker process with no filesystem, network, or environment access. |
 | Transfer | `file_download`, `file_upload` | HTTP transport only. Prepares a byte transfer over `/files`; `file_upload` needs `--allow-write`. |
 | Server | `execution_environment` | Returns fresh sanitized platform, privilege, package-manager, and command observations. |
 
 All groups except transfer are enabled by default. Use repeatable
-`--tool-group files|web|shell|code|transfer` arguments to expose a subset. Files, shell, and transfer
+`--tool-group files|web|shell|python_execution|transfer` arguments to expose a subset. Files, shell, and transfer
 require a positional root. Transfer additionally requires `--transport http`, because its tools mint
 URLs for a route only the HTTP transport serves; requesting it over stdio is a startup error.
 
@@ -81,7 +81,7 @@ Shell execution is denied by default. Configure `--shell-policy` for explicit al
 `--yolo` inside an appropriate isolation boundary to permit unmatched commands. Explicit policy denies
 still win under `--yolo`.
 
-The code tool is unrelated to the shell policy. It evaluates a snippet in a `monty` worker process
+The `python_execution` tool is unrelated to the shell policy. It evaluates a snippet in a `monty` worker process
 that has no filesystem, no network, no subprocesses, and an empty environment, so it needs no root
 and no policy. It is for computation, not for reaching the host. It requires the `monty` worker
 binary, which is installed from a pinned release rather than built with the workspace. Workcell
@@ -93,7 +93,7 @@ rather than exposing a tool that cannot run.
 ## Requirements
 
 - Rust 1.98 for source builds
-- The code tool group needs the pinned `monty` worker binary: `make code-worker`
+- The `python_execution` tool group needs the pinned `monty` worker binary: `make code-worker`
 - Linux is the primary production target
 - Bash is required for the shell tool in the production container
 
@@ -548,7 +548,7 @@ workcell = { git = "https://github.com/tensorninja/workcell-mcp", default-featur
 | `files-index` | `files` plus `index`, its typed output, and the feature-gated parser bundle |
 | `web` | `WebToolGroup`, `PreparedWebsearch`, `PreparedWebfetch`, extraction and provider lowering |
 | `shell` | `ShellToolGroup`, `PreparedShell`, scope analysis, progress streaming, and `output_filter` |
-| `code` | `CodeToolGroup`, isolated interpreter execution |
+| `code` | `CodeToolGroup`, isolated interpreter execution (the `python_execution` tool) |
 | `code-bundled` | `code` plus verified extraction of a build-time embedded Monty worker |
 | `environment` | `ExecutionEnvironment` inspection |
 
@@ -918,9 +918,9 @@ where possible so icon discovery does not refetch the page body.
 
 At most four shell calls execute concurrently within one process. Queued calls remain cancellable.
 
-### `code_execution`
+### `python_execution`
 
-`code_execution` evaluates one Python snippet in a separate `monty` worker process and returns the
+`python_execution` evaluates one Python snippet in a separate `monty` worker process and returns the
 value of its final expression along with anything it printed.
 
 - `code` is required and limited to 65,536 UTF-8 bytes. `timeout` is optional, measured in

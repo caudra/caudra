@@ -99,7 +99,7 @@ worker lease for the full pool lifetime; hosts supply cache and source policy, n
 ## Protocol Contracts
 
 - The supported MCP version is explicit and pinned in the server and SDK dependency.
-- Preserve stable catalog order: files, web, shell, code, transfer, execution environment.
+- Preserve stable catalog order: files, web, shell, python_execution, transfer, execution environment.
 - Within files, `index` follows `file_apply_patch` and precedes every web tool when enabled.
 - Tool names, schemas, annotations, and complete-result envelopes are compatibility contracts.
 - `ai.workcell/*` extension metadata is Workcell-owned. Do not introduce product-specific namespaces.

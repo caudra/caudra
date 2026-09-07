@@ -12,7 +12,7 @@ use workcell_mcp_code::{SUBSET_MODULES, UNTYPED_BUILTINS, WITHHELD_BUILTINS, cat
 #[test]
 fn matches_the_committed_catalog_fixture() {
     let fixture: Value = serde_json::from_str(include_str!(
-        "../../../fixtures/mcp-conformance/catalog/v1/code-tools.json"
+        "../../../fixtures/mcp-conformance/catalog/v1/python-tools.json"
     ))
     .expect("code catalog fixture");
     let actual = serde_json::to_value(catalog()).expect("serialize code catalog");
