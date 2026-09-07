@@ -987,7 +987,12 @@ impl<'h> Agent<'h> {
         if pad_empty_response {
             self.push_assistant_message(Message::empty_marker());
         }
-        if nudges >= if after_tools { MAX_NUDGES } else { MAX_IDLE_NUDGES } {
+        let nudge_limit = if after_tools {
+            MAX_NUDGES
+        } else {
+            MAX_IDLE_NUDGES
+        };
+        if nudges >= nudge_limit {
             return Ok(false);
         }
 
