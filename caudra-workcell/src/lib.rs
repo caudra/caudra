@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+mod read_only_shell;
+
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
@@ -13,8 +15,9 @@ use caudra_agent::permissions::{
 };
 use caudra_agent::tools::{
     BoxFuture, DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError,
-    PermissionIntent, PermissionScopes, RegistryError, Tool, ToolAudience, ToolContext, ToolEffect,
-    ToolExecResult, ToolInvocation, ToolLive, ToolRegistry, ToolSource, expand_tilde,
+    PermissionIntent, PermissionScopes, PlanModeAccess, RegistryError, Tool, ToolAudience,
+    ToolContext, ToolEffect, ToolExecResult, ToolInvocation, ToolLive, ToolRegistry, ToolSource,
+    expand_tilde,
 };
 use caudra_agent::{
     AgentEvent, CodeGraphRow, CodeGraphSource, GrepFileEntry, GrepMatchGroup, INDEX_TRUNCATED,
@@ -1085,8 +1088,31 @@ impl ToolInvocation for WorkcellInvocation {
         self.prepared_targets(|prepared| &prepared.read_targets)
     }
 
-    fn blocked_in_plan_mode(&self) -> bool {
-        matches!(self.input, Input::Shell(_))
+    /// A shell line is judged from its parsed form, which only exists once
+    /// `preflight` has run. Reaching here without it means the parse never
+    /// happened, so the line is unreviewed and refused.
+    fn plan_mode_access(&self) -> PlanModeAccess {
+        if !matches!(self.input, Input::Shell(_)) {
+            return PlanModeAccess::Standard;
+        }
+        match self
+            .prepared
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .map(|prepared| &prepared.execution)
+        {
+            Some(PreparedExecution::Shell(_, shell)) => {
+                let opaque =
+                    shell.analysis().opaque || shell_command_hides_operands(shell.command());
+                if read_only_shell::is_read_only(shell.analysis(), opaque) {
+                    PlanModeAccess::ReadOnly
+                } else {
+                    PlanModeAccess::Prompted
+                }
+            }
+            _ => PlanModeAccess::Refused,
+        }
     }
 
     fn preflight<'a>(
@@ -3720,6 +3746,128 @@ mod tests {
 
         assert!(done.is_error);
         assert!(done.output.as_text().contains("strict read-only mode"));
+        assert!(!target.exists());
+    }
+
+    const PLAN_MARKER: &str = "planned";
+    const PLAN_READ_COMMAND: &str = "ls";
+    const UNCLASSIFIED_COMMAND: &str = "true";
+    const UNCLASSIFIED_ALLOW_SCOPE: &str = "true";
+
+    fn shell_in_plan_mode(command: &str) -> caudra_agent::ToolDoneEvent {
+        let root = TempDir::new().expect("tempdir");
+        let (_host, registry) = host_and_registry(root.path());
+        let ctx = context_with_mode(
+            root.path(),
+            Arc::clone(&registry),
+            CancelToken::none(),
+            AgentMode::Plan(root.path().join("plan.md")),
+            DefaultEffect::Allow,
+        );
+
+        smol::block_on(caudra_agent::agent::tool_dispatch::run(
+            &registry,
+            None,
+            "shell-in-plan".into(),
+            "shell",
+            &json!({"command": command}),
+            &ctx,
+            caudra_agent::agent::tool_dispatch::Emit::Silent,
+        ))
+    }
+
+    /// Planning used to refuse every shell call, so a plan could not be
+    /// researched with the tools the repository already trusts.
+    #[test]
+    fn planning_runs_a_read_only_shell_command() {
+        let done = shell_in_plan_mode(PLAN_READ_COMMAND);
+
+        assert!(!done.is_error, "{}", done.output.as_text());
+    }
+
+    /// The allowlist does not have to be exhaustive because what it misses is
+    /// prompted rather than refused.
+    #[test]
+    fn planning_does_not_refuse_an_unclassified_shell_command_outright() {
+        let done = shell_in_plan_mode(UNCLASSIFIED_COMMAND);
+        let text = done.output.as_text();
+
+        assert!(
+            !text.contains(caudra_agent::tools::PLAN_WRITE_RESTRICTED),
+            "{text}"
+        );
+    }
+
+    /// A grant wide enough to cover the command must not carry it while
+    /// planning: an "allow always" answered in build mode would otherwise let a
+    /// plan run writes silently. Building runs it; planning forces the prompt,
+    /// and with no responder that means denied.
+    #[test_case(AgentMode::Build => false ; "building_uses_the_configured_allow")]
+    #[test_case(AgentMode::Plan(PathBuf::from("plan.md")) => true ; "planning_forces_the_prompt_anyway")]
+    fn a_configured_shell_allow_does_not_reach_a_plan(mode: AgentMode) -> bool {
+        let root = TempDir::new().expect("tempdir");
+        let (_host, registry) = host_and_registry(root.path());
+        let (tx, _rx) = flume::unbounded::<Envelope>();
+        let event_tx = EventSender::new(tx, 0);
+        let permissions = PermissionManager::new_nonpersistent(
+            PermissionsConfig {
+                rules: vec![PermissionRule {
+                    tool: ToolKey::native("shell"),
+                    scope: Some(UNCLASSIFIED_ALLOW_SCOPE.into()),
+                    effect: Effect::Allow,
+                }],
+                ..PermissionsConfig::default()
+            },
+            root.path().to_path_buf(),
+            Arc::default(),
+        );
+        let mut ctx = interpreter_ctx(
+            &mode,
+            &event_tx,
+            CancelToken::none(),
+            Arc::new(permissions),
+            Arc::new(FileReadTracker::new()),
+            None,
+            Arc::clone(&registry),
+        );
+        ctx.config.stale_read_check = false;
+
+        let done = smol::block_on(caudra_agent::agent::tool_dispatch::run(
+            &registry,
+            None,
+            "configured-shell".into(),
+            "shell",
+            &json!({"command": UNCLASSIFIED_COMMAND}),
+            &ctx,
+            caudra_agent::agent::tool_dispatch::Emit::Silent,
+        ));
+        done.is_error
+    }
+
+    #[test]
+    fn planning_still_refuses_a_write_outside_the_plan_file() {
+        let root = TempDir::new().expect("tempdir");
+        let (_host, registry) = host_and_registry(root.path());
+        let target = root.path().join("forged.txt");
+        let ctx = context_with_mode(
+            root.path(),
+            Arc::clone(&registry),
+            CancelToken::none(),
+            AgentMode::Plan(root.path().join("plan.md")),
+            DefaultEffect::Allow,
+        );
+
+        let done = smol::block_on(caudra_agent::agent::tool_dispatch::run(
+            &registry,
+            None,
+            "write-in-plan".into(),
+            "file_write",
+            &json!({"filePath": target, "content": PLAN_MARKER}),
+            &ctx,
+            caudra_agent::agent::tool_dispatch::Emit::Silent,
+        ));
+
+        assert!(done.is_error);
         assert!(!target.exists());
     }
 

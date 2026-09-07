@@ -259,6 +259,25 @@ impl Future for HeaderFuture {
     }
 }
 
+/// How a call may proceed while a plan is being written.
+///
+/// Plan mode otherwise judges a call by its registered effect, which is fixed
+/// before the input is parsed. These variants let a call that can only be
+/// judged from its parsed input say so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanModeAccess {
+    /// Nothing declared: the registered effect and mutation targets decide.
+    Standard,
+    /// Refused while planning, whatever the permissions would allow.
+    Refused,
+    /// Inspected and found to have no effects, so planning may run it under the
+    /// usual permission checks.
+    ReadOnly,
+    /// Effects are possible but unproven. Planning may run it only through a
+    /// prompt the user answers every time.
+    Prompted,
+}
+
 #[derive(Debug, Clone)]
 pub struct PermissionScopes {
     pub scopes: Vec<String>,
@@ -347,8 +366,11 @@ pub trait ToolInvocation: Send + Sync {
     fn read_targets(&self, _ctx: &ToolContext) -> Vec<PathBuf> {
         Vec::new()
     }
-    fn blocked_in_plan_mode(&self) -> bool {
-        false
+    /// How this call may proceed while a plan is being written. Consulted after
+    /// `preflight`, so an invocation that can only judge itself once its input
+    /// is parsed still gets to answer.
+    fn plan_mode_access(&self) -> PlanModeAccess {
+        PlanModeAccess::Standard
     }
     /// Effect of this one call. A tool whose commands do not share an effect
     /// registers its worst case and narrows here, so plan and read-only gating

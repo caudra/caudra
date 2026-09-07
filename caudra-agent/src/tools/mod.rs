@@ -21,8 +21,8 @@ pub use file_tracker::{FileReadTracker, STALE_READ_MSG};
 pub use path_locks::{PathGuards, PathLocks};
 pub use registry::{
     BoxFuture, ExecFuture, HeaderFuture, HeaderResult, ParseError, PermissionIntent,
-    PermissionScopes, RegisteredTool, RegistryError, Tool, ToolAudience, ToolEffect,
-    ToolExecResult, ToolInvocation, ToolRegistry, ToolSource,
+    PermissionScopes, PlanModeAccess, RegisteredTool, RegistryError, Tool, ToolAudience,
+    ToolEffect, ToolExecResult, ToolInvocation, ToolRegistry, ToolSource,
 };
 
 use std::collections::HashMap;

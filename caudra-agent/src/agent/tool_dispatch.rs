@@ -11,7 +11,7 @@ use tracing::{debug, error, warn};
 use crate::mcp::{McpSession, TOOL_SEARCH_TOOL_NAME, UNKNOWN_MCP};
 use crate::permissions::canonical_json;
 use crate::task_set::TaskSet;
-use crate::tools::registry::{ToolInvocation, ToolRegistry};
+use crate::tools::registry::{PlanModeAccess, ToolInvocation, ToolRegistry};
 use crate::tools::{
     DOOM_LOOP_MESSAGE, LocalToolEntry, READ_ONLY_TOOL_RESTRICTED, ToolContext, ToolEffect,
 };
@@ -237,25 +237,35 @@ async fn run_inner(
             return done_error(format!("{READ_ONLY_TOOL_RESTRICTED}: {name}"));
         }
 
-        let prepared_intent = match invocation.preflight(ctx).await {
+        let mut prepared_intent = match invocation.preflight(ctx).await {
             Ok(intent) => intent,
             Err(error) => return done_error(error),
         };
 
-        if ctx.mode.plan_path().is_some() && invocation.blocked_in_plan_mode() {
+        let planning = ctx.mode.plan_path().is_some();
+        let plan_access = invocation.plan_mode_access();
+        if planning && plan_access == PlanModeAccess::Refused {
             warn!(tool = %name, "blocked tool in plan mode");
             return done_error(crate::tools::PLAN_WRITE_RESTRICTED.into());
         }
+        // A plan-mode grant must not outlive the plan, so an "allow always"
+        // answered while building cannot silently cover this call.
+        if planning
+            && plan_access == PlanModeAccess::Prompted
+            && let Some(intent) = prepared_intent.as_mut()
+        {
+            intent.scopes.force_prompt = true;
+        }
 
         let mutation_targets = invocation.mutation_targets(ctx);
-        if ctx.mode.plan_path().is_some()
-            && !call_effect.is_safe_in_read_only()
-            && !entry.source.is_trusted()
-        {
+        if planning && !call_effect.is_safe_in_read_only() && !entry.source.is_trusted() {
             warn!(tool = %name, "blocked untrusted effect in plan mode");
             return done_error(crate::tools::PLAN_WRITE_RESTRICTED.into());
         }
-        if ctx.mode.plan_path().is_some()
+        // A call that named no target cannot be checked against the plan file,
+        // unless it already accounted for itself above.
+        if planning
+            && plan_access == PlanModeAccess::Standard
             && !call_effect.is_safe_in_read_only()
             && mutation_targets.is_empty()
         {

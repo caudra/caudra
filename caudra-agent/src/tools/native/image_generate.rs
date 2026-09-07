@@ -16,8 +16,8 @@ use serde_json::Value;
 
 use crate::tools::image_bytes::prepare;
 use crate::tools::registry::{
-    ExecFuture, HeaderFuture, HeaderResult, ParseError, PermissionScopes, Tool, ToolExecResult,
-    ToolInvocation,
+    ExecFuture, HeaderFuture, HeaderResult, ParseError, PermissionScopes, PlanModeAccess, Tool,
+    ToolExecResult, ToolInvocation,
 };
 use crate::tools::schema::{ParamKind, ParamSchema, Property, to_json_schema, validate};
 use crate::tools::{
@@ -175,8 +175,8 @@ impl ToolInvocation for ImageGenerateCall {
         self.references.iter().map(PathBuf::from).collect()
     }
 
-    fn blocked_in_plan_mode(&self) -> bool {
-        true
+    fn plan_mode_access(&self) -> PlanModeAccess {
+        PlanModeAccess::Refused
     }
 
     fn permission_scopes(&self) -> BoxFuture<'_, Option<PermissionScopes>> {
@@ -464,6 +464,6 @@ mod tests {
     #[test]
     fn generation_is_blocked_in_plan_mode() {
         let parsed = call(serde_json::json!({"prompt": PROMPT, "out": "a.png"})).unwrap();
-        assert!(parsed.blocked_in_plan_mode());
+        assert_eq!(parsed.plan_mode_access(), PlanModeAccess::Refused);
     }
 }
