@@ -10,13 +10,18 @@ version.workspace = true
 
 [features]
 default = []
+# Repository history signals. Optional because the graph is complete without them: a caller with no
+# repository, or one that does not want to pay for a history walk, gets the same symbol graph.
+git = ["dep:gix"]
 
 [dependencies]
+gix = { workspace = true, optional = true }
 tree-sitter.workspace = true
 workcell-source-languages.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true

@@ -19,6 +19,8 @@
 //! surface that reports one says so. A zero means "none found", never "none exists".
 
 pub mod extract;
+#[cfg(feature = "git")]
+pub mod git;
 pub mod ingest;
 pub mod model;
 pub mod rank;
@@ -26,6 +28,10 @@ pub mod resolve;
 pub mod retrieve;
 
 pub use extract::{ExtractLimits, FileFacts};
+#[cfg(feature = "git")]
+pub use git::{
+    CoChange, History, HistoryLimits, Signals, Truncation, Unavailable, signals, teleport_for_paths,
+};
 pub use ingest::{IngestLimits, IngestTruncation, Ingested, SourceInput, ingest};
 pub use model::{
     ByteSpan, Definition, Facts, FileId, LineSpan, Metrics, NodeId, Reference, SkipReason,

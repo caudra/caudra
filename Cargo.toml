@@ -63,6 +63,7 @@ lru = "0.18.1"
 # workspace, linking the interpreter into the server binary for every `--workspace` build.
 monty-pool = "=0.0.21"
 monty-types = "=0.0.21"
+gix = { version = "0.87.1", default-features = false, features = ["sha1", "max-performance-safe"] }
 proptest = "1.11.0"
 regex = "1.13.1"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls", "stream"] }

@@ -15,7 +15,7 @@ CODE_WORKER_BUILD ?= target/code-worker-build
 CODE_WORKER ?= $(CODE_WORKER_ROOT)/bin/monty
 BUNDLED_CODE_WORKER_ENV := WORKCELL_BUNDLED_MONTY_WORKER
 
-.PHONY: help code-worker fmt fmt-check check check-native clippy test build release ci install run run-web clean docker-build docker-smoke docker-run
+.PHONY: help code-worker fmt fmt-check check check-native clippy test test-optional-features build release ci install run run-web clean docker-build docker-smoke docker-run
 
 # Cargo wants one comma-separated `--features` value; Make can only build that from a word list.
 comma := ,
@@ -146,8 +146,15 @@ clippy:
 
 # Build-time bundling is separate from the runtime override, so tests exercise both embedded and
 # explicit-path worker sources without leaking operator configuration into CLI tests.
-test: code-worker
+test: code-worker test-optional-features
 	$(BUNDLED_CODE_WORKER_ENV)="$(abspath $(CODE_WORKER))" $(CARGO) test --workspace --locked
+
+# Optional features are dark to `--workspace` until something in the workspace turns them on, and a
+# feature nothing exercises is a feature nothing protects. These run the crates that carry one.
+test-optional-features:
+	$(CARGO) test --locked --package workcell-code-graph --features git
+	$(CARGO) clippy --locked --all-targets --package workcell-code-graph --features git \
+		-- -D warnings
 
 build:
 	$(CARGO) build --workspace --locked
