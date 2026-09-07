@@ -5,7 +5,7 @@
 //! Output is a sorted top-K. A sort has no tolerance band, so the contract is byte-identity: the
 //! same graph produces the same ordering on every run, on every machine.
 //!
-//! Three rules hold it up here:
+//! Four rules hold it up here:
 //!
 //! 1. **Fixed contiguous block partitioning.** [`REDUCTION_BLOCK`] is a constant. The obvious
 //!    "improvement" is to derive it from the machine — `available_parallelism`, a core count, a
@@ -19,10 +19,18 @@
 //! 2. **Every global reduction sums fixed per-block partials in canonical block order.** Never an
 //!    accumulating scalar over the whole vector, and never an atomic float add.
 //! 3. **The rank vector is `f64`.**
+//! 4. **No `algebraic_*` float operation anywhere in this module.** Ripwire's fourth rule was to
+//!    compile the PageRank translation unit without `-ffast-math`. Rust has no such flag and no
+//!    per-function or per-crate equivalent, so for a long time this rule had no analogue. It does
+//!    now: Rust 1.98 — the version this workspace pins — stabilized `f64::algebraic_add` and its
+//!    siblings as safe const methods. They permit exactly the reassociation rule 1 exists to
+//!    prevent, and the standard library documents their results as differing across optimization
+//!    levels, `-C target-cpu`, compiler versions, and even between two call sites in one binary.
 //!
-//! Rust has no fast-math flag, so ripwire's fourth rule — compile the PageRank translation unit
-//! without floating-point reassociation — has no analogue: rustc never reassociates float
-//! arithmetic. That failure mode simply does not exist here.
+//!    The opt-in is per-operation rather than per-build, which makes it worse here, not better. A
+//!    contributor vectorizing the dangling-mass reduction with `sum.algebraic_add(x)` changes one
+//!    token, gets a real speedup, keeps every local test green, and destroys the contract in the
+//!    same review-invisible way rule 1 describes. Reach for them anywhere else; not here.
 
 use crate::{model::NodeId, resolve::Graph};
 
@@ -290,6 +298,42 @@ mod tests {
         model::Facts,
         resolve::resolve,
     };
+
+    #[test]
+    fn reassociating_float_operations_are_absent_from_every_ranking_module() {
+        // Rule 4 of the determinism contract, mechanically. A doc comment cannot stop a one-token
+        // change that measurably speeds up a reduction and leaves every other test green, so this
+        // reads the source and refuses the token outright.
+        //
+        // These are the modules whose float arithmetic feeds a sort with no tolerance band. A new
+        // one belongs on this list.
+        let sources = [
+            ("rank.rs", include_str!("rank.rs")),
+            ("resolve.rs", include_str!("resolve.rs")),
+            ("retrieve.rs", include_str!("retrieve.rs")),
+        ];
+        // Split so this test does not match itself.
+        let needle = concat!("algebraic", "_");
+
+        let offenders: Vec<String> = sources
+            .iter()
+            .flat_map(|(name, source)| {
+                source
+                    .lines()
+                    .enumerate()
+                    .filter(|(_, line)| !line.trim_start().starts_with("//"))
+                    .filter(|(_, line)| line.contains(needle))
+                    .map(move |(index, line)| format!("{name}:{}: {}", index + 1, line.trim()))
+            })
+            .collect();
+
+        assert!(
+            offenders.is_empty(),
+            "these operations permit reassociation and contraction, which breaks byte-identity \
+             across optimization levels and target CPUs:\n{}",
+            offenders.join("\n")
+        );
+    }
 
     fn build(files: &[(&str, &str)]) -> (Facts, Graph) {
         let inputs = files
