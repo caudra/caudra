@@ -6076,3 +6076,89 @@ fn a_streaming_write_redraws_once_a_frame_not_once_a_fragment() {
     render(&mut panel, 80, WRITTEN_FILE_LINES as u16 + 8);
     assert!(rows(&panel) > settled, "{LIVE_WHOLE_MSG}");
 }
+
+const RATE_UNSET_MSG: &str = "one sample measures no interval, so there is no rate to show";
+const RATE_HELD_MSG: &str = "a frame under the sample window must extend the window, not reset it";
+const RATE_CLEARED_MSG: &str = "a finished prefill leaves no rate behind";
+const NARROW_RATE_MSG: &str = "a narrow viewport keeps the bar and drops the detail";
+const BAR_ALWAYS_MSG: &str = "the progress bar is drawn at every width";
+const BAR_WIDTH: u16 = 8;
+
+fn rate_at(samples: &[(u32, u64)]) -> Option<String> {
+    let start = std::time::Instant::now();
+    let mut rate = PromptRate::default();
+    for (processed, millis) in samples {
+        rate.sample(*processed, start + Duration::from_millis(*millis));
+    }
+    rate.label()
+}
+
+#[test]
+fn a_single_prompt_progress_frame_reports_no_rate() {
+    assert_eq!(rate_at(&[(0, 0)]), None, "{RATE_UNSET_MSG}");
+}
+
+#[test_case(&[(0, 0), (1_000, 500)] => Some(" 2.0k tok/s ·".to_owned()) ; "first_sample_is_the_measurement")]
+#[test_case(&[(0, 0), (1_000, 500), (3_000, 1_000)] => Some(" 2.6k tok/s ·".to_owned()) ; "later_samples_are_smoothed_toward_the_new_rate")]
+#[test_case(&[(0, 0), (100, 500)] => Some(" 200 tok/s ·".to_owned()) ; "sub_kilo_rates_keep_whole_tokens")]
+fn prompt_rate_reports_observed_throughput(samples: &[(u32, u64)]) -> Option<String> {
+    rate_at(samples)
+}
+
+/// The server reports every chunk boundary, and some land far closer together
+/// than the window. Discarding those would leave a fast prefill with no rate.
+#[test]
+fn frames_below_the_sample_window_accumulate_into_one_measurement() {
+    assert_eq!(
+        rate_at(&[(0, 0), (50, 50), (100, 200)]),
+        Some(" 500 tok/s ·".to_owned()),
+        "{RATE_HELD_MSG}"
+    );
+}
+
+#[test]
+fn clearing_prompt_progress_drops_the_rate() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    let start = std::time::Instant::now();
+    panel.prompt_rate.sample(0, start);
+    panel
+        .prompt_rate
+        .sample(1_000, start + Duration::from_millis(500));
+    panel.set_prompt_progress(None);
+
+    assert_eq!(panel.prompt_rate.label(), None, "{RATE_CLEARED_MSG}");
+}
+
+#[test_case(120 => true ; "wide_enough_for_both")]
+#[test_case(20 => false ; "too_narrow_for_the_detail")]
+fn the_rate_yields_to_the_bar_when_the_viewport_is_narrow(width: u16) -> bool {
+    fits(" 2.5k tok/s \u{b7}", BAR_WIDTH, width)
+}
+
+/// The bar is the answer and survives every width; the rate is the detail.
+#[test_case(120, true ; "wide_viewport_shows_both")]
+#[test_case(24, false ; "narrow_viewport_shows_the_bar_alone")]
+fn a_prefilling_prompt_draws_its_rate_beside_the_bar(width: u16, shows_rate: bool) {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    // An empty transcript draws the splash instead, and the splash owns the
+    // whole viewport.
+    panel.streaming_text.set_buffer("prefilling\n");
+    let start = std::time::Instant::now();
+    panel.prompt_rate.sample(0, start);
+    panel
+        .prompt_rate
+        .sample(1_000, start + Duration::from_millis(500));
+    panel.set_prompt_progress(Some(PromptProgress {
+        processed: 1_000,
+        total: 4_000,
+        cache: 0,
+    }));
+
+    let text = buffer_text(&render(&mut panel, width, 8));
+
+    assert!(
+        text.contains(PROMPT_PROGRESS_LABEL.trim()),
+        "{BAR_ALWAYS_MSG}"
+    );
+    assert_eq!(text.contains("2.0k tok/s"), shows_rate, "{NARROW_RATE_MSG}");
+}
