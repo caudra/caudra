@@ -11,7 +11,7 @@ mod clipboard;
 mod clock;
 mod color_compat;
 mod components;
-pub use components::command::{BUILTIN_COMMANDS, BuiltinCommand};
+pub use components::command::{BUILTIN_COMMANDS, BuiltinCommand, ChatScope};
 pub use components::keybindings;
 mod exit_summary;
 pub use exit_summary::ExitSummary;

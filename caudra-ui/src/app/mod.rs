@@ -161,6 +161,7 @@ const NOTIFICATION_PREVIEW_CHARS: usize = 200;
 /// error instead of ping-ponging with the Lua thread forever.
 pub(crate) const MAX_COMMAND_DEPTH: u8 = 8;
 pub(crate) const COMMAND_DEPTH_MSG: &str = "slash command nested too deeply (alias cycle?)";
+pub(crate) const MAIN_ONLY_CMD_MSG: &str = "Command applies to the main session";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Notification {
@@ -633,6 +634,19 @@ impl App {
         }
     }
 
+    /// The palette follows whichever composer is on screen, and learns from
+    /// the same call whether a task owns it, so the dropdown can never style
+    /// itself for a chat it is no longer attached to.
+    fn sync_command_palette(&mut self, text: &str) {
+        let task_focused = !self.is_main_chat();
+        self.command_palette.sync(text, task_focused);
+    }
+
+    fn resync_command_palette(&mut self) {
+        let text = self.active_input_box().palette_text();
+        self.sync_command_palette(&text);
+    }
+
     fn sync_subagent_input_target(&mut self) {
         let next = self.active_subagent_id().map(str::to_owned);
         if self.subagent_input_task == next {
@@ -653,6 +667,9 @@ impl App {
             .unwrap_or_default();
         self.subagent_input_box.set_draft(draft);
         self.subagent_input_task = next;
+        // Runs on every chat switch, so this is the single point that stops a
+        // dropdown opened over one composer from surviving into another.
+        self.resync_command_palette();
     }
 
     fn plan_form_active(&self) -> bool {
@@ -1052,12 +1069,10 @@ impl App {
                 PasteEditorAction::Consumed => {}
                 PasteEditorAction::Cancel => self.paste_editor.close(),
                 PasteEditorAction::Save { target, id, text } => {
-                    let updated = self.active_input_target() == Some(target)
+                    if self.active_input_target() == Some(target)
                         && self.active_input_box_mut().update_paste(id, &text)
-                        && self.is_main_chat();
-                    if updated {
-                        let palette_text = self.input_box.palette_text();
-                        self.command_palette.sync(&palette_text);
+                    {
+                        self.resync_command_palette();
                     }
                     self.paste_editor.close();
                 }
@@ -1283,13 +1298,14 @@ impl App {
         match action {
             CommandAction::Consumed => Some(Vec::new()),
             CommandAction::Execute(cmd) => {
-                self.input_box.discard();
+                self.active_input_box_mut().discard();
                 Some(self.execute_command(cmd, 0))
             }
             CommandAction::Complete(text) => {
-                self.command_palette.sync(&text);
-                self.input_box.set_input(text);
-                self.input_box.buffer.move_to_end();
+                self.sync_command_palette(&text);
+                let input = self.active_input_box_mut();
+                input.set_input(text);
+                input.buffer.move_to_end();
                 Some(Vec::new())
             }
             CommandAction::Passthrough => None,
@@ -1349,9 +1365,9 @@ impl App {
             WorkbenchAction::SendToComposer(text) => {
                 self.workbench.close();
                 if let InputAction::PaletteSync(val) =
-                    self.input_box.handle_paste_with_spaces(&text)
+                    self.active_input_box_mut().handle_paste_with_spaces(&text)
                 {
-                    self.command_palette.sync(&val);
+                    self.sync_command_palette(&val);
                 }
             }
         }
@@ -1364,9 +1380,9 @@ impl App {
             FilePickerModalAction::Select(path) => {
                 self.file_picker.close();
                 if let InputAction::PaletteSync(val) =
-                    self.input_box.handle_paste_with_spaces(&path)
+                    self.active_input_box_mut().handle_paste_with_spaces(&path)
                 {
-                    self.command_palette.sync(&val);
+                    self.sync_command_palette(&val);
                 }
             }
             FilePickerModalAction::Close => self.file_picker.close(),
@@ -1629,7 +1645,8 @@ impl App {
     pub(crate) fn run_builtin(&mut self, action: BuiltinAction) -> Vec<Action> {
         match action {
             BuiltinAction::CommandPalette => {
-                let rows = self.command_palette.rows();
+                let task_focused = !self.is_main_chat();
+                let rows = self.command_palette.rows(task_focused);
                 self.command_modal.open(rows);
             }
             BuiltinAction::FilePicker => {
@@ -1792,6 +1809,12 @@ impl App {
             return vec![];
         }
 
+        // Ahead of the main/task split so the editing chords answer the same
+        // way in every chat instead of only in the transcript.
+        if is_ctrl(&key) {
+            return self.handle_ctrl_key(key);
+        }
+
         if !self.is_main_chat() {
             if self.active_subagent_can_steer() {
                 return self.handle_subagent_chat_key(key);
@@ -1920,10 +1943,21 @@ impl App {
     }
 
     fn handle_subagent_chat_key(&mut self, key: KeyEvent) -> Vec<Action> {
+        let command_action = self
+            .command_palette
+            .handle_key(key, &self.subagent_input_box.buffer.value());
+        if let Some(actions) = self.handle_command_action(command_action) {
+            return actions;
+        }
+
         match self.subagent_input_box.handle_key(key) {
             InputAction::Submit(sub) => self.handle_subagent_submit(sub),
             InputAction::EditPaste(id) => {
                 self.open_paste_editor(id);
+                vec![]
+            }
+            InputAction::PaletteSync(val) => {
+                self.sync_command_palette(&val);
                 vec![]
             }
             InputAction::Passthrough(key) => match key.code {
@@ -1940,8 +1974,39 @@ impl App {
                 }
                 _ => vec![],
             },
-            InputAction::ContinueLine | InputAction::PaletteSync(_) | InputAction::None => vec![],
+            InputAction::ContinueLine | InputAction::None => vec![],
         }
+    }
+
+    /// Editing chords belong to whichever composer is on screen, so the
+    /// transcript and a focused task get the same set rather than the task
+    /// view silently dropping half of them. The plan editor and search need no
+    /// composer; the rest would otherwise type into a box nobody is drawing.
+    fn handle_ctrl_key(&mut self, key: KeyEvent) -> Vec<Action> {
+        if key::OPEN_EDITOR.matches(key) {
+            return self.run_builtin(BuiltinAction::PlanEditor);
+        }
+        if key::SEARCH.matches(key) {
+            return self.run_builtin(BuiltinAction::Search);
+        }
+        if !self.composer_is_visible() {
+            return vec![];
+        }
+        if key::FILE_PICKER.matches(key) {
+            return self.run_builtin(BuiltinAction::FilePicker);
+        }
+        if key.code == KeyCode::Char('v') && self.image_paste_rx.is_empty() {
+            self.start_image_paste();
+        } else if let InputAction::PaletteSync(val) = self.active_input_box_mut().handle_key(key) {
+            self.sync_command_palette(&val);
+        }
+        vec![]
+    }
+
+    /// Whether a composer is drawn, which is what
+    /// [`crate::app::view`] renders on and therefore what may take text.
+    fn composer_is_visible(&self) -> bool {
+        self.is_main_chat() || self.active_subagent_can_steer() || self.queue_editor_active()
     }
 
     fn handle_subagent_submit(&mut self, sub: Submission) -> Vec<Action> {
@@ -1952,25 +2017,39 @@ impl App {
             self.focus_active_queue();
             return vec![];
         }
-        if sub.text.trim().is_empty() || !sub.images.is_empty() {
+        if sub.text.trim().is_empty() {
             return vec![];
         }
         let Some(task_id) = self.active_subagent_id().map(str::to_owned) else {
             return vec![];
         };
-        let Some(tx) = self.subagent_steers.get(&task_id) else {
-            self.subagent_input_box.set_draft(sub.draft);
-            return vec![];
-        };
         let Submission {
             text,
-            images: _,
+            images,
             draft,
         } = sub;
+        self.steer_task(&task_id, text, images, draft)
+    }
+
+    /// The one place a steer reaches a running task, shared by the composer
+    /// and by commands that expand into a prompt, so neither can drift from
+    /// the queue bookkeeping the panel renders from. Returns the draft to the
+    /// composer when the task stopped being steerable.
+    fn steer_task(
+        &mut self,
+        task_id: &str,
+        text: String,
+        images: Vec<ImageSource>,
+        draft: InputDraft,
+    ) -> Vec<Action> {
+        let Some(tx) = self.subagent_steers.get(task_id) else {
+            self.subagent_input_box.set_draft(draft);
+            return vec![];
+        };
         let input = AgentInput {
             message: text.clone(),
             mode: AgentMode::Build,
-            images: Vec::new(),
+            images,
             preamble: Vec::new(),
             thinking: self.state.thinking.clone(),
             fast: self.state.fast,
@@ -1979,7 +2058,7 @@ impl App {
         };
         let id = tx.push(input);
         self.pending_subagent_steers
-            .entry(task_id)
+            .entry(task_id.to_owned())
             .or_default()
             .push_back(PendingSteer { id, text, draft });
         vec![]
@@ -2053,21 +2132,6 @@ impl App {
     }
 
     fn handle_main_chat_key(&mut self, key: KeyEvent) -> Vec<Action> {
-        if is_ctrl(&key) {
-            if key::OPEN_EDITOR.matches(key) {
-                return self.run_builtin(BuiltinAction::PlanEditor);
-            } else if key::SEARCH.matches(key) {
-                return self.run_builtin(BuiltinAction::Search);
-            } else if key::FILE_PICKER.matches(key) {
-                return self.run_builtin(BuiltinAction::FilePicker);
-            } else if key.code == KeyCode::Char('v') && self.image_paste_rx.is_empty() {
-                self.start_image_paste();
-            } else if let InputAction::PaletteSync(val) = self.input_box.handle_key(key) {
-                self.command_palette.sync(&val);
-            }
-            return vec![];
-        }
-
         if key.code == KeyCode::Enter
             && key.modifiers.is_empty()
             && let Some(id) = self.input_box.buffer.focused_paste()
@@ -2103,7 +2167,7 @@ impl App {
                 vec![]
             }
             InputAction::PaletteSync(val) => {
-                self.command_palette.sync(&val);
+                self.sync_command_palette(&val);
                 vec![]
             }
             InputAction::Passthrough(key) => {
@@ -2962,6 +3026,9 @@ impl App {
             .command_palette
             .resolve(&format!("/{}", name.trim_start_matches('/')))
             .ok_or_else(|| format!("unknown command '{name}'"))?;
+        if self.command_is_out_of_scope(&resolved) {
+            return Err(MAIN_ONLY_CMD_MSG.to_string());
+        }
         Ok(self.execute_command(
             ParsedCommand {
                 name: resolved,
@@ -2971,9 +3038,20 @@ impl App {
         ))
     }
 
+    /// A command whose effect lands on the main session's turn or history has
+    /// no meaning while a task owns the screen, so it says so instead of
+    /// acting somewhere the user is not looking.
+    fn command_is_out_of_scope(&self, name: &str) -> bool {
+        !self.is_main_chat() && self.command_palette.is_main_only(name)
+    }
+
     /// {depth} is the `caudra.api.run_command` hop count, forwarded to a Lua
     /// handler so an alias cycle keeps counting. 0 when the user typed it.
     fn execute_command(&mut self, cmd: ParsedCommand, depth: u8) -> Vec<Action> {
+        if self.command_is_out_of_scope(&cmd.name) {
+            self.flash(MAIN_ONLY_CMD_MSG.into());
+            return vec![];
+        }
         match cmd.name.as_str() {
             "/compact" => {
                 if self.status == Status::Streaming {
@@ -3237,13 +3315,22 @@ impl App {
         result
     }
 
+    /// A template expands into a prompt, so it follows the composer it was
+    /// typed in: a steerable task takes it as a steer, and everything else
+    /// falls back to the main session.
     fn execute_custom_command(&mut self, name: &str, args: &str) -> Vec<Action> {
         let Some(cmd) = self.command_palette.find_custom_command(name) else {
             self.flash(format!("Unknown command: {name}"));
             return vec![];
         };
+        let text = cmd.render(args);
+        if let Some(task_id) = self.active_subagent_id().map(str::to_owned)
+            && self.subagent_steers.contains_key(&task_id)
+        {
+            return self.steer_task(&task_id, text, Vec::new(), InputDraft::default());
+        }
         self.submit_or_queue(QueuedMessage {
-            text: cmd.render(args),
+            text,
             images: Vec::new(),
             paste_ranges: Vec::new(),
         })
@@ -3725,14 +3812,12 @@ impl App {
         try_picker!(self.session_picker);
         try_picker!(self.question_form);
         try_picker!(self.login_picker);
-        if !self.is_main_chat() {
-            if self.active_subagent_can_steer() || self.queue_editor_active() {
-                let _ = self.subagent_input_box.handle_paste(text);
-            }
+        if !self.is_main_chat() && !(self.active_subagent_can_steer() || self.queue_editor_active())
+        {
             return;
         }
-        if let InputAction::PaletteSync(val) = self.input_box.handle_paste(text) {
-            self.command_palette.sync(&val);
+        if let InputAction::PaletteSync(val) = self.active_input_box_mut().handle_paste(text) {
+            self.sync_command_palette(&val);
         }
     }
 
@@ -3755,15 +3840,22 @@ impl App {
         }
     }
 
+    /// What the external editor opens on, paired with
+    /// [`App::apply_external_input`] so a round trip cannot read one composer
+    /// and write another.
+    pub(crate) fn active_input_text(&self) -> String {
+        self.active_input_box().expanded_text()
+    }
+
     pub(crate) fn apply_external_input(&mut self, previous: &str, edited: String) {
         let edited = edited.replace("\r\n", "\n").replace('\r', "\n");
         if edited == previous {
             return;
         }
-        self.input_box.set_input(edited);
-        self.input_box.move_to_end();
-        let palette_text = self.input_box.palette_text();
-        self.command_palette.sync(&palette_text);
+        let input = self.active_input_box_mut();
+        input.set_input(edited);
+        input.move_to_end();
+        self.resync_command_palette();
     }
 
     fn handle_plan_form_action(&mut self, action: PlanFormAction) -> Vec<Action> {

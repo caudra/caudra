@@ -162,10 +162,7 @@ impl App {
         };
         self.active_input_box_mut()
             .set_state(InputState::new(draft, images));
-        if self.is_main_chat() {
-            let palette_text = self.input_box.palette_text();
-            self.command_palette.sync(&palette_text);
-        }
+        self.resync_command_palette();
     }
 
     fn report(&mut self, error: PromptStashError) -> Vec<Action> {

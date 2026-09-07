@@ -25,6 +25,8 @@ const MIN_WIDTH_PERCENT: u16 = 65;
 const MAX_HEIGHT_PERCENT: u16 = 80;
 const SEARCH_ROW: u16 = 1;
 const DETAIL_RIGHT_PAD: u16 = 1;
+const DETAIL_DIM: f32 = 0.4;
+pub(crate) const DISABLED_DIM: f32 = 0.45;
 
 pub trait PickerItem {
     fn label(&self) -> &str;
@@ -41,6 +43,11 @@ pub trait PickerItem {
         false
     }
     fn is_highlighted(&self) -> bool {
+        false
+    }
+    /// Rendered dimmed to say "listed here, but inert in this context". The
+    /// row stays selectable so whoever owns the action can explain the refusal.
+    fn is_disabled(&self) -> bool {
         false
     }
 }
@@ -951,15 +958,19 @@ fn render_list<T: PickerItem>(
 
         let highlighted = item.is_highlighted();
         let t = theme::current();
-        let (style, detail_style) = match (i == selected, highlighted) {
+        let (mut style, mut detail_style) = match (i == selected, highlighted) {
             (true, true) => {
                 let s = t.item_selected.fg(t.accent.fg.unwrap_or(t.foreground));
-                (s, theme::dim_style(s, 0.4))
+                (s, theme::dim_style(s, DETAIL_DIM))
             }
             (true, false) => (t.item_selected, t.item_selected),
-            (false, true) => (t.accent, theme::dim_style(t.accent, 0.4)),
+            (false, true) => (t.accent, theme::dim_style(t.accent, DETAIL_DIM)),
             (false, false) => (t.item, t.item_desc),
         };
+        if item.is_disabled() {
+            style = theme::dim_style(style, DISABLED_DIM);
+            detail_style = theme::dim_style(detail_style, DISABLED_DIM);
+        }
         let checkbox = enabled.map(|en| {
             let sym = if en[item_idx] { "✓ " } else { "✗ " };
             let sty = if i == selected {

@@ -56,7 +56,7 @@ impl App {
                     if !self.state.model.supports_vision() {
                         self.status_bar.flash(IMAGE_NOT_SUPPORTED_MSG.into());
                     } else {
-                        self.input_box.attach_image(source);
+                        self.active_input_box_mut().attach_image(source);
                         self.status_bar.flash("Image attached".into());
                     }
                 }

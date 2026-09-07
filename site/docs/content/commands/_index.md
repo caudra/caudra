@@ -11,41 +11,43 @@ Type `/` in the input box to open the command palette.
 
 ## Built-in commands
 
-| Command | Description |
-|---------|-------------|
-| `/compact` | Summarize and compact conversation history |
-| `/new` | Start a new session |
-| `/help` | Show keybindings |
-| `/usage` | Show token usage breakdown |
-| `/context` | Inspect active context window usage |
-| `/queue` | Inspect and edit queued prompts |
-| `/stash` | Park the current prompt draft for later |
-| `/stash-pop` | Restore the most recently stashed prompt |
-| `/stash-list` | Browse stashed prompts |
-| `/memory` | View, edit, and delete memory files |
-| `/tasks` | Browse tasks and steer running subagents |
-| `/sessions` | Browse and switch sessions |
-| `/rename` | Rename the current session |
-| `/model` | Switch model |
-| `/system-prompt` | Switch system prompt profile |
-| `/review` | Review the last reply passage by passage |
-| `/theme` | Switch color theme |
-| `/view` | Cycle transcript: auto / compact / expanded |
-| `/mcp` | Configure MCP servers |
-| `/permissions` | Inspect active conversation permission rules |
-| `/login` | Authenticate with an LLM provider |
-| `/cd` | Change working directory |
-| `/btw` | Ask a quick question (no tools, no history pollution) |
-| `/goal` | Work until a completion condition is met |
-| `/goal-clear` | Stop the active completion goal |
-| `/goal-model` | Choose the completion goal evaluator |
-| `/yolo` | Toggle YOLO mode (skip all permission prompts) |
-| `/thinking` | Set reasoning (off, adaptive/provider default, effort, or token budget) |
-| `/fast` | Toggle Anthropic fast mode (Opus only) |
-| `/workflow` | Toggle workflow context for custom Lua tools |
-| `/exit` | Exit the application |
-| `/reload` | Reload plugins and config |
-| `/workbench` | Open the file explorer, editor and source control view |
+Commands marked Main only act on the main session's turn or history. They stay listed while a task transcript is open, drawn dimmed, and report their scope rather than running. See [Tasks](#tasks).
+
+| Command | Description | Scope |
+|---------|-------------|-------|
+| `/compact` | Summarize and compact conversation history | Main only |
+| `/new` | Start a new session |  |
+| `/help` | Show keybindings |  |
+| `/usage` | Show token usage breakdown |  |
+| `/context` | Inspect active context window usage |  |
+| `/queue` | Inspect and edit queued prompts |  |
+| `/stash` | Park the current prompt draft for later |  |
+| `/stash-pop` | Restore the most recently stashed prompt |  |
+| `/stash-list` | Browse stashed prompts |  |
+| `/memory` | View, edit, and delete memory files |  |
+| `/tasks` | Browse tasks and steer running subagents |  |
+| `/sessions` | Browse and switch sessions |  |
+| `/rename` | Rename the current session |  |
+| `/model` | Switch model | Main only |
+| `/system-prompt` | Switch system prompt profile | Main only |
+| `/review` | Review the last reply passage by passage |  |
+| `/theme` | Switch color theme |  |
+| `/view` | Cycle transcript: auto / compact / expanded |  |
+| `/mcp` | Configure MCP servers |  |
+| `/permissions` | Inspect active conversation permission rules |  |
+| `/login` | Authenticate with an LLM provider |  |
+| `/cd` | Change working directory |  |
+| `/btw` | Ask a quick question (no tools, no history pollution) | Main only |
+| `/goal` | Work until a completion condition is met | Main only |
+| `/goal-clear` | Stop the active completion goal | Main only |
+| `/goal-model` | Choose the completion goal evaluator | Main only |
+| `/yolo` | Toggle YOLO mode (skip all permission prompts) |  |
+| `/thinking` | Set reasoning (off, adaptive/provider default, effort, or token budget) |  |
+| `/fast` | Toggle Anthropic fast mode (Opus only) |  |
+| `/workflow` | Toggle workflow context for custom Lua tools | Main only |
+| `/exit` | Exit the application |  |
+| `/reload` | Reload plugins and config |  |
+| `/workbench` | Open the file explorer, editor and source control view |  |
 
 ## Sessions
 
@@ -66,6 +68,10 @@ Stashing is for drafts you do not want to send yet. To line up prompts Caudra sh
 Each `task` subagent has a separate transcript. Open the task picker with `/tasks` or `Ctrl+X a`, click the task count above the input, or click a task call in the main chat. Click `[< Main]` in a task's status bar to return. The picker also lists Main and supports previewing every transcript.
 
 An input box appears while the focused task is running. Press Enter to queue guidance for its next turn boundary. Pending guidance stays visible above the input until the subagent consumes it. Task transcripts survive session reloads, and later `task` calls can continue one by passing its `task_id`.
+
+That input box is a full composer. Typing `/` opens the palette, `Ctrl+S` inserts a file path, `Ctrl+X e` edits the draft in your editor, and `Ctrl+V` attaches an image to the guidance. A custom `/project:` or `/user:` command expands its template and steers the focused task rather than the main session.
+
+Commands that reach the main session's turn or history have no task equivalent, so `/compact`, `/model`, `/system-prompt`, `/workflow`, `/btw`, the `/goal` family, and MCP prompts are drawn dimmed and report their scope when run. Return to Main to use them. `/context`, `/queue`, `/review`, and the stash commands already follow the focused transcript.
 
 ## Completion goals
 

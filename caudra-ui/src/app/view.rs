@@ -319,6 +319,7 @@ impl App {
                     !self.any_overlay_open(),
                     None,
                 );
+                self.command_palette.view(frame, layout.input_area);
             } else {
                 let sep = Block::default()
                     .borders(Borders::TOP)

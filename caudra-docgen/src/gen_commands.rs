@@ -1,6 +1,8 @@
 use std::fmt::Write;
 
-use caudra_ui::BUILTIN_COMMANDS;
+use caudra_ui::{BUILTIN_COMMANDS, ChatScope};
+
+const MAIN_ONLY_MARK: &str = "Main only";
 
 const ALIASING: &str = r#"## Aliasing commands
 
@@ -83,10 +85,23 @@ const TASKS: &str = r#"## Tasks
 
 Each `task` subagent has a separate transcript. Open the task picker with `/tasks` or `Ctrl+X a`, click the task count above the input, or click a task call in the main chat. Click `[< Main]` in a task's status bar to return. The picker also lists Main and supports previewing every transcript.
 
-An input box appears while the focused task is running. Press Enter to queue guidance for its next turn boundary. Pending guidance stays visible above the input until the subagent consumes it. Task transcripts survive session reloads, and later `task` calls can continue one by passing its `task_id`."#;
+An input box appears while the focused task is running. Press Enter to queue guidance for its next turn boundary. Pending guidance stays visible above the input until the subagent consumes it. Task transcripts survive session reloads, and later `task` calls can continue one by passing its `task_id`.
 
-fn write_row(out: &mut String, name: &str, description: &str) {
-    writeln!(out, "| `{name}` | {} |", description.replace('|', "\\|")).unwrap();
+That input box is a full composer. Typing `/` opens the palette, `Ctrl+S` inserts a file path, `Ctrl+X e` edits the draft in your editor, and `Ctrl+V` attaches an image to the guidance. A custom `/project:` or `/user:` command expands its template and steers the focused task rather than the main session.
+
+Commands that reach the main session's turn or history have no task equivalent, so `/compact`, `/model`, `/system-prompt`, `/workflow`, `/btw`, the `/goal` family, and MCP prompts are drawn dimmed and report their scope when run. Return to Main to use them. `/context`, `/queue`, `/review`, and the stash commands already follow the focused transcript."#;
+
+fn write_row(out: &mut String, name: &str, description: &str, scope: ChatScope) {
+    let scope = match scope {
+        ChatScope::Any => "",
+        ChatScope::MainOnly => MAIN_ONLY_MARK,
+    };
+    writeln!(
+        out,
+        "| `{name}` | {} | {scope} |",
+        description.replace('|', "\\|")
+    )
+    .unwrap();
 }
 
 pub fn generate() -> String {
@@ -109,10 +124,16 @@ pub fn generate() -> String {
 
     writeln!(out, "## Built-in commands").unwrap();
     writeln!(out).unwrap();
-    writeln!(out, "| Command | Description |").unwrap();
-    writeln!(out, "|---------|-------------|").unwrap();
+    writeln!(
+        out,
+        "Commands marked {MAIN_ONLY_MARK} act on the main session's turn or history. They stay listed while a task transcript is open, drawn dimmed, and report their scope rather than running. See [Tasks](#tasks)."
+    )
+    .unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "| Command | Description | Scope |").unwrap();
+    writeln!(out, "|---------|-------------|-------|").unwrap();
     for cmd in BUILTIN_COMMANDS {
-        write_row(&mut out, cmd.name, cmd.description);
+        write_row(&mut out, cmd.name, cmd.description, cmd.scope);
     }
 
     writeln!(out).unwrap();

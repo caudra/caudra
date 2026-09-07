@@ -188,7 +188,7 @@ impl App {
                 return self.handle_plan_form_action(action);
             }
         } else if self.command_palette.is_active() {
-            let input = self.input_box.buffer.value();
+            let input = self.active_input_box().buffer.value();
             let action = self.command_palette.handle_mouse(event, &input);
             if let Some(actions) = self.handle_command_action(action) {
                 self.clear_control_hovers();

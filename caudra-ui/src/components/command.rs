@@ -13,7 +13,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph};
 
-use crate::components::list_picker::PickerItem;
+use crate::components::list_picker::{DISABLED_DIM, PickerItem};
 use crate::theme;
 
 const TICK_TIMEOUT_MS: u64 = 10;
@@ -21,6 +21,17 @@ pub(crate) const SECTION_BUILTIN: &str = "Built-in";
 const SECTION_CUSTOM: &str = "Project & User";
 const SECTION_MCP: &str = "MCP Prompts";
 const SECTION_PLUGIN: &str = "Plugins";
+
+/// Which chat a command can act on. [`ChatScope::MainOnly`] reaches the main
+/// session's turn or history, which a focused task has no equivalent of, so
+/// those stay visible but inert while a task owns the composer. Distinct from
+/// [`caudra_agent::command::CommandScope`], which says where a custom command
+/// was defined.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ChatScope {
+    Any,
+    MainOnly,
+}
 
 /// A command as the modal palette sees it: flat, owned, and independent of
 /// the index-based [`CommandType`] the inline dropdown matches against.
@@ -30,6 +41,7 @@ pub struct CommandRow {
     pub description: String,
     pub max_args: usize,
     pub section: &'static str,
+    pub disabled: bool,
 }
 
 impl CommandRow {
@@ -50,12 +62,17 @@ impl PickerItem for CommandRow {
     fn section(&self) -> Option<&str> {
         Some(self.section)
     }
+
+    fn is_disabled(&self) -> bool {
+        self.disabled
+    }
 }
 
 pub struct BuiltinCommand {
     pub name: &'static str,
     pub description: &'static str,
     pub max_args: usize,
+    pub scope: ChatScope,
 }
 
 pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
@@ -63,166 +80,199 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         name: "/compact",
         description: "Summarize and compact conversation history",
         max_args: 0,
+        scope: ChatScope::MainOnly,
     },
     BuiltinCommand {
         name: "/new",
         description: "Start a new session",
         max_args: 0,
+        scope: ChatScope::Any,
     },
     BuiltinCommand {
         name: "/help",
         description: "Show keybindings",
         max_args: 0,
+        scope: ChatScope::Any,
     },
     BuiltinCommand {
         name: "/usage",
         description: "Show token usage breakdown",
         max_args: 0,
+        scope: ChatScope::Any,
     },
     BuiltinCommand {
         name: "/context",
         description: "Inspect active context window usage",
         max_args: 1,
+        scope: ChatScope::Any,
     },
     BuiltinCommand {
         name: "/queue",
         description: "Inspect and edit queued prompts",
         max_args: 0,
+        scope: ChatScope::Any,
     },
     BuiltinCommand {
         name: "/stash",
         description: "Park the current prompt draft for later",
         max_args: 0,
+        scope: ChatScope::Any,
     },
     BuiltinCommand {
         name: "/stash-pop",
         description: "Restore the most recently stashed prompt",
         max_args: 0,
+        scope: ChatScope::Any,
     },
     BuiltinCommand {
         name: "/stash-list",
         description: "Browse stashed prompts",
         max_args: 0,
+        scope: ChatScope::Any,
     },
     BuiltinCommand {
         name: "/memory",
         description: "View, edit, and delete memory files",
         max_args: 0,
+        scope: ChatScope::Any,
     },
     BuiltinCommand {
         name: "/tasks",
         description: "Browse tasks and steer running subagents",
         max_args: 0,
+        scope: ChatScope::Any,
     },
     BuiltinCommand {
         name: "/sessions",
         description: "Browse and switch sessions",
         max_args: 0,
+        scope: ChatScope::Any,
     },
     BuiltinCommand {
         name: "/rename",
         description: "Rename the current session",
         max_args: usize::MAX,
+        scope: ChatScope::Any,
     },
     BuiltinCommand {
         name: "/model",
         description: "Switch model",
         max_args: 0,
+        scope: ChatScope::MainOnly,
     },
     BuiltinCommand {
         name: "/system-prompt",
         description: "Switch system prompt profile",
         max_args: 0,
+        scope: ChatScope::MainOnly,
     },
     BuiltinCommand {
         name: "/review",
         description: "Review the last reply passage by passage",
         max_args: 0,
+        scope: ChatScope::Any,
     },
     BuiltinCommand {
         name: "/theme",
         description: "Switch color theme",
         max_args: 0,
+        scope: ChatScope::Any,
     },
     BuiltinCommand {
         name: "/view",
         description: "Cycle transcript: auto / compact / expanded",
         max_args: 0,
+        scope: ChatScope::Any,
     },
     BuiltinCommand {
         name: "/mcp",
         description: "Configure MCP servers",
         max_args: 0,
+        scope: ChatScope::Any,
     },
     BuiltinCommand {
         name: "/permissions",
         description: "Inspect active conversation permission rules",
         max_args: 0,
+        scope: ChatScope::Any,
     },
     BuiltinCommand {
         name: "/login",
         description: "Authenticate with an LLM provider",
         max_args: 0,
+        scope: ChatScope::Any,
     },
     BuiltinCommand {
         name: "/cd",
         description: "Change working directory",
         max_args: 1,
+        scope: ChatScope::Any,
     },
     BuiltinCommand {
         name: "/btw",
         description: "Ask a quick question (no tools, no history pollution)",
         max_args: usize::MAX,
+        scope: ChatScope::MainOnly,
     },
     BuiltinCommand {
         name: "/goal",
         description: "Work until a completion condition is met",
         max_args: usize::MAX,
+        scope: ChatScope::MainOnly,
     },
     BuiltinCommand {
         name: "/goal-clear",
         description: "Stop the active completion goal",
         max_args: 0,
+        scope: ChatScope::MainOnly,
     },
     BuiltinCommand {
         name: "/goal-model",
         description: "Choose the completion goal evaluator",
         max_args: 0,
+        scope: ChatScope::MainOnly,
     },
     BuiltinCommand {
         name: "/yolo",
         description: "Toggle YOLO mode (skip all permission prompts)",
         max_args: 0,
+        scope: ChatScope::Any,
     },
     BuiltinCommand {
         name: "/thinking",
         description: "Set reasoning (off, adaptive/provider default, effort, or token budget)",
         max_args: 1,
+        scope: ChatScope::Any,
     },
     BuiltinCommand {
         name: "/fast",
         description: "Toggle Anthropic fast mode (Opus only)",
         max_args: 0,
+        scope: ChatScope::Any,
     },
     BuiltinCommand {
         name: "/workflow",
         description: "Toggle workflow context for custom Lua tools",
         max_args: 0,
+        scope: ChatScope::MainOnly,
     },
     BuiltinCommand {
         name: "/exit",
         description: "Exit the application",
         max_args: 0,
+        scope: ChatScope::Any,
     },
     BuiltinCommand {
         name: "/reload",
         description: "Reload plugins and config",
         max_args: 0,
+        scope: ChatScope::Any,
     },
     BuiltinCommand {
         name: "/workbench",
         description: "Open the file explorer, editor and source control view",
         max_args: 0,
+        scope: ChatScope::Any,
     },
 ];
 
@@ -304,6 +354,10 @@ pub struct CommandPalette {
     popup_area: Option<Rect>,
     row_hits: Vec<CommandRowHit>,
     mouse_down: Option<CommandRowKey>,
+    /// Whether a task owns the composer, which decides who renders dimmed.
+    /// Set by [`CommandPalette::sync`] so it cannot go stale behind the rows
+    /// it styles.
+    task_focused: bool,
 }
 
 impl CommandPalette {
@@ -339,6 +393,7 @@ impl CommandPalette {
             popup_area: None,
             row_hits: Vec::new(),
             mouse_down: None,
+            task_focused: false,
         }
     }
 
@@ -515,13 +570,15 @@ impl CommandPalette {
         self.nucleo = Self::build_nucleo(&self.custom, &self.mcp_prompts, &self.lua_commands);
     }
 
-    /// Every command as a modal picker row, grouped by source.
-    pub fn rows(&mut self) -> Vec<CommandRow> {
+    /// Every command as a modal picker row, grouped by source. {task_focused}
+    /// only decides styling: refusal stays with the one dispatcher.
+    pub fn rows(&mut self, task_focused: bool) -> Vec<CommandRow> {
         self.refresh_sources();
         Self::items(&self.custom, &self.mcp_prompts, &self.lua_commands)
             .map(|item| CommandRow {
                 description: self.describe(&item.command_type).to_string(),
                 section: Self::section_of(&item.command_type),
+                disabled: task_focused && Self::scope_of(&item.command_type) == ChatScope::MainOnly,
                 name: item.name,
                 max_args: item.max_args,
             })
@@ -537,6 +594,25 @@ impl CommandPalette {
         }
     }
 
+    /// MCP prompts are main-only by construction rather than by annotation:
+    /// `AgentInput::prompt` is expanded in the main agent loop, and a steer
+    /// reaches a subagent that never reads it.
+    fn scope_of(command_type: &CommandType) -> ChatScope {
+        match command_type {
+            CommandType::Builtin(command) => command.scope,
+            CommandType::McpPrompt(_) => ChatScope::MainOnly,
+            CommandType::Custom(_) | CommandType::Lua(_) => ChatScope::Any,
+        }
+    }
+
+    /// The styling question the palettes ask, and the refusal question
+    /// [`crate::app::App`] asks, answered from one table.
+    pub fn is_main_only(&self, name: &str) -> bool {
+        Self::items(&self.custom, &self.mcp_prompts, &self.lua_commands)
+            .find(|item| item.name == name)
+            .is_some_and(|item| Self::scope_of(&item.command_type) == ChatScope::MainOnly)
+    }
+
     fn describe(&self, command_type: &CommandType) -> &str {
         match command_type {
             CommandType::Builtin(cmd) => cmd.description,
@@ -546,9 +622,10 @@ impl CommandPalette {
         }
     }
 
-    pub fn sync(&mut self, input: &str) {
+    pub fn sync(&mut self, input: &str, task_focused: bool) {
         self.invalidate_mouse_geometry();
         self.refresh_sources();
+        self.task_focused = task_focused;
         let Some(stripped) = input.strip_prefix('/') else {
             self.filtered.clear();
             self.current_arg_count = 0;
@@ -715,6 +792,10 @@ impl CommandPalette {
         self.describe(&m.command_type)
     }
 
+    fn is_disabled(&self, m: &Match) -> bool {
+        self.task_focused && Self::scope_of(&m.command_type) == ChatScope::MainOnly
+    }
+
     pub fn confirm(&self, input: &str) -> Option<ParsedCommand> {
         let item = self.filtered.get(self.selected)?;
         let name = self.item_name(item);
@@ -819,22 +900,30 @@ impl CommandPalette {
                 let desc = self.item_description(m);
                 let selected = i == self.selected;
                 let name_pad = max_name - name.len() + GAP;
+                let dim = |style: Style| {
+                    if self.is_disabled(m) {
+                        theme::dim_style(style, DISABLED_DIM)
+                    } else {
+                        style
+                    }
+                };
 
                 if selected {
                     let s = t.item_selected;
-                    let highlighted_name = self.build_highlighted_spans(&name, &m.indices, s);
+                    let highlighted_name = self.build_highlighted_spans(&name, &m.indices, dim(s));
                     let mut spans = vec![Span::styled(" ".repeat(PAD), s)];
                     spans.extend(highlighted_name);
                     spans.push(Span::styled(" ".repeat(name_pad), s));
-                    spans.push(Span::styled(desc, s));
+                    spans.push(Span::styled(desc, dim(s)));
                     spans.push(Span::styled(" ".repeat(PAD), s));
                     Line::from(spans)
                 } else {
-                    let highlighted_name = self.build_highlighted_spans(&name, &m.indices, t.item);
+                    let highlighted_name =
+                        self.build_highlighted_spans(&name, &m.indices, dim(t.item));
                     let mut spans = vec![Span::raw(" ".repeat(PAD))];
                     spans.extend(highlighted_name);
                     spans.push(Span::raw(" ".repeat(name_pad)));
-                    spans.push(Span::styled(desc, t.item_desc));
+                    spans.push(Span::styled(desc, dim(t.item_desc)));
                     spans.push(Span::raw(" ".repeat(PAD)));
                     Line::from(spans)
                 }
@@ -907,7 +996,7 @@ mod tests {
 
     fn synced(input: &str) -> CommandPalette {
         let mut p = CommandPalette::new(Arc::from([]), empty_snapshot(), LuaCommandReader::empty());
-        p.sync(input);
+        p.sync(input, false);
         p
     }
 
@@ -930,9 +1019,50 @@ mod tests {
             .unwrap();
     }
 
+    /// The foreground the popup actually painted the command's name in, which
+    /// is the only place the dimming decision becomes observable.
+    fn row_fg(palette: &mut CommandPalette, command: &str) -> ratatui::style::Color {
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                palette.view(frame, Rect::new(0, 20, 80, 4));
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        for y in 0..buffer.area.height {
+            let line: String = (0..buffer.area.width)
+                .filter_map(|x| buffer.cell((x, y)).map(|cell| cell.symbol()))
+                .collect();
+            if let Some(column) = line.find(command) {
+                return buffer.cell((column as u16, y)).unwrap().fg;
+            }
+        }
+        panic!("{command} was not rendered");
+    }
+
+    fn palette_for_scope(task_focused: bool) -> CommandPalette {
+        let mut palette =
+            CommandPalette::new(Arc::from([]), empty_snapshot(), LuaCommandReader::empty());
+        palette.sync("/", task_focused);
+        // Off the first row, so both commands under test are styled as
+        // ordinary rows rather than as the selection.
+        palette.move_down();
+        palette
+    }
+
+    #[test_case("/compact", true ; "main_only_dims")]
+    #[test_case("/help", false ; "anywhere_keeps_its_color")]
+    fn task_focus_dims_only_main_only_rows(command: &str, expected_dimmed: bool) {
+        let main = row_fg(&mut palette_for_scope(false), command);
+        let task = row_fg(&mut palette_for_scope(true), command);
+
+        assert_eq!(main != task, expected_dimmed);
+    }
+
     fn synced_with_custom(input: &str, custom: Arc<[CustomCommand]>) -> CommandPalette {
         let mut p = CommandPalette::new(custom, empty_snapshot(), LuaCommandReader::empty());
-        p.sync(input);
+        p.sync(input, false);
         p
     }
 
@@ -1096,7 +1226,7 @@ mod tests {
             "/",
         );
 
-        palette.sync("/goal");
+        palette.sync("/goal", false);
         let action = palette.handle_mouse(
             mouse(MouseEventKind::Up(MouseButton::Left), stale.area),
             "/goal",
@@ -1130,7 +1260,7 @@ mod tests {
     fn sync_clamps_selected() {
         let mut p = synced("/");
         p.selected = 100;
-        p.sync("/");
+        p.sync("/", false);
         assert_eq!(p.selected, p.filtered.len() - 1);
     }
 
@@ -1176,7 +1306,7 @@ mod tests {
     #[test_case("/btw hello world", "/btw", "hello world" ; "btw_multi_word")]
     fn confirm_parses_args(input: &str, expected_name: &str, expected_args: &str) {
         let mut p = CommandPalette::new(Arc::from([]), empty_snapshot(), LuaCommandReader::empty());
-        p.sync(input);
+        p.sync(input, false);
         let cmd = p.confirm(input).unwrap();
         assert_eq!(cmd.name, expected_name);
         assert_eq!(cmd.args, expected_args);
@@ -1186,7 +1316,7 @@ mod tests {
     fn confirm_custom_command() {
         let custom = sample_custom();
         let mut p = CommandPalette::new(custom, empty_snapshot(), LuaCommandReader::empty());
-        p.sync("/project:review");
+        p.sync("/project:review", false);
         assert!(p.is_active());
         let cmd = p.confirm("/project:review some-file.rs").unwrap();
         assert_eq!(cmd.name, "/project:review");
@@ -1231,7 +1361,7 @@ mod tests {
 
     fn synced_with_prompts(input: &str) -> CommandPalette {
         let mut p = CommandPalette::new(Arc::from([]), sample_prompts(), LuaCommandReader::empty());
-        p.sync(input);
+        p.sync(input, false);
         p
     }
 
@@ -1290,7 +1420,7 @@ mod tests {
         let reader = sample_prompts();
         let mut p = CommandPalette::new(Arc::from([]), reader, LuaCommandReader::empty());
 
-        p.sync("/");
+        p.sync("/", false);
         let initial_count = p
             .filtered
             .iter()
@@ -1311,7 +1441,7 @@ mod tests {
         });
 
         p.mcp_reader = updated_reader;
-        p.sync("/");
+        p.sync("/", false);
 
         let updated_count = p
             .filtered
@@ -1381,7 +1511,7 @@ mod tests {
             max_args,
         }]);
         let mut p = CommandPalette::new(Arc::from([]), empty_snapshot(), reader);
-        p.sync(input);
+        p.sync(input, false);
         p
     }
 
@@ -1409,7 +1539,7 @@ mod tests {
 
     fn synced_with_lua(input: &str) -> CommandPalette {
         let mut p = CommandPalette::new(Arc::from([]), empty_snapshot(), sample_lua_commands());
-        p.sync(input);
+        p.sync(input, false);
         p
     }
 
@@ -1447,7 +1577,7 @@ mod tests {
     #[test]
     fn confirm_lua_command_parses_args() {
         let mut p = CommandPalette::new(Arc::from([]), empty_snapshot(), sample_lua_commands());
-        p.sync("/memory");
+        p.sync("/memory", false);
         let cmd = p.confirm("/memory some-arg").unwrap();
         assert_eq!(cmd.name, "/memory");
         assert_eq!(cmd.args, "some-arg");
@@ -1463,7 +1593,7 @@ mod tests {
             max_args: 0,
         }]);
         let mut p = CommandPalette::new(Arc::from([]), empty_snapshot(), reader);
-        p.sync("/");
+        p.sync("/", false);
         let initial_lua = p
             .filtered
             .iter()
@@ -1485,7 +1615,7 @@ mod tests {
                 max_args: 0,
             },
         ]);
-        p.sync("/");
+        p.sync("/", false);
         let updated_lua = p
             .filtered
             .iter()

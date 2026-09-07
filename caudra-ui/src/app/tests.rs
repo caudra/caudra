@@ -1,8 +1,9 @@
 use super::*;
 use crate::agent::shared_queue;
+use crate::app::tasks::MAIN_TASK_ID;
 use crate::chat::{CANCELLED_TEXT, DONE_TEXT, ERROR_TEXT};
 use crate::components::btw_modal::BtwEvent;
-use crate::components::command::{BUILTIN_COMMANDS, ParsedCommand};
+use crate::components::command::{BUILTIN_COMMANDS, CommandPalette, ParsedCommand};
 use crate::components::context_modal::{
     EXPANDED_TITLE as CONTEXT_EXPANDED_TITLE, TITLE as CONTEXT_TITLE,
 };
@@ -16,6 +17,7 @@ use crate::components::{DisplaySource, ExitRequest, ToolProgress, buffer_text, k
 use crate::repaint::expect::{OWED, QUIET};
 use crate::selection::{SelectableZone, SelectionState, SelectionZone};
 use arc_swap::ArcSwap;
+use caudra_agent::command::CustomCommand;
 use caudra_agent::context::{
     ContextInventory, ContextModel, ContextReadiness, ContextReserve, ContextUsage, ContextWindow,
 };
@@ -602,7 +604,8 @@ fn reset_session_clears_exit_request_source() {
 }
 
 const TURNS_UNCOUNTED: &str = "a finished exchange must move the session's turn counter";
-const TURNS_UNSAVED: &str = "the exit summary reads the counter off the session, so it must be saved";
+const TURNS_UNSAVED: &str =
+    "the exit summary reads the counter off the session, so it must be saved";
 
 /// Compaction discards the history a count could be derived from, so the
 /// exit summary reads a stored counter instead. A deferred goal keeps the
@@ -2176,6 +2179,203 @@ fn subagent_paste_submits_expanded() {
     );
     assert!(app.update(Msg::Key(key(KeyCode::Enter))).is_empty());
     assert_eq!(steer_tx.entries()[0].text, "a\nb\nc");
+}
+
+/// A running task focused with its composer live, handing back the child
+/// queue so a test can see what the composer actually steered.
+fn focused_task_composer() -> (App, caudra_agent::SteeringQueue) {
+    let mut app = test_app();
+    app.run_id = 1;
+    let (steer_tx, _steer_rx) = caudra_agent::steering_queue();
+    let mut info = subagent_info(TASK_ID, RESEARCH_NAME);
+    info.steer_tx = Some(steer_tx.clone());
+    app.update(subagent_msg_with_info(
+        AgentEvent::TextDelta {
+            text: "working".into(),
+        },
+        info,
+    ));
+    app.active_chat = 1;
+    app.sync_subagent_input_target();
+    (app, steer_tx)
+}
+
+#[test]
+fn slash_opens_the_palette_in_a_task_composer() {
+    let (mut app, _steer_tx) = focused_task_composer();
+
+    type_slash(&mut app);
+
+    assert!(app.command_palette.is_active());
+}
+
+#[test]
+fn task_composer_executes_an_allowed_command() {
+    let (mut app, steer_tx) = focused_task_composer();
+
+    type_and_submit(&mut app, "/help");
+
+    assert!(app.help_modal.is_open());
+    assert!(steer_tx.entries().is_empty(), "command must not steer");
+    assert!(app.subagent_input_box.is_empty());
+}
+
+#[test_case("/compact" ; "compact")]
+#[test_case("/model" ; "model")]
+#[test_case("/goal" ; "goal")]
+#[test_case("/workflow" ; "workflow")]
+#[test_case("/btw" ; "btw")]
+fn task_composer_blocks_a_main_only_command(command: &str) {
+    let (mut app, steer_tx) = focused_task_composer();
+
+    let actions = type_and_submit(&mut app, command);
+
+    assert_eq!(app.status_bar.flash_text(), Some(MAIN_ONLY_CMD_MSG));
+    assert!(actions.is_empty(), "{command} must not act on the main run");
+    assert!(steer_tx.entries().is_empty(), "{command} must not steer");
+}
+
+#[test]
+fn main_only_commands_still_run_from_the_main_composer() {
+    let mut app = test_app();
+
+    let actions = type_and_submit(&mut app, "/compact");
+
+    assert!(actions.iter().any(|a| matches!(a, Action::Compact)));
+}
+
+#[test]
+fn run_cmdline_reports_main_only_commands_in_a_task_view() {
+    let (mut app, _steer_tx) = focused_task_composer();
+
+    let error = app.run_cmdline("/compact", 0).err();
+
+    assert_eq!(error.as_deref(), Some(MAIN_ONLY_CMD_MSG));
+}
+
+#[test]
+fn slash_noncommand_still_steers_a_task() {
+    const NOT_A_COMMAND: &str = "/nonexistent";
+    let (mut app, steer_tx) = focused_task_composer();
+
+    type_and_submit(&mut app, NOT_A_COMMAND);
+
+    assert!(app.status_bar.flash_text().is_none());
+    assert_eq!(steer_tx.entries()[0].text, NOT_A_COMMAND);
+}
+
+fn with_custom_command(app: &mut App, name: &str, content: &str) {
+    app.command_palette = CommandPalette::new(
+        Arc::from([CustomCommand {
+            name: name.to_string(),
+            description: String::new(),
+            content: content.to_string(),
+            scope: caudra_agent::command::CommandScope::Project,
+            accepts_args: false,
+        }]),
+        McpSnapshotReader::empty(),
+        LuaCommandReader::empty(),
+    );
+}
+
+#[test]
+fn custom_command_steers_the_focused_task() {
+    const RENDERED: &str = "check the retry path";
+    let (mut app, steer_tx) = focused_task_composer();
+    with_custom_command(&mut app, "audit", RENDERED);
+
+    let actions = type_and_submit(&mut app, "/project:audit");
+
+    assert!(actions.is_empty(), "the main session must not run it");
+    assert_eq!(steer_tx.entries()[0].text, RENDERED);
+}
+
+/// A finished task has no composer, so the modal palette is the only way in.
+/// The template has nowhere to steer and must not be swallowed.
+#[test]
+fn custom_command_falls_back_to_main_when_the_task_cannot_be_steered() {
+    const RENDERED: &str = "check the retry path";
+    let (mut app, _steer_tx) = focused_task_composer();
+    with_custom_command(&mut app, "audit", RENDERED);
+    app.subagent_steers.remove(TASK_ID);
+
+    let actions = app.execute_command(cmd("/project:audit"), 0);
+
+    assert!(actions.iter().any(|a| matches!(a, Action::SendMessage(..))));
+}
+
+#[test]
+fn file_picker_inserts_into_the_focused_task_composer() {
+    const PATH: &str = "src/main.rs";
+    let (mut app, _steer_tx) = focused_task_composer();
+
+    app.handle_file_picker_action(FilePickerModalAction::Select(PATH.into()));
+
+    assert!(app.subagent_input_box.buffer.value().contains(PATH));
+    assert!(app.input_box.is_empty(), "the main draft must be untouched");
+}
+
+#[test]
+fn external_editor_edits_the_focused_task_composer() {
+    const EDITED: &str = "rewritten steer";
+    let (mut app, _steer_tx) = focused_task_composer();
+
+    let previous = app.active_input_text();
+    app.apply_external_input(&previous, EDITED.into());
+
+    assert_eq!(app.subagent_input_box.buffer.value(), EDITED);
+    assert!(app.input_box.is_empty(), "the main draft must be untouched");
+}
+
+#[test]
+fn pasted_image_steers_the_focused_task() {
+    const STEER: &str = "look at this";
+    let (mut app, steer_tx) = focused_task_composer();
+    app.subagent_input_box
+        .attach_image(ImageSource::new(ImageMediaType::Png, Arc::from("aGVsbG8=")));
+    app.subagent_input_box.set_input(STEER.into());
+
+    app.update(Msg::Key(key(KeyCode::Enter)));
+
+    assert_eq!(steer_tx.entries()[0].text, STEER);
+    assert!(app.subagent_input_box.is_empty());
+}
+
+#[test]
+fn ctrl_shortcuts_reach_a_focused_task_composer() {
+    let (mut app, _steer_tx) = focused_task_composer();
+
+    app.update(Msg::Key(kb::FILE_PICKER.to_key_event()));
+    assert!(app.file_picker.is_open(), "Ctrl+S");
+    app.file_picker.close();
+
+    app.update(Msg::Key(kb::SEARCH.to_key_event()));
+    assert!(app.search_modal.is_open(), "Ctrl+F");
+}
+
+/// A finished task draws no composer, so the chords that only make sense with
+/// one stay inert while the transcript-wide ones keep working.
+#[test]
+fn a_read_only_task_takes_search_but_not_the_file_picker() {
+    let mut app = read_only_task_app();
+
+    app.update(Msg::Key(kb::FILE_PICKER.to_key_event()));
+    assert!(!app.file_picker.is_open(), "nothing to insert a path into");
+
+    app.update(Msg::Key(kb::SEARCH.to_key_event()));
+    assert!(app.search_modal.is_open());
+}
+
+#[test]
+fn switching_tasks_closes_the_palette() {
+    let (mut app, _steer_tx) = focused_task_composer();
+    type_slash(&mut app);
+    assert!(app.command_palette.is_active());
+
+    app.focus_task(MAIN_TASK_ID).unwrap();
+    app.sync_subagent_input_target();
+
+    assert!(!app.command_palette.is_active());
 }
 
 #[test]
@@ -4746,7 +4946,7 @@ fn command_palette_lists_builtin_and_plugin_commands() {
     let mut app = test_app();
     let names: Vec<String> = app
         .command_palette
-        .rows()
+        .rows(false)
         .into_iter()
         .map(|row| row.name)
         .collect();
@@ -4759,7 +4959,7 @@ fn context_command_is_discoverable_with_an_argument() {
     let mut app = test_app();
     let command = app
         .command_palette
-        .rows()
+        .rows(false)
         .into_iter()
         .find(|row| row.name == CONTEXT_COMMAND)
         .unwrap();

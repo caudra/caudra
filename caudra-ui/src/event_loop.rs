@@ -2469,7 +2469,7 @@ impl<'t> EventLoop<'t> {
                 }
             }
             Action::EditInputInEditor => {
-                let current_text = self.sessions[idx].app.input_box.expanded_text();
+                let current_text = self.sessions[idx].app.active_input_text();
                 let result = {
                     let _pause = self.input.pause();
                     terminal::edit_temp_content(&current_text, self.terminal)

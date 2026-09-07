@@ -311,6 +311,7 @@ mod tests {
             description: description.to_string(),
             max_args,
             section: SECTION_BUILTIN,
+            disabled: false,
         }
     }
 
