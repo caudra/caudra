@@ -21,6 +21,7 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use workcell_mcp_code::{CodeBuildError, CodeConfiguration, CodeToolGroup};
+use workcell_mcp_code_graph::CodeGraphToolGroup;
 use workcell_mcp_files::FileToolGroup;
 use workcell_mcp_shell::{ShellPermissionPolicy, ShellToolGroup};
 use workcell_mcp_web::{ProxyConfiguration, WebToolGroup, WebsearchExecutionConfiguration};
@@ -70,6 +71,9 @@ pub struct ToolConfiguration<'a> {
 #[derive(Clone)]
 pub struct WorkcellServer {
     files: Option<FileToolGroup>,
+    // The code-graph group owns a bounded extraction cache behind a mutex, which is shared rather
+    // than cloned so every server clone reuses the same warm facts.
+    code_graph: Option<Arc<CodeGraphToolGroup>>,
     web: Option<WebToolGroup>,
     shell: Option<ShellToolGroup>,
     // The code group owns a worker pool, which is shared rather than cloned so every server clone
@@ -126,6 +130,17 @@ impl WorkcellServer {
         } else {
             None
         };
+        // Constructed over its own read-only `FileToolGroup` so the group stands alone when the
+        // files tools are not exposed. Confinement is identical; only reads are ever performed.
+        let code_graph = if groups.contains(&ToolGroup::CodeGraph) {
+            Some(Arc::new(
+                CodeGraphToolGroup::new(root.ok_or(ServerBuildError::Filesystem)?, None)
+                    .await
+                    .map_err(|_| ServerBuildError::Filesystem)?,
+            ))
+        } else {
+            None
+        };
         let web = groups
             .contains(&ToolGroup::Web)
             .then(|| WebToolGroup::production_with_proxy(tools.web, tools.web_icons, &tools.proxy));
@@ -167,6 +182,9 @@ impl WorkcellServer {
         };
         compose_catalog([
             files.as_ref().map_or_else(Vec::new, FileToolGroup::catalog),
+            code_graph
+                .as_ref()
+                .map_or_else(Vec::new, |_| workcell_mcp_code_graph::catalog()),
             web.as_ref()
                 .map_or_else(Vec::new, |group| group.catalog(current_utc_year())),
             shell
@@ -189,6 +207,7 @@ impl WorkcellServer {
         };
         Ok(Self {
             files,
+            code_graph,
             web,
             shell,
             code,
@@ -211,6 +230,9 @@ impl WorkcellServer {
             self.files
                 .as_ref()
                 .map_or_else(Vec::new, FileToolGroup::catalog),
+            self.code_graph
+                .as_ref()
+                .map_or_else(Vec::new, |_| workcell_mcp_code_graph::catalog()),
             self.web
                 .as_ref()
                 .map_or_else(Vec::new, |group| group.catalog(current_utc_year())),
@@ -296,6 +318,13 @@ impl WorkcellServer {
         {
             return result;
         }
+        if let Some(code_graph) = &self.code_graph
+            && let Some(result) = code_graph
+                .dispatch(name, arguments.clone(), cancellation.clone())
+                .await
+        {
+            return result;
+        }
         if let Some(web) = &self.web
             && let Some(result) = web
                 .dispatch(name, arguments.clone(), cancellation.clone())
@@ -347,6 +376,7 @@ impl WorkcellServer {
             web: self.web.is_some(),
             shell: self.shell.is_some(),
             code: self.code.is_some(),
+            code_graph: self.code_graph.is_some(),
         }
     }
 
@@ -589,6 +619,7 @@ mod tests {
     fn composed_catalog_is_exact_and_ordered() {
         let names = compose_catalog([
             file_catalog(true),
+            workcell_mcp_code_graph::catalog(),
             web_catalog(2026, &WebsearchExecutionConfiguration::unconfigured()),
             workcell_mcp_shell::catalog(),
             workcell_mcp_code::catalog(),
@@ -599,9 +630,9 @@ mod tests {
         .into_iter()
         .map(|tool| tool.name.to_string())
         .collect::<Vec<_>>();
-        // Order is a compatibility contract. `python_execution` follows `shell` so the documented
-        // files/web/shell prefix is unchanged, the server-only transfer tools follow it, and the
-        // host-owned disclosure tool stays last.
+        // Order is a compatibility contract. The code-graph tools follow the files group because
+        // they answer the same question at repository scale, `python_execution` follows `shell`,
+        // the server-only transfer tools follow it, and the host-owned disclosure tool stays last.
         assert_eq!(
             names,
             [
@@ -612,6 +643,11 @@ mod tests {
                 "file_edit",
                 "file_apply_patch",
                 "index",
+                "code_map",
+                "code_context",
+                "code_refs",
+                "code_impact",
+                "code_expand",
                 "websearch",
                 "webfetch",
                 "shell",

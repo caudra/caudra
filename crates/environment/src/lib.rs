@@ -77,6 +77,7 @@ pub struct ToolGroupDisclosure {
     pub web: bool,
     pub shell: bool,
     pub code: bool,
+    pub code_graph: bool,
 }
 
 pub type ExecutionEnvironment = ExecutionEnvironmentDisclosure;
@@ -1901,6 +1902,7 @@ mod tests {
             web: false,
             shell: true,
             code: false,
+            code_graph: true,
         };
         let first = disclosure
             .call_tool(json!({}), groups, CancellationToken::new())
@@ -1991,6 +1993,7 @@ mod tests {
             web: false,
             shell: false,
             code: false,
+            code_graph: false,
         };
         let first = snapshot.descriptor(groups);
         let second = snapshot.descriptor(groups);

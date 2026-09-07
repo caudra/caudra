@@ -12,6 +12,14 @@ pub use workcell_environment::ExecutionEnvironment;
 pub use workcell_mcp_code as code;
 #[cfg(feature = "code")]
 pub use workcell_mcp_code::CodeToolGroup;
+#[cfg(feature = "code-graph")]
+pub use workcell_mcp_code_graph as code_graph;
+#[cfg(feature = "code-graph")]
+pub use workcell_mcp_code_graph::{
+    CodeContextInput, CodeContextOutput, CodeExpandInput, CodeExpandOutput, CodeGraphLimits,
+    CodeGraphToolGroup, CodeImpactInput, CodeImpactOutput, CodeMapInput, CodeMapOutput,
+    CodeRefsInput, CodeRefsOutput, SelectorRefusal,
+};
 #[cfg(feature = "files")]
 pub use workcell_mcp_files as files;
 #[cfg(feature = "files")]

@@ -22,10 +22,10 @@ comma := ,
 empty :=
 space := $(empty) $(empty)
 # Tool groups exposed by the `workcell` embedding facade, each gating one optional dependency.
-NATIVE_GROUPS := files files-index web shell code environment
+NATIVE_GROUPS := files files-index web shell code code-graph code-graph-git environment
 NATIVE_FEATURES := $(subst $(space),$(comma),$(NATIVE_GROUPS))
 # Tool crates that must compile with no MCP adapter, so native hosts never link a transport.
-NATIVE_CRATES := workcell-mcp-files workcell-mcp-web workcell-mcp-shell workcell-mcp-code workcell-environment
+NATIVE_CRATES := workcell-mcp-files workcell-mcp-web workcell-mcp-shell workcell-mcp-code workcell-mcp-code-graph workcell-environment
 
 help:
 	@printf '%s\n' \

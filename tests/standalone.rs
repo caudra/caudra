@@ -45,7 +45,12 @@ async fn fixture_server_with_options(
     .expect("index fixture");
     let server = WorkcellServer::configured(
         Some(root.path()),
-        &[ToolGroup::Files, ToolGroup::Web, ToolGroup::Shell],
+        &[
+            ToolGroup::Files,
+            ToolGroup::CodeGraph,
+            ToolGroup::Web,
+            ToolGroup::Shell,
+        ],
         ServerBehavior {
             expose_execution_environment: true,
             modern_only,
@@ -311,6 +316,11 @@ async fn stdio_discovers_lists_and_calls_all_standalone_tools() {
             "file_glob",
             "file_grep",
             "index",
+            "code_map",
+            "code_context",
+            "code_refs",
+            "code_impact",
+            "code_expand",
             "websearch",
             "webfetch",
             "shell",
@@ -361,6 +371,23 @@ async fn stdio_discovers_lists_and_calls_all_standalone_tools() {
 
     write_json(
         &mut write,
+        &mcp_request(32, "tools/call", json!({"name":"code_map","arguments":{}})),
+    )
+    .await;
+    let mapped = read_json(&mut read).await;
+    assert_eq!(
+        mapped["result"]["structuredContent"]["symbols"][0]["name"],
+        "visible"
+    );
+    assert!(
+        mapped["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("visible.rs")
+    );
+
+    write_json(
+        &mut write,
         &mcp_request(
             4,
             "tools/call",
@@ -372,7 +399,13 @@ async fn stdio_discovers_lists_and_calls_all_standalone_tools() {
     assert_environment_descriptor(&environment["result"]["structuredContent"]);
     assert_eq!(
         environment["result"]["structuredContent"]["toolGroups"],
-        json!({"files": true, "web": true, "shell": true, "code": false})
+        json!({
+            "files": true,
+            "web": true,
+            "shell": true,
+            "code": false,
+            "codeGraph": true,
+        })
     );
 
     write_json(
@@ -444,7 +477,7 @@ async fn authenticated_http_has_one_stateless_mcp_route() {
             .as_array()
             .unwrap()
             .len(),
-        8
+        13
     );
 
     let private_route = client
@@ -580,7 +613,7 @@ async fn http_supports_stateless_legacy_calls_and_progress() {
     .await;
     assert!(!listed.headers().contains_key("mcp-session-id"));
     let listed = final_sse_json(listed).await;
-    assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 8);
+    assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 13);
     assert!(listed["result"].get("ttlMs").is_none());
     assert!(listed["result"].get("cacheScope").is_none());
 

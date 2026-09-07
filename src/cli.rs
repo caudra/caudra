@@ -25,6 +25,9 @@ pub enum ToolGroup {
     // selector matches the tool it exposes, so it is named explicitly.
     #[value(name = "python_execution")]
     PythonExecution,
+    // Same reason as above: the selector matches the `code_*` tools it exposes.
+    #[value(name = "code_graph")]
+    CodeGraph,
     Transfer,
 }
 
@@ -36,6 +39,7 @@ impl ToolGroup {
             Self::Web => "web",
             Self::Shell => "shell",
             Self::PythonExecution => "python_execution",
+            Self::CodeGraph => "code_graph",
             Self::Transfer => "transfer",
         }
     }
@@ -345,6 +349,7 @@ impl RawOptions {
                 Some(value) => parse_groups(&value)?,
                 None => vec![
                     ToolGroup::Files,
+                    ToolGroup::CodeGraph,
                     ToolGroup::Web,
                     ToolGroup::Shell,
                     ToolGroup::PythonExecution,
@@ -473,10 +478,11 @@ impl RawOptions {
             }
         };
 
-        // Transfer resolves every path through a confined `FileToolGroup`, so it needs a root for
-        // the same reason the files tools do.
+        // Transfer and code_graph both resolve every path through a confined `FileToolGroup`, so
+        // they need a root for the same reason the files tools do.
         let has_local = groups.contains(&ToolGroup::Files)
             || groups.contains(&ToolGroup::Shell)
+            || groups.contains(&ToolGroup::CodeGraph)
             || groups.contains(&ToolGroup::Transfer);
         if has_local && self.root.is_none() {
             return Err(CliError::RootRequired);
@@ -667,6 +673,7 @@ fn parse_groups(value: &str) -> Result<Vec<ToolGroup>, CliError> {
             "web" => Ok(ToolGroup::Web),
             "shell" => Ok(ToolGroup::Shell),
             "python_execution" => Ok(ToolGroup::PythonExecution),
+            "code_graph" => Ok(ToolGroup::CodeGraph),
             "transfer" => Ok(ToolGroup::Transfer),
             _ => Err(CliError::InvalidToolGroup),
         })
@@ -691,6 +698,18 @@ mod tests {
             parse_groups("files,web,shell").unwrap(),
             [ToolGroup::Files, ToolGroup::Web, ToolGroup::Shell]
         );
+        // Every selector round-trips through the name the group reports for itself, so an
+        // operator can always paste `--tools` back from a disclosure.
+        for group in [
+            ToolGroup::Files,
+            ToolGroup::Web,
+            ToolGroup::Shell,
+            ToolGroup::PythonExecution,
+            ToolGroup::CodeGraph,
+            ToolGroup::Transfer,
+        ] {
+            assert_eq!(parse_groups(group.as_str()).unwrap(), [group]);
+        }
         assert_eq!(
             parse_groups("unknown").unwrap_err(),
             CliError::InvalidToolGroup

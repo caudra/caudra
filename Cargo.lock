@@ -5521,6 +5521,7 @@ version = "0.1.0"
 dependencies = [
  "workcell-environment",
  "workcell-mcp-code",
+ "workcell-mcp-code-graph",
  "workcell-mcp-files",
  "workcell-mcp-shell",
  "workcell-mcp-web",
@@ -5580,6 +5581,7 @@ dependencies = [
  "uuid",
  "workcell-environment",
  "workcell-mcp-code",
+ "workcell-mcp-code-graph",
  "workcell-mcp-files",
  "workcell-mcp-shell",
  "workcell-mcp-web",

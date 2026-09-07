@@ -15,11 +15,14 @@ web = ["dep:workcell-mcp-web"]
 shell = ["dep:workcell-mcp-shell", "dep:workcell-output-filter"]
 code = ["dep:workcell-mcp-code"]
 code-bundled = ["code", "workcell-mcp-code/bundled-worker"]
+code-graph = ["dep:workcell-mcp-code-graph"]
+code-graph-git = ["code-graph", "workcell-mcp-code-graph/git"]
 environment = ["dep:workcell-environment"]
 
 [dependencies]
 workcell-environment = { workspace = true, optional = true }
 workcell-mcp-code = { workspace = true, optional = true }
+workcell-mcp-code-graph = { workspace = true, optional = true }
 workcell-mcp-files = { workspace = true, optional = true }
 workcell-mcp-shell = { workspace = true, optional = true }
 workcell-mcp-web = { workspace = true, optional = true }
