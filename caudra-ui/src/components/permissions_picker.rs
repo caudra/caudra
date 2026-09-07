@@ -548,6 +548,7 @@ mod tests {
                 },
                 lifetime: PermissionLifetime::Conversation,
                 effect: StructuredPermissionEffect::Deny,
+                family: None,
             },
             Some(serde_json::json!({"<field:1>": "<string:10 chars>"})),
         )

@@ -5525,6 +5525,7 @@ fn conversation_permission_record() -> caudra_agent::permissions::PermissionRule
         arguments: PermissionArgumentConstraint::Unconstrained,
         lifetime: PermissionLifetime::Conversation,
         effect: StructuredPermissionEffect::Allow,
+        family: None,
     })
     .unwrap()
 }

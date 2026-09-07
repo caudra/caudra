@@ -12,6 +12,14 @@ const PERMISSION_RULES: StateKey = StateKey {
     name: "permission.rules",
     class: StateClass::Persistent,
 };
+/// Shared between `validate_family` and its tests so a wording change cannot
+/// silently pass an assertion.
+pub const FAMILY_REQUIRES_RESOURCES: &str =
+    "filesystem read family requires at least one resource constraint";
+pub const FAMILY_REQUIRES_FILESYSTEM_KIND: &str =
+    "filesystem read family requires file or directory resources";
+pub const FAMILY_REQUIRES_READ_ACCESS: &str =
+    "filesystem read family requires read or search access";
 pub const COMMAND_PATTERN_MAX_BYTES: usize = 256;
 pub const COMMAND_PATTERN_MAX_TOKENS: usize = 8;
 const SHA256_HEX_LEN: usize = 64;
@@ -134,6 +142,24 @@ pub enum StructuredPermissionEffect {
     Deny,
 }
 
+/// Widens a rule from the single tool contract and access mode it was minted
+/// from to the family of operations carrying identical authority, so one grant
+/// covers reading, listing, and searching a subtree instead of only the tool
+/// that happened to ask first.
+///
+/// A family never crosses a security boundary. `FilesystemRead` is validated to
+/// hold only `Read` and `Search` constraints, and the write contracts emit
+/// `Write` exclusively, so no grant minted from a read can authorize a mutation.
+///
+/// Absent on every rule written before families existed, and absent whenever a
+/// rule is exact, so an older binary that ignores this field falls back to exact
+/// subject matching and merely prompts more.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "family", rename_all = "snake_case")]
+pub enum PermissionCapabilityFamily {
+    FilesystemRead,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StructuredPermissionRule {
     pub subject: PermissionSubject,
@@ -142,6 +168,8 @@ pub struct StructuredPermissionRule {
     pub arguments: PermissionArgumentConstraint,
     pub lifetime: PermissionLifetime,
     pub effect: StructuredPermissionEffect,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub family: Option<PermissionCapabilityFamily>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -362,6 +390,9 @@ fn validate_record(
         }
         PermissionArgumentConstraint::Unconstrained => {}
     }
+    if let Some(family) = record.rule.family {
+        validate_family(family, &record.rule.resources)?;
+    }
     for resource in &record.rule.resources {
         validate_resource_selector(&resource.kind, &resource.selector)?;
         for (attribute, selector) in &resource.attributes {
@@ -394,6 +425,41 @@ fn validate_review(value: &Value) -> Result<(), PermissionStateError> {
             "permission review contains an unredacted value".into(),
         )),
     }
+}
+
+/// The invariant that keeps a widened rule from becoming an escalation. Every
+/// constraint must name a filesystem kind and an explicit read-shaped access, so
+/// a stored `FilesystemRead` rule cannot match a `Write` resource no matter which
+/// contract later presents it. An absent access would mean "any", so it is rejected.
+fn validate_family(
+    family: PermissionCapabilityFamily,
+    resources: &[PermissionResourceConstraint],
+) -> Result<(), PermissionStateError> {
+    let PermissionCapabilityFamily::FilesystemRead = family;
+    if resources.is_empty() {
+        return Err(PermissionStateError::Invalid(
+            FAMILY_REQUIRES_RESOURCES.into(),
+        ));
+    }
+    for resource in resources {
+        if !matches!(
+            resource.kind,
+            PermissionResourceKind::File | PermissionResourceKind::Directory
+        ) {
+            return Err(PermissionStateError::Invalid(
+                FAMILY_REQUIRES_FILESYSTEM_KIND.into(),
+            ));
+        }
+        if !matches!(
+            resource.access,
+            Some(PermissionResourceAccess::Read) | Some(PermissionResourceAccess::Search)
+        ) {
+            return Err(PermissionStateError::Invalid(
+                FAMILY_REQUIRES_READ_ACCESS.into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_resource_selector(
@@ -491,13 +557,16 @@ mod tests {
 
     use serde_json::json;
 
+    use test_case::test_case;
+
     use super::{
-        COMMAND_PATTERN_MAX_BYTES, PERMISSION_RULES, PermissionArgumentConstraint,
-        PermissionExecutorKind, PermissionLifetime, PermissionResourceAccess,
-        PermissionResourceConstraint, PermissionResourceKind, PermissionResourceSelector,
-        PermissionRuleRecord, PermissionState, PermissionStateError, PermissionSubject,
-        SHA256_HEX_LEN, StructuredPermissionEffect, StructuredPermissionRule,
-        validate_command_pattern,
+        COMMAND_PATTERN_MAX_BYTES, FAMILY_REQUIRES_FILESYSTEM_KIND, FAMILY_REQUIRES_READ_ACCESS,
+        FAMILY_REQUIRES_RESOURCES, PERMISSION_RULES, PermissionArgumentConstraint,
+        PermissionCapabilityFamily, PermissionExecutorKind, PermissionLifetime,
+        PermissionResourceAccess, PermissionResourceConstraint, PermissionResourceKind,
+        PermissionResourceSelector, PermissionRuleRecord, PermissionState, PermissionStateError,
+        PermissionSubject, SHA256_HEX_LEN, StructuredPermissionEffect, StructuredPermissionRule,
+        validate_command_pattern, validate_conversation_record,
     };
     use crate::state::{self, SCOPE_GLOBAL};
     use crate::{StateDir, now_epoch};
@@ -525,6 +594,7 @@ mod tests {
             },
             lifetime,
             effect: StructuredPermissionEffect::Allow,
+            family: None,
         }
     }
 
@@ -800,5 +870,111 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    fn family_rule(
+        kind: PermissionResourceKind,
+        access: Option<PermissionResourceAccess>,
+    ) -> StructuredPermissionRule {
+        StructuredPermissionRule {
+            subject: PermissionSubject::Native {
+                owner: "workcell".into(),
+                contract: "file.read.v1".into(),
+            },
+            executor: PermissionExecutorKind::Native,
+            resources: vec![PermissionResourceConstraint {
+                kind,
+                selector: PermissionResourceSelector::FilesystemSubtreeDigest {
+                    digest: DIGEST.into(),
+                },
+                access,
+                protected: Some(false),
+                attributes: BTreeMap::new(),
+            }],
+            arguments: PermissionArgumentConstraint::Unconstrained,
+            lifetime: PermissionLifetime::Conversation,
+            effect: StructuredPermissionEffect::Allow,
+            family: Some(PermissionCapabilityFamily::FilesystemRead),
+        }
+    }
+
+    fn family_error(rule: StructuredPermissionRule) -> String {
+        match PermissionRuleRecord::conversation(rule) {
+            Err(PermissionStateError::Invalid(message)) => message,
+            other => panic!("expected an invalid-record error, got {other:?}"),
+        }
+    }
+
+    #[test_case(
+        PermissionResourceKind::File,
+        Some(PermissionResourceAccess::Write),
+        FAMILY_REQUIRES_READ_ACCESS;
+        "write access cannot ride on a read family"
+    )]
+    #[test_case(
+        PermissionResourceKind::File,
+        Some(PermissionResourceAccess::Execute),
+        FAMILY_REQUIRES_READ_ACCESS;
+        "execute access cannot ride on a read family"
+    )]
+    #[test_case(
+        PermissionResourceKind::File,
+        None,
+        FAMILY_REQUIRES_READ_ACCESS;
+        "an unconstrained access would reach write"
+    )]
+    #[test_case(
+        PermissionResourceKind::Command,
+        Some(PermissionResourceAccess::Read),
+        FAMILY_REQUIRES_FILESYSTEM_KIND;
+        "a command resource is not a filesystem read"
+    )]
+    fn a_stored_read_family_cannot_widen_past_reading(
+        kind: PermissionResourceKind,
+        access: Option<PermissionResourceAccess>,
+        expected: &str,
+    ) {
+        assert_eq!(family_error(family_rule(kind, access)), expected);
+    }
+
+    #[test]
+    fn a_read_family_rule_needs_a_resource_to_widen() {
+        let mut rule = family_rule(
+            PermissionResourceKind::File,
+            Some(PermissionResourceAccess::Read),
+        );
+        rule.resources.clear();
+
+        assert_eq!(family_error(rule), FAMILY_REQUIRES_RESOURCES);
+    }
+
+    #[test_case(PermissionResourceAccess::Read; "read joins the family")]
+    #[test_case(PermissionResourceAccess::Search; "search joins the family")]
+    fn a_read_family_rule_stores_and_reloads(access: PermissionResourceAccess) {
+        let rule = family_rule(PermissionResourceKind::Directory, Some(access));
+
+        let record = PermissionRuleRecord::conversation(rule).expect("record is valid");
+        let encoded = serde_json::to_string(&record).expect("record serializes");
+        let decoded: PermissionRuleRecord =
+            serde_json::from_str(&encoded).expect("record deserializes");
+
+        assert_eq!(decoded.rule.family, record.rule.family);
+        assert!(validate_conversation_record(&decoded).is_ok());
+    }
+
+    #[test]
+    fn an_exact_rule_stores_no_family_key_and_older_records_load_as_exact() {
+        let record = PermissionRuleRecord::conversation(rule(PermissionLifetime::Conversation))
+            .expect("record is valid");
+
+        let encoded = serde_json::to_value(&record).expect("record serializes");
+
+        assert!(
+            encoded["rule"].get("family").is_none(),
+            "an exact rule must not grow a family key: {encoded}"
+        );
+        let decoded: PermissionRuleRecord =
+            serde_json::from_value(encoded).expect("a record without a family still loads");
+        assert_eq!(decoded.rule.family, None);
     }
 }

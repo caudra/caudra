@@ -12,13 +12,25 @@ use url::Url;
 use crate::tools::PermissionIntent;
 
 pub use caudra_storage::permission_state::{
-    PermissionArgumentConstraint, PermissionExecutorKind, PermissionLifetime,
-    PermissionResourceAccess, PermissionResourceConstraint, PermissionResourceKind,
-    PermissionResourceSelector, PermissionRuleRecord, PermissionSubject,
+    PermissionArgumentConstraint, PermissionCapabilityFamily, PermissionExecutorKind,
+    PermissionLifetime, PermissionResourceAccess, PermissionResourceConstraint,
+    PermissionResourceKind, PermissionResourceSelector, PermissionRuleRecord, PermissionSubject,
     SelectedPermissionArgument, StructuredPermissionEffect, StructuredPermissionRule,
 };
 
 const NATIVE_OWNER: &str = "caudra";
+/// Trust domain for the first-party Workcell tools, whose contracts are the only
+/// members of `PermissionCapabilityFamily::FilesystemRead`.
+const WORKCELL_OWNER: &str = "workcell";
+/// The Workcell contracts that only ever read: they emit `Read` or `Search`
+/// access, never `Write`, so one subtree grant may serve all of them. Adding a
+/// contract here widens stored authority, so it must never gain a writing tool.
+const FILESYSTEM_READ_CONTRACTS: &[&str] = &[
+    "file.read.v1",
+    "file.glob.v1",
+    "file.grep.v1",
+    "file.index.v1",
+];
 const MCP_CONTRACT: &str = "mcp.tools.call/v1";
 const SUMMARY_MAX_CHARS: usize = 240;
 const LISTED_COMMANDS_MAX: usize = 3;
@@ -517,14 +529,57 @@ pub fn resource_constraint_matches(
     constraint: &PermissionResourceConstraint,
     resource: &PermissionResource,
 ) -> bool {
-    if constraint.kind != resource.kind {
-        return false;
+    constraint_covers_resource(constraint, resource, None)
+}
+
+/// Whether the constraint and the resource name the same operation. Without a
+/// family this is exact equality on kind and access; a family instead accepts
+/// any member pair, which is what lets one subtree grant serve read, list, and
+/// search without ever reaching a write.
+fn operation_matches(
+    constraint: &PermissionResourceConstraint,
+    resource: &PermissionResource,
+    family: Option<PermissionCapabilityFamily>,
+) -> bool {
+    match family {
+        Some(PermissionCapabilityFamily::FilesystemRead) => {
+            is_filesystem_read_kind(&constraint.kind)
+                && is_filesystem_read_kind(&resource.kind)
+                && is_filesystem_read_access(constraint.access.as_ref())
+                && is_filesystem_read_access(resource.access.as_ref())
+        }
+        None => {
+            constraint.kind == resource.kind
+                && !constraint
+                    .access
+                    .as_ref()
+                    .is_some_and(|access| resource.access.as_ref() != Some(access))
+        }
     }
-    if constraint
-        .access
-        .as_ref()
-        .is_some_and(|access| resource.access.as_ref() != Some(access))
-    {
+}
+
+fn is_filesystem_read_kind(kind: &PermissionResourceKind) -> bool {
+    matches!(
+        kind,
+        PermissionResourceKind::File | PermissionResourceKind::Directory
+    )
+}
+
+/// An absent access means "any access" on a constraint, which would reach
+/// `Write`, so only an explicit read-shaped access joins the family.
+fn is_filesystem_read_access(access: Option<&PermissionResourceAccess>) -> bool {
+    matches!(
+        access,
+        Some(PermissionResourceAccess::Read) | Some(PermissionResourceAccess::Search)
+    )
+}
+
+fn constraint_covers_resource(
+    constraint: &PermissionResourceConstraint,
+    resource: &PermissionResource,
+    family: Option<PermissionCapabilityFamily>,
+) -> bool {
+    if !operation_matches(constraint, resource, family) {
         return false;
     }
     if constraint
@@ -593,7 +648,7 @@ pub fn permission_rule_covers_request(
         && request.resources.iter().all(|resource| {
             rule.resources
                 .iter()
-                .any(|constraint| resource_constraint_matches(constraint, resource))
+                .any(|constraint| constraint_covers_resource(constraint, resource, rule.family))
         })
 }
 
@@ -607,7 +662,7 @@ pub fn permission_rule_covers_resource(
         && rule
             .resources
             .iter()
-            .any(|constraint| resource_constraint_matches(constraint, resource))
+            .any(|constraint| constraint_covers_resource(constraint, resource, rule.family))
 }
 
 pub fn permission_rules_cover_request(
@@ -633,7 +688,7 @@ pub fn permission_rule_intersects_request(
             || request.resources.iter().any(|resource| {
                 rule.resources
                     .iter()
-                    .any(|constraint| resource_constraint_matches(constraint, resource))
+                    .any(|constraint| constraint_covers_resource(constraint, resource, rule.family))
             }))
 }
 
@@ -655,9 +710,37 @@ pub fn evaluate_structured_permission_rules(
 }
 
 fn rule_context_matches(rule: &StructuredPermissionRule, request: &PermissionRequest) -> bool {
-    rule.subject == request.subject
+    subject_matches(rule, request)
         && rule.executor == request.executor
         && argument_constraint_matches(&rule.arguments, &request.input)
+}
+
+/// Authority is keyed to the subject, which for a first-party tool is a single
+/// contract. A family rule is instead keyed to the trust domain, so the contract
+/// that happened to ask first stops being part of the key. Both sides must be
+/// members, which pins the owner too, since membership names one owner.
+fn subject_matches(rule: &StructuredPermissionRule, request: &PermissionRequest) -> bool {
+    if rule.subject == request.subject {
+        return true;
+    }
+    match rule.family {
+        Some(PermissionCapabilityFamily::FilesystemRead) => {
+            is_filesystem_read_subject(&rule.subject)
+                && is_filesystem_read_subject(&request.subject)
+        }
+        None => false,
+    }
+}
+
+fn is_filesystem_read_subject(subject: &PermissionSubject) -> bool {
+    match subject {
+        PermissionSubject::Native { owner, contract } => {
+            owner == WORKCELL_OWNER && FILESYSTEM_READ_CONTRACTS.contains(&contract.as_str())
+        }
+        PermissionSubject::Lua { .. }
+        | PermissionSubject::Mcp { .. }
+        | PermissionSubject::UnknownLegacy { .. } => false,
+    }
 }
 
 fn selector_matches(
@@ -1296,6 +1379,7 @@ fn rule_options(
             arguments,
             lifetime: PermissionLifetime::Once,
             effect,
+            family: None,
         },
         allowed_lifetimes,
         broad,
@@ -1653,11 +1737,10 @@ fn add_filesystem_options(
 ) {
     if resources.is_empty()
         || resources.iter().any(|resource| {
-            resource.protected
-                || !matches!(
-                    resource.kind,
-                    PermissionResourceKind::File | PermissionResourceKind::Directory
-                )
+            !matches!(
+                resource.kind,
+                PermissionResourceKind::File | PermissionResourceKind::Directory
+            )
         })
     {
         return;
@@ -1702,12 +1785,31 @@ fn add_filesystem_options(
             arguments,
             lifetime: PermissionLifetime::Once,
             effect: StructuredPermissionEffect::Allow,
+            family: None,
         },
         allowed_lifetimes: reusable.to_vec(),
         broad: true,
         is_default: false,
         confirmation: write.then(|| "ALLOW FILE CHANGES".into()),
     });
+
+    // A protected path never earns a subtree grant, because every subtree
+    // option below pins `protected: Some(false)` and so could not cover it
+    // anyway. Returning here keeps the exact-path option above, which carries
+    // the real protected flag and is reusable across differing tool inputs.
+    if resources.iter().any(|resource| resource.protected) {
+        return;
+    }
+
+    // Only a first-party read earns a widened subtree grant. A write request
+    // keeps its exact subject, so `allow_filesystem_subtree` on a write never
+    // becomes reachable from a reading contract.
+    let family = (is_filesystem_read_subject(subject)
+        && resources.iter().all(|resource| {
+            is_filesystem_read_kind(&resource.kind)
+                && is_filesystem_read_access(resource.access.as_ref())
+        }))
+    .then_some(PermissionCapabilityFamily::FilesystemRead);
 
     let mut roots = Vec::with_capacity(resources.len());
     let mut constraints = Vec::with_capacity(resources.len());
@@ -1742,7 +1844,11 @@ fn add_filesystem_options(
     options.push(PermissionRuleOption {
         id: "allow_filesystem_subtree".into(),
         label: "These directories and descendants".into(),
-        description: format!("Allow matching paths below {patterns}."),
+        description: if family.is_some() {
+            format!("Allow reading, listing, and searching any path below {patterns}.")
+        } else {
+            format!("Allow matching paths below {patterns}.")
+        },
         rule: StructuredPermissionRule {
             subject: subject.clone(),
             executor: executor.clone(),
@@ -1750,6 +1856,7 @@ fn add_filesystem_options(
             arguments: PermissionArgumentConstraint::Unconstrained,
             lifetime: PermissionLifetime::Once,
             effect: StructuredPermissionEffect::Allow,
+            family,
         },
         allowed_lifetimes: reusable.to_vec(),
         broad: true,
@@ -1790,7 +1897,14 @@ fn add_filesystem_options(
     options.push(PermissionRuleOption {
         id: "allow_project_files".into(),
         label: "Any unprotected project path".into(),
-        description: format!("Allow matching paths below {}/**.", project.display()),
+        description: if family.is_some() {
+            format!(
+                "Allow reading, listing, and searching any path below {}/**.",
+                project.display()
+            )
+        } else {
+            format!("Allow matching paths below {}/**.", project.display())
+        },
         rule: StructuredPermissionRule {
             subject: subject.clone(),
             executor: executor.clone(),
@@ -1798,6 +1912,7 @@ fn add_filesystem_options(
             arguments: PermissionArgumentConstraint::Unconstrained,
             lifetime: PermissionLifetime::Once,
             effect: StructuredPermissionEffect::Allow,
+            family,
         },
         allowed_lifetimes: reusable.to_vec(),
         broad: true,
@@ -2155,6 +2270,7 @@ mod tests {
             },
             lifetime: request.lifetime.clone(),
             effect,
+            family: None,
         }
     }
 
@@ -3024,6 +3140,238 @@ mod tests {
         };
 
         assert_eq!(resource_constraint_matches(&constraint, &resource), matches);
+    }
+
+    const EXACT_RESOURCES_OPTION: &str = "allow_exact_resources";
+    const SUBTREE_OPTION: &str = "allow_filesystem_subtree";
+    const PROJECT_OPTION: &str = "allow_project_files";
+
+    const PROTECTED_PATH: &str = "/project/.git/HEAD";
+    const FIRST_READ_OFFSET: u32 = 1;
+    const LATER_READ_OFFSET: u32 = 500;
+
+    fn filesystem_request(protected: bool, offset: u32) -> PermissionRequest {
+        explicit_request(
+            PermissionAuthorityProfile::Filesystem {
+                input_pointers: Vec::new(),
+            },
+            vec![PermissionResource {
+                kind: PermissionResourceKind::File,
+                value: PROTECTED_PATH.into(),
+                access: Some(PermissionResourceAccess::Read),
+                protected,
+                requires_prompt: protected,
+                attributes: BTreeMap::new(),
+            }],
+            json!({"path": PROTECTED_PATH, "offset": offset}),
+        )
+    }
+
+    fn option_ids(request: &PermissionRequest) -> Vec<&str> {
+        request
+            .options
+            .iter()
+            .map(|option| option.id.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn a_protected_path_is_offered_a_reusable_exact_path_grant() {
+        let request = filesystem_request(true, FIRST_READ_OFFSET);
+
+        let option = request
+            .options
+            .iter()
+            .find(|option| option.id == EXACT_RESOURCES_OPTION)
+            .expect("protected path must still earn an exact-path option");
+
+        assert!(matches!(
+            option.rule.arguments,
+            PermissionArgumentConstraint::Unconstrained
+        ));
+        assert_eq!(option.rule.resources[0].protected, Some(true));
+        assert!(
+            option
+                .allowed_lifetimes
+                .contains(&PermissionLifetime::Conversation)
+        );
+    }
+
+    #[test]
+    fn a_protected_path_is_never_offered_a_subtree_grant() {
+        let request = filesystem_request(true, FIRST_READ_OFFSET);
+        let ids = option_ids(&request);
+
+        assert!(!ids.contains(&SUBTREE_OPTION), "{ids:?}");
+        assert!(!ids.contains(&PROJECT_OPTION), "{ids:?}");
+    }
+
+    #[test]
+    fn an_unprotected_path_still_earns_every_filesystem_grant() {
+        let request = filesystem_request(false, FIRST_READ_OFFSET);
+        let ids = option_ids(&request);
+
+        assert!(ids.contains(&EXACT_RESOURCES_OPTION), "{ids:?}");
+        assert!(ids.contains(&SUBTREE_OPTION), "{ids:?}");
+        assert!(ids.contains(&PROJECT_OPTION), "{ids:?}");
+    }
+
+    #[test]
+    fn a_reusable_protected_grant_covers_the_same_path_under_a_different_input() {
+        let granted = filesystem_request(true, FIRST_READ_OFFSET);
+        let rule = granted
+            .option_rule(EXACT_RESOURCES_OPTION, PermissionLifetime::Conversation)
+            .expect("protected path must still earn an exact-path option");
+
+        let repeat = filesystem_request(true, LATER_READ_OFFSET);
+
+        assert_ne!(granted.input_digest, repeat.input_digest);
+        assert!(permission_rule_covers_request(&rule, &repeat));
+    }
+
+    const READ_CONTRACT: &str = "file.read.v1";
+    const GREP_CONTRACT: &str = "file.grep.v1";
+    const WRITE_CONTRACT: &str = "file.write.v1";
+    const SOURCE_FILE: &str = "/project/src/main.rs";
+    const SOURCE_DIR: &str = "/project/src";
+
+    fn workcell_request(
+        contract: &str,
+        kind: PermissionResourceKind,
+        access: PermissionResourceAccess,
+        value: &str,
+    ) -> PermissionRequest {
+        let intent = PermissionIntent::new(
+            PermissionScopes::single(value.to_owned()),
+            vec![PermissionResource {
+                kind,
+                value: value.into(),
+                access: Some(access),
+                protected: false,
+                requires_prompt: false,
+                attributes: BTreeMap::new(),
+            }],
+            PermissionRisk::Medium,
+        )
+        .with_authority(PermissionAuthorityProfile::Filesystem {
+            input_pointers: Vec::new(),
+        });
+        PermissionRequest::from_intent_with_identity(
+            "request".into(),
+            ToolKey::native("workcell_file_tool"),
+            &intent,
+            json!({ "path": value }),
+            Path::new("/project"),
+            PermissionSubject::Native {
+                owner: WORKCELL_OWNER.into(),
+                contract: contract.into(),
+            },
+            PermissionExecutorKind::Native,
+        )
+    }
+
+    fn read_subtree_rule(option: &str) -> StructuredPermissionRule {
+        workcell_request(
+            READ_CONTRACT,
+            PermissionResourceKind::File,
+            PermissionResourceAccess::Read,
+            SOURCE_FILE,
+        )
+        .option_rule(option, PermissionLifetime::Conversation)
+        .expect("a first-party read must offer a subtree grant")
+    }
+
+    #[test]
+    fn a_read_subtree_grant_covers_a_later_search_by_another_contract() {
+        let rule = read_subtree_rule(SUBTREE_OPTION);
+
+        let grep = workcell_request(
+            GREP_CONTRACT,
+            PermissionResourceKind::Directory,
+            PermissionResourceAccess::Search,
+            SOURCE_DIR,
+        );
+
+        assert_ne!(rule.subject, grep.subject);
+        assert!(permission_rule_covers_request(&rule, &grep));
+    }
+
+    #[test]
+    fn a_read_subtree_grant_never_covers_a_write_to_the_same_subtree() {
+        let rule = read_subtree_rule(SUBTREE_OPTION);
+
+        let write = workcell_request(
+            WRITE_CONTRACT,
+            PermissionResourceKind::File,
+            PermissionResourceAccess::Write,
+            SOURCE_FILE,
+        );
+
+        assert!(!permission_rule_covers_request(&rule, &write));
+    }
+
+    /// The subject check already rejects a real write, since the write contracts
+    /// are not family members. This pins the independent resource check, so a
+    /// caller presenting a reading contract with a write resource is still
+    /// refused rather than relying on subject filtering alone.
+    #[test]
+    fn a_read_family_grant_refuses_a_write_resource_from_a_reading_contract() {
+        let rule = read_subtree_rule(SUBTREE_OPTION);
+        let mut forged = workcell_request(
+            READ_CONTRACT,
+            PermissionResourceKind::File,
+            PermissionResourceAccess::Read,
+            SOURCE_FILE,
+        );
+        forged.resources[0].access = Some(PermissionResourceAccess::Write);
+
+        assert_eq!(rule.subject, forged.subject);
+        assert!(!permission_rule_covers_request(&rule, &forged));
+    }
+
+    #[test]
+    fn a_read_family_grant_stays_inside_its_trust_domain() {
+        let rule = read_subtree_rule(SUBTREE_OPTION);
+        let mut outsider = workcell_request(
+            READ_CONTRACT,
+            PermissionResourceKind::File,
+            PermissionResourceAccess::Read,
+            SOURCE_FILE,
+        );
+        outsider.subject = PermissionSubject::Native {
+            owner: NATIVE_OWNER.into(),
+            contract: READ_CONTRACT.into(),
+        };
+
+        assert!(!permission_rule_covers_request(&rule, &outsider));
+    }
+
+    #[test_case(SUBTREE_OPTION; "subtree grant is widened")]
+    #[test_case(PROJECT_OPTION; "project grant is widened")]
+    fn a_first_party_read_mints_the_filesystem_read_family(option: &str) {
+        assert_eq!(
+            read_subtree_rule(option).family,
+            Some(PermissionCapabilityFamily::FilesystemRead)
+        );
+    }
+
+    #[test]
+    fn the_exact_path_grant_is_never_widened() {
+        assert_eq!(read_subtree_rule(EXACT_RESOURCES_OPTION).family, None);
+    }
+
+    #[test]
+    fn a_write_request_mints_no_family() {
+        let rule = workcell_request(
+            WRITE_CONTRACT,
+            PermissionResourceKind::File,
+            PermissionResourceAccess::Write,
+            SOURCE_FILE,
+        )
+        .option_rule(SUBTREE_OPTION, PermissionLifetime::Conversation)
+        .expect("a write still offers a subtree grant");
+
+        assert_eq!(rule.family, None);
     }
 
     #[test]
