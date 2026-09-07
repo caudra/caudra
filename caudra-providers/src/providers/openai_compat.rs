@@ -193,7 +193,12 @@ impl OpenAiCompatProvider {
         // bytes flow. Neither bounds a server that accepts the request and
         // then never answers, so the header wait gets the stream budget too.
         let response = futures_lite::future::or(
-            async { self.client.send_async(request).await.map_err(AgentError::from) },
+            async {
+                self.client
+                    .send_async(request)
+                    .await
+                    .map_err(AgentError::from)
+            },
             async {
                 smol::Timer::after(self.stream_timeout).await;
                 Err(AgentError::Timeout {
