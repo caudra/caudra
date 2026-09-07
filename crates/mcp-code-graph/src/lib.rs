@@ -22,6 +22,8 @@
 
 pub mod catalog;
 pub mod crawl;
+#[cfg(feature = "mcp")]
+pub mod dispatch;
 pub mod engine;
 pub mod error;
 pub mod group;
