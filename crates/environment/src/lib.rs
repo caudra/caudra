@@ -41,6 +41,18 @@ const MAX_PROBE_OUTPUT_BYTES: u64 = 4_096;
 const MAX_METADATA_BYTES: u64 = 64 * 1024;
 const INHERITED_ENVIRONMENT: [&str; 6] = ["PATH", "LANG", "LC_ALL", "TERM", "SystemRoot", "WINDIR"];
 
+/// Conventional proxy variables, observed by presence only.
+///
+/// `NO_PROXY` is deliberately absent: a bypass list alone does not route egress through a proxy.
+const PROXY_ENVIRONMENT: [&str; 6] = [
+    "HTTPS_PROXY",
+    "https_proxy",
+    "HTTP_PROXY",
+    "http_proxy",
+    "ALL_PROXY",
+    "all_proxy",
+];
+
 #[derive(Clone, Debug)]
 pub(crate) struct ExecutionEnvironmentSnapshot {
     os: OsDescriptor,
@@ -48,6 +60,7 @@ pub(crate) struct ExecutionEnvironmentSnapshot {
     container: ContainerDescriptor,
     workspace: WorkspaceDescriptor,
     commands: Vec<CommandDescriptor>,
+    proxied: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -546,7 +559,7 @@ fn output_schema() -> serde_json::Map<String, Value> {
                 "properties": {
                     "shell": {"enum": ["bash", "cmd", "other", "none"]},
                     "sandbox": {"enum": ["container", "virtual-machine", "unknown"]},
-                    "networkAccess": {"const": "host-policy"},
+                    "networkAccess": {"enum": ["host-policy", "proxied"]},
                     "environmentInheritance": {"enum": ["allowlisted", "not-applicable"]},
                     "privilege": {
                         "type": "object",
@@ -667,6 +680,17 @@ fn tool_error(message: impl Into<String>) -> CallToolResult {
     CallToolResult::error(vec![ContentBlock::text(message.into())])
 }
 
+/// Whether this process's environment selects an outbound proxy.
+///
+/// Presence only: the value is never read into the disclosure, because a proxy URL is operator
+/// topology and may carry credentials. This is an observation rather than validation, so a
+/// malformed value still reports a proxy — it is also still forwarded verbatim to a shell child.
+fn proxy_configured() -> bool {
+    PROXY_ENVIRONMENT.iter().any(|name| {
+        std::env::var_os(name).is_some_and(|value| !value.to_string_lossy().trim().is_empty())
+    })
+}
+
 impl ExecutionEnvironmentSnapshot {
     pub(crate) async fn collect(root: Option<&Path>) -> Self {
         let canonical_root = canonical_root(root).await;
@@ -700,6 +724,7 @@ impl ExecutionEnvironmentSnapshot {
             container,
             workspace,
             commands,
+            proxied: proxy_configured(),
         }
     }
 
@@ -722,7 +747,11 @@ impl ExecutionEnvironmentSnapshot {
                 "none"
             },
             sandbox: sandbox_for_container(self.container.kind),
-            network_access: "host-policy",
+            network_access: if self.proxied {
+                "proxied"
+            } else {
+                "host-policy"
+            },
             environment_inheritance: if groups.shell {
                 "allowlisted"
             } else {
@@ -1648,6 +1677,36 @@ mod tests {
         assert_eq!(neutral.name, mcp.name);
         assert_eq!(neutral.input_schema, *mcp.input_schema);
         assert_eq!(neutral.contract_id, "execution-environment.snapshot.v1");
+    }
+
+    #[tokio::test]
+    async fn network_access_reports_an_observed_proxy() {
+        let schema = output_schema();
+        let allowed = schema["properties"]["execution"]["properties"]["networkAccess"]["enum"]
+            .as_array()
+            .expect("networkAccess is an enum");
+        let groups = ToolGroupDisclosure::default();
+        let mut snapshot = ExecutionEnvironmentSnapshot::collect(None).await;
+
+        snapshot.proxied = false;
+        let direct = snapshot.output(groups);
+        snapshot.proxied = true;
+        let proxied = snapshot.output(groups);
+
+        assert_eq!(direct.execution.network_access, "host-policy");
+        assert_eq!(proxied.execution.network_access, "proxied");
+        for value in [
+            direct.execution.network_access,
+            proxied.execution.network_access,
+        ] {
+            assert!(
+                allowed
+                    .iter()
+                    .any(|allowed| allowed.as_str() == Some(value))
+            );
+        }
+        // The observation is part of the canonical hash, so it must move the revision.
+        assert_ne!(direct.snapshot_revision, proxied.snapshot_revision);
     }
 
     #[test]

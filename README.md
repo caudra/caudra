@@ -316,6 +316,12 @@ every `websearch` backend, and source icons.
 | `--http-proxy`, `--no-proxy` | Flags that override every variable |
 | `--no-http-proxy` | Ignore all of the above and dial directly |
 
+The `shell` tool forwards the conventional variables, in both cases, to every command it runs, so
+`curl`, `git`, `pip`, and `npm` reach the same proxy with no extra setup. Forwarding is verbatim,
+credentials included. The Workcell-specific settings and the flags are not forwarded and do not strip
+an ambient value: they select the proxy for Workcell's own web tools only, so `--no-http-proxy` makes
+`webfetch` dial directly while a shell command still sees the environment it was given.
+
 Values are read once at startup, so a shell command cannot change the selection: it alters only its
 own children's environment. A malformed proxy value stops startup rather than falling back to a
 direct dial, because under enforcement that fallback would look like an egress bypass. Only `http`
@@ -887,7 +893,9 @@ where possible so icon discovery does not refetch the page body.
   win. Policy inspects command syntax but cannot infer the behavior of scripts, interpreters, wrappers,
   or allowed programs.
 - The child receives a cleaned allowlist of environment variables rather than the complete Workcell
-  environment. Standard input is closed; stdout and stderr are captured separately.
+  environment. The allowlist covers `PATH`, home, locale, temporary-directory, and the conventional
+  proxy variables, so a credentialed proxy URL is readable by any admitted command. Standard input is
+  closed; stdout and stderr are captured separately.
 - With an MCP progress token, decoded stdout and stderr chunks are sent as ordered
   `notifications/progress` messages before the final result. Without a token, output is still drained
   safely and only bounded tails are returned.
@@ -966,6 +974,10 @@ value of its final expression along with anything it printed.
   selects `nix`. macOS selects Homebrew, Windows selects WinGet, and FreeBSD selects `pkg`. The selected
   executable is checked outside the configured root and its normalized version is included when the
   fixed version probe succeeds.
+- `execution.networkAccess` reports `proxied` when the process environment selects an outbound proxy
+  and `host-policy` otherwise. It describes what a shell command faces, not Workcell's own web tools,
+  which `--http-proxy` and `--no-http-proxy` can point elsewhere. Only presence is observed; the proxy
+  URL is never disclosed.
 - On Unix, `execution.privilege.effectiveRoot` reports whether the Workcell process has effective UID 0.
   UID 0 may be constrained by a container or user namespace and does not imply host-level root.
 - A root process reports `nonInteractiveSudo: "not-needed"` without invoking sudo. A non-root Unix

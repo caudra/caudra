@@ -138,7 +138,7 @@
                 "sandbox": {
                   "enum": ["container", "virtual-machine", "unknown"]
                 },
-                "networkAccess": { "const": "host-policy" },
+                "networkAccess": { "enum": ["host-policy", "proxied"] },
                 "environmentInheritance": {
                   "enum": ["allowlisted", "not-applicable"]
                 },

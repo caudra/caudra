@@ -6,6 +6,7 @@
 //! equivalent graceful signaling or a reliable residual-tree existence check.
 
 use std::{
+    ffi::OsString,
     process::ExitStatus,
     time::{Duration, Instant},
 };
@@ -32,6 +33,10 @@ pub(crate) fn platform_command(script: &str) -> Command {
 }
 
 fn clean_environment(command: &mut Command) {
+    clean_environment_with(command, |name: &str| std::env::var_os(name));
+}
+
+fn clean_environment_with(command: &mut Command, read: impl Fn(&str) -> Option<OsString>) {
     command.env_clear();
     for name in [
         "PATH",
@@ -47,8 +52,21 @@ fn clean_environment(command: &mut Command) {
         "ComSpec",
         "SystemRoot",
         "WINDIR",
+        // Proxy selection is forwarded verbatim, credentials included. Under a sandbox whose only
+        // egress is an enforcing proxy, withholding it makes every network-using command fail
+        // closed; the accepted cost is that a credentialed proxy URL becomes readable by any
+        // admitted command. Both cases are listed because curl reads the lowercase names while
+        // most other clients read the uppercase ones.
+        "HTTP_PROXY",
+        "http_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+        "NO_PROXY",
+        "no_proxy",
     ] {
-        if let Some(value) = std::env::var_os(name) {
+        if let Some(value) = read(name) {
             command.env(name, value);
         }
     }
@@ -151,34 +169,71 @@ pub(crate) fn exit_signal(_status: &ExitStatus) -> Option<i32> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn child_environment_drops_runtime_and_provider_secrets() {
+    /// Resolve the child environment from a fixture instead of the real process environment, which
+    /// cannot be mutated from a test without `unsafe` under edition 2024.
+    fn child_environment(fixture: &[(&str, &str)]) -> Vec<(String, String)> {
         let mut command = Command::new("ignored");
+        for (name, value) in fixture {
+            command.env(name, value);
+        }
+        clean_environment_with(&mut command, |name| {
+            fixture
+                .iter()
+                .find(|(candidate, _)| *candidate == name)
+                .map(|(_, value)| OsString::from(*value))
+        });
         command
-            .env("WORKCELL_PRIVATE_SECRET", "private-secret-canary")
-            .env("WORKCELL_RUNTIME_SERVICE_TOKEN", "service-secret-canary")
-            .env("EXA_API_KEY", "web-secret-canary");
-        clean_environment(&mut command);
-        let inherited = command
             .as_std()
             .get_envs()
-            .filter_map(|(name, value)| value.map(|value| (name, value)))
-            .collect::<Vec<_>>();
+            .filter_map(|(name, value)| {
+                value.map(|value| {
+                    (
+                        name.to_string_lossy().into_owned(),
+                        value.to_string_lossy().into_owned(),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn child_environment_drops_runtime_and_provider_secrets() {
+        let inherited = child_environment(&[
+            ("PATH", "/usr/bin"),
+            ("WORKCELL_PRIVATE_SECRET", "private-secret-canary"),
+            ("WORKCELL_RUNTIME_SERVICE_TOKEN", "service-secret-canary"),
+            ("EXA_API_KEY", "web-secret-canary"),
+        ]);
         for forbidden in [
             "WORKCELL_PRIVATE_SECRET",
             "WORKCELL_RUNTIME_SERVICE_TOKEN",
             "EXA_API_KEY",
         ] {
-            assert!(
-                inherited
-                    .iter()
-                    .all(|(name, _)| name.to_string_lossy() != forbidden)
-            );
+            assert!(inherited.iter().all(|(name, _)| name.as_str() != forbidden));
         }
         assert!(
             inherited
                 .iter()
-                .all(|(_, value)| !value.to_string_lossy().contains("secret-canary"))
+                .all(|(_, value)| !value.contains("secret-canary"))
         );
+    }
+
+    #[test]
+    fn child_environment_forwards_proxy_configuration() {
+        let fixture = [
+            ("HTTPS_PROXY", "http://operator:hunter2@proxy.internal:8080"),
+            ("http_proxy", "http://proxy.internal:8080"),
+            ("ALL_PROXY", "http://proxy.internal:3128"),
+            ("NO_PROXY", "localhost,127.0.0.1,10.0.0.0/8"),
+        ];
+        let inherited = child_environment(&fixture);
+        for (name, value) in fixture {
+            assert!(
+                inherited
+                    .iter()
+                    .any(|(candidate, forwarded)| candidate.as_str() == name && forwarded == value),
+                "{name} must reach the child unmodified"
+            );
+        }
     }
 }

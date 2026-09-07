@@ -26,6 +26,14 @@ and source icons. The selection is a startup snapshot: it is read once, and beca
 changes only its own children's environment, no tool call can influence it. A malformed value stops
 startup instead of falling back to a direct dial.
 
+The `shell` tool forwards the conventional proxy variables to every command it runs, verbatim and
+including credentials, because withholding them makes every network-using command fail closed inside
+a guest whose only egress is an enforcing proxy. A credentialed proxy URL is therefore readable by
+any admitted command; prefer a proxy that authorizes the source over one that requires a password in
+the URL. The Workcell-specific settings do not constrain a shell child, and `--no-http-proxy` does not
+remove an ambient variable from a command's environment. `execution.networkAccess` reports `proxied`
+when such a variable is observed, disclosing presence only.
+
 A proxied request is not resolved by Workcell. Scheme, URL-credential, special-use-hostname, and
 IP-literal policy still reject targets locally before the proxy is contacted, but the address
 decision for a hostname, including DNS rebinding defense, is delegated to the proxy. Deploy this only
