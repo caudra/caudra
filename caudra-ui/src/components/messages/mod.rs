@@ -1164,6 +1164,24 @@ impl MessagesPanel {
         self.rebuild_tool_segment(tool_id);
     }
 
+    /// The children a still-streaming `batch` has named. Drawn through the
+    /// same roster the running call publishes, so a child reads the same
+    /// before it is dispatched as it does after. `ToolStart` replaces it with
+    /// the roster the batch actually dispatched.
+    pub fn tool_input_roster(&mut self, tool_id: &str, entries: Option<Vec<BatchToolEntry>>) {
+        let Some(entries) = entries else {
+            return;
+        };
+        let Some(msg) = self.find_tool_msg_mut(tool_id) else {
+            return;
+        };
+        msg.tool_output = Some(Arc::new(ToolOutput::Batch {
+            entries,
+            text: String::new(),
+        }));
+        self.rebuild_tool_segment(tool_id);
+    }
+
     /// The file a still-streaming write is spelling out. `ToolStart` drops it
     /// for the call's real output, so it only ever fills the wait.
     ///

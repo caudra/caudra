@@ -159,8 +159,10 @@ impl Chat {
                 preview,
                 size,
                 body,
+                roster,
                 ..
             } => {
+                self.messages_panel.tool_input_roster(&id, roster);
                 self.messages_panel.tool_input_preview(&id, preview, size);
                 self.messages_panel.tool_input_body(&id, body);
             }

@@ -10,6 +10,7 @@ pub mod title;
 mod tool_body;
 pub mod tool_dispatch;
 mod tool_preview;
+mod tool_roster;
 
 pub(crate) use compaction::compaction_reserve;
 pub use compaction::{auto_compact_enabled, compact};

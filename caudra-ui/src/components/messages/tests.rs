@@ -6022,6 +6022,57 @@ fn a_batch_that_finished_does_not_draw_the_roster_it_started_with() {
     );
 }
 
+/// The reported gap: a batch spent its whole stream as the bare word
+/// `Batching` and then produced every child at once. The roster read out of
+/// the still-arriving arguments draws through the same path the dispatched
+/// one does, so a child reads the same before it runs as after.
+#[test]
+fn a_streamed_roster_draws_its_children_before_the_batch_runs() {
+    const STREAMED_PATH: &str = "src/streamed.rs";
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.tool_pending("t1".into(), BATCH_TOOL);
+    let mut child = pending_child("file_read");
+    child.summary = STREAMED_PATH.into();
+    panel.tool_input_roster("t1", Some(vec![child]));
+    render(&mut panel, 80, 24);
+
+    let text = seg_text(&panel, "t1");
+    assert!(text.contains(STREAMED_PATH), "{text:?}");
+    assert!(text.contains(QUEUED_MARK), "{text:?}");
+}
+
+/// The streamed roster stands in for one the batch has not published yet, so
+/// the real one has to displace it rather than survive alongside it.
+#[test]
+fn a_streamed_roster_gives_way_to_the_dispatched_one() {
+    const STREAMED_PATH: &str = "src/streamed.rs";
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.tool_pending("t1".into(), BATCH_TOOL);
+    let mut child = pending_child("file_read");
+    child.summary = STREAMED_PATH.into();
+    panel.tool_input_roster("t1", Some(vec![child]));
+    render(&mut panel, 80, 24);
+    settle_highlights(&mut panel);
+
+    let mut ev = start("t1", BATCH_TOOL);
+    ev.output = Some(ToolOutput::Batch {
+        entries: vec![pending_child("file_grep")],
+        text: String::new(),
+    });
+    panel.tool_start(ev);
+    render(&mut panel, 80, 24);
+
+    let text = seg_text(&panel, "t1");
+    assert!(!text.contains(STREAMED_PATH), "{text:?}");
+}
+
+#[test]
+fn a_roster_for_an_unknown_call_is_ignored() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.tool_input_roster("t1", Some(vec![pending_child("file_read")]));
+    assert!(panel.messages.is_empty());
+}
+
 const FOLD_MARK: &str = "\u{2026}";
 const QUEUED_MARK: &str = "(queued)";
 

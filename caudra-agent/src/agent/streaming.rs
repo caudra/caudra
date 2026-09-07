@@ -12,7 +12,10 @@ use tracing::warn;
 
 use super::tool_body::BodyStream;
 use super::tool_preview;
+use super::tool_roster::RosterStream;
 use crate::cancel::CancelToken;
+use crate::tools::native::batch;
+use crate::types::BatchToolEntry;
 use crate::{AgentError, AgentEvent, EventSender};
 
 const FUNCTIONS_PREFIX: &str = "functions.";
@@ -46,6 +49,7 @@ struct Changed {
     preview: Option<String>,
     size: Option<String>,
     body: Option<String>,
+    roster: Option<Vec<BatchToolEntry>>,
 }
 
 /// The argument JSON of one tool call as it arrives, kept only until the
@@ -62,12 +66,15 @@ struct PendingInput {
     body: Option<BodyStream>,
     /// The last size published, so a body does not repaint the row per token.
     size: Option<String>,
+    /// Present only for `batch`, whose whole argument is a list of other calls.
+    roster: Option<RosterStream>,
 }
 
 impl PendingInput {
     fn new(name: String) -> Self {
         Self {
             body: BodyStream::new(&name),
+            roster: RosterStream::new(&name),
             name,
             json: String::new(),
             preview: None,
@@ -79,6 +86,18 @@ impl PendingInput {
     /// The headline settles long before a file body finishes arriving, so the
     /// body reader keeps taking fragments the preview has stopped caring about.
     fn absorb(&mut self, delta: &str) -> Changed {
+        // A batch has no headline of its own to scan for: its children are the
+        // headline, and the count they add up to is what the row says.
+        if self.roster.is_some() {
+            let Some(entries) = self.roster.as_mut().and_then(|r| r.absorb(delta)) else {
+                return Changed::default();
+            };
+            return Changed {
+                preview: self.published(batch::roster_header(entries.len())),
+                roster: Some(entries),
+                ..Changed::default()
+            };
+        }
         let preview = self.absorb_preview(delta);
         let Some(stream) = self.body.as_mut() else {
             return Changed {
@@ -100,6 +119,7 @@ impl PendingInput {
             preview: named.and_then(|header| self.published(header)).or(preview),
             size,
             body,
+            roster: None,
         }
     }
 
@@ -186,6 +206,7 @@ async fn forward_provider_events(
                     preview: changed.preview,
                     size: changed.size,
                     body: changed.body,
+                    roster: changed.roster,
                 }
             }
             ProviderEvent::PromptProgress {
@@ -484,6 +505,9 @@ mod tests {
     const WRITE: &str = "file_write";
     const EDIT: &str = "file_edit";
     const PATCH: &str = "file_apply_patch";
+    const BATCH: &str = "batch";
+    const READ: &str = "file_read";
+    const SHELL: &str = "shell";
     /// A body long enough to cross the first step and reach the second.
     const STEPPED_LINES: usize = 9;
     const THRESHOLD_LINES: usize = 4;
@@ -544,6 +568,18 @@ mod tests {
             .collect()
     }
 
+    /// Every roster published, in order, as the tools each row names.
+    fn rosters(fragments: &[&str]) -> Vec<Vec<String>> {
+        deltas(BATCH, fragments)
+            .into_iter()
+            .filter_map(|event| match event {
+                AgentEvent::ToolInputDelta { roster, .. } => roster,
+                _ => None,
+            })
+            .map(|entries| entries.into_iter().map(|entry| entry.tool).collect())
+            .collect()
+    }
+
     /// The decoded body, reassembled the way a reader accumulates it.
     fn published_body(tool: &str, fragments: &[&str]) -> String {
         deltas(tool, fragments)
@@ -584,6 +620,44 @@ mod tests {
     #[test]
     fn a_tool_with_nothing_short_to_show_publishes_no_preview() {
         assert!(previews("python_execution", &[r#"{"code": "print(1)"}"#]).is_empty());
+    }
+
+    /// A batch used to spend its whole stream as the bare word `Batching`,
+    /// then produce every child at once. Its children are its headline, so
+    /// they arrive as they are written.
+    #[test]
+    fn a_batch_publishes_its_children_as_they_are_named() {
+        let rosters = rosters(&[
+            r#"{"tool_calls": [{"tool": "file_read", "parameters": {"filePath": "a.rs"}}"#,
+            r#", {"tool": "shell", "parameters": {"command": "ls"}}]}"#,
+        ]);
+        assert_eq!(
+            rosters,
+            [vec![READ.to_owned()], vec![READ.to_owned(), SHELL.to_owned()]]
+        );
+    }
+
+    /// The count is the header a batch keeps once it runs, so the row it draws
+    /// while streaming is the row it settles on.
+    #[test]
+    fn a_batch_counts_its_children_in_the_header_it_will_keep() {
+        let published = previews(
+            BATCH,
+            &[
+                r#"{"tool_calls": [{"tool": "file_read", "parameters": {"filePath": "a.rs"}}"#,
+                r#", {"tool": "shell", "parameters": {"command": "ls"}}]}"#,
+            ],
+        );
+        assert_eq!(published, [batch::roster_header(1), batch::roster_header(2)]);
+    }
+
+    /// Only a batch has a roster, and nothing else may be mistaken for one.
+    #[test]
+    fn another_tools_arguments_publish_no_roster() {
+        let carried = deltas(SHELL, &[r#"{"command": "ls", "tool_calls": [{"tool": "x"}]}"#])
+            .into_iter()
+            .any(|event| matches!(event, AgentEvent::ToolInputDelta { roster: Some(_), .. }));
+        assert!(!carried);
     }
 
     #[test]

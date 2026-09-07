@@ -1098,6 +1098,12 @@ pub enum AgentEvent {
         /// outgrows what a card can hold.
         #[serde(skip_serializing_if = "Option::is_none")]
         body: Option<String>,
+        /// The children a `batch` has named so far, as pending roster rows.
+        /// `Some` only when a row was added or one changed, so a long list
+        /// does not redraw the card per token. `ToolStart` replaces it with
+        /// the roster the batch actually dispatched.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        roster: Option<Vec<BatchToolEntry>>,
     },
     ToolStart(Box<ToolStartEvent>),
     /// `content` is the **full accumulated output** so far, not a delta.

@@ -169,6 +169,22 @@ pub(crate) fn past_scan_cap(len: usize) -> bool {
     len > PREVIEW_SCAN_CAP
 }
 
+/// The value of the first top-level member named `key`, with whether its
+/// closing quote arrived. `None` while the member is unwritten, or once an
+/// earlier value stops the scan short of it.
+pub(super) fn string_member(json: &str, key: &str) -> Option<(String, bool)> {
+    let (_, value, complete) = Scanner::new(json).find_string(|found| same_key(found, key))?;
+    Some((value, complete))
+}
+
+/// Everything that has arrived of the object value of the first top-level
+/// member named `key`, from its opening brace. `None` while the member is
+/// unwritten or its value is not an object.
+pub(super) fn object_member<'a>(json: &'a str, key: &str) -> Option<&'a str> {
+    let start = Scanner::new(json).find_object(|found| same_key(found, key))?;
+    Some(&json[start..])
+}
+
 /// Truncating mid-character is fine: the scanner tolerates any tail, and past
 /// the cap the answer is "give up" either way.
 fn capped(json: &str) -> &str {
@@ -240,15 +256,10 @@ impl<'a> Scanner<'a> {
         }
     }
 
-    /// The first top-level `"key": "value"` whose key satisfies `matches`,
-    /// with whether the value's closing quote arrived. Scanning stops at the
-    /// first string value that is both unwanted and unfinished, because
-    /// nothing can follow it yet.
-    fn find_string(&mut self, matches: impl Fn(&str) -> bool) -> Option<(String, String, bool)> {
-        self.skip_ws();
-        if !self.eat('{') {
-            return None;
-        }
+    /// Leaves the reader on the value of the next top-level member and returns
+    /// its key. `None` once the object closes, or once the prefix stops before
+    /// a value begins.
+    fn next_key(&mut self) -> Option<String> {
         loop {
             self.skip_ws();
             match self.peek()? {
@@ -268,6 +279,20 @@ impl<'a> Scanner<'a> {
                 return None;
             }
             self.skip_ws();
+            return Some(key);
+        }
+    }
+
+    /// The first top-level `"key": "value"` whose key satisfies `matches`,
+    /// with whether the value's closing quote arrived. Scanning stops at the
+    /// first string value that is both unwanted and unfinished, because
+    /// nothing can follow it yet.
+    fn find_string(&mut self, matches: impl Fn(&str) -> bool) -> Option<(String, String, bool)> {
+        self.skip_ws();
+        if !self.eat('{') {
+            return None;
+        }
+        while let Some(key) = self.next_key() {
             if self.peek()? == '"' {
                 self.bump();
                 let mut value = String::new();
@@ -282,6 +307,24 @@ impl<'a> Scanner<'a> {
                 self.skip_value();
             }
         }
+        None
+    }
+
+    /// Where the object value of the first member satisfying `matches` opens.
+    /// A member of that name whose value is not an object is skipped like any
+    /// other, so the shape is part of what is being matched.
+    fn find_object(&mut self, matches: impl Fn(&str) -> bool) -> Option<usize> {
+        self.skip_ws();
+        if !self.eat('{') {
+            return None;
+        }
+        while let Some(key) = self.next_key() {
+            if self.peek()? == '{' && matches(&key) {
+                return Some(self.pos);
+            }
+            self.skip_value();
+        }
+        None
     }
 
     /// Decodes a string body, the opening quote already consumed. Returns
@@ -436,6 +479,27 @@ mod tests {
     #[test_case(10, Some("10+ lines") ; "the_next_step")]
     fn a_streamed_size_is_a_floor(lines: usize, expected: Option<&str>) {
         assert_eq!(size_label(lines).as_deref(), expected);
+    }
+
+    #[test_case(r#"{"tool": "shell", "parameters": {}}"#, Some(("shell", true)) ; "a_closed_value")]
+    #[test_case(r#"{"tool": "she"#, Some(("she", false)) ; "a_value_still_arriving")]
+    #[test_case(r#"{"parameters": {"a": 1}, "tool": "shell""#, Some(("shell", true)) ; "after_a_nested_object")]
+    #[test_case(r#"{"tool": {"nested": 1}"#, None ; "a_value_of_the_wrong_shape")]
+    #[test_case(r#"{"other": 1"#, None ; "an_absent_member")]
+    fn a_string_member_is_read_with_its_completeness(json: &str, expected: Option<(&str, bool)>) {
+        let found = super::string_member(json, "tool");
+        assert_eq!(
+            found.as_ref().map(|(value, done)| (value.as_str(), *done)),
+            expected
+        );
+    }
+
+    #[test_case(r#"{"tool": "shell", "parameters": {"command": "ls"#, Some(r#"{"command": "ls"#) ; "an_object_still_arriving")]
+    #[test_case(r#"{"parameters": {"a": {"b": 1}}, "tool": "x""#, Some(r#"{"a": {"b": 1}}, "tool": "x""#) ; "everything_from_the_brace")]
+    #[test_case(r#"{"tool": "shell", "command": "ls""#, None ; "the_flat_shape_has_none")]
+    #[test_case(r#"{"parameters": "not an object""#, None ; "a_member_of_the_wrong_shape")]
+    fn an_object_member_is_returned_from_its_brace(json: &str, expected: Option<&str>) {
+        assert_eq!(super::object_member(json, "parameters"), expected);
     }
 
     #[test]

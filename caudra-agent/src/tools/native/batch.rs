@@ -37,6 +37,7 @@ Rules:
 - Do NOT use for dependent operations or when filtering results (use python_execution)";
 
 const SECTION_PREFIX: &str = "## ";
+const HEADER_SUFFIX: &str = " tools";
 const ERROR_PREFIX: &str = "[ERROR] ";
 const EMPTY_ERROR: &str = "provide at least one tool call";
 const NESTED_ERROR: &str = "cannot nest batch inside batch";
@@ -122,6 +123,13 @@ impl Tool for BatchTool {
 static DISCARDED_ERROR: LazyLock<String> =
     LazyLock::new(|| format!("{DISCARDED_PREFIX}{MAX_BATCH_SIZE}{DISCARDED_SUFFIX}"));
 
+/// What a batch calls itself. Shared with the reader that counts the children
+/// out of the still-arriving arguments, so the header it shows while the call
+/// streams is the one it keeps once the call runs.
+pub(crate) fn roster_header(count: usize) -> String {
+    format!("{count}{HEADER_SUFFIX}")
+}
+
 struct Child {
     tool: String,
     params: Value,
@@ -180,10 +188,7 @@ struct BatchCall {
 
 impl ToolInvocation for BatchCall {
     fn start_header(&self) -> HeaderFuture {
-        HeaderFuture::Ready(HeaderResult::plain(format!(
-            "{} tools",
-            self.children.len()
-        )))
+        HeaderFuture::Ready(HeaderResult::plain(roster_header(self.children.len())))
     }
 
     /// Publishing the roster up front is what lets progress events name a
