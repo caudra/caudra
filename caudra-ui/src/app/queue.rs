@@ -1075,6 +1075,12 @@ impl App {
         if let Err(error) = result {
             self.flash(format!("Failed to snapshot workspace: {error}"));
             self.status = Status::Idle;
+            // The bubble was never drawn and the queue never saw this text, so
+            // dropping `pending` here is the only thing standing between the
+            // user and losing what they typed.
+            if !pending.display.is_empty() {
+                self.input_box.buffer.insert_text(&pending.display);
+            }
             return Vec::new();
         }
         self.fire_session_autocmd("TurnStart", serde_json::json!({}));

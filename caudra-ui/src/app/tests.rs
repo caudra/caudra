@@ -523,6 +523,21 @@ fn a_failed_submit_snapshot_starts_no_run() {
     );
 }
 
+/// The bubble is never drawn and the queue never sees this text, so a failed
+/// snapshot is the one path that can silently destroy what the user typed.
+#[test]
+fn a_failed_submit_snapshot_returns_the_typed_text() {
+    let mut app = test_app();
+    let actions = type_and_submit_unsettled(&mut app, "hi");
+    let [Action::SnapshotWorkspace { run_id, .. }] = actions.as_slice() else {
+        panic!("submit must defer its snapshot");
+    };
+
+    app.on_workspace_snapshot(*run_id, Err(SNAPSHOT_ERR.into()));
+
+    assert_eq!(app.input_box.buffer.value(), "hi");
+}
+
 /// A snapshot that lands after its run was superseded must not start it.
 #[test]
 fn a_stale_submit_snapshot_is_dropped() {
