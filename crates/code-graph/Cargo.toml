@@ -1,0 +1,22 @@
+[package]
+name = "workcell-code-graph"
+description = "Symbol extraction, reference resolution, and ranking over a source tree"
+readme = "README.md"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[features]
+default = []
+
+[dependencies]
+tree-sitter.workspace = true
+workcell-source-languages.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

@@ -4657,6 +4657,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "workcell-code-graph"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "tree-sitter",
+ "workcell-source-languages",
+]
+
+[[package]]
 name = "workcell-environment"
 version = "0.1.0"
 dependencies = [
