@@ -1,0 +1,14 @@
+{
+  "name": "catalog",
+  "version": "0.1.0",
+  "scripts": {
+    "build": "tsc --build",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "lodash.merge": "^4.6.2"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

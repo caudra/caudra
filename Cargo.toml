@@ -20,6 +20,7 @@ members = [
   "crates/net",
   "crates/output-filter",
   "crates/source-icons",
+  "crates/source-languages",
   "crates/tool-contract",
   "crates/workcell",
 ]
@@ -121,6 +122,7 @@ workcell-mcp-code = { path = "crates/mcp-code", default-features = false }
 workcell-mcp-files = { path = "crates/mcp-files", default-features = false }
 workcell-mcp-shell = { path = "crates/mcp-shell", default-features = false }
 workcell-mcp-web = { path = "crates/mcp-web", default-features = false }
+workcell-source-languages = { path = "crates/source-languages" }
 workcell-monty-worker = { path = "crates/monty-worker" }
 
 [workspace.lints.rust]

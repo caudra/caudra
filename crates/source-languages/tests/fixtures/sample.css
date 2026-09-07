@@ -1,0 +1,66 @@
+/* Fixture for the CSS tags query (tree-sitter-css). */
+
+@import url("reset.css");
+@import "tokens.css";
+@import url(layout.css);
+
+@charset "utf-8";
+
+:root {
+    --brand-fg: #101828;
+    --brand-bg: #ffffff;
+}
+
+html,
+body {
+    margin: 0;
+    color: var(--brand-fg);
+}
+
+.panel {
+    display: grid;
+    gap: 12px;
+}
+
+.panel > .panel__header {
+    font-weight: 600;
+}
+
+#app-shell {
+    min-height: 100vh;
+}
+
+a[data-state="active"]:hover::after {
+    content: "";
+}
+
+@media screen and (min-width: 48rem) {
+    .panel {
+        gap: 24px;
+    }
+
+    #app-shell {
+        padding: 32px;
+    }
+}
+
+@supports (display: grid) {
+    .panel {
+        grid-template-columns: 1fr 2fr;
+    }
+}
+
+@keyframes panel-fade-in {
+    from {
+        opacity: 0;
+    }
+
+    to {
+        opacity: 1;
+    }
+}
+
+@font-face {
+    font-family: "Workcell Sans";
+    src: url("workcell-sans.woff2");
+}

@@ -1,0 +1,30 @@
+"""Build targets for the sample workcell package."""
+
+load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library")
+load("//tools:defs.bzl", "workcell_test_suite")
+
+package(default_visibility = ["//visibility:public"])
+
+COMMON_COPTS = [
+    "-Wall",
+    "-Werror",
+]
+
+cc_library(
+    name = "logging",
+    srcs = ["logging.cc"],
+    hdrs = ["logging.h"],
+    copts = COMMON_COPTS,
+)
+
+cc_binary(
+    name = "workcell",
+    srcs = ["main.cc"],
+    copts = COMMON_COPTS,
+    deps = [":logging"],
+)
+
+workcell_test_suite(
+    name = "tests",
+    shard_count = 4,
+)

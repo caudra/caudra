@@ -1,0 +1,20 @@
+# Multi-stage build fixture. Containerfile is a config lane: instructions and
+# stage names become sections, never call edges.
+
+ARG RUST_VERSION=1.98
+
+FROM docker.io/library/rust:${RUST_VERSION} AS builder
+WORKDIR /src
+ENV CARGO_TERM_COLOR=never
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+RUN cargo build --release --locked
+
+FROM docker.io/library/debian:bookworm-slim AS runtime
+ARG PORT=8080
+ENV WORKCELL_MCP_ROOT=/workspace
+WORKDIR /workspace
+COPY --from=builder /src/target/release/workcell-mcp /usr/local/bin/workcell-mcp
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/workcell-mcp"]
+CMD ["--http", "0.0.0.0:8080"]

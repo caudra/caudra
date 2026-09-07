@@ -20,6 +20,7 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 use tree_sitter::{ParseOptions, Parser};
+use workcell_source_languages::Language;
 
 use crate::{
     FileResource, FileResourceAccess, FilesystemError,
@@ -36,44 +37,6 @@ use self::{
 
 const TRUNCATED: &str = "[truncated]";
 static PARSER_SEMAPHORE: Semaphore = Semaphore::const_new(INDEX_PARSER_CONCURRENCY);
-
-#[derive(Clone, Copy)]
-enum Language {
-    Rust,
-    Python,
-    TypeScript,
-    JavaScript,
-    Gleam,
-    Go,
-    Html,
-    Java,
-    C,
-    Cpp,
-    CSharp,
-    Ruby,
-    Php,
-    Swift,
-    Kotlin,
-    Scala,
-    Bash,
-    Lua,
-    Elixir,
-    Markdown,
-    BazelBuild,
-    BazelModule,
-    BazelBzl,
-    Zig,
-    Nix,
-    Dart,
-    Toml,
-    Yaml,
-    Sql,
-    Css,
-    Json,
-    Hcl,
-    Containerfile,
-    Make,
-}
 
 fn parse_skeleton(
     source: String,
@@ -156,143 +119,22 @@ fn revoke_queued_permit(permit: &Mutex<Option<SemaphorePermit<'static>>>) {
     }
 }
 
-impl Language {
-    fn detect(path: &Path) -> Result<Self, FilesystemError> {
-        let filename = path
-            .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or_default();
-        let exact = match filename {
-            "MODULE.bazel" => Some(Self::BazelModule),
-            "BUILD" | "BUILD.bazel" => Some(Self::BazelBuild),
-            "Containerfile" | "Dockerfile" => Some(Self::Containerfile),
-            "GNUmakefile" | "Makefile" => Some(Self::Make),
-            _ => None,
-        };
-        if let Some(language) = exact {
-            return Ok(language);
-        }
-        let Some(extension) = path.extension().and_then(|value| value.to_str()) else {
-            return Err(FilesystemError::message(
-                "Unsupported file type: (no extension). Use file_read instead.",
-            ));
-        };
-        match extension {
-            "rs" => Ok(Self::Rust),
-            "py" | "pyi" => Ok(Self::Python),
-            "ts" | "tsx" => Ok(Self::TypeScript),
-            "js" | "jsx" | "mjs" | "cjs" => Ok(Self::JavaScript),
-            "gleam" => Ok(Self::Gleam),
-            "go" => Ok(Self::Go),
-            "htm" | "html" => Ok(Self::Html),
-            "java" => Ok(Self::Java),
-            "c" | "h" => Ok(Self::C),
-            "cpp" | "cc" | "cxx" | "hpp" | "hxx" | "hh" | "ixx" => Ok(Self::Cpp),
-            "cs" => Ok(Self::CSharp),
-            "rb" | "rake" | "gemspec" => Ok(Self::Ruby),
-            "php" => Ok(Self::Php),
-            "swift" => Ok(Self::Swift),
-            "kt" | "kts" => Ok(Self::Kotlin),
-            "scala" | "sc" => Ok(Self::Scala),
-            "sh" | "bash" | "zsh" => Ok(Self::Bash),
-            "lua" => Ok(Self::Lua),
-            "ex" | "exs" => Ok(Self::Elixir),
-            "md" | "markdown" => Ok(Self::Markdown),
-            "bzl" => Ok(Self::BazelBzl),
-            "zig" => Ok(Self::Zig),
-            "nix" => Ok(Self::Nix),
-            "dart" => Ok(Self::Dart),
-            "toml" => Ok(Self::Toml),
-            "yaml" | "yml" => Ok(Self::Yaml),
-            "sql" => Ok(Self::Sql),
-            "css" => Ok(Self::Css),
-            "json" => Ok(Self::Json),
-            "hcl" | "tf" | "tfvars" => Ok(Self::Hcl),
-            "dockerfile" => Ok(Self::Containerfile),
-            "mk" => Ok(Self::Make),
-            _ => Err(FilesystemError::message(format!(
-                "Unsupported file type: .{extension}. Use file_read instead."
-            ))),
-        }
+/// Resolves the language for a path, or the refusal the `index` tool reports.
+///
+/// Detection itself lives in `workcell-source-languages` so the code map and this tool cannot
+/// disagree about what a `.tf` file is. Only the refusal wording is owned here, because it names
+/// the tool a caller should reach for instead.
+fn detect(path: &Path) -> Result<Language, FilesystemError> {
+    if let Some(language) = Language::from_path(path) {
+        return Ok(language);
     }
-
-    const fn name(self) -> &'static str {
-        match self {
-            Self::Rust => "rust",
-            Self::Python => "python",
-            Self::TypeScript => "typescript",
-            Self::JavaScript => "javascript",
-            Self::Gleam => "gleam",
-            Self::Go => "go",
-            Self::Html => "html",
-            Self::Java => "java",
-            Self::C => "c",
-            Self::Cpp => "cpp",
-            Self::CSharp => "c_sharp",
-            Self::Ruby => "ruby",
-            Self::Php => "php",
-            Self::Swift => "swift",
-            Self::Kotlin => "kotlin",
-            Self::Scala => "scala",
-            Self::Bash => "bash",
-            Self::Lua => "lua_lang",
-            Self::Elixir => "elixir",
-            Self::Markdown => "markdown",
-            Self::BazelBuild => "bazel_build",
-            Self::BazelModule => "bazel_module",
-            Self::BazelBzl => "bazel_bzl",
-            Self::Zig => "zig",
-            Self::Nix => "nix",
-            Self::Dart => "dart",
-            Self::Toml => "toml",
-            Self::Yaml => "yaml",
-            Self::Sql => "sql",
-            Self::Css => "css",
-            Self::Json => "json",
-            Self::Hcl => "hcl",
-            Self::Containerfile => "containerfile",
-            Self::Make => "make",
-        }
-    }
-
-    fn grammar(self) -> tree_sitter::Language {
-        match self {
-            Self::Rust => tree_sitter_rust::LANGUAGE.into(),
-            Self::Python => tree_sitter_python::LANGUAGE.into(),
-            Self::TypeScript | Self::JavaScript => {
-                tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()
-            }
-            Self::Gleam => tree_sitter_gleam::LANGUAGE.into(),
-            Self::Go => tree_sitter_go::LANGUAGE.into(),
-            Self::Html => tree_sitter_html::LANGUAGE.into(),
-            Self::Java => tree_sitter_java::LANGUAGE.into(),
-            Self::C => tree_sitter_c::LANGUAGE.into(),
-            Self::Cpp => tree_sitter_cpp::LANGUAGE.into(),
-            Self::CSharp => tree_sitter_c_sharp::LANGUAGE.into(),
-            Self::Ruby => tree_sitter_ruby::LANGUAGE.into(),
-            Self::Php => tree_sitter_php::LANGUAGE_PHP.into(),
-            Self::Swift => tree_sitter_swift::LANGUAGE.into(),
-            Self::Kotlin => tree_sitter_kotlin_ng::LANGUAGE.into(),
-            Self::Scala => tree_sitter_scala::LANGUAGE.into(),
-            Self::Bash => tree_sitter_bash::LANGUAGE.into(),
-            Self::Lua => tree_sitter_lua::LANGUAGE.into(),
-            Self::Elixir => tree_sitter_elixir::LANGUAGE.into(),
-            Self::Markdown => tree_sitter_md::LANGUAGE.into(),
-            Self::BazelBuild | Self::BazelModule | Self::BazelBzl => {
-                tree_sitter_starlark::LANGUAGE.into()
-            }
-            Self::Zig => tree_sitter_zig::LANGUAGE.into(),
-            Self::Nix => tree_sitter_nix::LANGUAGE.into(),
-            Self::Dart => tree_sitter_dart::LANGUAGE.into(),
-            Self::Toml => tree_sitter_toml_ng::LANGUAGE.into(),
-            Self::Yaml => tree_sitter_yaml::LANGUAGE.into(),
-            Self::Sql => tree_sitter_sequel::LANGUAGE.into(),
-            Self::Css => tree_sitter_css::LANGUAGE.into(),
-            Self::Json => tree_sitter_json::LANGUAGE.into(),
-            Self::Hcl => tree_sitter_hcl::LANGUAGE.into(),
-            Self::Containerfile => tree_sitter_containerfile::LANGUAGE.into(),
-            Self::Make => tree_sitter_make::LANGUAGE.into(),
-        }
+    match path.extension().and_then(|value| value.to_str()) {
+        Some(extension) => Err(FilesystemError::message(format!(
+            "Unsupported file type: .{extension}. Use file_read instead."
+        ))),
+        None => Err(FilesystemError::message(
+            "Unsupported file type: (no extension). Use file_read instead.",
+        )),
     }
 }
 
@@ -378,7 +220,7 @@ impl FilesystemCore {
         limits: IndexLimits,
         token: &CancellationToken,
     ) -> Result<IndexOutput, FilesystemError> {
-        let language = Language::detect(path)?;
+        let language = detect(path)?;
         let bytes = read_bounded(path, limits.max_source_bytes, token).await?;
         reject_binary(path, &bytes)?;
         let source = str::from_utf8(&bytes).map_err(|_| {

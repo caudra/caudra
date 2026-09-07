@@ -1,0 +1,16 @@
+[package]
+name = "catalog"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+tokio = "1"
+
+[tool.ruff.lint]
+select = ["E", "F"]
+ignore = ["E501"]
+
+[[bin]]
+name = "catalog-cli"
+path = "src/main.rs"
