@@ -1,7 +1,9 @@
 use std::collections::HashMap;
+use std::fmt::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, RwLockReadGuard, Weak};
+use std::time::Instant;
 
 use caudra_config::{
     DefaultEffect, Effect, FILE_WRITE_TOOLS, PermissionReviewCandidate, PermissionRule,
@@ -43,6 +45,21 @@ pub const DECISION_SOURCE_USER_ALWAYS: &str = "user_always";
 pub const DECISION_SOURCE_USER_ABORT: &str = "user_abort";
 const BASH_WORKDIR_SCOPE_MARKER: &str = " # caudra-workdir[";
 const BASH_WORKDIR_FRAME_MARKER: &str = " # caudra-frame[";
+
+/// Wide events for prompt analysis. They land in the ordinary JSON log, which
+/// already carries scopes and command text, rather than in telemetry, so the
+/// answer to "what keeps prompting me" does not depend on an exporter.
+const PERMISSION_LOG_TARGET: &str = "caudra::permission";
+const PROMPT_LOG_MAX_RESOURCES: usize = 8;
+const PROMPT_LOG_MAX_VALUE_CHARS: usize = 200;
+
+/// Why the request could not be settled from stored authority. Ordered by
+/// precedence: the first that applies is reported.
+const PROMPT_REASON_FORCED: &str = "force_prompt";
+const PROMPT_REASON_PROTECTED: &str = "protected";
+const PROMPT_REASON_REQUIRES_PROMPT: &str = "requires_prompt";
+const PROMPT_REASON_ASK_RULE: &str = "ask_rule";
+const PROMPT_REASON_UNCOVERED: &str = "uncovered";
 static NEXT_PERMISSION_MANAGER_ID: AtomicU64 = AtomicU64::new(1);
 const PROJECT_READ_TOOLS: &[&str] = &[
     "file_glob",
@@ -2149,7 +2166,7 @@ impl PermissionManager {
         };
 
         let (answer_tx, answer_rx) = flume::bounded(1);
-        {
+        let (forcing_reason, uncovered, uncovered_count) = {
             let mut pending = self.pending();
             let current_rules = self.applicable_structured_rules().map_err(|error| {
                 warn!(%error, "structured permission policy failed closed");
@@ -2215,17 +2232,80 @@ impl PermissionManager {
                 remove_pending(&mut pending, self.id, request_id);
                 return Err(deny(DECISION_SOURCE_USER_ABORT, None));
             }
-        }
+            (
+                prompt_forcing_reason(
+                    &request,
+                    &coverage,
+                    scopes.force_prompt,
+                    must_prompt
+                        || current_scope_decisions
+                            .iter()
+                            .any(|decision| decision.must_prompt),
+                ),
+                uncovered_resource_summary(&request, &coverage),
+                coverage.iter().filter(|covered| !**covered).count(),
+            )
+        };
+        // Emitted outside the pending lock: a log write must never serialize
+        // another agent's permission bookkeeping behind file IO.
+        let (subject_owner, subject_contract) = subject_kind_and_contract(&request.subject);
+        info!(
+            target: PERMISSION_LOG_TARGET,
+            event = "permission_prompt",
+            request_id,
+            tool = %request.tool,
+            executor = ?request.executor,
+            risk = ?request.risk,
+            subject_owner,
+            subject_contract,
+            resource_count = request.resources.len(),
+            uncovered_count,
+            forcing_reason,
+            uncovered = %uncovered,
+            offered_options = %request
+                .options
+                .iter()
+                .map(|option| option.id.as_str())
+                .collect::<Vec<_>>()
+                .join(","),
+            "permission prompt raised"
+        );
+        let waiting_since = Instant::now();
         let response = cancel.race(answer_rx.recv_async()).await;
         self.remove_pending(request_id);
 
         let decision = match response {
-            Ok(Ok(decision)) => decision,
+            Ok(Ok(decision)) => Some(decision),
             Ok(Err(_)) => {
                 warn!(tool = %tool, scope = %scope_display(), "permission channel closed");
-                return Err(deny(DECISION_SOURCE_USER_ABORT, None));
+                None
             }
-            Err(_) => return Err(deny(DECISION_SOURCE_USER_ABORT, None)),
+            Err(_) => None,
+        };
+        // Paired with `permission_prompt` by `request_id`: the two together give
+        // the prompt rate, what authority the answer bought, and the wait cost.
+        let (answer, option_id, lifetime, answer_source) = match &decision {
+            Some(PendingDecision::Explicit(explicit)) => {
+                let (answer, option_id, lifetime) = answer_log_fields(explicit);
+                (answer, option_id, lifetime, explicit.decision_source())
+            }
+            Some(PendingDecision::MatchedRule) => ("matched_rule", "", "", DECISION_SOURCE_RULE),
+            None => ("abandoned", "", "", DECISION_SOURCE_USER_ABORT),
+        };
+        info!(
+            target: PERMISSION_LOG_TARGET,
+            event = "permission_decision",
+            request_id,
+            tool = %request.tool,
+            answer,
+            option_id,
+            lifetime,
+            source = answer_source,
+            waited_ms = waiting_since.elapsed().as_millis() as u64,
+            "permission prompt answered"
+        );
+        let Some(decision) = decision else {
+            return Err(deny(DECISION_SOURCE_USER_ABORT, None));
         };
 
         let allow = match &decision {
@@ -2281,6 +2361,107 @@ impl PermissionManager {
             Err(deny(source, guidance))
         }
     }
+}
+
+fn subject_kind_and_contract(subject: &PermissionSubject) -> (&str, &str) {
+    match subject {
+        PermissionSubject::Native { owner, contract } => (owner, contract),
+        PermissionSubject::Lua {
+            plugin, contract, ..
+        } => (plugin, contract),
+        PermissionSubject::Mcp {
+            server, contract, ..
+        } => (server, contract),
+        PermissionSubject::UnknownLegacy { identity } => (identity, ""),
+    }
+}
+
+/// Answer kind, chosen option, and granted lifetime as separate fields, so
+/// prompt analysis can group by lifetime without parsing `encode()`. Denials
+/// carry no lifetime because a `deny_always_*` writes its rule elsewhere.
+fn answer_log_fields(answer: &PermissionAnswer) -> (&'static str, &str, &'static str) {
+    match answer {
+        PermissionAnswer::AllowOnce => ("allow", "", lifetime_name(&PermissionLifetime::Once)),
+        PermissionAnswer::AllowSession => (
+            "allow_session",
+            "",
+            lifetime_name(&PermissionLifetime::Conversation),
+        ),
+        PermissionAnswer::AllowAlwaysLocal => (
+            "allow_always_local",
+            "",
+            lifetime_name(&PermissionLifetime::Project),
+        ),
+        PermissionAnswer::AllowAlwaysGlobal => (
+            "allow_always_global",
+            "",
+            lifetime_name(&PermissionLifetime::Global),
+        ),
+        PermissionAnswer::AllowOption {
+            option_id,
+            lifetime,
+        } => ("allow_option", option_id, lifetime_name(lifetime)),
+        PermissionAnswer::Deny => ("deny", "", ""),
+        PermissionAnswer::DenyWithGuidance(_) => ("deny_guidance", "", ""),
+        PermissionAnswer::DenyAlwaysLocal => ("deny_always_local", "", ""),
+        PermissionAnswer::DenyAlwaysGlobal => ("deny_always_global", "", ""),
+    }
+}
+
+/// The first reason that applies, so a log line names one cause rather than a
+/// set. `ask_rule` covers both a builtin ask family and a configured ask;
+/// telling them apart would mean widening what `request_coverage` returns.
+fn prompt_forcing_reason(
+    request: &PermissionRequest,
+    coverage: &[bool],
+    forced: bool,
+    ask_rule: bool,
+) -> &'static str {
+    let uncovered = || {
+        request
+            .resources
+            .iter()
+            .enumerate()
+            .filter(move |(index, _)| !coverage.get(*index).copied().unwrap_or(false))
+    };
+    if forced {
+        PROMPT_REASON_FORCED
+    } else if uncovered().any(|(_, resource)| resource.protected) {
+        PROMPT_REASON_PROTECTED
+    } else if uncovered().any(|(_, resource)| resource.requires_prompt) {
+        PROMPT_REASON_REQUIRES_PROMPT
+    } else if ask_rule {
+        PROMPT_REASON_ASK_RULE
+    } else {
+        PROMPT_REASON_UNCOVERED
+    }
+}
+
+/// Only the resources that actually forced the prompt, capped, so a chain of
+/// twenty already-approved commands does not bury the one that is new.
+fn uncovered_resource_summary(request: &PermissionRequest, coverage: &[bool]) -> String {
+    let mut summary = String::new();
+    let uncovered = request
+        .resources
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !coverage.get(*index).copied().unwrap_or(false));
+    for (count, (_, resource)) in uncovered.enumerate() {
+        if count == PROMPT_LOG_MAX_RESOURCES {
+            let _ = write!(summary, ", ...");
+            break;
+        }
+        if count > 0 {
+            summary.push_str(", ");
+        }
+        let value: String = resource
+            .value
+            .chars()
+            .take(PROMPT_LOG_MAX_VALUE_CHARS)
+            .collect();
+        let _ = write!(summary, "{:?}:{value}", resource.kind);
+    }
+    summary
 }
 
 fn matches_rule(rule_key: &ToolKey, actual: &ToolKey) -> bool {
@@ -5261,5 +5442,153 @@ mod tests {
 
         assert!(fresh.structured_conversation_rules_snapshot().is_empty());
         assert_eq!(manager.structured_conversation_rules_snapshot().len(), 1);
+    }
+
+    fn log_request(resources: Vec<PermissionResource>) -> PermissionRequest {
+        let mut request = PermissionRequest::from_legacy(
+            "log".into(),
+            ToolKey::native("bash"),
+            vec!["cargo test".into()],
+            serde_json::json!({"command": "cargo test"}),
+            Path::new("/tmp"),
+            false,
+        );
+        request.resources = resources;
+        request
+    }
+
+    fn log_resource(value: &str, protected: bool, requires_prompt: bool) -> PermissionResource {
+        PermissionResource {
+            kind: PermissionResourceKind::Command,
+            value: value.into(),
+            access: Some(PermissionResourceAccess::Execute),
+            protected,
+            requires_prompt,
+            attributes: BTreeMap::new(),
+        }
+    }
+
+    #[test_case(true, true, true, PROMPT_REASON_FORCED; "force_prompt outranks every other cause")]
+    #[test_case(false, true, true, PROMPT_REASON_PROTECTED; "protected outranks an ask rule")]
+    #[test_case(false, false, true, PROMPT_REASON_ASK_RULE; "ask rule outranks bare uncovered")]
+    #[test_case(false, false, false, PROMPT_REASON_UNCOVERED; "uncovered is the fallback")]
+    fn prompt_forcing_reason_reports_the_highest_precedence_cause(
+        forced: bool,
+        protected: bool,
+        ask_rule: bool,
+        expected: &str,
+    ) {
+        let request = log_request(vec![log_resource("cargo test", protected, false)]);
+
+        let reason = prompt_forcing_reason(&request, &[false], forced, ask_rule);
+
+        assert_eq!(reason, expected);
+    }
+
+    #[test]
+    fn prompt_forcing_reason_ignores_covered_resources() {
+        let request = log_request(vec![
+            log_resource("git status", true, true),
+            log_resource("cargo test", false, false),
+        ]);
+
+        let reason = prompt_forcing_reason(&request, &[true, false], false, false);
+
+        assert_eq!(reason, PROMPT_REASON_UNCOVERED);
+    }
+
+    #[test]
+    fn prompt_forcing_reason_prefers_protected_over_requires_prompt() {
+        let request = log_request(vec![
+            log_resource("cargo test", false, true),
+            log_resource("git push", true, false),
+        ]);
+
+        let reason = prompt_forcing_reason(&request, &[false, false], false, false);
+
+        assert_eq!(reason, PROMPT_REASON_PROTECTED);
+    }
+
+    #[test]
+    fn uncovered_resource_summary_lists_only_uncovered_resources() {
+        let request = log_request(vec![
+            log_resource("already granted", false, false),
+            log_resource("brand new", false, false),
+        ]);
+
+        let summary = uncovered_resource_summary(&request, &[true, false]);
+
+        assert_eq!(summary, "Command:brand new");
+    }
+
+    #[test]
+    fn uncovered_resource_summary_caps_the_resource_count() {
+        let resources = (0..PROMPT_LOG_MAX_RESOURCES + 3)
+            .map(|index| log_resource(&format!("cmd{index}"), false, false))
+            .collect();
+        let request = log_request(resources);
+        let coverage = vec![false; PROMPT_LOG_MAX_RESOURCES + 3];
+
+        let summary = uncovered_resource_summary(&request, &coverage);
+
+        assert!(summary.ends_with(", ..."), "{summary}");
+        assert_eq!(
+            summary.matches("Command:").count(),
+            PROMPT_LOG_MAX_RESOURCES
+        );
+    }
+
+    #[test]
+    fn uncovered_resource_summary_truncates_a_long_value() {
+        let value = "x".repeat(PROMPT_LOG_MAX_VALUE_CHARS * 2);
+        let request = log_request(vec![log_resource(&value, false, false)]);
+
+        let summary = uncovered_resource_summary(&request, &[false]);
+
+        assert_eq!(
+            summary,
+            format!("Command:{}", "x".repeat(PROMPT_LOG_MAX_VALUE_CHARS))
+        );
+    }
+
+    #[test_case(PermissionAnswer::AllowOnce, "allow", "", "once")]
+    #[test_case(PermissionAnswer::AllowSession, "allow_session", "", "conversation")]
+    #[test_case(
+        PermissionAnswer::AllowAlwaysLocal,
+        "allow_always_local",
+        "",
+        "project"
+    )]
+    #[test_case(
+        PermissionAnswer::AllowAlwaysGlobal,
+        "allow_always_global",
+        "",
+        "global"
+    )]
+    #[test_case(PermissionAnswer::Deny, "deny", "", "")]
+    #[test_case(PermissionAnswer::DenyAlwaysGlobal, "deny_always_global", "", "")]
+    fn answer_log_fields_splits_the_answer_into_groupable_fields(
+        answer: PermissionAnswer,
+        expected_answer: &str,
+        expected_option: &str,
+        expected_lifetime: &str,
+    ) {
+        assert_eq!(
+            answer_log_fields(&answer),
+            (expected_answer, expected_option, expected_lifetime)
+        );
+    }
+
+    #[test]
+    fn answer_log_fields_reports_the_option_and_its_chosen_lifetime() {
+        let answer = PermissionAnswer::AllowOption {
+            option_id: "allow_subtree".into(),
+            lifetime: PermissionLifetime::Project,
+        };
+
+        assert_eq!(
+            answer_log_fields(&answer),
+            ("allow_option", "allow_subtree", "project")
+        );
     }
 }

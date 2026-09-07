@@ -104,6 +104,7 @@ const RETRY_DELAY: Duration = Duration::from_secs(5);
 const MISSING_DIR: &str = "gone";
 const RESUMED_PROMPT: &str = "carry me over";
 const SESSION_PERMISSION_SCOPE: &str = "cargo *";
+const CONVERSATION_PERMISSION_PATTERN: &str = "just *";
 const SONNET_SPEC: &str = "anthropic/claude-sonnet-4-5";
 const OPUS_SPEC: &str = "anthropic/claude-opus-4-8";
 const PLAIN_MODEL_SPEC: &str = "ollama/qwen3";
@@ -5497,6 +5498,81 @@ fn checkpoint_and_resume_restore_session_rules() {
     assert_eq!(restored_rules[0].scope, rule.scope);
     assert_eq!(restored_rules[0].effect, rule.effect);
     drain_writer(resumed, resumed_writer);
+}
+
+fn conversation_permission_record() -> caudra_agent::permissions::PermissionRuleRecord {
+    use caudra_agent::permissions::{
+        PermissionArgumentConstraint, PermissionExecutorKind, PermissionLifetime,
+        PermissionResourceAccess, PermissionResourceConstraint, PermissionResourceKind,
+        PermissionResourceSelector, PermissionRuleRecord, PermissionSubject,
+        StructuredPermissionEffect, StructuredPermissionRule,
+    };
+    PermissionRuleRecord::conversation(StructuredPermissionRule {
+        subject: PermissionSubject::Native {
+            owner: "workcell".into(),
+            contract: "shell.execution.v1".into(),
+        },
+        executor: PermissionExecutorKind::Native,
+        resources: vec![PermissionResourceConstraint {
+            kind: PermissionResourceKind::Command,
+            selector: PermissionResourceSelector::CommandPattern {
+                pattern: CONVERSATION_PERMISSION_PATTERN.into(),
+            },
+            access: Some(PermissionResourceAccess::Execute),
+            protected: Some(false),
+            attributes: Default::default(),
+        }],
+        arguments: PermissionArgumentConstraint::Unconstrained,
+        lifetime: PermissionLifetime::Conversation,
+        effect: StructuredPermissionEffect::Allow,
+    })
+    .unwrap()
+}
+
+/// The legacy `session_rules` path has coverage and is unused in practice.
+/// This is the one that carries real grants, so a dropped restore call has to
+/// fail here rather than silently re-prompting for everything next session.
+#[test]
+fn checkpoint_and_resume_restore_structured_conversation_rules() {
+    let (_tmp, dir, writer, mut app) = tempdir_app();
+    crate::push_history_message(
+        app.state.session_mut(),
+        Message::user(RESUMED_PROMPT.into()),
+    );
+    let record = conversation_permission_record();
+    app.permissions
+        .load_structured_conversation_rules(vec![record.clone()]);
+    app.checkpoint();
+    let id = app.state.session.id;
+    drain_writer(app, writer);
+
+    let stored = AppSession::load(id, &dir).unwrap();
+    assert_eq!(stored.meta.structured_permission_rules.len(), 1);
+    let resumed_writer = Arc::new(test_writer(dir.clone()));
+    let mut resumed = build_app(dir, Arc::clone(&resumed_writer));
+    resumed.state.session = Arc::new(stored);
+    resumed.restore_resumed_session();
+
+    let restored = resumed.permissions.structured_conversation_rules_snapshot();
+    assert_eq!(restored.len(), 1);
+    assert_eq!(restored[0].id, record.id);
+    assert_eq!(restored[0].rule, record.rule);
+    drain_writer(resumed, resumed_writer);
+}
+
+/// A session whose only content is a permission grant still has to restore, so
+/// `session_has_content` must keep counting the structured rules.
+#[test]
+fn a_session_holding_only_permission_grants_still_restores() {
+    let (_tmp, dir, writer, mut app) = tempdir_app();
+    app.permissions
+        .load_structured_conversation_rules(vec![conversation_permission_record()]);
+    app.checkpoint();
+    let id = app.state.session.id;
+    drain_writer(app, writer);
+
+    let stored = AppSession::load(id, &dir).unwrap();
+    assert!(crate::app::session::session_has_content(&stored));
 }
 
 fn app_and_session_with_yolo(seed: bool, stored: Option<bool>) -> (App, AppSession) {
