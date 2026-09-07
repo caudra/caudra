@@ -90,7 +90,7 @@ struct Session {
     selected: usize,
     scroll_offset: usize,
     viewport_height: usize,
-    inner_area: Rect,
+    popup_area: Rect,
     row_hits: Vec<FileRowHit>,
     mouse_down: Option<String>,
 
@@ -190,7 +190,7 @@ impl FilePickerModal {
             selected: 0,
             scroll_offset: 0,
             viewport_height: 0,
-            inner_area: Rect::default(),
+            popup_area: Rect::default(),
             row_hits: Vec::new(),
             mouse_down: None,
             cancel: cancel_clone,
@@ -210,10 +210,18 @@ impl FilePickerModal {
         self.session.is_some()
     }
 
+    /// The whole popup, border included: the frame is part of the picker, so a
+    /// press on it is a near miss rather than a press outside.
     pub fn contains(&self, pos: Position) -> bool {
         self.session
             .as_ref()
-            .is_some_and(|s| s.visible && s.inner_area.contains(pos))
+            .is_some_and(|s| s.visible && s.popup_area.contains(pos))
+    }
+
+    /// The walk is debounced onto the screen, so the picker can be open with
+    /// nothing drawn for it yet.
+    pub fn is_drawn(&self) -> bool {
+        self.session.as_ref().is_some_and(|s| s.visible)
     }
 
     pub fn scroll(&mut self, delta: i32) {
@@ -410,7 +418,7 @@ impl FilePickerModal {
             max_height_percent: MAX_HEIGHT_PERCENT,
         };
         let (popup, inner) = modal.render(frame, area, content_rows + SEARCH_ROW);
-        s.inner_area = inner;
+        s.popup_area = popup;
         s.viewport_height = inner.height.saturating_sub(SEARCH_ROW) as usize;
         ensure_visible(s);
 
@@ -741,7 +749,7 @@ mod tests {
             selected: 0,
             scroll_offset: 0,
             viewport_height: 0,
-            inner_area: Rect::default(),
+            popup_area: Rect::default(),
             row_hits: Vec::new(),
             mouse_down: None,
             cancel: Arc::new(AtomicBool::new(false)),

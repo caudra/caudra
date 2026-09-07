@@ -129,9 +129,15 @@ impl SearchModal {
         self.invalidate_mouse_geometry();
     }
 
+    /// Leaving the search behind without taking a match, which owes the
+    /// transcript the scroll position it was opened from.
+    pub fn cancel(&mut self) -> SearchAction {
+        SearchAction::Close(self.saved_scroll.take())
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) -> SearchAction {
         match key.code {
-            KeyCode::Esc => SearchAction::Close(self.saved_scroll.take()),
+            KeyCode::Esc => self.cancel(),
             KeyCode::Enter => {
                 if let Some(m) = self.matches.get(self.selected) {
                     SearchAction::Select(m.segment_index)

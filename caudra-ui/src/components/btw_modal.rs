@@ -9,7 +9,7 @@ use caudra_agent::CancelTrigger;
 use caudra_providers::TokenUsage;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 
@@ -46,6 +46,7 @@ pub struct BtwModal {
     /// already funnels through [`BtwModal::close`] cancels for free.
     cancel: Option<CancelTrigger>,
     pending_usage: Option<BtwUsage>,
+    popup: Rect,
 }
 
 impl BtwModal {
@@ -64,6 +65,7 @@ impl BtwModal {
             rx: None,
             cancel: None,
             pending_usage: None,
+            popup: Rect::default(),
         }
     }
 
@@ -103,6 +105,10 @@ impl BtwModal {
 
     pub fn is_open(&self) -> bool {
         self.open
+    }
+
+    pub fn contains(&self, pos: Position) -> bool {
+        self.open && self.popup.contains(pos)
     }
 
     pub fn poll(&mut self) -> Dirty {
@@ -199,6 +205,7 @@ impl BtwModal {
             render_vertical_scrollbar(frame, inner, total, scroll);
         }
 
+        self.popup = popup;
         popup
     }
 

@@ -506,6 +506,25 @@ impl FloatManager {
         self.focused_rect.is_some_and(|r| r.contains(pos))
     }
 
+    /// A press outside a centred float dismisses it. Splits and panels are
+    /// docked chrome rather than overlays, so they own no outside and are left
+    /// standing; `focused_rect` is claimed by the overlay pass alone, so an
+    /// unrecorded rect is never read as a miss.
+    pub fn dismiss_outside(&mut self, pos: ratatui::layout::Position) -> bool {
+        let Some(fid) = self.focused_id else {
+            return false;
+        };
+        let centred = self
+            .windows
+            .iter()
+            .any(|w| w.id == fid && w.config.split == Split::None);
+        if !centred || self.focused_rect.is_none_or(|r| r.contains(pos)) {
+            return false;
+        }
+        self.remove_windows(|w| w.id == fid);
+        true
+    }
+
     pub fn scroll(&mut self, delta: i32) {
         let Some(fid) = self.focused_id else {
             return;
@@ -1972,6 +1991,74 @@ mod tests {
             serx.drain().any(|e| matches!(e, WinEvent::Resize { .. })),
             "{EXPECT_SPLIT_DRAWN}: split joins layout via view_split",
         );
+    }
+
+    const EXPECT_DISMISSED: &str = "a press outside a centred float must dismiss it";
+    const EXPECT_DISMISS_NOTIFIES: &str = "a dismissed float must hear its own close";
+    const EXPECT_STANDING: &str = "a press inside a centred float must leave it standing";
+    const EXPECT_SPLIT_STANDING: &str =
+        "a split is docked chrome, so it owns no outside and no press dismisses it";
+
+    fn open_centred(mgr: &mut FloatManager) -> flume::Receiver<WinEvent> {
+        let (event_tx, cmd_rx, event_rx, _cmd_tx) = make_channels();
+        mgr.open(
+            make_buf(&["float"]),
+            FloatConfig {
+                width: Dimension::Abs(20),
+                height: Dimension::Abs(10),
+                ..FloatConfig::default()
+            },
+            true,
+            event_tx,
+            cmd_rx,
+        );
+        let area = Rect::new(0, 0, 80, 40);
+        render_into(mgr, area, |m, f| {
+            m.view(f, area);
+        });
+        event_rx
+    }
+
+    #[test]
+    fn a_press_outside_a_centred_float_dismisses_it() {
+        let mut mgr = FloatManager::new();
+        let event_rx = open_centred(&mut mgr);
+
+        assert!(
+            mgr.dismiss_outside(ratatui::layout::Position::new(0, 0)),
+            "{EXPECT_DISMISSED}",
+        );
+        assert!(!mgr.is_open(), "{EXPECT_CLOSED}");
+        assert!(
+            event_rx.drain().any(|e| matches!(e, WinEvent::Close)),
+            "{EXPECT_DISMISS_NOTIFIES}",
+        );
+    }
+
+    #[test]
+    fn a_press_inside_a_centred_float_leaves_it_standing() {
+        let mut mgr = FloatManager::new();
+        let _event_rx = open_centred(&mut mgr);
+        let inside = ratatui::layout::Position::new(40, 20);
+        assert!(mgr.contains(inside));
+
+        assert!(!mgr.dismiss_outside(inside), "{EXPECT_STANDING}");
+        assert!(mgr.is_open(), "{EXPECT_STANDING}");
+    }
+
+    #[test]
+    fn a_press_outside_a_split_leaves_it_standing() {
+        let mut mgr = FloatManager::new();
+        let _channels = open_split(&mut mgr, Split::Below, 10, true);
+        let area = Rect::new(0, 0, 80, 40);
+        let rect = Rect::new(0, 30, 80, 10);
+        render_into(&mut mgr, area, |m, f| m.view_split(f, Split::Below, rect));
+
+        assert!(
+            !mgr.dismiss_outside(ratatui::layout::Position::new(0, 0)),
+            "{EXPECT_SPLIT_STANDING}",
+        );
+        assert!(mgr.is_open(), "{EXPECT_SPLIT_STANDING}");
     }
 
     #[test]

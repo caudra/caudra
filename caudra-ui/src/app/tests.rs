@@ -9232,6 +9232,266 @@ fn picker_overlay_blocks_plan_row_clicks() {
     assert_eq!(app.state.mode, Mode::Plan);
 }
 
+const OUTSIDE_MODAL: (u16, u16) = (0, 0);
+const MODAL_CENTRE: (u16, u16) = (80 / 2, 24 / 2);
+const LEFT_STANDING: &str = "a press outside the modal should have dismissed it";
+const DISMISSED: &str = "a press inside the modal should have left it standing";
+const PRESS_SWALLOWED: &str = "the press that dismisses must not also start a selection";
+const ARGS_COMMAND: &str = "btw";
+
+fn open_help_modal(app: &mut App) {
+    app.help_modal.toggle();
+}
+
+fn open_usage_modal(app: &mut App) {
+    app.usage_modal.toggle();
+}
+
+fn open_context_modal(app: &mut App) {
+    app.context_modal.open(false);
+}
+
+fn open_goal_modal(app: &mut App) {
+    app.goal_modal.open();
+}
+
+fn open_model_picker(app: &mut App) {
+    let spec = app.state.model.spec();
+    app.model_picker.open(&spec);
+}
+
+fn open_command_modal(app: &mut App) {
+    app.run_builtin(BuiltinAction::CommandPalette);
+}
+
+/// Reaches the argument prompt, the command modal's second stage.
+fn open_argument_prompt(app: &mut App) {
+    app.run_builtin(BuiltinAction::CommandPalette);
+    app.route_text_paste(ARGS_COMMAND);
+    app.update(Msg::Key(key(KeyCode::Enter)));
+}
+
+#[test_case(open_help_modal    ; "help_modal")]
+#[test_case(open_usage_modal   ; "usage_modal")]
+#[test_case(open_context_modal ; "context_modal")]
+#[test_case(open_goal_modal    ; "goal_modal")]
+#[test_case(open_model_picker  ; "model_picker")]
+#[test_case(open_command_modal ; "command_modal")]
+fn a_press_outside_a_modal_dismisses_it(open: fn(&mut App)) {
+    let mut app = test_app();
+    open(&mut app);
+    let _ = rendered(&mut app);
+
+    let (column, row) = OUTSIDE_MODAL;
+    let actions = app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        column,
+        row,
+    ));
+
+    assert!(actions.is_empty());
+    assert!(!app.any_overlay_open(), "{LEFT_STANDING}");
+    assert!(app.selection_state.is_none(), "{PRESS_SWALLOWED}");
+}
+
+#[test_case(open_help_modal    ; "help_modal")]
+#[test_case(open_usage_modal   ; "usage_modal")]
+#[test_case(open_context_modal ; "context_modal")]
+#[test_case(open_goal_modal    ; "goal_modal")]
+#[test_case(open_model_picker  ; "model_picker")]
+#[test_case(open_command_modal ; "command_modal")]
+fn a_press_inside_a_modal_leaves_it_standing(open: fn(&mut App)) {
+    let mut app = test_app();
+    open(&mut app);
+    let _ = rendered(&mut app);
+
+    let (column, row) = MODAL_CENTRE;
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        column,
+        row,
+    ));
+
+    assert!(app.any_overlay_open(), "{DISMISSED}");
+}
+
+/// The argument prompt is a stage of its own, and a press outside dismisses the
+/// whole modal rather than stepping back to the list `Esc` would return to.
+#[test]
+fn a_press_outside_the_argument_prompt_dismisses_the_whole_command_modal() {
+    let mut app = test_app();
+    open_argument_prompt(&mut app);
+    let _ = rendered(&mut app);
+    assert!(app.command_modal.is_open());
+
+    let (column, row) = OUTSIDE_MODAL;
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        column,
+        row,
+    ));
+
+    assert!(!app.command_modal.is_open(), "{LEFT_STANDING}");
+}
+
+/// A press on the argument prompt itself is a press on the modal, even though
+/// the list it replaced is the only stage that scrolls.
+#[test]
+fn a_press_on_the_argument_prompt_leaves_it_standing() {
+    let mut app = test_app();
+    open_argument_prompt(&mut app);
+    let _ = rendered(&mut app);
+
+    let (column, row) = MODAL_CENTRE;
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        column,
+        row,
+    ));
+
+    assert!(app.command_modal.is_open(), "{DISMISSED}");
+}
+
+#[test]
+fn the_press_that_dismisses_a_modal_does_not_act_on_what_is_under_it() {
+    let mut app = test_app();
+    let _ = rendered(&mut app);
+    let mode_control = app
+        .status_hits
+        .iter()
+        .find(|hit| hit.target == StatusBarHitTarget::Mode)
+        .expect("the mode control should be on the status bar")
+        .area;
+    let mode = app.state.mode;
+    app.help_modal.toggle();
+    let _ = rendered(&mut app);
+
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        mode_control.x,
+        mode_control.y,
+    ));
+    app.update(mouse_event(
+        MouseEventKind::Up(MouseButton::Left),
+        mode_control.x,
+        mode_control.y,
+    ));
+
+    assert!(!app.help_modal.is_open(), "{LEFT_STANDING}");
+    assert_eq!(app.state.mode, mode);
+}
+
+const SEARCH_SCROLL_TOP: u16 = 3;
+const RESTORED_SCROLL: &str = "dismissing the search owes the transcript its scroll back";
+
+#[test]
+fn a_press_outside_the_search_modal_restores_the_scroll_it_saved() {
+    let mut app = test_app();
+    app.main_chat().push(DisplayMessage::new(
+        DisplayRole::Assistant,
+        "searchable item".into(),
+    ));
+    let _ = rendered(&mut app);
+    app.search_modal.open(SEARCH_SCROLL_TOP, false);
+    let _ = rendered(&mut app);
+    let (column, row) = OUTSIDE_MODAL;
+    assert!(!app.search_modal.contains(Position::new(column, row)));
+
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        column,
+        row,
+    ));
+
+    assert!(!app.search_modal.is_open(), "{LEFT_STANDING}");
+    assert_eq!(
+        app.chats[0].scroll_top(),
+        SEARCH_SCROLL_TOP,
+        "{RESTORED_SCROLL}"
+    );
+    assert!(!app.chats[0].auto_scroll(), "{RESTORED_SCROLL}");
+}
+
+const ORIGIN_RESTORED: &str = "dismissing the picker owes the transcript it was opened from";
+
+#[test]
+fn a_press_outside_the_task_picker_returns_to_the_origin_transcript() {
+    let mut app = app_with_subagent();
+    app.focus_task(TASK_ID).unwrap();
+    app.tasks_browse();
+    let _ = rendered(&mut app);
+    app.update(Msg::Key(key(KeyCode::Up)));
+    assert_eq!(app.active_chat, 0, "the preview should have moved to Main");
+
+    let (column, row) = OUTSIDE_MODAL;
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        column,
+        row,
+    ));
+
+    assert!(!app.task_picker.is_open(), "{LEFT_STANDING}");
+    assert_eq!(app.active_chat, 1, "{ORIGIN_RESTORED}");
+}
+
+const FORM_STANDING: &str = "a docked form owns no outside and must survive any press";
+
+#[test]
+fn a_press_leaves_the_permission_prompt_standing() {
+    let mut app = streaming_app();
+    app.update(agent_msg(permission_event("request", "cargo check")));
+    let _ = rendered(&mut app);
+    assert!(app.permission_prompt.is_open());
+
+    let (column, row) = OUTSIDE_MODAL;
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        column,
+        row,
+    ));
+
+    assert!(app.permission_prompt.is_open(), "{FORM_STANDING}");
+}
+
+#[test]
+fn a_press_leaves_the_plan_form_standing() {
+    let mut app = test_app();
+    app.state.mode = Mode::Plan;
+    app.plan_form.on_plan_ready();
+    let _ = rendered(&mut app);
+
+    let (column, row) = OUTSIDE_MODAL;
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        column,
+        row,
+    ));
+
+    assert!(app.plan_form.is_visible(), "{FORM_STANDING}");
+}
+
+/// It holds edits nothing else has a copy of, so a stray press must not be able
+/// to throw them away.
+#[test]
+fn a_press_leaves_the_paste_editor_standing() {
+    let mut app = test_app();
+    app.update(Msg::Paste("a\nb\nc".into()));
+    app.update(Msg::Key(key(KeyCode::Left)));
+    app.update(Msg::Key(key(KeyCode::Left)));
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    let _ = rendered(&mut app);
+    assert!(app.paste_editor.is_open());
+
+    let (column, row) = OUTSIDE_MODAL;
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        column,
+        row,
+    ));
+
+    assert!(app.paste_editor.is_open(), "{FORM_STANDING}");
+}
+
 #[test]
 fn search_hover_outside_results_preserves_current_preview() {
     let mut app = test_app();

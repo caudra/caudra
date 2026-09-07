@@ -128,6 +128,12 @@ impl TaskPicker {
         self.picker.contains(pos)
     }
 
+    /// Leaving without opening a transcript, which returns to whichever one the
+    /// picker was opened from.
+    pub fn cancel(&mut self) -> TaskPickerAction {
+        self.map_action(PickerAction::Close)
+    }
+
     pub fn scroll(&mut self, delta: i32) -> TaskPickerAction {
         self.picker.scroll(delta);
         self.preview()

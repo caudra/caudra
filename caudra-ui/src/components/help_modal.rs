@@ -9,7 +9,7 @@ use crate::theme;
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use unicode_width::UnicodeWidthStr;
@@ -27,6 +27,7 @@ const INPUT_PREFIXES: &[(&str, &str)] = &[
 pub struct HelpModal {
     open: bool,
     scroll: ModalScroll,
+    popup: Rect,
 }
 
 fn key_spans(label: KeyLabel, pad: usize, prefix: &str) -> Vec<Span<'static>> {
@@ -82,11 +83,16 @@ impl HelpModal {
         Self {
             open: false,
             scroll: ModalScroll::new_top(),
+            popup: Rect::default(),
         }
     }
 
     pub fn is_open(&self) -> bool {
         self.open
+    }
+
+    pub fn contains(&self, pos: Position) -> bool {
+        self.open && self.popup.contains(pos)
     }
 
     pub fn toggle(&mut self) {
@@ -214,6 +220,7 @@ impl HelpModal {
             render_vertical_scrollbar(frame, inner, total, scroll);
         }
 
+        self.popup = popup;
         popup
     }
 }

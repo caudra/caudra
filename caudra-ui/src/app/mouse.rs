@@ -20,6 +20,11 @@ const MESSAGE_ACTIONS_UNAVAILABLE: &str = "Message actions unavailable here";
 
 impl App {
     pub(super) fn handle_mouse(&mut self, event: MouseEvent) -> Vec<crate::components::Action> {
+        if event.kind == MouseEventKind::Down(MouseButton::Left)
+            && let Some(actions) = self.dismiss_at(Position::new(event.column, event.row))
+        {
+            return actions;
+        }
         if self.workbench.is_open() {
             self.clear_control_hovers();
             let action = self.workbench.handle_mouse(event);
@@ -721,6 +726,105 @@ impl App {
                 QueueAction::MoveMain => self.move_unsent_to_main(id),
             },
         }
+    }
+
+    /// A left press outside the overlay that owns the screen dismisses it, and
+    /// the press is swallowed so it never also acts on what is under it.
+    /// Ordered like [`App::scroll_at`]: the topmost overlay answers first, and a
+    /// press inside it is no dismissal at all.
+    ///
+    /// The docked forms are absent by design. The agent is parked on them until
+    /// they are answered, and the transcript behind them stays live, so they
+    /// own no outside to press.
+    fn dismiss_at(&mut self, pos: Position) -> Option<Vec<crate::components::Action>> {
+        // Both take the mouse ahead of everything else, and the paste editor
+        // holds edits that no stray press should throw away.
+        if self.paste_editor.is_open() || self.permission_prompt.is_open() {
+            return None;
+        }
+
+        macro_rules! dismiss {
+            // Closing outright is the whole dismissal.
+            ($overlay:expr) => {
+                dismiss!($overlay, {
+                    $overlay.close();
+                    Vec::new()
+                })
+            };
+            // Closing owes the app something as well: a restore, a warning, or
+            // the next prompt in a chain.
+            ($overlay:expr, $dismissal:expr) => {
+                if $overlay.is_open() {
+                    if $overlay.contains(pos) {
+                        return None;
+                    }
+                    return Some($dismissal);
+                }
+            };
+        }
+
+        // A centred float owns the screen the way a modal does. Splits and
+        // panels are docked chrome, so they neither answer a press nor stand in
+        // the way of one reaching the overlay below.
+        if self.float_mgr.contains(pos) {
+            return None;
+        }
+        if self.float_mgr.dismiss_outside(pos) {
+            return Some(Vec::new());
+        }
+
+        dismiss!(self.btw_modal);
+        dismiss!(self.help_modal);
+        dismiss!(self.usage_modal);
+        dismiss!(self.context_modal);
+        dismiss!(self.goal_modal);
+
+        dismiss!(self.command_modal);
+        dismiss!(self.search_modal, {
+            let action = self.search_modal.cancel();
+            self.handle_search_action(action)
+        });
+        dismiss!(self.theme_picker, {
+            let action = self.theme_picker.cancel();
+            self.handle_theme_picker_action(action)
+        });
+        dismiss!(
+            self.mcp_picker,
+            self.handle_mcp_picker_action(crate::components::mcp_picker::McpPickerAction::Close)
+        );
+        dismiss!(
+            self.login_picker,
+            self.handle_login_picker_action(
+                crate::components::login_picker::LoginPickerAction::Close
+            )
+        );
+        dismiss!(self.rewind_picker);
+        dismiss!(self.message_actions);
+        dismiss!(
+            self.review,
+            self.handle_review_action(crate::components::review::ReviewAction::Close)
+        );
+        dismiss!(self.model_picker);
+        dismiss!(self.prompt_profile_picker);
+        // Debounced onto the screen, so it can be open with nothing drawn for
+        // it. A press cannot land outside an overlay that was never there.
+        if self.file_picker.is_open() {
+            if !self.file_picker.is_drawn() || self.file_picker.contains(pos) {
+                return None;
+            }
+            self.file_picker.close();
+            return Some(Vec::new());
+        }
+        dismiss!(self.permissions_picker);
+        dismiss!(self.stash_picker);
+        dismiss!(self.memory_picker);
+        dismiss!(self.task_picker, {
+            let action = self.task_picker.cancel();
+            self.handle_task_picker_action(action)
+        });
+        dismiss!(self.session_picker);
+
+        None
     }
 
     fn route_overlay_mouse<T>(

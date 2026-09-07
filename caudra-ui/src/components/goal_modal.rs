@@ -4,7 +4,7 @@ use caudra_agent::{GoalStatus, GoalVerdict};
 use caudra_providers::model_registry::GoalEvaluatorTarget;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
-use ratatui::layout::{Alignment, Rect};
+use ratatui::layout::{Alignment, Position, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 
@@ -21,6 +21,7 @@ const H_PAD: u16 = 2;
 pub struct GoalModal {
     open: bool,
     scroll: ModalScroll,
+    popup: Rect,
 }
 
 impl Default for GoalModal {
@@ -28,6 +29,7 @@ impl Default for GoalModal {
         Self {
             open: false,
             scroll: ModalScroll::new_top(),
+            popup: Rect::default(),
         }
     }
 }
@@ -45,6 +47,10 @@ impl GoalModal {
                 self.scroll.handle_key(key);
             }
         }
+    }
+
+    pub fn contains(&self, pos: Position) -> bool {
+        self.open && self.popup.contains(pos)
     }
 
     pub fn scroll(&mut self, delta: i32) {
@@ -90,6 +96,7 @@ impl GoalModal {
         if total > padded.height {
             render_vertical_scrollbar(frame, inner, total, offset);
         }
+        self.popup = popup;
         popup
     }
 }

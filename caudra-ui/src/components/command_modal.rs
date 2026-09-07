@@ -52,6 +52,7 @@ pub struct CommandModal {
     /// from here when the argument prompt is dismissed.
     rows: Vec<CommandRow>,
     query: String,
+    popup: Rect,
 }
 
 impl CommandModal {
@@ -60,6 +61,7 @@ impl CommandModal {
             stage: Stage::Closed,
             rows: Vec::new(),
             query: String::new(),
+            popup: Rect::default(),
         }
     }
 
@@ -143,12 +145,10 @@ impl CommandModal {
         }
     }
 
-    /// Only the list scrolls; the argument prompt is two fixed rows.
+    /// Whichever stage is drawn: the argument prompt is a modal in its own
+    /// right, not a hole in the one it replaced.
     pub fn contains(&self, pos: Position) -> bool {
-        match &self.stage {
-            Stage::Pick(picker) => picker.contains(pos),
-            Stage::Closed | Stage::Args { .. } => false,
-        }
+        self.is_open() && self.popup.contains(pos)
     }
 
     /// A command that takes no arguments runs straight away; anything with
@@ -199,7 +199,7 @@ impl CommandModal {
     }
 
     pub fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
-        match &mut self.stage {
+        let popup = match &mut self.stage {
             Stage::Closed => Rect::default(),
             Stage::Pick(picker) => picker.view(frame, area),
             Stage::Args { input, row } => {
@@ -241,7 +241,9 @@ impl CommandModal {
                 frame.render_widget(Paragraph::new(args_footer()).style(bg), footer_area);
                 popup
             }
-        }
+        };
+        self.popup = popup;
+        popup
     }
 }
 

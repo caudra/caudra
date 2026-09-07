@@ -84,7 +84,7 @@ struct State<T> {
     search: TextBuffer,
     scroll_offset: usize,
     viewport_height: usize,
-    inner_area: Rect,
+    popup_area: Rect,
     row_hits: Vec<PickerRowHit>,
     mouse_down: Option<usize>,
     enabled: Option<Vec<bool>>,
@@ -124,7 +124,7 @@ impl<T: PickerItem> State<T> {
             search: TextBuffer::new(String::new()),
             scroll_offset: 0,
             viewport_height: 20,
-            inner_area: Rect::default(),
+            popup_area: Rect::default(),
             row_hits: Vec::new(),
             mouse_down: None,
             enabled: None,
@@ -447,10 +447,12 @@ impl<T: PickerItem> ListPicker<T> {
         self.state = None;
     }
 
+    /// The whole popup, border included: the frame is part of the picker, so a
+    /// press on it is a near miss rather than a press outside.
     pub fn contains(&self, pos: Position) -> bool {
         self.state
             .as_ref()
-            .is_some_and(|s| s.inner_area.contains(pos))
+            .is_some_and(|s| s.popup_area.contains(pos))
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> PickerAction<T> {
@@ -802,7 +804,7 @@ fn render_ready<T: PickerItem>(
         render_vertical_scrollbar(frame, list_area, total_visual as u16, visual_offset as u16);
     }
 
-    s.inner_area = inner;
+    s.popup_area = popup;
     popup
 }
 

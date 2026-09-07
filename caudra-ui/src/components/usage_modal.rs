@@ -13,7 +13,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
@@ -83,6 +83,7 @@ pub struct UsageModal {
     scope: UsageScope,
     scroll: ModalScroll,
     quota: Watch<UsageFetchState>,
+    popup: Rect,
 }
 
 impl UsageModal {
@@ -92,6 +93,7 @@ impl UsageModal {
             scope: UsageScope::default(),
             scroll: ModalScroll::new_top(),
             quota: Watch::default(),
+            popup: Rect::default(),
         }
     }
 
@@ -107,6 +109,10 @@ impl UsageModal {
 
     pub fn is_open(&self) -> bool {
         self.open
+    }
+
+    pub fn contains(&self, pos: Position) -> bool {
+        self.open && self.popup.contains(pos)
     }
 
     pub fn toggle(&mut self) {
@@ -202,6 +208,7 @@ impl UsageModal {
         };
         frame.render_widget(Paragraph::new(hint), hint_area);
 
+        self.popup = popup;
         popup
     }
 }

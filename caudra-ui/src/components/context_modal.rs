@@ -33,6 +33,7 @@ pub struct ContextModal {
     open: bool,
     expanded: bool,
     scroll: ModalScroll,
+    popup: Rect,
     footer_hit: Rect,
     mouse_position: Option<Position>,
     footer_mouse_down: bool,
@@ -44,6 +45,7 @@ impl ContextModal {
             open: false,
             expanded: false,
             scroll: ModalScroll::new_top(),
+            popup: Rect::default(),
             footer_hit: Rect::default(),
             mouse_position: None,
             footer_mouse_down: false,
@@ -68,6 +70,10 @@ impl ContextModal {
 
     pub fn is_open(&self) -> bool {
         self.open
+    }
+
+    pub fn contains(&self, pos: Position) -> bool {
+        self.open && self.popup.contains(pos)
     }
 
     pub fn handle_key(&mut self, key_event: KeyEvent) {
@@ -193,6 +199,7 @@ impl ContextModal {
             render_vertical_scrollbar(frame, inner, total, offset);
         }
 
+        self.popup = popup;
         popup
     }
 }

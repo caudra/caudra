@@ -63,6 +63,12 @@ impl ThemePicker {
         self.picker.contains(pos)
     }
 
+    /// Leaving without choosing, which puts the theme back the way the preview
+    /// found it.
+    pub fn cancel(&mut self) -> ThemePickerAction {
+        self.map_picker_action(PickerAction::Close)
+    }
+
     /// The wheel moves the viewport, not the selection, so the previewed theme
     /// is still the selected one and needs no reapplying.
     pub fn scroll(&mut self, delta: i32) {
