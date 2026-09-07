@@ -616,15 +616,19 @@ impl Workbench {
     /// last frame recorded. Anything outside a pane is left alone.
     pub fn handle_mouse(&mut self, event: MouseEvent) -> WorkbenchAction {
         let at = (event.column, event.row);
-        // The panel is anchored to a cell, so anything that could move what is
-        // under it takes it down first. A press is left to `press_menu`, and a
-        // right press re-anchors it somewhere else.
+        // The panel is anchored to a cell, so what could move the cell out from
+        // under it takes it down first. Named one by one rather than as
+        // everything else: a click is a press and a release, and swallowing the
+        // release would take down the menu the press had just opened.
         if self.menu.is_some()
-            && !matches!(
+            && matches!(
                 event.kind,
-                MouseEventKind::Moved
-                    | MouseEventKind::Down(MouseButton::Left)
-                    | MouseEventKind::Down(MouseButton::Right)
+                MouseEventKind::ScrollUp
+                    | MouseEventKind::ScrollDown
+                    | MouseEventKind::ScrollLeft
+                    | MouseEventKind::ScrollRight
+                    | MouseEventKind::Down(MouseButton::Middle)
+                    | MouseEventKind::Drag(MouseButton::Left)
             )
         {
             self.menu = None;
@@ -657,6 +661,8 @@ impl Workbench {
                 self.open_menu_at(at);
                 return WorkbenchAction::Consumed;
             }
+            // The tail of the press above, which has already been acted on.
+            MouseEventKind::Up(MouseButton::Right) => return WorkbenchAction::Consumed,
             MouseEventKind::Down(MouseButton::Middle) => {
                 self.close_under(at);
                 return WorkbenchAction::Consumed;
@@ -920,10 +926,7 @@ impl Workbench {
                 return self.copy(self.relative(&path).display().to_string());
             }
             MenuAction::SendToComposer => {
-                return WorkbenchAction::SendToComposer(format!(
-                    "@{}",
-                    self.relative(&path).display()
-                ));
+                return WorkbenchAction::SendToComposer(self.mention(&path));
             }
             MenuAction::Rename => self.ask_for_name(InputKind::Rename, path),
             MenuAction::NewFile => self.ask_for_name(InputKind::NewFile, self.holder(&path)),
@@ -2315,22 +2318,28 @@ impl Workbench {
         self.editor.active()?.buffer.selected_text()
     }
 
+    /// How a path is written for the composer, which is the same wherever the
+    /// path came from.
+    fn mention(&self, path: &Path) -> String {
+        format!("@{}", self.relative(path).display())
+    }
+
     /// What `Ctrl+X Enter` hands the composer: the tree's selection from the
     /// sidebar, and the cursor's line span from the editor.
     fn reference(&self) -> Option<String> {
         if self.focus == Focus::Sidebar {
             if self.sidebar == SidebarView::Search {
                 let (path, line) = self.search.selection()?;
-                return Some(format!("@{}:L{line}", self.relative(&path).display()));
+                return Some(format!("{}:L{line}", self.mention(&path)));
             }
             let path = match self.sidebar {
                 SidebarView::SourceControl => &self.scm.selected_change()?.path,
                 _ => &self.tree.selected()?.path,
             };
-            return Some(format!("@{}", self.relative(path).display()));
+            return Some(self.mention(path));
         }
         let tab = self.editor.active()?;
-        let path = self.relative(&tab.path).display().to_string();
+        let mention = self.mention(&tab.path);
         let (first, last) = match tab.buffer.selection() {
             Some((from, to)) => (from.line + 1, to.line + 1),
             None => {
@@ -2339,8 +2348,8 @@ impl Workbench {
             }
         };
         Some(match first == last {
-            true => format!("@{path}:L{first}"),
-            false => format!("@{path}:L{first}-L{last}"),
+            true => format!("{mention}:L{first}"),
+            false => format!("{mention}:L{first}-L{last}"),
         })
     }
 
@@ -2633,10 +2642,15 @@ mod tests {
     const MENU_GONE: &str = "a press inside the panel took the menu down";
     const WRONG_PROMPT: &str = "the field under the editor is not showing what is being typed";
     const WRONG_HINT: &str = "the status bar is not offering what the next key will reach";
+    const NOT_SENT: &str = "the composer was handed something other than the path";
+    const STILL_A_PREVIEW: &str = "the tab is still the one the next file will take over";
+    const NOT_REVEALED: &str = "the sidebar is not showing the file it was pointed at";
     /// The file [`project`] opens, and the folder beside it.
     const OPENED_FILE: &str = "a.txt";
     const NESTED_DIR: &str = "sub";
+    const NESTED_FILE: &str = "b.txt";
     const RENAMED_FILE: &str = "renamed.txt";
+    const RENAMED_DIR: &str = "moved";
     const MADE_NAME: &str = "made.txt";
     /// One keystroke of unsaved work, which is what makes a close ask.
     const EDIT: char = 'X';
@@ -2694,6 +2708,10 @@ mod tests {
 
     fn right_click(column: u16, row: u16) -> MouseEvent {
         mouse(MouseEventKind::Down(MouseButton::Right), column, row)
+    }
+
+    fn right_release(column: u16, row: u16) -> MouseEvent {
+        mouse(MouseEventKind::Up(MouseButton::Right), column, row)
     }
 
     /// Takes `action` from the menu that is up, which is what pressing its row
@@ -5663,6 +5681,30 @@ mod tests {
         assert_eq!(tab.title, RENAMED_FILE, "{TAB_LEFT_BEHIND}");
     }
 
+    /// A folder rename moves every path under it at once, so the tabs have to
+    /// be followed by prefix rather than by an equality check.
+    #[test]
+    fn renaming_a_folder_carries_the_tabs_under_it() {
+        let (dir, mut workbench) = project();
+        workbench.open_path(&dir.path().join(NESTED_DIR).join(NESTED_FILE));
+        workbench.tree.reveal(&dir.path().join(NESTED_DIR));
+        workbench.focus = Focus::Sidebar;
+        workbench.handle_leader(press(keys::MENU));
+        menu_action(&mut workbench, MenuAction::Rename);
+
+        answer_prompt(&mut workbench, RENAMED_DIR);
+
+        assert!(
+            dir.path().join(RENAMED_DIR).join(NESTED_FILE).is_file(),
+            "{NOT_RENAMED}"
+        );
+        assert_eq!(
+            workbench.editor.active().map(|tab| tab.path.clone()),
+            Some(dir.path().join(RENAMED_DIR).join(NESTED_FILE)),
+            "{TAB_LEFT_BEHIND}"
+        );
+    }
+
     /// The name is still there to be corrected, because retyping a long one
     /// over a typo is the worst way to answer a refusal.
     #[test]
@@ -5775,6 +5817,69 @@ mod tests {
     }
 
     #[test]
+    fn send_to_composer_names_the_row_the_way_the_composer_reads_it() {
+        let (dir, mut workbench) = project();
+        select_file(&dir, &mut workbench);
+        workbench.handle_leader(press(keys::MENU));
+
+        let sent = menu_action(&mut workbench, MenuAction::SendToComposer);
+
+        assert_eq!(
+            sent,
+            WorkbenchAction::SendToComposer(format!("@{OPENED_FILE}")),
+            "{NOT_SENT}"
+        );
+    }
+
+    /// A preview tab is the next one to be taken over, so keeping it is the
+    /// only thing standing between what is in it and the next file opened.
+    #[test]
+    fn keep_open_takes_a_tab_out_of_the_preview_slot() {
+        let (dir, mut workbench) = project();
+        let path = dir.path().join(OPENED_FILE);
+        workbench.editor.preview(&path, 0).expect("a preview tab");
+
+        workbench.run_menu(MenuAction::KeepOpen, &Target::Tab(0));
+
+        assert!(!workbench.editor.tabs()[0].preview, "{STILL_A_PREVIEW}");
+    }
+
+    #[test]
+    fn save_from_the_menu_writes_the_tab_it_was_asked_from() {
+        let (dir, mut workbench) = many_tabs(2);
+        edit_tab(&mut workbench, 0);
+        workbench.editor.select(1);
+
+        workbench.run_menu(MenuAction::Save, &Target::Tab(0));
+
+        assert_eq!(
+            fs::read_to_string(dir.path().join("file0.txt")).expect("the saved file"),
+            format!("{EDIT}one\n"),
+            "{ANSWER_IGNORED}"
+        );
+        assert!(!workbench.editor.tabs()[0].is_dirty(), "{ANSWER_IGNORED}");
+    }
+
+    #[test]
+    fn reveal_in_explorer_brings_the_sidebar_back_to_the_file() {
+        let (dir, mut workbench) = project();
+        open_file(&dir, &mut workbench);
+        workbench.sidebar = SidebarView::Search;
+        workbench.sidebar_collapsed = true;
+
+        workbench.run_menu(MenuAction::RevealInExplorer, &Target::Tab(0));
+
+        assert_eq!(workbench.sidebar, SidebarView::Explorer, "{NOT_REVEALED}");
+        assert!(!workbench.sidebar_collapsed, "{NOT_REVEALED}");
+        assert_eq!(workbench.focus, Focus::Sidebar, "{NOT_REVEALED}");
+        assert_eq!(
+            workbench.tree.selected().map(|row| row.path.clone()),
+            Some(dir.path().join(OPENED_FILE)),
+            "{NOT_REVEALED}"
+        );
+    }
+
+    #[test]
     fn close_saved_leaves_the_tab_with_work_in_it() {
         let (_dir, mut workbench) = many_tabs(3);
         edit_tab(&mut workbench, 1);
@@ -5831,6 +5936,7 @@ mod tests {
         let row = menu_row(&workbench, MenuAction::CopyPath);
 
         let copied = workbench.handle_mouse(click(workbench.panes.menu.x, row));
+        workbench.handle_mouse(release(workbench.panes.menu.x, row));
 
         assert_eq!(
             copied,
@@ -5838,6 +5944,23 @@ mod tests {
             "{PATH_UNCOPIED}"
         );
         assert!(workbench.menu.is_none(), "{MENU_STUCK}");
+    }
+
+    /// One click of a button is a press and a release. The release used to
+    /// take down the menu the press had just opened, which no test that sends
+    /// half a click can see.
+    #[test]
+    fn the_menu_outlives_the_release_of_the_press_that_opened_it() {
+        let (dir, mut workbench) = project();
+        select_file(&dir, &mut workbench);
+        paint(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        let rows = workbench.panes.rows;
+
+        workbench.handle_mouse(right_click(rows.x, rows.y));
+        let released = workbench.handle_mouse(right_release(rows.x, rows.y));
+
+        assert!(workbench.menu.is_some(), "{MENU_GONE}");
+        assert_eq!(released, WorkbenchAction::Consumed, "{MODAL_LEAKED}");
     }
 
     /// A rule is part of the panel, so hitting one is a near miss rather than
