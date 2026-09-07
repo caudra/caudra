@@ -638,6 +638,24 @@ pub struct PromptProgress {
     pub cache: u32,
 }
 
+/// Restoring a session that was cancelled mid-tool-call replays snapshots for
+/// tool ids whose messages are gone, and every snapshot row repeats the same
+/// id. One line per id says everything the flood did.
+#[derive(Default)]
+struct DroppedSnapshots(HashSet<String>);
+
+impl DroppedSnapshots {
+    fn record(&mut self, tool_id: &str) {
+        if self.0.insert(tool_id.to_owned()) {
+            warn!(tool_id, "snapshot dropped: no tool message with this id");
+        }
+    }
+
+    fn clear(&mut self) {
+        self.0.clear();
+    }
+}
+
 pub struct MessagesPanel {
     messages: Vec<DisplayMessage>,
     streaming_thinking: StreamingContent,
@@ -674,6 +692,7 @@ pub struct MessagesPanel {
     diagram_pans: HashMap<DiagramKey, u16>,
     /// Per-tool log of post-completion click rows, replayed on restore.
     lua_clicks: HashMap<String, Vec<usize>>,
+    dropped_snapshots: DroppedSnapshots,
     live_bufs: HashMap<String, Arc<SharedBuf>>,
     /// Bufs of finished tools we keep polling so runtime-side warm
     /// clicks stay visible. Purely local: every finished-tool click
@@ -751,6 +770,7 @@ impl MessagesPanel {
             batch_child_progress: BatchProgressMap::new(),
             diagram_pans: HashMap::new(),
             lua_clicks: HashMap::new(),
+            dropped_snapshots: DroppedSnapshots::default(),
             live_bufs: HashMap::new(),
             watched_bufs: VecDeque::new(),
             retained_shell_outputs: VecDeque::new(),
@@ -972,6 +992,7 @@ impl MessagesPanel {
         for msg in &mut msgs {
             msg.reasoning_open = None;
         }
+        self.dropped_snapshots.clear();
         self.messages = msgs;
         self.cache.clear();
         self.auto_open = None;
@@ -2926,10 +2947,7 @@ impl MessagesPanel {
             msg.snapshot_theme_gen = applied_gen;
             self.rebuild_tool_segment(tool_id);
         } else {
-            warn!(
-                tool_id,
-                is_header, "snapshot dropped: no tool message with this id"
-            );
+            self.dropped_snapshots.record(tool_id);
         }
     }
 
