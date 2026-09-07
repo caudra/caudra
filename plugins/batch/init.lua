@@ -57,7 +57,7 @@ Rules:
 - All calls run in parallel; order NOT guaranteed
 - Partial failures do not stop other calls
 - Do NOT nest batch inside batch
-- Do NOT use for dependent operations or when filtering results (use code_execution)]],
+- Do NOT use for dependent operations or when filtering results (use python_execution)]],
   MAX_BATCH_SIZE
 )
 
@@ -530,8 +530,7 @@ function Batch:run_child(c, ctx)
   local registered = caudra.api.get_tool(c.tool)
   c.lua_provenance = registered and registered.lua_provenance or nil
   self:rerender()
-  local text, err, invocation_id, error_restore_allowed, display =
-    caudra.agent.call_tool(ctx, c.tool, c.params, {
+  local text, err, invocation_id, error_restore_allowed, display = caudra.agent.call_tool(ctx, c.tool, c.params, {
     -- Clicks on a still-streaming child are a no-op: its click handler
     -- lives on the child's own handle, not on this wrapper buf.
     on_live_buf = function(b)

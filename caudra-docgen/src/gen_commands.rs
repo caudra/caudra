@@ -177,7 +177,7 @@ pub fn generate() -> String {
     .unwrap();
     writeln!(
         out,
-        "- **`/workflow`**: expose workflow mode to custom Lua tool descriptions and handlers. Native `code_execution` remains isolated. Config: `always_workflow = true`."
+        "- **`/workflow`**: expose workflow mode to custom Lua tool descriptions and handlers. Native `python_execution` remains isolated. Config: `always_workflow = true`."
     )
     .unwrap();
     writeln!(

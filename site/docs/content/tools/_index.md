@@ -7,7 +7,7 @@ group = "Reference"
 
 # Tools
 
-Caudra ships with 22 built-in tools in this reference (22 on by default, 0 opt-in via plugin options). Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
+Caudra ships with 27 built-in tools in this reference (27 on by default, 0 opt-in via plugin options). Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
 
 First-party file, web, shell, index, Python, and environment tools run through protocol-neutral Workcell contracts. Workcell owns schemas, validation, execution bounds, atomic file changes, network policy, subprocess cleanup, cancellation, and the bundled worker lifecycle. Caudra owns registration, authorization, retained session output, and model or UI presentation. Release builds pin an exact Workcell revision.
 
@@ -130,6 +130,58 @@ View an image file (png, jpeg, gif, webp) so you can actually see it; it is retu
 |-----------|------|----------|-------------|
 | `path` | string | yes | Path to the image file |
 
+## Code Intelligence
+
+### `code_map` {#code_map}
+
+Rank every symbol in a source tree by importance and return the top ones. Start here when you do not know a codebase.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `path` | string | no | Root-relative subdirectory to scope the map to. Absent means the whole configured root. |
+| `limit` | integer | no | Maximum rows to return. Narrows the result; it can never widen it past the host ceiling. |
+
+### `code_context` {#code_context}
+
+Return the symbols worth reading before making a specific change. Describe the change in your own words.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `task` | string | yes | The change you are about to make, in your own words. |
+| `path` | string | no | Root-relative subdirectory to scope the map to. Absent means the whole configured root. |
+| `limit` | integer | no | Maximum rows to return. Narrows the result; it can never widen it past the host ceiling. |
+
+### `code_refs` {#code_refs}
+
+List the symbols that reference a given symbol, or the symbols it references.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `symbol` | string | yes | A symbol name, optionally qualified as `path::name` to disambiguate. |
+| `direction` | string | no | `callers` lists symbols referencing this one; `callees` lists the ones it references. |
+| `path` | string | no | Root-relative subdirectory to scope the map to. Absent means the whole configured root. |
+| `limit` | integer | no | Maximum rows to return. Narrows the result; it can never widen it past the host ceiling. |
+
+### `code_impact` {#code_impact}
+
+Show what a change to a symbol could reach, and which tests already cover it.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `symbol` | string | yes | A symbol name, optionally qualified as `path::name` to disambiguate. |
+| `depth` | integer | no | Hops to walk backwards along call edges. Beyond a few hops a reachability set describes the repository rather than a blast radius. |
+| `path` | string | no | Root-relative subdirectory to scope the map to. Absent means the whole configured root. |
+| `limit` | integer | no | Maximum rows to return. Narrows the result; it can never widen it past the host ceiling. |
+
+### `code_expand` {#code_expand}
+
+Return one symbol's source together with its immediate callers and callees.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `symbol` | string | yes | A symbol name, optionally qualified as `path::name` to disambiguate. |
+| `path` | string | no | Root-relative subdirectory to scope the map to. Absent means the whole configured root. |
+
 ## Execution & Control
 
 ### `batch` {#batch}
@@ -154,7 +206,7 @@ A progress bar redraws a row instead of printing lines. Caudra renders both the 
 | `timeout` | integer | no | Optional timeout in milliseconds. Defaults to 120000 and is capped at 600000. |
 | `workdir` | string | no | Optional configured-root-relative or absolute initial working directory inside the configured root. |
 
-### `code_execution` {#code_execution}
+### `python_execution` {#python_execution}
 
 Execute a short Python script in an isolated interpreter and return its value and printed output.
 

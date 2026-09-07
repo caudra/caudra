@@ -60,7 +60,7 @@ local opts = caudra.api.register_options(output_limits.extend({
 }))
 
 local function new_view(ctx, buf)
-  return ToolView.new(buf, { max_lines = ctx:tool_output_lines().code_execution or 30 })
+  return ToolView.new(buf, { max_lines = ctx:tool_output_lines().python_execution or 30 })
 end
 
 -- One body builder for every path (start preview, handler, restore), so the
@@ -352,7 +352,7 @@ local function restore(input, output, is_error, ctx)
 end
 
 caudra.api.register_tool({
-  name = "code_execution",
+  name = "python_execution",
   description = description,
   describe = describe,
   schema = schema,
@@ -368,5 +368,5 @@ caudra.api.register_tool({
 
 caudra.api.register_prompt_hint({
   slot = "efficient_tools",
-  content = "code_execution",
+  content = "python_execution",
 })

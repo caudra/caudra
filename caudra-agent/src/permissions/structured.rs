@@ -30,6 +30,11 @@ const FILESYSTEM_READ_CONTRACTS: &[&str] = &[
     "file.glob.v1",
     "file.grep.v1",
     "file.index.v1",
+    "code.map.v1",
+    "code.context.v1",
+    "code.refs.v1",
+    "code.impact.v1",
+    "code.expand.v1",
 ];
 const MCP_CONTRACT: &str = "mcp.tools.call/v1";
 const SUMMARY_MAX_CHARS: usize = 240;

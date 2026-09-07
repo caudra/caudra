@@ -28,11 +28,21 @@ const SECTIONS: &[(&str, &[&str])] = &[
         ],
     ),
     (
+        "Code Intelligence",
+        &[
+            "code_map",
+            "code_context",
+            "code_refs",
+            "code_impact",
+            "code_expand",
+        ],
+    ),
+    (
         "Execution & Control",
         &[
             "batch",
             "shell",
-            "code_execution",
+            "python_execution",
             "execution_environment",
             "question",
         ],
@@ -190,7 +200,7 @@ fn write_tool_entry(out: &mut String, name: &str, info: &ToolInfo, opt_in: &Hash
     writeln!(out).unwrap();
     writeln!(out, "{summary}").unwrap();
     writeln!(out).unwrap();
-    if name == "code_execution" {
+    if name == "python_execution" {
         writeln!(
             out,
             "Release builds include the isolated Monty worker. `WORKCELL_MCP_CODE_WORKER` can override it with an operator-supplied worker binary."

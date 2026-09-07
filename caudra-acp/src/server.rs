@@ -496,7 +496,7 @@ fn question_tool(out_tx: Sender<Value>, pending: PendingState) -> LocalToolFn {
                 .as_ref()
                 .map(ToString::to_string)
                 .ok_or("no session")?;
-            // Batch/code_execution children dispatch with an empty id; a
+            // Batch/python_execution children dispatch with an empty id; a
             // scope pointing at a tool call the client never saw would get
             // the elicitation rejected or dropped.
             let tool_call_id = ctx.tool_use_id.filter(|id| !id.is_empty());

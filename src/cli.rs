@@ -574,9 +574,9 @@ mod tests {
 
     #[test_case("FileRead", "file_read")]
     #[test_case("Shell", "shell")]
-    #[test_case("CodeExecution", "code_execution")]
+    #[test_case("PythonExecution", "python_execution")]
     #[test_case("ExecutionEnvironment", "execution_environment")]
-    #[test_case("code_execution", "code_execution"; "snake_passthrough")]
+    #[test_case("python_execution", "python_execution"; "snake_passthrough")]
     fn normalize_tool_name_valid_inputs(input: &str, expected: &str) {
         assert_eq!(normalize_tool_name(input).unwrap(), expected);
     }

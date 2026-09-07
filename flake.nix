@@ -91,8 +91,8 @@
           "sha256-P4PgqfYykkZrWGg5G3WQo070lORLEhmXQUQPx3+Yslo=";
         "git+https://github.com/crossterm-rs/crossterm?rev=3ca54292d2b1f1c58e200a06122ddaf5dd6b5c77#3ca54292d2b1f1c58e200a06122ddaf5dd6b5c77" =
           "sha256-A5lgiEEi7mktf7m2GljdAxst7Fdl7Uqko29Xq6o90Ow=";
-        "git+https://github.com/tensorninja/workcell-mcp?rev=caf27561d016ed7e1bb73b893171384f9dd35060#caf27561d016ed7e1bb73b893171384f9dd35060" =
-          "";
+        "git+https://github.com/tensorninja/workcell-mcp?rev=a8b2370d493983166876b2e70a2ca1d6cf7579ff#a8b2370d493983166876b2e70a2ca1d6cf7579ff" =
+          "sha256-1bzh2nFse0O++uvj3M0q/gaI+Q7sSIftuujVieAOSbM=";
       };
 
       missingGitDepHashes = builtins.filter (s: !(builtins.hasAttr s gitDepHashes)) gitDepSources;
@@ -198,8 +198,8 @@
                 smoke_output="$(OPENAI_API_KEY=release-smoke \
                   XDG_CACHE_HOME="$TMPDIR/cache" \
                   $out/bin/caudra --model openai/gpt-5.1 prompt --tools --names 2>&1)"
-                printf '%s\n' "$smoke_output" | grep -qx code_execution
-                ! printf '%s\n' "$smoke_output" | grep -q 'Workcell code_execution is unavailable'
+                printf '%s\n' "$smoke_output" | grep -qx python_execution
+                ! printf '%s\n' "$smoke_output" | grep -q 'Workcell python_execution is unavailable'
               '';
             }
           );

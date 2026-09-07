@@ -309,7 +309,7 @@ def print_top_expensive_calls(all_calls, n=15):
             tools = inp.get("tool_calls", [])
             detail = f"{len(tools)} calls: " + ",".join(t.get("tool", "?") for t in tools[:5])
             detail = detail[:60]
-        elif name == "code_execution":
+        elif name == "python_execution":
             detail = str(inp.get("code", ""))[:60].replace("\n", "\\n")
         else:
             detail = str(inp)[:60]

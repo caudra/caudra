@@ -1,4 +1,4 @@
-//! Tests the code_execution plugin's interpreter visibility: one predicate
+//! Tests the python_execution plugin's interpreter visibility: one predicate
 //! gates both `describe` text and the handler's fn-map, so what the model
 //! sees is exactly what the interpreter can call.
 
@@ -11,7 +11,7 @@ use caudra_agent::tools::{
 };
 use caudra_lua::PluginHost;
 
-const CODE_EXECUTION_SRC: &str = include_str!("../../plugins/code_execution/init.lua");
+const PYTHON_EXECUTION_SRC: &str = include_str!("../../plugins/python_execution/init.lua");
 
 const ECHO_PREFIX: &str = "echo:";
 const FAIL_MSG: &str = "fixture blew up";
@@ -77,7 +77,7 @@ caudra.api.register_tool({{
 
 fn setup_with(reg: Arc<ToolRegistry>) -> (Arc<ToolRegistry>, PluginHost) {
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    host.load_source("code_execution", CODE_EXECUTION_SRC)
+    host.load_source("python_execution", PYTHON_EXECUTION_SRC)
         .expect("real plugin should load");
     host.load_source("policy_fixtures", &fixture_plugin())
         .expect("fixture plugin should load");
@@ -100,8 +100,8 @@ fn describe(
     audience: ToolAudience,
     workflow: bool,
 ) -> String {
-    reg.get("code_execution")
-        .expect("code_execution registered")
+    reg.get("python_execution")
+        .expect("python_execution registered")
         .tool
         .description(&DescriptionContext {
             filter,
@@ -113,8 +113,8 @@ fn describe(
 
 fn exec_code(reg: &ToolRegistry, ctx: &ToolContext, code: &str) -> Result<String, String> {
     let entry = reg
-        .get("code_execution")
-        .expect("code_execution registered");
+        .get("python_execution")
+        .expect("python_execution registered");
     let inv = entry
         .tool
         .parse(&serde_json::json!({ "code": code, "timeout": 10 }))
@@ -267,8 +267,8 @@ fn event_ctx(reg: &Arc<ToolRegistry>) -> (ToolContext, flume::Receiver<caudra_ag
 }
 
 fn parse_code(reg: &ToolRegistry, code: &str) -> Box<dyn caudra_agent::tools::ToolInvocation> {
-    reg.get("code_execution")
-        .expect("code_execution registered")
+    reg.get("python_execution")
+        .expect("python_execution registered")
         .tool
         .parse(&serde_json::json!({ "code": code, "timeout": 10 }))
         .expect("parse failed")
@@ -398,7 +398,7 @@ fn restore_lines_with(code: &str, output: &str, is_error: bool, clicks: Vec<usiz
     let (tx, rx) = flume::unbounded::<caudra_agent::Envelope>();
     eh.request_restore(
         caudra_lua::RestoreItem {
-            tool: Arc::from("code_execution"),
+            tool: Arc::from("python_execution"),
             tool_use_id: SCRIPT_TOOL_ID.into(),
             output: output.into(),
             input: serde_json::json!({ "code": code }),

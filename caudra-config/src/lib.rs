@@ -87,7 +87,6 @@ pub const MAX_INDEX_MAX_FILE_SIZE_MB: usize = 16;
 pub const DEFAULT_BUILTINS: &[&str] = &[
     "bash",
     "batch",
-    "code_execution",
     "edit",
     "glob",
     "grep",
@@ -156,7 +155,12 @@ pub const WORKCELL_NATIVE_TOOL_NAMES: &[&str] = &[
     "websearch",
     "webfetch",
     "shell",
-    "code_execution",
+    "python_execution",
+    "code_map",
+    "code_context",
+    "code_refs",
+    "code_impact",
+    "code_expand",
     "execution_environment",
 ];
 
@@ -691,7 +695,7 @@ pub enum NotificationMethod {
 #[serde(default, deny_unknown_fields)]
 pub struct ToolOutputLinesFile {
     pub bash: Option<usize>,
-    pub code_execution: Option<usize>,
+    pub python_execution: Option<usize>,
     pub task: Option<usize>,
     pub index: Option<usize>,
     pub grep: Option<usize>,
@@ -707,7 +711,7 @@ impl ToolOutputLinesFile {
             self,
             overlay,
             bash,
-            code_execution,
+            python_execution,
             task,
             index,
             grep,
@@ -1350,7 +1354,7 @@ impl UiConfig {
 #[serde(default)]
 pub struct ToolOutputLines {
     pub bash: usize,
-    pub code_execution: usize,
+    pub python_execution: usize,
     pub task: usize,
     pub index: usize,
     pub grep: usize,
@@ -1363,7 +1367,7 @@ pub struct ToolOutputLines {
 impl ToolOutputLines {
     pub const DEFAULT: Self = Self {
         bash: 5,
-        code_execution: 5,
+        python_execution: 5,
         task: 5,
         index: 3,
         grep: 3,
@@ -1375,7 +1379,7 @@ impl ToolOutputLines {
 
     pub const FIELD_DEFAULTS: &[(&'static str, usize)] = &[
         ("bash", Self::DEFAULT.bash),
-        ("code_execution", Self::DEFAULT.code_execution),
+        ("python_execution", Self::DEFAULT.python_execution),
         ("task", Self::DEFAULT.task),
         ("index", Self::DEFAULT.index),
         ("grep", Self::DEFAULT.grep),
@@ -1390,9 +1394,19 @@ impl ToolOutputLines {
     /// quietly falling through to `other` the way `file_grep` once did.
     pub const FIELD_TOOLS: &[(&'static str, &'static [&'static str])] = &[
         ("bash", &["shell"]),
-        ("code_execution", &["code_execution"]),
+        ("python_execution", &["python_execution"]),
         ("task", &["task"]),
-        ("index", &["index"]),
+        (
+            "index",
+            &[
+                "index",
+                "code_map",
+                "code_context",
+                "code_refs",
+                "code_impact",
+                "code_expand",
+            ],
+        ),
         ("grep", &["file_grep", "file_glob"]),
         ("read", &["file_read"]),
         (
@@ -1426,7 +1440,7 @@ impl ToolOutputLines {
         let f = f.unwrap_or_default();
         Self {
             bash: f.bash.unwrap_or(d.bash),
-            code_execution: f.code_execution.unwrap_or(d.code_execution),
+            python_execution: f.python_execution.unwrap_or(d.python_execution),
             task: f.task.unwrap_or(d.task),
             index: f.index.unwrap_or(d.index),
             grep: f.grep.unwrap_or(d.grep),
@@ -1440,7 +1454,7 @@ impl ToolOutputLines {
     fn fields(&self) -> [(&'static str, usize); 9] {
         [
             ("bash", self.bash),
-            ("code_execution", self.code_execution),
+            ("python_execution", self.python_execution),
             ("task", self.task),
             ("index", self.index),
             ("grep", self.grep),
@@ -1466,9 +1480,11 @@ impl ToolOutputLines {
     pub fn get(&self, name: &str) -> usize {
         match name {
             "bash" | "shell" => self.bash,
-            "code_execution" => self.code_execution,
+            "python_execution" => self.python_execution,
             "task" => self.task,
-            "index" => self.index,
+            "index" | "code_map" | "code_context" | "code_refs" | "code_impact" | "code_expand" => {
+                self.index
+            }
             "file_grep" | "file_glob" | "grep" | "glob" => self.grep,
             "file_read" | "read" => self.read,
             "memory" => self.write,
@@ -4456,7 +4472,7 @@ mod tests {
     /// coinciding with the right value.
     const DISTINCT_BUDGETS: ToolOutputLines = ToolOutputLines {
         bash: 1,
-        code_execution: 2,
+        python_execution: 2,
         task: 3,
         index: 4,
         grep: 5,

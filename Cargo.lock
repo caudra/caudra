@@ -9496,10 +9496,11 @@ dependencies = [
 [[package]]
 name = "workcell"
 version = "0.1.0"
-source = "git+https://github.com/tensorninja/workcell-mcp?rev=caf27561d016ed7e1bb73b893171384f9dd35060#caf27561d016ed7e1bb73b893171384f9dd35060"
+source = "git+https://github.com/tensorninja/workcell-mcp?rev=a8b2370d493983166876b2e70a2ca1d6cf7579ff#a8b2370d493983166876b2e70a2ca1d6cf7579ff"
 dependencies = [
  "workcell-environment",
  "workcell-mcp-code",
+ "workcell-mcp-code-graph",
  "workcell-mcp-files",
  "workcell-mcp-shell",
  "workcell-mcp-web",
@@ -9508,9 +9509,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "workcell-code-graph"
+version = "0.1.0"
+source = "git+https://github.com/tensorninja/workcell-mcp?rev=a8b2370d493983166876b2e70a2ca1d6cf7579ff#a8b2370d493983166876b2e70a2ca1d6cf7579ff"
+dependencies = [
+ "gix",
+ "lru",
+ "sha2 0.11.0",
+ "tree-sitter",
+ "workcell-source-languages",
+]
+
+[[package]]
 name = "workcell-environment"
 version = "0.1.0"
-source = "git+https://github.com/tensorninja/workcell-mcp?rev=caf27561d016ed7e1bb73b893171384f9dd35060#caf27561d016ed7e1bb73b893171384f9dd35060"
+source = "git+https://github.com/tensorninja/workcell-mcp?rev=a8b2370d493983166876b2e70a2ca1d6cf7579ff#a8b2370d493983166876b2e70a2ca1d6cf7579ff"
 dependencies = [
  "rustix 0.38.44",
  "serde",
@@ -9524,7 +9537,7 @@ dependencies = [
 [[package]]
 name = "workcell-mcp-code"
 version = "0.1.0"
-source = "git+https://github.com/tensorninja/workcell-mcp?rev=caf27561d016ed7e1bb73b893171384f9dd35060#caf27561d016ed7e1bb73b893171384f9dd35060"
+source = "git+https://github.com/tensorninja/workcell-mcp?rev=a8b2370d493983166876b2e70a2ca1d6cf7579ff#a8b2370d493983166876b2e70a2ca1d6cf7579ff"
 dependencies = [
  "monty-pool",
  "monty-types 0.0.21 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -9537,9 +9550,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "workcell-mcp-code-graph"
+version = "0.1.0"
+source = "git+https://github.com/tensorninja/workcell-mcp?rev=a8b2370d493983166876b2e70a2ca1d6cf7579ff#a8b2370d493983166876b2e70a2ca1d6cf7579ff"
+dependencies = [
+ "async-trait",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "workcell-code-graph",
+ "workcell-mcp-files",
+ "workcell-tool-contract",
+]
+
+[[package]]
 name = "workcell-mcp-files"
 version = "0.1.0"
-source = "git+https://github.com/tensorninja/workcell-mcp?rev=caf27561d016ed7e1bb73b893171384f9dd35060#caf27561d016ed7e1bb73b893171384f9dd35060"
+source = "git+https://github.com/tensorninja/workcell-mcp?rev=a8b2370d493983166876b2e70a2ca1d6cf7579ff#a8b2370d493983166876b2e70a2ca1d6cf7579ff"
 dependencies = [
  "dunce",
  "file-format",
@@ -9551,6 +9580,123 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
+ "tree-sitter",
+ "uuid",
+ "workcell-source-languages",
+ "workcell-tool-contract",
+]
+
+[[package]]
+name = "workcell-mcp-shell"
+version = "0.1.0"
+source = "git+https://github.com/tensorninja/workcell-mcp?rev=a8b2370d493983166876b2e70a2ca1d6cf7579ff#a8b2370d493983166876b2e70a2ca1d6cf7579ff"
+dependencies = [
+ "async-trait",
+ "dunce",
+ "rustix 0.38.44",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "toml 0.9.12+spec-1.1.0",
+ "tree-sitter",
+ "tree-sitter-bash",
+ "workcell-output-filter",
+ "workcell-tool-contract",
+]
+
+[[package]]
+name = "workcell-mcp-web"
+version = "0.1.0"
+source = "git+https://github.com/tensorninja/workcell-mcp?rev=a8b2370d493983166876b2e70a2ca1d6cf7579ff#a8b2370d493983166876b2e70a2ca1d6cf7579ff"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "bytes",
+ "chrono",
+ "dom_query",
+ "dom_smoothie",
+ "futures-util",
+ "htmd",
+ "http",
+ "pdf_oxide",
+ "regex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "url",
+ "workcell-net",
+ "workcell-source-icons",
+ "workcell-tool-contract",
+]
+
+[[package]]
+name = "workcell-monty-worker"
+version = "0.1.0"
+source = "git+https://github.com/tensorninja/workcell-mcp?rev=a8b2370d493983166876b2e70a2ca1d6cf7579ff#a8b2370d493983166876b2e70a2ca1d6cf7579ff"
+dependencies = [
+ "libc",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "workcell-net"
+version = "0.1.0"
+source = "git+https://github.com/tensorninja/workcell-mcp?rev=a8b2370d493983166876b2e70a2ca1d6cf7579ff#a8b2370d493983166876b2e70a2ca1d6cf7579ff"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "futures-util",
+ "http",
+ "httpdate",
+ "reqwest",
+ "serde",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "url",
+]
+
+[[package]]
+name = "workcell-output-filter"
+version = "0.1.0"
+source = "git+https://github.com/tensorninja/workcell-mcp?rev=a8b2370d493983166876b2e70a2ca1d6cf7579ff#a8b2370d493983166876b2e70a2ca1d6cf7579ff"
+dependencies = [
+ "regex",
+ "serde",
+ "toml 0.9.12+spec-1.1.0",
+]
+
+[[package]]
+name = "workcell-source-icons"
+version = "0.1.0"
+source = "git+https://github.com/tensorninja/workcell-mcp?rev=a8b2370d493983166876b2e70a2ca1d6cf7579ff#a8b2370d493983166876b2e70a2ca1d6cf7579ff"
+dependencies = [
+ "base64 0.22.1",
+ "bytes",
+ "futures-util",
+ "http",
+ "image",
+ "lru",
+ "resvg",
+ "serde",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "url",
+ "workcell-net",
+]
+
+[[package]]
+name = "workcell-source-languages"
+version = "0.1.0"
+source = "git+https://github.com/tensorninja/workcell-mcp?rev=a8b2370d493983166876b2e70a2ca1d6cf7579ff#a8b2370d493983166876b2e70a2ca1d6cf7579ff"
+dependencies = [
  "tree-sitter",
  "tree-sitter-bash",
  "tree-sitter-c",
@@ -9583,120 +9729,12 @@ dependencies = [
  "tree-sitter-typescript",
  "tree-sitter-yaml",
  "tree-sitter-zig",
- "uuid",
- "workcell-tool-contract",
-]
-
-[[package]]
-name = "workcell-mcp-shell"
-version = "0.1.0"
-source = "git+https://github.com/tensorninja/workcell-mcp?rev=caf27561d016ed7e1bb73b893171384f9dd35060#caf27561d016ed7e1bb73b893171384f9dd35060"
-dependencies = [
- "async-trait",
- "dunce",
- "rustix 0.38.44",
- "serde",
- "serde_json",
- "tokio",
- "tokio-util",
- "toml 0.9.12+spec-1.1.0",
- "tree-sitter",
- "tree-sitter-bash",
- "workcell-output-filter",
- "workcell-tool-contract",
-]
-
-[[package]]
-name = "workcell-mcp-web"
-version = "0.1.0"
-source = "git+https://github.com/tensorninja/workcell-mcp?rev=caf27561d016ed7e1bb73b893171384f9dd35060#caf27561d016ed7e1bb73b893171384f9dd35060"
-dependencies = [
- "async-trait",
- "base64 0.22.1",
- "bytes",
- "chrono",
- "dom_query",
- "dom_smoothie",
- "futures-util",
- "htmd",
- "http",
- "pdf_oxide",
- "regex",
- "reqwest",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tokio-util",
- "url",
- "workcell-net",
- "workcell-source-icons",
- "workcell-tool-contract",
-]
-
-[[package]]
-name = "workcell-monty-worker"
-version = "0.1.0"
-source = "git+https://github.com/tensorninja/workcell-mcp?rev=caf27561d016ed7e1bb73b893171384f9dd35060#caf27561d016ed7e1bb73b893171384f9dd35060"
-dependencies = [
- "libc",
- "sha2 0.11.0",
- "tempfile",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "workcell-net"
-version = "0.1.0"
-source = "git+https://github.com/tensorninja/workcell-mcp?rev=caf27561d016ed7e1bb73b893171384f9dd35060#caf27561d016ed7e1bb73b893171384f9dd35060"
-dependencies = [
- "async-trait",
- "bytes",
- "futures-util",
- "http",
- "httpdate",
- "reqwest",
- "serde",
- "thiserror 2.0.18",
- "tokio",
- "tokio-util",
- "url",
-]
-
-[[package]]
-name = "workcell-output-filter"
-version = "0.1.0"
-source = "git+https://github.com/tensorninja/workcell-mcp?rev=caf27561d016ed7e1bb73b893171384f9dd35060#caf27561d016ed7e1bb73b893171384f9dd35060"
-dependencies = [
- "regex",
- "serde",
- "toml 0.9.12+spec-1.1.0",
-]
-
-[[package]]
-name = "workcell-source-icons"
-version = "0.1.0"
-source = "git+https://github.com/tensorninja/workcell-mcp?rev=caf27561d016ed7e1bb73b893171384f9dd35060#caf27561d016ed7e1bb73b893171384f9dd35060"
-dependencies = [
- "base64 0.22.1",
- "bytes",
- "futures-util",
- "http",
- "image",
- "lru",
- "resvg",
- "serde",
- "thiserror 2.0.18",
- "tokio",
- "tokio-util",
- "url",
- "workcell-net",
 ]
 
 [[package]]
 name = "workcell-tool-contract"
 version = "0.1.0"
-source = "git+https://github.com/tensorninja/workcell-mcp?rev=caf27561d016ed7e1bb73b893171384f9dd35060#caf27561d016ed7e1bb73b893171384f9dd35060"
+source = "git+https://github.com/tensorninja/workcell-mcp?rev=a8b2370d493983166876b2e70a2ca1d6cf7579ff#a8b2370d493983166876b2e70a2ca1d6cf7579ff"
 dependencies = [
  "serde",
  "serde_json",

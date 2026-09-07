@@ -61,10 +61,19 @@ Rust workspace, key crates in root dir:
 - caudra-acp: ACP ndjson stdio server
 - caudra-workcell: Native Workcell adapter, Caudra authorization integration, and tool-result presentation
 
-First-party Workcell tools are native Rust: file_read, file_glob, file_grep, file_write, file_edit, file_apply_patch, index, websearch, webfetch, shell, code_execution, and execution_environment.
+First-party Workcell tools are native Rust: file_read, file_glob, file_grep, file_write, file_edit, file_apply_patch, index, websearch, webfetch, shell, python_execution, execution_environment, and the code-graph family code_map, code_context, code_refs, code_impact, and code_expand.
 Caudra owns authorization, registration, and presentation. Workcell owns protocol-neutral contracts,
 validation, bounds, atomicity, network policy, subprocess cleanup, and the bundled Monty worker
 lifecycle. Keep Workcell logic in Workcell rather than duplicating it in `caudra-workcell`.
+
+The code-graph group is read-only and constructed separately from the writable file group, so its
+limits clamp to the file group's. Envelope bounding uses Workcell's own `fit`/`Shrinkable`, and a
+`GraphPhaseSink` bridges `GraphProgress` phases to `ToolLive::Annotation` for build feedback. A
+`SelectorRefusal` is a successful call that returned no rows, not a tool error.
+
+Web tools are built with `production_with_proxy`. `ambient_proxy()` reads `HTTP(S)_PROXY`,
+`ALL_PROXY`, and `NO_PROXY` so web tools honour the same proxy shell children already inherit. An
+unparseable value degrades to direct dialling with a warning that never logs the URL.
 
 `caudra-workcell` supplies Caudra's cache root and uses Workcell's bundled-only worker source for normal
 production startup. `WORKCELL_BUNDLED_MONTY_WORKER` is a build input populated by `just code-worker`,
@@ -77,7 +86,7 @@ patch its packages from the sibling `../workcell-mcp` checkout when that reposit
 a temporary lockfile seeded from `Cargo.lock`. Use plain Cargo when intentionally updating dependencies.
 
 For worker or release changes, run the production bundled-worker execution test with a real pinned
-worker, not only a catalog check. Release smoke tests must fail when `code_execution` is reserved but
+worker, not only a catalog check. Release smoke tests must fail when `python_execution` is reserved but
 unavailable. Keep Monty's worker and `monty-pool` versions in lockstep.
 
 Caudra's own tools are native Rust in `caudra-agent/src/tools/native`, registered from

@@ -96,9 +96,17 @@ const COMPACT_ARG_MAX_CHARS: usize = 40;
 const ELLIPSIS: char = '…';
 const EDIT_KEYS: &[&str] = &["file_path", "old_string", "new_string"];
 const READ_RESULT_KEYS: &[&str] = &["offset", "limit"];
-/// The tools whose header is built from a pattern the model wrote.
-const QUERY_TOOLS: &[&str] = &["file_grep", "file_glob"];
-const QUERY_KEY: &str = "pattern";
+/// The tools whose header leads with a literal the model wrote, and the input
+/// key it wrote it under. One key per tool: a grep writes a pattern, a
+/// code-graph lookup writes a symbol or a whole task.
+const QUERY_KEYS: &[(&str, &str)] = &[
+    ("file_grep", "pattern"),
+    ("file_glob", "pattern"),
+    ("code_context", "task"),
+    ("code_refs", "symbol"),
+    ("code_impact", "symbol"),
+    ("code_expand", "symbol"),
+];
 const MILLIS_PER_SECOND: u64 = 1_000;
 
 /// Duration inputs and the millis one of their units is worth, so a bracket
@@ -109,7 +117,7 @@ const MILLIS_PER_SECOND: u64 = 1_000;
 /// it belongs to is what says the name is a duration at all.
 const DURATION_ARGS: &[(&str, &str, u64)] = &[
     ("shell", "timeout", 1),
-    ("code_execution", "timeout", 1),
+    ("python_execution", "timeout", 1),
     ("webfetch", "timeout", MILLIS_PER_SECOND),
     ("websearch", "timeoutSec", MILLIS_PER_SECOND),
 ];
@@ -197,6 +205,11 @@ const VIEW: Inflection = ("View", "Viewing", "Viewed");
 const DRAW: Inflection = ("Generate", "Generating", "Generated");
 /// A store reached by sub-command. The verb is the `command` argument, which
 /// the `[k=v]` suffix already shows, so the row names the store instead.
+const MAP: Inflection = ("Map", "Mapping", "Mapped");
+const LOCATE: Inflection = ("Locate", "Locating", "Located");
+const TRACE: Inflection = ("Trace", "Tracing", "Traced");
+const IMPACT: Inflection = ("Impact", "Assessing", "Assessed");
+const EXPAND: Inflection = ("Expand", "Expanding", "Expanded");
 const MEMORY: Inflection = ("Memory", "Memory", "Memory");
 const SESSIONS: Inflection = ("Sessions", "Sessions", "Sessions");
 
@@ -214,7 +227,12 @@ const COMPACT_TOOLS: &[(&str, CompactTool)] = &[
     tool_row("websearch", '◈', SEARCH, &["query"]),
     tool_row("webfetch", '%', FETCH, &["url"]),
     tool_row("shell", '$', RUN, &["command"]),
-    tool_row("code_execution", '$', COMPUTE, &["code"]),
+    tool_row("python_execution", '$', COMPUTE, &["code"]),
+    tool_row("code_map", '◇', MAP, &["path"]),
+    tool_row("code_context", '◇', LOCATE, &["task", "path"]),
+    tool_row("code_refs", '◇', TRACE, &["symbol", "path"]),
+    tool_row("code_impact", '◇', IMPACT, &["symbol", "path"]),
+    tool_row("code_expand", '◇', EXPAND, &["symbol", "path"]),
     tool_row("execution_environment", '⚙', INSPECT, &[]),
     tool_row("task", '#', DELEGATE, &["prompt", "description"]),
     tool_row("batch", '#', BATCH, &["invocations"]),
@@ -267,8 +285,11 @@ fn compact_tool(name: &str) -> Option<&'static CompactTool> {
     compact_row(name).map(|(_, entry)| entry)
 }
 
-fn is_query_tool(name: &str) -> bool {
-    compact_row(name).is_some_and(|(tool, _)| QUERY_TOOLS.contains(&tool))
+fn query_key(name: &str) -> Option<&'static str> {
+    let (tool, _) = compact_row(name)?;
+    QUERY_KEYS
+        .iter()
+        .find_map(|(query_tool, key)| (*query_tool == tool).then_some(*key))
 }
 
 /// How a tool introduces itself on a one-line row. A name the table has never
@@ -302,9 +323,8 @@ pub(super) fn header_spans(
     base: Style,
     raw_input: Option<&serde_json::Value>,
 ) -> Vec<Span<'static>> {
-    let query = is_query_tool(tool)
-        .then(|| raw_input?.get(QUERY_KEY)?.as_str())
-        .flatten()
+    let query = query_key(tool)
+        .and_then(|key| raw_input?.get(key)?.as_str())
         .filter(|query| !query.is_empty() && header.starts_with(query));
     let Some(query) = query else {
         return vec![Span::styled(header.to_owned(), base)];
@@ -527,6 +547,7 @@ impl HighlightRequest {
             | ToolOutput::Patch { .. }
             | ToolOutput::GrepResult { .. }
             | ToolOutput::Index(_)
+            | ToolOutput::CodeGraph { .. }
             | ToolOutput::Instructions { .. } => Some(o),
             ToolOutput::Plain(_)
             | ToolOutput::Markdown(_)
@@ -2251,7 +2272,7 @@ mod tests {
                 id: "t1".into(),
                 effect: ToolEffect::Unknown,
                 status: ToolStatus::Error,
-                name: "code_execution".into(),
+                name: "python_execution".into(),
             })),
             text: "2 lines".into(),
             tool_output: Some(Arc::new(ToolOutput::Plain(output.into()))),
@@ -3389,7 +3410,7 @@ mod tests {
         ; "a subprocess quotes its timeout in millis"
     )]
     #[test_case(
-        "code_execution", serde_json::json!({ "timeout": 5_000 }), Some(" [timeout=5s]")
+        "python_execution", serde_json::json!({ "timeout": 5_000 }), Some(" [timeout=5s]")
         ; "so does the code worker"
     )]
     #[test_case(

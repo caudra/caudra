@@ -314,12 +314,12 @@ mod tests {
         ; "table_only"
     )]
     #[test_case(
-        "| Tier | Tools | When |\n| --- | --- | --- |\n| Best | code_execution | Chained calls |\n| Good | index | File structure |\n| Costly | read | Full file reads |",
+        "| Tier | Tools | When |\n| --- | --- | --- |\n| Best | python_execution | Chained calls |\n| Good | index | File structure |\n| Costly | read | Full file reads |",
         ""
         ; "table_many_rows"
     )]
     #[test_case(
-        "Here is some code:\n```rust\nfn main() {}\n```\n\n| Tier | Tools |\n| --- | --- |\n| Best | code_execution |\n| Good | index |\n| Costly | read |",
+        "Here is some code:\n```rust\nfn main() {}\n```\n\n| Tier | Tools |\n| --- | --- |\n| Best | python_execution |\n| Good | index |\n| Costly | read |",
         ""
         ; "table_after_code_block"
     )]

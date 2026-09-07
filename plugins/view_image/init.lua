@@ -122,7 +122,7 @@ caudra.api.register_tool({
   permission_scopes = function(input)
     return { scopes = { caudra.fs.normalize(input.path) }, force_prompt = false }
   end,
-  -- No interpreter audience: the code_execution bridge flattens tool output
+  -- No interpreter audience: the python_execution bridge flattens tool output
   -- to text, so the pixels could never reach the model from there.
   audiences = { "main", "research_sub", "general_sub" },
 

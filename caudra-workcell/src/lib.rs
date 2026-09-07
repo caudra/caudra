@@ -17,7 +17,7 @@ use caudra_agent::tools::{
     ToolExecResult, ToolInvocation, ToolLive, ToolRegistry, ToolSource, expand_tilde,
 };
 use caudra_agent::{
-    AgentEvent, GrepFileEntry, GrepMatchGroup, INDEX_TRUNCATED,
+    AgentEvent, CodeGraphRow, CodeGraphSource, GrepFileEntry, GrepMatchGroup, INDEX_TRUNCATED,
     IndexDirectoryEntry as AgentIndexDirectoryEntry,
     IndexDirectoryEntryKind as AgentIndexDirectoryEntryKind, IndexLine as AgentIndexLine,
     IndexLineSemantic as AgentIndexLineSemantic, IndexOutput as AgentIndexOutput,
@@ -34,6 +34,11 @@ use workcell::ToolSpec;
 #[cfg(test)]
 use workcell::code::bundled_worker_available;
 use workcell::code::{CodeConfiguration, CodeExecution, CodeInput, Outcome, WorkerSource};
+use workcell::code_graph::{
+    CodeContextInput, CodeExpandInput, CodeGraphLimits, CodeGraphToolGroup, CodeImpactInput,
+    CodeMapInput, CodeRefsInput, GraphProgress, GraphProgressSink, ModelText as CodeGraphModelText,
+    RankedSymbol, ReachedSymbol, SelectorRefusal, SymbolRef, crawl_filesystem_limits, fit,
+};
 use workcell::environment::{
     ExecutionEnvironmentError, ExecutionEnvironmentResult, ToolGroupDisclosure,
 };
@@ -51,8 +56,9 @@ use workcell::shell::{
     ShellToolGroup,
 };
 use workcell::web::{
-    PreparedWebfetch, PreparedWebsearch, WebExecution, WebToolGroup, WebfetchInput, WebfetchOutput,
-    WebsearchExecutionConfiguration, WebsearchInput, WebsearchOutput,
+    PreparedWebfetch, PreparedWebsearch, ProxyConfiguration, WebExecution, WebToolGroup,
+    WebfetchInput, WebfetchOutput, WebsearchExecutionConfiguration, WebsearchInput,
+    WebsearchOutput,
 };
 use workcell::{CodeToolGroup, ExecutionEnvironment};
 
@@ -68,11 +74,16 @@ pub const NATIVE_TOOL_NAMES: &[&str] = &[
     "websearch",
     "webfetch",
     "shell",
-    "code_execution",
+    "python_execution",
+    "code_map",
+    "code_context",
+    "code_refs",
+    "code_impact",
+    "code_expand",
     "execution_environment",
 ];
 const CODE_WORKER_UNAVAILABLE: &str =
-    "Workcell code_execution is unavailable: no code worker path was supplied";
+    "Workcell python_execution is unavailable: no code worker path was supplied";
 const PROGRESS_MAX_BYTES: usize = 64 * 1024;
 const PROGRESS_TRUNCATED: &str = "[earlier output truncated]\n";
 const BYTES_PER_MIB: usize = 1024 * 1024;
@@ -81,6 +92,15 @@ const NORMALIZED_COMMAND_ATTRIBUTE: &str = "normalized_command";
 /// tools and every write still passes through the permission layer first.
 /// Withholding them here would hide tools the user is allowed to approve.
 const ALLOW_WRITE: bool = true;
+/// Source icons are a second fetch per result for decoration the TUI does not
+/// render.
+const SOURCE_ICONS_ENABLED: bool = false;
+/// Read in this order, first value wins, matching what every other HTTP client
+/// on the machine already does.
+const PROXY_ALL_VARS: &[&str] = &["ALL_PROXY", "all_proxy"];
+const PROXY_HTTP_VARS: &[&str] = &["HTTP_PROXY", "http_proxy"];
+const PROXY_HTTPS_VARS: &[&str] = &["HTTPS_PROXY", "https_proxy"];
+const PROXY_BYPASS_VARS: &[&str] = &["NO_PROXY", "no_proxy"];
 
 #[derive(Debug, thiserror::Error)]
 pub enum HostError {
@@ -96,7 +116,26 @@ pub enum HostError {
 struct ProjectGroups {
     files: FileToolGroup,
     shell: ShellToolGroup,
+    code_graph: Arc<CodeGraphToolGroup>,
     environment: Arc<ExecutionEnvironment>,
+}
+
+/// The code graph reads through its own filesystem group.
+///
+/// It cannot share the one the file tools use: that one is write-enabled and
+/// carries no traversal bound, and `from_files` clamps the crawl to whatever
+/// bound its group was built with. A second read-only group built from the
+/// crawl's own limits is what keeps a whole-tree map from silently stopping
+/// early.
+async fn code_graph_group(cwd: &Path) -> Result<Arc<CodeGraphToolGroup>, String> {
+    let limits = CodeGraphLimits::default();
+    let files = FileToolGroup::new_unconfined(cwd, false, Some(crawl_filesystem_limits(&limits)))
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(Arc::new(CodeGraphToolGroup::from_files(
+        Arc::new(files),
+        limits,
+    )))
 }
 
 struct HostInner {
@@ -119,10 +158,12 @@ impl HostInner {
         let shell = ShellToolGroup::new_unconfined(&cwd)
             .await
             .map_err(|error| error.to_string())?;
+        let code_graph = code_graph_group(&cwd).await?;
         let environment = Arc::new(ExecutionEnvironment::collect(Some(&cwd)).await);
         let groups = ProjectGroups {
             files,
             shell,
+            code_graph,
             environment,
         };
         projects.insert(cwd, groups.clone());
@@ -207,9 +248,10 @@ impl WorkcellHost {
             .map_err(HostError::Runtime)?;
         let project_cwd = std::fs::canonicalize(project_cwd.as_ref())
             .unwrap_or_else(|_| project_cwd.as_ref().to_path_buf());
-        let (files, shell, environment, code_result) = runtime.block_on(async {
+        let (files, shell, code_graph, environment, code_result) = runtime.block_on(async {
             let files = FileToolGroup::new_unconfined(&project_cwd, ALLOW_WRITE, None).await;
             let shell = ShellToolGroup::new_unconfined(&project_cwd).await;
+            let code_graph = code_graph_group(&project_cwd).await;
             let environment = ExecutionEnvironment::collect(Some(&project_cwd)).await;
             let code = if let Some(worker) = worker_source {
                 Some(
@@ -222,16 +264,17 @@ impl WorkcellHost {
             } else {
                 None
             };
-            (files, shell, environment, code)
+            (files, shell, code_graph, environment, code)
         });
         let files = files.map_err(|error| HostError::Files(error.to_string()))?;
         let shell = shell.map_err(|error| HostError::Shell(error.to_string()))?;
+        let code_graph = code_graph.map_err(HostError::Files)?;
         let mut warnings = Vec::new();
         let code = match code_result {
             Some(Ok(code)) => Some(Arc::new(code)),
             Some(Err(error)) => {
                 warnings.push(format!(
-                    "Workcell code_execution is unavailable: code worker initialization failed: {error}"
+                    "Workcell python_execution is unavailable: code worker initialization failed: {error}"
                 ));
                 None
             }
@@ -240,11 +283,14 @@ impl WorkcellHost {
                 None
             }
         };
+        let (proxy, proxy_warning) = ambient_proxy();
+        warnings.extend(proxy_warning);
         let projects = HashMap::from([(
             project_cwd,
             ProjectGroups {
                 files,
                 shell,
+                code_graph,
                 environment: Arc::new(environment),
             },
         )]);
@@ -252,7 +298,11 @@ impl WorkcellHost {
             inner: Arc::new(HostInner {
                 runtime,
                 projects: tokio::sync::Mutex::new(projects),
-                web: WebToolGroup::new(WebsearchExecutionConfiguration::default()),
+                web: WebToolGroup::production_with_proxy(
+                    WebsearchExecutionConfiguration::default(),
+                    SOURCE_ICONS_ENABLED,
+                    &proxy,
+                ),
                 code,
             }),
             warnings,
@@ -285,7 +335,7 @@ impl WorkcellHost {
                 host.reserve_code = true;
                 host.warnings.clear();
                 host.warnings.push(format!(
-                    "Workcell code_execution cache is unavailable: {error}"
+                    "Workcell python_execution cache is unavailable: {error}"
                 ));
                 Ok(host)
             }
@@ -319,6 +369,7 @@ impl WorkcellHost {
             &self.inner.web.snapshot().configuration,
         ));
         specs.extend(workcell::shell::specs());
+        specs.extend(workcell::code_graph::specs());
         if self.inner.code.is_some() || self.reserve_code || include_unavailable_code {
             specs.extend(workcell::code::specs());
         }
@@ -359,6 +410,11 @@ enum ToolKind {
     Webfetch,
     Shell,
     Code,
+    CodeMap,
+    CodeContext,
+    CodeRefs,
+    CodeImpact,
+    CodeExpand,
     Environment,
 }
 
@@ -375,7 +431,12 @@ impl ToolKind {
             "websearch" => Some(Self::Websearch),
             "webfetch" => Some(Self::Webfetch),
             "shell" => Some(Self::Shell),
-            "code_execution" => Some(Self::Code),
+            "python_execution" => Some(Self::Code),
+            "code_map" => Some(Self::CodeMap),
+            "code_context" => Some(Self::CodeContext),
+            "code_refs" => Some(Self::CodeRefs),
+            "code_impact" => Some(Self::CodeImpact),
+            "code_expand" => Some(Self::CodeExpand),
             "execution_environment" => Some(Self::Environment),
             _ => None,
         }
@@ -385,6 +446,9 @@ impl ToolKind {
         let read = ToolAudience::MAIN | ToolAudience::RESEARCH_SUB | ToolAudience::GENERAL_SUB;
         match self {
             Self::Index => ToolAudience::all(),
+            Self::CodeMap | Self::CodeContext | Self::CodeRefs | Self::CodeImpact => {
+                ToolAudience::all()
+            }
             Self::FileWrite | Self::FileEdit | Self::FileApplyPatch | Self::Shell => {
                 ToolAudience::MAIN | ToolAudience::GENERAL_SUB
             }
@@ -394,8 +458,14 @@ impl ToolKind {
 
     fn presentation_kind(self) -> &'static str {
         match self {
-            Self::FileRead | Self::Index => "read",
-            Self::FileGlob | Self::FileGrep | Self::Websearch => "search",
+            Self::FileRead | Self::Index | Self::CodeExpand => "read",
+            Self::FileGlob
+            | Self::FileGrep
+            | Self::Websearch
+            | Self::CodeMap
+            | Self::CodeContext
+            | Self::CodeRefs
+            | Self::CodeImpact => "search",
             Self::FileWrite | Self::FileEdit | Self::FileApplyPatch => "edit",
             Self::Webfetch => "fetch",
             Self::Shell | Self::Code | Self::Environment => "execute",
@@ -409,7 +479,12 @@ impl ToolKind {
             | Self::FileGrep
             | Self::Index
             | Self::Websearch
-            | Self::Webfetch => ToolEffect::ReadOnly,
+            | Self::Webfetch
+            | Self::CodeMap
+            | Self::CodeContext
+            | Self::CodeRefs
+            | Self::CodeImpact
+            | Self::CodeExpand => ToolEffect::ReadOnly,
             Self::Code => ToolEffect::Isolated,
             Self::FileWrite
             | Self::FileEdit
@@ -458,6 +533,34 @@ impl Tool for WorkcellTool {
     }
 }
 
+/// The outbound proxy for the web tools, read from the ambient environment.
+///
+/// Workcell already forwards these variables to every `shell` child, so without
+/// this the two disagree: behind an enforcing proxy `shell curl` would reach the
+/// network and `webfetch` would not.
+///
+/// An unusable value never fails host construction. Refusing to start over a
+/// malformed `NO_PROXY` entry would take the whole session down for a setting
+/// that only affects two tools, so it degrades to a direct dial and says so.
+fn ambient_proxy() -> (ProxyConfiguration, Option<String>) {
+    let first = |names: &[&str]| names.iter().find_map(|name| std::env::var(name).ok());
+    match ProxyConfiguration::from_values(
+        first(PROXY_HTTP_VARS).as_deref(),
+        first(PROXY_HTTPS_VARS).as_deref(),
+        first(PROXY_ALL_VARS).as_deref(),
+        first(PROXY_BYPASS_VARS).as_deref(),
+    ) {
+        Ok(proxy) => (proxy, None),
+        // The error never carries the value: a proxy URL may hold credentials.
+        Err(error) => (
+            ProxyConfiguration::direct(),
+            Some(format!(
+                "Workcell web tools are dialling directly: the proxy environment is unusable ({error})"
+            )),
+        ),
+    }
+}
+
 fn reject_unknown_fields(spec: &ToolSpec, input: &Value) -> Result<(), String> {
     let Some(input) = input.as_object() else {
         return Ok(());
@@ -491,6 +594,11 @@ enum Input {
     Webfetch(WebfetchInput),
     Shell(ShellInput),
     Code(CodeInput),
+    CodeMap(CodeMapInput),
+    CodeContext(CodeContextInput),
+    CodeRefs(CodeRefsInput),
+    CodeImpact(CodeImpactInput),
+    CodeExpand(CodeExpandInput),
     Environment,
 }
 
@@ -509,7 +617,12 @@ impl Input {
             ToolKind::Websearch => parse_input("websearch", input).map(Self::Websearch),
             ToolKind::Webfetch => parse_input("webfetch", input).map(Self::Webfetch),
             ToolKind::Shell => parse_input("shell", input).map(Self::Shell),
-            ToolKind::Code => parse_input("code_execution", input).map(Self::Code),
+            ToolKind::Code => parse_input("python_execution", input).map(Self::Code),
+            ToolKind::CodeMap => parse_input("code_map", input).map(Self::CodeMap),
+            ToolKind::CodeContext => parse_input("code_context", input).map(Self::CodeContext),
+            ToolKind::CodeRefs => parse_input("code_refs", input).map(Self::CodeRefs),
+            ToolKind::CodeImpact => parse_input("code_impact", input).map(Self::CodeImpact),
+            ToolKind::CodeExpand => parse_input("code_expand", input).map(Self::CodeExpand),
             ToolKind::Environment => match input {
                 Value::Object(values) if values.is_empty() => Ok(Self::Environment),
                 _ => Err(
@@ -533,6 +646,7 @@ enum PreparedExecution {
     Websearch(PreparedWebsearch),
     Webfetch(PreparedWebfetch),
     Shell(ShellToolGroup, PreparedShell),
+    CodeGraph(Arc<CodeGraphToolGroup>),
     Environment(Arc<ExecutionEnvironment>),
     None,
 }
@@ -816,6 +930,41 @@ impl WorkcellInvocation {
                 PermissionResourceAccess::Execute,
                 PermissionRisk::Low,
             ),
+            Input::CodeMap(input) => {
+                let group = self.code_graph_group(ctx, project.clone()).await?;
+                code_graph_prepared(group, &project, input.path.as_deref(), &["/path"])
+            }
+            Input::CodeContext(input) => {
+                let group = self.code_graph_group(ctx, project.clone()).await?;
+                code_graph_prepared(group, &project, input.path.as_deref(), &["/path", "/task"])
+            }
+            Input::CodeRefs(input) => {
+                let group = self.code_graph_group(ctx, project.clone()).await?;
+                code_graph_prepared(
+                    group,
+                    &project,
+                    input.path.as_deref(),
+                    &["/path", "/symbol"],
+                )
+            }
+            Input::CodeImpact(input) => {
+                let group = self.code_graph_group(ctx, project.clone()).await?;
+                code_graph_prepared(
+                    group,
+                    &project,
+                    input.path.as_deref(),
+                    &["/path", "/symbol"],
+                )
+            }
+            Input::CodeExpand(input) => {
+                let group = self.code_graph_group(ctx, project.clone()).await?;
+                code_graph_prepared(
+                    group,
+                    &project,
+                    input.path.as_deref(),
+                    &["/path", "/symbol"],
+                )
+            }
             Input::Environment => {
                 let host = Arc::clone(&self.host);
                 let environment = self
@@ -840,6 +989,19 @@ impl WorkcellInvocation {
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = Some(prepared);
         Ok(intent)
+    }
+
+    async fn code_graph_group(
+        &self,
+        ctx: &ToolContext,
+        project: PathBuf,
+    ) -> Result<Arc<CodeGraphToolGroup>, String> {
+        let host = Arc::clone(&self.host);
+        self.host
+            .run(ctx, move |_| async move {
+                Ok::<_, String>(host.project_groups(project).await?.code_graph)
+            })
+            .await?
     }
 
     async fn take_prepared(&self, ctx: &ToolContext) -> Result<PreparedInvocation, String> {
@@ -884,6 +1046,11 @@ impl ToolInvocation for WorkcellInvocation {
             Input::Webfetch(input) => input.url.clone(),
             Input::Shell(input) => input.command.lines().next().unwrap_or_default().into(),
             Input::Code(input) => format!("{} lines", input.code.lines().count()),
+            Input::CodeMap(input) => input.path.clone().unwrap_or_else(|| ".".into()),
+            Input::CodeContext(input) => search_header(&input.task, input.path.as_deref()),
+            Input::CodeRefs(input) => search_header(&input.symbol, input.path.as_deref()),
+            Input::CodeImpact(input) => search_header(&input.symbol, input.path.as_deref()),
+            Input::CodeExpand(input) => search_header(&input.symbol, input.path.as_deref()),
             Input::Environment => "execution environment".into(),
         }))
     }
@@ -1164,12 +1331,188 @@ impl WorkcellInvocation {
                     Err(error) => Err(error).into(),
                 }
             }
+            (Input::CodeMap(input), PreparedExecution::CodeGraph(group)) => {
+                let input = input.clone();
+                let sink = self.graph_progress(ctx);
+                match self
+                    .host
+                    .run(ctx, move |token| async move {
+                        group.code_map(input, sink.as_deref(), &token).await
+                    })
+                    .await
+                {
+                    Ok(Ok(output)) => {
+                        let output = fit(output);
+                        let annotation = shown_of(output.shown, output.total, "symbols");
+                        code_graph_result(
+                            &output,
+                            format!("ranked symbols in {}", output.path),
+                            ranked_rows(&output.symbols),
+                            None,
+                            graph_footer(&output),
+                            annotation,
+                        )
+                    }
+                    Ok(Err(error)) => Err(error.to_string()).into(),
+                    Err(error) => Err(error).into(),
+                }
+            }
+            (Input::CodeContext(input), PreparedExecution::CodeGraph(group)) => {
+                let input = input.clone();
+                let sink = self.graph_progress(ctx);
+                match self
+                    .host
+                    .run(ctx, move |token| async move {
+                        group.code_context(input, sink.as_deref(), &token).await
+                    })
+                    .await
+                {
+                    Ok(Ok(output)) => {
+                        let annotation = format!(
+                            "{} \u{b7} {} confidence",
+                            shown_of(output.shown, output.total_matched, "matches"),
+                            output.confidence
+                        );
+                        let headline = format!(
+                            "read as {} ({}); confidence {} at {}% separation",
+                            output.shape,
+                            output.shape_reason,
+                            output.confidence,
+                            output.margin_percent
+                        );
+                        let output = fit(output);
+                        code_graph_result(
+                            &output,
+                            headline,
+                            ranked_rows(&output.results),
+                            None,
+                            graph_footer(&output),
+                            annotation,
+                        )
+                    }
+                    Ok(Err(error)) => Err(error.to_string()).into(),
+                    Err(error) => Err(error).into(),
+                }
+            }
+            (Input::CodeRefs(input), PreparedExecution::CodeGraph(group)) => {
+                let input = input.clone();
+                let sink = self.graph_progress(ctx);
+                match self
+                    .host
+                    .run(ctx, move |token| async move {
+                        group.code_refs(input, sink.as_deref(), &token).await
+                    })
+                    .await
+                {
+                    Ok(Ok(Ok(output))) => {
+                        let output = fit(output);
+                        let annotation = shown_of(output.shown, output.total, output.unit);
+                        code_graph_result(
+                            &output,
+                            format!(
+                                "{} of {}, each row one {}",
+                                output.direction, output.symbol, output.unit
+                            ),
+                            ranked_rows(&output.references),
+                            None,
+                            graph_footer(&output),
+                            annotation,
+                        )
+                    }
+                    Ok(Ok(Err(refusal))) => selector_refusal_result(&refusal),
+                    Ok(Err(error)) => Err(error.to_string()).into(),
+                    Err(error) => Err(error).into(),
+                }
+            }
+            (Input::CodeImpact(input), PreparedExecution::CodeGraph(group)) => {
+                let input = input.clone();
+                let sink = self.graph_progress(ctx);
+                match self
+                    .host
+                    .run(ctx, move |token| async move {
+                        group.code_impact(input, sink.as_deref(), &token).await
+                    })
+                    .await
+                {
+                    Ok(Ok(Ok(output))) => {
+                        let output = fit(output);
+                        let annotation = format!(
+                            "{} \u{b7} {} tests",
+                            shown_of(output.shown, output.total, "reached"),
+                            output.tests_reaching.len()
+                        );
+                        code_graph_result(
+                            &output,
+                            format!(
+                                "{} symbols reach {} within {} hops; {} of them are tests",
+                                output.total,
+                                output.symbol,
+                                output.depth,
+                                output.tests_reaching.len()
+                            ),
+                            reached_rows(&output.reached),
+                            None,
+                            graph_footer(&output),
+                            annotation,
+                        )
+                    }
+                    Ok(Ok(Err(refusal))) => selector_refusal_result(&refusal),
+                    Ok(Err(error)) => Err(error.to_string()).into(),
+                    Err(error) => Err(error).into(),
+                }
+            }
+            (Input::CodeExpand(input), PreparedExecution::CodeGraph(group)) => {
+                let input = input.clone();
+                let sink = self.graph_progress(ctx);
+                match self
+                    .host
+                    .run(ctx, move |token| async move {
+                        group.code_expand(input, sink.as_deref(), &token).await
+                    })
+                    .await
+                {
+                    Ok(Ok(Ok(output))) => {
+                        let output = fit(output);
+                        let annotation = format!(
+                            "{} callers \u{b7} {} callees",
+                            output.callers.len(),
+                            output.callees.len()
+                        );
+                        let source = CodeGraphSource {
+                            path: output.path.clone(),
+                            kind: output.kind.clone(),
+                            line_start: output.line_start,
+                            lines: output.source.lines().map(str::to_owned).collect(),
+                            whole_file_reason: output.served_whole_file.clone(),
+                        };
+                        code_graph_result(
+                            &output,
+                            format!(
+                                "{} {} {}:{}-{}",
+                                output.symbol,
+                                output.kind,
+                                output.path,
+                                output.line_start,
+                                output.line_end
+                            ),
+                            neighbour_rows(&output.callers, &output.callees),
+                            Some(source),
+                            graph_footer(&output),
+                            annotation,
+                        )
+                    }
+                    Ok(Ok(Err(refusal))) => selector_refusal_result(&refusal),
+                    Ok(Err(error)) => Err(error.to_string()).into(),
+                    Err(error) => Err(error).into(),
+                }
+            }
             (Input::Environment, PreparedExecution::Environment(environment)) => {
                 let groups = ToolGroupDisclosure {
                     files: true,
                     web: true,
                     shell: true,
                     code: self.host.code.is_some(),
+                    code_graph: true,
                 };
                 match self
                     .host
@@ -1305,6 +1648,50 @@ fn file_patch_prepared(
         execution: PreparedExecution::FilePatch(group, patch),
         mutation_targets: permissions.mutation_targets,
         read_targets: permissions.read_targets,
+    }
+}
+
+/// One read-only intent over the tree a code-graph call will crawl.
+///
+/// The scope is the directory, never the symbol: the call reads every source
+/// file underneath it to build the graph, and a narrower scope would claim an
+/// access this tool does not have. `read_targets` stays empty for the same
+/// reason `file_grep`'s does — a crawl cannot name the files it will read
+/// before it runs.
+fn code_graph_prepared(
+    group: Arc<CodeGraphToolGroup>,
+    project: &Path,
+    path: Option<&str>,
+    input_pointers: &[&str],
+) -> PreparedInvocation {
+    let root = match path.map(str::trim).filter(|path| !path.is_empty()) {
+        Some(path) => project.join(path),
+        None => project.to_path_buf(),
+    };
+    let scope = format!(
+        "{}/**",
+        root.to_string_lossy().trim_end_matches(['/', '\\'])
+    );
+    PreparedInvocation {
+        intent: PermissionIntent::new(
+            PermissionScopes {
+                scopes: vec![scope],
+                force_prompt: false,
+            },
+            vec![filesystem_permission_resource(
+                PermissionResourceKind::Directory,
+                &root,
+                PermissionResourceAccess::Search,
+                project,
+            )],
+            PermissionRisk::Low,
+        )
+        .with_authority(PermissionAuthorityProfile::Filesystem {
+            input_pointers: input_pointers.iter().map(|p| (*p).to_owned()).collect(),
+        }),
+        execution: PreparedExecution::CodeGraph(group),
+        mutation_targets: Vec::new(),
+        read_targets: Vec::new(),
     }
 }
 
@@ -1969,6 +2356,122 @@ fn shell_status(output: &WorkcellShellOutput) -> String {
     format!("[shell status: {}]", statuses.join("; "))
 }
 
+/// Turns one code-graph answer into a card.
+///
+/// The model text is Workcell's own `ModelText`, never a restatement: that
+/// rendering carries the floor caveats and the truncation notice, and a second
+/// one here would be a second contract to keep in step.
+fn code_graph_result(
+    output: &(impl Serialize + CodeGraphModelText),
+    headline: String,
+    rows: Vec<CodeGraphRow>,
+    source: Option<CodeGraphSource>,
+    footer: String,
+    annotation: String,
+) -> ToolExecResult {
+    let state = serde_json::to_value(output).expect("code graph output serializes");
+    let exact = output.model_text().into_owned();
+    ToolExecResult::from(Ok::<_, String>(ToolOutput::CodeGraph {
+        headline,
+        rows,
+        source,
+        footer,
+        state: Some(state),
+    }))
+    .with_model_output(Some(exact))
+    .with_annotation(Some(annotation))
+}
+
+/// A refused selector is a successful call: the did-you-mean list is the useful
+/// answer, and an error envelope has nowhere to put it.
+fn selector_refusal_result(refusal: &SelectorRefusal) -> ToolExecResult {
+    let exact = refusal.model_text().into_owned();
+    let state = serde_json::to_value(refusal).expect("refusal serializes");
+    let candidates = refusal.did_you_mean.len();
+    ToolExecResult::from(Ok::<_, String>(ToolOutput::Plain(text_output(
+        exact.clone(),
+        state,
+    ))))
+    .with_model_output(Some(exact))
+    .with_annotation(Some(if candidates == 0 {
+        "no match".to_owned()
+    } else {
+        format!("no match \u{b7} {candidates} candidates")
+    }))
+}
+
+fn ranked_rows(symbols: &[RankedSymbol]) -> Vec<CodeGraphRow> {
+    symbols
+        .iter()
+        .map(|symbol| CodeGraphRow {
+            name: symbol.name.clone(),
+            kind: symbol.kind.clone(),
+            path: symbol.path.clone(),
+            line_start: symbol.line_start,
+            line_end: symbol.line_end,
+            inbound: Some(symbol.callers),
+            outbound: Some(symbol.calls),
+            hops: None,
+            test_scope: symbol.test_scope,
+        })
+        .collect()
+}
+
+fn reached_rows(reached: &[ReachedSymbol]) -> Vec<CodeGraphRow> {
+    reached
+        .iter()
+        .map(|row| CodeGraphRow {
+            name: row.symbol.name.clone(),
+            kind: row.symbol.kind.clone(),
+            path: row.symbol.path.clone(),
+            line_start: row.symbol.line_start,
+            line_end: row.symbol.line_end,
+            inbound: None,
+            outbound: None,
+            hops: Some(row.hops),
+            test_scope: row.test_scope,
+        })
+        .collect()
+}
+
+fn neighbour_rows(callers: &[SymbolRef], callees: &[SymbolRef]) -> Vec<CodeGraphRow> {
+    callers
+        .iter()
+        .map(|symbol| (symbol, Some(1_usize), None))
+        .chain(callees.iter().map(|symbol| (symbol, None, Some(1_usize))))
+        .map(|(symbol, inbound, outbound)| CodeGraphRow {
+            name: symbol.name.clone(),
+            kind: symbol.kind.clone(),
+            path: symbol.path.clone(),
+            line_start: symbol.line_start,
+            line_end: symbol.line_end,
+            inbound,
+            outbound,
+            hops: None,
+            test_scope: false,
+        })
+        .collect()
+}
+
+/// The trailing summary each result carries, taken from Workcell's own
+/// rendering so the card and the model see the same caveats.
+fn graph_footer(output: &impl CodeGraphModelText) -> String {
+    output
+        .model_text()
+        .lines()
+        .next_back()
+        .unwrap_or_default()
+        .to_owned()
+}
+
+fn shown_of(shown: usize, total: usize, unit: &str) -> String {
+    if total > shown {
+        format!("{shown} of {total} {unit}")
+    } else {
+        format!("{shown} {unit}")
+    }
+}
+
 fn code_result(execution: CodeExecution) -> ToolExecResult {
     let is_error = execution.output.outcome != Outcome::Completed;
     text_result(
@@ -2036,6 +2539,36 @@ struct NativeProgressSink {
     live_sink: Option<flume::Sender<ToolLive>>,
     body: Arc<caudra_agent::SharedBuf>,
     tail: Mutex<ProgressTail>,
+}
+
+/// Turns a code-graph phase into the one line the card shows while it runs.
+///
+/// A graph call is silent for seconds: it crawls, parses and ranks the whole
+/// tree before it can answer anything. Without this the card is a bare spinner
+/// for the entire time.
+struct GraphPhaseSink {
+    live_sink: flume::Sender<ToolLive>,
+}
+
+#[async_trait::async_trait]
+impl GraphProgressSink for GraphPhaseSink {
+    async fn publish(&self, progress: GraphProgress) {
+        let label = match progress.files {
+            0 => progress.phase.label().to_owned(),
+            files => format!("{} {files} files", progress.phase.label()),
+        };
+        // Dropping a phase costs a frame of animation and nothing else, so a
+        // full channel is never worth stalling the crawl for.
+        let _ = self.live_sink.try_send(ToolLive::Annotation(label));
+    }
+}
+
+impl WorkcellInvocation {
+    fn graph_progress(&self, ctx: &ToolContext) -> Option<Box<dyn GraphProgressSink>> {
+        ctx.live_sink
+            .clone()
+            .map(|live_sink| Box::new(GraphPhaseSink { live_sink }) as Box<dyn GraphProgressSink>)
+    }
 }
 
 impl NativeProgressSink {
@@ -2390,6 +2923,183 @@ mod tests {
         }
     }
 
+    /// A tree with a clear gradient: `normalize_sku` is called from three
+    /// places and `orphan_helper` from none.
+    fn code_graph_tree(root: &Path) {
+        for (path, source) in [
+            (
+                "src/normalize.rs",
+                "pub fn normalize_sku(input: &str) -> String { input.trim().to_owned() }\n",
+            ),
+            (
+                "src/catalog.rs",
+                "use crate::normalize::normalize_sku;\npub fn add_item(sku: &str) { normalize_sku(sku); }\npub fn update_item(sku: &str) { normalize_sku(sku); }\n",
+            ),
+            (
+                "src/import.rs",
+                "use crate::normalize::normalize_sku;\npub fn import_row(sku: &str) { normalize_sku(sku); }\npub fn orphan_helper() {}\n",
+            ),
+        ] {
+            let full = root.join(path);
+            std::fs::create_dir_all(full.parent().expect("parent")).expect("mkdir");
+            std::fs::write(full, source).expect("write");
+        }
+    }
+
+    fn run_code_graph(root: &Path, tool: &str, input: Value) -> ToolExecResult {
+        let (_host, registry) = host_and_registry(root);
+        let ctx = context(root, Arc::clone(&registry), CancelToken::none());
+        let invocation = registry
+            .get(tool)
+            .unwrap_or_else(|| panic!("registered {tool}"))
+            .tool
+            .parse(&input)
+            .expect("valid code-graph input");
+        smol::block_on(invocation.preflight(&ctx)).expect("code-graph preflight");
+        smol::block_on(invocation.execute(&ctx))
+    }
+
+    #[test_case("code_map", "code.map.v1", "search" ; "map")]
+    #[test_case("code_context", "code.context.v1", "search" ; "context")]
+    #[test_case("code_refs", "code.refs.v1", "search" ; "refs")]
+    #[test_case("code_impact", "code.impact.v1", "search" ; "impact")]
+    #[test_case("code_expand", "code.expand.v1", "read" ; "expand")]
+    fn code_graph_tools_register_read_only_with_workcell_contracts(
+        tool: &str,
+        contract: &str,
+        kind: &str,
+    ) {
+        let root = TempDir::new().expect("tempdir");
+        let (_host, registry) = host_and_registry(root.path());
+        let registered = registry.get(tool).expect("registered code-graph tool");
+
+        assert_eq!(registered.tool.tool_kind(), Some(kind));
+        assert_eq!(registered.effect, ToolEffect::ReadOnly);
+        assert!(matches!(
+            registered.source,
+            ToolSource::Native {
+                ref owner,
+                contract: ref registered,
+                trusted: true,
+            } if owner.as_ref() == OWNER && registered.as_ref() == contract
+        ));
+    }
+
+    #[test]
+    fn code_map_ranks_the_referenced_symbol_above_the_orphan() {
+        let root = TempDir::new().expect("tempdir");
+        code_graph_tree(root.path());
+        let result = run_code_graph(root.path(), "code_map", json!({}));
+
+        let Ok(ToolOutput::CodeGraph { rows, footer, .. }) = result.output else {
+            panic!("expected a code-graph card");
+        };
+        let ranked: Vec<&str> = rows.iter().map(|row| row.name.as_str()).collect();
+        assert_eq!(
+            ranked.first(),
+            Some(&"normalize_sku"),
+            "three callers must outrank an uncalled helper, got {ranked:?}"
+        );
+        assert!(
+            rows.iter()
+                .find(|row| row.name == "normalize_sku")
+                .is_some_and(|row| row.inbound == Some(3)),
+            "the row must carry the reference count it was ranked by"
+        );
+        assert!(footer.contains("symbols"), "footer was {footer:?}");
+    }
+
+    /// The card must never restate Workcell's rendering: the floor caveats and
+    /// the truncation notice live in that text, and a second copy here would be
+    /// a second contract to keep in step.
+    #[test]
+    fn the_model_sees_workcells_own_rendering() {
+        const LEGEND: &str = "counts are floors";
+
+        let root = TempDir::new().expect("tempdir");
+        code_graph_tree(root.path());
+        let result = run_code_graph(root.path(), "code_map", json!({}));
+        let model_output = result.model_output.expect("model output");
+
+        assert!(model_output.contains(LEGEND), "got {model_output:?}");
+        assert!(model_output.contains("normalize_sku"));
+    }
+
+    #[test]
+    fn code_impact_rows_carry_hop_distance_rather_than_reference_counts() {
+        let root = TempDir::new().expect("tempdir");
+        code_graph_tree(root.path());
+        let result = run_code_graph(
+            root.path(),
+            "code_impact",
+            json!({ "symbol": "normalize_sku" }),
+        );
+
+        let Ok(ToolOutput::CodeGraph { rows, .. }) = result.output else {
+            panic!("expected a code-graph card");
+        };
+        assert!(!rows.is_empty(), "three callers reach this symbol");
+        assert!(
+            rows.iter()
+                .all(|row| row.hops.is_some() && row.inbound.is_none()),
+            "a reach row measures distance, never references"
+        );
+    }
+
+    /// A well-formed question about a symbol that does not exist is answered
+    /// with candidates, not failed: an error envelope has nowhere to put them.
+    #[test]
+    fn an_unknown_symbol_is_refused_as_a_successful_call() {
+        let root = TempDir::new().expect("tempdir");
+        code_graph_tree(root.path());
+        let result = run_code_graph(
+            root.path(),
+            "code_refs",
+            json!({ "symbol": "normalise_sku" }),
+        );
+
+        assert!(
+            result.output.is_ok(),
+            "a refusal is a result, not a tool error"
+        );
+        let model_output = result.model_output.expect("model output");
+        assert!(
+            model_output.contains("normalize_sku"),
+            "the did-you-mean list is the useful answer, got {model_output:?}"
+        );
+    }
+
+    /// A crawl reads every source file under the scope, so the grant is the
+    /// directory. A narrower scope would claim an access the tool does not have.
+    #[test]
+    fn a_code_graph_call_asks_for_the_subtree_it_crawls() {
+        let root = TempDir::new().expect("tempdir");
+        code_graph_tree(root.path());
+        let (_host, registry) = host_and_registry(root.path());
+        let ctx = context(root.path(), Arc::clone(&registry), CancelToken::none());
+        let invocation = registry
+            .get("code_map")
+            .expect("registered code_map")
+            .tool
+            .parse(&json!({ "path": "src" }))
+            .expect("valid input");
+
+        let intent = smol::block_on(invocation.preflight(&ctx))
+            .expect("preflight")
+            .expect("an intent");
+        assert_eq!(intent.risk, PermissionRisk::Low);
+        assert!(
+            intent
+                .scopes
+                .scopes
+                .iter()
+                .all(|scope| scope.ends_with("/**")),
+            "a crawl grants a subtree, got {:?}",
+            intent.scopes.scopes
+        );
+        assert!(invocation.mutation_targets(&ctx).is_empty());
+    }
+
     #[test]
     fn terminal_rendering_survives_no_rtk_because_it_is_decoding() {
         let root = TempDir::new().expect("tempdir");
@@ -2493,12 +3203,81 @@ mod tests {
         assert_eq!(shown, "compiling\n 50%");
     }
 
+    /// Exercised through `from_values` rather than the process environment:
+    /// env vars are global to the test binary and would race every other test.
+    #[test_case(None, None, None ; "no_proxy_configured")]
+    #[test_case(Some("http://proxy.internal:8080"), None, None ; "http_only")]
+    #[test_case(None, Some("http://proxy.internal:8080"), None ; "https_only")]
+    #[test_case(None, None, Some("http://proxy.internal:3128") ; "all_supplies_both")]
+    fn a_usable_proxy_environment_is_accepted(
+        http: Option<&str>,
+        https: Option<&str>,
+        all: Option<&str>,
+    ) {
+        let configured = http.is_some() || https.is_some() || all.is_some();
+        let proxy = ProxyConfiguration::from_values(http, https, all, None).expect("usable");
+        assert_eq!(proxy.is_direct(), !configured);
+    }
+
+    #[test_case("socks5://proxy.internal:1080" ; "unsupported_scheme")]
+    #[test_case("not a url" ; "unparseable")]
+    fn an_unusable_proxy_value_degrades_to_a_direct_dial(value: &str) {
+        const DIRECT_NOTICE: &str = "dialling directly";
+
+        let error = ProxyConfiguration::from_values(None, None, Some(value), None)
+            .expect_err("must not be accepted");
+        let warning = format!(
+            "Workcell web tools are dialling directly: the proxy environment is unusable ({error})"
+        );
+        assert!(warning.contains(DIRECT_NOTICE));
+        assert!(
+            !warning.contains("proxy.internal"),
+            "a proxy URL can carry credentials and must never reach a log line"
+        );
+    }
+
+    /// `caudra-config` keeps its own copy of this list to answer `--help` and
+    /// the disable flags without depending on this crate. Nothing else forces
+    /// the two to agree, and a name that drifts out of the config copy silently
+    /// stops being a recognized built-in.
+    #[test]
+    fn the_config_copy_of_the_tool_roster_matches_this_one() {
+        let mut ours: Vec<&str> = NATIVE_TOOL_NAMES.to_vec();
+        let mut theirs: Vec<&str> = caudra_config::WORKCELL_NATIVE_TOOL_NAMES.to_vec();
+        ours.sort_unstable();
+        theirs.sort_unstable();
+        assert_eq!(ours, theirs);
+    }
+
+    /// Every spec Workcell publishes has to resolve to a `ToolKind`. `entries`
+    /// drops the ones that do not, so an upstream rename would otherwise remove
+    /// a tool from the registry without a word.
+    #[test]
+    fn every_published_spec_resolves_to_a_tool_kind() {
+        let mut published: Vec<&str> = workcell::files::specs(ALLOW_WRITE)
+            .into_iter()
+            .chain(workcell::web::specs(
+                2026,
+                &WebsearchExecutionConfiguration::default(),
+            ))
+            .chain(workcell::shell::specs())
+            .chain(workcell::code::specs())
+            .chain(workcell::code_graph::specs())
+            .chain(std::iter::once(workcell::environment::spec()))
+            .map(|spec| spec.name)
+            .collect();
+        published.sort_unstable();
+        let mut known: Vec<&str> = NATIVE_TOOL_NAMES.to_vec();
+        known.sort_unstable();
+        assert_eq!(published, known);
+    }
+
     #[test]
     fn missing_worker_omits_code_without_affecting_other_tools() {
         let root = TempDir::new().expect("tempdir");
         let (host, registry) = host_and_registry(root.path());
 
-        assert!(registry.get("code_execution").is_none());
+        assert!(registry.get("python_execution").is_none());
         assert!(registry.get("file_read").is_some());
         assert!(registry.get("shell").is_some());
         assert!(registry.get("execution_environment").is_some());
@@ -2506,7 +3285,7 @@ mod tests {
         assert!(
             host.warnings()
                 .iter()
-                .any(|warning| warning.contains("code_execution"))
+                .any(|warning| warning.contains("python_execution"))
         );
     }
 
@@ -2527,7 +3306,7 @@ mod tests {
         drop(host);
         let ctx = context(root.path(), Arc::clone(&registry), CancelToken::none());
         let invocation = registry
-            .get("code_execution")
+            .get("python_execution")
             .expect("registered code execution")
             .tool
             .parse(&json!({"code": "sum([1, 2, 3, 4])"}))
@@ -2884,7 +3663,7 @@ mod tests {
         ] {
             assert_eq!(registry.get(name).unwrap().effect, expected, "{name}");
         }
-        if let Some(code) = registry.get("code_execution") {
+        if let Some(code) = registry.get("python_execution") {
             assert_eq!(code.effect, ToolEffect::Isolated);
         }
     }
@@ -3120,7 +3899,7 @@ mod tests {
     }
 
     #[test]
-    fn production_reserves_code_execution_when_an_override_is_invalid() {
+    fn production_reserves_python_execution_when_an_override_is_invalid() {
         let root = TempDir::new().expect("tempdir");
         let missing = root.path().join("missing-worker");
         let host =
@@ -3129,11 +3908,11 @@ mod tests {
         host.register(&registry).expect("Workcell registration");
 
         assert_eq!(registry.iter().len(), NATIVE_TOOL_NAMES.len());
-        assert!(registry.get("code_execution").is_some());
+        assert!(registry.get("python_execution").is_some());
         assert!(
             host.warnings()
                 .iter()
-                .any(|warning| warning.contains("code_execution"))
+                .any(|warning| warning.contains("python_execution"))
         );
     }
 

@@ -5,9 +5,9 @@ use crate::components::scrollbar::SCROLLBAR_THUMB;
 use crate::repaint::expect::{OWED, QUIET};
 use crate::selection::{Selection, SelectionZone};
 use caudra_agent::tools::{
-    BATCH_TOOL_NAME, CODE_EXECUTION_TOOL_NAME, FILE_APPLY_PATCH_TOOL_NAME, FILE_EDIT_TOOL_NAME,
-    FILE_GLOB_TOOL_NAME, FILE_GREP_TOOL_NAME, FILE_READ_TOOL_NAME, FILE_WRITE_TOOL_NAME,
-    IMAGE_GENERATE_TOOL_NAME, INDEX_TOOL_NAME, MEMORY_TOOL_NAME, QUESTION_TOOL_NAME,
+    BATCH_TOOL_NAME, FILE_APPLY_PATCH_TOOL_NAME, FILE_EDIT_TOOL_NAME, FILE_GLOB_TOOL_NAME,
+    FILE_GREP_TOOL_NAME, FILE_READ_TOOL_NAME, FILE_WRITE_TOOL_NAME, IMAGE_GENERATE_TOOL_NAME,
+    INDEX_TOOL_NAME, MEMORY_TOOL_NAME, PYTHON_EXECUTION_TOOL_NAME, QUESTION_TOOL_NAME,
     SHELL_TOOL_NAME, TASK_TOOL_NAME, TODOWRITE_TOOL_NAME, TOOL_OUTPUT_GREP_TOOL_NAME,
     TOOL_OUTPUT_READ_TOOL_NAME, ToolEffect, VIEW_IMAGE_TOOL_NAME,
 };
@@ -46,7 +46,9 @@ fn effect_of(tool: &str) -> ToolEffect {
         | TOOL_OUTPUT_READ_TOOL_NAME
         | TOOL_OUTPUT_GREP_TOOL_NAME => ToolEffect::ReadOnly,
         BATCH_TOOL_NAME | TASK_TOOL_NAME => ToolEffect::Orchestrator,
-        CODE_EXECUTION_TOOL_NAME | TODOWRITE_TOOL_NAME | QUESTION_TOOL_NAME => ToolEffect::Isolated,
+        PYTHON_EXECUTION_TOOL_NAME | TODOWRITE_TOOL_NAME | QUESTION_TOOL_NAME => {
+            ToolEffect::Isolated
+        }
         SHELL_TOOL_NAME
         | FILE_WRITE_TOOL_NAME
         | FILE_EDIT_TOOL_NAME
@@ -5121,7 +5123,7 @@ fn a_full_card_in_expanded_falls_back_to_the_budget() {
     assert!(!seg_text(&panel, "t1").contains(BODY_TAIL), "{REST_MSG}");
 }
 
-/// `code_execution` draws a script and an output, which used to be separately
+/// `python_execution` draws a script and an output, which used to be separately
 /// disclosed and so took two clicks past the first to open.
 #[test]
 fn a_script_and_its_output_open_together() {
@@ -5135,7 +5137,7 @@ fn a_script_and_its_output_open_together() {
                 .collect::<Vec<_>>()
                 .join("\n"),
         }),
-        ..start("t1", "code_execution")
+        ..start("t1", "python_execution")
     });
     panel.tool_done(long_done("t1", CLICKED_BODY_LINES));
     rebuild(&mut panel);

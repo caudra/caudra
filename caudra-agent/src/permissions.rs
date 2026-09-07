@@ -62,6 +62,11 @@ const PROMPT_REASON_ASK_RULE: &str = "ask_rule";
 const PROMPT_REASON_UNCOVERED: &str = "uncovered";
 static NEXT_PERMISSION_MANAGER_ID: AtomicU64 = AtomicU64::new(1);
 const PROJECT_READ_TOOLS: &[&str] = &[
+    "code_context",
+    "code_expand",
+    "code_impact",
+    "code_map",
+    "code_refs",
     "file_glob",
     "file_grep",
     "file_read",
@@ -74,7 +79,7 @@ const PROJECT_READ_TOOLS: &[&str] = &[
 ];
 const TRUSTED_UNSCOPED_TOOLS: &[&str] = &[
     "batch",
-    "code_execution",
+    "python_execution",
     "question",
     "task",
     "todo_write",

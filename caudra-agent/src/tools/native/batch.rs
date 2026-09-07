@@ -34,7 +34,7 @@ Rules:
 - All calls run in parallel; order NOT guaranteed
 - Partial failures do not stop other calls
 - Do NOT nest batch inside batch
-- Do NOT use for dependent operations or when filtering results (use code_execution)";
+- Do NOT use for dependent operations or when filtering results (use python_execution)";
 
 const SECTION_PREFIX: &str = "## ";
 const ERROR_PREFIX: &str = "[ERROR] ";

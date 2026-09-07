@@ -583,7 +583,7 @@ mod tests {
 
     #[test]
     fn a_tool_with_nothing_short_to_show_publishes_no_preview() {
-        assert!(previews("code_execution", &[r#"{"code": "print(1)"}"#]).is_empty());
+        assert!(previews("python_execution", &[r#"{"code": "print(1)"}"#]).is_empty());
     }
 
     #[test]
@@ -606,7 +606,7 @@ mod tests {
     #[test]
     fn every_fragment_is_forwarded_verbatim_even_without_a_preview() {
         let fragments = [r#"{"code": ""#, "print(1)", r#""}"#];
-        let forwarded: Vec<String> = deltas("code_execution", &fragments)
+        let forwarded: Vec<String> = deltas("python_execution", &fragments)
             .into_iter()
             .filter_map(|event| match event {
                 AgentEvent::ToolInputDelta { delta, .. } => Some(delta),

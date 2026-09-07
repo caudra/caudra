@@ -617,7 +617,7 @@ await main()
         assert!(err.contains("inside preamble"), "error lost: {err}");
     }
 
-    /// The `gather` helper in the code_execution preamble awaits calls one at a
+    /// The `gather` helper in the python_execution preamble awaits calls one at a
     /// time so it can catch each failure alone. That stays concurrent only
     /// because every call is already pending when the first await parks, and
     /// here is where we would notice if that stopped being true.

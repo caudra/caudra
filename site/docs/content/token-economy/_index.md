@@ -50,7 +50,7 @@ Successful text results larger than 8 KiB are retained. This lets Caudra prune o
 
 Use `tool_output_grep` with that ID and a regex to find relevant lines. Its `offset` is the first line to search, `limit` caps matches, and `context_before` and `context_after` add nearby lines. Then use `tool_output_read` with a 1-indexed `offset` and line `limit` to page through the needed range. Both tools include an exact next-call hint when more results remain. IDs belong to the current session. [Sessions](/docs/sessions/#managed-tool-outputs) covers retention and cleanup.
 
-**Interrupted work is not wasted.** Press Esc on a long tool, or let its deadline hit, and whatever it printed so far still reaches the model, tagged as partial: `shell` keeps its streamed lines, `code_execution` the script output, a `task` subagent its half transcript. Otherwise the next turn starts from nothing and you pay to run it all again.
+**Interrupted work is not wasted.** Press Esc on a long tool, or let its deadline hit, and whatever it printed so far still reaches the model, tagged as partial: `shell` keeps its streamed lines, `python_execution` the script output, a `task` subagent its half transcript. Otherwise the next turn starts from nothing and you pay to run it all again.
 
 ## Fewer round-trips
 
@@ -58,10 +58,10 @@ Every round-trip re-sends the context, so round-trips are the other half of the 
 
 **batch** runs independent tool calls in one turn: one request, N results.
 
-**code_execution** runs pure computation in an isolated Python subset. It can reshape JSON, aggregate values, process text, and perform calculations without host filesystem or network access.
+**python_execution** runs pure computation in an isolated Python subset. It can reshape JSON, aggregate values, process text, and perform calculations without host filesystem or network access.
 
 ```
-manual calculation              with code_execution
+manual calculation              with python_execution
 ─────────────────────            ─────────────────────────────
 inspect a large JSON result      data = json.loads(source)
 reason over every value          print(sum(row["cost"] for row in data))

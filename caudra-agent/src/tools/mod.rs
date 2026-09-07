@@ -281,7 +281,7 @@ fn exclusions_without(openai_subscription: bool) -> &'static [&'static str] {
 }
 
 pub const BATCH_TOOL_NAME: &str = "batch";
-pub const CODE_EXECUTION_TOOL_NAME: &str = "code_execution";
+pub const PYTHON_EXECUTION_TOOL_NAME: &str = "python_execution";
 pub const EXECUTION_ENVIRONMENT_TOOL_NAME: &str = "execution_environment";
 pub const FILE_APPLY_PATCH_TOOL_NAME: &str = "file_apply_patch";
 pub const FILE_EDIT_TOOL_NAME: &str = "file_edit";

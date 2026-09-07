@@ -58,7 +58,12 @@ const TOOL_NAME_MAP: &[(&str, &str)] = &[
     ("webfetch", "WebFetch"),
     ("websearch", "WebSearch"),
     ("task", "Task"),
-    ("code_execution", "CodeExecution"),
+    ("python_execution", "PythonExecution"),
+    ("code_map", "CodeMap"),
+    ("code_context", "CodeContext"),
+    ("code_refs", "CodeRefs"),
+    ("code_impact", "CodeImpact"),
+    ("code_expand", "CodeExpand"),
     ("execution_environment", "ExecutionEnvironment"),
     ("index", "Index"),
     ("memory", "Memory"),
@@ -2075,7 +2080,7 @@ mod tests {
     #[test_case("webfetch", "WebFetch")]
     #[test_case("websearch", "WebSearch")]
     #[test_case("task", "Task")]
-    #[test_case("code_execution", "CodeExecution")]
+    #[test_case("python_execution", "PythonExecution")]
     #[test_case("execution_environment", "ExecutionEnvironment")]
     #[test_case("index", "Index")]
     #[test_case("memory", "Memory")]

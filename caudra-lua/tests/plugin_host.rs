@@ -5656,7 +5656,7 @@ fn view_image_tool_returns_image_output() {
 
     let (reg, _host) = builtins_host();
 
-    // The code_execution bridge flattens output to text, so view_image is
+    // The python_execution bridge flattens output to text, so view_image is
     // pointless from the interpreter.
     let audience = reg.get("view_image").unwrap().tool.audience();
     assert!(audience.contains(caudra_agent::tools::ToolAudience::MAIN));

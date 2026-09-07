@@ -349,6 +349,63 @@ pub struct IndexDirectoryEntry {
     pub kind: IndexDirectoryEntryKind,
 }
 
+/// One symbol in a code-graph answer.
+///
+/// `inbound`/`outbound` are reference counts and `hops` is a distance, so a row
+/// carries whichever its tool measured and leaves the rest unset rather than
+/// reporting a zero it did not compute. Every count is a floor: edges are
+/// recovered from source text by name, so dynamic dispatch and macros
+/// contribute none.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodeGraphRow {
+    pub name: String,
+    pub kind: String,
+    pub path: String,
+    pub line_start: usize,
+    pub line_end: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inbound: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outbound: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hops: Option<usize>,
+    #[serde(default)]
+    pub test_scope: bool,
+}
+
+impl CodeGraphRow {
+    /// The plain-text form, used when a card cannot be drawn.
+    pub fn as_line(&self) -> String {
+        let mut line = String::new();
+        if let Some(hops) = self.hops {
+            line.push_str(&format!("hop {hops} "));
+        }
+        line.push_str(&format!(
+            "{} {} {}:{}-{}",
+            self.name, self.kind, self.path, self.line_start, self.line_end
+        ));
+        if let (Some(inbound), Some(outbound)) = (self.inbound, self.outbound) {
+            line.push_str(&format!(" in={inbound} out={outbound}"));
+        }
+        if self.test_scope {
+            line.push_str(" [test]");
+        }
+        line
+    }
+}
+
+/// The body `code_expand` returns alongside its neighbours.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodeGraphSource {
+    pub path: String,
+    pub kind: String,
+    pub line_start: usize,
+    pub lines: Vec<String>,
+    /// Set when the whole file was returned instead of the symbol, and why.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub whole_file_reason: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum IndexOutput {
@@ -444,6 +501,21 @@ pub enum ToolOutput {
         capped: Option<SearchCap>,
     },
     Index(IndexOutput),
+    /// A code-graph answer: a headline, ranked or reached rows, an optional
+    /// body, and the footer describing the graph they came from.
+    ///
+    /// `annotation` is supplied per call because the rows mean different things
+    /// per tool — callers, reached symbols, ranked symbols — and one derived
+    /// count would be wrong for four of the five.
+    CodeGraph {
+        headline: String,
+        rows: Vec<CodeGraphRow>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<CodeGraphSource>,
+        footer: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        state: Option<serde_json::Value>,
+    },
     Shell(ShellOutput),
     /// `text` is what the model was told; `entries` is the same run written
     /// for a reader. Sessions written while batch was a Lua plugin carry only
@@ -617,7 +689,8 @@ impl ToolOutput {
         match self {
             Self::Plain(t) | Self::Markdown(t) | Self::ReadDir(t) => t.state.as_ref(),
             Self::Index(IndexOutput::File { state, .. })
-            | Self::Index(IndexOutput::Directory { state, .. }) => state.as_ref(),
+            | Self::Index(IndexOutput::Directory { state, .. })
+            | Self::CodeGraph { state, .. } => state.as_ref(),
             _ => None,
         }
     }
@@ -643,6 +716,7 @@ impl ToolOutput {
             | Self::WriteCode { .. }
             | Self::GrepResult { .. }
             | Self::Index(_)
+            | Self::CodeGraph { .. }
             | Self::Shell(_)
             | Self::TodoList(_)
             | Self::Answers(_) => Some(self.as_display_text()),
@@ -695,6 +769,22 @@ impl ToolOutput {
     pub fn as_display_text(&self) -> String {
         match self {
             Self::Plain(t) | Self::Markdown(t) | Self::ReadDir(t) => t.text.clone(),
+            Self::CodeGraph {
+                headline,
+                rows,
+                source,
+                footer,
+                ..
+            } => {
+                let mut out = vec![headline.clone()];
+                out.extend(rows.iter().map(CodeGraphRow::as_line));
+                if let Some(source) = source {
+                    out.push(format!("{}:{}", source.path, source.line_start));
+                    out.extend(source.lines.iter().cloned());
+                }
+                out.push(footer.clone());
+                out.join("\n")
+            }
             Self::Index(IndexOutput::File { skeleton, .. }) => skeleton.clone(),
             Self::Index(IndexOutput::Directory { listing, .. }) => listing.clone(),
             Self::Shell(output) => output.raw_text(),

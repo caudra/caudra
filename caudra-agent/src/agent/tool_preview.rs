@@ -36,6 +36,11 @@ const PREVIEW_KEYS: &[(&str, &str)] = &[
     ("webfetch", "url"),
     ("task", "description"),
     ("skill", "name"),
+    ("code_map", "path"),
+    ("code_context", "task"),
+    ("code_refs", "symbol"),
+    ("code_impact", "symbol"),
+    ("code_expand", "symbol"),
 ];
 
 /// Tools that lead with a blob or an aggregate. There is nothing short to show
@@ -45,7 +50,7 @@ const PREVIEW_KEYS: &[(&str, &str)] = &[
 /// from the envelope [`super::tool_body`] decodes, which keeps the newlines
 /// this scanner collapses into spaces.
 const NO_PREVIEW: &[&str] = &[
-    "code_execution",
+    "python_execution",
     "file_apply_patch",
     "batch",
     "todo_write",
@@ -375,7 +380,7 @@ mod tests {
     #[test_case(SHELL, r#"{"command": "a\nb""#, Some("a b") ; "escape_collapses_to_space")]
     #[test_case(SHELL, r#"{"command": "a\"#, Some("a") ; "truncated_mid_escape")]
     #[test_case(SHELL, r#"{"command": "sp   aced""#, Some("sp aced") ; "whitespace_collapsed")]
-    #[test_case("code_execution", r#"{"code": "print(1)""#, None ; "blob_tool_suppressed")]
+    #[test_case("python_execution", r#"{"code": "print(1)""#, None ; "blob_tool_suppressed")]
     #[test_case("batch", r#"{"tool_calls": []}"#, None ; "aggregate_tool_suppressed")]
     #[test_case("mcp_File_read", r#"{"filePath": "a.rs""#, Some("a.rs") ; "mcp_qualified_name")]
     #[test_case("some_plugin_tool", r#"{"target": "thing""#, Some("thing") ; "unknown_tool_fallback")]

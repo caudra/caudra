@@ -11,9 +11,9 @@ use caudra_agent::diff::{DiffLine, DiffSpan, compute_hunks};
 use caudra_agent::types::Answer;
 use caudra_agent::types::{TodoItem, TodoStatus};
 use caudra_agent::{
-    BatchToolEntry, BatchToolStatus, GrepFileEntry, INDEX_TRUNCATED, IndexDirectoryEntryKind,
-    IndexLine, IndexLineSemantic, IndexOutput, IndexSourceRange, InstructionBlock, PatchedFile,
-    SearchCap, SubagentProgress, ToolInput, ToolOutput,
+    BatchToolEntry, BatchToolStatus, CodeGraphRow, CodeGraphSource, GrepFileEntry, INDEX_TRUNCATED,
+    IndexDirectoryEntryKind, IndexLine, IndexLineSemantic, IndexOutput, IndexSourceRange,
+    InstructionBlock, PatchedFile, SearchCap, SubagentProgress, ToolInput, ToolOutput,
 };
 use caudra_config::ToolOutputLines;
 use ratatui::style::Style;
@@ -944,6 +944,128 @@ fn render_index_file(
     (lines, truncated)
 }
 
+/// Caveats the graph reports about itself. A rank caught mid-descent and a
+/// crawl that stopped early both order the same way a complete one does, so the
+/// footer is the only place a reader learns the difference.
+const GRAPH_CAVEATS: &[&str] = &["NOT converged", "truncated by", "stopped early"];
+const GRAPH_ROW_SIGIL: &str = "\u{25c7} ";
+
+/// One symbol per line, with the name leading and everything measured about it
+/// trailing in dimmed columns.
+///
+/// The name column is padded to the widest name actually shown rather than a
+/// fixed width, so a narrow result does not sit in a gutter of blanks.
+fn render_code_graph(
+    headline: &str,
+    rows: &[CodeGraphRow],
+    source: Option<&CodeGraphSource>,
+    footer: &str,
+    max_lines: usize,
+    highlight: bool,
+) -> (Vec<Line<'static>>, bool) {
+    let theme = theme::current();
+    // The headline and footer are the two lines that make the rest
+    // interpretable, so they are never what gets dropped.
+    let room = max_lines.saturating_sub(2);
+    let body_height = rows.len() + source.map_or(0, |source| source.lines.len() + 1);
+    let (shown, hidden) = within(body_height, room);
+    let truncated = hidden > 0;
+
+    let mut lines = vec![Line::from(Span::styled(
+        headline.to_owned(),
+        theme.tool_dim,
+    ))];
+
+    let row_count = rows.len().min(shown);
+    let name_width = rows
+        .iter()
+        .take(row_count)
+        .map(|row| row.name.chars().count())
+        .max()
+        .unwrap_or_default();
+    let hop_width = rows
+        .iter()
+        .take(row_count)
+        .filter_map(|row| row.hops)
+        .max()
+        .map(|hops| hops.to_string().len());
+    for row in rows.iter().take(row_count) {
+        lines.push(code_graph_row(row, name_width, hop_width));
+    }
+
+    if let Some(source) = source {
+        let body_room = shown.saturating_sub(row_count);
+        if body_room > 0 {
+            lines.push(Line::from(Span::styled(
+                match &source.whole_file_reason {
+                    Some(reason) => format!("{} \u{2014} {reason}", source.path),
+                    None => source.path.clone(),
+                },
+                theme.tool_path,
+            )));
+            let (body, _) = render_code(
+                highlight.then(|| caudra_highlight::Highlighter::for_path(&source.path)),
+                source.line_start,
+                &source.lines,
+                source.lines.len(),
+                body_room.saturating_sub(1),
+            );
+            lines.extend(body);
+        }
+    }
+
+    if truncated {
+        lines.push(truncation_line(hidden));
+    }
+    let caveated = GRAPH_CAVEATS.iter().any(|caveat| footer.contains(caveat));
+    lines.push(Line::from(Span::styled(
+        footer.to_owned(),
+        if caveated {
+            theme.error
+        } else {
+            theme.tool_dim
+        },
+    )));
+    (lines, truncated)
+}
+
+fn code_graph_row(
+    row: &CodeGraphRow,
+    name_width: usize,
+    hop_width: Option<usize>,
+) -> Line<'static> {
+    let theme = theme::current();
+    let mut spans = vec![Span::styled(GRAPH_ROW_SIGIL.to_owned(), theme.tool_dim)];
+    if let Some(width) = hop_width {
+        spans.push(Span::styled(
+            match row.hops {
+                Some(hops) => format!("{hops:>width$} "),
+                None => " ".repeat(width + 1),
+            },
+            theme.index_line_nr,
+        ));
+    }
+    spans.push(Span::styled(
+        format!("{:<name_width$}", row.name),
+        theme.tool,
+    ));
+    spans.push(Span::styled(format!("  {}", row.kind), theme.tool_dim));
+    spans.push(Span::styled(
+        format!("  {}:{}-{}", row.path, row.line_start, row.line_end),
+        theme.tool_path,
+    ));
+    if let (Some(inbound), Some(outbound)) = (row.inbound, row.outbound) {
+        spans.push(Span::styled(
+            format!("  in {inbound:>3} out {outbound:>3}"),
+            theme.tool_dim,
+        ));
+    }
+    if row.test_scope {
+        spans.push(Span::styled("  [test]".to_owned(), theme.index_section));
+    }
+    Line::from(spans)
+}
+
 fn render_index_directory(output: &IndexOutput, max_lines: usize) -> (Vec<Line<'static>>, bool) {
     let IndexOutput::Directory {
         entries,
@@ -1234,6 +1356,20 @@ pub fn render_tool_content(
         Some(ToolOutput::Index(IndexOutput::File {
             language, lines, ..
         })) => render_index_file(language, lines, limits.budget, highlight),
+        Some(ToolOutput::CodeGraph {
+            headline,
+            rows,
+            source,
+            footer,
+            ..
+        }) => render_code_graph(
+            headline,
+            rows,
+            source.as_ref(),
+            footer,
+            limits.budget,
+            highlight,
+        ),
         Some(ToolOutput::Index(output @ IndexOutput::Directory { .. })) => {
             render_index_directory(output, limits.budget)
         }
@@ -2362,5 +2498,121 @@ mod tests {
 
         assert_eq!(lines.len(), rows.len(), "the rows stay parallel");
         assert_eq!(unique_targets(&rows), vec![RowTarget(0)]);
+    }
+
+    fn ranked_row(name: &str, inbound: usize) -> CodeGraphRow {
+        CodeGraphRow {
+            name: name.to_owned(),
+            kind: "function".to_owned(),
+            path: "src/lib.rs".to_owned(),
+            line_start: 10,
+            line_end: 20,
+            inbound: Some(inbound),
+            outbound: Some(1),
+            hops: None,
+            test_scope: false,
+        }
+    }
+
+    #[test]
+    fn a_code_graph_card_keeps_its_headline_and_footer() {
+        const HEADLINE: &str = "ranked symbols in .";
+        const FOOTER: &str = "[3 files, 9 symbols, 4 edges]";
+
+        let rows = vec![ranked_row("alpha", 3), ranked_row("beta", 1)];
+        let (lines, truncated) = render_code_graph(HEADLINE, &rows, None, FOOTER, 20, false);
+
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+        assert!(!truncated);
+        assert_eq!(texts.first().map(String::as_str), Some(HEADLINE));
+        assert_eq!(texts.last().map(String::as_str), Some(FOOTER));
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.contains("alpha") && t.contains("in   3"))
+        );
+    }
+
+    /// The two lines that make the rows interpretable are the two a shortened
+    /// card must still show.
+    #[test]
+    fn a_shortened_card_keeps_the_lines_that_explain_the_rest() {
+        const HEADLINE: &str = "ranked symbols in .";
+        const FOOTER: &str = "[100 files]";
+
+        let rows: Vec<CodeGraphRow> = (0..40).map(|i| ranked_row(&format!("sym{i}"), i)).collect();
+        let (lines, truncated) = render_code_graph(HEADLINE, &rows, None, FOOTER, 8, false);
+
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+        assert!(truncated);
+        assert_eq!(texts.first().map(String::as_str), Some(HEADLINE));
+        assert_eq!(texts.last().map(String::as_str), Some(FOOTER));
+    }
+
+    /// A rank caught mid-descent orders the same way a converged one does. The
+    /// footer is the only place that difference is visible, so it has to look
+    /// different too.
+    #[test]
+    fn a_footer_naming_a_caveat_is_not_dimmed_like_an_ordinary_one() {
+        let rows = vec![ranked_row("alpha", 1)];
+        let plain = render_code_graph("h", &rows, None, "[3 files]", 20, false).0;
+        let caveated = render_code_graph(
+            "h",
+            &rows,
+            None,
+            "[3 files; rank NOT converged after 50 iterations]",
+            20,
+            false,
+        )
+        .0;
+
+        assert_ne!(
+            plain.last().expect("footer").spans[0].style,
+            caveated.last().expect("footer").spans[0].style
+        );
+    }
+
+    #[test]
+    fn a_reach_row_leads_with_its_hop_distance() {
+        let mut near = ranked_row("near", 0);
+        near.inbound = None;
+        near.outbound = None;
+        near.hops = Some(1);
+        let mut far = near.clone();
+        far.name = "far".to_owned();
+        far.hops = Some(12);
+
+        let (lines, _) = render_code_graph("h", &[near, far], None, "[f]", 20, false);
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+
+        let hop_column = |needle: &str| -> String {
+            let row = texts.iter().find(|t| t.contains(needle)).expect("row");
+            row.chars().take_while(|c| !c.is_alphabetic()).collect()
+        };
+        assert_eq!(
+            hop_column("near").len(),
+            hop_column("far").len(),
+            "a two-digit hop must not shift the name column of a one-digit row"
+        );
+        assert!(hop_column("far").contains("12"));
+    }
+
+    #[test]
+    fn code_expand_renders_the_body_under_its_path() {
+        let source = CodeGraphSource {
+            path: "src/lib.rs".to_owned(),
+            kind: "function".to_owned(),
+            line_start: 10,
+            lines: vec!["fn alpha() {".to_owned(), "}".to_owned()],
+            whole_file_reason: Some("the bundle would cost more than the file".to_owned()),
+        };
+        let (lines, _) = render_code_graph("h", &[], Some(&source), "[f]", 20, false);
+
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+        assert!(
+            texts.iter().any(|t| t.contains("bundle would cost more")),
+            "a whole-file substitution has to say why"
+        );
+        assert!(texts.iter().any(|t| t.contains("fn alpha")));
     }
 }

@@ -52,7 +52,7 @@ impl Tool for ViewImage {
     }
 
     fn audience(&self) -> ToolAudience {
-        // No interpreter audience: the code_execution bridge flattens tool
+        // No interpreter audience: the python_execution bridge flattens tool
         // output to text, so the pixels could never reach the model from there.
         ToolAudience::MAIN | ToolAudience::RESEARCH_SUB | ToolAudience::GENERAL_SUB
     }

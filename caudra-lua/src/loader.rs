@@ -130,8 +130,8 @@ static BUNDLED_PLUGINS: &[BundledPlugin] = &[
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/task"),
     },
     BundledPlugin {
-        name: "code_execution",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/code_execution"),
+        name: "python_execution",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/python_execution"),
     },
     BundledPlugin {
         name: "view_image",
@@ -720,13 +720,15 @@ mod tests {
         ));
     }
 
-    /// Tools that live in-tree as Lua reference implementations but are owned
-    /// natively in production. Loading one would shadow the native tool, or
-    /// fail registration outright on the name conflict.
+    /// Plugin ids that live in-tree as Lua reference implementations but are
+    /// owned natively in production. Loading one would shadow the native tool,
+    /// fail registration outright on the name conflict, or — where the native
+    /// name has since changed under them — quietly offer the same capability
+    /// twice.
     const NATIVELY_OWNED: &[&str] = &[
         "bash",
         "batch",
-        "code_execution",
+        "python_execution",
         "edit",
         "glob",
         "grep",
