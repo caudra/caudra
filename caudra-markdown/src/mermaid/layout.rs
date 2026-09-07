@@ -1374,10 +1374,7 @@ mod tests {
             labels.sort();
             labels
         };
-        assert_eq!(
-            named("datasets/"),
-            ["caveman_pirate", "lora_sft_120k"]
-        );
+        assert_eq!(named("datasets/"), ["caveman_pirate", "lora_sft_120k"]);
         assert_eq!(
             named("src/llmdata/"),
             ["data_mix", "targets/", "train_grpo", "train_lora"]
