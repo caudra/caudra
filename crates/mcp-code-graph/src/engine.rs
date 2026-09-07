@@ -14,6 +14,7 @@ use workcell_code_graph::{
 use crate::{
     crawl::Crawled,
     limits::CodeGraphLimits,
+    progress::{GraphPhase, PhaseNotifier},
     types::{Direction, GraphSummary, RankedSymbol, ReachedSymbol, SelectorRefusal, SymbolRef},
 };
 
@@ -73,7 +74,16 @@ pub struct CodeGraph {
 
 impl CodeGraph {
     /// Ingests, resolves, and ranks a crawl.
-    pub fn build(crawled: Crawled, limits: &CodeGraphLimits, cache: &mut FactsCache) -> Self {
+    pub fn build(
+        crawled: Crawled,
+        limits: &CodeGraphLimits,
+        cache: &mut FactsCache,
+        notify: Option<&PhaseNotifier>,
+    ) -> Self {
+        let files = crawled.inputs.len();
+        if let Some(notify) = notify {
+            notify(GraphPhase::Parse, files);
+        }
         let mut truncated_by: Vec<String> = crawled
             .truncated
             .map(|reason| vec![reason.name().to_owned()])
@@ -92,6 +102,9 @@ impl CodeGraph {
         }
 
         let facts = ingested.facts;
+        if let Some(notify) = notify {
+            notify(GraphPhase::Rank, files);
+        }
         let graph = resolve(&facts);
         let ranking = pagerank(&graph, &Teleport::Uniform);
         if !ranking.converged {

@@ -2,6 +2,8 @@
 
 use std::sync::{Arc, Mutex};
 
+use tokio::sync::mpsc;
+
 use tokio_util::sync::CancellationToken;
 use workcell_code_graph::FactsCache;
 use workcell_mcp_files::{FileResourceAccess, FileToolGroup};
@@ -12,6 +14,7 @@ use crate::{
     error::CodeGraphError,
     limits::CodeGraphLimits,
     model_text::ModelText,
+    progress::{GraphPhase, GraphProgress, GraphProgressSink, report},
     types::{
         CodeContextInput, CodeContextOutput, CodeExpandInput, CodeExpandOutput, CodeImpactInput,
         CodeImpactOutput, CodeMapInput, CodeMapOutput, CodeRefsInput, CodeRefsOutput, RankedSymbol,
@@ -68,8 +71,21 @@ impl CodeGraphToolGroup {
     ///
     /// A host that already constructed one shares it rather than creating a second resolver with
     /// possibly different confinement, which would be two answers to one authorization question.
+    ///
+    /// The supplied group carries its own traversal bounds, and the crawl cannot see more files
+    /// than that group will enumerate. Rather than let the two disagree silently — which would make
+    /// the result claim a ceiling it never reached — `limits` is clamped to what the group can
+    /// actually deliver, so `truncated_by` names the bound that really fired.
     #[must_use]
     pub fn from_files(files: Arc<FileToolGroup>, limits: CodeGraphLimits) -> Self {
+        let filesystem = files.limits();
+        let limits = CodeGraphLimits {
+            max_files: limits.max_files.min(filesystem.max_search_results),
+            max_traversal_entries: limits
+                .max_traversal_entries
+                .min(filesystem.max_traversal_entries),
+            ..limits
+        };
         let cache = FactsCache::new(limits.cache);
         Self {
             files,
@@ -92,32 +108,57 @@ impl CodeGraphToolGroup {
     async fn graph_for(
         &self,
         path: Option<&str>,
+        progress: Option<&dyn GraphProgressSink>,
         token: &CancellationToken,
     ) -> Result<CodeGraph, CodeGraphError> {
-        let crawled = crawl(&self.files, path, &self.limits, token).await?;
+        report(progress, GraphPhase::Crawl, 0).await;
+        let crawled = crawl(&self.files, path, &self.limits, progress, token).await?;
         let cache = Arc::clone(&self.cache);
         let limits = self.limits;
+        // The build cannot await, so its phase changes arrive over a channel that this function
+        // drains while the build runs. Unbounded because a phase report must never block the work
+        // it is describing, and the sender is dropped by the build itself, which is what ends the
+        // drain.
+        let (phases, mut reports) = mpsc::unbounded_channel();
         // Parsing and ranking a whole tree is CPU-bound for as long as the tree is large, and the
         // extraction it starts owns threads of its own. Left on a runtime worker it would stall
         // every other tool call this process is serving for that entire time.
-        tokio::task::spawn_blocking(move || {
+        let build = tokio::task::spawn_blocking(move || {
             let mut cache = cache
                 .lock()
                 .map_err(|_| CodeGraphError::Internal("extraction cache is poisoned"))?;
-            Ok(CodeGraph::build(crawled, &limits, &mut cache))
-        })
-        .await
-        .map_err(|_| CodeGraphError::Internal("graph construction did not complete"))?
+            let notify = move |phase, files| {
+                let _ = phases.send(GraphProgress { phase, files });
+            };
+            Ok(CodeGraph::build(
+                crawled,
+                &limits,
+                &mut cache,
+                Some(&notify),
+            ))
+        });
+        let drain = async {
+            while let Some(progress_report) = reports.recv().await {
+                if let Some(sink) = progress {
+                    sink.publish(progress_report).await;
+                }
+            }
+        };
+        let (built, ()) = tokio::join!(build, drain);
+        built.map_err(|_| CodeGraphError::Internal("graph construction did not complete"))?
     }
 
     /// Ranked symbols for a tree.
     pub async fn code_map(
         &self,
         input: CodeMapInput,
+        progress: Option<&dyn GraphProgressSink>,
         token: &CancellationToken,
     ) -> Result<CodeMapOutput, CodeGraphError> {
         let limit = self.limits.resolve_limit(input.limit);
-        let graph = self.graph_for(input.path.as_deref(), token).await?;
+        let graph = self
+            .graph_for(input.path.as_deref(), progress, token)
+            .await?;
 
         let ordered = graph.ordered();
         let total = ordered.len();
@@ -145,13 +186,16 @@ impl CodeGraphToolGroup {
     pub async fn code_context(
         &self,
         input: CodeContextInput,
+        progress: Option<&dyn GraphProgressSink>,
         token: &CancellationToken,
     ) -> Result<CodeContextOutput, CodeGraphError> {
         if input.task.trim().is_empty() {
             return Err(CodeGraphError::invalid("task must not be empty"));
         }
         let limit = self.limits.resolve_limit(input.limit);
-        let graph = self.graph_for(input.path.as_deref(), token).await?;
+        let graph = self
+            .graph_for(input.path.as_deref(), progress, token)
+            .await?;
 
         let retrieval = graph.retrieve(&input.task, limit);
         let results: Vec<RankedSymbol> = retrieval
@@ -183,10 +227,13 @@ impl CodeGraphToolGroup {
     pub async fn code_refs(
         &self,
         input: CodeRefsInput,
+        progress: Option<&dyn GraphProgressSink>,
         token: &CancellationToken,
     ) -> Result<Result<CodeRefsOutput, SelectorRefusal>, CodeGraphError> {
         let limit = self.limits.resolve_limit(input.limit);
-        let graph = self.graph_for(input.path.as_deref(), token).await?;
+        let graph = self
+            .graph_for(input.path.as_deref(), progress, token)
+            .await?;
 
         let seeds = match graph.select(&input.symbol, &self.limits) {
             Ok(seeds) => seeds,
@@ -218,6 +265,7 @@ impl CodeGraphToolGroup {
     pub async fn code_impact(
         &self,
         input: CodeImpactInput,
+        progress: Option<&dyn GraphProgressSink>,
         token: &CancellationToken,
     ) -> Result<Result<CodeImpactOutput, SelectorRefusal>, CodeGraphError> {
         let limit = self.limits.resolve_limit(input.limit);
@@ -225,7 +273,9 @@ impl CodeGraphToolGroup {
             .depth
             .unwrap_or(DEFAULT_IMPACT_DEPTH)
             .clamp(1, MAX_IMPACT_DEPTH);
-        let graph = self.graph_for(input.path.as_deref(), token).await?;
+        let graph = self
+            .graph_for(input.path.as_deref(), progress, token)
+            .await?;
 
         let seeds = match graph.select(&input.symbol, &self.limits) {
             Ok(seeds) => seeds,
@@ -264,9 +314,12 @@ impl CodeGraphToolGroup {
     pub async fn code_expand(
         &self,
         input: CodeExpandInput,
+        progress: Option<&dyn GraphProgressSink>,
         token: &CancellationToken,
     ) -> Result<Result<CodeExpandOutput, SelectorRefusal>, CodeGraphError> {
-        let graph = self.graph_for(input.path.as_deref(), token).await?;
+        let graph = self
+            .graph_for(input.path.as_deref(), progress, token)
+            .await?;
         let seeds = match graph.select(&input.symbol, &self.limits) {
             Ok(seeds) => seeds,
             Err(refusal) => return Ok(Err(refusal)),

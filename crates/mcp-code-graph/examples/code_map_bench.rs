@@ -41,7 +41,7 @@ async fn main() {
             .await
             .expect("build code graph group");
         let output = group
-            .code_map(CodeMapInput::default(), &token)
+            .code_map(CodeMapInput::default(), None, &token)
             .await
             .expect("code_map");
         elapsed.push(started.elapsed());

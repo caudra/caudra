@@ -16,6 +16,7 @@ mcp = ["dep:rmcp"]
 git = ["workcell-code-graph/git"]
 
 [dependencies]
+async-trait.workspace = true
 rmcp = { workspace = true, optional = true }
 serde.workspace = true
 thiserror.workspace = true

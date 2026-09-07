@@ -4,7 +4,7 @@ use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 use workcell_mcp_code_graph::{
     CodeContextInput, CodeExpandInput, CodeGraphToolGroup, CodeImpactInput, CodeMapInput,
-    CodeRefsInput, Direction, ModelText,
+    CodeRefsInput, Direction, GraphPhase, GraphProgress, GraphProgressSink, ModelText,
 };
 
 /// A tree with a clear importance gradient: `normalize` is called from three places, `orphan` from
@@ -55,7 +55,7 @@ fn token() -> CancellationToken {
 async fn code_map_ranks_the_most_referenced_symbol_first() {
     let (_directory, group) = group().await;
     let output = group
-        .code_map(CodeMapInput::default(), &token())
+        .code_map(CodeMapInput::default(), None, &token())
         .await
         .expect("map");
 
@@ -81,7 +81,7 @@ async fn code_map_ranks_the_most_referenced_symbol_first() {
 async fn code_map_paths_are_root_relative_whether_or_not_the_map_is_scoped() {
     let (_directory, group) = group().await;
     let whole = group
-        .code_map(CodeMapInput::default(), &token())
+        .code_map(CodeMapInput::default(), None, &token())
         .await
         .expect("map");
     let scoped = group
@@ -90,6 +90,7 @@ async fn code_map_paths_are_root_relative_whether_or_not_the_map_is_scoped() {
                 path: Some("src".to_owned()),
                 limit: None,
             },
+            None,
             &token(),
         )
         .await
@@ -123,6 +124,7 @@ async fn code_context_finds_a_symbol_the_task_did_not_spell() {
                 path: None,
                 limit: Some(5),
             },
+            None,
             &token(),
         )
         .await
@@ -148,6 +150,7 @@ async fn code_context_returns_nothing_for_an_unrelated_task() {
                 path: None,
                 limit: Some(5),
             },
+            None,
             &token(),
         )
         .await
@@ -172,6 +175,7 @@ async fn code_refs_names_its_unit_per_direction() {
                 path: None,
                 limit: None,
             },
+            None,
             &token(),
         )
         .await
@@ -188,6 +192,7 @@ async fn code_refs_names_its_unit_per_direction() {
                 path: None,
                 limit: None,
             },
+            None,
             &token(),
         )
         .await
@@ -215,6 +220,7 @@ async fn an_unknown_symbol_is_refused_with_candidates_not_answered_with_zero() {
                 path: None,
                 limit: None,
             },
+            None,
             &token(),
         )
         .await
@@ -242,6 +248,7 @@ async fn a_symbol_that_exists_with_no_callers_is_a_zero_not_a_refusal() {
                 path: None,
                 limit: None,
             },
+            None,
             &token(),
         )
         .await
@@ -262,6 +269,7 @@ async fn code_impact_reports_hop_distance_and_the_tests_that_reach_it() {
                 path: None,
                 limit: None,
             },
+            None,
             &token(),
         )
         .await
@@ -299,6 +307,7 @@ async fn code_expand_returns_the_body_and_its_neighbours() {
                 symbol: "add_item".to_owned(),
                 path: None,
             },
+            None,
             &token(),
         )
         .await
@@ -335,6 +344,7 @@ async fn code_expand_serves_the_whole_file_when_the_bundle_would_cost_more() {
                 symbol: "only_function".to_owned(),
                 path: None,
             },
+            None,
             &token(),
         )
         .await
@@ -366,6 +376,7 @@ async fn a_qualified_selector_picks_between_same_named_definitions() {
                 path: None,
                 limit: None,
             },
+            None,
             &token(),
         )
         .await
@@ -386,6 +397,7 @@ async fn a_qualified_selector_picks_between_same_named_definitions() {
                 path: None,
                 limit: None,
             },
+            None,
             &token(),
         )
         .await
@@ -400,11 +412,11 @@ async fn repeated_calls_return_byte_identical_results() {
     // The cache is shared across calls. If it could change an answer, this is where it would show.
     let (_directory, group) = group().await;
     let first = group
-        .code_map(CodeMapInput::default(), &token())
+        .code_map(CodeMapInput::default(), None, &token())
         .await
         .expect("map");
     let second = group
-        .code_map(CodeMapInput::default(), &token())
+        .code_map(CodeMapInput::default(), None, &token())
         .await
         .expect("map");
     assert_eq!(
@@ -423,6 +435,7 @@ async fn a_limit_narrows_the_result_and_the_truncation_is_disclosed() {
                 path: None,
                 limit: Some(2),
             },
+            None,
             &token(),
         )
         .await
@@ -443,9 +456,54 @@ async fn an_empty_task_is_rejected_rather_than_matching_everything() {
                 path: None,
                 limit: None,
             },
+            None,
             &token(),
         )
         .await
         .expect_err("an empty task is not a query");
     assert_eq!(error.kind(), "invalid");
+}
+
+/// Records every phase a call reports, in arrival order.
+#[derive(Default)]
+struct RecordingSink {
+    phases: std::sync::Mutex<Vec<GraphPhase>>,
+}
+
+#[async_trait::async_trait]
+impl GraphProgressSink for RecordingSink {
+    async fn publish(&self, progress: GraphProgress) {
+        self.phases.lock().expect("sink").push(progress.phase);
+    }
+}
+
+#[tokio::test]
+async fn a_call_reports_its_phases_in_order() {
+    const EXPECTED: &[GraphPhase] = &[GraphPhase::Crawl, GraphPhase::Parse, GraphPhase::Rank];
+
+    let (_directory, group) = group().await;
+    let sink = RecordingSink::default();
+    group
+        .code_map(CodeMapInput::default(), Some(&sink), &token())
+        .await
+        .expect("map");
+
+    let phases = sink.phases.lock().expect("sink").clone();
+    assert_eq!(
+        phases, EXPECTED,
+        "a host renders these in order; out-of-order or missing phases would animate backwards"
+    );
+}
+
+#[tokio::test]
+async fn a_call_without_a_sink_still_answers() {
+    let (_directory, group) = group().await;
+    let output = group
+        .code_map(CodeMapInput::default(), None, &token())
+        .await
+        .expect("map");
+    assert!(
+        !output.symbols.is_empty(),
+        "progress is advisory and must never gate the result"
+    );
 }

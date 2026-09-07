@@ -20,6 +20,7 @@
 //! Nothing here sandboxes anything. Confinement comes from the filesystem group this crate is
 //! constructed over, which is the only path resolver in the process.
 
+pub mod bound;
 pub mod catalog;
 pub mod crawl;
 #[cfg(feature = "mcp")]
@@ -29,8 +30,10 @@ pub mod error;
 pub mod group;
 pub mod limits;
 pub mod model_text;
+pub mod progress;
 pub mod types;
 
+pub use bound::{RAW_RESULT_CEILING_BYTES, Shrinkable, fit};
 #[cfg(feature = "mcp")]
 pub use catalog::catalog;
 pub use catalog::specs;
@@ -40,6 +43,9 @@ pub use error::CodeGraphError;
 pub use group::CodeGraphToolGroup;
 pub use limits::CodeGraphLimits;
 pub use model_text::ModelText;
+pub use progress::{
+    GraphPhase, GraphProgress, GraphProgressSink, PROGRESS_FILE_INTERVAL, PhaseNotifier,
+};
 pub use types::{
     CodeContextInput, CodeContextOutput, CodeExpandInput, CodeExpandOutput, CodeImpactInput,
     CodeImpactOutput, CodeMapInput, CodeMapOutput, CodeRefsInput, CodeRefsOutput, Direction,

@@ -5608,6 +5608,7 @@ dependencies = [
 name = "workcell-mcp-code-graph"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "rmcp",
  "serde",
  "serde_json",

@@ -560,6 +560,12 @@ workcell = { git = "https://github.com/tensorninja/workcell-mcp", default-featur
 annotations, presentation profile, and a stable contract identity. A host registers those directly.
 `files::ModelText` renders the content block a result carries, including the notice a truncated
 search reports, so a host presents the same text the MCP adapter does instead of restating it.
+The code-graph group renders its own through `code_graph::ModelText` and bounds its own envelope
+through `code_graph::fit`, both ungated: a native host gets the same text and the same size ceiling
+as an MCP client rather than reimplementing either. Its five methods take an optional
+`GraphProgressSink`, which reports the crawl, parse, and rank phases with a running file count so a
+host can show what a multi-second call is doing. Unlike shell progress, a dropped report cannot fail
+the call.
 Enabling a group's `mcp` feature additionally projects the same spec into an MCP `Tool`, which is how
 the standalone server builds its catalog; without it, `rmcp` is not in the dependency graph at all.
 

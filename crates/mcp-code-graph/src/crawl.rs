@@ -18,6 +18,7 @@ use workcell_mcp_files::{
 };
 
 use crate::limits::CodeGraphLimits;
+use crate::progress::{GraphPhase, GraphProgressSink, PROGRESS_FILE_INTERVAL, report};
 
 /// Why a discovered file contributed nothing.
 ///
@@ -105,6 +106,7 @@ pub async fn crawl(
     group: &FileToolGroup,
     relative_path: Option<&str>,
     limits: &CodeGraphLimits,
+    progress: Option<&dyn GraphProgressSink>,
     token: &CancellationToken,
 ) -> Result<Crawled, FilesystemError> {
     let listing = group
@@ -184,6 +186,9 @@ pub async fn crawl(
             Ok(source) => {
                 crawled.bytes_read = crawled.bytes_read.saturating_add(source.len());
                 crawled.inputs.push(SourceInput { path, source });
+                if crawled.inputs.len().is_multiple_of(PROGRESS_FILE_INTERVAL) {
+                    report(progress, GraphPhase::Crawl, crawled.inputs.len()).await;
+                }
             }
             Err(skip) => crawled.skipped.push((path, skip)),
         }
@@ -247,6 +252,7 @@ mod tests {
             &group(directory.path(), &limits).await,
             None,
             &limits,
+            None,
             &CancellationToken::new(),
         )
         .await
@@ -273,6 +279,7 @@ mod tests {
             &group(directory.path(), &limits).await,
             Some("src"),
             &limits,
+            None,
             &CancellationToken::new(),
         )
         .await
@@ -294,6 +301,7 @@ mod tests {
             &group(directory.path(), &limits).await,
             None,
             &limits,
+            None,
             &CancellationToken::new(),
         )
         .await
@@ -314,6 +322,7 @@ mod tests {
             &group(directory.path(), &limits).await,
             None,
             &limits,
+            None,
             &CancellationToken::new(),
         )
         .await
@@ -339,6 +348,7 @@ mod tests {
             &group(directory.path(), &limits).await,
             None,
             &limits,
+            None,
             &CancellationToken::new(),
         )
         .await
@@ -357,13 +367,20 @@ mod tests {
 
         let limits = CodeGraphLimits::default();
         let confined = group(&inner, &limits).await;
-        let escaped = crawl(&confined, Some(".."), &limits, &CancellationToken::new()).await;
+        let escaped = crawl(
+            &confined,
+            Some(".."),
+            &limits,
+            None,
+            &CancellationToken::new(),
+        )
+        .await;
         assert!(
             escaped.is_err(),
             "the filesystem group owns confinement and must refuse this"
         );
 
-        let crawled = crawl(&confined, None, &limits, &CancellationToken::new())
+        let crawled = crawl(&confined, None, &limits, None, &CancellationToken::new())
             .await
             .expect("crawl");
         assert_eq!(crawled.inputs.len(), 1);
