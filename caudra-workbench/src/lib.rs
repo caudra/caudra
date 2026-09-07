@@ -340,6 +340,9 @@ enum Drag {
     /// Resizing the border above this section's header, which doubles as the
     /// section's own fold handle when the pointer never moves.
     Section(usize),
+    /// A press the context menu took. The release finishes nothing, so it must
+    /// not be read as the end of a selection.
+    Menu,
 }
 
 pub struct Workbench {
@@ -881,6 +884,7 @@ impl Workbench {
     /// is swallowed, so the press that dismisses a menu never also acts on
     /// what is underneath it.
     fn press_menu(&mut self, at: (u16, u16)) -> WorkbenchAction {
+        self.drag = Drag::Menu;
         let Some(menu) = &self.menu else {
             return WorkbenchAction::Consumed;
         };
@@ -1319,7 +1323,9 @@ impl Workbench {
                 self.drag_at = at;
                 self.drag_border(index, at.1);
             }
-            Drag::None => {}
+            // A drag takes the menu down before it reaches here, so a press it
+            // took has nothing left to follow.
+            Drag::Menu | Drag::None => {}
         }
     }
 
@@ -1351,8 +1357,9 @@ impl Workbench {
         {
             self.scm.toggle_collapsed(Section::ALL[index]);
         }
+        let held = self.drag;
         self.drag = Drag::None;
-        if !self.panes.text.contains(self.drag_from.into()) {
+        if held == Drag::Menu || !self.panes.text.contains(self.drag_from.into()) {
             return None;
         }
         // A plain click collapses the selection, so an idle press never
@@ -2645,6 +2652,8 @@ mod tests {
     const NOT_SENT: &str = "the composer was handed something other than the path";
     const STILL_A_PREVIEW: &str = "the tab is still the one the next file will take over";
     const NOT_REVEALED: &str = "the sidebar is not showing the file it was pointed at";
+    const STRAY_COPY: &str = "the release of a menu press was read as the end of a selection";
+    const PANEL_OFF_BUFFER: &str = "the panel is not over the buffer, so the case is not covered";
     /// The file [`project`] opens, and the folder beside it.
     const OPENED_FILE: &str = "a.txt";
     const NESTED_DIR: &str = "sub";
@@ -2712,6 +2721,14 @@ mod tests {
 
     fn right_release(column: u16, row: u16) -> MouseEvent {
         mouse(MouseEventKind::Up(MouseButton::Right), column, row)
+    }
+
+    /// A way the pointer reaches the panes while a menu stands over them.
+    #[derive(Debug, Clone, Copy)]
+    enum Reach {
+        Wheel,
+        Middle,
+        Drag,
     }
 
     /// Takes `action` from the menu that is up, which is what pressing its row
@@ -5921,10 +5938,25 @@ mod tests {
         workbench.panes.menu.y + offset as u16
     }
 
-    /// Opens the menu on the first tree row and paints it, so the panel has
-    /// geometry for a press to land on.
+    /// Where the first rule between two groups was painted, counted from the
+    /// top of the panel.
+    fn rule_offset(workbench: &Workbench) -> u16 {
+        workbench
+            .menu
+            .as_ref()
+            .expect(NO_MENU)
+            .items()
+            .iter()
+            .position(|item| *item == MenuItem::Separator)
+            .expect("a rule between two groups") as u16
+    }
+
+    /// Opens the menu on a tree row and paints it, so the panel has geometry
+    /// for a press to land on. Painted first as well, because the menu is
+    /// anchored on the row the last frame put on screen.
     fn open_row_menu(dir: &TempDir, workbench: &mut Workbench) {
         select_file(dir, workbench);
+        paint(workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
         workbench.handle_leader(press(keys::MENU));
         paint(workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
     }
@@ -5969,36 +6001,63 @@ mod tests {
     fn a_press_on_a_rule_leaves_the_menu_standing() {
         let (dir, mut workbench) = project();
         open_row_menu(&dir, &mut workbench);
-        let rule = workbench
-            .menu
-            .as_ref()
-            .expect(NO_MENU)
-            .items()
-            .iter()
-            .position(|item| *item == MenuItem::Separator)
-            .expect("a rule between two groups") as u16;
+        let rule = rule_offset(&workbench);
 
         workbench.handle_mouse(click(workbench.panes.menu.x, workbench.panes.menu.y + rule));
 
         assert!(workbench.menu.is_some(), "{MENU_GONE}");
     }
 
-    #[test_case(true ; "a wheel would scroll what the panel is anchored to")]
-    #[test_case(false ; "and a middle press would close a tab behind it")]
-    fn the_menu_goes_down_before_the_pointer_reaches_the_panes(scrolled: bool) {
+    #[test_case(Reach::Wheel ; "a wheel would scroll what the panel is anchored to")]
+    #[test_case(Reach::Middle ; "a middle press would close a tab behind it")]
+    #[test_case(Reach::Drag ; "and a drag would take a selection under it")]
+    fn the_menu_goes_down_before_the_pointer_reaches_the_panes(reach: Reach) {
         let (_dir, mut workbench) = many_tabs(2);
         workbench.focus = Focus::Editor;
         workbench.handle_leader(press(keys::MENU));
         paint(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
         let tabs = workbench.panes.tabs;
 
-        match scrolled {
-            true => workbench.handle_mouse(wheel(tabs.x, tabs.bottom())),
-            false => workbench.handle_mouse(middle_click(tabs.x, tabs.y)),
+        match reach {
+            Reach::Wheel => workbench.handle_mouse(wheel(tabs.x, tabs.bottom())),
+            Reach::Middle => workbench.handle_mouse(middle_click(tabs.x, tabs.y)),
+            Reach::Drag => workbench.handle_mouse(drag(tabs.x, tabs.bottom())),
         };
 
         assert!(workbench.menu.is_none(), "{MENU_STUCK}");
         assert_eq!(workbench.editor.tabs().len(), 2, "{MODAL_LEAKED}");
+    }
+
+    /// A tab's panel hangs over the buffer, and the press that opened it left
+    /// a selection standing there. The release belongs to the panel, so it
+    /// must not be read as the end of that selection.
+    #[test_case(true ; "a press on a rule that leaves the menu up")]
+    #[test_case(false ; "and a press on a row that takes it down")]
+    fn a_release_after_a_menu_press_copies_nothing(rule: bool) {
+        let (dir, mut workbench) = project();
+        open_file(&dir, &mut workbench);
+        workbench.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        paint(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        workbench.handle_leader(press(keys::MENU));
+        paint(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        let panel = workbench.panes.menu;
+        let row = match rule {
+            true => panel.y + rule_offset(&workbench),
+            false => menu_row(&workbench, MenuAction::CopyRelative),
+        };
+        // Left of this the panel is over the gutter, where a release was never
+        // going to be read as a selection anyway.
+        let column = workbench.panes.text.x;
+        let at = (column, row).into();
+        assert!(
+            panel.contains(at) && workbench.panes.text.contains(at),
+            "{PANEL_OFF_BUFFER}"
+        );
+
+        workbench.handle_mouse(click(column, row));
+        let released = workbench.handle_mouse(release(column, row));
+
+        assert_eq!(released, WorkbenchAction::Consumed, "{STRAY_COPY}");
     }
 
     /// Whatever is standing over the panes is what the next key reaches, so
