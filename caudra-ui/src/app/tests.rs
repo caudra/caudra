@@ -606,6 +606,8 @@ fn reset_session_clears_exit_request_source() {
 const TURNS_UNCOUNTED: &str = "a finished exchange must move the session's turn counter";
 const TURNS_UNSAVED: &str =
     "the exit summary reads the counter off the session, so it must be saved";
+const LEVEL_UNSET: &str = "no level has been chosen yet";
+const LEVEL_UNSAVED: &str = "the chosen level must reach disk to survive a restart";
 
 /// Compaction discards the history a count could be derived from, so the
 /// exit summary reads a stored counter instead. A deferred goal keeps the
@@ -630,9 +632,6 @@ fn toggle_mode_state_machine() {
     let tab = |app: &mut App| app.update(Msg::Key(key(KeyCode::Tab)));
 
     let mut app = test_app();
-    assert_eq!(app.state.mode, Mode::Build);
-
-    tab(&mut app);
     assert_eq!(app.state.mode, Mode::Plan);
     let first_path = app.state.plan.path().unwrap().to_path_buf();
     assert!(first_path.to_str().unwrap().contains("plans"));
@@ -1354,6 +1353,7 @@ fn reset_session_clears_drafting_plan_in_build_mode() {
 fn load_session_clears_plan() {
     let (_tmp, _dir, _writer, mut app) = tempdir_app();
     crate::push_history_message(app.state.session_mut(), Message::user("test".into()));
+    app.state.session_mut().meta.mode = Some(StoredMode::Build);
     app.state.session_mut().save(&app.storage).unwrap();
     let id = app.state.session.id;
     app.state.mode = Mode::Build;
@@ -3693,9 +3693,9 @@ fn clicking_status_mode_toggles_build_and_plan() {
     let mut app = test_app();
 
     assert!(click_status(&mut app, StatusBarHitTarget::Mode).is_empty());
-    assert_eq!(app.state.mode, Mode::Plan);
-    assert!(click_status(&mut app, StatusBarHitTarget::Mode).is_empty());
     assert_eq!(app.state.mode, Mode::Build);
+    assert!(click_status(&mut app, StatusBarHitTarget::Mode).is_empty());
+    assert_eq!(app.state.mode, Mode::Plan);
 }
 
 #[test]
@@ -3913,7 +3913,7 @@ fn cached_mode_hit_revalidates_bash_state() {
         hit.area.y,
     ));
 
-    assert_eq!(app.state.mode, Mode::Build);
+    assert_eq!(app.state.mode, Mode::Plan);
 }
 
 /// When the picker gives up on a directory it cannot list, the flash is the
@@ -5126,9 +5126,10 @@ fn session_has_content_covers_each_branch() {
     session.meta.system_prompt_profile = Some("builtin".into());
     assert!(!session_has_content(&session));
 
-    session.meta.mode = Some(StoredMode::Plan);
-    assert!(session_has_content(&session));
     session.meta.mode = Some(StoredMode::Build);
+    assert!(session_has_content(&session));
+    session.meta.mode = Some(StoredMode::Plan);
+    assert!(!session_has_content(&session));
 
     crate::push_history_message(&mut session, Message::user("hello".into()));
     assert!(session_has_content(&session));
@@ -5202,7 +5203,7 @@ fn checkpoint_syncs_ephemeral_content_into_meta() {
 
     app.update(Msg::Key(key(KeyCode::Tab)));
     app.checkpoint();
-    assert_eq!(app.state.session.meta.mode, Some(StoredMode::Plan));
+    assert_eq!(app.state.session.meta.mode, Some(StoredMode::Build));
     assert!(session_has_content(&app.state.session));
 
     let mut queued = app_with_queued_message();
@@ -5210,7 +5211,7 @@ fn checkpoint_syncs_ephemeral_content_into_meta() {
     let session = &queued.state.session;
     assert!(session.messages().is_empty());
     assert!(session.meta.input_draft.is_none());
-    assert_eq!(session.meta.mode, Some(StoredMode::Build));
+    assert_eq!(session.meta.mode, Some(StoredMode::Plan));
     assert_eq!(
         session.meta.queued_messages,
         [stored_queued_prompt("queued")]
@@ -9612,12 +9613,12 @@ fn bash_prefix_overrides_mode() {
     app.update(Msg::Key(key(KeyCode::Tab)));
     assert_eq!(
         app.state.mode,
-        Mode::Build,
+        Mode::Plan,
         "tab must not toggle while bash prefix present"
     );
 
     app.input_box.set_input("ls".into());
-    assert_eq!(&*app.mode_label().0, "[BUILD]");
+    assert_eq!(&*app.mode_label().0, "[PLAN]");
 }
 
 #[test]
@@ -9645,6 +9646,30 @@ fn shift_tab_cycles_explicit_reasoning_efforts() {
     }
     app.update(Msg::Key(shift_tab));
     assert_eq!(app.state.thinking, ThinkingConfig::Off);
+}
+
+/// The level has to reach disk on the way through, or the next session opens
+/// on whatever the last one happened to leave in its own meta.
+#[test]
+fn a_chosen_reasoning_effort_reaches_the_next_session() {
+    let (_tmp, dir, _writer, mut app) = tempdir_app();
+    assert_eq!(caudra_storage::thinking::read(&dir), None, "{LEVEL_UNSET}");
+
+    app.set_thinking("high").unwrap();
+    assert_eq!(
+        caudra_storage::thinking::read(&dir),
+        Some(StoredThinking::Effort {
+            level: "high".into()
+        }),
+        "{LEVEL_UNSAVED}"
+    );
+
+    app.update(Msg::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT)));
+    assert_eq!(
+        caudra_storage::thinking::read(&dir),
+        Some(app.state.thinking.clone().into()),
+        "{LEVEL_UNSAVED}"
+    );
 }
 
 #[test]

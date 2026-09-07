@@ -67,9 +67,11 @@ impl SessionState {
             tracing::warn!(model = %model.id, error = %e, "failed to adjust resumed model");
         }
 
+        // Plan is where a session that never chose starts, so the agent has to
+        // be asked before it may touch the workspace.
         let mode = match session.meta.mode {
-            Some(StoredMode::Plan) => Mode::Plan,
-            _ => Mode::Build,
+            Some(StoredMode::Build) => Mode::Build,
+            _ => Mode::Plan,
         };
 
         let mut warnings = Vec::new();
@@ -120,10 +122,15 @@ impl SessionState {
         Self {
             // Saved model may differ from the live one (updated, removed, etc).
             // Reconcile so the UI badge and agent always see the truth.
+            // A session that never set a level falls back to the one last
+            // chosen anywhere, which is what carries `/thinking` across a
+            // restart. `always_thinking` is stamped into the meta before this
+            // runs, so config still wins.
             thinking: session
                 .meta
                 .thinking
                 .clone()
+                .or_else(|| caudra_storage::thinking::read(storage))
                 .map(Into::into)
                 .filter(|_| model.supports_thinking())
                 .unwrap_or_default(),
@@ -254,6 +261,7 @@ mod tests {
     use crate::components::{test_model, test_pricing};
     use caudra_providers::{
         ContentBlock, FastPricing, ImageMediaType, ImageSource, Message, ModelPricing, Role,
+        ThinkingSupport,
     };
     use caudra_storage::thinking::StoredThinking;
     use std::collections::HashMap;
@@ -276,6 +284,11 @@ mod tests {
     const IMAGE_DATA: &str = "iVBORw0KGgo=";
     const ITEMS_PER_TURN: &str = "the fixture must spread each exchange over several items";
     const TURNS_NOT_ITEMS: &str = "an exchange is one turn however many items it expands to";
+    const MODE_DEFAULT: &str = "plan is where a session opens unless it stored a choice";
+    const LEVEL_LOST: &str = "the level last chosen must survive into a session that has none";
+    const STORED_LEVEL_LOST: &str = "a level the session stored outranks the remembered one";
+    const LEVEL_KEPT: &str = "a model that cannot reason must not be sent a level";
+    const FIXTURE_REASONS: &str = "the fixture must be a model that cannot reason";
 
     fn resumed(session: AppSession, model: &Model) -> SessionState {
         let tmp = tempfile::tempdir().unwrap();
@@ -428,6 +441,84 @@ mod tests {
             SessionState::from_session(session, &test_model(), &storage, &ModelPolicy::default());
         assert_eq!(state.mode, Mode::Build);
         assert!(state.plan.path().is_none());
+    }
+
+    /// A session that never chose opens in plan, so the agent has to be asked
+    /// before it may touch the workspace. One that did chose keeps its choice,
+    /// which is what makes resuming mid-implementation land back in build.
+    #[test_case(None, Mode::Plan ; "unchosen_opens_in_plan")]
+    #[test_case(Some(StoredMode::Plan), Mode::Plan ; "stored_plan_survives")]
+    #[test_case(Some(StoredMode::Build), Mode::Build ; "stored_build_survives")]
+    fn a_session_opens_in_plan_unless_it_chose_otherwise(
+        stored: Option<StoredMode>,
+        expected: Mode,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = StateDir::from_path(tmp.path().to_path_buf());
+        let state = SessionState::from_session(
+            make_plan_session(stored, None),
+            &test_model(),
+            &storage,
+            &ModelPolicy::default(),
+        );
+        assert_eq!(state.mode, expected, "{MODE_DEFAULT}");
+    }
+
+    /// `/thinking` has to outlive the session it was typed in, so a session
+    /// that never set a level takes the one last chosen anywhere.
+    #[test]
+    fn a_session_without_a_level_takes_the_one_last_chosen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = StateDir::from_path(tmp.path().to_path_buf());
+        caudra_storage::thinking::persist(&storage, &StoredThinking::Adaptive);
+
+        let state = SessionState::from_session(
+            AppSession::new("test-model", "/tmp"),
+            &test_model(),
+            &storage,
+            &ModelPolicy::default(),
+        );
+
+        assert_eq!(state.thinking, ThinkingConfig::Adaptive, "{LEVEL_LOST}");
+    }
+
+    /// `always_thinking` is stamped into the meta before a session is restored,
+    /// so a stored level has to beat the remembered one or config would lose.
+    #[test]
+    fn a_stored_level_beats_the_remembered_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = StateDir::from_path(tmp.path().to_path_buf());
+        caudra_storage::thinking::persist(&storage, &StoredThinking::Adaptive);
+        let mut session = AppSession::new("test-model", "/tmp");
+        session.meta.thinking = Some(StoredThinking::Off);
+
+        let state =
+            SessionState::from_session(session, &test_model(), &storage, &ModelPolicy::default());
+
+        assert_eq!(state.thinking, ThinkingConfig::Off, "{STORED_LEVEL_LOST}");
+    }
+
+    /// The remembered level is global, so it outlives the model it was chosen
+    /// on and reaches models that cannot reason at all.
+    #[test]
+    fn a_remembered_level_a_model_cannot_honor_is_dropped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = StateDir::from_path(tmp.path().to_path_buf());
+        caudra_storage::thinking::persist(&storage, &StoredThinking::Adaptive);
+        let model = Model {
+            thinking_override: Some(ThinkingSupport::No),
+            ..test_model()
+        };
+        assert!(!model.supports_thinking(), "{FIXTURE_REASONS}");
+
+        let state = SessionState::from_session(
+            AppSession::new("test-model", "/tmp"),
+            &model,
+            &storage,
+            &ModelPolicy::default(),
+        );
+
+        assert_eq!(state.thinking, ThinkingConfig::default(), "{LEVEL_KEPT}");
     }
 
     #[test]

@@ -249,6 +249,8 @@ pub struct SessionMeta {
     pub history_head: Option<CaudraId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_revert: Option<PendingConversationRevert>,
+    /// `None` until the session picks a mode, which is what lets a fresh
+    /// session take the front end's default instead of a stored choice.
     #[serde(default)]
     pub mode: Option<StoredMode>,
     #[serde(default)]
@@ -859,10 +861,7 @@ where
             subagent_task_specs: HashMap::new(),
             subagents: Vec::new(),
             usage_by_model: HashMap::new(),
-            meta: SessionMeta {
-                mode: Some(StoredMode::Build),
-                ..Default::default()
-            },
+            meta: SessionMeta::default(),
             created_at: now,
             updated_at: now,
             revision: 0,
@@ -1309,6 +1308,7 @@ mod tests {
     const RENAMED_TITLE: &str = "Renamed by hand";
     const TITLE_PROMPT: &str = "add refresh token support";
     const FORK_TITLE: &str = "Renamed by hand (fork #1)";
+    const MODE_UNCHOSEN: &str = "a new session must not pretend it picked a mode";
 
     fn state_dir() -> (TempDir, StateDir) {
         let temp = TempDir::new().unwrap();
@@ -2240,6 +2240,14 @@ mod tests {
     fn session_meta_rejects_string_queued_messages() {
         let json = r#"{"queued_messages":["legacy"]}"#;
         assert!(serde_json::from_str::<SessionMeta>(json).is_err());
+    }
+
+    /// Storing a mode nobody picked would make every front end inherit this
+    /// crate's guess instead of its own default.
+    #[test]
+    fn a_new_session_has_not_chosen_a_mode() {
+        let session: TestSession = Session::new("m", "/project");
+        assert_eq!(session.meta.mode, None, "{MODE_UNCHOSEN}");
     }
 
     #[test]

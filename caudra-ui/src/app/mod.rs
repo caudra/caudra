@@ -682,14 +682,24 @@ impl App {
         persist_model(&self.storage, &self.state.session.model);
     }
 
+    /// The one place a chosen level lands, so every spelling of the choice
+    /// reaches the next session. A level the model forces off goes through
+    /// [`SessionState::update_model`] instead, which must not overwrite what
+    /// the user asked for on a model that could honor it.
+    fn apply_thinking(&mut self, thinking: ThinkingConfig) {
+        self.state.thinking = thinking;
+        caudra_storage::thinking::persist(&self.storage, &self.state.thinking.clone().into());
+    }
+
     /// Takes the spelling both `/thinking` and `caudra.model.set` accept; a
     /// blank {input} toggles.
     pub(crate) fn set_thinking(&mut self, input: &str) -> Result<ThinkingConfig, String> {
         if !self.state.model.supports_thinking() {
             return Err(THINKING_UNSUPPORTED_MSG.into());
         }
-        self.state.thinking =
+        let parsed =
             ThinkingConfig::parse(input.trim(), &self.state.thinking).map_err(str::to_owned)?;
+        self.apply_thinking(parsed);
         Ok(self.state.thinking.clone())
     }
 
@@ -715,13 +725,14 @@ impl App {
                 .and_then(|index| ladder.get(index + 1)),
             _ => None,
         };
-        self.state.thinking = match next {
+        let stepped = match next {
             Some(level) => ThinkingConfig::Effort((*level).into()),
             None if self.state.thinking.is_enabled() && !self.state.model.requires_thinking() => {
                 ThinkingConfig::Off
             }
             None => ThinkingConfig::Effort((*first).into()),
         };
+        self.apply_thinking(stepped);
         self.flash(format!("Reasoning effort: {}", self.state.thinking));
     }
 

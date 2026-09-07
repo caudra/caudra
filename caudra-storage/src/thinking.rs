@@ -13,9 +13,20 @@ use std::fmt;
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
+use tracing::warn;
+
+use crate::state::{self, SCOPE_GLOBAL, StateKey};
+use crate::{StateClass, StateDir};
 
 /// Floor for every token budget sent to a provider; some APIs reject smaller values.
 pub const MIN_THINKING_BUDGET: u32 = 1024;
+
+/// The level last chosen interactively, so a restart reopens on it. Global
+/// rather than per project, matching the selected model.
+const SELECTED: StateKey = StateKey {
+    name: "thinking.selected",
+    class: StateClass::Persistent,
+};
 
 /// Every effort level the models.dev catalog declares, ascending. Of the 3004
 /// models carrying an effort option, 3001 use only these and 3003 declare them
@@ -284,15 +295,33 @@ impl FromStr for StoredThinking {
     }
 }
 
+pub fn persist(dir: &StateDir, thinking: &StoredThinking) {
+    if let Err(error) = state::set(dir, SCOPE_GLOBAL, SELECTED, thinking) {
+        warn!(%error, "failed to persist thinking level");
+    }
+}
+
+/// `None` when nothing was stored or the row no longer deserializes, which
+/// leaves the caller's own default standing.
+pub fn read(dir: &StateDir) -> Option<StoredThinking> {
+    state::get(dir, SCOPE_GLOBAL, SELECTED).unwrap_or_else(|error| {
+        warn!(%error, "failed to read thinking level");
+        None
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    use tempfile::TempDir;
     use test_case::test_case;
 
     use super::{
         BUDGET_LADDER, EFFORT_LEVELS, MIN_THINKING_BUDGET, ReasoningOption, ReasoningOptions,
-        StoredThinking, ThinkingParseError, effort_rank,
+        StateDir, StoredThinking, ThinkingParseError, effort_rank,
     };
 
+    const ROUND_TRIP: &str = "a stored level must read back as written";
+    const UNSET: &str = "an unwritten level must leave the caller's default alone";
     const SENTINEL_IS_NOT_A_BOUND: &str =
         "a negative bound means the model decides, not a token count to clamp against";
     /// The window the session title request used to ask for. Half of it is
@@ -501,5 +530,35 @@ mod tests {
                 level: "medium".into()
             }
         );
+    }
+
+    #[test_case(StoredThinking::Off ; "off")]
+    #[test_case(StoredThinking::Adaptive ; "adaptive")]
+    #[test_case(StoredThinking::Effort { level: "high".into() } ; "effort")]
+    #[test_case(StoredThinking::Budget { tokens: 8192 } ; "budget")]
+    fn a_chosen_level_round_trips(thinking: StoredThinking) {
+        let tmp = TempDir::new().unwrap();
+        let dir = StateDir::from_path(tmp.path().to_path_buf());
+
+        super::persist(&dir, &thinking);
+        assert_eq!(super::read(&dir), Some(thinking), "{ROUND_TRIP}");
+    }
+
+    #[test]
+    fn an_unchosen_level_leaves_the_caller_its_default() {
+        let tmp = TempDir::new().unwrap();
+        let dir = StateDir::from_path(tmp.path().to_path_buf());
+
+        assert_eq!(super::read(&dir), None, "{UNSET}");
+    }
+
+    #[test]
+    fn the_latest_choice_replaces_the_last() {
+        let tmp = TempDir::new().unwrap();
+        let dir = StateDir::from_path(tmp.path().to_path_buf());
+
+        super::persist(&dir, &StoredThinking::Adaptive);
+        super::persist(&dir, &StoredThinking::Off);
+        assert_eq!(super::read(&dir), Some(StoredThinking::Off), "{ROUND_TRIP}");
     }
 }

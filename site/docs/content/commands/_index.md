@@ -116,11 +116,11 @@ Token counts are estimates. Deferred MCP definitions and memory or skill bodies 
 ## Modes and toggles
 
 - **`/yolo`**: skip permission prompts for this session (deny rules still apply). The toggle survives a resume, and `--yolo` only sets the starting value. Config: `always_yolo = true`.
-- **`/thinking`**: extended thinking. Optional arg: `off`, `adaptive`, an effort level (`minimal` … `max`), or a token budget number. Config: `always_thinking`.
+- **`/thinking`**: extended thinking. Optional arg: `off`, `adaptive`, an effort level (`minimal` … `max`), or a token budget number. The level is remembered across restarts. Config: `always_thinking` overrides the remembered level.
 - **`/fast`**: Anthropic fast mode (Opus only; ignored on other models). Config: `always_fast = true`.
 - **`/workflow`**: expose workflow mode to custom Lua tool descriptions and handlers. Native `code_execution` remains isolated. Config: `always_workflow = true`.
 - **`/view`**: cycle the transcript through auto, compact, and expanded. Auto is the default: every card falls back to a single row except the newest one, which stays open until a newer card replaces it. Compact draws every tool call as one row; expanded gives each its own card. Only calls that changed nothing can be hidden, so writes, edits, and shell commands stay open in every mode. An open card shows as much of its body as `ui.tool_output_lines` allows for that tool; clicking shows all of it, and clicking again puts it back. A card you opened yourself stays open as the transcript grows. `task` and `batch` keep their child rows throughout, and each child answers the same question its own card would: a child that changed something draws its body within that tool's `ui.tool_output_lines` budget, and every other child folds to its row until you click it. The choice is remembered across restarts.
-- **Plan / build**: not a slash command. Press `Tab` in the input to toggle plan mode (plan-file writes only).
+- **Plan / build**: not a slash command. Press `Tab` in the input to toggle plan mode (plan-file writes only). Caudra opens in plan mode, and a resumed session reopens in the mode it was left in.
 - **`/reload`**: rebuild plugins and config without leaving the app.
 - **`/btw`**: one-shot side question with no tools and no history pollution.
 - **`/memory`**: open the memory file picker (view / edit / delete). See the `memory` tool under [Tools](/docs/tools/).

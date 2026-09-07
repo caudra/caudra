@@ -167,7 +167,7 @@ pub fn generate() -> String {
     .unwrap();
     writeln!(
         out,
-        "- **`/thinking`**: extended thinking. Optional arg: `off`, `adaptive`, an effort level (`minimal` … `max`), or a token budget number. Config: `always_thinking`."
+        "- **`/thinking`**: extended thinking. Optional arg: `off`, `adaptive`, an effort level (`minimal` … `max`), or a token budget number. The level is remembered across restarts. Config: `always_thinking` overrides the remembered level."
     )
     .unwrap();
     writeln!(
@@ -187,7 +187,7 @@ pub fn generate() -> String {
     .unwrap();
     writeln!(
         out,
-        "- **Plan / build**: not a slash command. Press `Tab` in the input to toggle plan mode (plan-file writes only)."
+        "- **Plan / build**: not a slash command. Press `Tab` in the input to toggle plan mode (plan-file writes only). Caudra opens in plan mode, and a resumed session reopens in the mode it was left in."
     )
     .unwrap();
     writeln!(

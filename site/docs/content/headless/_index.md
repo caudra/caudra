@@ -78,7 +78,7 @@ SDK-only flags (`--system-prompt`, `--max-turns`, `--session-id`, `--fork-sessio
 
 Two caveats:
 
-- One-shot `--print` always starts a **new** session in **build** mode. Plan mode and session resume need the SDK path (or the TUI).
+- One-shot `--print` always starts a **new** session in **build** mode, unlike the TUI, which opens in plan mode. Plan mode and session resume need the SDK path (or the TUI).
 - The plan file for SDK `--permission-mode plan` is `./plan.md` under cwd, not the state-dir `plans/<slug>.md` files the TUI uses.
 
 ### Quick example

@@ -99,7 +99,9 @@ pub(crate) fn session_has_content(session: &AppSession) -> bool {
             .system_prompt_profile
             .as_deref()
             .is_some_and(|profile| profile != caudra_agent::prompt::profile::BUILTIN_PROFILE_NAME)
-        || session.meta.mode != Some(caudra_storage::sessions::StoredMode::Build)
+        // Plan is the mode a session opens in, so only leaving it is a choice
+        // worth keeping an otherwise empty session for.
+        || session.meta.mode == Some(caudra_storage::sessions::StoredMode::Build)
 }
 
 impl App {
