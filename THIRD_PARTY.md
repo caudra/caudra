@@ -23,6 +23,20 @@ The remaining fifteen — containerfile, css, dart, elixir, gleam, hcl, html, ko
 nix, scala, sql, starlark, zig — are authored here against the vendored grammars and carry no
 upstream provenance.
 
+## Code-graph pipeline
+
+`crates/code-graph/`
+
+The ranking pipeline — the resolution ladder, personalized PageRank over an in-edge graph, the BM25
+lexical lane, and their reciprocal-rank fusion — is a reimplementation of the corresponding stages of
+[ripwire](https://github.com/redhat-et/ripwire), Apache-2.0. No ripwire source is vendored: it is
+C++, this is Rust, and the data structures, bounds, cache, and honesty vocabulary are our own. The
+debt is to the design, and it is recorded here because the design is what makes the two comparable.
+
+Ripwire's on-disk cache blob, its write verbs, its own transport, and its remaining verb families are
+deliberately not ported. `crates/mcp-code-graph/README.md` records the benchmark comparison against
+the upstream binary.
+
 ## Output filter rules
 
 `crates/output-filter/rules/`

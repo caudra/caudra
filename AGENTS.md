@@ -29,6 +29,18 @@ deployment controllers, lease brokers, ontology tools, or harness-specific state
 - `crates/mcp-web` owns web tool schemas, provider lowering, fetch extraction, and parser bounds.
 - `crates/mcp-code` owns code tool schemas, worker-process supervision, interpreter isolation, value
   rendering, and the failure taxonomy.
+- `crates/code-graph` owns the protocol-neutral ranking engine: extraction, the resolution ladder,
+  PageRank, BM25, fusion, the fact cache, and optional git signals behind its `git` feature. It has
+  no filesystem access and no protocol dependency; keep it that way. Every reference count it
+  produces is a floor, and no result may present one as exact. Determinism is the property that
+  breaks most quietly here: ids come from sorted paths, ties break on a total order, iteration
+  counts are constants, no ranking module may use a reassociating float operation, and extraction
+  worker count must stay invisible in the output. Each of those has a gate; do not weaken one to
+  make a diff pass.
+- `crates/mcp-code-graph` owns the crawl, the five `code_*` tool schemas, result shaping, and the
+  MCP projection. It never opens a path: confinement is delegated to `mcp-files`, which stays the
+  only resolver in the process. Do not add a write verb to it — `file_edit` and `file_apply_patch`
+  already own mutation, with revalidation and atomic publication.
 - `crates/monty-worker` owns build-time worker validation, embedded bytes, secure extraction, and
   executable leases. It must remain optional for native code consumers.
 - `crates/output-filter` owns the declarative rule corpus and the engine that renders command output
@@ -99,8 +111,11 @@ worker lease for the full pool lifetime; hosts supply cache and source policy, n
 ## Protocol Contracts
 
 - The supported MCP version is explicit and pinned in the server and SDK dependency.
-- Preserve stable catalog order: files, web, shell, python_execution, transfer, execution environment.
-- Within files, `index` follows `file_apply_patch` and precedes every web tool when enabled.
+- Preserve stable catalog order: files, code graph, web, shell, python_execution, transfer, execution
+  environment.
+- Within files, `index` follows `file_apply_patch` and precedes every web tool when enabled. The five
+  code-graph tools follow `index` in the order `code_map`, `code_context`, `code_refs`, `code_impact`,
+  `code_expand`.
 - Tool names, schemas, annotations, and complete-result envelopes are compatibility contracts.
 - `ai.workcell/*` extension metadata is Workcell-owned. Do not introduce product-specific namespaces.
 - Update conformance fixtures and tests whenever a public contract intentionally changes.
@@ -132,6 +147,11 @@ that regression, because feature unification always resolves `mcp` in.
 For code worker or packaging changes, verify both explicit-path and bundled sources, then execute a
 real snippet through an optimized binary copied away from any adjacent worker. This proves the
 embedded fallback works rather than accidentally resolving the development worker.
+
+For code-graph changes that could affect cost, re-run `cargo run --release --example code_map_bench`
+over a real tree. Compare cold against cold: the upstream `ripwire` binary keeps an on-disk cache, so
+its second run measures that cache and not its pipeline. `crates/mcp-code-graph/README.md` records
+the current numbers and the host they came from.
 
 For transport or container changes, also build the image and perform a real discovery/list/call smoke
 test against the resulting process. Use `make docker-smoke` as the minimum image check.

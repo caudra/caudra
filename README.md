@@ -62,6 +62,7 @@ sequenceDiagram
 | Files | `file_read`, `file_glob`, `file_grep` | Root-confined, bounded reads and search. |
 | Files | `file_write`, `file_edit`, `file_apply_patch` | Present in the catalog only when `--allow-write` is set. |
 | Files | `index` | Bounded source skeletons and deterministic directory listings. |
+| Code graph | `code_map`, `code_context`, `code_refs`, `code_impact`, `code_expand` | Repository-scale symbol ranking, retrieval, and impact over the same confined tree. Reference counts are floors. |
 | Web | `websearch`, `webfetch` | Search defaults to credential-free Exa; fetch applies SSRF and response bounds. |
 | Shell | `shell` | Applies immutable command policy, then executes with ordered progress and a cleaned environment. |
 | Python execution | `python_execution` | Runs a Python snippet in a separate worker process with no filesystem, network, or environment access. |
@@ -69,9 +70,10 @@ sequenceDiagram
 | Server | `execution_environment` | Returns fresh sanitized platform, privilege, package-manager, and command observations. |
 
 All groups except transfer are enabled by default. Use repeatable
-`--tool-group files|web|shell|python_execution|transfer` arguments to expose a subset. Files, shell, and transfer
-require a positional root. Transfer additionally requires `--transport http`, because its tools mint
-URLs for a route only the HTTP transport serves; requesting it over stdio is a startup error.
+`--tool-group files|code_graph|web|shell|python_execution|transfer` arguments to expose a subset.
+Files, code graph, shell, and transfer require a positional root. Transfer additionally requires
+`--transport http`, because its tools mint URLs for a route only the HTTP transport serves;
+requesting it over stdio is a startup error.
 
 The filesystem tools enforce a canonical root. The shell tool uses that root as its initial working
 directory, but shell commands can deliberately access any path, network, or process visible inside the
@@ -550,6 +552,8 @@ workcell = { git = "https://github.com/tensorninja/workcell-mcp", default-featur
 | `shell` | `ShellToolGroup`, `PreparedShell`, scope analysis, progress streaming, and `output_filter` |
 | `code` | `CodeToolGroup`, isolated interpreter execution (the `python_execution` tool) |
 | `code-bundled` | `code` plus verified extraction of a build-time embedded Monty worker |
+| `code-graph` | `CodeGraphToolGroup` and the five `code_*` tools over a confined source tree |
+| `code-graph-git` | `code-graph` plus repository recency and churn signals through `gix` |
 | `environment` | `ExecutionEnvironment` inspection |
 
 `ToolSpec` carries the protocol-neutral contract: name, description, input and output schemas,
@@ -878,6 +882,36 @@ PDF responses have a separate 6 MiB transfer ceiling and support two explicit mo
 
 With `--web-icons`, `webfetch` may also resolve a verified source icon. Already-fetched HTML is reused
 where possible so icon discovery does not refetch the page body.
+
+### `code_map`, `code_context`, `code_refs`, `code_impact`, `code_expand`
+
+The code-graph group answers five questions from one graph built over the configured root. It reads
+through the same confined resolver the filesystem tools use and never opens a path itself.
+
+| Tool | Answers |
+| --- | --- |
+| `code_map` | orient: what are the important symbols here |
+| `code_context` | what should I read before making this change |
+| `code_refs` | what references this, or what does this reference |
+| `code_impact` | what breaks if I change this, and what tests cover it |
+| `code_expand` | show me this symbol and what sits next to it |
+
+- Importance is personalized PageRank over a call graph recovered from source text by name.
+  `code_context` fuses that with a BM25 lexical lane, and reports which lane its router picked and
+  why.
+- **Every reference count is a floor.** Dynamic dispatch, callbacks, function pointers, trait objects,
+  reflection, and macro-generated call sites contribute no edge at all, so a count of 0 means none was
+  found, never that none exists. The result says so in a field rather than only in the description.
+- An unknown symbol is refused with did-you-mean candidates rather than answered with zero. A symbol
+  that exists and has no callers returns zero. A name matching several definitions returns their union
+  and marks itself ambiguous instead of silently picking one.
+- `confidence` on `code_context` is derived from how far the top result separates from the rest. It
+  measures separation, never correctness, and a single result is always low.
+- Crawling, parsing, ranking, extraction worker count, and result size are bounded by host-only
+  policy. A bound that fires is named in the result. Results are fitted to a 64,000-byte envelope by
+  binary search over retained rows, measured on the serialized envelope rather than estimated.
+- Ranking is deterministic: ids come from sorted paths, ties break on a total order, and worker count
+  is invisible in the output.
 
 ### `shell`
 

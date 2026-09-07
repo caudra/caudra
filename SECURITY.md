@@ -111,6 +111,18 @@ not expose a construction-memory ceiling for those limits. Syntax trees and nati
 dropped after each call; no parser cache or scripting runtime is retained. These controls limit
 accidental and adversarial work but do not turn native parser code into a process-isolated sandbox.
 
+The code-graph tool group reads through the same confined filesystem group and adds no write
+authority, no second path resolver, and no network access. It parses a whole tree rather than one
+file, so its bounds are wider and all of them are host-owned: files per map, traversal entries,
+single-file and total source bytes, a crawl deadline, per-file and whole-tree definition and
+reference ceilings, PageRank iterations, retained cache entries and bytes, result rows, and
+extraction worker count. Parse trees are dropped as each file's facts are extracted, so live memory
+is bounded by worker count rather than by tree size. Extraction and ranking run on a blocking task
+with their own bounded worker pool, which limits concurrent parser work but, exactly as for the
+indexer above, is not CPU or memory containment. Every bound that fires is named in the result rather
+than applied in silence, and reference counts are floors: a zero means none was found, never that
+none exists.
+
 Execution-environment disclosure performs fixed, bounded local probes at startup and whenever the
 `execution_environment` tool is called. A non-root Unix process actively runs
 `sudo -n -- <resolved-true>` during each inspection; this may create audit records, update external
