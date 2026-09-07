@@ -372,6 +372,7 @@ supports_vision = false
 | `default_model` | string | Used after login when no model is saved yet |
 | `discover_models` | bool | When true, also probe the provider's model list endpoint (default false) |
 | `enable_free_models` | bool | Opencode only. Show free catalog models (default false) |
+| `model_defaults` | table | Model fields applied to every model of this provider (see below) |
 | `models` | array | Declared models for custom providers (see below) |
 | `overrides` | table | Aperture only. Per-upstream model overrides (see below) |
 
@@ -390,6 +391,27 @@ supports_vision = false
 | `pricing_input` / `pricing_output` | f64 | 0 | USD per 1M tokens |
 | `pricing_cache_write` / `pricing_cache_read` | f64 | 0 | USD per 1M tokens |
 | `pricing_fast_input` / `pricing_fast_output` | f64 | unset | Fast-mode pricing when the provider supports it |
+
+### Model defaults
+
+A `models` entry only applies to the exact `id` it names. When a provider's ids change often, or `discover_models` finds models you never declared, put the shared settings in `model_defaults` instead:
+
+```toml
+[my-proxy.model_defaults]
+context_window = 229376
+max_output_tokens = 32768
+reasoning_options = []
+
+[[my-proxy.models]]
+id = "smart-v1"
+tier = "strong"
+```
+
+It takes the same fields as a `models` entry apart from `id`, and applies to every model of the provider including discovered ones. A matching `models` entry wins field by field, so `smart-v1` above is strong with a 229376-token window. Anything a model neither declares nor inherits falls back to discovery, then to the protocol default.
+
+`reasoning_options = []` is a declaration, not an omission: it says the endpoint takes no reasoning controls, so Caudra sends no `reasoning_effort`. Leaving it unset instead lets a thinking level chosen for another model reach an endpoint that rejects it.
+
+A `models` entry whose `id` matches no live model is logged once: every setting on it is ignored, which otherwise looks like Caudra disregarding the config.
 
 Custom slugs must not reuse a built-in provider name. A bad TOML parse exits with code 2 at startup so a typo cannot silently empty the registry.
 

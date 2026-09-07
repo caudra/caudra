@@ -1,4 +1,5 @@
-use std::sync::{Arc, Mutex};
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use flume::Sender;
 use serde_json::Value;
@@ -15,7 +16,7 @@ use crate::manifest::ManifestRegistry;
 use crate::model::{FastPricing, Model, ModelInfo, ModelPricing, ModelTier, ThinkingSupport};
 use crate::provider::{BoxFuture, Provider, ProviderKind};
 use crate::providers::Timeouts;
-use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
+use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig};
 
 static CUSTOM_OPENAI_CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
     // Custom providers resolve their own base URL (including any override) from
@@ -102,39 +103,72 @@ pub fn lookup_model(slug: &str, model_id: &str) -> Option<Model> {
     Some(model_from_def(def, kind, slug, model_id))
 }
 
+/// An absent `tier` means medium, so a model declared without one keeps
+/// resolving the way it did before `model_defaults` existed.
+fn declared_tier(def: &ProviderDef, model_id: &str) -> ModelTier {
+    def.model_settings(model_id)
+        .tier
+        .map(ModelTier::from)
+        .unwrap_or(ModelTier::Medium)
+}
+
+/// A `providers.toml` entry whose id matches no live model silently voids every
+/// setting on it, which reads as caudra ignoring the config. Say so once per
+/// id: `model_from_def` runs per request, and provider defaults are the fix.
+fn warn_unmatched_model_id(def: &ProviderDef, slug: &str, model_id: &str) {
+    if def.models.is_empty() || def.declares(model_id) {
+        return;
+    }
+    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let mut seen = SEEN
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !seen.insert(format!("{slug}/{model_id}")) {
+        return;
+    }
+    let declared: Vec<&str> = def.models.iter().map(|m| m.id.as_str()).collect();
+    tracing::warn!(
+        provider = %slug,
+        model = %model_id,
+        declared = ?declared,
+        "no providers.toml entry for this model; its settings are ignored. \
+         Use [{slug}.model_defaults] for settings that apply to every model"
+    );
+}
+
 /// Build a model from an already-loaded provider definition so tier resolution
 /// and id lookup can share one `providers.toml` read instead of loading twice.
 fn model_from_def(def: &ProviderDef, kind: ProviderKind, slug: &str, model_id: &str) -> Model {
-    let declared = def.models.iter().find(|m| m.id == model_id);
-    let tier = declared
-        .map(|m| ModelTier::from(m.tier))
-        .unwrap_or(ModelTier::Medium);
+    warn_unmatched_model_id(def, slug, model_id);
+    let tier = declared_tier(def, model_id);
+    let declared = def.model_settings(model_id);
     let discovered = crate::model_registry::discovered(slug, model_id);
     let discovered = discovered.as_ref();
     let max_output_tokens = declared
-        .and_then(|m| m.max_output_tokens)
+        .max_output_tokens
         .or_else(|| discovered.and_then(|d| d.max_output_tokens))
         .or_else(|| kind.fallback_max_output());
     let context_window = declared
-        .and_then(|m| m.context_window)
+        .context_window
         .or_else(|| discovered.and_then(|d| d.context_window))
         .unwrap_or_else(|| kind.fallback_context_window());
-    let supports_tool_examples_override = declared.and_then(|m| m.supports_tool_examples);
+    let supports_tool_examples_override = declared.supports_tool_examples;
     let thinking_override = ThinkingSupport::from_flags(
         declared
-            .and_then(|m| m.supports_thinking)
+            .supports_thinking
             .or_else(|| ManifestRegistry::get(&kind.to_string()).map(|m| m.supports_thinking)),
-        declared.and_then(|m| m.requires_thinking).unwrap_or(false),
+        declared.requires_thinking.unwrap_or(false),
     );
-    let supports_vision_override = declared.and_then(|m| m.supports_vision);
-    let pricing = declared
+    let supports_vision_override = declared.supports_vision;
+    let pricing = Some(&declared)
         .filter(|m| m.has_pricing())
         .map(|m| ModelPricing {
             input: m.pricing_input.unwrap_or(0.0),
             output: m.pricing_output.unwrap_or(0.0),
             cache_write: m.pricing_cache_write.unwrap_or(0.0),
             cache_read: m.pricing_cache_read.unwrap_or(0.0),
-            fast: declared
+            fast: Some(m)
                 .filter(|d| d.has_fast_pricing())
                 .map(|d| FastPricing {
                     input: d.pricing_fast_input.unwrap_or(0.0),
@@ -156,10 +190,22 @@ fn model_from_def(def: &ProviderDef, kind: ProviderKind, slug: &str, model_id: &
         max_output_tokens,
         context_window,
         window_excludes_output: false,
-        reasoning_options: declared
-            .and_then(|m| m.reasoning_options.clone())
-            .unwrap_or_default(),
+        reasoning_options: declared.reasoning_options.unwrap_or_default(),
         thinking_fields: None,
+    }
+}
+
+/// `reasoning_effort`, not Anthropic's `thinking`: a strict OpenAI-compatible
+/// server 400s on an unknown top-level key.
+///
+/// A model that declares no reasoning options gets neither key. These endpoints
+/// reject an unrecognized level outright instead of falling back to a default,
+/// and with nothing declared there is no ladder to snap the level onto, so
+/// `ThinkingConfig::resolve` would pass it through verbatim. Declaring
+/// `reasoning_options` in `providers.toml` is the opt-in.
+fn apply_declared_effort(thinking: &ThinkingConfig, body: &mut Value, model: &Model) {
+    if !model.reasoning_options().is_empty() {
+        thinking.apply_reasoning_effort(body, model);
     }
 }
 
@@ -210,7 +256,7 @@ pub fn resolve_tier(slug: &str, tier: ModelTier) -> TierLookup {
     match def
         .models
         .iter()
-        .find(|model| ModelTier::from(model.tier) == tier)
+        .find(|model| declared_tier(def, &model.id) == tier)
     {
         Some(declared) => TierLookup::Model(model_from_def(def, kind, slug, &declared.id)),
         None => TierLookup::NoModelForTier(kind),
@@ -265,8 +311,8 @@ pub fn discover_models(timeouts: Timeouts) -> Vec<String> {
 /// the metadata candidate win and keeps declared config authoritative.
 fn overlay_declared_tiers(def: &ProviderDef, models: &mut [ModelInfo]) {
     for model in models {
-        if let Some(declared) = def.models.iter().find(|m| m.id == model.id) {
-            model.tier = Some(ModelTier::from(declared.tier));
+        if def.model_settings(&model.id).tier.is_some() {
+            model.tier = Some(declared_tier(def, &model.id));
         }
     }
 }
@@ -306,11 +352,7 @@ impl Provider for CustomOpenAiProvider {
             }
 
             let mut body = self.compat.build_body(model, messages, system, tools);
-            // `reasoning_effort`, not Anthropic's `thinking`: a strict
-            // OpenAI-compatible server 400s on an unknown top-level key, and
-            // this is the only knob that reaches the levels declared under
-            // `reasoning_options` in `providers.toml`.
-            opts.thinking.apply_reasoning_effort(&mut body, model);
+            apply_declared_effort(&opts.thinking, &mut body, model);
             self.compat
                 .do_stream(model, &[], &body, event_tx, &auth)
                 .await
@@ -405,6 +447,10 @@ mod tests {
         ThinkingConfig::Effort("xhigh".into()) => Some("xhigh".to_string()) ; "declared_level"
     )]
     #[test_case::test_case("[]", ThinkingConfig::Off => None ; "no_reasoning_options_sends_nothing")]
+    #[test_case::test_case(
+        "[]",
+        ThinkingConfig::Effort("max".into()) => None ; "undeclared_effort_is_not_guessed"
+    )]
     fn custom_openai_body_carries_effort_never_anthropic_thinking(
         reasoning_options: &str,
         thinking: ThinkingConfig,
@@ -417,7 +463,7 @@ mod tests {
         let provider = OpenAiCompatProvider::new(&CUSTOM_OPENAI_CONFIG, Timeouts::default());
 
         let mut body = provider.build_body(&model, &[], "", &Value::Null);
-        thinking.apply_reasoning_effort(&mut body, &model);
+        apply_declared_effort(&thinking, &mut body, &model);
 
         assert!(body.get("thinking").is_none(), "{ANTHROPIC_KEY_LEAKED}");
         body.get("reasoning_effort")

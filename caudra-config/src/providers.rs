@@ -30,8 +30,20 @@ pub enum Tier {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelDef {
     pub id: String,
-    #[serde(default)]
-    pub tier: Tier,
+    #[serde(flatten)]
+    pub fields: ModelFields,
+}
+
+/// Settings declarable per model, or for every model of a provider at once via
+/// [`ProviderDef::model_defaults`].
+///
+/// Every field is optional so absence means "inherit" rather than "reset to the
+/// default": a non-optional `tier` would make an exact entry silently outrank a
+/// provider default it never mentioned.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ModelFields {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier: Option<Tier>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -63,7 +75,7 @@ pub struct ModelDef {
     pub pricing_fast_output: Option<f64>,
 }
 
-impl ModelDef {
+impl ModelFields {
     /// Any pricing field set means the user provided pricing (other fields default to 0).
     pub fn has_pricing(&self) -> bool {
         self.pricing_input.is_some()
@@ -74,6 +86,29 @@ impl ModelDef {
 
     pub fn has_fast_pricing(&self) -> bool {
         self.pricing_fast_input.is_some() || self.pricing_fast_output.is_some()
+    }
+
+    /// Field-by-field override: whatever `self` declares wins, and `base` fills
+    /// every gap.
+    fn over(self, base: &Self) -> Self {
+        Self {
+            tier: self.tier.or(base.tier),
+            context_window: self.context_window.or(base.context_window),
+            max_output_tokens: self.max_output_tokens.or(base.max_output_tokens),
+            supports_tool_examples: self.supports_tool_examples.or(base.supports_tool_examples),
+            supports_thinking: self.supports_thinking.or(base.supports_thinking),
+            requires_thinking: self.requires_thinking.or(base.requires_thinking),
+            supports_vision: self.supports_vision.or(base.supports_vision),
+            reasoning_options: self
+                .reasoning_options
+                .or_else(|| base.reasoning_options.clone()),
+            pricing_input: self.pricing_input.or(base.pricing_input),
+            pricing_output: self.pricing_output.or(base.pricing_output),
+            pricing_cache_write: self.pricing_cache_write.or(base.pricing_cache_write),
+            pricing_cache_read: self.pricing_cache_read.or(base.pricing_cache_read),
+            pricing_fast_input: self.pricing_fast_input.or(base.pricing_fast_input),
+            pricing_fast_output: self.pricing_fast_output.or(base.pricing_fast_output),
+        }
     }
 }
 
@@ -194,8 +229,31 @@ pub struct ProviderDef {
     /// providers.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub overrides: HashMap<String, ProviderOverride>,
+    /// Applied to every model of this provider, including ones only discovery
+    /// knows about. A matching `models` entry overrides it field by field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_defaults: Option<ModelFields>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub models: Vec<ModelDef>,
+}
+
+impl ProviderDef {
+    /// Effective declared settings for `model_id`.
+    ///
+    /// An exact `models` entry wins field by field over `model_defaults`, so a
+    /// provider whose model ids churn keeps its context window and reasoning
+    /// options without an entry per id.
+    pub fn model_settings(&self, model_id: &str) -> ModelFields {
+        let defaults = self.model_defaults.clone().unwrap_or_default();
+        match self.models.iter().find(|m| m.id == model_id) {
+            Some(declared) => declared.fields.clone().over(&defaults),
+            None => defaults,
+        }
+    }
+
+    pub fn declares(&self, model_id: &str) -> bool {
+        self.models.iter().any(|m| m.id == model_id)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -428,15 +486,81 @@ values = ["none", "low", "medium", "xhigh"]
     const DECLARED_WINS: &str =
         "a level declared in providers.toml is the only description this model has";
 
+    const ABSENT_MEANS_INHERIT: &str =
+        "an absent field must inherit the provider default, not reset it";
+
+    const DEFAULTS_TOML: &str = r#"
+[local]
+protocol = "openai"
+
+[local.model_defaults]
+context_window = 229376
+max_output_tokens = 32768
+tier = "weak"
+reasoning_options = []
+
+[[local.models]]
+id = "qwen3.8-27b-lora"
+tier = "strong"
+
+[[local.models]]
+id = "small"
+context_window = 8192
+"#;
+
+    #[test_case("qwen3.8-27b-lora", Some(229_376), Some(Tier::Strong) ; "exact_entry_inherits_what_it_omits")]
+    #[test_case("small", Some(8_192), Some(Tier::Weak) ; "exact_entry_overrides_field_by_field")]
+    #[test_case("never-declared", Some(229_376), Some(Tier::Weak) ; "discovered_model_gets_defaults")]
+    fn model_defaults_apply_unless_an_exact_entry_overrides(
+        model_id: &str,
+        window: Option<u32>,
+        tier: Option<Tier>,
+    ) {
+        let parsed: ProvidersConfig = toml::from_str(DEFAULTS_TOML).unwrap();
+        let settings = parsed.get("local").unwrap().model_settings(model_id);
+
+        assert_eq!(settings.context_window, window, "{ABSENT_MEANS_INHERIT}");
+        assert_eq!(settings.tier, tier, "{ABSENT_MEANS_INHERIT}");
+        assert_eq!(settings.max_output_tokens, Some(32_768));
+    }
+
+    /// `models` and `model_defaults` both flatten, and caudra rewrites this
+    /// file on upsert, so a shape that parses but cannot be re-serialized would
+    /// corrupt the user's config on the next write.
+    #[test]
+    fn defaults_and_models_survive_a_serialize_roundtrip() {
+        let parsed: ProvidersConfig = toml::from_str(DEFAULTS_TOML).unwrap();
+        let rewritten = toml::to_string_pretty(&parsed).unwrap();
+        let reparsed: ProvidersConfig = toml::from_str(&rewritten).unwrap();
+
+        let settings = reparsed.get("local").unwrap().model_settings("small");
+        assert_eq!(settings.context_window, Some(8_192));
+        assert_eq!(settings.tier, Some(Tier::Weak), "{ABSENT_MEANS_INHERIT}");
+        assert_eq!(settings.max_output_tokens, Some(32_768));
+    }
+
+    /// An empty list is a real declaration ("this endpoint takes no reasoning
+    /// controls"), not an absent one, so it must survive the merge.
+    #[test]
+    fn empty_default_reasoning_options_are_declared_not_missing() {
+        let parsed: ProvidersConfig = toml::from_str(DEFAULTS_TOML).unwrap();
+        let settings = parsed
+            .get("local")
+            .unwrap()
+            .model_settings("never-declared");
+
+        assert!(settings.reasoning_options.expect(DECLARED_WINS).is_empty());
+    }
+
     #[test]
     fn model_def_reads_declared_reasoning_options() {
         let parsed: ProvidersConfig = toml::from_str(DECLARED_LEVELS_TOML).unwrap();
         let model = &parsed.get("local").unwrap().models[0];
 
         assert_eq!(model.id, "qwen3.8-27b");
-        assert_eq!(model.context_window, Some(229_376));
-        assert_eq!(model.max_output_tokens, Some(32_768));
-        let options = model.reasoning_options.clone().expect(DECLARED_WINS);
+        assert_eq!(model.fields.context_window, Some(229_376));
+        assert_eq!(model.fields.max_output_tokens, Some(32_768));
+        let options = model.fields.reasoning_options.clone().expect(DECLARED_WINS);
         assert_eq!(
             options.efforts(),
             ["none", "low", "medium", "xhigh"],
@@ -498,9 +622,9 @@ tier = "mediums"
     }
 
     #[test]
-    fn model_def_tier_defaults_to_medium() {
+    fn model_def_without_tier_inherits_rather_than_claiming_medium() {
         let m: ModelDef = toml::from_str(r#"id = "x""#).unwrap();
-        assert_eq!(m.tier, Tier::Medium);
+        assert_eq!(m.fields.tier, None, "{ABSENT_MEANS_INHERIT}");
     }
 
     #[test_case("weak", Tier::Weak ; "weak")]
@@ -513,7 +637,7 @@ tier = "{input}"
 "#
         );
         let m: ModelDef = toml::from_str(&toml).unwrap();
-        assert_eq!(m.tier, expected);
+        assert_eq!(m.fields.tier, Some(expected));
     }
 
     #[test]
