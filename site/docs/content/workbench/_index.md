@@ -42,6 +42,7 @@ The workbench takes the mouse the way an IDE does.
 | Click a tab | Switch to it |
 | Click the `×` on a tab | Close it |
 | Middle-click a tab | Close it |
+| Click the `⋮` on a row or a tab | Open its [context menu](#context-menu) |
 | Right-click a row or a tab | Open its [context menu](#context-menu) |
 | Click `FILES`, `GIT`, or `FIND` | Switch the sidebar view |
 | Click `FOLD` | Fold the explorer back to its top level |
@@ -67,7 +68,9 @@ A pane whose content runs past its bottom gives up its last column to a scrollba
 
 ## Context menu
 
-Right-click a row in the explorer or a tab in the strip to open a menu for it. `Ctrl+X .` opens the same menu over whatever the cursor is already on. Arrow keys walk it, `Home` and `End` jump to either end, `Enter` takes the highlighted item, and `Esc` closes it. A press off the panel closes the menu and is swallowed, so the press that dismisses a menu does not also act on what is under it.
+Every explorer row and every tab carries a `⋮` at its left. Click it to open a menu for that row or tab. The right button does the same from anywhere on the row or the tab, and `Ctrl+X .` opens the menu over whatever the cursor is already on. Opening a tab menu leaves the file on screen alone.
+
+Arrow keys walk the menu, `Home` and `End` jump to either end, `Enter` takes the highlighted item, and `Esc` closes it. A press off the panel closes the menu and is swallowed, so the press that dismisses a menu does not also act on what is under it.
 
 An explorer row offers Open, New File, New Folder, Copy Path, Copy Relative Path, Send to Composer, Rename, and Delete. A folder has no Open, because pressing one expands it. Something new lands inside the folder you asked from, and beside the file you asked from.
 
@@ -85,7 +88,7 @@ Arrow keys walk the tree. `Right` and `Enter` expand a directory or open a file,
 
 A rule runs down each level of indent, so a name three folders deep says which folder it belongs to. Folders holding nothing but one folder share a row, the way `src/main/java` reads as one step rather than three. Opening that row opens the last folder on it.
 
-Rows carry two marks. On the right, the source control letter for that path: `M` modified, `A` added, `D` deleted, `U` untracked, `!` conflicted. The name takes the colour of that letter, and a folder you have closed carries the loudest mark under it, so a conflict is visible before you open anything. Files that changed on disk while the workbench was open are marked as well, which in practice means the ones Caudra wrote.
+Rows carry three marks. On the left, a `⋮` that opens the [context menu](#context-menu) for that path. It sits ahead of the indent rules, so the marks line up in one column however deep the tree runs. On the right, the source control letter for that path: `M` modified, `A` added, `D` deleted, `U` untracked, `!` conflicted. The name takes the colour of that letter, and a folder you have closed carries the loudest mark under it, so a conflict is visible before you open anything. Files that changed on disk while the workbench was open are marked as well, which in practice means the ones Caudra wrote.
 
 Paths the repository ignores are listed and drawn back, so a build directory is somewhere you can still look without it competing with your source.
 
@@ -93,7 +96,7 @@ Paths the repository ignores are listed and drawn back, so a build directory is 
 
 ## Editor
 
-Tabs sit above the buffer, each with a `×` to close it. One click in the explorer puts a file in a preview tab, whose title is italic. The next preview takes that tab over, so reading your way through a tree leaves one tab behind rather than twenty. Clicking the file again, opening it with `Enter`, or typing in it keeps the tab for good. `Ctrl+PageUp` and `Ctrl+PageDown` cycle them, `Ctrl+X k` closes the active one. When more tabs are open than the strip can hold, it scrolls to keep the active one in view and marks the end it cut off with `‹` or `›`. A tab with unsaved changes asks before it goes, whichever way you close it: **Save** writes the file and closes, **Don't Save** throws the edits away, **Cancel** keeps the tab. `Left` and `Right` walk the answers, `Enter` takes the highlighted one, `Esc` cancels, and `S`, `D`, and `C` pick one outright. A save that fails leaves the tab open with the reason in the status row.
+Tabs sit above the buffer, each with a `⋮` to open its [context menu](#context-menu) and a `×` to close it. One click in the explorer puts a file in a preview tab, whose title is italic. The next preview takes that tab over, so reading your way through a tree leaves one tab behind rather than twenty. Clicking the file again, opening it with `Enter`, or typing in it keeps the tab for good. `Ctrl+PageUp` and `Ctrl+PageDown` cycle them, `Ctrl+X k` closes the active one. When more tabs are open than the strip can hold, it scrolls to keep the active one in view and marks the end it cut off with `‹` or `›`. A tab with unsaved changes asks before it goes, whichever way you close it: **Save** writes the file and closes, **Don't Save** throws the edits away, **Cancel** keeps the tab. `Left` and `Right` walk the answers, `Enter` takes the highlighted one, `Esc` cancels, and `S`, `D`, and `C` pick one outright. A save that fails leaves the tab open with the reason in the status row.
 
 Editing is ordinary: type to insert, `Enter` and `Backspace` do what they look like, `Shift` with a motion selects, `Ctrl+A` selects the buffer. `Ctrl+C` copies and `Shift+Delete` cuts to the system clipboard, `Ctrl+V` puts back what the workbench last took, and a terminal paste inserts at the cursor. `Ctrl+K` deletes to the end of the line. `Ctrl+Z` and `Ctrl+Y` undo and redo, grouped so a run of typing undoes in one press.
 
