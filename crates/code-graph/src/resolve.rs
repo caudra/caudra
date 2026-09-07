@@ -123,6 +123,36 @@ impl Graph {
         self.col_indices.len()
     }
 
+    /// Out-edge targets per source, built by transposing the in-edge CSR.
+    ///
+    /// The CSR is keyed by target because that is what the power iteration wants. Answering "what
+    /// does this symbol call" is the other direction, and it is a one-pass transpose rather than a
+    /// second stored layout: keeping both in the graph would double the memory every ranking run
+    /// pays for, to serve a question only the reference tools ask.
+    ///
+    /// Each row is ascending, so a caller reading it produces the same order on every run.
+    #[must_use]
+    pub fn out_adjacency(&self) -> Vec<Vec<NodeId>> {
+        let mut out: Vec<Vec<NodeId>> = vec![Vec::new(); self.node_count()];
+        for target in 0..self.node_count() {
+            let Ok(target_id) = NodeId::try_from(target) else {
+                continue;
+            };
+            for (source, _) in self.in_edges(target_id) {
+                if let Some(row) = out.get_mut(source as usize) {
+                    row.push(target_id);
+                }
+            }
+        }
+        // The CSR is ascending by target within a row, so pushes arrive ascending per source
+        // already; the sort is cheap insurance against that layout changing.
+        for row in &mut out {
+            row.sort_unstable();
+            row.dedup();
+        }
+        out
+    }
+
     /// The in-edges of one target: `(source, weight)` pairs.
     pub fn in_edges(&self, target: NodeId) -> impl Iterator<Item = (NodeId, f64)> + '_ {
         let index = target as usize;

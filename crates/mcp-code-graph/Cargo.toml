@@ -1,0 +1,35 @@
+[package]
+name = "workcell-mcp-code-graph"
+description = "Repository-scale symbol map, retrieval, and impact tools over a confined source tree"
+readme = "README.md"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[features]
+default = ["mcp"]
+mcp = ["dep:rmcp"]
+# Repository history signals. Optional for the same reason they are optional in the engine: the map
+# is complete without them.
+git = ["workcell-code-graph/git"]
+
+[dependencies]
+rmcp = { workspace = true, optional = true }
+serde.workspace = true
+thiserror.workspace = true
+serde_json.workspace = true
+tokio-util.workspace = true
+workcell-code-graph.workspace = true
+# The confined resolver. This crate never opens a path itself; every read goes through the
+# filesystem group so there is exactly one confinement implementation in the process.
+workcell-mcp-files = { workspace = true, default-features = false }
+workcell-tool-contract.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

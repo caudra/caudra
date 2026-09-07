@@ -5603,6 +5603,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "workcell-mcp-code-graph"
+version = "0.1.0"
+dependencies = [
+ "rmcp",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "workcell-code-graph",
+ "workcell-mcp-files",
+ "workcell-tool-contract",
+]
+
+[[package]]
 name = "workcell-mcp-files"
 version = "0.1.0"
 dependencies = [

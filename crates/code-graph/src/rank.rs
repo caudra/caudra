@@ -248,6 +248,26 @@ fn block_sum_map(left: &[f64], right: &[f64], mut combine: impl FnMut(f64, f64) 
 /// macro-generated call sites contribute no edge and cannot appear here.
 #[must_use]
 pub fn reaching(graph: &Graph, seeds: &[NodeId], hops: usize, limit: usize) -> Vec<NodeId> {
+    let mut reached: Vec<NodeId> = reaching_hops(graph, seeds, hops, limit)
+        .into_iter()
+        .map(|(node, _)| node)
+        .collect();
+    reached.sort_unstable();
+    reached
+}
+
+/// [`reaching`], keeping how far each symbol sits from the seed.
+///
+/// Ordered nearest first, then by ascending id. Distance is the shortest path found by this
+/// breadth-first walk, so a direct caller is always reported at one hop even when a longer path to
+/// it also exists. Reporting the longer one would overstate how far a change travels.
+#[must_use]
+pub fn reaching_hops(
+    graph: &Graph,
+    seeds: &[NodeId],
+    hops: usize,
+    limit: usize,
+) -> Vec<(NodeId, usize)> {
     let nodes = graph.node_count();
     if nodes == 0 || hops == 0 {
         return Vec::new();
@@ -262,20 +282,22 @@ pub fn reaching(graph: &Graph, seeds: &[NodeId], hops: usize, limit: usize) -> V
             frontier.push(seed);
         }
     }
-    let mut reached: Vec<NodeId> = Vec::new();
+    let mut reached: Vec<(NodeId, usize)> = Vec::new();
 
-    for _ in 0..hops {
+    for distance in 1..=hops {
         let mut next = Vec::new();
+        // Sorted so the order rows are discovered in, and therefore which survive the limit, does
+        // not depend on the order the seeds happened to arrive in.
+        frontier.sort_unstable();
         for &target in &frontier {
             for (source, _) in graph.in_edges(target) {
                 if let Some(slot) = seen.get_mut(source as usize)
                     && !*slot
                 {
                     *slot = true;
-                    reached.push(source);
+                    reached.push((source, distance));
                     next.push(source);
                     if reached.len() >= limit {
-                        reached.sort_unstable();
                         return reached;
                     }
                 }
@@ -286,7 +308,6 @@ pub fn reaching(graph: &Graph, seeds: &[NodeId], hops: usize, limit: usize) -> V
         }
         frontier = next;
     }
-    reached.sort_unstable();
     reached
 }
 
@@ -298,6 +319,73 @@ mod tests {
         model::Facts,
         resolve::resolve,
     };
+
+    #[test]
+    fn reaching_reports_the_shortest_distance_not_the_longest() {
+        // `entry` reaches `leaf` directly and also through `middle`. Reporting two hops would
+        // overstate how far a change to `leaf` travels before it is someone's direct problem.
+        let (facts, graph) = build(&[(
+            "src/a.rs",
+            "fn leaf() {}\nfn middle() { leaf(); }\nfn entry() { leaf(); middle(); }",
+        )]);
+        let node = |name: &str| {
+            facts
+                .definitions
+                .iter()
+                .find(|definition| definition.name == name)
+                .expect("defined")
+                .node
+        };
+
+        let reached = reaching_hops(&graph, &[node("leaf")], 4, 100);
+        let hops: Vec<_> = reached
+            .iter()
+            .map(|&(id, distance)| {
+                (
+                    facts.definition(id).map(|d| d.name.as_str()).unwrap_or(""),
+                    distance,
+                )
+            })
+            .collect();
+        assert!(hops.contains(&("middle", 1)));
+        assert!(
+            hops.contains(&("entry", 1)),
+            "entry calls leaf directly, so it is one hop: {hops:?}"
+        );
+    }
+
+    #[test]
+    fn out_adjacency_is_the_transpose_of_the_in_edge_csr() {
+        let (facts, graph) = build(&[(
+            "src/a.rs",
+            "fn leaf() {}\nfn other() {}\nfn caller() { leaf(); other(); }",
+        )]);
+        let node = |name: &str| {
+            facts
+                .definitions
+                .iter()
+                .find(|definition| definition.name == name)
+                .expect("defined")
+                .node
+        };
+
+        let out = graph.out_adjacency();
+        let mut expected = vec![node("leaf"), node("other")];
+        expected.sort_unstable();
+        assert_eq!(out[node("caller") as usize], expected);
+        assert!(
+            out[node("leaf") as usize].is_empty(),
+            "a leaf calls nothing"
+        );
+
+        // Every out-edge must correspond to an in-edge and vice versa, or the two views disagree
+        // about the same graph.
+        let mut from_out = 0;
+        for row in &out {
+            from_out += row.len();
+        }
+        assert_eq!(from_out, graph.edge_count());
+    }
 
     #[test]
     fn reassociating_float_operations_are_absent_from_every_ranking_module() {

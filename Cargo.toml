@@ -14,6 +14,7 @@ members = [
   "crates/code-graph",
   "crates/environment",
   "crates/mcp-code",
+  "crates/mcp-code-graph",
   "crates/mcp-files",
   "crates/mcp-shell",
   "crates/mcp-web",
@@ -125,6 +126,7 @@ workcell-mcp-files = { path = "crates/mcp-files", default-features = false }
 workcell-mcp-shell = { path = "crates/mcp-shell", default-features = false }
 workcell-mcp-web = { path = "crates/mcp-web", default-features = false }
 workcell-code-graph = { path = "crates/code-graph", default-features = false }
+workcell-mcp-code-graph = { path = "crates/mcp-code-graph", default-features = false }
 workcell-source-languages = { path = "crates/source-languages" }
 workcell-monty-worker = { path = "crates/monty-worker" }
 
