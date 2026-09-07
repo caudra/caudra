@@ -185,7 +185,7 @@ impl<T: PickerItem> State<T> {
             self.scroll_offset = 0;
         } else {
             self.selected = self.selected.min(self.filtered.len() - 1);
-            self.scroll_offset = self.scroll_offset.min(self.selected);
+            self.ensure_visible();
         }
     }
 
@@ -724,8 +724,11 @@ fn render_ready<T: PickerItem>(
     let viewport_h = inner
         .height
         .saturating_sub(error_rows + info_rows + SEARCH_ROW + footer_rows);
-    s.viewport_height = viewport_h as usize;
-    s.ensure_visible();
+    let viewport_height = viewport_h as usize;
+    if s.viewport_height != viewport_height {
+        s.viewport_height = viewport_height;
+        s.ensure_visible();
+    }
 
     let mut constraints: Vec<Constraint> = Vec::with_capacity(
         3 + footer.is_some() as usize
@@ -1367,6 +1370,35 @@ mod tests {
         assert!(picker.is_open());
     }
 
+    #[test]
+    fn wheel_scroll_survives_repaint_after_hovering_item() {
+        let items: Vec<Entry> = (0..30).map(|i| Entry::new(&format!("Item {i}"))).collect();
+        let mut picker = ListPicker::new();
+        picker.open(items, " Test ");
+        render(&mut picker);
+
+        let hovered = ready_state(&picker).row_hits[5];
+        picker.handle_mouse(mouse(MouseEventKind::Moved, hovered.area));
+        picker.scroll(-100);
+        let bottom_offset = ready_state(&picker).scroll_offset;
+        render(&mut picker);
+
+        let state = ready_state(&picker);
+        assert_eq!(state.scroll_offset, bottom_offset);
+        assert_eq!(state.selected, hovered.filtered_index);
+        assert_eq!(state.row_hits.last().map(|hit| hit.item_index), Some(29));
+
+        let hovered = state.row_hits[state.row_hits.len() / 2];
+        picker.handle_mouse(mouse(MouseEventKind::Moved, hovered.area));
+        picker.scroll(100);
+        render(&mut picker);
+
+        let state = ready_state(&picker);
+        assert_eq!(state.scroll_offset, 0);
+        assert_eq!(state.selected, hovered.filtered_index);
+        assert_eq!(state.row_hits.first().map(|hit| hit.item_index), Some(0));
+    }
+
     #[test_case(key(KeyCode::Esc) ; "esc_returns_close")]
     #[test_case(kb::QUIT.to_key_event() ; "ctrl_c_returns_close")]
     fn cancel_returns_close(cancel_key: KeyEvent) {
@@ -1629,7 +1661,7 @@ mod tests {
     }
 
     #[test]
-    fn ensure_visible_clamps_scroll_offset_after_filter() {
+    fn filtering_clamps_scroll_offset_to_the_selection() {
         let mut p = ListPicker::new();
         let items: Vec<Entry> = (0..20).map(|i| Entry::new(&format!("Item {i}"))).collect();
         p.open(items, " Test ");
@@ -1640,7 +1672,6 @@ mod tests {
 
         s.search.insert_text("0");
         s.update_search_and_clamp();
-        s.ensure_visible();
         assert_eq!(s.scroll_offset, 0);
     }
 
