@@ -21,6 +21,7 @@
 pub mod extract;
 pub mod ingest;
 pub mod model;
+pub mod rank;
 pub mod resolve;
 
 pub use extract::{ExtractLimits, FileFacts};
@@ -29,5 +30,6 @@ pub use model::{
     ByteSpan, Definition, Facts, FileId, LineSpan, Metrics, NodeId, Reference, SkipReason,
     SkippedFile, SourceFile,
 };
+pub use rank::{Ranking, Teleport, pagerank, reaching};
 pub use resolve::{Edge, Graph, ResolutionDiagnostics, ResolutionTier, resolve};
 pub use workcell_source_languages::{Language, LanguageFamily, ReferenceKind, SymbolKind};
