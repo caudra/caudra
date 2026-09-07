@@ -5533,7 +5533,9 @@ name = "workcell-code-graph"
 version = "0.1.0"
 dependencies = [
  "gix",
+ "lru",
  "proptest",
+ "sha2",
  "tempfile",
  "tree-sitter",
  "workcell-source-languages",

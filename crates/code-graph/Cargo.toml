@@ -16,6 +16,8 @@ git = ["dep:gix"]
 
 [dependencies]
 gix = { workspace = true, optional = true }
+lru.workspace = true
+sha2.workspace = true
 tree-sitter.workspace = true
 workcell-source-languages.workspace = true
 

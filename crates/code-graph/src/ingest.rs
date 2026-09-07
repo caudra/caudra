@@ -12,9 +12,12 @@
 //! Neither rule is expensive, and both are invisible until someone runs the same map on two
 //! machines and diffs it.
 
+use std::sync::Arc;
+
 use workcell_source_languages::Language;
 
 use crate::{
+    cache::FactsCache,
     extract::{ExtractLimits, FileFacts, extract},
     model::{Definition, Facts, FileId, NodeId, Reference, SkipReason, SkippedFile, SourceFile},
 };
@@ -79,7 +82,45 @@ pub struct Ingested {
 /// Inputs may arrive in any order; this sorts them. Duplicated paths are resolved by keeping the
 /// first after sorting, so a caller that offers the same path twice cannot mint two file ids.
 #[must_use]
-pub fn ingest(mut inputs: Vec<SourceInput>, limits: IngestLimits) -> Ingested {
+pub fn ingest(inputs: Vec<SourceInput>, limits: IngestLimits) -> Ingested {
+    ingest_with(
+        inputs,
+        limits,
+        &mut |_path, source, language, extract_limits| {
+            extract(source, language, extract_limits).map(Arc::new)
+        },
+    )
+}
+
+/// [`ingest`], reusing extraction results already retained for unchanged content.
+///
+/// Identical output to [`ingest`] for identical content. The cache is a cost decision, never a
+/// correctness one, and `cache::tests::warm_facts_are_identical_to_cold_facts` is the gate that
+/// keeps it that way.
+#[must_use]
+pub fn ingest_cached(
+    inputs: Vec<SourceInput>,
+    limits: IngestLimits,
+    cache: &mut FactsCache,
+) -> Ingested {
+    ingest_with(
+        inputs,
+        limits,
+        &mut |path, source, language, extract_limits| {
+            cache.facts(path, source, language, extract_limits)
+        },
+    )
+}
+
+/// The one ingest body. Cached and uncached runs differ only in this callback, so no stage after
+/// extraction can behave differently depending on where the facts came from.
+type Extractor<'a> = dyn FnMut(&str, &str, Language, ExtractLimits) -> Option<Arc<FileFacts>> + 'a;
+
+fn ingest_with(
+    mut inputs: Vec<SourceInput>,
+    limits: IngestLimits,
+    extractor: &mut Extractor<'_>,
+) -> Ingested {
     inputs.sort_by(|left, right| left.path.cmp(&right.path));
     inputs.dedup_by(|left, right| left.path == right.path);
 
@@ -92,7 +133,7 @@ pub fn ingest(mut inputs: Vec<SourceInput>, limits: IngestLimits) -> Ingested {
     let mut facts = Facts::default();
     // Per-file extraction results, retained only until ids are assigned. The tree itself is already
     // gone: `extract` drops it before returning.
-    let mut per_file: Vec<(FileId, FileFacts)> = Vec::with_capacity(inputs.len());
+    let mut per_file: Vec<(FileId, Arc<FileFacts>)> = Vec::with_capacity(inputs.len());
 
     for input in inputs {
         let path = input.path;
@@ -112,7 +153,7 @@ pub fn ingest(mut inputs: Vec<SourceInput>, limits: IngestLimits) -> Ingested {
             });
             continue;
         }
-        let Some(file_facts) = extract(&input.source, language, limits.extract) else {
+        let Some(file_facts) = extractor(&path, &input.source, language, limits.extract) else {
             facts.skipped.push(SkippedFile {
                 extension: extension_of(&path),
                 path,
@@ -214,6 +255,45 @@ mod tests {
             path: path.to_owned(),
             source: source.to_owned(),
         }
+    }
+
+    #[test]
+    fn a_cached_pipeline_is_byte_identical_to_a_cold_one_before_and_after_a_mutation() {
+        // The end-to-end half of the warm==cold gate. `cache::tests` proves one file's facts
+        // survive a round trip; this proves the assembled table does, including the ids, which are
+        // assigned after extraction and are exactly what a stale entry would corrupt silently.
+        let before = vec![
+            input("src/a.rs", "fn alpha() { beta(); }"),
+            input("src/b.rs", "fn beta() { gamma(); }"),
+            input("src/c.rs", "fn gamma() {}"),
+        ];
+        let after = vec![
+            input("src/a.rs", "fn alpha() { beta(); }"),
+            input("src/b.rs", "fn beta() { gamma(); delta(); }\nfn delta() {}"),
+            input("src/c.rs", "fn gamma() {}"),
+        ];
+
+        let mut cache = FactsCache::new(crate::cache::CacheLimits::default());
+        let warm_before = ingest_cached(before.clone(), IngestLimits::default(), &mut cache);
+        let warm_after = ingest_cached(after.clone(), IngestLimits::default(), &mut cache);
+
+        let cold_before = ingest(before, IngestLimits::default());
+        let cold_after = ingest(after, IngestLimits::default());
+
+        assert_eq!(
+            format!("{:?}", cold_before.facts),
+            format!("{:?}", warm_before.facts)
+        );
+        assert_eq!(
+            format!("{:?}", cold_after.facts),
+            format!("{:?}", warm_after.facts),
+            "a mutated file must not be served from the cache"
+        );
+        assert_eq!(
+            cache.stats().hits,
+            2,
+            "the two unchanged files must have hit, or this test proves nothing"
+        );
     }
 
     #[test]
