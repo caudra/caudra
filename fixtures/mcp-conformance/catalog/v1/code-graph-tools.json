@@ -13,14 +13,14 @@
       {
         "name": "code_map",
         "title": "Rank symbols in a tree",
-        "description": "Rank every symbol in a source tree by importance and return the top ones. Start here when you do not know a codebase.\n\n- Importance is personalized PageRank over a call graph recovered from source text by name.\n- Rows carry the defining file and line span, plus in/out reference counts.\n- `path` scopes the map to a subdirectory; absent means the whole configured root.\n- Counts are FLOORS. Dynamic dispatch, callbacks, function pointers, trait objects and macro-generated call sites contribute no edge, so a count of 0 means none was found, never that none exists.\n- Crawling, parsing, ranking and result size are bounded by host-only policy, and every bound that fires is named in the result.",
+        "description": "Rank every symbol in a source tree by importance and return the top ones. Start here when you do not know a codebase.\n\n- Importance is personalized PageRank over a call graph recovered from source text by name.\n- Rows carry the defining file and line span, plus in/out reference counts.\n- `path` scopes the map to a subdirectory; absent, or empty, means the whole configured root.\n- Counts are FLOORS. Dynamic dispatch, callbacks, function pointers, trait objects and macro-generated call sites contribute no edge, so a count of 0 means none was found, never that none exists.\n- Crawling, parsing, ranking and result size are bounded by host-only policy, and every bound that fires is named in the result.",
         "inputSchema": {
           "$schema": "http://json-schema.org/draft-07/schema#",
           "type": "object",
           "properties": {
             "path": {
               "type": "string",
-              "description": "Root-relative subdirectory to scope the map to. Absent means the whole configured root."
+              "description": "Root-relative subdirectory to scope the map to. Absent means the whole configured root, and an empty string is the same as absent."
             },
             "limit": {
               "type": "integer",
@@ -56,7 +56,7 @@
             },
             "path": {
               "type": "string",
-              "description": "Root-relative subdirectory to scope the map to. Absent means the whole configured root."
+              "description": "Root-relative subdirectory to scope the map to. Absent means the whole configured root, and an empty string is the same as absent."
             },
             "limit": {
               "type": "integer",
@@ -104,7 +104,7 @@
             },
             "path": {
               "type": "string",
-              "description": "Root-relative subdirectory to scope the map to. Absent means the whole configured root."
+              "description": "Root-relative subdirectory to scope the map to. Absent means the whole configured root, and an empty string is the same as absent."
             },
             "limit": {
               "type": "integer",
@@ -150,7 +150,7 @@
             },
             "path": {
               "type": "string",
-              "description": "Root-relative subdirectory to scope the map to. Absent means the whole configured root."
+              "description": "Root-relative subdirectory to scope the map to. Absent means the whole configured root, and an empty string is the same as absent."
             },
             "limit": {
               "type": "integer",
@@ -189,7 +189,7 @@
             },
             "path": {
               "type": "string",
-              "description": "Root-relative subdirectory to scope the map to. Absent means the whole configured root."
+              "description": "Root-relative subdirectory to scope the map to. Absent means the whole configured root, and an empty string is the same as absent."
             }
           },
           "required": [

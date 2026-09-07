@@ -713,7 +713,7 @@ policy.
 
 `file_read` reads a UTF-8 text file window or lists a directory.
 
-- `filePath` is required and must not be empty. Use `.` to address the configured root directory.
+- `filePath` is required. An empty value is treated as `.` and reads the configured root directory.
 - `offset` is an optional 1-indexed starting line. `limit` controls the maximum number of returned
   lines and defaults to 2,000.
 - File output prefixes each line with `<line>: ` so later calls can request precise windows. Lines over
@@ -730,8 +730,8 @@ large file.
 `file_glob` finds files by path pattern without invoking a shell.
 
 - `pattern` is required and supports `*`, `**`, `?`, and brace alternatives such as `*.{ts,tsx}`.
-- `path` optionally narrows traversal to a directory under the configured root; omission searches from
-  the root.
+- `path` optionally narrows traversal to a directory under the configured root; omission, or an empty
+  value, searches from the root.
 - Matches are returned in deterministic order with relative paths, byte sizes, and line counts for
   bounded text files.
 - Pattern size, brace depth, generated alternatives, matching work, traversal entries, and result count
@@ -748,7 +748,8 @@ large file.
   character classes, anchors, and repetition are supported; look-around and backreferences are
   rejected.
 - `path` optionally selects a file or directory. `include` optionally filters files with a glob such as
-  `*.rs` or `*.{ts,tsx}`.
+  `*.rs` or `*.{ts,tsx}`. An empty `path` searches from the root and an empty `include` is ignored,
+  because absence already means both.
 - Binary files, symlinks, and the skipped build-output directories listed above are ignored during
   broad searches.
 - Regex length, file size, traversal work, match count, line length, and total output are bounded.
@@ -913,6 +914,7 @@ through the same confined resolver the filesystem tools use and never opens a pa
   and marks itself ambiguous instead of silently picking one.
 - `confidence` on `code_context` is derived from how far the top result separates from the rest. It
   measures separation, never correctness, and a single result is always low.
+- `path` scopes any of them to a subdirectory. Absent, or empty, means the whole configured root.
 - Crawling, parsing, ranking, extraction worker count, and result size are bounded by host-only
   policy. A bound that fires is named in the result. Results are fitted to a 64,000-byte envelope by
   binary search over retained rows, measured on the serialized envelope rather than estimated.

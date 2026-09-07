@@ -13,6 +13,10 @@ const CASES: &[&str] = &[
     "read-file.json",
     "read-directory.json",
     "glob.json",
+    // The same case with `path` spelled as the empty string. Committed because the corpus is where
+    // this project records behavioural contracts, and this one had already drifted from the tool
+    // description once.
+    "glob-empty-path.json",
     "grep.json",
     "glob-truncated.json",
     "grep-truncated.json",

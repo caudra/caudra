@@ -789,8 +789,13 @@ fn nonempty(value: &str, name: &str) -> Result<(), FilesystemError> {
     }
 }
 
-fn validate_read(input: FileReadInput) -> Result<FileReadInput, FilesystemError> {
-    nonempty(&input.file_path, "filePath")?;
+fn validate_read(mut input: FileReadInput) -> Result<FileReadInput, FilesystemError> {
+    // "An empty filePath is treated as `.` and reads the file root directory." The description has
+    // always said so; rejecting it instead cost a caller a turn for believing it. `filePath` is
+    // required, so this maps onto the root rather than onto absent.
+    if input.file_path.is_empty() {
+        input.file_path = ".".to_owned();
+    }
     if input.offset == Some(0) {
         return Err(FilesystemError::message(
             "Invalid arguments: offset must be at least 1",
@@ -810,27 +815,26 @@ fn validate_read(input: FileReadInput) -> Result<FileReadInput, FilesystemError>
     Ok(input)
 }
 
-fn validate_glob(input: FileGlobInput) -> Result<FileGlobInput, FilesystemError> {
+fn validate_glob(mut input: FileGlobInput) -> Result<FileGlobInput, FilesystemError> {
+    // `pattern` is required and has no default, so an empty one is still a caller error.
     nonempty(&input.pattern, "pattern")?;
+    // "An empty path is treated as `.`." Absent already means the file root, and `.` resolves to
+    // the same directory, so the two spellings are folded into one here.
     if input.path.as_deref() == Some("") {
-        return Err(FilesystemError::message(
-            "Invalid arguments: path must not be empty",
-        ));
+        input.path = None;
     }
     Ok(input)
 }
 
-fn validate_grep(input: FileGrepInput) -> Result<FileGrepInput, FilesystemError> {
+fn validate_grep(mut input: FileGrepInput) -> Result<FileGrepInput, FilesystemError> {
     nonempty(&input.pattern, "pattern")?;
+    // "An empty path is treated as `.`, and an empty include filter is ignored." Ignoring a filter
+    // is exactly what absent means, so both fold onto absent.
     if input.path.as_deref() == Some("") {
-        return Err(FilesystemError::message(
-            "Invalid arguments: path must not be empty",
-        ));
+        input.path = None;
     }
     if input.include.as_deref() == Some("") {
-        return Err(FilesystemError::message(
-            "Invalid arguments: include must not be empty",
-        ));
+        input.include = None;
     }
     Ok(input)
 }

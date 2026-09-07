@@ -114,6 +114,68 @@ async fn code_map_paths_are_root_relative_whether_or_not_the_map_is_scoped() {
     );
 }
 
+/// Models reach for `""` when they mean "no scope", and this group used to answer that with an error
+/// borrowed from `file_glob` — naming a parameter of a tool the caller never invoked. Absent already
+/// means the whole root, so the empty string has one reading and it must be indistinguishable from
+/// it, in the echoed `path` as much as in the ranking.
+#[tokio::test]
+async fn an_empty_path_is_indistinguishable_from_an_absent_one() {
+    let (_directory, group) = group().await;
+
+    let absent = group
+        .code_map(CodeMapInput::default(), None, &token())
+        .await
+        .expect("map without a path");
+    let empty = group
+        .code_map(
+            CodeMapInput {
+                path: Some(String::new()),
+                limit: None,
+            },
+            None,
+            &token(),
+        )
+        .await
+        .expect("map with an empty path");
+    assert_eq!(format!("{empty:?}"), format!("{absent:?}"));
+    assert_eq!(
+        empty.path, ".",
+        "an empty scope echoes the root, not itself"
+    );
+
+    // A second tool, because the normalization is applied per call site and one passing site proves
+    // nothing about the other four.
+    let absent = group
+        .code_refs(
+            CodeRefsInput {
+                symbol: "normalize_sku".to_owned(),
+                direction: Direction::Callers,
+                path: None,
+                limit: None,
+            },
+            None,
+            &token(),
+        )
+        .await
+        .expect("refs without a path")
+        .expect("selector resolves");
+    let empty = group
+        .code_refs(
+            CodeRefsInput {
+                symbol: "normalize_sku".to_owned(),
+                direction: Direction::Callers,
+                path: Some(String::new()),
+                limit: None,
+            },
+            None,
+            &token(),
+        )
+        .await
+        .expect("refs with an empty path")
+        .expect("selector resolves");
+    assert_eq!(format!("{empty:?}"), format!("{absent:?}"));
+}
+
 #[tokio::test]
 async fn code_context_finds_a_symbol_the_task_did_not_spell() {
     let (_directory, group) = group().await;

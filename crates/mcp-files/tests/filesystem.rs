@@ -1234,8 +1234,21 @@ async fn unconfined_native_mode_inspects_and_operates_on_absolute_outside_paths(
         panic!("expected file");
     };
     assert_eq!(text, "secret\n");
+}
 
-    let invalid = files
+/// Every one of these was documented in the tool description and refused by the validator, which is
+/// the worst combination: a caller that reads the contract and obeys it loses a turn. Callers reach
+/// for `""` when they mean "no path", and for these fields the meaning was never in doubt, because
+/// absence already names the root.
+#[tokio::test]
+async fn empty_read_scope_and_filter_values_mean_what_the_descriptions_say_they_mean() {
+    let fixture = fixture();
+    let files = FileToolGroup::new(&fixture.root, true, None)
+        .await
+        .expect("tool group");
+
+    // "An empty filePath is treated as `.` and reads the file root directory."
+    let listing = files
         .file_read(
             FileReadInput {
                 file_path: String::new(),
@@ -1245,9 +1258,75 @@ async fn unconfined_native_mode_inspects_and_operates_on_absolute_outside_paths(
             &token(),
         )
         .await
-        .expect_err("typed validation");
+        .expect("empty filePath reads the root");
+    let FileReadOutput::Directory { entries, .. } = listing else {
+        panic!("expected the root directory listing");
+    };
+    assert_eq!(entries, ["notes.txt"]);
+
+    // "An empty path is treated as `.`." Asserted against the absent spelling rather than against a
+    // hand-written expectation, so the two can never drift apart.
+    let absent = files
+        .file_glob(
+            FileGlobInput {
+                pattern: "**/*.txt".into(),
+                path: None,
+            },
+            &token(),
+        )
+        .await
+        .expect("glob without a path");
+    let empty = files
+        .file_glob(
+            FileGlobInput {
+                pattern: "**/*.txt".into(),
+                path: Some(String::new()),
+            },
+            &token(),
+        )
+        .await
+        .expect("glob with an empty path");
+    assert_eq!(format!("{empty:?}"), format!("{absent:?}"));
+
+    // "An empty path is treated as `.`, and an empty include filter is ignored."
+    let absent = files
+        .file_grep(
+            FileGrepInput {
+                pattern: "alpha".into(),
+                path: None,
+                include: None,
+            },
+            &token(),
+        )
+        .await
+        .expect("grep without a path or include");
+    let empty = files
+        .file_grep(
+            FileGrepInput {
+                pattern: "alpha".into(),
+                path: Some(String::new()),
+                include: Some(String::new()),
+            },
+            &token(),
+        )
+        .await
+        .expect("grep with an empty path and include");
+    assert_eq!(format!("{empty:?}"), format!("{absent:?}"));
+
+    // The boundary this must not cross. A write names a file, not a scope, so there is no default
+    // for an empty path to fold onto and retargeting one at the root would be a silent surprise.
+    let refused = files
+        .file_write(
+            FileWriteInput {
+                file_path: String::new(),
+                content: "x".into(),
+            },
+            &token(),
+        )
+        .await
+        .expect_err("empty filePath is still a caller error for a mutation");
     assert_eq!(
-        invalid.to_string(),
+        refused.to_string(),
         "Invalid arguments: filePath must not be empty"
     );
 }

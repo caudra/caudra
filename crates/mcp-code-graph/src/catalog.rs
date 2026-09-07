@@ -16,7 +16,7 @@ const MAP_DESCRIPTION: &str = r#"Rank every symbol in a source tree by importanc
 
 - Importance is personalized PageRank over a call graph recovered from source text by name.
 - Rows carry the defining file and line span, plus in/out reference counts.
-- `path` scopes the map to a subdirectory; absent means the whole configured root.
+- `path` scopes the map to a subdirectory; absent, or empty, means the whole configured root.
 - Counts are FLOORS. Dynamic dispatch, callbacks, function pointers, trait objects and macro-generated call sites contribute no edge, so a count of 0 means none was found, never that none exists.
 - Crawling, parsing, ranking and result size are bounded by host-only policy, and every bound that fires is named in the result."#;
 
@@ -174,7 +174,7 @@ fn to_mcp_tool(spec: &ToolSpec) -> Tool {
 fn path_property() -> Value {
     json!({
         "type": "string",
-        "description": "Root-relative subdirectory to scope the map to. Absent means the whole configured root."
+        "description": "Root-relative subdirectory to scope the map to. Absent means the whole configured root, and an empty string is the same as absent."
     })
 }
 

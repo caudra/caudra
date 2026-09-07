@@ -1,0 +1,63 @@
+{
+  "fixtureVersion": 1,
+  "caseID": "filesystem.glob.empty-path-is-the-root",
+  "provenance": [
+    "rust/crates/mcp-files/src/group.rs",
+    "rust/crates/mcp-files/tests/conformance_fixtures.rs"
+  ],
+  "tool": "file_glob",
+  "input": {
+    "pattern": "**/*.md",
+    "path": ""
+  },
+  "setup": {
+    "files": [
+      {
+        "path": "docs/guide.md",
+        "asset": "assets/filesystem/guide.md"
+      },
+      {
+        "path": "notes.txt",
+        "asset": "assets/filesystem/notes.txt"
+      }
+    ]
+  },
+  "expected": {
+    "contentText": "docs/guide.md",
+    "structuredContent": {
+      "cwd": "{{ROOT}}",
+      "relativePath": ".",
+      "pattern": "**/*.md",
+      "files": [
+        {
+          "path": "{{ROOT}}/docs/guide.md",
+          "relativePath": "docs/guide.md",
+          "sizeBytes": 8,
+          "lineCount": 2
+        }
+      ],
+      "count": 1,
+      "total": 1,
+      "scanComplete": true,
+      "truncated": false
+    },
+    "postFilesystem": [
+      {
+        "path": "docs/guide.md",
+        "asset": "assets/filesystem/guide.md"
+      },
+      {
+        "path": "notes.txt",
+        "asset": "assets/filesystem/notes.txt"
+      }
+    ]
+  },
+  "normalization": {
+    "replacements": [
+      {
+        "placeholder": "{{ROOT}}",
+        "source": "configured canonical filesystem root"
+      }
+    ]
+  }
+}

@@ -157,7 +157,7 @@ impl CodeGraphToolGroup {
     ) -> Result<CodeMapOutput, CodeGraphError> {
         let limit = self.limits.resolve_limit(input.limit);
         let graph = self
-            .graph_for(input.path.as_deref(), progress, token)
+            .graph_for(scope(input.path.as_deref()), progress, token)
             .await?;
 
         let ordered = graph.ordered();
@@ -169,7 +169,7 @@ impl CodeGraphToolGroup {
             .collect();
 
         let mut output = CodeMapOutput {
-            path: input.path.unwrap_or_else(|| ".".to_owned()),
+            path: scope(input.path.as_deref()).unwrap_or(".").to_owned(),
             shown: symbols.len(),
             truncated: total > symbols.len(),
             symbols,
@@ -194,7 +194,7 @@ impl CodeGraphToolGroup {
         }
         let limit = self.limits.resolve_limit(input.limit);
         let graph = self
-            .graph_for(input.path.as_deref(), progress, token)
+            .graph_for(scope(input.path.as_deref()), progress, token)
             .await?;
 
         let retrieval = graph.retrieve(&input.task, limit);
@@ -206,7 +206,7 @@ impl CodeGraphToolGroup {
 
         let mut output = CodeContextOutput {
             task: input.task,
-            path: input.path.unwrap_or_else(|| ".".to_owned()),
+            path: scope(input.path.as_deref()).unwrap_or(".").to_owned(),
             shape: retrieval.shape.name().to_owned(),
             shape_reason: retrieval.shape.reason().to_owned(),
             confidence: retrieval.confidence.name().to_owned(),
@@ -232,7 +232,7 @@ impl CodeGraphToolGroup {
     ) -> Result<Result<CodeRefsOutput, SelectorRefusal>, CodeGraphError> {
         let limit = self.limits.resolve_limit(input.limit);
         let graph = self
-            .graph_for(input.path.as_deref(), progress, token)
+            .graph_for(scope(input.path.as_deref()), progress, token)
             .await?;
 
         let seeds = match graph.select(&input.symbol, &self.limits) {
@@ -274,7 +274,7 @@ impl CodeGraphToolGroup {
             .unwrap_or(DEFAULT_IMPACT_DEPTH)
             .clamp(1, MAX_IMPACT_DEPTH);
         let graph = self
-            .graph_for(input.path.as_deref(), progress, token)
+            .graph_for(scope(input.path.as_deref()), progress, token)
             .await?;
 
         let seeds = match graph.select(&input.symbol, &self.limits) {
@@ -318,7 +318,7 @@ impl CodeGraphToolGroup {
         token: &CancellationToken,
     ) -> Result<Result<CodeExpandOutput, SelectorRefusal>, CodeGraphError> {
         let graph = self
-            .graph_for(input.path.as_deref(), progress, token)
+            .graph_for(scope(input.path.as_deref()), progress, token)
             .await?;
         let seeds = match graph.select(&input.symbol, &self.limits) {
             Ok(seeds) => seeds,
@@ -417,6 +417,19 @@ impl CodeGraphToolGroup {
         output.estimated_tokens = estimate_tokens(output.model_text().len());
         Ok(Ok(output))
     }
+}
+
+/// Folds an empty `path` onto absent.
+///
+/// Absent already means the whole configured root, so an empty string has exactly one sensible
+/// reading and this is it. Callers reach for `""` when they mean "no scope", and refusing it spends
+/// a turn on a value whose meaning was never in doubt.
+///
+/// Done here rather than left to the filesystem group's own folding so the contract holds for a
+/// native embedder that never goes through an MCP validator, and so it survives any future change to
+/// how the crawl enumerates files.
+fn scope(path: Option<&str>) -> Option<&str> {
+    path.filter(|path| !path.is_empty())
 }
 
 /// Largest index at or below `limit` that is a char boundary.
