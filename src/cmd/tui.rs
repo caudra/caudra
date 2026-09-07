@@ -107,7 +107,6 @@ impl Stack {
     fn timeouts(&self) -> caudra_providers::Timeouts {
         caudra_providers::Timeouts {
             connect: self.config.provider.connect_timeout,
-            low_speed: self.config.provider.low_speed_timeout,
             stream: self.config.provider.stream_timeout,
         }
     }

@@ -55,7 +55,6 @@ pub fn run(
 
     let timeouts = caudra_providers::Timeouts {
         connect: config.provider.connect_timeout,
-        low_speed: config.provider.low_speed_timeout,
         stream: config.provider.stream_timeout,
     };
 

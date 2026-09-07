@@ -45,7 +45,6 @@ pub const DEFAULT_COMPACTION_BUFFER: CompactionBuffer = CompactionBuffer::Percen
 pub const DEFAULT_INPUT_BUDGET_COMPACTION_BUFFER: CompactionBuffer = CompactionBuffer::Percent(10);
 
 pub const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
-pub const DEFAULT_LOW_SPEED_TIMEOUT_SECS: u64 = 120;
 pub const DEFAULT_STREAM_TIMEOUT_SECS: u64 = 300;
 
 pub const DEFAULT_MAX_LOG_BYTES_MB: u64 = 200;
@@ -71,7 +70,6 @@ pub const MIN_MAX_LOG_BYTES_MB: u64 = 1;
 pub const MIN_MAX_LOG_FILES: u32 = 1;
 pub const MIN_INPUT_HISTORY_SIZE: usize = 10;
 pub const MIN_CONNECT_TIMEOUT_SECS: u64 = 1;
-pub const MIN_LOW_SPEED_TIMEOUT_SECS: u64 = 1;
 pub const MIN_STREAM_TIMEOUT_SECS: u64 = 10;
 /// Off by default: writing Caudra plugins is a niche task, and the skill's
 /// entry costs description tokens in every session that never writes one.
@@ -838,7 +836,6 @@ pub struct ProviderFileConfig {
     pub allowed_models: Option<Vec<String>>,
     pub excluded_models: Option<Vec<String>>,
     pub connect_timeout_secs: Option<u64>,
-    pub low_speed_timeout_secs: Option<u64>,
     pub stream_timeout_secs: Option<u64>,
 }
 
@@ -851,7 +848,6 @@ impl ProviderFileConfig {
             allowed_models,
             excluded_models,
             connect_timeout_secs,
-            low_speed_timeout_secs,
             stream_timeout_secs
         );
     }
@@ -1654,14 +1650,9 @@ pub struct ProviderConfig {
              desc = "HTTP connect timeout (seconds)")]
     pub connect_timeout: Duration,
 
-    #[config(key = "low_speed_timeout_secs", ty = "u64", default = DEFAULT_LOW_SPEED_TIMEOUT_SECS,
-             min = MIN_LOW_SPEED_TIMEOUT_SECS, val = "self.low_speed_timeout.as_secs()",
-             desc = "Low speed timeout (seconds with less than 1 byte received)")]
-    pub low_speed_timeout: Duration,
-
     #[config(key = "stream_timeout_secs", ty = "u64", default = DEFAULT_STREAM_TIMEOUT_SECS,
              min = MIN_STREAM_TIMEOUT_SECS, val = "self.stream_timeout.as_secs()",
-             desc = "Streaming response timeout (seconds)")]
+             desc = "Longest the server may send nothing before the request is abandoned (seconds)")]
     pub stream_timeout: Duration,
 }
 
@@ -1673,7 +1664,6 @@ impl Default for ProviderConfig {
             excluded_models: Vec::new(),
             model_policy: ModelPolicy::allow_all(),
             connect_timeout: Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS),
-            low_speed_timeout: Duration::from_secs(DEFAULT_LOW_SPEED_TIMEOUT_SECS),
             stream_timeout: Duration::from_secs(DEFAULT_STREAM_TIMEOUT_SECS),
         }
     }
@@ -1692,10 +1682,6 @@ impl ProviderConfig {
             connect_timeout: Duration::from_secs(
                 f.connect_timeout_secs
                     .unwrap_or(DEFAULT_CONNECT_TIMEOUT_SECS),
-            ),
-            low_speed_timeout: Duration::from_secs(
-                f.low_speed_timeout_secs
-                    .unwrap_or(DEFAULT_LOW_SPEED_TIMEOUT_SECS),
             ),
             stream_timeout: Duration::from_secs(
                 f.stream_timeout_secs.unwrap_or(DEFAULT_STREAM_TIMEOUT_SECS),

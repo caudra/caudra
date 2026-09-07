@@ -153,8 +153,7 @@ How many lines of output an open card shows per tool before it says how many it 
 | `allowed_models` | string[] | `[]` | - | Glob patterns for permitted qualified model specs; empty permits all models |
 | `excluded_models` | string[] | `[]` | - | Glob patterns for excluded qualified model specs; exclusions take precedence |
 | `connect_timeout_secs` | u64 | `10` | 1 | HTTP connect timeout (seconds) |
-| `low_speed_timeout_secs` | u64 | `120` | 1 | Low speed timeout (seconds with less than 1 byte received) |
-| `stream_timeout_secs` | u64 | `300` | 10 | Streaming response timeout (seconds) |
+| `stream_timeout_secs` | u64 | `300` | 10 | Longest the server may send nothing before the request is abandoned (seconds) |
 
 ### `storage`
 

@@ -48,7 +48,6 @@ pub(crate) fn user_agent() -> &'static str {
 pub struct Timeouts {
     pub connect: Duration,
     pub stream: Duration,
-    pub low_speed: Duration,
 }
 
 impl Default for Timeouts {
@@ -56,7 +55,6 @@ impl Default for Timeouts {
         Self {
             connect: Duration::from_secs(10),
             stream: Duration::from_secs(300),
-            low_speed: Duration::from_secs(30),
         }
     }
 }
@@ -189,7 +187,12 @@ fn is_sse_filler(line: &str) -> bool {
 pub(crate) fn http_client(timeouts: Timeouts) -> isahc::HttpClient {
     isahc::HttpClient::builder()
         .connect_timeout(timeouts.connect)
-        .low_speed_timeout(LOW_SPEED_BYTES_PER_SEC, timeouts.low_speed)
+        // A server that accepts a request and then computes in silence is
+        // normal: a cold prefill of a long conversation sends nothing for a
+        // minute or more. `stream` is the one budget for that silence, and the
+        // SSE reader enforces the same figure per payload line, so curl must
+        // not abort earlier on a shorter one of its own.
+        .low_speed_timeout(LOW_SPEED_BYTES_PER_SEC, timeouts.stream)
         // The workspace enables curl's http2 feature for OTLP over gRPC, which
         // would otherwise flip provider streaming to h2 over TLS. Streaming is
         // tuned for HTTP/1.1, so pin it.
