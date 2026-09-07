@@ -63,6 +63,8 @@ use workcell::web::{
 use workcell::{CodeToolGroup, ExecutionEnvironment};
 
 pub const OWNER: &str = "workcell";
+/// Shared with the tests so a wording change cannot silently pass an assertion.
+pub const MISSING_READ_TARGET: &str = "No such file or directory";
 pub const NATIVE_TOOL_NAMES: &[&str] = &[
     "file_read",
     "file_glob",
@@ -983,6 +985,9 @@ impl WorkcellInvocation {
                 prepared
             }
         };
+        if let Some(missing) = missing_read_target(&prepared.intent) {
+            return Err(format!("{MISSING_READ_TARGET}: {missing}"));
+        }
         let intent = prepared.intent.clone();
         *self
             .prepared
@@ -1562,6 +1567,28 @@ async fn confined_traversal_group(
         .await
         .map_err(|error| error.to_string())?;
     Ok((confined, ".".into()))
+}
+
+/// A read of a path that is not there can only fail, so the call is refused here
+/// rather than raised as a permission prompt. Nothing is authorized: the model
+/// gets the same "no such file" it would have got after an approval, without
+/// spending a user interaction on it. Refusing outright rather than allowing
+/// silently also leaves no window for the path to appear between this check and
+/// the read. Writes are exempt, because a write to a missing path creates it,
+/// which is precisely the case worth confirming.
+fn missing_read_target(intent: &PermissionIntent) -> Option<&str> {
+    intent.resources.iter().find_map(|resource| {
+        let reads = matches!(
+            resource.access,
+            Some(PermissionResourceAccess::Read) | Some(PermissionResourceAccess::Search)
+        );
+        let filesystem = matches!(
+            resource.kind,
+            PermissionResourceKind::File | PermissionResourceKind::Directory
+        );
+        (reads && filesystem && !Path::new(&resource.value).exists())
+            .then_some(resource.value.as_str())
+    })
 }
 
 fn file_prepared(
@@ -4523,5 +4550,85 @@ mod tests {
 
         assert!(!done.is_error, "{}", done.output.as_text());
         assert_eq!(std::fs::read_to_string(plan).unwrap(), "approved plan");
+    }
+
+    const MISSING_NAME: &str = "does-not-exist.txt";
+    const PRESENT_NAME: &str = "present.txt";
+
+    fn preflight_error(root: &Path, tool: &str, input: Value) -> Result<(), String> {
+        let (_host, registry) = host_and_registry(root);
+        let ctx = context(root, Arc::clone(&registry), CancelToken::none());
+        let invocation = registry
+            .get(tool)
+            .unwrap_or_else(|| panic!("registered {tool}"))
+            .tool
+            .parse(&input)
+            .expect("valid input");
+        smol::block_on(invocation.preflight(&ctx)).map(|_| ())
+    }
+
+    #[test_case("file_read", json!({"filePath": MISSING_NAME}); "reading a file that is not there")]
+    #[test_case("index", json!({"path": MISSING_NAME}); "indexing a path that is not there")]
+    #[test_case(
+        "file_grep",
+        json!({"pattern": "needle", "path": MISSING_NAME});
+        "searching under a root that is not there"
+    )]
+    #[test_case(
+        "file_glob",
+        json!({"pattern": "*.rs", "path": MISSING_NAME});
+        "globbing under a root that is not there"
+    )]
+    /// The property that matters is that an impossible read never costs a
+    /// prompt, whichever layer refuses it. `index` is already refused inside
+    /// Workcell; the rest reach the check here.
+    fn a_read_of_a_missing_path_fails_instead_of_asking(tool: &str, input: Value) {
+        let root = TempDir::new().expect("tempdir");
+
+        let error = preflight_error(root.path(), tool, input).expect_err("preflight must refuse");
+
+        assert!(
+            error.contains(MISSING_NAME),
+            "the refusal must name the absent path, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn the_missing_read_refusal_comes_from_this_crate() {
+        let root = TempDir::new().expect("tempdir");
+
+        let error = preflight_error(root.path(), "file_read", json!({"filePath": MISSING_NAME}))
+            .expect_err("preflight must refuse");
+
+        assert!(
+            error.contains(MISSING_READ_TARGET),
+            "expected our own refusal, got {error:?}"
+        );
+    }
+
+    /// A write to a path that is not there creates it, which is exactly the call
+    /// worth confirming, so it must still reach the permission prompt.
+    #[test]
+    fn a_write_to_a_missing_path_still_asks() {
+        let root = TempDir::new().expect("tempdir");
+
+        let result = preflight_error(
+            root.path(),
+            "file_write",
+            json!({"filePath": MISSING_NAME, "content": "new"}),
+        );
+
+        assert!(result.is_ok(), "a write must still prepare: {result:?}");
+    }
+
+    #[test_case(PRESENT_NAME; "an existing file still prepares")]
+    #[test_case("."; "an existing directory still prepares")]
+    fn a_read_of_a_present_path_still_asks(path: &str) {
+        let root = TempDir::new().expect("tempdir");
+        std::fs::write(root.path().join(PRESENT_NAME), "body").expect("seed file");
+
+        let result = preflight_error(root.path(), "file_read", json!({"filePath": path}));
+
+        assert!(result.is_ok(), "an existing path must prepare: {result:?}");
     }
 }
