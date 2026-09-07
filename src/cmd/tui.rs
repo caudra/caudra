@@ -438,16 +438,26 @@ fn resolve_sessions(
     })
 }
 
-fn read_initial_prompt(cli_prompt: Option<String>) -> Result<Option<String>> {
-    match cli_prompt {
-        Some(p) => Ok(Some(p)),
-        None if !io::stdin().is_terminal() => {
-            let mut buf = String::new();
-            io::stdin().read_to_string(&mut buf).context("read stdin")?;
-            Ok(Some(buf))
+fn resolve_prompt(flag: Option<String>) -> Result<Option<String>> {
+    let piped = if io::stdin().is_terminal() {
+        None
+    } else {
+        let mut buf = String::new();
+        io::stdin().read_to_string(&mut buf).context("read stdin")?;
+        Some(buf)
+    };
+    Ok(merge_prompt(flag, piped))
+}
+
+fn merge_prompt(flag: Option<String>, piped: Option<String>) -> Option<String> {
+    let merged = match (flag, piped) {
+        (Some(flag), Some(piped)) if !piped.trim().is_empty() => {
+            format!("{}\n\n{}", flag.trim_end(), piped.trim_end())
         }
-        None => Ok(None),
-    }
+        (Some(text), _) | (None, Some(text)) => text,
+        (None, None) => return None,
+    };
+    (!merged.trim().is_empty()).then_some(merged)
 }
 
 pub fn run(mut cli: Cli) -> Result<ExitCode> {
@@ -498,6 +508,11 @@ pub fn run(mut cli: Cli) -> Result<ExitCode> {
         .context("run sdk mode")?;
         return Ok(ExitCode::SUCCESS);
     }
+
+    // Past the SDK branch stdin is no longer a protocol channel, so both
+    // remaining paths can consume it as prompt text.
+    let mut initial_prompt = resolve_prompt(cli.prompt.take())?;
+
     if cli.print {
         let fast = stack.config.always_fast && stack.model.supports_fast();
         let thinking = stack
@@ -509,7 +524,7 @@ pub fn run(mut cli: Cli) -> Result<ExitCode> {
         let timeouts = stack.timeouts();
         crate::print::run(
             &stack.model,
-            cli.initial_prompt,
+            initial_prompt,
             cli.images,
             cli.output_format,
             cli.verbose,
@@ -540,7 +555,6 @@ pub fn run(mut cli: Cli) -> Result<ExitCode> {
     let mut tabs = resolved.tabs;
     let mut focused = resolved.focused;
     let mut warnings = resolved.warnings;
-    let mut initial_prompt = read_initial_prompt(cli.initial_prompt.take())?;
     let mut teardown = Teardown::default();
     let mut herdr_reporter = HerdrReporter::from_env();
     let mut sweeper = RetentionSweeper::spawn(storage.clone(), stack.config.storage.retention);
@@ -690,6 +704,7 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use test_case::test_case;
 
     const TEST_MODEL: &str = "test/model";
     const TEST_CWD: &str = "/tmp";
@@ -699,6 +714,23 @@ mod tests {
     const DUPLICATE_TAB_WARNING: &str = "is duplicated";
     const MISSING_TAB_WARNING: &str = "no longer exists";
     const WRONG_CWD_WARNING: &str = "belongs to";
+
+    #[test_case(Some("fix it"), None, Some("fix it"); "flag_only")]
+    #[test_case(None, Some("piped\n"), Some("piped\n"); "stdin_kept_verbatim")]
+    #[test_case(Some("fix it\n"), Some("error output\n"), Some("fix it\n\nerror output"); "both_joined")]
+    #[test_case(None, None, None; "neither")]
+    #[test_case(Some("   "), None, None; "blank_flag")]
+    #[test_case(None, Some("\n\n"), None; "blank_stdin")]
+    #[test_case(Some("fix it"), Some("  \n"), Some("fix it"); "blank_stdin_ignored")]
+    fn merge_prompt_combines_flag_and_stdin(
+        flag: Option<&str>,
+        piped: Option<&str>,
+        expected: Option<&str>,
+    ) {
+        let merged = merge_prompt(flag.map(String::from), piped.map(String::from));
+
+        assert_eq!(merged.as_deref(), expected);
+    }
 
     fn save_test_session(storage: &StateDir, cwd: &Path) -> CaudraId {
         let mut session = AppSession::new(TEST_MODEL, &cwd.to_string_lossy());

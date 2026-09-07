@@ -1,4 +1,4 @@
-//! Non-interactive (headless) mode: `caudra "prompt" --print`.
+//! Non-interactive (headless) mode: `caudra --print --prompt "..."`.
 //!
 //! Wire format intentionally matches Claude Code so existing scripts work
 //! unchanged. Keep `PrintResult` fields a strict subset of theirs. `StreamJson`
@@ -7,7 +7,6 @@
 //! We adopt new fields when Claude Code adds them but never invent our own.
 //! Check their docs before changing anything here.
 
-use std::io::{self, Read};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -26,11 +25,12 @@ use caudra_providers::{TokenUsage, add_cost};
 use caudra_storage::id::SessionRef;
 use clap::ValueEnum;
 use color_eyre::Result;
-use color_eyre::eyre::{Context, eyre};
+use color_eyre::eyre::eyre;
 use serde::Serialize;
 use serde_json::Value;
 
 const AGENT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const NO_PROMPT: &str = "no prompt: pass --prompt \"<text>\" or pipe text on stdin";
 
 // Fails fast: silently dropping an image the caller explicitly attached
 // would be worse than erroring.
@@ -158,14 +158,7 @@ pub fn run(
     model_policy: Arc<ModelPolicy>,
     plugin_rules: Arc<PluginRuleStore>,
 ) -> Result<()> {
-    let prompt = match prompt_arg {
-        Some(p) => p,
-        None => {
-            let mut buf = String::new();
-            io::stdin().read_to_string(&mut buf).context("read stdin")?;
-            buf
-        }
-    };
+    let prompt = prompt_arg.ok_or_else(|| eyre!(NO_PROMPT))?;
 
     let images = load_images(&image_paths)?;
     let (prompt, goal) = print_goal(prompt)?;

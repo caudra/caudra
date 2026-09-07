@@ -39,6 +39,10 @@ pub struct Cli {
     #[arg(short, long)]
     pub print: bool,
 
+    /// Initial message. Combined with piped stdin when both are present
+    #[arg(long, value_name = "TEXT", allow_hyphen_values = true)]
+    pub prompt: Option<String>,
+
     /// Store session data in a temporary directory removed when Caudra exits
     #[arg(long, global = true)]
     pub ephemeral: bool,
@@ -184,10 +188,6 @@ pub struct Cli {
     pub thinking: Option<String>,
     #[arg(long, hide = true)]
     pub thinking_display: Option<String>,
-
-    /// Initial prompt (reads stdin if piped)
-    #[arg(value_name = "PROMPT")]
-    pub initial_prompt: Option<String>,
 }
 
 impl Cli {
@@ -607,6 +607,42 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn prompt_flag_parses() {
+        let cli = Cli::try_parse_from(["caudra", "--prompt", "hello"]).unwrap();
+
+        assert_eq!(cli.prompt.as_deref(), Some("hello"));
+        assert!(!cli.print);
+    }
+
+    #[test]
+    fn prompt_accepts_leading_hyphen() {
+        let cli = Cli::try_parse_from(["caudra", "--prompt", "-v is broken"]).unwrap();
+
+        assert_eq!(cli.prompt.as_deref(), Some("-v is broken"));
+    }
+
+    #[test]
+    fn print_short_flag_still_means_print() {
+        let cli = Cli::try_parse_from(["caudra", "-p", "--prompt", "x"]).unwrap();
+
+        assert!(cli.print);
+        assert_eq!(cli.prompt.as_deref(), Some("x"));
+    }
+
+    #[test_case("fix the bug"; "quoted_sentence")]
+    #[test_case("mdoels"; "mistyped_subcommand")]
+    fn rejects_bare_positional(arg: &str) {
+        let kind = Cli::try_parse_from(["caudra", arg]).err().map(|e| e.kind());
+
+        assert_eq!(kind, Some(clap::error::ErrorKind::InvalidSubcommand));
+    }
+
+    #[test]
+    fn rejects_positional_after_subcommand() {
+        assert!(Cli::try_parse_from(["caudra", "models", "extra"]).is_err());
     }
 
     #[test]

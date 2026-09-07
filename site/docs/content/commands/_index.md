@@ -92,7 +92,7 @@ Eight automatic continuations are allowed in one query. When that safety cap or 
 One-shot headless mode accepts the same form:
 
 ```bash
-caudra --print '/goal tests pass and cargo clippy is clean'
+caudra --print --prompt '/goal tests pass and cargo clippy is clean'
 ```
 
 Headless mode waits for tracked background agents before evaluating. An impossible condition, evaluator failure, continuation cap, or turn limit produces an error result.

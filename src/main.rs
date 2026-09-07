@@ -13,17 +13,26 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::Parser;
+use clap::error::ErrorKind;
 
 use cli::Cli;
 
 /// How long a final telemetry export may take before caudra stops waiting.
 const TELEMETRY_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// A bare word is a mistyped subcommand far more often than a message, so point
+/// at the flag that does send one.
+const PROMPT_HINT: &str = "tip: to open a session with a message, use `caudra --prompt \"<text>\"`";
+
 /// Every exit runs through this return so command guards drop normally; a
 /// `process::exit` deeper in the tree would skip them.
 fn main() -> ExitCode {
     color_eyre::install().ok();
-    let result = cmd::dispatch(Cli::parse());
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(err) => return report_parse_error(&err),
+    };
+    let result = cmd::dispatch(cli);
     // Detached export tasks die with the process, so drain them once every
     // command has released its resources.
     caudra_otel::shutdown(TELEMETRY_SHUTDOWN_TIMEOUT);
@@ -34,6 +43,14 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn report_parse_error(err: &clap::Error) -> ExitCode {
+    err.print().ok();
+    if err.kind() == ErrorKind::InvalidSubcommand {
+        eprintln!("{PROMPT_HINT}");
+    }
+    ExitCode::from(err.exit_code() as u8)
 }
 
 fn print_error(e: &color_eyre::Report) {

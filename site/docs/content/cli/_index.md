@@ -10,11 +10,13 @@ group = "Reference"
 `caudra` without a subcommand starts the TUI. Subcommands cover auth, models, MCP OAuth, updates, and a few debug helpers. Many flags only apply to one of three run paths: **TUI**, one-shot **`--print`**, or **SDK** (`--print --input-format stream-json`).
 
 ```bash
-caudra [OPTIONS] [PROMPT]
+caudra [OPTIONS]
 caudra <COMMAND>
 ```
 
-If you pass a prompt (or pipe stdin) without `--print`, the TUI still opens and that text is the first message. With `--print`, Caudra runs non-interactively and exits when done.
+The first message comes from `--prompt`, from piped stdin, or from both. Without `--print`, the TUI opens and that text is sent as the first message. With `--print`, Caudra runs non-interactively and exits when done.
+
+Caudra takes no positional argument. A bare word is read as a subcommand, so `caudra mdoels` reports an unknown subcommand and suggests `models` rather than opening a session named after the typo.
 
 When interactive Caudra starts in a Herdr pane, it automatically reports native `caudra` lifecycle state through Herdr's inherited environment and public custom-agent API. `--print` and SDK mode do not claim pane lifecycle authority.
 
@@ -22,6 +24,7 @@ When interactive Caudra starts in a Herdr pane, it automatically reports native 
 
 | Flag | TUI | `--print` | SDK (`stream-json`) |
 |------|-----|-----------|---------------------|
+| `--prompt` | yes | yes | no (messages arrive on the wire) |
 | `-m` / `--model` | yes | yes | yes |
 | `--yolo` | yes | yes | yes (or `--permission-mode bypassPermissions`) |
 | `--no-plugins` / `--no-commands` / `--no-jit` | yes | yes | yes |
@@ -42,6 +45,7 @@ When interactive Caudra starts in a Herdr pane, it automatically reports native 
 | Flag | Description |
 |------|-------------|
 | `-p`, `--print` | Non-interactive run. See [Headless Mode](/docs/headless/) |
+| `--prompt <TEXT>` | First message of the session. Piped stdin is appended after it when both are present. Distinct from `-p`, which selects non-interactive output |
 | `--ephemeral` | Store the session, outputs, snapshots, input history, and stash in a temporary root removed at exit. Credentials, trust, and preferences remain persistent |
 | `--image <PATH>` | Attach an image in `--print` mode (repeatable). Paths must be png, jpeg, gif, or webp |
 | `-m`, `--model <SPEC>` | Model as `provider/model-id`. Fallback: last used → `provider.default_model` in config → auto-detect from available providers |
@@ -217,7 +221,7 @@ A session is kept when any rule matches. Pinned sessions, sessions open in any C
 cd ~/code/my-app && caudra
 
 # One-shot with YOLO and a model pin
-caudra -p --yolo -m anthropic/claude-sonnet-4-6 "summarize the architecture"
+caudra -p --yolo -m anthropic/claude-sonnet-4-6 --prompt "summarize the architecture"
 
 # Resume yesterday's session
 caudra --continue

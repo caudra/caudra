@@ -10,7 +10,7 @@ group = "Guides"
 Run Caudra non-interactively with `--print` / `-p`. Useful for scripts, CI, and automation.
 
 ```bash
-caudra "explain this codebase" --print
+caudra --print --prompt "explain this codebase"
 ```
 
 Pipe via stdin:
@@ -18,6 +18,8 @@ Pipe via stdin:
 ```bash
 echo "list all TODO comments" | caudra -p
 ```
+
+With both, the piped text is appended after `--prompt`, which lets you attach command output to an instruction. Running `--print` with neither is an error.
 
 ## Output Formats
 
@@ -28,7 +30,7 @@ echo "list all TODO comments" | caudra -p
 | `stream-json` | JSONL stream, one event per line |
 
 ```bash
-caudra "fix the tests" --print --output-format json
+caudra --print --output-format json --prompt "fix the tests"
 ```
 
 JSON output includes `type`, `subtype`, `is_error`, `duration_ms`, `num_turns`, `result`, `stop_reason`, `session_id`, `total_cost_usd`, and `usage`.
@@ -44,10 +46,10 @@ Caudra's `--print` is a drop-in replacement for Claude Code:
 claude "fix the bug" --print --output-format json
 
 # After
-caudra "fix the bug" --print --output-format json
+caudra --print --output-format json --prompt "fix the bug"
 ```
 
-Same JSON fields, same `--output-format` options, same `--verbose` behavior. Scripts that parse Claude Code output work unchanged.
+Same JSON fields, same `--output-format` options, same `--verbose` behavior. Scripts that parse Claude Code output work unchanged. The prompt itself moves to `--prompt`, because Caudra reads a bare word as a subcommand.
 
 ## SDK / Stream Mode
 
@@ -91,21 +93,21 @@ echo '{"type":"user","message":{"content":"explain this repo"}}' \
 Pipe compiler errors back for a fix:
 
 ```bash
-cargo build 2>&1 | caudra "Fix these compiler errors." --print --yolo
+cargo build 2>&1 | caudra --print --yolo --prompt "Fix these compiler errors."
 ```
 
 Generate a changelog from recent commits:
 
 ```bash
-git log --oneline v1.2.0..HEAD | caudra "Write a user-facing \
-  changelog grouped by: Added, Changed, Fixed. Skip chores." --print
+git log --oneline v1.2.0..HEAD | caudra --print --prompt "Write a user-facing \
+  changelog grouped by: Added, Changed, Fixed. Skip chores."
 ```
 
 Automated PR summaries in CI:
 
 ```bash
-SUMMARY=$(git diff main..HEAD | caudra "Write a 2-3 sentence \
-  summary of this change for a PR description." --print)
+SUMMARY=$(git diff main..HEAD | caudra --print --prompt "Write a 2-3 sentence \
+  summary of this change for a PR description.")
 gh pr edit --body "$SUMMARY"
 ```
 
@@ -113,13 +115,15 @@ Migrate an API across many files:
 
 ```bash
 grep -rl 'old_api_call' src/ | while read file; do
-  caudra "In $file, migrate old_api_call() to new_api_call(). \
-    Keep behavior identical." -p --yolo --allowed-tools Read,Edit
+  caudra -p --yolo --allowed-tools Read,Edit </dev/null \
+    --prompt "In $file, migrate old_api_call() to new_api_call(). Keep behavior identical."
 done
 ```
+
+The `</dev/null` matters. Inside a loop fed by a pipe, Caudra would otherwise read the remaining loop input as prompt text.
 
 Cost tracking:
 
 ```bash
-caudra "refactor the database layer" -p --output-format json | jq '.total_cost_usd'
+caudra -p --output-format json --prompt "refactor the database layer" | jq '.total_cost_usd'
 ```
