@@ -508,6 +508,9 @@ impl Workbench {
         let scroll = self.tree.scroll();
         let selected = self.tree.selected_index();
         let pointed = self.hovered_row(rows);
+        let on_mark = self
+            .hovering(rows)
+            .is_some_and(|at| on_menu_mark(at.0, rows.x));
         for (offset, row) in self
             .tree
             .rows()
@@ -517,7 +520,8 @@ impl Workbench {
             .enumerate()
         {
             let chosen = focused && scroll + offset == selected;
-            let line = tree_row(row, chosen, &self.styles, rows.width);
+            let marked = on_mark && pointed == Some(offset);
+            let line = tree_row(row, chosen, marked, &self.styles, rows.width);
             let line = emphasize(line, pointed == Some(offset) && !chosen, &self.styles);
             chrome::render_line(buf, line_at(rows, offset), line);
         }
@@ -1300,7 +1304,13 @@ fn digits(count: usize) -> u16 {
     count.max(1).ilog10() as u16 + 1
 }
 
-fn tree_row(row: &TreeRow, selected: bool, styles: &WorkbenchStyles, width: u16) -> Line<'static> {
+fn tree_row(
+    row: &TreeRow,
+    selected: bool,
+    marked: bool,
+    styles: &WorkbenchStyles,
+    width: u16,
+) -> Line<'static> {
     let marker = match (row.is_dir(), row.expanded) {
         (true, true) => EXPANDED_MARK,
         (true, false) => COLLAPSED_MARK,
@@ -1324,12 +1334,36 @@ fn tree_row(row: &TreeRow, selected: bool, styles: &WorkbenchStyles, width: u16)
     let reserved: usize = right.iter().map(|span| span.content.width()).sum();
     let guides = indent_guides(row.depth);
     let label = format!("{marker}{}", row.name);
-    let budget = (width as usize).saturating_sub(reserved + guides.width());
+    let budget = (width as usize).saturating_sub(reserved + guides.width() + menu_reserve());
     let left = vec![
+        Span::styled(
+            format!("{MENU_MARK}{TAB_GAP}"),
+            match marked {
+                true => styles.accent,
+                false => styles.dim,
+            },
+        ),
         Span::styled(guides, styles.border),
         Span::styled(chrome::fit(&label, budget), style),
     ];
     chrome::status_line(left, right, width, styles.background)
+}
+
+/// The columns every row keeps at its left for the menu handle, which is the
+/// only description of where [`tree_row`] puts it. Ahead of the indent guides
+/// rather than after them, so the handles line up as one column however deep
+/// the rows around them are nested.
+fn menu_reserve() -> usize {
+    MENU_MARK.chars().count() + TAB_GAP.len()
+}
+
+/// Whether a click at `column` landed on that handle. The gap after the mark
+/// goes with it, because what the gap would otherwise do is select the row,
+/// which the name already does.
+pub(crate) fn on_menu_mark(column: u16, origin: u16) -> bool {
+    column
+        .checked_sub(origin)
+        .is_some_and(|left| (left as usize) < menu_reserve())
 }
 
 /// A faint rule down every level the row sits under, so a name three folders
@@ -1795,9 +1829,10 @@ mod tests {
 
     use super::menu_panel;
     use super::{
-        CHANGE_TRAILING, Control, Editor, Focus, GitMark, ScmRow, Section, SidebarView, Style, Tab,
-        TabHit, TabPart, Toggle, TreeRow, Workbench, WorkbenchStyles, control_at, header_at, keys,
-        scm_controls, scroll_column, tab_at, toggle_at, tree_row, tree_style, visible_range,
+        CHANGE_TRAILING, Control, Editor, Focus, GitMark, MENU_MARK, ScmRow, Section, SidebarView,
+        Style, Tab, TabHit, TabPart, Toggle, TreeRow, Workbench, WorkbenchStyles, control_at,
+        header_at, keys, on_menu_mark, scm_controls, scroll_column, tab_at, toggle_at, tree_row,
+        tree_style, visible_range,
     };
     use crate::fs::tree::EntryKind;
     use crate::menu::Menu;
@@ -1811,6 +1846,9 @@ mod tests {
     const WRONG_HINT: &str = "the status bar is not offering what the focused pane needs most";
     const WRONG_PAINT: &str = "the row is not painted the way its standing asks for";
     const WRONG_GUIDES: &str = "the rules down the indent are not drawn as chrome";
+    const WRONG_HANDLE: &str = "the handle on the menu is not drawn back the way chrome is";
+    const HANDLE_MISPLACED: &str =
+        "the column the row paints the handle on is not the one a press reaches";
     const PANEL_MISPLACED: &str = "the panel is not where the cell it was asked for puts it";
     const PANEL_OFF_FRAME: &str = "the panel ran off the frame it was given";
     const TREE_NAME: &str = "a.rs";
@@ -2071,7 +2109,7 @@ mod tests {
 
     /// What a row reads as once painted, without the filler that pads it out.
     fn painted(row: &TreeRow) -> String {
-        tree_row(row, false, &WorkbenchStyles::default(), TREE_WIDTH)
+        tree_row(row, false, false, &WorkbenchStyles::default(), TREE_WIDTH)
             .spans
             .iter()
             .map(|span| span.content.as_ref())
@@ -2080,9 +2118,9 @@ mod tests {
             .to_owned()
     }
 
-    #[test_case(0 => format!("  {TREE_NAME}") ; "a row at the root has no folder to point at")]
-    #[test_case(1 => format!("\u{2502}   {TREE_NAME}") ; "one level in stands under one rule")]
-    #[test_case(3 => format!("\u{2502} \u{2502} \u{2502}   {TREE_NAME}") ; "and every level after it adds another")]
+    #[test_case(0 => format!("{MENU_MARK}   {TREE_NAME}") ; "a row at the root has no folder to point at")]
+    #[test_case(1 => format!("{MENU_MARK} \u{2502}   {TREE_NAME}") ; "one level in stands under one rule")]
+    #[test_case(3 => format!("{MENU_MARK} \u{2502} \u{2502} \u{2502}   {TREE_NAME}") ; "and every level after it adds another")]
     fn a_nested_row_stands_under_a_rule_for_each_level(depth: usize) -> String {
         painted(&entry(EntryKind::File, depth))
     }
@@ -2090,10 +2128,33 @@ mod tests {
     #[test]
     fn the_rules_are_faint_so_the_name_is_still_what_the_row_says() {
         let styles = WorkbenchStyles::default();
-        let line = tree_row(&entry(EntryKind::File, 2), false, &styles, TREE_WIDTH);
+        let line = tree_row(
+            &entry(EntryKind::File, 2),
+            false,
+            false,
+            &styles,
+            TREE_WIDTH,
+        );
 
-        assert_eq!(line.spans[0].style, styles.border, "{WRONG_GUIDES}");
-        assert_eq!(line.spans[1].style, styles.text, "{WRONG_PAINT}");
+        assert_eq!(line.spans[0].style, styles.dim, "{WRONG_HANDLE}");
+        assert_eq!(line.spans[1].style, styles.border, "{WRONG_GUIDES}");
+        assert_eq!(line.spans[2].style, styles.text, "{WRONG_PAINT}");
+    }
+
+    /// The handle sits at the left margin whatever the row is, so a press
+    /// reaches it without the depth of the row entering into it.
+    #[test_case(FRAME.x, 0 => true ; "the mark itself is the handle")]
+    #[test_case(FRAME.x + 1, 0 => true ; "and so is the gap that follows it")]
+    #[test_case(FRAME.x + 2, 0 => false ; "the rules past it belong to the row")]
+    #[test_case(FRAME.x + 2, 3 => false ; "however deep the row is nested")]
+    #[test_case(FRAME.x - 1, 0 => false ; "and a column left of the pane reaches nothing")]
+    fn a_press_at_the_left_margin_reaches_the_handle(column: u16, depth: usize) -> bool {
+        assert!(
+            painted(&entry(EntryKind::File, depth)).starts_with(MENU_MARK),
+            "{HANDLE_MISPLACED}"
+        );
+
+        on_menu_mark(column, FRAME.x)
     }
 
     fn menu(at: (u16, u16)) -> Menu {

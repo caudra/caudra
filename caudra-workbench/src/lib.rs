@@ -806,7 +806,15 @@ impl Workbench {
             return WorkbenchAction::Consumed;
         }
         if self.panes.rows.contains(position) {
-            self.press_row((at.1 - self.panes.rows.y) as usize, clicks);
+            // Only the explorer paints a handle there. Search results keep
+            // their leftmost columns for the path, so a press on them is a
+            // press on the result.
+            if self.sidebar == SidebarView::Explorer && view::on_menu_mark(at.0, self.panes.rows.x)
+            {
+                self.open_menu_at(at);
+            } else {
+                self.press_row((at.1 - self.panes.rows.y) as usize, clicks);
+            }
             return WorkbenchAction::Consumed;
         }
         if self.panes.text.contains(position) {
@@ -2536,7 +2544,7 @@ mod tests {
     use crate::view::{
         CARET, Control, MENU_HINTS, MENU_MARK, MORE_LEFT, MORE_RIGHT, NAME_HINTS, NOT_A_REPOSITORY,
         OPEN_MARK, REVERT_MARK, STAGE_MARK, TabHit, TabPart, UNSTAGE_MARK, button_at, confirm_at,
-        header_at, tab_at, toggle_at, visible_range,
+        header_at, on_menu_mark, tab_at, toggle_at, visible_range,
     };
     use crossterm::event::{
         KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -2802,6 +2810,14 @@ mod tests {
         paint(workbench, 80, 24)[at].style()
     }
 
+    /// A column that is the row itself rather than the handle at its margin,
+    /// found the same way the pointer tells the two apart.
+    fn row_body(rows: Rect) -> u16 {
+        (rows.x..rows.right())
+            .find(|column| !on_menu_mark(*column, rows.x))
+            .expect("a column past the handle")
+    }
+
     /// The column one of a tab's marks landed on, found the same way the
     /// pointer finds it.
     fn mark_column(workbench: &Workbench, index: usize, part: TabPart) -> u16 {
@@ -2997,11 +3013,12 @@ mod tests {
         let (_dir, mut workbench) = project();
         paint(&mut workbench, 80, 24);
         let rows = workbench.panes.rows;
-        workbench.handle_mouse(click(rows.x, rows.y));
-        workbench.handle_mouse(click(rows.x, rows.y + 1));
+        let body = row_body(rows);
+        workbench.handle_mouse(click(body, rows.y));
+        workbench.handle_mouse(click(body, rows.y + 1));
         assert_eq!(workbench.active_title(), "b.txt", "{NO_TAB}");
 
-        workbench.handle_mouse(click(rows.x, rows.y + 2));
+        workbench.handle_mouse(click(body, rows.y + 2));
 
         assert_eq!(workbench.editor.tabs().len(), 1, "{PREVIEW_STACKED}");
         assert_eq!(workbench.active_title(), "a.txt", "{NO_TAB}");
@@ -3012,11 +3029,12 @@ mod tests {
         let (_dir, mut workbench) = project();
         paint(&mut workbench, 80, 24);
         let rows = workbench.panes.rows;
-        workbench.handle_mouse(click(rows.x, rows.y + 1));
-        workbench.handle_mouse(click(rows.x, rows.y + 1));
+        let body = row_body(rows);
+        workbench.handle_mouse(click(body, rows.y + 1));
+        workbench.handle_mouse(click(body, rows.y + 1));
 
-        workbench.handle_mouse(click(rows.x, rows.y));
-        workbench.handle_mouse(click(rows.x, rows.y + 1));
+        workbench.handle_mouse(click(body, rows.y));
+        workbench.handle_mouse(click(body, rows.y + 1));
 
         assert_eq!(workbench.editor.tabs().len(), 2, "{PREVIEW_TOOK_OVER}");
     }
@@ -3026,12 +3044,13 @@ mod tests {
         let (_dir, mut workbench) = project();
         paint(&mut workbench, 80, 24);
         let rows = workbench.panes.rows;
-        workbench.handle_mouse(click(rows.x, rows.y + 1));
+        let body = row_body(rows);
+        workbench.handle_mouse(click(body, rows.y + 1));
         workbench.handle_key(key(KeyCode::Tab));
         workbench.handle_key(key(KeyCode::Char('x')));
 
-        workbench.handle_mouse(click(rows.x, rows.y));
-        workbench.handle_mouse(click(rows.x, rows.y + 1));
+        workbench.handle_mouse(click(body, rows.y));
+        workbench.handle_mouse(click(body, rows.y + 1));
 
         assert_eq!(workbench.editor.tabs().len(), 2, "{PREVIEW_TOOK_OVER}");
     }
@@ -5111,7 +5130,7 @@ mod tests {
         draw(&mut workbench, 80, 24);
         let rows = workbench.panes.rows;
 
-        workbench.handle_mouse(click(rows.x + 1, rows.y + 1));
+        workbench.handle_mouse(click(row_body(rows), rows.y + 1));
 
         assert_eq!(
             workbench.editor.active().expect(NO_TAB).title,
@@ -5139,7 +5158,7 @@ mod tests {
         let rows = workbench.panes.rows;
         let before = workbench.tree.rows().len();
 
-        workbench.handle_mouse(click(rows.x + 1, rows.y));
+        workbench.handle_mouse(click(row_body(rows), rows.y));
 
         assert!(workbench.tree.rows().len() > before, "{WRONG_CLICK}");
     }
@@ -5627,7 +5646,7 @@ mod tests {
         let (_dir, mut workbench) = project();
         draw(&mut workbench, 80, 24);
         let rows = workbench.panes.rows;
-        let selected = (rows.x + 1, rows.y);
+        let selected = (row_body(rows), rows.y);
         let before = cell_style(&mut workbench, selected);
 
         workbench.handle_mouse(moved(selected.0, selected.1));
@@ -5637,6 +5656,40 @@ mod tests {
             before,
             "{WRONG_HOVER}"
         );
+    }
+
+    /// The handle the row paints and the handle a press reaches have to be
+    /// the same column, and a left press on it has to open what the right
+    /// button opens, since the handle is what says the menu is there at all.
+    #[test]
+    fn a_press_on_a_row_handle_opens_its_menu() {
+        let (dir, mut workbench) = project();
+        draw(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        let rows = workbench.panes.rows;
+        let column = painted_column(&mut workbench, rows, rows.y, MENU_MARK);
+
+        workbench.handle_mouse(click(column, rows.y));
+
+        let menu = workbench.menu.as_ref().expect(NO_MENU);
+        assert_eq!(
+            menu.target(),
+            &Target::Row(dir.path().join(NESTED_DIR)),
+            "{WRONG_TARGET}"
+        );
+    }
+
+    /// A folder the handle belongs to must not open on the way to its menu,
+    /// which is what a press one column over would have done.
+    #[test]
+    fn a_press_on_a_row_handle_leaves_the_row_closed() {
+        let (_dir, mut workbench) = project();
+        draw(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        let rows = workbench.panes.rows;
+        let before = workbench.tree.rows().len();
+
+        workbench.handle_mouse(click(rows.x, rows.y));
+
+        assert_eq!(workbench.tree.rows().len(), before, "{WRONG_CLICK}");
     }
 
     #[test]
