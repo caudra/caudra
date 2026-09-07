@@ -30,21 +30,22 @@ const MAX_VISIBLE_ROWS: usize = 8;
 /// Header plus a trailing blank, matching the queue panel's grid.
 const CHROME_ROWS: u16 = 2;
 
-/// Hidden means the user dismissed it, and it stays hidden. Updating the list
-/// used to undo that, so a checkbox the model ticked put a panel back on
-/// screen that had been closed on purpose. [`TodoPanel::hint_line`] carries
-/// the count instead, and only a new session clears the dismissal.
+/// The panel is the user's to open. The model supplies rows and nothing more:
+/// neither a new list nor a restored session may put it on screen, so a box
+/// the model ticks can never take rows from the transcript.
+/// [`TodoPanel::hint_line`] carries the count while it is closed, and only a
+/// new session clears the flag.
 #[derive(Default)]
 pub struct TodoPanel {
     items: Vec<TodoItem>,
-    dismissed: bool,
+    revealed: bool,
     scroll: u16,
     /// Whether the viewport is tracking the first unfinished item. The wheel
     /// turns it off, a new list turns it back on: a reader who scrolled back
     /// to an earlier todo must not be yanked forward on the next repaint.
     follow_focus: bool,
     /// Where the panel and its header last drew. A wheel event needs the
-    /// panel, a dismissing click needs the header.
+    /// panel, a closing click needs the header.
     area: Rect,
     header: Rect,
     header_down: bool,
@@ -64,7 +65,7 @@ impl TodoPanel {
 
     pub fn reset(&mut self) {
         self.items.clear();
-        self.dismissed = false;
+        self.revealed = false;
         self.scroll = 0;
         self.follow_focus = true;
         self.area = Rect::default();
@@ -74,7 +75,7 @@ impl TodoPanel {
     }
 
     pub fn is_visible(&self) -> bool {
-        !self.items.is_empty() && !self.dismissed
+        !self.items.is_empty() && self.revealed
     }
 
     /// Ignored when there is nothing to show, so the key stays available to
@@ -83,7 +84,7 @@ impl TodoPanel {
         if self.items.is_empty() {
             return false;
         }
-        self.dismissed = !self.dismissed;
+        self.revealed = !self.revealed;
         true
     }
 
@@ -94,10 +95,10 @@ impl TodoPanel {
         self.items.len().min(MAX_VISIBLE_ROWS) as u16 + CHROME_ROWS
     }
 
-    /// The counter shown next to the chord while the panel is dismissed, so
+    /// The counter shown next to the chord while the panel is closed, so
     /// progress stays readable without occupying rows.
     pub fn hint_line(&self) -> Option<Line<'static>> {
-        if self.items.is_empty() || !self.dismissed {
+        if self.items.is_empty() || self.revealed {
             return None;
         }
         let t = theme::current();
@@ -163,7 +164,7 @@ impl TodoPanel {
         self.scroll = apply_scroll_delta(self.scroll, delta).min(self.overflow() as u16);
     }
 
-    /// The header doubles as the dismiss control, so the panel can be put away
+    /// The header doubles as the close control, so the panel can be put away
     /// without knowing about `Ctrl+T`. Rows are not targets: todos belong to
     /// the model, and there is no path back for a change made here.
     pub fn handle_mouse(&mut self, event: MouseEvent) -> bool {
@@ -184,7 +185,7 @@ impl TodoPanel {
             MouseEventKind::Up(MouseButton::Left) => {
                 let pressed = std::mem::take(&mut self.header_down);
                 if pressed && hit {
-                    self.dismissed = true;
+                    self.revealed = false;
                 }
                 pressed && hit
             }
@@ -294,8 +295,8 @@ mod tests {
     use ratatui::style::Modifier;
     use test_case::test_case;
 
-    const DISMISSAL_UNDONE: &str = "only the user or a new session may reopen a dismissed panel";
-    const HINT_STALE: &str = "the hint row must track the list while the panel is dismissed";
+    const OPENED_UNASKED: &str = "only the user may open the todo panel";
+    const HINT_STALE: &str = "the hint row must track the list while the panel is closed";
     const WIDE: u16 = 40;
 
     fn todo(content: &str, status: TodoStatus) -> TodoItem {
@@ -306,14 +307,19 @@ mod tests {
         }
     }
 
-    fn panel(statuses: &[TodoStatus]) -> TodoPanel {
-        let mut panel = TodoPanel::default();
-        let items = statuses
+    fn items(statuses: &[TodoStatus]) -> Vec<TodoItem> {
+        statuses
             .iter()
             .enumerate()
             .map(|(i, s)| todo(&format!("task {i}"), *s))
-            .collect();
-        panel.set_items(items);
+            .collect()
+    }
+
+    /// Opened, the way the user would: the panel never opens itself.
+    fn panel(statuses: &[TodoStatus]) -> TodoPanel {
+        let mut panel = TodoPanel::default();
+        panel.set_items(items(statuses));
+        panel.toggle();
         panel
     }
 
@@ -343,8 +349,20 @@ mod tests {
         assert_eq!(panel.height(), expected);
     }
 
+    /// The regression the default guards against: rows nobody asked for,
+    /// taken from the transcript by the first `todo_write`.
     #[test]
-    fn a_dismissed_panel_takes_no_rows_but_keeps_its_items() {
+    fn the_panel_starts_hidden() {
+        let mut panel = TodoPanel::default();
+        panel.set_items(items(&[TodoStatus::InProgress]));
+
+        assert!(!panel.is_visible(), "{OPENED_UNASKED}");
+        assert_eq!(panel.height(), 0);
+        assert!(panel.hint_line().is_some(), "the list is still reachable");
+    }
+
+    #[test]
+    fn a_closed_panel_takes_no_rows_but_keeps_its_items() {
         let mut panel = panel(&[TodoStatus::Pending]);
         assert!(panel.toggle());
         assert_eq!(panel.height(), 0);
@@ -358,24 +376,24 @@ mod tests {
         assert!(!panel.is_visible());
     }
 
-    /// A dismissal is the user's, and the agent does not get to undo it by
-    /// ticking a box. The panel used to reopen on every update, which put a
-    /// closed panel back on screen mid-task.
-    #[test]
-    fn updating_the_list_leaves_a_dismissal_alone() {
-        let mut panel = panel(&[TodoStatus::Pending]);
-        panel.toggle();
-        assert!(!panel.is_visible());
+    /// Opening is the user's alone, and the model does not get to do it by
+    /// ticking a box. The panel used to open on the first list and reopen on
+    /// every update, which put it on screen mid-task.
+    #[test_case(&[TodoStatus::Pending] ; "the same list again")]
+    #[test_case(&[TodoStatus::InProgress, TodoStatus::Pending] ; "a longer list")]
+    fn updating_the_list_never_opens_the_panel(statuses: &[TodoStatus]) {
+        let mut panel = TodoPanel::default();
+        panel.set_items(items(&[TodoStatus::Pending]));
 
-        panel.set_items(vec![todo("fresh", TodoStatus::InProgress)]);
+        panel.set_items(items(statuses));
 
-        assert!(!panel.is_visible(), "{DISMISSAL_UNDONE}");
+        assert!(!panel.is_visible(), "{OPENED_UNASKED}");
     }
 
-    /// Dismissed is not gone: the count keeps moving in the hint row, so the
-    /// panel is worth reopening and can be found again.
+    /// Closed is not gone: the count keeps moving in the hint row, so the
+    /// panel is worth opening and can be found again.
     #[test]
-    fn a_dismissed_panel_still_reports_progress() {
+    fn a_closed_panel_still_reports_progress() {
         let mut panel = panel(&[TodoStatus::Pending, TodoStatus::Pending]);
         panel.toggle();
 
@@ -384,22 +402,23 @@ mod tests {
             todo("b", TodoStatus::InProgress),
         ]);
 
-        let hint = panel.hint_line().expect(DISMISSAL_UNDONE);
+        let hint = panel.hint_line().expect(HINT_STALE);
         let text: String = hint.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains("1/2"), "{HINT_STALE}");
         assert!(text.contains(leader::PLAN_TOGGLE.label), "{HINT_STALE}");
     }
 
-    /// The one thing that does clear it, so a new session starts clean.
+    /// A new session starts clean, which means closed: the list a restore
+    /// replays must not bring the panel back with it.
     #[test]
-    fn a_reset_clears_a_dismissal() {
+    fn a_reset_closes_an_open_panel() {
         let mut panel = panel(&[TodoStatus::Pending]);
-        panel.toggle();
+        assert!(panel.is_visible());
 
         panel.reset();
-        panel.set_items(vec![todo("fresh", TodoStatus::InProgress)]);
+        panel.set_items(items(&[TodoStatus::InProgress]));
 
-        assert!(panel.is_visible());
+        assert!(!panel.is_visible(), "{OPENED_UNASKED}");
     }
 
     #[test]
@@ -409,23 +428,18 @@ mod tests {
         assert!(!panel.set_items(same));
     }
 
-    /// Re-sending the same list must not reopen a panel the user dismissed;
-    /// the model repeats its list constantly.
     #[test]
-    fn an_identical_list_does_not_undo_a_dismissal() {
-        let mut panel = panel(&[TodoStatus::Pending]);
-        panel.toggle();
-        panel.set_items(vec![todo("task 0", TodoStatus::Pending)]);
-        assert!(!panel.is_visible());
-    }
-
-    #[test]
-    fn the_hint_appears_only_while_dismissed() {
-        let mut panel = panel(&[TodoStatus::Completed, TodoStatus::Pending]);
-        assert!(panel.hint_line().is_none(), "visible panel needs no hint");
-        panel.toggle();
-        let hint = panel.hint_line().expect("dismissed panel shows a hint");
+    fn the_hint_appears_only_while_closed() {
+        let mut panel = TodoPanel::default();
+        panel.set_items(items(&[TodoStatus::Completed, TodoStatus::Pending]));
+        let hint = panel.hint_line().expect(HINT_STALE);
         assert!(hint.spans[0].content.contains("1/2"), "{hint:?}");
+
+        panel.toggle();
+        assert!(panel.hint_line().is_none(), "an open panel needs no hint");
+
+        panel.toggle();
+        assert!(panel.hint_line().is_some(), "{HINT_STALE}");
     }
 
     #[test]
@@ -461,6 +475,7 @@ mod tests {
     fn a_long_item_is_truncated_to_the_panel_width() {
         let mut panel = TodoPanel::default();
         panel.set_items(vec![todo(&"x".repeat(200), TodoStatus::Pending)]);
+        panel.toggle();
         let screen = render(&mut panel, WIDE);
         assert!(screen.contains(ELLIPSIS), "{screen}");
         assert!(screen.lines().all(|l| l.width() <= WIDE as usize));
@@ -545,7 +560,8 @@ mod tests {
         assert!(screen.contains("task 0"), "{screen}");
     }
 
-    /// A new list is new information, which is also why it undoes a dismissal.
+    /// A new list is new information, so the viewport goes back to tracking
+    /// the active row even after the reader scrolled away.
     #[test]
     fn a_new_list_puts_the_viewport_back_on_the_active_row() {
         let mut statuses = vec![TodoStatus::Completed; 20];
@@ -554,20 +570,12 @@ mod tests {
         let _ = render(&mut panel, WIDE);
         panel.scroll(i32::from(u16::MAX));
         statuses[16] = TodoStatus::InProgress;
-        assert!(
-            panel.set_items(
-                statuses
-                    .iter()
-                    .enumerate()
-                    .map(|(i, s)| todo(&format!("task {i}"), *s))
-                    .collect(),
-            )
-        );
+        assert!(panel.set_items(items(&statuses)));
         assert!(render(&mut panel, WIDE).contains("task 15"));
     }
 
     #[test]
-    fn clicking_the_header_dismisses_the_panel() {
+    fn clicking_the_header_closes_the_panel() {
         let mut panel = panel(&[TodoStatus::Pending]);
         let _ = render(&mut panel, WIDE);
         let header = panel.header;
@@ -579,7 +587,7 @@ mod tests {
     /// The press and release must land on the same control, or a drag that
     /// happens to end on the header would put the panel away.
     #[test]
-    fn a_press_elsewhere_does_not_dismiss_on_release_over_the_header() {
+    fn a_press_elsewhere_does_not_close_on_release_over_the_header() {
         let mut panel = panel(&[TodoStatus::Pending; 3]);
         let _ = render(&mut panel, WIDE);
         let header = panel.header;
@@ -598,7 +606,7 @@ mod tests {
 
     /// Dragging out of the header is the reader selecting its text.
     #[test]
-    fn dragging_off_the_header_does_not_dismiss() {
+    fn dragging_off_the_header_does_not_close() {
         let mut panel = panel(&[TodoStatus::Pending; 3]);
         let _ = render(&mut panel, WIDE);
         let header = panel.header;
@@ -630,10 +638,10 @@ mod tests {
         assert!(panel.is_visible());
     }
 
-    /// A dismissed panel draws nothing, so it must not keep claiming the rows
+    /// A closed panel draws nothing, so it must not keep claiming the rows
     /// it used to occupy.
     #[test]
-    fn a_dismissed_panel_owns_no_screen_area() {
+    fn a_closed_panel_owns_no_screen_area() {
         let mut panel = panel(&[TodoStatus::Pending]);
         let _ = render(&mut panel, WIDE);
         let inside = Position::new(panel.header.x, panel.header.y);
@@ -698,7 +706,7 @@ mod tests {
         );
     }
 
-    /// The dismiss control is the title, not the blank cells beside it: a
+    /// The close control is the title, not the blank cells beside it: a
     /// target the reader cannot see is not one they can aim at.
     #[test]
     fn the_header_control_stops_at_its_title() {
