@@ -155,6 +155,9 @@ test-optional-features:
 	$(CARGO) test --locked --package workcell-code-graph --features git
 	$(CARGO) clippy --locked --all-targets --package workcell-code-graph --features git \
 		-- -D warnings
+	$(CARGO) test --locked --package workcell-mcp-code-graph --features git
+	$(CARGO) clippy --locked --all-targets --package workcell-mcp-code-graph --features git \
+		-- -D warnings
 
 build:
 	$(CARGO) build --workspace --locked
@@ -190,7 +193,7 @@ docker-smoke: docker-build
 		'{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"container-smoke","version":"1"}}}' \
 		'{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}' \
 		'{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"python_execution","arguments":{"code":"sum([1, 2, 3, 4])"}}}' \
-		| $(DOCKER) run --rm --interactive "$(IMAGE):$(TAG)" --tool-group code); \
+		| $(DOCKER) run --rm --interactive "$(IMAGE):$(TAG)" --tool-group python_execution); \
 	printf '%s\n' "$$output" | grep -q '"outcome":"completed".*"result":10' \
 		|| { printf '%s\n' 'packaged code execution failed'; exit 2; }
 	@printf '%s\n' 'discovering and executing index through the packaged MCP server'
@@ -205,6 +208,18 @@ docker-smoke: docker-build
 		|| { printf '%s\n' 'packaged index catalog is incomplete'; exit 2; }; \
 	printf '%s\n' "$$output" | grep -q '"kind":"file".*"language":"markdown"' \
 		|| { printf '%s\n' 'packaged index execution failed'; exit 2; }
+	@printf '%s\n' 'ranking a tree through the packaged MCP server'
+	@output=$$(printf '%s\n' \
+		'{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"container-smoke","version":"1"}}}' \
+		'{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}' \
+		'{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
+		'{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"code_map","arguments":{}}}' \
+		| $(DOCKER) run --rm --interactive "$(IMAGE):$(TAG)" --tool-group code_graph \
+			/usr/share/doc/workcell-mcp); \
+	printf '%s\n' "$$output" | grep -q '"name":"code_map"' \
+		|| { printf '%s\n' 'packaged code-graph catalog is incomplete'; exit 2; }; \
+	printf '%s\n' "$$output" | grep -q '"graph":' \
+		|| { printf '%s\n' 'packaged code-graph execution failed'; exit 2; }
 
 docker-run:
 	@test -n "$(ROOT)" || { printf '%s\n' 'ROOT is required, for example: make docker-run ROOT=/absolute/workspace'; exit 2; }
