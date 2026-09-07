@@ -18,7 +18,7 @@ use workcell_source_languages::Language;
 
 use crate::{
     cache::FactsCache,
-    extract::{ExtractLimits, FileFacts, extract},
+    extract::{ExtractItem, ExtractLimits, FileFacts, extract_batch, worker_threads},
     model::{Definition, Facts, FileId, NodeId, Reference, SkipReason, SkippedFile, SourceFile},
 };
 
@@ -42,6 +42,11 @@ pub struct IngestLimits {
     pub max_definitions: usize,
     /// Most references retained across the whole tree.
     pub max_references: usize,
+    /// Extraction worker threads. Narrowed by the machine and by the batch.
+    ///
+    /// Bounded because each worker holds one live parse tree. It is a cost decision only: the
+    /// facts, their order, and their ids are identical at any setting.
+    pub max_extract_threads: usize,
 }
 
 impl Default for IngestLimits {
@@ -51,6 +56,7 @@ impl Default for IngestLimits {
             max_files: 25_000,
             max_definitions: 400_000,
             max_references: 1_500_000,
+            max_extract_threads: 16,
         }
     }
 }
@@ -83,13 +89,13 @@ pub struct Ingested {
 /// first after sorting, so a caller that offers the same path twice cannot mint two file ids.
 #[must_use]
 pub fn ingest(inputs: Vec<SourceInput>, limits: IngestLimits) -> Ingested {
-    ingest_with(
-        inputs,
-        limits,
-        &mut |_path, source, language, extract_limits| {
-            extract(source, language, extract_limits).map(Arc::new)
-        },
-    )
+    ingest_with(inputs, limits, &mut |batch, extract_limits| {
+        let threads = worker_threads(limits.max_extract_threads, batch.len());
+        extract_batch(batch, extract_limits, threads)
+            .into_iter()
+            .map(|facts| facts.map(Arc::new))
+            .collect()
+    })
 }
 
 /// [`ingest`], reusing extraction results already retained for unchanged content.
@@ -103,18 +109,19 @@ pub fn ingest_cached(
     limits: IngestLimits,
     cache: &mut FactsCache,
 ) -> Ingested {
-    ingest_with(
-        inputs,
-        limits,
-        &mut |path, source, language, extract_limits| {
-            cache.facts(path, source, language, extract_limits)
-        },
-    )
+    ingest_with(inputs, limits, &mut |batch, extract_limits| {
+        cache.facts_batch(batch, extract_limits, limits.max_extract_threads)
+    })
 }
 
 /// The one ingest body. Cached and uncached runs differ only in this callback, so no stage after
 /// extraction can behave differently depending on where the facts came from.
-type Extractor<'a> = dyn FnMut(&str, &str, Language, ExtractLimits) -> Option<Arc<FileFacts>> + 'a;
+///
+/// It receives the whole admitted batch rather than one file at a time, which is what lets an
+/// implementation extract in parallel. Position `i` of the result must belong to position `i` of the
+/// batch, so the callback cannot reorder anything.
+type Extractor<'a> =
+    dyn FnMut(&[ExtractItem<'_>], ExtractLimits) -> Vec<Option<Arc<FileFacts>>> + 'a;
 
 fn ingest_with(
     mut inputs: Vec<SourceInput>,
@@ -130,30 +137,54 @@ fn ingest_with(
         inputs.truncate(limits.max_files);
     }
 
+    // Admission is decided before extraction, so which files are skipped and why never depends on
+    // how the extraction was scheduled.
+    let admitted: Vec<Result<Language, SkipReason>> = inputs
+        .iter()
+        .map(
+            |input| match Language::from_path(std::path::Path::new(&input.path)) {
+                None => Err(SkipReason::UnknownLanguage),
+                Some(_) if input.source.len() > limits.extract.max_source_bytes => {
+                    Err(SkipReason::Oversize)
+                }
+                Some(language) => Ok(language),
+            },
+        )
+        .collect();
+    let batch: Vec<ExtractItem<'_>> = inputs
+        .iter()
+        .zip(&admitted)
+        .filter_map(|(input, language)| {
+            language.ok().map(|language| ExtractItem {
+                path: &input.path,
+                source: &input.source,
+                language,
+            })
+        })
+        .collect();
+    let mut extracted = extractor(&batch, limits.extract).into_iter();
+    debug_assert_eq!(batch.len(), extracted.len());
+    drop(batch);
+
     let mut facts = Facts::default();
     // Per-file extraction results, retained only until ids are assigned. The tree itself is already
     // gone: `extract` drops it before returning.
     let mut per_file: Vec<(FileId, Arc<FileFacts>)> = Vec::with_capacity(inputs.len());
 
-    for input in inputs {
+    for (input, language) in inputs.into_iter().zip(admitted) {
         let path = input.path;
-        let Some(language) = Language::from_path(std::path::Path::new(&path)) else {
-            facts.skipped.push(SkippedFile {
-                extension: extension_of(&path),
-                path,
-                reason: SkipReason::UnknownLanguage,
-            });
-            continue;
+        let language = match language {
+            Ok(language) => language,
+            Err(reason) => {
+                facts.skipped.push(SkippedFile {
+                    extension: extension_of(&path),
+                    path,
+                    reason,
+                });
+                continue;
+            }
         };
-        if input.source.len() > limits.extract.max_source_bytes {
-            facts.skipped.push(SkippedFile {
-                extension: extension_of(&path),
-                path,
-                reason: SkipReason::Oversize,
-            });
-            continue;
-        }
-        let Some(file_facts) = extractor(&path, &input.source, language, limits.extract) else {
+        let Some(file_facts) = extracted.next().flatten() else {
             facts.skipped.push(SkippedFile {
                 extension: extension_of(&path),
                 path,
@@ -294,6 +325,60 @@ mod tests {
             2,
             "the two unchanged files must have hit, or this test proves nothing"
         );
+    }
+
+    /// The trap ripwire's own architecture notes describe: a change that reads the machine's core
+    /// count is invisible in review and passes every test on the machine that makes it. Worker count
+    /// is a cost decision here, so this asserts it across the whole range a machine could report.
+    #[test]
+    fn extraction_is_independent_of_worker_count() {
+        // Deliberately uneven: enough files that a static split would assign them differently at
+        // each width, and enough definitions per file that ids would visibly shift if a result
+        // landed out of position.
+        let inputs: Vec<SourceInput> = (0..24)
+            .map(|index| {
+                let body = (0..=index)
+                    .map(|inner| format!("fn f{index}_{inner}() {{ f{index}_0(); }}\n"))
+                    .collect::<String>();
+                input(&format!("src/m{index:02}.rs"), &body)
+            })
+            .collect();
+
+        let single = ingest(
+            inputs.clone(),
+            IngestLimits {
+                max_extract_threads: 1,
+                ..IngestLimits::default()
+            },
+        );
+        for threads in [2, 3, 7, 16, 64] {
+            let parallel = ingest(
+                inputs.clone(),
+                IngestLimits {
+                    max_extract_threads: threads,
+                    ..IngestLimits::default()
+                },
+            );
+            assert_eq!(
+                format!("{:?}", single.facts),
+                format!("{:?}", parallel.facts),
+                "{threads} workers produced different facts"
+            );
+        }
+
+        // And the same through the cache, whose insertion order decides which entries eviction
+        // reaches. A cache that inserted in completion order would pass the check above and still
+        // retain a different set.
+        let mut cache = FactsCache::new(crate::cache::CacheLimits::default());
+        let cached = ingest_cached(
+            inputs,
+            IngestLimits {
+                max_extract_threads: 8,
+                ..IngestLimits::default()
+            },
+            &mut cache,
+        );
+        assert_eq!(format!("{:?}", single.facts), format!("{:?}", cached.facts));
     }
 
     #[test]

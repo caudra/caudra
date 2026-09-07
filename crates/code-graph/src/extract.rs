@@ -77,6 +77,86 @@ pub struct RawReference {
     pub enclosing: Option<usize>,
 }
 
+/// One file offered to a batch extraction.
+///
+/// The path is carried for the benefit of a caller that keys retained facts by it; extraction
+/// itself never reads it, so two files with identical content extract identically.
+#[derive(Clone, Copy, Debug)]
+pub struct ExtractItem<'a> {
+    pub path: &'a str,
+    pub source: &'a str,
+    pub language: Language,
+}
+
+/// Extraction worker threads for one batch.
+///
+/// The host names a ceiling; the machine and the batch narrow it. The count is a cost decision
+/// only: [`extract_batch`] returns the same values whatever this resolves to, which is the property
+/// `extraction_is_independent_of_worker_count` gates.
+#[must_use]
+pub fn worker_threads(ceiling: usize, items: usize) -> usize {
+    std::thread::available_parallelism()
+        .map_or(1, std::num::NonZeroUsize::get)
+        .min(ceiling)
+        .min(items)
+        .max(1)
+}
+
+/// Extracts a batch of files, using up to `threads` workers.
+///
+/// Position `i` of the result belongs to position `i` of `items`, regardless of the order the
+/// workers finished in, so worker count is invisible in the output. Files are claimed one at a time
+/// from a shared counter rather than partitioned up front, because source files differ in size by
+/// two orders of magnitude and a static split would leave every worker but one idle.
+///
+/// Memory is bounded by `threads` live parse trees, since [`extract`] drops each tree before it
+/// returns.
+#[must_use]
+pub fn extract_batch(
+    items: &[ExtractItem<'_>],
+    limits: ExtractLimits,
+    threads: usize,
+) -> Vec<Option<FileFacts>> {
+    if threads <= 1 || items.len() <= 1 {
+        return items
+            .iter()
+            .map(|item| extract(item.source, item.language, limits))
+            .collect();
+    }
+
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let collected: Vec<Vec<(usize, Option<FileFacts>)>> = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..threads)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut local = Vec::new();
+                    loop {
+                        let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(item) = items.get(index) else { break };
+                        local.push((index, extract(item.source, item.language, limits)));
+                    }
+                    local
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .map(|worker| {
+                worker
+                    .join()
+                    .unwrap_or_else(|payload| std::panic::resume_unwind(payload))
+            })
+            .collect()
+    });
+
+    let mut facts: Vec<Option<FileFacts>> =
+        std::iter::repeat_with(|| None).take(items.len()).collect();
+    for (index, extracted) in collected.into_iter().flatten() {
+        facts[index] = extracted;
+    }
+    facts
+}
+
 /// Parses one file and extracts its facts.
 ///
 /// Returns `None` when the parser did not produce a tree, which the caller records as a skip rather

@@ -20,6 +20,7 @@ rmcp = { workspace = true, optional = true }
 serde.workspace = true
 thiserror.workspace = true
 serde_json.workspace = true
+tokio.workspace = true
 tokio-util.workspace = true
 workcell-code-graph.workspace = true
 # The confined resolver. This crate never opens a path itself; every read goes through the
@@ -29,7 +30,6 @@ workcell-tool-contract.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [lints]
 workspace = true

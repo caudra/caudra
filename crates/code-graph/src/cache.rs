@@ -26,7 +26,9 @@ use lru::LruCache;
 use sha2::{Digest as _, Sha256};
 use workcell_source_languages::Language;
 
-use crate::extract::{ExtractLimits, FileFacts, extract};
+use crate::extract::{
+    ExtractItem, ExtractLimits, FileFacts, extract, extract_batch, worker_threads,
+};
 
 /// A content digest of one file's source text.
 type Digest = [u8; 32];
@@ -138,7 +140,59 @@ impl FactsCache {
         self.stats.misses += 1;
 
         let facts = Arc::new(extract(source, language, limits)?);
-        let weight = weigh(&facts);
+        self.store(path, digest, &facts);
+        Some(facts)
+    }
+
+    /// [`FactsCache::facts`] for a whole batch, extracting the misses together.
+    ///
+    /// The lookups stay sequential because they are a hash and a map probe; only the misses are
+    /// worth a thread. Every result keeps its input position.
+    #[must_use]
+    pub fn facts_batch(
+        &mut self,
+        items: &[ExtractItem<'_>],
+        limits: ExtractLimits,
+        thread_ceiling: usize,
+    ) -> Vec<Option<Arc<FileFacts>>> {
+        let mut resolved: Vec<Option<Arc<FileFacts>>> = Vec::with_capacity(items.len());
+        let mut misses: Vec<usize> = Vec::new();
+        let mut digests: Vec<Digest> = Vec::with_capacity(items.len());
+        for (index, item) in items.iter().enumerate() {
+            let digest: Digest = Sha256::digest(item.source.as_bytes()).into();
+            let hit = self
+                .entries
+                .get(item.path)
+                .filter(|entry| entry.digest == digest)
+                .map(|entry| Arc::clone(&entry.facts));
+            if hit.is_some() {
+                self.stats.hits += 1;
+            } else {
+                self.stats.misses += 1;
+                misses.push(index);
+            }
+            digests.push(digest);
+            resolved.push(hit);
+        }
+
+        let pending: Vec<ExtractItem<'_>> = misses.iter().map(|index| items[*index]).collect();
+        let threads = worker_threads(thread_ceiling, pending.len());
+        let extracted = extract_batch(&pending, limits, threads);
+
+        // Insertion order follows input order, not completion order, so the eviction the byte
+        // ceiling forces is the same at any thread count.
+        for (index, facts) in misses.into_iter().zip(extracted) {
+            let Some(facts) = facts else { continue };
+            let facts = Arc::new(facts);
+            self.store(items[index].path, digests[index], &facts);
+            resolved[index] = Some(facts);
+        }
+        resolved
+    }
+
+    /// Retains one extraction result, replacing any previous entry for the same path.
+    fn store(&mut self, path: &str, digest: Digest, facts: &Arc<FileFacts>) {
+        let weight = weigh(facts);
         if let Some(previous) = self.entries.pop(path) {
             self.bytes = self.bytes.saturating_sub(previous.weight);
         }
@@ -146,13 +200,12 @@ impl FactsCache {
             path.to_owned(),
             Entry {
                 digest,
-                facts: Arc::clone(&facts),
+                facts: Arc::clone(facts),
                 weight,
             },
         );
         self.bytes = self.bytes.saturating_add(weight);
         self.evict_to_bytes();
-        Some(facts)
     }
 
     /// Evicts least-recently-used entries until the byte ceiling holds.

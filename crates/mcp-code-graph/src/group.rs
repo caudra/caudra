@@ -34,7 +34,9 @@ const DEFAULT_IMPACT_DEPTH: usize = 3;
 pub struct CodeGraphToolGroup {
     files: Arc<FileToolGroup>,
     limits: CodeGraphLimits,
-    cache: Mutex<FactsCache>,
+    // Shared rather than owned so the blocking build task can hold it across a await-free section
+    // without borrowing the group.
+    cache: Arc<Mutex<FactsCache>>,
 }
 
 impl std::fmt::Debug for CodeGraphToolGroup {
@@ -72,7 +74,7 @@ impl CodeGraphToolGroup {
         Self {
             files,
             limits,
-            cache: Mutex::new(cache),
+            cache: Arc::new(Mutex::new(cache)),
         }
     }
 
@@ -93,11 +95,19 @@ impl CodeGraphToolGroup {
         token: &CancellationToken,
     ) -> Result<CodeGraph, CodeGraphError> {
         let crawled = crawl(&self.files, path, &self.limits, token).await?;
-        let mut cache = self
-            .cache
-            .lock()
-            .map_err(|_| CodeGraphError::Internal("extraction cache is poisoned"))?;
-        Ok(CodeGraph::build(crawled, &self.limits, &mut cache))
+        let cache = Arc::clone(&self.cache);
+        let limits = self.limits;
+        // Parsing and ranking a whole tree is CPU-bound for as long as the tree is large, and the
+        // extraction it starts owns threads of its own. Left on a runtime worker it would stall
+        // every other tool call this process is serving for that entire time.
+        tokio::task::spawn_blocking(move || {
+            let mut cache = cache
+                .lock()
+                .map_err(|_| CodeGraphError::Internal("extraction cache is poisoned"))?;
+            Ok(CodeGraph::build(crawled, &limits, &mut cache))
+        })
+        .await
+        .map_err(|_| CodeGraphError::Internal("graph construction did not complete"))?
     }
 
     /// Ranked symbols for a tree.
