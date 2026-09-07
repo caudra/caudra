@@ -3318,6 +3318,73 @@ fn expanded_streaming_reasoning_has_an_active_header_and_separate_body() {
     assert!(!text.contains("thinking>"));
 }
 
+const TITLE_MARKUP_MSG: &str = "a heading's own fence must never be drawn as body text";
+const TITLE_ROW_MSG: &str =
+    "an unnamed thought is one header row, so nothing jumps when it names itself";
+
+/// The title arrives a fragment at a time, and its `**` used to open a body
+/// row that the header took back the moment the fence closed.
+#[test]
+fn a_streaming_title_never_lands_in_the_body_first() {
+    let mut panel = streaming_reasoning_panel();
+
+    for fragment in ["**", "Review", "ing"] {
+        panel.thinking_delta(fragment);
+        let text = buffer_text(&render(&mut panel, 80, 10));
+        assert!(!text.contains('*'), "{TITLE_MARKUP_MSG}; got: {text}");
+        assert_eq!(panel.last_total_lines, 1, "{TITLE_ROW_MSG}; got: {text}");
+    }
+
+    panel.thinking_delta("**");
+    let named = buffer_text(&render(&mut panel, 80, 10));
+    assert!(named.contains("Thinking: Reviewing"), "{named}");
+    assert_eq!(panel.last_total_lines, 1, "{TITLE_ROW_MSG}; got: {named}");
+
+    panel.thinking_delta("\n\nBody details");
+    let bodied = buffer_text(&render(&mut panel, 80, 10));
+    assert!(bodied.contains("Thinking: Reviewing"), "{bodied}");
+    assert!(bodied.contains("Body details"), "{bodied}");
+    assert_eq!(panel.last_total_lines, 3, "{bodied}");
+}
+
+/// Bold that opens a sentence is prose, so withholding it would strand the
+/// reader on an empty header for the whole block.
+#[test]
+fn streaming_reasoning_that_never_names_itself_shows_its_body_at_once() {
+    let mut panel = streaming_reasoning_panel();
+    panel.thinking_delta("**Important:** keep this in the body.");
+
+    let text = buffer_text(&render(&mut panel, 80, 10));
+
+    assert!(!text.contains("Thinking: Important"), "{text}");
+    assert!(text.contains("keep this in the body."), "{text}");
+}
+
+#[test]
+fn an_unfinished_streaming_title_is_not_copied_as_body() {
+    let mut panel = streaming_reasoning_panel();
+    panel.push(DisplayMessage::new(DisplayRole::User, "Question".into()));
+    panel.thinking_delta("**Solo tra");
+
+    let copied = extract_entire_document(&mut panel);
+
+    assert!(copied.contains("## Thinking"), "{copied}");
+    assert!(!copied.contains('*'), "{TITLE_MARKUP_MSG}; got: {copied}");
+}
+
+/// Reveals the buffer one delta at a time, so a fragment is on screen the
+/// frame it arrives and the reveal never runs ahead of the assertions.
+fn streaming_reasoning_panel() -> MessagesPanel {
+    MessagesPanel::new(
+        UiConfig {
+            show_thinking: true,
+            typewriter_ms_per_char: 0,
+            ..UiConfig::default()
+        },
+        EventHandle::disconnected_for_test(),
+    )
+}
+
 #[test]
 fn streaming_reasoning_shows_a_spinner_and_tenths_timer() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
@@ -4794,11 +4861,17 @@ fn active_and_completed_reasoning_have_distinct_headers() {
             .collect::<String>()
     };
     assert_eq!(
-        line_text(&thought_line("**Reviewing**", None, false)[0]),
+        line_text(&thought_line(reasoning_summary("**Reviewing**").title, None, false)[0]),
         "Thinking: Reviewing"
     );
     assert_eq!(
-        line_text(&thought_line("plain body", Some(Duration::from_secs(2)), true)[0]),
+        line_text(
+            &thought_line(
+                reasoning_summary("plain body").title,
+                Some(Duration::from_secs(2)),
+                true
+            )[0]
+        ),
         "Thought · 2.0s"
     );
 }
@@ -4910,7 +4983,7 @@ fn reasoning_boundary_completes_one_block_and_starts_another() {
 #[test_case(Duration::from_millis(9_700), "Thought: t · 9.7s" ; "seconds_keep_one_decimal")]
 #[test_case(Duration::from_secs(125), "Thought: t · 2m 5s" ; "minutes_split_from_seconds")]
 fn thought_durations_are_formatted_by_magnitude(duration: Duration, expected: &str) {
-    let line = &thought_line("**t**", Some(duration), true)[0];
+    let line = &thought_line(Some("t"), Some(duration), true)[0];
     let text: String = line
         .spans
         .iter()

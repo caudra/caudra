@@ -1397,11 +1397,7 @@ pub fn reasoning_summary(text: &str) -> ReasoningSummary<'_> {
         return untitled;
     };
     let title = after_open[..close].trim();
-    if title.is_empty()
-        || title
-            .chars()
-            .any(|character| matches!(character, '*' | '\n' | '\r'))
-    {
+    if title.is_empty() || title.chars().any(breaks_a_title) {
         return untitled;
     }
     let suffix = &after_open[close + THOUGHT_TITLE_FENCE.len()..];
@@ -1419,6 +1415,56 @@ pub fn reasoning_summary(text: &str) -> ReasoningSummary<'_> {
         title: Some(title),
         body,
     }
+}
+
+/// What a still-animating block has earned so far, where `visible` is the
+/// revealed prefix of `buffered`. The buffer decides which half the reveal is
+/// spelling out, so a heading whose fence has not closed yet shows nothing at
+/// all rather than drawing its own markup as body text and taking it back a
+/// frame later.
+pub fn streaming_reasoning_summary<'a>(visible: &'a str, buffered: &str) -> ReasoningSummary<'a> {
+    if !may_be_titled(buffered) {
+        return ReasoningSummary {
+            title: None,
+            body: visible.trim(),
+        };
+    }
+    let revealed = reasoning_summary(visible);
+    if revealed.title.is_none() {
+        return ReasoningSummary {
+            title: None,
+            body: "",
+        };
+    }
+    revealed
+}
+
+/// Whether a prefix can still turn out to name itself. An unclosed fence is
+/// undecided rather than plain, and only text that has already broken the
+/// shape is body for good.
+fn may_be_titled(prefix: &str) -> bool {
+    let content = prefix.trim_start();
+    let Some(after_open) = content.strip_prefix(THOUGHT_TITLE_FENCE) else {
+        return THOUGHT_TITLE_FENCE.starts_with(content);
+    };
+    let Some(close) = after_open.find(THOUGHT_TITLE_FENCE) else {
+        // A single trailing star is the closing fence arriving, not a stray.
+        let started = after_open.strip_suffix('*').unwrap_or(after_open);
+        return !started.chars().any(breaks_a_title);
+    };
+    let title = after_open[..close].trim();
+    if title.is_empty() || title.chars().any(breaks_a_title) {
+        return false;
+    }
+    let suffix = &after_open[close + THOUGHT_TITLE_FENCE.len()..];
+    suffix.starts_with(PARAGRAPH_BREAK)
+        || suffix.starts_with(CRLF_PARAGRAPH_BREAK)
+        || PARAGRAPH_BREAK.starts_with(suffix)
+        || CRLF_PARAGRAPH_BREAK.starts_with(suffix)
+}
+
+fn breaks_a_title(character: char) -> bool {
+    matches!(character, '*' | '\n' | '\r')
 }
 
 /// What a subagent is doing right now, so a parent watching only the task
@@ -2512,5 +2558,44 @@ mod tests {
         let summary = reasoning_summary(text);
         assert_eq!(summary.title, title);
         assert_eq!(summary.body, body);
+    }
+
+    const STREAMED_THOUGHT: &str = "**Weighing it up**\n\nBoth read the same file.";
+
+    #[test_case("", None, "" ; "nothing_is_revealed_yet")]
+    #[test_case("*", None, "" ; "the_opening_fence_is_never_body")]
+    #[test_case("**", None, "" ; "a_whole_opening_fence_is_silent_too")]
+    #[test_case("**Weighing", None, "" ; "an_unfinished_title_waits_for_its_fence")]
+    #[test_case("**Weighing it up*", None, "" ; "a_half_closed_fence_waits_as_well")]
+    #[test_case("**Weighing it up**", Some("Weighing it up"), "" ; "the_closing_fence_names_the_header")]
+    #[test_case("**Weighing it up**\n", Some("Weighing it up"), "" ; "a_half_separator_stays_out_of_the_body")]
+    #[test_case(
+        "**Weighing it up**\n\nBoth read",
+        Some("Weighing it up"),
+        "Both read"
+        ; "the_body_follows_its_separator"
+    )]
+    fn a_streamed_thought_withholds_a_title_it_has_not_closed(
+        visible: &str,
+        title: Option<&str>,
+        body: &str,
+    ) {
+        let summary = streaming_reasoning_summary(visible, STREAMED_THOUGHT);
+        assert_eq!(summary.title, title);
+        assert_eq!(summary.body, body);
+    }
+
+    #[test_case("Both read the same file.", "Both read the same file." ; "plain_prose")]
+    #[test_case("**a**b", "**a**b**\n\nbody" ; "a_stray_star_disqualifies_the_buffer")]
+    #[test_case("****", "****\n\nbody" ; "an_empty_title_disqualifies_it_too")]
+    #[test_case(
+        "**Important:**",
+        "**Important:** keep this in the body."
+        ; "the_buffer_disqualifies_what_the_reveal_still_shows_closed"
+    )]
+    fn a_thought_that_broke_the_title_shape_streams_as_body(visible: &str, buffered: &str) {
+        let summary = streaming_reasoning_summary(visible, buffered);
+        assert_eq!(summary.title, None);
+        assert_eq!(summary.body, visible);
     }
 }

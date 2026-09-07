@@ -44,9 +44,9 @@ use super::scrollbar::render_vertical_scrollbar;
 use super::streaming_content::StreamingContent;
 use caudra_agent::tools::ToolEffect;
 use caudra_agent::{
-    BatchToolEntry, BufferSnapshot, EventSender, InstructionBlock, NO_FILES_FOUND, SharedBuf,
-    SubagentProgress, ToolDoneEvent, ToolOutput, ToolStartEvent, format_live_duration,
-    reasoning_summary,
+    BatchToolEntry, BufferSnapshot, EventSender, InstructionBlock, NO_FILES_FOUND,
+    ReasoningSummary, SharedBuf, SubagentProgress, ToolDoneEvent, ToolOutput, ToolStartEvent,
+    format_live_duration, reasoning_summary, streaming_reasoning_summary,
 };
 use caudra_lua::{EventHandle, WARM_TOOL_CAP, WinView};
 use caudra_storage::view::ViewMode;
@@ -2312,8 +2312,7 @@ impl MessagesPanel {
             let content_width =
                 SegmentChrome::for_kind(SegmentKind::Thinking, width, 0).content_width(width);
             self.streaming_thinking.tick();
-            let visible = self.streaming_thinking.visible().to_owned();
-            let body = reasoning_summary(&visible).body.to_owned();
+            let body = self.streaming_reasoning().body.to_owned();
             if self
                 .streaming_thinking
                 .update_render_from(body, content_width)
@@ -2584,10 +2583,7 @@ impl MessagesPanel {
                 (self.build_streaming_collapsed_lines(), None)
             } else {
                 let (lines, _) = self.build_streaming_expanded_lines();
-                let mut provenance = if reasoning_summary(self.streaming_thinking.visible())
-                    .body
-                    .is_empty()
-                {
+                let mut provenance = if self.streaming_reasoning().body.is_empty() {
                     None
                 } else {
                     self.streaming_thinking.provenance().cloned()
@@ -2654,17 +2650,11 @@ impl MessagesPanel {
                         || self.streaming_reasoning_open(),
                         |message| self.reasoning_open(message),
                     );
-                    let reasoning = message.map_or_else(
-                        || {
-                            if open {
-                                self.streaming_thinking.visible()
-                            } else {
-                                self.streaming_thinking.buffer()
-                            }
-                        },
-                        |message| message.text.as_str(),
-                    );
-                    let summary = reasoning_summary(reasoning);
+                    let summary = match message {
+                        Some(message) => reasoning_summary(&message.text),
+                        None if open => self.streaming_reasoning(),
+                        None => reasoning_summary(self.streaming_thinking.buffer()),
+                    };
                     let heading = summary.title.map_or_else(
                         || "Thinking".to_owned(),
                         |title| format!("Thinking: {}", markdown_inline(title)),
@@ -3023,22 +3013,35 @@ impl MessagesPanel {
         self.messages.push(msg);
     }
 
+    /// The two halves the reveal has earned so far. The buffer decides which
+    /// of them a fragment belongs to, so an unfinished heading is withheld
+    /// instead of being drawn as body and then moved into the header.
+    fn streaming_reasoning(&self) -> ReasoningSummary<'_> {
+        streaming_reasoning_summary(
+            self.streaming_thinking.visible(),
+            self.streaming_thinking.buffer(),
+        )
+    }
+
     fn build_streaming_collapsed_lines(&self) -> Vec<Line<'static>> {
         thought_line(
-            self.streaming_thinking.buffer(),
+            reasoning_summary(self.streaming_thinking.buffer()).title,
             self.thinking_started.map(|started| started.elapsed()),
             false,
         )
     }
 
     fn build_streaming_expanded_lines(&self) -> (Vec<Line<'static>>, LinkMap) {
+        let summary = self.streaming_reasoning();
         let mut lines = thought_line(
-            self.streaming_thinking.visible(),
+            summary.title,
             self.thinking_started.map(|started| started.elapsed()),
             false,
         );
         let mut links = LinkMap::none_for(&lines);
-        if !self.streaming_thinking.cached_lines().is_empty() {
+        // A body with nothing in it still renders one line, which would leave
+        // the card a row taller than the header it draws.
+        if !summary.body.is_empty() && !self.streaming_thinking.cached_lines().is_empty() {
             lines.push(Line::from(""));
             links.rows.push(Vec::new());
             lines.extend_from_slice(self.streaming_thinking.cached_lines());
@@ -3054,7 +3057,7 @@ impl MessagesPanel {
         text: &str,
         duration: Option<Duration>,
     ) -> Vec<Line<'static>> {
-        thought_line(text, duration, true)
+        thought_line(reasoning_summary(text).title, duration, true)
     }
 
     fn try_toggle_collapsed_thinking(&mut self, doc_row: u32, width: u16) -> bool {
@@ -3447,9 +3450,8 @@ fn same_display_item(left: &DisplayMessage, right: &DisplayMessage) -> bool {
     }
 }
 
-fn thought_line(text: &str, duration: Option<Duration>, done: bool) -> Vec<Line<'static>> {
+fn thought_line(title: Option<&str>, duration: Option<Duration>, done: bool) -> Vec<Line<'static>> {
     let theme = theme::current();
-    let summary = reasoning_summary(text);
     let label = if done { THOUGHT_PREFIX } else { "Thinking" };
     let header_style = if done {
         theme.thinking
@@ -3464,7 +3466,7 @@ fn thought_line(text: &str, duration: Option<Duration>, done: bool) -> Vec<Line<
         ));
     }
     spans.push(Span::styled(label, header_style));
-    if let Some(title) = summary.title {
+    if let Some(title) = title {
         spans.push(Span::styled(format!(": {title}"), header_style));
     }
     if let Some(duration) = duration {
@@ -3660,7 +3662,7 @@ fn build_message_lines(msg: &DisplayMessage, width: u16, diagram_pans: Vec<u16>)
 
 fn build_thinking_lines(msg: &DisplayMessage, width: u16, diagram_pans: Vec<u16>) -> BuiltMessage {
     let summary = reasoning_summary(&msg.text);
-    let mut lines = thought_line(&msg.text, msg.thinking_duration, true);
+    let mut lines = thought_line(summary.title, msg.thinking_duration, true);
     let mut links = LinkMap::none_for(&lines);
     let mut provenance = None;
     let mut diagrams = Vec::new();
