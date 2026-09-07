@@ -23,6 +23,7 @@ pub mod ingest;
 pub mod model;
 pub mod rank;
 pub mod resolve;
+pub mod retrieve;
 
 pub use extract::{ExtractLimits, FileFacts};
 pub use ingest::{IngestLimits, IngestTruncation, Ingested, SourceInput, ingest};
@@ -32,4 +33,5 @@ pub use model::{
 };
 pub use rank::{Ranking, Teleport, pagerank, reaching};
 pub use resolve::{Edge, Graph, ResolutionDiagnostics, ResolutionTier, resolve};
+pub use retrieve::{Confidence, QueryShape, Retrieval, Scored, retrieve, route, subtokens};
 pub use workcell_source_languages::{Language, LanguageFamily, ReferenceKind, SymbolKind};
