@@ -44,7 +44,7 @@ Dev builds skip debug info for deps and vendored C (our crates keep it); to debu
 
 ## Nix
 
-`nix develop` (dev shell), `nix build`, `nix fmt` (nixfmt), `nix flake check` (includes git-dep-hashes drift).
+`nix develop` (dev shell), `nix build`, `nix fmt` (nixfmt), `nix flake check` (includes git-dep-hashes drift, fixed by `just bump-workcell`).
 
 ## Architecture
 
@@ -84,6 +84,13 @@ extracted worker lease for the complete pool lifetime.
 Release builds use the Workcell Git revision pinned in `Cargo.toml`. Development recipes in `justfile`
 patch its packages from the sibling `../workcell-mcp` checkout when that repository is present and use
 a temporary lockfile seeded from `Cargo.lock`. Use plain Cargo when intentionally updating dependencies.
+
+Because those recipes read the sibling checkout, a change made there is invisible to a release until it
+is pushed and the pin moves. After pushing `workcell-mcp`, run `just bump-workcell`: it rewrites the
+rev in `Cargo.toml`, updates `Cargo.lock`, and refreshes the flake's git dependency hashes, which are
+keyed by commit and so change with every bump. Pass `--rev` to pin something other than the remote head.
+It needs `nix` on PATH but not the daemon, and refuses to run on a dirty `Cargo.toml`, `Cargo.lock`, or
+`flake.nix`. Local tests keep passing without it, so a Workcell change is not finished until it runs.
 
 For worker or release changes, run the production bundled-worker execution test with a real pinned
 worker, not only a catalog check. Release smoke tests must fail when `python_execution` is reserved but

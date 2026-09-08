@@ -58,5 +58,9 @@ gen-docs-check:
 machete:
     cargo machete
 
+# Pin Workcell at its latest pushed commit and refresh the flake's dependency hashes.
+bump-workcell *ARGS:
+    scripts/bump-workcell.py {{ ARGS }}
+
 # Full CI check
 ci: code-worker fmt-check lint pylint test gen-docs-check machete
