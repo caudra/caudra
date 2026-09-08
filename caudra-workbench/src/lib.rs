@@ -490,7 +490,13 @@ impl Workbench {
         if !self.open || self.root != root {
             self.open(root);
         }
-        self.open_path(path);
+        // A mention names a path relative to the project, and the tree only
+        // reveals what it can strip its own root from.
+        self.open_path(&self.root.join(path));
+        self.show_explorer();
+        // The tree marks its row only while it has the focus, so a reveal the
+        // reader cannot see is the same as no reveal.
+        self.focus = Focus::Sidebar;
         let Some(tab) = self.editor.active_mut() else {
             return;
         };
@@ -1061,8 +1067,7 @@ impl Workbench {
                 self.save_active();
             }
             MenuAction::RevealInExplorer => {
-                self.sidebar = SidebarView::Explorer;
-                self.sidebar_collapsed = false;
+                self.show_explorer();
                 self.focus = Focus::Sidebar;
                 self.tree.reveal(&path);
             }
@@ -2325,6 +2330,13 @@ impl Workbench {
         }
     }
 
+    /// Puts the tree back on screen. A revealed row is no reveal at all while
+    /// the sidebar is collapsed or showing source control.
+    fn show_explorer(&mut self) {
+        self.sidebar = SidebarView::Explorer;
+        self.sidebar_collapsed = false;
+    }
+
     /// Keeps the tree on whatever the editor is showing, so the sidebar never
     /// points somewhere else after a tab switch.
     fn reveal_active(&mut self) {
@@ -2922,6 +2934,27 @@ mod tests {
                 .map(|(from, _)| (from.line, from.col)),
             anchor,
             "{MENTION_WRONG_LINES}"
+        );
+    }
+
+    /// A mention names a path relative to the project, so the tree has to
+    /// resolve it before it can strip its own root and expand the way there.
+    #[test_case(OPENED_FILE ; "at_the_top_level")]
+    #[test_case("sub/b.txt" ; "inside_a_directory")]
+    fn open_at_selects_the_file_in_the_explorer(relative: &str) {
+        let (dir, mut workbench) = project();
+        workbench.sidebar = SidebarView::Search;
+        workbench.sidebar_collapsed = true;
+
+        workbench.open_at(dir.path(), Path::new(relative), None);
+
+        assert_eq!(workbench.sidebar, SidebarView::Explorer, "{NOT_REVEALED}");
+        assert!(!workbench.sidebar_collapsed, "{NOT_REVEALED}");
+        assert_eq!(workbench.focus, Focus::Sidebar, "{NOT_REVEALED}");
+        assert_eq!(
+            workbench.tree.selected().map(|row| row.path.clone()),
+            Some(dir.path().join(relative)),
+            "{NOT_REVEALED}"
         );
     }
 

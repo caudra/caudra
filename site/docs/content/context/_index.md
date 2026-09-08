@@ -66,7 +66,7 @@ A mention only resolves when the path exists in your working directory. That is 
 
 Caudra records a whole-file mention as a read, so a later edit is blocked if the file changed in between. A line range is not recorded, because seeing part of a file is not enough to edit the rest of it safely.
 
-A mention marks itself as the pointer passes over it, the way a paste label does. Click it to open the file in the [workbench](/docs/workbench/), scrolled to the lines it names. `Ctrl+X Enter` in the workbench goes the other way, sending the file and the selected lines to the composer as a mention.
+A mention marks itself as the pointer passes over it, the way a paste label does. Click it to open the file in the [workbench](/docs/workbench/), scrolled to the lines it names, with the explorer expanded to it and the row selected. `Ctrl+X Enter` in the workbench goes the other way, sending the file and the selected lines to the composer as a mention.
 
 ## Instruction files
 
