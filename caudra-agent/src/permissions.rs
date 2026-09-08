@@ -556,6 +556,33 @@ fn remove_pending(
     removed
 }
 
+/// Whether a new rule settles everything a pending prompt was still waiting on.
+///
+/// A resource the candidate already had covered when it prompted does not need
+/// saying again, so an answer narrowed to the part that was actually undecided
+/// still dismisses the prompt. Without that, choosing to remember only the new
+/// command in a batch would leave its siblings on screen forever.
+///
+/// A sticky ask is the rules themselves asking, which no grant answers.
+fn rule_settles(rule: &StructuredPermissionRule, candidate: &PendingPermission) -> bool {
+    candidate.sticky_ask.len() == candidate.request.resources.len()
+        && candidate.sticky_ask.iter().all(|sticky| !sticky)
+        && candidate
+            .request
+            .resources
+            .iter()
+            .enumerate()
+            .all(|(index, resource)| {
+                permission_rule_covers_resource(rule, &candidate.request, resource)
+                    || candidate
+                        .request
+                        .presentation
+                        .resources
+                        .get(index)
+                        .is_some_and(|shown| shown.covered)
+            })
+}
+
 fn reusable_rule_scope_matches(
     lifetime: &PermissionLifetime,
     source_manager_id: u64,
@@ -974,11 +1001,7 @@ impl PermissionManager {
                         project.as_deref(),
                         manager_id,
                         candidate.project.as_deref(),
-                    ) && candidate.sticky_ask.len() == candidate.request.resources.len()
-                        && candidate.sticky_ask.iter().all(|sticky| !sticky)
-                        && candidate.request.resources.iter().all(|resource| {
-                            permission_rule_covers_resource(&rule, &candidate.request, resource)
-                        })
+                    ) && rule_settles(&rule, candidate)
                     {
                         matches.push((manager_id, candidate_id.clone()));
                     }
@@ -4336,6 +4359,75 @@ mod tests {
         });
     }
 
+    /// A per-command answer deliberately says nothing about commands that were
+    /// already allowed, so the sweep has to count a sibling's own prior
+    /// coverage. Otherwise narrowing an answer to what was actually undecided
+    /// would strand every sibling that shares an allowed command.
+    #[test]
+    fn a_narrow_authority_sweeps_a_sibling_whose_other_commands_were_already_allowed() {
+        smol::block_on(async {
+            let manager = Arc::new(default_mgr());
+            let settled = "cargo build";
+            let undecided = "npm test";
+            let seed = PermissionRequest::from_legacy(
+                "seed".into(),
+                ToolKey::native("bash"),
+                vec![settled.into()],
+                serde_json::json!({"command": settled}),
+                Path::new("/tmp"),
+                false,
+            );
+            manager.load_structured_conversation_rules(vec![
+                PermissionRuleRecord::conversation(
+                    seed.option_rule("allow_exact_commands", PermissionLifetime::Conversation)
+                        .unwrap(),
+                )
+                .unwrap(),
+            ]);
+            let (first, first_events) = pending_tool_enforcement(
+                Arc::clone(&manager),
+                "first",
+                "bash",
+                undecided.into(),
+                serde_json::json!({"command": undecided}),
+            );
+            let (second, second_events) = pending_scope_enforcement(
+                Arc::clone(&manager),
+                "second",
+                "bash",
+                crate::tools::PermissionScopes {
+                    scopes: vec![settled.into(), undecided.into()],
+                    force_prompt: false,
+                    plan_scoped: false,
+                },
+                serde_json::json!({"command": format!("{settled} && {undecided}")}),
+            );
+            first_events.recv_async().await.unwrap();
+            let AgentEvent::PermissionRequest(sibling) =
+                second_events.recv_async().await.unwrap().event
+            else {
+                panic!("{COMPOSED_PROMPT_MISSING}");
+            };
+            assert!(sibling.presentation.resources[0].covered);
+            assert!(!sibling.presentation.resources[1].covered);
+
+            assert!(manager.answer(
+                "first",
+                PermissionAnswer::AllowComposed {
+                    rows: vec![Some(PermissionRowGrant::Offered("command_exact_0".into()))],
+                    lifetime: PermissionLifetime::Conversation,
+                }
+            ));
+            assert_eq!(manager.pending_count(), 0);
+            assert!(matches!(
+                second_events.try_recv().unwrap().event,
+                AgentEvent::PermissionRequestResolved { request_id, .. } if request_id == "second"
+            ));
+            assert!(first.await.is_ok());
+            assert!(second.await.is_ok());
+        });
+    }
+
     /// A forced prompt is the mode asking, not the rules, so no grant answers it.
     #[test]
     fn a_broad_authority_leaves_a_forced_prompt_pending() {
@@ -5020,6 +5112,7 @@ mod tests {
     }
 
     const COMPOSED_REQUEST_ID: &str = "composed-request";
+    const COMPOSED_PROMPT_MISSING: &str = "batched commands did not raise a prompt";
 
     /// The point of per-row scopes: one answer, one rule, and only the rows
     /// that asked to be remembered end up in it. The row that asked for nothing
