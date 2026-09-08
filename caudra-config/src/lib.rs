@@ -176,7 +176,10 @@ pub const CODE_GRAPH_GROUP: &str = "code graph";
 /// Deferred because most sessions never call them, not because there are too
 /// many: the code graph answers "I do not know this codebase", `image_generate`
 /// needs a subscription and an intent to draw, and `execution_environment`
-/// reports host facts `shell` can also reach. Everything else is either used
+/// reports host facts `shell` can also reach. `python_execution` is deferred for
+/// its size as well as its rate: its manual for Monty's Python subset is the
+/// largest definition in the array, and `shell`'s own description already tells
+/// the model a code execution tool exists. Everything else is either used
 /// constantly or is the only way to do something.
 ///
 /// Tools sharing a group load together. A name here must also appear in one of
@@ -189,6 +192,7 @@ pub const DEFERRED_BUILTIN_TOOLS: &[DeferredBuiltin] = &[
     DeferredBuiltin::grouped("code_expand", CODE_GRAPH_GROUP),
     DeferredBuiltin::alone("execution_environment"),
     DeferredBuiltin::alone("image_generate"),
+    DeferredBuiltin::alone("python_execution"),
 ];
 
 pub struct DeferredBuiltin {
