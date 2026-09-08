@@ -21,6 +21,7 @@ pub const FAMILY_REQUIRES_FILESYSTEM_KIND: &str =
 pub const FAMILY_REQUIRES_READ_ACCESS: &str =
     "filesystem read family requires read or search access";
 pub const FAMILY_REQUIRES_MCP_SUBJECT: &str = "mcp server family requires an mcp subject";
+pub const RAW_RESOURCE_VALUES_NOT_DURABLE: &str = "raw resource values cannot be stored durably";
 pub const COMMAND_PATTERN_MAX_BYTES: usize = 256;
 pub const COMMAND_PATTERN_MAX_TOKENS: usize = 8;
 const SHA256_HEX_LEN: usize = 64;
@@ -82,13 +83,33 @@ pub enum PermissionResourceAccess {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "match", rename_all = "snake_case")]
 pub enum PermissionResourceSelector {
-    Exact { value: String },
-    Digest { digest: String },
-    FilesystemSubtreeDigest { digest: String },
-    UrlSubtreeDigest { digest: String },
-    UrlOriginDigest { digest: String },
-    CommandPattern { pattern: String },
-    Subtree { root: String },
+    Exact {
+        value: String,
+    },
+    Digest {
+        digest: String,
+    },
+    FilesystemSubtreeDigest {
+        digest: String,
+    },
+    UrlSubtreeDigest {
+        digest: String,
+    },
+    UrlOriginDigest {
+        digest: String,
+    },
+    CommandPattern {
+        pattern: String,
+    },
+    Subtree {
+        root: String,
+    },
+    /// Everything whose value starts with `value`, which is what a configured
+    /// scope ending in a bare `*` has always meant. Carries raw text, so like
+    /// `Exact` and `Subtree` it is a configured selector and never a stored one.
+    Prefix {
+        value: String,
+    },
     Any,
 }
 
@@ -513,11 +534,11 @@ fn validate_selector(selector: &PermissionResourceSelector) -> Result<(), Permis
         PermissionResourceSelector::CommandPattern { .. } => Err(PermissionStateError::Invalid(
             "command pattern selector is only valid as a primary command resource selector".into(),
         )),
-        PermissionResourceSelector::Exact { .. } | PermissionResourceSelector::Subtree { .. } => {
-            Err(PermissionStateError::Invalid(
-                "raw resource values cannot be stored durably".into(),
-            ))
-        }
+        PermissionResourceSelector::Exact { .. }
+        | PermissionResourceSelector::Subtree { .. }
+        | PermissionResourceSelector::Prefix { .. } => Err(PermissionStateError::Invalid(
+            RAW_RESOURCE_VALUES_NOT_DURABLE.into(),
+        )),
     }
 }
 
@@ -591,8 +612,9 @@ mod tests {
         PermissionArgumentConstraint, PermissionCapabilityFamily, PermissionExecutorKind,
         PermissionLifetime, PermissionResourceAccess, PermissionResourceConstraint,
         PermissionResourceKind, PermissionResourceSelector, PermissionRuleRecord, PermissionState,
-        PermissionStateError, PermissionSubject, SHA256_HEX_LEN, StructuredPermissionEffect,
-        StructuredPermissionRule, validate_command_pattern, validate_conversation_record,
+        PermissionStateError, PermissionSubject, RAW_RESOURCE_VALUES_NOT_DURABLE, SHA256_HEX_LEN,
+        StructuredPermissionEffect, StructuredPermissionRule, validate_command_pattern,
+        validate_conversation_record,
     };
     use crate::state::{self, SCOPE_GLOBAL};
     use crate::{StateDir, now_epoch};
@@ -972,6 +994,22 @@ mod tests {
         rule.resources.clear();
 
         assert_eq!(family_error(rule), FAMILY_REQUIRES_RESOURCES);
+    }
+
+    /// A selector holding raw text cannot be stored: a record outlives the run
+    /// that wrote it, and raw text is not a stable name for a resource.
+    #[test_case(PermissionResourceSelector::Exact { value: "/project/notes.md".into() } ; "an exact value")]
+    #[test_case(PermissionResourceSelector::Subtree { root: "/project".into() } ; "a subtree root")]
+    #[test_case(PermissionResourceSelector::Prefix { value: "/project/gen".into() } ; "a prefix")]
+    fn a_raw_selector_cannot_be_stored_durably(selector: PermissionResourceSelector) {
+        let mut rule = family_rule(
+            PermissionResourceKind::File,
+            Some(PermissionResourceAccess::Read),
+        );
+        rule.family = None;
+        rule.resources[0].selector = selector;
+
+        assert_eq!(family_error(rule), RAW_RESOURCE_VALUES_NOT_DURABLE);
     }
 
     /// The server is read off the rule's own subject, so a subject that names no

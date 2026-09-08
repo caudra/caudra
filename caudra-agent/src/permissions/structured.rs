@@ -716,8 +716,9 @@ fn protected_coverage_allowed(
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum SelectorWidth {
     Blanket,
-    /// A subtree, or a command pattern carrying its literal count and byte
-    /// length so `git status *` outranks `git *`.
+    /// How much literal text the selector pins, as a token count and their total
+    /// byte length, so `git status *` outranks `git *`. A subtree pins a region
+    /// by structure rather than by text and so pins none.
     Region(usize, usize),
     Exact,
 }
@@ -725,14 +726,18 @@ enum SelectorWidth {
 fn selector_width(selector: &PermissionResourceSelector) -> SelectorWidth {
     match selector {
         PermissionResourceSelector::Any => SelectorWidth::Blanket,
-        // A pattern that names no literal reaches everything its kind has, so it
-        // ranks with the blanket selector rather than above it.
+        // The grammar knows to leave the trailing wildcard out of the count,
+        // which a plain tokenization would include.
         PermissionResourceSelector::CommandPattern { pattern } => {
             match super::command_pattern::specificity(pattern) {
-                Some((literals, bytes)) if literals > 0 => SelectorWidth::Region(literals, bytes),
-                _ => SelectorWidth::Blanket,
+                Some((tokens, bytes)) => pinned_text_width(tokens, bytes),
+                None => SelectorWidth::Blanket,
             }
         }
+        PermissionResourceSelector::Prefix { value } => pinned_text_width(
+            value.split_whitespace().count(),
+            value.split_whitespace().map(str::len).sum(),
+        ),
         PermissionResourceSelector::Subtree { .. }
         | PermissionResourceSelector::FilesystemSubtreeDigest { .. }
         | PermissionResourceSelector::UrlSubtreeDigest { .. }
@@ -740,6 +745,18 @@ fn selector_width(selector: &PermissionResourceSelector) -> SelectorWidth {
         PermissionResourceSelector::Exact { .. } | PermissionResourceSelector::Digest { .. } => {
             SelectorWidth::Exact
         }
+    }
+}
+
+/// A selector pinning no text reaches everything its kind has, so it ranks with
+/// the blanket selector rather than above it. Prefixes and command patterns are
+/// measured the same way, because a configured scope becomes one or the other
+/// purely by its spelling and the two must rank against each other honestly.
+fn pinned_text_width(tokens: usize, bytes: usize) -> SelectorWidth {
+    if tokens == 0 {
+        SelectorWidth::Blanket
+    } else {
+        SelectorWidth::Region(tokens, bytes)
     }
 }
 
@@ -995,6 +1012,10 @@ fn selector_matches(
             PermissionResourceKind::Url => http_url_is_subtree(root, value),
             _ => false,
         },
+        // Raw text matched raw, on every kind, exactly as a configured scope
+        // ending in a bare `*` always was. Normalizing either side would change
+        // which existing configs match, and a deny is among them.
+        PermissionResourceSelector::Prefix { value: prefix } => value.starts_with(prefix),
     }
 }
 
@@ -2989,10 +3010,50 @@ mod tests {
     #[test_case(PermissionResourceSelector::CommandPattern { pattern: BROAD_ASK.into() } => SelectorWidth::Region(1, 3) ; "a pattern names its literals")]
     #[test_case(PermissionResourceSelector::FilesystemSubtreeDigest { digest: SUBTREE_DIGEST.into() } => SelectorWidth::Region(0, 0) ; "a subtree names a region")]
     #[test_case(PermissionResourceSelector::Exact { value: NARROW_COMMAND.into() } => SelectorWidth::Exact ; "an exact selector names one resource")]
+    #[test_case(PermissionResourceSelector::Prefix { value: "git status".into() } => SelectorWidth::Region(2, 9) ; "a prefix is measured like the pattern it competes with")]
+    #[test_case(PermissionResourceSelector::Prefix { value: String::new() } => SelectorWidth::Blanket ; "an empty prefix names everything")]
     fn selector_width_reflects_how_much_a_selector_names(
         selector: PermissionResourceSelector,
     ) -> SelectorWidth {
         selector_width(&selector)
+    }
+
+    /// The one configured form the structured model had no equivalent for: a
+    /// scope ending in a bare `*`. It is raw text matched raw, on any kind, so
+    /// that the deny rules already written against it keep matching.
+    #[test_case(PermissionResourceKind::Command, "git status --short" => true ; "reaches a command it prefixes")]
+    #[test_case(PermissionResourceKind::Command, "git stash" => false ; "stops where the prefix stops")]
+    #[test_case(PermissionResourceKind::Command, "sudo git status" => false ; "must start the value, not merely appear in it")]
+    #[test_case(PermissionResourceKind::File, "git status --short" => true ; "is not tied to one kind")]
+    fn a_prefix_selector_reaches_what_it_starts(kind: PermissionResourceKind, value: &str) -> bool {
+        selector_matches(
+            &PermissionResourceSelector::Prefix {
+                value: "git stat".into(),
+            },
+            value,
+            &kind,
+        )
+    }
+
+    /// A configured scope becomes a prefix or a command pattern purely by its
+    /// spelling, so the two have to rank against each other rather than by which
+    /// kind of selector they became.
+    #[test]
+    fn a_prefix_outranks_a_command_pattern_that_pins_less() {
+        let prefix = PermissionResourceConstraint {
+            selector: PermissionResourceSelector::Prefix {
+                value: "git status".into(),
+            },
+            ..pattern_constraint(BROAD_ASK)
+        };
+
+        assert_eq!(
+            order_independent_command_decision(NARROW_COMMAND, |request| vec![
+                rule(request, ASK, vec![pattern_constraint(BROAD_ASK)]),
+                rule(request, ALLOW, vec![prefix.clone()]),
+            ]),
+            StructuredPermissionDecision::Allow
+        );
     }
 
     const MCP_SERVER: &str = "deepwiki";
