@@ -305,6 +305,27 @@ impl ThinkingSupport {
     }
 }
 
+/// Who pays for a turn. A subscription price is the API list price for the same
+/// tokens: the arithmetic is real, the invoice is not, so the two are counted
+/// apart everywhere rather than summed into one misleading total.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Billing {
+    #[default]
+    Api,
+    Subscription,
+}
+
+impl Billing {
+    pub fn from_oauth(oauth: bool) -> Self {
+        if oauth { Self::Subscription } else { Self::Api }
+    }
+
+    pub fn is_subscription(self) -> bool {
+        matches!(self, Self::Subscription)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Model {
     pub id: String,
@@ -334,6 +355,10 @@ pub struct Model {
     /// request never needs a live catalog lookup. Empty when nothing declared
     /// them, which callers read as "send nothing and take the API default".
     pub reasoning_options: ReasoningOptions,
+    /// Whether a turn on this model is invoiced. Providers that serve both an
+    /// API key and a subscription set it from their auth in `adjust_model`, so
+    /// a model built from a spec alone is `Api` until a provider says otherwise.
+    pub billing: Billing,
 }
 
 /// `ManifestRegistry::for_slug` resolves a custom slug to its base provider's
@@ -411,6 +436,7 @@ impl Model {
             window_excludes_output: window_excludes_output(manifest.slug, context_window),
             thinking_fields: None,
             reasoning_options,
+            billing: Billing::default(),
         }
     }
 
@@ -446,6 +472,7 @@ impl Model {
             window_excludes_output: false,
             thinking_fields: None,
             reasoning_options: meta.reasoning_options,
+            billing: Billing::default(),
         }
     }
 
@@ -713,16 +740,26 @@ impl From<StoredTokenUsage> for TokenUsage {
 }
 
 impl TokenUsage {
-    /// Ready to store, with what the turn was billed. No `From<TokenUsage>` on
-    /// purpose: a caller that forgets the cost quietly loses money from the
-    /// session total, so saying it out loud is mandatory.
-    pub fn billed(&self, cost: Option<f64>) -> StoredTokenUsage {
+    /// Ready to store, with what the turn was billed and who owes it. No
+    /// `From<TokenUsage>` on purpose: a caller that forgets the cost quietly
+    /// loses money from the session total, so saying it out loud is mandatory.
+    pub fn billed(&self, cost: Option<f64>, billing: Billing) -> StoredTokenUsage {
+        match billing {
+            Billing::Api => self.spent(cost, None),
+            Billing::Subscription => self.spent(None, cost),
+        }
+    }
+
+    /// For a caller holding both columns already, such as a goal that ran turns
+    /// under an API key and a subscription both.
+    pub fn spent(&self, cost: Option<f64>, subscription_cost: Option<f64>) -> StoredTokenUsage {
         StoredTokenUsage {
             input: self.input,
             output: self.output,
             cache_creation: self.cache_creation,
             cache_read: self.cache_read,
             cost,
+            subscription_cost,
         }
     }
 
@@ -1355,15 +1392,33 @@ mod tests {
     #[test]
     fn billed_stores_every_counter_and_the_cost() {
         assert_eq!(
-            COUNTERS.billed(Some(RECORDED_COST)),
+            COUNTERS.billed(Some(RECORDED_COST), Billing::Api),
             StoredTokenUsage {
                 input: COUNTERS.input,
                 output: COUNTERS.output,
                 cache_creation: COUNTERS.cache_creation,
                 cache_read: COUNTERS.cache_read,
                 cost: Some(RECORDED_COST),
+                subscription_cost: None,
             }
         );
-        assert_eq!(COUNTERS.billed(None).cost, None);
+        assert_eq!(COUNTERS.billed(None, Billing::Api).cost, None);
+    }
+
+    const WRONG_COLUMN: &str = "a price must land under the payer that owes it";
+
+    #[test_case(Billing::Api,          Some(RECORDED_COST), None ; "an_api_key_is_invoiced")]
+    #[test_case(Billing::Subscription, None, Some(RECORDED_COST) ; "a_plan_owes_nothing")]
+    fn billed_files_the_price_under_its_payer(
+        billing: Billing,
+        cost: Option<f64>,
+        subscription_cost: Option<f64>,
+    ) {
+        let stored = COUNTERS.billed(Some(RECORDED_COST), billing);
+        assert_eq!(stored.cost, cost, "{WRONG_COLUMN}");
+        assert_eq!(
+            stored.subscription_cost, subscription_cost,
+            "{WRONG_COLUMN}"
+        );
     }
 }

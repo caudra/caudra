@@ -76,6 +76,14 @@ more context and mistakes        one bounded result
 
 Each turn is priced when it happens and that number is stored with the session. Prices move (DeepSeek, for one, doubles every rate during peak UTC hours), so a total re-priced later would be a guess. What you see is what you were billed.
 
+## Spend on a subscription
+
+A Claude, ChatGPT, or Copilot login pays a flat monthly fee, so its turns never reach an invoice. Caudra still prices them at the provider's published API rates and files the figure separately, labelled `subscription (not billed)`. That is what the same work would have cost through the API.
+
+The status bar has room for one number. It shows real spend when there is any, and puts a tilde in front when a subscription covered the session: `~$0.123`. In `/usage` the headline total stays money owed, and the subscription figure sits on its own line beneath it.
+
+Turns recorded before Caudra tracked the two apart are filed as billed spend, so an older ledger can overstate what you paid.
+
 ## Lifetime spend
 
 Deleting a session deletes its transcript. The record of what it cost lives in a separate ledger that no session owns, so trimming and forgetting leave your spending history intact.

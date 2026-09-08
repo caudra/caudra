@@ -6,8 +6,8 @@ use caudra_config::ModelPolicy;
 use caudra_providers::model_registry::GoalEvaluatorTarget;
 use caudra_providers::provider::{Provider, from_model_async};
 use caudra_providers::{
-    AgentError, ContentBlock, Message, Model, ModelError, ModelTier, RequestOptions, Timeouts,
-    TokenUsage,
+    AgentError, Billing, ContentBlock, Message, Model, ModelError, ModelTier, RequestOptions,
+    Timeouts, TokenUsage,
 };
 use caudra_storage::id::SessionRef;
 use caudra_storage::sessions::{StoredActiveGoal, StoredGoalVerdict};
@@ -58,6 +58,7 @@ pub struct GoalSnapshot {
     pub elapsed_before: Duration,
     pub usage: TokenUsage,
     pub cost: Option<f64>,
+    pub subscription_cost: Option<f64>,
     pub(crate) generation: u64,
 }
 
@@ -96,6 +97,7 @@ pub struct GoalResult {
     pub duration: Duration,
     pub usage: TokenUsage,
     pub cost: Option<f64>,
+    pub subscription_cost: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -143,6 +145,7 @@ impl GoalHandle {
                 elapsed_before: Duration::from_millis(stored.elapsed_ms),
                 usage: stored.usage.into(),
                 cost: stored.usage.cost,
+                subscription_cost: stored.usage.subscription_cost,
                 generation: state.generation,
             });
         }
@@ -166,6 +169,7 @@ impl GoalHandle {
             elapsed_before: Duration::ZERO,
             usage: TokenUsage::default(),
             cost: None,
+            subscription_cost: None,
             generation: state.generation,
         };
         state.finished = None;
@@ -216,24 +220,30 @@ impl GoalHandle {
             .map(|goal| goal.condition.to_string())
     }
 
-    pub fn record_external_usage(&self, usage: TokenUsage, cost: Option<f64>) {
-        self.record_usage(usage, cost);
+    pub fn record_external_usage(&self, usage: TokenUsage, cost: Option<f64>, billing: Billing) {
+        self.record_usage(usage, cost, billing);
     }
 
-    pub(crate) fn record_usage(&self, usage: TokenUsage, cost: Option<f64>) {
+    pub(crate) fn record_usage(&self, usage: TokenUsage, cost: Option<f64>, billing: Billing) {
         if let Some(active) = self.lock().active.as_mut() {
             active.usage += usage;
-            add_cost(&mut active.cost, cost);
+            add_spend(active, cost, billing);
         }
     }
 
-    pub(crate) fn record_usage_for(&self, generation: u64, usage: TokenUsage, cost: Option<f64>) {
+    pub(crate) fn record_usage_for(
+        &self,
+        generation: u64,
+        usage: TokenUsage,
+        cost: Option<f64>,
+        billing: Billing,
+    ) {
         let mut state = self.lock();
         if let Some(active) = state.active.as_mut()
             && active.generation == generation
         {
             active.usage += usage;
-            add_cost(&mut active.cost, cost);
+            add_spend(active, cost, billing);
         }
     }
 
@@ -275,6 +285,7 @@ impl GoalHandle {
             duration: active.started_at.elapsed(),
             usage: active.usage,
             cost: active.cost,
+            subscription_cost: active.subscription_cost,
         });
         GoalApply::Terminal
     }
@@ -304,6 +315,7 @@ pub(crate) struct EvaluationResult {
     pub reason: String,
     pub usage: TokenUsage,
     pub cost: Option<f64>,
+    pub billing: Billing,
     pub model: String,
 }
 
@@ -311,6 +323,7 @@ pub(crate) struct EvaluationError {
     pub error: AgentError,
     pub usage: TokenUsage,
     pub cost: Option<f64>,
+    pub billing: Billing,
     pub model: String,
 }
 
@@ -485,6 +498,7 @@ impl Evaluator<'_> {
                         error,
                         usage,
                         cost,
+                        billing: model.billing,
                         model: model.spec(),
                     });
                 }
@@ -499,6 +513,7 @@ impl Evaluator<'_> {
                         error,
                         usage,
                         cost,
+                        billing: model.billing,
                         model: model.spec(),
                     });
                 }
@@ -510,6 +525,7 @@ impl Evaluator<'_> {
                         reason,
                         usage,
                         cost,
+                        billing: model.billing,
                         model: model.spec(),
                     });
                 }
@@ -525,6 +541,7 @@ impl Evaluator<'_> {
                             },
                             usage,
                             cost,
+                            billing: model.billing,
                             model: model.spec(),
                         });
                     }
@@ -696,6 +713,14 @@ fn truncate_output(output: &str) -> String {
 fn add_cost(total: &mut Option<f64>, cost: Option<f64>) {
     if let Some(cost) = cost {
         *total = Some(total.unwrap_or_default() + cost);
+    }
+}
+
+/// A goal's running spend, filed under whoever pays for the turn that added it.
+fn add_spend(goal: &mut GoalSnapshot, cost: Option<f64>, billing: Billing) {
+    match billing {
+        Billing::Api => add_cost(&mut goal.cost, cost),
+        Billing::Subscription => add_cost(&mut goal.subscription_cost, cost),
     }
 }
 

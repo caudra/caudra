@@ -27,6 +27,7 @@ const LABEL_WIDTH: usize = 10;
 const LABEL_SESSION: &str = "Session";
 const LABEL_MODEL: &str = "Model";
 const LABEL_USAGE: &str = "Usage";
+const LABEL_SUBSCRIPTION: &str = "On plan";
 const LABEL_CONTINUE: &str = "Continue";
 const LABEL_SAVED: &str = "Saved";
 
@@ -52,6 +53,7 @@ pub struct ExitSummary {
     model: String,
     usage: TokenUsage,
     cost: Option<f64>,
+    subscription_cost: Option<f64>,
     turns: u64,
     run_time: Duration,
     other_sessions: usize,
@@ -68,11 +70,13 @@ impl ExitSummary {
             usage: session.token_usage,
             // Turns settle their own cost, so summing the per-model entries
             // bills the session without pricing anything a second time.
-            cost: session
-                .usage_by_model()
-                .values()
-                .filter_map(|usage| usage.cost)
-                .reduce(|total, cost| total + cost),
+            cost: Self::sum(session.usage_by_model().values().filter_map(|u| u.cost)),
+            subscription_cost: Self::sum(
+                session
+                    .usage_by_model()
+                    .values()
+                    .filter_map(|u| u.subscription_cost),
+            ),
             turns: session.meta.turns,
             run_time,
             other_sessions,
@@ -92,12 +96,21 @@ impl ExitSummary {
         if self.usage != TokenUsage::default() {
             push_row(&mut out, LABEL_USAGE, &self.usage.format(self.cost));
         }
+        // Its own row rather than a share of the usage line: the figure above is
+        // money owed, and a subscription owes none.
+        if let Some(subscription) = self.subscription_cost {
+            push_row(&mut out, LABEL_SUBSCRIPTION, &format!("${subscription:.4}"));
+        }
         push_row(&mut out, LABEL_CONTINUE, &self.resume_command());
         if self.other_sessions > 0 {
             push_row(&mut out, LABEL_SAVED, &self.saved_row());
         }
         out.push('\n');
         out
+    }
+
+    fn sum(costs: impl Iterator<Item = f64>) -> Option<f64> {
+        costs.reduce(|total, cost| total + cost)
     }
 
     /// For a redirected stderr, where the block is noise a script has to skip.
@@ -193,6 +206,7 @@ mod tests {
             model: MODEL.into(),
             usage,
             cost,
+            subscription_cost: None,
             turns: 48,
             run_time: RUN_TIME,
             other_sessions: 0,

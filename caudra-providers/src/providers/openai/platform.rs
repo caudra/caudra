@@ -9,7 +9,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use tracing::{debug, warn};
 
-use crate::model::Model;
+use crate::model::{Billing, Model};
 use crate::provider::{BoxFuture, Provider};
 use crate::{
     AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse, UsageLimit,
@@ -594,6 +594,7 @@ impl Provider for OpenAi {
     }
 
     fn adjust_model(&self, model: &mut Model) {
+        model.billing = Billing::from_oauth(self.is_oauth());
         let baseline_context_window = *self
             .model_context_windows
             .lock()

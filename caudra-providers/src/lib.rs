@@ -18,10 +18,10 @@ pub use history::{
     resolve_history_head,
 };
 pub use model::{
-    FastPricing, Model, ModelEntry, ModelError, ModelFamily, ModelInfo, ModelPricing, ModelTier,
-    PricingTier, StaticReasoningOption, ThinkingSupport, TokenUsage, format_tokens,
+    Billing, FastPricing, Model, ModelEntry, ModelError, ModelFamily, ModelInfo, ModelPricing,
+    ModelTier, PricingTier, StaticReasoningOption, ThinkingSupport, TokenUsage, format_tokens,
 };
-pub use pricing::{model_cost, settle_session};
+pub use pricing::{ModelSpend, SessionSpend, model_cost, settle_session};
 pub use providers::Timeouts;
 pub use providers::anthropic::auth as anthropic_auth;
 pub use providers::catalog::ProviderData;

@@ -39,7 +39,7 @@ use caudra_config::{
 use caudra_lua::test_support::{HintWriterHandle, hint_writer_pair};
 use caudra_lua::{BuiltinAction, HintReader, KeymapReader, LuaCommandInfo, LuaCommandReader};
 use caudra_providers::{
-    ContentBlock, HistoryItemKind, Message, Role, THINKING_USAGE, TokenUsage, UserOrigin,
+    Billing, ContentBlock, HistoryItemKind, Message, Role, THINKING_USAGE, TokenUsage, UserOrigin,
     expand_message, project_messages,
 };
 use caudra_storage::id::CaudraId;
@@ -450,6 +450,7 @@ fn turn_complete_from(
         provider: provider.into(),
         purpose,
         cost,
+        billing: Billing::Api,
         context_size: None,
         context_window,
     }))
@@ -1832,7 +1833,10 @@ fn resumed_session_keeps_adding_to_the_restored_bill() {
     let mut app = test_app();
     let mut stored = AppSession::new("test-model", "/tmp");
     stored.token_usage = RESTORED_TOKENS;
-    stored.add_model_usage(RESTORED_MODEL, RESTORED_TOKENS.billed(Some(RESTORED_COST)));
+    stored.add_model_usage(
+        RESTORED_MODEL,
+        RESTORED_TOKENS.billed(Some(RESTORED_COST), Billing::Api),
+    );
 
     app.apply_loaded_session(stored, &test_model()).unwrap();
     assert_eq!(app.state.cost, Some(RESTORED_COST));
@@ -6191,6 +6195,7 @@ fn the_lifetime_view_reads_spend_the_current_session_never_produced() {
             cache_creation: 0,
             cache_read: 0,
             cost: Some(LEDGER_COST),
+            subscription: false,
         })
         .unwrap();
 
@@ -6319,6 +6324,7 @@ fn goal_evaluation_is_billed_to_its_own_provider_and_purpose() {
             ..Default::default()
         },
         cost: Some(GOAL_COST),
+        billing: Billing::Api,
         model: format!("{OTHER_PROVIDER}/{LEDGER_MODEL}"),
     }));
     drain_writer(app, writer);
@@ -6380,6 +6386,7 @@ fn title_spend_reaches_the_ledger_without_moving_the_context_size() {
             ..Default::default()
         },
         cost: Some(GOAL_COST),
+        billing: Billing::Api,
         model: LEDGER_MODEL.into(),
         provider: OTHER_PROVIDER.into(),
     }));
@@ -6420,6 +6427,7 @@ fn an_unusable_title_still_records_what_it_cost() {
             ..Default::default()
         },
         cost: Some(GOAL_COST),
+        billing: Billing::Api,
         model: LEDGER_MODEL.into(),
         provider: TEST_PROVIDER.into(),
     }));
@@ -6555,6 +6563,7 @@ fn a_resumed_active_goal_keeps_its_spend_evaluations_and_clock() {
             ..Default::default()
         },
         Some(GOAL_COST),
+        Billing::Api,
     );
     resumed.checkpoint_with(Duration::ZERO);
 
@@ -6640,6 +6649,7 @@ fn completed_goal_round_trips_through_session_metadata() {
             ..Default::default()
         },
         cost: Some(0.25),
+        subscription_cost: None,
     });
     app.checkpoint_with(Duration::ZERO);
     assert!(app.state.session.meta.goal_result.is_some());
@@ -9258,6 +9268,7 @@ fn btw_usage_settles_into_the_session_ledger() {
             ..Default::default()
         },
         cost: Some(BTW_COST),
+        billing: Billing::Api,
         model: BTW_MODEL.into(),
         provider: TEST_PROVIDER.into(),
     }))

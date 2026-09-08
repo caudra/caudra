@@ -53,7 +53,11 @@ struct UsageRow {
     cache_creation: u64,
     cache_read: u64,
     cost: f64,
-    /// Spend from `--ephemeral` runs, already counted in `cost`.
+    /// What a subscription covered, at API list rates. Kept out of `cost`,
+    /// which is money someone was invoiced for.
+    subscription_cost: f64,
+    /// Spend from `--ephemeral` runs, already counted in `cost` or
+    /// `subscription_cost` depending on who paid for it.
     ephemeral_cost: f64,
     priced_turns: u64,
     /// Turns that spent tokens on a model with no price, so `cost` understates
@@ -628,7 +632,11 @@ fn group_usage(buckets: &[UsageBucket], group_by: UsageGrouping) -> Vec<UsageRow
         row.output += bucket.output;
         row.cache_creation += bucket.cache_creation;
         row.cache_read += bucket.cache_read;
-        row.cost += bucket.cost;
+        if bucket.subscription {
+            row.subscription_cost += bucket.cost;
+        } else {
+            row.cost += bucket.cost;
+        }
         row.priced_turns += bucket.priced_turns;
         row.unpriced_turns += bucket.unpriced_turns;
         if bucket.ephemeral {
@@ -636,9 +644,11 @@ fn group_usage(buckets: &[UsageBucket], group_by: UsageGrouping) -> Vec<UsageRow
         }
     }
     let mut rows: Vec<UsageRow> = grouped.into_values().collect();
+    // Both payers rank together, or a subscription-only ledger comes back in
+    // alphabetical order with every row tied at zero.
     rows.sort_by(|a, b| {
-        b.cost
-            .partial_cmp(&a.cost)
+        (b.cost + b.subscription_cost)
+            .partial_cmp(&(a.cost + a.subscription_cost))
             .unwrap_or(Ordering::Equal)
             .then_with(|| a.group.cmp(&b.group))
     });
@@ -700,16 +710,29 @@ fn render_usage(rows: &[UsageRow], group_by: UsageGrouping) -> String {
             format_tokens_u64(row.input),
             format_tokens_u64(row.output),
             format_tokens_u64(row.cache_read + row.cache_creation),
-            format!("${:.4}", row.cost),
+            // One column, so a row a plan covered says so with a tilde rather
+            // than reporting zero next to real tokens.
+            match (row.cost, row.subscription_cost) {
+                (0.0, subscription) if subscription > 0.0 => format!("~${subscription:.4}"),
+                _ => format!("${:.4}", row.cost + row.subscription_cost),
+            },
             row.priced_turns + row.unpriced_turns,
         );
         total.input += row.input;
         total.output += row.output;
         total.cost += row.cost;
+        total.subscription_cost += row.subscription_cost;
         total.unpriced_turns += row.unpriced_turns;
         total.ephemeral_cost += row.ephemeral_cost;
     }
     let _ = writeln!(out, "\ntotal_cost: ${:.4}", total.cost);
+    if total.subscription_cost > 0.0 {
+        let _ = writeln!(
+            out,
+            "subscription_cost: ${:.4} (covered by a plan, not billed)",
+            total.subscription_cost
+        );
+    }
     if total.ephemeral_cost > 0.0 {
         let _ = writeln!(out, "ephemeral_cost: ${:.4}", total.ephemeral_cost);
     }
@@ -835,6 +858,7 @@ mod tests {
             cwd: cwd.into(),
             purpose: purpose.storage_name().into(),
             ephemeral: false,
+            subscription: false,
             input: 10,
             output: 5,
             cache_creation: 1,

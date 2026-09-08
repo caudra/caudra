@@ -343,7 +343,7 @@ impl AgentLoop {
         )
         .await?;
         self.goal
-            .record_external_usage(usage, model.billed_cost(&usage, false));
+            .record_external_usage(usage, model.billed_cost(&usage, false), model.billing);
         self.publish_prepared_context(&slot);
         Ok(())
     }

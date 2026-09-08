@@ -152,7 +152,9 @@ All of them are monotonic sums with delta temporality by default.
 | `caudra.active_time.total` | s | `type` = `cli` |
 
 `caudra.cost.usage` is an estimate from the model's price table. A model with no
-published price contributes nothing.
+published price contributes nothing. Turns covered by a subscription are left
+out, because the metric tracks money owed. Their list price is on the
+`caudra.api_request` event as `subscription_cost_usd`.
 
 Claude Code counts decisions only for edit tools. Caudra's permission model
 covers every tool, so `caudra.tool.decision` carries a `tool_name` and a
@@ -177,7 +179,7 @@ attributes, and the body is empty.
 | Event | Attributes |
 | --- | --- |
 | `caudra.user_prompt` | `prompt_length`, and `prompt` only with `log_user_prompts` |
-| `caudra.api_request` | `model`, `provider`, `input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_creation_tokens`, `cost_usd`, `duration_ms`, `stop_reason` |
+| `caudra.api_request` | `model`, `provider`, `input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_creation_tokens`, `cost_usd`, `subscription_cost_usd`, `duration_ms`, `stop_reason` |
 | `caudra.api_error` | `model`, `provider`, `error`, `status_code`, `attempt`, `duration_ms` |
 | `caudra.tool_result` | `tool_name`, `tool_source`, `success`, `duration_ms`, `error_type`, and `tool_input` only with `log_tool_details` |
 | `caudra.tool_decision` | `tool_name`, `decision`, `source` |

@@ -4,7 +4,8 @@ use std::time::{Duration, Instant};
 use caudra_providers::provider::Provider;
 use caudra_providers::retry::{MAX_TIMEOUT_RETRIES, RetryState};
 use caudra_providers::{
-    ContentBlock, Message, Model, ProviderEvent, ReasoningSource, RequestOptions, StreamResponse,
+    Billing, ContentBlock, Message, Model, ProviderEvent, ReasoningSource, RequestOptions,
+    StreamResponse,
 };
 use caudra_storage::id::SessionRef;
 use serde_json::Value;
@@ -451,6 +452,12 @@ fn emit_api_request(model: &Model, r: &StreamResponse, opts: RequestOptions, too
         return;
     }
     let usage = &r.usage;
+    // A subscription's rates describe a bill that never arrives, so the spend
+    // metric must not see them.
+    let (cost, subscription) = match model.billing {
+        Billing::Api => (model.billed_cost(usage, opts.fast), None),
+        Billing::Subscription => (None, model.billed_cost(usage, opts.fast)),
+    };
     caudra_otel::emit::api_request(&caudra_otel::emit::ApiRequest {
         model: &model.id,
         provider: &model.provider,
@@ -458,7 +465,8 @@ fn emit_api_request(model: &Model, r: &StreamResponse, opts: RequestOptions, too
         output_tokens: u64::from(usage.output),
         cache_read_tokens: u64::from(usage.cache_read),
         cache_creation_tokens: u64::from(usage.cache_creation),
-        cost_usd: model.billed_cost(usage, opts.fast).unwrap_or(0.0),
+        cost_usd: cost.unwrap_or(0.0),
+        subscription_cost_usd: subscription.unwrap_or(0.0),
         duration: took,
         stop_reason: r.stop_reason.map(<&'static str>::from),
     });

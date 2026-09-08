@@ -741,6 +741,7 @@ mod tests {
             cache_creation: 0,
             cache_read: 0,
             cost,
+            subscription: false,
         }
     }
 

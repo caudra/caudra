@@ -9,7 +9,7 @@ use tracing::{debug, error, info, warn};
 use caudra_providers::model_registry::CompactionTarget;
 use caudra_providers::provider::Provider;
 use caudra_providers::{
-    ContentBlock, EMPTY_RESPONSE_MARKER, Message, Model, RequestOptions, Role, StopReason,
+    Billing, ContentBlock, EMPTY_RESPONSE_MARKER, Message, Model, RequestOptions, Role, StopReason,
     StreamResponse, TokenUsage, estimate_tokens_cached,
 };
 
@@ -428,6 +428,7 @@ impl<'h> Agent<'h> {
                     title: outcome.title,
                     usage: outcome.usage,
                     cost: resolved.model.billed_cost(&outcome.usage, false),
+                    billing: resolved.model.billing,
                     model: resolved.model.id.clone(),
                     provider: resolved.model.provider.to_string(),
                 });
@@ -726,6 +727,7 @@ impl<'h> Agent<'h> {
             usage,
             self.model
                 .billed_cost(&usage, self.opts.clamped(&self.model).fast),
+            self.model.billing,
         );
         self.context_size = usage.total_input();
 
@@ -857,6 +859,7 @@ impl<'h> Agent<'h> {
                     applied: self.goal.is_generation_active(goal.generation),
                     usage: TokenUsage::default(),
                     cost: None,
+                    billing: Billing::default(),
                     model: target.to_string(),
                 })?;
                 if cancelled {
@@ -880,8 +883,12 @@ impl<'h> Agent<'h> {
             Ok(result) => result,
             Err(failure) => {
                 self.total_usage += failure.usage;
-                self.goal
-                    .record_usage_for(goal.generation, failure.usage, failure.cost);
+                self.goal.record_usage_for(
+                    goal.generation,
+                    failure.usage,
+                    failure.cost,
+                    failure.billing,
+                );
                 let cancelled = matches!(failure.error, AgentError::Cancelled);
                 let applied = self.goal.is_generation_active(goal.generation);
                 self.event_tx.send(AgentEvent::GoalEvaluationFailed {
@@ -890,6 +897,7 @@ impl<'h> Agent<'h> {
                     applied,
                     usage: failure.usage,
                     cost: failure.cost,
+                    billing: failure.billing,
                     model: failure.model,
                 })?;
                 if cancelled {
@@ -901,7 +909,7 @@ impl<'h> Agent<'h> {
 
         self.total_usage += result.usage;
         self.goal
-            .record_usage_for(goal.generation, result.usage, result.cost);
+            .record_usage_for(goal.generation, result.usage, result.cost, result.billing);
         let reason: Arc<str> = Arc::from(result.reason.as_str());
         let apply =
             self.goal
@@ -913,6 +921,7 @@ impl<'h> Agent<'h> {
             applied: !matches!(apply, GoalApply::Stale),
             usage: result.usage,
             cost: result.cost,
+            billing: result.billing,
             model: result.model,
         })?;
 
@@ -1018,6 +1027,7 @@ impl<'h> Agent<'h> {
                 cost: self
                     .model
                     .billed_cost(&response.usage, self.opts.clamped(&self.model).fast),
+                billing: self.model.billing,
                 context_size: Some(response.usage.context_tokens()),
                 context_window: self.model.context_window,
             })))
@@ -1175,7 +1185,7 @@ impl<'h> Agent<'h> {
         .await?;
         let cost = compact_model.billed_cost(&usage, false);
         self.total_usage += usage;
-        self.goal.record_usage(usage, cost);
+        self.goal.record_usage(usage, cost, compact_model.billing);
         self.rollback_len = self.history.len();
         self.event_tx.send(AgentEvent::CompactionDone)?;
         self.history

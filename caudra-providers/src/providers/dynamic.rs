@@ -17,7 +17,7 @@ use strum::IntoEnumIterator;
 use tracing::{debug, warn};
 
 use crate::manifest::ManifestRegistry;
-use crate::model::{Model, ModelPricing, ModelTier, ThinkingSupport};
+use crate::model::{Billing, Model, ModelPricing, ModelTier, ThinkingSupport};
 use crate::provider::{BoxFuture, Provider, ProviderKind};
 use crate::types::{ReasoningOptions, ThinkingFields};
 use crate::{AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse};
@@ -110,6 +110,7 @@ impl ScriptModel {
             window_excludes_output: false,
             reasoning_options: self.reasoning_options.clone().unwrap_or_default(),
             thinking_fields: self.thinking_fields.clone().map(Box::new),
+            billing: Billing::default(),
         }
     }
 }

@@ -833,6 +833,7 @@ pub(crate) fn test_model() -> caudra_providers::Model {
         window_excludes_output: false,
         reasoning_options: caudra_providers::ReasoningOptions::default(),
         thinking_fields: None,
+        billing: caudra_providers::Billing::Api,
     }
 }
 

@@ -334,7 +334,7 @@ impl App {
                     condition: goal.condition.to_string(),
                     evaluations: goal.evaluations,
                     elapsed_ms: as_millis(goal.elapsed()),
-                    usage: goal.usage.billed(goal.cost),
+                    usage: goal.usage.spent(goal.cost, goal.subscription_cost),
                     last_verdict: goal.last_verdict.map(Into::into),
                     last_reason: goal.last_reason.map(|reason| reason.to_string()),
                 })
@@ -346,7 +346,7 @@ impl App {
                     reason: goal.reason.to_string(),
                     evaluations: goal.evaluations,
                     duration_ms: as_millis(goal.duration),
-                    usage: goal.usage.billed(goal.cost),
+                    usage: goal.usage.spent(goal.cost, goal.subscription_cost),
                 })),
                 Some(GoalStatus::Active(_)) | None => None,
             },

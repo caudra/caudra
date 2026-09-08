@@ -63,6 +63,7 @@ pub enum ChatEventResult {
 pub struct Chat {
     pub name: String,
     pub cost: Option<f64>,
+    pub subscription_cost: Option<f64>,
     pub context_size: u32,
     pub context_window: u32,
     pub model_id: Option<String>,
@@ -86,6 +87,7 @@ impl Chat {
         Self {
             name,
             cost: None,
+            subscription_cost: None,
             context_size: 0,
             context_window: 0,
             model_id: None,

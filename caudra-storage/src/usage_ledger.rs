@@ -73,6 +73,9 @@ pub struct TurnUsage {
     /// `None` when the model has no price. Counted as an unpriced turn so a
     /// lifetime total can say how much of itself is missing.
     pub cost: Option<f64>,
+    /// True when a subscription already covers this turn, so `cost` is the API
+    /// list price for its tokens rather than money anyone owes.
+    pub subscription: bool,
 }
 
 pub fn bucket_for(epoch_seconds: u64) -> i64 {
@@ -109,12 +112,14 @@ impl UsageLedger {
             cwd: &turn.cwd,
             purpose: turn.purpose,
             ephemeral: self.ephemeral,
+            subscription: turn.subscription,
             usage: StoredTokenUsage {
                 input: turn.input,
                 output: turn.output,
                 cache_creation: turn.cache_creation,
                 cache_read: turn.cache_read,
                 cost: turn.cost,
+                subscription_cost: None,
             },
             cost: turn.cost,
         })
@@ -138,8 +143,17 @@ impl UsageLedger {
 pub struct UsageSlice {
     pub label: String,
     pub cost: f64,
+    pub subscription_cost: f64,
     pub tokens: u64,
     pub turns: u64,
+}
+
+impl UsageSlice {
+    /// What this slice was worth, whoever paid. Ordering a breakdown by billed
+    /// spend alone would tie every row of a subscription-only ledger at zero.
+    pub fn priced(&self) -> f64 {
+        self.cost + self.subscription_cost
+    }
 }
 
 /// Everything recorded, folded four ways. Built from the whole table, so it
@@ -150,8 +164,13 @@ pub struct LifetimeUsage {
     pub output: u64,
     pub cache_creation: u64,
     pub cache_read: u64,
+    /// USD actually invoiced.
     pub cost: f64,
-    /// Spend from `--ephemeral` runs, already counted in `cost`.
+    /// USD a subscription covered, priced at API rates. Held apart from `cost`
+    /// because no bill follows it.
+    pub subscription_cost: f64,
+    /// Spend from `--ephemeral` runs, already counted in `cost` or
+    /// `subscription_cost` depending on who paid for it.
     pub ephemeral_cost: f64,
     pub priced_turns: u64,
     /// Turns whose model had no price. `cost` understates by an unknown
@@ -194,7 +213,11 @@ fn summarize(buckets: &[UsageBucket]) -> LifetimeUsage {
         summary.output += bucket.output;
         summary.cache_creation += bucket.cache_creation;
         summary.cache_read += bucket.cache_read;
-        summary.cost += bucket.cost;
+        if bucket.subscription {
+            summary.subscription_cost += bucket.cost;
+        } else {
+            summary.cost += bucket.cost;
+        }
         summary.priced_turns += bucket.priced_turns;
         summary.unpriced_turns += bucket.unpriced_turns;
         if bucket.ephemeral {
@@ -225,20 +248,27 @@ fn add_slice(slices: &mut BTreeMap<String, UsageSlice>, label: String, bucket: &
     let slice = slices.entry(label.clone()).or_insert(UsageSlice {
         label,
         cost: 0.0,
+        subscription_cost: 0.0,
         tokens: 0,
         turns: 0,
     });
-    slice.cost += bucket.cost;
+    if bucket.subscription {
+        slice.subscription_cost += bucket.cost;
+    } else {
+        slice.cost += bucket.cost;
+    }
     slice.tokens += bucket.input + bucket.output + bucket.cache_creation + bucket.cache_read;
     slice.turns += bucket.priced_turns + bucket.unpriced_turns;
 }
 
-/// Dearest first: a spend breakdown is read to find where the money went.
+/// Dearest first: a spend breakdown is read to find where the money went. Both
+/// payers rank together, or a subscription-only ledger would come back in
+/// alphabetical order with every row tied at zero.
 fn ranked(slices: BTreeMap<String, UsageSlice>) -> Vec<UsageSlice> {
     let mut slices: Vec<UsageSlice> = slices.into_values().collect();
     slices.sort_by(|a, b| {
-        b.cost
-            .partial_cmp(&a.cost)
+        b.priced()
+            .partial_cmp(&a.priced())
             .unwrap_or(Ordering::Equal)
             .then_with(|| b.tokens.cmp(&a.tokens))
             .then_with(|| a.label.cmp(&b.label))
@@ -277,6 +307,10 @@ mod tests {
         "spend Caudra makes on its own must stay tellable from the chat";
 
     fn turn(model: &str, cost: Option<f64>) -> TurnUsage {
+        subscription_turn(model, cost, false)
+    }
+
+    fn subscription_turn(model: &str, cost: Option<f64>, subscription: bool) -> TurnUsage {
         TurnUsage {
             provider: PROVIDER.into(),
             model: model.into(),
@@ -287,6 +321,7 @@ mod tests {
             cache_creation: 30,
             cache_read: 40,
             cost,
+            subscription,
         }
     }
 
@@ -422,6 +457,72 @@ mod tests {
             "{PURPOSE_SEPARATES}"
         );
         assert_eq!(lifetime.by_purpose[0].cost, 6.0);
+    }
+
+    const PAYERS_SEPARATE: &str = "a plan's price must never reach the billed total";
+    const RANK_BY_WORTH: &str =
+        "a subscription-only ledger must rank by what the work was worth, not alphabetically";
+
+    #[test]
+    fn a_lifetime_summary_keeps_the_two_payers_apart() {
+        let (_temp, dir) = state_dir();
+        let ledger = ledger(&dir);
+        ledger.record_at(&turn(MODEL, Some(1.0)), 0).unwrap();
+        ledger
+            .record_at(&subscription_turn(MODEL, Some(6.0), true), 0)
+            .unwrap();
+
+        let lifetime = ledger.lifetime().unwrap();
+
+        assert_eq!(lifetime.cost, 1.0, "{PAYERS_SEPARATE}");
+        assert_eq!(lifetime.subscription_cost, 6.0, "{PAYERS_SEPARATE}");
+        assert_eq!(lifetime.priced_turns, 2);
+    }
+
+    /// `ranked` sorted on billed spend alone, which left every row of a
+    /// subscription-only ledger tied at zero and ordered by label.
+    #[test]
+    fn a_breakdown_ranks_subscription_spend_by_size() {
+        let (_temp, dir) = state_dir();
+        let ledger = ledger(&dir);
+        ledger
+            .record_at(&subscription_turn("a-cheap-model", Some(1.0), true), 0)
+            .unwrap();
+        ledger
+            .record_at(&subscription_turn("z-dear-model", Some(9.0), true), 0)
+            .unwrap();
+
+        let lifetime = ledger.lifetime().unwrap();
+
+        assert_eq!(
+            lifetime.by_model[0].label,
+            format!("{PROVIDER}/z-dear-model"),
+            "{RANK_BY_WORTH}"
+        );
+        assert_eq!(lifetime.by_model[0].subscription_cost, 9.0);
+        assert_eq!(lifetime.by_model[0].cost, 0.0, "{PAYERS_SEPARATE}");
+    }
+
+    /// Same bucket key but for the payer, so the two must not collapse into one
+    /// row that reports the plan's price as money owed.
+    #[test]
+    fn the_payer_splits_an_otherwise_identical_bucket() {
+        let (_temp, dir) = state_dir();
+        let ledger = ledger(&dir);
+        ledger
+            .record_at(&subscription_turn(MODEL, Some(2.0), false), 0)
+            .unwrap();
+        ledger
+            .record_at(&subscription_turn(MODEL, Some(5.0), true), 0)
+            .unwrap();
+
+        let rows = ledger.buckets(None).unwrap();
+
+        assert_eq!(rows.len(), 2, "{PAYERS_SEPARATE}");
+        let billed = rows.iter().find(|row| !row.subscription).unwrap();
+        let covered = rows.iter().find(|row| row.subscription).unwrap();
+        assert_eq!(billed.cost, 2.0);
+        assert_eq!(covered.cost, 5.0);
     }
 
     #[test]

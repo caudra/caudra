@@ -459,6 +459,7 @@ impl App {
             let ctx = UsageModalContext {
                 total: &self.state.token_usage,
                 total_cost: self.state.cost,
+                subscription_cost: self.state.subscription_cost,
                 by_model: self.state.session.usage_by_model(),
                 model: &self.state.model,
                 fast: self.state.fast,
@@ -546,8 +547,10 @@ impl App {
                 .unwrap_or(&self.state.session.model),
             stats: UsageStats {
                 global_cost: self.state.cost,
+                global_subscription_cost: self.state.subscription_cost,
                 context_size: chat.context_size,
                 cost: chat.cost,
+                subscription_cost: chat.subscription_cost,
                 context_window: if chat.context_window > 0 {
                     chat.context_window
                 } else {

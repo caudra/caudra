@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use caudra_providers::{AgentError, ContentBlock, Message, Role, StopReason, TokenUsage};
+use caudra_providers::{AgentError, Billing, ContentBlock, Message, Role, StopReason, TokenUsage};
 use caudra_storage::tool_outputs::ToolOutputRef;
 use caudra_storage::usage_ledger::LedgerPurpose;
 use flume::Sender;
@@ -1125,6 +1125,7 @@ pub enum AgentEvent {
         applied: bool,
         usage: TokenUsage,
         cost: Option<f64>,
+        billing: Billing,
         model: String,
     },
     GoalFinished {
@@ -1145,6 +1146,7 @@ pub enum AgentEvent {
         applied: bool,
         usage: TokenUsage,
         cost: Option<f64>,
+        billing: Billing,
         model: String,
     },
     GoalClearedAfterError {
@@ -1184,6 +1186,7 @@ pub enum AgentEvent {
         title: Option<String>,
         usage: TokenUsage,
         cost: Option<f64>,
+        billing: Billing,
         model: String,
         provider: String,
     },
@@ -1482,6 +1485,10 @@ pub struct TurnCompleteEvent {
     pub purpose: LedgerPurpose,
     #[serde(skip)]
     pub cost: Option<f64>,
+    /// Who owes `cost`. A subscription turn is priced at API rates for
+    /// reporting, so the number is only meaningful next to its payer.
+    #[serde(skip)]
+    pub billing: Billing,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_size: Option<u32>,
     /// The model's context window, so consumers can gauge `context_size`

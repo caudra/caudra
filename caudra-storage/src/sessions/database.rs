@@ -56,7 +56,7 @@ use crate::{
 pub const SESSIONS_DB_FILE: &str = "sessions.sqlite3";
 pub const SESSIONS_DB_LOCK_FILE: &str = "sessions.sqlite3.lock";
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 const APPLICATION_ID: i64 = i32::from_be_bytes(*b"CAUD") as i64;
 /// Pages copied per step of the pre-migration backup. The whole file is copied
 /// under the initialization lock, so this only bounds how long the backup holds
@@ -101,6 +101,10 @@ const UNKNOWN_CLEANUP_KIND: &str = "unknown cleanup job kind";
 /// `purpose` separates the conversation from what Caudra spends on its own, so
 /// a bill can name goal evaluation, compaction, or titles. The model cannot
 /// stand in for it: those workloads often run on the chat model.
+///
+/// `subscription` says whether anyone was invoiced. A subscription bucket holds
+/// the API list price for its tokens, which is a real number about a bill that
+/// never arrives, so summing the two together would overstate spend.
 const USAGE_LEDGER_TABLE: &str = r#"
 CREATE TABLE usage_ledger (
     bucket_start   INTEGER NOT NULL,
@@ -109,6 +113,7 @@ CREATE TABLE usage_ledger (
     cwd            TEXT NOT NULL,
     purpose        TEXT NOT NULL,
     ephemeral      INTEGER NOT NULL CHECK(ephemeral IN (0, 1)),
+    subscription   INTEGER NOT NULL CHECK(subscription IN (0, 1)),
     input_tokens   INTEGER NOT NULL,
     output_tokens  INTEGER NOT NULL,
     cache_creation INTEGER NOT NULL,
@@ -116,7 +121,7 @@ CREATE TABLE usage_ledger (
     cost           REAL NOT NULL,
     priced_turns   INTEGER NOT NULL,
     unpriced_turns INTEGER NOT NULL,
-    PRIMARY KEY(bucket_start, provider, model, cwd, purpose, ephemeral)
+    PRIMARY KEY(bucket_start, provider, model, cwd, purpose, ephemeral, subscription)
 ) STRICT, WITHOUT ROWID;
 "#;
 
@@ -169,6 +174,37 @@ INSERT INTO usage_ledger
 DROP TABLE usage_ledger_v2;
 "#;
 
+/// Rebuilt again for the same reason `2 -> 3` rebuilt it: the payer joins the
+/// primary key. Rows recorded before the split cannot say which payer they had,
+/// and calling them billed leaves every existing all-time total exactly where it
+/// was. `model_usage` only gains a column, so it is altered in place.
+const USAGE_LEDGER_ADD_SUBSCRIPTION: &str = r#"
+ALTER TABLE usage_ledger RENAME TO usage_ledger_v3;
+CREATE TABLE usage_ledger (
+    bucket_start   INTEGER NOT NULL,
+    provider       TEXT NOT NULL,
+    model          TEXT NOT NULL,
+    cwd            TEXT NOT NULL,
+    purpose        TEXT NOT NULL,
+    ephemeral      INTEGER NOT NULL CHECK(ephemeral IN (0, 1)),
+    subscription   INTEGER NOT NULL CHECK(subscription IN (0, 1)),
+    input_tokens   INTEGER NOT NULL,
+    output_tokens  INTEGER NOT NULL,
+    cache_creation INTEGER NOT NULL,
+    cache_read     INTEGER NOT NULL,
+    cost           REAL NOT NULL,
+    priced_turns   INTEGER NOT NULL,
+    unpriced_turns INTEGER NOT NULL,
+    PRIMARY KEY(bucket_start, provider, model, cwd, purpose, ephemeral, subscription)
+) STRICT, WITHOUT ROWID;
+INSERT INTO usage_ledger
+    SELECT bucket_start, provider, model, cwd, purpose, ephemeral, 0, input_tokens,
+           output_tokens, cache_creation, cache_read, cost, priced_turns, unpriced_turns
+    FROM usage_ledger_v3;
+DROP TABLE usage_ledger_v3;
+ALTER TABLE model_usage ADD COLUMN subscription_cost REAL;
+"#;
+
 /// One step of the schema chain. A fresh database gets [`SCHEMA`] at
 /// [`SCHEMA_VERSION`] directly; only an existing database replays these.
 struct Migration {
@@ -187,6 +223,11 @@ const MIGRATIONS: &[Migration] = &[
         from: 2,
         to: 3,
         sql: USAGE_LEDGER_ADD_PURPOSE,
+    },
+    Migration {
+        from: 3,
+        to: 4,
+        sql: USAGE_LEDGER_ADD_SUBSCRIPTION,
     },
 ];
 
@@ -275,13 +316,14 @@ CREATE TABLE subagents (
 ) STRICT, WITHOUT ROWID;
 
 CREATE TABLE model_usage (
-    session_id     BLOB NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-    model          TEXT NOT NULL,
-    input_tokens   INTEGER NOT NULL,
-    output_tokens  INTEGER NOT NULL,
-    cache_creation INTEGER NOT NULL,
-    cache_read     INTEGER NOT NULL,
-    cost           REAL,
+    session_id        BLOB NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    model             TEXT NOT NULL,
+    input_tokens      INTEGER NOT NULL,
+    output_tokens     INTEGER NOT NULL,
+    cache_creation    INTEGER NOT NULL,
+    cache_read        INTEGER NOT NULL,
+    cost              REAL,
+    subscription_cost REAL,
     PRIMARY KEY(session_id, model)
 ) STRICT, WITHOUT ROWID;
 
@@ -323,6 +365,7 @@ pub struct LedgerEntry<'a> {
     pub cwd: &'a str,
     pub purpose: LedgerPurpose,
     pub ephemeral: bool,
+    pub subscription: bool,
     pub usage: StoredTokenUsage,
     pub cost: Option<f64>,
 }
@@ -337,6 +380,7 @@ pub struct UsageBucket {
     pub cwd: String,
     pub purpose: String,
     pub ephemeral: bool,
+    pub subscription: bool,
     pub input: u64,
     pub output: u64,
     pub cache_creation: u64,
@@ -666,10 +710,11 @@ impl SessionDatabase {
         };
         self.connection.execute(
             "INSERT INTO usage_ledger (bucket_start, provider, model, cwd, purpose, ephemeral, \
-                 input_tokens, output_tokens, cache_creation, cache_read, cost, \
+                 subscription, input_tokens, output_tokens, cache_creation, cache_read, cost, \
                  priced_turns, unpriced_turns) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
-             ON CONFLICT(bucket_start, provider, model, cwd, purpose, ephemeral) DO UPDATE SET \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
+             ON CONFLICT(bucket_start, provider, model, cwd, purpose, ephemeral, subscription) \
+             DO UPDATE SET \
                  input_tokens = input_tokens + excluded.input_tokens, \
                  output_tokens = output_tokens + excluded.output_tokens, \
                  cache_creation = cache_creation + excluded.cache_creation, \
@@ -684,6 +729,7 @@ impl SessionDatabase {
                 entry.cwd,
                 entry.purpose.storage_name(),
                 i64::from(entry.ephemeral),
+                i64::from(entry.subscription),
                 i64::from(entry.usage.input),
                 i64::from(entry.usage.output),
                 i64::from(entry.usage.cache_creation),
@@ -698,8 +744,9 @@ impl SessionDatabase {
 
     pub fn usage_buckets(&self, since: Option<i64>) -> Result<Vec<UsageBucket>, SessionError> {
         let mut statement = self.connection.prepare(
-            "SELECT bucket_start, provider, model, cwd, purpose, ephemeral, input_tokens, \
-                    output_tokens, cache_creation, cache_read, cost, priced_turns, unpriced_turns  \
+            "SELECT bucket_start, provider, model, cwd, purpose, ephemeral, subscription, \
+                    input_tokens, output_tokens, cache_creation, cache_read, cost, \
+                    priced_turns, unpriced_turns  \
              FROM usage_ledger WHERE ?1 IS NULL OR bucket_start >= ?1  \
              ORDER BY bucket_start DESC, provider ASC, model ASC, cwd ASC, purpose ASC",
         )?;
@@ -713,13 +760,14 @@ impl SessionDatabase {
                 cwd: row.get(3)?,
                 purpose: row.get(4)?,
                 ephemeral: row.get::<_, i64>(5)? != 0,
-                input: from_i64(row.get(6)?, "usage_ledger.input_tokens")?,
-                output: from_i64(row.get(7)?, "usage_ledger.output_tokens")?,
-                cache_creation: from_i64(row.get(8)?, "usage_ledger.cache_creation")?,
-                cache_read: from_i64(row.get(9)?, "usage_ledger.cache_read")?,
-                cost: row.get(10)?,
-                priced_turns: from_i64(row.get(11)?, "usage_ledger.priced_turns")?,
-                unpriced_turns: from_i64(row.get(12)?, "usage_ledger.unpriced_turns")?,
+                subscription: row.get::<_, i64>(6)? != 0,
+                input: from_i64(row.get(7)?, "usage_ledger.input_tokens")?,
+                output: from_i64(row.get(8)?, "usage_ledger.output_tokens")?,
+                cache_creation: from_i64(row.get(9)?, "usage_ledger.cache_creation")?,
+                cache_read: from_i64(row.get(10)?, "usage_ledger.cache_read")?,
+                cost: row.get(11)?,
+                priced_turns: from_i64(row.get(12)?, "usage_ledger.priced_turns")?,
+                unpriced_turns: from_i64(row.get(13)?, "usage_ledger.unpriced_turns")?,
             });
         }
         Ok(buckets)
@@ -3069,8 +3117,9 @@ fn replace_auxiliary<M, U, T>(
     for (model, usage) in &session.usage_by_model {
         transaction.execute(
             "INSERT INTO model_usage (\
-                 session_id, model, input_tokens, output_tokens, cache_creation, cache_read, cost\
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                 session_id, model, input_tokens, output_tokens, cache_creation, cache_read, \
+                 cost, subscription_cost\
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 session.id.as_bytes().as_slice(),
                 model,
@@ -3079,6 +3128,7 @@ fn replace_auxiliary<M, U, T>(
                 i64::from(usage.cache_creation),
                 i64::from(usage.cache_read),
                 usage.cost,
+                usage.subscription_cost,
             ],
         )?;
     }
@@ -3172,7 +3222,8 @@ fn query_model_usage(
     id: CaudraId,
 ) -> Result<HashMap<String, StoredTokenUsage>, SessionError> {
     let mut statement = connection.prepare(
-        "SELECT model, input_tokens, output_tokens, cache_creation, cache_read, cost \
+        "SELECT model, input_tokens, output_tokens, cache_creation, cache_read, cost, \
+                subscription_cost \
          FROM model_usage WHERE session_id = ?1",
     )?;
     let mut rows = statement.query(params![id.as_bytes().as_slice()])?;
@@ -3186,6 +3237,7 @@ fn query_model_usage(
                 cache_creation: from_i64_u32(row.get(3)?, "model_usage.cache_creation")?,
                 cache_read: from_i64_u32(row.get(4)?, "model_usage.cache_read")?,
                 cost: row.get(5)?,
+                subscription_cost: row.get(6)?,
             },
         );
     }
@@ -4198,6 +4250,9 @@ mod tests {
         connection.execute_batch("VACUUM").unwrap();
         connection.execute_batch(SCHEMA).unwrap();
         connection
+            .execute_batch(MODEL_USAGE_BEFORE_SUBSCRIPTION)
+            .unwrap();
+        connection
             .pragma_update(None, "application_id", APPLICATION_ID)
             .unwrap();
         connection.pragma_update(None, "user_version", 1).unwrap();
@@ -4226,6 +4281,11 @@ mod tests {
         assert_eq!(database.usage_buckets(None).unwrap(), Vec::new());
     }
 
+    /// [`SCHEMA`] is always current, so a seeded old database has to give back
+    /// the column the `3 -> 4` step adds, or that step finds its own work done.
+    const MODEL_USAGE_BEFORE_SUBSCRIPTION: &str =
+        "ALTER TABLE model_usage DROP COLUMN subscription_cost;";
+
     /// A database as the ledger's first release left it: schema 2, no purpose.
     fn seed_v2_database(state_dir: &StateDir) {
         let path = state_dir.path().join(SESSIONS_DB_FILE);
@@ -4239,6 +4299,9 @@ mod tests {
             .unwrap();
         connection.execute_batch("VACUUM").unwrap();
         connection.execute_batch(SCHEMA).unwrap();
+        connection
+            .execute_batch(MODEL_USAGE_BEFORE_SUBSCRIPTION)
+            .unwrap();
         connection.execute_batch(USAGE_LEDGER_TABLE_V2).unwrap();
         connection
             .pragma_update(None, "application_id", APPLICATION_ID)
@@ -4273,6 +4336,30 @@ mod tests {
         );
         assert_eq!(rows[0].cost, LEDGER_COST, "{MIGRATION_KEEPS_SPEND}");
         assert_eq!(rows[0].model, MODEL, "{MIGRATION_KEEPS_SPEND}");
+        assert!(!rows[0].subscription, "{MIGRATION_KEEPS_SPEND}");
+    }
+
+    /// A row recorded before Caudra tracked the payer cannot say which it had.
+    /// Calling it billed is what leaves every existing all-time total alone.
+    #[test]
+    fn migrating_a_ledger_bills_the_rows_that_predate_the_split() {
+        let (_temp, state_dir) = state_dir();
+        seed_v2_database(&state_dir);
+
+        let database = SessionDatabase::open(&state_dir).unwrap();
+        let lifetime = database.usage_buckets(None).unwrap();
+
+        assert_eq!(database.stats().unwrap().schema_version, SCHEMA_VERSION);
+        let billed: f64 = lifetime
+            .iter()
+            .filter(|row| !row.subscription)
+            .map(|row| row.cost)
+            .sum();
+        assert_eq!(billed, LEDGER_COST, "{MIGRATION_KEEPS_SPEND}");
+        assert!(
+            lifetime.iter().all(|row| !row.subscription),
+            "{MIGRATION_KEEPS_SPEND}"
+        );
     }
 
     #[test]

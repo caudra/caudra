@@ -108,6 +108,7 @@ fn finish_compact(
         provider: model.provider.to_string(),
         purpose: LedgerPurpose::Compaction,
         cost: model.billed_cost(&response.usage, false),
+        billing: model.billing,
         context_size: Some(response.usage.output),
         context_window: model.context_window,
     })));

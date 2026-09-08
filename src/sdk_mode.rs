@@ -29,8 +29,8 @@ use caudra_agent::{
 use caudra_config::ModelPolicy;
 use caudra_providers::model::Model;
 use caudra_providers::{
-    HistoryItem, HistoryItemKind, ImageSource, StopReason, ThinkingConfig, Timeouts, TokenUsage,
-    add_cost,
+    Billing, HistoryItem, HistoryItemKind, ImageSource, StopReason, ThinkingConfig, Timeouts,
+    TokenUsage, add_cost,
 };
 use caudra_storage::id::SessionRef;
 use caudra_storage::permission_state::PermissionRuleRecord;
@@ -192,6 +192,9 @@ struct ResultPayload {
     num_turns: u32,
     result: String,
     total_cost_usd: f64,
+    /// What a subscription covered, at API list rates. Reported beside
+    /// `total_cost_usd` and never added to it, which stays actual spend.
+    subscription_cost_usd: f64,
     usage: TokenUsage,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     permission_denials: Vec<Value>,
@@ -726,6 +729,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         synth: StreamSynth::new(),
         result_text: String::new(),
         cost: None,
+        subscription_cost: None,
         request_counter: 0,
     }
     .spawn(handle.event_rx.clone());
@@ -1595,6 +1599,7 @@ struct EventPump {
     /// Summed as the turns land: rates move mid-prompt, and only a turn knows
     /// the rate it paid.
     cost: Option<f64>,
+    subscription_cost: Option<f64>,
     request_counter: u64,
 }
 
@@ -1621,10 +1626,20 @@ impl EventPump {
         })
     }
 
+    /// The run's spend, filed under whoever pays for it, so `total_cost_usd`
+    /// stays money owed rather than a price a plan already covers.
+    fn add_spend(&mut self, cost: Option<f64>, billing: Billing) {
+        match billing {
+            Billing::Api => add_cost(&mut self.cost, cost),
+            Billing::Subscription => add_cost(&mut self.subscription_cost, cost),
+        }
+    }
+
     fn reset_turn(&mut self) {
         self.synth.reset();
         self.result_text.clear();
         self.cost = None;
+        self.subscription_cost = None;
         let pending = mem::take(&mut self.shared.lock().unwrap().pending);
         for request_id in pending.into_values() {
             self.permissions.answer(&request_id, PermissionAnswer::Deny);
@@ -1641,6 +1656,7 @@ impl EventPump {
         let duration_ms = self.shared.lock().unwrap().turn_start.elapsed().as_millis();
         // Zero on an unpriced model, which is what its turns reported too.
         let total_cost_usd = self.cost.unwrap_or_default();
+        let subscription_cost_usd = self.subscription_cost.unwrap_or_default();
         self.writer.emit(WireInner::Result(ResultPayload {
             subtype: if is_error {
                 "error_during_execution"
@@ -1653,6 +1669,7 @@ impl EventPump {
             num_turns,
             result,
             total_cost_usd,
+            subscription_cost_usd,
             usage,
             permission_denials: Vec::new(),
         }))?;
@@ -1749,8 +1766,10 @@ impl EventPump {
             | AgentEvent::GoalLoopCap { .. }
             | AgentEvent::GoalTurnLimit { .. }
             | AgentEvent::GoalClearedAfterError { .. } => {}
-            AgentEvent::GoalEvaluation { cost, .. } => add_cost(&mut self.cost, *cost),
-            AgentEvent::GoalEvaluationFailed { cost, .. } => add_cost(&mut self.cost, *cost),
+            AgentEvent::GoalEvaluation { cost, billing, .. }
+            | AgentEvent::GoalEvaluationFailed { cost, billing, .. } => {
+                self.add_spend(*cost, *billing);
+            }
             AgentEvent::Retry {
                 attempt,
                 message,
@@ -1770,7 +1789,7 @@ impl EventPump {
                 )?;
             }
             AgentEvent::TurnComplete(tc) => {
-                add_cost(&mut self.cost, tc.cost);
+                self.add_spend(tc.cost, tc.billing);
                 if self.include_partial_messages {
                     let events = self.synth.finish_message(&tc.usage);
                     self.emit_stream(events)?;
@@ -2000,6 +2019,7 @@ mod tests {
             synth: StreamSynth::new(),
             result_text: String::new(),
             cost: None,
+            subscription_cost: None,
             request_counter: 0,
         };
         (pump, out_rx, shared)
@@ -2688,6 +2708,7 @@ mod tests {
                 num_turns: 1,
                 result: "done".into(),
                 total_cost_usd: 0.01,
+                subscription_cost_usd: 0.0,
                 usage: TokenUsage::default(),
                 permission_denials: Vec::new(),
             }),

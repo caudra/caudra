@@ -6,7 +6,7 @@ use flume::Sender;
 use serde_json::{Value, json};
 use tracing::{debug, warn};
 
-use crate::model::Model;
+use crate::model::{Billing, Model};
 use crate::provider::{BoxFuture, Provider};
 use crate::providers::ResolvedAuth;
 use crate::providers::openai::responses;
@@ -264,6 +264,7 @@ impl Provider for Xai {
     }
 
     fn adjust_model(&self, model: &mut Model) {
+        model.billing = Billing::from_oauth(self.is_oauth());
         let Some(cached) = catalog::cached_model(&model.id) else {
             return;
         };
@@ -323,6 +324,7 @@ mod tests {
             window_excludes_output: false,
             reasoning_options: ReasoningOptions::default(),
             thinking_fields: None,
+            billing: crate::model::Billing::default(),
         }
     }
 

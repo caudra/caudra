@@ -798,6 +798,7 @@ mod tests {
             provider: "test-provider".into(),
             purpose: LedgerPurpose::Chat,
             cost,
+            billing: caudra_providers::Billing::Api,
             context_size,
             context_window,
         }

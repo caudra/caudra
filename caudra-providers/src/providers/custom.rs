@@ -14,7 +14,7 @@ use super::openai::responses;
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 use crate::manifest::ManifestRegistry;
 use crate::model::{
-    FastPricing, Model, ModelFamily, ModelInfo, ModelPricing, ModelTier, ThinkingSupport,
+    Billing, FastPricing, Model, ModelFamily, ModelInfo, ModelPricing, ModelTier, ThinkingSupport,
 };
 use crate::provider::{BoxFuture, Provider, ProviderKind};
 use crate::providers::Timeouts;
@@ -198,6 +198,7 @@ fn model_from_def(def: &ProviderDef, kind: ProviderKind, slug: &str, model_id: &
         window_excludes_output: false,
         reasoning_options: declared.reasoning_options.unwrap_or_default(),
         thinking_fields: None,
+        billing: Billing::default(),
     }
 }
 

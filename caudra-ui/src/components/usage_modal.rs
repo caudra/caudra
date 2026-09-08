@@ -5,7 +5,7 @@ use arc_swap::ArcSwapOption;
 
 use caudra_config::ClockFormat;
 use caudra_providers::{
-    Model, ProviderUsage, TokenUsage, format_tokens, format_tokens_u64, model_cost,
+    Model, ModelSpend, ProviderUsage, TokenUsage, format_tokens, format_tokens_u64, model_cost,
 };
 use caudra_storage::sessions::StoredTokenUsage;
 use caudra_storage::usage_ledger::{LifetimeUsage, UsageSlice};
@@ -42,6 +42,10 @@ const MODEL_COL_MIN: usize = 16;
 const NUM_COL: usize = 7;
 const COL_GAP: usize = 2;
 const NO_USAGE_ENDPOINT: &str = "no usage endpoint for this provider";
+/// What a subscription figure is: the API list price for the same tokens, with
+/// no invoice behind it.
+const SUBSCRIPTION_LINE: &str = "subscription (not billed)";
+const NOT_BILLED_MARK: &str = "~";
 const HOUR: i64 = 3600;
 const DAY: i64 = 24 * HOUR;
 const WEEK: i64 = 7 * DAY;
@@ -69,6 +73,9 @@ pub struct UsageModalContext<'a> {
     /// What the session billed, from [`caudra_providers::session_cost`]. `None`
     /// means nothing here is priced, so the modal shows tokens only.
     pub total_cost: Option<f64>,
+    /// The same for turns a subscription covered, shown on its own line rather
+    /// than folded into `total_cost`.
+    pub subscription_cost: Option<f64>,
     pub by_model: &'a HashMap<String, StoredTokenUsage>,
     pub model: &'a Model,
     pub fast: bool,
@@ -227,6 +234,7 @@ fn build_lines(
     )));
 
     lines.push(Line::from(totals_row(ctx.total, ctx.total_cost, theme)));
+    lines.extend(subscription_line(ctx.subscription_cost, theme));
 
     if let Some(state) = quota {
         lines.push(Line::default());
@@ -259,11 +267,11 @@ fn build_lines(
     lines.push(Line::from(header_row(model_w, theme)));
 
     for (id, usage) in entries {
-        let cost = model_cost(id, usage, ctx.model, ctx.fast);
+        let spend = model_cost(id, usage, ctx.model, ctx.fast);
         lines.push(Line::from(model_row(
             id,
             usage,
-            cost,
+            spend,
             model_w,
             fg,
             theme.status_dim,
@@ -312,6 +320,15 @@ fn build_lifetime_lines(
             Span::styled(format!("  ${:.2}", lifetime.cost), theme.accent),
         ]),
     ];
+    if lifetime.subscription_cost > 0.0 {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "{PREFIX}{SUBSCRIPTION_LINE}: ${:.2}",
+                lifetime.subscription_cost
+            ),
+            theme.status_dim,
+        )));
+    }
     if lifetime.ephemeral_cost > 0.0 {
         lines.push(Line::from(Span::styled(
             format!(
@@ -369,7 +386,14 @@ fn slice_rows(slices: &[UsageSlice], fg: Style, dim: Style) -> Vec<Line<'static>
                 Span::raw(" ".repeat(COL_GAP)),
                 Span::styled(format!("{:>6}", slice.turns), dim),
                 Span::raw(" ".repeat(COL_GAP)),
-                Span::styled(format!("{:>8.3}", slice.cost), fg),
+                // A slice can hold both payers, so the column shows what the
+                // work was worth and marks it when none of it was billed.
+                match (slice.cost, slice.subscription_cost) {
+                    (0.0, subscription) if subscription > 0.0 => {
+                        Span::styled(format!("{NOT_BILLED_MARK}{subscription:>7.3}"), dim)
+                    }
+                    _ => Span::styled(format!("{:>8.3}", slice.priced()), fg),
+                },
             ])
         })
         .collect();
@@ -380,6 +404,16 @@ fn slice_rows(slices: &[UsageSlice], fg: Style, dim: Style) -> Vec<Line<'static>
         )));
     }
     lines
+}
+
+/// Its own line rather than a share of the total: the headline number is money
+/// owed, and a subscription owes none. Absent when there is none to report.
+fn subscription_line(cost: Option<f64>, theme: &crate::theme::Theme) -> Option<Line<'static>> {
+    let cost = cost.filter(|cost| *cost > 0.0)?;
+    Some(Line::from(Span::styled(
+        format!("{PREFIX}{SUBSCRIPTION_LINE}: ${cost:.3}"),
+        theme.status_dim,
+    )))
 }
 
 fn totals_row(
@@ -432,7 +466,7 @@ fn header_row(model_w: usize, theme: &crate::theme::Theme) -> Vec<Span<'static>>
 fn model_row(
     id: &str,
     usage: &StoredTokenUsage,
-    cost: Option<f64>,
+    spend: ModelSpend,
     model_w: usize,
     fg: Style,
     dim: Style,
@@ -451,7 +485,12 @@ fn model_row(
         gap(),
         num(usage.total()),
         gap(),
-        match cost {
+        match spend.usd {
+            // One column, two meanings: the tilde is the only room there is to
+            // say this row is priced rather than owed.
+            Some(c) if spend.billing.is_subscription() => {
+                Span::styled(format!("{}{c:>5.3}", NOT_BILLED_MARK), fg)
+            }
             Some(c) => Span::styled(format!("{c:>6.3}"), fg),
             None => Span::styled(format!("{:>6}", "—"), dim),
         },
@@ -567,6 +606,10 @@ mod tests {
 
     const RECORDED_COST: f64 = 0.123;
     const RECORDED_TEXT: &str = "0.123";
+    const SUBSCRIPTION_COST: f64 = 4.567;
+    const SUBSCRIPTION_TEXT: &str = "4.567";
+    const TOTAL_STAYS_BILLED: &str =
+        "the headline total is money owed, and a subscription owes none";
     /// 1M input tokens at the test model's $3/1M: what the modal would print if
     /// it re-priced the counters.
     const REPRICED_TEXT: &str = "3.000";
@@ -587,6 +630,7 @@ mod tests {
         UsageSlice {
             label: label.to_string(),
             cost,
+            subscription_cost: 0.0,
             tokens: ONE_MILLION as u64,
             turns: 1,
         }
@@ -818,9 +862,20 @@ mod tests {
         by_model: &HashMap<String, StoredTokenUsage>,
         model: &Model,
     ) -> Vec<String> {
+        modal_rows_with_subscription(total, total_cost, None, by_model, model)
+    }
+
+    fn modal_rows_with_subscription(
+        total: &TokenUsage,
+        total_cost: Option<f64>,
+        subscription_cost: Option<f64>,
+        by_model: &HashMap<String, StoredTokenUsage>,
+        model: &Model,
+    ) -> Vec<String> {
         let ctx = UsageModalContext {
             total,
             total_cost,
+            subscription_cost,
             by_model,
             model,
             fast: false,
@@ -863,6 +918,50 @@ mod tests {
         assert!(!unknown_row.contains(REPRICED_TEXT), "{unknown_row}");
     }
 
+    /// A subscription owes nothing, so folding its figure into the headline
+    /// would report money that no invoice will ever ask for.
+    #[test]
+    fn a_subscription_gets_its_own_line_and_never_joins_the_total() {
+        let model = test_model();
+        let total = TokenUsage {
+            input: ONE_MILLION,
+            ..Default::default()
+        };
+        let rows = |subscription| {
+            modal_rows_with_subscription(
+                &total,
+                Some(RECORDED_COST),
+                subscription,
+                &HashMap::new(),
+                &model,
+            )
+        };
+
+        let quiet = rows(None).join("\n");
+        assert!(!quiet.contains(SUBSCRIPTION_LINE), "{quiet}");
+
+        let loud = rows(Some(SUBSCRIPTION_COST));
+        let line = loud
+            .iter()
+            .find(|t| t.contains(SUBSCRIPTION_LINE))
+            .unwrap_or_else(|| panic!("no subscription line: {loud:?}"));
+        assert!(line.contains(SUBSCRIPTION_TEXT), "{line}");
+        assert!(
+            !line.contains(ONE_MILLION_TEXT),
+            "{TOTAL_STAYS_BILLED}: {line}"
+        );
+
+        let totals = loud
+            .iter()
+            .find(|t| t.contains(ONE_MILLION_TEXT))
+            .unwrap_or_else(|| panic!("no totals row: {loud:?}"));
+        assert!(totals.contains(RECORDED_TEXT), "{totals}");
+        assert!(
+            !totals.contains(SUBSCRIPTION_TEXT),
+            "{TOTAL_STAYS_BILLED}: {totals}"
+        );
+    }
+
     /// The session's bill arrives already computed, from the turns that paid it.
     /// These counters would price to [`REPRICED_TEXT`] against the selected
     /// model, so a modal doing its own arithmetic prints a different number,
@@ -899,6 +998,7 @@ mod tests {
         let ctx = UsageModalContext {
             total: &TokenUsage::default(),
             total_cost: None,
+            subscription_cost: None,
             by_model: &HashMap::new(),
             model: &model,
             fast: false,

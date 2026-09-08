@@ -21,7 +21,7 @@ use caudra_agent::{
 use caudra_config::ModelPolicy;
 use caudra_lua::EventHandle;
 use caudra_providers::model::Model;
-use caudra_providers::{TokenUsage, add_cost};
+use caudra_providers::{Billing, TokenUsage, add_cost};
 use caudra_storage::id::SessionRef;
 use clap::ValueEnum;
 use color_eyre::Result;
@@ -65,6 +65,9 @@ struct PrintResult {
     stop_reason: Option<DoneReason>,
     session_id: SessionRef,
     total_cost_usd: f64,
+    /// What a subscription covered, at API list rates. Reported beside
+    /// `total_cost_usd` and never added to it, which stays actual spend.
+    subscription_cost_usd: f64,
     usage: TokenUsage,
 }
 
@@ -246,6 +249,7 @@ pub fn run(
     // Summed as the turns land: rates move mid-run, and only a turn knows the
     // rate it paid.
     let mut cost = None;
+    let mut subscription_cost = None;
     let mut stop_reason: Option<DoneReason> = None;
 
     while let Ok(envelope) = smol::block_on(event_rx.recv_async()) {
@@ -348,9 +352,12 @@ pub fn run(
                 }
             }
             AgentEvent::TurnComplete(tc) => {
-                add_cost(&mut cost, tc.cost);
+                match tc.billing {
+                    Billing::Api => add_cost(&mut cost, tc.cost),
+                    Billing::Subscription => add_cost(&mut subscription_cost, tc.cost),
+                }
                 if parent_tool_use_id.is_some() {
-                    goal.record_external_usage(tc.usage, tc.cost);
+                    goal.record_external_usage(tc.usage, tc.cost, tc.billing);
                 }
                 if let Some(out) = &mut verbose_out {
                     let content_value = serde_json::to_value(&tc.message.content)?;
@@ -408,6 +415,7 @@ pub fn run(
     let duration_ms = start.elapsed().as_millis();
     // Zero on an unpriced model, which is what its turns reported too.
     let total_cost_usd = cost.unwrap_or_default();
+    let subscription_cost_usd = subscription_cost.unwrap_or_default();
 
     match format {
         OutputFormat::Text => {
@@ -424,6 +432,7 @@ pub fn run(
                 stop_reason,
                 session_id,
                 total_cost_usd,
+                subscription_cost_usd,
                 usage,
             };
             match verbose_out {
@@ -476,6 +485,7 @@ mod tests {
         "stop_reason",
         "session_id",
         "total_cost_usd",
+        "subscription_cost_usd",
         "usage",
         "duration_ms",
     ];
@@ -501,6 +511,7 @@ mod tests {
             stop_reason: Some(DoneReason::EndTurn),
             session_id: SessionRef::generate(),
             total_cost_usd: 0.003,
+            subscription_cost_usd: 0.0,
             usage: TokenUsage::default(),
         };
         let json: Value = serde_json::to_value(&result).unwrap();

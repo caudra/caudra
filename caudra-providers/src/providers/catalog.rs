@@ -1118,6 +1118,7 @@ mod tests {
             provider: Arc::from("opencode-go"),
             tier: ModelTier::Medium,
             family: ModelFamily::Generic,
+            billing: crate::model::Billing::default(),
             supports_tool_examples_override: None,
             thinking_override: None,
             supports_vision_override: None,

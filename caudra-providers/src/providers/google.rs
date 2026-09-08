@@ -728,6 +728,7 @@ mod tests {
             window_excludes_output: false,
             reasoning_options: ReasoningOptions::default(),
             thinking_fields: None,
+            billing: crate::model::Billing::default(),
         }
     }
 

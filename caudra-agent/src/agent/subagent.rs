@@ -850,7 +850,7 @@ mod tests {
         ContextInventory, ContextKey, ContextReadiness, ContextSnapshot, ContextStore,
         ContextUsage, ContextWindow,
     };
-    use caudra_providers::Message;
+    use caudra_providers::{Billing, Message};
     use caudra_storage::usage_ledger::LedgerPurpose;
 
     const RUN_ID: u64 = 7;
@@ -1006,6 +1006,7 @@ mod tests {
             provider: "test-provider".into(),
             purpose: LedgerPurpose::Chat,
             cost: Some(cost),
+            billing: Billing::Api,
             context_size: None,
             context_window: 0,
         }))

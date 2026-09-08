@@ -25,6 +25,9 @@ pub(crate) struct SessionState {
     /// since. Kept running, because re-deriving it from the counters would
     /// re-price history at today's rates. `None` while nothing was priced.
     pub cost: Option<f64>,
+    /// The same running total for turns a subscription covered. Never folded
+    /// into `cost`, which is money the user owes.
+    pub subscription_cost: Option<f64>,
     pub context_size: u32,
     /// Survives compaction, which throws away the history a count could
     /// otherwise be derived from.
@@ -97,7 +100,7 @@ impl SessionState {
 
         let fast = session.meta.fast && model.supports_fast();
         let token_usage = session.token_usage;
-        let cost = settle_session(&token_usage, session.usage_by_model_mut(), &model, fast);
+        let spend = settle_session(&token_usage, session.usage_by_model_mut(), &model, fast);
         let context_size = session.meta.context_size;
         // Sessions saved before the counter existed, and every headless run,
         // carry a zero: recover what the surviving history still shows rather
@@ -116,6 +119,7 @@ impl SessionState {
                 duration: std::time::Duration::from_millis(stored.duration_ms),
                 usage: stored.usage.into(),
                 cost: stored.usage.cost,
+                subscription_cost: stored.usage.subscription_cost,
             });
         }
 
@@ -143,7 +147,8 @@ impl SessionState {
             session: Arc::new(session),
             model,
             token_usage,
-            cost,
+            cost: spend.billed,
+            subscription_cost: spend.subscription,
             context_size,
             turns,
             mode,
@@ -204,8 +209,8 @@ mod tests {
     use super::*;
     use crate::components::{test_model, test_pricing};
     use caudra_providers::{
-        ContentBlock, FastPricing, ImageMediaType, ImageSource, Message, ModelPricing, Role,
-        ThinkingSupport,
+        Billing, ContentBlock, FastPricing, ImageMediaType, ImageSource, Message, ModelPricing,
+        Role, ThinkingSupport,
     };
     use caudra_storage::thinking::StoredThinking;
     use std::collections::HashMap;
@@ -262,7 +267,9 @@ mod tests {
         let mut session = session_with_counters();
         session.add_model_usage(
             UNRESOLVABLE_MODEL,
-            session.token_usage.billed(Some(RECORDED_COST)),
+            session
+                .token_usage
+                .billed(Some(RECORDED_COST), Billing::Api),
         );
         let state = resumed(session, &test_model());
         assert_eq!(state.cost, Some(RECORDED_COST));
@@ -288,9 +295,9 @@ mod tests {
     /// fast session on half its bill.
     ///
     /// Priced through [`settle_session`] rather than a resumed session,
-    /// because resuming adjusts the model against its provider and Anthropic
-    /// zeroes pricing under a subscription. That would make the rates here
-    /// depend on how the machine running the test happens to be logged in.
+    /// because resuming adjusts the model against its provider, which sets the
+    /// payer rather than the rates. That would make the column the price lands
+    /// in depend on how the machine running the test happens to be logged in.
     #[test_case(false => Some(LIST_PRICE)      ; "standard_rates")]
     #[test_case(true  => Some(FAST_INPUT_RATE) ; "fast_rates")]
     fn counters_without_a_breakdown_price_at_the_session_rate(fast: bool) -> Option<f64> {
@@ -300,6 +307,7 @@ mod tests {
             &fast_priced_model(),
             fast,
         )
+        .billed
     }
 
     /// The flag those rates are chosen with is the session's own, clamped to

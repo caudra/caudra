@@ -25,6 +25,20 @@ const BACK_TO_MAIN_LABEL: &str = "[< Main]";
 const FAST_LABEL: &str = " [fast]";
 const WORKFLOW_LABEL: &str = " [workflow]";
 const YOLO_LABEL: &str = " [yolo]";
+/// Marks a figure a subscription already covers. One column is all the bar can
+/// spare to say the number is a price rather than a bill.
+const NOT_BILLED_MARK: &str = "~";
+
+/// What to draw in the bar's one cost slot. Billed spend wins the slot when a
+/// session mixes the two, because that is the number someone pays; the tilde
+/// would otherwise claim the whole figure is notional when part of it is real.
+fn spend(billed: Option<f64>, subscription: Option<f64>) -> Option<String> {
+    match (billed, subscription) {
+        (Some(billed), _) => Some(format!("${billed:.3}")),
+        (None, Some(subscription)) => Some(format!("{NOT_BILLED_MARK}${subscription:.3}")),
+        (None, None) => None,
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusBarHitTarget {
@@ -45,8 +59,10 @@ pub struct UsageStats {
     /// The whole session's bill, drawn next to the focused chat's own once
     /// subagents make the two differ.
     pub global_cost: Option<f64>,
+    pub global_subscription_cost: Option<f64>,
     pub context_size: u32,
     pub cost: Option<f64>,
+    pub subscription_cost: Option<f64>,
     pub context_window: u32,
     pub show_global: bool,
 }
@@ -338,15 +354,13 @@ impl StatusBar {
                     format_tokens(ctx.stats.context_window),
                     pct,
                 );
-                let rest_text = match ctx.stats.cost {
-                    Some(cost) => format!("{context_text} ${cost:.3} "),
+                let rest_text = match spend(ctx.stats.cost, ctx.stats.subscription_cost) {
+                    Some(cost) => format!("{context_text} {cost} "),
                     None => format!("{context_text} "),
                 };
-                let global_text = ctx
-                    .stats
-                    .global_cost
+                let global_text = spend(ctx.stats.global_cost, ctx.stats.global_subscription_cost)
                     .filter(|_| ctx.stats.show_global)
-                    .map(|global| format!(" \u{03a3}${global:.3} "));
+                    .map(|global| format!(" \u{03a3}{global} "));
                 let core_width = rest_spans.iter().map(Span::width).sum::<usize>();
                 let full_width = rest_text.width();
                 let global_width = global_text.as_ref().map_or(0, |text| text.width());
@@ -676,8 +690,10 @@ mod tests {
             model_id: MODEL_ID,
             stats: UsageStats {
                 global_cost,
+                global_subscription_cost: None,
                 context_size: CONTEXT_SIZE,
                 cost: Some(CHAT_COST),
+                subscription_cost: None,
                 context_window: crate::components::TEST_CONTEXT_WINDOW,
                 show_global,
             },
@@ -887,6 +903,16 @@ mod tests {
     #[test_case("", 0, ""                                          ; "empty")]
     fn truncate_tail_cases(input: &str, max_width: usize, expected: &str) {
         assert_eq!(truncate_tail(input, max_width), expected);
+    }
+
+    /// The tilde is the bar's only room to say a figure is a price rather than
+    /// a bill, so a session that owes real money must not wear one.
+    #[test_case(Some(0.123), None,        Some("$0.123")  ; "billed_spend_is_bare")]
+    #[test_case(None,        Some(4.567), Some("~$4.567") ; "subscription_is_marked")]
+    #[test_case(Some(0.123), Some(4.567), Some("$0.123")  ; "billed_wins_a_mixed_slot")]
+    #[test_case(None,        None,        None            ; "nothing_spent_shows_nothing")]
+    fn spend_cases(billed: Option<f64>, subscription: Option<f64>, expected: Option<&str>) {
+        assert_eq!(spend(billed, subscription).as_deref(), expected);
     }
 
     #[test_case("model", 7, "[model]" ; "fits")]

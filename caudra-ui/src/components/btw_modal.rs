@@ -6,7 +6,7 @@ use crate::components::streaming_content::StreamingContent;
 use crate::theme;
 
 use caudra_agent::CancelTrigger;
-use caudra_providers::TokenUsage;
+use caudra_providers::{Billing, TokenUsage};
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
@@ -26,6 +26,7 @@ const MAX_HEIGHT_PERCENT: u16 = 80;
 pub struct BtwUsage {
     pub usage: TokenUsage,
     pub cost: Option<f64>,
+    pub billing: Billing,
     pub model: String,
     pub provider: String,
 }
@@ -255,6 +256,7 @@ mod tests {
                 ..Default::default()
             },
             cost: Some(0.5),
+            billing: Billing::Api,
             provider: PROVIDER.into(),
             model: MODEL.into(),
         })

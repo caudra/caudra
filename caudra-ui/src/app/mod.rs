@@ -98,7 +98,7 @@ use caudra_lua::{
     BuiltinAction, EventHandle, HintReader, HintSnapshot, KeymapReader, LuaCommandReader, WinView,
 };
 use caudra_providers::{
-    ContentBlock, Message, Model, ResolvedThinking, ThinkingConfig, TokenUsage, add_cost,
+    Billing, ContentBlock, Message, Model, ResolvedThinking, ThinkingConfig, TokenUsage, add_cost,
 };
 use caudra_storage::StateDir;
 use caudra_storage::id::CaudraId;
@@ -2607,14 +2607,22 @@ impl App {
             title,
             usage,
             cost,
+            billing,
             model,
             provider,
         } = envelope.event
         {
             self.state.token_usage += usage;
-            add_cost(&mut self.state.cost, cost);
-            self.record_model_usage(&provider, &model, LedgerPurpose::Title, usage, cost);
-            self.state.goal.record_external_usage(usage, cost);
+            self.add_session_spend(cost, billing);
+            self.record_model_usage(
+                &provider,
+                &model,
+                LedgerPurpose::Title,
+                usage,
+                cost,
+                billing,
+            );
+            self.state.goal.record_external_usage(usage, cost, billing);
             if let Some(title) = title {
                 self.state.session_mut().set_title_if_auto(title);
             }
@@ -2858,12 +2866,21 @@ impl App {
 
         if let AgentEvent::TurnComplete(ref tc) = envelope.event {
             self.state.token_usage += tc.usage;
-            add_cost(&mut self.state.cost, tc.cost);
-            add_cost(&mut self.chats[chat_idx].cost, tc.cost);
+            self.add_session_spend(tc.cost, tc.billing);
+            add_chat_spend(&mut self.chats[chat_idx], tc.cost, tc.billing);
             if subagent_id.is_some() {
-                self.state.goal.record_external_usage(tc.usage, tc.cost);
+                self.state
+                    .goal
+                    .record_external_usage(tc.usage, tc.cost, tc.billing);
             }
-            self.record_model_usage(&tc.provider, &tc.model, tc.purpose, tc.usage, tc.cost);
+            self.record_model_usage(
+                &tc.provider,
+                &tc.model,
+                tc.purpose,
+                tc.usage,
+                tc.cost,
+                tc.billing,
+            );
             let ctx_size = tc.context_size.unwrap_or_else(|| tc.usage.context_tokens());
             self.chats[chat_idx].context_size = ctx_size;
             if matches!(tc.purpose, LedgerPurpose::Chat) {
@@ -2901,12 +2918,13 @@ impl App {
                 applied,
                 usage,
                 cost,
+                billing,
                 model,
             } => {
                 self.state.token_usage += usage;
-                add_cost(&mut self.state.cost, cost);
-                add_cost(&mut self.chats[chat_idx].cost, cost);
-                self.record_goal_usage(&model, usage, cost);
+                self.add_session_spend(cost, billing);
+                add_chat_spend(&mut self.chats[chat_idx], cost, billing);
+                self.record_goal_usage(&model, usage, cost, billing);
                 if applied && verdict == GoalVerdict::NotMet {
                     self.main_chat().push(DisplayMessage::new(
                         DisplayRole::Notice,
@@ -2964,12 +2982,13 @@ impl App {
                 applied,
                 usage,
                 cost,
+                billing,
                 model,
             } => {
                 self.state.token_usage += usage;
-                add_cost(&mut self.state.cost, cost);
-                add_cost(&mut self.chats[chat_idx].cost, cost);
-                self.record_goal_usage(&model, usage, cost);
+                self.add_session_spend(cost, billing);
+                add_chat_spend(&mut self.chats[chat_idx], cost, billing);
+                self.record_goal_usage(&model, usage, cost, billing);
                 if applied {
                     self.main_chat().push(DisplayMessage::new(
                         DisplayRole::Error,
@@ -3900,11 +3919,12 @@ impl App {
         purpose: LedgerPurpose,
         usage: TokenUsage,
         cost: Option<f64>,
+        billing: Billing,
     ) {
         let key = session_usage_model(provider, model, &self.state.model.provider);
         self.state
             .session_mut()
-            .add_model_usage(&key, usage.billed(cost));
+            .add_model_usage(&key, usage.billed(cost, billing));
         self.storage_writer.record_usage(TurnUsage {
             provider: provider.to_owned(),
             model: model.to_owned(),
@@ -3915,6 +3935,7 @@ impl App {
             cache_creation: usage.cache_creation,
             cache_read: usage.cache_read,
             cost,
+            subscription: billing.is_subscription(),
         });
     }
 
@@ -3922,7 +3943,13 @@ impl App {
     /// served by a provider this session never chose. A resolution that failed
     /// before reaching a model reports no spec and no spend, and recording
     /// zeroes would invent a row for a request that never happened.
-    fn record_goal_usage(&mut self, spec: &str, usage: TokenUsage, cost: Option<f64>) {
+    fn record_goal_usage(
+        &mut self,
+        spec: &str,
+        usage: TokenUsage,
+        cost: Option<f64>,
+        billing: Billing,
+    ) {
         if usage.context_tokens() == 0 && cost.is_none() {
             return;
         }
@@ -3930,7 +3957,16 @@ impl App {
             Some((provider, model)) => (provider.to_owned(), model.to_owned()),
             None => (self.state.model.provider.to_string(), spec.to_owned()),
         };
-        self.record_model_usage(&provider, &model, LedgerPurpose::Goal, usage, cost);
+        self.record_model_usage(&provider, &model, LedgerPurpose::Goal, usage, cost, billing);
+    }
+
+    /// The session's running spend, filed under whoever pays for it. Every
+    /// arrival goes through here so the two totals never mix.
+    fn add_session_spend(&mut self, cost: Option<f64>, billing: Billing) {
+        match billing {
+            Billing::Api => add_cost(&mut self.state.cost, cost),
+            Billing::Subscription => add_cost(&mut self.state.subscription_cost, cost),
+        }
     }
 
     /// btw spends real tokens outside any turn, so it settles into the same
@@ -3940,16 +3976,19 @@ impl App {
         let dirty = self.btw_modal.poll();
         if let Some(btw) = self.btw_modal.take_usage() {
             self.state.token_usage += btw.usage;
-            add_cost(&mut self.state.cost, btw.cost);
-            add_cost(&mut self.main_chat().cost, btw.cost);
+            self.add_session_spend(btw.cost, btw.billing);
+            add_chat_spend(self.main_chat(), btw.cost, btw.billing);
             self.record_model_usage(
                 &btw.provider,
                 &btw.model,
                 LedgerPurpose::Btw,
                 btw.usage,
                 btw.cost,
+                btw.billing,
             );
-            self.state.goal.record_external_usage(btw.usage, btw.cost);
+            self.state
+                .goal
+                .record_external_usage(btw.usage, btw.cost, btw.billing);
         }
         dirty
     }
@@ -4169,6 +4208,16 @@ fn session_usage_model(provider: &str, model: &str, current_provider: &str) -> S
         model.to_owned()
     } else {
         format!("{provider}/{model}")
+    }
+}
+
+/// A chat's running spend, filed under whoever pays for it. Free of `&self` so
+/// it composes with the borrows that reach a chat by index or through
+/// `main_chat`.
+fn add_chat_spend(chat: &mut Chat, cost: Option<f64>, billing: Billing) {
+    match billing {
+        Billing::Api => add_cost(&mut chat.cost, cost),
+        Billing::Subscription => add_cost(&mut chat.subscription_cost, cost),
     }
 }
 

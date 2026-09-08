@@ -12,7 +12,7 @@ use std::fmt;
 use caudra_storage::sessions::StoredTokenUsage;
 use jiff::Timestamp;
 
-use crate::model::{Model, TokenUsage};
+use crate::model::{Billing, Model, TokenUsage};
 
 const HOURS_PER_DAY: u8 = 24;
 const SECONDS_PER_HOUR: i64 = 3_600;
@@ -107,6 +107,35 @@ impl fmt::Display for PricingSchedule {
     }
 }
 
+/// A session's bill, kept apart by who pays it. Both are `None` until something
+/// priced shows up, so callers show no cost instead of a made up "$0.000".
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct SessionSpend {
+    /// USD a provider actually invoices.
+    pub billed: Option<f64>,
+    /// USD the same tokens would have cost at API rates, on a subscription that
+    /// covers them. Never added to `billed`.
+    pub subscription: Option<f64>,
+}
+
+/// One model's price and who pays it.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ModelSpend {
+    pub usd: Option<f64>,
+    pub billing: Billing,
+}
+
+impl ModelSpend {
+    /// Where this belongs in a [`StoredTokenUsage`]: the two columns are the
+    /// same number under different payers, so only one is ever filled.
+    fn columns(self) -> (Option<f64>, Option<f64>) {
+        match self.billing {
+            Billing::Api => (self.usd, None),
+            Billing::Subscription => (None, self.usd),
+        }
+    }
+}
+
 /// The bill a stored session ran up. Status bar, `/usage`, ACP and headless all
 /// come here, so they cannot disagree about the same session.
 ///
@@ -116,44 +145,64 @@ impl fmt::Display for PricingSchedule {
 /// the counters no longer say which of them was already paid for, so estimating
 /// again would drop everything the entry had before. Counters with no breakdown
 /// get one seeded, so there is always somewhere to settle into.
-///
-/// `None` when nothing here is priced (oauth, local models), so callers show no
-/// cost instead of a made up "$0.000".
 pub fn settle_session(
     total: &TokenUsage,
     by_model: &mut HashMap<String, StoredTokenUsage>,
     current: &Model,
     fast: bool,
-) -> Option<f64> {
+) -> SessionSpend {
     if by_model.is_empty() && *total != TokenUsage::default() {
-        by_model.insert(current.id.clone(), total.billed(None));
+        by_model.insert(current.id.clone(), total.billed(None, current.billing));
     }
     for (id, usage) in by_model.iter_mut() {
-        usage.cost = model_cost(id, usage, current, fast);
+        let (billed, subscription) = model_cost(id, usage, current, fast).columns();
+        usage.cost = billed;
+        usage.subscription_cost = subscription;
     }
-    by_model
-        .values()
-        .filter_map(|usage| usage.cost)
-        .reduce(|total, cost| total + cost)
+    SessionSpend {
+        billed: sum(by_model.values().filter_map(|usage| usage.cost)),
+        subscription: sum(by_model
+            .values()
+            .filter_map(|usage| usage.subscription_cost)),
+    }
+}
+
+fn sum(costs: impl Iterator<Item = f64>) -> Option<f64> {
+    costs.reduce(|total, cost| total + cost)
 }
 
 /// One model's slice of [`settle_session`], as `/usage` breaks it down per row.
 /// Usage is keyed by bare model id, so resolving it needs the session's
 /// provider put back in front.
-pub fn model_cost(id: &str, usage: &StoredTokenUsage, current: &Model, fast: bool) -> Option<f64> {
-    if let Some(cost) = usage.cost {
-        return Some(cost);
+///
+/// A row written before Caudra recorded its payer is re-priced under `current`'s
+/// billing mode, the same borrowing that already lets today's rates stand in for
+/// the rates a historical turn actually paid.
+pub fn model_cost(id: &str, usage: &StoredTokenUsage, current: &Model, fast: bool) -> ModelSpend {
+    let billing = current.billing;
+    if let Some(usd) = usage.cost {
+        return ModelSpend {
+            usd: Some(usd),
+            billing: Billing::Api,
+        };
     }
-    if current.provider.as_ref() == "anthropic" && current.pricing.is_zero() {
-        return None;
+    if let Some(usd) = usage.subscription_cost {
+        return ModelSpend {
+            usd: Some(usd),
+            billing: Billing::Subscription,
+        };
     }
     if id == current.id {
-        return current.list_cost(&(*usage).into(), fast);
+        return ModelSpend {
+            usd: current.list_cost(&(*usage).into(), fast),
+            billing,
+        };
     }
-    Model::from_spec(id)
+    let usd = Model::from_spec(id)
         .or_else(|_| Model::from_spec(&format!("{}/{}", current.provider, id)))
-        .ok()?
-        .list_cost(&(*usage).into(), fast)
+        .ok()
+        .and_then(|model| model.list_cost(&(*usage).into(), fast));
+    ModelSpend { usd, billing }
 }
 
 #[cfg(test)]
@@ -217,6 +266,7 @@ mod tests {
             window_excludes_output: false,
             reasoning_options: ReasoningOptions::default(),
             thinking_fields: None,
+            billing: Billing::default(),
         }
     }
 
@@ -316,7 +366,7 @@ mod tests {
                 ..Default::default()
             };
             assert_eq!(
-                settle_session(&total, &mut by_model, &current, false),
+                settle_session(&total, &mut by_model, &current, false).billed,
                 expected,
                 "total of {input} input tokens"
             );
@@ -337,14 +387,14 @@ mod tests {
         };
 
         assert_eq!(
-            settle_session(&total, &mut by_model, &current, false),
+            settle_session(&total, &mut by_model, &current, false).billed,
             Some(LIST_PRICE)
         );
 
         *by_model.entry(CURRENT.to_owned()).or_default() += stored(Some(RECORDED));
 
         assert_eq!(
-            settle_session(&total, &mut by_model, &current, false),
+            settle_session(&total, &mut by_model, &current, false).billed,
             Some(LIST_PRICE + RECORDED)
         );
     }
@@ -363,16 +413,38 @@ mod tests {
         let sibling = Model::from_spec(&format!("{}/{sibling_id}", current.provider)).unwrap();
         let usage = stored(None);
 
-        let cost = model_cost(sibling_id, &usage, &current, false);
+        let cost = model_cost(sibling_id, &usage, &current, false).usd;
         assert_eq!(cost, sibling.list_cost(&usage.into(), false));
         assert_ne!(cost, current.list_cost(&usage.into(), false));
     }
 
+    const NOT_A_BILL: &str = "a plan's price must never reach the billed column";
+
+    /// Subscription turns used to report nothing at all. They price like any
+    /// other turn now; only the column they land in differs.
     #[test]
-    fn anthropic_oauth_keeps_sibling_models_unpriced() {
-        let current = model("claude-sonnet-4-6", UNPRICED);
-        let usage = stored(None);
-        assert_eq!(model_cost("claude-opus-4-8", &usage, &current, false), None);
+    fn a_subscription_prices_its_tokens_without_billing_them() {
+        let mut current = model(CURRENT, INPUT_RATE);
+        current.billing = Billing::Subscription;
+        let total = TokenUsage {
+            input: ONE_MILLION,
+            ..Default::default()
+        };
+
+        let spend = settle_session(&total, &mut breakdown(&[]), &current, false);
+
+        assert_eq!(spend.subscription, Some(LIST_PRICE));
+        assert_eq!(spend.billed, None, "{NOT_A_BILL}");
+    }
+
+    #[test_case(Billing::Api          ; "an_api_key_is_invoiced")]
+    #[test_case(Billing::Subscription ; "a_plan_owes_nothing")]
+    fn a_row_reports_the_payer_it_was_priced_under(billing: Billing) {
+        let mut current = model(CURRENT, INPUT_RATE);
+        current.billing = billing;
+        let spend = model_cost(CURRENT, &stored(None), &current, false);
+        assert_eq!(spend.usd, Some(LIST_PRICE));
+        assert_eq!(spend.billing, billing);
     }
 
     /// What was paid is what was paid, even for an id the table prices
@@ -382,7 +454,7 @@ mod tests {
     fn a_recorded_cost_short_circuits_the_price_table(input_rate: f64) {
         let current = model(CURRENT, input_rate);
         assert_eq!(
-            model_cost(CURRENT, &stored(Some(RECORDED)), &current, false),
+            model_cost(CURRENT, &stored(Some(RECORDED)), &current, false).usd,
             Some(RECORDED)
         );
     }
@@ -404,6 +476,6 @@ mod tests {
             ..Default::default()
         };
 
-        settle_session(&total, &mut breakdown(entries), &current, fast)
+        settle_session(&total, &mut breakdown(entries), &current, fast).billed
     }
 }

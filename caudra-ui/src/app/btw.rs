@@ -147,6 +147,7 @@ async fn run_btw(
             }
             let _ = btw_tx.send(BtwEvent::Done(BtwUsage {
                 cost: model.billed_cost(&response.usage, opts.fast),
+                billing: model.billing,
                 usage: response.usage,
                 model: model.id.clone(),
                 provider: model.provider.to_string(),

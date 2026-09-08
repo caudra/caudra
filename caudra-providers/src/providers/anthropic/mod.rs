@@ -20,7 +20,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::{debug, warn};
 
-use crate::model::{Model, ModelPricing};
+use crate::model::{Billing, Model};
 use crate::provider::{BoxFuture, Provider};
 use crate::{
     AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse, UsageLimit,
@@ -444,7 +444,6 @@ pub struct Anthropic {
     auth_state: Mutex<AuthState>,
     auth_update: async_lock::Mutex<()>,
     rejected_auth_credentials: Mutex<HashSet<String>>,
-    model_pricing: Mutex<HashMap<String, ModelPricing>>,
     storage: Option<StateDir>,
     system_prefix: Option<String>,
     stream_timeout: Duration,
@@ -473,7 +472,6 @@ impl Anthropic {
             }),
             auth_update: async_lock::Mutex::new(()),
             rejected_auth_credentials: Mutex::new(HashSet::new()),
-            model_pricing: Mutex::new(HashMap::new()),
             storage: Some(storage),
             system_prefix: None,
             stream_timeout: timeouts.stream,
@@ -496,7 +494,6 @@ impl Anthropic {
             }),
             auth_update: async_lock::Mutex::new(()),
             rejected_auth_credentials: Mutex::new(HashSet::new()),
-            model_pricing: Mutex::new(HashMap::new()),
             storage: None,
             system_prefix: None,
             stream_timeout: timeouts.stream,
@@ -1105,21 +1102,7 @@ impl Provider for Anthropic {
     }
 
     fn adjust_model(&self, model: &mut Model) {
-        let pricing = self
-            .model_pricing
-            .lock()
-            .unwrap()
-            .entry(model.id.clone())
-            .or_insert_with(|| model.pricing.clone())
-            .clone();
-        if self.is_oauth() {
-            model.pricing.input = 0.0;
-            model.pricing.output = 0.0;
-            model.pricing.cache_write = 0.0;
-            model.pricing.cache_read = 0.0;
-        } else {
-            model.pricing = pricing;
-        }
+        model.billing = Billing::from_oauth(self.is_oauth());
     }
 
     fn reasoning_transport(&self, _model: &Model) -> crate::ReasoningTransport {
@@ -1819,29 +1802,35 @@ data: {\"type\":\"content_block_stop\"}\n";
         assert_eq!(body["speed"], json!("fast"));
     }
 
-    #[test]
-    fn model_pricing_is_restored_after_oauth() {
+    const RATES_SURVIVE: &str = "a subscription still prices its tokens; only the payer changes, so zeroing the \
+         rates would lose the figure instead of labelling it";
+
+    /// The inverse of what this used to assert. Pricing was zeroed under OAuth,
+    /// which is why a Claude subscription reported no cost at all.
+    #[test_case(AuthMode::ClaudeOauth, Billing::Subscription ; "a_subscription_owes_nothing")]
+    #[test_case(AuthMode::Injected,    Billing::Api          ; "an_api_key_is_invoiced")]
+    fn oauth_sets_the_payer_and_leaves_the_rates_alone(mode: AuthMode, expected: Billing) {
         let provider = Anthropic::with_auth(
             Arc::new(Mutex::new(ResolvedAuth::bearer("test-key"))),
             crate::providers::Timeouts::default(),
         );
         let mut model = Model::from_spec("anthropic/claude-opus-4-8").unwrap();
         let baseline = model.pricing.clone();
+
+        provider.auth_state.lock().unwrap().mode = mode;
         provider.adjust_model(&mut model);
 
-        provider.auth_state.lock().unwrap().mode = AuthMode::ClaudeOauth;
-        provider.adjust_model(&mut model);
-        assert_eq!(model.pricing.input, 0.0);
-        assert_eq!(model.pricing.output, 0.0);
-        assert_eq!(model.pricing.cache_write, 0.0);
-        assert_eq!(model.pricing.cache_read, 0.0);
-
-        provider.auth_state.lock().unwrap().mode = AuthMode::Injected;
-        provider.adjust_model(&mut model);
-        assert_eq!(model.pricing.input, baseline.input);
-        assert_eq!(model.pricing.output, baseline.output);
-        assert_eq!(model.pricing.cache_write, baseline.cache_write);
-        assert_eq!(model.pricing.cache_read, baseline.cache_read);
+        assert_eq!(model.billing, expected);
+        assert_eq!(model.pricing.input, baseline.input, "{RATES_SURVIVE}");
+        assert_eq!(model.pricing.output, baseline.output, "{RATES_SURVIVE}");
+        assert_eq!(
+            model.pricing.cache_write, baseline.cache_write,
+            "{RATES_SURVIVE}"
+        );
+        assert_eq!(
+            model.pricing.cache_read, baseline.cache_read,
+            "{RATES_SURVIVE}"
+        );
     }
 
     #[test]

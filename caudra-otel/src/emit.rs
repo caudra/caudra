@@ -52,6 +52,7 @@ const KEY_OUTPUT_TOKENS: &str = "output_tokens";
 const KEY_CACHE_READ_TOKENS: &str = "cache_read_tokens";
 const KEY_CACHE_CREATION_TOKENS: &str = "cache_creation_tokens";
 const KEY_COST_USD: &str = "cost_usd";
+const KEY_SUBSCRIPTION_COST_USD: &str = "subscription_cost_usd";
 const KEY_PROMPT: &str = "prompt";
 const KEY_PROMPT_LENGTH: &str = "prompt_length";
 const KEY_TOOL_INPUT: &str = "tool_input";
@@ -91,6 +92,9 @@ pub struct ApiRequest<'a> {
     pub cache_read_tokens: u64,
     pub cache_creation_tokens: u64,
     pub cost_usd: f64,
+    /// What a subscription covered, at API list rates. Reported alongside
+    /// `cost_usd` but never added to it, and never recorded as spend.
+    pub subscription_cost_usd: f64,
     pub duration: Duration,
     pub stop_reason: Option<&'a str>,
 }
@@ -111,6 +115,7 @@ pub fn api_request(request: &ApiRequest<'_>) {
             .with(KEY_CACHE_READ_TOKENS, request.cache_read_tokens)
             .with(KEY_CACHE_CREATION_TOKENS, request.cache_creation_tokens)
             .with(KEY_COST_USD, request.cost_usd)
+            .with(KEY_SUBSCRIPTION_COST_USD, request.subscription_cost_usd)
             .with(KEY_DURATION_MS, request.duration.as_millis() as u64)
             .with_opt(KEY_STOP_REASON, request.stop_reason),
     );

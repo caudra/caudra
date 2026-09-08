@@ -379,7 +379,7 @@ async fn load_session(
         &recorded_model,
         RESTORED_FAST,
     );
-    install_session(srv, handle, mcp, spec, pending, cwd, restored_cost);
+    install_session(srv, handle, mcp, spec, pending, cwd, restored_cost.billed);
     Ok(AgentResponse::LoadSessionResponse(resp))
 }
 
@@ -1660,7 +1660,8 @@ mod tests {
                 &mut restored.by_model,
                 &recorded_model,
                 RESTORED_FAST
-            ),
+            )
+            .billed,
             Some(RECORDED_COST)
         );
     }

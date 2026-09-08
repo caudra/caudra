@@ -14,8 +14,8 @@ use super::anthropic::shared;
 use super::openai::responses;
 use super::openai_compat;
 use crate::model::{
-    Model, ModelEntry, ModelFamily, ModelInfo, ModelPricing, ModelTier, StaticReasoningOption,
-    lookup_entry,
+    Billing, Model, ModelEntry, ModelFamily, ModelInfo, ModelPricing, ModelTier,
+    StaticReasoningOption, lookup_entry,
 };
 use crate::provider::{BoxFuture, Provider};
 use crate::{
@@ -1197,6 +1197,12 @@ impl Provider for Copilot {
             Ok(())
         })
     }
+
+    /// Copilot sells no metered API, so its rates only ever describe what the
+    /// same tokens would cost elsewhere. Unconditional, with no auth to read.
+    fn adjust_model(&self, model: &mut Model) {
+        model.billing = Billing::Subscription;
+    }
 }
 
 #[cfg(test)]
@@ -1206,6 +1212,7 @@ mod tests {
     use super::*;
     use crate::TokenUsage;
     use crate::manifest::ManifestRegistry;
+    use crate::providers::ResolvedAuth;
     use test_case::test_case;
 
     #[test]
@@ -1331,6 +1338,24 @@ mod tests {
             .list_cost(&usage, false)
             .unwrap();
         assert!((cost - expected).abs() < 1e-9);
+    }
+
+    /// Copilot's rates say what the same tokens would cost elsewhere. Reporting
+    /// them as spend billed a subscriber for a bill that never arrives.
+    #[test]
+    fn copilot_models_are_always_covered_by_the_subscription() {
+        let provider = Copilot::with_auth(
+            Arc::new(Mutex::new(ResolvedAuth::bearer("test-token"))),
+            crate::providers::Timeouts::default(),
+        );
+        let mut model = Model::from_spec("copilot/gpt-5.6-luna").unwrap();
+        let baseline = model.pricing.clone();
+
+        provider.adjust_model(&mut model);
+
+        assert_eq!(model.billing, Billing::Subscription);
+        assert_eq!(model.pricing.input, baseline.input);
+        assert_eq!(model.pricing.output, baseline.output);
     }
 
     #[test]
