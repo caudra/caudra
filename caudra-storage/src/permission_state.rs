@@ -20,6 +20,7 @@ pub const FAMILY_REQUIRES_FILESYSTEM_KIND: &str =
     "filesystem read family requires file or directory resources";
 pub const FAMILY_REQUIRES_READ_ACCESS: &str =
     "filesystem read family requires read or search access";
+pub const FAMILY_REQUIRES_MCP_SUBJECT: &str = "mcp server family requires an mcp subject";
 pub const COMMAND_PATTERN_MAX_BYTES: usize = 256;
 pub const COMMAND_PATTERN_MAX_TOKENS: usize = 8;
 const SHA256_HEX_LEN: usize = 64;
@@ -164,6 +165,11 @@ pub enum StructuredPermissionEffect {
 #[serde(tag = "family", rename_all = "snake_case")]
 pub enum PermissionCapabilityFamily {
     FilesystemRead,
+    /// Widens a rule from the one MCP tool it was minted from to every tool on
+    /// the same server. The server is read from the rule's own subject, so the
+    /// family stays closed and a rule can never reach a server it was not
+    /// written against.
+    McpServer,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -397,7 +403,7 @@ fn validate_record(
         PermissionArgumentConstraint::Unconstrained => {}
     }
     if let Some(family) = record.rule.family {
-        validate_family(family, &record.rule.resources)?;
+        validate_family(family, &record.rule.subject, &record.rule.resources)?;
     }
     for resource in &record.rule.resources {
         validate_resource_selector(&resource.kind, &resource.selector)?;
@@ -439,33 +445,47 @@ fn validate_review(value: &Value) -> Result<(), PermissionStateError> {
 /// contract later presents it. An absent access would mean "any", so it is rejected.
 fn validate_family(
     family: PermissionCapabilityFamily,
+    subject: &PermissionSubject,
     resources: &[PermissionResourceConstraint],
 ) -> Result<(), PermissionStateError> {
-    let PermissionCapabilityFamily::FilesystemRead = family;
-    if resources.is_empty() {
-        return Err(PermissionStateError::Invalid(
-            FAMILY_REQUIRES_RESOURCES.into(),
-        ));
-    }
-    for resource in resources {
-        if !matches!(
-            resource.kind,
-            PermissionResourceKind::File | PermissionResourceKind::Directory
-        ) {
-            return Err(PermissionStateError::Invalid(
-                FAMILY_REQUIRES_FILESYSTEM_KIND.into(),
-            ));
+    match family {
+        PermissionCapabilityFamily::McpServer => {
+            // The server name is read off the subject, so a non-MCP subject
+            // would widen the rule to nothing it could name.
+            if !matches!(subject, PermissionSubject::Mcp { .. }) {
+                return Err(PermissionStateError::Invalid(
+                    FAMILY_REQUIRES_MCP_SUBJECT.into(),
+                ));
+            }
+            Ok(())
         }
-        if !matches!(
-            resource.access,
-            Some(PermissionResourceAccess::Read) | Some(PermissionResourceAccess::Search)
-        ) {
-            return Err(PermissionStateError::Invalid(
-                FAMILY_REQUIRES_READ_ACCESS.into(),
-            ));
+        PermissionCapabilityFamily::FilesystemRead => {
+            if resources.is_empty() {
+                return Err(PermissionStateError::Invalid(
+                    FAMILY_REQUIRES_RESOURCES.into(),
+                ));
+            }
+            for resource in resources {
+                if !matches!(
+                    resource.kind,
+                    PermissionResourceKind::File | PermissionResourceKind::Directory
+                ) {
+                    return Err(PermissionStateError::Invalid(
+                        FAMILY_REQUIRES_FILESYSTEM_KIND.into(),
+                    ));
+                }
+                if !matches!(
+                    resource.access,
+                    Some(PermissionResourceAccess::Read) | Some(PermissionResourceAccess::Search)
+                ) {
+                    return Err(PermissionStateError::Invalid(
+                        FAMILY_REQUIRES_READ_ACCESS.into(),
+                    ));
+                }
+            }
+            Ok(())
         }
     }
-    Ok(())
 }
 
 fn validate_resource_selector(
@@ -566,13 +586,13 @@ mod tests {
     use test_case::test_case;
 
     use super::{
-        COMMAND_PATTERN_MAX_BYTES, FAMILY_REQUIRES_FILESYSTEM_KIND, FAMILY_REQUIRES_READ_ACCESS,
-        FAMILY_REQUIRES_RESOURCES, PERMISSION_RULES, PermissionArgumentConstraint,
-        PermissionCapabilityFamily, PermissionExecutorKind, PermissionLifetime,
-        PermissionResourceAccess, PermissionResourceConstraint, PermissionResourceKind,
-        PermissionResourceSelector, PermissionRuleRecord, PermissionState, PermissionStateError,
-        PermissionSubject, SHA256_HEX_LEN, StructuredPermissionEffect, StructuredPermissionRule,
-        validate_command_pattern, validate_conversation_record,
+        COMMAND_PATTERN_MAX_BYTES, FAMILY_REQUIRES_FILESYSTEM_KIND, FAMILY_REQUIRES_MCP_SUBJECT,
+        FAMILY_REQUIRES_READ_ACCESS, FAMILY_REQUIRES_RESOURCES, PERMISSION_RULES,
+        PermissionArgumentConstraint, PermissionCapabilityFamily, PermissionExecutorKind,
+        PermissionLifetime, PermissionResourceAccess, PermissionResourceConstraint,
+        PermissionResourceKind, PermissionResourceSelector, PermissionRuleRecord, PermissionState,
+        PermissionStateError, PermissionSubject, SHA256_HEX_LEN, StructuredPermissionEffect,
+        StructuredPermissionRule, validate_command_pattern, validate_conversation_record,
     };
     use crate::state::{self, SCOPE_GLOBAL};
     use crate::{StateDir, now_epoch};
@@ -952,6 +972,45 @@ mod tests {
         rule.resources.clear();
 
         assert_eq!(family_error(rule), FAMILY_REQUIRES_RESOURCES);
+    }
+
+    /// The server is read off the rule's own subject, so a subject that names no
+    /// server would widen the rule to a set it cannot compute.
+    #[test]
+    fn an_mcp_server_family_is_refused_without_an_mcp_subject() {
+        let mut rule = family_rule(
+            PermissionResourceKind::File,
+            Some(PermissionResourceAccess::Read),
+        );
+        rule.family = Some(PermissionCapabilityFamily::McpServer);
+
+        assert_eq!(family_error(rule), FAMILY_REQUIRES_MCP_SUBJECT);
+    }
+
+    /// The server family widens the subject, not the operation, so it carries
+    /// none of the read family's resource restrictions.
+    #[test]
+    fn an_mcp_server_family_stores_and_reloads() {
+        let mut rule = family_rule(
+            PermissionResourceKind::Command,
+            Some(PermissionResourceAccess::Execute),
+        );
+        rule.subject = PermissionSubject::Mcp {
+            server: "deepwiki".into(),
+            authority: "deepwiki".into(),
+            tool: "search".into(),
+            contract: "mcp.tool.v1".into(),
+        };
+        rule.executor = PermissionExecutorKind::Mcp;
+        rule.family = Some(PermissionCapabilityFamily::McpServer);
+
+        let record = PermissionRuleRecord::conversation(rule).expect("record is valid");
+        let encoded = serde_json::to_string(&record).expect("record serializes");
+        let decoded: PermissionRuleRecord =
+            serde_json::from_str(&encoded).expect("record deserializes");
+
+        assert_eq!(decoded.rule.family, record.rule.family);
+        assert!(validate_conversation_record(&decoded).is_ok());
     }
 
     #[test_case(PermissionResourceAccess::Read; "read joins the family")]

@@ -592,7 +592,9 @@ fn operation_matches(
                 && is_filesystem_read_access(constraint.access.as_ref())
                 && is_filesystem_read_access(resource.access.as_ref())
         }
-        None => {
+        // Widens which subject a rule reaches, never which operation, so the
+        // constraint still has to name the operation exactly.
+        Some(PermissionCapabilityFamily::McpServer) | None => {
             constraint.kind == resource.kind
                 && !constraint
                     .access
@@ -813,7 +815,24 @@ fn subject_matches(rule: &StructuredPermissionRule, request: &PermissionRequest)
             is_filesystem_read_subject(&rule.subject)
                 && is_filesystem_read_subject(&request.subject)
         }
+        Some(PermissionCapabilityFamily::McpServer) => mcp_server(&rule.subject)
+            .zip(mcp_server(&request.subject))
+            .is_some_and(|(rule, request)| rule == request),
         None => false,
+    }
+}
+
+/// A server-wide rule is keyed to the server, so the tool that happened to ask
+/// first stops being part of the key. An empty name is never a key: it is what
+/// a record written before servers were recorded deserializes to, and matching
+/// on it would let one such rule reach every server.
+fn mcp_server(subject: &PermissionSubject) -> Option<&str> {
+    match subject {
+        PermissionSubject::Mcp { server, .. } if !server.is_empty() => Some(server),
+        PermissionSubject::Mcp { .. }
+        | PermissionSubject::Native { .. }
+        | PermissionSubject::Lua { .. }
+        | PermissionSubject::UnknownLegacy { .. } => None,
     }
 }
 
@@ -2722,6 +2741,100 @@ mod tests {
         assert_eq!(
             evaluate_structured_permission_rules(&[allow_one, allow_other, deny_one], &request),
             StructuredPermissionDecision::Deny
+        );
+    }
+
+    const MCP_SERVER: &str = "deepwiki";
+    const OTHER_SERVER: &str = "othersrv";
+    const MINTED_TOOL: &str = "search";
+    const OTHER_TOOL: &str = "fetch";
+
+    fn mcp_subject(server: &str, tool: &str) -> PermissionSubject {
+        PermissionSubject::Mcp {
+            server: server.into(),
+            authority: server.into(),
+            tool: tool.into(),
+            contract: MCP_CONTRACT.into(),
+        }
+    }
+
+    /// A server-wide rule is keyed to the server, so the tool that happened to
+    /// ask first stops being part of the key. It must not reach another server,
+    /// and without the family it must not reach another tool either.
+    #[test_case(Some(PermissionCapabilityFamily::McpServer), MCP_SERVER, OTHER_TOOL => true ; "reaches_a_sibling_tool")]
+    #[test_case(Some(PermissionCapabilityFamily::McpServer), MCP_SERVER, MINTED_TOOL => true ; "still_reaches_its_own_tool")]
+    #[test_case(Some(PermissionCapabilityFamily::McpServer), OTHER_SERVER, MINTED_TOOL => false ; "never_crosses_to_another_server")]
+    #[test_case(None, MCP_SERVER, OTHER_TOOL => false ; "without_the_family_one_tool_stays_one_tool")]
+    fn an_mcp_server_family_widens_to_the_server_and_no_further(
+        family: Option<PermissionCapabilityFamily>,
+        request_server: &str,
+        request_tool: &str,
+    ) -> bool {
+        let resource = command_resource("query", "/project");
+        let mut minted = request(vec![resource.clone()]);
+        minted.subject = mcp_subject(MCP_SERVER, MINTED_TOOL);
+        let mut rule = rule(&minted, ALLOW, vec![exact_constraint(&resource)]);
+        rule.family = family;
+
+        let mut incoming = request(vec![resource.clone()]);
+        incoming.subject = mcp_subject(request_server, request_tool);
+
+        permission_rules_resource_decision(&[rule], &incoming, &resource)
+            == StructuredPermissionDecision::Allow
+    }
+
+    /// A record written before servers were recorded deserializes with an empty
+    /// server, which must not become a key that reaches every server.
+    #[test]
+    fn an_unnamed_mcp_server_never_matches() {
+        let resource = command_resource("query", "/project");
+        let mut minted = request(vec![resource.clone()]);
+        minted.subject = mcp_subject("", MINTED_TOOL);
+        let mut rule = rule(&minted, ALLOW, vec![exact_constraint(&resource)]);
+        rule.family = Some(PermissionCapabilityFamily::McpServer);
+
+        let mut incoming = request(vec![resource.clone()]);
+        incoming.subject = mcp_subject("", OTHER_TOOL);
+
+        assert_eq!(
+            permission_rules_resource_decision(&[rule], &incoming, &resource),
+            StructuredPermissionDecision::NoMatch
+        );
+    }
+
+    /// Widening the subject must not widen the operation, or a rule minted from
+    /// a read would reach a write on a sibling tool.
+    #[test]
+    fn an_mcp_server_family_does_not_widen_the_operation() {
+        let read = PermissionResource {
+            kind: PermissionResourceKind::File,
+            value: "/project/notes.md".into(),
+            access: Some(PermissionResourceAccess::Read),
+            protected: false,
+            requires_prompt: false,
+            attributes: BTreeMap::new(),
+        };
+        let write = PermissionResource {
+            access: Some(PermissionResourceAccess::Write),
+            ..read.clone()
+        };
+        let mut minted = request(vec![read.clone()]);
+        minted.subject = mcp_subject(MCP_SERVER, MINTED_TOOL);
+        let mut rule = rule(&minted, ALLOW, vec![exact_constraint(&read)]);
+        rule.family = Some(PermissionCapabilityFamily::McpServer);
+
+        let mut incoming = request(vec![write.clone()]);
+        incoming.subject = mcp_subject(MCP_SERVER, OTHER_TOOL);
+
+        assert_eq!(
+            permission_rules_resource_decision(std::slice::from_ref(&rule), &incoming, &write),
+            StructuredPermissionDecision::NoMatch
+        );
+        let mut same_tool_read = request(vec![read.clone()]);
+        same_tool_read.subject = mcp_subject(MCP_SERVER, OTHER_TOOL);
+        assert_eq!(
+            permission_rules_resource_decision(&[rule], &same_tool_read, &read),
+            StructuredPermissionDecision::Allow
         );
     }
 
