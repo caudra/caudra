@@ -6,7 +6,7 @@ use caudra_agent::context::{
     ContextCapture, ContextInventory, ContextPublisher, ContextReadiness, ContextSnapshot,
 };
 use caudra_agent::mcp::config::McpServerStatus;
-use caudra_agent::mcp::{McpHandle, McpSession};
+use caudra_agent::mcp::{McpHandle, McpRequestSnapshot, McpSession};
 use caudra_agent::permissions::PermissionManager;
 use caudra_agent::prompt::profile::{
     BUILTIN_PROFILE_NAME, PromptProfileCatalog, SystemPromptProfile,
@@ -14,8 +14,8 @@ use caudra_agent::prompt::profile::{
 use caudra_agent::template;
 use caudra_agent::template::Vars;
 use caudra_agent::tools::{
-    DeferredTool, DescriptionContext, FileReadTracker, PathLocks, ToolAudience, ToolDefinitions,
-    ToolFilter, ToolRegistry, deferral,
+    DeferralSession, DeferredTool, DescriptionContext, FileReadTracker, PathLocks, ToolAudience,
+    ToolDefinitions, ToolFilter, ToolRegistry, deferral,
 };
 use caudra_agent::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentParams, AgentRunParams, CancelMap,
@@ -556,6 +556,25 @@ impl AgentLoop {
         self.instructions = smol::unblock(move || agent::load_instructions(&cwd)).await;
     }
 
+    /// The array a request actually carries. `self.tools` is the declared base, and a run
+    /// appends the deferred catalog and then MCP on top, so anything that has to match the live
+    /// array has to append them in that order. The loaded set comes from history, which is what
+    /// the agent seeds its own session from. A load that happens mid-turn is not reflected until
+    /// the next publish.
+    fn request_tools(&self, mcp: Option<&McpRequestSnapshot>) -> Value {
+        let mut tools = self.tools.clone();
+        DeferralSession::new(
+            self.deferred.clone(),
+            deferral::loaded_tool_names(self.history.as_slice()),
+        )
+        .request_snapshot()
+        .extend_tools(&mut tools);
+        if let Some(mcp) = mcp {
+            mcp.extend_tools(&mut tools);
+        }
+        tools
+    }
+
     /// Always pins `Build` mode: btw never acts on tools, so Plan-mode constraints would only
     /// confuse the model. Everything else must match the live request byte for byte, because a
     /// divergent tools array or system prompt costs btw the provider cache prefix and makes it
@@ -576,9 +595,10 @@ impl AgentLoop {
             &slot.model,
             self.system_prompt_profile.as_deref(),
         );
+        let mcp = self.mcp.as_ref().map(McpSession::request_snapshot);
         self.btw_prompt.store(Arc::new(BtwPrompt {
             system: system.clone(),
-            tools: self.tools.clone(),
+            tools: self.request_tools(mcp.as_ref()),
             opts,
         }));
         system
@@ -586,10 +606,7 @@ impl AgentLoop {
 
     fn publish_prepared_context(&self, slot: &ModelSlot) {
         let mcp = self.mcp.as_ref().map(McpSession::request_snapshot);
-        let mut tools = self.tools.clone();
-        if let Some(mcp) = &mcp {
-            mcp.extend_tools(&mut tools);
-        }
+        let tools = self.request_tools(mcp.as_ref());
         let messages = agent::project_for_target(
             self.history.as_slice(),
             &tools,
