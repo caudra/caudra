@@ -1616,7 +1616,9 @@ impl PermissionManager {
         rule.lifetime = lifetime;
         let covers = match rule.effect {
             StructuredPermissionEffect::Allow => permission_rule_covers_request(&rule, request),
-            StructuredPermissionEffect::Deny => permission_rule_intersects_request(&rule, request),
+            StructuredPermissionEffect::Deny | StructuredPermissionEffect::Ask => {
+                permission_rule_intersects_request(&rule, request)
+            }
         };
         if !covers {
             return Err(PermissionPolicyError(format!(

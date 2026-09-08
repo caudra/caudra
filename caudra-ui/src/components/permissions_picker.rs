@@ -427,6 +427,7 @@ fn effect_name(effect: &StructuredPermissionEffect) -> &'static str {
     match effect {
         StructuredPermissionEffect::Allow => "allow",
         StructuredPermissionEffect::Deny => "deny",
+        StructuredPermissionEffect::Ask => "ask",
     }
 }
 

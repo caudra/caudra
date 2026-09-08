@@ -135,11 +135,17 @@ pub enum PermissionLifetime {
     Global,
 }
 
+/// What a rule says about the requests it matches.
+///
+/// `Ask` grants no authority; it withholds one. A rule set that would otherwise
+/// allow a request still has to prompt when an `Ask` rule matches it, which is
+/// how a configured "always confirm this" survives a broad allow.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StructuredPermissionEffect {
     Allow,
     Deny,
+    Ask,
 }
 
 /// Widens a rule from the single tool contract and access mode it was minted

@@ -147,11 +147,36 @@ pub struct PermissionRequest {
     pub presentation: PermissionPresentation,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// What a rule set says about a request or one of its resources.
+///
+/// The declaration order is the precedence, so folding a set is `max`: a deny
+/// anywhere outranks an ask, an ask outranks an allow, and any of them outranks
+/// silence. `NoMatch` is not an allow — it means no rule spoke, and the caller
+/// decides what that means.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum StructuredPermissionDecision {
-    Allow,
-    Deny,
+    #[default]
     NoMatch,
+    Allow,
+    Ask,
+    Deny,
+}
+
+impl StructuredPermissionDecision {
+    /// Folds in what another rule said. Authority only ever narrows, so this is
+    /// associative and order-independent: the set decides, not the iteration.
+    #[must_use]
+    pub fn merge(self, other: Self) -> Self {
+        self.max(other)
+    }
+
+    fn of(effect: &StructuredPermissionEffect) -> Self {
+        match effect {
+            StructuredPermissionEffect::Allow => Self::Allow,
+            StructuredPermissionEffect::Ask => Self::Ask,
+            StructuredPermissionEffect::Deny => Self::Deny,
+        }
+    }
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -658,6 +683,39 @@ fn protected_coverage_allowed(
         })
 }
 
+/// Reports whether a rule speaks to a resource at all, regardless of what it
+/// then says about it. Keeping this separate from the effect is what lets one
+/// traversal answer for allow, deny, and ask alike.
+///
+/// A rule that names no resource is unrestricted, which is how the picker
+/// presents it and how deny already reads it, so it speaks to every resource.
+fn rule_matches_resource(
+    rule: &StructuredPermissionRule,
+    request: &PermissionRequest,
+    resource: &PermissionResource,
+) -> bool {
+    rule_context_matches(rule, request)
+        && (rule.resources.is_empty()
+            || rule
+                .resources
+                .iter()
+                .any(|constraint| constraint_covers_resource(constraint, resource, rule.family)))
+}
+
+/// What the rule set says about one resource.
+pub fn permission_rules_resource_decision(
+    rules: &[StructuredPermissionRule],
+    request: &PermissionRequest,
+    resource: &PermissionResource,
+) -> StructuredPermissionDecision {
+    rules
+        .iter()
+        .filter(|rule| rule_matches_resource(rule, request, resource))
+        .fold(StructuredPermissionDecision::NoMatch, |decision, rule| {
+            decision.merge(StructuredPermissionDecision::of(&rule.effect))
+        })
+}
+
 pub fn permission_rule_covers_request(
     rule: &StructuredPermissionRule,
     request: &PermissionRequest,
@@ -677,11 +735,7 @@ pub fn permission_rule_covers_resource(
     resource: &PermissionResource,
 ) -> bool {
     rule.effect == StructuredPermissionEffect::Allow
-        && rule_context_matches(rule, request)
-        && rule
-            .resources
-            .iter()
-            .any(|constraint| constraint_covers_resource(constraint, resource, rule.family))
+        && rule_matches_resource(rule, request, resource)
 }
 
 pub fn permission_rules_cover_request(
@@ -711,20 +765,32 @@ pub fn permission_rule_intersects_request(
             }))
 }
 
+/// What the rule set says about a whole request.
+///
+/// Deny and ask propagate from any one resource, because narrowing anywhere
+/// narrows the call. Allow does not: it needs every resource covered, since a
+/// call is only authorized when nothing it touches is left unspoken for.
 pub fn evaluate_structured_permission_rules(
     rules: &[StructuredPermissionRule],
     request: &PermissionRequest,
 ) -> StructuredPermissionDecision {
-    if rules
+    let narrowed = request
+        .resources
         .iter()
-        .any(|rule| permission_rule_intersects_request(rule, request))
-    {
-        return StructuredPermissionDecision::Deny;
-    }
-    if permission_rules_cover_request(rules, request) {
-        StructuredPermissionDecision::Allow
-    } else {
-        StructuredPermissionDecision::NoMatch
+        .map(|resource| permission_rules_resource_decision(rules, request, resource))
+        .fold(
+            StructuredPermissionDecision::NoMatch,
+            |decision, resource| decision.merge(resource),
+        );
+    match narrowed {
+        StructuredPermissionDecision::Deny | StructuredPermissionDecision::Ask => narrowed,
+        StructuredPermissionDecision::Allow | StructuredPermissionDecision::NoMatch => {
+            if permission_rules_cover_request(rules, request) {
+                StructuredPermissionDecision::Allow
+            } else {
+                StructuredPermissionDecision::NoMatch
+            }
+        }
     }
 }
 
@@ -2571,6 +2637,92 @@ mod tests {
             StructuredPermissionDecision::Allow
         );
         assert!(!permission_rule_covers_request(&allow_rules[0], &request));
+    }
+
+    const ALLOW: StructuredPermissionEffect = StructuredPermissionEffect::Allow;
+    const ASK: StructuredPermissionEffect = StructuredPermissionEffect::Ask;
+    const DENY: StructuredPermissionEffect = StructuredPermissionEffect::Deny;
+
+    fn decision_over(effects: &[StructuredPermissionEffect]) -> StructuredPermissionDecision {
+        let resource = command_resource("cargo test", "/project");
+        let request = request(vec![resource.clone()]);
+        let rules: Vec<_> = effects
+            .iter()
+            .map(|effect| rule(&request, effect.clone(), vec![exact_constraint(&resource)]))
+            .collect();
+
+        permission_rules_resource_decision(&rules, &request, &resource)
+    }
+
+    /// The precedence is the whole contract of a rule set: authority only ever
+    /// narrows, so the strictest rule that matches decides, whatever order the
+    /// set is stored in.
+    #[test_case(&[] => StructuredPermissionDecision::NoMatch ; "silence")]
+    #[test_case(&[ALLOW] => StructuredPermissionDecision::Allow ; "a_lone_allow")]
+    #[test_case(&[ASK] => StructuredPermissionDecision::Ask ; "a_lone_ask")]
+    #[test_case(&[DENY] => StructuredPermissionDecision::Deny ; "a_lone_deny")]
+    #[test_case(&[ALLOW, ASK] => StructuredPermissionDecision::Ask ; "ask_outranks_allow")]
+    #[test_case(&[ASK, ALLOW] => StructuredPermissionDecision::Ask ; "ask_outranks_allow_reversed")]
+    #[test_case(&[ALLOW, DENY] => StructuredPermissionDecision::Deny ; "deny_outranks_allow")]
+    #[test_case(&[DENY, ALLOW] => StructuredPermissionDecision::Deny ; "deny_outranks_allow_reversed")]
+    #[test_case(&[ASK, DENY] => StructuredPermissionDecision::Deny ; "deny_outranks_ask")]
+    #[test_case(&[ALLOW, ASK, DENY] => StructuredPermissionDecision::Deny ; "deny_outranks_everything")]
+    fn a_rule_set_is_decided_by_its_strictest_match(
+        effects: &[StructuredPermissionEffect],
+    ) -> StructuredPermissionDecision {
+        decision_over(effects)
+    }
+
+    /// A rule naming no resource is unrestricted, so it reaches resources no
+    /// constraint mentions. Deny already read it that way; allow and ask now
+    /// agree, which is what lets one traversal serve all three.
+    #[test_case(ALLOW => StructuredPermissionDecision::Allow ; "unrestricted_allow")]
+    #[test_case(ASK => StructuredPermissionDecision::Ask ; "unrestricted_ask")]
+    #[test_case(DENY => StructuredPermissionDecision::Deny ; "unrestricted_deny")]
+    fn an_unconstrained_rule_reaches_every_resource(
+        effect: StructuredPermissionEffect,
+    ) -> StructuredPermissionDecision {
+        let resource = command_resource("cargo test", "/project");
+        let request = request(vec![resource.clone()]);
+        let unrestricted = rule(&request, effect, Vec::new());
+
+        permission_rules_resource_decision(&[unrestricted], &request, &resource)
+    }
+
+    /// Narrowing one resource narrows the call, but authorizing one does not
+    /// authorize the call.
+    #[test]
+    fn a_request_is_denied_by_one_resource_and_allowed_only_by_all() {
+        let allowed = command_resource("cargo test", "/project");
+        let other = command_resource("git status", "/project");
+        let request = request(vec![allowed.clone(), other.clone()]);
+        let allow_one = rule(&request, ALLOW, vec![exact_constraint(&allowed)]);
+        let allow_other = rule(&request, ALLOW, vec![exact_constraint(&other)]);
+        let deny_one = rule(&request, DENY, vec![exact_constraint(&allowed)]);
+        let ask_one = rule(&request, ASK, vec![exact_constraint(&allowed)]);
+
+        assert_eq!(
+            evaluate_structured_permission_rules(std::slice::from_ref(&allow_one), &request),
+            StructuredPermissionDecision::NoMatch
+        );
+        assert_eq!(
+            evaluate_structured_permission_rules(
+                &[allow_one.clone(), allow_other.clone()],
+                &request
+            ),
+            StructuredPermissionDecision::Allow
+        );
+        assert_eq!(
+            evaluate_structured_permission_rules(
+                &[allow_one.clone(), allow_other.clone(), ask_one],
+                &request
+            ),
+            StructuredPermissionDecision::Ask
+        );
+        assert_eq!(
+            evaluate_structured_permission_rules(&[allow_one, allow_other, deny_one], &request),
+            StructuredPermissionDecision::Deny
+        );
     }
 
     #[test]
