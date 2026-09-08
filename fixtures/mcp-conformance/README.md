@@ -76,10 +76,10 @@ For example, an actual structured field of `/tmp/run-a/notes.txt` becomes:
 
 Filesystem `contentText` is the model-facing rendering and `structuredContent` is the canonical
 record, so neither restates the other: a read returns numbered lines, a directory read its listing,
-`file_glob` its relative paths, `file_grep` its `path:line: text` rows, `index` its skeleton or
+`file_glob` its relative paths, `file_grep` its `path:line: text` rows, `file_index` its skeleton or
 listing, and every mutation its unified diff. A field is omitted from the structured record only when
 it is exactly derivable from a field that remains, so `numberedText`, directory `entries`, the
-combined `file_apply_patch` `diff`, and the `index` `skeleton` and `listing` are rendering-only. Newlines, field order, and omission of undefined fields are part of the expectation.
+combined `file_apply_patch` `diff`, and the `file_index` `skeleton` and `listing` are rendering-only. Newlines, field order, and omission of undefined fields are part of the expectation.
 Read-only cases repeat their unchanged complete post-state so a conforming implementation also proves
 it did not mutate the root.
 

@@ -193,7 +193,7 @@ pub fn specs(allow_write: bool) -> Vec<ToolSpec> {
 fn append_index_spec(mut specs: Vec<ToolSpec>) -> Vec<ToolSpec> {
     specs.push(
         spec(
-            "index",
+            "file_index",
             "Index source file or directory",
             INDEX_DESCRIPTION,
             index_schema(),
@@ -538,7 +538,7 @@ mod tests {
             "file_apply_patch",
         ];
         #[cfg(feature = "index")]
-        let expected = expected.into_iter().chain(["index"]).collect::<Vec<_>>();
+        let expected = expected.into_iter().chain(["file_index"]).collect::<Vec<_>>();
         assert_eq!(
             tools
                 .iter()
@@ -572,7 +572,7 @@ mod tests {
         #[cfg(feature = "index")]
         {
             let index = specs(true).pop().expect("index spec");
-            assert_eq!(index.name, "index");
+            assert_eq!(index.name, "file_index");
             assert_eq!(index.contract_id, "file.index.v1");
             assert_eq!(index.presentation, "file.index.v1");
             assert_eq!(index.output_schema.as_ref().unwrap()["type"], "object");
@@ -611,7 +611,7 @@ mod tests {
             .collect::<Vec<_>>();
         let expected = vec!["file_read", "file_glob", "file_grep"];
         #[cfg(feature = "index")]
-        let expected = expected.into_iter().chain(["index"]).collect::<Vec<_>>();
+        let expected = expected.into_iter().chain(["file_index"]).collect::<Vec<_>>();
         assert_eq!(names, expected);
         assert_eq!(specs(false).len(), names.len());
     }

@@ -121,7 +121,7 @@
         }
       },
       {
-        "name": "index",
+        "name": "file_index",
         "title": "Index source file or directory",
         "description": "Return a compact structural overview of a source file, or a deterministic listing of a directory.\n\n- Use this first to understand file structure before reading specific sections with file_read.\n- File results include imports, declarations, signatures, source ranges, parse recovery status, and semantic output-line metadata.\n- Directory results list directories before files and append / to directory names.\n- The path may be absolute or relative to the configured file root.\n- Unsupported file types, binary files, and non-UTF-8 source are rejected.\n- Parsing, traversal, source, lines, output, admission, and concurrency are bounded by host-only policy.",
         "inputSchema": {

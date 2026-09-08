@@ -113,8 +113,8 @@ worker lease for the full pool lifetime; hosts supply cache and source policy, n
 - The supported MCP version is explicit and pinned in the server and SDK dependency.
 - Preserve stable catalog order: files, code graph, web, shell, python_execution, transfer, execution
   environment.
-- Within files, `index` follows `file_apply_patch` and precedes every web tool when enabled. The five
-  code-graph tools follow `index` in the order `code_map`, `code_context`, `code_refs`, `code_impact`,
+- Within files, `file_index` follows `file_apply_patch` and precedes every web tool when enabled. The five
+  code-graph tools follow `file_index` in the order `code_map`, `code_context`, `code_refs`, `code_impact`,
   `code_expand`.
 - Tool names, schemas, annotations, and complete-result envelopes are compatibility contracts.
 - `ai.workcell/*` extension metadata is Workcell-owned. Do not introduce product-specific namespaces.

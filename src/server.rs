@@ -642,7 +642,7 @@ mod tests {
                 "file_write",
                 "file_edit",
                 "file_apply_patch",
-                "index",
+                "file_index",
                 "code_map",
                 "code_context",
                 "code_refs",

@@ -468,7 +468,7 @@ impl FileToolGroup {
                 }
             }
             #[cfg(feature = "index")]
-            "index" => match parse_arguments::<IndexInput>(name, arguments) {
+            "file_index" => match parse_arguments::<IndexInput>(name, arguments) {
                 Ok(input) => run_index(self.index(input, &token).await),
                 Err(error) => tool_error(error),
             },

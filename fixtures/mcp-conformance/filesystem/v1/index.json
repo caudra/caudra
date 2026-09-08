@@ -5,7 +5,7 @@
     "rust/crates/mcp-files/src/index",
     "rust/crates/mcp-files/tests/conformance_fixtures.rs"
   ],
-  "tool": "index",
+  "tool": "file_index",
   "input": {
     "path": "index.rs"
   },

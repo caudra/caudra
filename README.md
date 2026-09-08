@@ -61,7 +61,7 @@ sequenceDiagram
 | --- | --- | --- |
 | Files | `file_read`, `file_glob`, `file_grep` | Root-confined, bounded reads and search. |
 | Files | `file_write`, `file_edit`, `file_apply_patch` | Present in the catalog only when `--allow-write` is set. |
-| Files | `index` | Bounded source skeletons and deterministic directory listings. |
+| Files | `file_index` | Bounded source skeletons and deterministic directory listings. |
 | Code graph | `code_map`, `code_context`, `code_refs`, `code_impact`, `code_expand` | Repository-scale symbol ranking, retrieval, and impact over the same confined tree. Reference counts are floors. |
 | Web | `websearch`, `webfetch` | Search defaults to credential-free Exa; fetch applies SSRF and response bounds. |
 | Shell | `shell` | Applies immutable command policy, then executes with ordered progress and a cleaned environment. |
@@ -547,7 +547,7 @@ workcell = { git = "https://github.com/tensorninja/workcell-mcp", default-featur
 | Feature | Provides |
 | --- | --- |
 | `files` | `FileToolGroup`, `PreparedFilePatch`, filesystem schemas and bounded operations |
-| `files-index` | `files` plus `index`, its typed output, and the feature-gated parser bundle |
+| `files-index` | `files` plus `file_index`, its typed output, and the feature-gated parser bundle |
 | `web` | `WebToolGroup`, `PreparedWebsearch`, `PreparedWebfetch`, extraction and provider lowering |
 | `shell` | `ShellToolGroup`, `PreparedShell`, scope analysis, progress streaming, and `output_filter` |
 | `code` | `CodeToolGroup`, isolated interpreter execution (the `python_execution` tool) |
@@ -798,9 +798,9 @@ delete sections.
 - A multi-file patch is validated as a unit but is not transactional after publication starts. A later
   operating-system I/O failure can leave earlier sections applied.
 
-#### `index`
+#### `file_index`
 
-`index` accepts one required `path` and returns either a source skeleton or a directory listing.
+`file_index` accepts one required `path` and returns either a source skeleton or a directory listing.
 
 - Root-relative and absolute paths use the same confined or unconfined policy as every file tool.
 - File output includes the canonical path, detected language, compact skeleton, semantic metadata and

@@ -315,7 +315,7 @@ async fn stdio_discovers_lists_and_calls_all_standalone_tools() {
             "file_read",
             "file_glob",
             "file_grep",
-            "index",
+            "file_index",
             "code_map",
             "code_context",
             "code_refs",
@@ -358,7 +358,7 @@ async fn stdio_discovers_lists_and_calls_all_standalone_tools() {
         &mcp_request(
             31,
             "tools/call",
-            json!({"name":"index","arguments":{"path":"visible.rs"}}),
+            json!({"name":"file_index","arguments":{"path":"visible.rs"}}),
         ),
     )
     .await;
@@ -1125,7 +1125,7 @@ async fn stdio_serves_the_full_catalog_including_python_execution() {
             "file_write",
             "file_edit",
             "file_apply_patch",
-            "index",
+            "file_index",
             "websearch",
             "webfetch",
             "shell",
@@ -1203,7 +1203,7 @@ async fn write_authority_decides_whether_mutation_tools_exist_at_all() {
     }
 
     let (_read_only_root, read_only) = files_catalog(false).await;
-    assert_eq!(read_only, ["file_read", "file_glob", "file_grep", "index"]);
+    assert_eq!(read_only, ["file_read", "file_glob", "file_grep", "file_index"]);
 
     let (_writable_root, writable) = files_catalog(true).await;
     assert_eq!(
@@ -1215,7 +1215,7 @@ async fn write_authority_decides_whether_mutation_tools_exist_at_all() {
             "file_write",
             "file_edit",
             "file_apply_patch",
-            "index",
+            "file_index",
         ]
     );
 }

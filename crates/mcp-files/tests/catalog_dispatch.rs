@@ -154,7 +154,7 @@ async fn index_dispatch_returns_bare_model_text_and_complete_structured_content(
         .expect("group");
     let result = group
         .dispatch(
-            "index",
+            "file_index",
             json!({"path": "source.rs"}),
             CancellationToken::new(),
         )
@@ -181,7 +181,7 @@ async fn index_dispatch_returns_bare_model_text_and_complete_structured_content(
     );
 
     let directory = group
-        .dispatch("index", json!({"path": "."}), CancellationToken::new())
+        .dispatch("file_index", json!({"path": "."}), CancellationToken::new())
         .await
         .expect("known")
         .expect("result");
@@ -199,7 +199,7 @@ async fn index_dispatch_returns_bare_model_text_and_complete_structured_content(
         json!({"path": "source.rs", "extra": true}),
     ] {
         let invalid = group
-            .dispatch("index", arguments, CancellationToken::new())
+            .dispatch("file_index", arguments, CancellationToken::new())
             .await
             .expect("known")
             .expect("tool error");
@@ -222,7 +222,7 @@ async fn index_dispatch_fits_escape_heavy_source_into_a_successful_result() {
 
     let result = group
         .dispatch(
-            "index",
+            "file_index",
             json!({"path": "escaped.html"}),
             CancellationToken::new(),
         )
