@@ -225,6 +225,12 @@ fn builtin_line(tool: &ContextBuiltinTool, theme: &Theme) -> Line<'static> {
     if !tokens.is_empty() {
         spans.push(Span::raw(format!(" \u{b7} {tokens}")));
     }
+    if let Some(billed_to) = tool.billed_to {
+        spans.push(Span::styled(
+            format!(" \u{b7} counted under {billed_to}"),
+            theme.status_dim,
+        ));
+    }
     if let Some(reason) = tool.reason {
         spans.push(Span::styled(format!(" \u{b7} {reason}"), theme.status_dim));
     }
@@ -315,6 +321,7 @@ mod tests {
             state,
             reason: (state == ContextBuiltinState::Disabled).then_some(DISABLED_REASON),
             tokens,
+            billed_to: None,
         }
     }
 

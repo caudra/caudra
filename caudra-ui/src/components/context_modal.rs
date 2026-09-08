@@ -766,12 +766,19 @@ fn builtin_lines(snapshot: &ContextSnapshot, theme: &Theme) -> Vec<Line<'static>
             ContextBuiltinState::Deferred => ("○", "on demand", theme.tool_dim),
             ContextBuiltinState::Disabled => continue,
         };
-        lines.push(Line::from(vec![
+        let mut spans = vec![
             Span::styled(format!("{glyph} "), status_style),
             Span::styled(escape_terminal_controls(&tool.name), theme.tool_path),
             Span::styled(format!("  {status} · "), status_style),
             Span::raw(token_label(tool.tokens)),
-        ]));
+        ];
+        if let Some(billed_to) = tool.billed_to {
+            spans.push(Span::styled(
+                format!(" · counted under {billed_to}"),
+                theme.status_dim,
+            ));
+        }
+        lines.push(Line::from(spans));
     }
     lines
 }
@@ -1064,6 +1071,8 @@ mod tests {
 
     const MODEL_SPEC: &str = "test/large";
     const MCP_TOOL: &str = "issues.fetch";
+    const BILLED_TOOL: &str = "task";
+    const BILLED_TO: &str = "profiles";
     const PROFILE: &str = "default";
     const MEMORY_FILE: &str = "project.md";
     const SKILL: &str = "deploy";
@@ -1129,6 +1138,15 @@ mod tests {
                             state: ContextBuiltinState::Declared,
                             reason: None,
                             tokens: 55,
+                            billed_to: None,
+                        },
+                        ContextBuiltinTool {
+                            name: BILLED_TOOL.to_owned(),
+                            source: "native:caudra".to_owned(),
+                            state: ContextBuiltinState::Declared,
+                            reason: None,
+                            tokens: 30,
+                            billed_to: Some(BILLED_TO),
                         },
                         ContextBuiltinTool {
                             name: "code_map".to_owned(),
@@ -1136,6 +1154,7 @@ mod tests {
                             state: ContextBuiltinState::Deferred,
                             reason: Some("deferred behind tool_search"),
                             tokens: 90,
+                            billed_to: None,
                         },
                     ],
                     catalog_tokens: 20,
@@ -1322,8 +1341,9 @@ mod tests {
             "░ Reserve 100 tokens (10.0%)",
             "Auto-compact  threshold 900 tokens (90.0%) · reserve 100 tokens (10.0%)",
             "M MCP tools  3 tools · 1 loaded/eager · 1 on demand · 1 disabled · ~40 tokens in context",
-            "T System tools  1 declared · 1 on demand · 0 disabled · ~75 tokens in context · ~90 tokens if loaded",
+            "T System tools  2 declared · 1 on demand · 0 disabled · ~75 tokens in context · ~90 tokens if loaded",
             "code_map  on demand · ~90 tokens",
+            "task  declared · ~30 tokens · counted under profiles",
             "On-load bodies  ~120 tokens across 1 notes",
             "definitions ~25 tokens · loaded bodies ~45 tokens",
             "issues.fetch  loaded/eager · ~40 tokens",

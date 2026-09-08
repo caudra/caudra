@@ -19,6 +19,9 @@ use crate::tools::{
 };
 
 const MEMORY_READ_COMMAND: &str = "read";
+const BILLED_TO_PROFILES: &str = "profiles";
+const BILLED_TO_MEMORY: &str = "memory";
+const BILLED_TO_SKILLS: &str = "skills";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ContextKey {
@@ -341,6 +344,10 @@ pub struct ContextBuiltinTool {
     /// The rule that decided the state, when one had to.
     pub reason: Option<&'static str>,
     pub tokens: u32,
+    /// The category row already paying for this definition. `task`, `memory`
+    /// and `skill` are charged to the feature they serve, so their tokens are
+    /// reported here and left out of the built-in total.
+    pub billed_to: Option<&'static str>,
 }
 
 /// `catalog_tokens` is the one `tool_search` entry. It stands in for the
@@ -359,7 +366,7 @@ impl ContextBuiltinInventory {
     fn tokens_for(&self, state: ContextBuiltinState) -> u32 {
         self.tools
             .iter()
-            .filter(|tool| tool.state == state)
+            .filter(|tool| tool.state == state && tool.billed_to.is_none())
             .map(|tool| tool.tokens)
             .fold(0, u32::saturating_add)
     }
@@ -426,6 +433,7 @@ impl BuiltinToolsInput<'_> {
                     state,
                     reason: report.reason,
                     tokens: deferred_tokens.get(name).copied().unwrap_or_default(),
+                    billed_to: None,
                 }
             })
             .collect();
@@ -583,7 +591,7 @@ struct RequestAccounting {
     skill_definition_tokens: u32,
     skill_result_tokens: u32,
     skill_results: BTreeMap<String, u32>,
-    system_definitions: Vec<(String, u32)>,
+    builtin_definitions: Vec<BuiltinDefinition>,
     system_unattributed: u32,
     mcp_definitions: Vec<(String, u32)>,
 }
@@ -595,9 +603,17 @@ struct ToolAccounting {
     profiles: u32,
     memory: u32,
     skills: u32,
-    system_definitions: Vec<(String, u32)>,
+    builtin_definitions: Vec<BuiltinDefinition>,
     system_unattributed: u32,
     mcp_definitions: Vec<(String, u32)>,
+}
+
+/// One built-in definition the request array carries, and the category its
+/// tokens were charged to when that was not the generic tool overhead.
+struct BuiltinDefinition {
+    name: String,
+    tokens: u32,
+    billed_to: Option<&'static str>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -607,6 +623,19 @@ enum ToolCategory {
     Profiles,
     Memory,
     Skills,
+}
+
+impl ToolCategory {
+    /// The category row that already pays for this definition, so the
+    /// built-in section can name it rather than repeat the charge.
+    fn billed_to(self) -> Option<&'static str> {
+        match self {
+            Self::System | Self::Mcp => None,
+            Self::Profiles => Some(BILLED_TO_PROFILES),
+            Self::Memory => Some(BILLED_TO_MEMORY),
+            Self::Skills => Some(BILLED_TO_SKILLS),
+        }
+    }
 }
 
 struct ToolContribution {
@@ -658,7 +687,7 @@ fn account_request(
         skill_definition_tokens: tools.skills,
         skill_result_tokens: messages.skills,
         skill_results: messages.skill_results,
-        system_definitions: tools.system_definitions,
+        builtin_definitions: tools.builtin_definitions,
         system_unattributed: tools.system_unattributed,
         mcp_definitions: tools.mcp_definitions,
     }
@@ -720,12 +749,21 @@ fn account_tools(base_tools: &Value, full_tools: &Value) -> ToolAccounting {
 
     let mut accounting = ToolAccounting::default();
     for contribution in contributions {
+        if let Some(billed_to) = contribution.category.billed_to() {
+            accounting.builtin_definitions.push(BuiltinDefinition {
+                name: contribution.name.clone(),
+                tokens: contribution.tokens,
+                billed_to: Some(billed_to),
+            });
+        }
         match contribution.category {
             ToolCategory::System => {
                 add_tokens(&mut accounting.system, contribution.tokens);
-                accounting
-                    .system_definitions
-                    .push((contribution.name, contribution.tokens));
+                accounting.builtin_definitions.push(BuiltinDefinition {
+                    name: contribution.name,
+                    tokens: contribution.tokens,
+                    billed_to: None,
+                });
             }
             ToolCategory::Mcp => {
                 add_tokens(&mut accounting.mcp, contribution.tokens);
@@ -839,7 +877,7 @@ impl ContextInventory {
                 .unwrap_or_default();
         }
         self.builtins.apply_request_tokens(
-            &accounting.system_definitions,
+            &accounting.builtin_definitions,
             accounting.system_unattributed,
         );
         self.mcp.apply_request_tokens(&accounting.mcp_definitions);
@@ -867,11 +905,16 @@ impl ContextBuiltinInventory {
     /// The registry says which tools exist and why; only the request knows
     /// what they cost. A name the array actually carries is declared with its
     /// measured tokens, whatever the filter predicted.
-    fn apply_request_tokens(&mut self, definitions: &[(String, u32)], unattributed: u32) {
+    fn apply_request_tokens(&mut self, definitions: &[BuiltinDefinition], unattributed: u32) {
         self.catalog_tokens = 0;
         self.unattributed_tokens = unattributed;
 
-        for (name, tokens) in definitions {
+        for definition in definitions {
+            let BuiltinDefinition {
+                name,
+                tokens,
+                billed_to,
+            } = definition;
             if name == TOOL_SEARCH_TOOL_NAME {
                 add_tokens(&mut self.catalog_tokens, *tokens);
                 continue;
@@ -880,6 +923,7 @@ impl ContextBuiltinInventory {
                 Some(tool) => {
                     tool.state = ContextBuiltinState::Declared;
                     tool.tokens = *tokens;
+                    tool.billed_to = *billed_to;
                 }
                 None => self.tools.push(ContextBuiltinTool {
                     name: name.clone(),
@@ -887,6 +931,7 @@ impl ContextBuiltinInventory {
                     state: ContextBuiltinState::Declared,
                     reason: None,
                     tokens: *tokens,
+                    billed_to: *billed_to,
                 }),
             }
         }
@@ -1226,6 +1271,17 @@ mod tests {
             .expect("declared built-in is inventoried");
         assert_eq!(declared.state, ContextBuiltinState::Declared);
         assert!(declared.tokens > 0);
+        // `task` costs real tokens the profiles row already pays for, so the
+        // built-in row reports them without adding them a second time.
+        let billed = snapshot
+            .inventory
+            .builtins
+            .tools
+            .iter()
+            .find(|tool| tool.name == TASK_TOOL_NAME)
+            .expect("a built-in billed elsewhere is still inventoried");
+        assert_eq!(billed.billed_to, Some(BILLED_TO_PROFILES));
+        assert_eq!(billed.tokens, snapshot.usage.profiles);
         assert_eq!(
             snapshot
                 .usage
