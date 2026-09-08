@@ -1331,7 +1331,10 @@ mod tests {
         let text = format_examples_as_text(&json!([{ "code": SNIPPET }])).expect(EXAMPLES_DROPPED);
 
         assert!(text.contains(SNIPPET));
-        assert!(!text.contains(EXAMPLE_CODE_KEY), "the key leaked into prose");
+        assert!(
+            !text.contains(EXAMPLE_CODE_KEY),
+            "the key leaked into prose"
+        );
     }
 
     #[test]
@@ -1373,5 +1376,4 @@ mod effect_tests {
             "{SPELLING_MSG}"
         );
     }
-
 }

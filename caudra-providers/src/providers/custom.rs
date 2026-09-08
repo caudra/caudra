@@ -428,7 +428,10 @@ mod tests {
         );
 
         assert_eq!(model.family, ModelFamily::Generic, "{protocol}");
-        assert!(!model.prefers_apply_patch(), "{protocol}: got the Codex editor");
+        assert!(
+            !model.prefers_apply_patch(),
+            "{protocol}: got the Codex editor"
+        );
         assert!(!model.supports_vision(), "{protocol}: claimed vision");
         assert!(
             !model.supports_tool_examples(),
