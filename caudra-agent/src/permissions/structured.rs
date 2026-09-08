@@ -576,7 +576,25 @@ pub fn resource_constraint_matches(
     constraint: &PermissionResourceConstraint,
     resource: &PermissionResource,
 ) -> bool {
-    constraint_covers_resource(constraint, resource, None)
+    constraint_covers_resource(constraint, resource, None, RuleIntent::Grant)
+}
+
+/// What a rule does with a resource it names. Protection raises the bar for
+/// granting only: a refusal that had to clear the same bar would fail open on
+/// exactly the resources protection exists for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuleIntent {
+    Grant,
+    Restrain,
+}
+
+impl RuleIntent {
+    fn of(effect: &StructuredPermissionEffect) -> Self {
+        match effect {
+            StructuredPermissionEffect::Allow => Self::Grant,
+            StructuredPermissionEffect::Ask | StructuredPermissionEffect::Deny => Self::Restrain,
+        }
+    }
 }
 
 /// Whether the constraint and the resource name the same operation. Without a
@@ -627,6 +645,7 @@ fn constraint_covers_resource(
     constraint: &PermissionResourceConstraint,
     resource: &PermissionResource,
     family: Option<PermissionCapabilityFamily>,
+    intent: RuleIntent,
 ) -> bool {
     if !operation_matches(constraint, resource, family) {
         return false;
@@ -637,7 +656,10 @@ fn constraint_covers_resource(
     {
         return false;
     }
-    if resource.protected && !protected_coverage_allowed(constraint, resource) {
+    if resource.protected
+        && intent == RuleIntent::Grant
+        && !protected_coverage_allowed(constraint, resource)
+    {
         return false;
     }
     if !selector_matches(&constraint.selector, &resource.value, &resource.kind) {
@@ -754,7 +776,14 @@ fn rule_standing(
     }
     rule.resources
         .iter()
-        .filter(|constraint| constraint_covers_resource(constraint, resource, rule.family))
+        .filter(|constraint| {
+            constraint_covers_resource(
+                constraint,
+                resource,
+                rule.family,
+                RuleIntent::of(&rule.effect),
+            )
+        })
         .map(|constraint| selector_width(&constraint.selector))
         .max()
         .and_then(standing)
@@ -786,9 +815,14 @@ pub fn permission_rule_covers_request(
     rule.effect == StructuredPermissionEffect::Allow
         && rule_context_matches(rule, request)
         && request.resources.iter().all(|resource| {
-            rule.resources
-                .iter()
-                .any(|constraint| constraint_covers_resource(constraint, resource, rule.family))
+            rule.resources.iter().any(|constraint| {
+                constraint_covers_resource(
+                    constraint,
+                    resource,
+                    rule.family,
+                    RuleIntent::of(&rule.effect),
+                )
+            })
         })
 }
 
@@ -822,9 +856,14 @@ pub fn permission_rule_intersects_request(
         && rule_context_matches(rule, request)
         && (rule.resources.is_empty()
             || request.resources.iter().any(|resource| {
-                rule.resources
-                    .iter()
-                    .any(|constraint| constraint_covers_resource(constraint, resource, rule.family))
+                rule.resources.iter().any(|constraint| {
+                    constraint_covers_resource(
+                        constraint,
+                        resource,
+                        rule.family,
+                        RuleIntent::of(&rule.effect),
+                    )
+                })
             }))
 }
 
@@ -2924,6 +2963,22 @@ mod tests {
                 ),
             ]
         })
+    }
+
+    /// Protection raises the bar for granting, so a rule naming a pattern cannot
+    /// grant a protected command. It must not raise the same bar for refusing, or
+    /// a deny would fail open on exactly the commands protection exists for.
+    #[test_case(ALLOW => StructuredPermissionDecision::NoMatch ; "a pattern cannot grant it")]
+    #[test_case(ASK => StructuredPermissionDecision::Ask ; "a pattern can still ask about it")]
+    #[test_case(DENY => StructuredPermissionDecision::Deny ; "a pattern can still refuse it")]
+    fn protection_gates_grants_and_not_refusals(
+        effect: StructuredPermissionEffect,
+    ) -> StructuredPermissionDecision {
+        let resource = protected_command_resource(NARROW_COMMAND, "/project");
+        let request = request(vec![resource.clone()]);
+        let rules = vec![rule(&request, effect, vec![pattern_constraint(BROAD_ASK)])];
+
+        permission_rules_resource_decision(&rules, &request, &resource)
     }
 
     /// The ranking table. The variant order supplies the comparison; this pins
