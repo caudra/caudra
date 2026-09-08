@@ -636,12 +636,13 @@ fn output_schema() -> serde_json::Map<String, Value> {
             "toolGroups": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["files", "web", "shell", "code"],
+                "required": ["files", "web", "shell", "code", "codeGraph"],
                 "properties": {
                     "files": {"type": "boolean"},
                     "web": {"type": "boolean"},
                     "shell": {"type": "boolean"},
-                    "code": {"type": "boolean"}
+                    "code": {"type": "boolean"},
+                    "codeGraph": {"type": "boolean"}
                 }
             },
             "commands": {
@@ -1659,6 +1660,8 @@ const fn architecture() -> &'static str {
 
 #[cfg(all(test, feature = "mcp"))]
 mod tests {
+    use std::collections::BTreeSet;
+
     use tempfile::tempdir;
 
     use super::*;
@@ -1983,6 +1986,77 @@ mod tests {
             panic!("expected text content");
         };
         assert_eq!(text.text, "Execution-environment inspection cancelled");
+    }
+
+    // The output schema is hand-written beside structs that derive their own
+    // serialization, so the two drift the moment a field is added: codeGraph
+    // shipped while the schema still closed toolGroups over the four groups
+    // that preceded it, and because the object says additionalProperties:
+    // false, every conformant MCP client rejected the tool's own result. A
+    // test that restates either side would have drifted with it, so walk the
+    // schema and a real payload together instead.
+    #[tokio::test]
+    async fn closed_objects_declare_exactly_what_is_serialized() {
+        fn walk(path: &str, schema: &Value, value: &Value) {
+            if let Some(items) = schema.get("items") {
+                if let Some(elements) = value.as_array() {
+                    for (index, element) in elements.iter().enumerate() {
+                        walk(&format!("{path}[{index}]"), items, element);
+                    }
+                }
+            }
+            let (Some(properties), Some(object)) = (
+                schema.get("properties").and_then(Value::as_object),
+                value.as_object(),
+            ) else {
+                return;
+            };
+            let serialized = object.keys().cloned().collect::<BTreeSet<_>>();
+            if schema.get("additionalProperties") == Some(&Value::Bool(false)) {
+                // Exactly what additionalProperties: false promises, and what
+                // codeGraph broke.
+                let declared = properties.keys().cloned().collect::<BTreeSet<_>>();
+                let undeclared = &serialized - &declared;
+                assert!(
+                    undeclared.is_empty(),
+                    "{path} serializes {undeclared:?}, which its schema forbids"
+                );
+            }
+            // Equality would be wrong in the other direction: commands[].version
+            // is absent when no version was parsed, and the schema is right to
+            // leave it out of required.
+            if let Some(required) = schema.get("required").and_then(Value::as_array) {
+                let missing = required
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .filter(|key| !object.contains_key(*key))
+                    .collect::<Vec<_>>();
+                assert!(
+                    missing.is_empty(),
+                    "{path} requires {missing:?} but does not serialize them"
+                );
+            }
+            for (key, child) in object {
+                if let Some(child_schema) = properties.get(key) {
+                    walk(&format!("{path}.{key}"), child_schema, child);
+                }
+            }
+        }
+
+        let snapshot = ExecutionEnvironmentSnapshot::collect(None).await;
+        // Every group on, so no field is absent merely because it was disabled.
+        let groups = ToolGroupDisclosure {
+            files: true,
+            web: true,
+            shell: true,
+            code: true,
+            code_graph: true,
+        };
+        walk(
+            "output",
+            &Value::Object(output_schema()),
+            &Value::Object(snapshot.descriptor(groups)),
+        );
     }
 
     #[tokio::test]

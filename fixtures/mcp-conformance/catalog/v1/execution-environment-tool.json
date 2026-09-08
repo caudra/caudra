@@ -263,12 +263,13 @@
             "toolGroups": {
               "type": "object",
               "additionalProperties": false,
-              "required": ["files", "web", "shell", "code"],
+              "required": ["files", "web", "shell", "code", "codeGraph"],
               "properties": {
                 "files": { "type": "boolean" },
                 "web": { "type": "boolean" },
                 "shell": { "type": "boolean" },
-                "code": { "type": "boolean" }
+                "code": { "type": "boolean" },
+                "codeGraph": { "type": "boolean" }
               }
             },
             "commands": {
