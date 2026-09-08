@@ -9,7 +9,7 @@ use color_eyre::eyre::{Context, bail};
 use caudra_agent::mcp::{McpSession, config as mcp_config, oauth as mcp_oauth};
 use caudra_agent::tools::{
     DescriptionContext, RegisteredTool, SHELL_TOOL_NAME, ToolAudience, ToolFilter, ToolRegistry,
-    capability_exclusions, credential_exclusions, is_tool_enabled,
+    VIEW_IMAGE_TOOL_NAME, capability_exclusions, credential_exclusions, is_tool_enabled,
 };
 use caudra_config::providers::{
     Protocol, ProviderDef, ProvidersConfig, all_builtins, builtin_provider, resolve_api_key_env,
@@ -761,6 +761,7 @@ const REASON_NO_VISION: &str = "model has no vision support";
 const REASON_NOT_ALLOWED: &str = "not in --allowed-tools";
 const REASON_COMPANION: &str = "always on (internal companion)";
 const REASON_NO_SUBSCRIPTION: &str = "no ChatGPT subscription";
+const REASON_OTHER_EDITOR: &str = "model uses the other editing tool";
 const REASON_DEFERRED: &str = "deferred behind tool_search";
 
 #[derive(serde::Serialize)]
@@ -797,7 +798,10 @@ fn builtin_note(
         return Some(REASON_CONFIG);
     }
     if capability_exclusions(model).contains(&name) {
-        return Some(REASON_NO_VISION);
+        return Some(match name {
+            VIEW_IMAGE_TOOL_NAME => REASON_NO_VISION,
+            _ => REASON_OTHER_EDITOR,
+        });
     }
     if credential_exclusions().contains(&name) {
         return Some(REASON_NO_SUBSCRIPTION);

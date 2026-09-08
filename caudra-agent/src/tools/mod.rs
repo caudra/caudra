@@ -248,12 +248,19 @@ impl ToolFilter {
 }
 
 /// One gate for every definitions builder (main loop, headless, Lua): a model
-/// without vision never learns `view_image` exists.
+/// without vision never learns `view_image` exists, and no model is shown both
+/// editors. Two overlapping mutating contracts are the surface small models
+/// pick wrong from most often, so each model gets the one it was trained on
+/// ([`Model::prefers_apply_patch`]) and never has to choose.
+///
+/// The combinations are enumerated rather than built, so the gate stays
+/// allocation-free on a path that runs for every request.
 pub fn capability_exclusions(model: &Model) -> &'static [&'static str] {
-    if model.supports_vision() {
-        &[]
-    } else {
-        &[VIEW_IMAGE_TOOL_NAME]
+    match (model.supports_vision(), model.prefers_apply_patch()) {
+        (true, true) => &[FILE_EDIT_TOOL_NAME],
+        (true, false) => &[FILE_APPLY_PATCH_TOOL_NAME],
+        (false, true) => &[VIEW_IMAGE_TOOL_NAME, FILE_EDIT_TOOL_NAME],
+        (false, false) => &[VIEW_IMAGE_TOOL_NAME, FILE_APPLY_PATCH_TOOL_NAME],
     }
 }
 
@@ -859,6 +866,22 @@ mod tests {
         assert!(
             filter.matches(FILE_READ_TOOL_NAME),
             "unrelated tools stay enabled"
+        );
+    }
+
+    /// Never both: the model that has to choose between two mutating editors
+    /// is the one that picks wrong.
+    #[test_case("openai/gpt-5.6-sol", FILE_APPLY_PATCH_TOOL_NAME, FILE_EDIT_TOOL_NAME ; "gpt gets apply_patch")]
+    #[test_case("anthropic/claude-opus-4-8", FILE_EDIT_TOOL_NAME, FILE_APPLY_PATCH_TOOL_NAME ; "claude gets edit")]
+    fn exactly_one_editor_reaches_the_model(spec: &str, offered: &str, withheld: &str) {
+        let model = Model::from_spec(spec).unwrap();
+        let filter = ToolFilter::from_config(&AgentConfig::default(), &model, &[]);
+
+        assert!(filter.matches(offered), "{spec} lost its editor");
+        assert!(!filter.matches(withheld), "{spec} was offered both editors");
+        assert!(
+            filter.matches(FILE_WRITE_TOOL_NAME),
+            "file_write serves both contracts and stays"
         );
     }
 

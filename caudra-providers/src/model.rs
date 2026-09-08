@@ -22,6 +22,9 @@ use crate::types::ThinkingFields;
 
 const PER_MILLION: f64 = 1_000_000.0;
 const ANTHROPIC_SLUG: &str = "anthropic";
+const GPT_PREFIX: &str = "gpt-";
+const GPT_4_PREFIX: &str = "gpt-4";
+const OPEN_WEIGHTS_MARKER: &str = "oss";
 
 #[derive(Debug, thiserror::Error)]
 pub enum ModelError {
@@ -477,6 +480,24 @@ impl Model {
             .unwrap_or_else(|| self.family.supports_tool_examples())
     }
 
+    /// Which of the two editing contracts this model was trained on, so it is
+    /// offered one rather than asked to choose. GPT-5 and its successors are
+    /// trained on the Codex `apply_patch` envelope; everything else does better
+    /// with string replacement.
+    ///
+    /// Matched on the id rather than [`ModelFamily`], which is a per-provider
+    /// label: Copilot and OpenRouter serve `gpt-5*` under `Generic`. `gpt-4*`
+    /// predates the format and the open-weight `gpt-oss*` line was not trained
+    /// on it, so both stay on string replacement. `family` covers the OpenAI
+    /// ids that do not say `gpt` at all, such as `o3` and `codex-*`.
+    pub fn prefers_apply_patch(&self) -> bool {
+        let id = self.id.to_ascii_lowercase();
+        if id.contains(GPT_4_PREFIX) || id.contains(OPEN_WEIGHTS_MARKER) {
+            return false;
+        }
+        id.contains(GPT_PREFIX) || self.family == ModelFamily::Gpt
+    }
+
     /// A model supports fast mode exactly when it carries fast-tier pricing, so
     /// capability and billing can never disagree. The provider gate keeps fast
     /// mode to Anthropic-based providers, resolved through the base manifest so
@@ -835,6 +856,25 @@ mod tests {
             std::mem::discriminant(&err),
             std::mem::discriminant(&expected)
         );
+    }
+
+    /// The id decides, not the provider: `copilot` and `openrouter` serve the
+    /// same GPT weights under `ModelFamily::Generic`.
+    #[test_case("openai/gpt-5.6-sol", true ; "gpt 5 on openai")]
+    #[test_case("copilot/gpt-5.6-terra", true ; "gpt 5 under a generic family")]
+    #[test_case("openai/gpt-4o", false ; "gpt 4 predates the format")]
+    #[test_case("groq/gpt-oss-120b", false ; "open weights were not trained on it")]
+    #[test_case("anthropic/claude-opus-4-8", false ; "claude uses string replacement")]
+    #[test_case("zai/glm-4.6", false ; "glm uses string replacement")]
+    fn prefers_apply_patch_follows_the_model_id(spec: &str, expected: bool) {
+        let mut model = Model::from_spec("anthropic/claude-opus-4-8").unwrap();
+        let (provider, id) = spec.split_once('/').unwrap();
+        model.provider = provider.into();
+        model.id = id.to_owned();
+        model.family = ManifestRegistry::for_slug(provider)
+            .map_or(ModelFamily::Generic, |manifest| manifest.family);
+
+        assert_eq!(model.prefers_apply_patch(), expected, "{spec}");
     }
 
     #[test]
