@@ -24,7 +24,9 @@ const PER_MILLION: f64 = 1_000_000.0;
 const ANTHROPIC_SLUG: &str = "anthropic";
 const GPT_PREFIX: &str = "gpt-";
 const GPT_4_PREFIX: &str = "gpt-4";
-const OPEN_WEIGHTS_MARKER: &str = "oss";
+const OPEN_WEIGHTS_PREFIX: &str = "gpt-oss";
+/// OpenAI ids trained on the Codex envelope that never spell `gpt`.
+const CODEX_TRAINED_PREFIXES: [&str; 3] = ["o3", "o4", "codex"];
 
 #[derive(Debug, thiserror::Error)]
 pub enum ModelError {
@@ -334,6 +336,27 @@ pub struct Model {
     pub reasoning_options: ReasoningOptions,
 }
 
+/// `ManifestRegistry::for_slug` resolves a custom slug to its base provider's
+/// manifest so stubs still get thinking, display-name, and window defaults. Those
+/// are transport concerns. Lineage is not: a custom provider's base is its wire
+/// protocol, and an OpenAI-shaped endpoint serves whatever the operator loaded,
+/// so a borrowed manifest never lends its family.
+///
+/// A dynamic provider names a real upstream, which is a lineage claim, so it
+/// keeps inheriting. `for_slug` tries builtin, then dynamic, then custom, so a
+/// borrowed manifest that is not dynamic was borrowed by a custom slug.
+fn inherited_lineage(
+    manifest: &ProviderManifest,
+    slug: &str,
+    entry: Option<&ModelEntry>,
+) -> ModelFamily {
+    let borrowed_by_custom = slug != manifest.slug && dynamic::base_for_slug(slug).is_none();
+    if borrowed_by_custom {
+        return ModelFamily::Generic;
+    }
+    entry.map_or(manifest.family, |entry| entry.family)
+}
+
 impl Model {
     /// When no static entry matches (a freshly released model the table has not
     /// caught up to yet), fall back to the provider defaults so it still resolves.
@@ -345,7 +368,7 @@ impl Model {
         let discovered = model_registry::discovered(manifest.slug, model_id);
         let discovered = discovered.as_ref();
         let tier = model_registry::tier_for(&spec, manifest.slug, static_entry.map(|e| e.tier));
-        let family = static_entry.map_or(manifest.family, |entry| entry.family);
+        let family = inherited_lineage(manifest, slug, static_entry);
         let discovered_pricing = discovered.and_then(|info| info.pricing.as_ref());
         let pricing = discovered_pricing
             .or_else(|| static_entry.map(|entry| &entry.pricing))
@@ -485,17 +508,20 @@ impl Model {
     /// trained on the Codex `apply_patch` envelope; everything else does better
     /// with string replacement.
     ///
-    /// Matched on the id rather than [`ModelFamily`], which is a per-provider
-    /// label: Copilot and OpenRouter serve `gpt-5*` under `Generic`. `gpt-4*`
-    /// predates the format and the open-weight `gpt-oss*` line was not trained
-    /// on it, so both stay on string replacement. `family` covers the OpenAI
-    /// ids that do not say `gpt` at all, such as `o3` and `codex-*`.
+    /// Matched on the id alone. [`ModelFamily`] cannot answer this: it is a
+    /// per-provider label that Copilot and OpenRouter set to `Generic` for real
+    /// `gpt-5*` weights, and that every OpenAI-shaped custom endpoint would
+    /// otherwise set to `Gpt` for weights that are not GPT at all.
+    ///
+    /// `gpt-4*` predates the format and the open-weight `gpt-oss*` line was not
+    /// trained on it, so both stay on string replacement. The reasoning and
+    /// Codex ids never say `gpt`, so they are named.
     pub fn prefers_apply_patch(&self) -> bool {
         let id = self.id.to_ascii_lowercase();
-        if id.contains(GPT_4_PREFIX) || id.contains(OPEN_WEIGHTS_MARKER) {
+        if id.contains(GPT_4_PREFIX) || id.starts_with(OPEN_WEIGHTS_PREFIX) {
             return false;
         }
-        id.contains(GPT_PREFIX) || self.family == ModelFamily::Gpt
+        id.contains(GPT_PREFIX) || CODEX_TRAINED_PREFIXES.iter().any(|p| id.starts_with(p))
     }
 
     /// A model supports fast mode exactly when it carries fast-tier pricing, so
@@ -858,23 +884,40 @@ mod tests {
         );
     }
 
-    /// The id decides, not the provider: `copilot` and `openrouter` serve the
-    /// same GPT weights under `ModelFamily::Generic`.
+    /// Resolved the way production resolves them, not by assigning `family` by
+    /// hand: the previous version of this test built a model no code path ever
+    /// produces, which is why it passed while local models were being handed the
+    /// wrong editor.
     #[test_case("openai/gpt-5.6-sol", true ; "gpt 5 on openai")]
     #[test_case("copilot/gpt-5.6-terra", true ; "gpt 5 under a generic family")]
+    #[test_case("openai/o3-pro", true ; "reasoning ids never spell gpt")]
+    #[test_case("openai/codex-mini", true ; "codex ids never spell gpt")]
     #[test_case("openai/gpt-4o", false ; "gpt 4 predates the format")]
-    #[test_case("groq/gpt-oss-120b", false ; "open weights were not trained on it")]
+    #[test_case("openrouter/gpt-oss-120b", false ; "open weights were not trained on it")]
     #[test_case("anthropic/claude-opus-4-8", false ; "claude uses string replacement")]
     #[test_case("zai/glm-4.6", false ; "glm uses string replacement")]
+    #[test_case("llama-cpp/qwen3.8-27b-cyberstrike", false ; "an openai shaped local server is not gpt")]
     fn prefers_apply_patch_follows_the_model_id(spec: &str, expected: bool) {
-        let mut model = Model::from_spec("anthropic/claude-opus-4-8").unwrap();
-        let (provider, id) = spec.split_once('/').unwrap();
-        model.provider = provider.into();
-        model.id = id.to_owned();
-        model.family = ManifestRegistry::for_slug(provider)
-            .map_or(ModelFamily::Generic, |manifest| manifest.family);
+        let model = Model::from_spec(spec).unwrap();
 
         assert_eq!(model.prefers_apply_patch(), expected, "{spec}");
+    }
+
+    /// A borrowed manifest lends windows and thinking defaults, never lineage.
+    #[test]
+    fn a_custom_slug_never_inherits_its_base_family() {
+        let openai = ManifestRegistry::get("openai").unwrap();
+
+        assert_eq!(
+            inherited_lineage(openai, "ninfer-4090", None),
+            ModelFamily::Generic,
+            "an openai-protocol custom provider claimed GPT lineage"
+        );
+        assert_eq!(
+            inherited_lineage(openai, "openai", None),
+            ModelFamily::Gpt,
+            "the provider that owns the manifest lost its own family"
+        );
     }
 
     #[test]

@@ -13,7 +13,9 @@ use super::ResolvedAuth;
 use super::openai::responses;
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 use crate::manifest::ManifestRegistry;
-use crate::model::{FastPricing, Model, ModelInfo, ModelPricing, ModelTier, ThinkingSupport};
+use crate::model::{
+    FastPricing, Model, ModelFamily, ModelInfo, ModelPricing, ModelTier, ThinkingSupport,
+};
 use crate::provider::{BoxFuture, Provider, ProviderKind};
 use crate::providers::Timeouts;
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig};
@@ -181,7 +183,11 @@ fn model_from_def(def: &ProviderDef, kind: ProviderKind, slug: &str, model_id: &
         id: model_id.to_string(),
         provider: Arc::from(slug),
         tier,
-        family: kind.family(),
+        // `kind` is the wire protocol, never the weights: an OpenAI-shaped
+        // endpoint serves whatever the operator loaded. Windows and thinking
+        // defaults above are transport concerns and may follow it; lineage may
+        // not, so capabilities come from config or stay off.
+        family: ModelFamily::Generic,
         supports_tool_examples_override,
         thinking_override,
         supports_vision_override,
@@ -400,6 +406,49 @@ mod tests {
             r#"{{"protocol":"openai","models":[{{"id":"{model_id}"}}]}}"#
         ))
         .unwrap()
+    }
+
+    /// The protocol says how to frame the request, never what the weights are:
+    /// every OpenAI-compatible local server used to inherit `ModelFamily::Gpt`
+    /// and with it the Codex editor, vision, and a tool-example encoding that
+    /// the OpenAI translations drop on the floor.
+    #[test_case::test_case("openai" ; "chat completions")]
+    #[test_case::test_case("openai-responses" ; "responses")]
+    fn an_openai_shaped_protocol_never_implies_gpt_weights(protocol: &str) {
+        let def: ProviderDef = serde_json::from_str(&format!(
+            r#"{{"protocol":"{protocol}","models":[{{"id":"qwen3.8-27b-cyberstrike"}}]}}"#
+        ))
+        .unwrap();
+
+        let model = model_from_def(
+            &def,
+            ProviderKind::OpenAi,
+            "local-openai-shaped-test",
+            "qwen3.8-27b-cyberstrike",
+        );
+
+        assert_eq!(model.family, ModelFamily::Generic, "{protocol}");
+        assert!(!model.prefers_apply_patch(), "{protocol}: got the Codex editor");
+        assert!(!model.supports_vision(), "{protocol}: claimed vision");
+        assert!(
+            !model.supports_tool_examples(),
+            "{protocol}: examples would go to `input_examples`, which the \
+             OpenAI translations drop instead of sending"
+        );
+    }
+
+    /// Declaring a capability is still how you get it; only the guess is gone.
+    #[test]
+    fn declared_capabilities_still_win_over_the_generic_default() {
+        let def: ProviderDef = serde_json::from_str(
+            r#"{"protocol":"openai","models":[{"id":"m","supports_vision":true,"supports_tool_examples":true}]}"#,
+        )
+        .unwrap();
+
+        let model = model_from_def(&def, ProviderKind::OpenAi, "declared-caps-test", "m");
+
+        assert!(model.supports_vision());
+        assert!(model.supports_tool_examples());
     }
 
     // `opencode` is a builtin whose slug is absent from the `builtin_provider`

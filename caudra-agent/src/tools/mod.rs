@@ -885,6 +885,7 @@ mod tests {
     /// is the one that picks wrong.
     #[test_case("openai/gpt-5.6-sol", FILE_APPLY_PATCH_TOOL_NAME, FILE_EDIT_TOOL_NAME ; "gpt gets apply_patch")]
     #[test_case("anthropic/claude-opus-4-8", FILE_EDIT_TOOL_NAME, FILE_APPLY_PATCH_TOOL_NAME ; "claude gets edit")]
+    #[test_case("llama-cpp/qwen3.8-27b", FILE_EDIT_TOOL_NAME, FILE_APPLY_PATCH_TOOL_NAME ; "an openai shaped local server gets edit")]
     fn exactly_one_editor_reaches_the_model(spec: &str, offered: &str, withheld: &str) {
         let model = Model::from_spec(spec).unwrap();
         let filter = ToolFilter::from_config(&AgentConfig::default(), &model, &[]);

@@ -218,10 +218,10 @@ supports_vision = false
 | `tier` | string | `medium` | `weak`, `medium`, or `strong` |
 | `context_window` | u32 | protocol default | Tokens of context |
 | `max_output_tokens` | u32 | protocol default | Max completion tokens |
-| `supports_tool_examples` | bool | protocol default | |
+| `supports_tool_examples` | bool | false | Send tool examples as a structured field. Off unless declared, because the protocol says nothing about the weights behind it |
 | `supports_thinking` | bool | protocol default | |
 | `requires_thinking` | bool | false | For APIs that reject requests with thinking disabled. Implies `supports_thinking` and raises thinking to minimal effort when off (including compaction) |
-| `supports_vision` | bool | protocol default | When false, image input and `view_image` are off |
+| `supports_vision` | bool | false | Off unless declared. When false, image input and `view_image` are off |
 | `pricing_input` / `pricing_output` | f64 | 0 | USD per 1M tokens |
 | `pricing_cache_write` / `pricing_cache_read` | f64 | 0 | USD per 1M tokens |
 | `pricing_fast_input` / `pricing_fast_output` | f64 | unset | Fast-mode pricing when the provider supports it |
