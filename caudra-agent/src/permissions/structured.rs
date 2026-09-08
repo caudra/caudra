@@ -149,10 +149,13 @@ pub struct PermissionRequest {
 
 /// What a rule set says about a request or one of its resources.
 ///
-/// The declaration order is the precedence, so folding a set is `max`: a deny
-/// anywhere outranks an ask, an ask outranks an allow, and any of them outranks
-/// silence. `NoMatch` is not an allow — it means no rule spoke, and the caller
-/// decides what that means.
+/// The declaration order is the precedence: a deny outranks an ask, an ask
+/// outranks an allow, and any of them outranks silence. `NoMatch` is not an
+/// allow — it means no rule spoke, and the caller decides what that means.
+///
+/// This order combines resources and breaks ties between equally specific
+/// rules. It does not rank the rules themselves; `permission_rules_resource_decision`
+/// does, because a narrow allow has to survive a broad ask.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum StructuredPermissionDecision {
     #[default]
@@ -685,26 +688,83 @@ fn protected_coverage_allowed(
         })
 }
 
-/// Reports whether a rule speaks to a resource at all, regardless of what it
-/// then says about it. Keeping this separate from the effect is what lets one
-/// traversal answer for allow, deny, and ask alike.
+/// How narrowly a selector names a resource. A rule that names one resource
+/// outranks one that names a region, which outranks one that names everything,
+/// so a specific grant is not swallowed by a broad ask.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum SelectorWidth {
+    Blanket,
+    /// A subtree, or a command pattern carrying its literal count and byte
+    /// length so `git status *` outranks `git *`.
+    Region(usize, usize),
+    Exact,
+}
+
+fn selector_width(selector: &PermissionResourceSelector) -> SelectorWidth {
+    match selector {
+        PermissionResourceSelector::Any => SelectorWidth::Blanket,
+        // A pattern that names no literal reaches everything its kind has, so it
+        // ranks with the blanket selector rather than above it.
+        PermissionResourceSelector::CommandPattern { pattern } => {
+            match super::command_pattern::specificity(pattern) {
+                Some((literals, bytes)) if literals > 0 => SelectorWidth::Region(literals, bytes),
+                _ => SelectorWidth::Blanket,
+            }
+        }
+        PermissionResourceSelector::Subtree { .. }
+        | PermissionResourceSelector::FilesystemSubtreeDigest { .. }
+        | PermissionResourceSelector::UrlSubtreeDigest { .. }
+        | PermissionResourceSelector::UrlOriginDigest { .. } => SelectorWidth::Region(0, 0),
+        PermissionResourceSelector::Exact { .. } | PermissionResourceSelector::Digest { .. } => {
+            SelectorWidth::Exact
+        }
+    }
+}
+
+/// Where a rule stands relative to the others once it has matched. Ordered
+/// lexicographically: a denial is absolute and outranks any width, then the rule
+/// that names the least wins, and an ask breaks a tie against an allow.
+type RuleStanding = (bool, SelectorWidth, StructuredPermissionDecision);
+
+/// Reports how strongly a rule speaks to a resource, or `None` when it does not
+/// speak to it at all. Keeping the traversal separate from the effect is what
+/// lets one definition of matching answer for allow, deny, and ask alike.
 ///
 /// A rule that names no resource is unrestricted, which is how the picker
-/// presents it and how deny already reads it, so it speaks to every resource.
-fn rule_matches_resource(
+/// presents it and how deny already reads it, so it speaks to every resource at
+/// the widest rank.
+fn rule_standing(
     rule: &StructuredPermissionRule,
     request: &PermissionRequest,
     resource: &PermissionResource,
-) -> bool {
-    rule_context_matches(rule, request)
-        && (rule.resources.is_empty()
-            || rule
-                .resources
-                .iter()
-                .any(|constraint| constraint_covers_resource(constraint, resource, rule.family)))
+) -> Option<RuleStanding> {
+    if !rule_context_matches(rule, request) {
+        return None;
+    }
+    let decision = StructuredPermissionDecision::of(&rule.effect);
+    let standing = |width| {
+        Some((
+            decision == StructuredPermissionDecision::Deny,
+            width,
+            decision,
+        ))
+    };
+    if rule.resources.is_empty() {
+        return standing(SelectorWidth::Blanket);
+    }
+    rule.resources
+        .iter()
+        .filter(|constraint| constraint_covers_resource(constraint, resource, rule.family))
+        .map(|constraint| selector_width(&constraint.selector))
+        .max()
+        .and_then(standing)
 }
 
 /// What the rule set says about one resource.
+///
+/// Ranking is what keeps a config that asks about `git *` from swallowing its
+/// own `git status` allow. Ties are broken entirely by the standing, so the
+/// answer does not depend on rule order.
 pub fn permission_rules_resource_decision(
     rules: &[StructuredPermissionRule],
     request: &PermissionRequest,
@@ -712,9 +772,10 @@ pub fn permission_rules_resource_decision(
 ) -> StructuredPermissionDecision {
     rules
         .iter()
-        .filter(|rule| rule_matches_resource(rule, request, resource))
-        .fold(StructuredPermissionDecision::NoMatch, |decision, rule| {
-            decision.merge(StructuredPermissionDecision::of(&rule.effect))
+        .filter_map(|rule| rule_standing(rule, request, resource))
+        .max()
+        .map_or(StructuredPermissionDecision::NoMatch, |(_, _, decision)| {
+            decision
         })
 }
 
@@ -737,7 +798,7 @@ pub fn permission_rule_covers_resource(
     resource: &PermissionResource,
 ) -> bool {
     rule.effect == StructuredPermissionEffect::Allow
-        && rule_matches_resource(rule, request, resource)
+        && rule_standing(rule, request, resource).is_some()
 }
 
 pub fn permission_rules_cover_request(
@@ -2742,6 +2803,141 @@ mod tests {
             evaluate_structured_permission_rules(&[allow_one, allow_other, deny_one], &request),
             StructuredPermissionDecision::Deny
         );
+    }
+
+    const BROAD_ASK: &str = "git *";
+    const NARROW_ALLOW: &str = "git status *";
+    const WILDCARD_ONLY: &str = "*";
+    const SUBTREE_DIGEST: &str = "subtree";
+    const NARROW_COMMAND: &str = "git status --short";
+    const BROAD_COMMAND: &str = "git commit -m message";
+
+    fn pattern_constraint(pattern: &str) -> PermissionResourceConstraint {
+        PermissionResourceConstraint {
+            kind: PermissionResourceKind::Command,
+            selector: PermissionResourceSelector::CommandPattern {
+                pattern: pattern.into(),
+            },
+            access: None,
+            protected: None,
+            attributes: BTreeMap::new(),
+        }
+    }
+
+    fn any_command_constraint() -> PermissionResourceConstraint {
+        PermissionResourceConstraint {
+            selector: PermissionResourceSelector::Any,
+            ..pattern_constraint(BROAD_ASK)
+        }
+    }
+
+    /// Answers for one command, and proves the answer is the rule set's rather
+    /// than the emission order's by requiring the reversed set to agree.
+    fn order_independent_command_decision(
+        command: &str,
+        rules: impl Fn(&PermissionRequest) -> Vec<StructuredPermissionRule>,
+    ) -> StructuredPermissionDecision {
+        let resource = command_resource(command, "/project");
+        let request = request(vec![resource.clone()]);
+        let mut reversed = rules(&request);
+        reversed.reverse();
+
+        let decision = permission_rules_resource_decision(&rules(&request), &request, &resource);
+        assert_eq!(
+            permission_rules_resource_decision(&reversed, &request, &resource),
+            decision,
+            "reversing the rules changed the decision"
+        );
+        decision
+    }
+
+    /// A config that asks about a family and allows one member of it means the
+    /// allow to win, so the rules have to be ranked rather than folded on the
+    /// effect alone.
+    #[test_case(NARROW_COMMAND => StructuredPermissionDecision::Allow ; "the narrower allow wins where it applies")]
+    #[test_case(BROAD_COMMAND => StructuredPermissionDecision::Ask ; "the broader ask still covers everything else")]
+    fn a_narrower_command_pattern_outranks_a_broader_one(
+        command: &str,
+    ) -> StructuredPermissionDecision {
+        order_independent_command_decision(command, |request| {
+            vec![
+                rule(request, ASK, vec![pattern_constraint(BROAD_ASK)]),
+                rule(request, ALLOW, vec![pattern_constraint(NARROW_ALLOW)]),
+            ]
+        })
+    }
+
+    /// Equal width leaves nothing to rank on, so the safer effect decides.
+    #[test_case(pattern_constraint(NARROW_ALLOW), pattern_constraint(NARROW_ALLOW) ; "two rules naming the same pattern")]
+    #[test_case(pattern_constraint(WILDCARD_ONLY), any_command_constraint() ; "a bare wildcard names no more than a blanket selector")]
+    fn equally_wide_rules_break_the_tie_toward_asking(
+        allow: PermissionResourceConstraint,
+        ask: PermissionResourceConstraint,
+    ) {
+        assert_eq!(
+            order_independent_command_decision(NARROW_COMMAND, |request| vec![
+                rule(request, ALLOW, vec![allow.clone()]),
+                rule(request, ASK, vec![ask.clone()]),
+            ]),
+            StructuredPermissionDecision::Ask
+        );
+    }
+
+    /// Width ranks what a rule set permits, never what it refuses, so a denial
+    /// cannot be out-specified.
+    #[test]
+    fn a_broad_deny_outranks_an_exact_allow() {
+        assert_eq!(
+            order_independent_command_decision(NARROW_COMMAND, |request| vec![
+                rule(
+                    request,
+                    ALLOW,
+                    vec![exact_constraint(&command_resource(
+                        NARROW_COMMAND,
+                        "/project"
+                    ))]
+                ),
+                rule(request, DENY, vec![pattern_constraint(BROAD_ASK)]),
+            ]),
+            StructuredPermissionDecision::Deny
+        );
+    }
+
+    /// A grant naming one exact resource is the narrowest statement there is, so
+    /// saving "always allow this" has to survive a broad ask.
+    #[test_case(pattern_constraint(BROAD_ASK) => StructuredPermissionDecision::Allow ; "outranks a pattern")]
+    #[test_case(any_command_constraint() => StructuredPermissionDecision::Allow ; "outranks a blanket selector")]
+    #[test_case(exact_constraint(&command_resource(NARROW_COMMAND, "/project")) => StructuredPermissionDecision::Ask ; "ties with another exact and yields")]
+    fn an_exact_grant_outranks_a_wider_ask(
+        ask: PermissionResourceConstraint,
+    ) -> StructuredPermissionDecision {
+        order_independent_command_decision(NARROW_COMMAND, |request| {
+            vec![
+                rule(request, ASK, vec![ask.clone()]),
+                rule(
+                    request,
+                    ALLOW,
+                    vec![exact_constraint(&command_resource(
+                        NARROW_COMMAND,
+                        "/project",
+                    ))],
+                ),
+            ]
+        })
+    }
+
+    /// The ranking table. The variant order supplies the comparison; this pins
+    /// what each selector is worth, which is where a selector could silently
+    /// rank as wider or narrower than it reaches.
+    #[test_case(PermissionResourceSelector::Any => SelectorWidth::Blanket ; "a blanket selector names everything")]
+    #[test_case(PermissionResourceSelector::CommandPattern { pattern: WILDCARD_ONLY.into() } => SelectorWidth::Blanket ; "a pattern with no literal names everything too")]
+    #[test_case(PermissionResourceSelector::CommandPattern { pattern: BROAD_ASK.into() } => SelectorWidth::Region(1, 3) ; "a pattern names its literals")]
+    #[test_case(PermissionResourceSelector::FilesystemSubtreeDigest { digest: SUBTREE_DIGEST.into() } => SelectorWidth::Region(0, 0) ; "a subtree names a region")]
+    #[test_case(PermissionResourceSelector::Exact { value: NARROW_COMMAND.into() } => SelectorWidth::Exact ; "an exact selector names one resource")]
+    fn selector_width_reflects_how_much_a_selector_names(
+        selector: PermissionResourceSelector,
+    ) -> SelectorWidth {
+        selector_width(&selector)
     }
 
     const MCP_SERVER: &str = "deepwiki";
