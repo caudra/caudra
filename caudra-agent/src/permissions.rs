@@ -408,9 +408,26 @@ struct SharedPermissionState {
     broker: Arc<PermissionBroker>,
 }
 
+/// What the rule set says about one request's resources.
+///
+/// `prompt_required` and `rule_ask` differ in exactly one case: a command no
+/// authority covers yet that the builtin ask family names. That is not a rule
+/// demanding review, it is the absence of one, so a later grant settles it.
+struct RequestCoverage {
+    covered: Vec<bool>,
+    must_prompt: bool,
+    /// Per resource: an ask decision resolved it, covered or not.
+    prompt_required: Vec<bool>,
+    /// Per resource: a rule or a mode demands review whatever is granted later.
+    rule_ask: Vec<bool>,
+}
+
 struct PendingPermission {
     request: PermissionRequest,
-    prompt_required: Vec<bool>,
+    /// Why a grant cannot settle this request on its own. A request nothing
+    /// asked about is one a covering grant may sweep; `prompt_required` would
+    /// also carry "not covered yet", which is the very thing the grant fixes.
+    sticky_ask: Vec<bool>,
     project: Option<PathBuf>,
     event_tx: EventSender,
     sender: flume::Sender<PendingDecision>,
@@ -926,11 +943,8 @@ impl PermissionManager {
                         project.as_deref(),
                         manager_id,
                         candidate.project.as_deref(),
-                    ) && candidate.prompt_required.len() == candidate.request.resources.len()
-                        && candidate
-                            .prompt_required
-                            .iter()
-                            .all(|prompt_required| !prompt_required)
+                    ) && candidate.sticky_ask.len() == candidate.request.resources.len()
+                        && candidate.sticky_ask.iter().all(|sticky| !sticky)
                         && candidate.request.resources.iter().all(|resource| {
                             permission_rule_covers_resource(&rule, &candidate.request, resource)
                         })
@@ -948,12 +962,16 @@ impl PermissionManager {
         drop(pending);
 
         for candidate in covered {
-            candidate
+            if candidate
                 .event_tx
-                .try_send(AgentEvent::PermissionRequestResolved {
+                .send(AgentEvent::PermissionRequestResolved {
                     request_id: candidate.request.id.clone(),
                     source_request_id: request_id.to_owned(),
-                });
+                })
+                .is_err()
+            {
+                warn!(request_id = %candidate.request.id, "swept permission prompt was not dismissed");
+            }
             if candidate
                 .sender
                 .try_send(PendingDecision::MatchedRule)
@@ -1034,7 +1052,7 @@ impl PermissionManager {
         request: &PermissionRequest,
         structured_rules: &[StructuredPermissionRule],
         shell_policy_eligible: bool,
-    ) -> Result<(Vec<bool>, bool, Vec<bool>), CommandPolicyDecision> {
+    ) -> Result<RequestCoverage, CommandPolicyDecision> {
         let command_decisions = self.command_policy_decisions(request, shell_policy_eligible);
         if command_decisions
             .as_ref()
@@ -1060,6 +1078,7 @@ impl PermissionManager {
 
         let mut must_prompt = false;
         let mut prompt_required = vec![false; request.resources.len()];
+        let mut rule_ask = vec![false; request.resources.len()];
         let non_shell_config_ask = command_decisions.is_none()
             && self
                 .scope_rule_decisions(&request.tool, &request.scopes, true, true)
@@ -1077,6 +1096,7 @@ impl PermissionManager {
                 if legacy.must_prompt {
                     must_prompt = true;
                     prompt_required[index] = true;
+                    rule_ask[index] = true;
                 }
                 let mut covered = structured || legacy.allowed && !resource.requires_prompt;
                 match command_decisions
@@ -1092,6 +1112,7 @@ impl PermissionManager {
                     CommandPolicyDecision::Ask => {
                         must_prompt = true;
                         prompt_required[index] = true;
+                        rule_ask[index] = true;
                         covered
                     }
                     CommandPolicyDecision::Deny => false,
@@ -1108,8 +1129,14 @@ impl PermissionManager {
         if non_shell_config_ask {
             must_prompt = true;
             prompt_required.fill(true);
+            rule_ask.fill(true);
         }
-        Ok((covered, must_prompt, prompt_required))
+        Ok(RequestCoverage {
+            covered,
+            must_prompt,
+            prompt_required,
+            rule_ask,
+        })
     }
 
     fn scope_rule_decisions(
@@ -1925,7 +1952,7 @@ impl PermissionManager {
         {
             return Err(deny(DECISION_SOURCE_RULE, None));
         }
-        let (full_coverage, full_must_prompt, full_prompt_required) = self
+        let full = self
             .request_coverage(&full_request, &structured_rules, include_builtin_allows)
             .map_err(|_| deny(DECISION_SOURCE_RULE, None))?;
         let scope_decisions =
@@ -1936,23 +1963,24 @@ impl PermissionManager {
         if self.is_yolo() {
             return allowed(by_rule());
         }
-        let all_resources_resolved = full_coverage
+        let all_resources_resolved = full
+            .covered
             .iter()
-            .zip(&full_prompt_required)
+            .zip(&full.prompt_required)
             .all(|(covered, must_prompt)| *covered || *must_prompt);
         let legacy_must_prompt = scope_decisions.iter().any(|decision| decision.must_prompt);
         let (t2, s2, force_prompt) = if all_resources_resolved {
-            if !scopes.force_prompt && !full_must_prompt && !legacy_must_prompt {
+            if !scopes.force_prompt && !full.must_prompt && !legacy_must_prompt {
                 return allowed(DECISION_SOURCE_RULE);
             }
             (tool.clone(), scopes.scopes.clone(), force_prompt)
         } else if intent.is_some() {
-            if exact_plan_write && !force_prompt && !full_must_prompt && !legacy_must_prompt {
+            if exact_plan_write && !force_prompt && !full.must_prompt && !legacy_must_prompt {
                 return allowed(DECISION_SOURCE_RULE);
             }
             match self.default_effect(tool) {
                 DefaultEffect::Allow
-                    if !force_prompt && !full_must_prompt && !legacy_must_prompt =>
+                    if !force_prompt && !full.must_prompt && !legacy_must_prompt =>
                 {
                     return allowed(by_rule());
                 }
@@ -1972,7 +2000,7 @@ impl PermissionManager {
                 include_builtin_allows,
                 false,
             ) {
-                PermissionCheck::Allowed if full_must_prompt || legacy_must_prompt => {
+                PermissionCheck::Allowed if full.must_prompt || legacy_must_prompt => {
                     (tool.clone(), scopes.scopes.clone(), force_prompt)
                 }
                 PermissionCheck::Allowed => return allowed(by_rule()),
@@ -1981,7 +2009,7 @@ impl PermissionManager {
                     tool,
                     scopes: _,
                     force_prompt,
-                } if full_must_prompt => (tool, full_request.scopes.clone(), force_prompt),
+                } if full.must_prompt => (tool, full_request.scopes.clone(), force_prompt),
                 PermissionCheck::NeedsPrompt {
                     tool,
                     scopes,
@@ -2013,19 +2041,19 @@ impl PermissionManager {
         {
             return Err(deny(DECISION_SOURCE_RULE, None));
         }
-        let (coverage, must_prompt, _) = self
+        let coverage = self
             .request_coverage(&request, &structured_rules, include_builtin_allows)
             .map_err(|_| deny(DECISION_SOURCE_RULE, None))?;
         if !scopes.force_prompt
-            && coverage.iter().all(|covered| *covered)
-            && !must_prompt
+            && coverage.covered.iter().all(|covered| *covered)
+            && !coverage.must_prompt
             && !current_scope_decisions
                 .iter()
                 .any(|decision| decision.must_prompt)
         {
             return allowed(DECISION_SOURCE_RULE);
         }
-        update_presentation_coverage(&mut request.presentation, &coverage);
+        update_presentation_coverage(&mut request.presentation, &coverage.covered);
 
         let Some(_) = user_response_rx else {
             warn!(tool = %tool, scope = %scope_display(), "no permission response channel");
@@ -2057,12 +2085,12 @@ impl PermissionManager {
             {
                 return Err(deny(DECISION_SOURCE_RULE, None));
             }
-            let (coverage, must_prompt, mut prompt_required) = self
+            let mut coverage = self
                 .request_coverage(&request, &current_rules, include_builtin_allows)
                 .map_err(|_| deny(DECISION_SOURCE_RULE, None))?;
             if !scopes.force_prompt
-                && coverage.iter().all(|covered| *covered)
-                && !must_prompt
+                && coverage.covered.iter().all(|covered| *covered)
+                && !coverage.must_prompt
                 && !current_scope_decisions
                     .iter()
                     .any(|decision| decision.must_prompt)
@@ -2074,9 +2102,10 @@ impl PermissionManager {
                     .iter()
                     .any(|decision| decision.must_prompt)
             {
-                prompt_required.fill(true);
+                coverage.prompt_required.fill(true);
+                coverage.rule_ask.fill(true);
             }
-            update_presentation_coverage(&mut request.presentation, &coverage);
+            update_presentation_coverage(&mut request.presentation, &coverage.covered);
             let requests = pending.entry(self.id).or_default();
             if requests.contains_key(request_id) {
                 warn!(request_id, "duplicate permission request id");
@@ -2086,7 +2115,7 @@ impl PermissionManager {
                 request_id.to_owned(),
                 PendingPermission {
                     request: request.clone(),
-                    prompt_required,
+                    sticky_ask: coverage.rule_ask,
                     project: canonical_project,
                     event_tx: event_tx.clone(),
                     sender: answer_tx,
@@ -2102,15 +2131,15 @@ impl PermissionManager {
             (
                 prompt_forcing_reason(
                     &request,
-                    &coverage,
+                    &coverage.covered,
                     scopes.force_prompt,
-                    must_prompt
+                    coverage.must_prompt
                         || current_scope_decisions
                             .iter()
                             .any(|decision| decision.must_prompt),
                 ),
-                uncovered_resource_summary(&request, &coverage),
-                coverage.iter().filter(|covered| !**covered).count(),
+                uncovered_resource_summary(&request, &coverage.covered),
+                coverage.covered.iter().filter(|covered| !**covered).count(),
             )
         };
         // Emitted outside the pending lock: a log write must never serialize
@@ -2200,15 +2229,15 @@ impl PermissionManager {
                 return Err(deny(DECISION_SOURCE_RULE, None));
             }
             if matches!(decision, PendingDecision::MatchedRule) {
-                let (coverage, must_prompt, _) = self
+                let coverage = self
                     .request_coverage(&request, &current_rules, include_builtin_allows)
                     .map_err(|_| deny(DECISION_SOURCE_RULE, None))?;
                 if scopes.force_prompt
-                    || must_prompt
+                    || coverage.must_prompt
                     || current_scope_decisions
                         .iter()
                         .any(|scope| scope.must_prompt)
-                    || !coverage.iter().all(|covered| *covered)
+                    || !coverage.covered.iter().all(|covered| *covered)
                 {
                     return Err(deny(DECISION_SOURCE_RULE, None));
                 }
@@ -2652,10 +2681,10 @@ mod tests {
             mark_confined(&mut request);
         }
 
-        let (covered, _, _) = manager
+        manager
             .request_coverage(&request, &builtin_structured_rules(), false)
-            .expect("nothing denies the command");
-        covered
+            .expect("nothing denies the command")
+            .covered
     }
 
     /// Coverage is only worth anything if the manager actually consults the
@@ -2713,10 +2742,10 @@ mod tests {
         );
         mark_confined(&mut request);
 
-        let (covered, _, _) = manager
+        let coverage = manager
             .request_coverage(&request, &builtin_structured_rules(), false)
             .expect("nothing denies the command");
-        assert_eq!(covered, vec![false]);
+        assert_eq!(coverage.covered, vec![false]);
     }
 
     /// Belt and braces. The shell tool never marks an opaque line, and an opaque
@@ -2730,10 +2759,10 @@ mod tests {
             resource.protected = true;
         }
 
-        let (covered, _, _) = manager
+        let coverage = manager
             .request_coverage(&request, &builtin_structured_rules(), false)
             .expect("nothing denies the command");
-        assert_eq!(covered, vec![false]);
+        assert_eq!(coverage.covered, vec![false]);
     }
 
     #[test]
@@ -2819,11 +2848,11 @@ mod tests {
 
         let builtin_manager = mgr_with(PermissionsConfig::default(), PathBuf::from("/tmp"));
         let request = request("/bin/rm -rf build", "rm -rf build");
-        let (_, must_prompt, prompt_required) = builtin_manager
+        let coverage = builtin_manager
             .request_coverage(&request, &[], true)
             .unwrap();
-        assert!(must_prompt);
-        assert_eq!(prompt_required, vec![true]);
+        assert!(coverage.must_prompt);
+        assert_eq!(coverage.prompt_required, vec![true]);
     }
 
     const GIT_HEAD: &str = ".git/HEAD";
@@ -2861,8 +2890,8 @@ mod tests {
         let manager = mgr_with(PermissionsConfig::default(), cwd.clone());
         let request = project_read_request(&cwd, relative);
 
-        let (covered, must_prompt, _) = manager.request_coverage(&request, &[], true).unwrap();
-        covered.iter().all(|covered| *covered) && !must_prompt
+        let coverage = manager.request_coverage(&request, &[], true).unwrap();
+        coverage.covered.iter().all(|covered| *covered) && !coverage.must_prompt
     }
 
     #[test]
@@ -2872,10 +2901,10 @@ mod tests {
             PathBuf::from("/tmp"),
         );
         let request = shell_request(&["rm build.log"], workcell_shell_subject());
-        let (covered, must_prompt, _) = manager.request_coverage(&request, &[], true).unwrap();
+        let coverage = manager.request_coverage(&request, &[], true).unwrap();
 
-        assert_eq!(covered, vec![true]);
-        assert!(!must_prompt);
+        assert_eq!(coverage.covered, vec![true]);
+        assert!(!coverage.must_prompt);
     }
 
     #[test]
@@ -2905,9 +2934,9 @@ mod tests {
             ],
         ] {
             let request = shell_request(&commands, workcell_shell_subject());
-            let (covered, must_prompt, _) = manager.request_coverage(&request, &[], true).unwrap();
-            assert!(covered.iter().all(|covered| *covered));
-            assert!(!must_prompt);
+            let coverage = manager.request_coverage(&request, &[], true).unwrap();
+            assert!(coverage.covered.iter().all(|covered| *covered));
+            assert!(!coverage.must_prompt);
         }
     }
 
@@ -3074,11 +3103,10 @@ mod tests {
         let allow = request
             .option_rule("allow_exact", PermissionLifetime::Conversation)
             .unwrap();
-        let (coverage, must_prompt, prompt_required) =
-            manager.request_coverage(&request, &[allow], false).unwrap();
-        assert_eq!(coverage, [true]);
-        assert!(must_prompt);
-        assert_eq!(prompt_required, [true]);
+        let coverage = manager.request_coverage(&request, &[allow], false).unwrap();
+        assert_eq!(coverage.covered, [true]);
+        assert!(coverage.must_prompt);
+        assert_eq!(coverage.prompt_required, [true]);
     }
 
     #[test]
@@ -3558,9 +3586,9 @@ mod tests {
         match effect {
             Effect::Deny => assert!(coverage.is_err()),
             Effect::Ask => {
-                let (_, must_prompt, prompt_required) = coverage.unwrap();
-                assert!(must_prompt);
-                assert_eq!(prompt_required, vec![true]);
+                let coverage = coverage.unwrap();
+                assert!(coverage.must_prompt);
+                assert_eq!(coverage.prompt_required, vec![true]);
             }
             Effect::Allow => unreachable!(),
         }
@@ -3570,12 +3598,12 @@ mod tests {
     fn builtin_echo_allow_covers_only_the_literal_command_in_a_chain() {
         let manager = default_mgr();
         let request = shell_request(&["echo hi", "rm -rf build"], workcell_shell_subject());
-        let (covered, must_prompt, prompt_required) =
-            manager.request_coverage(&request, &[], true).unwrap();
+        let coverage = manager.request_coverage(&request, &[], true).unwrap();
 
-        assert_eq!(covered, vec![true, false]);
-        assert!(must_prompt);
-        assert_eq!(prompt_required, vec![false, true]);
+        assert_eq!(coverage.covered, vec![true, false]);
+        assert!(coverage.must_prompt);
+        assert_eq!(coverage.prompt_required, vec![false, true]);
+        assert_eq!(coverage.rule_ask, vec![false, false]);
     }
 
     #[test]
@@ -3952,6 +3980,25 @@ mod tests {
         smol::Task<Result<(), PermissionError>>,
         flume::Receiver<crate::Envelope>,
     ) {
+        pending_scope_enforcement(
+            manager,
+            request_id,
+            tool,
+            crate::tools::PermissionScopes::single(scope),
+            input,
+        )
+    }
+
+    fn pending_scope_enforcement(
+        manager: Arc<PermissionManager>,
+        request_id: &str,
+        tool: &str,
+        scopes: crate::tools::PermissionScopes,
+        input: serde_json::Value,
+    ) -> (
+        smol::Task<Result<(), PermissionError>>,
+        flume::Receiver<crate::Envelope>,
+    ) {
         let (event_tx, event_rx) = flume::unbounded();
         let event_tx = crate::EventSender::new(event_tx, 0);
         let request_id = request_id.to_owned();
@@ -3962,7 +4009,7 @@ mod tests {
             manager
                 .enforce(
                     &tool,
-                    &crate::tools::PermissionScopes::single(scope),
+                    &scopes,
                     &input,
                     &event_tx,
                     Some(&legacy_rx),
@@ -4056,6 +4103,88 @@ mod tests {
             second_events.recv_async().await.unwrap();
 
             assert!(manager.answer("first", PermissionAnswer::AllowSession));
+            assert!(first.await.is_ok());
+            assert_eq!(manager.pending_count(), 1);
+            assert!(second_events.is_empty());
+            assert!(manager.answer("second", PermissionAnswer::AllowOnce));
+            assert!(second.await.is_ok());
+        });
+    }
+
+    const BROAD_SHELL_OPTION: &str = "allow_any_command";
+
+    fn broad_shell_grant() -> PermissionAnswer {
+        PermissionAnswer::AllowOption {
+            option_id: BROAD_SHELL_OPTION.into(),
+            lifetime: PermissionLifetime::Conversation,
+        }
+    }
+
+    /// The batch case: several commands ask at once and one broad grant answers
+    /// them all. Every other sweep test uses the same command twice, so nothing
+    /// caught that an uncovered command was marked un-sweepable for good.
+    #[test]
+    fn a_broad_authority_sweeps_a_pending_sibling_with_a_different_command() {
+        smol::block_on(async {
+            let manager = Arc::new(default_mgr());
+            let (first, first_events) = pending_tool_enforcement(
+                Arc::clone(&manager),
+                "first",
+                "bash",
+                "cargo test".into(),
+                serde_json::json!({"command": "cargo test"}),
+            );
+            let (second, second_events) = pending_tool_enforcement(
+                Arc::clone(&manager),
+                "second",
+                "bash",
+                "rm -rf build".into(),
+                serde_json::json!({"command": "rm -rf build"}),
+            );
+            first_events.recv_async().await.unwrap();
+            second_events.recv_async().await.unwrap();
+            assert_eq!(manager.pending_count(), 2);
+
+            // `answer` sweeps and notifies under its own lock, so both are
+            // observable the moment it returns. Asserting before awaiting keeps
+            // a regression a failure rather than a hang on a task nobody freed.
+            assert!(manager.answer("first", broad_shell_grant()));
+            assert_eq!(manager.pending_count(), 0);
+            assert!(matches!(
+                second_events.try_recv().unwrap().event,
+                AgentEvent::PermissionRequestResolved {
+                    request_id,
+                    source_request_id
+                } if request_id == "second" && source_request_id == "first"
+            ));
+            assert!(first.await.is_ok());
+            assert!(second.await.is_ok());
+        });
+    }
+
+    /// A forced prompt is the mode asking, not the rules, so no grant answers it.
+    #[test]
+    fn a_broad_authority_leaves_a_forced_prompt_pending() {
+        smol::block_on(async {
+            let manager = Arc::new(default_mgr());
+            let (first, first_events) = pending_tool_enforcement(
+                Arc::clone(&manager),
+                "first",
+                "bash",
+                "cargo test".into(),
+                serde_json::json!({"command": "cargo test"}),
+            );
+            let (second, second_events) = pending_scope_enforcement(
+                Arc::clone(&manager),
+                "second",
+                "bash",
+                crate::tools::PermissionScopes::force_prompt("rm -rf build".into()),
+                serde_json::json!({"command": "rm -rf build"}),
+            );
+            first_events.recv_async().await.unwrap();
+            second_events.recv_async().await.unwrap();
+
+            assert!(manager.answer("first", broad_shell_grant()));
             assert!(first.await.is_ok());
             assert_eq!(manager.pending_count(), 1);
             assert!(second_events.is_empty());
