@@ -54,8 +54,10 @@ The action line carries the arguments its own summary does not already name, in 
 | Key | Action |
 |---|---|
 | `y` | Allow this exact call once |
-| `Up` / `Down` | Select a host-generated reusable authority |
-| `Left` / `Right` | Walk the selected authority along its range, where it has one |
+| `Up` / `Down` | Select a host-generated reusable authority or a reviewed command |
+| `Left` / `Right` | Walk the selected row along its range, where it has one |
+| `<` / `>` | Narrow or widen every command row at once |
+| `Enter` | Write your own command pattern for the selected command |
 | `s` | Allow the selected authority for the conversation, after confirmation |
 | `a` | Allow the selected authority for the project, after confirmation |
 | `A` | Allow the selected authority globally, after confirmation |
@@ -65,13 +67,34 @@ The action line carries the arguments its own summary does not already name, in 
 | `PageUp` / `PageDown` | Scroll the body when it does not fit |
 | `Esc` or `Ctrl-C` | Deny once |
 
-The footer names widening only when the selected authority has somewhere to go, and the page keys only when the body is taller than the space it has.
+The footer names widening only when the selected authority has somewhere to go, and the page keys only when the body is taller than the space it has. It names the command-row keys only on a wide terminal, because a narrow footer gives its rows to the decision keys.
 
-Reusable approvals are exact by default. A parsed shell command can offer a token-bound command pattern such as `git diff *` before the unrestricted workdir and global shell choices. Broad authorities require explicit selection. Unrestricted URL, search, shell, and MCP authorities also require a typed phrase. Each authority advertises its valid lifetimes. Whole-tool MCP authority is conversation-only.
+Reusable approvals are exact by default. A parsed shell command is scoped one command at a time, described below, ahead of the unrestricted workdir and global shell choices. Broad authorities require explicit selection. Unrestricted URL, search, shell, and MCP authorities also require a typed phrase. Each authority advertises its valid lifetimes. Whole-tool MCP authority is conversation-only.
 
 A filesystem authority arrives as a ladder. Its narrowest rung covers the directories the request touched, and each step up covers the directory above, as far as the filesystem root. The rungs share one row, and `Left` and `Right` walk it, so widening changes the reach the row names rather than adding choices to scroll through. A rung reaching outside the repository is marked `outside repo`. A rung that takes in your home directory is marked `outside home` and needs the `ALLOW OUTSIDE HOME` phrase. Moving to another authority and back returns the ladder to its narrowest rung.
 
 Multiple requests are queued by request ID. The prompt identifies the requesting subtask. A subtask request cannot replace a prompt from the main agent or another subtask. Confirming a reusable authority also approves every pending request it already covers. Conversation, project, and global lifetimes limit which pending conversations or projects can share that approval. Allow once and deny decisions resolve only the selected request.
+
+## Per-command scopes
+
+A shell call often runs several commands at once. Each reviewed command gets its own row in the prompt, above a separate `Or grant broadly instead` section holding the blanket authorities. A row starts on `this command`, which remembers that exact command in that workdir, and widens to a token-bound pattern such as `git status *`. Narrowing past the start reaches `this call only`, which remembers nothing for that command.
+
+`Left` and `Right` walk the selected row. `<` and `>` walk every row one step at a time, so the usual answer stays two keystrokes however many commands were batched. Both ends of a row clamp rather than wrap.
+
+The scope you pick controls what Caudra remembers, never what runs. A shell call is atomic, so answering the prompt runs every command in it. Rows left on `this call only` are simply kept out of the stored rule. Confirming with `s`, `a`, or `A` writes one rule covering every row that chose a reusable scope, and the lifetimes offered are the ones every one of those rows allows.
+
+Rows replace the whole-request `This command in this workdir` and command-pattern choices, because a row on its narrowest reusable rung reproduces the first and a row at its widest reproduces the second.
+
+### Writing your own pattern
+
+`Enter` opens an editor on the selected command row. A pattern must end in `*`, hold at least one literal token before it, use at most eight tokens, and match the command on that row. Caudra refuses anything else and names the reason.
+
+Two patterns are accepted with a caution:
+
+- A pattern with one literal covers a whole program, such as `python *`. It is marked `[any invocation]` and needs the `ALLOW BROAD SHELL ACCESS` phrase.
+- A pattern overlapping a builtin always-ask family, such as `git push *`, is marked `[always-ask family]`. It is allowed because those are often the commands worth shortcutting, but read it before confirming.
+
+Grading is structural. It checks the shape of the pattern and that it matches the command, and it cannot know what a program does with its arguments. `sed -n *` grades clean, yet GNU `sed` can run shell commands through the `e` escape. Write patterns for programs whose arguments you understand.
 
 ## Plan mode
 
