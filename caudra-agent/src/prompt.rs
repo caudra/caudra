@@ -27,6 +27,7 @@ pub const RESEARCH_PROMPT: &str = include_str!("prompts/research.md");
 pub const GENERAL_PROMPT: &str = include_str!("prompts/general.md");
 pub const COMPACTION_SYSTEM: &str = include_str!("prompts/compaction.md");
 pub const COMPACTION_USER: &str = include_str!("prompts/compaction_user.md");
+pub const COMPACTION_MERGE: &str = include_str!("prompts/compaction_merge.md");
 pub const GOAL_EVALUATOR: &str = include_str!("prompts/goal_evaluator.md");
 pub const TITLE_SYSTEM: &str = include_str!("prompts/title.md");
 pub const TASK_PLAN_CONTRACT: &str = "\n\n# Host mode contract\nYou are in plan mode. Inspect, reason, and report, but do not modify files, persistent state, or external systems. If implementation is needed, describe the exact changes without applying them.";

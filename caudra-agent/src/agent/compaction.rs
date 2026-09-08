@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::env;
 
 use caudra_config::{
@@ -10,17 +11,23 @@ use caudra_providers::{
 use caudra_storage::usage_ledger::LedgerPurpose;
 use tracing::info;
 
-use super::history::{History, remove_orphaned_tool_results};
+use super::history::{History, remove_orphaned_tool_results, repair_tool_pairs};
+use super::run::estimate_message_tokens;
 use super::streaming::{StreamError, stream_with_retry};
 use crate::cancel::CancelToken;
 use crate::{AgentError, AgentEvent, DoneReason, EventSender, TurnCompleteEvent};
 
 const CONTINUE_AFTER_COMPACT: &str = "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed. If the summary contains a todo list, restore it with todo_write and keep it updated. If you learned important project context during this session, consider saving it to memory before it's lost.";
+const COMPACTION_ANCHOR: &str = "What did we do so far?";
 const IMAGE_PLACEHOLDER: &str = "[image]";
 const TOOL_RESULT_PLACEHOLDER: &str = "[tool result]";
 const KEEP_LAST_TOOL_RESULTS: usize = 3;
 /// Byte cap for each retained compaction tool result; truncation stays on UTF-8 boundaries.
 const RETAINED_TOOL_RESULT_MAX_BYTES: usize = 2_000;
+const PRESERVE_RECENT_MIN_TOKENS: u32 = 2_000;
+const PRESERVE_RECENT_MAX_TOKENS: u32 = 15_000;
+/// The share of the usable window the preserved tail may claim.
+const PRESERVE_RECENT_FRACTION: u32 = 4;
 
 fn normalize(text: &Option<String>) -> Option<&str> {
     text.as_deref().map(str::trim).filter(|t| !t.is_empty())
@@ -42,19 +49,16 @@ pub(super) async fn compact_history(
     config: &AgentConfig,
 ) -> Result<TokenUsage, AgentError> {
     let compact_start = std::time::Instant::now();
-    let mut compaction_history: Vec<Message> = history.as_slice().to_vec();
-    remove_orphaned_tool_results(&mut compaction_history);
+    let head_end = head_end(
+        history.as_slice(),
+        preserve_recent_budget(model, config.compaction_buffer),
+    );
+    let mut compaction_history =
+        repair_tool_pairs(Cow::Borrowed(&history.as_slice()[..head_end])).into_owned();
     strip_images(&mut compaction_history);
     strip_thinking(&mut compaction_history);
     strip_old_tool_results(&mut compaction_history);
-    let summary_prompt = match normalize(&config.compaction_instructions) {
-        Some(extra) => format!(
-            "{}\n\nAdditional instructions:\n{extra}",
-            crate::prompt::COMPACTION_USER
-        ),
-        None => crate::prompt::COMPACTION_USER.to_string(),
-    };
-    compaction_history.push(Message::user(summary_prompt));
+    compaction_history.push(Message::user(summary_prompt(&compaction_history, config)));
 
     let empty_tools = serde_json::json!([]);
     let max_attempts = 3;
@@ -81,7 +85,7 @@ pub(super) async fn compact_history(
                         "compaction succeeded after truncating oldest rounds"
                     );
                 }
-                return finish_compact(response, history, event_tx, compact_start, model);
+                return finish_compact(response, history, head_end, event_tx, compact_start, model);
             }
             Err(StreamError::Other(e)) if e.is_context_overflow() && attempt < max_attempts - 1 => {
                 last_error = Some(e);
@@ -94,9 +98,63 @@ pub(super) async fn compact_history(
     Err(last_error.unwrap())
 }
 
+fn summary_prompt(head: &[Message], config: &AgentConfig) -> String {
+    let mut prompt = String::from(crate::prompt::COMPACTION_USER);
+    if head.iter().any(|message| message.is_compaction_summary) {
+        prompt.push_str("\n\n");
+        prompt.push_str(crate::prompt::COMPACTION_MERGE);
+    }
+    if let Some(extra) = normalize(&config.compaction_instructions) {
+        prompt.push_str("\n\nAdditional instructions:\n");
+        prompt.push_str(extra);
+    }
+    prompt
+}
+
+/// How many trailing tokens survive compaction verbatim. Summarizing the whole
+/// session throws away the turns most likely to matter next, so the newest ones
+/// are kept as they are and only what precedes them is summarized.
+fn preserve_recent_budget(model: &Model, buffer: Option<CompactionBuffer>) -> u32 {
+    let usable = model
+        .context_window
+        .saturating_sub(compaction_reserve(model, buffer));
+    (usable / PRESERVE_RECENT_FRACTION).clamp(PRESERVE_RECENT_MIN_TOKENS, PRESERVE_RECENT_MAX_TOKENS)
+}
+
+/// Index where the preserved tail begins. A cut is only legal at a genuine user
+/// turn: anywhere else severs a tool result from its call and leaves a history
+/// the provider rejects and the session refuses to checkpoint. Returns
+/// `messages.len()` when no legal cut fits the budget, which summarizes
+/// everything rather than handing the summarizer an empty head.
+fn head_end(messages: &[Message], budget: u32) -> usize {
+    let mut tokens = 0;
+    let mut split = messages.len();
+    for (index, message) in messages.iter().enumerate().rev() {
+        tokens += estimate_message_tokens(std::slice::from_ref(message));
+        if tokens > budget {
+            break;
+        }
+        if index > 0 && is_user_turn(message) {
+            split = index;
+        }
+    }
+    split
+}
+
+fn is_user_turn(message: &Message) -> bool {
+    matches!(message.role, Role::User)
+        && !message.is_observation()
+        && message.display_text.as_deref() != Some("")
+        && !message
+            .content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
+}
+
 fn finish_compact(
     mut response: StreamResponse,
     history: &mut History,
+    head_end: usize,
     event_tx: &EventSender,
     compact_start: std::time::Instant,
     model: &Model,
@@ -119,18 +177,23 @@ fn finish_compact(
         return Err(AgentError::EmptySummary);
     }
 
-    response.message.retained_output_refs = retained_output_refs(history.as_slice());
-    response.message.retained_subagent_ids = retained_subagent_ids(history.as_slice());
+    let summarized = &history.as_slice()[..head_end];
+    response.message.retained_output_refs = retained_output_refs(summarized);
+    response.message.retained_subagent_ids = retained_subagent_ids(summarized);
     response.message.is_compaction_summary = true;
 
-    let new_history = vec![
-        Message::user("What did we do so far?".into()),
-        response.message,
-    ];
-    history.replace(new_history);
+    let tail = history.as_slice()[head_end..].to_vec();
+    let preserved = tail.len();
+    let mut new_history = Vec::with_capacity(preserved + 2);
+    new_history.push(Message::synthetic(COMPACTION_ANCHOR.into()));
+    new_history.push(response.message);
+    new_history.extend(tail);
+    history.replace(repair_tool_pairs(Cow::Owned(new_history)).into_owned());
     info!(
         model = %model.id,
         duration_ms = compact_start.elapsed().as_millis() as u64,
+        summarized = head_end,
+        preserved,
         "compaction completed"
     );
 
@@ -417,15 +480,25 @@ mod tests {
         model
     }
 
+    fn assistant_text(text: &str) -> Message {
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Text { text: text.into() }],
+            ..Default::default()
+        }
+    }
+
+    fn tool_result_carrier(id: &str) -> Message {
+        Message {
+            role: Role::User,
+            content: vec![tool_result(id)],
+            ..Default::default()
+        }
+    }
+
     fn text_response(stop_reason: StopReason) -> StreamResponse {
         StreamResponse {
-            message: Message {
-                role: Role::Assistant,
-                content: vec![ContentBlock::Text {
-                    text: "response".into(),
-                }],
-                ..Default::default()
-            },
+            message: assistant_text("response"),
             usage: TokenUsage::default(),
             stop_reason: Some(stop_reason),
             ..Default::default()
@@ -466,6 +539,120 @@ mod tests {
             assert!(matches!(msgs[0].role, Role::User));
             assert!(matches!(msgs[1].role, Role::Assistant));
         });
+    }
+
+    #[test]
+    fn compact_preserves_recent_turns_verbatim() {
+        smol::block_on(async {
+            const OLD: &str = "first";
+            const RECENT: &str = "second";
+            const RECENT_REPLY: &str = "reply two";
+
+            let provider = MockProvider::new(vec![Ok(text_response(StopReason::EndTurn))]);
+            let (raw_tx, _rx) = flume::unbounded();
+            let mut history = History::new(vec![
+                Message::user(OLD.into()),
+                assistant_text("reply one"),
+                Message::user(RECENT.into()),
+                assistant_text(RECENT_REPLY),
+            ]);
+
+            compact(
+                &provider,
+                &default_model(),
+                &mut history,
+                &EventSender::new(raw_tx, 0),
+                &AgentConfig::default(),
+            )
+            .await
+            .unwrap();
+
+            let msgs = history.as_slice();
+            assert_eq!(msgs.len(), 4);
+            assert!(msgs[1].is_compaction_summary);
+            assert_eq!(msgs[2].user_text(), Some(RECENT));
+            assert_eq!(msgs[3].first_text_content(), Some(RECENT_REPLY));
+
+            let summarized = provider.requests.lock().unwrap()[0].clone();
+            let reached_summarizer =
+                |text| summarized.iter().any(|m| m.user_text() == Some(text));
+            assert!(reached_summarizer(OLD), "the head must be summarized");
+            assert!(
+                !reached_summarizer(RECENT),
+                "the preserved tail must not be summarized as well"
+            );
+        });
+    }
+
+    #[test]
+    fn compact_keeps_the_preserved_tail_tool_pair_valid() {
+        smol::block_on(async {
+            const RECENT: &str = "second";
+
+            let provider = MockProvider::new(vec![Ok(text_response(StopReason::EndTurn))]);
+            let (raw_tx, _rx) = flume::unbounded();
+            let mut history = History::new(vec![
+                Message::user("first".into()),
+                tool_use("call-1"),
+                tool_result_carrier("call-1"),
+                Message::user(RECENT.into()),
+                tool_use("call-2"),
+                tool_result_carrier("call-2"),
+            ]);
+
+            compact(
+                &provider,
+                &default_model(),
+                &mut history,
+                &EventSender::new(raw_tx, 0),
+                &AgentConfig::default(),
+            )
+            .await
+            .unwrap();
+
+            let mut compacted = history.as_slice().to_vec();
+            assert!(
+                compacted.iter().any(|m| m.user_text() == Some(RECENT)),
+                "the recent turn must survive"
+            );
+            assert!(
+                !remove_orphaned_tool_results(&mut compacted),
+                "the tail must not be cut mid tool round"
+            );
+        });
+    }
+
+    #[test_case(vec![Message::user("a".into()), assistant_text("b"), Message::user("c".into())], 2 ; "cuts_at_a_user_turn")]
+    #[test_case(vec![Message::user("a".into()), assistant_text("b")], 2 ; "no_boundary_summarizes_everything")]
+    #[test_case(vec![Message::user("a".into()), tool_use("t"), tool_result_carrier("t")], 3 ; "tool_result_carrier_is_not_a_boundary")]
+    #[test_case(vec![Message::user("a".into()), assistant_text("b"), Message::synthetic("c".into())], 3 ; "synthetic_is_not_a_boundary")]
+    #[test_case(vec![Message::user("a".into()), assistant_text("b"), Message::observation("c".into())], 3 ; "observation_is_not_a_boundary")]
+    fn head_end_cuts_only_at_user_turns(messages: Vec<Message>, expected: usize) {
+        assert_eq!(head_end(&messages, PRESERVE_RECENT_MIN_TOKENS), expected);
+    }
+
+    #[test]
+    fn head_end_stops_at_the_budget() {
+        let messages = vec![
+            Message::user("oldest".into()),
+            Message::user("filler ".repeat(4_000)),
+            Message::user("newest".into()),
+        ];
+        assert_eq!(head_end(&messages, 20), 2);
+    }
+
+    #[test_case(false, false ; "fresh_history_gets_no_merge_rules")]
+    #[test_case(true, true ; "prior_summary_gets_merge_rules")]
+    fn summary_prompt_merges_a_prior_summary(prior: bool, expected: bool) {
+        let mut summary = assistant_text("earlier summary");
+        summary.is_compaction_summary = prior;
+        let prompt = summary_prompt(
+            &[Message::user("work".into()), summary],
+            &AgentConfig::default(),
+        );
+
+        assert!(prompt.starts_with(crate::prompt::COMPACTION_USER));
+        assert_eq!(prompt.contains(crate::prompt::COMPACTION_MERGE), expected);
     }
 
     #[test_case(vec![] ; "no_content")]
@@ -571,7 +758,9 @@ mod tests {
                 content: vec![image],
                 ..Default::default()
             };
-            let mut history = History::new(vec![orphan, chat_image]);
+            // The orphan carries a tool result, so no legal tail boundary exists
+            // and the whole history is summarized.
+            let mut history = History::new(vec![chat_image, orphan]);
             let (raw_tx, _rx) = flume::unbounded();
 
             compact_history(

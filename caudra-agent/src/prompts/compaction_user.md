@@ -1,24 +1,42 @@
-Provide a detailed summary for continuing our conversation above.
-Focus on information that would be helpful for continuing the conversation, including what we did, what we're doing, which files we're working on, and what we're going to do next.
+Summarize the conversation above so another coding agent can resume the work with no other context.
 
-Stick to this template:
----
-## Goal
-[What goal(s) is the user trying to accomplish?]
+Output exactly the Markdown structure inside <template>, with the section order unchanged. Do not include the <template> tags in your response.
 
-## Instructions
-- [Important instructions the user gave that are relevant]
-- [If there is a plan or spec, include information about it]
+<template>
+## Objective
+- [one or two sentences: what the user is trying to accomplish]
+
+## Constraints and Decisions
+- [user directives, stated preferences, approaches ruled out, technical decisions and why, or "(none)"]
 
 ## Discoveries
-[Notable things learned during this conversation]
+- [non-obvious facts learned about the codebase: architecture, conventions, gotchas, or "(none)"]
 
-## Accomplished
-[What work has been completed, what is still in progress, what is left?]
+## Work State
+### Completed
+- [finished work and verified facts, or "(none)"]
 
-## Relevant files / directories
-[Structured list of relevant files that have been read, edited, or created]
+### Active
+- [work in progress, partial edits, current investigation, or "(none)"]
 
-## Todo list
-[If a todo list was in use, repeat it here verbatim with each item's current status; it must be kept up to date with todo_write after continuing. Otherwise omit this section]
----
+### Blocked
+- [blockers, failing commands with their exact error, unresolved questions, or "(none)"]
+
+## Next Move
+1. [immediate concrete action, or "(none)"]
+2. [action after that, if known]
+
+## Relevant Files
+- `path`: [why it matters; what changed or still needs to change]
+
+## Todo List
+- [if a todo list was in use, repeat every item verbatim with its current status, otherwise "(none)"]
+</template>
+
+Rules:
+- Keep every heading even when the section is empty; write "(none)" rather than dropping it.
+- Terse bullets, never prose paragraphs.
+- Reproduce file paths, symbols, commands, error strings, URLs, and identifiers exactly. Never paraphrase an identifier.
+- If a tool result was truncated and its output ID was given, carry that ID into the summary so the full output can be re-read.
+- Record what was tried and failed, and why, so it is not retried.
+- Do not mention this summary or that context was dropped.
