@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -32,6 +32,13 @@ pub use structured::*;
 pub const DEFAULT_DENY_GUIDANCE: &str =
     "Do not retry. Try a different approach or ask the user for guidance.";
 const NORMALIZED_COMMAND_ATTRIBUTE: &str = "normalized_command";
+/// Set by the shell tool on a command that only observes and can only reach
+/// inside the project. Nothing else may set it: the builtin rule below reads it
+/// as the whole justification for running without asking.
+pub const CONFINED_READ_ATTRIBUTE: &str = "confined_read";
+pub const CONFINED_READ_VALUE: &str = "true";
+const SHELL_EXECUTION_CONTRACT: &str = "shell.execution.v1";
+const WORKCELL_TOOL_OWNER: &str = "workcell";
 
 /// Tests assert on this exact prefix; a wording tweak here updates them in one place.
 pub const PERMISSION_DENIED_PREFIX: &str = "Permission denied for";
@@ -104,6 +111,40 @@ fn builtin_rules(cwd: &Path) -> Vec<PermissionRule> {
     rules.extend(PROJECT_READ_TOOLS.iter().map(|tool| allow(tool, &cwd_glob)));
     rules.extend(TRUSTED_UNSCOPED_TOOLS.iter().map(|tool| allow(tool, "*")));
     rules
+}
+
+/// Reading the project is what the read tools are already allowed to do without
+/// asking, so a shell line that only observes and can only reach inside the
+/// project earns the same treatment. Without this the classifier only kept plan
+/// mode from refusing such a line; it still cost a prompt in either mode.
+///
+/// The rule turns entirely on `CONFINED_READ_ATTRIBUTE`, which the shell tool
+/// sets only after judging both halves. An opaque line never carries it, and
+/// `protected: Some(false)` refuses to cover one regardless.
+fn builtin_structured_rules() -> Vec<StructuredPermissionRule> {
+    vec![StructuredPermissionRule {
+        subject: PermissionSubject::Native {
+            owner: WORKCELL_TOOL_OWNER.into(),
+            contract: SHELL_EXECUTION_CONTRACT.into(),
+        },
+        executor: PermissionExecutorKind::Native,
+        resources: vec![PermissionResourceConstraint {
+            kind: PermissionResourceKind::Command,
+            selector: PermissionResourceSelector::Any,
+            access: Some(PermissionResourceAccess::Execute),
+            protected: Some(false),
+            attributes: BTreeMap::from([(
+                CONFINED_READ_ATTRIBUTE.into(),
+                PermissionResourceSelector::Exact {
+                    value: CONFINED_READ_VALUE.into(),
+                },
+            )]),
+        }],
+        arguments: PermissionArgumentConstraint::Unconstrained,
+        lifetime: PermissionLifetime::Conversation,
+        effect: StructuredPermissionEffect::Allow,
+        family: None,
+    }]
 }
 
 pub const BOUNDARY_UNVERIFIABLE_PREFIX: &str = "Cannot verify project boundary for";
@@ -1530,12 +1571,13 @@ impl PermissionManager {
         &self,
     ) -> Result<Vec<StructuredPermissionRule>, PermissionPolicyError> {
         self.ensure_conversation_policy_valid()?;
-        let mut rules: Vec<_> = self
-            .structured_conversation_rules()
-            .iter()
-            .filter(|record| record.is_active())
-            .map(|record| record.rule.clone())
-            .collect();
+        let mut rules = builtin_structured_rules();
+        rules.extend(
+            self.structured_conversation_rules()
+                .iter()
+                .filter(|record| record.is_active())
+                .map(|record| record.rule.clone()),
+        );
         rules.extend(
             self.persistent_records()?
                 .into_iter()
@@ -2589,6 +2631,113 @@ mod tests {
             tied.command_policy_decisions(&status, true),
             Some(vec![CommandPolicyDecision::Ask])
         );
+    }
+
+    const CONFINED_COMMAND: &str = "git status --short";
+
+    fn mark_confined(request: &mut PermissionRequest) {
+        for resource in &mut request.resources {
+            resource.attributes.insert(
+                CONFINED_READ_ATTRIBUTE.into(),
+                CONFINED_READ_VALUE.to_owned(),
+            );
+        }
+    }
+
+    /// The classifier only ever kept plan mode from refusing such a line; it
+    /// still cost a prompt in both modes. The builtin rule is what makes the
+    /// resource covered, so nothing has to be asked.
+    #[test_case(true => vec![true] ; "a confined read needs no prompt")]
+    #[test_case(false => vec![false] ; "the same line unmarked still does")]
+    fn a_confined_read_is_covered_by_the_builtin_rule(confined: bool) -> Vec<bool> {
+        let manager = default_mgr();
+        let mut request = shell_request(&[CONFINED_COMMAND], workcell_shell_subject());
+        if confined {
+            mark_confined(&mut request);
+        }
+
+        let (covered, _, _) = manager
+            .request_coverage(&request, &builtin_structured_rules(), false)
+            .expect("nothing denies the command");
+        covered
+    }
+
+    /// Coverage is only worth anything if the manager actually consults the
+    /// builtin rule when it collects the applicable set, which no test that
+    /// hands the rule in directly can show.
+    #[test_case(true => true ; "a confined read is enforced without a responder")]
+    #[test_case(false => false ; "the same line unmarked cannot be")]
+    fn the_manager_applies_the_builtin_rule_it_owns(confined: bool) -> bool {
+        smol::block_on(async {
+            let temp = tempfile::tempdir().unwrap();
+            let project = temp.path().to_path_buf();
+            let manager = mgr_with(PermissionsConfig::default(), project.clone());
+            let mut intent = shell_intent(&[CONFINED_COMMAND]);
+            if confined {
+                for resource in &mut intent.resources {
+                    resource.attributes.insert(
+                        CONFINED_READ_ATTRIBUTE.into(),
+                        CONFINED_READ_VALUE.to_owned(),
+                    );
+                }
+            }
+            let (event_tx, _event_rx) = flume::unbounded();
+            let event_tx = crate::EventSender::new(event_tx, 0);
+
+            manager
+                .enforce_with_intent(
+                    &ToolKey::native("shell"),
+                    &intent,
+                    &serde_json::json!({}),
+                    &event_tx,
+                    None,
+                    "confined-read",
+                    &crate::CancelToken::none(),
+                    None,
+                    Some((workcell_shell_subject(), PermissionExecutorKind::Native)),
+                    true,
+                )
+                .await
+                .is_ok()
+        })
+    }
+
+    /// The attribute is the whole justification, so it only justifies the tool
+    /// that earns it. A plugin presenting the same command must not inherit it.
+    #[test]
+    fn a_confined_read_does_not_cross_to_another_subject() {
+        let manager = default_mgr();
+        let mut request = shell_request(
+            &[CONFINED_COMMAND],
+            PermissionSubject::Lua {
+                plugin: "untrusted".into(),
+                tool: "shell".into(),
+                contract: "shell.execution.v1".into(),
+            },
+        );
+        mark_confined(&mut request);
+
+        let (covered, _, _) = manager
+            .request_coverage(&request, &builtin_structured_rules(), false)
+            .expect("nothing denies the command");
+        assert_eq!(covered, vec![false]);
+    }
+
+    /// Belt and braces. The shell tool never marks an opaque line, and an opaque
+    /// line is protected, which the rule refuses to cover on its own.
+    #[test]
+    fn a_protected_command_is_not_covered_even_when_marked() {
+        let manager = default_mgr();
+        let mut request = shell_request(&[CONFINED_COMMAND], workcell_shell_subject());
+        mark_confined(&mut request);
+        for resource in &mut request.resources {
+            resource.protected = true;
+        }
+
+        let (covered, _, _) = manager
+            .request_coverage(&request, &builtin_structured_rules(), false)
+            .expect("nothing denies the command");
+        assert_eq!(covered, vec![false]);
     }
 
     #[test]

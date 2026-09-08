@@ -10,8 +10,9 @@ use std::sync::{Arc, Mutex};
 
 use caudra_agent::patch;
 use caudra_agent::permissions::{
-    PermissionAuthorityProfile, PermissionResource, PermissionResourceAccess,
-    PermissionResourceKind, PermissionRisk, filesystem_permission_resource, shell_permission_scope,
+    CONFINED_READ_ATTRIBUTE, CONFINED_READ_VALUE, PermissionAuthorityProfile, PermissionResource,
+    PermissionResourceAccess, PermissionResourceKind, PermissionRisk,
+    filesystem_permission_resource, shell_permission_scope,
 };
 use caudra_agent::tools::{
     BoxFuture, DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError,
@@ -927,7 +928,7 @@ impl WorkcellInvocation {
                         Ok::<_, String>((group, prepared))
                     })
                     .await??;
-                shell_prepared(group, shell)
+                shell_prepared(group, shell, &project)
             }
             Input::Code(_) => exact_custom_prepared(
                 "isolated_compute",
@@ -1823,8 +1824,14 @@ fn file_permissions(resources: &[FileResource], project: &Path) -> FilePermissio
     }
 }
 
-fn shell_prepared(group: ShellToolGroup, shell: PreparedShell) -> PreparedInvocation {
+fn shell_prepared(
+    group: ShellToolGroup,
+    shell: PreparedShell,
+    project: &Path,
+) -> PreparedInvocation {
     let opaque = shell.analysis().opaque || shell_command_hides_operands(shell.command());
+    let confined_read = read_only_shell::is_read_only(shell.analysis(), opaque)
+        && read_only_shell::stays_in_project(shell.analysis(), shell.workdir(), project);
     let workdir = shell.workdir().to_string_lossy().into_owned();
     let scopes = if opaque || shell.analysis().scopes.is_empty() {
         vec![shell_permission_scope(shell.command(), shell.workdir())]
@@ -1852,6 +1859,12 @@ fn shell_prepared(group: ShellToolGroup, shell: PreparedShell) -> PreparedInvoca
             let mut attributes = BTreeMap::from([("workdir".into(), workdir.clone())]);
             if let Some(normalized) = normalized {
                 attributes.insert(NORMALIZED_COMMAND_ATTRIBUTE.into(), normalized);
+            }
+            if confined_read {
+                attributes.insert(
+                    CONFINED_READ_ATTRIBUTE.into(),
+                    CONFINED_READ_VALUE.to_owned(),
+                );
             }
             PermissionResource {
                 kind: PermissionResourceKind::Command,
@@ -2850,6 +2863,40 @@ mod tests {
         assert_eq!(intent.resources[0].value, command);
         assert!(intent.resources[0].protected);
         assert!(intent.resources[0].requires_prompt);
+    }
+
+    /// The classifier's answer has to reach the permission layer or it only ever
+    /// gated plan mode. This attribute is what the builtin allow rule keys on,
+    /// so marking a line is the whole difference between running and asking.
+    #[test_case("git status --short" => true ; "a read that cannot leave the project")]
+    #[test_case("cat Cargo.toml" => true ; "a read of a relative path")]
+    #[test_case("cat /etc/shadow" => false ; "a read that leaves the project")]
+    #[test_case("cat ../../secret" => false ; "a read that climbs out of it")]
+    #[test_case("rm -rf build" => false ; "not a read at all")]
+    #[test_case("git status > out.txt" => false ; "an opaque line is never marked")]
+    fn shell_preflight_marks_only_a_confined_read(command: &str) -> bool {
+        let root = TempDir::new().expect("tempdir");
+        let (_host, registry) = host_and_registry(root.path());
+        let ctx = context(root.path(), Arc::clone(&registry), CancelToken::none());
+        let invocation = registry
+            .get("shell")
+            .expect("registered shell")
+            .tool
+            .parse(&json!({"command": command}))
+            .expect("valid shell input");
+
+        let intent = smol::block_on(invocation.preflight(&ctx))
+            .expect("shell preflight")
+            .expect("shell permission intent");
+
+        !intent.resources.is_empty()
+            && intent.resources.iter().all(|resource| {
+                resource
+                    .attributes
+                    .get(CONFINED_READ_ATTRIBUTE)
+                    .map(String::as_str)
+                    == Some(CONFINED_READ_VALUE)
+            })
     }
 
     #[test]

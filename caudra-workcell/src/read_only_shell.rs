@@ -3,6 +3,8 @@
 //! The allowlist is deliberately small. Anything it does not recognize is not
 //! refused, it is prompted, so the list never has to be exhaustive to be safe.
 
+use std::path::{Component, Path};
+
 use workcell::shell::ShellCommandAnalysis;
 
 const GIT: &str = "git";
@@ -92,6 +94,45 @@ fn scope_is_read_only(normalized: &str) -> bool {
     }
 }
 
+/// Reports whether a line can only reach inside the project.
+///
+/// A read-only command still reads, and the project's own read tools are bound
+/// to the project, so granting one without the same bound would make `cat` reach
+/// what `file_read` has to ask about. Confinement is decided from the text, so
+/// anything it cannot resolve counts as escaping: an absolute path, a `~`, or
+/// any `..` segment. The workdir is checked too, because Caudra runs the shell
+/// unconfined and a relative operand is only inside when its base is.
+pub(crate) fn stays_in_project(
+    analysis: &ShellCommandAnalysis,
+    workdir: &Path,
+    project: &Path,
+) -> bool {
+    workdir.starts_with(project)
+        && analysis
+            .scopes
+            .iter()
+            .all(|scope| scope_stays_in_project(&scope.normalized))
+}
+
+fn scope_stays_in_project(normalized: &str) -> bool {
+    normalized.split_whitespace().all(|token| {
+        // A flag carrying an attached value hides a second operand, and
+        // `--file=/etc/passwd` reads it just as surely as a bare path would.
+        token
+            .split('=')
+            .all(|part| stays_inside(part) && stays_inside(&unquote(part)))
+    })
+}
+
+fn stays_inside(operand: &str) -> bool {
+    let path = Path::new(operand);
+    !path.is_absolute()
+        && !operand.starts_with('~')
+        && !path
+            .components()
+            .any(|component| component == Component::ParentDir)
+}
+
 fn denies(arguments: &[&str], denied: &[&str]) -> bool {
     arguments.iter().any(|argument| {
         let argument = unquote(argument);
@@ -116,7 +157,9 @@ fn unquote(argument: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::is_read_only;
+    use std::path::Path;
+
+    use super::{is_read_only, stays_in_project};
     use test_case::test_case;
     use workcell::shell::{ShellCommandAnalysis, ShellCommandScope};
 
@@ -171,5 +214,51 @@ mod tests {
     #[test_case(&[], false => false ; "no_scopes_is_never_read_only")]
     fn lines_are_classified(commands: &[&str], opaque: bool) -> bool {
         is_read_only(&analysis(commands), opaque)
+    }
+
+    const PROJECT: &str = "/home/dev/project";
+
+    #[test_case("cat notes.md" => true ; "a_relative_operand_stays_inside")]
+    #[test_case("rg pattern src/deep/nested" => true ; "so_does_a_nested_one")]
+    #[test_case("git log --oneline -20" => true ; "flags_are_not_paths")]
+    #[test_case("git diff HEAD~1" => true ; "a_tilde_inside_a_revision_is_not_a_home_directory")]
+    #[test_case("cat /etc/shadow" => false ; "an_absolute_operand_escapes")]
+    #[test_case("cat ~/.ssh/id_rsa" => false ; "a_home_operand_escapes")]
+    #[test_case("cat ../../secret" => false ; "a_parent_segment_escapes")]
+    #[test_case("cat src/../../secret" => false ; "a_parent_segment_escapes_from_anywhere_in_the_path")]
+    #[test_case("rg --file=/etc/passwd pattern" => false ; "an_attached_flag_value_escapes")]
+    #[test_case("git diff --no-index /etc/passwd x" => false ; "no_index_needs_no_special_case")]
+    #[test_case("cat \\/etc/shadow" => false ; "escaping_does_not_hide_an_absolute_path")]
+    fn operands_are_confined_to_the_project(command: &str) -> bool {
+        stays_in_project(
+            &analysis(&[command]),
+            Path::new(PROJECT),
+            Path::new(PROJECT),
+        )
+    }
+
+    /// Caudra runs the shell unconfined, so a relative operand is only inside
+    /// the project when the directory it resolves against is.
+    #[test_case(PROJECT => true ; "the_project_root_itself")]
+    #[test_case("/home/dev/project/crates/core" => true ; "a_directory_within_it")]
+    #[test_case("/home/dev/other" => false ; "a_sibling_project")]
+    #[test_case("/etc" => false ; "somewhere_else_entirely")]
+    fn a_workdir_outside_the_project_confines_nothing(workdir: &str) -> bool {
+        stays_in_project(
+            &analysis(&["cat notes.md"]),
+            Path::new(workdir),
+            Path::new(PROJECT),
+        )
+    }
+
+    /// Every command on the line has to stay inside, for the same reason one
+    /// writer taints the line for `is_read_only`.
+    #[test]
+    fn one_escaping_command_taints_the_line() {
+        assert!(!stays_in_project(
+            &analysis(&["cat notes.md", "cat /etc/shadow"]),
+            Path::new(PROJECT),
+            Path::new(PROJECT),
+        ));
     }
 }
