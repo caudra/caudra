@@ -29,11 +29,11 @@ Run [`caudra tools`](/docs/cli/) to see the resulting set, including which rule 
 
 ## Tools loaded on demand
 
-7 built-in tools start outside the request array. The model sees a `tool_search` entry instead, and one call with a query loads the matching tools for the rest of the session. Sessions that never need them never pay for their descriptions.
+8 built-in tools start outside the request array. The model sees a `tool_search` entry instead, and one call with a query loads the matching tools for the rest of the session. Sessions that never need them never pay for their descriptions.
 
 `code_map`, `code_context`, `code_refs`, `code_impact`, and `code_expand` load together as the code graph group, because a question about an unfamiliar codebase usually takes several of them in a row.
 
-`execution_environment` and `image_generate` load on their own.
+`execution_environment`, `image_generate`, and `python_execution` load on their own.
 
 Loading changes the tool array, so the provider's prompt cache prefix resets and the next request re-reads the history as fresh input. Caudra posts a notice naming what loaded when it happens.
 
@@ -208,7 +208,7 @@ A progress bar redraws a row instead of printing lines. Caudra renders both the 
 | `timeout` | integer | no | Optional timeout in milliseconds. Defaults to 120000 and is capped at 600000. |
 | `workdir` | string | no | Optional configured-root-relative or absolute initial working directory inside the configured root. |
 
-### `python_execution` {#python_execution}
+### `python_execution` <span class="badge">on demand</span> {#python_execution}
 
 Execute a short Python script in an isolated interpreter and return its value and printed output.
 
