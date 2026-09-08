@@ -50,6 +50,11 @@ const FIND: &str = "find";
 const FIND_DENIED_FLAGS: &[&str] = &[
     "-delete", "-exec", "-execdir", "-fls", "-fprint", "-fprintf", "-ok", "-okdir",
 ];
+/// Substitution leaves the operand undecidable from the text at any position,
+/// quoted or not, since `"$HOME"` expands exactly as `$HOME` does.
+const SUBSTITUTES: &[char] = &['$', '`'];
+/// Unquoted, these expand against the filesystem before the command runs.
+const GLOBS: &[char] = &['*', '?', '['];
 /// `sed` and `awk` are absent on purpose rather than deny-listed: `sed -i`
 /// writes, `sed`'s `w` command writes from inside the script, and `awk` has
 /// `system()` and `print >`. None can be made safe by rejecting flags.
@@ -115,13 +120,39 @@ pub(crate) fn stays_in_project(
 }
 
 fn scope_stays_in_project(normalized: &str) -> bool {
-    normalized.split_whitespace().all(|token| {
-        // A flag carrying an attached value hides a second operand, and
-        // `--file=/etc/passwd` reads it just as surely as a bare path would.
-        token
-            .split('=')
-            .all(|part| stays_inside(part) && stays_inside(&unquote(part)))
-    })
+    normalized.split_whitespace().all(token_stays_in_project)
+}
+
+fn token_stays_in_project(token: &str) -> bool {
+    // Judging a token's text only means anything while the text is the operand.
+    // Workcell marks `${...}` and `$(...)` opaque, but a bare `$HOME` is a
+    // `simple_expansion` it leaves intact, and `$HOME/.ssh/id_rsa` then reads as
+    // an ordinary relative path. An unquoted glob names a set the text does not.
+    if token.contains(SUBSTITUTES) || has_unquoted(token, GLOBS) {
+        return false;
+    }
+    // A flag carrying an attached value hides a second operand, and
+    // `--file=/etc/passwd` reads it just as surely as a bare path would.
+    token
+        .split('=')
+        .all(|part| stays_inside(part) && stays_inside(&unquote(part)))
+}
+
+/// Quoting decides whether a glob expands, so this reads the token as the shell
+/// would rather than stripping quotes first. A backslash escape is not honoured,
+/// which only costs a prompt.
+fn has_unquoted(token: &str, characters: &[char]) -> bool {
+    let mut quote = None;
+    for character in token.chars() {
+        match quote {
+            Some(open) if open == character => quote = None,
+            Some(_) => {}
+            None if matches!(character, '\'' | '"') => quote = Some(character),
+            None if characters.contains(&character) => return true,
+            None => {}
+        }
+    }
+    false
 }
 
 fn stays_inside(operand: &str) -> bool {
@@ -229,6 +260,14 @@ mod tests {
     #[test_case("rg --file=/etc/passwd pattern" => false ; "an_attached_flag_value_escapes")]
     #[test_case("git diff --no-index /etc/passwd x" => false ; "no_index_needs_no_special_case")]
     #[test_case("cat \\/etc/shadow" => false ; "escaping_does_not_hide_an_absolute_path")]
+    #[test_case("cat $HOME/.ssh/id_rsa" => false ; "a_bare_variable_is_not_a_relative_path")]
+    #[test_case("cat \"$HOME\"/.ssh/id_rsa" => false ; "quoting_a_variable_does_not_stop_it_expanding")]
+    #[test_case("cat `cat pointer`" => false ; "a_backtick_substitutes_too")]
+    #[test_case("cat *" => false ; "an_unquoted_glob_names_what_the_text_does_not")]
+    #[test_case("cat ?ecret" => false ; "so_does_a_single_character_wildcard")]
+    #[test_case("cat [a-z]ecret" => false ; "and_a_bracket_class")]
+    #[test_case("find . -name '*.rs'" => true ; "a_quoted_glob_is_a_literal_argument")]
+    #[test_case("rg 'a.*b' src" => true ; "a_quoted_regex_is_not_a_glob")]
     fn operands_are_confined_to_the_project(command: &str) -> bool {
         stays_in_project(
             &analysis(&[command]),

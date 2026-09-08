@@ -2874,6 +2874,12 @@ mod tests {
     #[test_case("cat ../../secret" => false ; "a read that climbs out of it")]
     #[test_case("rm -rf build" => false ; "not a read at all")]
     #[test_case("git status > out.txt" => false ; "an opaque line is never marked")]
+    // Workcell marks `${...}` and `$(...)` opaque but leaves a bare `$HOME`
+    // intact, so these reach the confinement check looking like plain relative
+    // paths. They are the reason it refuses a token it cannot resolve.
+    #[test_case("cat $HOME/.ssh/id_rsa" => false ; "a bare variable is not confined by its text")]
+    #[test_case("cat \"$HOME\"/.ssh/id_rsa" => false ; "nor is a quoted one")]
+    #[test_case("cat *" => false ; "nor is an unquoted glob")]
     fn shell_preflight_marks_only_a_confined_read(command: &str) -> bool {
         let root = TempDir::new().expect("tempdir");
         let (_host, registry) = host_and_registry(root.path());
