@@ -24,7 +24,17 @@ const CWD_MODEL_SEPARATOR: &str = "  ";
 const BACK_TO_MAIN_LABEL: &str = "[< Main]";
 const FAST_LABEL: &str = " [fast]";
 const WORKFLOW_LABEL: &str = " [workflow]";
+const WORKFLOW_SHORT_LABEL: &str = " [wf]";
 const YOLO_LABEL: &str = " [yolo]";
+const YOLO_SHORT_LABEL: &str = " [!]";
+const THINKING_PREFIX: &str = "thinking: ";
+/// A chip's leading space and its two brackets, which no tier sheds.
+const CHIP_OVERHEAD: usize = 3;
+const BRACKET_WIDTH: usize = 2;
+/// Enough for `[.]`, so a bar too narrow to name the model still offers the
+/// control that changes it.
+const CLICKABLE_MODEL_FLOOR: usize = 3;
+const PLAIN_MODEL_FLOOR: usize = 1;
 /// Marks a figure a subscription already covers. One column is all the bar can
 /// spare to say the number is a price rather than a bill.
 const NOT_BILLED_MARK: &str = "~";
@@ -77,7 +87,9 @@ pub struct StatusBarContext<'a> {
     pub chat_name: Option<&'a str>,
     pub back_to_main: bool,
     pub retry_info: Option<&'a RetryInfo>,
-    pub thinking_label: Option<Cow<'static, str>>,
+    /// The effective level alone (`off`, `xhigh`, `8192`). The bar spells the
+    /// word "thinking" in front of it only when it has the columns to spare.
+    pub thinking: Option<Cow<'static, str>>,
     pub fast: bool,
     pub workflow: bool,
     pub yolo: bool,
@@ -87,6 +99,229 @@ pub struct StatusBarContext<'a> {
     pub settings_clickable: bool,
     pub hovered: Option<StatusBarHitTarget>,
     pub hover_url: Option<&'a str>,
+}
+
+/// How much of the thinking chip survives: `[thinking: xhigh]`, `[xhigh]`, or
+/// nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThinkingTier {
+    Named,
+    Level,
+    Hidden,
+}
+
+/// `[anthropic/claude-opus-5]`, then the last path segment, then whatever the
+/// leftover columns hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelTier {
+    Full,
+    Leaf,
+    Chopped,
+}
+
+/// `[workflow]` and `[yolo]` spelled out, or squeezed to `[wf]` and `[!]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FlagTier {
+    Named,
+    Sigil,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContextTier {
+    /// `12.0k/200.0k (6%)` beside the spend.
+    Counts,
+    /// `6%` beside the spend.
+    Percent,
+    /// `6%` alone.
+    Bare,
+    Hidden,
+}
+
+/// One step down the ladder. Every step either abbreviates something or drops
+/// it, so the bar's width falls monotonically and the search terminates.
+#[derive(Debug, Clone, Copy)]
+enum Reduction {
+    DropGlobalSpend,
+    CompactContext,
+    ShortThinking,
+    ShortFlags,
+    LeafModel,
+    BareContext,
+    DropContext,
+    DropWorkflow,
+    DropFast,
+    DropThinking,
+    ChopModel,
+    DropYolo,
+}
+
+/// Cheap abbreviations come before anything is lost, and yolo goes last: a
+/// session that skips permission prompts has to say so at any width that can
+/// hold three columns.
+const LADDER: [Reduction; 12] = [
+    Reduction::DropGlobalSpend,
+    Reduction::CompactContext,
+    Reduction::ShortThinking,
+    Reduction::ShortFlags,
+    Reduction::LeafModel,
+    Reduction::BareContext,
+    Reduction::DropContext,
+    Reduction::DropWorkflow,
+    Reduction::DropFast,
+    Reduction::DropThinking,
+    Reduction::ChopModel,
+    Reduction::DropYolo,
+];
+
+/// The counters and prices, rendered once per frame so walking the ladder is
+/// pure arithmetic over widths the bar already knows.
+struct SpendText {
+    counts: String,
+    percent: String,
+    bare: String,
+    global: Option<String>,
+}
+
+impl SpendText {
+    fn new(stats: &UsageStats) -> Self {
+        let pct = if stats.context_window > 0 {
+            (stats.context_size as f64 / stats.context_window as f64 * 100.0) as u32
+        } else {
+            0
+        };
+        let bare = format!("  {pct}% ");
+        let counted = format!(
+            "  {}/{} ({pct}%)",
+            format_tokens(stats.context_size),
+            format_tokens(stats.context_window),
+        );
+        let (counts, percent) = match spend(stats.cost, stats.subscription_cost) {
+            Some(cost) => (format!("{counted} {cost} "), format!("  {pct}% {cost} ")),
+            None => (format!("{counted} "), bare.clone()),
+        };
+        Self {
+            counts,
+            percent,
+            bare,
+            global: spend(stats.global_cost, stats.global_subscription_cost)
+                .filter(|_| stats.show_global)
+                .map(|global| format!(" \u{03a3}{global} ")),
+        }
+    }
+}
+
+/// Which tier each slot of the right-hand side settled on. Widths and spans
+/// both read from this, so a chip cannot be measured as one size and drawn as
+/// another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Fit {
+    global_spend: bool,
+    context: ContextTier,
+    thinking: ThinkingTier,
+    flags: FlagTier,
+    model: ModelTier,
+    fast: bool,
+    workflow: bool,
+    yolo: bool,
+}
+
+impl Fit {
+    const FULL: Self = Self {
+        global_spend: true,
+        context: ContextTier::Counts,
+        thinking: ThinkingTier::Named,
+        flags: FlagTier::Named,
+        model: ModelTier::Full,
+        fast: true,
+        workflow: true,
+        yolo: true,
+    };
+
+    fn apply(&mut self, step: Reduction) {
+        match step {
+            Reduction::DropGlobalSpend => self.global_spend = false,
+            Reduction::CompactContext => self.context = ContextTier::Percent,
+            Reduction::ShortThinking => self.thinking = ThinkingTier::Level,
+            Reduction::ShortFlags => self.flags = FlagTier::Sigil,
+            Reduction::LeafModel => self.model = ModelTier::Leaf,
+            Reduction::BareContext => self.context = ContextTier::Bare,
+            Reduction::DropContext => self.context = ContextTier::Hidden,
+            Reduction::DropWorkflow => self.workflow = false,
+            Reduction::DropFast => self.fast = false,
+            Reduction::DropThinking => self.thinking = ThinkingTier::Hidden,
+            Reduction::ChopModel => self.model = ModelTier::Chopped,
+            Reduction::DropYolo => self.yolo = false,
+        }
+    }
+
+    /// Everything right of the cwd, which takes whatever this leaves behind.
+    fn width(self, ctx: &StatusBarContext<'_>, spend: &SpendText) -> usize {
+        self.model_width(ctx) + self.chip_width(ctx) + self.spend_width(spend)
+    }
+
+    /// Clamped up to the floor so [`Reduction::ChopModel`] can never widen a
+    /// short id, which would let the ladder grow instead of shrink.
+    fn model_width(self, ctx: &StatusBarContext<'_>) -> usize {
+        let floor = model_floor(ctx);
+        let named = |id: &str| id.width() + usize::from(ctx.settings_clickable) * BRACKET_WIDTH;
+        match self.model {
+            ModelTier::Full => named(ctx.model_id).max(floor),
+            ModelTier::Leaf => named(model_leaf(ctx.model_id)).max(floor),
+            ModelTier::Chopped => floor,
+        }
+    }
+
+    fn chip_width(self, ctx: &StatusBarContext<'_>) -> usize {
+        self.thinking_width(ctx)
+            + usize::from(ctx.fast && self.fast) * FAST_LABEL.width()
+            + usize::from(ctx.workflow && self.workflow) * self.flags.workflow_label().width()
+            + usize::from(ctx.yolo && self.yolo) * self.flags.yolo_label().width()
+    }
+
+    fn thinking_width(self, ctx: &StatusBarContext<'_>) -> usize {
+        let Some(level) = ctx.thinking.as_deref() else {
+            return 0;
+        };
+        match self.thinking {
+            ThinkingTier::Named => CHIP_OVERHEAD + THINKING_PREFIX.width() + level.width(),
+            ThinkingTier::Level => CHIP_OVERHEAD + level.width(),
+            ThinkingTier::Hidden => 0,
+        }
+    }
+
+    fn spend_width(self, spend: &SpendText) -> usize {
+        self.context_text(spend).map_or(0, UnicodeWidthStr::width)
+            + self.global_text(spend).map_or(0, UnicodeWidthStr::width)
+    }
+
+    fn context_text(self, spend: &SpendText) -> Option<&str> {
+        match self.context {
+            ContextTier::Counts => Some(&spend.counts),
+            ContextTier::Percent => Some(&spend.percent),
+            ContextTier::Bare => Some(&spend.bare),
+            ContextTier::Hidden => None,
+        }
+    }
+
+    fn global_text(self, spend: &SpendText) -> Option<&str> {
+        spend.global.as_deref().filter(|_| self.global_spend)
+    }
+}
+
+impl FlagTier {
+    fn workflow_label(self) -> &'static str {
+        match self {
+            Self::Named => WORKFLOW_LABEL,
+            Self::Sigil => WORKFLOW_SHORT_LABEL,
+        }
+    }
+
+    fn yolo_label(self) -> &'static str {
+        match self {
+            Self::Named => YOLO_LABEL,
+            Self::Sigil => YOLO_SHORT_LABEL,
+        }
+    }
 }
 
 pub struct StatusBar {
@@ -274,169 +509,15 @@ impl StatusBar {
                 left_spans.push(Span::styled(format!(" {e}"), theme::current().error));
             }
             _ => {
-                let pct = if ctx.stats.context_window > 0 {
-                    (ctx.stats.context_size as f64 / ctx.stats.context_window as f64 * 100.0) as u32
-                } else {
-                    0
-                };
-
                 let left_width = left_spans.iter().map(Span::width).sum::<usize>();
-                let right_budget = (area.width as usize).saturating_sub(left_width);
-                let min_model_width = if ctx.settings_clickable { 3 } else { 1 };
-                let thinking_width = ctx
-                    .thinking_label
-                    .as_ref()
-                    .map_or(0, |label| label.width() + 3);
-                let mut show_thinking = ctx.thinking_label.is_some();
-                let mut show_fast = ctx.fast;
-                let mut show_workflow = ctx.workflow;
-                let mut show_yolo = ctx.yolo;
-                let core_width = |thinking, fast, workflow, yolo| {
-                    thinking_width * usize::from(thinking)
-                        + FAST_LABEL.width() * usize::from(fast)
-                        + WORKFLOW_LABEL.width() * usize::from(workflow)
-                        + YOLO_LABEL.width() * usize::from(yolo)
-                };
-                if core_width(show_thinking, show_fast, show_workflow, show_yolo) + min_model_width
-                    > right_budget
-                {
-                    show_workflow = false;
-                }
-                if core_width(show_thinking, show_fast, show_workflow, show_yolo) + min_model_width
-                    > right_budget
-                {
-                    show_fast = false;
-                }
-                if core_width(show_thinking, show_fast, show_workflow, show_yolo) + min_model_width
-                    > right_budget
-                {
-                    show_thinking = false;
-                }
-                if core_width(show_thinking, show_fast, show_workflow, show_yolo) + min_model_width
-                    > right_budget
-                {
-                    show_yolo = false;
-                }
-
-                let mut rest_spans = Vec::new();
-                let mut thinking_offset = None;
-
-                if show_thinking && let Some(ref label) = ctx.thinking_label {
-                    thinking_offset = Some(rest_spans.iter().map(Span::width).sum::<usize>() + 1);
-                    rest_spans.push(Span::raw(" "));
-                    rest_spans.push(Span::styled(
-                        format!("[{label}]"),
-                        hover_style(
-                            if ctx.settings_clickable {
-                                theme::current().status_notice
-                            } else {
-                                theme::current().status_dim
-                            },
-                            ctx.settings_clickable
-                                && ctx.hovered == Some(StatusBarHitTarget::Thinking),
-                        ),
-                    ));
-                }
-
-                if show_fast {
-                    rest_spans.push(Span::styled(FAST_LABEL, theme::current().status_dim));
-                }
-                if show_workflow {
-                    rest_spans.push(Span::styled(WORKFLOW_LABEL, theme::current().status_dim));
-                }
-                if show_yolo {
-                    rest_spans.push(Span::styled(YOLO_LABEL, theme::current().error));
-                }
-
-                let context_text = format!(
-                    "  {}/{} ({}%)",
-                    format_tokens(ctx.stats.context_size),
-                    format_tokens(ctx.stats.context_window),
-                    pct,
-                );
-                let rest_text = match spend(ctx.stats.cost, ctx.stats.subscription_cost) {
-                    Some(cost) => format!("{context_text} {cost} "),
-                    None => format!("{context_text} "),
-                };
-                let global_text = spend(ctx.stats.global_cost, ctx.stats.global_subscription_cost)
-                    .filter(|_| ctx.stats.show_global)
-                    .map(|global| format!(" \u{03a3}{global} "));
-                let core_width = rest_spans.iter().map(Span::width).sum::<usize>();
-                let full_width = rest_text.width();
-                let global_width = global_text.as_ref().map_or(0, |text| text.width());
-                if core_width + min_model_width + full_width + global_width <= right_budget {
-                    rest_spans.push(Span::styled(
-                        rest_text,
-                        Style::new().fg(theme::current().foreground),
-                    ));
-                    if let Some(global_text) = global_text {
-                        rest_spans.push(Span::styled(
-                            global_text,
-                            Style::new().fg(theme::current().foreground),
-                        ));
-                    }
-                } else if core_width + min_model_width + full_width <= right_budget {
-                    rest_spans.push(Span::styled(
-                        rest_text,
-                        Style::new().fg(theme::current().foreground),
-                    ));
-                } else {
-                    let compact_context = format!("  {pct}% ");
-                    if core_width + min_model_width + compact_context.width() <= right_budget {
-                        rest_spans.push(Span::styled(
-                            compact_context,
-                            Style::new().fg(theme::current().foreground),
-                        ));
-                    }
-                }
-
-                let reserved = left_spans
-                    .iter()
-                    .chain(rest_spans.iter())
-                    .map(Span::width)
-                    .sum::<usize>();
-                let available = (area.width as usize).saturating_sub(reserved);
-                let model_budget = (available / 2).max(min_model_width).min(available);
-                let model = if ctx.settings_clickable {
-                    bracketed_tail(ctx.model_id, model_budget)
-                } else {
-                    truncate_tail(ctx.model_id, model_budget)
-                };
-                let separator = if model.is_empty() {
-                    ""
-                } else {
-                    CWD_MODEL_SEPARATOR
-                };
-                let cwd = truncate_tail(
+                let side = right_side(
+                    ctx,
                     &self.cwd_branch,
-                    available
-                        .saturating_sub(model.width())
-                        .saturating_sub(separator.width()),
+                    (area.width as usize).saturating_sub(left_width),
                 );
-                let separator = if cwd.is_empty() { "" } else { separator };
-
-                let model_offset = cwd.width() + separator.width();
-                let model_width = model.width();
-                let thinking_offset =
-                    thinking_offset.map(|offset| model_offset + model_width + offset);
-
-                right_spans.push(Span::styled(cwd, theme::current().status_dim));
-                right_spans.push(Span::raw(separator));
-                right_spans.push(Span::styled(
-                    model,
-                    hover_style(
-                        if ctx.settings_clickable {
-                            theme::current().status_notice
-                        } else {
-                            theme::current().status_dim
-                        },
-                        ctx.settings_clickable && ctx.hovered == Some(StatusBarHitTarget::Model),
-                    ),
-                ));
-                right_spans.append(&mut rest_spans);
-                model_hit = Some((model_offset, model_width));
-                thinking_hit =
-                    thinking_offset.zip(ctx.thinking_label.as_ref().map(|label| label.width() + 2));
+                right_spans = side.spans;
+                model_hit = Some(side.model_hit);
+                thinking_hit = side.thinking_hit;
             }
         }
 
@@ -504,6 +585,163 @@ impl StatusBar {
         }
         hits
     }
+}
+
+/// The right-hand half of the bar, already fitted to `budget`.
+struct RightSide<'a> {
+    spans: Vec<Span<'a>>,
+    /// Offsets measured on the glyphs that were drawn, so a hit cannot claim
+    /// columns a shorter tier never used.
+    model_hit: (usize, usize),
+    thinking_hit: Option<(usize, usize)>,
+}
+
+/// Walks [`LADDER`] until the fixed chips and the model fit, then hands the cwd
+/// whatever is left. The cwd goes last because the model names what answers you
+/// and the path is usually already in the shell prompt.
+fn right_side<'a>(
+    ctx: &'a StatusBarContext<'_>,
+    cwd_label: &'a str,
+    budget: usize,
+) -> RightSide<'a> {
+    let spend = SpendText::new(&ctx.stats);
+    let mut fit = Fit::FULL;
+    for step in LADDER {
+        if fit.width(ctx, &spend) <= budget {
+            break;
+        }
+        fit.apply(step);
+    }
+
+    let mut chips = Vec::new();
+    let mut thinking_chip = None;
+    if let Some(level) = ctx.thinking.as_deref()
+        && fit.thinking != ThinkingTier::Hidden
+    {
+        let label = match fit.thinking {
+            ThinkingTier::Named => format!("[{THINKING_PREFIX}{level}]"),
+            _ => format!("[{level}]"),
+        };
+        thinking_chip = Some((
+            chips.iter().map(Span::width).sum::<usize>() + 1,
+            label.width(),
+        ));
+        chips.push(Span::raw(" "));
+        chips.push(Span::styled(
+            label,
+            hover_style(
+                settings_style(ctx),
+                ctx.settings_clickable && ctx.hovered == Some(StatusBarHitTarget::Thinking),
+            ),
+        ));
+    }
+    if ctx.fast && fit.fast {
+        chips.push(Span::styled(FAST_LABEL, theme::current().status_dim));
+    }
+    if ctx.workflow && fit.workflow {
+        chips.push(Span::styled(
+            fit.flags.workflow_label(),
+            theme::current().status_dim,
+        ));
+    }
+    if ctx.yolo && fit.yolo {
+        chips.push(Span::styled(fit.flags.yolo_label(), theme::current().error));
+    }
+    let counters = Style::new().fg(theme::current().foreground);
+    for text in fit
+        .context_text(&spend)
+        .into_iter()
+        .chain(fit.global_text(&spend))
+    {
+        chips.push(Span::styled(text.to_owned(), counters));
+    }
+
+    let residue = budget.saturating_sub(chips.iter().map(Span::width).sum::<usize>());
+    let model = model_text(ctx, fit.model, residue);
+    let separator = if model.is_empty() {
+        ""
+    } else {
+        CWD_MODEL_SEPARATOR
+    };
+    let cwd = cwd_text(
+        cwd_label,
+        residue
+            .saturating_sub(model.width())
+            .saturating_sub(separator.width()),
+    );
+    let separator = if cwd.is_empty() { "" } else { separator };
+
+    let model_offset = cwd.width() + separator.width();
+    let model_width = model.width();
+    let mut spans = Vec::with_capacity(chips.len() + 3);
+    spans.push(Span::styled(cwd, theme::current().status_dim));
+    spans.push(Span::raw(separator));
+    spans.push(Span::styled(
+        model,
+        hover_style(
+            settings_style(ctx),
+            ctx.settings_clickable && ctx.hovered == Some(StatusBarHitTarget::Model),
+        ),
+    ));
+    spans.append(&mut chips);
+
+    RightSide {
+        spans,
+        model_hit: (model_offset, model_width),
+        thinking_hit: thinking_chip
+            .map(|(offset, width)| (model_offset + model_width + offset, width)),
+    }
+}
+
+fn settings_style(ctx: &StatusBarContext<'_>) -> Style {
+    if ctx.settings_clickable {
+        theme::current().status_notice
+    } else {
+        theme::current().status_dim
+    }
+}
+
+fn model_floor(ctx: &StatusBarContext<'_>) -> usize {
+    if ctx.settings_clickable {
+        CLICKABLE_MODEL_FLOOR
+    } else {
+        PLAIN_MODEL_FLOOR
+    }
+}
+
+fn model_text<'a>(ctx: &'a StatusBarContext<'_>, tier: ModelTier, budget: usize) -> Cow<'a, str> {
+    let id = match tier {
+        ModelTier::Full => ctx.model_id,
+        ModelTier::Leaf | ModelTier::Chopped => model_leaf(ctx.model_id),
+    };
+    if ctx.settings_clickable {
+        bracketed_tail(id, budget)
+    } else {
+        truncate_tail(id, budget)
+    }
+}
+
+/// `anthropic/claude-opus-5` is `claude-opus-5` once the columns run out: the
+/// segment that distinguishes two models the user might be switching between.
+fn model_leaf(id: &str) -> &str {
+    match id.rsplit_once('/') {
+        Some((_, leaf)) if !leaf.is_empty() => leaf,
+        _ => id,
+    }
+}
+
+/// `~/projects/caudra:main`, then `caudra:main`, then `caudra`, then nothing.
+/// Chopping the head instead would spend the same columns on `..dra:main`.
+fn cwd_text(label: &str, budget: usize) -> &str {
+    if label.width() <= budget {
+        return label;
+    }
+    let path = &label[..label.rfind(':').unwrap_or(label.len())];
+    let leaf = path.rfind('/').map_or(0, |slash| slash + 1);
+    [&label[leaf..], &path[leaf..]]
+        .into_iter()
+        .find(|candidate| candidate.width() <= budget)
+        .unwrap_or_default()
 }
 
 fn status_areas(area: Rect, right_spans: &[Span<'_>]) -> [Rect; 2] {
@@ -655,7 +893,22 @@ mod tests {
     const FLASH_MSG: &str = "Copied";
     const STALE_BRANCH: &str = "/nowhere:gone";
     const BAR_WIDTH: u16 = 120;
+    const MODE_LABEL: &str = "[BUILD]";
     const MODEL_ID: &str = "test-model";
+    const THINKING_LEVEL: &str = "off";
+    const LADDER_MODEL_ID: &str = "anthropic/claude-opus-5";
+    const LADDER_MODEL_LEAF: &str = "claude-opus-5";
+    const LADDER_THINKING: &str = "xhigh";
+    const LADDER_CWD: &str = "~/projects/caudra:main";
+    const PERCENT_MARK: &str = "%";
+    /// A budget the ladder answers with a squeezed thinking chip: wide enough
+    /// to keep the control, too narrow to spell the word in front of it.
+    const SHORT_THINKING_BUDGET: usize = 40;
+    const SHORT_THINKING_CHIP: &str = "[xhigh]";
+    const OVER_BUDGET_MSG: &str = "the right side claimed more columns than its budget";
+    const MONOTONE_MSG: &str = "a narrower bar showed a chip the wider one had dropped";
+    const YOLO_LAST_MSG: &str = "yolo must outlive every other chip";
+    const SHORT_THINKING_MSG: &str = "a squeezed thinking chip must still own its own glyphs";
     const CONTEXT_SIZE: u32 = 12_000;
     const CHAT_COST: f64 = 0.25;
     const CHAT_COST_TEXT: &str = "$0.250";
@@ -685,7 +938,7 @@ mod tests {
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 1)).unwrap();
         let ctx = StatusBarContext {
             status: &Status::Idle,
-            mode_label: "[BUILD]".into(),
+            mode_label: MODE_LABEL.into(),
             mode_style: Style::new(),
             model_id: MODEL_ID,
             stats: UsageStats {
@@ -701,7 +954,7 @@ mod tests {
             chat_name: None,
             back_to_main: false,
             retry_info: None,
-            thinking_label: Some("thinking: off".into()),
+            thinking: Some(THINKING_LEVEL.into()),
             fast: false,
             workflow: false,
             yolo,
@@ -727,6 +980,190 @@ mod tests {
 
     fn render(global_cost: Option<f64>, show_global: bool, yolo: bool) -> String {
         render_at(BAR_WIDTH, global_cost, show_global, yolo, None, None, None).0
+    }
+
+    /// Every flag on, a long model id and a real path: the widest the bar ever
+    /// has to squeeze, so each rung of the ladder gets exercised.
+    fn with_ladder_ctx(f: impl FnOnce(&StatusBarContext<'_>)) {
+        let ctx = StatusBarContext {
+            status: &Status::Idle,
+            mode_label: MODE_LABEL.into(),
+            mode_style: Style::new(),
+            model_id: LADDER_MODEL_ID,
+            stats: UsageStats {
+                global_cost: Some(SESSION_COST),
+                global_subscription_cost: None,
+                context_size: CONTEXT_SIZE,
+                cost: Some(CHAT_COST),
+                subscription_cost: None,
+                context_window: crate::components::TEST_CONTEXT_WINDOW,
+                show_global: true,
+            },
+            auto_scroll: true,
+            chat_name: None,
+            back_to_main: false,
+            retry_info: None,
+            thinking: Some(LADDER_THINKING.into()),
+            fast: true,
+            workflow: true,
+            yolo: true,
+            restoring: false,
+            goal: None,
+            mode_clickable: true,
+            settings_clickable: true,
+            hovered: None,
+            hover_url: None,
+        };
+        f(&ctx);
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Chip {
+        Thinking,
+        Fast,
+        Workflow,
+        Yolo,
+        Context,
+    }
+
+    fn side_text(side: &RightSide<'_>) -> String {
+        side.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    /// Reads the drawn glyphs rather than the [`Fit`], so a tier that measures
+    /// one way and draws another still counts as absent.
+    fn visible_chips(side: &RightSide<'_>) -> Vec<Chip> {
+        let text = side_text(side);
+        [
+            Chip::Thinking,
+            Chip::Fast,
+            Chip::Workflow,
+            Chip::Yolo,
+            Chip::Context,
+        ]
+        .into_iter()
+        .filter(|chip| match chip {
+            Chip::Thinking => text.contains(LADDER_THINKING),
+            Chip::Fast => text.contains(FAST_LABEL.trim()),
+            Chip::Workflow => {
+                text.contains(WORKFLOW_LABEL.trim()) || text.contains(WORKFLOW_SHORT_LABEL.trim())
+            }
+            Chip::Yolo => {
+                text.contains(YOLO_LABEL.trim()) || text.contains(YOLO_SHORT_LABEL.trim())
+            }
+            Chip::Context => text.contains(PERCENT_MARK),
+        })
+        .collect()
+    }
+
+    /// An overdrawn bar does not fail on screen: ratatui clips it, and the
+    /// columns come out of the mode label at the other end.
+    #[test_case(0   ; "no_room")]
+    #[test_case(3   ; "model_floor_only")]
+    #[test_case(8   ; "very_narrow")]
+    #[test_case(16  ; "narrow")]
+    #[test_case(24  ; "cramped")]
+    #[test_case(40  ; "medium")]
+    #[test_case(60  ; "roomy")]
+    #[test_case(80  ; "wide")]
+    #[test_case(120 ; "everything_fits")]
+    fn the_right_side_never_exceeds_its_budget(budget: usize) {
+        with_ladder_ctx(|ctx| {
+            let side = right_side(ctx, LADDER_CWD, budget);
+            let width = side.spans.iter().map(Span::width).sum::<usize>();
+            assert!(width <= budget, "{OVER_BUDGET_MSG}: {width} > {budget}");
+        });
+    }
+
+    /// The ladder is a prefix chain, so a wider bar can only settle on an
+    /// earlier rung. The cwd is left out: it spends whatever the chips and the
+    /// model did not, so a wider bar that keeps the full model id legitimately
+    /// has less room for the path.
+    #[test_case(0,  3   ; "nothing_to_something")]
+    #[test_case(3,  8   ; "model_floor_to_narrow")]
+    #[test_case(8,  16  ; "narrow_steps_up")]
+    #[test_case(16, 24  ; "cramped_steps_up")]
+    #[test_case(24, 40  ; "medium_steps_up")]
+    #[test_case(40, 60  ; "roomy_steps_up")]
+    #[test_case(60, 80  ; "wide_steps_up")]
+    #[test_case(80, 120 ; "everything_steps_up")]
+    fn a_narrower_bar_never_shows_more(narrow: usize, wide: usize) {
+        with_ladder_ctx(|ctx| {
+            let fewer = visible_chips(&right_side(ctx, LADDER_CWD, narrow));
+            let more = visible_chips(&right_side(ctx, LADDER_CWD, wide));
+            assert!(
+                fewer.iter().all(|chip| more.contains(chip)),
+                "{MONOTONE_MSG}: {fewer:?} at {narrow}, {more:?} at {wide}"
+            );
+        });
+    }
+
+    /// Yolo skips permission prompts for the rest of the session, so the bar
+    /// may not trade that warning for a token count or a reasoning level.
+    #[test_case(3   ; "model_floor_only")]
+    #[test_case(8   ; "very_narrow")]
+    #[test_case(16  ; "narrow")]
+    #[test_case(24  ; "cramped")]
+    #[test_case(40  ; "medium")]
+    #[test_case(60  ; "roomy")]
+    fn a_bypassed_session_keeps_its_warning_longest(budget: usize) {
+        with_ladder_ctx(|ctx| {
+            let chips = visible_chips(&right_side(ctx, LADDER_CWD, budget));
+            let others = chips.iter().any(|chip| *chip != Chip::Yolo);
+            assert!(
+                !others || chips.contains(&Chip::Yolo),
+                "{YOLO_LAST_MSG}: {chips:?} at {budget}"
+            );
+        });
+    }
+
+    /// Squeezing the chip must move its click target with it, or the bar hands
+    /// clicks to columns the short spelling never drew on.
+    #[test]
+    fn a_squeezed_thinking_chip_keeps_its_own_hit() {
+        with_ladder_ctx(|ctx| {
+            let side = right_side(ctx, LADDER_CWD, SHORT_THINKING_BUDGET);
+            let (offset, width) = side.thinking_hit.expect(SHORT_THINKING_MSG);
+            let text = side_text(&side);
+            let chip: String = text.chars().skip(offset).take(width).collect();
+
+            assert_eq!(chip, SHORT_THINKING_CHIP, "{SHORT_THINKING_MSG}");
+            assert_eq!(
+                text.chars().nth(offset - 1),
+                Some(' '),
+                "{SHORT_THINKING_MSG}"
+            );
+        });
+    }
+
+    /// The whole point of the ladder: the columns freed by abbreviating a chip
+    /// go to the strings that actually identify the session.
+    #[test]
+    fn a_squeezed_bar_still_names_the_model() {
+        with_ladder_ctx(|ctx| {
+            let text = side_text(&right_side(ctx, LADDER_CWD, SHORT_THINKING_BUDGET));
+            assert!(text.contains(LADDER_MODEL_LEAF), "{text}");
+        });
+    }
+
+    #[test_case("anthropic/claude-opus-5", "claude-opus-5" ; "strips_provider_and_org")]
+    #[test_case("claude-opus-5", "claude-opus-5"           ; "bare_id_is_its_own_leaf")]
+    #[test_case("anthropic/", "anthropic/"                 ; "trailing_slash_keeps_the_id")]
+    fn model_leaf_cases(id: &str, expected: &str) {
+        assert_eq!(model_leaf(id), expected);
+    }
+
+    #[test_case("~/projects/caudra:main", 30, "~/projects/caudra:main" ; "fits_untouched")]
+    #[test_case("~/projects/caudra:main", 12, "caudra:main"            ; "leaf_keeps_the_branch")]
+    #[test_case("~/projects/caudra:main", 8,  "caudra"                 ; "leaf_alone")]
+    #[test_case("~/projects/caudra:main", 3,  ""                       ; "nothing_readable_fits")]
+    #[test_case("~/projects/caudra", 8, "caudra"                       ; "no_branch_to_shed")]
+    #[test_case("caudra:main", 6, "caudra"                             ; "no_path_to_shed")]
+    fn cwd_text_cases(label: &str, budget: usize, expected: &str) {
+        assert_eq!(cwd_text(label, budget), expected);
     }
 
     /// The sigma is the whole session's bill, and only the session can hand it

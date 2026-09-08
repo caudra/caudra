@@ -527,15 +527,16 @@ impl App {
         let main_chat = render_chat == 0;
         // What the request will actually carry, not what was asked for: a
         // model can refuse to stop reasoning, and the badge has to say so.
-        let thinking_label = (main_chat && self.state.model.supports_thinking()).then(|| {
-            let effective = RequestOptions {
+        let thinking = (main_chat && self.state.model.supports_thinking()).then(|| {
+            RequestOptions {
                 thinking: self.state.thinking.clone(),
                 fast: self.state.fast,
             }
             .clamped(&self.state.model)
             .thinking
-            .resolve(&self.state.model);
-            format!("thinking: {effective}").into()
+            .resolve(&self.state.model)
+            .to_string()
+            .into()
         });
         let ctx = StatusBarContext {
             status: &self.status,
@@ -562,7 +563,7 @@ impl App {
             chat_name,
             back_to_main: render_chat != 0,
             retry_info: self.retry_info.as_ref(),
-            thinking_label,
+            thinking,
             fast: self.state.fast,
             workflow: self.state.workflow,
             yolo: self.permissions.is_yolo(),

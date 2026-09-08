@@ -1794,6 +1794,9 @@ const RESTORED_TOKENS: TokenUsage = TokenUsage {
 };
 const RESTORED_MODEL: &str = "model-that-ran-before";
 const SIGMA_MISSING: &str = "the status bar must draw the session total";
+const SIGMA_BAR_WIDTH: u16 = 140;
+const THINKING_OFF: &str = "off";
+const THINKING_MINIMAL: &str = "minimal";
 const COST_WAS_NOT_BILLED: &str = "the turn must bill something for the reset to prove anything";
 
 /// A new session opens on a clean bill. The total is never re-derived from the
@@ -1850,7 +1853,9 @@ fn resumed_session_keeps_adding_to_the_restored_bill() {
 }
 
 /// The sigma the status bar draws once subagents split the bill is the session
-/// total itself, so it cannot drift from what `/usage` sums.
+/// total itself, so it cannot drift from what `/usage` sums. The session total
+/// is the first thing a narrow bar sheds, so this asks for a bar wide enough to
+/// still be carrying it.
 #[test]
 fn status_bar_sigma_draws_the_session_cost() {
     let mut app = app_with_subagent();
@@ -1860,7 +1865,7 @@ fn status_bar_sigma_draws_the_session_cost() {
     let total = app.state.cost.expect("both turns were priced");
     let sigma = format!("\u{03a3}${total:.3}");
     assert!(
-        rendered(&mut app).contains(&sigma),
+        rendered_wide(&mut app, SIGMA_BAR_WIDTH).contains(&sigma),
         "{SIGMA_MISSING}: {sigma}"
     );
 }
@@ -3706,7 +3711,11 @@ fn hidden_context_modal_does_not_repaint_for_publications() {
 }
 
 fn rendered(app: &mut App) -> String {
-    let backend = ratatui::backend::TestBackend::new(80, 24);
+    rendered_wide(app, 80)
+}
+
+fn rendered_wide(app: &mut App, width: u16) -> String {
+    let backend = ratatui::backend::TestBackend::new(width, 24);
     let mut terminal = ratatui::Terminal::new(backend).unwrap();
     terminal.draw(|frame| app.view(frame)).unwrap();
     buffer_text(terminal.backend().buffer())
@@ -3937,6 +3946,21 @@ fn status_hit(
         .expect("status control was not rendered")
 }
 
+/// The bar spells the chip `[thinking: xhigh]` or just `[xhigh]` depending on
+/// how many columns it has, so tests read the control's own glyphs instead of
+/// asserting on one of the two spellings.
+fn thinking_chip(app: &mut App) -> String {
+    let hit = status_hit(app, StatusBarHitTarget::Thinking);
+    let backend = ratatui::backend::TestBackend::new(80, 24);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal.draw(|frame| app.view(frame)).unwrap();
+    let buffer = terminal.backend().buffer();
+    (hit.area.x..hit.area.right())
+        .filter_map(|column| buffer.cell((column, hit.area.y)))
+        .map(ratatui::buffer::Cell::symbol)
+        .collect()
+}
+
 fn click_status(app: &mut App, target: StatusBarHitTarget) -> Vec<Action> {
     let hit = status_hit(app, target);
     app.update(mouse_event(
@@ -3987,7 +4011,8 @@ fn opening_model_picker_clears_footer_hover() {
 #[test]
 fn clicking_status_thinking_cycles_from_visible_off_state() {
     let mut app = test_app();
-    assert!(rendered(&mut app).contains("[thinking: off]"));
+    let chip = thinking_chip(&mut app);
+    assert!(chip.contains(THINKING_OFF), "{chip}");
 
     assert!(click_status(&mut app, StatusBarHitTarget::Thinking).is_empty());
 
@@ -4037,7 +4062,8 @@ fn required_thinking_click_advances_from_effective_minimal() {
     let mut app = test_app();
     app.state.model.thinking_override = Some(caudra_providers::ThinkingSupport::Required);
     app.state.thinking = ThinkingConfig::Off;
-    assert!(rendered(&mut app).contains("[thinking: minimal]"));
+    let chip = thinking_chip(&mut app);
+    assert!(chip.contains(THINKING_MINIMAL), "{chip}");
 
     click_status(&mut app, StatusBarHitTarget::Thinking);
 

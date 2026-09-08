@@ -882,15 +882,6 @@ impl ThinkingConfig {
             .map(Into::into)
             .map_err(|_| THINKING_USAGE)
     }
-
-    pub fn status_label(&self) -> Option<Cow<'static, str>> {
-        match self {
-            Self::Off => None,
-            Self::Adaptive => Some(Cow::Borrowed("thinking")),
-            Self::Effort(level) => Some(Cow::Owned(format!("thinking: {level}"))),
-            Self::Budget(tokens) => Some(Cow::Owned(format!("thinking: {tokens}"))),
-        }
-    }
 }
 
 impl std::fmt::Display for ThinkingConfig {
