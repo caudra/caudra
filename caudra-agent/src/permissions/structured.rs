@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 
@@ -48,6 +48,12 @@ const FILE_SEARCH_TOOLS: &[&str] = &["file_glob", "file_grep", "glob", "grep"];
 const GIT_METADATA_DIR: &str = ".git";
 const SUBTREE_OPTION_ID: &str = "allow_filesystem_subtree";
 const OUTSIDE_HOME_PHRASE: &str = "ALLOW OUTSIDE HOME";
+const BROAD_SHELL_PHRASE: &str = "ALLOW BROAD SHELL ACCESS";
+const WORKDIR_ATTRIBUTE: &str = "workdir";
+pub const COMMAND_GROUP_PREFIX: &str = "command_";
+pub const COMMAND_EXACT_PREFIX: &str = "command_exact_";
+pub const COMMAND_PATTERN_PREFIX: &str = "command_pattern_";
+const EXACT_COMMAND_CHIP: &str = "this command";
 const INERT_GIT_METADATA: &[&str] = &[
     "COMMIT_EDITMSG",
     "FETCH_HEAD",
@@ -103,10 +109,17 @@ pub struct PermissionResource {
 /// `key` names the ladder and `value` is the part that differs between its
 /// rungs, so a renderer can show one row and move along it without parsing the
 /// varying part back out of the description.
+///
+/// `resource` marks a ladder that speaks for a single resource of the request
+/// rather than for all of it. Those rungs compose: one may be taken from every
+/// such ladder and the chosen constraints merged into one rule. Ladders without
+/// it stay mutually exclusive with everything else.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PermissionOptionGroup {
     pub key: String,
     pub value: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource: Option<usize>,
 }
 
 /// How far an authority reaches beyond what the request was about.
@@ -693,14 +706,10 @@ fn constraint_covers_resource(
         return false;
     }
     constraint.attributes.iter().all(|(name, selector)| {
-        resource.attributes.get(name).is_some_and(|value| {
-            let kind = if name == "workdir" {
-                PermissionResourceKind::Directory
-            } else {
-                PermissionResourceKind::Custom { name: name.clone() }
-            };
-            selector_matches(selector, value, &kind)
-        })
+        resource
+            .attributes
+            .get(name)
+            .is_some_and(|value| selector_matches(selector, value, &attribute_kind(name)))
     })
 }
 
@@ -1593,42 +1602,57 @@ fn is_inert_git_metadata(path: &Path, project: &Path) -> bool {
             .is_some_and(|entry| INERT_GIT_METADATA.contains(&entry.as_str()))
 }
 
+/// The digest a selector pins a value with, falling back to hashing the value
+/// as text when the kind has no canonical form of its own.
+fn pinned_digest(value: &str, kind: &PermissionResourceKind) -> String {
+    resource_value_digest(value, kind)
+        .unwrap_or_else(|| canonical_json_sha256(&Value::String(value.to_owned())))
+}
+
+/// The kind an attribute's value is matched as. One definition, so building a
+/// constraint and testing one agree on what `workdir` means.
+fn attribute_kind(name: &str) -> PermissionResourceKind {
+    if name == WORKDIR_ATTRIBUTE {
+        PermissionResourceKind::Directory
+    } else {
+        PermissionResourceKind::Custom {
+            name: name.to_owned(),
+        }
+    }
+}
+
+/// The constraint that pins one resource to itself, attributes included.
+///
+/// Widening a single resource means taking this and replacing its selector, so
+/// option generation and answer validation both start here.
+fn resource_constraint(resource: &PermissionResource) -> PermissionResourceConstraint {
+    PermissionResourceConstraint {
+        kind: resource.kind.clone(),
+        selector: PermissionResourceSelector::Digest {
+            digest: pinned_digest(&resource.value, &resource.kind),
+        },
+        access: resource.access.clone(),
+        protected: Some(resource.protected),
+        attributes: resource
+            .attributes
+            .iter()
+            .filter(|(name, _)| name.as_str() != NORMALIZED_COMMAND_ATTRIBUTE)
+            .map(|(name, value)| {
+                (
+                    name.clone(),
+                    PermissionResourceSelector::Digest {
+                        digest: pinned_digest(value, &attribute_kind(name)),
+                    },
+                )
+            })
+            .collect(),
+    }
+}
+
 fn exact_resource_constraints(
     resources: &[PermissionResource],
 ) -> Vec<PermissionResourceConstraint> {
-    resources
-        .iter()
-        .map(|resource| PermissionResourceConstraint {
-            kind: resource.kind.clone(),
-            selector: PermissionResourceSelector::Digest {
-                digest: resource_value_digest(&resource.value, &resource.kind).unwrap_or_else(
-                    || canonical_json_sha256(&Value::String(resource.value.clone())),
-                ),
-            },
-            access: resource.access.clone(),
-            protected: Some(resource.protected),
-            attributes: resource
-                .attributes
-                .iter()
-                .filter(|(name, _)| name.as_str() != NORMALIZED_COMMAND_ATTRIBUTE)
-                .map(|(name, value)| {
-                    let kind = if name == "workdir" {
-                        PermissionResourceKind::Directory
-                    } else {
-                        PermissionResourceKind::Custom { name: name.clone() }
-                    };
-                    (
-                        name.clone(),
-                        PermissionResourceSelector::Digest {
-                            digest: resource_value_digest(value, &kind).unwrap_or_else(|| {
-                                canonical_json_sha256(&Value::String(value.clone()))
-                            }),
-                        },
-                    )
-                })
-                .collect(),
-        })
-        .collect()
+    resources.iter().map(resource_constraint).collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1845,17 +1869,12 @@ fn rule_options(
             .iter()
             .all(|resource| resource.kind == PermissionResourceKind::Command)
     {
-        let workdir_label = resources
-            .first()
-            .and_then(|resource| resource.attributes.get("workdir"))
-            .map_or_else(
-                || "this workdir".to_owned(),
-                |workdir| safe_summary(workdir),
-            );
+        let workdir_label = workdir_label(resources.first());
         // Protected commands were reviewed as whole command lines because analysis
         // dropped operands, so only the blanket options below describe them
         // truthfully.
         if resources.iter().all(|resource| !resource.protected) {
+            add_command_options(&mut options, resources, subject, executor, &reusable);
             options.push(option(
                 "allow_exact_commands",
                 if resources.len() == 1 {
@@ -1931,39 +1950,48 @@ fn rule_options(
                 ));
             }
         }
-        if let Some(workdir) = resources
-            .first()
-            .and_then(|resource| resource.attributes.get("workdir"))
-        {
+        // One constraint per distinct workdir. Every attribute of a constraint
+        // must match for it to cover a resource, so pinning only the first
+        // workdir would leave `cd /elsewhere && …` uncoverable and the answer
+        // uncommittable.
+        let workdirs = resources
+            .iter()
+            .filter_map(|resource| resource.attributes.get(WORKDIR_ATTRIBUTE))
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        if !workdirs.is_empty() {
             options.push(option(
                 "allow_commands_in_workdir",
-                "Any command in this workdir",
+                if workdirs.len() == 1 {
+                    "Any command in this workdir"
+                } else {
+                    "Any command in these workdirs"
+                },
                 &format!(
                     "Allow arbitrary commands starting in {}.",
-                    safe_summary(workdir)
+                    listed_commands(workdirs.iter().copied())
                 ),
                 StructuredPermissionEffect::Allow,
-                vec![PermissionResourceConstraint {
-                    kind: PermissionResourceKind::Command,
-                    selector: PermissionResourceSelector::Any,
-                    access: Some(PermissionResourceAccess::Execute),
-                    protected: None,
-                    attributes: BTreeMap::from([(
-                        "workdir".into(),
-                        PermissionResourceSelector::Digest {
-                            digest: resource_value_digest(
-                                workdir,
-                                &PermissionResourceKind::Directory,
-                            )
-                            .expect("workdir has a digest"),
-                        },
-                    )]),
-                }],
+                workdirs
+                    .iter()
+                    .map(|workdir| PermissionResourceConstraint {
+                        kind: PermissionResourceKind::Command,
+                        selector: PermissionResourceSelector::Any,
+                        access: Some(PermissionResourceAccess::Execute),
+                        protected: None,
+                        attributes: BTreeMap::from([(
+                            WORKDIR_ATTRIBUTE.into(),
+                            PermissionResourceSelector::Digest {
+                                digest: pinned_digest(workdir, &PermissionResourceKind::Directory),
+                            },
+                        )]),
+                    })
+                    .collect(),
                 PermissionArgumentConstraint::Unconstrained,
                 reusable.clone(),
                 true,
                 false,
-                Some("ALLOW BROAD SHELL ACCESS"),
+                Some(BROAD_SHELL_PHRASE),
             ));
         }
         options.push(option(
@@ -1982,7 +2010,7 @@ fn rule_options(
             reusable.clone(),
             true,
             false,
-            Some("ALLOW BROAD SHELL ACCESS"),
+            Some(BROAD_SHELL_PHRASE),
         ));
     }
 
@@ -2011,6 +2039,87 @@ fn rule_options(
         ));
     }
     options
+}
+
+/// How a workdir reads in a sentence, or a stand-in when the resource carries
+/// none.
+fn workdir_label(resource: Option<&PermissionResource>) -> String {
+    resource
+        .and_then(|resource| resource.attributes.get(WORKDIR_ATTRIBUTE))
+        .map_or_else(
+            || "this workdir".to_owned(),
+            |workdir| safe_summary(workdir),
+        )
+}
+
+/// One ladder per command, so a request that batches several can be remembered
+/// at a different breadth for each.
+///
+/// The rungs are deliberately narrow: the command itself, and its reusable
+/// prefix when it has one. Anything wider is a claim about the whole request
+/// and stays in the blanket options. Rungs leave the arguments unconstrained
+/// because a composition cannot pin them for one resource and not another.
+fn add_command_options(
+    options: &mut Vec<PermissionRuleOption>,
+    resources: &[PermissionResource],
+    subject: &PermissionSubject,
+    executor: &PermissionExecutorKind,
+    reusable: &[PermissionLifetime],
+) {
+    for (index, resource) in resources.iter().enumerate() {
+        let constraint = resource_constraint(resource);
+        let workdir = workdir_label(Some(resource));
+        let command = safe_summary(&resource.value);
+        let rung = |id: String,
+                    value: &str,
+                    description: String,
+                    selector: PermissionResourceSelector| PermissionRuleOption {
+            id,
+            label: command.clone(),
+            description,
+            rule: StructuredPermissionRule {
+                subject: subject.clone(),
+                executor: executor.clone(),
+                resources: vec![PermissionResourceConstraint {
+                    selector,
+                    ..constraint.clone()
+                }],
+                arguments: PermissionArgumentConstraint::Unconstrained,
+                lifetime: PermissionLifetime::Once,
+                effect: StructuredPermissionEffect::Allow,
+                family: None,
+            },
+            allowed_lifetimes: reusable.to_vec(),
+            broad: true,
+            is_default: false,
+            confirmation: None,
+            group: Some(PermissionOptionGroup {
+                key: format!("{COMMAND_GROUP_PREFIX}{index}"),
+                value: value.to_owned(),
+                resource: Some(index),
+            }),
+            caution: None,
+        };
+        options.push(rung(
+            format!("{COMMAND_EXACT_PREFIX}{index}"),
+            EXACT_COMMAND_CHIP,
+            format!("Allow `{command}` in {workdir} with different timeout or display controls."),
+            constraint.selector.clone(),
+        ));
+        if let Some(pattern) = super::command_pattern::reusable_prefix(&resource.value) {
+            options.push(rung(
+                format!("{COMMAND_PATTERN_PREFIX}{index}"),
+                &pattern,
+                format!(
+                    "Allow commands matching `{}` in {workdir}.",
+                    safe_summary(&pattern)
+                ),
+                PermissionResourceSelector::CommandPattern {
+                    pattern: pattern.clone(),
+                },
+            ));
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2249,6 +2358,7 @@ impl SubtreeLadder<'_> {
             group: Some(PermissionOptionGroup {
                 key: SUBTREE_OPTION_ID.into(),
                 value,
+                resource: None,
             }),
             caution,
         }
@@ -3792,6 +3902,94 @@ mod tests {
             option.description,
             "Allow `cargo test` in /project with different timeout or display controls."
         );
+    }
+
+    #[test]
+    fn each_command_earns_a_ladder_that_speaks_only_for_itself() {
+        let resources = vec![
+            command_resource("git status --short", "/project"),
+            command_resource(r#"printf "%s\n" done"#, "/project"),
+        ];
+        let request = explicit_request(
+            PermissionAuthorityProfile::Shell,
+            resources.clone(),
+            json!({"command": "multiple"}),
+        );
+        let rungs = |index: usize| {
+            request
+                .options
+                .iter()
+                .filter(|option| {
+                    option.group.as_ref().and_then(|group| group.resource) == Some(index)
+                })
+                .collect::<Vec<_>>()
+        };
+        let chips = |index: usize| {
+            rungs(index)
+                .into_iter()
+                .map(|option| {
+                    (
+                        option.id.clone(),
+                        option.group.as_ref().unwrap().value.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            chips(0),
+            [
+                ("command_exact_0".to_owned(), EXACT_COMMAND_CHIP.to_owned()),
+                ("command_pattern_0".to_owned(), "git status *".to_owned()),
+            ]
+        );
+        assert_eq!(
+            chips(1),
+            [("command_exact_1".to_owned(), EXACT_COMMAND_CHIP.to_owned())]
+        );
+        for index in 0..resources.len() {
+            for option in rungs(index) {
+                assert_eq!(
+                    option.group.as_ref().unwrap().key,
+                    format!("command_{index}")
+                );
+                assert_eq!(option.rule.resources.len(), 1);
+                assert!(permission_rule_covers_resource(
+                    &option.rule,
+                    &request,
+                    &resources[index]
+                ));
+                assert!(!permission_rule_covers_resource(
+                    &option.rule,
+                    &request,
+                    &resources[1 - index]
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn blanket_workdir_authority_reaches_every_reviewed_workdir() {
+        let request = explicit_request(
+            PermissionAuthorityProfile::Shell,
+            vec![
+                command_resource("git status", "/project"),
+                command_resource("cargo test", "/other"),
+            ],
+            json!({"command": "multiple"}),
+        );
+        let option = request
+            .options
+            .iter()
+            .find(|option| option.id == "allow_commands_in_workdir")
+            .expect("workdir authority option");
+
+        assert_eq!(option.label, "Any command in these workdirs");
+        assert_eq!(
+            option.description,
+            "Allow arbitrary commands starting in `/other`, `/project`."
+        );
+        assert!(permission_rule_covers_request(&option.rule, &request));
     }
 
     #[test]
