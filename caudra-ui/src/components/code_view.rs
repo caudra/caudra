@@ -7,7 +7,7 @@ use crate::theme;
 
 use super::tool_display::{batch_sigil_style, compact_args_for, compact_sigil_label, header_spans};
 use super::{ToolProgress, is_collapsible};
-use caudra_agent::diff::{DiffLine, DiffSpan, compute_hunks};
+use caudra_agent::diff::{DiffHunk, DiffLine, DiffSpan, compute_hunks};
 use caudra_agent::types::Answer;
 use caudra_agent::types::{TodoItem, TodoStatus};
 use caudra_agent::{
@@ -38,6 +38,11 @@ const QUEUED_ANNOTATION: &str = "queued";
 const UNCONSTRAINED_WIDTH: u16 = 0;
 const GREP_COUNT_SEP: &str = " \u{b7} ";
 const GREP_SUMMARY_INDENT: &str = "  ";
+/// Past this many lines in one hunk, diffing its two sides again costs more
+/// than the grouping it buys, so the wire's own order is drawn instead. A card
+/// is rebuilt on every resize and theme change, so that cost is paid again
+/// each time.
+const MAX_REDIFF_LINES: usize = 4096;
 
 pub(crate) fn instruction_limit(expanded: bool) -> usize {
     if expanded {
@@ -307,66 +312,142 @@ fn hunk_start(line: &str) -> Option<usize> {
         .ok()
 }
 
-/// Widest line number the patch will print, so every gutter lines up.
-fn patch_nr_width(patch: &str) -> usize {
-    let mut width = 1;
-    let mut nr = 0;
-    for line in patch.lines() {
-        match hunk_start(line) {
-            Some(start) => nr = start,
-            None if !line.starts_with('+') => {
-                width = width.max(nr_width(nr));
-                nr += 1;
+/// The side of the file a hunk's body line belongs to. A `\ No newline at end
+/// of file` marker belongs to neither, and a line that lost its leading space
+/// is context rather than a line whose first character is a prefix.
+enum Side<'a> {
+    Before(&'a str),
+    After(&'a str),
+    Both(&'a str),
+    Neither,
+}
+
+fn side(raw: &str) -> Side<'_> {
+    match raw.split_at_checked(1) {
+        Some(("-", text)) => Side::Before(text),
+        Some(("+", text)) => Side::After(text),
+        Some(("\\", _)) => Side::Neither,
+        Some((" ", text)) => Side::Both(text),
+        _ => Side::Both(raw),
+    }
+}
+
+/// One hunk of a unified patch: where its numbering restarts, and the body
+/// lines it describes.
+struct PatchHunk<'a> {
+    before_start: usize,
+    body: Vec<&'a str>,
+}
+
+impl PatchHunk<'_> {
+    /// The last line number the hunk prints, which is what the gutter is sized
+    /// against. Added lines are unnumbered, so only the before side counts.
+    fn before_end(&self) -> usize {
+        let numbered = self
+            .body
+            .iter()
+            .filter(|raw| matches!(side(raw), Side::Before(_) | Side::Both(_)))
+            .count();
+        self.before_start + numbered.saturating_sub(1)
+    }
+
+    /// The two file states the hunk describes, for the diff the card computes
+    /// itself.
+    fn sides(&self) -> (String, String) {
+        let (mut before, mut after) = (String::new(), String::new());
+        let push = |out: &mut String, text: &str| {
+            out.push_str(text);
+            out.push('\n');
+        };
+        for raw in &self.body {
+            match side(raw) {
+                Side::Before(text) => push(&mut before, text),
+                Side::After(text) => push(&mut after, text),
+                Side::Both(text) => {
+                    push(&mut before, text);
+                    push(&mut after, text);
+                }
+                Side::Neither => {}
             }
-            None => {}
+        }
+        (before, after)
+    }
+
+    /// The hunk in the order the wire wrote it, for one too large to diff
+    /// again.
+    fn wire_lines(&self) -> Vec<DiffLine> {
+        let change = |text: &str| {
+            vec![DiffSpan {
+                text: text.to_owned(),
+                emphasized: false,
+            }]
+        };
+        self.body
+            .iter()
+            .filter_map(|raw| match side(raw) {
+                Side::Before(text) => Some(DiffLine::Removed(change(text))),
+                Side::After(text) => Some(DiffLine::Added(change(text))),
+                Side::Both(text) => Some(DiffLine::Unchanged(text.to_owned())),
+                Side::Neither => None,
+            })
+            .collect()
+    }
+}
+
+/// The `---`/`+++` preamble precedes the first header, so a line that starts
+/// the same way inside a hunk is content.
+fn patch_hunks(patch: &str) -> Vec<PatchHunk<'_>> {
+    let mut hunks: Vec<PatchHunk> = Vec::new();
+    for raw in patch.lines() {
+        match hunk_start(raw) {
+            Some(before_start) => hunks.push(PatchHunk {
+                before_start,
+                body: Vec::new(),
+            }),
+            None => {
+                if let Some(hunk) = hunks.last_mut() {
+                    hunk.body.push(raw);
+                }
+            }
         }
     }
-    width
+    hunks
 }
 
 /// A unified diff drawn the way an edit's diff is drawn: real line numbers
-/// down the left, removed and added lines in the diff colours. Syntax
-/// highlighting is left out on purpose, because a hunk carries only its own
-/// context and a highlighter fed that much guesses wrong more than it helps.
+/// down the left, removed and added lines in the diff colours.
+///
+/// The wire's grouping is not trusted. A patch reports what was applied, and an
+/// applied chunk arrives as the whole region it matched followed by the whole
+/// region it produced, which prints every line they share twice. Diffing the
+/// two sides again is what puts each change beside the line it replaces.
+///
+/// Syntax highlighting is left out on purpose, because a hunk carries only its
+/// own context and a highlighter fed that much guesses wrong more than it
+/// helps.
 fn render_unified_patch(patch: &str) -> Vec<Line<'static>> {
-    let theme = theme::current();
-    let width = patch_nr_width(patch);
+    let hunks = patch_hunks(patch);
+    let width = nr_width(hunks.iter().map(PatchHunk::before_end).max().unwrap_or(1));
     let mut lines = Vec::new();
-    let mut line_nr = 0;
-    let mut in_hunk = false;
-    for raw in patch.lines() {
-        if let Some(start) = hunk_start(raw) {
-            if in_hunk {
+    for hunk in &hunks {
+        let groups = if hunk.body.len() > MAX_REDIFF_LINES {
+            vec![DiffHunk {
+                before_start: 1,
+                after_start: 1,
+                lines: hunk.wire_lines(),
+            }]
+        } else {
+            let (before, after) = hunk.sides();
+            compute_hunks(&before, &after)
+        };
+        for group in groups {
+            if !lines.is_empty() {
                 lines.push(gap_ellipsis());
             }
-            (line_nr, in_hunk) = (start, true);
-            continue;
-        }
-        // File headers only precede the first hunk, so a later line starting
-        // the same way is content and keeps its numbering.
-        if !in_hunk {
-            continue;
-        }
-        let (prefix, style, text) = match raw.split_at_checked(1) {
-            Some(("-", rest)) => ("- ", theme.diff_old, rest),
-            Some(("+", rest)) => ("+ ", theme.diff_new, rest),
-            Some((" ", rest)) => ("  ", theme.code_block, rest),
-            _ => ("  ", theme.code_block, raw),
-        };
-        let numbered = prefix != "+ ";
-        let mut spans = vec![if numbered {
-            gutter(&format!("{line_nr:>width$}"))
-        } else {
-            gutter(&" ".repeat(width))
-        }];
-        spans.push(Span::styled(prefix, style.patch(theme.code_block)));
-        spans.push(Span::styled(
-            caudra_highlight::normalize_text(text),
-            style.patch(theme.code_block),
-        ));
-        lines.push(Line::from(spans));
-        if numbered {
-            line_nr += 1;
+            let mut line_nr = hunk.before_start + group.before_start - 1;
+            for dl in &group.lines {
+                lines.push(render_hunk_line(dl, None, &mut line_nr, width));
+            }
         }
     }
     lines
@@ -1557,6 +1638,58 @@ mod tests {
         assert!(
             rendered.contains("++ added text"),
             "content after a hunk header is content: {rendered}"
+        );
+    }
+
+    const BLOCK_PATCH: &str =
+        "@@ -1,4 +1,4 @@\n-alpha\n-beta\n-gamma\n-delta\n+alpha\n+BETA\n+gamma\n+DELTA\n";
+    const INTERLEAVED: &[&str] = &[
+        "1   alpha",
+        "2 - beta",
+        "  + BETA",
+        "3   gamma",
+        "4 - delta",
+        "  + DELTA",
+    ];
+    const INTERLEAVED_MSG: &str =
+        "a change belongs beside the line it replaces, not after the whole region";
+    const NO_NEWLINE_PATCH: &str =
+        "@@ -1,2 +1,2 @@\n keep\n-gone\n\\ No newline at end of file\n+added\n";
+    const NO_NEWLINE_MSG: &str = "the no-newline marker is not a line of either file";
+    const OVERSIZED_MSG: &str = "a hunk too large to diff again is drawn as the wire wrote it";
+
+    /// The rows under the file's heading.
+    fn patch_rows(patch: &str) -> Vec<String> {
+        patch_text(&one_file(patch)).split_off(1)
+    }
+
+    /// An applied chunk arrives as the whole region it matched followed by the
+    /// whole region it produced, which prints every line they share twice.
+    #[test]
+    fn a_block_shaped_hunk_is_diffed_again() {
+        assert_eq!(patch_rows(BLOCK_PATCH), INTERLEAVED, "{INTERLEAVED_MSG}");
+    }
+
+    #[test]
+    fn a_no_newline_marker_costs_no_line_number() {
+        assert_eq!(
+            patch_rows(NO_NEWLINE_PATCH),
+            ["1   keep", "2 - gone", "  + added"],
+            "{NO_NEWLINE_MSG}"
+        );
+    }
+
+    #[test]
+    fn an_oversized_hunk_keeps_the_wire_order() {
+        let half = MAX_REDIFF_LINES / 2 + 1;
+        let removed: String = (0..half).map(|i| format!("-line {i}\n")).collect();
+        let added: String = (0..half).map(|i| format!("+line {i}\n")).collect();
+        let rendered = patch_rows(&format!("@@ -1,{half} +1,{half} @@\n{removed}{added}"));
+        assert_eq!(rendered.len(), half * 2, "{OVERSIZED_MSG}");
+        assert!(
+            rendered[0].ends_with("- line 0") && rendered[half].ends_with("+ line 0"),
+            "{OVERSIZED_MSG}: {:?}",
+            &rendered[..1]
         );
     }
 
