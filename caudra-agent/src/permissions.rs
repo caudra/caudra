@@ -27,6 +27,7 @@ mod command_arity;
 #[allow(dead_code)]
 pub(crate) mod command_pattern;
 mod structured;
+pub use command_pattern::{PatternFault, PatternGrade, grade_command_pattern};
 pub use structured::*;
 
 pub const DEFAULT_DENY_GUIDANCE: &str =

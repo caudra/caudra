@@ -1,5 +1,11 @@
+use thiserror::Error;
+
+use super::structured::{BROAD_SHELL_PHRASE, PermissionCaution};
+
 pub(super) const MAX_PATTERN_TOKENS: usize = 8;
 const MAX_PREFIX_LITERALS: usize = 3;
+const WILDCARD_TOKEN: &str = "*";
+const WILDCARD_SUFFIX: &str = " *";
 
 pub(crate) const BUILTIN_ASK_PATTERNS: &[&str] = &[
     "rm *",
@@ -153,7 +159,7 @@ pub(crate) fn reusable_prefix(command: &str) -> Option<String> {
         return None;
     }
 
-    Some(format!("{} *", literals.join(" ")))
+    Some(format!("{}{WILDCARD_SUFFIX}", literals.join(" ")))
 }
 
 /// A curated entry is a deliberate decision, so it may keep a bare executable or
@@ -186,14 +192,77 @@ fn heuristic_literals(decoded: &[String]) -> Option<&[String]> {
 
 /// A pattern that shares a prefix with an ask family in either direction covers
 /// or is covered by it, and a stored rule silences the ask entirely.
-fn overlaps_builtin_ask(literals: &[String]) -> bool {
+fn overlaps_builtin_ask<S: AsRef<str>>(literals: &[S]) -> bool {
     BUILTIN_ASK_PATTERNS.iter().any(|pattern| {
         pattern
-            .strip_suffix(" *")
+            .strip_suffix(WILDCARD_SUFFIX)
             .unwrap_or(pattern)
             .split_whitespace()
             .zip(literals)
-            .all(|(ask, literal)| ask == literal.as_str())
+            .all(|(ask, literal)| ask == literal.as_ref())
+    })
+}
+
+/// Why a hand-written pattern cannot be granted, phrased for the person typing
+/// it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum PatternFault {
+    #[error("name at least one literal token before the `*`")]
+    Empty,
+    #[error("use at most {} tokens", MAX_PATTERN_TOKENS)]
+    TooManyTokens,
+    #[error("tokens may only contain letters, digits, and . _ / @ : = + -")]
+    NonLiteralToken,
+    #[error("end the pattern with ` *`")]
+    MissingWildcard,
+    #[error("the pattern must match the command on this row")]
+    DoesNotMatch,
+}
+
+/// How far a hand-written pattern reaches, and what it costs to store it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PatternGrade {
+    pub caution: Option<PermissionCaution>,
+    pub confirmation: Option<&'static str>,
+}
+
+/// Judges a pattern a user typed against the command it is being granted for.
+///
+/// `reusable_prefix` decides what Caudra *suggests* and stays conservative.
+/// This decides what Caudra *accepts*, so it admits shapes the suggestion
+/// refuses and grades them instead. Requiring the pattern to match the reviewed
+/// command is the containment: a prompt about `rg` cannot be turned into a
+/// grant for `sed`.
+///
+/// A single literal is graded gravest. `sed *` or `python *` is every
+/// invocation of an interpreter, which is arbitrary execution wearing one name.
+pub fn grade_command_pattern(pattern: &str, command: &str) -> Result<PatternGrade, PatternFault> {
+    let mut literals: Vec<&str> = pattern.split_whitespace().collect();
+    if literals.len() > MAX_PATTERN_TOKENS {
+        return Err(PatternFault::TooManyTokens);
+    }
+    if literals.pop() != Some(WILDCARD_TOKEN) {
+        return Err(PatternFault::MissingWildcard);
+    }
+    if literals.is_empty() {
+        return Err(PatternFault::Empty);
+    }
+    if !literals.iter().all(|token| is_pattern_literal(token)) {
+        return Err(PatternFault::NonLiteralToken);
+    }
+    if !matches(pattern, command) {
+        return Err(PatternFault::DoesNotMatch);
+    }
+    let caution = if literals.len() == 1 {
+        Some(PermissionCaution::Danger)
+    } else if overlaps_builtin_ask(&literals) {
+        Some(PermissionCaution::Warn)
+    } else {
+        None
+    };
+    Ok(PatternGrade {
+        caution,
+        confirmation: (caution == Some(PermissionCaution::Danger)).then_some(BROAD_SHELL_PHRASE),
     })
 }
 
@@ -316,9 +385,45 @@ mod tests {
     use test_case::test_case;
 
     use super::{
-        BUILTIN_ALLOW_PATTERNS, BUILTIN_ASK_PATTERNS, builtin_allowed, matches, reusable_prefix,
-        specificity, tokenize,
+        BROAD_SHELL_PHRASE, BUILTIN_ALLOW_PATTERNS, BUILTIN_ASK_PATTERNS, PatternFault,
+        PatternGrade, PermissionCaution, builtin_allowed, grade_command_pattern, matches,
+        reusable_prefix, specificity, tokenize,
     };
+
+    const SED_SLICE: &str = "sed -n 1,140p src/main.rs";
+
+    #[test_case("sed -n *", SED_SLICE, None ; "flag_prefix_is_plain")]
+    #[test_case("sed *", SED_SLICE, Some(PermissionCaution::Danger) ; "bare_executable_is_grave")]
+    #[test_case("git push *", "git push origin main", Some(PermissionCaution::Warn) ; "ask_family_only_warns")]
+    #[test_case("rm *", "rm -rf build", Some(PermissionCaution::Danger) ; "bare_ask_family_is_grave")]
+    fn a_typed_pattern_is_graded_by_how_much_it_reaches(
+        pattern: &str,
+        command: &str,
+        caution: Option<PermissionCaution>,
+    ) {
+        assert_eq!(
+            grade_command_pattern(pattern, command),
+            Ok(PatternGrade {
+                caution,
+                confirmation: (caution == Some(PermissionCaution::Danger))
+                    .then_some(BROAD_SHELL_PHRASE),
+            })
+        );
+    }
+
+    #[test_case("rg *", SED_SLICE, PatternFault::DoesNotMatch ; "another_command")]
+    #[test_case("sed -n", SED_SLICE, PatternFault::MissingWildcard ; "no_wildcard")]
+    #[test_case("*", SED_SLICE, PatternFault::Empty ; "wildcard_alone")]
+    #[test_case("", SED_SLICE, PatternFault::MissingWildcard ; "nothing_typed")]
+    #[test_case("sed -n '1,140p' *", SED_SLICE, PatternFault::NonLiteralToken ; "quoted_token")]
+    #[test_case("a b c d e f g h i *", SED_SLICE, PatternFault::TooManyTokens ; "past_the_token_cap")]
+    fn a_typed_pattern_is_refused_with_the_reason_to_show(
+        pattern: &str,
+        command: &str,
+        fault: PatternFault,
+    ) {
+        assert_eq!(grade_command_pattern(pattern, command), Err(fault));
+    }
 
     #[test]
     fn tokenize_preserves_source_spelling() {
