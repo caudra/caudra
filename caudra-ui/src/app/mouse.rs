@@ -2,6 +2,7 @@ use std::time::{Duration, Instant};
 
 use crate::clipboard::CopyResult;
 use crate::components::Overlay;
+use crate::components::input::InputHit;
 use crate::components::permission_prompt::PromptMouse;
 use crate::components::queue_panel::{QueueAction, QueueHit, QueueHitTarget};
 use crate::components::status_bar::{StatusBarHit, StatusBarHitTarget};
@@ -208,6 +209,12 @@ impl App {
                 self.clear_control_hovers();
                 return actions;
             }
+        } else if self.mention_popup.is_open() {
+            let action = self.mention_popup.handle_mouse(event);
+            if let Some(actions) = self.handle_mention_action(action) {
+                self.clear_control_hovers();
+                return actions;
+            }
         }
         // Docked and not modal, so it is asked last and only acts on what it
         // drew: a drag that selected text releases as a selection rather than
@@ -284,16 +291,26 @@ impl App {
                     // Move the cursor to the click position in the input area.
                     if zone.zone == SelectionZone::Input {
                         let focused = !self.any_overlay_open();
-                        let paste = self.active_input_box_mut().handle_click(
+                        let hit = self.active_input_box_mut().handle_click(
                             zone.area,
                             event.row,
                             event.column,
                             focused,
                         );
-                        if let Some(id) = paste {
-                            self.selection_state = None;
-                            self.open_paste_editor(id);
-                            return Vec::new();
+                        match hit {
+                            Some(InputHit::Paste(id)) => {
+                                self.selection_state = None;
+                                self.open_paste_editor(id);
+                                return Vec::new();
+                            }
+                            Some(InputHit::Mention { mention, .. }) => {
+                                self.selection_state = None;
+                                self.open_workbench_at(&mention);
+                                return Vec::new();
+                            }
+                            // The caret moved, so the `@` popup has to decide
+                            // again whether it is still inside its query.
+                            None => self.resync_dropdowns(),
                         }
                     }
                     if zone.zone == SelectionZone::Messages
@@ -897,7 +914,7 @@ impl App {
         if let Some(area) = input_area {
             let focused = !self.any_overlay_open();
             self.active_input_box_mut()
-                .update_paste_hover(area, row, col, focused);
+                .update_hover(area, row, col, focused);
         }
     }
 

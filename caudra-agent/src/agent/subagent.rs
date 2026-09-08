@@ -325,6 +325,7 @@ impl Subagent {
                 message,
                 mode: self.mode.clone(),
                 images: Vec::new(),
+                mentions: Vec::new(),
                 preamble: Vec::new(),
                 thinking: self.thinking.clone(),
                 fast: self.fast,

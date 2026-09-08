@@ -44,6 +44,30 @@ The left column is the fixed overhead of every single request, so Caudra keeps i
 
 The `/context` views report what currently contributes without loading deferred material to size it. Large MCP installations contribute a compact `tool_search` catalog until the agent selects full definitions. Memory contributes its tag index and skills contribute their names and descriptions. A memory or skill body enters the transcript only when its tool reads it. These loads belong to the Main or task context that requested them.
 
+## Mention a file with @
+
+Typing `@` in the composer opens a path completion popup drawn from the same project walk as the file picker, so it honours your ignore rules and skips `.git`. Arrow keys move, Enter picks, Tab drills into a directory, Esc dismisses. You can also type the path yourself. The pointer works the same way: moving over a row marks it, the wheel walks the list, and a click takes the row under it, drilling into a directory the way `Tab` does.
+
+A mention names a file, and optionally a line range:
+
+| Written | Sent to the model |
+|---------|-------------------|
+| `@src/main.rs` | The whole file |
+| `@src/main.rs:L42` | Line 42 |
+| `@src/main.rs:L42-L88` | Lines 42 to 88 |
+| `@src/` | A listing of the directory |
+| `@"my notes.md"` | Quote a path that contains spaces |
+
+At send time Caudra reads each mentioned file and puts the contents in the request ahead of your message, so the model has them without spending a turn on `file_read`. The reading goes through `file_read` itself, so truncation limits, binary detection and line numbering match what the model sees when it calls the tool. An image lands as a real image when the model supports vision. A file that is missing, binary or past the per-turn budget is reported to the model as a short note rather than silently omitted.
+
+The transcript keeps the short `@src/main.rs:L42-L88` you typed. Contents are read once, when you send, so a later turn sees what the file said at that moment.
+
+A mention only resolves when the path exists in your working directory. That is what keeps `@dataclass`, `@media` and an email address from being treated as files.
+
+Caudra records a whole-file mention as a read, so a later edit is blocked if the file changed in between. A line range is not recorded, because seeing part of a file is not enough to edit the rest of it safely.
+
+A mention marks itself as the pointer passes over it, the way a paste label does. Click it to open the file in the [workbench](/docs/workbench/), scrolled to the lines it names. `Ctrl+X Enter` in the workbench goes the other way, sending the file and the selected lines to the composer as a mention.
+
 ## Instruction files
 
 At session start Caudra walks from the project git root down to the working directory (no `.git` root, only the cwd). In each directory it loads **one** project instruction file, first match wins:

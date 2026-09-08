@@ -1829,6 +1829,7 @@ impl<'t> EventLoop<'t> {
         let msg = QueuedMessage {
             text,
             images: Vec::new(),
+            mentions: Vec::new(),
             paste_ranges: Vec::new(),
         };
         match self.sessions[idx]
@@ -2211,7 +2212,7 @@ impl<'t> EventLoop<'t> {
                     text: input.message.clone(),
                     image_count: input.images.len(),
                     paste_ranges: Vec::new(),
-                    input,
+                    input: Box::new(input),
                     run_id,
                     admission: caudra_agent::PromptAdmission::Queue,
                     displayed: true,

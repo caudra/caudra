@@ -7,7 +7,7 @@ use crate::components::command::{BUILTIN_COMMANDS, CommandPalette, ParsedCommand
 use crate::components::context_modal::{
     EXPANDED_TITLE as CONTEXT_EXPANDED_TITLE, TITLE as CONTEXT_TITLE,
 };
-use crate::components::file_picker::UNREADABLE_DIR_MSG;
+use crate::components::file_walk::UNREADABLE_DIR_MSG;
 use crate::components::keybindings::{Bind, KeybindContext, key as kb, leader as chord};
 use crate::components::queue_panel::{QueueAction, QueueHitTarget};
 use crate::components::rewind_picker::RewindEntry;
@@ -67,6 +67,12 @@ const WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const TEST_PROVIDER: &str = "anthropic";
 const SNAPSHOT_ERR: &str = "snapshot store lock is poisoned";
 const ARMING_LEADER_IS_INERT_MSG: &str = "arming the leader waits for a second key, it never acts";
+const MENTION_POPUP_CLOSED: &str = "typing @ over a matching path must open the popup";
+const MENTION_POPUP_LINGERED: &str = "choosing a file must close the popup";
+const MENTION_ROW_MISSING: &str = "the popup drew no row for the path under test";
+const MENTION_UNRESOLVED: &str = "a completed path must resolve to a mention";
+const MENTION_DROPPED_A_PASTE: &str =
+    "completing a mention must splice a range, not replace the buffer";
 const OTHER_PROVIDER: &str = "openrouter";
 const LEDGER_PROVIDER: &str = "anthropic";
 const LEDGER_MODEL: &str = "claude-opus-5";
@@ -1310,6 +1316,7 @@ fn queued_msg(text: &str) -> QueuedMessage {
     QueuedMessage {
         text: text.into(),
         images: vec![],
+        mentions: Vec::new(),
         paste_ranges: Vec::new(),
     }
 }
@@ -5759,6 +5766,7 @@ fn checkpoint_persists_queued_submission_images_and_paste_ranges() {
         Submission {
             text: QUEUED_TEXT.into(),
             images: vec![image],
+            mentions: Vec::new(),
             draft: InputDraft {
                 text: draft_text.clone(),
                 paste_ranges: std::iter::once(0..draft_text.len()).collect(),
@@ -7170,6 +7178,7 @@ fn run_snapshots_are_complete_and_associated_with_atomic_heads() {
     let actions = app.start_from_queue(&QueuedMessage {
         text: "next prompt".into(),
         images: Vec::new(),
+        mentions: Vec::new(),
         paste_ranges: Vec::new(),
     });
     let actions = settle_snapshot(&mut app, actions);
@@ -10654,6 +10663,7 @@ fn workflow_toggle_flows_into_agent_input() {
     let msg = QueuedMessage {
         text: "hi".into(),
         images: Vec::new(),
+        mentions: Vec::new(),
         paste_ranges: Vec::new(),
     };
     assert!(!app.build_agent_input(&msg).workflow);
@@ -11977,6 +11987,116 @@ fn turn_end_keeps_only_the_subagents_that_finished() {
         .map(|sa| sa.tool_use_id.as_str())
         .collect();
     assert_eq!(ids, [FINISHED_TASK_ID]);
+}
+
+/// The popup is fed by a walker thread, so a test settles it before asserting
+/// on what it matched.
+fn mention_popup_at(app: &mut App, cwd: &std::path::Path, query: &str) {
+    let store = App::snapshot_store_for(&app.storage, app.state.session.id, cwd)
+        .expect("a snapshot store for the project");
+    app.install_working_directory(cwd, store, PermissionsConfig::default());
+    for character in query.chars() {
+        app.update(Msg::Key(key(KeyCode::Char(character))));
+    }
+    app.mention_popup.settle();
+}
+
+#[test]
+fn typing_an_at_sigil_opens_the_mention_popup_and_completing_splices_in_place() {
+    let dir = TempDir::new().expect("a temporary directory");
+    std::fs::write(dir.path().join("target.rs"), "body\n").expect("a file");
+    let mut app = test_app();
+
+    mention_popup_at(&mut app, dir.path(), "see @targ");
+    assert!(app.mention_popup.is_open(), "{MENTION_POPUP_CLOSED}");
+
+    app.update(Msg::Key(key(KeyCode::Enter)));
+
+    assert_eq!(app.input_box.buffer.display_text(), "see @target.rs");
+    assert!(!app.mention_popup.is_open(), "{MENTION_POPUP_LINGERED}");
+    let mentions = app.input_box.mentions();
+    assert_eq!(mentions.len(), 1, "{MENTION_UNRESOLVED}");
+    assert_eq!(mentions[0].1.path, std::path::PathBuf::from("target.rs"));
+}
+
+/// Where `needle` was drawn, so a test can press the row the reader sees.
+fn screen_hit(app: &mut App, needle: &str) -> (u16, u16) {
+    let backend = ratatui::backend::TestBackend::new(TEST_AREA.width, TEST_AREA.height);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal.draw(|frame| app.view(frame)).unwrap();
+    let buffer = terminal.backend().buffer().clone();
+    (buffer.area.y..buffer.area.bottom())
+        .find_map(|row| {
+            let line: String = (buffer.area.x..buffer.area.right())
+                .map(|column| buffer[(column, row)].symbol())
+                .collect();
+            line.find(needle).map(|column| (row, column as u16))
+        })
+        .expect(MENTION_ROW_MISSING)
+}
+
+#[test]
+fn clicking_a_popup_row_completes_the_mention_it_shows() {
+    let dir = TempDir::new().expect("a temporary directory");
+    std::fs::write(dir.path().join("target.rs"), "body\n").expect("a file");
+    let mut app = test_app();
+
+    mention_popup_at(&mut app, dir.path(), "see @targ");
+    let (row, column) = screen_hit(&mut app, "target.rs");
+
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        column,
+        row,
+    ));
+    app.update(mouse_event(
+        MouseEventKind::Up(MouseButton::Left),
+        column,
+        row,
+    ));
+
+    assert_eq!(app.input_box.buffer.display_text(), "see @target.rs");
+    assert!(!app.mention_popup.is_open(), "{MENTION_POPUP_LINGERED}");
+}
+
+/// Clicking away moves the caret out of the query, and the popup has no
+/// business outliving it.
+#[test]
+fn clicking_the_composer_closes_the_mention_popup() {
+    let dir = TempDir::new().expect("a temporary directory");
+    std::fs::write(dir.path().join("target.rs"), "body\n").expect("a file");
+    let mut app = test_app();
+
+    mention_popup_at(&mut app, dir.path(), "see @targ");
+    let (row, column) = screen_hit(&mut app, "see @targ");
+
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        column,
+        row,
+    ));
+
+    assert!(!app.mention_popup.is_open(), "{MENTION_POPUP_LINGERED}");
+}
+
+#[test]
+fn completing_a_mention_leaves_an_earlier_paste_token_intact() {
+    let dir = TempDir::new().expect("a temporary directory");
+    std::fs::write(dir.path().join("target.rs"), "body\n").expect("a file");
+    let mut app = test_app();
+    app.input_box.handle_paste("one\ntwo\nthree");
+
+    mention_popup_at(&mut app, dir.path(), "@targ");
+    app.update(Msg::Key(key(KeyCode::Enter)));
+
+    assert!(app.input_box.has_pastes(), "{MENTION_DROPPED_A_PASTE}");
+    assert!(
+        app.input_box
+            .buffer
+            .expanded_text()
+            .contains("one\ntwo\nthree")
+    );
+    assert!(app.input_box.buffer.display_text().ends_with("@target.rs"));
 }
 
 #[test]

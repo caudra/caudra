@@ -743,6 +743,7 @@ impl App {
             QueuedMessage {
                 text: item.text.clone(),
                 images: Vec::new(),
+                mentions: Vec::new(),
                 paste_ranges: Vec::new(),
             },
             PromptAdmission::Queue,
@@ -864,6 +865,7 @@ impl App {
         let msg = QueuedMessage {
             text: condition.to_owned(),
             images: Vec::new(),
+            mentions: Vec::new(),
             paste_ranges: Vec::new(),
         };
         let mut input = self.build_agent_input(&msg);
@@ -879,7 +881,7 @@ impl App {
                 text: msg.text,
                 image_count: 0,
                 paste_ranges: msg.paste_ranges,
-                input,
+                input: Box::new(input),
                 run_id: self.run_id,
                 admission: PromptAdmission::Queue,
                 displayed: false,
@@ -911,7 +913,7 @@ impl App {
             text: msg.text,
             image_count: msg.images.len(),
             paste_ranges: msg.paste_ranges,
-            input,
+            input: Box::new(input),
             run_id: self.run_id,
             admission,
             displayed: false,
@@ -928,7 +930,7 @@ impl App {
             text: msg.text,
             image_count: msg.images.len(),
             paste_ranges: msg.paste_ranges,
-            input,
+            input: Box::new(input),
             run_id: self.run_id,
             admission: PromptAdmission::Interrupt,
             displayed: false,
@@ -1021,6 +1023,7 @@ impl App {
                 .collect();
             self.queue_with_admission(
                 QueuedMessage {
+                    mentions: self.scan_mentions(&prompt.text),
                     text: prompt.text,
                     images,
                     paste_ranges: prompt
@@ -1094,6 +1097,7 @@ impl App {
         let mut input = self.build_agent_input(&QueuedMessage {
             text: String::new(),
             images: Vec::new(),
+            mentions: Vec::new(),
             paste_ranges: Vec::new(),
         });
         input.preamble = preamble;
@@ -1108,6 +1112,7 @@ impl App {
         let mut input = self.build_agent_input(&QueuedMessage {
             text: String::new(),
             images: Vec::new(),
+            mentions: Vec::new(),
             paste_ranges: Vec::new(),
         });
         input.preamble.push(caudra_providers::Message::synthetic(

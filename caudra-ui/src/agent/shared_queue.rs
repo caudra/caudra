@@ -13,7 +13,8 @@ use std::sync::{Arc, Mutex};
 
 use caudra_agent::{
     AgentInput, EditableQueue, EditableQueueReceiver, ExtractedCommand, ImageSource,
-    InterruptSource, PromptAdmission, QueueDelivery, QueueItemId, QueuedInterrupt, editable_queue,
+    InterruptSource, Mention, PromptAdmission, QueueDelivery, QueueItemId, QueuedInterrupt,
+    editable_queue,
 };
 
 use crate::components::input::{InputState, Submission};
@@ -26,6 +27,7 @@ const COMPACT_LABEL: &str = "/compact";
 pub(crate) struct QueuedMessage {
     pub(crate) text: String,
     pub(crate) images: Vec<ImageSource>,
+    pub(crate) mentions: Vec<Mention>,
     pub(crate) paste_ranges: Vec<Range<usize>>,
 }
 
@@ -54,6 +56,7 @@ impl From<Submission> for QueuedMessage {
         Self {
             text: sub.text,
             images: sub.images,
+            mentions: sub.mentions,
             paste_ranges,
         }
     }
@@ -64,7 +67,9 @@ pub(crate) enum QueueItem {
         text: String,
         image_count: usize,
         paste_ranges: Vec<Range<usize>>,
-        input: AgentInput,
+        /// Boxed to keep the queue's cheap `Compact` variant from carrying a
+        /// whole agent request's worth of padding.
+        input: Box<AgentInput>,
         run_id: u64,
         admission: PromptAdmission,
         /// `true` when the UI already drew the bubble (immediate dispatch).
@@ -150,7 +155,7 @@ impl QueueItem {
 
     fn into_extracted_command(self, id: QueueItemId) -> ExtractedCommand {
         match self {
-            Self::Message { input, run_id, .. } => ExtractedCommand::Interrupt(input, run_id, id),
+            Self::Message { input, run_id, .. } => ExtractedCommand::Interrupt(*input, run_id, id),
             Self::Compact { run_id } => ExtractedCommand::Compact(run_id),
         }
     }
@@ -594,9 +599,11 @@ impl InterruptSource for QueueReceiver {
                 claimed
                     .into_iter()
                     .filter_map(|(id, item)| match item {
-                        QueueItem::Message { input, run_id, .. } => {
-                            Some(QueuedInterrupt { id, input, run_id })
-                        }
+                        QueueItem::Message { input, run_id, .. } => Some(QueuedInterrupt {
+                            id,
+                            input: *input,
+                            run_id,
+                        }),
                         QueueItem::Compact { .. } => None,
                     })
                     .collect(),
@@ -621,16 +628,17 @@ mod tests {
             text: "t".into(),
             image_count: 0,
             paste_ranges: Vec::new(),
-            input: AgentInput {
+            input: Box::new(AgentInput {
                 message: String::new(),
                 mode: Default::default(),
                 images: Vec::new(),
+                mentions: Vec::new(),
                 preamble: Vec::new(),
                 thinking: Default::default(),
                 fast: false,
                 workflow: false,
                 prompt: None,
-            },
+            }),
             run_id: 0,
             admission: PromptAdmission::Queue,
             displayed,
@@ -649,6 +657,7 @@ mod tests {
         let message = QueuedMessage::from(Submission {
             text: PADDED_DRAFT.trim().into(),
             images: Vec::new(),
+            mentions: Vec::new(),
             draft: InputDraft {
                 text: PADDED_DRAFT.into(),
                 paste_ranges: vec![range],

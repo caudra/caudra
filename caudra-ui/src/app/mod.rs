@@ -45,6 +45,7 @@ use crate::components::login_picker::{LoginPicker, LoginPickerAction};
 use crate::components::lua_float::FloatManager;
 use crate::components::mcp_picker::{McpPicker, McpPickerAction};
 use crate::components::memory_picker::MemoryPicker;
+use crate::components::mention_popup::{MentionAction, MentionPopup};
 use crate::components::message_actions::{MessageActionKind, MessageActions, MessageActionsAction};
 use crate::components::messages::MessageActionTarget;
 use crate::components::model_picker::{ModelPicker, ModelPickerAction};
@@ -80,6 +81,7 @@ use crate::repaint::{Cadence, Dirty, Watch};
 use crate::selection::{SelectionState, SelectionZone, ZoneRegistry};
 use arc_swap::{ArcSwap, ArcSwapOption};
 use caudra_agent::context::{ContextKey, ContextSnapshot, ContextStore};
+use caudra_agent::mentions;
 use caudra_agent::permissions::{
     PermissionAnswer, PermissionManager, PermissionPolicyError, RevokedRuleScope,
 };
@@ -87,7 +89,8 @@ use caudra_agent::prompt::profile::PromptProfileCatalog;
 use caudra_agent::snapshots::{SESSION_SNAPSHOTS_DIR, SnapshotError, SnapshotStore, workspace_key};
 use caudra_agent::{
     AgentEvent, AgentInput, AgentMode, Envelope, GoalVerdict, ImageSource, McpConfigErrors,
-    McpPromptInfo, McpSnapshotReader, QueueItemId, SharedHistory, SteeringQueue, SubagentInfo,
+    McpPromptInfo, McpSnapshotReader, Mention, QueueItemId, SharedHistory, SteeringQueue,
+    SubagentInfo,
 };
 use caudra_config::{ModelPolicy, PermissionsConfig, UiConfig};
 use caudra_lua::{
@@ -286,6 +289,7 @@ pub struct App {
     pub(super) float_mgr: FloatManager,
     pub(super) search_modal: SearchModal,
     pub(super) file_picker: FilePickerModal,
+    pub(super) mention_popup: MentionPopup,
     pub(super) paste_editor: PasteEditor,
     pub(super) permission_prompt: PermissionPrompt,
     pub(super) permissions_picker: PermissionsPicker,
@@ -481,6 +485,7 @@ impl App {
             float_mgr: FloatManager::new(),
             search_modal: SearchModal::new(),
             file_picker: FilePickerModal::new(),
+            mention_popup: MentionPopup::new(),
             paste_editor: PasteEditor::new(),
             permission_prompt: PermissionPrompt::new(),
             permissions_picker: PermissionsPicker::new(),
@@ -571,6 +576,7 @@ impl App {
                 .collect(),
         );
         app.chats[0].context_window = app.state.model.context_window;
+        app.sync_composer_cwd();
         app
     }
 
@@ -676,9 +682,42 @@ impl App {
         self.command_palette.sync(text, task_focused);
     }
 
-    fn resync_command_palette(&mut self) {
+    fn resync_dropdowns(&mut self) {
+        let text = self.active_input_box().palette_text();
+        self.sync_dropdowns(&text);
+    }
+
+    /// Every edit to the composer reaches both dropdowns through here, so the
+    /// `@` popup can never be left open over text that moved on without it.
+    fn sync_dropdowns(&mut self, palette_text: &str) {
+        self.sync_command_palette(palette_text);
+        let cwd = self.state.session.cwd.clone();
+        let input = self.active_input_box();
+        let (text, cursor) = (input.buffer.display_text(), input.buffer.cursor_offset());
+        self.mention_popup.sync(&text, cursor, &cwd);
+    }
+
+    /// Splices a completed path over the `@query` that opened the popup. The
+    /// palette is resynced but the popup is not: it has already decided whether
+    /// to stay open for a directory the reader is still drilling into.
+    fn complete_mention(&mut self, range: std::ops::Range<usize>, path: &str) {
+        let input = self.active_input_box_mut();
+        input.buffer.replace_range(range, path);
         let text = self.active_input_box().palette_text();
         self.sync_command_palette(&text);
+    }
+
+    /// `None` means the popup did not want the event, so the composer still
+    /// gets its turn at it.
+    fn handle_mention_action(&mut self, action: MentionAction) -> Option<Vec<Action>> {
+        match action {
+            MentionAction::Consumed => Some(Vec::new()),
+            MentionAction::Insert { range, path } => {
+                self.complete_mention(range, &path);
+                Some(Vec::new())
+            }
+            MentionAction::Passthrough => None,
+        }
     }
 
     fn sync_subagent_input_target(&mut self) {
@@ -703,7 +742,7 @@ impl App {
         self.subagent_input_task = next;
         // Runs on every chat switch, so this is the single point that stops a
         // dropdown opened over one composer from surviving into another.
-        self.resync_command_palette();
+        self.resync_dropdowns();
     }
 
     fn plan_form_active(&self) -> bool {
@@ -1038,6 +1077,10 @@ impl App {
             self.command_palette.scroll(delta);
             return None;
         }
+        if self.mention_popup.contains(pos) {
+            self.mention_popup.scroll(delta);
+            return None;
+        }
         let zone = self.zone_at(row, column)?.zone;
         self.scroll_zone(zone, delta);
         Some(zone)
@@ -1136,7 +1179,7 @@ impl App {
                     if self.active_input_target() == Some(target)
                         && self.active_input_box_mut().update_paste(id, &text)
                     {
-                        self.resync_command_palette();
+                        self.resync_dropdowns();
                     }
                     self.paste_editor.close();
                 }
@@ -1442,12 +1485,13 @@ impl App {
                 };
                 self.status_bar.flash(message);
             }
-            WorkbenchAction::SendToComposer(text) => {
+            WorkbenchAction::SendToComposer { path, lines } => {
                 self.workbench.close();
+                let text = mentions::format(&path, lines.as_ref());
                 if let InputAction::PaletteSync(val) =
                     self.active_input_box_mut().handle_paste_with_spaces(&text)
                 {
-                    self.sync_command_palette(&val);
+                    self.sync_dropdowns(&val);
                 }
             }
         }
@@ -1462,7 +1506,7 @@ impl App {
                 if let InputAction::PaletteSync(val) =
                     self.active_input_box_mut().handle_paste_with_spaces(&path)
                 {
-                    self.sync_command_palette(&val);
+                    self.sync_dropdowns(&val);
                 }
             }
             FilePickerModalAction::Close => self.file_picker.close(),
@@ -1818,6 +1862,16 @@ impl App {
         self.workbench_layout = Some(layout);
     }
 
+    /// Where a click on a mention lands, from the composer or the transcript.
+    /// The stored layout is skipped: the reader asked for one file, and opening
+    /// a session's worth of tabs around it would bury the answer.
+    pub(crate) fn open_workbench_at(&mut self, mention: &Mention) {
+        self.sync_workbench_theme();
+        let cwd = PathBuf::from(&self.state.session.cwd);
+        self.workbench
+            .open_at(&cwd, &mention.path, mention.lines.clone());
+    }
+
     /// The workbench paints from a palette resolved once, so a theme change
     /// while it is open has to be handed over rather than read mid render.
     fn sync_workbench_theme(&mut self) {
@@ -2026,7 +2080,7 @@ impl App {
                 vec![]
             }
             InputAction::PaletteSync(val) => {
-                self.sync_command_palette(&val);
+                self.sync_dropdowns(&val);
                 vec![]
             }
             InputAction::Passthrough(key) => match key.code {
@@ -2067,7 +2121,7 @@ impl App {
         if key.code == KeyCode::Char('v') && self.image_paste_rx.is_empty() {
             self.start_image_paste();
         } else if let InputAction::PaletteSync(val) = self.active_input_box_mut().handle_key(key) {
-            self.sync_command_palette(&val);
+            self.sync_dropdowns(&val);
         }
         vec![]
     }
@@ -2095,9 +2149,10 @@ impl App {
         let Submission {
             text,
             images,
+            mentions,
             draft,
         } = sub;
-        self.steer_task(&task_id, text, images, draft)
+        self.steer_task(&task_id, text, images, mentions, draft)
     }
 
     /// The one place a steer reaches a running task, shared by the composer
@@ -2109,6 +2164,7 @@ impl App {
         task_id: &str,
         text: String,
         images: Vec<ImageSource>,
+        mentions: Vec<Mention>,
         draft: InputDraft,
     ) -> Vec<Action> {
         let Some(tx) = self.subagent_steers.get(task_id) else {
@@ -2119,6 +2175,7 @@ impl App {
             message: text.clone(),
             mode: AgentMode::Build,
             images,
+            mentions,
             preamble: Vec::new(),
             thinking: self.state.thinking.clone(),
             fast: self.state.fast,
@@ -2235,6 +2292,11 @@ impl App {
             return vec![];
         }
 
+        let mention_action = self.mention_popup.handle_key(key);
+        if let Some(actions) = self.handle_mention_action(mention_action) {
+            return actions;
+        }
+
         let command_action = self
             .command_palette
             .handle_key(key, &self.input_box.buffer.value());
@@ -2262,7 +2324,7 @@ impl App {
                 vec![]
             }
             InputAction::PaletteSync(val) => {
-                self.sync_command_palette(&val);
+                self.sync_dropdowns(&val);
                 vec![]
             }
             InputAction::Passthrough(key) => {
@@ -3397,6 +3459,7 @@ impl App {
         let mut input = self.build_agent_input(&QueuedMessage {
             text: display_text.clone(),
             images: Vec::new(),
+            mentions: Vec::new(),
             paste_ranges: Vec::new(),
         });
         input.prompt = Some(Box::new(prompt_ref));
@@ -3442,14 +3505,16 @@ impl App {
             return vec![];
         };
         let text = cmd.render(args);
+        let mentions = self.scan_mentions(&text);
         if let Some(task_id) = self.active_subagent_id().map(str::to_owned)
             && self.subagent_steers.contains_key(&task_id)
         {
-            return self.steer_task(&task_id, text, Vec::new(), InputDraft::default());
+            return self.steer_task(&task_id, text, Vec::new(), mentions, InputDraft::default());
         }
         self.submit_or_queue(QueuedMessage {
             text,
             images: Vec::new(),
+            mentions,
             paste_ranges: Vec::new(),
         })
     }
@@ -3498,6 +3563,15 @@ impl App {
             .set_cwd(cwd.to_string_lossy().into_owned());
         self.snapshot_store = snapshot_store;
         self.status_bar.refresh_cwd();
+        self.sync_composer_cwd();
+    }
+
+    /// Points both composers at the session's working directory, which is what
+    /// decides whether an `@path` resolves to a file or stays prose.
+    fn sync_composer_cwd(&mut self) {
+        let cwd = PathBuf::from(&self.state.session.cwd);
+        self.input_box.set_cwd(cwd.clone());
+        self.subagent_input_box.set_cwd(cwd);
     }
 
     fn overlays(&self) -> [&dyn Overlay; 28] {
@@ -3691,6 +3765,7 @@ impl App {
             | self.poll_context_snapshot()
             | self.hints.poll(self.hint_reader.load_full())
             | self.tick_file_picker()
+            | self.mention_popup.tick()
             | self.refresh_memory_picker_if_stale()
             | self.refresh_session_picker()
             | self.tick_workbench()
@@ -3942,7 +4017,7 @@ impl App {
             return;
         }
         if let InputAction::PaletteSync(val) = self.active_input_box_mut().handle_paste(text) {
-            self.sync_command_palette(&val);
+            self.sync_dropdowns(&val);
         }
     }
 
@@ -3980,7 +4055,7 @@ impl App {
         let input = self.active_input_box_mut();
         input.set_input(edited);
         input.move_to_end();
-        self.resync_command_palette();
+        self.resync_dropdowns();
     }
 
     fn handle_plan_form_action(&mut self, action: PlanFormAction) -> Vec<Action> {
@@ -4036,6 +4111,7 @@ impl App {
         let msg = QueuedMessage {
             text,
             images: vec![],
+            mentions: Vec::new(),
             paste_ranges: Vec::new(),
         };
         actions.extend(self.start_from_queue(&msg));

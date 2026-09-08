@@ -325,6 +325,7 @@ impl App {
                     None,
                 );
                 self.command_palette.view(frame, layout.input_area);
+                self.mention_popup.view(frame, layout.input_area);
             } else {
                 let sep = Block::default()
                     .borders(Borders::TOP)
@@ -393,6 +394,7 @@ impl App {
                 panel_hint,
             );
             self.command_palette.view(frame, layout.input_area);
+            self.mention_popup.view(frame, layout.input_area);
         }
     }
 

@@ -12,6 +12,8 @@ pub use mcp::protocol::PromptRole;
 pub use mcp::{
     McpCommand, McpHandle, McpPromptArg, McpPromptInfo, McpSession, McpSnapshot, McpSnapshotReader,
 };
+pub mod mentions;
+pub use mentions::Mention;
 pub(crate) mod task_set;
 pub use agent::{
     Agent, AgentParams, AgentRunParams, GoalError, GoalHandle, GoalResult, GoalSnapshot,
@@ -52,7 +54,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 pub use caudra_providers::AgentError;
-use caudra_providers::Message;
+pub use caudra_providers::{ContentBlock, Message};
 pub use caudra_providers::{EMPTY_RESPONSE_MARKER, ImageMediaType, ImageSource, ThinkingConfig};
 pub use editable_queue::{
     EditableQueue, EditableQueueReceiver, PromptAdmission, QueueDelivery, QueueItemId,
@@ -119,6 +121,10 @@ pub struct AgentInput {
     pub message: String,
     pub mode: AgentMode,
     pub images: Vec<ImageSource>,
+    /// Files the caller asked to have inlined, declared rather than parsed out
+    /// of `message`: `@` is too common in prose for a scan to be safe here, and
+    /// the composer already knows which of them resolved to a real path.
+    pub mentions: Vec<Mention>,
     pub preamble: Vec<Message>,
     pub thinking: ThinkingConfig,
     pub fast: bool,

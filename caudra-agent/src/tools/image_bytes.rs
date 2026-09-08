@@ -60,7 +60,7 @@ pub(crate) fn token_estimate(source: &ImageSource) -> u32 {
 }
 
 #[derive(Debug)]
-pub(super) struct PreparedImage {
+pub(crate) struct PreparedImage {
     pub source: ImageSource,
     pub width: u32,
     pub height: u32,
@@ -70,7 +70,7 @@ pub(super) struct PreparedImage {
 }
 
 /// Read, validate, and shrink `path` until a provider will accept it.
-pub(super) fn prepare(path: &str) -> Result<PreparedImage, String> {
+pub(crate) fn prepare(path: &str) -> Result<PreparedImage, String> {
     let meta = std::fs::metadata(path).map_err(|_| format!("error: path not found: {path}"))?;
     if meta.is_dir() {
         return Err(format!("error: {path} is a directory"));

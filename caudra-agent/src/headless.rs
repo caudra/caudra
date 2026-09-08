@@ -27,6 +27,7 @@ use tracing::{error, warn};
 
 use crate::agent::{self, History};
 use crate::cancel::{CancelMap, CancelToken};
+use crate::mentions;
 use crate::permissions::{PermissionManager, PluginRuleStore};
 use crate::prompt::ResolvedSlots;
 use crate::prompt::profile::{BUILTIN_PROFILE_NAME, PromptProfileCatalog};
@@ -822,11 +823,17 @@ pub fn spawn(mut params: HeadlessParams) -> HeadlessHandle {
             .with_background_wait()
             .with_mcp(mcp);
 
+            let root = params.initial_wd.clone();
+            let mentions = mentions::scan(&params.prompt, |path| root.join(path).exists())
+                .into_iter()
+                .map(|(_, mention)| mention)
+                .collect();
             let result = agent
                 .run(AgentInput {
                     message: params.prompt,
                     mode,
                     images: params.images,
+                    mentions,
                     preamble: Vec::new(),
                     thinking: params.thinking,
                     fast,

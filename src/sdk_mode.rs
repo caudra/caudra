@@ -757,10 +757,16 @@ pub fn run(params: SdkParams) -> Result<()> {
                     shared.turn_start = Instant::now();
                     shared.permission_mode
                 };
+                let mentions =
+                    caudra_agent::mentions::scan(&prompt, |path| cwd.join(path).exists())
+                        .into_iter()
+                        .map(|(_, mention)| mention)
+                        .collect();
                 let input = AgentInput {
                     message: prompt,
                     mode: mode.agent_mode(&cwd),
                     images,
+                    mentions,
                     preamble: Vec::new(),
                     thinking: thinking.clone(),
                     fast,

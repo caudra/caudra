@@ -9,10 +9,13 @@ use crate::input_document::{InputDocument, InputDraft, PasteId, should_summarize
 use crate::text_buffer::{EditResult, TextBuffer, is_newline_key};
 use crate::theme;
 
+use caudra_agent::Mention;
 use caudra_agent::PromptAdmission;
 use caudra_storage::input_history::InputHistory;
 use crossterm::event::{KeyCode, KeyEvent};
 use std::mem;
+use std::ops::Range;
+use std::path::PathBuf;
 
 use caudra_providers::ImageSource;
 use ratatui::Frame;
@@ -31,6 +34,7 @@ const PREFIX_WIDTH: u16 = 2;
 const SPACE: char = ' ';
 const COMPOSER_RAIL_WIDTH: u16 = 1;
 const COMPOSER_VERTICAL_PADDING: u16 = 1;
+const MAX_MENTION_CANDIDATES: usize = 32;
 const ADMISSION_SEPARATOR: &str = "  ";
 const ADMISSION_DESCRIPTION_GAP: &str = " ";
 const PLACEHOLDER_SUGGESTIONS: &[&str] = &[
@@ -79,6 +83,18 @@ pub enum Placeholder {
     Steer,
 }
 
+/// What a click or the pointer landed on in the composer, when it landed on
+/// anything. A mention carries the char range it occupies as well as the
+/// mention itself, because marking it needs the glyphs rather than the path.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum InputHit {
+    Paste(PasteId),
+    Mention {
+        range: Range<usize>,
+        mention: Mention,
+    },
+}
+
 pub enum InputAction {
     Submit(Submission),
     EditPaste(PasteId),
@@ -91,6 +107,7 @@ pub enum InputAction {
 pub struct Submission {
     pub text: String,
     pub images: Vec<ImageSource>,
+    pub mentions: Vec<Mention>,
     pub(crate) draft: InputDraft,
 }
 
@@ -114,6 +131,7 @@ impl Submission {
         Self {
             text: String::new(),
             images: Vec::new(),
+            mentions: Vec::new(),
             draft: InputDraft::default(),
         }
     }
@@ -130,6 +148,7 @@ impl Submission {
             },
             text,
             images: Vec::new(),
+            mentions: Vec::new(),
         }
     }
 }
@@ -146,7 +165,10 @@ pub struct InputBox {
     max_input_lines: u16,
     last_total_lines: u16,
     last_content_height: u16,
-    hovered_paste: Option<PasteId>,
+    hover: Option<InputHit>,
+    /// Resolves the relative paths a mention names. Mentions stay inert until
+    /// the app hands the composer the session's working directory.
+    cwd: PathBuf,
 }
 
 impl InputBox {
@@ -261,8 +283,23 @@ impl InputBox {
             max_input_lines,
             last_total_lines: 1,
             last_content_height: 1,
-            hovered_paste: None,
+            hover: None,
+            cwd: PathBuf::new(),
         }
+    }
+
+    pub(crate) fn set_cwd(&mut self, cwd: impl Into<PathBuf>) {
+        self.cwd = cwd.into();
+    }
+
+    /// The mentions the composer text currently resolves, capped so a prompt
+    /// full of `@` never turns a render into a burst of syscalls.
+    pub(crate) fn mentions(&self) -> Vec<(Range<usize>, Mention)> {
+        let mut candidates = 0;
+        self.buffer.mentions(|path| {
+            candidates += 1;
+            candidates <= MAX_MENTION_CANDIDATES && self.cwd.join(path).exists()
+        })
     }
 
     pub fn copy_text(&self) -> String {
@@ -338,6 +375,8 @@ impl InputBox {
         if text.is_empty() && images.is_empty() {
             return None;
         }
+        let mut mentions: Vec<Mention> = self.mentions().into_iter().map(|(_, m)| m).collect();
+        mentions.dedup_by(|left, right| left.path == right.path && left.lines == right.lines);
         if record_history {
             self.history.push(text.clone());
         }
@@ -345,6 +384,7 @@ impl InputBox {
         Some(Submission {
             text,
             images,
+            mentions,
             draft,
         })
     }
@@ -508,6 +548,11 @@ impl InputBox {
         self.scroll_y = self.scroll_y.min(max_scroll);
 
         let is_empty = self.buffer.display_text().is_empty();
+        let mention_ranges: Vec<Range<usize>> = self
+            .mentions()
+            .into_iter()
+            .map(|(range, _)| range)
+            .collect();
         let mut styled_lines: Vec<Line> = if is_empty && self.pending_images.is_empty() {
             let base = theme::current().input_placeholder;
             let (head, tail) = match placeholder {
@@ -535,22 +580,22 @@ impl InputBox {
                 .iter()
                 .enumerate()
                 .flat_map(|(i, line)| {
-                    let paste_ranges = self.buffer.paste_ranges_on_line(i);
+                    let tokens = token_ranges_on_line(
+                        &self.buffer,
+                        i,
+                        &mention_ranges,
+                        focused_paste,
+                        self.hover.as_ref(),
+                    );
                     let is_cursor_line = i == cursor_y && focused && focused_paste.is_none();
-                    let shell_spans = if i == 0 && paste_ranges.is_empty() {
+                    let shell_spans = if i == 0 && tokens.is_empty() {
                         shell_highlight_spans(line)
                     } else {
                         None
                     };
-                    let styled_spans = if paste_ranges.is_empty() {
-                        shell_spans
-                    } else {
-                        Some(paste_token_spans(
-                            line,
-                            &paste_ranges,
-                            focused_paste,
-                            self.hovered_paste,
-                        ))
+                    let styled_spans = match tokens.is_empty() {
+                        true => shell_spans,
+                        false => Some(token_spans(line, &tokens)),
                     };
                     wrap_line(
                         line,
@@ -627,26 +672,44 @@ impl InputBox {
         row: u16,
         col: u16,
         focused: bool,
-    ) -> Option<PasteId> {
+    ) -> Option<InputHit> {
         let (y, x, text_hit) = self.click_position_with_hit(area, row, col, focused)?;
-        if text_hit && let Some(id) = self.buffer.paste_at(y, x) {
-            self.buffer.focus_paste(id);
-            self.follow_cursor = true;
-            return Some(id);
+        let hit = text_hit.then(|| self.hit_at(y, x)).flatten();
+        match hit {
+            Some(InputHit::Paste(id)) => {
+                self.buffer.focus_paste(id);
+                self.follow_cursor = true;
+                Some(InputHit::Paste(id))
+            }
+            hit => {
+                self.buffer.set_cursor(y, x);
+                self.follow_cursor = true;
+                hit
+            }
         }
-        self.buffer.set_cursor(y, x);
-        self.follow_cursor = true;
-        None
     }
 
-    pub(crate) fn update_paste_hover(&mut self, area: Rect, row: u16, col: u16, focused: bool) {
-        self.hovered_paste = self
+    /// A mention keeps the text cursor where it was clicked, unlike a paste
+    /// label, which the cursor may not sit inside.
+    fn hit_at(&self, y: usize, x: usize) -> Option<InputHit> {
+        if let Some(id) = self.buffer.paste_at(y, x) {
+            return Some(InputHit::Paste(id));
+        }
+        let offset = self.buffer.line_offset(y)? + x;
+        self.mentions()
+            .into_iter()
+            .find(|(range, _)| range.contains(&offset))
+            .map(|(range, mention)| InputHit::Mention { range, mention })
+    }
+
+    pub(crate) fn update_hover(&mut self, area: Rect, row: u16, col: u16, focused: bool) {
+        self.hover = self
             .click_position_with_hit(area, row, col, focused)
-            .and_then(|(y, x, text_hit)| text_hit.then(|| self.buffer.paste_at(y, x)).flatten());
+            .and_then(|(y, x, text_hit)| text_hit.then(|| self.hit_at(y, x)).flatten());
     }
 
     pub(crate) fn clear_hover(&mut self) {
-        self.hovered_paste = None;
+        self.hover = None;
     }
 
     /// Convert a mouse click at terminal (row, col) within the input content
@@ -1013,15 +1076,53 @@ fn total_visual_lines(buffer: &InputDocument, ew: usize, cursor_visible: bool) -
         .sum()
 }
 
-fn paste_token_spans(
-    line: &str,
-    pastes: &[(std::ops::Range<usize>, PasteId)],
+/// Line-local styled ranges for both kinds of composer token: paste labels,
+/// which stand in for text that is not shown, and mentions, which are ordinary
+/// text the model will be handed the contents of. Sorted so [`token_spans`] can
+/// walk them in one pass; the two kinds cannot overlap, because a mention is
+/// scanned out of the display text a paste label already occupies.
+fn token_ranges_on_line(
+    buffer: &InputDocument,
+    y: usize,
+    mentions: &[Range<usize>],
     focused: Option<PasteId>,
-    hovered: Option<PasteId>,
-) -> Vec<Span<'static>> {
-    let mut spans = Vec::with_capacity(pastes.len() * 2 + 1);
+    hovered: Option<&InputHit>,
+) -> Vec<(Range<usize>, Style)> {
+    let mut tokens: Vec<(Range<usize>, Style)> = buffer
+        .paste_ranges_on_line(y)
+        .into_iter()
+        .map(|(range, id)| {
+            let on = matches!(hovered, Some(InputHit::Paste(other)) if *other == id);
+            let style = match focused == Some(id) {
+                true => theme::current().item_selected,
+                false => hover_style(theme::current().active, on),
+            };
+            (range, style)
+        })
+        .collect();
+    if let Some(start) = buffer.line_offset(y) {
+        let end = start + buffer.lines()[y].chars().count();
+        tokens.extend(
+            mentions
+                .iter()
+                .filter(|range| range.start >= start && range.end <= end)
+                .map(|range| {
+                    let on = matches!(hovered, Some(InputHit::Mention { range: other, .. }) if other == range);
+                    (
+                        range.start - start..range.end - start,
+                        hover_style(theme::current().mention, on),
+                    )
+                }),
+        );
+    }
+    tokens.sort_by_key(|(range, _)| range.start);
+    tokens
+}
+
+fn token_spans(line: &str, tokens: &[(Range<usize>, Style)]) -> Vec<Span<'static>> {
+    let mut spans = Vec::with_capacity(tokens.len() * 2 + 1);
     let mut cursor = 0;
-    for (range, id) in pastes {
+    for (range, style) in tokens {
         if cursor < range.start {
             spans.push(Span::raw(
                 line.chars()
@@ -1031,12 +1132,7 @@ fn paste_token_spans(
             ));
         }
         let text: String = line.chars().skip(range.start).take(range.len()).collect();
-        let style = if focused == Some(*id) {
-            theme::current().item_selected
-        } else {
-            hover_style(theme::current().active, hovered == Some(*id))
-        };
-        spans.push(Span::styled(text, style));
+        spans.push(Span::styled(text, *style));
         cursor = range.end;
     }
     if cursor < line.chars().count() {
@@ -1052,6 +1148,12 @@ mod tests {
     use crossterm::event::KeyModifiers;
     use ratatui::layout::Rect;
     use test_case::test_case;
+
+    const EXPECT_PASTE_HIT: &str = "a click inside a paste label reports the paste, not a mention";
+    const EXPECT_MENTION_HIT: &str = "a click inside a mention reports the file it names";
+    const NOT_HOVERED: &str = "the pointer sat on the token without the composer noticing";
+    const TOKEN_UNMARKED: &str = "the token under the pointer was drawn unmarked";
+    const PROSE_MARKED: &str = "hover reached text outside the token";
 
     fn type_text(input: &mut InputBox, text: &str) {
         for c in text.chars() {
@@ -1121,10 +1223,69 @@ mod tests {
     fn clicking_summarized_paste_returns_its_id() {
         let mut input = InputBox::new(InputHistory::default(), 20);
         input.handle_paste("a\nb\nc");
-        let id = input
+        let InputHit::Paste(id) = input
             .handle_click(Rect::new(0, 0, 80, 1), 0, 2, true)
-            .expect("paste token should be clickable");
+            .expect("paste token should be clickable")
+        else {
+            panic!("{EXPECT_PASTE_HIT}");
+        };
         assert_eq!(input.buffer.focused_paste(), Some(id));
+    }
+
+    /// The composer resolves mentions against its own working directory, so a
+    /// test can point it at a real tree and type a path that exists there.
+    fn composer_at_crate_root(text: &str) -> InputBox {
+        let mut input = InputBox::new(InputHistory::default(), 20);
+        input.set_cwd(env!("CARGO_MANIFEST_DIR"));
+        type_text(&mut input, text);
+        input
+    }
+
+    #[test_case("@src/lib.rs", Some(None) ; "whole_file")]
+    #[test_case("@src/lib.rs:L3-L9", Some(Some(3..=9)) ; "line_range")]
+    #[test_case("look at @src/lib.rs now", Some(None) ; "mid_sentence")]
+    #[test_case("@src/does_not_exist.rs", None ; "unresolved_path")]
+    #[test_case("@dataclass", None ; "decorator")]
+    fn the_composer_resolves_only_paths_that_exist(
+        text: &str,
+        expected: Option<Option<std::ops::RangeInclusive<usize>>>,
+    ) {
+        let mentions = composer_at_crate_root(text).mentions();
+        assert_eq!(mentions.len(), usize::from(expected.is_some()), "{text}");
+        if let Some(lines) = expected {
+            assert_eq!(mentions[0].1.lines, lines);
+        }
+    }
+
+    #[test]
+    fn a_mention_stays_editable_rather_than_deleting_whole() {
+        let mut input = composer_at_crate_root("@src/lib.rs");
+        input.buffer.remove_char();
+        assert_eq!(input.buffer.display_text(), "@src/lib.r");
+        assert!(input.mentions().is_empty(), "the shortened path is prose");
+    }
+
+    #[test]
+    fn clicking_a_mention_reports_the_file_it_names() {
+        let mut input = composer_at_crate_root("@src/lib.rs");
+        let hit = input
+            .handle_click(Rect::new(0, 0, 80, 1), 0, 4, true)
+            .expect("a mention is clickable");
+        let InputHit::Mention { mention, .. } = hit else {
+            panic!("{EXPECT_MENTION_HIT}");
+        };
+        assert_eq!(mention.path, std::path::PathBuf::from("src/lib.rs"));
+    }
+
+    #[test]
+    fn a_submission_carries_its_mentions_once_each() {
+        let mut input = composer_at_crate_root("@src/lib.rs and @src/lib.rs again");
+        let submission = input.take_submission().expect("non-empty submission");
+        assert_eq!(submission.mentions.len(), 1);
+        assert_eq!(
+            submission.mentions[0].path,
+            std::path::PathBuf::from("src/lib.rs")
+        );
     }
 
     #[test]
@@ -1348,27 +1509,44 @@ mod tests {
         input.handle_paste("a\nb\nc");
         let content = content_area(area);
         let token_x = content.x + PREFIX_WIDTH;
-        input.update_paste_hover(content, content.y, token_x, true);
-        assert!(input.hovered_paste.is_some());
+        input.update_hover(content, content.y, token_x, true);
+        assert!(input.hover.is_some(), "{NOT_HOVERED}");
 
         let terminal = render_input_with(&mut input, area.width, area.height, Placeholder::Blank);
         let buffer = terminal.backend().buffer();
+        assert!(reversed(buffer, token_x, content.y), "{TOKEN_UNMARKED}");
+        assert!(!reversed(buffer, token_x - 1, content.y), "{PROSE_MARKED}");
+    }
+
+    /// The mention is ordinary text the reader can edit, so only the glyphs
+    /// the pointer is actually over are marked.
+    #[test]
+    fn mention_hover_reverses_only_the_path_it_names() {
+        const PROSE: &str = "see ";
+        let area = Rect::new(0, 0, 60, 3);
+        let mut input = composer_at_crate_root(&format!("{PROSE}@src/lib.rs"));
+        let content = content_area(area);
+        let mention_x = content.x + PREFIX_WIDTH + PROSE.len() as u16;
+
+        input.update_hover(content, content.y, mention_x, true);
+        assert!(input.hover.is_some(), "{NOT_HOVERED}");
+
+        let terminal = render_input_with(&mut input, area.width, area.height, Placeholder::Blank);
+        let buffer = terminal.backend().buffer();
+        assert!(reversed(buffer, mention_x, content.y), "{TOKEN_UNMARKED}");
         assert!(
-            buffer
-                .cell((token_x, content.y))
-                .unwrap()
-                .style()
-                .add_modifier
-                .contains(Modifier::REVERSED)
+            !reversed(buffer, mention_x - 1, content.y),
+            "{PROSE_MARKED}"
         );
-        assert!(
-            !buffer
-                .cell((token_x - 1, content.y))
-                .unwrap()
-                .style()
-                .add_modifier
-                .contains(Modifier::REVERSED)
-        );
+    }
+
+    fn reversed(buffer: &ratatui::buffer::Buffer, x: u16, y: u16) -> bool {
+        buffer
+            .cell((x, y))
+            .unwrap()
+            .style()
+            .add_modifier
+            .contains(Modifier::REVERSED)
     }
 
     fn has_scrollbar_thumb(terminal: &ratatui::Terminal<ratatui::backend::TestBackend>) -> bool {

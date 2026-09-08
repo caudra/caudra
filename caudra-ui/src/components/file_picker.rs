@@ -1,15 +1,12 @@
 use std::mem;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
 use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
-use ignore::WalkBuilder;
-use ignore::overrides::OverrideBuilder;
 use nucleo::pattern::{CaseMatching, Normalization};
-use nucleo::{Config, Matcher, Nucleo, Utf32String};
+use nucleo::{Config, Matcher, Nucleo};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::Modifier;
@@ -20,6 +17,7 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::animation::spinner_frame;
 use crate::components::Overlay;
+use crate::components::file_walk::{self, Walk};
 use crate::components::keybindings::key;
 use crate::components::modal::Modal;
 use crate::components::scrollbar::render_vertical_scrollbar;
@@ -35,8 +33,6 @@ const SEARCH_ROW: u16 = 1;
 const NO_MATCHES: &str = "  No matches";
 const LABEL_INDENT: &str = "  ";
 /// Not "empty": a directory full of ignored files walks up just as short.
-const NOTHING_TO_PICK_MSG: &str = "Nothing to pick in the current directory";
-pub(crate) const UNREADABLE_DIR_MSG: &str = "Cannot list the current directory";
 const WALKER_CRASHED_MSG: &str = "File scanner crashed";
 const PENDING_DEBOUNCE_MS: u128 = 100;
 const MAX_MATERIALIZED: u32 = 640;
@@ -44,25 +40,6 @@ const MAX_MATERIALIZED: u32 = 640;
 /// The walker answers once, and its answer only matters when the list came up
 /// empty: an empty directory, a fully ignored one and one we could not open
 /// look identical from the injector's side.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Walk {
-    Running,
-    Listed,
-    Unreadable,
-}
-
-impl Walk {
-    /// What to tell the user when the walk is over and the list is still empty.
-    /// Total over the state, so no ending can be forgotten.
-    fn nothing_found_msg(self) -> Option<&'static str> {
-        match self {
-            Self::Running => None,
-            Self::Listed => Some(NOTHING_TO_PICK_MSG),
-            Self::Unreadable => Some(UNREADABLE_DIR_MSG),
-        }
-    }
-}
-
 pub enum FilePickerModalAction {
     Consumed,
     Select(String),
@@ -124,62 +101,12 @@ impl FilePickerModal {
 
         let notify = Arc::new(|| {});
         let nucleo = Nucleo::new(Config::DEFAULT.match_paths(), notify, None, 1);
-        let injector = nucleo.injector();
         let cancel = Arc::new(AtomicBool::new(false));
-        let cancel_clone = cancel.clone();
-        let (done_tx, done_rx) = flume::bounded(1);
-
-        let root = PathBuf::from(cwd);
-        if let Err(e) = thread::Builder::new()
-            .name("file-walker".into())
-            .spawn(move || {
-                let overrides = OverrideBuilder::new(&root)
-                    .add("!.git")
-                    .unwrap()
-                    .build()
-                    .unwrap();
-                WalkBuilder::new(&root)
-                    .hidden(false)
-                    // Depth 0 is the root, which strips to an empty name: a
-                    // bare separator at the top of every list, selected by
-                    // default.
-                    .min_depth(Some(1))
-                    .overrides(overrides)
-                    .build_parallel()
-                    .run(|| {
-                        let injector = injector.clone();
-                        let cancel = cancel.clone();
-                        let root = root.clone();
-                        Box::new(move |entry| {
-                            if cancel.load(Ordering::Relaxed) {
-                                return ignore::WalkState::Quit;
-                            }
-                            let Ok(entry) = entry else {
-                                return ignore::WalkState::Continue;
-                            };
-                            if !entry
-                                .file_type()
-                                .is_some_and(|ft| ft.is_file() || ft.is_dir() || ft.is_symlink())
-                            {
-                                return ignore::WalkState::Continue;
-                            }
-                            let path = entry.path().strip_prefix(&root).unwrap_or(entry.path());
-                            let mut name = path.to_string_lossy().into_owned();
-                            if entry.file_type().is_some_and(|ft| ft.is_dir()) {
-                                name.push(std::path::MAIN_SEPARATOR);
-                            }
-                            injector.push((), |_, cols| {
-                                cols[0] = Utf32String::from(name.as_str());
-                            });
-                            ignore::WalkState::Continue
-                        })
-                    });
-                let _ = done_tx.send(walk_end(&root));
-            })
-        {
-            warn!("{WALKER_CRASHED_MSG}: failed to spawn thread: {e}");
+        let Some(done_rx) =
+            file_walk::spawn(PathBuf::from(cwd), nucleo.injector(), Arc::clone(&cancel))
+        else {
             return;
-        }
+        };
 
         self.session = Some(Session {
             nucleo,
@@ -193,7 +120,7 @@ impl FilePickerModal {
             popup_area: Rect::default(),
             row_hits: Vec::new(),
             mouse_down: None,
-            cancel: cancel_clone,
+            cancel,
             done_rx,
             started_at: Instant::now(),
             walk: Walk::Running,
@@ -451,19 +378,6 @@ impl Overlay for FilePickerModal {
     }
 }
 
-/// Only the directory itself can say whether an empty walk means "nothing to
-/// pick" or "I could not even look". Asking happens here, on the walker thread,
-/// where a slow filesystem cannot stall the UI.
-fn walk_end(root: &Path) -> Walk {
-    match root.read_dir() {
-        Ok(_) => Walk::Listed,
-        Err(e) => {
-            warn!("{UNREADABLE_DIR_MSG}: {}: {e}", root.display());
-            Walk::Unreadable
-        }
-    }
-}
-
 fn reparse_pattern(s: &mut Session) {
     invalidate_mouse_geometry(s);
     let query = s.search.value();
@@ -668,6 +582,7 @@ fn build_highlighted_line<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::components::file_walk::NOTHING_TO_PICK_MSG;
     use crate::components::keybindings::key as kb;
     use crate::repaint::expect::{OWED, QUIET};
     use crossterm::event::{KeyEventKind, KeyEventState, KeyModifiers};
@@ -688,7 +603,6 @@ mod tests {
     const MAIN_PATH: &str = "src/main.rs";
     const README_PATH: &str = "docs/readme.md";
     const README_QUERY: &str = "readme";
-    const MISSING_DIR: &str = "gone";
     const MAIN_FILE: &str = "main.rs";
 
     /// Ticks until `ready` holds, collecting the frames owed on the way, or
@@ -765,7 +679,7 @@ mod tests {
     fn inject_file(picker: &FilePickerModal, path: &str) {
         let s = picker.session.as_ref().unwrap();
         s.nucleo.injector().push((), |_, cols| {
-            cols[0] = Utf32String::from(path);
+            cols[0] = nucleo::Utf32String::from(path);
         });
     }
 
@@ -821,17 +735,6 @@ mod tests {
         assert_eq!(dirty, Dirty::YES, "{OWED}");
         assert_eq!(picker.tick(), (Dirty::NO, None), "{QUIET}");
         flash.unwrap()
-    }
-
-    /// Both endings inject nothing, and the flash is the only trace the user
-    /// gets, so this is the difference between "there is nothing here" and "I
-    /// could not look".
-    #[test]
-    fn walk_end_tells_an_empty_directory_from_an_unopenable_one() {
-        let tmp = TempDir::new().unwrap();
-
-        assert_eq!(walk_end(tmp.path()), Walk::Listed);
-        assert_eq!(walk_end(&tmp.path().join(MISSING_DIR)), Walk::Unreadable);
     }
 
     /// Depth 0 is the root itself, which strips to an empty name: a bare

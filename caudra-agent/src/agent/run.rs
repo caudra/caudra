@@ -20,6 +20,7 @@ use super::goal::{
 };
 use super::history::{History, repair_tool_pairs, sanitize_cancelled_history};
 use super::instructions::LoadedInstructions;
+use super::mention_preamble;
 use super::provider_projection;
 use super::streaming::{StreamError, stream_with_retry};
 use super::title;
@@ -35,8 +36,8 @@ use crate::tools::{Deadline, FileReadTracker, LocalTools, PathLocks, ToolAudienc
 use crate::tools::{DeferralSession, DeferredTool};
 use crate::{
     AgentConfig, AgentError, AgentEvent, AgentInput, AgentMode, DoneReason, EventSender,
-    ExtractedCommand, InterruptSource, QueueConsumedItem, SessionMailbox, SubagentHistoryStore,
-    TurnCompleteEvent,
+    ExtractedCommand, InterruptSource, Mention, QueueConsumedItem, SessionMailbox,
+    SubagentHistoryStore, TurnCompleteEvent,
 };
 use caudra_config::{ModelPolicy, ToolOutputLines};
 use caudra_storage::id::SessionRef;
@@ -328,7 +329,7 @@ impl<'h> Agent<'h> {
     ) -> Result<DoneReason, AgentError> {
         self.goal_blocks = 0;
         self.rollback_len = self.history.len();
-        let message = self.push_user_inputs(inputs, queued);
+        let message = self.push_user_inputs(inputs, queued).await;
 
         info!(
             model = %self.model.id,
@@ -435,7 +436,7 @@ impl<'h> Agent<'h> {
         .detach();
     }
 
-    fn push_user_inputs(&mut self, mut inputs: Vec<AgentInput>, queued: bool) -> String {
+    async fn push_user_inputs(&mut self, mut inputs: Vec<AgentInput>, queued: bool) -> String {
         let Some(latest) = inputs.last() else {
             return String::new();
         };
@@ -449,6 +450,7 @@ impl<'h> Agent<'h> {
         let mut preamble = Vec::new();
         for input in &mut inputs {
             preamble.append(&mut input.preamble);
+            preamble.append(&mut self.mention_preamble(&input.mentions).await);
         }
         self.push_input_context(preamble);
 
@@ -468,6 +470,31 @@ impl<'h> Agent<'h> {
             self.history.push(message);
         }
         telemetry.join("\n\n")
+    }
+
+    /// Resolves the caller's mentions into hidden context. A slice gets a
+    /// throwaway file tracker because Workcell records every successful read
+    /// against the tracker it is given, and seeing 20 lines must not clear a
+    /// later edit's staleness check on the whole file.
+    async fn mention_preamble(&self, mentions: &[Mention]) -> Vec<Message> {
+        if mentions.is_empty() {
+            return Vec::new();
+        }
+        let slice = ToolContext {
+            file_tracker: FileReadTracker::fresh(),
+            ..self.tool_context()
+        };
+        mention_preamble::build(
+            mentions,
+            mention_preamble::Resolution {
+                root: &self.permissions.project_cwd(),
+                registry: &self.registry,
+                whole_file: &self.tool_context(),
+                slice: &slice,
+                vision: self.model.supports_vision(),
+            },
+        )
+        .await
     }
 
     fn push_input_context(&mut self, preamble: Vec<Message>) {
@@ -1167,7 +1194,7 @@ impl<'h> Agent<'h> {
                     text: input.message.clone(),
                     image_count: input.images.len(),
                 })?;
-                self.push_user_inputs(vec![input], true);
+                self.push_user_inputs(vec![input], true).await;
                 let _ = run_id;
             }
             ExtractedCommand::InterruptBatch(inputs) => {
@@ -1184,7 +1211,8 @@ impl<'h> Agent<'h> {
                 self.push_user_inputs(
                     inputs.into_iter().map(|queued| queued.input).collect(),
                     true,
-                );
+                )
+                .await;
             }
             ExtractedCommand::Compact(_) => {
                 self.do_compact().await?;
@@ -1699,6 +1727,7 @@ mod tests {
             message: "hello".into(),
             mode: AgentMode::Build,
             images: Vec::new(),
+            mentions: Vec::new(),
             preamble: Vec::new(),
             thinking: Default::default(),
             fast: false,

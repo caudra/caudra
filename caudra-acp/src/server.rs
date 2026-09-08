@@ -82,6 +82,8 @@ struct SessionState {
     current_mode: AgentMode,
     current_model: String,
     pending: PendingState,
+    /// Resolves the relative paths an `@` mention names in a prompt.
+    cwd: PathBuf,
 }
 
 struct Server {
@@ -660,7 +662,7 @@ fn install_session(
         handle.session_id.clone(),
         srv.out_tx.clone(),
         Arc::clone(&pending),
-        cwd,
+        cwd.clone(),
         caudra_storage::paths::home(),
         initial_cost,
     );
@@ -670,6 +672,7 @@ fn install_session(
         current_mode: AgentMode::Build,
         current_model,
         pending,
+        cwd,
     });
 }
 
@@ -733,10 +736,15 @@ fn handle_prompt(srv: &mut Server, raw: &Value, id: &RequestId) -> Result<(), Ac
     let session = srv.session.as_ref().ok_or_else(no_session)?;
 
     let (message, images) = extract_prompt_content(&req.prompt);
+    let mentions = caudra_agent::mentions::scan(&message, |path| session.cwd.join(path).exists())
+        .into_iter()
+        .map(|(_, mention)| mention)
+        .collect();
     let input = AgentInput {
         message,
         mode: session.current_mode.clone(),
         images,
+        mentions,
         preamble: Vec::new(),
         thinking: srv.thinking.clone(),
         fast: false,
@@ -1221,6 +1229,7 @@ mod tests {
                 current_mode: AgentMode::Build,
                 current_model: String::new(),
                 pending: Arc::new(Mutex::new(Pending { prompt: None, asks })),
+                cwd: PathBuf::new(),
             }),
         };
         (server, answer_rx, out_rx)

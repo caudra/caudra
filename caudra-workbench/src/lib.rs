@@ -24,6 +24,7 @@ pub use style::WorkbenchStyles;
 use unicode_width::UnicodeWidthStr;
 
 use std::collections::HashSet;
+use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -482,6 +483,29 @@ impl Workbench {
         }
     }
 
+    /// Opens `path` in the editor, selecting `lines` when given. This is what a
+    /// click on an `@path:L12-L20` mention lands on, so it opens the workbench
+    /// if it was closed rather than requiring two gestures.
+    pub fn open_at(&mut self, root: &Path, path: &Path, lines: Option<RangeInclusive<usize>>) {
+        if !self.open || self.root != root {
+            self.open(root);
+        }
+        self.open_path(path);
+        let Some(tab) = self.editor.active_mut() else {
+            return;
+        };
+        match lines {
+            Some(lines) => {
+                tab.buffer
+                    .set_cursor(Cursor::new(lines.start().saturating_sub(1), 0), false);
+                tab.buffer
+                    .set_cursor(Cursor::new(lines.end().saturating_sub(1), 0), true);
+            }
+            None => tab.buffer.goto_line(1),
+        }
+        self.follow_cursor();
+    }
+
     pub fn set_styles(&mut self, styles: WorkbenchStyles) {
         self.styles = styles;
         self.theme_generation += 1;
@@ -937,9 +961,7 @@ impl Workbench {
             MenuAction::CopyRelative => {
                 return self.copy(self.relative(&path).display().to_string());
             }
-            MenuAction::SendToComposer => {
-                return WorkbenchAction::SendToComposer(self.mention(&path));
-            }
+            MenuAction::SendToComposer => return self.mention(&path, None),
             MenuAction::Rename => self.ask_for_name(InputKind::Rename, path),
             MenuAction::NewFile => self.ask_for_name(InputKind::NewFile, self.holder(&path)),
             MenuAction::NewFolder => self.ask_for_name(InputKind::NewFolder, self.holder(&path)),
@@ -1569,10 +1591,7 @@ impl Workbench {
             }
         }
         if keys::SEND_TO_COMPOSER.matches(key) {
-            return match self.reference() {
-                Some(text) => WorkbenchAction::SendToComposer(text),
-                None => WorkbenchAction::Consumed,
-            };
+            return self.reference().unwrap_or(WorkbenchAction::Consumed);
         }
         if keys::CUT_CHORD.matches(key) {
             return self.cut();
@@ -2339,39 +2358,38 @@ impl Workbench {
         self.editor.active()?.buffer.selected_text()
     }
 
-    /// How a path is written for the composer, which is the same wherever the
-    /// path came from.
-    fn mention(&self, path: &Path) -> String {
-        format!("@{}", self.relative(path).display())
+    /// How a path leaves for the composer, which is the same wherever the path
+    /// came from.
+    fn mention(&self, path: &Path, lines: Option<RangeInclusive<usize>>) -> WorkbenchAction {
+        WorkbenchAction::SendToComposer {
+            path: self.relative(path).to_path_buf(),
+            lines,
+        }
     }
 
     /// What `Ctrl+X Enter` hands the composer: the tree's selection from the
     /// sidebar, and the cursor's line span from the editor.
-    fn reference(&self) -> Option<String> {
+    fn reference(&self) -> Option<WorkbenchAction> {
         if self.focus == Focus::Sidebar {
             if self.sidebar == SidebarView::Search {
                 let (path, line) = self.search.selection()?;
-                return Some(format!("{}:L{line}", self.mention(&path)));
+                return Some(self.mention(&path, Some(line..=line)));
             }
             let path = match self.sidebar {
                 SidebarView::SourceControl => &self.scm.selected_change()?.path,
                 _ => &self.tree.selected()?.path,
             };
-            return Some(self.mention(path));
+            return Some(self.mention(path, None));
         }
         let tab = self.editor.active()?;
-        let mention = self.mention(&tab.path);
-        let (first, last) = match tab.buffer.selection() {
-            Some((from, to)) => (from.line + 1, to.line + 1),
+        let lines = match tab.buffer.selection() {
+            Some((from, to)) => from.line + 1..=to.line + 1,
             None => {
                 let line = tab.buffer.cursor().line + 1;
-                (line, line)
+                line..=line
             }
         };
-        Some(match first == last {
-            true => format!("{mention}:L{first}"),
-            false => format!("{mention}:L{first}-L{last}"),
-        })
+        Some(self.mention(&tab.path, Some(lines)))
     }
 
     /// The open tabs the palette lists first, most recently opened before the
@@ -2557,6 +2575,7 @@ mod tests {
     use ratatui::style::Style;
     use std::collections::BTreeMap;
     use std::fs;
+    use std::ops::RangeInclusive;
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
     use test_case::test_case;
@@ -2572,6 +2591,8 @@ mod tests {
         "the workbench must hand Ctrl+X back, or every chord under it goes dead";
     const BLIND_CUT: &str = "cut with nothing selected must not eat the character at the cursor";
     const WRONG_REFERENCE: &str = "the composer reference does not point where the cursor is";
+    const MENTION_NOT_OPENED: &str = "a mention must open the file it names";
+    const MENTION_WRONG_LINES: &str = "a mention must land on the lines it names";
     const NOT_PAINTED: &str = "a frame is missing something it must always show";
     const WRONG_PANE: &str = "the sidebar is not showing what it was asked for";
     const STILL_UNFOLDED: &str = "folding the tree must leave nothing but its top level";
@@ -2686,6 +2707,13 @@ mod tests {
     /// which is what [`Workbench::handle_leader`] expects.
     fn press(bind: keys::Bind) -> KeyEvent {
         KeyEvent::new(bind.code, bind.modifiers)
+    }
+
+    fn sent(path: &str, lines: Option<RangeInclusive<usize>>) -> WorkbenchAction {
+        WorkbenchAction::SendToComposer {
+            path: PathBuf::from(path),
+            lines,
+        }
     }
 
     fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
@@ -2865,6 +2893,36 @@ mod tests {
         let mut workbench = Workbench::new(WorkbenchStyles::default());
         workbench.open(dir.path());
         (dir, workbench)
+    }
+
+    #[test_case(None, (0, 0), None ; "whole_file_lands_on_the_first_line")]
+    #[test_case(Some(2..=2), (1, 0), None ; "one_line_moves_the_cursor")]
+    #[test_case(Some(1..=3), (2, 0), Some((0, 0)) ; "a_range_selects_it")]
+    fn open_at_opens_the_file_and_lands_on_its_lines(
+        lines: Option<RangeInclusive<usize>>,
+        expected: (usize, usize),
+        anchor: Option<(usize, usize)>,
+    ) {
+        let (dir, mut workbench) = project();
+        workbench.close();
+
+        workbench.open_at(dir.path(), &dir.path().join("a.txt"), lines);
+
+        assert!(workbench.is_open(), "{MENTION_NOT_OPENED}");
+        let tab = workbench.editor.active().expect(NO_TAB);
+        assert!(tab.path.ends_with("a.txt"), "{MENTION_NOT_OPENED}");
+        assert_eq!(
+            (tab.buffer.cursor().line, tab.buffer.cursor().col),
+            expected,
+            "{MENTION_WRONG_LINES}"
+        );
+        assert_eq!(
+            tab.buffer
+                .selection()
+                .map(|(from, _)| (from.line, from.col)),
+            anchor,
+            "{MENTION_WRONG_LINES}"
+        );
     }
 
     fn cursor(workbench: &Workbench) -> Cursor {
@@ -3377,9 +3435,12 @@ mod tests {
         );
     }
 
-    #[test_case(Focus::Sidebar, "@a.txt" ; "the sidebar sends the selected path")]
-    #[test_case(Focus::Editor, "@a.txt:L1" ; "the editor sends the cursor line")]
-    fn the_send_chord_hands_a_reference_to_the_composer(focus: Focus, expected: &str) {
+    #[test_case(Focus::Sidebar, None ; "the sidebar sends the selected path")]
+    #[test_case(Focus::Editor, Some(1..=1) ; "the editor sends the cursor line")]
+    fn the_send_chord_hands_a_reference_to_the_composer(
+        focus: Focus,
+        lines: Option<RangeInclusive<usize>>,
+    ) {
         let (dir, mut workbench) = project();
         match focus {
             Focus::Sidebar => select_file(&dir, &mut workbench),
@@ -3388,11 +3449,7 @@ mod tests {
 
         let action = workbench.handle_leader(press(keys::SEND_TO_COMPOSER));
 
-        assert_eq!(
-            action,
-            WorkbenchAction::SendToComposer(expected.to_owned()),
-            "{WRONG_REFERENCE}"
-        );
+        assert_eq!(action, sent(OPENED_FILE, lines), "{WRONG_REFERENCE}");
     }
 
     /// Also proves the renderer records the text pane, which is what paging,
@@ -4840,11 +4897,7 @@ mod tests {
     fn a_reference_from_source_control_names_the_changed_file() {
         let (_dir, mut workbench) = repository();
         let action = workbench.handle_leader(press(keys::SEND_TO_COMPOSER));
-        assert_eq!(
-            action,
-            WorkbenchAction::SendToComposer("@a.txt".to_owned()),
-            "{WRONG_REFERENCE}"
-        );
+        assert_eq!(action, sent(OPENED_FILE, None), "{WRONG_REFERENCE}");
     }
 
     /// Types `text` into whichever field the search pane has the caret in.
@@ -4936,7 +4989,7 @@ mod tests {
 
         assert_eq!(
             workbench.handle_leader(press(keys::SEND_TO_COMPOSER)),
-            WorkbenchAction::SendToComposer("@a.txt:L3".to_owned()),
+            sent(OPENED_FILE, Some(3..=3)),
             "{WRONG_REFERENCE}"
         );
     }
@@ -5936,13 +5989,9 @@ mod tests {
         select_file(&dir, &mut workbench);
         workbench.handle_leader(press(keys::MENU));
 
-        let sent = menu_action(&mut workbench, MenuAction::SendToComposer);
+        let from_menu = menu_action(&mut workbench, MenuAction::SendToComposer);
 
-        assert_eq!(
-            sent,
-            WorkbenchAction::SendToComposer(format!("@{OPENED_FILE}")),
-            "{NOT_SENT}"
-        );
+        assert_eq!(from_menu, sent(OPENED_FILE, None), "{NOT_SENT}");
     }
 
     /// A preview tab is the next one to be taken over, so keeping it is the

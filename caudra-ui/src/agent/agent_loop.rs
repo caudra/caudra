@@ -224,7 +224,7 @@ impl AgentLoop {
                         image_count,
                     });
                 }
-                self.do_agent_run(input, event_tx, run_id).await
+                self.do_agent_run(*input, event_tx, run_id).await
             }
             QueueItem::Compact { .. } => self.do_compact(&event_tx).await,
         };
@@ -276,7 +276,7 @@ impl AgentLoop {
                 text,
                 image_count,
             });
-            inputs.push(input);
+            inputs.push(*input);
         }
         if inputs.is_empty() {
             self.queue.clear_active_run();

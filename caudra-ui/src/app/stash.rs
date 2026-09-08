@@ -162,7 +162,7 @@ impl App {
         };
         self.active_input_box_mut()
             .set_state(InputState::new(draft, images));
-        self.resync_command_palette();
+        self.resync_dropdowns();
     }
 
     fn report(&mut self, error: PromptStashError) -> Vec<Action> {

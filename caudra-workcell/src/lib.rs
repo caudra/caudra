@@ -2686,20 +2686,27 @@ impl ShellProgressSink for NativeProgressSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use caudra_agent::agent::mention_preamble;
     use caudra_agent::cancel::CancelToken;
     use caudra_agent::permissions::{
         PermissionManager, PermissionResourceAccess, PermissionResourceKind,
     };
     use caudra_agent::tools::{FileReadTracker, STALE_READ_MSG, interpreter_ctx};
-    use caudra_agent::{AgentMode, Envelope, EventSender};
+    use caudra_agent::{AgentMode, ContentBlock, Envelope, EventSender, Mention, Message};
     use caudra_config::{DefaultEffect, Effect, PermissionRule, PermissionsConfig, ToolKey};
     use serde_json::json;
+    use std::ops::RangeInclusive;
     use std::sync::Arc;
     use tempfile::TempDir;
     use test_case::test_case;
 
     const PATCH: &str = "*** Begin Patch\n*** Add File: created.txt\n+hello\n*** End Patch";
     const PREVIEW_FLAG_MSG: &str = "a dry-run argument must fail the call rather than write";
+    const EXPECT_MENTION_INLINED: &str = "a mention hands the model the file's contents";
+    const EXPECT_SLICE_LEAVES_NO_RECORD: &str =
+        "only a whole-file mention may clear a later edit's staleness check";
+    const EXPECT_MENTION_NOTE: &str = "a mention that read nothing still tells the model why";
+    const EXPECT_MENTION_HIDDEN: &str = "mention context never shows up in the transcript";
     const PATCH_STRUCTURED_MSG: &str = "a patch reports the files it changed, not a diff blob";
     const FILTERABLE_MAKEFILE: &str = "all:\n\t@echo \"make[1]: Entering directory '/x'\"\n\t@echo \"real build line\"\n\t@echo \"make[1]: Leaving directory '/x'\"\n";
 
@@ -4288,6 +4295,90 @@ mod tests {
             invocation.mutation_targets(&ctx).is_empty(),
             "{EXPECT_NO_DOUBLE_GUARD}"
         );
+    }
+
+    /// Workcell records every successful `file_read` against the tracker it is
+    /// handed, `offset` or not, so the only thing standing between a 20-line
+    /// mention and a later edit passing its staleness check on the whole file
+    /// is the throwaway tracker the resolver gives a slice.
+    #[test_case(None, true ; "whole_file_records_the_read")]
+    #[test_case(Some(1..=1), false ; "a_slice_records_nothing")]
+    fn a_mention_records_a_read_only_when_it_covers_the_file(
+        lines: Option<RangeInclusive<usize>>,
+        recorded: bool,
+    ) {
+        let root = TempDir::new().expect("tempdir");
+        let path = root.path().join(CONTENT_FILE);
+        std::fs::write(&path, "first\nsecond\n").expect("seed file");
+        let (_host, registry) = host_and_registry(root.path());
+
+        let mut whole_file = context(root.path(), Arc::clone(&registry), CancelToken::none());
+        whole_file.config.stale_read_check = true;
+        let slice = ToolContext {
+            file_tracker: FileReadTracker::fresh(),
+            ..context(root.path(), Arc::clone(&registry), CancelToken::none())
+        };
+        let tracker = Arc::clone(&whole_file.file_tracker);
+
+        let messages = smol::block_on(mention_preamble::build(
+            &[Mention::new(CONTENT_FILE, lines)],
+            mention_preamble::Resolution {
+                root: root.path(),
+                registry: &registry,
+                whole_file: &whole_file,
+                slice: &slice,
+                vision: false,
+            },
+        ));
+
+        assert_eq!(messages.len(), 1);
+        assert!(
+            message_text(&messages[0]).contains("first"),
+            "{EXPECT_MENTION_INLINED}"
+        );
+        bump_mtime(&path);
+        assert_eq!(
+            tracker.check_before_edit(&path).is_err(),
+            recorded,
+            "{EXPECT_SLICE_LEAVES_NO_RECORD}"
+        );
+    }
+
+    #[test]
+    fn a_mention_of_a_missing_file_says_so_instead_of_going_quiet() {
+        let root = TempDir::new().expect("tempdir");
+        let (_host, registry) = host_and_registry(root.path());
+        let ctx = context(root.path(), Arc::clone(&registry), CancelToken::none());
+
+        let messages = smol::block_on(mention_preamble::build(
+            &[Mention::new("absent.txt", None)],
+            mention_preamble::Resolution {
+                root: root.path(),
+                registry: &registry,
+                whole_file: &ctx,
+                slice: &ctx,
+                vision: false,
+            },
+        ));
+
+        let text = message_text(&messages[0]);
+        assert!(text.contains("error="), "{EXPECT_MENTION_NOTE}: {text}");
+        assert_eq!(
+            messages[0].display_text.as_deref(),
+            Some(""),
+            "{EXPECT_MENTION_HIDDEN}"
+        );
+    }
+
+    fn message_text(message: &Message) -> String {
+        message
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Write authority is Caudra's to grant, so a model cannot ask for a

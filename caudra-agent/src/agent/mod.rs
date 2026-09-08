@@ -2,6 +2,7 @@ mod compaction;
 mod goal;
 mod history;
 mod instructions;
+pub mod mention_preamble;
 mod provider_projection;
 mod run;
 mod streaming;

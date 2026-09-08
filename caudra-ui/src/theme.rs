@@ -562,6 +562,7 @@ pub struct Theme {
     pub index_line_nr: Style,
     pub index_keyword: Style,
     pub shell_prefix: Style,
+    pub mention: Style,
     pub progress_bar: Style,
 
     pub syntax: syntect::highlighting::Theme,
@@ -1095,6 +1096,11 @@ impl Theme {
             index_line_nr: derived_style("index_line_nr", &["comment"], Modifier::empty()),
             index_keyword: derived_style("index_keyword", &["keyword"], Modifier::empty()),
             shell_prefix: derived_style("shell_prefix", &["string"], Modifier::BOLD),
+            mention: derived_style(
+                "mention",
+                &["markup.link.url", "string.special.path", "string"],
+                Modifier::UNDERLINED,
+            ),
             progress_bar: {
                 let s = style("progress_bar");
                 if s == Style::default() {

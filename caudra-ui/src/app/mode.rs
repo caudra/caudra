@@ -4,7 +4,8 @@ use std::path::{Path, PathBuf};
 use crate::agent::QueuedMessage;
 use crate::components::Status;
 use crate::theme;
-use caudra_agent::{AgentInput, AgentMode};
+use caudra_agent::mentions;
+use caudra_agent::{AgentInput, AgentMode, Mention};
 use caudra_storage::StateDir;
 use caudra_storage::plans;
 use ratatui::style::{Color, Modifier, Style};
@@ -120,11 +121,23 @@ impl App {
         }
     }
 
+    /// Mentions in text the composer did not hand us already resolved: a queue
+    /// entry restored from a previous session, where the paths were checked
+    /// against a working directory that may since have changed.
+    pub(crate) fn scan_mentions(&self, text: &str) -> Vec<Mention> {
+        let root = Path::new(&self.state.session.cwd);
+        mentions::scan(text, |path| root.join(path).exists())
+            .into_iter()
+            .map(|(_, mention)| mention)
+            .collect()
+    }
+
     pub(crate) fn build_agent_input(&self, msg: &QueuedMessage) -> AgentInput {
         AgentInput {
             message: msg.text.clone(),
             mode: self.agent_mode(),
             images: msg.images.clone(),
+            mentions: msg.mentions.clone(),
             preamble: Vec::new(),
             thinking: self.state.thinking.clone(),
             fast: self.state.fast,

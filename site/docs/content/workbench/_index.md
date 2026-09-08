@@ -179,14 +179,14 @@ The walk respects `.gitignore` and skips `.git`, binaries, and files above the s
 
 ## Sending a reference to the agent
 
-`Ctrl+X Enter` puts what you are looking at into the composer as a file reference, then closes the workbench so you can finish the sentence.
+`Ctrl+X Enter` puts what you are looking at into the composer as a [mention](/docs/context/), then closes the workbench so you can finish the sentence. `Send to Composer` in a row's [context menu](#context-menu) does the same for a path you have not opened.
 
 - From the explorer or source control: `@path/to/file`
 - From a search result: `@path/to/file:L42`
 - From the editor with the cursor on a line: `@path/to/file:L42`
 - From the editor with a selection: `@path/to/file:L10-L20`
 
-This is the fastest way to say "look at this" without typing the path or the line numbers.
+This is the fastest way to say "look at this" without typing the path or the line numbers. When you send the prompt, Caudra reads the lines a mention names and puts them in the request, so the agent starts with them rather than calling `file_read`.
 
 ## What is remembered
 

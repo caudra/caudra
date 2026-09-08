@@ -3,6 +3,9 @@
 //! The crate owns no clipboard, no composer and no session, so anything that
 //! reaches outside its own state leaves as one of these.
 
+use std::ops::RangeInclusive;
+use std::path::PathBuf;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkbenchAction {
     /// The workbench handled the event.
@@ -12,8 +15,13 @@ pub enum WorkbenchAction {
     Passthrough,
     /// Hand the workbench back to the transcript.
     Close,
-    /// Append text to the composer, then return to the transcript.
-    SendToComposer(String),
+    /// Mention a file in the composer, then return to the transcript. The path
+    /// is relative to the project root, and the host owns the spelling so the
+    /// workbench never has to keep a copy of the composer's mention syntax.
+    SendToComposer {
+        path: PathBuf,
+        lines: Option<RangeInclusive<usize>>,
+    },
     /// Put text on the system clipboard.
     Copy(String),
     /// Say something in the status bar.
