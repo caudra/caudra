@@ -1,8 +1,8 @@
 use std::collections::{HashSet, VecDeque};
 
 use caudra_agent::permissions::{
-    DEFAULT_DENY_GUIDANCE, PermissionAnswer, PermissionLifetime, PermissionRequest, PermissionRisk,
-    PermissionRuleOption, StructuredPermissionEffect,
+    DEFAULT_DENY_GUIDANCE, PermissionAnswer, PermissionCaution, PermissionLifetime,
+    PermissionRequest, PermissionRisk, PermissionRuleOption, StructuredPermissionEffect,
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
@@ -29,17 +29,21 @@ const KEY_ALLOW_GLOBAL: &str = "A";
 const KEY_GUIDE_DENY: &str = "n";
 const KEY_DENY_LOCAL: &str = "d";
 const KEY_DENY_GLOBAL: &str = "D";
-const KEY_DETAILS: &str = "f";
-const KEY_INPUT: &str = "i";
 const HINT_ENTER: &str = "Enter";
 const HINT_ESC: &str = "Esc";
-const HINT_TAB: &str = "Tab";
 /// Two keys, one action: the hint names `Enter` first and a click follows it.
 const HINT_CONFIRM: &str = "Enter/y";
-/// Scrolling is the wheel's job, so this hint is a label rather than a button.
-const HINT_SCROLL: &str = "↑/↓";
+/// Arrow hints are labels rather than buttons: an arrow is not a key a click
+/// can synthesise from its name.
+const HINT_SELECT: &str = "↑/↓";
+const HINT_WIDEN: &str = "←/→";
+const HINT_PAGE: &str = "PgUp/PgDn";
+const WIDEN_MARK: &str = " ←/→";
+const BADGE_RECOMMENDED: &str = " [recommended]";
+const BADGE_WARN: &str = " [outside repo]";
+const BADGE_DANGER: &str = " [outside home]";
 
-type HintPairs = &'static [(&'static str, &'static str)];
+type HintPairs = Vec<(&'static str, &'static str)>;
 
 enum FooterRow {
     Hints(HintPairs),
@@ -47,12 +51,12 @@ enum FooterRow {
     Guidance,
 }
 
-/// The lines to draw plus where the reusable authorities landed among them,
-/// in the order `cycle_option` walks. Both come out of one pass so a click
-/// and `Tab` can never disagree about which option is which.
+/// The lines to draw plus which authority each selectable row stands for and
+/// where it landed. Both come out of one pass so a click and the arrow keys can
+/// never disagree about which option is which.
 struct PromptBody {
     lines: Vec<Line<'static>>,
-    authority_lines: Vec<u16>,
+    entries: Vec<(String, u16)>,
 }
 
 /// The options that can be granted beyond this one call.
@@ -66,12 +70,46 @@ fn authorities(request: &PermissionRequest) -> impl Iterator<Item = &PermissionR
     })
 }
 
+/// One authority per row, with every ladder collapsed to the rung in use.
+struct AuthorityRow {
+    /// The rung the row currently stands for.
+    chosen: String,
+    /// Every rung on the row, narrowest first, so `←`/`→` can walk it.
+    rungs: Vec<String>,
+}
+
+/// The authorities as rows. Options sharing a group key are one ladder and
+/// occupy one row; everything else is a row of its own.
+fn authority_rows(request: &PermissionRequest, selected: &str) -> Vec<AuthorityRow> {
+    let mut keys: Vec<Option<&str>> = Vec::new();
+    let mut rows: Vec<AuthorityRow> = Vec::new();
+    for option in authorities(request) {
+        let key = option.group.as_ref().map(|group| group.key.as_str());
+        let existing = key.and_then(|key| keys.iter().position(|found| *found == Some(key)));
+        match existing.map(|index| &mut rows[index]) {
+            Some(row) => {
+                if option.id == selected {
+                    row.chosen.clone_from(&option.id);
+                }
+                row.rungs.push(option.id.clone());
+            }
+            None => {
+                keys.push(key);
+                rows.push(AuthorityRow {
+                    chosen: option.id.clone(),
+                    rungs: vec![option.id.clone()],
+                });
+            }
+        }
+    }
+    rows
+}
+
 /// The key a hint stands for, so a click can press it. A hint listing
 /// alternatives names the one to synthesise first.
 fn hint_key(label: &str) -> Option<KeyEvent> {
     let code = match label {
         HINT_ESC => KeyCode::Esc,
-        HINT_TAB => KeyCode::Tab,
         _ => match label.split('/').next()? {
             HINT_ENTER => KeyCode::Enter,
             first => {
@@ -113,9 +151,10 @@ pub struct PermissionPrompt {
     state: PromptState,
     buffer: TextBuffer,
     scroll: ModalScroll,
-    full_details: bool,
-    input_expanded: bool,
     selected_option: String,
+    /// An authority the next draw has to bring into view, once the layout it
+    /// lands in is known.
+    pending_reveal: Option<String>,
     row_hits: Vec<PromptHit>,
     mouse_down: Option<PromptTarget>,
     /// What the pointer is resting on, so a control can say it is about to act.
@@ -170,9 +209,8 @@ impl PermissionPrompt {
             state: PromptState::Normal,
             buffer: TextBuffer::new(String::new()),
             scroll: ModalScroll::new_top(),
-            full_details: false,
-            input_expanded: false,
             selected_option: "allow_exact".into(),
+            pending_reveal: None,
             row_hits: Vec::new(),
             mouse_down: None,
             hover: None,
@@ -298,13 +336,13 @@ impl PermissionPrompt {
                 answer: PermissionAnswer::Deny,
             });
         }
-        if self.scroll.handle_key(key) {
+        let plain = !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        if plain && self.steer(key.code) {
             return None;
         }
-        if key
-            .modifiers
-            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-        {
+        if self.scroll.handle_key(key) || !plain {
             return None;
         }
         match key.code {
@@ -345,26 +383,22 @@ impl PermissionPrompt {
                 );
                 None
             }
-            KeyCode::Tab => {
-                self.cycle_option(false);
-                None
-            }
-            KeyCode::BackTab => {
-                self.cycle_option(true);
-                None
-            }
-            KeyCode::Char('f') => {
-                self.full_details = !self.full_details;
-                self.scroll.reset();
-                None
-            }
-            KeyCode::Char('i') => {
-                self.input_expanded = !self.input_expanded;
-                self.scroll.reset();
-                None
-            }
             _ => None,
         }
+    }
+
+    /// Arrows steer the authority list: `↑`/`↓` pick a row and `←`/`→` walk the
+    /// ladder on it. They are claimed before the scroll sees them, so the page
+    /// keys are what moves the viewport.
+    fn steer(&mut self, code: KeyCode) -> bool {
+        match code {
+            KeyCode::Up => self.move_selection(true),
+            KeyCode::Down => self.move_selection(false),
+            KeyCode::Left => self.widen(false),
+            KeyCode::Right => self.widen(true),
+            _ => return false,
+        }
+        true
     }
 
     pub fn resolve(&mut self, request_id: &str) -> bool {
@@ -424,13 +458,11 @@ impl PermissionPrompt {
             self.row_hits.clear();
             return;
         };
-        let authority_ids: Vec<_> = authorities(request)
-            .map(|option| option.id.clone())
-            .collect();
         let body = self.body(request);
         let footer_width = area.width.saturating_sub(2);
-        let footer_rows = self.footer_rows(footer_width);
-        let footer_lines = self.footer_lines(footer_width);
+        // The overflow hint joins a row rather than adding one, so the footer's
+        // height is known before the body has been measured against it.
+        let footer_height = self.footer_rows(footer_width, false).len();
         let title = format!(" Permission Required ({} pending) ", self.pending_count());
         let t = theme::current();
         let block = Block::default()
@@ -442,13 +474,15 @@ impl PermissionPrompt {
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        let footer_height = footer_lines.len().min(inner.height as usize) as u16;
+        let footer_height = footer_height.min(inner.height as usize) as u16;
         let [body_area, footer_area] =
             Layout::vertical([Constraint::Min(0), Constraint::Length(footer_height)]).areas(inner);
         let body_width = body_area.width.max(1);
         let rows = visual_rows(&body.lines, body_width);
         let total = rows.total;
+        let scrolling = total > body_area.height;
         self.scroll.update_dimensions(total, body_area.height);
+        self.follow_selection(&rows, &body.entries);
         let offset = self.scroll.offset();
         frame.render_widget(
             Paragraph::new(body.lines)
@@ -457,11 +491,14 @@ impl PermissionPrompt {
                 .scroll((offset, 0)),
             body_area,
         );
-        let scrolling = total > body_area.height;
         if scrolling {
             render_vertical_scrollbar(frame, body_area, total, offset);
         }
-        frame.render_widget(Paragraph::new(footer_lines), footer_area);
+        let footer_rows = self.footer_rows(footer_width, scrolling);
+        frame.render_widget(
+            Paragraph::new(self.footer_lines(footer_width, scrolling)),
+            footer_area,
+        );
 
         self.row_hits.clear();
         // The scrollbar sits in the last column and takes its own clicks.
@@ -469,7 +506,7 @@ impl PermissionPrompt {
             width: body_area.width.saturating_sub(u16::from(scrolling)),
             ..body_area
         };
-        for (id, line) in authority_ids.into_iter().zip(body.authority_lines) {
+        for (id, line) in body.entries {
             self.push_body_hit(&rows, clickable, offset, line, PromptTarget::Authority(id));
         }
         for (index, row) in footer_rows.into_iter().enumerate() {
@@ -484,7 +521,7 @@ impl PermissionPrompt {
             if line.y >= footer_area.bottom() {
                 break;
             }
-            for (area, key) in super::hint_hits(pairs, line)
+            for (area, key) in super::hint_hits(&pairs, line)
                 .into_iter()
                 .zip(pairs.iter().map(|(label, _)| hint_key(label)))
             {
@@ -496,6 +533,22 @@ impl PermissionPrompt {
                 }
             }
         }
+    }
+
+    /// Brings a freshly selected authority into view, together with the
+    /// description it just grew, now that the wrapped layout says where it is.
+    fn follow_selection(&mut self, rows: &VisualRows, entries: &[(String, u16)]) {
+        let Some(id) = self.pending_reveal.take() else {
+            return;
+        };
+        let Some((_, line)) = entries.iter().find(|(entry, _)| *entry == id) else {
+            return;
+        };
+        self.scroll.reveal(
+            rows.row_of(*line),
+            rows.height_of(*line)
+                .saturating_add(rows.height_of(line + 1)),
+        );
     }
 
     /// The rows one body line occupies once wrapped and scrolled, clipped to
@@ -589,7 +642,7 @@ impl PermissionPrompt {
         };
         let inner_width = width.saturating_sub(2).max(1);
         let body = visual_rows(&self.body(request).lines, inner_width).total;
-        let footer = self.footer_rows(inner_width).len() as u16;
+        let footer = self.footer_rows(inner_width, false).len() as u16;
         body.saturating_add(footer).saturating_add(2)
     }
 
@@ -601,8 +654,7 @@ impl PermissionPrompt {
         self.state = PromptState::Normal;
         self.buffer = TextBuffer::new(String::new());
         self.scroll.reset();
-        self.full_details = false;
-        self.input_expanded = false;
+        self.pending_reveal = None;
         self.row_hits.clear();
         self.mouse_down = None;
         self.hover = None;
@@ -639,31 +691,58 @@ impl PermissionPrompt {
         })
     }
 
-    fn cycle_option(&mut self, reverse: bool) {
-        let Some(request) = self.current() else {
-            return;
-        };
-        let options: Vec<_> = authorities(request).collect();
-        if options.is_empty() {
-            return;
+    /// The rows on offer and where the selection currently sits among them.
+    fn selection(&self) -> Option<(Vec<AuthorityRow>, usize)> {
+        let rows = authority_rows(self.current()?, &self.selected_option);
+        if rows.is_empty() {
+            return None;
         }
-        let current = options
+        let current = rows
             .iter()
-            .position(|option| option.id == self.selected_option)
-            .unwrap_or(0);
-        let next = if reverse {
-            current.checked_sub(1).unwrap_or(options.len() - 1)
-        } else {
-            (current + 1) % options.len()
+            .position(|row| row.rungs.contains(&self.selected_option))
+            .unwrap_or_default();
+        Some((rows, current))
+    }
+
+    /// Moves between authorities. A ladder counts as one step however many
+    /// rungs it has, and lands on its narrowest.
+    fn move_selection(&mut self, reverse: bool) {
+        let Some((rows, current)) = self.selection() else {
+            return;
         };
-        self.select_authority(options[next].id.clone());
+        let next = if reverse {
+            current.checked_sub(1).unwrap_or(rows.len() - 1)
+        } else {
+            (current + 1) % rows.len()
+        };
+        self.select_authority(rows[next].chosen.clone());
+    }
+
+    /// Walks the ladder the selected row stands for. Ends clamp rather than
+    /// wrap: stepping off the widest rung must not quietly land on the
+    /// narrowest.
+    fn widen(&mut self, forward: bool) {
+        let Some((rows, current)) = self.selection() else {
+            return;
+        };
+        let rungs = &rows[current].rungs;
+        let rung = rungs
+            .iter()
+            .position(|rung| *rung == self.selected_option)
+            .unwrap_or_default();
+        let next = if forward {
+            (rung + 1).min(rungs.len() - 1)
+        } else {
+            rung.saturating_sub(1)
+        };
+        self.select_authority(rungs[next].clone());
     }
 
     fn select_authority(&mut self, id: String) {
+        // The selected authority grows a description line, so the row may need
+        // following once the draw knows where it landed.
+        self.pending_reveal = Some(id.clone());
         self.selected_option = id;
-        // The selected authority grows a description line, so what was under
-        // the pointer is no longer what is under it now.
-        self.scroll.reset();
     }
 
     fn confirm_answer(&self) -> Option<PermissionAnswer> {
@@ -704,7 +783,7 @@ impl PermissionPrompt {
         let value = Style::new().fg(t.foreground);
         let safe = |text: &str| escape_terminal_controls(text);
         let mut lines = Vec::new();
-        let mut authority_lines = Vec::new();
+        let mut entries = Vec::new();
         if let Some(requester) = self
             .requests
             .front()
@@ -718,7 +797,7 @@ impl PermissionPrompt {
             ));
         }
         lines.extend([
-            field_line("Action", safe(&request.presentation.action), label, value),
+            action_line(request, label, value),
             field_line(
                 "Risk",
                 format!(
@@ -771,17 +850,25 @@ impl PermissionPrompt {
                 );
             }
         }
-        let options: Vec<_> = authorities(request).collect();
-        if !options.is_empty() {
+        let rows = authority_rows(request, &self.selected_option);
+        if !rows.is_empty() {
             lines.extend([
                 Line::default(),
                 Line::from(Span::styled("  Reusable authority", t.panel_title)),
             ]);
-            for option in options {
+            for row in rows {
+                let Some(option) = request
+                    .options
+                    .iter()
+                    .find(|option| option.id == row.chosen)
+                else {
+                    continue;
+                };
                 let selected = option.id == self.selected_option;
                 let on =
                     matches!(&self.hover, Some(PromptTarget::Authority(id)) if *id == option.id);
-                authority_lines.push(lines.len() as u16);
+                let ladder = row.rungs.len() > 1;
+                entries.push((option.id.clone(), lines.len() as u16));
                 lines.push(Line::from(vec![
                     Span::styled(
                         if selected { "  > " } else { "    " },
@@ -791,68 +878,45 @@ impl PermissionPrompt {
                         safe(&option.label),
                         hover_style(if selected { value } else { label }, on),
                     ),
+                    // The rung in use, so widening changes the row and not
+                    // only the sentence under it.
                     Span::styled(
-                        if option.is_default {
-                            " [recommended]"
-                        } else {
-                            ""
+                        option
+                            .group
+                            .as_ref()
+                            .map(|group| format!(" {}", safe(&group.value)))
+                            .unwrap_or_default(),
+                        hover_style(t.tool_dim, on),
+                    ),
+                    Span::styled(
+                        if ladder && selected { WIDEN_MARK } else { "" },
+                        hover_style(t.status_notice, on),
+                    ),
+                    Span::styled(
+                        match option.caution {
+                            Some(PermissionCaution::Danger) => BADGE_DANGER,
+                            Some(PermissionCaution::Warn) => BADGE_WARN,
+                            None if option.is_default => BADGE_RECOMMENDED,
+                            None => "",
                         },
-                        hover_style(t.tool_success, on),
+                        hover_style(caution_style(option.caution, t.tool_success), on),
                     ),
                 ]));
                 if selected {
                     lines.push(Line::from(Span::styled(
                         format!("      {}", safe(&option.description)),
-                        t.tool_dim,
+                        caution_style(option.caution, t.tool_dim),
                     )));
                 }
             }
         }
-        let masked = masked_json(&request.input);
         lines.extend([
             Line::default(),
             Line::from(Span::styled(
                 "  Not sent to tool until approved",
                 t.status_notice,
             )),
-            Line::default(),
-            Line::from(Span::styled(
-                "  Input (validated JSON; likely secrets masked)",
-                t.panel_title,
-            )),
         ]);
-        if self.input_expanded {
-            lines.extend(masked.lines().map(|line| Line::from(format!("    {line}"))));
-        } else {
-            lines.push(Line::from(Span::styled(
-                format!(
-                    "    {} · {KEY_INPUT} to expand",
-                    input_summary(&request.input, masked.len())
-                ),
-                t.tool_dim,
-            )));
-        }
-
-        if self.full_details {
-            lines.extend([
-                Line::default(),
-                Line::from(Span::styled("  Technical details", t.panel_title)),
-                field_line("Tool", safe(&request.tool.to_string()), label, value),
-                field_line(
-                    "Executor",
-                    safe(&format!("{:?}", request.executor)),
-                    label,
-                    value,
-                ),
-                field_line(
-                    "Subject",
-                    safe(&format!("{:?}", request.subject)),
-                    label,
-                    value,
-                ),
-                field_line("Input SHA-256", safe(&request.input_digest), label, value),
-            ]);
-        }
 
         if let Some(authority) = self.confirmation_authority(request) {
             lines.extend([
@@ -874,53 +938,18 @@ impl PermissionPrompt {
                 ]);
             }
         }
-        PromptBody {
-            lines,
-            authority_lines,
-        }
+        PromptBody { lines, entries }
     }
 
     /// The footer a row at a time. `footer_lines` draws these and the hit
     /// rects are measured from them, so a click can never land on a hint the
     /// footer is no longer showing.
-    fn footer_rows(&self, width: u16) -> Vec<FooterRow> {
+    fn footer_rows(&self, width: u16, scrolling: bool) -> Vec<FooterRow> {
         match self.state {
-            PromptState::Normal if width < NARROW_WIDTH => vec![
-                FooterRow::Hints(&[(KEY_ALLOW_ONCE, "once"), (KEY_ALLOW_SESSION, "convo")]),
-                FooterRow::Hints(&[(KEY_ALLOW_LOCAL, "project"), (KEY_ALLOW_GLOBAL, "global")]),
-                FooterRow::Hints(&[
-                    (KEY_GUIDE_DENY, "guide deny"),
-                    (KEY_DENY_LOCAL, "deny project"),
-                ]),
-                FooterRow::Hints(&[
-                    (KEY_DENY_GLOBAL, "deny global"),
-                    (HINT_TAB, "authority"),
-                    (KEY_INPUT, "input"),
-                    (KEY_DETAILS, "details"),
-                ]),
-            ],
-            PromptState::Normal => vec![
-                FooterRow::Hints(&[
-                    (KEY_ALLOW_ONCE, "Allow once"),
-                    (KEY_ALLOW_SESSION, "Selected conversation"),
-                ]),
-                FooterRow::Hints(&[
-                    (KEY_ALLOW_LOCAL, "Selected project"),
-                    (KEY_ALLOW_GLOBAL, "Selected global"),
-                ]),
-                FooterRow::Hints(&[
-                    (KEY_GUIDE_DENY, "Guidance"),
-                    (KEY_DENY_LOCAL, "Deny project"),
-                    (KEY_DENY_GLOBAL, "Deny global"),
-                    (HINT_TAB, "Authority"),
-                    (KEY_INPUT, "Input"),
-                    (KEY_DETAILS, "Details"),
-                    (HINT_SCROLL, "Inspect"),
-                ]),
-            ],
+            PromptState::Normal => self.normal_footer(width, scrolling),
             PromptState::DenyEditing => vec![
                 FooterRow::Guidance,
-                FooterRow::Hints(&[(HINT_ENTER, "Deny"), (HINT_ESC, "Back")]),
+                FooterRow::Hints(vec![(HINT_ENTER, "Deny"), (HINT_ESC, "Back")]),
             ],
             PromptState::ConfirmAllowAlwaysLocal
             | PromptState::ConfirmAllowAlwaysGlobal
@@ -928,12 +957,12 @@ impl PermissionPrompt {
             | PromptState::ConfirmDenyAlwaysLocal
             | PromptState::ConfirmDenyAlwaysGlobal => {
                 if self.confirmation_phrase().is_some() {
-                    vec![FooterRow::Hints(&[
+                    vec![FooterRow::Hints(vec![
                         (HINT_ENTER, "Confirm phrase"),
                         (HINT_ESC, "Back"),
                     ])]
                 } else {
-                    vec![FooterRow::Hints(&[
+                    vec![FooterRow::Hints(vec![
                         (HINT_CONFIRM, "Confirm authority"),
                         (HINT_ESC, "Back"),
                     ])]
@@ -942,12 +971,71 @@ impl PermissionPrompt {
         }
     }
 
-    fn footer_lines(&self, width: u16) -> Vec<Line<'static>> {
+    /// The controls the prompt is offering right now. Widening is named only
+    /// for a selection with somewhere to go, and the page keys only once the
+    /// body does not fit, so the footer never advertises a key that does
+    /// nothing.
+    fn normal_footer(&self, width: u16, scrolling: bool) -> Vec<FooterRow> {
+        let narrow = width < NARROW_WIDTH;
+        let mut rows = if narrow {
+            vec![
+                FooterRow::Hints(vec![(KEY_ALLOW_ONCE, "once"), (KEY_ALLOW_SESSION, "convo")]),
+                FooterRow::Hints(vec![
+                    (KEY_ALLOW_LOCAL, "project"),
+                    (KEY_ALLOW_GLOBAL, "global"),
+                ]),
+                FooterRow::Hints(vec![
+                    (KEY_GUIDE_DENY, "guide deny"),
+                    (KEY_DENY_LOCAL, "deny project"),
+                ]),
+                FooterRow::Hints(vec![
+                    (KEY_DENY_GLOBAL, "deny global"),
+                    (HINT_SELECT, "pick"),
+                ]),
+            ]
+        } else {
+            vec![
+                FooterRow::Hints(vec![
+                    (KEY_ALLOW_ONCE, "Allow once"),
+                    (KEY_ALLOW_SESSION, "Selected conversation"),
+                ]),
+                FooterRow::Hints(vec![
+                    (KEY_ALLOW_LOCAL, "Selected project"),
+                    (KEY_ALLOW_GLOBAL, "Selected global"),
+                ]),
+                FooterRow::Hints(vec![
+                    (KEY_GUIDE_DENY, "Guidance"),
+                    (KEY_DENY_LOCAL, "Deny project"),
+                    (KEY_DENY_GLOBAL, "Deny global"),
+                    (HINT_SELECT, "Select"),
+                ]),
+            ]
+        };
+        let mut offered: HintPairs = Vec::new();
+        if self.can_widen() {
+            offered.push((HINT_WIDEN, if narrow { "widen" } else { "Widen" }));
+        }
+        if scrolling {
+            offered.push((HINT_PAGE, if narrow { "scroll" } else { "Scroll" }));
+        }
+        if let Some(FooterRow::Hints(pairs)) = rows.last_mut() {
+            pairs.extend(offered);
+        }
+        rows
+    }
+
+    /// Whether the selected authority is a ladder with another rung to take.
+    fn can_widen(&self) -> bool {
+        self.selection()
+            .is_some_and(|(rows, current)| rows[current].rungs.len() > 1)
+    }
+
+    fn footer_lines(&self, width: u16, scrolling: bool) -> Vec<Line<'static>> {
         let hovered = match &self.hover {
             Some(PromptTarget::Hint(key)) => Some(*key),
             _ => None,
         };
-        self.footer_rows(width)
+        self.footer_rows(width, scrolling)
             .into_iter()
             .map(|row| match row {
                 FooterRow::Hints(pairs) => {
@@ -958,7 +1046,7 @@ impl PermissionPrompt {
                             .iter()
                             .position(|(label, _)| hint_key(label) == Some(key))
                     });
-                    hint_line_hovered(pairs, index)
+                    hint_line_hovered(&pairs, index)
                 }
                 FooterRow::Guidance => self.guidance_line(),
             })
@@ -1022,11 +1110,40 @@ impl PermissionPrompt {
     }
 }
 
+/// What the tool was asked to do, followed by the inputs its own summary does
+/// not already name. The prompt shows no separate input block, so this line is
+/// where an argument that would change the meaning of the call has to appear.
+fn action_line(request: &PermissionRequest, label: Style, value: Style) -> Line<'static> {
+    let action = escape_terminal_controls(&request.presentation.action);
+    let args = super::tool_display::compact_args_for(
+        &request.tool.to_string(),
+        &request.presentation.action,
+        Some(&mask_secrets(&request.input)),
+        None,
+    );
+    let mut line = field_line("Action", action, label, value);
+    if let Some(args) = args {
+        line.push_span(Span::styled(escape_terminal_controls(&args), label));
+    }
+    line
+}
+
 fn field_line(name: &str, value: String, label_style: Style, value_style: Style) -> Line<'static> {
     Line::from(vec![
         Span::styled(format!("  {name:<12}"), label_style),
         Span::styled(value, value_style),
     ])
+}
+
+/// How far an authority reaches, said in colour. An uncautioned option keeps
+/// whatever style its row already called for.
+fn caution_style(caution: Option<PermissionCaution>, plain: Style) -> Style {
+    let t = theme::current();
+    match caution {
+        Some(PermissionCaution::Danger) => t.error,
+        Some(PermissionCaution::Warn) => t.tool_warning,
+        None => plain,
+    }
 }
 
 fn risk_name(risk: &PermissionRisk) -> &'static str {
@@ -1037,28 +1154,6 @@ fn risk_name(risk: &PermissionRisk) -> &'static str {
         PermissionRisk::Critical => "critical",
         PermissionRisk::Unknown => "unknown",
     }
-}
-
-/// Describes a collapsed input by shape and size, so the reviewer knows how
-/// much the expanded block holds before spending a screen on it.
-fn input_summary(input: &Value, bytes: usize) -> String {
-    let shape = match input {
-        Value::Object(fields) => plural(fields.len(), "field"),
-        Value::Array(items) => plural(items.len(), "item"),
-        Value::String(_) => "string".into(),
-        Value::Number(_) => "number".into(),
-        Value::Bool(_) => "boolean".into(),
-        Value::Null => "null".into(),
-    };
-    format!("{shape} · {}", plural(bytes, "byte"))
-}
-
-fn plural(count: usize, noun: &str) -> String {
-    format!("{count} {noun}{}", if count == 1 { "" } else { "s" })
-}
-
-fn masked_json(input: &Value) -> String {
-    serde_json::to_string_pretty(&mask_secrets(input)).unwrap_or_else(|_| "null".into())
 }
 
 fn mask_secrets(value: &Value) -> Value {
@@ -1144,6 +1239,7 @@ mod tests {
     use test_case::test_case;
 
     use crate::components::buffer_text;
+    use crate::components::keybindings::key as kb;
     use ratatui::style::Modifier;
 
     use super::*;
@@ -1275,14 +1371,25 @@ mod tests {
     }
 
     #[test]
-    fn action_and_full_input_render_before_controls() {
+    fn the_action_carries_its_arguments_before_the_controls() {
         let mut prompt = open_prompt();
         let screen = render(&mut prompt, 100, 24);
         let action = screen.find("Run native tool bash").unwrap();
-        let input = screen.find("cargo test").unwrap();
+        let args = screen.find("[command=cargo test]").unwrap();
         let controls = screen.find("Allow once").unwrap();
-        assert!(action < input && input < controls);
+        assert!(action < args && args < controls);
         assert!(screen.contains("Not sent to tool until approved"));
+    }
+
+    /// An argument the action already names would only be said twice.
+    #[test]
+    fn the_action_does_not_repeat_what_it_already_says() {
+        let mut prompt = PermissionPrompt::new();
+        let mut duplicated = request("echo", json!({"command": "cargo test"}));
+        duplicated.presentation.action = "Run cargo test".into();
+        prompt.enqueue(duplicated, None);
+        let screen = render(&mut prompt, 100, 24);
+        assert!(!screen.contains("command="), "{screen}");
     }
 
     fn prompt_with_mixed_resource_coverage() -> PermissionPrompt {
@@ -1356,78 +1463,24 @@ mod tests {
         assert_eq!(uncovered.spans.len(), 3);
     }
 
+    /// The page keys move the body; the arrows are the selection's.
     #[test]
-    fn long_mcp_input_is_inspectable_by_scrolling() {
-        let mut prompt = PermissionPrompt::new();
-        let tail = "TAIL-VALUE";
-        prompt.enqueue(
-            Box::new(PermissionRequest::from_legacy(
-                "mcp".into(),
-                ToolKey::parse("github.create_issue").unwrap(),
-                vec!["repository".into()],
-                json!({"payload": "x".repeat(240), "zz_last": tail}),
-                Path::new("/project"),
-                true,
-            )),
-            None,
-        );
-        prompt.handle_key(key(KeyCode::Char('i')));
-        let first = render(&mut prompt, 60, 12);
-        assert!(!first.contains(tail));
-        for _ in 0..20 {
-            prompt.handle_key(key(KeyCode::Down));
-        }
-        let scrolled = render(&mut prompt, 60, 12);
-        assert!(scrolled.contains(tail));
-        assert!(scrolled.contains("convo"));
+    fn the_page_keys_scroll_a_body_that_does_not_fit() {
+        let mut prompt = prompt_with_authorities();
+        let first = render(&mut prompt, 60, CRAMPED_HEIGHT);
+        prompt.handle_key(kb::SCROLL_HALF_DOWN.to_key_event());
+        let scrolled = render(&mut prompt, 60, CRAMPED_HEIGHT);
+        assert_ne!(first, scrolled, "{EXPECT_SCROLLED}");
+        assert!(prompt.scroll.offset() > 0, "{EXPECT_SCROLLED}");
     }
 
+    /// The page hint is a promise about what the keys will do, so it may not
+    /// appear on a body that is already whole.
     #[test]
-    fn input_is_collapsed_until_requested() {
-        let mut prompt = PermissionPrompt::new();
-        let secret_free_value = "PAYLOAD-VALUE";
-        prompt.enqueue(
-            request("collapsed", json!({"command": secret_free_value})),
-            None,
-        );
-
-        let collapsed = render(&mut prompt, 100, 24);
-        assert!(!collapsed.contains(secret_free_value));
-        assert!(collapsed.contains("1 field"));
-        assert!(collapsed.contains("i to expand"));
-
-        prompt.handle_key(key(KeyCode::Char('i')));
-        let expanded = render(&mut prompt, 100, 24);
-        assert!(expanded.contains(secret_free_value));
-        assert!(!expanded.contains("i to expand"));
-    }
-
-    #[test]
-    fn collapsing_the_input_shortens_the_prompt() {
-        let mut prompt = PermissionPrompt::new();
-        prompt.enqueue(
-            request(
-                "tall",
-                json!({"values": (0..24).map(|value| format!("line-{value}")).collect::<Vec<_>>() }),
-            ),
-            None,
-        );
-
-        let collapsed = prompt.height(100);
-        prompt.handle_key(key(KeyCode::Char('i')));
-
-        assert!(prompt.height(100) > collapsed);
-    }
-
-    #[test]
-    fn resolving_a_request_recollapses_the_input() {
-        let mut prompt = PermissionPrompt::new();
-        prompt.enqueue(request("first", json!({"command": "one"})), None);
-        prompt.enqueue(request("second", json!({"command": "two"})), None);
-        prompt.handle_key(key(KeyCode::Char('i')));
-        prompt.resolve("first");
-
-        assert!(render(&mut prompt, 100, 24).contains("i to expand"));
+    fn the_page_hint_appears_only_when_the_body_overflows() {
+        let mut prompt = prompt_with_authorities();
+        assert!(!render(&mut prompt, ROOMY_WIDTH, ROOMY_HEIGHT).contains(HINT_PAGE));
+        assert!(render(&mut prompt, ROOMY_WIDTH, CRAMPED_HEIGHT).contains(HINT_PAGE));
     }
 
     #[test]
@@ -1447,17 +1500,13 @@ mod tests {
         }
     }
 
+    /// The prompt asks for the room its own contents need rather than a fixed
+    /// number of rows.
     #[test]
-    fn prompt_uses_available_height_instead_of_fixed_eighteen_rows() {
-        let mut prompt = PermissionPrompt::new();
-        prompt.enqueue(
-            request(
-                "tall",
-                json!({"values": (0..24).map(|value| format!("line-{value}")).collect::<Vec<_>>() }),
-            ),
-            None,
-        );
-        assert!(prompt.height(100) > 18);
+    fn prompt_height_grows_with_what_it_has_to_show() {
+        let one = open_prompt().height(100);
+        let many = prompt_with_mixed_resource_coverage().height(100);
+        assert!(many > one, "{many} vs {one}");
     }
 
     #[test]
@@ -1472,13 +1521,10 @@ mod tests {
         structured.presentation.action = "run\u{1b}[2Jdanger".into();
         let mut prompt = PermissionPrompt::new();
         prompt.enqueue(structured, None);
-        prompt.handle_key(key(KeyCode::Char('i')));
         let screen = render(&mut prompt, 100, 24);
         assert!(!screen.contains('\u{1b}'));
         assert!(!screen.contains("do-not-show"));
-        assert!(screen.contains("api_token"));
-        assert!(screen.contains("<redacted:string>"));
-        assert!(screen.contains("<redacted:number>"));
+        assert!(screen.contains("api_token=<redacted:string>"));
         assert!(screen.contains("\\u{1b}"));
     }
 
@@ -1508,7 +1554,7 @@ mod tests {
         assert!(!screen.contains("token=secret"));
 
         for _ in 0..4 {
-            prompt.handle_key(key(KeyCode::Tab));
+            prompt.handle_key(key(KeyCode::Down));
         }
         prompt.handle_key(key(KeyCode::Char('a')));
         assert!(prompt.handle_key(key(KeyCode::Enter)).is_none());
@@ -1539,7 +1585,7 @@ mod tests {
         );
         let primary = render(&mut prompt, 100, 24);
         assert!(primary.contains("Allow whole MCP tool"));
-        prompt.handle_key(key(KeyCode::Tab));
+        prompt.handle_key(key(KeyCode::Down));
         let selected = render(&mut prompt, 100, 24);
         assert!(selected.contains("Broad: allow this MCP tool"));
         prompt.handle_key(key(KeyCode::Char('s')));
@@ -1570,12 +1616,215 @@ mod tests {
             None,
         );
         for _ in 0..4 {
-            prompt.handle_key(key(KeyCode::Tab));
+            prompt.handle_key(key(KeyCode::Down));
         }
 
         prompt.handle_key(key(KeyCode::Char('d')));
         let decision = prompt.handle_key(key(KeyCode::Enter)).unwrap();
         assert_eq!(decision.answer, PermissionAnswer::DenyAlwaysLocal);
+    }
+
+    const LADDER_PATH: &str = "/project/src/main.rs";
+    const EXPECT_LADDER: &str = "the file request offers a subtree ladder";
+
+    /// A file request, whose reusable authorities include the subtree ladder
+    /// the arrows widen along.
+    fn prompt_with_a_ladder() -> PermissionPrompt {
+        let mut prompt = PermissionPrompt::new();
+        prompt.enqueue(
+            Box::new(PermissionRequest::from_legacy(
+                "read".into(),
+                ToolKey::native("file_read"),
+                vec![LADDER_PATH.into()],
+                json!({ "filePath": LADDER_PATH }),
+                Path::new("/project"),
+                true,
+            )),
+            None,
+        );
+        prompt
+    }
+
+    fn ladder_rungs(prompt: &PermissionPrompt) -> Vec<String> {
+        authority_rows(
+            prompt.current().expect("a request is queued"),
+            &prompt.selected_option,
+        )
+        .into_iter()
+        .find(|row| row.rungs.len() > 1)
+        .expect(EXPECT_LADDER)
+        .rungs
+    }
+
+    /// What one authority row reads as, without the lines around it.
+    fn row_text(prompt: &PermissionPrompt, id: &str) -> String {
+        let body = prompt.body(prompt.current().expect("a request is queued"));
+        let line = body
+            .entries
+            .iter()
+            .find(|(entry, _)| entry == id)
+            .map(|(_, line)| *line)
+            .expect("the row is drawn");
+        body.lines[line as usize]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    /// Selects the ladder, whichever row it landed on.
+    fn select_ladder(prompt: &mut PermissionPrompt) -> Vec<String> {
+        let rungs = ladder_rungs(prompt);
+        prompt.select_authority(rungs[0].clone());
+        rungs
+    }
+
+    /// However many rungs a ladder has, it is one row and one step of the
+    /// selection: widening is what walks it.
+    #[test]
+    fn a_ladder_occupies_a_single_row() {
+        let mut prompt = prompt_with_a_ladder();
+        render(&mut prompt, ROOMY_WIDTH, ROOMY_HEIGHT);
+        let request = prompt.current().expect("a request is queued");
+        let offered = authorities(request).count();
+        let drawn = authority_targets(&prompt).len();
+        assert!(drawn < offered, "{drawn} rows for {offered} authorities");
+        assert_eq!(
+            drawn,
+            authority_rows(request, &prompt.selected_option).len()
+        );
+    }
+
+    #[test]
+    fn the_arrows_walk_the_ladder_and_stop_at_its_ends() {
+        let mut prompt = prompt_with_a_ladder();
+        let rungs = select_ladder(&mut prompt);
+        let widest = rungs.last().expect(EXPECT_LADDER);
+        for _ in 0..rungs.len() {
+            prompt.handle_key(key(KeyCode::Right));
+        }
+        assert_eq!(prompt.selected_option, *widest);
+        prompt.handle_key(key(KeyCode::Right));
+        assert_eq!(prompt.selected_option, *widest);
+
+        for _ in 0..rungs.len() {
+            prompt.handle_key(key(KeyCode::Left));
+        }
+        assert_eq!(prompt.selected_option, rungs[0]);
+        prompt.handle_key(key(KeyCode::Left));
+        assert_eq!(prompt.selected_option, rungs[0]);
+    }
+
+    /// A widened rung is a choice about this prompt, not a mode: leaving the
+    /// row and coming back offers the narrowest reach again.
+    #[test]
+    fn leaving_a_widened_ladder_returns_it_to_its_narrowest_rung() {
+        let mut prompt = prompt_with_a_ladder();
+        let rungs = select_ladder(&mut prompt);
+        prompt.handle_key(key(KeyCode::Right));
+        assert_eq!(prompt.selected_option, rungs[1]);
+        prompt.handle_key(key(KeyCode::Down));
+        prompt.handle_key(key(KeyCode::Up));
+        assert_eq!(prompt.selected_option, rungs[0]);
+    }
+
+    /// The arrows are the selection's, so they must not reach the scroll.
+    #[test]
+    fn up_and_down_select_rather_than_scroll() {
+        let mut prompt = prompt_with_a_ladder();
+        render(&mut prompt, ROOMY_WIDTH, ROOMY_HEIGHT);
+        let first = prompt.selected_option.clone();
+        prompt.handle_key(key(KeyCode::Down));
+        assert_ne!(prompt.selected_option, first);
+        prompt.handle_key(key(KeyCode::Up));
+        assert_eq!(prompt.selected_option, first);
+    }
+
+    /// A selection that walks past the fold has to be followed, or the prompt
+    /// grants something the reader cannot see.
+    #[test]
+    fn selecting_past_the_fold_brings_the_row_into_view() {
+        let mut prompt = prompt_with_a_ladder();
+        render(&mut prompt, ROOMY_WIDTH, CRAMPED_HEIGHT);
+        let rows = authority_rows(
+            prompt.current().expect("a request is queued"),
+            &prompt.selected_option,
+        )
+        .len();
+        for _ in 0..rows - 1 {
+            prompt.handle_key(key(KeyCode::Down));
+            render(&mut prompt, ROOMY_WIDTH, CRAMPED_HEIGHT);
+            let selected = PromptTarget::Authority(prompt.selected_option.clone());
+            hit_area(&prompt, &selected);
+        }
+        assert!(prompt.scroll.offset() > 0, "{EXPECT_SCROLLED}");
+    }
+
+    #[test]
+    fn a_widened_rung_is_the_one_granted() {
+        let mut prompt = prompt_with_a_ladder();
+        let rungs = select_ladder(&mut prompt);
+        prompt.handle_key(key(KeyCode::Right));
+        prompt.handle_key(key(KeyCode::Char('s')));
+        let decision = prompt
+            .handle_key(key(KeyCode::Enter))
+            .expect("the confirmation answered");
+        assert_eq!(
+            decision.answer,
+            PermissionAnswer::AllowOption {
+                option_id: rungs[1].clone(),
+                lifetime: PermissionLifetime::Conversation,
+            }
+        );
+    }
+
+    /// Widening is offered where it exists and nowhere else, in the footer and
+    /// on the row alike.
+    #[test]
+    fn the_widen_controls_appear_only_on_a_ladder() {
+        let mut prompt = prompt_with_a_ladder();
+        select_ladder(&mut prompt);
+        let ladder = render(&mut prompt, ROOMY_WIDTH, ROOMY_HEIGHT);
+        assert!(ladder.contains(HINT_WIDEN), "{ladder}");
+        assert!(ladder.contains(WIDEN_MARK.trim_start()), "{ladder}");
+
+        prompt.select_authority("allow_exact".into());
+        let exact = render(&mut prompt, ROOMY_WIDTH, ROOMY_HEIGHT);
+        assert!(!exact.contains(HINT_WIDEN), "{exact}");
+        assert!(!exact.contains(WIDEN_MARK.trim_start()), "{exact}");
+    }
+
+    /// Every rung is labelled the same, so the row has to name the reach it
+    /// currently stands for or widening looks like it did nothing.
+    #[test]
+    fn widening_changes_what_the_row_shows() {
+        let mut prompt = prompt_with_a_ladder();
+        let rungs = select_ladder(&mut prompt);
+        assert!(row_text(&prompt, &rungs[0]).contains("/project/src/**"));
+
+        prompt.handle_key(key(KeyCode::Right));
+        let widened = row_text(&prompt, &rungs[1]);
+        assert!(widened.contains("/project/**"), "{widened}");
+        assert!(!widened.contains("/project/src/**"), "{widened}");
+    }
+
+    /// A rung that reaches past the home directory has to say so where the
+    /// reader is looking, not only in the sentence below it.
+    #[test]
+    fn the_widest_rung_is_badged_and_coloured() {
+        let mut prompt = prompt_with_a_ladder();
+        let rungs = select_ladder(&mut prompt);
+        prompt.select_authority(rungs.last().expect(EXPECT_LADDER).clone());
+        assert!(render(&mut prompt, ROOMY_WIDTH, ROOMY_HEIGHT).contains(BADGE_DANGER));
+
+        let body = prompt.body(prompt.current().expect("a request is queued"));
+        let badge = body
+            .lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .find(|span| span.content == BADGE_DANGER)
+            .expect("the widest rung is badged");
+        assert_eq!(badge.style, theme::current().error);
     }
 
     /// Wide enough for the three-row footer and tall enough that nothing in
@@ -1672,14 +1921,17 @@ mod tests {
         assert_eq!(once.right(), session.x);
     }
 
-    /// A label the prompt does not act on must not become a button.
-    #[test]
-    fn the_scroll_hint_is_not_clickable() {
-        assert!(hint_key(HINT_SCROLL).is_none());
-        let mut prompt = open_prompt();
-        render(&mut prompt, ROOMY_WIDTH, ROOMY_HEIGHT);
+    /// A label the prompt does not act on must not become a button: an arrow
+    /// or a page key is a caption, and no click can synthesise it.
+    #[test_case(HINT_SELECT ; "select")]
+    #[test_case(HINT_WIDEN ; "widen")]
+    #[test_case(HINT_PAGE ; "page")]
+    fn a_caption_hint_is_not_clickable(label: &str) {
+        assert!(hint_key(label).is_none());
+        let mut prompt = prompt_with_authorities();
+        render(&mut prompt, ROOMY_WIDTH, CRAMPED_HEIGHT);
         assert!(!prompt.row_hits.iter().any(|hit| {
-            matches!(&hit.target, PromptTarget::Hint(k) if !matches!(k.code, KeyCode::Char(c) if c.is_ascii_alphanumeric()) && k.code != KeyCode::Tab && k.code != KeyCode::Esc && k.code != KeyCode::Enter)
+            matches!(&hit.target, PromptTarget::Hint(k) if !matches!(k.code, KeyCode::Char(c) if c.is_ascii_alphanumeric()) && k.code != KeyCode::Esc && k.code != KeyCode::Enter)
         }));
     }
 
@@ -1764,6 +2016,7 @@ mod tests {
     /// every offset rather than only the unscrolled one.
     const CRAMPED_HEIGHT: u16 = 12;
     const BODY_PROBE_ROWS: usize = 40;
+    const EXPECT_SCROLLED: &str = "the page key has to move the body";
     const EXPECT_ON_GLYPHS: &str = "the hit rect has to sit on the row it claims";
 
     fn screen_rows(prompt: &mut PermissionPrompt, height: u16) -> Vec<String> {
@@ -1835,7 +2088,6 @@ mod tests {
     }
 
     #[test_case(HINT_ESC, KeyCode::Esc ; "named_esc")]
-    #[test_case(HINT_TAB, KeyCode::Tab ; "named_tab")]
     #[test_case(HINT_ENTER, KeyCode::Enter ; "named_enter")]
     #[test_case(HINT_CONFIRM, KeyCode::Enter ; "first_of_two")]
     #[test_case(KEY_ALLOW_GLOBAL, KeyCode::Char('A') ; "case_is_kept")]

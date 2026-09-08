@@ -358,6 +358,19 @@ impl ModalScroll {
         }
     }
 
+    /// Scrolls the least distance that brings a row range into view, so moving
+    /// a selection past the edge follows it instead of jumping.
+    pub fn reveal(&mut self, top: u16, height: u16) {
+        if top < self.offset {
+            self.offset = top;
+        } else if top.saturating_add(height) > self.offset.saturating_add(self.viewport_h) {
+            self.offset = top
+                .saturating_add(height)
+                .saturating_sub(self.viewport_h.max(1));
+        }
+        self.clamp();
+    }
+
     pub fn handle_key(&mut self, key_event: KeyEvent) -> bool {
         use keybindings::key;
         match key_event.code {
