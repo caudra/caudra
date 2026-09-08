@@ -11,7 +11,7 @@ use caudra_providers::{
 use caudra_storage::usage_ledger::LedgerPurpose;
 use tracing::info;
 
-use super::history::{History, remove_orphaned_tool_results, repair_tool_pairs};
+use super::history::{History, is_user_turn, remove_orphaned_tool_results, repair_tool_pairs};
 use super::run::estimate_message_tokens;
 use super::streaming::{StreamError, stream_with_retry};
 use crate::cancel::CancelToken;
@@ -139,16 +139,6 @@ fn head_end(messages: &[Message], budget: u32) -> usize {
         }
     }
     split
-}
-
-fn is_user_turn(message: &Message) -> bool {
-    matches!(message.role, Role::User)
-        && !message.is_observation()
-        && message.display_text.as_deref() != Some("")
-        && !message
-            .content
-            .iter()
-            .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
 }
 
 fn finish_compact(

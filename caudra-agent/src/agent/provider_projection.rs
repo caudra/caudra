@@ -7,12 +7,17 @@ use caudra_providers::{
 };
 use serde_json::Value;
 
-use crate::tools::TOOL_OUTPUT_TOOL_NAME;
+use super::history::is_user_turn;
+use crate::tools::{SKILL_TOOL_NAME, TOOL_OUTPUT_TOOL_NAME};
 
 const PROTECTED_USER_TURNS: usize = 2;
 const PROTECTED_OLD_RESULT_TOKENS: usize = 40_000;
 const PRUNE_TRIGGER_TOKENS: usize = 20_000;
 const READ_LIMIT: usize = 200;
+/// Results that must survive pruning: the retrieval tool's own output would
+/// send the model back to a notice it already read, and a skill's payload is
+/// the instructions the agent is still following.
+const PRUNE_PROTECTED_TOOLS: &[&str] = &[TOOL_OUTPUT_TOOL_NAME, SKILL_TOOL_NAME];
 
 struct Candidate {
     message_index: usize,
@@ -56,7 +61,7 @@ pub fn project<'a>(messages: &'a [Message], tools: &Value) -> Cow<'a, [Message]>
                     };
                     if tool_names
                         .get(tool_use_id.as_str())
-                        .is_some_and(|name| *name == TOOL_OUTPUT_TOOL_NAME)
+                        .is_some_and(|name| PRUNE_PROTECTED_TOOLS.contains(name))
                     {
                         return None;
                     }
@@ -226,19 +231,9 @@ fn protected_turn_start(messages: &[Message]) -> usize {
         .iter()
         .enumerate()
         .rev()
-        .filter(|(_, message)| is_actual_user_turn(message))
+        .filter(|(_, message)| is_user_turn(message))
         .nth(PROTECTED_USER_TURNS - 1)
         .map_or(0, |(index, _)| index)
-}
-
-fn is_actual_user_turn(message: &Message) -> bool {
-    matches!(message.role, Role::User)
-        && !message.is_observation()
-        && message.display_text.as_deref() != Some("")
-        && !message
-            .content
-            .iter()
-            .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
 }
 
 #[cfg(test)]
@@ -532,13 +527,14 @@ mod tests {
     }
 
     #[test]
-    fn errors_missing_refs_and_retrieval_results_are_never_candidates() {
+    fn errors_missing_refs_and_protected_tools_are_never_candidates() {
         let large = PRUNE_TRIGGER_TOKENS + 1;
         let mut history = vec![Message::user("old request".into())];
         for (id, name, is_error, with_ref) in [
             ("error", "bash", true, true),
             ("missing-ref", "bash", false, false),
             ("read-result", TOOL_OUTPUT_TOOL_NAME, false, true),
+            ("skill-result", SKILL_TOOL_NAME, false, true),
         ] {
             history.push(tool_use(id, name));
             history.push(result(id, large, is_error, with_ref));
@@ -547,7 +543,7 @@ mod tests {
 
         let projected = project(&history, &tools(true));
         assert!(result_content(&projected, "candidate").starts_with("[Old tool result pruned."));
-        for id in ["error", "missing-ref", "read-result"] {
+        for id in ["error", "missing-ref", "read-result", "skill-result"] {
             assert!(!result_content(&projected, id).starts_with("[Old tool result pruned."));
         }
     }

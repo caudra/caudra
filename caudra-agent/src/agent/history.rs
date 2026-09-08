@@ -450,6 +450,20 @@ fn synthesize_missing_tool_results(messages: &mut Vec<Message>) {
     }
 }
 
+/// A message the user actually sent, rather than an observation, a synthetic
+/// nudge, or the carrier a tool result rides in. Compaction cuts the preserved
+/// tail here and the provider projection starts protecting here, because both
+/// need a boundary that leaves every tool call paired with its result.
+pub(super) fn is_user_turn(message: &Message) -> bool {
+    matches!(message.role, Role::User)
+        && !message.is_observation()
+        && message.display_text.as_deref() != Some("")
+        && !message
+            .content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
+}
+
 /// Empty markers and synthetic prompts (empty `display_text`) are
 /// bookkeeping, not conversation.
 fn is_system_padding(m: &Message) -> bool {
