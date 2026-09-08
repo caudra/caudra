@@ -22,6 +22,11 @@ use crate::{BufferSnapshot, ToolInput, ToolOutput, ToolOutputLimits};
 use super::deferral::DeferredTool;
 use super::{DescriptionContext, ToolContext};
 
+const EXAMPLES_HEADER: &str = "Examples:";
+const EXAMPLE_CODE_KEY: &str = "code";
+const EXAMPLE_FENCE_OPEN: &str = "\n```\n";
+const EXAMPLE_FENCE_CLOSE: &str = "\n```";
+
 bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct ToolAudience: u8 {
@@ -807,20 +812,22 @@ impl RegistrySnapshot {
     }
 }
 
+/// The fallback for models that take examples as prose rather than as a
+/// structured field. An example is either a prewritten snippet under `code` or,
+/// as every native tool writes them, a literal input object; rendering only the
+/// former emitted a bare header and silently dropped every example.
 fn format_examples_as_text(examples: &Value) -> Option<String> {
-    let arr = examples.as_array()?;
-    if arr.is_empty() {
-        return None;
+    let mut text = String::from(EXAMPLES_HEADER);
+    for example in examples.as_array()? {
+        let body = match example.get(EXAMPLE_CODE_KEY).and_then(Value::as_str) {
+            Some(code) => code.to_owned(),
+            None => serde_json::to_string_pretty(example).ok()?,
+        };
+        text.push_str(EXAMPLE_FENCE_OPEN);
+        text.push_str(&body);
+        text.push_str(EXAMPLE_FENCE_CLOSE);
     }
-    let mut text = String::from("Examples:");
-    for ex in arr {
-        if let Some(code) = ex.get("code").and_then(|c| c.as_str()) {
-            text.push_str("\n```\n");
-            text.push_str(code);
-            text.push_str("\n```");
-        }
-    }
-    Some(text)
+    (text.len() > EXAMPLES_HEADER.len()).then_some(text)
 }
 
 #[cfg(test)]
@@ -828,6 +835,9 @@ mod tests {
     use super::*;
     use crate::template::Vars;
     use test_case::test_case;
+
+    const EXAMPLES_DROPPED: &str = "an example body must survive into the text form";
+    const SNIPPET: &str = "batch { file_read }";
 
     struct MockTool {
         name: String,
@@ -1303,6 +1313,32 @@ mod tests {
         assert_eq!(result.written_paths, ["first.rs", "second.rs"]);
         assert_eq!(result.model_output.as_deref(), Some("model-only"));
     }
+
+    /// Every native tool writes its examples as literal input objects, so
+    /// rendering only a `code` key shipped the header alone. A header with
+    /// nothing under it is worse than no header.
+    #[test]
+    fn an_input_object_example_reaches_the_text_form() {
+        let text = format_examples_as_text(&json!([{ "pattern": "src/**/*.ts" }]))
+            .expect(EXAMPLES_DROPPED);
+
+        assert!(text.contains("src/**/*.ts"), "{EXAMPLES_DROPPED}");
+        assert!(text.starts_with(EXAMPLES_HEADER));
+    }
+
+    #[test]
+    fn a_prewritten_snippet_still_wins_over_the_input_object() {
+        let text = format_examples_as_text(&json!([{ "code": SNIPPET }])).expect(EXAMPLES_DROPPED);
+
+        assert!(text.contains(SNIPPET));
+        assert!(!text.contains(EXAMPLE_CODE_KEY), "the key leaked into prose");
+    }
+
+    #[test]
+    fn no_examples_means_no_dangling_header() {
+        assert!(format_examples_as_text(&json!([])).is_none());
+        assert!(format_examples_as_text(&json!({})).is_none());
+    }
 }
 
 #[cfg(test)]
@@ -1337,4 +1373,5 @@ mod effect_tests {
             "{SPELLING_MSG}"
         );
     }
+
 }
