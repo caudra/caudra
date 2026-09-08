@@ -135,6 +135,8 @@ const TOOLS_COMMAND: &str = "/tools";
 const TOOLS_UPPERCASE_COMMAND: &str = "/TOOLS";
 const TOOLS_EXCESS_ARGS_COMMAND: &str = "/tools all";
 const TOOLSMITH_PROMPT: &str = "/toolsmith";
+const SKILLS_COMMAND: &str = "/skills";
+const SKILLS_EXCESS_ARGS_COMMAND: &str = "/skills all";
 const CONTEXT_EXISTING_MESSAGE: &str = "existing conversation";
 const MAIN_CONTEXT_SPEC: &str = "test/main-context";
 const TASK_CONTEXT_SPEC: &str = "test/task-context";
@@ -2399,6 +2401,7 @@ fn with_custom_command(app: &mut App, name: &str, content: &str) {
             content: content.to_string(),
             scope: caudra_agent::command::CommandScope::Project,
             accepts_args: false,
+            source: PathBuf::from("/project/.caudra/commands/custom.md"),
         }]),
         McpSnapshotReader::empty(),
         LuaCommandReader::empty(),
@@ -6714,6 +6717,26 @@ fn tools_command_is_local_in_both_the_main_chat_and_a_task(
     assert_eq!(task.tools_modal.is_open(), expected_open);
 }
 
+#[test_case(SKILLS_COMMAND, true, None ; "summary")]
+#[test_case(SKILLS_EXCESS_ARGS_COMMAND, false, Some(SKILLS_USAGE) ; "excess_args")]
+fn skills_command_is_local_in_both_the_main_chat_and_a_task(
+    command: &str,
+    expected_open: bool,
+    expected_flash: Option<&str>,
+) {
+    let mut app = test_app();
+    let actions = type_and_submit(&mut app, command);
+    assert!(actions.is_empty());
+    assert_eq!(app.skills_modal.is_open(), expected_open);
+    assert_eq!(app.status_bar.flash_text(), expected_flash);
+
+    let mut task = steerable_task_app();
+    let actions = type_and_submit(&mut task, command);
+    assert!(actions.is_empty());
+    assert!(task.subagent_steers[TASK_ID].entries().is_empty());
+    assert_eq!(task.skills_modal.is_open(), expected_open);
+}
+
 #[test]
 fn toolsmith_is_not_intercepted_as_the_tools_command() {
     let mut app = test_app();
@@ -9257,6 +9280,10 @@ fn open_tools_modal(app: &mut App) {
     app.tools_modal.open();
 }
 
+fn open_skills_modal(app: &mut App) {
+    app.skills_modal.open();
+}
+
 fn open_goal_modal(app: &mut App) {
     app.goal_modal.open();
 }
@@ -9281,6 +9308,7 @@ fn open_argument_prompt(app: &mut App) {
 #[test_case(open_usage_modal   ; "usage_modal")]
 #[test_case(open_context_modal ; "context_modal")]
 #[test_case(open_tools_modal   ; "tools_modal")]
+#[test_case(open_skills_modal  ; "skills_modal")]
 #[test_case(open_goal_modal    ; "goal_modal")]
 #[test_case(open_model_picker  ; "model_picker")]
 #[test_case(open_command_modal ; "command_modal")]
@@ -9305,6 +9333,7 @@ fn a_press_outside_a_modal_dismisses_it(open: fn(&mut App)) {
 #[test_case(open_usage_modal   ; "usage_modal")]
 #[test_case(open_context_modal ; "context_modal")]
 #[test_case(open_tools_modal   ; "tools_modal")]
+#[test_case(open_skills_modal  ; "skills_modal")]
 #[test_case(open_goal_modal    ; "goal_modal")]
 #[test_case(open_model_picker  ; "model_picker")]
 #[test_case(open_command_modal ; "command_modal")]

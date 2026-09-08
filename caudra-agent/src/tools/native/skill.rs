@@ -1,9 +1,11 @@
 //! `skill`: load a named instruction set on demand.
 //!
-//! Skills are `SKILL.md` files with YAML frontmatter, discovered across the
-//! config directory, the user's home, and every project ancestor up to the
-//! repository root. Only the names and descriptions go in the tool
-//! description; the body is paid for when the model asks for it.
+//! Skills are `SKILL.md` files with YAML frontmatter, discovered in the config
+//! directory, the user's home, and every project ancestor up to the repository
+//! root. Each of those places is a tier list: the first directory that exists
+//! wins outright, and the compatibility directories below it are never read.
+//! Only the names and descriptions go in the tool description; the body is
+//! paid for when the model asks for it.
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -14,8 +16,8 @@ use arc_swap::ArcSwap;
 use serde_json::Value;
 
 use crate::tools::registry::{
-    ExecFuture, HeaderFuture, HeaderResult, ParseError, PermissionScopes, Tool, ToolExecResult,
-    ToolInvocation, ToolRegistry,
+    ExecFuture, HeaderFuture, HeaderResult, ParseError, PermissionScopes, RegisteredTool, Tool,
+    ToolExecResult, ToolInvocation, ToolRegistry,
 };
 use crate::tools::schema::{ParamKind, ParamSchema, Property, to_json_schema, validate};
 use crate::tools::{BoxFuture, DescriptionContext, SKILL_TOOL_NAME, ToolContext, relative_path};
@@ -27,7 +29,10 @@ pub const DESCRIPTION: &str =
 const SKILL_FILE: &str = "SKILL.md";
 const NOT_FOUND: &str = "skill not found: ";
 const NO_SKILLS: &str = "No skills available.";
+const SKILLS_SUBDIR: &str = "skills";
 
+/// Tier lists, highest priority first. The first directory that exists is the
+/// only one read, so a Caudra directory shuts out the compatibility ones.
 const PROJECT_SKILL_DIRS: &[&str] = &[
     ".caudra/skills",
     ".claude/skills",
@@ -76,17 +81,73 @@ fn installed_builtin() -> Option<Arc<BuiltinSkill>> {
     BUILTIN.load().as_ref().clone()
 }
 
+/// Where a skill or a search directory came from, so a report can say why one
+/// name won and another was never read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkillScope {
+    Builtin,
+    User,
+    Project,
+}
+
+impl SkillScope {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Builtin => "builtin",
+            Self::User => "user",
+            Self::Project => "project",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkillDirState {
+    /// Exists and is scanned.
+    Selected,
+    /// A higher tier in the same group won, so this one is never read.
+    Superseded,
+    /// Nothing here, and no higher tier claimed the group.
+    Missing,
+}
+
+impl SkillDirState {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Selected => "selected",
+            Self::Superseded => "superseded",
+            Self::Missing => "missing",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillDirCandidate {
+    pub path: PathBuf,
+    pub scope: SkillScope,
+    pub state: SkillDirState,
+}
+
+impl SkillDirCandidate {
+    fn is_selected(&self) -> bool {
+        self.state == SkillDirState::Selected
+    }
+}
+
 #[derive(Clone)]
 struct Skill {
     name: String,
     description: String,
     location: String,
+    scope: SkillScope,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkillInventoryEntry {
     pub name: String,
     pub description: String,
+    /// The `SKILL.md` path, or `builtin:<name>` for a skill Caudra ships.
+    pub location: String,
+    pub scope: SkillScope,
 }
 
 struct SkillCatalog {
@@ -95,7 +156,7 @@ struct SkillCatalog {
 }
 
 pub struct SkillTool {
-    dirs: Vec<PathBuf>,
+    dirs: Vec<SkillDirCandidate>,
     /// Built on first use, not at registration: tools register before the
     /// config that decides whether the builtin skill exists. Memoized so the
     /// list the model was given cannot change under it mid-session.
@@ -123,6 +184,8 @@ impl SkillTool {
                     .map(|skill| SkillInventoryEntry {
                         name: skill.name.clone(),
                         description: skill.description.clone(),
+                        location: skill.location.clone(),
+                        scope: skill.scope,
                     })
                     .collect(),
             }
@@ -143,6 +206,31 @@ pub fn inventory(registry: &ToolRegistry) -> Vec<SkillInventoryEntry> {
                 .map(|tool| tool.inventory().to_vec())
         })
         .unwrap_or_default()
+}
+
+/// Every candidate directory with the state precedence gave it, so `/skills`
+/// and `caudra skills` can show what was skipped rather than leaving a missing
+/// skill unexplained.
+pub fn directories(registry: &ToolRegistry) -> Vec<SkillDirCandidate> {
+    registry
+        .get(SKILL_TOOL_NAME)
+        .and_then(|registered| {
+            registered
+                .downcast_ref::<SkillTool>()
+                .map(|tool| tool.dirs.clone())
+        })
+        .unwrap_or_default()
+}
+
+/// The body exactly as the model receives it, for `caudra skills <name>`.
+pub fn load(registry: &ToolRegistry, name: &str) -> Result<String, String> {
+    let registered = registry.get(SKILL_TOOL_NAME);
+    let dirs = registered
+        .as_ref()
+        .and_then(RegisteredTool::downcast_ref::<SkillTool>)
+        .map(|tool| tool.dirs.as_slice())
+        .unwrap_or_default();
+    load_from(name, dirs, installed_builtin().as_deref())
 }
 
 impl Tool for SkillTool {
@@ -177,7 +265,7 @@ impl Tool for SkillTool {
 
 struct SkillCall {
     name: String,
-    dirs: Vec<PathBuf>,
+    dirs: Vec<SkillDirCandidate>,
 }
 
 impl ToolInvocation for SkillCall {
@@ -186,12 +274,14 @@ impl ToolInvocation for SkillCall {
     }
 
     /// Scoped to the directories a skill can come from, not the individual
-    /// file: approving `skill` once should not re-prompt per skill.
+    /// file: approving `skill` once should not re-prompt per skill. Superseded
+    /// directories are never read, so granting them would over-approve.
     fn permission_scopes(&self) -> BoxFuture<'_, Option<PermissionScopes>> {
         let scopes: Vec<String> = self
             .dirs
             .iter()
-            .map(|dir| format!("{}/**", dir.to_string_lossy().trim_end_matches('/')))
+            .filter(|dir| dir.is_selected())
+            .map(|dir| format!("{}/**", dir.path.to_string_lossy().trim_end_matches('/')))
             .collect();
         Box::pin(std::future::ready((!scopes.is_empty()).then_some(
             PermissionScopes {
@@ -219,7 +309,7 @@ impl SkillCall {
 
 fn load_from(
     name: &str,
-    dirs: &[PathBuf],
+    dirs: &[SkillDirCandidate],
     builtin: Option<&BuiltinSkill>,
 ) -> Result<String, String> {
     let discovered = discover(dirs, builtin);
@@ -246,7 +336,7 @@ fn skill_list(skills: &BTreeMap<String, Skill>) -> String {
     )
 }
 
-fn discover(dirs: &[PathBuf], builtin: Option<&BuiltinSkill>) -> BTreeMap<String, Skill> {
+fn discover(dirs: &[SkillDirCandidate], builtin: Option<&BuiltinSkill>) -> BTreeMap<String, Skill> {
     let mut skills = BTreeMap::new();
     if let Some(builtin) = builtin {
         skills.insert(
@@ -255,11 +345,12 @@ fn discover(dirs: &[PathBuf], builtin: Option<&BuiltinSkill>) -> BTreeMap<String
                 name: builtin.name.clone(),
                 description: builtin.description.clone(),
                 location: builtin_location(&builtin.name),
+                scope: SkillScope::Builtin,
             },
         );
     }
-    for dir in dirs {
-        scan(dir, &mut skills);
+    for dir in dirs.iter().filter(|dir| dir.is_selected()) {
+        scan(&dir.path, dir.scope, &mut skills);
     }
     skills
 }
@@ -268,7 +359,7 @@ fn builtin_location(name: &str) -> String {
     format!("builtin:{name}")
 }
 
-fn scan(dir: &Path, skills: &mut BTreeMap<String, Skill>) {
+fn scan(dir: &Path, scope: SkillScope, skills: &mut BTreeMap<String, Skill>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -295,6 +386,7 @@ fn scan(dir: &Path, skills: &mut BTreeMap<String, Skill>) {
                 name,
                 description,
                 location: path.to_string_lossy().into_owned(),
+                scope,
             },
         );
     }
@@ -351,28 +443,47 @@ fn parse_frontmatter(content: &str) -> (BTreeMap<String, String>, String) {
     (fields, body)
 }
 
-/// Search order is widest to narrowest, and the map keeps the last write, so a
-/// project skill shadows a global one of the same name.
-fn skill_dirs() -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    let mut push = |dir: PathBuf| {
-        if !dirs.contains(&dir) {
-            dirs.push(dir);
-        }
-    };
+/// One tier group. The first directory that exists is selected and everything
+/// below it is superseded, existing or not: a Caudra directory is a decision,
+/// not a merge.
+fn resolve_group(
+    candidates: impl IntoIterator<Item = PathBuf>,
+    scope: SkillScope,
+    dirs: &mut Vec<SkillDirCandidate>,
+) {
+    let mut claimed = false;
+    for path in candidates {
+        let state = if claimed {
+            SkillDirState::Superseded
+        } else if path.is_dir() {
+            claimed = true;
+            SkillDirState::Selected
+        } else {
+            SkillDirState::Missing
+        };
+        dirs.push(SkillDirCandidate { path, scope, state });
+    }
+}
 
-    if let Ok(config) = caudra_storage::paths::config_dir() {
-        push(config.join("skills"));
-    }
-    if let Some(home) = caudra_storage::paths::home() {
-        for rel in GLOBAL_SKILL_DIRS {
-            push(home.join(rel));
-        }
-    }
+/// Search order is widest to narrowest, and the map keeps the last write, so a
+/// project skill shadows a global one of the same name. The global tier is one
+/// group; each project ancestor is a group of its own, so levels still merge
+/// and a repo-root skill still shadows a nested one.
+fn skill_dirs() -> Vec<SkillDirCandidate> {
+    let mut dirs = Vec::new();
+    let config = caudra_storage::paths::config_dir().ok();
+    let home = caudra_storage::paths::home();
+    let global = caudra_storage::paths::user_config_dir(config.as_deref(), SKILLS_SUBDIR)
+        .into_iter()
+        .chain(
+            home.iter()
+                .flat_map(|home| GLOBAL_SKILL_DIRS.iter().map(|rel| home.join(rel))),
+        );
+    resolve_group(global, SkillScope::User, &mut dirs);
+
     for ancestor in project_ancestors() {
-        for rel in PROJECT_SKILL_DIRS {
-            push(ancestor.join(rel));
-        }
+        let level = PROJECT_SKILL_DIRS.iter().map(|rel| ancestor.join(rel));
+        resolve_group(level, SkillScope::Project, &mut dirs);
     }
     dirs
 }
@@ -405,11 +516,19 @@ mod tests {
     const BUILTIN_BODY: &str = "how to write plugins";
     const BUILTIN_DESC: &str = "author plugins";
 
-    fn skill_dir(temp: &tempfile::TempDir, name: &str, content: &str) -> PathBuf {
+    fn selected(path: PathBuf) -> SkillDirCandidate {
+        SkillDirCandidate {
+            path,
+            scope: SkillScope::Project,
+            state: SkillDirState::Selected,
+        }
+    }
+
+    fn skill_dir(temp: &tempfile::TempDir, name: &str, content: &str) -> SkillDirCandidate {
         let dir = temp.path().join(name);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join(SKILL_FILE), content).unwrap();
-        temp.path().to_path_buf()
+        selected(temp.path().to_path_buf())
     }
 
     fn plugin_dev_skill(reference: Option<PathBuf>) -> BuiltinSkill {
@@ -522,10 +641,18 @@ mod tests {
     }
 
     #[test]
-    fn permission_scopes_cover_every_search_directory() {
+    fn permission_scopes_cover_every_selected_directory() {
         let call = SkillCall {
             name: "x".into(),
-            dirs: vec![PathBuf::from("/a/skills"), PathBuf::from("/b/skills")],
+            dirs: vec![
+                selected(PathBuf::from("/a/skills")),
+                selected(PathBuf::from("/b/skills")),
+                SkillDirCandidate {
+                    path: PathBuf::from("/c/skills"),
+                    scope: SkillScope::User,
+                    state: SkillDirState::Superseded,
+                },
+            ],
         };
         let scopes = smol::block_on(call.permission_scopes()).unwrap();
         assert_eq!(scopes.scopes, vec!["/a/skills/**", "/b/skills/**"]);
@@ -585,6 +712,104 @@ mod tests {
         let out = load_from(BUILTIN_NAME, &[root], Some(&builtin)).unwrap();
         assert!(out.contains("real file content"), "{out}");
         assert!(!out.contains(BUILTIN_BODY), "{out}");
+    }
+
+    const TIERS: &[&str] = &["caudra", "claude", "opencode", "agents"];
+
+    fn tier_group(temp: &tempfile::TempDir, existing: &[&str]) -> Vec<SkillDirCandidate> {
+        for name in existing {
+            std::fs::create_dir_all(temp.path().join(name)).unwrap();
+        }
+        let mut dirs = Vec::new();
+        resolve_group(
+            TIERS.iter().map(|tier| temp.path().join(tier)),
+            SkillScope::User,
+            &mut dirs,
+        );
+        dirs
+    }
+
+    fn states(dirs: &[SkillDirCandidate]) -> Vec<SkillDirState> {
+        dirs.iter().map(|dir| dir.state).collect()
+    }
+
+    use SkillDirState::{Missing, Selected, Superseded};
+
+    #[test_case(
+        &["caudra"], &[Selected, Superseded, Superseded, Superseded]
+        ; "the_caudra_directory_shuts_out_the_rest"
+    )]
+    #[test_case(
+        &["claude", "opencode"], &[Missing, Selected, Superseded, Superseded]
+        ; "the_first_existing_directory_wins"
+    )]
+    #[test_case(
+        &["agents"], &[Missing, Missing, Missing, Selected]
+        ; "the_last_tier_is_still_reachable"
+    )]
+    #[test_case(&[], &[Missing, Missing, Missing, Missing] ; "nothing_to_select")]
+    fn a_tier_group_selects_the_first_existing_directory(
+        existing: &[&str],
+        expected: &[SkillDirState],
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        assert_eq!(states(&tier_group(&temp, existing)), expected);
+    }
+
+    #[test]
+    fn a_regular_file_never_claims_a_tier() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join(TIERS[0]), "not a directory").unwrap();
+        assert_eq!(
+            states(&tier_group(&temp, &["claude"])),
+            &[Missing, Selected, Superseded, Superseded]
+        );
+    }
+
+    /// The whole point of the tiers: an empty Caudra directory is an answer,
+    /// not a reason to fall through to somebody else's skills.
+    #[test]
+    fn an_empty_selected_directory_still_shuts_out_the_rest() {
+        let temp = tempfile::tempdir().unwrap();
+        let compat = temp.path().join(TIERS[1]).join("deploy");
+        std::fs::create_dir_all(&compat).unwrap();
+        std::fs::write(compat.join(SKILL_FILE), "---\nname: deploy\n---\nbody\n").unwrap();
+
+        let dirs = tier_group(&temp, &["caudra", "claude"]);
+        assert_eq!(
+            states(&dirs),
+            &[Selected, Superseded, Superseded, Superseded]
+        );
+        assert!(discover(&dirs, None).is_empty());
+    }
+
+    #[test]
+    fn every_entry_carries_where_it_came_from() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut root = skill_dir(&temp, "deploy", "---\ndescription: ship it\n---\nbody\n");
+        root.scope = SkillScope::User;
+        let tool = SkillTool {
+            dirs: vec![root],
+            catalog: OnceLock::new(),
+        };
+
+        let entry = &tool.inventory()[0];
+        assert_eq!(entry.scope, SkillScope::User);
+        assert_eq!(
+            entry.location,
+            temp.path()
+                .join("deploy")
+                .join(SKILL_FILE)
+                .to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn the_builtin_skill_is_attributed_to_caudra() {
+        let builtin = plugin_dev_skill(None);
+        let found = discover(&[], Some(&builtin));
+        assert_eq!(found[BUILTIN_NAME].scope, SkillScope::Builtin);
+        assert_eq!(found[BUILTIN_NAME].location, builtin_location(BUILTIN_NAME));
     }
 
     #[test_case("---\nname: a\n---\nbody", Some("a"), "body" ; "well_formed")]

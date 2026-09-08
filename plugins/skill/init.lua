@@ -8,6 +8,8 @@ local helpers = require("skill_helpers")
 local parse_frontmatter = helpers.parse_frontmatter
 local build_skill_list = helpers.build_skill_list
 
+-- Tier lists, highest priority first. The first directory that exists is the
+-- only one read.
 local PROJECT_SKILL_DIRS = {
   ".caudra/skills",
   ".claude/skills",
@@ -63,33 +65,45 @@ local function find_project_ancestors()
   return dirs
 end
 
+-- One tier group: the first directory that exists is the only one read, so a
+-- Caudra directory shuts out the compatibility ones.
+local function first_existing(candidates)
+  for _, dir in ipairs(candidates) do
+    local meta = caudra.fs.metadata(dir)
+    if meta and meta.is_dir then
+      return caudra.fs.normalize(dir)
+    end
+  end
+  return nil
+end
+
 local function configured_skill_dirs()
   local dirs = {}
-  local seen = {}
   local function add(dir)
-    dir = caudra.fs.normalize(dir)
-    if not seen[dir] then
-      seen[dir] = true
+    if dir then
       dirs[#dirs + 1] = dir
     end
   end
 
+  local global = {}
   local config = caudra.env.config_dir()
   if config then
-    add(caudra.fs.joinpath(config, "skills"))
+    global[#global + 1] = caudra.fs.joinpath(config, "skills")
   end
-
   local home = caudra.uv.os_homedir()
   if home then
     for _, rel in ipairs(GLOBAL_SKILL_DIRS) do
-      add(caudra.fs.joinpath(home, rel))
+      global[#global + 1] = caudra.fs.joinpath(home, rel)
     end
   end
+  add(first_existing(global))
 
   for _, ancestor in ipairs(find_project_ancestors()) do
+    local level = {}
     for _, rel in ipairs(PROJECT_SKILL_DIRS) do
-      add(caudra.fs.joinpath(ancestor, rel))
+      level[#level + 1] = caudra.fs.joinpath(ancestor, rel)
     end
+    add(first_existing(level))
   end
   return dirs
 end

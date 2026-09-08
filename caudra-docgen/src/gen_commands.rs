@@ -39,6 +39,8 @@ The summary shows the active model and window, estimated tokens by category, the
 
 `/tools` covers the tool array on its own. It lists every built-in and MCP tool with its state, its token cost, and the rule behind that state, and it is the only view that shows tools turned off by configuration. See [Tools](/docs/tools/) for the lists that decide those states.
 
+`/skills` does the same for skills. It lists each skill with its file, its scope, and whether its body is already in the window, then every candidate directory with the state directory precedence gave it. It reads the disk when it opens, so it works before the first request. See [Skills](/docs/skills/#where-skills-live).
+
 Token counts are estimates. Deferred MCP definitions and memory or skill bodies stay on demand, and opening either report does not load them. The compact MCP catalog, memory tag index, and skill name and description list count when present. Full definitions and bodies count after the agent loads them.
 
 `/usage` is the cumulative view. It totals provider-reported tokens and priced spend for completed calls across the session, and its global view shows lifetime spend. See [Context](/docs/context/) for how requests are assembled and [Token Economy](/docs/token-economy/#lifetime-spend) for the spending ledger."#;
@@ -91,7 +93,7 @@ An input box appears while the focused task is running. Press Enter to queue gui
 
 That input box is a full composer. Typing `/` opens the palette, `Ctrl+S` inserts a file path, `Ctrl+X e` edits the draft in your editor, and `Ctrl+V` attaches an image to the guidance. A custom `/project:` or `/user:` command expands its template and steers the focused task rather than the main session.
 
-Commands that reach the main session's turn or history have no task equivalent, so `/compact`, `/model`, `/system-prompt`, `/workflow`, `/btw`, the `/goal` family, and MCP prompts are drawn dimmed and report their scope when run. Return to Main to use them. `/context`, `/tools`, `/queue`, `/review`, and the stash commands already follow the focused transcript."#;
+Commands that reach the main session's turn or history have no task equivalent, so `/compact`, `/model`, `/system-prompt`, `/workflow`, `/btw`, the `/goal` family, and MCP prompts are drawn dimmed and report their scope when run. Return to Main to use them. `/context`, `/tools`, `/skills`, `/queue`, `/review`, and the stash commands already follow the focused transcript."#;
 
 fn write_row(out: &mut String, name: &str, description: &str, scope: ChatScope) {
     let scope = match scope {
@@ -222,21 +224,36 @@ pub fn generate() -> String {
     writeln!(out).unwrap();
     writeln!(
         out,
-        "Later sources override earlier ones when the command **name** matches (the stem of the file, or `name` in frontmatter):"
-    )
-    .unwrap();
-    writeln!(out).unwrap();
-    writeln!(out, "1. User config: `~/.config/caudra/commands/`").unwrap();
-    writeln!(out, "2. User third-party: `~/.claude/commands/`").unwrap();
-    writeln!(
-        out,
-        "3. Project dirs, walking from the current working directory up to the nearest `.git` root. At each level: `.caudra/commands/`, then `.claude/commands/`"
+        "Your commands come from two places, and each place reads exactly one directory:"
     )
     .unwrap();
     writeln!(out).unwrap();
     writeln!(
         out,
-        "Because the walk goes cwd → … → git root, a command at the **repository root overrides** the same name found only under a nested cwd. Project commands override user commands. Palette names are `/project:<name>` or `/user:<name>` depending on which scope won."
+        "1. User: the first of `~/.config/caudra/commands/`, `~/.claude/commands/`, `~/.config/opencode/commands/` that exists"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "2. Project: walking from the current working directory up to the nearest `.git` root, at each level the first of `.caudra/commands/`, `.claude/commands/`, `.opencode/commands/` that exists"
+    )
+    .unwrap();
+    writeln!(out).unwrap();
+    writeln!(
+        out,
+        "The `.claude` and `.opencode` directories are there so commands you already wrote for other agents keep working. A compatibility directory next to a `.caudra/commands/` is never read, even for a name only it defines. An empty `~/.config/caudra/commands/` counts as existing, so it switches the compatibility directories off."
+    )
+    .unwrap();
+    writeln!(out).unwrap();
+    writeln!(
+        out,
+        "A command written for another agent loads as-is. Caudra reads `name`, `description` and `argument-hint` from the frontmatter and ignores the rest, and it substitutes `$ARGUMENTS` only, so OpenCode positional parameters, shell injection and `@file` references stay literal text."
+    )
+    .unwrap();
+    writeln!(out).unwrap();
+    writeln!(
+        out,
+        "Levels still combine. Later sources override earlier ones when the command **name** matches (the stem of the file, or `name` in frontmatter). Because the walk goes cwd → … → git root, a command at the **repository root overrides** the same name found only under a nested cwd. Project commands override user commands. Palette names are `/project:<name>` or `/user:<name>` depending on which scope won."
     )
     .unwrap();
     writeln!(out).unwrap();

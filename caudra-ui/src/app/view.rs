@@ -481,6 +481,13 @@ impl App {
                 overlay_rect = r;
             }
         }
+        if self.skills_modal.is_open() {
+            let snapshot = self.context_snapshot.get();
+            let r = self.skills_modal.view(frame, full, snapshot);
+            if r.width > 0 {
+                overlay_rect = r;
+            }
+        }
         if self.goal_modal.is_open() {
             let status = self.state.goal.status();
             let evaluator = caudra_providers::model_registry::goal_evaluator_target();

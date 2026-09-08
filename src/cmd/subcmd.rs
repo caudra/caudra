@@ -7,6 +7,7 @@ use color_eyre::Result;
 use color_eyre::eyre::{Context, bail};
 
 use caudra_agent::mcp::{McpSession, config as mcp_config, oauth as mcp_oauth};
+use caudra_agent::tools::native::skill::{self, SkillDirCandidate, SkillInventoryEntry};
 use caudra_agent::tools::report::{REASON_CONFIG, REASON_DEFERRED};
 use caudra_agent::tools::{
     DescriptionContext, RegisteredTool, SHELL_TOOL_NAME, ToolAudience, ToolFilter, ToolRegistry,
@@ -38,6 +39,11 @@ const AUTH_STATUS_ENV: &str = "\x1b[33m~ env  \x1b[0m";
 const AUTH_STATUS_KEY: &str = "\x1b[32m✓ key  \x1b[0m";
 const AUTH_STATUS_OAUTH: &str = "\x1b[32m✓ oauth\x1b[0m";
 const PROVIDER_SLUG_WIDTH: usize = 14;
+const SKILLS_HEADING: &str = "Skills";
+const SKILL_DIRS_HEADING: &str = "Directories";
+const NO_SKILLS_FOUND: &str = "No skills found.";
+const SKILL_SCOPE_WIDTH: usize = 8;
+const SKILL_DIR_STATE_WIDTH: usize = 11;
 
 #[derive(Debug, PartialEq, Eq)]
 enum LoginRoute {
@@ -949,6 +955,104 @@ pub fn tools(cli: &Cli, enabled_only: bool, json: bool, names: bool, schemas: bo
         print_group("MCP", &mcp_tools);
     }
     Ok(())
+}
+
+/// Skills need neither a model nor MCP, so this stops short of both. The
+/// built-in plugin-dev skill still has to be installed, or the listing would
+/// disagree with the one the model sees.
+pub fn skills(cli: &Cli, name: Option<&str>, names: bool, json: bool, dirs: bool) -> Result<()> {
+    let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
+    load_env_files(&cwd);
+    let _workcell_host = super::register_builtin_tools(&cwd)?;
+
+    let reg = ToolRegistry::global_arc();
+    let mut host =
+        PluginHost::with_jit(Arc::clone(reg), !cli.no_jit).context("initialize lua plugin host")?;
+    let config = super::load_config(&host, cli, &cwd)?;
+    super::configure_native_tools(&config.agent);
+    host.load_production_builtins(&config.plugins)
+        .context("load builtin plugins")?;
+
+    if let Some(name) = name {
+        match skill::load(reg, name) {
+            Ok(body) => println!("{body}"),
+            Err(message) => bail!(message),
+        }
+        return Ok(());
+    }
+
+    let found = skill::inventory(reg);
+    let candidates = skill::directories(reg);
+
+    if names {
+        for entry in &found {
+            println!("{}", entry.name);
+        }
+    } else if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "skills": found
+                    .iter()
+                    .map(|entry| serde_json::json!({
+                        "name": entry.name,
+                        "description": entry.description,
+                        "location": entry.location,
+                        "scope": entry.scope.label(),
+                    }))
+                    .collect::<Vec<_>>(),
+                "directories": candidates
+                    .iter()
+                    .map(|dir| serde_json::json!({
+                        "path": dir.path,
+                        "scope": dir.scope.label(),
+                        "state": dir.state.label(),
+                    }))
+                    .collect::<Vec<_>>(),
+            }))?
+        );
+    } else if dirs {
+        print_skill_dirs(&candidates);
+    } else {
+        print_skills(&found);
+    }
+    Ok(())
+}
+
+fn print_skills(found: &[SkillInventoryEntry]) {
+    println!("{SKILLS_HEADING}");
+    if found.is_empty() {
+        println!("  {NO_SKILLS_FOUND}");
+        return;
+    }
+    let name_width = found
+        .iter()
+        .map(|entry| entry.name.len())
+        .max()
+        .unwrap_or(0);
+    for entry in found {
+        println!(
+            "  {:<SKILL_SCOPE_WIDTH$}{:<name_width$}  {}",
+            entry.scope.label(),
+            entry.name,
+            entry.location
+        );
+        if !entry.description.is_empty() {
+            println!("  {:<SKILL_SCOPE_WIDTH$}{}", "", entry.description);
+        }
+    }
+}
+
+fn print_skill_dirs(candidates: &[SkillDirCandidate]) {
+    println!("{SKILL_DIRS_HEADING}");
+    for dir in candidates {
+        println!(
+            "  {:<SKILL_DIR_STATE_WIDTH$}{:<SKILL_SCOPE_WIDTH$}{}",
+            dir.state.label(),
+            dir.scope.label(),
+            dir.path.display()
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

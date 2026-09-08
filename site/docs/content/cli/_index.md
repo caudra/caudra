@@ -54,7 +54,7 @@ When interactive Caudra starts in a Herdr pane, it automatically reports native 
 | `-s`, `--session` / `--resume <ID>` | Resume a specific session (TUI / SDK only) |
 | `--output-format <text\|json\|stream-json>` | Output shape for `--print` (default `text`) |
 | `--input-format <text\|stream-json>` | With `--print`, `stream-json` enters SDK mode |
-| `--no-commands` | Skip custom commands from `.caudra/commands`, `.claude/commands`, etc. |
+| `--no-commands` | Skip custom commands from every user and project command directory |
 | `--no-plugins` | Skip user `init.lua` (global and project). The Lua host stays up and every built-in tool is native, so nothing else is lost |
 | `--no-jit` | Run plugin Lua on the interpreter with full debug info |
 | `--yolo` | Skip permission prompts on gated tools (alias: `--dangerously-skip-permissions`). Deny rules still apply |
@@ -178,6 +178,18 @@ Resolves config the way a real run does, so the output reflects `agent.disabled_
 A tool that is off carries the rule that turned it off: `--disallowed-tools`, `disabled by config`, `not in --allowed-tools`, `model has no vision support`, `model uses the other editing tool`, or `no ChatGPT subscription`. A `deny` or `allow` default from [Permissions](/docs/permissions/) appears next to the tool it applies to. See [Disabling tools](/docs/tools/#disabling-tools).
 
 A tool marked `lazy` is available and starts outside the request array, so the model reaches it through `tool_search` rather than seeing it upfront. Built-in and MCP tools can both be lazy. See [Tools loaded on demand](/docs/tools/#tools-loaded-on-demand).
+
+### `caudra skills`
+
+```bash
+caudra skills                 # every skill with its scope and file
+caudra skills git-release     # one skill's body, exactly as the model receives it
+caudra skills --names         # names, one per line
+caudra skills --json          # full records
+caudra skills --dirs          # candidate directories: selected, superseded, or missing
+```
+
+Applies the same directory precedence a real run does, including the builtin `caudra-plugin-dev` skill when `plugins.skill.plugin_dev` is on. `--dirs` answers why a skill is missing: a directory reads `superseded` when a higher-priority one exists, and `missing` when nothing is there. See [Skills](/docs/skills/#where-skills-live).
 
 ### `caudra storage`
 

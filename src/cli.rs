@@ -75,7 +75,7 @@ pub struct Cli {
     #[arg(long, value_enum, default_value_t = InputFormat::Text)]
     pub input_format: InputFormat,
 
-    /// Skip loading custom commands from .caudra/commands, .claude/commands, etc.
+    /// Skip loading custom commands from every user and project command directory
     #[arg(long)]
     pub no_commands: bool,
 
@@ -292,6 +292,21 @@ pub enum Command {
         /// The tool definitions as the provider receives them
         #[arg(long, conflicts_with_all = ["json", "names"])]
         schemas: bool,
+    },
+    /// List every skill with the directory precedence applied
+    Skills {
+        /// Print one skill's body, exactly as the model receives it
+        #[arg(value_name = "NAME", conflicts_with_all = ["names", "json", "dirs"])]
+        name: Option<String>,
+        /// Skill names only, one per line
+        #[arg(long, conflicts_with_all = ["json", "dirs"])]
+        names: bool,
+        /// Full records as JSON
+        #[arg(long, conflicts_with_all = ["names", "dirs"])]
+        json: bool,
+        /// Every candidate directory: selected, superseded, or missing
+        #[arg(long, conflicts_with_all = ["names", "json"])]
+        dirs: bool,
     },
     /// Inspect and maintain session storage
     Storage {

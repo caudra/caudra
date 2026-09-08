@@ -154,6 +154,14 @@ pub fn dispatch(cli: Cli) -> Result<ExitCode> {
         }) => {
             subcmd::tools(&cli, enabled_only, json, names, schemas)?;
         }
+        Some(Command::Skills {
+            ref name,
+            names,
+            json,
+            dirs,
+        }) => {
+            subcmd::skills(&cli, name.as_deref(), names, json, dirs)?;
+        }
         Some(Command::Storage { action }) => {
             storage::run(action, cli.no_plugins, cli.no_jit)?;
         }

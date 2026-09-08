@@ -60,6 +60,7 @@ use crate::components::rewind_picker::{RewindPicker, RewindPickerAction};
 use crate::components::scrollbar;
 use crate::components::search_modal::{SearchAction, SearchModal};
 use crate::components::session_picker::{SessionPicker, SessionRow};
+use crate::components::skills_modal::SkillsModal;
 use crate::components::stash_picker::StashPicker;
 use crate::components::status_bar::{StatusBar, StatusBarHit, StatusBarHitTarget};
 use crate::components::task_picker::TaskPicker;
@@ -130,6 +131,7 @@ const FLASH_EXIT: &str = "Press Ctrl+D again to exit...";
 const FLASH_NO_CHORD: &str = "is not a chord";
 const CONTEXT_USAGE: &str = "Usage: /context [all]";
 const TOOLS_USAGE: &str = "Usage: /tools";
+const SKILLS_USAGE: &str = "Usage: /skills";
 const AUTH_EXPIRED_MSG: &str = "Authentication failed. Run `caudra auth login` in another terminal; Caudra will resume automatically, or press Enter to retry now.";
 const FLASH_NO_PLAN: &str = "No plan file";
 const FAST_UNSUPPORTED_MSG: &str = "Fast mode requires an Anthropic Opus 4.6+ model (API only)";
@@ -274,6 +276,7 @@ pub struct App {
     pub(super) usage_modal: UsageModal,
     pub(super) context_modal: ContextModal,
     pub(super) tools_modal: ToolsModal,
+    pub(super) skills_modal: SkillsModal,
     context_snapshot: Watch<ContextSnapshot>,
     /// Read from the ledger when the modal asks for it, not on every frame:
     /// the table outlives sessions and only grows.
@@ -470,6 +473,7 @@ impl App {
             usage_modal: UsageModal::new(),
             context_modal: ContextModal::new(),
             tools_modal: ToolsModal::new(),
+            skills_modal: SkillsModal::new(),
             context_snapshot: Watch::default(),
             lifetime_usage: None,
             goal_modal: GoalModal::default(),
@@ -982,6 +986,10 @@ impl App {
             self.tools_modal.scroll(delta);
             return None;
         }
+        if self.skills_modal.is_open() {
+            self.skills_modal.scroll(delta);
+            return None;
+        }
         if self.goal_modal.is_open() {
             self.goal_modal.scroll(delta);
             return None;
@@ -1174,6 +1182,11 @@ impl App {
 
         if self.tools_modal.is_open() {
             self.tools_modal.handle_key(key);
+            return Some(vec![]);
+        }
+
+        if self.skills_modal.is_open() {
+            self.skills_modal.handle_key(key);
             return Some(vec![]);
         }
 
@@ -2134,6 +2147,14 @@ impl App {
             }
             return true;
         }
+        if token.eq_ignore_ascii_case("/skills") {
+            if args.trim().is_empty() {
+                self.execute_skills();
+            } else {
+                self.flash(SKILLS_USAGE.into());
+            }
+            return true;
+        }
         false
     }
 
@@ -2153,6 +2174,11 @@ impl App {
     fn execute_tools(&mut self) {
         self.context_snapshot = Watch::seeded(self.active_context_snapshot());
         self.tools_modal.open();
+    }
+
+    fn execute_skills(&mut self) {
+        self.context_snapshot = Watch::seeded(self.active_context_snapshot());
+        self.skills_modal.open();
     }
 
     fn preserve_unconsumed_steers(&mut self, task_id: &str) {
@@ -2917,6 +2943,7 @@ impl App {
         if let ChatEventResult::PermissionRequest(request) = result {
             self.context_modal.close();
             self.tools_modal.close();
+            self.skills_modal.close();
             if self.permissions_picker.is_open() {
                 self.permissions_picker.close();
                 self.permission_config_trust_deferred =
@@ -3163,6 +3190,10 @@ impl App {
             }
             "/tools" => {
                 self.execute_tools();
+                vec![]
+            }
+            "/skills" => {
+                self.execute_skills();
                 vec![]
             }
             "/btw" => {
@@ -3469,13 +3500,14 @@ impl App {
         self.status_bar.refresh_cwd();
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 27] {
+    fn overlays(&self) -> [&dyn Overlay; 28] {
         [
             &self.workbench,
             &self.help_modal,
             &self.usage_modal,
             &self.context_modal,
             &self.tools_modal,
+            &self.skills_modal,
             &self.goal_modal,
             &self.btw_modal,
             &self.float_mgr,
@@ -3501,13 +3533,14 @@ impl App {
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 27] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 28] {
         [
             &mut self.workbench,
             &mut self.help_modal,
             &mut self.usage_modal,
             &mut self.context_modal,
             &mut self.tools_modal,
+            &mut self.skills_modal,
             &mut self.goal_modal,
             &mut self.btw_modal,
             &mut self.float_mgr,
@@ -3665,7 +3698,10 @@ impl App {
     }
 
     fn poll_context_snapshot(&mut self) -> Dirty {
-        if !self.context_modal.is_open() && !self.tools_modal.is_open() {
+        if !self.context_modal.is_open()
+            && !self.tools_modal.is_open()
+            && !self.skills_modal.is_open()
+        {
             return Dirty::NO;
         }
         let snapshot = self.active_context_snapshot();

@@ -13,14 +13,22 @@ Write one for anything you keep explaining: how you cut a release, how you write
 
 ## Where skills live
 
-A skill is a directory with a `SKILL.md` inside. Caudra looks for them every time the `skill` tool runs (and once at startup, to build the list). When two skills share a name, the one found last wins:
+A skill is a directory with a `SKILL.md` inside. Caudra looks for them every time the `skill` tool runs (and once at startup, to build the list).
 
-1. The builtin `caudra-plugin-dev` (if enabled)
-2. `~/.config/caudra/skills/` (Windows: `%APPDATA%\caudra\skills\`)
-3. `~/.claude/skills/`, `~/.config/opencode/skills/`, `~/.agents/skills/`
-4. In your project, walking from the current directory up to the `.git` root, at each step: `.caudra/skills/`, `.claude/skills/`, `.opencode/skills/`, `.agents/skills/`
+Personal skills come from one directory. Caudra takes the first of these that exists and reads nothing below it:
 
-So project skills beat personal ones, and a skill at the repo root beats one with the same name deeper down. The `.claude`, `.opencode` and `.agents` dirs are there so skills you already wrote for other agents keep working.
+1. `~/.config/caudra/skills/` (Windows: `%APPDATA%\caudra\skills\`)
+2. `~/.claude/skills/`
+3. `~/.config/opencode/skills/`
+4. `~/.agents/skills/`
+
+Project skills work the same way at each level of the walk from your current directory up to the `.git` root. At every level Caudra takes the first of `.caudra/skills/`, `.claude/skills/`, `.opencode/skills/`, `.agents/skills/` that exists, and skips the others.
+
+The `.claude`, `.opencode` and `.agents` directories are there so skills you already wrote for other agents keep working. Once you make a `.caudra/skills/` next to them, they stop being read. An empty `~/.config/caudra/skills/` counts as existing, so it switches the compatibility directories off. Delete it if you want them back.
+
+Levels still combine: a skill at the repo root and a skill in a subdirectory both load. When two skills share a name, the one found last wins, so project skills beat personal ones and the repo root beats a nested directory. The builtin `caudra-plugin-dev` sits below all of them and any file of the same name replaces it.
+
+Run `caudra skills --dirs` or `/skills` to see every candidate directory and which one won.
 
 Only `SKILL.md` is read. If you want extra notes, put them in files next to it and link them from the body, like `./notes.md`.
 
@@ -52,6 +60,20 @@ The frontmatter is optional. Without it, the directory name is the skill name an
 The `skill` tool lists every skill it found, the agent calls it with a name and gets the body back. A wrong name errors and reprints the list so the model can pick again.
 
 Skills are not slash commands: typing `/git-release` does nothing unless you also add a [custom command](/docs/commands/#custom-commands). Ask the agent to use a skill, or let it pick one on its own.
+
+## Seeing what the agent has
+
+`/skills` opens a report with every skill, where its file lives, whether its body is already in the window, and every candidate directory with the state precedence gave it. It reads the disk when it opens, so it works before the first request.
+
+The same report is on the command line:
+
+```
+caudra skills                 # every skill with its scope and file
+caudra skills git-release     # the body, exactly as the model receives it
+caudra skills --names         # names, one per line
+caudra skills --json          # full records
+caudra skills --dirs          # candidate directories: selected, superseded, or missing
+```
 
 ## The builtin: caudra-plugin-dev
 

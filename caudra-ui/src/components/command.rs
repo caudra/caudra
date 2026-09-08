@@ -113,6 +113,12 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         scope: ChatScope::Any,
     },
     BuiltinCommand {
+        name: "/skills",
+        description: "Show the skills the model can load and where they come from",
+        max_args: 0,
+        scope: ChatScope::Any,
+    },
+    BuiltinCommand {
         name: "/queue",
         description: "Inspect and edit queued prompts",
         max_args: 0,
@@ -991,6 +997,8 @@ impl CommandPalette {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
     use caudra_agent::{McpPromptArg, McpSnapshot};
     use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -1080,6 +1088,7 @@ mod tests {
                 content: "Review $ARGUMENTS".into(),
                 scope: caudra_agent::command::CommandScope::Project,
                 accepts_args: true,
+                source: PathBuf::from(".caudra/commands/review.md"),
             },
             CustomCommand {
                 name: "fix".into(),
@@ -1087,6 +1096,7 @@ mod tests {
                 content: "Fix the code".into(),
                 scope: caudra_agent::command::CommandScope::User,
                 accepts_args: false,
+                source: PathBuf::from("/config/caudra/commands/fix.md"),
             },
         ])
     }

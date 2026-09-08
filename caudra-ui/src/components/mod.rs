@@ -31,6 +31,7 @@ pub(crate) mod rewind_picker;
 pub(crate) mod scrollbar;
 pub(crate) mod search_modal;
 pub(crate) mod session_picker;
+pub(crate) mod skills_modal;
 pub(crate) mod split_layout;
 pub(crate) mod stash_picker;
 pub mod status_bar;

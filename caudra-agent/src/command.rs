@@ -5,8 +5,12 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use tracing::{debug, warn};
 
-const PROJECT_COMMAND_DIRS: &[&str] = &[".caudra/commands", ".claude/commands"];
-const GLOBAL_THIRD_PARTY_COMMAND_DIRS: &[&str] = &[".claude/commands"];
+/// Tier lists, highest priority first. The first directory that exists is the
+/// only one read, so a Caudra directory shuts out the compatibility ones.
+const PROJECT_COMMAND_DIRS: &[&str] =
+    &[".caudra/commands", ".claude/commands", ".opencode/commands"];
+const GLOBAL_THIRD_PARTY_COMMAND_DIRS: &[&str] = &[".claude/commands", ".config/opencode/commands"];
+const COMMANDS_SUBDIR: &str = "commands";
 const ARGUMENTS_PLACEHOLDER: &str = "$ARGUMENTS";
 
 #[derive(Debug, Default, Deserialize)]
@@ -60,6 +64,9 @@ pub struct CustomCommand {
     pub content: String,
     pub scope: CommandScope,
     pub accepts_args: bool,
+    /// The file this came from, so a shadowed or missing command can be traced
+    /// to a directory rather than guessed at.
+    pub source: PathBuf,
 }
 
 impl CustomCommand {
@@ -88,31 +95,42 @@ pub fn discover_commands(cwd: &Path) -> Vec<CustomCommand> {
     )
 }
 
+/// One tier group: the first directory that exists is the only one read.
+fn first_existing(candidates: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
+    candidates.into_iter().find(|dir| dir.is_dir())
+}
+
 fn discover_commands_inner(
     cwd: &Path,
     home: Option<&Path>,
     xdg_config: Option<&Path>,
 ) -> Vec<CustomCommand> {
     let mut commands: HashMap<String, CustomCommand> = HashMap::new();
+    let mut scanned: Vec<PathBuf> = Vec::new();
 
-    if let Some(dir) = caudra_storage::paths::user_config_dir(xdg_config, "commands") {
+    let global = caudra_storage::paths::user_config_dir(xdg_config, COMMANDS_SUBDIR)
+        .into_iter()
+        .chain(home.iter().flat_map(|home| {
+            GLOBAL_THIRD_PARTY_COMMAND_DIRS
+                .iter()
+                .map(|rel| home.join(rel))
+        }));
+    if let Some(dir) = first_existing(global) {
         scan_command_dir(&dir, CommandScope::User, &mut commands);
-    }
-    if let Some(home) = home {
-        for dir in GLOBAL_THIRD_PARTY_COMMAND_DIRS {
-            scan_command_dir(&home.join(dir), CommandScope::User, &mut commands);
-        }
+        scanned.push(dir);
     }
 
-    for dir in find_project_ancestor_dirs(cwd) {
-        for cmd_dir in PROJECT_COMMAND_DIRS {
-            scan_command_dir(&dir.join(cmd_dir), CommandScope::Project, &mut commands);
+    for ancestor in find_project_ancestor_dirs(cwd) {
+        let level = PROJECT_COMMAND_DIRS.iter().map(|rel| ancestor.join(rel));
+        if let Some(dir) = first_existing(level) {
+            scan_command_dir(&dir, CommandScope::Project, &mut commands);
+            scanned.push(dir);
         }
     }
 
     let mut result: Vec<_> = commands.into_values().collect();
     result.sort_by(|a, b| a.name.cmp(&b.name));
-    debug!(count = result.len(), "commands discovered");
+    debug!(count = result.len(), dirs = ?scanned, "commands discovered");
     result
 }
 
@@ -164,6 +182,7 @@ fn parse_command(content: &str, path: &Path, scope: CommandScope) -> Option<Cust
         content: body.to_string(),
         scope,
         accepts_args,
+        source: path.to_path_buf(),
     })
 }
 
@@ -222,6 +241,7 @@ mod tests {
             content: "body".into(),
             scope,
             accepts_args: false,
+            source: PathBuf::from("/fake/review.md"),
         };
         assert_eq!(cmd.display_name(), expected);
     }
@@ -259,13 +279,16 @@ mod tests {
         assert_eq!(global_only.scope, CommandScope::User);
     }
 
+    /// The Caudra directory is a decision, not a merge: the compatibility
+    /// directories beside it are never read, even for names they alone define.
     #[test]
-    fn discover_supports_both_dir_sources() {
+    fn a_caudra_directory_shuts_out_the_compatibility_ones() {
         let dir = TempDir::new().unwrap();
 
         for (cmd_dir, filename) in [
             (".caudra/commands", "a-cmd.md"),
             (".claude/commands", "b-cmd.md"),
+            (".opencode/commands", "c-cmd.md"),
         ] {
             let path = dir.path().join(cmd_dir);
             fs::create_dir_all(&path).unwrap();
@@ -274,8 +297,98 @@ mod tests {
 
         let commands = discover_commands_inner(dir.path(), None, None);
         let names: Vec<_> = commands.iter().map(|c| c.name.as_str()).collect();
-        assert!(names.contains(&"a-cmd"));
-        assert!(names.contains(&"b-cmd"));
+        assert_eq!(names, vec!["a-cmd"]);
+    }
+
+    #[test_case(".claude/commands" ; "claude")]
+    #[test_case(".opencode/commands" ; "opencode")]
+    fn a_compatibility_directory_is_read_when_it_is_the_only_one(cmd_dir: &str) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(cmd_dir);
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("b-cmd.md"), "Content").unwrap();
+
+        let commands = discover_commands_inner(dir.path(), None, None);
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].name, "b-cmd");
+        assert_eq!(commands[0].source, path.join("b-cmd.md"));
+    }
+
+    /// OpenCode writes `description`, `agent`, `model` and `subtask`. The two
+    /// fields Caudra shares are read and the rest are ignored, so a command
+    /// written for OpenCode loads unchanged.
+    #[test]
+    fn an_opencode_command_keeps_the_fields_caudra_shares() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(".opencode/commands");
+        fs::create_dir_all(&path).unwrap();
+        fs::write(
+            path.join("test.md"),
+            "---\ndescription: Run tests with coverage\nagent: build\nsubtask: true\n---\nRun the suite for $ARGUMENTS",
+        )
+        .unwrap();
+
+        let commands = discover_commands_inner(dir.path(), None, None);
+        assert_eq!(commands[0].name, "test");
+        assert_eq!(commands[0].description, "Run tests with coverage");
+        assert!(commands[0].has_args());
+    }
+
+    /// An empty `~/.config/caudra/commands` is still an answer, so the home
+    /// compatibility directories below it stay unread.
+    #[test]
+    fn an_empty_user_config_directory_shuts_out_the_home_ones() {
+        let cwd = TempDir::new().unwrap();
+        let config = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+
+        fs::create_dir_all(
+            caudra_storage::paths::user_config_dir(Some(config.path()), "commands").unwrap(),
+        )
+        .unwrap();
+        for rel in [".claude/commands", ".config/opencode/commands"] {
+            let dir = home.path().join(rel);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("global.md"), "Content").unwrap();
+        }
+
+        let commands = discover_commands_inner(cwd.path(), Some(home.path()), Some(config.path()));
+        assert!(commands.is_empty(), "{commands:?}");
+    }
+
+    #[test]
+    fn the_opencode_home_directory_is_the_last_global_tier() {
+        let cwd = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        let opencode = home.path().join(".config/opencode/commands");
+        fs::create_dir_all(&opencode).unwrap();
+        fs::write(opencode.join("git-commit.md"), "Content").unwrap();
+
+        let commands = discover_commands_inner(cwd.path(), Some(home.path()), None);
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].name, "git-commit");
+        assert_eq!(commands[0].scope, CommandScope::User);
+    }
+
+    /// Each ancestor is its own tier group, so a nested Caudra directory does
+    /// not suppress the repository root's commands.
+    #[test]
+    fn project_levels_still_merge() {
+        let root = TempDir::new().unwrap();
+        let nested = root.path().join("nested");
+        fs::create_dir_all(root.path().join(".git")).unwrap();
+
+        for (dir, filename) in [
+            (root.path().join(".claude/commands"), "root-cmd.md"),
+            (nested.join(".caudra/commands"), "nested-cmd.md"),
+        ] {
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join(filename), "Content").unwrap();
+        }
+
+        let commands = discover_commands_inner(&nested, None, None);
+        let names: Vec<_> = commands.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["nested-cmd", "root-cmd"]);
     }
 
     #[test]
