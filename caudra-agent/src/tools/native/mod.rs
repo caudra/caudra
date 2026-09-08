@@ -36,14 +36,9 @@ pub fn register(registry: &ToolRegistry) -> Result<(), RegistryError> {
 fn entries() -> Vec<(Arc<dyn Tool>, ToolSource, ToolEffect)> {
     vec![
         entry(
-            tool_output::ToolOutputRead,
+            tool_output::ToolOutputTool,
             ToolEffect::ReadOnly,
-            tool_output::READ_DESCRIPTION,
-        ),
-        entry(
-            tool_output::ToolOutputGrep,
-            ToolEffect::ReadOnly,
-            tool_output::GREP_DESCRIPTION,
+            tool_output::DESCRIPTION,
         ),
         entry(
             batch::BatchTool,

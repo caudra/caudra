@@ -299,8 +299,7 @@ pub const SHELL_TOOL_NAME: &str = "shell";
 pub const SKILL_TOOL_NAME: &str = "skill";
 pub const TASK_TOOL_NAME: &str = "task";
 pub const TODOWRITE_TOOL_NAME: &str = "todo_write";
-pub const TOOL_OUTPUT_GREP_TOOL_NAME: &str = "tool_output_grep";
-pub const TOOL_OUTPUT_READ_TOOL_NAME: &str = "tool_output_read";
+pub const TOOL_OUTPUT_TOOL_NAME: &str = "tool_output";
 pub const VIEW_IMAGE_TOOL_NAME: &str = "view_image";
 
 /// Containers own nested tool calls: their result is the list of children
@@ -889,21 +888,16 @@ mod tests {
         let filter = ToolFilter::from_config(&config, &model, INTERNAL_COMPANION_TOOL_NAMES);
 
         assert!(filter.matches(FILE_READ_TOOL_NAME));
-        assert!(filter.matches(TOOL_OUTPUT_READ_TOOL_NAME));
-        assert!(filter.matches(TOOL_OUTPUT_GREP_TOOL_NAME));
+        assert!(filter.matches(TOOL_OUTPUT_TOOL_NAME));
         assert!(!filter.matches(SHELL_TOOL_NAME));
-        assert!(is_tool_enabled(
-            &config.disabled_tools,
-            TOOL_OUTPUT_READ_TOOL_NAME
-        ));
+        assert!(is_tool_enabled(&config.disabled_tools, TOOL_OUTPUT_TOOL_NAME));
     }
 
     #[test]
     fn explicit_empty_filter_stays_no_tools() {
         let filter = ToolFilter::Only(Vec::new());
 
-        assert!(!filter.matches(TOOL_OUTPUT_READ_TOOL_NAME));
-        assert!(!filter.matches(TOOL_OUTPUT_GREP_TOOL_NAME));
+        assert!(!filter.matches(TOOL_OUTPUT_TOOL_NAME));
         assert!(!filter.matches(FILE_READ_TOOL_NAME));
     }
 
@@ -932,11 +926,10 @@ mod tests {
         assert!(!filter.matches(SHELL_TOOL_NAME));
     }
 
-    #[test_case(TOOL_OUTPUT_READ_TOOL_NAME)]
-    #[test_case(TOOL_OUTPUT_GREP_TOOL_NAME)]
-    fn managed_output_companions_are_builtin_names(name: &str) {
-        assert!(is_builtin_tool(name));
-        assert!(all_builtin_tool_names().contains(&name));
+    #[test]
+    fn the_managed_output_companion_is_a_builtin_name() {
+        assert!(is_builtin_tool(TOOL_OUTPUT_TOOL_NAME));
+        assert!(all_builtin_tool_names().contains(&TOOL_OUTPUT_TOOL_NAME));
     }
 
     #[test_case(30,  "30s timeout"   ; "seconds_only")]

@@ -235,8 +235,9 @@ async fn persist(ctx: &ToolContext, text: String) -> Option<ToolOutputRef> {
 fn marker(output_ref: Option<&ToolOutputRef>) -> String {
     match output_ref {
         Some(output_ref) => format!(
-            "[Tool output truncated. Full output ID: {id}. Use tool_output_read(output_id=\"{id}\", offset=1, limit={READ_LIMIT}) or tool_output_grep(output_id=\"{id}\", pattern=\"...\").]",
+            "[Tool output truncated. Full output ID: {id}. Use {tool}(output_id=\"{id}\", offset=1, limit={READ_LIMIT}), optionally with pattern=\"...\" to search it.]",
             id = output_ref.id,
+            tool = crate::tools::TOOL_OUTPUT_TOOL_NAME,
         ),
         None => "[Tool output truncated. Full output was unavailable; rerun this tool with narrower output.]".into(),
     }
@@ -651,8 +652,11 @@ mod tests {
         assert!(model_output.starts_with("first"));
         assert!(model_output.contains("last"));
         assert!(model_output.contains(&format!("Full output ID: {}", output_ref.id)));
-        assert!(model_output.contains("tool_output_read(output_id="));
-        assert!(model_output.contains("tool_output_grep(output_id="));
+        assert!(model_output.contains(&format!(
+            "{}(output_id=",
+            crate::tools::TOOL_OUTPUT_TOOL_NAME
+        )));
+        assert!(model_output.contains("pattern=\"...\""));
         assert!(model_output.ends_with("model-only guidance"));
         assert_eq!(model_output.matches("model-only guidance").count(), 1);
 

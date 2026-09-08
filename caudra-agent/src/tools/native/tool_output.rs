@@ -1,10 +1,11 @@
-//! `tool_output_read` / `tool_output_grep`: paging over output too large to
-//! inline.
+//! `tool_output`: paging over output too large to inline.
 //!
 //! When a tool's result exceeds the session's line budget it is spilled to the
 //! `ToolOutputStore` and replaced by a truncation notice carrying an opaque
-//! id. These two tools are how the model gets the rest back. Both are
-//! session-scoped: an id from another session reads as if it does not exist.
+//! id. This tool is how the model gets the rest back, either as a page of
+//! lines or as regex matches: one contract rather than two near-identical ones
+//! competing for the same call. It is session-scoped, so an id from another
+//! session reads as if it does not exist.
 
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -23,13 +24,12 @@ use caudra_storage::tool_outputs::{
     ToolOutputGrepResult, ToolOutputId, ToolOutputReadResult, ToolOutputStore,
 };
 
-pub const READ_DESCRIPTION: &str =
-    "Read a page of managed tool output owned by the current session.";
-pub const GREP_DESCRIPTION: &str =
-    "Search managed tool output owned by the current session using a regex.";
+pub const DESCRIPTION: &str = "Page or search managed tool output owned by the current session. \
+     Omit `pattern` to read lines from `offset`; supply it to return regex matches with context.";
 
 const SESSION_REQUIRED: &str = "tool output retrieval requires a session";
 const STORE_UNAVAILABLE: &str = "tool output store is unavailable";
+const BYTE_OFFSET_WITH_PATTERN: &str = "byte_offset only applies without pattern";
 
 const DEFAULT_READ_OFFSET: usize = 1;
 const DEFAULT_READ_BYTE_OFFSET: usize = 0;
@@ -51,77 +51,60 @@ static OUTPUT_ID_PARAM: ParamSchema = ParamSchema::Primitive {
     kind: ParamKind::String,
     description: "Opaque ID from a tool-output truncation notice.",
 };
-static READ_OFFSET_PARAM: ParamSchema = ParamSchema::Primitive {
+static OFFSET_PARAM: ParamSchema = ParamSchema::Primitive {
     kind: ParamKind::Integer,
     description: "Starting line, 1-indexed (default: 1).",
 };
 static BYTE_OFFSET_PARAM: ParamSchema = ParamSchema::Primitive {
     kind: ParamKind::Integer,
-    description: "Starting byte within the first line (default: 0; use continuation hints).",
+    description: "Starting byte within the first line (default: 0; use continuation hints). \
+                  Reading only.",
 };
-static READ_LIMIT_PARAM: ParamSchema = ParamSchema::Primitive {
+static LIMIT_PARAM: ParamSchema = ParamSchema::Primitive {
     kind: ParamKind::Integer,
-    description: "Maximum lines to return (default: 200; capped at 2000).",
+    description: "Lines to return when reading (default: 200, capped at 2000) or matches when \
+                  searching (default: 100, capped at 200).",
 };
-static READ_PROPERTIES: &[Property] = &[
-    ("output_id", &OUTPUT_ID_PARAM, true, &[]),
-    ("offset", &READ_OFFSET_PARAM, false, &[]),
-    ("byte_offset", &BYTE_OFFSET_PARAM, false, &[]),
-    ("limit", &READ_LIMIT_PARAM, false, &[]),
-];
-static READ_SCHEMA: ParamSchema = ParamSchema::Object {
-    properties: READ_PROPERTIES,
-    description: "",
-    reject_unknown: false,
-};
-
 static PATTERN_PARAM: ParamSchema = ParamSchema::Primitive {
     kind: ParamKind::String,
-    description: "Regex pattern.",
-};
-static GREP_OFFSET_PARAM: ParamSchema = ParamSchema::Primitive {
-    kind: ParamKind::Integer,
-    description: "Starting line, 1-indexed (default: 1).",
-};
-static GREP_LIMIT_PARAM: ParamSchema = ParamSchema::Primitive {
-    kind: ParamKind::Integer,
-    description: "Maximum matches to return (default: 100; capped at 200).",
+    description: "Regex to search for. Omit to read lines instead.",
 };
 static CONTEXT_BEFORE_PARAM: ParamSchema = ParamSchema::Primitive {
     kind: ParamKind::Integer,
-    description: "Context lines before each match (default: 0; capped at 5).",
+    description: "Context lines before each match (default: 0; capped at 5). Searching only.",
 };
 static CONTEXT_AFTER_PARAM: ParamSchema = ParamSchema::Primitive {
     kind: ParamKind::Integer,
-    description: "Context lines after each match (default: 0; capped at 5).",
+    description: "Context lines after each match (default: 0; capped at 5). Searching only.",
 };
-static GREP_PROPERTIES: &[Property] = &[
+static PROPERTIES: &[Property] = &[
     ("output_id", &OUTPUT_ID_PARAM, true, &[]),
-    ("pattern", &PATTERN_PARAM, true, &[]),
-    ("offset", &GREP_OFFSET_PARAM, false, &[]),
-    ("limit", &GREP_LIMIT_PARAM, false, &[]),
+    ("pattern", &PATTERN_PARAM, false, &[]),
+    ("offset", &OFFSET_PARAM, false, &[]),
+    ("limit", &LIMIT_PARAM, false, &[]),
+    ("byte_offset", &BYTE_OFFSET_PARAM, false, &[]),
     ("context_before", &CONTEXT_BEFORE_PARAM, false, &[]),
     ("context_after", &CONTEXT_AFTER_PARAM, false, &[]),
 ];
-static GREP_SCHEMA: ParamSchema = ParamSchema::Object {
-    properties: GREP_PROPERTIES,
+static SCHEMA: ParamSchema = ParamSchema::Object {
+    properties: PROPERTIES,
     description: "",
     reject_unknown: false,
 };
 
-pub struct ToolOutputRead;
+pub struct ToolOutputTool;
 
-impl Tool for ToolOutputRead {
+impl Tool for ToolOutputTool {
     fn name(&self) -> &str {
-        crate::tools::TOOL_OUTPUT_READ_TOOL_NAME
+        crate::tools::TOOL_OUTPUT_TOOL_NAME
     }
 
     fn description(&self, _ctx: &DescriptionContext) -> Cow<'_, str> {
-        Cow::Borrowed(READ_DESCRIPTION)
+        Cow::Borrowed(DESCRIPTION)
     }
 
     fn schema(&self) -> Value {
-        to_json_schema(&READ_SCHEMA)
+        to_json_schema(&SCHEMA)
     }
 
     fn audience(&self) -> ToolAudience {
@@ -132,15 +115,37 @@ impl Tool for ToolOutputRead {
         Some("read")
     }
 
+    /// `pattern` picks the mode. A `byte_offset` alongside it is refused
+    /// rather than dropped: it means the model expected a page and would
+    /// otherwise read the match list as one.
     fn parse(&self, input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
-        let input = validate(&READ_SCHEMA, input.clone())?;
-        Ok(Box::new(ReadCall {
-            output_id: required_str(&input, "output_id")?,
-            offset: usize_field(&input, "offset").unwrap_or(DEFAULT_READ_OFFSET),
-            byte_offset: usize_field(&input, "byte_offset").unwrap_or(DEFAULT_READ_BYTE_OFFSET),
-            limit: usize_field(&input, "limit")
-                .unwrap_or(DEFAULT_READ_LIMIT)
-                .min(MAX_READ_LIMIT),
+        let input = validate(&SCHEMA, input.clone())?;
+        let output_id = required_str(&input, "output_id")?;
+        let offset = usize_field(&input, "offset");
+        let limit = usize_field(&input, "limit");
+        let Some(pattern) = optional_str(&input, "pattern") else {
+            return Ok(Box::new(ReadCall {
+                output_id,
+                offset: offset.unwrap_or(DEFAULT_READ_OFFSET),
+                byte_offset: usize_field(&input, "byte_offset")
+                    .unwrap_or(DEFAULT_READ_BYTE_OFFSET),
+                limit: limit.unwrap_or(DEFAULT_READ_LIMIT).min(MAX_READ_LIMIT),
+            }));
+        };
+        if input.get("byte_offset").is_some() {
+            return Err(ParseError::custom(BYTE_OFFSET_WITH_PATTERN.to_owned()));
+        }
+        Ok(Box::new(GrepCall {
+            output_id,
+            pattern,
+            offset: offset.unwrap_or(DEFAULT_GREP_OFFSET),
+            limit: limit.unwrap_or(DEFAULT_GREP_LIMIT).min(MAX_GREP_LIMIT),
+            context_before: usize_field(&input, "context_before")
+                .unwrap_or(DEFAULT_CONTEXT)
+                .min(MAX_CONTEXT),
+            context_after: usize_field(&input, "context_after")
+                .unwrap_or(DEFAULT_CONTEXT)
+                .min(MAX_CONTEXT),
         }))
     }
 }
@@ -180,48 +185,6 @@ impl ReadCall {
             smol::unblock(move || store.read_at(session, id, offset, limit, byte_offset)).await;
         let result = result.map_err(|e| e.to_string())?;
         Ok(format_read(&self.output_id, &result, self.limit))
-    }
-}
-
-pub struct ToolOutputGrep;
-
-impl Tool for ToolOutputGrep {
-    fn name(&self) -> &str {
-        crate::tools::TOOL_OUTPUT_GREP_TOOL_NAME
-    }
-
-    fn description(&self, _ctx: &DescriptionContext) -> Cow<'_, str> {
-        Cow::Borrowed(GREP_DESCRIPTION)
-    }
-
-    fn schema(&self) -> Value {
-        to_json_schema(&GREP_SCHEMA)
-    }
-
-    fn audience(&self) -> ToolAudience {
-        ToolAudience::all()
-    }
-
-    fn tool_kind(&self) -> Option<&str> {
-        Some("search")
-    }
-
-    fn parse(&self, input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
-        let input = validate(&GREP_SCHEMA, input.clone())?;
-        Ok(Box::new(GrepCall {
-            output_id: required_str(&input, "output_id")?,
-            pattern: required_str(&input, "pattern")?,
-            offset: usize_field(&input, "offset").unwrap_or(DEFAULT_GREP_OFFSET),
-            limit: usize_field(&input, "limit")
-                .unwrap_or(DEFAULT_GREP_LIMIT)
-                .min(MAX_GREP_LIMIT),
-            context_before: usize_field(&input, "context_before")
-                .unwrap_or(DEFAULT_CONTEXT)
-                .min(MAX_CONTEXT),
-            context_after: usize_field(&input, "context_after")
-                .unwrap_or(DEFAULT_CONTEXT)
-                .min(MAX_CONTEXT),
-        }))
     }
 }
 
@@ -288,11 +251,11 @@ fn positive(value: usize, name: &str) -> Result<usize, String> {
 }
 
 fn required_str(input: &Value, key: &str) -> Result<String, ParseError> {
-    input
-        .get(key)
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-        .ok_or_else(|| ParseError::custom(format!("{key} is required")))
+    optional_str(input, key).ok_or_else(|| ParseError::custom(format!("{key} is required")))
+}
+
+fn optional_str(input: &Value, key: &str) -> Option<String> {
+    input.get(key)?.as_str().map(str::to_owned)
 }
 
 /// Absent and malformed both fall back to the default: validation has already
@@ -314,14 +277,13 @@ fn line_count(text: &str) -> usize {
 }
 
 fn read_hint(output_id: &str, offset: usize, byte_offset: usize, limit: usize) -> String {
+    let tool = crate::tools::TOOL_OUTPUT_TOOL_NAME;
     if byte_offset > 0 {
         format!(
-            "Next call: tool_output_read(output_id={output_id:?}, offset={offset}, byte_offset={byte_offset}, limit={limit})"
+            "Next call: {tool}(output_id={output_id:?}, offset={offset}, byte_offset={byte_offset}, limit={limit})"
         )
     } else {
-        format!(
-            "Next call: tool_output_read(output_id={output_id:?}, offset={offset}, limit={limit})"
-        )
+        format!("Next call: {tool}(output_id={output_id:?}, offset={offset}, limit={limit})")
     }
 }
 
@@ -395,8 +357,13 @@ fn format_grep(call: &GrepCall, result: &ToolOutputGrepResult) -> String {
     if let Some(next_offset) = result.next_offset {
         parts.push(String::new());
         parts.push(format!(
-            "Next call: tool_output_grep(output_id={:?}, pattern={:?}, offset={next_offset}, limit={}, context_before={}, context_after={})",
-            call.output_id, call.pattern, call.limit, call.context_before, call.context_after
+            "Next call: {}(output_id={:?}, pattern={:?}, offset={next_offset}, limit={}, context_before={}, context_after={})",
+            crate::tools::TOOL_OUTPUT_TOOL_NAME,
+            call.output_id,
+            call.pattern,
+            call.limit,
+            call.context_before,
+            call.context_after
         ));
     }
     parts.join("\n")
@@ -451,7 +418,7 @@ mod tests {
     fn read_requires_a_session() {
         let mut f = fixture("output");
         f.ctx.session_id = None;
-        let error = run(&ToolOutputRead, json!({ "output_id": f.output_id }), &f.ctx).unwrap_err();
+        let error = run(&ToolOutputTool, json!({ "output_id": f.output_id }), &f.ctx).unwrap_err();
         assert!(error.contains(SESSION_REQUIRED), "got: {error}");
     }
 
@@ -459,7 +426,7 @@ mod tests {
     fn read_requires_a_store() {
         let mut f = fixture("output");
         f.ctx.tool_output_store = None;
-        let error = run(&ToolOutputRead, json!({ "output_id": f.output_id }), &f.ctx).unwrap_err();
+        let error = run(&ToolOutputTool, json!({ "output_id": f.output_id }), &f.ctx).unwrap_err();
         assert!(error.contains(STORE_UNAVAILABLE), "got: {error}");
     }
 
@@ -467,7 +434,7 @@ mod tests {
     fn invalid_ids_are_rejected() {
         let f = fixture("output");
         let error = run(
-            &ToolOutputGrep,
+            &ToolOutputTool,
             json!({ "output_id": "not-an-output-id", "pattern": "output" }),
             &f.ctx,
         )
@@ -479,7 +446,7 @@ mod tests {
     fn another_sessions_output_does_not_exist() {
         let mut f = fixture("private output");
         f.ctx.session_id = Some(OTHER_SESSION.parse().unwrap());
-        let error = run(&ToolOutputRead, json!({ "output_id": f.output_id }), &f.ctx).unwrap_err();
+        let error = run(&ToolOutputTool, json!({ "output_id": f.output_id }), &f.ctx).unwrap_err();
         assert!(error.contains("does not exist for session"), "got: {error}");
     }
 
@@ -487,7 +454,7 @@ mod tests {
     fn read_paginates_with_a_hint_that_resumes_exactly() {
         let f = fixture("one\ntwo\nthree\nfour\n");
         let first = run(
-            &ToolOutputRead,
+            &ToolOutputTool,
             json!({ "output_id": &f.output_id, "limit": 2 }),
             &f.ctx,
         )
@@ -496,14 +463,15 @@ mod tests {
         assert!(first.contains("one\ntwo"), "{first}");
         assert!(
             first.contains(&format!(
-                "Next call: tool_output_read(output_id={:?}, offset=3, limit=2)",
+                "Next call: {}(output_id={:?}, offset=3, limit=2)",
+                crate::tools::TOOL_OUTPUT_TOOL_NAME,
                 f.output_id
             )),
             "{first}"
         );
 
         let second = run(
-            &ToolOutputRead,
+            &ToolOutputTool,
             json!({ "output_id": &f.output_id, "offset": 3, "limit": 2 }),
             &f.ctx,
         )
@@ -521,7 +489,7 @@ mod tests {
         const TEXT: &str = "one\ntwo\nthree\nfour\n";
         let f = fixture(TEXT);
         let page = run(
-            &ToolOutputRead,
+            &ToolOutputTool,
             json!({ "output_id": &f.output_id, "limit": 2 }),
             &f.ctx,
         )
@@ -541,7 +509,7 @@ mod tests {
         let long = "x".repeat(MAX_OUTPUT_BYTES * 2);
         let f = fixture(&long);
         let page = run(
-            &ToolOutputRead,
+            &ToolOutputTool,
             json!({ "output_id": &f.output_id, "limit": 1 }),
             &f.ctx,
         )
@@ -555,7 +523,7 @@ mod tests {
         let body: String = (0..5000).map(|i| format!("line {i}\n")).collect();
         let f = fixture(&body);
         let page = run(
-            &ToolOutputRead,
+            &ToolOutputTool,
             json!({ "output_id": &f.output_id, "limit": MAX_READ_LIMIT }),
             &f.ctx,
         )
@@ -568,7 +536,7 @@ mod tests {
     fn grep_marks_matches_and_context_differently() {
         let f = fixture("alpha\nbeta\ngamma\nbeta\ndelta\n");
         let out = run(
-            &ToolOutputGrep,
+            &ToolOutputTool,
             json!({
                 "output_id": &f.output_id,
                 "pattern": "beta",
@@ -588,7 +556,7 @@ mod tests {
     fn the_grep_hint_resumes_at_the_next_match() {
         let f = fixture("alpha\nbeta\ngamma\nbeta\ndelta\n");
         let first = run(
-            &ToolOutputGrep,
+            &ToolOutputTool,
             json!({ "output_id": &f.output_id, "pattern": "beta", "limit": 1 }),
             &f.ctx,
         )
@@ -603,7 +571,7 @@ mod tests {
             .expect("next offset is a number");
 
         let second = run(
-            &ToolOutputGrep,
+            &ToolOutputTool,
             json!({
                 "output_id": &f.output_id,
                 "pattern": "beta",
@@ -621,7 +589,7 @@ mod tests {
     fn grep_without_matches_says_so() {
         let f = fixture("alpha\nbeta\n");
         let out = run(
-            &ToolOutputGrep,
+            &ToolOutputTool,
             json!({ "output_id": &f.output_id, "pattern": "zeta" }),
             &f.ctx,
         )
@@ -638,7 +606,7 @@ mod tests {
             .collect();
         let f = fixture(&body);
         let page = run(
-            &ToolOutputRead,
+            &ToolOutputTool,
             json!({ "output_id": &f.output_id, "limit": 99_999 }),
             &f.ctx,
         )
@@ -656,7 +624,7 @@ mod tests {
             .collect();
         let f = fixture(&body);
         let page = run(
-            &ToolOutputGrep,
+            &ToolOutputTool,
             json!({
                 "output_id": &f.output_id,
                 "pattern": "hit",
@@ -674,17 +642,48 @@ mod tests {
     }
 
     #[test]
-    fn both_tools_are_visible_to_every_audience() {
-        assert_eq!(ToolOutputRead.audience(), ToolAudience::all());
-        assert_eq!(ToolOutputGrep.audience(), ToolAudience::all());
+    fn the_tool_is_visible_to_every_audience() {
+        assert_eq!(ToolOutputTool.audience(), ToolAudience::all());
+    }
+
+    /// `pattern` is the mode switch, so it cannot be required: a schema that
+    /// demanded it would leave no way to ask for a page.
+    #[test]
+    fn only_the_output_id_is_required() {
+        assert_eq!(ToolOutputTool.schema()["required"], json!(["output_id"]));
     }
 
     #[test]
-    fn schemas_require_their_identifying_fields() {
-        assert_eq!(ToolOutputRead.schema()["required"], json!(["output_id"]));
-        assert_eq!(
-            ToolOutputGrep.schema()["required"],
-            json!(["output_id", "pattern"])
-        );
+    fn a_pattern_switches_the_same_call_from_paging_to_searching() {
+        let f = fixture("alpha\nbeta\ngamma\n");
+        let page = run(
+            &ToolOutputTool,
+            json!({ "output_id": &f.output_id }),
+            &f.ctx,
+        )
+        .unwrap();
+        assert!(page.contains("lines 1-3 of 3"), "{page}");
+
+        let matches = run(
+            &ToolOutputTool,
+            json!({ "output_id": &f.output_id, "pattern": "beta" }),
+            &f.ctx,
+        )
+        .unwrap();
+        assert!(matches.contains("2: beta"), "{matches}");
+        assert!(!matches.contains("1: alpha"), "{matches}");
+    }
+
+    /// Dropping it would answer a page request with a match list.
+    #[test]
+    fn a_byte_offset_with_a_pattern_is_refused_rather_than_ignored() {
+        let f = fixture("alpha\nbeta\n");
+        let error = run(
+            &ToolOutputTool,
+            json!({ "output_id": &f.output_id, "pattern": "beta", "byte_offset": 4 }),
+            &f.ctx,
+        )
+        .unwrap_err();
+        assert!(error.contains(BYTE_OFFSET_WITH_PATTERN), "got: {error}");
     }
 }

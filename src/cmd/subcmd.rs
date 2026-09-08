@@ -1208,11 +1208,12 @@ mod tools_tests {
 
     /// Naming a companion is not an error, but the report has to say the
     /// request did not take.
-    #[test_case("tool_output_read" ; "read")]
-    #[test_case("tool_output_grep" ; "grep")]
-    fn a_companion_asked_to_turn_off_stays_on_with_a_note(name: &str) {
-        let config = agent_config(&[name], &[]);
-        assert_eq!(note(name, true, &[], &config), Some(REASON_COMPANION));
+    #[test]
+    fn a_companion_asked_to_turn_off_stays_on_with_a_note() {
+        for name in caudra_config::INTERNAL_COMPANION_TOOL_NAMES {
+            let config = agent_config(&[name], &[]);
+            assert_eq!(note(name, true, &[], &config), Some(REASON_COMPANION));
+        }
     }
 }
 

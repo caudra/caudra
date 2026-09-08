@@ -1212,26 +1212,15 @@ mod tests {
 
     #[test]
     fn definitions_keep_internal_companions_with_restrictive_config() {
-        use crate::tools::{
-            FILE_READ_TOOL_NAME, SHELL_TOOL_NAME, TOOL_OUTPUT_GREP_TOOL_NAME,
-            TOOL_OUTPUT_READ_TOOL_NAME,
-        };
+        use crate::tools::{FILE_READ_TOOL_NAME, SHELL_TOOL_NAME, TOOL_OUTPUT_TOOL_NAME};
 
         let reg = ToolRegistry::new();
-        for name in [
-            FILE_READ_TOOL_NAME,
-            TOOL_OUTPUT_READ_TOOL_NAME,
-            TOOL_OUTPUT_GREP_TOOL_NAME,
-            SHELL_TOOL_NAME,
-        ] {
+        for name in [FILE_READ_TOOL_NAME, TOOL_OUTPUT_TOOL_NAME, SHELL_TOOL_NAME] {
             reg.register(mock(name), lua_source("p")).unwrap();
         }
         let config = crate::AgentConfig {
             allowed_tools: vec![FILE_READ_TOOL_NAME.into()],
-            disabled_tools: vec![
-                TOOL_OUTPUT_READ_TOOL_NAME.into(),
-                TOOL_OUTPUT_GREP_TOOL_NAME.into(),
-            ],
+            disabled_tools: vec![TOOL_OUTPUT_TOOL_NAME.into()],
             ..Default::default()
         };
         let model = caudra_providers::Model::from_spec("anthropic/claude-opus-4-8").unwrap();
@@ -1250,14 +1239,7 @@ mod tests {
             .map(|definition| definition["name"].as_str().unwrap())
             .collect();
 
-        assert_eq!(
-            names,
-            [
-                FILE_READ_TOOL_NAME,
-                TOOL_OUTPUT_READ_TOOL_NAME,
-                TOOL_OUTPUT_GREP_TOOL_NAME
-            ]
-        );
+        assert_eq!(names, [FILE_READ_TOOL_NAME, TOOL_OUTPUT_TOOL_NAME]);
     }
 
     #[test_case(Err("boom".into()), Some("/tmp/foo".into()), None          ; "clears_on_error")]

@@ -137,8 +137,7 @@ pub const CAUDRA_NATIVE_TOOL_NAMES: &[&str] = &[
     "skill",
     "task",
     "todo_write",
-    "tool_output_grep",
-    "tool_output_read",
+    "tool_output",
     "view_image",
 ];
 
@@ -165,7 +164,7 @@ pub const WORKCELL_NATIVE_TOOL_NAMES: &[&str] = &[
 /// Tools the agent reaches for on its own to page through an oversized result.
 /// They stay enabled whatever the filters say, or a truncated result becomes
 /// unreadable.
-pub const INTERNAL_COMPANION_TOOL_NAMES: &[&str] = &["tool_output_grep", "tool_output_read"];
+pub const INTERNAL_COMPANION_TOOL_NAMES: &[&str] = &["tool_output"];
 
 /// `INTERNAL_COMPANION_TOOL_NAMES` overlaps the native list: it marks tools
 /// that stay enabled regardless of `disabled_tools`, which is orthogonal to
@@ -1424,8 +1423,7 @@ impl ToolOutputLines {
                 "question",
                 "skill",
                 "todo_write",
-                "tool_output_grep",
-                "tool_output_read",
+                "tool_output",
                 "view_image",
             ],
         ),

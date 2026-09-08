@@ -90,8 +90,7 @@ const TRUSTED_UNSCOPED_TOOLS: &[&str] = &[
     "question",
     "task",
     "todo_write",
-    "tool_output_grep",
-    "tool_output_read",
+    "tool_output",
 ];
 
 fn builtin_rules(cwd: &Path) -> Vec<PermissionRule> {

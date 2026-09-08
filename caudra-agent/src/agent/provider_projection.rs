@@ -7,7 +7,7 @@ use caudra_providers::{
 };
 use serde_json::Value;
 
-use crate::tools::{TOOL_OUTPUT_GREP_TOOL_NAME, TOOL_OUTPUT_READ_TOOL_NAME};
+use crate::tools::TOOL_OUTPUT_TOOL_NAME;
 
 const PROTECTED_USER_TURNS: usize = 2;
 const PROTECTED_OLD_RESULT_TOKENS: usize = 40_000;
@@ -21,7 +21,7 @@ struct Candidate {
 }
 
 pub fn project<'a>(messages: &'a [Message], tools: &Value) -> Cow<'a, [Message]> {
-    if !has_tool(tools, TOOL_OUTPUT_READ_TOOL_NAME) {
+    if !has_tool(tools, TOOL_OUTPUT_TOOL_NAME) {
         return Cow::Borrowed(messages);
     }
 
@@ -54,12 +54,10 @@ pub fn project<'a>(messages: &'a [Message], tools: &Value) -> Cow<'a, [Message]>
                     else {
                         return None;
                     };
-                    if tool_names.get(tool_use_id.as_str()).is_some_and(|name| {
-                        matches!(
-                            *name,
-                            TOOL_OUTPUT_READ_TOOL_NAME | TOOL_OUTPUT_GREP_TOOL_NAME
-                        )
-                    }) {
+                    if tool_names
+                        .get(tool_use_id.as_str())
+                        .is_some_and(|name| *name == TOOL_OUTPUT_TOOL_NAME)
+                    {
                         return None;
                     }
                     Some(Candidate {
@@ -104,7 +102,7 @@ pub fn project<'a>(messages: &'a [Message], tools: &Value) -> Cow<'a, [Message]>
         };
         let id = output_ref.id;
         *content = format!(
-            "[Old tool result pruned. Full output ID: {id}. Use tool_output_read(output_id=\"{id}\", offset=1, limit={READ_LIMIT}) or tool_output_grep(output_id=\"{id}\", pattern=\"...\").]"
+            "[Old tool result pruned. Full output ID: {id}. Use {TOOL_OUTPUT_TOOL_NAME}(output_id=\"{id}\", offset=1, limit={READ_LIMIT}), optionally with pattern=\"...\" to search it.]"
         );
     }
     Cow::Owned(projected)
@@ -256,13 +254,9 @@ mod tests {
 
     fn tools(include_read: bool) -> Value {
         if include_read {
-            serde_json::json!([
-                {"name": TOOL_OUTPUT_READ_TOOL_NAME},
-                {"name": TOOL_OUTPUT_GREP_TOOL_NAME},
-                {"name": "bash"}
-            ])
+            serde_json::json!([{"name": TOOL_OUTPUT_TOOL_NAME}, {"name": "bash"}])
         } else {
-            serde_json::json!([{"name": "bash"}, {"name": TOOL_OUTPUT_GREP_TOOL_NAME}])
+            serde_json::json!([{"name": "bash"}])
         }
     }
 
@@ -525,7 +519,7 @@ mod tests {
         assert_eq!(output_ref.as_ref(), Some(&original_ref));
         assert!(content.contains(&original_ref.id.to_string()));
         assert!(content.contains("offset=1, limit=200"));
-        assert!(content.contains("tool_output_grep"));
+        assert!(content.contains(TOOL_OUTPUT_TOOL_NAME));
         assert!(content.contains("pattern=\"...\""));
         assert_eq!(
             projected
@@ -544,8 +538,7 @@ mod tests {
         for (id, name, is_error, with_ref) in [
             ("error", "bash", true, true),
             ("missing-ref", "bash", false, false),
-            ("read-result", TOOL_OUTPUT_READ_TOOL_NAME, false, true),
-            ("grep-result", TOOL_OUTPUT_GREP_TOOL_NAME, false, true),
+            ("read-result", TOOL_OUTPUT_TOOL_NAME, false, true),
         ] {
             history.push(tool_use(id, name));
             history.push(result(id, large, is_error, with_ref));
@@ -554,7 +547,7 @@ mod tests {
 
         let projected = project(&history, &tools(true));
         assert!(result_content(&projected, "candidate").starts_with("[Old tool result pruned."));
-        for id in ["error", "missing-ref", "read-result", "grep-result"] {
+        for id in ["error", "missing-ref", "read-result"] {
             assert!(!result_content(&projected, id).starts_with("[Old tool result pruned."));
         }
     }
