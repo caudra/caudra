@@ -269,7 +269,7 @@ fn multiedit_batch_child_shows_full_numbered_diff() {
     );
 }
 
-const INDEX_TOOL: &str = "index";
+const INDEX_TOOL: &str = "file_index";
 const LIVE_TOOL_USE_ID: &str = "live_id";
 /// More than the index view cap, exactly the read view cap, so a listing
 /// rendered through the index view is visibly truncated.

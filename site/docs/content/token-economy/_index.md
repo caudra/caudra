@@ -21,7 +21,7 @@ So Caudra attacks the two multipliers: how much each step adds to context, and h
 
 ## Smaller results
 
-**index instead of file_read.** The native `index` tool returns a tree-sitter skeleton of a source file: imports, types, signatures, line numbers. Usually 70-90% smaller than the file itself. The agent indexes first, then reads only the ranges it needs.
+**file_index instead of file_read.** The native `file_index` tool returns a tree-sitter skeleton of a source file: imports, types, signatures, line numbers. Usually 70-90% smaller than the file itself. The agent indexes first, then reads only the ranges it needs.
 
 Directory indexing follows Workcell's generic listing contract. Instruction files appear as ordinary visible entries, and the call does not discover their contents.
 

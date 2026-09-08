@@ -26,7 +26,7 @@ const FILE_TOOLS: &[&str] = &[
     "file_edit",
     "file_read",
     "file_write",
-    "index",
+    "file_index",
     "view_image",
 ];
 
@@ -625,7 +625,7 @@ mod tests {
     #[test_case("edit_lines", Some(json!({"path": "/a", "start": 3, "end": 9, "new_string": "n"})), Some(json!([{"path": "/a", "line": 2}])) ; "edit_lines_start_becomes_line")]
     #[test_case("insert_lines", Some(json!({"path": "/a", "line": 5, "new_string": "n"})), Some(json!([{"path": "/a", "line": 5}])) ; "insert_lines_reports_the_inserted_row")]
     #[test_case("insert_lines", Some(json!({"path": "/a", "line": 0, "new_string": "n"})), Some(json!([{"path": "/a", "line": 0}])) ; "insert_lines_at_top")]
-    #[test_case("index", Some(json!({"path": "/a/b.rs"})), Some(json!([{"path": "/a/b.rs"}])) ; "index_file_path")]
+    #[test_case("file_index", Some(json!({"path": "/a/b.rs"})), Some(json!([{"path": "/a/b.rs"}])) ; "index_file_path")]
     #[test_case("view_image", Some(json!({"path": "img.png"})), Some(json!([{"path": "/home/user/project/img.png"}])) ; "view_image_relative")]
     #[test_case("glob", Some(json!({"pattern": "*.rs", "path": "src"})), None ; "glob_directory_path_ignored")]
     #[test_case("grep", Some(json!({"pattern": "x", "path": "src"})), None ; "grep_directory_path_ignored")]

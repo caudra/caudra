@@ -154,7 +154,7 @@ Structured requests distinguish files, directories, URLs, commands, queries, and
 - Shell authority includes the initial working directory.
 - A deny that intersects any resource blocks the complete call.
 
-File-write tools remain pre-allowed inside the project working directory. Read-only filesystem tools declare scopes and trusted native policy allows them by default. Explicit deny rules can therefore block `file_read`, `file_glob`, `file_grep`, `index`, `skill`, or image access without adding normal prompt noise.
+File-write tools remain pre-allowed inside the project working directory. Read-only filesystem tools declare scopes and trusted native policy allows them by default. Explicit deny rules can therefore block `file_read`, `file_glob`, `file_grep`, `file_index`, `skill`, or image access without adding normal prompt noise.
 
 Every registered model tool reaches the permission manager. A tool without declared scopes receives its canonical validated input as an exact fallback scope. The `batch` container routes inner calls through the same manager. Native `python_execution` is isolated and has no inner tool calls.
 

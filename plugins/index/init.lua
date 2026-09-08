@@ -143,16 +143,16 @@ end
 
 caudra.api.register_prompt_hint({
   slot = "tool_usage",
-  content = "- Use the **index** tool first on individual files to get their skeleton, then use **file_read** with offset/limit for the specific section you need.",
+  content = "- Use the **file_index** tool first on individual files to get their skeleton, then use **file_read** with offset/limit for the specific section you need.",
 })
 
 caudra.api.register_prompt_hint({
   slot = "efficient_tools",
-  content = "index",
+  content = "file_index",
 })
 
 caudra.api.register_tool({
-  name = "index",
+  name = "file_index",
   effect = "read_only",
   kind = "read",
   description = [[

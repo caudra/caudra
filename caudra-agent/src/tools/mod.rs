@@ -299,12 +299,12 @@ pub const FILE_APPLY_PATCH_TOOL_NAME: &str = "file_apply_patch";
 pub const FILE_EDIT_TOOL_NAME: &str = "file_edit";
 pub const FILE_GLOB_TOOL_NAME: &str = "file_glob";
 pub const FILE_GREP_TOOL_NAME: &str = "file_grep";
+pub const FILE_INDEX_TOOL_NAME: &str = "file_index";
 pub const FILE_READ_TOOL_NAME: &str = "file_read";
 pub const FILE_WRITE_TOOL_NAME: &str = "file_write";
 pub const IMAGE_GENERATE_TOOL_NAME: &str = "image_generate";
 /// The only backend `image_generate` can reach today.
 const OPENAI_PROVIDER_SLUG: &str = "openai";
-pub const INDEX_TOOL_NAME: &str = "index";
 pub const MEMORY_TOOL_NAME: &str = "memory";
 pub const QUESTION_TOOL_NAME: &str = "question";
 pub const SHELL_TOOL_NAME: &str = "shell";

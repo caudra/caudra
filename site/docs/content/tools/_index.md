@@ -79,7 +79,7 @@ Use file_apply_patch to edit files with a stripped-down, file-oriented diff form
 |-----------|------|----------|-------------|
 | `patchText` | string | yes | Complete stripped-down file patch. |
 
-### `index` {#index}
+### `file_index` {#file_index}
 
 Return a compact structural overview of a source file, or a deterministic listing of a directory.
 

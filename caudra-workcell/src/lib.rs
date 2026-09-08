@@ -76,7 +76,7 @@ pub const NATIVE_TOOL_NAMES: &[&str] = &[
     "file_write",
     "file_edit",
     "file_apply_patch",
-    "index",
+    "file_index",
     "websearch",
     "webfetch",
     "shell",
@@ -433,7 +433,7 @@ impl ToolKind {
             "file_write" => Some(Self::FileWrite),
             "file_edit" => Some(Self::FileEdit),
             "file_apply_patch" => Some(Self::FileApplyPatch),
-            "index" => Some(Self::Index),
+            "file_index" => Some(Self::Index),
             "websearch" => Some(Self::Websearch),
             "webfetch" => Some(Self::Webfetch),
             "shell" => Some(Self::Shell),
@@ -619,7 +619,7 @@ impl Input {
             ToolKind::FileApplyPatch => {
                 parse_input("file_apply_patch", input).map(Self::FileApplyPatch)
             }
-            ToolKind::Index => parse_input("index", input).map(Self::Index),
+            ToolKind::Index => parse_input("file_index", input).map(Self::Index),
             ToolKind::Websearch => parse_input("websearch", input).map(Self::Websearch),
             ToolKind::Webfetch => parse_input("webfetch", input).map(Self::Webfetch),
             ToolKind::Shell => parse_input("shell", input).map(Self::Shell),
@@ -3519,9 +3519,9 @@ mod tests {
         let (_host, registry) = host_and_registry(root.path());
         let expected = workcell::files::specs(ALLOW_WRITE)
             .into_iter()
-            .find(|spec| spec.name == "index")
+            .find(|spec| spec.name == "file_index")
             .expect("index spec");
-        let registered = registry.get("index").expect("registered index");
+        let registered = registry.get("file_index").expect("registered index");
 
         assert_eq!(
             registered.tool.schema(),
@@ -3573,7 +3573,7 @@ mod tests {
                     .as_array()
                     .unwrap()
                     .iter()
-                    .any(|definition| definition["name"] == "index"),
+                    .any(|definition| definition["name"] == "file_index"),
                 "index missing for {audience:?}"
             );
         }
@@ -3593,7 +3593,7 @@ mod tests {
             registry
                 .iter()
                 .iter()
-                .filter(|entry| entry.name() == "index")
+                .filter(|entry| entry.name() == "file_index")
                 .count(),
             1
         );
@@ -3622,7 +3622,7 @@ mod tests {
             ),
         ] {
             let invocation = registry
-                .get("index")
+                .get("file_index")
                 .unwrap()
                 .tool
                 .parse(&json!({"path": path}))
@@ -3653,7 +3653,7 @@ mod tests {
         let (_host, registry) = host_and_registry(root.path());
         let ctx = context(root.path(), Arc::clone(&registry), CancelToken::none());
         let invocation = registry
-            .get("index")
+            .get("file_index")
             .unwrap()
             .tool
             .parse(&json!({"path": "source.rs"}))
@@ -3682,7 +3682,7 @@ mod tests {
         let (_host, registry) = host_and_registry(root.path());
         let ctx = context(root.path(), Arc::clone(&registry), CancelToken::none());
         let invocation = registry
-            .get("index")
+            .get("file_index")
             .unwrap()
             .tool
             .parse(&json!({"path": path}))
@@ -3727,7 +3727,7 @@ mod tests {
         let (_host, registry) = host_and_registry(root.path());
         let ctx = context(root.path(), Arc::clone(&registry), CancelToken::none());
         let invocation = registry
-            .get("index")
+            .get("file_index")
             .unwrap()
             .tool
             .parse(&json!({"path": root.path()}))
@@ -3793,7 +3793,7 @@ mod tests {
         let mut ctx = context(root.path(), Arc::clone(&registry), CancelToken::none());
         ctx.config.index_max_file_size_mb = 1;
         let invocation = registry
-            .get("index")
+            .get("file_index")
             .unwrap()
             .tool
             .parse(&json!({"path": path}))
@@ -3820,7 +3820,7 @@ mod tests {
             ("file_read", ToolEffect::ReadOnly),
             ("file_glob", ToolEffect::ReadOnly),
             ("file_grep", ToolEffect::ReadOnly),
-            ("index", ToolEffect::ReadOnly),
+            ("file_index", ToolEffect::ReadOnly),
             ("websearch", ToolEffect::ReadOnly),
             ("webfetch", ToolEffect::ReadOnly),
             ("execution_environment", ToolEffect::Mutating),
@@ -4244,13 +4244,13 @@ mod tests {
     const EXPECT_NO_COARSE_GUARD: &str =
         "a search names no file up front, so it declares nothing to guard";
 
-    /// `file_read` and `index` record the file's mtime only after reading its
+    /// `file_read` and `file_index` record the file's mtime only after reading its
     /// content. Without a shared guard a write landing in between records an
     /// mtime newer than what the model saw, and the next edit passes its stale
     /// check holding stale content.
     #[test_case("file_read", json!({ "filePath": CONTENT_FILE }), true ; "file_read_guards_its_file")]
-    #[test_case("index", json!({ "path": CONTENT_FILE }), true ; "index_guards_its_file")]
-    #[test_case("index", json!({ "path": "." }), false ; "index_does_not_guard_a_directory")]
+    #[test_case("file_index", json!({ "path": CONTENT_FILE }), true ; "index_guards_its_file")]
+    #[test_case("file_index", json!({ "path": "." }), false ; "index_does_not_guard_a_directory")]
     #[test_case("file_grep", json!({ "pattern": "body" }), false ; "grep_guards_nothing")]
     #[test_case("file_glob", json!({ "pattern": "*.txt" }), false ; "glob_guards_nothing")]
     fn read_targets_cover_whole_file_reads_only(tool: &str, input: Value, guarded: bool) {
@@ -4831,7 +4831,7 @@ mod tests {
     }
 
     #[test_case("file_read", json!({"filePath": MISSING_NAME}); "reading a file that is not there")]
-    #[test_case("index", json!({"path": MISSING_NAME}); "indexing a path that is not there")]
+    #[test_case("file_index", json!({"path": MISSING_NAME}); "indexing a path that is not there")]
     #[test_case(
         "file_grep",
         json!({"pattern": "needle", "path": MISSING_NAME});
@@ -4843,7 +4843,7 @@ mod tests {
         "globbing under a root that is not there"
     )]
     /// The property that matters is that an impossible read never costs a
-    /// prompt, whichever layer refuses it. `index` is already refused inside
+    /// prompt, whichever layer refuses it. `file_index` is already refused inside
     /// Workcell; the rest reach the check here.
     fn a_read_of_a_missing_path_fails_instead_of_asking(tool: &str, input: Value) {
         let root = TempDir::new().expect("tempdir");

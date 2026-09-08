@@ -79,7 +79,7 @@ const PROJECT_READ_TOOLS: &[&str] = &[
     "file_read",
     "glob",
     "grep",
-    "index",
+    "file_index",
     "list",
     "read",
     "view_image",

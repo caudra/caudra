@@ -80,7 +80,7 @@ fn write_section(out: &mut String, heading: &str, fields: &[ConfigField]) {
 fn native_tool_note(plugin: &str) -> Option<String> {
     match plugin {
         "index" => Some(format!(
-            "`index` executes as a native Workcell tool. This table keeps its existing configuration keys. The file-size limit accepts {} through {} MiB to bound parser memory and work.",
+            "`file_index` executes as a native Workcell tool, and this table keeps the `plugins.index` key it was configured under. The file-size limit accepts {} through {} MiB to bound parser memory and work.",
             caudra_config::MIN_INDEX_MAX_FILE_SIZE_MB,
             caudra_config::MAX_INDEX_MAX_FILE_SIZE_MB,
         )),

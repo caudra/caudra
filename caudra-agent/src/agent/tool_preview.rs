@@ -26,7 +26,7 @@ const PREVIEW_KEYS: &[(&str, &str)] = &[
     ("file_read", "filePath"),
     ("file_write", "filePath"),
     ("file_edit", "filePath"),
-    ("index", "path"),
+    ("file_index", "path"),
     ("view_image", "path"),
     ("file_glob", "pattern"),
     ("file_grep", "pattern"),

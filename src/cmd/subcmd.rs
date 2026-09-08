@@ -679,14 +679,14 @@ pub fn index(path: &str, no_plugins: bool, no_jit: bool) -> Result<()> {
     ensure_index_enabled(&config.agent)?;
     let reg = ToolRegistry::global_arc();
     let entry = reg
-        .get("index")
+        .get("file_index")
         .ok_or_else(|| color_eyre::eyre::eyre!("index tool not registered"))?;
     print!("{}", execute_index(entry, path, config.agent, &cwd)?);
     Ok(())
 }
 
 fn ensure_index_enabled(config: &caudra_config::AgentConfig) -> Result<()> {
-    if !is_tool_enabled(&config.disabled_tools, "index") {
+    if !is_tool_enabled(&config.disabled_tools, "file_index") {
         bail!("index is disabled by plugins.index.enabled = false");
     }
     Ok(())
@@ -1277,7 +1277,7 @@ mod index_tests {
         let registry = Arc::new(ToolRegistry::new());
         let host = caudra_workcell::WorkcellHost::new(root.path(), None).unwrap();
         host.register(&registry).unwrap();
-        let entry = registry.get("index").unwrap();
+        let entry = registry.get("file_index").unwrap();
 
         let output = execute_index(
             entry.clone(),
@@ -1298,7 +1298,7 @@ mod index_tests {
         assert_eq!(directory, "nested/\nsource.rs");
 
         let disabled = caudra_config::AgentConfig {
-            disabled_tools: vec!["index".into()],
+            disabled_tools: vec!["file_index".into()],
             ..Default::default()
         };
         assert!(ensure_index_enabled(&disabled).is_err());

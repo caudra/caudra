@@ -9,7 +9,7 @@ group = "Concepts"
 
 Caudra diverged from [Maki](https://github.com/tontinton/maki) after commit [`d2d6e75`](https://github.com/tontinton/maki/commit/d2d6e757983551776a023f0dece7662aa03e3d95). Both projects continued from that point, so this page records work added on the Caudra branch rather than comparing every later release from both projects.
 
-Maki provided the native Rust TUI, Lua plugin system, provider integrations, MCP, ACP, skills, image input, and the original `index`, `python_execution`, and `task` tools. Caudra retains that foundation and changes how longer work is completed, steered, recovered, and authorized.
+Maki provided the native Rust TUI, Lua plugin system, provider integrations, MCP, ACP, skills, image input, and the original `file_index`, `python_execution`, and `task` tools. Caudra retains that foundation and changes how longer work is completed, steered, recovered, and authorized.
 
 ## Evidence-gated completion goals
 

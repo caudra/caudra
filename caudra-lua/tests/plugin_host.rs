@@ -4634,7 +4634,7 @@ fn read_only_filesystem_tools_declare_scopes_without_changing_default_behavior()
             json!({ "path": "/tmp/parent/../scope", "offset": 1, "limit": 1 }),
         ),
         ("list", json!({ "path": "/tmp/parent/../scope" })),
-        ("index", json!({ "path": "/tmp/parent/../scope" })),
+        ("file_index", json!({ "path": "/tmp/parent/../scope" })),
         ("view_image", json!({ "path": "/tmp/parent/../scope" })),
         (
             "glob",

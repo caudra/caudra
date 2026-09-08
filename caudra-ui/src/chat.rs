@@ -1245,7 +1245,7 @@ mod tests {
     #[test]
     fn restored_native_index_keeps_rust_renderer_without_lua_restore() {
         let messages = tool_use_pair(
-            "index",
+            "file_index",
             serde_json::json!({"path": "src/lib.rs"}),
             INDEX_SKELETON,
             false,
@@ -1295,7 +1295,7 @@ mod tests {
     #[test]
     fn index_without_stored_output_falls_back_to_plain_text_and_a_lua_restore() {
         let messages = tool_use_pair(
-            "index",
+            "file_index",
             serde_json::json!({"path": "src/lib.rs"}),
             INDEX_SKELETON,
             false,

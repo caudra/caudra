@@ -19,7 +19,7 @@ const SECTIONS: &[(&str, &[&str])] = &[
             "file_write",
             "file_edit",
             "file_apply_patch",
-            "index",
+            "file_index",
             "file_glob",
             "file_grep",
             "tool_output",

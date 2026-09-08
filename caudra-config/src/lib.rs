@@ -112,6 +112,7 @@ const LEGACY_PLUGIN_TOOLS: &[(&str, &[&str])] = &[
     ("edit", &["file_edit", "file_apply_patch"]),
     ("glob", &["file_glob"]),
     ("grep", &["file_grep"]),
+    ("index", &["file_index"]),
     ("read", &["file_read"]),
     ("write", &["file_write"]),
 ];
@@ -148,7 +149,7 @@ pub const WORKCELL_NATIVE_TOOL_NAMES: &[&str] = &[
     "file_grep",
     "file_read",
     "file_write",
-    "index",
+    "file_index",
     "websearch",
     "webfetch",
     "shell",
@@ -1442,7 +1443,7 @@ impl ToolOutputLines {
         (
             "index",
             &[
-                "index",
+                "file_index",
                 "code_map",
                 "code_context",
                 "code_refs",
@@ -1524,9 +1525,8 @@ impl ToolOutputLines {
             "bash" | "shell" => self.bash,
             "python_execution" => self.python_execution,
             "task" => self.task,
-            "index" | "code_map" | "code_context" | "code_refs" | "code_impact" | "code_expand" => {
-                self.index
-            }
+            "index" | "file_index" | "code_map" | "code_context" | "code_refs" | "code_impact"
+            | "code_expand" => self.index,
             "file_grep" | "file_glob" | "grep" | "glob" => self.grep,
             "file_read" | "read" => self.read,
             "memory" => self.write,
@@ -3970,7 +3970,7 @@ mod tests {
             toml::from_str("[plugins.index]\nenabled = false\nmax_file_size_mb = 4\n").unwrap();
         let config = config.into_config(false).unwrap();
         assert_eq!(config.agent.index_max_file_size_mb, 4);
-        assert!(config.agent.disabled_tools.contains(&"index".into()));
+        assert!(config.agent.disabled_tools.contains(&"file_index".into()));
         assert!(!config.plugins.names.contains(&"index".into()));
     }
 
@@ -4144,7 +4144,7 @@ mod tests {
     #[test_case("bash", &["shell"] ; "bash_disables_shell")]
     #[test_case("edit", &["file_edit", "file_apply_patch"] ; "edit_disables_both_edit_tools")]
     #[test_case("read", &["file_read"] ; "read_disables_file_read")]
-    #[test_case("index", &["index"] ; "name_matching_the_tool_passes_through")]
+    #[test_case("index", &["file_index"] ; "index_disables_the_renamed_file_index")]
     fn disabled_plugin_disables_the_tools_it_was_replaced_by(plugin: &str, expected: &[&str]) {
         let raw: RawConfig =
             toml::from_str(&format!("[plugins.{plugin}]\nenabled = false\n")).unwrap();

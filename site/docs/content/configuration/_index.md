@@ -122,7 +122,7 @@ How many lines of output an open card shows per tool before it says how many it 
 | `bash` | 5 | `shell` |
 | `python_execution` | 5 | `python_execution` |
 | `task` | 5 | `task` |
-| `index` | 3 | `index`, `code_map`, `code_context`, `code_refs`, `code_impact`, `code_expand` |
+| `index` | 3 | `file_index`, `code_map`, `code_context`, `code_refs`, `code_impact`, `code_expand` |
 | `grep` | 3 | `file_grep`, `file_glob` |
 | `read` | 3 | `file_read` |
 | `write` | 7 | `file_write`, `file_edit`, `file_apply_patch`, `image_generate`, `memory` |
@@ -235,7 +235,7 @@ caudra.setup({
 
 ### `plugins.index`
 
-`index` executes as a native Workcell tool. This table keeps its existing configuration keys. The file-size limit accepts 1 through 16 MiB to bound parser memory and work.
+`file_index` executes as a native Workcell tool, and this table keeps the `plugins.index` key it was configured under. The file-size limit accepts 1 through 16 MiB to bound parser memory and work.
 
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|

@@ -40,20 +40,20 @@ const RESEARCH_CONVENTIONS_HEADING: &str = "# Guidelines\n";
 const GENERAL_CONVENTIONS_HEADING: &str = "# Conventions\n";
 const GENERAL_COMPLETION_HEADING: &str = "# When done\n";
 const CODE_MAP_TOOL_USAGE: &str = "- In an unfamiliar codebase, use **code_map** to see what matters before reading, **code_context** to find what a change touches, and **code_refs**/**code_impact** before editing a shared symbol. Their counts are floors: a zero means no reference was found, never that none exists.";
-const INDEX_TOOL_USAGE: &str = "- Use the **index** tool first on individual files to get their skeleton, then use **file_read** with offset/limit for the specific section you need.";
+const INDEX_TOOL_USAGE: &str = "- Use the **file_index** tool first on individual files to get their skeleton, then use **file_read** with offset/limit for the specific section you need.";
 
 /// `(tool, slot, content)`. Only applied when the tool survives the filter.
 const NATIVE_HINTS: &[(&str, Slot, &str)] = &[
     ("code_map", Slot::ToolUsage, CODE_MAP_TOOL_USAGE),
     (
-        crate::tools::INDEX_TOOL_NAME,
+        crate::tools::FILE_INDEX_TOOL_NAME,
         Slot::ToolUsage,
         INDEX_TOOL_USAGE,
     ),
     (
-        crate::tools::INDEX_TOOL_NAME,
+        crate::tools::FILE_INDEX_TOOL_NAME,
         Slot::EfficientTools,
-        crate::tools::INDEX_TOOL_NAME,
+        crate::tools::FILE_INDEX_TOOL_NAME,
     ),
     (
         crate::tools::TODOWRITE_TOOL_NAME,
@@ -678,16 +678,16 @@ mod tests {
         let s = slots(
             PromptId::System,
             &[
-                (Slot::EfficientTools, "index"),
+                (Slot::EfficientTools, "file_index"),
                 (Slot::EfficientTools, "foo"),
             ],
         );
         let out = assemble(PromptId::System, &s, "");
-        assert!(out.contains(&format!("{NATIVE_EFFICIENT_LINE}, index, foo.")));
+        assert!(out.contains(&format!("{NATIVE_EFFICIENT_LINE}, file_index, foo.")));
     }
 
     #[test_case(crate::tools::ToolFilter::All, true ; "enabled")]
-    #[test_case(crate::tools::ToolFilter::AllExcept(vec!["index".into()]), false ; "disabled")]
+    #[test_case(crate::tools::ToolFilter::AllExcept(vec!["file_index".into()]), false ; "disabled")]
     fn native_index_hints_follow_effective_filter(
         filter: crate::tools::ToolFilter,
         expected: bool,
@@ -696,7 +696,7 @@ mod tests {
         let filtered = slots.with_native_hints(&filter);
         let output = assemble(PromptId::System, &filtered, "");
         assert_eq!(output.contains(INDEX_TOOL_USAGE), expected);
-        assert_eq!(output.contains("task, index."), expected);
+        assert_eq!(output.contains("task, file_index."), expected);
     }
 
     #[test_case(PromptId::Research ; "research")]

@@ -42,7 +42,7 @@ const LISTED_COMMANDS_MAX: usize = 3;
 const REVIEW_MAX_DEPTH: usize = 6;
 const REVIEW_MAX_ITEMS: usize = 32;
 const NORMALIZED_COMMAND_ATTRIBUTE: &str = super::NORMALIZED_COMMAND_ATTRIBUTE;
-const FILE_READ_TOOLS: &[&str] = &["file_read", "index", "read", "view_image"];
+const FILE_READ_TOOLS: &[&str] = &["file_read", "file_index", "read", "view_image"];
 const DIRECTORY_READ_TOOLS: &[&str] = &["list"];
 const FILE_SEARCH_TOOLS: &[&str] = &["file_glob", "file_grep", "glob", "grep"];
 const GIT_METADATA_DIR: &str = ".git";
@@ -53,7 +53,7 @@ const INERT_GIT_METADATA: &[&str] = &[
     "MERGE_HEAD",
     "MERGE_MSG",
     "ORIG_HEAD",
-    "index",
+    "file_index",
     "logs",
     "objects",
     "packed-refs",
@@ -1382,7 +1382,7 @@ fn resources_for(
         ToolKey::Native(name) if FILE_READ_TOOLS.contains(&name.as_ref()) => scopes
             .iter()
             .map(|scope| {
-                let directory = name.as_ref() == "index" && Path::new(scope).is_dir();
+                let directory = name.as_ref() == "file_index" && Path::new(scope).is_dir();
                 filesystem_resource(
                     if directory {
                         PermissionResourceKind::Directory

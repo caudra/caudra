@@ -65,7 +65,7 @@ const TOOL_NAME_MAP: &[(&str, &str)] = &[
     ("code_impact", "CodeImpact"),
     ("code_expand", "CodeExpand"),
     ("execution_environment", "ExecutionEnvironment"),
-    ("index", "Index"),
+    ("file_index", "Index"),
     ("memory", "Memory"),
     ("question", "Question"),
     ("skill", "Skill"),
@@ -2062,7 +2062,7 @@ mod tests {
     #[test_case("task", "Task")]
     #[test_case("python_execution", "PythonExecution")]
     #[test_case("execution_environment", "ExecutionEnvironment")]
-    #[test_case("index", "Index")]
+    #[test_case("file_index", "Index")]
     #[test_case("memory", "Memory")]
     #[test_case("question", "Question")]
     fn caudra_to_claude_roundtrip(caudra: &str, claude: &str) {

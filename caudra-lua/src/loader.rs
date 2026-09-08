@@ -758,7 +758,7 @@ mod tests {
             assert!(reg.get(name).is_none(), "{name} was registered from Lua");
             assert!(!caudra_config::ACTIVE_DEFAULT_LUA_PLUGINS.contains(name));
         }
-        assert!(caudra_config::WORKCELL_NATIVE_TOOL_NAMES.contains(&"index"));
+        assert!(caudra_config::WORKCELL_NATIVE_TOOL_NAMES.contains(&"file_index"));
         assert!(caudra_config::CAUDRA_NATIVE_TOOL_NAMES.contains(&"view_image"));
     }
 

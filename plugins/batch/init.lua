@@ -80,7 +80,7 @@ local examples = {
     tool_calls = {
       { tool = "file_glob", parameters = { pattern = "src/**/*.ts" } },
       { tool = "file_grep", parameters = { pattern = "import", include = "*.ts" } },
-      { tool = "index", parameters = { path = "/project/index.ts" } },
+      { tool = "file_index", parameters = { path = "/project/index.ts" } },
     },
   },
 }

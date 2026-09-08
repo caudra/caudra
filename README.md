@@ -20,7 +20,7 @@ Caudra modifications are maintained by [Thorsten Born](https://thorstenborn.com)
 
 ### Effective action
 
-- `index` parses supported languages with [tree-sitter](https://tree-sitter.github.io/tree-sitter) and returns compact file structure with exact line ranges.
+- `file_index` parses supported languages with [tree-sitter](https://tree-sitter.github.io/tree-sitter) and returns compact file structure with exact line ranges.
 - `python_execution` uses [Monty](https://github.com/pydantic/monty) to run bounded, isolated Python over values already in context. It cannot call tools or access host files, processes, or the network. The final expression and printed output return as one tool result.
 - `task` delegates isolated planning or implementation to subagents with selectable models and thinking modes.
 - Tool results feed back into the next decision, so Caudra can inspect failures, change course, and continue.
