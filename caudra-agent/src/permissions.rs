@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
@@ -210,6 +211,12 @@ pub enum PermissionAnswer {
         option_id: String,
         lifetime: PermissionLifetime,
     },
+    /// One choice per resource of the request, composed into a single rule.
+    /// A row left `None` is granted for this call only.
+    AllowComposed {
+        rows: Vec<Option<PermissionRowGrant>>,
+        lifetime: PermissionLifetime,
+    },
     Deny,
     DenyWithGuidance(String),
     DenyAlwaysLocal,
@@ -225,9 +232,17 @@ impl PermissionAnswer {
             | Self::AllowOption {
                 lifetime: PermissionLifetime::Once,
                 ..
+            }
+            | Self::AllowComposed {
+                lifetime: PermissionLifetime::Once,
+                ..
             } => DECISION_SOURCE_USER_ONCE,
             Self::AllowSession
             | Self::AllowOption {
+                lifetime: PermissionLifetime::Conversation,
+                ..
+            }
+            | Self::AllowComposed {
                 lifetime: PermissionLifetime::Conversation,
                 ..
             } => DECISION_SOURCE_USER_SESSION,
@@ -235,7 +250,8 @@ impl PermissionAnswer {
             | Self::AllowAlwaysGlobal
             | Self::DenyAlwaysLocal
             | Self::DenyAlwaysGlobal
-            | Self::AllowOption { .. } => DECISION_SOURCE_USER_ALWAYS,
+            | Self::AllowOption { .. }
+            | Self::AllowComposed { .. } => DECISION_SOURCE_USER_ALWAYS,
         }
     }
 
@@ -247,6 +263,7 @@ impl PermissionAnswer {
                 | Self::AllowAlwaysLocal
                 | Self::AllowAlwaysGlobal
                 | Self::AllowOption { .. }
+                | Self::AllowComposed { .. }
         )
     }
 
@@ -260,6 +277,11 @@ impl PermissionAnswer {
                 option_id,
                 lifetime,
             } => format!("allow_option:{}:{option_id}", lifetime_name(lifetime)),
+            Self::AllowComposed { rows, lifetime } => format!(
+                "allow_composed:{}:{}",
+                lifetime_name(lifetime),
+                serde_json::to_string(rows).unwrap_or_default()
+            ),
             Self::Deny => "deny".to_string(),
             Self::DenyWithGuidance(g) => format!("deny:{g}"),
             Self::DenyAlwaysLocal => "deny_always_local".to_string(),
@@ -281,6 +303,14 @@ impl PermissionAnswer {
                 let (lifetime, option_id) = rest.split_once(':')?;
                 Some(Self::AllowOption {
                     option_id: option_id.to_owned(),
+                    lifetime: parse_lifetime(lifetime)?,
+                })
+            }
+            _ if s.starts_with("allow_composed:") => {
+                let rest = s.strip_prefix("allow_composed:")?;
+                let (lifetime, rows) = rest.split_once(':')?;
+                Some(Self::AllowComposed {
+                    rows: serde_json::from_str(rows).ok()?,
                     lifetime: parse_lifetime(lifetime)?,
                 })
             }
@@ -1687,6 +1717,15 @@ impl PermissionManager {
                 option_id,
                 lifetime,
             } => (option_id.as_str(), lifetime.clone()),
+            PermissionAnswer::AllowComposed { rows, lifetime } => {
+                let Some(rule) = request
+                    .composed_rule(rows, lifetime)
+                    .map_err(|error| PermissionPolicyError(error.to_string()))?
+                else {
+                    return Ok(None);
+                };
+                return self.store_reusable_rule(request, rule, approved_project);
+            }
             PermissionAnswer::DenyAlwaysLocal => ("deny_exact", PermissionLifetime::Project),
             PermissionAnswer::DenyAlwaysGlobal => ("deny_exact", PermissionLifetime::Global),
             PermissionAnswer::Deny | PermissionAnswer::DenyWithGuidance(_) => return Ok(None),
@@ -1716,6 +1755,17 @@ impl PermissionManager {
                 "authority {option_id:?} does not cover the pending request"
             )));
         }
+        self.store_reusable_rule(request, rule, approved_project)
+    }
+
+    /// Files a validated rule wherever its lifetime belongs, and reports the
+    /// allow that other pending prompts can be swept with.
+    fn store_reusable_rule(
+        &self,
+        request: &PermissionRequest,
+        rule: StructuredPermissionRule,
+        approved_project: Option<&Path>,
+    ) -> Result<Option<StructuredPermissionRule>, PermissionPolicyError> {
         if rule.lifetime == PermissionLifetime::Once {
             return Ok(None);
         }
@@ -2238,8 +2288,15 @@ impl PermissionManager {
                 let (answer, option_id, lifetime) = answer_log_fields(explicit);
                 (answer, option_id, lifetime, explicit.decision_source())
             }
-            Some(PendingDecision::MatchedRule) => ("matched_rule", "", "", DECISION_SOURCE_RULE),
-            None => ("abandoned", "", "", DECISION_SOURCE_USER_ABORT),
+            Some(PendingDecision::MatchedRule) => {
+                ("matched_rule", Cow::Borrowed(""), "", DECISION_SOURCE_RULE)
+            }
+            None => (
+                "abandoned",
+                Cow::Borrowed(""),
+                "",
+                DECISION_SOURCE_USER_ABORT,
+            ),
         };
         info!(
             target: PERMISSION_LOG_TARGET,
@@ -2247,7 +2304,7 @@ impl PermissionManager {
             request_id,
             tool = %request.tool,
             answer,
-            option_id,
+            option_id = %option_id,
             lifetime,
             source = answer_source,
             waited_ms = waiting_since.elapsed().as_millis() as u64,
@@ -2335,32 +2392,48 @@ fn subject_kind_and_contract(subject: &PermissionSubject) -> (&str, &str) {
 /// Answer kind, chosen option, and granted lifetime as separate fields, so
 /// prompt analysis can group by lifetime without parsing `encode()`. Denials
 /// carry no lifetime because a `deny_always_*` writes its rule elsewhere.
-fn answer_log_fields(answer: &PermissionAnswer) -> (&'static str, &str, &'static str) {
+fn answer_log_fields(answer: &PermissionAnswer) -> (&'static str, Cow<'_, str>, &'static str) {
+    let none = Cow::Borrowed("");
     match answer {
-        PermissionAnswer::AllowOnce => ("allow", "", lifetime_name(&PermissionLifetime::Once)),
+        PermissionAnswer::AllowOnce => ("allow", none, lifetime_name(&PermissionLifetime::Once)),
         PermissionAnswer::AllowSession => (
             "allow_session",
-            "",
+            none,
             lifetime_name(&PermissionLifetime::Conversation),
         ),
         PermissionAnswer::AllowAlwaysLocal => (
             "allow_always_local",
-            "",
+            none,
             lifetime_name(&PermissionLifetime::Project),
         ),
         PermissionAnswer::AllowAlwaysGlobal => (
             "allow_always_global",
-            "",
+            none,
             lifetime_name(&PermissionLifetime::Global),
         ),
         PermissionAnswer::AllowOption {
             option_id,
             lifetime,
-        } => ("allow_option", option_id, lifetime_name(lifetime)),
-        PermissionAnswer::Deny => ("deny", "", ""),
-        PermissionAnswer::DenyWithGuidance(_) => ("deny_guidance", "", ""),
-        PermissionAnswer::DenyAlwaysLocal => ("deny_always_local", "", ""),
-        PermissionAnswer::DenyAlwaysGlobal => ("deny_always_global", "", ""),
+        } => (
+            "allow_option",
+            Cow::Borrowed(option_id.as_str()),
+            lifetime_name(lifetime),
+        ),
+        // The rungs themselves are not named: what matters for grouping is how
+        // much of the request an answer chose to remember.
+        PermissionAnswer::AllowComposed { rows, lifetime } => (
+            "allow_composed",
+            Cow::Owned(format!(
+                "{}/{} rows",
+                rows.iter().filter(|row| row.is_some()).count(),
+                rows.len()
+            )),
+            lifetime_name(lifetime),
+        ),
+        PermissionAnswer::Deny => ("deny", none, ""),
+        PermissionAnswer::DenyWithGuidance(_) => ("deny_guidance", none, ""),
+        PermissionAnswer::DenyAlwaysLocal => ("deny_always_local", none, ""),
+        PermissionAnswer::DenyAlwaysGlobal => ("deny_always_global", none, ""),
     }
 }
 
@@ -3895,6 +3968,14 @@ mod tests {
                 option_id: "allow_url_origin".into(),
                 lifetime: PermissionLifetime::Project,
             },
+            PermissionAnswer::AllowComposed {
+                rows: vec![
+                    Some(PermissionRowGrant::Offered("command_exact_0".into())),
+                    Some(PermissionRowGrant::Written("git status *".into())),
+                    None,
+                ],
+                lifetime: PermissionLifetime::Conversation,
+            },
             PermissionAnswer::Deny,
             PermissionAnswer::DenyWithGuidance("hint".into()),
         ] {
@@ -4938,6 +5019,79 @@ mod tests {
             .await
     }
 
+    const COMPOSED_REQUEST_ID: &str = "composed-request";
+
+    /// The point of per-row scopes: one answer, one rule, and only the rows
+    /// that asked to be remembered end up in it. The row that asked for nothing
+    /// still runs, because the call proceeds on the answer and not on the rule.
+    #[test]
+    fn a_composed_answer_remembers_only_the_rows_that_asked_for_it() {
+        smol::block_on(async {
+            let manager = Arc::new(default_mgr());
+            let commands = ["git status --short", "cargo test"];
+            let input = serde_json::json!({"command": commands.join(" && ")});
+            let (event_tx, event_rx) = flume::unbounded::<crate::Envelope>();
+            let (_legacy_tx, legacy_rx) = flume::unbounded();
+            let legacy_rx = Arc::new(async_lock::Mutex::new(legacy_rx));
+            let task = smol::spawn({
+                let manager = Arc::clone(&manager);
+                let input = input.clone();
+                async move {
+                    manager
+                        .enforce(
+                            &ToolKey::native("bash"),
+                            &crate::tools::PermissionScopes {
+                                scopes: commands.iter().map(|c| (*c).to_owned()).collect(),
+                                force_prompt: false,
+                                plan_scoped: false,
+                            },
+                            &input,
+                            &crate::EventSender::new(event_tx, 0),
+                            Some(&legacy_rx),
+                            COMPOSED_REQUEST_ID,
+                            &crate::CancelToken::none(),
+                            None,
+                        )
+                        .await
+                }
+            });
+            assert!(matches!(
+                event_rx.recv_async().await.unwrap().event,
+                AgentEvent::PermissionRequest(_)
+            ));
+            assert!(manager.answer(
+                COMPOSED_REQUEST_ID,
+                PermissionAnswer::AllowComposed {
+                    rows: vec![
+                        Some(PermissionRowGrant::Offered("command_pattern_0".into())),
+                        None,
+                    ],
+                    lifetime: PermissionLifetime::Conversation,
+                }
+            ));
+            assert!(task.await.is_ok());
+
+            assert!(
+                enforce_without_prompt(
+                    &manager,
+                    "git status --porcelain",
+                    serde_json::json!({"command": "git status --porcelain"})
+                )
+                .await
+                .is_ok()
+            );
+            assert!(
+                enforce_without_prompt(
+                    &manager,
+                    "cargo test",
+                    serde_json::json!({"command": "cargo test"})
+                )
+                .await
+                .is_err()
+            );
+        });
+    }
+
     fn opaque_intent(
         command: &str,
         workdir: &Path,
@@ -5848,7 +6002,11 @@ mod tests {
     ) {
         assert_eq!(
             answer_log_fields(&answer),
-            (expected_answer, expected_option, expected_lifetime)
+            (
+                expected_answer,
+                Cow::Borrowed(expected_option),
+                expected_lifetime
+            )
         );
     }
 
@@ -5861,7 +6019,7 @@ mod tests {
 
         assert_eq!(
             answer_log_fields(&answer),
-            ("allow_option", "allow_subtree", "project")
+            ("allow_option", Cow::Borrowed("allow_subtree"), "project")
         );
     }
 }

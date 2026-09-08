@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use url::Url;
 
+use super::command_pattern::{PatternFault, grade_command_pattern};
 use crate::tools::PermissionIntent;
 
 pub use caudra_storage::permission_state::{
@@ -149,6 +150,35 @@ pub struct PermissionRuleOption {
     pub group: Option<PermissionOptionGroup>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub caution: Option<PermissionCaution>,
+}
+
+/// What one resource row contributes to a composed answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionRowGrant {
+    /// A rung the request offered for this resource.
+    Offered(String),
+    /// A pattern the user wrote for this resource.
+    Written(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum ComposedAnswerError {
+    #[error("answer named {named} rows for {resources} resources")]
+    RowCount { named: usize, resources: usize },
+    #[error("request did not offer {0:?} for this command")]
+    NotOffered(String),
+    #[error("authority {0:?} does not allow the chosen lifetime")]
+    LifetimeWithdrawn(String),
+    #[error("pattern for `{command}` is not usable: {fault}")]
+    Pattern {
+        command: String,
+        fault: PatternFault,
+    },
+    #[error("chosen authorities do not share one capability family")]
+    MixedFamilies,
+    #[error("chosen authority does not cover the command it was chosen for")]
+    Uncovered,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -365,6 +395,108 @@ impl PermissionRequest {
         let mut rule = option.rule.clone();
         rule.lifetime = lifetime;
         Some(rule)
+    }
+
+    /// The one rule a per-row answer stands for, or `None` when no row asked to
+    /// be remembered.
+    ///
+    /// Composing is sound because a rule's resource constraints are a set: each
+    /// granted row contributes the constraint it chose, and the rule covers a
+    /// resource when any constraint does. Rows left ungranted contribute
+    /// nothing, which is what makes them this call only — the call itself
+    /// proceeds on the answer, not on the rule.
+    ///
+    /// A written pattern is authority the request never offered, so it is
+    /// admitted only against the command on its own row and only for a lifetime
+    /// that row's offered rung still allows. That second gate is what keeps
+    /// plan mode contained without knowing anything about plans.
+    pub fn composed_rule(
+        &self,
+        rows: &[Option<PermissionRowGrant>],
+        lifetime: &PermissionLifetime,
+    ) -> Result<Option<StructuredPermissionRule>, ComposedAnswerError> {
+        if rows.len() != self.resources.len() {
+            return Err(ComposedAnswerError::RowCount {
+                named: rows.len(),
+                resources: self.resources.len(),
+            });
+        }
+        let offered = |index: usize, id: &str| {
+            self.options
+                .iter()
+                .find(|option| {
+                    option.id == id
+                        && option.rule.effect == StructuredPermissionEffect::Allow
+                        && option.group.as_ref().and_then(|group| group.resource) == Some(index)
+                })
+                .ok_or_else(|| ComposedAnswerError::NotOffered(id.to_owned()))
+                .and_then(|option| {
+                    option
+                        .allowed_lifetimes
+                        .contains(lifetime)
+                        .then_some(option)
+                        .ok_or_else(|| ComposedAnswerError::LifetimeWithdrawn(id.to_owned()))
+                })
+        };
+        let mut constraints = Vec::new();
+        let mut family = None;
+        for (index, grant) in rows.iter().enumerate() {
+            let Some(grant) = grant else {
+                continue;
+            };
+            let (option, chosen) = match grant {
+                PermissionRowGrant::Offered(id) => {
+                    let option = offered(index, id)?;
+                    (option, option.rule.resources.clone())
+                }
+                PermissionRowGrant::Written(pattern) => {
+                    let resource = &self.resources[index];
+                    let option = offered(index, &format!("{COMMAND_EXACT_PREFIX}{index}"))?;
+                    grade_command_pattern(pattern, &resource.value).map_err(|fault| {
+                        ComposedAnswerError::Pattern {
+                            command: safe_summary(&resource.value),
+                            fault,
+                        }
+                    })?;
+                    (
+                        option,
+                        vec![PermissionResourceConstraint {
+                            selector: PermissionResourceSelector::CommandPattern {
+                                pattern: pattern.clone(),
+                            },
+                            ..resource_constraint(resource)
+                        }],
+                    )
+                }
+            };
+            match family {
+                Some(family) if family != option.rule.family => {
+                    return Err(ComposedAnswerError::MixedFamilies);
+                }
+                _ => family = Some(option.rule.family),
+            }
+            constraints.extend(chosen);
+        }
+        if constraints.is_empty() {
+            return Ok(None);
+        }
+        let rule = StructuredPermissionRule {
+            subject: self.subject.clone(),
+            executor: self.executor.clone(),
+            resources: constraints,
+            arguments: PermissionArgumentConstraint::Unconstrained,
+            lifetime: lifetime.clone(),
+            effect: StructuredPermissionEffect::Allow,
+            family: family.flatten(),
+        };
+        for (index, grant) in rows.iter().enumerate() {
+            if grant.is_some()
+                && !permission_rule_covers_resource(&rule, self, &self.resources[index])
+            {
+                return Err(ComposedAnswerError::Uncovered);
+            }
+        }
+        Ok(Some(rule))
     }
 }
 
@@ -3966,6 +4098,179 @@ mod tests {
                 ));
             }
         }
+    }
+
+    fn two_command_request() -> PermissionRequest {
+        explicit_request(
+            PermissionAuthorityProfile::Shell,
+            vec![
+                command_resource("git status --short", "/project"),
+                command_resource("cargo test", "/project"),
+            ],
+            json!({"command": "multiple"}),
+        )
+    }
+
+    fn composed(
+        request: &PermissionRequest,
+        rows: Vec<Option<PermissionRowGrant>>,
+    ) -> Result<Option<StructuredPermissionRule>, ComposedAnswerError> {
+        request.composed_rule(&rows, &PermissionLifetime::Conversation)
+    }
+
+    #[test]
+    fn a_composed_answer_keeps_each_row_at_the_breadth_it_chose() {
+        let request = two_command_request();
+        let rule = composed(
+            &request,
+            vec![
+                Some(PermissionRowGrant::Offered("command_pattern_0".into())),
+                Some(PermissionRowGrant::Offered("command_exact_1".into())),
+            ],
+        )
+        .unwrap()
+        .unwrap();
+
+        assert!(matches!(
+            rule.arguments,
+            PermissionArgumentConstraint::Unconstrained
+        ));
+        assert!(matches!(
+            &rule.resources[0].selector,
+            PermissionResourceSelector::CommandPattern { pattern } if pattern == "git status *"
+        ));
+        assert_eq!(
+            rule.resources[1].selector,
+            resource_constraint(&request.resources[1]).selector
+        );
+        assert!(permission_rule_covers_request(&rule, &request));
+        // The widened row reaches beyond what was reviewed; the pinned one does not.
+        assert!(permission_rule_covers_resource(
+            &rule,
+            &request,
+            &command_resource("git status --porcelain", "/project")
+        ));
+        assert!(!permission_rule_covers_resource(
+            &rule,
+            &request,
+            &command_resource("cargo test --lib", "/project")
+        ));
+    }
+
+    /// A row left ungranted must contribute no constraint. An empty constraint
+    /// list is an unrestricted rule, so the answer has to store nothing at all
+    /// rather than store a rule that happens to name nothing.
+    #[test]
+    fn a_row_left_ungranted_is_absent_from_the_stored_rule() {
+        let request = two_command_request();
+        let rule = composed(
+            &request,
+            vec![
+                Some(PermissionRowGrant::Offered("command_exact_0".into())),
+                None,
+            ],
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(rule.resources.len(), 1);
+        assert!(permission_rule_covers_resource(
+            &rule,
+            &request,
+            &request.resources[0]
+        ));
+        assert!(!permission_rule_covers_resource(
+            &rule,
+            &request,
+            &request.resources[1]
+        ));
+        assert_eq!(composed(&request, vec![None, None]), Ok(None));
+    }
+
+    #[test]
+    fn a_written_pattern_is_admitted_only_against_its_own_command() {
+        let request = two_command_request();
+        let rule = composed(
+            &request,
+            vec![
+                None,
+                Some(PermissionRowGrant::Written("cargo test *".into())),
+            ],
+        )
+        .unwrap()
+        .unwrap();
+
+        assert!(matches!(
+            &rule.resources[0].selector,
+            PermissionResourceSelector::CommandPattern { pattern } if pattern == "cargo test *"
+        ));
+        assert_eq!(
+            composed(
+                &request,
+                vec![
+                    Some(PermissionRowGrant::Written("cargo test *".into())),
+                    None
+                ],
+            ),
+            Err(ComposedAnswerError::Pattern {
+                command: "git status --short".into(),
+                fault: PatternFault::DoesNotMatch,
+            })
+        );
+    }
+
+    #[test]
+    fn a_row_may_not_borrow_another_rows_rung() {
+        let request = two_command_request();
+
+        assert_eq!(
+            composed(
+                &request,
+                vec![
+                    Some(PermissionRowGrant::Offered("command_exact_1".into())),
+                    None,
+                ],
+            ),
+            Err(ComposedAnswerError::NotOffered("command_exact_1".into()))
+        );
+        assert_eq!(
+            composed(&request, vec![None]),
+            Err(ComposedAnswerError::RowCount {
+                named: 1,
+                resources: 2,
+            })
+        );
+    }
+
+    /// Withdrawing a row's lifetimes is how plan mode contains authority, and a
+    /// written pattern must not be a way around it.
+    #[test]
+    fn a_written_pattern_inherits_the_lifetimes_its_row_still_allows() {
+        let mut request = two_command_request();
+        for option in &mut request.options {
+            option.allowed_lifetimes.retain(|lifetime| {
+                !matches!(
+                    lifetime,
+                    PermissionLifetime::Project | PermissionLifetime::Global
+                )
+            });
+        }
+        let rows = vec![
+            None,
+            Some(PermissionRowGrant::Written("cargo test *".into())),
+        ];
+
+        assert!(
+            request
+                .composed_rule(&rows, &PermissionLifetime::Conversation)
+                .is_ok()
+        );
+        assert_eq!(
+            request.composed_rule(&rows, &PermissionLifetime::Project),
+            Err(ComposedAnswerError::LifetimeWithdrawn(
+                "command_exact_1".into()
+            ))
+        );
     }
 
     #[test]
