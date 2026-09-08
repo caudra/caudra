@@ -2870,16 +2870,28 @@ mod tests {
     /// so marking a line is the whole difference between running and asking.
     #[test_case("git status --short" => true ; "a read that cannot leave the project")]
     #[test_case("cat Cargo.toml" => true ; "a read of a relative path")]
+    #[test_case("cat \"my file.txt\"" => true ; "a quoted operand is one word, not two")]
+    #[test_case("find . -name '*.rs'" => true ; "a quoted glob is an ordinary argument")]
     #[test_case("cat /etc/shadow" => false ; "a read that leaves the project")]
     #[test_case("cat ../../secret" => false ; "a read that climbs out of it")]
     #[test_case("rm -rf build" => false ; "not a read at all")]
     #[test_case("git status > out.txt" => false ; "an opaque line is never marked")]
-    // Workcell marks `${...}` and `$(...)` opaque but leaves a bare `$HOME`
-    // intact, so these reach the confinement check looking like plain relative
-    // paths. They are the reason it refuses a token it cannot resolve.
-    #[test_case("cat $HOME/.ssh/id_rsa" => false ; "a bare variable is not confined by its text")]
-    #[test_case("cat \"$HOME\"/.ssh/id_rsa" => false ; "nor is a quoted one")]
-    #[test_case("cat *" => false ; "nor is an unquoted glob")]
+    #[test_case("git \"-C\" /elsewhere log" => false ; "quoting does not hide a denied flag")]
+    #[test_case("cat \\/etc/shadow" => false ; "escaping does not hide an absolute path")]
+    // Every one of these names something its own text does not. Workcell marks
+    // `${...}` and `$(...)` opaque but leaves the rest intact, so each arrived
+    // at the confinement check looking like an ordinary relative path, and each
+    // textual rule written to catch them missed the next one.
+    #[test_case("cat $HOME/.ssh/id_rsa" => false ; "a bare variable")]
+    #[test_case("cat \"$HOME\"/.ssh/id_rsa" => false ; "a quoted variable, which expands the same")]
+    #[test_case("cat *" => false ; "an unquoted glob")]
+    #[test_case("cat {/etc/shadow,x}" => false ; "a brace expansion naming an absolute path")]
+    #[test_case("cat {1..9}" => false ; "a numeric brace range")]
+    // A denied flag cannot be recognized in a word that cannot be read, and plan
+    // mode gates on `is_read_only` alone, so the unreadable word has to
+    // disqualify the line rather than wait for the confinement check.
+    #[test_case("find . $FLAG" => false ; "find could be hiding -delete")]
+    #[test_case("rg $PRE pattern" => false ; "ripgrep could be hiding --pre")]
     fn shell_preflight_marks_only_a_confined_read(command: &str) -> bool {
         let root = TempDir::new().expect("tempdir");
         confined_read_preflight_marks(root.path(), command)
@@ -2901,6 +2913,34 @@ mod tests {
         std::os::unix::fs::symlink(outside.path(), root.path().join("linked")).expect("dir link");
 
         confined_read_preflight_marks(root.path(), command)
+    }
+
+    /// Plan mode gates on `is_read_only` alone, with no confinement check, so
+    /// the classifier has to be self-sufficient there. A denied flag cannot be
+    /// recognized inside a word the parse could not read, which is why an
+    /// unreadable word disqualifies the line rather than deferring to a check
+    /// this path never runs.
+    #[test_case("git log --oneline" => true ; "a read the parse can account for")]
+    #[test_case("find . -name '*.rs'" => true ; "a quoted glob is an ordinary argument")]
+    #[test_case("cat /etc/shadow" => true ; "plan mode judges the verb, not the operand")]
+    #[test_case("find . $FLAG" => false ; "find could be hiding -delete")]
+    #[test_case("rg $PRE pattern" => false ; "ripgrep could be hiding --pre")]
+    #[test_case("git -c core.pager=sh log" => false ; "a flag it can read is refused on its merits")]
+    #[test_case("rm -rf build" => false ; "not a read at all")]
+    fn plan_mode_admits_only_a_line_it_could_read(command: &str) -> bool {
+        let root = TempDir::new().expect("tempdir");
+        let (_host, registry) = host_and_registry(root.path());
+        let ctx = context(root.path(), Arc::clone(&registry), CancelToken::none());
+        let invocation = registry
+            .get("shell")
+            .expect("registered shell")
+            .tool
+            .parse(&json!({"command": command}))
+            .expect("valid shell input");
+
+        smol::block_on(invocation.preflight(&ctx)).expect("shell preflight");
+
+        matches!(invocation.plan_mode_access(), PlanModeAccess::ReadOnly)
     }
 
     fn confined_read_preflight_marks(root: &Path, command: &str) -> bool {
