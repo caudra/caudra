@@ -26,7 +26,8 @@ use super::title;
 use super::tool_dispatch::{self, RecentCalls};
 use crate::cancel::{CancelMap, CancelToken};
 use crate::context::{
-    ContextCapture, ContextInventory, ContextPublisher, ContextReadiness, ContextSnapshot,
+    BuiltinToolsInput, ContextCapture, ContextInventory, ContextPublisher, ContextReadiness,
+    ContextSnapshot,
 };
 use crate::mcp::{McpRequestSnapshot, McpSession};
 use crate::permissions::PermissionManager;
@@ -552,7 +553,13 @@ impl<'h> Agent<'h> {
             &self.prompt_profiles,
             &task_profiles,
             self.active_prompt_profile_name.as_deref(),
-            self.deferral.definitions(),
+            Some(&BuiltinToolsInput {
+                registry: &self.registry,
+                filter: &self.tool_filter,
+                config: &self.config,
+                model: &self.model,
+                deferred: self.deferral.definitions(),
+            }),
             mcp,
         );
         publisher.publish(ContextSnapshot::capture(ContextCapture {

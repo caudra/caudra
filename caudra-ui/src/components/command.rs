@@ -107,6 +107,12 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         scope: ChatScope::Any,
     },
     BuiltinCommand {
+        name: "/tools",
+        description: "Show which tools the model can reach",
+        max_args: 0,
+        scope: ChatScope::Any,
+    },
+    BuiltinCommand {
         name: "/queue",
         description: "Inspect and edit queued prompts",
         max_args: 0,

@@ -35,7 +35,9 @@ const CONTEXT: &str = r#"## Context window
 
 `/context` opens a compact summary of the active context window. Main and each task have separate prompts, tools, and transcripts. The command reports Main when Main is open, or the selected task when its transcript is open. It never adds those windows together. A task restored after restart has no request snapshot until the task is continued.
 
-The summary shows the active model and window, estimated tokens by category, the compaction reserve, and remaining space. `/context all` adds item-level MCP tool, profile, memory, and skill inventories. Both views use the active provider's request projection, so eligible old retained tool results count as compact output-ID markers rather than their full canonical text.
+The summary shows the active model and window, estimated tokens by category, the compaction reserve, and remaining space. `/context all` adds item-level built-in tool, MCP tool, profile, memory, and skill inventories. Both views use the active provider's request projection, so eligible old retained tool results count as compact output-ID markers rather than their full canonical text.
+
+`/tools` covers the tool array on its own. It lists every built-in and MCP tool with its state, its token cost, and the rule behind that state, and it is the only view that shows tools turned off by configuration. See [Tools](/docs/tools/) for the lists that decide those states.
 
 Token counts are estimates. Deferred MCP definitions and memory or skill bodies stay on demand, and opening either report does not load them. The compact MCP catalog, memory tag index, and skill name and description list count when present. Full definitions and bodies count after the agent loads them.
 
@@ -89,7 +91,7 @@ An input box appears while the focused task is running. Press Enter to queue gui
 
 That input box is a full composer. Typing `/` opens the palette, `Ctrl+S` inserts a file path, `Ctrl+X e` edits the draft in your editor, and `Ctrl+V` attaches an image to the guidance. A custom `/project:` or `/user:` command expands its template and steers the focused task rather than the main session.
 
-Commands that reach the main session's turn or history have no task equivalent, so `/compact`, `/model`, `/system-prompt`, `/workflow`, `/btw`, the `/goal` family, and MCP prompts are drawn dimmed and report their scope when run. Return to Main to use them. `/context`, `/queue`, `/review`, and the stash commands already follow the focused transcript."#;
+Commands that reach the main session's turn or history have no task equivalent, so `/compact`, `/model`, `/system-prompt`, `/workflow`, `/btw`, the `/goal` family, and MCP prompts are drawn dimmed and report their scope when run. Return to Main to use them. `/context`, `/tools`, `/queue`, `/review`, and the stash commands already follow the focused transcript."#;
 
 fn write_row(out: &mut String, name: &str, description: &str, scope: ChatScope) {
     let scope = match scope {

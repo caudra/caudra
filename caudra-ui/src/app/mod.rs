@@ -65,6 +65,7 @@ use crate::components::status_bar::{StatusBar, StatusBarHit, StatusBarHitTarget}
 use crate::components::task_picker::TaskPicker;
 use crate::components::theme_picker::{ThemePicker, ThemePickerAction};
 use crate::components::todo_panel::TodoPanel;
+use crate::components::tools_modal::ToolsModal;
 use crate::components::usage_modal::{UsageFetchState, UsageModal, UsageScope};
 use crate::components::which_key::WhichKey;
 use crate::components::workbench::styles as workbench_styles;
@@ -128,6 +129,7 @@ const FLASH_REWIND: &str = "Press esc again to rewind...";
 const FLASH_EXIT: &str = "Press Ctrl+D again to exit...";
 const FLASH_NO_CHORD: &str = "is not a chord";
 const CONTEXT_USAGE: &str = "Usage: /context [all]";
+const TOOLS_USAGE: &str = "Usage: /tools";
 const AUTH_EXPIRED_MSG: &str = "Authentication failed. Run `caudra auth login` in another terminal; Caudra will resume automatically, or press Enter to retry now.";
 const FLASH_NO_PLAN: &str = "No plan file";
 const FAST_UNSUPPORTED_MSG: &str = "Fast mode requires an Anthropic Opus 4.6+ model (API only)";
@@ -271,6 +273,7 @@ pub struct App {
     pub(super) which_key: WhichKey,
     pub(super) usage_modal: UsageModal,
     pub(super) context_modal: ContextModal,
+    pub(super) tools_modal: ToolsModal,
     context_snapshot: Watch<ContextSnapshot>,
     /// Read from the ledger when the modal asks for it, not on every frame:
     /// the table outlives sessions and only grows.
@@ -466,6 +469,7 @@ impl App {
             which_key: WhichKey::new(ui_config.which_key_delay()),
             usage_modal: UsageModal::new(),
             context_modal: ContextModal::new(),
+            tools_modal: ToolsModal::new(),
             context_snapshot: Watch::default(),
             lifetime_usage: None,
             goal_modal: GoalModal::default(),
@@ -974,6 +978,10 @@ impl App {
             self.context_modal.scroll(delta);
             return None;
         }
+        if self.tools_modal.is_open() {
+            self.tools_modal.scroll(delta);
+            return None;
+        }
         if self.goal_modal.is_open() {
             self.goal_modal.scroll(delta);
             return None;
@@ -1161,6 +1169,11 @@ impl App {
 
         if self.context_modal.is_open() {
             self.context_modal.handle_key(key);
+            return Some(vec![]);
+        }
+
+        if self.tools_modal.is_open() {
+            self.tools_modal.handle_key(key);
             return Some(vec![]);
         }
 
@@ -2053,7 +2066,7 @@ impl App {
     }
 
     fn handle_subagent_submit(&mut self, sub: Submission) -> Vec<Action> {
-        if self.intercept_context_submission(&sub.text) {
+        if self.intercept_inspection_submission(&sub.text) {
             return vec![];
         }
         if sub.images.is_empty() && sub.text.trim() == "/queue" {
@@ -2107,13 +2120,21 @@ impl App {
         vec![]
     }
 
-    fn intercept_context_submission(&mut self, text: &str) -> bool {
+    fn intercept_inspection_submission(&mut self, text: &str) -> bool {
         let (token, args) = text.split_once(char::is_whitespace).unwrap_or((text, ""));
-        if !token.eq_ignore_ascii_case("/context") {
-            return false;
+        if token.eq_ignore_ascii_case("/context") {
+            self.execute_context(args);
+            return true;
         }
-        self.execute_context(args);
-        true
+        if token.eq_ignore_ascii_case("/tools") {
+            if args.trim().is_empty() {
+                self.execute_tools();
+            } else {
+                self.flash(TOOLS_USAGE.into());
+            }
+            return true;
+        }
+        false
     }
 
     fn execute_context(&mut self, args: &str) {
@@ -2127,6 +2148,11 @@ impl App {
         };
         self.context_snapshot = Watch::seeded(self.active_context_snapshot());
         self.context_modal.open(expanded);
+    }
+
+    fn execute_tools(&mut self) {
+        self.context_snapshot = Watch::seeded(self.active_context_snapshot());
+        self.tools_modal.open();
     }
 
     fn preserve_unconsumed_steers(&mut self, task_id: &str) {
@@ -2316,7 +2342,7 @@ impl App {
         if sub.is_empty() {
             return vec![];
         }
-        if self.intercept_context_submission(&sub.text) {
+        if self.intercept_inspection_submission(&sub.text) {
             return vec![];
         }
         if sub.draft.paste_ranges.is_empty() && sub.text.trim() == "exit" {
@@ -2890,6 +2916,7 @@ impl App {
 
         if let ChatEventResult::PermissionRequest(request) = result {
             self.context_modal.close();
+            self.tools_modal.close();
             if self.permissions_picker.is_open() {
                 self.permissions_picker.close();
                 self.permission_config_trust_deferred =
@@ -3132,6 +3159,10 @@ impl App {
             }
             "/context" => {
                 self.execute_context(&cmd.args);
+                vec![]
+            }
+            "/tools" => {
+                self.execute_tools();
                 vec![]
             }
             "/btw" => {
@@ -3438,12 +3469,13 @@ impl App {
         self.status_bar.refresh_cwd();
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 26] {
+    fn overlays(&self) -> [&dyn Overlay; 27] {
         [
             &self.workbench,
             &self.help_modal,
             &self.usage_modal,
             &self.context_modal,
+            &self.tools_modal,
             &self.goal_modal,
             &self.btw_modal,
             &self.float_mgr,
@@ -3469,12 +3501,13 @@ impl App {
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 26] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 27] {
         [
             &mut self.workbench,
             &mut self.help_modal,
             &mut self.usage_modal,
             &mut self.context_modal,
+            &mut self.tools_modal,
             &mut self.goal_modal,
             &mut self.btw_modal,
             &mut self.float_mgr,
@@ -3632,7 +3665,7 @@ impl App {
     }
 
     fn poll_context_snapshot(&mut self) -> Dirty {
-        if !self.context_modal.is_open() {
+        if !self.context_modal.is_open() && !self.tools_modal.is_open() {
             return Dirty::NO;
         }
         let snapshot = self.active_context_snapshot();

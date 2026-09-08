@@ -85,8 +85,9 @@ fn write_disabling_section(out: &mut String) {
          {companions} {verb} available whatever the lists say. The agent calls {pronoun} on its \
          own to page through a truncated result.\n\n\
          Run [`caudra tools`](/docs/cli/) to see the resulting set, including which rule turned \
-         each tool off. To keep a tool available but gate every call, use a `deny` or `prompt` \
-         default in [Permissions](/docs/permissions/) instead."
+         each tool off, or `/tools` inside a session to see it for the open transcript. To keep \
+         a tool available but gate every call, use a `deny` or `prompt` default in \
+         [Permissions](/docs/permissions/) instead."
     )
     .unwrap();
 }

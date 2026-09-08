@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
-use caudra_config::CompactionBuffer;
+use caudra_config::{AgentConfig, CompactionBuffer};
 use caudra_providers::{
     ContentBlock, Message, Model, Role, adapt_images_for_model, estimate_tokens_cached,
 };
@@ -13,7 +13,10 @@ use crate::mcp::{McpRequestSnapshot, McpToolStatus};
 use crate::prompt::profile::{BUILTIN_PROFILE_NAME, PromptProfileCatalog, TaskProfileBindings};
 use crate::tools::TOOL_SEARCH_TOOL_NAME;
 use crate::tools::native::{memory, skill};
-use crate::tools::{DeferredTool, MEMORY_TOOL_NAME, SKILL_TOOL_NAME, TASK_TOOL_NAME, ToolRegistry};
+use crate::tools::{
+    DeferredTool, MEMORY_TOOL_NAME, SKILL_TOOL_NAME, TASK_TOOL_NAME, ToolFilter, ToolRegistry,
+    ToolState, builtin_report,
+};
 
 const MEMORY_READ_COMMAND: &str = "read";
 
@@ -327,12 +330,16 @@ impl ContextMcpInventory {
 pub enum ContextBuiltinState {
     Declared,
     Deferred,
+    Disabled,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextBuiltinTool {
     pub name: String,
+    pub source: String,
     pub state: ContextBuiltinState,
+    /// The rule that decided the state, when one had to.
+    pub reason: Option<&'static str>,
     pub tokens: u32,
 }
 
@@ -369,11 +376,8 @@ impl ContextBuiltinInventory {
         self.tokens_for(ContextBuiltinState::Deferred)
     }
 
-    pub fn deferred_count(&self) -> usize {
-        self.tools
-            .iter()
-            .filter(|tool| tool.state == ContextBuiltinState::Deferred)
-            .count()
+    pub fn count(&self, state: ContextBuiltinState) -> usize {
+        self.tools.iter().filter(|tool| tool.state == state).count()
     }
 }
 
@@ -386,6 +390,52 @@ pub struct ContextInventory {
     pub mcp: ContextMcpInventory,
 }
 
+/// Everything the built-in half of an inventory needs: the tools that exist,
+/// the rules that decide their state, and the deferred definitions the array
+/// does not carry.
+pub struct BuiltinToolsInput<'a> {
+    pub registry: &'a ToolRegistry,
+    pub filter: &'a ToolFilter,
+    pub config: &'a AgentConfig,
+    pub model: &'a Model,
+    pub deferred: &'a [DeferredTool],
+}
+
+impl BuiltinToolsInput<'_> {
+    fn inventory(&self) -> ContextBuiltinInventory {
+        let deferred_tokens: HashMap<&str, u32> = self
+            .deferred
+            .iter()
+            .map(|tool| (tool.name.as_ref(), value_tokens(&tool.definition)))
+            .collect();
+        let tools = self
+            .registry
+            .iter()
+            .iter()
+            .map(|entry| {
+                let name = entry.name();
+                let report = builtin_report(name, self.filter, &[], self.config, self.model);
+                let state = match report.state {
+                    ToolState::On => ContextBuiltinState::Declared,
+                    ToolState::Lazy => ContextBuiltinState::Deferred,
+                    ToolState::Off => ContextBuiltinState::Disabled,
+                };
+                ContextBuiltinTool {
+                    name: name.to_owned(),
+                    source: entry.source.as_log_field().into_owned(),
+                    state,
+                    reason: report.reason,
+                    tokens: deferred_tokens.get(name).copied().unwrap_or_default(),
+                }
+            })
+            .collect();
+        ContextBuiltinInventory {
+            tools,
+            ..ContextBuiltinInventory::default()
+        }
+    }
+}
+
 impl ContextInventory {
     pub fn collect(
         cwd: &Path,
@@ -393,7 +443,7 @@ impl ContextInventory {
         profiles: &PromptProfileCatalog,
         task_profiles: &TaskProfileBindings,
         active_profile: Option<&str>,
-        deferred: &[DeferredTool],
+        builtins: Option<&BuiltinToolsInput<'_>>,
         mcp: Option<&McpRequestSnapshot>,
     ) -> Self {
         let available = task_profiles
@@ -460,17 +510,9 @@ impl ContextInventory {
                 skills,
                 ..ContextSkillInventory::default()
             },
-            builtins: ContextBuiltinInventory {
-                tools: deferred
-                    .iter()
-                    .map(|tool| ContextBuiltinTool {
-                        name: tool.name.to_string(),
-                        state: ContextBuiltinState::Deferred,
-                        tokens: value_tokens(&tool.definition),
-                    })
-                    .collect(),
-                ..ContextBuiltinInventory::default()
-            },
+            builtins: builtins
+                .map(BuiltinToolsInput::inventory)
+                .unwrap_or_default(),
             mcp,
         }
     }
@@ -822,14 +864,12 @@ impl ContextMcpInventory {
 }
 
 impl ContextBuiltinInventory {
-    /// Seeded with every deferred definition, then corrected by the request:
-    /// a name the array actually carries is declared, whatever it started as,
-    /// and its tokens become the measured ones.
+    /// The registry says which tools exist and why; only the request knows
+    /// what they cost. A name the array actually carries is declared with its
+    /// measured tokens, whatever the filter predicted.
     fn apply_request_tokens(&mut self, definitions: &[(String, u32)], unattributed: u32) {
         self.catalog_tokens = 0;
         self.unattributed_tokens = unattributed;
-        self.tools
-            .retain(|tool| tool.state == ContextBuiltinState::Deferred);
 
         for (name, tokens) in definitions {
             if name == TOOL_SEARCH_TOOL_NAME {
@@ -843,7 +883,9 @@ impl ContextBuiltinInventory {
                 }
                 None => self.tools.push(ContextBuiltinTool {
                     name: name.clone(),
+                    source: String::new(),
                     state: ContextBuiltinState::Declared,
+                    reason: None,
                     tokens: *tokens,
                 }),
             }
@@ -1059,7 +1101,7 @@ mod tests {
             &profiles,
             &task_profiles,
             active_profile,
-            &[],
+            None,
             None,
         );
         let active = inventory

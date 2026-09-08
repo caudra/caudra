@@ -3,7 +3,8 @@ use std::{env, sync::Arc};
 use arc_swap::ArcSwap;
 use caudra_agent::agent;
 use caudra_agent::context::{
-    ContextCapture, ContextInventory, ContextPublisher, ContextReadiness, ContextSnapshot,
+    BuiltinToolsInput, ContextCapture, ContextInventory, ContextPublisher, ContextReadiness,
+    ContextSnapshot,
 };
 use caudra_agent::mcp::config::McpServerStatus;
 use caudra_agent::mcp::{McpHandle, McpRequestSnapshot, McpSession};
@@ -631,7 +632,13 @@ impl AgentLoop {
                     .as_deref()
                     .map_or(BUILTIN_PROFILE_NAME, SystemPromptProfile::name),
             ),
-            &self.deferred,
+            Some(&BuiltinToolsInput {
+                registry: ToolRegistry::global(),
+                filter: &ToolFilter::from_config(&self.config, &slot.model, &[]),
+                config: &self.config,
+                model: &slot.model,
+                deferred: &self.deferred,
+            }),
             mcp.as_ref(),
         );
         self.context_publisher

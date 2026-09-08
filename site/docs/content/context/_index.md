@@ -13,7 +13,9 @@ Everything the model knows about your project passes through one context window,
 
 `/context` shows a compact snapshot of the context Caudra would send for the transcript currently open. Main has one context. Each task has its own system prompt, tool set, and transcript, so opening a task and running `/context` reports that task alone. Return to Main to inspect Main. A task restored after restart has no request snapshot until the task is continued.
 
-The summary shows the active model and window size, estimated tokens grouped by source, the compaction reserve, and the space available before automatic compaction. `/context all` adds item-level MCP tool, profile, memory, and skill inventories. Opening either view does not add its report to the transcript.
+The summary shows the active model and window size, estimated tokens grouped by source, the compaction reserve, and the space available before automatic compaction. `/context all` adds item-level built-in tool, MCP tool, profile, memory, and skill inventories. Opening either view does not add its report to the transcript.
+
+`/tools` answers a narrower question: which tools the model can reach right now. It lists every built-in and MCP tool with its state, its token cost, and the rule behind that state. Tools turned off by configuration appear there and nowhere else, because they cost no context.
 
 Every token count in the report is an estimate. Caudra uses local estimates for text and images. Provider tokenizers and wire formats vary, so the input total reported after a completed call can differ.
 
@@ -31,7 +33,7 @@ Repeated requests increase `/usage` even when the current `/context` total stays
 ```
 session start (paid every request)   on demand (paid when used)
 ──────────────────────────────────   ─────────────────────────────────
-effective system prompt              file contents   file_read / index / file_grep
+effective system prompt              file contents   file_read / file_index / file_grep
 tool definitions                     skill bodies    skill tool
 instruction files (AGENTS.md, ...)   memory notes    memory tool
 memory tag names                     subdir rules    first file_read there

@@ -25,7 +25,7 @@ caudra.setup({
 
 `tool_output` stays available whatever the lists say. The agent calls it on its own to page through a truncated result.
 
-Run [`caudra tools`](/docs/cli/) to see the resulting set, including which rule turned each tool off. To keep a tool available but gate every call, use a `deny` or `prompt` default in [Permissions](/docs/permissions/) instead.
+Run [`caudra tools`](/docs/cli/) to see the resulting set, including which rule turned each tool off, or `/tools` inside a session to see it for the open transcript. To keep a tool available but gate every call, use a `deny` or `prompt` default in [Permissions](/docs/permissions/) instead.
 
 ## Tools loaded on demand
 

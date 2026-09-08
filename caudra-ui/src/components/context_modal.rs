@@ -648,17 +648,14 @@ fn inventory_summary_lines(snapshot: &ContextSnapshot, theme: &Theme) -> Vec<Lin
         .count();
 
     let builtins = &snapshot.inventory.builtins;
-    let declared_builtins = builtins
-        .tools
-        .len()
-        .saturating_sub(builtins.deferred_count());
     vec![
         inventory_summary_line(
             GridKind::SystemTools,
             format!(
-                "{} declared · {} on demand · {} in context · {} if loaded",
-                format_usize(declared_builtins),
-                format_usize(builtins.deferred_count()),
+                "{} declared · {} on demand · {} disabled · {} in context · {} if loaded",
+                format_usize(builtins.count(ContextBuiltinState::Declared)),
+                format_usize(builtins.count(ContextBuiltinState::Deferred)),
+                format_usize(builtins.count(ContextBuiltinState::Disabled)),
                 token_label(builtins.request_tokens()),
                 token_label(builtins.deferred_tokens())
             ),
@@ -755,16 +752,19 @@ fn builtin_lines(snapshot: &ContextSnapshot, theme: &Theme) -> Vec<Line<'static>
             "On demand",
             format!(
                 "{} tools · {} if loaded",
-                format_usize(inventory.deferred_count()),
+                format_usize(inventory.count(ContextBuiltinState::Deferred)),
                 token_label(inventory.deferred_tokens())
             ),
             theme,
         ),
     ];
     for tool in &inventory.tools {
+        // A disabled tool contributes nothing and belongs to `/tools`, which
+        // is about what exists rather than about what the window holds.
         let (glyph, status, status_style) = match tool.state {
             ContextBuiltinState::Declared => ("●", "declared", theme.tool_success),
             ContextBuiltinState::Deferred => ("○", "on demand", theme.tool_dim),
+            ContextBuiltinState::Disabled => continue,
         };
         lines.push(Line::from(vec![
             Span::styled(format!("{glyph} "), status_style),
@@ -1125,12 +1125,16 @@ mod tests {
                     tools: vec![
                         ContextBuiltinTool {
                             name: "file_read".to_owned(),
+                            source: "native:workcell".to_owned(),
                             state: ContextBuiltinState::Declared,
+                            reason: None,
                             tokens: 55,
                         },
                         ContextBuiltinTool {
                             name: "code_map".to_owned(),
+                            source: "native:workcell".to_owned(),
                             state: ContextBuiltinState::Deferred,
+                            reason: Some("deferred behind tool_search"),
                             tokens: 90,
                         },
                     ],
@@ -1318,7 +1322,7 @@ mod tests {
             "░ Reserve 100 tokens (10.0%)",
             "Auto-compact  threshold 900 tokens (90.0%) · reserve 100 tokens (10.0%)",
             "M MCP tools  3 tools · 1 loaded/eager · 1 on demand · 1 disabled · ~40 tokens in context",
-            "T System tools  1 declared · 1 on demand · ~75 tokens in context · ~90 tokens if loaded",
+            "T System tools  1 declared · 1 on demand · 0 disabled · ~75 tokens in context · ~90 tokens if loaded",
             "code_map  on demand · ~90 tokens",
             "On-load bodies  ~120 tokens across 1 notes",
             "definitions ~25 tokens · loaded bodies ~45 tokens",
