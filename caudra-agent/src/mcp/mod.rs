@@ -48,7 +48,7 @@ use self::http::HttpTransport;
 use self::stdio::StdioTransport;
 use self::transport::McpTransport;
 use crate::permissions::{PermissionSubject, canonical_json_sha256};
-use crate::tools::deferral::{SearchOutcome, TOOL_SEARCH_TOOL_NAME};
+use crate::tools::deferral::SearchOutcome;
 use crate::tools::schema::sanitize_tool_input_schema;
 
 const SEPARATOR: &str = ".";
@@ -608,9 +608,17 @@ impl McpRequestSnapshot {
     /// what's left deferred, so loading tools mid-session can never flip
     /// the remainder into the context.
     pub fn extend_tools(&self, tools: &mut Value) {
+        let section = self.extend_declared(tools);
+        crate::tools::deferral::push_catalog(tools, section.as_slice());
+    }
+
+    /// Appends this request's declared definitions and returns MCP's slice of
+    /// the shared `tool_search` entry. See [`DeferralSnapshot::extend_declared`]
+    /// for why the two halves are separate.
+    pub fn extend_declared(&self, tools: &mut Value) -> Option<String> {
         let Some(arr) = tools.as_array_mut() else {
             debug_assert!(false, "tools must be a JSON array");
-            return;
+            return None;
         };
         let existing: HashSet<String> = arr
             .iter()
@@ -635,16 +643,7 @@ impl McpRequestSnapshot {
                 deferred.push(descriptor);
             }
         }
-        if !deferred.is_empty() {
-            if existing.contains(TOOL_SEARCH_TOOL_NAME) {
-                warn!(
-                    deferred = deferred.len(),
-                    "a tool named {TOOL_SEARCH_TOOL_NAME} already exists; deferred MCP tools stay hidden"
-                );
-            } else {
-                arr.push(tool_search_definition(&deferred));
-            }
-        }
+        (!deferred.is_empty()).then(|| catalog_section(&deferred))
     }
 }
 
@@ -1650,7 +1649,10 @@ fn build_haystack(definition: &Value) -> String {
     hay
 }
 
-fn tool_search_definition(deferred: &[&ToolDescriptor]) -> Value {
+/// MCP's slice of the shared `tool_search` entry. Unlike the built-in
+/// catalog this stays bare names: a server index is unbounded, so a sentence
+/// each would cost more than the deferral saves.
+fn catalog_section(deferred: &[&ToolDescriptor]) -> String {
     // Grouping by server drops the repeated `server__` prefix, a few
     // tokens per tool. Descriptors arrive grouped because entries are
     // sorted and published per server.
@@ -1673,25 +1675,7 @@ fn tool_search_definition(deferred: &[&ToolDescriptor]) -> Value {
         }
         catalog.push_str(raw);
     }
-    json!({
-        "name": TOOL_SEARCH_TOOL_NAME,
-        "description": format!(
-            "Search and load deferred MCP tools; they are not callable until \
-             loaded, from your next message on. Keywords match tool names, \
-             descriptions, and parameter names; an exact tool name always wins.\n\
-             Deferred tools:\n{catalog}"
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "Keywords or an exact tool name from the catalog"
-                }
-            },
-            "required": ["query"]
-        }
-    })
+    format!("From MCP servers:\n{catalog}")
 }
 
 fn transport_url(transport: &Transport) -> Option<String> {
@@ -1748,6 +1732,7 @@ fn intern(name: String) -> Arc<str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::deferral::TOOL_SEARCH_TOOL_NAME;
     use async_lock::Mutex as AsyncMutex;
     use caudra_providers::{Model, Role};
     use caudra_storage::sessions::SessionDatabase;
@@ -1824,6 +1809,8 @@ mod tests {
 
     const TOOL_NAME: &str = "srv.tool";
     const WIRE_TOOL_NAME: &str = "srv__tool";
+    const BUILTIN_DEFERRED: &str = "code_map";
+    const BUILTIN_DESCRIPTION: &str = "Rank every symbol in a source tree.";
 
     /// Counts shutdowns, signals on `call_entered` the moment a `tools/call` begins, and holds
     /// the call inside `call_gate` until tests release it. That way tests can meet an in-flight
@@ -2635,6 +2622,61 @@ mod tests {
             .expect("tool_search must stay while any tool is deferred");
         let description = catalog["description"].as_str().unwrap();
         assert!(description.contains("srv: gamma"), "got: {description}");
+    }
+
+    /// Both sources share one `tool_search`, and the request builds it by
+    /// running built-in deferral first. Whichever ran first used to claim the
+    /// name and leave the other's tools uncatalogued.
+    #[test]
+    fn a_builtin_catalog_does_not_hide_the_deferred_mcp_tools() {
+        let defs = vec![
+            tool_def("srv", "alpha", "", json!({})),
+            tool_def("srv", "beta", "", json!({})),
+            tool_def("srv", "gamma", "", json!({})),
+        ];
+        let (_inner, handle) = setup_with_defer(vec![entry_with_tools("srv", defs)], 2);
+        let builtin = crate::tools::DeferralSession::new(
+            vec![crate::tools::DeferredTool::new(
+                BUILTIN_DEFERRED,
+                None,
+                json!({ "name": BUILTIN_DEFERRED, "description": BUILTIN_DESCRIPTION }),
+            )],
+            std::iter::empty(),
+        );
+
+        let mut tools = json!([]);
+        let mut sections: Vec<String> = builtin
+            .request_snapshot()
+            .extend_declared(&mut tools)
+            .into_iter()
+            .collect();
+        sections.extend(handle.request_snapshot().extend_declared(&mut tools));
+        crate::tools::deferral::push_catalog(&mut tools, &sections);
+
+        assert_eq!(tool_names(&tools), vec![TOOL_SEARCH_TOOL_NAME]);
+        let description = tools.as_array().unwrap()[0]["description"]
+            .as_str()
+            .unwrap();
+        assert!(description.contains(BUILTIN_DEFERRED), "got: {description}");
+        assert!(description.contains("srv: alpha"), "got: {description}");
+    }
+
+    /// A plugin or server owning the name is a real conflict, unlike the two
+    /// internal sources that share the entry by design.
+    #[test]
+    fn a_tool_the_caller_declared_as_tool_search_keeps_the_name() {
+        let (_inner, handle) = setup(vec![fake_entry("srv", FakeTransport::new())]);
+        let mut tools = json!([{ "name": TOOL_SEARCH_TOOL_NAME, "description": "mine" }]);
+
+        let sections: Vec<String> = handle
+            .request_snapshot()
+            .extend_declared(&mut tools)
+            .into_iter()
+            .collect();
+        crate::tools::deferral::push_catalog(&mut tools, &sections);
+
+        assert_eq!(tool_names(&tools), vec![TOOL_SEARCH_TOOL_NAME]);
+        assert_eq!(tools.as_array().unwrap()[0]["description"], "mine");
     }
 
     #[test]

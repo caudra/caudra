@@ -696,12 +696,15 @@ fn advertised_tool_names(
     mcp: Option<&McpSession>,
 ) -> Vec<String> {
     let mut probe = tools.clone();
-    DeferralSession::new(deferred.to_vec(), std::iter::empty())
+    let mut sections: Vec<String> = DeferralSession::new(deferred.to_vec(), std::iter::empty())
         .request_snapshot()
-        .extend_tools(&mut probe);
+        .extend_declared(&mut probe)
+        .into_iter()
+        .collect();
     if let Some(mcp) = mcp {
-        mcp.request_snapshot().extend_tools(&mut probe);
+        sections.extend(mcp.request_snapshot().extend_declared(&mut probe));
     }
+    crate::tools::deferral::push_catalog(&mut probe, &sections);
     extract_tool_names(&probe)
 }
 

@@ -538,12 +538,18 @@ impl<'h> Agent<'h> {
             return (Cow::Borrowed(&self.tools), None);
         }
         let mut tools = self.tools.clone();
-        self.deferral.request_snapshot().extend_tools(&mut tools);
+        let mut sections: Vec<String> = self
+            .deferral
+            .request_snapshot()
+            .extend_declared(&mut tools)
+            .into_iter()
+            .collect();
         let snapshot = self.mcp.as_ref().map(|mcp| {
             let snapshot = mcp.request_snapshot();
-            snapshot.extend_tools(&mut tools);
+            sections.extend(snapshot.extend_declared(&mut tools));
             snapshot
         });
+        crate::tools::deferral::push_catalog(&mut tools, &sections);
         (Cow::Owned(tools), snapshot)
     }
 

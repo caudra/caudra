@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use caudra_providers::{ContentBlock, Message};
 use serde_json::{Value, json};
-use tracing::info;
+use tracing::{info, warn};
 
 pub const TOOL_SEARCH_TOOL_NAME: &str = "tool_search";
 
@@ -25,6 +25,7 @@ const NAME_HIT_SCORE: usize = 2;
 const DESCRIPTION_HIT_SCORE: usize = 1;
 pub(crate) const SEARCH_EMPTY_QUERY: &str = "query must not be empty";
 const SEARCH_NO_MATCH: &str = "No deferred tools matched";
+const BUILTIN_HEADING: &str = "Available to load:";
 
 /// Every tool the transcript shows being called, for reseeding a resumed
 /// session: a tool that was loaded and used stays declared across a restart.
@@ -233,9 +234,18 @@ impl DeferralSnapshot {
     /// is left. Appending keeps the base array a prefix of the result, which
     /// is what token accounting attributes against.
     pub fn extend_tools(&self, tools: &mut Value) {
+        let section = self.extend_declared(tools);
+        push_catalog(tools, section.as_slice());
+    }
+
+    /// Appends the loaded definitions and returns this source's slice of the
+    /// catalog. Declaring and cataloguing are separate because the request
+    /// carries one `tool_search` covering every source, and whichever source
+    /// ran first used to claim the name and silence the rest.
+    pub fn extend_declared(&self, tools: &mut Value) -> Option<String> {
         let Some(array) = tools.as_array_mut() else {
             debug_assert!(false, "tools must be a JSON array");
-            return;
+            return None;
         };
         let declared: HashSet<String> = array
             .iter()
@@ -248,10 +258,7 @@ impl DeferralSnapshot {
             .partition(|tool| self.loaded.contains(&tool.name));
 
         array.extend(loaded.iter().map(|tool| tool.definition.clone()));
-        if pending.is_empty() || declared.contains(TOOL_SEARCH_TOOL_NAME) {
-            return;
-        }
-        array.push(catalog_definition(&pending));
+        (!pending.is_empty()).then(|| format!("{BUILTIN_HEADING}{}", catalog_listing(&pending)))
     }
 
     pub fn pending_names(&self) -> Vec<&str> {
@@ -263,10 +270,35 @@ impl DeferralSnapshot {
     }
 }
 
-/// The one entry that stands in for everything deferred. MCP builds its own
-/// against server names; this one lists built-ins and says what a load costs,
-/// because the model is the one choosing to spend it.
-fn catalog_definition(pending: &[&DeferredTool]) -> Value {
+/// The one entry that stands in for everything deferred, whatever it came
+/// from. Built-ins and MCP each contribute a section, and `run_tool_search`
+/// already answers for both, so the model never has to know which is which.
+///
+/// A `tool_search` the caller declared itself wins: a plugin or server owning
+/// that name is a real conflict, unlike the two internal sources that share
+/// this entry by design.
+pub fn push_catalog(tools: &mut Value, sections: &[String]) {
+    let Some(array) = tools.as_array_mut() else {
+        debug_assert!(false, "tools must be a JSON array");
+        return;
+    };
+    if sections.is_empty() {
+        return;
+    }
+    if array
+        .iter()
+        .any(|tool| tool["name"] == TOOL_SEARCH_TOOL_NAME)
+    {
+        warn!(
+            sections = sections.len(),
+            "a tool named {TOOL_SEARCH_TOOL_NAME} already exists; deferred tools stay hidden"
+        );
+        return;
+    }
+    array.push(catalog_definition(&sections.join("\n")));
+}
+
+fn catalog_definition(listing: &str) -> Value {
     json!({
         "name": TOOL_SEARCH_TOOL_NAME,
         "description": format!(
@@ -274,8 +306,7 @@ fn catalog_definition(pending: &[&DeferredTool]) -> Value {
              next message on. Keywords match tool names and descriptions, and an \
              exact name always wins. Related tools load together, and every load \
              resets the prompt cache, so search once for the work you are about \
-             to do rather than tool by tool.\nAvailable to load:{}",
-            catalog_listing(pending)
+             to do rather than tool by tool.\n{listing}"
         ),
         "input_schema": {
             "type": "object",

@@ -564,15 +564,18 @@ impl AgentLoop {
     /// the next publish.
     fn request_tools(&self, mcp: Option<&McpRequestSnapshot>) -> Value {
         let mut tools = self.tools.clone();
-        DeferralSession::new(
+        let mut sections: Vec<String> = DeferralSession::new(
             self.deferred.clone(),
             deferral::loaded_tool_names(self.history.as_slice()),
         )
         .request_snapshot()
-        .extend_tools(&mut tools);
+        .extend_declared(&mut tools)
+        .into_iter()
+        .collect();
         if let Some(mcp) = mcp {
-            mcp.extend_tools(&mut tools);
+            sections.extend(mcp.extend_declared(&mut tools));
         }
+        deferral::push_catalog(&mut tools, &sections);
         tools
     }
 
