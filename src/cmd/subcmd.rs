@@ -763,12 +763,19 @@ const REASON_COMPANION: &str = "always on (internal companion)";
 const REASON_NO_SUBSCRIPTION: &str = "no ChatGPT subscription";
 const REASON_OTHER_EDITOR: &str = "model uses the other editing tool";
 const REASON_DEFERRED: &str = "deferred behind tool_search";
+/// Padded to a common width so the name column starts at one column.
+const STATE_ON: &str = "on  ";
+const STATE_OFF: &str = "off ";
+const STATE_LAZY: &str = "lazy";
 
 #[derive(serde::Serialize)]
 struct ToolRow {
     name: String,
     source: String,
     enabled: bool,
+    /// Enabled, and absent from the request array until `tool_search` loads it.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    deferred: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     note: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -782,6 +789,7 @@ struct ToolRow {
 fn builtin_note(
     name: &str,
     enabled: bool,
+    deferred: bool,
     cli_disallowed: &[String],
     config: &AgentConfig,
     model: &Model,
@@ -792,7 +800,7 @@ fn builtin_note(
         if named_off || config_off {
             return Some(REASON_COMPANION);
         }
-        return deferral::is_deferred(name, &config.allowed_tools).then_some(REASON_DEFERRED);
+        return deferred.then_some(REASON_DEFERRED);
     }
     if named_off {
         return Some(REASON_DISALLOWED_FLAG);
@@ -840,11 +848,13 @@ fn builtin_rows(
                 _ => vec![ToolKey::native(name)],
             };
             let enabled = filter.matches(name);
+            let deferred = enabled && deferral::is_deferred(name, &config.agent.allowed_tools);
             ToolRow {
                 name: name.to_owned(),
                 source: entry.source.as_log_field().into_owned(),
                 enabled,
-                note: builtin_note(name, enabled, cli_disallowed, &config.agent, model),
+                deferred,
+                note: builtin_note(name, enabled, deferred, cli_disallowed, &config.agent, model),
                 permission: permission_default(&config.permissions, &keys),
             }
         })
@@ -871,6 +881,7 @@ fn mcp_rows(mcp: Option<&McpSession>, permissions: &PermissionsConfig) -> Vec<To
             .collect::<Vec<_>>();
             ToolRow {
                 enabled: !tool.disabled,
+                deferred: !tool.disabled && tool.deferred,
                 note: match (tool.disabled, tool.deferred) {
                     (true, _) => Some(REASON_CONFIG),
                     (false, true) => Some(REASON_DEFERRED),
@@ -894,7 +905,11 @@ fn print_group(heading: &str, rows: &[ToolRow]) {
     let source_width = rows.iter().map(|row| row.source.len()).max().unwrap_or(0);
     println!("{heading}");
     for row in rows {
-        let state = if row.enabled { "on " } else { "off" };
+        let state = match (row.enabled, row.deferred) {
+            (false, _) => STATE_OFF,
+            (true, true) => STATE_LAZY,
+            (true, false) => STATE_ON,
+        };
         let mut detail = row.note.map(str::to_owned).unwrap_or_default();
         if let Some(permission) = row.permission {
             if !detail.is_empty() {
@@ -1182,7 +1197,8 @@ mod tools_tests {
     ) -> Option<&'static str> {
         let cli: Vec<String> = cli.iter().map(|t| (*t).to_string()).collect();
         let model = caudra_providers::Model::from_spec(MODEL_SPEC).unwrap();
-        builtin_note(name, enabled, &cli, config, &model)
+        let deferred = enabled && deferral::is_deferred(name, &config.allowed_tools);
+        builtin_note(name, enabled, deferred, &cli, config, &model)
     }
 
     #[test]

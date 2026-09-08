@@ -165,8 +165,8 @@ Debug helper for inspecting the prompt and tool surface the agent sees. The `res
 ### `caudra tools`
 
 ```bash
-caudra tools                                  # every tool, on or off, with the reason
-caudra tools --enabled-only                   # only what the model will see
+caudra tools                                  # every tool, on, lazy, or off, with the reason
+caudra tools --enabled-only                   # only the tools the model can reach
 caudra tools --names                          # names, one per line
 caudra tools --json                           # full records
 caudra tools --schemas                        # definitions as the provider receives them
@@ -175,7 +175,9 @@ caudra tools --disallowed-tools shell         # preview a change before you run 
 
 Resolves config the way a real run does, so the output reflects `agent.disabled_tools`, the plugin table, `--allowed-tools`, `--disallowed-tools`, and the model you select with `-m`. Built-in tools come first, then MCP tools grouped by server. MCP servers connect on every run, so a slow or failed server shows its status instead of its tools.
 
-A tool that is off carries the rule that turned it off: `--disallowed-tools`, `disabled by config`, `not in --allowed-tools`, `model has no vision support`, or `no ChatGPT subscription`. MCP tools also report `deferred behind tool_search`. A `deny` or `allow` default from [Permissions](/docs/permissions/) appears next to the tool it applies to. See [Disabling tools](/docs/tools/#disabling-tools).
+A tool that is off carries the rule that turned it off: `--disallowed-tools`, `disabled by config`, `not in --allowed-tools`, `model has no vision support`, `model uses the other editing tool`, or `no ChatGPT subscription`. A `deny` or `allow` default from [Permissions](/docs/permissions/) appears next to the tool it applies to. See [Disabling tools](/docs/tools/#disabling-tools).
+
+A tool marked `lazy` is available and starts outside the request array, so the model reaches it through `tool_search` rather than seeing it upfront. Built-in and MCP tools can both be lazy. See [Tools loaded on demand](/docs/tools/#tools-loaded-on-demand).
 
 ### `caudra storage`
 
