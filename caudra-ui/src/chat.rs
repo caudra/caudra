@@ -36,6 +36,7 @@ pub(crate) const CANCELLED_TEXT: &str = "Cancelled";
 /// One notice per streak: a wedged model can spend twenty nudges, and twenty
 /// identical bubbles bury the conversation they are about.
 const NUDGE_TEXT: &str = "Model ended turn without a response, nudging...";
+const AUTO_COMPACTING_TEXT: &str = "Auto-compacting conversation...";
 const TOOLS_LOADED_PREFIX: &str = "Loaded ";
 const TOOLS_LOADED_SUFFIX: &str = " - the tools array changed, so the prompt cache prefix resets.";
 
@@ -208,8 +209,8 @@ impl Chat {
             AgentEvent::AutoCompacting => {
                 self.messages_panel.flush();
                 self.messages_panel.push(DisplayMessage::new(
-                    DisplayRole::Assistant,
-                    "Auto-compacting conversation...".into(),
+                    DisplayRole::Notice,
+                    AUTO_COMPACTING_TEXT.into(),
                 ));
             }
             AgentEvent::CompactionDone => {
@@ -1658,6 +1659,8 @@ mod tests {
 
         chat.handle_event(AgentEvent::AutoCompacting, None);
         assert_eq!(chat.message_count(), 1);
+        assert_eq!(chat.last_message_text(), AUTO_COMPACTING_TEXT);
+        assert_eq!(chat.last_message_role(), Some(&DisplayRole::Notice));
 
         chat.handle_event(
             AgentEvent::TextDelta {
