@@ -12,7 +12,7 @@ jobs:
   rust:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.98.0
@@ -22,7 +22,7 @@ jobs:
       # pinned release rather than built here. Cached on the pin so it is rebuilt only when it moves.
       - id: worker
         run: echo "version=$(awk '/^name = "monty-pool"$/ { getline; gsub(/[",]/, "", $3); print $3 }' Cargo.lock)" >> "$GITHUB_OUTPUT"
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: target/code-worker
           key: monty-worker-${{ runner.os }}-${{ steps.worker.outputs.version }}

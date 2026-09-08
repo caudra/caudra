@@ -1998,11 +1998,11 @@ mod tests {
     #[tokio::test]
     async fn closed_objects_declare_exactly_what_is_serialized() {
         fn walk(path: &str, schema: &Value, value: &Value) {
-            if let Some(items) = schema.get("items") {
-                if let Some(elements) = value.as_array() {
-                    for (index, element) in elements.iter().enumerate() {
-                        walk(&format!("{path}[{index}]"), items, element);
-                    }
+            if let Some(items) = schema.get("items")
+                && let Some(elements) = value.as_array()
+            {
+                for (index, element) in elements.iter().enumerate() {
+                    walk(&format!("{path}[{index}]"), items, element);
                 }
             }
             let (Some(properties), Some(object)) = (
