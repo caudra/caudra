@@ -46,6 +46,8 @@ const FILE_READ_TOOLS: &[&str] = &["file_read", "file_index", "read", "view_imag
 const DIRECTORY_READ_TOOLS: &[&str] = &["list"];
 const FILE_SEARCH_TOOLS: &[&str] = &["file_glob", "file_grep", "glob", "grep"];
 const GIT_METADATA_DIR: &str = ".git";
+const SUBTREE_OPTION_ID: &str = "allow_filesystem_subtree";
+const OUTSIDE_HOME_PHRASE: &str = "ALLOW OUTSIDE HOME";
 const INERT_GIT_METADATA: &[&str] = &[
     "COMMIT_EDITMSG",
     "FETCH_HEAD",
@@ -96,6 +98,27 @@ pub struct PermissionResource {
     pub attributes: BTreeMap<String, String>,
 }
 
+/// One rung of a ladder of mutually exclusive authorities.
+///
+/// `key` names the ladder and `value` is the part that differs between its
+/// rungs, so a renderer can show one row and move along it without parsing the
+/// varying part back out of the description.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermissionOptionGroup {
+    pub key: String,
+    pub value: String,
+}
+
+/// How far an authority reaches beyond what the request was about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionCaution {
+    /// Outside the repository the request came from.
+    Warn,
+    /// Outside the user's home directory entirely.
+    Danger,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PermissionRuleOption {
     pub id: String,
@@ -109,6 +132,10 @@ pub struct PermissionRuleOption {
     pub is_default: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confirmation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<PermissionOptionGroup>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caution: Option<PermissionCaution>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1645,6 +1672,8 @@ fn rule_options(
         broad,
         is_default,
         confirmation: confirmation.map(String::from),
+        group: None,
+        caution: None,
     };
     let reusable = vec![
         PermissionLifetime::Conversation,
@@ -2051,10 +2080,12 @@ fn add_filesystem_options(
         broad: true,
         is_default: false,
         confirmation: write.then(|| "ALLOW FILE CHANGES".into()),
+        group: None,
+        caution: None,
     });
 
-    // A protected path never earns a subtree grant, because every subtree
-    // option below pins `protected: Some(false)` and so could not cover it
+    // A protected path never earns a subtree grant, because every rung of the
+    // ladder below pins `protected: Some(false)` and so could not cover it
     // anyway. Returning here keeps the exact-path option above, which carries
     // the real protected flag and is reusable across differing tool inputs.
     if resources.iter().any(|resource| resource.protected) {
@@ -2082,7 +2113,7 @@ fn add_filesystem_options(
         } else {
             path.as_path()
         };
-        roots.push(root.to_string_lossy().into_owned());
+        roots.push(root.to_path_buf());
         constraints.push(PermissionResourceConstraint {
             kind: resource.kind.clone(),
             selector: PermissionResourceSelector::FilesystemSubtreeDigest {
@@ -2096,89 +2127,200 @@ fn add_filesystem_options(
     }
     roots.sort();
     roots.dedup();
-    let patterns = roots
-        .iter()
-        .map(|root| format!("{}/**", root.trim_end_matches('/')))
-        .collect::<Vec<_>>()
-        .join(", ");
-    options.push(PermissionRuleOption {
-        id: "allow_filesystem_subtree".into(),
-        label: "These directories and descendants".into(),
-        description: if family.is_some() {
+
+    let project = normalized_filesystem_path(&cwd.to_string_lossy());
+    let ladder = SubtreeLadder {
+        family,
+        write,
+        project: project.as_deref(),
+        repository: enclosing_repository(roots.first().map(PathBuf::as_path)),
+        home: caudra_storage::paths::home(),
+    };
+    options.push(ladder.rung(
+        SUBTREE_OPTION_ID.into(),
+        &roots,
+        constraints,
+        subject,
+        executor,
+        reusable,
+    ));
+
+    // Every rung above the first is a single root the whole request fits
+    // under, so the ladder walks the ancestors of what the roots have in
+    // common. With one root that common ancestor is the root itself, whose own
+    // level is already the rung above, so the walk starts one step up.
+    let Some(common) = common_ancestor(&roots) else {
+        return;
+    };
+    let climb: Vec<_> = if roots.len() == 1 {
+        common.ancestors().skip(1).collect()
+    } else {
+        common.ancestors().collect()
+    };
+    for (step, ancestor) in climb.into_iter().enumerate() {
+        let Some(digest) = filesystem_subtree_digest(&ancestor.to_string_lossy()) else {
+            continue;
+        };
+        let mut widened: Vec<PermissionResourceConstraint> = Vec::new();
+        for resource in resources {
+            if widened.iter().any(|constraint| {
+                constraint.kind == resource.kind && constraint.access == resource.access
+            }) {
+                continue;
+            }
+            widened.push(PermissionResourceConstraint {
+                kind: resource.kind.clone(),
+                selector: PermissionResourceSelector::FilesystemSubtreeDigest {
+                    digest: digest.clone(),
+                },
+                access: resource.access.clone(),
+                protected: Some(false),
+                attributes: BTreeMap::new(),
+            });
+        }
+        options.push(ladder.rung(
+            format!("{SUBTREE_OPTION_ID}_{}", step + 1),
+            std::slice::from_ref(&ancestor.to_path_buf()),
+            widened,
+            subject,
+            executor,
+            reusable,
+        ));
+    }
+}
+
+/// The context a subtree rung is judged in, so every rung is labelled, described
+/// and cautioned by one rule instead of by the loop that happens to build it.
+struct SubtreeLadder<'a> {
+    family: Option<PermissionCapabilityFamily>,
+    write: bool,
+    project: Option<&'a Path>,
+    repository: Option<PathBuf>,
+    home: Option<PathBuf>,
+}
+
+impl SubtreeLadder<'_> {
+    #[allow(clippy::too_many_arguments)]
+    fn rung(
+        &self,
+        id: String,
+        roots: &[PathBuf],
+        resources: Vec<PermissionResourceConstraint>,
+        subject: &PermissionSubject,
+        executor: &PermissionExecutorKind,
+        reusable: &[PermissionLifetime],
+    ) -> PermissionRuleOption {
+        let patterns = roots
+            .iter()
+            .map(|root| format!("{}/**", root.to_string_lossy().trim_end_matches('/')))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let caution = self.caution(roots);
+        let mut value = patterns.clone();
+        if roots.len() == 1 && self.project == Some(roots[0].as_path()) {
+            value.push_str(" (project root)");
+        }
+        let mut description = if self.family.is_some() {
             format!("Allow reading, listing, and searching any path below {patterns}.")
         } else {
             format!("Allow matching paths below {patterns}.")
-        },
-        rule: StructuredPermissionRule {
-            subject: subject.clone(),
-            executor: executor.clone(),
-            resources: constraints,
-            arguments: PermissionArgumentConstraint::Unconstrained,
-            lifetime: PermissionLifetime::Once,
-            effect: StructuredPermissionEffect::Allow,
-            family,
-        },
-        allowed_lifetimes: reusable.to_vec(),
-        broad: true,
-        is_default: false,
-        confirmation: write.then(|| "ALLOW DIRECTORY CHANGES".into()),
-    });
-
-    let Some(project) = normalized_filesystem_path(&cwd.to_string_lossy()) else {
-        return;
-    };
-    if !resources.iter().all(|resource| {
-        normalized_filesystem_path(&resource.value)
-            .is_some_and(|path| path == project || path.starts_with(&project))
-    }) {
-        return;
-    }
-    let mut project_constraints = Vec::new();
-    for resource in resources {
-        if project_constraints
-            .iter()
-            .any(|constraint: &PermissionResourceConstraint| {
-                constraint.kind == resource.kind && constraint.access == resource.access
-            })
-        {
-            continue;
+        };
+        if let Some(reason) = self.reason(caution) {
+            description.push(' ');
+            description.push_str(&reason);
         }
-        project_constraints.push(PermissionResourceConstraint {
-            kind: resource.kind.clone(),
-            selector: PermissionResourceSelector::FilesystemSubtreeDigest {
-                digest: filesystem_subtree_digest(&project.to_string_lossy())
-                    .expect("normalized project has a digest"),
+        PermissionRuleOption {
+            id,
+            label: "These directories and descendants".into(),
+            description,
+            rule: StructuredPermissionRule {
+                subject: subject.clone(),
+                executor: executor.clone(),
+                resources,
+                arguments: PermissionArgumentConstraint::Unconstrained,
+                lifetime: PermissionLifetime::Once,
+                effect: StructuredPermissionEffect::Allow,
+                family: self.family,
             },
-            access: resource.access.clone(),
-            protected: Some(false),
-            attributes: BTreeMap::new(),
-        });
+            allowed_lifetimes: reusable.to_vec(),
+            broad: true,
+            is_default: false,
+            confirmation: self.confirmation(caution),
+            group: Some(PermissionOptionGroup {
+                key: SUBTREE_OPTION_ID.into(),
+                value,
+            }),
+            caution,
+        }
     }
-    options.push(PermissionRuleOption {
-        id: "allow_project_files".into(),
-        label: "Any unprotected project path".into(),
-        description: if family.is_some() {
-            format!(
-                "Allow reading, listing, and searching any path below {}/**.",
-                project.display()
-            )
-        } else {
-            format!("Allow matching paths below {}/**.", project.display())
-        },
-        rule: StructuredPermissionRule {
-            subject: subject.clone(),
-            executor: executor.clone(),
-            resources: project_constraints,
-            arguments: PermissionArgumentConstraint::Unconstrained,
-            lifetime: PermissionLifetime::Once,
-            effect: StructuredPermissionEffect::Allow,
-            family,
-        },
-        allowed_lifetimes: reusable.to_vec(),
-        broad: true,
-        is_default: false,
-        confirmation: write.then(|| "ALLOW PROJECT FILE CHANGES".into()),
-    });
+
+    /// How much a rung exposes, measured against the two landmarks a user
+    /// reasons about. Grave once the grant swallows the home directory, which a
+    /// root outside home entirely does not do — that root is beside home, not
+    /// above it, and reaches nothing home holds. An unknown home is grave,
+    /// because a boundary that cannot be found cannot be respected.
+    fn caution(&self, roots: &[PathBuf]) -> Option<PermissionCaution> {
+        let swallows_home = self.home.as_deref().is_none_or(|home| {
+            roots
+                .iter()
+                .any(|root| home == root || home.starts_with(root))
+        });
+        if swallows_home {
+            return Some(PermissionCaution::Danger);
+        }
+        let outside_repository = self.repository.as_deref().is_none_or(|repository| {
+            roots
+                .iter()
+                .any(|root| root != repository && !root.starts_with(repository))
+        });
+        outside_repository.then_some(PermissionCaution::Warn)
+    }
+
+    fn reason(&self, caution: Option<PermissionCaution>) -> Option<String> {
+        match caution? {
+            PermissionCaution::Danger => Some("This takes in your whole home directory.".into()),
+            PermissionCaution::Warn => Some(match &self.repository {
+                Some(repository) => format!(
+                    "This reaches outside the repository at {}.",
+                    repository.display()
+                ),
+                None => "This reaches outside any repository.".into(),
+            }),
+        }
+    }
+
+    /// The phrase to type before the grant is stored. Reaching past home is the
+    /// graver claim, so it names itself even when the grant also writes.
+    fn confirmation(&self, caution: Option<PermissionCaution>) -> Option<String> {
+        if caution == Some(PermissionCaution::Danger) {
+            return Some(OUTSIDE_HOME_PHRASE.into());
+        }
+        self.write.then(|| "ALLOW DIRECTORY CHANGES".into())
+    }
+}
+
+/// The deepest directory every root sits under, which is the first rung the
+/// whole request can share.
+fn common_ancestor(roots: &[PathBuf]) -> Option<PathBuf> {
+    let mut shared = roots.first()?.clone();
+    for root in &roots[1..] {
+        while !root.starts_with(&shared) {
+            if !shared.pop() {
+                return Some(shared);
+            }
+        }
+    }
+    Some(shared)
+}
+
+/// The nearest ancestor holding a `.git` entry, which is what "outside the
+/// repository" is measured against. A worktree or submodule records a file
+/// rather than a directory, so existence is the test.
+fn enclosing_repository(start: Option<&Path>) -> Option<PathBuf> {
+    start?
+        .ancestors()
+        .find(|ancestor| ancestor.join(GIT_METADATA_DIR).exists())
+        .map(Path::to_path_buf)
 }
 
 fn presentation_for(
@@ -3775,7 +3917,10 @@ mod tests {
 
     const EXACT_RESOURCES_OPTION: &str = "allow_exact_resources";
     const SUBTREE_OPTION: &str = "allow_filesystem_subtree";
-    const PROJECT_OPTION: &str = "allow_project_files";
+    /// The first rung above the resource's own directory. For a path one level
+    /// inside the project that rung is the project root itself.
+    const PROJECT_RUNG: &str = "allow_filesystem_subtree_1";
+    const PROJECT_ROOT_MARK: &str = "(project root)";
 
     const PROTECTED_PATH: &str = "/project/.env";
     const FIRST_READ_OFFSET: u32 = 1;
@@ -3833,8 +3978,10 @@ mod tests {
         let request = filesystem_request(true, FIRST_READ_OFFSET);
         let ids = option_ids(&request);
 
-        assert!(!ids.contains(&SUBTREE_OPTION), "{ids:?}");
-        assert!(!ids.contains(&PROJECT_OPTION), "{ids:?}");
+        assert!(
+            !ids.iter().any(|id| id.starts_with(SUBTREE_OPTION)),
+            "{ids:?}"
+        );
     }
 
     #[test]
@@ -3844,7 +3991,13 @@ mod tests {
 
         assert!(ids.contains(&EXACT_RESOURCES_OPTION), "{ids:?}");
         assert!(ids.contains(&SUBTREE_OPTION), "{ids:?}");
-        assert!(ids.contains(&PROJECT_OPTION), "{ids:?}");
+        assert!(
+            request.options.iter().any(|option| option
+                .group
+                .as_ref()
+                .is_some_and(|group| group.value.contains(PROJECT_ROOT_MARK))),
+            "{ids:?}"
+        );
     }
 
     #[test]
@@ -3958,6 +4111,271 @@ mod tests {
         .expect("a first-party read must offer a subtree grant")
     }
 
+    /// Every rung of the subtree ladder, in the order it was offered.
+    fn subtree_ladder(request: &PermissionRequest) -> Vec<&PermissionRuleOption> {
+        request
+            .options
+            .iter()
+            .filter(|option| {
+                option
+                    .group
+                    .as_ref()
+                    .is_some_and(|group| group.key == SUBTREE_OPTION)
+            })
+            .collect()
+    }
+
+    fn ladder_values(request: &PermissionRequest) -> Vec<String> {
+        subtree_ladder(request)
+            .iter()
+            .map(|option| {
+                option
+                    .group
+                    .as_ref()
+                    .expect("a rung is grouped")
+                    .value
+                    .clone()
+            })
+            .collect()
+    }
+
+    /// A file two levels inside the project can be widened all the way out, so
+    /// reading a sibling checkout no longer stops at the file's own directory.
+    #[test]
+    fn the_subtree_ladder_climbs_to_the_filesystem_root() {
+        let request = workcell_request(
+            READ_CONTRACT,
+            PermissionResourceKind::File,
+            PermissionResourceAccess::Read,
+            SOURCE_FILE,
+        );
+
+        assert_eq!(
+            ladder_values(&request),
+            vec![
+                "/project/src/**".to_string(),
+                format!("/project/** {PROJECT_ROOT_MARK}"),
+                "/**".to_string(),
+            ]
+        );
+        assert_eq!(
+            subtree_ladder(&request)
+                .iter()
+                .map(|option| option.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![SUBTREE_OPTION, PROJECT_RUNG, "allow_filesystem_subtree_2"]
+        );
+    }
+
+    /// The widest rung still has to grant what the request asked for, or the
+    /// ladder is a row of labels that authorise nothing.
+    #[test]
+    fn the_widest_rung_still_covers_the_requested_path() {
+        let request = workcell_request(
+            READ_CONTRACT,
+            PermissionResourceKind::File,
+            PermissionResourceAccess::Read,
+            SOURCE_FILE,
+        );
+        let widest = subtree_ladder(&request)
+            .last()
+            .expect("the ladder has a widest rung")
+            .id
+            .clone();
+        let rule = request
+            .option_rule(&widest, PermissionLifetime::Conversation)
+            .expect("the widest rung is grantable");
+
+        assert!(permission_rule_covers_request(&rule, &request));
+    }
+
+    /// The ladder may reach the filesystem root, so this is what keeps a
+    /// credential out of reach however far it is widened. Two guards say so
+    /// independently — every rung pins `protected: Some(false)`, and a subtree
+    /// selector is not exact enough to grant a protected resource — so the
+    /// outcome is asserted rather than either mechanism.
+    #[test]
+    fn no_rung_can_reach_a_protected_path() {
+        let request = workcell_request(
+            READ_CONTRACT,
+            PermissionResourceKind::File,
+            PermissionResourceAccess::Read,
+            SOURCE_FILE,
+        );
+        let intent = PermissionIntent::new(
+            PermissionScopes::single(PROTECTED_PATH.into()),
+            vec![PermissionResource {
+                kind: PermissionResourceKind::File,
+                value: PROTECTED_PATH.into(),
+                access: Some(PermissionResourceAccess::Read),
+                protected: true,
+                requires_prompt: true,
+                attributes: BTreeMap::new(),
+            }],
+            PermissionRisk::Medium,
+        )
+        .with_authority(PermissionAuthorityProfile::Filesystem {
+            input_pointers: Vec::new(),
+        });
+        let secret = PermissionRequest::from_intent_with_identity(
+            "request".into(),
+            ToolKey::native("workcell_file_tool"),
+            &intent,
+            json!({ "path": PROTECTED_PATH }),
+            Path::new("/project"),
+            PermissionSubject::Native {
+                owner: WORKCELL_OWNER.into(),
+                contract: READ_CONTRACT.into(),
+            },
+            PermissionExecutorKind::Native,
+        );
+
+        for rung in subtree_ladder(&request) {
+            let rule = request
+                .option_rule(&rung.id, PermissionLifetime::Conversation)
+                .expect("a rung is grantable");
+            assert!(
+                !permission_rule_covers_request(&rule, &secret),
+                "{} reached {PROTECTED_PATH}",
+                rung.id
+            );
+        }
+    }
+
+    /// Two resources in sibling directories share no rung until their common
+    /// ancestor, so that is where the ladder starts climbing.
+    #[test]
+    fn a_split_request_starts_climbing_at_the_common_ancestor() {
+        let intent = PermissionIntent::new(
+            PermissionScopes::single("split".into()),
+            ["/project/src/main.rs", "/project/tests/it.rs"]
+                .into_iter()
+                .map(|value| PermissionResource {
+                    kind: PermissionResourceKind::File,
+                    value: value.into(),
+                    access: Some(PermissionResourceAccess::Read),
+                    protected: false,
+                    requires_prompt: false,
+                    attributes: BTreeMap::new(),
+                })
+                .collect(),
+            PermissionRisk::Medium,
+        )
+        .with_authority(PermissionAuthorityProfile::Filesystem {
+            input_pointers: Vec::new(),
+        });
+        let request = PermissionRequest::from_intent_with_identity(
+            "request".into(),
+            ToolKey::native("workcell_file_tool"),
+            &intent,
+            json!({ "paths": ["/project/src/main.rs", "/project/tests/it.rs"] }),
+            Path::new("/project"),
+            PermissionSubject::Native {
+                owner: WORKCELL_OWNER.into(),
+                contract: READ_CONTRACT.into(),
+            },
+            PermissionExecutorKind::Native,
+        );
+
+        assert_eq!(
+            ladder_values(&request),
+            vec![
+                "/project/src/**, /project/tests/**".to_string(),
+                format!("/project/** {PROJECT_ROOT_MARK}"),
+                "/**".to_string(),
+            ]
+        );
+    }
+
+    fn caution_of(root: &Path, resource: &Path) -> Vec<Option<PermissionCaution>> {
+        let value = resource.to_string_lossy().into_owned();
+        let intent = PermissionIntent::new(
+            PermissionScopes::single(value.clone()),
+            vec![PermissionResource {
+                kind: PermissionResourceKind::File,
+                value: value.clone(),
+                access: Some(PermissionResourceAccess::Read),
+                protected: false,
+                requires_prompt: false,
+                attributes: BTreeMap::new(),
+            }],
+            PermissionRisk::Medium,
+        )
+        .with_authority(PermissionAuthorityProfile::Filesystem {
+            input_pointers: Vec::new(),
+        });
+        let request = PermissionRequest::from_intent_with_identity(
+            "request".into(),
+            ToolKey::native("workcell_file_tool"),
+            &intent,
+            json!({ "path": value }),
+            root,
+            PermissionSubject::Native {
+                owner: WORKCELL_OWNER.into(),
+                contract: READ_CONTRACT.into(),
+            },
+            PermissionExecutorKind::Native,
+        );
+        subtree_ladder(&request)
+            .iter()
+            .map(|option| option.caution)
+            .collect()
+    }
+
+    /// Widening is uncautioned inside the repository, warned once it reaches
+    /// past it, and grave once the grant would swallow the home directory.
+    #[test]
+    fn the_ladder_cautions_each_rung_by_what_it_reaches() {
+        let Some(home) = caudra_storage::paths::home() else {
+            return;
+        };
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repository = temp.path().join("repo");
+        std::fs::create_dir_all(repository.join(GIT_METADATA_DIR)).expect("git marker");
+        std::fs::create_dir_all(repository.join("src")).expect("source dir");
+
+        // A repository outside home: its own rungs are clean, the rungs above
+        // it warn, and only the root — which contains home — is grave. Sitting
+        // outside home is not the same as reaching over it.
+        let cautions = caution_of(&repository, &repository.join("src/main.rs"));
+        assert_eq!(cautions.first(), Some(&None));
+        assert!(
+            cautions.contains(&Some(PermissionCaution::Warn)),
+            "{cautions:?}"
+        );
+        assert_eq!(cautions.last(), Some(&Some(PermissionCaution::Danger)));
+        assert_eq!(
+            cautions
+                .iter()
+                .filter(|caution| **caution == Some(PermissionCaution::Danger))
+                .count(),
+            1,
+            "{cautions:?}"
+        );
+
+        // A path under home with no repository at all warns from the start and
+        // still ends grave at the root.
+        let cautions = caution_of(&home, &home.join("notes/todo.md"));
+        assert_eq!(cautions.first(), Some(&Some(PermissionCaution::Warn)));
+        assert_eq!(cautions.last(), Some(&Some(PermissionCaution::Danger)));
+    }
+
+    /// A grant that swallows home has to be typed out, whatever else it does.
+    #[test]
+    fn a_rung_outside_home_demands_the_typed_phrase() {
+        let request = workcell_request(
+            READ_CONTRACT,
+            PermissionResourceKind::File,
+            PermissionResourceAccess::Read,
+            SOURCE_FILE,
+        );
+        let ladder = subtree_ladder(&request);
+        let widest = ladder.last().expect("the ladder has a widest rung");
+
+        assert_eq!(widest.caution, Some(PermissionCaution::Danger));
+        assert_eq!(widest.confirmation.as_deref(), Some(OUTSIDE_HOME_PHRASE));
+    }
+
     #[test]
     fn a_read_subtree_grant_covers_a_later_search_by_another_contract() {
         let rule = read_subtree_rule(SUBTREE_OPTION);
@@ -4024,7 +4442,7 @@ mod tests {
     }
 
     #[test_case(SUBTREE_OPTION; "subtree grant is widened")]
-    #[test_case(PROJECT_OPTION; "project grant is widened")]
+    #[test_case(PROJECT_RUNG; "project grant is widened")]
     fn a_first_party_read_mints_the_filesystem_read_family(option: &str) {
         assert_eq!(
             read_subtree_rule(option).family,
