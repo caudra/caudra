@@ -1,6 +1,8 @@
 use caudra_agent::context::{
     ContextBuiltinState, ContextBuiltinTool, ContextMcpStatus, ContextSnapshot,
 };
+use caudra_agent::tools::TOOL_SEARCH_TOOL_NAME as TOOL_SEARCH;
+use caudra_agent::tools::report::{CATALOG_SOURCE, REASON_CATALOG};
 use caudra_providers::token_label;
 use crossterm::event::{KeyEvent, MouseEvent, MouseEventKind};
 use ratatui::Frame;
@@ -193,6 +195,22 @@ fn summary_lines(snapshot: &ContextSnapshot, theme: &Theme) -> Vec<Line<'static>
 
 fn builtin_lines(snapshot: &ContextSnapshot, theme: &Theme) -> Vec<Line<'static>> {
     let mut lines = vec![Line::default(), section_line("Built-in", theme)];
+    // `tool_search` has no registry entry, so it is derived from the catalog
+    // it costs rather than listed like the tools it stands in for.
+    let catalog_tokens = snapshot.inventory.builtins.catalog_tokens;
+    if catalog_tokens > 0 {
+        lines.push(Line::from(vec![
+            Span::styled(format!("{DECLARED_GLYPH} "), theme.tool_success),
+            Span::styled(TOOL_SEARCH.to_owned(), theme.tool_path),
+            Span::styled("  on", theme.tool_success),
+            Span::raw(format!(
+                " \u{b7} {} in context",
+                token_label(catalog_tokens)
+            )),
+            Span::styled(format!(" \u{b7} {REASON_CATALOG}"), theme.status_dim),
+            Span::styled(format!(" \u{b7} {CATALOG_SOURCE}"), theme.status_dim),
+        ]));
+    }
     for tool in &snapshot.inventory.builtins.tools {
         lines.push(builtin_line(tool, theme));
     }
@@ -302,8 +320,8 @@ mod tests {
     };
 
     use super::{
-        ContextBuiltinState, ContextBuiltinTool, ContextMcpStatus, ContextSnapshot, NO_MCP,
-        NO_SNAPSHOT, build_lines,
+        CATALOG_SOURCE, ContextBuiltinState, ContextBuiltinTool, ContextMcpStatus, ContextSnapshot,
+        NO_MCP, NO_SNAPSHOT, REASON_CATALOG, TOOL_SEARCH, build_lines,
     };
     use crate::theme;
 
@@ -400,6 +418,31 @@ mod tests {
         assert!(out.contains("issues.fetch  lazy · "), "{out}");
         assert!(out.contains("· issues"), "{out}");
         assert!(!out.contains(NO_MCP), "{out}");
+    }
+
+    /// `tool_search` has no registry row to inherit, so the report derives it
+    /// from the catalog it costs.
+    #[test]
+    fn the_catalog_is_reported_when_the_request_carries_one() {
+        let out = rendered(Some(&snapshot(Vec::new())));
+
+        assert!(
+            out.contains(&format!(
+                "{TOOL_SEARCH}  on · ~20 tokens in context · {REASON_CATALOG} · {CATALOG_SOURCE}"
+            )),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn no_catalog_row_without_a_catalog() {
+        let mut without = snapshot(Vec::new());
+        without.inventory.builtins.catalog_tokens = 0;
+
+        assert!(
+            !rendered(Some(&without)).contains(TOOL_SEARCH),
+            "{TOOL_SEARCH}"
+        );
     }
 
     #[test]

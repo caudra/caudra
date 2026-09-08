@@ -13,6 +13,11 @@ pub const REASON_COMPANION: &str = "always on (internal companion)";
 pub const REASON_NO_SUBSCRIPTION: &str = "no ChatGPT subscription";
 pub const REASON_OTHER_EDITOR: &str = "model uses the other editing tool";
 pub const REASON_DEFERRED: &str = "deferred behind tool_search";
+/// `tool_search` has no registry entry. The request array grows one whenever
+/// something is deferred, so every listing derives the row from that rather
+/// than looking it up.
+pub const REASON_CATALOG: &str = "loads the lazy tools on request";
+pub const CATALOG_SOURCE: &str = "native:caudra";
 
 /// What a tool is doing in this run. `Lazy` is enabled and absent from the
 /// request array at once, which neither `On` nor `Off` can express.

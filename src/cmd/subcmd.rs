@@ -8,10 +8,10 @@ use color_eyre::eyre::{Context, bail};
 
 use caudra_agent::mcp::{McpSession, config as mcp_config, oauth as mcp_oauth};
 use caudra_agent::tools::native::skill::{self, SkillDirCandidate, SkillInventoryEntry};
-use caudra_agent::tools::report::{REASON_CONFIG, REASON_DEFERRED};
+use caudra_agent::tools::report::{CATALOG_SOURCE, REASON_CATALOG, REASON_CONFIG, REASON_DEFERRED};
 use caudra_agent::tools::{
-    DescriptionContext, RegisteredTool, SHELL_TOOL_NAME, ToolAudience, ToolFilter, ToolRegistry,
-    ToolState, builtin_report, is_tool_enabled,
+    DescriptionContext, RegisteredTool, SHELL_TOOL_NAME, TOOL_SEARCH_TOOL_NAME, ToolAudience,
+    ToolFilter, ToolRegistry, ToolState, builtin_report, is_tool_enabled,
 };
 use caudra_config::providers::{
     Protocol, ProviderDef, ProvidersConfig, all_builtins, builtin_provider, resolve_api_key_env,
@@ -816,6 +816,23 @@ fn builtin_rows(
     rows
 }
 
+/// Derived, not looked up: `tool_search` is synthesized into the request
+/// array whenever something is deferred, so a lazy row anywhere means the
+/// model is offered the catalog too.
+fn catalog_row(builtin: &[ToolRow], mcp: &[ToolRow]) -> Option<ToolRow> {
+    let lazy = builtin
+        .iter()
+        .chain(mcp)
+        .any(|row| row.state == ToolState::Lazy);
+    lazy.then(|| ToolRow {
+        name: TOOL_SEARCH_TOOL_NAME.to_owned(),
+        source: CATALOG_SOURCE.to_owned(),
+        state: ToolState::On,
+        note: Some(REASON_CATALOG),
+        permission: None,
+    })
+}
+
 fn mcp_rows(mcp: Option<&McpSession>, permissions: &PermissionsConfig) -> Vec<ToolRow> {
     let Some(mcp) = mcp else {
         return Vec::new();
@@ -932,6 +949,10 @@ pub fn tools(cli: &Cli, enabled_only: bool, json: bool, names: bool, schemas: bo
         .collect::<Result<Vec<_>>>()?;
     let mut builtin = builtin_rows(reg, &filter, &config, &cli_disallowed, &model);
     let mut mcp_tools = mcp_rows(mcp.as_ref(), &config.permissions);
+    if let Some(catalog) = catalog_row(&builtin, &mcp_tools) {
+        let at = builtin.partition_point(|row| row.name < catalog.name);
+        builtin.insert(at, catalog);
+    }
     if enabled_only {
         builtin.retain(|row| row.state.reaches_model());
         mcp_tools.retain(|row| row.state.reaches_model());
@@ -1219,5 +1240,39 @@ mod auth_tests {
     #[test_case("unknown", None ; "unknown_protocol")]
     fn custom_protocol_choices(input: &str, expected: Option<Protocol>) {
         assert_eq!(custom_protocol(input), expected);
+    }
+
+    fn state_rows(states: &[ToolState]) -> Vec<ToolRow> {
+        states
+            .iter()
+            .map(|state| ToolRow {
+                name: String::new(),
+                source: String::new(),
+                state: *state,
+                note: None,
+                permission: None,
+            })
+            .collect()
+    }
+
+    /// The catalog has no registry entry, so the row exists exactly when the
+    /// request would carry one: whenever any source has something deferred.
+    #[test_case(&[ToolState::On], &[], false ; "nothing_lazy")]
+    #[test_case(&[ToolState::Off], &[], false ; "disabled_is_not_lazy")]
+    #[test_case(&[ToolState::Lazy], &[], true ; "lazy_builtin")]
+    #[test_case(&[], &[ToolState::Lazy], true ; "lazy_mcp")]
+    fn the_catalog_row_tracks_whether_anything_is_lazy(
+        builtin: &[ToolState],
+        mcp: &[ToolState],
+        expected: bool,
+    ) {
+        let row = catalog_row(&state_rows(builtin), &state_rows(mcp));
+
+        assert_eq!(row.is_some(), expected);
+        if let Some(row) = row {
+            assert_eq!(row.name, TOOL_SEARCH_TOOL_NAME);
+            assert_eq!(row.state, ToolState::On);
+            assert!(row.permission.is_none(), "search has no permission gate");
+        }
     }
 }
