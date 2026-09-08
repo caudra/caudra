@@ -264,13 +264,9 @@ impl DeferralSnapshot {
 }
 
 /// The one entry that stands in for everything deferred. MCP builds its own
-/// against server names; this one lists bare built-ins and says what a load
-/// costs, because the model is the one choosing to spend it.
+/// against server names; this one lists built-ins and says what a load costs,
+/// because the model is the one choosing to spend it.
 fn catalog_definition(pending: &[&DeferredTool]) -> Value {
-    let names: Vec<String> = pending
-        .iter()
-        .map(|tool| tool.name.as_ref().to_owned())
-        .collect();
     json!({
         "name": TOOL_SEARCH_TOOL_NAME,
         "description": format!(
@@ -278,8 +274,8 @@ fn catalog_definition(pending: &[&DeferredTool]) -> Value {
              next message on. Keywords match tool names and descriptions, and an \
              exact name always wins. Related tools load together, and every load \
              resets the prompt cache, so search once for the work you are about \
-             to do rather than tool by tool.\nAvailable to load: {}",
-            names.join(", ")
+             to do rather than tool by tool.\nAvailable to load:{}",
+            catalog_listing(pending)
         ),
         "input_schema": {
             "type": "object",
@@ -309,6 +305,51 @@ fn describe(loaded: &[Arc<str>], query: &str) -> String {
     out
 }
 
+/// One line per load: a group names its members, an ungrouped tool carries
+/// the sentence its own description opens with. A group is a mode of work
+/// rather than a capability, and summarising its members separately would
+/// invite loading them one at a time, which is what the group exists to stop.
+fn catalog_listing(pending: &[&DeferredTool]) -> String {
+    let mut listing = String::new();
+    let mut listed: Vec<&str> = Vec::new();
+    for tool in pending {
+        match tool.group {
+            Some(group) if listed.contains(&group) => continue,
+            Some(group) => {
+                listed.push(group);
+                let members: Vec<&str> = pending
+                    .iter()
+                    .filter(|other| other.group == Some(group))
+                    .map(|other| other.name.as_ref())
+                    .collect();
+                listing.push_str(&format!("\n- {group}: {}", members.join(", ")));
+            }
+            None => listing.push_str(&format!("\n- {}: {}", tool.name, summary(&tool.definition))),
+        }
+    }
+    listing
+}
+
+/// The first sentence of a description, derived rather than authored so the
+/// catalog cannot drift from the tool it advertises. A description with no
+/// full stop is short enough to use whole.
+fn summary(definition: &Value) -> &str {
+    let description = definition["description"]
+        .as_str()
+        .unwrap_or_default()
+        .trim_start();
+    let end = description
+        .match_indices('.')
+        .find(|(index, _)| {
+            description[index + 1..]
+                .chars()
+                .next()
+                .is_none_or(char::is_whitespace)
+        })
+        .map_or(description.len(), |(index, _)| index + 1);
+    description[..end].trim_end()
+}
+
 fn haystack(definition: &Value) -> String {
     let mut hay = definition["description"]
         .as_str()
@@ -332,6 +373,13 @@ mod tests {
     const MAP: &str = "code_map";
     const REFS: &str = "code_refs";
     const LONELY: &str = "execution_environment";
+    const MAP_DESCRIPTION: &str = "Rank every symbol in a source tree";
+    const REFS_DESCRIPTION: &str = "List the symbols that reference one";
+    const LONELY_DESCRIPTION: &str = "Inspect the execution host";
+    const FIRST_SENTENCE: &str = "Inspect the execution host's environment.";
+    const SECOND_SENTENCE: &str = "Each call collects a fresh snapshot.";
+    const TWO_SENTENCES: &str =
+        "Inspect the execution host's environment. Each call collects a fresh snapshot.";
     const NOTHING_DEFERRED: &str = "a catalog with nothing left to load is dead weight";
 
     fn tool(name: &str, group: Option<&'static str>, description: &str) -> DeferredTool {
@@ -345,9 +393,9 @@ mod tests {
     fn session() -> DeferralSession {
         DeferralSession::new(
             vec![
-                tool(MAP, Some(GRAPH), "Rank every symbol in a source tree"),
-                tool(REFS, Some(GRAPH), "List the symbols that reference one"),
-                tool(LONELY, None, "Inspect the execution host"),
+                tool(MAP, Some(GRAPH), MAP_DESCRIPTION),
+                tool(REFS, Some(GRAPH), REFS_DESCRIPTION),
+                tool(LONELY, None, LONELY_DESCRIPTION),
             ],
             std::iter::empty(),
         )
@@ -360,6 +408,61 @@ mod tests {
             .iter()
             .map(|tool| tool["name"].as_str().unwrap().to_owned())
             .collect()
+    }
+
+    fn catalog_description(session: &DeferralSession) -> String {
+        let mut tools = json!([]);
+        session.request_snapshot().extend_tools(&mut tools);
+        tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == TOOL_SEARCH_TOOL_NAME)
+            .expect("the catalog is declared while anything is pending")["description"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    fn lonely(description: &str) -> DeferralSession {
+        DeferralSession::new(vec![tool(LONELY, None, description)], std::iter::empty())
+    }
+
+    /// The catalog is what the model reads when deciding to spend a load, so
+    /// it carries one sentence and stops.
+    #[test]
+    fn an_ungrouped_tool_is_listed_with_its_first_sentence() {
+        let description = catalog_description(&lonely(TWO_SENTENCES));
+
+        assert!(
+            description.contains(&format!("- {LONELY}: {FIRST_SENTENCE}")),
+            "{description}"
+        );
+        assert!(!description.contains(SECOND_SENTENCE), "{description}");
+    }
+
+    /// A group is one decision. Summarising each member separately would
+    /// invite loading them one at a time.
+    #[test]
+    fn a_group_is_named_once_and_its_members_are_not_summarised() {
+        let description = catalog_description(&session());
+
+        assert!(
+            description.contains(&format!("- {GRAPH}: {MAP}, {REFS}")),
+            "{description}"
+        );
+        assert_eq!(description.matches(GRAPH).count(), 1, "{description}");
+        assert!(!description.contains(MAP_DESCRIPTION), "{description}");
+    }
+
+    #[test]
+    fn a_description_without_a_full_stop_is_listed_whole() {
+        let description = catalog_description(&lonely(LONELY_DESCRIPTION));
+
+        assert!(
+            description.contains(&format!("- {LONELY}: {LONELY_DESCRIPTION}")),
+            "{description}"
+        );
     }
 
     #[test]
