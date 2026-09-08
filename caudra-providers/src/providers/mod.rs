@@ -136,10 +136,7 @@ impl SseErrorPayload {
             "authentication_error" | "invalid_api_key" => 401,
             _ => 400,
         };
-        AgentError::Api {
-            status,
-            message: self.error.message,
-        }
+        AgentError::api(status, self.error.message)
     }
 }
 

@@ -1,10 +1,13 @@
 //! Provider error types with retry semantics.
 //! Retryable: 429, 5xx, IO, HTTP transport. Non-retryable: other 4xx, JSON parse, config,
-//! channel closed, user cancel. `user_message()` returns human-readable text for each variant.
+//! channel closed, user cancel. `user_message()` returns human-readable text for each variant,
+//! including whatever the provider said in the response body.
 
 use std::time::Duration;
 
 use futures_lite::io::AsyncReadExt;
+use isahc::http::HeaderMap;
+use serde_json::Value;
 
 /// Enough of an error body to diagnose one, and no more: a non-200 can be an
 /// endless stream, and nothing downstream reads past the first screenful.
@@ -12,10 +15,43 @@ const ERROR_BODY_CAP: u64 = 64 * 1024;
 const ERROR_BODY_TIMEOUT: Duration = Duration::from_secs(10);
 const UNREADABLE_ERROR_BODY: &str = "unable to read error body";
 
+const HEADER_RETRY_AFTER: &str = "retry-after";
+const HEADER_RETRY_AFTER_MS: &str = "retry-after-ms";
+/// Keeps `Duration::from_secs_f64` away from its overflow panic; the retry loop
+/// clamps far harder than this before it ever waits.
+const MAX_PARSED_RETRY_AFTER_SECS: f64 = 86_400.0;
+const MINUTE_SECS: u64 = 60;
+const HOUR_SECS: u64 = 3_600;
+
+/// The transcript can afford a paragraph of provider text; the status bar is one
+/// clipped line, so it gets a much shorter slice of the same detail.
+const DETAIL_CAP: usize = 400;
+const RETRY_DETAIL_CAP: usize = 120;
+const HTML_SNIFF_CHARS: usize = 16;
+const HTML_PREFIXES: [&str; 2] = ["<!doctype", "<html"];
+const ELLIPSIS: char = '…';
+
+const AUTH_LABEL: &str = "authentication failed";
+const AUTH_HINT: &str = ", run `caudra auth login` or check your API key";
+const RATE_LIMIT_LABEL: &str = "rate limited";
+const RATE_LIMIT_FALLBACK: &str = "rate limited, try again in a moment";
+const OVERLOADED_LABEL: &str = "provider is overloaded";
+const OVERLOADED_FALLBACK: &str = "provider is overloaded, try again later";
+const RETRY_RATE_LIMIT_LABEL: &str = "Rate limited";
+const RETRY_OVERLOADED_LABEL: &str = "Provider is overloaded";
+const GATEWAY_401: &str = "authentication failed: request was blocked by a gateway or proxy, your token may be missing or expired, run `caudra auth login` or check your API key";
+const GATEWAY_403: &str = "forbidden: request was blocked by a gateway or proxy, check your account and provider settings";
+
 #[derive(Debug, thiserror::Error)]
 pub enum AgentError {
     #[error("API error ({status}): {message}")]
-    Api { status: u16, message: String },
+    Api {
+        status: u16,
+        message: String,
+        /// Only ever set by `from_response`; every other construction site is a
+        /// locally detected failure with no HTTP response behind it.
+        retry_after: Option<Duration>,
+    },
     #[error("{message}")]
     Config { message: String },
     #[error("tool error in {tool}: {message}")]
@@ -39,6 +75,22 @@ pub enum AgentError {
 }
 
 impl AgentError {
+    pub fn api(status: u16, message: impl Into<String>) -> Self {
+        Self::Api {
+            status,
+            message: message.into(),
+            retry_after: None,
+        }
+    }
+
+    /// The provider's own `Retry-After`, when it sent one.
+    pub fn retry_after(&self) -> Option<Duration> {
+        match self {
+            Self::Api { retry_after, .. } => *retry_after,
+            _ => None,
+        }
+    }
+
     pub fn is_retryable(&self) -> bool {
         if self.is_context_overflow() {
             return false;
@@ -108,13 +160,11 @@ impl AgentError {
     pub fn user_message(&self) -> String {
         match self {
             Self::Config { message } => message.clone(),
-            Self::Api { status: 429, .. } => "rate limited, try again in a moment".into(),
-            Self::Api { status: 529, .. } => "provider is overloaded, try again later".into(),
-            Self::Api { status, .. } if *status >= 500 => format!("server error ({status})"),
-            Self::Api { status: 401, .. } => {
-                "authentication failed, run `caudra auth login` or check your API key".into()
-            }
-            Self::Api { status, message } => format!("API error ({status}): {message}"),
+            Self::Api {
+                status,
+                message,
+                retry_after,
+            } => api_user_message(*status, message, *retry_after),
             Self::Tool { tool, message } => format!("{tool}: {message}"),
             Self::Io(e) => format!("I/O error: {e}"),
             Self::Http(_) => "connection error, check your network".into(),
@@ -129,20 +179,174 @@ impl AgentError {
 
     pub async fn from_response(response: isahc::Response<isahc::AsyncBody>) -> Self {
         let status = response.status().as_u16();
+        let retry_after = parse_retry_after(response.headers());
         let message = read_error_body(response.into_body()).await;
-        Self::Api { status, message }
+        Self::Api {
+            status,
+            message,
+            retry_after,
+        }
     }
 
     pub fn retry_message(&self) -> String {
         match self {
-            Self::Api { status: 429, .. } => "Rate limited".into(),
-            Self::Api { status: 529, .. } => "Provider is overloaded".into(),
-            Self::Api { status, .. } if *status >= 500 => format!("Server error ({status})"),
+            Self::Api {
+                status, message, ..
+            } => api_retry_message(*status, message),
             Self::Io(_) | Self::Http(_) => "Connection error".into(),
             Self::Timeout { .. } => "Stream timed out".into(),
             _ => self.to_string(),
         }
     }
+}
+
+fn api_user_message(status: u16, body: &str, retry_after: Option<Duration>) -> String {
+    let message = match status {
+        401 | 403 if is_html(body) => gateway_message(status).to_owned(),
+        401 => format!(
+            "{}{AUTH_HINT}",
+            labeled(AUTH_LABEL, AUTH_LABEL, body, DETAIL_CAP)
+        ),
+        429 => labeled(RATE_LIMIT_LABEL, RATE_LIMIT_FALLBACK, body, DETAIL_CAP),
+        529 => labeled(OVERLOADED_LABEL, OVERLOADED_FALLBACK, body, DETAIL_CAP),
+        _ => {
+            let label = if status >= 500 {
+                format!("server error ({status})")
+            } else {
+                format!("API error ({status})")
+            };
+            labeled(&label, &label, body, DETAIL_CAP)
+        }
+    };
+    // Retrying stopped somewhere the user cannot see; when the provider named a
+    // window, that window is the difference between "try again" and "wait".
+    match retry_after {
+        Some(after) => format!("{message} (retry after {})", friendly_wait(after)),
+        None => message,
+    }
+}
+
+fn friendly_wait(after: Duration) -> String {
+    let secs = after.as_secs().max(1);
+    match secs {
+        0..MINUTE_SECS => format!("{secs}s"),
+        MINUTE_SECS..HOUR_SECS => format!("{}m", secs / MINUTE_SECS),
+        _ => format!("{}h", secs / HOUR_SECS),
+    }
+}
+
+fn api_retry_message(status: u16, body: &str) -> String {
+    let label = match status {
+        429 => RETRY_RATE_LIMIT_LABEL.to_owned(),
+        529 => RETRY_OVERLOADED_LABEL.to_owned(),
+        _ if status >= 500 => format!("Server error ({status})"),
+        _ => format!("API error ({status})"),
+    };
+    labeled(&label, &label, body, RETRY_DETAIL_CAP)
+}
+
+fn gateway_message(status: u16) -> &'static str {
+    if status == 403 {
+        GATEWAY_403
+    } else {
+        GATEWAY_401
+    }
+}
+
+fn labeled(label: &str, fallback: &str, body: &str, cap: usize) -> String {
+    match provider_detail(body, cap) {
+        Some(detail) => format!("{label}: {detail}"),
+        None => fallback.to_owned(),
+    }
+}
+
+/// The provider's own explanation, pulled out of whatever shape it arrived in.
+/// A gateway error page is markup rather than an explanation, so it is dropped
+/// and the caller falls back to status-specific guidance.
+fn provider_detail(body: &str, cap: usize) -> Option<String> {
+    let body = body.trim();
+    if body.is_empty() || is_html(body) {
+        return None;
+    }
+    let detail = serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|value| json_detail(&value))
+        .unwrap_or_else(|| body.to_owned());
+    Some(truncate(&detail, cap))
+}
+
+/// A bare 429 says nothing a status code did not already say; the error code
+/// beside the message is what separates a per-minute limit from a dead quota.
+fn json_detail(value: &Value) -> Option<String> {
+    let error = value.get("error");
+    let message = [
+        error.and_then(|e| e.get("message")),
+        error,
+        value.get("message"),
+        value.get("detail"),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(non_empty_str)?;
+    let code = error
+        .and_then(|e| e.get("type").or_else(|| e.get("code")))
+        .and_then(non_empty_str);
+    Some(match code {
+        Some(code) if !message.contains(&code) => format!("{code}: {message}"),
+        _ => message,
+    })
+}
+
+fn non_empty_str(value: &Value) -> Option<String> {
+    let text = value.as_str()?.trim();
+    (!text.is_empty()).then(|| text.to_owned())
+}
+
+fn is_html(body: &str) -> bool {
+    let head: String = body
+        .trim_start()
+        .chars()
+        .take(HTML_SNIFF_CHARS)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    HTML_PREFIXES.iter().any(|prefix| head.starts_with(prefix))
+}
+
+fn truncate(text: &str, cap: usize) -> String {
+    if text.chars().count() <= cap {
+        return text.to_owned();
+    }
+    let kept: String = text.chars().take(cap).collect();
+    format!("{}{ELLIPSIS}", kept.trim_end())
+}
+
+/// `retry-after-ms` first because providers that send both use it for the
+/// sub-second precision the seconds form cannot express.
+fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
+    let header = |name: &str| headers.get(name).and_then(|value| value.to_str().ok());
+    if let Some(millis) = header(HEADER_RETRY_AFTER_MS)
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .and_then(|millis| positive_secs(millis / 1000.0))
+    {
+        return Some(millis);
+    }
+    let value = header(HEADER_RETRY_AFTER)?.trim();
+    value
+        .parse::<f64>()
+        .ok()
+        .and_then(positive_secs)
+        .or_else(|| parse_http_date(value))
+}
+
+fn parse_http_date(value: &str) -> Option<Duration> {
+    let target = jiff::fmt::rfc2822::parse(value).ok()?.timestamp();
+    let delta = target.as_millisecond() - jiff::Timestamp::now().as_millisecond();
+    positive_secs(delta as f64 / 1000.0)
+}
+
+fn positive_secs(secs: f64) -> Option<Duration> {
+    (secs.is_finite() && secs > 0.0)
+        .then(|| Duration::from_secs_f64(secs.min(MAX_PARSED_RETRY_AFTER_SECS)))
 }
 
 /// A non-200 body is untrusted input on a connection that has already
@@ -175,10 +379,7 @@ impl From<caudra_storage::StorageError> for AgentError {
         match e {
             caudra_storage::StorageError::Io(io) => Self::Io(io),
             caudra_storage::StorageError::Json(j) => Self::Json(j),
-            other => Self::Api {
-                status: 0,
-                message: other.to_string(),
-            },
+            other => Self::api(0, other.to_string()),
         }
     }
 }
@@ -186,20 +387,47 @@ impl From<caudra_storage::StorageError> for AgentError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use isahc::http::{HeaderName, HeaderValue};
     use test_case::test_case;
 
+    const BODY: &str = "bad input";
+    const ANTHROPIC_RATE_LIMIT: &str = r#"{"type":"error","error":{"type":"rate_limit_error","message":"This request would exceed your organization's rate limit"}}"#;
+    const ANTHROPIC_RATE_LIMIT_DETAIL: &str =
+        "rate limited: rate_limit_error: This request would exceed your organization's rate limit";
+    const OPENAI_QUOTA: &str =
+        r#"{"error":{"message":"You exceeded your current quota","code":"insufficient_quota"}}"#;
+    const OPENAI_QUOTA_DETAIL: &str =
+        "rate limited: insufficient_quota: You exceeded your current quota";
+    const GATEWAY_HTML: &str = "<!DOCTYPE html>\n<html><body>502 Bad Gateway</body></html>";
+    const REDUNDANT_CODE: &str = r#"{"error":{"code":"overloaded","message":"overloaded, retry"}}"#;
+    const HTTP_DATE_OFFSET_SECS: i64 = 300;
+    const HTTP_DATE_TOLERANCE_SECS: u64 = 5;
+
     fn api(status: u16) -> AgentError {
-        AgentError::Api {
-            status,
-            message: String::new(),
-        }
+        AgentError::api(status, String::new())
     }
 
     fn api_msg(status: u16, message: &str) -> AgentError {
+        AgentError::api(status, message)
+    }
+
+    fn rate_limited_after(after: Duration) -> AgentError {
         AgentError::Api {
-            status,
-            message: message.into(),
+            status: 429,
+            message: String::new(),
+            retry_after: Some(after),
         }
+    }
+
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for (name, value) in pairs {
+            map.insert(
+                HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        map
     }
 
     #[test_case(429, true  ; "rate_limit")]
@@ -224,17 +452,130 @@ mod tests {
         assert_eq!(api(status).retry_message(), expected);
     }
 
-    #[test_case(429, "rate limited, try again in a moment"                              ; "user_msg_429")]
-    #[test_case(529, "provider is overloaded, try again later"                           ; "user_msg_529")]
-    #[test_case(500, "server error (500)"                                                 ; "user_msg_500")]
-    #[test_case(401, "authentication failed, run `caudra auth login` or check your API key" ; "user_msg_401")]
-    #[test_case(400, "API error (400): bad input"                                         ; "user_msg_400")]
-    fn user_message_api(status: u16, expected: &str) {
-        let err = AgentError::Api {
-            status,
-            message: "bad input".into(),
-        };
-        assert_eq!(err.user_message(), expected);
+    #[test_case(429, RATE_LIMIT_FALLBACK  ; "user_msg_429")]
+    #[test_case(529, OVERLOADED_FALLBACK  ; "user_msg_529")]
+    #[test_case(500, "server error (500)" ; "user_msg_500")]
+    #[test_case(400, "API error (400)"    ; "user_msg_400")]
+    fn user_message_falls_back_without_detail(status: u16, expected: &str) {
+        assert_eq!(api(status).user_message(), expected);
+    }
+
+    #[test]
+    fn user_message_401_always_carries_the_login_hint() {
+        assert_eq!(api(401).user_message(), format!("{AUTH_LABEL}{AUTH_HINT}"));
+        assert_eq!(
+            api_msg(401, BODY).user_message(),
+            format!("{AUTH_LABEL}: {BODY}{AUTH_HINT}")
+        );
+    }
+
+    #[test_case(429, BODY, "rate limited: bad input"             ; "plain_body")]
+    #[test_case(529, BODY, "provider is overloaded: bad input"   ; "overloaded")]
+    #[test_case(500, BODY, "server error (500): bad input"       ; "server_error")]
+    #[test_case(400, BODY, "API error (400): bad input"          ; "other_status")]
+    #[test_case(429, ANTHROPIC_RATE_LIMIT, ANTHROPIC_RATE_LIMIT_DETAIL ; "anthropic_nested")]
+    #[test_case(429, OPENAI_QUOTA, OPENAI_QUOTA_DETAIL           ; "openai_code")]
+    #[test_case(429, r#"{"error":"flat string"}"#, "rate limited: flat string" ; "flat_error_string")]
+    #[test_case(429, r#"{"message":"top level"}"#, "rate limited: top level"   ; "top_level_message")]
+    #[test_case(529, REDUNDANT_CODE, "provider is overloaded: overloaded, retry" ; "code_not_duplicated")]
+    #[test_case(429, r#"{"unrelated":1}"#, r#"rate limited: {"unrelated":1}"#   ; "unrecognised_json_kept_raw")]
+    fn user_message_extracts_provider_detail(status: u16, body: &str, expected: &str) {
+        assert_eq!(api_msg(status, body).user_message(), expected);
+    }
+
+    #[test_case(401, GATEWAY_401 ; "unauthorized")]
+    #[test_case(403, GATEWAY_403 ; "forbidden")]
+    fn html_body_yields_gateway_guidance(status: u16, expected: &str) {
+        assert_eq!(api_msg(status, GATEWAY_HTML).user_message(), expected);
+    }
+
+    #[test]
+    fn html_body_is_never_shown_as_detail() {
+        let message = api_msg(500, GATEWAY_HTML).user_message();
+        assert_eq!(message, "server error (500)");
+        assert!(!message.contains('<'));
+    }
+
+    #[test]
+    fn detail_is_truncated_to_the_cap() {
+        let body = "x".repeat(DETAIL_CAP * 2);
+        let message = api_msg(429, &body).user_message();
+        assert!(message.ends_with(ELLIPSIS));
+        assert_eq!(
+            message.chars().count(),
+            RATE_LIMIT_LABEL.chars().count() + ": ".len() + DETAIL_CAP + 1
+        );
+    }
+
+    #[test]
+    fn retry_message_uses_the_shorter_cap() {
+        let body = "x".repeat(DETAIL_CAP * 2);
+        let err = api_msg(429, &body);
+        assert!(err.retry_message().chars().count() < err.user_message().chars().count());
+        assert_eq!(
+            err.retry_message().chars().count(),
+            RETRY_RATE_LIMIT_LABEL.chars().count() + ": ".len() + RETRY_DETAIL_CAP + 1
+        );
+    }
+
+    #[test]
+    fn retry_message_carries_detail() {
+        assert_eq!(
+            api_msg(429, ANTHROPIC_RATE_LIMIT).retry_message(),
+            "Rate limited: rate_limit_error: This request would exceed your organization's rate limit"
+        );
+    }
+
+    #[test_case(&[("retry-after", "3")], 3_000                        ; "seconds")]
+    #[test_case(&[("retry-after", "1.5")], 1_500                      ; "fractional_seconds")]
+    #[test_case(&[("retry-after-ms", "250")], 250                     ; "millis")]
+    #[test_case(&[("retry-after-ms", "250"), ("retry-after", "9")], 250 ; "millis_wins")]
+    fn parse_retry_after_reads_the_hint(pairs: &[(&str, &str)], expected_millis: u64) {
+        assert_eq!(
+            parse_retry_after(&headers(pairs)),
+            Some(Duration::from_millis(expected_millis))
+        );
+    }
+
+    #[test_case(&[]                              ; "absent")]
+    #[test_case(&[("retry-after", "later")]      ; "garbage")]
+    #[test_case(&[("retry-after", "0")]          ; "zero")]
+    #[test_case(&[("retry-after", "-5")]         ; "negative")]
+    #[test_case(&[("retry-after", "Mon, 1 Jan 2001 00:00:00 +0000")] ; "past_date")]
+    fn parse_retry_after_rejects_unusable_values(pairs: &[(&str, &str)]) {
+        assert_eq!(parse_retry_after(&headers(pairs)), None);
+    }
+
+    #[test]
+    fn parse_retry_after_reads_http_dates() {
+        let target =
+            jiff::Timestamp::now() + jiff::SignedDuration::from_secs(HTTP_DATE_OFFSET_SECS);
+        let formatted =
+            jiff::fmt::rfc2822::to_string(&target.to_zoned(jiff::tz::TimeZone::UTC)).unwrap();
+        let parsed = parse_retry_after(&headers(&[("retry-after", &formatted)])).unwrap();
+        let offset = Duration::from_secs(HTTP_DATE_OFFSET_SECS as u64);
+        assert!(parsed <= offset);
+        assert!(parsed > offset - Duration::from_secs(HTTP_DATE_TOLERANCE_SECS));
+    }
+
+    #[test]
+    fn retry_after_is_only_carried_by_api_errors() {
+        assert_eq!(api(429).retry_after(), None);
+        assert_eq!(AgentError::Timeout { secs: 30 }.retry_after(), None);
+        assert_eq!(
+            rate_limited_after(Duration::from_secs(7)).retry_after(),
+            Some(Duration::from_secs(7))
+        );
+    }
+
+    #[test_case(1, "rate limited, try again in a moment (retry after 1s)"  ; "seconds")]
+    #[test_case(90, "rate limited, try again in a moment (retry after 1m)" ; "minutes")]
+    #[test_case(7_200, "rate limited, try again in a moment (retry after 2h)" ; "hours")]
+    fn user_message_names_the_window_the_provider_asked_for(secs: u64, expected: &str) {
+        assert_eq!(
+            rate_limited_after(Duration::from_secs(secs)).user_message(),
+            expected
+        );
     }
 
     #[test]

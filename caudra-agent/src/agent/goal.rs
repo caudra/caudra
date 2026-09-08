@@ -750,7 +750,10 @@ pub(crate) fn is_unrecoverable(error: &AgentError) -> bool {
     if error.is_auth_error() || error.is_context_overflow() {
         return true;
     }
-    let AgentError::Api { status, message } = error else {
+    let AgentError::Api {
+        status, message, ..
+    } = error
+    else {
         return false;
     };
     let message = message.to_ascii_lowercase();

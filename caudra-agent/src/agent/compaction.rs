@@ -118,7 +118,8 @@ fn preserve_recent_budget(model: &Model, buffer: Option<CompactionBuffer>) -> u3
     let usable = model
         .context_window
         .saturating_sub(compaction_reserve(model, buffer));
-    (usable / PRESERVE_RECENT_FRACTION).clamp(PRESERVE_RECENT_MIN_TOKENS, PRESERVE_RECENT_MAX_TOKENS)
+    (usable / PRESERVE_RECENT_FRACTION)
+        .clamp(PRESERVE_RECENT_MIN_TOKENS, PRESERVE_RECENT_MAX_TOKENS)
 }
 
 /// Index where the preserved tail begins. A cut is only legal at a genuine user
@@ -564,8 +565,7 @@ mod tests {
             assert_eq!(msgs[3].first_text_content(), Some(RECENT_REPLY));
 
             let summarized = provider.requests.lock().unwrap()[0].clone();
-            let reached_summarizer =
-                |text| summarized.iter().any(|m| m.user_text() == Some(text));
+            let reached_summarizer = |text| summarized.iter().any(|m| m.user_text() == Some(text));
             assert!(reached_summarizer(OLD), "the head must be summarized");
             assert!(
                 !reached_summarizer(RECENT),
@@ -1158,10 +1158,7 @@ mod tests {
             const TOOL_USE_ID: &str = "call_dMZDTpEfz2JxMvFbqFHua1Zy";
 
             let provider = MockProvider::new(vec![
-                Err(AgentError::Api {
-                    status: 413,
-                    message: "prompt is too long".into(),
-                }),
+                Err(AgentError::api(413, "prompt is too long")),
                 Ok(text_response(StopReason::EndTurn)),
             ]);
             let mut history = History::new(vec![

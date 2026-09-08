@@ -313,10 +313,7 @@ pub(crate) async fn parse_sse(
                 .as_str()
                 .unwrap_or("unknown error")
                 .to_string();
-            return Err(AgentError::Api {
-                status: 500,
-                message,
-            });
+            return Err(AgentError::api(500, message));
         }
 
         let parsed_event = if current_event.is_empty() {
@@ -655,7 +652,7 @@ pub(crate) async fn parse_sse(
                     "server_error" => 500,
                     _ => 500,
                 };
-                return Err(AgentError::Api { status, message });
+                return Err(AgentError::api(status, message));
             }
 
             _ => {}
@@ -828,7 +825,9 @@ data: {\"error\":{\"message\":\"Server overloaded\",\"type\":\"overloaded_error\
 
             let (err, _) = run_sse(sse).await;
             match err.unwrap_err() {
-                AgentError::Api { status, message } => {
+                AgentError::Api {
+                    status, message, ..
+                } => {
                     assert_eq!(status, 529);
                     assert_eq!(message, "Server overloaded");
                 }
@@ -847,7 +846,9 @@ data: {\"response\":{\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"R
 
             let (err, _) = run_sse(sse).await;
             match err.unwrap_err() {
-                AgentError::Api { status, message } => {
+                AgentError::Api {
+                    status, message, ..
+                } => {
                     assert_eq!(status, 429);
                     assert_eq!(message, "Rate limit hit");
                 }

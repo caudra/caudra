@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use caudra_providers::provider::Provider;
-use caudra_providers::retry::{MAX_TIMEOUT_RETRIES, RetryState};
+use caudra_providers::retry::RetryState;
 use caudra_providers::{
     Billing, ContentBlock, Message, Model, ProviderEvent, ReasoningSource, RequestOptions,
     StreamResponse,
@@ -406,10 +406,9 @@ async fn stream_with_retry_inner(
                 {
                     warn!("rotated API key after error: {e}");
                 }
-                let (attempt, delay) = retry.next_delay();
-                if matches!(e, AgentError::Timeout { .. }) && attempt > MAX_TIMEOUT_RETRIES {
+                let Some((attempt, delay)) = retry.next_delay(e.retry_after()) else {
                     return Err(e.into());
-                }
+                };
                 let delay_ms = delay.as_millis() as u64;
                 warn!(attempt, delay_ms, error = %e, "retryable, will retry");
                 if let Some(event_tx) = event_tx {
@@ -951,10 +950,7 @@ mod tests {
 
     #[test]
     fn a_reported_api_error_leaves_the_provider_body_behind() {
-        let error = AgentError::Api {
-            status: 400,
-            message: SECRET_BODY.into(),
-        };
+        let error = AgentError::api(400, SECRET_BODY);
         let reported = error_description(&error);
         assert!(!reported.contains("private"));
         assert_eq!(reported, "API error (400)");

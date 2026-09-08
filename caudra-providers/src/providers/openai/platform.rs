@@ -767,10 +767,7 @@ mod tests {
                                 text: "partial".into(),
                             })
                             .unwrap();
-                        Err(AgentError::Api {
-                            status: TEST_AUTH_STATUS,
-                            message: TEST_AUTH_ERROR.into(),
-                        })
+                        Err(AgentError::api(TEST_AUTH_STATUS, TEST_AUTH_ERROR))
                     }
                 })
                 .await

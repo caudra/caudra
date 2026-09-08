@@ -72,27 +72,23 @@ impl Xai {
         let storage = self.storage.clone().ok_or_else(|| AgentError::Config {
             message: "OAuth refresh not available for externally-managed auth".into(),
         })?;
-        let resolved =
-            smol::unblock(move || {
-                let tokens = caudra_storage::auth::load_tokens(&storage, auth::PROVIDER)
-                    .ok_or_else(|| AgentError::Api {
-                        status: 401,
-                        message: "xAI OAuth tokens not found on disk".into(),
-                    })?;
-                match auth::refresh_tokens(&tokens) {
-                    Ok(fresh) => {
-                        caudra_storage::auth::save_tokens(&storage, auth::PROVIDER, &fresh)?;
-                        Ok(auth::build_oauth_resolved(&fresh))
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "xAI OAuth refresh failed, clearing stale tokens");
-                        let _ = caudra_storage::auth::delete_tokens(&storage, auth::PROVIDER);
-                        catalog::invalidate();
-                        Err(e)
-                    }
+        let resolved = smol::unblock(move || {
+            let tokens = caudra_storage::auth::load_tokens(&storage, auth::PROVIDER)
+                .ok_or_else(|| AgentError::api(401, "xAI OAuth tokens not found on disk"))?;
+            match auth::refresh_tokens(&tokens) {
+                Ok(fresh) => {
+                    caudra_storage::auth::save_tokens(&storage, auth::PROVIDER, &fresh)?;
+                    Ok(auth::build_oauth_resolved(&fresh))
                 }
-            })
-            .await?;
+                Err(e) => {
+                    warn!(error = %e, "xAI OAuth refresh failed, clearing stale tokens");
+                    let _ = caudra_storage::auth::delete_tokens(&storage, auth::PROVIDER);
+                    catalog::invalidate();
+                    Err(e)
+                }
+            }
+        })
+        .await?;
         *self.auth.lock().unwrap() = resolved;
         debug!("refreshed xAI OAuth token");
         Ok(())

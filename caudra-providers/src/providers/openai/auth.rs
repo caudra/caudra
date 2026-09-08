@@ -236,10 +236,10 @@ fn into_oauth_tokens(
 
 pub(crate) fn refresh_tokens(tokens: &OAuthTokens) -> Result<OAuthTokens, AgentError> {
     if tokens.refresh.is_empty() {
-        return Err(AgentError::Api {
-            status: 401,
-            message: "OpenAI credentials do not include a refresh token".into(),
-        });
+        return Err(AgentError::api(
+            401,
+            "OpenAI credentials do not include a refresh token",
+        ));
     }
     let expired = tokens.is_expired();
     debug!(expired, "refreshing OpenAI OAuth tokens");
@@ -262,10 +262,10 @@ pub(crate) fn refresh_tokens(tokens: &OAuthTokens) -> Result<OAuthTokens, AgentE
     let status = resp.status().as_u16();
     if status != 200 {
         let body_text = resp.text().unwrap_or_else(|_| "unknown error".into());
-        return Err(AgentError::Api {
-            status: oauth_error_status(status, &body_text),
-            message: format!("OpenAI token refresh failed ({status}): {body_text}"),
-        });
+        return Err(AgentError::api(
+            oauth_error_status(status, &body_text),
+            format!("OpenAI token refresh failed ({status}): {body_text}"),
+        ));
     }
 
     let body_text = resp.text()?;

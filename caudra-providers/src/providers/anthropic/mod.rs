@@ -856,7 +856,7 @@ fn auth_credential(auth: &super::ResolvedAuth) -> Option<String> {
 
 fn oauth_auth_error(error: &AgentError) -> bool {
     matches!(error, AgentError::Api { status: 401, .. })
-        || matches!(error, AgentError::Api { status: 403, message } if message.contains("OAuth token has been revoked"))
+        || matches!(error, AgentError::Api { status: 403, message, .. } if message.contains("OAuth token has been revoked"))
 }
 
 fn normalize_oauth_auth_error(error: AgentError) -> AgentError {
@@ -864,10 +864,8 @@ fn normalize_oauth_auth_error(error: AgentError) -> AgentError {
         AgentError::Api {
             status: 403,
             message,
-        } if message.contains("OAuth token has been revoked") => AgentError::Api {
-            status: 401,
-            message,
-        },
+            ..
+        } if message.contains("OAuth token has been revoked") => AgentError::api(401, message),
         error => error,
     }
 }
@@ -985,10 +983,7 @@ impl Provider for Anthropic {
             if matches!(&result, Err(error) if oauth_auth_error(error)) && forwarded == 0 {
                 let retry_auth = self.refresh_oauth(self.rejected_auth_credentials()).await?;
                 if retry_auth.mode != AuthMode::ClaudeOauth {
-                    return Err(AgentError::Api {
-                        status: AUTH_CHANGED_STATUS,
-                        message: AUTH_CHANGED_MESSAGE.into(),
-                    });
+                    return Err(AgentError::api(AUTH_CHANGED_STATUS, AUTH_CHANGED_MESSAGE));
                 }
                 let retry_access = bearer_token(&retry_auth.resolved);
                 let retry = self
@@ -1930,7 +1925,9 @@ data: {\"type\":\"content_block_stop\"}\n";
                 .await
                 .unwrap_err();
             match err {
-                AgentError::Api { status, message } => {
+                AgentError::Api {
+                    status, message, ..
+                } => {
                     assert_eq!(status, 529);
                     assert_eq!(message, "Overloaded");
                 }
@@ -1948,7 +1945,9 @@ data: {\"type\":\"content_block_stop\"}\n";
                 .await
                 .unwrap_err();
             match err {
-                AgentError::Api { status, message } => {
+                AgentError::Api {
+                    status, message, ..
+                } => {
                     assert_eq!(status, 400);
                     assert_eq!(message, "not-json");
                 }

@@ -179,17 +179,13 @@ async fn parse_sse(
             return Err(error);
         }
         if let Some(result) = image_result(&event) {
-            return BASE64.decode(result).map_err(|e| AgentError::Api {
-                status: BAD_GATEWAY,
-                message: format!("{DECODE_FAILED}: {e}"),
-            });
+            return BASE64
+                .decode(result)
+                .map_err(|e| AgentError::api(BAD_GATEWAY, format!("{DECODE_FAILED}: {e}")));
         }
     }
 
-    Err(AgentError::Api {
-        status: BAD_GATEWAY,
-        message: NO_RESULT.into(),
-    })
+    Err(AgentError::api(BAD_GATEWAY, NO_RESULT))
 }
 
 fn image_result(event: &Value) -> Option<&str> {

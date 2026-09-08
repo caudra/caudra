@@ -48,9 +48,8 @@ pub(crate) fn refresh_from_storage(
             continue;
         };
 
-        let tokens = load_tokens(storage, provider)?.ok_or_else(|| AgentError::Api {
-            status: 401,
-            message: format!("{provider} OAuth tokens not found on disk"),
+        let tokens = load_tokens(storage, provider)?.ok_or_else(|| {
+            AgentError::api(401, format!("{provider} OAuth tokens not found on disk"))
         })?;
         if usable_without_refresh(&tokens, reason) {
             return Ok(tokens);
@@ -69,10 +68,10 @@ pub(crate) fn refresh_from_storage(
             Err(error) => return Err(error),
         };
         if matches!(reason, RefreshReason::Rejected(rejected) if rejected.contains(&fresh.access)) {
-            return Err(AgentError::Api {
-                status: 401,
-                message: format!("{provider} OAuth refresh returned the rejected access token"),
-            });
+            return Err(AgentError::api(
+                401,
+                format!("{provider} OAuth refresh returned the rejected access token"),
+            ));
         }
         save_tokens(storage, provider, &fresh)?;
         return Ok(fresh);
@@ -164,10 +163,7 @@ mod tests {
         save_tokens(&storage, PROVIDER, &current).unwrap();
 
         let resolved = refresh_from_storage(&storage, PROVIDER, RefreshReason::Proactive, |_| {
-            Err(AgentError::Api {
-                status: 500,
-                message: "temporary".into(),
-            })
+            Err(AgentError::api(500, "temporary"))
         })
         .unwrap();
 
@@ -193,12 +189,7 @@ mod tests {
             &storage,
             PROVIDER,
             RefreshReason::Rejected(&rejected),
-            |_| {
-                Err(AgentError::Api {
-                    status: 500,
-                    message: "temporary".into(),
-                })
-            },
+            |_| Err(AgentError::api(500, "temporary")),
         )
         .unwrap_err();
 

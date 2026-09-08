@@ -103,10 +103,10 @@ fn post_token(body: &impl Serialize) -> Result<TokenResponse, AgentError> {
     let status = response.status().as_u16();
     let text = response.text().unwrap_or_default();
     if status != 200 {
-        return Err(AgentError::Api {
-            status: oauth_error_status(status, &text),
-            message: oauth_error(status, &text),
-        });
+        return Err(AgentError::api(
+            oauth_error_status(status, &text),
+            oauth_error(status, &text),
+        ));
     }
     serde_json::from_str(&text).map_err(AgentError::from)
 }
@@ -217,10 +217,10 @@ pub(crate) fn refresh_from_storage(
 
 pub(crate) fn refresh_tokens(tokens: &OAuthTokens) -> Result<OAuthTokens, AgentError> {
     if tokens.refresh.is_empty() {
-        return Err(AgentError::Api {
-            status: 401,
-            message: "Anthropic credentials do not include a refresh token".into(),
-        });
+        return Err(AgentError::api(
+            401,
+            "Anthropic credentials do not include a refresh token",
+        ));
     }
     debug!(
         expired = tokens.is_expired(),

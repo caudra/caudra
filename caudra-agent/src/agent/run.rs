@@ -1584,6 +1584,8 @@ mod tests {
         delta_is_thinking: bool,
         cancel_after_delta: Mutex<Option<crate::cancel::CancelTrigger>>,
         fail_status: Option<u16>,
+        fail_body: Option<&'static str>,
+        fail_retry_after: Option<Duration>,
     }
 
     impl Provider for StubStreamProvider {
@@ -1612,7 +1614,8 @@ mod tests {
                 match self.fail_status {
                     Some(status) => Err(AgentError::Api {
                         status,
-                        message: "stub".into(),
+                        message: self.fail_body.unwrap_or("stub").into(),
+                        retry_after: self.fail_retry_after,
                     }),
                     None => futures_lite::future::pending().await,
                 }
@@ -1887,10 +1890,7 @@ mod tests {
     }
 
     fn auth_error() -> AgentError {
-        AgentError::Api {
-            status: AUTH_ERROR_STATUS,
-            message: AUTH_ERROR_MESSAGE.into(),
-        }
+        AgentError::api(AUTH_ERROR_STATUS, AUTH_ERROR_MESSAGE)
     }
 
     #[test]
@@ -2969,6 +2969,60 @@ mod tests {
                     )),
                 "failed attempt's text must not reach history"
             );
+        });
+    }
+
+    /// The provider's own `Retry-After` sets the wait, and its explanation of
+    /// why survives all the way to the event the status bar renders.
+    #[test]
+    fn retry_event_carries_the_provider_hint_and_reason() {
+        const RETRY_AFTER: Duration = Duration::from_secs(7);
+        const BODY: &str =
+            r#"{"error":{"type":"rate_limit_error","message":"input tokens per minute exceeded"}}"#;
+        const EXPECTED: &str = "Rate limited: rate_limit_error: input tokens per minute exceeded";
+        smol::block_on(async {
+            let (trigger, cancel) = CancelToken::new();
+            let provider = StubStreamProvider {
+                fail_status: Some(429),
+                fail_body: Some(BODY),
+                fail_retry_after: Some(RETRY_AFTER),
+                ..Default::default()
+            };
+            let mut history = History::new(Vec::new());
+            let (agent, event_rx) = make_agent(provider, &mut history);
+            let mut agent = agent.with_cancel(cancel);
+
+            let observed = Arc::new(Mutex::new(None));
+            let pump = smol::spawn({
+                let observed = Arc::clone(&observed);
+                let mut trigger = Some(trigger);
+                async move {
+                    while let Ok(envelope) = event_rx.recv_async().await {
+                        if let AgentEvent::Retry {
+                            attempt,
+                            message,
+                            delay_ms,
+                        } = envelope.event
+                            && let Some(t) = trigger.take()
+                        {
+                            *observed.lock().unwrap() = Some((attempt, message, delay_ms));
+                            t.cancel();
+                        }
+                    }
+                }
+            });
+
+            assert_eq!(
+                agent.run(default_input()).await.unwrap(),
+                DoneReason::Cancelled
+            );
+            drop(agent);
+            pump.await;
+
+            let (attempt, message, delay_ms) = observed.lock().unwrap().take().unwrap();
+            assert_eq!(attempt, 1);
+            assert_eq!(delay_ms, RETRY_AFTER.as_millis() as u64);
+            assert_eq!(message, EXPECTED);
         });
     }
 
