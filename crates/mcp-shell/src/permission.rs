@@ -6,7 +6,7 @@ use std::{fs::File, io::Read};
 use serde::Deserialize;
 use tree_sitter::{Node, Parser};
 
-use crate::types::{ShellCommandAnalysis, ShellCommandScope};
+use crate::types::{ShellCommandAnalysis, ShellCommandScope, ShellWord};
 
 const POLICY_VERSION: u8 = 1;
 pub(crate) const MAX_COMMAND_BYTES: usize = 64 * 1024;
@@ -393,9 +393,35 @@ fn command_scope(node: Node<'_>, command: &[u8]) -> Option<(ShellCommandScope, b
             source,
             normalized,
             permission: format!("{basename} *"),
+            executable: basename.to_owned(),
+            arguments: command_arguments(node, command),
         },
         is_opaque_wrapper(basename),
     ))
+}
+
+/// Decodes the words a plain command passes, in order.
+///
+/// The grammar keeps redirect destinations in their own field, so reading the
+/// `argument` field leaves them out for the same reason the scope source does.
+/// Nodes that are not commands have no such field and are reported as never
+/// enumerated rather than as taking no arguments.
+fn command_arguments(node: Node<'_>, command: &[u8]) -> Option<Vec<ShellWord>> {
+    if node.kind() != "command" {
+        return None;
+    }
+    let mut cursor = node.walk();
+    Some(
+        node.children_by_field_name("argument", &mut cursor)
+            .map(|argument| {
+                argument
+                    .utf8_text(command)
+                    .ok()
+                    .and_then(decode_static_word)
+                    .map_or(ShellWord::Undecodable, ShellWord::Literal)
+            })
+            .collect(),
+    )
 }
 
 fn decode_static_word(word: &str) -> Option<String> {
@@ -703,6 +729,73 @@ mod tests {
         let debug = format!("{policy:?}");
         assert!(!debug.contains("private-command"));
         assert!(!debug.contains("secret-path"));
+    }
+
+    fn first_scope(command: &str) -> ShellCommandScope {
+        analyze(command)
+            .expect("analyzed")
+            .scopes
+            .into_iter()
+            .next()
+            .expect("at least one scope")
+    }
+
+    /// Quoting is resolved and word boundaries survive, so a caller reads the
+    /// operands the shell will pass rather than re-splitting the source text.
+    #[test]
+    fn arguments_decode_to_the_words_the_shell_passes() {
+        let scope = first_scope("cat \"my file.txt\" 'a*b' plain");
+        assert_eq!(scope.executable, "cat");
+        assert_eq!(
+            scope.arguments,
+            Some(vec![
+                ShellWord::Literal("my file.txt".into()),
+                ShellWord::Literal("a*b".into()),
+                ShellWord::Literal("plain".into()),
+            ])
+        );
+    }
+
+    /// Each of these names something the source text does not, so no caller can
+    /// judge the operand by reading it. Quoting a variable does not stop it
+    /// expanding, and a brace or a wildcard stands for words that are not there.
+    #[test]
+    fn words_that_do_not_mean_their_own_text_are_undecodable() {
+        for command in [
+            "cat $HOME",
+            "cat \"$HOME\"",
+            "cat `cat pointer`",
+            "cat *",
+            "cat ?ecret",
+            "cat [a-z]ecret",
+            "cat {/etc/shadow,x}",
+            "cat {1..9}",
+        ] {
+            assert_eq!(
+                first_scope(command).arguments,
+                Some(vec![ShellWord::Undecodable]),
+                "decoded {command:?}"
+            );
+        }
+    }
+
+    /// Taking no arguments is a fact about the command; never having read them
+    /// is a fact about the parse. A caller that confuses the two treats an
+    /// unexamined line as an examined one.
+    #[test]
+    fn a_command_with_no_arguments_differs_from_one_never_enumerated() {
+        assert_eq!(first_scope("pwd").arguments, Some(Vec::new()));
+        assert_eq!(first_scope("unset EDITOR").arguments, None);
+    }
+
+    /// Redirect destinations sit in their own field, so they are not arguments,
+    /// for the same reason the scope source leaves them out.
+    #[test]
+    fn redirect_destinations_are_not_arguments() {
+        assert_eq!(
+            first_scope("cat notes.md > /etc/shadow").arguments,
+            Some(vec![ShellWord::Literal("notes.md".into())])
+        );
     }
 
     #[test]

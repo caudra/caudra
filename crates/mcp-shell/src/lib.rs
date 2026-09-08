@@ -28,5 +28,6 @@ pub use progress::ShellProgressSink;
 pub use types::{
     DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS, PreparedShell, ShellCommandAnalysis, ShellCommandScope,
     ShellExecution, ShellFilterInfo, ShellInput, ShellOutput, ShellProgressChunk, ShellStream,
+    ShellWord,
 };
 pub use workcell_tool_contract::{ToolAnnotations, ToolSpec};

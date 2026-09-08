@@ -75,12 +75,29 @@ pub struct ShellProgressChunk {
     pub text: String,
 }
 
+/// A word the shell will pass to a command.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ShellWord {
+    /// The shell passes exactly this text, with quoting and escapes resolved.
+    Literal(String),
+    /// Expansion, globbing, or quoting the source does not resolve, so what the
+    /// shell will pass is not knowable from the text.
+    Undecodable,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ShellCommandScope {
     pub start_byte: usize,
     pub source: String,
     pub normalized: String,
     pub permission: String,
+    /// Decoded basename of the executable.
+    pub executable: String,
+    /// Words after the executable, in order.
+    ///
+    /// `None` when the scope is not a plain command, so its words were never
+    /// enumerated, which is not the same as a command with no arguments.
+    pub arguments: Option<Vec<ShellWord>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
