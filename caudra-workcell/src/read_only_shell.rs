@@ -5,6 +5,7 @@
 
 use std::path::{Component, Path};
 
+use caudra_agent::permissions::physical_boundary_check;
 use workcell::shell::ShellCommandAnalysis;
 
 const GIT: &str = "git";
@@ -116,14 +117,16 @@ pub(crate) fn stays_in_project(
         && analysis
             .scopes
             .iter()
-            .all(|scope| scope_stays_in_project(&scope.normalized))
+            .all(|scope| scope_stays_in_project(&scope.normalized, workdir, project))
 }
 
-fn scope_stays_in_project(normalized: &str) -> bool {
-    normalized.split_whitespace().all(token_stays_in_project)
+fn scope_stays_in_project(normalized: &str, workdir: &Path, project: &Path) -> bool {
+    normalized
+        .split_whitespace()
+        .all(|token| token_stays_in_project(token, workdir, project))
 }
 
-fn token_stays_in_project(token: &str) -> bool {
+fn token_stays_in_project(token: &str, workdir: &Path, project: &Path) -> bool {
     // Judging a token's text only means anything while the text is the operand.
     // Workcell marks `${...}` and `$(...)` opaque, but a bare `$HOME` is a
     // `simple_expansion` it leaves intact, and `$HOME/.ssh/id_rsa` then reads as
@@ -133,9 +136,23 @@ fn token_stays_in_project(token: &str) -> bool {
     }
     // A flag carrying an attached value hides a second operand, and
     // `--file=/etc/passwd` reads it just as surely as a bare path would.
-    token
-        .split('=')
-        .all(|part| stays_inside(part) && stays_inside(&unquote(part)))
+    token.split('=').all(|part| {
+        stays_inside(part)
+            && stays_inside(&unquote(part))
+            && resolves_inside(&unquote(part), workdir, project)
+    })
+}
+
+/// Text cannot see through a symlink, and a project can contain one pointing
+/// anywhere, so a token is resolved and bounded by the same symlink-aware check
+/// the file tools use.
+///
+/// Most tokens are not paths at all, and they need no special case: the rules
+/// above have already excluded every form that escapes, so a flag or a pattern
+/// joins the workdir and canonicalizes to its own lexical form, which is inside.
+/// Only a link can leave, and only resolving finds it.
+fn resolves_inside(operand: &str, workdir: &Path, project: &Path) -> bool {
+    physical_boundary_check(project, &workdir.join(operand)) == Some(true)
 }
 
 /// Quoting decides whether a glob expands, so this reads the token as the shell
@@ -288,6 +305,47 @@ mod tests {
             Path::new(workdir),
             Path::new(PROJECT),
         )
+    }
+
+    /// A project can contain a symlink pointing anywhere, and nothing in a
+    /// command's text says so. `cat notes.md` is confined by every textual rule
+    /// there is and still reads whatever the link names.
+    #[test_case("cat inside.md" => true ; "a real file inside the project")]
+    #[test_case("cat notes.md" => false ; "a symlink to a file outside it")]
+    #[test_case("cat linked/id_rsa" => false ; "a path through a symlinked directory")]
+    #[test_case("cat missing.md" => true ; "a name that resolves to nothing is not a path we read")]
+    #[test_case("find . -name '*.rs'" => true ; "a pattern argument still resolves to nothing")]
+    fn a_symlink_out_of_the_project_is_not_confined(command: &str) -> bool {
+        let project = tempfile::tempdir().expect("project");
+        let outside = tempfile::tempdir().expect("outside");
+        let secret = outside.path().join("id_rsa");
+        std::fs::write(&secret, "key").expect("secret");
+        std::fs::write(project.path().join("inside.md"), "notes").expect("inside");
+        std::os::unix::fs::symlink(&secret, project.path().join("notes.md")).expect("file link");
+        std::os::unix::fs::symlink(outside.path(), project.path().join("linked"))
+            .expect("dir link");
+        let root = project.path().canonicalize().expect("canonical project");
+
+        stays_in_project(&analysis(&[command]), &root, &root)
+    }
+
+    /// The bound is the project, not the directory the command runs from, so a
+    /// link that never leaves the project stays confined even when it points
+    /// outside the workdir.
+    #[test]
+    fn a_link_within_the_project_stays_confined_from_a_subdirectory() {
+        let project = tempfile::tempdir().expect("project");
+        let root = project.path().canonicalize().expect("canonical project");
+        let workdir = root.join("crates");
+        std::fs::create_dir(&workdir).expect("workdir");
+        std::fs::write(root.join("docs.md"), "docs").expect("docs");
+        std::os::unix::fs::symlink(root.join("docs.md"), workdir.join("link.md")).expect("link");
+
+        assert!(stays_in_project(
+            &analysis(&["cat link.md"]),
+            &workdir,
+            &root
+        ));
     }
 
     /// Every command on the line has to stay inside, for the same reason one

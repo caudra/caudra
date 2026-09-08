@@ -2882,8 +2882,30 @@ mod tests {
     #[test_case("cat *" => false ; "nor is an unquoted glob")]
     fn shell_preflight_marks_only_a_confined_read(command: &str) -> bool {
         let root = TempDir::new().expect("tempdir");
-        let (_host, registry) = host_and_registry(root.path());
-        let ctx = context(root.path(), Arc::clone(&registry), CancelToken::none());
+        confined_read_preflight_marks(root.path(), command)
+    }
+
+    /// A checked-in symlink needs no privileged action from the model: cloning a
+    /// repository is enough. Every textual rule says `cat notes.md` is confined,
+    /// so only resolving it says otherwise.
+    #[test_case("cat inside.md" => true ; "a real file inside the project")]
+    #[test_case("cat notes.md" => false ; "a symlink out of the project")]
+    #[test_case("cat linked/id_rsa" => false ; "a path through a symlinked directory")]
+    fn shell_preflight_resolves_a_symlink_before_marking(command: &str) -> bool {
+        let root = TempDir::new().expect("tempdir");
+        let outside = TempDir::new().expect("outside");
+        std::fs::write(outside.path().join("id_rsa"), "key").expect("secret");
+        std::fs::write(root.path().join("inside.md"), "notes").expect("inside");
+        std::os::unix::fs::symlink(outside.path().join("id_rsa"), root.path().join("notes.md"))
+            .expect("file link");
+        std::os::unix::fs::symlink(outside.path(), root.path().join("linked")).expect("dir link");
+
+        confined_read_preflight_marks(root.path(), command)
+    }
+
+    fn confined_read_preflight_marks(root: &Path, command: &str) -> bool {
+        let (_host, registry) = host_and_registry(root);
+        let ctx = context(root, Arc::clone(&registry), CancelToken::none());
         let invocation = registry
             .get("shell")
             .expect("registered shell")
