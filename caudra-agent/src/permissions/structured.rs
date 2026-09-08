@@ -55,6 +55,12 @@ pub const COMMAND_GROUP_PREFIX: &str = "command_";
 pub const COMMAND_EXACT_PREFIX: &str = "command_exact_";
 pub const COMMAND_PATTERN_PREFIX: &str = "command_pattern_";
 const EXACT_COMMAND_CHIP: &str = "this command";
+const EXACT_COMMANDS_OPTION: &str = "allow_exact_commands";
+const COMMAND_PATTERNS_OPTION: &str = "allow_command_patterns";
+/// The whole-request shell authorities a per-command answer reproduces exactly:
+/// every row on its narrowest reusable rung is one, every row at its widest is
+/// the other. A prompt that offers the rows has no reason to offer these too.
+pub const COMPOSABLE_SHELL_OPTIONS: &[&str] = &[EXACT_COMMANDS_OPTION, COMMAND_PATTERNS_OPTION];
 const INERT_GIT_METADATA: &[&str] = &[
     "COMMIT_EDITMSG",
     "FETCH_HEAD",
@@ -2008,7 +2014,7 @@ fn rule_options(
         if resources.iter().all(|resource| !resource.protected) {
             add_command_options(&mut options, resources, subject, executor, &reusable);
             options.push(option(
-                "allow_exact_commands",
+                EXACT_COMMANDS_OPTION,
                 if resources.len() == 1 {
                     "This command in this workdir"
                 } else {
@@ -2069,7 +2075,7 @@ fn rule_options(
                     ));
                 }
                 options.push(option(
-                    "allow_command_patterns",
+                    COMMAND_PATTERNS_OPTION,
                     &label,
                     &description,
                     StructuredPermissionEffect::Allow,

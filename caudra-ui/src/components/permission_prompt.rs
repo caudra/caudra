@@ -1,8 +1,9 @@
 use std::collections::{HashSet, VecDeque};
 
 use caudra_agent::permissions::{
-    DEFAULT_DENY_GUIDANCE, PermissionAnswer, PermissionCaution, PermissionLifetime,
-    PermissionRequest, PermissionRisk, PermissionRuleOption, StructuredPermissionEffect,
+    COMPOSABLE_SHELL_OPTIONS, DEFAULT_DENY_GUIDANCE, PatternFault, PatternGrade, PermissionAnswer,
+    PermissionCaution, PermissionLifetime, PermissionRequest, PermissionRisk, PermissionRowGrant,
+    PermissionRuleOption, StructuredPermissionEffect, grade_command_pattern,
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
@@ -37,11 +38,22 @@ const HINT_CONFIRM: &str = "Enter/y";
 /// can synthesise from its name.
 const HINT_SELECT: &str = "↑/↓";
 const HINT_WIDEN: &str = "←/→";
+const HINT_WIDEN_ALL: &str = "</>";
 const HINT_PAGE: &str = "PgUp/PgDn";
 const WIDEN_MARK: &str = " ←/→";
 const BADGE_RECOMMENDED: &str = " [recommended]";
 const BADGE_WARN: &str = " [outside repo]";
 const BADGE_DANGER: &str = " [outside home]";
+const BADGE_ASK_FAMILY: &str = " [always-ask family]";
+const BADGE_ANY_INVOCATION: &str = " [any invocation]";
+const KEY_WIDEN_ALL_IN: char = '<';
+const KEY_WIDEN_ALL_OUT: char = '>';
+const CHIP_ARROW: &str = " → ";
+const CHIP_ONCE: &str = "this call only";
+const CHIP_COVERED: &str = "already allowed";
+const WRITTEN_MARK: &str = " (typed)";
+const COMMANDS_HEADING: &str = "  Commands";
+const BLANKET_HEADING: &str = "  Or grant broadly instead";
 
 type HintPairs = Vec<(&'static str, &'static str)>;
 
@@ -59,15 +71,75 @@ struct PromptBody {
     entries: Vec<(String, u16)>,
 }
 
-/// The options that can be granted beyond this one call.
+/// The options that can be granted beyond this one call and speak for the whole
+/// request.
+///
+/// Per-command rungs are excluded because they are rows of their own, and so
+/// are the aggregates those rows reproduce exactly: `<` and `>` land on them.
 fn authorities(request: &PermissionRequest) -> impl Iterator<Item = &PermissionRuleOption> {
-    request.options.iter().filter(|option| {
+    let per_command = !command_ladders(request).is_empty();
+    request.options.iter().filter(move |option| {
         option.rule.effect == StructuredPermissionEffect::Allow
             && option
                 .allowed_lifetimes
                 .iter()
                 .any(|lifetime| *lifetime != PermissionLifetime::Once)
+            && option
+                .group
+                .as_ref()
+                .is_none_or(|group| group.resource.is_none())
+            && !(per_command && COMPOSABLE_SHELL_OPTIONS.contains(&option.id.as_str()))
     })
+}
+
+/// The rungs offered for each resource, narrowest first, or nothing when the
+/// request offers no per-command choice at all.
+///
+/// A request ladders every resource or none of them, so one empty ladder means
+/// the prompt answers as a whole.
+fn command_ladders(request: &PermissionRequest) -> Vec<Vec<&PermissionRuleOption>> {
+    let mut ladders = vec![Vec::new(); request.resources.len()];
+    for option in &request.options {
+        if option.rule.effect != StructuredPermissionEffect::Allow {
+            continue;
+        }
+        if let Some(index) = option.group.as_ref().and_then(|group| group.resource)
+            && let Some(ladder) = ladders.get_mut(index)
+        {
+            ladder.push(option);
+        }
+    }
+    if ladders.iter().any(Vec::is_empty) {
+        return Vec::new();
+    }
+    ladders
+}
+
+/// Where one command row sits on its ladder, and the pattern typed for it.
+///
+/// Rung 0 grants nothing beyond this call; then come the offered rungs in
+/// order, and last the written pattern once the row has one. The text survives
+/// stepping away from it so stepping back finds it again.
+#[derive(Clone, Default, PartialEq, Eq, Debug)]
+struct RowChoice {
+    rung: usize,
+    written: Option<String>,
+}
+
+impl RowChoice {
+    fn ladder_len(&self, offered: usize) -> usize {
+        1 + offered + usize::from(self.written.is_some())
+    }
+
+    /// What this row contributes to the answer, or `None` for this call only.
+    fn grant(&self, offered: &[&PermissionRuleOption]) -> Option<PermissionRowGrant> {
+        match self.rung.checked_sub(1)? {
+            rung if rung < offered.len() => {
+                Some(PermissionRowGrant::Offered(offered[rung].id.clone()))
+            }
+            _ => self.written.clone().map(PermissionRowGrant::Written),
+        }
+    }
 }
 
 /// One authority per row, with every ladder collapsed to the rung in use.
@@ -132,6 +204,8 @@ pub(crate) enum PromptState {
     ConfirmDenyAlwaysLocal,
     ConfirmDenyAlwaysGlobal,
     DenyEditing,
+    /// Writing a pattern for the selected command row.
+    PatternEditing,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -152,6 +226,9 @@ pub struct PermissionPrompt {
     buffer: TextBuffer,
     scroll: ModalScroll,
     selected_option: String,
+    /// Where each command row sits on its ladder, positional with the
+    /// request's resources.
+    scopes: Vec<RowChoice>,
     /// An authority the next draw has to bring into view, once the layout it
     /// lands in is known.
     pending_reveal: Option<String>,
@@ -210,6 +287,7 @@ impl PermissionPrompt {
             buffer: TextBuffer::new(String::new()),
             scroll: ModalScroll::new_top(),
             selected_option: "allow_exact".into(),
+            scopes: Vec::new(),
             pending_reveal: None,
             row_hits: Vec::new(),
             mouse_down: None,
@@ -222,13 +300,12 @@ impl PermissionPrompt {
         if !self.request_ids.insert(request.id.clone()) {
             return false;
         }
-        if self.requests.is_empty()
-            && let Some(option) = request.options.iter().find(|option| option.is_default)
-        {
-            self.selected_option = option.id.clone();
-        }
+        let first = self.requests.is_empty();
         self.requests
             .push_back(QueuedPermission { request, requester });
+        if first {
+            self.reset_selection();
+        }
         true
     }
 
@@ -297,6 +374,22 @@ impl PermissionPrompt {
                     None
                 }
             };
+        }
+
+        if self.state == PromptState::PatternEditing {
+            match key.code {
+                // Inert while the pattern is unusable, so the reason under the
+                // field is what answers the keypress.
+                KeyCode::Enter => self.commit_written_pattern(),
+                KeyCode::Esc => {
+                    self.state = PromptState::Normal;
+                    self.buffer = TextBuffer::new(String::new());
+                }
+                _ => {
+                    self.buffer.handle_key(key);
+                }
+            }
+            return None;
         }
 
         if let Some(answer) = self.confirm_answer() {
@@ -387,18 +480,77 @@ impl PermissionPrompt {
         }
     }
 
-    /// Arrows steer the authority list: `↑`/`↓` pick a row and `←`/`→` walk the
-    /// ladder on it. They are claimed before the scroll sees them, so the page
-    /// keys are what moves the viewport.
+    /// Arrows steer the row list: `↑`/`↓` pick a row, `←`/`→` walk the ladder
+    /// on it, and `<`/`>` walk every command row at once. `Enter` opens the
+    /// pattern editor for the selected command. They are claimed before the
+    /// scroll sees them, so the page keys are what moves the viewport.
     fn steer(&mut self, code: KeyCode) -> bool {
         match code {
             KeyCode::Up => self.move_selection(true),
             KeyCode::Down => self.move_selection(false),
             KeyCode::Left => self.widen(false),
             KeyCode::Right => self.widen(true),
+            KeyCode::Char(KEY_WIDEN_ALL_IN) => self.widen_all(false),
+            KeyCode::Char(KEY_WIDEN_ALL_OUT) => self.widen_all(true),
+            KeyCode::Enter => return self.open_pattern_editor(),
             _ => return false,
         }
         true
+    }
+
+    /// Opens the editor on the selected command row, seeded with the pattern
+    /// already written for it, else the rung the request suggested, else the
+    /// command itself for the user to cut down.
+    fn open_pattern_editor(&mut self) -> bool {
+        let Some(row) = self.command_row() else {
+            return false;
+        };
+        let Some(request) = self.current() else {
+            return false;
+        };
+        let seed = self.scopes[row]
+            .written
+            .clone()
+            .or_else(|| {
+                command_ladders(request)[row]
+                    .get(1)
+                    .and_then(|rung| rung.group.as_ref())
+                    .map(|group| group.value.clone())
+            })
+            .or_else(|| {
+                request
+                    .resources
+                    .get(row)
+                    .map(|resource| resource.value.clone())
+            })
+            .unwrap_or_default();
+        self.buffer = TextBuffer::new(seed);
+        self.buffer.move_end();
+        self.state = PromptState::PatternEditing;
+        true
+    }
+
+    /// Takes the written pattern, but only once it is one this row can be
+    /// granted with. The row then stands on it.
+    fn commit_written_pattern(&mut self) {
+        let Some(row) = self.command_row() else {
+            return;
+        };
+        let pattern = self.buffer.value().trim().to_owned();
+        let usable = self
+            .current()
+            .and_then(|request| request.resources.get(row))
+            .is_some_and(|resource| grade_command_pattern(&pattern, &resource.value).is_ok());
+        if !usable {
+            return;
+        }
+        let offered = self
+            .current()
+            .map_or(0, |request| command_ladders(request)[row].len());
+        self.scopes[row].written = Some(pattern);
+        self.scopes[row].rung = offered + 1;
+        self.state = PromptState::Normal;
+        self.buffer = TextBuffer::new(String::new());
     }
 
     pub fn resolve(&mut self, request_id: &str) -> bool {
@@ -431,9 +583,11 @@ impl PermissionPrompt {
     }
 
     pub fn handle_paste(&mut self, text: &str) -> bool {
-        if (self.state != PromptState::DenyEditing && self.confirmation_phrase().is_none())
-            || !self.is_open()
-        {
+        let editing = matches!(
+            self.state,
+            PromptState::DenyEditing | PromptState::PatternEditing
+        );
+        if (!editing && self.confirmation_phrase().is_none()) || !self.is_open() {
             return false;
         }
         self.buffer.insert_text(text);
@@ -658,15 +812,55 @@ impl PermissionPrompt {
         self.row_hits.clear();
         self.mouse_down = None;
         self.hover = None;
-        self.selected_option = self
-            .current()
-            .and_then(|request| {
-                request.options.iter().find(|option| {
+        self.reset_selection();
+    }
+
+    /// Where a fresh prompt starts. Command rows begin pinned to the command
+    /// reviewed, except the ones already allowed, which begin granting nothing
+    /// so a plain `s` remembers what was actually undecided and no more. The
+    /// selection lands on the first row still waiting on an answer.
+    fn reset_selection(&mut self) {
+        let Some(request) = self.current() else {
+            self.scopes.clear();
+            self.selected_option = "allow_exact".into();
+            return;
+        };
+        let covered = |row: usize| {
+            request
+                .presentation
+                .resources
+                .get(row)
+                .is_some_and(|shown| shown.covered)
+        };
+        let ladders = command_ladders(request);
+        let scopes = (0..ladders.len())
+            .map(|row| RowChoice {
+                rung: usize::from(!covered(row)),
+                written: None,
+            })
+            .collect();
+        let default_authority = || {
+            request
+                .options
+                .iter()
+                .find(|option| {
                     option.is_default && option.rule.effect == StructuredPermissionEffect::Allow
                 })
-            })
-            .map(|option| option.id.clone())
-            .unwrap_or_else(|| "allow_exact".into());
+                .map_or_else(|| "allow_exact".into(), |option| option.id.clone())
+        };
+        let selected = ladders
+            .iter()
+            .enumerate()
+            .find(|(row, _)| !covered(*row))
+            .or_else(|| ladders.iter().enumerate().next())
+            .map_or_else(default_authority, |(_, ladder)| {
+                ladder[0]
+                    .group
+                    .as_ref()
+                    .map_or_else(|| ladder[0].id.clone(), |group| group.key.clone())
+            });
+        self.scopes = scopes;
+        self.selected_option = selected;
     }
 
     fn open_confirmation(&mut self, state: PromptState) {
@@ -676,66 +870,154 @@ impl PermissionPrompt {
     }
 
     fn open_allow_confirmation(&mut self, state: PromptState, lifetime: PermissionLifetime) {
-        if self
-            .selected_authority()
-            .is_some_and(|option| option.allowed_lifetimes.contains(&lifetime))
-        {
+        if self.grants_lifetime(&lifetime) {
             self.open_confirmation(state);
         }
     }
 
-    fn selected_authority(&self) -> Option<&caudra_agent::permissions::PermissionRuleOption> {
+    /// Whether the selection can be granted for this long. A composition is as
+    /// durable as its least durable granted row, and a composition that grants
+    /// nothing is durable at any lifetime because it stores nothing.
+    fn grants_lifetime(&self, lifetime: &PermissionLifetime) -> bool {
+        let Some(request) = self.current() else {
+            return false;
+        };
+        if self.command_row().is_none() {
+            return self
+                .selected_authority()
+                .is_some_and(|option| option.allowed_lifetimes.contains(lifetime));
+        }
+        command_ladders(request)
+            .iter()
+            .zip(&self.scopes)
+            .filter_map(|(offered, choice)| match choice.grant(offered)? {
+                PermissionRowGrant::Offered(id) => offered.iter().find(|rung| rung.id == id),
+                // A written pattern is stored under the authority of the row's
+                // narrowest reusable rung, so that is what gates it.
+                PermissionRowGrant::Written(_) => offered.first(),
+            })
+            .all(|option| option.allowed_lifetimes.contains(lifetime))
+    }
+
+    fn selected_authority(&self) -> Option<&PermissionRuleOption> {
         self.current()?.options.iter().find(|option| {
             option.id == self.selected_option
                 && option.rule.effect == StructuredPermissionEffect::Allow
         })
     }
 
-    /// The rows on offer and where the selection currently sits among them.
-    fn selection(&self) -> Option<(Vec<AuthorityRow>, usize)> {
-        let rows = authority_rows(self.current()?, &self.selected_option);
-        if rows.is_empty() {
-            return None;
-        }
-        let current = rows
+    /// Which command row the selection sits on, if any. A command row is keyed
+    /// by its ladder's group key, so the key survives widening the row.
+    fn command_row(&self) -> Option<usize> {
+        command_ladders(self.current()?)
             .iter()
-            .position(|row| row.rungs.contains(&self.selected_option))
-            .unwrap_or_default();
-        Some((rows, current))
+            .position(|ladder| self.row_key(ladder[0]) == self.selected_option)
     }
 
-    /// Moves between authorities. A ladder counts as one step however many
-    /// rungs it has, and lands on its narrowest.
+    /// A command row is one row however many rungs it has, so it is keyed by
+    /// its ladder rather than by the rung showing.
+    fn row_key(&self, option: &PermissionRuleOption) -> String {
+        option
+            .group
+            .as_ref()
+            .filter(|group| group.resource.is_some())
+            .map_or_else(|| option.id.clone(), |group| group.key.clone())
+    }
+
+    /// Every selectable row in draw order: the commands, then the authorities
+    /// that speak for the whole request.
+    fn row_keys(&self) -> Vec<String> {
+        let Some(request) = self.current() else {
+            return Vec::new();
+        };
+        command_ladders(request)
+            .iter()
+            .map(|ladder| self.row_key(ladder[0]))
+            .chain(
+                authority_rows(request, &self.selected_option)
+                    .into_iter()
+                    .map(|row| row.chosen),
+            )
+            .collect()
+    }
+
+    /// Moves between rows. A ladder counts as one step however many rungs it
+    /// has, and a blanket ladder lands on its narrowest.
     fn move_selection(&mut self, reverse: bool) {
-        let Some((rows, current)) = self.selection() else {
+        let keys = self.row_keys();
+        if keys.is_empty() {
             return;
-        };
+        }
+        let current = keys
+            .iter()
+            .position(|key| *key == self.selected_option)
+            .unwrap_or_default();
         let next = if reverse {
-            current.checked_sub(1).unwrap_or(rows.len() - 1)
+            current.checked_sub(1).unwrap_or(keys.len() - 1)
         } else {
-            (current + 1) % rows.len()
+            (current + 1) % keys.len()
         };
-        self.select_authority(rows[next].chosen.clone());
+        self.select_authority(keys[next].clone());
     }
 
     /// Walks the ladder the selected row stands for. Ends clamp rather than
     /// wrap: stepping off the widest rung must not quietly land on the
     /// narrowest.
     fn widen(&mut self, forward: bool) {
-        let Some((rows, current)) = self.selection() else {
+        if let Some(row) = self.command_row() {
+            self.step_command_row(row, forward);
+            self.pending_reveal = Some(self.selected_option.clone());
+            return;
+        }
+        let Some(request) = self.current() else {
             return;
         };
-        let rungs = &rows[current].rungs;
-        let rung = rungs
+        let rows = authority_rows(request, &self.selected_option);
+        let Some(row) = rows
+            .iter()
+            .find(|row| row.rungs.contains(&self.selected_option))
+        else {
+            return;
+        };
+        let rung = row
+            .rungs
             .iter()
             .position(|rung| *rung == self.selected_option)
             .unwrap_or_default();
         let next = if forward {
-            (rung + 1).min(rungs.len() - 1)
+            (rung + 1).min(row.rungs.len() - 1)
         } else {
             rung.saturating_sub(1)
         };
-        self.select_authority(rungs[next].clone());
+        self.select_authority(row.rungs[next].clone());
+    }
+
+    /// Walks every command row at once, so the common answer stays two
+    /// keystrokes however many commands were batched.
+    fn widen_all(&mut self, forward: bool) {
+        let Some(request) = self.current() else {
+            return;
+        };
+        for row in 0..command_ladders(request).len() {
+            self.step_command_row(row, forward);
+        }
+    }
+
+    fn step_command_row(&mut self, row: usize, forward: bool) {
+        let Some(request) = self.current() else {
+            return;
+        };
+        let Some(offered) = command_ladders(request).get(row).map(Vec::len) else {
+            return;
+        };
+        let Some(choice) = self.scopes.get_mut(row) else {
+            return;
+        };
+        choice.rung = if forward {
+            (choice.rung + 1).min(choice.ladder_len(offered) - 1)
+        } else {
+            choice.rung.saturating_sub(1)
+        };
     }
 
     fn select_authority(&mut self, id: String) {
@@ -746,25 +1028,44 @@ impl PermissionPrompt {
     }
 
     fn confirm_answer(&self) -> Option<PermissionAnswer> {
-        match self.state {
-            PromptState::ConfirmAllowAlwaysLocal => Some(PermissionAnswer::AllowOption {
+        let lifetime = match self.state {
+            PromptState::ConfirmAllowAlwaysLocal => PermissionLifetime::Project,
+            PromptState::ConfirmAllowAlwaysGlobal => PermissionLifetime::Global,
+            PromptState::ConfirmAllowSession => PermissionLifetime::Conversation,
+            PromptState::ConfirmDenyAlwaysLocal => return Some(PermissionAnswer::DenyAlwaysLocal),
+            PromptState::ConfirmDenyAlwaysGlobal => {
+                return Some(PermissionAnswer::DenyAlwaysGlobal);
+            }
+            PromptState::Normal | PromptState::DenyEditing | PromptState::PatternEditing => {
+                return None;
+            }
+        };
+        Some(self.allow_answer(lifetime))
+    }
+
+    /// The selection as an answer. A selection on a command row answers with
+    /// every row's choice, because the call is one call: rows are breadths to
+    /// remember, never a way to run part of it.
+    fn allow_answer(&self, lifetime: PermissionLifetime) -> PermissionAnswer {
+        let Some(request) = self.current().filter(|_| self.command_row().is_some()) else {
+            return PermissionAnswer::AllowOption {
                 option_id: self.selected_option.clone(),
-                lifetime: PermissionLifetime::Project,
-            }),
-            PromptState::ConfirmAllowAlwaysGlobal => Some(PermissionAnswer::AllowOption {
-                option_id: self.selected_option.clone(),
-                lifetime: PermissionLifetime::Global,
-            }),
-            PromptState::ConfirmAllowSession => Some(PermissionAnswer::AllowOption {
-                option_id: self.selected_option.clone(),
-                lifetime: PermissionLifetime::Conversation,
-            }),
-            PromptState::ConfirmDenyAlwaysLocal => Some(PermissionAnswer::DenyAlwaysLocal),
-            PromptState::ConfirmDenyAlwaysGlobal => Some(PermissionAnswer::DenyAlwaysGlobal),
-            PromptState::Normal | PromptState::DenyEditing => None,
+                lifetime,
+            };
+        };
+        PermissionAnswer::AllowComposed {
+            rows: command_ladders(request)
+                .iter()
+                .zip(&self.scopes)
+                .map(|(offered, choice)| choice.grant(offered))
+                .collect(),
+            lifetime,
         }
     }
 
+    /// The phrase a durable grant has to be typed out for. A composition takes
+    /// the gravest phrase any of its rows earned, so one danger-graded pattern
+    /// gates the whole answer.
     fn confirmation_phrase(&self) -> Option<&str> {
         if !matches!(
             self.state,
@@ -774,7 +1075,24 @@ impl PermissionPrompt {
         ) {
             return None;
         }
-        self.selected_authority()?.confirmation.as_deref()
+        if self.command_row().is_none() {
+            return self.selected_authority()?.confirmation.as_deref();
+        }
+        self.written_grades()
+            .find_map(|(_, grade)| grade.ok()?.confirmation)
+    }
+
+    /// Every written pattern in the answer, graded, in row order.
+    fn written_grades(&self) -> impl Iterator<Item = (usize, Result<PatternGrade, PatternFault>)> {
+        let request = self.current();
+        self.scopes
+            .iter()
+            .enumerate()
+            .filter_map(move |(row, choice)| {
+                let pattern = choice.written.as_deref()?;
+                let command = &request?.resources.get(row)?.value;
+                Some((row, grade_command_pattern(pattern, command)))
+            })
     }
 
     fn body(&self, request: &PermissionRequest) -> PromptBody {
@@ -809,8 +1127,19 @@ impl PermissionPrompt {
                 value,
             ),
             Line::default(),
-            Line::from(Span::styled("  Resources", t.panel_title)),
         ]);
+        let ladders = command_ladders(request);
+        if !ladders.is_empty() {
+            lines.push(Line::from(Span::styled(COMMANDS_HEADING, t.panel_title)));
+            self.command_lines(request, &ladders, &mut lines, &mut entries);
+            lines.extend([
+                Line::default(),
+                Line::from(Span::styled(BLANKET_HEADING, t.panel_title)),
+            ]);
+            self.authority_lines(request, &mut lines, &mut entries);
+            return self.tail(request, PromptBody { lines, entries });
+        }
+        lines.push(Line::from(Span::styled("  Resources", t.panel_title)));
         if request.presentation.resources.is_empty() {
             lines.push(Line::from(Span::styled("    none declared", t.tool_dim)));
         } else {
@@ -850,13 +1179,157 @@ impl PermissionPrompt {
                 );
             }
         }
-        let rows = authority_rows(request, &self.selected_option);
-        if !rows.is_empty() {
+        if !authority_rows(request, &self.selected_option).is_empty() {
             lines.extend([
                 Line::default(),
                 Line::from(Span::styled("  Reusable authority", t.panel_title)),
             ]);
-            for row in rows {
+            self.authority_lines(request, &mut lines, &mut entries);
+        }
+        self.tail(request, PromptBody { lines, entries })
+    }
+
+    /// One row per reviewed command: the command verbatim, then the authority
+    /// that row contributes. The command text is the review surface, so it
+    /// leads and the chip follows it.
+    fn command_lines(
+        &self,
+        request: &PermissionRequest,
+        ladders: &[Vec<&PermissionRuleOption>],
+        lines: &mut Vec<Line<'static>>,
+        entries: &mut Vec<(String, u16)>,
+    ) {
+        let t = theme::current();
+        let value = Style::new().fg(t.foreground);
+        let safe = |text: &str| escape_terminal_controls(text);
+        for (row, offered) in ladders.iter().enumerate() {
+            let key = self.row_key(offered[0]);
+            let selected = key == self.selected_option;
+            let on = matches!(&self.hover, Some(PromptTarget::Authority(id)) if *id == key);
+            let choice = self.scopes.get(row).cloned().unwrap_or_default();
+            let covered = request
+                .presentation
+                .resources
+                .get(row)
+                .is_some_and(|shown| shown.covered);
+            let summary = request
+                .presentation
+                .resources
+                .get(row)
+                .map_or_else(String::new, |shown| safe(&shown.summary));
+            let (chip, caution) = self.chip(row, offered, &choice, covered);
+            entries.push((key, lines.len() as u16));
+            lines.push(Line::from(vec![
+                Span::styled(
+                    if selected { "  > " } else { "    " },
+                    hover_style(t.status_notice, on),
+                ),
+                Span::styled(
+                    summary,
+                    hover_style(if choice.rung == 0 { t.tool_dim } else { value }, on),
+                ),
+                Span::styled(CHIP_ARROW, hover_style(t.tool_dim, on)),
+                Span::styled(chip, hover_style(caution_style(caution, t.tool_dim), on)),
+                Span::styled(
+                    if selected && choice.ladder_len(offered.len()) > 1 {
+                        WIDEN_MARK
+                    } else {
+                        ""
+                    },
+                    hover_style(t.status_notice, on),
+                ),
+                Span::styled(
+                    match caution {
+                        Some(PermissionCaution::Danger) => BADGE_ANY_INVOCATION,
+                        Some(PermissionCaution::Warn) => BADGE_ASK_FAMILY,
+                        None => "",
+                    },
+                    hover_style(caution_style(caution, t.tool_dim), on),
+                ),
+            ]));
+            if selected && self.state == PromptState::PatternEditing {
+                lines.push(self.confirmation_input_line());
+                lines.push(Line::from(Span::styled(
+                    format!("      {}", self.pattern_feedback(row)),
+                    match self.pattern_caution(row) {
+                        Ok(caution) => caution_style(caution, t.tool_dim),
+                        Err(()) => t.error,
+                    },
+                )));
+            }
+        }
+    }
+
+    /// What a row's current rung is called, and how grave it is.
+    fn chip(
+        &self,
+        row: usize,
+        offered: &[&PermissionRuleOption],
+        choice: &RowChoice,
+        covered: bool,
+    ) -> (String, Option<PermissionCaution>) {
+        match choice.rung.checked_sub(1) {
+            None if covered => (CHIP_COVERED.into(), None),
+            None => (CHIP_ONCE.into(), None),
+            Some(rung) if rung < offered.len() => (
+                offered[rung]
+                    .group
+                    .as_ref()
+                    .map_or_else(|| offered[rung].label.clone(), |group| group.value.clone()),
+                None,
+            ),
+            Some(_) => (
+                format!(
+                    "{}{WRITTEN_MARK}",
+                    escape_terminal_controls(choice.written.as_deref().unwrap_or_default())
+                ),
+                self.pattern_caution(row).unwrap_or_default(),
+            ),
+        }
+    }
+
+    /// How grave the pattern written for a row is, or `Err` when it is not one
+    /// this row can be granted with.
+    fn pattern_caution(&self, row: usize) -> Result<Option<PermissionCaution>, ()> {
+        self.written_grades()
+            .find(|(written, _)| *written == row)
+            .map_or(Ok(None), |(_, grade)| {
+                grade.map(|grade| grade.caution).map_err(|_| ())
+            })
+    }
+
+    /// What the editor says about what has been typed so far.
+    fn pattern_feedback(&self, row: usize) -> String {
+        let pattern = self.buffer.value();
+        let Some(command) = self
+            .current()
+            .and_then(|request| request.resources.get(row))
+        else {
+            return String::new();
+        };
+        match grade_command_pattern(pattern.trim(), &command.value) {
+            Err(fault) => fault.to_string(),
+            Ok(grade) => match grade.caution {
+                Some(PermissionCaution::Danger) => "every invocation of this program".to_owned(),
+                Some(PermissionCaution::Warn) => "overlaps an always-ask family".to_owned(),
+                None => "matches this command".to_owned(),
+            },
+        }
+    }
+
+    /// The authorities that speak for the whole request, one row each.
+    fn authority_lines(
+        &self,
+        request: &PermissionRequest,
+        lines: &mut Vec<Line<'static>>,
+        entries: &mut Vec<(String, u16)>,
+    ) {
+        let t = theme::current();
+        let label = t.tool_dim;
+        let value = Style::new().fg(t.foreground);
+        let safe = |text: &str| escape_terminal_controls(text);
+        {
+            for row in authority_rows(request, &self.selected_option) {
                 let Some(option) = request
                     .options
                     .iter()
@@ -910,6 +1383,14 @@ impl PermissionPrompt {
                 }
             }
         }
+    }
+
+    /// What every prompt ends with: the reassurance, and the confirmation
+    /// screen when one is open.
+    fn tail(&self, request: &PermissionRequest, body: PromptBody) -> PromptBody {
+        let PromptBody { mut lines, entries } = body;
+        let t = theme::current();
+        let safe = |text: &str| escape_terminal_controls(text);
         lines.extend([
             Line::default(),
             Line::from(Span::styled(
@@ -951,6 +1432,10 @@ impl PermissionPrompt {
                 FooterRow::Guidance,
                 FooterRow::Hints(vec![(HINT_ENTER, "Deny"), (HINT_ESC, "Back")]),
             ],
+            PromptState::PatternEditing => vec![FooterRow::Hints(vec![
+                (HINT_ENTER, "Use pattern"),
+                (HINT_ESC, "Back"),
+            ])],
             PromptState::ConfirmAllowAlwaysLocal
             | PromptState::ConfirmAllowAlwaysGlobal
             | PromptState::ConfirmAllowSession
@@ -1007,13 +1492,22 @@ impl PermissionPrompt {
                     (KEY_GUIDE_DENY, "Guidance"),
                     (KEY_DENY_LOCAL, "Deny project"),
                     (KEY_DENY_GLOBAL, "Deny global"),
-                    (HINT_SELECT, "Select"),
                 ]),
+                // Steering has a row of its own so the hints it grows in a
+                // per-command prompt cannot push the decision keys off the
+                // line they share.
+                FooterRow::Hints(vec![(HINT_SELECT, "Select")]),
             ]
         };
         let mut offered: HintPairs = Vec::new();
         if self.can_widen() {
-            offered.push((HINT_WIDEN, if narrow { "widen" } else { "Widen" }));
+            offered.push((HINT_WIDEN, if narrow { "scope" } else { "Scope" }));
+        }
+        // The pattern editor is a wide-terminal control: naming it in a narrow
+        // footer costs a row the decision keys need more.
+        if !narrow && self.command_row().is_some() {
+            offered.push((HINT_WIDEN_ALL, "Scope all"));
+            offered.push((HINT_ENTER, "Edit pattern"));
         }
         if scrolling {
             offered.push((HINT_PAGE, if narrow { "scroll" } else { "Scroll" }));
@@ -1024,10 +1518,20 @@ impl PermissionPrompt {
         rows
     }
 
-    /// Whether the selected authority is a ladder with another rung to take.
+    /// Whether the selected row is a ladder with another rung to take.
     fn can_widen(&self) -> bool {
-        self.selection()
-            .is_some_and(|(rows, current)| rows[current].rungs.len() > 1)
+        let Some(request) = self.current() else {
+            return false;
+        };
+        if let Some(row) = self.command_row() {
+            return self
+                .scopes
+                .get(row)
+                .is_some_and(|choice| choice.ladder_len(command_ladders(request)[row].len()) > 1);
+        }
+        authority_rows(request, &self.selected_option)
+            .iter()
+            .any(|row| row.rungs.contains(&self.selected_option) && row.rungs.len() > 1)
     }
 
     fn footer_lines(&self, width: u16, scrolling: bool) -> Vec<Line<'static>> {
@@ -1105,7 +1609,7 @@ impl PermissionPrompt {
             PromptState::ConfirmDenyAlwaysGlobal => {
                 Some("Deny this exact action, resources, and input globally.".into())
             }
-            PromptState::Normal | PromptState::DenyEditing => None,
+            PromptState::Normal | PromptState::DenyEditing | PromptState::PatternEditing => None,
         }
     }
 }
@@ -1829,6 +2333,230 @@ mod tests {
 
     /// Wide enough for the three-row footer and tall enough that nothing in
     /// the body is cut off, so hits are not lost to clipping.
+    const FIRST_COMMAND: &str = "git status --short";
+    const SECOND_COMMAND: &str = "cargo test";
+    const FIRST_ROW: &str = "command_0";
+    const SECOND_ROW: &str = "command_1";
+    const WORKDIR: &str = "/project";
+    const EXPECT_COMPOSED: &str = "a batched shell prompt answers per command";
+    const EXACT_CHIP: &str = "this command";
+    const PATTERN_CHIP: &str = "git status *";
+
+    fn prompt_with_commands() -> PermissionPrompt {
+        let mut prompt = PermissionPrompt::new();
+        prompt.enqueue(
+            Box::new(PermissionRequest::from_legacy(
+                "batch".into(),
+                ToolKey::native("bash"),
+                vec![FIRST_COMMAND.into(), SECOND_COMMAND.into()],
+                json!({"command": format!("{FIRST_COMMAND} && {SECOND_COMMAND}")}),
+                Path::new("/project"),
+                false,
+            )),
+            None,
+        );
+        prompt
+    }
+
+    /// The text of every row, keyed by the row it stands for.
+    fn rows_of(prompt: &PermissionPrompt) -> Vec<String> {
+        let body = prompt.body(prompt.current().unwrap());
+        body.entries
+            .iter()
+            .map(|(_, line)| {
+                body.lines[*line as usize]
+                    .spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    fn row_keys_of(prompt: &PermissionPrompt) -> Vec<String> {
+        prompt
+            .body(prompt.current().unwrap())
+            .entries
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    #[test]
+    fn each_command_is_a_row_carrying_the_authority_it_contributes() {
+        let prompt = prompt_with_commands();
+
+        assert_eq!(
+            row_keys_of(&prompt)[..2],
+            [FIRST_ROW.to_owned(), SECOND_ROW.to_owned()]
+        );
+        assert_eq!(
+            rows_of(&prompt)[..2],
+            [
+                format!("  > {FIRST_COMMAND} in {WORKDIR}{CHIP_ARROW}{EXACT_CHIP}{WIDEN_MARK}"),
+                format!("    {SECOND_COMMAND} in {WORKDIR}{CHIP_ARROW}{EXACT_CHIP}"),
+            ]
+        );
+    }
+
+    /// `<` and `>` are what keep the common answer two keystrokes however many
+    /// commands were batched.
+    #[test]
+    fn the_arrows_scope_one_row_and_the_angle_keys_scope_them_all() {
+        let mut prompt = prompt_with_commands();
+        prompt.handle_key(key(KeyCode::Right));
+
+        assert!(rows_of(&prompt)[0].contains(PATTERN_CHIP));
+        assert!(rows_of(&prompt)[1].contains(EXACT_CHIP));
+
+        prompt.handle_key(key(KeyCode::Char(KEY_WIDEN_ALL_IN)));
+        prompt.handle_key(key(KeyCode::Char(KEY_WIDEN_ALL_IN)));
+        assert!(
+            rows_of(&prompt)
+                .iter()
+                .take(2)
+                .all(|row| row.contains(CHIP_ONCE))
+        );
+
+        prompt.handle_key(key(KeyCode::Char(KEY_WIDEN_ALL_OUT)));
+        assert!(
+            rows_of(&prompt)
+                .iter()
+                .take(2)
+                .all(|row| row.contains(EXACT_CHIP))
+        );
+    }
+
+    /// Both ends hold: stepping off the narrowest rung must not wrap to the
+    /// widest, and stepping off the widest must not run the rung past the
+    /// ladder, which would make the next step back land on nothing.
+    #[test]
+    fn a_row_clamps_at_both_ends_of_its_ladder() {
+        let mut prompt = prompt_with_commands();
+        for _ in 0..3 {
+            prompt.handle_key(key(KeyCode::Left));
+        }
+
+        assert!(rows_of(&prompt)[0].contains(CHIP_ONCE));
+        assert_eq!(
+            prompt.allow_answer(PermissionLifetime::Conversation),
+            PermissionAnswer::AllowComposed {
+                rows: vec![
+                    None,
+                    Some(PermissionRowGrant::Offered("command_exact_1".into())),
+                ],
+                lifetime: PermissionLifetime::Conversation,
+            }
+        );
+
+        for _ in 0..4 {
+            prompt.handle_key(key(KeyCode::Right));
+        }
+        assert!(rows_of(&prompt)[0].contains(PATTERN_CHIP));
+
+        prompt.handle_key(key(KeyCode::Left));
+        assert!(rows_of(&prompt)[0].contains(EXACT_CHIP));
+    }
+
+    #[test]
+    fn the_answer_carries_the_choice_each_row_stands_on() {
+        let mut prompt = prompt_with_commands();
+        prompt.handle_key(key(KeyCode::Right));
+
+        assert_eq!(
+            prompt.allow_answer(PermissionLifetime::Project),
+            PermissionAnswer::AllowComposed {
+                rows: vec![
+                    Some(PermissionRowGrant::Offered("command_pattern_0".into())),
+                    Some(PermissionRowGrant::Offered("command_exact_1".into())),
+                ],
+                lifetime: PermissionLifetime::Project,
+            }
+        );
+    }
+
+    /// The two whole-request authorities `<` and `>` land on exactly are not
+    /// worth a row of their own once the rows exist.
+    #[test]
+    fn the_authorities_the_rows_reproduce_are_not_offered_again() {
+        let prompt = prompt_with_commands();
+        let keys = row_keys_of(&prompt);
+
+        assert!(
+            keys.contains(&"allow_exact".to_owned()),
+            "{EXPECT_COMPOSED}"
+        );
+        assert!(
+            COMPOSABLE_SHELL_OPTIONS
+                .iter()
+                .all(|id| !keys.contains(&(*id).to_owned()))
+        );
+    }
+
+    #[test]
+    fn a_written_pattern_becomes_the_widest_rung_of_its_row() {
+        let mut prompt = prompt_with_commands();
+        prompt.handle_key(key(KeyCode::Enter));
+        for _ in 0..FIRST_COMMAND.len() {
+            prompt.handle_key(key(KeyCode::Backspace));
+        }
+        for character in "git *".chars() {
+            prompt.handle_key(key(KeyCode::Char(character)));
+        }
+        prompt.handle_key(key(KeyCode::Enter));
+
+        assert_eq!(prompt.state, PromptState::Normal);
+        assert!(rows_of(&prompt)[0].contains(&format!("git *{WRITTEN_MARK}")));
+        assert_eq!(
+            prompt.allow_answer(PermissionLifetime::Conversation),
+            PermissionAnswer::AllowComposed {
+                rows: vec![
+                    Some(PermissionRowGrant::Written("git *".into())),
+                    Some(PermissionRowGrant::Offered("command_exact_1".into())),
+                ],
+                lifetime: PermissionLifetime::Conversation,
+            }
+        );
+    }
+
+    /// A pattern for another row's command would be authority laundered
+    /// through a prompt about something else, so the editor refuses it and
+    /// says why rather than silently doing nothing.
+    #[test]
+    fn a_pattern_that_misses_its_command_is_refused_with_the_reason() {
+        let mut prompt = prompt_with_commands();
+        prompt.handle_key(key(KeyCode::Enter));
+        for _ in 0..FIRST_COMMAND.len() {
+            prompt.handle_key(key(KeyCode::Backspace));
+        }
+        for character in "cargo *".chars() {
+            prompt.handle_key(key(KeyCode::Char(character)));
+        }
+        prompt.handle_key(key(KeyCode::Enter));
+
+        assert_eq!(prompt.state, PromptState::PatternEditing);
+        assert_eq!(
+            prompt.pattern_feedback(0),
+            PatternFault::DoesNotMatch.to_string()
+        );
+    }
+
+    /// A pattern naming one program is every invocation of it, so it costs the
+    /// same typed phrase as a blanket shell grant.
+    #[test]
+    fn a_pattern_over_a_whole_program_demands_the_typed_phrase() {
+        let mut prompt = prompt_with_commands();
+        prompt.scopes[0].written = Some("git *".into());
+        prompt.scopes[0].rung = 3;
+        prompt.handle_key(key(KeyCode::Char('s')));
+
+        assert_eq!(prompt.state, PromptState::ConfirmAllowSession);
+        assert_eq!(
+            prompt.confirmation_phrase(),
+            Some("ALLOW BROAD SHELL ACCESS")
+        );
+    }
+
     const ROOMY_WIDTH: u16 = 100;
     const ROOMY_HEIGHT: u16 = 60;
 
