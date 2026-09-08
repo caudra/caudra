@@ -27,6 +27,7 @@ Usage notes:
 - Use workdir instead of embedding cd commands. It must resolve inside the configured root and defaults to ".".
 - Only the initial working directory is root-confined. Execution is unsafe and unsandboxed: commands can mutate host files, access the network, and read inherited environment variables.
 - Prefer the dedicated file tools when they are available and fit the operation, and prefer the code execution tool for pure computation such as arithmetic, statistics, string processing, and JSON reshaping, because it runs isolated from the host.
+- To read part of a file, use file_read with offset and limit rather than sed, awk, head, or tail.
 - Always quote file paths that contain spaces.
 - Non-zero exits are completed results with an exit code so the caller can inspect and continue.
 - Output is streamed through MCP progress notifications; the final result contains bounded tails and completion accounting.
@@ -101,6 +102,10 @@ mod tests {
         assert!(description.contains("unsafe and unsandboxed"));
         // Cross-tool steering only works when both descriptions agree on the preference.
         assert!(description.contains("prefer the code execution tool for pure computation"));
+        // Naming the replacement is what displaces the paging shape a model reaches for by
+        // habit. "Prefer the dedicated file tools" alone is too abstract to compete with a
+        // remembered `sed -n '1,140p'`.
+        assert!(description.contains("use file_read with offset and limit"));
         // A caller that truncates before the server sees the output defeats the rule corpus, which
         // applies only to a single-program command, and suppresses live progress. The exemption for
         // rg and grep keeps this consistent with the filesystem catalog's guidance to search command
