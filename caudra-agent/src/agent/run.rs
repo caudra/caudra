@@ -29,9 +29,9 @@ use crate::context::{
     ContextCapture, ContextInventory, ContextPublisher, ContextReadiness, ContextSnapshot,
 };
 use crate::mcp::{McpRequestSnapshot, McpSession};
-use crate::tools::{DeferralSession, DeferredTool};
 use crate::permissions::PermissionManager;
 use crate::tools::{Deadline, FileReadTracker, LocalTools, PathLocks, ToolAudience, ToolContext};
+use crate::tools::{DeferralSession, DeferredTool};
 use crate::{
     AgentConfig, AgentError, AgentEvent, AgentInput, AgentMode, DoneReason, EventSender,
     ExtractedCommand, InterruptSource, QueueConsumedItem, SessionMailbox, SubagentHistoryStore,

@@ -2459,7 +2459,10 @@ mod tests {
     #[test]
     fn search_reports_no_match_without_loading() {
         let (_inner, handle) = setup(vec![fake_entry("srv", FakeTransport::new())]);
-        let result = handle.search_tools("nonexistent-capability").unwrap().message;
+        let result = handle
+            .search_tools("nonexistent-capability")
+            .unwrap()
+            .message;
         assert!(result.contains(SEARCH_NO_MATCH), "got: {result}");
         let mut tools = json!([]);
         handle.request_snapshot().extend_tools(&mut tools);

@@ -210,7 +210,9 @@ impl RosterStream {
     }
 
     fn accumulate(&mut self, c: char) {
-        if self.tracked && let Some(child) = self.children.last_mut() {
+        if self.tracked
+            && let Some(child) = self.children.last_mut()
+        {
             child.absorb(c);
         }
     }
@@ -219,7 +221,9 @@ impl RosterStream {
     /// whole, then the buffer goes.
     fn close(&mut self) {
         self.refresh();
-        if self.tracked && let Some(child) = self.children.last_mut() {
+        if self.tracked
+            && let Some(child) = self.children.last_mut()
+        {
             child.settle();
         }
         self.tracked = false;
@@ -382,7 +386,8 @@ mod tests {
 
     #[test]
     fn a_nested_parameters_object_is_previewed() {
-        let roster = roster(&[r#"{"tool_calls": [{"tool": "file_read", "parameters": {"filePath": "src/a"#]);
+        let roster =
+            roster(&[r#"{"tool_calls": [{"tool": "file_read", "parameters": {"filePath": "src/a"#]);
         assert_eq!(roster, [row(READ, "src/a")]);
     }
 
@@ -440,8 +445,9 @@ mod tests {
     #[test_case(r#""a}b""# ; "a_brace")]
     #[test_case(r#""tool_calls""# ; "the_list_key_itself")]
     fn a_string_value_does_not_break_element_boundaries(pattern: &str) {
-        let json =
-            format!(r#"{{"tool_calls": [{{"tool": "file_grep", "parameters": {{"pattern": {pattern}}}}}, {{"tool": "shell", "parameters": {{"command": "ls"#);
+        let json = format!(
+            r#"{{"tool_calls": [{{"tool": "file_grep", "parameters": {{"pattern": {pattern}}}}}, {{"tool": "shell", "parameters": {{"command": "ls"#
+        );
         let roster = roster(&[&json]);
         assert_eq!(roster.len(), 2, "{roster:?}");
         assert_eq!(roster[1], row(SHELL, "ls"));
@@ -500,7 +506,10 @@ mod tests {
         }
         let roster = roster(&[&json]);
         assert_eq!(roster.len(), MAX_BATCH_SIZE);
-        assert_eq!(roster[MAX_BATCH_SIZE - 1].1, format!("c{}", MAX_BATCH_SIZE - 1));
+        assert_eq!(
+            roster[MAX_BATCH_SIZE - 1].1,
+            format!("c{}", MAX_BATCH_SIZE - 1)
+        );
     }
 
     /// The walk that finds where an element ends has to keep running past the

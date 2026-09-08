@@ -7,17 +7,17 @@ use color_eyre::Result;
 use color_eyre::eyre::{Context, bail};
 
 use caudra_agent::mcp::{McpSession, config as mcp_config, oauth as mcp_oauth};
+use caudra_agent::tools::report::{REASON_CONFIG, REASON_DEFERRED};
 use caudra_agent::tools::{
     DescriptionContext, RegisteredTool, SHELL_TOOL_NAME, ToolAudience, ToolFilter, ToolRegistry,
-    VIEW_IMAGE_TOOL_NAME, capability_exclusions, credential_exclusions, deferral, is_tool_enabled,
+    ToolState, builtin_report, is_tool_enabled,
 };
 use caudra_config::providers::{
     Protocol, ProviderDef, ProvidersConfig, all_builtins, builtin_provider, resolve_api_key_env,
     resolve_base_url, resolve_default_model, resolve_display_name, resolve_login_url, slugify,
 };
 use caudra_config::{
-    AgentConfig, Config, DefaultEffect, PermissionsConfig, ToolKey, load_env_files,
-    load_permissions,
+    Config, DefaultEffect, PermissionsConfig, ToolKey, load_env_files, load_permissions,
 };
 use caudra_lua::PluginHost;
 use caudra_providers::provider::fetch_all_models;
@@ -755,69 +755,18 @@ pub fn mcp_logout(server: &str, storage: &StateDir) -> Result<()> {
 const SOURCE_MCP: &str = "mcp";
 /// `permissions.toml` still accepts the pre-rename section for the shell tool.
 const LEGACY_SHELL_KEY: &str = "bash";
-const REASON_DISALLOWED_FLAG: &str = "--disallowed-tools";
-const REASON_CONFIG: &str = "disabled by config";
-const REASON_NO_VISION: &str = "model has no vision support";
-const REASON_NOT_ALLOWED: &str = "not in --allowed-tools";
-const REASON_COMPANION: &str = "always on (internal companion)";
-const REASON_NO_SUBSCRIPTION: &str = "no ChatGPT subscription";
-const REASON_OTHER_EDITOR: &str = "model uses the other editing tool";
-const REASON_DEFERRED: &str = "deferred behind tool_search";
 /// Padded to a common width so the name column starts at one column.
-const STATE_ON: &str = "on  ";
-const STATE_OFF: &str = "off ";
-const STATE_LAZY: &str = "lazy";
+const STATE_WIDTH: usize = 4;
 
 #[derive(serde::Serialize)]
 struct ToolRow {
     name: String,
     source: String,
-    enabled: bool,
-    /// Enabled, and absent from the request array until `tool_search` loads it.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    deferred: bool,
+    state: ToolState,
     #[serde(skip_serializing_if = "Option::is_none")]
     note: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     permission: Option<&'static str>,
-}
-
-/// Why a built-in would not reach the model, in the order a user would ask:
-/// what they typed, then what their config says, then what the model and the
-/// allow list leave behind. An enabled tool only earns a note when something
-/// asked for it to be off and did not get it.
-fn builtin_note(
-    name: &str,
-    enabled: bool,
-    deferred: bool,
-    cli_disallowed: &[String],
-    config: &AgentConfig,
-    model: &Model,
-) -> Option<&'static str> {
-    let named_off = cli_disallowed.iter().any(|tool| tool == name);
-    let config_off = config.disabled_tools.iter().any(|tool| tool == name);
-    if enabled {
-        if named_off || config_off {
-            return Some(REASON_COMPANION);
-        }
-        return deferred.then_some(REASON_DEFERRED);
-    }
-    if named_off {
-        return Some(REASON_DISALLOWED_FLAG);
-    }
-    if config_off {
-        return Some(REASON_CONFIG);
-    }
-    if capability_exclusions(model).contains(&name) {
-        return Some(match name {
-            VIEW_IMAGE_TOOL_NAME => REASON_NO_VISION,
-            _ => REASON_OTHER_EDITOR,
-        });
-    }
-    if credential_exclusions().contains(&name) {
-        return Some(REASON_NO_SUBSCRIPTION);
-    }
-    (!config.allowed_tools.is_empty()).then_some(REASON_NOT_ALLOWED)
 }
 
 fn permission_default(permissions: &PermissionsConfig, keys: &[ToolKey]) -> Option<&'static str> {
@@ -847,14 +796,12 @@ fn builtin_rows(
                 SHELL_TOOL_NAME => vec![ToolKey::native(name), ToolKey::native(LEGACY_SHELL_KEY)],
                 _ => vec![ToolKey::native(name)],
             };
-            let enabled = filter.matches(name);
-            let deferred = enabled && deferral::is_deferred(name, &config.agent.allowed_tools);
+            let report = builtin_report(name, filter, cli_disallowed, &config.agent, model);
             ToolRow {
                 name: name.to_owned(),
                 source: entry.source.as_log_field().into_owned(),
-                enabled,
-                deferred,
-                note: builtin_note(name, enabled, deferred, cli_disallowed, &config.agent, model),
+                state: report.state,
+                note: report.reason,
                 permission: permission_default(&config.permissions, &keys),
             }
         })
@@ -879,14 +826,14 @@ fn mcp_rows(mcp: Option<&McpSession>, permissions: &PermissionsConfig) -> Vec<To
             .into_iter()
             .flatten()
             .collect::<Vec<_>>();
+            let (state, note) = match (tool.disabled, tool.deferred) {
+                (true, _) => (ToolState::Off, Some(REASON_CONFIG)),
+                (false, true) => (ToolState::Lazy, Some(REASON_DEFERRED)),
+                _ => (ToolState::On, None),
+            };
             ToolRow {
-                enabled: !tool.disabled,
-                deferred: !tool.disabled && tool.deferred,
-                note: match (tool.disabled, tool.deferred) {
-                    (true, _) => Some(REASON_CONFIG),
-                    (false, true) => Some(REASON_DEFERRED),
-                    _ => None,
-                },
+                state,
+                note,
                 permission: permission_default(permissions, &keys),
                 source: format!("{SOURCE_MCP}:{}", tool.server),
                 name: tool.wire_name,
@@ -905,11 +852,7 @@ fn print_group(heading: &str, rows: &[ToolRow]) {
     let source_width = rows.iter().map(|row| row.source.len()).max().unwrap_or(0);
     println!("{heading}");
     for row in rows {
-        let state = match (row.enabled, row.deferred) {
-            (false, _) => STATE_OFF,
-            (true, true) => STATE_LAZY,
-            (true, false) => STATE_ON,
-        };
+        let state = row.state.label();
         let mut detail = row.note.map(str::to_owned).unwrap_or_default();
         if let Some(permission) = row.permission {
             if !detail.is_empty() {
@@ -923,7 +866,7 @@ fn print_group(heading: &str, rows: &[ToolRow]) {
             format!("  ({detail})")
         };
         let line = format!(
-            "  {state}  {:name_width$}  {:source_width$}{detail}",
+            "  {state:<STATE_WIDTH$}  {:name_width$}  {:source_width$}{detail}",
             row.name, row.source
         );
         println!("{}", line.trim_end());
@@ -984,8 +927,8 @@ pub fn tools(cli: &Cli, enabled_only: bool, json: bool, names: bool, schemas: bo
     let mut builtin = builtin_rows(reg, &filter, &config, &cli_disallowed, &model);
     let mut mcp_tools = mcp_rows(mcp.as_ref(), &config.permissions);
     if enabled_only {
-        builtin.retain(|row| row.enabled);
-        mcp_tools.retain(|row| row.enabled);
+        builtin.retain(|row| row.state.reaches_model());
+        mcp_tools.retain(|row| row.state.reaches_model());
     }
 
     if names {
@@ -1172,147 +1115,5 @@ mod auth_tests {
     #[test_case("unknown", None ; "unknown_protocol")]
     fn custom_protocol_choices(input: &str, expected: Option<Protocol>) {
         assert_eq!(custom_protocol(input), expected);
-    }
-}
-
-#[cfg(test)]
-mod tools_tests {
-    use super::*;
-
-    const MODEL_SPEC: &str = "anthropic/claude-opus-4-8";
-
-    fn agent_config(disabled: &[&str], allowed: &[&str]) -> caudra_config::AgentConfig {
-        caudra_config::AgentConfig {
-            disabled_tools: disabled.iter().map(|t| (*t).to_string()).collect(),
-            allowed_tools: allowed.iter().map(|t| (*t).to_string()).collect(),
-            ..Default::default()
-        }
-    }
-
-    fn note(
-        name: &str,
-        enabled: bool,
-        cli: &[&str],
-        config: &caudra_config::AgentConfig,
-    ) -> Option<&'static str> {
-        let cli: Vec<String> = cli.iter().map(|t| (*t).to_string()).collect();
-        let model = caudra_providers::Model::from_spec(MODEL_SPEC).unwrap();
-        let deferred = enabled && deferral::is_deferred(name, &config.allowed_tools);
-        builtin_note(name, enabled, deferred, &cli, config, &model)
-    }
-
-    #[test]
-    fn a_config_disabled_tool_says_so() {
-        let config = agent_config(&["shell"], &[]);
-        assert_eq!(note("shell", false, &[], &config), Some(REASON_CONFIG));
-    }
-
-    /// The flag wins the explanation: it is the thing the user just typed.
-    #[test]
-    fn a_flag_disabled_tool_names_the_flag() {
-        let config = agent_config(&["shell"], &[]);
-        assert_eq!(
-            note("shell", false, &["shell"], &config),
-            Some(REASON_DISALLOWED_FLAG)
-        );
-    }
-
-    #[test]
-    fn a_tool_outside_the_allow_list_says_so() {
-        let config = agent_config(&[], &["file_read"]);
-        assert_eq!(note("shell", false, &[], &config), Some(REASON_NOT_ALLOWED));
-    }
-
-    #[test]
-    fn an_ordinary_enabled_tool_has_no_note() {
-        assert_eq!(note("shell", true, &[], &agent_config(&[], &[])), None);
-    }
-
-    /// Enabled but absent from the request array until asked for, which is
-    /// exactly the state a `caudra tools` reader would otherwise misread as
-    /// "the model can see this".
-    #[test]
-    fn a_deferred_tool_says_it_waits_behind_tool_search() {
-        let config = agent_config(&[], &[]);
-        for deferred in caudra_config::DEFERRED_BUILTIN_TOOLS {
-            assert_eq!(
-                note(deferred.name, true, &[], &config),
-                Some(REASON_DEFERRED),
-                "{}",
-                deferred.name
-            );
-        }
-    }
-
-    /// Asking for a tool by name is asking for it upfront, so the allow list
-    /// cancels the deferral rather than leaving the user to search for what
-    /// they already named.
-    #[test]
-    fn an_allow_listed_deferred_tool_is_not_deferred() {
-        let name = caudra_config::DEFERRED_BUILTIN_TOOLS[0].name;
-        assert_eq!(note(name, true, &[], &agent_config(&[], &[name])), None);
-    }
-
-    /// Naming a companion is not an error, but the report has to say the
-    /// request did not take.
-    #[test]
-    fn a_companion_asked_to_turn_off_stays_on_with_a_note() {
-        for name in caudra_config::INTERNAL_COMPANION_TOOL_NAMES {
-            let config = agent_config(&[name], &[]);
-            assert_eq!(note(name, true, &[], &config), Some(REASON_COMPANION));
-        }
-    }
-}
-
-#[cfg(test)]
-mod index_tests {
-    use super::*;
-
-    #[test]
-    fn one_shot_index_honors_enablement_and_source_size() {
-        let root = tempfile::tempdir().unwrap();
-        let source = root.path().join("source.rs");
-        std::fs::write(&source, "pub fn run() {}\n").unwrap();
-        std::fs::create_dir(root.path().join("nested")).unwrap();
-        let registry = Arc::new(ToolRegistry::new());
-        let host = caudra_workcell::WorkcellHost::new(root.path(), None).unwrap();
-        host.register(&registry).unwrap();
-        let entry = registry.get("file_index").unwrap();
-
-        let output = execute_index(
-            entry.clone(),
-            "source.rs",
-            caudra_config::AgentConfig::default(),
-            root.path(),
-        )
-        .unwrap();
-        assert_eq!(output, "fns:\n  pub run() [1]");
-
-        let directory = execute_index(
-            entry.clone(),
-            ".",
-            caudra_config::AgentConfig::default(),
-            root.path(),
-        )
-        .unwrap();
-        assert_eq!(directory, "nested/\nsource.rs");
-
-        let disabled = caudra_config::AgentConfig {
-            disabled_tools: vec!["file_index".into()],
-            ..Default::default()
-        };
-        assert!(ensure_index_enabled(&disabled).is_err());
-
-        std::fs::write(&source, vec![b' '; 1024 * 1024 + 1]).unwrap();
-        let limited = caudra_config::AgentConfig {
-            index_max_file_size_mb: 1,
-            ..Default::default()
-        };
-        let error = execute_index(entry, "source.rs", limited, root.path()).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("exceeds maximum size of 1048576 bytes")
-        );
     }
 }

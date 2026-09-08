@@ -13,11 +13,12 @@ pub mod interpreter_bridge;
 pub mod native;
 mod path_locks;
 pub mod registry;
+pub mod report;
 pub mod schema;
 
 pub use caudra_config::{
-    DEFERRED_BUILTIN_TOOLS, INTERNAL_COMPANION_TOOL_NAMES, all_builtin_tool_names,
-    is_builtin_tool, is_deferred_builtin, is_tool_enabled,
+    DEFERRED_BUILTIN_TOOLS, INTERNAL_COMPANION_TOOL_NAMES, all_builtin_tool_names, is_builtin_tool,
+    is_deferred_builtin, is_tool_enabled,
 };
 pub use deferral::{
     DeferralSession, DeferralSnapshot, DeferredTool, SearchOutcome, TOOL_SEARCH_TOOL_NAME,
@@ -29,6 +30,7 @@ pub use registry::{
     PermissionScopes, PlanModeAccess, RegisteredTool, RegistryError, Tool, ToolAudience,
     ToolDefinitions, ToolEffect, ToolExecResult, ToolInvocation, ToolRegistry, ToolSource,
 };
+pub use report::{ToolReport, ToolState, builtin_report};
 
 use std::collections::HashMap;
 use std::env;
@@ -923,7 +925,10 @@ mod tests {
         assert!(filter.matches(FILE_READ_TOOL_NAME));
         assert!(filter.matches(TOOL_OUTPUT_TOOL_NAME));
         assert!(!filter.matches(SHELL_TOOL_NAME));
-        assert!(is_tool_enabled(&config.disabled_tools, TOOL_OUTPUT_TOOL_NAME));
+        assert!(is_tool_enabled(
+            &config.disabled_tools,
+            TOOL_OUTPUT_TOOL_NAME
+        ));
     }
 
     #[test]

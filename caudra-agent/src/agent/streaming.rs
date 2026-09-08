@@ -633,7 +633,10 @@ mod tests {
         ]);
         assert_eq!(
             rosters,
-            [vec![READ.to_owned()], vec![READ.to_owned(), SHELL.to_owned()]]
+            [
+                vec![READ.to_owned()],
+                vec![READ.to_owned(), SHELL.to_owned()]
+            ]
         );
     }
 
@@ -648,15 +651,29 @@ mod tests {
                 r#", {"tool": "shell", "parameters": {"command": "ls"}}]}"#,
             ],
         );
-        assert_eq!(published, [batch::roster_header(1), batch::roster_header(2)]);
+        assert_eq!(
+            published,
+            [batch::roster_header(1), batch::roster_header(2)]
+        );
     }
 
     /// Only a batch has a roster, and nothing else may be mistaken for one.
     #[test]
     fn another_tools_arguments_publish_no_roster() {
-        let carried = deltas(SHELL, &[r#"{"command": "ls", "tool_calls": [{"tool": "x"}]}"#])
-            .into_iter()
-            .any(|event| matches!(event, AgentEvent::ToolInputDelta { roster: Some(_), .. }));
+        let carried = deltas(
+            SHELL,
+            &[r#"{"command": "ls", "tool_calls": [{"tool": "x"}]}"#],
+        )
+        .into_iter()
+        .any(|event| {
+            matches!(
+                event,
+                AgentEvent::ToolInputDelta {
+                    roster: Some(_),
+                    ..
+                }
+            )
+        });
         assert!(!carried);
     }
 

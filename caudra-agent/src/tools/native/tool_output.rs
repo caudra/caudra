@@ -128,8 +128,7 @@ impl Tool for ToolOutputTool {
             return Ok(Box::new(ReadCall {
                 output_id,
                 offset: offset.unwrap_or(DEFAULT_READ_OFFSET),
-                byte_offset: usize_field(&input, "byte_offset")
-                    .unwrap_or(DEFAULT_READ_BYTE_OFFSET),
+                byte_offset: usize_field(&input, "byte_offset").unwrap_or(DEFAULT_READ_BYTE_OFFSET),
                 limit: limit.unwrap_or(DEFAULT_READ_LIMIT).min(MAX_READ_LIMIT),
             }));
         };

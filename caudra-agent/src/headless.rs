@@ -1799,7 +1799,8 @@ mod tests {
     #[test_case(true,  true  ; "both share one catalog entry")]
     fn advertised_names_show_tool_search_not_deferred_tools(mcp: bool, builtin: bool) {
         let base = serde_json::json!([{"name": "read"}]);
-        let session = mcp.then(|| crate::mcp::stub_session(&[("srv.fetch_issue", "Fetch an issue")]));
+        let session =
+            mcp.then(|| crate::mcp::stub_session(&[("srv.fetch_issue", "Fetch an issue")]));
         let deferred = match builtin {
             true => vec![DeferredTool::new(
                 "code_map",

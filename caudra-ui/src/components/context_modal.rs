@@ -648,7 +648,10 @@ fn inventory_summary_lines(snapshot: &ContextSnapshot, theme: &Theme) -> Vec<Lin
         .count();
 
     let builtins = &snapshot.inventory.builtins;
-    let declared_builtins = builtins.tools.len().saturating_sub(builtins.deferred_count());
+    let declared_builtins = builtins
+        .tools
+        .len()
+        .saturating_sub(builtins.deferred_count());
     vec![
         inventory_summary_line(
             GridKind::SystemTools,
@@ -1048,10 +1051,9 @@ mod tests {
     use std::path::PathBuf;
 
     use caudra_agent::context::{
-        ContextBuiltinInventory, ContextBuiltinTool, ContextInventory, ContextMcpInventory, ContextMcpTool,
-        ContextMemoryFile,
-        ContextMemoryInventory, ContextModel, ContextProfile, ContextProfileInventory,
-        ContextSkill, ContextSkillInventory, ContextUsage, ContextWindow,
+        ContextBuiltinInventory, ContextBuiltinTool, ContextInventory, ContextMcpInventory,
+        ContextMcpTool, ContextMemoryFile, ContextMemoryInventory, ContextModel, ContextProfile,
+        ContextProfileInventory, ContextSkill, ContextSkillInventory, ContextUsage, ContextWindow,
     };
     use ratatui::backend::TestBackend;
     use ratatui::style::Modifier;

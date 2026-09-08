@@ -1306,7 +1306,10 @@ mod tests {
             )
             .await;
             assert!(done.is_error);
-            assert_eq!(done.output.as_text(), crate::tools::deferral::SEARCH_EMPTY_QUERY);
+            assert_eq!(
+                done.output.as_text(),
+                crate::tools::deferral::SEARCH_EMPTY_QUERY
+            );
         });
     }
 

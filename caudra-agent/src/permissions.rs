@@ -1508,15 +1508,12 @@ impl PermissionManager {
                     rule,
                 }),
         );
-        entries.extend(
-            self.plugin_rules
-                .snapshot()
-                .into_iter()
-                .map(|rule| EffectivePermissionRule {
-                    source: "trusted plugin",
-                    rule,
-                }),
-        );
+        entries.extend(self.plugin_rules.snapshot().into_iter().map(|rule| {
+            EffectivePermissionRule {
+                source: "trusted plugin",
+                rule,
+            }
+        }));
         entries
     }
 

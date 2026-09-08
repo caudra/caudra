@@ -51,8 +51,7 @@ pub fn deferred_names(allowed_tools: &[String]) -> Vec<&'static str> {
 }
 
 pub fn is_deferred(name: &str, allowed_tools: &[String]) -> bool {
-    caudra_config::is_deferred_builtin(name)
-        && !allowed_tools.iter().any(|allowed| allowed == name)
+    caudra_config::is_deferred_builtin(name) && !allowed_tools.iter().any(|allowed| allowed == name)
 }
 
 /// One deferred definition and the text a query is matched against.
@@ -80,10 +79,7 @@ impl DeferredTool {
     /// Members of the same group, plus the tool itself. An ungrouped tool
     /// loads alone.
     fn loads_with(&self, other: &Self) -> bool {
-        self.name == other.name
-            || self
-                .group
-                .is_some_and(|group| other.group == Some(group))
+        self.name == other.name || self.group.is_some_and(|group| other.group == Some(group))
     }
 }
 
@@ -189,7 +185,11 @@ impl DeferralSession {
                 (exact || score > 0).then_some((exact, score, tool))
             })
             .collect();
-        matches.sort_by(|a, b| (b.0, b.1).cmp(&(a.0, a.1)).then_with(|| a.2.name.cmp(&b.2.name)));
+        matches.sort_by(|a, b| {
+            (b.0, b.1)
+                .cmp(&(a.0, a.1))
+                .then_with(|| a.2.name.cmp(&b.2.name))
+        });
 
         let mut guard = self.lock_loaded();
         let loaded: Vec<Arc<str>> = matches
@@ -207,11 +207,7 @@ impl DeferralSession {
 
     /// Loading is per group, so the returned list is what the array gains,
     /// never a tool that was already declared.
-    fn load_group(
-        &self,
-        loaded: &mut HashSet<Arc<str>>,
-        hit: &DeferredTool,
-    ) -> Vec<Arc<str>> {
+    fn load_group(&self, loaded: &mut HashSet<Arc<str>>, hit: &DeferredTool) -> Vec<Arc<str>> {
         self.deferred
             .iter()
             .filter(|tool| hit.loads_with(tool))
@@ -437,7 +433,11 @@ mod tests {
         let outcome = session.search("quantum tunnelling").unwrap();
 
         assert!(outcome.loaded.is_empty());
-        assert!(outcome.message.contains(SEARCH_NO_MATCH), "{}", outcome.message);
+        assert!(
+            outcome.message.contains(SEARCH_NO_MATCH),
+            "{}",
+            outcome.message
+        );
     }
 
     #[test_case("" ; "blank")]
