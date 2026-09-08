@@ -538,6 +538,7 @@ impl ToolInvocation for MemoryCall {
             Some(PermissionScopes {
                 scopes: vec![scope.to_string_lossy().into_owned()],
                 force_prompt: false,
+                plan_scoped: false,
             })
         })
     }

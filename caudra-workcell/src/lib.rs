@@ -1632,6 +1632,7 @@ fn file_prepared(
             PermissionScopes {
                 scopes: permissions.scopes,
                 force_prompt: false,
+                plan_scoped: false,
             },
             permissions.resources,
             if mutation {
@@ -1663,6 +1664,7 @@ fn index_prepared(
             PermissionScopes {
                 scopes: permissions.scopes,
                 force_prompt: false,
+                plan_scoped: false,
             },
             permissions.resources,
             PermissionRisk::Low,
@@ -1688,6 +1690,7 @@ fn file_patch_prepared(
             PermissionScopes {
                 scopes: permissions.scopes,
                 force_prompt: false,
+                plan_scoped: false,
             },
             permissions.resources,
             if permissions.mutation_targets.is_empty() {
@@ -1731,6 +1734,7 @@ fn code_graph_prepared(
             PermissionScopes {
                 scopes: vec![scope],
                 force_prompt: false,
+                plan_scoped: false,
             },
             vec![filesystem_permission_resource(
                 PermissionResourceKind::Directory,
@@ -1885,6 +1889,7 @@ fn shell_prepared(
             PermissionScopes {
                 scopes,
                 force_prompt: false,
+                plan_scoped: false,
             },
             resources,
             if opaque {
@@ -3915,8 +3920,9 @@ mod tests {
 
     /// A grant wide enough to cover the command must not carry it while
     /// planning: an "allow always" answered in build mode would otherwise let a
-    /// plan run writes silently. Building runs it; planning forces the prompt,
-    /// and with no responder that means denied.
+    /// plan run writes silently. A configured allow is authority the plan never
+    /// asked for, so containment withholds it and the call has to ask. With no
+    /// responder, asking means denied.
     #[test_case(AgentMode::Build => false ; "building_uses_the_configured_allow")]
     #[test_case(AgentMode::Plan(PathBuf::from("plan.md")) => true ; "planning_forces_the_prompt_anyway")]
     fn a_configured_shell_allow_does_not_reach_a_plan(mode: AgentMode) -> bool {

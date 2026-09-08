@@ -279,22 +279,28 @@ pub enum PlanModeAccess {
     /// Inspected and found to have no effects, so planning may run it under the
     /// usual permission checks.
     ReadOnly,
-    /// Effects are possible but unproven. Planning may run it only through a
-    /// prompt the user answers every time.
+    /// Effects are possible but unproven. Planning may run it only under an
+    /// authority the plan itself asked for.
     Prompted,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct PermissionScopes {
     pub scopes: Vec<String>,
+    /// The call is unreviewable, so no rule may cover it and the user answers
+    /// every time.
     pub force_prompt: bool,
+    /// The call happens while a plan is being built. It is unreviewable in the
+    /// same way, except that an authority granted inside this conversation may
+    /// still cover it — and no wider authority may be minted from it.
+    pub plan_scoped: bool,
 }
 
 impl PermissionScopes {
     pub fn single(scope: String) -> Self {
         Self {
             scopes: vec![scope],
-            force_prompt: false,
+            ..Self::default()
         }
     }
 
@@ -302,6 +308,7 @@ impl PermissionScopes {
         Self {
             scopes: vec![scope],
             force_prompt: true,
+            ..Self::default()
         }
     }
 }

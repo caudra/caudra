@@ -287,6 +287,7 @@ impl ToolInvocation for SkillCall {
             PermissionScopes {
                 scopes,
                 force_prompt: false,
+                plan_scoped: false,
             },
         )))
     }

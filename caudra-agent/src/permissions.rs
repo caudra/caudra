@@ -1052,6 +1052,7 @@ impl PermissionManager {
         request: &PermissionRequest,
         structured_rules: &[StructuredPermissionRule],
         shell_policy_eligible: bool,
+        plan_scoped: bool,
     ) -> Result<RequestCoverage, CommandPolicyDecision> {
         let command_decisions = self.command_policy_decisions(request, shell_policy_eligible);
         if command_decisions
@@ -1098,7 +1099,10 @@ impl PermissionManager {
                     prompt_required[index] = true;
                     rule_ask[index] = true;
                 }
-                let mut covered = structured || legacy.allowed && !resource.requires_prompt;
+                // A configured allow is authority the plan never asked for, so
+                // containment withholds it the way it withholds a stored one.
+                let configured_allows = !plan_scoped && !resource.requires_prompt;
+                let mut covered = structured || legacy.allowed && configured_allows;
                 match command_decisions
                     .as_ref()
                     .and_then(|decisions| decisions.get(index))
@@ -1106,7 +1110,7 @@ impl PermissionManager {
                     .unwrap_or(CommandPolicyDecision::NoMatch)
                 {
                     CommandPolicyDecision::Allow => {
-                        covered |= !resource.requires_prompt;
+                        covered |= configured_allows;
                         covered
                     }
                     CommandPolicyDecision::Ask => {
@@ -1590,6 +1594,27 @@ impl PermissionManager {
         }
     }
 
+    /// The rules that may speak to a call, contained to the plan when one is
+    /// being built: an authority granted before the plan is not one the plan
+    /// asked for, so no persistent allow applies. Denials and asks are left
+    /// alone, because containment narrows and must never widen.
+    fn applicable_rules_within(
+        &self,
+        plan_scoped: bool,
+    ) -> Result<Vec<StructuredPermissionRule>, PermissionPolicyError> {
+        let mut rules = self.applicable_structured_rules()?;
+        if plan_scoped {
+            rules.retain(|rule| {
+                rule.effect != StructuredPermissionEffect::Allow
+                    || matches!(
+                        rule.lifetime,
+                        PermissionLifetime::Once | PermissionLifetime::Conversation
+                    )
+            });
+        }
+        Ok(rules)
+    }
+
     fn applicable_structured_rules(
         &self,
     ) -> Result<Vec<StructuredPermissionRule>, PermissionPolicyError> {
@@ -1834,6 +1859,10 @@ impl PermissionManager {
         intent: Option<&crate::tools::PermissionIntent>,
     ) -> Result<(), PermissionError> {
         let scope_refs: Vec<&str> = scopes.scopes.iter().map(|s| s.as_str()).collect();
+        // A plan-scoped call is unreviewable in the same way a forced prompt
+        // is, so it is built and presented the same way. The difference is what
+        // may settle it, which is decided against the rules, not here.
+        let unreviewed = scopes.force_prompt || scopes.plan_scoped;
         let (cwd, canonical_project) = {
             let project = self.project();
             (project.cwd.clone(), project.canonical_project.clone())
@@ -1913,8 +1942,7 @@ impl PermissionManager {
                 ),
             }
         };
-        let initial_request =
-            make_request(tool.clone(), scopes.scopes.clone(), scopes.force_prompt);
+        let initial_request = make_request(tool.clone(), scopes.scopes.clone(), unreviewed);
         let exact_plan_write = plan_path.is_some_and(|plan_path| {
             matches!(tool, ToolKey::Native(name) if FILE_WRITE_TOOLS.contains(&name.as_ref()))
                 && !initial_request.resources.is_empty()
@@ -1924,13 +1952,13 @@ impl PermissionManager {
                             == normalize_scope_path(&plan_path.display().to_string())
                 })
         });
-        let force_prompt = scopes.force_prompt
+        let force_prompt = unreviewed
             || (!exact_plan_write
                 && initial_request
                     .resources
                     .iter()
                     .any(|resource| resource.requires_prompt));
-        let full_request = if force_prompt == scopes.force_prompt {
+        let full_request = if force_prompt == unreviewed {
             initial_request
         } else {
             make_request(tool.clone(), scopes.scopes.clone(), force_prompt)
@@ -1942,10 +1970,12 @@ impl PermissionManager {
                 Some("tool permission intent did not identify any resources".into()),
             ));
         }
-        let structured_rules = self.applicable_structured_rules().map_err(|error| {
-            warn!(%error, "structured permission policy failed closed");
-            deny(DECISION_SOURCE_RULE, Some(error.to_string()))
-        })?;
+        let structured_rules =
+            self.applicable_rules_within(scopes.plan_scoped)
+                .map_err(|error| {
+                    warn!(%error, "structured permission policy failed closed");
+                    deny(DECISION_SOURCE_RULE, Some(error.to_string()))
+                })?;
         if structured_rules
             .iter()
             .any(|rule| permission_rule_intersects_request(rule, &full_request))
@@ -1953,7 +1983,12 @@ impl PermissionManager {
             return Err(deny(DECISION_SOURCE_RULE, None));
         }
         let full = self
-            .request_coverage(&full_request, &structured_rules, include_builtin_allows)
+            .request_coverage(
+                &full_request,
+                &structured_rules,
+                include_builtin_allows,
+                scopes.plan_scoped,
+            )
             .map_err(|_| deny(DECISION_SOURCE_RULE, None))?;
         let scope_decisions =
             self.scope_rule_decisions(tool, &scopes.scopes, include_builtin_allows, false);
@@ -2019,10 +2054,15 @@ impl PermissionManager {
         };
 
         let mut request = make_request(t2.clone(), s2.clone(), force_prompt);
-        let structured_rules = self.applicable_structured_rules().map_err(|error| {
-            warn!(%error, "structured permission policy failed closed");
-            deny(DECISION_SOURCE_RULE, Some(error.to_string()))
-        })?;
+        if scopes.plan_scoped {
+            contain_authority_to_the_plan(&mut request);
+        }
+        let structured_rules =
+            self.applicable_rules_within(scopes.plan_scoped)
+                .map_err(|error| {
+                    warn!(%error, "structured permission policy failed closed");
+                    deny(DECISION_SOURCE_RULE, Some(error.to_string()))
+                })?;
         if structured_rules
             .iter()
             .any(|rule| permission_rule_intersects_request(rule, &request))
@@ -2042,7 +2082,12 @@ impl PermissionManager {
             return Err(deny(DECISION_SOURCE_RULE, None));
         }
         let coverage = self
-            .request_coverage(&request, &structured_rules, include_builtin_allows)
+            .request_coverage(
+                &request,
+                &structured_rules,
+                include_builtin_allows,
+                scopes.plan_scoped,
+            )
             .map_err(|_| deny(DECISION_SOURCE_RULE, None))?;
         if !scopes.force_prompt
             && coverage.covered.iter().all(|covered| *covered)
@@ -2063,10 +2108,12 @@ impl PermissionManager {
         let (answer_tx, answer_rx) = flume::bounded(1);
         let (forcing_reason, uncovered, uncovered_count) = {
             let mut pending = self.pending();
-            let current_rules = self.applicable_structured_rules().map_err(|error| {
-                warn!(%error, "structured permission policy failed closed");
-                deny(DECISION_SOURCE_RULE, Some(error.to_string()))
-            })?;
+            let current_rules =
+                self.applicable_rules_within(scopes.plan_scoped)
+                    .map_err(|error| {
+                        warn!(%error, "structured permission policy failed closed");
+                        deny(DECISION_SOURCE_RULE, Some(error.to_string()))
+                    })?;
             if current_rules
                 .iter()
                 .any(|rule| permission_rule_intersects_request(rule, &request))
@@ -2086,7 +2133,12 @@ impl PermissionManager {
                 return Err(deny(DECISION_SOURCE_RULE, None));
             }
             let mut coverage = self
-                .request_coverage(&request, &current_rules, include_builtin_allows)
+                .request_coverage(
+                    &request,
+                    &current_rules,
+                    include_builtin_allows,
+                    scopes.plan_scoped,
+                )
                 .map_err(|_| deny(DECISION_SOURCE_RULE, None))?;
             if !scopes.force_prompt
                 && coverage.covered.iter().all(|covered| *covered)
@@ -2132,7 +2184,7 @@ impl PermissionManager {
                 prompt_forcing_reason(
                     &request,
                     &coverage.covered,
-                    scopes.force_prompt,
+                    unreviewed,
                     coverage.must_prompt
                         || current_scope_decisions
                             .iter()
@@ -2209,10 +2261,12 @@ impl PermissionManager {
             PendingDecision::MatchedRule => true,
         };
         if allow {
-            let current_rules = self.applicable_structured_rules().map_err(|error| {
-                warn!(%error, "structured permission policy failed closed");
-                deny(DECISION_SOURCE_RULE, Some(error.to_string()))
-            })?;
+            let current_rules =
+                self.applicable_rules_within(scopes.plan_scoped)
+                    .map_err(|error| {
+                        warn!(%error, "structured permission policy failed closed");
+                        deny(DECISION_SOURCE_RULE, Some(error.to_string()))
+                    })?;
             if current_rules
                 .iter()
                 .any(|rule| permission_rule_intersects_request(rule, &request))
@@ -2230,7 +2284,12 @@ impl PermissionManager {
             }
             if matches!(decision, PendingDecision::MatchedRule) {
                 let coverage = self
-                    .request_coverage(&request, &current_rules, include_builtin_allows)
+                    .request_coverage(
+                        &request,
+                        &current_rules,
+                        include_builtin_allows,
+                        scopes.plan_scoped,
+                    )
                     .map_err(|_| deny(DECISION_SOURCE_RULE, None))?;
                 if scopes.force_prompt
                     || coverage.must_prompt
@@ -2301,6 +2360,27 @@ fn answer_log_fields(answer: &PermissionAnswer) -> (&'static str, &str, &'static
         PermissionAnswer::DenyWithGuidance(_) => ("deny_guidance", "", ""),
         PermissionAnswer::DenyAlwaysLocal => ("deny_always_local", "", ""),
         PermissionAnswer::DenyAlwaysGlobal => ("deny_always_global", "", ""),
+    }
+}
+
+/// Withdraws the lifetimes that would outlive the plan being built.
+///
+/// `commit_structured_decision` validates an answer against the lifetimes the
+/// request carried, so withdrawing them here is what refuses a project or
+/// global answer from any client, not just from a prompt that hid the keys.
+/// Denials keep theirs: a plan may not widen authority, but narrowing it is
+/// always the user's to make.
+fn contain_authority_to_the_plan(request: &mut PermissionRequest) {
+    for option in &mut request.options {
+        if option.rule.effect != StructuredPermissionEffect::Allow {
+            continue;
+        }
+        option.allowed_lifetimes.retain(|lifetime| {
+            matches!(
+                lifetime,
+                PermissionLifetime::Once | PermissionLifetime::Conversation
+            )
+        });
     }
 }
 
@@ -2570,6 +2650,7 @@ mod tests {
             crate::tools::PermissionScopes {
                 scopes: commands.iter().map(|command| (*command).into()).collect(),
                 force_prompt: false,
+                plan_scoped: false,
             },
             commands
                 .iter()
@@ -2682,7 +2763,7 @@ mod tests {
         }
 
         manager
-            .request_coverage(&request, &builtin_structured_rules(), false)
+            .request_coverage(&request, &builtin_structured_rules(), false, false)
             .expect("nothing denies the command")
             .covered
     }
@@ -2743,7 +2824,7 @@ mod tests {
         mark_confined(&mut request);
 
         let coverage = manager
-            .request_coverage(&request, &builtin_structured_rules(), false)
+            .request_coverage(&request, &builtin_structured_rules(), false, false)
             .expect("nothing denies the command");
         assert_eq!(coverage.covered, vec![false]);
     }
@@ -2760,7 +2841,7 @@ mod tests {
         }
 
         let coverage = manager
-            .request_coverage(&request, &builtin_structured_rules(), false)
+            .request_coverage(&request, &builtin_structured_rules(), false, false)
             .expect("nothing denies the command");
         assert_eq!(coverage.covered, vec![false]);
     }
@@ -2849,7 +2930,7 @@ mod tests {
         let builtin_manager = mgr_with(PermissionsConfig::default(), PathBuf::from("/tmp"));
         let request = request("/bin/rm -rf build", "rm -rf build");
         let coverage = builtin_manager
-            .request_coverage(&request, &[], true)
+            .request_coverage(&request, &[], true, false)
             .unwrap();
         assert!(coverage.must_prompt);
         assert_eq!(coverage.prompt_required, vec![true]);
@@ -2890,7 +2971,9 @@ mod tests {
         let manager = mgr_with(PermissionsConfig::default(), cwd.clone());
         let request = project_read_request(&cwd, relative);
 
-        let coverage = manager.request_coverage(&request, &[], true).unwrap();
+        let coverage = manager
+            .request_coverage(&request, &[], true, false)
+            .unwrap();
         coverage.covered.iter().all(|covered| *covered) && !coverage.must_prompt
     }
 
@@ -2901,7 +2984,9 @@ mod tests {
             PathBuf::from("/tmp"),
         );
         let request = shell_request(&["rm build.log"], workcell_shell_subject());
-        let coverage = manager.request_coverage(&request, &[], true).unwrap();
+        let coverage = manager
+            .request_coverage(&request, &[], true, false)
+            .unwrap();
 
         assert_eq!(coverage.covered, vec![true]);
         assert!(!coverage.must_prompt);
@@ -2934,7 +3019,9 @@ mod tests {
             ],
         ] {
             let request = shell_request(&commands, workcell_shell_subject());
-            let coverage = manager.request_coverage(&request, &[], true).unwrap();
+            let coverage = manager
+                .request_coverage(&request, &[], true, false)
+                .unwrap();
             assert!(coverage.covered.iter().all(|covered| *covered));
             assert!(!coverage.must_prompt);
         }
@@ -3103,7 +3190,9 @@ mod tests {
         let allow = request
             .option_rule("allow_exact", PermissionLifetime::Conversation)
             .unwrap();
-        let coverage = manager.request_coverage(&request, &[allow], false).unwrap();
+        let coverage = manager
+            .request_coverage(&request, &[allow], false, false)
+            .unwrap();
         assert_eq!(coverage.covered, [true]);
         assert!(coverage.must_prompt);
         assert_eq!(coverage.prompt_required, [true]);
@@ -3338,6 +3427,7 @@ mod tests {
                         external.to_string_lossy().into_owned(),
                     ],
                     force_prompt: false,
+                    plan_scoped: false,
                 },
                 vec![project_resource, external_resource],
                 PermissionRisk::High,
@@ -3581,7 +3671,7 @@ mod tests {
             PathBuf::from("/tmp"),
         );
         let request = shell_request(&["echo hi"], workcell_shell_subject());
-        let coverage = manager.request_coverage(&request, &[], true);
+        let coverage = manager.request_coverage(&request, &[], true, false);
 
         match effect {
             Effect::Deny => assert!(coverage.is_err()),
@@ -3598,7 +3688,9 @@ mod tests {
     fn builtin_echo_allow_covers_only_the_literal_command_in_a_chain() {
         let manager = default_mgr();
         let request = shell_request(&["echo hi", "rm -rf build"], workcell_shell_subject());
-        let coverage = manager.request_coverage(&request, &[], true).unwrap();
+        let coverage = manager
+            .request_coverage(&request, &[], true, false)
+            .unwrap();
 
         assert_eq!(coverage.covered, vec![true, false]);
         assert!(coverage.must_prompt);
@@ -4845,13 +4937,18 @@ mod tests {
             .await
     }
 
-    async fn enforce_opaque_command_without_prompt(
-        manager: &PermissionManager,
-        workdir: &Path,
+    fn opaque_intent(
         command: &str,
-    ) -> Result<(), PermissionError> {
-        let intent = crate::tools::PermissionIntent::new(
-            crate::tools::PermissionScopes::single(command.to_owned()),
+        workdir: &Path,
+        plan_scoped: bool,
+    ) -> crate::tools::PermissionIntent {
+        let scopes = crate::tools::PermissionScopes {
+            scopes: vec![command.to_owned()],
+            force_prompt: false,
+            plan_scoped,
+        };
+        crate::tools::PermissionIntent::new(
+            scopes,
             vec![PermissionResource {
                 kind: PermissionResourceKind::Command,
                 value: command.into(),
@@ -4865,12 +4962,36 @@ mod tests {
             }],
             PermissionRisk::Critical,
         )
-        .with_authority(PermissionAuthorityProfile::Shell);
+        .with_authority(PermissionAuthorityProfile::Shell)
+    }
+
+    async fn enforce_opaque_command_without_prompt(
+        manager: &PermissionManager,
+        workdir: &Path,
+        command: &str,
+    ) -> Result<(), PermissionError> {
+        enforce_opaque_command_scoped(manager, workdir, command, false).await
+    }
+
+    async fn enforce_plan_command_without_prompt(
+        manager: &PermissionManager,
+        workdir: &Path,
+        command: &str,
+    ) -> Result<(), PermissionError> {
+        enforce_opaque_command_scoped(manager, workdir, command, true).await
+    }
+
+    async fn enforce_opaque_command_scoped(
+        manager: &PermissionManager,
+        workdir: &Path,
+        command: &str,
+        plan_scoped: bool,
+    ) -> Result<(), PermissionError> {
         let (event_tx, _event_rx) = flume::unbounded::<crate::Envelope>();
         manager
             .enforce_with_intent(
                 &ToolKey::native("bash"),
-                &intent,
+                &opaque_intent(command, workdir, plan_scoped),
                 &serde_json::json!({"command": command}),
                 &crate::EventSender::new(event_tx, 0),
                 None,
@@ -4881,6 +5002,209 @@ mod tests {
                 true,
             )
             .await
+    }
+
+    /// Answers one plan-scoped command prompt, reporting whether the answer was
+    /// accepted and what the request offered. A refused answer leaves the call
+    /// waiting, so it is always followed by one that ends it.
+    async fn answer_plan_command(
+        manager: Arc<PermissionManager>,
+        workdir: &Path,
+        command: &str,
+        answer: PermissionAnswer,
+    ) -> (bool, Result<(), PermissionError>, Box<PermissionRequest>) {
+        let intent = opaque_intent(command, workdir, true);
+        let input = serde_json::json!({ "command": command });
+        let (event_tx, event_rx) = flume::unbounded::<crate::Envelope>();
+        let (_legacy_tx, legacy_rx) = flume::unbounded();
+        let legacy_rx = Arc::new(async_lock::Mutex::new(legacy_rx));
+        let task = smol::spawn({
+            let manager = Arc::clone(&manager);
+            let input = input.clone();
+            async move {
+                manager
+                    .enforce_with_intent(
+                        &ToolKey::native("bash"),
+                        &intent,
+                        &input,
+                        &crate::EventSender::new(event_tx, 0),
+                        Some(&legacy_rx),
+                        PLAN_REQUEST_ID,
+                        &crate::CancelToken::none(),
+                        None,
+                        None,
+                        true,
+                    )
+                    .await
+            }
+        });
+        let AgentEvent::PermissionRequest(request) = event_rx.recv_async().await.unwrap().event
+        else {
+            panic!("{PLAN_PROMPT_MISSING}");
+        };
+        let accepted = manager.answer(PLAN_REQUEST_ID, answer);
+        if !accepted {
+            manager.answer(PLAN_REQUEST_ID, PermissionAnswer::Deny);
+        }
+        (accepted, task.await, request)
+    }
+
+    const PLAN_REQUEST_ID: &str = "plan-request";
+    const PLAN_PROMPT_MISSING: &str = "plan-scoped call did not raise a prompt";
+    const WORKDIR_OPTION: &str = "allow_commands_in_workdir";
+
+    fn workdir_grant(lifetime: PermissionLifetime) -> PermissionAnswer {
+        PermissionAnswer::AllowOption {
+            option_id: WORKDIR_OPTION.into(),
+            lifetime,
+        }
+    }
+
+    /// The point of plan containment: one approval while planning is enough to
+    /// keep exploring, so the model can run the scripts the plan needs.
+    #[test]
+    fn a_conversation_grant_covers_later_plan_scoped_commands() {
+        smol::block_on(async {
+            let temp = tempfile::tempdir().unwrap();
+            let project = temp.path().join("project");
+            std::fs::create_dir(&project).unwrap();
+            let manager =
+                persistent_manager(StateDir::from_path(temp.path().join("state")), &project);
+
+            assert!(
+                enforce_plan_command_without_prompt(&manager, &project, "cargo check > /tmp/out")
+                    .await
+                    .is_err()
+            );
+
+            let (accepted, granted, _) = answer_plan_command(
+                Arc::clone(&manager),
+                &project,
+                "cargo check",
+                workdir_grant(PermissionLifetime::Conversation),
+            )
+            .await;
+            assert!(accepted);
+            assert!(granted.is_ok());
+
+            assert!(
+                enforce_plan_command_without_prompt(&manager, &project, "python3 explore.py")
+                    .await
+                    .is_ok()
+            );
+        });
+    }
+
+    /// Containment cuts the other way too: authority the plan never asked for
+    /// does not apply to it, however durable that authority is.
+    #[test]
+    fn a_project_grant_does_not_cover_a_plan_scoped_command() {
+        smol::block_on(async {
+            let temp = tempfile::tempdir().unwrap();
+            let project = temp.path().join("project");
+            std::fs::create_dir(&project).unwrap();
+            let manager =
+                persistent_manager(StateDir::from_path(temp.path().join("state")), &project);
+            let command = "cargo check > /tmp/out";
+
+            answer_enforcement(
+                Arc::clone(&manager),
+                "cargo check",
+                serde_json::json!({"command": "cargo check"}),
+                workdir_grant(PermissionLifetime::Project),
+            )
+            .await
+            .unwrap();
+
+            assert!(
+                enforce_opaque_command_without_prompt(&manager, &project, command)
+                    .await
+                    .is_ok()
+            );
+            assert!(
+                enforce_plan_command_without_prompt(&manager, &project, command)
+                    .await
+                    .is_err()
+            );
+        });
+    }
+
+    #[test_case(PermissionLifetime::Project ; "project")]
+    #[test_case(PermissionLifetime::Global ; "global")]
+    fn a_plan_scoped_prompt_refuses_a_lifetime_that_outlives_the_plan(
+        lifetime: PermissionLifetime,
+    ) {
+        smol::block_on(async {
+            let temp = tempfile::tempdir().unwrap();
+            let project = temp.path().join("project");
+            std::fs::create_dir(&project).unwrap();
+            let manager =
+                persistent_manager(StateDir::from_path(temp.path().join("state")), &project);
+
+            let (accepted, _, request) = answer_plan_command(
+                Arc::clone(&manager),
+                &project,
+                "cargo check",
+                workdir_grant(lifetime),
+            )
+            .await;
+
+            assert!(!accepted);
+            let offered = request
+                .options
+                .iter()
+                .find(|option| option.id == WORKDIR_OPTION)
+                .expect("the workdir authority is offered");
+            assert_eq!(
+                offered.allowed_lifetimes,
+                vec![PermissionLifetime::Conversation]
+            );
+        });
+    }
+
+    /// Containment narrows. A deny is narrowing, so the plan still obeys it
+    /// even though the conversation grant would otherwise have covered it.
+    #[test]
+    fn a_project_deny_outranks_a_plan_scoped_conversation_grant() {
+        smol::block_on(async {
+            let temp = tempfile::tempdir().unwrap();
+            let project = temp.path().join("project");
+            std::fs::create_dir(&project).unwrap();
+            let manager =
+                persistent_manager(StateDir::from_path(temp.path().join("state")), &project);
+            let denied = "cargo check > /tmp/out";
+
+            let (denied_accepted, refused, _) = answer_plan_command(
+                Arc::clone(&manager),
+                &project,
+                denied,
+                PermissionAnswer::DenyAlwaysLocal,
+            )
+            .await;
+            assert!(denied_accepted);
+            assert!(refused.is_err());
+            let (accepted, _, _) = answer_plan_command(
+                Arc::clone(&manager),
+                &project,
+                "cargo check",
+                workdir_grant(PermissionLifetime::Conversation),
+            )
+            .await;
+            assert!(accepted);
+
+            // The grant is live for the workdir, and still cannot reach what
+            // the project denied.
+            assert!(
+                enforce_plan_command_without_prompt(&manager, &project, "python3 explore.py")
+                    .await
+                    .is_ok()
+            );
+            assert!(
+                enforce_plan_command_without_prompt(&manager, &project, denied)
+                    .await
+                    .is_err()
+            );
+        });
     }
 
     #[test]

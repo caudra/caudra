@@ -2084,6 +2084,7 @@ impl LuaRuntime {
         Some(PermissionScopes {
             scopes,
             force_prompt,
+            ..PermissionScopes::default()
         })
     }
 

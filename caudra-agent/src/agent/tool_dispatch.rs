@@ -257,13 +257,14 @@ async fn run_inner(
             warn!(tool = %name, "blocked tool in plan mode");
             return done_error(crate::tools::PLAN_WRITE_RESTRICTED.into());
         }
-        // A plan-mode grant must not outlive the plan, so an "allow always"
-        // answered while building cannot silently cover this call.
+        // A plan-mode grant must not outlive the plan, and no authority from
+        // before the plan may quietly cover this call. Both are containment,
+        // not a veto: an authority granted while planning still applies.
         if planning
             && plan_access == PlanModeAccess::Prompted
             && let Some(intent) = prepared_intent.as_mut()
         {
-            intent.scopes.force_prompt = true;
+            intent.scopes.plan_scoped = true;
         }
 
         let mutation_targets = invocation.mutation_targets(ctx);
