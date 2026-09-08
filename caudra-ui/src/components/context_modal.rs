@@ -1,5 +1,6 @@
 use caudra_agent::context::{
-    ContextMcpStatus, ContextProfileSource, ContextReadiness, ContextReserve, ContextSnapshot,
+    ContextBuiltinState, ContextMcpStatus, ContextProfileSource, ContextReadiness, ContextReserve,
+    ContextSnapshot,
 };
 use caudra_providers::{format_tokens, token_label};
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
@@ -296,6 +297,7 @@ fn build_lines_with_footer_hover(
     let mut lines = if let Some(snapshot) = snapshot {
         let mut lines = summary_lines(snapshot, width, theme);
         if expanded {
+            lines.extend(builtin_lines(snapshot, theme));
             lines.extend(mcp_lines(snapshot, theme));
             lines.extend(profile_lines(snapshot, theme));
             lines.extend(memory_lines(snapshot, theme));
@@ -645,7 +647,20 @@ fn inventory_summary_lines(snapshot: &ContextSnapshot, theme: &Theme) -> Vec<Lin
         .filter(|skill| skill.loaded_tokens > 0)
         .count();
 
+    let builtins = &snapshot.inventory.builtins;
+    let declared_builtins = builtins.tools.len().saturating_sub(builtins.deferred_count());
     vec![
+        inventory_summary_line(
+            GridKind::SystemTools,
+            format!(
+                "{} declared · {} on demand · {} in context · {} if loaded",
+                format_usize(declared_builtins),
+                format_usize(builtins.deferred_count()),
+                token_label(builtins.request_tokens()),
+                token_label(builtins.deferred_tokens())
+            ),
+            theme,
+        ),
         inventory_summary_line(
             GridKind::McpTools,
             format!(
@@ -719,17 +734,51 @@ fn mcp_status_counts(snapshot: &ContextSnapshot) -> (usize, usize, usize) {
         })
 }
 
-fn mcp_lines(snapshot: &ContextSnapshot, theme: &Theme) -> Vec<Line<'static>> {
-    let inventory = &snapshot.inventory.mcp;
+/// The catalog line lives here rather than under MCP because one
+/// `tool_search` entry stands in for the deferred built-ins and the deferred
+/// server tools together.
+fn builtin_lines(snapshot: &ContextSnapshot, theme: &Theme) -> Vec<Line<'static>> {
+    let inventory = &snapshot.inventory.builtins;
     let mut lines = vec![
         Line::default(),
-        section_line("MCP tools", theme),
+        section_line("Built-in tools", theme),
         labeled_line("In context", token_label(inventory.request_tokens()), theme),
         labeled_line(
             "Search catalog",
             token_label(inventory.catalog_tokens),
             theme,
         ),
+        labeled_line(
+            "On demand",
+            format!(
+                "{} tools · {} if loaded",
+                format_usize(inventory.deferred_count()),
+                token_label(inventory.deferred_tokens())
+            ),
+            theme,
+        ),
+    ];
+    for tool in &inventory.tools {
+        let (glyph, status, status_style) = match tool.state {
+            ContextBuiltinState::Declared => ("●", "declared", theme.tool_success),
+            ContextBuiltinState::Deferred => ("○", "on demand", theme.tool_dim),
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{glyph} "), status_style),
+            Span::styled(escape_terminal_controls(&tool.name), theme.tool_path),
+            Span::styled(format!("  {status} · "), status_style),
+            Span::raw(token_label(tool.tokens)),
+        ]));
+    }
+    lines
+}
+
+fn mcp_lines(snapshot: &ContextSnapshot, theme: &Theme) -> Vec<Line<'static>> {
+    let inventory = &snapshot.inventory.mcp;
+    let mut lines = vec![
+        Line::default(),
+        section_line("MCP tools", theme),
+        labeled_line("In context", token_label(inventory.request_tokens()), theme),
         labeled_line(
             "Unattributed",
             token_label(inventory.unattributed_tokens),
@@ -999,7 +1048,8 @@ mod tests {
     use std::path::PathBuf;
 
     use caudra_agent::context::{
-        ContextInventory, ContextMcpInventory, ContextMcpTool, ContextMemoryFile,
+        ContextBuiltinInventory, ContextBuiltinTool, ContextInventory, ContextMcpInventory, ContextMcpTool,
+        ContextMemoryFile,
         ContextMemoryInventory, ContextModel, ContextProfile, ContextProfileInventory,
         ContextSkill, ContextSkillInventory, ContextUsage, ContextWindow,
     };
@@ -1069,6 +1119,22 @@ mod tests {
                     definition_tokens: 25,
                     loaded_tokens: 45,
                 },
+                builtins: ContextBuiltinInventory {
+                    tools: vec![
+                        ContextBuiltinTool {
+                            name: "file_read".to_owned(),
+                            state: ContextBuiltinState::Declared,
+                            tokens: 55,
+                        },
+                        ContextBuiltinTool {
+                            name: "code_map".to_owned(),
+                            state: ContextBuiltinState::Deferred,
+                            tokens: 90,
+                        },
+                    ],
+                    catalog_tokens: 20,
+                    unattributed_tokens: 0,
+                },
                 mcp: ContextMcpInventory {
                     tools: vec![
                         ContextMcpTool {
@@ -1093,7 +1159,6 @@ mod tests {
                             request_tokens: 0,
                         },
                     ],
-                    catalog_tokens: 20,
                     unattributed_tokens: 0,
                 },
             },
@@ -1250,7 +1315,9 @@ mod tests {
             "· Free ~300 tokens (30.0%)",
             "░ Reserve 100 tokens (10.0%)",
             "Auto-compact  threshold 900 tokens (90.0%) · reserve 100 tokens (10.0%)",
-            "M MCP tools  3 tools · 1 loaded/eager · 1 on demand · 1 disabled · ~60 tokens in context",
+            "M MCP tools  3 tools · 1 loaded/eager · 1 on demand · 1 disabled · ~40 tokens in context",
+            "T System tools  1 declared · 1 on demand · ~75 tokens in context · ~90 tokens if loaded",
+            "code_map  on demand · ~90 tokens",
             "On-load bodies  ~120 tokens across 1 notes",
             "definitions ~25 tokens · loaded bodies ~45 tokens",
             "issues.fetch  loaded/eager · ~40 tokens",

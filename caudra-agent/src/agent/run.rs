@@ -552,6 +552,7 @@ impl<'h> Agent<'h> {
             &self.prompt_profiles,
             &task_profiles,
             self.active_prompt_profile_name.as_deref(),
+            self.deferral.definitions(),
             mcp,
         );
         publisher.publish(ContextSnapshot::capture(ContextCapture {

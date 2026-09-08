@@ -13,7 +13,7 @@ use crate::mcp::{McpRequestSnapshot, McpToolStatus};
 use crate::tools::TOOL_SEARCH_TOOL_NAME;
 use crate::prompt::profile::{BUILTIN_PROFILE_NAME, PromptProfileCatalog, TaskProfileBindings};
 use crate::tools::native::{memory, skill};
-use crate::tools::{MEMORY_TOOL_NAME, SKILL_TOOL_NAME, TASK_TOOL_NAME, ToolRegistry};
+use crate::tools::{DeferredTool, MEMORY_TOOL_NAME, SKILL_TOOL_NAME, TASK_TOOL_NAME, ToolRegistry};
 
 const MEMORY_READ_COMMAND: &str = "read";
 
@@ -278,7 +278,6 @@ pub struct ContextMcpTool {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ContextMcpInventory {
     pub tools: Vec<ContextMcpTool>,
-    pub catalog_tokens: u32,
     pub unattributed_tokens: u32,
 }
 
@@ -316,8 +315,65 @@ impl ContextMcpInventory {
         self.tools
             .iter()
             .map(|tool| tool.request_tokens)
-            .chain([self.catalog_tokens, self.unattributed_tokens])
+            .chain([self.unattributed_tokens])
             .fold(0, u32::saturating_add)
+    }
+}
+
+/// Whether a built-in reaches the model in this request. `Deferred` is not a
+/// weaker `Declared`: the definition is absent from the array, so its tokens
+/// are what a load would cost rather than what the request is paying.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ContextBuiltinState {
+    Declared,
+    Deferred,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextBuiltinTool {
+    pub name: String,
+    pub state: ContextBuiltinState,
+    pub tokens: u32,
+}
+
+/// `catalog_tokens` is the one `tool_search` entry. It stands in for the
+/// deferred built-ins and the deferred MCP tools together, so it belongs to
+/// neither inventory alone and is counted here.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContextBuiltinInventory {
+    pub tools: Vec<ContextBuiltinTool>,
+    pub catalog_tokens: u32,
+    /// What the array costs beyond the definitions it holds, so the section
+    /// reconciles with `ContextUsage::system_tools` exactly.
+    pub unattributed_tokens: u32,
+}
+
+impl ContextBuiltinInventory {
+    fn tokens_for(&self, state: ContextBuiltinState) -> u32 {
+        self.tools
+            .iter()
+            .filter(|tool| tool.state == state)
+            .map(|tool| tool.tokens)
+            .fold(0, u32::saturating_add)
+    }
+
+    /// What the declared built-ins cost this request, catalog included.
+    pub fn request_tokens(&self) -> u32 {
+        self.tokens_for(ContextBuiltinState::Declared)
+            .saturating_add(self.catalog_tokens)
+            .saturating_add(self.unattributed_tokens)
+    }
+
+    /// What loading every deferred built-in would add.
+    pub fn deferred_tokens(&self) -> u32 {
+        self.tokens_for(ContextBuiltinState::Deferred)
+    }
+
+    pub fn deferred_count(&self) -> usize {
+        self.tools
+            .iter()
+            .filter(|tool| tool.state == ContextBuiltinState::Deferred)
+            .count()
     }
 }
 
@@ -326,6 +382,7 @@ pub struct ContextInventory {
     pub profiles: ContextProfileInventory,
     pub memory: ContextMemoryInventory,
     pub skills: ContextSkillInventory,
+    pub builtins: ContextBuiltinInventory,
     pub mcp: ContextMcpInventory,
 }
 
@@ -336,6 +393,7 @@ impl ContextInventory {
         profiles: &PromptProfileCatalog,
         task_profiles: &TaskProfileBindings,
         active_profile: Option<&str>,
+        deferred: &[DeferredTool],
         mcp: Option<&McpRequestSnapshot>,
     ) -> Self {
         let available = task_profiles
@@ -401,6 +459,17 @@ impl ContextInventory {
             skills: ContextSkillInventory {
                 skills,
                 ..ContextSkillInventory::default()
+            },
+            builtins: ContextBuiltinInventory {
+                tools: deferred
+                    .iter()
+                    .map(|tool| ContextBuiltinTool {
+                        name: tool.name.to_string(),
+                        state: ContextBuiltinState::Deferred,
+                        tokens: value_tokens(&tool.definition),
+                    })
+                    .collect(),
+                ..ContextBuiltinInventory::default()
             },
             mcp,
         }
@@ -472,6 +541,8 @@ struct RequestAccounting {
     skill_definition_tokens: u32,
     skill_result_tokens: u32,
     skill_results: BTreeMap<String, u32>,
+    system_definitions: Vec<(String, u32)>,
+    system_unattributed: u32,
     mcp_definitions: Vec<(String, u32)>,
 }
 
@@ -482,6 +553,8 @@ struct ToolAccounting {
     profiles: u32,
     memory: u32,
     skills: u32,
+    system_definitions: Vec<(String, u32)>,
+    system_unattributed: u32,
     mcp_definitions: Vec<(String, u32)>,
 }
 
@@ -543,6 +616,8 @@ fn account_request(
         skill_definition_tokens: tools.skills,
         skill_result_tokens: messages.skills,
         skill_results: messages.skill_results,
+        system_definitions: tools.system_definitions,
+        system_unattributed: tools.system_unattributed,
         mcp_definitions: tools.mcp_definitions,
     }
 }
@@ -580,15 +655,17 @@ fn account_tools(base_tools: &Value, full_tools: &Value) -> ToolAccounting {
         .enumerate()
         .map(|(index, definition)| {
             let name = tool_name(definition).unwrap_or_default();
-            let category = if index >= base.len() {
-                ToolCategory::Mcp
-            } else {
-                match name {
-                    TASK_TOOL_NAME => ToolCategory::Profiles,
-                    MEMORY_TOOL_NAME => ToolCategory::Memory,
-                    SKILL_TOOL_NAME => ToolCategory::Skills,
-                    _ => ToolCategory::System,
-                }
+            let category = match name {
+                TASK_TOOL_NAME => ToolCategory::Profiles,
+                MEMORY_TOOL_NAME => ToolCategory::Memory,
+                SKILL_TOOL_NAME => ToolCategory::Skills,
+                _ if index < base.len() => ToolCategory::System,
+                // Past the base array a definition is either a deferred
+                // built-in the model loaded or the catalog standing in for the
+                // ones it did not, both of ours, or it came from a server.
+                TOOL_SEARCH_TOOL_NAME => ToolCategory::System,
+                _ if caudra_config::is_deferred_builtin(name) => ToolCategory::System,
+                _ => ToolCategory::Mcp,
             };
             ToolContribution {
                 name: name.to_owned(),
@@ -602,7 +679,12 @@ fn account_tools(base_tools: &Value, full_tools: &Value) -> ToolAccounting {
     let mut accounting = ToolAccounting::default();
     for contribution in contributions {
         match contribution.category {
-            ToolCategory::System => add_tokens(&mut accounting.system, contribution.tokens),
+            ToolCategory::System => {
+                add_tokens(&mut accounting.system, contribution.tokens);
+                accounting
+                    .system_definitions
+                    .push((contribution.name, contribution.tokens));
+            }
             ToolCategory::Mcp => {
                 add_tokens(&mut accounting.mcp, contribution.tokens);
                 accounting
@@ -620,10 +702,8 @@ fn account_tools(base_tools: &Value, full_tools: &Value) -> ToolAccounting {
         .saturating_add(accounting.profiles)
         .saturating_add(accounting.memory)
         .saturating_add(accounting.skills);
-    add_tokens(
-        &mut accounting.system,
-        full_tokens.saturating_sub(definitions),
-    );
+    accounting.system_unattributed = full_tokens.saturating_sub(definitions);
+    add_tokens(&mut accounting.system, accounting.system_unattributed);
     accounting
 }
 
@@ -716,27 +796,63 @@ impl ContextInventory {
                 .copied()
                 .unwrap_or_default();
         }
+        self.builtins.apply_request_tokens(
+            &accounting.system_definitions,
+            accounting.system_unattributed,
+        );
         self.mcp.apply_request_tokens(&accounting.mcp_definitions);
     }
 }
 
 impl ContextMcpInventory {
     fn apply_request_tokens(&mut self, definitions: &[(String, u32)]) {
-        self.catalog_tokens = 0;
         self.unattributed_tokens = 0;
         for tool in &mut self.tools {
             tool.request_tokens = 0;
         }
 
         for (name, tokens) in definitions {
-            if name == TOOL_SEARCH_TOOL_NAME {
-                add_tokens(&mut self.catalog_tokens, *tokens);
-            } else if let Some(tool) = self.tools.iter_mut().find(|tool| tool.wire_name == *name) {
+            if let Some(tool) = self.tools.iter_mut().find(|tool| tool.wire_name == *name) {
                 add_tokens(&mut tool.request_tokens, *tokens);
             } else {
                 add_tokens(&mut self.unattributed_tokens, *tokens);
             }
         }
+    }
+}
+
+impl ContextBuiltinInventory {
+    /// Seeded with every deferred definition, then corrected by the request:
+    /// a name the array actually carries is declared, whatever it started as,
+    /// and its tokens become the measured ones.
+    fn apply_request_tokens(&mut self, definitions: &[(String, u32)], unattributed: u32) {
+        self.catalog_tokens = 0;
+        self.unattributed_tokens = unattributed;
+        self.tools
+            .retain(|tool| tool.state == ContextBuiltinState::Deferred);
+
+        for (name, tokens) in definitions {
+            if name == TOOL_SEARCH_TOOL_NAME {
+                add_tokens(&mut self.catalog_tokens, *tokens);
+                continue;
+            }
+            match self.tools.iter_mut().find(|tool| tool.name == *name) {
+                Some(tool) => {
+                    tool.state = ContextBuiltinState::Declared;
+                    tool.tokens = *tokens;
+                }
+                None => self.tools.push(ContextBuiltinTool {
+                    name: name.clone(),
+                    state: ContextBuiltinState::Declared,
+                    tokens: *tokens,
+                }),
+            }
+        }
+        self.tools.sort_by(|left, right| {
+            left.state
+                .cmp(&right.state)
+                .then_with(|| left.name.cmp(&right.name))
+        });
     }
 }
 
@@ -943,6 +1059,7 @@ mod tests {
             &profiles,
             &task_profiles,
             active_profile,
+            &[],
             None,
         );
         let active = inventory
@@ -1044,9 +1161,29 @@ mod tests {
             value_tokens(&base_tools[3])
         );
         assert_eq!(
-            snapshot.usage.mcp_tools,
+            snapshot
+                .usage
+                .mcp_tools
+                .saturating_add(snapshot.inventory.builtins.catalog_tokens),
             value_tokens(&full_tools[4]).saturating_add(value_tokens(&full_tools[5]))
         );
+        assert!(
+            snapshot.inventory.builtins.catalog_tokens > 0,
+            "the shared catalog is ours, not a server's"
+        );
+        assert_eq!(
+            snapshot.inventory.builtins.request_tokens(),
+            snapshot.usage.system_tools
+        );
+        let declared = snapshot
+            .inventory
+            .builtins
+            .tools
+            .iter()
+            .find(|tool| tool.name == "file_read")
+            .expect("declared built-in is inventoried");
+        assert_eq!(declared.state, ContextBuiltinState::Declared);
+        assert!(declared.tokens > 0);
         assert_eq!(
             snapshot
                 .usage
@@ -1079,7 +1216,7 @@ mod tests {
             snapshot.usage.mcp_tools
         );
         assert_eq!(snapshot.inventory.mcp.unattributed_tokens, 0);
-        assert!(snapshot.inventory.mcp.catalog_tokens > 0);
+        assert!(snapshot.inventory.builtins.catalog_tokens > 0);
         let loaded = snapshot
             .inventory
             .mcp

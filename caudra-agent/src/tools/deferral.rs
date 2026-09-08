@@ -131,6 +131,12 @@ impl DeferralSession {
         self.deferred.is_empty()
     }
 
+    /// Every deferred definition, loaded or not, so a report can size what a
+    /// load would cost before the model spends it.
+    pub fn definitions(&self) -> &[DeferredTool] {
+        &self.deferred
+    }
+
     /// Snapshot for one request, taken while the loaded set is stable.
     pub fn request_snapshot(&self) -> DeferralSnapshot {
         DeferralSnapshot {

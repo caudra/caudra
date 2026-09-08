@@ -631,6 +631,7 @@ impl AgentLoop {
                     .as_deref()
                     .map_or(BUILTIN_PROFILE_NAME, SystemPromptProfile::name),
             ),
+            &self.deferred,
             mcp.as_ref(),
         );
         self.context_publisher
