@@ -199,7 +199,6 @@ index_keyword      = { fg = "accent" }
 shell_prefix       = { fg = "green", modifiers = ["bold"] }
 progress_bar       = { fg = "primary" }
 queue              = { fg = "secondary" }
-queue_delete       = { fg = "red", modifiers = ["bold"] }
 plan_path          = { fg = "primary", modifiers = ["bold"] }
 status_notice      = { fg = "orange" }
 status_retry_error = { fg = "red" }

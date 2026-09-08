@@ -555,7 +555,6 @@ pub struct Theme {
     pub status_retry_error: Style,
     pub status_retry_info: Style,
     pub input_placeholder: Style,
-    pub queue_delete: Style,
     pub timestamp: Style,
     pub spinner: Style,
     pub index_section: Style,
@@ -1085,7 +1084,6 @@ impl Theme {
             status_retry_error: style("status_retry_error"),
             status_retry_info: style("status_retry_info"),
             input_placeholder: style("input_placeholder"),
-            queue_delete: style("queue_delete"),
             timestamp: style("timestamp"),
             spinner: style("spinner"),
             index_section: derived_style(

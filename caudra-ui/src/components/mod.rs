@@ -27,6 +27,7 @@ pub(crate) mod plan_form;
 pub(crate) mod progress_bar;
 pub(crate) mod prompt_profile_picker;
 pub(crate) mod question_form;
+pub(crate) mod queue_actions;
 pub mod queue_panel;
 pub(crate) mod review;
 pub(crate) mod rewind_picker;

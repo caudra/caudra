@@ -136,6 +136,8 @@ Some pickers add extra bindings on top of the defaults:
 | Queue | `g` | Guide current run |
 | Queue | `n` | Move prompt to Up next |
 | Queue | `b` | Toggle send together |
+| Queue | `.` | Open item actions |
+| Queue | `r` | Replace current run |
 | Commands | `Tab` | Complete command |
 | Model Picker | `Tab` / `Shift+Tab` | Switch model purpose |
 | Model Picker | `R` | Reset model purpose |

@@ -191,13 +191,13 @@ impl App {
             self.plan_form.height().min(max_bottom)
         } else if self.is_main_chat() {
             let panel_h: u16 = self.float_mgr.panel_reqs().iter().map(|(_, h)| *h).sum();
-            queue_panel::height(self.queue.panel_len())
+            queue_panel::height(&self.queue.panel_entries())
                 + self.todo_panel.height()
                 + panel_h
                 + self.input_box.height(inner.width).min(max_bottom)
         } else {
             let panel_h: u16 = self.float_mgr.panel_reqs().iter().map(|(_, h)| *h).sum();
-            queue_panel::height(self.active_queue_entries().len())
+            queue_panel::height(&self.active_queue_entries())
                 + self.todo_panel.height()
                 + panel_h
                 + if self.active_subagent_can_steer() || self.queue_editor_active() {
@@ -222,9 +222,9 @@ impl App {
         let queue_height = if bottom_takeover {
             0
         } else if !self.is_main_chat() {
-            queue_panel::height(self.active_queue_entries().len())
+            queue_panel::height(&self.active_queue_entries())
         } else {
-            queue_panel::height(self.queue.panel_len())
+            queue_panel::height(&self.queue.panel_entries())
         };
 
         let todo_height = if bottom_takeover {
@@ -429,6 +429,7 @@ impl App {
         render_if_open!(self.command_modal);
         render_if_open!(self.rewind_picker);
         render_if_open!(self.message_actions);
+        render_if_open!(self.queue_actions);
         render_if_open!(self.review);
         render_if_open!(self.theme_picker);
         render_if_open!(self.prompt_profile_picker);

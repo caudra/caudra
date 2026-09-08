@@ -166,6 +166,14 @@ impl App {
             ) {
                 return actions;
             }
+        } else if self.queue_actions.is_open() {
+            if let Some(actions) = self.route_overlay_mouse(
+                event,
+                |app, event| app.queue_actions.handle_mouse(event),
+                |app, action| app.handle_queue_actions_action(action),
+            ) {
+                return actions;
+            }
         } else if self.review.is_open() {
             let action = self.review.handle_mouse(event);
             if !matches!(action, crate::components::review::ReviewAction::Passthrough) {
@@ -421,8 +429,7 @@ impl App {
                             && let Some(pressed) = self.queue_mouse_down.take()
                             && self.queue_hit_at(event.row, event.column) == Some(pressed)
                         {
-                            self.handle_queue_click(pressed);
-                            return Vec::new();
+                            return self.handle_queue_click(pressed);
                         }
                         if zone == SelectionZone::Messages {
                             let area = self.msg_area();
@@ -730,29 +737,17 @@ impl App {
         }
     }
 
-    fn handle_queue_click(&mut self, hit: QueueHit) {
+    fn handle_queue_click(&mut self, hit: QueueHit) -> Vec<crate::components::Action> {
         self.queue_hover = None;
         match hit.target {
             QueueHitTarget::ToggleTogether => self.toggle_active_queue_delivery(),
             QueueHitTarget::Item { .. } if self.queue_editor_active() => {}
             QueueHitTarget::Item { id, action } => match action {
                 QueueAction::Select => self.select_active_queue_item(id),
-                QueueAction::MoveUp => {
-                    self.move_active_queue_item(id, true);
-                }
-                QueueAction::MoveDown => {
-                    self.move_active_queue_item(id, false);
-                }
-                QueueAction::Edit => {
-                    self.select_active_queue_item(id);
-                    self.begin_queue_edit(id);
-                }
-                QueueAction::Delete => {
-                    self.delete_active_queue_item(id);
-                }
-                QueueAction::MoveMain => self.move_unsent_to_main(id),
+                QueueAction::Menu => self.open_queue_actions(id),
             },
         }
+        Vec::new()
     }
 
     /// A left press outside the overlay that owns the screen dismisses it, and
@@ -829,6 +824,7 @@ impl App {
         );
         dismiss!(self.rewind_picker);
         dismiss!(self.message_actions);
+        dismiss!(self.queue_actions);
         dismiss!(
             self.review,
             self.handle_review_action(crate::components::review::ReviewAction::Close)

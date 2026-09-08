@@ -18,6 +18,7 @@ use crate::theme;
 
 pub(crate) use crate::agent::shared_queue::QueuedMessage;
 
+pub(crate) const ALREADY_SENT_ERR: &str = "Queued message was already sent";
 pub(crate) const EMPTY_PROMPT_ERR: &str = "prompt is empty";
 pub(crate) const NO_QUEUE_ERR: &str = "session cannot queue messages";
 pub(crate) const REPLACE_BUSY_ERR: &str = "session is already stopping a run";
@@ -67,11 +68,12 @@ impl MessageQueue {
     }
 
     pub(crate) fn remove_id(&mut self, id: QueueItemId) -> bool {
-        let removed = self
-            .shared
-            .as_ref()
-            .is_some_and(|shared| shared.remove_id(id).is_some());
-        if removed {
+        self.take_id(id).is_some()
+    }
+
+    pub(crate) fn take_id(&mut self, id: QueueItemId) -> Option<QueueItem> {
+        let removed = self.shared.as_ref().and_then(|shared| shared.remove_id(id));
+        if removed.is_some() {
             self.clamp_focus();
         }
         removed
@@ -105,10 +107,6 @@ impl MessageQueue {
 
     pub(crate) fn unfocus(&mut self) {
         self.selected = None;
-    }
-
-    pub(crate) fn panel_len(&self) -> usize {
-        self.shared.as_ref().map_or(0, |s| s.panel_len())
     }
 
     pub(crate) fn panel_entries(&self) -> Vec<QueueEntry<'static>> {
@@ -186,13 +184,14 @@ impl MessageQueue {
 
     pub(crate) fn scroll(&mut self, delta: i32) {
         let max = self
-            .panel_len()
-            .saturating_sub(crate::components::queue_panel::max_visible_rows());
+            .panel_entries()
+            .len()
+            .saturating_sub(crate::components::queue_panel::max_visible_entries());
         self.viewport = self
             .viewport
             .saturating_add_signed(-delta as isize)
             .min(max);
-        let visible = crate::components::queue_panel::max_visible_rows();
+        let visible = crate::components::queue_panel::max_visible_entries();
         if let Some(index) = self.focus()
             && (index < self.viewport || index >= self.viewport + visible)
         {
@@ -215,14 +214,14 @@ impl MessageQueue {
         }
         let max = entries
             .len()
-            .saturating_sub(crate::components::queue_panel::max_visible_rows());
+            .saturating_sub(crate::components::queue_panel::max_visible_entries());
         self.viewport = self.viewport.min(max);
     }
 
     pub(crate) fn set_focus_at(&mut self, index: usize) {
         if let Some(id) = self.panel_entries().get(index).map(|entry| entry.id) {
             self.selected = Some(id);
-            let visible = crate::components::queue_panel::max_visible_rows();
+            let visible = crate::components::queue_panel::max_visible_entries();
             if index < self.viewport {
                 self.viewport = index;
             } else if index >= self.viewport + visible {
@@ -499,12 +498,12 @@ impl App {
         let max = self
             .active_queue_entries()
             .len()
-            .saturating_sub(crate::components::queue_panel::max_visible_rows());
+            .saturating_sub(crate::components::queue_panel::max_visible_entries());
         self.task_queue_viewport = self
             .task_queue_viewport
             .saturating_add_signed(-delta as isize)
             .min(max);
-        let visible = crate::components::queue_panel::max_visible_rows();
+        let visible = crate::components::queue_panel::max_visible_entries();
         if let Some(index) = self.active_queue_focus()
             && (index < self.task_queue_viewport || index >= self.task_queue_viewport + visible)
         {
@@ -547,11 +546,12 @@ impl App {
         if removed {
             if self.replacement_item == Some(id) {
                 self.replacement_item = None;
-                self.status = if self.cancelling_run.is_some() || self.queue.panel_len() > 0 {
-                    Status::Streaming
-                } else {
-                    Status::Idle
-                };
+                self.status =
+                    if self.cancelling_run.is_some() || !self.queue.panel_entries().is_empty() {
+                        Status::Streaming
+                    } else {
+                        Status::Idle
+                    };
             }
             self.clamp_active_queue_focus();
         }
@@ -559,31 +559,29 @@ impl App {
     }
 
     pub(super) fn delete_focused_queue_item(&mut self) {
-        if let Some(id) = self
-            .active_queue_entries()
-            .get(self.active_queue_focus().unwrap_or(0))
-        {
-            self.delete_active_queue_item(id.id);
+        if let Some(id) = self.focused_queue_entry().map(|entry| entry.id) {
+            self.delete_active_queue_item(id);
         }
     }
 
+    pub(super) fn focused_queue_entry(&self) -> Option<QueueEntry<'static>> {
+        self.active_queue_entries()
+            .into_iter()
+            .nth(self.active_queue_focus().unwrap_or(0))
+    }
+
     pub(super) fn set_focused_queue_admission(&mut self, admission: PromptAdmission) {
-        if !self.is_main_chat() {
+        if let Some(id) = self.focused_queue_entry().map(|entry| entry.id) {
+            self.set_queue_admission(id, admission);
+        }
+    }
+
+    /// Only the main queue has lanes to move between, and only a prompt that
+    /// is still waiting can change the one it waits in.
+    pub(super) fn set_queue_admission(&mut self, id: QueueItemId, admission: PromptAdmission) {
+        if !self.is_main_chat() || !self.is_lane_changeable(id) {
             return;
         }
-        let Some(id) = self
-            .active_queue_entries()
-            .get(self.active_queue_focus().unwrap_or(0))
-            .filter(|entry| {
-                matches!(
-                    entry.admission,
-                    Some(PromptAdmission::Queue | PromptAdmission::Steer)
-                )
-            })
-            .map(|entry| entry.id)
-        else {
-            return;
-        };
         if self.queue.set_admission(id, admission) {
             self.queue.select(id);
             self.flash(match admission {
@@ -591,6 +589,74 @@ impl App {
                 PromptAdmission::Steer => "Prompt will guide the current run".into(),
                 PromptAdmission::Interrupt => return,
             });
+        }
+    }
+
+    fn is_lane_changeable(&self, id: QueueItemId) -> bool {
+        self.active_queue_entries().iter().any(|entry| {
+            entry.id == id
+                && matches!(
+                    entry.admission,
+                    Some(PromptAdmission::Queue | PromptAdmission::Steer)
+                )
+        })
+    }
+
+    pub(super) fn open_focused_queue_actions(&mut self) {
+        if let Some(id) = self.focused_queue_entry().map(|entry| entry.id) {
+            self.open_queue_actions(id);
+        }
+    }
+
+    pub(super) fn open_queue_actions(&mut self, id: QueueItemId) {
+        let entries = self.active_queue_entries();
+        let Some(entry) = entries.iter().find(|entry| entry.id == id) else {
+            return;
+        };
+        let main_queue = self.is_main_chat();
+        self.select_active_queue_item(id);
+        self.queue_actions.open(entry, main_queue);
+    }
+
+    pub(super) fn replace_with_focused_queue_item(&mut self) -> Vec<Action> {
+        let Some(id) = self.focused_queue_entry().map(|entry| entry.id) else {
+            return Vec::new();
+        };
+        self.replace_with_queued_item(id)
+    }
+
+    /// Takes the prompt out of the queue and applies it through the shared
+    /// replacement path, so it cancels the running turn exactly the way a
+    /// freshly typed replacement does. A refusal puts it back where it was.
+    pub(super) fn replace_with_queued_item(&mut self, id: QueueItemId) -> Vec<Action> {
+        if !self.is_main_chat() || !self.is_lane_changeable(id) {
+            return Vec::new();
+        }
+        let Some(QueueItem::Message {
+            text,
+            paste_ranges,
+            input,
+            admission,
+            ..
+        }) = self.queue.take_id(id)
+        else {
+            self.flash(ALREADY_SENT_ERR.into());
+            return Vec::new();
+        };
+        let message = || QueuedMessage {
+            text: text.clone(),
+            images: input.images.clone(),
+            mentions: input.mentions.clone(),
+            paste_ranges: paste_ranges.clone(),
+        };
+        match self.submit_prompt_with_admission(message(), PromptAdmission::Interrupt) {
+            SubmitOutcome::Started(actions) | SubmitOutcome::Replacing(actions) => actions,
+            SubmitOutcome::Queued => Vec::new(),
+            SubmitOutcome::Rejected(error) => {
+                self.queue_with_admission(message(), admission);
+                self.flash(error.into());
+                Vec::new()
+            }
         }
     }
 
@@ -606,7 +672,7 @@ impl App {
         }
         let (target, input) = if self.is_main_chat() {
             let Some(input) = self.queue.begin_edit(id) else {
-                self.flash("Queued message was already sent".into());
+                self.flash(ALREADY_SENT_ERR.into());
                 self.clamp_active_queue_focus();
                 return;
             };
@@ -632,7 +698,7 @@ impl App {
                 && let Some(queue) = self.subagent_steers.get(&task_id)
                 && queue.begin_edit(id).is_none()
             {
-                self.flash("Queued message was already sent".into());
+                self.flash(ALREADY_SENT_ERR.into());
                 self.clamp_active_queue_focus();
                 return;
             }
@@ -703,7 +769,7 @@ impl App {
         };
         self.active_input_box_mut().set_state(editor.previous_input);
         if !saved {
-            self.flash("Queued message was already sent".into());
+            self.flash(ALREADY_SENT_ERR.into());
         }
         Vec::new()
     }
@@ -770,7 +836,7 @@ impl App {
     }
 
     fn ensure_task_queue_visible(&mut self, index: usize) {
-        let visible = crate::components::queue_panel::max_visible_rows();
+        let visible = crate::components::queue_panel::max_visible_entries();
         if index < self.task_queue_viewport {
             self.task_queue_viewport = index;
         } else if index >= self.task_queue_viewport + visible {
@@ -795,7 +861,7 @@ impl App {
         }
         let max = entries
             .len()
-            .saturating_sub(crate::components::queue_panel::max_visible_rows());
+            .saturating_sub(crate::components::queue_panel::max_visible_entries());
         self.task_queue_viewport = self.task_queue_viewport.min(max);
     }
 

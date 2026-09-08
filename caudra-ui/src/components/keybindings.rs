@@ -861,6 +861,18 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::All,
     },
     Keybind {
+        label: KeyLabel::Single("."),
+        description: "Open item actions",
+        context: KeybindContext::QueueFocus,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single("r"),
+        description: "Replace current run",
+        context: KeybindContext::QueueFocus,
+        platform: Platform::All,
+    },
+    Keybind {
         label: KeyLabel::Single("Tab"),
         description: "Complete command",
         context: KeybindContext::CommandPalette,

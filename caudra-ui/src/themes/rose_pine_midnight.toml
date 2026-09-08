@@ -153,7 +153,6 @@ status_notice      = { fg = "gold" }
 status_retry_error = { fg = "love" }
 status_retry_info  = { fg = "comment" }
 input_placeholder  = { fg = "comment" }
-queue_delete       = { fg = "love", modifiers = ["bold"] }
 timestamp          = { fg = "comment" }
 spinner            = { fg = "gold" }
 active             = { fg = "foam" }

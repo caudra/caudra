@@ -55,6 +55,7 @@ use crate::components::permissions_picker::{PermissionsPicker, PermissionsPicker
 use crate::components::plan_form::{PlanForm, PlanFormAction};
 use crate::components::prompt_profile_picker::{PromptProfilePicker, PromptProfilePickerAction};
 use crate::components::question_form::{QuestionForm, QuestionFormAction};
+use crate::components::queue_actions::{QueueActionKind, QueueActions, QueueActionsAction};
 use crate::components::queue_panel::{QueueHit, QueueHitTarget};
 use crate::components::review::{ReviewAction, ReviewModal};
 use crate::components::rewind_picker::{RewindPicker, RewindPickerAction};
@@ -89,8 +90,8 @@ use caudra_agent::prompt::profile::PromptProfileCatalog;
 use caudra_agent::snapshots::{SESSION_SNAPSHOTS_DIR, SnapshotError, SnapshotStore, workspace_key};
 use caudra_agent::{
     AgentEvent, AgentInput, AgentMode, Envelope, GoalVerdict, ImageSource, McpConfigErrors,
-    McpPromptInfo, McpSnapshotReader, Mention, QueueItemId, SharedHistory, SteeringQueue,
-    SubagentInfo,
+    McpPromptInfo, McpSnapshotReader, Mention, PromptAdmission, QueueItemId, SharedHistory,
+    SteeringQueue, SubagentInfo,
 };
 use caudra_config::{ModelPolicy, PermissionsConfig, UiConfig};
 use caudra_lua::{
@@ -273,6 +274,7 @@ pub struct App {
     pub(super) mcp_picker: McpPicker,
     pub(super) rewind_picker: RewindPicker,
     pub(super) message_actions: MessageActions,
+    pub(super) queue_actions: QueueActions,
     pub(super) review: ReviewModal,
     pub(super) help_modal: HelpModal,
     pub(super) which_key: WhichKey,
@@ -323,7 +325,7 @@ pub struct App {
     pub(super) queue_hover: Option<QueueHitTarget>,
     pub(super) admission_hits: Vec<AdmissionHit>,
     pub(super) admission_mouse_down: Option<AdmissionHit>,
-    pub(super) admission_hover: Option<caudra_agent::PromptAdmission>,
+    pub(super) admission_hover: Option<PromptAdmission>,
     /// Zero-sized whenever the task hint is not on screen, so the pointer
     /// cannot land on a hint that a higher-priority one replaced.
     pub(super) task_hint_hit: Rect,
@@ -471,6 +473,7 @@ impl App {
             mcp_picker: McpPicker::new(mcp_reader, mcp_config_errors),
             rewind_picker: RewindPicker::new(),
             message_actions: MessageActions::new(),
+            queue_actions: QueueActions::new(),
             review: ReviewModal::new(),
             help_modal: HelpModal::new(),
             which_key: WhichKey::new(ui_config.which_key_delay()),
@@ -1054,6 +1057,7 @@ impl App {
         try_picker!(self.login_picker);
         try_picker!(self.rewind_picker);
         try_picker!(self.message_actions);
+        try_picker!(self.queue_actions);
         try_picker!(self.review);
         try_picker!(self.model_picker);
         try_picker!(self.prompt_profile_picker);
@@ -1261,6 +1265,13 @@ impl App {
             return Some(self.handle_queue_editor_key(key));
         }
 
+        // Ahead of the focused queue itself: the menu is drawn over the panel
+        // it acts on, so it answers first.
+        if self.queue_actions.is_open() {
+            let action = self.queue_actions.handle_key(key);
+            return Some(self.handle_queue_actions_action(action));
+        }
+
         if self.active_queue_is_focused() {
             match key.code {
                 KeyCode::Up if key.modifiers == KeyModifiers::SHIFT => {
@@ -1296,13 +1307,19 @@ impl App {
                     }
                 }
                 KeyCode::Char('g') if key.modifiers.is_empty() => {
-                    self.set_focused_queue_admission(caudra_agent::PromptAdmission::Steer);
+                    self.set_focused_queue_admission(PromptAdmission::Steer);
                 }
                 KeyCode::Char('n') if key.modifiers.is_empty() => {
-                    self.set_focused_queue_admission(caudra_agent::PromptAdmission::Queue);
+                    self.set_focused_queue_admission(PromptAdmission::Queue);
                 }
                 KeyCode::Char('b') if key.modifiers.is_empty() => {
                     self.toggle_active_queue_delivery();
+                }
+                KeyCode::Char('.') if key.modifiers.is_empty() => {
+                    self.open_focused_queue_actions();
+                }
+                KeyCode::Char('r') if key.modifiers.is_empty() => {
+                    return Some(self.replace_with_focused_queue_item());
                 }
                 KeyCode::Esc => self.unfocus_active_queue(),
                 _ if key::QUIT.matches(key) => self.unfocus_active_queue(),
@@ -1551,6 +1568,32 @@ impl App {
                 Vec::new()
             }
         }
+    }
+
+    fn handle_queue_actions_action(&mut self, action: QueueActionsAction) -> Vec<Action> {
+        let QueueActionsAction::Select { id, kind } = action else {
+            return Vec::new();
+        };
+        match kind {
+            QueueActionKind::Edit => {
+                self.select_active_queue_item(id);
+                self.begin_queue_edit(id);
+            }
+            QueueActionKind::MoveUp => {
+                self.move_active_queue_item(id, true);
+            }
+            QueueActionKind::MoveDown => {
+                self.move_active_queue_item(id, false);
+            }
+            QueueActionKind::Guide => self.set_queue_admission(id, PromptAdmission::Steer),
+            QueueActionKind::Next => self.set_queue_admission(id, PromptAdmission::Queue),
+            QueueActionKind::Replace => return self.replace_with_queued_item(id),
+            QueueActionKind::MoveMain => self.move_unsent_to_main(id),
+            QueueActionKind::Delete => {
+                self.delete_active_queue_item(id);
+            }
+        }
+        Vec::new()
     }
 
     /// Compiled notes land in the prompt editor as a collapsed paste, so the
@@ -2020,11 +2063,8 @@ impl App {
         }
         if self.status == Status::Streaming {
             for (bind, admission) in [
-                (leader::STEER_PROMPT, caudra_agent::PromptAdmission::Steer),
-                (
-                    leader::INTERRUPT_PROMPT,
-                    caudra_agent::PromptAdmission::Interrupt,
-                ),
+                (leader::STEER_PROMPT, PromptAdmission::Steer),
+                (leader::INTERRUPT_PROMPT, PromptAdmission::Interrupt),
             ] {
                 if bind.matches(key) {
                     return self.handle_streaming_admission(admission);
@@ -2385,13 +2425,10 @@ impl App {
     }
 
     pub(crate) fn handle_submit(&mut self, sub: Submission) -> Vec<Action> {
-        self.handle_submit_with_admission(sub, caudra_agent::PromptAdmission::Queue)
+        self.handle_submit_with_admission(sub, PromptAdmission::Queue)
     }
 
-    fn handle_streaming_admission(
-        &mut self,
-        admission: caudra_agent::PromptAdmission,
-    ) -> Vec<Action> {
+    fn handle_streaming_admission(&mut self, admission: PromptAdmission) -> Vec<Action> {
         if !self.is_main_chat() || self.status != Status::Streaming || self.queue_editor_active() {
             return Vec::new();
         }
@@ -2399,7 +2436,7 @@ impl App {
             self.flash(queue::NO_QUEUE_ERR.into());
             return Vec::new();
         }
-        if admission == caudra_agent::PromptAdmission::Interrupt
+        if admission == PromptAdmission::Interrupt
             && self.cancelling_run.is_some()
             && self.replacement_item.is_none()
         {
@@ -2416,7 +2453,7 @@ impl App {
     fn handle_submit_with_admission(
         &mut self,
         sub: Submission,
-        admission: caudra_agent::PromptAdmission,
+        admission: PromptAdmission,
     ) -> Vec<Action> {
         match std::mem::take(&mut self.pending_input) {
             PendingInput::AuthRetry { waiters } => {
@@ -2700,11 +2737,12 @@ impl App {
             if cancelled_terminal {
                 let cancelled_error = matches!(&envelope.event, AgentEvent::Error { .. });
                 self.cancelling_run = None;
-                self.status = if self.replacement_item.is_some() || self.queue.panel_len() > 0 {
-                    Status::Streaming
-                } else {
-                    Status::Idle
-                };
+                self.status =
+                    if self.replacement_item.is_some() || !self.queue.panel_entries().is_empty() {
+                        Status::Streaming
+                    } else {
+                        Status::Idle
+                    };
                 if let Err(error) = self.snapshot_history_head() {
                     self.flash(format!("Failed to snapshot cancelled run: {error}"));
                 }
@@ -3574,7 +3612,7 @@ impl App {
         self.subagent_input_box.set_cwd(cwd);
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 28] {
+    fn overlays(&self) -> [&dyn Overlay; 29] {
         [
             &self.workbench,
             &self.help_modal,
@@ -3590,6 +3628,7 @@ impl App {
             &self.paste_editor,
             &self.rewind_picker,
             &self.message_actions,
+            &self.queue_actions,
             &self.review,
             &self.command_modal,
             &self.theme_picker,
@@ -3607,7 +3646,7 @@ impl App {
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 28] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 29] {
         [
             &mut self.workbench,
             &mut self.help_modal,
@@ -3623,6 +3662,7 @@ impl App {
             &mut self.paste_editor,
             &mut self.rewind_picker,
             &mut self.message_actions,
+            &mut self.queue_actions,
             &mut self.review,
             &mut self.command_modal,
             &mut self.theme_picker,
@@ -3999,6 +4039,7 @@ impl App {
         try_picker!(self.file_picker);
         try_picker!(self.rewind_picker);
         try_picker!(self.message_actions);
+        try_picker!(self.queue_actions);
         try_picker!(self.review);
         try_picker!(self.command_modal);
         try_picker!(self.theme_picker);

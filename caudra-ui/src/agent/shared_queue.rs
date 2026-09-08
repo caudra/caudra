@@ -430,14 +430,6 @@ impl QueueSender {
             .collect()
     }
 
-    pub(crate) fn panel_len(&self) -> usize {
-        self.queue
-            .entries(|_, item, _| item.visible_in_panel())
-            .into_iter()
-            .filter(|visible| *visible)
-            .count()
-    }
-
     pub(crate) fn panel_entries(&self) -> Vec<QueueEntry<'static>> {
         let mut entries = self
             .queue
@@ -675,9 +667,7 @@ mod tests {
     fn panel_visibility(item: QueueItem, visible: bool) {
         let (tx, _rx) = queue();
         tx.push(item);
-        let expected = usize::from(visible);
-        assert_eq!(tx.panel_len(), expected);
-        assert_eq!(tx.panel_entries().len(), expected);
+        assert_eq!(tx.panel_entries().len(), usize::from(visible));
     }
 
     #[test]

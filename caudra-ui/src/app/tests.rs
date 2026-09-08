@@ -9,7 +9,8 @@ use crate::components::context_modal::{
 };
 use crate::components::file_walk::UNREADABLE_DIR_MSG;
 use crate::components::keybindings::{Bind, KeybindContext, key as kb, leader as chord};
-use crate::components::queue_panel::{QueueAction, QueueHitTarget};
+use crate::components::queue_actions::QueueActionKind;
+use crate::components::queue_panel::{QueueAction, QueueHit, QueueHitTarget};
 use crate::components::rewind_picker::RewindEntry;
 use crate::components::status_bar::StatusBarHitTarget;
 use crate::components::usage_modal::SCOPE_KEY;
@@ -74,6 +75,13 @@ const MENTION_UNRESOLVED: &str = "a completed path must resolve to a mention";
 const MENTION_DROPPED_A_PASTE: &str =
     "completing a mention must splice a range, not replace the buffer";
 const OTHER_PROVIDER: &str = "openrouter";
+const QUEUE_MENU_MISSING: &str = "the three-dot affordance must open the queue menu";
+const QUEUE_MENU_ENTRY_MISSING: &str = "the queue menu did not offer the action under test";
+const QUEUE_ROW_MISSING: &str = "the queue panel drew no row";
+const QUEUE_TEXT_OFFSET: u16 = 2;
+/// Six content rows plus the header and the trailing edge.
+const QUEUE_PANEL_MAX_HEIGHT: u16 = 8;
+const REPLACEMENT_PROMPT: &str = "replace the running turn";
 const LEDGER_PROVIDER: &str = "anthropic";
 const LEDGER_MODEL: &str = "claude-opus-5";
 const LEDGER_CWD: &str = "/home/dev/caudra";
@@ -3739,6 +3747,53 @@ fn click_queue_action(app: &mut App, action: QueueAction) {
     ));
 }
 
+fn queue_select_hit(app: &mut App) -> QueueHit {
+    let _ = rendered(app);
+    app.queue_hits
+        .iter()
+        .find(|hit| {
+            matches!(
+                hit.target,
+                QueueHitTarget::Item {
+                    action: QueueAction::Select,
+                    ..
+                }
+            )
+        })
+        .copied()
+        .expect(QUEUE_ROW_MISSING)
+}
+
+/// A column the affordance does not claim, so a press there is about the row.
+fn queue_row_column(hit: QueueHit) -> u16 {
+    hit.area.x + QUEUE_TEXT_OFFSET
+}
+
+fn open_queue_menu(app: &mut App) {
+    click_queue_action(app, QueueAction::Menu);
+    assert!(app.queue_actions.is_open(), "{QUEUE_MENU_MISSING}");
+}
+
+/// Walks the menu to `kind` rather than assuming a row, so a menu that offers
+/// fewer entries for a less capable item still drives the same action.
+fn pick_queue_action(app: &mut App, kind: QueueActionKind) -> Vec<Action> {
+    let index = app
+        .queue_actions
+        .kinds()
+        .iter()
+        .position(|offered| *offered == kind)
+        .expect(QUEUE_MENU_ENTRY_MISSING);
+    for _ in 0..index {
+        app.update(Msg::Key(key(KeyCode::Down)));
+    }
+    app.update(Msg::Key(key(KeyCode::Enter)))
+}
+
+fn queue_menu_action(app: &mut App, kind: QueueActionKind) -> Vec<Action> {
+    open_queue_menu(app);
+    pick_queue_action(app, kind)
+}
+
 fn click_queue_delivery_toggle(app: &mut App) {
     let _ = rendered(app);
     let hit = app
@@ -4851,7 +4906,7 @@ fn mouse_selects_and_edits_queue_without_losing_composer_draft() {
     click_queue_action(&mut app, QueueAction::Select);
     assert_eq!(app.queue.focus(), Some(0));
 
-    click_queue_action(&mut app, QueueAction::Edit);
+    queue_menu_action(&mut app, QueueActionKind::Edit);
     assert!(app.queue_editor_active());
     assert_eq!(app.input_box.buffer.value(), "queued");
 
@@ -4868,19 +4923,19 @@ fn mouse_delete_is_explicit_and_atomic() {
 
     click_queue_action(&mut app, QueueAction::Select);
     assert_eq!(app.queue.len(), 1, "selection is not destructive");
-    click_queue_action(&mut app, QueueAction::Delete);
+    queue_menu_action(&mut app, QueueActionKind::Delete);
 
     assert!(app.queue.is_empty());
     assert!(app.queue.focus().is_none());
 }
 
 #[test]
-fn mouse_arrows_reorder_selected_queue_item() {
+fn menu_reorders_selected_queue_item() {
     let mut app = app_with_queued_message();
     app.queue_and_notify(queued_msg("second"));
     click_queue_action(&mut app, QueueAction::Select);
 
-    click_queue_action(&mut app, QueueAction::MoveDown);
+    queue_menu_action(&mut app, QueueActionKind::MoveDown);
 
     assert_eq!(
         app.queue
@@ -4894,25 +4949,124 @@ fn mouse_arrows_reorder_selected_queue_item() {
 }
 
 #[test]
+fn dot_opens_the_menu_for_the_focused_queue_item() {
+    let mut app = app_with_queued_message();
+    app.queue.set_focus_at(0);
+
+    app.update(Msg::Key(key(KeyCode::Char('.'))));
+
+    assert!(app.queue_actions.is_open(), "{QUEUE_MENU_MISSING}");
+    assert_eq!(
+        app.queue_actions.kinds(),
+        [
+            QueueActionKind::Edit,
+            QueueActionKind::Guide,
+            QueueActionKind::Replace,
+            QueueActionKind::Delete,
+        ]
+    );
+}
+
+#[test_case(QueueActionKind::Guide, caudra_agent::PromptAdmission::Steer ; "queued_prompt_moves_to_guide")]
+#[test_case(QueueActionKind::Next, caudra_agent::PromptAdmission::Queue ; "guidance_moves_to_up_next")]
+fn menu_moves_a_prompt_between_lanes(
+    kind: QueueActionKind,
+    expected: caudra_agent::PromptAdmission,
+) {
+    let mut app = app_with_queued_message();
+    if kind == QueueActionKind::Next {
+        let id = app.queue.panel_entries()[0].id;
+        app.set_queue_admission(id, caudra_agent::PromptAdmission::Steer);
+    }
+    click_queue_action(&mut app, QueueAction::Select);
+
+    queue_menu_action(&mut app, kind);
+
+    assert_eq!(app.queue.pending_prompts()[0].admission, expected);
+}
+
+#[test]
+fn menu_replace_takes_the_prompt_out_of_the_queue_and_cancels_the_run() {
+    let mut app = test_app();
+    type_and_submit(&mut app, "first");
+    let (sender, receiver) = shared_queue::queue();
+    app.queue.set_shared(sender);
+    receiver.set_active_run(1);
+    app.queue_and_notify(queued_msg(REPLACEMENT_PROMPT));
+    click_queue_action(&mut app, QueueAction::Select);
+
+    let actions = queue_menu_action(&mut app, QueueActionKind::Replace);
+
+    assert!(matches!(
+        actions.as_slice(),
+        [Action::CancelAgent { run_id: 1 }]
+    ));
+    assert_eq!(app.run_id, 2);
+    assert_eq!(
+        app.queue
+            .pending_prompts()
+            .into_iter()
+            .map(|prompt| (prompt.text, prompt.admission))
+            .collect::<Vec<_>>(),
+        [(
+            REPLACEMENT_PROMPT.to_owned(),
+            caudra_agent::PromptAdmission::Interrupt
+        )]
+    );
+}
+
+#[test]
+fn rejected_menu_replace_returns_the_prompt_to_its_lane() {
+    let mut app = app_with_queued_message();
+    app.cancelling_run = Some(1);
+    click_queue_action(&mut app, QueueAction::Select);
+
+    let actions = queue_menu_action(&mut app, QueueActionKind::Replace);
+
+    assert!(actions.is_empty());
+    assert_eq!(app.status_bar.flash_text(), Some(queue::REPLACE_BUSY_ERR));
+    assert_eq!(
+        app.queue
+            .pending_prompts()
+            .into_iter()
+            .map(|prompt| (prompt.text, prompt.admission))
+            .collect::<Vec<_>>(),
+        [("queued".to_owned(), caudra_agent::PromptAdmission::Queue)]
+    );
+}
+
+#[test]
+fn r_replaces_the_focused_queue_item() {
+    let mut app = test_app();
+    type_and_submit(&mut app, "first");
+    let (sender, receiver) = shared_queue::queue();
+    app.queue.set_shared(sender);
+    receiver.set_active_run(1);
+    app.queue_and_notify(queued_msg(REPLACEMENT_PROMPT));
+    app.queue.set_focus_at(0);
+
+    let actions = app.update(Msg::Key(key(KeyCode::Char('r'))));
+
+    assert!(matches!(
+        actions.as_slice(),
+        [Action::CancelAgent { run_id: 1 }]
+    ));
+    assert_eq!(
+        app.queue.pending_prompts()[0].admission,
+        caudra_agent::PromptAdmission::Interrupt
+    );
+}
+
+#[test]
 fn hovering_queue_row_tracks_exact_target() {
     let mut app = app_with_queued_message();
-    let _ = rendered(&mut app);
-    let hit = app
-        .queue_hits
-        .iter()
-        .find(|hit| {
-            matches!(
-                hit.target,
-                QueueHitTarget::Item {
-                    action: QueueAction::Select,
-                    ..
-                }
-            )
-        })
-        .copied()
-        .unwrap();
+    let hit = queue_select_hit(&mut app);
 
-    app.update(mouse_event(MouseEventKind::Moved, hit.area.x, hit.area.y));
+    app.update(mouse_event(
+        MouseEventKind::Moved,
+        queue_row_column(hit),
+        hit.area.y,
+    ));
 
     assert_eq!(app.queue_hover, Some(hit.target));
     assert_eq!(app.status_hover, None);
@@ -4921,32 +5075,18 @@ fn hovering_queue_row_tracks_exact_target() {
 #[test]
 fn dragging_cancels_pending_queue_activation_immediately() {
     let mut app = app_with_queued_message();
-    let _ = rendered(&mut app);
-    let hit = app
-        .queue_hits
-        .iter()
-        .find(|hit| {
-            matches!(
-                hit.target,
-                QueueHitTarget::Item {
-                    action: QueueAction::Select,
-                    ..
-                }
-            )
-        })
-        .copied()
-        .unwrap();
+    let hit = queue_select_hit(&mut app);
 
     app.update(mouse_event(
         MouseEventKind::Down(MouseButton::Left),
-        hit.area.x,
+        queue_row_column(hit),
         hit.area.y,
     ));
     assert_eq!(app.queue_mouse_down, Some(hit));
 
     app.update(mouse_event(
         MouseEventKind::Drag(MouseButton::Left),
-        hit.area.x.saturating_add(1),
+        queue_row_column(hit).saturating_add(1),
         hit.area.y,
     ));
 
@@ -4957,23 +5097,9 @@ fn dragging_cancels_pending_queue_activation_immediately() {
 #[test]
 fn dragging_queue_text_does_not_select_or_delete_item() {
     let mut app = app_with_queued_message();
-    let _ = rendered(&mut app);
-    let hit = app
-        .queue_hits
-        .iter()
-        .find(|hit| {
-            matches!(
-                hit.target,
-                QueueHitTarget::Item {
-                    action: QueueAction::Select,
-                    ..
-                }
-            )
-        })
-        .copied()
-        .unwrap();
+    let hit = queue_select_hit(&mut app);
     let row = hit.area.y;
-    let start = hit.area.x;
+    let start = queue_row_column(hit);
     let end = (start + 3).min(hit.area.right().saturating_sub(1));
 
     app.update(mouse_event(
@@ -4999,21 +5125,7 @@ fn wheel_over_long_queue_scrolls_its_bounded_viewport() {
     for index in 1..6 {
         app.queue_and_notify(queued_msg(&format!("queued {index}")));
     }
-    let _ = rendered(&mut app);
-    let hit = app
-        .queue_hits
-        .iter()
-        .find(|hit| {
-            matches!(
-                hit.target,
-                QueueHitTarget::Item {
-                    action: QueueAction::Select,
-                    ..
-                }
-            )
-        })
-        .copied()
-        .unwrap();
+    let hit = queue_select_hit(&mut app);
 
     app.update(Msg::Scroll {
         column: hit.area.x,
@@ -5022,7 +5134,10 @@ fn wheel_over_long_queue_scrolls_its_bounded_viewport() {
     });
 
     assert_eq!(app.queue.viewport(), 2);
-    assert_eq!(crate::components::queue_panel::height(app.queue.len()), 6);
+    assert_eq!(
+        crate::components::queue_panel::height(&app.queue.panel_entries()),
+        QUEUE_PANEL_MAX_HEIGHT
+    );
 }
 
 #[test]
@@ -5157,7 +5272,7 @@ fn finished_task_mouse_action_moves_unsent_item_to_main() {
     close_subagent_transcript(&mut app, TASK_ID);
 
     click_queue_action(&mut app, QueueAction::Select);
-    click_queue_action(&mut app, QueueAction::MoveMain);
+    queue_menu_action(&mut app, QueueActionKind::MoveMain);
 
     assert!(!app.unsent_subagent_steers.contains_key(TASK_ID));
     assert_eq!(app.queue.panel_entries()[0].text, STEER);
