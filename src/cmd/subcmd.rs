@@ -1160,7 +1160,6 @@ mod auth_tests {
 #[cfg(test)]
 mod tools_tests {
     use super::*;
-    use test_case::test_case;
 
     const MODEL_SPEC: &str = "anthropic/claude-opus-4-8";
 

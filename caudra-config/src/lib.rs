@@ -166,6 +166,54 @@ pub const WORKCELL_NATIVE_TOOL_NAMES: &[&str] = &[
 /// unreadable.
 pub const INTERNAL_COMPANION_TOOL_NAMES: &[&str] = &["tool_output"];
 
+/// The code graph is one mode of work, entered once. Loading its five tools
+/// separately would spend five prompt-cache prefixes to answer one question.
+pub const CODE_GRAPH_GROUP: &str = "code graph";
+
+/// Built-ins kept out of the request array until `tool_search` loads them.
+///
+/// Deferred because most sessions never call them, not because there are too
+/// many: the code graph answers "I do not know this codebase", `image_generate`
+/// needs a subscription and an intent to draw, and `execution_environment`
+/// reports host facts `shell` can also reach. Everything else is either used
+/// constantly or is the only way to do something.
+///
+/// Tools sharing a group load together. A name here must also appear in one of
+/// the registration lists above, or it defers something that does not exist.
+pub const DEFERRED_BUILTIN_TOOLS: &[DeferredBuiltin] = &[
+    DeferredBuiltin::grouped("code_map", CODE_GRAPH_GROUP),
+    DeferredBuiltin::grouped("code_context", CODE_GRAPH_GROUP),
+    DeferredBuiltin::grouped("code_refs", CODE_GRAPH_GROUP),
+    DeferredBuiltin::grouped("code_impact", CODE_GRAPH_GROUP),
+    DeferredBuiltin::grouped("code_expand", CODE_GRAPH_GROUP),
+    DeferredBuiltin::alone("execution_environment"),
+    DeferredBuiltin::alone("image_generate"),
+];
+
+pub struct DeferredBuiltin {
+    pub name: &'static str,
+    pub group: Option<&'static str>,
+}
+
+impl DeferredBuiltin {
+    const fn grouped(name: &'static str, group: &'static str) -> Self {
+        Self {
+            name,
+            group: Some(group),
+        }
+    }
+
+    const fn alone(name: &'static str) -> Self {
+        Self { name, group: None }
+    }
+}
+
+pub fn is_deferred_builtin(name: &str) -> bool {
+    DEFERRED_BUILTIN_TOOLS
+        .iter()
+        .any(|deferred| deferred.name == name)
+}
+
 /// `INTERNAL_COMPANION_TOOL_NAMES` overlaps the native list: it marks tools
 /// that stay enabled regardless of `disabled_tools`, which is orthogonal to
 /// who implements them. Dedupe so `--help` never prints a name twice.

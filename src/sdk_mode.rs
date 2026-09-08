@@ -1729,6 +1729,7 @@ impl EventPump {
             | AgentEvent::ToolHeaderSnapshot { .. }
             | AgentEvent::LiveToolBuf { .. }
             | AgentEvent::Nudge
+            | AgentEvent::ToolsLoaded { .. }
             | AgentEvent::PromptProgress { .. } => {}
             AgentEvent::StreamReset => {
                 if self.include_partial_messages {

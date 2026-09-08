@@ -5,6 +5,7 @@
 //! quotes, camelCase keys, extra wrappers). Plan mode rejects writes to
 //! anything but the plan file before they reach the tool.
 
+pub mod deferral;
 mod file_tracker;
 pub mod grep;
 pub(crate) mod image_bytes;
@@ -15,14 +16,18 @@ pub mod registry;
 pub mod schema;
 
 pub use caudra_config::{
-    INTERNAL_COMPANION_TOOL_NAMES, all_builtin_tool_names, is_builtin_tool, is_tool_enabled,
+    DEFERRED_BUILTIN_TOOLS, INTERNAL_COMPANION_TOOL_NAMES, all_builtin_tool_names,
+    is_builtin_tool, is_deferred_builtin, is_tool_enabled,
+};
+pub use deferral::{
+    DeferralSession, DeferralSnapshot, DeferredTool, SearchOutcome, TOOL_SEARCH_TOOL_NAME,
 };
 pub use file_tracker::{FileReadTracker, STALE_READ_MSG};
 pub use path_locks::{PathGuards, PathLocks};
 pub use registry::{
     BoxFuture, ExecFuture, HeaderFuture, HeaderResult, ParseError, PermissionIntent,
     PermissionScopes, PlanModeAccess, RegisteredTool, RegistryError, Tool, ToolAudience,
-    ToolEffect, ToolExecResult, ToolInvocation, ToolRegistry, ToolSource,
+    ToolDefinitions, ToolEffect, ToolExecResult, ToolInvocation, ToolRegistry, ToolSource,
 };
 
 use std::collections::HashMap;
@@ -441,6 +446,10 @@ pub struct ToolContext {
     pub loaded_instructions: LoadedInstructions,
     pub cancel: CancelToken,
     pub mcp: Option<McpSession>,
+    /// Built-ins withheld from this request until `tool_search` loads them.
+    /// Shared with the agent, so a load inside a batch child reaches the
+    /// array the parent builds next turn.
+    pub deferral: Option<DeferralSession>,
     pub deadline: Deadline,
     pub config: AgentConfig,
     pub tool_output_lines: ToolOutputLines,
@@ -686,6 +695,7 @@ pub fn interpreter_ctx(
         loaded_instructions: LoadedInstructions::new(),
         cancel,
         mcp: None,
+        deferral: None,
         deadline: Deadline::None,
         config: AgentConfig::default(),
         tool_output_lines: ToolOutputLines::default(),

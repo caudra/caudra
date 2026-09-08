@@ -8,12 +8,13 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use tracing::{debug, error, warn};
 
-use crate::mcp::{McpSession, TOOL_SEARCH_TOOL_NAME, UNKNOWN_MCP};
+use crate::mcp::{McpSession, UNKNOWN_MCP};
 use crate::permissions::canonical_json;
 use crate::task_set::TaskSet;
 use crate::tools::registry::{PlanModeAccess, ToolInvocation, ToolRegistry};
 use crate::tools::{
-    DOOM_LOOP_MESSAGE, LocalToolEntry, READ_ONLY_TOOL_RESTRICTED, ToolContext, ToolEffect,
+    DOOM_LOOP_MESSAGE, LocalToolEntry, READ_ONLY_TOOL_RESTRICTED, TOOL_SEARCH_TOOL_NAME,
+    ToolContext, ToolEffect,
 };
 use crate::{AgentError, AgentEvent, LuaToolProvenance, ToolDoneEvent, ToolOutput, ToolStartEvent};
 use caudra_config::ToolKey;
@@ -195,7 +196,8 @@ async fn run_inner(
             (Some(local), _) => local.effect.is_safe_in_read_only(),
             (None, Some(_)) => true,
             (None, None) => {
-                !mcp.is_some_and(|mcp| name == TOOL_SEARCH_TOOL_NAME || mcp.has_tool(mcp_lookup))
+                !(name == TOOL_SEARCH_TOOL_NAME && searchable(mcp, ctx))
+                    && !mcp.is_some_and(|mcp| mcp.has_tool(mcp_lookup))
             }
         };
         if !allowed {
@@ -217,6 +219,13 @@ async fn run_inner(
                 "tool {name} is unavailable to the current agent audience"
             ));
         }
+        // Guessing a deferred tool's name right is as good as searching for
+        // it: keep it declared so the model is not told to look for what it
+        // just called.
+        if let Some(deferral) = &ctx.deferral {
+            announce_loads(ctx, deferral.mark_loaded(name));
+        }
+
         let invocation = match entry.tool.parse(input) {
             Ok(inv) => inv,
             Err(e) => {
@@ -381,7 +390,7 @@ async fn run_inner(
                 done
             }
         }
-    } else if let Some(mcp) = mcp.filter(|_| name == TOOL_SEARCH_TOOL_NAME) {
+    } else if name == TOOL_SEARCH_TOOL_NAME && searchable(mcp, ctx) {
         run_tool_search(mcp, id, input, ctx, emit)
     } else if mcp.is_some_and(|m| m.has_tool(mcp_lookup)) {
         emit_raw_start(
@@ -451,10 +460,31 @@ fn emit_raw_start(
     emit.deliver(ctx, start);
 }
 
-/// Runs without a permission gate: search only reveals names the deferred
-/// catalog already showed the model.
+/// Says what a load just cost. Silent when nothing changed, so a repeat
+/// search or a second call to an already-loaded tool draws no card.
+fn announce_loads(ctx: &ToolContext, loaded: Vec<Arc<str>>) {
+    if loaded.is_empty() {
+        return;
+    }
+    let names = loaded.iter().map(|name| name.to_string()).collect();
+    let _ = ctx.event_tx.send(AgentEvent::ToolsLoaded { names });
+}
+
+/// Whether anything is deferred at all. The search tool is declared only when
+/// it has something to find, so being asked for it otherwise is an unknown
+/// tool rather than an empty answer.
+fn searchable(mcp: Option<&McpSession>, ctx: &ToolContext) -> bool {
+    mcp.is_some() || ctx.deferral.as_ref().is_some_and(|d| !d.is_empty())
+}
+
+/// One search over both catalogs: the model is offered one tool, so it must
+/// not have to know whether what it wants is a built-in or an MCP tool.
+/// Built-ins rank first because their catalog is the smaller, curated one.
+///
+/// Runs without a permission gate: search only reveals names the catalog
+/// already showed the model.
 fn run_tool_search(
-    mcp: &McpSession,
+    mcp: Option<&McpSession>,
     id: String,
     input: &Value,
     ctx: &ToolContext,
@@ -471,9 +501,26 @@ fn run_tool_search(
         query.to_owned(),
         input,
     );
-    let (output, is_error) = match mcp.search_tools(query) {
-        Ok(out) => (out, false),
-        Err(e) => (e, true),
+    let builtin = ctx
+        .deferral
+        .as_ref()
+        .filter(|deferral| !deferral.is_empty())
+        .map(|deferral| deferral.search(query));
+    if let Some(Ok(outcome)) = &builtin {
+        announce_loads(ctx, outcome.loaded.clone());
+    }
+    let (output, is_error) = match (builtin, mcp) {
+        (Some(Ok(outcome)), _) if !outcome.loaded.is_empty() => (outcome.message, false),
+        (_, Some(mcp)) => match mcp.search_tools(query) {
+            Ok(outcome) => {
+                announce_loads(ctx, outcome.loaded);
+                (outcome.message, false)
+            }
+            Err(e) => (e, true),
+        },
+        (Some(Ok(outcome)), None) => (outcome.message, false),
+        (Some(Err(e)), None) => (e, true),
+        (None, None) => (crate::tools::deferral::SEARCH_EMPTY_QUERY.into(), true),
     };
     ToolDoneEvent {
         id,
@@ -708,7 +755,9 @@ async fn execute_mcp_tool(
 
     // A permitted call to a deferred tool counts as loading it, so its full
     // definition joins the next request; a denied call must not load anything.
-    mcp.mark_loaded(tool_name);
+    if mcp.mark_loaded(tool_name) {
+        announce_loads(ctx, vec![Arc::from(tool_name)]);
+    }
     match binding.call(input).await {
         Ok(text) => done(text, false),
         Err(e) => done(e.to_string(), true),
@@ -1257,7 +1306,7 @@ mod tests {
             )
             .await;
             assert!(done.is_error);
-            assert_eq!(done.output.as_text(), crate::mcp::SEARCH_EMPTY_QUERY);
+            assert_eq!(done.output.as_text(), crate::tools::deferral::SEARCH_EMPTY_QUERY);
         });
     }
 

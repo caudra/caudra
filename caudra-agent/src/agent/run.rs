@@ -29,6 +29,7 @@ use crate::context::{
     ContextCapture, ContextInventory, ContextPublisher, ContextReadiness, ContextSnapshot,
 };
 use crate::mcp::{McpRequestSnapshot, McpSession};
+use crate::tools::{DeferralSession, DeferredTool};
 use crate::permissions::PermissionManager;
 use crate::tools::{Deadline, FileReadTracker, LocalTools, PathLocks, ToolAudience, ToolContext};
 use crate::{
@@ -132,6 +133,9 @@ pub struct AgentRunParams<'h> {
     pub system: String,
     pub event_tx: EventSender,
     pub tools: Value,
+    /// Definitions the request holds back until `tool_search` loads them.
+    /// Built by the same caller as `tools`, from the same vars and filter.
+    pub deferred: Vec<DeferredTool>,
 }
 
 pub struct Agent<'h> {
@@ -141,6 +145,7 @@ pub struct Agent<'h> {
     system: String,
     event_tx: EventSender,
     tools: Value,
+    deferral: DeferralSession,
     mode: AgentMode,
     user_response_rx: Option<Arc<async_lock::Mutex<flume::Receiver<String>>>>,
     interrupt_source: Option<Arc<dyn InterruptSource>>,
@@ -187,6 +192,12 @@ impl<'h> Agent<'h> {
     pub fn new(params: AgentParams, run: AgentRunParams<'h>) -> Self {
         let mut model = params.model;
         params.provider.adjust_model(&mut model);
+        // Seeded before the history moves in: a restored session keeps the
+        // tools it already searched for rather than hunting them again.
+        let deferral = DeferralSession::new(
+            run.deferred,
+            crate::tools::deferral::loaded_tool_names(run.history.as_slice()),
+        );
         Self {
             provider: params.provider,
             model: Arc::new(model),
@@ -198,6 +209,7 @@ impl<'h> Agent<'h> {
             system: run.system,
             event_tx: run.event_tx,
             tools: run.tools,
+            deferral,
             mode: AgentMode::default(),
             user_response_rx: None,
             interrupt_source: None,
@@ -487,17 +499,24 @@ impl<'h> Agent<'h> {
         }
     }
 
-    /// `self.tools` holds base tools only; the MCP part is recomputed here
-    /// every turn so `tool_search` loads and late-connecting servers take
-    /// effect on the next request.
+    /// `self.tools` holds the declared base only; deferred built-ins and MCP
+    /// are recomputed here every turn so `tool_search` loads and
+    /// late-connecting servers take effect on the next request.
+    ///
+    /// Both extensions append, which keeps the base a prefix of the result
+    /// and gives token accounting a stable boundary to attribute against.
     fn request_tools(&self) -> (Cow<'_, Value>, Option<McpRequestSnapshot>) {
-        let Some(mcp) = &self.mcp else {
+        if self.mcp.is_none() && self.deferral.is_empty() {
             return (Cow::Borrowed(&self.tools), None);
-        };
-        let snapshot = mcp.request_snapshot();
+        }
         let mut tools = self.tools.clone();
-        snapshot.extend_tools(&mut tools);
-        (Cow::Owned(tools), Some(snapshot))
+        self.deferral.request_snapshot().extend_tools(&mut tools);
+        let snapshot = self.mcp.as_ref().map(|mcp| {
+            let snapshot = mcp.request_snapshot();
+            snapshot.extend_tools(&mut tools);
+            snapshot
+        });
+        (Cow::Owned(tools), snapshot)
     }
 
     fn projected_history<'a>(&'a self, tools: &Value) -> Cow<'a, [Message]> {
@@ -1053,6 +1072,7 @@ impl<'h> Agent<'h> {
             loaded_instructions: self.loaded_instructions.clone(),
             cancel: self.cancel.clone(),
             mcp: self.mcp.clone(),
+            deferral: Some(self.deferral.clone()),
             deadline: Deadline::None,
             config: self.config.clone(),
             tool_output_lines: self.tool_output_lines,
@@ -1660,6 +1680,7 @@ mod tests {
                 system: "system".into(),
                 event_tx: EventSender::new(raw_tx, 0),
                 tools: serde_json::json!([]),
+                deferred: Vec::new(),
             },
         );
         (agent, event_rx)
@@ -2417,7 +2438,7 @@ mod tests {
         smol::block_on(async {
             let provider = MockProvider::new(vec![
                 tool_use_response(
-                    crate::mcp::TOOL_SEARCH_TOOL_NAME,
+                    crate::tools::TOOL_SEARCH_TOOL_NAME,
                     serde_json::json!({"query": "fetch issue"}),
                 ),
                 text_response(StopReason::EndTurn),
@@ -2434,7 +2455,7 @@ mod tests {
             let captured = captured.lock().unwrap();
             assert_eq!(captured.len(), 2);
             let first = tool_names(&captured[0]);
-            assert!(first.contains(&crate::mcp::TOOL_SEARCH_TOOL_NAME));
+            assert!(first.contains(&crate::tools::TOOL_SEARCH_TOOL_NAME));
             assert!(!first.contains(&"srv__fetch_issue"));
             assert!(tool_names(&captured[1]).contains(&"srv__fetch_issue"));
         });

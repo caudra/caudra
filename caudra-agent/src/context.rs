@@ -9,7 +9,8 @@ use caudra_providers::{
 use serde_json::Value;
 
 use crate::agent::{compaction_reserve, estimate_message_tokens};
-use crate::mcp::{McpRequestSnapshot, McpToolStatus, TOOL_SEARCH_TOOL_NAME};
+use crate::mcp::{McpRequestSnapshot, McpToolStatus};
+use crate::tools::TOOL_SEARCH_TOOL_NAME;
 use crate::prompt::profile::{BUILTIN_PROFILE_NAME, PromptProfileCatalog, TaskProfileBindings};
 use crate::tools::native::{memory, skill};
 use crate::tools::{MEMORY_TOOL_NAME, SKILL_TOOL_NAME, TASK_TOOL_NAME, ToolRegistry};

@@ -1204,6 +1204,12 @@ pub enum AgentEvent {
     AuthRequired,
     AuthRestored,
     Nudge,
+    /// Deferred tools moved into the request array. Reported because the user
+    /// is paying for it: the tools array changes, so the provider's prompt
+    /// cache prefix is invalidated and the next request re-reads the history.
+    ToolsLoaded {
+        names: Vec<String>,
+    },
     /// A subagent's progress moved. Only ever stamped with [`SubagentInfo`],
     /// so the parent knows which task header to update.
     SubagentProgress {

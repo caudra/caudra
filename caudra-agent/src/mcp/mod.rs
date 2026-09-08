@@ -48,12 +48,12 @@ use self::http::HttpTransport;
 use self::stdio::StdioTransport;
 use self::transport::McpTransport;
 use crate::permissions::{PermissionSubject, canonical_json_sha256};
+use crate::tools::deferral::{SearchOutcome, TOOL_SEARCH_TOOL_NAME};
 use crate::tools::schema::sanitize_tool_input_schema;
 
 const SEPARATOR: &str = ".";
 const WIRE_SEPARATOR: &str = "__";
 pub const UNKNOWN_MCP: &str = "unknown_mcp";
-pub const TOOL_SEARCH_TOOL_NAME: &str = "tool_search";
 /// Below this many deferrable tools, a search round-trip plus its
 /// prompt-cache miss cost more than a handful of upfront definitions.
 /// Overridden by `defer_tools` in mcp.toml.
@@ -66,7 +66,7 @@ const DESCRIPTION_HIT_SCORE: usize = 1;
 const MAX_OVERFLOW_NAMES: usize = 20;
 const SEARCH_NO_MATCH: &str = "No deferred MCP tools matched";
 const SEARCH_OVERFLOW_PREFIX: &str = "Also matched but not loaded: ";
-pub(crate) const SEARCH_EMPTY_QUERY: &str = "query must not be empty";
+pub(crate) use crate::tools::deferral::SEARCH_EMPTY_QUERY;
 
 /// Convert internal qualified name (`server.tool`) to wire format (`server__tool`)
 /// for LLM provider APIs that reject dots in tool names.
@@ -456,7 +456,7 @@ impl McpSession {
     /// Rank deferred tools against `query` keywords (exact name first,
     /// then name hits over description hits) and mark the top
     /// `MAX_SEARCH_LOADS` loaded; their definitions join the next request.
-    pub fn search_tools(&self, query: &str) -> Result<String, String> {
+    pub fn search_tools(&self, query: &str) -> Result<SearchOutcome, String> {
         let q = query.trim().to_lowercase();
         let tokens: Vec<&str> = q
             .split(|c: char| !c.is_alphanumeric())
@@ -499,23 +499,29 @@ impl McpSession {
                 .cmp(&(a.0, a.1))
                 .then_with(|| a.2.wire_name().cmp(b.2.wire_name()))
         });
-        let mut loaded = self.lock_loaded();
+        let mut guard = self.lock_loaded();
         let mut hits: Vec<&str> = Vec::new();
         let mut overflow: Vec<&str> = Vec::new();
+        let mut loaded: Vec<Arc<str>> = Vec::new();
         for (_, _, d) in &matches {
             if hits.len() < MAX_SEARCH_LOADS {
-                loaded.insert(Arc::clone(&d.qualified_name));
+                if guard.insert(Arc::clone(&d.qualified_name)) {
+                    loaded.push(Arc::from(d.wire_name()));
+                }
                 hits.push(d.wire_name());
             } else {
                 overflow.push(d.wire_name());
             }
         }
-        drop(loaded);
+        drop(guard);
         info!(query = %q, loaded = hits.len(), overflow = overflow.len(), "MCP tool search");
         if hits.is_empty() {
-            return Ok(format!(
-                "{SEARCH_NO_MATCH} '{query}'. Try other keywords or an exact name from the catalog."
-            ));
+            return Ok(SearchOutcome {
+                loaded,
+                message: format!(
+                    "{SEARCH_NO_MATCH} '{query}'. Try other keywords or an exact name from the catalog."
+                ),
+            });
         }
         let plural = if hits.len() == 1 { "tool" } else { "tools" };
         let mut out = format!(
@@ -534,13 +540,17 @@ impl McpSession {
             }
             out.push_str(". Search an exact tool name to load it.");
         }
-        Ok(out)
+        Ok(SearchOutcome {
+            loaded,
+            message: out,
+        })
     }
 
     /// Invoked on every MCP dispatch: a deferred tool the model calls by
-    /// catalog name gets its full definition on the next request.
-    pub fn mark_loaded(&self, qualified_name: &str) {
-        self.lock_loaded().insert(Arc::from(qualified_name));
+    /// catalog name gets its full definition on the next request. `true` when
+    /// that call is what declared it, so the change can be reported once.
+    pub fn mark_loaded(&self, qualified_name: &str) -> bool {
+        self.lock_loaded().insert(Arc::from(qualified_name))
     }
 
     fn lock_loaded(&self) -> std::sync::MutexGuard<'_, HashSet<Arc<str>>> {
@@ -2373,6 +2383,7 @@ mod tests {
             session
                 .search_tools("tool")
                 .unwrap()
+                .message
                 .contains("other__tool"),
             "search must not reach a disabled tool"
         );
@@ -2437,7 +2448,7 @@ mod tests {
     #[test]
     fn search_loads_tools_into_next_extend() {
         let (_inner, handle) = setup(vec![fake_entry("srv", FakeTransport::new())]);
-        let result = handle.search_tools("TOOL").unwrap();
+        let result = handle.search_tools("TOOL").unwrap().message;
         assert!(result.contains(WIRE_TOOL_NAME), "got: {result}");
 
         let mut tools = json!([]);
@@ -2448,7 +2459,7 @@ mod tests {
     #[test]
     fn search_reports_no_match_without_loading() {
         let (_inner, handle) = setup(vec![fake_entry("srv", FakeTransport::new())]);
-        let result = handle.search_tools("nonexistent-capability").unwrap();
+        let result = handle.search_tools("nonexistent-capability").unwrap().message;
         assert!(result.contains(SEARCH_NO_MATCH), "got: {result}");
         let mut tools = json!([]);
         handle.request_snapshot().extend_tools(&mut tools);
@@ -2469,7 +2480,7 @@ mod tests {
             .collect();
         let (_inner, handle) = setup(vec![entry]);
 
-        let result = handle.search_tools("tool").unwrap();
+        let result = handle.search_tools("tool").unwrap().message;
         let expected = format!(
             "{SEARCH_OVERFLOW_PREFIX}`srv__tool-{}`, `srv__tool-{}`",
             MAX_SEARCH_LOADS,
@@ -2509,7 +2520,7 @@ mod tests {
         let (_inner, handle) = setup(vec![entry_with_tools("srv", tools)]);
         // Alphabetical tie-break alone would leave the last tool in overflow.
         let last = format!("{prefix}{MAX_SEARCH_LOADS}");
-        let result = handle.search_tools(&last).unwrap();
+        let result = handle.search_tools(&last).unwrap().message;
         let overflow = result
             .lines()
             .find(|l| l.starts_with(SEARCH_OVERFLOW_PREFIX))
@@ -2528,7 +2539,7 @@ mod tests {
             tool_def("srv", "create_issue", "Open a ticket", json!({})),
         ];
         let (_inner, handle) = setup(vec![entry_with_tools("srv", tools)]);
-        let result = handle.search_tools("issue").unwrap();
+        let result = handle.search_tools("issue").unwrap().message;
         let pos = |name: &str| {
             result
                 .find(name)
@@ -2549,7 +2560,7 @@ mod tests {
             json!({}),
         )];
         let (_inner, handle) = setup(vec![entry_with_tools("srv", tools)]);
-        let result = handle.search_tools("pull request").unwrap();
+        let result = handle.search_tools("pull request").unwrap().message;
         assert!(result.contains("srv__create_pr"), "got: {result}");
     }
 
@@ -2558,7 +2569,7 @@ mod tests {
         let schema = json!({"type": "object", "properties": {"labels": {"type": "array"}}});
         let tools = vec![tool_def("srv", "update", "Update a thing", schema)];
         let (_inner, handle) = setup(vec![entry_with_tools("srv", tools)]);
-        let result = handle.search_tools("labels").unwrap();
+        let result = handle.search_tools("labels").unwrap().message;
         assert!(result.contains("srv__update"), "got: {result}");
     }
 
@@ -2678,7 +2689,7 @@ mod tests {
     #[test]
     fn search_ignores_always_load_tools() {
         let (_inner, handle) = setup(vec![always_load_entry("eager", FakeTransport::new())]);
-        let result = handle.search_tools("tool").unwrap();
+        let result = handle.search_tools("tool").unwrap().message;
         assert!(
             result.contains(SEARCH_NO_MATCH),
             "always_load tools are already declared: {result}"

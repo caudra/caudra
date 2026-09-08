@@ -23,8 +23,8 @@ use crate::cancel::{CancelMap, CancelSlot};
 use crate::prompt::PromptId;
 use crate::tools::registry::ToolRegistry;
 use crate::tools::{
-    DescriptionContext, FileReadTracker, LocalTools, ToolAudience, ToolContext, ToolFilter,
-    ToolLive,
+    DeferredTool, DescriptionContext, FileReadTracker, LocalTools, ToolAudience, ToolContext,
+    ToolFilter, ToolLive, deferral,
 };
 use crate::{
     Agent, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, DoneReason,
@@ -191,6 +191,7 @@ pub struct Subagent {
     params: AgentParams,
     system: String,
     tools: JsonValue,
+    deferred: Vec<DeferredTool>,
     mode: AgentMode,
     thinking: ThinkingConfig,
     fast: bool,
@@ -310,6 +311,7 @@ impl Subagent {
                 system: self.system.clone(),
                 event_tx: self.sub_event_tx.clone(),
                 tools: self.tools.clone(),
+                deferred: self.deferred.clone(),
             },
         )
         .with_user_response_rx(Arc::clone(&self.answer_rx))
@@ -401,6 +403,10 @@ struct Resolved {
     provider: Arc<dyn provider::Provider>,
     system: String,
     tools: JsonValue,
+    /// Held back behind `tool_search` for this child. A subagent starts with
+    /// nothing loaded: what the parent searched for says nothing about what
+    /// the child needs.
+    deferred: Vec<DeferredTool>,
     mode: AgentMode,
     audience: ToolAudience,
     thinking: ThinkingConfig,
@@ -542,7 +548,7 @@ pub async fn open_task(ctx: &ToolContext, opts: TaskOptions) -> Result<Subagent,
         profile.as_deref(),
         contract,
     );
-    let mut tools = ToolRegistry::global().definitions(
+    let mut definitions = ToolRegistry::global().definitions_split(
         &vars,
         &DescriptionContext {
             filter: &base_filter,
@@ -550,8 +556,10 @@ pub async fn open_task(ctx: &ToolContext, opts: TaskOptions) -> Result<Subagent,
             workflow: false,
         },
         model.supports_tool_examples(),
+        &deferral::deferred_names(&ctx.config.allowed_tools),
     );
-    tools
+    definitions
+        .declared
         .as_array_mut()
         .expect("definitions return an array")
         .extend(opts.local_definitions);
@@ -564,7 +572,8 @@ pub async fn open_task(ctx: &ToolContext, opts: TaskOptions) -> Result<Subagent,
             model,
             provider,
             system: vars.apply(&assembled).into_owned(),
-            tools,
+            tools: definitions.declared,
+            deferred: definitions.deferred,
             mode,
             audience,
             thinking,
@@ -604,6 +613,7 @@ pub async fn open_generic(ctx: &ToolContext, opts: GenericOptions) -> Result<Sub
             provider,
             system: opts.system,
             tools: opts.tools,
+            deferred: Vec::new(),
             mode: AgentMode::Build,
             audience: opts.audience.unwrap_or(DEFAULT_SESSION_AUDIENCE),
             thinking: opts.thinking.unwrap_or_else(|| ctx.opts.thinking.clone()),
@@ -788,6 +798,7 @@ fn build(
         },
         system: resolved.system,
         tools: resolved.tools,
+        deferred: resolved.deferred,
         mode: resolved.mode,
         thinking: resolved.thinking,
         fast,

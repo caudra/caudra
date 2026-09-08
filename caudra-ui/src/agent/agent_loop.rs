@@ -14,7 +14,8 @@ use caudra_agent::prompt::profile::{
 use caudra_agent::template;
 use caudra_agent::template::Vars;
 use caudra_agent::tools::{
-    DescriptionContext, FileReadTracker, PathLocks, ToolAudience, ToolFilter, ToolRegistry,
+    DeferredTool, DescriptionContext, FileReadTracker, PathLocks, ToolAudience, ToolDefinitions,
+    ToolFilter, ToolRegistry, deferral,
 };
 use caudra_agent::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentParams, AgentRunParams, CancelMap,
@@ -40,6 +41,9 @@ pub(super) struct AgentLoop {
     vars: Vars,
     instructions: Instructions,
     tools: Value,
+    /// Withheld from `tools` until `tool_search` loads them. Rebuilt with
+    /// `tools`, so a model switch reconsiders both halves together.
+    deferred: Vec<DeferredTool>,
     mcp: Option<McpSession>,
     history: History,
     history_restore_error: Option<String>,
@@ -115,6 +119,7 @@ impl AgentLoop {
             vars: Vars::default(),
             instructions: Instructions::default(),
             tools: Value::Null,
+            deferred: Vec::new(),
             mcp,
             history,
             history_restore_error,
@@ -307,7 +312,7 @@ impl AgentLoop {
         // Built once MCP has settled, so a `/btw` fired before the first prompt
         // carries the same tools the live request will.
         let slot = self.model_slot.load();
-        self.tools = self.build_tools(
+        self.rebuild_tools(
             &slot.model,
             &caudra_providers::ThinkingConfig::default(),
             false,
@@ -472,6 +477,7 @@ impl AgentLoop {
                 system,
                 event_tx,
                 tools: self.tools.clone(),
+                deferred: self.deferred.clone(),
             },
         )
         .with_loaded_instructions(self.instructions.loaded.clone())
@@ -512,7 +518,9 @@ impl AgentLoop {
         thinking: &caudra_providers::ThinkingConfig,
         workflow: bool,
     ) {
-        self.tools = self.build_tools(model, thinking, workflow);
+        let definitions = self.build_tools(model, thinking, workflow);
+        self.tools = definitions.declared;
+        self.deferred = definitions.deferred;
     }
 
     fn build_tools(
@@ -520,7 +528,7 @@ impl AgentLoop {
         model: &Model,
         thinking: &caudra_providers::ThinkingConfig,
         workflow: bool,
-    ) -> Value {
+    ) -> ToolDefinitions {
         let examples = model.supports_tool_examples();
         let filter = ToolFilter::from_config(&self.config, model, &[]);
         let bindings =
@@ -535,7 +543,12 @@ impl AgentLoop {
             audience: ToolAudience::MAIN,
             workflow,
         };
-        ToolRegistry::global().definitions(&vars, &ctx, examples)
+        ToolRegistry::global().definitions_split(
+            &vars,
+            &ctx,
+            examples,
+            &deferral::deferred_names(&self.config.allowed_tools),
+        )
     }
 
     async fn reload_instructions(&mut self) {

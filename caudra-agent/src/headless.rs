@@ -32,8 +32,8 @@ use crate::prompt::ResolvedSlots;
 use crate::prompt::profile::{BUILTIN_PROFILE_NAME, PromptProfileCatalog};
 use crate::template;
 use crate::tools::{
-    DescriptionContext, FileReadTracker, LocalTools, PathLocks, ToolAudience, ToolFilter,
-    ToolRegistry,
+    DeferralSession, DeferredTool, DescriptionContext, FileReadTracker, LocalTools, PathLocks,
+    ToolAudience, ToolDefinitions, ToolFilter, ToolRegistry, deferral,
 };
 use crate::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, DoneReason,
@@ -614,6 +614,7 @@ struct AgentSetup {
     vars: template::Vars,
     instructions: agent::Instructions,
     tools: Value,
+    deferred: Vec<DeferredTool>,
     tool_filter: ToolFilter,
 }
 
@@ -633,7 +634,7 @@ fn setup(
 ) -> AgentSetup {
     let vars = template::env_vars();
     let instructions = agent::load_instructions(&vars.apply("{cwd}"));
-    let tools = tool_definitions(
+    let definitions = tool_definitions(
         &vars,
         model,
         config,
@@ -646,13 +647,15 @@ fn setup(
     AgentSetup {
         vars,
         instructions,
-        tools,
+        tools: definitions.declared,
+        deferred: definitions.deferred,
         tool_filter: ToolFilter::from_config(config, model, excluded_tools),
     }
 }
 
-/// Base definitions only. MCP definitions are injected per request by
-/// `Agent::request_tools`; storing them here would freeze the catalog.
+/// Base definitions only, split into declared and deferred. MCP definitions
+/// are injected per request by `Agent::request_tools`; storing them here would
+/// freeze the catalog.
 fn tool_definitions(
     vars: &template::Vars,
     model: &Model,
@@ -661,7 +664,7 @@ fn tool_definitions(
     workflow: bool,
     registry: &ToolRegistry,
     task: TaskDescriptionContext<'_>,
-) -> Value {
+) -> ToolDefinitions {
     let filter = ToolFilter::from_config(config, model, excluded_tools);
     let bindings =
         task.prompt_profiles
@@ -675,13 +678,26 @@ fn tool_definitions(
         audience: ToolAudience::MAIN,
         workflow,
     };
-    registry.definitions(&vars, &ctx, model.supports_tool_examples())
+    registry.definitions_split(
+        &vars,
+        &ctx,
+        model.supports_tool_examples(),
+        &deferral::deferred_names(&config.allowed_tools),
+    )
 }
 
-/// Names advertised to SDK clients: base tools plus what the first request
-/// would carry from MCP (always-load definitions and `tool_search`).
-fn advertised_tool_names(tools: &Value, mcp: Option<&McpSession>) -> Vec<String> {
+/// Names advertised to SDK clients: what the first request would actually
+/// carry, so a deferred built-in shows up as `tool_search` rather than as
+/// itself.
+fn advertised_tool_names(
+    tools: &Value,
+    deferred: &[DeferredTool],
+    mcp: Option<&McpSession>,
+) -> Vec<String> {
     let mut probe = tools.clone();
+    DeferralSession::new(deferred.to_vec(), std::iter::empty())
+        .request_snapshot()
+        .extend_tools(&mut probe);
     if let Some(mcp) = mcp {
         mcp.request_snapshot().extend_tools(&mut probe);
     }
@@ -699,6 +715,7 @@ pub fn spawn(mut params: HeadlessParams) -> HeadlessHandle {
         vars,
         instructions,
         tools,
+        deferred,
         tool_filter,
     } = setup(
         &params.model,
@@ -727,7 +744,7 @@ pub fn spawn(mut params: HeadlessParams) -> HeadlessHandle {
         .mcp_handle
         .clone()
         .map(|h| McpSession::new(h, &[]).with_disabled_tools(&params.config.disabled_tools));
-    let tool_names = advertised_tool_names(&tools, mcp.as_ref());
+    let tool_names = advertised_tool_names(&tools, &deferred, mcp.as_ref());
 
     let (raw_tx, event_rx) = flume::unbounded::<Envelope>();
 
@@ -797,6 +814,7 @@ pub fn spawn(mut params: HeadlessParams) -> HeadlessHandle {
                     system,
                     event_tx,
                     tools,
+                    deferred,
                 },
             )
             .with_loaded_instructions(instructions.loaded)
@@ -951,6 +969,7 @@ pub fn spawn_prepared_interactive(prepared: PreparedInteractive) -> InteractiveH
         vars,
         instructions,
         tools,
+        deferred,
         mut tool_filter,
     } = setup(
         &model,
@@ -969,7 +988,7 @@ pub fn spawn_prepared_interactive(prepared: PreparedInteractive) -> InteractiveH
     let mcp = params.mcp_handle.clone().map(|h| {
         McpSession::new(h, initial_messages).with_disabled_tools(&params.config.disabled_tools)
     });
-    let tool_names = advertised_tool_names(&tools, mcp.as_ref());
+    let tool_names = advertised_tool_names(&tools, &deferred, mcp.as_ref());
 
     let session_ref = params.session_id.clone();
     let session_id = session_ref.id();
@@ -1085,7 +1104,7 @@ pub fn spawn_prepared_interactive(prepared: PreparedInteractive) -> InteractiveH
                     }
                 }
 
-                let tools = tool_definitions(
+                let definitions = tool_definitions(
                     &vars,
                     &model,
                     &params.config,
@@ -1154,7 +1173,8 @@ pub fn spawn_prepared_interactive(prepared: PreparedInteractive) -> InteractiveH
                         history: &mut history,
                         system,
                         event_tx,
-                        tools: tools.clone(),
+                        tools: definitions.declared,
+                        deferred: definitions.deferred,
                     },
                 )
                 .with_loaded_instructions(instructions.loaded.clone())
@@ -1243,6 +1263,7 @@ mod tests {
     use caudra_storage::sessions::generate_title;
     use caudra_storage::tool_outputs::ToolOutputStore;
     use tempfile::TempDir;
+    use test_case::test_case;
 
     use super::*;
 
@@ -1771,21 +1792,40 @@ mod tests {
         assert_eq!(extract_tool_names(&tools), vec!["read", "bash"]);
     }
 
-    #[test]
-    fn advertised_names_show_tool_search_not_deferred_tools() {
+    /// Both deferral sources collapse into the one search tool, so a client
+    /// is told what the first request actually carries.
+    #[test_case(true,  false ; "mcp only")]
+    #[test_case(false, true  ; "built-ins only")]
+    #[test_case(true,  true  ; "both share one catalog entry")]
+    fn advertised_names_show_tool_search_not_deferred_tools(mcp: bool, builtin: bool) {
         let base = serde_json::json!([{"name": "read"}]);
-        let mcp = crate::mcp::stub_session(&[("srv.fetch_issue", "Fetch a GitHub issue")]);
-        let names = advertised_tool_names(&base, Some(&mcp));
+        let session = mcp.then(|| crate::mcp::stub_session(&[("srv.fetch_issue", "Fetch an issue")]));
+        let deferred = match builtin {
+            true => vec![DeferredTool::new(
+                "code_map",
+                None,
+                serde_json::json!({"name": "code_map", "description": "Rank symbols"}),
+            )],
+            false => Vec::new(),
+        };
+
+        let names = advertised_tool_names(&base, &deferred, session.as_ref());
+
         assert_eq!(
             names,
-            vec!["read", crate::mcp::TOOL_SEARCH_TOOL_NAME],
+            vec!["read", crate::tools::TOOL_SEARCH_TOOL_NAME],
             "clients must see the search tool, not deferred definitions"
         );
         assert_eq!(
             base,
             serde_json::json!([{"name": "read"}]),
-            "probing must not bake MCP entries into the base tools"
+            "probing must not bake deferred entries into the base tools"
         );
-        assert_eq!(advertised_tool_names(&base, None), vec!["read"]);
+    }
+
+    #[test]
+    fn advertised_names_omit_the_search_tool_when_nothing_is_deferred() {
+        let base = serde_json::json!([{"name": "read"}]);
+        assert_eq!(advertised_tool_names(&base, &[], None), vec!["read"]);
     }
 }

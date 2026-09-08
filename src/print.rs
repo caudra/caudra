@@ -287,6 +287,7 @@ pub fn run(
             | AgentEvent::ToolHeaderSnapshot { .. }
             | AgentEvent::LiveToolBuf { .. }
             | AgentEvent::Nudge
+            | AgentEvent::ToolsLoaded { .. }
             | AgentEvent::PromptProgress { .. } => {}
             AgentEvent::GoalEvaluating { .. } => {}
             AgentEvent::GoalEvaluation {

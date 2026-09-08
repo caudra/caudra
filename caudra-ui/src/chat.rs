@@ -36,6 +36,8 @@ pub(crate) const CANCELLED_TEXT: &str = "Cancelled";
 /// One notice per streak: a wedged model can spend twenty nudges, and twenty
 /// identical bubbles bury the conversation they are about.
 const NUDGE_TEXT: &str = "Model ended turn without a response, nudging...";
+const TOOLS_LOADED_PREFIX: &str = "Loaded ";
+const TOOLS_LOADED_SUFFIX: &str = " - the tools array changed, so the prompt cache prefix resets.";
 
 pub enum ChatEventResult {
     Continue,
@@ -275,6 +277,15 @@ impl Chat {
                     self.messages_panel
                         .push(DisplayMessage::new(DisplayRole::Notice, NUDGE_TEXT.into()));
                 }
+            }
+            AgentEvent::ToolsLoaded { names } => {
+                self.messages_panel.flush();
+                let text = format!(
+                    "{TOOLS_LOADED_PREFIX}{}{TOOLS_LOADED_SUFFIX}",
+                    names.join(", ")
+                );
+                self.messages_panel
+                    .push(DisplayMessage::new(DisplayRole::Notice, text));
             }
             AgentEvent::SubagentHistory { .. } => {}
             AgentEvent::LiveToolBuf { id, body } => {
