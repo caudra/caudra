@@ -45,9 +45,14 @@ pub fn loaded_tool_names(history: &[Message]) -> impl Iterator<Item = Arc<str>> 
 pub fn deferred_names(allowed_tools: &[String]) -> Vec<&'static str> {
     caudra_config::DEFERRED_BUILTIN_TOOLS
         .iter()
-        .filter(|deferred| !allowed_tools.iter().any(|name| name == deferred.name))
         .map(|deferred| deferred.name)
+        .filter(|name| is_deferred(name, allowed_tools))
         .collect()
+}
+
+pub fn is_deferred(name: &str, allowed_tools: &[String]) -> bool {
+    caudra_config::is_deferred_builtin(name)
+        && !allowed_tools.iter().any(|allowed| allowed == name)
 }
 
 /// One deferred definition and the text a query is matched against.

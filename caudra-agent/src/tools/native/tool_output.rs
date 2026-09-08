@@ -25,7 +25,8 @@ use caudra_storage::tool_outputs::{
 };
 
 pub const DESCRIPTION: &str = "Page or search managed tool output owned by the current session. \
-     Omit `pattern` to read lines from `offset`; supply it to return regex matches with context.";
+     Omit `pattern` to read lines from `offset`, or supply it to return regex matches with \
+     context.";
 
 const SESSION_REQUIRED: &str = "tool output retrieval requires a session";
 const STORE_UNAVAILABLE: &str = "tool output store is unavailable";
@@ -62,8 +63,8 @@ static BYTE_OFFSET_PARAM: ParamSchema = ParamSchema::Primitive {
 };
 static LIMIT_PARAM: ParamSchema = ParamSchema::Primitive {
     kind: ParamKind::Integer,
-    description: "Lines to return when reading (default: 200, capped at 2000) or matches when \
-                  searching (default: 100, capped at 200).",
+    description: "Lines to return when reading, or matches when searching. Reading defaults to \
+                  200 and caps at 2000. Searching defaults to 100 and caps at 200.",
 };
 static PATTERN_PARAM: ParamSchema = ParamSchema::Primitive {
     kind: ParamKind::String,

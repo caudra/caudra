@@ -62,7 +62,11 @@ struct ToolInfo {
 /// Hand-written prose that belongs with the generated tool list. Kept here so
 /// the page stays a single generated file.
 fn write_disabling_section(out: &mut String) {
-    let companions = caudra_config::INTERNAL_COMPANION_TOOL_NAMES.join("` and `");
+    let companions = code_list(caudra_config::INTERNAL_COMPANION_TOOL_NAMES);
+    let (verb, pronoun) = match caudra_config::INTERNAL_COMPANION_TOOL_NAMES.len() {
+        1 => ("stays", "it"),
+        _ => ("stay", "them"),
+    };
     writeln!(
         out,
         "\n## Disabling tools\n\n\
@@ -78,11 +82,68 @@ fn write_disabling_section(out: &mut String) {
          `--disallowed-tools` does the same for one run and accepts the same names. \
          `plugins.<name>.enabled = false` still works and maps to the tools that plugin was \
          replaced by, so `plugins.bash` turns off `shell`.\n\n\
-         `{companions}` stay available whatever the lists say. The agent calls them on its own to \
-         page through a truncated result.\n\n\
+         {companions} {verb} available whatever the lists say. The agent calls {pronoun} on its \
+         own to page through a truncated result.\n\n\
          Run [`caudra tools`](/docs/cli/) to see the resulting set, including which rule turned \
          each tool off. To keep a tool available but gate every call, use a `deny` or `prompt` \
          default in [Permissions](/docs/permissions/) instead."
+    )
+    .unwrap();
+}
+
+fn code_list(names: &[&str]) -> String {
+    let quoted: Vec<String> = names.iter().map(|name| format!("`{name}`")).collect();
+    match quoted.split_last() {
+        Some((last, [])) => last.clone(),
+        Some((last, [first])) => format!("{first} and {last}"),
+        Some((last, rest)) => format!("{}, and {last}", rest.join(", ")),
+        None => String::new(),
+    }
+}
+
+/// Derived from `DEFERRED_BUILTIN_TOOLS` so the page cannot drift from the set
+/// the agent actually withholds.
+fn write_on_demand_section(out: &mut String) {
+    let mut groups: Vec<(&str, Vec<&str>)> = Vec::new();
+    let mut ungrouped: Vec<&str> = Vec::new();
+    for deferred in caudra_config::DEFERRED_BUILTIN_TOOLS {
+        match deferred.group {
+            Some(group) => match groups.iter_mut().find(|(name, _)| *name == group) {
+                Some((_, members)) => members.push(deferred.name),
+                None => groups.push((group, vec![deferred.name])),
+            },
+            None => ungrouped.push(deferred.name),
+        }
+    }
+    let total = caudra_config::DEFERRED_BUILTIN_TOOLS.len();
+
+    writeln!(
+        out,
+        "\n## Tools loaded on demand\n\n\
+         {total} built-in tools start outside the request array. The model sees a `tool_search` \
+         entry instead, and one call with a query loads the matching tools for the rest of the \
+         session. Sessions that never need them never pay for their descriptions."
+    )
+    .unwrap();
+    for (group, members) in &groups {
+        writeln!(
+            out,
+            "\n{} load together as the {group} group, because a question about an unfamiliar \
+             codebase usually takes several of them in a row.",
+            code_list(members)
+        )
+        .unwrap();
+    }
+    if !ungrouped.is_empty() {
+        writeln!(out, "\n{} load on their own.", code_list(&ungrouped)).unwrap();
+    }
+    writeln!(
+        out,
+        "\nLoading changes the tool array, so the provider's prompt cache prefix resets and the \
+         next request re-reads the history as fresh input. Caudra posts a notice naming what \
+         loaded when it happens.\n\n\
+         Listing a tool in `--allowed-tools` asks for it upfront and skips the search. \
+         [`caudra tools`](/docs/cli/) marks the rest as `deferred behind tool_search`."
     )
     .unwrap();
 }
@@ -194,6 +255,9 @@ fn write_tool_entry(out: &mut String, name: &str, info: &ToolInfo, opt_in: &Hash
     }
     if opt_in.contains(name) {
         badges.push_str(" <span class=\"badge badge-optin\">opt-in</span>");
+    }
+    if caudra_config::is_deferred_builtin(name) {
+        badges.push_str(" <span class=\"badge\">on demand</span>");
     }
     writeln!(out, "### `{name}`{badges} {{#{name}}}").unwrap();
     writeln!(out).unwrap();
@@ -380,6 +444,7 @@ pub fn generate() -> String {
     )
     .unwrap();
     write_disabling_section(&mut out);
+    write_on_demand_section(&mut out);
 
     let mut rendered: HashSet<&str> = HashSet::new();
 

@@ -9,7 +9,7 @@ use color_eyre::eyre::{Context, bail};
 use caudra_agent::mcp::{McpSession, config as mcp_config, oauth as mcp_oauth};
 use caudra_agent::tools::{
     DescriptionContext, RegisteredTool, SHELL_TOOL_NAME, ToolAudience, ToolFilter, ToolRegistry,
-    VIEW_IMAGE_TOOL_NAME, capability_exclusions, credential_exclusions, is_tool_enabled,
+    VIEW_IMAGE_TOOL_NAME, capability_exclusions, credential_exclusions, deferral, is_tool_enabled,
 };
 use caudra_config::providers::{
     Protocol, ProviderDef, ProvidersConfig, all_builtins, builtin_provider, resolve_api_key_env,
@@ -789,7 +789,10 @@ fn builtin_note(
     let named_off = cli_disallowed.iter().any(|tool| tool == name);
     let config_off = config.disabled_tools.iter().any(|tool| tool == name);
     if enabled {
-        return (named_off || config_off).then_some(REASON_COMPANION);
+        if named_off || config_off {
+            return Some(REASON_COMPANION);
+        }
+        return deferral::is_deferred(name, &config.allowed_tools).then_some(REASON_DEFERRED);
     }
     if named_off {
         return Some(REASON_DISALLOWED_FLAG);
@@ -887,7 +890,8 @@ fn print_group(heading: &str, rows: &[ToolRow]) {
     if rows.is_empty() {
         return;
     }
-    let width = rows.iter().map(|row| row.name.len()).max().unwrap_or(0);
+    let name_width = rows.iter().map(|row| row.name.len()).max().unwrap_or(0);
+    let source_width = rows.iter().map(|row| row.source.len()).max().unwrap_or(0);
     println!("{heading}");
     for row in rows {
         let state = if row.enabled { "on " } else { "off" };
@@ -903,12 +907,11 @@ fn print_group(heading: &str, rows: &[ToolRow]) {
         } else {
             format!("  ({detail})")
         };
-        println!(
-            "  {state}  {:width$}  {}{detail}",
-            row.name,
-            row.source,
-            width = width
+        let line = format!(
+            "  {state}  {:name_width$}  {:source_width$}{detail}",
+            row.name, row.source
         );
+        println!("{}", line.trim_end());
     }
     println!();
 }
@@ -1207,6 +1210,31 @@ mod tools_tests {
     #[test]
     fn an_ordinary_enabled_tool_has_no_note() {
         assert_eq!(note("shell", true, &[], &agent_config(&[], &[])), None);
+    }
+
+    /// Enabled but absent from the request array until asked for, which is
+    /// exactly the state a `caudra tools` reader would otherwise misread as
+    /// "the model can see this".
+    #[test]
+    fn a_deferred_tool_says_it_waits_behind_tool_search() {
+        let config = agent_config(&[], &[]);
+        for deferred in caudra_config::DEFERRED_BUILTIN_TOOLS {
+            assert_eq!(
+                note(deferred.name, true, &[], &config),
+                Some(REASON_DEFERRED),
+                "{}",
+                deferred.name
+            );
+        }
+    }
+
+    /// Asking for a tool by name is asking for it upfront, so the allow list
+    /// cancels the deferral rather than leaving the user to search for what
+    /// they already named.
+    #[test]
+    fn an_allow_listed_deferred_tool_is_not_deferred() {
+        let name = caudra_config::DEFERRED_BUILTIN_TOOLS[0].name;
+        assert_eq!(note(name, true, &[], &agent_config(&[], &[name])), None);
     }
 
     /// Naming a companion is not an error, but the report has to say the

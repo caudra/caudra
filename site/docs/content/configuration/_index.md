@@ -127,7 +127,7 @@ How many lines of output an open card shows per tool before it says how many it 
 | `read` | 3 | `file_read` |
 | `write` | 7 | `file_write`, `file_edit`, `file_apply_patch`, `image_generate`, `memory` |
 | `web` | 3 | `webfetch`, `websearch` |
-| `other` | 3 | `batch`, `execution_environment`, `question`, `skill`, `todo_write`, `tool_output_grep`, `tool_output_read`, `view_image` |
+| `other` | 3 | `batch`, `execution_environment`, `question`, `skill`, `todo_write`, `tool_output`, `view_image` |
 
 ### `agent`
 

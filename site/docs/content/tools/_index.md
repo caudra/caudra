@@ -7,7 +7,7 @@ group = "Reference"
 
 # Tools
 
-Caudra ships with 27 built-in tools in this reference (27 on by default, 0 opt-in via plugin options). Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
+Caudra ships with 26 built-in tools in this reference (26 on by default, 0 opt-in via plugin options). Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
 
 First-party file, web, shell, index, Python, and environment tools run through protocol-neutral Workcell contracts. Workcell owns schemas, validation, execution bounds, atomic file changes, network policy, subprocess cleanup, cancellation, and the bundled worker lifecycle. Caudra owns registration, authorization, retained session output, and model or UI presentation. Release builds pin an exact Workcell revision.
 
@@ -23,9 +23,21 @@ caudra.setup({
 
 `--disallowed-tools` does the same for one run and accepts the same names. `plugins.<name>.enabled = false` still works and maps to the tools that plugin was replaced by, so `plugins.bash` turns off `shell`.
 
-`tool_output_grep` and `tool_output_read` stay available whatever the lists say. The agent calls them on its own to page through a truncated result.
+`tool_output` stays available whatever the lists say. The agent calls it on its own to page through a truncated result.
 
 Run [`caudra tools`](/docs/cli/) to see the resulting set, including which rule turned each tool off. To keep a tool available but gate every call, use a `deny` or `prompt` default in [Permissions](/docs/permissions/) instead.
+
+## Tools loaded on demand
+
+7 built-in tools start outside the request array. The model sees a `tool_search` entry instead, and one call with a query loads the matching tools for the rest of the session. Sessions that never need them never pay for their descriptions.
+
+`code_map`, `code_context`, `code_refs`, `code_impact`, and `code_expand` load together as the code graph group, because a question about an unfamiliar codebase usually takes several of them in a row.
+
+`execution_environment` and `image_generate` load on their own.
+
+Loading changes the tool array, so the provider's prompt cache prefix resets and the next request re-reads the history as fresh input. Caudra posts a notice naming what loaded when it happens.
+
+Listing a tool in `--allowed-tools` asks for it upfront and skips the search. [`caudra tools`](/docs/cli/) marks the rest as `deferred behind tool_search`.
 
 ## File Operations
 
@@ -98,29 +110,19 @@ A search that reaches its bounds returns what it found instead of failing. The r
 | `path` | string | no | Optional file or directory under the root. |
 | `include` | string | no | Optional file glob filter. |
 
-### `tool_output_read` {#tool_output_read}
+### `tool_output` {#tool_output}
 
-Read a page of managed tool output owned by the current session.
-
-| Parameter | Type | Required | Default | Description |
-|-----------|------|----------|---------|-------------|
-| `output_id` | string | yes |  | Opaque ID from a tool-output truncation notice. |
-| `offset` | integer | no | 1 | Starting line, 1-indexed. |
-| `byte_offset` | integer | no | 0; use continuation hints | Starting byte within the first line. |
-| `limit` | integer | no | 200; capped at 2000 | Maximum lines to return. |
-
-### `tool_output_grep` {#tool_output_grep}
-
-Search managed tool output owned by the current session using a regex.
+Page or search managed tool output owned by the current session. Omit `pattern` to read lines from `offset`, or supply it to return regex matches with context.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | `output_id` | string | yes |  | Opaque ID from a tool-output truncation notice. |
-| `pattern` | string | yes |  | Regex pattern. |
+| `pattern` | string | no |  | Regex to search for. Omit to read lines instead. |
 | `offset` | integer | no | 1 | Starting line, 1-indexed. |
-| `limit` | integer | no | 100; capped at 200 | Maximum matches to return. |
-| `context_before` | integer | no | 0; capped at 5 | Context lines before each match. |
-| `context_after` | integer | no | 0; capped at 5 | Context lines after each match. |
+| `limit` | integer | no |  | Lines to return when reading, or matches when searching. Reading defaults to 200 and caps at 2000. Searching defaults to 100 and caps at 200. |
+| `byte_offset` | integer | no | 0; use continuation hints | Starting byte within the first line. Reading only. |
+| `context_before` | integer | no | 0; capped at 5 | Context lines before each match. Searching only. |
+| `context_after` | integer | no | 0; capped at 5 | Context lines after each match. Searching only. |
 
 ### `view_image` {#view_image}
 
@@ -132,26 +134,26 @@ View an image file (png, jpeg, gif, webp) so you can actually see it; it is retu
 
 ## Code Intelligence
 
-### `code_map` {#code_map}
+### `code_map` <span class="badge">on demand</span> {#code_map}
 
 Rank every symbol in a source tree by importance and return the top ones. Start here when you do not know a codebase.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `path` | string | no | Root-relative subdirectory to scope the map to. Absent means the whole configured root. |
+| `path` | string | no | Root-relative subdirectory to scope the map to. Absent means the whole configured root, and an empty string is the same as absent. |
 | `limit` | integer | no | Maximum rows to return. Narrows the result; it can never widen it past the host ceiling. |
 
-### `code_context` {#code_context}
+### `code_context` <span class="badge">on demand</span> {#code_context}
 
 Return the symbols worth reading before making a specific change. Describe the change in your own words.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `task` | string | yes | The change you are about to make, in your own words. |
-| `path` | string | no | Root-relative subdirectory to scope the map to. Absent means the whole configured root. |
+| `path` | string | no | Root-relative subdirectory to scope the map to. Absent means the whole configured root, and an empty string is the same as absent. |
 | `limit` | integer | no | Maximum rows to return. Narrows the result; it can never widen it past the host ceiling. |
 
-### `code_refs` {#code_refs}
+### `code_refs` <span class="badge">on demand</span> {#code_refs}
 
 List the symbols that reference a given symbol, or the symbols it references.
 
@@ -159,10 +161,10 @@ List the symbols that reference a given symbol, or the symbols it references.
 |-----------|------|----------|-------------|
 | `symbol` | string | yes | A symbol name, optionally qualified as `path::name` to disambiguate. |
 | `direction` | string | no | `callers` lists symbols referencing this one; `callees` lists the ones it references. |
-| `path` | string | no | Root-relative subdirectory to scope the map to. Absent means the whole configured root. |
+| `path` | string | no | Root-relative subdirectory to scope the map to. Absent means the whole configured root, and an empty string is the same as absent. |
 | `limit` | integer | no | Maximum rows to return. Narrows the result; it can never widen it past the host ceiling. |
 
-### `code_impact` {#code_impact}
+### `code_impact` <span class="badge">on demand</span> {#code_impact}
 
 Show what a change to a symbol could reach, and which tests already cover it.
 
@@ -170,17 +172,17 @@ Show what a change to a symbol could reach, and which tests already cover it.
 |-----------|------|----------|-------------|
 | `symbol` | string | yes | A symbol name, optionally qualified as `path::name` to disambiguate. |
 | `depth` | integer | no | Hops to walk backwards along call edges. Beyond a few hops a reachability set describes the repository rather than a blast radius. |
-| `path` | string | no | Root-relative subdirectory to scope the map to. Absent means the whole configured root. |
+| `path` | string | no | Root-relative subdirectory to scope the map to. Absent means the whole configured root, and an empty string is the same as absent. |
 | `limit` | integer | no | Maximum rows to return. Narrows the result; it can never widen it past the host ceiling. |
 
-### `code_expand` {#code_expand}
+### `code_expand` <span class="badge">on demand</span> {#code_expand}
 
 Return one symbol's source together with its immediate callers and callees.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `symbol` | string | yes | A symbol name, optionally qualified as `path::name` to disambiguate. |
-| `path` | string | no | Root-relative subdirectory to scope the map to. Absent means the whole configured root. |
+| `path` | string | no | Root-relative subdirectory to scope the map to. Absent means the whole configured root, and an empty string is the same as absent. |
 
 ## Execution & Control
 
@@ -217,7 +219,7 @@ Release builds include the isolated Monty worker. `WORKCELL_MCP_CODE_WORKER` can
 | `code` | string | yes | Python source to execute. The value of the final expression is returned. |
 | `timeout` | integer | no | Optional timeout in milliseconds. Defaults to 5000 and is capped at 30000. |
 
-### `execution_environment` {#execution_environment}
+### `execution_environment` <span class="badge">on demand</span> {#execution_environment}
 
 Inspect the execution host's current sanitized environment.
 
@@ -280,7 +282,7 @@ Load a skill that provides instructions and workflows for specific tasks.
 
 ## Media
 
-### `image_generate` {#image_generate}
+### `image_generate` <span class="badge">on demand</span> {#image_generate}
 
 Generate a raster image from a text prompt and save it as a PNG. Use for AI-created bitmap visuals: illustrations, textures, sprites, photos, and mockups. Requires a ChatGPT subscription login (`caudra auth login openai`) and bills against that plan, not API credits.
 
