@@ -91,7 +91,7 @@ caudra
 Type what you want done, press Enter, watch it work. Worth knowing on day one:
 
 - **Permissions.** File edits inside the repo run freely. `shell` and web tools ask first: `y` allows once, `s` remembers the exact call for the conversation, and `a` remembers it for the project. Deny rules always win. `/yolo` skips prompts after deny checks. Details in [Permissions](/docs/permissions/).
-- **Plan mode.** Caudra opens here, so the plan file is the only thing the agent writes until you approve. It reads and searches freely, and runs read-only shell commands like `git log` and `rg`. Anything else asks first, every time. `Tab` toggles it. A resumed session reopens in the mode you left it in.
+- **Plan mode.** Caudra opens here, so the plan file is the only thing the agent writes until you approve. It reads and searches freely, and runs read-only shell commands like `git log` and `rg`. Anything else asks first. You can approve it for the conversation, though not for the project or globally, so nothing allowed while planning outlives the session. `Tab` toggles it. A resumed session reopens in the mode you left it in.
 - **Models.** `/model` switches mid-session.
 - **Sessions.** `/new` starts a second session while the first keeps working in the background; `/sessions` jumps between them. Tomorrow, `caudra --continue` resumes where you left off.
 - **Message actions.** Click `⋮` beside a conversation message to fork or revert there. Right-clicking the message is an optional shortcut when the terminal forwards it. See [Sessions, Forks, and Revert](/docs/sessions/) for history boundaries, file snapshots, conflicts, and unrevert.

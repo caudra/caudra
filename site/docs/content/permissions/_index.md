@@ -49,25 +49,35 @@ A user-created fork starts with no conversation grants and no inherited explicit
 
 The prompt shows the action, risk, selected authority, and typed resources before its controls. Resources already covered by another rule appear after unresolved resources with an `already allowed` marker. The body expands when the terminal has room and scrolls on smaller terminals while the controls remain visible.
 
-The validated JSON input starts collapsed to a summary of its shape and size. Press `i` to read all of it. Nothing is truncated when it is expanded. Likely secret values and URL query values are masked in both states.
+The action line carries the arguments its own summary does not already name, in the compact form the transcript uses. Likely secret values and URL query values are masked there.
 
 | Key | Action |
 |---|---|
 | `y` | Allow this exact call once |
-| `Tab` / `Shift-Tab` | Select a host-generated reusable authority |
+| `Up` / `Down` | Select a host-generated reusable authority |
+| `Left` / `Right` | Walk the selected authority along its range, where it has one |
 | `s` | Allow the selected authority for the conversation, after confirmation |
 | `a` | Allow the selected authority for the project, after confirmation |
 | `A` | Allow the selected authority globally, after confirmation |
 | `n` | Add guidance and deny once |
 | `d` | Deny this exact call for the project, after confirmation |
 | `D` | Deny this exact call globally, after confirmation |
-| `i` | Expand or collapse the validated JSON input |
-| `f` | Show technical identity and digest details |
+| `PageUp` / `PageDown` | Scroll the body when it does not fit |
 | `Esc` or `Ctrl-C` | Deny once |
+
+The footer names widening only when the selected authority has somewhere to go, and the page keys only when the body is taller than the space it has.
 
 Reusable approvals are exact by default. A parsed shell command can offer a token-bound command pattern such as `git diff *` before the unrestricted workdir and global shell choices. Broad authorities require explicit selection. Unrestricted URL, search, shell, and MCP authorities also require a typed phrase. Each authority advertises its valid lifetimes. Whole-tool MCP authority is conversation-only.
 
+A filesystem authority arrives as a ladder. Its narrowest rung covers the directories the request touched, and each step up covers the directory above, as far as the filesystem root. The rungs share one row, and `Left` and `Right` walk it, so widening changes the reach the row names rather than adding choices to scroll through. A rung reaching outside the repository is marked `outside repo`. A rung that takes in your home directory is marked `outside home` and needs the `ALLOW OUTSIDE HOME` phrase. Moving to another authority and back returns the ladder to its narrowest rung.
+
 Multiple requests are queued by request ID. The prompt identifies the requesting subtask. A subtask request cannot replace a prompt from the main agent or another subtask. Confirming a reusable authority also approves every pending request it already covers. Conversation, project, and global lifetimes limit which pending conversations or projects can share that approval. Allow once and deny decisions resolve only the selected request.
+
+## Plan mode
+
+While plan mode is active, Caudra withholds the authority that would outlive the plan. Remembered project and global rules do not apply, allows from `permissions.toml` do not apply, and the prompt offers only the once and conversation lifetimes. Deny and ask rules still apply, because they only restrict access.
+
+A conversation grant made while planning does apply for the rest of the plan. Approving broad shell authority once therefore lets the agent keep exploring with scripts and searches instead of asking about each command. The grant stays with the conversation after you leave plan mode.
 
 ## Stored rules
 
