@@ -1495,35 +1495,17 @@ fn filesystem_ancestor_digests(value: &str) -> Option<HashSet<String>> {
     )
 }
 
-fn url_subtree_digest(value: &str) -> Option<String> {
-    let root = url_subtree_root(value)?;
-    Some(scoped_digest("url_subtree", &root))
+fn url_subtree_digest(root: &str) -> String {
+    scoped_digest("url_subtree", root)
 }
 
 fn url_subtree_digests(value: &str) -> Option<HashSet<String>> {
-    let strict = strict_http_url(value)?;
-    let segments: Vec<_> = strict
-        .url
-        .path_segments()?
-        .filter(|segment| !segment.is_empty())
-        .collect();
-    let mut digests = HashSet::with_capacity(segments.len() + 1);
-    for count in 0..=segments.len() {
-        let mut root = strict.url.clone();
-        root.set_query(None);
-        root.set_fragment(None);
-        let path = if count == 0 {
-            "/".to_owned()
-        } else {
-            format!("/{}", segments[..count].join("/"))
-        };
-        root.set_path(&path);
-        digests.insert(scoped_digest(
-            "url_subtree",
-            &normalize_percent_hex(root.as_str()),
-        ));
-    }
-    Some(digests)
+    Some(
+        url_subtree_roots(&strict_http_url(value)?)?
+            .iter()
+            .map(|root| url_subtree_digest(root))
+            .collect(),
+    )
 }
 
 fn url_origin_digest(value: &str) -> Option<String> {
@@ -1534,16 +1516,28 @@ fn url_origin_digest(value: &str) -> Option<String> {
     ))
 }
 
-fn url_subtree_root(value: &str) -> Option<String> {
-    let strict = strict_http_url(value)?;
-    let mut root = strict.url;
-    root.set_query(None);
-    root.set_fragment(None);
-    if root.path().len() > 1 {
-        let path = root.path().trim_end_matches('/').to_owned();
-        root.set_path(&path);
-    }
-    Some(normalize_percent_hex(root.as_str()))
+/// Every prefix of a URL's path as a subtree root, deepest first and ending at
+/// the origin's own root. One construction, so a rule minted for a root and the
+/// match that has to accept it can never disagree on how the root is spelled.
+fn url_subtree_roots(strict: &StrictHttpUrl) -> Option<Vec<String>> {
+    let segments: Vec<_> = strict
+        .url
+        .path_segments()?
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    let mut base = strict.url.clone();
+    base.set_query(None);
+    base.set_fragment(None);
+    Some(
+        (0..=segments.len())
+            .rev()
+            .map(|depth| {
+                let mut root = base.clone();
+                root.set_path(&format!("/{}", segments[..depth].join("/")));
+                normalize_percent_hex(root.as_str())
+            })
+            .collect(),
+    )
 }
 
 fn normalized_filesystem_path(path: &str) -> Option<PathBuf> {
@@ -2168,7 +2162,9 @@ fn rule_options(
             None,
         ));
 
-        if let Some(root) = url_subtree_root(&resource.value)
+        if let Some(root) = url_subtree_roots(&strict)
+            .as_ref()
+            .and_then(|roots| roots.first())
             && strict.url.path() != "/"
         {
             options.push(option(
@@ -2179,7 +2175,7 @@ fn rule_options(
                 vec![PermissionResourceConstraint {
                     kind: PermissionResourceKind::Url,
                     selector: PermissionResourceSelector::UrlSubtreeDigest {
-                        digest: url_subtree_digest(&root).expect("strict URL subtree has a digest"),
+                        digest: url_subtree_digest(root),
                     },
                     access: resource.access.clone(),
                     protected: Some(false),
@@ -4005,6 +4001,49 @@ mod tests {
             serde_json::from_str::<PermissionRequest>(&serialized).unwrap(),
             request
         );
+    }
+
+    const EXPECT_STRICT_URL: &str = "the value is a strict HTTP(S) URL";
+    const EXPECT_URL_ROOTS: &str = "a strict HTTP(S) URL has subtree roots";
+    const EXPECT_SUBTREE_OPTION: &str = "a webfetch request offers a URL subtree";
+
+    fn webfetch_request(url: &str) -> PermissionRequest {
+        PermissionRequest::from_legacy(
+            url.into(),
+            ToolKey::native("webfetch"),
+            vec![url.into()],
+            json!({"url": url}),
+            Path::new("/project"),
+            false,
+        )
+    }
+
+    #[test]
+    fn url_subtree_roots_climb_from_the_path_to_the_origin() {
+        let strict =
+            strict_http_url("https://example.com/a/b/c?q=1#frag").expect(EXPECT_STRICT_URL);
+        assert_eq!(
+            url_subtree_roots(&strict).expect(EXPECT_URL_ROOTS),
+            [
+                "https://example.com/a/b/c",
+                "https://example.com/a/b",
+                "https://example.com/a",
+                "https://example.com/",
+            ]
+        );
+    }
+
+    /// The root a rule is minted from and the roots a match is tested against
+    /// have to be spelled the same way, or a grant fails to cover the very URL
+    /// it was granted for. An empty path segment is where the two spellings used
+    /// to diverge.
+    #[test]
+    fn a_repeated_slash_mints_a_rule_that_matches_its_own_url() {
+        let request = webfetch_request("https://example.com/a//b");
+        let subtree = request
+            .option_rule("allow_url_subtree", PermissionLifetime::Conversation)
+            .expect(EXPECT_SUBTREE_OPTION);
+        assert!(permission_rule_covers_request(&subtree, &request));
     }
 
     #[test]
