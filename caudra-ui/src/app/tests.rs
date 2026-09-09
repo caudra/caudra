@@ -4008,6 +4008,49 @@ fn opening_model_picker_clears_footer_hover() {
     assert_eq!(app.status_hover, None);
 }
 
+/// The footer draws no price until a turn has been billed, and no price means
+/// no control to click.
+fn priced_app() -> App {
+    let mut app = test_app();
+    app.chats[0].cost = MAIN_COST;
+    app
+}
+
+/// The two figures on the right of the footer are the shortest form of the
+/// answers `/context` and `/usage` give, so clicking one opens the view behind
+/// it rather than making the reader type the command.
+#[test]
+fn clicking_the_context_figure_opens_the_context_modal() {
+    let mut app = test_app();
+
+    assert!(click_status(&mut app, StatusBarHitTarget::Context).is_empty());
+
+    assert!(app.context_modal.is_open());
+}
+
+#[test]
+fn clicking_the_spend_figure_opens_usage_with_its_lifetime_totals() {
+    let mut app = priced_app();
+
+    let actions = click_status(&mut app, StatusBarHitTarget::Usage);
+
+    assert!(app.usage_modal.is_open());
+    assert!(matches!(&actions[..], [Action::RefreshUsage]));
+}
+
+#[test_case(StatusBarHitTarget::Context ; "context")]
+#[test_case(StatusBarHitTarget::Usage   ; "usage")]
+fn opening_a_figure_clears_footer_hover(target: StatusBarHitTarget) {
+    let mut app = priced_app();
+    let hit = status_hit(&mut app, target);
+    app.update(mouse_event(MouseEventKind::Moved, hit.area.x, hit.area.y));
+    assert_eq!(app.status_hover, Some(target));
+
+    click_status(&mut app, target);
+
+    assert_eq!(app.status_hover, None);
+}
+
 #[test]
 fn clicking_status_thinking_cycles_from_visible_off_state() {
     let mut app = test_app();

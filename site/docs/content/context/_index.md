@@ -11,7 +11,7 @@ Everything the model knows about your project passes through one context window,
 
 ## Inspect the active window
 
-`/context` shows a compact snapshot of the context Caudra would send for the transcript currently open. Main has one context. Each task has its own system prompt, tool set, and transcript, so opening a task and running `/context` reports that task alone. Return to Main to inspect Main. A task restored after restart has no request snapshot until the task is continued.
+`/context` shows a compact snapshot of the context Caudra would send for the transcript currently open. Clicking the token counter in the status bar opens the same view. Main has one context. Each task has its own system prompt, tool set, and transcript, so opening a task and running `/context` reports that task alone. Return to Main to inspect Main. A task restored after restart has no request snapshot until the task is continued.
 
 The summary shows the active model and window size, estimated tokens grouped by source, the compaction reserve, and the space available before automatic compaction. `/context all` adds item-level built-in tool, MCP tool, profile, memory, and skill inventories. Opening either view does not add its report to the transcript.
 

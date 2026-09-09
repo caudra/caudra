@@ -57,6 +57,8 @@ pub enum StatusBarHitTarget {
     Model,
     Thinking,
     Goal,
+    Context,
+    Usage,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,12 +130,10 @@ enum FlagTier {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ContextTier {
-    /// `12.0k/200.0k (6%)` beside the spend.
+    /// `12.0k/200.0k (6%)`.
     Counts,
-    /// `6%` beside the spend.
+    /// `6%`.
     Percent,
-    /// `6%` alone.
-    Bare,
     Hidden,
 }
 
@@ -146,7 +146,7 @@ enum Reduction {
     ShortThinking,
     ShortFlags,
     LeafModel,
-    BareContext,
+    DropSpend,
     DropContext,
     DropWorkflow,
     DropFast,
@@ -164,7 +164,7 @@ const LADDER: [Reduction; 12] = [
     Reduction::ShortThinking,
     Reduction::ShortFlags,
     Reduction::LeafModel,
-    Reduction::BareContext,
+    Reduction::DropSpend,
     Reduction::DropContext,
     Reduction::DropWorkflow,
     Reduction::DropFast,
@@ -174,11 +174,13 @@ const LADDER: [Reduction; 12] = [
 ];
 
 /// The counters and prices, rendered once per frame so walking the ladder is
-/// pure arithmetic over widths the bar already knows.
+/// pure arithmetic over widths the bar already knows. The counter and the money
+/// are separate strings because they are separate controls, and each carries the
+/// padding that keeps the two apart once they sit side by side.
 struct SpendText {
     counts: String,
     percent: String,
-    bare: String,
+    spend: Option<String>,
     global: Option<String>,
 }
 
@@ -189,20 +191,14 @@ impl SpendText {
         } else {
             0
         };
-        let bare = format!("  {pct}% ");
-        let counted = format!(
-            "  {}/{} ({pct}%)",
-            format_tokens(stats.context_size),
-            format_tokens(stats.context_window),
-        );
-        let (counts, percent) = match spend(stats.cost, stats.subscription_cost) {
-            Some(cost) => (format!("{counted} {cost} "), format!("  {pct}% {cost} ")),
-            None => (format!("{counted} "), bare.clone()),
-        };
         Self {
-            counts,
-            percent,
-            bare,
+            counts: format!(
+                "  {}/{} ({pct}%) ",
+                format_tokens(stats.context_size),
+                format_tokens(stats.context_window),
+            ),
+            percent: format!("  {pct}% "),
+            spend: spend(stats.cost, stats.subscription_cost).map(|cost| format!("{cost} ")),
             global: spend(stats.global_cost, stats.global_subscription_cost)
                 .filter(|_| stats.show_global)
                 .map(|global| format!(" \u{03a3}{global} ")),
@@ -215,6 +211,7 @@ impl SpendText {
 /// another.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Fit {
+    spend: bool,
     global_spend: bool,
     context: ContextTier,
     thinking: ThinkingTier,
@@ -227,6 +224,7 @@ struct Fit {
 
 impl Fit {
     const FULL: Self = Self {
+        spend: true,
         global_spend: true,
         context: ContextTier::Counts,
         thinking: ThinkingTier::Named,
@@ -244,7 +242,7 @@ impl Fit {
             Reduction::ShortThinking => self.thinking = ThinkingTier::Level,
             Reduction::ShortFlags => self.flags = FlagTier::Sigil,
             Reduction::LeafModel => self.model = ModelTier::Leaf,
-            Reduction::BareContext => self.context = ContextTier::Bare,
+            Reduction::DropSpend => self.spend = false,
             Reduction::DropContext => self.context = ContextTier::Hidden,
             Reduction::DropWorkflow => self.workflow = false,
             Reduction::DropFast => self.fast = false,
@@ -291,20 +289,27 @@ impl Fit {
 
     fn spend_width(self, spend: &SpendText) -> usize {
         self.context_text(spend).map_or(0, UnicodeWidthStr::width)
-            + self.global_text(spend).map_or(0, UnicodeWidthStr::width)
+            + self.money_text(spend).map_or(0, |money| money.width())
     }
 
     fn context_text(self, spend: &SpendText) -> Option<&str> {
         match self.context {
             ContextTier::Counts => Some(&spend.counts),
             ContextTier::Percent => Some(&spend.percent),
-            ContextTier::Bare => Some(&spend.bare),
             ContextTier::Hidden => None,
         }
     }
 
-    fn global_text(self, spend: &SpendText) -> Option<&str> {
-        spend.global.as_deref().filter(|_| self.global_spend)
+    /// Both figures answer the same question, so they are drawn and hit as one
+    /// control rather than as a price with a total stuck to it.
+    fn money_text(self, spend: &SpendText) -> Option<Cow<'_, str>> {
+        let chat = spend.spend.as_deref().filter(|_| self.spend);
+        let session = spend.global.as_deref().filter(|_| self.global_spend);
+        match (chat, session) {
+            (Some(chat), Some(session)) => Some(Cow::Owned(format!("{chat}{session}"))),
+            (Some(only), None) | (None, Some(only)) => Some(Cow::Borrowed(only)),
+            (None, None) => None,
+        }
     }
 }
 
@@ -501,8 +506,7 @@ impl StatusBar {
         }
 
         let mut right_spans = Vec::new();
-        let mut model_hit = None;
-        let mut thinking_hit = None;
+        let mut right_hits = Vec::new();
 
         match ctx.status {
             Status::Error { message: e, .. } => {
@@ -516,8 +520,7 @@ impl StatusBar {
                     (area.width as usize).saturating_sub(left_width),
                 );
                 right_spans = side.spans;
-                model_hit = Some(side.model_hit);
-                thinking_hit = side.thinking_hit;
+                right_hits = side.hits;
             }
         }
 
@@ -553,24 +556,14 @@ impl StatusBar {
             ctx.back_to_main,
             StatusBarHitTarget::BackToMain,
         );
-        if let Some((offset, width)) = model_hit {
+        for (target, offset, width) in right_hits {
             push_hit(
                 &mut hits,
                 right_area,
                 offset,
                 width,
                 ctx.settings_clickable,
-                StatusBarHitTarget::Model,
-            );
-        }
-        if let Some((offset, width)) = thinking_hit {
-            push_hit(
-                &mut hits,
-                right_area,
-                offset,
-                width,
-                ctx.settings_clickable,
-                StatusBarHitTarget::Thinking,
+                target,
             );
         }
         if let Some((offset, width)) = goal_hit {
@@ -587,13 +580,33 @@ impl StatusBar {
     }
 }
 
-/// The right-hand half of the bar, already fitted to `budget`.
+/// The right-hand half of the bar, already fitted to `budget`. Hits are measured
+/// on the glyphs that were drawn, so a control cannot claim columns a shorter
+/// tier never used.
 struct RightSide<'a> {
     spans: Vec<Span<'a>>,
-    /// Offsets measured on the glyphs that were drawn, so a hit cannot claim
-    /// columns a shorter tier never used.
-    model_hit: (usize, usize),
-    thinking_hit: Option<(usize, usize)>,
+    hits: Vec<(StatusBarHitTarget, usize, usize)>,
+}
+
+/// Draws one control: the padding stays plain so a hover reverses the figure
+/// alone, and the returned hit covers exactly the glyphs that were highlighted.
+fn push_control<'a>(chips: &mut Vec<Span<'a>>, text: &str, style: Style) -> Option<(usize, usize)> {
+    let offset = chips.iter().map(Span::width).sum::<usize>();
+    let body = text.trim();
+    if body.is_empty() {
+        chips.push(Span::raw(text.to_owned()));
+        return None;
+    }
+    let lead = text.len() - text.trim_start().len();
+    let tail = lead + body.len();
+    if lead > 0 {
+        chips.push(Span::raw(text[..lead].to_owned()));
+    }
+    chips.push(Span::styled(body.to_owned(), style));
+    if tail < text.len() {
+        chips.push(Span::raw(text[tail..].to_owned()));
+    }
+    Some((offset + lead, body.width()))
 }
 
 /// Walks [`LADDER`] until the fixed chips and the model fit, then hands the cwd
@@ -614,26 +627,27 @@ fn right_side<'a>(
     }
 
     let mut chips = Vec::new();
-    let mut thinking_chip = None;
+    let mut chip_hits = Vec::new();
+    let mut control = |chips: &mut Vec<Span<'a>>, target, text: &str, style| {
+        let hovered = ctx.settings_clickable && ctx.hovered == Some(target);
+        if let Some(hit) = push_control(chips, text, hover_style(style, hovered)) {
+            chip_hits.push((target, hit.0, hit.1));
+        }
+    };
+
     if let Some(level) = ctx.thinking.as_deref()
         && fit.thinking != ThinkingTier::Hidden
     {
         let label = match fit.thinking {
-            ThinkingTier::Named => format!("[{THINKING_PREFIX}{level}]"),
-            _ => format!("[{level}]"),
+            ThinkingTier::Named => format!(" [{THINKING_PREFIX}{level}]"),
+            _ => format!(" [{level}]"),
         };
-        thinking_chip = Some((
-            chips.iter().map(Span::width).sum::<usize>() + 1,
-            label.width(),
-        ));
-        chips.push(Span::raw(" "));
-        chips.push(Span::styled(
-            label,
-            hover_style(
-                settings_style(ctx),
-                ctx.settings_clickable && ctx.hovered == Some(StatusBarHitTarget::Thinking),
-            ),
-        ));
+        control(
+            &mut chips,
+            StatusBarHitTarget::Thinking,
+            &label,
+            settings_style(ctx),
+        );
     }
     if ctx.fast && fit.fast {
         chips.push(Span::styled(FAST_LABEL, theme::current().status_dim));
@@ -648,12 +662,11 @@ fn right_side<'a>(
         chips.push(Span::styled(fit.flags.yolo_label(), theme::current().error));
     }
     let counters = Style::new().fg(theme::current().foreground);
-    for text in fit
-        .context_text(&spend)
-        .into_iter()
-        .chain(fit.global_text(&spend))
-    {
-        chips.push(Span::styled(text.to_owned(), counters));
+    if let Some(text) = fit.context_text(&spend) {
+        control(&mut chips, StatusBarHitTarget::Context, text, counters);
+    }
+    if let Some(text) = fit.money_text(&spend) {
+        control(&mut chips, StatusBarHitTarget::Usage, &text, counters);
     }
 
     let residue = budget.saturating_sub(chips.iter().map(Span::width).sum::<usize>());
@@ -685,12 +698,14 @@ fn right_side<'a>(
     ));
     spans.append(&mut chips);
 
-    RightSide {
-        spans,
-        model_hit: (model_offset, model_width),
-        thinking_hit: thinking_chip
-            .map(|(offset, width)| (model_offset + model_width + offset, width)),
-    }
+    let chips_at = model_offset + model_width;
+    let mut hits = vec![(StatusBarHitTarget::Model, model_offset, model_width)];
+    hits.extend(
+        chip_hits
+            .into_iter()
+            .map(|(target, offset, width)| (target, chips_at + offset, width)),
+    );
+    RightSide { spans, hits }
 }
 
 fn settings_style(ctx: &StatusBarContext<'_>) -> Style {
@@ -905,6 +920,13 @@ mod tests {
     /// to keep the control, too narrow to spell the word in front of it.
     const SHORT_THINKING_BUDGET: usize = 40;
     const SHORT_THINKING_CHIP: &str = "[xhigh]";
+    /// Room for every rung, so both figures are on screen at their full tier.
+    const WIDE_BUDGET: usize = 120;
+    const COUNTS_GLYPHS: &str = "12.0k/200.0k (6%)";
+    const MONEY_GLYPHS: &str = "$0.250  \u{03a3}$1.500";
+    const MISSING_HIT_MSG: &str = "the control was drawn without a hit";
+    const FIGURE_HIT_MSG: &str = "a figure's hit must cover its glyphs and no padding";
+    const STALE_HIT_MSG: &str = "a hit outlived the figure it was measured on";
     const OVER_BUDGET_MSG: &str = "the right side claimed more columns than its budget";
     const MONOTONE_MSG: &str = "a narrower bar showed a chip the wider one had dropped";
     const YOLO_LAST_MSG: &str = "yolo must outlive every other chip";
@@ -1033,6 +1055,19 @@ mod tests {
             .collect()
     }
 
+    fn side_hit(side: &RightSide<'_>, target: StatusBarHitTarget) -> Option<(usize, usize)> {
+        side.hits
+            .iter()
+            .find(|(hit, _, _)| *hit == target)
+            .map(|(_, offset, width)| (*offset, *width))
+    }
+
+    /// The glyphs a hit claims, read back out of the spans it was measured on.
+    fn hit_glyphs(side: &RightSide<'_>, target: StatusBarHitTarget) -> String {
+        let (offset, width) = side_hit(side, target).expect(MISSING_HIT_MSG);
+        side_text(side).chars().skip(offset).take(width).collect()
+    }
+
     /// Reads the drawn glyphs rather than the [`Fit`], so a tier that measures
     /// one way and draws another still counts as absent.
     fn visible_chips(side: &RightSide<'_>) -> Vec<Chip> {
@@ -1126,15 +1161,71 @@ mod tests {
     fn a_squeezed_thinking_chip_keeps_its_own_hit() {
         with_ladder_ctx(|ctx| {
             let side = right_side(ctx, LADDER_CWD, SHORT_THINKING_BUDGET);
-            let (offset, width) = side.thinking_hit.expect(SHORT_THINKING_MSG);
-            let text = side_text(&side);
-            let chip: String = text.chars().skip(offset).take(width).collect();
+            let (offset, _) = side_hit(&side, StatusBarHitTarget::Thinking).expect(MISSING_HIT_MSG);
 
-            assert_eq!(chip, SHORT_THINKING_CHIP, "{SHORT_THINKING_MSG}");
             assert_eq!(
-                text.chars().nth(offset - 1),
+                hit_glyphs(&side, StatusBarHitTarget::Thinking),
+                SHORT_THINKING_CHIP,
+                "{SHORT_THINKING_MSG}"
+            );
+            assert_eq!(
+                side_text(&side).chars().nth(offset - 1),
                 Some(' '),
                 "{SHORT_THINKING_MSG}"
+            );
+        });
+    }
+
+    /// Both figures open a view, so each needs a target of its own measured on
+    /// the glyphs alone. Padding inside a hit would hand clicks on empty
+    /// columns to a modal.
+    #[test_case(StatusBarHitTarget::Context, COUNTS_GLYPHS ; "counter_opens_context")]
+    #[test_case(StatusBarHitTarget::Usage, MONEY_GLYPHS    ; "money_opens_usage")]
+    fn a_figure_is_hit_on_its_own_glyphs(target: StatusBarHitTarget, expected: &str) {
+        with_ladder_ctx(|ctx| {
+            let side = right_side(ctx, LADDER_CWD, WIDE_BUDGET);
+            let (offset, _) = side_hit(&side, target).expect(MISSING_HIT_MSG);
+
+            assert_eq!(hit_glyphs(&side, target), expected, "{FIGURE_HIT_MSG}");
+            assert_eq!(
+                side_text(&side).chars().nth(offset - 1),
+                Some(' '),
+                "{FIGURE_HIT_MSG}"
+            );
+        });
+    }
+
+    /// The session total sits beside the chat's own price with two columns
+    /// between them. One control covers both, or hovering leaves a gap that
+    /// still answers the click.
+    #[test]
+    fn the_money_control_covers_both_figures() {
+        with_ladder_ctx(|ctx| {
+            let side = right_side(ctx, LADDER_CWD, WIDE_BUDGET);
+            let glyphs = hit_glyphs(&side, StatusBarHitTarget::Usage);
+
+            assert!(glyphs.starts_with(CHAT_COST_TEXT), "{glyphs}");
+            assert!(glyphs.ends_with(SESSION_COST_TEXT), "{glyphs}");
+        });
+    }
+
+    /// A figure the ladder dropped must not leave a control behind, or the bar
+    /// hands clicks to columns another chip is using.
+    #[test_case(WIDE_BUDGET, true, true              ; "both_figures_fit")]
+    #[test_case(SHORT_THINKING_BUDGET, false, false  ; "neither_figure_fits")]
+    fn a_dropped_figure_drops_its_control(budget: usize, context: bool, money: bool) {
+        with_ladder_ctx(|ctx| {
+            let side = right_side(ctx, LADDER_CWD, budget);
+
+            assert_eq!(
+                side_hit(&side, StatusBarHitTarget::Context).is_some(),
+                context,
+                "{STALE_HIT_MSG}"
+            );
+            assert_eq!(
+                side_hit(&side, StatusBarHitTarget::Usage).is_some(),
+                money,
+                "{STALE_HIT_MSG}"
             );
         });
     }
@@ -1239,8 +1330,10 @@ mod tests {
             StatusBarHitTarget::Model,
             StatusBarHitTarget::Thinking,
             StatusBarHitTarget::Goal,
+            StatusBarHitTarget::Context,
+            StatusBarHitTarget::Usage,
         ] {
-            assert!(hits.iter().any(|hit| hit.target == target));
+            assert!(hits.iter().any(|hit| hit.target == target), "{target:?}");
         }
     }
 
@@ -1258,6 +1351,8 @@ mod tests {
             StatusBarHitTarget::Model,
             StatusBarHitTarget::Thinking,
             StatusBarHitTarget::Goal,
+            StatusBarHitTarget::Context,
+            StatusBarHitTarget::Usage,
         ] {
             let (_, hits, styles) = render_at(
                 BAR_WIDTH,

@@ -733,6 +733,15 @@ impl App {
                 self.goal_modal.open();
                 Vec::new()
             }
+            StatusBarHitTarget::Context if self.is_main_chat() => {
+                self.clear_control_hovers();
+                self.execute_context("");
+                Vec::new()
+            }
+            StatusBarHitTarget::Usage if self.is_main_chat() => {
+                self.clear_control_hovers();
+                self.toggle_usage_modal()
+            }
             _ => Vec::new(),
         }
     }

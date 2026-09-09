@@ -2255,6 +2255,18 @@ impl App {
         false
     }
 
+    /// Shared by `/usage` and the footer's spend control, so a click cannot
+    /// open the modal without the lifetime figures the command loads.
+    fn toggle_usage_modal(&mut self) -> Vec<Action> {
+        self.usage_modal.toggle();
+        if self.usage_modal.is_open() {
+            self.load_lifetime_usage();
+            vec![Action::RefreshUsage]
+        } else {
+            vec![]
+        }
+    }
+
     fn execute_context(&mut self, args: &str) {
         let expanded = match args.trim() {
             "" => false,
@@ -3294,15 +3306,7 @@ impl App {
                 self.help_modal.toggle();
                 vec![]
             }
-            "/usage" => {
-                self.usage_modal.toggle();
-                if self.usage_modal.is_open() {
-                    self.load_lifetime_usage();
-                    vec![Action::RefreshUsage]
-                } else {
-                    vec![]
-                }
-            }
+            "/usage" => self.toggle_usage_modal(),
             "/context" => {
                 self.execute_context(&cmd.args);
                 vec![]
