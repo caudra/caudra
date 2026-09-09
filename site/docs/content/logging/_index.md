@@ -23,6 +23,11 @@ against the message, the target, the level, and each field on its own. Space
 separates terms and a record has to match all of them, so `provider retry` finds
 a retry from the provider.
 
+A record shows every field it carries, so a wide one runs past the right margin.
+`w` wraps it onto as many rows as it needs and the arrow keys pan across it, the
+same pair of answers the [Workbench](/docs/workbench/) editor gives a long line.
+The arrow hint appears only while there is something out there to reach.
+
 `Tab` on a selected record keeps only the records sharing its narrowest id, which
 turns a scattered turn or tool call into a readable sequence. A hint row lists
 the rest. See [Commands](/docs/commands/#logs) for the keys.

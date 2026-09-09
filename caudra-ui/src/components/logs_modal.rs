@@ -27,8 +27,10 @@ use crate::components::{
     Overlay, escape_terminal_controls, hint_line, hover_style, input_line_with_cursor, is_ctrl,
 };
 use crate::repaint::{Cadence, Dirty};
+use crate::selection::wrap_breaks;
 use crate::text_buffer::TextBuffer;
 use crate::theme::Theme;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 pub(crate) const TITLE: &str = " Logs ";
 const WIDTH_PERCENT: u16 = 92;
@@ -48,7 +50,6 @@ const KV_SEPARATOR: &str = "=";
 const EXPAND_INDENT: &str = "    ";
 const EXPAND_ARROW: &str = "> ";
 const RAW_JSON_LABEL: &str = "raw";
-const OVERFLOW_PREFIX: &str = "+";
 const LEVEL_PREFIX: &str = ">=";
 
 const NO_TAIL: &str = "No log file yet.";
@@ -61,9 +62,6 @@ const PAUSED: &str = "paused";
 const COPIED: &str = "Copied log line";
 const COPIED_RAW: &str = "Copied raw record";
 
-/// Fields shown inline. The rest live behind the expand key, so one slow tool
-/// call with twenty fields cannot push every other row off the screen.
-const INLINE_FIELD_LIMIT: usize = 6;
 /// Span fields worth carrying on the one-line view.
 const CORRELATION_FIELDS: &[&str] = &["session_id", "turn_id", "request_id", "tool_use_id"];
 /// Most specific first. `turn_id` is absent on purpose: it counts from one per
@@ -78,34 +76,32 @@ const HINT_KEY_ENTER: &str = "enter";
 const HINT_KEY_ESC: &str = "esc";
 const HINT_MOVE: &str = "select";
 const HINT_EXPAND: &str = "expand";
-const HINT_COLLAPSE: &str = "collapse";
 const HINT_FOCUS: &str = "only this id";
 const HINT_FILTER: &str = "filter";
 const HINT_LEVEL: &str = "level";
 const HINT_COPY: &str = "copy / raw";
-const HINT_FOLLOW: &str = "follow";
 const HINT_CLOSE: &str = "close";
 const HINT_APPLY: &str = "done";
 const HINT_CLEAR: &str = "clear";
-const HINTS: [(&str, &str); 7] = [
-    (HINT_KEY_MOVE, HINT_MOVE),
-    (HINT_KEY_ENTER, HINT_EXPAND),
-    ("tab", HINT_FOCUS),
-    ("/", HINT_FILTER),
+const HINT_KEY_PAN: &str = "\u{2190}\u{2192}";
+const HINT_KEY_FOCUS: &str = "tab";
+const HINT_KEY_FILTER: &str = "/";
+const HINT_PAN: &str = "pan";
+const HINT_WRAP: &str = "wrap";
+const HINT_COLLAPSE: &str = "collapse";
+const HINT_MOVE_KEYS: (&str, &str) = (HINT_KEY_MOVE, HINT_MOVE);
+const HINT_TAIL: [(&str, &str); 4] = [
     ("l", HINT_LEVEL),
+    ("w", HINT_WRAP),
     ("y/Y", HINT_COPY),
     (HINT_KEY_ESC, HINT_CLOSE),
 ];
-const EXPANDED_HINTS: [(&str, &str); 7] = [
-    (HINT_KEY_MOVE, HINT_MOVE),
-    (HINT_KEY_ENTER, HINT_COLLAPSE),
-    ("tab", HINT_FOCUS),
-    ("f", HINT_FOLLOW),
-    ("l", HINT_LEVEL),
-    ("y/Y", HINT_COPY),
-    (HINT_KEY_ESC, HINT_CLOSE),
-];
+
 const NO_FOCUS: &str = "That record carries no id to filter on";
+const WRAPPED: &str = "wrapped";
+const PAN_MARK: &str = "col ";
+/// Log lines are wide, so panning a character at a time would take all day.
+const PAN_STEP: isize = 8;
 
 pub enum LogsAction {
     Consumed,
@@ -126,6 +122,11 @@ pub struct LogsModal {
     selected: usize,
     view_top: usize,
     expanded: bool,
+    wrap: bool,
+    /// Display columns scrolled off the left. Always zero while wrapping,
+    /// since a wrapped row has nothing past the right margin to reach.
+    pan: usize,
+    max_pan: usize,
     outcome: ScanOutcome,
     last_sequence: u64,
     viewport_h: usize,
@@ -152,6 +153,9 @@ impl LogsModal {
             selected: 0,
             view_top: 0,
             expanded: false,
+            wrap: false,
+            pan: 0,
+            max_pan: 0,
             outcome: ScanOutcome::Filled,
             last_sequence: 0,
             viewport_h: 0,
@@ -185,6 +189,7 @@ impl LogsModal {
         self.expanded = false;
         self.query.clear();
         self.query_focused = false;
+        self.pan = 0;
         self.filter = Filter::default();
     }
 
@@ -274,6 +279,10 @@ impl LogsModal {
             }
             KeyCode::Char('f') => self.follow = !self.follow,
             KeyCode::Char('l') => self.cycle_level(),
+            KeyCode::Char('w') => self.toggle_wrap(),
+            KeyCode::Left => self.pan(-PAN_STEP),
+            KeyCode::Right => self.pan(PAN_STEP),
+            KeyCode::Home => self.pan = 0,
             KeyCode::Tab => return self.focus_correlation(),
             KeyCode::Enter | KeyCode::Char(' ') => self.expanded = !self.expanded,
             KeyCode::Char('y') => return self.copy(false),
@@ -343,6 +352,20 @@ impl LogsModal {
         self.query_focused = false;
         self.apply_query();
         LogsAction::Consumed
+    }
+
+    /// Wrapping and panning are two answers to the same question, so turning
+    /// one on puts the other back at the left margin.
+    fn toggle_wrap(&mut self) {
+        self.wrap = !self.wrap;
+        self.pan = 0;
+    }
+
+    fn pan(&mut self, delta: isize) {
+        if self.wrap {
+            return;
+        }
+        self.pan = self.pan.saturating_add_signed(delta).min(self.max_pan);
     }
 
     fn cycle_level(&mut self) {
@@ -441,7 +464,6 @@ impl LogsModal {
             self.selected = (self.selected + want).min(self.window_len().saturating_sub(1));
             self.follow = self.selected + 1 >= self.window_len() && self.at_end();
         }
-        self.reveal();
     }
 
     fn at_end(&self) -> bool {
@@ -480,21 +502,13 @@ impl LogsModal {
         self.view_top = self.view_top.saturating_sub(evicted);
     }
 
-    fn reveal(&mut self) {
-        let height = self.viewport_h.max(1);
-        if self.selected < self.view_top {
-            self.view_top = self.selected;
-        } else if self.selected >= self.view_top + height {
-            self.view_top = self.selected + 1 - height;
-        }
-        self.view_top = self.view_top.min(self.window_len().saturating_sub(1));
-    }
-
     pub fn handle_mouse(&mut self, event: MouseEvent) -> LogsAction {
         let pos = Position::new(event.column, event.row);
         match event.kind {
             MouseEventKind::ScrollUp => self.scroll_view(-1),
             MouseEventKind::ScrollDown => self.scroll_view(1),
+            MouseEventKind::ScrollLeft => self.pan(-PAN_STEP),
+            MouseEventKind::ScrollRight => self.pan(PAN_STEP),
             // Hover is read on the next frame, so it is recorded even where the
             // move itself is nothing the modal needs to act on.
             MouseEventKind::Moved => self.level_hovered = self.level_hit.contains(pos),
@@ -536,7 +550,11 @@ impl LogsModal {
             height: body_height,
             ..padded
         };
-        let (lines, rows) = self.body_lines(usize::from(padded.width), theme);
+        let width = usize::from(padded.width);
+        self.anchor(width, theme);
+        self.max_pan = self.widest_row(theme).saturating_sub(width);
+        self.pan = self.pan.min(self.max_pan);
+        let (lines, rows) = self.body_lines(width, theme);
         self.rows = rows;
         frame.render_widget(
             Paragraph::new(lines).style(Style::new().fg(theme.foreground)),
@@ -559,7 +577,7 @@ impl LogsModal {
                 next_row(),
             );
         }
-        frame.render_widget(Paragraph::new(hint_line(self.hints())), next_row());
+        frame.render_widget(Paragraph::new(hint_line(&self.hints())), next_row());
         let footer = next_row();
         let (line, level) = self.footer_line(theme);
         self.level_hit = hit_rect(footer, level);
@@ -584,6 +602,28 @@ impl LogsModal {
         popup
     }
 
+    /// Record indices cannot say where the top of the pane goes once a record
+    /// can be several rows tall, so the anchor is measured every frame against
+    /// the rows the pane will actually paint.
+    fn anchor(&mut self, width: usize, theme: &Theme) {
+        let len = self.window_len();
+        if len == 0 || self.viewport_h == 0 {
+            return;
+        }
+        let last = match self.follow {
+            true => len - 1,
+            false => self.selected.min(len - 1),
+        };
+        if !self.follow && self.selected < self.view_top {
+            self.view_top = self.selected;
+            return;
+        }
+        let top = self.top_for(last, width, theme);
+        if self.follow || top > self.view_top {
+            self.view_top = top;
+        }
+    }
+
     /// A resize changes how much the window has to hold, and following has to
     /// stay pinned to the newest row across it.
     fn resize(&mut self, body_height: usize) {
@@ -597,9 +637,58 @@ impl LogsModal {
         }
         if self.follow {
             self.snap_to_end();
-        } else {
-            self.reveal();
         }
+    }
+
+    /// One record before the pane is applied: the summary row, plus its
+    /// expansion when it is the selected record.
+    fn logical_lines(&self, index: usize, theme: &Theme) -> Vec<Line<'static>> {
+        let Some(line) = self.tail.as_ref().and_then(|t| t.window().get(index)) else {
+            return Vec::new();
+        };
+        let selected = index == self.selected;
+        let mut out = vec![entry_line(&line.entry, selected, theme)];
+        if selected && self.expanded {
+            out.extend(expansion_lines(line, theme));
+        }
+        out
+    }
+
+    /// Every row one record paints. Measuring and drawing both go through this,
+    /// so the two can never disagree about how tall a wrapped record is.
+    fn record_rows(&self, index: usize, width: usize, theme: &Theme) -> Vec<Line<'static>> {
+        self.logical_lines(index, theme)
+            .iter()
+            .flat_map(|line| lay_out(line, width, self.pan, self.wrap))
+            .collect()
+    }
+
+    /// The widest row on screen, measured before panning, which is how far
+    /// panning is allowed to go. Without it the arrows would walk a short page
+    /// off into blank columns with no way to tell how far back to come.
+    fn widest_row(&self, theme: &Theme) -> usize {
+        (self.view_top..self.window_len())
+            .take(self.viewport_h.max(1))
+            .flat_map(|index| self.logical_lines(index, theme))
+            .map(|line| display_width(&line))
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// The topmost record that still leaves `last` on screen. Wrapping makes a
+    /// record several rows tall, so this has to be measured rather than counted.
+    fn top_for(&self, last: usize, width: usize, theme: &Theme) -> usize {
+        let mut used = 0;
+        let mut top = last;
+        for index in (0..=last).rev() {
+            let height = self.record_rows(index, width, theme).len().max(1);
+            if used + height > self.viewport_h && used > 0 {
+                break;
+            }
+            used += height;
+            top = index;
+        }
+        top
     }
 
     /// Also reports the window index behind each screen row, so a click lands
@@ -624,21 +713,13 @@ impl LogsModal {
 
         let mut lines = Vec::with_capacity(self.viewport_h);
         let mut rows = Vec::with_capacity(self.viewport_h);
-        for (index, line) in tail
-            .window()
-            .iter()
-            .enumerate()
-            .skip(self.view_top)
-            .take(self.viewport_h)
-        {
-            let selected = index == self.selected;
-            lines.push(entry_line(&line.entry, width, selected, theme));
-            rows.push(index);
-            if selected && self.expanded {
-                for extra in expansion_lines(line, width, theme) {
-                    lines.push(extra);
-                    rows.push(index);
-                }
+        for index in self.view_top..self.window_len() {
+            if lines.len() >= self.viewport_h {
+                break;
+            }
+            for row in self.record_rows(index, width, theme) {
+                lines.push(row);
+                rows.push(index);
             }
         }
         lines.truncate(self.viewport_h);
@@ -649,15 +730,27 @@ impl LogsModal {
     /// The actions a reader can reach from here. Without this row the only way
     /// to learn that a record expands or that a turn can be isolated is to open
     /// the keybinding reference.
-    fn hints(&self) -> &'static [(&'static str, &'static str)] {
+    fn hints(&self) -> Vec<(&'static str, &'static str)> {
         if self.query_focused {
-            return &[(HINT_KEY_ENTER, HINT_APPLY), (HINT_KEY_ESC, HINT_CLEAR)];
+            return vec![(HINT_KEY_ENTER, HINT_APPLY), (HINT_KEY_ESC, HINT_CLEAR)];
         }
-        if self.expanded {
-            &EXPANDED_HINTS
-        } else {
-            &HINTS
+        let mut out = vec![HINT_MOVE_KEYS];
+        // Panning is offered only where it can do something, so a wrapped or a
+        // narrow pane does not advertise a key that would be ignored.
+        if self.max_pan > 0 && !self.wrap {
+            out.push((HINT_KEY_PAN, HINT_PAN));
         }
+        out.push((
+            HINT_KEY_ENTER,
+            match self.expanded {
+                true => HINT_COLLAPSE,
+                false => HINT_EXPAND,
+            },
+        ));
+        out.push((HINT_KEY_FOCUS, HINT_FOCUS));
+        out.push((HINT_KEY_FILTER, HINT_FILTER));
+        out.extend(HINT_TAIL);
+        out
     }
 
     /// Also reports the level chip's column range, which is what keeps the
@@ -701,6 +794,11 @@ impl LogsModal {
                 theme.status_dim
             },
         );
+        if self.wrap {
+            push(WRAPPED.to_owned(), theme.tool_annotation);
+        } else if self.pan > 0 {
+            push(format!("{PAN_MARK}{}", self.pan), theme.tool_annotation);
+        }
         if self.outcome == ScanOutcome::ScanLimit {
             push(SCAN_LIMIT_NOTE.to_owned(), theme.tool_warning);
         } else if self.outcome == ScanOutcome::Exhausted && self.view_top == 0 {
@@ -747,6 +845,78 @@ impl Overlay for LogsModal {
     }
 }
 
+/// The spans covering `range` of the line's concatenated characters, styles
+/// intact, so a field value cut by a wrap or a pan keeps its colour.
+fn slice_spans(spans: &[Span<'static>], range: Range<usize>) -> Vec<Span<'static>> {
+    let mut out = Vec::new();
+    let mut at = 0;
+    for span in spans {
+        let len = span.content.chars().count();
+        let start = range.start.saturating_sub(at).min(len);
+        let end = range.end.saturating_sub(at).min(len);
+        if start < end {
+            let text: String = span.content.chars().skip(start).take(end - start).collect();
+            out.push(Span::styled(text, span.style));
+        }
+        at += len;
+        if at >= range.end {
+            break;
+        }
+    }
+    out
+}
+
+/// The first character at or past display column `column`. Panning counts
+/// columns rather than characters so a wide glyph cannot shear a line.
+fn char_at_column(chars: &[char], column: usize) -> usize {
+    let mut used = 0;
+    for (index, ch) in chars.iter().enumerate() {
+        if used >= column {
+            return index;
+        }
+        used += ch.width().unwrap_or(0);
+    }
+    chars.len()
+}
+
+fn display_width(line: &Line<'static>) -> usize {
+    line.spans
+        .iter()
+        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+        .sum()
+}
+
+/// One logical record laid out for the pane: broken onto as many rows as it
+/// needs, or kept on one row panned `pan` columns to the right. Wrapping uses
+/// the shared break walk, so these rows fall where every other wrapped surface
+/// in the UI puts them.
+fn lay_out(line: &Line<'static>, width: usize, pan: usize, wrap: bool) -> Vec<Line<'static>> {
+    if !wrap {
+        if pan == 0 {
+            return vec![line.clone()];
+        }
+        let chars: Vec<char> = line.spans.iter().flat_map(|s| s.content.chars()).collect();
+        let start = char_at_column(&chars, pan);
+        return vec![Line::from(slice_spans(&line.spans, start..chars.len()))];
+    }
+
+    let chars: Vec<char> = line.spans.iter().flat_map(|s| s.content.chars()).collect();
+    let mut starts = vec![0];
+    starts.extend(
+        wrap_breaks(&chars, u16::try_from(width).unwrap_or(u16::MAX).max(1))
+            .into_iter()
+            .map(|brk| brk.start),
+    );
+    starts
+        .iter()
+        .enumerate()
+        .map(|(row, &start)| {
+            let end = starts.get(row + 1).copied().unwrap_or(chars.len());
+            Line::from(slice_spans(&line.spans, start..end))
+        })
+        .collect()
+}
+
 fn level_style(level: Level, theme: &Theme) -> Style {
     match level {
         Level::Error => theme.error,
@@ -759,10 +929,10 @@ fn level_style(level: Level, theme: &Theme) -> Style {
 
 /// Everything rendered here can carry text the model, a tool, or an MCP server
 /// produced, so nothing reaches the terminal unescaped.
-fn entry_line(entry: &Entry, width: usize, selected: bool, theme: &Theme) -> Line<'static> {
+fn entry_line(entry: &Entry, selected: bool, theme: &Theme) -> Line<'static> {
     let line = match entry {
         Entry::Raw(raw) => Line::from(Span::styled(escape_terminal_controls(raw), theme.tool_dim)),
-        Entry::Record(record) => record_line(record, width, theme),
+        Entry::Record(record) => record_line(record, theme),
     };
     if selected {
         line.style(theme.item_selected)
@@ -771,7 +941,10 @@ fn entry_line(entry: &Entry, width: usize, selected: bool, theme: &Theme) -> Lin
     }
 }
 
-fn record_line(record: &Record, width: usize, theme: &Theme) -> Line<'static> {
+/// Every field, however wide that runs. What does not fit is reached by
+/// wrapping or panning rather than being dropped, so no record can hide a field
+/// the reader has no way to ask for.
+fn record_line(record: &Record, theme: &Theme) -> Line<'static> {
     let mut spans = vec![
         Span::styled(record.time_of_day().to_owned(), theme.timestamp),
         Span::raw(COLUMN_GAP),
@@ -788,41 +961,11 @@ fn record_line(record: &Record, width: usize, theme: &Theme) -> Line<'static> {
         ),
     ];
 
-    let mut used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
     for (key, value) in correlation_fields(record) {
-        push_field(
-            &mut spans,
-            &mut used,
-            width,
-            &key,
-            &value,
-            theme.tool_dim,
-            theme.accent,
-        );
+        push_field(&mut spans, &key, &value, theme.tool_dim, theme.accent);
     }
-    let mut shown = 0;
     for (key, value) in &record.fields {
-        if shown >= INLINE_FIELD_LIMIT {
-            break;
-        }
-        if push_field(
-            &mut spans,
-            &mut used,
-            width,
-            key,
-            value,
-            theme.tool_annotation,
-            theme.accent,
-        ) {
-            shown += 1;
-        }
-    }
-    let hidden = record.fields.len().saturating_sub(shown);
-    if hidden > 0 {
-        spans.push(Span::styled(
-            format!("{FIELD_GAP}{OVERFLOW_PREFIX}{hidden}"),
-            theme.tool_dim,
-        ));
+        push_field(&mut spans, key, value, theme.tool_annotation, theme.accent);
     }
     Line::from(spans)
 }
@@ -856,36 +999,20 @@ fn correlation_fields(record: &Record) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Returns whether the field fit. Once one does not, no later one will either,
-/// and the caller counts it toward the hidden total.
 fn push_field(
     spans: &mut Vec<Span<'static>>,
-    used: &mut usize,
-    width: usize,
     key: &str,
     value: &str,
     key_style: Style,
     value_style: Style,
-) -> bool {
-    let key = escape_terminal_controls(key);
-    let value = escape_terminal_controls(value);
-    let cost = key.chars().count() + value.chars().count() + FIELD_GAP.len() + KV_SEPARATOR.len();
-    if *used + cost > width {
-        return false;
-    }
-    *used += cost;
+) {
     spans.push(Span::raw(FIELD_GAP));
-    spans.push(Span::styled(key, key_style));
+    spans.push(Span::styled(escape_terminal_controls(key), key_style));
     spans.push(Span::styled(KV_SEPARATOR.to_owned(), key_style));
-    spans.push(Span::styled(value, value_style));
-    true
+    spans.push(Span::styled(escape_terminal_controls(value), value_style));
 }
 
-fn expansion_lines(
-    line: &caudra_storage::log::tail::Line,
-    width: usize,
-    theme: &Theme,
-) -> Vec<Line<'static>> {
+fn expansion_lines(line: &caudra_storage::log::tail::Line, theme: &Theme) -> Vec<Line<'static>> {
     let mut out = Vec::new();
     if let Entry::Record(record) = &line.entry {
         out.push(detail(RECORD_TIME, &record.timestamp, theme));
@@ -898,7 +1025,7 @@ fn expansion_lines(
             out.push(detail(key, value, theme));
         }
     }
-    out.push(detail(RAW_JSON_LABEL, &truncate(&line.raw, width), theme));
+    out.push(detail(RAW_JSON_LABEL, &line.raw, theme));
     out
 }
 
@@ -912,15 +1039,6 @@ fn detail(key: &str, value: &str, theme: &Theme) -> Line<'static> {
         Span::styled(KV_SEPARATOR.to_owned(), theme.tool_dim),
         Span::styled(escape_terminal_controls(value), theme.accent),
     ])
-}
-
-fn truncate(text: &str, width: usize) -> String {
-    let budget =
-        width.saturating_sub(EXPAND_INDENT.len() + EXPAND_ARROW.len() + RAW_JSON_LABEL.len());
-    match text.char_indices().nth(budget) {
-        Some((at, _)) => text[..at].to_owned(),
-        None => text.to_owned(),
-    }
 }
 
 /// What a copy of the rendered line should contain: the same information, with
@@ -993,7 +1111,14 @@ mod tests {
 
     fn render(raw: &str, width: usize) -> String {
         let theme = theme::current();
-        rendered(&entry_line(&Entry::parse(raw), width, false, &theme))
+        rendered(
+            &lay_out(
+                &entry_line(&Entry::parse(raw), false, &theme),
+                width,
+                0,
+                false,
+            )[0],
+        )
     }
 
     #[test]
@@ -1024,11 +1149,53 @@ mod tests {
         assert!(!out.contains(ESCAPE), "{out}");
     }
 
+    /// A narrow pane clips rather than dropping, so no field is unreachable.
+    /// The row is longer than the pane and panning is what brings it into view.
     #[test]
-    fn a_narrow_viewport_drops_fields_and_counts_them() {
-        let narrow = render(EVENT, 60);
-        assert!(!narrow.contains("attempt=3"), "{narrow}");
-        assert!(narrow.contains("+1"), "{narrow}");
+    fn a_narrow_pane_keeps_every_field_on_a_row_that_runs_past_it() {
+        const NARROW: usize = 60;
+        let theme = theme::current();
+        let full = entry_line(&Entry::parse(EVENT), false, &theme);
+
+        assert!(rendered(&full).contains("attempt=3"));
+        assert!(display_width(&full) > NARROW);
+
+        let panned = &lay_out(&full, NARROW, 20, false)[0];
+        assert!(
+            !rendered(panned).contains("14:22:07"),
+            "the pan never moved"
+        );
+        assert!(rendered(panned).contains("attempt=3"));
+    }
+
+    #[test]
+    fn wrapping_puts_the_whole_record_on_screen_across_several_rows() {
+        let theme = theme::current();
+        let full = entry_line(&Entry::parse(EVENT), false, &theme);
+        let rows = lay_out(&full, 40, 0, true);
+
+        assert!(rows.len() > 1);
+        assert!(rows.iter().all(|row| display_width(row) <= 40));
+        let joined: String = rows.iter().map(rendered).collect();
+        assert!(joined.contains("attempt=3"), "{joined}");
+    }
+
+    #[test]
+    fn a_cut_row_keeps_the_styles_of_the_spans_it_came_from() {
+        let theme = theme::current();
+        let full = entry_line(&Entry::parse(EVENT), false, &theme);
+        let rows = lay_out(&full, 40, 0, true);
+
+        let styles: Vec<_> = rows
+            .iter()
+            .flat_map(|r| r.spans.iter().map(|s| s.style))
+            .collect();
+        assert!(
+            styles
+                .iter()
+                .any(|style| *style == level_style(Level::Warn, &theme)),
+            "the level lost its colour on the way through the wrap"
+        );
     }
 
     #[test]
@@ -1038,7 +1205,7 @@ mod tests {
             raw: WITH_SPAN.to_owned(),
             entry: Entry::parse(WITH_SPAN),
         };
-        let out: String = expansion_lines(&line, WIDE, &theme)
+        let out: String = expansion_lines(&line, &theme)
             .iter()
             .map(rendered)
             .collect::<Vec<_>>()
@@ -1226,7 +1393,7 @@ mod tests {
         let mut modal = seeded_modal(tmp.path());
         let out = drawn(&mut modal);
 
-        for (_, action) in HINTS {
+        for (_, action) in modal.hints() {
             assert!(out.contains(action), "{action} missing from {out}");
         }
     }
@@ -1316,6 +1483,54 @@ mod tests {
             modal.handle_key(key(KeyCode::Tab)),
             LogsAction::Flash(NO_FOCUS)
         ));
+    }
+
+    #[test]
+    fn wrapping_and_panning_are_one_question_so_each_undoes_the_other() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut modal = seeded_modal(tmp.path());
+        modal.max_pan = 40;
+
+        modal.handle_key(key(KeyCode::Right));
+        assert_eq!(modal.pan, PAN_STEP as usize);
+
+        modal.handle_key(key(KeyCode::Char('w')));
+        assert!(modal.wrap);
+        assert_eq!(
+            modal.pan, 0,
+            "wrapping has nothing past the margin to pan to"
+        );
+
+        modal.handle_key(key(KeyCode::Right));
+        assert_eq!(modal.pan, 0, "a wrapped pane must ignore the pan keys");
+    }
+
+    #[test]
+    fn panning_stops_at_the_widest_row_on_screen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut modal = seeded_modal(tmp.path());
+        modal.max_pan = 5;
+
+        for _ in 0..10 {
+            modal.handle_key(key(KeyCode::Right));
+        }
+        assert_eq!(modal.pan, 5);
+
+        modal.handle_key(key(KeyCode::Home));
+        assert_eq!(modal.pan, 0);
+    }
+
+    #[test]
+    fn a_wrapped_record_keeps_the_newest_one_on_screen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut modal = seeded_modal(tmp.path());
+        modal.handle_key(key(KeyCode::Char('w')));
+        let out = drawn(&mut modal);
+
+        assert!(
+            out.contains(&format!("line-{}", SEEDED - 1)),
+            "following lost the newest record to the fold: {out}"
+        );
     }
 
     #[test]

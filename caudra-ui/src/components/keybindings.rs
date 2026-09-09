@@ -809,6 +809,24 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::All,
     },
     Keybind {
+        label: KeyLabel::Single("w"),
+        description: "Wrap long records onto more rows",
+        context: KeybindContext::Logs,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Alt("\u{2190}", "\u{2192}"),
+        description: "Pan across a record too wide for the pane",
+        context: KeybindContext::Logs,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single("Home"),
+        description: "Back to the left margin",
+        context: KeybindContext::Logs,
+        platform: Platform::All,
+    },
+    Keybind {
         label: KeyLabel::Single("l"),
         description: "Cycle the minimum level, or click it in the footer",
         context: KeybindContext::Logs,
