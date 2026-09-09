@@ -143,6 +143,7 @@ impl AgentHandles {
         app.answer_tx = Some(self.answer_tx.clone());
         app.cmd_tx = Some(self.cmd_tx.clone());
         app.shared_history = Some(Arc::clone(&self.history));
+        app.forget_merged_history();
         app.btw_prompt = Some(Arc::clone(&self.btw_prompt));
         app.context_store = Some(self.context_store.clone());
         app.queue.set_shared(self.queue.clone());

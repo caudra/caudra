@@ -11900,6 +11900,45 @@ fn type_draft_leaving_last_key_waiting(app: &mut App) -> Sent {
     first
 }
 
+const MERGE_FIRST_MSG: &str = "the first checkpoint has nothing to compare against and must merge";
+const MERGE_SKIP_MSG: &str = "an unchanged history must not walk the graph again";
+const MERGE_PUSH_MSG: &str = "a message the producer appended must bring the merge back";
+const MERGE_REINSTALL_MSG: &str = "installing a different history must bring the merge back";
+
+/// The event loop checkpoints every frame, so the merge behind it has to cost
+/// nothing while both sides hold still. It used to allocate a set of every
+/// message id, deep-clone the message vector and deep-compare it ten times a
+/// second, which is what made an idle session burn a quarter of a core.
+#[test]
+fn an_unchanged_history_skips_the_merge() {
+    let (_tmp, _dir, _writer, mut app) = tempdir_app();
+    let mut history = attach_live_history(&mut app, vec![Message::user("go".into())]);
+    let snapshot = app.shared_history.as_ref().unwrap().load_full();
+    assert!(app.history_moved(&snapshot), "{MERGE_FIRST_MSG}");
+
+    app.checkpoint();
+    let snapshot = app.shared_history.as_ref().unwrap().load_full();
+    assert!(!app.history_moved(&snapshot), "{MERGE_SKIP_MSG}");
+
+    history.push(tool_use_msg("t1"));
+    let snapshot = app.shared_history.as_ref().unwrap().load_full();
+    assert!(app.history_moved(&snapshot), "{MERGE_PUSH_MSG}");
+}
+
+/// Pointer identity cannot notice a whole history being swapped underneath the
+/// app, so every install has to drop the memo by hand.
+#[test]
+fn reinstalling_a_history_brings_the_merge_back() {
+    let (_tmp, _dir, _writer, mut app) = tempdir_app();
+    let _history = attach_live_history(&mut app, vec![Message::user("go".into())]);
+    app.checkpoint();
+
+    let _replacement = attach_live_history(&mut app, vec![Message::user("again".into())]);
+    app.forget_merged_history();
+    let snapshot = app.shared_history.as_ref().unwrap().load_full();
+    assert!(app.history_moved(&snapshot), "{MERGE_REINSTALL_MSG}");
+}
+
 /// Checkpointing mid-batch used to freeze the tools as failed forever. The
 /// synthetic closing message made the snapshot as long as the real results that
 /// followed, so the append cursor never saw them.

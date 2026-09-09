@@ -11,6 +11,7 @@ use crate::components::{Action, DisplaySource, ForkDraft, ForkedSession, LoadedS
 use crate::input_document::InputDraft;
 use crate::repaint::{Dirty, Watch};
 use caudra_agent::GoalStatus;
+use caudra_agent::HistorySnapshot;
 use caudra_agent::agent::estimate_message_tokens;
 use caudra_agent::snapshots::{
     ConflictPolicy, RestoreReport, RestoreStatus, RestoreTarget, SnapshotError, SnapshotStore,
@@ -81,6 +82,21 @@ pub(super) struct Sent {
     pub at: Instant,
 }
 
+/// The producer snapshot `App::checkpoint` last merged, and the session
+/// revision the merge left behind.
+///
+/// The merge walks the whole history graph, and the event loop checkpoints
+/// every frame, so an idle session would pay that walk ten times a second
+/// forever. `ArcSwap` publishes a fresh `Arc` per mutation, which makes
+/// pointer identity an exact "the producer added nothing" test, and holding
+/// the `Arc` is what stops a later snapshot from landing on the same address.
+/// The revision covers the other side: a rewind or a compaction moves the
+/// session's own messages without the producer publishing anything.
+pub(super) struct MergedHistory {
+    snapshot: Arc<HistorySnapshot>,
+    content_revision: u64,
+}
+
 /// The one content check: `App::checkpoint` saves a session only when this
 /// holds, and the shutdown report reuses it to say which tabs were saved, so
 /// the report and the disk can never disagree.
@@ -127,7 +143,7 @@ impl App {
     pub(super) fn checkpoint_with(&mut self, soft_delay: Duration) {
         let snapshot = self.shared_history.as_ref().map(|h| h.load_full());
         let mut meta = self.build_meta();
-        if let Some(snapshot) = snapshot.as_deref() {
+        if let Some(snapshot) = snapshot.filter(|snapshot| self.history_moved(snapshot)) {
             let known: HashSet<_> = self
                 .state
                 .session
@@ -164,7 +180,7 @@ impl App {
                     }
                     if merged.as_slice() != self.state.session.messages() {
                         let session = self.state.session_mut();
-                        session.merge_history(snapshot, merged);
+                        session.merge_history(&snapshot, merged);
                         session.update_title_if_default();
                     }
                     if added {
@@ -175,6 +191,13 @@ impl App {
                         );
                         self.main_chat().bind_sources(&messages);
                     }
+                    // Only a merge that reached a consistent graph may be
+                    // remembered. A failed one has to be retried, and its
+                    // flash re-raised, on the next frame.
+                    self.merged_history = Some(MergedHistory {
+                        snapshot,
+                        content_revision: self.state.session.content_revision(),
+                    });
                 }
                 Err(error) => {
                     tracing::error!(%error, "refusing to checkpoint invalid history graph");
@@ -221,6 +244,26 @@ impl App {
 
         self.storage_writer.send(Arc::clone(&self.state.session));
         self.last_sent = Some(sent);
+    }
+
+    /// Drops the merge memo so the next checkpoint walks the graph again.
+    /// Called wherever a different history is installed, which is the one
+    /// thing pointer identity cannot notice on its own.
+    pub(crate) fn forget_merged_history(&mut self) {
+        self.merged_history = None;
+    }
+
+    /// Whether either side of the history merge moved since the last one.
+    ///
+    /// Both comparisons are `u64`-cheap, which is the point: the merge they
+    /// guard allocates a set of every message id, deep-clones the whole
+    /// message vector and deep-compares it, and an idle session runs this ten
+    /// times a second.
+    pub(super) fn history_moved(&self, snapshot: &Arc<HistorySnapshot>) -> bool {
+        self.merged_history.as_ref().is_none_or(|merged| {
+            !Arc::ptr_eq(&merged.snapshot, snapshot)
+                || merged.content_revision != self.state.session.content_revision()
+        })
     }
 
     /// Everything the session mirrors from live state, built field by field so
@@ -736,6 +779,7 @@ impl App {
     /// agent's stale copy back. Only `respawn_agent` hands a live mirror in.
     fn install_local_history(&mut self) -> LoadedSession {
         self.shared_history = None;
+        self.merged_history = None;
         let messages = match crate::active_session_history(&self.state.session) {
             Ok(history) => history,
             Err(error) => {

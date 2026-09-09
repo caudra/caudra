@@ -118,7 +118,7 @@ pub(crate) use mode::{Mode, PlanState, PlanTrigger};
 #[cfg(test)]
 use mouse::EDGE_SCROLL_LINES;
 pub(crate) use queue::{MessageQueue, SubmitOutcome};
-use session::Sent;
+use session::{MergedHistory, Sent};
 pub(crate) use session::{
     REVERT_BUSY_MSG, reachable_subagent_ids, recover_pending_workspace_restore, session_has_content,
 };
@@ -371,6 +371,7 @@ pub struct App {
     pub(crate) image_paste_rx: Vec<flume::Receiver<Result<ImageSource, String>>>,
     storage_writer: Arc<StorageWriter>,
     last_sent: Option<Sent>,
+    merged_history: Option<MergedHistory>,
     pub(crate) shell: shell::ShellState,
     pub(crate) ui_config: UiConfig,
     pub(crate) permissions: Arc<PermissionManager>,
@@ -562,6 +563,7 @@ impl App {
             image_paste_rx: vec![],
             storage_writer,
             last_sent: None,
+            merged_history: None,
             shell: shell::ShellState::default(),
             ui_config,
             permissions,
