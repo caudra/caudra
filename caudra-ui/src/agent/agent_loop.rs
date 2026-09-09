@@ -429,11 +429,9 @@ impl AgentLoop {
             .await;
         let tool_filter = ToolFilter::from_config(&self.config, &slot.model, &[]);
         let system = agent::build_system_prompt(
-            &self.vars,
             &self.instructions.text,
             &prompt_slots,
             &tool_filter,
-            &slot.model,
             self.system_prompt_profile.as_deref(),
         );
         self.context_system.clone_from(&system);
@@ -478,6 +476,7 @@ impl AgentLoop {
             AgentRunParams {
                 history: &mut self.history,
                 system,
+                environment: Some(agent::environment_block(&self.vars, &slot.model)),
                 event_tx,
                 tools: self.tools.clone(),
                 deferred: self.deferred.clone(),
@@ -594,11 +593,9 @@ impl AgentLoop {
         let slot = self.model_slot.load();
         let tool_filter = ToolFilter::from_config(&self.config, &slot.model, &[]);
         let system = agent::build_system_prompt(
-            &self.vars,
             &self.instructions.text,
             prompt_slots,
             &tool_filter,
-            &slot.model,
             self.system_prompt_profile.as_deref(),
         );
         let mcp = self.mcp.as_ref().map(McpSession::request_snapshot);

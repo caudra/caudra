@@ -135,6 +135,9 @@ pub struct AgentParams {
 pub struct AgentRunParams<'h> {
     pub history: &'h mut History,
     pub system: String,
+    /// `None` for a subagent, whose task prompt carries its own environment
+    /// section and which is too short-lived for the announcement to pay.
+    pub environment: Option<String>,
     pub event_tx: EventSender,
     pub tools: Value,
     /// Definitions the request holds back until `tool_search` loads them.
@@ -147,6 +150,7 @@ pub struct Agent<'h> {
     model: Arc<Model>,
     history: &'h mut History,
     system: String,
+    environment: Option<String>,
     event_tx: EventSender,
     tools: Value,
     deferral: DeferralSession,
@@ -214,6 +218,7 @@ impl<'h> Agent<'h> {
             timeouts: params.timeouts,
             history: run.history,
             system: run.system,
+            environment: run.environment,
             event_tx: run.event_tx,
             tools: run.tools,
             deferral,
@@ -472,7 +477,11 @@ impl<'h> Agent<'h> {
         let Some(latest) = inputs.last() else {
             return String::new();
         };
-        let switch = mode_switch_notice(self.history.as_slice(), &latest.mode);
+        let mut standing = Vec::from_iter(environment_notice(
+            self.history.as_slice(),
+            self.environment.as_deref(),
+        ));
+        standing.extend(mode_switch_notice(self.history.as_slice(), &latest.mode));
         self.mode = latest.mode.clone();
         self.workflow = latest.workflow;
         self.opts = RequestOptions {
@@ -480,7 +489,7 @@ impl<'h> Agent<'h> {
             fast: latest.fast,
         };
 
-        let mut preamble = Vec::from_iter(switch);
+        let mut preamble = standing;
         for input in &mut inputs {
             preamble.append(&mut input.preamble);
             preamble.append(&mut self.mention_preamble(&input.mentions).await);
@@ -1296,6 +1305,26 @@ impl AnnouncedMode {
     }
 }
 
+/// The text of the most recent standing reminder carrying `marker`.
+fn last_announced<'a>(history: &'a [Message], marker: &str) -> Option<&'a str> {
+    history
+        .iter()
+        .rev()
+        .filter(|message| message.is_observation())
+        .find_map(|message| message.user_text().filter(|text| text.contains(marker)))
+}
+
+/// Restates the environment when the transcript does not already end with this
+/// exact block, which covers a first turn, a date rollover, a model switch, and
+/// a compaction that dropped the previous announcement.
+fn environment_notice(history: &[Message], environment: Option<&str>) -> Option<Message> {
+    let environment = environment?;
+    if last_announced(history, crate::prompt::ENVIRONMENT_MARKER) == Some(environment) {
+        return None;
+    }
+    Some(Message::observation(environment.to_owned()))
+}
+
 /// The mode the transcript last told the model it was in.
 ///
 /// Derived from history rather than from a field because [`Agent`] is rebuilt
@@ -1489,6 +1518,11 @@ mod tests {
     const TEST_PLAN_PATH: &str = ".caudra/plans/123.md";
     const EXPECTED_PLAN_NOTICE: &str = "entering plan mode must be announced";
     const EXPECTED_BUILD_NOTICE: &str = "leaving plan mode must be announced";
+    const ENVIRONMENT: &str =
+        "<system-reminder>\n# Environment\n\n- Date: 2026-09-09\n</system-reminder>";
+    const ENVIRONMENT_NEXT_DAY: &str =
+        "<system-reminder>\n# Environment\n\n- Date: 2026-09-10\n</system-reminder>";
+    const EXPECTED_ENVIRONMENT_NOTICE: &str = "a changed environment must be announced";
 
     struct MockInterruptSource {
         commands: Mutex<VecDeque<ExtractedCommand>>,
@@ -1836,6 +1870,7 @@ mod tests {
             AgentRunParams {
                 history,
                 system: "system".into(),
+                environment: None,
                 event_tx: EventSender::new(raw_tx, 0),
                 tools: serde_json::json!([]),
                 deferred: Vec::new(),
@@ -2474,6 +2509,93 @@ mod tests {
     fn a_marker_quoted_by_the_user_is_not_an_announcement() {
         let history = [Message::user(crate::prompt::PLAN_MODE_MARKER.into())];
         assert!(mode_switch_notice(&history, &AgentMode::Build).is_none());
+    }
+
+    fn environment_announcement(environment: &str) -> Message {
+        environment_notice(&[], Some(environment)).expect(EXPECTED_ENVIRONMENT_NOTICE)
+    }
+
+    #[test]
+    fn a_fresh_session_announces_its_environment() {
+        let notice = environment_announcement(ENVIRONMENT);
+        assert!(notice.is_observation());
+        assert_eq!(notice.user_text(), Some(ENVIRONMENT));
+    }
+
+    #[test]
+    fn an_unchanged_environment_announces_once() {
+        let history = [environment_announcement(ENVIRONMENT)];
+        assert!(environment_notice(&history, Some(ENVIRONMENT)).is_none());
+    }
+
+    /// A date rollover or a model switch is the whole reason this is announced
+    /// rather than carried by the system prompt.
+    #[test]
+    fn a_changed_environment_is_re_announced() {
+        let history = [environment_announcement(ENVIRONMENT)];
+        let notice = environment_notice(&history, Some(ENVIRONMENT_NEXT_DAY))
+            .expect(EXPECTED_ENVIRONMENT_NOTICE);
+        assert_eq!(notice.user_text(), Some(ENVIRONMENT_NEXT_DAY));
+    }
+
+    /// The compaction contract: dropping the announcement costs one re-emit
+    /// rather than leaving the model without an environment.
+    #[test]
+    fn a_compacted_history_re_announces_the_environment() {
+        let history = [Message::user("what survived compaction".into())];
+        assert_eq!(
+            environment_notice(&history, Some(ENVIRONMENT))
+                .expect(EXPECTED_ENVIRONMENT_NOTICE)
+                .user_text(),
+            Some(ENVIRONMENT)
+        );
+    }
+
+    #[test]
+    fn a_subagent_announces_no_environment() {
+        assert!(environment_notice(&[], None).is_none());
+    }
+
+    /// Announcements are only worth persisting if they come back as
+    /// observations: `last_announced` ignores anything else, so a lossy round
+    /// trip would silently re-announce on every session load.
+    #[test]
+    fn announcements_survive_a_storage_round_trip() {
+        let mut items: Vec<caudra_providers::HistoryItem> = Vec::new();
+        for message in [environment_announcement(ENVIRONMENT), plan_announcement()] {
+            let parent = items.last().map(|item| item.id);
+            items.extend(caudra_providers::expand_message(&message, parent));
+        }
+        let restored = caudra_providers::project_messages(&items).unwrap();
+
+        assert!(restored.iter().all(Message::is_observation));
+        assert!(environment_notice(&restored, Some(ENVIRONMENT)).is_none());
+        assert!(mode_switch_notice(&restored, &plan_mode()).is_none());
+    }
+
+    #[test]
+    fn run_announces_the_environment_ahead_of_the_mode() {
+        smol::block_on(async {
+            let mut history = History::new(Vec::new());
+            let (mut agent, _event_rx) = make_agent(
+                MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+                &mut history,
+            );
+            agent.environment = Some(ENVIRONMENT.to_owned());
+            let mut input = default_input();
+            input.mode = plan_mode();
+
+            agent.run(input).await.unwrap();
+            drop(agent);
+
+            assert_eq!(history.as_slice()[0].user_text(), Some(ENVIRONMENT));
+            assert!(
+                history.as_slice()[1]
+                    .user_text()
+                    .is_some_and(|text| text.contains(crate::prompt::PLAN_MODE_MARKER))
+            );
+            assert_eq!(history.as_slice()[2].user_text(), Some("hello"));
+        });
     }
 
     #[test]

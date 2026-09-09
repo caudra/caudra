@@ -735,11 +735,9 @@ pub fn spawn(mut params: HeadlessParams) -> HeadlessHandle {
     );
 
     let system = agent::build_system_prompt(
-        &vars,
         &instructions.text,
         &params.prompt_slots,
         &tool_filter,
-        &params.model,
         params.system_prompt_profile.as_deref(),
     );
 
@@ -815,6 +813,7 @@ pub fn spawn(mut params: HeadlessParams) -> HeadlessHandle {
                 AgentRunParams {
                     history: &mut history,
                     system,
+                    environment: Some(agent::environment_block(&vars, &params.model)),
                     event_tx,
                     tools,
                     deferred,
@@ -1130,11 +1129,9 @@ pub fn spawn_prepared_interactive(prepared: PreparedInteractive) -> InteractiveH
 
                 let mut system = params.system_prompt_override.clone().unwrap_or_else(|| {
                     agent::build_system_prompt(
-                        &vars,
                         &instructions.text,
                         &params.prompt_slots,
                         &tool_filter,
-                        &model,
                         params.system_prompt_profile.as_deref(),
                     )
                 });
@@ -1180,6 +1177,7 @@ pub fn spawn_prepared_interactive(prepared: PreparedInteractive) -> InteractiveH
                     AgentRunParams {
                         history: &mut history,
                         system,
+                        environment: Some(agent::environment_block(&vars, &model)),
                         event_tx,
                         tools: definitions.declared,
                         deferred: definitions.deferred,

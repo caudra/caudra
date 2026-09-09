@@ -1090,7 +1090,7 @@ pub fn prompt(
     profile_arg: Option<&str>,
 ) -> Result<()> {
     use crate::cli::PromptVariant;
-    use caudra_agent::agent::{build_system_prompt, load_instruction_text};
+    use caudra_agent::agent::{build_system_prompt, environment_block, load_instruction_text};
     use caudra_agent::prompt::{
         PromptId, TASK_BUILD_CONTRACT, TASK_PLAN_CONTRACT, assemble_task_with_filter,
     };
@@ -1173,13 +1173,12 @@ pub fn prompt(
     let output = match variant {
         PromptVariant::System => {
             let system = build_system_prompt(
-                &vars,
                 &instructions,
                 &slots,
                 &filter,
-                &model,
                 system_prompt_profile.as_deref(),
             );
+            let system = format!("{system}\n\n{}", environment_block(&vars, &model));
             // The system prompt no longer varies by mode; the plan reminder is
             // announced in the conversation, so show it alongside.
             if plan {

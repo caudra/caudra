@@ -52,24 +52,24 @@ pub fn is_instruction_file(name: &str) -> bool {
 }
 
 pub fn build_system_prompt(
-    vars: &Vars,
     instructions: &str,
     slots: &crate::prompt::ResolvedSlots,
     tool_filter: &crate::tools::ToolFilter,
-    model: &Model,
     profile: Option<&SystemPromptProfile>,
 ) -> String {
-    let env = vars.apply(
-        "\n\nEnvironment:\n- Working directory: {cwd}\n- Platform: {platform}\n- Date: {date}",
-    );
-    let env = format!("{env}\n- Model: {}", model.spec());
-    let instructions = format!("{env}{instructions}");
     crate::prompt::assemble_system(
         &slots.with_native_hints(tool_filter),
-        &instructions,
+        instructions,
         crate::prompt::MODES_PROMPT,
         profile,
     )
+}
+
+/// Announced in the conversation rather than carried by the system prompt, so
+/// that a date rollover or a model switch cannot re-cache the conversation.
+pub fn environment_block(vars: &Vars, model: &Model) -> String {
+    vars.apply(crate::prompt::ENVIRONMENT_PROMPT)
+        .replace(crate::prompt::MODEL_SLOT, &model.spec())
 }
 
 fn read_instruction(path: &Path, loaded: &LoadedInstructions) -> Option<(PathBuf, String)> {
@@ -201,26 +201,35 @@ mod tests {
     const PLAN_PATH: &str = ".caudra/plans/123.md";
 
     fn system_prompt() -> String {
-        let vars = Vars::new().set("{cwd}", "/tmp").set("{platform}", "linux");
-        let slots = crate::prompt::ResolvedSlots::default();
-        let model = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
         build_system_prompt(
-            &vars,
             "",
-            &slots,
+            &crate::prompt::ResolvedSlots::default(),
             &crate::tools::ToolFilter::All,
-            &model,
             None,
         )
     }
 
-    /// The system block precedes every message in the cache prefix, so a mode
-    /// that varied it would re-cache the whole conversation on each toggle.
+    /// The system block precedes every message in the cache prefix, so anything
+    /// here that varies re-caches the whole conversation when it moves. Mode,
+    /// date, and model all vary, so all three are announced instead.
     #[test_case(crate::prompt::PLAN_MODE_MARKER ; "plan_reminder_stays_out")]
     #[test_case(crate::prompt::BUILD_MODE_MARKER ; "build_reminder_stays_out")]
     #[test_case(PLAN_PATH ; "plan_path_stays_out")]
-    fn the_system_prompt_never_names_a_mode(absent: &str) {
+    #[test_case(crate::prompt::ENVIRONMENT_MARKER ; "environment_stays_out")]
+    #[test_case("Working directory" ; "cwd_stays_out")]
+    fn the_system_prompt_carries_nothing_that_varies(absent: &str) {
         assert!(!system_prompt().contains(absent));
+    }
+
+    #[test]
+    fn the_environment_block_names_the_model_and_the_date() {
+        let vars = Vars::new().set("{cwd}", "/tmp").set("{date}", "2026-09-09");
+        let model = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
+        let block = environment_block(&vars, &model);
+        assert!(block.contains(crate::prompt::ENVIRONMENT_MARKER));
+        assert!(block.contains(&model.spec()));
+        assert!(block.contains("2026-09-09"));
+        assert!(!block.contains(crate::prompt::MODEL_SLOT));
     }
 
     #[test]
@@ -233,7 +242,6 @@ mod tests {
         use std::sync::Arc;
         const INSTR: &str = "Project instructions here";
         const EXTRA: &str = "MEMORY_EXTRA";
-        let vars = Vars::new().set("{cwd}", "/tmp").set("{platform}", "linux");
         let mut slots = crate::prompt::ResolvedSlots::default();
         slots.insert(
             crate::prompt::PromptId::System,
@@ -244,11 +252,9 @@ mod tests {
             },
         );
         let prompt = build_system_prompt(
-            &vars,
             &format!("\n{INSTR}"),
             &slots,
             &crate::tools::ToolFilter::All,
-            &Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap(),
             None,
         );
         let positions =

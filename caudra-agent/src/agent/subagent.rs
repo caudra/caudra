@@ -307,6 +307,7 @@ impl Subagent {
         let mut agent = Agent::new(
             self.params.clone(),
             AgentRunParams {
+                environment: None,
                 history: &mut self.history,
                 system: self.system.clone(),
                 event_tx: self.sub_event_tx.clone(),

@@ -29,6 +29,13 @@ pub const PLAN_PROMPT: &str = include_str!("prompts/plan.md");
 pub const BUILD_PROMPT: &str = include_str!("prompts/build.md");
 /// The mode-invariant half, which stays in the system prompt.
 pub const MODES_PROMPT: &str = include_str!("prompts/modes.md");
+/// Announced for the same reason: the date rolls at midnight and the model
+/// changes when the user switches one.
+pub const ENVIRONMENT_PROMPT: &str = include_str!("prompts/environment.md");
+pub const ENVIRONMENT_MARKER: &str = "# Environment";
+/// Not a [`Vars`](crate::template::Vars) entry: the model is per-run rather
+/// than a process-wide environment value, and is already threaded as `&Model`.
+pub const MODEL_SLOT: &str = "{model}";
 /// Headings of the two announcements. Emitting and detecting a mode share one
 /// constant so history stays the source of truth.
 pub const BUILD_MODE_MARKER: &str = "# Build Mode";
