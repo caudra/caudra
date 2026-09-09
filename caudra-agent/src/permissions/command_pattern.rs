@@ -245,6 +245,9 @@ pub struct PatternGrade {
 ///
 /// A single literal is graded gravest. `sed *` or `python *` is every
 /// invocation of an interpreter, which is arbitrary execution wearing one name.
+/// The exception is a pattern Caudra itself suggests for this command: `ls *` is
+/// offered as a rung one keypress away, so typing it out cannot be graver than
+/// picking it.
 pub fn grade_command_pattern(pattern: &str, command: &str) -> Result<PatternGrade, PatternFault> {
     let mut literals: Vec<&str> = pattern.split_whitespace().collect();
     if literals.len() > MAX_PATTERN_TOKENS {
@@ -262,7 +265,10 @@ pub fn grade_command_pattern(pattern: &str, command: &str) -> Result<PatternGrad
     if !matches(pattern, command) {
         return Err(PatternFault::DoesNotMatch);
     }
-    let caution = if literals.len() == 1 {
+    let normalized = literals.join(" ") + WILDCARD_SUFFIX;
+    let caution = if reusable_prefix(command).as_deref() == Some(normalized.as_str()) {
+        None
+    } else if literals.len() == 1 {
         Some(PermissionCaution::Danger)
     } else if overlaps_builtin_ask(&literals) {
         Some(PermissionCaution::Warn)
@@ -403,8 +409,12 @@ mod tests {
 
     #[test_case("sed -n *", SED_SLICE, None ; "flag_prefix_is_plain")]
     #[test_case("sed *", SED_SLICE, Some(PermissionCaution::Danger) ; "bare_executable_is_grave")]
+    #[test_case("python *", "python script.py", Some(PermissionCaution::Danger) ; "unsuggested_bare_executable_is_grave")]
     #[test_case("git push *", "git push origin main", Some(PermissionCaution::Warn) ; "ask_family_only_warns")]
     #[test_case("rm *", "rm -rf build", Some(PermissionCaution::Danger) ; "bare_ask_family_is_grave")]
+    #[test_case("ls *", "ls -la", None ; "typing_the_suggestion_grades_like_the_rung")]
+    #[test_case("wc *", "wc -l a.rs b/*.rs", None ; "suggestion_over_a_globbed_operand")]
+    #[test_case("ls   *", "ls -la", None ; "spacing_does_not_change_the_grade")]
     fn a_typed_pattern_is_graded_by_how_much_it_reaches(
         pattern: &str,
         command: &str,
