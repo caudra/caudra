@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -49,6 +50,7 @@ pub const DEFAULT_STREAM_TIMEOUT_SECS: u64 = 300;
 
 pub const DEFAULT_MAX_LOG_BYTES_MB: u64 = 200;
 pub const DEFAULT_MAX_LOG_FILES: u32 = 10;
+pub const DEFAULT_LOG_LEVEL: LogLevel = LogLevel::Info;
 pub const DEFAULT_INPUT_HISTORY_SIZE: usize = 100;
 pub const DEFAULT_EPHEMERAL: bool = false;
 pub const DEFAULT_RETENTION_SWEEP_INTERVAL_HOURS: u64 = 24;
@@ -731,6 +733,37 @@ pub enum MermaidStyle {
     Off,
 }
 
+/// Minimum severity written to the log file. `RUST_LOG` overrides it when set,
+/// so a one-off debugging session needs no config edit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogLevel {
+    Trace,
+    Debug,
+    #[default]
+    Info,
+    Warn,
+    Error,
+}
+
+impl LogLevel {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Trace => "trace",
+            Self::Debug => "debug",
+            Self::Info => "info",
+            Self::Warn => "warn",
+            Self::Error => "error",
+        }
+    }
+}
+
+impl fmt::Display for LogLevel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum NotificationMethod {
@@ -910,6 +943,7 @@ impl ProviderFileConfig {
 pub struct StorageFileConfig {
     pub max_log_bytes_mb: Option<u64>,
     pub max_log_files: Option<u32>,
+    pub log_level: Option<LogLevel>,
     pub input_history_size: Option<usize>,
     pub ephemeral: Option<bool>,
     pub retention: Option<RetentionFileConfig>,
@@ -922,6 +956,7 @@ impl StorageFileConfig {
             overlay,
             max_log_bytes_mb,
             max_log_files,
+            log_level,
             input_history_size,
             ephemeral
         );
@@ -1809,6 +1844,10 @@ pub struct StorageConfig {
              desc = "Max number of log files to keep")]
     pub max_log_files: u32,
 
+    #[config(default = DEFAULT_LOG_LEVEL, ty = "string", default_doc = "info",
+             desc = "Minimum severity written to the log file: trace, debug, info, warn, or error. RUST_LOG overrides it")]
+    pub log_level: LogLevel,
+
     #[config(default = DEFAULT_INPUT_HISTORY_SIZE, min = MIN_INPUT_HISTORY_SIZE,
              desc = "Number of input history entries to retain")]
     pub input_history_size: usize,
@@ -1826,6 +1865,7 @@ impl Default for StorageConfig {
         Self {
             max_log_bytes: DEFAULT_MAX_LOG_BYTES_MB * 1024 * 1024,
             max_log_files: DEFAULT_MAX_LOG_FILES,
+            log_level: DEFAULT_LOG_LEVEL,
             input_history_size: DEFAULT_INPUT_HISTORY_SIZE,
             ephemeral: DEFAULT_EPHEMERAL,
             retention: RetentionConfig::default(),
@@ -1838,6 +1878,7 @@ impl StorageConfig {
         Self {
             max_log_bytes: f.max_log_bytes_mb.unwrap_or(DEFAULT_MAX_LOG_BYTES_MB) * 1024 * 1024,
             max_log_files: f.max_log_files.unwrap_or(DEFAULT_MAX_LOG_FILES),
+            log_level: f.log_level.unwrap_or(DEFAULT_LOG_LEVEL),
             input_history_size: f.input_history_size.unwrap_or(DEFAULT_INPUT_HISTORY_SIZE),
             ephemeral: f.ephemeral.unwrap_or(DEFAULT_EPHEMERAL),
             retention: RetentionConfig::from_file(f.retention.unwrap_or_default()),
@@ -2770,6 +2811,23 @@ mod tests {
     #[test]
     fn notifications_reject_unknown_value() {
         let result: Result<RawConfig, _> = toml::from_str("[ui]\nnotifications = \"desktop\"\n");
+        assert!(result.is_err());
+    }
+
+    #[test_case("trace", LogLevel::Trace ; "trace")]
+    #[test_case("debug", LogLevel::Debug ; "debug")]
+    #[test_case("info", LogLevel::Info ; "info")]
+    #[test_case("warn", LogLevel::Warn ; "warn")]
+    #[test_case("error", LogLevel::Error ; "error")]
+    fn log_level_deserialize(value: &str, expected: LogLevel) {
+        let raw: RawConfig =
+            toml::from_str(&format!("[storage]\nlog_level = \"{value}\"\n")).unwrap();
+        assert_eq!(raw.into_config(false).unwrap().storage.log_level, expected);
+    }
+
+    #[test]
+    fn log_level_rejects_unknown_value() {
+        let result: Result<RawConfig, _> = toml::from_str("[storage]\nlog_level = \"verbose\"\n");
         assert!(result.is_err());
     }
 

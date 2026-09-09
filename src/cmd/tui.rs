@@ -472,10 +472,11 @@ pub fn run(mut cli: Cli) -> Result<ExitCode> {
     let ephemeral = cli.ephemeral || stack.config.storage.ephemeral;
     let (storage, _ephemeral_root) = super::run_storage(persistent_storage, ephemeral)?;
 
-    setup::init_logging(&stack.config.storage);
+    let _logging = setup::init_logging(&stack.config.storage);
     setup::init_telemetry(&stack.config.telemetry);
     setup::install_panic_log_hook();
     setup::warn_ignored_provider_fields();
+    setup::report_startup(setup::MODE_TUI, &stack.model, &cwd);
 
     if cli.is_sdk_mode() {
         let fast = stack.config.always_fast && stack.model.supports_fast();
@@ -594,6 +595,7 @@ pub fn run(mut cli: Cli) -> Result<ExitCode> {
                 config: stack.config.agent.clone(),
                 ui_config: stack.config.ui.clone(),
                 input_history_size: stack.config.storage.input_history_size,
+                max_log_files: stack.config.storage.max_log_files,
                 permissions: Arc::new(
                     caudra_agent::permissions::PermissionManager::new_persistent(
                         stack.config.permissions.clone(),

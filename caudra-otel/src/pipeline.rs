@@ -234,7 +234,7 @@ mod tests {
 
     use super::*;
     use crate::attr::AttrSet;
-    use crate::logs::{EVENT_API_REQUEST, LogRecord};
+    use crate::logs::{EVENT_API_REQUEST, LogRecord, Severity};
     use crate::metrics::{COMMIT_COUNT, Measurement, Value};
     use crate::settings::{ENV_ENABLE, resolve};
     use crate::transport::{ExportError, ExportFuture};
@@ -343,6 +343,7 @@ mod tests {
                 .send(LogRecord {
                     time_unix_nano: 1,
                     event_name: EVENT_API_REQUEST,
+                    severity: Severity::INFO,
                     attrs: AttrSet::new(),
                 })
                 .unwrap();

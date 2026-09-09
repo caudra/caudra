@@ -20,6 +20,7 @@ Commands marked Main only act on the main session's turn or history. They stay l
 | `/help` | Show keybindings |  |
 | `/usage` | Show token usage breakdown |  |
 | `/context` | Inspect active context window usage |  |
+| `/logs` | Browse the structured log |  |
 | `/tools` | Show which tools the model can reach |  |
 | `/skills` | Show the skills the model can load and where they come from |  |
 | `/queue` | Inspect and edit queued prompts |  |
@@ -118,6 +119,20 @@ The summary shows the active model and window, estimated tokens by category, the
 Token counts are estimates. Deferred MCP definitions and memory or skill bodies stay on demand, and opening either report does not load them. The compact MCP catalog, memory tag index, and skill name and description list count when present. Full definitions and bodies count after the agent loads them.
 
 `/usage` is the cumulative view. It totals provider-reported tokens and priced spend for completed calls across the session, and its global view shows lifetime spend. See [Context](/docs/context/) for how requests are assembled and [Token Economy](/docs/token-economy/#lifetime-spend) for the spending ledger.
+
+## Logs
+
+`/logs` opens the structured log Caudra writes for every run. It reads only the rows on screen plus a small buffer, so the modal opens at the same speed on a 5 KB file and a 5 MB one.
+
+New records arrive while the modal is open. Press `f` to pause that and read a fixed view, then `f` again to resume. Scrolling up pauses on its own, and jumping to the end resumes.
+
+Press `l` to cycle the minimum level, or click the level in the footer. Press `Enter` to expand the selected record into every field, its spans, and the raw JSON, `y` to copy the record as shown, and `Y` to copy the stored line.
+
+Press `/` to filter. Each term matches as a subsequence, so `tolcal` finds `tool_call`, and a term is compared against the message, the target, the level, and each field and span value on its own. Space separates terms, and a record has to match all of them, so `provider retry` finds a retry from the provider. Filtering reads backward through the rotated files, and the footer says when it reached the oldest one or stopped at the scan limit.
+
+A line the parser cannot read, such as a panic backtrace, is shown as it was written and treated as an error so a filter never hides it.
+
+Prompt text and tool input are not written to the log unless you opt in. See [Telemetry](/docs/telemetry/#privacy). Run `caudra logs` for the same records outside the TUI, and see [Logging](/docs/logging/) for the file, its rotation, and the level.
 
 ## Modes and toggles
 

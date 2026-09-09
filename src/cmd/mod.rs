@@ -1,4 +1,5 @@
 mod acp;
+mod logs;
 mod storage;
 mod subcmd;
 mod tui;
@@ -161,6 +162,14 @@ pub fn dispatch(cli: Cli) -> Result<ExitCode> {
             dirs,
         }) => {
             subcmd::skills(&cli, name.as_deref(), names, json, dirs)?;
+        }
+        Some(Command::Logs {
+            follow,
+            level,
+            lines,
+            json,
+        }) => {
+            logs::run(follow, level, lines, json)?;
         }
         Some(Command::Storage { action }) => {
             storage::run(action, cli.no_plugins, cli.no_jit)?;

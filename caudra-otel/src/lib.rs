@@ -14,7 +14,10 @@
 pub mod attr;
 pub mod emit;
 pub mod encode;
+mod layer;
 pub mod logs;
+pub use layer::{OtelLayer, layer, telemetry_targets};
+
 pub mod metrics;
 pub mod pipeline;
 pub mod resource;
@@ -30,7 +33,8 @@ use flume::Sender;
 use thiserror::Error;
 
 use crate::attr::AttrSet;
-use crate::logs::LogRecord;
+use crate::emit::{KEY_ERROR, KEY_PROMPT, KEY_TOOL_INPUT};
+use crate::logs::{LogRecord, Severity};
 use crate::metrics::{Measurement, MetricDef, Value};
 use crate::pipeline::{Dropped, Exporters, Inputs, Pipeline, Shutdown, now_nanos};
 use crate::settings::{Exporter, SettingsError, SignalSettings};
@@ -57,7 +61,7 @@ pub enum InitError {
     Client(#[from] isahc::Error),
 }
 
-struct Handle {
+pub(crate) struct Handle {
     measurements: Sender<Measurement>,
     events: Sender<LogRecord>,
     shutdown: Sender<Shutdown>,
@@ -228,7 +232,7 @@ impl Handle {
     /// The name is repeated as an attribute because older collectors drop
     /// the newer OTLP `event_name` field; the sequence orders events that
     /// share a timestamp.
-    fn event(&self, name: &'static str, extra: AttrSet) {
+    pub(crate) fn event(&self, name: &'static str, severity: Severity, extra: AttrSet) {
         let mut attrs = AttrSet::new()
             .with(KEY_TERMINAL_TYPE, self.terminal_type.as_str())
             .with(KEY_APP_VERSION, resource::VERSION)
@@ -244,6 +248,7 @@ impl Handle {
             LogRecord {
                 time_unix_nano: now_nanos(),
                 event_name: name,
+                severity,
                 attrs,
             },
             &self.dropped.logs,
@@ -263,8 +268,23 @@ pub(crate) fn truncate_chars(text: &str, max_chars: usize) -> String {
     }
 }
 
-fn handle() -> Option<&'static Handle> {
+pub(crate) fn handle() -> Option<&'static Handle> {
     enabled().then(|| HANDLE.get()).flatten()
+}
+
+/// Second gate for the fields the OTel privacy settings cover. Call sites also
+/// check, so this catches a new `tracing` call site that forgot to. Both are
+/// needed: the call-site check also avoids serializing what it will not send.
+pub(crate) fn redact_for_export(handle: &Handle, attrs: &mut AttrSet) {
+    if !handle.log_user_prompts {
+        attrs.remove(KEY_PROMPT);
+    }
+    if !handle.log_tool_details {
+        attrs.remove(KEY_TOOL_INPUT);
+    }
+    for key in [KEY_PROMPT, KEY_ERROR] {
+        attrs.map_str(key, |text| truncate_chars(text, handle.content_max_length));
+    }
 }
 
 /// A slow collector must never stall a turn, so a full queue costs the item

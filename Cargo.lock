@@ -1053,6 +1053,7 @@ dependencies = [
  "test-case",
  "thiserror 2.0.18",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -1095,9 +1096,11 @@ version = "0.1.0"
 dependencies = [
  "bs58",
  "etcetera",
+ "flume",
  "getrandom 0.4.3",
  "isahc",
  "jiff",
+ "memchr",
  "regex",
  "regex-automata",
  "rusqlite",

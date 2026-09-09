@@ -12,6 +12,7 @@ pub mod input;
 pub mod keybindings;
 pub(crate) mod list_picker;
 pub(crate) mod login_picker;
+pub(crate) mod logs_modal;
 pub(crate) mod lua_float;
 pub(crate) mod mcp_picker;
 pub(crate) mod memory_picker;

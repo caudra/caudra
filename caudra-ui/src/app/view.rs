@@ -471,6 +471,13 @@ impl App {
                 overlay_rect = r;
             }
         }
+        if self.logs_modal.is_open() {
+            let theme = crate::theme::current();
+            let r = self.logs_modal.view(frame, full, &theme);
+            if r.width > 0 {
+                overlay_rect = r;
+            }
+        }
         if self.context_modal.is_open() {
             let snapshot = self.context_snapshot.get();
             let r = self.context_modal.view(frame, full, snapshot);

@@ -6,9 +6,11 @@ edition.workspace = true
 authors.workspace = true
 
 [dependencies]
+flume = { workspace = true }
 getrandom = { workspace = true }
 isahc = { workspace = true }
 jiff = { workspace = true }
+memchr = { workspace = true }
 regex = { workspace = true }
 regex-automata = { workspace = true }
 serde = { workspace = true }

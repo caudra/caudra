@@ -20,6 +20,10 @@ use cli::Cli;
 /// How long a final telemetry export may take before caudra stops waiting.
 const TELEMETRY_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// How long the queued log records may take to reach the file before caudra
+/// stops waiting.
+const LOG_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// A bare word is a mistyped subcommand far more often than a message, so point
 /// at the flag that does send one.
 const PROMPT_HINT: &str = "tip: to open a session with a message, use `caudra --prompt \"<text>\"`";
@@ -36,6 +40,7 @@ fn main() -> ExitCode {
     // Detached export tasks die with the process, so drain them once every
     // command has released its resources.
     caudra_otel::shutdown(TELEMETRY_SHUTDOWN_TIMEOUT);
+    caudra_storage::log::flush_blocking(LOG_FLUSH_TIMEOUT);
     match result {
         Ok(code) => code,
         Err(e) => {

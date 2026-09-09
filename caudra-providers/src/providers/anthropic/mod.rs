@@ -12,13 +12,14 @@ use std::time::{Duration, Instant};
 use caudra_storage::StateDir;
 use caudra_storage::auth::OAuthTokens;
 use caudra_storage::id::SessionRef;
+use caudra_storage::log::{outcome, target};
 use flume::Sender;
 use futures_lite::io::{AsyncBufReadExt, BufReader};
 use isahc::config::Configurable;
 use isahc::{AsyncReadResponseExt, HttpClient, Request};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::model::{Billing, Model};
 use crate::provider::{BoxFuture, Provider};
@@ -603,7 +604,13 @@ impl Anthropic {
         let tokens =
             smol::unblock(move || auth::refresh_from_storage(&storage, &rejected_accesses)).await?;
         self.install_oauth_tokens(&tokens);
-        debug!("refreshed Anthropic OAuth token");
+        info!(
+            target: target::PROVIDER,
+            event = crate::auth_events::REFRESHED,
+            provider = "anthropic",
+            outcome = outcome::OK,
+            "refreshed OAuth token"
+        );
         Ok(self.auth_snapshot())
     }
 

@@ -60,10 +60,11 @@ pub fn run(
 
     let model = setup::resolve_model(model_arg.as_deref(), &config.provider, &storage)?;
 
-    setup::init_logging(&config.storage);
+    let _logging = setup::init_logging(&config.storage);
     setup::init_telemetry(&config.telemetry);
     setup::install_panic_log_hook();
     setup::warn_ignored_provider_fields();
+    setup::report_startup(setup::MODE_ACP, &model, &cwd);
 
     let prompt_slots = plugin_host
         .event_handle()

@@ -91,6 +91,32 @@ impl AgentError {
         }
     }
 
+    /// A stable discriminant for logs and dashboards. The `Display` text moves
+    /// with provider wording, so grouping on it would split one failure mode
+    /// across many buckets.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Api { .. } => "api",
+            Self::Config { .. } => "config",
+            Self::Tool { .. } => "tool",
+            Self::Io(_) => "io",
+            Self::Http(_) => "http",
+            Self::HttpRequest(_) => "http_request",
+            Self::Json(_) => "json",
+            Self::Channel => "channel",
+            Self::Cancelled => "cancelled",
+            Self::Timeout { .. } => "timeout",
+            Self::EmptySummary => "empty_summary",
+        }
+    }
+
+    pub fn status(&self) -> Option<u16> {
+        match self {
+            Self::Api { status, .. } => Some(*status),
+            _ => None,
+        }
+    }
+
     pub fn is_retryable(&self) -> bool {
         if self.is_context_overflow() {
             return false;

@@ -5,7 +5,7 @@
 
 use crate::attr::{AttrSet, AttrValue};
 use crate::encode::pb::Writer;
-use crate::logs::{LogRecord, SEVERITY_INFO, SEVERITY_TEXT_INFO};
+use crate::logs::LogRecord;
 use crate::metrics::{MetricData, Value};
 use crate::resource::{SCOPE_NAME, VERSION};
 use crate::settings::Temporality;
@@ -153,8 +153,8 @@ pub fn encode_logs(payload: &LogsPayload<'_>) -> Vec<u8> {
             for record in payload.records {
                 sl.message(SCOPE_LOGS_RECORDS, |r| {
                     r.fixed64(LOG_TIME, record.time_unix_nano);
-                    r.int32(LOG_SEVERITY_NUMBER, SEVERITY_INFO);
-                    r.string(LOG_SEVERITY_TEXT, SEVERITY_TEXT_INFO);
+                    r.int32(LOG_SEVERITY_NUMBER, record.severity.number);
+                    r.string(LOG_SEVERITY_TEXT, record.severity.text);
                     write_attributes(r, LOG_ATTRIBUTES, &record.attrs);
                     r.fixed64(LOG_OBSERVED_TIME, record.time_unix_nano);
                     r.string(LOG_EVENT_NAME, record.event_name);
@@ -168,6 +168,7 @@ pub fn encode_logs(payload: &LogsPayload<'_>) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::logs::{SEVERITY_TEXT_INFO, Severity};
     use crate::metrics::{COMMIT_COUNT, DataPoint};
 
     const TIME: u64 = 0x0102030405060708;
@@ -303,6 +304,7 @@ mod tests {
         let records = vec![LogRecord {
             time_unix_nano: TIME,
             event_name: crate::logs::EVENT_API_REQUEST,
+            severity: Severity::INFO,
             attrs: AttrSet::new().with("model", "m"),
         }];
         let bytes = encode_logs(&LogsPayload {

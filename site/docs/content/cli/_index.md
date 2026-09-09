@@ -191,6 +191,17 @@ caudra skills --dirs          # candidate directories: selected, superseded, or 
 
 Applies the same directory precedence a real run does, including the builtin `caudra-plugin-dev` skill when `plugins.skill.plugin_dev` is on. `--dirs` answers why a skill is missing: a directory reads `superseded` when a higher-priority one exists, and `missing` when nothing is there. See [Skills](/docs/skills/#where-skills-live).
 
+### `caudra logs`
+
+```bash
+caudra logs                      # the last 200 records at info and above
+caudra logs -f                   # keep printing as records arrive
+caudra logs -n 50 -l warn        # the last 50 warnings and errors
+caudra logs --json | jq 'select(.fields.event == "retry")'
+```
+
+Prints the same structured log the `/logs` modal shows, formatted for a terminal and coloured by level when stdout is a TTY. `--json` writes the stored line back unchanged, one object per line, which is the form to pipe into `jq`. Reading the log never writes to it. See [Logging](/docs/logging/).
+
 ### `caudra storage`
 
 ```bash

@@ -40,6 +40,12 @@ impl App {
             }
             return Vec::new();
         }
+        if self.logs_modal.is_open() && !self.permission_prompt.is_open() {
+            self.clear_control_hovers();
+            let action = self.logs_modal.handle_mouse(event);
+            self.handle_logs_action(action);
+            return Vec::new();
+        }
         if self.context_modal.is_open() && !self.permission_prompt.is_open() {
             self.clear_control_hovers();
             self.context_modal.handle_mouse(event);
@@ -831,6 +837,7 @@ impl App {
         dismiss!(self.btw_modal);
         dismiss!(self.help_modal);
         dismiss!(self.usage_modal);
+        dismiss!(self.logs_modal);
         dismiss!(self.context_modal);
         dismiss!(self.tools_modal);
         dismiss!(self.skills_modal);

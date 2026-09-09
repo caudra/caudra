@@ -65,6 +65,7 @@ The docs are sorted by what you came here to do:
     <a class="card" href="/docs/keybindings/"><span class="card-title">Keybindings</span><span class="card-desc">Defaults, precedence, rebinding from Lua.</span></a>
     <a class="card" href="/docs/lua-api/"><span class="card-title">Lua API</span><span class="card-desc">The plugin surface, mirrored from Neovim.</span></a>
     <a class="card" href="/docs/cli/"><span class="card-title">CLI</span><span class="card-desc">Flags and subcommands (auth, models, acp, prompt, ...).</span></a>
+    <a class="card" href="/docs/logging/"><span class="card-title">Logging</span><span class="card-desc">The structured log every run writes, and the two ways to read it.</span></a>
     <a class="card" href="/docs/telemetry/"><span class="card-title">Telemetry</span><span class="card-desc">Opt-in OpenTelemetry metrics and events, to a collector you run.</span></a>
   </div>
 </div>

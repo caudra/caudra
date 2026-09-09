@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
-use tracing::{debug, error, info, warn};
+use tracing::{Instrument, debug, error, info, info_span, warn};
 
 use caudra_providers::model_registry::CompactionTarget;
 use caudra_providers::provider::Provider;
@@ -166,6 +166,8 @@ pub struct Agent<'h> {
     permissions: Arc<PermissionManager>,
     opts: RequestOptions,
     session_id: Option<SessionRef>,
+    /// Numbers each turn so every log line inside one can be correlated.
+    turn_id: u64,
     root_tool_use_id: Option<String>,
     mailbox: Option<SessionMailbox>,
     context_publisher: Option<ContextPublisher>,
@@ -227,6 +229,7 @@ impl<'h> Agent<'h> {
             reauth_attempts: 0,
             opts: RequestOptions::default(),
             session_id: params.session_id,
+            turn_id: 0,
             root_tool_use_id: params.root_tool_use_id,
             mailbox: params.mailbox,
             context_publisher: params.context_publisher,
@@ -322,7 +325,25 @@ impl<'h> Agent<'h> {
         self.run_inputs(inputs, false).await
     }
 
+    /// One span per turn. Everything the turn awaits inherits `session_id`,
+    /// `turn_id`, and `model`, which is what makes a log line from deep inside
+    /// tool dispatch attributable.
     async fn run_inputs(
+        &mut self,
+        inputs: Vec<AgentInput>,
+        queued: bool,
+    ) -> Result<DoneReason, AgentError> {
+        self.turn_id += 1;
+        let span = info_span!(
+            "turn",
+            session_id = self.session_id.as_ref().map(SessionRef::as_str),
+            turn_id = self.turn_id,
+            model = %self.model.id,
+        );
+        self.run_turn(inputs, queued).instrument(span).await
+    }
+
+    async fn run_turn(
         &mut self,
         inputs: Vec<AgentInput>,
         queued: bool,
@@ -700,7 +721,7 @@ impl<'h> Agent<'h> {
                 return self.wait_for_reauth(error, forwarded).await;
             }
             Err(StreamError::Other(e)) => {
-                error!(error = %e, model = %self.model.id, self.num_turns, "stream_message failed");
+                error!(error = %e, model = %self.model.id, turns = self.num_turns, "stream_message failed");
                 return Err(e);
             }
         };
@@ -963,7 +984,7 @@ impl<'h> Agent<'h> {
             return Err(err);
         }
         let Some(rx) = &self.user_response_rx else {
-            error!(error = %err, model = %self.model.id, self.num_turns, "stream_message failed");
+            error!(error = %err, model = %self.model.id, turns = self.num_turns, "stream_message failed");
             return Err(err);
         };
         self.reauth_attempts += 1;

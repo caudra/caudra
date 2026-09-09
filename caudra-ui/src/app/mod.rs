@@ -42,6 +42,7 @@ use crate::components::help_modal::HelpModal;
 use crate::components::input::{AdmissionHit, InputAction, InputBox, Submission};
 use crate::components::keybindings::{self, KeybindContext, key, leader};
 use crate::components::login_picker::{LoginPicker, LoginPickerAction};
+use crate::components::logs_modal::{LogsAction, LogsModal};
 use crate::components::lua_float::FloatManager;
 use crate::components::mcp_picker::{McpPicker, McpPickerAction};
 use crate::components::memory_picker::MemoryPicker;
@@ -137,6 +138,7 @@ const CONTEXT_USAGE: &str = "Usage: /context [all]";
 const TOOLS_USAGE: &str = "Usage: /tools";
 const SKILLS_USAGE: &str = "Usage: /skills";
 const AUTH_EXPIRED_MSG: &str = "Authentication failed. Run `caudra auth login` in another terminal; Caudra will resume automatically, or press Enter to retry now.";
+const COPY_FAILED: &str = "Copy failed: ";
 const FLASH_NO_PLAN: &str = "No plan file";
 const FAST_UNSUPPORTED_MSG: &str = "Fast mode requires an Anthropic Opus 4.6+ model (API only)";
 const THINKING_UNSUPPORTED_MSG: &str = "Thinking requires a model that supports it";
@@ -280,6 +282,7 @@ pub struct App {
     pub(super) which_key: WhichKey,
     pub(super) usage_modal: UsageModal,
     pub(super) context_modal: ContextModal,
+    pub(super) logs_modal: LogsModal,
     pub(super) tools_modal: ToolsModal,
     pub(super) skills_modal: SkillsModal,
     context_snapshot: Watch<ContextSnapshot>,
@@ -433,6 +436,7 @@ impl App {
         storage_writer: Arc<StorageWriter>,
         ui_config: UiConfig,
         input_history_size: usize,
+        max_log_files: u32,
         permissions: Arc<PermissionManager>,
         custom_commands: Arc<[caudra_agent::command::CustomCommand]>,
         lua_event_handle: EventHandle,
@@ -480,6 +484,7 @@ impl App {
             which_key: WhichKey::new(ui_config.which_key_delay()),
             usage_modal: UsageModal::new(),
             context_modal: ContextModal::new(),
+            logs_modal: LogsModal::new(max_log_files),
             tools_modal: ToolsModal::new(),
             skills_modal: SkillsModal::new(),
             context_snapshot: Watch::default(),
@@ -1022,6 +1027,10 @@ impl App {
             self.usage_modal.scroll(delta);
             return None;
         }
+        if self.logs_modal.is_open() {
+            self.logs_modal.scroll(delta);
+            return None;
+        }
         if self.context_modal.is_open() {
             self.context_modal.scroll(delta);
             return None;
@@ -1221,6 +1230,12 @@ impl App {
             }
             self.usage_modal.handle_key(key);
             self.load_lifetime_usage();
+            return Some(vec![]);
+        }
+
+        if self.logs_modal.is_open() {
+            let action = self.logs_modal.handle_key(key);
+            self.handle_logs_action(action);
             return Some(vec![]);
         }
 
@@ -2282,6 +2297,18 @@ impl App {
         self.context_modal.open(expanded);
     }
 
+    fn handle_logs_action(&mut self, action: LogsAction) {
+        match action {
+            LogsAction::Consumed => {}
+            LogsAction::Close => self.logs_modal.close(),
+            LogsAction::Copy { text, label } => match self.clipboard.copy_text(&text) {
+                Ok(CopyResult::Noop) => {}
+                Ok(CopyResult::Copied) => self.flash(label.into()),
+                Err(e) => self.flash(format!("{COPY_FAILED}{e}")),
+            },
+        }
+    }
+
     fn execute_tools(&mut self) {
         self.context_snapshot = Watch::seeded(self.active_context_snapshot());
         self.tools_modal.open();
@@ -3313,6 +3340,10 @@ impl App {
                 self.execute_context(&cmd.args);
                 vec![]
             }
+            "/logs" => {
+                self.logs_modal.open();
+                vec![]
+            }
             "/tools" => {
                 self.execute_tools();
                 vec![]
@@ -3637,9 +3668,10 @@ impl App {
         self.subagent_input_box.set_cwd(cwd);
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 29] {
+    fn overlays(&self) -> [&dyn Overlay; 30] {
         [
             &self.workbench,
+            &self.logs_modal,
             &self.help_modal,
             &self.usage_modal,
             &self.context_modal,
@@ -3671,9 +3703,10 @@ impl App {
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 29] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 30] {
         [
             &mut self.workbench,
+            &mut self.logs_modal,
             &mut self.help_modal,
             &mut self.usage_modal,
             &mut self.context_modal,
@@ -3828,6 +3861,7 @@ impl App {
             | self.model_picker.refresh()
             | self.usage_modal.poll(&self.usage_slot)
             | self.poll_context_snapshot()
+            | self.logs_modal.poll()
             | self.hints.poll(self.hint_reader.load_full())
             | self.tick_file_picker()
             | self.mention_popup.tick()
@@ -4064,6 +4098,10 @@ impl App {
             return;
         }
         if self.float_mgr.handle_paste(text) {
+            return;
+        }
+        if self.logs_modal.is_open() {
+            self.logs_modal.handle_paste(text);
             return;
         }
         if self.search_modal.is_open() {

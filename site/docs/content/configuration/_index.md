@@ -161,6 +161,7 @@ How many lines of output an open card shows per tool before it says how many it 
 |-------|------|---------|-----|-------------|
 | `max_log_bytes_mb` | u64 | `200` | 1 | Max total log size (MB) |
 | `max_log_files` | u32 | `10` | 1 | Max number of log files to keep |
+| `log_level` | string | `info` | - | Minimum severity written to the log file: trace, debug, info, warn, or error. RUST_LOG overrides it |
 | `input_history_size` | usize | `100` | 10 | Number of input history entries to retain |
 | `ephemeral` | bool | `false` | - | Store session data in a temporary directory removed when Caudra exits |
 

@@ -2,14 +2,15 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use caudra_providers::provider::Provider;
-use caudra_providers::retry::RetryState;
+use caudra_providers::retry::{MAX_RETRIES, RetryDecision, RetryState};
 use caudra_providers::{
     Billing, ContentBlock, Message, Model, ProviderEvent, ReasoningSource, RequestOptions,
     StreamResponse,
 };
 use caudra_storage::id::SessionRef;
+use caudra_storage::log::target;
 use serde_json::Value;
-use tracing::warn;
+use tracing::{info, warn};
 
 use super::tool_body::BodyStream;
 use super::tool_preview;
@@ -20,6 +21,16 @@ use crate::types::BatchToolEntry;
 use crate::{AgentError, AgentEvent, EventSender};
 
 const FUNCTIONS_PREFIX: &str = "functions.";
+
+const EVENT_RETRY: &str = "provider_retry";
+const EVENT_RETRY_EXHAUSTED: &str = "provider_retry_exhausted";
+const EVENT_RETRY_RECOVERED: &str = "provider_retry_recovered";
+const EVENT_KEY_ROTATED: &str = "provider_key_rotated";
+const EVENT_REQUEST_FAILED: &str = "provider_request_failed";
+const EVENT_REQUEST_FINISHED: &str = "provider_request_finished";
+const OUTCOME_OK: &str = "ok";
+const OUTCOME_ERROR: &str = "error";
+const OUTCOME_CANCELLED: &str = "cancelled";
 
 /// GPT models sometimes emit `functions.<name>`, a Codex training habit.
 /// Stripped here at the provider boundary so no raw name enters the agent;
@@ -352,6 +363,9 @@ async fn stream_with_retry_inner(
     let messages = caudra_providers::adapt_images_for_model(model, messages);
     let messages = &*messages;
     let mut retry = RetryState::new();
+    // `started` restarts per attempt, so total time across a retry storm needs
+    // its own clock.
+    let first_attempt_at = Instant::now();
     loop {
         let started = Instant::now();
         let (ptx, prx) = flume::unbounded();
@@ -391,9 +405,31 @@ async fn stream_with_retry_inner(
                     provider.reasoning_transport(model),
                 ));
                 emit_api_request(model, &r, opts, started.elapsed());
+                if retry.attempts() > 0 {
+                    info!(
+                        target: target::PROVIDER,
+                        event = EVENT_RETRY_RECOVERED,
+                        provider = %model.provider,
+                        model = %model.id,
+                        attempt = retry.attempts(),
+                        elapsed_ms = first_attempt_at.elapsed().as_millis() as u64,
+                        outcome = OUTCOME_OK,
+                        "request succeeded after retrying"
+                    );
+                }
                 return Ok(r);
             }
             Err(AgentError::Cancelled) => {
+                info!(
+                    target: target::PROVIDER,
+                    event = EVENT_REQUEST_FINISHED,
+                    provider = %model.provider,
+                    model = %model.id,
+                    attempt = retry.attempts() + 1,
+                    duration_ms = started.elapsed().as_millis() as u64,
+                    outcome = OUTCOME_CANCELLED,
+                    "request cancelled"
+                );
                 return Err(StreamError::Cancelled {
                     streamed,
                     reasoning,
@@ -404,13 +440,57 @@ async fn stream_with_retry_inner(
                 if e.should_rotate_key()
                     && let Ok(true) = provider.rotate_key().await
                 {
-                    warn!("rotated API key after error: {e}");
+                    warn!(
+                        target: target::PROVIDER,
+                        event = EVENT_KEY_ROTATED,
+                        provider = %model.provider,
+                        error_kind = e.kind(),
+                        status = e.status(),
+                        "rotated API key after error"
+                    );
                 }
-                let Some((attempt, delay)) = retry.next_delay(e.retry_after()) else {
-                    return Err(e.into());
+                let hint_ms = e.retry_after().map(|after| after.as_millis() as u64);
+                let (attempt, delay, source) = match retry.decide(e.retry_after()) {
+                    RetryDecision::Wait {
+                        attempt,
+                        delay,
+                        source,
+                    } => (attempt, delay, source),
+                    RetryDecision::GiveUp(reason) => {
+                        warn!(
+                            target: target::PROVIDER,
+                            event = EVENT_RETRY_EXHAUSTED,
+                            provider = %model.provider,
+                            model = %model.id,
+                            attempt = retry.attempts(),
+                            max_retries = MAX_RETRIES,
+                            reason = reason.as_str(),
+                            retry_after_ms = hint_ms,
+                            status = e.status(),
+                            error_kind = e.kind(),
+                            elapsed_ms = first_attempt_at.elapsed().as_millis() as u64,
+                            outcome = OUTCOME_ERROR,
+                            "giving up after retrying"
+                        );
+                        return Err(e.into());
+                    }
                 };
                 let delay_ms = delay.as_millis() as u64;
-                warn!(attempt, delay_ms, error = %e, "retryable, will retry");
+                warn!(
+                    target: target::PROVIDER,
+                    event = EVENT_RETRY,
+                    provider = %model.provider,
+                    model = %model.id,
+                    attempt,
+                    max_retries = MAX_RETRIES,
+                    delay_ms,
+                    delay_source = source.as_str(),
+                    retry_after_ms = hint_ms,
+                    status = e.status(),
+                    error_kind = e.kind(),
+                    error = %e,
+                    "retryable, will retry"
+                );
                 if let Some(event_tx) = event_tx {
                     event_tx.send(AgentEvent::Retry {
                         attempt,
@@ -434,6 +514,21 @@ async fn stream_with_retry_inner(
             }
             Err(e) => {
                 emit_api_error(model, &e, retry.attempts() + 1, started.elapsed());
+                // The status is reported but never the body: see
+                // `error_description`.
+                warn!(
+                    target: target::PROVIDER,
+                    event = EVENT_REQUEST_FAILED,
+                    provider = %model.provider,
+                    model = %model.id,
+                    attempt = retry.attempts() + 1,
+                    status = e.status(),
+                    error_kind = e.kind(),
+                    auth = e.is_auth_error(),
+                    duration_ms = started.elapsed().as_millis() as u64,
+                    outcome = OUTCOME_ERROR,
+                    "request failed without a retry"
+                );
                 if e.is_auth_error() {
                     return Err(StreamError::Auth {
                         error: e,
@@ -446,10 +541,9 @@ async fn stream_with_retry_inner(
     }
 }
 
+/// No telemetry gate: the event feeds the log file through the same call, and
+/// the telemetry layer no-ops when telemetry is off.
 fn emit_api_request(model: &Model, r: &StreamResponse, opts: RequestOptions, took: Duration) {
-    if !caudra_otel::enabled() {
-        return;
-    }
     let usage = &r.usage;
     // A subscription's rates describe a bill that never arrives, so the spend
     // metric must not see them.
@@ -472,9 +566,6 @@ fn emit_api_request(model: &Model, r: &StreamResponse, opts: RequestOptions, too
 }
 
 fn emit_api_error(model: &Model, error: &AgentError, attempt: u32, took: Duration) {
-    if !caudra_otel::enabled() {
-        return;
-    }
     caudra_otel::emit::api_error(&caudra_otel::emit::ApiError {
         model: &model.id,
         provider: &model.provider,

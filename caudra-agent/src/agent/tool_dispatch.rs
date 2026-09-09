@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
-use tracing::{debug, error, warn};
+use tracing::{Instrument, debug, error, info_span, warn};
 
 use crate::mcp::{McpSession, UNKNOWN_MCP};
 use crate::permissions::canonical_json;
@@ -116,15 +116,17 @@ pub async fn run(
     ctx: &ToolContext,
     mut emit: Emit<'_>,
 ) -> ToolDoneEvent {
-    let telemetry = caudra_otel::enabled();
-    let canonical = telemetry.then(|| canonical_tool_name(name, ctx));
-    let source = canonical.map(|name| tool_source(registry, ctx, name));
+    // Resolved unconditionally now that the report also feeds the log file,
+    // which is where "which tool took nine seconds" gets answered.
+    let canonical = canonical_tool_name(name, ctx);
+    let source = tool_source(registry, ctx, canonical);
+    let span = info_span!("tool", tool = canonical, tool_use_id = %id);
     let started = Instant::now();
-    let mut done = run_inner(registry, mcp, id, name, input, ctx, &mut emit).await;
+    let mut done = run_inner(registry, mcp, id, name, input, ctx, &mut emit)
+        .instrument(span)
+        .await;
     crate::tool_output::limit(&mut done, ctx).await;
-    if let (Some(canonical), Some(source)) = (canonical, source) {
-        report(&done, canonical, &source, input, started.elapsed());
-    }
+    report(&done, canonical, &source, input, started.elapsed());
     done
 }
 

@@ -114,6 +114,24 @@ impl AttrSet {
     pub fn iter(&self) -> impl Iterator<Item = (&str, &AttrValue)> {
         self.0.iter().map(|(k, v)| (k.as_str(), v))
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn remove(&mut self, key: &str) -> Option<AttrValue> {
+        let at = self.0.binary_search_by(|(k, _)| k.as_str().cmp(key)).ok()?;
+        Some(self.0.remove(at).1)
+    }
+
+    /// Replaces a string value in place, leaving other kinds untouched.
+    pub fn map_str(&mut self, key: &str, f: impl FnOnce(&str) -> String) {
+        if let Ok(at) = self.0.binary_search_by(|(k, _)| k.as_str().cmp(key))
+            && let AttrValue::Str(current) = &self.0[at].1
+        {
+            self.0[at].1 = AttrValue::Str(f(current));
+        }
+    }
 }
 
 #[cfg(test)]

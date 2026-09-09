@@ -9,6 +9,9 @@ use caudra_config::TelemetryConfig;
 use caudra_otel::emit::{self, ToolResult};
 use caudra_otel::logs::{EVENT_TOOL_RESULT, EVENT_USER_PROMPT};
 use serde_json::Value;
+use tracing_subscriber::Layer;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 mod support;
 
@@ -51,6 +54,11 @@ fn prompt_text_and_tool_input_stay_home_by_default() {
         logs_interval_ms: Some(NEVER_MS),
         ..TelemetryConfig::default()
     };
+    // `emit::*` reaches the exporter through the layer, so a run without a
+    // subscriber would export nothing and prove nothing.
+    tracing_subscriber::registry()
+        .with(caudra_otel::layer().with_filter(caudra_otel::telemetry_targets()))
+        .init();
     caudra_otel::init(&config).expect("telemetry should start");
     assert!(
         !caudra_otel::logs_tool_details(),

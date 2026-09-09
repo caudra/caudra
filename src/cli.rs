@@ -10,6 +10,8 @@ use caudra_storage::retention::{Duration as RetentionDuration, GroupBy, KeepPoli
 
 use crate::print::OutputFormat;
 
+const DEFAULT_LOG_LINES: usize = 200;
+
 #[derive(Clone, ValueEnum, Default)]
 pub enum PromptVariant {
     #[default]
@@ -23,6 +25,29 @@ pub enum InputFormat {
     #[default]
     Text,
     StreamJson,
+}
+
+#[derive(Clone, Copy, ValueEnum, Default)]
+#[value(rename_all = "lower")]
+pub enum LogLevel {
+    Trace,
+    Debug,
+    #[default]
+    Info,
+    Warn,
+    Error,
+}
+
+impl From<LogLevel> for caudra_storage::log::record::Level {
+    fn from(level: LogLevel) -> Self {
+        match level {
+            LogLevel::Trace => Self::Trace,
+            LogLevel::Debug => Self::Debug,
+            LogLevel::Info => Self::Info,
+            LogLevel::Warn => Self::Warn,
+            LogLevel::Error => Self::Error,
+        }
+    }
 }
 
 #[derive(Parser)]
@@ -308,6 +333,21 @@ pub enum Command {
         #[arg(long, conflicts_with_all = ["names", "json"])]
         dirs: bool,
     },
+    /// Print the structured log
+    Logs {
+        /// Keep printing new records as they arrive
+        #[arg(short, long)]
+        follow: bool,
+        /// Hide records below this level
+        #[arg(short, long, value_name = "LEVEL", default_value = "info")]
+        level: LogLevel,
+        /// How many records to print before following
+        #[arg(short = 'n', long, value_name = "COUNT", default_value_t = DEFAULT_LOG_LINES)]
+        lines: usize,
+        /// Emit the records as they are stored, one JSON object per line
+        #[arg(long)]
+        json: bool,
+    },
     /// Inspect and maintain session storage
     Storage {
         #[command(subcommand)]
@@ -587,6 +627,8 @@ mod tests {
     use super::*;
     use test_case::test_case;
 
+    const LOGS_NOT_PARSED: &str = "expected the logs subcommand";
+
     #[test_case("FileRead", "file_read")]
     #[test_case("Shell", "shell")]
     #[test_case("PythonExecution", "python_execution")]
@@ -594,6 +636,46 @@ mod tests {
     #[test_case("python_execution", "python_execution"; "snake_passthrough")]
     fn normalize_tool_name_valid_inputs(input: &str, expected: &str) {
         assert_eq!(normalize_tool_name(input).unwrap(), expected);
+    }
+
+    #[test]
+    fn the_logs_subcommand_defaults_to_a_bounded_non_following_read() {
+        let cli = Cli::try_parse_from(["caudra", "logs"]).unwrap();
+        let Some(Command::Logs {
+            follow,
+            level,
+            lines,
+            json,
+        }) = cli.command
+        else {
+            panic!("{LOGS_NOT_PARSED}");
+        };
+        assert!(!follow);
+        assert!(!json);
+        assert_eq!(lines, DEFAULT_LOG_LINES);
+        assert!(matches!(level, LogLevel::Info));
+    }
+
+    #[test]
+    fn the_logs_subcommand_takes_short_flags() {
+        let cli = Cli::try_parse_from(["caudra", "logs", "-f", "-l", "warn", "-n", "10"]).unwrap();
+        let Some(Command::Logs {
+            follow,
+            level,
+            lines,
+            ..
+        }) = cli.command
+        else {
+            panic!("{LOGS_NOT_PARSED}");
+        };
+        assert!(follow);
+        assert_eq!(lines, 10);
+        assert!(matches!(level, LogLevel::Warn));
+    }
+
+    #[test]
+    fn the_logs_subcommand_rejects_an_unknown_level() {
+        assert!(Cli::try_parse_from(["caudra", "logs", "--level", "chatty"]).is_err());
     }
 
     #[test]

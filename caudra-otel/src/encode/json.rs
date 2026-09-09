@@ -5,7 +5,7 @@ use serde_json::{Map, Value as Json, json};
 
 use crate::attr::{AttrSet, AttrValue};
 use crate::encode::otlp::{LogsPayload, MetricsPayload, temporality_code};
-use crate::logs::{SEVERITY_INFO, SEVERITY_TEXT_INFO};
+
 use crate::metrics::Value;
 use crate::resource::{SCOPE_NAME, VERSION};
 
@@ -106,8 +106,8 @@ pub fn encode_logs(payload: &LogsPayload<'_>) -> Vec<u8> {
             json!({
                 "timeUnixNano": time,
                 "observedTimeUnixNano": time,
-                "severityNumber": SEVERITY_INFO,
-                "severityText": SEVERITY_TEXT_INFO,
+                "severityNumber": record.severity.number,
+                "severityText": record.severity.text,
                 "eventName": record.event_name,
                 "attributes": attributes(&record.attrs),
             })
@@ -128,7 +128,7 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
-    use crate::logs::{EVENT_API_REQUEST, LogRecord};
+    use crate::logs::{EVENT_API_REQUEST, LogRecord, SEVERITY_INFO, Severity};
     use crate::metrics::{COST_USAGE, DataPoint, MetricData, TOKEN_USAGE};
     use crate::settings::Temporality;
 
@@ -219,6 +219,7 @@ mod tests {
         let records = vec![LogRecord {
             time_unix_nano: TIME,
             event_name: EVENT_API_REQUEST,
+            severity: Severity::INFO,
             attrs: AttrSet::new()
                 .with("input_tokens", 10i64)
                 .with("cost_usd", 0.5f64)
@@ -250,6 +251,7 @@ mod tests {
         let records = vec![LogRecord {
             time_unix_nano: TIME,
             event_name: EVENT_API_REQUEST,
+            severity: Severity::INFO,
             attrs: AttrSet::new().with("cost_usd", value),
         }];
         let got = parse(encode_logs(&LogsPayload {

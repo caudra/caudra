@@ -141,6 +141,7 @@ const CONTINUED_CONTENT: &str = "continued after revert";
 const GOAL_CONDITION: &str = "all focused tests pass";
 const GOAL_CHIP_PREFIX: &str = "[goal \u{b7}";
 const CONTEXT_COMMAND: &str = "/context";
+const LOGS_COMMAND: &str = "/logs";
 const CONTEXT_UPPERCASE_COMMAND: &str = "/CONTEXT";
 const CONTEXT_TRAILING_COMMAND: &str = "/context   ";
 const CONTEXT_ALL_COMMAND: &str = "/context all";
@@ -199,6 +200,7 @@ fn build_app_with_lua(
         writer,
         UiConfig::default(),
         100,
+        caudra_storage::log::DEFAULT_MAX_FILES,
         Arc::new(PermissionManager::new_nonpersistent(
             PermissionsConfig {
                 rules: vec![],
@@ -3690,6 +3692,24 @@ fn open_context_modal_repaints_once_and_renders_the_watched_snapshot() {
     let after_poll = rendered(&mut app);
     assert!(!after_poll.contains(INITIAL_CONTEXT_PROVIDER));
     assert!(after_poll.contains(UPDATED_CONTEXT_PROVIDER));
+    assert_eq!(app.tick(), Dirty::NO, "{QUIET}");
+}
+
+#[test]
+fn the_logs_command_opens_the_modal_and_esc_closes_it() {
+    let mut app = app_without_splash();
+    app.execute_command(cmd(LOGS_COMMAND), 0);
+    assert!(app.logs_modal.is_open());
+
+    app.update(Msg::Key(key(KeyCode::Esc)));
+    assert!(!app.logs_modal.is_open(), "{LEFT_STANDING}");
+}
+
+#[test]
+fn a_closed_logs_modal_never_owes_a_repaint() {
+    let mut app = app_without_splash();
+    app.execute_command(cmd(LOGS_COMMAND), 0);
+    app.logs_modal.close();
     assert_eq!(app.tick(), Dirty::NO, "{QUIET}");
 }
 
@@ -9484,6 +9504,10 @@ fn open_context_modal(app: &mut App) {
     app.context_modal.open(false);
 }
 
+fn open_logs_modal(app: &mut App) {
+    app.logs_modal.open();
+}
+
 fn open_tools_modal(app: &mut App) {
     app.tools_modal.open();
 }
@@ -9515,6 +9539,7 @@ fn open_argument_prompt(app: &mut App) {
 #[test_case(open_help_modal    ; "help_modal")]
 #[test_case(open_usage_modal   ; "usage_modal")]
 #[test_case(open_context_modal ; "context_modal")]
+#[test_case(open_logs_modal    ; "logs_modal")]
 #[test_case(open_tools_modal   ; "tools_modal")]
 #[test_case(open_skills_modal  ; "skills_modal")]
 #[test_case(open_goal_modal    ; "goal_modal")]
@@ -9540,6 +9565,7 @@ fn a_press_outside_a_modal_dismisses_it(open: fn(&mut App)) {
 #[test_case(open_help_modal    ; "help_modal")]
 #[test_case(open_usage_modal   ; "usage_modal")]
 #[test_case(open_context_modal ; "context_modal")]
+#[test_case(open_logs_modal    ; "logs_modal")]
 #[test_case(open_tools_modal   ; "tools_modal")]
 #[test_case(open_skills_modal  ; "skills_modal")]
 #[test_case(open_goal_modal    ; "goal_modal")]

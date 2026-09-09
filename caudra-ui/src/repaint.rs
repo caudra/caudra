@@ -183,6 +183,15 @@ impl Cadence {
         }
     }
 
+    /// Wake every `delay` to run a poller, and paint only if the poller found
+    /// something. For a source that is usually quiet, like a log file.
+    pub fn polling(delay: Duration) -> Self {
+        Self {
+            frame: Some(delay),
+            moves: false,
+        }
+    }
+
     /// `cadence` while `applies`, else [`Cadence::IDLE`].
     pub fn when(applies: bool, cadence: Self) -> Self {
         if applies { cadence } else { Self::IDLE }

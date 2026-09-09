@@ -37,25 +37,18 @@ const KEY_START_TYPE: &str = "start_type";
 const KEY_MODEL: &str = "model";
 const KEY_PROVIDER: &str = "provider";
 const KEY_TOOL_NAME: &str = "tool_name";
-const KEY_TOOL_SOURCE: &str = "tool_source";
 const KEY_DECISION: &str = "decision";
 const KEY_SOURCE: &str = "source";
-const KEY_SUCCESS: &str = "success";
-const KEY_DURATION_MS: &str = "duration_ms";
-const KEY_ERROR: &str = "error";
-const KEY_ERROR_TYPE: &str = "error_type";
-const KEY_STATUS_CODE: &str = "status_code";
-const KEY_ATTEMPT: &str = "attempt";
-const KEY_STOP_REASON: &str = "stop_reason";
-const KEY_INPUT_TOKENS: &str = "input_tokens";
-const KEY_OUTPUT_TOKENS: &str = "output_tokens";
-const KEY_CACHE_READ_TOKENS: &str = "cache_read_tokens";
-const KEY_CACHE_CREATION_TOKENS: &str = "cache_creation_tokens";
-const KEY_COST_USD: &str = "cost_usd";
-const KEY_SUBSCRIPTION_COST_USD: &str = "subscription_cost_usd";
-const KEY_PROMPT: &str = "prompt";
-const KEY_PROMPT_LENGTH: &str = "prompt_length";
-const KEY_TOOL_INPUT: &str = "tool_input";
+/// Redacted by [`crate::redact_for_export`] as well as by the call sites here.
+pub(crate) const KEY_ERROR: &str = "error";
+pub(crate) const KEY_PROMPT: &str = "prompt";
+pub(crate) const KEY_TOOL_INPUT: &str = "tool_input";
+
+const MSG_USER_PROMPT: &str = "user prompt";
+const MSG_API_REQUEST: &str = "api request";
+const MSG_API_ERROR: &str = "api error";
+const MSG_TOOL_RESULT: &str = "tool result";
+const MSG_TOOL_DECISION: &str = "tool decision";
 
 /// The one entry point for session starts: the id is set before counting, so
 /// a counted session can never miss it.
@@ -73,15 +66,21 @@ pub fn session_started(start_type: &'static str, session_id: Option<&str>) {
     );
 }
 
+/// Prompt text is opt-in, and the gate lives here so the text is never
+/// formatted, never reaches the log file, and never reaches the exporter
+/// unless it was asked for.
+fn opt_in_prompt(prompt: &str) -> Option<String> {
+    let handle = handle()?;
+    handle.log_user_prompts.then(|| handle.truncate(prompt))
+}
+
 pub fn user_prompt(prompt: &str) {
-    let Some(handle) = handle() else {
-        return;
-    };
-    let mut attrs = AttrSet::new().with(KEY_PROMPT_LENGTH, prompt.chars().count());
-    if handle.log_user_prompts {
-        attrs.insert(KEY_PROMPT, handle.truncate(prompt));
-    }
-    handle.event(EVENT_USER_PROMPT, attrs);
+    tracing::info!(
+        target: EVENT_USER_PROMPT,
+        prompt_length = prompt.chars().count(),
+        prompt = opt_in_prompt(prompt),
+        MSG_USER_PROMPT,
+    );
 }
 
 pub struct ApiRequest<'a> {
@@ -100,26 +99,27 @@ pub struct ApiRequest<'a> {
 }
 
 pub fn api_request(request: &ApiRequest<'_>) {
+    tracing::info!(
+        target: EVENT_API_REQUEST,
+        model = request.model,
+        provider = request.provider,
+        input_tokens = request.input_tokens,
+        output_tokens = request.output_tokens,
+        cache_read_tokens = request.cache_read_tokens,
+        cache_creation_tokens = request.cache_creation_tokens,
+        cost_usd = request.cost_usd,
+        subscription_cost_usd = request.subscription_cost_usd,
+        duration_ms = request.duration.as_millis() as u64,
+        stop_reason = request.stop_reason,
+        MSG_API_REQUEST,
+    );
+
     let Some(handle) = handle() else {
         return;
     };
     let model_attrs = AttrSet::new()
         .with(KEY_MODEL, request.model)
         .with(KEY_PROVIDER, request.provider);
-    handle.event(
-        EVENT_API_REQUEST,
-        model_attrs
-            .clone()
-            .with(KEY_INPUT_TOKENS, request.input_tokens)
-            .with(KEY_OUTPUT_TOKENS, request.output_tokens)
-            .with(KEY_CACHE_READ_TOKENS, request.cache_read_tokens)
-            .with(KEY_CACHE_CREATION_TOKENS, request.cache_creation_tokens)
-            .with(KEY_COST_USD, request.cost_usd)
-            .with(KEY_SUBSCRIPTION_COST_USD, request.subscription_cost_usd)
-            .with(KEY_DURATION_MS, request.duration.as_millis() as u64)
-            .with_opt(KEY_STOP_REASON, request.stop_reason),
-    );
-
     for (kind, count) in [
         (TOKEN_INPUT, request.input_tokens),
         (TOKEN_OUTPUT, request.output_tokens),
@@ -150,18 +150,15 @@ pub struct ApiError<'a> {
 }
 
 pub fn api_error(error: &ApiError<'_>) {
-    let Some(handle) = handle() else {
-        return;
-    };
-    handle.event(
-        EVENT_API_ERROR,
-        AttrSet::new()
-            .with(KEY_MODEL, error.model)
-            .with(KEY_PROVIDER, error.provider)
-            .with(KEY_ERROR, handle.truncate(error.error))
-            .with_opt(KEY_STATUS_CODE, error.status_code.map(i64::from))
-            .with(KEY_ATTEMPT, i64::from(error.attempt))
-            .with(KEY_DURATION_MS, error.duration.as_millis() as u64),
+    tracing::warn!(
+        target: EVENT_API_ERROR,
+        model = error.model,
+        provider = error.provider,
+        error = error.error,
+        status_code = error.status_code,
+        attempt = error.attempt,
+        duration_ms = error.duration.as_millis() as u64,
+        MSG_API_ERROR,
     );
 }
 
@@ -174,35 +171,49 @@ pub struct ToolResult<'a> {
     pub tool_input: Option<&'a str>,
 }
 
+/// Tool input is opt-in for the same reason prompts are: it routinely carries
+/// file contents, shell commands, and paths.
+fn opt_in_tool_input(input: Option<&str>) -> Option<String> {
+    let handle = handle()?;
+    handle
+        .log_tool_details
+        .then_some(input)
+        .flatten()
+        .map(|input| handle.truncate(input))
+}
+
 pub fn tool_result(result: &ToolResult<'_>) {
-    let Some(handle) = handle() else {
-        return;
-    };
-    let mut attrs = AttrSet::new()
-        .with(KEY_TOOL_NAME, result.tool_name)
-        .with(KEY_TOOL_SOURCE, result.tool_source)
-        .with(KEY_SUCCESS, result.success)
-        .with(KEY_DURATION_MS, result.duration.as_millis() as u64)
-        .with_opt(KEY_ERROR_TYPE, result.error_type);
-    if handle.log_tool_details
-        && let Some(input) = result.tool_input
-    {
-        attrs.insert(KEY_TOOL_INPUT, handle.truncate(input));
-    }
-    handle.event(EVENT_TOOL_RESULT, attrs);
+    tracing::info!(
+        target: EVENT_TOOL_RESULT,
+        tool_name = result.tool_name,
+        tool_source = result.tool_source,
+        success = result.success,
+        duration_ms = result.duration.as_millis() as u64,
+        error_type = result.error_type,
+        tool_input = opt_in_tool_input(result.tool_input),
+        MSG_TOOL_RESULT,
+    );
 }
 
 /// Both the event and the counter: dashboards want the rate, audits the detail.
 pub fn tool_decision(tool_name: &str, decision: &'static str, source: &'static str) {
-    let Some(handle) = handle() else {
-        return;
-    };
-    let attrs = AttrSet::new()
-        .with(KEY_TOOL_NAME, tool_name)
-        .with(KEY_DECISION, decision)
-        .with(KEY_SOURCE, source);
-    handle.event(EVENT_TOOL_DECISION, attrs.clone());
-    handle.record(&TOOL_DECISION, Value::Int(1), attrs);
+    tracing::info!(
+        target: EVENT_TOOL_DECISION,
+        tool_name,
+        decision,
+        source,
+        MSG_TOOL_DECISION,
+    );
+    if let Some(handle) = handle() {
+        handle.record(
+            &TOOL_DECISION,
+            Value::Int(1),
+            AttrSet::new()
+                .with(KEY_TOOL_NAME, tool_name)
+                .with(KEY_DECISION, decision)
+                .with(KEY_SOURCE, source),
+        );
+    }
 }
 
 pub fn lines_of_code(added: u64, removed: u64) {

@@ -6,6 +6,12 @@ pub mod model_registry;
 pub mod pricing;
 pub mod provider;
 pub(crate) mod providers;
+/// Names for auth lifecycle events, shared so the three OAuth providers report
+/// the same shape under `caudra::provider`.
+pub mod auth_events {
+    pub const REFRESHED: &str = "auth_refreshed";
+}
+
 pub mod retry;
 pub mod tokens;
 pub(crate) mod types;

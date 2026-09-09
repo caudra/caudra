@@ -211,7 +211,8 @@ interval (60 seconds by default). Shorten it while testing with
 ## Troubleshooting
 
 Telemetry problems never show up in the UI. They all go to the log file, so
-start there.
+start there. Run `caudra logs -l warn` or open `/logs` in the TUI, and see
+[Logging](/docs/logging/) for the file itself.
 
 **Nothing arrives.** Check that `enabled` is set and that an exporter is not
 `none`. Caudra logs `telemetry enabled` at startup when it is actually on.

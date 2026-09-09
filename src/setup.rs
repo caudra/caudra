@@ -1,5 +1,5 @@
 use std::fmt::Display;
-use std::sync::Mutex;
+use std::time::Duration;
 
 use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
@@ -9,9 +9,19 @@ use caudra_providers::model::{Model, ModelError, ModelTier};
 use caudra_providers::{HistoryItem, active_history_items, resolve_history_head};
 use caudra_storage::StateDir;
 use caudra_storage::id::CaudraId;
-use caudra_storage::log::RotatingFileWriter;
+use caudra_storage::log::{LogSinkGuard, RotatingFileWriter};
 use caudra_storage::model::read_model;
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{EnvFilter, Layer};
+
+const RUST_LOG: &str = "RUST_LOG";
+const EVENT_STARTED: &str = "caudra_started";
+pub const MODE_TUI: &str = "tui";
+pub const MODE_ACP: &str = "acp";
+/// Long enough for a queued burst to reach the disk, short enough that a
+/// wedged filesystem does not hold up exit.
+const LOG_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 
 const PROVIDER_PRIORITY: &[&str] = &[
     "anthropic",
@@ -153,6 +163,9 @@ pub fn install_panic_log_hook() {
             panic.location = location.as_deref().unwrap_or("<unknown>"),
             "panic occurred"
         );
+        // The writer thread is asynchronous, and an abort after this hook would
+        // drop the one record that explains the crash.
+        caudra_storage::log::flush_blocking(LOG_FLUSH_TIMEOUT);
         prev(info);
     }));
 }
@@ -173,19 +186,58 @@ pub fn report_session_start(start_type: &'static str, session_id: Option<impl Di
     caudra_otel::emit::session_started(start_type, id.as_deref());
 }
 
-pub fn init_logging(storage_config: &caudra_config::StorageConfig) {
-    let Ok(writer) =
-        RotatingFileWriter::new(storage_config.max_log_bytes, storage_config.max_log_files)
-    else {
-        return;
+/// Keeps the writer thread alive for as long as the command runs. Dropping it
+/// drains the queue and stops the thread.
+pub struct LoggingGuard(#[expect(dead_code, reason = "held for its Drop")] Option<LogSinkGuard>);
+
+/// Installs the file sink and the telemetry layer as separate layers with
+/// separate filters. `RUST_LOG` must not be able to switch telemetry off, and a
+/// log file that cannot be opened must not take the telemetry layer with it.
+pub fn init_logging(storage_config: &caudra_config::StorageConfig) -> LoggingGuard {
+    let sink = RotatingFileWriter::new(storage_config.max_log_bytes, storage_config.max_log_files)
+        .ok()
+        .map(|writer| {
+            caudra_storage::log::spawn(writer, caudra_storage::log::DEFAULT_QUEUE_CAPACITY)
+        });
+    let (writer, guard) = match sink {
+        Some((writer, guard)) => (Some(writer), Some(guard)),
+        None => (None, None),
     };
-    let writer = Mutex::new(writer);
-    let filter = EnvFilter::try_from_env("RUST_LOG").unwrap_or_else(|_| EnvFilter::new("info"));
-    tracing_subscriber::fmt()
-        .json()
-        .with_env_filter(filter)
-        .with_writer(writer)
+
+    let file_layer = writer.map(|writer| {
+        tracing_subscriber::fmt::layer()
+            .json()
+            .with_writer(move || writer.clone())
+            .with_filter(file_filter(storage_config.log_level))
+    });
+
+    tracing_subscriber::registry()
+        .with(file_layer)
+        .with(caudra_otel::layer().with_filter(caudra_otel::telemetry_targets()))
         .init();
+
+    LoggingGuard(guard)
+}
+
+/// `RUST_LOG` still wins so a one-off debugging session needs no config edit.
+fn file_filter(level: caudra_config::LogLevel) -> EnvFilter {
+    EnvFilter::try_from_env(RUST_LOG).unwrap_or_else(|_| EnvFilter::new(level.as_str()))
+}
+
+/// The first line of every run. Reading a log without knowing the version, the
+/// model, and the directory costs more time than writing it does.
+pub fn report_startup(mode: &'static str, model: &Model, cwd: &std::path::Path) {
+    tracing::info!(
+        target: caudra_storage::log::target::AGENT,
+        event = EVENT_STARTED,
+        version = env!("CARGO_PKG_VERSION"),
+        mode,
+        model = %model.id,
+        provider = %model.provider,
+        cwd = %cwd.display(),
+        pid = std::process::id(),
+        "caudra started"
+    );
 }
 
 #[cfg(test)]

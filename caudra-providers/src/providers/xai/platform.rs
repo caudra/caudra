@@ -2,9 +2,10 @@ use std::sync::{Arc, Mutex};
 
 use caudra_storage::StateDir;
 use caudra_storage::id::SessionRef;
+use caudra_storage::log::{outcome, target};
 use flume::Sender;
 use serde_json::{Value, json};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::model::{Billing, Model};
 use crate::provider::{BoxFuture, Provider};
@@ -90,7 +91,13 @@ impl Xai {
         })
         .await?;
         *self.auth.lock().unwrap() = resolved;
-        debug!("refreshed xAI OAuth token");
+        info!(
+            target: target::PROVIDER,
+            event = crate::auth_events::REFRESHED,
+            provider = "xai",
+            outcome = outcome::OK,
+            "refreshed OAuth token"
+        );
         Ok(())
     }
 

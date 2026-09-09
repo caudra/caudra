@@ -139,7 +139,8 @@ settings in a local table, or export a `setup(opts)` function `init.lua` calls.
 runs, an edited plugin is still the old one.
 
 To debug, add `caudra.log.info|warn|error(...)` calls. They write to `caudra.log`
-in the directory `caudra.env.logs_dir()` returns. When
+in the directory `caudra.env.logs_dir()` returns, which [Logging](/docs/logging/)
+describes and `/logs` reads live. When
 a backtrace comes out useless, start caudra with `--no-jit`: plugins then run on
 the interpreter, with full debug info.
 
