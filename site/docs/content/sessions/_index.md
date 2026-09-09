@@ -127,6 +127,8 @@ The snapshot section lists workspace stores largest first with their size, objec
 
 Measuring walks the snapshot stores on disk, so the modal opens immediately and fills in when the walk finishes. The same figures are available without the TUI from `caudra storage stats` and `caudra storage snapshots`.
 
+To reclaim one store the modal named, trim that session: `caudra storage trim <ID>`. Trimming drops the workspace snapshots, retained tool output files, and rewind archives while the conversation stays and stays resumable, so it is the right answer when a single session has grown out of proportion and you still want its transcript. Pinned sessions are refused and a session open in another process is skipped, so the command is safe to run while Caudra is up. Add `--dry-run` to see the session and its artifact size first.
+
 ## Conversation revert
 
 A conversation revert changes the active head rather than deleting items. Selecting a user prompt lands before that prompt and restores it to the composer. Other item types are inclusive.

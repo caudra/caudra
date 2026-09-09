@@ -396,13 +396,17 @@ pub enum StorageAction {
         #[arg(long)]
         json: bool,
     },
-    /// Demote sessions outside a keep policy to the transcript tier
+    /// Demote sessions outside a keep policy, or the given session IDs, to the
+    /// transcript tier
     ///
     /// Trimming removes workspace snapshots, retained tool output files, rewind
     /// archives, and large rich tool output records. The conversation stays
     /// and the session can still be resumed. Without any --keep-* flag the
     /// configured storage.retention.trim policy applies.
     Trim {
+        /// Session IDs to trim regardless of policy
+        #[arg(value_name = "ID", conflicts_with_all = ["directory", "group_by"])]
+        ids: Vec<String>,
         #[command(flatten)]
         policy: KeepPolicyArgs,
         #[command(flatten)]
@@ -637,6 +641,7 @@ mod tests {
     use test_case::test_case;
 
     const LOGS_NOT_PARSED: &str = "expected the logs subcommand";
+    const TRIM_NOT_PARSED: &str = "expected the storage trim subcommand";
 
     #[test_case("FileRead", "file_read")]
     #[test_case("Shell", "shell")]
@@ -710,6 +715,34 @@ mod tests {
                 "review",
                 "--system-prompt",
                 "raw",
+            ])
+            .is_err()
+        );
+    }
+
+    /// Naming a session is how a snapshot store gets reclaimed by hand, so the
+    /// IDs must reach `trim` and must not be silently mixed with a scope that
+    /// selects a different set of sessions.
+    #[test]
+    fn trim_accepts_session_ids_and_rejects_a_conflicting_scope() {
+        const SESSION_ID: &str = "CessP4gmzDyKuw7PHSTkd";
+
+        let cli = Cli::try_parse_from(["caudra", "storage", "trim", SESSION_ID]).unwrap();
+        let Some(Command::Storage {
+            action: StorageAction::Trim { ids, .. },
+        }) = cli.command
+        else {
+            panic!("{TRIM_NOT_PARSED}");
+        };
+        assert_eq!(ids, vec![SESSION_ID.to_owned()]);
+        assert!(
+            Cli::try_parse_from([
+                "caudra",
+                "storage",
+                "trim",
+                SESSION_ID,
+                "--directory",
+                "/tmp"
             ])
             .is_err()
         );

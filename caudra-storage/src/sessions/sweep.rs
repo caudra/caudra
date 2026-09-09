@@ -306,11 +306,13 @@ fn act_on(
     })
 }
 
-/// Deletes the sessions in `ids` regardless of policy. Pinned and open
-/// sessions are refused.
-pub fn forget_ids(
+/// Applies `action` to the sessions in `ids` regardless of policy. Pinned and
+/// open sessions are refused, so naming a session directly still cannot
+/// override the pin that protects it or race a process holding it.
+pub fn apply_ids(
     database: &mut SessionDatabase,
     state_dir: &StateDir,
+    action: Action,
     ids: &[CaudraId],
 ) -> Result<ExecuteReport, SessionError> {
     let facts = database.session_facts(None)?;
@@ -328,7 +330,7 @@ pub fn forget_ids(
                 artifact_bytes: database.artifact_bytes(*id),
                 session: session.clone(),
             };
-            act_on(database, state_dir, Action::Forget, &candidate)
+            act_on(database, state_dir, action, &candidate)
         };
         report.outcomes.push(Outcome { session, kind });
     }
@@ -691,7 +693,13 @@ mod tests {
         let plain = saved_session(&mut database, CWD, epoch(&now, 2));
         database.set_pinned(pinned.id, true).unwrap();
 
-        let report = forget_ids(&mut database, &state_dir, &[pinned.id, plain.id]).unwrap();
+        let report = apply_ids(
+            &mut database,
+            &state_dir,
+            Action::Forget,
+            &[pinned.id, plain.id],
+        )
+        .unwrap();
 
         assert_eq!(report.acted(), 1);
         assert!(matches!(
@@ -700,9 +708,42 @@ mod tests {
         ));
         assert_eq!(database.persisted_session_ids().unwrap(), vec![pinned.id]);
         assert!(matches!(
-            forget_ids(&mut database, &state_dir, &[CaudraId::generate()]),
+            apply_ids(
+                &mut database,
+                &state_dir,
+                Action::Forget,
+                &[CaudraId::generate()]
+            ),
             Err(SessionError::Storage(StorageError::NotFound(_)))
         ));
+    }
+
+    /// Naming a session must reclaim its artifacts without costing the
+    /// conversation: that is the whole reason to trim one session by hand
+    /// rather than forget it.
+    #[test]
+    fn trimming_by_id_releases_the_snapshot_store_and_keeps_the_session() {
+        const STORE_CONTENT: &[u8] = b"snapshot object";
+
+        let (temp, state_dir) = state_dir();
+        let mut database = SessionDatabase::open(&state_dir).unwrap();
+        let session = saved_session(&mut database, CWD, epoch(&now(), 1));
+        let store = temp
+            .path()
+            .join(SESSION_SNAPSHOT_DIR)
+            .join(session.id.to_string());
+        fs::create_dir_all(&store).unwrap();
+        fs::write(store.join("object"), STORE_CONTENT).unwrap();
+
+        let report = apply_ids(&mut database, &state_dir, Action::Trim, &[session.id]).unwrap();
+
+        assert_eq!(report.acted(), 1);
+        assert!(!store.exists());
+        assert_eq!(
+            database.persisted_session_ids().unwrap(),
+            vec![session.id],
+            "trimming must keep the session it reclaimed"
+        );
     }
 
     #[test]

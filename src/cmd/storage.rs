@@ -34,6 +34,7 @@ const OBJECTS_WIDTH: usize = 9;
 const MANIFESTS_WIDTH: usize = 6;
 const NO_SNAPSHOTS: &str = "no workspace snapshots";
 const ORPHANED_STORE: &str = "(workspace root missing)";
+const ID_POLICY_CONFLICT: &str = "session IDs and --keep-* rules cannot be combined";
 const REASONS_WIDTH: usize = 24;
 const TITLE_WIDTH: usize = 40;
 const TIME_FORMAT: &str = "%Y-%m-%d %H:%M";
@@ -178,30 +179,49 @@ pub fn run(action: StorageAction, no_plugins: bool, no_jit: bool) -> Result<()> 
             }
         }
         StorageAction::Trim {
+            ids,
             policy,
             scope,
             dry_run,
             json,
         } => {
-            let retention = load_retention(no_plugins, no_jit)?;
-            let policy = effective_policy(&policy, &scope, retention.trim)?;
-            let group_by = scope.group_by.unwrap_or(retention.group_by);
             let mut database =
                 SessionDatabase::open(&state_dir).context("open session database")?;
-            let plan = sweep::plan(
-                &database,
-                Action::Trim,
-                policy,
-                group_by,
-                scope.directory.as_deref(),
-                &Zoned::now(),
-            )
-            .context("plan trim")?;
-            let outcomes = (!dry_run)
-                .then(|| sweep::execute(&mut database, &state_dir, &plan))
-                .transpose()
-                .context("trim sessions")?;
-            report_plan(&plan, dry_run, outcomes.as_ref(), None, json)?;
+            let options = SweepOptions {
+                dry_run,
+                json,
+                prune: false,
+            };
+            if ids.is_empty() {
+                let retention = load_retention(no_plugins, no_jit)?;
+                let policy = effective_policy(&policy, &scope, retention.trim)?;
+                let group_by = scope.group_by.unwrap_or(retention.group_by);
+                let plan = sweep::plan(
+                    &database,
+                    Action::Trim,
+                    policy,
+                    group_by,
+                    scope.directory.as_deref(),
+                    &Zoned::now(),
+                )
+                .context("plan trim")?;
+                let outcomes = (!dry_run)
+                    .then(|| sweep::execute(&mut database, &state_dir, &plan))
+                    .transpose()
+                    .context("trim sessions")?;
+                report_plan(&plan, dry_run, outcomes.as_ref(), None, json)?;
+            } else {
+                if policy.policy().is_some() {
+                    bail!("{ID_POLICY_CONFLICT}");
+                }
+                apply_by_ids(
+                    &mut database,
+                    &state_dir,
+                    Action::Trim,
+                    &parse_ids(&ids)?,
+                    options,
+                )?;
+            }
         }
         StorageAction::Forget {
             ids,
@@ -213,7 +233,7 @@ pub fn run(action: StorageAction, no_plugins: bool, no_jit: bool) -> Result<()> 
         } => {
             let mut database =
                 SessionDatabase::open(&state_dir).context("open session database")?;
-            let options = ForgetOptions {
+            let options = SweepOptions {
                 dry_run,
                 json,
                 prune,
@@ -225,9 +245,15 @@ pub fn run(action: StorageAction, no_plugins: bool, no_jit: bool) -> Result<()> 
                 forget_by_policy(&mut database, &state_dir, policy, group_by, &scope, options)?;
             } else {
                 if policy.policy().is_some() {
-                    bail!("session IDs and --keep-* rules cannot be combined");
+                    bail!("{ID_POLICY_CONFLICT}");
                 }
-                forget_by_ids(&mut database, &state_dir, &parse_ids(&ids)?, options)?;
+                apply_by_ids(
+                    &mut database,
+                    &state_dir,
+                    Action::Forget,
+                    &parse_ids(&ids)?,
+                    options,
+                )?;
             }
         }
         StorageAction::Prune { dry_run, json } => {
@@ -269,7 +295,7 @@ pub fn run(action: StorageAction, no_plugins: bool, no_jit: bool) -> Result<()> 
     Ok(())
 }
 
-struct ForgetOptions {
+struct SweepOptions {
     dry_run: bool,
     json: bool,
     prune: bool,
@@ -288,7 +314,7 @@ fn forget_by_policy(
     policy: KeepPolicy,
     group_by: GroupBy,
     scope: &PolicyScopeArgs,
-    options: ForgetOptions,
+    options: SweepOptions,
 ) -> Result<()> {
     let plan = sweep::plan(
         database,
@@ -318,11 +344,12 @@ fn forget_by_policy(
     )
 }
 
-fn forget_by_ids(
+fn apply_by_ids(
     database: &mut SessionDatabase,
     state_dir: &StateDir,
+    action: Action,
     ids: &[CaudraId],
-    options: ForgetOptions,
+    options: SweepOptions,
 ) -> Result<()> {
     if options.dry_run {
         let facts = database.session_facts(None)?;
@@ -343,12 +370,13 @@ fn forget_by_ids(
         if options.json {
             println!("{}", serde_json::to_string_pretty(&rows)?);
         } else {
-            println!("Dry run: would forget {} sessions", rows.len());
+            println!("Dry run: would {} {} sessions", action.verb(), rows.len());
             print!("{}", render_sessions(&rows));
         }
         return Ok(());
     }
-    let outcomes = sweep::forget_ids(database, state_dir, ids).context("forget sessions")?;
+    let outcomes = sweep::apply_ids(database, state_dir, action, ids)
+        .with_context(|| format!("{} sessions", action.verb()))?;
     let pruned = if options.prune && outcomes.acted() > 0 {
         Some(sweep::prune(database, state_dir, false).context("prune")?)
     } else {
@@ -363,13 +391,17 @@ fn forget_by_ids(
             })?
         );
     } else {
-        print!("{}", render_outcomes(Action::Forget, &outcomes));
+        print!("{}", render_outcomes(action, &outcomes));
         if let Some(report) = &pruned {
             print!("{}", render_prune(report));
         }
     }
     if outcomes.failed() > 0 {
-        bail!("{} sessions could not be forgotten", outcomes.failed());
+        bail!(
+            "{} sessions could not be {}",
+            outcomes.failed(),
+            action.past()
+        );
     }
     Ok(())
 }
