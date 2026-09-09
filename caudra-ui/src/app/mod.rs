@@ -951,6 +951,15 @@ impl App {
     fn handle_question_form_action(&mut self, action: QuestionFormAction) -> Vec<Action> {
         let reply = match action {
             QuestionFormAction::Consumed => return Vec::new(),
+            // Nothing is sent back: the parked tool ends on its own cancel
+            // path, and the run only moves again when the user says so.
+            QuestionFormAction::Cancel => {
+                self.question_form.close();
+                return match self.question_subagent.take() {
+                    Some(task_id) => self.cancel_subagent(task_id),
+                    None => self.handle_cancel(),
+                };
+            }
             QuestionFormAction::Dismiss => QUESTION_DISMISSED.to_owned(),
             QuestionFormAction::Submit(answers) => {
                 serde_json::to_string(&answers).unwrap_or_else(|_| QUESTION_DISMISSED.to_owned())
@@ -2567,6 +2576,7 @@ impl App {
         self.pending_input = PendingInput::None;
         self.finish_subagents(TaskOutcome::Killed, CANCELLED_TEXT);
         self.subagent_answers.clear();
+        self.question_subagent = None;
         self.preserve_all_unconsumed_steers();
         self.subagent_steers.clear();
         self.pending_subagent_steers.clear();
@@ -2590,14 +2600,33 @@ impl App {
         let Some(task_id) = self.active_subagent_id().map(str::to_owned) else {
             return vec![];
         };
+        self.cancel_subagent(task_id)
+    }
 
-        self.chats[self.active_chat].flush();
-        self.chats[self.active_chat].cancel_in_progress();
-        self.chats[self.active_chat].mark_finished(TaskOutcome::Killed, CANCELLED_TEXT);
+    /// Keyed by task id rather than by the chat on screen: a subagent's
+    /// question is docked over whatever chat the user is looking at, so the
+    /// one being cancelled is not always the active one.
+    fn cancel_subagent(&mut self, task_id: String) -> Vec<Action> {
+        let Some(index) = self
+            .chats
+            .iter()
+            .position(|chat| chat.task_id().is_some_and(|id| &**id == task_id.as_str()))
+        else {
+            return vec![];
+        };
+
+        self.chats[index].flush();
+        self.chats[index].cancel_in_progress();
+        self.chats[index].mark_finished(TaskOutcome::Killed, CANCELLED_TEXT);
         self.sync_subagents();
         self.subagent_answers.remove(&task_id);
         self.clear_auth_waiter(Some(&task_id));
         self.preserve_unconsumed_steers(&task_id);
+        // The tool the form was parked on is gone, so the form goes with it.
+        if self.question_subagent.as_deref() == Some(task_id.as_str()) {
+            self.question_subagent = None;
+            self.question_form.close();
+        }
 
         vec![Action::CancelSubagent {
             tool_use_id: task_id,

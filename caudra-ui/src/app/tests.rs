@@ -2965,14 +2965,9 @@ fn transcript_scroll_binds_use_the_navigation_keys() {
 const QUESTION_TEXT: &str = "Which one?";
 const QUESTION_HEADER: &str = "Pick";
 const QUESTION_OPTION: &str = "First";
+const EXPECT_RUN_LEFT_ALONE: &str = "only a cancel may stop the run that asked";
 
-/// A full transcript with the question form waiting under it.
-fn question_app() -> App {
-    let mut app = test_app();
-    for i in 0..TRANSCRIPT_LINES {
-        app.active_chat()
-            .push(DisplayMessage::new(DisplayRole::User, format!("line {i}")));
-    }
+fn open_question(app: &mut App) {
     app.question_form
         .open(vec![caudra_agent::types::AskedQuestion {
             question: QUESTION_TEXT.into(),
@@ -2983,6 +2978,16 @@ fn question_app() -> App {
             }],
             multiple: false,
         }]);
+}
+
+/// A full transcript with the question form waiting under it.
+fn question_app() -> App {
+    let mut app = test_app();
+    for i in 0..TRANSCRIPT_LINES {
+        app.active_chat()
+            .push(DisplayMessage::new(DisplayRole::User, format!("line {i}")));
+    }
+    open_question(&mut app);
     app
 }
 
@@ -3018,6 +3023,54 @@ fn the_form_still_answers_its_own_keys() {
         !app.question_form.is_open(),
         "Enter picks the option under the cursor and answers"
     );
+}
+
+/// Dismissing hands the tool a reply it reads as a refusal, so the agent has
+/// something to go on and carries on with it.
+#[test]
+fn escape_dismisses_the_question_without_stopping_the_run() {
+    let mut app = question_app();
+    let _ = rendered(&mut app);
+
+    let actions = app.update(Msg::Key(key(KeyCode::Esc)));
+    assert!(actions.is_empty(), "{EXPECT_RUN_LEFT_ALONE}");
+    assert!(!app.question_form.is_open());
+}
+
+/// Cancelling sends nothing back, so nothing moves until the user does.
+#[test]
+fn ctrl_c_on_a_question_cancels_the_run() {
+    let mut app = question_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    let _ = rendered(&mut app);
+
+    let actions = app.update(Msg::Key(kb::QUIT.to_key_event()));
+    assert!(matches!(
+        actions.as_slice(),
+        [Action::CancelAgent { run_id: 1 }]
+    ));
+    assert!(!app.question_form.is_open());
+}
+
+/// The form is docked over whichever chat is on screen, so the subagent it
+/// belongs to is found by id and cancelled on its own.
+#[test]
+fn ctrl_c_on_a_subagent_question_cancels_only_that_subagent() {
+    let mut app = app_with_subagent();
+    open_question(&mut app);
+    app.question_subagent = Some(TASK_ID.to_owned());
+    let run_id = app.run_id;
+    let _ = rendered(&mut app);
+
+    let actions = app.update(Msg::Key(kb::QUIT.to_key_event()));
+    assert!(matches!(
+        actions.as_slice(),
+        [Action::CancelSubagent { tool_use_id }] if tool_use_id == TASK_ID
+    ));
+    assert_eq!(app.run_id, run_id, "{EXPECT_RUN_LEFT_ALONE}");
+    assert!(app.chats[1].is_finished());
+    assert!(!app.question_form.is_open());
 }
 
 /// Where the pointer is decides whose wheel event it is.

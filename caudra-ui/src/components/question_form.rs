@@ -45,13 +45,17 @@ const HINT_SHIFT_ENTER: &str = "Shift+Enter";
 const HINT_TAB: &str = "Tab";
 const HINT_SHIFT_TAB: &str = "Shift+Tab";
 const HINT_ESC: &str = "Esc";
+const HINT_CTRL_C: &str = "Ctrl+C";
 
 pub enum QuestionFormAction {
     Consumed,
     /// One label list per question, in question order. An empty list is a
     /// question the user skipped.
     Submit(Vec<Vec<String>>),
+    /// Answer nothing and let the asking agent carry on.
     Dismiss,
+    /// Stop the agent that asked, so only a new message moves it again.
+    Cancel,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -518,7 +522,7 @@ impl QuestionForm {
             }
             KeyCode::Esc => return QuestionFormAction::Dismiss,
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                return QuestionFormAction::Dismiss;
+                return QuestionFormAction::Cancel;
             }
             _ => {}
         }
@@ -554,7 +558,7 @@ impl QuestionForm {
             KeyCode::Enter => return self.commit_custom(),
             KeyCode::Esc => self.mode = Mode::Selecting,
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                return QuestionFormAction::Dismiss;
+                return QuestionFormAction::Cancel;
             }
             _ => {
                 self.custom.handle_key(key);
@@ -599,7 +603,7 @@ impl QuestionForm {
             }
             KeyCode::Esc => QuestionFormAction::Dismiss,
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                QuestionFormAction::Dismiss
+                QuestionFormAction::Cancel
             }
             _ => QuestionFormAction::Consumed,
         }
@@ -640,22 +644,26 @@ impl QuestionForm {
             Mode::EditingCustom => &[
                 (HINT_ENTER, "submit"),
                 (HINT_SHIFT_ENTER, "newline"),
-                (HINT_ESC, "cancel"),
+                (HINT_ESC, "back"),
+                (HINT_CTRL_C, "cancel"),
             ],
             Mode::Confirming => &[
                 (HINT_ENTER, "submit"),
                 (HINT_SHIFT_TAB, "back"),
                 (HINT_ESC, "dismiss"),
+                (HINT_CTRL_C, "cancel"),
             ],
             Mode::Selecting if self.is_multi() => &[
                 (HINT_ENTER, "toggle"),
                 (HINT_TAB, "next"),
                 (HINT_ESC, "dismiss"),
+                (HINT_CTRL_C, "cancel"),
             ],
             Mode::Selecting => &[
                 (HINT_ENTER, "submit"),
                 (HINT_TAB, "next"),
                 (HINT_ESC, "dismiss"),
+                (HINT_CTRL_C, "cancel"),
             ],
         }
     }
@@ -926,6 +934,7 @@ fn hint_key(label: &str) -> Option<KeyEvent> {
         HINT_TAB => (KeyCode::Tab, KeyModifiers::NONE),
         HINT_SHIFT_TAB => (KeyCode::BackTab, KeyModifiers::SHIFT),
         HINT_ESC => (KeyCode::Esc, KeyModifiers::NONE),
+        HINT_CTRL_C => (KeyCode::Char('c'), KeyModifiers::CONTROL),
         _ => return None,
     };
     Some(KeyEvent::new(code, modifiers))
@@ -1614,6 +1623,20 @@ mod tests {
         ));
     }
 
+    /// Dismissing answers nothing and lets the run carry on; cancelling stops
+    /// the agent that asked. The two must never collapse back into one key.
+    #[test_case(Mode::Selecting ; "selecting")]
+    #[test_case(Mode::EditingCustom ; "editing")]
+    #[test_case(Mode::Confirming ; "confirming")]
+    fn ctrl_c_cancels_instead_of_dismissing(mode: Mode) {
+        let mut form = opened(vec![question(HEADER, false)]);
+        form.mode = mode;
+        assert!(matches!(
+            chord(&mut form, KeyCode::Char('c'), KeyModifiers::CONTROL),
+            QuestionFormAction::Cancel
+        ));
+    }
+
     #[test]
     fn the_cursor_stops_at_the_typed_answer_row() {
         let mut form = opened(vec![question(HEADER, false)]);
@@ -1723,13 +1746,29 @@ mod tests {
         );
     }
 
+    fn hint_index(form: &QuestionForm, label: &str) -> usize {
+        form.hint_pairs()
+            .iter()
+            .position(|(name, _)| *name == label)
+            .expect("the bar offers the hint")
+    }
+
     #[test]
     fn the_dismiss_hint_dismisses() {
         let mut form = opened(vec![question(HEADER, false)]);
         render(&mut form);
-        let last = form.hint_pairs().len() - 1;
-        let action = click_target(&mut form, FormTarget::Hint(last));
+        let index = hint_index(&form, HINT_ESC);
+        let action = click_target(&mut form, FormTarget::Hint(index));
         assert!(matches!(action, QuestionFormAction::Dismiss));
+    }
+
+    #[test]
+    fn the_cancel_hint_cancels() {
+        let mut form = opened(vec![question(HEADER, false)]);
+        render(&mut form);
+        let index = hint_index(&form, HINT_CTRL_C);
+        let action = click_target(&mut form, FormTarget::Hint(index));
+        assert!(matches!(action, QuestionFormAction::Cancel));
     }
 
     /// A hint that resolves to no key is a control the form draws and then
