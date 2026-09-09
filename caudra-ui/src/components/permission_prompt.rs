@@ -51,6 +51,7 @@ const KEY_WIDEN_ALL_OUT: char = '>';
 const CHIP_ARROW: &str = " → ";
 const CHIP_ONCE: &str = "this call only";
 const CHIP_COVERED: &str = "already allowed";
+const CHIP_SUBSUMED: &str = "covered by `";
 const COVERAGE_SEPARATOR: &str = " · ";
 const WRITTEN_MARK: &str = " (typed)";
 const COMMANDS_HEADING: &str = "  Commands";
@@ -1088,13 +1089,35 @@ impl PermissionPrompt {
             };
         };
         PermissionAnswer::AllowComposed {
-            rows: command_ladders(request)
-                .iter()
-                .zip(&self.scopes)
-                .map(|(offered, choice)| choice.grant(offered))
-                .collect(),
+            rows: self.row_grants(request),
             lifetime,
         }
+    }
+
+    /// Every row's grant in row order, which is exactly what the answer carries
+    /// and what subsumption is computed against.
+    fn row_grants(&self, request: &PermissionRequest) -> Vec<Option<PermissionRowGrant>> {
+        command_ladders(request)
+            .iter()
+            .zip(&self.scopes)
+            .map(|(offered, choice)| choice.grant(offered))
+            .collect()
+    }
+
+    /// What another row's chip says, for a row that only reproduces it.
+    fn row_chip(
+        &self,
+        request: &PermissionRequest,
+        ladders: &[Vec<&PermissionRuleOption>],
+        row: usize,
+    ) -> Option<String> {
+        let choice = self.scopes.get(row).cloned().unwrap_or_default();
+        let covered = request
+            .presentation
+            .resources
+            .get(row)
+            .and_then(|shown| shown.coverage.as_ref());
+        Some(self.chip(row, ladders.get(row)?, &choice, covered).0)
     }
 
     /// The phrase a durable grant has to be typed out for. A composition takes
@@ -1246,6 +1269,7 @@ impl PermissionPrompt {
         let t = theme::current();
         let value = Style::new().fg(t.foreground);
         let safe = |text: &str| escape_terminal_controls(text);
+        let subsumed = request.subsumed_rows(&self.row_grants(request));
         for (row, offered) in ladders.iter().enumerate() {
             let key = self.row_key(offered[0]);
             let selected = key == self.selected_option;
@@ -1254,7 +1278,16 @@ impl PermissionPrompt {
             let shown = request.presentation.resources.get(row);
             let covered = shown.and_then(|shown| shown.coverage.as_ref());
             let summary = shown.map_or_else(String::new, |shown| safe(&shown.summary));
-            let (chip, caution) = self.chip(row, offered, &choice, covered);
+            let covering = subsumed
+                .get(row)
+                .copied()
+                .flatten()
+                .and_then(|other| self.row_chip(request, ladders, other));
+            let (chip, caution) = match &covering {
+                Some(covering) => (format!("{CHIP_SUBSUMED}{covering}`"), None),
+                None => self.chip(row, offered, &choice, covered),
+            };
+            let contributes = choice.rung > 0 && covering.is_none();
             entries.push((key, lines.len() as u16));
             lines.push(Line::from(vec![
                 Span::styled(
@@ -1263,7 +1296,7 @@ impl PermissionPrompt {
                 ),
                 Span::styled(
                     summary,
-                    hover_style(if choice.rung == 0 { t.tool_dim } else { value }, on),
+                    hover_style(if contributes { value } else { t.tool_dim }, on),
                 ),
                 Span::styled(CHIP_ARROW, hover_style(t.tool_dim, on)),
                 Span::styled(chip, hover_style(caution_style(caution, t.tool_dim), on)),
@@ -2423,6 +2456,16 @@ mod tests {
             .collect()
     }
 
+    /// The style each row draws its command text in, which is how a row says
+    /// whether it still contributes anything.
+    fn summary_styles(prompt: &PermissionPrompt) -> Vec<Style> {
+        let body = prompt.body(prompt.current().unwrap());
+        body.entries
+            .iter()
+            .map(|(_, line)| body.lines[*line as usize].spans[1].style)
+            .collect()
+    }
+
     fn row_keys_of(prompt: &PermissionPrompt) -> Vec<String> {
         prompt
             .body(prompt.current().unwrap())
@@ -2442,6 +2485,69 @@ mod tests {
         prompt.requests.push_front(queued);
         prompt.reset_selection();
         prompt
+    }
+
+    const TWIN_COMMAND: &str = "git status --porcelain";
+
+    /// Two commands one pattern reaches, so widening either row covers both.
+    fn prompt_with_twin_commands() -> PermissionPrompt {
+        let mut prompt = PermissionPrompt::new();
+        prompt.enqueue(
+            Box::new(PermissionRequest::from_legacy(
+                "twins".into(),
+                ToolKey::native("bash"),
+                vec![FIRST_COMMAND.into(), TWIN_COMMAND.into()],
+                json!({"command": format!("{FIRST_COMMAND} && {TWIN_COMMAND}")}),
+                Path::new(WORKDIR),
+                false,
+            )),
+            None,
+        );
+        prompt
+    }
+
+    /// A row another row already covers contributes nothing, and saying it
+    /// still grants `this command` would be a claim the stored rule does not
+    /// make.
+    #[test]
+    fn a_row_another_row_covers_says_so_instead_of_its_own_rung() {
+        let mut prompt = prompt_with_twin_commands();
+        prompt.widen(true);
+
+        assert_eq!(
+            rows_of(&prompt)[..2],
+            [
+                format!("  > {FIRST_COMMAND} in {WORKDIR}{CHIP_ARROW}{PATTERN_CHIP}{WIDEN_MARK}"),
+                format!(
+                    "    {TWIN_COMMAND} in {WORKDIR}{CHIP_ARROW}{CHIP_SUBSUMED}{PATTERN_CHIP}`"
+                ),
+            ]
+        );
+        // The row that contributes reads as live text; the one it covers does not.
+        assert_eq!(
+            summary_styles(&prompt)[..2],
+            [
+                Style::new().fg(theme::current().foreground),
+                theme::current().tool_dim,
+            ]
+        );
+    }
+
+    /// Narrowing the covering row hands the subsumed row its own choice back,
+    /// which is why the choice is never overwritten while it is subsumed.
+    #[test]
+    fn narrowing_the_covering_row_restores_the_other_rows_chip() {
+        let mut prompt = prompt_with_twin_commands();
+        prompt.widen(true);
+        prompt.widen(false);
+
+        assert_eq!(
+            rows_of(&prompt)[..2],
+            [
+                format!("  > {FIRST_COMMAND} in {WORKDIR}{CHIP_ARROW}{EXACT_CHIP}{WIDEN_MARK}"),
+                format!("    {TWIN_COMMAND} in {WORKDIR}{CHIP_ARROW}{EXACT_CHIP}"),
+            ]
+        );
     }
 
     /// A covered row has to name the scope and the authority: without them the

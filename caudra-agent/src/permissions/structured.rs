@@ -492,54 +492,16 @@ impl PermissionRequest {
                 resources: self.resources.len(),
             });
         }
-        let offered = |index: usize, id: &str| {
-            self.options
-                .iter()
-                .find(|option| {
-                    option.id == id
-                        && option.rule.effect == StructuredPermissionEffect::Allow
-                        && option.group.as_ref().and_then(|group| group.resource) == Some(index)
-                })
-                .ok_or_else(|| ComposedAnswerError::NotOffered(id.to_owned()))
-                .and_then(|option| {
-                    option
-                        .allowed_lifetimes
-                        .contains(lifetime)
-                        .then_some(option)
-                        .ok_or_else(|| ComposedAnswerError::LifetimeWithdrawn(id.to_owned()))
-                })
-        };
         let mut constraints = Vec::new();
         let mut family = None;
         for (index, grant) in rows.iter().enumerate() {
             let Some(grant) = grant else {
                 continue;
             };
-            let (option, chosen) = match grant {
-                PermissionRowGrant::Offered(id) => {
-                    let option = offered(index, id)?;
-                    (option, option.rule.resources.clone())
-                }
-                PermissionRowGrant::Written(pattern) => {
-                    let resource = &self.resources[index];
-                    let option = offered(index, &format!("{COMMAND_EXACT_PREFIX}{index}"))?;
-                    grade_command_pattern(pattern, &resource.value).map_err(|fault| {
-                        ComposedAnswerError::Pattern {
-                            command: safe_summary(&resource.value),
-                            fault,
-                        }
-                    })?;
-                    (
-                        option,
-                        vec![PermissionResourceConstraint {
-                            selector: PermissionResourceSelector::CommandPattern {
-                                pattern: pattern.clone(),
-                            },
-                            ..resource_constraint(resource)
-                        }],
-                    )
-                }
-            };
+            let (option, chosen) = self.row_reach(index, grant)?;
+            if !option.allowed_lifetimes.contains(lifetime) {
+                return Err(ComposedAnswerError::LifetimeWithdrawn(option.id.clone()));
+            }
             match family {
                 Some(family) if family != option.rule.family => {
                     return Err(ComposedAnswerError::MixedFamilies);
@@ -568,6 +530,109 @@ impl PermissionRequest {
             }
         }
         Ok(Some(rule))
+    }
+
+    /// The option one row's grant rides on, and the constraints it names.
+    ///
+    /// Lifetime is deliberately not checked here: how far a grant reaches is a
+    /// question about resources, and subsumption has to answer it before any
+    /// lifetime has been chosen.
+    fn row_reach(
+        &self,
+        index: usize,
+        grant: &PermissionRowGrant,
+    ) -> Result<(&PermissionRuleOption, Vec<PermissionResourceConstraint>), ComposedAnswerError>
+    {
+        let offered = |id: &str| {
+            self.options
+                .iter()
+                .find(|option| {
+                    option.id == id
+                        && option.rule.effect == StructuredPermissionEffect::Allow
+                        && option.group.as_ref().and_then(|group| group.resource) == Some(index)
+                })
+                .ok_or_else(|| ComposedAnswerError::NotOffered(id.to_owned()))
+        };
+        let resource = self
+            .resources
+            .get(index)
+            .ok_or(ComposedAnswerError::Uncovered)?;
+        match grant {
+            PermissionRowGrant::Offered(id) => {
+                let option = offered(id)?;
+                Ok((option, option.rule.resources.clone()))
+            }
+            PermissionRowGrant::Written(pattern) => {
+                let option = offered(&format!("{COMMAND_EXACT_PREFIX}{index}"))?;
+                grade_command_pattern(pattern, &resource.value).map_err(|fault| {
+                    ComposedAnswerError::Pattern {
+                        command: safe_summary(&resource.value),
+                        fault,
+                    }
+                })?;
+                Ok((
+                    option,
+                    vec![PermissionResourceConstraint {
+                        selector: PermissionResourceSelector::CommandPattern {
+                            pattern: pattern.clone(),
+                        },
+                        ..resource_constraint(resource)
+                    }],
+                ))
+            }
+        }
+    }
+
+    /// One row's grant as a rule of its own, for asking how far it reaches. The
+    /// lifetime is the caller's to set; reach does not depend on it.
+    fn row_rule(
+        &self,
+        index: usize,
+        grant: &PermissionRowGrant,
+    ) -> Option<StructuredPermissionRule> {
+        let (option, resources) = self.row_reach(index, grant).ok()?;
+        Some(StructuredPermissionRule {
+            subject: self.subject.clone(),
+            executor: self.executor.clone(),
+            resources,
+            arguments: PermissionArgumentConstraint::Unconstrained,
+            lifetime: PermissionLifetime::Once,
+            effect: StructuredPermissionEffect::Allow,
+            family: option.rule.family,
+        })
+    }
+
+    /// For each row, the row whose grant already covers it.
+    ///
+    /// A grant that reaches no further than another row's contributes nothing:
+    /// the prompt should not claim it does, and storage should not keep it. Row
+    /// `i` is subsumed by `j` when `j` reaches resource `i` and either `i` does
+    /// not reach resource `j` — a redundant narrower row, wherever it sits — or
+    /// `j` comes first, which is what settles two rows that reach each other so
+    /// that exactly one of them survives.
+    pub fn subsumed_rows(&self, rows: &[Option<PermissionRowGrant>]) -> Vec<Option<usize>> {
+        let reach: Vec<Option<StructuredPermissionRule>> = rows
+            .iter()
+            .enumerate()
+            .map(|(index, grant)| self.row_rule(index, grant.as_ref()?))
+            .collect();
+        let covers = |row: usize, resource: usize| {
+            reach.get(row).and_then(Option::as_ref).is_some_and(|rule| {
+                self.resources
+                    .get(resource)
+                    .is_some_and(|resource| permission_rule_covers_resource(rule, self, resource))
+            })
+        };
+        (0..rows.len())
+            .map(|index| {
+                reach.get(index)?.as_ref()?;
+                (0..rows.len()).find(|&other| {
+                    other != index
+                        && covers(other, index)
+                        && (!covers(index, other) || other < index)
+                })
+            })
+            .collect()
     }
 }
 
@@ -4263,6 +4328,92 @@ mod tests {
         rows: Vec<Option<PermissionRowGrant>>,
     ) -> Result<Option<StructuredPermissionRule>, ComposedAnswerError> {
         request.composed_rule(&rows, &PermissionLifetime::Conversation)
+    }
+
+    const SHARED_PATTERN_COMMANDS: [&str; 2] = ["git status --short", "git status --porcelain"];
+
+    /// Two commands one pattern reaches, which is how a pipeline that greps
+    /// twice arrives at the prompt.
+    fn twin_command_request() -> PermissionRequest {
+        explicit_request(
+            PermissionAuthorityProfile::Shell,
+            SHARED_PATTERN_COMMANDS
+                .iter()
+                .map(|command| command_resource(command, "/project"))
+                .collect(),
+            json!({"command": "twice"}),
+        )
+    }
+
+    fn offered(id: &str) -> Option<PermissionRowGrant> {
+        Some(PermissionRowGrant::Offered(id.into()))
+    }
+
+    /// Two rows reaching the same pattern reach each other, so exactly one has
+    /// to survive or the answer files the same rule twice.
+    #[test]
+    fn rows_that_reach_each_other_leave_only_the_first_standing() {
+        let request = twin_command_request();
+
+        assert_eq!(
+            request.subsumed_rows(&[offered("command_pattern_0"), offered("command_pattern_1")]),
+            vec![None, Some(0)]
+        );
+    }
+
+    /// A row pinned to its own command contributes nothing under a row that
+    /// reaches it, whichever way round they sit.
+    #[test]
+    fn a_narrower_row_is_subsumed_from_either_direction() {
+        let request = twin_command_request();
+
+        assert_eq!(
+            request.subsumed_rows(&[offered("command_exact_0"), offered("command_pattern_1")]),
+            vec![Some(1), None]
+        );
+        assert_eq!(
+            request.subsumed_rows(&[offered("command_pattern_0"), offered("command_exact_1")]),
+            vec![None, Some(0)]
+        );
+    }
+
+    /// Narrowing the covering row hands the subsumed row its own choice back,
+    /// so nothing has to be remembered across the change.
+    #[test]
+    fn narrowing_the_covering_row_leaves_nothing_subsumed() {
+        let request = twin_command_request();
+
+        assert_eq!(
+            request.subsumed_rows(&[offered("command_exact_0"), offered("command_exact_1")]),
+            vec![None, None]
+        );
+    }
+
+    /// A row granting nothing neither subsumes nor is subsumed: it is not part
+    /// of the answer at all.
+    #[test]
+    fn a_row_that_grants_nothing_stays_out_of_subsumption() {
+        let request = twin_command_request();
+
+        assert_eq!(
+            request.subsumed_rows(&[None, offered("command_pattern_1")]),
+            vec![None, None]
+        );
+    }
+
+    /// A pattern typed for one row still reaches the other, so it subsumes the
+    /// same way an offered rung does.
+    #[test]
+    fn a_written_pattern_subsumes_the_row_it_reaches() {
+        let request = twin_command_request();
+
+        assert_eq!(
+            request.subsumed_rows(&[
+                Some(PermissionRowGrant::Written(BROAD_ASK.into())),
+                offered("command_exact_1"),
+            ]),
+            vec![None, Some(0)]
+        );
     }
 
     #[test]
