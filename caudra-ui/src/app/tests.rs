@@ -13,6 +13,9 @@ use crate::components::queue_actions::QueueActionKind;
 use crate::components::queue_panel::{QueueAction, QueueHit, QueueHitTarget};
 use crate::components::rewind_picker::RewindEntry;
 use crate::components::status_bar::StatusBarHitTarget;
+use crate::components::storage_modal::{
+    EXPANDED_TITLE as STORAGE_EXPANDED_TITLE, TITLE as STORAGE_TITLE,
+};
 use crate::components::usage_modal::SCOPE_KEY;
 use crate::components::{DisplaySource, ExitRequest, ToolProgress, buffer_text, key, test_model};
 use crate::repaint::expect::{OWED, QUIET};
@@ -150,6 +153,10 @@ const CONTEXT_ALL_TRAILING_COMMAND: &str = "/context all   ";
 const CONTEXT_INVALID_COMMAND: &str = "/context everything";
 const CONTEXT_EXCESS_ARGS_COMMAND: &str = "/context all extra";
 const CONTEXTUAL_PROMPT: &str = "/contextual";
+const STORAGE_COMMAND: &str = "/storage";
+const STORAGE_ALL_COMMAND: &str = "/storage ALL";
+const STORAGE_INVALID_COMMAND: &str = "/storage everything";
+const MISSING_STORAGE_REFRESH: &str = "opening /storage must request a measurement";
 const TOOLS_COMMAND: &str = "/tools";
 const TOOLS_UPPERCASE_COMMAND: &str = "/TOOLS";
 const TOOLS_EXCESS_ARGS_COMMAND: &str = "/tools all";
@@ -6956,6 +6963,47 @@ fn context_command_is_local_and_does_not_mutate_the_chat(
     );
 }
 
+/// Opening must ask for a measurement, not take one: the walk that sizes the
+/// snapshot stores is far too slow to run on the command's own frame.
+#[test_case(STORAGE_COMMAND, Some(false), None ; "summary")]
+#[test_case(STORAGE_ALL_COMMAND, Some(true), None ; "case_insensitive_all")]
+#[test_case(STORAGE_INVALID_COMMAND, None, Some(STORAGE_USAGE) ; "invalid_args")]
+fn storage_command_opens_the_modal_and_asks_for_a_measurement(
+    command: &str,
+    expected_expanded: Option<bool>,
+    expected_flash: Option<&str>,
+) {
+    let mut app = test_app();
+
+    let actions = type_and_submit(&mut app, command);
+
+    assert_eq!(app.status_bar.flash_text(), expected_flash);
+    let Some(expanded) = expected_expanded else {
+        assert!(!app.storage_modal.is_open());
+        assert!(actions.is_empty());
+        return;
+    };
+    assert!(app.storage_modal.is_open());
+    assert!(
+        actions
+            .iter()
+            .any(|action| matches!(action, Action::RefreshStorage)),
+        "{MISSING_STORAGE_REFRESH}"
+    );
+    let frame = rendered(&mut app);
+    let expected_title = if expanded {
+        STORAGE_EXPANDED_TITLE
+    } else {
+        STORAGE_TITLE
+    };
+    assert!(frame.contains(expected_title.trim()), "frame={frame:?}");
+    assert_eq!(
+        frame.contains(STORAGE_EXPANDED_TITLE.trim()),
+        expanded,
+        "frame={frame:?}"
+    );
+}
+
 #[test_case(CONTEXT_COMMAND, true, None ; "summary")]
 #[test_case(CONTEXT_UPPERCASE_COMMAND, true, None ; "uppercase_command")]
 #[test_case(CONTEXT_ALL_TRAILING_COMMAND, true, None ; "all_trailing_whitespace")]
@@ -9623,6 +9671,10 @@ fn open_skills_modal(app: &mut App) {
     app.skills_modal.open();
 }
 
+fn open_storage_modal(app: &mut App) {
+    app.storage_modal.open(false);
+}
+
 fn open_goal_modal(app: &mut App) {
     app.goal_modal.open();
 }
@@ -9649,6 +9701,7 @@ fn open_argument_prompt(app: &mut App) {
 #[test_case(open_logs_modal    ; "logs_modal")]
 #[test_case(open_tools_modal   ; "tools_modal")]
 #[test_case(open_skills_modal  ; "skills_modal")]
+#[test_case(open_storage_modal ; "storage_modal")]
 #[test_case(open_goal_modal    ; "goal_modal")]
 #[test_case(open_model_picker  ; "model_picker")]
 #[test_case(open_command_modal ; "command_modal")]
@@ -9675,6 +9728,7 @@ fn a_press_outside_a_modal_dismisses_it(open: fn(&mut App)) {
 #[test_case(open_logs_modal    ; "logs_modal")]
 #[test_case(open_tools_modal   ; "tools_modal")]
 #[test_case(open_skills_modal  ; "skills_modal")]
+#[test_case(open_storage_modal ; "storage_modal")]
 #[test_case(open_goal_modal    ; "goal_modal")]
 #[test_case(open_model_picker  ; "model_picker")]
 #[test_case(open_command_modal ; "command_modal")]

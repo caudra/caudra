@@ -20,6 +20,7 @@ use caudra_agent::permissions::PermissionManager;
 use caudra_agent::prompt::profile::{
     BUILTIN_PROFILE_NAME, PromptProfileCatalog, SystemPromptProfile,
 };
+use caudra_agent::snapshots::{SESSION_SNAPSHOTS_DIR, SnapshotStore};
 use caudra_agent::{
     AgentConfig, AgentEvent, CancelToken, Envelope, McpCommand, McpConfigErrors, McpHandle, mcp,
 };
@@ -35,7 +36,7 @@ use caudra_storage::StateDir;
 use caudra_storage::StorageError;
 use caudra_storage::id::{CaudraId, CaudraIdParseError, SessionRef};
 use caudra_storage::sessions::{
-    SessionError, SessionLease, StoredImage, TitleSource, normalize_title,
+    SessionDatabase, SessionError, SessionLease, StoredImage, TitleSource, normalize_title,
 };
 use caudra_storage::state::WorkspaceTabs;
 use crossterm::event::{
@@ -54,6 +55,7 @@ use crate::appearance::{self, AutoSwitch};
 use crate::color_compat;
 use crate::components::input::Submission;
 use crate::components::session_picker::{SessionActivity, SessionRow};
+use crate::components::storage_modal::{StorageFetchState, StorageReport};
 use crate::components::usage_modal::UsageFetchState;
 use crate::components::{Action, ExitRequest, ForkDraft, ForkedSession, Status};
 use crate::herdr::{HerdrObservation, HerdrReporterHandle, aggregate_observations};
@@ -470,6 +472,18 @@ fn validate_session_cwd(session: &AppSession, process_cwd: &Path) -> Result<(), 
         process_cwd.display(),
         session_cwd.display()
     ))
+}
+
+/// Blocking, and deliberately so: both halves are disk work. Reported together
+/// because the question `/storage` answers is which of the two is spending the
+/// disk, and one half without the other cannot answer it.
+fn measure_storage(storage: &StateDir) -> StorageFetchState {
+    let stats = match SessionDatabase::open_read_only(storage).and_then(|db| db.stats()) {
+        Ok(stats) => stats,
+        Err(error) => return StorageFetchState::Error(error.to_string()),
+    };
+    let stores = SnapshotStore::store_entries(&storage.path().join(SESSION_SNAPSHOTS_DIR));
+    StorageFetchState::Ready(Box::new(StorageReport { stats, stores }))
 }
 
 fn prepare_session_for_runtime(
@@ -2551,6 +2565,7 @@ impl<'t> EventLoop<'t> {
             }
             Action::RefreshModels => self.refresh_models(),
             Action::RefreshUsage => self.refresh_usage(),
+            Action::RefreshStorage => self.refresh_storage(),
             Action::ManualExit => self.sessions[idx].notifications.on_manual_exit(),
         }
     }
@@ -2638,6 +2653,20 @@ impl<'t> EventLoop<'t> {
                 Ok(None) => UsageFetchState::Unsupported,
                 Err(e) => UsageFetchState::Error(e.user_message()),
             };
+            slot.store(Some(Arc::new(state)));
+        })
+        .detach();
+    }
+
+    /// Sizing the snapshot stores walks every object on disk, so the whole
+    /// measurement goes to a blocking thread and the database is opened
+    /// read-only: a diagnostic must never contend with the session writer.
+    fn refresh_storage(&mut self) {
+        let storage = self.ctx.storage.clone();
+        let slot = Arc::clone(&self.focused_app().storage_slot);
+        slot.store(Some(Arc::new(StorageFetchState::Loading)));
+        smol::spawn(async move {
+            let state = smol::unblock(move || measure_storage(&storage)).await;
             slot.store(Some(Arc::new(state)));
         })
         .detach();

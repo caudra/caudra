@@ -122,6 +122,12 @@ impl<T> Watch<T> {
     pub fn get(&self) -> Option<&T> {
         self.0.as_deref()
     }
+
+    /// A handle that outlives the borrow of the watcher, for a `view` that must
+    /// read the value and still take `&mut self` to record hit regions.
+    pub fn held(&self) -> Option<Arc<T>> {
+        self.0.clone()
+    }
 }
 
 impl<T> Default for Watch<T> {

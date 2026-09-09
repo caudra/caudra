@@ -119,6 +119,14 @@ The sweep runs on a background thread once per interval while the TUI is open. I
 
 Retention never removes spending records. What a session cost is written to a separate ledger that no session owns, so `caudra storage usage` still answers after the sessions are gone. See [Lifetime spend](/docs/token-economy/#lifetime-spend).
 
+## What the state directory holds
+
+`/storage` shows where the disk went. A proportional bar splits the state directory between the session database, tool output files, workspace snapshots, and archives, and a legend gives each one its exact size. Below it, the database section reports file and write-ahead log sizes, free pages that a prune would reclaim, and the session and item counts behind them.
+
+The snapshot section lists workspace stores largest first with their size, object count, and number of snapshots. A store whose workspace root is gone is marked rather than hidden, because an orphaned store is usually the one worth deleting. `/storage all` lists every store instead of the largest few; the footer command toggles between them.
+
+Measuring walks the snapshot stores on disk, so the modal opens immediately and fills in when the walk finishes. The same figures are available without the TUI from `caudra storage stats` and `caudra storage snapshots`.
+
 ## Conversation revert
 
 A conversation revert changes the active head rather than deleting items. Selecting a user prompt lands before that prompt and restores it to the composer. Other item types are inclusive.

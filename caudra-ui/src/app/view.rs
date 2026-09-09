@@ -499,6 +499,12 @@ impl App {
                 overlay_rect = r;
             }
         }
+        if self.storage_modal.is_open() {
+            let r = self.storage_modal.view(frame, full);
+            if r.width > 0 {
+                overlay_rect = r;
+            }
+        }
         if self.goal_modal.is_open() {
             let status = self.state.goal.status();
             let evaluator = caudra_providers::model_registry::goal_evaluator_target();

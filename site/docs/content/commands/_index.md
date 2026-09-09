@@ -20,6 +20,7 @@ Commands marked Main only act on the main session's turn or history. They stay l
 | `/help` | Show keybindings |  |
 | `/usage` | Show token usage breakdown |  |
 | `/context` | Inspect active context window usage |  |
+| `/storage` | Inspect what the state directory holds |  |
 | `/logs` | Browse the structured log |  |
 | `/tools` | Show which tools the model can reach |  |
 | `/skills` | Show the skills the model can load and where they come from |  |

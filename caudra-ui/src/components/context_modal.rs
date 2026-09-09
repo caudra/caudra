@@ -13,7 +13,10 @@ use ratatui::widgets::{Paragraph, Wrap};
 use crate::components::keybindings::key;
 use crate::components::modal::{CHROME_LINES, Modal};
 use crate::components::scrollbar::render_vertical_scrollbar;
-use crate::components::{ModalScroll, Overlay, escape_terminal_controls, hover_style};
+use crate::components::{
+    ModalScroll, Overlay, apportion, escape_terminal_controls, format_integer, format_usize,
+    hover_style,
+};
 use crate::theme::{self, Theme};
 
 pub(crate) const TITLE: &str = " Context usage ";
@@ -27,7 +30,6 @@ const GRID_CELL_COUNT: usize = 100;
 const CATEGORY_COUNT: usize = 7;
 const PERCENT_SCALE: u64 = 100;
 const PERCENT_TENTHS_SCALE: u64 = 1_000;
-const DIGIT_GROUP: usize = 3;
 const LEGEND_GAP: &str = "   ";
 
 pub struct ContextModal {
@@ -493,37 +495,6 @@ fn grid_cells(snapshot: &ContextSnapshot) -> Vec<GridKind> {
     cells.resize(GRID_CELL_COUNT, GridKind::Free);
     cells.truncate(GRID_CELL_COUNT);
     cells
-}
-
-fn apportion(weights: &[u64], cells: usize) -> Vec<usize> {
-    let total = weights.iter().copied().fold(0_u64, u64::saturating_add);
-    if total == 0 {
-        return vec![0; weights.len()];
-    }
-
-    let cell_count = u64::try_from(cells).unwrap_or(u64::MAX);
-    let mut allocated = 0_usize;
-    let mut remainders = Vec::with_capacity(weights.len());
-    let mut result = weights
-        .iter()
-        .map(|weight| {
-            let numerator = weight.saturating_mul(cell_count);
-            let count = usize::try_from(numerator / total).unwrap_or(usize::MAX);
-            allocated = allocated.saturating_add(count);
-            remainders.push(numerator % total);
-            count
-        })
-        .collect::<Vec<_>>();
-    let mut order = (0..weights.len()).collect::<Vec<_>>();
-    order.sort_unstable_by(|left, right| {
-        remainders[*right]
-            .cmp(&remainders[*left])
-            .then_with(|| left.cmp(right))
-    });
-    for index in order.into_iter().take(cells.saturating_sub(allocated)) {
-        result[index] = result[index].saturating_add(1);
-    }
-    result
 }
 
 fn grid_lines(snapshot: &ContextSnapshot, width: u16, theme: &Theme) -> Vec<Line<'static>> {
@@ -1034,23 +1005,6 @@ fn format_percentage(tokens: u32, window: u32) -> String {
     }
     let tenths = u64::from(tokens).saturating_mul(PERCENT_TENTHS_SCALE) / u64::from(window);
     format!("{}.{:01}%", tenths / 10, tenths % 10)
-}
-
-fn format_usize(value: usize) -> String {
-    format_integer(u64::try_from(value).unwrap_or(u64::MAX))
-}
-
-fn format_integer(value: u64) -> String {
-    let digits = value.to_string();
-    let separators = digits.len().saturating_sub(1) / DIGIT_GROUP;
-    let mut grouped = String::with_capacity(digits.len().saturating_add(separators));
-    for (index, digit) in digits.chars().enumerate() {
-        if index > 0 && (digits.len() - index).is_multiple_of(DIGIT_GROUP) {
-            grouped.push(',');
-        }
-        grouped.push(digit);
-    }
-    grouped
 }
 
 #[cfg(test)]

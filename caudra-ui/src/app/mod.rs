@@ -66,6 +66,7 @@ use crate::components::session_picker::{SessionPicker, SessionRow};
 use crate::components::skills_modal::SkillsModal;
 use crate::components::stash_picker::StashPicker;
 use crate::components::status_bar::{StatusBar, StatusBarHit, StatusBarHitTarget};
+use crate::components::storage_modal::{StorageFetchState, StorageModal};
 use crate::components::task_picker::TaskPicker;
 use crate::components::theme_picker::{ThemePicker, ThemePickerAction};
 use crate::components::todo_panel::TodoPanel;
@@ -135,6 +136,7 @@ const FLASH_REWIND: &str = "Press esc again to rewind...";
 const FLASH_EXIT: &str = "Press Ctrl+D again to exit...";
 const FLASH_NO_CHORD: &str = "is not a chord";
 const CONTEXT_USAGE: &str = "Usage: /context [all]";
+const STORAGE_USAGE: &str = "Usage: /storage [all]";
 const TOOLS_USAGE: &str = "Usage: /tools";
 const SKILLS_USAGE: &str = "Usage: /skills";
 const AUTH_EXPIRED_MSG: &str = "Authentication failed. Run `caudra auth login` in another terminal; Caudra will resume automatically, or press Enter to retry now.";
@@ -285,6 +287,7 @@ pub struct App {
     pub(super) logs_modal: LogsModal,
     pub(super) tools_modal: ToolsModal,
     pub(super) skills_modal: SkillsModal,
+    pub(super) storage_modal: StorageModal,
     context_snapshot: Watch<ContextSnapshot>,
     /// Read from the ledger when the modal asks for it, not on every frame:
     /// the table outlives sessions and only grows.
@@ -365,6 +368,7 @@ pub struct App {
     pub(crate) storage: StateDir,
     pub(crate) snapshot_store: Arc<SnapshotStore>,
     pub(crate) usage_slot: Arc<ArcSwapOption<UsageFetchState>>,
+    pub(crate) storage_slot: Arc<ArcSwapOption<StorageFetchState>>,
     pub(crate) shared_history: Option<SharedHistory>,
     pub(crate) btw_prompt: Option<crate::agent::SharedBtwPrompt>,
     pub(crate) context_store: Option<ContextStore>,
@@ -488,6 +492,7 @@ impl App {
             logs_modal: LogsModal::new(max_log_files),
             tools_modal: ToolsModal::new(),
             skills_modal: SkillsModal::new(),
+            storage_modal: StorageModal::new(),
             context_snapshot: Watch::default(),
             lifetime_usage: None,
             goal_modal: GoalModal::default(),
@@ -557,6 +562,7 @@ impl App {
             storage,
             snapshot_store,
             usage_slot: Arc::new(ArcSwapOption::empty()),
+            storage_slot: Arc::new(ArcSwapOption::empty()),
             shared_history: None,
             btw_prompt: None,
             context_store: None,
@@ -1074,6 +1080,10 @@ impl App {
             self.skills_modal.scroll(delta);
             return None;
         }
+        if self.storage_modal.is_open() {
+            self.storage_modal.scroll(delta);
+            return None;
+        }
         if self.goal_modal.is_open() {
             self.goal_modal.scroll(delta);
             return None;
@@ -1282,6 +1292,11 @@ impl App {
 
         if self.skills_modal.is_open() {
             self.skills_modal.handle_key(key);
+            return Some(vec![]);
+        }
+
+        if self.storage_modal.is_open() {
+            self.storage_modal.handle_key(key);
             return Some(vec![]);
         }
 
@@ -2328,6 +2343,21 @@ impl App {
         self.context_modal.open(expanded);
     }
 
+    /// Measuring is a directory walk, so the modal opens on `Loading` and the
+    /// answer arrives through the slot rather than blocking the command.
+    fn execute_storage(&mut self, args: &str) -> Vec<Action> {
+        let expanded = match args.trim() {
+            "" => false,
+            arg if arg.eq_ignore_ascii_case("all") => true,
+            _ => {
+                self.flash(STORAGE_USAGE.into());
+                return vec![];
+            }
+        };
+        self.storage_modal.open(expanded);
+        vec![Action::RefreshStorage]
+    }
+
     fn handle_logs_action(&mut self, action: LogsAction) {
         match action {
             LogsAction::Consumed => {}
@@ -3156,6 +3186,7 @@ impl App {
             self.context_modal.close();
             self.tools_modal.close();
             self.skills_modal.close();
+            self.storage_modal.close();
             if self.permissions_picker.is_open() {
                 self.permissions_picker.close();
                 self.permission_config_trust_deferred =
@@ -3392,6 +3423,7 @@ impl App {
                 self.execute_context(&cmd.args);
                 vec![]
             }
+            "/storage" => self.execute_storage(&cmd.args),
             "/logs" => {
                 self.logs_modal.open();
                 vec![]
@@ -3720,7 +3752,7 @@ impl App {
         self.subagent_input_box.set_cwd(cwd);
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 30] {
+    fn overlays(&self) -> [&dyn Overlay; 31] {
         [
             &self.workbench,
             &self.logs_modal,
@@ -3729,6 +3761,7 @@ impl App {
             &self.context_modal,
             &self.tools_modal,
             &self.skills_modal,
+            &self.storage_modal,
             &self.goal_modal,
             &self.btw_modal,
             &self.float_mgr,
@@ -3755,7 +3788,7 @@ impl App {
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 30] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 31] {
         [
             &mut self.workbench,
             &mut self.logs_modal,
@@ -3764,6 +3797,7 @@ impl App {
             &mut self.context_modal,
             &mut self.tools_modal,
             &mut self.skills_modal,
+            &mut self.storage_modal,
             &mut self.goal_modal,
             &mut self.btw_modal,
             &mut self.float_mgr,
@@ -3912,6 +3946,7 @@ impl App {
             | self.tick_permission_config_trust()
             | self.model_picker.refresh()
             | self.usage_modal.poll(&self.usage_slot)
+            | self.storage_modal.poll(&self.storage_slot)
             | self.poll_context_snapshot()
             | self.logs_modal.poll()
             | self.hints.poll(self.hint_reader.load_full())

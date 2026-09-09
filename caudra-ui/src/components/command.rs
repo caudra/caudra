@@ -107,6 +107,12 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         scope: ChatScope::Any,
     },
     BuiltinCommand {
+        name: "/storage",
+        description: "Inspect what the state directory holds",
+        max_args: 1,
+        scope: ChatScope::Any,
+    },
+    BuiltinCommand {
         name: "/logs",
         description: "Browse the structured log",
         max_args: 0,

@@ -62,6 +62,11 @@ impl App {
             self.skills_modal.handle_mouse(event);
             return Vec::new();
         }
+        if self.storage_modal.is_open() && !self.permission_prompt.is_open() {
+            self.clear_control_hovers();
+            self.storage_modal.handle_mouse(event);
+            return Vec::new();
+        }
         let passive_modal_open = self.help_modal.is_open()
             || self.usage_modal.is_open()
             || self.goal_modal.is_open()
@@ -853,6 +858,7 @@ impl App {
         dismiss!(self.context_modal);
         dismiss!(self.tools_modal);
         dismiss!(self.skills_modal);
+        dismiss!(self.storage_modal);
         dismiss!(self.goal_modal);
 
         dismiss!(self.command_modal);

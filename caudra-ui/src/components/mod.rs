@@ -39,6 +39,7 @@ pub(crate) mod skills_modal;
 pub(crate) mod split_layout;
 pub(crate) mod stash_picker;
 pub mod status_bar;
+pub(crate) mod storage_modal;
 pub(crate) mod streaming_content;
 pub(crate) mod task_picker;
 pub(crate) mod theme_picker;
@@ -67,6 +68,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::selection::wrap_breaks;
 
 pub(crate) const CHEVRON: &str = "❯ ";
+const DIGIT_GROUP: usize = 3;
 
 pub(crate) fn chevron_span() -> ratatui::text::Span<'static> {
     ratatui::text::Span::styled(CHEVRON, crate::theme::current().tool_dim)
@@ -290,6 +292,57 @@ pub(crate) fn apply_scroll_delta(offset: u16, delta: i32) -> u16 {
     }
 }
 
+/// Splits `cells` between `weights` by largest remainder, so the parts always
+/// sum to `cells` and a non-zero weight is never rounded away to nothing on the
+/// proportional bars the modals draw.
+pub(crate) fn apportion(weights: &[u64], cells: usize) -> Vec<usize> {
+    let total = weights.iter().copied().fold(0_u64, u64::saturating_add);
+    if total == 0 {
+        return vec![0; weights.len()];
+    }
+
+    let cell_count = u64::try_from(cells).unwrap_or(u64::MAX);
+    let mut allocated = 0_usize;
+    let mut remainders = Vec::with_capacity(weights.len());
+    let mut result = weights
+        .iter()
+        .map(|weight| {
+            let numerator = weight.saturating_mul(cell_count);
+            let count = usize::try_from(numerator / total).unwrap_or(usize::MAX);
+            allocated = allocated.saturating_add(count);
+            remainders.push(numerator % total);
+            count
+        })
+        .collect::<Vec<_>>();
+    let mut order = (0..weights.len()).collect::<Vec<_>>();
+    order.sort_unstable_by(|left, right| {
+        remainders[*right]
+            .cmp(&remainders[*left])
+            .then_with(|| left.cmp(right))
+    });
+    for index in order.into_iter().take(cells.saturating_sub(allocated)) {
+        result[index] = result[index].saturating_add(1);
+    }
+    result
+}
+
+pub(crate) fn format_integer(value: u64) -> String {
+    let digits = value.to_string();
+    let separators = digits.len().saturating_sub(1) / DIGIT_GROUP;
+    let mut grouped = String::with_capacity(digits.len().saturating_add(separators));
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(DIGIT_GROUP) {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    grouped
+}
+
+pub(crate) fn format_usize(value: usize) -> String {
+    format_integer(u64::try_from(value).unwrap_or(u64::MAX))
+}
+
 pub(crate) fn escape_terminal_controls(text: &str) -> String {
     let mut escaped = String::with_capacity(text.len());
     for character in text.chars() {
@@ -493,6 +546,7 @@ pub enum Action {
     SetTitleModel(TitleTarget),
     RefreshModels,
     RefreshUsage,
+    RefreshStorage,
     Compact,
     ToggleMcp(String, bool),
     TrustMcpOnce(String),
