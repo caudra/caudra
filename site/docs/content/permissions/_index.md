@@ -47,7 +47,7 @@ A user-created fork starts with no conversation grants and no inherited explicit
 
 ## Permission prompts
 
-The prompt shows the action, risk, selected authority, and typed resources before its controls. Resources already covered by another rule appear after unresolved resources with an `already allowed` marker. The body expands when the terminal has room and scrolls on smaller terminals while the controls remain visible.
+The prompt shows the action, risk, selected authority, and typed resources before its controls. Resources already covered by another rule appear after unresolved resources, marked with the scope that covers them and the authority that carries it, such as `already allowed · project · rg *`. The scope tells you whether the coverage outlives the session and the authority tells you how far it already reaches, which is what decides whether granting again changes anything. The body expands when the terminal has room and scrolls on smaller terminals while the controls remain visible.
 
 The action line carries the arguments its own summary does not already name, in the compact form the transcript uses. Likely secret values and URL query values are masked there.
 
@@ -77,11 +77,20 @@ Multiple requests are queued by request ID. The prompt identifies the requesting
 
 ## Per-command scopes
 
-A shell call often runs several commands at once. Each reviewed command gets its own row in the prompt, above a separate `Or grant broadly instead` section holding the blanket authorities. A row starts on `this command`, which remembers that exact command in that workdir, and widens to a token-bound pattern such as `git status *`. Narrowing past the start reaches `this call only`, which remembers nothing for that command.
+A shell call often runs several commands at once. Each reviewed command gets its own row in the prompt, above a separate `Or grant broadly instead` section holding the blanket authorities. A row starts on `this command`, which remembers that exact command in that workdir, and widens to a token-bound pattern such as `git status *`. Narrowing past the start reaches `this call only`, which remembers nothing for that command. Rows already covered start there, so answering without moving remembers only what was undecided.
+
+The `Commands` heading counts the rows still waiting, such as `2 of 5 need approval`. The call is atomic, so those rows are the whole decision.
+
+A pattern is offered whenever it would match the command, including commands whose operands the shell expands. `ls src/ src/*/` offers `ls *` and `wc -l a.rs b/*.rs` offers `wc *`, because the pattern only pins leading literals. Commands using command substitution get no pattern, because the reviewed text is not what would run.
 
 `Left` and `Right` walk the selected row. `<` and `>` walk every row one step at a time, so the usual answer stays two keystrokes however many commands were batched. Both ends of a row clamp rather than wrap.
 
-The scope you pick controls what Caudra remembers, never what runs. A shell call is atomic, so answering the prompt runs every command in it. Rows left on `this call only` are simply kept out of the stored rule. Confirming with `s`, `a`, or `A` writes one rule covering every row that chose a reusable scope, and the lifetimes offered are the ones every one of those rows allows.
+The scope you pick controls what Caudra remembers, never what runs. A shell call is atomic, so answering the prompt runs every command in it. Rows left on `this call only` are kept out of the stored rules. Confirming with `s`, `a`, or `A` writes one rule per row that chose a reusable scope, so `/permissions` lists each command separately and revoking one leaves the others in place. The lifetimes offered are the ones every granted row allows.
+
+A row that adds nothing files nothing:
+
+- When one row already covers another, the covered row reads `covered by \`rg *\`` and contributes no rule. A pipeline running `rg` twice writes one `rg *` rather than two. Narrowing the covering row hands the other row its own choice straight back. The covered row stays selectable, because `Enter` can still reach a wider pattern than the one covering it.
+- A row whose existing coverage is at least as durable as the scope you are granting files nothing. Answering `a` on a row only a conversation rule covers still files, or the authority would disappear with the session. The builtin allowlist never counts as coverage here, because it is a default that a configured ask or deny overrides. Widening a covered row still files, since a wider pattern reaches commands this prompt is not about.
 
 Rows replace the whole-request `This command in this workdir` and command-pattern choices, because a row on its narrowest reusable rung reproduces the first and a row at its widest reproduces the second.
 
@@ -91,7 +100,7 @@ Rows replace the whole-request `This command in this workdir` and command-patter
 
 Two patterns are accepted with a caution:
 
-- A pattern with one literal covers a whole program, such as `python *`. It is marked `[any invocation]` and needs the `ALLOW BROAD SHELL ACCESS` phrase.
+- A pattern with one literal covers a whole program, such as `python *`. It is marked `[any invocation]` and needs the `ALLOW BROAD SHELL ACCESS` phrase. Typing a pattern Caudra offers on that row, such as `ls *`, is graded like the offered rung rather than as a broad grant.
 - A pattern overlapping a builtin always-ask family, such as `git push *`, is marked `[always-ask family]`. It is allowed because those are often the commands worth shortcutting, but read it before confirming.
 
 Grading is structural. It checks the shape of the pattern and that it matches the command, and it cannot know what a program does with its arguments. `sed -n *` grades clean, yet GNU `sed` can run shell commands through the `e` escape. Write patterns for programs whose arguments you understand.
