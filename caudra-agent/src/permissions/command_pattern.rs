@@ -5,7 +5,7 @@ use super::structured::{BROAD_SHELL_PHRASE, PermissionCaution};
 pub(super) const MAX_PATTERN_TOKENS: usize = 8;
 const MAX_PREFIX_LITERALS: usize = 3;
 const WILDCARD_TOKEN: &str = "*";
-const WILDCARD_SUFFIX: &str = " *";
+pub(super) const WILDCARD_SUFFIX: &str = " *";
 
 pub(crate) const BUILTIN_ASK_PATTERNS: &[&str] = &[
     "rm *",

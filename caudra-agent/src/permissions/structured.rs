@@ -42,7 +42,6 @@ const SUMMARY_MAX_CHARS: usize = 240;
 const LISTED_COMMANDS_MAX: usize = 3;
 const REVIEW_MAX_DEPTH: usize = 6;
 const REVIEW_MAX_ITEMS: usize = 32;
-const NORMALIZED_COMMAND_ATTRIBUTE: &str = super::NORMALIZED_COMMAND_ATTRIBUTE;
 const FILE_READ_TOOLS: &[&str] = &["file_read", "file_index", "read", "view_image"];
 const DIRECTORY_READ_TOOLS: &[&str] = &["list"];
 const FILE_SEARCH_TOOLS: &[&str] = &["file_glob", "file_grep", "glob", "grep"];
@@ -51,6 +50,10 @@ const SUBTREE_OPTION_ID: &str = "allow_filesystem_subtree";
 const OUTSIDE_HOME_PHRASE: &str = "ALLOW OUTSIDE HOME";
 pub(super) const BROAD_SHELL_PHRASE: &str = "ALLOW BROAD SHELL ACCESS";
 const WORKDIR_ATTRIBUTE: &str = "workdir";
+/// The executable-name-resolved form of a command, set by the shell tool.
+/// Restrictive policy is matched against it as well as the reviewed text, so a
+/// deny cannot be dodged by spelling the executable as a path.
+pub(super) const NORMALIZED_COMMAND_ATTRIBUTE: &str = "normalized_command";
 pub const COMMAND_GROUP_PREFIX: &str = "command_";
 pub const COMMAND_EXACT_PREFIX: &str = "command_exact_";
 pub const COMMAND_PATTERN_PREFIX: &str = "command_pattern_";
@@ -1752,6 +1755,8 @@ fn pinned_digest(value: &str, kind: &PermissionResourceKind) -> String {
 fn attribute_kind(name: &str) -> PermissionResourceKind {
     if name == WORKDIR_ATTRIBUTE {
         PermissionResourceKind::Directory
+    } else if name == NORMALIZED_COMMAND_ATTRIBUTE {
+        PermissionResourceKind::Command
     } else {
         PermissionResourceKind::Custom {
             name: name.to_owned(),
