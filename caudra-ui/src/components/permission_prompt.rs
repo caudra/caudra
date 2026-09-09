@@ -3,7 +3,7 @@ use std::collections::{HashSet, VecDeque};
 use caudra_agent::permissions::{
     COMPOSABLE_SHELL_OPTIONS, DEFAULT_DENY_GUIDANCE, PatternFault, PatternGrade, PermissionAnswer,
     PermissionCaution, PermissionLifetime, PermissionRequest, PermissionRisk, PermissionRowGrant,
-    PermissionRuleOption, StructuredPermissionEffect, grade_command_pattern,
+    PermissionRuleOption, ResourceCoverage, StructuredPermissionEffect, grade_command_pattern,
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
@@ -51,8 +51,11 @@ const KEY_WIDEN_ALL_OUT: char = '>';
 const CHIP_ARROW: &str = " → ";
 const CHIP_ONCE: &str = "this call only";
 const CHIP_COVERED: &str = "already allowed";
+const COVERAGE_SEPARATOR: &str = " · ";
 const WRITTEN_MARK: &str = " (typed)";
 const COMMANDS_HEADING: &str = "  Commands";
+const NEEDS_APPROVAL: &str = " need approval";
+const ALL_COVERED: &str = "  all already allowed";
 const BLANKET_HEADING: &str = "  Or grant broadly instead";
 
 type HintPairs = Vec<(&'static str, &'static str)>;
@@ -175,6 +178,37 @@ fn authority_rows(request: &PermissionRequest, selected: &str) -> Vec<AuthorityR
         }
     }
     rows
+}
+
+/// How many commands the answer is actually about. The call is atomic, so it
+/// runs only once every command is allowed; saying how many are still waiting is
+/// what turns a wall of rows into a decision.
+fn approval_gate(request: &PermissionRequest) -> String {
+    let waiting = request
+        .presentation
+        .resources
+        .iter()
+        .filter(|resource| !resource.covered())
+        .count();
+    match waiting {
+        0 => ALL_COVERED.into(),
+        waiting => format!(
+            "  {waiting} of {}{NEEDS_APPROVAL}",
+            request.presentation.resources.len()
+        ),
+    }
+}
+
+/// What already allows a resource: the scope it holds at, and how that
+/// authority names the resource. Both are needed to act on it — the scope says
+/// whether the coverage outlives the session, and the authority says how far it
+/// reaches beyond this one command.
+fn coverage_chip(coverage: &ResourceCoverage) -> String {
+    format!(
+        "{CHIP_COVERED}{COVERAGE_SEPARATOR}{}{COVERAGE_SEPARATOR}{}",
+        coverage.origin.label(),
+        escape_terminal_controls(&coverage.authority)
+    )
 }
 
 /// The key a hint stands for, so a click can press it. A hint listing
@@ -1130,7 +1164,10 @@ impl PermissionPrompt {
         ]);
         let ladders = command_ladders(request);
         if !ladders.is_empty() {
-            lines.push(Line::from(Span::styled(COMMANDS_HEADING, t.panel_title)));
+            lines.push(Line::from(vec![
+                Span::styled(COMMANDS_HEADING, t.panel_title),
+                Span::styled(approval_gate(request), t.tool_dim),
+            ]));
             self.command_lines(request, &ladders, &mut lines, &mut entries);
             lines.extend([
                 Line::default(),
@@ -1175,8 +1212,11 @@ impl PermissionPrompt {
                                     summary_style,
                                 ),
                             ];
-                            if resource.covered() {
-                                spans.push(Span::styled(" [already allowed]", t.tool_dim));
+                            if let Some(coverage) = &resource.coverage {
+                                spans.push(Span::styled(
+                                    format!(" [{}]", coverage_chip(coverage)),
+                                    t.tool_dim,
+                                ));
                             }
                             Line::from(spans)
                         }),
@@ -1211,16 +1251,9 @@ impl PermissionPrompt {
             let selected = key == self.selected_option;
             let on = matches!(&self.hover, Some(PromptTarget::Authority(id)) if *id == key);
             let choice = self.scopes.get(row).cloned().unwrap_or_default();
-            let covered = request
-                .presentation
-                .resources
-                .get(row)
-                .is_some_and(|shown| shown.covered());
-            let summary = request
-                .presentation
-                .resources
-                .get(row)
-                .map_or_else(String::new, |shown| safe(&shown.summary));
+            let shown = request.presentation.resources.get(row);
+            let covered = shown.and_then(|shown| shown.coverage.as_ref());
+            let summary = shown.map_or_else(String::new, |shown| safe(&shown.summary));
             let (chip, caution) = self.chip(row, offered, &choice, covered);
             entries.push((key, lines.len() as u16));
             lines.push(Line::from(vec![
@@ -1270,10 +1303,10 @@ impl PermissionPrompt {
         row: usize,
         offered: &[&PermissionRuleOption],
         choice: &RowChoice,
-        covered: bool,
+        covered: Option<&ResourceCoverage>,
     ) -> (String, Option<PermissionCaution>) {
         match choice.rung.checked_sub(1) {
-            None if covered => (CHIP_COVERED.into(), None),
+            None if covered.is_some() => (covered.map_or_else(String::new, coverage_chip), None),
             None => (CHIP_ONCE.into(), None),
             Some(rung) if rung < offered.len() => (
                 offered[rung]
@@ -1939,10 +1972,12 @@ mod tests {
         let covered_first = screen.find(r"covered\u{1b}[31m-first").unwrap();
         let covered_last = screen.find("covered-last").unwrap();
 
+        let marker = format!("[{}]", coverage_chip(&project_coverage()));
         assert!(uncovered < covered_first && covered_first < covered_last);
-        assert_eq!(screen.matches("[already allowed]").count(), 2);
+        assert_eq!(screen.matches(&marker).count(), 2);
         assert!(screen.contains("execute command: needs-approval"));
-        assert!(screen.contains("covered-last [protected] [already allowed]"));
+        assert!(screen.contains(&format!("covered-last [protected] {marker}")));
+        assert!(marker.contains(RuleOrigin::Project.label()) && marker.contains(COVERING_PATTERN));
         assert!(!screen.contains('\u{1b}'));
     }
 
@@ -2395,6 +2430,63 @@ mod tests {
             .into_iter()
             .map(|(id, _)| id)
             .collect()
+    }
+
+    fn prompt_with_first_command_covered() -> PermissionPrompt {
+        let mut prompt = prompt_with_commands();
+        let mut queued = prompt.requests.pop_front().expect(EXPECT_COMPOSED);
+        queued.request.presentation.resources[0].coverage = Some(ResourceCoverage {
+            origin: RuleOrigin::Conversation,
+            authority: PATTERN_CHIP.into(),
+        });
+        prompt.requests.push_front(queued);
+        prompt.reset_selection();
+        prompt
+    }
+
+    /// A covered row has to name the scope and the authority: without them the
+    /// user cannot tell coverage that expires with the session from coverage
+    /// that does not, nor how far it already reaches.
+    #[test]
+    fn a_covered_row_names_the_scope_and_the_authority_that_covers_it() {
+        let prompt = prompt_with_first_command_covered();
+
+        assert_eq!(
+            rows_of(&prompt)[..2],
+            [
+                format!(
+                    "    {FIRST_COMMAND} in {WORKDIR}{CHIP_ARROW}{CHIP_COVERED}\
+                     {COVERAGE_SEPARATOR}conversation{COVERAGE_SEPARATOR}{PATTERN_CHIP}"
+                ),
+                format!("  > {SECOND_COMMAND} in {WORKDIR}{CHIP_ARROW}{EXACT_CHIP}{WIDEN_MARK}"),
+            ]
+        );
+    }
+
+    /// The call is atomic, so the rows still waiting are the whole decision.
+    #[test]
+    fn the_commands_heading_counts_the_rows_still_waiting() {
+        let request = prompt_with_commands();
+        assert_eq!(
+            approval_gate(request.current().unwrap()),
+            format!("  2 of 2{NEEDS_APPROVAL}")
+        );
+
+        let partly = prompt_with_first_command_covered();
+        assert_eq!(
+            approval_gate(partly.current().unwrap()),
+            format!("  1 of 2{NEEDS_APPROVAL}")
+        );
+    }
+
+    #[test]
+    fn a_fully_covered_request_says_so_instead_of_counting() {
+        let mut prompt = prompt_with_first_command_covered();
+        let mut queued = prompt.requests.pop_front().expect(EXPECT_COMPOSED);
+        queued.request.presentation.resources[1].coverage = Some(project_coverage());
+        prompt.requests.push_front(queued);
+
+        assert_eq!(approval_gate(prompt.current().unwrap()), ALL_COVERED);
     }
 
     #[test]
