@@ -1226,6 +1226,14 @@ impl App {
         }]
     }
 
+    /// Whether a working-tree capture is between dispatch and reply.
+    ///
+    /// `pending_run` already brackets exactly that window, so the status bar
+    /// reads it rather than carrying a second flag that could disagree.
+    pub(crate) fn is_snapshotting(&self) -> bool {
+        self.pending_run.is_some()
+    }
+
     /// Second half of [`Self::start_run`], resumed once the capture is done.
     /// A failure leaves the run unstarted, matching the inline behaviour it
     /// replaces: the user sees a flash and no message bubble.

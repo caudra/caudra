@@ -575,6 +575,7 @@ impl App {
             workflow: self.state.workflow,
             yolo: self.permissions.is_yolo(),
             restoring: self.restoring.load(Ordering::Relaxed),
+            snapshotting: self.is_snapshotting(),
             goal: goal.as_ref(),
             mode_clickable: main_chat && !self.is_bash_input(),
             settings_clickable: main_chat,

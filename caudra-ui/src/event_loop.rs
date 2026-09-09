@@ -69,6 +69,10 @@ use crate::terminal;
 /// Max events handled per frame so a flood cannot starve rendering.
 const DRAIN_BUDGET: usize = 256;
 const AGENT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long the final snapshot of one session may wait for the artifact lock.
+/// Budgeted per session so a workspace of tabs cannot multiply into a stall,
+/// and matched to the agent timeout so no one phase of exit dominates.
+const SHUTDOWN_SNAPSHOT_BUDGET: Duration = Duration::from_secs(3);
 const DELETE_FOCUSED_ERR: &str = "cannot delete the focused session";
 const DELETE_BUSY_ERR: &str = "wait for the session to become idle before deleting it";
 const MODEL_POLICY_ERR: &str = "Model is not allowed by policy";
@@ -2745,8 +2749,16 @@ impl<'t> EventLoop<'t> {
                 step = Instant::now();
                 elapsed
             };
-            if let Err(error) = app.snapshot_history_head() {
-                warn!(session_id = %app.state.session.id, %error, "final workspace snapshot failed");
+            match app.snapshot_history_head_within(SHUTDOWN_SNAPSHOT_BUDGET) {
+                Ok(true) => {}
+                Ok(false) => warn!(
+                    session_id = %app.state.session.id,
+                    budget = ?SHUTDOWN_SNAPSHOT_BUDGET,
+                    "artifact lock busy, skipping final workspace snapshot"
+                ),
+                Err(error) => {
+                    warn!(session_id = %app.state.session.id, %error, "final workspace snapshot failed")
+                }
             }
             snapshot_ms += step_ms();
             app.checkpoint_now();

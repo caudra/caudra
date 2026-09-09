@@ -13,7 +13,9 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 use caudra_storage::id::CaudraId;
-use caudra_storage::{SessionArtifactLock, StateDir, lock_session_artifacts};
+use caudra_storage::{
+    SessionArtifactLock, StateDir, lock_session_artifacts, lock_session_artifacts_within,
+};
 use ignore::WalkBuilder;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -295,6 +297,63 @@ pub struct SnapshotStore {
     artifact_state: Option<StateDir>,
 }
 
+/// One workspace store on disk, as `caudra storage snapshots` reports it.
+#[derive(Debug, Clone, Serialize)]
+pub struct StoreEntry {
+    pub session_id: String,
+    pub workspace_key: String,
+    /// The worktree this store captures, or `None` when the marker is gone and
+    /// the store is orphaned.
+    pub root: Option<PathBuf>,
+    pub bytes: u64,
+    pub objects: u64,
+    /// Manifest names, so `session-start` and each checkpoint id are visible
+    /// rather than reduced to a count.
+    pub manifests: Vec<String>,
+}
+
+fn tree_bytes(dir: &Path) -> u64 {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|entry| match entry.file_type() {
+            Ok(kind) if kind.is_dir() => tree_bytes(&entry.path()),
+            Ok(_) => entry.metadata().map(|meta| meta.len()).unwrap_or(0),
+            Err(_) => 0,
+        })
+        .sum()
+}
+
+fn count_files(dir: &Path) -> u64 {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|entry| match entry.file_type() {
+            Ok(kind) if kind.is_dir() => count_files(&entry.path()),
+            Ok(_) => 1,
+            Err(_) => 0,
+        })
+        .sum()
+}
+
+fn manifest_names(dir: &Path) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .filter(|entry| entry.path().extension() == Some(OsStr::new(MANIFEST_EXT)))
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name != WORKSPACE_ROOT_NAME)
+        .collect();
+    names.sort();
+    names
+}
+
 impl SnapshotStore {
     pub fn new(snapshots_dir: PathBuf) -> Self {
         Self::with_cap(snapshots_dir, DEFAULT_SNAPSHOT_CAP_BYTES)
@@ -344,6 +403,41 @@ impl SnapshotStore {
         let root = self.bind_root(cwd)?;
         let path = self.manifest_path(SnapshotKey::Checkpoint(checkpoint));
         self.capture_to(&root, &path, Some(checkpoint), "checkpoint")
+    }
+
+    /// Session start plus `head`, holding the artifact lock across both and
+    /// giving it up after `budget`. Answers whether the capture ran.
+    ///
+    /// A `false` is not a failure. The artifact lock is one file for every
+    /// caudra on the machine, so waiting for it is waiting on unrelated
+    /// workspaces, and a caller on a deadline would rather lose one snapshot
+    /// than inherit that wait.
+    pub fn capture_head_within(
+        &self,
+        cwd: &Path,
+        head: Option<CaudraId>,
+        budget: Duration,
+    ) -> Result<bool, SnapshotError> {
+        let _artifact_lock = match self.artifact_state.as_ref() {
+            None => None,
+            Some(state) => match lock_session_artifacts_within(state, budget)
+                .map_err(|error| SnapshotError::from(io::Error::other(error)))?
+            {
+                None => return Ok(false),
+                held => held,
+            },
+        };
+        let _guard = lock_store()?;
+        let root = self.bind_root(cwd)?;
+        if !self.has_session_start() {
+            let path = self.manifest_path(SnapshotKey::SessionStart);
+            self.capture_to(&root, &path, None, "session_start")?;
+        }
+        if let Some(head) = head {
+            let path = self.manifest_path(SnapshotKey::Checkpoint(head));
+            self.capture_to(&root, &path, Some(head), "checkpoint")?;
+        }
+        Ok(true)
     }
 
     /// Captures `root`, writes the manifest and enforces the store cap,
@@ -778,6 +872,42 @@ impl SnapshotStore {
         self.dir.join(OBJECTS_DIR)
     }
 
+    /// Every workspace store under `snapshots_dir`, largest first.
+    ///
+    /// Reads the layout rather than a manifest index because the store is the
+    /// authority on its own size: `session-snapshots/<session>/<workspace
+    /// key>/{objects,*.json}`. A store whose `workspace-root.json` is missing
+    /// or unreadable still reports its cost with `root: None`, since an
+    /// orphaned store is exactly what an operator is looking for.
+    pub fn store_entries(snapshots_dir: &Path) -> Vec<StoreEntry> {
+        let mut entries = Vec::new();
+        let Ok(sessions) = fs::read_dir(snapshots_dir) else {
+            return entries;
+        };
+        for session in sessions.flatten() {
+            let Ok(workspaces) = fs::read_dir(session.path()) else {
+                continue;
+            };
+            for workspace in workspaces.flatten() {
+                let dir = workspace.path();
+                if !dir.is_dir() {
+                    continue;
+                }
+                let objects = dir.join(OBJECTS_DIR);
+                entries.push(StoreEntry {
+                    session_id: session.file_name().to_string_lossy().into_owned(),
+                    workspace_key: workspace.file_name().to_string_lossy().into_owned(),
+                    root: read_json(&dir.join(WORKSPACE_ROOT_NAME), "workspace root").ok(),
+                    bytes: tree_bytes(&dir),
+                    objects: count_files(&objects),
+                    manifests: manifest_names(&dir),
+                });
+            }
+        }
+        entries.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.session_id.cmp(&b.session_id)));
+        entries
+    }
+
     fn manifest_path(&self, key: SnapshotKey) -> PathBuf {
         let name = match key {
             SnapshotKey::SessionStart => SESSION_START_NAME.to_owned(),
@@ -897,8 +1027,22 @@ impl SnapshotStore {
             builder.standard_filters(false);
         }
         builder.filter_entry(move |entry| {
-            entry.depth() == 0
-                || (entry.file_name() != OsStr::new(".git") && !entry.path().starts_with(&excluded))
+            if entry.depth() == 0 {
+                return true;
+            }
+            if entry.file_name() == OsStr::new(".git") || entry.path().starts_with(&excluded) {
+                return false;
+            }
+            // A directory carrying its own `.git` is a different repository,
+            // and this snapshot describes one worktree. Git agrees: a nested
+            // repository contributes nothing to the parent's status, whether
+            // it is a submodule (`.git` file) or an unregistered clone (`.git`
+            // directory). Descending anyway meant a workspace whose 357
+            // tracked files sat beside a 928k-file data repository read and
+            // hashed all 7 GB of it on every capture.
+            !(git_worktree
+                && entry.file_type().is_some_and(|kind| kind.is_dir())
+                && entry.path().join(".git").exists())
         });
 
         let mut files = Vec::new();
@@ -1764,6 +1908,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use tempfile::TempDir;
+    use test_case::test_case;
 
     use super::*;
 
@@ -2813,6 +2958,65 @@ mod tests {
         assert_eq!(hasher.count(), 2);
         assert_ne!(first["a.txt"].hash, second["a.txt"].hash);
         assert_eq!(second["a.txt"].hash, hex_encode(&hash_bytes(b"bravo")));
+    }
+
+    /// Exit takes this path, so a lock held by an unrelated caudra has to come
+    /// back as "did not run" inside the budget rather than as a stalled exit.
+    #[test]
+    fn capture_head_within_gives_up_on_a_held_artifact_lock() {
+        const BUSY_MSG: &str = "a held artifact lock must report no capture";
+        const FREE_MSG: &str = "a free artifact lock must capture";
+        const BUDGET: Duration = Duration::from_millis(120);
+        let (_temp, root, _unused) = setup();
+        let state = TempDir::new().unwrap();
+        let state_dir = StateDir::from_path(state.path().to_path_buf());
+        write(&root, "kept.txt", ALPHA);
+        let store = SnapshotStore::new_managed(
+            state_dir.clone(),
+            state.path().join(SESSION_SNAPSHOTS_DIR),
+        );
+
+        let held = lock_session_artifacts(&state_dir).unwrap();
+        let started = Instant::now();
+        assert!(
+            !store.capture_head_within(&root, None, BUDGET).unwrap(),
+            "{BUSY_MSG}"
+        );
+        assert!(started.elapsed() >= BUDGET, "{BUSY_MSG}");
+
+        drop(held);
+        assert!(
+            store.capture_head_within(&root, None, BUDGET).unwrap(),
+            "{FREE_MSG}"
+        );
+    }
+
+    const NESTED_REPO_MSG: &str = "a nested repository belongs to itself, not to this worktree";
+
+    /// The parent's own files still have to be captured; only the nested
+    /// repository is out of scope.
+    #[test_case(true  ; "unregistered_clone_is_a_boundary")]
+    #[test_case(false ; "submodule_gitlink_is_a_boundary")]
+    fn a_nested_repository_is_not_part_of_this_worktree(nested_git_is_dir: bool) {
+        let (_temp, root, snapshots) = setup();
+        fs::create_dir(root.join(".git")).unwrap();
+        write(&root, "kept.txt", ALPHA);
+        fs::create_dir_all(root.join("training-data")).unwrap();
+        if nested_git_is_dir {
+            fs::create_dir(root.join("training-data/.git")).unwrap();
+        } else {
+            write(&root, "training-data/.git", "gitdir: ../.git/modules/td");
+        }
+        write(&root, "training-data/huge.bin", BETA);
+
+        let store = SnapshotStore::new(snapshots);
+        let manifest = store.snapshot_session_start(&root).unwrap();
+
+        assert!(manifest.contains_key("kept.txt"), "{NESTED_REPO_MSG}");
+        assert!(
+            !manifest.contains_key("training-data/huge.bin"),
+            "{NESTED_REPO_MSG}"
+        );
     }
 
     #[test]

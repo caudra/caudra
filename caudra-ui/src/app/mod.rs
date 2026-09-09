@@ -638,6 +638,26 @@ impl App {
         )
     }
 
+    /// [`Self::snapshot_history_head`] with a ceiling on how long it may wait
+    /// for the machine-global artifact lock. Answers whether it ran.
+    ///
+    /// Exit is the one caller that cannot afford the unbounded form: the lock
+    /// is one file for every caudra on the machine, so a capture running in an
+    /// unrelated workspace is enough to hold exit open, and `flock` will
+    /// happily starve the waiter. Losing the final snapshot costs rewind
+    /// fidelity for one head; waiting costs the user their terminal, and
+    /// blocks every other session queued behind the same lock.
+    pub(super) fn snapshot_history_head_within(
+        &self,
+        budget: Duration,
+    ) -> Result<bool, SnapshotError> {
+        self.snapshot_store.capture_head_within(
+            std::path::Path::new(&self.state.session.cwd),
+            self.history_head(),
+            budget,
+        )
+    }
+
     pub(crate) fn main_chat(&mut self) -> &mut Chat {
         &mut self.chats[0]
     }
@@ -4076,6 +4096,7 @@ impl App {
                 self.restoring.load(Ordering::Relaxed),
                 self.retry_info.is_some(),
                 self.state.goal.snapshot().is_some(),
+                self.is_snapshotting(),
             ),
             self.selection_state
                 .as_ref()

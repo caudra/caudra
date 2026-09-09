@@ -209,6 +209,7 @@ caudra storage path                       # session database path
 caudra storage stats [--json]             # rows, bytes, artifacts, pending cleanup
 caudra storage check                      # integrity check
 caudra storage sessions [--directory DIR] # list sessions with activity, size, state
+caudra storage snapshots [--json] [--manifests]  # workspace snapshot stores, largest first
 caudra storage trim   [POLICY] [--dry-run]
 caudra storage forget [POLICY | ID...] [--dry-run] [--prune]
 caudra storage prune  [--dry-run]
@@ -219,6 +220,8 @@ caudra storage vacuum [--pages N]
 caudra storage usage  [--group-by GROUP] [--since DURATION] [--json]
 caudra storage usage  --prune-older-than DURATION
 ```
+
+`snapshots` lists the working-tree snapshot stores one row per session and workspace, largest first, so a store that has grown out of proportion to its repository is visible. A store whose workspace marker is gone is reported as orphaned rather than skipped. Snapshots stop at a nested repository the way git does, so a checkout inside your worktree is not captured with it.
 
 `trim` demotes sessions to the transcript tier and `forget` deletes them. Both take a keep policy in `restic forget` terms and fall back to the configured `storage.retention` policy when no `--keep-*` flag is given. `prune` reclaims space that no session references. See [Sessions](/docs/sessions/#retention) for the policy rules and what each tier keeps.
 

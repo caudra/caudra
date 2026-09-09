@@ -4,6 +4,7 @@ use std::env;
 use std::fmt::Write as _;
 use std::sync::Arc;
 
+use caudra_agent::snapshots::{SESSION_SNAPSHOTS_DIR, SnapshotStore, StoreEntry};
 use caudra_agent::tools::ToolRegistry;
 use caudra_config::{RetentionConfig, load_env_files};
 use caudra_lua::PluginHost;
@@ -29,6 +30,10 @@ use crate::cli::{KeepPolicyArgs, PolicyScopeArgs, StorageAction, UsageGrouping};
 const ID_WIDTH: usize = 22;
 const ACTIVITY_WIDTH: usize = 16;
 const SIZE_WIDTH: usize = 10;
+const OBJECTS_WIDTH: usize = 9;
+const MANIFESTS_WIDTH: usize = 6;
+const NO_SNAPSHOTS: &str = "no workspace snapshots";
+const ORPHANED_STORE: &str = "(workspace root missing)";
 const REASONS_WIDTH: usize = 24;
 const TITLE_WIDTH: usize = 40;
 const TIME_FORMAT: &str = "%Y-%m-%d %H:%M";
@@ -120,6 +125,15 @@ pub fn run(action: StorageAction, no_plugins: bool, no_jit: bool) -> Result<()> 
                 println!("snapshot_bytes: {}", bytes(stats.snapshot_bytes));
                 println!("archive_bytes: {}", bytes(stats.archive_bytes));
                 println!("pending_cleanup_jobs: {}", stats.pending_cleanup_jobs);
+            }
+        }
+        StorageAction::Snapshots { json, manifests } => {
+            let entries =
+                SnapshotStore::store_entries(&state_dir.path().join(SESSION_SNAPSHOTS_DIR));
+            if json {
+                println!("{}", serde_json::to_string_pretty(&entries)?);
+            } else {
+                print!("{}", render_snapshots(&entries, manifests));
             }
         }
         StorageAction::Check => {
@@ -784,6 +798,50 @@ fn render_sessions(rows: &[SessionRow<'_>]) -> String {
     out
 }
 
+fn render_snapshots(entries: &[StoreEntry], manifests: bool) -> String {
+    let mut out = String::new();
+    if entries.is_empty() {
+        let _ = writeln!(out, "{NO_SNAPSHOTS}");
+        return out;
+    }
+    let _ = writeln!(
+        out,
+        "{:ID_WIDTH$} {:>SIZE_WIDTH$} {:>OBJECTS_WIDTH$} {:>MANIFESTS_WIDTH$} Workspace",
+        "Session", "Size", "Objects", "Snaps"
+    );
+    let mut total = 0;
+    let mut objects = 0;
+    for entry in entries {
+        total += entry.bytes;
+        objects += entry.objects;
+        let _ = writeln!(
+            out,
+            "{:ID_WIDTH$} {:>SIZE_WIDTH$} {:>OBJECTS_WIDTH$} {:>MANIFESTS_WIDTH$} {}",
+            entry.session_id,
+            bytes(entry.bytes),
+            entry.objects,
+            entry.manifests.len(),
+            entry
+                .root
+                .as_ref()
+                .map_or_else(|| ORPHANED_STORE.to_owned(), |root| root.display().to_string()),
+        );
+        if manifests {
+            for name in &entry.manifests {
+                let _ = writeln!(out, "{:ID_WIDTH$} {name}", "");
+            }
+        }
+    }
+    let _ = writeln!(
+        out,
+        "{} stores, {} objects, {}",
+        entries.len(),
+        objects,
+        bytes(total)
+    );
+    out
+}
+
 fn activity(facts: &SessionFacts) -> String {
     i64::try_from(facts.active_at())
         .ok()
@@ -831,6 +889,8 @@ mod tests {
     const UNPRICED_VISIBLE: &str = "a total that cannot price some of its tokens must say so";
     const EPHEMERAL_COUNTED: &str = "ephemeral spend is real money and belongs in the total";
     const PURPOSE_IS_ANSWERABLE: &str = "a bill must be able to name what goals cost";
+    const WORKSPACE_KEY: &str = "9a3913d670e736996dbc23f4de4fa88f02d249c5081e7cbeaec20d42bc85d002";
+    const SESSION_START_MANIFEST: &str = "session-start.json";
 
     fn bucket(bucket_start: i64, provider: &str, model: &str, cwd: &str, cost: f64) -> UsageBucket {
         purposed_bucket(
@@ -1016,6 +1076,70 @@ mod tests {
                 .unwrap()
                 .keep_daily,
             Some(7)
+        );
+    }
+
+    fn store_entry(session_id: &str, root: Option<&str>, bytes: u64) -> StoreEntry {
+        StoreEntry {
+            session_id: session_id.to_owned(),
+            workspace_key: WORKSPACE_KEY.to_owned(),
+            root: root.map(Into::into),
+            bytes,
+            objects: 2,
+            manifests: vec![SESSION_START_MANIFEST.to_owned()],
+        }
+    }
+
+    /// The point of the listing is finding the store that got out of hand, so
+    /// the biggest has to come first and the total has to be stated.
+    #[test]
+    fn snapshot_stores_are_reported_largest_first_with_a_total() {
+        const ORDER_MSG: &str = "the largest store must be listed first";
+        const TOTAL_MSG: &str = "the listing must total what the stores cost";
+        let rendered = render_snapshots(
+            &[
+                store_entry("CeBig", Some("/repo/big"), 3 * 1024 * 1024),
+                store_entry("CeSmall", Some("/repo/small"), 1024),
+            ],
+            false,
+        );
+
+        let big = rendered.find("CeBig").expect(ORDER_MSG);
+        let small = rendered.find("CeSmall").expect(ORDER_MSG);
+        assert!(big < small, "{ORDER_MSG}");
+        assert!(rendered.contains("2 stores"), "{TOTAL_MSG}");
+        assert!(rendered.contains(&bytes(3 * 1024 * 1024 + 1024)), "{TOTAL_MSG}");
+    }
+
+    /// A store whose workspace marker is gone is exactly what an operator is
+    /// hunting for, so it is named rather than dropped from the listing.
+    #[test]
+    fn an_orphaned_store_is_named_not_hidden() {
+        let rendered = render_snapshots(&[store_entry("CeLost", None, 512)], false);
+        assert!(
+            rendered.contains(ORPHANED_STORE),
+            "an orphaned store must say so"
+        );
+    }
+
+    #[test]
+    fn an_empty_store_says_so_instead_of_printing_a_header() {
+        let rendered = render_snapshots(&[], false);
+        assert_eq!(rendered.trim(), NO_SNAPSHOTS);
+    }
+
+    #[test]
+    fn manifests_are_listed_only_when_asked() {
+        const HIDDEN_MSG: &str = "manifests stay out of the default listing";
+        const SHOWN_MSG: &str = "--manifests must list each manifest";
+        let entry = [store_entry("CeM", Some("/repo"), 64)];
+        assert!(
+            !render_snapshots(&entry, false).contains(SESSION_START_MANIFEST),
+            "{HIDDEN_MSG}"
+        );
+        assert!(
+            render_snapshots(&entry, true).contains(SESSION_START_MANIFEST),
+            "{SHOWN_MSG}"
         );
     }
 

@@ -365,6 +365,15 @@ pub enum StorageAction {
         #[arg(long)]
         json: bool,
     },
+    /// Show per-workspace working-tree snapshot stores, largest first
+    Snapshots {
+        /// Emit JSON
+        #[arg(long)]
+        json: bool,
+        /// Also list the manifests each store holds
+        #[arg(long)]
+        manifests: bool,
+    },
     /// Check database and foreign-key integrity
     Check,
     /// Checkpoint the write-ahead log

@@ -37,9 +37,7 @@ use std::process;
 use std::sync::OnceLock;
 #[cfg(windows)]
 use std::thread;
-#[cfg(windows)]
-use std::time::Duration;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tempfile::NamedTempFile;
 
 use paths::state_dir;
@@ -49,6 +47,9 @@ const RENAME_ATTEMPTS: usize = 20;
 const XDG_RUNTIME_DIR_ENV: &str = "XDG_RUNTIME_DIR";
 const EPHEMERAL_DIR_PREFIX: &str = "caudra";
 const SESSION_ARTIFACT_LOCK_FILE: &str = "sessions.sqlite3.artifacts.lock";
+/// How long a bounded artifact-lock wait sleeps between attempts. `flock`
+/// grants no queue and no fairness, so a waiter polls rather than blocks.
+const ARTIFACT_LOCK_POLL: Duration = Duration::from_millis(20);
 
 /// Where state lives. Normally one directory. An ephemeral run splits it:
 /// session data goes to a volatile root removed at exit, while credentials,
@@ -356,6 +357,32 @@ pub fn lock_session_artifacts(state_dir: &StateDir) -> Result<SessionArtifactLoc
     Ok(SessionArtifactLock { _file: file })
 }
 
+/// Takes the artifact lock, giving up after `budget` instead of waiting for as
+/// long as it takes.
+///
+/// This lock is one file for the whole state directory, so every concurrent
+/// caudra contends for it whatever workspace it is in, and `flock` hands out no
+/// queue: a waiter can be overtaken indefinitely by processes that keep
+/// re-acquiring. Callers that must finish on a deadline take the bounded form
+/// and do without the artifact rather than inherit an unbounded wait.
+pub fn lock_session_artifacts_within(
+    state_dir: &StateDir,
+    budget: Duration,
+) -> Result<Option<SessionArtifactLock>, StorageError> {
+    let path = state_dir.path().join(SESSION_ARTIFACT_LOCK_FILE);
+    let deadline = Instant::now() + budget;
+    loop {
+        if let Some(file) = try_exclusive_state_lock(&path, 0o600)? {
+            return Ok(Some(SessionArtifactLock { _file: file }));
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(None);
+        }
+        std::thread::sleep(ARTIFACT_LOCK_POLL.min(remaining));
+    }
+}
+
 /// `into_parts` drops the auto-cleanup-on-drop guarantee, but we need the
 /// File handle closed (Windows can't rename an open file) and tempfile's
 /// `persist()` doesn't support the fibonacci backoff retry that Windows
@@ -532,6 +559,38 @@ mod tests {
     const REPLACEMENT: &[u8] = b"replacement";
     #[cfg(unix)]
     const FILE_MODE_MASK: u32 = 0o777;
+
+    const LOCK_FREE_MSG: &str = "an uncontended artifact lock must be granted";
+    const LOCK_BUSY_MSG: &str = "a held artifact lock must time out, not block forever";
+    const LOCK_BUDGET_MSG: &str = "the wait must respect its budget";
+    const LOCK_BUDGET: Duration = Duration::from_millis(120);
+
+    /// The artifact lock is one file for every caudra on the machine, and
+    /// `flock` offers no queue, so the bounded form is what keeps a deadline
+    /// from becoming someone else's workload.
+    #[test]
+    fn a_held_artifact_lock_times_out_instead_of_blocking() {
+        let root = tempfile::tempdir().unwrap();
+        let state_dir = StateDir::from_path(root.path().to_path_buf());
+
+        let held = lock_session_artifacts_within(&state_dir, LOCK_BUDGET)
+            .unwrap()
+            .expect(LOCK_FREE_MSG);
+
+        let started = Instant::now();
+        let contended = lock_session_artifacts_within(&state_dir, LOCK_BUDGET).unwrap();
+        let waited = started.elapsed();
+        assert!(contended.is_none(), "{LOCK_BUSY_MSG}");
+        assert!(waited >= LOCK_BUDGET, "{LOCK_BUDGET_MSG}");
+
+        drop(held);
+        assert!(
+            lock_session_artifacts_within(&state_dir, LOCK_BUDGET)
+                .unwrap()
+                .is_some(),
+            "{LOCK_FREE_MSG}"
+        );
+    }
 
     #[derive(Clone, serde::Deserialize, serde::Serialize)]
     struct TestMessage;

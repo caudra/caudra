@@ -22,6 +22,7 @@ use caudra_agent::GoalSnapshot;
 const TRUNCATE_PREFIX: &str = "..";
 const CWD_MODEL_SEPARATOR: &str = "  ";
 const BACK_TO_MAIN_LABEL: &str = "[< Main]";
+const SNAPSHOTTING_LABEL: &str = "snapshotting workspace";
 /// Replaces the countdown under the pointer: the control has to say what a
 /// click does, and the seconds left stop mattering once you mean to skip them.
 const RETRY_NOW_LABEL: &str = " · retry now";
@@ -100,6 +101,11 @@ pub struct StatusBarContext<'a> {
     pub workflow: bool,
     pub yolo: bool,
     pub restoring: bool,
+    /// A working-tree capture is in flight. It walks and hashes every file the
+    /// worktree owns, so on a large one it is the slowest thing between
+    /// pressing enter and the model seeing the prompt, and silence reads as a
+    /// hang.
+    pub snapshotting: bool,
     pub goal: Option<&'a GoalSnapshot>,
     pub mode_clickable: bool,
     pub settings_clickable: bool,
@@ -397,10 +403,16 @@ impl StatusBar {
     /// The bar spins for a whole turn, again while a restore is in flight, and
     /// it counts a retry down by the second. It sits next to [`Self::view`] so
     /// a new moving span cannot forget to claim its frames.
-    pub fn cadence(status: &Status, restoring: bool, retrying: bool, goal_active: bool) -> Cadence {
+    pub fn cadence(
+        status: &Status,
+        restoring: bool,
+        retrying: bool,
+        goal_active: bool,
+        snapshotting: bool,
+    ) -> Cadence {
         Cadence::any([
             Cadence::when(
-                *status == Status::Streaming || restoring || retrying,
+                *status == Status::Streaming || restoring || retrying || snapshotting,
                 Cadence::SPINNER,
             ),
             Cadence::when(goal_active, Cadence::CLOCK),
@@ -429,6 +441,16 @@ impl StatusBar {
             let ch = spinner_frame(self.started_at.elapsed().as_millis());
             left_spans.push(Span::styled(
                 format!(" {ch}"),
+                theme::current().status_notice,
+            ));
+        }
+
+        // Named rather than left as a bare spinner: a capture can outlast a
+        // whole turn's first token, and the reader needs to know the wait is
+        // the workspace and not the model.
+        if ctx.snapshotting {
+            left_spans.push(Span::styled(
+                format!(" {SNAPSHOTTING_LABEL}"),
                 theme::current().status_notice,
             ));
         }
@@ -989,6 +1011,7 @@ mod tests {
         hover_hint: Option<&'a str>,
         goal: Option<&'a GoalSnapshot>,
         retry_info: Option<&'a RetryInfo>,
+        snapshotting: bool,
     }
 
     impl Default for Fixture<'_> {
@@ -1002,6 +1025,7 @@ mod tests {
                 hover_hint: None,
                 goal: None,
                 retry_info: None,
+                snapshotting: false,
             }
         }
     }
@@ -1016,6 +1040,7 @@ mod tests {
             hover_hint,
             goal,
             retry_info,
+            snapshotting,
         } = fixture;
         let bar = StatusBar::new(FLASH_TTL);
         let mut terminal =
@@ -1043,6 +1068,7 @@ mod tests {
             workflow: false,
             yolo,
             restoring: false,
+            snapshotting,
             goal,
             mode_clickable: true,
             settings_clickable: true,
@@ -1098,6 +1124,7 @@ mod tests {
             workflow: true,
             yolo: true,
             restoring: false,
+            snapshotting: false,
             goal: None,
             mode_clickable: true,
             settings_clickable: true,
@@ -1408,6 +1435,35 @@ mod tests {
         ] {
             assert!(hits.iter().any(|hit| hit.target == target), "{target:?}");
         }
+    }
+
+    /// A capture walks and hashes the whole worktree before the model sees
+    /// anything, so the bar has to say so rather than sit still.
+    #[test]
+    fn a_running_capture_names_itself_and_claims_frames() {
+        const QUIET_MSG: &str = "an idle bar must not claim to be snapshotting";
+        const NAMED_MSG: &str = "a running capture must name itself in the bar";
+        let (idle, _, _) = render_at(Fixture::default());
+        assert!(!idle.contains(SNAPSHOTTING_LABEL), "{QUIET_MSG}");
+
+        let (busy, _, _) = render_at(Fixture {
+            snapshotting: true,
+            ..Fixture::default()
+        });
+        assert!(busy.contains(SNAPSHOTTING_LABEL), "{NAMED_MSG}");
+
+        assert_eq!(
+            StatusBar::cadence(&Status::Idle, false, false, false, true),
+            Cadence::SPINNER,
+            "{}",
+            crate::repaint::expect::OWED
+        );
+        assert_eq!(
+            StatusBar::cadence(&Status::Idle, false, false, false, false),
+            Cadence::IDLE,
+            "{}",
+            crate::repaint::expect::QUIET
+        );
     }
 
     #[test]
