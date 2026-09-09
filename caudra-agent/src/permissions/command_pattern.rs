@@ -141,53 +141,62 @@ pub(crate) fn builtin_allowed(command: &str) -> bool {
         })
 }
 
+/// A pattern keeps only leading literals, so an operand the shell would expand
+/// disqualifies nothing: decoding stops at the first non-static token and the
+/// prefix is derived from what came before it. `matches` is then the acceptance
+/// boundary, exactly as it is at enforcement, so a suggestion is never offered
+/// that the rule it becomes could not cover.
 pub(crate) fn reusable_prefix(command: &str) -> Option<String> {
     let tokens = tokenize(command)?;
-    let decoded: Vec<String> = tokens
-        .into_iter()
-        .map(decode_static_token)
-        .collect::<Option<_>>()?;
-    if !is_pattern_literal(decoded.first()?) {
+    let prefix: Vec<String> = tokens
+        .iter()
+        .map_while(|token| decode_static_token(token))
+        .collect();
+    if !is_pattern_literal(prefix.first()?) {
         return None;
     }
 
-    let literals = match super::command_arity::curated_literals(&decoded) {
-        Some(curated) => curated_literals(&decoded, curated)?,
-        None => heuristic_literals(&decoded)?,
+    let literals = match super::command_arity::curated_literals(&prefix) {
+        Some(curated) => curated_literals(&prefix, curated)?,
+        None => heuristic_literals(&prefix, tokens.len())?,
     };
     if overlaps_builtin_ask(literals) {
         return None;
     }
 
-    Some(format!("{}{WILDCARD_SUFFIX}", literals.join(" ")))
+    let pattern = format!("{}{WILDCARD_SUFFIX}", literals.join(" "));
+    matches(&pattern, command).then_some(pattern)
 }
 
 /// A curated entry is a deliberate decision, so it may keep a bare executable or
 /// the whole command where the heuristic may not. It still refuses to reach past
-/// a flag, because `git -C /repo commit` would otherwise yield `git -C *`.
-fn curated_literals(decoded: &[String], literals: usize) -> Option<&[String]> {
-    (literals <= decoded.len()
-        && decoded[1..literals]
+/// a flag, because `git -C /repo commit` would otherwise yield `git -C *`, and
+/// past a token that did not decode, which is why it counts against the prefix
+/// rather than against the command.
+fn curated_literals(prefix: &[String], literals: usize) -> Option<&[String]> {
+    (literals <= prefix.len()
+        && prefix[1..literals]
             .iter()
             .all(|token| is_subcommand_word(token)))
-    .then(|| &decoded[..literals])
+    .then(|| &prefix[..literals])
 }
 
 /// Without curation the leading tokens are only guessed to be subcommands, so a
 /// guess that degenerates to the bare executable or swallows every operand is
-/// discarded rather than offered.
-fn heuristic_literals(decoded: &[String]) -> Option<&[String]> {
-    if decoded.get(1)?.starts_with('-') {
+/// discarded rather than offered. Operands are counted from the command, not
+/// from the decoded prefix, so a trailing glob still counts as one.
+fn heuristic_literals(prefix: &[String], tokens: usize) -> Option<&[String]> {
+    if prefix.get(1)?.starts_with('-') {
         return None;
     }
-    let literals = decoded
+    let literals = prefix
         .iter()
         .skip(1)
         .take(MAX_PREFIX_LITERALS - 1)
         .take_while(|token| is_subcommand_word(token))
         .count()
         + 1;
-    (literals > 1 && literals < decoded.len()).then(|| &decoded[..literals])
+    (literals > 1 && literals < tokens).then(|| &prefix[..literals])
 }
 
 /// A pattern that shares a prefix with an ask family in either direction covers
@@ -492,14 +501,17 @@ mod tests {
     #[test_case("cargo nextest run --workspace", Some("cargo nextest run *"))]
     #[test_case(r#"git "status" --short"#, Some("git status *"))]
     #[test_case("git status", None; "complete prefix")]
-    #[test_case(r#"git status "$FORMAT""#, None; "parameter expansion")]
+    #[test_case(r#"git status "$FORMAT""#, Some("git status *"); "parameter expansion")]
     #[test_case("git status $(format)", None; "command substitution")]
-    #[test_case("git status *.rs", None; "glob expansion")]
+    #[test_case("git status *.rs", Some("git status *"); "glob expansion")]
     #[test_case(r#"git status "unterminated"#, None; "malformed input")]
     #[test_case("rg foo src/", Some("rg *"); "curated tool keeps its operand out")]
     #[test_case("rg -n foo", Some("rg *"); "curated tool reaches past a leading flag")]
     #[test_case("wc -l src/lib.rs", Some("wc *"))]
     #[test_case("ls -la", Some("ls *"))]
+    #[test_case("ls src/ src/*/", Some("ls *"); "curated tool tolerates a globbed operand")]
+    #[test_case("wc -l a.rs b/*.rs", Some("wc *"); "globbed operand past a flag")]
+    #[test_case("npm run $(x)", None; "curated prefix stops at a substitution")]
     #[test_case("npm run build", Some("npm run build *"); "curated prefix takes every operand")]
     #[test_case("npm install react", Some("npm install *"))]
     #[test_case("uv run pytest tests/", Some("uv run pytest *"))]
