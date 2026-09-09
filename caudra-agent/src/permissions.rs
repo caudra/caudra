@@ -560,7 +560,7 @@ fn remove_pending(
 /// command in a batch would leave its siblings on screen forever.
 ///
 /// A sticky ask is the rules themselves asking, which no grant answers.
-fn rule_settles(rule: &StructuredPermissionRule, candidate: &PendingPermission) -> bool {
+fn rules_settle(rules: &[StructuredPermissionRule], candidate: &PendingPermission) -> bool {
     candidate.sticky_ask.len() == candidate.request.resources.len()
         && candidate.sticky_ask.iter().all(|sticky| !sticky)
         && candidate
@@ -569,7 +569,9 @@ fn rule_settles(rule: &StructuredPermissionRule, candidate: &PendingPermission) 
             .iter()
             .enumerate()
             .all(|(index, resource)| {
-                permission_rule_covers_resource(rule, &candidate.request, resource)
+                rules
+                    .iter()
+                    .any(|rule| permission_rule_covers_resource(rule, &candidate.request, resource))
                     || candidate
                         .request
                         .presentation
@@ -1040,9 +1042,9 @@ impl PermissionManager {
         else {
             return false;
         };
-        let reusable_rule =
+        let reusable_rules =
             match self.commit_structured_decision(&request, &answer, project.as_deref()) {
-                Ok(rule) => rule,
+                Ok(rules) => rules,
                 Err(error) => {
                     warn!(%error, request_id, "permission decision was not committed");
                     return false;
@@ -1052,17 +1054,18 @@ impl PermissionManager {
             return false;
         };
         let mut covered = Vec::new();
-        if let Some(rule) = reusable_rule {
+        // One answer files at one lifetime, so scope is settled once for the set.
+        if let Some(lifetime) = reusable_rules.first().map(|rule| rule.lifetime.clone()) {
             let mut matches = Vec::new();
             for (&manager_id, requests) in pending.iter() {
                 for (candidate_id, candidate) in requests {
                     if reusable_rule_scope_matches(
-                        &rule.lifetime,
+                        &lifetime,
                         self.id,
                         project.as_deref(),
                         manager_id,
                         candidate.project.as_deref(),
-                    ) && rule_settles(&rule, candidate)
+                    ) && rules_settle(&reusable_rules, candidate)
                     {
                         matches.push((manager_id, candidate_id.clone()));
                     }
@@ -1606,12 +1609,15 @@ impl PermissionManager {
             .collect())
     }
 
+    /// Files what the answer decided and reports the allows other pending
+    /// prompts can be swept with. A composed answer files one rule per command,
+    /// so each is listed and revoked on its own.
     fn commit_structured_decision(
         &self,
         request: &PermissionRequest,
         answer: &PermissionAnswer,
         approved_project: Option<&Path>,
-    ) -> Result<Option<StructuredPermissionRule>, PermissionPolicyError> {
+    ) -> Result<Vec<StructuredPermissionRule>, PermissionPolicyError> {
         let (option_id, lifetime) = match answer {
             PermissionAnswer::AllowOnce => ("allow_exact", PermissionLifetime::Once),
             PermissionAnswer::AllowSession => ("allow_exact", PermissionLifetime::Conversation),
@@ -1622,17 +1628,20 @@ impl PermissionManager {
                 lifetime,
             } => (option_id.as_str(), lifetime.clone()),
             PermissionAnswer::AllowComposed { rows, lifetime } => {
-                let Some(rule) = request
-                    .composed_rule(rows, lifetime)
+                let mut stored = Vec::new();
+                for rule in request
+                    .composed_rules(rows, lifetime)
                     .map_err(|error| PermissionPolicyError(error.to_string()))?
-                else {
-                    return Ok(None);
-                };
-                return self.store_reusable_rule(request, rule, approved_project);
+                {
+                    stored.extend(self.store_reusable_rule(request, rule, approved_project)?);
+                }
+                return Ok(stored);
             }
             PermissionAnswer::DenyAlwaysLocal => ("deny_exact", PermissionLifetime::Project),
             PermissionAnswer::DenyAlwaysGlobal => ("deny_exact", PermissionLifetime::Global),
-            PermissionAnswer::Deny | PermissionAnswer::DenyWithGuidance(_) => return Ok(None),
+            PermissionAnswer::Deny | PermissionAnswer::DenyWithGuidance(_) => {
+                return Ok(Vec::new());
+            }
         };
         let option = request
             .options
@@ -1659,7 +1668,11 @@ impl PermissionManager {
                 "authority {option_id:?} does not cover the pending request"
             )));
         }
-        self.store_reusable_rule(request, rule, approved_project)
+        Ok(Vec::from_iter(self.store_reusable_rule(
+            request,
+            rule,
+            approved_project,
+        )?))
     }
 
     /// Files a validated rule wherever its lifetime belongs, and reports the
@@ -4477,6 +4490,56 @@ mod tests {
                 "first",
                 PermissionAnswer::AllowComposed {
                     rows: vec![Some(PermissionRowGrant::Offered("command_exact_0".into()))],
+                    lifetime: PermissionLifetime::Conversation,
+                }
+            ));
+            assert_eq!(manager.pending_count(), 0);
+            assert!(matches!(
+                second_events.try_recv().unwrap().event,
+                AgentEvent::PermissionRequestResolved { request_id, .. } if request_id == "second"
+            ));
+            assert!(first.await.is_ok());
+            assert!(second.await.is_ok());
+        });
+    }
+
+    /// A composed answer files one rule per command, so a sibling waiting on
+    /// the second of them is only swept if the whole set is consulted.
+    #[test]
+    fn a_sibling_is_swept_by_any_rule_the_answer_filed() {
+        smol::block_on(async {
+            let manager = Arc::new(default_mgr());
+            let first_command = "cargo build";
+            let second_command = "npm test";
+            let (first, first_events) = pending_scope_enforcement(
+                Arc::clone(&manager),
+                "first",
+                "bash",
+                crate::tools::PermissionScopes {
+                    scopes: vec![first_command.into(), second_command.into()],
+                    force_prompt: false,
+                    plan_scoped: false,
+                },
+                serde_json::json!({"command": format!("{first_command} && {second_command}")}),
+            );
+            let (second, second_events) = pending_tool_enforcement(
+                Arc::clone(&manager),
+                "second",
+                "bash",
+                second_command.into(),
+                serde_json::json!({"command": second_command}),
+            );
+            first_events.recv_async().await.unwrap();
+            second_events.recv_async().await.unwrap();
+            assert_eq!(manager.pending_count(), 2);
+
+            assert!(manager.answer(
+                "first",
+                PermissionAnswer::AllowComposed {
+                    rows: vec![
+                        Some(PermissionRowGrant::Offered("command_exact_0".into())),
+                        Some(PermissionRowGrant::Offered("command_exact_1".into())),
+                    ],
                     lifetime: PermissionLifetime::Conversation,
                 }
             ));

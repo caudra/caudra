@@ -185,8 +185,6 @@ pub enum ComposedAnswerError {
         command: String,
         fault: PatternFault,
     },
-    #[error("chosen authorities do not share one capability family")]
-    MixedFamilies,
     #[error("chosen authority does not cover the command it was chosen for")]
     Uncovered,
 }
@@ -216,6 +214,32 @@ impl RuleOrigin {
             Self::Project => "project",
             Self::Global => "global",
         }
+    }
+
+    /// How long coverage from this origin can be relied on, for deciding
+    /// whether granting again would add anything.
+    ///
+    /// The builtin allowlist has no answer: it is a default consulted only
+    /// where no rule speaks, so a grant over it is a real grant. A plugin's
+    /// rules last only as long as the plugin has them loaded, which is no
+    /// longer than the conversation.
+    fn durability(self) -> Option<PermissionLifetime> {
+        match self {
+            Self::Builtin => None,
+            Self::Plugin | Self::Conversation => Some(PermissionLifetime::Conversation),
+            Self::Config | Self::Project => Some(PermissionLifetime::Project),
+            Self::Global => Some(PermissionLifetime::Global),
+        }
+    }
+}
+
+/// How durable a lifetime is, so coverage can be compared against a grant.
+fn lifetime_rank(lifetime: &PermissionLifetime) -> u8 {
+    match lifetime {
+        PermissionLifetime::Once => 0,
+        PermissionLifetime::Conversation => 1,
+        PermissionLifetime::Project => 2,
+        PermissionLifetime::Global => 3,
     }
 }
 
@@ -481,55 +505,93 @@ impl PermissionRequest {
     /// admitted only against the command on its own row and only for a lifetime
     /// that row's offered rung still allows. That second gate is what keeps
     /// plan mode contained without knowing anything about plans.
-    pub fn composed_rule(
+    pub fn composed_rules(
         &self,
         rows: &[Option<PermissionRowGrant>],
         lifetime: &PermissionLifetime,
-    ) -> Result<Option<StructuredPermissionRule>, ComposedAnswerError> {
+    ) -> Result<Vec<StructuredPermissionRule>, ComposedAnswerError> {
         if rows.len() != self.resources.len() {
             return Err(ComposedAnswerError::RowCount {
                 named: rows.len(),
                 resources: self.resources.len(),
             });
         }
-        let mut constraints = Vec::new();
-        let mut family = None;
+        let subsumed = self.subsumed_rows(rows);
+        let mut rules = Vec::new();
         for (index, grant) in rows.iter().enumerate() {
             let Some(grant) = grant else {
                 continue;
             };
-            let (option, chosen) = self.row_reach(index, grant)?;
+            // Validated before pruning: a grant the request never offered is an
+            // error whether or not it would have been kept.
+            let (option, resources) = self.row_reach(index, grant)?;
             if !option.allowed_lifetimes.contains(lifetime) {
                 return Err(ComposedAnswerError::LifetimeWithdrawn(option.id.clone()));
             }
-            match family {
-                Some(family) if family != option.rule.family => {
-                    return Err(ComposedAnswerError::MixedFamilies);
-                }
-                _ => family = Some(option.rule.family),
+            if subsumed[index].is_some() || self.row_adds_nothing(index, grant, lifetime) {
+                continue;
             }
-            constraints.extend(chosen);
-        }
-        if constraints.is_empty() {
-            return Ok(None);
-        }
-        let rule = StructuredPermissionRule {
-            subject: self.subject.clone(),
-            executor: self.executor.clone(),
-            resources: constraints,
-            arguments: PermissionArgumentConstraint::Unconstrained,
-            lifetime: lifetime.clone(),
-            effect: StructuredPermissionEffect::Allow,
-            family: family.flatten(),
-        };
-        for (index, grant) in rows.iter().enumerate() {
-            if grant.is_some()
-                && !permission_rule_covers_resource(&rule, self, &self.resources[index])
-            {
+            let rule = StructuredPermissionRule {
+                subject: self.subject.clone(),
+                executor: self.executor.clone(),
+                resources,
+                arguments: PermissionArgumentConstraint::Unconstrained,
+                lifetime: lifetime.clone(),
+                effect: StructuredPermissionEffect::Allow,
+                family: option.rule.family,
+            };
+            if !permission_rule_covers_resource(&rule, self, &self.resources[index]) {
                 return Err(ComposedAnswerError::Uncovered);
             }
+            rules.push(rule);
         }
-        Ok(Some(rule))
+        Ok(rules)
+    }
+
+    /// Whether a row's grant would add nothing to what already covers it.
+    ///
+    /// Coverage that expires sooner than the lifetime being granted is not
+    /// enough: answering for the project on a row only a conversation rule
+    /// covers has to file, or the authority disappears with the session. The
+    /// builtin allowlist is never enough either, because it is a defeasible
+    /// default consulted only where no rule speaks, not a rule.
+    ///
+    /// Past that a row is redundant only if it reaches no further than the
+    /// coverage. Pinning the reviewed command cannot, and neither can naming
+    /// the pattern already stored, but widening to any other pattern reaches
+    /// commands this prompt is not about.
+    fn row_adds_nothing(
+        &self,
+        index: usize,
+        grant: &PermissionRowGrant,
+        lifetime: &PermissionLifetime,
+    ) -> bool {
+        let Some(coverage) = self
+            .presentation
+            .resources
+            .get(index)
+            .and_then(|shown| shown.coverage.as_ref())
+        else {
+            return false;
+        };
+        if coverage
+            .origin
+            .durability()
+            .is_none_or(|held| lifetime_rank(&held) < lifetime_rank(lifetime))
+        {
+            return false;
+        }
+        match grant {
+            PermissionRowGrant::Offered(id) => self
+                .options
+                .iter()
+                .find(|option| option.id == *id)
+                .and_then(|option| option.group.as_ref())
+                .is_some_and(|group| {
+                    group.value == EXACT_COMMAND_CHIP || group.value == coverage.authority
+                }),
+            PermissionRowGrant::Written(pattern) => *pattern == coverage.authority,
+        }
     }
 
     /// The option one row's grant rides on, and the constraints it names.
@@ -4326,11 +4388,12 @@ mod tests {
     fn composed(
         request: &PermissionRequest,
         rows: Vec<Option<PermissionRowGrant>>,
-    ) -> Result<Option<StructuredPermissionRule>, ComposedAnswerError> {
-        request.composed_rule(&rows, &PermissionLifetime::Conversation)
+    ) -> Result<Vec<StructuredPermissionRule>, ComposedAnswerError> {
+        request.composed_rules(&rows, &PermissionLifetime::Conversation)
     }
 
     const SHARED_PATTERN_COMMANDS: [&str; 2] = ["git status --short", "git status --porcelain"];
+    const BUILTIN_ALLOW_AUTHORITY: &str = "echo *";
 
     /// Two commands one pattern reaches, which is how a pipeline that greps
     /// twice arrives at the prompt.
@@ -4401,6 +4464,148 @@ mod tests {
         );
     }
 
+    fn covered_at(
+        request: &mut PermissionRequest,
+        index: usize,
+        origin: RuleOrigin,
+        authority: &str,
+    ) {
+        request.presentation.resources[index].coverage = Some(ResourceCoverage {
+            origin,
+            authority: authority.into(),
+        });
+    }
+
+    /// Two rows reaching the same pattern once produced one rule holding the
+    /// same constraint twice; as separate rules they would be twins that a
+    /// single revoke could not remove together.
+    #[test]
+    fn rows_that_reach_each_other_file_one_rule() {
+        let request = twin_command_request();
+
+        let rules = composed(
+            &request,
+            vec![offered("command_pattern_0"), offered("command_pattern_1")],
+        )
+        .unwrap();
+
+        assert_eq!(rules.len(), 1);
+        assert!(
+            request
+                .resources
+                .iter()
+                .all(|resource| permission_rule_covers_resource(&rules[0], &request, resource))
+        );
+    }
+
+    /// Each surviving row is a rule of its own, so one command can be revoked
+    /// without touching the others.
+    #[test]
+    fn every_surviving_row_files_a_rule_of_its_own() {
+        let request = two_command_request();
+
+        let rules = composed(
+            &request,
+            vec![offered("command_exact_0"), offered("command_exact_1")],
+        )
+        .unwrap();
+
+        assert_eq!(rules.len(), 2);
+        for (index, rule) in rules.iter().enumerate() {
+            assert_eq!(rule.resources.len(), 1);
+            assert!(permission_rule_covers_resource(
+                rule,
+                &request,
+                &request.resources[index]
+            ));
+            assert!(!permission_rule_covers_resource(
+                rule,
+                &request,
+                &request.resources[1 - index]
+            ));
+        }
+    }
+
+    /// Re-granting what is already covered as durably files nothing, which is
+    /// what keeps the inventory free of rules that change no decision.
+    #[test]
+    fn a_row_already_covered_as_durably_files_nothing() {
+        let mut request = two_command_request();
+        covered_at(&mut request, 0, RuleOrigin::Project, NARROW_ALLOW);
+        let rows = vec![offered("command_exact_0"), None];
+
+        assert_eq!(
+            request.composed_rules(&rows, &PermissionLifetime::Project),
+            Ok(Vec::new())
+        );
+        assert_eq!(
+            request
+                .composed_rules(&rows, &PermissionLifetime::Conversation)
+                .map(|rules| rules.len()),
+            Ok(0)
+        );
+    }
+
+    /// Coverage that expires sooner than the grant is not enough: pruning there
+    /// would drop the grant and let the authority disappear with the session.
+    #[test]
+    fn a_row_covered_less_durably_than_the_grant_still_files() {
+        let mut request = two_command_request();
+        covered_at(&mut request, 0, RuleOrigin::Conversation, NARROW_ALLOW);
+        let rows = vec![offered("command_exact_0"), None];
+
+        assert_eq!(
+            request
+                .composed_rules(&rows, &PermissionLifetime::Project)
+                .map(|rules| rules.len()),
+            Ok(1)
+        );
+    }
+
+    /// The builtin allowlist is a default consulted only where no rule speaks,
+    /// so a grant over it is a real grant however durable it looks.
+    #[test]
+    fn a_row_covered_only_by_the_builtin_allowlist_still_files() {
+        let mut request = two_command_request();
+        covered_at(
+            &mut request,
+            0,
+            RuleOrigin::Builtin,
+            BUILTIN_ALLOW_AUTHORITY,
+        );
+        let rows = vec![offered("command_exact_0"), None];
+
+        assert_eq!(
+            request
+                .composed_rules(&rows, &PermissionLifetime::Global)
+                .map(|rules| rules.len()),
+            Ok(1)
+        );
+    }
+
+    /// Widening a covered row reaches commands the coverage may not, so it is
+    /// a real grant even though this command was already allowed.
+    #[test]
+    fn widening_a_covered_row_still_files() {
+        let mut request = two_command_request();
+        covered_at(&mut request, 0, RuleOrigin::Project, EXACT_COMMAND_CHIP);
+        let rows = vec![offered("command_pattern_0"), None];
+
+        assert_eq!(
+            request
+                .composed_rules(&rows, &PermissionLifetime::Project)
+                .map(|rules| rules.len()),
+            Ok(1)
+        );
+
+        covered_at(&mut request, 0, RuleOrigin::Project, NARROW_ALLOW);
+        assert_eq!(
+            request.composed_rules(&rows, &PermissionLifetime::Project),
+            Ok(Vec::new()),
+            "naming the stored pattern reaches no further than it does"
+        );
+    }
+
     /// A pattern typed for one row still reaches the other, so it subsumes the
     /// same way an offered rung does.
     #[test]
@@ -4419,37 +4624,37 @@ mod tests {
     #[test]
     fn a_composed_answer_keeps_each_row_at_the_breadth_it_chose() {
         let request = two_command_request();
-        let rule = composed(
+        let rules = composed(
             &request,
             vec![
                 Some(PermissionRowGrant::Offered("command_pattern_0".into())),
                 Some(PermissionRowGrant::Offered("command_exact_1".into())),
             ],
         )
-        .unwrap()
         .unwrap();
 
+        assert_eq!(rules.len(), 2);
+        assert!(
+            rules
+                .iter()
+                .all(|rule| matches!(rule.arguments, PermissionArgumentConstraint::Unconstrained))
+        );
         assert!(matches!(
-            rule.arguments,
-            PermissionArgumentConstraint::Unconstrained
-        ));
-        assert!(matches!(
-            &rule.resources[0].selector,
+            &rules[0].resources[0].selector,
             PermissionResourceSelector::CommandPattern { pattern } if pattern == "git status *"
         ));
         assert_eq!(
-            rule.resources[1].selector,
+            rules[1].resources[0].selector,
             resource_constraint(&request.resources[1]).selector
         );
-        assert!(permission_rule_covers_request(&rule, &request));
         // The widened row reaches beyond what was reviewed; the pinned one does not.
         assert!(permission_rule_covers_resource(
-            &rule,
+            &rules[0],
             &request,
             &command_resource("git status --porcelain", "/project")
         ));
         assert!(!permission_rule_covers_resource(
-            &rule,
+            &rules[1],
             &request,
             &command_resource("cargo test --lib", "/project")
         ));
@@ -4461,45 +4666,44 @@ mod tests {
     #[test]
     fn a_row_left_ungranted_is_absent_from_the_stored_rule() {
         let request = two_command_request();
-        let rule = composed(
+        let rules = composed(
             &request,
             vec![
                 Some(PermissionRowGrant::Offered("command_exact_0".into())),
                 None,
             ],
         )
-        .unwrap()
         .unwrap();
 
-        assert_eq!(rule.resources.len(), 1);
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].resources.len(), 1);
         assert!(permission_rule_covers_resource(
-            &rule,
+            &rules[0],
             &request,
             &request.resources[0]
         ));
         assert!(!permission_rule_covers_resource(
-            &rule,
+            &rules[0],
             &request,
             &request.resources[1]
         ));
-        assert_eq!(composed(&request, vec![None, None]), Ok(None));
+        assert_eq!(composed(&request, vec![None, None]), Ok(Vec::new()));
     }
 
     #[test]
     fn a_written_pattern_is_admitted_only_against_its_own_command() {
         let request = two_command_request();
-        let rule = composed(
+        let rules = composed(
             &request,
             vec![
                 None,
                 Some(PermissionRowGrant::Written("cargo test *".into())),
             ],
         )
-        .unwrap()
         .unwrap();
 
         assert!(matches!(
-            &rule.resources[0].selector,
+            &rules[0].resources[0].selector,
             PermissionResourceSelector::CommandPattern { pattern } if pattern == "cargo test *"
         ));
         assert_eq!(
@@ -4560,11 +4764,11 @@ mod tests {
 
         assert!(
             request
-                .composed_rule(&rows, &PermissionLifetime::Conversation)
+                .composed_rules(&rows, &PermissionLifetime::Conversation)
                 .is_ok()
         );
         assert_eq!(
-            request.composed_rule(&rows, &PermissionLifetime::Project),
+            request.composed_rules(&rows, &PermissionLifetime::Project),
             Err(ComposedAnswerError::LifetimeWithdrawn(
                 "command_exact_1".into()
             ))
