@@ -15,7 +15,7 @@ use caudra_agent::prompt::profile::PromptProfileCatalog;
 use caudra_agent::prompt::profile::SystemPromptProfile;
 use caudra_agent::{
     AgentConfig, CancelMap, CancelToken, Envelope, HistorySnapshot, McpCommand, McpConfigErrors,
-    McpHandle, McpSnapshotReader, SessionMailbox, SharedHistory, SubagentHistoryStore,
+    McpHandle, McpSnapshotReader, Nudge, SessionMailbox, SharedHistory, SubagentHistoryStore,
     ToolOutputLines,
 };
 use caudra_config::ModelPolicy;
@@ -53,9 +53,15 @@ pub(crate) struct BtwPrompt {
 pub(crate) type SharedBtwPrompt = Arc<ArcSwap<BtwPrompt>>;
 
 pub(crate) enum AgentCommand {
-    Cancel { run_id: u64 },
+    Cancel {
+        run_id: u64,
+    },
     CancelAll,
-    CancelSubagent { tool_use_id: String },
+    CancelSubagent {
+        tool_use_id: String,
+    },
+    /// Stop waiting out a retry backoff and try again now.
+    RetryNow,
 }
 
 /// Input channels (`cmd_tx`, `answer_tx`, `queue`) are per-agent, so an old
@@ -313,6 +319,7 @@ fn spawn_agent_internal(
     let (init_trigger, init_cancel) = CancelToken::new();
     let cancel_map = Arc::new(new_run_cancel_map(0, init_trigger));
     let subagent_cancels: Arc<CancelMap<String>> = Arc::new(CancelMap::new());
+    let retry_now = Nudge::default();
     let mailbox = session_id
         .as_ref()
         .map(|session_id| SessionMailbox::register(session_id.id()));
@@ -321,6 +328,7 @@ fn spawn_agent_internal(
         cmd_rx,
         Arc::clone(&cancel_map),
         Arc::clone(&subagent_cancels),
+        retry_now.clone(),
     );
 
     let agent_loop = AgentLoop::new(
@@ -337,6 +345,7 @@ fn spawn_agent_internal(
         answer_rx,
         queue_rx,
         cancel_map,
+        retry_now,
         init_cancel,
         session_id,
         mailbox.clone(),

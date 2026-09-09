@@ -22,6 +22,9 @@ use caudra_agent::GoalSnapshot;
 const TRUNCATE_PREFIX: &str = "..";
 const CWD_MODEL_SEPARATOR: &str = "  ";
 const BACK_TO_MAIN_LABEL: &str = "[< Main]";
+/// Replaces the countdown under the pointer: the control has to say what a
+/// click does, and the seconds left stop mattering once you mean to skip them.
+const RETRY_NOW_LABEL: &str = " · retry now";
 const FAST_LABEL: &str = " [fast]";
 const WORKFLOW_LABEL: &str = " [workflow]";
 const WORKFLOW_SHORT_LABEL: &str = " [wf]";
@@ -59,6 +62,7 @@ pub enum StatusBarHitTarget {
     Goal,
     Context,
     Usage,
+    Retry,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -490,20 +494,30 @@ impl StatusBar {
             (offset, width)
         });
 
-        if let Some(retry) = ctx.retry_info {
-            let secs = retry
-                .deadline
-                .saturating_duration_since(Instant::now())
-                .as_secs();
+        let retry_hit = ctx.retry_info.map(|retry| {
+            let hovered = ctx.hovered == Some(StatusBarHitTarget::Retry);
+            let countdown = if hovered {
+                RETRY_NOW_LABEL.to_owned()
+            } else {
+                let secs = retry
+                    .deadline
+                    .saturating_duration_since(Instant::now())
+                    .as_secs();
+                format!(" · retrying in {secs}s (#{})", retry.attempt)
+            };
+            let offset = left_spans.iter().map(Span::width).sum::<usize>() + " ".width();
+            let width = retry.message.width() + countdown.width();
+            left_spans.push(Span::raw(" "));
             left_spans.push(Span::styled(
-                format!(" {}", retry.message),
-                theme::current().status_retry_error,
+                retry.message.clone(),
+                hover_style(theme::current().status_retry_error, hovered),
             ));
             left_spans.push(Span::styled(
-                format!(" · retrying in {secs}s (#{})", retry.attempt),
-                theme::current().status_retry_info,
+                countdown,
+                hover_style(theme::current().status_retry_info, hovered),
             ));
-        }
+            (offset, width)
+        });
 
         let mut right_spans = Vec::new();
         let mut right_hits = Vec::new();
@@ -574,6 +588,16 @@ impl StatusBar {
                 width,
                 ctx.settings_clickable,
                 StatusBarHitTarget::Goal,
+            );
+        }
+        if let Some((offset, width)) = retry_hit {
+            push_hit(
+                &mut hits,
+                left_area,
+                offset,
+                width,
+                true,
+                StatusBarHitTarget::Retry,
             );
         }
         hits
@@ -939,6 +963,14 @@ mod tests {
     const SIGMA: char = '\u{03a3}';
     const GOAL_CONDITION: &str = "all focused tests pass";
     const GOAL_CHIP_PREFIX: &str = "[goal \u{b7}";
+    const RETRY_MESSAGE: &str = "Rate limited: rate_limit_error";
+    const RETRY_ATTEMPT: u32 = 3;
+    const RETRY_REMAINING: Duration = Duration::from_secs(9);
+    /// Asserted without the seconds: the deadline ticks down between
+    /// construction and render, so the digit is not the test's business.
+    const RETRY_COUNTDOWN_PREFIX: &str = "retrying in";
+    const RETRY_ATTEMPT_MARK: &str = "(#3)";
+    const MISSING_RETRY_HIT_MSG: &str = "a visible retry countdown must be clickable";
 
     fn active_goal() -> GoalSnapshot {
         caudra_agent::GoalHandle::default()
@@ -946,15 +978,45 @@ mod tests {
             .unwrap()
     }
 
-    fn render_at(
+    /// Everything the bar's tests vary, defaulting to a plain idle bar at
+    /// `BAR_WIDTH`, so each test names only what it actually exercises.
+    struct Fixture<'a> {
         width: u16,
         global_cost: Option<f64>,
         show_global: bool,
         yolo: bool,
         hovered: Option<StatusBarHitTarget>,
-        hover_hint: Option<&str>,
-        goal: Option<&GoalSnapshot>,
-    ) -> (String, Vec<StatusBarHit>, Vec<Style>) {
+        hover_hint: Option<&'a str>,
+        goal: Option<&'a GoalSnapshot>,
+        retry_info: Option<&'a RetryInfo>,
+    }
+
+    impl Default for Fixture<'_> {
+        fn default() -> Self {
+            Self {
+                width: BAR_WIDTH,
+                global_cost: None,
+                show_global: false,
+                yolo: false,
+                hovered: None,
+                hover_hint: None,
+                goal: None,
+                retry_info: None,
+            }
+        }
+    }
+
+    fn render_at(fixture: Fixture<'_>) -> (String, Vec<StatusBarHit>, Vec<Style>) {
+        let Fixture {
+            width,
+            global_cost,
+            show_global,
+            yolo,
+            hovered,
+            hover_hint,
+            goal,
+            retry_info,
+        } = fixture;
         let bar = StatusBar::new(FLASH_TTL);
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 1)).unwrap();
@@ -975,7 +1037,7 @@ mod tests {
             auto_scroll: true,
             chat_name: None,
             back_to_main: false,
-            retry_info: None,
+            retry_info,
             thinking: Some(THINKING_LEVEL.into()),
             fast: false,
             workflow: false,
@@ -1001,7 +1063,13 @@ mod tests {
     }
 
     fn render(global_cost: Option<f64>, show_global: bool, yolo: bool) -> String {
-        render_at(BAR_WIDTH, global_cost, show_global, yolo, None, None, None).0
+        render_at(Fixture {
+            global_cost,
+            show_global,
+            yolo,
+            ..Default::default()
+        })
+        .0
     }
 
     /// Every flag on, a long model id and a real path: the widest the bar ever
@@ -1295,15 +1363,14 @@ mod tests {
     #[test_case(BAR_WIDTH ; "wide")]
     fn status_hits_stay_inside_the_rendered_area(width: u16) {
         let goal = active_goal();
-        let (_, hits, _) = render_at(
+        let (_, hits, _) = render_at(Fixture {
             width,
-            Some(SESSION_COST),
-            true,
-            true,
-            None,
-            None,
-            Some(&goal),
-        );
+            global_cost: Some(SESSION_COST),
+            show_global: true,
+            yolo: true,
+            goal: Some(&goal),
+            ..Default::default()
+        });
         let area = Rect::new(0, 0, width, 1);
         assert!(hits.iter().all(|hit| {
             hit.area.width > 0
@@ -1314,7 +1381,10 @@ mod tests {
 
     #[test]
     fn compact_status_preserves_mode_control() {
-        let (_, hits, _) = render_at(20, None, false, false, None, None, None);
+        let (_, hits, _) = render_at(Fixture {
+            width: 20,
+            ..Default::default()
+        });
         assert!(
             hits.iter()
                 .any(|hit| hit.target == StatusBarHitTarget::Mode)
@@ -1324,7 +1394,10 @@ mod tests {
     #[test]
     fn wide_status_exposes_all_main_controls() {
         let goal = active_goal();
-        let (_, hits, _) = render_at(BAR_WIDTH, None, false, false, None, None, Some(&goal));
+        let (_, hits, _) = render_at(Fixture {
+            goal: Some(&goal),
+            ..Default::default()
+        });
         for target in [
             StatusBarHitTarget::Mode,
             StatusBarHitTarget::Model,
@@ -1354,15 +1427,11 @@ mod tests {
             StatusBarHitTarget::Context,
             StatusBarHitTarget::Usage,
         ] {
-            let (_, hits, styles) = render_at(
-                BAR_WIDTH,
-                None,
-                false,
-                false,
-                Some(target),
-                None,
-                Some(&goal),
-            );
+            let (_, hits, styles) = render_at(Fixture {
+                hovered: Some(target),
+                goal: Some(&goal),
+                ..Default::default()
+            });
             let hit = hits.iter().find(|hit| hit.target == target).unwrap();
             let start = usize::from(hit.area.x);
             let end = usize::from(hit.area.right());
@@ -1379,7 +1448,10 @@ mod tests {
     #[test]
     fn hovered_url_replaces_status_content() {
         const URL: &str = "https://example.com/docs";
-        let (text, hits, _) = render_at(BAR_WIDTH, None, false, false, None, Some(URL), None);
+        let (text, hits, _) = render_at(Fixture {
+            hover_hint: Some(URL),
+            ..Default::default()
+        });
 
         assert!(text.trim_start().starts_with(URL));
         assert!(hits.is_empty());
@@ -1391,7 +1463,10 @@ mod tests {
     #[test]
     fn goal_chip_hit_covers_the_chip_alone() {
         let goal = active_goal();
-        let (text, hits, _) = render_at(BAR_WIDTH, None, false, false, None, None, Some(&goal));
+        let (text, hits, _) = render_at(Fixture {
+            goal: Some(&goal),
+            ..Default::default()
+        });
         let hit = hits
             .iter()
             .find(|hit| hit.target == StatusBarHitTarget::Goal)
@@ -1409,7 +1484,7 @@ mod tests {
 
     #[test]
     fn a_session_without_a_goal_has_no_goal_control() {
-        let (text, hits, _) = render_at(BAR_WIDTH, None, false, false, None, None, None);
+        let (text, hits, _) = render_at(Fixture::default());
 
         assert!(!text.contains(GOAL_CHIP_PREFIX));
         assert!(
@@ -1536,5 +1611,66 @@ mod tests {
         bar.flash("Copied".into());
         bar.clear_flash();
         assert!(bar.flash.is_none());
+    }
+
+    fn render_retry(hovered: bool) -> (String, Vec<StatusBarHit>, Vec<Style>) {
+        let retry = RetryInfo {
+            attempt: RETRY_ATTEMPT,
+            message: RETRY_MESSAGE.into(),
+            deadline: Instant::now() + RETRY_REMAINING,
+        };
+        render_at(Fixture {
+            hovered: hovered.then_some(StatusBarHitTarget::Retry),
+            retry_info: Some(&retry),
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn a_retry_countdown_is_clickable() {
+        let (text, hits, _) = render_retry(false);
+        assert!(text.contains(RETRY_MESSAGE));
+        assert!(text.contains(RETRY_COUNTDOWN_PREFIX));
+        assert!(text.contains(RETRY_ATTEMPT_MARK));
+        assert!(!text.contains(RETRY_NOW_LABEL.trim()));
+        hits.iter()
+            .find(|hit| hit.target == StatusBarHitTarget::Retry)
+            .expect(MISSING_RETRY_HIT_MSG);
+    }
+
+    /// The countdown is the only thing that changes: the error keeps saying
+    /// what went wrong while the chip says what the click will do.
+    #[test]
+    fn hovering_a_retry_offers_to_retry_now() {
+        let (text, _, _) = render_retry(true);
+        assert!(text.contains(RETRY_MESSAGE));
+        assert!(text.contains(RETRY_NOW_LABEL.trim()));
+        assert!(!text.contains(RETRY_COUNTDOWN_PREFIX));
+    }
+
+    #[test]
+    fn hovering_a_retry_highlights_the_whole_control() {
+        let (_, hits, styles) = render_retry(true);
+        let hit = hits
+            .iter()
+            .find(|hit| hit.target == StatusBarHitTarget::Retry)
+            .expect(MISSING_RETRY_HIT_MSG);
+        let start = usize::from(hit.area.x);
+        let end = usize::from(hit.area.right());
+        assert!(!styles[start - 1].add_modifier.contains(Modifier::REVERSED));
+        assert!(
+            styles[start..end]
+                .iter()
+                .all(|style| style.add_modifier.contains(Modifier::REVERSED))
+        );
+    }
+
+    #[test]
+    fn no_retry_means_no_retry_hit() {
+        let (_, hits, _) = render_at(Fixture::default());
+        assert!(
+            hits.iter()
+                .all(|hit| hit.target != StatusBarHitTarget::Retry)
+        );
     }
 }

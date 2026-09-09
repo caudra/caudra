@@ -1,5 +1,6 @@
 use std::time::{Duration, Instant};
 
+use crate::agent::AgentCommand;
 use crate::clipboard::CopyResult;
 use crate::components::Overlay;
 use crate::components::input::InputHit;
@@ -771,6 +772,17 @@ impl App {
             StatusBarHitTarget::Usage if self.is_main_chat() => {
                 self.clear_control_hovers();
                 self.toggle_usage_modal()
+            }
+            // The countdown is cleared here rather than left to the next event:
+            // the agent may spend a moment on the request, and a chip stuck at
+            // "retrying in 0s" reads like the click missed.
+            StatusBarHitTarget::Retry => {
+                self.clear_control_hovers();
+                self.retry_info = None;
+                if let Some(cmd_tx) = &self.cmd_tx {
+                    let _ = cmd_tx.try_send(AgentCommand::RetryNow);
+                }
+                Vec::new()
             }
             _ => Vec::new(),
         }

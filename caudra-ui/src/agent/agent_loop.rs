@@ -21,8 +21,8 @@ use caudra_agent::tools::{
 use caudra_agent::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentParams, AgentRunParams, CancelMap,
     CancelToken, CancelTrigger, DoneReason, Envelope, EventSender, GoalHandle, History,
-    Instructions, McpCommand, PromptRole, SessionMailbox, SharedHistory, SubagentHistoryStore,
-    ToolOutputLines,
+    Instructions, McpCommand, Nudge, PromptRole, SessionMailbox, SharedHistory,
+    SubagentHistoryStore, ToolOutputLines,
 };
 use caudra_config::ModelPolicy;
 use caudra_lua::EventHandle;
@@ -53,6 +53,7 @@ pub(super) struct AgentLoop {
     context_system: String,
     context_options: RequestOptions,
     cancel_map: Arc<RunCancelMap>,
+    retry_now: Nudge,
     init_cancel: CancelToken,
     permissions: Arc<PermissionManager>,
     file_tracker: Arc<FileReadTracker>,
@@ -89,6 +90,7 @@ impl AgentLoop {
         answer_rx: flume::Receiver<String>,
         queue: Arc<QueueReceiver>,
         cancel_map: Arc<RunCancelMap>,
+        retry_now: Nudge,
         init_cancel: CancelToken,
         session_id: Option<SessionRef>,
         mailbox: Option<SessionMailbox>,
@@ -129,6 +131,7 @@ impl AgentLoop {
             context_system: String::new(),
             context_options: RequestOptions::default(),
             cancel_map,
+            retry_now,
             init_cancel,
             permissions,
             file_tracker: FileReadTracker::fresh(),
@@ -485,6 +488,7 @@ impl AgentLoop {
         .with_user_response_rx(Arc::clone(&self.answer_rx))
         .with_interrupt_source(Arc::clone(&self.queue) as Arc<dyn caudra_agent::InterruptSource>)
         .with_cancel(cancel)
+        .with_retry_now(self.retry_now.clone())
         .with_goal(self.goal.clone())
         .with_mcp(self.mcp.clone());
 

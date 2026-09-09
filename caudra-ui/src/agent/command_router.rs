@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use caudra_agent::CancelMap;
+use caudra_agent::{CancelMap, Nudge};
 
 use super::AgentCommand;
 use super::cancel_map::RunCancelMap;
@@ -9,6 +9,7 @@ pub(super) fn spawn_command_router(
     cmd_rx: flume::Receiver<AgentCommand>,
     cancel_map: Arc<RunCancelMap>,
     subagent_cancels: Arc<CancelMap<String>>,
+    retry_now: Nudge,
 ) {
     smol::spawn(async move {
         while let Ok(cmd) = cmd_rx.recv_async().await {
@@ -23,6 +24,7 @@ pub(super) fn spawn_command_router(
                 AgentCommand::CancelSubagent { tool_use_id } => {
                     subagent_cancels.cancel_or_precancel(tool_use_id);
                 }
+                AgentCommand::RetryNow => retry_now.notify(),
             }
         }
     })

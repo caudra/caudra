@@ -31,6 +31,7 @@ use crate::context::{
     ContextSnapshot,
 };
 use crate::mcp::{McpRequestSnapshot, McpSession};
+use crate::nudge::Nudge;
 use crate::permissions::PermissionManager;
 use crate::tools::{Deadline, FileReadTracker, LocalTools, PathLocks, ToolAudience, ToolContext};
 use crate::tools::{DeferralSession, DeferredTool};
@@ -152,6 +153,7 @@ pub struct Agent<'h> {
     user_response_rx: Option<Arc<async_lock::Mutex<flume::Receiver<String>>>>,
     interrupt_source: Option<Arc<dyn InterruptSource>>,
     cancel: CancelToken,
+    retry_now: Nudge,
     total_usage: TokenUsage,
     context_size: u32,
     num_turns: u32,
@@ -218,6 +220,7 @@ impl<'h> Agent<'h> {
             user_response_rx: None,
             interrupt_source: None,
             cancel: CancelToken::none(),
+            retry_now: Nudge::default(),
             total_usage: TokenUsage::default(),
             context_size: 0,
             num_turns: 0,
@@ -274,6 +277,12 @@ impl<'h> Agent<'h> {
 
     pub fn with_cancel(mut self, cancel: CancelToken) -> Self {
         self.cancel = cancel;
+        self
+    }
+
+    /// Lets a waiting retry be cut short from outside the loop.
+    pub fn with_retry_now(mut self, retry_now: Nudge) -> Self {
+        self.retry_now = retry_now;
         self
     }
 
@@ -670,6 +679,7 @@ impl<'h> Agent<'h> {
                 tools.as_ref(),
                 &self.event_tx,
                 &self.cancel,
+                &self.retry_now,
                 self.opts.clone(),
                 self.session_id.as_ref(),
             )
@@ -1201,6 +1211,7 @@ impl<'h> Agent<'h> {
             self.history,
             &self.event_tx,
             &self.cancel,
+            &self.retry_now,
             &self.config,
         )
         .await?;
@@ -3044,6 +3055,60 @@ mod tests {
             assert_eq!(attempt, 1);
             assert_eq!(delay_ms, RETRY_AFTER.as_millis() as u64);
             assert_eq!(message, EXPECTED);
+        });
+    }
+
+    /// A nudge cuts the backoff short. Without it the second attempt waits out
+    /// the provider's full window, so reaching attempt two at all is the proof.
+    #[test]
+    fn a_nudge_retries_without_waiting_out_the_backoff() {
+        const LONG_WAIT: Duration = Duration::from_secs(60);
+        const GENEROUS_BOUND: Duration = Duration::from_secs(10);
+        const FIRST: u32 = 1;
+        const SECOND: u32 = 2;
+        smol::block_on(async {
+            let (trigger, cancel) = CancelToken::new();
+            let retry_now = Nudge::default();
+            let provider = StubStreamProvider {
+                fail_status: Some(429),
+                fail_retry_after: Some(LONG_WAIT),
+                ..Default::default()
+            };
+            let mut history = History::new(Vec::new());
+            let (agent, event_rx) = make_agent(provider, &mut history);
+            let mut agent = agent.with_cancel(cancel).with_retry_now(retry_now.clone());
+
+            let attempts = Arc::new(Mutex::new(Vec::new()));
+            let pump = smol::spawn({
+                let attempts = Arc::clone(&attempts);
+                let mut trigger = Some(trigger);
+                async move {
+                    while let Ok(envelope) = event_rx.recv_async().await {
+                        let AgentEvent::Retry { attempt, .. } = envelope.event else {
+                            continue;
+                        };
+                        attempts.lock().unwrap().push(attempt);
+                        match attempt {
+                            FIRST => retry_now.notify(),
+                            _ => drop(trigger.take()),
+                        }
+                    }
+                }
+            });
+
+            let started = Instant::now();
+            assert_eq!(
+                agent.run(default_input()).await.unwrap(),
+                DoneReason::Cancelled
+            );
+            drop(agent);
+            pump.await;
+
+            assert_eq!(*attempts.lock().unwrap(), vec![FIRST, SECOND]);
+            assert!(
+                started.elapsed() < GENEROUS_BOUND,
+                "the nudge must not wait out the provider's window"
+            );
         });
     }
 

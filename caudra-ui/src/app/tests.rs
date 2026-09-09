@@ -8729,6 +8729,60 @@ fn retry_clears_in_progress_tools() {
     assert!(app.retry_info.is_some());
 }
 
+/// The countdown is a control, not just a label: clicking it asks the agent to
+/// stop waiting, and the chip goes away so the click visibly landed.
+#[test]
+fn clicking_the_retry_countdown_asks_for_an_immediate_retry() {
+    const RETRY_DELAY_MS: u64 = 30_000;
+    let mut app = test_app();
+    let (cmd_tx, cmd_rx) = flume::unbounded();
+    app.cmd_tx = Some(cmd_tx);
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    app.update(agent_msg(AgentEvent::Retry {
+        attempt: 2,
+        message: "Rate limited".into(),
+        delay_ms: RETRY_DELAY_MS,
+    }));
+
+    assert!(click_status(&mut app, StatusBarHitTarget::Retry).is_empty());
+
+    assert!(app.retry_info.is_none());
+    assert!(matches!(
+        cmd_rx.try_recv(),
+        Ok(crate::agent::AgentCommand::RetryNow)
+    ));
+}
+
+#[test]
+fn hovering_the_retry_countdown_marks_it_hovered() {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    app.update(agent_msg(AgentEvent::Retry {
+        attempt: 1,
+        message: "Rate limited".into(),
+        delay_ms: 1_000,
+    }));
+    let hit = status_hit(&mut app, StatusBarHitTarget::Retry);
+
+    app.update(mouse_event(MouseEventKind::Moved, hit.area.x, hit.area.y));
+
+    assert_eq!(app.status_hover, Some(StatusBarHitTarget::Retry));
+}
+
+/// Nothing is waiting, so there is nothing to cut short.
+#[test]
+fn an_idle_bar_has_no_retry_control() {
+    let mut app = test_app();
+    let _ = rendered(&mut app);
+    assert!(
+        app.status_hits
+            .iter()
+            .all(|hit| hit.target != StatusBarHitTarget::Retry)
+    );
+}
+
 #[test]
 fn retry_clears_subagent_in_progress_tools() {
     let mut app = test_app();

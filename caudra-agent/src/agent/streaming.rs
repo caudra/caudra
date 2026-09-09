@@ -16,6 +16,7 @@ use super::tool_body::BodyStream;
 use super::tool_preview;
 use super::tool_roster::RosterStream;
 use crate::cancel::CancelToken;
+use crate::nudge::Nudge;
 use crate::tools::native::batch;
 use crate::types::BatchToolEntry;
 use crate::{AgentError, AgentEvent, EventSender};
@@ -313,6 +314,7 @@ pub(crate) async fn stream_with_retry(
     tools: &Value,
     event_tx: &EventSender,
     cancel: &CancelToken,
+    retry_now: &Nudge,
     opts: RequestOptions,
     session_id: Option<&SessionRef>,
 ) -> Result<StreamResponse, StreamError> {
@@ -324,6 +326,7 @@ pub(crate) async fn stream_with_retry(
         tools,
         Some(event_tx),
         cancel,
+        retry_now,
         opts,
         session_id,
     )
@@ -342,7 +345,16 @@ pub(crate) async fn stream_silent_with_retry(
     session_id: Option<&SessionRef>,
 ) -> Result<StreamResponse, StreamError> {
     stream_with_retry_inner(
-        provider, messages, model, system, tools, None, cancel, opts, session_id,
+        provider,
+        messages,
+        model,
+        system,
+        tools,
+        None,
+        cancel,
+        &Nudge::default(),
+        opts,
+        session_id,
     )
     .await
 }
@@ -356,6 +368,7 @@ async fn stream_with_retry_inner(
     tools: &Value,
     event_tx: Option<&EventSender>,
     cancel: &CancelToken,
+    retry_now: &Nudge,
     opts: RequestOptions,
     session_id: Option<&SessionRef>,
 ) -> Result<StreamResponse, StreamError> {
@@ -498,13 +511,16 @@ async fn stream_with_retry_inner(
                         delay_ms,
                     })?;
                 }
-                futures_lite::future::race(
-                    async {
-                        smol::Timer::after(delay).await;
-                    },
-                    cancel.cancelled(),
-                )
-                .await;
+                let waited = async {
+                    futures_lite::future::race(
+                        async {
+                            smol::Timer::after(delay).await;
+                        },
+                        retry_now.notified(),
+                    )
+                    .await;
+                };
+                futures_lite::future::race(waited, cancel.cancelled()).await;
                 if cancel.is_cancelled() {
                     return Err(StreamError::Cancelled {
                         streamed: String::new(),

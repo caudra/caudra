@@ -15,6 +15,7 @@ use super::history::{History, is_user_turn, remove_orphaned_tool_results, repair
 use super::run::estimate_message_tokens;
 use super::streaming::{StreamError, stream_with_retry};
 use crate::cancel::CancelToken;
+use crate::nudge::Nudge;
 use crate::{AgentError, AgentEvent, DoneReason, EventSender, TurnCompleteEvent};
 
 const CONTINUE_AFTER_COMPACT: &str = "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed. If the summary contains a todo list, restore it with todo_write and keep it updated. If you learned important project context during this session, consider saving it to memory before it's lost.";
@@ -46,6 +47,7 @@ pub(super) async fn compact_history(
     history: &mut History,
     event_tx: &EventSender,
     cancel: &CancelToken,
+    retry_now: &Nudge,
     config: &AgentConfig,
 ) -> Result<TokenUsage, AgentError> {
     let compact_start = std::time::Instant::now();
@@ -73,6 +75,7 @@ pub(super) async fn compact_history(
             &empty_tools,
             event_tx,
             cancel,
+            retry_now,
             RequestOptions::default(),
             None,
         )
@@ -237,7 +240,16 @@ pub async fn compact(
 ) -> Result<TokenUsage, AgentError> {
     event_tx.send(AgentEvent::Compacting)?;
     let cancel = CancelToken::none();
-    let usage = compact_history(provider, model, history, event_tx, &cancel, config).await?;
+    let usage = compact_history(
+        provider,
+        model,
+        history,
+        event_tx,
+        &cancel,
+        &Nudge::default(),
+        config,
+    )
+    .await?;
     if let Some(post) = normalize(&config.post_compaction_instructions) {
         history.push(Message::synthetic(post.to_string()));
     }
@@ -783,6 +795,7 @@ mod tests {
                 &mut history,
                 &EventSender::new(raw_tx, 0),
                 &CancelToken::none(),
+                &Nudge::default(),
                 &AgentConfig::default(),
             )
             .await
@@ -1203,6 +1216,7 @@ mod tests {
                 &mut history,
                 &EventSender::new(raw_tx, 0),
                 &CancelToken::none(),
+                &Nudge::default(),
                 &AgentConfig::default(),
             )
             .await
@@ -1245,6 +1259,7 @@ mod tests {
                 &mut history,
                 &EventSender::new(raw_tx, 0),
                 &CancelToken::none(),
+                &Nudge::default(),
                 &AgentConfig::default(),
             )
             .await

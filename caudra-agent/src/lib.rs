@@ -3,6 +3,7 @@
 pub mod agent;
 pub mod cancel;
 pub mod child_guard;
+pub mod nudge;
 pub use child_guard::ChildGuard;
 pub mod headless;
 pub mod mailbox;
@@ -25,6 +26,7 @@ pub use agent::{
 pub use cancel::{CancelMap, CancelToken, CancelTrigger};
 pub use caudra_config::{AgentConfig, PermissionsConfig, ToolOutputLines};
 pub use mailbox::{MailboxError, SessionMailbox};
+pub use nudge::Nudge;
 pub mod command;
 pub mod context;
 pub mod diff;
