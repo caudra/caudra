@@ -122,29 +122,32 @@ fn builtin_rules(cwd: &Path) -> Vec<PermissionRule> {
 /// The rule turns entirely on `CONFINED_READ_ATTRIBUTE`, which the shell tool
 /// sets only after judging both halves. An opaque line never carries it, and
 /// `protected: Some(false)` refuses to cover one regardless.
-fn builtin_structured_rules() -> Vec<StructuredPermissionRule> {
-    vec![StructuredPermissionRule {
-        subject: PermissionSubject::Native {
-            owner: WORKCELL_TOOL_OWNER.into(),
-            contract: SHELL_EXECUTION_CONTRACT.into(),
+fn builtin_structured_rules() -> Vec<PolicyRule> {
+    vec![PolicyRule {
+        origin: RuleOrigin::Builtin,
+        rule: StructuredPermissionRule {
+            subject: PermissionSubject::Native {
+                owner: WORKCELL_TOOL_OWNER.into(),
+                contract: SHELL_EXECUTION_CONTRACT.into(),
+            },
+            executor: PermissionExecutorKind::Native,
+            resources: vec![PermissionResourceConstraint {
+                kind: PermissionResourceKind::Command,
+                selector: PermissionResourceSelector::Any,
+                access: Some(PermissionResourceAccess::Execute),
+                protected: Some(false),
+                attributes: BTreeMap::from([(
+                    CONFINED_READ_ATTRIBUTE.into(),
+                    PermissionResourceSelector::Exact {
+                        value: CONFINED_READ_VALUE.into(),
+                    },
+                )]),
+            }],
+            arguments: PermissionArgumentConstraint::Unconstrained,
+            lifetime: PermissionLifetime::Conversation,
+            effect: StructuredPermissionEffect::Allow,
+            family: None,
         },
-        executor: PermissionExecutorKind::Native,
-        resources: vec![PermissionResourceConstraint {
-            kind: PermissionResourceKind::Command,
-            selector: PermissionResourceSelector::Any,
-            access: Some(PermissionResourceAccess::Execute),
-            protected: Some(false),
-            attributes: BTreeMap::from([(
-                CONFINED_READ_ATTRIBUTE.into(),
-                PermissionResourceSelector::Exact {
-                    value: CONFINED_READ_VALUE.into(),
-                },
-            )]),
-        }],
-        arguments: PermissionArgumentConstraint::Unconstrained,
-        lifetime: PermissionLifetime::Conversation,
-        effect: StructuredPermissionEffect::Allow,
-        family: None,
     }]
 }
 
@@ -434,7 +437,8 @@ struct SharedPermissionState {
 /// authority covers yet that the builtin ask family names. That is not a rule
 /// demanding review, it is the absence of one, so a later grant settles it.
 struct RequestCoverage {
-    covered: Vec<bool>,
+    /// Per resource: the authority that already allows it, if any.
+    covered: Vec<Option<ResourceCoverage>>,
     must_prompt: bool,
     /// Per resource: an ask decision resolved it, covered or not.
     prompt_required: Vec<bool>,
@@ -571,7 +575,7 @@ fn rule_settles(rule: &StructuredPermissionRule, candidate: &PendingPermission) 
                         .presentation
                         .resources
                         .get(index)
-                        .is_some_and(|shown| shown.covered)
+                        .is_some_and(PermissionResourcePresentation::covered)
             })
 }
 
@@ -1120,10 +1124,14 @@ impl PermissionManager {
     /// a default rather than a rule, so it is consulted only where no rule
     /// speaks: ranking it against configured policy would let `echo hi` outrank
     /// a configured `echo *` ask purely for being the more exact text.
-    fn builtin_command_allow(resource: &PermissionResource) -> bool {
-        resource.kind == PermissionResourceKind::Command
-            && !resource.protected
-            && command_pattern::builtin_allowed(&resource.value)
+    fn builtin_command_allow(resource: &PermissionResource) -> Option<ResourceCoverage> {
+        (resource.kind == PermissionResourceKind::Command && !resource.protected)
+            .then(|| command_pattern::builtin_allow_pattern(&resource.value))
+            .flatten()
+            .map(|pattern| ResourceCoverage {
+                origin: RuleOrigin::Builtin,
+                authority: pattern.to_owned(),
+            })
     }
 
     fn builtin_command_ask(resource: &PermissionResource) -> bool {
@@ -1140,7 +1148,7 @@ impl PermissionManager {
     fn request_coverage(
         &self,
         request: &PermissionRequest,
-        structured_rules: &[StructuredPermissionRule],
+        structured_rules: &[PolicyRule],
         builtin_allows: bool,
     ) -> RequestCoverage {
         let mut must_prompt = false;
@@ -1151,8 +1159,10 @@ impl PermissionManager {
             .iter()
             .enumerate()
             .map(|(index, resource)| {
-                match permission_rules_resource_decision(structured_rules, request, resource) {
-                    StructuredPermissionDecision::Allow => true,
+                let standing =
+                    permission_rules_resource_standing(structured_rules, request, resource);
+                match standing.decision {
+                    StructuredPermissionDecision::Allow => standing.coverage,
                     // An ask withholds authority without erasing it. The
                     // resource stays covered so the prompt can say so and a
                     // later grant can sweep it.
@@ -1160,14 +1170,14 @@ impl PermissionManager {
                         must_prompt = true;
                         prompt_required[index] = true;
                         rule_ask[index] = true;
-                        structured_rules
-                            .iter()
-                            .any(|rule| permission_rule_covers_resource(rule, request, resource))
+                        standing.coverage
                     }
-                    StructuredPermissionDecision::Deny => false,
+                    StructuredPermissionDecision::Deny => None,
                     StructuredPermissionDecision::NoMatch => {
-                        let covered = builtin_allows && Self::builtin_command_allow(resource);
-                        if !covered && Self::builtin_command_ask(resource) {
+                        let covered = builtin_allows
+                            .then(|| Self::builtin_command_allow(resource))
+                            .flatten();
+                        if covered.is_none() && Self::builtin_command_ask(resource) {
                             must_prompt = true;
                             prompt_required[index] = true;
                         }
@@ -1487,15 +1497,24 @@ impl PermissionManager {
         &self,
         request: &PermissionRequest,
         include_builtin_allows: bool,
-    ) -> Vec<StructuredPermissionRule> {
+    ) -> Vec<PolicyRule> {
         let config = self.active_config_rules();
         let builtin = self.project().builtin_rules.clone();
         let plugin = self.plugin_rules.snapshot();
+        let tagged = |origin| move |rule| (origin, rule);
         config
             .iter()
-            .chain(builtin.iter().filter(|_| include_builtin_allows))
-            .chain(&plugin)
-            .filter_map(|rule| compile_configured_rule(rule, request))
+            .map(tagged(RuleOrigin::Config))
+            .chain(
+                builtin
+                    .iter()
+                    .filter(|_| include_builtin_allows)
+                    .map(tagged(RuleOrigin::Builtin)),
+            )
+            .chain(plugin.iter().map(tagged(RuleOrigin::Plugin)))
+            .filter_map(|(origin, rule)| {
+                compile_configured_rule(rule, request).map(|rule| PolicyRule { origin, rule })
+            })
             .collect()
     }
 
@@ -1509,14 +1528,14 @@ impl PermissionManager {
         request: &PermissionRequest,
         plan_scoped: bool,
         include_builtin_allows: bool,
-    ) -> Result<Vec<StructuredPermissionRule>, PermissionPolicyError> {
+    ) -> Result<Vec<PolicyRule>, PermissionPolicyError> {
         let mut rules = self.applicable_structured_rules()?;
         rules.extend(self.configured_structured_rules(request, include_builtin_allows));
         if plan_scoped {
-            rules.retain(|rule| {
-                rule.effect != StructuredPermissionEffect::Allow
+            rules.retain(|policy| {
+                policy.rule.effect != StructuredPermissionEffect::Allow
                     || matches!(
-                        rule.lifetime,
+                        policy.rule.lifetime,
                         PermissionLifetime::Once | PermissionLifetime::Conversation
                     )
             });
@@ -1524,21 +1543,28 @@ impl PermissionManager {
         Ok(rules)
     }
 
-    fn applicable_structured_rules(
-        &self,
-    ) -> Result<Vec<StructuredPermissionRule>, PermissionPolicyError> {
+    fn applicable_structured_rules(&self) -> Result<Vec<PolicyRule>, PermissionPolicyError> {
         self.ensure_conversation_policy_valid()?;
         let mut rules = builtin_structured_rules();
         rules.extend(
             self.structured_conversation_rules()
                 .iter()
                 .filter(|record| record.is_active())
-                .map(|record| record.rule.clone()),
+                .map(|record| PolicyRule {
+                    origin: RuleOrigin::Conversation,
+                    rule: record.rule.clone(),
+                }),
         );
         rules.extend(
             self.persistent_records()?
                 .into_iter()
-                .map(|record| record.rule),
+                .map(|record| PolicyRule {
+                    origin: match record.rule.lifetime {
+                        PermissionLifetime::Global => RuleOrigin::Global,
+                        _ => RuleOrigin::Project,
+                    },
+                    rule: record.rule,
+                }),
         );
         Ok(rules)
     }
@@ -1906,7 +1932,7 @@ impl PermissionManager {
             })?;
         if structured_rules
             .iter()
-            .any(|rule| permission_rule_intersects_request(rule, &full_request))
+            .any(|policy| permission_rule_intersects_request(&policy.rule, &full_request))
         {
             return Err(deny(DECISION_SOURCE_RULE, None));
         }
@@ -1918,7 +1944,7 @@ impl PermissionManager {
             .covered
             .iter()
             .zip(&full.prompt_required)
-            .all(|(covered, must_prompt)| *covered || *must_prompt);
+            .all(|(covered, must_prompt)| covered.is_some() || *must_prompt);
         let (t2, s2, force_prompt) = if all_resources_resolved {
             if !scopes.force_prompt && !full.must_prompt {
                 return allowed(DECISION_SOURCE_RULE);
@@ -1955,13 +1981,13 @@ impl PermissionManager {
             })?;
         if structured_rules
             .iter()
-            .any(|rule| permission_rule_intersects_request(rule, &request))
+            .any(|policy| permission_rule_intersects_request(&policy.rule, &request))
         {
             return Err(deny(DECISION_SOURCE_RULE, None));
         }
         let coverage = self.request_coverage(&request, &structured_rules, include_builtin_allows);
         if !scopes.force_prompt
-            && coverage.covered.iter().all(|covered| *covered)
+            && coverage.covered.iter().all(Option::is_some)
             && !coverage.must_prompt
         {
             return allowed(DECISION_SOURCE_RULE);
@@ -1984,14 +2010,14 @@ impl PermissionManager {
                 })?;
             if current_rules
                 .iter()
-                .any(|rule| permission_rule_intersects_request(rule, &request))
+                .any(|policy| permission_rule_intersects_request(&policy.rule, &request))
             {
                 return Err(deny(DECISION_SOURCE_RULE, None));
             }
             let mut coverage =
                 self.request_coverage(&request, &current_rules, include_builtin_allows);
             if !scopes.force_prompt
-                && coverage.covered.iter().all(|covered| *covered)
+                && coverage.covered.iter().all(Option::is_some)
                 && !coverage.must_prompt
             {
                 return allowed(DECISION_SOURCE_RULE);
@@ -2031,7 +2057,11 @@ impl PermissionManager {
                     coverage.must_prompt,
                 ),
                 uncovered_resource_summary(&request, &coverage.covered),
-                coverage.covered.iter().filter(|covered| !**covered).count(),
+                coverage
+                    .covered
+                    .iter()
+                    .filter(|covered| covered.is_none())
+                    .count(),
             )
         };
         // Emitted outside the pending lock: a log write must never serialize
@@ -2116,7 +2146,7 @@ impl PermissionManager {
                 })?;
             if current_rules
                 .iter()
-                .any(|rule| permission_rule_intersects_request(rule, &request))
+                .any(|policy| permission_rule_intersects_request(&policy.rule, &request))
             {
                 return Err(deny(DECISION_SOURCE_RULE, None));
             }
@@ -2125,7 +2155,7 @@ impl PermissionManager {
                     self.request_coverage(&request, &current_rules, include_builtin_allows);
                 if scopes.force_prompt
                     || coverage.must_prompt
-                    || !coverage.covered.iter().all(|covered| *covered)
+                    || !coverage.covered.iter().all(Option::is_some)
                 {
                     return Err(deny(DECISION_SOURCE_RULE, None));
                 }
@@ -2234,7 +2264,7 @@ fn contain_authority_to_the_plan(request: &mut PermissionRequest) {
 /// telling them apart would mean widening what `request_coverage` returns.
 fn prompt_forcing_reason(
     request: &PermissionRequest,
-    coverage: &[bool],
+    coverage: &[Option<ResourceCoverage>],
     forced: bool,
     ask_rule: bool,
 ) -> &'static str {
@@ -2243,7 +2273,7 @@ fn prompt_forcing_reason(
             .resources
             .iter()
             .enumerate()
-            .filter(move |(index, _)| !coverage.get(*index).copied().unwrap_or(false))
+            .filter(move |(index, _)| coverage.get(*index).is_none_or(Option::is_none))
     };
     if forced {
         PROMPT_REASON_FORCED
@@ -2260,13 +2290,16 @@ fn prompt_forcing_reason(
 
 /// Only the resources that actually forced the prompt, capped, so a chain of
 /// twenty already-approved commands does not bury the one that is new.
-fn uncovered_resource_summary(request: &PermissionRequest, coverage: &[bool]) -> String {
+fn uncovered_resource_summary(
+    request: &PermissionRequest,
+    coverage: &[Option<ResourceCoverage>],
+) -> String {
     let mut summary = String::new();
     let uncovered = request
         .resources
         .iter()
         .enumerate()
-        .filter(|(index, _)| !coverage.get(*index).copied().unwrap_or(false));
+        .filter(|(index, _)| coverage.get(*index).is_none_or(Option::is_none));
     for (count, (_, resource)) in uncovered.enumerate() {
         if count == PROMPT_LOG_MAX_RESOURCES {
             let _ = write!(summary, ", ...");
@@ -2465,7 +2498,7 @@ mod tests {
         request
             .resources
             .iter()
-            .map(|resource| permission_rules_resource_decision(&rules, request, resource))
+            .map(|resource| permission_rules_resource_standing(&rules, request, resource).decision)
             .collect()
     }
 
@@ -2476,18 +2509,32 @@ mod tests {
         manager: &PermissionManager,
         request: &PermissionRequest,
         builtin_allows: bool,
-        stored: &[StructuredPermissionRule],
+        stored: &[PolicyRule],
     ) -> RequestCoverage {
-        let mut rules = manager.configured_structured_rules(request, builtin_allows);
-        rules.extend_from_slice(stored);
+        let mut rules = stored.to_vec();
+        rules.extend(manager.configured_structured_rules(request, builtin_allows));
         manager.request_coverage(request, &rules, builtin_allows)
+    }
+
+    /// Which resources carry authority, for cases about coverage rather than
+    /// about the authority that granted it.
+    fn covered_flags(coverage: &RequestCoverage) -> Vec<bool> {
+        coverage.covered.iter().map(Option::is_some).collect()
+    }
+
+    /// A stored grant, which is what a persisted record compiles to.
+    fn stored_policy(rule: StructuredPermissionRule) -> PolicyRule {
+        PolicyRule {
+            origin: RuleOrigin::Project,
+            rule,
+        }
     }
 
     /// A call the rules settle on their own: every resource carries authority
     /// and nothing withholds it, so `enforce` returns without prompting.
     fn allows_without_prompt(manager: &PermissionManager, request: &PermissionRequest) -> bool {
         let coverage = coverage_with(manager, request, true, &[]);
-        coverage.covered.iter().all(|covered| *covered) && !coverage.must_prompt
+        coverage.covered.iter().all(Option::is_some) && !coverage.must_prompt
     }
 
     /// A restrictive rule reaching the request, which is the one answer that
@@ -2497,7 +2544,7 @@ mod tests {
             .applicable_rules_within(request, false, true)
             .unwrap()
             .iter()
-            .any(|rule| permission_rule_intersects_request(rule, request))
+            .any(|policy| permission_rule_intersects_request(&policy.rule, request))
     }
 
     /// The default effect answers what no rule spoke to, so a deny default only
@@ -2507,7 +2554,7 @@ mod tests {
             && !coverage_with(manager, request, true, &[])
                 .covered
                 .iter()
-                .all(|covered| *covered)
+                .all(Option::is_some)
     }
 
     fn allowed_by_default(manager: &PermissionManager, request: &PermissionRequest) -> bool {
@@ -2677,7 +2724,12 @@ mod tests {
             mark_confined(&mut request);
         }
 
-        coverage_with(&manager, &request, false, &builtin_structured_rules()).covered
+        covered_flags(&coverage_with(
+            &manager,
+            &request,
+            false,
+            &builtin_structured_rules(),
+        ))
     }
 
     /// Coverage is only worth anything if the manager actually consults the
@@ -2736,7 +2788,7 @@ mod tests {
         mark_confined(&mut request);
 
         let coverage = coverage_with(&manager, &request, false, &builtin_structured_rules());
-        assert_eq!(coverage.covered, vec![false]);
+        assert_eq!(covered_flags(&coverage), vec![false]);
     }
 
     /// Belt and braces. The shell tool never marks an opaque line, and an opaque
@@ -2751,7 +2803,7 @@ mod tests {
         }
 
         let coverage = coverage_with(&manager, &request, false, &builtin_structured_rules());
-        assert_eq!(coverage.covered, vec![false]);
+        assert_eq!(covered_flags(&coverage), vec![false]);
     }
 
     #[test]
@@ -2780,6 +2832,131 @@ mod tests {
         );
     }
 
+    const COVERAGE_COMMAND: &str = "git status --short";
+    const COVERAGE_PATTERN: &str = "git status *";
+    const ECHO_COMMAND: &str = "echo hi";
+    const BUILTIN_ECHO_PATTERN: &str = "echo *";
+    const THIS_COMMAND_AUTHORITY: &str = "this command";
+    const BROAD_GIT_PATTERN: &str = "git *";
+
+    fn coverage_of(
+        manager: &PermissionManager,
+        command: &str,
+        stored: &[PolicyRule],
+    ) -> Option<ResourceCoverage> {
+        let request = shell_request(&[command], workcell_shell_subject());
+        coverage_with(manager, &request, true, stored)
+            .covered
+            .swap_remove(0)
+    }
+
+    fn conversation_grant(command: &str) -> PolicyRule {
+        let request = shell_request(&[command], workcell_shell_subject());
+        PolicyRule {
+            origin: RuleOrigin::Conversation,
+            rule: request
+                .option_rule("allow_exact", PermissionLifetime::Conversation)
+                .unwrap(),
+        }
+    }
+
+    /// A covered resource has to say which authority covers it: a prompt that
+    /// only says "already allowed" cannot be acted on, and the lifetime alone
+    /// would report configured policy as something the user granted.
+    #[test]
+    fn coverage_names_the_origin_and_the_authority_that_carries_it() {
+        let configured = mgr_with(
+            make_config(vec![shell_policy_rule(COVERAGE_PATTERN, Effect::Allow)]),
+            PathBuf::from(SHELL_WORKDIR),
+        );
+
+        assert_eq!(
+            coverage_of(&configured, COVERAGE_COMMAND, &[]),
+            Some(ResourceCoverage {
+                origin: RuleOrigin::Config,
+                authority: COVERAGE_PATTERN.into(),
+            })
+        );
+        assert_eq!(
+            coverage_of(&default_mgr(), ECHO_COMMAND, &[]),
+            Some(ResourceCoverage {
+                origin: RuleOrigin::Builtin,
+                authority: BUILTIN_ECHO_PATTERN.into(),
+            })
+        );
+        assert_eq!(
+            coverage_of(
+                &default_mgr(),
+                COVERAGE_COMMAND,
+                &[conversation_grant(COVERAGE_COMMAND)]
+            ),
+            Some(ResourceCoverage {
+                origin: RuleOrigin::Conversation,
+                authority: THIS_COMMAND_AUTHORITY.into(),
+            })
+        );
+    }
+
+    /// A deny leaves nothing covered even when an allow reaches the resource,
+    /// so the prompt cannot claim an authority the call does not have.
+    #[test]
+    fn a_denied_resource_carries_no_coverage() {
+        let manager = mgr_with(
+            make_config(vec![
+                shell_policy_rule(BROAD_GIT_PATTERN, Effect::Allow),
+                shell_policy_rule(COVERAGE_PATTERN, Effect::Deny),
+            ]),
+            PathBuf::from(SHELL_WORKDIR),
+        );
+
+        assert_eq!(coverage_of(&manager, COVERAGE_COMMAND, &[]), None);
+    }
+
+    /// Configured policy and a grant of equal reach both cover the command. The
+    /// grant is the one the user made, so it is the one the prompt credits.
+    #[test]
+    fn a_grant_outranks_configured_policy_of_equal_reach() {
+        let manager = mgr_with(
+            make_config(vec![shell_policy_rule(COVERAGE_COMMAND, Effect::Allow)]),
+            PathBuf::from(SHELL_WORKDIR),
+        );
+
+        assert_eq!(
+            coverage_of(
+                &manager,
+                COVERAGE_COMMAND,
+                &[conversation_grant(COVERAGE_COMMAND)]
+            )
+            .map(|coverage| coverage.origin),
+            Some(RuleOrigin::Conversation)
+        );
+    }
+
+    /// An ask withholds authority without erasing it, so the covering allow is
+    /// still reported and a later grant can still sweep the prompt.
+    #[test]
+    fn an_ask_still_reports_the_allow_that_covers_the_resource() {
+        let manager = mgr_with(
+            make_config(vec![
+                shell_policy_rule(BROAD_GIT_PATTERN, Effect::Allow),
+                shell_policy_rule(COVERAGE_PATTERN, Effect::Ask),
+            ]),
+            PathBuf::from(SHELL_WORKDIR),
+        );
+        let request = shell_request(&[COVERAGE_COMMAND], workcell_shell_subject());
+
+        let coverage = coverage_with(&manager, &request, true, &[]);
+
+        assert!(coverage.must_prompt);
+        assert_eq!(
+            coverage.covered[0],
+            Some(ResourceCoverage {
+                origin: RuleOrigin::Config,
+                authority: BROAD_GIT_PATTERN.into(),
+            })
+        );
+    }
+
     /// `cmd *` is a command pattern, not a text prefix: it has always covered
     /// the bare invocation as well as the one with arguments, and it stops at a
     /// token boundary so it cannot reach a longer executable name.
@@ -2791,7 +2968,7 @@ mod tests {
         );
         let covered = |command: &str| {
             let request = shell_request(&[command], workcell_shell_subject());
-            coverage_with(&manager, &request, false, &[]).covered
+            covered_flags(&coverage_with(&manager, &request, false, &[]))
         };
 
         assert_eq!(covered("pwd"), [true]);
@@ -2847,7 +3024,10 @@ mod tests {
             decisions(&manager, &opaque),
             vec![StructuredPermissionDecision::NoMatch]
         );
-        assert_eq!(coverage_with(&manager, &opaque, true, &[]).covered, [false]);
+        assert_eq!(
+            covered_flags(&coverage_with(&manager, &opaque, true, &[])),
+            [false]
+        );
     }
 
     /// A configured allow is written against a command's reviewed text, which a
@@ -2860,11 +3040,14 @@ mod tests {
             PathBuf::from("/tmp"),
         );
         let mut request = shell_request(&["git status --short"], workcell_shell_subject());
-        assert_eq!(coverage_with(&manager, &request, true, &[]).covered, [true]);
+        assert_eq!(
+            covered_flags(&coverage_with(&manager, &request, true, &[])),
+            [true]
+        );
 
         request.resources[0].protected = true;
         assert_eq!(
-            coverage_with(&manager, &request, true, &[]).covered,
+            covered_flags(&coverage_with(&manager, &request, true, &[])),
             [false]
         );
     }
@@ -2949,7 +3132,7 @@ mod tests {
         let request = project_read_request(&cwd, relative);
 
         let coverage = coverage_with(&manager, &request, true, &[]);
-        coverage.covered.iter().all(|covered| *covered) && !coverage.must_prompt
+        coverage.covered.iter().all(Option::is_some) && !coverage.must_prompt
     }
 
     #[test]
@@ -2961,7 +3144,7 @@ mod tests {
         let request = shell_request(&["rm build.log"], workcell_shell_subject());
         let coverage = coverage_with(&manager, &request, true, &[]);
 
-        assert_eq!(coverage.covered, vec![true]);
+        assert_eq!(covered_flags(&coverage), vec![true]);
         assert!(!coverage.must_prompt);
     }
 
@@ -2993,7 +3176,7 @@ mod tests {
         ] {
             let request = shell_request(&commands, workcell_shell_subject());
             let coverage = coverage_with(&manager, &request, true, &[]);
-            assert!(coverage.covered.iter().all(|covered| *covered));
+            assert!(coverage.covered.iter().all(Option::is_some));
             assert!(!coverage.must_prompt);
         }
     }
@@ -3156,8 +3339,8 @@ mod tests {
         let allow = request
             .option_rule("allow_exact", PermissionLifetime::Conversation)
             .unwrap();
-        let coverage = coverage_with(&manager, &request, false, &[allow]);
-        assert_eq!(coverage.covered, [true]);
+        let coverage = coverage_with(&manager, &request, false, &[stored_policy(allow)]);
+        assert_eq!(covered_flags(&coverage), [true]);
         assert!(coverage.must_prompt);
         assert_eq!(coverage.prompt_required, [true]);
     }
@@ -3626,9 +3809,12 @@ mod tests {
         let manager = default_mgr();
         let request = shell_request(&["echo hi"], workcell_shell_subject());
 
-        assert_eq!(coverage_with(&manager, &request, true, &[]).covered, [true]);
         assert_eq!(
-            coverage_with(&manager, &request, false, &[]).covered,
+            covered_flags(&coverage_with(&manager, &request, true, &[])),
+            [true]
+        );
+        assert_eq!(
+            covered_flags(&coverage_with(&manager, &request, false, &[])),
             [false]
         );
     }
@@ -3647,7 +3833,7 @@ mod tests {
             Effect::Deny => assert!(
                 rules
                     .iter()
-                    .any(|rule| permission_rule_intersects_request(rule, &request))
+                    .any(|policy| permission_rule_intersects_request(&policy.rule, &request))
             ),
             Effect::Ask => {
                 let coverage = manager.request_coverage(&request, &rules, true);
@@ -3664,7 +3850,7 @@ mod tests {
         let request = shell_request(&["echo hi", "rm -rf build"], workcell_shell_subject());
         let coverage = coverage_with(&manager, &request, true, &[]);
 
-        assert_eq!(coverage.covered, vec![true, false]);
+        assert_eq!(covered_flags(&coverage), vec![true, false]);
         assert!(coverage.must_prompt);
         assert_eq!(coverage.prompt_required, vec![false, true]);
         assert_eq!(coverage.rule_ask, vec![false, false]);
@@ -3682,9 +3868,12 @@ mod tests {
             false,
         );
 
-        assert_eq!(coverage_with(&manager, &request, true, &[]).covered, [true]);
         assert_eq!(
-            coverage_with(&manager, &request, false, &[]).covered,
+            covered_flags(&coverage_with(&manager, &request, true, &[])),
+            [true]
+        );
+        assert_eq!(
+            covered_flags(&coverage_with(&manager, &request, false, &[])),
             [false]
         );
     }
@@ -3936,7 +4125,7 @@ mod tests {
         );
         let request = shell_request(&["cargo test", "git push", "ls"], workcell_shell_subject());
         let coverage = coverage_with(&mgr, &request, true, &[]);
-        assert_eq!(coverage.covered, vec![true, false, false]);
+        assert_eq!(covered_flags(&coverage), vec![true, false, false]);
         assert!(coverage.must_prompt);
     }
 
@@ -4281,8 +4470,8 @@ mod tests {
             else {
                 panic!("{COMPOSED_PROMPT_MISSING}");
             };
-            assert!(sibling.presentation.resources[0].covered);
-            assert!(!sibling.presentation.resources[1].covered);
+            assert!(sibling.presentation.resources[0].covered());
+            assert!(!sibling.presentation.resources[1].covered());
 
             assert!(manager.answer(
                 "first",
@@ -5843,6 +6032,13 @@ mod tests {
         request
     }
 
+    fn log_coverage() -> Option<ResourceCoverage> {
+        Some(ResourceCoverage {
+            origin: RuleOrigin::Project,
+            authority: "this command".into(),
+        })
+    }
+
     fn log_resource(value: &str, protected: bool, requires_prompt: bool) -> PermissionResource {
         PermissionResource {
             kind: PermissionResourceKind::Command,
@@ -5866,7 +6062,7 @@ mod tests {
     ) {
         let request = log_request(vec![log_resource("cargo test", protected, false)]);
 
-        let reason = prompt_forcing_reason(&request, &[false], forced, ask_rule);
+        let reason = prompt_forcing_reason(&request, &[None], forced, ask_rule);
 
         assert_eq!(reason, expected);
     }
@@ -5878,7 +6074,7 @@ mod tests {
             log_resource("cargo test", false, false),
         ]);
 
-        let reason = prompt_forcing_reason(&request, &[true, false], false, false);
+        let reason = prompt_forcing_reason(&request, &[log_coverage(), None], false, false);
 
         assert_eq!(reason, PROMPT_REASON_UNCOVERED);
     }
@@ -5890,7 +6086,7 @@ mod tests {
             log_resource("git push", true, false),
         ]);
 
-        let reason = prompt_forcing_reason(&request, &[false, false], false, false);
+        let reason = prompt_forcing_reason(&request, &[None, None], false, false);
 
         assert_eq!(reason, PROMPT_REASON_PROTECTED);
     }
@@ -5902,7 +6098,7 @@ mod tests {
             log_resource("brand new", false, false),
         ]);
 
-        let summary = uncovered_resource_summary(&request, &[true, false]);
+        let summary = uncovered_resource_summary(&request, &[log_coverage(), None]);
 
         assert_eq!(summary, "Command:brand new");
     }
@@ -5913,7 +6109,7 @@ mod tests {
             .map(|index| log_resource(&format!("cmd{index}"), false, false))
             .collect();
         let request = log_request(resources);
-        let coverage = vec![false; PROMPT_LOG_MAX_RESOURCES + 3];
+        let coverage = vec![None; PROMPT_LOG_MAX_RESOURCES + 3];
 
         let summary = uncovered_resource_summary(&request, &coverage);
 
@@ -5929,7 +6125,7 @@ mod tests {
         let value = "x".repeat(PROMPT_LOG_MAX_VALUE_CHARS * 2);
         let request = log_request(vec![log_resource(&value, false, false)]);
 
-        let summary = uncovered_resource_summary(&request, &[false]);
+        let summary = uncovered_resource_summary(&request, &[None]);
 
         assert_eq!(
             summary,

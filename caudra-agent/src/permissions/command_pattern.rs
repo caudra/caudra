@@ -131,14 +131,23 @@ pub(crate) fn matches(pattern: &str, command: &str) -> bool {
 /// executables; decoding every token additionally rejects any expansion the
 /// shell would perform after the command was reviewed.
 pub(crate) fn builtin_allowed(command: &str) -> bool {
+    builtin_allow_pattern(command).is_some()
+}
+
+/// The allowlist entry that admits this command, so a prompt can name the
+/// authority rather than assert one.
+pub(crate) fn builtin_allow_pattern(command: &str) -> Option<&'static str> {
+    if !tokenize(command).is_some_and(|tokens| {
+        tokens
+            .iter()
+            .all(|token| decode_static_token(token).is_some())
+    }) {
+        return None;
+    }
     BUILTIN_ALLOW_PATTERNS
         .iter()
-        .any(|pattern| matches(pattern, command))
-        && tokenize(command).is_some_and(|tokens| {
-            tokens
-                .iter()
-                .all(|token| decode_static_token(token).is_some())
-        })
+        .copied()
+        .find(|pattern| matches(pattern, command))
 }
 
 /// A pattern keeps only leading literals, so an operand the shell would expand

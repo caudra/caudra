@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
@@ -190,6 +191,61 @@ pub enum ComposedAnswerError {
     Uncovered,
 }
 
+/// Where a rule came from, so a resource that is already allowed can say which
+/// authority allows it. The lifetime cannot answer that on its own: the builtin
+/// confined-read rule is a `Conversation` rule and configured policy compiles to
+/// a `Project` one, yet neither is something the user granted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuleOrigin {
+    Builtin,
+    Config,
+    Plugin,
+    Conversation,
+    Project,
+    Global,
+}
+
+impl RuleOrigin {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Builtin => "builtin",
+            Self::Config => "config",
+            Self::Plugin => "plugin",
+            Self::Conversation => "conversation",
+            Self::Project => "project",
+            Self::Global => "global",
+        }
+    }
+}
+
+/// A rule paired with where it came from. Assembly is the only place that knows
+/// the origin, so it is attached there rather than rediscovered later.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PolicyRule {
+    pub origin: RuleOrigin,
+    pub rule: StructuredPermissionRule,
+}
+
+/// The authority that already allows a resource, for a prompt that has to say
+/// why a command needs no answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourceCoverage {
+    pub origin: RuleOrigin,
+    /// How the covering constraint names the resource, such as `rg *`.
+    pub authority: String,
+}
+
+/// What the rule set says about one resource, and which authority said it.
+///
+/// An ask withholds authority without erasing it, so coverage is reported
+/// whatever the decision: the prompt can still say the resource is covered and a
+/// later grant can still sweep it.
+pub struct ResourceStanding {
+    pub decision: StructuredPermissionDecision,
+    pub coverage: Option<ResourceCoverage>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PermissionResourcePresentation {
     pub kind: PermissionResourceKind,
@@ -197,8 +253,14 @@ pub struct PermissionResourcePresentation {
     pub access: Option<PermissionResourceAccess>,
     pub summary: String,
     pub protected: bool,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub covered: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage: Option<ResourceCoverage>,
+}
+
+impl PermissionResourcePresentation {
+    pub fn covered(&self) -> bool {
+        self.coverage.is_some()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -954,19 +1016,30 @@ fn rule_standing(
     request: &PermissionRequest,
     resource: &PermissionResource,
 ) -> Option<RuleStanding> {
+    rule_reach(rule, request, resource).map(|(standing, _)| standing)
+}
+
+/// `rule_standing` with the constraint that carried the standing, so a caller
+/// that has to name the authority names the one that actually decided. A rule
+/// naming no resource is unrestricted and so carries no constraint.
+fn rule_reach<'a>(
+    rule: &'a StructuredPermissionRule,
+    request: &PermissionRequest,
+    resource: &PermissionResource,
+) -> Option<(RuleStanding, Option<&'a PermissionResourceConstraint>)> {
     if !rule_context_matches(rule, request) {
         return None;
     }
     let decision = StructuredPermissionDecision::of(&rule.effect);
     let standing = |width| {
-        Some((
+        (
             decision == StructuredPermissionDecision::Deny,
             width,
             decision,
-        ))
+        )
     };
     if rule.resources.is_empty() {
-        return standing(SelectorWidth::Blanket);
+        return Some((standing(SelectorWidth::Blanket), None));
     }
     rule.resources
         .iter()
@@ -978,28 +1051,92 @@ fn rule_standing(
                 RuleIntent::of(&rule.effect),
             )
         })
-        .map(|constraint| selector_width(&constraint.selector))
-        .max()
-        .and_then(standing)
+        .max_by_key(|constraint| selector_width(&constraint.selector))
+        .map(|constraint| {
+            (
+                standing(selector_width(&constraint.selector)),
+                Some(constraint),
+            )
+        })
 }
 
-/// What the rule set says about one resource.
+/// What the rule set says about one resource, and the allow that covers it.
 ///
 /// Ranking is what keeps a config that asks about `git *` from swallowing its
 /// own `git status` allow. Ties are broken entirely by the standing, so the
-/// answer does not depend on rule order.
-pub fn permission_rules_resource_decision(
-    rules: &[StructuredPermissionRule],
+/// answer does not depend on rule order. The credited allow is ranked the same
+/// way, so the authority a prompt names is the one that would decide.
+pub fn permission_rules_resource_standing(
+    rules: &[PolicyRule],
+    request: &PermissionRequest,
+    resource: &PermissionResource,
+) -> ResourceStanding {
+    let decision = resource_decision(rules.iter().map(|policy| &policy.rule), request, resource);
+    // `min_by_key` over the reversed width keeps the first rule of equal reach,
+    // so a grant the user made outranks configured policy that says the same.
+    let coverage = rules
+        .iter()
+        .filter(|policy| policy.rule.effect == StructuredPermissionEffect::Allow)
+        .filter_map(|policy| {
+            rule_reach(&policy.rule, request, resource)
+                .map(|((_, width, _), constraint)| (policy, width, constraint))
+        })
+        .min_by_key(|(_, width, _)| Reverse(*width))
+        .map(|(policy, _, constraint)| ResourceCoverage {
+            origin: policy.origin,
+            authority: constraint.map_or_else(
+                || blanket_authority(&resource.kind),
+                |constraint| selector_authority(&constraint.selector, &resource.kind),
+            ),
+        });
+    ResourceStanding { decision, coverage }
+}
+
+fn resource_decision<'a>(
+    rules: impl IntoIterator<Item = &'a StructuredPermissionRule>,
     request: &PermissionRequest,
     resource: &PermissionResource,
 ) -> StructuredPermissionDecision {
     rules
-        .iter()
+        .into_iter()
         .filter_map(|rule| rule_standing(rule, request, resource))
         .max()
         .map_or(StructuredPermissionDecision::NoMatch, |(_, _, decision)| {
             decision
         })
+}
+
+/// How a covering constraint names a resource, for a prompt that has to say why
+/// the resource is already allowed.
+fn selector_authority(
+    selector: &PermissionResourceSelector,
+    kind: &PermissionResourceKind,
+) -> String {
+    match selector {
+        PermissionResourceSelector::CommandPattern { pattern } => safe_summary(pattern),
+        PermissionResourceSelector::Prefix { value } => safe_summary(value),
+        PermissionResourceSelector::Subtree { root } => safe_summary(root),
+        PermissionResourceSelector::Exact { .. } | PermissionResourceSelector::Digest { .. } => {
+            format!("this {}", kind_noun(kind))
+        }
+        PermissionResourceSelector::FilesystemSubtreeDigest { .. }
+        | PermissionResourceSelector::UrlSubtreeDigest { .. }
+        | PermissionResourceSelector::UrlOriginDigest { .. } => {
+            format!("this {} tree", kind_noun(kind))
+        }
+        PermissionResourceSelector::Any => blanket_authority(kind),
+    }
+}
+
+fn blanket_authority(kind: &PermissionResourceKind) -> String {
+    format!("any {}", kind_noun(kind))
+}
+
+fn kind_noun(kind: &PermissionResourceKind) -> String {
+    match kind {
+        PermissionResourceKind::Custom { name } => safe_summary(name),
+        other => format!("{other:?}").to_lowercase(),
+    }
 }
 
 pub fn permission_rule_covers_request(
@@ -1073,7 +1210,7 @@ pub fn evaluate_structured_permission_rules(
     let narrowed = request
         .resources
         .iter()
-        .map(|resource| permission_rules_resource_decision(rules, request, resource))
+        .map(|resource| resource_decision(rules, request, resource))
         .fold(
             StructuredPermissionDecision::NoMatch,
             |decision, resource| decision.merge(resource),
@@ -2624,7 +2761,7 @@ fn presentation_for(
                     access: resource.access.clone(),
                     summary,
                     protected: resource.protected,
-                    covered: false,
+                    coverage: None,
                 }
             })
             .collect(),
@@ -2633,13 +2770,13 @@ fn presentation_for(
 
 pub fn update_presentation_coverage(
     presentation: &mut PermissionPresentation,
-    covered: &[bool],
+    coverage: &[Option<ResourceCoverage>],
 ) -> bool {
-    if presentation.resources.len() != covered.len() {
+    if presentation.resources.len() != coverage.len() {
         return false;
     }
-    for (resource, covered) in presentation.resources.iter_mut().zip(covered) {
-        resource.covered = *covered;
+    for (resource, coverage) in presentation.resources.iter_mut().zip(coverage) {
+        resource.coverage.clone_from(coverage);
     }
     true
 }
@@ -3186,7 +3323,7 @@ mod tests {
             .map(|effect| rule(&request, effect.clone(), vec![exact_constraint(&resource)]))
             .collect();
 
-        permission_rules_resource_decision(&rules, &request, &resource)
+        resource_decision(&rules, &request, &resource)
     }
 
     /// The precedence is the whole contract of a rule set: authority only ever
@@ -3221,7 +3358,7 @@ mod tests {
         let request = request(vec![resource.clone()]);
         let unrestricted = rule(&request, effect, Vec::new());
 
-        permission_rules_resource_decision(&[unrestricted], &request, &resource)
+        resource_decision(&[unrestricted], &request, &resource)
     }
 
     /// Narrowing one resource narrows the call, but authorizing one does not
@@ -3297,9 +3434,9 @@ mod tests {
         let mut reversed = rules(&request);
         reversed.reverse();
 
-        let decision = permission_rules_resource_decision(&rules(&request), &request, &resource);
+        let decision = resource_decision(&rules(&request), &request, &resource);
         assert_eq!(
-            permission_rules_resource_decision(&reversed, &request, &resource),
+            resource_decision(&reversed, &request, &resource),
             decision,
             "reversing the rules changed the decision"
         );
@@ -3394,7 +3531,7 @@ mod tests {
         let request = request(vec![resource.clone()]);
         let rules = vec![rule(&request, effect, vec![pattern_constraint(BROAD_ASK)])];
 
-        permission_rules_resource_decision(&rules, &request, &resource)
+        resource_decision(&rules, &request, &resource)
     }
 
     /// The ranking table. The variant order supplies the comparison; this pins
@@ -3486,8 +3623,7 @@ mod tests {
         let mut incoming = request(vec![resource.clone()]);
         incoming.subject = mcp_subject(request_server, request_tool);
 
-        permission_rules_resource_decision(&[rule], &incoming, &resource)
-            == StructuredPermissionDecision::Allow
+        resource_decision(&[rule], &incoming, &resource) == StructuredPermissionDecision::Allow
     }
 
     /// A record written before servers were recorded deserializes with an empty
@@ -3504,7 +3640,7 @@ mod tests {
         incoming.subject = mcp_subject("", OTHER_TOOL);
 
         assert_eq!(
-            permission_rules_resource_decision(&[rule], &incoming, &resource),
+            resource_decision(&[rule], &incoming, &resource),
             StructuredPermissionDecision::NoMatch
         );
     }
@@ -3534,13 +3670,13 @@ mod tests {
         incoming.subject = mcp_subject(MCP_SERVER, OTHER_TOOL);
 
         assert_eq!(
-            permission_rules_resource_decision(std::slice::from_ref(&rule), &incoming, &write),
+            resource_decision(std::slice::from_ref(&rule), &incoming, &write),
             StructuredPermissionDecision::NoMatch
         );
         let mut same_tool_read = request(vec![read.clone()]);
         same_tool_read.subject = mcp_subject(MCP_SERVER, OTHER_TOOL);
         assert_eq!(
-            permission_rules_resource_decision(&[rule], &same_tool_read, &read),
+            resource_decision(&[rule], &same_tool_read, &read),
             StructuredPermissionDecision::Allow
         );
     }
@@ -4984,18 +5120,18 @@ mod tests {
     }
 
     #[test]
-    fn presentation_coverage_defaults_false_and_updates_atomically() {
+    fn presentation_coverage_defaults_absent_and_updates_atomically() {
         let resource = PermissionResourcePresentation {
             kind: PermissionResourceKind::Command,
             access: Some(PermissionResourceAccess::Execute),
             summary: "git status".into(),
             protected: false,
-            covered: false,
+            coverage: None,
         };
         let serialized = serde_json::to_value(&resource).unwrap();
-        assert!(serialized.get("covered").is_none());
+        assert!(serialized.get("coverage").is_none());
         let restored: PermissionResourcePresentation = serde_json::from_value(serialized).unwrap();
-        assert!(!restored.covered);
+        assert!(!restored.covered());
 
         let mut presentation = PermissionPresentation {
             action: "Run commands".into(),
@@ -5003,19 +5139,23 @@ mod tests {
             risk_summary: "Shell execution".into(),
             resources: vec![resource.clone(), resource],
         };
+        let granted = ResourceCoverage {
+            origin: RuleOrigin::Project,
+            authority: NARROW_ALLOW.into(),
+        };
         assert!(update_presentation_coverage(
             &mut presentation,
-            &[true, false]
+            &[Some(granted), None]
         ));
-        assert!(presentation.resources[0].covered);
-        assert!(!presentation.resources[1].covered);
+        assert!(presentation.resources[0].covered());
+        assert!(!presentation.resources[1].covered());
 
         let unchanged = presentation.clone();
-        assert!(!update_presentation_coverage(&mut presentation, &[false]));
+        assert!(!update_presentation_coverage(&mut presentation, &[None]));
         assert_eq!(presentation, unchanged);
         assert_eq!(
-            serde_json::to_value(&presentation.resources[0]).unwrap()["covered"],
-            true
+            serde_json::to_value(&presentation.resources[0]).unwrap()["coverage"],
+            json!({"origin": "project", "authority": NARROW_ALLOW})
         );
     }
 

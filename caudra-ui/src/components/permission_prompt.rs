@@ -830,7 +830,7 @@ impl PermissionPrompt {
                 .presentation
                 .resources
                 .get(row)
-                .is_some_and(|shown| shown.covered)
+                .is_some_and(|shown| shown.covered())
         };
         let ladders = command_ladders(request);
         let scopes = (0..ladders.len())
@@ -1149,7 +1149,7 @@ impl PermissionPrompt {
                         .presentation
                         .resources
                         .iter()
-                        .filter(|resource| resource.covered == covered)
+                        .filter(|resource| resource.covered() == covered)
                         .map(|resource| {
                             let access = resource
                                 .access
@@ -1162,7 +1162,11 @@ impl PermissionPrompt {
                             } else {
                                 ""
                             };
-                            let summary_style = if resource.covered { t.tool_dim } else { value };
+                            let summary_style = if resource.covered() {
+                                t.tool_dim
+                            } else {
+                                value
+                            };
                             let mut spans = vec![
                                 Span::styled("    - ", t.tool_dim),
                                 Span::styled(format!("{access}{kind}: "), label),
@@ -1171,7 +1175,7 @@ impl PermissionPrompt {
                                     summary_style,
                                 ),
                             ];
-                            if resource.covered {
+                            if resource.covered() {
                                 spans.push(Span::styled(" [already allowed]", t.tool_dim));
                             }
                             Line::from(spans)
@@ -1211,7 +1215,7 @@ impl PermissionPrompt {
                 .presentation
                 .resources
                 .get(row)
-                .is_some_and(|shown| shown.covered);
+                .is_some_and(|shown| shown.covered());
             let summary = request
                 .presentation
                 .resources
@@ -1734,7 +1738,9 @@ fn json_type(value: &Value) -> &'static str {
 mod tests {
     use std::path::Path;
 
-    use caudra_agent::permissions::{PermissionAnswer, PermissionLifetime, PermissionRequest};
+    use caudra_agent::permissions::{
+        PermissionAnswer, PermissionLifetime, PermissionRequest, ResourceCoverage, RuleOrigin,
+    };
     use caudra_config::ToolKey;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::Terminal;
@@ -1757,6 +1763,15 @@ mod tests {
             Path::new("/project"),
             true,
         ))
+    }
+
+    const COVERING_PATTERN: &str = "cargo test *";
+
+    fn project_coverage() -> ResourceCoverage {
+        ResourceCoverage {
+            origin: RuleOrigin::Project,
+            authority: COVERING_PATTERN.into(),
+        }
     }
 
     fn open_prompt() -> PermissionPrompt {
@@ -1902,13 +1917,13 @@ mod tests {
         let mut covered_first = resource.clone();
         covered_first.summary = "covered\u{1b}[31m-first".into();
         covered_first.protected = false;
-        covered_first.covered = true;
+        covered_first.coverage = Some(project_coverage());
         let mut uncovered = resource.clone();
         uncovered.summary = "needs-approval".into();
         uncovered.protected = false;
         let mut covered_last = resource;
         covered_last.summary = "covered-last".into();
-        covered_last.covered = true;
+        covered_last.coverage = Some(project_coverage());
         structured.presentation.resources = vec![covered_first, uncovered, covered_last];
 
         let mut prompt = PermissionPrompt::new();
