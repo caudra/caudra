@@ -504,6 +504,10 @@ async fn stream_with_retry_inner(
                     error = %e,
                     "retryable, will retry"
                 );
+                // Listening before the event goes out: a nudge is dropped when
+                // nothing is waiting, and announcing the wait first invites one
+                // to arrive in the gap before it starts.
+                let nudged = retry_now.listen();
                 if let Some(event_tx) = event_tx {
                     event_tx.send(AgentEvent::Retry {
                         attempt,
@@ -516,7 +520,9 @@ async fn stream_with_retry_inner(
                         async {
                             smol::Timer::after(delay).await;
                         },
-                        retry_now.notified(),
+                        async {
+                            nudged.await;
+                        },
                     )
                     .await;
                 };

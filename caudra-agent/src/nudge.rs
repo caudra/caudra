@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use event_listener::Event;
+use event_listener::{Event, EventListener};
 
 /// Cuts short a wait someone else is already in. Carrying no state is the
 /// point: a nudge that arrives while nothing is waiting is dropped rather than
@@ -22,8 +22,15 @@ impl Nudge {
         self.0.notify(usize::MAX);
     }
 
+    /// Registers interest now and waits later. A caller that announces the wait
+    /// before entering it must listen first, or the nudge answering that
+    /// announcement lands while nothing is waiting and is dropped.
+    pub fn listen(&self) -> EventListener {
+        self.0.listen()
+    }
+
     pub async fn notified(&self) {
-        self.0.listen().await;
+        self.listen().await;
     }
 }
 
