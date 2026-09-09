@@ -17,8 +17,8 @@ use caudra_agent::permissions::PermissionRequest;
 use caudra_agent::tools::{FILE_WRITE_TOOL_NAME, ToolEffect, ToolInvocation, ToolRegistry};
 use caudra_agent::types::QuestionEvent;
 use caudra_agent::{
-    AgentEvent, BatchToolEntry, BufferSnapshot, SubagentProgress, ToolDoneEvent, ToolOutput,
-    ToolStartEvent,
+    AgentEvent, BatchToolEntry, BufferSnapshot, Mention, SubagentProgress, ToolDoneEvent,
+    ToolOutput, ToolStartEvent,
 };
 use caudra_config::{ToolOutputLines, UiConfig};
 use caudra_lua::WinView;
@@ -401,17 +401,24 @@ impl Chat {
         self.messages_panel.handle_click(row, area);
     }
 
-    pub(crate) fn update_hover(&mut self, row: u16, col: u16, area: Rect, known_task_target: bool) {
+    pub(crate) fn update_hover(
+        &mut self,
+        row: u16,
+        col: u16,
+        area: Rect,
+        known_task_target: bool,
+        cwd: &Path,
+    ) {
         self.messages_panel
-            .update_hover(row, col, area, known_task_target);
+            .update_hover(row, col, area, known_task_target, cwd);
     }
 
     pub(crate) fn clear_hover(&mut self) {
         self.messages_panel.clear_hover();
     }
 
-    pub(crate) fn hovered_link(&self) -> Option<&str> {
-        self.messages_panel.hovered_link()
+    pub(crate) fn hovered_hint(&self) -> Option<&str> {
+        self.messages_panel.hovered_hint()
     }
 
     pub(crate) fn terminal_links(&self) -> &[crate::markdown::TerminalLink] {
@@ -420,6 +427,10 @@ impl Chat {
 
     pub(crate) fn link_at(&self, row: u16, col: u16, area: Rect) -> Option<Arc<str>> {
         self.messages_panel.link_at(row, col, area)
+    }
+
+    pub(crate) fn mention_at(&self, row: u16, col: u16, area: Rect, cwd: &Path) -> Option<Mention> {
+        self.messages_panel.mention_at(row, col, area, cwd)
     }
 
     pub(crate) fn message_action_at(

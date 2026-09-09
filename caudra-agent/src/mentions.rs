@@ -23,6 +23,9 @@ const TRAILING_PUNCTUATION: [char; 9] = ['.', ',', ';', ':', '!', '?', ')', ']',
 /// text. Excluding everything else is what keeps `user@host` and `HEAD@{1}`
 /// from ever reaching the existence check.
 const OPENING_DELIMITERS: [char; 3] = ['(', '[', '{'];
+/// How many candidates [`scan_in`] will stat. A prompt full of `@` must not
+/// turn one keystroke or one mouse move into a burst of syscalls.
+const MAX_CANDIDATES: usize = 32;
 
 /// A resolved reference to a file, with the source text that produced it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,6 +81,16 @@ pub fn format(path: &Path, lines: Option<&RangeInclusive<usize>>) -> String {
         }
     }
     out
+}
+
+/// Finds every mention in `text` that names a path under `cwd`, which is what a
+/// caller holding a working directory wants instead of its own predicate.
+pub fn scan_in(text: &str, cwd: &Path) -> Vec<(Range<usize>, Mention)> {
+    let mut candidates = 0;
+    scan(text, |path| {
+        candidates += 1;
+        candidates <= MAX_CANDIDATES && cwd.join(path).exists()
+    })
 }
 
 /// Finds every mention in `text` whose path satisfies `exists`.

@@ -9,8 +9,8 @@ use crate::input_document::{InputDocument, InputDraft, PasteId, should_summarize
 use crate::text_buffer::{EditResult, TextBuffer, is_newline_key};
 use crate::theme;
 
-use caudra_agent::Mention;
 use caudra_agent::PromptAdmission;
+use caudra_agent::mentions::{self, Mention};
 use caudra_storage::input_history::InputHistory;
 use crossterm::event::{KeyCode, KeyEvent};
 use std::mem;
@@ -34,7 +34,6 @@ const PREFIX_WIDTH: u16 = 2;
 const SPACE: char = ' ';
 const COMPOSER_RAIL_WIDTH: u16 = 1;
 const COMPOSER_VERTICAL_PADDING: u16 = 1;
-const MAX_MENTION_CANDIDATES: usize = 32;
 const ADMISSION_SEPARATOR: &str = "  ";
 const ADMISSION_DESCRIPTION_GAP: &str = " ";
 const PLACEHOLDER_SUGGESTIONS: &[&str] = &[
@@ -292,14 +291,16 @@ impl InputBox {
         self.cwd = cwd.into();
     }
 
-    /// The mentions the composer text currently resolves, capped so a prompt
-    /// full of `@` never turns a render into a burst of syscalls.
+    /// The mentions the composer text resolves, as char ranges into it.
+    ///
+    /// Derived on demand rather than stored as spans: a mention's display form
+    /// *is* its text, so there is nothing a span would preserve, and leaving it
+    /// as ordinary text keeps it hand-editable — retyping `L12` as `L13` is a
+    /// normal edit rather than a token replacement. Scanning the display text
+    /// rather than the expanded text also means an `@path` sitting inside
+    /// pasted content stays data instead of becoming a request to read a file.
     pub(crate) fn mentions(&self) -> Vec<(Range<usize>, Mention)> {
-        let mut candidates = 0;
-        self.buffer.mentions(|path| {
-            candidates += 1;
-            candidates <= MAX_MENTION_CANDIDATES && self.cwd.join(path).exists()
-        })
+        mentions::scan_in(&self.buffer.display_text(), &self.cwd)
     }
 
     pub fn copy_text(&self) -> String {

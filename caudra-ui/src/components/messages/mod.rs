@@ -37,11 +37,13 @@ use caudra_markdown::render::SpanSource;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::mem;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::scrollbar::render_vertical_scrollbar;
 use super::streaming_content::StreamingContent;
+use caudra_agent::mentions::{self, Mention};
 use caudra_agent::tools::ToolEffect;
 use caudra_agent::{
     BatchToolEntry, BufferSnapshot, EventSender, InstructionBlock, NO_FILES_FOUND,
@@ -145,6 +147,7 @@ const MATH_BRACKET_OPEN: &str = "\\[";
 #[derive(Debug, PartialEq, Eq)]
 enum HoverTarget {
     Link(Arc<str>),
+    Mention(Mention),
     MessageAction(usize),
     CachedThinking(usize),
     StreamingThinking,
@@ -1826,8 +1829,15 @@ impl MessagesPanel {
         self.segment_source(segment)
     }
 
-    pub(crate) fn update_hover(&mut self, row: u16, col: u16, area: Rect, known_task_target: bool) {
-        self.hover = self.hover_target_at(row, col, area, known_task_target);
+    pub(crate) fn update_hover(
+        &mut self,
+        row: u16,
+        col: u16,
+        area: Rect,
+        known_task_target: bool,
+        cwd: &Path,
+    ) {
+        self.hover = self.hover_target_at(row, col, area, known_task_target, cwd);
     }
 
     pub(crate) fn message_action_at(&self, row: u16, col: u16) -> Option<MessageActionTarget> {
@@ -1842,9 +1852,13 @@ impl MessagesPanel {
         self.hover = None;
     }
 
-    pub(crate) fn hovered_link(&self) -> Option<&str> {
+    /// What the status bar says about whatever the pointer is over. Neither
+    /// target marks its own glyphs, so this line is the only sign either of
+    /// them is there.
+    pub(crate) fn hovered_hint(&self) -> Option<&str> {
         match &self.hover {
             Some(HoverTarget::Link(target)) => Some(target),
+            Some(HoverTarget::Mention(mention)) => Some(&mention.raw),
             _ => None,
         }
     }
@@ -1872,12 +1886,46 @@ impl MessagesPanel {
         self.streaming_link_at(doc_row, rel_col, width)
     }
 
+    /// The mention under the pointer, resolved against the markdown the message
+    /// was painted from rather than the glyphs on screen, so a mention still
+    /// names the file the reader typed wherever the renderer reworded the line
+    /// around it.
+    ///
+    /// Only a user message answers. A mention is something the reader wrote,
+    /// and a path the model happens to spell with an `@` was never a request to
+    /// open anything.
+    pub(crate) fn mention_at(&self, row: u16, col: u16, area: Rect, cwd: &Path) -> Option<Mention> {
+        if area.height == 0
+            || row < area.y
+            || row >= area.bottom()
+            || col < area.x
+            || col >= area.right()
+        {
+            return None;
+        }
+        let width = self.viewport_width;
+        let doc_row = (row - area.y) as u32 + self.scroll_top as u32;
+        let (_, segment, start) = self.cache.segment_at_row(doc_row, width)?;
+        if segment.kind() != SegmentKind::User {
+            return None;
+        }
+        let rel_row = u16::try_from(doc_row - start).ok()?;
+        let (source, byte) = segment.source_at(rel_row, col - area.x, width)?;
+        // Provenance counts bytes and the scanner counts chars.
+        let offset = source.get(..byte as usize)?.chars().count();
+        mentions::scan_in(&source, cwd)
+            .into_iter()
+            .find(|(range, _)| range.contains(&offset))
+            .map(|(_, mention)| mention)
+    }
+
     fn hover_target_at(
         &self,
         row: u16,
         col: u16,
         area: Rect,
         known_task_target: bool,
+        cwd: &Path,
     ) -> Option<HoverTarget> {
         if let Some(target) = self.message_action_at(row, col) {
             return Some(HoverTarget::MessageAction(target.segment_index));
@@ -1906,6 +1954,11 @@ impl MessagesPanel {
         }
         if let Some(target) = segment.link_at(rel, col - area.x, width) {
             return Some(HoverTarget::Link(target));
+        }
+        // After the link map, so a markdown link keeps its cell wherever the
+        // two somehow overlap.
+        if let Some(mention) = self.mention_at(row, col, area, cwd) {
+            return Some(HoverTarget::Mention(mention));
         }
         let Some(tool_id) = segment.tool_id.as_deref() else {
             let msg_index = segment.msg_index?;
@@ -1972,6 +2025,7 @@ impl MessagesPanel {
             Some(HoverTarget::CachedThinking(_))
             | Some(HoverTarget::MessageAction(_))
             | Some(HoverTarget::Link(_))
+            | Some(HoverTarget::Mention(_))
             | Some(HoverTarget::StreamingThinking)
             | Some(HoverTarget::Tool { .. })
             | Some(HoverTarget::Diagram(_))

@@ -71,6 +71,10 @@ const ARMING_LEADER_IS_INERT_MSG: &str = "arming the leader waits for a second k
 const MENTION_POPUP_CLOSED: &str = "typing @ over a matching path must open the popup";
 const MENTION_POPUP_LINGERED: &str = "choosing a file must close the popup";
 const MENTION_ROW_MISSING: &str = "the popup drew no row for the path under test";
+const MENTIONED_FILE: &str = "target.rs";
+const MENTION_NOT_OPENED: &str = "clicking a mention must open the workbench at the file it names";
+const MENTION_OPENED: &str = "the workbench opened for a press and release that named nothing";
+const MENTION_ATE_SELECTION: &str = "a drag across a mention must still select text";
 const MENTION_UNRESOLVED: &str = "a completed path must resolve to a mention";
 const MENTION_DROPPED_A_PASTE: &str =
     "completing a mention must splice a range, not replace the buffer";
@@ -12252,6 +12256,86 @@ fn clicking_a_popup_row_completes_the_mention_it_shows() {
 
     assert_eq!(app.input_box.buffer.display_text(), "see @target.rs");
     assert!(!app.mention_popup.is_open(), "{MENTION_POPUP_LINGERED}");
+}
+
+/// A transcript holding one user message that mentions a real file, with the
+/// screen position of the mention.
+fn transcript_mention(app: &mut App) -> (TempDir, u16, u16) {
+    let dir = TempDir::new().expect("a temporary directory");
+    std::fs::write(dir.path().join(MENTIONED_FILE), "body\n").expect("a file");
+    let store = App::snapshot_store_for(&app.storage, app.state.session.id, dir.path())
+        .expect("a snapshot store for the project");
+    app.install_working_directory(dir.path(), store, PermissionsConfig::default());
+    app.main_chat()
+        .push_user_message(format!("look at @{MENTIONED_FILE} please"));
+    let (row, column) = screen_hit(app, MENTIONED_FILE);
+    (dir, row, column)
+}
+
+#[test]
+fn clicking_a_mention_in_the_transcript_opens_the_workbench() {
+    let mut app = test_app();
+    let (_dir, row, column) = transcript_mention(&mut app);
+
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        column,
+        row,
+    ));
+    app.update(mouse_event(
+        MouseEventKind::Up(MouseButton::Left),
+        column,
+        row,
+    ));
+
+    assert!(app.workbench.is_open(), "{MENTION_NOT_OPENED}");
+    assert!(
+        rendered(&mut app).contains(MENTIONED_FILE),
+        "{MENTION_NOT_OPENED}"
+    );
+}
+
+/// Pressing a mention and releasing on prose is a slip rather than a choice.
+#[test]
+fn releasing_off_the_mention_opens_nothing() {
+    let mut app = test_app();
+    let (_dir, row, column) = transcript_mention(&mut app);
+
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        column,
+        row,
+    ));
+    app.update(mouse_event(MouseEventKind::Up(MouseButton::Left), 0, row));
+
+    assert!(!app.workbench.is_open(), "{MENTION_OPENED}");
+}
+
+/// Dragging across a mention is how a reader copies the text around it, so it
+/// must stay a selection.
+#[test]
+fn dragging_over_a_mention_selects_instead_of_opening() {
+    let mut app = test_app();
+    let (_dir, row, column) = transcript_mention(&mut app);
+
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        column,
+        row,
+    ));
+    app.update(mouse_event(
+        MouseEventKind::Drag(MouseButton::Left),
+        column + 5,
+        row,
+    ));
+    app.update(mouse_event(
+        MouseEventKind::Up(MouseButton::Left),
+        column + 5,
+        row,
+    ));
+
+    assert!(!app.workbench.is_open(), "{MENTION_OPENED}");
+    assert!(app.selection_state.is_some(), "{MENTION_ATE_SELECTION}");
 }
 
 /// Clicking away moves the caret out of the query, and the popup has no

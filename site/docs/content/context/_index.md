@@ -68,6 +68,8 @@ Caudra records a whole-file mention as a read, so a later edit is blocked if the
 
 A mention marks itself as the pointer passes over it, the way a paste label does. Click it to open the file in the [workbench](/docs/workbench/), scrolled to the lines it names, with the explorer expanded to it and the row selected. `Ctrl+X Enter` in the workbench goes the other way, sending the file and the selected lines to the composer as a mention.
 
+A mention you already sent stays clickable in the transcript. Hovering one puts the path in the status bar, the way a hovered link does, and clicking it opens the same workbench view. Only your own messages answer, so a path the model writes with an `@` is left as text. A mention wrapped in emphasis, a code span, or link text is left as text too: what reaches the screen there is no longer the path you typed.
+
 ## Instruction files
 
 At session start Caudra walks from the project git root down to the working directory (no `.git` root, only the cwd). In each directory it loads **one** project instruction file, first match wins:

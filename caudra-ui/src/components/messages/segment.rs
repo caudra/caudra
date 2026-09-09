@@ -211,6 +211,21 @@ impl Segment {
         self.links.target_at(&self.lines, content_width, row, col)
     }
 
+    /// The markdown behind the cell at (`rel_row`, `rel_col`), with the byte it
+    /// was painted from. What a click resolves against, since the painter drops
+    /// the syntax the glyphs came from.
+    pub fn source_at(&self, rel_row: u16, rel_col: u16, width: u16) -> Option<(Arc<str>, u32)> {
+        let chrome = self.chrome(width);
+        let row = rel_row.checked_sub(chrome.content_start())?;
+        if row >= self.content_height(width) {
+            return None;
+        }
+        let col = rel_col.checked_sub(chrome.left)?;
+        let provenance = self.provenance.as_ref()?;
+        let byte = provenance.byte_at(&self.lines, chrome.content_width(width), row, col)?;
+        Some((Arc::clone(provenance.source()), byte))
+    }
+
     /// The diagram drawn on `line`, if any.
     pub fn diagram_at_line(&self, line: usize) -> Option<&DiagramSpan> {
         self.diagrams.iter().find(|span| span.rows.contains(&line))

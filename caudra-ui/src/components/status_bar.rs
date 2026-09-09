@@ -100,7 +100,7 @@ pub struct StatusBarContext<'a> {
     pub mode_clickable: bool,
     pub settings_clickable: bool,
     pub hovered: Option<StatusBarHitTarget>,
-    pub hover_url: Option<&'a str>,
+    pub hover_hint: Option<&'a str>,
 }
 
 /// How much of the thinking chip survives: `[thinking: xhigh]`, `[xhigh]`, or
@@ -404,7 +404,7 @@ impl StatusBar {
     }
 
     pub fn view(&self, frame: &mut Frame, area: Rect, ctx: &StatusBarContext) -> Vec<StatusBarHit> {
-        if let Some(url) = ctx.hover_url.filter(|_| self.flash.is_none()) {
+        if let Some(url) = ctx.hover_hint.filter(|_| self.flash.is_none()) {
             frame.render_widget(
                 Paragraph::new(Line::from(Span::styled(
                     format!(" {url}"),
@@ -952,7 +952,7 @@ mod tests {
         show_global: bool,
         yolo: bool,
         hovered: Option<StatusBarHitTarget>,
-        hover_url: Option<&str>,
+        hover_hint: Option<&str>,
         goal: Option<&GoalSnapshot>,
     ) -> (String, Vec<StatusBarHit>, Vec<Style>) {
         let bar = StatusBar::new(FLASH_TTL);
@@ -985,7 +985,7 @@ mod tests {
             mode_clickable: true,
             settings_clickable: true,
             hovered,
-            hover_url,
+            hover_hint,
         };
         let mut hits = Vec::new();
         terminal
@@ -1034,7 +1034,7 @@ mod tests {
             mode_clickable: true,
             settings_clickable: true,
             hovered: None,
-            hover_url: None,
+            hover_hint: None,
         };
         f(&ctx);
     }

@@ -7,8 +7,10 @@ use crate::components::permission_prompt::PromptMouse;
 use crate::components::queue_panel::{QueueAction, QueueHit, QueueHitTarget};
 use crate::components::status_bar::{StatusBarHit, StatusBarHitTarget};
 use crate::selection::{self, ContentRegion, EdgeScroll, Selection, SelectionState, SelectionZone};
+use caudra_agent::Mention;
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Position, Rect};
+use std::path::PathBuf;
 
 use crate::repaint::Dirty;
 
@@ -274,6 +276,7 @@ impl App {
                 self.status_mouse_down = None;
                 self.message_action_mouse_down = None;
                 self.link_mouse_down = None;
+                self.mention_mouse_down = None;
                 if !self.has_modal_overlay() {
                     self.admission_mouse_down = self.admission_hit_at(event.row, event.column);
                     self.task_hint_mouse_down = self.task_hint_hit_at(event.row, event.column);
@@ -321,15 +324,18 @@ impl App {
                             None => self.resync_dropdowns(),
                         }
                     }
-                    if zone.zone == SelectionZone::Messages
-                        && !self.has_modal_overlay()
-                        && crate::terminal::local_url_opener_available()
-                    {
-                        self.link_mouse_down = self.chats[self.active_chat].link_at(
-                            event.row,
-                            event.column,
-                            self.msg_area(),
-                        );
+                    if zone.zone == SelectionZone::Messages && !self.has_modal_overlay() {
+                        // Not gated on an opener the way a link is: the
+                        // workbench is ours to open.
+                        self.mention_mouse_down =
+                            self.transcript_mention_at(event.row, event.column);
+                        if crate::terminal::local_url_opener_available() {
+                            self.link_mouse_down = self.chats[self.active_chat].link_at(
+                                event.row,
+                                event.column,
+                                self.msg_area(),
+                            );
+                        }
                     }
                     let scroll = self.scroll_offset(zone.zone);
                     self.selection_state = Some(SelectionState::Dragging {
@@ -353,6 +359,7 @@ impl App {
                 self.status_mouse_down = None;
                 self.message_action_mouse_down = None;
                 self.link_mouse_down = None;
+                self.mention_mouse_down = None;
                 self.handle_drag(event.row, event.column);
             }
             MouseEventKind::Up(MouseButton::Left) => {
@@ -364,6 +371,7 @@ impl App {
                     self.status_mouse_down = None;
                     self.message_action_mouse_down = None;
                     self.link_mouse_down = None;
+                    self.mention_mouse_down = None;
                     self.task_hint_mouse_down = false;
                     return self.handle_streaming_admission(pressed.admission);
                 }
@@ -375,6 +383,7 @@ impl App {
                     self.status_mouse_down = None;
                     self.message_action_mouse_down = None;
                     self.link_mouse_down = None;
+                    self.mention_mouse_down = None;
                     return self.tasks_browse();
                 }
                 if !self.has_modal_overlay()
@@ -387,6 +396,7 @@ impl App {
                     self.queue_mouse_down = None;
                     self.status_mouse_down = None;
                     self.link_mouse_down = None;
+                    self.mention_mouse_down = None;
                     self.message_actions.open(
                         pressed.source(),
                         self.state.session.meta.pending_revert.is_some(),
@@ -397,6 +407,7 @@ impl App {
                     if !sel.is_empty() {
                         self.queue_mouse_down = None;
                         self.link_mouse_down = None;
+                        self.mention_mouse_down = None;
                         self.selection_state = Some(SelectionState::PendingCopy { sel });
                     } else {
                         let zone = sel.zone;
@@ -416,6 +427,18 @@ impl App {
                             self.queue_mouse_down = None;
                             self.status_mouse_down = None;
                             return vec![crate::components::Action::OpenUrl(target.to_string())];
+                        }
+                        if zone == SelectionZone::Messages
+                            && !self.has_modal_overlay()
+                            && let Some(pressed) = self.mention_mouse_down.take()
+                            && self.transcript_mention_at(event.row, event.column)
+                                == Some(pressed.clone())
+                        {
+                            self.message_action_mouse_down = None;
+                            self.queue_mouse_down = None;
+                            self.status_mouse_down = None;
+                            self.open_workbench_at(&pressed);
+                            return Vec::new();
                         }
                         self.message_action_mouse_down = None;
                         if !self.has_modal_overlay()
@@ -449,6 +472,7 @@ impl App {
                 self.status_mouse_down = None;
                 self.message_action_mouse_down = None;
                 self.link_mouse_down = None;
+                self.mention_mouse_down = None;
             }
             MouseEventKind::Moved => {
                 if self.has_modal_overlay() {
@@ -956,7 +980,14 @@ impl App {
                     .iter()
                     .any(|chat| chat.task_id().is_some_and(|id| **id == task_id))
             });
-        self.chats[self.active_chat].update_hover(row, col, area, known_task_target);
+        let cwd = PathBuf::from(&self.state.session.cwd);
+        self.chats[self.active_chat].update_hover(row, col, area, known_task_target, &cwd);
+    }
+
+    /// The mention under the pointer in the transcript.
+    fn transcript_mention_at(&self, row: u16, col: u16) -> Option<Mention> {
+        let cwd = PathBuf::from(&self.state.session.cwd);
+        self.chats[self.active_chat].mention_at(row, col, self.msg_area(), &cwd)
     }
 
     pub(super) fn scroll_offset(&self, zone: SelectionZone) -> u32 {

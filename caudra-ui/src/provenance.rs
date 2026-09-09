@@ -57,6 +57,37 @@ impl Provenance {
         self.lines.push(LineProvenance::chrome(span_count));
     }
 
+    pub fn source(&self) -> &Arc<str> {
+        &self.source
+    }
+
+    /// The source byte the cell at (`row`, `column`) was painted from, for a
+    /// click to resolve against the text rather than the glyphs.
+    ///
+    /// `None` where no byte lines up: chrome the markdown never produced, and
+    /// any span the renderer rewrote on the way to the screen.
+    pub fn byte_at(&self, lines: &[Line<'_>], width: u16, row: u16, column: u16) -> Option<u32> {
+        if width == 0 || column >= width || self.lines.len() != lines.len() {
+            return None;
+        }
+
+        let mut at = 0u16;
+        for (line, provenance) in lines.iter().zip(&self.lines) {
+            let chars = line_chars(line);
+            let starts = row_starts(&chars, width);
+            for (index, &start) in starts.iter().enumerate() {
+                if at != row {
+                    at = at.saturating_add(1);
+                    continue;
+                }
+                let end = starts.get(index + 1).copied().unwrap_or(chars.len());
+                let offset = column_char(&chars[start..end], column)?;
+                return span_byte(line, provenance, start + offset);
+            }
+        }
+        None
+    }
+
     /// Source text for the rows `from..to` of `lines`, clipped horizontally
     /// by `sel`. Returns `None` when any covered span lacks provenance, so
     /// the caller can fall back to scraping cells.
@@ -148,6 +179,45 @@ fn covered_chars(
     Some(first?..last? + 1)
 }
 
+/// Which char of a display row the cell at `column` shows.
+fn column_char(chars: &[char], column: u16) -> Option<usize> {
+    let mut at = 0usize;
+    for (index, ch) in chars.iter().enumerate() {
+        at += ch.width().unwrap_or(0).max(1);
+        if (column as usize) < at {
+            return Some(index);
+        }
+    }
+    None
+}
+
+/// The source byte behind char `index` of a painted line. Only a verbatim span
+/// can answer: anywhere else the rendered chars are not the source slice, so
+/// there is no byte to name.
+fn span_byte(line: &Line<'_>, provenance: &LineProvenance, index: usize) -> Option<u32> {
+    let mut at = 0usize;
+    for (span, source) in line.spans.iter().zip(&provenance.spans) {
+        let len = span.content.chars().count();
+        if index >= at + len {
+            at += len;
+            continue;
+        }
+        let SpanSource::Range(source) = source else {
+            return None;
+        };
+        if !source.verbatim {
+            return None;
+        }
+        let byte = span
+            .content
+            .char_indices()
+            .nth(index - at)
+            .map_or(span.content.len(), |(byte, _)| byte) as u32;
+        return Some(source.range.start + byte);
+    }
+    None
+}
+
 /// Ranges for the spans overlapping `covered`. Fails on spans with no
 /// provenance so the caller can fall back wholesale.
 fn span_ranges(
@@ -183,4 +253,78 @@ fn span_ranges(
         }
     }
     Some(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::markdown::text_to_painted;
+    use ratatui::style::Style;
+
+    const WIDTH: u16 = 40;
+    const WRONG_BYTE: &str = "the cell does not name the source byte behind it";
+    const NOT_INERT: &str = "a rewritten span named a source byte it cannot have";
+
+    fn painted(text: &str, width: u16) -> (Vec<Line<'static>>, Provenance) {
+        let (painted, parsed) = text_to_painted(
+            text,
+            "",
+            Style::default(),
+            Style::default(),
+            width,
+            None,
+            Vec::new(),
+        );
+        (painted.lines, Provenance::new(parsed, painted.provenance))
+    }
+
+    #[test]
+    fn a_cell_names_the_source_byte_behind_it() {
+        const TEXT: &str = "see @src/lib.rs now";
+        let (lines, provenance) = painted(TEXT, WIDTH);
+        let column = TEXT.find('@').expect("a sigil");
+
+        let byte = provenance.byte_at(&lines, WIDTH, 0, column as u16);
+
+        assert_eq!(byte, Some(column as u32), "{WRONG_BYTE}");
+    }
+
+    /// The heading marker never reaches the screen, so the first cell of the
+    /// row is two bytes into the source rather than at its start.
+    #[test]
+    fn dropped_syntax_does_not_shift_the_byte() {
+        const TEXT: &str = "# Title";
+        let (lines, provenance) = painted(TEXT, WIDTH);
+
+        let byte = provenance.byte_at(&lines, WIDTH, 0, 0);
+
+        assert_eq!(
+            byte,
+            Some(TEXT.find('T').expect("a title") as u32),
+            "{WRONG_BYTE}"
+        );
+    }
+
+    /// A word too long for the width is broken mid-word, so the second row
+    /// starts where the first ran out rather than at a space.
+    #[test]
+    fn a_wrapped_row_counts_from_where_the_line_broke() {
+        const NARROW: u16 = 10;
+        const TEXT: &str = "abcdefghijklmnopqrst";
+        let (lines, provenance) = painted(TEXT, NARROW);
+
+        let byte = provenance.byte_at(&lines, NARROW, 1, 0);
+
+        assert_eq!(byte, Some(u32::from(NARROW)), "{WRONG_BYTE}");
+    }
+
+    /// Inline maths is copied whole because its glyphs are not its source, so
+    /// no cell inside it can name a byte.
+    #[test]
+    fn a_rewritten_span_names_no_byte() {
+        const TEXT: &str = "a $x^2$ b";
+        let (lines, provenance) = painted(TEXT, WIDTH);
+
+        assert_eq!(provenance.byte_at(&lines, WIDTH, 0, 2), None, "{NOT_INERT}");
+    }
 }

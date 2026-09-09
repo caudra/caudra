@@ -574,8 +574,8 @@ impl App {
             hovered: (!self.has_modal_overlay())
                 .then_some(self.status_hover)
                 .flatten(),
-            hover_url: (!self.has_modal_overlay())
-                .then(|| chat.hovered_link())
+            hover_hint: (!self.has_modal_overlay())
+                .then(|| chat.hovered_hint())
                 .flatten(),
         };
         self.status_hits = self.status_bar.view(frame, status_area, &ctx);

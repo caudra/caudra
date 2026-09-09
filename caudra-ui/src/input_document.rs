@@ -1,7 +1,5 @@
 use std::ops::Range;
-use std::path::Path;
 
-use caudra_agent::mentions::{self, Mention};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::highlight::TAB_SPACES;
@@ -394,18 +392,6 @@ impl InputDocument {
         };
         self.display.set_cursor_offset(cursor);
         true
-    }
-
-    /// The mentions in the composer text, as char ranges into the display text.
-    ///
-    /// Derived on demand rather than stored as spans: a mention's display form
-    /// *is* its text, so there is nothing a span would preserve, and leaving it
-    /// as ordinary text keeps it hand-editable — retyping `L12` as `L13` is a
-    /// normal edit rather than a token replacement. Scanning the display text
-    /// rather than the expanded text also means an `@path` sitting inside
-    /// pasted content stays data instead of becoming a request to read a file.
-    pub fn mentions(&self, exists: impl FnMut(&Path) -> bool) -> Vec<(Range<usize>, Mention)> {
-        mentions::scan(&self.display.value(), exists)
     }
 
     /// Char offset of the first character of line `y`.

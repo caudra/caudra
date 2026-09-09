@@ -20,11 +20,21 @@ use caudra_agent::{
 use ratatui::backend::TestBackend;
 use ratatui::style::Modifier;
 use std::collections::HashSet;
+use std::path::Path;
 use std::time::Duration;
 use test_case::test_case;
 use unicode_width::UnicodeWidthStr;
 
 const SPINNER_GLYPHS: &str = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";
+/// A working directory nothing resolves under, for the hover tests that are
+/// not about mentions.
+const NO_PROJECT: &str = "/caudra-no-such-project";
+const MENTION_PATH: &str = "src/lib.rs";
+const MENTION: &str = "@src/lib.rs";
+const MENTION_PROSE: &str = "look at @src/lib.rs please";
+const MENTION_MISSED: &str = "the pointer sat on a mention the panel did not resolve";
+const MENTION_CLAIMED: &str = "a message the reader did not write answered with a mention";
+const MENTION_MARKED_GLYPHS: &str = "a hovered mention repainted the message around it";
 const TOOL_ID: &str = "t1";
 
 fn snap_line(text: &str) -> SnapshotLine {
@@ -224,7 +234,7 @@ fn message_action_hover_reverses_only_the_glyph() {
         })
         .unwrap();
 
-    panel.update_hover(row, col, area, false);
+    panel.update_hover(row, col, area, false, Path::new(NO_PROJECT));
     let terminal = render_actions(&mut panel, 80, 24);
     let glyph = terminal
         .backend()
@@ -2338,7 +2348,7 @@ fn hovering_the_raw_switch_reverses_it_instead_of_the_card_header() {
     let area = Rect::new(0, 0, 80, 24);
     let row = shell_toggle_row(&panel);
 
-    panel.update_hover(row, area.x, area, false);
+    panel.update_hover(row, area.x, area, false, Path::new(NO_PROJECT));
 
     assert_eq!(
         panel.hover_feedback_for_segment(
@@ -2385,9 +2395,9 @@ fn native_tool_hover_reverses_only_the_expand_affordance_without_mutating_cache(
             .map(|segment| segment.lines().to_vec())
     });
 
-    panel.update_hover(area.y, area.right(), area, false);
+    panel.update_hover(area.y, area.right(), area, false, Path::new(NO_PROJECT));
     assert!(panel.hover.is_none(), "outside columns are not hoverable");
-    panel.update_hover(area.y, area.x, area, false);
+    panel.update_hover(area.y, area.x, area, false, Path::new(NO_PROJECT));
     let terminal = render(&mut panel, area.width, area.height);
 
     assert!(
@@ -2424,7 +2434,7 @@ fn expanded_native_tool_hover_accents_header_and_rail_not_body() {
     assert!(panel.toggle_expansion("t1"));
     render(&mut panel, area.width, area.height);
 
-    panel.update_hover(area.y, area.x, area, false);
+    panel.update_hover(area.y, area.x, area, false, Path::new(NO_PROJECT));
     let terminal = render(&mut panel, area.width, area.height);
     let buffer = terminal.backend().buffer();
     let rail = buffer.cell((area.x, area.y)).unwrap().style();
@@ -2445,13 +2455,13 @@ fn snapshot_tool_hovers_only_when_caller_confirms_a_known_task_card() {
     let area = Rect::new(0, 0, 80, 24);
     render(&mut panel, area.width, area.height);
 
-    panel.update_hover(area.y, area.x, area, false);
+    panel.update_hover(area.y, area.x, area, false, Path::new(NO_PROJECT));
     assert!(
         panel.hover.is_none(),
         "ordinary Lua snapshot rows are excluded"
     );
 
-    panel.update_hover(area.y, area.x, area, true);
+    panel.update_hover(area.y, area.x, area, true, Path::new(NO_PROJECT));
     assert!(matches!(
         panel.hover,
         Some(HoverTarget::Tool {
@@ -2473,7 +2483,7 @@ fn ordinary_message_rows_never_become_transcript_hover_controls() {
     let mut panel = panel_with_msgs(&["long-click context"], 80, 24);
     let area = Rect::new(0, 0, 80, 24);
 
-    panel.update_hover(area.y, area.x, area, false);
+    panel.update_hover(area.y, area.x, area, false, Path::new(NO_PROJECT));
 
     assert!(panel.hover.is_none());
 }
@@ -2493,10 +2503,72 @@ fn message_link_hit_testing_accounts_for_segment_chrome() {
     let row = area.y + segment.chrome(80).content_start();
     let column = area.x + segment.chrome(80).left;
 
-    panel.update_hover(row, column, area, false);
-    assert_eq!(panel.hovered_link(), Some("https://example.com"));
-    panel.update_hover(row, column + 4, area, false);
-    assert_eq!(panel.hovered_link(), None);
+    panel.update_hover(row, column, area, false, Path::new(NO_PROJECT));
+    assert_eq!(panel.hovered_hint(), Some("https://example.com"));
+    panel.update_hover(row, column + 4, area, false, Path::new(NO_PROJECT));
+    assert_eq!(panel.hovered_hint(), None);
+}
+
+/// Places the pointer over the mention in a one-message transcript and reports
+/// what the panel makes of it. The project is this crate, so `src/lib.rs`
+/// resolves without a temporary directory.
+fn mention_hover(role: DisplayRole, text: &str) -> (MessagesPanel, Rect, u16, u16) {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.push(DisplayMessage::new(role, text.into()));
+    panel.viewport_width = 80;
+    panel.rebuild_line_cache();
+    panel.set_scroll_top(0);
+    let area = Rect::new(5, 7, 80, 5);
+    let chrome = panel.cache.get(0).expect("a segment").chrome(80);
+    let row = area.y + chrome.content_start();
+    let column = area.x + chrome.left + text.find(MENTION).expect("a mention") as u16;
+    (panel, area, row, column)
+}
+
+#[test]
+fn a_mention_in_a_user_message_answers_the_pointer() {
+    let (panel, area, row, column) = mention_hover(DisplayRole::User, MENTION_PROSE);
+
+    let mention = panel.mention_at(row, column, area, Path::new(env!("CARGO_MANIFEST_DIR")));
+
+    assert_eq!(
+        mention.map(|mention| mention.path),
+        Some(std::path::PathBuf::from(MENTION_PATH)),
+        "{MENTION_MISSED}"
+    );
+}
+
+/// A path the model happens to spell with an `@` was never a request to open
+/// anything.
+#[test]
+fn a_mention_the_model_wrote_is_left_alone() {
+    let (panel, area, row, column) = mention_hover(DisplayRole::Assistant, MENTION_PROSE);
+
+    let mention = panel.mention_at(row, column, area, Path::new(env!("CARGO_MANIFEST_DIR")));
+
+    assert!(mention.is_none(), "{MENTION_CLAIMED}");
+}
+
+/// The status bar is the only sign a mention is there, so hovering one must
+/// leave every glyph in the message alone.
+#[test]
+fn hovering_a_mention_marks_the_status_bar_and_no_glyph() {
+    let (mut panel, area, row, column) = mention_hover(DisplayRole::User, MENTION_PROSE);
+
+    panel.update_hover(
+        row,
+        column,
+        area,
+        false,
+        Path::new(env!("CARGO_MANIFEST_DIR")),
+    );
+
+    assert_eq!(panel.hovered_hint(), Some(MENTION), "{MENTION_MISSED}");
+    let segment = panel.cache.get(0).expect("a segment");
+    assert!(
+        panel.hover_feedback_for_segment(segment).is_none(),
+        "{MENTION_MARKED_GLYPHS}"
+    );
 }
 
 #[test]
@@ -3419,7 +3491,7 @@ fn cached_collapsed_thinking_header_responds_to_hover() {
     let area = Rect::new(0, 0, 80, 10);
     render(&mut panel, area.width, area.height);
 
-    panel.update_hover(area.y, area.x, area, false);
+    panel.update_hover(area.y, area.x, area, false, Path::new(NO_PROJECT));
     let terminal = render(&mut panel, area.width, area.height);
 
     assert!(matches!(panel.hover, Some(HoverTarget::CachedThinking(0))));
@@ -3441,7 +3513,7 @@ fn streaming_collapsed_thinking_header_responds_to_hover() {
     let area = Rect::new(0, 0, 80, 10);
     render(&mut panel, area.width, area.height);
 
-    panel.update_hover(area.y, area.x, area, false);
+    panel.update_hover(area.y, area.x, area, false, Path::new(NO_PROJECT));
     let terminal = render(&mut panel, area.width, area.height);
 
     assert!(matches!(panel.hover, Some(HoverTarget::StreamingThinking)));
@@ -3453,16 +3525,16 @@ fn transcript_hover_clears_explicitly_and_on_scroll_or_layout_change() {
     let mut panel = panel_with_long_tool(200);
     let area = Rect::new(0, 0, 80, 24);
 
-    panel.update_hover(area.y, area.x, area, false);
+    panel.update_hover(area.y, area.x, area, false, Path::new(NO_PROJECT));
     assert!(panel.hover.is_some());
     panel.clear_hover();
     assert!(panel.hover.is_none());
 
-    panel.update_hover(area.y, area.x, area, false);
+    panel.update_hover(area.y, area.x, area, false, Path::new(NO_PROJECT));
     panel.set_scroll_top(panel.scroll_top());
     assert!(panel.hover.is_none());
 
-    panel.update_hover(area.y, area.x, area, false);
+    panel.update_hover(area.y, area.x, area, false, Path::new(NO_PROJECT));
     render(&mut panel, 79, area.height);
     assert!(panel.hover.is_none());
 }
@@ -4360,14 +4432,14 @@ fn hovering_a_diagram_row_targets_it() {
     let content_start = segment.chrome(panel.viewport_width).content_start();
     let row = content_start + segment.diagrams()[0].rows.start as u16;
 
-    panel.update_hover(row, 1, area, false);
+    panel.update_hover(row, 1, area, false, Path::new(NO_PROJECT));
     assert!(
         matches!(panel.hover, Some(HoverTarget::Diagram(_))),
         "{:?}",
         panel.hover
     );
 
-    panel.update_hover(0, 1, area, false);
+    panel.update_hover(0, 1, area, false, Path::new(NO_PROJECT));
     assert!(
         !matches!(panel.hover, Some(HoverTarget::Diagram(_))),
         "a prose row is not a diagram: {:?}",
@@ -4384,7 +4456,7 @@ fn a_hovered_diagram_pans_and_an_unhovered_one_does_not() {
     let segment = panel.cache.get(0).expect("one segment");
     let content_start = segment.chrome(panel.viewport_width).content_start();
     let row = content_start + segment.diagrams()[0].rows.start as u16;
-    panel.update_hover(row, 1, area, false);
+    panel.update_hover(row, 1, area, false, Path::new(NO_PROJECT));
     assert!(panel.pan_hovered_diagram(PAN_STEP_TEST));
 }
 
@@ -4443,7 +4515,7 @@ fn the_keyboard_and_the_pointer_agree_on_the_target() {
 
     let hovered: Vec<DiagramKey> = (0..PAN_HEIGHT)
         .filter_map(|row| {
-            panel.update_hover(row, 1, area, false);
+            panel.update_hover(row, 1, area, false, Path::new(NO_PROJECT));
             match panel.hover {
                 Some(HoverTarget::Diagram(key)) => Some(key),
                 _ => None,
@@ -4479,7 +4551,7 @@ fn the_keyboard_finds_a_chart_under_heavily_wrapped_prose() {
     let area = Rect::new(0, 0, PAN_WIDTH, PAN_HEIGHT);
     let seen: Vec<DiagramKey> = (0..PAN_HEIGHT)
         .filter_map(|row| {
-            panel.update_hover(row, 1, area, false);
+            panel.update_hover(row, 1, area, false, Path::new(NO_PROJECT));
             match panel.hover {
                 Some(HoverTarget::Diagram(key)) => Some(key),
                 _ => None,
@@ -4983,7 +5055,7 @@ fn compact_hover_tracks_clickability_through_the_whole_cycle(tool: &'static str)
     let area = Rect::new(0, 0, 80, 24);
 
     for _ in 0..MAX_COMPACT_CLICK_CYCLE {
-        panel.update_hover(area.y, area.x, area, false);
+        panel.update_hover(area.y, area.x, area, false, Path::new(NO_PROJECT));
         let hovered = panel.hover.is_some();
         assert_eq!(
             hovered,
@@ -5647,7 +5719,7 @@ fn hovering_a_batch_child_marks_that_row() {
     let mut panel = panel_with_batch();
     let area = Rect::new(0, 0, 80, 24);
     let row = batch_child_row(&panel, 1);
-    panel.update_hover(row, area.x, area, false);
+    panel.update_hover(row, area.x, area, false, Path::new(NO_PROJECT));
     let segment = panel
         .cache
         .segments()
