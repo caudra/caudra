@@ -30,7 +30,7 @@ Allows can combine across resources. A shell chain can use separate grants for `
 
 Authority controls what a rule covers. Lifetime controls how long the rule remains active. The prompt selects them independently.
 
-Exact call is the default authority. Trusted tool profiles can also offer a URL path, URL origin, filesystem subtree, shell command pattern, shell workdir, search provider, or whole MCP tool. Caudra does not infer these choices from names in an external tool schema.
+Exact call is the default authority. Trusted tool profiles can also offer a URL prefix, filesystem subtree, shell command pattern, shell workdir, search provider, or whole MCP tool. Caudra does not infer these choices from names in an external tool schema.
 
 Prompt decisions use four lifetimes:
 
@@ -72,6 +72,8 @@ The footer names widening only when the selected authority has somewhere to go, 
 Reusable approvals are exact by default. A parsed shell command is scoped one command at a time, described below, ahead of the unrestricted workdir and global shell choices. Broad authorities require explicit selection. Unrestricted URL, search, shell, and MCP authorities also require a typed phrase. Each authority advertises its valid lifetimes. Whole-tool MCP authority is conversation-only.
 
 A filesystem authority arrives as a ladder. Its narrowest rung covers the directories the request touched, and each step up covers the directory above, as far as the filesystem root. The rungs share one row, and `Left` and `Right` walk it, so widening changes the reach the row names rather than adding choices to scroll through. A rung reaching outside the repository is marked `outside repo`. A rung that takes in your home directory is marked `outside home` and needs the `ALLOW OUTSIDE HOME` phrase. Moving to another authority and back returns the ladder to its narrowest rung.
+
+A URL authority is a ladder too. `Left` and `Right` walk it the same way, one path segment at a time, so a page can be scoped to the section it sits in. A request for `https://example.com/path/to/sub/page` starts at `https://example.com/path/to/sub/page/**` and widens through `https://example.com/path/to/**` and `https://example.com/path/**` to `https://example.com/**`, where the row reads `Any page on this origin`. A path deeper than eight segments offers its eight deepest prefixes and the origin. A URL with no path offers the origin alone. Reaching other origins is a separate authority that needs the `ALLOW ANY URL` phrase.
 
 Multiple requests are queued by request ID. The prompt identifies the requesting subtask. A subtask request cannot replace a prompt from the main agent or another subtask. Confirming a reusable authority also approves every pending request it already covers. Conversation, project, and global lifetimes limit which pending conversations or projects can share that approval. Allow once and deny decisions resolve only the selected request.
 
