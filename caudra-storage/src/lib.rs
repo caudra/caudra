@@ -12,6 +12,7 @@ pub mod paths;
 pub mod permission_config_trust;
 pub mod permission_state;
 pub mod plans;
+pub mod projects;
 pub mod prompt_stash;
 pub mod retention;
 pub mod sessions;
@@ -175,7 +176,7 @@ impl StateDir {
         self.persistent.is_some()
     }
 
-    pub fn ensure_subdir(&self, name: &str) -> Result<PathBuf, StorageError> {
+    pub fn ensure_subdir(&self, name: impl AsRef<Path>) -> Result<PathBuf, StorageError> {
         let dir = self.root.join(name);
         fs::create_dir_all(&dir)?;
         Ok(dir)

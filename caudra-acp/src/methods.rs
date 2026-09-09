@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use agent_client_protocol_schema::ProtocolVersion;
 use agent_client_protocol_schema::v1::{
     AgentCapabilities, Implementation, InitializeResponse, LoadSessionResponse, McpCapabilities,
@@ -57,12 +59,12 @@ pub fn model_config_option(current: &str, specs: &[String]) -> SessionConfigOpti
         .category(SessionConfigOptionCategory::Model)
 }
 
-pub fn mode_id_to_agent_mode(mode_id: &str) -> Option<caudra_agent::AgentMode> {
+pub fn mode_id_to_agent_mode(mode_id: &str, cwd: &Path) -> Option<caudra_agent::AgentMode> {
     match mode_id {
         MODE_BUILD => Some(caudra_agent::AgentMode::Build),
         MODE_PLAN => {
             let storage = caudra_storage::StateDir::resolve().ok()?;
-            let plan_path = caudra_storage::plans::new_plan_path(&storage).ok()?;
+            let plan_path = caudra_storage::plans::new_plan_path(&storage, cwd).ok()?;
             Some(caudra_agent::AgentMode::Plan(plan_path))
         }
         _ => None,

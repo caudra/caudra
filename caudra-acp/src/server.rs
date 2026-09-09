@@ -764,11 +764,9 @@ fn handle_prompt(srv: &mut Server, raw: &Value, id: &RequestId) -> Result<(), Ac
 fn handle_set_mode(srv: &mut Server, raw: &Value) -> Result<AgentResponse, AcpError> {
     let req: SetSessionModeRequest = parse_params(raw)?;
     let mode_str = req.mode_id.0.to_string();
-    let new_mode = methods::mode_id_to_agent_mode(&mode_str)
-        .ok_or_else(|| AcpError::new(-32602, format!("unknown mode: {mode_str}")))?;
-
     let session = srv.session.as_mut().ok_or_else(no_session)?;
-    session.current_mode = new_mode;
+    session.current_mode = methods::mode_id_to_agent_mode(&mode_str, &session.cwd)
+        .ok_or_else(|| AcpError::new(-32602, format!("unknown mode: {mode_str}")))?;
 
     let sid = SessionId::from(session.handle.session_id.to_string());
     session_update(

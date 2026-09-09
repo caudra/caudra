@@ -4711,7 +4711,8 @@ mod tests {
         assert!(denied_by_default(&mgr, &write));
     }
 
-    const PLAN_PATH: &str = "/home/user/.local/state/caudra/plans/test.md";
+    const PLAN_PATH: &str =
+        "/home/user/.local/state/caudra/projects/app-0123456789abcdef/plans/test.md";
 
     /// Enforces against the plan being built with no response channel, so the
     /// plan-write escape hatch is the only thing that can let the call through.

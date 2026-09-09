@@ -64,10 +64,11 @@ impl PlanState {
         matches!(self, Self::Ready(_))
     }
 
-    pub(crate) fn allocate_path(&mut self, storage: &StateDir) {
+    pub(crate) fn allocate_path(&mut self, storage: &StateDir, cwd: &Path) {
         if matches!(self, Self::None) {
             *self = Self::Drafting(
-                plans::new_plan_path(storage).unwrap_or_else(|_| PathBuf::from("plans/plan.md")),
+                plans::new_plan_path(storage, cwd)
+                    .unwrap_or_else(|_| PathBuf::from("plans/plan.md")),
             );
         }
     }
@@ -96,7 +97,8 @@ impl App {
     }
 
     pub(super) fn enter_plan(&mut self) {
-        self.state.plan.allocate_path(&self.storage);
+        let cwd = PathBuf::from(&self.state.session.cwd);
+        self.state.plan.allocate_path(&self.storage, &cwd);
         self.state.mode = Mode::Plan;
     }
 

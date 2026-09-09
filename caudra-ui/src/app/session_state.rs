@@ -95,7 +95,7 @@ impl SessionState {
         };
 
         if mode == Mode::Plan {
-            plan.allocate_path(storage);
+            plan.allocate_path(storage, Path::new(&session.cwd));
         }
 
         let fast = session.meta.fast && model.supports_fast();
