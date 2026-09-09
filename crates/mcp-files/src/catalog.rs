@@ -538,7 +538,10 @@ mod tests {
             "file_apply_patch",
         ];
         #[cfg(feature = "index")]
-        let expected = expected.into_iter().chain(["file_index"]).collect::<Vec<_>>();
+        let expected = expected
+            .into_iter()
+            .chain(["file_index"])
+            .collect::<Vec<_>>();
         assert_eq!(
             tools
                 .iter()
@@ -611,7 +614,10 @@ mod tests {
             .collect::<Vec<_>>();
         let expected = vec!["file_read", "file_glob", "file_grep"];
         #[cfg(feature = "index")]
-        let expected = expected.into_iter().chain(["file_index"]).collect::<Vec<_>>();
+        let expected = expected
+            .into_iter()
+            .chain(["file_index"])
+            .collect::<Vec<_>>();
         assert_eq!(names, expected);
         assert_eq!(specs(false).len(), names.len());
     }

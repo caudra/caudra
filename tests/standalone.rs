@@ -1203,7 +1203,10 @@ async fn write_authority_decides_whether_mutation_tools_exist_at_all() {
     }
 
     let (_read_only_root, read_only) = files_catalog(false).await;
-    assert_eq!(read_only, ["file_read", "file_glob", "file_grep", "file_index"]);
+    assert_eq!(
+        read_only,
+        ["file_read", "file_glob", "file_grep", "file_index"]
+    );
 
     let (_writable_root, writable) = files_catalog(true).await;
     assert_eq!(
