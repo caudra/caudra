@@ -5,7 +5,6 @@ use std::sync::{Arc, Mutex};
 
 use caudra_providers::model::Model;
 
-use crate::AgentMode;
 use crate::command::find_project_ancestor_dirs;
 use crate::prompt::profile::SystemPromptProfile;
 use crate::template::Vars;
@@ -54,7 +53,6 @@ pub fn is_instruction_file(name: &str) -> bool {
 
 pub fn build_system_prompt(
     vars: &Vars,
-    mode: &AgentMode,
     instructions: &str,
     slots: &crate::prompt::ResolvedSlots,
     tool_filter: &crate::tools::ToolFilter,
@@ -66,16 +64,10 @@ pub fn build_system_prompt(
     );
     let env = format!("{env}\n- Model: {}", model.spec());
     let instructions = format!("{env}{instructions}");
-    let plan = if let Some(plan_path) = mode.plan_path() {
-        let plan_vars = Vars::new().set("{plan_path}", plan_path.display().to_string());
-        plan_vars.apply(crate::prompt::PLAN_PROMPT).into_owned()
-    } else {
-        String::new()
-    };
     crate::prompt::assemble_system(
         &slots.with_native_hints(tool_filter),
         &instructions,
-        &plan,
+        crate::prompt::MODES_PROMPT,
         profile,
     )
 }
@@ -202,33 +194,38 @@ pub fn find_subdirectory_instructions(
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::path::PathBuf;
-
     use test_case::test_case;
 
     use super::*;
 
     const PLAN_PATH: &str = ".caudra/plans/123.md";
 
-    #[test_case(&AgentMode::Build, false ; "build_excludes_plan")]
-    #[test_case(&AgentMode::Plan(PathBuf::from(PLAN_PATH)), true ; "plan_includes_plan")]
-    fn plan_section_presence(mode: &AgentMode, expect_plan: bool) {
+    fn system_prompt() -> String {
         let vars = Vars::new().set("{cwd}", "/tmp").set("{platform}", "linux");
         let slots = crate::prompt::ResolvedSlots::default();
         let model = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
-        let prompt = build_system_prompt(
+        build_system_prompt(
             &vars,
-            mode,
             "",
             &slots,
             &crate::tools::ToolFilter::All,
             &model,
             None,
-        );
-        assert_eq!(prompt.contains("Plan Mode"), expect_plan);
-        if expect_plan {
-            assert!(prompt.contains(PLAN_PATH));
-        }
+        )
+    }
+
+    /// The system block precedes every message in the cache prefix, so a mode
+    /// that varied it would re-cache the whole conversation on each toggle.
+    #[test_case(crate::prompt::PLAN_MODE_MARKER ; "plan_reminder_stays_out")]
+    #[test_case(crate::prompt::BUILD_MODE_MARKER ; "build_reminder_stays_out")]
+    #[test_case(PLAN_PATH ; "plan_path_stays_out")]
+    fn the_system_prompt_never_names_a_mode(absent: &str) {
+        assert!(!system_prompt().contains(absent));
+    }
+
+    #[test]
+    fn the_system_prompt_explains_the_mode_protocol() {
+        assert!(system_prompt().contains(crate::prompt::MODES_PROMPT.trim_end()));
     }
 
     #[test]
@@ -248,17 +245,17 @@ mod tests {
         );
         let prompt = build_system_prompt(
             &vars,
-            &AgentMode::Plan(PathBuf::from("plan.md")),
             &format!("\n{INSTR}"),
             &slots,
             &crate::tools::ToolFilter::All,
             &Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap(),
             None,
         );
-        let positions = [INSTR, EXTRA, "Plan Mode"].map(|n| prompt.find(n).unwrap());
+        let positions =
+            [INSTR, EXTRA, crate::prompt::MODES_PROMPT.trim()].map(|n| prompt.find(n).unwrap());
         assert!(
             positions.is_sorted(),
-            "expected order instructions < slot extra < plan section, got {positions:?}"
+            "expected order instructions < slot extra < mode section, got {positions:?}"
         );
     }
 

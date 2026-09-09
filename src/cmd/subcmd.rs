@@ -34,6 +34,7 @@ use caudra_storage::model::persist_model;
 use crate::cli::{AuthMethod, Cli, normalize_tool_name};
 use crate::setup::resolve_model;
 
+const PROMPT_PLAN_PATH: &str = "plan.md";
 const AUTH_STATUS_EMPTY: &str = "       ";
 const AUTH_STATUS_ENV: &str = "\x1b[33m~ env  \x1b[0m";
 const AUTH_STATUS_KEY: &str = "\x1b[32m✓ key  \x1b[0m";
@@ -1171,20 +1172,25 @@ pub fn prompt(
 
     let output = match variant {
         PromptVariant::System => {
-            let mode = if plan {
-                caudra_agent::AgentMode::Plan(std::path::PathBuf::from("plan.md"))
-            } else {
-                caudra_agent::AgentMode::Build
-            };
-            build_system_prompt(
+            let system = build_system_prompt(
                 &vars,
-                &mode,
                 &instructions,
                 &slots,
                 &filter,
                 &model,
                 system_prompt_profile.as_deref(),
-            )
+            );
+            // The system prompt no longer varies by mode; the plan reminder is
+            // announced in the conversation, so show it alongside.
+            if plan {
+                let plan_vars = template::Vars::new().set("{plan_path}", PROMPT_PLAN_PATH);
+                format!(
+                    "{system}\n\n{}",
+                    plan_vars.apply(caudra_agent::prompt::PLAN_PROMPT)
+                )
+            } else {
+                system
+            }
         }
         PromptVariant::Research => vars
             .apply(&assemble_task_with_filter(

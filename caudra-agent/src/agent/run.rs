@@ -33,6 +33,7 @@ use crate::context::{
 use crate::mcp::{McpRequestSnapshot, McpSession};
 use crate::nudge::Nudge;
 use crate::permissions::PermissionManager;
+use crate::template::Vars;
 use crate::tools::{Deadline, FileReadTracker, LocalTools, PathLocks, ToolAudience, ToolContext};
 use crate::tools::{DeferralSession, DeferredTool};
 use crate::{
@@ -471,6 +472,7 @@ impl<'h> Agent<'h> {
         let Some(latest) = inputs.last() else {
             return String::new();
         };
+        let switch = mode_switch_notice(self.history.as_slice(), &latest.mode);
         self.mode = latest.mode.clone();
         self.workflow = latest.workflow;
         self.opts = RequestOptions {
@@ -478,7 +480,7 @@ impl<'h> Agent<'h> {
             fast: latest.fast,
         };
 
-        let mut preamble = Vec::new();
+        let mut preamble = Vec::from_iter(switch);
         for input in &mut inputs {
             preamble.append(&mut input.preamble);
             preamble.append(&mut self.mention_preamble(&input.mentions).await);
@@ -1276,6 +1278,72 @@ fn queued_message(display: &str) -> String {
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnnouncedMode {
+    Build,
+    Plan,
+}
+
+impl AnnouncedMode {
+    /// `ReadOnly` is a subagent contract rather than a mode the user toggles,
+    /// and its system prompt restates it every turn, so it announces nothing.
+    fn of(mode: &AgentMode) -> Option<Self> {
+        match mode {
+            AgentMode::Plan(_) => Some(Self::Plan),
+            AgentMode::Build => Some(Self::Build),
+            AgentMode::ReadOnly => None,
+        }
+    }
+}
+
+/// The mode the transcript last told the model it was in.
+///
+/// Derived from history rather than from a field because [`Agent`] is rebuilt
+/// for every run while history outlives it, so an in-memory previous mode is
+/// always the default and never a transition. Reading the transcript also
+/// survives a restart, which is the case that matters most: a session resumed
+/// days later still knows it was planning.
+fn last_announced_mode(history: &[Message]) -> AnnouncedMode {
+    history
+        .iter()
+        .rev()
+        .filter(|message| message.is_observation())
+        .find_map(|message| {
+            let text = message.user_text()?;
+            if text.contains(crate::prompt::BUILD_MODE_MARKER) {
+                Some(AnnouncedMode::Build)
+            } else if text.contains(crate::prompt::PLAN_MODE_MARKER) {
+                Some(AnnouncedMode::Plan)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(AnnouncedMode::Build)
+}
+
+/// Announces the active mode to the model, or `None` when the transcript
+/// already says what the incoming input says.
+///
+/// Carries the mode's full instructions rather than a bare notice, because this
+/// is the only place they appear: the system prompt is deliberately identical in
+/// both modes so that toggling does not re-cache the conversation. Compaction
+/// dropping the announcement is self-healing, since the next turn then finds no
+/// match and announces again.
+fn mode_switch_notice(history: &[Message], next: &AgentMode) -> Option<Message> {
+    let announced = AnnouncedMode::of(next)?;
+    if announced == last_announced_mode(history) {
+        return None;
+    }
+    let text = match next.plan_path() {
+        Some(plan_path) => Vars::new()
+            .set("{plan_path}", plan_path.display().to_string())
+            .apply(crate::prompt::PLAN_PROMPT)
+            .into_owned(),
+        None => crate::prompt::BUILD_PROMPT.to_owned(),
+    };
+    Some(Message::observation(text))
+}
+
 /// Counts provider-visible message content and replay framing. The system
 /// prompt and tool schemas stay invisible here, so never let this replace a
 /// context size the provider measured.
@@ -1418,6 +1486,9 @@ mod tests {
     /// Generous: the mock answers in microseconds, so this only bounds a
     /// regression that would otherwise hang instead of failing.
     const TITLE_EVENT_TIMEOUT: Duration = Duration::from_secs(5);
+    const TEST_PLAN_PATH: &str = ".caudra/plans/123.md";
+    const EXPECTED_PLAN_NOTICE: &str = "entering plan mode must be announced";
+    const EXPECTED_BUILD_NOTICE: &str = "leaving plan mode must be announced";
 
     struct MockInterruptSource {
         commands: Mutex<VecDeque<ExtractedCommand>>,
@@ -2315,6 +2386,116 @@ mod tests {
             assert_eq!(history.as_slice()[0].user_text(), Some("preamble"));
             assert_eq!(history.as_slice()[1].user_text(), Some("mailbox"));
             assert_eq!(history.as_slice()[2].user_text(), Some("hello"));
+        });
+    }
+
+    fn plan_mode() -> AgentMode {
+        AgentMode::Plan(std::path::PathBuf::from(TEST_PLAN_PATH))
+    }
+
+    fn plan_announcement() -> Message {
+        mode_switch_notice(&[], &plan_mode()).expect(EXPECTED_PLAN_NOTICE)
+    }
+
+    #[test_case(AgentMode::Build, Some(AnnouncedMode::Build) ; "build_announces_build")]
+    #[test_case(AgentMode::ReadOnly, None ; "read_only_announces_nothing")]
+    fn announced_mode_of_agent_mode(mode: AgentMode, expected: Option<AnnouncedMode>) {
+        assert_eq!(AnnouncedMode::of(&mode), expected);
+    }
+
+    #[test]
+    fn plan_mode_announces_plan() {
+        assert_eq!(AnnouncedMode::of(&plan_mode()), Some(AnnouncedMode::Plan));
+    }
+
+    #[test]
+    fn a_fresh_build_session_announces_nothing() {
+        assert!(mode_switch_notice(&[], &AgentMode::Build).is_none());
+    }
+
+    #[test]
+    fn entering_plan_announces_plan() {
+        let notice = plan_announcement();
+        assert!(notice.is_observation());
+        assert!(
+            notice
+                .user_text()
+                .is_some_and(|text| text.contains(crate::prompt::PLAN_MODE_MARKER))
+        );
+    }
+
+    #[test]
+    fn leaving_plan_announces_build() {
+        let history = [plan_announcement()];
+        let notice = mode_switch_notice(&history, &AgentMode::Build).expect(EXPECTED_BUILD_NOTICE);
+        assert!(
+            notice
+                .user_text()
+                .is_some_and(|text| text.contains(crate::prompt::BUILD_MODE_MARKER))
+        );
+    }
+
+    #[test]
+    fn repeated_build_turns_announce_once() {
+        let history = [
+            plan_announcement(),
+            mode_switch_notice(&[plan_announcement()], &AgentMode::Build)
+                .expect(EXPECTED_BUILD_NOTICE),
+        ];
+        assert!(mode_switch_notice(&history, &AgentMode::Build).is_none());
+    }
+
+    #[test]
+    fn repeated_plan_turns_announce_once() {
+        let history = [plan_announcement()];
+        assert!(mode_switch_notice(&history, &plan_mode()).is_none());
+    }
+
+    /// The case an in-memory previous mode cannot catch: `Agent` is rebuilt per
+    /// run, so only the transcript still knows the session was planning.
+    #[test]
+    fn a_restored_plan_transcript_switched_to_build_announces_build() {
+        let history = [
+            plan_announcement(),
+            Message::user("draft the plan".into()),
+            Message::observation("a mention preamble".into()),
+        ];
+        let notice = mode_switch_notice(&history, &AgentMode::Build).expect(EXPECTED_BUILD_NOTICE);
+        assert!(
+            notice
+                .user_text()
+                .is_some_and(|text| text.contains(crate::prompt::BUILD_MODE_MARKER))
+        );
+    }
+
+    /// Only Caudra's own announcements count, or quoting this conversation back
+    /// at the model would rewrite its mode.
+    #[test]
+    fn a_marker_quoted_by_the_user_is_not_an_announcement() {
+        let history = [Message::user(crate::prompt::PLAN_MODE_MARKER.into())];
+        assert!(mode_switch_notice(&history, &AgentMode::Build).is_none());
+    }
+
+    #[test]
+    fn run_announces_plan_mode_ahead_of_the_user_message() {
+        smol::block_on(async {
+            let mut history = History::new(Vec::new());
+            let (mut agent, _event_rx) = make_agent(
+                MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+                &mut history,
+            );
+            let mut input = default_input();
+            input.mode = plan_mode();
+
+            agent.run(input).await.unwrap();
+            drop(agent);
+
+            assert!(
+                history.as_slice()[0]
+                    .user_text()
+                    .is_some_and(|text| text.contains(crate::prompt::PLAN_MODE_MARKER))
+            );
+            assert_eq!(history.as_slice()[1].user_text(), Some("hello"));
         });
     }
 

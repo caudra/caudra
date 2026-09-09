@@ -33,7 +33,9 @@ Prioritize correctness bugs, regressions, and missing tests.
 Do not edit files unless the user explicitly asks.
 ```
 
-`layout: overlay` is the default, so the frontmatter is optional. Caudra inserts the profile after runtime context and before the plan mode reminder.
+`layout: overlay` is the default, so the frontmatter is optional. Caudra inserts the profile after runtime context and before the mode section.
+
+The system prompt is identical in plan and build mode. The active mode is announced in the conversation instead, so toggling modes does not invalidate the prompt cache.
 
 ## Control the layout
 
@@ -67,7 +69,7 @@ Act as a security-focused reviewer. Report findings before summaries.
 | `{{caudra.conventions}}` | Git, security, and plugin conventions |
 | `{{caudra.completion}}` | Completion requirements |
 | `{{caudra.context}}` | Environment, model, instruction files, and plugin runtime context |
-| `{{caudra.plan}}` | The plan mode reminder when plan mode is active |
+| `{{caudra.plan}}` | How plan and build mode work. Identical in both modes |
 
 A directive expands only when it occupies a complete line. Prefix it with `\` to keep it literal, for example `\{{caudra.tools}}`.
 

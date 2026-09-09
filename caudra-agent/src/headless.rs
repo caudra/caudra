@@ -736,7 +736,6 @@ pub fn spawn(mut params: HeadlessParams) -> HeadlessHandle {
 
     let system = agent::build_system_prompt(
         &vars,
-        &mode,
         &instructions.text,
         &params.prompt_slots,
         &tool_filter,
@@ -1132,7 +1131,6 @@ pub fn spawn_prepared_interactive(prepared: PreparedInteractive) -> InteractiveH
                 let mut system = params.system_prompt_override.clone().unwrap_or_else(|| {
                     agent::build_system_prompt(
                         &vars,
-                        &input.mode,
                         &instructions.text,
                         &params.prompt_slots,
                         &tool_filter,

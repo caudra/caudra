@@ -430,7 +430,6 @@ impl AgentLoop {
         let tool_filter = ToolFilter::from_config(&self.config, &slot.model, &[]);
         let system = agent::build_system_prompt(
             &self.vars,
-            &input.mode,
             &self.instructions.text,
             &prompt_slots,
             &tool_filter,
@@ -596,7 +595,6 @@ impl AgentLoop {
         let tool_filter = ToolFilter::from_config(&self.config, &slot.model, &[]);
         let system = agent::build_system_prompt(
             &self.vars,
-            &caudra_agent::AgentMode::Build,
             &self.instructions.text,
             prompt_slots,
             &tool_filter,

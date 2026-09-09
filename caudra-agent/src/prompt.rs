@@ -22,7 +22,17 @@ const SYSTEM_STYLE: &str = include_str!("prompts/system_style.md");
 const SYSTEM_TOOLS: &str = include_str!("prompts/system_tools.md");
 const SYSTEM_CONVENTIONS: &str = include_str!("prompts/system_conventions.md");
 const SYSTEM_COMPLETION: &str = include_str!("prompts/system_completion.md");
+/// Announced in the conversation rather than the system prompt: the system
+/// block sits ahead of every message in the cache prefix, so varying it by mode
+/// re-caches the whole history on each toggle.
 pub const PLAN_PROMPT: &str = include_str!("prompts/plan.md");
+pub const BUILD_PROMPT: &str = include_str!("prompts/build.md");
+/// The mode-invariant half, which stays in the system prompt.
+pub const MODES_PROMPT: &str = include_str!("prompts/modes.md");
+/// Headings of the two announcements. Emitting and detecting a mode share one
+/// constant so history stays the source of truth.
+pub const BUILD_MODE_MARKER: &str = "# Build Mode";
+pub const PLAN_MODE_MARKER: &str = "# Plan Mode";
 pub const RESEARCH_PROMPT: &str = include_str!("prompts/research.md");
 pub const GENERAL_PROMPT: &str = include_str!("prompts/general.md");
 pub const COMPACTION_SYSTEM: &str = include_str!("prompts/compaction.md");
