@@ -21,8 +21,8 @@ use caudra_agent::tools::{
 use caudra_agent::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentParams, AgentRunParams, CancelMap,
     CancelToken, CancelTrigger, DoneReason, Envelope, EventSender, GoalHandle, History,
-    Instructions, McpCommand, Nudge, PromptRole, SessionMailbox, SharedHistory,
-    SubagentHistoryStore, ToolOutputLines,
+    InstructionBaseline, Instructions, McpCommand, Nudge, PromptRole, SessionMailbox,
+    SharedHistory, SubagentHistoryStore, ToolOutputLines,
 };
 use caudra_config::ModelPolicy;
 use caudra_lua::EventHandle;
@@ -40,7 +40,7 @@ pub(super) struct AgentLoop {
     config: AgentConfig,
     tool_output_lines: ToolOutputLines,
     vars: Vars,
-    instructions: Instructions,
+    instructions: InstructionBaseline,
     tools: Value,
     /// Withheld from `tools` until `tool_search` loads them. Rebuilt with
     /// `tools`, so a model switch reconsiders both halves together.
@@ -120,7 +120,7 @@ impl AgentLoop {
             config,
             tool_output_lines,
             vars: Vars::default(),
-            instructions: Instructions::default(),
+            instructions: InstructionBaseline::default(),
             tools: Value::Null,
             deferred: Vec::new(),
             mcp,
@@ -386,9 +386,13 @@ impl AgentLoop {
 
         let old_cwd = self.vars.apply("{cwd}").into_owned();
         self.vars = template::env_vars();
-        if *self.vars.apply("{cwd}") != old_cwd {
+        let instructions = if *self.vars.apply("{cwd}") != old_cwd {
             self.reload_instructions().await;
-        }
+            None
+        } else {
+            let current = self.read_instructions().await;
+            self.instructions.drift(current, self.history.epoch())
+        };
         self.rebuild_tools(&slot.model, &input.thinking, input.workflow);
 
         if let Some(ref prompt_ref) = input.prompt {
@@ -429,7 +433,7 @@ impl AgentLoop {
             .await;
         let tool_filter = ToolFilter::from_config(&self.config, &slot.model, &[]);
         let system = agent::build_system_prompt(
-            &self.instructions.text,
+            self.instructions.text(),
             &prompt_slots,
             &tool_filter,
             self.system_prompt_profile.as_deref(),
@@ -477,12 +481,13 @@ impl AgentLoop {
                 history: &mut self.history,
                 system,
                 environment: Some(agent::environment_block(&self.vars, &slot.model)),
+                instructions,
                 event_tx,
                 tools: self.tools.clone(),
                 deferred: self.deferred.clone(),
             },
         )
-        .with_loaded_instructions(self.instructions.loaded.clone())
+        .with_loaded_instructions(self.instructions.loaded().clone())
         .with_user_response_rx(Arc::clone(&self.answer_rx))
         .with_interrupt_source(Arc::clone(&self.queue) as Arc<dyn caudra_agent::InterruptSource>)
         .with_cancel(cancel)
@@ -554,9 +559,16 @@ impl AgentLoop {
         )
     }
 
-    async fn reload_instructions(&mut self) {
+    async fn read_instructions(&self) -> Instructions {
         let cwd = self.vars.apply("{cwd}").into_owned();
-        self.instructions = smol::unblock(move || agent::load_instructions(&cwd)).await;
+        smol::unblock(move || agent::load_instructions(&cwd)).await
+    }
+
+    /// Rewrites the system prompt to match disk, so it is only free while the
+    /// prefix cache is cold anyway: at startup, or on a change of directory.
+    async fn reload_instructions(&mut self) {
+        let current = self.read_instructions().await;
+        self.instructions = InstructionBaseline::adopt(current, self.history.epoch());
     }
 
     /// The array a request actually carries. `self.tools` is the declared base, and a run
@@ -593,7 +605,7 @@ impl AgentLoop {
         let slot = self.model_slot.load();
         let tool_filter = ToolFilter::from_config(&self.config, &slot.model, &[]);
         let system = agent::build_system_prompt(
-            &self.instructions.text,
+            self.instructions.text(),
             prompt_slots,
             &tool_filter,
             self.system_prompt_profile.as_deref(),

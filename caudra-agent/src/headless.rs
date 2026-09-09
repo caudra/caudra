@@ -814,6 +814,7 @@ pub fn spawn(mut params: HeadlessParams) -> HeadlessHandle {
                     history: &mut history,
                     system,
                     environment: Some(agent::environment_block(&vars, &params.model)),
+                    instructions: None,
                     event_tx,
                     tools,
                     deferred,
@@ -992,6 +993,8 @@ pub fn spawn_prepared_interactive(prepared: PreparedInteractive) -> InteractiveH
         },
     );
 
+    let mut baseline = agent::InstructionBaseline::adopt(instructions, history.epoch());
+
     let initial_messages = history.as_slice();
     let mcp = params.mcp_handle.clone().map(|h| {
         McpSession::new(h, initial_messages).with_disabled_tools(&params.config.disabled_tools)
@@ -1127,9 +1130,15 @@ pub fn spawn_prepared_interactive(prepared: PreparedInteractive) -> InteractiveH
                     },
                 );
 
+                let instructions = {
+                    let cwd = vars.apply("{cwd}").into_owned();
+                    let current = smol::unblock(move || agent::load_instructions(&cwd)).await;
+                    baseline.drift(current, history.epoch())
+                };
+
                 let mut system = params.system_prompt_override.clone().unwrap_or_else(|| {
                     agent::build_system_prompt(
-                        &instructions.text,
+                        baseline.text(),
                         &params.prompt_slots,
                         &tool_filter,
                         params.system_prompt_profile.as_deref(),
@@ -1178,12 +1187,13 @@ pub fn spawn_prepared_interactive(prepared: PreparedInteractive) -> InteractiveH
                         history: &mut history,
                         system,
                         environment: Some(agent::environment_block(&vars, &model)),
+                        instructions,
                         event_tx,
                         tools: definitions.declared,
                         deferred: definitions.deferred,
                     },
                 )
-                .with_loaded_instructions(instructions.loaded.clone())
+                .with_loaded_instructions(baseline.loaded().clone())
                 .with_user_response_rx(Arc::clone(&answer_rx))
                 .with_cancel(cancel)
                 .with_local_tools(Arc::clone(&params.local_tools))

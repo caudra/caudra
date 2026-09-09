@@ -18,10 +18,10 @@ pub use mentions::Mention;
 pub(crate) mod task_set;
 pub use agent::{
     Agent, AgentParams, AgentRunParams, GoalError, GoalHandle, GoalResult, GoalSnapshot,
-    GoalStatus, GoalVerdict, History, HistorySnapshot, Instructions, LoadedInstructions,
-    MAX_GOAL_CHARS, SharedHistory, UNAVAILABLE_RESULT, close_dangling_tool_calls,
-    find_subdirectory_instructions, goal_checkin_message, goal_kickoff_message,
-    is_instruction_file, project_for_provider, project_for_target,
+    GoalStatus, GoalVerdict, History, HistorySnapshot, InstructionBaseline, Instructions,
+    LoadedInstructions, MAX_GOAL_CHARS, SharedHistory, UNAVAILABLE_RESULT,
+    close_dangling_tool_calls, find_subdirectory_instructions, goal_checkin_message,
+    goal_kickoff_message, is_instruction_file, project_for_provider, project_for_target,
 };
 pub use cancel::{CancelMap, CancelToken, CancelTrigger};
 pub use caudra_config::{AgentConfig, PermissionsConfig, ToolOutputLines};

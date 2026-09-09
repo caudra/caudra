@@ -23,8 +23,9 @@ pub use history::{
     History, HistorySnapshot, SharedHistory, UNAVAILABLE_RESULT, close_dangling_tool_calls,
 };
 pub use instructions::{
-    Instructions, LoadedInstructions, build_system_prompt, environment_block,
-    find_subdirectory_instructions, is_instruction_file, load_instruction_text, load_instructions,
+    InstructionBaseline, InstructionScope, Instructions, LoadedInstructions, build_system_prompt,
+    environment_block, find_subdirectory_instructions, is_instruction_file, load_instruction_text,
+    load_instructions,
 };
 pub use provider_projection::{project as project_for_provider, project_for_target};
 pub use run::{

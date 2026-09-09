@@ -308,6 +308,7 @@ impl Subagent {
             self.params.clone(),
             AgentRunParams {
                 environment: None,
+                instructions: None,
                 history: &mut self.history,
                 system: self.system.clone(),
                 event_tx: self.sub_event_tx.clone(),

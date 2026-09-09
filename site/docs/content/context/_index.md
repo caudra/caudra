@@ -99,6 +99,18 @@ After the match it always loads `AGENTS.local.md` from the same directory if pre
 
 That `web/AGENTS.md` is not dead weight. The first time `file_read` opens a file under a subdirectory whose instruction file was never loaded, Caudra pulls it in. Monorepo rules live next to the code they govern and cost nothing until someone works there.
 
+Each file arrives in the system prompt wrapped in a tag naming where it came from, so your rules cannot be mistaken for Caudra's own and a file that opens with a heading cannot read as a new prompt section:
+
+```
+<instructions scope="project" path="/home/you/repo/AGENTS.md">
+...
+</instructions>
+```
+
+`scope` is `project`, `local`, or `global`.
+
+Editing one of these files mid-session takes effect on your next message. The system prompt keeps the text it was built with, because rewriting it would invalidate the whole cached prefix on every save; the change reaches the model as a diff against that text instead. Compaction and `/undo` replace the conversation and have already given up that cache, so they quietly rebuild the system prompt from disk.
+
 Put coding conventions, repo quirks, and off-limits directories in these files. Keep them short; the next section explains why.
 
 ## Four places to put knowledge

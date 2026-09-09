@@ -23,6 +23,9 @@ const INSTRUCTION_FILES: &[&str] = &[
 ];
 
 const LOCAL_INSTRUCTION_FILE: &str = "AGENTS.local.md";
+/// The drift diff spans every instruction file at once, so it names the section
+/// of the system prompt it patches rather than any one path.
+const INSTRUCTIONS_DISPLAY_PATH: &str = "instructions";
 
 #[derive(Clone, Default)]
 pub struct LoadedInstructions(Arc<Mutex<HashSet<PathBuf>>>);
@@ -72,6 +75,57 @@ pub fn environment_block(vars: &Vars, model: &Model) -> String {
         .replace(crate::prompt::MODEL_SLOT, &model.spec())
 }
 
+/// The instruction snapshot the system prompt quotes, pinned.
+///
+/// Instruction files change while a session runs. Reloading them into the
+/// system prompt would invalidate the whole cached prefix on every save, so the
+/// baseline stays put and an edit reaches the model as a diff against it.
+/// Compaction and conversation revert swap the transcript wholesale and have
+/// already paid that cost, which is the one moment a fresh baseline is free.
+#[derive(Default)]
+pub struct InstructionBaseline {
+    instructions: Instructions,
+    epoch: u64,
+}
+
+impl InstructionBaseline {
+    pub fn adopt(instructions: Instructions, epoch: u64) -> Self {
+        Self {
+            instructions,
+            epoch,
+        }
+    }
+
+    pub fn text(&self) -> &str {
+        &self.instructions.text
+    }
+
+    pub fn loaded(&self) -> &LoadedInstructions {
+        &self.instructions.loaded
+    }
+
+    /// `epoch` is the history epoch, which changes only when the conversation
+    /// was replaced. Returns the reminder to announce, or `None` when the
+    /// baseline already matches `current` or was quietly refreshed to it.
+    pub fn drift(&mut self, current: Instructions, epoch: u64) -> Option<String> {
+        let swapped = epoch != std::mem::replace(&mut self.epoch, epoch);
+        if current.text == self.instructions.text {
+            return None;
+        }
+        if swapped {
+            self.instructions = current;
+            return None;
+        }
+        let diff = crate::diff::unified_text(
+            &self.instructions.text,
+            &current.text,
+            &crate::diff::stat(&self.instructions.text, &current.text),
+            INSTRUCTIONS_DISPLAY_PATH,
+        );
+        Some(crate::prompt::INSTRUCTIONS_CHANGED_PROMPT.replace(crate::prompt::DIFF_SLOT, &diff))
+    }
+}
+
 fn read_instruction(path: &Path, loaded: &LoadedInstructions) -> Option<(PathBuf, String)> {
     let canonical = path.canonicalize().ok()?;
     if loaded.contains_or_insert(canonical.clone()) {
@@ -81,11 +135,45 @@ fn read_instruction(path: &Path, loaded: &LoadedInstructions) -> Option<(PathBuf
     Some((canonical, content))
 }
 
+/// Where a set of instructions came from. Rendered as an attribute rather than
+/// three tag names: the scope is data, and one tag keeps the drift diff and any
+/// future parsing simple.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstructionScope {
+    Project,
+    Local,
+    Global,
+}
+
+impl InstructionScope {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Project => "project",
+            Self::Local => "local",
+            Self::Global => "global",
+        }
+    }
+}
+
+/// Delimited so the model can tell a project's instructions from Caudra's own,
+/// and so a file that opens with a heading cannot read as a new prompt section.
+fn render(files: Vec<(InstructionScope, String, String)>) -> String {
+    let mut text = String::new();
+    for (scope, path, content) in files {
+        text.push_str(&format!(
+            "\n\n<instructions scope=\"{}\" path=\"{path}\">\n{}\n</instructions>",
+            scope.as_str(),
+            content.trim_end()
+        ));
+    }
+    text
+}
+
 fn collect_instruction_files(
     cwd: &str,
     xdg_config: Option<&Path>,
     loaded: &LoadedInstructions,
-) -> Vec<(String, String)> {
+) -> Vec<(InstructionScope, String, String)> {
     let mut out = Vec::new();
 
     let ancestor_dirs: Vec<_> = find_project_ancestor_dirs(Path::new(cwd)).collect();
@@ -101,7 +189,8 @@ fn collect_instruction_files(
         for filename in INSTRUCTION_FILES {
             if let Some((canonical, content)) = read_instruction(&dir.join(filename), loaded) {
                 out.push((
-                    format!("Project instructions ({})", canonical.display()),
+                    InstructionScope::Project,
+                    canonical.display().to_string(),
                     content,
                 ));
                 break;
@@ -112,7 +201,8 @@ fn collect_instruction_files(
             read_instruction(&dir.join(LOCAL_INSTRUCTION_FILE), loaded)
         {
             out.push((
-                format!("Local instructions ({})", canonical.display()),
+                InstructionScope::Local,
+                canonical.display().to_string(),
                 content,
             ));
         }
@@ -121,8 +211,11 @@ fn collect_instruction_files(
     if let Some(path) = caudra_storage::paths::user_config_dir(xdg_config, "AGENTS.md")
         && let Some((canonical, content)) = read_instruction(&path, loaded)
     {
-        let label = format!("Global instructions ({})", canonical.display());
-        out.push((label, content));
+        out.push((
+            InstructionScope::Global,
+            canonical.display().to_string(),
+            content,
+        ));
     }
 
     out
@@ -134,13 +227,7 @@ pub fn load_instruction_text(cwd: &str) -> String {
 
 pub(crate) fn load_instruction_text_in(cwd: &str, xdg_config: Option<&Path>) -> String {
     let loaded = LoadedInstructions::new();
-    let files = collect_instruction_files(cwd, xdg_config, &loaded);
-
-    let mut text = String::new();
-    for (label, content) in files {
-        text.push_str(&format!("\n\n{label}:\n{content}"));
-    }
-    text
+    render(collect_instruction_files(cwd, xdg_config, &loaded))
 }
 
 pub fn load_instructions(cwd: &str) -> Instructions {
@@ -149,12 +236,7 @@ pub fn load_instructions(cwd: &str) -> Instructions {
 
 pub(crate) fn load_instructions_in(cwd: &str, xdg_config: Option<&Path>) -> Instructions {
     let mut instr = Instructions::default();
-    let files = collect_instruction_files(cwd, xdg_config, &instr.loaded);
-
-    for (label, content) in files {
-        instr.text.push_str(&format!("\n\n{label}:\n{content}"));
-    }
-
+    instr.text = render(collect_instruction_files(cwd, xdg_config, &instr.loaded));
     instr
 }
 
@@ -199,6 +281,10 @@ mod tests {
     use super::*;
 
     const PLAN_PATH: &str = ".caudra/plans/123.md";
+    const BASELINE_TEXT: &str = "# Code guidelines\n";
+    const EDITED_TEXT: &str = "# Code guidelines\nbe brief\n";
+    const EXPECTED_DRIFT_NOTICE: &str = "an edited instruction file should be announced";
+    const EPOCH: u64 = 7;
 
     fn system_prompt() -> String {
         build_system_prompt(
@@ -289,6 +375,115 @@ mod tests {
             text.find("team rules").unwrap() < text.find("my preferences").unwrap(),
             "project instructions should come before local instructions"
         );
+    }
+
+    /// Unlabelled instructions read as another section of Caudra's own prompt,
+    /// and a file that opens with a heading can shadow one. The tags scope them.
+    #[test_case(InstructionScope::Project, "AGENTS.md" ; "project")]
+    #[test_case(InstructionScope::Local, "AGENTS.local.md" ; "local")]
+    fn instruction_files_are_delimited_by_scope_and_path(scope: InstructionScope, file: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(file), "# Code guidelines\nbe brief\n").unwrap();
+        let path = dir.path().join(file).canonicalize().unwrap();
+
+        let text = load_instructions_in(dir.path().to_str().unwrap(), None).text;
+        assert_eq!(
+            text.trim(),
+            format!(
+                "<instructions scope=\"{}\" path=\"{}\">\n# Code guidelines\nbe brief\n</instructions>",
+                scope.as_str(),
+                path.display()
+            )
+        );
+    }
+
+    fn baseline_of(text: &str) -> InstructionBaseline {
+        InstructionBaseline::adopt(
+            Instructions {
+                text: text.into(),
+                ..Instructions::default()
+            },
+            EPOCH,
+        )
+    }
+
+    fn instructions_of(text: &str) -> Instructions {
+        Instructions {
+            text: text.into(),
+            ..Instructions::default()
+        }
+    }
+
+    #[test]
+    fn an_unchanged_instruction_file_says_nothing() {
+        assert!(
+            baseline_of(BASELINE_TEXT)
+                .drift(instructions_of(BASELINE_TEXT), EPOCH)
+                .is_none()
+        );
+    }
+
+    /// The point of the whole exercise: the system prompt keeps quoting the old
+    /// text, so the change has to arrive as a diff against it.
+    #[test]
+    fn an_edited_instruction_file_is_announced_as_a_diff() {
+        let mut baseline = baseline_of(BASELINE_TEXT);
+        let notice = baseline
+            .drift(instructions_of(EDITED_TEXT), EPOCH)
+            .expect(EXPECTED_DRIFT_NOTICE);
+
+        assert!(notice.contains(crate::prompt::INSTRUCTIONS_CHANGED_MARKER));
+        assert!(notice.contains("+ be brief"));
+        assert!(!notice.contains(crate::prompt::DIFF_SLOT));
+        assert_eq!(
+            baseline.text(),
+            BASELINE_TEXT,
+            "the baseline is what the system prompt still carries"
+        );
+    }
+
+    /// Replacing the conversation has already cost the prefix cache, so that is
+    /// the one moment the system prompt can be rewritten for free.
+    #[test]
+    fn a_replaced_conversation_adopts_the_new_instructions_silently() {
+        let mut baseline = baseline_of(BASELINE_TEXT);
+        assert!(
+            baseline
+                .drift(instructions_of(EDITED_TEXT), EPOCH + 1)
+                .is_none()
+        );
+        assert_eq!(baseline.text(), EDITED_TEXT);
+    }
+
+    /// The reminder is deduplicated against the transcript by exact text, so an
+    /// unchanging file must not produce a new one on every turn.
+    #[test]
+    fn a_repeated_drift_notice_is_identical() {
+        let mut baseline = baseline_of(BASELINE_TEXT);
+        let first = baseline.drift(instructions_of(EDITED_TEXT), EPOCH);
+        let second = baseline.drift(instructions_of(EDITED_TEXT), EPOCH);
+        assert_eq!(first, second);
+        assert!(first.is_some(), "{EXPECTED_DRIFT_NOTICE}");
+    }
+
+    /// A swap that lands while the files are untouched must not leave the
+    /// baseline looking stale, or the next real edit rewrites the system prompt
+    /// against a cache that has since gone warm again.
+    #[test]
+    fn a_replacement_without_an_edit_still_settles_the_baseline() {
+        let mut baseline = baseline_of(BASELINE_TEXT);
+        assert!(
+            baseline
+                .drift(instructions_of(BASELINE_TEXT), EPOCH + 1)
+                .is_none()
+        );
+        assert!(
+            baseline
+                .drift(instructions_of(EDITED_TEXT), EPOCH + 1)
+                .is_some(),
+            "{EXPECTED_DRIFT_NOTICE}"
+        );
+        assert_eq!(baseline.text(), BASELINE_TEXT);
     }
 
     #[test]

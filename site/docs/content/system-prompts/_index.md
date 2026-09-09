@@ -35,7 +35,7 @@ Do not edit files unless the user explicitly asks.
 
 `layout: overlay` is the default, so the frontmatter is optional. Caudra inserts the profile after runtime context and before the mode section.
 
-The system prompt is identical in plan and build mode, and carries no working directory, date, or model. All of those are announced in the conversation instead, and re-announced only when they change, so switching mode, crossing midnight, or changing model does not invalidate the prompt cache.
+The system prompt is identical in plan and build mode, and carries no working directory, date, or model. All of those are announced in the conversation instead, and re-announced only when they change, so switching mode, crossing midnight, or changing model does not invalidate the prompt cache. Editing an instruction file mid-session is announced the same way, as a diff against the copy the prompt already carries.
 
 ## Control the layout
 

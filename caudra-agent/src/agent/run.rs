@@ -138,6 +138,10 @@ pub struct AgentRunParams<'h> {
     /// `None` for a subagent, whose task prompt carries its own environment
     /// section and which is too short-lived for the announcement to pay.
     pub environment: Option<String>,
+    /// A diff against the instruction files `system` quotes, when they have
+    /// since changed on disk. `None` when they match, and for a subagent, which
+    /// reads them fresh at spawn.
+    pub instructions: Option<String>,
     pub event_tx: EventSender,
     pub tools: Value,
     /// Definitions the request holds back until `tool_search` loads them.
@@ -151,6 +155,7 @@ pub struct Agent<'h> {
     history: &'h mut History,
     system: String,
     environment: Option<String>,
+    instructions: Option<String>,
     event_tx: EventSender,
     tools: Value,
     deferral: DeferralSession,
@@ -219,6 +224,7 @@ impl<'h> Agent<'h> {
             history: run.history,
             system: run.system,
             environment: run.environment,
+            instructions: run.instructions,
             event_tx: run.event_tx,
             tools: run.tools,
             deferral,
@@ -477,9 +483,15 @@ impl<'h> Agent<'h> {
         let Some(latest) = inputs.last() else {
             return String::new();
         };
-        let mut standing = Vec::from_iter(environment_notice(
+        let mut standing = Vec::from_iter(standing_notice(
             self.history.as_slice(),
+            crate::prompt::ENVIRONMENT_MARKER,
             self.environment.as_deref(),
+        ));
+        standing.extend(standing_notice(
+            self.history.as_slice(),
+            crate::prompt::INSTRUCTIONS_CHANGED_MARKER,
+            self.instructions.as_deref(),
         ));
         standing.extend(mode_switch_notice(self.history.as_slice(), &latest.mode));
         self.mode = latest.mode.clone();
@@ -1314,15 +1326,15 @@ fn last_announced<'a>(history: &'a [Message], marker: &str) -> Option<&'a str> {
         .find_map(|message| message.user_text().filter(|text| text.contains(marker)))
 }
 
-/// Restates the environment when the transcript does not already end with this
-/// exact block, which covers a first turn, a date rollover, a model switch, and
-/// a compaction that dropped the previous announcement.
-fn environment_notice(history: &[Message], environment: Option<&str>) -> Option<Message> {
-    let environment = environment?;
-    if last_announced(history, crate::prompt::ENVIRONMENT_MARKER) == Some(environment) {
+/// Restates `text` when the transcript does not already carry this exact block.
+/// Idempotent by construction, which is what covers a first turn, a change in
+/// the underlying value, and a compaction that dropped the last announcement.
+fn standing_notice(history: &[Message], marker: &str, text: Option<&str>) -> Option<Message> {
+    let text = text?;
+    if last_announced(history, marker) == Some(text) {
         return None;
     }
-    Some(Message::observation(environment.to_owned()))
+    Some(Message::observation(text.to_owned()))
 }
 
 /// The mode the transcript last told the model it was in.
@@ -1523,6 +1535,8 @@ mod tests {
     const ENVIRONMENT_NEXT_DAY: &str =
         "<system-reminder>\n# Environment\n\n- Date: 2026-09-10\n</system-reminder>";
     const EXPECTED_ENVIRONMENT_NOTICE: &str = "a changed environment must be announced";
+    const INSTRUCTIONS_CHANGED: &str =
+        "<system-reminder>\n# Instructions changed\n\n+ be brief\n</system-reminder>";
 
     struct MockInterruptSource {
         commands: Mutex<VecDeque<ExtractedCommand>>,
@@ -1871,6 +1885,7 @@ mod tests {
                 history,
                 system: "system".into(),
                 environment: None,
+                instructions: None,
                 event_tx: EventSender::new(raw_tx, 0),
                 tools: serde_json::json!([]),
                 deferred: Vec::new(),
@@ -2512,7 +2527,8 @@ mod tests {
     }
 
     fn environment_announcement(environment: &str) -> Message {
-        environment_notice(&[], Some(environment)).expect(EXPECTED_ENVIRONMENT_NOTICE)
+        standing_notice(&[], crate::prompt::ENVIRONMENT_MARKER, Some(environment))
+            .expect(EXPECTED_ENVIRONMENT_NOTICE)
     }
 
     #[test]
@@ -2525,7 +2541,14 @@ mod tests {
     #[test]
     fn an_unchanged_environment_announces_once() {
         let history = [environment_announcement(ENVIRONMENT)];
-        assert!(environment_notice(&history, Some(ENVIRONMENT)).is_none());
+        assert!(
+            standing_notice(
+                &history,
+                crate::prompt::ENVIRONMENT_MARKER,
+                Some(ENVIRONMENT)
+            )
+            .is_none()
+        );
     }
 
     /// A date rollover or a model switch is the whole reason this is announced
@@ -2533,8 +2556,12 @@ mod tests {
     #[test]
     fn a_changed_environment_is_re_announced() {
         let history = [environment_announcement(ENVIRONMENT)];
-        let notice = environment_notice(&history, Some(ENVIRONMENT_NEXT_DAY))
-            .expect(EXPECTED_ENVIRONMENT_NOTICE);
+        let notice = standing_notice(
+            &history,
+            crate::prompt::ENVIRONMENT_MARKER,
+            Some(ENVIRONMENT_NEXT_DAY),
+        )
+        .expect(EXPECTED_ENVIRONMENT_NOTICE);
         assert_eq!(notice.user_text(), Some(ENVIRONMENT_NEXT_DAY));
     }
 
@@ -2544,16 +2571,20 @@ mod tests {
     fn a_compacted_history_re_announces_the_environment() {
         let history = [Message::user("what survived compaction".into())];
         assert_eq!(
-            environment_notice(&history, Some(ENVIRONMENT))
-                .expect(EXPECTED_ENVIRONMENT_NOTICE)
-                .user_text(),
+            standing_notice(
+                &history,
+                crate::prompt::ENVIRONMENT_MARKER,
+                Some(ENVIRONMENT)
+            )
+            .expect(EXPECTED_ENVIRONMENT_NOTICE)
+            .user_text(),
             Some(ENVIRONMENT)
         );
     }
 
     #[test]
     fn a_subagent_announces_no_environment() {
-        assert!(environment_notice(&[], None).is_none());
+        assert!(standing_notice(&[], crate::prompt::ENVIRONMENT_MARKER, None).is_none());
     }
 
     /// Announcements are only worth persisting if they come back as
@@ -2569,7 +2600,14 @@ mod tests {
         let restored = caudra_providers::project_messages(&items).unwrap();
 
         assert!(restored.iter().all(Message::is_observation));
-        assert!(environment_notice(&restored, Some(ENVIRONMENT)).is_none());
+        assert!(
+            standing_notice(
+                &restored,
+                crate::prompt::ENVIRONMENT_MARKER,
+                Some(ENVIRONMENT)
+            )
+            .is_none()
+        );
         assert!(mode_switch_notice(&restored, &plan_mode()).is_none());
     }
 
@@ -2596,6 +2634,49 @@ mod tests {
             );
             assert_eq!(history.as_slice()[2].user_text(), Some("hello"));
         });
+    }
+
+    /// Instruction drift patches the system prompt, so it has to land before
+    /// anything the model might act on under the stale text.
+    #[test]
+    fn run_announces_changed_instructions_between_the_environment_and_the_mode() {
+        smol::block_on(async {
+            let mut history = History::new(Vec::new());
+            let (mut agent, _event_rx) = make_agent(
+                MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+                &mut history,
+            );
+            agent.environment = Some(ENVIRONMENT.to_owned());
+            agent.instructions = Some(INSTRUCTIONS_CHANGED.to_owned());
+            let mut input = default_input();
+            input.mode = plan_mode();
+
+            agent.run(input).await.unwrap();
+            drop(agent);
+
+            let texts: Vec<_> = history
+                .as_slice()
+                .iter()
+                .filter_map(Message::user_text)
+                .collect();
+            assert_eq!(texts[0], ENVIRONMENT);
+            assert_eq!(texts[1], INSTRUCTIONS_CHANGED);
+            assert!(texts[2].contains(crate::prompt::PLAN_MODE_MARKER));
+            assert_eq!(texts[3], "hello");
+        });
+    }
+
+    #[test]
+    fn an_unchanged_instruction_notice_announces_once() {
+        let history = [Message::observation(INSTRUCTIONS_CHANGED.to_owned())];
+        assert!(
+            standing_notice(
+                &history,
+                crate::prompt::INSTRUCTIONS_CHANGED_MARKER,
+                Some(INSTRUCTIONS_CHANGED)
+            )
+            .is_none()
+        );
     }
 
     #[test]

@@ -33,6 +33,11 @@ pub const MODES_PROMPT: &str = include_str!("prompts/modes.md");
 /// changes when the user switches one.
 pub const ENVIRONMENT_PROMPT: &str = include_str!("prompts/environment.md");
 pub const ENVIRONMENT_MARKER: &str = "# Environment";
+/// Instruction files are snapshotted into the system prompt, so a later edit
+/// arrives as a diff against that snapshot rather than by rebuilding it.
+pub const INSTRUCTIONS_CHANGED_PROMPT: &str = include_str!("prompts/instructions_changed.md");
+pub const INSTRUCTIONS_CHANGED_MARKER: &str = "# Instructions changed";
+pub const DIFF_SLOT: &str = "{diff}";
 /// Not a [`Vars`](crate::template::Vars) entry: the model is per-run rather
 /// than a process-wide environment value, and is already threaded as `&Model`.
 pub const MODEL_SLOT: &str = "{model}";

@@ -56,6 +56,13 @@ impl History {
         self
     }
 
+    /// Bumped by `replace` and `truncate` but not by `extend`, so a caller can
+    /// tell a wholesale swap of the conversation from an append. Compaction and
+    /// conversation revert are the swaps, and both cool the message cache.
+    pub fn epoch(&self) -> u64 {
+        self.snapshot.epoch
+    }
+
     pub fn as_slice(&self) -> &[Message] {
         &self.messages
     }
