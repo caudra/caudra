@@ -48,10 +48,13 @@ deployment controllers, lease brokers, ontology tools, or harness-specific state
   clean copy; `rules-workcell/` holds rules authored here. Both are build inputs; do not add operator
   or project-local rule loading. Write a rule against output captured from the real tool in
   `crates/output-filter/evals`, never from a remembered format, and ship inline expectations with it.
-  It also owns the two command-independent reductions: terminal redraw rendering and progress line
-  collapse. Terminal rendering is decoding, not policy, so it stays unconditional and single-row; do
-  not gate it on a rule or add a screen buffer. Progress collapse is a judgement, so its gates stay
-  narrow and every gate keeps a negative fixture proving what it protects. Regenerate
+  It also owns the three command-independent reductions: terminal redraw rendering, escape stripping,
+  and progress line collapse. Terminal rendering is decoding, not policy, so it stays unconditional
+  and single-row; do not gate it on a rule or add a screen buffer. `scan_escape` is the only
+  definition of where a sequence ends and is shared by the renderer and the strip; a caller may
+  remove less than it finds but never more, and the strip must keep the `cat -v` caret form intact so
+  the documented way to read escapes back survives. Progress collapse is a judgement, so its gates
+  stay narrow and every gate keeps a negative fixture proving what it protects. Regenerate
   `tests/fixtures/progress` with `evals/capture-progress.py`; never hand-write a bar format.
 - `crates/net` owns outbound URL, DNS, redirect, retry, and response-body policy.
 - `crates/source-icons` owns bounded source-icon discovery and normalization.

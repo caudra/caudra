@@ -22,7 +22,15 @@
 //! Sequences with no cursor meaning, SGR colour above all, are zero width. They
 //! are anchored to the column they preceded and replayed at flush, so they never
 //! consume a cell and never shift the overwrite alignment of a coloured frame.
-//! Deciding whether they should survive at all remains `strip_ansi`'s job.
+//! Deciding whether they should survive at all belongs to
+//! [`strip_escape_sequences`](crate::strip_escape_sequences), which is where a
+//! caller that does not want them removes them.
+//!
+//! Where a sequence *ends* is not decided here. That is
+//! [`scan_escape`](crate::escape::scan_escape), shared with the strip so the two
+//! cannot disagree about what a sequence is.
+
+use crate::escape::{Scan, scan_escape};
 
 /// Widest row retained before the canvas is flushed and a new one begun.
 ///
@@ -37,19 +45,6 @@ const ROW_CANVAS_CHARS: usize = 16_384;
 /// separately from the canvas. Past the bound the row is still rendered; only
 /// further decoration is dropped.
 const ROW_MARK_BYTES: usize = 4_096;
-
-/// Longest escape sequence scanned before it is treated as a stray byte.
-const MAX_ESCAPE_CHARS: usize = 64;
-
-/// Longest operating-system-command payload scanned before the same.
-const MAX_OSC_CHARS: usize = 512;
-
-enum Scan {
-    /// The sequence ends before this index.
-    Found(usize),
-    /// The sequence is split across chunks and needs more input.
-    Incomplete,
-}
 
 /// Incremental renderer for one output stream.
 ///
@@ -346,50 +341,6 @@ impl RowRenderer {
             self.row_dirty = true;
         }
         self.column = column;
-    }
-}
-
-/// Finds the end of the escape sequence beginning at `start`.
-fn scan_escape(source: &[char], start: usize) -> Scan {
-    let Some(introducer) = source.get(start + 1) else {
-        return Scan::Incomplete;
-    };
-    match introducer {
-        '[' => {
-            let mut index = start + 2;
-            while let Some(character) = source.get(index) {
-                // A final byte ends a control sequence; parameter and
-                // intermediate bytes precede it.
-                if ('\u{40}'..='\u{7e}').contains(character) {
-                    return Scan::Found(index + 1);
-                }
-                index += 1;
-                if index - start > MAX_ESCAPE_CHARS {
-                    // Not a sequence any tool emits. Treat the introducer as a
-                    // stray byte so scanning cannot buffer without bound.
-                    return Scan::Found(start + 1);
-                }
-            }
-            Scan::Incomplete
-        }
-        ']' => {
-            let mut index = start + 2;
-            while let Some(character) = source.get(index) {
-                if *character == '\u{7}' {
-                    return Scan::Found(index + 1);
-                }
-                if *character == '\u{1b}' && source.get(index + 1) == Some(&'\\') {
-                    return Scan::Found(index + 2);
-                }
-                index += 1;
-                if index - start > MAX_OSC_CHARS {
-                    return Scan::Found(start + 1);
-                }
-            }
-            Scan::Incomplete
-        }
-        // Every other escape is two characters wide.
-        _ => Scan::Found(start + 2),
     }
 }
 

@@ -70,6 +70,15 @@ fn clean_environment_with(command: &mut Command, read: impl Fn(&str) -> Option<O
             command.env(name, value);
         }
     }
+    // Set, not forwarded. `env_clear` already dropped any inherited `NO_COLOR`,
+    // `FORCE_COLOR`, and `CLICOLOR_FORCE`, so this establishes a default for an
+    // environment that has none rather than overriding an operator's choice.
+    // Not conditioned on the output filter: this describes the environment a
+    // command runs in, not how its output is rendered, and a caller who disables
+    // filtering still sees exactly what the command wrote. An explicit
+    // `--color=always` still wins, which is the intended behaviour.
+    command.env("NO_COLOR", "1");
+    command.env("CLICOLOR", "0");
 }
 
 pub(crate) async fn terminate_and_reap(
@@ -233,6 +242,22 @@ mod tests {
                     .iter()
                     .any(|(candidate, forwarded)| candidate.as_str() == name && forwarded == value),
                 "{name} must reach the child unmodified"
+            );
+        }
+    }
+
+    #[test]
+    fn child_environment_defaults_to_no_colour() {
+        // Preventing the bytes is cheaper than deleting them afterwards, and it
+        // is the only lever that works on a tool the escape strip would have to
+        // rewrite. A value inherited from the parent must not defeat it.
+        let inherited = child_environment(&[("NO_COLOR", ""), ("CLICOLOR", "1")]);
+        for (name, expected) in [("NO_COLOR", "1"), ("CLICOLOR", "0")] {
+            assert!(
+                inherited
+                    .iter()
+                    .any(|(candidate, value)| candidate == name && value == expected),
+                "{name} must be set to {expected}"
             );
         }
     }

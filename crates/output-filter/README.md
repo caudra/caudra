@@ -1,10 +1,10 @@
 # workcell-output-filter
 
 `workcell-output-filter` renders captured command output so a bounded model-facing window carries
-proportionally more signal. It does three things: it decodes a terminal redraw stream into the rows a
-terminal would show, it applies a declarative rule set selected by command, and it collapses progress
-frames that arrive one per line. It performs no I/O, spawns no processes, and reads no configuration
-from disk.
+proportionally more signal. It does four things: it decodes a terminal redraw stream into the rows a
+terminal would show, it applies a declarative rule set selected by command, it removes terminal escape
+sequences, and it collapses progress frames that arrive one per line. It performs no I/O, spawns no
+processes, and reads no configuration from disk.
 
 ## Corpus
 
@@ -77,12 +77,33 @@ Stages run in a fixed order; later stages assume earlier ones have run.
 7. `max_lines` — absolute cap, applied after windowing so markers are counted
 8. `on_empty` — message when nothing survived
 
+## Escapes
+
+`strip_escape_sequences` removes decoration a terminal would have consumed:
+colour, cursor modes, window titles, hyperlinks. It is command-independent for
+the same reason the progress collapse is — a request that resolves to more than
+one command scope selects no rule, and an ad-hoc script with hardcoded colour is
+exactly such a request.
+
+It removes nothing but the sequences themselves. No line is dropped, joined, or
+reordered, which is what makes a one-word stage name adequate disclosure.
+
+Where a sequence *ends* is decided by `scan_escape`, shared with the renderer so
+the two cannot disagree about what a sequence is. A caller may decline to act on
+what the scanner finds but must never extend it: the strip declines a
+two-character escape whose second character is not printable, because removing
+`\x1b\n` would delete a line ending. Removing less is always safe.
+
+A caller that wants the bytes pipes through `cat -v`, `od -c`, or `sed -n l`.
+Those render ESC as a printable `^[` before the strip sees it, which is why no
+per-call opt-out is needed and why a fixture pins that the caret form survives.
+
 ## Progress
 
-Two reductions are command-independent, because the programs that emit progress
-bars are overwhelmingly ones no rule names — a training script, an ad-hoc
-downloader — and a rule cannot be written for a program that does not exist yet.
-Neither is selected by `match_command`.
+Two further reductions are command-independent, for the same reason: the programs
+that emit progress bars are overwhelmingly ones no rule names — a training
+script, an ad-hoc downloader — and a rule cannot be written for a program that
+does not exist yet. Neither is selected by `match_command`.
 
 `render_terminal` and `RowRenderer` decode a redraw stream. A bar that redraws
 does not emit lines; it emits `\r`, overwriting text, and erase sequences, so
@@ -148,6 +169,8 @@ it were a library's output.
 
 - Filtering is a rendering step. It is not a substitute for retaining the raw capture, and callers
   are expected to keep one.
+- `scan_escape` is the only definition of where an escape sequence ends. The renderer and the strip
+  share it; a caller may remove less than it finds but never more.
 - Terminal rendering is faithful but not lossless: the overwritten frames are gone. It reports how
   many it absorbed so a caller can disclose that, and it is applied where the caller still holds the
   exact byte count and, in the shell tool, the untouched progress stream.

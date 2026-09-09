@@ -341,11 +341,31 @@ fn a_coloured_bar_overwrites_on_visible_columns_only() {
 }
 
 #[test]
-fn private_mode_sequences_are_left_for_strip_ansi() {
+fn private_mode_sequences_are_left_for_the_escape_strip() {
     // `\x1b[?25l` hides the cursor; it is not motion and must not be silently
-    // consumed by a renderer that claims only to model the cursor.
+    // consumed by a renderer that claims only to model the cursor. Removing it
+    // belongs to `strip_escape_sequences`, which is asserted to do so in its own
+    // module — a handoff this test names but does not itself prove.
     let (rendered, _) = render_terminal("\u{1b}[?25labc\u{1b}[?25h\n");
     assert_eq!(rendered, "\u{1b}[?25labc\u{1b}[?25h\n");
+    assert_eq!(
+        workcell_output_filter::strip_escape_sequences(&rendered).0,
+        "abc\n"
+    );
+}
+
+#[test]
+fn a_charset_selection_does_not_leave_its_final_byte_as_text() {
+    // `\x1b(B` is three characters. A renderer that assumed two would consume
+    // `\x1b(` and write `B` into the row as a visible cell, so the strip would
+    // then leave `Babc` — output the command never printed. The sequence is
+    // retained whole, and what survives the strip is the text alone.
+    let (rendered, _) = render_terminal("\u{1b}(Babc\n");
+    assert_eq!(rendered, "\u{1b}(Babc\n");
+    assert_eq!(
+        workcell_output_filter::strip_escape_sequences(&rendered).0,
+        "abc\n"
+    );
 }
 
 #[test]

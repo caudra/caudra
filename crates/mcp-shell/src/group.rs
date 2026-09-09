@@ -36,7 +36,10 @@ use std::{
 };
 use tokio::sync::{Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
-use workcell_output_filter::{Rule as FilterRule, collapse_progress_lines};
+use workcell_output_filter::{Rule as FilterRule, collapse_progress_lines, strip_escape_sequences};
+
+/// Name reported for the command-independent escape reduction.
+const ESCAPE_STAGE: &str = "escapes";
 
 /// Name reported for the command-independent progress reduction.
 const PROGRESS_STAGE: &str = "progress";
@@ -380,11 +383,12 @@ impl ShellToolGroup {
 
     /// Builds the model-facing rendering from the retained tails.
     ///
-    /// Two reductions can apply. A corpus rule is selected by command and knows
-    /// the format it is reading. The progress collapse is command-independent,
-    /// because the commands that emit bars are overwhelmingly ones no rule names
-    /// — a training script or an ad-hoc program — and a rule cannot be written
-    /// for a program that does not exist yet.
+    /// Three reductions can apply. A corpus rule is selected by command and
+    /// knows the format it is reading. The escape strip and the progress
+    /// collapse are command-independent, because the commands that emit
+    /// decoration and bars are overwhelmingly ones no rule names — a deploy
+    /// script or an ad-hoc program — and a rule cannot be written for a program
+    /// that does not exist yet.
     fn render_with_filter(
         &self,
         output: &ShellOutput,
@@ -403,6 +407,17 @@ impl ShellToolGroup {
         // what survived instead of on the raw end of the stream.
         let stdout = stdout_tail.text();
         let stderr = stderr_tail.text();
+
+        // Runs before rule selection for two reasons. Rule patterns are authored
+        // against clean text, so a coloured line silently evades a
+        // `strip_lines_matching` that was written to catch it; and the progress
+        // collapse compares line shapes, which decoration makes incomparable.
+        let (stdout, stdout_escapes) = strip_escape_sequences(&stdout);
+        let (stderr, stderr_escapes) = strip_escape_sequences(&stderr);
+        if stdout_escapes > 0 || stderr_escapes > 0 {
+            stages.push(ESCAPE_STAGE.to_owned());
+        }
+
         let mut consumed_stderr = false;
         let mut body = stdout;
         if let Some(rule) = self.matching_rule(analysis) {

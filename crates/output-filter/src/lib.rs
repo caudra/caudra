@@ -7,7 +7,7 @@
 //! banners, progress frames, and boilerplate. This crate reduces the captured
 //! text first, so the same budget carries proportionally more signal.
 //!
-//! Three reductions are available, and they are not interchangeable.
+//! Four reductions are available, and they are not interchangeable.
 //!
 //! [`render_terminal`] and [`RowRenderer`] decode a redraw stream. This is not a
 //! judgement about content: a bar that redraws emits a control stream, and the
@@ -17,6 +17,12 @@
 //!
 //! [`Corpus::find`] and [`Rule::apply`] are the declarative corpus, selected by
 //! command, and are the right tool when the format is known.
+//!
+//! [`strip_escape_sequences`] removes decoration a terminal would have consumed:
+//! colour, cursor modes, window titles, hyperlinks. Like the collapse below it
+//! is not selected by a rule, because a request resolving to more than one
+//! command scope selects none, and an ad-hoc script with hardcoded colour is
+//! exactly such a request.
 //!
 //! [`collapse_progress_lines`] reduces progress frames that arrive one per line,
 //! which no rule can cover because the programs that emit them are
@@ -37,12 +43,14 @@
 //! inspection would let that tree rewrite what the model sees.
 
 mod compile;
+pub(crate) mod escape;
 mod pipeline;
 mod progress;
 mod rule;
 mod terminal;
 
 pub use compile::{Corpus, Rule, builtin};
+pub use escape::strip_escape_sequences;
 pub use pipeline::Filtered;
 pub use progress::collapse_progress_lines;
 pub use rule::RuleTest;

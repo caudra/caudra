@@ -446,8 +446,9 @@ is on by default.
 Rules match the same tree-sitter command scope that shell policy authorizes, not the raw command
 string, so shell metacharacters cannot steer rule selection. A rule applies only when the command
 resolves to exactly one non-opaque scope; output from a pipeline or chain belongs to more than one
-program and is returned unfiltered. A rule that would replace output with a success summary is
-suppressed unless the command actually exited zero, so a failing command is never rendered as success.
+program, so no rule is selected for it. The two command-independent reductions below still apply
+there. A rule that would replace output with a success summary is suppressed unless the command
+actually exited zero, so a failing command is never rendered as success.
 
 The corpus covers common build, test, package-manager, and container commands, including `cargo`,
 `go`, `mvn`, `git`, `npm`, `pip`, `apt`, `pytest`, `jest`, `vitest`, `tar`, `wget`, `docker build`,
@@ -477,6 +478,36 @@ Disable filtering with `--no-shell-output-filter` or `WORKCELL_MCP_SHELL_OUTPUT_
 return unfiltered command output. Rules in `crates/output-filter/rules/` are vendored from
 [RTK](https://github.com/rtk-ai/rtk) under Apache-2.0; rules in `crates/output-filter/rules-workcell/`
 are original to this project. See `crates/output-filter/NOTICE`.
+
+### Terminal Escape Sequences
+
+Colour, cursor-mode changes, window titles, and hyperlinks are addressed to a terminal. A model is
+not one, and the bytes cost far more than their length suggests: `\x1b[33m` is several tokens that
+merge with nothing, decorating text that is often a single character.
+
+Workcell handles them at both ends.
+
+The child environment sets `NO_COLOR=1` and `CLICOLOR=0`, so a tool that honours the convention never
+writes the bytes. These are set rather than forwarded: the shell child starts from a cleared
+environment, so this is a default for an environment that has none rather than an override of an
+operator's choice. An explicit `--color=always`, `-c color.ui=always`, or equivalent still wins.
+Because it describes the environment a command runs in rather than how output is rendered, it is not
+affected by `--no-shell-output-filter`.
+
+What still arrives is stripped from the model-facing rendering and announced as
+`[filtered: escapes]`. Like the progress collapse, this is command-independent: hardcoded colour
+comes overwhelmingly from hand-written scripts and chains, for which no rule is ever selected. The
+strip runs before rule selection, so a rule's patterns see clean text rather than silently missing a
+coloured line. Nothing but decoration is removed — no line is dropped, joined, or reordered — and the
+structured result keeps the bytes.
+
+To read the sequences themselves, pipe through `cat -v`, `od -c`, or `sed -n l`. Those render ESC as
+a printable `^[` before the filter sees it, so the request survives intact:
+
+```
+$ printf '\033[33mwarn\033[0m\n' | cat -v
+^[[33mwarn^[[0m
+```
 
 ### Progress Bars
 

@@ -5,10 +5,6 @@
 //! before per-line truncation, and the absolute cap after the head/tail window
 //! so omission markers are themselves counted.
 
-use std::sync::LazyLock;
-
-use regex::Regex;
-
 use crate::compile::Rule;
 
 /// Input beyond this size is reduced to its tail before filtering. The bound
@@ -16,9 +12,6 @@ use crate::compile::Rule;
 /// trims and an unexpected caller still cannot make filtering unbounded.
 const MAX_INPUT_BYTES: usize = 1_048_576;
 const MAX_INPUT_LINES: usize = 100_000;
-
-static ANSI: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\x1b\[[0-9;]*[a-zA-Z]").expect("ANSI pattern is valid"));
 
 /// Result of applying a rule.
 pub struct Filtered {
@@ -189,8 +182,13 @@ fn bound_input(source: &str) -> (String, bool) {
     (bounded.to_owned(), trimmed)
 }
 
+/// Removes escape sequences for a rule that declares `strip_ansi`.
+///
+/// The shell tool already strips before a rule is selected, so this is normally
+/// a no-op. It stays because `Rule::apply` is public API for a native host that
+/// has done no such thing, and because the rule corpus asserts it inline.
 fn strip_ansi(text: &str) -> String {
-    ANSI.replace_all(text, "").into_owned()
+    crate::escape::strip_escape_sequences(text).0
 }
 
 /// Truncates by character count so multi-byte text is never split mid-scalar.
