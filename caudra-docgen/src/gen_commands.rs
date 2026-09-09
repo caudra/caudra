@@ -53,6 +53,8 @@ New records arrive while the modal is open. Press `f` to pause that and read a f
 
 Press `l` to cycle the minimum level, or click the level in the footer. Press `Enter` to expand the selected record into every field, its spans, and the raw JSON, `y` to copy the record as shown, and `Y` to copy the stored line.
 
+Press `Tab` to keep only the records sharing the selected one's narrowest id, which is its tool call, then its request, then its session. That id lands in the filter field, so it can be widened or cleared like anything else typed there. A record carrying no id says so rather than filtering to nothing.
+
 Press `/` to filter. Each term matches as a subsequence, so `tolcal` finds `tool_call`, and a term is compared against the message, the target, the level, and each field and span value on its own. Space separates terms, and a record has to match all of them, so `provider retry` finds a retry from the provider. Filtering reads backward through the rotated files, and the footer says when it reached the oldest one or stopped at the scan limit.
 
 A line the parser cannot read, such as a panic backtrace, is shown as it was written and treated as an error so a filter never hides it.

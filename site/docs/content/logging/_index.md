@@ -18,10 +18,14 @@ Read it three ways:
 - Any file reader, since each line is plain JSON.
 
 In `/logs`, the wheel scrolls the page and clicking the level in the footer
-cycles it. `/` opens a fuzzy filter where each term matches as a subsequence
+cycles it. `/` opens a filter field where each term matches as a subsequence
 against the message, the target, the level, and each field on its own. Space
 separates terms and a record has to match all of them, so `provider retry` finds
-a retry from the provider. See [Commands](/docs/commands/#logs) for the keys.
+a retry from the provider.
+
+`Tab` on a selected record keeps only the records sharing its narrowest id, which
+turns a scattered turn or tool call into a readable sequence. A hint row lists
+the rest. See [Commands](/docs/commands/#logs) for the keys.
 
 ## Where the file lives
 

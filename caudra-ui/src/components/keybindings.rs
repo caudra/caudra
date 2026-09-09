@@ -797,6 +797,12 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::All,
     },
     Keybind {
+        label: KeyLabel::Single("Tab"),
+        description: "Filter to the selected record's tool call, request, or session",
+        context: KeybindContext::Logs,
+        platform: Platform::All,
+    },
+    Keybind {
         label: KeyLabel::Single("f"),
         description: "Follow new records or pause",
         context: KeybindContext::Logs,

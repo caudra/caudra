@@ -2301,6 +2301,7 @@ impl App {
         match action {
             LogsAction::Consumed => {}
             LogsAction::Close => self.logs_modal.close(),
+            LogsAction::Flash(message) => self.flash(message.into()),
             LogsAction::Copy { text, label } => match self.clipboard.copy_text(&text) {
                 Ok(CopyResult::Noop) => {}
                 Ok(CopyResult::Copied) => self.flash(label.into()),

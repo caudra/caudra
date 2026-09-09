@@ -23,7 +23,9 @@ use ratatui::widgets::Paragraph;
 use crate::components::keybindings::key;
 use crate::components::modal::Modal;
 use crate::components::scrollbar::render_vertical_scrollbar;
-use crate::components::{Overlay, escape_terminal_controls, hover_style, is_ctrl};
+use crate::components::{
+    Overlay, escape_terminal_controls, hint_line, hover_style, input_line_with_cursor, is_ctrl,
+};
 use crate::repaint::{Cadence, Dirty};
 use crate::text_buffer::TextBuffer;
 use crate::theme::Theme;
@@ -47,7 +49,6 @@ const EXPAND_INDENT: &str = "    ";
 const EXPAND_ARROW: &str = "> ";
 const RAW_JSON_LABEL: &str = "raw";
 const OVERFLOW_PREFIX: &str = "+";
-const FILTER_PREFIX: &str = "/";
 const LEVEL_PREFIX: &str = ">=";
 
 const NO_TAIL: &str = "No log file yet.";
@@ -65,10 +66,51 @@ const COPIED_RAW: &str = "Copied raw record";
 const INLINE_FIELD_LIMIT: usize = 6;
 /// Span fields worth carrying on the one-line view.
 const CORRELATION_FIELDS: &[&str] = &["session_id", "turn_id", "request_id", "tool_use_id"];
+/// Most specific first. `turn_id` is absent on purpose: it counts from one per
+/// session, so filtering on it alone would pull in every session's fourth turn.
+const FOCUS_FIELDS: &[&str] = &["tool_use_id", "request_id", "session_id"];
+
+/// The search row and the hint row, which are always drawn. The status row is
+/// part of the footer that reports the file.
+const CHROME_ROWS: u16 = 2;
+const HINT_KEY_MOVE: &str = "\u{2191}\u{2193}";
+const HINT_KEY_ENTER: &str = "enter";
+const HINT_KEY_ESC: &str = "esc";
+const HINT_MOVE: &str = "select";
+const HINT_EXPAND: &str = "expand";
+const HINT_COLLAPSE: &str = "collapse";
+const HINT_FOCUS: &str = "only this id";
+const HINT_FILTER: &str = "filter";
+const HINT_LEVEL: &str = "level";
+const HINT_COPY: &str = "copy / raw";
+const HINT_FOLLOW: &str = "follow";
+const HINT_CLOSE: &str = "close";
+const HINT_APPLY: &str = "done";
+const HINT_CLEAR: &str = "clear";
+const HINTS: [(&str, &str); 7] = [
+    (HINT_KEY_MOVE, HINT_MOVE),
+    (HINT_KEY_ENTER, HINT_EXPAND),
+    ("tab", HINT_FOCUS),
+    ("/", HINT_FILTER),
+    ("l", HINT_LEVEL),
+    ("y/Y", HINT_COPY),
+    (HINT_KEY_ESC, HINT_CLOSE),
+];
+const EXPANDED_HINTS: [(&str, &str); 7] = [
+    (HINT_KEY_MOVE, HINT_MOVE),
+    (HINT_KEY_ENTER, HINT_COLLAPSE),
+    ("tab", HINT_FOCUS),
+    ("f", HINT_FOLLOW),
+    ("l", HINT_LEVEL),
+    ("y/Y", HINT_COPY),
+    (HINT_KEY_ESC, HINT_CLOSE),
+];
+const NO_FOCUS: &str = "That record carries no id to filter on";
 
 pub enum LogsAction {
     Consumed,
     Close,
+    Flash(&'static str),
     Copy { text: String, label: &'static str },
 }
 
@@ -232,6 +274,7 @@ impl LogsModal {
             }
             KeyCode::Char('f') => self.follow = !self.follow,
             KeyCode::Char('l') => self.cycle_level(),
+            KeyCode::Tab => return self.focus_correlation(),
             KeyCode::Enter | KeyCode::Char(' ') => self.expanded = !self.expanded,
             KeyCode::Char('y') => return self.copy(false),
             KeyCode::Char('Y') => return self.copy(true),
@@ -287,6 +330,19 @@ impl LogsModal {
     fn apply_query(&mut self) {
         self.filter = Filter::new(self.filter.min_level, &self.query.value());
         self.reload();
+    }
+
+    /// Narrows to everything sharing the selected record's most specific id.
+    /// A turn or a tool call spans many records, and reading it any other way
+    /// means eyeballing an id across a scrolling file.
+    fn focus_correlation(&mut self) -> LogsAction {
+        let Some(id) = self.current().and_then(|line| correlation_id(&line.entry)) else {
+            return LogsAction::Flash(NO_FOCUS);
+        };
+        self.query = TextBuffer::new(id);
+        self.query_focused = false;
+        self.apply_query();
+        LogsAction::Consumed
     }
 
     fn cycle_level(&mut self) {
@@ -471,8 +527,9 @@ impl LogsModal {
             width: inner.width.saturating_sub(H_PAD.saturating_mul(2)),
             ..inner
         };
-        // One row is the footer, which never scrolls.
-        let body_height = padded.height.saturating_sub(1);
+        let searching = self.query_focused || !self.query.value().is_empty();
+        let chrome = CHROME_ROWS + u16::from(searching);
+        let body_height = padded.height.saturating_sub(chrome);
         self.resize(usize::from(body_height));
 
         self.body = Rect {
@@ -485,18 +542,42 @@ impl LogsModal {
             Paragraph::new(lines).style(Style::new().fg(theme.foreground)),
             self.body,
         );
-        let footer = Rect {
-            y: padded.y.saturating_add(body_height),
-            height: 1,
-            ..padded
+
+        let mut row = padded.y.saturating_add(body_height);
+        let mut next_row = || {
+            let area = Rect {
+                y: row,
+                height: 1,
+                ..padded
+            };
+            row = row.saturating_add(1);
+            area
         };
+        if searching {
+            frame.render_widget(
+                Paragraph::new(input_line_with_cursor(&self.query)),
+                next_row(),
+            );
+        }
+        frame.render_widget(Paragraph::new(hint_line(self.hints())), next_row());
+        let footer = next_row();
         let (line, level) = self.footer_line(theme);
         self.level_hit = hit_rect(footer, level);
         frame.render_widget(Paragraph::new(line), footer);
         let len = u16::try_from(self.window_len()).unwrap_or(u16::MAX);
         if len > body_height {
             let offset = u16::try_from(self.view_top).unwrap_or(u16::MAX);
-            render_vertical_scrollbar(frame, inner, len, offset);
+            // Against the body, not the whole modal: the search, hint, and
+            // status rows do not scroll and must not wear a track.
+            render_vertical_scrollbar(
+                frame,
+                Rect {
+                    height: body_height,
+                    ..inner
+                },
+                len,
+                offset,
+            );
         }
 
         self.popup = popup;
@@ -565,6 +646,20 @@ impl LogsModal {
         (lines, rows)
     }
 
+    /// The actions a reader can reach from here. Without this row the only way
+    /// to learn that a record expands or that a turn can be isolated is to open
+    /// the keybinding reference.
+    fn hints(&self) -> &'static [(&'static str, &'static str)] {
+        if self.query_focused {
+            return &[(HINT_KEY_ENTER, HINT_APPLY), (HINT_KEY_ESC, HINT_CLEAR)];
+        }
+        if self.expanded {
+            &EXPANDED_HINTS
+        } else {
+            &HINTS
+        }
+    }
+
     /// Also reports the level chip's column range, which is what keeps the
     /// footer and the hit test from drifting apart.
     fn footer_line(&self, theme: &Theme) -> (Line<'static>, Range<usize>) {
@@ -598,17 +693,6 @@ impl LogsModal {
                 self.level_hovered,
             ),
         );
-        let query = self.query.value();
-        if self.query_focused || !query.is_empty() {
-            push(
-                format!("{FILTER_PREFIX}{}", escape_terminal_controls(&query)),
-                if self.query_focused {
-                    theme.cursor
-                } else {
-                    theme.item_match
-                },
-            );
-        }
         push(
             if self.follow { FOLLOWING } else { PAUSED }.to_owned(),
             if self.follow {
@@ -743,6 +827,23 @@ fn record_line(record: &Record, width: usize, theme: &Theme) -> Line<'static> {
     Line::from(spans)
 }
 
+/// The narrowest id the record carries. Span fields are searched first because
+/// a tool call nests inside the turn that made it.
+fn correlation_id(entry: &Entry) -> Option<String> {
+    let Entry::Record(record) = entry else {
+        return None;
+    };
+    FOCUS_FIELDS.iter().find_map(|wanted| {
+        record
+            .spans
+            .iter()
+            .flat_map(|span| span.fields.iter())
+            .chain(record.fields.iter())
+            .find(|(key, _)| key == wanted)
+            .map(|(_, value)| value.clone())
+    })
+}
+
 /// Correlation lives on the spans, so it is worth a place on the one-line view
 /// even though it is not an event field.
 fn correlation_fields(record: &Record) -> Vec<(String, String)> {
@@ -875,6 +976,7 @@ pub(crate) fn max_files_or_default(configured: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::components::{buffer_text, key};
     use crate::theme;
     use test_case::test_case;
 
@@ -1098,6 +1200,122 @@ mod tests {
         modal.handle_mouse(wheel(MouseEventKind::Down(MouseButton::Left), 1, 4));
 
         assert_eq!(modal.selected, 11);
+    }
+
+    const TOOL_RECORD: &str = r#"{"timestamp":"2026-09-09T14:22:07.418123Z","level":"INFO","fields":{"message":"tool result"},"target":"caudra::tool","spans":[{"name":"turn","session_id":"s-1","turn_id":4},{"name":"tool","tool_use_id":"tu-9"}]}"#;
+    const NO_ID: &str = r#"{"timestamp":"2026-09-09T14:22:07.418123Z","level":"INFO","fields":{"message":"hi"},"target":"caudra::agent"}"#;
+    const FRAME_W: u16 = 120;
+    const FRAME_H: u16 = 30;
+    const NOT_DRAWN: &str = "the row never reached the frame";
+
+    fn drawn(modal: &mut LogsModal) -> String {
+        let backend = ratatui::backend::TestBackend::new(FRAME_W, FRAME_H);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let theme = theme::current();
+        terminal
+            .draw(|frame| {
+                modal.view(frame, frame.area(), &theme);
+            })
+            .unwrap();
+        buffer_text(terminal.backend().buffer())
+    }
+
+    #[test]
+    fn the_hint_row_names_every_action_the_selection_has() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut modal = seeded_modal(tmp.path());
+        let out = drawn(&mut modal);
+
+        for (_, action) in HINTS {
+            assert!(out.contains(action), "{action} missing from {out}");
+        }
+    }
+
+    #[test]
+    fn the_hint_row_follows_what_the_key_will_do_next() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut modal = seeded_modal(tmp.path());
+        assert!(drawn(&mut modal).contains(HINT_EXPAND));
+
+        modal.handle_key(key(KeyCode::Enter));
+        assert!(drawn(&mut modal).contains(HINT_COLLAPSE));
+    }
+
+    #[test]
+    fn pressing_slash_opens_a_field_with_a_cursor_in_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut modal = seeded_modal(tmp.path());
+        let before = drawn(&mut modal);
+        assert!(!before.contains(HINT_APPLY));
+
+        modal.handle_key(key(KeyCode::Char('/')));
+        modal.handle_key(key(KeyCode::Char('l')));
+        modal.handle_key(key(KeyCode::Char('n')));
+        let out = drawn(&mut modal);
+
+        assert!(out.contains(HINT_APPLY), "{NOT_DRAWN}: {out}");
+        assert!(out.contains(HINT_CLEAR), "{NOT_DRAWN}: {out}");
+        assert!(out.contains("ln"), "typed text never appeared: {out}");
+    }
+
+    #[test]
+    fn the_search_row_only_takes_a_line_while_it_is_in_use() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut modal = seeded_modal(tmp.path());
+        let _ = drawn(&mut modal);
+        let quiet = modal.viewport_h;
+
+        modal.handle_key(key(KeyCode::Char('/')));
+        let _ = drawn(&mut modal);
+        assert_eq!(modal.viewport_h, quiet - 1);
+
+        modal.handle_key(key(KeyCode::Esc));
+        let _ = drawn(&mut modal);
+        assert_eq!(modal.viewport_h, quiet);
+    }
+
+    #[test_case(TOOL_RECORD, "tu-9" ; "the tool call over the turn that made it")]
+    #[test_case(WITH_SPAN, "s-1" ; "the session when nothing narrower is there")]
+    fn focus_narrows_to_the_records_most_specific_id(raw: &str, expected: &str) {
+        assert_eq!(
+            correlation_id(&Entry::parse(raw)).as_deref(),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn a_record_with_no_id_says_so_rather_than_filtering_to_nothing() {
+        assert!(correlation_id(&Entry::parse(NO_ID)).is_none());
+        assert!(correlation_id(&Entry::parse(NOT_JSON)).is_none());
+    }
+
+    #[test]
+    fn focus_puts_the_id_in_the_field_so_it_can_be_edited_or_cleared() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut modal = seeded_modal(tmp.path());
+        std::fs::write(
+            caudra_storage::log::file_path(tmp.path(), 0),
+            format!("{TOOL_RECORD}\n"),
+        )
+        .unwrap();
+        modal.reload();
+
+        assert!(matches!(
+            modal.handle_key(key(KeyCode::Tab)),
+            LogsAction::Consumed
+        ));
+        assert_eq!(modal.query.value(), "tu-9");
+    }
+
+    #[test]
+    fn focus_on_a_record_without_an_id_flashes_instead() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut modal = seeded_modal(tmp.path());
+
+        assert!(matches!(
+            modal.handle_key(key(KeyCode::Tab)),
+            LogsAction::Flash(NO_FOCUS)
+        ));
     }
 
     #[test]
