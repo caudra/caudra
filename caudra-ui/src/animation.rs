@@ -68,7 +68,10 @@ impl Typewriter {
         self.buffer.push_str(text);
         self.tick();
         self.anim_start_visible = self.visible_len;
-        self.anim_target = self.buffer.chars().count();
+        // Counted from the delta, not recounted over the buffer: a provider
+        // that streams token-sized chunks calls this thousands of times per
+        // block, and recounting made the reveal cost grow with its own output.
+        self.anim_target += text.chars().count();
         if self.ms_per_char == 0 {
             self.advance_visible(self.anim_target);
             return;
@@ -221,6 +224,27 @@ mod tests {
         tw.push("🦀");
         assert_eq!(tw.visible(), "aé中🦀");
         assert!(!tw.is_animating());
+    }
+
+    /// `anim_target` is carried forward per delta instead of recounted, so the
+    /// invariant it used to get for free now needs saying: it is the buffer's
+    /// char count, across resets and multibyte splits alike.
+    #[test]
+    fn anim_target_tracks_the_buffer_char_count() {
+        const TARGET_MSG: &str = "anim_target must equal the buffer's char count";
+        let mut tw = Typewriter::with_speed(0);
+        for delta in ["a", "é", "中", "🦀", "", "tail"] {
+            tw.push(delta);
+            assert_eq!(tw.anim_target, tw.buffer.chars().count(), "{TARGET_MSG}");
+        }
+
+        tw.clear();
+        tw.push("after clear");
+        assert_eq!(tw.anim_target, tw.buffer.chars().count(), "{TARGET_MSG}");
+
+        let _ = tw.take_all();
+        tw.push("after take");
+        assert_eq!(tw.anim_target, tw.buffer.chars().count(), "{TARGET_MSG}");
     }
 
     #[test]

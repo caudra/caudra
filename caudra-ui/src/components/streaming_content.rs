@@ -205,7 +205,27 @@ impl StreamingContent {
 
     pub fn update_render(&mut self, width: u16) -> bool {
         self.typewriter.tick();
-        self.update_render_from(self.typewriter.visible().to_owned(), width)
+        // Disjoint field borrows rather than an owned copy. The visible text is
+        // the whole block and this runs every frame, so cloning it to satisfy
+        // the borrow checker cost a full-buffer allocation per frame even on
+        // the frames where the cache then hit.
+        let Self {
+            typewriter,
+            cache,
+            renderer,
+            prefix,
+            text_style,
+            prefix_style,
+            interactive_links,
+        } = self;
+        cache.get_or_update_with_links(
+            renderer,
+            typewriter.visible(),
+            prefix,
+            (*text_style, *prefix_style),
+            width,
+            *interactive_links,
+        )
     }
 
     pub fn tick(&mut self) {
