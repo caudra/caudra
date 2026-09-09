@@ -134,14 +134,40 @@ worker lease for the full pool lifetime; hosts supply cache and source policy, n
 - Keep stdout protocol-only in stdio mode. Logs always go to stderr.
 - HTTP may print only the documented single readiness JSON line to stdout.
 - Add comments only where security invariants or non-obvious protocol behavior need explanation.
+- Declare dependencies in the workspace `Cargo.toml` and reference them with `workspace = true`.
+  Reach for an existing dependency before adding one.
+
+## Tests
+
+- Unit tests live inline in a `#[cfg(test)]` module; contract and behavioural tests live in `tests/`.
+  A property that only a real process can show, such as what the capture ring evicts, belongs in the
+  latter no matter how small it is.
+- A test name is a sentence stating the property that holds, not a label for the function under test:
+  `an_empty_path_is_indistinguishable_from_an_absent_one`, never `test_empty_path`.
+- A gate is worth committing only once it has been observed to fail. Deleting the code it covers is
+  not that observation if the test stays green; reinstate the rejection, the wrong ordering, or the
+  unbounded input and watch it go red. A gate that has never failed is a claim, not a guarantee.
+- A gate that protects against a false positive keeps a negative fixture naming what it protects.
 
 ## Verification
+
+Cheapest first, and scope to the crate you touched while iterating:
+
+```bash
+cargo check -p <crate> --all-targets
+cargo clippy -p <crate> --all-targets -- -D warnings
+cargo test -p <crate>
+```
 
 Run before considering a change complete:
 
 ```bash
 make
 ```
+
+`make` defaults to `ci`: `code-worker`, `fmt-check`, `check`, `check-native`, `clippy`, `test`,
+`release`. It costs minutes, so it is the gate rather than the loop. There are no per-crate targets;
+use Cargo directly while iterating.
 
 `make` includes `check-native`, which builds every `workcell` facade feature with no MCP adapter and
 fails if `rmcp` becomes reachable from the neutral tree. A workspace-wide `cargo check` cannot catch
@@ -166,3 +192,7 @@ test against the resulting process. Use `make docker-smoke` as the minimum image
 Update `README.md`, `SECURITY.md`, and `example.env` when startup, transport, authentication,
 deployment, embedding, or security behavior changes. Mermaid diagrams are preferred for architecture and flow
 documentation.
+
+Match the voice of the files you are editing: declarative, carrying the reason a choice was made
+rather than only its shape, and describing what ships rather than what is planned. No marketing
+register and no reassurance. A paragraph that could be deleted without losing a fact should be.
