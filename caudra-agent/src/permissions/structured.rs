@@ -48,6 +48,12 @@ const DIRECTORY_READ_TOOLS: &[&str] = &["list"];
 const FILE_SEARCH_TOOLS: &[&str] = &["file_glob", "file_grep", "glob", "grep"];
 const GIT_METADATA_DIR: &str = ".git";
 const SUBTREE_OPTION_ID: &str = "allow_filesystem_subtree";
+const URL_SUBTREE_OPTION_ID: &str = "allow_url_subtree";
+const URL_ORIGIN_OPTION_ID: &str = "allow_url_origin";
+/// How many path prefixes a URL ladder offers below its origin. The rungs share
+/// one row, so this bounds the request a deep path serializes to rather than
+/// anything the prompt draws. Real paths stay well under it.
+const MAX_URL_LADDER_RUNGS: usize = 8;
 const OUTSIDE_HOME_PHRASE: &str = "ALLOW OUTSIDE HOME";
 pub(super) const BROAD_SHELL_PHRASE: &str = "ALLOW BROAD SHELL ACCESS";
 const WORKDIR_ATTRIBUTE: &str = "workdir";
@@ -2162,53 +2168,40 @@ fn rule_options(
             None,
         ));
 
-        if let Some(root) = url_subtree_roots(&strict)
-            .as_ref()
-            .and_then(|roots| roots.first())
-            && strict.url.path() != "/"
-        {
-            options.push(option(
-                "allow_url_subtree",
+        let ladder = UrlLadder {
+            subject,
+            executor,
+            access: resource.access.as_ref(),
+            reusable: &reusable,
+        };
+        // Deepest first, dropping the origin's own root: the rung below reaches
+        // exactly that far and says so in the origin's own terms.
+        let roots = url_subtree_roots(&strict).unwrap_or_default();
+        let pages = roots.len().saturating_sub(1).min(MAX_URL_LADDER_RUNGS);
+        for (step, root) in roots[..pages].iter().enumerate() {
+            options.push(ladder.rung(
+                match step {
+                    0 => URL_SUBTREE_OPTION_ID.into(),
+                    step => format!("{URL_SUBTREE_OPTION_ID}_{step}"),
+                },
                 "This page and subpages",
-                &format!("Allow requested URLs at or below {root}/**."),
-                StructuredPermissionEffect::Allow,
-                vec![PermissionResourceConstraint {
-                    kind: PermissionResourceKind::Url,
-                    selector: PermissionResourceSelector::UrlSubtreeDigest {
-                        digest: url_subtree_digest(root),
-                    },
-                    access: resource.access.clone(),
-                    protected: Some(false),
-                    attributes: BTreeMap::new(),
-                }],
-                PermissionArgumentConstraint::Unconstrained,
-                reusable.clone(),
-                true,
-                false,
-                None,
+                format!("Allow requested URLs at or below {root}/**."),
+                format!("{root}/**"),
+                PermissionResourceSelector::UrlSubtreeDigest {
+                    digest: url_subtree_digest(root),
+                },
             ));
         }
 
         let origin = strict.url.origin().ascii_serialization();
-        options.push(option(
-            "allow_url_origin",
+        options.push(ladder.rung(
+            URL_ORIGIN_OPTION_ID.into(),
             "Any page on this origin",
-            &format!("Allow any requested URL on {origin}/**."),
-            StructuredPermissionEffect::Allow,
-            vec![PermissionResourceConstraint {
-                kind: PermissionResourceKind::Url,
-                selector: PermissionResourceSelector::UrlOriginDigest {
-                    digest: url_origin_digest(&resource.value).expect("strict URL has an origin"),
-                },
-                access: resource.access.clone(),
-                protected: Some(false),
-                attributes: BTreeMap::new(),
-            }],
-            PermissionArgumentConstraint::Unconstrained,
-            reusable.clone(),
-            true,
-            false,
-            None,
+            format!("Allow any requested URL on {origin}/**."),
+            format!("{origin}/**"),
+            PermissionResourceSelector::UrlOriginDigest {
+                digest: url_origin_digest(&resource.value).expect("strict URL has an origin"),
+            },
         ));
         options.push(option(
             "allow_any_url",
@@ -2698,6 +2691,58 @@ fn add_filesystem_options(
             executor,
             reusable,
         ));
+    }
+}
+
+/// What every rung of a URL ladder shares. The rungs are one authority at
+/// widening reach — the page a request named, each prefix of its path, and the
+/// origin — so they carry one group key and the prompt walks them as one row.
+struct UrlLadder<'a> {
+    subject: &'a PermissionSubject,
+    executor: &'a PermissionExecutorKind,
+    access: Option<&'a PermissionResourceAccess>,
+    reusable: &'a [PermissionLifetime],
+}
+
+impl UrlLadder<'_> {
+    fn rung(
+        &self,
+        id: String,
+        label: &str,
+        description: String,
+        pattern: String,
+        selector: PermissionResourceSelector,
+    ) -> PermissionRuleOption {
+        PermissionRuleOption {
+            id,
+            label: label.into(),
+            description,
+            rule: StructuredPermissionRule {
+                subject: self.subject.clone(),
+                executor: self.executor.clone(),
+                resources: vec![PermissionResourceConstraint {
+                    kind: PermissionResourceKind::Url,
+                    selector,
+                    access: self.access.cloned(),
+                    protected: Some(false),
+                    attributes: BTreeMap::new(),
+                }],
+                arguments: PermissionArgumentConstraint::Unconstrained,
+                lifetime: PermissionLifetime::Once,
+                effect: StructuredPermissionEffect::Allow,
+                family: None,
+            },
+            allowed_lifetimes: self.reusable.to_vec(),
+            broad: true,
+            is_default: false,
+            confirmation: None,
+            group: Some(PermissionOptionGroup {
+                key: URL_SUBTREE_OPTION_ID.into(),
+                value: pattern,
+                resource: None,
+            }),
+            caution: None,
+        }
     }
 }
 
@@ -4044,6 +4089,90 @@ mod tests {
             .option_rule("allow_url_subtree", PermissionLifetime::Conversation)
             .expect(EXPECT_SUBTREE_OPTION);
         assert!(permission_rule_covers_request(&subtree, &request));
+    }
+
+    /// Every rung of the URL ladder, narrowest first, as `(id, shown reach)`.
+    fn url_ladder(request: &PermissionRequest) -> Vec<(&str, &str)> {
+        request
+            .options
+            .iter()
+            .filter_map(|option| {
+                let group = option.group.as_ref()?;
+                (group.key == URL_SUBTREE_OPTION_ID)
+                    .then_some((option.id.as_str(), group.value.as_str()))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_url_ladder_climbs_one_path_segment_at_a_time() {
+        assert_eq!(
+            url_ladder(&webfetch_request("https://example.com/path/to/sub/page")),
+            [
+                (
+                    "allow_url_subtree",
+                    "https://example.com/path/to/sub/page/**"
+                ),
+                ("allow_url_subtree_1", "https://example.com/path/to/sub/**"),
+                ("allow_url_subtree_2", "https://example.com/path/to/**"),
+                ("allow_url_subtree_3", "https://example.com/path/**"),
+                ("allow_url_origin", "https://example.com/**"),
+            ]
+        );
+    }
+
+    /// A rung is worth walking to only if it reaches further than the one below
+    /// and no further than the one above.
+    #[test]
+    fn each_url_rung_reaches_its_own_prefix_and_no_further() {
+        let request = webfetch_request("https://example.com/path/to/sub/page");
+        let reaches = |rung: &str, url: &str| {
+            let rule = request
+                .option_rule(rung, PermissionLifetime::Conversation)
+                .expect(EXPECT_SUBTREE_OPTION);
+            permission_rule_covers_request(&rule, &webfetch_request(url))
+        };
+        assert!(reaches(
+            "allow_url_subtree_2",
+            "https://example.com/path/to/other"
+        ));
+        assert!(!reaches(
+            "allow_url_subtree_2",
+            "https://example.com/path/other"
+        ));
+        assert!(reaches(
+            "allow_url_subtree_3",
+            "https://example.com/path/other"
+        ));
+        assert!(!reaches(
+            "allow_url_subtree_3",
+            "https://example.com/elsewhere"
+        ));
+        assert!(reaches("allow_url_origin", "https://example.com/elsewhere"));
+        assert!(!reaches("allow_url_origin", "https://other.example/path"));
+    }
+
+    /// The cap bounds the ladder from the origin end, because the page the
+    /// request named is the rung that has to be there.
+    #[test]
+    fn a_long_url_path_offers_its_deepest_rungs_and_the_origin() {
+        let path = (1..=12).map(|n| format!("s{n}")).collect::<Vec<_>>();
+        let request = webfetch_request(&format!("https://example.com/{}", path.join("/")));
+        let rungs = url_ladder(&request);
+        assert_eq!(rungs.len(), MAX_URL_LADDER_RUNGS + 1);
+        assert_eq!(
+            rungs[0].1,
+            format!("https://example.com/{}/**", path.join("/"))
+        );
+        assert_eq!(rungs[MAX_URL_LADDER_RUNGS].0, URL_ORIGIN_OPTION_ID);
+    }
+
+    #[test]
+    fn a_url_with_no_path_offers_the_origin_alone() {
+        assert_eq!(
+            url_ladder(&webfetch_request("https://example.com/")),
+            [(URL_ORIGIN_OPTION_ID, "https://example.com/**")]
+        );
     }
 
     #[test]

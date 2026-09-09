@@ -2133,14 +2133,16 @@ mod tests {
         for authority in [
             "This exact URL",
             "This page and subpages",
-            "Any page on this origin",
             "Any public HTTP(S) URL",
         ] {
             assert!(screen.contains(authority), "missing {authority}: {screen}");
         }
+        // The origin is a rung of the row above it, reached by widening rather
+        // than by a row of its own.
+        assert!(!screen.contains("Any page on this origin"), "{screen}");
         assert!(!screen.contains("token=secret"));
 
-        for _ in 0..4 {
+        for _ in 0..3 {
             prompt.handle_key(key(KeyCode::Down));
         }
         prompt.handle_key(key(KeyCode::Char('a')));
@@ -2393,6 +2395,68 @@ mod tests {
         let widened = row_text(&prompt, &rungs[1]);
         assert!(widened.contains("/project/**"), "{widened}");
         assert!(!widened.contains("/project/src/**"), "{widened}");
+    }
+
+    const LADDER_URL: &str = "https://example.com/path/to/sub/page";
+    /// The reach each rung of `LADDER_URL`'s ladder stands for, narrowest first.
+    const URL_RUNG_REACHES: [&str; 5] = [
+        "https://example.com/path/to/sub/page/**",
+        "https://example.com/path/to/sub/**",
+        "https://example.com/path/to/**",
+        "https://example.com/path/**",
+        "https://example.com/**",
+    ];
+
+    fn prompt_with_a_url_ladder() -> PermissionPrompt {
+        let mut prompt = PermissionPrompt::new();
+        prompt.enqueue(
+            Box::new(PermissionRequest::from_legacy(
+                "webfetch".into(),
+                ToolKey::native("webfetch"),
+                vec![LADDER_URL.into()],
+                json!({ "url": LADDER_URL }),
+                Path::new("/project"),
+                false,
+            )),
+            None,
+        );
+        prompt
+    }
+
+    /// A URL widens the way a path does, one path segment at a time, so a page
+    /// can be scoped to the section it sits in and not only to its whole origin.
+    #[test]
+    fn the_arrows_walk_a_url_from_its_page_to_its_origin() {
+        let mut prompt = prompt_with_a_url_ladder();
+        select_ladder(&mut prompt);
+        for reach in URL_RUNG_REACHES {
+            let row = row_text(&prompt, &prompt.selected_option);
+            assert!(row.contains(reach), "expected {reach}: {row}");
+            prompt.handle_key(key(KeyCode::Right));
+        }
+        let widest = row_text(&prompt, &prompt.selected_option);
+        assert!(widest.contains("Any page on this origin"), "{widest}");
+    }
+
+    /// Whichever rung is showing is the one the answer carries, so a mid-ladder
+    /// grant is a rule about that prefix and nothing wider.
+    #[test]
+    fn a_widened_url_rung_is_the_one_granted() {
+        let mut prompt = prompt_with_a_url_ladder();
+        let rungs = select_ladder(&mut prompt);
+        prompt.handle_key(key(KeyCode::Right));
+        prompt.handle_key(key(KeyCode::Right));
+        prompt.handle_key(key(KeyCode::Char('s')));
+        let decision = prompt
+            .handle_key(key(KeyCode::Enter))
+            .expect("the confirmation answered");
+        assert_eq!(
+            decision.answer,
+            PermissionAnswer::AllowOption {
+                option_id: rungs[2].clone(),
+                lifetime: PermissionLifetime::Conversation,
+            }
+        );
     }
 
     /// A rung that reaches past the home directory has to say so where the
