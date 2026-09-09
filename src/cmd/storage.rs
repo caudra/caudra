@@ -821,10 +821,10 @@ fn render_snapshots(entries: &[StoreEntry], manifests: bool) -> String {
             bytes(entry.bytes),
             entry.objects,
             entry.manifests.len(),
-            entry
-                .root
-                .as_ref()
-                .map_or_else(|| ORPHANED_STORE.to_owned(), |root| root.display().to_string()),
+            entry.root.as_ref().map_or_else(
+                || ORPHANED_STORE.to_owned(),
+                |root| root.display().to_string()
+            ),
         );
         if manifests {
             for name in &entry.manifests {
@@ -1108,7 +1108,10 @@ mod tests {
         let small = rendered.find("CeSmall").expect(ORDER_MSG);
         assert!(big < small, "{ORDER_MSG}");
         assert!(rendered.contains("2 stores"), "{TOTAL_MSG}");
-        assert!(rendered.contains(&bytes(3 * 1024 * 1024 + 1024)), "{TOTAL_MSG}");
+        assert!(
+            rendered.contains(&bytes(3 * 1024 * 1024 + 1024)),
+            "{TOTAL_MSG}"
+        );
     }
 
     /// A store whose workspace marker is gone is exactly what an operator is

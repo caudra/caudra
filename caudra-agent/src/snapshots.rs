@@ -312,31 +312,49 @@ pub struct StoreEntry {
     pub manifests: Vec<String>,
 }
 
-fn tree_bytes(dir: &Path) -> u64 {
+/// Bytes and file count under `dir`, in one pass.
+///
+/// One walk rather than two: a store holds an object per distinct file version
+/// the worktree ever had, so on a large workspace this is the expensive part of
+/// reporting, and counting and sizing separately doubled it for no reason.
+fn tree_totals(dir: &Path) -> (u64, u64) {
     let Ok(entries) = fs::read_dir(dir) else {
-        return 0;
+        return (0, 0);
     };
     entries
         .flatten()
-        .map(|entry| match entry.file_type() {
-            Ok(kind) if kind.is_dir() => tree_bytes(&entry.path()),
-            Ok(_) => entry.metadata().map(|meta| meta.len()).unwrap_or(0),
-            Err(_) => 0,
+        .fold((0, 0), |(bytes, files), entry| match entry.file_type() {
+            Ok(kind) if kind.is_dir() => {
+                let (sub_bytes, sub_files) = tree_totals(&entry.path());
+                (bytes + sub_bytes, files + sub_files)
+            }
+            Ok(_) => (
+                bytes + entry.metadata().map(|meta| meta.len()).unwrap_or(0),
+                files + 1,
+            ),
+            Err(_) => (bytes, files),
         })
-        .sum()
 }
 
-fn count_files(dir: &Path) -> u64 {
+/// Bytes of the files sitting directly in `dir`, ignoring subdirectories.
+///
+/// A store's manifests, journal, and workspace root live beside `objects/`, so
+/// this covers the whole store when added to an `objects/` walk, without
+/// descending that expensive tree a second time.
+fn shallow_bytes(dir: &Path) -> u64 {
     let Ok(entries) = fs::read_dir(dir) else {
         return 0;
     };
     entries
         .flatten()
-        .map(|entry| match entry.file_type() {
-            Ok(kind) if kind.is_dir() => count_files(&entry.path()),
-            Ok(_) => 1,
-            Err(_) => 0,
+        .filter(|entry| {
+            entry
+                .file_type()
+                .map(|kind| !kind.is_dir())
+                .unwrap_or(false)
         })
+        .filter_map(|entry| entry.metadata().ok())
+        .map(|meta| meta.len())
         .sum()
 }
 
@@ -893,18 +911,22 @@ impl SnapshotStore {
                 if !dir.is_dir() {
                     continue;
                 }
-                let objects = dir.join(OBJECTS_DIR);
+                let (object_bytes, objects) = tree_totals(&dir.join(OBJECTS_DIR));
                 entries.push(StoreEntry {
                     session_id: session.file_name().to_string_lossy().into_owned(),
                     workspace_key: workspace.file_name().to_string_lossy().into_owned(),
                     root: read_json(&dir.join(WORKSPACE_ROOT_NAME), "workspace root").ok(),
-                    bytes: tree_bytes(&dir),
-                    objects: count_files(&objects),
+                    bytes: object_bytes + shallow_bytes(&dir),
+                    objects,
                     manifests: manifest_names(&dir),
                 });
             }
         }
-        entries.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.session_id.cmp(&b.session_id)));
+        entries.sort_by(|a, b| {
+            b.bytes
+                .cmp(&a.bytes)
+                .then_with(|| a.session_id.cmp(&b.session_id))
+        });
         entries
     }
 
@@ -2971,10 +2993,8 @@ mod tests {
         let state = TempDir::new().unwrap();
         let state_dir = StateDir::from_path(state.path().to_path_buf());
         write(&root, "kept.txt", ALPHA);
-        let store = SnapshotStore::new_managed(
-            state_dir.clone(),
-            state.path().join(SESSION_SNAPSHOTS_DIR),
-        );
+        let store =
+            SnapshotStore::new_managed(state_dir.clone(), state.path().join(SESSION_SNAPSHOTS_DIR));
 
         let held = lock_session_artifacts(&state_dir).unwrap();
         let started = Instant::now();
