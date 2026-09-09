@@ -235,6 +235,7 @@ pub async fn compact(
     event_tx: &EventSender,
     config: &AgentConfig,
 ) -> Result<TokenUsage, AgentError> {
+    event_tx.send(AgentEvent::Compacting)?;
     let cancel = CancelToken::none();
     let usage = compact_history(provider, model, history, event_tx, &cancel, config).await?;
     if let Some(post) = normalize(&config.post_compaction_instructions) {
@@ -529,6 +530,29 @@ mod tests {
             assert_eq!(msgs.len(), 2);
             assert!(matches!(msgs[0].role, Role::User));
             assert!(matches!(msgs[1].role, Role::Assistant));
+        });
+    }
+
+    /// `/compact` reaches `compact` directly rather than through the auto path,
+    /// and the UI draws the compaction border from this event.
+    #[test]
+    fn compact_announces_itself_before_summarizing() {
+        smol::block_on(async {
+            let provider = MockProvider::new(vec![Ok(text_response(StopReason::EndTurn))]);
+            let (raw_tx, rx) = flume::unbounded();
+            let mut history = History::new(vec![Message::user("work".into())]);
+
+            compact(
+                &provider,
+                &default_model(),
+                &mut history,
+                &EventSender::new(raw_tx, 0),
+                &AgentConfig::default(),
+            )
+            .await
+            .unwrap();
+
+            assert!(matches!(rx.recv().unwrap().event, AgentEvent::Compacting));
         });
     }
 

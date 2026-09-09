@@ -277,7 +277,7 @@ pub fn run(
             | AgentEvent::QueueItemConsumed { .. }
             | AgentEvent::QueueBatchConsumed { .. }
             | AgentEvent::QueueDrained
-            | AgentEvent::AutoCompacting
+            | AgentEvent::Compacting
             | AgentEvent::CompactionDone
             | AgentEvent::SessionTitle { .. }
             | AgentEvent::StreamReset

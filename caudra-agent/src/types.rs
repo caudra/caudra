@@ -1171,7 +1171,7 @@ pub enum AgentEvent {
         num_turns: u32,
         reason: DoneReason,
     },
-    AutoCompacting,
+    Compacting,
     CompactionDone,
     /// A model-written name for the session, produced off the turn's critical
     /// path. Arrives at most once per session and may land after the run that
@@ -1636,7 +1636,7 @@ impl SubagentActivity {
             AgentEvent::ToolStart(start) => {
                 Some(Self::tool(Arc::clone(&start.tool), &start.summary))
             }
-            AgentEvent::AutoCompacting => Some(Self::Compacting),
+            AgentEvent::Compacting => Some(Self::Compacting),
             AgentEvent::Retry { .. } => Some(Self::Retrying),
             AgentEvent::PermissionRequest(_) => Some(Self::AwaitingPermission),
             _ => None,
@@ -2635,7 +2635,7 @@ mod tests {
         Some(("shell", Some("rg -n 'AgentEvent'")))
         ; "a_wrapped_header_collapses_to_one_line"
     )]
-    #[test_case(AgentEvent::AutoCompacting, Some((COMPACTING_LABEL, None)) ; "compacting")]
+    #[test_case(AgentEvent::Compacting, Some((COMPACTING_LABEL, None)) ; "compacting")]
     #[test_case(
         AgentEvent::Retry { attempt: 1, message: "overloaded".into(), delay_ms: 10 },
         Some((RETRYING_LABEL, None))

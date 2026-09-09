@@ -36,7 +36,10 @@ pub(crate) const CANCELLED_TEXT: &str = "Cancelled";
 /// One notice per streak: a wedged model can spend twenty nudges, and twenty
 /// identical bubbles bury the conversation they are about.
 const NUDGE_TEXT: &str = "Model ended turn without a response, nudging...";
-const AUTO_COMPACTING_TEXT: &str = "Auto-compacting conversation...";
+/// The seam a summary replaced turns at. Progress belongs to the status bar's
+/// spinner, so the transcript card marks the border instead of announcing work.
+const COMPACTION_BORDER_TEXT: &str =
+    "Context compacted - the turns above were replaced by the summary below.";
 const TOOLS_LOADED_PREFIX: &str = "Loaded ";
 const TOOLS_LOADED_SUFFIX: &str = " - the tools array changed, so the prompt cache prefix resets.";
 
@@ -206,11 +209,11 @@ impl Chat {
                     self.messages_panel.set_turn_usage_on_last_tool(usage);
                 }
             }
-            AgentEvent::AutoCompacting => {
+            AgentEvent::Compacting => {
                 self.messages_panel.flush();
                 self.messages_panel.push(DisplayMessage::new(
                     DisplayRole::Notice,
-                    AUTO_COMPACTING_TEXT.into(),
+                    COMPACTION_BORDER_TEXT.into(),
                 ));
             }
             AgentEvent::CompactionDone => {
@@ -681,7 +684,17 @@ pub fn history_to_display(
                     display.push(message);
                 }
             }
-            HistoryItemKind::AssistantText { text, .. } if !text.is_empty() => {
+            HistoryItemKind::AssistantText {
+                text,
+                is_compaction_summary,
+                ..
+            } if !text.is_empty() => {
+                if *is_compaction_summary {
+                    display.push(DisplayMessage::new(
+                        DisplayRole::Notice,
+                        COMPACTION_BORDER_TEXT.into(),
+                    ));
+                }
                 let mut message = DisplayMessage::new(DisplayRole::Assistant, text.clone());
                 message.source = Some(DisplaySource::AssistantText(item.id));
                 display.push(message);
@@ -1570,6 +1583,40 @@ mod tests {
         assert_eq!(display[1].role, DisplayRole::Assistant);
     }
 
+    /// Live, the border rides on the Compacting event. A restored session
+    /// replays history instead, so without this the summary butts straight
+    /// against the reply it replaced everything after.
+    #[test]
+    fn history_to_display_marks_the_compaction_border() {
+        let mut summary = Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Text {
+                text: "## Objective".into(),
+            }],
+            ..Default::default()
+        };
+        summary.is_compaction_summary = true;
+        let msgs = vec![
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: "earlier reply".into(),
+                }],
+                ..Default::default()
+            },
+            summary,
+        ];
+
+        let display = display_messages(&msgs, &HashMap::new()).0;
+
+        assert_eq!(display.len(), 3);
+        assert_eq!(display[0].role, DisplayRole::Assistant);
+        assert_eq!(display[1].role, DisplayRole::Notice);
+        assert_eq!(display[1].text, COMPACTION_BORDER_TEXT);
+        assert_eq!(display[2].role, DisplayRole::Assistant);
+        assert_eq!(display[2].text, "## Objective");
+    }
+
     #[test]
     fn history_to_display_keeps_opaque_reasoning_as_a_title_only_block() {
         let mut reasoning = ContentBlock::thinking(String::new(), None);
@@ -1668,9 +1715,9 @@ mod tests {
     fn compaction_done_flushes_streaming_buffers() {
         let mut chat = chat();
 
-        chat.handle_event(AgentEvent::AutoCompacting, None);
+        chat.handle_event(AgentEvent::Compacting, None);
         assert_eq!(chat.message_count(), 1);
-        assert_eq!(chat.last_message_text(), AUTO_COMPACTING_TEXT);
+        assert_eq!(chat.last_message_text(), COMPACTION_BORDER_TEXT);
         assert_eq!(chat.last_message_role(), Some(&DisplayRole::Notice));
 
         chat.handle_event(

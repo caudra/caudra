@@ -1183,7 +1183,7 @@ impl<'h> Agent<'h> {
             return Ok(false);
         }
         info!(context_size = self.context_size, "auto-compacting");
-        self.event_tx.send(AgentEvent::AutoCompacting)?;
+        self.event_tx.send(AgentEvent::Compacting)?;
         self.do_compact().await?;
         Ok(true)
     }
@@ -2776,7 +2776,7 @@ mod tests {
             assert_eq!(
                 has_event(&drain_events(&event_rx), |e| matches!(
                     e,
-                    AgentEvent::AutoCompacting
+                    AgentEvent::Compacting
                 )),
                 expected,
             );
