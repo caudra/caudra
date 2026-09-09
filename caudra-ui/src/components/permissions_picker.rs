@@ -1,7 +1,6 @@
 use caudra_agent::permissions::{
-    EffectivePermissionRule, PermissionArgumentConstraint, PermissionLifetime,
-    PermissionResourceSelector, PermissionRuleRecord, PermissionSubject,
-    StructuredPermissionEffect,
+    ActivePolicyRule, PermissionArgumentConstraint, PermissionLifetime, PermissionResourceSelector,
+    PermissionRuleRecord, PermissionSubject, StructuredPermissionEffect,
 };
 use caudra_config::{Effect, PermissionReviewCandidate, PermissionReviewKind, PermissionSource};
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
@@ -34,7 +33,7 @@ struct PermissionEntry {
     id: Option<String>,
     tool: String,
     detail: String,
-    legacy_policy: bool,
+    read_only_policy: bool,
     project_config_action: Option<ProjectConfigAction>,
 }
 
@@ -72,7 +71,7 @@ impl PermissionsPicker {
         &mut self,
         rules: Vec<PermissionRuleRecord>,
         review_candidates: &[PermissionReviewCandidate],
-        effective_policy: &[EffectivePermissionRule],
+        effective_policy: &[ActivePolicyRule],
         needs_project_config_trust: bool,
         project_config_trusted: bool,
     ) {
@@ -144,7 +143,7 @@ impl PermissionsPicker {
                 } else if let Some(id) = entry.id.clone() {
                     self.confirm_revoke(id);
                 } else {
-                    self.show_read_only(entry.legacy_policy);
+                    self.show_read_only(entry.read_only_policy);
                 }
             }
             return PermissionsPickerAction::Consumed;
@@ -194,7 +193,7 @@ impl PermissionsPicker {
                 } else if let Some(id) = entry.id {
                     self.confirm_revoke(id);
                 } else {
-                    self.show_read_only(entry.legacy_policy);
+                    self.show_read_only(entry.read_only_policy);
                 }
                 PermissionsPickerAction::Consumed
             }
@@ -222,8 +221,8 @@ impl PermissionsPicker {
         ));
     }
 
-    fn show_read_only(&mut self, legacy_policy: bool) {
-        let message = if legacy_policy {
+    fn show_read_only(&mut self, read_only_policy: bool) {
+        let message = if read_only_policy {
             "This policy is read-only here. Edit its configuration or plugin source to change it."
         } else {
             "This legacy allow is inactive. Re-approve the next exact request or remove the old config entry."
@@ -259,7 +258,7 @@ fn project_config_entry(action: ProjectConfigAction) -> PermissionEntry {
             "shell allow patterns are inactive · no authority has been granted"
         }
         .into(),
-        legacy_policy: false,
+        read_only_policy: false,
         project_config_action: Some(action),
     }
 }
@@ -314,7 +313,7 @@ fn entry(record: PermissionRuleRecord) -> PermissionEntry {
         id: Some(record.id),
         tool: escape_terminal_controls(&tool),
         detail,
-        legacy_policy: false,
+        read_only_policy: false,
         project_config_action: None,
     }
 }
@@ -342,18 +341,18 @@ fn review_entry(candidate: &PermissionReviewCandidate) -> PermissionEntry {
             "[needs review] inactive {kind} · {source} · scope {}",
             escape_terminal_controls(scope)
         ),
-        legacy_policy: false,
+        read_only_policy: false,
         project_config_action: None,
     }
 }
 
-fn policy_entry(entry: &EffectivePermissionRule) -> PermissionEntry {
+fn policy_entry(entry: &ActivePolicyRule) -> PermissionEntry {
     let scope = entry.rule.scope.as_deref().unwrap_or("<all>");
     PermissionEntry {
         id: None,
         tool: escape_terminal_controls(&entry.rule.tool.to_string()),
         detail: format!(
-            "[legacy] {} · {} · scope {} · read-only",
+            "[policy] {} · {} · scope {} · read-only",
             match entry.rule.effect {
                 Effect::Allow => "allow",
                 Effect::Ask => "ask",
@@ -362,7 +361,7 @@ fn policy_entry(entry: &EffectivePermissionRule) -> PermissionEntry {
             entry.source,
             escape_terminal_controls(scope),
         ),
-        legacy_policy: true,
+        read_only_policy: true,
         project_config_action: None,
     }
 }

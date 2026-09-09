@@ -1713,7 +1713,7 @@ impl App {
     fn open_permissions_picker(&mut self) -> Result<(), PermissionPolicyError> {
         let rules = self.permissions.structured_rule_inventory()?;
         let candidates = self.permissions.review_candidates();
-        let policy = self.permissions.effective_legacy_policy();
+        let policy = self.permissions.active_policy();
         let needs_project_config_trust = self.permissions.needs_project_permission_config_trust();
         let project_config_trusted = self.permissions.project_permission_config_trusted();
         self.permissions_picker.open(

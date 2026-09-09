@@ -465,8 +465,11 @@ pub enum RevokedRuleScope {
     Global,
 }
 
+/// One line of the configured, builtin, or plugin policy, for display in the
+/// permissions picker. These rules are edited at their source rather than
+/// revoked, so the picker shows them read-only.
 #[derive(Clone)]
-pub struct EffectivePermissionRule {
+pub struct ActivePolicyRule {
     pub source: &'static str,
     pub rule: PermissionRule,
 }
@@ -1404,31 +1407,31 @@ impl PermissionManager {
         candidates
     }
 
-    pub fn effective_legacy_policy(&self) -> Vec<EffectivePermissionRule> {
+    /// The policy the picker shows but cannot revoke: `permissions.toml`, the
+    /// builtin project allows, and rules registered by trusted plugins.
+    pub fn active_policy(&self) -> Vec<ActivePolicyRule> {
         let builtin_rules = self.project().builtin_rules.clone();
         let mut entries: Vec<_> = self
             .active_config_rules()
             .into_iter()
-            .map(|rule| EffectivePermissionRule {
+            .map(|rule| ActivePolicyRule {
                 source: "configuration",
                 rule,
             })
             .collect();
+        entries.extend(builtin_rules.iter().cloned().map(|rule| ActivePolicyRule {
+            source: "builtin",
+            rule,
+        }));
         entries.extend(
-            builtin_rules
-                .iter()
-                .cloned()
-                .map(|rule| EffectivePermissionRule {
-                    source: "builtin",
+            self.plugin_rules
+                .snapshot()
+                .into_iter()
+                .map(|rule| ActivePolicyRule {
+                    source: "trusted plugin",
                     rule,
                 }),
         );
-        entries.extend(self.plugin_rules.snapshot().into_iter().map(|rule| {
-            EffectivePermissionRule {
-                source: "trusted plugin",
-                rule,
-            }
-        }));
         entries
     }
 

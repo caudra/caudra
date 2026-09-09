@@ -127,7 +127,7 @@ An unreadable or malformed permissions file fails closed. Caudra disables inheri
 
 A project `prompt` default cannot weaken a global `deny` default, including per-tool and MCP defaults.
 
-`/permissions` lists inactive entries as `needs review`, shows trusted config policy, and can revoke remembered prompt decisions. Legacy conversation allows can be removed directly from the picker.
+`/permissions` lists inactive entries as `needs review`, shows trusted config policy, and can revoke remembered prompt decisions. Configured, builtin, and plugin policy appears read-only, because it is changed at its source.
 
 ```toml
 default = "prompt"
@@ -158,13 +158,17 @@ Shell allow and ask patterns use literal tokens followed by an optional bare `*`
 
 Command patterns never authorize a redirect that names a file. Writing to a file, reading from a file, and heredocs all produce a protected request carrying the complete original command. File descriptor duplication such as `2>&1` names no file and stays an ordinary reviewable command. Path-qualified executables remain path-qualified, so `git status *` does not authorize `/tmp/git status`.
 
+No configured allow reaches a protected command, whatever its pattern. A protected command that no deny names is left uncovered and prompts, so the reviewed text reaches you rather than a rule written against a shape it does not have.
+
+Restrictive rules are also matched against the resolved executable name, so `/bin/rm -rf build` cannot dodge a `rm *` deny. Allows are matched against the reviewed text alone.
+
 For shell allow and ask rules, the most specific matching pattern wins and ask wins a tie. Any matching deny still blocks the complete call. Rule order in the file has no effect. A catch-all `ask = ["*"]` can therefore coexist with more specific read-only allows.
 
 Caudra also asks by default for these command families unless a configured or remembered allow covers them: `rm`, destructive Git operations, `chmod`, `chown`, `dd`, `mkfs`, network transfer and remote-login commands, and process termination commands.
 
 Caudra allows `echo` by default when every argument is literal after quoting, so the reviewed text is exactly what the shell runs. Parameter expansion, command substitution, globs, tildes, braces, redirects, and operators all fall back to the normal prompt, and a configured ask or deny still overrides the default. Single quotes keep their contents literal, so `echo '$HOME'` is allowed while `echo $HOME` asks.
 
-Legacy deny matching remains glob-like for compatibility:
+A configured scope matches glob-like, whatever its effect:
 
 | Pattern | Matches |
 |---|---|
