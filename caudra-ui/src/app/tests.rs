@@ -10798,7 +10798,7 @@ fn bash_prefix_overrides_mode() {
     let mut app = test_app();
 
     app.input_box.set_input("! ls".into());
-    assert_eq!(&*app.mode_label().0, "[BASH]");
+    assert_eq!(&*app.mode_label().full, "[BASH]");
 
     app.update(Msg::Key(key(KeyCode::Tab)));
     assert_eq!(
@@ -10808,7 +10808,38 @@ fn bash_prefix_overrides_mode() {
     );
 
     app.input_box.set_input("ls".into());
-    assert_eq!(&*app.mode_label().0, "[PLAN]");
+    assert_eq!(&*app.mode_label().full, "[PLAN]");
+}
+
+/// A toggle only reaches the agent on the next message, so claiming the new
+/// mode straight away would promise a switch that has not happened.
+#[test]
+fn a_toggled_mode_reads_as_pending_until_a_message_carries_it() {
+    let mut app = test_app();
+    assert_eq!(&*app.mode_label().full, "[PLAN]");
+
+    app.update(Msg::Key(key(KeyCode::Tab)));
+    assert_eq!(app.state.mode, Mode::Build);
+    assert_eq!(&*app.mode_label().full, "[PLAN\u{2192}BUILD]");
+    assert_eq!(&*app.mode_label().short, "[P\u{2192}B]");
+
+    app.build_agent_input(&QueuedMessage {
+        text: "go".into(),
+        images: Vec::new(),
+        mentions: Vec::new(),
+        paste_ranges: Vec::new(),
+    });
+    assert_eq!(&*app.mode_label().full, "[BUILD]");
+    assert_eq!(&*app.mode_label().short, "[B]");
+}
+
+/// Toggling back is not a pending transition, it is no transition at all.
+#[test]
+fn toggling_back_before_sending_clears_the_pending_label() {
+    let mut app = test_app();
+    app.update(Msg::Key(key(KeyCode::Tab)));
+    app.update(Msg::Key(key(KeyCode::Tab)));
+    assert_eq!(&*app.mode_label().full, "[PLAN]");
 }
 
 #[test]

@@ -33,6 +33,10 @@ pub(crate) struct SessionState {
     /// otherwise be derived from.
     pub turns: u64,
     pub mode: Mode,
+    /// The mode the agent was last handed. A toggle only reaches it on the next
+    /// message, so while this trails `mode` the status bar shows the pending
+    /// transition rather than claiming a switch that has not happened.
+    pub applied_mode: Mode,
     pub plan: PlanState,
     pub warnings: Vec<String>,
     pub thinking: ThinkingConfig,
@@ -152,6 +156,7 @@ impl SessionState {
             context_size,
             turns,
             mode,
+            applied_mode: mode,
             plan,
             warnings,
         }

@@ -212,7 +212,7 @@ pub fn generate() -> String {
     .unwrap();
     writeln!(
         out,
-        "- **Plan / build**: not a slash command. Press `Tab` in the input to toggle plan mode (plan-file writes only). Caudra opens in plan mode, and a resumed session reopens in the mode it was left in."
+        "- **Plan / build**: not a slash command. Press `Tab` in the input to toggle plan mode (plan-file writes only). Caudra opens in plan mode, and a resumed session reopens in the mode it was left in. A toggle reaches the agent with your next message, so until you send one the status bar shows the pending switch as `[PLAN\u{2192}BUILD]` (`[P\u{2192}B]` on a narrow terminal) rather than the new mode."
     )
     .unwrap();
     writeln!(

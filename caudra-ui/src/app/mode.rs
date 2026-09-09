@@ -1,8 +1,8 @@
-use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
 use crate::agent::QueuedMessage;
 use crate::components::Status;
+use crate::components::status_bar::ModeLabel;
 use crate::theme;
 use caudra_agent::mentions;
 use caudra_agent::{AgentInput, AgentMode, Mention};
@@ -11,6 +11,17 @@ use caudra_storage::plans;
 use ratatui::style::{Color, Modifier, Style};
 
 use super::App;
+
+const BASH_LABEL: &str = "[BASH]";
+const BASH_SHORT_LABEL: &str = "[$]";
+const BUILD_LABEL: &str = "[BUILD]";
+const BUILD_SHORT_LABEL: &str = "[B]";
+const PLAN_LABEL: &str = "[PLAN]";
+const PLAN_SHORT_LABEL: &str = "[P]";
+const TO_PLAN_LABEL: &str = "[BUILD\u{2192}PLAN]";
+const TO_PLAN_SHORT_LABEL: &str = "[B\u{2192}P]";
+const TO_BUILD_LABEL: &str = "[PLAN\u{2192}BUILD]";
+const TO_BUILD_SHORT_LABEL: &str = "[P\u{2192}B]";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Mode {
@@ -134,7 +145,10 @@ impl App {
             .collect()
     }
 
-    pub(crate) fn build_agent_input(&self, msg: &QueuedMessage) -> AgentInput {
+    /// The one place the mode is committed to the agent, so it is also where a
+    /// pending toggle stops being pending.
+    pub(crate) fn build_agent_input(&mut self, msg: &QueuedMessage) -> AgentInput {
+        self.state.applied_mode = self.state.mode;
         AgentInput {
             message: msg.text.clone(),
             mode: self.agent_mode(),
@@ -148,19 +162,27 @@ impl App {
         }
     }
 
-    pub(super) fn mode_label(&self) -> (Cow<'static, str>, Style) {
-        let label: Cow<'static, str> = if self.is_bash_input() {
-            "[BASH]".into()
+    /// A toggle does not reach the agent until the next message carries it, so
+    /// a mode that has been switched but not yet handed over reads as a
+    /// transition rather than as an accomplished fact.
+    pub(super) fn mode_label(&self) -> ModeLabel {
+        let (full, short) = if self.is_bash_input() {
+            (BASH_LABEL, BASH_SHORT_LABEL)
         } else {
-            match self.state.mode {
-                Mode::Build => "[BUILD]".into(),
-                Mode::Plan => "[PLAN]".into(),
+            match (self.state.applied_mode, self.state.mode) {
+                (Mode::Build, Mode::Build) => (BUILD_LABEL, BUILD_SHORT_LABEL),
+                (Mode::Plan, Mode::Plan) => (PLAN_LABEL, PLAN_SHORT_LABEL),
+                (Mode::Build, Mode::Plan) => (TO_PLAN_LABEL, TO_PLAN_SHORT_LABEL),
+                (Mode::Plan, Mode::Build) => (TO_BUILD_LABEL, TO_BUILD_SHORT_LABEL),
             }
         };
-        let style = Style::new()
-            .fg(self.effective_mode_color())
-            .add_modifier(Modifier::BOLD);
-        (label, style)
+        ModeLabel {
+            full: full.into(),
+            short: short.into(),
+            style: Style::new()
+                .fg(self.effective_mode_color())
+                .add_modifier(Modifier::BOLD),
+        }
     }
 
     pub(crate) fn is_bash_input(&self) -> bool {

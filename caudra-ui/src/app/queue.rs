@@ -971,7 +971,7 @@ impl App {
         msg: QueuedMessage,
         admission: PromptAdmission,
     ) -> bool {
-        let Some(ref shared) = self.queue.shared else {
+        let Some(shared) = self.queue.shared.clone() else {
             return false;
         };
         let input = self.build_agent_input(&msg);

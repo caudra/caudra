@@ -35,6 +35,9 @@ const THINKING_PREFIX: &str = "thinking: ";
 /// A chip's leading space and its two brackets, which no tier sheds.
 const CHIP_OVERHEAD: usize = 3;
 const BRACKET_WIDTH: usize = 2;
+/// Below the classic 80-column terminal the right side is already abbreviating
+/// chips, and the mode reads just as well as an initial.
+const MODE_SHORT_WIDTH: u16 = 80;
 /// Enough for `[.]`, so a bar too narrow to name the model still offers the
 /// control that changes it.
 const CLICKABLE_MODEL_FLOOR: usize = 3;
@@ -84,10 +87,28 @@ pub struct UsageStats {
     pub show_global: bool,
 }
 
+/// The mode label at both widths. The bar draws one of them, and the choice
+/// belongs here rather than at build time because the label sits on the left and
+/// every column it takes is a column the right side does not get.
+pub struct ModeLabel {
+    pub full: Cow<'static, str>,
+    pub short: Cow<'static, str>,
+    pub style: Style,
+}
+
+impl ModeLabel {
+    fn text(&self, width: u16) -> &Cow<'static, str> {
+        if width < MODE_SHORT_WIDTH {
+            &self.short
+        } else {
+            &self.full
+        }
+    }
+}
+
 pub struct StatusBarContext<'a> {
     pub status: &'a Status,
-    pub mode_label: Cow<'static, str>,
-    pub mode_style: Style,
+    pub mode: ModeLabel,
     pub model_id: &'a str,
     pub stats: UsageStats,
     pub auto_scroll: bool,
@@ -455,12 +476,13 @@ impl StatusBar {
             ));
         }
 
+        let mode_label = ctx.mode.text(area.width);
         let mode_offset = left_spans.iter().map(Span::width).sum::<usize>() + " ".width();
         left_spans.push(Span::raw(" "));
         left_spans.push(Span::styled(
-            ctx.mode_label.clone(),
+            mode_label.clone(),
             hover_style(
-                ctx.mode_style,
+                ctx.mode.style,
                 ctx.mode_clickable && ctx.hovered == Some(StatusBarHitTarget::Mode),
             ),
         ));
@@ -580,7 +602,7 @@ impl StatusBar {
             &mut hits,
             left_area,
             mode_offset,
-            ctx.mode_label.width(),
+            mode_label.width(),
             ctx.mode_clickable,
             StatusBarHitTarget::Mode,
         );
@@ -955,6 +977,8 @@ mod tests {
     const STALE_BRANCH: &str = "/nowhere:gone";
     const BAR_WIDTH: u16 = 120;
     const MODE_LABEL: &str = "[BUILD]";
+    const MODE_SHORT_LABEL: &str = "[B]";
+    const EXPECTED_MODE_HIT: &str = "the mode label is always clickable here";
     const MODEL_ID: &str = "test-model";
     const THINKING_LEVEL: &str = "off";
     const LADDER_MODEL_ID: &str = "anthropic/claude-opus-5";
@@ -1047,8 +1071,11 @@ mod tests {
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 1)).unwrap();
         let ctx = StatusBarContext {
             status: &Status::Idle,
-            mode_label: MODE_LABEL.into(),
-            mode_style: Style::new(),
+            mode: ModeLabel {
+                full: MODE_LABEL.into(),
+                short: MODE_SHORT_LABEL.into(),
+                style: Style::new(),
+            },
             model_id: MODEL_ID,
             stats: UsageStats {
                 global_cost,
@@ -1103,8 +1130,11 @@ mod tests {
     fn with_ladder_ctx(f: impl FnOnce(&StatusBarContext<'_>)) {
         let ctx = StatusBarContext {
             status: &Status::Idle,
-            mode_label: MODE_LABEL.into(),
-            mode_style: Style::new(),
+            mode: ModeLabel {
+                full: MODE_LABEL.into(),
+                short: MODE_SHORT_LABEL.into(),
+                style: Style::new(),
+            },
             model_id: LADDER_MODEL_ID,
             stats: UsageStats {
                 global_cost: Some(SESSION_COST),
@@ -1719,6 +1749,24 @@ mod tests {
                 .iter()
                 .all(|style| style.add_modifier.contains(Modifier::REVERSED))
         );
+    }
+
+    /// The label is measured for the click target and drawn from the same
+    /// choice, so a bar that abbreviates one and not the other would leave the
+    /// mode clickable over the wrong columns.
+    #[test_case(MODE_SHORT_WIDTH, MODE_LABEL ; "the_name_survives_at_the_threshold")]
+    #[test_case(MODE_SHORT_WIDTH - 1, MODE_SHORT_LABEL ; "one_column_narrower_abbreviates")]
+    fn a_narrow_bar_abbreviates_the_mode(width: u16, expected: &str) {
+        let (text, hits, _) = render_at(Fixture {
+            width,
+            ..Fixture::default()
+        });
+        assert!(text.contains(expected), "{text}");
+        let hit = hits
+            .iter()
+            .find(|hit| hit.target == StatusBarHitTarget::Mode)
+            .expect(EXPECTED_MODE_HIT);
+        assert_eq!(usize::from(hit.area.width), expected.width());
     }
 
     #[test]

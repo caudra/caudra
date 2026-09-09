@@ -536,7 +536,7 @@ impl App {
         let chat = &self.chats[render_chat];
         let goal = self.state.goal.snapshot();
         let chat_name = (self.chats.len() > 1).then_some(chat.name.as_str());
-        let (mode_label, mode_style) = self.mode_label();
+        let mode = self.mode_label();
         let main_chat = render_chat == 0;
         // What the request will actually carry, not what was asked for: a
         // model can refuse to stop reasoning, and the badge has to say so.
@@ -553,8 +553,7 @@ impl App {
         });
         let ctx = StatusBarContext {
             status: &self.status,
-            mode_label,
-            mode_style,
+            mode,
             model_id: chat
                 .model_id
                 .as_deref()
