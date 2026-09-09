@@ -5,9 +5,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use caudra_agent::tools::{
-    DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError, QUESTION_TOOL_NAME,
-    Tool, ToolAudience, ToolContext, ToolExecResult, ToolInvocation, ToolLive, ToolRegistry,
-    ToolSource, timeout_annotation,
+    DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError, PermissionScopes,
+    QUESTION_TOOL_NAME, Tool, ToolAudience, ToolContext, ToolExecResult, ToolInvocation, ToolLive,
+    ToolRegistry, ToolSource, timeout_annotation,
 };
 use caudra_agent::{ToolOutput, ToolOutputLimits};
 use caudra_config::{
@@ -4625,6 +4625,28 @@ fn path_permission_scope_expands_and_normalizes_tilde() {
     assert!(!scopes.force_prompt);
 }
 
+const BLOCKED_READ_PATH: &str = "/tmp/blocked";
+const ALLOWED_READ_PATH: &str = "/tmp/allowed";
+
+/// Runs the real permission evaluator with no response channel, so a call the
+/// rules do not settle reports the refusal instead of waiting on a prompt.
+fn enforce_read_without_prompt(
+    manager: &caudra_agent::permissions::PermissionManager,
+    path: &str,
+) -> Result<(), caudra_agent::permissions::PermissionError> {
+    let (event_tx, _event_rx) = flume::unbounded();
+    smol::block_on(manager.enforce(
+        &ToolKey::native("read"),
+        &PermissionScopes::single(path.to_owned()),
+        &json!({ "path": path }),
+        &caudra_agent::EventSender::new(event_tx, 0),
+        None,
+        "read-request",
+        &caudra_agent::CancelToken::none(),
+        None,
+    ))
+}
+
 #[test]
 fn read_only_filesystem_tools_declare_scopes_without_changing_default_behavior() {
     let (reg, host) = builtins_host();
@@ -4660,7 +4682,7 @@ fn read_only_filesystem_tools_declare_scopes_without_changing_default_behavior()
         PermissionsConfig {
             rules: vec![PermissionRule {
                 tool: ToolKey::native("read"),
-                scope: Some("/tmp/blocked".into()),
+                scope: Some(BLOCKED_READ_PATH.into()),
                 effect: Effect::Deny,
             }],
             ..PermissionsConfig::default()
@@ -4668,14 +4690,8 @@ fn read_only_filesystem_tools_declare_scopes_without_changing_default_behavior()
         "/tmp".into(),
         host.plugin_rules(),
     );
-    assert!(matches!(
-        manager.check(&ToolKey::native("read"), "/tmp/blocked", None),
-        caudra_agent::permissions::PermissionCheck::Denied
-    ));
-    assert!(matches!(
-        manager.check(&ToolKey::native("read"), "/tmp/allowed", None),
-        caudra_agent::permissions::PermissionCheck::Allowed
-    ));
+    assert!(enforce_read_without_prompt(&manager, BLOCKED_READ_PATH).is_err());
+    assert!(enforce_read_without_prompt(&manager, ALLOWED_READ_PATH).is_ok());
 }
 
 #[test]

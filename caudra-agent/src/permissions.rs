@@ -150,17 +150,6 @@ fn builtin_structured_rules() -> Vec<StructuredPermissionRule> {
 
 pub const BOUNDARY_UNVERIFIABLE_PREFIX: &str = "Cannot verify project boundary for";
 
-#[derive(Debug)]
-pub enum PermissionCheck {
-    Allowed,
-    Denied,
-    NeedsPrompt {
-        tool: ToolKey,
-        scopes: Vec<String>,
-        force_prompt: bool,
-    },
-}
-
 #[derive(Debug, Error)]
 pub struct PermissionError {
     tool: String,
@@ -600,6 +589,17 @@ fn reusable_rule_scope_matches(
     }
 }
 
+/// A stable numeric encoding of an effect for the project-config trust digest.
+/// The numbers are part of the digest, so changing one re-prompts every trusted
+/// project for consent it already gave.
+fn config_effect_code(effect: Effect) -> u8 {
+    match effect {
+        Effect::Allow => 0,
+        Effect::Ask => 1,
+        Effect::Deny => 2,
+    }
+}
+
 fn project_permission_config_digest(
     allow_rules: &[PermissionRule],
     restrictive_rules: &[PermissionRule],
@@ -614,7 +614,7 @@ fn project_permission_config_digest(
             (
                 rule.tool.to_string(),
                 rule.scope.as_deref().unwrap_or("*").to_owned(),
-                command_policy_priority(rule.effect),
+                config_effect_code(rule.effect),
             )
         })
         .collect();
@@ -654,21 +654,6 @@ fn configured_policy(
         default: config.default,
         tool_defaults: config.tool_defaults,
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CommandPolicyDecision {
-    Allow,
-    Ask,
-    Deny,
-    NoMatch,
-}
-
-#[derive(Clone, Copy, Default)]
-struct ScopeRuleDecision {
-    allowed: bool,
-    must_prompt: bool,
-    denied: bool,
 }
 
 /// The selector a configured scope stands for, read against the kind of the
@@ -805,73 +790,6 @@ fn configured_constraints(
         })
         .flatten()
         .collect()
-}
-
-fn command_policy_priority(effect: Effect) -> u8 {
-    match effect {
-        Effect::Allow => 0,
-        Effect::Ask => 1,
-        Effect::Deny => 2,
-    }
-}
-
-fn configured_command_decision<'a>(
-    rules: impl IntoIterator<Item = &'a PermissionRule>,
-    tool: &ToolKey,
-    command: &str,
-    normalized_command: Option<&str>,
-    requires_exact: bool,
-) -> CommandPolicyDecision {
-    let mut best = None;
-    for rule in rules {
-        if !command_rule_tool_matches(&rule.tool, tool) {
-            continue;
-        }
-        if requires_exact && rule.effect == Effect::Deny {
-            return CommandPolicyDecision::Deny;
-        }
-        let matches = match (&rule.scope, rule.effect) {
-            (None, _) => true,
-            (Some(pattern), Effect::Deny) => {
-                scope_matches(pattern, command)
-                    || command_pattern::matches(pattern, command)
-                    || normalized_command.is_some_and(|normalized| {
-                        scope_matches(pattern, normalized)
-                            || command_pattern::matches(pattern, normalized)
-                    })
-            }
-            (Some(pattern), Effect::Allow | Effect::Ask) => {
-                command_pattern::matches(pattern, command)
-                    || rule.effect == Effect::Ask
-                        && normalized_command
-                            .is_some_and(|normalized| command_pattern::matches(pattern, normalized))
-            }
-        };
-        if !matches || requires_exact && rule.effect == Effect::Allow {
-            continue;
-        }
-        if rule.effect == Effect::Deny {
-            return CommandPolicyDecision::Deny;
-        }
-        let specificity = rule
-            .scope
-            .as_deref()
-            .and_then(command_pattern::specificity)
-            .unwrap_or((0, 0));
-        if best.is_none_or(|(best_specificity, best_effect)| {
-            specificity > best_specificity
-                || specificity == best_specificity
-                    && command_policy_priority(rule.effect) > command_policy_priority(best_effect)
-        }) {
-            best = Some((specificity, rule.effect));
-        }
-    }
-    match best.map(|(_, effect)| effect) {
-        Some(Effect::Allow) => CommandPolicyDecision::Allow,
-        Some(Effect::Ask) => CommandPolicyDecision::Ask,
-        Some(Effect::Deny) => CommandPolicyDecision::Deny,
-        None => CommandPolicyDecision::NoMatch,
-    }
 }
 
 impl PermissionManager {
@@ -1263,146 +1181,6 @@ impl PermissionManager {
         }
     }
 
-    fn scope_rule_decisions(
-        &self,
-        tool: &ToolKey,
-        scopes: &[String],
-        include_builtin_allows: bool,
-        include_config_shell_policy: bool,
-    ) -> Vec<ScopeRuleDecision> {
-        let config = self.active_config_rules();
-        let builtin = self.project().builtin_rules.clone();
-        let plugin = self.plugin_rules.snapshot();
-        let shell_tool = is_shell_tool(tool);
-
-        scopes
-            .iter()
-            .map(|scope| {
-                let mut decision = ScopeRuleDecision::default();
-                for rule in config
-                    .iter()
-                    .filter(|_| !shell_tool)
-                    .chain(builtin.iter().filter(|_| include_builtin_allows))
-                    .chain(&plugin)
-                {
-                    if !matches_rule(&rule.tool, tool) || !rule_matches_scope(rule, tool, scope) {
-                        continue;
-                    }
-                    match rule.effect {
-                        Effect::Allow => decision.allowed = true,
-                        Effect::Ask => decision.must_prompt = true,
-                        Effect::Deny => decision.denied = true,
-                    }
-                }
-                if shell_tool {
-                    let command = bash_command_scope(scope).unwrap_or(scope);
-                    if include_builtin_allows && command_pattern::builtin_allowed(command) {
-                        decision.allowed = true;
-                    }
-                    match configured_command_decision(
-                        config.iter().filter(|rule| {
-                            include_config_shell_policy || rule.effect == Effect::Deny
-                        }),
-                        tool,
-                        command,
-                        None,
-                        false,
-                    ) {
-                        CommandPolicyDecision::Allow => decision.allowed = true,
-                        CommandPolicyDecision::Ask => decision.must_prompt = true,
-                        CommandPolicyDecision::Deny => decision.denied = true,
-                        CommandPolicyDecision::NoMatch => {}
-                    }
-                }
-                decision
-            })
-            .collect()
-    }
-
-    fn check_inner(
-        &self,
-        tool: &ToolKey,
-        scopes: &[&str],
-        force_prompt: bool,
-        plan_path: Option<&Path>,
-        include_builtin_allows: bool,
-        include_config_shell_policy: bool,
-    ) -> PermissionCheck {
-        let owned_scopes: Vec<_> = scopes.iter().map(|scope| (*scope).to_owned()).collect();
-        let decisions = self.scope_rule_decisions(
-            tool,
-            &owned_scopes,
-            include_builtin_allows,
-            include_config_shell_policy,
-        );
-        if let Some((index, _)) = decisions
-            .iter()
-            .enumerate()
-            .find(|(_, decision)| decision.denied)
-        {
-            info!(tool = %tool, scope = %scopes[index], "permission denied");
-            return PermissionCheck::Denied;
-        }
-
-        if self.yolo.load(Ordering::Relaxed) {
-            return PermissionCheck::Allowed;
-        }
-
-        let pending: Vec<_> = scopes
-            .iter()
-            .zip(&decisions)
-            .filter_map(|(scope, decision)| {
-                (force_prompt || !decision.allowed || decision.must_prompt)
-                    .then_some((*scope, force_prompt || decision.must_prompt))
-            })
-            .collect();
-
-        if pending.is_empty() {
-            return PermissionCheck::Allowed;
-        }
-
-        // Plan file auto-allow: fires AFTER deny rules have been evaluated.
-        // Only triggers if ALL pending scopes match the plan file path.
-        // A single non-plan scope means we must prompt for the rest.
-        if !force_prompt && pending.iter().all(|(_, must_prompt)| !must_prompt) {
-            let is_plan_write = plan_path.is_some_and(|pp| {
-                matches!(tool, ToolKey::Native(name) if FILE_WRITE_TOOLS.contains(&name.as_ref()))
-                    && {
-                        let normalized_plan = normalize_scope_path(&pp.display().to_string());
-                        pending
-                            .iter()
-                            .all(|(scope, _)| normalize_scope_path(scope) == normalized_plan)
-                    }
-            });
-            if is_plan_write {
-                return PermissionCheck::Allowed;
-            }
-        }
-
-        let eff = self.default_effect(tool);
-        let has_unclaimed = pending.iter().any(|(_, must_prompt)| !must_prompt);
-        let prompt_scopes = |include_unclaimed: bool| PermissionCheck::NeedsPrompt {
-            tool: tool.clone(),
-            scopes: pending
-                .iter()
-                .filter(|(_, must_prompt)| include_unclaimed || *must_prompt)
-                .map(|(scope, _)| (*scope).to_owned())
-                .collect(),
-            force_prompt,
-        };
-        match eff {
-            DefaultEffect::Deny if has_unclaimed => {
-                info!(tool = %tool, "denied by default");
-                PermissionCheck::Denied
-            }
-            DefaultEffect::Allow if !pending.iter().any(|(_, must_prompt)| *must_prompt) => {
-                PermissionCheck::Allowed
-            }
-            DefaultEffect::Allow | DefaultEffect::Deny => prompt_scopes(false),
-            DefaultEffect::Prompt => prompt_scopes(true),
-        }
-    }
-
     fn default_effect(&self, tool: &ToolKey) -> DefaultEffect {
         let configured = self.configured();
         configured
@@ -1422,20 +1200,6 @@ impl PermissionManager {
                     .copied()
             })
             .unwrap_or(configured.default)
-    }
-
-    pub fn check(&self, tool: &ToolKey, scope: &str, plan_path: Option<&Path>) -> PermissionCheck {
-        self.check_inner(tool, &[scope], false, plan_path, true, true)
-    }
-
-    pub fn check_multi(
-        &self,
-        tool: &ToolKey,
-        scopes: &[&str],
-        force_prompt: bool,
-        plan_path: Option<&Path>,
-    ) -> PermissionCheck {
-        self.check_inner(tool, scopes, force_prompt, plan_path, true, true)
     }
 
     /// The explicit toggle, so it also claims the session's intent: `/yolo` off
@@ -2020,7 +1784,6 @@ impl PermissionManager {
         include_builtin_allows: bool,
         intent: Option<&crate::tools::PermissionIntent>,
     ) -> Result<(), PermissionError> {
-        let scope_refs: Vec<&str> = scopes.scopes.iter().map(|s| s.as_str()).collect();
         // A plan-scoped call is unreviewable in the same way a forced prompt
         // is, so it is built and presented the same way. The difference is what
         // may settle it, which is decided against the rules, not here.
@@ -2158,10 +1921,12 @@ impl PermissionManager {
                 return allowed(DECISION_SOURCE_RULE);
             }
             (tool.clone(), scopes.scopes.clone(), force_prompt)
-        } else if intent.is_some() {
+        } else {
             if exact_plan_write && !force_prompt && !full.must_prompt {
                 return allowed(DECISION_SOURCE_RULE);
             }
+            // Silence is answered by the default effect, which is not a rule:
+            // it says what an unmatched call means rather than matching one.
             match self.default_effect(tool) {
                 DefaultEffect::Allow if !force_prompt && !full.must_prompt => {
                     return allowed(by_rule());
@@ -2172,31 +1937,6 @@ impl PermissionManager {
                 DefaultEffect::Allow | DefaultEffect::Deny | DefaultEffect::Prompt => {
                     (tool.clone(), scopes.scopes.clone(), force_prompt)
                 }
-            }
-        } else {
-            match self.check_inner(
-                tool,
-                &scope_refs,
-                force_prompt,
-                plan_path,
-                include_builtin_allows,
-                false,
-            ) {
-                PermissionCheck::Allowed if full.must_prompt => {
-                    (tool.clone(), scopes.scopes.clone(), force_prompt)
-                }
-                PermissionCheck::Allowed => return allowed(by_rule()),
-                PermissionCheck::Denied => return Err(deny(DECISION_SOURCE_RULE, None)),
-                PermissionCheck::NeedsPrompt {
-                    tool,
-                    scopes: _,
-                    force_prompt,
-                } if full.must_prompt => (tool, full_request.scopes.clone(), force_prompt),
-                PermissionCheck::NeedsPrompt {
-                    tool,
-                    scopes,
-                    force_prompt,
-                } => (tool, scopes, force_prompt),
             }
         };
 
@@ -2593,24 +2333,6 @@ fn is_bound_shell_request(request: &PermissionRequest) -> bool {
     }
 }
 
-fn rule_matches_scope(rule: &PermissionRule, tool: &ToolKey, scope: &str) -> bool {
-    match &rule.scope {
-        None => true,
-        Some(pattern) if tool.is_mcp() => {
-            scope_matches(pattern, scope)
-                || (canonical_mcp_scope(pattern) == canonical_mcp_scope(scope))
-        }
-        Some(pattern) => {
-            scope_matches(pattern, scope)
-                || matches!(tool, ToolKey::Native(name) if matches!(name.as_ref(), "bash" | "shell"))
-                    && bash_command_scope(scope).is_some_and(|command| {
-                        scope_matches(pattern, command)
-                            || command_pattern::matches(pattern, command)
-                    })
-        }
-    }
-}
-
 pub fn shell_permission_scope(command: &str, workdir: &Path) -> String {
     let workdir = workdir.to_string_lossy();
     format!(
@@ -2618,10 +2340,6 @@ pub fn shell_permission_scope(command: &str, workdir: &Path) -> String {
         workdir.len(),
         workdir.len()
     )
-}
-
-fn bash_command_scope(scope: &str) -> Option<&str> {
-    bash_scope_parts(scope).map(|(command, _)| command)
 }
 
 fn bash_scope_parts(scope: &str) -> Option<(&str, &str)> {
@@ -2632,12 +2350,6 @@ fn bash_scope_parts(scope: &str) -> Option<(&str, &str)> {
     let workdir = payload.get(workdir_start..)?;
     let metadata = format!("{BASH_WORKDIR_SCOPE_MARKER}{workdir_length}]=");
     Some((command_with_metadata.strip_suffix(&metadata)?, workdir))
-}
-
-fn canonical_mcp_scope(scope: &str) -> String {
-    serde_json::from_str(scope)
-        .map(|value| canonical_json(&value))
-        .unwrap_or_else(|_| scope.to_owned())
 }
 
 /// Glob matcher for permission scopes. The boundary suffixes (`/**`, `" *"`)
@@ -2714,6 +2426,8 @@ mod tests {
     use test_case::test_case;
 
     const PERMISSION_RULES_STATE_KEY: &str = "permission.rules";
+    const SHELL_WORKDIR: &str = "/tmp";
+    const LEGACY_REQUEST_ID: &str = "legacy-request";
 
     fn make_config(rules: Vec<PermissionRule>) -> PermissionsConfig {
         PermissionsConfig {
@@ -2766,6 +2480,53 @@ mod tests {
         manager.request_coverage(request, &rules, builtin_allows)
     }
 
+    /// A call the rules settle on their own: every resource carries authority
+    /// and nothing withholds it, so `enforce` returns without prompting.
+    fn allows_without_prompt(manager: &PermissionManager, request: &PermissionRequest) -> bool {
+        let coverage = coverage_with(manager, request, true, &[]);
+        coverage.covered.iter().all(|covered| *covered) && !coverage.must_prompt
+    }
+
+    /// A restrictive rule reaching the request, which is the one answer that
+    /// outranks every grant, yolo, and the default effect.
+    fn denied_by_rule(manager: &PermissionManager, request: &PermissionRequest) -> bool {
+        manager
+            .applicable_rules_within(request, false, true)
+            .unwrap()
+            .iter()
+            .any(|rule| permission_rule_intersects_request(rule, request))
+    }
+
+    /// The default effect answers what no rule spoke to, so a deny default only
+    /// blocks the resources the rules left uncovered.
+    fn denied_by_default(manager: &PermissionManager, request: &PermissionRequest) -> bool {
+        matches!(manager.default_effect(&request.tool), DefaultEffect::Deny)
+            && !coverage_with(manager, request, true, &[])
+                .covered
+                .iter()
+                .all(|covered| *covered)
+    }
+
+    fn allowed_by_default(manager: &PermissionManager, request: &PermissionRequest) -> bool {
+        matches!(manager.default_effect(&request.tool), DefaultEffect::Allow)
+            && !coverage_with(manager, request, true, &[]).must_prompt
+    }
+
+    fn legacy_request(
+        manager: &PermissionManager,
+        tool: ToolKey,
+        scopes: &[&str],
+    ) -> PermissionRequest {
+        PermissionRequest::from_legacy(
+            LEGACY_REQUEST_ID.into(),
+            tool,
+            scopes.iter().map(|scope| (*scope).to_owned()).collect(),
+            serde_json::Value::Null,
+            &manager.project_cwd(),
+            false,
+        )
+    }
+
     fn shell_policy_rule(scope: &str, effect: Effect) -> PermissionRule {
         PermissionRule {
             tool: ToolKey::native("shell"),
@@ -2775,7 +2536,7 @@ mod tests {
     }
 
     fn shell_intent(commands: &[&str]) -> crate::tools::PermissionIntent {
-        let workdir = "/tmp";
+        let workdir = SHELL_WORKDIR;
         crate::tools::PermissionIntent::new(
             crate::tools::PermissionScopes {
                 scopes: commands.iter().map(|command| (*command).into()).collect(),
@@ -2799,7 +2560,7 @@ mod tests {
     }
 
     fn shell_request(commands: &[&str], subject: PermissionSubject) -> PermissionRequest {
-        let workdir = "/tmp";
+        let workdir = SHELL_WORKDIR;
         let intent = shell_intent(commands);
         PermissionRequest::from_intent_with_identity(
             "shell-request".into(),
@@ -2810,6 +2571,33 @@ mod tests {
             subject,
             PermissionExecutorKind::Native,
         )
+    }
+
+    /// Runs the real evaluator over a shell call with no response channel, so a
+    /// call it cannot settle on the rules alone reports the refusal instead of
+    /// waiting on a prompt nobody will answer.
+    async fn enforce_shell_without_prompt(
+        manager: &PermissionManager,
+        commands: &[&str],
+        force_prompt: bool,
+    ) -> Result<(), PermissionError> {
+        let mut intent = shell_intent(commands);
+        intent.scopes.force_prompt = force_prompt;
+        let (event_tx, _event_rx) = flume::unbounded();
+        manager
+            .enforce_with_intent(
+                &ToolKey::native("shell"),
+                &intent,
+                &serde_json::json!({"command": commands.join(" && "), "workdir": SHELL_WORKDIR}),
+                &crate::EventSender::new(event_tx, 0),
+                None,
+                "shell-request",
+                &crate::CancelToken::none(),
+                None,
+                Some((workcell_shell_subject(), PermissionExecutorKind::Native)),
+                true,
+            )
+            .await
     }
 
     fn workcell_shell_subject() -> PermissionSubject {
@@ -2847,14 +2635,8 @@ mod tests {
             decisions(&manager, &commit),
             vec![StructuredPermissionDecision::Ask]
         );
-        assert!(matches!(
-            manager.check(&ToolKey::native("shell"), "git status --short", None),
-            PermissionCheck::Allowed
-        ));
-        assert!(matches!(
-            manager.check(&ToolKey::native("shell"), "git commit -m message", None),
-            PermissionCheck::NeedsPrompt { .. }
-        ));
+        assert!(allows_without_prompt(&manager, &status));
+        assert!(coverage_with(&manager, &commit, true, &[]).must_prompt);
 
         let tied = mgr_with(
             make_config(vec![
@@ -3239,10 +3021,7 @@ mod tests {
         manager.trust_project_permission_config().unwrap();
         assert!(!manager.needs_project_permission_config_trust());
         assert!(manager.project_permission_config_trusted());
-        assert!(matches!(
-            manager.check(&ToolKey::native("shell"), "git diff --check", None),
-            PermissionCheck::Allowed
-        ));
+        assert!(allows_without_prompt(&manager, &request));
         assert_eq!(
             decisions(&manager, &request),
             vec![StructuredPermissionDecision::Allow]
@@ -3347,10 +3126,8 @@ mod tests {
             },
             PathBuf::from("/tmp"),
         );
-        assert!(matches!(
-            manager.check(&tool, "resource", None),
-            PermissionCheck::NeedsPrompt { .. }
-        ));
+        let legacy = legacy_request(&manager, tool.clone(), &["resource"]);
+        assert!(coverage_with(&manager, &legacy, true, &[]).must_prompt);
 
         let intent = crate::tools::PermissionIntent::new(
             crate::tools::PermissionScopes::single("resource".into()),
@@ -3761,10 +3538,10 @@ mod tests {
     fn compound_check(scopes: Vec<&str>, rules: Vec<&str>, expect_allowed: bool) {
         let mgr = mgr_with(
             make_config(rules.into_iter().map(allow_rule).collect()),
-            PathBuf::from("/tmp"),
+            PathBuf::from(SHELL_WORKDIR),
         );
-        let check = mgr.check_multi(&ToolKey::native("bash"), &scopes, false, None);
-        assert_eq!(matches!(check, PermissionCheck::Allowed), expect_allowed);
+        let request = shell_request(&scopes, workcell_shell_subject());
+        assert_eq!(allows_without_prompt(&mgr, &request), expect_allowed);
     }
 
     #[test]
@@ -3775,26 +3552,32 @@ mod tests {
                 allow_rule("cargo *"),
                 deny_rule("rm *"),
             ]),
-            PathBuf::from("/tmp"),
+            PathBuf::from(SHELL_WORKDIR),
         );
-        assert!(matches!(
-            mgr.check_multi(
-                &ToolKey::native("bash"),
-                &["cd /tmp", "cargo test", "rm -rf /"],
-                false,
-                None
-            ),
-            PermissionCheck::Denied
-        ));
+        let request = shell_request(
+            &["cd /tmp", "cargo test", "rm -rf /"],
+            workcell_shell_subject(),
+        );
+        assert!(denied_by_rule(&mgr, &request));
     }
+
+    const COMPLEX_COMMAND: &str = "echo $(whoami)";
 
     #[test]
     fn complex_constructs_force_prompt_even_with_allow_star() {
-        let mgr = mgr_with(make_config(vec![allow_rule("*")]), PathBuf::from("/tmp"));
-        assert!(matches!(
-            mgr.check_multi(&ToolKey::native("bash"), &["echo $(whoami)"], true, None),
-            PermissionCheck::NeedsPrompt { .. }
-        ));
+        smol::block_on(async {
+            let mgr = mgr_with(
+                make_config(vec![allow_rule("*")]),
+                PathBuf::from(SHELL_WORKDIR),
+            );
+            let request = shell_request(&[COMPLEX_COMMAND], workcell_shell_subject());
+            assert!(allows_without_prompt(&mgr, &request));
+            assert!(
+                enforce_shell_without_prompt(&mgr, &[COMPLEX_COMMAND], true)
+                    .await
+                    .is_err()
+            );
+        });
     }
 
     #[test]
@@ -3813,10 +3596,8 @@ mod tests {
             workdir.len(),
             workdir.len(),
         );
-        assert!(matches!(
-            mgr.check(&ToolKey::native("bash"), &scope, None,),
-            PermissionCheck::Denied
-        ));
+        let request = legacy_request(&mgr, ToolKey::native("bash"), &[&scope]);
+        assert!(denied_by_rule(&mgr, &request));
     }
 
     #[test_case("write", "/tmp/file.txt" => true ; "write_in_cwd")]
@@ -3827,24 +3608,26 @@ mod tests {
     #[test_case("shell", "echo hi" => true ; "literal_echo_allowed_for_shell")]
     #[test_case("bash", "echo $HOME" => false ; "expanding_echo_prompts")]
     fn builtin_check(tool: &str, scope: &str) -> bool {
-        matches!(
-            default_mgr().check(&ToolKey::native(tool), scope, None),
-            PermissionCheck::Allowed
-        )
+        let manager = default_mgr();
+        let key = ToolKey::native(tool);
+        let request = if is_shell_tool(&key) {
+            shell_request(&[scope], workcell_shell_subject())
+        } else {
+            legacy_request(&manager, key, &[scope])
+        };
+        allows_without_prompt(&manager, &request)
     }
 
     #[test]
     fn builtin_echo_allow_requires_a_bundled_implementation() {
         let manager = default_mgr();
-        let tool = ToolKey::native("shell");
-        assert!(matches!(
-            manager.check_inner(&tool, &["echo hi"], false, None, true, true),
-            PermissionCheck::Allowed
-        ));
-        assert!(matches!(
-            manager.check_inner(&tool, &["echo hi"], false, None, false, true),
-            PermissionCheck::NeedsPrompt { .. }
-        ));
+        let request = shell_request(&["echo hi"], workcell_shell_subject());
+
+        assert_eq!(coverage_with(&manager, &request, true, &[]).covered, [true]);
+        assert_eq!(
+            coverage_with(&manager, &request, false, &[]).covered,
+            [false]
+        );
     }
 
     #[test_case(Effect::Deny; "deny")]
@@ -3887,15 +3670,20 @@ mod tests {
     #[test]
     fn builtin_allows_apply_only_to_bundled_implementations() {
         let manager = default_mgr();
-        let tool = ToolKey::native("task");
-        assert!(matches!(
-            manager.check_inner(&tool, &["{}"], false, None, true, true),
-            PermissionCheck::Allowed
-        ));
-        assert!(matches!(
-            manager.check_inner(&tool, &["{}"], false, None, false, true),
-            PermissionCheck::NeedsPrompt { .. }
-        ));
+        let request = PermissionRequest::from_legacy(
+            "task".into(),
+            ToolKey::native("task"),
+            vec!["{}".into()],
+            serde_json::Value::Null,
+            Path::new("/tmp"),
+            false,
+        );
+
+        assert_eq!(coverage_with(&manager, &request, true, &[]).covered, [true]);
+        assert_eq!(
+            coverage_with(&manager, &request, false, &[]).covered,
+            [false]
+        );
     }
 
     #[test]
@@ -3963,10 +3751,10 @@ mod tests {
     #[test]
     fn path_traversal_prompts() {
         let path = normalize_scope_path("/tmp/../etc/passwd");
-        assert!(matches!(
-            default_mgr().check(&ToolKey::native("write"), &path, None),
-            PermissionCheck::NeedsPrompt { .. }
-        ));
+        let manager = default_mgr();
+        let request = legacy_request(&manager, ToolKey::native("write"), &[&path]);
+        assert!(!denied_by_rule(&manager, &request));
+        assert!(!allows_without_prompt(&manager, &request));
     }
 
     #[test]
@@ -3977,12 +3765,10 @@ mod tests {
                 rules: vec![deny_rule("rm *")],
                 ..Default::default()
             },
-            PathBuf::from("/tmp"),
+            PathBuf::from(SHELL_WORKDIR),
         );
-        assert!(matches!(
-            mgr.check(&ToolKey::native("bash"), "rm -rf /", None),
-            PermissionCheck::Denied
-        ));
+        let request = shell_request(&["rm -rf /"], workcell_shell_subject());
+        assert!(denied_by_rule(&mgr, &request));
     }
 
     #[test]
@@ -4095,65 +3881,60 @@ mod tests {
         }
     }
 
+    const ALLOWED_COMMANDS: [&str; 2] = ["cargo test", "git push"];
+
     #[test]
-    fn check_multi_force_prompt_skips_allow_rules() {
+    fn force_prompt_skips_allow_rules() {
+        smol::block_on(async {
+            let mgr = mgr_with(
+                make_config(vec![allow_rule("cargo *"), allow_rule("git *")]),
+                PathBuf::from(SHELL_WORKDIR),
+            );
+            let request = shell_request(&ALLOWED_COMMANDS, workcell_shell_subject());
+            assert!(allows_without_prompt(&mgr, &request));
+            assert!(
+                enforce_shell_without_prompt(&mgr, &ALLOWED_COMMANDS, false)
+                    .await
+                    .is_ok()
+            );
+            assert!(
+                enforce_shell_without_prompt(&mgr, &ALLOWED_COMMANDS, true)
+                    .await
+                    .is_err()
+            );
+        });
+    }
+
+    #[test]
+    fn deny_wins_over_force_prompt() {
         let mgr = mgr_with(
-            make_config(vec![allow_rule("cargo *"), allow_rule("git *")]),
-            PathBuf::from("/tmp"),
+            make_config(vec![deny_rule("rm *")]),
+            PathBuf::from(SHELL_WORKDIR),
         );
-        assert!(matches!(
-            mgr.check_multi(
-                &ToolKey::native("bash"),
-                &["cargo test", "git push"],
-                false,
-                None
-            ),
-            PermissionCheck::Allowed
-        ));
-        match mgr.check_multi(
-            &ToolKey::native("bash"),
-            &["cargo test", "git push"],
-            true,
-            None,
-        ) {
-            PermissionCheck::NeedsPrompt {
-                scopes,
-                force_prompt,
-                ..
-            } => {
-                assert_eq!(scopes, vec!["cargo test", "git push"]);
-                assert!(force_prompt);
-            }
-            other => panic!("expected NeedsPrompt, got {other:?}"),
-        }
+        let mut forced = shell_intent(&["rm -rf /"]);
+        forced.scopes.force_prompt = true;
+        let request = PermissionRequest::from_intent_with_identity(
+            "forced-request".into(),
+            ToolKey::native("shell"),
+            &forced,
+            serde_json::json!({"command": "rm -rf /", "workdir": SHELL_WORKDIR}),
+            Path::new(SHELL_WORKDIR),
+            workcell_shell_subject(),
+            PermissionExecutorKind::Native,
+        );
+        assert!(denied_by_rule(&mgr, &request));
     }
 
     #[test]
-    fn check_multi_deny_wins_over_force_prompt() {
-        let mgr = mgr_with(make_config(vec![deny_rule("rm *")]), PathBuf::from("/tmp"));
-        assert!(matches!(
-            mgr.check_multi(&ToolKey::native("bash"), &["rm -rf /"], true, None),
-            PermissionCheck::Denied
-        ));
-    }
-
-    #[test]
-    fn check_multi_partial_coverage_prompts_uncovered() {
+    fn partial_coverage_prompts_only_the_uncovered_commands() {
         let mgr = mgr_with(
             make_config(vec![allow_rule("cargo *")]),
-            PathBuf::from("/tmp"),
+            PathBuf::from(SHELL_WORKDIR),
         );
-        match mgr.check_multi(
-            &ToolKey::native("bash"),
-            &["cargo test", "git push", "ls"],
-            false,
-            None,
-        ) {
-            PermissionCheck::NeedsPrompt { scopes, .. } => {
-                assert_eq!(scopes, vec!["git push", "ls"]);
-            }
-            other => panic!("expected NeedsPrompt, got {other:?}"),
-        }
+        let request = shell_request(&["cargo test", "git push", "ls"], workcell_shell_subject());
+        let coverage = coverage_with(&mgr, &request, true, &[]);
+        assert_eq!(coverage.covered, vec![true, false, false]);
+        assert!(coverage.must_prompt);
     }
 
     #[test]
@@ -4708,12 +4489,10 @@ mod tests {
                 scope: None,
                 effect: Effect::Deny,
             }]),
-            PathBuf::from("/tmp"),
+            PathBuf::from(SHELL_WORKDIR),
         );
-        assert!(matches!(
-            mgr.check(&ToolKey::native("bash"), "anything", None),
-            PermissionCheck::Denied
-        ));
+        let request = shell_request(&["anything"], workcell_shell_subject());
+        assert!(denied_by_rule(&mgr, &request));
     }
 
     #[test]
@@ -4727,29 +4506,34 @@ mod tests {
             PathBuf::from("/tmp"),
         );
         // Any deny wins: Wildcard deny blocks everything including builtins
-        assert!(matches!(
-            mgr.check(&ToolKey::native("bash"), "ls", None),
-            PermissionCheck::Denied
-        ));
-        assert!(matches!(
-            mgr.check(&ToolKey::native("write"), "/tmp/x", None),
-            PermissionCheck::Denied
-        ));
+        let command = shell_request(&["ls"], workcell_shell_subject());
+        let write = legacy_request(&mgr, ToolKey::native("write"), &["/tmp/x"]);
+        assert!(denied_by_rule(&mgr, &command));
+        assert!(denied_by_rule(&mgr, &write));
     }
 
     #[test]
     fn yolo_mode_allows_but_deny_still_blocks() {
-        let mgr = mgr_with(make_config(vec![deny_rule("rm *")]), PathBuf::from("/tmp"));
-        mgr.toggle_yolo();
-        assert!(mgr.is_yolo());
-        assert!(matches!(
-            mgr.check(&ToolKey::native("bash"), "cargo test", None),
-            PermissionCheck::Allowed
-        ));
-        assert!(matches!(
-            mgr.check(&ToolKey::native("bash"), "rm -rf /", None),
-            PermissionCheck::Denied
-        ));
+        smol::block_on(async {
+            let mgr = mgr_with(
+                make_config(vec![deny_rule("rm *")]),
+                PathBuf::from(SHELL_WORKDIR),
+            );
+            mgr.toggle_yolo();
+            assert!(mgr.is_yolo());
+            assert!(
+                enforce_shell_without_prompt(&mgr, &["cargo test"], false)
+                    .await
+                    .is_ok()
+            );
+            let denied = shell_request(&["rm -rf /"], workcell_shell_subject());
+            assert!(denied_by_rule(&mgr, &denied));
+            assert!(
+                enforce_shell_without_prompt(&mgr, &["rm -rf /"], false)
+                    .await
+                    .is_err()
+            );
+        });
     }
 
     fn seeded_mgr(yolo: bool) -> PermissionManager {
@@ -4801,6 +4585,8 @@ mod tests {
         yolo_state(&mgr)
     }
 
+    const CARGO_TEST_COMMAND: &str = "cargo test";
+
     #[test]
     fn default_deny_blocks_unmatched() {
         let mgr = mgr_with(
@@ -4808,12 +4594,10 @@ mod tests {
                 default: DefaultEffect::Deny,
                 ..Default::default()
             },
-            PathBuf::from("/tmp"),
+            PathBuf::from(SHELL_WORKDIR),
         );
-        assert!(matches!(
-            mgr.check(&ToolKey::native("bash"), "cargo test", None),
-            PermissionCheck::Denied
-        ));
+        let request = shell_request(&[CARGO_TEST_COMMAND], workcell_shell_subject());
+        assert!(denied_by_default(&mgr, &request));
     }
 
     #[test]
@@ -4824,16 +4608,12 @@ mod tests {
                 rules: vec![allow_rule("cargo *")],
                 ..Default::default()
             },
-            PathBuf::from("/tmp"),
+            PathBuf::from(SHELL_WORKDIR),
         );
-        assert!(matches!(
-            mgr.check(&ToolKey::native("bash"), "cargo test", None),
-            PermissionCheck::Allowed
-        ));
-        assert!(matches!(
-            mgr.check(&ToolKey::native("bash"), "rm -rf /", None),
-            PermissionCheck::Denied
-        ));
+        let allowed = shell_request(&[CARGO_TEST_COMMAND], workcell_shell_subject());
+        let denied = shell_request(&["rm -rf /"], workcell_shell_subject());
+        assert!(allows_without_prompt(&mgr, &allowed));
+        assert!(denied_by_default(&mgr, &denied));
     }
 
     #[test]
@@ -4843,22 +4623,25 @@ mod tests {
                 default: DefaultEffect::Allow,
                 ..Default::default()
             },
-            PathBuf::from("/tmp"),
+            PathBuf::from(SHELL_WORKDIR),
         );
-        assert!(matches!(
-            mgr.check(&ToolKey::native("bash"), "cargo test", None),
-            PermissionCheck::Allowed
-        ));
+        let request = shell_request(&[CARGO_TEST_COMMAND], workcell_shell_subject());
+        assert!(!denied_by_rule(&mgr, &request));
+        assert!(allowed_by_default(&mgr, &request));
     }
 
     #[test]
     fn default_prompt_is_default_behavior() {
-        let mgr = mgr_with(PermissionsConfig::default(), PathBuf::from("/tmp"));
+        let mgr = mgr_with(PermissionsConfig::default(), PathBuf::from(SHELL_WORKDIR));
+        let request = shell_request(&[CARGO_TEST_COMMAND], workcell_shell_subject());
+        assert!(!allows_without_prompt(&mgr, &request));
         assert!(matches!(
-            mgr.check(&ToolKey::native("bash"), "cargo test", None),
-            PermissionCheck::NeedsPrompt { .. }
+            mgr.default_effect(&request.tool),
+            DefaultEffect::Prompt
         ));
     }
+
+    const EMPTY_MCP_SCOPE: &str = "{}";
 
     #[test]
     fn mcp_server_wildcard_matches_all_server_tools() {
@@ -4872,28 +4655,17 @@ mod tests {
             }]),
             PathBuf::from("/tmp"),
         );
-        assert!(matches!(
-            mgr.check(
-                &ToolKey::McpTool {
+        for tool in ["search", "web_search"] {
+            let request = legacy_request(
+                &mgr,
+                ToolKey::McpTool {
                     server: "deepwiki".into(),
-                    tool: "search".into()
+                    tool: tool.into(),
                 },
-                "{}",
-                None
-            ),
-            PermissionCheck::Allowed
-        ));
-        assert!(matches!(
-            mgr.check(
-                &ToolKey::McpTool {
-                    server: "deepwiki".into(),
-                    tool: "web_search".into()
-                },
-                "{}",
-                None
-            ),
-            PermissionCheck::Allowed
-        ));
+                &[EMPTY_MCP_SCOPE],
+            );
+            assert!(allows_without_prompt(&mgr, &request));
+        }
     }
 
     #[test]
@@ -4908,17 +4680,15 @@ mod tests {
             }]),
             PathBuf::from("/tmp"),
         );
-        assert!(!matches!(
-            mgr.check(
-                &ToolKey::McpTool {
-                    server: "github".into(),
-                    tool: "search".into()
-                },
-                "{}",
-                None
-            ),
-            PermissionCheck::Allowed
-        ));
+        let request = legacy_request(
+            &mgr,
+            ToolKey::McpTool {
+                server: "github".into(),
+                tool: "search".into(),
+            },
+            &[EMPTY_MCP_SCOPE],
+        );
+        assert!(!allows_without_prompt(&mgr, &request));
     }
 
     #[test]
@@ -4932,31 +4702,56 @@ mod tests {
             },
             PathBuf::from("/tmp"),
         );
-        assert!(matches!(
-            mgr.check(&ToolKey::native("bash"), "cargo test", None),
-            PermissionCheck::Allowed
-        ));
-        assert!(matches!(
-            mgr.check(&ToolKey::native("write"), "/etc/passwd", None),
-            PermissionCheck::Denied
-        ));
+        let command = legacy_request(&mgr, ToolKey::native("bash"), &[CARGO_TEST_COMMAND]);
+        let write = legacy_request(&mgr, ToolKey::native("write"), &["/etc/passwd"]);
+        assert!(allowed_by_default(&mgr, &command));
+        assert!(denied_by_default(&mgr, &write));
+    }
+
+    const PLAN_PATH: &str = "/home/user/.local/state/caudra/plans/test.md";
+
+    /// Enforces against the plan being built with no response channel, so the
+    /// plan-write escape hatch is the only thing that can let the call through.
+    async fn enforce_plan_write_without_prompt(
+        manager: &PermissionManager,
+        tool: &str,
+        scopes: &[&str],
+    ) -> Result<(), PermissionError> {
+        let (event_tx, _event_rx) = flume::unbounded();
+        manager
+            .enforce(
+                &ToolKey::native(tool),
+                &crate::tools::PermissionScopes {
+                    scopes: scopes.iter().map(|scope| (*scope).to_owned()).collect(),
+                    force_prompt: false,
+                    plan_scoped: false,
+                },
+                &serde_json::Value::Null,
+                &crate::EventSender::new(event_tx, 0),
+                None,
+                "plan-request",
+                &crate::CancelToken::none(),
+                Some(Path::new(PLAN_PATH)),
+            )
+            .await
     }
 
     #[test_case("write", true ; "write_tool_allowed")]
     #[test_case("edit", true ; "edit_tool_allowed")]
     #[test_case("bash", false ; "non_write_tool_prompts")]
     fn plan_path_auto_allows_file_write_tools_only(tool: &str, expect_allowed: bool) {
-        let plan = "/home/user/.local/state/caudra/plans/test.md";
-        let plan_path = Path::new(plan);
-        let mgr = default_mgr();
-        assert_eq!(
-            matches!(
-                mgr.check(&ToolKey::native(tool), plan, Some(plan_path)),
-                PermissionCheck::Allowed
-            ),
-            expect_allowed,
-        );
+        smol::block_on(async {
+            let mgr = default_mgr();
+            assert_eq!(
+                enforce_plan_write_without_prompt(&mgr, tool, &[PLAN_PATH])
+                    .await
+                    .is_ok(),
+                expect_allowed,
+            );
+        });
     }
+
+    const PLUGIN_EDIT_PATH: &str = "/x/f";
 
     #[test]
     fn plugin_rules_apply_to_manager_and_forks() {
@@ -4968,11 +4763,9 @@ mod tests {
         );
         let fork = mgr.fork();
         store.replace("memory", vec![plugin_edit_rule("/x/**", Effect::Allow)]);
-        for m in [&mgr, &fork] {
-            assert!(matches!(
-                m.check(&ToolKey::native("edit"), "/x/f", None),
-                PermissionCheck::Allowed
-            ));
+        for manager in [&mgr, &fork] {
+            let request = legacy_request(manager, ToolKey::native("edit"), &[PLUGIN_EDIT_PATH]);
+            assert!(allows_without_prompt(manager, &request));
         }
     }
 
@@ -4985,39 +4778,25 @@ mod tests {
             PathBuf::from("/tmp"),
             store,
         );
-        assert!(matches!(
-            mgr.check(&ToolKey::native("edit"), "/x/f", None),
-            PermissionCheck::Denied
-        ));
+        let request = legacy_request(&mgr, ToolKey::native("edit"), &[PLUGIN_EDIT_PATH]);
+        assert!(denied_by_rule(&mgr, &request));
     }
 
     #[test]
     fn plan_path_multi_scope_all_must_match() {
-        let plan = "/home/user/.local/state/caudra/plans/test.md";
-        let plan_path = Path::new(plan);
-        let mgr = default_mgr();
-
-        // All scopes match plan → allowed
-        assert!(matches!(
-            mgr.check_multi(
-                &ToolKey::native("write"),
-                &[plan, plan],
-                false,
-                Some(plan_path),
-            ),
-            PermissionCheck::Allowed
-        ));
-
-        // One scope is non-plan → needs prompt
-        assert!(matches!(
-            mgr.check_multi(
-                &ToolKey::native("write"),
-                &[plan, "/etc/passwd"],
-                false,
-                Some(plan_path),
-            ),
-            PermissionCheck::NeedsPrompt { .. }
-        ));
+        smol::block_on(async {
+            let mgr = default_mgr();
+            assert!(
+                enforce_plan_write_without_prompt(&mgr, "write", &[PLAN_PATH, PLAN_PATH])
+                    .await
+                    .is_ok()
+            );
+            assert!(
+                enforce_plan_write_without_prompt(&mgr, "write", &[PLAN_PATH, "/etc/passwd"])
+                    .await
+                    .is_err()
+            );
+        });
     }
 
     fn persistent_manager(state_dir: StateDir, project: &Path) -> Arc<PermissionManager> {
@@ -5873,14 +5652,14 @@ mod tests {
                 .to_string_lossy()
                 .into_owned();
 
-            assert!(matches!(
-                manager.check(&ToolKey::native("write"), &first_file, None),
-                PermissionCheck::Allowed
-            ));
-            assert!(matches!(
-                manager.check(&ToolKey::native("write"), &second_file, None),
-                PermissionCheck::NeedsPrompt { .. }
-            ));
+            let write_first = |manager: &PermissionManager| {
+                legacy_request(manager, ToolKey::native("write"), &[&first_file])
+            };
+            let write_second = |manager: &PermissionManager| {
+                legacy_request(manager, ToolKey::native("write"), &[&second_file])
+            };
+            assert!(allows_without_prompt(&manager, &write_first(&manager)));
+            assert!(!allows_without_prompt(&manager, &write_second(&manager)));
             answer_enforcement(
                 Arc::clone(&manager),
                 "cargo check",
@@ -5892,14 +5671,8 @@ mod tests {
 
             manager.set_project(&second_project);
             assert!(manager.structured_rule_inventory().unwrap().is_empty());
-            assert!(matches!(
-                manager.check(&ToolKey::native("write"), &first_file, None),
-                PermissionCheck::NeedsPrompt { .. }
-            ));
-            assert!(matches!(
-                manager.check(&ToolKey::native("write"), &second_file, None),
-                PermissionCheck::Allowed
-            ));
+            assert!(!allows_without_prompt(&manager, &write_first(&manager)));
+            assert!(allows_without_prompt(&manager, &write_second(&manager)));
             assert!(
                 enforce_without_prompt(
                     &manager,
