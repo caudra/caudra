@@ -2,10 +2,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use caudra_config::ModelPolicy;
-use caudra_providers::model_registry::TitleTarget;
 use caudra_providers::provider::{Provider, from_model_async};
 use caudra_providers::{
-    AgentError, ContentBlock, MIN_THINKING_BUDGET, Message, Model, ModelError, ModelTier,
+    AgentError, ContentBlock, MIN_THINKING_BUDGET, Message, Model, ModelError, ModelPurpose,
     RequestOptions, Timeouts, TokenUsage,
 };
 use caudra_storage::id::SessionRef;
@@ -60,9 +59,9 @@ pub async fn for_prompt(
     Ok((resolved, outcome))
 }
 
-/// Falls back to the chat model whenever the target cannot be resolved: a
-/// missing weak tier is a reason to use what is already loaded, not to skip
-/// naming the session.
+/// Falls back to the chat model whenever the binding cannot be resolved: a
+/// title model that will not load is a reason to use what is already there, not
+/// to skip naming the session.
 async fn resolve(
     current_provider: &Arc<dyn Provider>,
     current_model: &Model,
@@ -109,32 +108,13 @@ async fn resolve(
 }
 
 fn title_model(current_model: &Model, model_policy: &ModelPolicy) -> Result<Model, AgentError> {
-    match caudra_providers::model_registry::title_target() {
-        TitleTarget::Auto => {
-            Model::from_tier_with_policy(&current_model.provider, ModelTier::Weak, model_policy)
-                .map_err(|error| title_model_error("weak tier", error))
-        }
-        TitleTarget::Model(spec) => {
-            if !model_policy.allows(&spec) {
-                return Err(title_model_error(
-                    &spec,
-                    ModelError::NotAllowed(spec.clone()),
-                ));
-            }
-            match Model::from_spec(&spec) {
-                Err(ModelError::UnsupportedProvider(_)) => {
-                    caudra_providers::warm_catalog();
-                    Model::from_spec(&spec).map_err(|error| title_model_error(&spec, error))
-                }
-                result => result.map_err(|error| title_model_error(&spec, error)),
-            }
-        }
-    }
+    Model::resolve(ModelPurpose::Title, current_model, model_policy)
+        .map_err(|error| title_model_error(ModelPurpose::Title, error))
 }
 
-fn title_model_error(spec: &str, error: ModelError) -> AgentError {
+fn title_model_error(purpose: ModelPurpose, error: ModelError) -> AgentError {
     AgentError::Config {
-        message: format!("cannot resolve title model '{spec}': {error}"),
+        message: format!("cannot resolve the {purpose} model: {error}"),
     }
 }
 

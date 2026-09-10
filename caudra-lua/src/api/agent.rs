@@ -17,10 +17,10 @@ use caudra_agent::tools::{
     ToolFilter, ToolLive, audited_local_tool,
 };
 use caudra_agent::{SubagentTaskMode, ToolDoneEvent};
+use caudra_config::providers::UnknownPurpose;
 use caudra_lua_macro::{lua_class, lua_fn, lua_table};
-use caudra_providers::model::ModelTier;
 use caudra_providers::provider;
-use caudra_providers::{Model, ModelError, ThinkingConfig};
+use caudra_providers::{Model, ModelPurpose, ThinkingConfig};
 use caudra_storage::id::CaudraId;
 use caudra_storage::thinking::StoredThinking;
 use futures::future::{Either, select};
@@ -52,20 +52,17 @@ fn parse_local_tool_effect(effect: Option<&str>) -> Result<ToolEffect, String> {
     }
 }
 
-fn resolve_model_from_ctx(ctx: &AgentContext, tier: Option<&str>) -> Result<Model, String> {
-    let Some(tier_str) = tier else {
+fn resolve_model_from_ctx(ctx: &AgentContext, purpose: Option<&str>) -> Result<Model, String> {
+    let Some(name) = purpose else {
         return Ok(Model::clone(&ctx.model));
     };
-    let requested: ModelTier = tier_str.parse().map_err(|e: ModelError| e.to_string())?;
-    let effective = requested.min(ctx.model.tier);
-    Model::from_tier_with_policy(&ctx.model.provider, effective, &ctx.model_policy)
-        .map_err(|e| e.to_string())
+    let purpose: ModelPurpose = name.parse().map_err(|e: UnknownPurpose| e.to_string())?;
+    Model::resolve(purpose, &ctx.model, &ctx.model_policy).map_err(|e| e.to_string())
 }
 
 fn model_to_lua_table(lua: &Lua, model: &Model) -> LuaResult<Table> {
     let tbl = lua.create_table()?;
     tbl.set("id", model.id.clone())?;
-    tbl.set("tier", model.tier.to_string())?;
     tbl.set("provider", model.provider.to_string())?;
     tbl.set("spec", model.spec())?;
     Ok(tbl)
@@ -76,24 +73,25 @@ fn dispatch_ctx<'a>(ctx: &'a LuaCtx, method: &str) -> Result<&'a AgentContext, S
         .ok_or_else(|| ctx.cap_err(&format!("caudra.agent.{method}")))
 }
 
-/// Look up the model that the current agent is using, or pick a cheaper one.
-/// You might want a cheaper model for simple subtasks (summaries, classification)
-/// without hard-coding a model name.
+/// Look up the model that the current agent is using, or the one bound to
+/// another purpose. Ask for `"fast"` when a subtask is simple (summaries,
+/// classification) instead of hard-coding a model name.
 ///
-/// The returned table has fields: `id` (string), `tier` (string),
-/// `provider` (string), `spec` (string).
+/// The returned table has fields: `id` (string), `provider` (string),
+/// `spec` (string).
 ///
 /// @param ctx LuaCtx Agent context.
 /// @param opts table? Optional fields:
-///   `tier` (string?) - target tier, one of `"weak"`, `"medium"`, `"strong"`. Clamped to
-///     the parent tier so you cannot escalate.
+///   `purpose` (string?) - which binding to resolve, one of `"chat"`, `"fast"`,
+///     `"balanced"`, `"best"`, `"title"`, `"compact"`, `"goal"`. Resolves to the
+///     model the user bound, or that purpose's default.
 ///   `spec` (string?) - exact `provider/model` spec, e.g. `"anthropic/claude-haiku-4-5"`.
-///     Takes precedence over `tier`.
+///     Takes precedence over `purpose`.
 /// @return (table?, string?) Model table on success, or `(nil, err)` on failure.
 /// @example
-/// local model, err = caudra.agent.resolve_model(ctx, { tier = "weak" })
+/// local model, err = caudra.agent.resolve_model(ctx, { purpose = "fast" })
 /// if err then error(err) end
-/// print(model.spec, model.tier)
+/// print(model.spec)
 #[lua_fn]
 async fn resolve_model(
     lua: Lua,
@@ -101,9 +99,9 @@ async fn resolve_model(
     opts: Option<Table>,
 ) -> LuaResult<Pair<Table>> {
     let agent = try_pair!(dispatch_ctx(&ctx, "resolve_model"));
-    let tier_str = opts
+    let purpose = opts
         .as_ref()
-        .map(|table| table.get::<Option<String>>("tier"))
+        .map(|table| table.get::<Option<String>>("purpose"))
         .transpose()?
         .flatten();
     let spec_str = opts
@@ -114,7 +112,7 @@ async fn resolve_model(
 
     let model = match spec_str {
         Some(ref spec) => try_pair!(Model::from_spec_with_policy(spec, &agent.model_policy)),
-        None => try_pair!(resolve_model_from_ctx(agent, tier_str.as_deref())),
+        None => try_pair!(resolve_model_from_ctx(agent, purpose.as_deref())),
     };
     Ok((Some(model_to_lua_table(&lua, &model)?), None))
 }

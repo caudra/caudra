@@ -7,11 +7,28 @@ group = "Reference"
 
 # Providers
 
-Caudra talks to LLM providers over their HTTP APIs. Models are split into three capability tiers: **weak** (cheap and fast), **medium** (balanced), and **strong** (highest capability, highest cost). Compaction and session titling are separate workload roles rather than capability tiers.
+Caudra talks to LLM providers over their HTTP APIs. Each workload resolves through a **purpose**: **Chat** is the conversation, **Fast**, **Balanced**, and **Best** name how much capability a caller is asking for, and **Title**, **Compact**, and **Goal** are the background workloads. Binding a purpose says which model serves it; leaving one unbound lets Caudra pick.
 
-Open the model picker with `/model`. Use `Tab` and `Shift+Tab` to switch between Chat, Goal, Compact, Title, Fast, Balanced, and Best. `Enter` selects or assigns the highlighted row for that purpose. Uppercase `R` resets the displayed purpose.
+Open the model picker with `/model`. Use `Tab` and `Shift+Tab` to switch between Chat, Fast, Balanced, Best, Title, Compact, and Goal. `Enter` binds the highlighted row to the displayed purpose, and uppercase `R` clears the binding.
 
-Fast, Balanced, and Best are global exact-model presets saved in the `model.tiers` row of Caudra's SQLite state database. Goal, Compact, and Title use its `model.roles` row. Without an exact preset, tiered workloads choose a matching model from the active provider. Default Goal tries Fast and then uses the chat model. Default Compact uses the chat model. Default Title uses the weak tier of the active provider and falls back to the chat model. See [Sessions](/docs/sessions/#titles) for what the Title role does.
+A purpose is bound either to an exact `provider/model-id` or to another purpose, and every binding lives in the `model.purposes` row of Caudra's SQLite state database. Chat is the model the conversation runs on; the rest bind a workload.
+
+An unbound purpose is not an error, it just means the caller applies its own rule. Compact uses the chat model, because compaction reads the whole conversation and a small window cannot hold what it must summarize. Title and Goal follow Fast. Fast, Balanced, and Best ask the active provider: a `purposes` declaration in `providers.toml` first, then Caudra's curated table for that provider. Fast then tries the cheapest model the provider published a price for, or on a local runtime where everything is priced at zero, the one with the fewest parameters. Balanced and Best stop at the curated table, because cheapness is a sound proxy for the Fast slot and an unsound one for capability. Anything still unresolved falls back to the chat model. See [Sessions](/docs/sessions/#titles) for what Title does.
+
+## Model classes
+
+The picker and `caudra models` show a dim **Fast**, **Balanced**, or **Best** beside a model: how its provider classifies it, taken from `purposes` in `providers.toml` first and then the curated table. Aggregators such as OpenRouter carry no catalog of their own, so a vendor-prefixed id borrows the class of the upstream vendor's entry.
+
+A blank class means nobody classified that model, which is the normal state for local runtimes and custom endpoints. Caudra does not infer one from price or list position. Declare `purposes` for that provider to fill it in.
+
+`purposes` entries match by prefix, so an endpoint serving a family of fine-tunes needs one line rather than one per variant:
+
+```toml
+[my-server.purposes]
+fast = "qwen3.8-27b"   # covers qwen3.8-27b, qwen3.8-27b-canary, qwen3.8-27b-math7, ...
+```
+
+The first entry doubles as the id that wins the slot, so it has to name a model the endpoint actually serves. A prefix that matches nothing live would send requests to an id that does not exist.
 
 ## Auth Reloading
 
@@ -46,22 +63,22 @@ The built-in provider still owns the slug, so `protocol`, `api_key_env`, `discov
 - **API**: `https://api.anthropic.com/v1/messages`
 - **Features**: Prompt caching, thinking mode (adaptive/budgeted), advanced tool use
 
-| Tier | Models | Pricing (in/out per 1M tokens) | Context |
-|------|--------|-------------------------------|---------|
-| Weak | **claude-haiku-4-5** (default) | $1.00 / $5.00 | 200K ctx / 64K out |
-| Medium | claude-sonnet-4-5 | $3.00 / $15.00 | 200K ctx / 64K out |
-| Medium | claude-sonnet-4-6 | $3.00 / $15.00 | 372K ctx / 64K out |
-| Medium | **claude-sonnet-5** (default) | $2.00 / $10.00 | 372K ctx / 128K out |
-| Medium | claude-sonnet-4 | $3.00 / $15.00 | 200K ctx / 64K out |
-| Strong | claude-opus-4-5 | $5.00 / $25.00 | 200K ctx / 64K out |
-| Strong | claude-opus-4-6 | $5.00 / $25.00 | 372K ctx / 128K out |
-| Strong | claude-opus-4-7 | $5.00 / $25.00 | 372K ctx / 128K out |
-| Strong | claude-opus-4-8 | $5.00 / $25.00 | 372K ctx / 128K out |
-| Strong | **claude-opus-5** (default) | $5.00 / $25.00 | 372K ctx / 128K out |
-| Strong | claude-fable-5 | $10.00 / $50.00 | 372K ctx / 128K out |
-| Strong | claude-opus-4-0, claude-opus-4-1 | $15.00 / $75.00 | 200K ctx / 32K out |
+| Purpose | Models | Pricing (in/out per 1M tokens) | Context |
+|---------|--------|-------------------------------|---------|
+| Fast | **claude-haiku-4-5** (default) | $1.00 / $5.00 | 200K ctx / 64K out |
+| Balanced | claude-sonnet-4-5 | $3.00 / $15.00 | 200K ctx / 64K out |
+| Balanced | claude-sonnet-4-6 | $3.00 / $15.00 | 372K ctx / 64K out |
+| Balanced | **claude-sonnet-5** (default) | $2.00 / $10.00 | 372K ctx / 128K out |
+| Balanced | claude-sonnet-4 | $3.00 / $15.00 | 200K ctx / 64K out |
+| Best | claude-opus-4-5 | $5.00 / $25.00 | 200K ctx / 64K out |
+| Best | claude-opus-4-6 | $5.00 / $25.00 | 372K ctx / 128K out |
+| Best | claude-opus-4-7 | $5.00 / $25.00 | 372K ctx / 128K out |
+| Best | claude-opus-4-8 | $5.00 / $25.00 | 372K ctx / 128K out |
+| Best | **claude-opus-5** (default) | $5.00 / $25.00 | 372K ctx / 128K out |
+| Best | claude-fable-5 | $10.00 / $50.00 | 372K ctx / 128K out |
+| Best | claude-opus-4-0, claude-opus-4-1 | $15.00 / $75.00 | 200K ctx / 32K out |
 
-Defaults: claude-haiku-4-5 (weak), claude-sonnet-5 (medium), claude-opus-5 (strong)
+Defaults: claude-haiku-4-5 (fast), claude-sonnet-5 (balanced), claude-opus-5 (best)
 
 Run `caudra auth login anthropic` to sign in to a Claude subscription through browser OAuth. Caudra stores the tokens in its state directory, refreshes them automatically, and shows subscription limits through `/usage`. Subscription requests always go to `api.anthropic.com`, even when `ANTHROPIC_BASE_URL` is set.
 
@@ -89,28 +106,28 @@ You can override the model with `ANTHROPIC_MODEL` and the endpoint with `ANTHROP
 - **Env var**: `OPENAI_API_KEY` (also supports OAuth device flow)
 - **API**: `https://api.openai.com/v1`
 
-| Tier | Models | Pricing (in/out per 1M tokens) | Context |
-|------|--------|-------------------------------|---------|
-| Weak | **gpt-5.6-luna** (default) | $1.00 / $6.00 | 372K ctx / 128K out |
-| Weak | gpt-5.4-nano | $0.20 / $1.25 | 400K ctx / 128K out |
-| Weak | gpt-5.4-mini | $0.75 / $4.50 | 400K ctx / 128K out |
-| Weak | gpt-4.1-nano | $0.10 / $0.40 | 1047K ctx / 32K out |
-| Medium | **gpt-5.6-terra** (default) | $2.50 / $15.00 | 372K ctx / 128K out |
-| Medium | gpt-4.1-mini | $0.40 / $1.60 | 1047K ctx / 32K out |
-| Medium | gpt-4.1 | $2.00 / $8.00 | 1047K ctx / 32K out |
-| Medium | o4-mini | $1.10 / $4.40 | 200K ctx / 100K out |
-| Medium | gpt-5.1-codex-mini | $0.25 / $2.00 | 400K ctx / 128K out |
-| Strong | **gpt-5.6-sol** (default) | $5.00 / $30.00 | 372K ctx / 128K out |
-| Strong | gpt-5.5 | $5.00 / $30.00 | 1050K ctx / 128K out |
-| Strong | gpt-5.4 | $2.50 / $15.00 | 1050K ctx / 128K out |
-| Strong | o3 | $2.00 / $8.00 | 200K ctx / 100K out |
-| Strong | gpt-5.3-codex | $1.75 / $14.00 | 400K ctx / 128K out |
-| Strong | gpt-5.2-codex | $1.75 / $14.00 | 400K ctx / 128K out |
-| Strong | gpt-5.2 | $1.75 / $14.00 | 400K ctx / 128K out |
-| Strong | gpt-5.1-codex-max | $1.25 / $10.00 | 400K ctx / 128K out |
-| Strong | gpt-5.1-codex | $1.25 / $10.00 | 400K ctx / 128K out |
+| Purpose | Models | Pricing (in/out per 1M tokens) | Context |
+|---------|--------|-------------------------------|---------|
+| Fast | **gpt-5.6-luna** (default) | $1.00 / $6.00 | 372K ctx / 128K out |
+| Fast | gpt-5.4-nano | $0.20 / $1.25 | 400K ctx / 128K out |
+| Fast | gpt-5.4-mini | $0.75 / $4.50 | 400K ctx / 128K out |
+| Fast | gpt-4.1-nano | $0.10 / $0.40 | 1047K ctx / 32K out |
+| Balanced | **gpt-5.6-terra** (default) | $2.50 / $15.00 | 372K ctx / 128K out |
+| Balanced | gpt-4.1-mini | $0.40 / $1.60 | 1047K ctx / 32K out |
+| Balanced | gpt-4.1 | $2.00 / $8.00 | 1047K ctx / 32K out |
+| Balanced | o4-mini | $1.10 / $4.40 | 200K ctx / 100K out |
+| Balanced | gpt-5.1-codex-mini | $0.25 / $2.00 | 400K ctx / 128K out |
+| Best | **gpt-5.6-sol** (default) | $5.00 / $30.00 | 372K ctx / 128K out |
+| Best | gpt-5.5 | $5.00 / $30.00 | 1050K ctx / 128K out |
+| Best | gpt-5.4 | $2.50 / $15.00 | 1050K ctx / 128K out |
+| Best | o3 | $2.00 / $8.00 | 200K ctx / 100K out |
+| Best | gpt-5.3-codex | $1.75 / $14.00 | 400K ctx / 128K out |
+| Best | gpt-5.2-codex | $1.75 / $14.00 | 400K ctx / 128K out |
+| Best | gpt-5.2 | $1.75 / $14.00 | 400K ctx / 128K out |
+| Best | gpt-5.1-codex-max | $1.25 / $10.00 | 400K ctx / 128K out |
+| Best | gpt-5.1-codex | $1.25 / $10.00 | 400K ctx / 128K out |
 
-Defaults: gpt-5.6-luna (weak), gpt-5.6-terra (medium), gpt-5.6-sol (strong)
+Defaults: gpt-5.6-luna (fast), gpt-5.6-terra (balanced), gpt-5.6-sol (best)
 
 ### Google
 
@@ -118,13 +135,13 @@ Defaults: gpt-5.6-luna (weak), gpt-5.6-terra (medium), gpt-5.6-sol (strong)
 - **API**: `https://generativelanguage.googleapis.com/v1beta`
 - **Features**: Native Gemini API with thinking support
 
-| Tier | Models | Pricing (in/out per 1M tokens) | Context |
-|------|--------|-------------------------------|---------|
-| Weak | **gemini-2.0-flash-lite** (default) | $0.07 / $0.30 | 1048K ctx / 65K out |
-| Medium | **gemini-2.5-flash** (default) | $0.15 / $0.60 | 1048K ctx / 65K out |
-| Strong | **gemini-2.5-pro** (default) | $1.25 / $5.00 | 1048K ctx / 65K out |
+| Purpose | Models | Pricing (in/out per 1M tokens) | Context |
+|---------|--------|-------------------------------|---------|
+| Fast | **gemini-2.0-flash-lite** (default) | $0.07 / $0.30 | 1048K ctx / 65K out |
+| Balanced | **gemini-2.5-flash** (default) | $0.15 / $0.60 | 1048K ctx / 65K out |
+| Best | **gemini-2.5-pro** (default) | $1.25 / $5.00 | 1048K ctx / 65K out |
 
-Defaults: gemini-2.5-pro (strong), gemini-2.5-flash (medium), gemini-2.0-flash-lite (weak)
+Defaults: gemini-2.5-pro (best), gemini-2.5-flash (balanced), gemini-2.0-flash-lite (fast)
 
 ### Copilot
 
@@ -132,33 +149,33 @@ Defaults: gemini-2.5-pro (strong), gemini-2.5-flash (medium), gemini-2.0-flash-l
 - **API**: `https://api.githubcopilot.com (or GraphQL-discovered Copilot API endpoint)`
 - **Features**: Native Copilot Chat HTTP API with model endpoint discovery
 
-| Tier | Models | Pricing (in/out per 1M tokens) | Context |
-|------|--------|-------------------------------|---------|
-| Weak | gpt-5-mini | $0.25 / $2.00 | 200K ctx / 100K out |
-| Weak | gpt-5.4-mini | $0.75 / $4.50 | 200K ctx / 100K out |
-| Weak | gpt-5.4-nano | $0.20 / $1.25 | 200K ctx / 100K out |
-| Weak | claude-haiku-4.5 | $1.00 / $5.00 | 200K ctx / 64K out |
-| Weak | gemini-3.5-flash | $1.50 / $9.00 | 200K ctx / 65K out |
-| Weak | mai-code-1-flash-picker | $0.75 / $4.50 | 200K ctx / 100K out |
-| Weak | **gpt-5.6-luna** (default) | $0.20 / $1.20 | 200K ctx / 100K out |
-| Medium | gemini-3.6-flash | $0.75 / $3.75 | 200K ctx / 65K out |
-| Medium | gemini-3.7-flash | $0.75 / $3.75 | 200K ctx / 65K out |
-| Medium | claude-sonnet-4.5, claude-sonnet-4.6 | $3.00 / $15.00 | 200K ctx / 64K out |
-| Medium | claude-sonnet-5 | $2.00 / $10.00 | 200K ctx / 100K out |
-| Medium | kimi-k2.7-code | $0.95 / $4.00 | 200K ctx / 100K out |
-| Medium | gemini-3.1-pro-preview | $2.00 / $12.00 | 200K ctx / 65K out |
-| Medium | **gpt-5.6-terra** (default) | $2.00 / $12.00 | 200K ctx / 100K out |
-| Medium | grok-4.5 | $2.00 / $6.00 | 200K ctx / 100K out |
-| Medium | grok-4.6 | $2.00 / $6.00 | 200K ctx / 100K out |
-| Strong | gpt-5.5 | $5.00 / $30.00 | 200K ctx / 100K out |
-| Strong | kimi-k3 | $3.00 / $15.00 | 200K ctx / 100K out |
-| Strong | gpt-5.4 | $2.50 / $15.00 | 200K ctx / 100K out |
-| Strong | gpt-5.6-sol | $5.00 / $30.00 | 200K ctx / 100K out |
-| Strong | gpt-5.3-codex | $1.75 / $14.00 | 200K ctx / 100K out |
-| Strong | **claude-opus-5, claude-opus-4.8, claude-opus-4.7, claude-opus-4.6, claude-opus-4.5** (default) | $5.00 / $25.00 | 200K ctx / 64K out |
-| Strong | claude-opus-4.8-fast, claude-fable-5 | $10.00 / $50.00 | 200K ctx / 100K out |
+| Purpose | Models | Pricing (in/out per 1M tokens) | Context |
+|---------|--------|-------------------------------|---------|
+| Fast | gpt-5-mini | $0.25 / $2.00 | 200K ctx / 100K out |
+| Fast | gpt-5.4-mini | $0.75 / $4.50 | 200K ctx / 100K out |
+| Fast | gpt-5.4-nano | $0.20 / $1.25 | 200K ctx / 100K out |
+| Fast | claude-haiku-4.5 | $1.00 / $5.00 | 200K ctx / 64K out |
+| Fast | gemini-3.5-flash | $1.50 / $9.00 | 200K ctx / 65K out |
+| Fast | mai-code-1-flash-picker | $0.75 / $4.50 | 200K ctx / 100K out |
+| Fast | **gpt-5.6-luna** (default) | $0.20 / $1.20 | 200K ctx / 100K out |
+| Balanced | gemini-3.6-flash | $0.75 / $3.75 | 200K ctx / 65K out |
+| Balanced | gemini-3.7-flash | $0.75 / $3.75 | 200K ctx / 65K out |
+| Balanced | claude-sonnet-4.5, claude-sonnet-4.6 | $3.00 / $15.00 | 200K ctx / 64K out |
+| Balanced | claude-sonnet-5 | $2.00 / $10.00 | 200K ctx / 100K out |
+| Balanced | kimi-k2.7-code | $0.95 / $4.00 | 200K ctx / 100K out |
+| Balanced | gemini-3.1-pro-preview | $2.00 / $12.00 | 200K ctx / 65K out |
+| Balanced | **gpt-5.6-terra** (default) | $2.00 / $12.00 | 200K ctx / 100K out |
+| Balanced | grok-4.5 | $2.00 / $6.00 | 200K ctx / 100K out |
+| Balanced | grok-4.6 | $2.00 / $6.00 | 200K ctx / 100K out |
+| Best | gpt-5.5 | $5.00 / $30.00 | 200K ctx / 100K out |
+| Best | kimi-k3 | $3.00 / $15.00 | 200K ctx / 100K out |
+| Best | gpt-5.4 | $2.50 / $15.00 | 200K ctx / 100K out |
+| Best | gpt-5.6-sol | $5.00 / $30.00 | 200K ctx / 100K out |
+| Best | gpt-5.3-codex | $1.75 / $14.00 | 200K ctx / 100K out |
+| Best | **claude-opus-5, claude-opus-4.8, claude-opus-4.7, claude-opus-4.6, claude-opus-4.5** (default) | $5.00 / $25.00 | 200K ctx / 64K out |
+| Best | claude-opus-4.8-fast, claude-fable-5 | $10.00 / $50.00 | 200K ctx / 100K out |
 
-Defaults: gpt-5.6-luna (weak), gpt-5.6-terra (medium), claude-opus-5 (strong)
+Defaults: gpt-5.6-luna (fast), gpt-5.6-terra (balanced), claude-opus-5 (best)
 
 ### Ollama
 
@@ -181,14 +198,14 @@ Connects to any OpenAI-compatible `/v1` endpoint. Point `LLAMA_CPP_HOST` to your
 - **Env var**: `MISTRAL_API_KEY`
 - **API**: `https://api.mistral.ai/v1`
 
-| Tier | Models | Pricing (in/out per 1M tokens) | Context |
-|------|--------|-------------------------------|---------|
-| Weak | **ministral-14b-latest, ministral-14b-2512** (default) | $0.20 / $0.20 | 262K ctx |
-| Medium | **mistral-small-latest, mistral-small-2603** (default) | $0.15 / $0.60 | 262K ctx |
-| Strong | **mistral-medium-latest, mistral-medium-3.5, mistral-medium-3-5, mistral-medium-2604** (default) | $1.50 / $7.50 | 262K ctx |
-| Strong | glm-5-2, zai-glm-5-2 | $1.40 / $4.40 | 1000K ctx |
+| Purpose | Models | Pricing (in/out per 1M tokens) | Context |
+|---------|--------|-------------------------------|---------|
+| Fast | **ministral-14b-latest, ministral-14b-2512** (default) | $0.20 / $0.20 | 262K ctx |
+| Balanced | **mistral-small-latest, mistral-small-2603** (default) | $0.15 / $0.60 | 262K ctx |
+| Best | **mistral-medium-latest, mistral-medium-3.5, mistral-medium-3-5, mistral-medium-2604** (default) | $1.50 / $7.50 | 262K ctx |
+| Best | glm-5-2, zai-glm-5-2 | $1.40 / $4.40 | 1000K ctx |
 
-Defaults: mistral-medium-latest (strong), mistral-small-latest (medium), ministral-14b-latest (weak)
+Defaults: mistral-medium-latest (best), mistral-small-latest (balanced), ministral-14b-latest (fast)
 
 ### Z.AI
 
@@ -197,18 +214,18 @@ Defaults: mistral-medium-latest (strong), mistral-small-latest (medium), ministr
   - `https://api.z.ai/api/paas/v4`
   - `https://api.z.ai/api/coding/paas/v4`
 
-| Tier | Models | Pricing (in/out per 1M tokens) | Context |
-|------|--------|-------------------------------|---------|
-| Weak | **glm-4.7-flash** (default) | $0.00 / $0.00 | 200K ctx / 131K out |
-| Weak | glm-4.5-flash | $0.00 / $0.00 | 131K ctx / 98K out |
-| Weak | glm-4.5-air | $0.20 / $1.10 | 131K ctx / 98K out |
-| Medium | **glm-4.7, glm-4.6** (default) | $0.60 / $2.20 | 200K ctx / 131K out |
-| Medium | glm-4.5 | $0.60 / $2.20 | 131K ctx / 98K out |
-| Strong | **glm-5-code** (default) | $1.20 / $5.00 | 200K ctx / 131K out |
-| Strong | glm-5.2 | $1.00 / $3.20 | 1000K ctx / 131K out |
-| Strong | glm-5.1, glm-5 | $1.00 / $3.20 | 200K ctx / 131K out |
+| Purpose | Models | Pricing (in/out per 1M tokens) | Context |
+|---------|--------|-------------------------------|---------|
+| Fast | **glm-4.7-flash** (default) | $0.00 / $0.00 | 200K ctx / 131K out |
+| Fast | glm-4.5-flash | $0.00 / $0.00 | 131K ctx / 98K out |
+| Fast | glm-4.5-air | $0.20 / $1.10 | 131K ctx / 98K out |
+| Balanced | **glm-4.7, glm-4.6** (default) | $0.60 / $2.20 | 200K ctx / 131K out |
+| Balanced | glm-4.5 | $0.60 / $2.20 | 131K ctx / 98K out |
+| Best | **glm-5-code** (default) | $1.20 / $5.00 | 200K ctx / 131K out |
+| Best | glm-5.2 | $1.00 / $3.20 | 1000K ctx / 131K out |
+| Best | glm-5.1, glm-5 | $1.00 / $3.20 | 200K ctx / 131K out |
 
-Defaults: glm-5-code (strong), glm-4.7-flash (weak), glm-4.7 (medium)
+Defaults: glm-5-code (best), glm-4.7-flash (fast), glm-4.7 (balanced)
 
 ### DeepSeek
 
@@ -217,12 +234,12 @@ Defaults: glm-5-code (strong), glm-4.7-flash (weak), glm-4.7 (medium)
 - **Features**: Thinking mode toggle (on/off), open-weight models
 - **Peak pricing**: the prices below are off-peak; each turn is billed as it happens, at 2x during 01:00-04:00, 06:00-10:00 UTC
 
-| Tier | Models | Pricing (in/out per 1M tokens) | Context |
-|------|--------|-------------------------------|---------|
-| Medium | **deepseek-v4-flash** (default) | $0.22 / $0.66 | 1000K ctx / 384K out |
-| Strong | **deepseek-v4-pro** (default) | $0.66 / $1.98 | 1000K ctx / 384K out |
+| Purpose | Models | Pricing (in/out per 1M tokens) | Context |
+|---------|--------|-------------------------------|---------|
+| Balanced | **deepseek-v4-flash** (default) | $0.22 / $0.66 | 1000K ctx / 384K out |
+| Best | **deepseek-v4-pro** (default) | $0.66 / $1.98 | 1000K ctx / 384K out |
 
-Defaults: deepseek-v4-flash (medium), deepseek-v4-pro (strong)
+Defaults: deepseek-v4-flash (balanced), deepseek-v4-pro (best)
 
 ### OpenRouter
 
@@ -238,13 +255,13 @@ OpenRouter aggregates models from many providers behind a single API key. Browse
 - **API**: `https://api.synthetic.new/openai/v1`
 - **Features**: Reasoning effort support (low/medium/high), open-weight models
 
-| Tier | Models | Pricing (in/out per 1M tokens) | Context |
-|------|--------|-------------------------------|---------|
-| Weak | **hf:zai-org/GLM-4.7-Flash** (default) | $0.10 / $0.50 | 200K ctx / 131K out |
-| Medium | **hf:deepseek-ai/DeepSeek-V3.2** (default) | $0.56 / $1.68 | 200K ctx / 131K out |
-| Strong | **hf:moonshotai/Kimi-K2.5** (default) | $0.45 / $3.40 | 200K ctx / 131K out |
+| Purpose | Models | Pricing (in/out per 1M tokens) | Context |
+|---------|--------|-------------------------------|---------|
+| Fast | **hf:zai-org/GLM-4.7-Flash** (default) | $0.10 / $0.50 | 200K ctx / 131K out |
+| Balanced | **hf:deepseek-ai/DeepSeek-V3.2** (default) | $0.56 / $1.68 | 200K ctx / 131K out |
+| Best | **hf:moonshotai/Kimi-K2.5** (default) | $0.45 / $3.40 | 200K ctx / 131K out |
 
-Defaults: hf:moonshotai/Kimi-K2.5 (strong), hf:deepseek-ai/DeepSeek-V3.2 (medium), hf:zai-org/GLM-4.7-Flash (weak)
+Defaults: hf:moonshotai/Kimi-K2.5 (best), hf:deepseek-ai/DeepSeek-V3.2 (balanced), hf:zai-org/GLM-4.7-Flash (fast)
 
 ### TensorX
 
@@ -279,13 +296,13 @@ The default is `false`.
   - `https://cli-chat-proxy.grok.com/v1`
 - **Features**: OAuth login, account-specific model catalog, Grok reasoning (low/medium/high/xhigh)
 
-| Tier | Models | Pricing (in/out per 1M tokens) | Context |
-|------|--------|-------------------------------|---------|
-| Medium | **grok-4.3** (default) | $1.25 / $2.50 | 1000K ctx / 131K out |
-| Strong | **grok-4.6** (default) | $2.00 / $6.00 | 500K ctx / 131K out |
-| Strong | grok-4.5 | $2.00 / $6.00 | 500K ctx / 131K out |
+| Purpose | Models | Pricing (in/out per 1M tokens) | Context |
+|---------|--------|-------------------------------|---------|
+| Balanced | **grok-4.3** (default) | $1.25 / $2.50 | 1000K ctx / 131K out |
+| Best | **grok-4.6** (default) | $2.00 / $6.00 | 500K ctx / 131K out |
+| Best | grok-4.5 | $2.00 / $6.00 | 500K ctx / 131K out |
 
-Defaults: grok-4.6 (strong), grok-4.3 (medium)
+Defaults: grok-4.6 (best), grok-4.3 (balanced)
 
 OAuth uses the same first-party xAI client as the official Grok CLI (`caudra auth login xai`). Browser login (PKCE) is the desktop default; device code is recommended over SSH or in a container. Tokens refresh automatically. After login, Caudra fetches your account catalog from `GET /v1/models-v2` on the Grok CLI proxy and caches it for 15 minutes. `XAI_BASE_URL` only redirects the public API-key endpoint, never the OAuth proxy.
 
@@ -342,9 +359,12 @@ api_key_env = "MY_PROXY_API_KEY"
 default_model = "my-proxy/fast-v1"
 discover_models = true         # also list models via the provider's /models endpoint
 
+[my-proxy.purposes]
+fast = "fast-v1"               # a prefix: also covers fast-v1-turbo, fast-v1-lora, ...
+best = ["smart-v1", "smart-v0"]   # a list when one prefix cannot span them
+
 [[my-proxy.models]]
 id = "fast-v1"
-tier = "weak"
 context_window = 128000
 max_output_tokens = 16384
 pricing_input = 0.5
@@ -352,7 +372,6 @@ pricing_output = 1.5
 
 [[my-proxy.models]]
 id = "smart-v1"
-tier = "strong"
 context_window = 200000
 max_output_tokens = 32000
 supports_thinking = true
@@ -373,6 +392,7 @@ supports_vision = false
 | `discover_models` | bool | When true, also probe the provider's model list endpoint (default false) |
 | `enable_free_models` | bool | Opencode only. Show free catalog models (default false) |
 | `model_defaults` | table | Model fields applied to every model of this provider (see below) |
+| `purposes` | table | Model id prefixes per workload: `chat`, `fast`, `balanced`, `best`, `title`, `compact`, `goal`. A string or a list, first entry winning the slot. Outranked by a binding made in the picker |
 | `models` | array | Declared models for custom providers (see below) |
 | `overrides` | table | Aperture only. Per-upstream model overrides (see below) |
 
@@ -381,7 +401,6 @@ supports_vision = false
 | Field | Type | Default | Notes |
 |-------|------|---------|-------|
 | `id` | string | required | Model id. Spec becomes `{slug}/{id}` |
-| `tier` | string | `medium` | `weak`, `medium`, or `strong` |
 | `context_window` | u32 | protocol default | Tokens of context |
 | `max_output_tokens` | u32 | protocol default | Max completion tokens |
 | `supports_tool_examples` | bool | false | Send tool examples as a structured field. Off unless declared, because the protocol says nothing about the weights behind it |
@@ -404,10 +423,10 @@ reasoning_options = []
 
 [[my-proxy.models]]
 id = "smart-v1"
-tier = "strong"
+max_output_tokens = 64000
 ```
 
-It takes the same fields as a `models` entry apart from `id`, and applies to every model of the provider including discovered ones. A matching `models` entry wins field by field, so `smart-v1` above is strong with a 229376-token window. Anything a model neither declares nor inherits falls back to discovery, then to the protocol default.
+It takes the same fields as a `models` entry apart from `id`, and applies to every model of the provider including discovered ones. A matching `models` entry wins field by field, so `smart-v1` above keeps the 229376-token window and raises only its output cap. Anything a model neither declares nor inherits falls back to discovery, then to the protocol default.
 
 `reasoning_options = []` is a declaration, not an omission: it says the endpoint takes no reasoning controls, so Caudra sends no `reasoning_effort`. Leaving it unset instead lets a thinking level chosen for another model reach an endpoint that rejects it.
 
@@ -479,10 +498,10 @@ The `base` field specifies which built-in provider to inherit the model catalog 
 If your provider serves models not in the base catalog, add a `models` subcommand returning:
 
 ```json
-[{"id": "my-model-v2", "tier": "strong", "context_window": 200000, "max_output_tokens": 16384}]
+[{"id": "my-model-v2", "context_window": 200000, "max_output_tokens": 16384}]
 ```
 
-Only `id` is required. Optional fields: `tier` (default `medium`), `context_window` (128K), `max_output_tokens` (16K), `pricing` (`{input, output, cache_write, cache_read}`, all per 1M tokens), `supports_tool_examples` (defaults to the base provider's setting), `supports_thinking` (defaults to the base provider's setting), `requires_thinking` (default false; for APIs that reject requests with thinking off, raises it to minimal effort and implies `supports_thinking`), `supports_vision` (defaults to the base provider's setting; when false, image input and the `view_image` tool are disabled). The first model listed per tier is used for sub-agents. Without this subcommand, the base provider's models are used.
+Only `id` is required. Optional fields: `context_window` (128K), `max_output_tokens` (16K), `pricing` (`{input, output, cache_write, cache_read}`, all per 1M tokens), `supports_tool_examples` (defaults to the base provider's setting), `supports_thinking` (defaults to the base provider's setting), `requires_thinking` (default false; for APIs that reject requests with thinking off, raises it to minimal effort and implies `supports_thinking`), `supports_vision` (defaults to the base provider's setting; when false, image input and the `view_image` tool are disabled). Without this subcommand, the base provider's models are used.
 
 A `llama-cpp` model can replace Caudra's token-budget mapping with its native thinking fields. Each thinking mode maps to a JSON fragment merged into the request body:
 

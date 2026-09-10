@@ -281,7 +281,6 @@ impl OpenAiCompatProvider {
             supports_thinking: None,
             supports_vision,
             reasoning_options: None,
-            tier: None,
             provider_info: None,
         })
     }

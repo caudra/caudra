@@ -15,16 +15,146 @@ const BAD_CONFIG_EXIT_CODE: i32 = 2;
 /// The only built-in that reads `enable_free_models`.
 const OPENCODE_SLUG: &str = "opencode";
 
-/// Coarse capability classification used by caudra-providers to dispatch tiered
-/// requests. Mirrors `caudra_providers::ModelTier` shape but lives here so the
-/// config layer can validate inputs without depending on caudra-providers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+/// A workload slot a model can be bound to. A purpose records what the user
+/// wants a model used for, never a claim about what the model is capable of.
+///
+/// Lives here rather than in caudra-providers so the config layer can validate
+/// bindings without depending on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum Tier {
-    Weak,
-    #[default]
-    Medium,
-    Strong,
+pub enum ModelPurpose {
+    Chat,
+    Fast,
+    Balanced,
+    Best,
+    Title,
+    Compact,
+    Goal,
+}
+
+impl ModelPurpose {
+    pub const ALL: [Self; 7] = [
+        Self::Chat,
+        Self::Fast,
+        Self::Balanced,
+        Self::Best,
+        Self::Title,
+        Self::Compact,
+        Self::Goal,
+    ];
+
+    /// The purposes that name how much capability a caller wants, as opposed to
+    /// which workload is asking. Only these carry a curated model table, and
+    /// only these are worth pointing another purpose at.
+    pub const CLASSES: [Self; 3] = [Self::Fast, Self::Balanced, Self::Best];
+
+    /// Title-cased name for pickers and docs. `Display` stays lowercase so it
+    /// matches what the config and state rows hold.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Chat => "Chat",
+            Self::Fast => "Fast",
+            Self::Balanced => "Balanced",
+            Self::Best => "Best",
+            Self::Title => "Title",
+            Self::Compact => "Compact",
+            Self::Goal => "Goal",
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Chat => "chat",
+            Self::Fast => "fast",
+            Self::Balanced => "balanced",
+            Self::Best => "best",
+            Self::Title => "title",
+            Self::Compact => "compact",
+            Self::Goal => "goal",
+        }
+    }
+}
+
+impl std::fmt::Display for ModelPurpose {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for ModelPurpose {
+    type Err = UnknownPurpose;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|purpose| purpose.as_str() == s)
+            .ok_or_else(|| UnknownPurpose(s.to_string()))
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "unknown model purpose '{0}', expected one of: chat, fast, balanced, best, title, compact, goal"
+)]
+pub struct UnknownPurpose(pub String);
+
+/// Model id prefixes a provider offers for one purpose, best first.
+///
+/// Accepts a bare string or a list so the common single-model case stays a
+/// one-liner. Entries match by prefix, and the first one also names the model
+/// that wins the slot, so it has to be a real id. That is the same contract the
+/// built-in tables keep: a curated entry lists prefixes and resolves its default
+/// from the first of them.
+///
+/// Prefixes are what make a server full of fine-tune variants declarable. One
+/// `qwen3.8-27b` covers every `qwen3.8-27b-*` the endpoint loads, without the
+/// config needing an edit each time a new one appears.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "OneOrMany", into = "OneOrMany")]
+pub struct PurposeModels(Vec<String>);
+
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum OneOrMany {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl From<OneOrMany> for PurposeModels {
+    fn from(value: OneOrMany) -> Self {
+        match value {
+            OneOrMany::One(id) => Self(vec![id]),
+            OneOrMany::Many(ids) => Self(ids),
+        }
+    }
+}
+
+/// Round-trips back to the shape the operator wrote, so caudra rewriting this
+/// file on upsert does not reformat a hand-written one-liner into a list.
+impl From<PurposeModels> for OneOrMany {
+    fn from(value: PurposeModels) -> Self {
+        match <[String; 1]>::try_from(value.0) {
+            Ok([id]) => Self::One(id),
+            Err(ids) => Self::Many(ids),
+        }
+    }
+}
+
+impl PurposeModels {
+    /// The id that wins the slot when several are declared.
+    pub fn preferred(&self) -> Option<&str> {
+        self.0.first().map(String::as_str)
+    }
+
+    /// Whether `model_id` is one this purpose covers. Prefix, not equality, so a
+    /// family of fine-tunes is one line rather than one line each.
+    pub fn matches(&self, model_id: &str) -> bool {
+        self.0.iter().any(|prefix| model_id.starts_with(prefix))
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &str> {
+        self.0.iter().map(String::as_str)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,16 +164,15 @@ pub struct ModelDef {
     pub fields: ModelFields,
 }
 
-/// Settings declarable per model, or for every model of a provider at once via
-/// [`ProviderDef::model_defaults`].
+/// Facts declarable per model, or for every model of a provider at once via
+/// [`ProviderDef::model_defaults`]. Facts only: which workload a model serves is
+/// a binding, declared in [`ProviderDef::purposes`].
 ///
 /// Every field is optional so absence means "inherit" rather than "reset to the
-/// default": a non-optional `tier` would make an exact entry silently outrank a
+/// default": a non-optional field would make an exact entry silently outrank a
 /// provider default it never mentioned.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ModelFields {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tier: Option<Tier>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -92,7 +221,6 @@ impl ModelFields {
     /// every gap.
     fn over(self, base: &Self) -> Self {
         Self {
-            tier: self.tier.or(base.tier),
             context_window: self.context_window.or(base.context_window),
             max_output_tokens: self.max_output_tokens.or(base.max_output_tokens),
             supports_tool_examples: self.supports_tool_examples.or(base.supports_tool_examples),
@@ -233,6 +361,10 @@ pub struct ProviderDef {
     /// knows about. A matching `models` entry overrides it field by field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_defaults: Option<ModelFields>,
+    /// Which model id serves each workload while this provider is active.
+    /// Checked-in bindings, outranked by an assignment made in the picker.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub purposes: HashMap<ModelPurpose, PurposeModels>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub models: Vec<ModelDef>,
 }
@@ -264,7 +396,7 @@ pub struct ProvidersConfig {
 
 impl ProvidersConfig {
     /// Read and parse `providers.toml`. Hard-exits on parse errors so a typo
-    /// in tier or pricing surfaces immediately instead of silently dropping
+    /// in a purpose or pricing surfaces immediately instead of silently dropping
     /// every provider and starting caudra with an empty registry.
     pub fn load() -> Self {
         let path = providers_file_path();
@@ -466,7 +598,7 @@ mod tests {
     use super::*;
     use test_case::test_case;
 
-    const UNKNOWN_TIER: &str = "unknown variant `compaction`";
+    const UNKNOWN_PURPOSE: &str = "unknown variant `compaction`";
     const DECLARED_LEVELS_TOML: &str = r#"
 [local]
 protocol = "openai"
@@ -493,35 +625,75 @@ values = ["none", "low", "medium", "xhigh"]
 [local]
 protocol = "openai"
 
+[local.purposes]
+fast = ["small", "small-draft"]
+best = "qwen3.8-27b-lora"
+
 [local.model_defaults]
 context_window = 229376
 max_output_tokens = 32768
-tier = "weak"
 reasoning_options = []
 
 [[local.models]]
 id = "qwen3.8-27b-lora"
-tier = "strong"
 
 [[local.models]]
 id = "small"
 context_window = 8192
 "#;
 
-    #[test_case("qwen3.8-27b-lora", Some(229_376), Some(Tier::Strong) ; "exact_entry_inherits_what_it_omits")]
-    #[test_case("small", Some(8_192), Some(Tier::Weak) ; "exact_entry_overrides_field_by_field")]
-    #[test_case("never-declared", Some(229_376), Some(Tier::Weak) ; "discovered_model_gets_defaults")]
-    fn model_defaults_apply_unless_an_exact_entry_overrides(
-        model_id: &str,
-        window: Option<u32>,
-        tier: Option<Tier>,
-    ) {
+    #[test_case("qwen3.8-27b-lora", Some(229_376) ; "exact_entry_inherits_what_it_omits")]
+    #[test_case("small", Some(8_192) ; "exact_entry_overrides_field_by_field")]
+    #[test_case("never-declared", Some(229_376) ; "discovered_model_gets_defaults")]
+    fn model_defaults_apply_unless_an_exact_entry_overrides(model_id: &str, window: Option<u32>) {
         let parsed: ProvidersConfig = toml::from_str(DEFAULTS_TOML).unwrap();
         let settings = parsed.get("local").unwrap().model_settings(model_id);
 
         assert_eq!(settings.context_window, window, "{ABSENT_MEANS_INHERIT}");
-        assert_eq!(settings.tier, tier, "{ABSENT_MEANS_INHERIT}");
         assert_eq!(settings.max_output_tokens, Some(32_768));
+    }
+
+    #[test_case(ModelPurpose::Fast, "small" ; "list_prefers_its_first_entry")]
+    #[test_case(ModelPurpose::Best, "qwen3.8-27b-lora" ; "bare_string_is_still_accepted")]
+    fn declared_purposes_bind_a_model_id(purpose: ModelPurpose, expected: &str) {
+        let parsed: ProvidersConfig = toml::from_str(DEFAULTS_TOML).unwrap();
+        let def = parsed.get("local").unwrap();
+
+        assert_eq!(
+            def.purposes
+                .get(&purpose)
+                .and_then(PurposeModels::preferred),
+            Some(expected)
+        );
+    }
+
+    /// Every declared entry serves the purpose, not just the one that wins the
+    /// slot, and each covers its whole family: a server that loads a dozen
+    /// fine-tunes of one base must not need a dozen config lines.
+    #[test_case("small", true ; "exact_entry")]
+    #[test_case("small-draft", true ; "later_entry_still_counts")]
+    #[test_case("small-v2-experimental", true ; "variant_matches_by_prefix")]
+    #[test_case("qwen3.8-27b-lora", false ; "another_purposes_model_does_not")]
+    #[test_case("tiny", false ; "unrelated_id_does_not")]
+    fn declared_entries_cover_their_family(model_id: &str, expected: bool) {
+        let parsed: ProvidersConfig = toml::from_str(DEFAULTS_TOML).unwrap();
+        let fast = parsed
+            .get("local")
+            .unwrap()
+            .purposes
+            .get(&ModelPurpose::Fast)
+            .unwrap();
+
+        assert_eq!(fast.matches(model_id), expected);
+    }
+
+    #[test]
+    fn undeclared_purposes_stay_absent_rather_than_defaulting() {
+        let parsed: ProvidersConfig = toml::from_str(DEFAULTS_TOML).unwrap();
+        let def = parsed.get("local").unwrap();
+
+        assert_eq!(def.purposes.get(&ModelPurpose::Balanced), None);
+        assert_eq!(def.purposes.get(&ModelPurpose::Title), None);
     }
 
     /// `models` and `model_defaults` both flatten, and caudra rewrites this
@@ -533,10 +705,18 @@ context_window = 8192
         let rewritten = toml::to_string_pretty(&parsed).unwrap();
         let reparsed: ProvidersConfig = toml::from_str(&rewritten).unwrap();
 
-        let settings = reparsed.get("local").unwrap().model_settings("small");
+        let local = reparsed.get("local").unwrap();
+        let settings = local.model_settings("small");
         assert_eq!(settings.context_window, Some(8_192));
-        assert_eq!(settings.tier, Some(Tier::Weak), "{ABSENT_MEANS_INHERIT}");
         assert_eq!(settings.max_output_tokens, Some(32_768));
+        assert_eq!(
+            local
+                .purposes
+                .get(&ModelPurpose::Fast)
+                .map(|models| models.iter().collect::<Vec<_>>()),
+            Some(vec!["small", "small-draft"]),
+            "a declared list must survive the rewrite caudra does on upsert"
+        );
     }
 
     /// An empty list is a real declaration ("this endpoint takes no reasoning
@@ -610,40 +790,31 @@ context_window = 8192
         assert_eq!(def.enable_free_models, None);
     }
 
-    const UNKNOWN_TIER_TOML: &str = r#"id = "x"
-tier = "mediums"
+    const UNKNOWN_PURPOSE_TOML: &str = r#"[local.purposes]
+compaction = "x"
 "#;
 
     #[test]
-    fn model_def_rejects_unknown_tier() {
-        let err = toml::from_str::<ModelDef>(UNKNOWN_TIER_TOML).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("medium"), "expected enum hint, got: {msg}");
+    fn config_rejects_an_unknown_purpose() {
+        let error = toml::from_str::<ProvidersConfig>(UNKNOWN_PURPOSE_TOML).unwrap_err();
+        assert!(error.to_string().contains(UNKNOWN_PURPOSE), "{error}");
+    }
+
+    #[test_case("chat", ModelPurpose::Chat ; "chat")]
+    #[test_case("fast", ModelPurpose::Fast ; "fast")]
+    #[test_case("balanced", ModelPurpose::Balanced ; "balanced")]
+    #[test_case("best", ModelPurpose::Best ; "best")]
+    #[test_case("title", ModelPurpose::Title ; "title")]
+    #[test_case("compact", ModelPurpose::Compact ; "compact")]
+    #[test_case("goal", ModelPurpose::Goal ; "goal")]
+    fn purpose_parses_and_renders_the_same_name(input: &str, expected: ModelPurpose) {
+        assert_eq!(input.parse::<ModelPurpose>().unwrap(), expected);
+        assert_eq!(expected.to_string(), input);
     }
 
     #[test]
-    fn model_def_without_tier_inherits_rather_than_claiming_medium() {
-        let m: ModelDef = toml::from_str(r#"id = "x""#).unwrap();
-        assert_eq!(m.fields.tier, None, "{ABSENT_MEANS_INHERIT}");
-    }
-
-    #[test_case("weak", Tier::Weak ; "weak")]
-    #[test_case("medium", Tier::Medium ; "medium")]
-    #[test_case("strong", Tier::Strong ; "strong")]
-    fn model_def_tier_roundtrip(input: &str, expected: Tier) {
-        let toml = format!(
-            r#"id = "x"
-tier = "{input}"
-"#
-        );
-        let m: ModelDef = toml::from_str(&toml).unwrap();
-        assert_eq!(m.fields.tier, Some(expected));
-    }
-
-    #[test]
-    fn model_def_rejects_the_removed_compaction_tier() {
-        let error = toml::from_str::<ModelDef>("id = \"x\"\ntier = \"compaction\"\n").unwrap_err();
-        assert!(error.to_string().contains(UNKNOWN_TIER), "{error}");
+    fn purpose_from_str_rejects_an_unknown_name() {
+        assert!("weak".parse::<ModelPurpose>().is_err());
     }
 
     #[test_case("anthropic", None => "ANTHROPIC_API_KEY".to_string(); "builtin_default")]

@@ -6,9 +6,9 @@ use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 use ratatui::text::{Line, Span};
 
-use caudra_providers::ModelTier;
+use caudra_providers::ModelPurpose;
 use caudra_providers::dynamic;
-use caudra_providers::model_registry::{self, CompactionTarget, GoalEvaluatorTarget, TitleTarget};
+use caudra_providers::model_registry::{self, Binding};
 use caudra_providers::provider::ProviderKind;
 
 use crate::components::Overlay;
@@ -16,10 +16,14 @@ use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
 use crate::repaint::{Cadence, Dirty, Watch};
 use crate::theme;
 
-const TARGET_SECTION: &str = "Evaluator target";
+const TARGET_SECTION: &str = "Binding";
+const DEFAULT_ROW: &str = "Default";
+const DEFAULT_DETAIL: &str = "unbound";
+const SAME_DETAIL: &str = "follows another slot";
+const SAVED_DETAIL: &str = "saved exact model";
 const RECENT_SECTION: &str = "Recent";
 const FREE_LABEL: &str = "Free";
-const FREE_PREFIX: &str = "Free · ";
+const DETAIL_SEPARATOR: &str = " · ";
 const LOADING_MODELS: &str = "Loading models...";
 const NO_MATCHES: &str = "No matches";
 
@@ -53,11 +57,8 @@ fn is_reset_key(key: KeyEvent) -> bool {
 pub enum ModelPickerAction {
     Consumed,
     Select(String),
-    SetGoalEvaluator(GoalEvaluatorTarget),
-    SetCompaction(CompactionTarget),
-    SetTitleModel(TitleTarget),
-    AssignTier(String, ModelTier),
-    ResetTier(ModelTier),
+    Bind(ModelPurpose, Binding),
+    Unbind(ModelPurpose),
     Close,
 }
 
@@ -66,10 +67,13 @@ struct ModelEntry {
     id: String,
     provider_display: String,
     suffix: Option<String>,
-    tier: String,
-    override_tiers: Vec<ModelTier>,
-    goal_target: Option<GoalEvaluatorTarget>,
-    goal_assigned: bool,
+    detail: String,
+    /// Every slot pointed at this row, so one accent cannot hide that a model
+    /// serves several workloads.
+    claimed_by: Vec<ModelPurpose>,
+    /// What selecting this row binds the open purpose to. `None` unbinds.
+    binds: Option<Binding>,
+    selected: bool,
     free: bool,
 }
 
@@ -83,7 +87,7 @@ impl PickerItem for ModelEntry {
     }
 
     fn detail(&self) -> Option<&str> {
-        Some(&self.tier)
+        Some(&self.detail)
     }
 
     fn section(&self) -> Option<&str> {
@@ -91,66 +95,23 @@ impl PickerItem for ModelEntry {
     }
 
     fn is_highlighted(&self) -> bool {
-        !self.override_tiers.is_empty() || self.goal_assigned
+        !self.claimed_by.is_empty() || self.selected
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PickerMode {
-    Chat,
-    Goal,
-    Compact,
-    Title,
-    Fast,
-    Balanced,
-    Best,
+fn title_for(purpose: ModelPurpose) -> String {
+    format!(" Models · {} ", purpose.label())
 }
 
-impl PickerMode {
-    const ALL: [Self; 7] = [
-        Self::Chat,
-        Self::Goal,
-        Self::Compact,
-        Self::Title,
-        Self::Fast,
-        Self::Balanced,
-        Self::Best,
-    ];
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::Chat => "Chat",
-            Self::Goal => "Goal",
-            Self::Compact => "Compact",
-            Self::Title => "Title",
-            Self::Fast => "Fast",
-            Self::Balanced => "Balanced",
-            Self::Best => "Best",
-        }
-    }
-
-    fn title(self) -> String {
-        format!(" Models · {} ", self.label())
-    }
-
-    fn preset_tier(self) -> Option<ModelTier> {
-        match self {
-            Self::Fast => Some(ModelTier::Weak),
-            Self::Balanced => Some(ModelTier::Medium),
-            Self::Best => Some(ModelTier::Strong),
-            _ => None,
-        }
-    }
-
-    fn shifted(self, backwards: bool) -> Self {
-        let index = Self::ALL.iter().position(|mode| *mode == self).unwrap_or(0);
-        let next = if backwards {
-            index.checked_sub(1).unwrap_or(Self::ALL.len() - 1)
-        } else {
-            (index + 1) % Self::ALL.len()
-        };
-        Self::ALL[next]
-    }
+fn shifted(purpose: ModelPurpose, backwards: bool) -> ModelPurpose {
+    let all = ModelPurpose::ALL;
+    let index = all.iter().position(|p| *p == purpose).unwrap_or(0);
+    let next = if backwards {
+        index.checked_sub(1).unwrap_or(all.len() - 1)
+    } else {
+        (index + 1) % all.len()
+    };
+    all[next]
 }
 
 pub struct ModelPicker {
@@ -159,10 +120,8 @@ pub struct ModelPicker {
     available: Watch<Vec<String>>,
     recents: Vec<String>,
     current_spec: String,
-    goal_target: GoalEvaluatorTarget,
-    compaction_target: CompactionTarget,
-    title_target: TitleTarget,
-    mode: PickerMode,
+    purpose: ModelPurpose,
+    binding: Option<Binding>,
     needs_rebuild: bool,
     /// User-moved entry to restore on refresh: `(was_recent, spec)`.
     anchor: Option<(bool, String)>,
@@ -178,10 +137,8 @@ impl ModelPicker {
             available: Watch::default(),
             recents: Vec::new(),
             current_spec: String::new(),
-            goal_target: GoalEvaluatorTarget::Auto,
-            compaction_target: CompactionTarget::Auto,
-            title_target: TitleTarget::Auto,
-            mode: PickerMode::Chat,
+            purpose: ModelPurpose::Chat,
+            binding: None,
             needs_rebuild: false,
             anchor: None,
         }
@@ -193,35 +150,29 @@ impl ModelPicker {
     }
 
     pub fn open(&mut self, current_spec: &str) {
-        self.mode = PickerMode::Chat;
-        self.current_spec = current_spec.to_owned();
-        self.goal_target = model_registry::goal_evaluator_target();
-        self.compaction_target = model_registry::compaction_target();
-        self.title_target = model_registry::title_target();
-        self.anchor = None;
-        self.needs_rebuild = false;
-        self.picker.set_footer_builder(model_footer_line);
-        let _ = self.available.poll(self.models.load_full());
-        self.sync_empty_text();
-        let entries = self.load_entries();
-        self.picker.open(entries, self.mode.title());
-        self.preselect_mode();
+        self.open_purpose(current_spec, ModelPurpose::Chat);
     }
 
-    pub fn open_goal(&mut self, current_spec: &str, target: GoalEvaluatorTarget) {
-        self.mode = PickerMode::Goal;
+    pub fn open_purpose(&mut self, current_spec: &str, purpose: ModelPurpose) {
+        self.purpose = purpose;
         self.current_spec = current_spec.to_owned();
-        self.goal_target = target;
-        self.compaction_target = model_registry::compaction_target();
-        self.title_target = model_registry::title_target();
+        self.binding = model_registry::binding(purpose);
         self.anchor = None;
         self.needs_rebuild = false;
-        self.picker.set_footer_builder(assignment_footer_line);
+        self.picker.set_footer_builder(self.footer_builder());
         let _ = self.available.poll(self.models.load_full());
         self.sync_empty_text();
         let entries = self.load_entries();
-        self.picker.open(entries, self.mode.title());
-        self.preselect_mode();
+        self.picker.open(entries, title_for(purpose));
+        self.preselect_purpose();
+    }
+
+    fn footer_builder(&self) -> fn() -> Line<'static> {
+        if self.purpose == ModelPurpose::Chat {
+            model_footer_line
+        } else {
+            assignment_footer_line
+        }
     }
 
     /// Providers fetch their model lists in the background and drop them into
@@ -244,7 +195,7 @@ impl ModelPicker {
             self.picker
                 .select_item_by(|e| e.spec == *spec && e.suffix().is_some() == *was_recent);
         } else {
-            self.preselect_mode();
+            self.preselect_purpose();
         }
         Dirty::YES
     }
@@ -260,42 +211,22 @@ impl ModelPicker {
 
     fn load_entries(&self) -> Vec<ModelEntry> {
         let specs = self.available.get();
-        if self.mode == PickerMode::Goal {
-            let mut entries = goal_target_entries(&self.goal_target);
-            let mut models: Vec<ModelEntry> = specs
-                .map(|specs| {
-                    specs
-                        .iter()
-                        .filter_map(|spec| {
-                            let mut entry = parse_model_entry(spec)?;
-                            let target = GoalEvaluatorTarget::Model(spec.clone());
-                            entry.goal_assigned = self.goal_target == target;
-                            entry.goal_target = Some(target);
-                            if entry.goal_assigned {
-                                entry.tier = assignment_detail(&entry.tier, self.mode.label());
-                            }
-                            Some(entry)
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            sort_models(&mut models);
-            if let GoalEvaluatorTarget::Model(spec) = &self.goal_target
-                && !models.iter().any(|entry| entry.spec == *spec)
-            {
-                entries.push(saved_goal_model_entry(spec));
-            }
-            entries.extend(models);
-            return entries;
+        let mut entries = if self.purpose == ModelPurpose::Chat {
+            Vec::new()
+        } else {
+            binding_entries(self.purpose)
+        };
+        for entry in &mut entries {
+            self.mark_selection(entry);
         }
 
-        let mut entries = Vec::new();
+        let mut recents = Vec::new();
         for spec in &self.recents {
             if let Some(mut e) = parse_model_entry(spec) {
-                self.mark_assignment(&mut e);
+                self.mark_selection(&mut e);
                 e.suffix = Some(std::mem::take(&mut e.provider_display));
                 e.provider_display = RECENT_SECTION.to_string();
-                entries.push(e);
+                recents.push(e);
             }
         }
         let mut full: Vec<ModelEntry> = specs
@@ -303,67 +234,58 @@ impl ModelPicker {
                 s.iter()
                     .filter_map(|spec| {
                         let mut entry = parse_model_entry(spec)?;
-                        self.mark_assignment(&mut entry);
+                        self.mark_selection(&mut entry);
                         Some(entry)
                     })
                     .collect()
             })
             .unwrap_or_default();
-        if self.mode == PickerMode::Chat
+        if self.purpose == ModelPurpose::Chat
             && !self.current_spec.is_empty()
-            && !entries.iter().any(|entry| entry.spec == self.current_spec)
+            && !recents.iter().any(|entry| entry.spec == self.current_spec)
             && !full.iter().any(|entry| entry.spec == self.current_spec)
             && let Some(mut current) = parse_model_entry(&self.current_spec)
         {
-            self.mark_assignment(&mut current);
+            self.mark_selection(&mut current);
             full.push(current);
         }
         sort_models(&mut full);
-        entries.extend(full);
-        if let Some(spec) = self.assigned_spec()
-            && !entries.iter().any(|entry| entry.spec == spec)
+        if let Some(spec) = self.bound_spec()
+            && !recents.iter().any(|entry| entry.spec == spec)
+            && !full.iter().any(|entry| entry.spec == spec)
         {
-            entries.insert(0, saved_assignment_entry(&spec, self.mode.label()));
+            entries.push(saved_binding_entry(spec));
         }
+        entries.extend(recents);
+        entries.extend(full);
         entries
     }
 
-    fn mark_assignment(&self, entry: &mut ModelEntry) {
-        entry.goal_assigned = self.assigned_spec().is_some_and(|spec| spec == entry.spec);
-        if entry.goal_assigned {
-            entry.tier = assignment_detail(&entry.tier, self.mode.label());
+    /// Chat picks a session model, every other purpose picks a binding, so what
+    /// counts as the current row differs.
+    fn mark_selection(&self, entry: &mut ModelEntry) {
+        entry.selected = if self.purpose == ModelPurpose::Chat {
+            entry.spec == self.current_spec
+        } else {
+            entry.binds == self.binding
+        };
+    }
+
+    fn bound_spec(&self) -> Option<&str> {
+        match &self.binding {
+            Some(Binding::Exact(spec)) => Some(spec),
+            _ => None,
         }
     }
 
-    fn assigned_spec(&self) -> Option<String> {
-        match self.mode {
-            PickerMode::Goal => match &self.goal_target {
-                GoalEvaluatorTarget::Model(spec) => Some(spec.clone()),
-                _ => None,
-            },
-            PickerMode::Compact => match &self.compaction_target {
-                CompactionTarget::Model(spec) => Some(spec.clone()),
-                CompactionTarget::Auto => None,
-            },
-            PickerMode::Title => match &self.title_target {
-                TitleTarget::Model(spec) => Some(spec.clone()),
-                TitleTarget::Auto => None,
-            },
-            mode => mode
-                .preset_tier()
-                .and_then(model_registry::override_spec_for_tier),
-        }
-    }
-
-    fn preselect_mode(&mut self) {
-        if self.mode == PickerMode::Goal {
-            self.picker
-                .select_item_by(|entry| entry.goal_target.as_ref() == Some(&self.goal_target));
-        } else if let Some(spec) = self.assigned_spec() {
-            self.preselect_spec(&spec);
-        } else if self.mode == PickerMode::Chat {
+    fn preselect_purpose(&mut self) {
+        if self.purpose == ModelPurpose::Chat {
             let spec = self.current_spec.clone();
             self.preselect_spec(&spec);
+        } else if let Some(spec) = self.bound_spec().map(str::to_owned) {
+            self.preselect_spec(&spec);
+        } else {
+            self.picker.select_item_by(|entry| entry.selected);
         }
     }
 
@@ -428,69 +350,45 @@ impl ModelPicker {
             _ => None,
         };
         if let Some(backwards) = backwards {
-            self.mode = self.mode.shifted(backwards);
+            self.purpose = shifted(self.purpose, backwards);
+            self.binding = model_registry::binding(self.purpose);
             self.anchor = None;
-            self.picker.set_title(self.mode.title());
-            self.picker
-                .set_footer_builder(if self.mode == PickerMode::Chat {
-                    model_footer_line
-                } else {
-                    assignment_footer_line
-                });
+            self.picker.set_title(title_for(self.purpose));
+            self.picker.set_footer_builder(self.footer_builder());
             let entries = self.load_entries();
             self.picker.replace_items(entries);
-            self.preselect_mode();
+            self.preselect_purpose();
             return ModelPickerAction::Consumed;
         }
         if is_reset_key(key) {
             self.anchor = None;
             self.picker.clear_search();
             self.needs_rebuild = true;
-            return match self.mode {
-                PickerMode::Chat => {
-                    self.preselect_mode();
-                    ModelPickerAction::Consumed
-                }
-                PickerMode::Goal => {
-                    self.goal_target = GoalEvaluatorTarget::Auto;
-                    ModelPickerAction::SetGoalEvaluator(GoalEvaluatorTarget::Auto)
-                }
-                PickerMode::Compact => {
-                    self.compaction_target = CompactionTarget::Auto;
-                    ModelPickerAction::SetCompaction(CompactionTarget::Auto)
-                }
-                PickerMode::Title => {
-                    self.title_target = TitleTarget::Auto;
-                    ModelPickerAction::SetTitleModel(TitleTarget::Auto)
-                }
-                mode => ModelPickerAction::ResetTier(
-                    mode.preset_tier().expect("preset mode must have a tier"),
-                ),
-            };
+            if self.purpose == ModelPurpose::Chat {
+                self.preselect_purpose();
+                return ModelPickerAction::Consumed;
+            }
+            self.binding = None;
+            return ModelPickerAction::Unbind(self.purpose);
         }
         let action = self.picker.handle_key(key);
         self.map_picker_action(action)
     }
 
-    fn map_picker_action(&self, action: PickerAction<ModelEntry>) -> ModelPickerAction {
+    fn map_picker_action(&mut self, action: PickerAction<ModelEntry>) -> ModelPickerAction {
         match action {
             PickerAction::Consumed => ModelPickerAction::Consumed,
-            PickerAction::Select(entry) => match self.mode {
-                PickerMode::Chat => ModelPickerAction::Select(entry.spec),
-                PickerMode::Goal => ModelPickerAction::SetGoalEvaluator(
-                    entry.goal_target.unwrap_or(GoalEvaluatorTarget::Auto),
-                ),
-                PickerMode::Compact => {
-                    ModelPickerAction::SetCompaction(CompactionTarget::Model(entry.spec))
+            PickerAction::Select(entry) if self.purpose == ModelPurpose::Chat => {
+                ModelPickerAction::Select(entry.spec)
+            }
+            PickerAction::Select(entry) => {
+                self.binding = entry.binds.clone();
+                self.needs_rebuild = true;
+                match entry.binds {
+                    Some(binding) => ModelPickerAction::Bind(self.purpose, binding),
+                    None => ModelPickerAction::Unbind(self.purpose),
                 }
-                PickerMode::Title => {
-                    ModelPickerAction::SetTitleModel(TitleTarget::Model(entry.spec))
-                }
-                mode => ModelPickerAction::AssignTier(
-                    entry.spec,
-                    mode.preset_tier().expect("preset mode must have a tier"),
-                ),
-            },
+            }
             PickerAction::Close => ModelPickerAction::Close,
             PickerAction::Toggle(..) => ModelPickerAction::Consumed,
         }
@@ -501,41 +399,42 @@ impl ModelPicker {
     }
 }
 
-fn goal_target_entries(current: &GoalEvaluatorTarget) -> Vec<ModelEntry> {
-    [
-        ("Default", "fast, then chat", GoalEvaluatorTarget::Auto),
-        (
-            "Fast",
-            "global preset",
-            GoalEvaluatorTarget::Tier(ModelTier::Weak),
-        ),
-        (
-            "Balanced",
-            "global preset",
-            GoalEvaluatorTarget::Tier(ModelTier::Medium),
-        ),
-        (
-            "Best",
-            "global preset",
-            GoalEvaluatorTarget::Tier(ModelTier::Strong),
-        ),
-    ]
-    .into_iter()
-    .map(|(label, detail, target)| ModelEntry {
-        spec: format!("@goal:{target}"),
-        id: label.into(),
-        provider_display: TARGET_SECTION.into(),
-        suffix: None,
-        tier: detail.into(),
-        override_tiers: Vec::new(),
-        goal_assigned: &target == current,
-        goal_target: Some(target),
-        free: false,
-    })
-    .collect()
+/// Rows that bind a purpose to something other than one exact model: the unbound
+/// default, plus every slot this purpose may follow.
+fn binding_entries(purpose: ModelPurpose) -> Vec<ModelEntry> {
+    std::iter::once(binding_row(DEFAULT_ROW, DEFAULT_DETAIL, None))
+        .chain(
+            ModelPurpose::CLASSES
+                .into_iter()
+                .filter(|target| *target != purpose)
+                .map(|target| {
+                    binding_row(target.label(), SAME_DETAIL, Some(Binding::Same(target)))
+                }),
+        )
+        .collect()
 }
 
-fn saved_goal_model_entry(spec: &str) -> ModelEntry {
+fn binding_row(id: &str, detail: &str, binds: Option<Binding>) -> ModelEntry {
+    let spec = match &binds {
+        Some(Binding::Same(target)) => format!("@same:{target}"),
+        _ => format!("@{DEFAULT_DETAIL}"),
+    };
+    ModelEntry {
+        spec,
+        id: id.to_string(),
+        provider_display: TARGET_SECTION.into(),
+        suffix: None,
+        detail: detail.into(),
+        claimed_by: Vec::new(),
+        binds,
+        selected: false,
+        free: false,
+    }
+}
+
+/// A bound spec the provider no longer lists still has to be visible, otherwise
+/// the picker would show the purpose as unbound.
+fn saved_binding_entry(spec: &str) -> ModelEntry {
     let id = spec
         .split_once('/')
         .map_or(spec, |(_, model_id)| model_id)
@@ -545,19 +444,12 @@ fn saved_goal_model_entry(spec: &str) -> ModelEntry {
         id,
         provider_display: TARGET_SECTION.into(),
         suffix: None,
-        tier: "saved exact model".into(),
-        override_tiers: Vec::new(),
-        goal_target: Some(GoalEvaluatorTarget::Model(spec.to_string())),
-        goal_assigned: true,
+        detail: SAVED_DETAIL.into(),
+        claimed_by: Vec::new(),
+        binds: Some(Binding::Exact(spec.to_string())),
+        selected: true,
         free: false,
     }
-}
-
-fn saved_assignment_entry(spec: &str, purpose: &str) -> ModelEntry {
-    let mut entry = saved_goal_model_entry(spec);
-    entry.goal_target = None;
-    entry.tier = format!("saved {} model", purpose.to_ascii_lowercase());
-    entry
 }
 
 fn sort_models(models: &mut [ModelEntry]) {
@@ -569,13 +461,27 @@ fn sort_models(models: &mut [ModelEntry]) {
     });
 }
 
-fn assignment_detail(detail: &str, purpose: &str) -> String {
-    let purpose = purpose.to_ascii_lowercase();
-    if detail.is_empty() {
-        purpose
-    } else {
-        format!("{detail}/{purpose}")
+/// The dim right-hand column: what the provider files this model as, then which
+/// purposes point at it. A model nobody classified simply shows nothing there,
+/// because the old tier label filled that gap with a guess.
+fn row_detail(class: Option<ModelPurpose>, claimed_by: &[ModelPurpose], free: bool) -> String {
+    let mut parts = Vec::new();
+    if free {
+        parts.push(FREE_LABEL.to_string());
     }
+    if let Some(class) = class {
+        parts.push(class.label().to_string());
+    }
+    if !claimed_by.is_empty() {
+        parts.push(
+            claimed_by
+                .iter()
+                .map(|purpose| purpose.as_str())
+                .collect::<Vec<_>>()
+                .join("/"),
+        );
+    }
+    parts.join(DETAIL_SEPARATOR)
 }
 
 impl Overlay for ModelPicker {
@@ -609,35 +515,18 @@ fn parse_model_entry(spec: &str) -> Option<ModelEntry> {
         caudra_config::providers::resolve_display_name(provider_str, config.get(provider_str))
     };
 
-    let override_tiers = model_registry::override_tiers(spec);
-    let (tier, free) = match caudra_providers::Model::from_spec(spec) {
-        Ok(m) => (m.tier.to_string(), m.is_free()),
-        Err(_) => (String::new(), false),
-    };
-    let tier = if override_tiers.is_empty() {
-        tier
-    } else {
-        override_tiers
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join("/")
-    };
-    let tier = match (free, tier.is_empty()) {
-        (true, true) => FREE_LABEL.to_string(),
-        (true, false) => format!("{FREE_PREFIX}{tier}"),
-        (false, _) => tier,
-    };
-    let id = model_id.to_string();
+    let claimed_by = model_registry::purposes_bound_to(spec);
+    let free = caudra_providers::Model::from_spec(spec).is_ok_and(|model| model.is_free());
+    let class = caudra_providers::Model::class_of(provider_str, model_id);
     Some(ModelEntry {
         spec: spec.to_string(),
-        id,
+        id: model_id.to_string(),
         provider_display,
         suffix: None,
-        tier,
-        override_tiers,
-        goal_target: None,
-        goal_assigned: false,
+        detail: row_detail(class, &claimed_by, free),
+        claimed_by,
+        binds: Some(Binding::Exact(spec.to_string())),
+        selected: false,
         free,
     })
 }
@@ -655,6 +544,9 @@ mod tests {
 
     const SAME_SIZED_LIST: &str = "a republished list of the same length is still a new list";
     const SWAPPED_SPEC: &str = "zai/glm-5";
+    const SONNET_SPEC: &str = "anthropic/claude-sonnet-4-20250514";
+    const MISSING_SPEC: &str = "catalog-provider/vendor/model";
+    const UNCLASSIFIED_SPEC: &str = "anthropic/claude-nothing-curated";
     const MODEL_QUERY: &str = "view";
     const BEST_MATCH_SPEC: &str = "anthropic/view";
     const WEAKER_MATCH_SPEC: &str = "zai/xxview";
@@ -773,64 +665,49 @@ mod tests {
     }
 
     #[test]
-    fn goal_picker_selects_tier_target() {
+    fn binding_picker_points_a_purpose_at_another_slot() {
         let mut p = ModelPicker::new(test_models());
-        p.open_goal("", GoalEvaluatorTarget::Auto);
+        p.open_purpose("", ModelPurpose::Goal);
         p.handle_key(key(KeyCode::Down));
 
         let action = p.handle_key(key(KeyCode::Enter));
 
         assert!(matches!(
             action,
-            ModelPickerAction::SetGoalEvaluator(GoalEvaluatorTarget::Tier(ModelTier::Weak))
+            ModelPickerAction::Bind(ModelPurpose::Goal, Binding::Same(ModelPurpose::Fast))
         ));
     }
 
     #[test]
-    fn goal_picker_preselects_exact_model() {
+    fn binding_picker_binds_an_exact_model() {
         let mut p = ModelPicker::new(test_models());
-        p.open_goal("", GoalEvaluatorTarget::Model(SWAPPED_SPEC.into()));
+        p.open_purpose("", ModelPurpose::Goal);
+        p.picker
+            .select_item_by(|entry| entry.spec == SWAPPED_SPEC && entry.suffix().is_none());
 
         let action = p.handle_key(key(KeyCode::Enter));
 
         assert!(matches!(
             action,
-            ModelPickerAction::SetGoalEvaluator(GoalEvaluatorTarget::Model(spec))
-                if spec == SWAPPED_SPEC
+            ModelPickerAction::Bind(ModelPurpose::Goal, Binding::Exact(spec)) if spec == SWAPPED_SPEC
         ));
     }
 
+    /// A bound model the provider stopped listing still has to show up selected,
+    /// or the purpose would read as unbound and the next Enter would change it.
     #[test]
-    fn goal_picker_preserves_saved_exact_model_missing_from_discovery() {
-        let target = GoalEvaluatorTarget::Model("catalog-provider/vendor/model".into());
-        let models = Arc::new(ArcSwapOption::empty());
-        let mut p = ModelPicker::new(models);
-        p.open_goal("", target.clone());
-
-        let action = p.handle_key(key(KeyCode::Enter));
-
-        assert!(matches!(
-            action,
-            ModelPickerAction::SetGoalEvaluator(selected) if selected == target
-        ));
-    }
-
-    #[test]
-    fn goal_picker_refresh_keeps_unavailable_saved_exact_model_selected() {
-        let target = GoalEvaluatorTarget::Model("catalog-provider/vendor/model".into());
-        let models = Arc::new(ArcSwapOption::empty());
-        let mut p = ModelPicker::new(Arc::clone(&models));
-        p.open_goal("", target.clone());
-        models.store(Some(Arc::new(vec![
-            "anthropic/claude-sonnet-4-20250514".into(),
-        ])));
+    fn binding_picker_keeps_a_bound_model_missing_from_discovery() {
+        let mut p = ModelPicker::new(test_models());
+        p.open_purpose("", ModelPurpose::Goal);
+        p.binding = Some(Binding::Exact(MISSING_SPEC.into()));
+        p.needs_rebuild = true;
 
         assert_eq!(p.refresh(), Dirty::YES);
         let action = p.handle_key(key(KeyCode::Enter));
 
         assert!(matches!(
             action,
-            ModelPickerAction::SetGoalEvaluator(selected) if selected == target
+            ModelPickerAction::Bind(ModelPurpose::Goal, Binding::Exact(spec)) if spec == MISSING_SPEC
         ));
     }
 
@@ -857,7 +734,7 @@ mod tests {
     }
 
     #[test]
-    fn tab_switches_to_goal_and_reset_restores_default() {
+    fn tab_switches_purpose_and_reset_unbinds() {
         let spec = "anthropic/claude-opus-4-6-20260101";
         let mut p = ModelPicker::new(test_models());
         p.open(spec);
@@ -867,18 +744,18 @@ mod tests {
             ModelPickerAction::Consumed
         ));
         p.picker
-            .select_item_by(|entry| entry.spec == spec && entry.goal_target.is_some());
+            .select_item_by(|entry| entry.spec == spec && entry.suffix().is_none());
         let assign = p.handle_key(key(KeyCode::Enter));
 
         assert!(matches!(
             assign,
-            ModelPickerAction::SetGoalEvaluator(GoalEvaluatorTarget::Model(value)) if value == spec
+            ModelPickerAction::Bind(ModelPurpose::Fast, Binding::Exact(value)) if value == spec
         ));
-        p.open_goal(spec, GoalEvaluatorTarget::Model(spec.into()));
+        p.open_purpose(spec, ModelPurpose::Fast);
         let reset = p.handle_key(key(KeyCode::Char('R')));
         assert!(matches!(
             reset,
-            ModelPickerAction::SetGoalEvaluator(GoalEvaluatorTarget::Auto)
+            ModelPickerAction::Unbind(ModelPurpose::Fast)
         ));
         assert!(p.is_open());
     }
@@ -901,17 +778,38 @@ mod tests {
 
     #[test]
     fn parse_model_entry_valid() {
-        let entry = parse_model_entry("anthropic/claude-sonnet-4-20250514").unwrap();
+        let entry = parse_model_entry(SONNET_SPEC).unwrap();
         assert_eq!(entry.id, "claude-sonnet-4-20250514");
         assert_eq!(entry.provider_display, "Anthropic");
-        assert!(!entry.tier.is_empty());
+        assert_eq!(entry.binds, Some(Binding::Exact(SONNET_SPEC.into())));
+    }
+
+    /// The dim right-hand column carries the provider's own classification, so
+    /// a row says what it is worth before you bind anything to it.
+    #[test]
+    fn a_curated_model_shows_its_class() {
+        assert_eq!(
+            parse_model_entry(SONNET_SPEC).unwrap().detail,
+            ModelPurpose::Balanced.label()
+        );
+    }
+
+    /// An unclassified model shows nothing rather than a guessed class.
+    #[test]
+    fn an_unclassified_model_shows_no_class() {
+        assert!(
+            parse_model_entry(UNCLASSIFIED_SPEC)
+                .unwrap()
+                .detail
+                .is_empty()
+        );
     }
 
     #[test]
     fn parse_model_entry_paid_model_not_marked_free() {
-        let entry = parse_model_entry("anthropic/claude-sonnet-4-20250514").unwrap();
+        let entry = parse_model_entry(SONNET_SPEC).unwrap();
         assert!(
-            !entry.tier.starts_with(FREE_PREFIX),
+            !entry.detail.starts_with(FREE_LABEL),
             "paid anthropic model must not be marked free"
         );
     }
@@ -921,49 +819,48 @@ mod tests {
         assert!(parse_model_entry("no-slash").is_none());
     }
 
-    #[test_case(4, ModelTier::Weak     ; "fast")]
-    #[test_case(5, ModelTier::Medium   ; "balanced")]
-    #[test_case(6, ModelTier::Strong   ; "best")]
-    fn preset_modes_assign_selected_exact_model(tabs: usize, want: ModelTier) {
+    #[test_case(1, ModelPurpose::Fast     ; "fast")]
+    #[test_case(2, ModelPurpose::Balanced ; "balanced")]
+    #[test_case(3, ModelPurpose::Best     ; "best")]
+    #[test_case(4, ModelPurpose::Title    ; "title")]
+    #[test_case(5, ModelPurpose::Compact  ; "compact")]
+    #[test_case(6, ModelPurpose::Goal     ; "goal")]
+    fn tabbed_purpose_binds_selected_exact_model(tabs: usize, want: ModelPurpose) {
         let mut p = ModelPicker::new(test_models());
-        p.open("anthropic/claude-sonnet-4-20250514");
+        p.open(SONNET_SPEC);
         for _ in 0..tabs {
             p.handle_key(key(KeyCode::Tab));
         }
-        p.picker.select_item_by(|entry| {
-            entry.spec == "anthropic/claude-sonnet-4-20250514" && entry.suffix().is_none()
-        });
+        p.picker
+            .select_item_by(|entry| entry.spec == SONNET_SPEC && entry.suffix().is_none());
         let action = p.handle_key(key(KeyCode::Enter));
         assert!(
-            matches!(&action, ModelPickerAction::AssignTier(s, t)
-                if s == "anthropic/claude-sonnet-4-20250514" && *t == want),
-            "expected AssignTier(claude-sonnet, {want:?}), got something else",
+            matches!(&action, ModelPickerAction::Bind(purpose, Binding::Exact(spec))
+                if spec == SONNET_SPEC && *purpose == want),
+            "expected Bind({want:?}, {SONNET_SPEC}), got something else",
         );
         assert!(!p.is_open());
     }
 
     #[test]
-    fn shift_tab_wraps_from_chat_to_best() {
-        let spec = "anthropic/claude-sonnet-4-20250514";
+    fn shift_tab_wraps_from_chat_to_the_last_purpose() {
         let mut p = ModelPicker::new(test_models());
-        p.open(spec);
+        p.open(SONNET_SPEC);
         p.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT));
         p.picker
-            .select_item_by(|entry| entry.spec == spec && entry.suffix().is_none());
+            .select_item_by(|entry| entry.spec == SONNET_SPEC && entry.suffix().is_none());
 
         assert!(matches!(
             p.handle_key(key(KeyCode::Enter)),
-            ModelPickerAction::AssignTier(value, ModelTier::Strong) if value == spec
+            ModelPickerAction::Bind(ModelPurpose::Goal, Binding::Exact(spec)) if spec == SONNET_SPEC
         ));
     }
 
     #[test]
-    fn uppercase_r_resets_preset_while_lowercase_r_filters() {
+    fn uppercase_r_unbinds_while_lowercase_r_filters() {
         let mut p = ModelPicker::new(test_models());
         p.open("");
-        for _ in 0..4 {
-            p.handle_key(key(KeyCode::Tab));
-        }
+        p.handle_key(key(KeyCode::Tab));
 
         assert!(matches!(
             p.handle_key(key(KeyCode::Char('r'))),
@@ -971,7 +868,7 @@ mod tests {
         ));
         assert!(matches!(
             p.handle_key(key(KeyCode::Char('R'))),
-            ModelPickerAction::ResetTier(ModelTier::Weak)
+            ModelPickerAction::Unbind(ModelPurpose::Fast)
         ));
         assert!(p.is_open());
     }
@@ -990,57 +887,6 @@ mod tests {
         assert!(matches!(
             p.handle_key(key(KeyCode::Enter)),
             ModelPickerAction::Select(spec) if spec == current
-        ));
-    }
-
-    #[test]
-    fn compact_mode_assigns_and_resets_exact_model() {
-        let spec = "anthropic/claude-sonnet-4-20250514";
-        let mut p = ModelPicker::new(test_models());
-        p.open(spec);
-        p.handle_key(key(KeyCode::Tab));
-        p.handle_key(key(KeyCode::Tab));
-        p.picker
-            .select_item_by(|entry| entry.spec == spec && entry.suffix().is_none());
-
-        assert!(matches!(
-            p.handle_key(key(KeyCode::Enter)),
-            ModelPickerAction::SetCompaction(CompactionTarget::Model(value)) if value == spec
-        ));
-
-        p.open(spec);
-        p.handle_key(key(KeyCode::Tab));
-        p.handle_key(key(KeyCode::Tab));
-        assert!(matches!(
-            p.handle_key(key(KeyCode::Char('R'))),
-            ModelPickerAction::SetCompaction(CompactionTarget::Auto)
-        ));
-    }
-
-    #[test]
-    fn title_mode_assigns_and_resets_exact_model() {
-        const TABS_TO_TITLE: usize = 3;
-        let spec = "anthropic/claude-sonnet-4-20250514";
-        let mut p = ModelPicker::new(test_models());
-        p.open(spec);
-        for _ in 0..TABS_TO_TITLE {
-            p.handle_key(key(KeyCode::Tab));
-        }
-        p.picker
-            .select_item_by(|entry| entry.spec == spec && entry.suffix().is_none());
-
-        assert!(matches!(
-            p.handle_key(key(KeyCode::Enter)),
-            ModelPickerAction::SetTitleModel(TitleTarget::Model(value)) if value == spec
-        ));
-
-        p.open(spec);
-        for _ in 0..TABS_TO_TITLE {
-            p.handle_key(key(KeyCode::Tab));
-        }
-        assert!(matches!(
-            p.handle_key(key(KeyCode::Char('R'))),
-            ModelPickerAction::SetTitleModel(TitleTarget::Auto)
         ));
     }
 
@@ -1262,7 +1108,7 @@ mod tests {
         register_openrouter_models();
         let entry = parse_model_entry(OX_SPEC).unwrap();
         assert!(
-            entry.tier.starts_with(FREE_PREFIX),
+            entry.detail.starts_with(FREE_LABEL),
             "zero-priced discovery must mark the entry free"
         );
     }
@@ -1272,7 +1118,7 @@ mod tests {
         register_openrouter_models();
         let entry = parse_model_entry(&format!("openrouter/{PAID_ID}")).unwrap();
         assert!(
-            !entry.tier.starts_with(FREE_PREFIX),
+            !entry.detail.starts_with(FREE_LABEL),
             "paid discovery must not mark the entry free"
         );
     }

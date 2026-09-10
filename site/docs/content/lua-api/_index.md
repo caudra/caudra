@@ -793,30 +793,31 @@ sess:close()
 caudra.agent.resolve_model({ctx}, {opts?})
 ```
 
-Look up the model that the current agent is using, or pick a cheaper one.
-You might want a cheaper model for simple subtasks (summaries, classification)
-without hard-coding a model name.
+Look up the model that the current agent is using, or the one bound to
+another purpose. Ask for `"fast"` when a subtask is simple (summaries,
+classification) instead of hard-coding a model name.
 
-The returned table has fields: `id` (string), `tier` (string),
-`provider` (string), `spec` (string).
+The returned table has fields: `id` (string), `provider` (string),
+`spec` (string).
 
 **Parameters:**
 
 - `{ctx}` (`LuaCtx`) Agent context.
 - `{opts?}` (`table?`) Optional fields:
-  - `tier` (`string?`) target tier, one of `"weak"`, `"medium"`, `"strong"`. Clamped to
-    the parent tier so you cannot escalate.
+  - `purpose` (`string?`) which binding to resolve, one of `"chat"`, `"fast"`,
+    `"balanced"`, `"best"`, `"title"`, `"compact"`, `"goal"`. Resolves to the
+    model the user bound, or that purpose's default.
   - `spec` (`string?`) exact `provider/model` spec, e.g. `"anthropic/claude-haiku-4-5"`.
-    Takes precedence over `tier`.
+    Takes precedence over `purpose`.
 
 **Returns:** (`table?`, `string?`) Model table on success, or `(nil, err)` on failure.
 
 **Example:**
 
 ```lua
-local model, err = caudra.agent.resolve_model(ctx, { tier = "weak" })
+local model, err = caudra.agent.resolve_model(ctx, { purpose = "fast" })
 if err then error(err) end
-print(model.spec, model.tier)
+print(model.spec)
 ```
 
 ---

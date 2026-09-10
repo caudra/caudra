@@ -238,11 +238,9 @@ mod tests {
 
     /// Every former standalone file, with the name and lock name it had
     /// before consolidation and a payload the old reader would have accepted.
-    const LEGACY_STATE_FILES: [(&str, &str); 13] = [
+    const LEGACY_STATE_FILES: [(&str, &str); 11] = [
         ("model", "legacy/model"),
         ("recent-models", "legacy/one\nlegacy/two"),
-        ("model-tiers", "legacy/model=fast"),
-        ("model-roles", "legacy/model=plan"),
         ("view", "compact"),
         ("theme", "legacy-theme"),
         ("provider-scripts.json", r#"{"legacy":{"models":[]}}"#),

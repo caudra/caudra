@@ -31,7 +31,7 @@ use caudra_lua::{
 };
 use caudra_providers::Timeouts;
 use caudra_providers::provider::{Provider, fetch_all_models, from_model};
-use caudra_providers::{HistoryItem, Message, Model, ModelTier};
+use caudra_providers::{HistoryItem, Message, Model};
 use caudra_storage::StateDir;
 use caudra_storage::StorageError;
 use caudra_storage::id::{CaudraId, CaudraIdParseError, SessionRef};
@@ -86,6 +86,7 @@ const CWD_REVERT_ERR: &str = "Resolve pending reverts before changing directory"
 const NOTHING_TO_NAME_ERR: &str = "Nothing said yet, so there is nothing to name";
 const NO_TITLE_ERR: &str = "The model returned nothing usable";
 const NAMING_SESSION: &str = "Naming the session…";
+const UNBOUND_FLASH: &str = "default";
 
 /// The prompt that opened a session, which is what its title is about.
 fn opening_prompt<M: TitleSource>(messages: &[M]) -> Result<String, String> {
@@ -96,14 +97,6 @@ fn opening_prompt<M: TitleSource>(messages: &[M]) -> Result<String, String> {
         .filter(|text| !text.is_empty())
         .map(str::to_owned)
         .ok_or_else(|| NOTHING_TO_NAME_ERR.to_owned())
-}
-
-fn preset_label(tier: ModelTier) -> &'static str {
-    match tier {
-        ModelTier::Weak => "Fast",
-        ModelTier::Medium => "Balanced",
-        ModelTier::Strong => "Best",
-    }
 }
 
 /// Tabs carry their in-memory sessions so `/reload` reopens them without a
@@ -2407,48 +2400,24 @@ impl<'t> EventLoop<'t> {
                         .flash(format!("{} login failed: {error}", provider.display_name())),
                 }
             }
-            Action::AssignTier(spec, tier) => {
-                caudra_providers::model_registry::set_and_persist(
-                    spec.clone(),
-                    tier,
+            Action::Bind(purpose, binding) => {
+                caudra_providers::model_registry::set_binding_and_persist(
+                    purpose,
+                    binding.clone(),
                     &self.ctx.storage,
                 );
                 self.sessions[idx]
                     .app
-                    .flash(format!("{} model: {spec}", preset_label(tier)));
+                    .flash(format!("{} model: {binding}", purpose.label()));
             }
-            Action::ResetTier(tier) => {
-                caudra_providers::model_registry::reset_tier_and_persist(tier, &self.ctx.storage);
-                self.sessions[idx]
-                    .app
-                    .flash(format!("{} model: default", preset_label(tier)));
-            }
-            Action::SetGoalEvaluator(target) => {
-                caudra_providers::model_registry::set_goal_evaluator_and_persist(
-                    target.clone(),
+            Action::Unbind(purpose) => {
+                caudra_providers::model_registry::clear_binding_and_persist(
+                    purpose,
                     &self.ctx.storage,
                 );
                 self.sessions[idx]
                     .app
-                    .flash(format!("Goal evaluator: {target}"));
-            }
-            Action::SetCompaction(target) => {
-                caudra_providers::model_registry::set_compaction_and_persist(
-                    target.clone(),
-                    &self.ctx.storage,
-                );
-                self.sessions[idx]
-                    .app
-                    .flash(format!("Compaction model: {target}"));
-            }
-            Action::SetTitleModel(target) => {
-                caudra_providers::model_registry::set_title_model_and_persist(
-                    target.clone(),
-                    &self.ctx.storage,
-                );
-                self.sessions[idx]
-                    .app
-                    .flash(format!("Title model: {target}"));
+                    .flash(format!("{} model: {UNBOUND_FLASH}", purpose.label()));
             }
             Action::Compact => {
                 let rt = &mut self.sessions[idx];

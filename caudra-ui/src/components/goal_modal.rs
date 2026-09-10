@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use caudra_agent::{GoalStatus, GoalVerdict, MAX_GOAL_CONTINUATION_LIMIT};
-use caudra_providers::model_registry::GoalEvaluatorTarget;
+use caudra_providers::model_registry::Binding;
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
@@ -22,6 +22,7 @@ const GOAL_MODEL: &str = "/goal-model";
 const GOAL_START: &str = "/goal <condition>";
 const SEPARATOR: &str = " · ";
 const CLOSE_HINT: &str = " · Esc close";
+const UNBOUND_EVALUATOR: &str = "default (fast, then chat)";
 
 pub struct GoalModal {
     open: bool,
@@ -101,7 +102,7 @@ impl GoalModal {
         frame: &mut Frame,
         area: Rect,
         status: Option<&GoalStatus>,
-        evaluator: &GoalEvaluatorTarget,
+        evaluator: Option<&Binding>,
         continuation_limit: u32,
     ) -> Rect {
         if !self.open {
@@ -194,7 +195,7 @@ fn footer(active: bool) -> FooterLine {
 
 fn status_lines(
     status: Option<&GoalStatus>,
-    evaluator: &GoalEvaluatorTarget,
+    evaluator: Option<&Binding>,
     continuation_limit: u32,
 ) -> Vec<Line<'static>> {
     let theme = theme::current();
@@ -280,12 +281,8 @@ fn status_lines(
     lines
 }
 
-fn evaluator_line(target: &GoalEvaluatorTarget) -> Line<'static> {
-    let value = match target {
-        GoalEvaluatorTarget::Auto => "auto (weak, then current model)".into(),
-        GoalEvaluatorTarget::Tier(tier) => format!("{tier} (active provider)"),
-        GoalEvaluatorTarget::Model(spec) => spec.clone(),
-    };
+fn evaluator_line(binding: Option<&Binding>) -> Line<'static> {
+    let value = binding.map_or_else(|| UNBOUND_EVALUATOR.to_string(), Binding::to_string);
     Line::from(vec![
         Span::styled("Evaluator  ", theme::current().tool_dim),
         Span::raw(value),
@@ -357,7 +354,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT)).unwrap();
         terminal
             .draw(|frame| {
-                modal.view(frame, frame.area(), status, &GoalEvaluatorTarget::Auto, 16);
+                modal.view(frame, frame.area(), status, None, 16);
             })
             .unwrap();
         terminal

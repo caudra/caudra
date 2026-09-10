@@ -1,6 +1,7 @@
 use caudra_providers::EFFORT_LEVELS;
+use caudra_providers::ModelPurpose;
 use caudra_providers::manifest::ManifestRegistry;
-use caudra_providers::model::{ModelEntry, ModelTier};
+use caudra_providers::model::ModelEntry;
 use caudra_providers::provider::ProviderKind;
 use std::fmt::Write;
 use strum::IntoEnumIterator;
@@ -12,9 +13,26 @@ weight = 5
 group = "Reference"
 +++"#;
 
-const TIER_PICKER_NOTE: &str = r#"Open the model picker with `/model`. Use `Tab` and `Shift+Tab` to switch between Chat, Goal, Compact, Title, Fast, Balanced, and Best. `Enter` selects or assigns the highlighted row for that purpose. Uppercase `R` resets the displayed purpose.
+const PURPOSE_PICKER_NOTE: &str = r#"Open the model picker with `/model`. Use `Tab` and `Shift+Tab` to switch between Chat, Fast, Balanced, Best, Title, Compact, and Goal. `Enter` binds the highlighted row to the displayed purpose, and uppercase `R` clears the binding.
 
-Fast, Balanced, and Best are global exact-model presets saved in the `model.tiers` row of Caudra's SQLite state database. Goal, Compact, and Title use its `model.roles` row. Without an exact preset, tiered workloads choose a matching model from the active provider. Default Goal tries Fast and then uses the chat model. Default Compact uses the chat model. Default Title uses the weak tier of the active provider and falls back to the chat model. See [Sessions](/docs/sessions/#titles) for what the Title role does."#;
+A purpose is bound either to an exact `provider/model-id` or to another purpose, and every binding lives in the `model.purposes` row of Caudra's SQLite state database. Chat is the model the conversation runs on; the rest bind a workload.
+
+An unbound purpose is not an error, it just means the caller applies its own rule. Compact uses the chat model, because compaction reads the whole conversation and a small window cannot hold what it must summarize. Title and Goal follow Fast. Fast, Balanced, and Best ask the active provider: a `purposes` declaration in `providers.toml` first, then Caudra's curated table for that provider. Fast then tries the cheapest model the provider published a price for, or on a local runtime where everything is priced at zero, the one with the fewest parameters. Balanced and Best stop at the curated table, because cheapness is a sound proxy for the Fast slot and an unsound one for capability. Anything still unresolved falls back to the chat model. See [Sessions](/docs/sessions/#titles) for what Title does.
+
+## Model classes
+
+The picker and `caudra models` show a dim **Fast**, **Balanced**, or **Best** beside a model: how its provider classifies it, taken from `purposes` in `providers.toml` first and then the curated table. Aggregators such as OpenRouter carry no catalog of their own, so a vendor-prefixed id borrows the class of the upstream vendor's entry.
+
+A blank class means nobody classified that model, which is the normal state for local runtimes and custom endpoints. Caudra does not infer one from price or list position. Declare `purposes` for that provider to fill it in.
+
+`purposes` entries match by prefix, so an endpoint serving a family of fine-tunes needs one line rather than one per variant:
+
+```toml
+[my-server.purposes]
+fast = "qwen3.8-27b"   # covers qwen3.8-27b, qwen3.8-27b-canary, qwen3.8-27b-math7, ...
+```
+
+The first entry doubles as the id that wins the slot, so it has to name a model the endpoint actually serves. A prefix that matches nothing live would send requests to an id that does not exist."#;
 
 const AUTH_RELOADING: &str = r#"## Auth Reloading
 
@@ -176,9 +194,12 @@ api_key_env = "MY_PROXY_API_KEY"
 default_model = "my-proxy/fast-v1"
 discover_models = true         # also list models via the provider's /models endpoint
 
+[my-proxy.purposes]
+fast = "fast-v1"               # a prefix: also covers fast-v1-turbo, fast-v1-lora, ...
+best = ["smart-v1", "smart-v0"]   # a list when one prefix cannot span them
+
 [[my-proxy.models]]
 id = "fast-v1"
-tier = "weak"
 context_window = 128000
 max_output_tokens = 16384
 pricing_input = 0.5
@@ -186,7 +207,6 @@ pricing_output = 1.5
 
 [[my-proxy.models]]
 id = "smart-v1"
-tier = "strong"
 context_window = 200000
 max_output_tokens = 32000
 supports_thinking = true
@@ -207,6 +227,7 @@ supports_vision = false
 | `discover_models` | bool | When true, also probe the provider's model list endpoint (default false) |
 | `enable_free_models` | bool | Opencode only. Show free catalog models (default false) |
 | `model_defaults` | table | Model fields applied to every model of this provider (see below) |
+| `purposes` | table | Model id prefixes per workload: `chat`, `fast`, `balanced`, `best`, `title`, `compact`, `goal`. A string or a list, first entry winning the slot. Outranked by a binding made in the picker |
 | `models` | array | Declared models for custom providers (see below) |
 | `overrides` | table | Aperture only. Per-upstream model overrides (see below) |
 
@@ -215,7 +236,6 @@ supports_vision = false
 | Field | Type | Default | Notes |
 |-------|------|---------|-------|
 | `id` | string | required | Model id. Spec becomes `{{slug}}/{{id}}` |
-| `tier` | string | `medium` | `weak`, `medium`, or `strong` |
 | `context_window` | u32 | protocol default | Tokens of context |
 | `max_output_tokens` | u32 | protocol default | Max completion tokens |
 | `supports_tool_examples` | bool | false | Send tool examples as a structured field. Off unless declared, because the protocol says nothing about the weights behind it |
@@ -238,10 +258,10 @@ reasoning_options = []
 
 [[my-proxy.models]]
 id = "smart-v1"
-tier = "strong"
+max_output_tokens = 64000
 ```
 
-It takes the same fields as a `models` entry apart from `id`, and applies to every model of the provider including discovered ones. A matching `models` entry wins field by field, so `smart-v1` above is strong with a 229376-token window. Anything a model neither declares nor inherits falls back to discovery, then to the protocol default.
+It takes the same fields as a `models` entry apart from `id`, and applies to every model of the provider including discovered ones. A matching `models` entry wins field by field, so `smart-v1` above keeps the 229376-token window and raises only its output cap. Anything a model neither declares nor inherits falls back to discovery, then to the protocol default.
 
 `reasoning_options = []` is a declaration, not an omission: it says the endpoint takes no reasoning controls, so Caudra sends no `reasoning_effort`. Leaving it unset instead lets a thinking level chosen for another model reach an endpoint that rejects it.
 
@@ -301,10 +321,10 @@ The `base` field specifies which built-in provider to inherit the model catalog 
 If your provider serves models not in the base catalog, add a `models` subcommand returning:
 
 ```json
-[{{"id": "my-model-v2", "tier": "strong", "context_window": 200000, "max_output_tokens": 16384}}]
+[{{"id": "my-model-v2", "context_window": 200000, "max_output_tokens": 16384}}]
 ```
 
-Only `id` is required. Optional fields: `tier` (default `medium`), `context_window` (128K), `max_output_tokens` (16K), `pricing` (`{{input, output, cache_write, cache_read}}`, all per 1M tokens), `supports_tool_examples` (defaults to the base provider's setting), `supports_thinking` (defaults to the base provider's setting), `requires_thinking` (default false; for APIs that reject requests with thinking off, raises it to minimal effort and implies `supports_thinking`), `supports_vision` (defaults to the base provider's setting; when false, image input and the `view_image` tool are disabled). The first model listed per tier is used for sub-agents. Without this subcommand, the base provider's models are used.
+Only `id` is required. Optional fields: `context_window` (128K), `max_output_tokens` (16K), `pricing` (`{{input, output, cache_write, cache_read}}`, all per 1M tokens), `supports_tool_examples` (defaults to the base provider's setting), `supports_thinking` (defaults to the base provider's setting), `requires_thinking` (default false; for APIs that reject requests with thinking off, raises it to minimal effort and implies `supports_thinking`), `supports_vision` (defaults to the base provider's setting; when false, image input and the `view_image` tool are disabled). Without this subcommand, the base provider's models are used.
 
 A `llama-cpp` model can replace Caudra's token-budget mapping with its native thinking fields. Each thinking mode maps to a JSON fragment merged into the request body:
 
@@ -346,14 +366,6 @@ Dynamic provider models are namespaced as `{{slug}}/{{model_id}}` (e.g. `myproxy
         valid_values.join(", "),
         efforts.join(", "),
     )
-}
-
-fn tier_label(tier: ModelTier) -> &'static str {
-    match tier {
-        ModelTier::Weak => "Weak",
-        ModelTier::Medium => "Medium",
-        ModelTier::Strong => "Strong",
-    }
 }
 
 fn format_pricing(entry: &ModelEntry) -> String {
@@ -477,22 +489,22 @@ fn build_sections() -> Vec<ProviderSection> {
 fn write_model_table(out: &mut String, entries: &[ModelEntry]) {
     let _ = writeln!(
         out,
-        "| Tier | Models | Pricing (in/out per 1M tokens) | Context |"
+        "| Purpose | Models | Pricing (in/out per 1M tokens) | Context |"
     );
     let _ = writeln!(
         out,
-        "|------|--------|-------------------------------|---------|"
+        "|---------|--------|-------------------------------|---------|"
     );
 
-    // A row per model, not per tier: prices and context sizes differ inside a
-    // tier, so one merged row would quote a single model's numbers for all.
-    for tier in [ModelTier::Weak, ModelTier::Medium, ModelTier::Strong] {
-        for entry in entries.iter().filter(|e| e.tier == tier) {
+    // A row per model, not per purpose: prices and context sizes differ inside
+    // a purpose, so one merged row would quote a single model's numbers for all.
+    for purpose in ModelPurpose::CLASSES {
+        for entry in entries.iter().filter(|e| e.purpose == purpose) {
             let names = entry.prefixes.join(", ");
             let _ = writeln!(
                 out,
                 "| {} | {} | {} | {} |",
-                tier_label(tier),
+                purpose.label(),
                 if entry.default {
                     format!("**{names}** (default)")
                 } else {
@@ -507,13 +519,7 @@ fn write_model_table(out: &mut String, entries: &[ModelEntry]) {
     let defaults: Vec<String> = entries
         .iter()
         .filter(|e| e.default)
-        .map(|e| {
-            format!(
-                "{} ({})",
-                e.prefixes.first().unwrap_or(&"?"),
-                tier_label(e.tier).to_lowercase(),
-            )
-        })
+        .map(|e| format!("{} ({})", e.prefixes.first().unwrap_or(&"?"), e.purpose,))
         .collect();
 
     if !defaults.is_empty() {
@@ -604,13 +610,14 @@ pub fn generate() -> String {
     let _ = writeln!(out, "# Providers\n");
     let _ = writeln!(
         out,
-        "Caudra talks to LLM providers over their HTTP APIs. \
-         Models are split into three capability tiers: **weak** (cheap and fast), \
-         **medium** (balanced), and **strong** (highest capability, highest cost). \
-         Compaction and session titling are separate workload roles rather than \
-         capability tiers.\n"
+        "Caudra talks to LLM providers over their HTTP APIs. Each workload \
+         resolves through a **purpose**: **Chat** is the conversation, **Fast**, \
+         **Balanced**, and **Best** name how much capability a caller is asking \
+         for, and **Title**, **Compact**, and **Goal** are the background \
+         workloads. Binding a purpose says which model serves it; leaving one \
+         unbound lets Caudra pick.\n"
     );
-    let _ = writeln!(out, "{TIER_PICKER_NOTE}\n");
+    let _ = writeln!(out, "{PURPOSE_PICKER_NOTE}\n");
     let _ = writeln!(out, "{AUTH_RELOADING}\n");
     let _ = writeln!(out, "{BASE_URL_OVERRIDES}\n");
     let _ = writeln!(out, "## Built-in Providers\n");

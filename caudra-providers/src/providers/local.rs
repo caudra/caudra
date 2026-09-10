@@ -321,7 +321,6 @@ impl LocalEndpoint {
                     supports_thinking: None,
                     supports_vision,
                     reasoning_options: None,
-                    tier: None,
                     provider_info: None,
                 })
             })
@@ -425,15 +424,15 @@ impl LocalEndpoint {
         let futures: Vec<_> = body
             .data
             .iter()
-            .map(|m| ollama_fetch_context_window(compat, auth, root, &m.id))
+            .map(|m| ollama_fetch_details(compat, auth, root, &m.id))
             .collect();
-        let context_windows = join_all(futures).await;
+        let details = join_all(futures).await;
 
         let mut models: Vec<crate::model::ModelInfo> = body
             .data
             .into_iter()
-            .zip(context_windows)
-            .map(|(m, context_window)| crate::model::ModelInfo {
+            .zip(details)
+            .map(|(m, (context_window, info))| crate::model::ModelInfo {
                 id: m.id,
                 context_window,
                 max_output_tokens: None,
@@ -441,8 +440,7 @@ impl LocalEndpoint {
                 supports_thinking: None,
                 supports_vision: None,
                 reasoning_options: None,
-                tier: None,
-                provider_info: None,
+                provider_info: Some(Arc::new(info)),
             })
             .collect();
         models.sort_by(|a, b| a.id.cmp(&b.id));
@@ -450,12 +448,43 @@ impl LocalEndpoint {
     }
 }
 
-async fn ollama_fetch_context_window(
+/// What one `/api/show` call tells us about a local model. Parameter count
+/// rides along because the call is already being made for the context window,
+/// and a local endpoint prices everything at zero, so size is the only cheapness
+/// signal the Fast slot has to go on.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct OllamaModelInfo {
+    pub parameter_count: Option<u64>,
+}
+
+async fn ollama_fetch_details(
     compat: &OpenAiCompatProvider,
     auth: &ResolvedAuth,
     root: &str,
     model_id: &str,
-) -> Option<u32> {
+) -> (Option<u32>, OllamaModelInfo) {
+    let show = ollama_show(compat, auth, root, model_id).await;
+    let Some(show) = show else {
+        return (None, OllamaModelInfo::default());
+    };
+    let context_window = show
+        .model_info
+        .as_ref()
+        .and_then(ollama_extract_context_length)
+        .or_else(|| show.parameters.as_deref().and_then(ollama_extract_num_ctx));
+    let parameter_count = show
+        .model_info
+        .as_ref()
+        .and_then(ollama_extract_parameter_count);
+    (context_window, OllamaModelInfo { parameter_count })
+}
+
+async fn ollama_show(
+    compat: &OpenAiCompatProvider,
+    auth: &ResolvedAuth,
+    root: &str,
+    model_id: &str,
+) -> Option<OllamaShowResponse> {
     let show_url = format!("{root}/api/show");
     let body = json!({"model": model_id});
     let json_body = serde_json::to_vec(&body).ok()?;
@@ -470,27 +499,20 @@ async fn ollama_fetch_context_window(
             return None;
         }
     };
-    let show: OllamaShowResponse = match serde_json::from_str(&text) {
-        Ok(s) => s,
+    match serde_json::from_str(&text) {
+        Ok(show) => Some(show),
         Err(e) => {
             warn!(model = model_id, error = %e, "Failed to parse Ollama /api/show response");
-            return None;
+            None
         }
-    };
-
-    if let Some(ref info) = show.model_info
-        && let Some(ctx) = ollama_extract_context_length(info)
-    {
-        return Some(ctx);
     }
+}
 
-    if let Some(ref params) = show.parameters
-        && let Some(ctx) = ollama_extract_num_ctx(params)
-    {
-        return Some(ctx);
-    }
-
-    None
+fn ollama_extract_parameter_count(info: &serde_json::Map<String, Value>) -> Option<u64> {
+    info.iter()
+        .find(|(k, _)| k.ends_with("parameter_count"))
+        .and_then(|(_, v)| v.as_u64())
+        .filter(|count| *count > 0)
 }
 
 fn ollama_extract_context_length(info: &serde_json::Map<String, Value>) -> Option<u32> {

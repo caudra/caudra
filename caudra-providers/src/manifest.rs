@@ -1,6 +1,6 @@
 use caudra_storage::thinking::ReasoningOptions;
 
-use crate::model::{ModelEntry, ModelFamily, ModelTier};
+use crate::model::{ModelEntry, ModelFamily, ModelPurpose};
 use crate::pricing::PricingSchedule;
 use crate::providers::{
     anthropic, aperture, copilot, custom, deepseek, dynamic, google, llama_cpp, mistral, ollama,
@@ -287,11 +287,52 @@ impl ManifestRegistry {
         BUILTINS
     }
 
-    pub fn find_default_for_tier(slug: &str, tier: ModelTier) -> Option<&'static ModelEntry> {
-        Self::for_slug(slug)?
+    /// Keyed by the real builtin slug, never a borrowed base: a custom provider
+    /// serves whatever its operator loaded, so inheriting a curated default
+    /// through its protocol would name an id that provider does not have.
+    pub fn find_default_for_purpose(
+        slug: &str,
+        purpose: ModelPurpose,
+    ) -> Option<&'static ModelEntry> {
+        Self::get(slug)?
             .models
             .iter()
-            .find(|e| e.default && e.tier == tier)
+            .find(|e| e.default && e.purpose == purpose)
+    }
+
+    /// Which slot the curated table files `model_id` under. The longest prefix
+    /// wins, so a table listing both a family and one of its members answers
+    /// with the member rather than whichever entry happens to come first.
+    pub fn purpose_for_model(slug: &str, model_id: &str) -> Option<ModelPurpose> {
+        Self::get(slug)?
+            .models
+            .iter()
+            .filter_map(|entry| {
+                entry
+                    .prefixes
+                    .iter()
+                    .filter(|prefix| model_id.starts_with(*prefix))
+                    .map(|prefix| (prefix.len(), entry.purpose))
+                    .max()
+            })
+            .max()
+            .map(|(_, purpose)| purpose)
+    }
+
+    /// Every curated candidate for a slot, the declared default first, so a
+    /// caller filtering on a model policy can take the next best rather than
+    /// giving up on the provider.
+    pub fn prefixes_for_purpose(slug: &str, purpose: ModelPurpose) -> Vec<&'static str> {
+        let Some(manifest) = Self::get(slug) else {
+            return Vec::new();
+        };
+        let mut entries: Vec<_> = manifest
+            .models
+            .iter()
+            .filter(|e| e.purpose == purpose)
+            .collect();
+        entries.sort_by_key(|e| !e.default);
+        entries.iter().flat_map(|e| e.prefixes).copied().collect()
     }
 }
 

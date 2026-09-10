@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use tracing::warn;
 
 use crate::model::{
-    Model, ModelEntry, ModelFamily, ModelPricing, ModelTier, StaticReasoningOption,
+    Model, ModelEntry, ModelFamily, ModelPricing, ModelPurpose, StaticReasoningOption,
 };
 use crate::provider::{BoxFuture, Provider};
 use crate::{
@@ -39,7 +39,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
     const MODELS: &[ModelEntry] = &[
         ModelEntry {
             prefixes: &["gemini-2.5-pro"],
-            tier: ModelTier::Strong,
+            purpose: ModelPurpose::Best,
             family: ModelFamily::Gemini,
             vision: true,
             default: true,
@@ -60,7 +60,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["gemini-2.5-flash"],
-            tier: ModelTier::Medium,
+            purpose: ModelPurpose::Balanced,
             family: ModelFamily::Gemini,
             vision: true,
             default: true,
@@ -84,7 +84,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["gemini-2.0-flash-lite"],
-            tier: ModelTier::Weak,
+            purpose: ModelPurpose::Fast,
             family: ModelFamily::Gemini,
             vision: true,
             default: true,
@@ -716,7 +716,6 @@ mod tests {
         Model {
             id: "gemini-2.5-flash".into(),
             provider: Arc::<str>::from("google"),
-            tier: ModelTier::Medium,
             family: ModelFamily::Gemini,
             supports_vision_override: Some(true),
             supports_tool_examples_override: None,

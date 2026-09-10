@@ -4,7 +4,7 @@ use caudra_storage::id::SessionRef;
 use flume::Sender;
 use serde_json::Value;
 
-use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelTier};
+use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelPurpose};
 use crate::provider::{BoxFuture, Provider};
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
 
@@ -36,7 +36,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
     const MODELS: &[ModelEntry] = &[
         ModelEntry {
             prefixes: &["hf:moonshotai/Kimi-K2.5"],
-            tier: ModelTier::Strong,
+            purpose: ModelPurpose::Best,
             family: ModelFamily::Synthetic,
             vision: false,
             default: true,
@@ -54,7 +54,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["hf:deepseek-ai/DeepSeek-V3.2"],
-            tier: ModelTier::Medium,
+            purpose: ModelPurpose::Balanced,
             family: ModelFamily::Synthetic,
             vision: false,
             default: true,
@@ -72,7 +72,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["hf:zai-org/GLM-4.7-Flash"],
-            tier: ModelTier::Weak,
+            purpose: ModelPurpose::Fast,
             family: ModelFamily::Synthetic,
             vision: false,
             default: true,

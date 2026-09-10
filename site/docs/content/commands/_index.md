@@ -94,9 +94,9 @@ Commands that reach the main session's turn or history have no task equivalent, 
 
 At the end of each natural work turn, a separate model call evaluates the condition against a private copy of the transcript. The evaluator has no tools and its messages do not enter the conversation. A met goal clears itself. An unmet goal adds hidden guidance and starts another work turn. A genuinely impossible goal stops with the evaluator's reason and clears itself.
 
-Run `/goal-model` to choose the evaluator. `/goal model` is also accepted as an alias. Default tries the global Fast preset, then the active provider's weak model, and finally the current conversation model. Fast, Balanced, and Best use their global exact-model preset when assigned, otherwise the matching tier from the active provider. Selecting an exact model may use another provider. Explicit selections report an error instead of silently falling back when unavailable or disallowed.
+Run `/goal-model` to bind the Goal purpose. `/goal model` is also accepted as an alias. Left unbound, Goal follows Fast, which asks the active provider and ends at the conversation model if nothing answers. Binding it to Fast, Balanced, or Best follows that purpose instead; binding it to an exact model may use another provider. An explicit binding reports an error rather than silently falling back when the model is unavailable or disallowed.
 
-The evaluator choice is saved globally in the `model.roles` row of Caudra's SQLite state database and applies across sessions. The same Goal mode is available from `/model` with `Tab`. Press uppercase `R` in that mode to restore Default.
+The binding is saved globally in the `model.purposes` row of Caudra's SQLite state database and applies across sessions. The same Goal purpose is available from `/model` with `Tab`. Press uppercase `R` there to clear the binding.
 
 Run `/goal` without arguments to open the status panel. It shows the condition, evaluator, elapsed time, evaluation count, spend, latest reason, and automatic-continuation limit. Use Left and Right or `-` and `+` to adjust the limit for the current session. The footer shows a compact indicator while a goal is active, and clicking that indicator opens the panel.
 

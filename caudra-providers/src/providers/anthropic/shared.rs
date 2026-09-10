@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 
 use crate::model::{
-    FastPricing, Model, ModelEntry, ModelFamily, ModelPricing, ModelTier, StaticReasoningOption,
+    FastPricing, Model, ModelEntry, ModelFamily, ModelPricing, ModelPurpose, StaticReasoningOption,
 };
 use crate::{
     AgentError, ContentBlock, EMPTY_RESPONSE_MARKER, INVALID_TOOL_JSON_KEY, Message, ProviderEvent,
@@ -662,7 +662,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
     const MODELS: &[ModelEntry] = &[
         ModelEntry {
             prefixes: &["claude-haiku-4-5"],
-            tier: ModelTier::Weak,
+            purpose: ModelPurpose::Fast,
             family: ModelFamily::Claude,
             vision: true,
             default: true,
@@ -680,7 +680,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["claude-sonnet-4-5"],
-            tier: ModelTier::Medium,
+            purpose: ModelPurpose::Balanced,
             family: ModelFamily::Claude,
             vision: true,
             default: false,
@@ -698,7 +698,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["claude-sonnet-4-6"],
-            tier: ModelTier::Medium,
+            purpose: ModelPurpose::Balanced,
             family: ModelFamily::Claude,
             vision: true,
             default: false,
@@ -716,7 +716,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["claude-sonnet-5"],
-            tier: ModelTier::Medium,
+            purpose: ModelPurpose::Balanced,
             family: ModelFamily::Claude,
             vision: true,
             default: true,
@@ -735,7 +735,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["claude-sonnet-4"],
-            tier: ModelTier::Medium,
+            purpose: ModelPurpose::Balanced,
             family: ModelFamily::Claude,
             vision: true,
             default: false,
@@ -753,7 +753,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["claude-opus-4-5"],
-            tier: ModelTier::Strong,
+            purpose: ModelPurpose::Best,
             family: ModelFamily::Claude,
             vision: true,
             default: false,
@@ -771,7 +771,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["claude-opus-4-6"],
-            tier: ModelTier::Strong,
+            purpose: ModelPurpose::Best,
             family: ModelFamily::Claude,
             vision: true,
             default: false,
@@ -790,7 +790,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["claude-opus-4-7"],
-            tier: ModelTier::Strong,
+            purpose: ModelPurpose::Best,
             family: ModelFamily::Claude,
             vision: true,
             default: false,
@@ -809,7 +809,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["claude-opus-4-8"],
-            tier: ModelTier::Strong,
+            purpose: ModelPurpose::Best,
             family: ModelFamily::Claude,
             vision: true,
             default: false,
@@ -830,7 +830,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["claude-opus-5"],
-            tier: ModelTier::Strong,
+            purpose: ModelPurpose::Best,
             family: ModelFamily::Claude,
             vision: true,
             default: true,
@@ -851,7 +851,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["claude-fable-5"],
-            tier: ModelTier::Strong,
+            purpose: ModelPurpose::Best,
             family: ModelFamily::Claude,
             vision: true,
             default: false,
@@ -869,7 +869,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["claude-opus-4-0", "claude-opus-4-1"],
-            tier: ModelTier::Strong,
+            purpose: ModelPurpose::Best,
             family: ModelFamily::Claude,
             vision: true,
             default: false,
@@ -981,7 +981,9 @@ mod tests {
     fn every_wire_tool_asks_for_eager_input_streaming() {
         let tools = wire_tools();
         assert!(
-            tools.iter().all(|t| t[EAGER_INPUT_STREAMING] == json!(true)),
+            tools
+                .iter()
+                .all(|t| t[EAGER_INPUT_STREAMING] == json!(true)),
             "{BUFFERED_TOOL}"
         );
         assert!(tools[0]["cache_control"].is_null(), "{BREAKPOINT_MOVED}");
@@ -1001,7 +1003,9 @@ mod tests {
 
         let tools = body["tools"].as_array().unwrap();
         assert!(
-            tools.iter().all(|t| t[EAGER_INPUT_STREAMING] == json!(true)),
+            tools
+                .iter()
+                .all(|t| t[EAGER_INPUT_STREAMING] == json!(true)),
             "{BUFFERED_TOOL}"
         );
         assert!(tools[1]["name"].as_str().unwrap().starts_with("mcp_"));

@@ -4,7 +4,7 @@ use caudra_storage::id::SessionRef;
 use flume::Sender;
 use serde_json::{Value, json};
 
-use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelTier, ThinkingSupport};
+use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelPurpose, ThinkingSupport};
 use crate::provider::{BoxFuture, Provider};
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
 
@@ -60,7 +60,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
                 "mistral-medium-3-5",
                 "mistral-medium-2604",
             ],
-            tier: ModelTier::Strong,
+            purpose: ModelPurpose::Best,
             family: ModelFamily::Generic,
             vision: true,
             default: true,
@@ -78,7 +78,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["glm-5-2", "zai-glm-5-2"],
-            tier: ModelTier::Strong,
+            purpose: ModelPurpose::Best,
             family: ModelFamily::Glm,
             vision: false,
             default: false,
@@ -96,7 +96,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["mistral-small-latest", "mistral-small-2603"],
-            tier: ModelTier::Medium,
+            purpose: ModelPurpose::Balanced,
             family: ModelFamily::Generic,
             vision: true,
             default: true,
@@ -114,7 +114,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["ministral-14b-latest", "ministral-14b-2512"],
-            tier: ModelTier::Weak,
+            purpose: ModelPurpose::Fast,
             family: ModelFamily::Generic,
             vision: false,
             default: true,
@@ -279,7 +279,6 @@ impl Provider for Mistral {
                         supports_thinking,
                         supports_vision: Some(supports_vision),
                         reasoning_options: None,
-                        tier: None,
                         provider_info: None,
                     })
                 })

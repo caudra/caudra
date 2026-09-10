@@ -210,7 +210,7 @@ mod tests {
     use super::*;
     use crate::ReasoningOptions;
     use crate::manifest::ManifestRegistry;
-    use crate::model::{FastPricing, ModelFamily, ModelPricing, ModelTier};
+    use crate::model::{FastPricing, ModelFamily, ModelPricing};
     use std::sync::Arc;
     use test_case::test_case;
 
@@ -251,7 +251,6 @@ mod tests {
         Model {
             id: id.into(),
             provider: Arc::from("anthropic"),
-            tier: ModelTier::Medium,
             family: ModelFamily::Claude,
             supports_tool_examples_override: None,
             thinking_override: None,

@@ -4,19 +4,19 @@
 //! + cache reads/writes because the context window limit applies to all of them combined.
 
 use std::any::Any;
-use std::fmt;
 use std::ops::AddAssign;
-use std::str::FromStr;
 use std::sync::Arc;
 
 use caudra_config::ModelPolicy;
+pub use caudra_config::providers::ModelPurpose;
+use caudra_config::providers::UnknownPurpose;
 use caudra_storage::sessions::StoredTokenUsage;
 use caudra_storage::thinking::{ReasoningOption, ReasoningOptions};
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use crate::manifest::{ManifestRegistry, ProviderManifest};
-use crate::model_registry;
+use crate::model_registry::{self, Binding};
 use crate::providers::{anthropic, custom, dynamic};
 use crate::types::ThinkingFields;
 
@@ -28,6 +28,24 @@ const OPEN_WEIGHTS_PREFIX: &str = "gpt-oss";
 /// OpenAI ids trained on the Codex envelope that never spell `gpt`.
 const CODEX_TRAINED_PREFIXES: [&str; 3] = ["o3", "o4", "codex"];
 
+/// Vendor slugs aggregators use that spell a builtin provider differently.
+/// Aggregators follow OpenRouter's naming, which hyphenates some vendors caudra
+/// does not, so an exact slug match alone would miss them.
+const VENDOR_ALIASES: [(&str, &str); 5] = [
+    ("z-ai", "zai"),
+    ("x-ai", "xai"),
+    ("mistralai", "mistral"),
+    ("google-vertex", "google"),
+    ("github-copilot", "copilot"),
+];
+
+fn builtin_for_vendor(vendor: &str) -> &str {
+    VENDOR_ALIASES
+        .iter()
+        .find(|(alias, _)| *alias == vendor)
+        .map_or(vendor, |(_, slug)| slug)
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ModelError {
     #[error("model must be in 'provider/model' format (e.g. anthropic/claude-sonnet-4-20250514)")]
@@ -36,14 +54,12 @@ pub enum ModelError {
     UnsupportedProvider(String),
     #[error("unknown model '{0}'")]
     UnknownModel(String),
-    #[error("invalid model tier '{0}' (expected: strong, medium, weak)")]
-    InvalidTier(String),
-    #[error("no allowed model for {0}/{1}")]
-    NoAllowedModel(String, ModelTier),
-    #[error("no default model for {0}/{1}")]
-    NoDefault(String, ModelTier),
+    #[error(transparent)]
+    InvalidPurpose(#[from] UnknownPurpose),
     #[error("model '{0}' is not allowed by provider model policy")]
     NotAllowed(String),
+    #[error("model purpose {0} is bound in a cycle")]
+    PurposeCycle(ModelPurpose),
 }
 
 /// Rates that replace the base ones once a prompt crosses `above` tokens.
@@ -90,7 +106,6 @@ pub struct ModelInfo {
     /// Levels and bounds the provider just told us about, which outrank both
     /// the static table and the catalog.
     pub reasoning_options: Option<ReasoningOptions>,
-    pub tier: Option<ModelTier>,
     /// Store of additional metadata from the provider.
     pub provider_info: Option<Arc<dyn Any + Send + Sync>>,
 }
@@ -105,7 +120,6 @@ impl ModelInfo {
             supports_thinking: None,
             supports_vision: None,
             reasoning_options: None,
-            tier: None,
             provider_info: None,
         }
     }
@@ -162,48 +176,6 @@ pub enum ModelFamily {
     Synthetic,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ModelTier {
-    Weak,
-    Medium,
-    Strong,
-}
-
-impl fmt::Display for ModelTier {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Weak => "weak",
-            Self::Medium => "medium",
-            Self::Strong => "strong",
-        })
-    }
-}
-
-impl FromStr for ModelTier {
-    type Err = ModelError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "weak" => Ok(Self::Weak),
-            "medium" => Ok(Self::Medium),
-            "strong" => Ok(Self::Strong),
-            other => Err(ModelError::InvalidTier(other.to_string())),
-        }
-    }
-}
-
-impl From<caudra_config::providers::Tier> for ModelTier {
-    fn from(t: caudra_config::providers::Tier) -> Self {
-        use caudra_config::providers::Tier;
-        match t {
-            Tier::Weak => Self::Weak,
-            Tier::Medium => Self::Medium,
-            Tier::Strong => Self::Strong,
-        }
-    }
-}
-
 /// Const-constructible mirror of [`ReasoningOption`], so the static tables can
 /// carry a correction for a model the catalog gets wrong or has not reached.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -234,7 +206,10 @@ pub(crate) fn reasoning_options_from_static(options: &[StaticReasoningOption]) -
 #[derive(Debug)]
 pub struct ModelEntry {
     pub prefixes: &'static [&'static str],
-    pub tier: ModelTier,
+    /// Which slot this model is the curated answer for when `default` is set.
+    /// A recommendation the resolver may use, never a claim carried on a
+    /// resolved [`Model`].
+    pub purpose: ModelPurpose,
     pub family: ModelFamily,
     /// Gates vision-only tools (`view_image`) and image blocks at request time.
     pub vision: bool,
@@ -330,7 +305,6 @@ impl Billing {
 pub struct Model {
     pub id: String,
     pub provider: Arc<str>,
-    pub tier: ModelTier,
     pub family: ModelFamily,
     pub supports_tool_examples_override: Option<bool>,
     /// Resolved thinking support, used by gateway providers (e.g. Aperture)
@@ -387,12 +361,10 @@ impl Model {
     /// caught up to yet), fall back to the provider defaults so it still resolves.
     fn from_base(manifest: &ProviderManifest, slug: &str, model_id: &str) -> Self {
         let static_entry = lookup_entry(manifest.models, model_id).ok();
-        let spec = format!("{slug}/{model_id}");
         // Discovery keys `known_models` by the builtin slug, so a dynamic or
-        // custom slug reads positional tiers and metadata through its base.
+        // custom slug reads metadata through its base.
         let discovered = model_registry::discovered(manifest.slug, model_id);
         let discovered = discovered.as_ref();
-        let tier = model_registry::tier_for(&spec, manifest.slug, static_entry.map(|e| e.tier));
         let family = inherited_lineage(manifest, slug, static_entry);
         let discovered_pricing = discovered.and_then(|info| info.pricing.as_ref());
         let pricing = discovered_pricing
@@ -424,7 +396,6 @@ impl Model {
         Self {
             id: model_id.to_string(),
             provider: Arc::from(slug),
-            tier,
             family,
             supports_tool_examples_override: None,
             thinking_override: None,
@@ -453,7 +424,6 @@ impl Model {
         Self {
             id: model_id.to_string(),
             provider: Arc::from(slug),
-            tier: ModelTier::Medium,
             family: ModelFamily::Generic,
             supports_tool_examples_override: None,
             thinking_override: ThinkingSupport::from_flags(Some(meta.supports_thinking), false),
@@ -590,76 +560,142 @@ impl Model {
         ManifestRegistry::for_slug(&self.provider).map_or("Unknown", |m| m.display_name)
     }
 
-    pub fn from_tier(slug: &str, tier: ModelTier) -> Result<Self, ModelError> {
-        if let Some(spec) = model_registry::override_spec_for_tier(tier) {
-            return Self::from_spec(&spec);
-        }
-        if let Some(spec) = model_registry::spec_for_tier(slug, tier) {
-            return Self::from_spec(&spec);
-        }
-        let entry = ManifestRegistry::find_default_for_tier(slug, tier)
-            .ok_or_else(|| ModelError::NoDefault(slug.to_string(), tier))?;
-        let model_id = entry.prefixes[0];
-        Self::from_spec(&format!("{slug}/{model_id}"))
-    }
-
-    pub fn from_tier_with_policy(
-        slug: &str,
-        tier: ModelTier,
+    /// Which model serves `purpose` while `chat` is the conversation model.
+    ///
+    /// A binding the user made wins. Otherwise each purpose falls back to its
+    /// own rule, and every rule ends at `chat`, so resolution never invents an
+    /// id the active provider does not serve.
+    pub fn resolve(
+        purpose: ModelPurpose,
+        chat: &Self,
         policy: &ModelPolicy,
     ) -> Result<Self, ModelError> {
-        if let Some(spec) = model_registry::override_spec_for_tier(tier) {
-            return Self::from_spec_with_policy(&spec, policy);
-        }
-        if let Ok(model) = Self::from_tier_dynamic(slug, tier)
-            && policy.allows(&model.spec())
-        {
-            return Ok(model);
-        }
-
-        let Some(manifest) = ManifestRegistry::for_slug(slug) else {
-            return Err(ModelError::NoAllowedModel(slug.to_string(), tier));
-        };
-        manifest
-            .models
-            .iter()
-            .filter(|entry| entry.tier == tier)
-            .flat_map(|entry| entry.prefixes)
-            .map(|model_id| format!("{slug}/{model_id}"))
-            .find(|spec| policy.allows(spec))
-            .map(|spec| Self::from_spec(&spec))
-            .transpose()?
-            .ok_or_else(|| ModelError::NoAllowedModel(slug.to_string(), tier))
+        Self::resolve_seen(purpose, chat, policy, &mut Vec::new())
     }
 
-    pub fn from_tier_dynamic(slug: &str, tier: ModelTier) -> Result<Self, ModelError> {
-        if let Some(model) = dynamic::find_model_for_tier(slug, tier) {
-            return Ok(model);
+    /// [`Self::resolve`] against a binding the caller already read, so a caller
+    /// that reports which binding it used cannot resolve a different one.
+    pub fn resolve_binding(
+        purpose: ModelPurpose,
+        binding: Option<&Binding>,
+        chat: &Self,
+        policy: &ModelPolicy,
+    ) -> Result<Self, ModelError> {
+        let seen = &mut vec![purpose];
+        match binding {
+            Some(binding) => Self::follow(binding, chat, policy, seen),
+            None => Self::auto(purpose, chat, policy, seen),
         }
-        // One providers.toml read, three answers: a model declared at this tier,
-        // the provider exists but declares nothing here (inherit the base
-        // protocol default under the custom slug, keeping its tier and pricing),
-        // or no such provider.
-        match custom::resolve_tier(slug, tier) {
-            custom::TierLookup::Model(model) => return Ok(model),
-            custom::TierLookup::NoModelForTier(base) => {
-                let manifest = ManifestRegistry::get(&base.to_string())
-                    .ok_or_else(|| ModelError::NoDefault(slug.to_string(), tier))?;
-                let entry = manifest
-                    .models
-                    .iter()
-                    .find(|e| e.default && e.tier == tier)
-                    .ok_or_else(|| ModelError::NoDefault(slug.to_string(), tier))?;
-                return Ok(Self::from_base(manifest, slug, entry.prefixes[0]));
+    }
+
+    fn resolve_seen(
+        purpose: ModelPurpose,
+        chat: &Self,
+        policy: &ModelPolicy,
+        seen: &mut Vec<ModelPurpose>,
+    ) -> Result<Self, ModelError> {
+        if seen.contains(&purpose) {
+            return Err(ModelError::PurposeCycle(purpose));
+        }
+        seen.push(purpose);
+        match model_registry::binding(purpose) {
+            Some(binding) => Self::follow(&binding, chat, policy, seen),
+            None => Self::auto(purpose, chat, policy, seen),
+        }
+    }
+
+    fn follow(
+        binding: &Binding,
+        chat: &Self,
+        policy: &ModelPolicy,
+        seen: &mut Vec<ModelPurpose>,
+    ) -> Result<Self, ModelError> {
+        match binding {
+            // A bound spec may name a catalogue sub-provider this process has
+            // not fetched yet, so an unknown provider is worth one warm retry
+            // before it counts as unresolvable.
+            Binding::Exact(spec) => match Self::from_spec_with_policy(spec, policy) {
+                Err(ModelError::UnsupportedProvider(_)) => {
+                    crate::warm_catalog();
+                    Self::from_spec_with_policy(spec, policy)
+                }
+                result => result,
+            },
+            Binding::Same(other) => Self::resolve_seen(*other, chat, policy, seen),
+        }
+    }
+
+    fn auto(
+        purpose: ModelPurpose,
+        chat: &Self,
+        policy: &ModelPolicy,
+        seen: &mut Vec<ModelPurpose>,
+    ) -> Result<Self, ModelError> {
+        match purpose {
+            // Compaction reads the whole conversation, so the cheap slot is the
+            // wrong default: a small window cannot hold what it must summarize.
+            ModelPurpose::Chat | ModelPurpose::Compact => Ok(chat.clone()),
+            ModelPurpose::Title | ModelPurpose::Goal => {
+                Self::resolve_seen(ModelPurpose::Fast, chat, policy, seen)
             }
-            custom::TierLookup::Unknown => {}
+            slot => Ok(Self::provider_default(slot, chat, policy).unwrap_or_else(|| chat.clone())),
         }
-        // Builtin or dynamic slug: resolve the base default under the slug
-        // (dynamic slugs route through `base_for_slug`).
-        if ManifestRegistry::get(slug).is_some() || dynamic::base_for_slug(slug).is_some() {
-            return Self::from_tier(slug, tier);
-        }
-        Err(ModelError::UnsupportedProvider(slug.to_string()))
+    }
+
+    /// The provider's own answer for a slot: a `providers.toml` binding, then the
+    /// curated table, then the cheapest price the provider reported.
+    ///
+    /// Only Fast consults price. It is a sound proxy for cheap and an unsound one
+    /// for capable, so Balanced and Best stop at the curated table and let the
+    /// caller fall back to the model the user already chose.
+    fn provider_default(purpose: ModelPurpose, chat: &Self, policy: &ModelPolicy) -> Option<Self> {
+        let slug = chat.provider.as_ref();
+        let cheapest = (purpose == ModelPurpose::Fast)
+            .then(|| {
+                model_registry::cheapest_known(slug)
+                    .or_else(|| model_registry::smallest_known(slug))
+            })
+            .flatten();
+        custom::declared_purpose(slug, purpose)
+            .into_iter()
+            .chain(
+                ManifestRegistry::prefixes_for_purpose(slug, purpose)
+                    .into_iter()
+                    .map(str::to_string),
+            )
+            .chain(cheapest)
+            .map(|model_id| format!("{slug}/{model_id}"))
+            .filter(|spec| policy.allows(spec))
+            .find_map(|spec| Self::from_spec(&spec).ok())
+    }
+
+    /// Which capability slot the active provider files this model under, if
+    /// any. The inverse of [`Self::provider_default`], and it answers in the
+    /// same order: what the operator declared in `providers.toml`, then the
+    /// curated table.
+    ///
+    /// `None` is the honest answer for a model nobody classified. Nothing
+    /// infers one from price or list position, because those were guesses.
+    pub fn class_of(provider: &str, model_id: &str) -> Option<ModelPurpose> {
+        ModelPurpose::CLASSES
+            .into_iter()
+            .find(|purpose| custom::declares_purpose(provider, *purpose, model_id))
+            .or_else(|| ManifestRegistry::purpose_for_model(provider, model_id))
+            .or_else(|| {
+                // An aggregator has no catalogue of its own, but it serves other
+                // vendors' models under a vendor-prefixed id. Those are the same
+                // weights the vendor's own curated entry describes, so route to
+                // it instead of reporting nothing.
+                let (vendor, upstream) = model_id.split_once('/')?;
+                ManifestRegistry::purpose_for_model(builtin_for_vendor(vendor), upstream)
+            })
+    }
+
+    /// Curated default for a builtin provider, with no conversation to fall back
+    /// on. First-run setup only, before any model has been chosen.
+    pub fn curated_default(slug: &str, purpose: ModelPurpose) -> Option<Self> {
+        let entry = ManifestRegistry::find_default_for_purpose(slug, purpose)?;
+        Self::from_spec(&format!("{slug}/{}", entry.prefixes[0])).ok()
     }
 
     pub fn from_spec_with_policy(spec: &str, policy: &ModelPolicy) -> Result<Self, ModelError> {
@@ -852,7 +888,44 @@ mod tests {
         .unwrap()
     }
 
-    const TIERS: [ModelTier; 3] = [ModelTier::Weak, ModelTier::Medium, ModelTier::Strong];
+    const SLOTS: [ModelPurpose; 3] = ModelPurpose::CLASSES;
+    /// DeepSeek curates no cheap model, so its Fast slot has no candidate.
+    const NO_FAST_SLOT: &str = "deepseek";
+
+    const AGGREGATOR: &str = "tensorx";
+    const ALIASED_VENDOR_MODEL: &str = "z-ai/glm-4.5-air";
+    const UNCLASSIFIABLE: &str = "ollama";
+
+    const OPENAI_CHAT_SPEC: &str = "openai/gpt-5.6-sol";
+
+    #[test_case("anthropic", "claude-haiku-4-5", Some(ModelPurpose::Fast) ; "curated_table")]
+    #[test_case("anthropic", "claude-opus-4-6", Some(ModelPurpose::Best) ; "curated_best")]
+    #[test_case(UNCLASSIFIABLE, "llama3", None ; "no_table_means_no_class")]
+    fn class_of_reads_the_providers_own_answer(
+        provider: &str,
+        model_id: &str,
+        expected: Option<ModelPurpose>,
+    ) {
+        assert_eq!(Model::class_of(provider, model_id), expected);
+    }
+
+    /// Aggregators carry no catalogue, and they spell some vendors differently
+    /// than caudra does, so the class has to survive both hops.
+    #[test]
+    fn an_aggregator_borrows_the_class_of_an_aliased_vendor() {
+        assert_eq!(
+            Model::class_of(AGGREGATOR, ALIASED_VENDOR_MODEL),
+            Some(ModelPurpose::Fast)
+        );
+    }
+
+    #[test_case("z-ai", "zai" ; "hyphenated_zai")]
+    #[test_case("x-ai", "xai" ; "hyphenated_xai")]
+    #[test_case("mistralai", "mistral" ; "run_together_mistral")]
+    #[test_case("anthropic", "anthropic" ; "already_matching_slug_passes_through")]
+    fn vendor_slugs_map_onto_builtins(vendor: &str, expected: &str) {
+        assert_eq!(builtin_for_vendor(vendor), expected);
+    }
 
     const EPSILON: f64 = 1e-10;
     /// The only builtin whose rates move with the wall clock.
@@ -977,25 +1050,25 @@ mod tests {
     }
 
     #[test]
-    fn tier_with_policy_uses_allowed_alternative() {
+    fn resolve_takes_an_allowed_curated_alternative() {
         let policy = policy(&["openai/gpt-5.4-nano"], &[]);
+        let chat = Model::from_spec(OPENAI_CHAT_SPEC).unwrap();
 
-        let model = Model::from_tier_with_policy("openai", ModelTier::Weak, &policy).unwrap();
+        let model = Model::resolve(ModelPurpose::Fast, &chat, &policy).unwrap();
 
         assert_eq!(model.spec(), "openai/gpt-5.4-nano");
-        assert_eq!(model.tier, ModelTier::Weak);
     }
 
+    /// Every rule ends at the conversation model, which the user already chose,
+    /// so a slot the policy empties can never resolve to nothing.
     #[test]
-    fn tier_with_policy_errors_without_allowed_candidate() {
+    fn resolve_falls_back_to_chat_when_the_policy_allows_no_candidate() {
         let policy = policy(&["anthropic/*"], &[]);
+        let chat = Model::from_spec(OPENAI_CHAT_SPEC).unwrap();
 
-        let error = Model::from_tier_with_policy("openai", ModelTier::Weak, &policy).unwrap_err();
+        let model = Model::resolve(ModelPurpose::Fast, &chat, &policy).unwrap();
 
-        assert!(matches!(
-            error,
-            ModelError::NoAllowedModel(provider, ModelTier::Weak) if provider == "openai"
-        ));
+        assert_eq!(model.spec(), chat.spec());
     }
 
     #[test]
@@ -1107,7 +1180,7 @@ mod tests {
             if manifest.accepts_arbitrary_models {
                 continue;
             }
-            let model = Model::from_tier(manifest.slug, ModelTier::Medium).unwrap();
+            let model = Model::curated_default(manifest.slug, ModelPurpose::Balanced).unwrap();
             let round = Model::from_spec(&model.spec()).unwrap();
             assert_eq!(round.id, model.id);
             assert_eq!(round.provider, model.provider);
@@ -1133,20 +1206,18 @@ mod tests {
     }
 
     #[test]
-    fn from_tier_covers_all_providers() {
+    fn every_curated_slot_resolves_to_a_usable_model() {
         for manifest in ManifestRegistry::builtins() {
             if manifest.accepts_arbitrary_models {
                 continue;
             }
             let slug: Arc<str> = Arc::from(manifest.slug);
-            for &tier in &TIERS {
-                // DeepSeek has no Weak tier model
-                if manifest.slug == "deepseek" && tier == ModelTier::Weak {
+            for &purpose in &SLOTS {
+                if manifest.slug == NO_FAST_SLOT && purpose == ModelPurpose::Fast {
                     continue;
                 }
-                let model = Model::from_tier(manifest.slug, tier).unwrap();
+                let model = Model::curated_default(manifest.slug, purpose).unwrap();
                 assert_eq!(model.provider, slug);
-                assert_eq!(model.tier, tier);
                 let max_output = model.max_output_tokens.unwrap();
                 assert!(max_output > 0);
                 assert!(model.context_window >= max_output);
@@ -1155,36 +1226,24 @@ mod tests {
     }
 
     #[test]
-    fn tier_display_roundtrip() {
-        for &tier in &TIERS {
-            let s = tier.to_string();
-            assert_eq!(s.parse::<ModelTier>().unwrap(), tier);
-        }
-        assert!(matches!(
-            "turbo".parse::<ModelTier>(),
-            Err(ModelError::InvalidTier(_))
-        ));
-    }
-
-    #[test]
-    fn exactly_one_default_per_provider_tier() {
+    fn exactly_one_default_per_provider_slot() {
         for manifest in ManifestRegistry::builtins() {
             if manifest.accepts_arbitrary_models {
                 continue;
             }
             let entries = manifest.models;
-            for &tier in &TIERS {
-                if manifest.slug == "deepseek" && tier == ModelTier::Weak {
+            for &purpose in &SLOTS {
+                if manifest.slug == NO_FAST_SLOT && purpose == ModelPurpose::Fast {
                     continue;
                 }
                 let count = entries
                     .iter()
-                    .filter(|e| e.tier == tier && e.default)
+                    .filter(|e| e.purpose == purpose && e.default)
                     .count();
                 assert_eq!(
                     count, 1,
                     "{}/{}: expected exactly 1 default, found {count}",
-                    manifest.slug, tier
+                    manifest.slug, purpose
                 );
             }
         }

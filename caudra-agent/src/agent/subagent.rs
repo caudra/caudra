@@ -284,10 +284,7 @@ impl Subagent {
     /// `None` resumes: the subagent picks its own history back up with no new
     /// instruction, which is all a caller continuing an interrupted task has
     /// to say.
-    pub async fn prompt(
-        &mut self,
-        message: Option<String>,
-    ) -> Result<PromptResult, PromptFailure> {
+    pub async fn prompt(&mut self, message: Option<String>) -> Result<PromptResult, PromptFailure> {
         if self.closed {
             return Err(PromptFailure {
                 error: SESSION_CLOSED.to_owned(),

@@ -25,7 +25,7 @@ pub use history::{
 };
 pub use model::{
     Billing, FastPricing, Model, ModelEntry, ModelError, ModelFamily, ModelInfo, ModelPricing,
-    ModelTier, PricingTier, StaticReasoningOption, ThinkingSupport, TokenUsage, format_tokens,
+    ModelPurpose, PricingTier, StaticReasoningOption, ThinkingSupport, TokenUsage, format_tokens,
 };
 pub use pricing::{ModelSpend, SessionSpend, model_cost, settle_session};
 pub use providers::Timeouts;
@@ -44,8 +44,7 @@ pub use tokens::{estimate_tokens, estimate_tokens_cached, format_tokens_u64, tok
 pub use types::{
     ContentBlock, EFFORT_LEVELS, EMPTY_RESPONSE_MARKER, IMAGE_OMITTED_NOTE, INVALID_TOOL_JSON_KEY,
     ImageMediaType, ImageSource, MIN_THINKING_BUDGET, Message, MessageKind, ProviderEvent,
-    ProviderUsage,
-    ReasoningOption, ReasoningOptions, ReasoningSource, ReasoningTransport, RequestOptions,
-    ResolvedThinking, ResponsesReasoning, Role, StopReason, StreamResponse, THINKING_USAGE,
-    ThinkingConfig, ToolNameAliases, UsageLimit, adapt_images_for_model,
+    ProviderUsage, ReasoningOption, ReasoningOptions, ReasoningSource, ReasoningTransport,
+    RequestOptions, ResolvedThinking, ResponsesReasoning, Role, StopReason, StreamResponse,
+    THINKING_USAGE, ThinkingConfig, ToolNameAliases, UsageLimit, adapt_images_for_model,
 };

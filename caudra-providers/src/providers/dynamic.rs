@@ -17,7 +17,7 @@ use strum::IntoEnumIterator;
 use tracing::{debug, warn};
 
 use crate::manifest::ManifestRegistry;
-use crate::model::{Billing, Model, ModelPricing, ModelTier, ThinkingSupport};
+use crate::model::{Billing, Model, ModelPricing, ThinkingSupport};
 use crate::provider::{BoxFuture, Provider, ProviderKind};
 use crate::types::{ReasoningOptions, ThinkingFields};
 use crate::{AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse};
@@ -69,8 +69,6 @@ struct ScriptInfo {
 #[derive(Deserialize)]
 struct ScriptModel {
     id: String,
-    #[serde(default = "default_tier")]
-    tier: ModelTier,
     #[serde(default)]
     supports_tool_examples: Option<bool>,
     #[serde(default)]
@@ -91,11 +89,10 @@ struct ScriptModel {
 }
 
 impl ScriptModel {
-    fn to_model(&self, slug: &str, base: ProviderKind, id: String, tier: ModelTier) -> Model {
+    fn to_model(&self, slug: &str, base: ProviderKind, id: String) -> Model {
         Model {
             id,
             provider: Arc::from(slug),
-            tier,
             family: base.family(),
             supports_tool_examples_override: self.supports_tool_examples,
             thinking_override: ThinkingSupport::from_flags(
@@ -113,10 +110,6 @@ impl ScriptModel {
             billing: Billing::default(),
         }
     }
-}
-
-fn default_tier() -> ModelTier {
-    ModelTier::Medium
 }
 
 fn default_max_output_tokens() -> u32 {
@@ -664,13 +657,7 @@ pub fn lookup_model(slug: &str, model_id: &str) -> Option<Model> {
         .iter()
         .filter(|m| model_id.starts_with(&m.id))
         .max_by_key(|m| m.id.len())?;
-    Some(script_model.to_model(slug, meta.base, model_id.to_string(), script_model.tier))
-}
-
-pub fn find_model_for_tier(slug: &str, tier: ModelTier) -> Option<Model> {
-    let meta = find_meta(slug)?;
-    let script_model = meta.models.iter().find(|m| m.tier == tier)?;
-    Some(script_model.to_model(slug, meta.base, script_model.id.clone(), tier))
+    Some(script_model.to_model(slug, meta.base, model_id.to_string()))
 }
 
 struct DynamicProvider {
@@ -826,7 +813,6 @@ impl Provider for DynamicProvider {
                     supports_thinking: None,
                     supports_vision: m.supports_vision,
                     reasoning_options: None,
-                    tier: None,
                     provider_info: None,
                 })
                 .collect())
@@ -915,24 +901,17 @@ mod tests {
 
     #[test]
     fn script_model_deserialization() {
-        let full = r#"{"id": "my-model", "tier": "strong", "supports_tool_examples": true, "max_output_tokens": 32000, "context_window": 200000, "pricing": {"input": 3.0, "output": 15.0, "cache_write": 3.75, "cache_read": 0.30}, "thinking_fields": {"adaptive": {"reasoning_effort": "medium"}, "low": {"reasoning_effort": "low"}}}"#;
+        let full = r#"{"id": "my-model", "supports_tool_examples": true, "max_output_tokens": 32000, "context_window": 200000, "pricing": {"input": 3.0, "output": 15.0, "cache_write": 3.75, "cache_read": 0.30}, "thinking_fields": {"adaptive": {"reasoning_effort": "medium"}, "low": {"reasoning_effort": "low"}}}"#;
         let model: ScriptModel = serde_json::from_str(full).unwrap();
         assert_eq!(model.id, "my-model");
-        assert_eq!(model.tier, ModelTier::Strong);
         assert_eq!(model.supports_tool_examples, Some(true));
         assert!(model.pricing.is_some());
-        let resolved = model.to_model(
-            "dynamic",
-            ProviderKind::LlamaCpp,
-            model.id.clone(),
-            model.tier,
-        );
+        let resolved = model.to_model("dynamic", ProviderKind::LlamaCpp, model.id.clone());
         let mut body = serde_json::json!({});
         crate::ThinkingConfig::Adaptive.apply_local_thinking(&mut body, &resolved);
         assert_eq!(body, serde_json::json!({"reasoning_effort": "medium"}));
 
         let minimal: ScriptModel = serde_json::from_str(r#"{"id": "custom-v1"}"#).unwrap();
-        assert_eq!(minimal.tier, ModelTier::Medium);
         assert_eq!(minimal.supports_tool_examples, None);
         assert_eq!(minimal.max_output_tokens, 16384);
         assert_eq!(minimal.context_window, 128_000);
@@ -948,7 +927,7 @@ mod tests {
             info: r#"{"display_name": "T", "base": "llama-cpp", "has_auth": false}"#.into(),
             models: Some(
                 r#"[{"id": "typo", "thinking_fields": {"hight": {"reasoning_effort": "high"}}},
-                    {"id": "broken", "tier": 7},
+                    {"id": "broken", "context_window": "wide"},
                     {"id": "good"}]"#
                     .into(),
             ),
@@ -1070,7 +1049,7 @@ mod tests {
         let script = r#"#!/bin/sh
 case "$1" in
   info) echo '{"display_name": "Custom", "base": "openai", "has_auth": false}' ;;
-  models) echo '[{"id": "custom-v1", "tier": "strong", "max_output_tokens": 32000, "context_window": 200000}]' ;;
+  models) echo '[{"id": "custom-v1", "max_output_tokens": 32000, "context_window": 200000}]' ;;
   resolve) echo '{"headers": {"authorization": "Bearer test"}}' ;;
   *) exit 1 ;;
 esac
@@ -1084,7 +1063,7 @@ esac
         assert_eq!(providers.len(), 1);
         assert_eq!(providers[0].models.len(), 1);
         assert_eq!(providers[0].models[0].id, "custom-v1");
-        assert_eq!(providers[0].models[0].tier, ModelTier::Strong);
+        assert_eq!(providers[0].models[0].max_output_tokens, 32_000);
     }
 
     /// Writes a `refresh` script that counts its runs in `counter`. A rotating

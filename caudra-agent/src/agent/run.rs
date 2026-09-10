@@ -6,11 +6,11 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use tracing::{Instrument, debug, error, info, info_span, warn};
 
-use caudra_providers::model_registry::CompactionTarget;
+use caudra_providers::model_registry::Binding;
 use caudra_providers::provider::Provider;
 use caudra_providers::{
-    Billing, ContentBlock, EMPTY_RESPONSE_MARKER, Message, Model, RequestOptions, Role, StopReason,
-    StreamResponse, TokenUsage, estimate_tokens_cached,
+    Billing, ContentBlock, EMPTY_RESPONSE_MARKER, Message, Model, ModelPurpose, RequestOptions,
+    Role, StopReason, StreamResponse, TokenUsage, estimate_tokens_cached,
 };
 
 use super::compaction;
@@ -82,6 +82,8 @@ const CANCELLED_TEXT_NOTE: &str = "[Response cut off by user cancel]";
 /// assistant tail above it cannot: keep going.
 const RESUME_PROMPT: &str =
     "Continue the task from where you left off, and end your turn with a text response.";
+/// Reported in place of a spec when nothing is bound to the goal evaluator.
+const UNBOUND_EVALUATOR: &str = "default";
 
 pub fn resolve_compaction_model(
     provider: &Arc<dyn Provider>,
@@ -89,18 +91,15 @@ pub fn resolve_compaction_model(
     timeouts: caudra_providers::Timeouts,
     model_policy: &ModelPolicy,
 ) -> Result<(Arc<dyn Provider>, Model), AgentError> {
-    let CompactionTarget::Model(spec) = caudra_providers::model_registry::compaction_target()
-    else {
+    let mut compact_model =
+        Model::resolve(ModelPurpose::Compact, model, model_policy).map_err(|error| {
+            AgentError::Config {
+                message: format!("cannot resolve the compaction model: {error}"),
+            }
+        })?;
+    if compact_model.spec() == model.spec() {
         return Ok((Arc::clone(provider), model.clone()));
-    };
-    if !model_policy.allows(&spec) {
-        return Err(AgentError::Config {
-            message: format!("compaction model '{spec}' is not allowed by provider model policy"),
-        });
     }
-    let mut compact_model = Model::from_spec(&spec).map_err(|error| AgentError::Config {
-        message: format!("cannot resolve compaction model '{spec}': {error}"),
-    })?;
     let compact_provider = caudra_providers::provider::from_model(&mut compact_model, timeouts)?;
     Ok((Arc::from(compact_provider), compact_model))
 }
@@ -918,21 +917,22 @@ impl<'h> Agent<'h> {
         let evaluation = goal.evaluations.saturating_add(1);
         self.event_tx
             .send(AgentEvent::GoalEvaluating { evaluation })?;
-        let target = caudra_providers::model_registry::goal_evaluator_target();
+        // Only an exactly bound evaluator is worth caching a provider for: any
+        // other binding can resolve elsewhere as the conversation model changes.
+        let binding = caudra_providers::model_registry::binding(ModelPurpose::Goal);
+        let exactly_bound = matches!(binding, Some(Binding::Exact(_)));
+        let binding_label = binding
+            .as_ref()
+            .map_or_else(|| UNBOUND_EVALUATOR.to_string(), Binding::to_string);
         let cached_provider = self
             .goal_evaluator
             .as_ref()
-            .filter(|resolved| {
-                matches!(
-                    &target,
-                    caudra_providers::model_registry::GoalEvaluatorTarget::Model(_)
-                ) && resolved.target == target
-            })
+            .filter(|resolved| exactly_bound && resolved.binding == binding)
             .map(|resolved| Arc::clone(&resolved.provider));
         let mut evaluator = match resolve_evaluator(
             &self.provider,
             &self.model,
-            target.clone(),
+            binding,
             self.timeouts,
             &self.model_policy,
             &self.cancel,
@@ -941,11 +941,7 @@ impl<'h> Agent<'h> {
         .await
         {
             Ok(resolved) => {
-                self.goal_evaluator = matches!(
-                    resolved.target,
-                    caudra_providers::model_registry::GoalEvaluatorTarget::Model(_)
-                )
-                .then_some(resolved.clone());
+                self.goal_evaluator = exactly_bound.then_some(resolved.clone());
                 resolved
             }
             Err(error) => {
@@ -957,7 +953,7 @@ impl<'h> Agent<'h> {
                     usage: TokenUsage::default(),
                     cost: None,
                     billing: Billing::default(),
-                    model: target.to_string(),
+                    model: binding_label,
                 })?;
                 if cancelled {
                     return Err(AgentError::Cancelled);
@@ -2540,9 +2536,9 @@ mod tests {
             ]);
             let captured_models = Arc::clone(&provider.captured_models);
             let current_model = default_model();
-            let weak_model = Model::from_tier_with_policy(
-                &current_model.provider,
-                caudra_providers::ModelTier::Weak,
+            let weak_model = Model::resolve(
+                caudra_providers::ModelPurpose::Fast,
+                &current_model,
                 &ModelPolicy::default(),
             )
             .unwrap();
@@ -2582,9 +2578,9 @@ mod tests {
             ]);
             let captured_models = Arc::clone(&provider.captured_models);
             let current_model = default_model();
-            let weak_model = Model::from_tier_with_policy(
-                &current_model.provider,
-                caudra_providers::ModelTier::Weak,
+            let weak_model = Model::resolve(
+                caudra_providers::ModelPurpose::Fast,
+                &current_model,
                 &ModelPolicy::default(),
             )
             .unwrap();
@@ -2645,9 +2641,9 @@ mod tests {
             ]);
             let captured_models = Arc::clone(&provider.captured_models);
             let current_model = default_model();
-            let weak_model = Model::from_tier_with_policy(
-                &current_model.provider,
-                caudra_providers::ModelTier::Weak,
+            let weak_model = Model::resolve(
+                caudra_providers::ModelPurpose::Fast,
+                &current_model,
                 &ModelPolicy::default(),
             )
             .unwrap();

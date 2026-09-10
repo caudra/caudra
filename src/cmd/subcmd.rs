@@ -22,7 +22,7 @@ use caudra_config::{
 };
 use caudra_lua::PluginHost;
 use caudra_providers::provider::fetch_all_models;
-use caudra_providers::{Model, ProviderData, Timeouts, catalog_providers};
+use caudra_providers::{Model, ModelPurpose, ProviderData, Timeouts, catalog_providers};
 use caudra_providers::{anthropic_auth, copilot_auth, dynamic, openai_auth, xai_auth};
 use caudra_storage::StateDir;
 use caudra_storage::auth::{
@@ -40,6 +40,7 @@ const AUTH_STATUS_ENV: &str = "\x1b[33m~ env  \x1b[0m";
 const AUTH_STATUS_KEY: &str = "\x1b[32m✓ key  \x1b[0m";
 const AUTH_STATUS_OAUTH: &str = "\x1b[32m✓ oauth\x1b[0m";
 const PROVIDER_SLUG_WIDTH: usize = 14;
+const CLASS_GAP: &str = "  ";
 const SKILLS_HEADING: &str = "Skills";
 const SKILL_DIRS_HEADING: &str = "Directories";
 const NO_SKILLS_FOUND: &str = "No skills found.";
@@ -629,6 +630,37 @@ pub fn auth_status(storage: &StateDir) -> Result<()> {
     Ok(())
 }
 
+/// Specs stay first, and a batch with nothing classified stays unpadded, so
+/// piping `caudra models` into another command keeps working unchanged.
+///
+/// Width is per batch because batches stream in as each provider answers, and
+/// buffering every provider to align one column would hold back the output.
+fn model_lines(specs: &[String]) -> Vec<String> {
+    let classes: Vec<Option<ModelPurpose>> = specs
+        .iter()
+        .map(|spec| {
+            spec.split_once('/')
+                .and_then(|(provider, id)| Model::class_of(provider, id))
+        })
+        .collect();
+    let width = specs
+        .iter()
+        .zip(&classes)
+        .filter(|(_, class)| class.is_some())
+        .map(|(spec, _)| spec.chars().count())
+        .max();
+    specs
+        .iter()
+        .zip(classes)
+        .map(|(spec, class)| match (class, width) {
+            (Some(class), Some(width)) => {
+                format!("{spec:<width$}{CLASS_GAP}{}", class.label())
+            }
+            _ => spec.clone(),
+        })
+        .collect()
+}
+
 pub fn models(no_plugins: bool, no_jit: bool) -> Result<()> {
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
     load_env_files(&cwd);
@@ -640,8 +672,8 @@ pub fn models(no_plugins: bool, no_jit: bool) -> Result<()> {
     smol::block_on(fetch_all_models(
         &config.provider.model_policy,
         |batch| {
-            for model in batch.models {
-                println!("{model}");
+            for line in model_lines(&batch.models) {
+                println!("{line}");
             }
             for warning in batch.warnings {
                 eprintln!("warning: {warning}");
@@ -1236,6 +1268,47 @@ mod auth_tests {
     #[test]
     fn oauth_method_rejects_non_subscription_provider() {
         assert!(login_route("google", Some(AuthMethod::Oauth)).is_err());
+    }
+
+    const CURATED_SPEC: &str = "anthropic/claude-haiku-4-5";
+    const UNCURATED_SPEC: &str = "ollama/llama3";
+    const AGGREGATED_SPEC: &str = "openrouter/anthropic/claude-haiku-4-5";
+
+    #[test]
+    fn a_listed_model_carries_its_class() {
+        let lines = model_lines(&[CURATED_SPEC.into()]);
+        assert_eq!(
+            lines,
+            vec![format!(
+                "{CURATED_SPEC}{CLASS_GAP}{}",
+                ModelPurpose::Fast.label()
+            )]
+        );
+    }
+
+    /// An aggregator has no catalogue of its own, so the class has to come from
+    /// the vendor named in the model id.
+    #[test]
+    fn an_aggregated_model_borrows_the_upstream_class() {
+        let lines = model_lines(&[AGGREGATED_SPEC.into()]);
+        assert!(lines[0].ends_with(ModelPurpose::Fast.label()), "{lines:?}");
+    }
+
+    /// A batch nobody classified must pipe exactly as it did before the column
+    /// existed, with no trailing padding.
+    #[test]
+    fn an_unclassified_batch_stays_bare() {
+        assert_eq!(
+            model_lines(&[UNCURATED_SPEC.into()]),
+            vec![UNCURATED_SPEC.to_string()]
+        );
+    }
+
+    #[test]
+    fn a_mixed_batch_aligns_on_the_widest_classified_spec() {
+        let lines = model_lines(&[CURATED_SPEC.into(), UNCURATED_SPEC.into()]);
+        assert_eq!(lines[1], UNCURATED_SPEC, "unclassified rows stay bare");
+        assert!(lines[0].starts_with(CURATED_SPEC));
     }
 
     #[test_case("1", Some(Protocol::Openai) ; "chat_by_number")]

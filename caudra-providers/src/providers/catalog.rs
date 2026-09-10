@@ -280,7 +280,6 @@ impl CatalogMeta {
             supports_thinking: Some(self.supports_thinking),
             supports_vision: Some(self.supports_vision),
             reasoning_options: Some(self.reasoning_options.clone()),
-            tier: None,
             provider_info: None,
         }
     }
@@ -1043,7 +1042,7 @@ mod tests {
     use crate::model::{Model, ModelPricing};
     use crate::provider::Provider;
     use crate::providers::Timeouts;
-    use crate::{AgentError, ModelFamily, ModelTier, RequestOptions};
+    use crate::{AgentError, ModelFamily, RequestOptions};
     use test_case::test_case;
 
     #[test]
@@ -1116,7 +1115,6 @@ mod tests {
         let model = Model {
             id: "free-model".into(),
             provider: Arc::from("opencode-go"),
-            tier: ModelTier::Medium,
             family: ModelFamily::Generic,
             billing: crate::model::Billing::default(),
             supports_tool_examples_override: None,

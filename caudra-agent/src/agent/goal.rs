@@ -3,11 +3,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use caudra_config::ModelPolicy;
-use caudra_providers::model_registry::GoalEvaluatorTarget;
+use caudra_providers::model_registry::Binding;
 use caudra_providers::provider::{Provider, from_model_async};
 use caudra_providers::{
-    AgentError, Billing, ContentBlock, Message, Model, ModelError, ModelTier, RequestOptions,
-    Timeouts, TokenUsage,
+    AgentError, Billing, ContentBlock, Message, Model, ModelPurpose, RequestOptions, Timeouts,
+    TokenUsage,
 };
 use caudra_storage::id::SessionRef;
 use caudra_storage::sessions::{StoredActiveGoal, StoredGoalVerdict};
@@ -350,26 +350,31 @@ pub(crate) struct EvaluationError {
 
 #[derive(Clone)]
 pub(crate) struct ResolvedEvaluator {
-    pub target: GoalEvaluatorTarget,
+    /// The Goal binding this was resolved from, or `None` when nothing is bound
+    /// and the default rule chose the model.
+    pub binding: Option<Binding>,
     pub provider: Arc<dyn Provider>,
     pub model: Model,
 }
 
 impl ResolvedEvaluator {
+    /// Only an unbound evaluator retreats to the chat model. A model the user
+    /// named is reported instead, since silently substituting it would hide the
+    /// choice they made.
     pub(crate) fn fallback_to_current(
         &self,
         error: &AgentError,
         current_provider: &Arc<dyn Provider>,
         current_model: &Model,
     ) -> Option<Self> {
-        if self.target != GoalEvaluatorTarget::Auto
+        if self.binding.is_some()
             || !error.is_model_unavailable()
             || (self.model.provider == current_model.provider && self.model.id == current_model.id)
         {
             return None;
         }
         Some(Self {
-            target: GoalEvaluatorTarget::Auto,
+            binding: None,
             provider: Arc::clone(current_provider),
             model: with_evaluator_limits(current_model.clone()),
         })
@@ -379,7 +384,7 @@ impl ResolvedEvaluator {
 pub(crate) async fn resolve_evaluator(
     current_provider: &Arc<dyn Provider>,
     current_model: &Model,
-    target: GoalEvaluatorTarget,
+    binding: Option<Binding>,
     timeouts: Timeouts,
     model_policy: &ModelPolicy,
     cancel: &CancelToken,
@@ -388,13 +393,12 @@ pub(crate) async fn resolve_evaluator(
     let current_provider = Arc::clone(current_provider);
     let current_model = current_model.clone();
     let current_slug = Arc::clone(&current_model.provider);
-    let target_for_resolution = target.clone();
     let model_policy = model_policy.clone();
+    let bound = binding.clone();
     let (model, provider) = initialization_with_limits(cancel, async move {
-        let mut model = smol::unblock(move || {
-            evaluator_model(&current_model, &target_for_resolution, &model_policy)
-        })
-        .await?;
+        let mut model =
+            smol::unblock(move || evaluator_model(bound.as_ref(), &current_model, &model_policy))
+                .await?;
         let provider: Arc<dyn Provider> = if model.provider == current_slug {
             current_provider.adjust_model(&mut model);
             current_provider
@@ -409,7 +413,7 @@ pub(crate) async fn resolve_evaluator(
     .await?;
     let model = with_evaluator_limits(model);
     Ok(ResolvedEvaluator {
-        target,
+        binding,
         provider,
         model,
     })
@@ -441,46 +445,16 @@ async fn initialization_with_limits<T>(
         .map_err(|_| AgentError::Cancelled)?
 }
 
-fn goal_model_error(spec: &str, error: ModelError) -> AgentError {
-    AgentError::Config {
-        message: format!("cannot resolve goal evaluator model '{spec}': {error}"),
-    }
-}
-
 fn evaluator_model(
+    binding: Option<&Binding>,
     current_model: &Model,
-    target: &GoalEvaluatorTarget,
     model_policy: &ModelPolicy,
 ) -> Result<Model, AgentError> {
-    let model = match target {
-        GoalEvaluatorTarget::Auto => {
-            Model::from_tier_with_policy(&current_model.provider, ModelTier::Weak, model_policy)
-                .unwrap_or_else(|_| current_model.clone())
-        }
-        GoalEvaluatorTarget::Tier(tier) => {
-            Model::from_tier_with_policy(&current_model.provider, *tier, model_policy).map_err(
-                |error| AgentError::Config {
-                    message: format!("cannot resolve {tier} goal evaluator: {error}"),
-                },
-            )?
-        }
-        GoalEvaluatorTarget::Model(spec) => {
-            if !model_policy.allows(spec) {
-                return Err(goal_model_error(
-                    spec,
-                    ModelError::NotAllowed(spec.to_string()),
-                ));
-            }
-            match Model::from_spec(spec) {
-                Err(ModelError::UnsupportedProvider(_)) => {
-                    caudra_providers::warm_catalog();
-                    Model::from_spec(spec).map_err(|error| goal_model_error(spec, error))?
-                }
-                result => result.map_err(|error| goal_model_error(spec, error))?,
-            }
-        }
-    };
-    Ok(model)
+    Model::resolve_binding(ModelPurpose::Goal, binding, current_model, model_policy).map_err(
+        |error| AgentError::Config {
+            message: format!("cannot resolve the goal evaluator model: {error}"),
+        },
+    )
 }
 
 #[derive(Deserialize)]
@@ -809,6 +783,10 @@ mod tests {
     use caudra_providers::{ModelInfo, ProviderEvent, StreamResponse};
     use serde_json::Value;
 
+    const CHAT_SPEC: &str = "anthropic/claude-sonnet-4-20250514";
+    const HAIKU_SPEC: &str = "anthropic/claude-haiku-4-5";
+    const OPUS_SPEC: &str = "anthropic/claude-opus-4-6-20260101";
+
     struct NullProvider;
 
     struct ProgressProvider;
@@ -979,61 +957,49 @@ mod tests {
     }
 
     #[test]
-    fn resolves_auto_tiers_and_exact_models() {
+    fn an_unbound_evaluator_takes_the_curated_cheap_model_of_the_chat_provider() {
         smol::block_on(async {
             let provider: Arc<dyn Provider> = Arc::new(NullProvider);
-            let current = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
-            let policy = ModelPolicy::default();
+            let current = Model::from_spec(CHAT_SPEC).unwrap();
 
             let auto = resolve_evaluator(
                 &provider,
                 &current,
-                GoalEvaluatorTarget::Auto,
+                None,
                 Timeouts::default(),
-                &policy,
+                &ModelPolicy::default(),
                 &CancelToken::none(),
                 None,
             )
             .await
             .unwrap();
-            assert_eq!(auto.model.tier, ModelTier::Weak);
+
+            assert_eq!(auto.model.provider.as_ref(), "anthropic");
+            assert_ne!(auto.model.spec(), current.spec());
             assert_eq!(auto.model.max_output_tokens, Some(EVALUATOR_OUTPUT_TOKENS));
             assert!(Arc::ptr_eq(&auto.provider, &provider));
+        });
+    }
 
-            let strong = resolve_evaluator(
-                &provider,
-                &current,
-                GoalEvaluatorTarget::Tier(ModelTier::Strong),
-                Timeouts::default(),
-                &policy,
-                &CancelToken::none(),
-                None,
-            )
-            .await
-            .unwrap();
-            assert_eq!(strong.model.tier, ModelTier::Strong);
-            assert_eq!(strong.model.provider.as_ref(), "anthropic");
-
-            let cross_provider = evaluator_model(
-                &current,
-                &GoalEvaluatorTarget::Model("ollama/qwen3".into()),
-                &policy,
-            )
-            .unwrap();
-            assert_eq!(cross_provider.spec(), "ollama/qwen3");
+    #[test]
+    fn an_exact_binding_may_name_another_provider() {
+        smol::block_on(async {
+            let provider: Arc<dyn Provider> = Arc::new(NullProvider);
+            let current = Model::from_spec(CHAT_SPEC).unwrap();
 
             let exact = resolve_evaluator(
                 &provider,
                 &current,
-                GoalEvaluatorTarget::Model("anthropic/claude-opus-4-6-20260101".into()),
+                Some(Binding::Exact(OPUS_SPEC.into())),
                 Timeouts::default(),
-                &policy,
+                &ModelPolicy::default(),
                 &CancelToken::none(),
                 None,
             )
             .await
             .unwrap();
-            assert_eq!(exact.model.spec(), "anthropic/claude-opus-4-6-20260101");
+
+            assert_eq!(exact.model.spec(), OPUS_SPEC);
             assert!(Arc::ptr_eq(&exact.provider, &provider));
         });
     }
@@ -1044,9 +1010,9 @@ mod tests {
         let current_model = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
         let original_output_limit = current_model.max_output_tokens;
         let evaluator = ResolvedEvaluator {
-            target: GoalEvaluatorTarget::Auto,
+            binding: None,
             provider: Arc::new(NullProvider),
-            model: Model::from_spec("anthropic/claude-haiku-4-5").unwrap(),
+            model: Model::from_spec(HAIKU_SPEC).unwrap(),
         };
 
         let fallback = evaluator
@@ -1067,19 +1033,19 @@ mod tests {
     }
 
     #[test]
-    fn only_auto_falls_back_from_an_unavailable_model() {
+    fn only_an_unbound_evaluator_falls_back_from_an_unavailable_model() {
         let current_provider: Arc<dyn Provider> = Arc::new(NullProvider);
-        let current_model = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
+        let current_model = Model::from_spec(CHAT_SPEC).unwrap();
         let unavailable = AgentError::api(404, "unknown model claude-haiku-4-5");
 
-        for target in [
-            GoalEvaluatorTarget::Tier(ModelTier::Weak),
-            GoalEvaluatorTarget::Model("anthropic/claude-haiku-4-5".into()),
+        for binding in [
+            Binding::Same(ModelPurpose::Fast),
+            Binding::Exact(HAIKU_SPEC.into()),
         ] {
             let evaluator = ResolvedEvaluator {
-                target,
+                binding: Some(binding),
                 provider: Arc::new(NullProvider),
-                model: Model::from_spec("anthropic/claude-haiku-4-5").unwrap(),
+                model: Model::from_spec(HAIKU_SPEC).unwrap(),
             };
             assert!(
                 evaluator
@@ -1094,7 +1060,7 @@ mod tests {
         let current_provider: Arc<dyn Provider> = Arc::new(NullProvider);
         let current_model = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
         let evaluator = ResolvedEvaluator {
-            target: GoalEvaluatorTarget::Auto,
+            binding: None,
             provider: Arc::new(NullProvider),
             model: current_model.clone(),
         };
@@ -1110,7 +1076,7 @@ mod tests {
         );
 
         let other_model = ResolvedEvaluator {
-            model: Model::from_spec("anthropic/claude-haiku-4-5").unwrap(),
+            model: Model::from_spec(HAIKU_SPEC).unwrap(),
             ..evaluator
         };
         assert!(
@@ -1134,7 +1100,7 @@ mod tests {
             let disallowed = resolve_evaluator(
                 &provider,
                 &current,
-                GoalEvaluatorTarget::Model("anthropic/claude-opus-4-6".into()),
+                Some(Binding::Exact("anthropic/claude-opus-4-6".into())),
                 Timeouts::default(),
                 &policy,
                 &CancelToken::none(),

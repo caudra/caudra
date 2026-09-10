@@ -5,7 +5,7 @@ use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
 
 use caudra_providers::manifest::ManifestRegistry;
-use caudra_providers::model::{Model, ModelError, ModelTier};
+use caudra_providers::model::{Model, ModelError, ModelPurpose};
 use caudra_providers::{HistoryItem, active_history_items, resolve_history_head};
 use caudra_storage::StateDir;
 use caudra_storage::id::CaudraId;
@@ -111,10 +111,10 @@ fn from_spec_or_warm_catalog(spec: &str) -> Result<Model, ModelError> {
 }
 
 fn auto_detect_model(policy: &caudra_config::ModelPolicy) -> Option<Model> {
-    for tier in [ModelTier::Strong, ModelTier::Medium] {
+    for purpose in [ModelPurpose::Best, ModelPurpose::Balanced] {
         for &slug in PROVIDER_PRIORITY {
             if caudra_providers::provider::provider_available(slug)
-                && let Ok(model) = Model::from_tier(slug, tier)
+                && let Some(model) = Model::curated_default(slug, purpose)
                 && policy.allows(&model.spec())
             {
                 return Some(model);

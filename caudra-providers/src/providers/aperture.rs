@@ -374,7 +374,6 @@ fn parse_models(body: &Value, overrides: &Overrides) -> Vec<ModelInfo> {
                     .or_else(|| routed_kind(provider_id, &ov).map(kind_supports_thinking)),
                 supports_vision: ov.supports_vision,
                 reasoning_options: None,
-                tier: None,
                 provider_info: None,
             })
         })

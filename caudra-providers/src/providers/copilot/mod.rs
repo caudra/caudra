@@ -14,7 +14,7 @@ use super::anthropic::shared;
 use super::openai::responses;
 use super::openai_compat;
 use crate::model::{
-    Billing, Model, ModelEntry, ModelFamily, ModelInfo, ModelPricing, ModelTier,
+    Billing, Model, ModelEntry, ModelFamily, ModelInfo, ModelPricing, ModelPurpose,
     StaticReasoningOption, lookup_entry,
 };
 use crate::provider::{BoxFuture, Provider};
@@ -107,7 +107,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
     const MODELS: &[ModelEntry] = &[
         ModelEntry {
             prefixes: &["gpt-5-mini"],
-            tier: ModelTier::Weak,
+            purpose: ModelPurpose::Fast,
             family: ModelFamily::Generic,
             vision: true,
             default: false,
@@ -125,7 +125,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["gpt-5.4-mini"],
-            tier: ModelTier::Weak,
+            purpose: ModelPurpose::Fast,
             family: ModelFamily::Generic,
             vision: true,
             default: false,
@@ -143,7 +143,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["gpt-5.4-nano"],
-            tier: ModelTier::Weak,
+            purpose: ModelPurpose::Fast,
             family: ModelFamily::Generic,
             vision: true,
             default: false,
@@ -161,7 +161,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["claude-haiku-4.5"],
-            tier: ModelTier::Weak,
+            purpose: ModelPurpose::Fast,
             family: ModelFamily::Generic,
             vision: true,
             default: false,
@@ -179,7 +179,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["gemini-3.5-flash"],
-            tier: ModelTier::Weak,
+            purpose: ModelPurpose::Fast,
             family: ModelFamily::Generic,
             vision: true,
             default: false,
@@ -197,7 +197,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["gemini-3.6-flash"],
-            tier: ModelTier::Medium,
+            purpose: ModelPurpose::Balanced,
             family: ModelFamily::Generic,
             vision: true,
             default: false,
@@ -215,7 +215,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["gemini-3.7-flash"],
-            tier: ModelTier::Medium,
+            purpose: ModelPurpose::Balanced,
             family: ModelFamily::Generic,
             vision: true,
             default: false,
@@ -233,7 +233,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["mai-code-1-flash-picker"],
-            tier: ModelTier::Weak,
+            purpose: ModelPurpose::Fast,
             family: ModelFamily::Generic,
             vision: true,
             default: false,
@@ -251,7 +251,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["claude-sonnet-4.5", "claude-sonnet-4.6"],
-            tier: ModelTier::Medium,
+            purpose: ModelPurpose::Balanced,
             family: ModelFamily::Generic,
             vision: true,
             default: false,
@@ -269,7 +269,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["claude-sonnet-5"],
-            tier: ModelTier::Medium,
+            purpose: ModelPurpose::Balanced,
             family: ModelFamily::Generic,
             vision: true,
             default: false,
@@ -287,7 +287,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["gpt-5.5"],
-            tier: ModelTier::Strong,
+            purpose: ModelPurpose::Best,
             family: ModelFamily::Generic,
             vision: true,
             default: false,
@@ -305,7 +305,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["kimi-k2.7-code"],
-            tier: ModelTier::Medium,
+            purpose: ModelPurpose::Balanced,
             family: ModelFamily::Generic,
             vision: true,
             default: false,
@@ -323,7 +323,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["kimi-k3"],
-            tier: ModelTier::Strong,
+            purpose: ModelPurpose::Best,
             family: ModelFamily::Generic,
             vision: true,
             default: false,
@@ -341,7 +341,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["gemini-3.1-pro-preview"],
-            tier: ModelTier::Medium,
+            purpose: ModelPurpose::Balanced,
             family: ModelFamily::Generic,
             vision: true,
             default: false,
@@ -359,7 +359,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["gpt-5.6-luna"],
-            tier: ModelTier::Weak,
+            purpose: ModelPurpose::Fast,
             family: ModelFamily::Generic,
             vision: true,
             default: true,
@@ -377,7 +377,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["gpt-5.4"],
-            tier: ModelTier::Strong,
+            purpose: ModelPurpose::Best,
             family: ModelFamily::Generic,
             vision: true,
             default: false,
@@ -395,7 +395,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["gpt-5.6-sol"],
-            tier: ModelTier::Strong,
+            purpose: ModelPurpose::Best,
             family: ModelFamily::Generic,
             vision: true,
             default: false,
@@ -413,7 +413,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["gpt-5.6-terra"],
-            tier: ModelTier::Medium,
+            purpose: ModelPurpose::Balanced,
             family: ModelFamily::Generic,
             vision: true,
             default: true,
@@ -431,7 +431,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["gpt-5.3-codex"],
-            tier: ModelTier::Strong,
+            purpose: ModelPurpose::Best,
             family: ModelFamily::Generic,
             vision: true,
             default: false,
@@ -455,7 +455,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
                 "claude-opus-4.6",
                 "claude-opus-4.5",
             ],
-            tier: ModelTier::Strong,
+            purpose: ModelPurpose::Best,
             family: ModelFamily::Generic,
             vision: true,
             default: true,
@@ -473,7 +473,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["claude-opus-4.8-fast", "claude-fable-5"],
-            tier: ModelTier::Strong,
+            purpose: ModelPurpose::Best,
             family: ModelFamily::Generic,
             vision: true,
             default: false,
@@ -491,7 +491,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["grok-4.5"],
-            tier: ModelTier::Medium,
+            purpose: ModelPurpose::Balanced,
             family: ModelFamily::Generic,
             vision: true,
             default: false,
@@ -509,7 +509,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["grok-4.6"],
-            tier: ModelTier::Medium,
+            purpose: ModelPurpose::Balanced,
             family: ModelFamily::Generic,
             vision: true,
             default: false,
@@ -796,8 +796,6 @@ struct CopilotModel {
     #[serde(default)]
     model_picker_enabled: bool,
     #[serde(default)]
-    model_picker_category: Option<CopilotModelCategory>,
-    #[serde(default)]
     supported_endpoints: Vec<String>,
 }
 
@@ -844,9 +842,6 @@ impl CopilotModel {
             supports_thinking: Some(self.supports_thinking()),
             supports_vision: Some(self.capabilities.supports.vision),
             reasoning_options: Some(self.reasoning_options()),
-            tier: self
-                .model_picker_category
-                .and_then(CopilotModelCategory::tier),
             provider_info: None,
         }
     }
@@ -921,27 +916,6 @@ impl CopilotModel {
             Endpoint::Responses
         } else {
             Endpoint::ChatCompletions
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum CopilotModelCategory {
-    Lightweight,
-    Versatile,
-    Powerful,
-    #[serde(other)]
-    Unknown,
-}
-
-impl CopilotModelCategory {
-    const fn tier(self) -> Option<ModelTier> {
-        match self {
-            Self::Lightweight => Some(ModelTier::Weak),
-            Self::Versatile => Some(ModelTier::Medium),
-            Self::Powerful => Some(ModelTier::Strong),
-            Self::Unknown => None,
         }
     }
 }
@@ -1227,7 +1201,6 @@ mod tests {
             billing: CopilotModelBilling::default(),
             is_chat_default: false,
             model_picker_enabled: true,
-            model_picker_category: None,
             supported_endpoints: vec![CHAT_COMPLETIONS_PATH.into(), MESSAGES_PATH.into()],
         };
         assert_eq!(model.endpoint(), Endpoint::Messages);
@@ -1240,11 +1213,10 @@ mod tests {
     }
 
     #[test]
-    fn parses_discovered_capabilities_and_category() {
+    fn parses_discovered_capabilities() {
         let model: CopilotModel = serde_json::from_value(json!({
             "id": "gpt-5.6-sol",
             "model_picker_enabled": true,
-            "model_picker_category": "powerful",
             "supported_endpoints": ["/responses"],
             "capabilities": {
                 "type": "chat",
@@ -1268,14 +1240,13 @@ mod tests {
         assert_eq!(info.max_output_tokens, Some(128_000));
         assert_eq!(info.supports_thinking, Some(true));
         assert_eq!(info.supports_vision, Some(true));
-        assert_eq!(info.tier, Some(ModelTier::Strong));
         let options = info.reasoning_options.unwrap();
         assert_eq!(options.efforts(), ["none", "low", "medium", "high"]);
         assert_eq!(options.budget_bounds(), Some((Some(1_024), Some(64_000))));
     }
 
     #[test]
-    fn unknown_category_keeps_model_without_tier() {
+    fn an_unrecognized_picker_field_keeps_the_model() {
         let model: CopilotModel = serde_json::from_value(json!({
             "id": "gpt-6",
             "model_picker_enabled": true,
@@ -1285,7 +1256,6 @@ mod tests {
         .unwrap();
 
         assert!(model.is_enabled_chat_model());
-        assert_eq!(model.model_info().tier, None);
     }
 
     #[test_case(RESPONSES_PATH, true; "responses honors reasoning")]
@@ -1305,18 +1275,18 @@ mod tests {
         assert_eq!(model.model_info().supports_thinking, Some(expected));
     }
 
-    #[test_case(ModelTier::Weak, "gpt-5.6-luna"; "weak defaults to luna")]
-    #[test_case(ModelTier::Medium, "gpt-5.6-terra"; "medium defaults to terra")]
-    #[test_case(ModelTier::Strong, "claude-opus-5"; "strong defaults to opus")]
-    fn manifest_has_exactly_one_default_per_tier(tier: ModelTier, expected_prefix: &str) {
+    #[test_case(ModelPurpose::Fast, "gpt-5.6-luna"; "fast defaults to luna")]
+    #[test_case(ModelPurpose::Balanced, "gpt-5.6-terra"; "balanced defaults to terra")]
+    #[test_case(ModelPurpose::Best, "claude-opus-5"; "best defaults to opus")]
+    fn manifest_has_exactly_one_default_per_purpose(purpose: ModelPurpose, expected_prefix: &str) {
         let defaults: Vec<_> = models()
             .iter()
-            .filter(|entry| entry.default && entry.tier == tier)
+            .filter(|entry| entry.default && entry.purpose == purpose)
             .collect();
         assert_eq!(defaults.len(), 1);
         assert_eq!(defaults[0].prefixes[0], expected_prefix);
         assert_eq!(
-            ManifestRegistry::find_default_for_tier("copilot", tier)
+            ManifestRegistry::find_default_for_purpose("copilot", purpose)
                 .unwrap()
                 .prefixes[0],
             expected_prefix
@@ -1439,7 +1409,6 @@ mod tests {
             billing: CopilotModelBilling::default(),
             is_chat_default: false,
             model_picker_enabled: true,
-            model_picker_category: None,
             supported_endpoints: vec![],
         };
         assert!(enabled.is_enabled_chat_model());

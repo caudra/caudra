@@ -57,8 +57,8 @@ use std::time::{Duration, Instant};
 use caudra_agent::AgentInput;
 use caudra_agent::tools::{SHELL_TOOL_NAME, ToolEffect};
 use caudra_agent::{BufferSnapshot, ImageSource, SubagentProgress, ToolInput, ToolOutput};
-use caudra_providers::model_registry::{CompactionTarget, GoalEvaluatorTarget, TitleTarget};
-use caudra_providers::{CaudraId, HistoryItem, ModelTier};
+use caudra_providers::model_registry::Binding;
+use caudra_providers::{CaudraId, HistoryItem, ModelPurpose};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
@@ -539,11 +539,8 @@ pub enum Action {
         provider: SubscriptionProvider,
         model_spec: String,
     },
-    AssignTier(String, ModelTier),
-    ResetTier(ModelTier),
-    SetGoalEvaluator(GoalEvaluatorTarget),
-    SetCompaction(CompactionTarget),
-    SetTitleModel(TitleTarget),
+    Bind(ModelPurpose, Binding),
+    Unbind(ModelPurpose),
     RefreshModels,
     RefreshUsage,
     RefreshStorage,
@@ -880,7 +877,6 @@ pub(crate) fn test_model() -> caudra_providers::Model {
     caudra_providers::Model {
         id: "test-model".into(),
         provider: std::sync::Arc::<str>::from("anthropic"),
-        tier: caudra_providers::ModelTier::Medium,
         family: caudra_providers::ModelFamily::Claude,
         supports_tool_examples_override: None,
         thinking_override: None,

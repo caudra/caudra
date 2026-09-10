@@ -1536,7 +1536,6 @@ mod tests {
         crate::model::Model {
             id: "test-model".into(),
             provider: std::sync::Arc::<str>::from(provider.to_string()),
-            tier: crate::model::ModelTier::Medium,
             family: provider.family(),
             supports_tool_examples_override: None,
             thinking_override: None,

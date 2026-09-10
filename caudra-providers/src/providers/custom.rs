@@ -5,7 +5,8 @@ use flume::Sender;
 use serde_json::Value;
 
 use caudra_config::providers::{
-    Protocol, ProviderDef, ProvidersConfig, resolve_api_key_env, resolve_base_url, resolve_protocol,
+    ModelPurpose, Protocol, ProviderDef, ProvidersConfig, resolve_api_key_env, resolve_base_url,
+    resolve_protocol,
 };
 use caudra_storage::id::SessionRef;
 
@@ -13,9 +14,7 @@ use super::ResolvedAuth;
 use super::openai::responses;
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 use crate::manifest::ManifestRegistry;
-use crate::model::{
-    Billing, FastPricing, Model, ModelFamily, ModelInfo, ModelPricing, ModelTier, ThinkingSupport,
-};
+use crate::model::{Billing, FastPricing, Model, ModelFamily, ModelPricing, ThinkingSupport};
 use crate::provider::{BoxFuture, Provider, ProviderKind};
 use crate::providers::Timeouts;
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig};
@@ -105,13 +104,24 @@ pub fn lookup_model(slug: &str, model_id: &str) -> Option<Model> {
     Some(model_from_def(def, kind, slug, model_id))
 }
 
-/// An absent `tier` means medium, so a model declared without one keeps
-/// resolving the way it did before `model_defaults` existed.
-fn declared_tier(def: &ProviderDef, model_id: &str) -> ModelTier {
-    def.model_settings(model_id)
-        .tier
-        .map(ModelTier::from)
-        .unwrap_or(ModelTier::Medium)
+/// Model ids this provider declares for `purpose` in `providers.toml`, the one
+/// that wins the slot first.
+pub fn declared_purpose(slug: &str, purpose: ModelPurpose) -> Vec<String> {
+    ProvidersConfig::load()
+        .get(slug)
+        .and_then(|def| def.purposes.get(&purpose))
+        .map(|models| models.iter().map(str::to_owned).collect())
+        .unwrap_or_default()
+}
+
+/// Whether `slug` declares `model_id` under `purpose`. Prefix-matched, so one
+/// declaration covers a whole family of fine-tunes and a picker can label every
+/// one of them rather than only the id that wins the slot.
+pub fn declares_purpose(slug: &str, purpose: ModelPurpose, model_id: &str) -> bool {
+    ProvidersConfig::load()
+        .get(slug)
+        .and_then(|def| def.purposes.get(&purpose))
+        .is_some_and(|models| models.matches(model_id))
 }
 
 /// A `providers.toml` entry whose id matches no live model silently voids every
@@ -139,11 +149,10 @@ fn warn_unmatched_model_id(def: &ProviderDef, slug: &str, model_id: &str) {
     );
 }
 
-/// Build a model from an already-loaded provider definition so tier resolution
+/// Build a model from an already-loaded provider definition so declared settings
 /// and id lookup can share one `providers.toml` read instead of loading twice.
 fn model_from_def(def: &ProviderDef, kind: ProviderKind, slug: &str, model_id: &str) -> Model {
     warn_unmatched_model_id(def, slug, model_id);
-    let tier = declared_tier(def, model_id);
     let declared = def.model_settings(model_id);
     let discovered = crate::model_registry::discovered(slug, model_id);
     let discovered = discovered.as_ref();
@@ -182,7 +191,6 @@ fn model_from_def(def: &ProviderDef, kind: ProviderKind, slug: &str, model_id: &
     Model {
         id: model_id.to_string(),
         provider: Arc::from(slug),
-        tier,
         // `kind` is the wire protocol, never the weights: an OpenAI-shaped
         // endpoint serves whatever the operator loaded. Windows and thinking
         // defaults above are transport concerns and may follow it; lineage may
@@ -252,39 +260,6 @@ fn declared_specs_from(config: &ProvidersConfig) -> Vec<String> {
     specs
 }
 
-/// Outcome of resolving a tier against `providers.toml` in a single read.
-pub enum TierLookup {
-    Model(Model),
-    /// Provider exists but declares no model at this tier; carries the base kind
-    /// so the caller can inherit the base protocol's default.
-    NoModelForTier(ProviderKind),
-    Unknown,
-}
-
-pub fn resolve_tier(slug: &str, tier: ModelTier) -> TierLookup {
-    // Builtins are never overridden through providers.toml (from_spec/create
-    // check builtin first); keep the tier path consistent with that.
-    if is_builtin_slug(slug) {
-        return TierLookup::Unknown;
-    }
-    let config = ProvidersConfig::load();
-    let Some(def) = config.get(slug) else {
-        return TierLookup::Unknown;
-    };
-    let Some(protocol) = def.protocol else {
-        return TierLookup::Unknown;
-    };
-    let kind = protocol_kind(protocol);
-    match def
-        .models
-        .iter()
-        .find(|model| declared_tier(def, &model.id) == tier)
-    {
-        Some(declared) => TierLookup::Model(model_from_def(def, kind, slug, &declared.id)),
-        None => TierLookup::NoModelForTier(kind),
-    }
-}
-
 /// Skip definitions handled by [`declared_model_specs`]; only HTTP `/models`
 /// goes through here, so an empty `discover_models = false` provider returns
 /// nothing and never hits the network.
@@ -307,8 +282,7 @@ pub fn discover_models(timeouts: Timeouts) -> Vec<String> {
                 let slug_c = slug.clone();
                 let result = smol::block_on(provider.list_models());
                 match result {
-                    Ok(mut models) => {
-                        overlay_declared_tiers(def, &mut models);
+                    Ok(models) => {
                         crate::model_registry::set_known_models(&slug_c, models.clone());
                         for m in models {
                             all_specs.push(format!("{slug_c}/{}", m.id));
@@ -325,18 +299,6 @@ pub fn discover_models(timeouts: Timeouts) -> Vec<String> {
         }
     }
     all_specs
-}
-
-/// Discovery via the openai compat layer never reports tiers, so stored models
-/// would only resolve positionally in `spec_for_tier`, shadowing tiers declared
-/// in `providers.toml`. Copying declared tiers onto the discovered entries lets
-/// the metadata candidate win and keeps declared config authoritative.
-fn overlay_declared_tiers(def: &ProviderDef, models: &mut [ModelInfo]) {
-    for model in models {
-        if def.model_settings(&model.id).tier.is_some() {
-            model.tier = Some(declared_tier(def, &model.id));
-        }
-    }
 }
 
 struct CustomOpenAiProvider {
@@ -397,6 +359,7 @@ impl Provider for CustomOpenAiProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::ModelInfo;
     use crate::types::ThinkingConfig;
 
     const ANTHROPIC_KEY_LEAKED: &str =
@@ -583,21 +546,5 @@ mod tests {
         assert_eq!(body["input"][0]["type"], "message");
         assert_eq!(body["input"][0]["content"][0]["text"], "hello");
         assert!(body.get("previous_response_id").is_none());
-    }
-
-    #[test]
-    fn overlay_declared_tiers_sets_tier_for_declared_models_only() {
-        let def: ProviderDef = serde_json::from_str(
-            r#"{"protocol":"openai","models":[{"id":"declared","tier":"strong"}]}"#,
-        )
-        .unwrap();
-        let mut models = vec![
-            ModelInfo::id_only("declared".to_string()),
-            ModelInfo::id_only("undeclared".to_string()),
-        ];
-
-        overlay_declared_tiers(&def, &mut models);
-        assert_eq!(models[0].tier, Some(ModelTier::Strong));
-        assert_eq!(models[1].tier, None);
     }
 }

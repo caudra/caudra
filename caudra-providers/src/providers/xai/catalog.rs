@@ -75,7 +75,6 @@ impl From<CachedModel> for ModelInfo {
                     values: model.reasoning_efforts,
                 }])
             }),
-            tier: None,
             provider_info: None,
         }
     }

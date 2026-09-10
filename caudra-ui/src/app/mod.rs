@@ -1492,13 +1492,8 @@ impl App {
         match action {
             ModelPickerAction::Consumed | ModelPickerAction::Close => vec![],
             ModelPickerAction::Select(spec) => vec![Action::ChangeModel(spec)],
-            ModelPickerAction::SetGoalEvaluator(target) => {
-                vec![Action::SetGoalEvaluator(target)]
-            }
-            ModelPickerAction::AssignTier(spec, tier) => vec![Action::AssignTier(spec, tier)],
-            ModelPickerAction::ResetTier(tier) => vec![Action::ResetTier(tier)],
-            ModelPickerAction::SetCompaction(target) => vec![Action::SetCompaction(target)],
-            ModelPickerAction::SetTitleModel(target) => vec![Action::SetTitleModel(target)],
+            ModelPickerAction::Bind(purpose, binding) => vec![Action::Bind(purpose, binding)],
+            ModelPickerAction::Unbind(purpose) => vec![Action::Unbind(purpose)],
         }
     }
 
@@ -3605,9 +3600,9 @@ impl App {
     }
 
     fn open_goal_model_picker(&mut self) -> Vec<Action> {
-        self.model_picker.open_goal(
+        self.model_picker.open_purpose(
             &self.state.model.spec(),
-            caudra_providers::model_registry::goal_evaluator_target(),
+            caudra_providers::ModelPurpose::Goal,
         );
         vec![Action::RefreshModels]
     }

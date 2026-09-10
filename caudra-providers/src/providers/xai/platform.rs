@@ -305,13 +305,12 @@ mod tests {
     use super::*;
     use crate::ReasoningOptions;
     use crate::types::ThinkingConfig;
-    use crate::{ModelFamily, ModelPricing, ModelTier};
+    use crate::{ModelFamily, ModelPricing};
 
     fn test_model(thinking: bool) -> Model {
         Model {
             id: "grok-4.6".into(),
             provider: "xai".into(),
-            tier: ModelTier::Strong,
             family: ModelFamily::Generic,
             supports_tool_examples_override: None,
             thinking_override: Some(if thinking {

@@ -507,12 +507,13 @@ impl App {
         }
         if self.goal_modal.is_open() {
             let status = self.state.goal.status();
-            let evaluator = caudra_providers::model_registry::goal_evaluator_target();
+            let evaluator =
+                caudra_providers::model_registry::binding(caudra_providers::ModelPurpose::Goal);
             let r = self.goal_modal.view(
                 frame,
                 full,
                 status.as_ref(),
-                &evaluator,
+                evaluator.as_ref(),
                 self.state.goal.continuation_limit(),
             );
             if r.width > 0 {
