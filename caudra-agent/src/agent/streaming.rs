@@ -187,6 +187,11 @@ async fn forward_provider_events(
         if let ProviderEvent::ThinkingDelta { text } = &pe {
             run_started.get_or_insert_with(Instant::now);
             reasoning_text.push_str(text);
+        } else if matches!(pe, ProviderEvent::PromptProgress { .. }) {
+            // A prefill ping is transport, not content. Ending the run on one
+            // would split a single thinking block into several, and only the
+            // first of those is paired with it, so a minute of reasoning would
+            // be recorded as the millisecond before the first ping.
         } else if let Some(started) = run_started.take() {
             reasoning.push(ForwardedReasoning {
                 text: std::mem::take(&mut reasoning_text),
@@ -1087,6 +1092,35 @@ mod tests {
         assert_eq!(forwarded.reasoning.len(), 2);
         assert_eq!(forwarded.reasoning[0].text, "first");
         assert_eq!(forwarded.reasoning[1].text, "second");
+    }
+
+    /// A prefill ping arriving mid-thought used to end the run, so one thinking
+    /// block became several and kept only the first, which is why a restored
+    /// transcript reported milliseconds for a thought that took seconds.
+    #[test]
+    fn a_prefill_ping_does_not_cut_a_thought_in_two() {
+        let (tx, rx) = flume::unbounded();
+        for event in [
+            ProviderEvent::ThinkingDelta {
+                text: "first".into(),
+            },
+            ProviderEvent::PromptProgress {
+                processed: 1,
+                total: 2,
+                cache: 0,
+            },
+            ProviderEvent::ThinkingDelta {
+                text: " second".into(),
+            },
+        ] {
+            tx.send(event).unwrap();
+        }
+        drop(tx);
+
+        let forwarded = smol::block_on(forward_provider_events(rx, None, false));
+
+        assert_eq!(forwarded.reasoning.len(), 1);
+        assert_eq!(forwarded.reasoning[0].text, "first second");
     }
 
     #[test]

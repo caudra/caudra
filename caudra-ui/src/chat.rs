@@ -680,7 +680,15 @@ pub fn history_to_display(
     let mut display = Vec::new();
     let mut restore_items: Vec<caudra_lua::RestoreItem> = Vec::new();
     let mut displayed_user_groups = HashSet::new();
+    // A run's reminders are written into the history ahead of the message that
+    // triggered them, but the reader typed that message first and watched it
+    // land first. Held back so the restored order is the order they saw, rather
+    // than the order the request was assembled in.
+    let mut introducing: Vec<DisplayMessage> = Vec::new();
     for item in items {
+        if !matches!(item.kind, HistoryItemKind::User { .. }) {
+            display.append(&mut introducing);
+        }
         match &item.kind {
             // An injected item is its own row rather than a candidate for the
             // turn's bubble, so it must not consume the group: a reminder and
@@ -691,7 +699,7 @@ pub fn history_to_display(
                 ..
             } => {
                 if show_reminders && text != COMPACTION_ANCHOR {
-                    display.push(DisplayMessage::new(DisplayRole::Injected, text.clone()));
+                    introducing.push(DisplayMessage::new(DisplayRole::Injected, text.clone()));
                 }
             }
             HistoryItemKind::User {
@@ -706,6 +714,7 @@ pub fn history_to_display(
                     message.source = Some(DisplaySource::User(id));
                     display.push(message);
                 }
+                display.append(&mut introducing);
             }
             HistoryItemKind::AssistantText {
                 text,
@@ -840,6 +849,7 @@ pub fn history_to_display(
             | HistoryItemKind::ToolResult { .. } => {}
         }
     }
+    display.append(&mut introducing);
     (display, restore_items)
 }
 
@@ -1630,8 +1640,13 @@ mod tests {
     /// Live, each reminder arrives as its own `Injected` event. A restored
     /// session replays history instead, so without this the reader loses every
     /// reminder the moment they reopen the session that received it.
+    ///
+    /// The order is the reader's, not the request's. A run writes its reminders
+    /// ahead of the message that triggered them, but the reader typed that
+    /// message first and watched it land first, so a reload that hoisted the
+    /// reminders above it would rewrite what they remember happening.
     #[test]
-    fn history_to_display_replays_injected_messages_except_mentions() {
+    fn history_to_display_replays_injected_messages_after_the_turn_they_introduce() {
         let msgs = vec![
             Message::observation(INJECTED_TEXT.into()),
             Message::mention(MENTION_BODY.into()),
@@ -1650,11 +1665,65 @@ mod tests {
         assert_eq!(
             rows,
             [
-                (&DisplayRole::Injected, INJECTED_TEXT),
                 (&DisplayRole::User, USER_TEXT),
+                (&DisplayRole::Injected, INJECTED_TEXT),
                 (&DisplayRole::Injected, SYNTHETIC_TEXT),
             ]
         );
+    }
+
+    /// The exact shape of a fresh session: the environment and the mode are
+    /// announced before the first message reaches the model, so a naive replay
+    /// opens the transcript on two reminders instead of on what was typed.
+    #[test]
+    fn a_restored_first_turn_keeps_its_reminders_below_it() {
+        let msgs = vec![
+            Message::observation(INJECTED_TEXT.into()),
+            Message::observation(SYNTHETIC_TEXT.into()),
+            Message::user(USER_TEXT.into()),
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: REPLY_TEXT.into(),
+                }],
+                ..Default::default()
+            },
+        ];
+        let items = crate::history_items(&msgs);
+
+        let display =
+            history_to_display(&items, &empty_outputs(), &ToolOutputLines::default(), true).0;
+
+        assert_eq!(display[0].role, DisplayRole::User);
+        assert_eq!(display[0].text, USER_TEXT);
+        assert_eq!(display[1].role, DisplayRole::Injected);
+        assert_eq!(display[2].role, DisplayRole::Injected);
+        assert_eq!(display[3].role, DisplayRole::Assistant);
+    }
+
+    /// A continuation has no turn to sit under, so it stays where it happened.
+    #[test]
+    fn an_injected_message_with_no_following_turn_keeps_its_place() {
+        let msgs = vec![
+            Message::user(USER_TEXT.into()),
+            Message::synthetic(SYNTHETIC_TEXT.into()),
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: REPLY_TEXT.into(),
+                }],
+                ..Default::default()
+            },
+        ];
+        let items = crate::history_items(&msgs);
+
+        let display =
+            history_to_display(&items, &empty_outputs(), &ToolOutputLines::default(), true).0;
+
+        assert_eq!(display[0].role, DisplayRole::User);
+        assert_eq!(display[1].role, DisplayRole::Injected);
+        assert_eq!(display[1].text, SYNTHETIC_TEXT);
+        assert_eq!(display[2].role, DisplayRole::Assistant);
     }
 
     #[test]
