@@ -1,4 +1,4 @@
-use crate::FilesystemError;
+use crate::{FilesystemError, diff::DiffHunk};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PatchHunk {
@@ -167,11 +167,15 @@ pub(crate) fn parse_patch(patch_text: &str) -> Result<Vec<PatchHunk>, Filesystem
     Ok(hunks)
 }
 
+/// Apply the parsed chunks and report where each one landed. The spans are the
+/// matched region of the original, not the chunk's own `old_lines`: `seek`
+/// accepts whitespace-insensitive matches, so only the file's own lines
+/// describe what was replaced.
 pub(crate) fn apply_update_chunks(
     file_path: &str,
     chunks: &[UpdateChunk],
     original: &str,
-) -> Result<String, FilesystemError> {
+) -> Result<(String, Vec<DiffHunk>), FilesystemError> {
     let body = original.strip_suffix('\n').unwrap_or(original);
     let lines = body.split('\n').map(ToOwned::to_owned).collect::<Vec<_>>();
     let mut replacements: Vec<(usize, usize, Vec<String>)> = Vec::new();
@@ -203,11 +207,27 @@ pub(crate) fn apply_update_chunks(
     // Applying from the end keeps earlier indices valid. Stable sorting also
     // reproduces JavaScript's ordering for multiple insertions at one index.
     replacements.sort_by_key(|replacement| std::cmp::Reverse(replacement.0));
+    // A chunk's new position is shifted only by the chunks spliced after it, so
+    // walking the splice order backwards accumulates exactly that shift. Two
+    // insertions at one index land in splice order, which this reproduces and a
+    // forward walk over the original positions would not.
+    let mut hunks = Vec::with_capacity(replacements.len());
+    let mut shift = 0isize;
+    for (start, length, replacement) in replacements.iter().rev() {
+        hunks.push(DiffHunk {
+            old_start: *start,
+            old_len: *length,
+            new_start: start.saturating_add_signed(shift),
+            new_len: replacement.len(),
+        });
+        shift += replacement.len() as isize - *length as isize;
+    }
+    hunks.sort_by_key(|hunk| (hunk.new_start, hunk.old_start));
     let mut next = lines;
     for (start, length, replacement) in replacements {
         next.splice(start..start + length, replacement);
     }
-    Ok(format!("{}\n", next.join("\n")))
+    Ok((format!("{}\n", next.join("\n")), hunks))
 }
 
 fn seek(lines: &[String], pattern: &[String], start: usize, eof: bool) -> Option<usize> {
@@ -302,7 +322,7 @@ fn strip_heredoc(input: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{PatchHunk, apply_update_chunks, parse_patch};
+    use super::{DiffHunk, PatchHunk, apply_update_chunks, parse_patch};
 
     #[test]
     fn parses_heredoc_and_applies_context_with_whitespace_fallback() {
@@ -313,9 +333,52 @@ mod tests {
         let PatchHunk::Update { chunks, .. } = &hunks[0] else {
             panic!("expected update");
         };
+        let (applied, hunks) =
+            apply_update_chunks("a.txt", chunks, "title\nold\n").expect("chunk applies");
+        assert_eq!(applied, "title\nnew\n");
         assert_eq!(
-            apply_update_chunks("a.txt", chunks, "title\nold\n").expect("chunk applies"),
-            "title\nnew\n"
+            hunks,
+            vec![DiffHunk {
+                old_start: 1,
+                old_len: 1,
+                new_start: 1,
+                new_len: 1
+            }]
         );
+    }
+
+    #[test]
+    fn a_reported_span_names_the_files_own_lines_not_the_patchs_spelling() {
+        // `seek` falls back to whitespace-insensitive matching, so a span that
+        // echoed the patch would render a line the file never contained.
+        let hunks = parse_patch(
+            "*** Begin Patch\n*** Update File: a.txt\n@@\n-beta\n+gamma\n*** End Patch",
+        )
+        .expect("patch parses");
+        let PatchHunk::Update { chunks, .. } = &hunks[0] else {
+            panic!("expected update");
+        };
+        let (_, spans) = apply_update_chunks("a.txt", chunks, "alpha\n  beta  \ndelta\n")
+            .expect("chunk applies");
+        assert_eq!(spans[0].old_start, 1);
+        assert_eq!(spans[0].old_len, 1);
+    }
+
+    #[test]
+    fn separated_chunks_report_separated_spans() {
+        let hunks = parse_patch(
+            "*** Begin Patch\n*** Update File: a.txt\n@@\n-one\n+ONE\n@@\n-five\n+FIVE\n*** End Patch",
+        )
+        .expect("patch parses");
+        let PatchHunk::Update { chunks, .. } = &hunks[0] else {
+            panic!("expected update");
+        };
+        let (applied, spans) =
+            apply_update_chunks("a.txt", chunks, "one\ntwo\nthree\nfour\nfive\n")
+                .expect("chunks apply");
+        assert_eq!(applied, "ONE\ntwo\nthree\nfour\nFIVE\n");
+        assert_eq!(spans.len(), 2);
+        assert_eq!((spans[0].old_start, spans[0].new_start), (0, 0));
+        assert_eq!((spans[1].old_start, spans[1].new_start), (4, 4));
     }
 }

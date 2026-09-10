@@ -1104,7 +1104,42 @@ async fn exact_edit_requires_unique_match_unless_replace_all_is_set() {
 }
 
 #[tokio::test]
-async fn bounds_reported_diffs_and_rejects_oversized_patch_results_before_publication() {
+async fn a_scattered_replace_all_previews_the_sites_not_the_span_between_them() {
+    let fixture = fixture();
+    let mut lines = (0..400)
+        .map(|index| format!("filler {index}\n"))
+        .collect::<Vec<_>>();
+    lines[3] = "target\n".to_owned();
+    lines[396] = "target\n".to_owned();
+    fs::write(fixture.root.join("scattered.txt"), lines.concat()).expect("fixture file");
+    let files = FileToolGroup::new(&fixture.root, true, None)
+        .await
+        .expect("tool group");
+
+    let output = files
+        .file_edit(
+            FileEditInput {
+                file_path: "scattered.txt".into(),
+                old_string: "target".into(),
+                new_string: "TARGET".into(),
+                replace_all: Some(true),
+            },
+            &token(),
+        )
+        .await
+        .expect("scattered edit");
+
+    // Two one-line sites 393 lines apart. A span-shaped preview would restate
+    // every line between them, on both sides.
+    assert_eq!((output.diff.additions, output.diff.deletions), (2, 2));
+    assert!(!output.diff.truncated);
+    assert_eq!(output.diff.patch.matches("@@ -").count(), 2);
+    assert!(output.diff.patch.len() < 512);
+    assert!(!output.diff.patch.contains("filler 200"));
+}
+
+#[tokio::test]
+async fn bounds_reported_diffs_without_ever_failing_the_mutation() {
     let fixture = fixture();
     fs::write(fixture.root.join("large.txt"), "old\n".repeat(20_000)).expect("large file");
     let files = FileToolGroup::new(
@@ -1170,8 +1205,9 @@ async fn bounds_reported_diffs_and_rejects_oversized_patch_results_before_public
     assert!(bounded_patch.files[0].truncated);
     assert!(!fixture.root.join("large.txt").exists());
 
-    let original = fs::read_to_string(fixture.root.join("notes.txt")).expect("original");
-    let result = files
+    // A configured result budget shortens the receipt for the model. It never
+    // withholds a change the caller asked for and the plan already validated.
+    let result = bounded_patch_files
         .file_apply_patch(
             FileApplyPatchInput {
                 patch_text:
@@ -1181,15 +1217,13 @@ async fn bounds_reported_diffs_and_rejects_oversized_patch_results_before_public
             &token(),
         )
         .await
-        .expect_err("result budget must reject before publication");
+        .expect("a tight result budget shortens rather than refuses");
+    assert!(result.applied);
+    assert_eq!(result.files.len(), 1);
     assert!(
-        result
-            .to_string()
-            .contains("Patch result exceeds maximum size")
-    );
-    assert_eq!(
-        fs::read_to_string(fixture.root.join("notes.txt")).expect("unchanged"),
-        original
+        fs::read_to_string(fixture.root.join("notes.txt"))
+            .expect("patched")
+            .starts_with("changed")
     );
 }
 

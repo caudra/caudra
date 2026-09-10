@@ -810,6 +810,8 @@ large file.
 - `filePath`, `oldString`, and `newString` are required.
 - By default, the edit fails if `oldString` is absent or appears more than once. Set `replaceAll: true`
   only when replacing every exact occurrence is intentional.
+- The result carries a bounded unified diff with one hunk per replacement site, so a `replaceAll`
+  across a large file reports the sites rather than the span between them.
 - Workcell revalidates source identity and content before publication, then uses the same atomic
   same-directory replacement path as `file_write`.
 
@@ -822,8 +824,13 @@ delete sections.
   for every file.
 - Add-file content uses `+` lines. Update sections use contextual hunks and may include
   `*** Move to:`. Delete sections remove an existing file.
-- The complete patch is validated and its result checked against the MCP size ceiling before the
-  first file is published.
+- The reported diff is rendered from the sections the patch declares, so it costs the change rather
+  than the distance between the first and last change in a file. `additions` and `deletions` count
+  the lines that actually differ.
+- The complete patch is validated and its result fitted to the MCP size ceiling before the first file
+  is published. Per-file previews share one byte allowance and are shortened together, so a receipt
+  too large to report never withholds the change. Only a receipt that cannot fit with no preview at
+  all fails, and nothing is published when it does.
 - Patch text, section count, file sizes, plan memory, diffs, and final MCP output are independently
   bounded. Source files are revalidated before publication.
 - A multi-file patch is validated as a unit but is not transactional after publication starts. A later

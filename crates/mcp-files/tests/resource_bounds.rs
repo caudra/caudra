@@ -13,7 +13,7 @@ fn token() -> CancellationToken {
 }
 
 #[tokio::test]
-async fn protocol_ceiling_rejects_patch_before_publication() {
+async fn a_patch_whose_preview_exceeds_the_protocol_ceiling_still_publishes() {
     let root = root();
     let large = "old\n".repeat(20_000);
     fs::write(root.path().join("one.txt"), &large).expect("first file");
@@ -30,6 +30,45 @@ async fn protocol_ceiling_rejects_patch_before_publication() {
     .await
     .expect("tool group");
 
+    let output = files
+        .file_apply_patch(
+            FileApplyPatchInput {
+                patch_text: "*** Begin Patch\n*** Delete File: one.txt\n*** Delete File: two.txt\n*** End Patch".into(),
+            },
+            &token(),
+        )
+        .await
+        .expect("a receipt too large to report is shortened, not refused");
+
+    assert!(output.applied);
+    assert!(output.truncated);
+    // Both files keep a row: the change is what the caller asked for, and a
+    // receipt that dropped one would misreport what happened on disk.
+    assert_eq!(output.files.len(), 2);
+    assert!(output.files.iter().all(|file| file.truncated));
+    assert!(!root.path().join("one.txt").exists());
+    assert!(!root.path().join("two.txt").exists());
+}
+
+#[tokio::test]
+async fn a_receipt_no_allowance_can_represent_leaves_every_target_unchanged() {
+    let root = root();
+    let original = "alpha\n";
+    fs::write(root.path().join("one.txt"), original).expect("first file");
+    fs::write(root.path().join("two.txt"), original).expect("second file");
+    let files = FileToolGroup::new(
+        root.path(),
+        true,
+        Some(FilesystemLimits {
+            // Smaller than the file rows alone, which survive every allowance,
+            // so no shortening can bring the receipt inside the budget.
+            max_patch_result_bytes: 200,
+            ..FilesystemLimits::default()
+        }),
+    )
+    .await
+    .expect("tool group");
+
     let error = files
         .file_apply_patch(
             FileApplyPatchInput {
@@ -38,16 +77,20 @@ async fn protocol_ceiling_rejects_patch_before_publication() {
             &token(),
         )
         .await
-        .expect_err("wire result must exceed the hard ceiling");
+        .expect_err("no representable receipt exists");
 
-    assert!(error.to_string().contains("maximum size of 64000 bytes"));
+    assert!(
+        error
+            .to_string()
+            .contains("Patch result exceeds maximum size of 200 bytes")
+    );
     assert_eq!(
         fs::read_to_string(root.path().join("one.txt")).unwrap(),
-        large
+        original
     );
     assert_eq!(
         fs::read_to_string(root.path().join("two.txt")).unwrap(),
-        large
+        original
     );
 }
 

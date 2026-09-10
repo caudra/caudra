@@ -58,7 +58,8 @@ backtracking controlled by model input.
 - Traversal descends from a canonical root through entries verified not to be symlinks, so a joined
   entry path is already canonical and is authorized without a per-entry `realpath`.
 - Exhausting the traversal budget, the result count, the glob work budget, or the protocol result
-  ceiling truncates a search result. None of them fails the call.
+  ceiling truncates a search result. None of them fails the call. A patch receipt too large to report
+  is shortened the same way, so a bound on what can be described never withholds a change.
 - `file_glob` reports `total`, exact when `scanComplete` and a lower bound otherwise; `file_grep`
   reports `filesScanned` and `filesListed`. A truncated result states its counts in the model text.
 - Binary files are rejected using content signatures and a bounded byte-sample fallback; filename
@@ -80,8 +81,10 @@ backtracking controlled by model input.
   check and inside the resolved root. Created directories take the process umask.
 - Replacements use exclusive same-directory temporary files and atomic rename.
 - Source identity and content are revalidated before edit or patch publication.
-- Patch output is constructed and checked against the host's 64,000-byte MCP result ceiling before
-  the first file is published.
+- Patch output is constructed and fitted to the host's 64,000-byte MCP result ceiling before the
+  first file is published. Per-file previews share one byte allowance, so every file keeps a row and
+  its own `truncated` marker rather than losing its preview to a longer neighbour. Only a receipt
+  that cannot fit with no preview at all fails, and it fails before publication.
 
 Multi-file publication is validated as a unit but is not transactional after publication starts. A
 later I/O failure can leave earlier sections applied, and this behavior has an explicit regression
@@ -105,8 +108,14 @@ Neither form restates the other. A field is omitted from the structured record o
 exactly derivable from a field that remains, so `numberedText` follows from `text` and `lineStart`, a
 directory listing from its entry details, the combined `file_apply_patch` `diff` from the per-file
 patches, and the `index` `skeleton` and `listing` from `lines` and `entries`. Native callers still read every field on the Rust types; only the serialized record
-is deduplicated. Both forms are charged against the protocol ceiling and the configured result
-budgets.
+is deduplicated.
+
+The protocol ceiling is enforced where a result grows with the tree rather than with the request:
+`file_glob`, `file_grep`, `index`, and `file_apply_patch` are measured against it and shortened to
+fit. `file_read`, `file_write`, and `file_edit` are bounded instead by `maxReadBytes` and
+`maxDiffBytes`, which charge the model-facing form. Those budgets sit above the ceiling on purpose:
+a full-window read is a larger frame than 64,000 bytes, and halving the read window to hold one
+number would cost more than it buys.
 
 ## Compatibility
 
