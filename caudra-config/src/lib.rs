@@ -186,6 +186,11 @@ pub const CODE_GRAPH_GROUP: &str = "code graph";
 ///
 /// Tools sharing a group load together. A name here must also appear in one of
 /// the registration lists above, or it defers something that does not exist.
+///
+/// Whether a run actually withholds them is decided per model by
+/// [`DeferBuiltinTools`]: the saving is real for a small model and a loss for a
+/// capable one, which pays a prompt-cache prefix to load what it would have
+/// used anyway.
 pub const DEFERRED_BUILTIN_TOOLS: &[DeferredBuiltin] = &[
     DeferredBuiltin::grouped("code_map", CODE_GRAPH_GROUP),
     DeferredBuiltin::grouped("code_context", CODE_GRAPH_GROUP),
@@ -776,6 +781,23 @@ pub enum NotificationMethod {
     Off,
 }
 
+/// Whether the tools in [`DEFERRED_BUILTIN_TOOLS`] start outside the request
+/// array.
+///
+/// `Auto` reads the class the active provider files the model under: Balanced
+/// and Best take them all upfront, because they choose well from a long list
+/// and a mid-session load resets a prompt-cache prefix they were already
+/// paying to keep. Fast defers, and so does a model nobody classified, since
+/// guessing capability is what a blank class exists to refuse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DeferBuiltinTools {
+    #[default]
+    Auto,
+    Always,
+    Never,
+}
+
 #[derive(Deserialize, Default, Debug)]
 #[serde(default, deny_unknown_fields)]
 pub struct ToolOutputLinesFile {
@@ -889,6 +911,7 @@ pub struct AgentFileConfig {
     pub generate_titles: Option<bool>,
     pub stale_read_check: Option<bool>,
     pub shell_output_filter: Option<bool>,
+    pub defer_builtin_tools: Option<DeferBuiltinTools>,
     pub disabled_tools: Option<Vec<String>>,
 }
 
@@ -906,7 +929,8 @@ impl AgentFileConfig {
             post_compaction_instructions,
             generate_titles,
             stale_read_check,
-            shell_output_filter
+            shell_output_filter,
+            defer_builtin_tools
         );
         // Restriction only, unlike every other list here: a project must not be
         // able to hand itself back a tool the global config took away.
@@ -1651,6 +1675,14 @@ pub struct AgentConfig {
     )]
     pub shell_output_filter: bool,
 
+    #[config(
+        default = DeferBuiltinTools::Auto,
+        ty = "string",
+        default_doc = "auto",
+        desc = "When the on-demand built-in tools start outside the request array: `auto` defers them for a Fast or unclassified model and declares them upfront for Balanced and Best, `always` defers for every model, `never` declares them upfront"
+    )]
+    pub defer_builtin_tools: DeferBuiltinTools,
+
     #[config(skip, default = false)]
     pub no_rtk: bool,
 
@@ -1703,6 +1735,7 @@ impl AgentConfig {
             generate_titles: file.generate_titles.unwrap_or(true),
             stale_read_check: file.stale_read_check.unwrap_or(true),
             shell_output_filter: !no_rtk && file.shell_output_filter.unwrap_or(true),
+            defer_builtin_tools: file.defer_builtin_tools.unwrap_or_default(),
             max_turns: None,
             allowed_tools: Vec::new(),
             disabled_tools,
@@ -2821,6 +2854,18 @@ mod tests {
     fn notifications_reject_unknown_value() {
         let result: Result<RawConfig, _> = toml::from_str("[ui]\nnotifications = \"desktop\"\n");
         assert!(result.is_err());
+    }
+
+    #[test_case("auto", DeferBuiltinTools::Auto ; "auto")]
+    #[test_case("always", DeferBuiltinTools::Always ; "always")]
+    #[test_case("never", DeferBuiltinTools::Never ; "never")]
+    fn defer_builtin_tools_deserialize(value: &str, expected: DeferBuiltinTools) {
+        let raw: RawConfig =
+            toml::from_str(&format!("[agent]\ndefer_builtin_tools = \"{value}\"\n")).unwrap();
+        assert_eq!(
+            raw.into_config(false).unwrap().agent.defer_builtin_tools,
+            expected
+        );
     }
 
     #[test_case("trace", LogLevel::Trace ; "trace")]

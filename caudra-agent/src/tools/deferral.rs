@@ -11,11 +11,20 @@
 //! Deferring costs a prompt-cache prefix each time something loads, so tools
 //! that are one mode of work carry a group and load together. The code graph
 //! is five tools and one decision.
+//!
+//! That prefix is also why deferral is per model rather than global. A Fast
+//! model gains from the shorter array and rebuilds its prefix cheaply; a
+//! Balanced or Best one would spend a large prefix to load what it was going
+//! to reach for anyway. [`BuiltinDeferral`] is that decision, taken once per
+//! definitions build and carried as a value, because reading it is a
+//! `providers.toml` parse ([`Model::class_of`]) and the tool report asks per
+//! registry entry.
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use caudra_providers::{ContentBlock, Message};
+use caudra_config::{AgentConfig, DeferBuiltinTools};
+use caudra_providers::{ContentBlock, Message, Model, ModelPurpose};
 use serde_json::{Value, json};
 use tracing::{info, warn};
 
@@ -40,19 +49,58 @@ pub fn loaded_tool_names(history: &[Message]) -> impl Iterator<Item = Arc<str>> 
         })
 }
 
+/// Whether this run holds the deferrable built-ins back, and what decided it.
+/// The eager variants are distinct so a report can say which, since one is the
+/// user's setting and the other is a fact about the model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuiltinDeferral {
+    Lazy,
+    EagerByClass,
+    EagerByConfig,
+}
+
+impl BuiltinDeferral {
+    pub fn resolve(config: &AgentConfig, model: &Model) -> Self {
+        Self::from_class(
+            config.defer_builtin_tools,
+            Model::class_of(&model.provider, &model.id),
+        )
+    }
+
+    /// Split from [`Self::resolve`] so the rule is decided without reading
+    /// `providers.toml`, which is what a class lookup costs.
+    fn from_class(setting: DeferBuiltinTools, class: Option<ModelPurpose>) -> Self {
+        match (setting, class) {
+            (DeferBuiltinTools::Never, _) => Self::EagerByConfig,
+            (DeferBuiltinTools::Always, _) => Self::Lazy,
+            (
+                DeferBuiltinTools::Auto,
+                Some(ModelPurpose::Balanced | ModelPurpose::Best),
+            ) => Self::EagerByClass,
+            (DeferBuiltinTools::Auto, _) => Self::Lazy,
+        }
+    }
+
+    pub fn is_lazy(self) -> bool {
+        matches!(self, Self::Lazy)
+    }
+}
+
 /// Which built-ins this run withholds. Naming a tool in `allowed_tools` is a
 /// request for it upfront, so an explicit allow list opts that tool out of
 /// deferral rather than fighting it.
-pub fn deferred_names(allowed_tools: &[String]) -> Vec<&'static str> {
+pub fn deferred_names(allowed_tools: &[String], deferral: BuiltinDeferral) -> Vec<&'static str> {
     caudra_config::DEFERRED_BUILTIN_TOOLS
         .iter()
         .map(|deferred| deferred.name)
-        .filter(|name| is_deferred(name, allowed_tools))
+        .filter(|name| is_deferred(name, allowed_tools, deferral))
         .collect()
 }
 
-pub fn is_deferred(name: &str, allowed_tools: &[String]) -> bool {
-    caudra_config::is_deferred_builtin(name) && !allowed_tools.iter().any(|allowed| allowed == name)
+pub fn is_deferred(name: &str, allowed_tools: &[String], deferral: BuiltinDeferral) -> bool {
+    deferral.is_lazy()
+        && caudra_config::is_deferred_builtin(name)
+        && !allowed_tools.iter().any(|allowed| allowed == name)
 }
 
 /// One deferred definition and the text a query is matched against.
@@ -412,6 +460,9 @@ mod tests {
     const TWO_SENTENCES: &str =
         "Inspect the execution host's environment. Each call collects a fresh snapshot.";
     const NOTHING_DEFERRED: &str = "a catalog with nothing left to load is dead weight";
+    const BEST_SPEC: &str = "anthropic/claude-opus-4-8";
+    const FAST_SPEC: &str = "anthropic/claude-haiku-4-5";
+    const DEFERRABLE: &str = "code_map";
 
     fn tool(name: &str, group: Option<&'static str>, description: &str) -> DeferredTool {
         DeferredTool::new(
@@ -591,6 +642,51 @@ mod tests {
         let mut tools = json!([]);
         child.request_snapshot().extend_tools(&mut tools);
         assert_eq!(names(&tools), [TOOL_SEARCH_TOOL_NAME]);
+    }
+
+    /// Only a Fast model, and a model nobody classified, pays for the shorter
+    /// array. Everything else would spend a cache prefix loading what it was
+    /// going to reach for.
+    #[test_case(DeferBuiltinTools::Auto, Some(ModelPurpose::Fast), BuiltinDeferral::Lazy ; "auto_defers_for_fast")]
+    #[test_case(DeferBuiltinTools::Auto, None, BuiltinDeferral::Lazy ; "auto_defers_for_an_unclassified_model")]
+    #[test_case(DeferBuiltinTools::Auto, Some(ModelPurpose::Balanced), BuiltinDeferral::EagerByClass ; "auto_declares_for_balanced")]
+    #[test_case(DeferBuiltinTools::Auto, Some(ModelPurpose::Best), BuiltinDeferral::EagerByClass ; "auto_declares_for_best")]
+    #[test_case(DeferBuiltinTools::Always, Some(ModelPurpose::Best), BuiltinDeferral::Lazy ; "always_outranks_the_class")]
+    #[test_case(DeferBuiltinTools::Never, Some(ModelPurpose::Fast), BuiltinDeferral::EagerByConfig ; "never_outranks_the_class")]
+    fn the_class_decides_deferral_unless_the_setting_does(
+        setting: DeferBuiltinTools,
+        class: Option<ModelPurpose>,
+        expected: BuiltinDeferral,
+    ) {
+        assert_eq!(BuiltinDeferral::from_class(setting, class), expected);
+    }
+
+    /// The rule above is only worth anything if the lookup it wraps files real
+    /// models where the curated table says it does.
+    #[test_case(BEST_SPEC, BuiltinDeferral::EagerByClass ; "a_best_model_takes_them_upfront")]
+    #[test_case(FAST_SPEC, BuiltinDeferral::Lazy ; "a_fast_model_defers")]
+    fn resolve_reads_the_class_of_a_real_model(spec: &str, expected: BuiltinDeferral) {
+        let model = Model::from_spec(spec).unwrap();
+
+        assert_eq!(
+            BuiltinDeferral::resolve(&AgentConfig::default(), &model),
+            expected
+        );
+    }
+
+    #[test_case(BuiltinDeferral::EagerByClass ; "by class")]
+    #[test_case(BuiltinDeferral::EagerByConfig ; "by config")]
+    fn an_eager_run_withholds_nothing(deferral: BuiltinDeferral) {
+        assert!(deferred_names(&[], deferral).is_empty());
+        assert!(!is_deferred(DEFERRABLE, &[], deferral));
+    }
+
+    #[test]
+    fn a_lazy_run_withholds_every_deferrable_builtin() {
+        let names = deferred_names(&[], BuiltinDeferral::Lazy);
+
+        assert_eq!(names.len(), caudra_config::DEFERRED_BUILTIN_TOOLS.len());
+        assert!(is_deferred(DEFERRABLE, &[], BuiltinDeferral::Lazy));
     }
 
     /// Definitions the caller already put in the array win, so a tool forced

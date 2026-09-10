@@ -35,7 +35,7 @@ use crate::nudge::Nudge;
 use crate::permissions::PermissionManager;
 use crate::template::Vars;
 use crate::tools::{Deadline, FileReadTracker, LocalTools, PathLocks, ToolAudience, ToolContext};
-use crate::tools::{DeferralSession, DeferredTool};
+use crate::tools::{BuiltinDeferral, DeferralSession, DeferredTool};
 use crate::{
     AgentConfig, AgentError, AgentEvent, AgentInput, AgentMode, DoneReason, EventSender,
     ExtractedCommand, InterruptSource, Mention, QueueConsumedItem, SessionMailbox,
@@ -687,6 +687,7 @@ impl<'h> Agent<'h> {
                 filter: &self.tool_filter,
                 config: &self.config,
                 model: &self.model,
+                deferral: BuiltinDeferral::resolve(&self.config, &self.model),
                 deferred: self.deferral.definitions(),
             }),
             mcp,

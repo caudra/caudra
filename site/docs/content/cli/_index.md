@@ -177,7 +177,7 @@ Resolves config the way a real run does, so the output reflects `agent.disabled_
 
 A tool that is off carries the rule that turned it off: `--disallowed-tools`, `disabled by config`, `not in --allowed-tools`, `model has no vision support`, `model uses the other editing tool`, or `no ChatGPT subscription`. A `deny` or `allow` default from [Permissions](/docs/permissions/) appears next to the tool it applies to. See [Disabling tools](/docs/tools/#disabling-tools).
 
-A tool marked `lazy` is available and starts outside the request array, so the model reaches it through `tool_search` rather than seeing it upfront. Built-in and MCP tools can both be lazy. See [Tools loaded on demand](/docs/tools/#tools-loaded-on-demand).
+A tool marked `lazy` is available and starts outside the request array, so the model reaches it through `tool_search` rather than seeing it upfront. Built-in and MCP tools can both be lazy. Which built-ins are lazy depends on the model you select with `-m`: a Fast or unclassified model defers them, a Balanced or Best one lists them `on` with the note `declared upfront on a balanced or best model`. See [Tools loaded on demand](/docs/tools/#tools-loaded-on-demand).
 
 ### `caudra skills`
 

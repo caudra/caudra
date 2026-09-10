@@ -44,6 +44,8 @@ one line stays              ~20k tokens stay outside main
 
 **Deferred MCP tools.** An MCP server with 100 tools would ship 100 definitions in every request. Caudra loads a single `tool_search` tool instead; the model searches when it actually needs something and only the matches load. See [MCP](/docs/mcp/#tool-search).
 
+**Deferred built-in tools.** Eight built-ins can start outside the request array behind that same `tool_search` entry. Caudra defers them for a Fast or unclassified model, where the shorter array helps and the prompt cache is cheap to rebuild, and declares them upfront for Balanced and Best, where loading one mid-session would cost more than carrying all eight. See [Tools loaded on demand](/docs/tools/#which-models-defer).
+
 **Managed tool output.** The host enforces `agent.max_output_bytes` and `agent.max_output_lines` after every tool dispatch. The same boundary covers Lua and MCP tools, batch children, nested calls, and local tools. `output_limits` can replace those defaults for one result. The host still performs limiting and retention after dispatch.
 
 Successful text results larger than 8 KiB are retained. This lets Caudra prune older copies from [provider requests](/docs/context/#provider-request-projection) while preserving retrieval. When a result exceeds its effective configured limits, the model receives a bounded head and tail plus an opaque output ID instead of the complete text.

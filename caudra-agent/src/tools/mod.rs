@@ -21,7 +21,8 @@ pub use caudra_config::{
     is_deferred_builtin, is_tool_enabled,
 };
 pub use deferral::{
-    DeferralSession, DeferralSnapshot, DeferredTool, SearchOutcome, TOOL_SEARCH_TOOL_NAME,
+    BuiltinDeferral, DeferralSession, DeferralSnapshot, DeferredTool, SearchOutcome,
+    TOOL_SEARCH_TOOL_NAME,
 };
 pub use file_tracker::{FileReadTracker, STALE_READ_MSG};
 pub use path_locks::{PathGuards, PathLocks};

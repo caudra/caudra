@@ -10,8 +10,8 @@ use caudra_agent::mcp::{McpSession, config as mcp_config, oauth as mcp_oauth};
 use caudra_agent::tools::native::skill::{self, SkillDirCandidate, SkillInventoryEntry};
 use caudra_agent::tools::report::{CATALOG_SOURCE, REASON_CATALOG, REASON_CONFIG, REASON_DEFERRED};
 use caudra_agent::tools::{
-    DescriptionContext, RegisteredTool, SHELL_TOOL_NAME, TOOL_SEARCH_TOOL_NAME, ToolAudience,
-    ToolFilter, ToolRegistry, ToolState, builtin_report, is_tool_enabled,
+    BuiltinDeferral, DescriptionContext, RegisteredTool, SHELL_TOOL_NAME, TOOL_SEARCH_TOOL_NAME,
+    ToolAudience, ToolFilter, ToolRegistry, ToolState, builtin_report, is_tool_enabled,
 };
 use caudra_config::providers::{
     Protocol, ProviderDef, ProvidersConfig, all_builtins, builtin_provider, resolve_api_key_env,
@@ -826,6 +826,7 @@ fn builtin_rows(
     cli_disallowed: &[String],
     model: &Model,
 ) -> Vec<ToolRow> {
+    let deferral = BuiltinDeferral::resolve(&config.agent, model);
     let mut rows: Vec<ToolRow> = registry
         .iter()
         .iter()
@@ -835,7 +836,8 @@ fn builtin_rows(
                 SHELL_TOOL_NAME => vec![ToolKey::native(name), ToolKey::native(LEGACY_SHELL_KEY)],
                 _ => vec![ToolKey::native(name)],
             };
-            let report = builtin_report(name, filter, cli_disallowed, &config.agent, model);
+            let report =
+                builtin_report(name, filter, cli_disallowed, &config.agent, model, deferral);
             ToolRow {
                 name: name.to_owned(),
                 source: entry.source.as_log_field().into_owned(),

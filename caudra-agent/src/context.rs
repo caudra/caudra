@@ -14,8 +14,8 @@ use crate::prompt::profile::{BUILTIN_PROFILE_NAME, PromptProfileCatalog, TaskPro
 use crate::tools::TOOL_SEARCH_TOOL_NAME;
 use crate::tools::native::{memory, skill};
 use crate::tools::{
-    DeferredTool, MEMORY_TOOL_NAME, SKILL_TOOL_NAME, TASK_TOOL_NAME, ToolFilter, ToolRegistry,
-    ToolState, builtin_report,
+    BuiltinDeferral, DeferredTool, MEMORY_TOOL_NAME, SKILL_TOOL_NAME, TASK_TOOL_NAME, ToolFilter,
+    ToolRegistry, ToolState, builtin_report,
 };
 
 const MEMORY_READ_COMMAND: &str = "read";
@@ -405,6 +405,7 @@ pub struct BuiltinToolsInput<'a> {
     pub filter: &'a ToolFilter,
     pub config: &'a AgentConfig,
     pub model: &'a Model,
+    pub deferral: BuiltinDeferral,
     pub deferred: &'a [DeferredTool],
 }
 
@@ -421,7 +422,8 @@ impl BuiltinToolsInput<'_> {
             .iter()
             .map(|entry| {
                 let name = entry.name();
-                let report = builtin_report(name, self.filter, &[], self.config, self.model);
+                let report =
+                    builtin_report(name, self.filter, &[], self.config, self.model, self.deferral);
                 let state = match report.state {
                     ToolState::On => ContextBuiltinState::Declared,
                     ToolState::Lazy => ContextBuiltinState::Deferred,

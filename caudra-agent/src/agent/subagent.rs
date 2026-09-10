@@ -23,8 +23,8 @@ use crate::cancel::{CancelMap, CancelSlot};
 use crate::prompt::PromptId;
 use crate::tools::registry::ToolRegistry;
 use crate::tools::{
-    DeferredTool, DescriptionContext, FileReadTracker, LocalTools, ToolAudience, ToolContext,
-    ToolFilter, ToolLive, deferral,
+    BuiltinDeferral, DeferredTool, DescriptionContext, FileReadTracker, LocalTools, ToolAudience,
+    ToolContext, ToolFilter, ToolLive, deferral,
 };
 use crate::{
     Agent, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, DoneReason,
@@ -563,7 +563,10 @@ pub async fn open_task(ctx: &ToolContext, opts: TaskOptions) -> Result<Subagent,
             workflow: false,
         },
         model.supports_tool_examples(),
-        &deferral::deferred_names(&ctx.config.allowed_tools),
+        &deferral::deferred_names(
+            &ctx.config.allowed_tools,
+            BuiltinDeferral::resolve(&ctx.config, &model),
+        ),
     );
     definitions
         .declared

@@ -33,8 +33,8 @@ use crate::prompt::ResolvedSlots;
 use crate::prompt::profile::{BUILTIN_PROFILE_NAME, PromptProfileCatalog};
 use crate::template;
 use crate::tools::{
-    DeferralSession, DeferredTool, DescriptionContext, FileReadTracker, LocalTools, PathLocks,
-    ToolAudience, ToolDefinitions, ToolFilter, ToolRegistry, deferral,
+    BuiltinDeferral, DeferralSession, DeferredTool, DescriptionContext, FileReadTracker, LocalTools,
+    PathLocks, ToolAudience, ToolDefinitions, ToolFilter, ToolRegistry, deferral,
 };
 use crate::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, DoneReason,
@@ -683,7 +683,10 @@ fn tool_definitions(
         &vars,
         &ctx,
         model.supports_tool_examples(),
-        &deferral::deferred_names(&config.allowed_tools),
+        &deferral::deferred_names(
+            &config.allowed_tools,
+            BuiltinDeferral::resolve(config, model),
+        ),
     )
 }
 

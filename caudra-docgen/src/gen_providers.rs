@@ -25,6 +25,8 @@ The picker and `caudra models` show a dim **Fast**, **Balanced**, or **Best** be
 
 A blank class means nobody classified that model, which is the normal state for local runtimes and custom endpoints. Caudra does not infer one from price or list position. Declare `purposes` for that provider to fill it in.
 
+The class also decides which built-in tools reach the model upfront. Fast and unclassified models load the on-demand tools through `tool_search`, while Balanced and Best receive all of them in the first request. See [Tools loaded on demand](/docs/tools/#which-models-defer).
+
 `purposes` entries match by prefix, so an endpoint serving a family of fine-tunes needs one line rather than one per variant:
 
 ```toml

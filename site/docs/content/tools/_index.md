@@ -29,7 +29,7 @@ Run [`caudra tools`](/docs/cli/) to see the resulting set, including which rule 
 
 ## Tools loaded on demand
 
-8 built-in tools start outside the request array. The model sees a `tool_search` entry instead, and one call with a query loads the matching tools for the rest of the session. Sessions that never need them never pay for their descriptions.
+8 built-in tools can start outside the request array. The model sees a `tool_search` entry instead, and one call with a query loads the matching tools for the rest of the session. Sessions that never need them never pay for their descriptions.
 
 `code_map`, `code_context`, `code_refs`, `code_impact`, and `code_expand` load together as the code graph group, because a question about an unfamiliar codebase usually takes several of them in a row.
 
@@ -37,7 +37,13 @@ Run [`caudra tools`](/docs/cli/) to see the resulting set, including which rule 
 
 Loading changes the tool array, so the provider's prompt cache prefix resets and the next request re-reads the history as fresh input. Caudra posts a notice naming what loaded when it happens.
 
-Listing a tool in `--allowed-tools` asks for it upfront and skips the search. [`caudra tools`](/docs/cli/) marks the rest as `deferred behind tool_search`.
+### Which models defer
+
+That cache reset is why deferral depends on the model. Caudra defers for a model its provider classifies **Fast**, and for a model nobody classified, where a shorter array helps the model choose and the prefix is cheap to rebuild. A **Balanced** or **Best** model takes all 8 upfront, because it picks well from a long list and would spend a large prefix loading a tool it was going to reach for anyway.
+
+Declare `purposes` in `providers.toml` to classify a model your provider does not ([Providers](/docs/providers/#model-classes)), or set `agent.defer_builtin_tools` to `always` or `never` to decide for every model ([Configuration](/docs/configuration/#agent)).
+
+Listing a tool in `--allowed-tools` asks for it upfront and skips the search. [`caudra tools`](/docs/cli/) marks a deferred tool `lazy` and says `deferred behind tool_search`.
 
 ## File Operations
 

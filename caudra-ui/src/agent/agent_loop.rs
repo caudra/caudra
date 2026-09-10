@@ -15,8 +15,8 @@ use caudra_agent::prompt::profile::{
 use caudra_agent::template;
 use caudra_agent::template::Vars;
 use caudra_agent::tools::{
-    DeferralSession, DeferredTool, DescriptionContext, FileReadTracker, PathLocks, ToolAudience,
-    ToolDefinitions, ToolFilter, ToolRegistry, deferral,
+    BuiltinDeferral, DeferralSession, DeferredTool, DescriptionContext, FileReadTracker, PathLocks,
+    ToolAudience, ToolDefinitions, ToolFilter, ToolRegistry, deferral,
 };
 use caudra_agent::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentParams, AgentRunParams, CancelMap,
@@ -555,7 +555,10 @@ impl AgentLoop {
             &vars,
             &ctx,
             examples,
-            &deferral::deferred_names(&self.config.allowed_tools),
+            &deferral::deferred_names(
+                &self.config.allowed_tools,
+                BuiltinDeferral::resolve(&self.config, model),
+            ),
         )
     }
 
@@ -651,6 +654,7 @@ impl AgentLoop {
                 filter: &ToolFilter::from_config(&self.config, &slot.model, &[]),
                 config: &self.config,
                 model: &slot.model,
+                deferral: BuiltinDeferral::resolve(&self.config, &slot.model),
                 deferred: &self.deferred,
             }),
             mcp.as_ref(),

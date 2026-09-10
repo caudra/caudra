@@ -2,7 +2,8 @@ use caudra_config::AgentConfig;
 use caudra_providers::Model;
 
 use crate::tools::{
-    ToolFilter, VIEW_IMAGE_TOOL_NAME, capability_exclusions, credential_exclusions, deferral,
+    BuiltinDeferral, ToolFilter, VIEW_IMAGE_TOOL_NAME, capability_exclusions, credential_exclusions,
+    deferral,
 };
 
 pub const REASON_DISALLOWED_FLAG: &str = "--disallowed-tools";
@@ -13,6 +14,8 @@ pub const REASON_COMPANION: &str = "always on (internal companion)";
 pub const REASON_NO_SUBSCRIPTION: &str = "no ChatGPT subscription";
 pub const REASON_OTHER_EDITOR: &str = "model uses the other editing tool";
 pub const REASON_DEFERRED: &str = "deferred behind tool_search";
+pub const REASON_EAGER_CLASS: &str = "declared upfront on a balanced or best model";
+pub const REASON_EAGER_CONFIG: &str = "lazy loading disabled by config";
 /// `tool_search` has no registry entry. The request array grows one whenever
 /// something is deferred, so every listing derives the row from that rather
 /// than looking it up.
@@ -57,12 +60,16 @@ pub struct ToolReport {
 /// `cli_disallowed` is separate from `config.disabled_tools` only so the
 /// report can name the flag the user just typed. A caller that has already
 /// merged the two passes an empty slice and reads `disabled by config`.
+///
+/// `deferral` is passed rather than resolved, because this runs once per
+/// registry entry and resolving it parses `providers.toml`.
 pub fn builtin_report(
     name: &str,
     filter: &ToolFilter,
     cli_disallowed: &[String],
     config: &AgentConfig,
     model: &Model,
+    deferral: BuiltinDeferral,
 ) -> ToolReport {
     let named_off = cli_disallowed.iter().any(|tool| tool == name);
     let config_off = config.disabled_tools.iter().any(|tool| tool == name);
@@ -99,7 +106,7 @@ pub fn builtin_report(
             reason: Some(REASON_COMPANION),
         };
     }
-    if deferral::is_deferred(name, &config.allowed_tools) {
+    if deferral::is_deferred(name, &config.allowed_tools, deferral) {
         return ToolReport {
             state: ToolState::Lazy,
             reason: Some(REASON_DEFERRED),
@@ -107,7 +114,21 @@ pub fn builtin_report(
     }
     ToolReport {
         state: ToolState::On,
-        reason: None,
+        reason: eager_reason(name, deferral),
+    }
+}
+
+/// Why a tool that would normally be lazy is in the array anyway. Nothing for
+/// a tool that was never deferrable, and nothing when an allow list asked for
+/// it upfront, which the caller already got what it wanted from.
+fn eager_reason(name: &str, deferral: BuiltinDeferral) -> Option<&'static str> {
+    if !caudra_config::is_deferred_builtin(name) {
+        return None;
+    }
+    match deferral {
+        BuiltinDeferral::Lazy => None,
+        BuiltinDeferral::EagerByClass => Some(REASON_EAGER_CLASS),
+        BuiltinDeferral::EagerByConfig => Some(REASON_EAGER_CONFIG),
     }
 }
 
@@ -117,9 +138,9 @@ mod tests {
     use test_case::test_case;
 
     use super::{
-        AgentConfig, Model, REASON_COMPANION, REASON_CONFIG, REASON_DEFERRED,
-        REASON_DISALLOWED_FLAG, REASON_NOT_ALLOWED, REASON_OTHER_EDITOR, ToolReport, ToolState,
-        builtin_report,
+        AgentConfig, BuiltinDeferral, Model, REASON_COMPANION, REASON_CONFIG, REASON_DEFERRED,
+        REASON_DISALLOWED_FLAG, REASON_EAGER_CLASS, REASON_EAGER_CONFIG, REASON_NOT_ALLOWED,
+        REASON_OTHER_EDITOR, ToolReport, ToolState, builtin_report,
     };
     use crate::tools::{
         FILE_APPLY_PATCH_TOOL_NAME, FILE_READ_TOOL_NAME, SHELL_TOOL_NAME, ToolFilter,
@@ -136,11 +157,23 @@ mod tests {
         }
     }
 
-    fn report(name: &str, cli: &[&str], config: &AgentConfig) -> ToolReport {
+    /// The deferral is handed in rather than resolved from `MODEL_SPEC`, so
+    /// these cases test the ordering of the rules and not the class lookup,
+    /// which owns its own tests and reads `providers.toml`.
+    fn report(
+        name: &str,
+        cli: &[&str],
+        config: &AgentConfig,
+        deferral: BuiltinDeferral,
+    ) -> ToolReport {
         let model = Model::from_spec(MODEL_SPEC).unwrap();
         let cli: Vec<String> = cli.iter().map(|tool| (*tool).to_string()).collect();
         let filter = ToolFilter::from_config(config, &model, &[]);
-        builtin_report(name, &filter, &cli, config, &model)
+        builtin_report(name, &filter, &cli, config, &model, deferral)
+    }
+
+    fn lazy_report(name: &str, cli: &[&str], config: &AgentConfig) -> ToolReport {
+        report(name, cli, config, BuiltinDeferral::Lazy)
     }
 
     #[test_case(SHELL_TOOL_NAME, &[], &["shell"], &[], ToolState::Off, Some(REASON_CONFIG) ; "config_disabled")]
@@ -158,9 +191,36 @@ mod tests {
         state: ToolState,
         reason: Option<&'static str>,
     ) {
-        let report = report(name, cli, &config(disabled, allowed));
+        let report = lazy_report(name, cli, &config(disabled, allowed));
         assert_eq!(report.state, state);
         assert_eq!(report.reason, reason);
+    }
+
+    /// A run that defers nothing still has to say why a tool the docs call
+    /// lazy is sitting in the array.
+    #[test_case(BuiltinDeferral::EagerByClass, REASON_EAGER_CLASS ; "the_model_did_not_need_the_help")]
+    #[test_case(BuiltinDeferral::EagerByConfig, REASON_EAGER_CONFIG ; "the_user_turned_it_off")]
+    fn an_eager_run_names_what_declared_the_lazy_tools(
+        deferral: BuiltinDeferral,
+        reason: &'static str,
+    ) {
+        let report = report(DEFERRED_TOOL, &[], &config(&[], &[]), deferral);
+        assert_eq!(report.state, ToolState::On);
+        assert_eq!(report.reason, Some(reason));
+    }
+
+    /// The reason belongs to the tools deferral would have withheld. A tool
+    /// that was never lazy has nothing to explain.
+    #[test]
+    fn an_ordinary_tool_gains_no_reason_from_an_eager_run() {
+        let report = report(
+            SHELL_TOOL_NAME,
+            &[],
+            &config(&[], &[]),
+            BuiltinDeferral::EagerByClass,
+        );
+        assert_eq!(report.state, ToolState::On);
+        assert_eq!(report.reason, None);
     }
 
     /// Asking for a companion to turn off is not an error, but the report has
@@ -168,7 +228,7 @@ mod tests {
     #[test]
     fn a_companion_asked_to_turn_off_stays_on_with_a_reason() {
         for name in INTERNAL_COMPANION_TOOL_NAMES {
-            let report = report(name, &[], &config(&[name], &[]));
+            let report = lazy_report(name, &[], &config(&[name], &[]));
             assert_eq!(report.state, ToolState::On);
             assert_eq!(report.reason, Some(REASON_COMPANION));
         }
@@ -179,7 +239,7 @@ mod tests {
         assert!(ToolState::Lazy.reaches_model());
         assert!(!ToolState::Off.reaches_model());
         assert!(
-            report(FILE_READ_TOOL_NAME, &[], &config(&[], &[]))
+            lazy_report(FILE_READ_TOOL_NAME, &[], &config(&[], &[]))
                 .state
                 .reaches_model()
         );
