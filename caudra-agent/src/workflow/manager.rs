@@ -13,14 +13,15 @@ use caudra_storage::StateDir;
 use caudra_storage::id::CaudraId;
 use caudra_storage::paths::config_dir;
 use caudra_storage::workflow::{
-    WorkflowCallKind, WorkflowCallState, WorkflowRunPatch, WorkflowRunRow, WorkflowRunStatus,
-    WorkflowUpdate,
+    MAX_HISTORY_RUNS, WorkflowCallKind, WorkflowCallRow, WorkflowCallState, WorkflowRunPatch,
+    WorkflowRunRow, WorkflowRunStatus, WorkflowUpdate,
 };
 use caudra_workflow::{
-    CallKey, CallKind, DEFAULT_AGENT_BUDGET, Journal, JournalEntry, LaunchRequest, MAX_ACTIVE_RUNS,
-    MAX_AGENT_BUDGET, RunSnapshot, RunStatus, RunUsage, SmokeResult, WORKFLOW_ABI_VERSION,
-    WORKFLOW_LANGUAGE_VERSION, WorkflowError, WorkflowOutcome, WorkflowRequest, WorkflowResponse,
-    WorkflowState, hash_request, validate,
+    CallKey, CallKind, CallState, DEFAULT_AGENT_BUDGET, Journal, JournalEntry, LaunchRequest,
+    MAX_ACTIVE_RUNS, MAX_AGENT_BUDGET, RunCall, RunDetail, RunHistoryEntry, RunSnapshot, RunStatus,
+    RunUsage, SmokeResult, WORKFLOW_ABI_VERSION, WORKFLOW_LANGUAGE_VERSION, WorkflowError,
+    WorkflowOutcome, WorkflowRequest, WorkflowResponse, WorkflowState, call_preview, hash_request,
+    validate,
 };
 use flume::Receiver;
 use serde_json::Value;
@@ -29,7 +30,10 @@ use tracing::{info, warn};
 use super::catalog::Catalog;
 use super::handle::{Reply, WorkflowHandle};
 use super::run::{ActiveRun, Interrupt, RunEnv, RunSpec, launch};
-use super::state::{Published, publish, run_status, snapshot_from_row, stored_source_kind};
+use super::state::{
+    Published, publish, restore_timeline, run_event, run_status, snapshot_from_row,
+    stored_source_kind,
+};
 use super::store::WorkflowStore;
 use crate::AgentMode;
 use crate::agent::task_runner::{ModeResolver, TaskRunner};
@@ -47,6 +51,10 @@ const RUN_MOVED_DURING_RESUME: &str = "workflow run changed while it was being r
 const RUN_ALREADY_DRIVEN: &str = "workflow run already has a driver";
 const DRIVER_MISSING: &str = "active workflow run has no driver";
 const PHASE_LIST_SEPARATOR: &str = ", ";
+const DEFAULT_HISTORY_RUNS: usize = 20;
+const CALL_LABEL_FIELD: &str = "label";
+const CALL_PROMPT_FIELD: &str = "prompt";
+const CALL_NAME_FIELD: &str = "name";
 
 pub struct RuntimeDeps {
     pub state_dir: StateDir,
@@ -82,9 +90,13 @@ impl WorkflowRuntime {
             info!(interrupted, "workflow runs lost with the previous process");
         }
         let rows = store.load_runs().await?;
-        let published: Published = Arc::new(ArcSwap::from_pointee(WorkflowState {
-            runs: rows.iter().map(snapshot_from_row).collect(),
-        }));
+        let mut runs = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let mut snapshot = snapshot_from_row(row);
+            restore_timeline(&mut snapshot, &store.load_events(row.run_id.clone()).await?);
+            runs.push(snapshot);
+        }
+        let published: Published = Arc::new(ArcSwap::from_pointee(WorkflowState { runs }));
         let (requests, inbox) = flume::unbounded();
         let handle = WorkflowHandle::new(requests, Arc::clone(&published));
         let (root_trigger, root) = CancelToken::new();
@@ -163,6 +175,8 @@ impl Manager {
             WorkflowRequest::Validate { name } => self.validate(name).await,
             WorkflowRequest::Start(launch) => self.start(launch).await,
             WorkflowRequest::Status { run_id } => self.status(run_id.as_deref()),
+            WorkflowRequest::Inspect { run_id } => self.inspect(&run_id).await,
+            WorkflowRequest::History { limit } => self.history(limit).await,
             WorkflowRequest::Pause { run_id } => self.interrupt(&run_id, RunStatus::Paused).await,
             WorkflowRequest::Stop { run_id } => self.interrupt(&run_id, RunStatus::Cancelled).await,
             WorkflowRequest::Resume {
@@ -295,7 +309,11 @@ impl Manager {
             return Err(WorkflowError::Internal(RUN_MOVED_DURING_RESUME.to_owned()));
         }
         let row = self.load_row(&run_id).await?;
-        let snapshot = snapshot_from_row(&row);
+        let mut snapshot = snapshot_from_row(&row);
+        restore_timeline(
+            &mut snapshot,
+            &self.env.store.load_events(run_id.clone()).await?,
+        );
         publish(&self.env.published, &snapshot);
         let journal = self.journal(&run_id).await?;
         let args = serde_json::from_str(&row.args)
@@ -370,6 +388,49 @@ impl Manager {
         }
     }
 
+    /// A run from any session with its journal and timeline. A live run is
+    /// read from the published state so its in-flight roster shows.
+    async fn inspect(&self, run_id: &str) -> Result<WorkflowResponse, WorkflowError> {
+        let events = self.env.store.load_events(run_id.to_owned()).await?;
+        let run = match self.find(run_id) {
+            Ok(run) => run,
+            Err(_) => {
+                let mut run = snapshot_from_row(&self.load_row(run_id).await?);
+                restore_timeline(&mut run, &events);
+                run
+            }
+        };
+        let calls: Vec<RunCall> = self
+            .env
+            .store
+            .load_calls(run_id.to_owned())
+            .await?
+            .iter()
+            .map(run_call)
+            .collect();
+        let journal_trimmed = calls.is_empty() && run.usage.agents_admitted > 0;
+        Ok(WorkflowResponse::Detail(Box::new(RunDetail {
+            run,
+            calls,
+            events: events.iter().map(run_event).collect(),
+            journal_trimmed,
+        })))
+    }
+
+    async fn history(&self, limit: Option<usize>) -> Result<WorkflowResponse, WorkflowError> {
+        let limit = limit.unwrap_or(DEFAULT_HISTORY_RUNS).min(MAX_HISTORY_RUNS);
+        let rows = self.env.store.load_history(limit).await?;
+        Ok(WorkflowResponse::History(
+            rows.into_iter()
+                .map(|row| RunHistoryEntry {
+                    run: snapshot_from_row(&row.run),
+                    session_id: row.run.session_id.to_string(),
+                    session_title: row.session_title,
+                })
+                .collect(),
+        ))
+    }
+
     async fn ack(&self, run_id: String, revision: u64) -> Result<WorkflowResponse, WorkflowError> {
         let acked = self.env.store.ack_outbox(run_id.clone(), revision).await?;
         if acked {
@@ -416,11 +477,7 @@ impl Manager {
             let (WorkflowCallState::Completed, Some(result)) = (call.state, call.result) else {
                 continue;
             };
-            let kind = match call.kind {
-                WorkflowCallKind::Agent => CallKind::Agent,
-                WorkflowCallKind::Parallel => CallKind::Parallel,
-                WorkflowCallKind::ScratchFile => CallKind::ScratchFile,
-            };
+            let kind = call_kind(call.kind);
             let request: Value = serde_json::from_str(&call.request).map_err(internal)?;
             let result: Value = serde_json::from_str(&result).map_err(internal)?;
             journal
@@ -488,6 +545,41 @@ impl Manager {
     }
 }
 
+/// A journal row as the inspector shows it. The label is what the script
+/// gave the agent, else the start of its prompt, else the scratch file name.
+fn run_call(call: &WorkflowCallRow) -> RunCall {
+    let request: Value = serde_json::from_str(&call.request).unwrap_or(Value::Null);
+    let label = [CALL_LABEL_FIELD, CALL_NAME_FIELD, CALL_PROMPT_FIELD]
+        .iter()
+        .find_map(|field| request.get(field).and_then(Value::as_str))
+        .map(|text| call_preview(text.lines().next().unwrap_or_default()));
+    RunCall {
+        call_key: call.call_key,
+        kind: call_kind(call.kind),
+        state: match call.state {
+            WorkflowCallState::Started => CallState::Started,
+            WorkflowCallState::Completed => CallState::Completed,
+            WorkflowCallState::Failed => CallState::Failed,
+        },
+        label,
+        task_id: call.task_id.clone(),
+        tokens_used: call.tokens_used,
+        duration_ms: call.duration_ms,
+        started_at: call.started_at,
+        finished_at: call.finished_at,
+        result_preview: call.result.as_deref().map(call_preview),
+        error: call.error.clone(),
+    }
+}
+
+fn call_kind(kind: WorkflowCallKind) -> CallKind {
+    match kind {
+        WorkflowCallKind::Agent => CallKind::Agent,
+        WorkflowCallKind::Parallel => CallKind::Parallel,
+        WorkflowCallKind::ScratchFile => CallKind::ScratchFile,
+    }
+}
+
 fn check_budget(budget: u32) -> Result<(), WorkflowError> {
     if budget > MAX_AGENT_BUDGET {
         return Err(WorkflowError::Budget {
@@ -544,7 +636,7 @@ mod tests {
     use std::path::Path;
     use std::sync::Mutex;
 
-    use caudra_storage::workflow::{WorkflowCallState, WorkflowSourceKind};
+    use caudra_storage::workflow::{WorkflowCallState, WorkflowEventKind, WorkflowSourceKind};
     use caudra_workflow::{RosterState, WorkflowEvent};
     use serde_json::json;
     use tempfile::TempDir;
@@ -635,6 +727,8 @@ complete(first.output.echo);
     const ACK_IS_EXACT: &str = "an ack must clear only the revision it delivered";
     const NAMES_ARE_UNIQUE: &str = "two runs of one workflow must not share a display name";
     const OLD_HANDLE_IS_DEAD: &str = "a handle must report unavailable after shutdown";
+    const TIMELINE_IS_KEPT: &str = "phases and log lines must be stored with the run";
+    const HISTORY_IS_FOREIGN: &str = "history must list only other sessions' runs";
 
     /// Answers each agent by its label: `block-*` parks until released or
     /// cancelled, `fail-*` fails without opening a session, anything else
@@ -781,9 +875,21 @@ complete(first.output.echo);
         }
 
         async fn spawn(&self) -> WorkflowRuntime {
+            self.spawn_as(self.session_id).await
+        }
+
+        /// A second session in the same state directory, as another
+        /// Caudra process on the same machine would have.
+        fn new_session(&self) -> CaudraId {
+            let mut session = StoredSession::new(MODEL, self.project.to_string_lossy().as_ref());
+            session.save(&self.state_dir).unwrap();
+            session.id
+        }
+
+        async fn spawn_as(&self, session_id: CaudraId) -> WorkflowRuntime {
             WorkflowRuntime::spawn(RuntimeDeps {
                 state_dir: self.state_dir.clone(),
-                session_id: self.session_id,
+                session_id,
                 cwd: self.project.clone(),
                 user_config_dir: Some(self.config.clone()),
                 runner: Arc::clone(&self.runner) as Arc<dyn TaskRunner>,
@@ -858,6 +964,27 @@ complete(first.output.echo);
             .collect()
     }
 
+    fn log_messages(run: &RunSnapshot) -> Vec<&str> {
+        run.logs.iter().map(|line| line.message.as_str()).collect()
+    }
+
+    fn phase_titles(run: &RunSnapshot) -> Vec<&str> {
+        run.phase_history
+            .iter()
+            .map(|record| record.title.as_str())
+            .collect()
+    }
+
+    async fn run_history(handle: &WorkflowHandle) -> Vec<RunHistoryEntry> {
+        match handle
+            .request(WorkflowRequest::History { limit: None })
+            .await
+        {
+            Ok(WorkflowResponse::History(entries)) => entries,
+            other => panic!("{other:?}"),
+        }
+    }
+
     #[test]
     fn a_run_completes_and_journals_every_call() {
         smol::block_on(async {
@@ -881,7 +1008,8 @@ complete(first.output.echo);
             assert_eq!(scratch.file_name().unwrap(), SCRATCH_FILE);
             assert_eq!(fs::read_to_string(scratch).unwrap(), SCRATCH_CONTENT);
             assert_eq!(done.phase.as_deref(), Some(PHASE));
-            assert_eq!(done.logs, [LOG_LINE]);
+            assert_eq!(log_messages(&done), [LOG_LINE]);
+            assert_eq!(phase_titles(&done), [PHASE], "{TIMELINE_IS_KEPT}");
             assert_eq!(done.usage.agents_admitted, 1);
             assert_eq!(done.usage.tokens_used, TOKENS_PER_AGENT);
             assert_eq!(roster_states(&done), [(FIRST_KEY, RosterState::Completed)]);
@@ -917,7 +1045,123 @@ complete(first.output.echo);
                 ]
             );
             assert_eq!(calls[0].task_id.as_deref(), Some("task-worker-1"));
+            let events = store.load_events(started.run_id.clone()).await.unwrap();
+            assert_eq!(
+                events
+                    .iter()
+                    .map(|event| (event.kind, event.text.as_str()))
+                    .collect::<Vec<_>>(),
+                [
+                    (WorkflowEventKind::Phase, PHASE),
+                    (WorkflowEventKind::Log, LOG_LINE)
+                ],
+                "{TIMELINE_IS_KEPT}"
+            );
             store.shutdown().await;
+            runtime.shutdown().await;
+        });
+    }
+
+    /// The timeline is what a restarted process shows for a settled run, so
+    /// it must come back from the store rather than from memory.
+    #[test]
+    fn a_restarted_runtime_restores_the_timeline() {
+        smol::block_on(async {
+            let fixture = Fixture::new();
+            fixture.user_workflow(ECHO, ECHO_BODY);
+            let runtime = fixture.spawn().await;
+            let started = start(&runtime.handle(), ECHO, None).await;
+            fixture
+                .wait_for(&started.run_id, RunStatus::Completed)
+                .await;
+            runtime.shutdown().await;
+
+            let runtime = fixture.spawn().await;
+            let restored = run(
+                &runtime.handle(),
+                WorkflowRequest::Status {
+                    run_id: Some(started.run_id.clone()),
+                },
+            )
+            .await;
+
+            assert_eq!(log_messages(&restored), [LOG_LINE], "{TIMELINE_IS_KEPT}");
+            assert_eq!(phase_titles(&restored), [PHASE], "{TIMELINE_IS_KEPT}");
+            runtime.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn inspect_answers_with_the_journal_and_timeline() {
+        smol::block_on(async {
+            let fixture = Fixture::new();
+            fixture.user_workflow(ECHO, ECHO_BODY);
+            let runtime = fixture.spawn().await;
+            let handle = runtime.handle();
+            let started = start(&handle, ECHO, None).await;
+            fixture
+                .wait_for(&started.run_id, RunStatus::Completed)
+                .await;
+
+            let detail = match handle
+                .request(WorkflowRequest::Inspect {
+                    run_id: started.run_id.clone(),
+                })
+                .await
+            {
+                Ok(WorkflowResponse::Detail(detail)) => detail,
+                other => panic!("{other:?}"),
+            };
+            let unknown = handle
+                .request(WorkflowRequest::Inspect {
+                    run_id: UNKNOWN_RUN.into(),
+                })
+                .await;
+
+            assert_eq!(detail.run.run_id, started.run_id);
+            assert_eq!(
+                detail
+                    .calls
+                    .iter()
+                    .map(|call| (call.call_key, call.kind, call.state))
+                    .collect::<Vec<_>>(),
+                [
+                    (FIRST_KEY, CallKind::Agent, CallState::Completed),
+                    (SECOND_KEY, CallKind::ScratchFile, CallState::Completed),
+                ]
+            );
+            assert_eq!(detail.calls[0].label.as_deref(), Some("worker-1"));
+            assert!(detail.calls[0].result_preview.is_some());
+            assert_eq!(detail.calls[1].label.as_deref(), Some(SCRATCH_FILE));
+            assert_eq!(detail.events.len(), 2, "{TIMELINE_IS_KEPT}");
+            assert!(!detail.journal_trimmed);
+            assert!(matches!(unknown, Err(WorkflowError::UnknownRun { .. })));
+            runtime.shutdown().await;
+        });
+    }
+
+    /// History is for looking back at other sessions: this session's runs
+    /// are already in the published state.
+    #[test]
+    fn history_lists_other_sessions_runs_only() {
+        smol::block_on(async {
+            let fixture = Fixture::new();
+            fixture.user_workflow(ECHO, ECHO_BODY);
+            let runtime = fixture.spawn().await;
+            let started = start(&runtime.handle(), ECHO, None).await;
+            fixture
+                .wait_for(&started.run_id, RunStatus::Completed)
+                .await;
+            let own = run_history(&runtime.handle()).await;
+            runtime.shutdown().await;
+
+            let runtime = fixture.spawn_as(fixture.new_session()).await;
+            let foreign = run_history(&runtime.handle()).await;
+
+            assert!(own.is_empty(), "{HISTORY_IS_FOREIGN}");
+            assert_eq!(foreign.len(), 1, "{HISTORY_IS_FOREIGN}");
+            assert_eq!(foreign[0].run.run_id, started.run_id);
+            assert_eq!(foreign[0].session_id, fixture.session_id.to_string());
             runtime.shutdown().await;
         });
     }
@@ -1376,7 +1620,11 @@ complete(first.output.echo);
             assert_eq!(done.result, Some(json!("caught")));
             assert_eq!(roster_states(&done), [(FIRST_KEY, RosterState::Failed)]);
             assert_eq!(done.logs.len(), 1);
-            assert!(done.logs[0].contains(FAILURE), "{}", done.logs[0]);
+            assert!(
+                done.logs[0].message.contains(FAILURE),
+                "{}",
+                done.logs[0].message
+            );
             runtime.shutdown().await;
         });
     }

@@ -586,6 +586,7 @@ impl HighlightRequest {
             | ToolOutput::TodoList(_)
             | ToolOutput::Answers(_)
             | ToolOutput::Shell(_)
+            | ToolOutput::WorkflowRun(_)
             | ToolOutput::Image { .. } => None,
             // Children carry their own code and diffs, so a batch reaches the
             // highlighting worker exactly as a lone child would. A batch with

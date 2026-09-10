@@ -11,8 +11,8 @@ use caudra_storage::StateDir;
 use caudra_storage::id::CaudraId;
 use caudra_storage::sessions::SessionDatabase;
 use caudra_storage::workflow::{
-    WorkflowCallFinish, WorkflowCallRow, WorkflowCallStart, WorkflowRunPatch, WorkflowRunRow,
-    WorkflowUpdate,
+    WorkflowCallFinish, WorkflowCallRow, WorkflowCallStart, WorkflowEventKind, WorkflowEventRow,
+    WorkflowHistoryRow, WorkflowRunPatch, WorkflowRunRow, WorkflowUpdate,
 };
 use caudra_storage::workflow_scratch::{ScratchDir, remove_run};
 use caudra_workflow::WorkflowError;
@@ -93,6 +93,53 @@ impl WorkflowStore {
             worker
                 .database
                 .load_workflow_runs(worker.session_id)
+                .map_err(storage)
+        })
+        .await
+    }
+
+    /// Recent runs of every other session, newest first.
+    pub async fn load_history(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<WorkflowHistoryRow>, WorkflowError> {
+        self.call(move |worker| {
+            worker
+                .database
+                .load_workflow_history(limit)
+                .map(|rows| {
+                    rows.into_iter()
+                        .filter(|row| row.run.session_id != worker.session_id)
+                        .collect()
+                })
+                .map_err(storage)
+        })
+        .await
+    }
+
+    pub async fn append_event(
+        &self,
+        run_id: String,
+        kind: WorkflowEventKind,
+        text: String,
+    ) -> Result<u64, WorkflowError> {
+        self.call(move |worker| {
+            worker
+                .database
+                .append_workflow_event(&run_id, kind, &text)
+                .map_err(storage)
+        })
+        .await
+    }
+
+    pub async fn load_events(
+        &self,
+        run_id: String,
+    ) -> Result<Vec<WorkflowEventRow>, WorkflowError> {
+        self.call(move |worker| {
+            worker
+                .database
+                .load_workflow_events(&run_id)
                 .map_err(storage)
         })
         .await

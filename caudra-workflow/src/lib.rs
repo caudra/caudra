@@ -41,9 +41,11 @@ pub use meta::{MetaError, PhaseMeta, WorkflowMeta, is_valid_workflow_name};
 pub use request::{WorkflowError, WorkflowRequest, WorkflowResponse};
 pub use run::{EngineLimits, PauseKind, PauseKindError, WorkflowOutcome};
 pub use snapshot::{
-    AgentRosterEntry, DEFAULT_AGENT_BUDGET, MAX_ACTIVE_RUNS, MAX_AGENT_BUDGET, MAX_RUN_LOG_ENTRIES,
-    RosterState, RunSnapshot, RunStatus, RunUsage, SourceKind, WORKFLOW_ABI_VERSION,
-    WORKFLOW_LANGUAGE_VERSION, WorkflowEvent, WorkflowState,
+    AgentRosterEntry, CallState, DEFAULT_AGENT_BUDGET, LogLine, MAX_ACTIVE_RUNS, MAX_AGENT_BUDGET,
+    MAX_CALL_PREVIEW_BYTES, MAX_PHASE_HISTORY, MAX_RUN_LOG_ENTRIES, PhaseRecord, RosterState,
+    RunCall, RunDetail, RunEvent, RunEventKind, RunHistoryEntry, RunSnapshot, RunStatus, RunUsage,
+    SourceKind, WORKFLOW_ABI_VERSION, WORKFLOW_LANGUAGE_VERSION, WorkflowEvent, WorkflowState,
+    call_preview,
 };
 #[cfg(feature = "rhai")]
 pub use validate::{SmokeResult, ValidationError, ValidationReport, validate};

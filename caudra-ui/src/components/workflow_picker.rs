@@ -336,6 +336,7 @@ mod tests {
             execution_epoch: 1,
             phase: None,
             phases: Vec::new(),
+            phase_history: Vec::new(),
             agent_budget: 8,
             usage: RunUsage::default(),
             roster,

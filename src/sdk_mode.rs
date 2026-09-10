@@ -56,6 +56,8 @@ const WORKFLOW_LIST: &str = "workflow_list";
 const WORKFLOW_VALIDATE: &str = "workflow_validate";
 const WORKFLOW_START: &str = "workflow_start";
 const WORKFLOW_STATUS: &str = "workflow_status";
+const WORKFLOW_INSPECT: &str = "workflow_inspect";
+const WORKFLOW_HISTORY: &str = "workflow_history";
 const WORKFLOW_PAUSE: &str = "workflow_pause";
 const WORKFLOW_RESUME: &str = "workflow_resume";
 const WORKFLOW_STOP: &str = "workflow_stop";
@@ -68,6 +70,8 @@ const WORKFLOW_CONTROLS: &[&str] = &[
     WORKFLOW_VALIDATE,
     WORKFLOW_START,
     WORKFLOW_STATUS,
+    WORKFLOW_INSPECT,
+    WORKFLOW_HISTORY,
     WORKFLOW_PAUSE,
     WORKFLOW_RESUME,
     WORKFLOW_STOP,
@@ -1519,6 +1523,13 @@ fn workflow_request(subtype: &str, extra: &Value) -> Option<Result<WorkflowReque
         }),
         WORKFLOW_STATUS => Ok(WorkflowRequest::Status {
             run_id: text("run_id").ok(),
+        }),
+        WORKFLOW_INSPECT => text("run_id").map(|run_id| WorkflowRequest::Inspect { run_id }),
+        WORKFLOW_HISTORY => Ok(WorkflowRequest::History {
+            limit: extra
+                .get("limit")
+                .and_then(Value::as_u64)
+                .map(|limit| usize::try_from(limit).unwrap_or(usize::MAX)),
         }),
         WORKFLOW_PAUSE => text("run_id").map(|run_id| WorkflowRequest::Pause { run_id }),
         WORKFLOW_RESUME => text("run_id").map(|run_id| WorkflowRequest::Resume {
@@ -3369,6 +3380,7 @@ mod tests {
             execution_epoch: EPOCH,
             phase: Some(PHASE.into()),
             phases: vec![PHASE.into()],
+            phase_history: Vec::new(),
             agent_budget: AGENT_BUDGET,
             usage: RunUsage::default(),
             roster: Vec::new(),
@@ -3452,6 +3464,9 @@ mod tests {
     #[test_case(WORKFLOW_START, serde_json::json!({"name": WORKFLOW_NAME}) => WorkflowRequest::Start(LaunchRequest { name: WORKFLOW_NAME.into(), args: serde_json::json!({}), agent_budget: None }); "start_defaults_to_empty_args")]
     #[test_case(WORKFLOW_STATUS, serde_json::json!({}) => WorkflowRequest::Status { run_id: None }; "status_all")]
     #[test_case(WORKFLOW_STATUS, serde_json::json!({"run_id": RUN_ID}) => WorkflowRequest::Status { run_id: Some(RUN_ID.into()) }; "status_one")]
+    #[test_case(WORKFLOW_INSPECT, serde_json::json!({"run_id": RUN_ID}) => WorkflowRequest::Inspect { run_id: RUN_ID.into() }; "inspect")]
+    #[test_case(WORKFLOW_HISTORY, serde_json::json!({"limit": 5}) => WorkflowRequest::History { limit: Some(5) }; "history_with_limit")]
+    #[test_case(WORKFLOW_HISTORY, serde_json::json!({}) => WorkflowRequest::History { limit: None }; "history_defaults")]
     #[test_case(WORKFLOW_PAUSE, serde_json::json!({"run_id": RUN_ID}) => WorkflowRequest::Pause { run_id: RUN_ID.into() }; "pause")]
     #[test_case(WORKFLOW_RESUME, serde_json::json!({"run_id": RUN_ID, "agent_budget": AGENT_BUDGET}) => WorkflowRequest::Resume { run_id: RUN_ID.into(), agent_budget: Some(AGENT_BUDGET) }; "resume")]
     #[test_case(WORKFLOW_STOP, serde_json::json!({"run_id": RUN_ID}) => WorkflowRequest::Stop { run_id: RUN_ID.into() }; "stop")]
@@ -3464,6 +3479,7 @@ mod tests {
     #[test_case(WORKFLOW_VALIDATE, serde_json::json!({}); "validate_without_name")]
     #[test_case(WORKFLOW_TRUST, serde_json::json!({"name": WORKFLOW_NAME}); "trust_without_digest")]
     #[test_case(WORKFLOW_ACK, serde_json::json!({"run_id": RUN_ID}); "ack_without_revision")]
+    #[test_case(WORKFLOW_INSPECT, serde_json::json!({}); "inspect_without_run_id")]
     #[test_case(WORKFLOW_STOP, serde_json::json!({"run_id": 7}); "stop_with_a_non_string_run_id")]
     fn a_workflow_control_missing_a_field_is_refused_by_name(subtype: &str, extra: Value) {
         let message = workflow_request(subtype, &extra).unwrap().unwrap_err();

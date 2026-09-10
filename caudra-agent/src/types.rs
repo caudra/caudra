@@ -8,6 +8,9 @@ use std::time::Duration;
 use caudra_providers::{AgentError, Billing, ContentBlock, Message, Role, StopReason, TokenUsage};
 use caudra_storage::tool_outputs::ToolOutputRef;
 use caudra_storage::usage_ledger::LedgerPurpose;
+use caudra_workflow::{
+    AgentRosterEntry, LogLine, PhaseRecord, RosterState, RunSnapshot, RunStatus, RunUsage,
+};
 use flume::Sender;
 use serde::{Deserialize, Serialize};
 use strum::Display;
@@ -22,6 +25,15 @@ pub const INDEX_TRUNCATED: &str = "[truncated]";
 /// outlive agent turns, so they never belong to one. One below the UI's
 /// restore sentinel, which already claims `u64::MAX`.
 pub const WORKFLOW_EVENT_RUN_ID: u64 = u64::MAX - 1;
+/// How much of a run's report or result a transcript card quotes.
+pub const MAX_CARD_PREVIEW_BYTES: usize = 2048;
+/// Log lines a card keeps under its roster while the run works.
+pub const CARD_LOG_LINES: usize = 3;
+const CARD_REPORT_FIELD: &str = "report";
+const CARD_PATH_FIELD: &str = "path";
+const CARD_PREVIEW_MARKER: &str = "…";
+const CARD_PHASE_SEPARATOR: &str = " › ";
+const CARD_ANNOTATION_SEPARATOR: &str = " · ";
 
 const SECONDS_PER_MINUTE: u64 = 60;
 const TALLY_SEPARATOR: &str = " · ";
@@ -463,6 +475,184 @@ impl From<&str> for TextOutput {
     }
 }
 
+/// A workflow run as its transcript card shows it: the parts of a snapshot
+/// a reader follows, with the report cut to what a card can hold. Stored
+/// with the tool result so a restored session draws the card in Rust.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorkflowRunCard {
+    pub run_id: String,
+    pub display_name: String,
+    pub workflow_name: String,
+    pub status: RunStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+    #[serde(default)]
+    pub phases: Vec<String>,
+    #[serde(default)]
+    pub phase_history: Vec<PhaseRecord>,
+    pub agent_budget: u32,
+    #[serde(default)]
+    pub usage: RunUsage,
+    #[serde(default)]
+    pub roster: Vec<AgentRosterEntry>,
+    #[serde(default)]
+    pub logs: Vec<LogLine>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_preview: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scratch_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pause_message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub created_at: u64,
+    pub updated_at: u64,
+}
+
+impl From<&RunSnapshot> for WorkflowRunCard {
+    fn from(run: &RunSnapshot) -> Self {
+        let result_preview = run.result.as_ref().map(|result| {
+            let text = result
+                .get(CARD_REPORT_FIELD)
+                .and_then(serde_json::Value::as_str)
+                .map_or_else(|| result.to_string(), str::to_owned);
+            if text.len() <= MAX_CARD_PREVIEW_BYTES {
+                text
+            } else {
+                let end = text.floor_char_boundary(MAX_CARD_PREVIEW_BYTES);
+                format!("{}{CARD_PREVIEW_MARKER}", &text[..end])
+            }
+        });
+        let scratch_path = run
+            .result
+            .as_ref()
+            .and_then(|result| result.get(CARD_PATH_FIELD))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        let logs = run
+            .logs
+            .iter()
+            .rev()
+            .take(CARD_LOG_LINES)
+            .rev()
+            .cloned()
+            .collect();
+        Self {
+            run_id: run.run_id.clone(),
+            display_name: run.display_name.clone(),
+            workflow_name: run.workflow_name.clone(),
+            status: run.status,
+            phase: run.phase.clone(),
+            phases: run.phases.clone(),
+            phase_history: run.phase_history.clone(),
+            agent_budget: run.agent_budget,
+            usage: run.usage.clone(),
+            roster: run.roster.clone(),
+            logs,
+            result_preview,
+            scratch_path,
+            pause_message: run.pause_message.clone(),
+            error: run.error.clone(),
+            created_at: run.created_at,
+            updated_at: run.updated_at,
+        }
+    }
+}
+
+impl WorkflowRunCard {
+    /// `status`, then the phase when the run is in one.
+    pub fn headline(&self) -> String {
+        match &self.phase {
+            Some(phase) => format!("{}{CARD_ANNOTATION_SEPARATOR}{phase}", self.status),
+            None => self.status.to_string(),
+        }
+    }
+
+    /// The declared phases in order with the current one marked, or the
+    /// phases seen so far when the script declared none.
+    pub fn phase_strip(&self) -> Vec<(String, PhaseMark)> {
+        let titles: Vec<&str> = if self.phases.is_empty() {
+            self.phase_history
+                .iter()
+                .map(|record| record.title.as_str())
+                .collect()
+        } else {
+            self.phases.iter().map(String::as_str).collect()
+        };
+        let current = self
+            .phase
+            .as_deref()
+            .and_then(|phase| titles.iter().rposition(|title| *title == phase));
+        let settled = self.status.is_terminal();
+        titles
+            .iter()
+            .enumerate()
+            .map(|(index, title)| {
+                let mark = match current {
+                    Some(at) if index < at => PhaseMark::Done,
+                    Some(at) if index == at && settled => PhaseMark::Done,
+                    Some(at) if index == at => PhaseMark::Current,
+                    _ => PhaseMark::Pending,
+                };
+                ((*title).to_owned(), mark)
+            })
+            .collect()
+    }
+
+    pub fn running_agents(&self) -> impl Iterator<Item = &AgentRosterEntry> {
+        self.roster
+            .iter()
+            .filter(|agent| agent.state == RosterState::Running)
+    }
+
+    fn display_text(&self) -> String {
+        let mut out = format!(
+            "{} ({}) {}",
+            self.display_name,
+            self.workflow_name,
+            self.headline()
+        );
+        let strip: Vec<String> = self
+            .phase_strip()
+            .into_iter()
+            .map(|(title, mark)| format!("{title} {}", mark.glyph()))
+            .collect();
+        if !strip.is_empty() {
+            out.push('\n');
+            out.push_str(&strip.join(CARD_PHASE_SEPARATOR));
+        }
+        for agent in &self.roster {
+            let _ = write!(out, "\n  {} [{}]", agent.label, agent.state);
+        }
+        if let Some(preview) = &self.result_preview {
+            out.push('\n');
+            out.push_str(preview);
+        }
+        if let Some(error) = &self.error {
+            let _ = write!(out, "\nerror: {error}");
+        }
+        out
+    }
+}
+
+/// Where a phase stands in a card's strip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PhaseMark {
+    Done,
+    Current,
+    Pending,
+}
+
+impl PhaseMark {
+    pub const fn glyph(self) -> &'static str {
+        match self {
+            Self::Done => "✓",
+            Self::Current => "●",
+            Self::Pending => "○",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ToolOutput {
     Plain(TextOutput),
@@ -538,6 +728,8 @@ pub enum ToolOutput {
         /// the pixels ride separately as a `ContentBlock::Image`.
         text: String,
     },
+    /// A workflow run the transcript follows live and restores settled.
+    WorkflowRun(Box<WorkflowRunCard>),
 }
 
 /// How far a search reached before a bound stopped it. Both counts are lower
@@ -656,6 +848,7 @@ impl ToolOutput {
                     .unwrap_or(text)
                     .to_string(),
             ),
+            Self::WorkflowRun(card) => Some(card.headline()),
             _ => None,
         }
     }
@@ -723,7 +916,8 @@ impl ToolOutput {
             | Self::CodeGraph { .. }
             | Self::Shell(_)
             | Self::TodoList(_)
-            | Self::Answers(_) => Some(self.as_display_text()),
+            | Self::Answers(_)
+            | Self::WorkflowRun(_) => Some(self.as_display_text()),
             _ => None,
         }
     }
@@ -836,6 +1030,7 @@ impl ToolOutput {
                 .map(|a| format!("{}: {}", a.header, a.labels.join(", ")))
                 .collect::<Vec<_>>()
                 .join("\n"),
+            Self::WorkflowRun(card) => card.display_text(),
             Self::TodoList(items) => {
                 if items.is_empty() {
                     return "No todos.".into();

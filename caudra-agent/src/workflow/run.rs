@@ -8,13 +8,14 @@
 use std::sync::Arc;
 
 use caudra_storage::workflow::{
-    WorkflowCallFinish, WorkflowCallKind, WorkflowCallStart, WorkflowRunPatch, WorkflowUpdate,
+    WorkflowCallFinish, WorkflowCallKind, WorkflowCallStart, WorkflowEventKind, WorkflowRunPatch,
+    WorkflowUpdate,
 };
 use caudra_workflow::{
     AgentRequest, AgentResult, AgentRosterEntry, CallKey, CallKind, CapabilityMode, EngineLimits,
-    HostError, Journal, MAX_RUN_LOG_ENTRIES, RhaiEngine, RosterState, RunParams, RunSnapshot,
-    RunStatus, WorkflowEngine, WorkflowError, WorkflowEvent, WorkflowHost, WorkflowOutcome,
-    agent_request_value, hash_request, scratch_request_value,
+    HostError, Journal, LogLine, MAX_PHASE_HISTORY, MAX_RUN_LOG_ENTRIES, PhaseRecord, RhaiEngine,
+    RosterState, RunParams, RunSnapshot, RunStatus, WorkflowEngine, WorkflowError, WorkflowEvent,
+    WorkflowHost, WorkflowOutcome, agent_request_value, hash_request, scratch_request_value,
 };
 use flume::{Receiver, Sender};
 use futures_lite::future;
@@ -337,7 +338,7 @@ impl Driver {
                 let _ = reply.send(());
             }
             HostCommand::Log { message, reply } => {
-                self.log(message);
+                self.log(message).await;
                 let _ = reply.send(());
             }
             HostCommand::Scratch {
@@ -502,7 +503,8 @@ impl Driver {
             }
         };
         if let Some(error) = &outcome.error {
-            self.log(format!("{}: {error}", label_in_roster(&self.snapshot, key)));
+            self.log(format!("{}: {error}", label_in_roster(&self.snapshot, key)))
+                .await;
         }
         if let Err(error) = self.env.store.finish_call(run_id, key.0, finish).await {
             warn!(run_id = %self.snapshot.run_id, call_key = key.0, %error, "workflow call could not be journaled");
@@ -565,7 +567,7 @@ impl Driver {
         if self.preempted {
             return;
         }
-        self.snapshot.phase = Some(title);
+        self.snapshot.phase = Some(title.clone());
         match self
             .commit(WorkflowRunPatch {
                 phase: Some(self.snapshot.phase.clone()),
@@ -573,7 +575,17 @@ impl Driver {
             })
             .await
         {
-            Ok(true) => self.publish(),
+            Ok(true) => {
+                if self.snapshot.phase_history.len() >= MAX_PHASE_HISTORY {
+                    self.snapshot.phase_history.remove(0);
+                }
+                self.snapshot.phase_history.push(PhaseRecord {
+                    title: title.clone(),
+                    started_at: now_secs(),
+                });
+                self.record_event(WorkflowEventKind::Phase, title).await;
+                self.publish();
+            }
             Ok(false) => {}
             Err(error) => {
                 warn!(run_id = %self.snapshot.run_id, %error, "workflow phase could not be stored");
@@ -581,17 +593,39 @@ impl Driver {
         }
     }
 
-    fn log(&mut self, message: String) {
+    async fn log(&mut self, message: String) {
+        let at = now_secs();
         if self.snapshot.logs.len() >= MAX_RUN_LOG_ENTRIES {
             self.snapshot.logs.remove(0);
         }
-        self.snapshot.logs.push(message.clone());
+        self.snapshot.logs.push(LogLine {
+            at,
+            message: message.clone(),
+        });
+        if !self.preempted {
+            self.record_event(WorkflowEventKind::Log, message.clone())
+                .await;
+        }
         publish(&self.env.published, &self.snapshot);
         self.emit(WorkflowEvent::Log {
             run_id: self.snapshot.run_id.clone(),
             revision: self.snapshot.revision,
+            at,
             message,
         });
+    }
+
+    /// The timeline is a view, so a row it cannot keep is a warning rather
+    /// than a failed run.
+    async fn record_event(&self, kind: WorkflowEventKind, text: String) {
+        if let Err(error) = self
+            .env
+            .store
+            .append_event(self.snapshot.run_id.clone(), kind, text)
+            .await
+        {
+            warn!(run_id = %self.snapshot.run_id, %kind, %error, "workflow timeline row could not be stored");
+        }
     }
 
     async fn scratch(
@@ -755,8 +789,10 @@ impl Driver {
             .await?
             .ok_or_else(|| WorkflowError::Internal(RUN_ROW_MISSING.to_owned()))?;
         let logs = std::mem::take(&mut self.snapshot.logs);
+        let phase_history = std::mem::take(&mut self.snapshot.phase_history);
         self.snapshot = snapshot_from_row(&row);
         self.snapshot.logs = logs;
+        self.snapshot.phase_history = phase_history;
         publish(&self.env.published, &self.snapshot);
         Ok(())
     }

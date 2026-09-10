@@ -2351,6 +2351,7 @@ complete(#{ report: first.output });
             execution_epoch: 0,
             phase: None,
             phases: Vec::new(),
+            phase_history: Vec::new(),
             agent_budget: 1,
             usage: caudra_workflow::RunUsage::default(),
             roster: Vec::new(),

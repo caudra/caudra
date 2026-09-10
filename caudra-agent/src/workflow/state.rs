@@ -5,9 +5,12 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwap;
-use caudra_storage::workflow::{WorkflowRunRow, WorkflowRunStatus, WorkflowSourceKind};
+use caudra_storage::workflow::{
+    WorkflowEventKind, WorkflowEventRow, WorkflowRunRow, WorkflowRunStatus, WorkflowSourceKind,
+};
 use caudra_workflow::{
-    AgentRosterEntry, RunSnapshot, RunStatus, RunUsage, SourceKind, WorkflowState, parse_meta,
+    AgentRosterEntry, LogLine, MAX_PHASE_HISTORY, MAX_RUN_LOG_ENTRIES, PhaseRecord, RunEvent,
+    RunEventKind, RunSnapshot, RunStatus, RunUsage, SourceKind, WorkflowState, parse_meta,
 };
 use tracing::warn;
 
@@ -47,6 +50,7 @@ pub(super) fn snapshot_from_row(row: &WorkflowRunRow) -> RunSnapshot {
         roster,
         result,
         error: row.error.clone(),
+        phase_history: Vec::new(),
         logs: Vec::new(),
         outbox_pending: row.outbox_pending,
         created_at: row.created_at,
@@ -91,6 +95,46 @@ pub(super) fn stored_source_kind(kind: SourceKind) -> WorkflowSourceKind {
         SourceKind::Builtin => WorkflowSourceKind::Builtin,
         SourceKind::Project => WorkflowSourceKind::Project,
         SourceKind::User => WorkflowSourceKind::User,
+    }
+}
+
+/// Fills a snapshot's timeline from its stored events, keeping the newest
+/// of each kind within the snapshot's own bounds.
+pub(super) fn restore_timeline(snapshot: &mut RunSnapshot, events: &[WorkflowEventRow]) {
+    snapshot.phase_history = events
+        .iter()
+        .filter(|event| event.kind == WorkflowEventKind::Phase)
+        .map(|event| PhaseRecord {
+            title: event.text.clone(),
+            started_at: event.at,
+        })
+        .collect();
+    let excess = snapshot
+        .phase_history
+        .len()
+        .saturating_sub(MAX_PHASE_HISTORY);
+    snapshot.phase_history.drain(..excess);
+    snapshot.logs = events
+        .iter()
+        .filter(|event| event.kind == WorkflowEventKind::Log)
+        .map(|event| LogLine {
+            at: event.at,
+            message: event.text.clone(),
+        })
+        .collect();
+    let excess = snapshot.logs.len().saturating_sub(MAX_RUN_LOG_ENTRIES);
+    snapshot.logs.drain(..excess);
+}
+
+pub(super) fn run_event(row: &WorkflowEventRow) -> RunEvent {
+    RunEvent {
+        seq: row.seq,
+        at: row.at,
+        kind: match row.kind {
+            WorkflowEventKind::Phase => RunEventKind::Phase,
+            WorkflowEventKind::Log => RunEventKind::Log,
+        },
+        text: row.text.clone(),
     }
 }
 
