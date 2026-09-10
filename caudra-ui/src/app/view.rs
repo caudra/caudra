@@ -508,9 +508,13 @@ impl App {
         if self.goal_modal.is_open() {
             let status = self.state.goal.status();
             let evaluator = caudra_providers::model_registry::goal_evaluator_target();
-            let r = self
-                .goal_modal
-                .view(frame, full, status.as_ref(), &evaluator);
+            let r = self.goal_modal.view(
+                frame,
+                full,
+                status.as_ref(),
+                &evaluator,
+                self.state.goal.continuation_limit(),
+            );
             if r.width > 0 {
                 overlay_rect = r;
             }

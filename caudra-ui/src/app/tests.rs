@@ -4171,6 +4171,17 @@ fn clicking_the_goal_chip_opens_the_goal_modal() {
 }
 
 #[test]
+fn goal_modal_adjusts_the_session_continuation_limit() {
+    let mut app = test_app();
+    let initial = app.state.goal.continuation_limit();
+    app.goal_modal.open();
+
+    app.update(Msg::Key(key(KeyCode::Right)));
+
+    assert_eq!(app.state.goal.continuation_limit(), initial + 1);
+}
+
+#[test]
 fn opening_the_goal_modal_clears_footer_hover() {
     let mut app = test_app();
     app.state.goal.set(GOAL_CONDITION).unwrap();
@@ -6444,6 +6455,28 @@ fn goal_without_arguments_opens_status_modal() {
     assert!(app.goal_modal.is_open());
 }
 
+#[test]
+fn goal_loop_cap_notice_separates_run_continuations_from_total_evaluations() {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+
+    app.update(agent_msg(AgentEvent::GoalLoopCap {
+        evaluations: 23,
+        continuations: 16,
+        limit: 16,
+    }));
+
+    assert_eq!(
+        app.main_chat().last_message_role(),
+        Some(&DisplayRole::Notice)
+    );
+    assert_eq!(
+        app.main_chat().last_message_text(),
+        "Goal remains active after 16 automatic continuations in this run (23 total evaluations); the session limit is 16. Send another message to resume."
+    );
+}
+
 #[test_case("/goal-model"; "registered_command")]
 #[test_case("/goal MODEL"; "legacy_subcommand")]
 fn goal_model_opens_dedicated_picker_without_starting_goal(command: &str) {
@@ -6638,8 +6671,10 @@ fn deferred_goal_builds_an_automatic_checkin() {
 
 #[test]
 fn active_goal_round_trips_through_session_metadata() {
+    let continuation_limit = 24;
     let mut app = test_app();
     app.state.goal.set(GOAL_CONDITION).unwrap();
+    app.state.goal.set_continuation_limit(continuation_limit);
     app.checkpoint_with(Duration::ZERO);
     assert_eq!(
         app.state
@@ -6649,6 +6684,10 @@ fn active_goal_round_trips_through_session_metadata() {
             .as_ref()
             .map(|goal| goal.condition.as_str()),
         Some(GOAL_CONDITION)
+    );
+    assert_eq!(
+        app.state.session.meta.goal_continuation_limit,
+        Some(continuation_limit)
     );
 
     let model = app.state.model.clone();
@@ -6662,6 +6701,7 @@ fn active_goal_round_trips_through_session_metadata() {
         state.goal.snapshot().unwrap().condition.as_ref(),
         GOAL_CONDITION
     );
+    assert_eq!(state.goal.continuation_limit(), continuation_limit);
 }
 
 /// The panel reports spend, evaluations, elapsed time and the latest reason.
@@ -6777,13 +6817,18 @@ fn resuming_an_active_goal_starts_no_work_on_its_own() {
 }
 
 #[test]
-fn new_session_clears_active_goal() {
+fn new_session_clears_goal_and_restores_the_default_continuation_limit() {
     let mut app = test_app();
     app.state.goal.set("old session only").unwrap();
+    app.state.goal.set_continuation_limit(24);
 
     app.reset_session();
 
     assert!(app.state.goal.status().is_none());
+    assert_eq!(
+        app.state.goal.continuation_limit(),
+        caudra_agent::DEFAULT_GOAL_CONTINUATION_LIMIT
+    );
     assert!(app.state.session.meta.active_goal.is_none());
 }
 

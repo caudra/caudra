@@ -1136,6 +1136,8 @@ pub enum AgentEvent {
     },
     GoalLoopCap {
         evaluations: u32,
+        continuations: u32,
+        limit: u32,
     },
     GoalTurnLimit {
         evaluations: u32,

@@ -87,7 +87,7 @@ Run `/goal-model` to choose the evaluator. `/goal model` is also accepted as an 
 
 The evaluator choice is saved globally in the `model.roles` row of Caudra's SQLite state database and applies across sessions. The same Goal mode is available from `/model` with `Tab`. Press uppercase `R` in that mode to restore Default.
 
-Run `/goal` without arguments to open the status panel. It shows the condition, evaluator, elapsed time, evaluation count, spend, and latest reason. The footer shows a compact indicator while a goal is active, and clicking that indicator opens the panel.
+Run `/goal` without arguments to open the status panel. It shows the condition, evaluator, elapsed time, evaluation count, spend, latest reason, and automatic-continuation limit. Use Left and Right or `-` and `+` to adjust the limit for the current session. The footer shows a compact indicator while a goal is active, and clicking that indicator opens the panel.
 
 Use `/goal-clear` to stop early. `/goal clear` remains an alias, and `stop`, `off`, `reset`, `none`, and `cancel` are also accepted after `/goal`, without regard to case.
 
@@ -97,7 +97,7 @@ Evaluator spend is recorded under the `goal` purpose in the lifetime ledger, bil
 
 Caudra defers evaluation while tracked background agents are running and starts a hidden check-in after they finish. Worker compaction can still run, but evaluator calls never compact or alter history.
 
-Eight automatic continuations are allowed in one query. When that safety cap or the configured turn limit is reached, Caudra returns control with the goal still active. Send another message to resume. Evaluator errors also leave the goal active. Authentication, billing, context-limit, and unavailable-model errors clear it when retrying cannot recover.
+Sixteen automatic continuations are allowed in one query by default. The `/goal` panel accepts a session-only limit from 0 through 100. When that safety cap or the configured turn limit is reached, Caudra returns control with the goal still active and reports this-run continuations separately from total evaluations. Send another message to resume. Evaluator errors also leave the goal active. Authentication, billing, context-limit, and unavailable-model errors clear it when retrying cannot recover.
 
 One-shot headless mode accepts the same form:
 

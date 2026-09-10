@@ -167,6 +167,7 @@ async fn generate(
         &messages,
         crate::prompt::TITLE_SYSTEM,
         &tools,
+        None,
         cancel,
         RequestOptions::default(),
         session_id,

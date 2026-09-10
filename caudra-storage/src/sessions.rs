@@ -295,6 +295,8 @@ pub struct SessionMeta {
     pub active_goal: Option<Box<StoredActiveGoal>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub goal_result: Option<Box<StoredGoalResult>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_continuation_limit: Option<u32>,
     /// `None` when the user never set yolo for this session, which is what
     /// makes `--yolo` a property of the invocation rather than of the log.
     #[serde(default, skip_serializing_if = "Option::is_none")]

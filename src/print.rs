@@ -46,6 +46,18 @@ fn load_images(paths: &[PathBuf]) -> Result<Vec<ImageSource>> {
         .collect()
 }
 
+fn add_spend(
+    billed: &mut Option<f64>,
+    subscription: &mut Option<f64>,
+    amount: Option<f64>,
+    billing: Billing,
+) {
+    match billing {
+        Billing::Api => add_cost(billed, amount),
+        Billing::Subscription => add_cost(subscription, amount),
+    }
+}
+
 #[derive(Clone, ValueEnum)]
 pub enum OutputFormat {
     Text,
@@ -295,9 +307,11 @@ pub fn run(
             | AgentEvent::PromptProgress { .. } => {}
             AgentEvent::GoalEvaluating { .. } => {}
             AgentEvent::GoalEvaluation {
-                cost: goal_cost, ..
+                cost: goal_cost,
+                billing,
+                ..
             } => {
-                add_cost(&mut cost, *goal_cost);
+                add_spend(&mut cost, &mut subscription_cost, *goal_cost, *billing);
             }
             AgentEvent::GoalFinished { result } => {
                 if result.verdict != GoalVerdict::Met {
@@ -308,10 +322,14 @@ pub fn run(
             AgentEvent::GoalDeferred {
                 active_background_tasks: _,
             } => {}
-            AgentEvent::GoalLoopCap { evaluations } => {
+            AgentEvent::GoalLoopCap {
+                evaluations,
+                continuations,
+                limit,
+            } => {
                 is_error = true;
                 result_text = format!(
-                    "Goal remains active after {evaluations} evaluations; automatic continuation paused"
+                    "Goal remains active after {continuations} automatic continuations in this run ({evaluations} total evaluations); the session limit is {limit}"
                 );
             }
             AgentEvent::GoalTurnLimit { evaluations } => {
@@ -323,12 +341,16 @@ pub fn run(
             AgentEvent::GoalEvaluationFailed {
                 evaluation,
                 message,
+                applied,
                 cost: goal_cost,
+                billing,
                 ..
             } => {
-                add_cost(&mut cost, *goal_cost);
-                is_error = true;
-                result_text = format!("Goal evaluation #{evaluation} failed: {message}");
+                add_spend(&mut cost, &mut subscription_cost, *goal_cost, *billing);
+                if *applied {
+                    is_error = true;
+                    result_text = format!("Goal evaluation #{evaluation} failed: {message}");
+                }
             }
             AgentEvent::GoalClearedAfterError { condition, message } => {
                 is_error = true;
@@ -352,10 +374,7 @@ pub fn run(
                 }
             }
             AgentEvent::TurnComplete(tc) => {
-                match tc.billing {
-                    Billing::Api => add_cost(&mut cost, tc.cost),
-                    Billing::Subscription => add_cost(&mut subscription_cost, tc.cost),
-                }
+                add_spend(&mut cost, &mut subscription_cost, tc.cost, tc.billing);
                 if parent_tool_use_id.is_some() {
                     goal.record_external_usage(tc.usage, tc.cost, tc.billing);
                 }
@@ -498,6 +517,23 @@ mod tests {
         "error",
         "session_id",
     ];
+
+    #[test]
+    fn spend_is_attributed_to_its_billing_source() {
+        let mut billed = None;
+        let mut subscription = None;
+
+        add_spend(&mut billed, &mut subscription, Some(1.0), Billing::Api);
+        add_spend(
+            &mut billed,
+            &mut subscription,
+            Some(2.0),
+            Billing::Subscription,
+        );
+
+        assert_eq!(billed, Some(1.0));
+        assert_eq!(subscription, Some(2.0));
+    }
 
     #[test]
     fn wire_format_required_fields() {

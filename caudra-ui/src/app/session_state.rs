@@ -114,6 +114,9 @@ impl SessionState {
             turns => turns,
         };
         let goal = GoalHandle::restored(session.meta.active_goal.as_deref());
+        if let Some(limit) = session.meta.goal_continuation_limit {
+            goal.set_continuation_limit(limit);
+        }
         if let Some(stored) = session.meta.goal_result.as_ref() {
             goal.restore_finished(GoalResult {
                 condition: Arc::from(stored.condition.as_str()),

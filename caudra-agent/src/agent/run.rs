@@ -15,8 +15,8 @@ use caudra_providers::{
 
 use super::compaction;
 use super::goal::{
-    Evaluator, GOAL_BLOCK_CAP, GoalApply, GoalHandle, GoalStatus, ResolvedEvaluator,
-    continuation_message, is_unrecoverable, resolve_evaluator,
+    Evaluator, GoalApply, GoalHandle, GoalStatus, ResolvedEvaluator, continuation_message,
+    is_unrecoverable, resolve_evaluator,
 };
 use super::history::{History, repair_tool_pairs, sanitize_cancelled_history};
 use super::instructions::LoadedInstructions;
@@ -886,7 +886,7 @@ impl<'h> Agent<'h> {
                 ) && resolved.target == target
             })
             .map(|resolved| Arc::clone(&resolved.provider));
-        let evaluator = match resolve_evaluator(
+        let mut evaluator = match resolve_evaluator(
             &self.provider,
             &self.model,
             target.clone(),
@@ -922,38 +922,64 @@ impl<'h> Agent<'h> {
                 return Ok(TurnOutcome::Done(done_reason));
             }
         };
-        let result = Evaluator {
+        let mut result = Evaluator {
             provider: &*evaluator.provider,
             model: &evaluator.model,
             history: self.history.as_slice(),
             condition: &goal.condition,
             evaluation,
+            event_tx: &self.event_tx,
             cancel: &self.cancel,
             session_id: self.session_id.as_ref(),
         }
         .run()
         .await;
+        let fallback = match &result {
+            Err(failure) if self.goal.is_generation_active(goal.generation) => {
+                evaluator.fallback_to_current(&failure.error, &self.provider, &self.model)
+            }
+            _ => None,
+        };
+        result = match (fallback, result) {
+            (Some(fallback), Err(failure)) => {
+                let fallback_model = fallback.model.spec();
+                warn!(
+                    model = %failure.model,
+                    fallback_model,
+                    status = failure.error.status(),
+                    error_kind = failure.error.kind(),
+                    "goal evaluator model unavailable, falling back to chat model"
+                );
+                if failure.usage != TokenUsage::default() || failure.cost.is_some() {
+                    self.record_goal_evaluation_failure(
+                        goal.generation,
+                        evaluation,
+                        failure,
+                        false,
+                    )?;
+                }
+                evaluator = fallback;
+                Evaluator {
+                    provider: &*evaluator.provider,
+                    model: &evaluator.model,
+                    history: self.history.as_slice(),
+                    condition: &goal.condition,
+                    evaluation,
+                    event_tx: &self.event_tx,
+                    cancel: &self.cancel,
+                    session_id: self.session_id.as_ref(),
+                }
+                .run()
+                .await
+            }
+            (_, result) => result,
+        };
         let result = match result {
             Ok(result) => result,
             Err(failure) => {
-                self.total_usage += failure.usage;
-                self.goal.record_usage_for(
-                    goal.generation,
-                    failure.usage,
-                    failure.cost,
-                    failure.billing,
-                );
                 let cancelled = matches!(failure.error, AgentError::Cancelled);
                 let applied = self.goal.is_generation_active(goal.generation);
-                self.event_tx.send(AgentEvent::GoalEvaluationFailed {
-                    evaluation,
-                    message: failure.error.to_string(),
-                    applied,
-                    usage: failure.usage,
-                    cost: failure.cost,
-                    billing: failure.billing,
-                    model: failure.model,
-                })?;
+                self.record_goal_evaluation_failure(goal.generation, evaluation, failure, applied)?;
                 if cancelled {
                     return Err(AgentError::Cancelled);
                 }
@@ -988,9 +1014,12 @@ impl<'h> Agent<'h> {
                 Ok(TurnOutcome::Done(done_reason))
             }
             GoalApply::Continue { evaluation } => {
-                if self.goal_blocks >= GOAL_BLOCK_CAP {
+                let continuation_limit = self.goal.continuation_limit();
+                if self.goal_blocks >= continuation_limit {
                     self.event_tx.send(AgentEvent::GoalLoopCap {
                         evaluations: evaluation,
+                        continuations: self.goal_blocks,
+                        limit: continuation_limit,
                     })?;
                     return Ok(TurnOutcome::Done(done_reason));
                 }
@@ -1002,6 +1031,27 @@ impl<'h> Agent<'h> {
                 Ok(TurnOutcome::Continue)
             }
         }
+    }
+
+    fn record_goal_evaluation_failure(
+        &mut self,
+        generation: u64,
+        evaluation: u32,
+        failure: super::goal::EvaluationError,
+        applied: bool,
+    ) -> Result<(), AgentError> {
+        self.total_usage += failure.usage;
+        self.goal
+            .record_usage_for(generation, failure.usage, failure.cost, failure.billing);
+        self.event_tx.send(AgentEvent::GoalEvaluationFailed {
+            evaluation,
+            message: failure.error.to_string(),
+            applied,
+            usage: failure.usage,
+            cost: failure.cost,
+            billing: failure.billing,
+            model: failure.model,
+        })
     }
 
     async fn wait_for_reauth(
@@ -1537,6 +1587,7 @@ mod tests {
     const EXPECTED_ENVIRONMENT_NOTICE: &str = "a changed environment must be announced";
     const INSTRUCTIONS_CHANGED: &str =
         "<system-reminder>\n# Instructions changed\n\n+ be brief\n</system-reminder>";
+    const MODEL_UNAVAILABLE: &str = r#"{"error":{"code":"model_not_found","message":"model 'claude-haiku-4-5' not found","param":"model","type":"invalid_request_error"}}"#;
 
     struct MockInterruptSource {
         commands: Mutex<VecDeque<ExtractedCommand>>,
@@ -1557,15 +1608,21 @@ mod tests {
     }
 
     struct MockProvider {
-        responses: Mutex<Vec<StreamResponse>>,
+        responses: Mutex<Vec<Result<StreamResponse, AgentError>>>,
         captured_tools: Arc<Mutex<Vec<Value>>>,
+        captured_models: Arc<Mutex<Vec<String>>>,
     }
 
     impl MockProvider {
         fn new(responses: Vec<StreamResponse>) -> Self {
+            Self::with_results(responses.into_iter().map(Ok).collect())
+        }
+
+        fn with_results(responses: Vec<Result<StreamResponse, AgentError>>) -> Self {
             Self {
                 responses: Mutex::new(responses),
                 captured_tools: Arc::default(),
+                captured_models: Arc::default(),
             }
         }
     }
@@ -1573,7 +1630,7 @@ mod tests {
     impl Provider for MockProvider {
         fn stream_message<'a>(
             &'a self,
-            _: &'a Model,
+            model: &'a Model,
             _: &'a [Message],
             _: &'a str,
             tools: &'a Value,
@@ -1583,9 +1640,10 @@ mod tests {
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async {
                 self.captured_tools.lock().unwrap().push(tools.clone());
+                self.captured_models.lock().unwrap().push(model.spec());
                 let mut responses = self.responses.lock().unwrap();
                 assert!(!responses.is_empty(), "MockProvider: no more responses");
-                Ok(responses.remove(0))
+                responses.remove(0)
             })
         }
 
@@ -1836,6 +1894,22 @@ mod tests {
             text: "not json".into(),
         }]);
         response.usage.output = 7;
+        response
+    }
+
+    fn tool_call_goal_response() -> StreamResponse {
+        let mut response = assistant_response(vec![ContentBlock::tool_use(
+            "toolu_goal",
+            "shell",
+            serde_json::json!({"command": "true"}),
+        )]);
+        response.usage.output = 7;
+        response
+    }
+
+    fn goal_response_with_output_usage(reason: &str, output: u32) -> StreamResponse {
+        let mut response = goal_response(true, false, reason);
+        response.usage.output = output;
         response
     }
 
@@ -2363,14 +2437,190 @@ mod tests {
     }
 
     #[test]
-    fn goal_loop_cap_pauses_after_eight_continuations() {
+    fn evaluator_tool_call_is_reprompted_without_interrupting_the_goal() {
         smol::block_on(async {
+            let valid_output = 11;
+            let provider = MockProvider::new(vec![
+                text_response(StopReason::EndTurn),
+                tool_call_goal_response(),
+                goal_response_with_output_usage("verified after retry", valid_output),
+            ]);
+            let captured_models = Arc::clone(&provider.captured_models);
+            let current_model = default_model();
+            let weak_model = Model::from_tier_with_policy(
+                &current_model.provider,
+                caudra_providers::ModelTier::Weak,
+                &ModelPolicy::default(),
+            )
+            .unwrap();
+            let goal = GoalHandle::default();
+            goal.set("tests pass").unwrap();
+            let mut history = History::new(Vec::new());
+            let (agent, event_rx) = make_agent(provider, &mut history);
+            let mut agent = agent.with_goal(goal.clone());
+
+            agent.run(default_input()).await.unwrap();
+            drop(agent);
+
+            assert_eq!(
+                captured_models.lock().unwrap().as_slice(),
+                [current_model.spec(), weak_model.spec(), weak_model.spec()]
+            );
+            assert!(!event_rx.try_iter().any(|envelope| matches!(
+                envelope.event,
+                AgentEvent::GoalEvaluationFailed { applied: true, .. }
+            )));
+            let Some(GoalStatus::Finished(result)) = goal.status() else {
+                panic!("goal did not finish after evaluator retry");
+            };
+            assert_eq!(result.reason.as_ref(), "verified after retry");
+            assert_eq!(result.usage.output, 7 + valid_output);
+            assert_eq!(result.evaluations, 1);
+        });
+    }
+
+    #[test]
+    fn auto_goal_evaluator_falls_back_when_fast_model_is_unavailable() {
+        smol::block_on(async {
+            let provider = MockProvider::with_results(vec![
+                Ok(text_response(StopReason::EndTurn)),
+                Err(AgentError::api(404, MODEL_UNAVAILABLE)),
+                Ok(goal_response(true, false, "verified by chat")),
+            ]);
+            let captured_models = Arc::clone(&provider.captured_models);
+            let current_model = default_model();
+            let weak_model = Model::from_tier_with_policy(
+                &current_model.provider,
+                caudra_providers::ModelTier::Weak,
+                &ModelPolicy::default(),
+            )
+            .unwrap();
+            let goal = GoalHandle::default();
+            goal.set("tests pass").unwrap();
+            let mut history = History::new(Vec::new());
+            let (agent, event_rx) = make_agent(provider, &mut history);
+            let mut agent = agent.with_goal(goal.clone());
+
+            assert_eq!(
+                agent.run(default_input()).await.unwrap(),
+                DoneReason::EndTurn
+            );
+            drop(agent);
+
+            assert_eq!(
+                captured_models.lock().unwrap().as_slice(),
+                [
+                    current_model.spec(),
+                    weak_model.spec(),
+                    current_model.spec()
+                ]
+            );
+            let events: Vec<_> = event_rx.try_iter().map(|envelope| envelope.event).collect();
+            assert!(events.iter().any(|event| matches!(
+                event,
+                AgentEvent::GoalEvaluation {
+                    evaluation: 1,
+                    applied: true,
+                    model,
+                    ..
+                } if model == &current_model.spec()
+            )));
+            assert!(!events.iter().any(|event| matches!(
+                event,
+                AgentEvent::GoalEvaluationFailed { applied: true, .. }
+            )));
+            let Some(GoalStatus::Finished(result)) = goal.status() else {
+                panic!("goal did not finish after fallback");
+            };
+            assert_eq!(result.evaluations, 1);
+            assert_eq!(result.reason.as_ref(), "verified by chat");
+        });
+    }
+
+    #[test]
+    fn auto_fallback_attributes_each_attempt_to_its_model() {
+        smol::block_on(async {
+            let fallback_output = 11;
+            let provider = MockProvider::with_results(vec![
+                Ok(text_response(StopReason::EndTurn)),
+                Ok(invalid_goal_response()),
+                Err(AgentError::api(404, MODEL_UNAVAILABLE)),
+                Ok(goal_response_with_output_usage(
+                    "verified by chat",
+                    fallback_output,
+                )),
+            ]);
+            let captured_models = Arc::clone(&provider.captured_models);
+            let current_model = default_model();
+            let weak_model = Model::from_tier_with_policy(
+                &current_model.provider,
+                caudra_providers::ModelTier::Weak,
+                &ModelPolicy::default(),
+            )
+            .unwrap();
+            let goal = GoalHandle::default();
+            goal.set("tests pass").unwrap();
+            let mut history = History::new(Vec::new());
+            let (agent, event_rx) = make_agent(provider, &mut history);
+            let mut agent = agent.with_goal(goal.clone());
+
+            agent.run(default_input()).await.unwrap();
+            drop(agent);
+
+            assert_eq!(
+                captured_models.lock().unwrap().as_slice(),
+                [
+                    current_model.spec(),
+                    weak_model.spec(),
+                    weak_model.spec(),
+                    current_model.spec(),
+                ]
+            );
+            let events: Vec<_> = event_rx.try_iter().map(|envelope| envelope.event).collect();
+            assert!(events.iter().any(|event| matches!(
+                event,
+                AgentEvent::GoalEvaluationFailed {
+                    applied: false,
+                    usage: TokenUsage { output: 7, .. },
+                    model,
+                    ..
+                } if model == &weak_model.spec()
+            )));
+            assert!(events.iter().any(|event| matches!(
+                event,
+                AgentEvent::GoalEvaluation {
+                    applied: true,
+                    usage: TokenUsage { output, .. },
+                    model,
+                    ..
+                } if *output == fallback_output && model == &current_model.spec()
+            )));
+            assert!(events.iter().any(|event| matches!(
+                event,
+                AgentEvent::Done {
+                    usage: TokenUsage { output: 18, .. },
+                    ..
+                }
+            )));
+            let Some(GoalStatus::Finished(result)) = goal.status() else {
+                panic!("goal did not finish after fallback");
+            };
+            assert_eq!(result.usage.output, 18);
+            assert_eq!(result.evaluations, 1);
+        });
+    }
+
+    #[test]
+    fn goal_loop_cap_uses_the_session_limit() {
+        smol::block_on(async {
+            let continuation_limit = 2;
             let mut responses = Vec::new();
-            for _ in 0..=GOAL_BLOCK_CAP {
+            for _ in 0..=continuation_limit {
                 responses.push(text_response(StopReason::EndTurn));
                 responses.push(goal_response(false, false, "more work remains"));
             }
             let goal = GoalHandle::default();
+            goal.set_continuation_limit(continuation_limit);
             goal.set("never met").unwrap();
             let mut history = History::new(Vec::new());
             let (agent, event_rx) = make_agent(MockProvider::new(responses), &mut history);
@@ -2379,10 +2629,16 @@ mod tests {
             agent.run(default_input()).await.unwrap();
             drop(agent);
 
-            assert_eq!(goal.snapshot().unwrap().evaluations, GOAL_BLOCK_CAP + 1);
+            assert_eq!(goal.snapshot().unwrap().evaluations, continuation_limit + 1);
             assert!(event_rx.try_iter().any(|envelope| matches!(
                 envelope.event,
-                AgentEvent::GoalLoopCap { evaluations } if evaluations == GOAL_BLOCK_CAP + 1
+                AgentEvent::GoalLoopCap {
+                    evaluations,
+                    continuations,
+                    limit,
+                } if evaluations == continuation_limit + 1
+                    && continuations == continuation_limit
+                    && limit == continuation_limit
             )));
         });
     }

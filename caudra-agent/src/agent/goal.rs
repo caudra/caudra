@@ -17,12 +17,14 @@ use strum::Display;
 
 use super::history::{UNAVAILABLE_RESULT, close_dangling_tool_calls, remove_orphaned_tool_results};
 use super::run::estimate_message_tokens;
-use super::streaming::{StreamError, stream_silent_with_retry};
+use super::streaming::stream_silent_with_retry;
 use crate::cancel::CancelToken;
+use crate::{AgentEvent, EventSender};
 
 pub const MAX_GOAL_CHARS: usize = 4_000;
-pub const GOAL_BLOCK_CAP: u32 = 8;
-const EVALUATOR_TIMEOUT: Duration = Duration::from_secs(30);
+pub const DEFAULT_GOAL_CONTINUATION_LIMIT: u32 = 16;
+pub const MAX_GOAL_CONTINUATION_LIMIT: u32 = 100;
+const EVALUATOR_INITIALIZATION_TIMEOUT: Duration = Duration::from_secs(30);
 const EVALUATOR_OUTPUT_TOKENS: u32 = 4_096;
 const MAX_EVALUATOR_OUTPUT_BYTES: usize = 64 * 1024;
 const MAX_VALIDATION_ATTEMPTS: u32 = 3;
@@ -106,11 +108,22 @@ pub enum GoalStatus {
     Finished(GoalResult),
 }
 
-#[derive(Default)]
 struct GoalState {
     generation: u64,
     active: Option<GoalSnapshot>,
     finished: Option<GoalResult>,
+    continuation_limit: u32,
+}
+
+impl Default for GoalState {
+    fn default() -> Self {
+        Self {
+            generation: 0,
+            active: None,
+            finished: None,
+            continuation_limit: DEFAULT_GOAL_CONTINUATION_LIMIT,
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -218,6 +231,14 @@ impl GoalHandle {
             .active
             .as_ref()
             .map(|goal| goal.condition.to_string())
+    }
+
+    pub fn continuation_limit(&self) -> u32 {
+        self.lock().continuation_limit
+    }
+
+    pub fn set_continuation_limit(&self, limit: u32) {
+        self.lock().continuation_limit = limit.min(MAX_GOAL_CONTINUATION_LIMIT);
     }
 
     pub fn record_external_usage(&self, usage: TokenUsage, cost: Option<f64>, billing: Billing) {
@@ -334,6 +355,27 @@ pub(crate) struct ResolvedEvaluator {
     pub model: Model,
 }
 
+impl ResolvedEvaluator {
+    pub(crate) fn fallback_to_current(
+        &self,
+        error: &AgentError,
+        current_provider: &Arc<dyn Provider>,
+        current_model: &Model,
+    ) -> Option<Self> {
+        if self.target != GoalEvaluatorTarget::Auto
+            || !error.is_model_unavailable()
+            || (self.model.provider == current_model.provider && self.model.id == current_model.id)
+        {
+            return None;
+        }
+        Some(Self {
+            target: GoalEvaluatorTarget::Auto,
+            provider: Arc::clone(current_provider),
+            model: with_evaluator_limits(current_model.clone()),
+        })
+    }
+}
+
 pub(crate) async fn resolve_evaluator(
     current_provider: &Arc<dyn Provider>,
     current_model: &Model,
@@ -348,7 +390,7 @@ pub(crate) async fn resolve_evaluator(
     let current_slug = Arc::clone(&current_model.provider);
     let target_for_resolution = target.clone();
     let model_policy = model_policy.clone();
-    let (mut model, provider) = initialization_with_limits(cancel, async move {
+    let (model, provider) = initialization_with_limits(cancel, async move {
         let mut model = smol::unblock(move || {
             evaluator_model(&current_model, &target_for_resolution, &model_policy)
         })
@@ -365,12 +407,7 @@ pub(crate) async fn resolve_evaluator(
         Ok((model, provider))
     })
     .await?;
-    model.max_output_tokens = Some(
-        model
-            .max_output_tokens
-            .unwrap_or(EVALUATOR_OUTPUT_TOKENS)
-            .min(EVALUATOR_OUTPUT_TOKENS),
-    );
+    let model = with_evaluator_limits(model);
     Ok(ResolvedEvaluator {
         target,
         provider,
@@ -378,14 +415,24 @@ pub(crate) async fn resolve_evaluator(
     })
 }
 
+fn with_evaluator_limits(mut model: Model) -> Model {
+    model.max_output_tokens = Some(
+        model
+            .max_output_tokens
+            .unwrap_or(EVALUATOR_OUTPUT_TOKENS)
+            .min(EVALUATOR_OUTPUT_TOKENS),
+    );
+    model
+}
+
 async fn initialization_with_limits<T>(
     cancel: &CancelToken,
     future: impl Future<Output = Result<T, AgentError>>,
 ) -> Result<T, AgentError> {
     let timed = futures_lite::future::race(future, async {
-        smol::Timer::after(EVALUATOR_TIMEOUT).await;
+        smol::Timer::after(EVALUATOR_INITIALIZATION_TIMEOUT).await;
         Err(AgentError::Timeout {
-            secs: EVALUATOR_TIMEOUT.as_secs(),
+            secs: EVALUATOR_INITIALIZATION_TIMEOUT.as_secs(),
         })
     });
     cancel
@@ -451,6 +498,7 @@ pub(crate) struct Evaluator<'a> {
     pub history: &'a [Message],
     pub condition: &'a str,
     pub evaluation: u32,
+    pub event_tx: &'a EventSender,
     pub cancel: &'a CancelToken,
     pub session_id: Option<&'a SessionRef>,
 }
@@ -481,6 +529,7 @@ impl Evaluator<'_> {
                 model,
                 &messages,
                 crate::prompt::GOAL_EVALUATOR,
+                self.event_tx,
                 self.cancel,
                 self.session_id,
             )
@@ -506,49 +555,39 @@ impl Evaluator<'_> {
             usage += response.usage;
             add_cost(&mut cost, model.billed_cost(&response.usage, false));
 
-            let output = match response_text(&response.message) {
-                Ok(output) => output,
-                Err(error) => {
-                    return Err(EvaluationError {
-                        error,
-                        usage,
-                        cost,
-                        billing: model.billing,
-                        model: model.spec(),
-                    });
-                }
-            };
-            match parse_evaluation(&output) {
-                Ok((verdict, reason)) => {
-                    return Ok(EvaluationResult {
-                        verdict,
-                        reason,
-                        usage,
-                        cost,
-                        billing: model.billing,
-                        model: model.spec(),
-                    });
-                }
-                Err(error) => {
-                    validation_attempt += 1;
-                    if validation_attempt >= MAX_VALIDATION_ATTEMPTS {
-                        return Err(EvaluationError {
-                            error: AgentError::Tool {
-                                tool: "goal_evaluator".into(),
-                                message: format!(
-                                    "invalid evaluator response after {MAX_VALIDATION_ATTEMPTS} attempts: {error}"
-                                ),
-                            },
+            let (error, output) = match response_text(&response.message) {
+                Ok(output) => match parse_evaluation(&output) {
+                    Ok((verdict, reason)) => {
+                        return Ok(EvaluationResult {
+                            verdict,
+                            reason,
                             usage,
                             cost,
                             billing: model.billing,
                             model: model.spec(),
                         });
                     }
-                    previous_error = Some(error);
-                    previous_output = Some(truncate_output(&output));
-                }
+                    Err(error) => (error, Some(output)),
+                },
+                Err(error) => (error, None),
+            };
+            validation_attempt += 1;
+            if validation_attempt >= MAX_VALIDATION_ATTEMPTS {
+                return Err(EvaluationError {
+                    error: AgentError::Tool {
+                        tool: "goal_evaluator".into(),
+                        message: format!(
+                            "invalid evaluator response after {MAX_VALIDATION_ATTEMPTS} attempts: {error}"
+                        ),
+                    },
+                    usage,
+                    cost,
+                    billing: model.billing,
+                    model: model.spec(),
+                });
             }
+            previous_error = Some(error);
+            previous_output = output.as_deref().map(truncate_output);
         }
     }
 }
@@ -558,6 +597,7 @@ async fn evaluator_request(
     model: &Model,
     messages: &[Message],
     system: &str,
+    event_tx: &EventSender,
     cancel: &CancelToken,
     session_id: Option<&SessionRef>,
 ) -> Result<caudra_providers::StreamResponse, AgentError> {
@@ -568,18 +608,18 @@ async fn evaluator_request(
         messages,
         system,
         &tools,
+        Some(event_tx),
         cancel,
         RequestOptions::default(),
         session_id,
     );
-    futures_lite::future::race(request, async {
-        smol::Timer::after(EVALUATOR_TIMEOUT).await;
-        Err(StreamError::Other(AgentError::Timeout {
-            secs: EVALUATOR_TIMEOUT.as_secs(),
-        }))
-    })
-    .await
-    .map_err(Into::into)
+    let result = request.await.map_err(Into::into);
+    event_tx.send(AgentEvent::PromptProgress {
+        processed: 0,
+        total: 0,
+        cache: 0,
+    })?;
+    result
 }
 
 fn transcript_within_budget(history: &[Message], model: &Model, percent: u32) -> Vec<Message> {
@@ -637,20 +677,21 @@ fn evaluator_prompt(
 ) -> String {
     let condition = serde_json::to_string(condition).unwrap_or_else(|_| "\"\"".into());
     let mut prompt = format!("Evaluation number: {evaluation}\nCondition: {condition}");
-    if let (Some(error), Some(output)) = (previous_error, previous_output) {
+    if let Some(error) = previous_error {
         prompt.push_str(&format!(
-            "\n\nYour previous response was invalid ({error}). Previous response:\n{output}\n\nReturn only the required JSON object."
+            "\n\nYour previous response was invalid ({error})."
         ));
+        if let Some(output) = previous_output {
+            prompt.push_str(&format!(" Previous response:\n{output}"));
+        }
+        prompt.push_str("\n\nReturn only the required JSON object.");
     }
     prompt
 }
 
-fn response_text(message: &Message) -> Result<String, AgentError> {
+fn response_text(message: &Message) -> Result<String, String> {
     if message.has_tool_calls() {
-        return Err(AgentError::Tool {
-            tool: "goal_evaluator".into(),
-            message: "evaluator attempted to call a tool".into(),
-        });
+        return Err("evaluator attempted to call a tool".into());
     }
     let mut output = String::new();
     for block in &message.content {
@@ -659,16 +700,10 @@ fn response_text(message: &Message) -> Result<String, AgentError> {
         }
     }
     if output.trim().is_empty() {
-        return Err(AgentError::Tool {
-            tool: "goal_evaluator".into(),
-            message: "evaluator returned no text".into(),
-        });
+        return Err("evaluator returned no text".into());
     }
     if output.len() > MAX_EVALUATOR_OUTPUT_BYTES {
-        return Err(AgentError::Tool {
-            tool: "goal_evaluator".into(),
-            message: "evaluator response was too large".into(),
-        });
+        return Err("evaluator response was too large".into());
     }
     Ok(output)
 }
@@ -747,7 +782,7 @@ pub fn goal_checkin_message(condition: &str) -> String {
 }
 
 pub(crate) fn is_unrecoverable(error: &AgentError) -> bool {
-    if error.is_auth_error() || error.is_context_overflow() {
+    if error.is_auth_error() || error.is_context_overflow() || error.is_model_unavailable() {
         return true;
     }
     let AgentError::Api {
@@ -765,8 +800,6 @@ pub(crate) fn is_unrecoverable(error: &AgentError) -> bool {
                 || message.contains("oauth")
                 || message.contains("organization")
                 || message.contains("account on hold")))
-        || message.contains("model is not available")
-        || message.contains("model not found")
 }
 
 #[cfg(test)]
@@ -777,6 +810,8 @@ mod tests {
     use serde_json::Value;
 
     struct NullProvider;
+
+    struct ProgressProvider;
 
     impl Provider for NullProvider {
         fn stream_message<'a>(
@@ -797,6 +832,32 @@ mod tests {
         }
     }
 
+    impl Provider for ProgressProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            _: &'a [Message],
+            _: &'a str,
+            _: &'a Value,
+            event_tx: &'a flume::Sender<ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&'a SessionRef>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(async {
+                event_tx.send(ProviderEvent::PromptProgress {
+                    processed: 100,
+                    total: 1_000,
+                    cache: 50,
+                })?;
+                Ok(StreamResponse::default())
+            })
+        }
+
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+            Box::pin(async { unimplemented!() })
+        }
+    }
+
     #[test]
     fn validates_condition_by_characters() {
         assert_eq!(Goal::validate("  ship it  ").unwrap().as_ref(), "ship it");
@@ -805,6 +866,61 @@ mod tests {
             Goal::validate(&"é".repeat(MAX_GOAL_CHARS + 1)).unwrap_err(),
             GoalError::TooLong
         );
+    }
+
+    #[test]
+    fn continuation_limit_is_session_scoped_and_bounded() {
+        let handle = GoalHandle::default();
+        assert_eq!(handle.continuation_limit(), DEFAULT_GOAL_CONTINUATION_LIMIT);
+
+        handle.set_continuation_limit(24);
+        handle.set("first").unwrap();
+        handle.clear();
+        handle.set("second").unwrap();
+        assert_eq!(handle.continuation_limit(), 24);
+
+        handle.set_continuation_limit(MAX_GOAL_CONTINUATION_LIMIT + 1);
+        assert_eq!(handle.continuation_limit(), MAX_GOAL_CONTINUATION_LIMIT);
+    }
+
+    #[test]
+    fn evaluator_request_forwards_prefill_progress_and_clears_it() {
+        smol::block_on(async {
+            let provider = ProgressProvider;
+            let model = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
+            let (raw_tx, event_rx) = flume::unbounded();
+            let event_tx = EventSender::new(raw_tx, 0);
+
+            evaluator_request(
+                &provider,
+                &model,
+                &[],
+                "system",
+                &event_tx,
+                &CancelToken::none(),
+                None,
+            )
+            .await
+            .unwrap();
+            drop(event_tx);
+
+            let events: Vec<_> = event_rx.drain().map(|envelope| envelope.event).collect();
+            assert!(matches!(
+                events.as_slice(),
+                [
+                    AgentEvent::PromptProgress {
+                        processed: 100,
+                        total: 1_000,
+                        cache: 50,
+                    },
+                    AgentEvent::PromptProgress {
+                        processed: 0,
+                        total: 0,
+                        cache: 0,
+                    },
+                ]
+            ));
+        });
     }
 
     #[test]
@@ -920,6 +1036,92 @@ mod tests {
             assert_eq!(exact.model.spec(), "anthropic/claude-opus-4-6-20260101");
             assert!(Arc::ptr_eq(&exact.provider, &provider));
         });
+    }
+
+    #[test]
+    fn auto_fallback_reuses_current_provider_and_caps_the_cloned_model() {
+        let current_provider: Arc<dyn Provider> = Arc::new(NullProvider);
+        let current_model = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
+        let original_output_limit = current_model.max_output_tokens;
+        let evaluator = ResolvedEvaluator {
+            target: GoalEvaluatorTarget::Auto,
+            provider: Arc::new(NullProvider),
+            model: Model::from_spec("anthropic/claude-haiku-4-5").unwrap(),
+        };
+
+        let fallback = evaluator
+            .fallback_to_current(
+                &AgentError::api(404, "model 'claude-haiku-4-5' not found"),
+                &current_provider,
+                &current_model,
+            )
+            .unwrap();
+
+        assert!(Arc::ptr_eq(&fallback.provider, &current_provider));
+        assert_eq!(fallback.model.spec(), current_model.spec());
+        assert_eq!(
+            fallback.model.max_output_tokens,
+            Some(EVALUATOR_OUTPUT_TOKENS)
+        );
+        assert_eq!(current_model.max_output_tokens, original_output_limit);
+    }
+
+    #[test]
+    fn only_auto_falls_back_from_an_unavailable_model() {
+        let current_provider: Arc<dyn Provider> = Arc::new(NullProvider);
+        let current_model = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
+        let unavailable = AgentError::api(404, "unknown model claude-haiku-4-5");
+
+        for target in [
+            GoalEvaluatorTarget::Tier(ModelTier::Weak),
+            GoalEvaluatorTarget::Model("anthropic/claude-haiku-4-5".into()),
+        ] {
+            let evaluator = ResolvedEvaluator {
+                target,
+                provider: Arc::new(NullProvider),
+                model: Model::from_spec("anthropic/claude-haiku-4-5").unwrap(),
+            };
+            assert!(
+                evaluator
+                    .fallback_to_current(&unavailable, &current_provider, &current_model)
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn auto_does_not_fallback_for_an_unrelated_error_or_the_current_model() {
+        let current_provider: Arc<dyn Provider> = Arc::new(NullProvider);
+        let current_model = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
+        let evaluator = ResolvedEvaluator {
+            target: GoalEvaluatorTarget::Auto,
+            provider: Arc::new(NullProvider),
+            model: current_model.clone(),
+        };
+
+        assert!(
+            evaluator
+                .fallback_to_current(
+                    &AgentError::api(404, "model 'claude-sonnet-4-20250514' not found"),
+                    &current_provider,
+                    &current_model,
+                )
+                .is_none()
+        );
+
+        let other_model = ResolvedEvaluator {
+            model: Model::from_spec("anthropic/claude-haiku-4-5").unwrap(),
+            ..evaluator
+        };
+        assert!(
+            other_model
+                .fallback_to_current(
+                    &AgentError::api(404, "route not found"),
+                    &current_provider,
+                    &current_model,
+                )
+                .is_none()
+        );
     }
 
     #[test]

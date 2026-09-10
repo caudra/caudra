@@ -175,6 +175,7 @@ pub(crate) struct ForwardedReasoning {
 async fn forward_provider_events(
     prx: flume::Receiver<ProviderEvent>,
     event_tx: Option<&EventSender>,
+    progress_only: bool,
 ) -> ForwardedStream {
     let mut streamed = String::new();
     let mut reasoning = Vec::new();
@@ -192,6 +193,7 @@ async fn forward_provider_events(
                 duration: started.elapsed(),
             });
         }
+        let forward = !progress_only || matches!(&pe, ProviderEvent::PromptProgress { .. });
         let ae = match pe {
             ProviderEvent::TextDelta { text } => {
                 streamed.push_str(&text);
@@ -232,7 +234,7 @@ async fn forward_provider_events(
                 cache,
             },
         };
-        if let Some(event_tx) = event_tx {
+        if forward && let Some(event_tx) = event_tx {
             if event_tx.send(ae).is_err() {
                 break;
             }
@@ -325,6 +327,7 @@ pub(crate) async fn stream_with_retry(
         system,
         tools,
         Some(event_tx),
+        false,
         cancel,
         retry_now,
         opts,
@@ -340,6 +343,7 @@ pub(crate) async fn stream_silent_with_retry(
     messages: &[Message],
     system: &str,
     tools: &Value,
+    progress_tx: Option<&EventSender>,
     cancel: &CancelToken,
     opts: RequestOptions,
     session_id: Option<&SessionRef>,
@@ -350,7 +354,8 @@ pub(crate) async fn stream_silent_with_retry(
         model,
         system,
         tools,
-        None,
+        progress_tx,
+        true,
         cancel,
         &Nudge::default(),
         opts,
@@ -367,6 +372,7 @@ async fn stream_with_retry_inner(
     system: &str,
     tools: &Value,
     event_tx: Option<&EventSender>,
+    progress_only: bool,
     cancel: &CancelToken,
     retry_now: &Nudge,
     opts: RequestOptions,
@@ -384,7 +390,7 @@ async fn stream_with_retry_inner(
         let (ptx, prx) = flume::unbounded();
         let forwarder = smol::spawn({
             let event_tx = event_tx.cloned();
-            async move { forward_provider_events(prx, event_tx.as_ref()).await }
+            async move { forward_provider_events(prx, event_tx.as_ref(), progress_only).await }
         });
         let result = futures_lite::future::race(
             provider.stream_message(
@@ -658,12 +664,45 @@ mod tests {
 
         let (etx, erx) = flume::unbounded();
         let sender = crate::EventSender::new(etx, 0);
-        smol::block_on(forward_provider_events(prx, Some(&sender)));
+        smol::block_on(forward_provider_events(prx, Some(&sender), false));
         drop(sender);
         erx.drain()
             .map(|envelope| envelope.event)
             .filter(|event| matches!(event, AgentEvent::ToolInputDelta { .. }))
             .collect()
+    }
+
+    #[test]
+    fn progress_only_forwarding_hides_model_output() {
+        let (ptx, prx) = flume::unbounded();
+        ptx.send(ProviderEvent::TextDelta {
+            text: "private evaluator output".into(),
+        })
+        .unwrap();
+        ptx.send(ProviderEvent::PromptProgress {
+            processed: 100,
+            total: 1_000,
+            cache: 50,
+        })
+        .unwrap();
+        drop(ptx);
+
+        let (etx, erx) = flume::unbounded();
+        let sender = crate::EventSender::new(etx, 0);
+        let forwarded = smol::block_on(forward_provider_events(prx, Some(&sender), true));
+        drop(sender);
+        let events: Vec<_> = erx.drain().map(|envelope| envelope.event).collect();
+
+        assert_eq!(forwarded.streamed, "private evaluator output");
+        assert!(forwarded.forwarded);
+        assert!(matches!(
+            events.as_slice(),
+            [AgentEvent::PromptProgress {
+                processed: 100,
+                total: 1_000,
+                cache: 50,
+            }]
+        ));
     }
 
     /// Every preview published, in order. `None` fragments are dropped, so the
@@ -809,7 +848,7 @@ mod tests {
 
         let (etx, erx) = flume::unbounded();
         let sender = crate::EventSender::new(etx, 0);
-        smol::block_on(forward_provider_events(prx, Some(&sender)));
+        smol::block_on(forward_provider_events(prx, Some(&sender), false));
         drop(sender);
         assert_eq!(erx.drain().count(), 0);
     }
@@ -1021,7 +1060,7 @@ mod tests {
         }
         drop(tx);
 
-        let forwarded = smol::block_on(forward_provider_events(rx, None));
+        let forwarded = smol::block_on(forward_provider_events(rx, None, false));
         assert_eq!(forwarded.streamed, "x");
         assert_eq!(forwarded.reasoning.len(), 2);
         assert_eq!(forwarded.reasoning[0].text, "ab");
@@ -1044,7 +1083,7 @@ mod tests {
         }
         drop(tx);
 
-        let forwarded = smol::block_on(forward_provider_events(rx, None));
+        let forwarded = smol::block_on(forward_provider_events(rx, None, false));
         assert_eq!(forwarded.reasoning.len(), 2);
         assert_eq!(forwarded.reasoning[0].text, "first");
         assert_eq!(forwarded.reasoning[1].text, "second");
@@ -1057,7 +1096,7 @@ mod tests {
             .unwrap();
         drop(tx);
 
-        let forwarded = smol::block_on(forward_provider_events(rx, None));
+        let forwarded = smol::block_on(forward_provider_events(rx, None, false));
         assert!(forwarded.reasoning.is_empty());
     }
 

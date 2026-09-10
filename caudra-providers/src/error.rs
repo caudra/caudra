@@ -179,6 +179,47 @@ impl AgentError {
         matches!(self, Self::Api { status: 401, .. })
     }
 
+    pub fn is_model_unavailable(&self) -> bool {
+        let Self::Api { message, .. } = self else {
+            return false;
+        };
+        if let Ok(value) = serde_json::from_str::<Value>(message) {
+            let error = value.get("error");
+            let unavailable_code = [
+                error.and_then(|error| error.get("code")),
+                error.and_then(|error| error.get("type")),
+                value.get("code"),
+                value.get("type"),
+            ]
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .any(|code| {
+                matches!(
+                    code.to_ascii_lowercase().as_str(),
+                    "model_not_found"
+                        | "model_not_available"
+                        | "model_unavailable"
+                        | "unknown_model"
+                )
+            });
+            if unavailable_code {
+                return true;
+            }
+            let detail = [
+                error.and_then(|error| error.get("message")),
+                error.filter(|error| error.is_string()),
+                value.get("message"),
+                value.get("detail"),
+            ]
+            .into_iter()
+            .flatten()
+            .find_map(|value| Value::as_str(value).filter(|detail| !detail.trim().is_empty()));
+            return detail.is_some_and(model_unavailable_message);
+        }
+        model_unavailable_message(message)
+    }
+
     pub fn should_rotate_key(&self) -> bool {
         matches!(self, Self::Api { status, .. } if *status == 429 || *status == 401 || *status == 403)
     }
@@ -224,6 +265,28 @@ impl AgentError {
             _ => self.to_string(),
         }
     }
+}
+
+fn model_unavailable_message(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    if message.contains("unknown model") {
+        return true;
+    }
+    let Some(model_index) = message.find("model") else {
+        return false;
+    };
+    let model_detail = message[model_index..]
+        .split(['.', ',', ';', '\n'])
+        .next()
+        .unwrap_or_default();
+    if model_detail.contains("not available for this feature") {
+        return false;
+    }
+    model_detail.contains("not found")
+        || model_detail.contains("not available")
+        || model_detail.contains("unavailable")
+        || model_detail.contains("does not exist")
+        || model_detail.contains("doesn't exist")
 }
 
 fn api_user_message(status: u16, body: &str, retry_after: Option<Duration>) -> String {
@@ -469,6 +532,31 @@ mod tests {
     #[test_case(403, false ; "forbidden")]
     fn api_auth_error(status: u16, expected: bool) {
         assert_eq!(api(status).is_auth_error(), expected);
+    }
+
+    #[test_case(404, r#"{"error":{"code":"model_not_found","message":"model 'gpt-5.6-luna' not found","param":"model","type":"invalid_request_error"}}"#, true ; "structured_code")]
+    #[test_case(404, "model 'qwen' not found", true ; "named_model_not_found")]
+    #[test_case(400, "unknown model qwen", true ; "unknown_model")]
+    #[test_case(404, "The model `qwen` does not exist or you do not have access", true ; "model_does_not_exist")]
+    #[test_case(404, "model qwen is not available", true ; "model_not_available")]
+    #[test_case(404, "route not found", false ; "generic_not_found")]
+    #[test_case(400, "Feature not available for this model", false ; "feature_unavailable")]
+    #[test_case(400, "This model is not available for this feature", false ; "model_feature_unavailable")]
+    #[test_case(404, r#"{"model":"qwen","message":"organization not found"}"#, false ; "unrelated_json_field")]
+    #[test_case(404, r#"{"error":{"message":""},"message":"model qwen not found"}"#, true ; "empty_nested_message")]
+    #[test_case(429, "rate limit exceeded", false ; "rate_limit")]
+    fn model_unavailable_api_error(status: u16, message: &str, expected: bool) {
+        assert_eq!(api_msg(status, message).is_model_unavailable(), expected);
+    }
+
+    #[test]
+    fn non_api_error_is_not_model_unavailable() {
+        assert!(
+            !AgentError::Config {
+                message: "model qwen not found".into(),
+            }
+            .is_model_unavailable()
+        );
     }
 
     #[test_case(429, "Rate limited"        ; "rate_limited")]

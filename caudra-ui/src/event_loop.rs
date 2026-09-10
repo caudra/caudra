@@ -624,6 +624,9 @@ impl SpawnCtx {
         let permissions = Arc::new(self.permissions.fork());
         permissions.set_session_yolo(session.meta.yolo);
         let goal = caudra_agent::GoalHandle::restored(session.meta.active_goal.as_deref());
+        if let Some(limit) = session.meta.goal_continuation_limit {
+            goal.set_continuation_limit(limit);
+        }
         let subagent_history = crate::agent::stored_subagent_history(&session);
         let handles = AgentHandles::spawn(
             &self.model_slot,

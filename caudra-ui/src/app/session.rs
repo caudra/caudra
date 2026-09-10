@@ -10,12 +10,12 @@ use crate::components::session_picker::{SessionPickerAction, SessionRow};
 use crate::components::{Action, DisplaySource, ForkDraft, ForkedSession, LoadedSession};
 use crate::input_document::InputDraft;
 use crate::repaint::{Dirty, Watch};
-use caudra_agent::GoalStatus;
 use caudra_agent::HistorySnapshot;
 use caudra_agent::agent::estimate_message_tokens;
 use caudra_agent::snapshots::{
     ConflictPolicy, RestoreReport, RestoreStatus, RestoreTarget, SnapshotError, SnapshotStore,
 };
+use caudra_agent::{GoalHandle, GoalStatus};
 use caudra_providers::{
     HistoryItem, HistoryItemKind, ImageSource, Model, TokenUsage, active_history_items,
     merge_history_items, project_messages,
@@ -393,6 +393,7 @@ impl App {
                 })),
                 Some(GoalStatus::Active(_)) | None => None,
             },
+            goal_continuation_limit: Some(state.goal.continuation_limit()),
             yolo: self.permissions.persisted_yolo(),
         }
     }
@@ -829,7 +830,7 @@ impl App {
         self.state.token_usage = TokenUsage::default();
         self.state.cost = None;
         self.state.context_size = 0;
-        self.state.goal.reset();
+        self.state.goal = GoalHandle::default();
         self.goal_deferred = false;
         self.state.plan = PlanState::None;
         self.permissions

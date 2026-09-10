@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use caudra_agent::{GoalStatus, GoalVerdict};
+use caudra_agent::{GoalStatus, GoalVerdict, MAX_GOAL_CONTINUATION_LIMIT};
 use caudra_providers::model_registry::GoalEvaluatorTarget;
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use ratatui::Frame;
@@ -52,11 +52,21 @@ impl GoalModal {
         self.footer.clear();
     }
 
-    pub fn handle_key(&mut self, key: KeyEvent) {
+    pub fn handle_key(&mut self, key: KeyEvent, continuation_limit: u32) -> Option<u32> {
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => self.close(),
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.close();
+                None
+            }
+            KeyCode::Left | KeyCode::Char('-') => Some(continuation_limit.saturating_sub(1)),
+            KeyCode::Right | KeyCode::Char('+') | KeyCode::Char('=') => Some(
+                continuation_limit
+                    .saturating_add(1)
+                    .min(MAX_GOAL_CONTINUATION_LIMIT),
+            ),
             _ => {
                 self.scroll.handle_key(key);
+                None
             }
         }
     }
@@ -92,6 +102,7 @@ impl GoalModal {
         area: Rect,
         status: Option<&GoalStatus>,
         evaluator: &GoalEvaluatorTarget,
+        continuation_limit: u32,
     ) -> Rect {
         if !self.open {
             return Rect::default();
@@ -100,7 +111,7 @@ impl GoalModal {
         let width = (area.width as u32 * WIDTH_PERCENT as u32 / 100)
             .saturating_sub((2 + H_PAD * 2) as u32) as u16;
         self.active = is_active(status);
-        let mut lines = status_lines(status, evaluator);
+        let mut lines = status_lines(status, evaluator, continuation_limit);
         let total = Paragraph::new(lines.clone())
             .wrap(Wrap { trim: false })
             .line_count(width) as u16;
@@ -184,6 +195,7 @@ fn footer(active: bool) -> FooterLine {
 fn status_lines(
     status: Option<&GoalStatus>,
     evaluator: &GoalEvaluatorTarget,
+    continuation_limit: u32,
 ) -> Vec<Line<'static>> {
     let theme = theme::current();
     let Some(status) = status else {
@@ -191,6 +203,7 @@ fn status_lines(
             Line::from(Span::styled("No goal set", theme.status_dim)),
             Line::default(),
             evaluator_line(evaluator),
+            continuation_line(continuation_limit),
             Line::default(),
             footer(false).line(None),
         ];
@@ -239,6 +252,7 @@ fn status_lines(
         Line::from(condition.to_owned()),
         Line::default(),
         evaluator_line(evaluator),
+        continuation_line(continuation_limit),
         Line::from(vec![
             Span::styled("Evaluations  ", theme.tool_dim),
             Span::raw(evaluations.to_string()),
@@ -275,6 +289,14 @@ fn evaluator_line(target: &GoalEvaluatorTarget) -> Line<'static> {
     Line::from(vec![
         Span::styled("Evaluator  ", theme::current().tool_dim),
         Span::raw(value),
+    ])
+}
+
+fn continuation_line(limit: u32) -> Line<'static> {
+    Line::from(vec![
+        Span::styled("Automatic continuations  ", theme::current().tool_dim),
+        Span::raw(limit.to_string()),
+        Span::styled("    ←/→ adjust for this session", theme::current().tool_dim),
     ])
 }
 
@@ -335,7 +357,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT)).unwrap();
         terminal
             .draw(|frame| {
-                modal.view(frame, frame.area(), status, &GoalEvaluatorTarget::Auto);
+                modal.view(frame, frame.area(), status, &GoalEvaluatorTarget::Auto, 16);
             })
             .unwrap();
         terminal
@@ -346,6 +368,23 @@ mod tests {
         assert_eq!(format_duration(Duration::from_secs(8)), "8s");
         assert_eq!(format_duration(Duration::from_secs(68)), "1m 8s");
         assert_eq!(format_duration(Duration::from_secs(3_668)), "1h 1m");
+    }
+
+    #[test]
+    fn continuation_limit_keys_adjust_within_bounds() {
+        let mut modal = GoalModal::default();
+        assert_eq!(
+            modal.handle_key(KeyEvent::from(KeyCode::Right), 16),
+            Some(17)
+        );
+        assert_eq!(modal.handle_key(KeyEvent::from(KeyCode::Left), 0), Some(0));
+        assert_eq!(
+            modal.handle_key(
+                KeyEvent::from(KeyCode::Char('+')),
+                MAX_GOAL_CONTINUATION_LIMIT,
+            ),
+            Some(MAX_GOAL_CONTINUATION_LIMIT)
+        );
     }
 
     #[test]

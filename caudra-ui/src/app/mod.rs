@@ -1301,7 +1301,12 @@ impl App {
         }
 
         if self.goal_modal.is_open() {
-            self.goal_modal.handle_key(key);
+            if let Some(limit) = self
+                .goal_modal
+                .handle_key(key, self.state.goal.continuation_limit())
+            {
+                self.state.goal.set_continuation_limit(limit);
+            }
             return Some(vec![]);
         }
 
@@ -3081,11 +3086,15 @@ impl App {
                 ));
                 return vec![];
             }
-            AgentEvent::GoalLoopCap { evaluations } => {
+            AgentEvent::GoalLoopCap {
+                evaluations,
+                continuations,
+                limit,
+            } => {
                 self.main_chat().push(DisplayMessage::new(
-                    DisplayRole::Error,
+                    DisplayRole::Notice,
                     format!(
-                        "Goal remains active after {evaluations} evaluations; automatic continuation paused. Send another message to resume."
+                        "Goal remains active after {continuations} automatic continuations in this run ({evaluations} total evaluations); the session limit is {limit}. Send another message to resume."
                     ),
                 ));
                 return vec![];
