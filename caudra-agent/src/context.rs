@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -624,7 +625,7 @@ struct BuiltinDefinition {
     billed_to: Option<&'static str>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy)]
 enum ToolCategory {
     System,
     Mcp,
@@ -951,6 +952,13 @@ impl ContextBuiltinInventory {
     }
 }
 
+/// Reconciles per-definition estimates with what the array actually costs.
+///
+/// Measured apart, definitions cost more than the array holding them, because
+/// the tokenizer merges across the `},{` boundaries. The difference is an
+/// artifact of how every row was measured, not a debt any one row owes, so it
+/// comes off all of them in proportion; charging it to whichever row happens to
+/// sit last would grow with the tool count until that row read zero.
 fn normalize_tool_contributions(contributions: &mut [ToolContribution], budget: u32) {
     let total = contributions
         .iter()
@@ -959,30 +967,31 @@ fn normalize_tool_contributions(contributions: &mut [ToolContribution], budget: 
     if total <= budget {
         return;
     }
-    let mut excess = total - budget;
-    for contribution in contributions
-        .iter_mut()
-        .rev()
-        .filter(|contribution| contribution.category == ToolCategory::System)
-    {
-        let removed = contribution.tokens.min(excess);
-        contribution.tokens -= removed;
-        excess -= removed;
-        if excess == 0 {
-            break;
-        }
+    let excess = u64::from(total - budget);
+    let total = u64::from(total);
+
+    let mut placed = 0;
+    let mut remainders = Vec::with_capacity(contributions.len());
+    for (index, contribution) in contributions.iter_mut().enumerate() {
+        let scaled = u64::from(contribution.tokens) * excess;
+        let share = (scaled / total) as u32;
+        contribution.tokens -= share;
+        placed += u64::from(share);
+        remainders.push((scaled % total, index));
     }
-    for contribution in contributions
-        .iter_mut()
-        .rev()
-        .filter(|contribution| contribution.category != ToolCategory::System)
-    {
-        let removed = contribution.tokens.min(excess);
-        contribution.tokens -= removed;
-        excess -= removed;
-        if excess == 0 {
+
+    // Integer division leaves fewer tokens over than there are rows, and a row
+    // only has a remainder if it kept a token to give: the largest ones have
+    // the strongest claim to what is left.
+    remainders.sort_unstable_by_key(|&(remainder, _)| Reverse(remainder));
+    let mut leftover = excess - placed;
+    for (_, index) in remainders {
+        if leftover == 0 {
             break;
         }
+        let tokens = &mut contributions[index].tokens;
+        *tokens = tokens.saturating_sub(1);
+        leftover -= 1;
     }
 }
 
@@ -1036,6 +1045,9 @@ mod tests {
     const LOAD_CALL_ID: &str = "load-call";
     const MISSING_INVENTORY_DIR: &str = "/nonexistent/caudra-context-inventory";
     const SKILL_NAME: &str = "deploy";
+    const CROWDED_ROWS: u32 = 60;
+    const CROWDED_ROW_TOKENS: u32 = 20;
+    const CROWDED_EXCESS: u32 = 30;
 
     fn model(context_window: u32, window_excludes_output: bool) -> Model {
         let mut model = Model::from_spec(MODEL_SPEC).unwrap();
@@ -1050,6 +1062,30 @@ mod tests {
             "description": description,
             "input_schema": { "type": "object" }
         })
+    }
+
+    /// What measuring the definitions apart overcounts the array by, and so the
+    /// most any one row can be reconciled down.
+    fn reconciliation_slack(tools: &Value) -> u32 {
+        let measured = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(value_tokens)
+            .fold(0, u32::saturating_add);
+        measured.saturating_sub(value_tokens(tools))
+    }
+
+    /// A row is never charged more than it measures alone, and never discounted
+    /// by more than the whole array was overcounted by.
+    fn assert_reconciled(charged: u32, definition: &Value, slack: u32) {
+        let measured = value_tokens(definition);
+        let name = tool_name(definition).unwrap_or_default();
+        assert!(
+            charged <= measured && measured - charged <= slack,
+            "{name} was charged {charged} against the {measured} it measures alone, \
+             beyond the {slack} of reconciliation"
+        );
     }
 
     fn mcp_status(
@@ -1246,21 +1282,23 @@ mod tests {
                 .saturating_add(snapshot.inventory.skills.definition_tokens),
             value_tokens(&full_tools)
         );
-        assert_eq!(snapshot.usage.profiles, value_tokens(&base_tools[1]));
-        assert_eq!(
+        let slack = reconciliation_slack(&full_tools);
+        assert_reconciled(snapshot.usage.profiles, &base_tools[1], slack);
+        assert_reconciled(
             snapshot.inventory.memory.definition_tokens,
-            value_tokens(&base_tools[2])
+            &base_tools[2],
+            slack,
         );
-        assert_eq!(
+        assert_reconciled(
             snapshot.inventory.skills.definition_tokens,
-            value_tokens(&base_tools[3])
+            &base_tools[3],
+            slack,
         );
-        assert_eq!(
-            snapshot
-                .usage
-                .mcp_tools
-                .saturating_add(snapshot.inventory.builtins.catalog_tokens),
-            value_tokens(&full_tools[4]).saturating_add(value_tokens(&full_tools[5]))
+        assert_reconciled(snapshot.usage.mcp_tools, &full_tools[4], slack);
+        assert_reconciled(
+            snapshot.inventory.builtins.catalog_tokens,
+            &full_tools[5],
+            slack,
         );
         assert!(
             snapshot.inventory.builtins.catalog_tokens > 0,
@@ -1347,6 +1385,35 @@ mod tests {
         assert!(loaded.request_tokens > 0);
         assert_eq!(deferred.request_tokens, 0);
         assert_eq!(disabled.request_tokens, 0);
+    }
+
+    /// The reconciliation grows with the tool count, so a request carrying
+    /// enough of them used to drain whichever row the loop reached first down
+    /// to nothing and start on the next.
+    #[test]
+    fn reconciliation_comes_off_every_row_instead_of_emptying_the_last() {
+        let budget = CROWDED_ROWS * CROWDED_ROW_TOKENS - CROWDED_EXCESS;
+        let mut contributions = (0..CROWDED_ROWS)
+            .map(|index| ToolContribution {
+                name: index.to_string(),
+                category: ToolCategory::System,
+                tokens: CROWDED_ROW_TOKENS,
+            })
+            .collect::<Vec<_>>();
+
+        normalize_tool_contributions(&mut contributions, budget);
+
+        let total = contributions
+            .iter()
+            .map(|contribution| contribution.tokens)
+            .fold(0, u32::saturating_add);
+        assert_eq!(total, budget);
+        let smallest = contributions
+            .iter()
+            .map(|contribution| contribution.tokens)
+            .min()
+            .unwrap();
+        assert_eq!(smallest, CROWDED_ROW_TOKENS - 1);
     }
 
     #[test_case(MEMORY_TOOL_NAME, FULL_RESULT, PRUNED_RESULT ; "memory_result")]
