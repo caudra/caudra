@@ -5,8 +5,10 @@ pub mod catalog;
 mod handle;
 mod manager;
 mod run;
+mod skill;
 mod state;
 pub mod store;
 
 pub use handle::WorkflowHandle;
 pub use manager::{RuntimeDeps, WorkflowRuntime};
+pub use skill::workflow_dev_skill;

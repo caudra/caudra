@@ -101,8 +101,13 @@ fn install_native_permission_rules(
 /// `plugins.skill.plugin_dev = false` takes effect.
 fn configure_native_tools(agent: &caudra_config::AgentConfig) {
     if agent.skill_plugin_dev {
-        caudra_agent::tools::native::skill::set_builtin_skill(
+        caudra_agent::tools::native::skill::install_builtin_skill(
             caudra_lua::docs_render::plugin_dev_skill(),
+        );
+    }
+    if agent.skill_workflow_dev {
+        caudra_agent::tools::native::skill::install_builtin_skill(
+            caudra_agent::workflow::workflow_dev_skill(),
         );
     }
     caudra_agent::tools::native::task::set_max_concurrent(agent.task_max_concurrent);

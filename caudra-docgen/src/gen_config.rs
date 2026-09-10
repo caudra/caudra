@@ -11,6 +11,8 @@ use caudra_lua::{OptionSpec, OptionType, PluginHost, PluginOptionSpecs};
 
 const PLUGIN_DEV_DESC: &str =
     "Offer the builtin caudra-plugin-dev skill for writing caudra plugins.";
+const WORKFLOW_DEV_DESC: &str =
+    "Offer the builtin caudra-workflow-dev skill for writing and running workflows.";
 const MAX_CONCURRENT_DESC: &str = "Max concurrently running subagents.";
 
 type ExtraColumn = (&'static str, fn(&ConfigField) -> String);
@@ -160,13 +162,22 @@ fn collect_plugin_options() -> PluginOptionSpecs {
     );
     specs.insert(
         "skill".into(),
-        vec![OptionSpec {
-            name: "plugin_dev".into(),
-            ty: OptionType::Boolean,
-            default: Some(serde_json::json!(caudra_config::DEFAULT_SKILL_PLUGIN_DEV)),
-            min: None,
-            desc: PLUGIN_DEV_DESC.into(),
-        }],
+        vec![
+            OptionSpec {
+                name: "plugin_dev".into(),
+                ty: OptionType::Boolean,
+                default: Some(serde_json::json!(caudra_config::DEFAULT_SKILL_PLUGIN_DEV)),
+                min: None,
+                desc: PLUGIN_DEV_DESC.into(),
+            },
+            OptionSpec {
+                name: "workflow_dev".into(),
+                ty: OptionType::Boolean,
+                default: Some(serde_json::json!(caudra_config::DEFAULT_SKILL_WORKFLOW_DEV)),
+                min: None,
+                desc: WORKFLOW_DEV_DESC.into(),
+            },
+        ],
     );
     assert!(
         !specs.is_empty(),

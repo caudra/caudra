@@ -318,6 +318,7 @@ mod tests {
         picker.fill(WorkflowCatalog {
             entries,
             invalid: Vec::new(),
+            ..WorkflowCatalog::default()
         });
         picker
     }
@@ -378,6 +379,7 @@ mod tests {
                 source_kind: SourceKind::Project,
                 error: "parse error".into(),
             }],
+            ..WorkflowCatalog::default()
         });
         assert!(
             picker

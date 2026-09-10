@@ -189,7 +189,7 @@ caudra skills --json          # full records
 caudra skills --dirs          # candidate directories: selected, superseded, or missing
 ```
 
-Applies the same directory precedence a real run does, including the builtin `caudra-plugin-dev` skill when `plugins.skill.plugin_dev` is on. `--dirs` answers why a skill is missing: a directory reads `superseded` when a higher-priority one exists, and `missing` when nothing is there. See [Skills](/docs/skills/#where-skills-live).
+Applies the same directory precedence a real run does, including the builtin `caudra-workflow-dev` and `caudra-plugin-dev` skills when their `plugins.skill` switches are on. `--dirs` answers why a skill is missing: a directory reads `superseded` when a higher-priority one exists, and `missing` when nothing is there. See [Skills](/docs/skills/#where-skills-live).
 
 ### `caudra logs`
 

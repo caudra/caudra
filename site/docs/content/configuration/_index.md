@@ -250,6 +250,7 @@ caudra.setup({
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|
 | `plugin_dev` | boolean | `false` | - | Offer the builtin caudra-plugin-dev skill for writing caudra plugins. |
+| `workflow_dev` | boolean | `true` | - | Offer the builtin caudra-workflow-dev skill for writing and running workflows. |
 
 ### `plugins.task`
 

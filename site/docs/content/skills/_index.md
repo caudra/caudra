@@ -26,7 +26,7 @@ Project skills work the same way at each level of the walk from your current dir
 
 The `.claude`, `.opencode` and `.agents` directories are there so skills you already wrote for other agents keep working. Once you make a `.caudra/skills/` next to them, they stop being read. An empty `~/.config/caudra/skills/` counts as existing, so it switches the compatibility directories off. Delete it if you want them back.
 
-Levels still combine: a skill at the repo root and a skill in a subdirectory both load. When two skills share a name, the one found last wins, so project skills beat personal ones and the repo root beats a nested directory. The builtin `caudra-plugin-dev` sits below all of them and any file of the same name replaces it.
+Levels still combine: a skill at the repo root and a skill in a subdirectory both load. When two skills share a name, the one found last wins, so project skills beat personal ones and the repo root beats a nested directory. The builtins `caudra-workflow-dev` and `caudra-plugin-dev` sit below all of them and any file of the same name replaces one.
 
 Run `caudra skills --dirs` or `/skills` to see every candidate directory and which one won.
 
@@ -75,15 +75,27 @@ caudra skills --json          # full records
 caudra skills --dirs          # candidate directories: selected, superseded, or missing
 ```
 
-## The builtin: caudra-plugin-dev
+## The builtins
 
-Caudra ships one skill, `caudra-plugin-dev`. It teaches the agent how to write caudra Lua plugins, and on load it writes the full Lua API reference to a file in the state dir, so the agent can read it in pieces instead of swallowing it whole. It carries the same guide you can read in [Plugins](/docs/plugins/), so "write me a plugin that ..." is usually enough. Turn it off if you never write plugins:
+Caudra ships two skills. Each is a normal entry in the `skill` tool's list, and a `SKILL.md` of the same name in any of your directories replaces it.
+
+### caudra-workflow-dev
+
+On by default. It is the complete authoring guide for [workflows](/docs/workflows/): where a script goes and which scope to choose, the `meta` header rules, every host function with its result shape and failure modes, the parts of Rhai that trip people up, how replay and resume constrain a script, prompt patterns for untrusted agent output, three complete worked scripts, and a table of common errors with their fixes. With it loaded, "write me a workflow that reviews a branch with three readers and verifies their findings" produces a file the agent can validate and start in the same session. The examples in the guide are compiled and smoke-run by Caudra's own test suite, so they cannot drift from the engine.
+
+The agent writes to the project directory when the plan belongs to the repository and to your user directory when it is personal. A project script still needs your approval in `/workflows` before it can start. The agent cannot grant that.
+
+### caudra-plugin-dev
+
+Off by default. It teaches the agent how to write caudra Lua plugins, and on load it writes the full Lua API reference to a file in the state dir, so the agent can read it in pieces instead of swallowing it whole. It carries the same guide you can read in [Plugins](/docs/plugins/), so "write me a plugin that ..." is usually enough.
+
+Both are switches under `plugins.skill`:
 
 ```lua
 -- ~/.config/caudra/init.lua
 caudra.setup({
     plugins = {
-        skill = { plugin_dev = false },
+        skill = { plugin_dev = true, workflow_dev = false },
     },
 })
 ```

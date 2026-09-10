@@ -56,6 +56,7 @@ pub struct Catalog {
     invalid: Vec<InvalidEntry>,
     claims: BTreeMap<String, Claim>,
     project_root: Option<PathBuf>,
+    user_dir: Option<PathBuf>,
 }
 
 impl Catalog {
@@ -75,6 +76,7 @@ impl Catalog {
             invalid: Vec::new(),
             claims: BTreeMap::new(),
             project_root,
+            user_dir: user_config_dir(user_config, WORKFLOWS_SUBDIR),
         };
         let builtins = builtin_candidates(&mut catalog.invalid);
         catalog.admit(SourceKind::Builtin, builtins);
@@ -88,7 +90,7 @@ impl Catalog {
             );
             catalog.admit(SourceKind::Project, candidates);
         }
-        if let Some(dir) = user_config_dir(user_config, WORKFLOWS_SUBDIR) {
+        if let Some(dir) = catalog.user_dir.clone() {
             let candidates =
                 scan_directory(&dir, SourceKind::User, &mut catalog.invalid, |_, _| true);
             catalog.admit(SourceKind::User, candidates);
@@ -132,6 +134,11 @@ impl Catalog {
                 })
                 .collect(),
             invalid: self.invalid.clone(),
+            project_dir: self
+                .project_root
+                .as_ref()
+                .map(|root| root.join(PROJECT_DIR).join(WORKFLOWS_SUBDIR)),
+            user_dir: self.user_dir.clone(),
         }
     }
 
@@ -480,7 +487,10 @@ mod tests {
         Catalog::ensure_user_scope(Some(&fixture.config));
 
         assert!(fixture.user_workflows().is_dir());
-        assert!(fixture.scan().to_catalog().invalid.is_empty(), "{NOTHING_INVALID}");
+        assert!(
+            fixture.scan().to_catalog().invalid.is_empty(),
+            "{NOTHING_INVALID}"
+        );
     }
 
     #[test]

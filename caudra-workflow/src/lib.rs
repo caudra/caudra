@@ -20,6 +20,10 @@ pub mod validate;
 
 pub const DEEP_RESEARCH_NAME: &str = "deep-research";
 pub const DEEP_RESEARCH_SOURCE: &str = include_str!("../builtins/deep-research.rhai");
+/// The authoring guide the `skill` tool offers as `caudra-workflow-dev`, with
+/// its frontmatter. It lives beside the engine so its examples are tested
+/// against the ABI they describe.
+pub const WORKFLOW_SKILL: &str = include_str!("../skill/SKILL.md");
 
 pub use catalog::{CatalogEntry, InvalidEntry, LaunchRequest, WorkflowCatalog};
 #[cfg(feature = "rhai")]
@@ -47,6 +51,41 @@ pub use validate::{SmokeResult, ValidationError, ValidationReport, validate};
 #[cfg(all(test, feature = "rhai"))]
 mod tests {
     use super::*;
+
+    const RHAI_FENCE: &str = "```rhai";
+    const FENCE: &str = "```";
+    const EXAMPLES_MSG: &str = "the skill must carry complete examples";
+
+    /// Every fenced `rhai` block that starts with a `meta` header. Fragments
+    /// without one are illustrations, not scripts.
+    fn skill_scripts() -> Vec<String> {
+        WORKFLOW_SKILL
+            .split(RHAI_FENCE)
+            .skip(1)
+            .filter_map(|rest| {
+                rest.split_once(FENCE)
+                    .map(|(block, _)| block.trim().to_owned())
+            })
+            .filter(|block| block.starts_with("let meta"))
+            .collect()
+    }
+
+    /// The guide promises that its examples run. A change to the ABI that
+    /// breaks one must update the guide in the same change.
+    #[test]
+    fn every_complete_example_in_the_skill_validates() {
+        let scripts = skill_scripts();
+        assert!(scripts.len() >= 3, "{EXAMPLES_MSG}");
+        for script in scripts {
+            let name = parse_meta(&script).map(|meta| meta.name);
+            let report = validate(&script).unwrap_or_else(|error| panic!("{name:?}: {error}"));
+            assert!(
+                matches!(report.smoke.outcome, WorkflowOutcome::Completed(_)),
+                "{name:?}: {:?}",
+                report.smoke.outcome
+            );
+        }
+    }
 
     #[test]
     fn bundled_deep_research_header_matches_its_name() {

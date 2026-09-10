@@ -61,6 +61,9 @@ const TRUSTED: &str = "trusted";
 const UNTRUSTED: &str = "untrusted";
 const INVALID_HEADING: &str = "Invalid:";
 const NO_WORKFLOWS: &str = "No workflows are available.";
+const PROJECT_DIR_LABEL: &str =
+    "Project scripts (need approval in /workflows before they can start): ";
+const USER_DIR_LABEL: &str = "User scripts (trusted as written): ";
 const STATUS_HINT: &str = "The run continues in the background. Check on it with";
 /// Log lines kept per run in a `status` answer.
 const MAX_STATUS_LOGS: usize = 20;
@@ -221,13 +224,20 @@ async fn render(handle: &WorkflowHandle, request: WorkflowRequest) -> ToolExecRe
 }
 
 fn render_catalog(catalog: &WorkflowCatalog) -> String {
-    if catalog.entries.is_empty() && catalog.invalid.is_empty() {
-        return NO_WORKFLOWS.to_owned();
-    }
-    let mut lines: Vec<String> = catalog.entries.iter().map(catalog_line).collect();
+    let mut lines: Vec<String> = if catalog.entries.is_empty() && catalog.invalid.is_empty() {
+        vec![NO_WORKFLOWS.to_owned()]
+    } else {
+        catalog.entries.iter().map(catalog_line).collect()
+    };
     if !catalog.invalid.is_empty() {
         lines.push(INVALID_HEADING.to_owned());
         lines.extend(catalog.invalid.iter().map(invalid_line));
+    }
+    if let Some(dir) = &catalog.project_dir {
+        lines.push(format!("{PROJECT_DIR_LABEL}{}", dir.display()));
+    }
+    if let Some(dir) = &catalog.user_dir {
+        lines.push(format!("{USER_DIR_LABEL}{}", dir.display()));
     }
     lines.join("\n")
 }
@@ -309,6 +319,8 @@ mod tests {
     const RUN_ID: &str = "run-1";
     const DIGEST: &str = "abc123";
     const SCRIPT_PATH: &str = "/project/.caudra/workflows/review.rhai";
+    const PROJECT_WORKFLOWS_DIR: &str = "/project/.caudra/workflows";
+    const USER_WORKFLOWS_DIR: &str = "/home/me/.config/caudra/workflows";
     const RUNTIME_ANSWERS: &str = "the tool must relay the runtime's answer";
     const ERRORS_ARE_FLAGGED: &str = "a refused action must be an error result";
     const LOGS_ARE_BOUNDED: &str = "status must keep only the newest log lines";
@@ -444,6 +456,8 @@ mod tests {
                     source_kind: SourceKind::Project,
                     error: "meta: missing name".into(),
                 }],
+                project_dir: Some(PathBuf::from(PROJECT_WORKFLOWS_DIR)),
+                user_dir: Some(PathBuf::from(USER_WORKFLOWS_DIR)),
             }))
         });
 
@@ -457,6 +471,32 @@ mod tests {
         assert!(text.contains("Plan → Review"), "{text}");
         assert!(text.contains(INVALID_HEADING), "{text}");
         assert!(text.contains("broken.rhai"), "{text}");
+        assert!(
+            text.contains(&format!("{PROJECT_DIR_LABEL}{PROJECT_WORKFLOWS_DIR}")),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("{USER_DIR_LABEL}{USER_WORKFLOWS_DIR}")),
+            "{text}"
+        );
+    }
+
+    /// A writer needs the directories even before the first script exists.
+    #[test]
+    fn an_empty_catalog_still_names_where_scripts_go() {
+        let ctx = with_runtime(|_| {
+            Ok(WorkflowResponse::Catalog(WorkflowCatalog {
+                user_dir: Some(PathBuf::from(USER_WORKFLOWS_DIR)),
+                ..WorkflowCatalog::default()
+            }))
+        });
+
+        let (is_error, text) = execute(json!({"action": "list"}), &ctx);
+
+        assert!(!is_error);
+        assert!(text.starts_with(NO_WORKFLOWS), "{text}");
+        assert!(text.contains(USER_WORKFLOWS_DIR), "{text}");
+        assert!(!text.contains(PROJECT_DIR_LABEL), "{text}");
     }
 
     #[test]

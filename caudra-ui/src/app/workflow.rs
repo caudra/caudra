@@ -857,6 +857,7 @@ mod tests {
                     shadowed: Vec::new(),
                 }],
                 invalid: Vec::new(),
+                ..WorkflowCatalog::default()
             })),
         });
 
@@ -885,6 +886,7 @@ mod tests {
                     shadowed: Vec::new(),
                 }],
                 invalid: Vec::new(),
+                ..WorkflowCatalog::default()
             })),
         });
 

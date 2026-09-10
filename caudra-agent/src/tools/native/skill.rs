@@ -59,7 +59,7 @@ static SCHEMA: ParamSchema = ParamSchema::Object {
 /// A skill Caudra ships rather than discovers. `caudra-lua` installs the
 /// plugin-authoring skill here at startup: it is generated from the live Lua
 /// API docs, which only that crate can render, and `caudra-agent` must not
-/// depend on it.
+/// depend on it. The workflow-authoring skill is installed the same way.
 pub struct BuiltinSkill {
     pub name: String,
     pub description: String,
@@ -68,17 +68,27 @@ pub struct BuiltinSkill {
     pub resolve: Box<dyn Fn() -> (String, Option<PathBuf>) + Send + Sync>,
 }
 
-/// Absent until something installs one, which is exactly how
-/// `plugins.skill.plugin_dev = false` turns the builtin skill off.
-static BUILTIN: LazyLock<ArcSwap<Option<Arc<BuiltinSkill>>>> =
-    LazyLock::new(|| ArcSwap::from_pointee(None));
+/// Empty until something installs one, which is exactly how
+/// `plugins.skill.plugin_dev = false` turns a builtin skill off.
+static BUILTINS: LazyLock<ArcSwap<Vec<Arc<BuiltinSkill>>>> =
+    LazyLock::new(|| ArcSwap::from_pointee(Vec::new()));
 
-pub fn set_builtin_skill(skill: BuiltinSkill) {
-    BUILTIN.store(Arc::new(Some(Arc::new(skill))));
+/// Installing a name twice replaces the earlier skill.
+pub fn install_builtin_skill(skill: BuiltinSkill) {
+    let skill = Arc::new(skill);
+    BUILTINS.rcu(|installed| {
+        let mut next: Vec<Arc<BuiltinSkill>> = installed
+            .iter()
+            .filter(|existing| existing.name != skill.name)
+            .cloned()
+            .collect();
+        next.push(Arc::clone(&skill));
+        next
+    });
 }
 
-fn installed_builtin() -> Option<Arc<BuiltinSkill>> {
-    BUILTIN.load().as_ref().clone()
+fn installed_builtins() -> Arc<Vec<Arc<BuiltinSkill>>> {
+    BUILTINS.load_full()
 }
 
 /// Where a skill or a search directory came from, so a report can say why one
@@ -175,8 +185,7 @@ impl Default for SkillTool {
 impl SkillTool {
     fn catalog(&self) -> &SkillCatalog {
         self.catalog.get_or_init(|| {
-            let builtin = installed_builtin();
-            let found = discover(&self.dirs, builtin.as_deref());
+            let found = discover(&self.dirs, &installed_builtins());
             SkillCatalog {
                 description: format!("{DESCRIPTION}{}", skill_list(&found)),
                 entries: found
@@ -230,7 +239,7 @@ pub fn load(registry: &ToolRegistry, name: &str) -> Result<String, String> {
         .and_then(RegisteredTool::downcast_ref::<SkillTool>)
         .map(|tool| tool.dirs.as_slice())
         .unwrap_or_default();
-    load_from(name, dirs, installed_builtin().as_deref())
+    load_from(name, dirs, &installed_builtins())
 }
 
 impl Tool for SkillTool {
@@ -304,20 +313,20 @@ impl ToolInvocation for SkillCall {
 
 impl SkillCall {
     fn load(&self) -> Result<String, String> {
-        load_from(&self.name, &self.dirs, installed_builtin().as_deref())
+        load_from(&self.name, &self.dirs, &installed_builtins())
     }
 }
 
 fn load_from(
     name: &str,
     dirs: &[SkillDirCandidate],
-    builtin: Option<&BuiltinSkill>,
+    builtins: &[Arc<BuiltinSkill>],
 ) -> Result<String, String> {
-    let discovered = discover(dirs, builtin);
+    let discovered = discover(dirs, builtins);
     let Some(skill) = discovered.get(name) else {
         return Err(format!("{NOT_FOUND}{name}{}", skill_list(&discovered)));
     };
-    let (content, location) = read_skill(skill, builtin)?;
+    let (content, location) = read_skill(skill, builtins)?;
     Ok(format!("{location}\n{}", numbered(&content)))
 }
 
@@ -337,9 +346,9 @@ fn skill_list(skills: &BTreeMap<String, Skill>) -> String {
     )
 }
 
-fn discover(dirs: &[SkillDirCandidate], builtin: Option<&BuiltinSkill>) -> BTreeMap<String, Skill> {
+fn discover(dirs: &[SkillDirCandidate], builtins: &[Arc<BuiltinSkill>]) -> BTreeMap<String, Skill> {
     let mut skills = BTreeMap::new();
-    if let Some(builtin) = builtin {
+    for builtin in builtins {
         skills.insert(
             builtin.name.clone(),
             Skill {
@@ -393,9 +402,10 @@ fn scan(dir: &Path, scope: SkillScope, skills: &mut BTreeMap<String, Skill>) {
     }
 }
 
-fn read_skill(skill: &Skill, builtin: Option<&BuiltinSkill>) -> Result<(String, String), String> {
-    if let Some(builtin) = builtin
-        && skill.location == builtin_location(&builtin.name)
+fn read_skill(skill: &Skill, builtins: &[Arc<BuiltinSkill>]) -> Result<(String, String), String> {
+    if let Some(builtin) = builtins
+        .iter()
+        .find(|builtin| skill.location == builtin_location(&builtin.name))
     {
         let (content, reference) = (builtin.resolve)();
         let location = reference.map_or_else(
@@ -423,7 +433,7 @@ fn numbered(content: &str) -> String {
 /// Only the scalar `key: value` pairs are read: `name` and `description` are
 /// all a skill header is allowed to carry, and a full YAML parse would accept
 /// shapes the rest of the code cannot use.
-fn parse_frontmatter(content: &str) -> (BTreeMap<String, String>, String) {
+pub(crate) fn parse_frontmatter(content: &str) -> (BTreeMap<String, String>, String) {
     let Some(rest) = content.trim_start().strip_prefix("---\n") else {
         return (BTreeMap::new(), content.trim().to_owned());
     };
@@ -548,7 +558,7 @@ mod tests {
             "deploy",
             "---\nname: deploy\ndescription: ship it\n---\nfirst\nsecond\n",
         );
-        let out = load_from("deploy", &[root], None).unwrap();
+        let out = load_from("deploy", &[root], &[]).unwrap();
         assert!(out.contains("   1 | first"), "{out}");
         assert!(out.contains("   2 | second"), "{out}");
         assert!(!out.contains("description: ship it"), "frontmatter leaked");
@@ -558,7 +568,7 @@ mod tests {
     fn the_directory_name_is_the_fallback_skill_name() {
         let temp = tempfile::tempdir().unwrap();
         let root = skill_dir(&temp, "unnamed", "no frontmatter here");
-        let found = discover(&[root], None);
+        let found = discover(&[root], &[]);
         assert!(found.contains_key("unnamed"), "{:?}", found.keys());
     }
 
@@ -566,7 +576,7 @@ mod tests {
     fn a_frontmatter_name_wins_over_the_directory() {
         let temp = tempfile::tempdir().unwrap();
         let root = skill_dir(&temp, "dirname", "---\nname: realname\n---\nbody\n");
-        let found = discover(&[root], None);
+        let found = discover(&[root], &[]);
         assert!(found.contains_key("realname"), "{:?}", found.keys());
         assert!(!found.contains_key("dirname"));
     }
@@ -575,7 +585,7 @@ mod tests {
     fn a_body_less_skill_is_skipped() {
         let temp = tempfile::tempdir().unwrap();
         let root = skill_dir(&temp, "empty", "---\nname: empty\n---\n");
-        assert!(discover(&[root], None).is_empty());
+        assert!(discover(&[root], &[]).is_empty());
     }
 
     /// A later directory shadows an earlier one, which is what makes a project
@@ -586,7 +596,7 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         let global_root = skill_dir(&global, "deploy", "---\ndescription: global\n---\nbody\n");
         let project_root = skill_dir(&project, "deploy", "---\ndescription: local\n---\nbody\n");
-        let found = discover(&[global_root, project_root], None);
+        let found = discover(&[global_root, project_root], &[]);
         assert_eq!(found["deploy"].description, "local");
     }
 
@@ -594,7 +604,7 @@ mod tests {
     fn an_unknown_skill_lists_what_is_available() {
         let temp = tempfile::tempdir().unwrap();
         let root = skill_dir(&temp, "deploy", "---\ndescription: ship it\n---\nbody\n");
-        let error = load_from("nope", &[root], None).unwrap_err();
+        let error = load_from("nope", &[root], &[]).unwrap_err();
         assert!(error.starts_with(NOT_FOUND), "{error}");
         assert!(error.contains("- deploy: ship it"), "{error}");
     }
@@ -610,7 +620,7 @@ mod tests {
         skill_dir(&temp, "zulu", "---\ndescription: z\n---\nbody\n");
         skill_dir(&temp, "alpha", "---\ndescription: a\n---\nbody\n");
         let root = skill_dir(&temp, "mike", "---\ndescription: m\n---\nbody\n");
-        let listing = skill_list(&discover(&[root], None));
+        let listing = skill_list(&discover(&[root], &[]));
         let alpha = listing.find("alpha").unwrap();
         let mike = listing.find("mike").unwrap();
         let zulu = listing.find("zulu").unwrap();
@@ -671,21 +681,44 @@ mod tests {
 
     #[test]
     fn an_uninstalled_builtin_is_simply_absent() {
-        assert!(discover(&[], None).is_empty());
-        let error = load_from(BUILTIN_NAME, &[], None).unwrap_err();
+        assert!(discover(&[], &[]).is_empty());
+        let error = load_from(BUILTIN_NAME, &[], &[]).unwrap_err();
         assert!(error.starts_with(NOT_FOUND), "{error}");
     }
 
     #[test]
     fn an_installed_builtin_is_listed_and_loadable() {
-        let builtin = plugin_dev_skill(None);
+        let builtins = [Arc::new(plugin_dev_skill(None))];
         assert_eq!(
-            discover(&[], Some(&builtin))[BUILTIN_NAME].description,
+            discover(&[], &builtins)[BUILTIN_NAME].description,
             BUILTIN_DESC
         );
-        let out = load_from(BUILTIN_NAME, &[], Some(&builtin)).unwrap();
+        let out = load_from(BUILTIN_NAME, &[], &builtins).unwrap();
         assert!(out.contains(BUILTIN_BODY), "{out}");
         assert!(out.contains(&builtin_location(BUILTIN_NAME)), "{out}");
+    }
+
+    /// Every builtin is its own entry, and each loads its own body rather
+    /// than the first one installed.
+    #[test]
+    fn several_builtins_are_listed_and_each_loads_its_own_body() {
+        const OTHER_NAME: &str = "caudra-other";
+        const OTHER_BODY: &str = "how to do the other thing";
+        let builtins = [
+            Arc::new(plugin_dev_skill(None)),
+            Arc::new(BuiltinSkill {
+                name: OTHER_NAME.into(),
+                description: BUILTIN_DESC.into(),
+                resolve: Box::new(|| (OTHER_BODY.into(), None)),
+            }),
+        ];
+        let found = discover(&[], &builtins);
+        assert!(found.contains_key(BUILTIN_NAME) && found.contains_key(OTHER_NAME));
+        let out = load_from(OTHER_NAME, &[], &builtins).unwrap();
+        assert!(
+            out.contains(OTHER_BODY) && !out.contains(BUILTIN_BODY),
+            "{out}"
+        );
     }
 
     /// The plugin-dev skill spills the API reference to disk and reports that
@@ -694,7 +727,7 @@ mod tests {
     fn a_builtin_that_spills_a_reference_reports_its_path() {
         let reference = PathBuf::from("/state/docs/lua-api.md");
         let builtin = plugin_dev_skill(Some(reference.clone()));
-        let out = load_from(BUILTIN_NAME, &[], Some(&builtin)).unwrap();
+        let out = load_from(BUILTIN_NAME, &[], &[Arc::new(builtin)]).unwrap();
         assert!(
             out.starts_with(&reference.to_string_lossy().to_string()),
             "{out}"
@@ -710,7 +743,7 @@ mod tests {
             &format!("---\nname: {BUILTIN_NAME}\n---\nreal file content\n"),
         );
         let builtin = plugin_dev_skill(None);
-        let out = load_from(BUILTIN_NAME, &[root], Some(&builtin)).unwrap();
+        let out = load_from(BUILTIN_NAME, &[root], &[Arc::new(builtin)]).unwrap();
         assert!(out.contains("real file content"), "{out}");
         assert!(!out.contains(BUILTIN_BODY), "{out}");
     }
@@ -781,7 +814,7 @@ mod tests {
             states(&dirs),
             &[Selected, Superseded, Superseded, Superseded]
         );
-        assert!(discover(&dirs, None).is_empty());
+        assert!(discover(&dirs, &[]).is_empty());
     }
 
     #[test]
@@ -808,7 +841,7 @@ mod tests {
     #[test]
     fn the_builtin_skill_is_attributed_to_caudra() {
         let builtin = plugin_dev_skill(None);
-        let found = discover(&[], Some(&builtin));
+        let found = discover(&[], &[Arc::new(builtin)]);
         assert_eq!(found[BUILTIN_NAME].scope, SkillScope::Builtin);
         assert_eq!(found[BUILTIN_NAME].location, builtin_location(BUILTIN_NAME));
     }

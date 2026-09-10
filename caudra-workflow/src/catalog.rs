@@ -39,6 +39,13 @@ pub struct WorkflowCatalog {
     pub entries: Vec<CatalogEntry>,
     #[serde(default)]
     pub invalid: Vec<InvalidEntry>,
+    /// Where a project script goes. Absent when the session has no project
+    /// root, so a writer knows not to invent one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_dir: Option<PathBuf>,
+    /// Where a user script goes, resolved for this build and platform.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

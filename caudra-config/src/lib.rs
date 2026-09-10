@@ -76,6 +76,12 @@ pub const MIN_STREAM_TIMEOUT_SECS: u64 = 10;
 /// Off by default: writing Caudra plugins is a niche task, and the skill's
 /// entry costs description tokens in every session that never writes one.
 pub const DEFAULT_SKILL_PLUGIN_DEV: bool = false;
+/// On by default: the skill is how the model learns to write a workflow for
+/// the session it is in, and a workflow is the answer to many multi-step asks.
+pub const DEFAULT_SKILL_WORKFLOW_DEV: bool = true;
+const SKILL_PLUGIN_DEV_FIELD: &str = "plugin_dev";
+const SKILL_WORKFLOW_DEV_FIELD: &str = "workflow_dev";
+const SKILL_FIELDS: [&str; 2] = [SKILL_PLUGIN_DEV_FIELD, SKILL_WORKFLOW_DEV_FIELD];
 pub const DEFAULT_TASK_MAX_CONCURRENT: usize = 8;
 pub const MIN_TASK_MAX_CONCURRENT: usize = 1;
 pub const DEFAULT_INDEX_MAX_FILE_SIZE_MB: usize = 2;
@@ -485,7 +491,9 @@ impl RawConfig {
         self.validate_plugin_tables()?;
         let index_max_file_size_mb = self.index_max_file_size_mb()?;
         let task_max_concurrent = self.task_max_concurrent()?;
-        let skill_plugin_dev = self.skill_plugin_dev()?;
+        let skill_plugin_dev = self.skill_flag(SKILL_PLUGIN_DEV_FIELD, DEFAULT_SKILL_PLUGIN_DEV)?;
+        let skill_workflow_dev =
+            self.skill_flag(SKILL_WORKFLOW_DEV_FIELD, DEFAULT_SKILL_WORKFLOW_DEV)?;
         let disabled_tools = self.resolve_disabled_tools()?;
         Ok(Config {
             always_yolo: self.always_yolo.unwrap_or(false),
@@ -502,6 +510,7 @@ impl RawConfig {
                 index_max_file_size_mb,
                 task_max_concurrent,
                 skill_plugin_dev,
+                skill_workflow_dev,
             ),
             provider: ProviderConfig::from_file(self.provider)?,
             storage: StorageConfig::from_file(self.storage),
@@ -629,17 +638,16 @@ impl RawConfig {
         Ok(value as usize)
     }
 
-    fn skill_plugin_dev(&self) -> Result<bool, ConfigError> {
-        const FIELD: &str = "plugin_dev";
-        let Some(opts) = self.native_tool_opts("skill", &[FIELD])? else {
-            return Ok(DEFAULT_SKILL_PLUGIN_DEV);
+    fn skill_flag(&self, field: &'static str, default: bool) -> Result<bool, ConfigError> {
+        let Some(opts) = self.native_tool_opts("skill", &SKILL_FIELDS)? else {
+            return Ok(default);
         };
-        match opts.get(FIELD) {
-            None => Ok(DEFAULT_SKILL_PLUGIN_DEV),
+        match opts.get(field) {
+            None => Ok(default),
             Some(JsonValue::Bool(value)) => Ok(*value),
             Some(_) => Err(ConfigError::InvalidNativeToolOption {
                 plugin: "skill",
-                field: FIELD.into(),
+                field: field.into(),
                 message: "expected a boolean".into(),
             }),
         }
@@ -1692,6 +1700,9 @@ pub struct AgentConfig {
 
     #[config(skip, default = DEFAULT_SKILL_PLUGIN_DEV)]
     pub skill_plugin_dev: bool,
+
+    #[config(skip, default = DEFAULT_SKILL_WORKFLOW_DEV)]
+    pub skill_workflow_dev: bool,
 }
 
 impl AgentConfig {
@@ -1702,6 +1713,7 @@ impl AgentConfig {
         index_max_file_size_mb: usize,
         task_max_concurrent: usize,
         skill_plugin_dev: bool,
+        skill_workflow_dev: bool,
     ) -> Self {
         Self {
             no_rtk,
@@ -1726,6 +1738,7 @@ impl AgentConfig {
             index_max_file_size_mb,
             task_max_concurrent,
             skill_plugin_dev,
+            skill_workflow_dev,
         }
     }
 }
@@ -4066,6 +4079,25 @@ mod tests {
     fn index_config_is_strict(option: &str, expected: &str) {
         let raw: RawConfig = toml::from_str(&format!("[plugins.index]\n{option}\n")).unwrap();
         let error = raw.into_config(false).err().expect("invalid index option");
+        assert!(error.to_string().contains(expected), "{error}");
+    }
+
+    #[test_case("", DEFAULT_SKILL_PLUGIN_DEV, DEFAULT_SKILL_WORKFLOW_DEV ; "defaults")]
+    #[test_case("plugin_dev = true", true, DEFAULT_SKILL_WORKFLOW_DEV ; "plugin_dev_alone")]
+    #[test_case("workflow_dev = false", DEFAULT_SKILL_PLUGIN_DEV, false ; "workflow_dev_alone")]
+    #[test_case("plugin_dev = true\nworkflow_dev = false", true, false ; "both")]
+    fn skill_flags_are_read_independently(options: &str, plugin_dev: bool, workflow_dev: bool) {
+        let raw: RawConfig = toml::from_str(&format!("[plugins.skill]\n{options}\n")).unwrap();
+        let config = raw.into_config(false).unwrap();
+        assert_eq!(config.agent.skill_plugin_dev, plugin_dev);
+        assert_eq!(config.agent.skill_workflow_dev, workflow_dev);
+    }
+
+    #[test_case("workflow_dev = \"no\"", "expected a boolean" ; "wrong_type")]
+    #[test_case("workflows = false", "unknown option" ; "unknown_field")]
+    fn skill_config_is_strict(option: &str, expected: &str) {
+        let raw: RawConfig = toml::from_str(&format!("[plugins.skill]\n{option}\n")).unwrap();
+        let error = raw.into_config(false).err().expect("invalid skill option");
         assert!(error.to_string().contains(expected), "{error}");
     }
 

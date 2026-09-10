@@ -117,7 +117,7 @@ A workflow control is a `control_request` whose `subtype` is one of the advertis
 
 | Subtype | Arguments | Answer `kind` |
 |---------|-----------|---------------|
-| `workflow_list` | | `catalog`: `entries` (with `name`, `digest`, `trusted`, `source_kind`, `phases`) and `invalid` |
+| `workflow_list` | | `catalog`: `entries` (with `name`, `digest`, `trusted`, `source_kind`, `phases`), `invalid`, and the `project_dir` and `user_dir` a new script would go in |
 | `workflow_validate` | `name` | `validation`: `ok` and a `report` |
 | `workflow_start` | `name`, `args` (object, default `{}`), `agent_budget` | `started`: the new run |
 | `workflow_status` | `run_id` (optional) | `runs` for every run, `run` for one |

@@ -67,6 +67,8 @@ Caudra reads each file once and uses that buffer for the digest, the catalog, co
 
 ## Write one
 
+You can ask the agent to write one. The builtin `caudra-workflow-dev` [skill](/docs/skills/#caudra-workflow-dev) carries this whole reference plus worked examples and the Rhai details that trip people up, and the agent validates the result with the `workflow` tool before handing it over. The `list` action tells it which directory to use.
+
 Workflows are [Rhai](https://rhai.rs) scripts. The file name must be `<meta.name>.rhai` and the first statement must be the metadata:
 
 ```rhai
