@@ -1,19 +1,18 @@
 use arc_swap::ArcSwapOption;
 use caudra_agent::snapshots::StoreEntry;
 use caudra_storage::sessions::SessionStorageStats;
-use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use ratatui::Frame;
-use ratatui::layout::{Alignment, Position, Rect};
+use ratatui::layout::{Position, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 
 use crate::components::keybindings::key;
-use crate::components::modal::{CHROME_LINES, Modal};
+use crate::components::modal::{CHROME_LINES, FooterHits, FooterLine, Modal};
 use crate::components::scrollbar::render_vertical_scrollbar;
 use crate::components::{
     ModalScroll, Overlay, apportion, escape_terminal_controls, format_integer, format_usize,
-    hover_style,
 };
 use crate::repaint::{Dirty, Watch};
 use crate::theme::{self, Theme};
@@ -41,6 +40,7 @@ const ORPHANED_STORE: &str = "(workspace root missing)";
 const LOADING: &str = "Measuring the state directory…";
 const LOADING_HINT: &str = "Snapshot stores are walked on disk, so this takes a moment.";
 const NO_STORES: &str = "No workspace snapshots have been captured.";
+const CLOSE_HINT: &str = " · Esc close";
 
 /// What the background measurement produced. Held in a slot rather than
 /// computed in `view` because sizing the snapshot stores walks the whole state
@@ -61,9 +61,7 @@ pub struct StorageModal {
     expanded: bool,
     scroll: ModalScroll,
     popup: Rect,
-    footer_hit: Rect,
-    mouse_position: Option<Position>,
-    footer_mouse_down: bool,
+    footer: FooterHits,
     report: Watch<StorageFetchState>,
 }
 
@@ -74,9 +72,7 @@ impl StorageModal {
             expanded: false,
             scroll: ModalScroll::new_top(),
             popup: Rect::default(),
-            footer_hit: Rect::default(),
-            mouse_position: None,
-            footer_mouse_down: false,
+            footer: FooterHits::default(),
             report: Watch::default(),
         }
     }
@@ -85,16 +81,13 @@ impl StorageModal {
         self.open = true;
         self.expanded = expanded;
         self.scroll.reset();
-        self.footer_hit = Rect::default();
-        self.footer_mouse_down = false;
+        self.footer.clear();
     }
 
     pub fn close(&mut self) {
         self.open = false;
         self.scroll.reset();
-        self.footer_hit = Rect::default();
-        self.mouse_position = None;
-        self.footer_mouse_down = false;
+        self.footer.reset();
     }
 
     pub fn is_open(&self) -> bool {
@@ -132,66 +125,19 @@ impl StorageModal {
     /// grows, and re-walking the state directory to show rows already in hand
     /// would stall the very frame the click asked for.
     pub fn handle_mouse(&mut self, event: MouseEvent) {
-        let position = Position::new(event.column, event.row);
-        self.mouse_position = Some(position);
-        match event.kind {
-            MouseEventKind::Down(MouseButton::Left) => {
-                self.footer_mouse_down = self.footer_hit.contains(position);
-            }
-            MouseEventKind::Drag(MouseButton::Left) => {
-                self.footer_mouse_down = false;
-            }
-            MouseEventKind::Up(MouseButton::Left) => {
-                let activate = self.footer_mouse_down && self.footer_hit.contains(position);
-                self.footer_mouse_down = false;
-                if activate {
-                    self.open(!self.expanded);
-                }
-            }
-            _ => {}
+        if self.footer.handle_mouse(event).is_some() {
+            self.open(!self.expanded);
         }
-    }
-
-    fn footer_hovered(&self) -> bool {
-        self.mouse_position
-            .is_some_and(|position| self.footer_hit.contains(position))
     }
 
     #[cfg(test)]
     pub(crate) fn footer_hit(&self) -> Rect {
-        self.footer_hit
+        self.footer.hit(0)
     }
 
     #[cfg(test)]
     pub(crate) fn is_expanded(&self) -> bool {
         self.expanded
-    }
-
-    fn update_footer_hit(&mut self, lines: &[Line<'static>], area: Rect, offset: u16, total: u16) {
-        self.footer_hit = Rect::default();
-        let Some(footer) = lines.last() else {
-            return;
-        };
-        let Ok(footer_width) = u16::try_from(footer.width()) else {
-            return;
-        };
-        if area.width == 0 || footer_width > area.width {
-            return;
-        }
-        let Some(row) = total.saturating_sub(1).checked_sub(offset) else {
-            return;
-        };
-        if row >= area.height {
-            return;
-        }
-        let command_width = u16::try_from(footer_command(self.expanded).len()).unwrap_or(u16::MAX);
-        self.footer_hit = Rect::new(
-            area.x
-                .saturating_add(area.width.saturating_sub(footer_width) / 2),
-            area.y.saturating_add(row),
-            command_width.min(area.width),
-            1,
-        );
     }
 
     pub fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
@@ -225,10 +171,12 @@ impl StorageModal {
         };
         self.scroll.update_dimensions(total, padded.height);
         let offset = self.scroll.offset();
-        self.update_footer_hit(&lines, padded, offset, total);
-        if self.footer_hovered() {
-            lines =
-                build_lines_with_footer_hover(report, self.expanded, content_width, &theme, true);
+        let footer = footer(self.expanded, &theme);
+        self.footer.set(footer.hits(padded, offset, total));
+        if let Some(index) = self.footer.hovered()
+            && let Some(last) = lines.last_mut()
+        {
+            *last = footer.line(Some(index));
         }
 
         frame.render_widget(
@@ -333,16 +281,6 @@ fn build_lines(
     width: u16,
     theme: &Theme,
 ) -> Vec<Line<'static>> {
-    build_lines_with_footer_hover(report, expanded, width, theme, false)
-}
-
-fn build_lines_with_footer_hover(
-    report: Option<&StorageFetchState>,
-    expanded: bool,
-    width: u16,
-    theme: &Theme,
-    footer_hovered: bool,
-) -> Vec<Line<'static>> {
     let mut lines = match report {
         Some(StorageFetchState::Ready(report)) => report_lines(report, expanded, width, theme),
         Some(StorageFetchState::Error(message)) => vec![Line::from(Span::styled(
@@ -355,7 +293,7 @@ fn build_lines_with_footer_hover(
         ],
     };
     lines.push(Line::default());
-    lines.push(command_hint(expanded, theme, footer_hovered));
+    lines.push(footer(expanded, theme).line(None));
     lines
 }
 
@@ -514,21 +452,19 @@ fn footer_command(expanded: bool) -> &'static str {
     if expanded { "/storage" } else { "/storage all" }
 }
 
-fn command_hint(expanded: bool, theme: &Theme, hovered: bool) -> Line<'static> {
-    let description = if expanded {
-        " largest stores"
-    } else {
-        " every store"
-    };
-    Line::from(vec![
-        Span::styled(
-            footer_command(expanded),
-            hover_style(theme.keybind_key, hovered),
-        ),
-        Span::styled(description, theme.tool_dim),
-        Span::styled(" · Esc close", theme.tool_dim),
-    ])
-    .alignment(Alignment::Center)
+fn footer(expanded: bool, theme: &Theme) -> FooterLine {
+    let mut footer = FooterLine::default();
+    footer.command(footer_command(expanded), theme.keybind_key);
+    footer.text(
+        if expanded {
+            " largest stores"
+        } else {
+            " every store"
+        },
+        theme.tool_dim,
+    );
+    footer.text(CLOSE_HINT, theme.tool_dim);
+    footer
 }
 
 fn grid_cells(stats: &SessionStorageStats) -> Vec<Consumer> {
@@ -662,6 +598,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
+    use crossterm::event::{MouseButton, MouseEventKind};
     use ratatui::backend::TestBackend;
     use ratatui::style::Modifier;
     use test_case::test_case;
@@ -890,13 +827,16 @@ mod tests {
             .unwrap();
         let reversed = (0..HEIGHT)
             .flat_map(|y| (0..WIDTH).map(move |x| Position::new(x, y)))
-            .find(|position| {
+            .filter(|position| {
                 terminal.backend().buffer()[(position.x, position.y)]
                     .modifier
                     .contains(Modifier::REVERSED)
             })
-            .expect(HOVER_MISSED);
-        assert!(hit.contains(reversed), "{HOVER_MISSED}");
+            .collect::<Vec<_>>();
+        assert!(
+            !reversed.is_empty() && reversed.iter().all(|position| hit.contains(*position)),
+            "{HOVER_MISSED}: hit={hit:?} reversed={reversed:?}"
+        );
 
         modal.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), hit));
         modal.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), hit));

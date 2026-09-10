@@ -3,19 +3,18 @@ use caudra_agent::context::{
     ContextSnapshot,
 };
 use caudra_providers::{format_tokens, token_label};
-use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use ratatui::Frame;
-use ratatui::layout::{Alignment, Position, Rect};
+use ratatui::layout::{Position, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 
 use crate::components::keybindings::key;
-use crate::components::modal::{CHROME_LINES, Modal};
+use crate::components::modal::{CHROME_LINES, FooterHits, FooterLine, Modal};
 use crate::components::scrollbar::render_vertical_scrollbar;
 use crate::components::{
     ModalScroll, Overlay, apportion, escape_terminal_controls, format_integer, format_usize,
-    hover_style,
 };
 use crate::theme::{self, Theme};
 
@@ -31,15 +30,14 @@ const CATEGORY_COUNT: usize = 7;
 const PERCENT_SCALE: u64 = 100;
 const PERCENT_TENTHS_SCALE: u64 = 1_000;
 const LEGEND_GAP: &str = "   ";
+const CLOSE_HINT: &str = " · Esc close";
 
 pub struct ContextModal {
     open: bool,
     expanded: bool,
     scroll: ModalScroll,
     popup: Rect,
-    footer_hit: Rect,
-    mouse_position: Option<Position>,
-    footer_mouse_down: bool,
+    footer: FooterHits,
 }
 
 impl ContextModal {
@@ -49,9 +47,7 @@ impl ContextModal {
             expanded: false,
             scroll: ModalScroll::new_top(),
             popup: Rect::default(),
-            footer_hit: Rect::default(),
-            mouse_position: None,
-            footer_mouse_down: false,
+            footer: FooterHits::default(),
         }
     }
 
@@ -59,16 +55,13 @@ impl ContextModal {
         self.open = true;
         self.expanded = expanded;
         self.scroll.reset();
-        self.footer_hit = Rect::default();
-        self.footer_mouse_down = false;
+        self.footer.clear();
     }
 
     pub fn close(&mut self) {
         self.open = false;
         self.scroll.reset();
-        self.footer_hit = Rect::default();
-        self.mouse_position = None;
-        self.footer_mouse_down = false;
+        self.footer.reset();
     }
 
     pub fn is_open(&self) -> bool {
@@ -94,61 +87,14 @@ impl ContextModal {
     }
 
     pub fn handle_mouse(&mut self, event: MouseEvent) {
-        let position = Position::new(event.column, event.row);
-        self.mouse_position = Some(position);
-        match event.kind {
-            MouseEventKind::Down(MouseButton::Left) => {
-                self.footer_mouse_down = self.footer_hit.contains(position);
-            }
-            MouseEventKind::Drag(MouseButton::Left) => {
-                self.footer_mouse_down = false;
-            }
-            MouseEventKind::Up(MouseButton::Left) => {
-                let activate = self.footer_mouse_down && self.footer_hit.contains(position);
-                self.footer_mouse_down = false;
-                if activate {
-                    self.open(!self.expanded);
-                }
-            }
-            _ => {}
+        if self.footer.handle_mouse(event).is_some() {
+            self.open(!self.expanded);
         }
-    }
-
-    fn footer_hovered(&self) -> bool {
-        self.mouse_position
-            .is_some_and(|position| self.footer_hit.contains(position))
     }
 
     #[cfg(test)]
     pub(crate) fn footer_hit(&self) -> Rect {
-        self.footer_hit
-    }
-
-    fn update_footer_hit(&mut self, lines: &[Line<'static>], area: Rect, offset: u16, total: u16) {
-        self.footer_hit = Rect::default();
-        let Some(footer) = lines.last() else {
-            return;
-        };
-        let Ok(footer_width) = u16::try_from(footer.width()) else {
-            return;
-        };
-        if area.width == 0 || footer_width > area.width {
-            return;
-        }
-        let Some(row) = total.saturating_sub(1).checked_sub(offset) else {
-            return;
-        };
-        if row >= area.height {
-            return;
-        }
-        let command_width = u16::try_from(footer_command(self.expanded).len()).unwrap_or(u16::MAX);
-        self.footer_hit = Rect::new(
-            area.x
-                .saturating_add(area.width.saturating_sub(footer_width) / 2),
-            area.y.saturating_add(row),
-            command_width.min(area.width),
-            1,
-        );
+        self.footer.hit(0)
     }
 
     pub fn view(
@@ -185,10 +131,12 @@ impl ContextModal {
         };
         self.scroll.update_dimensions(total, padded.height);
         let offset = self.scroll.offset();
-        self.update_footer_hit(&lines, padded, offset, total);
-        if self.footer_hovered() {
-            lines =
-                build_lines_with_footer_hover(snapshot, self.expanded, content_width, &theme, true);
+        let footer = footer(self.expanded, &theme);
+        self.footer.set(footer.hits(padded, offset, total));
+        if let Some(index) = self.footer.hovered()
+            && let Some(last) = lines.last_mut()
+        {
+            *last = footer.line(Some(index));
         }
 
         frame.render_widget(
@@ -286,16 +234,6 @@ fn build_lines(
     width: u16,
     theme: &Theme,
 ) -> Vec<Line<'static>> {
-    build_lines_with_footer_hover(snapshot, expanded, width, theme, false)
-}
-
-fn build_lines_with_footer_hover(
-    snapshot: Option<&ContextSnapshot>,
-    expanded: bool,
-    width: u16,
-    theme: &Theme,
-    footer_hovered: bool,
-) -> Vec<Line<'static>> {
     let mut lines = if let Some(snapshot) = snapshot {
         let mut lines = summary_lines(snapshot, width, theme);
         if expanded {
@@ -319,7 +257,7 @@ fn build_lines_with_footer_hover(
         ]
     };
     lines.push(Line::default());
-    lines.push(command_hint(expanded, theme, footer_hovered));
+    lines.push(footer(expanded, theme).line(None));
     lines
 }
 
@@ -433,21 +371,19 @@ fn footer_command(expanded: bool) -> &'static str {
     if expanded { "/context" } else { "/context all" }
 }
 
-fn command_hint(expanded: bool, theme: &Theme, hovered: bool) -> Line<'static> {
-    let description = if expanded {
-        " summary"
-    } else {
-        " item details"
-    };
-    Line::from(vec![
-        Span::styled(
-            footer_command(expanded),
-            hover_style(theme.keybind_key, hovered),
-        ),
-        Span::styled(description, theme.tool_dim),
-        Span::styled(" · Esc close", theme.tool_dim),
-    ])
-    .alignment(Alignment::Center)
+fn footer(expanded: bool, theme: &Theme) -> FooterLine {
+    let mut footer = FooterLine::default();
+    footer.command(footer_command(expanded), theme.keybind_key);
+    footer.text(
+        if expanded {
+            " summary"
+        } else {
+            " item details"
+        },
+        theme.tool_dim,
+    );
+    footer.text(CLOSE_HINT, theme.tool_dim);
+    footer
 }
 
 fn usage_categories(snapshot: &ContextSnapshot) -> [(GridKind, u32); CATEGORY_COUNT] {
@@ -1016,6 +952,7 @@ mod tests {
         ContextMcpTool, ContextMemoryFile, ContextMemoryInventory, ContextModel, ContextProfile,
         ContextProfileInventory, ContextSkill, ContextSkillInventory, ContextUsage, ContextWindow,
     };
+    use crossterm::event::{MouseButton, MouseEventKind};
     use ratatui::backend::TestBackend;
     use ratatui::style::Modifier;
     use test_case::test_case;
@@ -1030,6 +967,7 @@ mod tests {
     const PROFILE: &str = "default";
     const MEMORY_FILE: &str = "project.md";
     const SKILL: &str = "deploy";
+    const HOVER_MISSED: &str = "the footer command must reverse under the pointer";
 
     fn snapshot() -> ContextSnapshot {
         ContextSnapshot {
@@ -1222,8 +1160,11 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert!(
-            summary_hit.contains(reversed[0]),
-            "hit={summary_hit:?} reversed={reversed:?}"
+            !reversed.is_empty()
+                && reversed
+                    .iter()
+                    .all(|position| summary_hit.contains(*position)),
+            "{HOVER_MISSED}: hit={summary_hit:?} reversed={reversed:?}"
         );
 
         modal.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), summary_hit));

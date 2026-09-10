@@ -2,26 +2,35 @@ use std::time::Duration;
 
 use caudra_agent::{GoalStatus, GoalVerdict};
 use caudra_providers::model_registry::GoalEvaluatorTarget;
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use ratatui::Frame;
-use ratatui::layout::{Alignment, Position, Rect};
+use ratatui::layout::{Position, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 
 use super::ModalScroll;
 use super::Overlay;
-use super::modal::Modal;
+use super::modal::{FooterHits, FooterLine, Modal};
 use super::scrollbar::render_vertical_scrollbar;
 use crate::theme;
 
 const WIDTH_PERCENT: u16 = 72;
 const MAX_HEIGHT_PERCENT: u16 = 70;
 const H_PAD: u16 = 2;
+const GOAL_CLEAR: &str = "/goal-clear";
+const GOAL_MODEL: &str = "/goal-model";
+const GOAL_START: &str = "/goal <condition>";
+const SEPARATOR: &str = " · ";
+const CLOSE_HINT: &str = " · Esc close";
 
 pub struct GoalModal {
     open: bool,
     scroll: ModalScroll,
     popup: Rect,
+    footer: FooterHits,
+    /// Which footer was last drawn. A click is answered from the same table
+    /// that produced the hits, so a cleared goal cannot report `/goal-clear`.
+    active: bool,
 }
 
 impl Default for GoalModal {
@@ -30,6 +39,8 @@ impl Default for GoalModal {
             open: false,
             scroll: ModalScroll::new_top(),
             popup: Rect::default(),
+            footer: FooterHits::default(),
+            active: false,
         }
     }
 }
@@ -38,6 +49,7 @@ impl GoalModal {
     pub fn open(&mut self) {
         self.open = true;
         self.scroll.reset();
+        self.footer.clear();
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
@@ -57,6 +69,23 @@ impl GoalModal {
         self.scroll.scroll(delta);
     }
 
+    #[cfg(test)]
+    pub(crate) fn footer_hit(&self, command: &str) -> Rect {
+        footer_commands(self.active)
+            .iter()
+            .position(|name| *name == command)
+            .map(|index| self.footer.hit(index))
+            .unwrap_or_default()
+    }
+
+    /// The command line a footer click asked for, left to the host to run: the
+    /// footer names session commands, not modal state.
+    pub fn handle_mouse(&mut self, event: MouseEvent) -> Option<&'static str> {
+        self.footer
+            .handle_mouse(event)
+            .and_then(|index| footer_commands(self.active).get(index).copied())
+    }
+
     pub fn view(
         &mut self,
         frame: &mut Frame,
@@ -70,7 +99,8 @@ impl GoalModal {
 
         let width = (area.width as u32 * WIDTH_PERCENT as u32 / 100)
             .saturating_sub((2 + H_PAD * 2) as u32) as u16;
-        let lines = status_lines(status, evaluator);
+        self.active = is_active(status);
+        let mut lines = status_lines(status, evaluator);
         let total = Paragraph::new(lines.clone())
             .wrap(Wrap { trim: false })
             .line_count(width) as u16;
@@ -87,6 +117,13 @@ impl GoalModal {
         };
         self.scroll.update_dimensions(total, padded.height);
         let offset = self.scroll.offset();
+        let footer = footer(self.active);
+        self.footer.set(footer.hits(padded, offset, total));
+        if let Some(index) = self.footer.hovered()
+            && let Some(last) = lines.last_mut()
+        {
+            *last = footer.line(Some(index));
+        }
         frame.render_widget(
             Paragraph::new(lines)
                 .wrap(Wrap { trim: false })
@@ -109,7 +146,39 @@ impl Overlay for GoalModal {
     fn close(&mut self) {
         self.open = false;
         self.scroll.reset();
+        self.footer.reset();
     }
+}
+
+fn is_active(status: Option<&GoalStatus>) -> bool {
+    matches!(status, Some(GoalStatus::Active(_)))
+}
+
+/// The commands the footer offers, indexed the way [`FooterLine`] targets are.
+fn footer_commands(active: bool) -> &'static [&'static str] {
+    if active {
+        &[GOAL_CLEAR, GOAL_MODEL]
+    } else {
+        &[GOAL_MODEL]
+    }
+}
+
+/// Kept as short as the `/context` footer on purpose: an 80 column terminal
+/// leaves this modal 51 columns, and a footer that wraps is one the pointer
+/// cannot be offered at all. The commands name what they do, and the body
+/// spells out the condition and evaluator they act on.
+fn footer(active: bool) -> FooterLine {
+    let theme = theme::current();
+    let mut footer = FooterLine::default();
+    if active {
+        footer.command(GOAL_CLEAR, theme.keybind_key);
+    } else {
+        footer.text(GOAL_START, theme.tool_dim);
+    }
+    footer.text(SEPARATOR, theme.tool_dim);
+    footer.command(GOAL_MODEL, theme.keybind_key);
+    footer.text(CLOSE_HINT, theme.tool_dim);
+    footer
 }
 
 fn status_lines(
@@ -123,10 +192,7 @@ fn status_lines(
             Line::default(),
             evaluator_line(evaluator),
             Line::default(),
-            Line::from(Span::styled(
-                "Start with /goal <condition>  ·  Change evaluator with /goal-model",
-                theme.tool_dim,
-            )),
+            footer(false).line(None),
         ];
     };
 
@@ -196,17 +262,7 @@ fn status_lines(
         lines.push(Line::from(reason.to_owned()));
     }
     lines.push(Line::default());
-    lines.push(
-        Line::from(Span::styled(
-             if active {
-                "/goal-clear to stop  ·  /goal-model to change evaluator  ·  Esc to close"
-            } else {
-                "/goal <condition> to start another  ·  /goal-model to change evaluator  ·  Esc to close"
-            },
-            theme.tool_dim,
-        ))
-        .alignment(Alignment::Center),
-    );
+    lines.push(footer(active).line(None));
     lines
 }
 
@@ -238,12 +294,115 @@ fn format_duration(duration: Duration) -> String {
 
 #[cfg(test)]
 mod tests {
+    use caudra_agent::GoalResult;
+    use caudra_providers::TokenUsage;
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::style::Modifier;
+
     use super::*;
+
+    const WIDTH: u16 = 120;
+    const HEIGHT: u16 = 40;
+    const CONDITION: &str = "the suite is green";
+    const REASON: &str = "every test passed";
+    const HOVER_MISSED: &str = "the footer command must reverse under the pointer";
+
+    fn finished() -> GoalStatus {
+        GoalStatus::Finished(GoalResult {
+            condition: CONDITION.into(),
+            verdict: GoalVerdict::Met,
+            reason: REASON.into(),
+            evaluations: 3,
+            duration: Duration::from_secs(12),
+            usage: TokenUsage::default(),
+            cost: None,
+            subscription_cost: None,
+        })
+    }
+
+    fn mouse(kind: MouseEventKind, at: Rect) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: at.x,
+            row: at.y,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn drawn(modal: &mut GoalModal, status: Option<&GoalStatus>) -> Terminal<TestBackend> {
+        let mut terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT)).unwrap();
+        terminal
+            .draw(|frame| {
+                modal.view(frame, frame.area(), status, &GoalEvaluatorTarget::Auto);
+            })
+            .unwrap();
+        terminal
+    }
 
     #[test]
     fn duration_is_compact() {
         assert_eq!(format_duration(Duration::from_secs(8)), "8s");
         assert_eq!(format_duration(Duration::from_secs(68)), "1m 8s");
         assert_eq!(format_duration(Duration::from_secs(3_668)), "1h 1m");
+    }
+
+    #[test]
+    fn the_footer_command_hovers_and_activates() {
+        let status = finished();
+        let mut modal = GoalModal::default();
+        modal.open();
+        let _ = drawn(&mut modal, Some(&status));
+
+        let hit = modal.footer_hit(GOAL_MODEL);
+        assert!(!hit.is_empty());
+
+        modal.handle_mouse(mouse(MouseEventKind::Moved, hit));
+        let terminal = drawn(&mut modal, Some(&status));
+        let reversed = (0..HEIGHT)
+            .flat_map(|y| (0..WIDTH).map(move |x| Position::new(x, y)))
+            .filter(|position| {
+                terminal.backend().buffer()[(position.x, position.y)]
+                    .modifier
+                    .contains(Modifier::REVERSED)
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !reversed.is_empty() && reversed.iter().all(|position| hit.contains(*position)),
+            "{HOVER_MISSED}: hit={hit:?} reversed={reversed:?}"
+        );
+
+        assert_eq!(
+            modal.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), hit)),
+            None
+        );
+        assert_eq!(
+            modal.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), hit)),
+            Some(GOAL_MODEL)
+        );
+    }
+
+    #[test]
+    fn a_press_off_the_footer_activates_nothing() {
+        let status = finished();
+        let mut modal = GoalModal::default();
+        modal.open();
+        let _ = drawn(&mut modal, Some(&status));
+
+        let off = Rect::new(modal.footer_hit(GOAL_MODEL).x, 0, 1, 1);
+        modal.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), off));
+        assert_eq!(
+            modal.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), off)),
+            None
+        );
+    }
+
+    /// A goal that is over cannot be stopped, so the command that would stop it
+    /// is not on screen and its index is not reachable.
+    #[test]
+    fn a_finished_goal_offers_no_clear() {
+        assert_eq!(footer_commands(false), [GOAL_MODEL]);
+        assert_eq!(footer_commands(true), [GOAL_CLEAR, GOAL_MODEL]);
     }
 }

@@ -67,9 +67,25 @@ impl App {
             self.storage_modal.handle_mouse(event);
             return Vec::new();
         }
+        // The goal footer names session commands rather than modal state, and
+        // `/goal-model` opens a picker this modal is drawn over, so the click
+        // closes the modal before the command runs.
+        if self.goal_modal.is_open() && !self.permission_prompt.is_open() {
+            self.clear_control_hovers();
+            let Some(cmdline) = self.goal_modal.handle_mouse(event) else {
+                return Vec::new();
+            };
+            self.goal_modal.close();
+            return match self.run_cmdline(cmdline, 0) {
+                Ok(actions) => actions,
+                Err(error) => {
+                    self.flash(error);
+                    Vec::new()
+                }
+            };
+        }
         let passive_modal_open = self.help_modal.is_open()
             || self.usage_modal.is_open()
-            || self.goal_modal.is_open()
             || self.btw_modal.is_open()
             || self.float_mgr.is_open();
         if passive_modal_open {

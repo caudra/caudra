@@ -7139,6 +7139,69 @@ fn context_footer_click_switches_views() {
     );
 }
 
+const GOAL_MODEL_COMMAND: &str = "/goal-model";
+const GOAL_CLEAR_COMMAND: &str = "/goal-clear";
+
+fn click_goal_footer(app: &mut App, command: &str) -> Vec<Action> {
+    let _ = rendered(app);
+    let hit = app.goal_modal.footer_hit(command);
+    assert!(!hit.is_empty(), "command={command}");
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        hit.x,
+        hit.y,
+    ));
+    app.update(mouse_event(
+        MouseEventKind::Up(MouseButton::Left),
+        hit.x,
+        hit.y,
+    ))
+}
+
+/// The picker is drawn under the goal modal and outranks it in `dismiss_at`, so
+/// a footer click that left the modal standing would hide the very thing it
+/// opened.
+#[test]
+fn goal_footer_click_opens_the_model_picker() {
+    let mut app = test_app();
+    app.state.goal.set(GOAL_CONDITION).unwrap();
+    app.goal_modal.open();
+
+    let actions = click_goal_footer(&mut app, GOAL_MODEL_COMMAND);
+
+    assert!(app.model_picker.is_open());
+    assert!(!app.goal_modal.is_open());
+    assert!(matches!(&actions[..], [Action::RefreshModels]));
+}
+
+#[test]
+fn goal_footer_click_clears_the_goal() {
+    let mut app = test_app();
+    app.state.goal.set(GOAL_CONDITION).unwrap();
+    app.goal_modal.open();
+
+    let actions = click_goal_footer(&mut app, GOAL_CLEAR_COMMAND);
+
+    assert!(actions.is_empty());
+    assert!(app.state.goal.snapshot().is_none());
+    assert!(!app.goal_modal.is_open());
+    assert_eq!(
+        app.status_bar.flash_text(),
+        Some(format!("Goal cleared: {GOAL_CONDITION}").as_str())
+    );
+}
+
+/// A goal that is over cannot be stopped, so the footer offers no way to try.
+#[test]
+fn a_finished_goal_footer_has_no_clear() {
+    let mut app = test_app();
+    app.goal_modal.open();
+    let _ = rendered(&mut app);
+
+    assert!(app.goal_modal.footer_hit(GOAL_CLEAR_COMMAND).is_empty());
+    assert!(!app.goal_modal.footer_hit(GOAL_MODEL_COMMAND).is_empty());
+}
+
 const LUA_COMMAND_RAN: &str = "lua command with args must reach the plugin";
 const LUA_COMMAND_NOT_SENT: &str = "lua command with args must not reach the model";
 
