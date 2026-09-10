@@ -78,6 +78,10 @@ const RECENT_TOOL_WINDOW: usize = 5;
 /// turn, and a model resuming its own cut-off text can wedge the session
 /// (seen with llama.cpp stuck on an unterminated tool call).
 const CANCELLED_TEXT_NOTE: &str = "[Response cut off by user cancel]";
+/// Only reached when a resume has no seam to land on, so it says what the
+/// assistant tail above it cannot: keep going.
+const RESUME_PROMPT: &str =
+    "Continue the task from where you left off, and end your turn with a text response.";
 
 pub fn resolve_compaction_model(
     provider: &Arc<dyn Provider>,
@@ -370,6 +374,9 @@ impl<'h> Agent<'h> {
         queued: bool,
     ) -> Result<DoneReason, AgentError> {
         self.goal_blocks = 0;
+        if inputs.last().is_some_and(|input| input.resume) {
+            self.prepare_resume();
+        }
         self.rollback_len = self.history.len();
         let message = self.push_user_inputs(inputs, queued).await;
 
@@ -481,6 +488,23 @@ impl<'h> Agent<'h> {
             }
         })
         .detach();
+    }
+
+    /// A resume adds no turn of its own, so the request still has to end
+    /// somewhere the model can answer from. Dropping the cancel marker puts it
+    /// back on the tool result the loop stopped at; when the reply itself was
+    /// cut there is no such seam, and an assistant tail would go out as a
+    /// prefill, which providers reject once reasoning is on.
+    fn prepare_resume(&mut self) {
+        self.history.drop_cancel_marker();
+        if self
+            .history
+            .as_slice()
+            .last()
+            .is_none_or(|message| matches!(message.role, Role::Assistant))
+        {
+            self.push_injected(Message::synthetic(RESUME_PROMPT.into()));
+        }
     }
 
     async fn push_user_inputs(&mut self, mut inputs: Vec<AgentInput>, queued: bool) -> String {
@@ -1589,6 +1613,9 @@ mod tests {
     const GOAL_CONTEXT_MISSING: &str =
         "assistant history must publish before goal evaluation completes";
     const PARTIAL_RESPONSE: &str = "partial";
+    const GO: &str = "go";
+    const RESUME_TOOL_ID: &str = "t1";
+    const RESUME_DROPPED_ONLY_MARKER: &str = "a resume drops the cancel marker and nothing else";
     const TITLE_PROMPT: &str = "add refresh token support";
     const MODEL_TITLE: &str = "Refresh token support";
     const TITLE_MUST_SURVIVE: &str = "a title is asked for at the start of a turn and answers after it, so the turn ending must not cancel it";
@@ -1663,6 +1690,38 @@ mod tests {
                 let mut responses = self.responses.lock().unwrap();
                 assert!(!responses.is_empty(), "MockProvider: no more responses");
                 responses.remove(0)
+            })
+        }
+
+        fn list_models(
+            &self,
+        ) -> BoxFuture<'_, Result<Vec<caudra_providers::ModelInfo>, AgentError>> {
+            Box::pin(async { unimplemented!() })
+        }
+    }
+
+    /// Keeps the last request's messages, which is the only way to tell what a
+    /// resume actually put on the wire rather than what it left in history.
+    struct RequestCapturingProvider {
+        captured: Arc<Mutex<Vec<Message>>>,
+    }
+
+    impl Provider for RequestCapturingProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            messages: &'a [Message],
+            _: &'a str,
+            _: &'a Value,
+            _: &'a flume::Sender<ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&'a SessionRef>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(async {
+                let mut captured = self.captured.lock().unwrap();
+                captured.clear();
+                captured.extend_from_slice(messages);
+                Ok(text_response(StopReason::EndTurn))
             })
         }
 
@@ -1998,7 +2057,22 @@ mod tests {
             fast: false,
             workflow: false,
             prompt: None,
+            resume: false,
         }
+    }
+
+    fn resume_input() -> AgentInput {
+        AgentInput {
+            message: String::new(),
+            resume: true,
+            ..default_input()
+        }
+    }
+
+    fn cancelled_history(tail: Message) -> History {
+        let mut history = History::new(vec![Message::user(GO.into()), tail]);
+        sanitize_cancelled_history(&mut history, 0);
+        history
     }
 
     #[test]
@@ -3148,6 +3222,80 @@ mod tests {
             assert_eq!(history.as_slice().len(), 2);
             assert!(history.as_slice()[0].is_observation());
             assert!(matches!(history.as_slice()[1].role, Role::Assistant));
+        });
+    }
+
+    /// The point of a resume: nothing the caller did not write reaches the
+    /// request, which lands back on the tool result the cancelled loop
+    /// stopped at.
+    #[test]
+    fn a_resume_after_a_tool_cancel_sends_no_new_turn() {
+        smol::block_on(async {
+            let captured: Arc<Mutex<Vec<Message>>> = Arc::default();
+            let mut history = cancelled_history(Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::tool_use(
+                    RESUME_TOOL_ID,
+                    "read",
+                    serde_json::json!({}),
+                )],
+                ..Default::default()
+            });
+            let before = history.len();
+            let (mut agent, _event_rx) = make_agent(
+                RequestCapturingProvider {
+                    captured: Arc::clone(&captured),
+                },
+                &mut history,
+            );
+
+            agent.run(resume_input()).await.unwrap();
+            drop(agent);
+
+            let request = captured.lock().unwrap().clone();
+            assert_eq!(request.len(), before - 1, "{RESUME_DROPPED_ONLY_MARKER}");
+            let last = request.last().unwrap();
+            assert!(matches!(last.role, Role::User));
+            assert!(
+                last.content
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
+            );
+        });
+    }
+
+    /// An assistant tail has no seam to resume from, and a prefill breaks once
+    /// reasoning is on, so this is the one case that says it in words.
+    #[test]
+    fn a_resume_after_a_cut_reply_injects_one_continuation() {
+        smol::block_on(async {
+            let mut history = cancelled_history(Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: PARTIAL_RESPONSE.into(),
+                }],
+                ..Default::default()
+            });
+            let (mut agent, event_rx) = make_agent(
+                MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+                &mut history,
+            );
+
+            agent.run(resume_input()).await.unwrap();
+            drop(agent);
+
+            let injected: Vec<String> = drain_events(&event_rx)
+                .into_iter()
+                .filter_map(|envelope| match envelope.event {
+                    AgentEvent::Injected { text, .. } => Some(text),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(injected, [RESUME_PROMPT]);
+            assert!(matches!(
+                history.as_slice()[2].content.first(),
+                Some(ContentBlock::Text { text }) if text == RESUME_PROMPT
+            ));
         });
     }
 

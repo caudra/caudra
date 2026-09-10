@@ -22,6 +22,8 @@ pub(crate) const ALREADY_SENT_ERR: &str = "Queued message was already sent";
 pub(crate) const EMPTY_PROMPT_ERR: &str = "prompt is empty";
 pub(crate) const NO_QUEUE_ERR: &str = "session cannot queue messages";
 pub(crate) const REPLACE_BUSY_ERR: &str = "session is already stopping a run";
+pub(crate) const CONTINUE_BUSY_ERR: &str = "session is already working";
+pub(crate) const CONTINUE_EMPTY_ERR: &str = "nothing to continue";
 
 pub(crate) enum SubmitOutcome {
     Started(Vec<Action>),
@@ -1167,6 +1169,32 @@ impl App {
             paste_ranges: Vec::new(),
         });
         input.preamble = preamble;
+        self.start_run(input, String::new())
+    }
+
+    /// Resumes with no turn of its own, so nothing the user did not type
+    /// reaches the transcript. What the request tail still needs is the
+    /// agent's call, since it is the only side that owns history.
+    pub(super) fn continue_run(&mut self) -> Vec<Action> {
+        if self.status == Status::Streaming || self.cancelling_run.is_some() {
+            self.flash(CONTINUE_BUSY_ERR.into());
+            return Vec::new();
+        }
+        if self
+            .shared_history
+            .as_ref()
+            .is_none_or(|history| history.load().messages.is_empty())
+        {
+            self.flash(CONTINUE_EMPTY_ERR.into());
+            return Vec::new();
+        }
+        let mut input = self.build_agent_input(&QueuedMessage {
+            text: String::new(),
+            images: Vec::new(),
+            mentions: Vec::new(),
+            paste_ranges: Vec::new(),
+        });
+        input.resume = true;
         self.start_run(input, String::new())
     }
 

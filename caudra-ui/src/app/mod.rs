@@ -2289,6 +2289,7 @@ impl App {
             fast: self.state.fast,
             workflow: false,
             prompt: None,
+            resume: false,
         };
         let id = tx.push(input);
         self.pending_subagent_steers
@@ -3457,6 +3458,7 @@ impl App {
             "/goal" => self.execute_goal(&cmd.args),
             "/goal-clear" => self.clear_goal(),
             "/goal-model" => self.open_goal_model_picker(),
+            "/continue" => self.continue_run(),
             "/new" => vec![Action::RequestNewSession],
             "/queue" => {
                 self.focus_active_queue();

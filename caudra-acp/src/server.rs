@@ -750,6 +750,7 @@ fn handle_prompt(srv: &mut Server, raw: &Value, id: &RequestId) -> Result<(), Ac
         fast: false,
         workflow: false,
         prompt: None,
+        resume: false,
     };
 
     session

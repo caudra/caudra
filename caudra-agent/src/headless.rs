@@ -841,6 +841,7 @@ pub fn spawn(mut params: HeadlessParams) -> HeadlessHandle {
                     fast,
                     workflow,
                     prompt: None,
+                    resume: false,
                 })
                 .await;
             drop(agent);

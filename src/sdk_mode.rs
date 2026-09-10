@@ -776,6 +776,7 @@ pub fn run(params: SdkParams) -> Result<()> {
                     fast,
                     workflow,
                     prompt: None,
+                    resume: false,
                 };
                 if handle.input_tx.send(input).is_err() {
                     break;

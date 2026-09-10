@@ -630,6 +630,7 @@ mod tests {
                 fast: false,
                 workflow: false,
                 prompt: None,
+                resume: false,
             }),
             run_id: 0,
             admission: PromptAdmission::Queue,

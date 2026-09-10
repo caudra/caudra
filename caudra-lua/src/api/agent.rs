@@ -788,7 +788,7 @@ async fn prompt(
 ) -> LuaResult<Pair<Table>> {
     let inner = Arc::clone(&this.inner);
     drop(this);
-    match inner.lock().await.prompt(message).await {
+    match inner.lock().await.prompt(Some(message)).await {
         Ok(result) => {
             let tbl = lua.create_table()?;
             tbl.set("text", result.text)?;

@@ -16,6 +16,7 @@ Commands marked Main only act on the main session's turn or history. They stay l
 | Command | Description | Scope |
 |---------|-------------|-------|
 | `/compact` | Summarize and compact conversation history | Main only |
+| `/continue` | Resume an interrupted turn without adding a message | Main only |
 | `/new` | Start a new session |  |
 | `/help` | Show keybindings |  |
 | `/usage` | Show token usage breakdown |  |
@@ -53,6 +54,16 @@ Commands marked Main only act on the main session's turn or history. They stay l
 | `/reload` | Reload plugins and config |  |
 | `/workbench` | Open the file explorer, editor and source control view |  |
 
+## Resuming after an interruption
+
+`Esc Esc` cancels the running turn. `/continue` picks the work back up without adding a message of your own, so the model reads the history it was already working from instead of a fresh instruction.
+
+What Caudra sends depends on where the turn stopped. A turn cancelled inside a tool call resumes from that tool result, the same point the loop would have carried on from. A reply cancelled part way through has no such point, so Caudra adds one short line asking the model to continue, drawn in the transcript as an injected message rather than as something you wrote.
+
+`/continue` also works after a turn that ended normally, which is how you ask for more work without writing a prompt. It reports why it did nothing when the session is busy or when the session has no history yet.
+
+Subagents resume the same way. A `task` call that passes a `task_id` may omit `prompt`, which continues that subagent from its existing messages with nothing new to act on.
+
 ## Sessions
 
 Sessions run concurrently. `/new` starts a fresh session while the old one keeps working in the background, and `/sessions` shows the live status of each (working, needs input, idle) so you can jump between them. When a background session finishes or needs input, Caudra flashes a note in the status bar. `/rename` renames the current session; in the session picker, `Ctrl+N` / `Ctrl+R` / `Ctrl+D` create, rename, and delete.
@@ -75,7 +86,7 @@ An input box appears while the focused task is running. Press Enter to queue gui
 
 That input box is a full composer. Typing `/` opens the palette, `Ctrl+S` inserts a file path, `Ctrl+X e` edits the draft in your editor, and `Ctrl+V` attaches an image to the guidance. A custom `/project:` or `/user:` command expands its template and steers the focused task rather than the main session.
 
-Commands that reach the main session's turn or history have no task equivalent, so `/compact`, `/model`, `/system-prompt`, `/workflow`, `/btw`, the `/goal` family, and MCP prompts are drawn dimmed and report their scope when run. Return to Main to use them. `/context`, `/tools`, `/skills`, `/queue`, `/review`, and the stash commands already follow the focused transcript.
+Commands that reach the main session's turn or history have no task equivalent, so `/compact`, `/continue`, `/model`, `/system-prompt`, `/workflow`, `/btw`, the `/goal` family, and MCP prompts are drawn dimmed and report their scope when run. Return to Main to use them. `/context`, `/tools`, `/skills`, `/queue`, `/review`, and the stash commands already follow the focused transcript.
 
 ## Completion goals
 

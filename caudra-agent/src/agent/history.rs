@@ -134,6 +134,26 @@ impl History {
         self.publish();
     }
 
+    /// Undoes the tail [`sanitize_cancelled_history`] leaves behind, reporting
+    /// whether there was one. The marker only exists so a cancelled turn ends
+    /// on a user message; the cut itself is already recorded in the tool result
+    /// or in the reply, so a resume drops it and the model picks the loop back
+    /// up instead of answering the cancellation.
+    ///
+    /// No epoch bump, unlike [`Self::truncate`]: the epoch marks a wholesale
+    /// swap of the conversation, and this is the exact inverse of the append
+    /// that added the marker.
+    pub(crate) fn drop_cancel_marker(&mut self) -> bool {
+        if !self.messages.last().is_some_and(is_cancel_marker) {
+            return false;
+        }
+        let item_len = item_len_for_message_count(self.active_items(), self.messages.len() - 1);
+        Arc::make_mut(&mut self.snapshot.messages).truncate(item_len);
+        self.messages.pop();
+        self.publish();
+        true
+    }
+
     pub fn into_vec(self) -> Vec<Message> {
         self.messages
     }
@@ -488,6 +508,14 @@ fn is_empty_marker(m: &Message) -> bool {
     m.is_empty_padding()
 }
 
+/// Role and `display_text` are part of the shape here too: a user who types the
+/// marker text verbatim wrote a real message, and a resume must not eat it.
+fn is_cancel_marker(m: &Message) -> bool {
+    matches!(m.role, Role::User)
+        && m.display_text.as_deref() == Some("")
+        && matches!(m.content.as_slice(), [ContentBlock::Text { text }] if text == CANCEL_MARKER)
+}
+
 pub fn close_dangling_tool_calls(messages: &mut Vec<Message>, note: &str) {
     let Some(last) = messages.last() else { return };
     if !matches!(last.role, Role::Assistant) || !last.has_tool_calls() {
@@ -827,6 +855,53 @@ mod tests {
             &messages[3].content[0],
             ContentBlock::Text { text } if text == CANCEL_MARKER
         ));
+    }
+
+    /// The marker is the only tail a resume may eat, and it is recognised by
+    /// shape rather than by text so a user who types it keeps their message.
+    #[test_case(vec![Message::user(GO.into())], false ; "user_turn_stays")]
+    #[test_case(vec![Message::user(CANCEL_MARKER.into())], false ; "typed_marker_stays")]
+    #[test_case(
+        vec![make_tool_use_msg(&["t1"]), make_tool_result_msg(&["t1"])],
+        false
+        ; "tool_result_stays"
+    )]
+    #[test_case(vec![text_msg(Role::Assistant, FIRST)], false ; "assistant_stays")]
+    #[test_case(vec![], false ; "empty_history_is_noop")]
+    #[test_case(
+        vec![Message::user(GO.into()), Message::synthetic(CANCEL_MARKER.into())],
+        true
+        ; "synthetic_marker_is_dropped"
+    )]
+    fn drop_cancel_marker_cases(messages: Vec<Message>, expected: bool) {
+        let mirror = make_mirror();
+        let len = messages.len();
+        let mut history = History::new(messages).with_mirror(Arc::clone(&mirror));
+        let epoch = mirror.load().epoch;
+
+        assert_eq!(history.drop_cancel_marker(), expected);
+
+        let expected_len = len - usize::from(expected);
+        assert_eq!(history.len(), expected_len);
+        let snap = mirror.load();
+        assert_eq!(snap.epoch, epoch, "dropping the marker is not a swap");
+        assert_eq!(snapshot_messages(&snap).len(), expected_len);
+    }
+
+    /// Cancelling inside a tool call is what a resume has to land on: dropping
+    /// the marker leaves the closing tool result, which is exactly where the
+    /// loop would have carried on.
+    #[test]
+    fn cancel_then_resume_ends_on_the_closing_tool_result() {
+        let mut history = History::new(vec![Message::user(GO.into()), make_tool_use_msg(&["t1"])]);
+
+        sanitize_cancelled_history(&mut history, 0);
+        assert!(history.drop_cancel_marker());
+
+        assert_eq!(history.len(), 3);
+        let last = history.as_slice().last().unwrap();
+        assert!(matches!(last.role, Role::User));
+        assert_eq!(extract_error_ids(last), ["t1"]);
     }
 
     fn text_msg(role: Role, text: &str) -> Message {

@@ -42,7 +42,7 @@ Notes:
 1. Launch multiple tasks concurrently when possible.
 2. The agent's result is not visible to the user. Summarize it in your response.
 3. A fresh call gives the subagent no context beyond your prompt, so make the prompt self-contained and state exactly what to report back.
-4. Every result, success or failure, carries a task_id. Pass it back to continue that subagent with its previous messages and tool outputs, sending only the new work. Omit mode and profile when continuing; they stay locked to the original run.
+4. Every result, success or failure, carries a task_id. Pass it back to continue that subagent with its previous messages and tool outputs, sending only the new work. Omit mode and profile when continuing; they stay locked to the original run. Omit prompt too to resume an interrupted subagent that needs no new instruction.
 5. Tell it to return concise summaries with file:line refs, not full file contents.
 ";
 
@@ -64,6 +64,8 @@ const NUDGE_MISSING: &str = "You did not call the structured_output tool. Call i
 const NUDGE_SUMMARY: &str = "You finished your work but did not provide a summary. Reply with a concise summary of what you did and found.";
 const INVALID_INPUT_PREFIX: &str =
     "Input does not match the required schema. Fix the errors and call structured_output again:\n";
+const DESCRIPTION_REQUIRED_ERROR: &str = "description is required";
+const PROMPT_REQUIRED_ERROR: &str = "prompt is required unless task_id is set";
 const INTERRUPTED_PREFIX: &str = "sub-agent interrupted (";
 const INTERRUPTED_SUFFIX: &str = "). Partial output:\n";
 const ERROR_PREFIX: &str = "sub-agent error: ";
@@ -87,7 +89,7 @@ static DESCRIPTION_PARAM: ParamSchema = ParamSchema::Primitive {
 };
 static PROMPT_PARAM: ParamSchema = ParamSchema::Primitive {
     kind: ParamKind::String,
-    description: "Detailed task prompt for the agent",
+    description: "Detailed task prompt for the agent. Required for a new task; omit it to resume a task_id with no new work.",
 };
 static TASK_ID_PARAM: ParamSchema = ParamSchema::Primitive {
     kind: ParamKind::String,
@@ -106,7 +108,7 @@ static OUTPUT_SCHEMA_PARAM: ParamSchema = ParamSchema::Any {
 };
 static PROPERTIES: &[Property] = &[
     ("description", &DESCRIPTION_PARAM, true, &[]),
-    ("prompt", &PROMPT_PARAM, true, &[]),
+    ("prompt", &PROMPT_PARAM, false, &[]),
     ("task_id", &TASK_ID_PARAM, false, &[]),
     ("mode", &MODE_PARAM, false, &[]),
     ("profile", &PROFILE_PARAM, false, &[]),
@@ -147,11 +149,16 @@ impl Tool for TaskTool {
     fn parse(&self, input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
         let input = validate(&SCHEMA, input.clone())?;
         let field = |name: &str| input.get(name).and_then(Value::as_str).map(str::to_owned);
+        let task_id = field("task_id");
+        let prompt = field("prompt");
+        if prompt.is_none() && task_id.is_none() {
+            return Err(ParseError::custom(PROMPT_REQUIRED_ERROR));
+        }
         Ok(Box::new(TaskCall {
             description: field("description")
-                .ok_or_else(|| ParseError::custom("description is required"))?,
-            prompt: field("prompt").ok_or_else(|| ParseError::custom("prompt is required"))?,
-            task_id: field("task_id"),
+                .ok_or_else(|| ParseError::custom(DESCRIPTION_REQUIRED_ERROR))?,
+            prompt,
+            task_id,
             profile: field("profile"),
             mode: field("mode").map(|mode| parse_mode(&mode)).transpose()?,
             output_schema: input.get("output_schema").cloned(),
@@ -169,7 +176,8 @@ fn parse_mode(raw: &str) -> Result<SubagentTaskMode, ParseError> {
 
 struct TaskCall {
     description: String,
-    prompt: String,
+    /// `None` continues an existing `task_id` with nothing new to say.
+    prompt: Option<String>,
     task_id: Option<String>,
     profile: Option<String>,
     mode: Option<SubagentTaskMode>,
@@ -251,10 +259,12 @@ impl TaskCall {
         validating: bool,
         captured: &Mutex<Captured>,
     ) -> ToolExecResult {
-        let mut message = self.prompt.clone();
-        if validating {
-            message.push_str(STRUCTURED_OUTPUT_PROMPT_SUFFIX);
-        }
+        let message = self.prompt.clone().map(|mut message| {
+            if validating {
+                message.push_str(STRUCTURED_OUTPUT_PROMPT_SUFFIX);
+            }
+            message
+        });
         let mut result = session.prompt(message).await;
         for _ in 0..MAX_NUDGES {
             let Ok(reply) = &result else { break };
@@ -262,7 +272,7 @@ impl TaskCall {
             else {
                 break;
             };
-            result = session.prompt(nudge.to_owned()).await;
+            result = session.prompt(Some(nudge.to_owned())).await;
         }
 
         let text = match result {
@@ -464,6 +474,23 @@ mod tests {
             parse(input).is_err(),
             "{field} must not be caller-controlled"
         );
+    }
+
+    /// Resuming an interrupted subagent has nothing new to say, and inventing
+    /// a prompt for it would land a fake instruction in the child's history.
+    #[test]
+    fn a_continuation_may_omit_the_prompt() {
+        let input = json!({ "description": "find auth", "task_id": TASK_ID });
+        assert!(parse(input).is_ok());
+    }
+
+    #[test]
+    fn a_new_task_without_a_prompt_is_rejected() {
+        let input = json!({ "description": "find auth" });
+        let Err(error) = parse(input) else {
+            panic!("a new task without a prompt was accepted");
+        };
+        assert!(error.to_string().contains(PROMPT_REQUIRED_ERROR));
     }
 
     #[test]

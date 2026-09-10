@@ -281,7 +281,13 @@ impl Subagent {
         self.closed
     }
 
-    pub async fn prompt(&mut self, message: String) -> Result<PromptResult, PromptFailure> {
+    /// `None` resumes: the subagent picks its own history back up with no new
+    /// instruction, which is all a caller continuing an interrupted task has
+    /// to say.
+    pub async fn prompt(
+        &mut self,
+        message: Option<String>,
+    ) -> Result<PromptResult, PromptFailure> {
         if self.closed {
             return Err(PromptFailure {
                 error: SESSION_CLOSED.to_owned(),
@@ -295,7 +301,7 @@ impl Subagent {
                 parent_tool_use_id: self.parent_tool_use_id.clone(),
                 task_id: self.task_id.clone(),
                 name: self.name.clone(),
-                prompt: Some(message.clone()),
+                prompt: message.clone(),
                 model: Some(self.params.model.spec()),
                 answer_tx: self.answer_tx.take(),
                 steer_tx: self.steer_tx.take(),
@@ -324,7 +330,8 @@ impl Subagent {
 
         let result = agent
             .run(AgentInput {
-                message,
+                resume: message.is_none(),
+                message: message.unwrap_or_default(),
                 mode: self.mode.clone(),
                 images: Vec::new(),
                 mentions: Vec::new(),

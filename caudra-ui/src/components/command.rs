@@ -83,6 +83,12 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         scope: ChatScope::MainOnly,
     },
     BuiltinCommand {
+        name: "/continue",
+        description: "Resume an interrupted turn without adding a message",
+        max_args: 0,
+        scope: ChatScope::MainOnly,
+    },
+    BuiltinCommand {
         name: "/new",
         description: "Start a new session",
         max_args: 0,

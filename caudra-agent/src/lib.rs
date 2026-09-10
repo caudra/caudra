@@ -134,4 +134,7 @@ pub struct AgentInput {
     /// No `Default` on this struct so adding a field forces every call site to update.
     pub workflow: bool,
     pub prompt: Option<Box<McpPromptRef>>,
+    /// Resume with no turn of the caller's own: the run starts from history as
+    /// it stands, and the agent decides what the request tail still needs.
+    pub resume: bool,
 }

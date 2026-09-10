@@ -89,6 +89,8 @@ const QUEUE_TEXT_OFFSET: u16 = 2;
 /// Six content rows plus the header and the trailing edge.
 const QUEUE_PANEL_MAX_HEIGHT: u16 = 8;
 const REPLACEMENT_PROMPT: &str = "replace the running turn";
+const RESUME_PROMPT_TEXT: &str = "keep going";
+const RESUME_PARTIAL_TEXT: &str = "half an answer";
 const LEDGER_PROVIDER: &str = "anthropic";
 const LEDGER_MODEL: &str = "claude-opus-5";
 const LEDGER_CWD: &str = "/home/dev/caudra";
@@ -2387,6 +2389,7 @@ fn task_composer_executes_an_allowed_command() {
 }
 
 #[test_case("/compact" ; "compact")]
+#[test_case("/continue" ; "resume")]
 #[test_case("/model" ; "model")]
 #[test_case("/goal" ; "goal")]
 #[test_case("/workflow" ; "workflow")]
@@ -2826,6 +2829,54 @@ fn compact_command_sets_streaming() {
     let actions = app.execute_command(cmd("/compact"), 0);
     assert!(matches!(&actions[0], Action::Compact));
     assert_eq!(app.status, Status::Streaming);
+}
+
+/// A resume must reach the agent carrying nothing but its flag: no bubble,
+/// no text, so the model sees only the history it was already working from.
+#[test]
+fn continue_command_starts_a_run_with_no_message() {
+    let mut app = test_app();
+    app.shared_history = Some(Arc::new(ArcSwap::from_pointee(HistorySnapshot::new(
+        crate::history_items(&[
+            Message::user(RESUME_PROMPT_TEXT.into()),
+            assistant_message(RESUME_PARTIAL_TEXT),
+        ]),
+    ))));
+    let before = app.main_chat().message_count();
+
+    let actions = app.execute_command(cmd("/continue"), 0);
+
+    let [Action::SnapshotWorkspace { run_id, .. }] = actions.as_slice() else {
+        panic!("continue must defer its snapshot");
+    };
+    let settled = app.on_workspace_snapshot(*run_id, Ok(()));
+    let [Action::SendMessage(input)] = settled.as_slice() else {
+        panic!("continue must start a run");
+    };
+    assert!(input.message.is_empty());
+    assert!(input.resume);
+    assert_eq!(app.main_chat().message_count(), before);
+}
+
+#[test]
+fn continue_command_is_refused_while_streaming() {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+
+    let actions = app.execute_command(cmd("/continue"), 0);
+
+    assert!(actions.is_empty());
+    assert_eq!(app.status_bar.flash_text(), Some(queue::CONTINUE_BUSY_ERR));
+}
+
+#[test]
+fn continue_command_is_refused_with_nothing_to_resume() {
+    let mut app = test_app();
+
+    let actions = app.execute_command(cmd("/continue"), 0);
+
+    assert!(actions.is_empty());
+    assert_eq!(app.status_bar.flash_text(), Some(queue::CONTINUE_EMPTY_ERR));
 }
 
 #[test]
