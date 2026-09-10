@@ -1036,7 +1036,7 @@ impl MessagesPanel {
         }
     }
 
-    fn card_closed(&self, tool_id: &str) -> bool {
+    pub(crate) fn card_closed(&self, tool_id: &str) -> bool {
         self.tool_expansion(tool_id, self.card_opens_by_default(tool_id))
             .is_none()
     }
@@ -2315,6 +2315,16 @@ impl MessagesPanel {
         }
         self.open_card(&tool_id);
         true
+    }
+
+    /// Puts a card behind its header without a click, for when something else
+    /// on screen already draws its body. Unlike [`Self::close_card`] this is
+    /// not the reader's doing, so `card_can_close` does not gate it: a write is
+    /// never collapsible by mode, and here that is beside the point.
+    pub fn close_tool_card(&mut self, tool_id: &str) {
+        self.disclosure
+            .insert(tool_id.to_owned(), CardState::Closed);
+        self.rebuild_tool_lines(tool_id);
     }
 
     /// Takes a card back to the single line it started as. The close is

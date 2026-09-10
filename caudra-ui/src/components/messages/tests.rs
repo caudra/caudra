@@ -1369,6 +1369,22 @@ fn streaming_write(panel: &mut MessagesPanel, fragments: &[&str]) {
     }
 }
 
+/// A write announces its path before any of its body, so the card knows which
+/// of the two ways to draw the file before there is anything to draw.
+#[test]
+fn a_streamed_write_to_a_markdown_file_draws_the_document() {
+    const PATH: &str = "plan.md";
+    const HEADING: &str = "# Title\n";
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.tool_pending(TOOL_ID.into(), FILE_WRITE_TOOL_NAME);
+    panel.tool_input_preview(TOOL_ID, Some(PATH.into()), None);
+    panel.tool_input_body(TOOL_ID, Some(HEADING.into()));
+
+    let shown = buffer_text(&render(&mut panel, 80, 24));
+    assert!(shown.contains("Title"), "{shown}");
+    assert!(!shown.contains(HEADING.trim_end()), "{shown}");
+}
+
 #[test]
 fn a_streamed_write_grows_in_the_card() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());

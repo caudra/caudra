@@ -8,6 +8,7 @@ use code_view::{BatchProgressMap, BatchViewMap, BatchViews, Disclosure, RenderLi
 
 use std::borrow::Cow;
 use std::fmt::Write;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -100,6 +101,8 @@ const COMPACT_ARG_MAX_CHARS: usize = 40;
 const ELLIPSIS: char = '…';
 const EDIT_KEYS: &[&str] = &["file_path", "old_string", "new_string"];
 const READ_RESULT_KEYS: &[&str] = &["offset", "limit"];
+/// Extensions whose file is worth more rendered than quoted.
+const MARKDOWN_EXTENSIONS: &[&str] = &["md", "markdown", "mdx"];
 /// The tools whose header leads with a literal the model wrote, and the input
 /// key it wrote it under. One key per tool: a grep writes a pattern, a
 /// code-graph lookup writes a symbol or a whole task.
@@ -302,6 +305,16 @@ pub(super) fn compact_sigil_label(name: &str, tense: Tense) -> (char, &str) {
     compact_tool(name).map_or((COMPACT_FALLBACK_SIGIL, name), |entry| {
         (entry.sigil, entry.label(tense))
     })
+}
+
+/// Whether a write to `path` is drawn as the document it is rather than as its
+/// source. A markdown file's rendering *is* what the write produced, so the
+/// gutter costs the thing the card is for.
+fn renders_as_markdown(path: &str) -> bool {
+    Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| MARKDOWN_EXTENSIONS.iter().any(|md| ext.eq_ignore_ascii_case(md)))
 }
 
 fn same_key(left: &str, right: &str) -> bool {
@@ -1022,6 +1035,24 @@ impl ToolLineBuilder {
     }
 
     fn push_code_content(&mut self, input: Option<&ToolInput>, output: Option<&ToolOutput>) {
+        // `content_range` stays empty for a rendered document, because the
+        // highlighting worker answers a `WriteCode` range with the file's
+        // source and would splice it back over what was drawn.
+        match output {
+            Some(ToolOutput::WriteCode { path, lines, .. }) if renders_as_markdown(path) => {
+                self.push_markdown_body(&lines.join("\n"));
+            }
+            _ => self.push_rendered_code(input, output),
+        }
+        if let Some(ToolInput::Code { code, .. } | ToolInput::Script { code, .. }) = input {
+            self.push_search_text(code.trim_end());
+        }
+        if let Some(text) = output.and_then(|o| o.structured_display_text()) {
+            self.push_search_text(&text);
+        }
+    }
+
+    fn push_rendered_code(&mut self, input: Option<&ToolInput>, output: Option<&ToolOutput>) {
         let content = code_view::render_tool_content(input, output, false, self.limits.clone());
         self.truncation |= content.truncation;
         let start = self.lines.len();
@@ -1032,23 +1063,24 @@ impl ToolLineBuilder {
         self.content_range = (start, self.lines.len());
         self.rows.resize(start, None);
         self.rows.extend(content.rows);
-        if let Some(ToolInput::Code { code, .. } | ToolInput::Script { code, .. }) = input {
-            self.push_search_text(code.trim_end());
-        }
-        if let Some(text) = output.and_then(|o| o.structured_display_text()) {
-            self.push_search_text(&text);
-        }
     }
 
     /// Takes the place `push_code_content` would fill, because the call it
     /// belongs to has no output yet and its arguments are the only record of
     /// what it is about to do.
-    fn push_live_body(&mut self, body: &str) {
-        let lines = code_view::render_live_body(body);
+    ///
+    /// `path` is what the header has said so far, which is all a still-arriving
+    /// write has said about itself. A document is drawn the way the settled
+    /// card will draw it, so nothing about the body changes when the call runs.
+    fn push_live_body(&mut self, body: &str, path: &str) {
         let start = self.lines.len();
-        for mut line in lines {
-            line.spans.insert(0, Span::raw(TOOL_BODY_INDENT));
-            self.lines.push(line);
+        if renders_as_markdown(path) {
+            self.push_markdown_body(body);
+        } else {
+            for mut line in code_view::render_live_body(body) {
+                line.spans.insert(0, Span::raw(TOOL_BODY_INDENT));
+                self.lines.push(line);
+            }
         }
         self.content_range = (start, self.lines.len());
     }
@@ -1383,7 +1415,7 @@ pub fn build_tool_lines(
     }
     let has_snapshot = msg.render_snapshot.is_some();
     match msg.live_body.as_ref().filter(|_| !has_snapshot) {
-        Some(live) => b.push_live_body(live),
+        Some(live) => b.push_live_body(live, header),
         None => b.push_code_content(
             msg.tool_input.as_deref(),
             if has_snapshot {
@@ -1713,6 +1745,100 @@ mod tests {
             .map(|s| s.content.as_ref())
             .collect::<Vec<_>>()
             .join("")
+    }
+
+    const MARKDOWN_PATH: &str = "notes.md";
+    const SOURCE_PATH: &str = "main.rs";
+    /// A heading is the cheapest thing that reads differently drawn than
+    /// quoted: rendering it spends the hashes, source keeps them.
+    const HEADING_SOURCE: &str = "# Title";
+    const HEADING_TEXT: &str = "Title";
+
+    fn write_msg(
+        path: &str,
+        live_body: Option<&str>,
+        output: Option<ToolOutput>,
+    ) -> DisplayMessage {
+        DisplayMessage {
+            role: DisplayRole::Tool(Box::new(ToolRole {
+                id: "t1".into(),
+                effect: ToolEffect::Unknown,
+                status: ToolStatus::Success,
+                name: FILE_WRITE_TOOL_NAME.into(),
+            })),
+            text: path.into(),
+            source: None,
+            tool_input: None,
+            tool_raw_input: None,
+            tool_output: output.map(Arc::new),
+            live_output: None,
+            live_body: live_body.map(str::to_owned),
+            annotation: None,
+            progress: None,
+            plan_path: None,
+            truncated_lines: 0,
+            timestamp: None,
+            turn_usage: None,
+            render_snapshot: None,
+            render_header: None,
+            snapshot_theme_gen: 0,
+            body_open: None,
+            thinking_duration: None,
+        }
+    }
+
+    fn write_output(path: &str) -> ToolOutput {
+        ToolOutput::WriteCode {
+            path: path.into(),
+            byte_count: HEADING_SOURCE.len(),
+            lines: vec![HEADING_SOURCE.into()],
+        }
+    }
+
+    #[test_case("plan.md",        true  ; "md")]
+    #[test_case("NOTES.MARKDOWN", true  ; "extension_case_is_not_the_answer")]
+    #[test_case("doc.mdx",        true  ; "mdx")]
+    #[test_case("main.rs",        false ; "source")]
+    #[test_case("README",         false ; "no_extension")]
+    #[test_case("a.md.rs",        false ; "markdown_only_in_the_stem")]
+    fn renders_as_markdown_matches_document_extensions(path: &str, expected: bool) {
+        assert_eq!(renders_as_markdown(path), expected);
+    }
+
+    /// The header is the only thing a still-arriving write has said about
+    /// itself, and it is the path.
+    #[test_case(MARKDOWN_PATH, false ; "a_document_is_drawn")]
+    #[test_case(SOURCE_PATH,   true  ; "source_is_quoted")]
+    fn a_streaming_write_draws_its_body_by_extension(path: &str, keeps_markers: bool) {
+        let msg = write_msg(path, Some(HEADING_SOURCE), None);
+        let tl = build_tool_lines(
+            &msg,
+            ToolStatus::InProgress,
+            &test_rctx(80),
+            Some(Disclosure::default()),
+        );
+        let text = lines_text(&tl);
+        assert!(text.contains(HEADING_TEXT), "{text}");
+        assert_eq!(text.contains(HEADING_SOURCE), keeps_markers, "{text}");
+    }
+
+    /// The settled card draws what the streaming one drew, and a document that
+    /// asked for highlighting would have the worker splice the file's source
+    /// back over it.
+    #[test_case(MARKDOWN_PATH, false ; "a_document_is_drawn")]
+    #[test_case(SOURCE_PATH,   true  ; "source_is_quoted")]
+    fn a_settled_write_draws_its_body_by_extension(path: &str, keeps_markers: bool) {
+        let msg = write_msg(path, None, Some(write_output(path)));
+        let tl = build_tool_lines(
+            &msg,
+            ToolStatus::Success,
+            &test_rctx(80),
+            Some(Disclosure::default()),
+        );
+        let text = lines_text(&tl);
+        assert!(text.contains(HEADING_TEXT), "{text}");
+        assert_eq!(text.contains(HEADING_SOURCE), keeps_markers, "{text}");
+        assert_eq!(tl.highlight.is_some(), keeps_markers);
     }
 
     #[test]

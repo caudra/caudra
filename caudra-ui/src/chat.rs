@@ -186,6 +186,7 @@ impl Chat {
             AgentEvent::ToolDone(e) => {
                 let plan_write = plan_path.filter(|pp| e.wrote_to(pp));
                 let is_full_write = &*e.tool == FILE_WRITE_TOOL_NAME;
+                let tool_id = e.id.clone();
                 self.messages_panel.tool_done(*e);
                 if let Some(pp) = plan_write {
                     let content = if is_full_write {
@@ -193,6 +194,13 @@ impl Chat {
                     } else {
                         String::new()
                     };
+                    // The plan card below draws the same file, and a write's
+                    // card draws it too, so the write falls back to its header
+                    // rather than the plan being read twice. An edit keeps its
+                    // body: the plan card it produces has none.
+                    if !content.is_empty() {
+                        self.messages_panel.close_tool_card(&tool_id);
+                    }
                     self.messages_panel
                         .push(DisplayMessage::plan(content, pp.display().to_string()));
                 }
@@ -1137,6 +1145,11 @@ mod tests {
         assert_eq!(chat.in_progress_count(), 0);
     }
 
+    /// The plan card renders the same file the write card does, so exactly one
+    /// of them draws it.
+    const PLAN_DUPLICATION_MSG: &str = "a plan write should fall back to its header";
+    const PLAN_DIFF_MSG: &str = "a plan edit is a diff the plan card does not carry";
+
     #[test]
     fn plan_write_renders_file_content() {
         let mut chat = chat();
@@ -1155,6 +1168,10 @@ mod tests {
         assert!(chat.last_message_is_plan());
         let last = chat.last_message_text();
         assert!(last.contains("# My Plan"));
+        assert!(
+            chat.messages_panel.card_closed("w1"),
+            "{PLAN_DUPLICATION_MSG}"
+        );
     }
 
     #[test]
@@ -1186,6 +1203,7 @@ mod tests {
 
         assert!(chat.last_message_is_plan());
         assert!(chat.last_message_text().is_empty());
+        assert!(!chat.messages_panel.card_closed("e1"), "{PLAN_DIFF_MSG}");
     }
 
     #[test]
