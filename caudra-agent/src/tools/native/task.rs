@@ -39,6 +39,8 @@ Notes:
 
 const TASK_METADATA_FORMAT: &str = "<task_metadata>\ntask_id: {task_id}\n</task_metadata>";
 const TASK_ID_PLACEHOLDER: &str = "{task_id}";
+const JSON_FENCE_OPEN: &str = "```json\n";
+const JSON_FENCE_CLOSE: &str = "\n```";
 const DESCRIPTION_REQUIRED_ERROR: &str = "description is required";
 const PROMPT_REQUIRED_ERROR: &str = "prompt is required unless task_id is set";
 
@@ -176,7 +178,7 @@ fn render(outcome: TaskOutcome) -> ToolExecResult {
     let result = match (outcome.error, outcome.output) {
         (Some(message), _) => error(message),
         (None, Value::String(text)) => markdown(text),
-        (None, structured) => markdown(structured.to_string()),
+        (None, structured) => structured_json(structured),
     };
     match outcome.task_id {
         Some(task_id) => with_task_id(&task_id, result),
@@ -191,6 +193,17 @@ fn with_task_id(task_id: &str, mut result: ToolExecResult) -> ToolExecResult {
 
 fn markdown(text: String) -> ToolExecResult {
     ToolExecResult::from(Ok(ToolOutput::Markdown(text.into())))
+}
+
+/// A schema-validated result is data, not prose. One compact line is the
+/// cheapest thing to hand the model and the least readable thing to draw, so
+/// the two diverge: the card gets a fenced block the renderer can break and
+/// highlight, and the model keeps the line it had.
+fn structured_json(structured: Value) -> ToolExecResult {
+    let compact = structured.to_string();
+    let pretty = serde_json::to_string_pretty(&structured).unwrap_or_else(|_| compact.clone());
+    markdown(format!("{JSON_FENCE_OPEN}{pretty}{JSON_FENCE_CLOSE}"))
+        .with_model_output(Some(compact))
 }
 
 fn error(message: String) -> ToolExecResult {
@@ -302,14 +315,38 @@ mod tests {
     }
 
     #[test]
-    fn a_structured_value_is_returned_as_compact_json() {
+    fn a_structured_value_is_fenced_for_the_card_and_compact_for_the_model() {
         let value = json!({ REQUIRED_FIELD: SUMMARY });
         let result = render(outcome(Some(TASK_ID), Ok(value.clone())));
         assert!(!result.is_error);
-        assert_eq!(text_of(&result), value.to_string());
+        let expected = serde_json::to_string_pretty(&value).expect("pretty json");
+        assert_eq!(
+            text_of(&result),
+            format!("{JSON_FENCE_OPEN}{expected}{JSON_FENCE_CLOSE}")
+        );
+        assert_eq!(
+            result.model_output.as_deref(),
+            Some(value.to_string().as_str())
+        );
         assert_eq!(
             result.model_suffix.as_deref(),
             Some(metadata(TASK_ID).as_str())
+        );
+    }
+
+    /// The fence is presentation: stripping it has to give the payload back
+    /// byte for byte, or the card is showing something the model never got.
+    #[test]
+    fn the_fenced_card_text_parses_back_to_the_result() {
+        let value = json!({ REQUIRED_FIELD: [SUMMARY, BOOM], "nested": { "n": 1 } });
+        let text = text_of(&render(outcome(Some(TASK_ID), Ok(value.clone()))));
+        let inner = text
+            .strip_prefix(JSON_FENCE_OPEN)
+            .and_then(|t| t.strip_suffix(JSON_FENCE_CLOSE))
+            .expect("fenced json block");
+        assert_eq!(
+            serde_json::from_str::<Value>(inner).expect("valid json"),
+            value
         );
     }
 

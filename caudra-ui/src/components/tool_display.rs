@@ -53,7 +53,9 @@ impl RenderCtx<'_> {
             .and_then(|id| self.batch_progress.get(id))
             .cloned()
             .unwrap_or_default();
-        RenderLimits::new(full, budget, views, *self.tool_output_lines).with_progress(progress)
+        RenderLimits::new(full, budget, views, *self.tool_output_lines)
+            .with_progress(progress)
+            .with_width(self.width.saturating_sub(TOOL_BODY_INDENT_WIDTH))
     }
 
     /// The rows a card rests at, `usize::MAX` for a call with no useful
@@ -79,6 +81,7 @@ impl RenderCtx<'_> {
 
 pub const TOOL_INDICATOR: &str = "● ";
 pub const TOOL_BODY_INDENT: &str = "  ";
+const TOOL_BODY_INDENT_WIDTH: u16 = TOOL_BODY_INDENT.len() as u16;
 pub(crate) const NOTICE_PREFIX: &str = "· ";
 pub(crate) const SPINNER_STYLE_NAME: &str = "spinner";
 pub(crate) const SPINNER_STYLE_PREFIX: &str = "spinner:";
@@ -1124,13 +1127,12 @@ impl ToolLineBuilder {
 
     fn push_markdown_body(&mut self, text: &str) {
         let style = theme::current().assistant;
-        let indent = TOOL_BODY_INDENT.len() as u16;
         let (painted, _) = text_to_painted(
             text,
             "",
             style,
             style,
-            self.width.saturating_sub(indent),
+            self.width.saturating_sub(TOOL_BODY_INDENT_WIDTH),
             Some(caudra_markdown::render::TOOL_OUTPUT_MAX_LINE_BYTES),
             Vec::new(),
         );

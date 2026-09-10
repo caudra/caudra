@@ -221,18 +221,24 @@ fn load_task_host_with_opts(
     (reg, host)
 }
 
+/// The model-facing text, which a tool may render differently from the card:
+/// `task` fences a structured result for display and keeps the compact JSON
+/// here.
 fn exec_tool(reg: &ToolRegistry, name: &str, input: Value) -> Result<String, String> {
     let entry = reg
         .get(name)
         .unwrap_or_else(|| panic!("tool {name} not registered"));
     let inv = entry.tool.parse(&input).expect("parse failed");
     let ctx = stub_ctx(&AgentMode::Build);
-    smol::block_on(async { inv.execute(&ctx).await })
-        .output
-        .map(|out| match out {
+    let result = smol::block_on(async { inv.execute(&ctx).await });
+    let model_output = result.model_output;
+    result.output.map(|out| match model_output {
+        Some(text) => text,
+        None => match out {
             ToolOutput::Plain(s) | ToolOutput::Markdown(s) => s.text,
             other => panic!("unexpected output: {other:?}"),
-        })
+        },
+    })
 }
 
 fn probe(reg: &ToolRegistry) -> Value {

@@ -1475,7 +1475,7 @@ impl ToolOutputLines {
     pub const DEFAULT: Self = Self {
         bash: 5,
         python_execution: 5,
-        task: 5,
+        task: 12,
         index: 3,
         grep: 3,
         read: 3,

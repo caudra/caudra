@@ -46,12 +46,16 @@ struct HighlightKey {
     /// A child view changes which lines the range holds, so reusing across a
     /// fold would splice back the body the reader just put away.
     views: BatchViews,
+    /// A body is wrapped to it, so reusing across a resize would splice back
+    /// lines broken for the width the terminal used to be.
+    width: u16,
 }
 
 impl PartialEq for HighlightKey {
     fn eq(&self, other: &Self) -> bool {
         self.theme_gen == other.theme_gen
             && self.views == other.views
+            && self.width == other.width
             && same_source(&self.input, &other.input)
             && same_source(&self.output, &other.output)
     }
@@ -77,6 +81,7 @@ impl HighlightKey {
             output: hl.and_then(|h| h.output.clone()),
             theme_gen: theme::generation(),
             views: hl.map(|h| h.limits.views.clone()).unwrap_or_default(),
+            width: hl.map_or(0, |h| h.limits.width),
         }
     }
 }
@@ -722,10 +727,13 @@ mod tests {
     }
 
     #[test]
-    fn reuse_highlight_keys_on_theme_not_width() {
+    fn reuse_highlight_keys_on_theme_and_width() {
         use crate::components::code_view::RenderLimits;
         use caudra_agent::ToolOutput;
         use std::sync::Arc;
+
+        const WIDTH: u16 = 80;
+        const RESIZED: u16 = 40;
 
         let output = Arc::new(ToolOutput::ReadCode {
             path: "f.rs".into(),
@@ -734,16 +742,16 @@ mod tests {
             total_lines: 1,
             instructions: None,
         });
-        let key = || {
+        let key = |width| {
             HighlightKey::from_request(Some(&HighlightRequest {
                 range: (1, 3),
                 input: None,
                 output: Some(Arc::clone(&output)),
-                limits: RenderLimits::default(),
+                limits: RenderLimits::default().with_width(width),
             }))
         };
         let seg = Segment {
-            highlight_key: key(),
+            highlight_key: key(WIDTH),
             highlight_range: Some((1, 3)),
             lines: vec![
                 Line::raw("h"),
@@ -754,16 +762,21 @@ mod tests {
             ..Segment::default()
         };
 
-        // Highlighted lines are source lines, not wrapped rows (the worker
-        // job carries no width), so the key deliberately omits width.
         assert!(
-            seg.reuse_highlight(&key(), (1, 3)).is_some(),
-            "reuse must fire across a width change; highlight lines are width-independent"
+            seg.reuse_highlight(&key(WIDTH), (1, 3)).is_some(),
+            "an unchanged card must reuse rather than re-render"
+        );
+
+        // A markdown body is wrapped to the width its job carried, so a resize
+        // has to re-render instead of splicing back the old breaks.
+        assert!(
+            seg.reuse_highlight(&key(RESIZED), (1, 3)).is_none(),
+            "width mismatch must force a fresh highlight, not splice stale wrapping"
         );
 
         theme::set(theme::load_by_name(OTHER_THEME).unwrap());
         assert!(
-            seg.reuse_highlight(&key(), (1, 3)).is_none(),
+            seg.reuse_highlight(&key(WIDTH), (1, 3)).is_none(),
             "theme mismatch must force a fresh highlight, not splice old-palette lines"
         );
     }

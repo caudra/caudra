@@ -23,6 +23,7 @@ use syntect::util::LinesWithEndings;
 
 pub(crate) const MAX_INSTRUCTION_LINES: usize = 15;
 const BATCH_CHILD_INDENT: &str = "  ";
+const BATCH_CHILD_INDENT_WIDTH: u16 = BATCH_CHILD_INDENT.len() as u16;
 const ANSWER_MARK: &str = "  \u{2713} ";
 const ANSWER_INDENT: &str = "    ";
 const NO_ANSWER: &str = "(no answer)";
@@ -660,7 +661,9 @@ fn child_body(
         );
     }
     match output {
-        Some(ToolOutput::Markdown(text)) => capped(markdown_lines(&text.text), limits.budget),
+        Some(ToolOutput::Markdown(text)) => {
+            capped(markdown_lines(&text.text, limits.width), limits.budget)
+        }
         Some(ToolOutput::Plain(text) | ToolOutput::ReadDir(text)) => {
             capped(text_lines(text.text.clone()), limits.budget)
         }
@@ -690,19 +693,27 @@ fn capped(mut lines: Vec<Line<'static>>, budget: usize) -> (Vec<Line<'static>>, 
 /// report and a skill's instructions are prose, and showing them as source
 /// puts the syntax on screen instead of what it says.
 ///
-/// Rendered unconstrained, like every other body here. A child is built once
-/// for every width, since the highlight worker is handed no width and its
-/// answer is spliced back over whatever the terminal has since become. Zero is
-/// the renderer's own word for that, and costs only a horizontal rule, which
-/// has nothing left to fill.
-fn markdown_lines(text: &str) -> Vec<Line<'static>> {
+/// Given the columns the child actually has, which is what a code block or a
+/// table needs to break itself. Left unbroken they run past the card and the
+/// terminal wraps them, and `Wrap` restarts a continuation at column zero, so
+/// the indent saying which child the row belongs to is lost. A subagent
+/// reporting a structured result is a fenced block, so this is the case that
+/// matters. Paragraphs are still ratatui's to wrap, here as everywhere else:
+/// pre-breaking them would turn soft wraps into hard newlines in a copy.
+///
+/// The width rides on the limits, which is what reaches the highlight worker,
+/// and `HighlightKey` carries it so a resize re-renders instead of splicing
+/// back an answer broken for the width the terminal used to be. Zero is the
+/// renderer's own word for not wrapping, and stays what a caller with no width
+/// to give gets.
+fn markdown_lines(text: &str, width: u16) -> Vec<Line<'static>> {
     let style = theme::current().assistant;
     let (painted, _) = text_to_painted(
         text,
         "",
         style,
         style,
-        UNCONSTRAINED_WIDTH,
+        width,
         Some(caudra_markdown::render::TOOL_OUTPUT_MAX_LINE_BYTES),
         Vec::new(),
     );
@@ -1293,6 +1304,10 @@ pub struct RenderLimits {
     /// Every tool's budget rather than only this card's, because a batch child
     /// rests at the one its own tool would be drawn with.
     pub tool_lines: ToolOutputLines,
+    /// The columns the body has, already net of the indent its lines are
+    /// prefixed with. Zero means the renderer should not wrap, which is what a
+    /// caller with no width to give gets.
+    pub width: u16,
 }
 
 impl RenderLimits {
@@ -1302,11 +1317,16 @@ impl RenderLimits {
             views,
             progress: ChildProgress::default(),
             tool_lines,
+            width: UNCONSTRAINED_WIDTH,
         }
     }
 
     pub fn with_progress(self, progress: ChildProgress) -> Self {
         Self { progress, ..self }
+    }
+
+    pub fn with_width(self, width: u16) -> Self {
+        Self { width, ..self }
     }
 
     /// Whether any child is still reporting. A live row is redrawn every tick
@@ -1344,6 +1364,7 @@ impl RenderLimits {
             views: BatchViews::default(),
             progress: ChildProgress::default(),
             tool_lines: self.tool_lines,
+            width: self.width.saturating_sub(BATCH_CHILD_INDENT_WIDTH),
         })
     }
 }
@@ -2167,6 +2188,111 @@ mod tests {
 
     fn limits(views: BatchViews) -> RenderLimits {
         RenderLimits::new(false, PARENT_BUDGET, views, TOOL_LINES)
+    }
+
+    const MARKDOWN_CHILD_TOOL: &str = "task";
+    const FENCE_MARK: &str = "```";
+    const FENCE_KEY: &str = "answer";
+    /// One value long enough that a narrow card has to break the line, which
+    /// is what a subagent's structured report looks like.
+    const FENCE_PAYLOAD: &str =
+        "found the middleware, the router, and the two call sites that bypass both";
+    const CODE_GUTTER: &str = caudra_markdown::render::CODE_BAR_WRAP;
+    const NARROW_BODY_WIDTH: u16 = 24;
+
+    /// A fenced block the line budget cut before its closing fence, which is
+    /// what `truncate_output` hands the card for any structured task result.
+    fn unclosed_fence() -> String {
+        format!("{FENCE_MARK}json\n{{\n  \"{FENCE_KEY}\": \"{FENCE_PAYLOAD}\"")
+    }
+
+    /// A block that fits occupies the blank row the renderer opens with, then
+    /// one row per line of code; the fence itself draws none.
+    fn unbroken_rows(fence: &str) -> usize {
+        fence.lines().count()
+    }
+
+    fn markdown_entry(text: &str) -> BatchToolEntry {
+        BatchToolEntry {
+            tool: MARKDOWN_CHILD_TOOL.into(),
+            effect: ToolEffect::ReadOnly,
+            summary: format!("{MARKDOWN_CHILD_TOOL} summary"),
+            status: BatchToolStatus::Success,
+            input: None,
+            raw_input: None,
+            output: Some(ToolOutput::Markdown(caudra_agent::TextOutput {
+                text: text.to_owned(),
+                instructions: None,
+                state: None,
+                lua_provenance: None,
+            })),
+            annotation: None,
+        }
+    }
+
+    /// The child's body rows, which follow its one summary row. The card is
+    /// given the child's width plus the indent it prefixes, so `width` is what
+    /// the body itself ends up with.
+    fn markdown_child_body(text: &str, width: u16) -> Vec<String> {
+        let limits = limits(BatchViews::new([0])).with_width(width + BATCH_CHILD_INDENT_WIDTH);
+        let (lines, _) = render_batch(&[markdown_entry(text)], false, &limits);
+        lines
+            .iter()
+            .skip(1)
+            .map(|line| spans_text(&line.spans))
+            .collect()
+    }
+
+    /// A line the card does not break is one the terminal breaks, and `Wrap`
+    /// restarts a continuation at column zero, so the row stops saying whose
+    /// body it is.
+    #[test]
+    fn a_wrapped_markdown_child_indents_every_line() {
+        let fence = unclosed_fence();
+        let body = markdown_child_body(&fence, NARROW_BODY_WIDTH);
+        assert!(
+            body.len() > unbroken_rows(&fence),
+            "the long value has to have been broken: {body:?}"
+        );
+        let limit = usize::from(NARROW_BODY_WIDTH) + BATCH_CHILD_INDENT.len();
+        for line in &body {
+            assert!(
+                line.starts_with(BATCH_CHILD_INDENT),
+                "an unindented row reads as belonging to the batch, not the child: {line:?}"
+            );
+            assert!(
+                line.chars().count() <= limit,
+                "a row past the width is one the terminal wraps for us: {line:?}"
+            );
+        }
+    }
+
+    /// The escape hatch every caller with no width to give relies on.
+    #[test]
+    fn a_markdown_child_with_no_width_is_left_unbroken() {
+        let fence = unclosed_fence();
+        let body = markdown_child_body(&fence, UNCONSTRAINED_WIDTH);
+        assert_eq!(body.len(), unbroken_rows(&fence), "{body:?}");
+    }
+
+    /// The budget cuts the text before the renderer sees it, so the closing
+    /// fence is routinely missing. It still has to read as a block rather than
+    /// put its own syntax on screen.
+    #[test]
+    fn a_fence_the_budget_cut_short_does_not_leak_its_syntax() {
+        let body = markdown_child_body(&unclosed_fence(), NARROW_BODY_WIDTH);
+        assert!(
+            body.iter().any(|line| line.contains(FENCE_KEY)),
+            "the payload has to survive: {body:?}"
+        );
+        assert!(
+            !body.iter().any(|line| line.contains(FENCE_MARK)),
+            "the fence is presentation, not content: {body:?}"
+        );
+        assert!(
+            body.iter().any(|line| line.contains(CODE_GUTTER)),
+            "an unterminated fence still has to read as a block: {body:?}"
+        );
     }
 
     fn batch_of(
