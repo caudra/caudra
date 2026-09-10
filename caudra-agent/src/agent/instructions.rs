@@ -63,7 +63,7 @@ pub fn build_system_prompt(
     crate::prompt::assemble_system(
         &slots.with_native_hints(tool_filter),
         instructions,
-        crate::prompt::MODES_PROMPT,
+        crate::prompt::STANDING_PROMPT,
         profile,
     )
 }
@@ -86,6 +86,11 @@ pub fn environment_block(vars: &Vars, model: &Model) -> String {
 pub struct InstructionBaseline {
     instructions: Instructions,
     epoch: u64,
+    /// Whether the transcript's last word on the instructions is a diff. A file
+    /// that is edited and then put back matches the baseline again, so without
+    /// this the diff would stand uncorrected and the model would go on
+    /// following a rule that no longer exists.
+    drifted: bool,
 }
 
 impl InstructionBaseline {
@@ -93,6 +98,7 @@ impl InstructionBaseline {
         Self {
             instructions,
             epoch,
+            drifted: false,
         }
     }
 
@@ -105,24 +111,32 @@ impl InstructionBaseline {
     }
 
     /// `epoch` is the history epoch, which changes only when the conversation
-    /// was replaced. Returns the reminder to announce, or `None` when the
-    /// baseline already matches `current` or was quietly refreshed to it.
+    /// was replaced. Returns the reminder to announce: a diff while the files
+    /// differ from the baseline, a withdrawal on the turn they stop differing,
+    /// and `None` once the transcript and disk agree.
     pub fn drift(&mut self, current: Instructions, epoch: u64) -> Option<String> {
         let swapped = epoch != std::mem::replace(&mut self.epoch, epoch);
-        if current.text == self.instructions.text {
-            return None;
-        }
-        if swapped {
+        if current.text != self.instructions.text {
+            if !swapped {
+                self.drifted = true;
+                let diff = crate::diff::unified_text(
+                    &self.instructions.text,
+                    &current.text,
+                    &crate::diff::stat(&self.instructions.text, &current.text),
+                    INSTRUCTIONS_DISPLAY_PATH,
+                );
+                return Some(
+                    crate::prompt::INSTRUCTIONS_CHANGED_PROMPT
+                        .replace(crate::prompt::DIFF_SLOT, &diff),
+                );
+            }
             self.instructions = current;
-            return None;
         }
-        let diff = crate::diff::unified_text(
-            &self.instructions.text,
-            &current.text,
-            &crate::diff::stat(&self.instructions.text, &current.text),
-            INSTRUCTIONS_DISPLAY_PATH,
-        );
-        Some(crate::prompt::INSTRUCTIONS_CHANGED_PROMPT.replace(crate::prompt::DIFF_SLOT, &diff))
+        // The system prompt matches disk, either because nothing changed or
+        // because the baseline was just adopted. A diff the transcript still
+        // shows has to be withdrawn or the model keeps following it.
+        std::mem::take(&mut self.drifted)
+            .then(|| crate::prompt::INSTRUCTIONS_RESTORED_PROMPT.to_owned())
     }
 }
 
@@ -283,6 +297,7 @@ mod tests {
     const PLAN_PATH: &str = ".caudra/plans/123.md";
     const BASELINE_TEXT: &str = "# Code guidelines\n";
     const EDITED_TEXT: &str = "# Code guidelines\nbe brief\n";
+    const OTHER_TEXT: &str = "# Code guidelines\nbe thorough\n";
     const EXPECTED_DRIFT_NOTICE: &str = "an edited instruction file should be announced";
     const EPOCH: u64 = 7;
 
@@ -321,6 +336,13 @@ mod tests {
     #[test]
     fn the_system_prompt_explains_the_mode_protocol() {
         assert!(system_prompt().contains(crate::prompt::MODES_PROMPT.trim_end()));
+    }
+
+    /// Reminders arrive as user-role observations, so without this the tag is
+    /// the only thing telling the model they are not the user talking.
+    #[test]
+    fn the_system_prompt_explains_the_reminder_contract() {
+        assert!(system_prompt().contains(crate::prompt::REMINDERS_PROMPT.trim_end()));
     }
 
     #[test]
@@ -464,6 +486,55 @@ mod tests {
         let second = baseline.drift(instructions_of(EDITED_TEXT), EPOCH);
         assert_eq!(first, second);
         assert!(first.is_some(), "{EXPECTED_DRIFT_NOTICE}");
+    }
+
+    /// The gap a "latest wins" rule cannot close: a file put back the way it
+    /// was leaves no later block to supersede the diff, so the diff has to be
+    /// withdrawn explicitly.
+    #[test]
+    fn a_reverted_instruction_file_withdraws_the_diff() {
+        let mut baseline = baseline_of(BASELINE_TEXT);
+        baseline
+            .drift(instructions_of(EDITED_TEXT), EPOCH)
+            .expect(EXPECTED_DRIFT_NOTICE);
+
+        assert_eq!(
+            baseline.drift(instructions_of(BASELINE_TEXT), EPOCH),
+            Some(crate::prompt::INSTRUCTIONS_RESTORED_PROMPT.to_owned())
+        );
+        assert!(
+            baseline
+                .drift(instructions_of(BASELINE_TEXT), EPOCH)
+                .is_none(),
+            "the withdrawal is announced once, not on every quiet turn"
+        );
+    }
+
+    /// Adopting a baseline rewrites the system prompt out from under a diff the
+    /// transcript still shows, which leaves it just as stale as a revert does.
+    #[test]
+    fn an_adopted_baseline_withdraws_an_outstanding_diff() {
+        let mut baseline = baseline_of(BASELINE_TEXT);
+        baseline
+            .drift(instructions_of(EDITED_TEXT), EPOCH)
+            .expect(EXPECTED_DRIFT_NOTICE);
+
+        assert_eq!(
+            baseline.drift(instructions_of(OTHER_TEXT), EPOCH + 1),
+            Some(crate::prompt::INSTRUCTIONS_RESTORED_PROMPT.to_owned())
+        );
+        assert_eq!(baseline.text(), OTHER_TEXT);
+    }
+
+    /// Both bodies have to be the same kind, or the generic supersession rule
+    /// has nothing to match the withdrawal against and `standing_notice` keys
+    /// them separately.
+    #[test]
+    fn the_withdrawal_is_the_same_kind_as_the_diff() {
+        assert!(
+            crate::prompt::INSTRUCTIONS_RESTORED_PROMPT
+                .contains(crate::prompt::INSTRUCTIONS_CHANGED_MARKER)
+        );
     }
 
     /// A swap that lands while the files are untouched must not leave the

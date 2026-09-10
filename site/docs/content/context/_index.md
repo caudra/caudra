@@ -111,6 +111,8 @@ Each file arrives in the system prompt wrapped in a tag naming where it came fro
 
 Editing one of these files mid-session takes effect on your next message. The system prompt keeps the text it was built with, because rewriting it would invalidate the whole cached prefix on every save; the change reaches the model as a diff against that text instead. Compaction and `/undo` replace the conversation and have already given up that cache, so they quietly rebuild the system prompt from disk.
 
+Putting a file back the way it was withdraws the diff rather than leaving it standing, as does a compaction that rebuilds the system prompt while a diff is outstanding. Either way the model is told to go back to following the system prompt as written.
+
 Put coding conventions, repo quirks, and off-limits directories in these files. Keep them short; the next section explains why.
 
 ## Four places to put knowledge

@@ -37,6 +37,8 @@ Do not edit files unless the user explicitly asks.
 
 The system prompt is identical in plan and build mode, and carries no working directory, date, or model. All of those are announced in the conversation instead, and re-announced only when they change, so switching mode, crossing midnight, or changing model does not invalidate the prompt cache. Editing an instruction file mid-session is announced the same way, as a diff against the copy the prompt already carries.
 
+Those announcements arrive wrapped in `<system-reminder>`. They are appended to the conversation and never edited, so a kind is restated only when its content changes and earlier blocks of the same kind remain as history. The most recent block of a kind is the only one in force; the system prompt tells the model this, and that a reminder is not the user talking.
+
 ## Control the layout
 
 Set `layout: custom` to compose the full main-agent prompt from dynamic Caudra components:
@@ -69,7 +71,7 @@ Act as a security-focused reviewer. Report findings before summaries.
 | `{{caudra.conventions}}` | Git, security, and plugin conventions |
 | `{{caudra.completion}}` | Completion requirements |
 | `{{caudra.context}}` | Instruction files and plugin runtime context |
-| `{{caudra.plan}}` | How plan and build mode work. Identical in both modes |
+| `{{caudra.plan}}` | The system-reminder contract, and how plan and build mode work. Identical in both modes |
 
 A directive expands only when it occupies a complete line. Prefix it with `\` to keep it literal, for example `\{{caudra.tools}}`.
 

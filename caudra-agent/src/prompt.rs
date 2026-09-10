@@ -29,6 +29,16 @@ pub const PLAN_PROMPT: &str = include_str!("prompts/plan.md");
 pub const BUILD_PROMPT: &str = include_str!("prompts/build.md");
 /// The mode-invariant half, which stays in the system prompt.
 pub const MODES_PROMPT: &str = include_str!("prompts/modes.md");
+/// Standing reminders reach the model as user-role observations, so the tag is
+/// all that separates them from something the user typed.
+pub const REMINDERS_PROMPT: &str = include_str!("prompts/reminders.md");
+/// Both standing sections, in the order they are read: the contract that
+/// governs every reminder, then the mode rules that are its highest-stakes
+/// instance.
+pub const STANDING_PROMPT: &str = concat!(
+    include_str!("prompts/reminders.md"),
+    include_str!("prompts/modes.md"),
+);
 /// Announced for the same reason: the date rolls at midnight and the model
 /// changes when the user switches one.
 pub const ENVIRONMENT_PROMPT: &str = include_str!("prompts/environment.md");
@@ -36,6 +46,9 @@ pub const ENVIRONMENT_MARKER: &str = "# Environment";
 /// Instruction files are snapshotted into the system prompt, so a later edit
 /// arrives as a diff against that snapshot rather than by rebuilding it.
 pub const INSTRUCTIONS_CHANGED_PROMPT: &str = include_str!("prompts/instructions_changed.md");
+/// Withdraws an announced diff once the files match the system prompt again.
+/// Shares the heading, and so the kind, with the diff it supersedes.
+pub const INSTRUCTIONS_RESTORED_PROMPT: &str = include_str!("prompts/instructions_restored.md");
 pub const INSTRUCTIONS_CHANGED_MARKER: &str = "# Instructions changed";
 pub const DIFF_SLOT: &str = "{diff}";
 /// Not a [`Vars`](crate::template::Vars) entry: the model is per-run rather
