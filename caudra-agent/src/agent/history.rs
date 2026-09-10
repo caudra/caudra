@@ -751,7 +751,10 @@ mod tests {
 
         let marker = sanitize_failed_history(&mut history, 1, FAILURE).expect("marker expected");
 
-        assert!(marker.contains(FAILURE), "the marker must name the failure: {marker}");
+        assert!(
+            marker.contains(FAILURE),
+            "the marker must name the failure: {marker}"
+        );
         assert_eq!(history.len(), 4);
         let last = history.as_slice().last().unwrap();
         assert!(matches!(last.role, Role::User));
@@ -796,7 +799,10 @@ mod tests {
 
         let marker = sanitize_failed_history(&mut history, 1, &sprawling).expect("marker expected");
 
-        assert!(!marker.contains('\n'), "the marker must not break the row: {marker}");
+        assert!(
+            !marker.contains('\n'),
+            "the marker must not break the row: {marker}"
+        );
         assert!(marker.chars().count() < sprawling.chars().count());
         assert!(marker.starts_with(RUN_FAILED_PREFIX) && marker.ends_with(RUN_FAILED_SUFFIX));
     }

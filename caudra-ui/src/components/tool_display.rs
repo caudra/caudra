@@ -314,7 +314,11 @@ fn renders_as_markdown(path: &str) -> bool {
     Path::new(path)
         .extension()
         .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| MARKDOWN_EXTENSIONS.iter().any(|md| ext.eq_ignore_ascii_case(md)))
+        .is_some_and(|ext| {
+            MARKDOWN_EXTENSIONS
+                .iter()
+                .any(|md| ext.eq_ignore_ascii_case(md))
+        })
 }
 
 fn same_key(left: &str, right: &str) -> bool {
