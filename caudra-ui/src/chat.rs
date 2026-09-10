@@ -17,8 +17,8 @@ use caudra_agent::permissions::PermissionRequest;
 use caudra_agent::tools::{FILE_WRITE_TOOL_NAME, ToolEffect, ToolInvocation, ToolRegistry};
 use caudra_agent::types::QuestionEvent;
 use caudra_agent::{
-    AgentEvent, BatchToolEntry, BufferSnapshot, Mention, SubagentProgress, ToolDoneEvent,
-    ToolOutput, ToolStartEvent,
+    AgentEvent, BatchToolEntry, BufferSnapshot, COMPACTION_ANCHOR, Mention, SubagentProgress,
+    ToolDoneEvent, ToolOutput, ToolStartEvent,
 };
 use caudra_config::{ToolOutputLines, UiConfig};
 use caudra_lua::WinView;
@@ -33,9 +33,6 @@ use crate::repaint::{Cadence, Dirty};
 pub(crate) const DONE_TEXT: &str = "Done!";
 pub(crate) const ERROR_TEXT: &str = "Error";
 pub(crate) const CANCELLED_TEXT: &str = "Cancelled";
-/// One notice per streak: a wedged model can spend twenty nudges, and twenty
-/// identical bubbles bury the conversation they are about.
-const NUDGE_TEXT: &str = "Model ended turn without a response, nudging...";
 /// The seam a summary replaced turns at. Progress belongs to the status bar's
 /// spinner, so the transcript card marks the border instead of announcing work.
 const COMPACTION_BORDER_TEXT: &str =
@@ -80,6 +77,10 @@ pub struct Chat {
     /// is the handle `caudra.task` addresses a task by, see `app::tasks`.
     task_id: Option<Arc<str>>,
     parent_tool_use_id: Option<Arc<str>>,
+    /// Whether harness-injected messages get a row at all. They always start
+    /// folded, so this is the switch for readers who want the transcript to
+    /// hold nothing but the conversation.
+    show_reminders: bool,
 }
 
 impl Chat {
@@ -96,6 +97,7 @@ impl Chat {
             context_window: 0,
             model_id: None,
             pending_turn_usage: None,
+            show_reminders: ui_config.show_reminders,
             messages_panel: MessagesPanel::new(ui_config, lua_event_handle),
             finish: None,
             task_id: None,
@@ -277,11 +279,15 @@ impl Chat {
                 self.messages_panel
                     .tool_header_snapshot(&id, snapshot, theme_gen);
             }
-            AgentEvent::Nudge => {
-                self.messages_panel.flush();
-                if self.messages_panel.last_message_text() != NUDGE_TEXT {
+            // The continuation itself arrives as `Injected` and carries the
+            // prompt the model was actually sent, which is strictly more than a
+            // fixed line could say.
+            AgentEvent::Nudge => {}
+            AgentEvent::Injected { text } => {
+                if self.show_reminders {
+                    self.messages_panel.flush();
                     self.messages_panel
-                        .push(DisplayMessage::new(DisplayRole::Notice, NUDGE_TEXT.into()));
+                        .push(DisplayMessage::new(DisplayRole::Injected, text));
                 }
             }
             AgentEvent::ToolsLoaded { names } => {
@@ -668,6 +674,7 @@ pub fn history_to_display(
     items: &[HistoryItem],
     tool_outputs: &HashMap<String, Arc<ToolOutput>>,
     tool_output_lines: &ToolOutputLines,
+    show_reminders: bool,
 ) -> (Vec<DisplayMessage>, Vec<caudra_lua::RestoreItem>) {
     let results = build_tool_results_map(items);
     let mut display = Vec::new();
@@ -675,6 +682,22 @@ pub fn history_to_display(
     let mut displayed_user_groups = HashSet::new();
     for item in items {
         match &item.kind {
+            // An injected item is its own row rather than a candidate for the
+            // turn's bubble, so it must not consume the group: a reminder and
+            // the message it precedes can share one.
+            HistoryItemKind::User {
+                origin: UserOrigin::Observation | UserOrigin::Synthetic,
+                text,
+                ..
+            } => {
+                if show_reminders && text != COMPACTION_ANCHOR {
+                    display.push(DisplayMessage::new(DisplayRole::Injected, text.clone()));
+                }
+            }
+            HistoryItemKind::User {
+                origin: UserOrigin::Mention,
+                ..
+            } => {}
             HistoryItemKind::User { .. } => {
                 if displayed_user_groups.insert(item.group_id)
                     && let Some((id, text)) = visible_user_text(items, item.group_id)
@@ -808,7 +831,7 @@ pub fn history_to_display(
                     render_snapshot: None,
                     render_header: None,
                     snapshot_theme_gen: 0,
-                    reasoning_open: None,
+                    body_open: None,
                     thinking_duration: None,
                 });
             }
@@ -1046,6 +1069,7 @@ mod tests {
             &crate::history_items(messages),
             outputs,
             &ToolOutputLines::default(),
+            true,
         )
     }
 
@@ -1054,6 +1078,9 @@ mod tests {
     const TASK_ID: &str = "toolu_01";
     const USER_TEXT: &str = "one more thing";
     const REPLY_TEXT: &str = "on it";
+    const INJECTED_TEXT: &str = "# Environment\n\ncwd: /tmp";
+    const SYNTHETIC_TEXT: &str = "# Goal check-in";
+    const MENTION_BODY: &str = "<file path=\"a.rs\">fn main() {}</file>";
     const INDEX_SKELETON: &str = "fns:\n  pub run() [2]";
     const INDEX_ANNOTATION: &str = "2 lines";
 
@@ -1164,25 +1191,6 @@ mod tests {
     }
 
     #[test]
-    fn history_hides_observations_but_keeps_the_reply() {
-        let msgs = vec![
-            Message::observation("build failed".into()),
-            Message::synthetic("internal nudge".into()),
-            Message {
-                role: Role::Assistant,
-                content: vec![ContentBlock::Text {
-                    text: "I will fix it".into(),
-                }],
-                ..Default::default()
-            },
-        ];
-        let display = display_messages(&msgs, &empty_outputs()).0;
-        assert_eq!(display.len(), 1);
-        assert_eq!(display[0].role, DisplayRole::Assistant);
-        assert_eq!(display[0].text, "I will fix it");
-    }
-
-    #[test]
     fn history_sources_keep_atomic_ids_on_merged_tools() {
         let messages = vec![
             Message::user("do it".into()),
@@ -1210,7 +1218,8 @@ mod tests {
         ];
         let items = crate::history_items(&messages);
 
-        let display = history_to_display(&items, &empty_outputs(), &ToolOutputLines::default()).0;
+        let display =
+            history_to_display(&items, &empty_outputs(), &ToolOutputLines::default(), true).0;
 
         assert_eq!(display[0].source, Some(DisplaySource::User(items[0].id)));
         assert_eq!(
@@ -1604,6 +1613,7 @@ mod tests {
                 }],
                 ..Default::default()
             },
+            Message::synthetic(COMPACTION_ANCHOR.into()),
             summary,
         ];
 
@@ -1615,6 +1625,59 @@ mod tests {
         assert_eq!(display[1].text, COMPACTION_BORDER_TEXT);
         assert_eq!(display[2].role, DisplayRole::Assistant);
         assert_eq!(display[2].text, "## Objective");
+    }
+
+    /// Live, each reminder arrives as its own `Injected` event. A restored
+    /// session replays history instead, so without this the reader loses every
+    /// reminder the moment they reopen the session that received it.
+    #[test]
+    fn history_to_display_replays_injected_messages_except_mentions() {
+        let msgs = vec![
+            Message::observation(INJECTED_TEXT.into()),
+            Message::mention(MENTION_BODY.into()),
+            Message::user(USER_TEXT.into()),
+            Message::synthetic(SYNTHETIC_TEXT.into()),
+        ];
+        let items = crate::history_items(&msgs);
+
+        let display =
+            history_to_display(&items, &empty_outputs(), &ToolOutputLines::default(), true).0;
+
+        let rows: Vec<(&DisplayRole, &str)> = display
+            .iter()
+            .map(|message| (&message.role, message.text.as_str()))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                (&DisplayRole::Injected, INJECTED_TEXT),
+                (&DisplayRole::User, USER_TEXT),
+                (&DisplayRole::Injected, SYNTHETIC_TEXT),
+            ]
+        );
+    }
+
+    #[test]
+    fn history_to_display_drops_injected_messages_when_reminders_are_off() {
+        let msgs = vec![
+            Message::observation(INJECTED_TEXT.into()),
+            Message::synthetic(SYNTHETIC_TEXT.into()),
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: REPLY_TEXT.into(),
+                }],
+                ..Default::default()
+            },
+        ];
+        let items = crate::history_items(&msgs);
+
+        let display =
+            history_to_display(&items, &empty_outputs(), &ToolOutputLines::default(), false).0;
+
+        assert_eq!(display.len(), 1);
+        assert_eq!(display[0].role, DisplayRole::Assistant);
+        assert_eq!(display[0].text, REPLY_TEXT);
     }
 
     #[test]
@@ -1746,24 +1809,29 @@ mod tests {
         assert_eq!(chat.last_message_text(), "new");
     }
 
-    /// A nudge is the harness acting on the user's behalf, so it must not
-    /// arrive wearing the assistant's role: `last_reply_source` reads that
-    /// role to decide what a copy or a review is about.
+    /// `Nudge` only says a continuation is coming; the continuation itself
+    /// follows as `Injected` and carries the prompt that was really sent. A
+    /// bubble on the announcement would double every retry.
     #[test]
-    fn a_nudge_is_a_notice_and_repeats_as_one_bubble() {
+    fn a_nudge_shows_the_continuation_rather_than_an_announcement() {
         let mut chat = chat();
         text_delta(&mut chat, REPLY_TEXT);
 
         chat.handle_event(AgentEvent::Nudge, None);
-        chat.handle_event(AgentEvent::Nudge, None);
+        chat.handle_event(
+            AgentEvent::Injected {
+                text: INJECTED_TEXT.into(),
+            },
+            None,
+        );
 
-        assert_eq!(chat.last_message_text(), NUDGE_TEXT);
-        assert_eq!(chat.last_message_role(), Some(&DisplayRole::Notice));
         assert_eq!(chat.message_count(), 2);
         assert_eq!(
             chat.message_at(0).map(|m| &m.role),
             Some(&DisplayRole::Assistant)
         );
+        assert_eq!(chat.last_message_role(), Some(&DisplayRole::Injected));
+        assert_eq!(chat.last_message_text(), INJECTED_TEXT);
     }
 
     /// The transcript keeps growing after the ending, since the subagent chat

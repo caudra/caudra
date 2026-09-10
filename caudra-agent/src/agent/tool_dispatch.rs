@@ -52,8 +52,7 @@ const DOOM_LOOP_THRESHOLD: usize = 3;
 const MCP_BLOCKED_IN_PLAN: &str = "MCP tools are not available in plan mode";
 const UNKNOWN_TOOL_PREFIX: &str = "unknown tool";
 const TOOL_DISABLED_SUFFIX: &str = "is disabled for the current agent";
-const INVALID_INPUT_MESSAGE: &str =
-    "arguments were not valid JSON, so the tool did not run. Call it again with complete \
+const INVALID_INPUT_MESSAGE: &str = "arguments were not valid JSON, so the tool did not run. Call it again with complete \
      arguments; if the input is large, split it across several calls. Raw text received:";
 const SOURCE_NATIVE: &str = "native";
 const SOURCE_LOCAL: &str = "local";

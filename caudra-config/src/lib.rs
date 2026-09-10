@@ -680,6 +680,7 @@ pub struct UiFileConfig {
     pub typewriter_ms_per_char: Option<u64>,
     pub mouse_scroll_lines: Option<u32>,
     pub show_thinking: Option<bool>,
+    pub show_reminders: Option<bool>,
     pub theme: Option<String>,
     pub theme_light: Option<String>,
     pub clock_format: Option<ClockFormat>,
@@ -703,6 +704,7 @@ impl UiFileConfig {
             typewriter_ms_per_char,
             mouse_scroll_lines,
             show_thinking,
+            show_reminders,
             theme,
             theme_light,
             clock_format,
@@ -1374,6 +1376,12 @@ pub struct UiConfig {
     )]
     pub show_thinking: bool,
 
+    #[config(
+        default = true,
+        desc = "Show the messages Caudra writes into the conversation on your behalf: standing reminders, goal check-ins, nudges, and continuations. Each is one dim row that expands on click to the exact text the model was sent. Turn this off to keep the transcript to the conversation alone"
+    )]
+    pub show_reminders: bool,
+
     #[config(default = ClockFormat::System, ty = "String", default_doc = "system", desc = "Clock format for timestamps: \"12h\", \"24h\", or \"system\" (follow the OS preference, 24h when unknown)")]
     pub clock_format: ClockFormat,
 
@@ -1418,6 +1426,7 @@ impl UiConfig {
             mouse_scroll_lines: f.mouse_scroll_lines.unwrap_or(DEFAULT_MOUSE_SCROLL_LINES),
             max_input_lines: f.max_input_lines.unwrap_or(DEFAULT_MAX_INPUT_LINES),
             show_thinking: f.show_thinking.unwrap_or(true),
+            show_reminders: f.show_reminders.unwrap_or(true),
             clock_format: f.clock_format.unwrap_or_default(),
             update_check: f.update_check.unwrap_or(false),
             theme: f.theme,

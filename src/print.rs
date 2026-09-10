@@ -303,6 +303,7 @@ pub fn run(
             | AgentEvent::ToolHeaderSnapshot { .. }
             | AgentEvent::LiveToolBuf { .. }
             | AgentEvent::Nudge
+            | AgentEvent::Injected { .. }
             | AgentEvent::ToolsLoaded { .. }
             | AgentEvent::PromptProgress { .. } => {}
             AgentEvent::GoalEvaluating { .. } => {}

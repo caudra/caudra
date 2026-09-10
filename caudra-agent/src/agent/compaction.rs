@@ -19,7 +19,10 @@ use crate::nudge::Nudge;
 use crate::{AgentError, AgentEvent, DoneReason, EventSender, TurnCompleteEvent};
 
 const CONTINUE_AFTER_COMPACT: &str = "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed. If the summary contains a todo list, restore it with todo_write and keep it updated. If you learned important project context during this session, consider saving it to memory before it's lost.";
-const COMPACTION_ANCHOR: &str = "What did we do so far?";
+/// The turn the summary answers. It has to be in the history for the roles to
+/// alternate, and the transcript already draws that seam as a border, so the
+/// UI skips it by this exact text rather than drawing it twice.
+pub const COMPACTION_ANCHOR: &str = "What did we do so far?";
 const IMAGE_PLACEHOLDER: &str = "[image]";
 const TOOL_RESULT_PLACEHOLDER: &str = "[tool result]";
 const KEEP_LAST_TOOL_RESULTS: usize = 3;
@@ -252,6 +255,9 @@ pub async fn compact(
     .await?;
     if let Some(post) = normalize(&config.post_compaction_instructions) {
         history.push(Message::synthetic(post.to_string()));
+        event_tx.send(AgentEvent::Injected {
+            text: post.to_string(),
+        })?;
     }
 
     event_tx.send(AgentEvent::Done {

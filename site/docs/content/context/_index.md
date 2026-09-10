@@ -113,7 +113,25 @@ Editing one of these files mid-session takes effect on your next message. The sy
 
 Putting a file back the way it was withdraws the diff rather than leaving it standing, as does a compaction that rebuilds the system prompt while a diff is outstanding. Either way the model is told to go back to following the system prompt as written.
 
-Put coding conventions, repo quirks, and off-limits directories in these files. Keep them short; the next section explains why.
+Put coding conventions, repo quirks, and off-limits directories in these files. Keep them short, for the reason the next section gives.
+
+## What Caudra writes on your behalf
+
+Part of what the model reads was written by Caudra rather than typed by you. These messages carry your role, because that is the only role a provider accepts for them, and each one is wrapped in a `<system-reminder>` tag so the model can tell it apart from something you asked for.
+
+| Injected | Sent |
+|----------|------|
+| Environment | At session start, and again whenever the date, working directory, or model changes |
+| Mode announcement | On the first message after you switch between plan and build |
+| Instruction diff | On the first message after you edit an instruction file, and again to withdraw the diff when you put the file back |
+| Goal check-in | While a goal is running, to report progress against it |
+| Continuation | After a nudge or a compaction, to say what the model should pick up |
+
+None of this lives in the system prompt. Anything that changes during a session would invalidate the cached prefix on every change, so it reaches the model as a message instead, and it is sent only when it differs from the last time Caudra said it.
+
+Each one appears in the transcript as a dim row folded to its heading. Click the row to read the exact text the model was sent, and click again to fold it back. Mentioned file contents are the exception: the model gets them, and the transcript shows the `@path` you typed rather than the body behind it.
+
+Set `ui.show_reminders = false` to keep the transcript to the conversation alone. The messages still reach the model.
 
 ## Four places to put knowledge
 

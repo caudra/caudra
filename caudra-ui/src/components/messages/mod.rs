@@ -62,6 +62,9 @@ use ratatui::text::{Line, Span};
 use tracing::warn;
 
 const THOUGHT_PREFIX: &str = "Thought";
+const INJECTED_FALLBACK_TITLE: &str = "injected message";
+const INJECTED_SEARCH_PREFIX: &str = "injected> ";
+const THINKING_SEARCH_PREFIX: &str = "thinking> ";
 const MILLIS_PER_SECOND: u128 = 1_000;
 const SECONDS_PER_MINUTE: u64 = 60;
 const REFLOW_MARGIN_VIEWPORTS: u32 = 1;
@@ -893,7 +896,7 @@ impl MessagesPanel {
         self.streaming_reasoning_open = None;
         self.auto_open = None;
         for msg in &mut self.messages {
-            msg.reasoning_open = None;
+            msg.body_open = None;
         }
         // Anchor before the cache goes: the modes have wildly different
         // heights, so a raw line offset would land anywhere.
@@ -1075,7 +1078,7 @@ impl MessagesPanel {
 
     pub fn load_messages(&mut self, mut msgs: Vec<DisplayMessage>) {
         for msg in &mut msgs {
-            msg.reasoning_open = None;
+            msg.body_open = None;
         }
         self.dropped_snapshots.clear();
         self.messages = msgs;
@@ -1638,6 +1641,7 @@ impl MessagesPanel {
         self.messages.get(index)
     }
 
+    #[cfg(test)]
     pub fn last_message_text(&self) -> &str {
         self.messages.last().map(|m| m.text.as_str()).unwrap_or("")
     }
@@ -1970,9 +1974,7 @@ impl MessagesPanel {
             return self
                 .messages
                 .get(msg_index)
-                .is_some_and(|message| {
-                    matches!(message.role, DisplayRole::Thinking) && !self.reasoning_open(message)
-                })
+                .is_some_and(|message| Self::has_foldable_body(message) && !self.body_open(message))
                 .then_some(HoverTarget::CachedThinking(msg_index));
         };
 
@@ -2416,8 +2418,19 @@ impl MessagesPanel {
     /// the transcript can summarise in a row, so no view mode closes it: the
     /// modes decide density among tool cards, and `show_thinking` is the only
     /// thing that decides whether reasoning starts open.
-    fn reasoning_open(&self, msg: &DisplayMessage) -> bool {
-        msg.reasoning_open.unwrap_or(self.show_thinking)
+    ///
+    /// An injected message is the other way round. It is reference material
+    /// rather than part of the conversation, so it stays folded to its heading
+    /// until someone asks for it.
+    fn body_open(&self, msg: &DisplayMessage) -> bool {
+        msg.body_open.unwrap_or(match msg.role {
+            DisplayRole::Thinking => self.show_thinking,
+            _ => false,
+        })
+    }
+
+    fn has_foldable_body(msg: &DisplayMessage) -> bool {
+        matches!(msg.role, DisplayRole::Thinking | DisplayRole::Injected)
     }
 
     fn streaming_thinking_collapsed(&self) -> bool {
@@ -2890,7 +2903,7 @@ impl MessagesPanel {
                 SegmentKind::Thinking => {
                     let open = message.map_or_else(
                         || self.streaming_reasoning_open(),
-                        |message| self.reasoning_open(message),
+                        |message| self.body_open(message),
                     );
                     let summary = match message {
                         Some(message) => reasoning_summary(&message.text),
@@ -3247,7 +3260,7 @@ impl MessagesPanel {
         }
         let mut msg =
             DisplayMessage::new(DisplayRole::Thinking, self.streaming_thinking.take_all());
-        msg.reasoning_open = self.streaming_reasoning_open.take();
+        msg.body_open = self.streaming_reasoning_open.take();
         msg.thinking_duration = started.map(|started| started.elapsed());
         self.messages.push(msg);
     }
@@ -3299,6 +3312,22 @@ impl MessagesPanel {
         thought_line(reasoning_summary(text).title, duration, true)
     }
 
+    /// The one row a folded message draws, plus the text search still has to
+    /// match against. Both fold paths read it so a rebuild cannot disagree with
+    /// a reflow about what a closed block looks like.
+    fn folded_lines(&self, msg: &DisplayMessage) -> (Vec<Line<'static>>, String) {
+        match msg.role {
+            DisplayRole::Injected => (
+                injected_line(&msg.text),
+                format!("{INJECTED_SEARCH_PREFIX}{}", msg.text),
+            ),
+            _ => (
+                self.build_cached_thinking_indicator(&msg.text, msg.thinking_duration),
+                format!("{THINKING_SEARCH_PREFIX}{}", msg.text),
+            ),
+        }
+    }
+
     fn try_toggle_collapsed_thinking(&mut self, doc_row: u32, width: u16) -> bool {
         if !self.is_collapsed_streaming_thinking_row(doc_row, width) {
             return false;
@@ -3325,11 +3354,11 @@ impl MessagesPanel {
         let Some(msg) = self.messages.get(idx) else {
             return false;
         };
-        if !matches!(msg.role, DisplayRole::Thinking) {
+        if !Self::has_foldable_body(msg) {
             return false;
         }
-        let open = self.reasoning_open(msg);
-        self.messages[idx].reasoning_open = Some(!open);
+        let open = self.body_open(msg);
+        self.messages[idx].body_open = Some(!open);
         self.rebuild_thinking_segment(idx, width);
         true
     }
@@ -3338,17 +3367,10 @@ impl MessagesPanel {
         let Some(message) = self.messages.get(msg_idx).cloned() else {
             return;
         };
-        let (lines, links, provenance, diagrams, search_text) = if !self.reasoning_open(&message) {
-            let lines =
-                self.build_cached_thinking_indicator(&message.text, message.thinking_duration);
+        let (lines, links, provenance, diagrams, search_text) = if !self.body_open(&message) {
+            let (lines, search_text) = self.folded_lines(&message);
             let links = LinkMap::none_for(&lines);
-            (
-                lines,
-                links,
-                None,
-                Vec::new(),
-                format!("thinking> {}", message.text),
-            )
+            (lines, links, None, Vec::new(), search_text)
         } else {
             let built = build_message_lines(&message, width, self.pans_for(msg_idx));
             (
@@ -3494,13 +3516,11 @@ impl MessagesPanel {
                     self.upsert_instruction_segment(&id, &blocks, last_idx);
                 }
             } else {
-                if matches!(&msg.role, DisplayRole::Thinking) && !self.reasoning_open(msg) {
-                    let (text, duration) = (msg.text.clone(), msg.thinking_duration);
-                    let lines = self.build_cached_thinking_indicator(&text, duration);
-                    let search_text = format!("thinking> {text}");
+                if Self::has_foldable_body(msg) && !self.body_open(msg) {
+                    let (lines, search_text) = self.folded_lines(msg);
                     let mut segment = Segment::with_lines(lines, search_text, Some(i));
                     segment.set_links(LinkMap::none_for(segment.lines()));
-                    segment.set_kind(SegmentKind::Thinking);
+                    segment.set_kind(segment_kind(&msg.role));
                     self.cache.push(segment);
                     continue;
                 }
@@ -3628,7 +3648,7 @@ impl MessagesPanel {
         let collapsed = self
             .messages
             .get(msg_idx)
-            .is_some_and(|m| matches!(m.role, DisplayRole::Thinking) && !self.reasoning_open(m));
+            .is_some_and(|m| Self::has_foldable_body(m) && !self.body_open(m));
         if collapsed {
             // Geometry is width-independent, but `width_changed` also fires on
             // theme changes; rebuild so spans pick up the new palette.
@@ -3685,9 +3705,31 @@ fn same_display_item(left: &DisplayMessage, right: &DisplayMessage) -> bool {
         (DisplayRole::User, DisplayRole::User)
         | (DisplayRole::Assistant, DisplayRole::Assistant)
         | (DisplayRole::Thinking, DisplayRole::Thinking)
-        | (DisplayRole::Notice, DisplayRole::Notice) => left.text == right.text,
+        | (DisplayRole::Notice, DisplayRole::Notice)
+        | (DisplayRole::Injected, DisplayRole::Injected) => left.text == right.text,
         _ => false,
     }
+}
+
+/// The heading an injected block folds to. Each one opens with a `# Heading`
+/// inside a tag, and that heading is the same string the agent keys its
+/// announcements on, so the first line that is neither blank nor a tag titles
+/// the row without needing a table of kinds.
+fn injected_title(text: &str) -> &str {
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('<'))
+        .map(|line| line.trim_start_matches('#').trim())
+        .filter(|line| !line.is_empty())
+        .unwrap_or(INJECTED_FALLBACK_TITLE)
+}
+
+fn injected_line(text: &str) -> Vec<Line<'static>> {
+    let style = notice_style();
+    vec![Line::from(vec![
+        Span::styled(style.prefix, style.prefix_style),
+        Span::styled(injected_title(text).to_owned(), style.text_style),
+    ])]
 }
 
 fn thought_line(title: Option<&str>, duration: Option<Duration>, done: bool) -> Vec<Line<'static>> {
@@ -3748,7 +3790,7 @@ fn segment_kind(role: &DisplayRole) -> SegmentKind {
         DisplayRole::Thinking => SegmentKind::Thinking,
         DisplayRole::Error => SegmentKind::Error,
         DisplayRole::Done => SegmentKind::Done,
-        DisplayRole::Notice => SegmentKind::Assistant,
+        DisplayRole::Notice | DisplayRole::Injected => SegmentKind::Assistant,
         DisplayRole::Tool(_) => SegmentKind::ToolBlock,
     }
 }
@@ -3793,7 +3835,7 @@ fn build_message_lines(msg: &DisplayMessage, width: u16, diagram_pans: Vec<u16>)
         DisplayRole::Thinking => thinking_style(),
         DisplayRole::Error => error_style(),
         DisplayRole::Done => done_style(),
-        DisplayRole::Notice => notice_style(),
+        DisplayRole::Notice | DisplayRole::Injected => notice_style(),
         DisplayRole::Tool(_) => unreachable!(),
     };
     let prefix = if msg.plan_path.is_some() {

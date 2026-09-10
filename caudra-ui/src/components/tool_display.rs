@@ -1671,7 +1671,7 @@ mod tests {
             render_snapshot: None,
             render_header: None,
             snapshot_theme_gen: 0,
-            reasoning_open: None,
+            body_open: None,
             thinking_duration: None,
         }
     }
@@ -1974,7 +1974,7 @@ mod tests {
             render_snapshot: None,
             render_header: None,
             snapshot_theme_gen: 0,
-            reasoning_open: None,
+            body_open: None,
             thinking_duration: None,
         }
     }
@@ -2074,7 +2074,7 @@ mod tests {
             render_snapshot: None,
             render_header: None,
             snapshot_theme_gen: 0,
-            reasoning_open: None,
+            body_open: None,
             thinking_duration: None,
         }
     }
@@ -2168,7 +2168,7 @@ mod tests {
             render_snapshot: Some(snapshot),
             render_header: None,
             snapshot_theme_gen: 0,
-            reasoning_open: None,
+            body_open: None,
             thinking_duration: None,
         }
     }
@@ -2487,7 +2487,7 @@ mod tests {
             render_snapshot: None,
             render_header: None,
             snapshot_theme_gen: 0,
-            reasoning_open: None,
+            body_open: None,
             thinking_duration: None,
         }
     }
@@ -2613,7 +2613,7 @@ mod tests {
             render_snapshot: None,
             render_header: None,
             snapshot_theme_gen: 0,
-            reasoning_open: None,
+            body_open: None,
             thinking_duration: None,
         }
     }
@@ -2907,7 +2907,7 @@ mod tests {
             render_snapshot: Some(snapshot),
             render_header: None,
             snapshot_theme_gen: 0,
-            reasoning_open: None,
+            body_open: None,
             thinking_duration: None,
         };
         let tl = build_tool_lines(
@@ -2951,7 +2951,7 @@ mod tests {
             render_snapshot: Some(snapshot),
             render_header: None,
             snapshot_theme_gen: 0,
-            reasoning_open: None,
+            body_open: None,
             thinking_duration: None,
         };
         let tl = build_tool_lines(

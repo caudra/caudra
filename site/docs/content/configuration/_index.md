@@ -80,6 +80,7 @@ All fields are optional. Typos in field names cause an error right away.
 | `mouse_scroll_lines` | u32 | `3` | - | 1 | Lines per mouse wheel scroll |
 | `max_input_lines` | u32 | `20` | - | 1 | Maximum visible input lines |
 | `show_thinking` | bool | `true` | - | - | Show full model reasoning live and persisted. Turn this off to start every reasoning block collapsed behind a Thinking or Thought header that can be clicked to expand |
+| `show_reminders` | bool | `true` | - | - | Show the messages Caudra writes into the conversation on your behalf: standing reminders, goal check-ins, nudges, and continuations. Each is one dim row that expands on click to the exact text the model was sent. Turn this off to keep the transcript to the conversation alone |
 | `clock_format` | String | `system` | - | - | Clock format for timestamps: "12h", "24h", or "system" (follow the OS preference, 24h when unknown) |
 | `update_check` | bool | `false` | `CAUDRA_ENABLE_UPDATE_CHECK` | - | Ask GitHub for the latest release on startup and show it in the splash. Off by default, so Caudra makes no such request unless you turn this on |
 

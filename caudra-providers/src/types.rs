@@ -265,6 +265,10 @@ pub enum MessageKind {
     /// The host noticed it and passed it to the model. It stays in session
     /// history for conversation order but is hidden from user-facing views.
     Observation,
+    /// A file body pulled in by an `@mention`. Separated from the rest of the
+    /// injected content because the user already sees the path they typed, so
+    /// the transcript has nothing to add by repeating it.
+    Mention,
 }
 
 impl MessageKind {
@@ -405,6 +409,17 @@ impl Message {
             display_text: Some(String::new()),
             ..Default::default()
         }
+    }
+
+    pub fn mention(text: String) -> Self {
+        Self {
+            kind: MessageKind::Mention,
+            ..Self::synthetic(text)
+        }
+    }
+
+    pub fn is_mention(&self) -> bool {
+        self.kind == MessageKind::Mention
     }
 
     pub fn user_text(&self) -> Option<&str> {

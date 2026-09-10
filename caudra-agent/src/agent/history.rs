@@ -9,7 +9,7 @@ use caudra_providers::{
 use caudra_storage::sessions::next_epoch;
 use tracing::warn;
 
-const CANCEL_MARKER: &str = "[Cancelled by user]";
+pub(crate) const CANCEL_MARKER: &str = "[Cancelled by user]";
 pub const UNAVAILABLE_RESULT: &str = "[Tool result not available]";
 
 pub type HistorySnapshot = caudra_storage::sessions::HistorySnapshot<HistoryItem>;
@@ -510,9 +510,11 @@ pub fn close_dangling_tool_calls(messages: &mut Vec<Message>, note: &str) {
     });
 }
 
-pub(crate) fn sanitize_cancelled_history(history: &mut History, rollback_len: usize) {
+/// Reports whether the marker was appended, so the caller can announce the
+/// same row the restored transcript will draw from it.
+pub(crate) fn sanitize_cancelled_history(history: &mut History, rollback_len: usize) -> bool {
     if history.len() <= rollback_len {
-        return;
+        return false;
     }
     let mut tail = history.as_slice().last().cloned().into_iter().collect();
     close_dangling_tool_calls(&mut tail, CANCEL_MARKER);
@@ -522,6 +524,7 @@ pub(crate) fn sanitize_cancelled_history(history: &mut History, rollback_len: us
     }
     additions.push(Message::synthetic(CANCEL_MARKER.into()));
     history.extend(additions);
+    true
 }
 
 #[cfg(test)]
@@ -628,8 +631,12 @@ mod tests {
         expect_cancel_marker: bool,
     ) {
         let mut history = History::new(messages);
-        sanitize_cancelled_history(&mut history, rollback_len);
+        let marked = sanitize_cancelled_history(&mut history, rollback_len);
         assert_eq!(history.len(), expected_len);
+        assert_eq!(
+            marked, expect_cancel_marker,
+            "the report must match the marker, or the live row and the restored one disagree"
+        );
         if expect_cancel_marker {
             assert_ends_with_cancel_marker(&history);
         }

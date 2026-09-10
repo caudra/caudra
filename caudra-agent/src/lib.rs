@@ -17,9 +17,9 @@ pub mod mentions;
 pub use mentions::Mention;
 pub(crate) mod task_set;
 pub use agent::{
-    Agent, AgentParams, AgentRunParams, DEFAULT_GOAL_CONTINUATION_LIMIT, GoalError, GoalHandle,
-    GoalResult, GoalSnapshot, GoalStatus, GoalVerdict, History, HistorySnapshot,
-    InstructionBaseline, Instructions, LoadedInstructions, MAX_GOAL_CHARS,
+    Agent, AgentParams, AgentRunParams, COMPACTION_ANCHOR, DEFAULT_GOAL_CONTINUATION_LIMIT,
+    GoalError, GoalHandle, GoalResult, GoalSnapshot, GoalStatus, GoalVerdict, History,
+    HistorySnapshot, InstructionBaseline, Instructions, LoadedInstructions, MAX_GOAL_CHARS,
     MAX_GOAL_CONTINUATION_LIMIT, SharedHistory, UNAVAILABLE_RESULT, close_dangling_tool_calls,
     find_subdirectory_instructions, goal_checkin_message, goal_kickoff_message,
     is_instruction_file, project_for_provider, project_for_target,

@@ -1209,6 +1209,13 @@ pub enum AgentEvent {
     AuthRequired,
     AuthRestored,
     Nudge,
+    /// A message the harness wrote into the conversation on the user's behalf:
+    /// a standing reminder, a goal check-in, a nudge, a continuation. Reported
+    /// so the transcript can show what was sent rather than only that something
+    /// was. `@mention` file bodies are excluded; the user already sees the path.
+    Injected {
+        text: String,
+    },
     /// Deferred tools moved into the request array. Reported because the user
     /// is paying for it: the tools array changes, so the provider's prompt
     /// cache prefix is invalidated and the next request re-reads the history.

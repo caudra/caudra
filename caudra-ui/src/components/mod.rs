@@ -718,7 +718,7 @@ pub struct DisplayMessage {
     pub snapshot_theme_gen: u64,
     /// What the reader asked of this reasoning block. `None` leaves the
     /// disclosure to the view mode, which is where every card starts.
-    pub reasoning_open: Option<bool>,
+    pub body_open: Option<bool>,
     /// Wall time the model spent on a `Thinking` block. Absent for sessions
     /// written before reasoning was timed.
     pub thinking_duration: Option<Duration>,
@@ -744,7 +744,7 @@ impl DisplayMessage {
             render_snapshot: None,
             render_header: None,
             snapshot_theme_gen: 0,
-            reasoning_open: None,
+            body_open: None,
             thinking_duration: None,
         }
     }
@@ -768,7 +768,7 @@ impl DisplayMessage {
             render_snapshot: None,
             render_header: None,
             snapshot_theme_gen: 0,
-            reasoning_open: None,
+            body_open: None,
             thinking_duration: None,
         }
     }
@@ -835,6 +835,10 @@ pub enum DisplayRole {
     /// Harness chatter: what the run did on the user's behalf, never
     /// something a model or a person said.
     Notice,
+    /// A message the harness wrote into the conversation. Unlike a notice it
+    /// has a body worth reading, so it collapses to its heading and opens on a
+    /// click.
+    Injected,
 }
 
 impl DisplayRole {

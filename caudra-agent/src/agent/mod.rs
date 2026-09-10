@@ -14,7 +14,7 @@ mod tool_preview;
 mod tool_roster;
 
 pub(crate) use compaction::compaction_reserve;
-pub use compaction::{auto_compact_enabled, compact};
+pub use compaction::{COMPACTION_ANCHOR, auto_compact_enabled, compact};
 pub use goal::{
     DEFAULT_GOAL_CONTINUATION_LIMIT, GoalError, GoalHandle, GoalResult, GoalSnapshot, GoalStatus,
     GoalVerdict, MAX_GOAL_CHARS, MAX_GOAL_CONTINUATION_LIMIT, goal_checkin_message,

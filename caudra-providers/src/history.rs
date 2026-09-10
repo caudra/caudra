@@ -104,6 +104,7 @@ pub enum UserOrigin {
     Turn,
     Observation,
     Synthetic,
+    Mention,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -327,12 +328,11 @@ fn validate_history_graph(
 }
 
 fn expand_user_message(message: &Message) -> Vec<HistoryItemKind> {
-    let origin = if message.kind == MessageKind::Observation {
-        UserOrigin::Observation
-    } else if message.display_text.as_deref() == Some("") {
-        UserOrigin::Synthetic
-    } else {
-        UserOrigin::Turn
+    let origin = match message.kind {
+        MessageKind::Observation => UserOrigin::Observation,
+        MessageKind::Mention => UserOrigin::Mention,
+        MessageKind::Turn if message.display_text.as_deref() == Some("") => UserOrigin::Synthetic,
+        MessageKind::Turn => UserOrigin::Turn,
     };
     let has_tool_results = message
         .content
@@ -738,10 +738,11 @@ fn project_group(items: &[HistoryItem]) -> Message {
                 if !has_user_metadata {
                     message.kind = match origin {
                         UserOrigin::Observation => MessageKind::Observation,
+                        UserOrigin::Mention => MessageKind::Mention,
                         UserOrigin::Turn | UserOrigin::Synthetic => MessageKind::Turn,
                     };
                     message.display_text = match origin {
-                        UserOrigin::Synthetic => Some(String::new()),
+                        UserOrigin::Synthetic | UserOrigin::Mention => Some(String::new()),
                         UserOrigin::Turn | UserOrigin::Observation => display_text.clone(),
                     };
                     has_user_metadata = true;
@@ -867,6 +868,8 @@ mod tests {
     const CALL_TWO: &str = "call-two";
     const STORED_OUTPUT: &str = "first\nsecond";
     const TOOL_NAME: &str = "read";
+    const MENTION_TEXT: &str = "<file path=\"a.rs\">fn main() {}</file>";
+    const SYNTHETIC_TEXT: &str = "# Goal check-in";
     const REASONING_DURATION_MS: u64 = 9_700;
 
     fn image(data: &str) -> ImageSource {
@@ -1293,9 +1296,10 @@ mod tests {
             Message::user("turn".into()),
             Message::observation("observation".into()),
             Message::synthetic("synthetic".into()),
+            Message::mention("mention".into()),
             Message::empty_marker(),
         ];
-        let origins: Vec<UserOrigin> = messages[..3]
+        let origins: Vec<UserOrigin> = messages[..4]
             .iter()
             .map(|message| match &expand_message(message, None)[0].kind {
                 HistoryItemKind::User { origin, .. } => *origin,
@@ -1307,16 +1311,42 @@ mod tests {
             [
                 UserOrigin::Turn,
                 UserOrigin::Observation,
-                UserOrigin::Synthetic
+                UserOrigin::Synthetic,
+                UserOrigin::Mention
             ]
         );
         assert!(matches!(
-            expand_message(&messages[3], None)[0].kind,
+            expand_message(&messages[4], None)[0].kind,
             HistoryItemKind::AssistantText {
                 state: AssistantTextState::Padding,
                 ..
             }
         ));
+    }
+
+    /// A restored mention preamble and a restored goal check-in were both
+    /// `synthetic`, so the transcript could not tell the user's own `@file`
+    /// from something the harness wrote. The kind has to survive the round
+    /// trip for the UI to keep suppressing only the former.
+    #[test]
+    fn projection_keeps_a_mention_distinct_from_a_synthetic_message() {
+        let messages = [
+            Message::mention(MENTION_TEXT.into()),
+            Message::synthetic(SYNTHETIC_TEXT.into()),
+        ];
+        let mut items = Vec::new();
+        for message in &messages {
+            append_message(&mut items, message);
+        }
+
+        let projected = project_messages(&items).unwrap();
+
+        assert_eq!(
+            serde_json::to_value(&projected).unwrap(),
+            serde_json::to_value(&messages).unwrap()
+        );
+        assert!(projected[0].is_mention());
+        assert!(!projected[1].is_mention());
     }
 
     #[test]

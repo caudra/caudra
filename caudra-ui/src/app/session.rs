@@ -188,6 +188,7 @@ impl App {
                             &snapshot.messages,
                             self.state.session.tool_outputs(),
                             &self.ui_config.tool_output_lines,
+                            self.ui_config.show_reminders,
                         );
                         self.main_chat().bind_sources(&messages);
                     }
@@ -507,6 +508,7 @@ impl App {
             &active_history,
             self.state.session.tool_outputs(),
             &self.ui_config.tool_output_lines,
+            self.ui_config.show_reminders,
         );
         let mut reachable_subagents = reachable_subagent_ids(
             &active_history,
@@ -699,6 +701,7 @@ impl App {
                 messages,
                 self.state.session.tool_outputs(),
                 &self.ui_config.tool_output_lines,
+                self.ui_config.show_reminders,
             );
             self.chat_index
                 .insert(sa.tool_use_id.clone(), self.chats.len());

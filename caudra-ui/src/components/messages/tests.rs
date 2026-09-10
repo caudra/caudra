@@ -36,6 +36,11 @@ const MENTION_MISSED: &str = "the pointer sat on a mention the panel did not res
 const MENTION_CLAIMED: &str = "a message the reader did not write answered with a mention";
 const MENTION_MARKED_GLYPHS: &str = "a hovered mention repainted the message around it";
 const TOOL_ID: &str = "t1";
+const INJECTED_BODY: &str =
+    "<system-reminder>\n# Environment\n\n- Date: 2026-09-10\n</system-reminder>";
+const INJECTED_HEADING: &str = "Environment";
+const INJECTED_DETAIL: &str = "2026-09-10";
+const REASONING_BODY: &str = "weighing the options";
 
 fn snap_line(text: &str) -> SnapshotLine {
     SnapshotLine {
@@ -1734,7 +1739,7 @@ fn open_thinking_copies_its_visible_markdown_body() {
         DisplayRole::Thinking,
         format!("**Tracing selection**\n\n{BODY}"),
     );
-    thought.reasoning_open = Some(true);
+    thought.body_open = Some(true);
     panel.push(thought);
     panel.push(DisplayMessage::new(
         DisplayRole::Assistant,
@@ -1762,7 +1767,7 @@ fn collapsed_thinking_copies_its_summary_without_hidden_body() {
         DisplayRole::Thinking,
         format!("**Tracing selection**\n\n{HIDDEN}"),
     );
-    thought.reasoning_open = Some(false);
+    thought.body_open = Some(false);
     panel.push(thought);
     panel.push(DisplayMessage::new(
         DisplayRole::Assistant,
@@ -1790,7 +1795,7 @@ fn settled_thinking_does_not_borrow_the_streaming_duration() {
     );
     panel.push(DisplayMessage::new(DisplayRole::User, "Investigate".into()));
     let mut settled = DisplayMessage::new(DisplayRole::Thinking, "**Old trace**".into());
-    settled.reasoning_open = Some(false);
+    settled.body_open = Some(false);
     panel.push(settled);
     panel.thinking_started = Some(Instant::now() - Duration::from_millis(100));
     panel.streaming_thinking.set_buffer("**Live trace**");
@@ -1811,7 +1816,7 @@ fn selected_open_thinking_header_still_marks_a_card_boundary() {
         DisplayRole::Thinking,
         format!("**Tracing selection**\n\n{HIDDEN}"),
     );
-    thought.reasoning_open = Some(true);
+    thought.body_open = Some(true);
     panel.push(thought);
     render(&mut panel, 80, 20);
     let area = Rect::new(0, 0, 80, 20);
@@ -3498,6 +3503,78 @@ fn cached_collapsed_thinking_header_responds_to_hover() {
     assert!(buffer_text(&terminal).contains("Thought"));
 }
 
+/// Reasoning is the model narrating the turn, so it opens with the turn. An
+/// injected message is reference material the harness sent on the user's
+/// behalf, so it has to fold to its heading or it buries the conversation.
+#[test]
+fn an_injected_message_folds_to_its_heading_while_reasoning_opens() {
+    let mut panel = MessagesPanel::new(
+        UiConfig {
+            show_thinking: true,
+            ..UiConfig::default()
+        },
+        EventHandle::disconnected_for_test(),
+    );
+    panel.push(DisplayMessage::new(
+        DisplayRole::Injected,
+        INJECTED_BODY.into(),
+    ));
+    panel.thinking_delta(REASONING_BODY);
+    panel.flush();
+
+    let text = buffer_text(&render(&mut panel, 80, 24));
+
+    assert!(
+        text.contains(INJECTED_HEADING),
+        "the injected row should title itself; got: {text}"
+    );
+    assert!(
+        !text.contains(INJECTED_DETAIL),
+        "the injected body must stay folded; got: {text}"
+    );
+    assert!(
+        text.contains(REASONING_BODY),
+        "reasoning must stay open; got: {text}"
+    );
+}
+
+/// The heading is all the row shows, so a click is the only way to read what
+/// was actually sent, and the only way back.
+#[test]
+fn clicking_an_injected_heading_opens_and_refolds_the_body() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.push(DisplayMessage::new(
+        DisplayRole::Injected,
+        INJECTED_BODY.into(),
+    ));
+    panel.flush();
+    let area = Rect::new(0, 0, 80, 24);
+    rebuild(&mut panel);
+    let folded = panel.segment_heights()[0];
+
+    assert!(panel.handle_click(0, area));
+    assert!(buffer_text(&render(&mut panel, area.width, area.height)).contains(INJECTED_DETAIL));
+
+    assert!(panel.handle_click(0, area));
+    assert_eq!(panel.segment_heights()[0], folded);
+}
+
+#[test]
+fn an_injected_heading_responds_to_hover() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.push(DisplayMessage::new(
+        DisplayRole::Injected,
+        INJECTED_BODY.into(),
+    ));
+    panel.flush();
+    let area = Rect::new(0, 0, 80, 10);
+    render(&mut panel, area.width, area.height);
+
+    panel.update_hover(area.y, area.x, area, false, Path::new(NO_PROJECT));
+
+    assert!(matches!(panel.hover, Some(HoverTarget::CachedThinking(0))));
+}
+
 #[test]
 fn streaming_collapsed_thinking_header_responds_to_hover() {
     let mut panel = MessagesPanel::new(
@@ -3898,7 +3975,7 @@ fn reflow_rebuilds_collapsed_thinking_instead_of_only_stamping() {
         DisplayRole::Thinking,
         "**First title**\n\none\ntwo".to_string(),
     );
-    m.reasoning_open = Some(false);
+    m.body_open = Some(false);
     panel.push(m);
     render(&mut panel, 80, 10);
     assert!(
@@ -4804,7 +4881,7 @@ fn a_thought_takes_air_from_the_rows_around_it(view: ViewMode) {
     panel.tool_start(start("t1", FILE_GREP_TOOL_NAME));
     panel.tool_done(done("t1"));
     let mut thought = DisplayMessage::new(DisplayRole::Thinking, "planning".into());
-    thought.reasoning_open = Some(false);
+    thought.body_open = Some(false);
     panel.push(thought);
     panel.tool_start(start("t2", FILE_GREP_TOOL_NAME));
     panel.tool_done(done("t2"));
@@ -4826,7 +4903,7 @@ fn a_wrapped_row_takes_air_from_the_rows_around_it(view: ViewMode) {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     panel.set_view(view);
     let mut thought = DisplayMessage::new(DisplayRole::Thinking, "planning".into());
-    thought.reasoning_open = Some(false);
+    thought.body_open = Some(false);
     panel.push(thought);
     let mut long = start("t1", FILE_READ_TOOL_NAME);
     long.summary = "a/very/deeply/nested/path/that/has/to/wrap/at/this/width.md".into();
@@ -4903,7 +4980,7 @@ fn a_streaming_thought_takes_the_same_room_as_a_settled_one() {
     let streaming = panel.last_total_lines;
 
     let mut msg = DisplayMessage::new(DisplayRole::Thinking, "weighing options".into());
-    msg.reasoning_open = Some(false);
+    msg.body_open = Some(false);
     panel.streaming_thinking.clear();
     panel.push(msg);
     render(&mut panel, 80, 24);
@@ -5149,7 +5226,7 @@ fn compact_reasoning_reports_its_summary_and_duration() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     panel.set_view(ViewMode::Compact);
     let mut msg = DisplayMessage::new(DisplayRole::Thinking, "**Weighing options**\n\nbody".into());
-    msg.reasoning_open = Some(false);
+    msg.body_open = Some(false);
     msg.thinking_duration = Some(Duration::from_millis(9_700));
     panel.push(msg);
     rebuild(&mut panel);
@@ -5230,7 +5307,7 @@ fn untimed_reasoning_drops_the_duration_suffix() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     panel.set_view(ViewMode::Compact);
     let mut msg = DisplayMessage::new(DisplayRole::Thinking, "just a thought".into());
-    msg.reasoning_open = Some(false);
+    msg.body_open = Some(false);
     panel.push(msg);
     rebuild(&mut panel);
 
@@ -5248,12 +5325,12 @@ fn no_mode_closes_reasoning(view: ViewMode) {
         "reasoning".into(),
     ));
     rebuild(&mut panel);
-    assert!(panel.reasoning_open(&panel.messages[0]), "{MODE_KEEPS_MSG}");
+    assert!(panel.body_open(&panel.messages[0]), "{MODE_KEEPS_MSG}");
 
     panel.set_view(view);
     rebuild(&mut panel);
 
-    assert!(panel.reasoning_open(&panel.messages[0]), "{MODE_KEEPS_MSG}");
+    assert!(panel.body_open(&panel.messages[0]), "{MODE_KEEPS_MSG}");
 }
 
 /// The click is the only way to fold a long block, so it has to work in the
@@ -5272,16 +5349,10 @@ fn a_thought_folds_and_reopens_on_click(view: ViewMode) {
     let area = Rect::new(0, 0, 80, 24);
 
     assert!(panel.handle_click(0, area), "{THOUGHT_FOLD_MSG}");
-    assert!(
-        !panel.reasoning_open(&panel.messages[0]),
-        "{THOUGHT_FOLD_MSG}"
-    );
+    assert!(!panel.body_open(&panel.messages[0]), "{THOUGHT_FOLD_MSG}");
 
     assert!(panel.handle_click(0, area), "{THOUGHT_FOLD_MSG}");
-    assert!(
-        panel.reasoning_open(&panel.messages[0]),
-        "{THOUGHT_FOLD_MSG}"
-    );
+    assert!(panel.body_open(&panel.messages[0]), "{THOUGHT_FOLD_MSG}");
 }
 
 #[test]
@@ -5531,7 +5602,7 @@ fn reasoning_answers_to_the_gate_alone(view: ViewMode, show_thinking: bool, open
     rebuild(&mut panel);
 
     assert_eq!(
-        panel.reasoning_open(&panel.messages[0]),
+        panel.body_open(&panel.messages[0]),
         open,
         "{REASONING_GATE_MSG}"
     );
@@ -5549,14 +5620,8 @@ fn auto_leaves_older_reasoning_open() {
     panel.push(DisplayMessage::new(DisplayRole::Thinking, "second".into()));
     rebuild(&mut panel);
 
-    assert!(
-        panel.reasoning_open(&panel.messages[0]),
-        "{REASONING_TAIL_MSG}"
-    );
-    assert!(
-        panel.reasoning_open(&panel.messages[1]),
-        "{REASONING_TAIL_MSG}"
-    );
+    assert!(panel.body_open(&panel.messages[0]), "{REASONING_TAIL_MSG}");
+    assert!(panel.body_open(&panel.messages[1]), "{REASONING_TAIL_MSG}");
     assert_eq!(panel.segment_heights()[0], open, "{REASONING_TAIL_MSG}");
 }
 

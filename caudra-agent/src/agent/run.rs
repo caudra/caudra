@@ -18,7 +18,7 @@ use super::goal::{
     Evaluator, GoalApply, GoalHandle, GoalStatus, ResolvedEvaluator, continuation_message,
     is_unrecoverable, resolve_evaluator,
 };
-use super::history::{History, repair_tool_pairs, sanitize_cancelled_history};
+use super::history::{CANCEL_MARKER, History, repair_tool_pairs, sanitize_cancelled_history};
 use super::instructions::LoadedInstructions;
 use super::mention_preamble;
 use super::provider_projection;
@@ -406,7 +406,11 @@ impl<'h> Agent<'h> {
         let reason = match result {
             Ok(reason) => reason,
             Err(AgentError::Cancelled) => {
-                sanitize_cancelled_history(self.history, self.rollback_len);
+                if sanitize_cancelled_history(self.history, self.rollback_len) {
+                    let _ = self.event_tx.send(AgentEvent::Injected {
+                        text: CANCEL_MARKER.into(),
+                    });
+                }
                 self.publish_prepared_context();
                 DoneReason::Cancelled
             }
@@ -553,13 +557,28 @@ impl<'h> Agent<'h> {
 
     fn push_input_context(&mut self, preamble: Vec<Message>) {
         for message in preamble {
-            self.history.push(message);
+            self.push_injected(message);
         }
         if let Some(mailbox) = &self.mailbox {
             for message in mailbox.drain() {
-                self.history.push(message);
+                self.push_injected(message);
             }
         }
+    }
+
+    /// Every harness-authored user message goes through here, so the transcript
+    /// can show what was injected rather than only that something was. Mention
+    /// preambles are pushed silently: the user already sees the path they typed,
+    /// and the file body would swamp the rows that carry new information.
+    fn push_injected(&mut self, message: Message) {
+        if !message.is_mention()
+            && let Some(ContentBlock::Text { text }) = message.content.first()
+        {
+            let _ = self
+                .event_tx
+                .send(AgentEvent::Injected { text: text.clone() });
+        }
+        self.history.push(message);
     }
 
     async fn run_loop(&mut self) -> Result<DoneReason, AgentError> {
@@ -1024,7 +1043,7 @@ impl<'h> Agent<'h> {
                     return Ok(TurnOutcome::Done(done_reason));
                 }
                 self.goal_blocks += 1;
-                self.history.push(Message::synthetic(continuation_message(
+                self.push_injected(Message::synthetic(continuation_message(
                     &goal.condition,
                     &reason,
                 )));
@@ -1175,7 +1194,7 @@ impl<'h> Agent<'h> {
             after_tools, "turn ended without a response, nudging model to continue"
         );
         self.event_tx.send(AgentEvent::Nudge)?;
-        self.history.push(Message::synthetic(
+        self.push_injected(Message::synthetic(
             if after_tools {
                 NUDGE_PROMPT
             } else {
@@ -1293,10 +1312,9 @@ impl<'h> Agent<'h> {
         self.goal.record_usage(usage, cost, compact_model.billing);
         self.rollback_len = self.history.len();
         self.event_tx.send(AgentEvent::CompactionDone)?;
-        self.history
-            .push(Message::synthetic(compaction::continue_message(
-                &self.config,
-            )));
+        self.push_injected(Message::synthetic(compaction::continue_message(
+            &self.config,
+        )));
         self.publish_prepared_context();
         Ok(())
     }
@@ -1587,6 +1605,7 @@ mod tests {
     const EXPECTED_ENVIRONMENT_NOTICE: &str = "a changed environment must be announced";
     const INSTRUCTIONS_CHANGED: &str =
         "<system-reminder>\n# Instructions changed\n\n+ be brief\n</system-reminder>";
+    const MENTION_BODY: &str = "<file path=\"a.rs\">fn main() {}</file>";
     const MODEL_UNAVAILABLE: &str = r#"{"error":{"code":"model_not_found","message":"model 'claude-haiku-4-5' not found","param":"model","type":"invalid_request_error"}}"#;
 
     struct MockInterruptSource {
@@ -2889,6 +2908,46 @@ mod tests {
                     .is_some_and(|text| text.contains(crate::prompt::PLAN_MODE_MARKER))
             );
             assert_eq!(history.as_slice()[2].user_text(), Some("hello"));
+        });
+    }
+
+    /// A reminder the user cannot see is a reminder they cannot audit, and the
+    /// mention body is the one injection they already have on screen: the path
+    /// they typed sits directly above it.
+    #[test]
+    fn run_reports_injected_messages_but_not_mention_bodies() {
+        smol::block_on(async {
+            let mut history = History::new(Vec::new());
+            let (mut agent, event_rx) = make_agent(
+                MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+                &mut history,
+            );
+            agent.environment = Some(ENVIRONMENT.to_owned());
+            let mut input = default_input();
+            input.mode = plan_mode();
+            input.preamble = vec![Message::mention(MENTION_BODY.into())];
+
+            agent.run(input).await.unwrap();
+            drop(agent);
+
+            let injected: Vec<String> = drain_events(&event_rx)
+                .into_iter()
+                .filter_map(|envelope| match envelope.event {
+                    AgentEvent::Injected { text } => Some(text),
+                    _ => None,
+                })
+                .collect();
+
+            assert_eq!(injected[0], ENVIRONMENT);
+            assert!(injected[1].contains(crate::prompt::PLAN_MODE_MARKER));
+            assert_eq!(injected.len(), 2);
+            assert!(
+                history
+                    .as_slice()
+                    .iter()
+                    .any(|message| message.first_text_content() == Some(MENTION_BODY)),
+                "the mention body must still reach the model"
+            );
         });
     }
 

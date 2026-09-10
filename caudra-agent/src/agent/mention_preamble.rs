@@ -89,7 +89,7 @@ async fn resolve(mention: &Mention, resolution: &Resolution<'_>, budget: &mut us
         return note(mention, "not inlined: the read returned nothing");
     };
     *budget = budget.saturating_sub(body.len());
-    Message::synthetic(format!("{}\n{body}\n</file>", open_tag(mention)))
+    Message::mention(format!("{}\n{body}\n</file>", open_tag(mention)))
 }
 
 /// An image is handed over as a real image block when the model can see one.
@@ -127,7 +127,7 @@ fn open_tag(mention: &Mention) -> String {
 fn note(mention: &Mention, error: &str) -> Message {
     let open = open_tag(mention);
     let open = open.trim_end_matches('>');
-    Message::synthetic(format!("{open} error=\"{}\" />", error.replace('"', "'")))
+    Message::mention(format!("{open} error=\"{}\" />", error.replace('"', "'")))
 }
 
 fn is_image(path: &Path) -> bool {
