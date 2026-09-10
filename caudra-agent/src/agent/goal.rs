@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -15,7 +16,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use strum::Display;
 
-use super::history::{UNAVAILABLE_RESULT, close_dangling_tool_calls, remove_orphaned_tool_results};
 use super::run::estimate_message_tokens;
 use super::streaming::stream_silent_with_retry;
 use crate::cancel::CancelToken;
@@ -30,6 +30,13 @@ const MAX_EVALUATOR_OUTPUT_BYTES: usize = 64 * 1024;
 const MAX_VALIDATION_ATTEMPTS: u32 = 3;
 const INITIAL_TRANSCRIPT_PERCENT: u32 = 50;
 const RETRY_TRANSCRIPT_PERCENT: u32 = 25;
+const TOOL_CALL_LINE: &str = "[tool call]";
+const TOOL_RESULT_LINE: &str = "[tool result]";
+const TOOL_ERROR_LINE: &str = "[tool error]";
+const UNNAMED_TOOL: &str = "tool";
+const NO_TEXT_ERROR: &str = "evaluator returned no text";
+const OVERSIZE_ERROR: &str = "evaluator response was too large";
+const TOOL_CALL_ERROR: &str = "evaluator attempted to call a tool instead of answering";
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum GoalError {
@@ -490,7 +497,6 @@ impl Evaluator<'_> {
 
         loop {
             let mut messages = transcript_within_budget(self.history, model, percent);
-            close_dangling_tool_calls(&mut messages, UNAVAILABLE_RESULT);
             messages.push(Message::synthetic(evaluator_prompt(
                 self.condition,
                 self.evaluation,
@@ -596,16 +602,61 @@ async fn evaluator_request(
     result
 }
 
+/// Re-containers tool traffic as plain text. Tool output is the evidence the
+/// evaluator judges, so nothing is dropped; the point is that a transcript of
+/// `tool_use` blocks demonstrates tool calling to the one model being asked not
+/// to call tools, and weak models follow the demonstration over the
+/// instruction. It also stops the request contradicting itself, since the
+/// evaluator declares no tools while replaying a conversation full of them.
+///
+/// Message count is preserved, which the omission notice in
+/// [`transcript_within_budget`] counts on, and no tool pair survives for
+/// [`truncate_oldest_round`] to orphan.
+fn flatten_tool_blocks(messages: &mut [Message]) {
+    let names: HashMap<String, String> = messages
+        .iter()
+        .flat_map(|message| message.tool_uses())
+        .map(|(id, name, _)| (id.to_owned(), name.to_owned()))
+        .collect();
+
+    for message in messages {
+        for block in &mut message.content {
+            let text = match block {
+                ContentBlock::ToolUse { name, input, .. } => {
+                    format!("{TOOL_CALL_LINE} {name} {input}")
+                }
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                    ..
+                } => {
+                    let line = if *is_error {
+                        TOOL_ERROR_LINE
+                    } else {
+                        TOOL_RESULT_LINE
+                    };
+                    // Unknown once the owning call is truncated away.
+                    let name = names.get(tool_use_id).map_or(UNNAMED_TOOL, String::as_str);
+                    format!("{line} {name}\n{content}")
+                }
+                _ => continue,
+            };
+            *block = ContentBlock::Text { text };
+        }
+    }
+}
+
 fn transcript_within_budget(history: &[Message], model: &Model, percent: u32) -> Vec<Message> {
     let mut messages = history.to_vec();
+    // Before budgeting, so the estimate measures what is actually sent.
+    flatten_tool_blocks(&mut messages);
     let budget = model.context_window.saturating_mul(percent) / 100;
     // Rescans the whole transcript per iteration. The token counts themselves
     // are cached, so an iteration hashes the transcript rather than tokenizing
     // it, but the walk is still proportional to its size. A running total is
-    // not worth the state here: `truncate_oldest_round` both drains the front
-    // and drops orphaned results from the messages that remain, so the
-    // bookkeeping would have to mirror two removal paths to stay correct, and
-    // this runs once per goal evaluation rather than per turn.
+    // not worth the state here, and this runs once per goal evaluation rather
+    // than per turn.
     while estimate_message_tokens(&messages) > budget && truncate_oldest_round(&mut messages) {}
     let omitted = history.len().saturating_sub(messages.len());
     if omitted > 0 {
@@ -639,7 +690,6 @@ fn truncate_oldest_round(messages: &mut Vec<Message>) -> bool {
     {
         messages.remove(0);
     }
-    remove_orphaned_tool_results(messages);
     true
 }
 
@@ -663,10 +713,11 @@ fn evaluator_prompt(
     prompt
 }
 
+/// A stray tool call beside a real answer is ignored rather than fatal:
+/// [`parse_evaluation`] is the arbiter of the text, and a bad answer reports the
+/// more actionable JSON error. Only a reply that is *nothing but* a tool call
+/// fails, and it names the tool so the retry has something concrete to correct.
 fn response_text(message: &Message) -> Result<String, String> {
-    if message.has_tool_calls() {
-        return Err("evaluator attempted to call a tool".into());
-    }
     let mut output = String::new();
     for block in &message.content {
         if let ContentBlock::Text { text } = block {
@@ -674,10 +725,13 @@ fn response_text(message: &Message) -> Result<String, String> {
         }
     }
     if output.trim().is_empty() {
-        return Err("evaluator returned no text".into());
+        return match message.tool_uses().next() {
+            Some((_, name, _)) => Err(format!("{TOOL_CALL_ERROR} ({name})")),
+            None => Err(NO_TEXT_ERROR.into()),
+        };
     }
     if output.len() > MAX_EVALUATOR_OUTPUT_BYTES {
-        return Err("evaluator response was too large".into());
+        return Err(OVERSIZE_ERROR.into());
     }
     Ok(output)
 }
@@ -780,12 +834,24 @@ pub(crate) fn is_unrecoverable(error: &AgentError) -> bool {
 mod tests {
     use super::*;
     use caudra_providers::provider::BoxFuture;
-    use caudra_providers::{ModelInfo, ProviderEvent, StreamResponse};
+    use caudra_providers::{
+        ImageMediaType, ImageSource, ModelInfo, ProviderEvent, Role, StreamResponse,
+    };
     use serde_json::Value;
+    use test_case::test_case;
 
     const CHAT_SPEC: &str = "anthropic/claude-sonnet-4-20250514";
     const HAIKU_SPEC: &str = "anthropic/claude-haiku-4-5";
     const OPUS_SPEC: &str = "anthropic/claude-opus-4-6-20260101";
+    const CALL_ID: &str = "call_1";
+    const TOOL_NAME: &str = "file_read";
+    const READ_PATH: &str = "src/main.rs";
+    const RESULT_BODY: &str = "fn main() {}";
+    const PROMPT: &str = "ship it";
+    const THOUGHT: &str = "weighing the evidence";
+    const IMAGE_DATA: &str = "aGk=";
+    const ANSWER_JSON: &str = r#"{"ok":true,"reason":"tests pass","impossible":false}"#;
+    const NO_TOOL_BLOCKS: &str = "flattening must leave no tool blocks behind";
 
     struct NullProvider;
 
@@ -1129,5 +1195,176 @@ mod tests {
 
             assert!(matches!(result, Err(AgentError::Cancelled)));
         });
+    }
+
+    fn assistant(content: Vec<ContentBlock>) -> Message {
+        Message {
+            role: Role::Assistant,
+            content,
+            ..Default::default()
+        }
+    }
+
+    fn tool_result(is_error: bool) -> Message {
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: CALL_ID.into(),
+                content: RESULT_BODY.into(),
+                is_error,
+                output_ref: None,
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn tool_call() -> Message {
+        assistant(vec![ContentBlock::tool_use(
+            CALL_ID,
+            TOOL_NAME,
+            json!({ "path": READ_PATH }),
+        )])
+    }
+
+    fn block_text(message: &Message) -> String {
+        message
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn has_tool_blocks(messages: &[Message]) -> bool {
+        messages.iter().any(|message| {
+            message.content.iter().any(|block| {
+                matches!(
+                    block,
+                    ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. }
+                )
+            })
+        })
+    }
+
+    #[test]
+    fn a_flattened_transcript_keeps_its_evidence_and_loses_its_tool_blocks() {
+        let mut messages = vec![
+            Message::user(PROMPT.into()),
+            tool_call(),
+            tool_result(false),
+        ];
+
+        flatten_tool_blocks(&mut messages);
+
+        assert!(!has_tool_blocks(&messages), "{NO_TOOL_BLOCKS}");
+        assert_eq!(messages.len(), 3);
+        let call = block_text(&messages[1]);
+        assert!(
+            call.starts_with(&format!("{TOOL_CALL_LINE} {TOOL_NAME}")),
+            "{call}"
+        );
+        assert!(call.contains(READ_PATH), "{call}");
+        assert!(block_text(&messages[2]).contains(RESULT_BODY));
+    }
+
+    #[test_case(false, TOOL_RESULT_LINE ; "a_result_is_flattened_as_a_result")]
+    #[test_case(true, TOOL_ERROR_LINE ; "an_error_result_stays_marked_as_an_error")]
+    fn a_flattened_result_names_the_tool_that_produced_it(is_error: bool, line: &str) {
+        let mut messages = vec![tool_call(), tool_result(is_error)];
+
+        flatten_tool_blocks(&mut messages);
+
+        let text = block_text(&messages[1]);
+        assert!(text.starts_with(&format!("{line} {TOOL_NAME}")), "{text}");
+    }
+
+    /// The owning call is gone once truncation drains the front of the
+    /// transcript, leaving the result with nothing to name it.
+    #[test]
+    fn an_orphaned_result_flattens_under_a_placeholder_name() {
+        let mut messages = vec![tool_result(false)];
+
+        flatten_tool_blocks(&mut messages);
+
+        let text = block_text(&messages[0]);
+        assert!(
+            text.starts_with(&format!("{TOOL_RESULT_LINE} {UNNAMED_TOOL}")),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn thinking_and_images_survive_flattening() {
+        let mut messages = vec![assistant(vec![
+            ContentBlock::thinking(THOUGHT.into(), None),
+            ContentBlock::Image {
+                source: ImageSource::new(ImageMediaType::Png, IMAGE_DATA.into()),
+            },
+            ContentBlock::tool_use(CALL_ID, TOOL_NAME, json!({})),
+        ])];
+
+        flatten_tool_blocks(&mut messages);
+
+        assert!(matches!(
+            messages[0].content.as_slice(),
+            [
+                ContentBlock::Thinking { .. },
+                ContentBlock::Image { .. },
+                ContentBlock::Text { .. }
+            ]
+        ));
+    }
+
+    #[test]
+    fn the_budgeted_transcript_is_flattened_and_needs_no_placeholder_result() {
+        let history = vec![Message::user(PROMPT.into()), tool_call()];
+
+        let messages = transcript_within_budget(
+            &history,
+            &Model::from_spec(CHAT_SPEC).unwrap(),
+            INITIAL_TRANSCRIPT_PERCENT,
+        );
+
+        assert_eq!(messages.len(), history.len());
+        assert!(!has_tool_blocks(&messages), "{NO_TOOL_BLOCKS}");
+        assert!(
+            !messages
+                .iter()
+                .any(|message| block_text(message).contains(crate::UNAVAILABLE_RESULT)),
+            "a dangling call has nothing left to close"
+        );
+    }
+
+    #[test]
+    fn a_stray_tool_call_does_not_discard_a_valid_answer() {
+        let message = assistant(vec![
+            ContentBlock::Text {
+                text: ANSWER_JSON.into(),
+            },
+            ContentBlock::tool_use(CALL_ID, TOOL_NAME, json!({})),
+        ]);
+
+        let output = response_text(&message).unwrap();
+
+        assert_eq!(parse_evaluation(&output).unwrap().0, GoalVerdict::Met);
+    }
+
+    #[test]
+    fn a_tool_call_with_no_text_names_the_tool_it_tried() {
+        let message = tool_call();
+
+        let error = response_text(&message).unwrap_err();
+
+        assert!(error.starts_with(TOOL_CALL_ERROR), "{error}");
+        assert!(error.contains(TOOL_NAME), "{error}");
+    }
+
+    #[test]
+    fn an_answerless_response_still_reports_no_text() {
+        let message = assistant(vec![ContentBlock::Text { text: "  ".into() }]);
+
+        assert_eq!(response_text(&message).unwrap_err(), NO_TEXT_ERROR);
     }
 }
