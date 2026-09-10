@@ -580,7 +580,7 @@ impl App {
             },
             auto_scroll: chat.auto_scroll(),
             chat_name,
-            back_to_main: render_chat != 0,
+            main_chat,
             retry_info: self.retry_info.as_ref(),
             thinking,
             fast: self.state.fast,
@@ -592,8 +592,7 @@ impl App {
             restoring: self.restoring.load(Ordering::Relaxed),
             snapshotting: self.is_snapshotting(),
             goal: goal.as_ref(),
-            mode_clickable: main_chat && !self.is_bash_input(),
-            settings_clickable: main_chat,
+            bash_input: self.is_bash_input(),
             hovered: (!self.has_modal_overlay())
                 .then_some(self.status_hover)
                 .flatten(),

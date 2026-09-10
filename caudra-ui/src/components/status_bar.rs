@@ -3,6 +3,7 @@ use std::env;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use super::command::ChatScope;
 use super::{RetryInfo, Status, hover_style};
 
 use crate::animation::spinner_frame;
@@ -86,6 +87,24 @@ pub enum StatusBarHitTarget {
     Retry,
 }
 
+impl StatusBarHitTarget {
+    /// Which chat a control acts on, mirroring the [`ChatScope`] of the command
+    /// it opens so the bar cannot refuse a click the palette would accept.
+    ///
+    /// [`Self::Thinking`] is main-only although `/thinking` is [`ChatScope::Any`]:
+    /// the command edits a session setting, while the chip renders and cycles
+    /// the effective level of the session model, which is not the model a task
+    /// runs.
+    pub fn scope(self) -> ChatScope {
+        match self {
+            Self::BackToMain | Self::Context | Self::Usage | Self::Retry => ChatScope::Any,
+            Self::Mode | Self::Model | Self::Thinking | Self::Goal | Self::Workflows => {
+                ChatScope::MainOnly
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StatusBarHit {
     pub area: Rect,
@@ -130,7 +149,7 @@ pub struct StatusBarContext<'a> {
     pub stats: UsageStats,
     pub auto_scroll: bool,
     pub chat_name: Option<&'a str>,
-    pub back_to_main: bool,
+    pub main_chat: bool,
     pub retry_info: Option<&'a RetryInfo>,
     /// The effective level alone (`off`, `xhigh`, `8192`). The bar spells the
     /// word "thinking" in front of it only when it has the columns to spare.
@@ -147,8 +166,9 @@ pub struct StatusBarContext<'a> {
     /// hang.
     pub snapshotting: bool,
     pub goal: Option<&'a GoalSnapshot>,
-    pub mode_clickable: bool,
-    pub settings_clickable: bool,
+    /// The composer is running a shell line, so the chip names bash rather than
+    /// a mode and there is nothing for a click to toggle.
+    pub bash_input: bool,
     pub hovered: Option<StatusBarHitTarget>,
     pub hover_hint: Option<&'a str>,
 }
@@ -310,7 +330,9 @@ impl Fit {
     /// short id, which would let the ladder grow instead of shrink.
     fn model_width(self, ctx: &StatusBarContext<'_>) -> usize {
         let floor = model_floor(ctx);
-        let named = |id: &str| id.width() + usize::from(ctx.settings_clickable) * BRACKET_WIDTH;
+        let named = |id: &str| {
+            id.width() + usize::from(clickable(ctx, StatusBarHitTarget::Model)) * BRACKET_WIDTH
+        };
         match self.model {
             ModelTier::Full => named(ctx.model_id).max(floor),
             ModelTier::Leaf => named(model_leaf(ctx.model_id)).max(floor),
@@ -503,14 +525,14 @@ impl StatusBar {
             mode_label.clone(),
             hover_style(
                 ctx.mode.style,
-                ctx.mode_clickable && ctx.hovered == Some(StatusBarHitTarget::Mode),
+                clickable(ctx, StatusBarHitTarget::Mode)
+                    && ctx.hovered == Some(StatusBarHitTarget::Mode),
             ),
         ));
 
-        let back_offset = ctx
-            .back_to_main
+        let back_offset = (!ctx.main_chat)
             .then(|| left_spans.iter().map(Span::width).sum::<usize>() + " ".width());
-        if ctx.back_to_main {
+        if !ctx.main_chat {
             left_spans.push(Span::raw(" "));
             left_spans.push(Span::styled(
                 BACK_TO_MAIN_LABEL,
@@ -523,10 +545,10 @@ impl StatusBar {
 
         if let Some(name) = ctx.chat_name {
             left_spans.push(Span::styled(
-                if ctx.back_to_main {
-                    format!(" {name}")
-                } else {
+                if ctx.main_chat {
                     format!(" [{name}]")
+                } else {
+                    format!(" {name}")
                 },
                 theme::current().status_dim,
             ));
@@ -552,7 +574,8 @@ impl StatusBar {
                 label,
                 hover_style(
                     theme::current().status_notice,
-                    ctx.settings_clickable && ctx.hovered == Some(StatusBarHitTarget::Goal),
+                    clickable(ctx, StatusBarHitTarget::Goal)
+                        && ctx.hovered == Some(StatusBarHitTarget::Goal),
                 ),
             ));
             (offset, width)
@@ -620,47 +643,40 @@ impl StatusBar {
         let mut hits = Vec::with_capacity(2);
         push_hit(
             &mut hits,
+            ctx,
             left_area,
             mode_offset,
             mode_label.width(),
-            ctx.mode_clickable,
             StatusBarHitTarget::Mode,
         );
         push_hit(
             &mut hits,
+            ctx,
             left_area,
             back_offset.unwrap_or_default(),
             BACK_TO_MAIN_LABEL.width(),
-            ctx.back_to_main,
             StatusBarHitTarget::BackToMain,
         );
         for (target, offset, width) in right_hits {
-            push_hit(
-                &mut hits,
-                right_area,
-                offset,
-                width,
-                ctx.settings_clickable,
-                target,
-            );
+            push_hit(&mut hits, ctx, right_area, offset, width, target);
         }
         if let Some((offset, width)) = goal_hit {
             push_hit(
                 &mut hits,
+                ctx,
                 left_area,
                 offset,
                 width,
-                ctx.settings_clickable,
                 StatusBarHitTarget::Goal,
             );
         }
         if let Some((offset, width)) = retry_hit {
             push_hit(
                 &mut hits,
+                ctx,
                 left_area,
                 offset,
                 width,
-                true,
                 StatusBarHitTarget::Retry,
             );
         }
@@ -717,7 +733,7 @@ fn right_side<'a>(
     let mut chips = Vec::new();
     let mut chip_hits = Vec::new();
     let mut control = |chips: &mut Vec<Span<'a>>, target, text: &str, style| {
-        let hovered = ctx.settings_clickable && ctx.hovered == Some(target);
+        let hovered = clickable(ctx, target) && ctx.hovered == Some(target);
         if let Some(hit) = push_control(chips, text, hover_style(style, hovered)) {
             chip_hits.push((target, hit.0, hit.1));
         }
@@ -734,7 +750,7 @@ fn right_side<'a>(
             &mut chips,
             StatusBarHitTarget::Thinking,
             &label,
-            settings_style(ctx),
+            control_style(ctx, StatusBarHitTarget::Thinking),
         );
     }
     if ctx.fast && fit.fast {
@@ -745,7 +761,7 @@ fn right_side<'a>(
             &mut chips,
             StatusBarHitTarget::Workflows,
             label,
-            theme::current().status_notice,
+            control_style(ctx, StatusBarHitTarget::Workflows),
         );
     }
     if let Some(label) = fit.yolo_label(ctx) {
@@ -782,8 +798,9 @@ fn right_side<'a>(
     spans.push(Span::styled(
         model,
         hover_style(
-            settings_style(ctx),
-            ctx.settings_clickable && ctx.hovered == Some(StatusBarHitTarget::Model),
+            control_style(ctx, StatusBarHitTarget::Model),
+            clickable(ctx, StatusBarHitTarget::Model)
+                && ctx.hovered == Some(StatusBarHitTarget::Model),
         ),
     ));
     spans.append(&mut chips);
@@ -798,8 +815,19 @@ fn right_side<'a>(
     RightSide { spans, hits }
 }
 
-fn settings_style(ctx: &StatusBarContext<'_>) -> Style {
-    if ctx.settings_clickable {
+/// Whether a control answers the pointer in the chat being drawn. Every
+/// enablement question the bar and [`crate::app::App`] ask goes through here,
+/// so the glyphs, the hit rects and the click cannot disagree.
+fn clickable(ctx: &StatusBarContext<'_>, target: StatusBarHitTarget) -> bool {
+    match target {
+        StatusBarHitTarget::BackToMain => !ctx.main_chat,
+        StatusBarHitTarget::Mode => ctx.main_chat && !ctx.bash_input,
+        _ => ctx.main_chat || target.scope() == ChatScope::Any,
+    }
+}
+
+fn control_style(ctx: &StatusBarContext<'_>, target: StatusBarHitTarget) -> Style {
+    if clickable(ctx, target) {
         theme::current().status_notice
     } else {
         theme::current().status_dim
@@ -807,7 +835,7 @@ fn settings_style(ctx: &StatusBarContext<'_>) -> Style {
 }
 
 fn model_floor(ctx: &StatusBarContext<'_>) -> usize {
-    if ctx.settings_clickable {
+    if clickable(ctx, StatusBarHitTarget::Model) {
         CLICKABLE_MODEL_FLOOR
     } else {
         PLAIN_MODEL_FLOOR
@@ -819,7 +847,7 @@ fn model_text<'a>(ctx: &'a StatusBarContext<'_>, tier: ModelTier, budget: usize)
         ModelTier::Full => ctx.model_id,
         ModelTier::Leaf | ModelTier::Chopped => model_leaf(ctx.model_id),
     };
-    if ctx.settings_clickable {
+    if clickable(ctx, StatusBarHitTarget::Model) {
         bracketed_tail(id, budget)
     } else {
         truncate_tail(id, budget)
@@ -859,10 +887,10 @@ fn status_areas(area: Rect, right_spans: &[Span<'_>]) -> [Rect; 2] {
 
 fn push_hit(
     hits: &mut Vec<StatusBarHit>,
+    ctx: &StatusBarContext<'_>,
     area: Rect,
     offset: usize,
     width: usize,
-    enabled: bool,
     target: StatusBarHitTarget,
 ) {
     let (Ok(offset), Ok(width)) = (u16::try_from(offset), u16::try_from(width)) else {
@@ -871,7 +899,11 @@ fn push_hit(
     let Some(x) = area.x.checked_add(offset) else {
         return;
     };
-    if enabled && area.height > 0 && width > 0 && x.saturating_add(width) <= area.right() {
+    if clickable(ctx, target)
+        && area.height > 0
+        && width > 0
+        && x.saturating_add(width) <= area.right()
+    {
         hits.push(StatusBarHit {
             area: Rect::new(x, area.y, width, 1),
             target,
@@ -1062,6 +1094,7 @@ mod tests {
         retry_info: Option<&'a RetryInfo>,
         snapshotting: bool,
         workflows: Option<String>,
+        main_chat: bool,
     }
 
     impl Default for Fixture<'_> {
@@ -1077,6 +1110,7 @@ mod tests {
                 retry_info: None,
                 snapshotting: false,
                 workflows: None,
+                main_chat: true,
             }
         }
     }
@@ -1093,6 +1127,7 @@ mod tests {
             retry_info,
             snapshotting,
             workflows,
+            main_chat,
         } = fixture;
         let bar = StatusBar::new(FLASH_TTL);
         let mut terminal =
@@ -1116,7 +1151,7 @@ mod tests {
             },
             auto_scroll: true,
             chat_name: None,
-            back_to_main: false,
+            main_chat,
             retry_info,
             thinking: Some(THINKING_LEVEL.into()),
             fast: false,
@@ -1125,8 +1160,7 @@ mod tests {
             restoring: false,
             snapshotting,
             goal,
-            mode_clickable: true,
-            settings_clickable: true,
+            bash_input: false,
             hovered,
             hover_hint,
         };
@@ -1175,7 +1209,7 @@ mod tests {
             },
             auto_scroll: true,
             chat_name: None,
-            back_to_main: false,
+            main_chat: true,
             retry_info: None,
             thinking: Some(LADDER_THINKING.into()),
             fast: true,
@@ -1184,8 +1218,7 @@ mod tests {
             restoring: false,
             snapshotting: false,
             goal: None,
-            mode_clickable: true,
-            settings_clickable: true,
+            bash_input: false,
             hovered: None,
             hover_hint: None,
         };
@@ -1822,5 +1855,81 @@ mod tests {
             hits.iter()
                 .all(|hit| hit.target != StatusBarHitTarget::Retry)
         );
+    }
+
+    const ALL_CONTROLS: [StatusBarHitTarget; 9] = [
+        StatusBarHitTarget::BackToMain,
+        StatusBarHitTarget::Mode,
+        StatusBarHitTarget::Model,
+        StatusBarHitTarget::Thinking,
+        StatusBarHitTarget::Goal,
+        StatusBarHitTarget::Context,
+        StatusBarHitTarget::Usage,
+        StatusBarHitTarget::Workflows,
+        StatusBarHitTarget::Retry,
+    ];
+    const TASK_CONTROLS: [StatusBarHitTarget; 4] = [
+        StatusBarHitTarget::BackToMain,
+        StatusBarHitTarget::Context,
+        StatusBarHitTarget::Usage,
+        StatusBarHitTarget::Retry,
+    ];
+    const TASK_HIT_MSG: &str = "a task's bar offers exactly the controls a task owns";
+    /// Wide enough that every chip survives the ladder, so a control missing
+    /// from the hits is one the scope refused rather than one the width dropped.
+    const TASK_BAR_WIDTH: u16 = 200;
+
+    /// A task's bar still draws the session's model, reasoning level, workflow
+    /// count and goal, because they describe the run the task belongs to. Only
+    /// the controls that read the transcript in front of you, or leave it,
+    /// answer the pointer.
+    #[test]
+    fn a_task_bar_offers_only_the_controls_a_task_owns() {
+        let goal = active_goal();
+        let retry = RetryInfo {
+            attempt: RETRY_ATTEMPT,
+            message: RETRY_MESSAGE.into(),
+            deadline: Instant::now() + RETRY_REMAINING,
+        };
+        let (_, hits, _) = render_at(Fixture {
+            width: TASK_BAR_WIDTH,
+            main_chat: false,
+            goal: Some(&goal),
+            retry_info: Some(&retry),
+            workflows: workflow_chip(LADDER_WORKFLOWS_ACTIVE, LADDER_WORKFLOWS_WAITING),
+            ..Default::default()
+        });
+
+        for target in ALL_CONTROLS {
+            assert_eq!(
+                hits.iter().any(|hit| hit.target == target),
+                TASK_CONTROLS.contains(&target),
+                "{TASK_HIT_MSG}: {target:?}"
+            );
+        }
+    }
+
+    /// Every control that opens a command carries that command's scope, so the
+    /// bar cannot refuse a click the palette accepts. `Mode`, `BackToMain`,
+    /// `Retry` and `Thinking` are absent because their click runs no command.
+    const SCOPED_COMMANDS: [(StatusBarHitTarget, &str); 5] = [
+        (StatusBarHitTarget::Model, "/model"),
+        (StatusBarHitTarget::Goal, "/goal"),
+        (StatusBarHitTarget::Context, "/context"),
+        (StatusBarHitTarget::Usage, "/usage"),
+        (StatusBarHitTarget::Workflows, "/workflows"),
+    ];
+    const SCOPE_DRIFT_MSG: &str = "a control and its command must agree on which chat they act on";
+    const UNKNOWN_COMMAND_MSG: &str = "a control names a command the builtin table does not have";
+
+    #[test]
+    fn every_control_shares_the_scope_of_the_command_it_opens() {
+        for (target, name) in SCOPED_COMMANDS {
+            let command = crate::components::command::BUILTIN_COMMANDS
+                .iter()
+                .find(|builtin| builtin.name == name)
+                .expect(UNKNOWN_COMMAND_MSG);
+            assert_eq!(target.scope(), command.scope, "{SCOPE_DRIFT_MSG}: {name}");
+        }
     }
 }

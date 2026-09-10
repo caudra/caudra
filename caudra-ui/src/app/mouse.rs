@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 use crate::agent::AgentCommand;
 use crate::clipboard::CopyResult;
 use crate::components::Overlay;
+use crate::components::command::ChatScope;
 use crate::components::input::InputHit;
 use crate::components::permission_prompt::PromptMouse;
 use crate::components::queue_panel::{QueueAction, QueueHit, QueueHitTarget};
@@ -785,40 +786,41 @@ impl App {
             .copied()
     }
 
+    /// The scope table is the bar's, so a control the bar drew inert cannot be
+    /// activated by a click landing on a hit rect from an earlier frame.
     fn handle_status_click(&mut self, hit: StatusBarHit) -> Vec<crate::components::Action> {
+        if hit.target.scope() == ChatScope::MainOnly && !self.is_main_chat() {
+            return Vec::new();
+        }
         match hit.target {
             StatusBarHitTarget::BackToMain if !self.is_main_chat() => {
                 let _ = self.focus_task(MAIN_TASK_ID);
                 Vec::new()
             }
-            StatusBarHitTarget::Mode if self.is_main_chat() && !self.is_bash_input() => {
-                self.toggle_mode()
-            }
-            StatusBarHitTarget::Model if self.is_main_chat() => {
+            StatusBarHitTarget::Mode if !self.is_bash_input() => self.toggle_mode(),
+            StatusBarHitTarget::Model => {
                 self.clear_control_hovers();
                 self.run_builtin(caudra_lua::BuiltinAction::ModelPicker)
             }
-            StatusBarHitTarget::Thinking
-                if self.is_main_chat() && self.state.model.supports_thinking() =>
-            {
+            StatusBarHitTarget::Thinking if self.state.model.supports_thinking() => {
                 self.cycle_reasoning_effort();
                 Vec::new()
             }
-            StatusBarHitTarget::Goal if self.is_main_chat() => {
+            StatusBarHitTarget::Goal => {
                 self.clear_control_hovers();
                 self.goal_modal.open();
                 Vec::new()
             }
-            StatusBarHitTarget::Context if self.is_main_chat() => {
+            StatusBarHitTarget::Context => {
                 self.clear_control_hovers();
                 self.execute_context("");
                 Vec::new()
             }
-            StatusBarHitTarget::Usage if self.is_main_chat() => {
+            StatusBarHitTarget::Usage => {
                 self.clear_control_hovers();
                 self.toggle_usage_modal()
             }
-            StatusBarHitTarget::Workflows if self.is_main_chat() => {
+            StatusBarHitTarget::Workflows => {
                 self.clear_control_hovers();
                 self.execute_workflow("")
             }

@@ -4404,18 +4404,58 @@ fn clicking_status_thinking_cycles_from_visible_off_state() {
     assert_eq!(app.state.thinking, ThinkingConfig::Effort("minimal".into()));
 }
 
-#[test]
-fn status_controls_are_read_only_in_subagent_chat() {
+/// A focused task whose own turn has been billed, so the spend figure it owns
+/// is drawn and can be clicked.
+fn priced_subagent_app() -> App {
     let mut app = app_with_subagent();
-    app.state.goal.set(GOAL_CONDITION).unwrap();
+    app.chats[1].cost = SUB_COST;
     app.focus_task(TASK_ID).unwrap();
+    app
+}
+
+/// The session's model, reasoning level and goal stay on a task's bar for
+/// reference, but a click on them would move state the task does not own.
+#[test_case(StatusBarHitTarget::Mode  ; "mode")]
+#[test_case(StatusBarHitTarget::Model ; "model")]
+#[test_case(StatusBarHitTarget::Goal  ; "goal")]
+fn session_controls_are_read_only_in_subagent_chat(target: StatusBarHitTarget) {
+    let mut app = priced_subagent_app();
+    app.state.goal.set(GOAL_CONDITION).unwrap();
 
     assert!(rendered(&mut app).contains(GOAL_CHIP_PREFIX));
-    assert!(
-        app.status_hits
-            .iter()
-            .all(|hit| hit.target == StatusBarHitTarget::BackToMain)
+    assert!(app.status_hits.iter().all(|hit| hit.target != target));
+}
+
+/// `/context` reports the transcript in front of you, and its snapshot is the
+/// task's, so the figure that abbreviates it has to open the same view rather
+/// than sending the reader back to Main to type the command.
+#[test]
+fn clicking_the_context_figure_in_a_task_opens_that_task_context() {
+    let mut app = priced_subagent_app();
+    let store = ContextStore::new();
+    let main = store.publisher(ContextKey::Main);
+    main.publish(current_context_snapshot(&app));
+    main.for_task(TASK_ID)
+        .publish(context_snapshot(TASK_CONTEXT_SPEC, CHAT_CONTEXT_WINDOW));
+    app.context_store = Some(store);
+
+    assert!(click_status(&mut app, StatusBarHitTarget::Context).is_empty());
+
+    assert!(app.context_modal.is_open());
+    assert_eq!(
+        app.context_snapshot.get().unwrap().model.spec,
+        TASK_CONTEXT_SPEC
     );
+}
+
+#[test]
+fn clicking_the_spend_figure_in_a_task_opens_usage() {
+    let mut app = priced_subagent_app();
+
+    let actions = click_status(&mut app, StatusBarHitTarget::Usage);
+
+    assert!(app.usage_modal.is_open());
+    assert!(matches!(&actions[..], [Action::RefreshUsage]));
 }
 
 #[test]
