@@ -191,7 +191,7 @@ impl FilePickerModal {
             _ if key::SCROLL_HALF_UP.matches(key) => {
                 move_selection(s, -((s.viewport_height / 2).max(1) as isize))
             }
-            _ if key::SCROLL_HALF_DOWN.matches(key) => {
+            _ if key::PAGE_DOWN.matches(key) => {
                 move_selection(s, (s.viewport_height / 2).max(1) as isize)
             }
             _ if key::SCROLL_LINE_UP.matches(key) => move_selection(s, -1),

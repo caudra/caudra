@@ -478,6 +478,7 @@ impl App {
         self.task_hint_hit = Rect::ZERO;
         self.task_hint_mouse_down = false;
         self.task_hint_hover = false;
+        self.key_focus = super::KeyFocus::Composer;
         self.recoverable_queue.clear();
         self.recoverable_queue_together = false;
         self.close_all_overlays();

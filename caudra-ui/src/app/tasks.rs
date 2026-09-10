@@ -127,10 +127,8 @@ impl App {
     /// are looked up by id, never by position and never through `chat_index`,
     /// a routing cache wiped at the end of every turn.
     pub(crate) fn focus_task(&mut self, id: &str) -> Result<(), String> {
-        self.cancel_queue_edit();
-        self.unfocus_active_queue();
+        self.leave_active_chat();
         self.task_queue_viewport = 0;
-        self.chats[self.active_chat].clear_hover();
         self.active_chat = if id == MAIN_TASK_ID {
             0
         } else {
@@ -140,6 +138,16 @@ impl App {
                 .ok_or_else(|| format!("{UNKNOWN_TASK_ERR}{id}"))?
         };
         Ok(())
+    }
+
+    /// Bookkeeping every chat switch shares: an edit in flight, a queue
+    /// selection and a hover all belong to the chat being left, and the
+    /// navigation keys go back to the composer with it.
+    pub(super) fn leave_active_chat(&mut self) {
+        self.cancel_queue_edit();
+        self.unfocus_active_queue();
+        self.chats[self.active_chat].clear_hover();
+        self.key_focus = super::KeyFocus::Composer;
     }
 }
 

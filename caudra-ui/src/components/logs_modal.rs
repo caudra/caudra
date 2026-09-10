@@ -291,16 +291,11 @@ impl LogsModal {
             KeyCode::Down => self.move_cursor(1),
             KeyCode::PageUp => self.move_cursor(-self.half_page()),
             KeyCode::PageDown => self.move_cursor(self.half_page()),
-            _ if key::SCROLL_HALF_UP.matches(event) || key::SCROLL_HALF_UP_ALT.matches(event) => {
-                self.move_cursor(-self.half_page());
-            }
-            _ if key::SCROLL_HALF_DOWN.matches(event) => self.move_cursor(self.half_page()),
+            _ if key::SCROLL_HALF_UP.matches(event) => self.move_cursor(-self.half_page()),
             _ if key::SCROLL_LINE_UP.matches(event) => self.move_cursor(-1),
             _ if key::SCROLL_LINE_DOWN.matches(event) => self.move_cursor(1),
-            _ if key::SCROLL_TOP.matches(event) || key::SCROLL_TOP_ALT.matches(event) => {
-                self.move_cursor(-(MIN_OVERSCAN as isize));
-            }
-            _ if key::SCROLL_BOTTOM.matches(event) || key::SCROLL_BOTTOM_ALT.matches(event) => {
+            _ if key::SCROLL_TOP.matches(event) => self.move_cursor(-(MIN_OVERSCAN as isize)),
+            _ if key::SCROLL_BOTTOM.matches(event) || key::DOC_BOTTOM.matches(event) => {
                 self.reload();
             }
             _ => {}

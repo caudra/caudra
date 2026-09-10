@@ -435,21 +435,17 @@ impl ModalScroll {
         match key_event.code {
             KeyCode::Up => self.scroll(1),
             KeyCode::Down => self.scroll(-1),
-            _ if key::SCROLL_HALF_UP.matches(key_event)
-                || key::SCROLL_HALF_UP_ALT.matches(key_event) =>
-            {
+            _ if key::SCROLL_HALF_UP.matches(key_event) || key::PAGE_UP.matches(key_event) => {
                 self.scroll(self.half_page())
             }
-            _ if key::SCROLL_HALF_DOWN.matches(key_event) => self.scroll(-self.half_page()),
+            _ if key::PAGE_DOWN.matches(key_event) => self.scroll(-self.half_page()),
             _ if key::SCROLL_LINE_UP.matches(key_event) => self.scroll(1),
             _ if key::SCROLL_LINE_DOWN.matches(key_event) => self.scroll(-1),
-            _ if key::SCROLL_TOP.matches(key_event) || key::SCROLL_TOP_ALT.matches(key_event) => {
+            _ if key::SCROLL_TOP.matches(key_event) || key::DOC_TOP.matches(key_event) => {
                 self.offset = 0;
                 self.auto_scroll = false;
             }
-            _ if key::SCROLL_BOTTOM.matches(key_event)
-                || key::SCROLL_BOTTOM_ALT.matches(key_event) =>
-            {
+            _ if key::SCROLL_BOTTOM.matches(key_event) || key::DOC_BOTTOM.matches(key_event) => {
                 self.auto_scroll = true;
                 self.offset = self.max_offset;
             }
@@ -1025,10 +1021,10 @@ mod tests {
     }
 
     /// Modals answer the same navigation keys as the transcript.
-    #[test_case(keybindings::key::SCROLL_TOP_ALT.to_key_event(),     0                                  ; "ctrl_home")]
-    #[test_case(keybindings::key::SCROLL_BOTTOM_ALT.to_key_event(),  MODAL_MAX_OFFSET                   ; "ctrl_end")]
-    #[test_case(keybindings::key::SCROLL_HALF_UP_ALT.to_key_event(), MODAL_MAX_OFFSET - MODAL_HALF_PAGE ; "page_up")]
-    #[test_case(keybindings::key::SCROLL_HALF_DOWN.to_key_event(),   MODAL_MAX_OFFSET                   ; "page_down")]
+    #[test_case(keybindings::key::DOC_TOP.to_key_event(),    0                                  ; "home")]
+    #[test_case(keybindings::key::DOC_BOTTOM.to_key_event(), MODAL_MAX_OFFSET                   ; "end")]
+    #[test_case(keybindings::key::PAGE_UP.to_key_event(),    MODAL_MAX_OFFSET - MODAL_HALF_PAGE ; "page_up")]
+    #[test_case(keybindings::key::PAGE_DOWN.to_key_event(),  MODAL_MAX_OFFSET                   ; "page_down")]
     fn modal_scroll_navigation_keys(key_event: KeyEvent, expected: u16) {
         let mut scroll = ModalScroll::new();
         scroll.update_dimensions(MODAL_TOTAL, MODAL_VIEWPORT);
@@ -1044,7 +1040,7 @@ mod tests {
         scroll.update_dimensions(MODAL_TOTAL, MODAL_VIEWPORT);
         assert_eq!(scroll.offset(), 0);
 
-        assert!(scroll.handle_key(keybindings::key::SCROLL_BOTTOM_ALT.to_key_event()));
+        assert!(scroll.handle_key(keybindings::key::DOC_BOTTOM.to_key_event()));
         assert_eq!(scroll.offset(), MODAL_MAX_OFFSET);
         scroll.reset();
         scroll.update_dimensions(MODAL_TOTAL, MODAL_VIEWPORT);
@@ -1058,7 +1054,7 @@ mod tests {
         scroll.update_dimensions(MODAL_TOTAL, MODAL_VIEWPORT);
         assert_eq!(scroll.offset(), MODAL_MAX_OFFSET);
 
-        assert!(scroll.handle_key(keybindings::key::SCROLL_TOP_ALT.to_key_event()));
+        assert!(scroll.handle_key(keybindings::key::DOC_TOP.to_key_event()));
         assert_eq!(scroll.offset(), 0);
         scroll.reset();
         scroll.update_dimensions(MODAL_TOTAL, MODAL_VIEWPORT);

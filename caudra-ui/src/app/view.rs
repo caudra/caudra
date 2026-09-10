@@ -321,7 +321,7 @@ impl App {
                         Placeholder::Steer
                     },
                     self.separator_style(),
-                    !self.any_overlay_open(),
+                    self.composer_holds_keys(),
                     None,
                 );
                 self.command_palette.view(frame, layout.input_area);
@@ -390,7 +390,7 @@ impl App {
                 layout.input_area,
                 placeholder,
                 self.separator_style(),
-                !self.any_overlay_open(),
+                self.composer_holds_keys(),
                 panel_hint,
             );
             self.command_palette.view(frame, layout.input_area);
@@ -613,11 +613,7 @@ impl App {
             zone: SelectionZone::Messages,
         });
 
-        if layout.input_area.height > 0
-            && !layout.bottom_takeover
-            && (self.is_main_chat()
-                || self.active_subagent_can_steer()
-                || self.queue_editor_active())
+        if layout.input_area.height > 0 && !layout.bottom_takeover && self.composer_is_interactive()
         {
             let input_inner = input::content_area(layout.input_area);
             self.zones.push(SelectableZone {

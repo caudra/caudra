@@ -665,6 +665,18 @@ impl InputBox {
         self.follow_cursor = false;
     }
 
+    /// Pages a draft too tall for its viewport, and reports whether it claimed
+    /// the key. A draft that fits leaves the navigation keys to the transcript
+    /// rather than eating them to do nothing.
+    pub fn page(&mut self, up: bool) -> bool {
+        if self.max_scroll() == 0 {
+            return false;
+        }
+        let half = (self.last_content_height / 2).max(1) as i32;
+        self.scroll(if up { half } else { -half });
+        true
+    }
+
     /// Move the text cursor to the position corresponding to a mouse click at
     /// the terminal coordinates (row, col) within the input content area.
     pub fn handle_click(

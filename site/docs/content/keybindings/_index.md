@@ -11,6 +11,12 @@ group = "Reference"
 
 Leader chords are written as two keys below, and every one of them is reachable on any terminal: Caudra ships no `Alt` defaults, because macOS routes Option through the input method and never reports it as Alt.
 
+## Focus
+
+`PageUp`, `PageDown`, `Home`, and `End` act on whatever holds the keyboard. While you are typing they belong to the composer, so `Home` and `End` move the text cursor and the page keys scroll a draft too tall to fit. When the draft fits, a page key scrolls the transcript and hands it the focus, so `Home` and `End` then reach the top and bottom of the chat.
+
+Typing anything takes the focus back, and so does `Esc`. Clicking the transcript gives it the focus, and clicking the composer returns it. The wheel scrolls whatever the pointer is over and leaves the focus where it is. `Ctrl+U`, `Ctrl+Y`, `Ctrl+E`, `Ctrl+G`, and `Ctrl+B` scroll the transcript wherever the focus sits, and an open modal claims all four navigation keys for itself.
+
 ## General
 
 | Key | Action |
@@ -50,13 +56,13 @@ Leader chords are written as two keys below, and every one of them is reachable 
 | `Ctrl+Del` | Delete word forward |
 | `Ctrl+K` | Delete to end of line |
 | `Ctrl+A` | Jump to start of line |
-| `Home` / `End` | Jump to start/end of line |
-| `Ctrl+U` / `PageUp` | Scroll half page up |
-| `PageDown` | Scroll half page down |
+| `Home` / `End` | Start / end of line or transcript |
+| `PageUp` / `PageDown` | Page the draft or the transcript |
+| `Ctrl+U` | Scroll half page up |
 | `Shift+Left` / `Shift+Right` | Pan a wide diagram left / right |
 | `Ctrl+E` | Jump to end of line |
-| `Ctrl+G` / `Ctrl+Home` | Scroll to top |
-| `Ctrl+B` / `Ctrl+End` | Scroll to bottom |
+| `Ctrl+G` | Scroll to top |
+| `Ctrl+B` | Scroll to bottom |
 | `Ctrl+Q` / `Ctrl+X q` | Pop queue |
 | `Esc Esc` | Rewind |
 | `Ctrl+X e` | Edit input in external editor |

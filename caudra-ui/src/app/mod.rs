@@ -262,6 +262,16 @@ pub enum Msg {
     Agent(Box<Envelope>),
 }
 
+/// Who `PageUp`, `PageDown`, `Home` and `End` act on once no overlay has
+/// claimed them. Everything else keeps reaching the composer, and any key that
+/// does hands the focus straight back, so the transcript can never hold the
+/// keyboard hostage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyFocus {
+    Composer,
+    Transcript,
+}
+
 pub struct App {
     pub(super) chats: Vec<Chat>,
     pub(super) active_chat: usize,
@@ -344,6 +354,7 @@ pub struct App {
     pub(super) message_action_mouse_down: Option<MessageActionTarget>,
     pub(super) link_mouse_down: Option<Arc<str>>,
     pub(super) mention_mouse_down: Option<Mention>,
+    pub(super) key_focus: KeyFocus,
     pub status: Status,
     pub(crate) state: session_state::SessionState,
     pub exit_request: ExitRequest,
@@ -542,6 +553,7 @@ impl App {
             message_action_mouse_down: None,
             link_mouse_down: None,
             mention_mouse_down: None,
+            key_focus: KeyFocus::Composer,
             status: Status::Idle,
             state,
             exit_request: ExitRequest::None,
@@ -1205,6 +1217,15 @@ impl App {
         if self.scroll_transcript(key) {
             return Some(vec![]);
         }
+        // Reading is the only thing Esc backs out of here, so it never reaches
+        // the rewind it would otherwise arm.
+        if key.code == KeyCode::Esc
+            && self.key_focus == KeyFocus::Transcript
+            && self.composer_is_interactive()
+        {
+            self.key_focus = KeyFocus::Composer;
+            return Some(vec![]);
+        }
         // Only claimed when a diagram actually moves, so the binding stays
         // out of the way in a transcript that has none.
         for (bind, delta) in [(key::PAN_LEFT, -PAN_STEP), (key::PAN_RIGHT, PAN_STEP)] {
@@ -1218,21 +1239,64 @@ impl App {
     /// Keys that only move the transcript. A form waiting on an answer hands
     /// these through so the chat behind it can still be read, which is why
     /// they live apart from the rest of the global binds.
+    ///
+    /// The Ctrl binds are unconditional. The four bare navigation keys are
+    /// left to the composer while it holds the focus, and taking them is what
+    /// hands the focus over, so a reader never has to arm a mode first.
     fn scroll_transcript(&mut self, key: KeyEvent) -> bool {
-        if key::SCROLL_HALF_UP.matches(key) || key::SCROLL_HALF_UP_ALT.matches(key) {
+        let composer_owns = self.nav_owner() == KeyFocus::Composer;
+        if key::SCROLL_HALF_UP.matches(key) {
             let half = self.chats[self.active_chat].half_page();
             self.active_chat().scroll(half);
-        } else if key::SCROLL_HALF_DOWN.matches(key) {
-            let half = self.chats[self.active_chat].half_page();
-            self.active_chat().scroll(-half);
-        } else if key::SCROLL_TOP.matches(key) || key::SCROLL_TOP_ALT.matches(key) {
+        } else if key::SCROLL_TOP.matches(key) {
             self.active_chat().scroll_to_top();
-        } else if key::SCROLL_BOTTOM.matches(key) || key::SCROLL_BOTTOM_ALT.matches(key) {
+        } else if key::SCROLL_BOTTOM.matches(key) {
+            self.active_chat().enable_auto_scroll();
+        } else if key::PAGE_UP.matches(key) || key::PAGE_DOWN.matches(key) {
+            let up = key::PAGE_UP.matches(key);
+            if composer_owns && self.active_input_box_mut().page(up) {
+                return true;
+            }
+            let half = self.chats[self.active_chat].half_page();
+            self.active_chat().scroll(if up { half } else { -half });
+            self.key_focus = KeyFocus::Transcript;
+        } else if key::DOC_TOP.matches(key) && !composer_owns {
+            self.active_chat().scroll_to_top();
+        } else if key::DOC_BOTTOM.matches(key) && !composer_owns {
             self.active_chat().enable_auto_scroll();
         } else {
             return false;
         }
         true
+    }
+
+    /// The composer is on screen and taking keys. The same condition gates the
+    /// `Input` zone in `register_zones`, so a click and a key agree on where
+    /// the keyboard is.
+    pub(super) fn composer_is_interactive(&self) -> bool {
+        !self.plan_form_active()
+            && !self.question_form.is_open()
+            && (self.is_main_chat()
+                || self.active_subagent_can_steer()
+                || self.queue_editor_active())
+    }
+
+    /// Whether the composer is the thing taking keys, which is what draws its
+    /// cursor block and what hit testing has to assume that block occupies.
+    /// An open overlay takes the keyboard outright; a transcript that has been
+    /// handed the navigation keys takes only those, but the block goes with
+    /// them because it is the one sign of where they land.
+    pub(super) fn composer_holds_keys(&self) -> bool {
+        !self.any_overlay_open() && self.key_focus == KeyFocus::Composer
+    }
+
+    /// Who the four bare navigation keys act on. With no composer drawn there
+    /// is nothing to compete with the transcript, whatever the focus says.
+    fn nav_owner(&self) -> KeyFocus {
+        match self.key_focus == KeyFocus::Composer && self.composer_is_interactive() {
+            true => KeyFocus::Composer,
+            false => KeyFocus::Transcript,
+        }
     }
 
     fn dispatch_overlay(&mut self, key: KeyEvent) -> Option<Vec<Action>> {
@@ -1929,15 +1993,11 @@ impl App {
                 self.pop_active_queue();
             }
             BuiltinAction::PrevChat => {
-                self.cancel_queue_edit();
-                self.unfocus_active_queue();
-                self.chats[self.active_chat].clear_hover();
+                self.leave_active_chat();
                 self.active_chat = self.active_chat.saturating_sub(1);
             }
             BuiltinAction::NextChat => {
-                self.cancel_queue_edit();
-                self.unfocus_active_queue();
-                self.chats[self.active_chat].clear_hover();
+                self.leave_active_chat();
                 self.active_chat = (self.active_chat + 1).min(self.chats.len() - 1);
             }
             BuiltinAction::ModelPicker => {
@@ -2049,6 +2109,10 @@ impl App {
         if let Some(actions) = self.handle_global_key(key) {
             return actions;
         }
+
+        // Anything the transcript did not claim is on its way to the composer,
+        // so the navigation keys go back with it.
+        self.key_focus = KeyFocus::Composer;
 
         if key::THINKING.matches(key) || is_shift_tab(key) {
             self.cycle_reasoning_effort();
@@ -4262,6 +4326,7 @@ impl App {
         {
             return;
         }
+        self.key_focus = KeyFocus::Composer;
         if let InputAction::PaletteSync(val) = self.active_input_box_mut().handle_paste(text) {
             self.sync_dropdowns(&val);
         }

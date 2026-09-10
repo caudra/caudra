@@ -15,8 +15,8 @@ use std::path::PathBuf;
 
 use crate::repaint::Dirty;
 
-use super::App;
 use super::tasks::MAIN_TASK_ID;
+use super::{App, KeyFocus};
 
 pub(super) const EDGE_SCROLL_LINES: i32 = 1;
 pub(super) const EDGE_SCROLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -334,6 +334,14 @@ impl App {
                     if self.has_modal_overlay() && zone.zone != SelectionZone::Overlay {
                         return Vec::new();
                     }
+                    // The second way the transcript takes the navigation keys.
+                    // The wheel deliberately stays out of it: scrolling past
+                    // something must not disarm Home in a half-typed draft.
+                    match zone.zone {
+                        SelectionZone::Input => self.key_focus = KeyFocus::Composer,
+                        SelectionZone::Messages => self.key_focus = KeyFocus::Transcript,
+                        SelectionZone::Overlay => {}
+                    }
                     if zone.zone == SelectionZone::Messages
                         && self.is_main_chat()
                         && !self.has_modal_overlay()
@@ -345,7 +353,7 @@ impl App {
                     }
                     // Move the cursor to the click position in the input area.
                     if zone.zone == SelectionZone::Input {
-                        let focused = !self.any_overlay_open();
+                        let focused = self.composer_holds_keys();
                         let hit = self.active_input_box_mut().handle_click(
                             zone.area,
                             event.row,
@@ -1004,7 +1012,7 @@ impl App {
         self.input_box.clear_hover();
         self.subagent_input_box.clear_hover();
         if let Some(area) = input_area {
-            let focused = !self.any_overlay_open();
+            let focused = self.composer_holds_keys();
             self.active_input_box_mut()
                 .update_hover(area, row, col, focused);
         }

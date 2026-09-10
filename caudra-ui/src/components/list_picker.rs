@@ -545,10 +545,6 @@ impl<T: PickerItem> ListPicker<T> {
             s.page_up();
             return PickerAction::Consumed;
         }
-        if key::SCROLL_HALF_DOWN.matches(key) {
-            s.page_down();
-            return PickerAction::Consumed;
-        }
         match key.code {
             KeyCode::Up => {
                 s.move_up();
@@ -1212,13 +1208,13 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_d_and_ctrl_u_page_like_page_keys() {
+    fn ctrl_u_pages_like_the_page_keys() {
         let items: Vec<Entry> = (0..50).map(|i| Entry::new(&format!("Item {i}"))).collect();
         let mut p = ListPicker::new();
         p.open(items, " Test ");
         ready_state_mut(&mut p).viewport_height = 10;
 
-        p.handle_key(key::SCROLL_HALF_DOWN.to_key_event());
+        p.handle_key(key::PAGE_DOWN.to_key_event());
         assert_eq!(ready_state(&p).selected, 10);
 
         p.handle_key(key::SCROLL_HALF_UP.to_key_event());

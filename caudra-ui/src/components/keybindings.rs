@@ -167,16 +167,6 @@ pub mod key {
     };
     pub const COMMAND_PALETTE: Bind = ctrl_bind!('p');
     pub const SCROLL_HALF_UP: Bind = ctrl_bind!('u');
-    pub const SCROLL_HALF_UP_ALT: Bind = Bind {
-        code: KeyCode::PageUp,
-        modifiers: KeyModifiers::NONE,
-        label: "PageUp",
-    };
-    pub const SCROLL_HALF_DOWN: Bind = Bind {
-        code: KeyCode::PageDown,
-        modifiers: KeyModifiers::NONE,
-        label: "PageDown",
-    };
     /// Shift is the only free arrow modifier: plain, Ctrl, Alt and Super all
     /// move the input cursor, and neither text buffer inspects Shift.
     pub const PAN_LEFT: Bind = Bind {
@@ -193,17 +183,30 @@ pub mod key {
     pub const SCROLL_LINE_DOWN: Bind = ctrl_bind!('e');
     pub const SCROLL_TOP: Bind = ctrl_bind!('g');
     pub const SCROLL_BOTTOM: Bind = ctrl_bind!('b');
-    /// Ctrl is the only free Home/End modifier: bare Home/End move the input
-    /// cursor to the start/end of the line.
-    pub const SCROLL_TOP_ALT: Bind = Bind {
-        code: KeyCode::Home,
-        modifiers: KeyModifiers::CONTROL,
-        label: "Ctrl+Home",
+
+    /// The four keys whose target is whatever holds the keyboard: the composer
+    /// while it is being typed in, the transcript once it has taken focus, and
+    /// a modal outright while one is open. Every other scroll bind above acts
+    /// on the transcript no matter where the focus sits.
+    pub const PAGE_UP: Bind = Bind {
+        code: KeyCode::PageUp,
+        modifiers: KeyModifiers::NONE,
+        label: "PageUp",
     };
-    pub const SCROLL_BOTTOM_ALT: Bind = Bind {
+    pub const PAGE_DOWN: Bind = Bind {
+        code: KeyCode::PageDown,
+        modifiers: KeyModifiers::NONE,
+        label: "PageDown",
+    };
+    pub const DOC_TOP: Bind = Bind {
+        code: KeyCode::Home,
+        modifiers: KeyModifiers::NONE,
+        label: "Home",
+    };
+    pub const DOC_BOTTOM: Bind = Bind {
         code: KeyCode::End,
-        modifiers: KeyModifiers::CONTROL,
-        label: "Ctrl+End",
+        modifiers: KeyModifiers::NONE,
+        label: "End",
     };
     pub const POP_QUEUE: Bind = ctrl_bind!('q');
     pub const DELETE_WORD: Bind = ctrl_bind!('w');
@@ -631,20 +634,20 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::All,
     },
     Keybind {
-        label: KeyLabel::Alt("Home", "End"),
-        description: "Jump to start/end of line",
+        label: KeyLabel::Alt(key::DOC_TOP.label, key::DOC_BOTTOM.label),
+        description: "Start / end of line or transcript",
         context: KeybindContext::Editing,
         platform: Platform::All,
     },
     Keybind {
-        label: KeyLabel::Multi(&[key::SCROLL_HALF_UP.label, key::SCROLL_HALF_UP_ALT.label]),
+        label: KeyLabel::Alt(key::PAGE_UP.label, key::PAGE_DOWN.label),
+        description: "Page the draft or the transcript",
+        context: KeybindContext::Editing,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(key::SCROLL_HALF_UP.label),
         description: "Scroll half page up",
-        context: KeybindContext::Editing,
-        platform: Platform::All,
-    },
-    Keybind {
-        label: KeyLabel::Single(key::SCROLL_HALF_DOWN.label),
-        description: "Scroll half page down",
         context: KeybindContext::Editing,
         platform: Platform::All,
     },
@@ -661,13 +664,13 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::All,
     },
     Keybind {
-        label: KeyLabel::Multi(&[key::SCROLL_TOP.label, key::SCROLL_TOP_ALT.label]),
+        label: KeyLabel::Single(key::SCROLL_TOP.label),
         description: "Scroll to top",
         context: KeybindContext::Editing,
         platform: Platform::All,
     },
     Keybind {
-        label: KeyLabel::Multi(&[key::SCROLL_BOTTOM.label, key::SCROLL_BOTTOM_ALT.label]),
+        label: KeyLabel::Single(key::SCROLL_BOTTOM.label),
         description: "Scroll to bottom",
         context: KeybindContext::Editing,
         platform: Platform::All,
@@ -883,7 +886,7 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::All,
     },
     Keybind {
-        label: KeyLabel::Alt("PageUp", "PageDown"),
+        label: KeyLabel::Alt(key::PAGE_UP.label, key::PAGE_DOWN.label),
         description: "Scroll page up / down",
         context: KeybindContext::Picker,
         platform: Platform::All,

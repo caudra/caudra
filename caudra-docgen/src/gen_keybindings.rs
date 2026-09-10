@@ -73,6 +73,27 @@ fn write_leader(out: &mut String) {
     );
 }
 
+fn write_focus(out: &mut String) {
+    out.push_str("\n## Focus\n\n");
+    out.push_str(
+        "`PageUp`, `PageDown`, `Home`, and `End` act on whatever holds the \
+         keyboard. While you are typing they belong to the composer, so \
+         `Home` and `End` move the text cursor and the page keys scroll a \
+         draft too tall to fit. When the draft fits, a page key scrolls the \
+         transcript and hands it the focus, so `Home` and `End` then reach \
+         the top and bottom of the chat.\n\n",
+    );
+    out.push_str(
+        "Typing anything takes the focus back, and so does `Esc`. Clicking \
+         the transcript gives it the focus, and clicking the composer \
+         returns it. The wheel scrolls whatever the pointer is over and \
+         leaves the focus where it is. `Ctrl+U`, `Ctrl+Y`, `Ctrl+E`, \
+         `Ctrl+G`, and `Ctrl+B` scroll the transcript wherever the focus \
+         sits, and an open modal claims all four navigation keys for \
+         itself.\n",
+    );
+}
+
 fn write_context_specific(out: &mut String) {
     let child_binds: Vec<_> = KEYBINDS
         .iter()
@@ -132,6 +153,7 @@ pub fn generate() -> String {
     let mut out = String::from(FRONTMATTER);
     out.push_str("\n\n# Keybindings\n\n");
     write_leader(&mut out);
+    write_focus(&mut out);
 
     for &ctx in MAIN_CONTEXTS {
         write_section(&mut out, ctx);

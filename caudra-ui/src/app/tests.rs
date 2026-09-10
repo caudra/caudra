@@ -2770,10 +2770,10 @@ fn cancelling_from_inside_a_subagent_reports_error() {
 const OVERLAY_BLOCKED_KEYS: &[KeyEvent] = &[
     kb::EXIT.to_key_event(),
     kb::SCROLL_HALF_UP.to_key_event(),
-    kb::SCROLL_HALF_UP_ALT.to_key_event(),
-    kb::SCROLL_HALF_DOWN.to_key_event(),
-    kb::SCROLL_TOP_ALT.to_key_event(),
-    kb::SCROLL_BOTTOM_ALT.to_key_event(),
+    kb::PAGE_UP.to_key_event(),
+    kb::PAGE_DOWN.to_key_event(),
+    kb::DOC_TOP.to_key_event(),
+    kb::DOC_BOTTOM.to_key_event(),
     kb::HELP.to_key_event(),
 ];
 
@@ -2997,6 +2997,36 @@ const TRANSCRIPT_AREA: Rect = Rect {
     height: 20,
 };
 
+const FOCUS_KEPT: &str = "the composer still holds the navigation keys";
+const FOCUS_TAKEN: &str = "the transcript holds the navigation keys";
+const NAV_KEYS_ARE_BARE: &str = "a modifier would put the key back out of the composer's reach";
+const TRANSCRIPT_STILL: &str = "the draft claimed the key, so the transcript stayed put";
+const DRAFT_OVERFLOWS: &str = "the draft has to outgrow the composer for the page keys to matter";
+const DRAFT_PAGED: &str = "the page key moved the draft";
+/// Taller than any composer the test terminal can give a draft.
+const TALL_DRAFT_LINES: usize = 20;
+
+/// The area a zone occupies once the app has actually drawn it.
+fn rendered_zone(app: &mut App, zone: SelectionZone) -> Rect {
+    let _ = rendered(app);
+    app.zones.find(zone).expect("zone was not drawn").area
+}
+
+/// A transcript long enough to scroll, drawn once so it has a viewport.
+fn fill_transcript(app: &mut App) {
+    for i in 0..TRANSCRIPT_LINES {
+        app.active_chat()
+            .push(DisplayMessage::new(DisplayRole::User, format!("line {i}")));
+    }
+    let backend = ratatui::backend::TestBackend::new(TRANSCRIPT_AREA.width, TRANSCRIPT_AREA.height);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| {
+            app.active_chat().view(frame, TRANSCRIPT_AREA, false, false);
+        })
+        .unwrap();
+}
+
 fn main_chat_app() -> App {
     test_app()
 }
@@ -3030,42 +3060,52 @@ fn steerable_task_app() -> App {
 #[test_case(steerable_task_app           ; "steerable_task")]
 fn transcript_scroll_keys_reach_every_chat(build: fn() -> App) {
     let mut app = build();
-    for i in 0..TRANSCRIPT_LINES {
-        app.active_chat()
-            .push(DisplayMessage::new(DisplayRole::User, format!("line {i}")));
-    }
-    let backend = ratatui::backend::TestBackend::new(TRANSCRIPT_AREA.width, TRANSCRIPT_AREA.height);
-    let mut terminal = ratatui::Terminal::new(backend).unwrap();
-    terminal
-        .draw(|frame| {
-            app.active_chat().view(frame, TRANSCRIPT_AREA, false, false);
-        })
-        .unwrap();
+    fill_transcript(&mut app);
     let half = app.active_chat().half_page() as u16;
 
-    app.update(Msg::Key(kb::SCROLL_TOP_ALT.to_key_event()));
-    assert_eq!(app.active_chat().scroll_top(), 0, "Ctrl+Home");
-    assert!(
-        !app.chats[app.active_chat].auto_scroll(),
-        "Ctrl+Home must unpin"
-    );
+    // The first page press is what hands a composer-owning chat its focus.
+    app.update(Msg::Key(kb::PAGE_UP.to_key_event()));
+    app.update(Msg::Key(kb::DOC_TOP.to_key_event()));
+    assert_eq!(app.active_chat().scroll_top(), 0, "Home");
+    assert!(!app.chats[app.active_chat].auto_scroll(), "Home must unpin");
 
-    app.update(Msg::Key(kb::SCROLL_HALF_DOWN.to_key_event()));
+    app.update(Msg::Key(kb::PAGE_DOWN.to_key_event()));
     assert_eq!(app.active_chat().scroll_top(), half, "PageDown");
 
-    app.update(Msg::Key(kb::SCROLL_HALF_UP_ALT.to_key_event()));
+    app.update(Msg::Key(kb::PAGE_UP.to_key_event()));
     assert_eq!(app.active_chat().scroll_top(), 0, "PageUp");
 
-    app.update(Msg::Key(kb::SCROLL_BOTTOM_ALT.to_key_event()));
-    assert!(app.chats[app.active_chat].auto_scroll(), "Ctrl+End");
+    app.update(Msg::Key(kb::DOC_BOTTOM.to_key_event()));
+    assert!(app.chats[app.active_chat].auto_scroll(), "End");
+}
+
+/// The Ctrl binds answer wherever the focus sits, so a full draft never has to
+/// give the keyboard up to reach the top of the chat.
+#[test]
+fn ctrl_scroll_binds_ignore_the_focus() {
+    let mut app = main_chat_app();
+    fill_transcript(&mut app);
+    app.update(Msg::Key(key(KeyCode::Char('a'))));
+    assert_eq!(app.key_focus, KeyFocus::Composer);
+
+    app.update(Msg::Key(kb::SCROLL_TOP.to_key_event()));
+    assert_eq!(app.active_chat().scroll_top(), 0);
+    assert_eq!(app.key_focus, KeyFocus::Composer, "{FOCUS_KEPT}");
+
+    app.update(Msg::Key(kb::SCROLL_BOTTOM.to_key_event()));
+    assert!(app.chats[0].auto_scroll());
+    assert_eq!(app.key_focus, KeyFocus::Composer, "{FOCUS_KEPT}");
 }
 
 #[test]
 fn transcript_scroll_binds_use_the_navigation_keys() {
-    assert_eq!(kb::SCROLL_HALF_UP_ALT.code, KeyCode::PageUp);
-    assert_eq!(kb::SCROLL_HALF_DOWN.code, KeyCode::PageDown);
-    assert_eq!(kb::SCROLL_TOP_ALT.code, KeyCode::Home);
-    assert_eq!(kb::SCROLL_BOTTOM_ALT.code, KeyCode::End);
+    assert_eq!(kb::PAGE_UP.code, KeyCode::PageUp);
+    assert_eq!(kb::PAGE_DOWN.code, KeyCode::PageDown);
+    assert_eq!(kb::DOC_TOP.code, KeyCode::Home);
+    assert_eq!(kb::DOC_BOTTOM.code, KeyCode::End);
+    for bind in [kb::PAGE_UP, kb::PAGE_DOWN, kb::DOC_TOP, kb::DOC_BOTTOM] {
+        assert_eq!(bind.modifiers, KeyModifiers::NONE, "{NAV_KEYS_ARE_BARE}");
+    }
 }
 
 const QUESTION_TEXT: &str = "Which one?";
@@ -3106,15 +3146,15 @@ fn the_transcript_scrolls_by_key_while_a_question_is_open() {
     app.active_chat().enable_auto_scroll();
     let half = app.active_chat().half_page() as u16;
 
-    app.update(Msg::Key(kb::SCROLL_TOP_ALT.to_key_event()));
-    assert_eq!(app.active_chat().scroll_top(), 0, "Ctrl+Home");
-    assert!(!app.chats[0].auto_scroll(), "Ctrl+Home must unpin");
+    app.update(Msg::Key(kb::DOC_TOP.to_key_event()));
+    assert_eq!(app.active_chat().scroll_top(), 0, "Home");
+    assert!(!app.chats[0].auto_scroll(), "Home must unpin");
 
-    app.update(Msg::Key(kb::SCROLL_HALF_DOWN.to_key_event()));
+    app.update(Msg::Key(kb::PAGE_DOWN.to_key_event()));
     assert_eq!(app.active_chat().scroll_top(), half, "PageDown");
 
-    app.update(Msg::Key(kb::SCROLL_BOTTOM_ALT.to_key_event()));
-    assert!(app.chats[0].auto_scroll(), "Ctrl+End");
+    app.update(Msg::Key(kb::DOC_BOTTOM.to_key_event()));
+    assert!(app.chats[0].auto_scroll(), "End");
     assert!(app.question_form.is_open(), "and the question still stands");
 }
 
@@ -3271,8 +3311,8 @@ fn the_question_form_docks_between_the_transcript_and_the_status_bar() {
     );
 }
 
-/// Ctrl is what promotes Home/End to transcript navigation; bare presses stay
-/// on the input cursor.
+/// Home and End cannot be taken from a draft by anything but a deliberate page
+/// press or a click, so typing never has to wonder where they will land.
 #[test]
 fn bare_home_and_end_keep_moving_the_input_cursor() {
     let mut app = test_app();
@@ -3287,6 +3327,125 @@ fn bare_home_and_end_keep_moving_the_input_cursor() {
     app.update(Msg::Key(key(KeyCode::End)));
     app.update(Msg::Key(key(KeyCode::Char('?'))));
     assert_eq!(app.input_box.buffer.value(), "!abc?");
+}
+
+/// The round trip the whole design rests on: one page press hands the keys
+/// over, and one keystroke of typing hands them back.
+#[test]
+fn paging_hands_the_navigation_keys_over_and_typing_takes_them_back() {
+    let mut app = main_chat_app();
+    fill_transcript(&mut app);
+    for c in "abc".chars() {
+        app.update(Msg::Key(key(KeyCode::Char(c))));
+    }
+    app.active_chat().enable_auto_scroll();
+
+    app.update(Msg::Key(kb::PAGE_UP.to_key_event()));
+    assert_eq!(app.key_focus, KeyFocus::Transcript, "{FOCUS_TAKEN}");
+    assert!(!app.chats[0].auto_scroll());
+
+    app.update(Msg::Key(kb::DOC_TOP.to_key_event()));
+    assert_eq!(app.active_chat().scroll_top(), 0);
+    assert_eq!(
+        app.input_box.buffer.value(),
+        "abc",
+        "the draft is untouched"
+    );
+
+    app.update(Msg::Key(key(KeyCode::Char('!'))));
+    assert_eq!(app.key_focus, KeyFocus::Composer, "{FOCUS_KEPT}");
+    app.update(Msg::Key(key(KeyCode::Home)));
+    app.update(Msg::Key(key(KeyCode::Char('?'))));
+    assert_eq!(app.input_box.buffer.value(), "?abc!");
+}
+
+/// A draft taller than the composer keeps the page keys for itself, so the
+/// only text you cannot see is never the text you cannot reach.
+#[test]
+fn a_draft_that_overflows_pages_itself_and_keeps_the_focus() {
+    let mut app = main_chat_app();
+    fill_transcript(&mut app);
+    for _ in 0..TALL_DRAFT_LINES {
+        app.update(Msg::Key(key(KeyCode::Char('x'))));
+        app.update(Msg::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)));
+    }
+    let _ = rendered(&mut app);
+    app.active_chat().enable_auto_scroll();
+    let before = app.active_chat().scroll_top();
+    let draft_scroll = app.input_box.scroll_y();
+    assert!(draft_scroll > 0, "{DRAFT_OVERFLOWS}");
+
+    app.update(Msg::Key(kb::PAGE_UP.to_key_event()));
+    assert_eq!(app.key_focus, KeyFocus::Composer, "{FOCUS_KEPT}");
+    assert_eq!(app.active_chat().scroll_top(), before, "{TRANSCRIPT_STILL}");
+    assert!(app.input_box.scroll_y() < draft_scroll, "{DRAFT_PAGED}");
+}
+
+/// The wheel already scrolls what the pointer is over, so letting it move the
+/// focus as well would disarm Home in a half-typed draft.
+#[test]
+fn the_wheel_scrolls_the_transcript_without_taking_the_focus() {
+    let mut app = main_chat_app();
+    fill_transcript(&mut app);
+    let msg_area = rendered_zone(&mut app, SelectionZone::Messages);
+    app.active_chat().enable_auto_scroll();
+
+    app.update(Msg::Scroll {
+        column: msg_area.x,
+        row: msg_area.y,
+        delta: 1,
+    });
+    assert!(
+        !app.chats[0].auto_scroll(),
+        "the wheel moved the transcript"
+    );
+    assert_eq!(app.key_focus, KeyFocus::Composer, "{FOCUS_KEPT}");
+}
+
+/// A click is the mouse's way in, and it works in both directions.
+#[test_case(SelectionZone::Messages, KeyFocus::Transcript ; "transcript")]
+#[test_case(SelectionZone::Input,    KeyFocus::Composer   ; "composer")]
+fn clicking_a_surface_gives_it_the_navigation_keys(zone: SelectionZone, expected: KeyFocus) {
+    let mut app = main_chat_app();
+    fill_transcript(&mut app);
+    app.key_focus = match expected {
+        KeyFocus::Composer => KeyFocus::Transcript,
+        KeyFocus::Transcript => KeyFocus::Composer,
+    };
+    let area = rendered_zone(&mut app, zone);
+
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        area.x,
+        area.y,
+    ));
+    assert_eq!(app.key_focus, expected);
+}
+
+/// Esc backs out of reading without arming the rewind it would otherwise flash.
+#[test]
+fn esc_returns_the_navigation_keys_to_the_composer() {
+    let mut app = main_chat_app();
+    fill_transcript(&mut app);
+    app.update(Msg::Key(kb::PAGE_UP.to_key_event()));
+    assert_eq!(app.key_focus, KeyFocus::Transcript, "{FOCUS_TAKEN}");
+
+    app.update(Msg::Key(key(KeyCode::Esc)));
+    assert_eq!(app.key_focus, KeyFocus::Composer, "{FOCUS_KEPT}");
+    assert!(app.last_esc.is_none(), "the rewind must stay unarmed");
+}
+
+/// Focus belongs to the chat it was taken in, so a switch cannot leave the
+/// next composer answering keys the reader aimed at a transcript.
+#[test]
+fn switching_chats_returns_the_navigation_keys_to_the_composer() {
+    let mut app = steerable_task_app();
+    fill_transcript(&mut app);
+    app.update(Msg::Key(kb::PAGE_UP.to_key_event()));
+    assert_eq!(app.key_focus, KeyFocus::Transcript, "{FOCUS_TAKEN}");
+
+    app.focus_task(MAIN_TASK_ID).unwrap();
+    assert_eq!(app.key_focus, KeyFocus::Composer, "{FOCUS_KEPT}");
 }
 
 #[test]

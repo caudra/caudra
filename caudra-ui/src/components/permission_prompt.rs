@@ -2055,7 +2055,7 @@ mod tests {
     fn the_page_keys_scroll_a_body_that_does_not_fit() {
         let mut prompt = prompt_with_authorities();
         let first = render(&mut prompt, 60, CRAMPED_HEIGHT);
-        prompt.handle_key(kb::SCROLL_HALF_DOWN.to_key_event());
+        prompt.handle_key(kb::PAGE_DOWN.to_key_event());
         let scrolled = render(&mut prompt, 60, CRAMPED_HEIGHT);
         assert_ne!(first, scrolled, "{EXPECT_SCROLLED}");
         assert!(prompt.scroll.offset() > 0, "{EXPECT_SCROLLED}");
