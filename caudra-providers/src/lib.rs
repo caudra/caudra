@@ -42,8 +42,9 @@ pub use providers::openai::images as openai_images;
 pub use providers::xai::auth as xai_auth;
 pub use tokens::{estimate_tokens, estimate_tokens_cached, format_tokens_u64, token_label};
 pub use types::{
-    ContentBlock, EFFORT_LEVELS, EMPTY_RESPONSE_MARKER, IMAGE_OMITTED_NOTE, ImageMediaType,
-    ImageSource, MIN_THINKING_BUDGET, Message, MessageKind, ProviderEvent, ProviderUsage,
+    ContentBlock, EFFORT_LEVELS, EMPTY_RESPONSE_MARKER, IMAGE_OMITTED_NOTE, INVALID_TOOL_JSON_KEY,
+    ImageMediaType, ImageSource, MIN_THINKING_BUDGET, Message, MessageKind, ProviderEvent,
+    ProviderUsage,
     ReasoningOption, ReasoningOptions, ReasoningSource, ReasoningTransport, RequestOptions,
     ResolvedThinking, ResponsesReasoning, Role, StopReason, StreamResponse, THINKING_USAGE,
     ThinkingConfig, ToolNameAliases, UsageLimit, adapt_images_for_model,

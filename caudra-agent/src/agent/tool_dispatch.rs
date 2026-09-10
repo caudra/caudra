@@ -18,6 +18,7 @@ use crate::tools::{
 };
 use crate::{AgentError, AgentEvent, LuaToolProvenance, ToolDoneEvent, ToolOutput, ToolStartEvent};
 use caudra_config::ToolKey;
+use caudra_providers::INVALID_TOOL_JSON_KEY;
 
 /// Where a tool's start presentation goes: the transcript, the caller that
 /// asked for it, or nowhere.
@@ -51,6 +52,9 @@ const DOOM_LOOP_THRESHOLD: usize = 3;
 const MCP_BLOCKED_IN_PLAN: &str = "MCP tools are not available in plan mode";
 const UNKNOWN_TOOL_PREFIX: &str = "unknown tool";
 const TOOL_DISABLED_SUFFIX: &str = "is disabled for the current agent";
+const INVALID_INPUT_MESSAGE: &str =
+    "arguments were not valid JSON, so the tool did not run. Call it again with complete \
+     arguments; if the input is large, split it across several calls. Raw text received:";
 const SOURCE_NATIVE: &str = "native";
 const SOURCE_LOCAL: &str = "local";
 const SOURCE_UNKNOWN: &str = "unknown";
@@ -184,6 +188,12 @@ async fn run_inner(
             model_output_from_ref: false,
         }
     };
+
+    // Before every gate and lookup: arguments that never parsed cannot be
+    // judged, so there is nothing to permit and nothing to run.
+    if let Some(raw) = input.get(INVALID_TOOL_JSON_KEY).and_then(Value::as_str) {
+        return done_error(format!("{name} {INVALID_INPUT_MESSAGE} {raw}"));
+    }
 
     // Before the read-only gate: a tool the config turned off should say so
     // even when the mode would have refused it for another reason.
@@ -1049,6 +1059,33 @@ mod tests {
             .await;
             assert!(done.is_error);
             assert_eq!(done.output.as_text(), "nope");
+        });
+    }
+
+    const RAN_ANYWAY: &str = "a tool whose arguments never parsed must not run";
+    const RAW_TEXT_LOST: &str = "the model needs the raw text back to see where it went wrong";
+
+    /// Eager tool streaming turns off Anthropic's per-argument validation, so a
+    /// truncated body reaches dispatch instead of being rejected upstream.
+    #[test]
+    fn an_unparseable_tool_input_is_reported_rather_than_run() {
+        const TRUNCATED: &str = r#"{"path": "/a", "content": "half a fi"#;
+
+        smol::block_on(async {
+            let ctx = local_ctx("batch", |_| panic!("{RAN_ANYWAY}"));
+            let done = run(
+                ToolRegistry::global(),
+                None,
+                "t1".into(),
+                "batch",
+                &serde_json::json!({ INVALID_TOOL_JSON_KEY: TRUNCATED }),
+                &ctx,
+                Emit::Silent,
+            )
+            .await;
+
+            assert!(done.is_error, "{RAN_ANYWAY}");
+            assert!(done.output.as_text().contains(TRUNCATED), "{RAW_TEXT_LOST}");
         });
     }
 

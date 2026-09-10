@@ -1176,7 +1176,8 @@ mod tests {
     use super::*;
     use crate::providers::ResolvedAuth;
     use crate::{
-        CaudraId, ContentBlock, EMPTY_RESPONSE_MARKER, ProviderEvent, Role, StopReason, TokenUsage,
+        CaudraId, ContentBlock, EMPTY_RESPONSE_MARKER, INVALID_TOOL_JSON_KEY, ProviderEvent, Role,
+        StopReason, TokenUsage,
     };
     use caudra_storage::tool_outputs::ToolOutputRef;
     use serde_json::{Value, json};
@@ -1185,6 +1186,7 @@ mod tests {
     use test_case::test_case;
 
     const TEST_STREAM_TIMEOUT: Duration = Duration::from_secs(300);
+    const RAW_TEXT_LOST: &str = "an unparseable tool input must keep its raw text for the model";
     const THIRD_PARTY_BASE_URL: &str = "https://proxy.example.com/v1/messages";
     const STORED_OUTPUT: &str = "first\nsecond";
 
@@ -1964,7 +1966,7 @@ data: {\"type\":\"content_block_stop\"}\n";
     }
 
     #[test]
-    fn parse_sse_malformed_tool_json_yields_empty_object() {
+    fn parse_sse_unparseable_tool_json_is_wrapped_rather_than_emptied() {
         smol::block_on(async {
             let sse_data = "\
 event: message_start\n\
@@ -1990,7 +1992,11 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":1}}\n";
             let tools: Vec<_> = resp.message.tool_uses().collect();
             assert_eq!(tools.len(), 1);
             assert_eq!(tools[0].1, "read");
-            assert_eq!(*tools[0].2, Value::Object(Default::default()));
+            assert_eq!(
+                tools[0].2[INVALID_TOOL_JSON_KEY],
+                json!("{broken"),
+                "{RAW_TEXT_LOST}"
+            );
         })
     }
 

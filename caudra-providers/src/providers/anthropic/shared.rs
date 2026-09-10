@@ -4,7 +4,7 @@ use std::sync::{Arc, LazyLock};
 
 use flume::Sender;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 
@@ -12,8 +12,8 @@ use crate::model::{
     FastPricing, Model, ModelEntry, ModelFamily, ModelPricing, ModelTier, StaticReasoningOption,
 };
 use crate::{
-    AgentError, ContentBlock, EMPTY_RESPONSE_MARKER, Message, ProviderEvent, Role, StopReason,
-    StreamResponse, ThinkingConfig, TokenUsage,
+    AgentError, ContentBlock, EMPTY_RESPONSE_MARKER, INVALID_TOOL_JSON_KEY, Message, ProviderEvent,
+    Role, StopReason, StreamResponse, ThinkingConfig, TokenUsage,
 };
 
 pub(super) const BETA_TOOL_EXAMPLES_BEDROCK: &str = "tool-examples-2025-10-29";
@@ -256,15 +256,38 @@ pub(super) fn build_wire_messages(messages: &[Message]) -> Vec<WireMessage<'_>> 
         .collect()
 }
 
+/// Without this the API buffers and validates each parameter value before
+/// streaming it back, so a large argument such as a written file body arrives
+/// as one fragment at `content_block_stop` and the UI cannot draw it growing.
+/// The per-tool field supersedes the `fine-grained-tool-streaming-2025-05-14`
+/// beta header, which the API rejects alongside computer-use toolset entries.
+const EAGER_INPUT_STREAMING: &str = "eager_input_streaming";
+
 pub(super) fn build_wire_tools(tools: &Value) -> Value {
     let Some(arr) = tools.as_array() else {
         return tools.clone();
     };
     let mut out: Vec<Value> = arr.to_vec();
+    for tool in &mut out {
+        tool[EAGER_INPUT_STREAMING] = json!(true);
+    }
     if let Some(last) = out.last_mut() {
         last["cache_control"] = json!({"type": "ephemeral"});
     }
     Value::Array(out)
+}
+
+/// A body that never parsed can be as long as the whole output window, and it
+/// travels back to the model inside a tool result. This is enough to see where
+/// generation went wrong without spending the next turn on the wreckage.
+const INVALID_TOOL_JSON_EXCERPT: usize = 2_000;
+
+fn invalid_tool_input(raw: &str) -> Value {
+    let excerpt: String = raw.chars().take(INVALID_TOOL_JSON_EXCERPT).collect();
+    Value::Object(Map::from_iter([(
+        INVALID_TOOL_JSON_KEY.to_string(),
+        Value::String(excerpt),
+    )]))
 }
 
 pub(crate) fn build_request_body_with_system(
@@ -555,8 +578,8 @@ impl EventParser {
                             v
                         }
                         Err(e) => {
-                            warn!(error = %e, json = %self.current_tool_json, "malformed tool JSON, falling back to {{}}");
-                            Value::Object(Default::default())
+                            warn!(error = %e, json = %self.current_tool_json, "unparseable tool input JSON");
+                            invalid_tool_input(&self.current_tool_json)
                         }
                     };
                     self.current_tool_json.clear();
@@ -933,5 +956,67 @@ mod tests {
     #[test_case("mcp_fetch" ; "already_prefixed")]
     fn oauth_tool_names_round_trip(name: &str) {
         assert_eq!(canonical_tool_name(&oauth_tool_name(name)), name);
+    }
+
+    use serde_json::{Value, json};
+
+    use super::{
+        EAGER_INPUT_STREAMING, INVALID_TOOL_JSON_EXCERPT, INVALID_TOOL_JSON_KEY,
+        apply_oauth_request_profile, build_wire_tools, invalid_tool_input,
+    };
+
+    const BUFFERED_TOOL: &str =
+        "every tool must ask for eager streaming or its large arguments arrive in one fragment";
+    const BREAKPOINT_MOVED: &str = "only the last tool carries the cache breakpoint";
+
+    fn wire_tools() -> Vec<Value> {
+        let tools = json!([
+            {"name": "file_read", "input_schema": {}},
+            {"name": "file_write", "input_schema": {}},
+        ]);
+        build_wire_tools(&tools).as_array().unwrap().clone()
+    }
+
+    #[test]
+    fn every_wire_tool_asks_for_eager_input_streaming() {
+        let tools = wire_tools();
+        assert!(
+            tools.iter().all(|t| t[EAGER_INPUT_STREAMING] == json!(true)),
+            "{BUFFERED_TOOL}"
+        );
+        assert!(tools[0]["cache_control"].is_null(), "{BREAKPOINT_MOVED}");
+        assert!(!tools[1]["cache_control"].is_null(), "{BREAKPOINT_MOVED}");
+    }
+
+    /// The OAuth profile rewrites tool names in place, so the field it does not
+    /// know about has to survive the rename it does perform.
+    #[test]
+    fn the_oauth_rename_keeps_eager_input_streaming() {
+        let mut body = json!({
+            "system": [],
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+            "tools": wire_tools(),
+        });
+        apply_oauth_request_profile(&mut body, "", "1.0.0");
+
+        let tools = body["tools"].as_array().unwrap();
+        assert!(
+            tools.iter().all(|t| t[EAGER_INPUT_STREAMING] == json!(true)),
+            "{BUFFERED_TOOL}"
+        );
+        assert!(tools[1]["name"].as_str().unwrap().starts_with("mcp_"));
+    }
+
+    const EXCERPT_UNBOUNDED: &str = "a runaway tool body must not travel back whole";
+
+    #[test]
+    fn an_unparseable_tool_input_keeps_a_bounded_excerpt() {
+        let raw = "\u{e9}".repeat(INVALID_TOOL_JSON_EXCERPT * 2);
+        let wrapped = invalid_tool_input(&raw);
+
+        let excerpt = wrapped[INVALID_TOOL_JSON_KEY].as_str().unwrap();
+        assert_eq!(excerpt.chars().count(), INVALID_TOOL_JSON_EXCERPT);
+        assert!(raw.starts_with(excerpt), "{EXCERPT_UNBOUNDED}");
+        assert_eq!(wrapped.as_object().unwrap().len(), 1);
     }
 }

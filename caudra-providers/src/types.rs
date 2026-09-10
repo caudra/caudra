@@ -98,6 +98,13 @@ pub const IMAGE_OMITTED_NOTE: &str =
     "[image omitted: the current model does not support image input]";
 /// See [`Message::empty_marker`].
 pub const EMPTY_RESPONSE_MARKER: &str = "(empty)";
+/// The sole key of a tool input that never parsed. Asking Anthropic to stream
+/// tool arguments eagerly also turns off its per-argument validation, so a
+/// truncated or malformed body now reaches us instead of being rejected
+/// upstream. Wrapping the raw text keeps the call addressable: the agent
+/// reports it back as a failed tool result rather than running the tool with
+/// guessed arguments.
+pub const INVALID_TOOL_JSON_KEY: &str = "INVALID_JSON";
 
 /// For models without vision, image blocks become a text note instead of a
 /// wire block the API would reject. History keeps the pixels, so switching
