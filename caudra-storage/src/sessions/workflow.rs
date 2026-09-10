@@ -26,6 +26,12 @@ const MAX_PATH_BYTES: usize = 32 * 1024;
 const MAX_RUNS_PER_LOAD: i64 = 64;
 const MAX_CALLS_PER_RUN: u64 = 16_384;
 const MAX_CALL_LOAD_BYTES: u64 = 64 * 1024 * 1024;
+/// Timeline rows one run keeps. Past it the oldest log line goes, so a phase
+/// marker outlives any amount of chatter.
+pub const MAX_EVENTS_PER_RUN: u64 = 512;
+const MAX_EVENT_TEXT_BYTES: usize = 4 * 1024;
+/// The most runs a cross-session history query answers with.
+pub const MAX_HISTORY_RUNS: usize = 50;
 pub const WORKFLOW_CALL_ALREADY_COMMITTED: &str = "workflow call already committed";
 pub const WORKFLOW_CALL_REQUEST_MISMATCH: &str =
     "workflow call request differs from the journaled call";
@@ -43,6 +49,9 @@ pub(crate) const SESSION_WORKFLOW_BYTES: &str = "coalesce((SELECT sum(bytes) FRO
         WHERE session_id = sessions.id), 0) \
      + coalesce((SELECT sum(calls.bytes) FROM workflow_calls AS calls \
         JOIN workflow_runs AS runs ON runs.run_id = calls.run_id \
+        WHERE runs.session_id = sessions.id), 0) \
+     + coalesce((SELECT sum(events.bytes) FROM workflow_run_events AS events \
+        JOIN workflow_runs AS runs ON runs.run_id = events.run_id \
         WHERE runs.session_id = sessions.id), 0)";
 const RUN_COLUMNS: &str = "run_id, session_id, display_name, workflow_name, source_kind, \
      source_path, source_digest, language_version, abi_version, source, args, objective, \
@@ -51,6 +60,7 @@ const RUN_COLUMNS: &str = "run_id, session_id, display_name, workflow_name, sour
      created_at, updated_at, bytes";
 const CALL_COLUMNS: &str = "run_id, call_key, kind, request_hash, request, state, result, \
      error, task_id, started_at, finished_at, tokens_used, duration_ms, bytes";
+const EVENT_COLUMNS: &str = "run_id, seq, at, kind, text";
 
 /// A stored text that names no variant of the enum it should decode to.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -132,6 +142,31 @@ text_enum! {
         Completed = "completed",
         Failed = "failed",
     }
+}
+
+text_enum! {
+    WorkflowEventKind as "workflow event kind" {
+        Phase = "phase",
+        Log = "log",
+    }
+}
+
+/// One `workflow_run_events` row: a phase the run entered or a line it
+/// logged, stamped when storage wrote it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowEventRow {
+    pub run_id: String,
+    pub seq: u64,
+    pub at: u64,
+    pub kind: WorkflowEventKind,
+    pub text: String,
+}
+
+/// A run listed across sessions, with the title of the session that ran it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowHistoryRow {
+    pub run: WorkflowRunRow,
+    pub session_title: String,
 }
 
 /// One `workflow_runs` row. JSON columns stay opaque strings the caller has
@@ -246,6 +281,8 @@ pub(crate) struct WorkflowTotals {
 pub(crate) struct WorkflowTrim {
     pub(crate) call_rows: u64,
     pub(crate) call_bytes: u64,
+    pub(crate) event_rows: u64,
+    pub(crate) event_bytes: u64,
 }
 
 impl SessionDatabase {
@@ -377,6 +414,92 @@ impl SessionDatabase {
             runs.push(read_run(row)?);
         }
         Ok(runs)
+    }
+
+    /// The newest runs across every session, each with its session's title,
+    /// at most `limit` and never more than [`MAX_HISTORY_RUNS`].
+    pub fn load_workflow_history(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<WorkflowHistoryRow>, SessionError> {
+        let limit = signed(limit.min(MAX_HISTORY_RUNS) as u64)?;
+        let mut statement = self.connection().prepare(&format!(
+            "SELECT {RUN_COLUMNS}, \
+                 (SELECT title FROM sessions WHERE sessions.id = workflow_runs.session_id) \
+             FROM workflow_runs ORDER BY created_at DESC, run_id DESC LIMIT ?1"
+        ))?;
+        let mut rows = statement.query(params![limit])?;
+        let mut history = Vec::new();
+        while let Some(row) = rows.next()? {
+            history.push(WorkflowHistoryRow {
+                run: read_run(row)?,
+                session_title: row.get(29)?,
+            });
+        }
+        Ok(history)
+    }
+
+    /// Appends one timeline row and returns its sequence number. Past
+    /// [`MAX_EVENTS_PER_RUN`] rows the oldest log line is dropped first; a
+    /// phase marker is refused only once phases alone fill the run.
+    pub fn append_workflow_event(
+        &self,
+        run_id: &str,
+        kind: WorkflowEventKind,
+        text: &str,
+    ) -> Result<u64, SessionError> {
+        bounded_identifier("workflow run id", run_id)?;
+        SessionDatabase::validate_len("workflow event text", text.len(), MAX_EVENT_TEXT_BYTES)?;
+        let transaction = self.connection().unchecked_transaction()?;
+        let (count, last_seq) = transaction.query_row(
+            "SELECT count(*), coalesce(max(seq), -1) FROM workflow_run_events WHERE run_id = ?1",
+            params![run_id],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )?;
+        if unsigned(count, "workflow_run_events count")? >= MAX_EVENTS_PER_RUN {
+            let evicted = transaction.execute(
+                "DELETE FROM workflow_run_events WHERE run_id = ?1 AND seq = \
+                     (SELECT min(seq) FROM workflow_run_events WHERE run_id = ?1 AND kind = ?2)",
+                params![run_id, WorkflowEventKind::Log.as_str()],
+            )?;
+            if evicted == 0 {
+                return Err(SessionError::LimitExceeded {
+                    kind: "workflow event rows",
+                    actual: usize::try_from(count).unwrap_or(usize::MAX),
+                    maximum: usize::try_from(MAX_EVENTS_PER_RUN).unwrap_or(usize::MAX),
+                });
+            }
+        }
+        let seq = last_seq + 1;
+        transaction.execute(
+            "INSERT INTO workflow_run_events (run_id, seq, at, kind, text) \
+             VALUES (?1, ?2, unixepoch(), ?3, ?4)",
+            params![run_id, seq, kind.as_str(), text],
+        )?;
+        transaction.commit()?;
+        unsigned(seq, "workflow_run_events.seq")
+    }
+
+    /// The timeline of one run in the order it happened.
+    pub fn load_workflow_events(
+        &self,
+        run_id: &str,
+    ) -> Result<Vec<WorkflowEventRow>, SessionError> {
+        let mut statement = self.connection().prepare(&format!(
+            "SELECT {EVENT_COLUMNS} FROM workflow_run_events WHERE run_id = ?1 ORDER BY seq"
+        ))?;
+        let mut rows = statement.query(params![run_id])?;
+        let mut events = Vec::new();
+        while let Some(row) = rows.next()? {
+            events.push(WorkflowEventRow {
+                run_id: row.get(0)?,
+                seq: unsigned(row.get(1)?, "workflow_run_events.seq")?,
+                at: unsigned(row.get(2)?, "workflow_run_events.at")?,
+                kind: parse_column(row, 3, "workflow_run_events.kind")?,
+                text: row.get(4)?,
+            });
+        }
+        Ok(events)
     }
 
     /// Ends every active run of a session: the run becomes `interrupted` in a
@@ -611,11 +734,12 @@ impl SessionDatabase {
 }
 
 pub(crate) fn workflow_totals(connection: &Connection) -> Result<WorkflowTotals, SessionError> {
-    let (run_count, run_bytes, call_count, call_bytes) = connection.query_row(
+    let (run_count, run_bytes, call_count, call_bytes, event_bytes) = connection.query_row(
         "SELECT (SELECT count(*) FROM workflow_runs), \
                 (SELECT coalesce(sum(bytes), 0) FROM workflow_runs), \
                 (SELECT count(*) FROM workflow_calls), \
-                (SELECT coalesce(sum(bytes), 0) FROM workflow_calls)",
+                (SELECT coalesce(sum(bytes), 0) FROM workflow_calls), \
+                (SELECT coalesce(sum(bytes), 0) FROM workflow_run_events)",
         [],
         |row| {
             Ok((
@@ -623,6 +747,7 @@ pub(crate) fn workflow_totals(connection: &Connection) -> Result<WorkflowTotals,
                 row.get::<_, i64>(1)?,
                 row.get::<_, i64>(2)?,
                 row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
             ))
         },
     )?;
@@ -630,32 +755,53 @@ pub(crate) fn workflow_totals(connection: &Connection) -> Result<WorkflowTotals,
         run_count: unsigned(run_count, "workflow run count")?,
         call_count: unsigned(call_count, "workflow call count")?,
         bytes: unsigned(run_bytes, "workflow run bytes")?
-            + unsigned(call_bytes, "workflow call bytes")?,
+            + unsigned(call_bytes, "workflow call bytes")?
+            + unsigned(event_bytes, "workflow event bytes")?,
     })
 }
 
-/// What a trim does to a session's workflows: the journal goes, and every run
-/// the journal could still have resumed becomes `interrupted`.
+/// What a trim does to a session's workflows: the journal and the timeline
+/// go, and every run the journal could still have resumed becomes
+/// `interrupted`.
 pub(crate) fn trim_workflow_runs(
     connection: &Connection,
     session_id: CaudraId,
 ) -> Result<WorkflowTrim, SessionError> {
-    let (rows, bytes) = connection.query_row(
-        "SELECT count(*), coalesce(sum(bytes), 0) FROM workflow_calls WHERE run_id IN \
-             (SELECT run_id FROM workflow_runs WHERE session_id = ?1)",
+    let (call_rows, call_bytes) = trim_run_children(connection, session_id, "workflow_calls")?;
+    let (event_rows, event_bytes) =
+        trim_run_children(connection, session_id, "workflow_run_events")?;
+    interrupt_runs(connection, session_id, &RESUMABLE_STATUSES)?;
+    Ok(WorkflowTrim {
+        call_rows: unsigned(call_rows, "trimmed workflow call rows")?,
+        call_bytes: unsigned(call_bytes, "trimmed workflow call bytes")?,
+        event_rows: unsigned(event_rows, "trimmed workflow event rows")?,
+        event_bytes: unsigned(event_bytes, "trimmed workflow event bytes")?,
+    })
+}
+
+/// Deletes every row of `table` belonging to the session's runs and reports
+/// what went. `table` is one of this module's own names, never input.
+fn trim_run_children(
+    connection: &Connection,
+    session_id: CaudraId,
+    table: &'static str,
+) -> Result<(i64, i64), SessionError> {
+    let counted = connection.query_row(
+        &format!(
+            "SELECT count(*), coalesce(sum(bytes), 0) FROM {table} WHERE run_id IN \
+                 (SELECT run_id FROM workflow_runs WHERE session_id = ?1)"
+        ),
         params![session_id.as_bytes().as_slice()],
         |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
     )?;
     connection.execute(
-        "DELETE FROM workflow_calls WHERE run_id IN \
-             (SELECT run_id FROM workflow_runs WHERE session_id = ?1)",
+        &format!(
+            "DELETE FROM {table} WHERE run_id IN \
+                 (SELECT run_id FROM workflow_runs WHERE session_id = ?1)"
+        ),
         params![session_id.as_bytes().as_slice()],
     )?;
-    interrupt_runs(connection, session_id, &RESUMABLE_STATUSES)?;
-    Ok(WorkflowTrim {
-        call_rows: unsigned(rows, "trimmed workflow call rows")?,
-        call_bytes: unsigned(bytes, "trimmed workflow call bytes")?,
-    })
+    Ok(counted)
 }
 
 fn interrupt_runs(
@@ -905,6 +1051,10 @@ mod tests {
     const CASCADE: &str = "workflow rows must go with their session";
     const FORK_IS_SEPARATE: &str = "a forked session must not inherit workflow runs";
     const BYTES_ARE_ACCOUNTED: &str = "every stored workflow byte must be counted";
+    const PHASES_OUTLIVE_LOGS: &str = "eviction must drop log lines before phase markers";
+    const HISTORY_IS_GLOBAL: &str = "history must list runs from every session with its title";
+    const PHASE_TEXT: &str = "Plan";
+    const LOG_TEXT: &str = "searching";
 
     #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
     struct TestMessage(String);
@@ -1372,16 +1522,150 @@ mod tests {
             .unwrap();
         let lease = SessionLease::acquire(&state_dir, session_id).unwrap();
 
+        database
+            .append_workflow_event(RUN_ID, WorkflowEventKind::Log, LOG_TEXT)
+            .unwrap();
+
         let report = database.trim(&lease).unwrap();
 
         assert_eq!(report.workflow_call_rows, 2);
         assert!(report.workflow_call_bytes > 0, "{BYTES_ARE_ACCOUNTED}");
+        assert_eq!(report.workflow_event_rows, 1);
+        assert!(report.workflow_event_bytes > 0, "{BYTES_ARE_ACCOUNTED}");
         assert!(database.load_workflow_calls(RUN_ID).unwrap().is_empty());
+        assert!(database.load_workflow_events(RUN_ID).unwrap().is_empty());
         let interrupted = database.load_workflow_run(RUN_ID).unwrap().unwrap();
         assert_eq!(interrupted.status, WorkflowRunStatus::Interrupted);
         assert_eq!(interrupted.execution_epoch, 1);
         let settled = database.load_workflow_run(OTHER_RUN_ID).unwrap().unwrap();
         assert_eq!(settled.status, WorkflowRunStatus::Completed);
         assert_eq!(settled.revision, 0);
+    }
+
+    #[test]
+    fn events_append_in_sequence_and_load_in_order() {
+        let (_temp, _state_dir, database, session_id) = open();
+        database
+            .insert_workflow_run(&run(session_id, RUN_ID))
+            .unwrap();
+
+        let first = database
+            .append_workflow_event(RUN_ID, WorkflowEventKind::Phase, PHASE_TEXT)
+            .unwrap();
+        let second = database
+            .append_workflow_event(RUN_ID, WorkflowEventKind::Log, LOG_TEXT)
+            .unwrap();
+        let events = database.load_workflow_events(RUN_ID).unwrap();
+
+        assert_eq!((first, second), (0, 1));
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| (event.seq, event.kind, event.text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, WorkflowEventKind::Phase, PHASE_TEXT),
+                (1, WorkflowEventKind::Log, LOG_TEXT)
+            ]
+        );
+        assert!(events.iter().all(|event| event.at > 0));
+        assert!(
+            database.workflow_bytes(session_id).unwrap() > 0,
+            "{BYTES_ARE_ACCOUNTED}"
+        );
+    }
+
+    #[test]
+    fn a_full_timeline_evicts_the_oldest_log_line_and_keeps_phases() {
+        let (_temp, _state_dir, database, session_id) = open();
+        database
+            .insert_workflow_run(&run(session_id, RUN_ID))
+            .unwrap();
+        database
+            .append_workflow_event(RUN_ID, WorkflowEventKind::Phase, PHASE_TEXT)
+            .unwrap();
+        for _ in 1..MAX_EVENTS_PER_RUN {
+            database
+                .append_workflow_event(RUN_ID, WorkflowEventKind::Log, LOG_TEXT)
+                .unwrap();
+        }
+
+        let seq = database
+            .append_workflow_event(RUN_ID, WorkflowEventKind::Log, PHASE_TEXT)
+            .unwrap();
+        let events = database.load_workflow_events(RUN_ID).unwrap();
+
+        assert_eq!(seq, MAX_EVENTS_PER_RUN);
+        assert_eq!(events.len() as u64, MAX_EVENTS_PER_RUN);
+        assert_eq!(
+            events[0].kind,
+            WorkflowEventKind::Phase,
+            "{PHASES_OUTLIVE_LOGS}"
+        );
+        assert_eq!(events[1].seq, 2, "{PHASES_OUTLIVE_LOGS}");
+    }
+
+    #[test]
+    fn a_timeline_of_phases_alone_refuses_another() {
+        let (_temp, _state_dir, database, session_id) = open();
+        database
+            .insert_workflow_run(&run(session_id, RUN_ID))
+            .unwrap();
+        for _ in 0..MAX_EVENTS_PER_RUN {
+            database
+                .append_workflow_event(RUN_ID, WorkflowEventKind::Phase, PHASE_TEXT)
+                .unwrap();
+        }
+
+        let refused = database.append_workflow_event(RUN_ID, WorkflowEventKind::Phase, PHASE_TEXT);
+
+        assert!(matches!(refused, Err(SessionError::LimitExceeded { .. })));
+    }
+
+    #[test]
+    fn deleting_a_session_removes_its_timeline() {
+        let (_temp, _state_dir, mut database, session_id) = open();
+        database
+            .insert_workflow_run(&run(session_id, RUN_ID))
+            .unwrap();
+        database
+            .append_workflow_event(RUN_ID, WorkflowEventKind::Log, LOG_TEXT)
+            .unwrap();
+
+        database.delete(session_id, None).unwrap();
+
+        assert!(
+            database.load_workflow_events(RUN_ID).unwrap().is_empty(),
+            "{CASCADE}"
+        );
+        assert_eq!(database.stats().unwrap().workflow_bytes, 0, "{CASCADE}");
+    }
+
+    #[test]
+    fn history_spans_sessions_newest_first_within_its_limit() {
+        let (_temp, _state_dir, mut database, session_id) = open();
+        let mut other = TestSession::new(MODEL, CWD);
+        other.push_message(TestMessage("other session".into()));
+        database.save(&other, None).unwrap();
+        database
+            .insert_workflow_run(&run(session_id, RUN_ID))
+            .unwrap();
+        database
+            .insert_workflow_run(&run(other.id, OTHER_RUN_ID))
+            .unwrap();
+
+        let history = database.load_workflow_history(MAX_HISTORY_RUNS).unwrap();
+        let limited = database.load_workflow_history(1).unwrap();
+
+        assert_eq!(history.len(), 2, "{HISTORY_IS_GLOBAL}");
+        let other_entry = history
+            .iter()
+            .find(|entry| entry.run.session_id == other.id)
+            .expect(HISTORY_IS_GLOBAL);
+        assert_eq!(
+            other_entry.session_title, other.title,
+            "{HISTORY_IS_GLOBAL}"
+        );
+        assert_eq!(limited.len(), 1);
     }
 }

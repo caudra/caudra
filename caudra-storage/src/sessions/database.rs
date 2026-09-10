@@ -58,7 +58,7 @@ use crate::{
 pub const SESSIONS_DB_FILE: &str = "sessions.sqlite3";
 pub const SESSIONS_DB_LOCK_FILE: &str = "sessions.sqlite3.lock";
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 const APPLICATION_ID: i64 = i32::from_be_bytes(*b"CAUD") as i64;
 /// Pages copied per step of the pre-migration backup. The whole file is copied
 /// under the initialization lock, so this only bounds how long the backup holds
@@ -278,6 +278,22 @@ CREATE TABLE workflow_calls (
 ) STRICT;
 "#;
 
+/// The timeline of a run: every phase it entered and every line it logged,
+/// in the order they happened. Viewing data only; replay never reads it.
+const WORKFLOW_EVENTS_TABLE: &str = r#"
+CREATE TABLE workflow_run_events (
+    run_id TEXT NOT NULL REFERENCES workflow_runs(run_id) ON DELETE CASCADE,
+    seq    INTEGER NOT NULL,
+    at     INTEGER NOT NULL,
+    kind   TEXT NOT NULL CHECK(kind IN ('phase', 'log')),
+    text   TEXT NOT NULL,
+    bytes  INTEGER NOT NULL GENERATED ALWAYS AS (
+        length(CAST(run_id AS BLOB)) + length(CAST(text AS BLOB))
+    ) STORED,
+    PRIMARY KEY(run_id, seq)
+) STRICT;
+"#;
+
 /// One step of the schema chain. A fresh database gets [`SCHEMA`] at
 /// [`SCHEMA_VERSION`] directly; only an existing database replays these.
 struct Migration {
@@ -306,6 +322,11 @@ const MIGRATIONS: &[Migration] = &[
         from: 4,
         to: 5,
         sql: WORKFLOW_TABLES,
+    },
+    Migration {
+        from: 5,
+        to: 6,
+        sql: WORKFLOW_EVENTS_TABLE,
     },
 ];
 
@@ -431,7 +452,7 @@ CREATE TABLE pending_archives (
 
 /// What a fresh database gets: every migration already folded in.
 fn full_schema() -> String {
-    format!("{SCHEMA}{USAGE_LEDGER_TABLE}{WORKFLOW_TABLES}")
+    format!("{SCHEMA}{USAGE_LEDGER_TABLE}{WORKFLOW_TABLES}{WORKFLOW_EVENTS_TABLE}")
 }
 
 /// One turn on its way into [`usage_ledger`](USAGE_LEDGER_TABLE). Borrowed
@@ -536,6 +557,8 @@ pub struct TrimReport {
     pub tool_output_row_bytes: u64,
     pub workflow_call_rows: u64,
     pub workflow_call_bytes: u64,
+    pub workflow_event_rows: u64,
+    pub workflow_event_bytes: u64,
     pub artifact_bytes: u64,
 }
 
@@ -960,6 +983,8 @@ impl SessionDatabase {
             tool_output_row_bytes: from_i64(bytes, "trimmed tool output bytes")?,
             workflow_call_rows: workflow.call_rows,
             workflow_call_bytes: workflow.call_bytes,
+            workflow_event_rows: workflow.event_rows,
+            workflow_event_bytes: workflow.event_bytes,
             artifact_bytes,
         })
     }
@@ -3456,6 +3481,7 @@ mod tests {
     const TOMBSTONES_TABLE: &str = "session_tombstones";
     const LEDGER_TABLE: &str = "usage_ledger";
     const WORKFLOW_RUNS_TABLE: &str = "workflow_runs";
+    const WORKFLOW_EVENTS_TABLE_NAME: &str = "workflow_run_events";
     const MIGRATED_MATCHES_FRESH: &str =
         "a migrated database must end with exactly the schema a fresh one gets";
     const BACKUP_KEEPS_ORIGIN: &str =
@@ -4505,6 +4531,28 @@ mod tests {
         drop(connection);
     }
 
+    /// A database as the release before the workflow timeline left it: schema 5.
+    fn seed_v5_database(state_dir: &StateDir) {
+        let path = state_dir.path().join(SESSIONS_DB_FILE);
+        create_owner_only(&path).unwrap();
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .pragma_update(None, "page_size", PAGE_SIZE)
+            .unwrap();
+        connection
+            .pragma_update(None, "auto_vacuum", "INCREMENTAL")
+            .unwrap();
+        connection.execute_batch("VACUUM").unwrap();
+        connection.execute_batch(SCHEMA).unwrap();
+        connection.execute_batch(USAGE_LEDGER_TABLE).unwrap();
+        connection.execute_batch(WORKFLOW_TABLES).unwrap();
+        connection
+            .pragma_update(None, "application_id", APPLICATION_ID)
+            .unwrap();
+        connection.pragma_update(None, "user_version", 5).unwrap();
+        drop(connection);
+    }
+
     fn schema_objects(database: &SessionDatabase) -> Vec<(String, String, Option<String>)> {
         let mut statement = database
             .connection
@@ -4539,6 +4587,28 @@ mod tests {
             schema_objects(&fresh)
                 .iter()
                 .any(|(_, name, _)| name == WORKFLOW_RUNS_TABLE)
+        );
+    }
+
+    #[test]
+    fn migrating_a_v5_database_adds_the_workflow_timeline() {
+        let (_migrated_temp, migrated_dir) = state_dir();
+        let (_fresh_temp, fresh_dir) = state_dir();
+        seed_v5_database(&migrated_dir);
+
+        let migrated = SessionDatabase::open(&migrated_dir).unwrap();
+        let fresh = SessionDatabase::open(&fresh_dir).unwrap();
+
+        assert_eq!(migrated.stats().unwrap().schema_version, SCHEMA_VERSION);
+        assert_eq!(
+            schema_objects(&migrated),
+            schema_objects(&fresh),
+            "{MIGRATED_MATCHES_FRESH}"
+        );
+        assert!(
+            schema_objects(&fresh)
+                .iter()
+                .any(|(_, name, _)| name == WORKFLOW_EVENTS_TABLE_NAME)
         );
     }
 
