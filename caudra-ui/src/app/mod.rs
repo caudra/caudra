@@ -3265,6 +3265,13 @@ impl App {
                 }
                 ChatEventResult::Error(message) => {
                     self.cancel_queue_edit();
+                    // The transcript keeps what the turn managed to write, so say so here: the
+                    // remedy is one command and nothing else in the UI names it.
+                    let message = if self.died_mid_turn() {
+                        format!("{message} ({})", queue::CONTINUE_HINT)
+                    } else {
+                        message
+                    };
                     self.status = Status::error(message.clone());
                     self.status_bar.clear_flash();
                     self.subagent_answers.clear();

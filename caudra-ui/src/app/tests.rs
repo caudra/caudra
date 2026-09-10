@@ -2858,6 +2858,50 @@ fn continue_command_starts_a_run_with_no_message() {
     assert_eq!(app.main_chat().message_count(), before);
 }
 
+/// A turn killed mid-run keeps whatever it wrote, so the error has to name the one command that
+/// picks it back up. Nothing else in the UI does.
+#[test]
+fn an_error_after_a_turn_died_names_the_resume() {
+    const FAILED_MARKER: &str = "[Run failed: inference engine is unavailable]";
+    const PROVIDER_ERROR: &str = "provider failed";
+    let mut app = test_app();
+    app.run_id = 1;
+    app.shared_history = Some(Arc::new(ArcSwap::from_pointee(HistorySnapshot::new(
+        crate::history_items(&[
+            Message::user(RESUME_PROMPT_TEXT.into()),
+            Message::synthetic(FAILED_MARKER.into()),
+        ]),
+    ))));
+
+    app.update(agent_msg(AgentEvent::Error {
+        message: PROVIDER_ERROR.into(),
+    }));
+
+    let Status::Error { message, .. } = &app.status else {
+        panic!("an error must leave the session in Status::Error");
+    };
+    assert!(message.contains(PROVIDER_ERROR), "got: {message}");
+    assert!(message.contains(queue::CONTINUE_HINT), "got: {message}");
+}
+
+/// An error that landed before the turn wrote anything leaves no marker, and offering a resume
+/// there would point at a command that refuses.
+#[test]
+fn an_error_with_nothing_to_resume_offers_no_hint() {
+    const PROVIDER_ERROR: &str = "provider failed";
+    let mut app = test_app();
+    app.run_id = 1;
+
+    app.update(agent_msg(AgentEvent::Error {
+        message: PROVIDER_ERROR.into(),
+    }));
+
+    let Status::Error { message, .. } = &app.status else {
+        panic!("an error must leave the session in Status::Error");
+    };
+    assert!(!message.contains(queue::CONTINUE_HINT), "got: {message}");
+}
+
 #[test]
 fn continue_command_is_refused_while_streaming() {
     let mut app = test_app();

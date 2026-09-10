@@ -22,7 +22,7 @@ pub use agent::{
     HistorySnapshot, InstructionBaseline, Instructions, LoadedInstructions, MAX_GOAL_CHARS,
     MAX_GOAL_CONTINUATION_LIMIT, SharedHistory, UNAVAILABLE_RESULT, close_dangling_tool_calls,
     find_subdirectory_instructions, goal_checkin_message, goal_kickoff_message,
-    is_instruction_file, project_for_provider, project_for_target,
+    is_instruction_file, is_run_failure_marker, project_for_provider, project_for_target,
 };
 pub use cancel::{CancelMap, CancelToken, CancelTrigger};
 pub use caudra_config::{AgentConfig, PermissionsConfig, ToolOutputLines};

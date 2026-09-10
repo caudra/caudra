@@ -5,8 +5,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use caudra_agent::AgentInput;
-use caudra_agent::{PromptAdmission, QueueDelivery, QueueItemId};
-use caudra_providers::{ImageMediaType, ImageSource};
+use caudra_agent::{PromptAdmission, QueueDelivery, QueueItemId, is_run_failure_marker};
+use caudra_providers::{HistoryItemKind, ImageMediaType, ImageSource};
 
 use super::{Action, App, PendingRun, Status, format_with_images};
 
@@ -24,6 +24,7 @@ pub(crate) const NO_QUEUE_ERR: &str = "session cannot queue messages";
 pub(crate) const REPLACE_BUSY_ERR: &str = "session is already stopping a run";
 pub(crate) const CONTINUE_BUSY_ERR: &str = "session is already working";
 pub(crate) const CONTINUE_EMPTY_ERR: &str = "nothing to continue";
+pub(crate) const CONTINUE_HINT: &str = "/continue resumes the turn";
 
 pub(crate) enum SubmitOutcome {
     Started(Vec<Action>),
@@ -1170,6 +1171,18 @@ impl App {
         });
         input.preamble = preamble;
         self.start_run(input, String::new())
+    }
+
+    /// Whether the last run died mid-turn and left a transcript a resume can pick back up. The
+    /// agent closes such a run on a marker, so the marker at the tail is the signal; an error
+    /// that landed before the turn wrote anything leaves none and there is nothing to offer.
+    pub(super) fn died_mid_turn(&self) -> bool {
+        self.shared_history.as_ref().is_some_and(|history| {
+            matches!(
+                history.load().messages.last().map(|item| &item.kind),
+                Some(HistoryItemKind::User { text, .. }) if is_run_failure_marker(text)
+            )
+        })
     }
 
     /// Resumes with no turn of its own, so nothing the user did not type

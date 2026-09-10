@@ -10,6 +10,11 @@ use caudra_storage::sessions::next_epoch;
 use tracing::warn;
 
 pub(crate) const CANCEL_MARKER: &str = "[Cancelled by user]";
+/// Opens the marker a run that died mid-turn leaves behind. A prefix rather than a fixed
+/// string because the marker names the failure, which is the whole reason it exists.
+pub(crate) const RUN_FAILED_PREFIX: &str = "[Run failed: ";
+const RUN_FAILED_SUFFIX: &str = "]";
+const MARKER_REASON_CHARS: usize = 200;
 pub const UNAVAILABLE_RESULT: &str = "[Tool result not available]";
 
 pub type HistorySnapshot = caudra_storage::sessions::HistorySnapshot<HistoryItem>;
@@ -165,8 +170,8 @@ impl History {
     /// No epoch bump, unlike [`Self::truncate`]: the epoch marks a wholesale
     /// swap of the conversation, and this is the exact inverse of the append
     /// that added the marker.
-    pub(crate) fn drop_cancel_marker(&mut self) -> bool {
-        if !self.messages.last().is_some_and(is_cancel_marker) {
+    pub(crate) fn drop_run_marker(&mut self) -> bool {
+        if !self.messages.last().is_some_and(is_run_marker) {
             return false;
         }
         let item_len = item_len_for_message_count(self.active_items(), self.messages.len() - 1);
@@ -531,12 +536,23 @@ fn is_empty_marker(m: &Message) -> bool {
     m.is_empty_padding()
 }
 
-/// Role and `display_text` are part of the shape here too: a user who types the
-/// marker text verbatim wrote a real message, and a resume must not eat it.
-fn is_cancel_marker(m: &Message) -> bool {
+/// The markers a run leaves behind when it ends without a reply: a cancel, or a failure that
+/// killed the turn. Both exist only so the transcript ends on a user message, and both are
+/// dropped by a resume so the model picks the loop back up.
+///
+/// Role and `display_text` are part of the shape here too: a user who types the marker text
+/// verbatim wrote a real message, and a resume must not eat it.
+fn is_run_marker(m: &Message) -> bool {
     matches!(m.role, Role::User)
         && m.display_text.as_deref() == Some("")
-        && matches!(m.content.as_slice(), [ContentBlock::Text { text }] if text == CANCEL_MARKER)
+        && matches!(m.content.as_slice(), [ContentBlock::Text { text }]
+            if text == CANCEL_MARKER || is_run_failure_marker(text))
+}
+
+/// Recognises what [`sanitize_failed_history`] wrote, so a frontend can tell a turn that died
+/// mid-run from one that never started and offer the resume that picks it back up.
+pub fn is_run_failure_marker(text: &str) -> bool {
+    text.starts_with(RUN_FAILED_PREFIX) && text.ends_with(RUN_FAILED_SUFFIX)
 }
 
 pub fn close_dangling_tool_calls(messages: &mut Vec<Message>, note: &str) {
@@ -561,21 +577,50 @@ pub fn close_dangling_tool_calls(messages: &mut Vec<Message>, note: &str) {
     });
 }
 
-/// Reports whether the marker was appended, so the caller can announce the
-/// same row the restored transcript will draw from it.
-pub(crate) fn sanitize_cancelled_history(history: &mut History, rollback_len: usize) -> bool {
+/// Ends a run that produced no reply on a user message, closing any tool call the loop left
+/// dangling, so the transcript does not stop mid-turn and the next request has a seam to answer
+/// from. Reports whether the marker was appended, so the caller can announce the same row the
+/// restored transcript will draw from it.
+fn close_run_with_marker(history: &mut History, rollback_len: usize, marker: &str) -> bool {
     if history.len() <= rollback_len {
         return false;
     }
     let mut tail = history.as_slice().last().cloned().into_iter().collect();
-    close_dangling_tool_calls(&mut tail, CANCEL_MARKER);
+    close_dangling_tool_calls(&mut tail, marker);
     let mut additions = Vec::with_capacity(2);
     if tail.len() == 2 {
         additions.push(tail.pop().unwrap());
     }
-    additions.push(Message::synthetic(CANCEL_MARKER.into()));
+    additions.push(Message::synthetic(marker.into()));
     history.extend(additions);
     true
+}
+
+pub(crate) fn sanitize_cancelled_history(history: &mut History, rollback_len: usize) -> bool {
+    close_run_with_marker(history, rollback_len, CANCEL_MARKER)
+}
+
+/// Records a run killed by an error its retry budget could not absorb. Without it the transcript
+/// ends on whatever the loop last wrote -- after a tool call, on the tool result -- and a
+/// reloaded session looks like it simply stopped mid-task. Returns the marker it wrote so the
+/// caller can announce the same text it persisted.
+pub(crate) fn sanitize_failed_history(
+    history: &mut History,
+    rollback_len: usize,
+    reason: &str,
+) -> Option<String> {
+    let marker = format!("{RUN_FAILED_PREFIX}{}{RUN_FAILED_SUFFIX}", one_line(reason));
+    close_run_with_marker(history, rollback_len, &marker).then_some(marker)
+}
+
+/// A provider can fail with a whole response body. The marker is one row of transcript, so it
+/// carries enough to recognise the failure and leaves the rest to the log.
+fn one_line(reason: &str) -> String {
+    let collapsed = reason.split_whitespace().collect::<Vec<_>>().join(" ");
+    match collapsed.char_indices().nth(MARKER_REASON_CHARS) {
+        Some((end, _)) => format!("{}...", &collapsed[..end]),
+        None => collapsed,
+    }
 }
 
 #[cfg(test)]
@@ -588,6 +633,7 @@ mod tests {
     const FIRST: &str = "first";
     const SECOND: &str = "second";
     const GO: &str = "go";
+    const FAILURE: &str = "inference engine is unavailable";
 
     #[track_caller]
     fn assert_ends_with_cancel_marker(history: &History) {
@@ -691,6 +737,81 @@ mod tests {
         if expect_cancel_marker {
             assert_ends_with_cancel_marker(&history);
         }
+    }
+
+    /// The shape the outage produced: the loop got as far as a tool result and then the provider
+    /// died. Without a marker the transcript ends there and a reload cannot say why.
+    #[test]
+    fn a_failed_run_closes_on_a_marker_naming_the_failure() {
+        let mut history = History::new(vec![
+            Message::user(GO.into()),
+            make_tool_use_msg(&["t1"]),
+            make_tool_result_msg(&["t1"]),
+        ]);
+
+        let marker = sanitize_failed_history(&mut history, 1, FAILURE).expect("marker expected");
+
+        assert!(marker.contains(FAILURE), "the marker must name the failure: {marker}");
+        assert_eq!(history.len(), 4);
+        let last = history.as_slice().last().unwrap();
+        assert!(matches!(last.role, Role::User));
+        assert_eq!(last.display_text.as_deref(), Some(""));
+    }
+
+    /// A resume has to land back on the tool result the loop stopped at, exactly as it does
+    /// after a cancel, or the model answers the marker instead of continuing the task.
+    #[test]
+    fn a_failure_marker_is_dropped_by_a_resume() {
+        let mut history = History::new(vec![
+            Message::user(GO.into()),
+            make_tool_use_msg(&["t1"]),
+            make_tool_result_msg(&["t1"]),
+        ]);
+
+        assert!(sanitize_failed_history(&mut history, 1, FAILURE).is_some());
+        assert!(history.drop_run_marker());
+
+        assert_eq!(history.len(), 3);
+        assert!(matches!(
+            history.as_slice().last().unwrap().content.as_slice(),
+            [ContentBlock::ToolResult { .. }]
+        ));
+    }
+
+    /// A run that wrote nothing has nothing to close, and a marker there would be a turn the
+    /// user never took.
+    #[test]
+    fn a_failure_before_the_run_wrote_anything_marks_nothing() {
+        let mut history = History::new(vec![Message::user(GO.into())]);
+
+        assert!(sanitize_failed_history(&mut history, 1, FAILURE).is_none());
+        assert_eq!(history.len(), 1);
+    }
+
+    /// A provider can fail with a whole response body, and the marker is one transcript row.
+    #[test]
+    fn a_failure_marker_stays_one_readable_line() {
+        let sprawling = format!("API error (503):\n{}", "x".repeat(MARKER_REASON_CHARS * 2));
+        let mut history = History::new(vec![Message::user(GO.into()), make_tool_use_msg(&["t1"])]);
+
+        let marker = sanitize_failed_history(&mut history, 1, &sprawling).expect("marker expected");
+
+        assert!(!marker.contains('\n'), "the marker must not break the row: {marker}");
+        assert!(marker.chars().count() < sprawling.chars().count());
+        assert!(marker.starts_with(RUN_FAILED_PREFIX) && marker.ends_with(RUN_FAILED_SUFFIX));
+    }
+
+    /// A dangling call has to be closed before the marker, or the next request goes out with a
+    /// tool call nothing answered.
+    #[test]
+    fn a_failure_inside_a_tool_call_closes_it_first() {
+        let mut history = History::new(vec![Message::user(GO.into()), make_tool_use_msg(&["t1"])]);
+
+        assert!(sanitize_failed_history(&mut history, 1, FAILURE).is_some());
+        assert!(history.drop_run_marker());
+
+        let last = history.as_slice().last().unwrap();
+        assert_eq!(extract_error_ids(last), ["t1"]);
     }
 
     #[test]
@@ -896,13 +1017,13 @@ mod tests {
         true
         ; "synthetic_marker_is_dropped"
     )]
-    fn drop_cancel_marker_cases(messages: Vec<Message>, expected: bool) {
+    fn drop_run_marker_cases(messages: Vec<Message>, expected: bool) {
         let mirror = make_mirror();
         let len = messages.len();
         let mut history = History::new(messages).with_mirror(Arc::clone(&mirror));
         let epoch = mirror.load().epoch;
 
-        assert_eq!(history.drop_cancel_marker(), expected);
+        assert_eq!(history.drop_run_marker(), expected);
 
         let expected_len = len - usize::from(expected);
         assert_eq!(history.len(), expected_len);
@@ -919,7 +1040,7 @@ mod tests {
         let mut history = History::new(vec![Message::user(GO.into()), make_tool_use_msg(&["t1"])]);
 
         sanitize_cancelled_history(&mut history, 0);
-        assert!(history.drop_cancel_marker());
+        assert!(history.drop_run_marker());
 
         assert_eq!(history.len(), 3);
         let last = history.as_slice().last().unwrap();

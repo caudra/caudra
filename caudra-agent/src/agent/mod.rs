@@ -22,6 +22,7 @@ pub use goal::{
 };
 pub use history::{
     History, HistorySnapshot, SharedHistory, UNAVAILABLE_RESULT, close_dangling_tool_calls,
+    is_run_failure_marker,
 };
 pub use instructions::{
     InstructionBaseline, InstructionScope, Instructions, LoadedInstructions, build_system_prompt,

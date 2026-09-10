@@ -18,7 +18,9 @@ use super::goal::{
     Evaluator, GoalApply, GoalHandle, GoalStatus, ResolvedEvaluator, continuation_message,
     is_unrecoverable, resolve_evaluator,
 };
-use super::history::{CANCEL_MARKER, History, repair_tool_pairs, sanitize_cancelled_history};
+use super::history::{
+    CANCEL_MARKER, History, repair_tool_pairs, sanitize_cancelled_history, sanitize_failed_history,
+};
 use super::instructions::LoadedInstructions;
 use super::mention_preamble;
 use super::provider_projection;
@@ -429,6 +431,15 @@ impl<'h> Agent<'h> {
                         message: e.to_string(),
                     })?;
                 }
+                // The turn dies here, but whatever it already wrote stays. Closing it on a
+                // marker is what stops a reloaded session from ending mid-task on a tool
+                // result with nothing to say why.
+                if let Some(text) =
+                    sanitize_failed_history(self.history, self.rollback_len, &e.user_message())
+                {
+                    let _ = self.event_tx.send(AgentEvent::Injected { text });
+                }
+                self.publish_prepared_context();
                 return Err(e);
             }
         };
@@ -495,7 +506,7 @@ impl<'h> Agent<'h> {
     /// cut there is no such seam, and an assistant tail would go out as a
     /// prefill, which providers reject once reasoning is on.
     fn prepare_resume(&mut self) {
-        self.history.drop_cancel_marker();
+        self.history.drop_run_marker();
         if self
             .history
             .as_slice()
