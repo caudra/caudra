@@ -86,10 +86,13 @@ const PROJECT_READ_TOOLS: &[&str] = &[
     "read",
     "view_image",
 ];
+/// Tools whose reach is fixed by their own construction rather than by an
+/// argument, so a scope would describe nothing a caller can steer.
 const TRUSTED_UNSCOPED_TOOLS: &[&str] = &[
     "batch",
     "python_execution",
     "question",
+    "skill",
     "task",
     "todo_write",
     "tool_output",
@@ -3803,6 +3806,7 @@ mod tests {
     #[test_case("write", "/tmp/file.txt" => true ; "write_in_cwd")]
     #[test_case("write", "/etc/passwd" => false ; "write_outside_cwd")]
     #[test_case("task", "task:research" => true ; "task_allowed")]
+    #[test_case("skill", r#"{"name":"caudra-workflow-dev"}"# => true ; "skill_allowed")]
     #[test_case("bash", "cargo test" => false ; "bash_prompts")]
     #[test_case("bash", "echo hi" => true ; "literal_echo_allowed")]
     #[test_case("shell", "echo hi" => true ; "literal_echo_allowed_for_shell")]

@@ -16,11 +16,11 @@ use arc_swap::ArcSwap;
 use serde_json::Value;
 
 use crate::tools::registry::{
-    ExecFuture, HeaderFuture, HeaderResult, ParseError, PermissionScopes, RegisteredTool, Tool,
-    ToolExecResult, ToolInvocation, ToolRegistry,
+    ExecFuture, HeaderFuture, HeaderResult, ParseError, RegisteredTool, Tool, ToolExecResult,
+    ToolInvocation, ToolRegistry,
 };
 use crate::tools::schema::{ParamKind, ParamSchema, Property, to_json_schema, validate};
-use crate::tools::{BoxFuture, DescriptionContext, SKILL_TOOL_NAME, ToolContext, relative_path};
+use crate::tools::{DescriptionContext, SKILL_TOOL_NAME, ToolContext, relative_path};
 use crate::types::ToolOutput;
 
 pub const DESCRIPTION: &str =
@@ -280,25 +280,6 @@ struct SkillCall {
 impl ToolInvocation for SkillCall {
     fn start_header(&self) -> HeaderFuture {
         HeaderFuture::Ready(HeaderResult::plain(self.name.clone()))
-    }
-
-    /// Scoped to the directories a skill can come from, not the individual
-    /// file: approving `skill` once should not re-prompt per skill. Superseded
-    /// directories are never read, so granting them would over-approve.
-    fn permission_scopes(&self) -> BoxFuture<'_, Option<PermissionScopes>> {
-        let scopes: Vec<String> = self
-            .dirs
-            .iter()
-            .filter(|dir| dir.is_selected())
-            .map(|dir| format!("{}/**", dir.path.to_string_lossy().trim_end_matches('/')))
-            .collect();
-        Box::pin(std::future::ready((!scopes.is_empty()).then_some(
-            PermissionScopes {
-                scopes,
-                force_prompt: false,
-                plan_scoped: false,
-            },
-        )))
     }
 
     fn execute<'a>(self: Box<Self>, _ctx: &'a ToolContext) -> ExecFuture<'a> {
@@ -649,34 +630,6 @@ mod tests {
         assert_eq!(first[0].description, "ship safely");
         assert!(tool.catalog().description.contains("- deploy: ship safely"));
         assert!(!tool.catalog().description.contains("later"));
-    }
-
-    #[test]
-    fn permission_scopes_cover_every_selected_directory() {
-        let call = SkillCall {
-            name: "x".into(),
-            dirs: vec![
-                selected(PathBuf::from("/a/skills")),
-                selected(PathBuf::from("/b/skills")),
-                SkillDirCandidate {
-                    path: PathBuf::from("/c/skills"),
-                    scope: SkillScope::User,
-                    state: SkillDirState::Superseded,
-                },
-            ],
-        };
-        let scopes = smol::block_on(call.permission_scopes()).unwrap();
-        assert_eq!(scopes.scopes, vec!["/a/skills/**", "/b/skills/**"]);
-        assert!(!scopes.force_prompt);
-    }
-
-    #[test]
-    fn no_search_directories_means_no_scopes() {
-        let call = SkillCall {
-            name: "x".into(),
-            dirs: Vec::new(),
-        };
-        assert!(smol::block_on(call.permission_scopes()).is_none());
     }
 
     #[test]
