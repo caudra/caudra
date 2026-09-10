@@ -10,6 +10,7 @@ pub mod subagent;
 pub mod task_runner;
 pub mod title;
 mod tool_body;
+mod tool_delegation;
 pub mod tool_dispatch;
 mod tool_preview;
 mod tool_roster;

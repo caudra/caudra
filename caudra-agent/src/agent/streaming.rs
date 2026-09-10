@@ -13,12 +13,13 @@ use serde_json::Value;
 use tracing::{info, warn};
 
 use super::tool_body::BodyStream;
+use super::tool_delegation::{Delegated, DelegationStream};
 use super::tool_preview;
 use super::tool_roster::RosterStream;
 use crate::cancel::CancelToken;
 use crate::nudge::Nudge;
 use crate::tools::native::batch;
-use crate::types::BatchToolEntry;
+use crate::types::{BatchToolEntry, Delegation};
 use crate::{AgentError, AgentEvent, EventSender};
 
 const FUNCTIONS_PREFIX: &str = "functions.";
@@ -63,6 +64,9 @@ struct Changed {
     size: Option<String>,
     body: Option<String>,
     roster: Option<Vec<BatchToolEntry>>,
+    /// One per delegating call the fragment moved: the call itself, or the
+    /// `batch` children writing their briefs.
+    delegations: Vec<Delegation>,
 }
 
 /// The argument JSON of one tool call as it arrives, kept only until the
@@ -81,14 +85,21 @@ struct PendingInput {
     size: Option<String>,
     /// Present only for `batch`, whose whole argument is a list of other calls.
     roster: Option<RosterStream>,
+    /// Present only for `task`, whose brief opens a chat before it runs.
+    delegation: Option<DelegationStream>,
+    /// The call's own id, so a delegation can name the chat its subagent will
+    /// publish under.
+    id: String,
 }
 
 impl PendingInput {
-    fn new(name: String) -> Self {
+    fn new(id: String, name: String) -> Self {
         Self {
             body: BodyStream::new(&name),
             roster: RosterStream::new(&name),
+            delegation: DelegationStream::new(&name),
             name,
+            id,
             json: String::new(),
             preview: None,
             settled: false,
@@ -102,19 +113,42 @@ impl PendingInput {
         // A batch has no headline of its own to scan for: its children are the
         // headline, and the count they add up to is what the row says.
         if self.roster.is_some() {
-            let Some(entries) = self.roster.as_mut().and_then(|r| r.absorb(delta)) else {
-                return Changed::default();
+            let rostered = self
+                .roster
+                .as_mut()
+                .map(|roster| roster.absorb(delta))
+                .unwrap_or_default();
+            let delegations = rostered
+                .delegated
+                .into_iter()
+                .map(|(index, delegated)| {
+                    delegation(batch::child_tool_use_id(Some(&self.id), index), delegated)
+                })
+                .collect();
+            let Some(entries) = rostered.entries else {
+                return Changed {
+                    delegations,
+                    ..Changed::default()
+                };
             };
             return Changed {
                 preview: self.published(batch::roster_header(entries.len())),
                 roster: Some(entries),
+                delegations,
                 ..Changed::default()
             };
         }
+        let delegations = self
+            .delegation
+            .as_mut()
+            .and_then(|stream| stream.absorb(delta))
+            .map(|delegated| vec![delegation(self.id.clone(), delegated)])
+            .unwrap_or_default();
         let preview = self.absorb_preview(delta);
         let Some(stream) = self.body.as_mut() else {
             return Changed {
                 preview,
+                delegations,
                 ..Changed::default()
             };
         };
@@ -133,6 +167,7 @@ impl PendingInput {
             size,
             body,
             roster: None,
+            delegations,
         }
     }
 
@@ -159,6 +194,16 @@ impl PendingInput {
             self.preview = Some(header.clone());
             header
         })
+    }
+}
+
+/// Names a decoded brief with the id the subagent it opens will publish under.
+fn delegation(parent_tool_use_id: String, delegated: Delegated) -> Delegation {
+    Delegation {
+        parent_tool_use_id,
+        name: delegated.name,
+        prompt: delegated.prompt,
+        task_id: delegated.task_id,
     }
 }
 
@@ -208,7 +253,7 @@ async fn forward_provider_events(
             ProviderEvent::ThinkingBoundary => AgentEvent::ThinkingBoundary,
             ProviderEvent::ToolUseStart { id, name } => {
                 let name = canonical_tool_name(&name).to_owned();
-                pending_inputs.insert(id.clone(), PendingInput::new(name.clone()));
+                pending_inputs.insert(id.clone(), PendingInput::new(id.clone(), name.clone()));
                 AgentEvent::ToolPending { id, name }
             }
             ProviderEvent::ToolInputDelta { id, delta } => {
@@ -227,6 +272,7 @@ async fn forward_provider_events(
                     size: changed.size,
                     body: changed.body,
                     roster: changed.roster,
+                    delegations: changed.delegations,
                 }
             }
             ProviderEvent::PromptProgress {

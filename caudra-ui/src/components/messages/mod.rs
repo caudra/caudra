@@ -744,6 +744,10 @@ pub struct MessagesPanel {
     messages: Vec<DisplayMessage>,
     streaming_thinking: StreamingContent,
     streaming_text: StreamingContent,
+    /// Whose words `streaming_text` currently holds. A delegated task's chat
+    /// streams the instruction it is being given before any agent is attached
+    /// to it, and that is the one case where the buffer is not the model's.
+    streaming_role: DisplayRole,
     started_at: Instant,
     scroll_top: u16,
     auto_scroll: bool,
@@ -837,6 +841,7 @@ impl MessagesPanel {
                 assistant.prefix_style,
                 ms,
             ),
+            streaming_role: DisplayRole::Assistant,
             started_at: Instant::now(),
             scroll_top: u16::MAX,
             auto_scroll: true,
@@ -1129,7 +1134,35 @@ impl MessagesPanel {
     pub fn text_delta(&mut self, text: &str) {
         self.clear_hover();
         self.flush_thinking();
+        self.stream_as(DisplayRole::Assistant);
         self.streaming_text.push(text);
+    }
+
+    /// Grows the instruction a delegated task is being given while the call
+    /// that will carry it is still being written. The chat it lands in has no
+    /// agent behind it yet, so nothing else can be streaming into the same
+    /// buffer.
+    pub fn prompt_delta(&mut self, text: &str) {
+        self.clear_hover();
+        self.stream_as(DisplayRole::User);
+        self.streaming_text.push(text);
+        self.enable_auto_scroll();
+    }
+
+    /// Closes the buffer before it changes hands, so one bubble can never hold
+    /// two speakers.
+    fn stream_as(&mut self, role: DisplayRole) {
+        if self.streaming_role == role {
+            return;
+        }
+        self.flush();
+        self.streaming_role = role;
+    }
+
+    /// The chrome the streaming buffer draws under, which follows whose words
+    /// it holds.
+    fn streaming_kind(&self) -> SegmentKind {
+        segment_kind(&self.streaming_role)
     }
 
     pub fn tool_pending(&mut self, id: String, name: &str) {
@@ -1532,6 +1565,7 @@ impl MessagesPanel {
     pub fn stream_reset(&mut self) {
         self.streaming_thinking.clear();
         self.streaming_text.clear();
+        self.streaming_role = DisplayRole::Assistant;
         self.streaming_reasoning_open = None;
         self.thinking_started = None;
         self.cancel_in_progress();
@@ -1703,10 +1737,11 @@ impl MessagesPanel {
         self.prompt_rate.reset();
         if !self.streaming_text.is_empty() {
             self.messages.push(DisplayMessage::new(
-                DisplayRole::Assistant,
+                self.streaming_role.clone(),
                 self.streaming_text.take_all(),
             ));
         }
+        self.streaming_role = DisplayRole::Assistant;
     }
 
     pub fn scroll(&mut self, delta: i32) {
@@ -2044,7 +2079,7 @@ impl MessagesPanel {
                 self.streaming_thinking_collapsed(),
                 SegmentKind::Thinking,
             ),
-            (&self.streaming_text, false, SegmentKind::Assistant),
+            (&self.streaming_text, false, self.streaming_kind()),
         ];
         for (stream, collapsed, kind) in streams {
             if stream.is_empty() {
@@ -2499,13 +2534,16 @@ impl MessagesPanel {
         if width_changed {
             self.cache.mark_all_width_stale();
             let thinking = thinking_style();
-            let assistant = assistant_style();
+            let streaming = match self.streaming_role {
+                DisplayRole::User => user_style(),
+                _ => assistant_style(),
+            };
             self.streaming_thinking
                 .set_style("", thinking.text_style, thinking.prefix_style);
             self.streaming_text.set_style(
-                assistant.prefix,
-                assistant.text_style,
-                assistant.prefix_style,
+                streaming.prefix,
+                streaming.text_style,
+                streaming.prefix_style,
             );
         }
         self.follow_latest();
@@ -2563,7 +2601,7 @@ impl MessagesPanel {
 
         if !self.streaming_text.is_empty() {
             let content_width =
-                SegmentChrome::for_kind(SegmentKind::Assistant, width, 0).content_width(width);
+                SegmentChrome::for_kind(self.streaming_kind(), width, 0).content_width(width);
             if self.streaming_text.update_render(content_width) {
                 self.clear_hover();
             }
@@ -2646,7 +2684,7 @@ impl MessagesPanel {
                 thinking_collapsed,
                 SegmentKind::Thinking,
             ),
-            (&self.streaming_text, false, SegmentKind::Assistant),
+            (&self.streaming_text, false, self.streaming_kind()),
         ];
         for (sc, collapsed, kind) in streamed {
             if sc.is_empty() || height_idx >= streaming_heights.len() || cursor.past_bottom() {
@@ -2697,7 +2735,7 @@ impl MessagesPanel {
                             (sc.cached_lines(), Some(sc.links())),
                             h,
                             SegmentChrome::for_kind(kind, width, 0),
-                            (None, None),
+                            segment_styles(kind, accent, compact),
                             RenderFeedback::default(),
                             frame,
                         );
@@ -2879,7 +2917,7 @@ impl MessagesPanel {
             String::new(),
             None,
         );
-        segment.set_kind(SegmentKind::Assistant);
+        segment.set_kind(self.streaming_kind());
         segment.set_margin_top(u16::from(
             cached_count > 0 || !self.streaming_thinking.is_empty(),
         ));

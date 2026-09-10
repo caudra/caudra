@@ -21,6 +21,7 @@
 //! gap, so an index always means the child it looks like, and `ToolStart`
 //! replaces the whole thing with the roster the batch actually dispatched.
 
+use super::tool_delegation::{Delegated, DelegationStream};
 use super::tool_preview::{
     candidates, object_member, past_scan_cap, preview_for, same_key, string_member,
 };
@@ -99,6 +100,12 @@ struct Child {
     tool: Option<String>,
     summary: String,
     settled: bool,
+    /// Present only for a child that delegates, from the moment it names
+    /// itself. A prompt outgrows anything worth rescanning, so it is read one
+    /// character at a time instead.
+    delegation: Option<DelegationStream>,
+    /// What the delegation revealed since the last publication.
+    revealed: Delegated,
 }
 
 impl Child {
@@ -113,6 +120,37 @@ impl Child {
         if !self.settled {
             self.text.push(c);
         }
+        if let Some(stream) = self.delegation.as_mut() {
+            stream.push(c, &mut self.revealed);
+        }
+    }
+
+    /// Hands the element read so far to a delegation reader and stops
+    /// buffering it: from here the child is read character by character, which
+    /// is the only affordable way to carry a prompt of any length.
+    fn delegate(&mut self, tool: &str) {
+        let Some(mut stream) = DelegationStream::new(tool) else {
+            return;
+        };
+        for c in self.text.chars() {
+            stream.push(c, &mut self.revealed);
+        }
+        self.delegation = Some(stream);
+        self.settle();
+    }
+
+    /// What this child's delegation revealed, `None` when it revealed nothing.
+    /// The row's own header follows the description, since the rescan that
+    /// used to keep it current stopped at the hand-off.
+    fn take_revealed(&mut self) -> Option<Delegated> {
+        if self.revealed.is_empty() {
+            return None;
+        }
+        let revealed = std::mem::take(&mut self.revealed);
+        if let Some(name) = &revealed.name {
+            self.summary.clone_from(name);
+        }
+        Some(revealed)
     }
 
     fn settle(&mut self) {
@@ -134,6 +172,15 @@ impl Child {
             annotation: None,
         })
     }
+}
+
+/// What one fragment of a `batch` call left behind.
+#[derive(Default)]
+pub(super) struct Rostered {
+    /// The roster, `None` when no row changed.
+    pub(super) entries: Option<Vec<BatchToolEntry>>,
+    /// What each delegating child revealed, by its index in the list.
+    pub(super) delegated: Vec<(usize, Delegated)>,
 }
 
 /// The roster of one `batch` call as its argument fragments arrive.
@@ -161,16 +208,27 @@ impl RosterStream {
             .then(Self::default)
     }
 
-    /// The roster this fragment left behind, `None` when it changed no row.
-    /// The list stops at the first child still waiting for its name, so an
-    /// index always means the child it looks like.
-    pub(super) fn absorb(&mut self, delta: &str) -> Option<Vec<BatchToolEntry>> {
+    /// What this fragment left behind: the roster, when it changed a row, and
+    /// whatever any delegating child revealed. The list stops at the first
+    /// child still waiting for its name, so an index always means the child it
+    /// looks like.
+    pub(super) fn absorb(&mut self, delta: &str) -> Rostered {
         for c in delta.chars() {
             self.push(c);
         }
         self.refresh();
-        std::mem::take(&mut self.changed)
-            .then(|| self.children.iter().map_while(Child::entry).collect())
+        let delegated: Vec<(usize, Delegated)> = self
+            .children
+            .iter_mut()
+            .enumerate()
+            .filter_map(|(index, child)| Some((index, child.take_revealed()?)))
+            .collect();
+        self.changed |= delegated.iter().any(|(_, d)| d.name.is_some());
+        Rostered {
+            entries: std::mem::take(&mut self.changed)
+                .then(|| self.children.iter().map_while(Child::entry).collect()),
+            delegated,
+        }
     }
 
     /// Re-reads the element still being written. Every earlier child has
@@ -194,12 +252,19 @@ impl RosterStream {
         );
         let summary = preview.as_ref().map(|p| p.text.clone()).unwrap_or_default();
         let changed = child.tool.as_deref() != Some(tool.as_str()) || child.summary != summary;
-        child.tool = Some(tool);
+        child.tool = Some(tool.clone());
         child.summary = summary;
+        self.changed |= changed;
+        // A delegating child owns the rest of its element: it stops being
+        // rescanned and starts being decoded, which is what carries a prompt
+        // no preview would ever hold.
+        child.delegate(&tool);
+        if child.settled {
+            return;
+        }
         if preview.is_some_and(|p| p.complete) || past_scan_cap(child.text.len()) {
             child.settle();
         }
-        self.changed |= changed;
     }
 
     fn open(&mut self) {
@@ -332,8 +397,32 @@ mod tests {
     const GREP: &str = "file_grep";
     const SHELL: &str = "shell";
     const WRITE: &str = "file_write";
+    const TASK: &str = "task";
     /// Long enough that the element outgrows what is worth re-reading.
     const OVERSIZED_BODY: usize = 16 * 1024;
+
+    /// Every brief the fragments revealed, folded per child index.
+    fn delegated(fragments: &[&str]) -> Vec<(usize, String, String)> {
+        let mut stream = RosterStream::new(BATCH).unwrap();
+        let mut folded: Vec<(usize, String, String)> = Vec::new();
+        for fragment in fragments {
+            for (index, revealed) in stream.absorb(fragment).delegated {
+                let slot = match folded.iter_mut().find(|(at, ..)| *at == index) {
+                    Some(slot) => slot,
+                    None => {
+                        folded.push((index, String::new(), String::new()));
+                        folded.last_mut().expect("just pushed")
+                    }
+                };
+                if let Some(name) = revealed.name {
+                    slot.1 = name;
+                }
+                slot.2
+                    .push_str(revealed.prompt.as_deref().unwrap_or_default());
+            }
+        }
+        folded
+    }
 
     /// What a roster draws: one tool and one header per row.
     fn rows(entries: Vec<BatchToolEntry>) -> Vec<(String, String)> {
@@ -357,7 +446,7 @@ mod tests {
         let mut stream = RosterStream::new(BATCH).unwrap();
         fragments
             .iter()
-            .filter_map(|fragment| stream.absorb(fragment))
+            .filter_map(|fragment| stream.absorb(fragment).entries)
             .map(rows)
             .collect()
     }
@@ -465,13 +554,14 @@ mod tests {
     #[test]
     fn a_fragment_that_changes_no_row_publishes_nothing() {
         let mut stream = RosterStream::new(BATCH).unwrap();
-        assert!(stream.absorb(r#"{"tool_calls": [{"too"#).is_none());
+        assert!(stream.absorb(r#"{"tool_calls": [{"too"#).entries.is_none());
         let named = stream
             .absorb(r#"l": "shell", "parameters": {"command": "ls"}}"#)
+            .entries
             .expect("a named child is a row");
         assert_eq!(rows(named), [row(SHELL, "ls")]);
         assert!(
-            stream.absorb(", ").is_none(),
+            stream.absorb(", ").entries.is_none(),
             "the comma between children changes no row"
         );
     }
@@ -483,6 +573,7 @@ mod tests {
         let mut stream = RosterStream::new(BATCH).unwrap();
         let entries = stream
             .absorb(r#"{"tool_calls": [{"tool": "shell", "parameters": {"command": "ls"}}"#)
+            .entries
             .expect("a named child is a row");
         let [entry] = &entries[..] else {
             panic!("expected one child, got {}", entries.len());
@@ -533,6 +624,71 @@ mod tests {
         assert_eq!(
             roster(&[unfinished, r#"}, "tool": "file_read"}"#]),
             [row(READ, "a.rs")]
+        );
+    }
+
+    #[test]
+    fn every_delegating_child_reveals_its_brief_under_its_own_index() {
+        let json = concat!(
+            r#"{"tool_calls": [{"tool": "task", "parameters": {"description": "first", "#,
+            r#""prompt": "do one"}}, {"tool": "shell", "parameters": {"command": "ls"}}, "#,
+            r#"{"tool": "task", "parameters": {"description": "second", "prompt": "do two"}}]}"#
+        );
+        assert_eq!(
+            delegated(&[json]),
+            [
+                (0, "first".to_owned(), "do one".to_owned()),
+                (2, "second".to_owned(), "do two".to_owned()),
+            ]
+        );
+    }
+
+    /// One fragment can close a child and open the next, and a brief must not
+    /// spill from the chat it belongs to into its sibling's.
+    #[test]
+    fn a_fragment_spanning_two_children_splits_their_briefs() {
+        let fragments = [
+            r#"{"tool_calls": [{"tool": "task", "parameters": {"prompt": "do "#,
+            r#"one"}}, {"tool": "task", "parameters": {"prompt": "do two"#,
+        ];
+        assert_eq!(
+            delegated(&fragments),
+            [
+                (0, String::new(), "do one".to_owned()),
+                (1, String::new(), "do two".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_child_that_does_not_delegate_reveals_nothing() {
+        let json = r#"{"tool_calls": [{"tool": "shell", "parameters": {"command": "ls"}}]}"#;
+        assert!(delegated(&[json]).is_empty());
+    }
+
+    /// A description settles the preview, but the prompt behind it is the
+    /// whole point, so the child keeps being read past that closing quote.
+    #[test]
+    fn a_delegating_child_keeps_streaming_past_its_settled_preview() {
+        let body = "x".repeat(OVERSIZED_BODY);
+        let json = format!(
+            r#"{{"tool_calls": [{{"tool": "task", "parameters": {{"description": "big", "prompt": "{body}"}}}}, {{"tool": "shell", "parameters": {{"command": "ls"#
+        );
+        assert_eq!(delegated(&[&json]), [(0, "big".to_owned(), body)]);
+        assert_eq!(roster(&[&json]), [row(TASK, "big"), row(SHELL, "ls")]);
+    }
+
+    /// The rescan that used to keep the row current stops at the hand-off, so
+    /// the header has to follow the description the delegation decodes.
+    #[test]
+    fn a_delegating_child_names_its_row_from_the_brief_it_streams() {
+        let published = published(&[
+            r#"{"tool_calls": [{"tool": "task", "parameters": {"description": "Rename "#,
+            r#"the workflow"}}"#,
+        ]);
+        assert_eq!(
+            published.last().map(Vec::as_slice),
+            Some([row(TASK, "Rename the workflow")].as_slice())
         );
     }
 

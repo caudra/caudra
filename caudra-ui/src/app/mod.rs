@@ -5,6 +5,7 @@
 //! `AgentHandles::respawn`. Everything else only reads it.
 
 mod btw;
+mod delegation;
 mod image_paste;
 mod memory;
 pub(crate) mod mode;
@@ -406,6 +407,10 @@ pub struct App {
     pending_subagent_steers: HashMap<String, VecDeque<PendingSteer>>,
     unsent_subagent_steers: HashMap<String, VecDeque<PendingSteer>>,
     parent_task_ids: HashMap<String, String>,
+    /// Chats opened from a delegation whose call has not run yet, by the
+    /// `parent_tool_use_id` their subagent is predicted to publish under. They
+    /// stay out of `chat_index`, which routes events for subagents that exist.
+    pending_delegations: HashSet<String>,
     /// How much of each card is open, shared by every chat and pushed at
     /// render time.
     pub(crate) view: ViewMode,
@@ -604,6 +609,7 @@ impl App {
             pending_subagent_steers: HashMap::new(),
             unsent_subagent_steers: HashMap::new(),
             parent_task_ids: HashMap::new(),
+            pending_delegations: HashSet::new(),
             view,
         };
         app.model_picker.set_recents(
@@ -2779,7 +2785,7 @@ impl App {
         }
     }
 
-    fn handle_agent_event(&mut self, envelope: Envelope) -> Vec<Action> {
+    fn handle_agent_event(&mut self, mut envelope: Envelope) -> Vec<Action> {
         // Sent under their own run id, ahead of the stale-run filter: a run
         // outlives the turn that launched it and reports through every one
         // after it.
@@ -3019,7 +3025,25 @@ impl App {
             None => 0,
         };
 
+        // A brief is written by the main chat and read into the task's own,
+        // which is neither of the chats this event is otherwise addressed to.
+        if let AgentEvent::ToolInputDelta {
+            ref mut delegations,
+            ..
+        } = envelope.event
+            && subagent_id.is_none()
+        {
+            for delegation in std::mem::take(delegations) {
+                self.delegation_delta(delegation);
+            }
+        }
+
         if let AgentEvent::ToolDone(ref e) = envelope.event {
+            // Whatever the call opened and never claimed was a prediction the
+            // call disagreed with: bad arguments, or a child `batch` refused.
+            if subagent_id.is_none() {
+                self.discard_pending_delegations_under(&e.id);
+            }
             if self.state.mode == Mode::Plan
                 && self.state.plan.path().is_some_and(|pp| e.wrote_to(pp))
             {
@@ -3052,6 +3076,7 @@ impl App {
 
         if matches!(envelope.event, AgentEvent::StreamReset) {
             self.chats[chat_idx].stream_reset();
+            self.discard_stream_delegations(chat_idx);
             self.retry_info = None;
             return vec![];
         }
@@ -3063,6 +3088,7 @@ impl App {
         } = envelope.event
         {
             self.chats[chat_idx].stream_reset();
+            self.discard_stream_delegations(chat_idx);
             if chat_idx == 0 {
                 self.retry_info = Some(RetryInfo {
                     attempt,
@@ -3412,6 +3438,15 @@ impl App {
             if let Some(ref model) = subagent.model {
                 self.chats[0].update_tool_model(parent_tool_use_id, model);
             }
+        }
+
+        if let Some(idx) = self.adopt_pending_delegation(parent_tool_use_id, task_id) {
+            let chat = &mut self.chats[idx];
+            chat.name.clone_from(&subagent.name);
+            chat.model_id.clone_from(&subagent.model);
+            self.chat_index.insert(task_id.clone(), idx);
+            self.sync_subagents();
+            return idx;
         }
 
         if let Some(&idx) = self.chat_index.get(task_id.as_str()) {
@@ -4238,6 +4273,7 @@ impl App {
     }
 
     fn finish_subagents(&mut self, outcome: TaskOutcome, text: &str) {
+        self.discard_all_pending_delegations();
         self.retain_resolved_subagents(outcome, text);
         self.chat_index.clear();
     }
@@ -4245,6 +4281,7 @@ impl App {
     /// Terminalizes every tool left in progress when a turn ends, sparing
     /// shell commands that outlive the agent.
     fn terminalize_turn(&mut self, message: &str) {
+        self.discard_all_pending_delegations();
         self.retain_resolved_subagents(TaskOutcome::Error, ERROR_TEXT);
         self.chats[0].fail_in_progress_except(message.into(), self.shell.active_ids());
         for chat in self.chats.iter_mut().skip(1) {

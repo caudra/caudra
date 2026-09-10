@@ -25,7 +25,7 @@ use crate::patch;
 /// Stops carrying a runaway body once no reader could follow it. Matches the
 /// cap on live shell output. The line count keeps going, so a huge write still
 /// reports that it is making progress.
-const LIVE_BODY_MAX_BYTES: usize = 64 * 1024;
+pub(super) const LIVE_BODY_MAX_BYTES: usize = 64 * 1024;
 /// Room for the envelope lines a streaming patch is named by. A patch that
 /// declares more files than this holds collapsed to a bare count long ago, and
 /// `ToolStart` replaces whatever the header settled on.
@@ -136,7 +136,7 @@ impl Envelope {
 
 /// One decoded character, or the fact that the escape it belongs to has not
 /// produced one yet.
-enum Piece {
+pub(super) enum Piece {
     Char(char),
     Pending,
     /// The closing quote.
@@ -146,14 +146,14 @@ enum Piece {
 /// Decodes a JSON string body one character at a time, the opening quote
 /// already consumed.
 #[derive(Default)]
-struct StringReader {
+pub(super) struct StringReader {
     escaped: bool,
     /// The code point built so far and how many of its digits have arrived.
     unicode: Option<(u32, u8)>,
 }
 
 impl StringReader {
-    fn push(&mut self, c: char) -> Piece {
+    pub(super) fn push(&mut self, c: char) -> Piece {
         if let Some((code, seen)) = self.unicode {
             // A lone surrogate or a truncated escape contributes nothing
             // rather than poisoning the body with a replacement character.

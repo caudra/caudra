@@ -1,6 +1,6 @@
 use super::*;
 use crate::agent::shared_queue;
-use crate::app::tasks::MAIN_TASK_ID;
+use crate::app::tasks::{MAIN_TASK_ID, TaskStatus};
 use crate::chat::{CANCELLED_TEXT, DONE_TEXT, ERROR_TEXT};
 use crate::components::btw_modal::BtwEvent;
 use crate::components::command::{BUILTIN_COMMANDS, CommandPalette, ParsedCommand};
@@ -1648,6 +1648,274 @@ fn subagent_prompt_shown_once_and_not_duplicated() {
     app.chats[1].flush();
     assert_eq!(app.chats[1].message_count(), 2);
     assert_eq!(app.chats[1].last_message_text(), "ab");
+}
+
+const DELEGATE_ID: &str = "toolu_delegate";
+const DELEGATE_NAME: &str = "Rename the workflow";
+const DELEGATE_PROMPT: &str = "Rename it everywhere.";
+
+fn delegation(
+    parent_id: &str,
+    name: Option<&str>,
+    prompt: Option<&str>,
+) -> caudra_agent::Delegation {
+    caudra_agent::Delegation {
+        parent_tool_use_id: parent_id.into(),
+        name: name.map(String::from),
+        prompt: prompt.map(String::from),
+        task_id: None,
+    }
+}
+
+fn delegation_msg(delegations: Vec<caudra_agent::Delegation>) -> Msg {
+    agent_msg(AgentEvent::ToolInputDelta {
+        id: DELEGATE_ID.into(),
+        name: caudra_agent::tools::TASK_TOOL_NAME.into(),
+        delta: String::new(),
+        preview: None,
+        size: None,
+        body: None,
+        roster: None,
+        delegations,
+    })
+}
+
+fn tool_done_msg(id: &str) -> Msg {
+    agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
+        id: id.into(),
+        tool: caudra_agent::tools::TASK_TOOL_NAME.into(),
+        output: ToolOutput::Plain("done".into()),
+        is_error: false,
+        annotation: None,
+        written_path: None,
+        written_paths: Vec::new(),
+        output_ref: None,
+        output_limits: None,
+        model_suffix: None,
+        model_output: None,
+        model_output_from_ref: false,
+    })))
+}
+
+/// A streaming task opens its chat before anything runs, so the reader can
+/// walk into it and watch the brief being written.
+#[test]
+fn a_streaming_delegation_opens_an_enterable_chat_before_its_call_runs() {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    app.update(delegation_msg(vec![delegation(
+        DELEGATE_ID,
+        Some(DELEGATE_NAME),
+        Some("Rename it "),
+    )]));
+    app.update(delegation_msg(vec![delegation(
+        DELEGATE_ID,
+        None,
+        Some("everywhere."),
+    )]));
+
+    assert_eq!(app.chats.len(), 2);
+    assert_eq!(app.chats[1].name, DELEGATE_NAME);
+    app.chats[1].flush();
+    assert_eq!(app.chats[1].last_message_text(), DELEGATE_PROMPT);
+    assert!(
+        app.chat_index.is_empty(),
+        "nothing routes a subagent's events to a chat with no subagent behind it"
+    );
+    app.focus_task(DELEGATE_ID).expect("the task is reachable");
+    assert_eq!(app.active_chat, 1);
+    assert_eq!(
+        app.tasks()
+            .into_iter()
+            .map(|task| (task.id.to_string(), task.status))
+            .collect::<Vec<_>>(),
+        [
+            (MAIN_TASK_ID.to_owned(), None),
+            (DELEGATE_ID.to_owned(), Some(TaskStatus::Working)),
+        ]
+    );
+}
+
+/// The prediction becomes the real chat: one transcript, one copy of the
+/// instruction, and the routing cache finally pointing at it.
+#[test]
+fn the_subagent_adopts_the_chat_its_brief_already_opened() {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    app.update(delegation_msg(vec![delegation(
+        DELEGATE_ID,
+        Some(DELEGATE_NAME),
+        Some(DELEGATE_PROMPT),
+    )]));
+    app.update(subagent_msg_with_prompt(
+        AgentEvent::TextDelta { text: "a".into() },
+        DELEGATE_ID,
+        Some(DELEGATE_NAME),
+        Some(DELEGATE_PROMPT),
+    ));
+
+    assert_eq!(
+        app.chats.len(),
+        2,
+        "the prediction was adopted, not doubled"
+    );
+    assert_eq!(app.chats[1].message_count(), 1);
+    assert_eq!(app.chats[1].last_message_text(), DELEGATE_PROMPT);
+    assert_eq!(app.chat_index.get(DELEGATE_ID), Some(&1));
+    assert!(app.pending_delegations.is_empty());
+}
+
+/// The reserved id differs from the predicted one when the call collided with
+/// its own history. The chat follows the real id rather than being shadowed.
+#[test]
+fn a_subagent_reserved_under_another_id_still_adopts_the_chat() {
+    const RESERVED: &str = "session-fresh";
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    app.update(delegation_msg(vec![delegation(
+        DELEGATE_ID,
+        Some(DELEGATE_NAME),
+        Some(DELEGATE_PROMPT),
+    )]));
+    let mut info = subagent_info(DELEGATE_ID, DELEGATE_NAME);
+    info.task_id = RESERVED.into();
+    app.update(subagent_msg_with_info(
+        AgentEvent::TextDelta { text: "a".into() },
+        info,
+    ));
+
+    assert_eq!(app.chats.len(), 2);
+    assert_eq!(
+        app.chats[1].task_id().map(|id| id.to_string()).as_deref(),
+        Some(RESERVED)
+    );
+    assert_eq!(app.chat_index.get(RESERVED), Some(&1));
+}
+
+/// A batch writes its children under ids that extend its own, and each brief
+/// has to land in the chat that child will run in.
+#[test]
+fn every_batched_delegation_opens_its_own_chat() {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    app.update(delegation_msg(vec![
+        delegation("batch1:0", Some("first"), Some("do one")),
+        delegation("batch1:1", Some("second"), Some("do two")),
+    ]));
+
+    assert_eq!(app.chats.len(), 3);
+    for (idx, (name, prompt)) in [("first", "do one"), ("second", "do two")]
+        .into_iter()
+        .enumerate()
+    {
+        let chat = &mut app.chats[idx + 1];
+        chat.flush();
+        assert_eq!(chat.name, name);
+        assert_eq!(chat.last_message_text(), prompt);
+    }
+}
+
+#[test_case(
+    |app: &mut App| { app.update(agent_msg(AgentEvent::StreamReset)); }
+    ; "a_reset_stream"
+)]
+#[test_case(
+    |app: &mut App| { app.update(tool_done_msg(DELEGATE_ID)); }
+    ; "a_call_that_never_opened_a_subagent"
+)]
+#[test_case(end_turn ; "the_end_of_the_turn")]
+fn an_unclaimed_delegation_is_dropped_by(abandon: fn(&mut App)) {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    app.update(delegation_msg(vec![delegation(
+        DELEGATE_ID,
+        Some(DELEGATE_NAME),
+        Some(DELEGATE_PROMPT),
+    )]));
+    app.active_chat = 1;
+
+    abandon(&mut app);
+
+    assert_eq!(app.chats.len(), 1, "the prediction left nothing behind");
+    assert_eq!(app.active_chat, 0, "focus followed the chat that went");
+    assert!(app.pending_delegations.is_empty());
+}
+
+/// Removing a chat shifts every index behind it, and `chat_index` is a map of
+/// indices, so a real subagent must not be left pointing at the wrong one.
+#[test]
+fn dropping_a_prediction_keeps_the_surviving_chats_addressable() {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    app.update(delegation_msg(vec![delegation(
+        DELEGATE_ID,
+        Some(DELEGATE_NAME),
+        Some(DELEGATE_PROMPT),
+    )]));
+    app.update(subagent_msg(
+        AgentEvent::TextDelta { text: "a".into() },
+        TASK_ID,
+        Some("real"),
+    ));
+    assert_eq!(app.chat_index.get(TASK_ID), Some(&2));
+
+    app.update(tool_done_msg(DELEGATE_ID));
+
+    assert_eq!(app.chats.len(), 2);
+    assert_eq!(app.chat_index.get(TASK_ID), Some(&1));
+    assert_eq!(app.chats[1].name, "real");
+}
+
+/// A prediction is not session state: a snapshot taken while one is on screen
+/// must not record a subagent that may never exist.
+#[test]
+fn a_checkpoint_taken_over_a_prediction_records_no_subagent() {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    app.update(delegation_msg(vec![delegation(
+        DELEGATE_ID,
+        Some(DELEGATE_NAME),
+        Some(DELEGATE_PROMPT),
+    )]));
+    app.checkpoint();
+    assert!(app.state.session.subagents().is_empty());
+}
+
+/// A continuation names a chat that already holds a transcript. Its
+/// instruction lands there whole when the call runs, so the prediction opened
+/// beside it goes rather than showing the brief twice.
+#[test]
+fn a_continuation_drops_the_prediction_and_leaves_its_chat_alone() {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    app.update(subagent_msg(
+        AgentEvent::TextDelta { text: "a".into() },
+        TASK_ID,
+        Some("earlier"),
+    ));
+    app.update(delegation_msg(vec![delegation(
+        DELEGATE_ID,
+        Some(DELEGATE_NAME),
+        Some("more work"),
+    )]));
+    assert_eq!(app.chats.len(), 3);
+
+    app.update(delegation_msg(vec![caudra_agent::Delegation {
+        task_id: Some(TASK_ID.into()),
+        ..delegation(DELEGATE_ID, None, None)
+    }]));
+
+    assert_eq!(app.chats.len(), 2);
+    assert_eq!(app.chats[1].name, "earlier");
+    assert!(app.pending_delegations.is_empty());
 }
 
 #[test]

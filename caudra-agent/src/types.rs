@@ -1108,6 +1108,11 @@ pub enum AgentEvent {
         /// the roster the batch actually dispatched.
         #[serde(skip_serializing_if = "Option::is_none")]
         roster: Option<Vec<BatchToolEntry>>,
+        /// The briefs the delegating calls in this fragment are writing: the
+        /// call itself, or the `batch` children that moved. Empty for every
+        /// fragment that delegates nothing, which is nearly all of them.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        delegations: Vec<Delegation>,
     },
     ToolStart(Box<ToolStartEvent>),
     /// `content` is the **full accumulated output** so far, not a delta.
@@ -1726,6 +1731,26 @@ pub fn format_live_duration(duration: Duration) -> String {
             tenths % 10
         )
     }
+}
+
+/// What a delegating call has revealed about the subagent it is about to
+/// open, while its arguments are still arriving. The chat opened from this is
+/// a prediction: [`SubagentInfo`] is the truth, and it adopts the chat by
+/// `parent_tool_use_id`, which is exact in every case.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Delegation {
+    /// The id the subagent's events will carry: the call's own `tool_use_id`,
+    /// or the one a `batch` derives for the child writing this.
+    pub parent_tool_use_id: String,
+    /// The `description` so far, republished as it grows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// What this fragment added to the prompt, decoded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    /// Set only by a call continuing a subagent that already has an id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

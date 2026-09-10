@@ -316,13 +316,19 @@ impl BatchCall {
 /// output refs do not collide with a sibling's.
 fn child_context(ctx: &ToolContext, index: usize) -> ToolContext {
     let mut child = ctx.clone();
-    child.tool_use_id = ctx
-        .tool_use_id
-        .as_ref()
-        .map(|id| format!("{id}:{index}"))
-        .or(Some(index.to_string()));
+    child.tool_use_id = Some(child_tool_use_id(ctx.tool_use_id.as_deref(), index));
     child.live_sink = None;
     child
+}
+
+/// The id a child runs under. Shared with the streaming reader that predicts
+/// it, so a chat opened before the dispatch cannot be keyed on an id the
+/// dispatch would never use.
+pub(crate) fn child_tool_use_id(parent: Option<&str>, index: usize) -> String {
+    match parent {
+        Some(id) => format!("{id}:{index}"),
+        None => index.to_string(),
+    }
 }
 
 fn publish(

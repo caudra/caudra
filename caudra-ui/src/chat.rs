@@ -121,6 +121,19 @@ impl Chat {
         self.task_id.as_ref()
     }
 
+    /// A chat opened from a still-streaming delegation is keyed on the id its
+    /// subagent is predicted to take. When the real one differs, the chat
+    /// follows it rather than being duplicated beside it.
+    pub(crate) fn set_task_id(&mut self, id: impl Into<Arc<str>>) {
+        self.task_id = Some(id.into());
+    }
+
+    /// Grows the instruction this task is being given, before the subagent
+    /// that will receive it exists.
+    pub(crate) fn prompt_delta(&mut self, text: &str) {
+        self.messages_panel.prompt_delta(text);
+    }
+
     pub(crate) fn parent_tool_use_id(&self) -> Option<&Arc<str>> {
         self.parent_tool_use_id.as_ref()
     }
