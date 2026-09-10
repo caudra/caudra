@@ -1,7 +1,7 @@
 -- Policy for the Python interpreter: which tools it may call, what the model
 -- sees (via the `describe(dctx)` callback), and the preamble. The sandbox and
 -- dispatch live in Rust, which exposes primitives only (`caudra.api.get_tools`,
--- `caudra.agent.call_tool`); orchestration policy is here.
+-- `caudra.agent.call_tool`); the exposure policy is here.
 
 local ToolView = require("caudra.tool_view")
 local output_limits = require("caudra.output_limits")
@@ -46,8 +46,6 @@ async def gather(*calls):
     return results
 ]]):format(ERROR_PREFIX)
 local TOOLS_HEADER = "\n\nAvailable tools (called as Python functions with keyword arguments):\n"
-local WORKFLOW_TOOLS_NOTE =
-  "\nWorkflow mode: orchestrate subagents from this script. Await every `task(...)` call and use `gather(task(...), task(...))` for parallel fan-out. Pass `output_schema` to task for machine-readable results (a JSON string, parse with `json.loads`).\n"
 local PY_TYPES = { string = "str", integer = "int", boolean = "bool", array = "list" }
 
 local opts = caudra.api.register_options(output_limits.extend({
@@ -157,15 +155,14 @@ for line in content.splitlines():
 -- Shared predicate for describe and handler so advertised == callable.
 -- The interpreter is a calling convention, not a capability grant: a read-only
 -- subagent must not reach edit/write through Python.
-local function interpreter_tools(tools, audience, workflow)
+local function interpreter_tools(tools, audience)
   local out = {}
   for _, t in ipairs(tools) do
     local aud = {}
     for _, a in ipairs(t.audiences) do
       aud[a] = true
     end
-    if t.enabled and aud[audience] and (aud.interpreter or (workflow and aud.workflow)) then
-      t.workflow_only = not aud.interpreter
+    if t.enabled and aud[audience] and aud.interpreter then
       out[#out + 1] = t
     end
   end
@@ -220,15 +217,10 @@ end
 -- to avoid recursion from describe callbacks.
 local function describe(dctx)
   local parts = { description, TOOLS_HEADER }
-  local has_workflow_only = false
-  for _, t in ipairs(interpreter_tools(caudra.api.get_tools(), dctx.audience, dctx.workflow)) do
+  for _, t in ipairs(interpreter_tools(caudra.api.get_tools(), dctx.audience)) do
     if matches_filter(t.name, dctx) then
-      has_workflow_only = has_workflow_only or t.workflow_only
       parts[#parts + 1] = signature(t) .. "\n"
     end
-  end
-  if has_workflow_only then
-    parts[#parts + 1] = WORKFLOW_TOOLS_NOTE
   end
   return table.concat(parts)
 end
@@ -282,9 +274,9 @@ local function handler(input, ctx)
   end)
 
   local tools = {}
-  for _, t in ipairs(interpreter_tools(caudra.api.get_tools({ config = config }), ctx:audience(), ctx:workflow())) do
+  local call_opts = { timeout = timeout }
+  for _, t in ipairs(interpreter_tools(caudra.api.get_tools({ config = config }), ctx:audience())) do
     local name = t.name
-    local call_opts = t.workflow_only and {} or { timeout = timeout }
     tools[name] = function(tool_input)
       return caudra.agent.call_tool(ctx, name, tool_input, call_opts)
     end

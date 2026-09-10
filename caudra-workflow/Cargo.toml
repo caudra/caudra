@@ -1,0 +1,23 @@
+[package]
+name = "caudra-workflow"
+description = "Durable, runtime-neutral workflow scripting engine that orchestrates agents through a small host ABI."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["rhai"]
+rhai = ["dep:rhai"]
+
+[dependencies]
+rhai = { workspace = true, optional = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+test-case = { workspace = true }

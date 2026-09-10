@@ -49,6 +49,8 @@ use crate::id::CaudraId;
 use crate::retention::SessionFacts;
 use crate::tool_outputs::{TOOL_OUTPUT_DIR, delete_session_outputs};
 use crate::usage_ledger::LedgerPurpose;
+use crate::workflow::{SESSION_WORKFLOW_BYTES, trim_workflow_runs, workflow_totals};
+use crate::workflow_scratch::{remove_session as remove_scratch_session, session_scratch_bytes};
 use crate::{
     StateDir, StorageError, lock_session_artifacts, shared_existing_state_lock, shared_state_lock,
 };
@@ -56,7 +58,7 @@ use crate::{
 pub const SESSIONS_DB_FILE: &str = "sessions.sqlite3";
 pub const SESSIONS_DB_LOCK_FILE: &str = "sessions.sqlite3.lock";
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 const APPLICATION_ID: i64 = i32::from_be_bytes(*b"CAUD") as i64;
 /// Pages copied per step of the pre-migration backup. The whole file is copied
 /// under the initialization lock, so this only bounds how long the backup holds
@@ -80,7 +82,8 @@ const OWNER_FILE_MODE: u32 = 0o600;
 pub(super) const SESSION_SNAPSHOT_DIR: &str = "session-snapshots";
 const CLEANUP_RETRY_DELAY_MS: i64 = 60_000;
 const PENDING_ARCHIVE_ORPHAN_GRACE: Duration = Duration::from_secs(60 * 60);
-const ARTIFACT_CLEANUP_KINDS: [&str; 3] = ["tool_output", "archive", "snapshot"];
+const ARTIFACT_CLEANUP_KINDS: [&str; 4] =
+    ["tool_output", "archive", "snapshot", "workflow_scratch"];
 const STATE_SCOPE_GLOBAL: &str = "global";
 /// Rich tool output rows at or below this size survive a trim so old
 /// transcripts keep their todo panels and other small structured records.
@@ -205,6 +208,76 @@ DROP TABLE usage_ledger_v3;
 ALTER TABLE model_usage ADD COLUMN subscription_cost REAL;
 "#;
 
+/// Durable workflow runs and the journal of host calls each one made. Runs
+/// belong to a session and go with it; calls belong to a run. `bytes` is
+/// generated so the accounting can never drift from the row it describes.
+const WORKFLOW_TABLES: &str = r#"
+CREATE TABLE workflow_runs (
+    run_id           TEXT PRIMARY KEY,
+    session_id       BLOB NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    display_name     TEXT NOT NULL,
+    workflow_name    TEXT NOT NULL,
+    source_kind      TEXT NOT NULL CHECK(source_kind IN ('builtin', 'project', 'user')),
+    source_path      TEXT,
+    source_digest    TEXT NOT NULL,
+    language_version INTEGER NOT NULL,
+    abi_version      INTEGER NOT NULL,
+    source           TEXT NOT NULL,
+    args             TEXT NOT NULL CHECK(json_valid(args)),
+    objective        TEXT,
+    launch_mode      TEXT NOT NULL,
+    status           TEXT NOT NULL CHECK(status IN ('active', 'paused', 'budget_limited', 'interrupted', 'completed', 'cancelled', 'failed')),
+    pause_kind       TEXT,
+    pause_message    TEXT,
+    revision         INTEGER NOT NULL DEFAULT 0,
+    execution_epoch  INTEGER NOT NULL DEFAULT 0,
+    phase            TEXT,
+    agent_budget     INTEGER NOT NULL,
+    agents_admitted  INTEGER NOT NULL DEFAULT 0,
+    usage            TEXT NOT NULL CHECK(json_valid(usage)),
+    roster           TEXT NOT NULL CHECK(json_valid(roster)),
+    result           TEXT CHECK(result IS NULL OR json_valid(result)),
+    error            TEXT,
+    outbox_pending   INTEGER NOT NULL DEFAULT 0 CHECK(outbox_pending IN (0, 1)),
+    created_at       INTEGER NOT NULL,
+    updated_at       INTEGER NOT NULL,
+    bytes            INTEGER NOT NULL GENERATED ALWAYS AS (
+        length(CAST(run_id AS BLOB)) + length(CAST(display_name AS BLOB))
+        + length(CAST(workflow_name AS BLOB)) + coalesce(length(CAST(source_path AS BLOB)), 0)
+        + length(CAST(source_digest AS BLOB)) + length(CAST(source AS BLOB))
+        + length(CAST(args AS BLOB)) + coalesce(length(CAST(objective AS BLOB)), 0)
+        + length(CAST(launch_mode AS BLOB)) + coalesce(length(CAST(pause_kind AS BLOB)), 0)
+        + coalesce(length(CAST(pause_message AS BLOB)), 0) + coalesce(length(CAST(phase AS BLOB)), 0)
+        + length(CAST(usage AS BLOB)) + length(CAST(roster AS BLOB))
+        + coalesce(length(CAST(result AS BLOB)), 0) + coalesce(length(CAST(error AS BLOB)), 0)
+    ) STORED
+) STRICT;
+
+CREATE INDEX workflow_runs_by_session ON workflow_runs(session_id, created_at);
+
+CREATE TABLE workflow_calls (
+    run_id       TEXT NOT NULL REFERENCES workflow_runs(run_id) ON DELETE CASCADE,
+    call_key     INTEGER NOT NULL,
+    kind         TEXT NOT NULL CHECK(kind IN ('agent', 'parallel', 'scratch_file')),
+    request_hash TEXT NOT NULL,
+    request      TEXT NOT NULL CHECK(json_valid(request)),
+    state        TEXT NOT NULL CHECK(state IN ('started', 'completed', 'failed')),
+    result       TEXT CHECK(result IS NULL OR json_valid(result)),
+    error        TEXT,
+    task_id      TEXT,
+    started_at   INTEGER NOT NULL,
+    finished_at  INTEGER,
+    tokens_used  INTEGER NOT NULL DEFAULT 0,
+    duration_ms  INTEGER NOT NULL DEFAULT 0,
+    bytes        INTEGER NOT NULL GENERATED ALWAYS AS (
+        length(CAST(run_id AS BLOB)) + length(CAST(request_hash AS BLOB))
+        + length(CAST(request AS BLOB)) + coalesce(length(CAST(result AS BLOB)), 0)
+        + coalesce(length(CAST(error AS BLOB)), 0) + coalesce(length(CAST(task_id AS BLOB)), 0)
+    ) STORED,
+    PRIMARY KEY(run_id, call_key)
+) STRICT;
+"#;
+
 /// One step of the schema chain. A fresh database gets [`SCHEMA`] at
 /// [`SCHEMA_VERSION`] directly; only an existing database replays these.
 struct Migration {
@@ -228,6 +301,11 @@ const MIGRATIONS: &[Migration] = &[
         from: 3,
         to: 4,
         sql: USAGE_LEDGER_ADD_SUBSCRIPTION,
+    },
+    Migration {
+        from: 4,
+        to: 5,
+        sql: WORKFLOW_TABLES,
     },
 ];
 
@@ -353,7 +431,7 @@ CREATE TABLE pending_archives (
 
 /// What a fresh database gets: every migration already folded in.
 fn full_schema() -> String {
-    format!("{SCHEMA}{USAGE_LEDGER_TABLE}")
+    format!("{SCHEMA}{USAGE_LEDGER_TABLE}{WORKFLOW_TABLES}")
 }
 
 /// One turn on its way into [`usage_ledger`](USAGE_LEDGER_TABLE). Borrowed
@@ -441,6 +519,9 @@ pub struct SessionStorageStats {
     pub tool_output_count: u64,
     pub subagent_item_count: u64,
     pub logical_bytes: u64,
+    pub workflow_run_count: u64,
+    pub workflow_call_count: u64,
+    pub workflow_bytes: u64,
     pub tool_output_file_bytes: u64,
     pub snapshot_bytes: u64,
     pub archive_bytes: u64,
@@ -453,6 +534,8 @@ pub struct SessionStorageStats {
 pub struct TrimReport {
     pub tool_output_rows: u64,
     pub tool_output_row_bytes: u64,
+    pub workflow_call_rows: u64,
+    pub workflow_call_bytes: u64,
     pub artifact_bytes: u64,
 }
 
@@ -652,6 +735,7 @@ impl SessionDatabase {
         let pending_cleanup_jobs: i64 =
             self.connection
                 .query_row("SELECT count(*) FROM cleanup_jobs", [], |row| row.get(0))?;
+        let workflow = workflow_totals(&self.connection)?;
         let state_path = self.state_dir.path();
         Ok(SessionStorageStats {
             database_bytes,
@@ -669,6 +753,9 @@ impl SessionDatabase {
             tool_output_count: from_i64(tool_output_count, "tool output count")?,
             subagent_item_count: from_i64(subagent_item_count, "subagent item count")?,
             logical_bytes: from_i64(logical_bytes, "logical bytes")?,
+            workflow_run_count: workflow.run_count,
+            workflow_call_count: workflow.call_count,
+            workflow_bytes: workflow.bytes,
             tool_output_file_bytes: directory_bytes(&state_path.join(TOOL_OUTPUT_DIR)),
             snapshot_bytes: directory_bytes(&state_path.join(SESSION_SNAPSHOT_DIR)),
             archive_bytes: directory_bytes(
@@ -781,14 +868,16 @@ impl SessionDatabase {
     }
 
     /// Scalar facts for every session, or for one working directory. Payload
-    /// tables are never joined to plan retention.
+    /// tables are never joined to plan retention; workflow rows contribute
+    /// their accounted size only.
     pub fn session_facts(&self, cwd: Option<&str>) -> Result<Vec<SessionFacts>, SessionError> {
-        let mut statement = self.connection.prepare(
+        let mut statement = self.connection.prepare(&format!(
             "SELECT id, title, cwd, created_at, updated_at, last_opened_at, pinned, trimmed_at,\
-                    logical_bytes, json_extract(metadata, '$.pending_revert') IS NOT NULL \
+                    logical_bytes + {SESSION_WORKFLOW_BYTES}, \
+                    json_extract(metadata, '$.pending_revert') IS NOT NULL \
              FROM sessions WHERE ?1 IS NULL OR cwd = ?1 \
-             ORDER BY max(updated_at, coalesce(last_opened_at, 0)) DESC, id DESC",
-        )?;
+             ORDER BY max(updated_at, coalesce(last_opened_at, 0)) DESC, id DESC"
+        ))?;
         let mut rows = statement.query(params![cwd])?;
         let mut facts = Vec::new();
         while let Some(row) = rows.next()? {
@@ -835,6 +924,7 @@ impl SessionDatabase {
             "DELETE FROM tool_outputs WHERE session_id = ?1 AND byte_count > ?2",
             params![id.as_bytes().as_slice(), TRIM_KEEP_OUTPUT_BYTES],
         )?;
+        let workflow = trim_workflow_runs(&transaction, id)?;
         let removed_rows = from_i64_usize(rows, "trimmed tool output rows")?;
         let removed_bytes = from_i64_usize(bytes, "trimmed tool output bytes")?;
         let tool_output_count = root.tool_output_count.checked_sub(removed_rows);
@@ -868,6 +958,8 @@ impl SessionDatabase {
         Ok(TrimReport {
             tool_output_rows: from_i64(rows, "trimmed tool output rows")?,
             tool_output_row_bytes: from_i64(bytes, "trimmed tool output bytes")?,
+            workflow_call_rows: workflow.call_rows,
+            workflow_call_bytes: workflow.call_bytes,
             artifact_bytes,
         })
     }
@@ -876,7 +968,7 @@ impl SessionDatabase {
     pub fn artifact_bytes(&self, id: CaudraId) -> u64 {
         let state_path = self.state_dir.path();
         let name = id.to_string();
-        [
+        let directories: u64 = [
             state_path.join(TOOL_OUTPUT_DIR).join(&name),
             state_path.join(SESSION_SNAPSHOT_DIR).join(&name),
             state_path
@@ -886,7 +978,31 @@ impl SessionDatabase {
         ]
         .iter()
         .map(|path| directory_bytes(path))
-        .sum()
+        .sum();
+        directories + session_scratch_bytes(&self.state_dir, id)
+    }
+
+    pub(crate) fn connection(&self) -> &Connection {
+        &self.connection
+    }
+
+    /// Payload bounds shared with the workflow repository, which lives outside
+    /// this module: byte size against the canonical payload limit, then
+    /// nesting depth.
+    pub(crate) fn validate_payload_json(
+        kind: &'static str,
+        value: &str,
+    ) -> Result<(), SessionError> {
+        validate_len(kind, value.len(), MAX_PAYLOAD_BYTES)?;
+        validate_json_depth(value)
+    }
+
+    pub(crate) fn validate_len(
+        kind: &'static str,
+        actual: usize,
+        maximum: usize,
+    ) -> Result<(), SessionError> {
+        validate_len(kind, actual, maximum)
     }
 
     pub fn state_get<T: DeserializeOwned>(
@@ -1465,6 +1581,7 @@ impl SessionDatabase {
                 id,
             ),
             "snapshot" => remove_state_directory(&self.state_dir, &[SESSION_SNAPSHOT_DIR], id),
+            "workflow_scratch" => remove_scratch_session(&self.state_dir, id),
             _ => unreachable!("cleanup kind validated"),
         };
         match cleanup {
@@ -3323,6 +3440,7 @@ mod tests {
 
     use super::*;
     use crate::sessions::{Session, StoredSubagentOutcome, TitleSource};
+    use crate::workflow_scratch::WORKFLOW_SCRATCH_DIR;
     use serde::{Deserialize, Serialize};
     use serde_json::{Value, json};
     use tempfile::TempDir;
@@ -3337,6 +3455,9 @@ mod tests {
     const SMALL_OUTPUT_ID: &str = "small";
     const TOMBSTONES_TABLE: &str = "session_tombstones";
     const LEDGER_TABLE: &str = "usage_ledger";
+    const WORKFLOW_RUNS_TABLE: &str = "workflow_runs";
+    const MIGRATED_MATCHES_FRESH: &str =
+        "a migrated database must end with exactly the schema a fresh one gets";
     const BACKUP_KEEPS_ORIGIN: &str =
         "the pre-migration backup must stay readable by the version that wrote it";
     const PARTIAL_MIGRATION: &str = "a failed step must leave a version some binary can open";
@@ -4068,7 +4189,7 @@ mod tests {
         assert!(!shm.exists());
     }
 
-    fn artifact_paths(state_dir: &StateDir, id: CaudraId) -> [PathBuf; 3] {
+    fn artifact_paths(state_dir: &StateDir, id: CaudraId) -> [PathBuf; 4] {
         let name = id.to_string();
         [
             state_dir.path().join(TOOL_OUTPUT_DIR).join(&name),
@@ -4078,10 +4199,11 @@ mod tests {
                 .join(super::super::ARCHIVE_DIR)
                 .join(&name),
             state_dir.path().join(SESSION_SNAPSHOT_DIR).join(&name),
+            state_dir.path().join(WORKFLOW_SCRATCH_DIR).join(&name),
         ]
     }
 
-    fn seed_artifacts(state_dir: &StateDir, id: CaudraId) -> [PathBuf; 3] {
+    fn seed_artifacts(state_dir: &StateDir, id: CaudraId) -> [PathBuf; 4] {
         let paths = artifact_paths(state_dir, id);
         for path in &paths {
             fs::create_dir_all(path).unwrap();
@@ -4362,6 +4484,64 @@ mod tests {
         );
     }
 
+    /// A database as the release before workflow storage left it: schema 4.
+    fn seed_v4_database(state_dir: &StateDir) {
+        let path = state_dir.path().join(SESSIONS_DB_FILE);
+        create_owner_only(&path).unwrap();
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .pragma_update(None, "page_size", PAGE_SIZE)
+            .unwrap();
+        connection
+            .pragma_update(None, "auto_vacuum", "INCREMENTAL")
+            .unwrap();
+        connection.execute_batch("VACUUM").unwrap();
+        connection.execute_batch(SCHEMA).unwrap();
+        connection.execute_batch(USAGE_LEDGER_TABLE).unwrap();
+        connection
+            .pragma_update(None, "application_id", APPLICATION_ID)
+            .unwrap();
+        connection.pragma_update(None, "user_version", 4).unwrap();
+        drop(connection);
+    }
+
+    fn schema_objects(database: &SessionDatabase) -> Vec<(String, String, Option<String>)> {
+        let mut statement = database
+            .connection
+            .prepare(
+                "SELECT type, name, sql FROM sqlite_schema \
+                 WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name",
+            )
+            .unwrap();
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn migrating_a_v4_database_yields_the_fresh_schema() {
+        let (_migrated_temp, migrated_dir) = state_dir();
+        let (_fresh_temp, fresh_dir) = state_dir();
+        seed_v4_database(&migrated_dir);
+
+        let migrated = SessionDatabase::open(&migrated_dir).unwrap();
+        let fresh = SessionDatabase::open(&fresh_dir).unwrap();
+
+        assert_eq!(migrated.stats().unwrap().schema_version, SCHEMA_VERSION);
+        assert_eq!(
+            schema_objects(&migrated),
+            schema_objects(&fresh),
+            "{MIGRATED_MATCHES_FRESH}"
+        );
+        assert!(
+            schema_objects(&fresh)
+                .iter()
+                .any(|(_, name, _)| name == WORKFLOW_RUNS_TABLE)
+        );
+    }
+
     #[test]
     fn migrating_leaves_the_original_readable_at_its_own_version() {
         let (_temp, state_dir) = state_dir();
@@ -4608,7 +4788,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(deferred, 3);
+        assert_eq!(deferred, ARTIFACT_CLEANUP_KINDS.len() as i64);
         drop(lease);
         database
             .connection
@@ -4617,7 +4797,7 @@ mod tests {
 
         let completed = database.process_cleanup_jobs().unwrap();
 
-        assert_eq!(completed, 3);
+        assert_eq!(completed, ARTIFACT_CLEANUP_KINDS.len() as u64);
         assert!(
             paths.iter().all(|path| !path.exists()),
             "{ARTIFACTS_REMOVED}"

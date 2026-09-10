@@ -295,7 +295,7 @@ async fn new_session(
     close_session(srv).await;
     let mcp = start_mcp(&cwd, &req.mcp_servers).await;
     prepared.set_mcp_handle(mcp.clone());
-    let handle = headless::spawn_prepared_interactive(prepared);
+    let handle = headless::spawn_prepared_interactive(prepared).await;
     caudra_otel::emit::session_started(
         caudra_otel::emit::START_FRESH,
         Some(handle.session_id.as_str()),
@@ -359,7 +359,7 @@ async fn load_session(
     close_session(srv).await;
     let mcp = start_mcp(&cwd, &req.mcp_servers).await;
     prepared.set_mcp_handle(mcp.clone());
-    let handle = headless::spawn_prepared_interactive(prepared);
+    let handle = headless::spawn_prepared_interactive(prepared).await;
     for update in replay_updates {
         session_update(&srv.out_tx, &sid, update);
     }
@@ -433,10 +433,12 @@ async fn prepare_session(
         session_yolo,
         system_prompt_override: None,
         append_system_prompt: None,
-        workflow: false,
         model_policy: Arc::clone(&params.model_policy),
         plugin_rules: Arc::clone(&params.plugin_rules),
         local_tools,
+        // ACP has no wire shape for workflow runs, so a session under it
+        // gets no runtime and the `workflow` tool reports unavailable.
+        workflow_mode: None,
     })
     .await
     .map_err(|error| AcpError::internal_error().data(json_str(&error)))?;
@@ -748,7 +750,6 @@ fn handle_prompt(srv: &mut Server, raw: &Value, id: &RequestId) -> Result<(), Ac
         preamble: Vec::new(),
         thinking: srv.thinking.clone(),
         fast: false,
-        workflow: false,
         prompt: None,
         resume: false,
     };
@@ -1061,6 +1062,13 @@ fn start_event_pump(
                     }
                     continue;
                 }
+                AgentEvent::Workflow(event) => {
+                    debug!(
+                        ?event,
+                        "workflow event dropped: ACP sessions run no workflows"
+                    );
+                    continue;
+                }
                 _ => continue,
             };
             session_update(&out_tx, &sid, update);
@@ -1214,6 +1222,7 @@ mod tests {
             session_id,
             session_lease,
             permissions,
+            workflow: None,
             task: smol::spawn(async {}),
         };
         let server = Server {
@@ -1519,6 +1528,7 @@ mod tests {
                         steer_tx: None,
                     }),
                     run_id: 0,
+                    workflow: None,
                 })
                 .unwrap();
 

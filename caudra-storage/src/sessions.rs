@@ -289,8 +289,6 @@ pub struct SessionMeta {
     pub thinking: Option<StoredThinking>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub fast: bool,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub workflow: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_goal: Option<Box<StoredActiveGoal>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2220,11 +2218,18 @@ mod tests {
         let meta: SessionMeta = serde_json::from_str(json).unwrap();
         assert!(meta.thinking.is_none());
         assert!(!meta.fast);
-        assert!(!meta.workflow);
         assert!(!meta.queued_messages_together);
         assert!(meta.queued_message_admissions.is_empty());
         assert!(meta.unsent_subagent_messages.is_empty());
         assert!(meta.yolo.is_none());
+    }
+
+    /// Sessions saved before the legacy flag was removed still carry its key.
+    #[test_case(r#"{"workflow":true}"# ; "workflow_key")]
+    #[test_case(r#"{"orchestration":true}"# ; "orchestration_key")]
+    fn session_meta_ignores_removed_flag_keys(json: &str) {
+        let meta: SessionMeta = serde_json::from_str(json).unwrap();
+        assert_eq!(meta, SessionMeta::default());
     }
 
     #[test]
@@ -2247,7 +2252,6 @@ mod tests {
         let mut session: TestSession = Session::new("m", "/project");
         session.meta.thinking = Some(StoredThinking::Budget { tokens: 8192 });
         session.meta.fast = true;
-        session.meta.workflow = true;
         session.meta.queued_messages_together = true;
         session.meta.queued_messages = vec![
             StoredQueuedPrompt {
@@ -2282,7 +2286,6 @@ mod tests {
             Some(StoredThinking::Budget { tokens: 8192 })
         );
         assert!(loaded.meta.fast);
-        assert!(loaded.meta.workflow);
         assert!(loaded.meta.queued_messages_together);
         assert_eq!(loaded.meta.queued_messages, session.meta.queued_messages);
         assert_eq!(

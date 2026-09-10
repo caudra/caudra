@@ -1,7 +1,9 @@
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use async_lock::Mutex;
 use caudra_config::ModelPolicy;
 #[cfg(test)]
@@ -21,10 +23,14 @@ use caudra_storage::permission_state::PermissionRuleRecord;
 use caudra_storage::sessions::{
     SessionCursor, SessionDatabase, SessionLease, StoredSubagent, StoredSubagentOutcome,
 };
+use caudra_workflow::{RunSnapshot, WorkflowRequest, WorkflowResponse};
 use flume::Receiver;
 use serde_json::Value;
 use tracing::{error, warn};
 
+use crate::agent::task_runner::{
+    HostExtras, ModeResolver, ModelResolver, SubagentTaskRunner, WorkflowHostContext,
+};
 use crate::agent::{self, History};
 use crate::cancel::{CancelMap, CancelToken};
 use crate::mentions;
@@ -36,12 +42,18 @@ use crate::tools::{
     BuiltinDeferral, DeferralSession, DeferredTool, DescriptionContext, FileReadTracker,
     LocalTools, PathLocks, ToolAudience, ToolDefinitions, ToolFilter, ToolRegistry, deferral,
 };
+use crate::workflow::{RuntimeDeps, WorkflowHandle, WorkflowRuntime};
 use crate::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, DoneReason,
     Envelope, EventSender, GoalHandle, ImageSource, McpHandle, McpSession, PermissionsConfig,
     SessionMailbox, StoredSession, SubagentHistorySnapshot, SubagentHistoryStore, ToolOutput,
     ToolOutputLines, open_stored_session,
 };
+
+/// Bytes of a run's report or result carried into the next prompt.
+const COMPLETION_TEXT_LIMIT: usize = 8 * 1024;
+const TRUNCATED_SUFFIX: &str = "…[truncated]";
+const COMPLETION_SEPARATOR: &str = "\n\n";
 
 struct SessionStore {
     dir: StateDir,
@@ -596,7 +608,6 @@ pub struct HeadlessParams {
     pub mcp_handle: Option<McpHandle>,
     pub initial_wd: PathBuf,
     pub fast: bool,
-    pub workflow: bool,
     pub model_policy: Arc<ModelPolicy>,
     pub plugin_rules: Arc<PluginRuleStore>,
     pub goal: GoalHandle,
@@ -630,7 +641,7 @@ fn setup(
     model: &Model,
     config: &AgentConfig,
     excluded_tools: &[&'static str],
-    workflow: bool,
+    workflows_available: bool,
     task: TaskDescriptionContext<'_>,
 ) -> AgentSetup {
     let vars = template::env_vars();
@@ -640,8 +651,8 @@ fn setup(
         model,
         config,
         excluded_tools,
-        workflow,
         ToolRegistry::global(),
+        workflows_available,
         task,
     );
 
@@ -662,8 +673,8 @@ fn tool_definitions(
     model: &Model,
     config: &AgentConfig,
     excluded_tools: &[&'static str],
-    workflow: bool,
     registry: &ToolRegistry,
+    workflows_available: bool,
     task: TaskDescriptionContext<'_>,
 ) -> ToolDefinitions {
     let filter = ToolFilter::from_config(config, model, excluded_tools);
@@ -677,7 +688,7 @@ fn tool_definitions(
     let ctx = DescriptionContext {
         filter: &filter,
         audience: ToolAudience::MAIN,
-        workflow,
+        workflows_available,
     };
     registry.definitions_split(
         &vars,
@@ -728,7 +739,7 @@ pub fn spawn(mut params: HeadlessParams) -> HeadlessHandle {
         &params.model,
         &params.config,
         &params.excluded_tools,
-        params.workflow,
+        false,
         TaskDescriptionContext {
             prompt_profiles: &params.prompt_profiles,
             thinking: &params.thinking,
@@ -757,7 +768,6 @@ pub fn spawn(mut params: HeadlessParams) -> HeadlessHandle {
     let session_ref_clone = session_ref.clone();
     let mailbox = SessionMailbox::register(session_id);
     let fast = params.fast;
-    let workflow = params.workflow;
     let goal = params.goal.clone();
     let active_prompt_profile_name: Arc<str> = Arc::from(
         params
@@ -812,6 +822,7 @@ pub fn spawn(mut params: HeadlessParams) -> HeadlessHandle {
                     audience: ToolAudience::MAIN,
                     tool_filter,
                     model_policy: Arc::clone(&params.model_policy),
+                    workflow: None,
                 },
                 AgentRunParams {
                     history: &mut history,
@@ -842,7 +853,6 @@ pub fn spawn(mut params: HeadlessParams) -> HeadlessHandle {
                     preamble: Vec::new(),
                     thinking: params.thinking,
                     fast,
-                    workflow,
                     prompt: None,
                     resume: false,
                 })
@@ -894,12 +904,15 @@ pub struct InteractiveParams {
     pub session_yolo: Option<bool>,
     pub system_prompt_override: Option<String>,
     pub append_system_prompt: Option<String>,
-    pub workflow: bool,
     pub model_policy: Arc<ModelPolicy>,
     pub plugin_rules: Arc<PluginRuleStore>,
     /// Host-side overrides that shadow a registered tool's execution while
     /// keeping its advertised schema (e.g. ACP answers `question` via elicitation).
     pub local_tools: LocalTools,
+    /// `Some` attaches a workflow runtime to the session, whose agents are
+    /// capped by the mode this returns as each of them starts. `None` leaves
+    /// the `workflow` tool reporting unavailable.
+    pub workflow_mode: Option<ModeResolver>,
 }
 
 pub struct InteractiveHandle {
@@ -912,6 +925,8 @@ pub struct InteractiveHandle {
     pub session_id: SessionRef,
     pub session_lease: Arc<SessionLease>,
     pub permissions: Arc<PermissionManager>,
+    /// The session's workflow runtime, when `workflow_mode` asked for one.
+    pub workflow: Option<WorkflowHandle>,
     pub task: smol::Task<()>,
 }
 
@@ -970,14 +985,15 @@ pub async fn prepare_interactive(
     })
 }
 
-pub fn spawn_prepared_interactive(prepared: PreparedInteractive) -> InteractiveHandle {
+pub async fn spawn_prepared_interactive(prepared: PreparedInteractive) -> InteractiveHandle {
     let PreparedInteractive {
-        params,
+        mut params,
         mut history,
         mut model,
         mut provider,
         store,
     } = prepared;
+    let workflows_available = params.workflow_mode.is_some();
     let AgentSetup {
         vars,
         instructions,
@@ -988,7 +1004,7 @@ pub fn spawn_prepared_interactive(prepared: PreparedInteractive) -> InteractiveH
         &model,
         &params.config,
         &params.excluded_tools,
-        params.workflow,
+        workflows_available,
         TaskDescriptionContext {
             prompt_profiles: &params.prompt_profiles,
             thinking: &params.thinking,
@@ -1009,35 +1025,119 @@ pub fn spawn_prepared_interactive(prepared: PreparedInteractive) -> InteractiveH
     let session_id = session_ref.id();
     let session_lease = Arc::clone(&params.session_lease);
     let subagent_history = store.subagent_history.clone();
+    let state_dir = store.dir.clone();
     let store = Arc::new(Mutex::new(Some(store)));
 
     let (raw_tx, event_rx) = flume::unbounded::<Envelope>();
+    let (agent_tx, agent_rx) = flume::unbounded::<Envelope>();
     let (input_tx, input_rx) = flume::unbounded::<AgentInput>();
     let (answer_tx, answer_rx) = flume::unbounded::<String>();
     let (cancel_tx, cancel_rx) = flume::bounded::<()>(1);
     let (model_tx, model_rx) = flume::unbounded::<Model>();
 
-    let mailbox = SessionMailbox::register(session_id);
-
     let mut permissions_config = params.permissions_config;
     permissions_config.yolo |= params.yolo;
-    let permissions = Arc::new(PermissionManager::new_persistent(
+    let permissions = Arc::new(PermissionManager::new_persistent_in(
         permissions_config,
-        params.initial_wd,
+        params.initial_wd.clone(),
         Arc::clone(&params.plugin_rules),
+        state_dir.clone(),
     ));
-    permissions.load_structured_conversation_rules(params.structured_permission_rules);
+    permissions.load_structured_conversation_rules(std::mem::take(
+        &mut params.structured_permission_rules,
+    ));
     permissions.set_session_yolo(params.session_yolo);
 
     let answer_rx = Arc::new(Mutex::new(answer_rx));
-    let file_tracker = FileReadTracker::fresh();
-    let path_locks = PathLocks::fresh();
+    let active_prompt_profile_name: Arc<str> = Arc::from(
+        params
+            .system_prompt_profile_name
+            .as_deref()
+            .unwrap_or(BUILTIN_PROFILE_NAME),
+    );
+    // What every top-level agent of the session shares; a turn swaps in its
+    // provider, model, and filter, and gets a cancel map of its own.
+    let base = AgentParams {
+        provider: Arc::clone(&provider),
+        model: model.clone(),
+        config: params.config.clone(),
+        tool_output_lines: ToolOutputLines::default(),
+        permissions: Arc::clone(&permissions),
+        session_id: Some(session_ref.clone()),
+        root_tool_use_id: None,
+        mailbox: Some(SessionMailbox::register(session_id)),
+        context_publisher: None,
+        timeouts: params.timeouts,
+        file_tracker: FileReadTracker::fresh(),
+        path_locks: PathLocks::fresh(),
+        prompt_slots: Arc::clone(&params.prompt_slots),
+        prompt_profiles: Arc::clone(&params.prompt_profiles),
+        default_task_prompt_profile_name: Arc::clone(&active_prompt_profile_name),
+        active_prompt_profile_name: Some(active_prompt_profile_name),
+        subagent_cancels: Arc::new(CancelMap::new()),
+        subagent_history,
+        registry: Arc::clone(ToolRegistry::global_arc()),
+        audience: ToolAudience::MAIN,
+        tool_filter: tool_filter.clone(),
+        model_policy: Arc::clone(&params.model_policy),
+        workflow: None,
+    };
 
-    let session_ref_clone = session_ref.clone();
+    // Workflow agents resolve the provider at launch, so a model switched
+    // mid-session reaches runs that outlive the turn which switched it.
+    let live_model = Arc::new(ArcSwap::from_pointee((
+        Arc::clone(&provider),
+        Arc::new(model.clone()),
+    )));
+    let runtime = match params.workflow_mode.take() {
+        Some(mode) => {
+            let model: ModelResolver = Arc::new({
+                let live_model = Arc::clone(&live_model);
+                move || {
+                    let live = live_model.load();
+                    (Arc::clone(&live.0), Arc::clone(&live.1))
+                }
+            });
+            let subagent_cancels = Arc::new(CancelMap::new());
+            let host = WorkflowHostContext::from_agent_params(
+                &base,
+                HostExtras {
+                    mcp: mcp.clone(),
+                    loaded_instructions: baseline.loaded().clone(),
+                    user_response_rx: Some(Arc::clone(&answer_rx)),
+                },
+                model,
+                Arc::clone(&mode),
+                Arc::clone(&subagent_cancels),
+            );
+            // A runtime that fails to open leaves the `workflow` tool reporting
+            // unavailable rather than taking the session down.
+            WorkflowRuntime::spawn(RuntimeDeps {
+                state_dir,
+                session_id,
+                cwd: params.initial_wd.clone(),
+                user_config_dir: None,
+                runner: Arc::new(SubagentTaskRunner::new(Arc::new(host))),
+                events: agent_tx.clone(),
+                mode,
+                subagent_cancels,
+            })
+            .await
+            .map_err(|error| warn!(%error, "workflow runtime unavailable for this session"))
+            .ok()
+        }
+        None => None,
+    };
+    let workflow = runtime.as_ref().map(WorkflowRuntime::handle);
+    let base = AgentParams {
+        workflow: workflow.clone(),
+        ..base
+    };
+
     let task = smol::spawn({
         let permissions = Arc::clone(&permissions);
+        let workflow = workflow.clone();
         async move {
-            let (agent_tx, agent_rx) = flume::unbounded();
             let event_forwarder = smol::spawn({
                 let store = Arc::clone(&store);
                 let raw_tx = raw_tx.clone();
@@ -1060,6 +1160,7 @@ pub fn spawn_prepared_interactive(prepared: PreparedInteractive) -> InteractiveH
                                     },
                                     subagent: None,
                                     run_id,
+                                    workflow: None,
                                 })
                                 .await
                                 .is_err()
@@ -1070,8 +1171,9 @@ pub fn spawn_prepared_interactive(prepared: PreparedInteractive) -> InteractiveH
                 }
             });
             let mut run_id: u64 = 0;
+            let mut acked_completions = HashSet::new();
 
-            while let Ok(input) = input_rx.recv_async().await {
+            while let Ok(mut input) = input_rx.recv_async().await {
                 let (trigger, cancel) = CancelToken::new();
                 let cancel_task = smol::spawn({
                     let cancel_rx = cancel_rx.clone();
@@ -1107,6 +1209,8 @@ pub fn spawn_prepared_interactive(prepared: PreparedInteractive) -> InteractiveH
                                 &params.excluded_tools,
                             );
                             model = new_model;
+                            live_model
+                                .store(Arc::new((Arc::clone(&provider), Arc::new(model.clone()))));
                         }
                         Err(e) => {
                             error!(error = %e, "provider error");
@@ -1119,13 +1223,20 @@ pub fn spawn_prepared_interactive(prepared: PreparedInteractive) -> InteractiveH
                     }
                 }
 
+                if let Some(workflow) = &workflow
+                    && let Some(context) =
+                        completion_context(workflow, &mut acked_completions).await
+                {
+                    input.message = format!("{context}{COMPLETION_SEPARATOR}{}", input.message);
+                }
+
                 let definitions = tool_definitions(
                     &vars,
                     &model,
                     &params.config,
                     &params.excluded_tools,
-                    input.workflow,
                     ToolRegistry::global(),
+                    workflows_available,
                     TaskDescriptionContext {
                         prompt_profiles: &params.prompt_profiles,
                         thinking: &input.thinking,
@@ -1155,37 +1266,13 @@ pub fn spawn_prepared_interactive(prepared: PreparedInteractive) -> InteractiveH
 
                 while answer_rx.lock().await.try_recv().is_ok() {}
 
-                let active_prompt_profile_name: Arc<str> = Arc::from(
-                    params
-                        .system_prompt_profile_name
-                        .as_deref()
-                        .unwrap_or(BUILTIN_PROFILE_NAME),
-                );
-
                 let mut agent = Agent::new(
                     AgentParams {
                         provider: Arc::clone(&provider),
                         model: model.clone(),
-                        config: params.config.clone(),
-                        tool_output_lines: ToolOutputLines::default(),
-                        permissions: Arc::clone(&permissions),
-                        session_id: Some(session_ref_clone.clone()),
-                        root_tool_use_id: None,
-                        mailbox: Some(mailbox.clone()),
-                        context_publisher: None,
-                        timeouts: params.timeouts,
-                        file_tracker: Arc::clone(&file_tracker),
-                        path_locks: Arc::clone(&path_locks),
-                        prompt_slots: Arc::clone(&params.prompt_slots),
-                        prompt_profiles: Arc::clone(&params.prompt_profiles),
-                        default_task_prompt_profile_name: Arc::clone(&active_prompt_profile_name),
-                        active_prompt_profile_name: Some(active_prompt_profile_name),
-                        subagent_cancels: Arc::new(CancelMap::new()),
-                        subagent_history: subagent_history.clone(),
-                        registry: Arc::clone(ToolRegistry::global_arc()),
-                        audience: ToolAudience::MAIN,
                         tool_filter: tool_filter.clone(),
-                        model_policy: Arc::clone(&params.model_policy),
+                        subagent_cancels: Arc::new(CancelMap::new()),
+                        ..base.clone()
                     },
                     AgentRunParams {
                         history: &mut history,
@@ -1227,6 +1314,11 @@ pub fn spawn_prepared_interactive(prepared: PreparedInteractive) -> InteractiveH
                 run_id += 1;
             }
 
+            // Active runs are interrupted and their agents drained before the
+            // session is saved, so nothing writes to it afterwards.
+            if let Some(runtime) = runtime {
+                runtime.shutdown().await;
+            }
             drop(agent_tx);
             event_forwarder.await;
             if let Some(store) = &mut *store.lock().await {
@@ -1254,6 +1346,7 @@ pub fn spawn_prepared_interactive(prepared: PreparedInteractive) -> InteractiveH
         session_id: session_ref,
         session_lease,
         permissions,
+        workflow,
         task,
     }
 }
@@ -1261,9 +1354,81 @@ pub fn spawn_prepared_interactive(prepared: PreparedInteractive) -> InteractiveH
 pub async fn spawn_interactive(
     params: InteractiveParams,
 ) -> Result<InteractiveHandle, InteractiveStartError> {
-    prepare_interactive(params)
+    let prepared = prepare_interactive(params).await?;
+    Ok(spawn_prepared_interactive(prepared).await)
+}
+
+/// What finished since the last prompt, as one block per run for the next
+/// one. Every notice it carries is acknowledged, so a run is reported once
+/// per revision even when the runtime loses the ack.
+async fn completion_context(
+    workflow: &WorkflowHandle,
+    acked: &mut HashSet<(String, u64)>,
+) -> Option<String> {
+    if workflow.pending_completions() == 0 {
+        return None;
+    }
+    let runs = match workflow
+        .request(WorkflowRequest::Status { run_id: None })
         .await
-        .map(spawn_prepared_interactive)
+    {
+        Ok(WorkflowResponse::Runs(runs)) => runs,
+        Ok(_) => Vec::new(),
+        Err(error) => {
+            warn!(%error, "workflow completions could not be read");
+            return None;
+        }
+    };
+    let mut blocks = Vec::new();
+    for run in runs.into_iter().filter(|run| run.outbox_pending) {
+        let notice = (run.run_id.clone(), run.revision);
+        if acked.contains(&notice) {
+            continue;
+        }
+        blocks.push(completion_block(&run));
+        if let Err(error) = workflow
+            .request(WorkflowRequest::AckCompletion {
+                run_id: run.run_id,
+                revision: run.revision,
+            })
+            .await
+        {
+            warn!(%error, "workflow completion could not be acknowledged");
+        }
+        acked.insert(notice);
+    }
+    (!blocks.is_empty()).then(|| blocks.join(COMPLETION_SEPARATOR))
+}
+
+fn completion_block(run: &RunSnapshot) -> String {
+    let mut block = format!(
+        "Workflow {} ({}) finished with status {}.",
+        run.display_name, run.workflow_name, run.status
+    );
+    if let Some(result) = &run.result {
+        match result.get("report").and_then(Value::as_str) {
+            Some(report) => block.push_str(&format!("\nReport: {}", bounded(report))),
+            None => block.push_str(&format!("\nResult: {}", bounded(&result.to_string()))),
+        }
+        if let Some(path) = result.get("path").and_then(Value::as_str) {
+            block.push_str(&format!("\nScratch file: {path}"));
+        }
+    }
+    if let Some(message) = &run.pause_message {
+        block.push_str(&format!("\nPaused: {message}"));
+    }
+    if let Some(error) = &run.error {
+        block.push_str(&format!("\nError: {error}"));
+    }
+    block
+}
+
+fn bounded(text: &str) -> Cow<'_, str> {
+    if text.len() <= COMPLETION_TEXT_LIMIT {
+        return Cow::Borrowed(text);
+    }
+    let end = text.floor_char_boundary(COMPLETION_TEXT_LIMIT);
+    Cow::Owned(format!("{}{TRUNCATED_SUFFIX}", &text[..end]))
 }
 
 fn extract_tool_names(tools: &Value) -> Vec<String> {
@@ -1279,13 +1444,18 @@ fn extract_tool_names(tools: &Value) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use caudra_providers::{AgentError, ProviderEvent, RequestOptions, StopReason, StreamResponse};
     use caudra_storage::permission_state::PermissionRuleRecord;
     use caudra_storage::sessions::generate_title;
     use caudra_storage::tool_outputs::ToolOutputStore;
+    use caudra_storage::workflow::WorkflowRunStatus;
+    use caudra_workflow::{RunStatus, WorkflowError, WorkflowEvent};
     use tempfile::TempDir;
     use test_case::test_case;
 
     use super::*;
+    use crate::tools::registry::BoxFuture;
+    use crate::workflow::store::WorkflowStore;
 
     const SESSION_ID: &str = "CNK1hV6GWoysH3KQMm5wu";
     const CWD: &str = "/project";
@@ -1556,6 +1726,7 @@ mod tests {
                 event: AgentEvent::ToolDone(Box::new(done)),
                 subagent: None,
                 run_id: 0,
+                workflow: None,
             })
             .unwrap();
         store
@@ -1571,6 +1742,7 @@ mod tests {
                 },
                 subagent: None,
                 run_id: 0,
+                workflow: None,
             })
             .unwrap();
         let mut nested_done = crate::ToolDoneEvent::error("nested-call".into(), "nested output");
@@ -1580,6 +1752,7 @@ mod tests {
                 event: AgentEvent::ToolDone(Box::new(nested_done)),
                 subagent: None,
                 run_id: 0,
+                workflow: None,
             })
             .unwrap();
 
@@ -1619,6 +1792,7 @@ mod tests {
                     },
                     subagent: None,
                     run_id: 0,
+                    workflow: None,
                 })
                 .unwrap();
         }
@@ -1629,6 +1803,7 @@ mod tests {
                 event: AgentEvent::ToolDone(Box::new(done)),
                 subagent: None,
                 run_id: 0,
+                workflow: None,
             })
             .unwrap();
 
@@ -1848,5 +2023,383 @@ mod tests {
     fn advertised_names_omit_the_search_tool_when_nothing_is_deferred() {
         let base = serde_json::json!([{"name": "read"}]);
         assert_eq!(advertised_tool_names(&base, &[], None), vec!["read"]);
+    }
+
+    const WORKFLOW_NAME: &str = "echo";
+    const WORKFLOW_SOURCE: &str = r#"
+let meta = #{ name: "echo", description: "A test workflow" };
+let first = agent("hello", #{ label: "worker" });
+complete(#{ report: first.output });
+"#;
+    const PROJECT_WORKFLOWS: &str = ".caudra/workflows";
+    const SCRIPT_EXTENSION: &str = "rhai";
+    const ANSWER: &str = "the worker's findings";
+    const PROMPT: &str = "what did the workflow find?";
+    const SECOND_PROMPT: &str = "and now?";
+    const COMPLETION_HEADING: &str = "Workflow echo (echo) finished with status completed.";
+    const EVENTS_CLOSED: &str = "the session dropped its event channel";
+    const NO_RUNTIME: &str = "the session must attach a workflow runtime";
+    const AGENT_NEVER_STARTED: &str = "the workflow agent never reached the provider";
+    const REPORTED_ONCE: &str = "a completion is reported in one prompt only";
+
+    /// Answers every request with `ANSWER`, or parks forever once built to
+    /// hang. Each request's messages are kept, and `started` fires per
+    /// request so a test can wait for an agent to be in flight.
+    struct ScriptedProvider {
+        hang: bool,
+        started: flume::Sender<()>,
+        requests: std::sync::Mutex<Vec<Vec<Message>>>,
+    }
+
+    impl ScriptedProvider {
+        /// The text of the last user message of every request, in order.
+        fn user_prompts(&self) -> Vec<String> {
+            self.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|messages| {
+                    messages
+                        .iter()
+                        .rev()
+                        .find(|message| matches!(message.role, Role::User))
+                        .and_then(Message::first_text_content)
+                        .unwrap_or_default()
+                        .to_owned()
+                })
+                .collect()
+        }
+    }
+
+    impl Provider for ScriptedProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            messages: &'a [Message],
+            _: &'a str,
+            _: &'a Value,
+            _: &'a flume::Sender<ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&'a SessionRef>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(async move {
+                self.requests.lock().unwrap().push(messages.to_vec());
+                let _ = self.started.send(());
+                if self.hang {
+                    futures_lite::future::pending().await
+                }
+                Ok(StreamResponse {
+                    message: Message {
+                        role: Role::Assistant,
+                        content: vec![ContentBlock::Text {
+                            text: ANSWER.into(),
+                        }],
+                        ..Default::default()
+                    },
+                    stop_reason: Some(StopReason::EndTurn),
+                    ..Default::default()
+                })
+            })
+        }
+
+        fn list_models(
+            &self,
+        ) -> BoxFuture<'_, Result<Vec<caudra_providers::ModelInfo>, AgentError>> {
+            Box::pin(async { unimplemented!() })
+        }
+    }
+
+    /// An interactive session over a scripted provider, with one project
+    /// workflow on disk and a runtime attached.
+    struct WorkflowSession {
+        _temp: TempDir,
+        state_dir: StateDir,
+        project: PathBuf,
+        provider: Arc<ScriptedProvider>,
+        started: flume::Receiver<()>,
+    }
+
+    impl WorkflowSession {
+        fn new(hang: bool) -> Self {
+            let temp = TempDir::new().unwrap();
+            let project = temp.path().join("project");
+            let workflows = project.join(PROJECT_WORKFLOWS);
+            std::fs::create_dir_all(&workflows).unwrap();
+            std::fs::write(
+                workflows.join(format!("{WORKFLOW_NAME}.{SCRIPT_EXTENSION}")),
+                WORKFLOW_SOURCE,
+            )
+            .unwrap();
+            let (started_tx, started) = flume::unbounded();
+            Self {
+                state_dir: StateDir::from_path(temp.path().to_path_buf()),
+                project: project.canonicalize().unwrap(),
+                provider: Arc::new(ScriptedProvider {
+                    hang,
+                    started: started_tx,
+                    requests: std::sync::Mutex::new(Vec::new()),
+                }),
+                started,
+                _temp: temp,
+            }
+        }
+
+        async fn spawn(&self, workflows: bool) -> InteractiveHandle {
+            let lease = Arc::new(SessionLease::acquire(&self.state_dir, session_id()).unwrap());
+            let store = SessionStore::open_in_with_lease(
+                self.state_dir.clone(),
+                session_id(),
+                &self.project.to_string_lossy(),
+                MODEL_SPEC,
+                Arc::clone(&lease),
+            )
+            .unwrap();
+            let params = InteractiveParams {
+                model: Model::from_spec(MODEL_SPEC).unwrap(),
+                config: AgentConfig::default(),
+                permissions_config: PermissionsConfig::default(),
+                timeouts: Timeouts::default(),
+                prompt_slots: Arc::new(ResolvedSlots::default()),
+                thinking: crate::ThinkingConfig::default(),
+                system_prompt_profile: None,
+                system_prompt_profile_name: None,
+                prompt_profiles: Arc::new(PromptProfileCatalog::default()),
+                excluded_tools: Vec::new(),
+                mcp_handle: None,
+                initial_wd: self.project.clone(),
+                session_id: SessionRef::from(session_id()),
+                session_lease: lease,
+                expected_write_version: None,
+                initial_history: Vec::new(),
+                yolo: true,
+                structured_permission_rules: Vec::new(),
+                session_yolo: None,
+                system_prompt_override: None,
+                append_system_prompt: None,
+                model_policy: Arc::new(ModelPolicy::default()),
+                plugin_rules: Arc::default(),
+                local_tools: LocalTools::default(),
+                workflow_mode: workflows.then(|| Arc::new(|| AgentMode::Build) as ModeResolver),
+            };
+            spawn_prepared_interactive(PreparedInteractive {
+                params,
+                history: History::default(),
+                model: Model::from_spec(MODEL_SPEC).unwrap(),
+                provider: Arc::clone(&self.provider) as Arc<dyn Provider>,
+                store,
+            })
+            .await
+        }
+    }
+
+    /// Trusts the project script by the digest the catalog reports, as an SDK
+    /// client would, and starts it.
+    async fn trust_and_start(workflow: &WorkflowHandle) -> RunSnapshot {
+        let Ok(WorkflowResponse::Catalog(catalog)) = workflow.request(WorkflowRequest::List).await
+        else {
+            panic!("expected the catalog");
+        };
+        let digest = catalog
+            .entries
+            .iter()
+            .find(|entry| entry.name == WORKFLOW_NAME)
+            .expect("the project workflow is listed")
+            .digest
+            .clone();
+        workflow
+            .request(WorkflowRequest::Trust {
+                name: WORKFLOW_NAME.into(),
+                digest,
+            })
+            .await
+            .unwrap();
+        match workflow
+            .request(WorkflowRequest::Start(caudra_workflow::LaunchRequest {
+                name: WORKFLOW_NAME.into(),
+                args: serde_json::json!({}),
+                agent_budget: None,
+            }))
+            .await
+        {
+            Ok(WorkflowResponse::Started(run)) => *run,
+            other => panic!("expected a started run, got {other:?}"),
+        }
+    }
+
+    async fn wait_for_run(events: &Receiver<Envelope>, run_id: &str, status: RunStatus) {
+        loop {
+            let envelope = events.recv_async().await.expect(EVENTS_CLOSED);
+            if let AgentEvent::Workflow(event) = &envelope.event
+                && let WorkflowEvent::Snapshot(snapshot) = event.as_ref()
+                && snapshot.run_id == run_id
+                && snapshot.status == status
+            {
+                return;
+            }
+        }
+    }
+
+    async fn wait_for_turn(events: &Receiver<Envelope>) {
+        loop {
+            let envelope = events.recv_async().await.expect(EVENTS_CLOSED);
+            match &envelope.event {
+                AgentEvent::Done { .. } if envelope.subagent.is_none() => return,
+                AgentEvent::Error { message } => panic!("turn failed: {message}"),
+                _ => {}
+            }
+        }
+    }
+
+    fn prompt(message: &str) -> AgentInput {
+        AgentInput {
+            message: message.into(),
+            mode: AgentMode::Build,
+            images: Vec::new(),
+            mentions: Vec::new(),
+            preamble: Vec::new(),
+            thinking: crate::ThinkingConfig::default(),
+            fast: false,
+            prompt: None,
+            resume: false,
+        }
+    }
+
+    #[test]
+    fn a_finished_run_is_reported_in_the_next_prompt_once_and_acknowledged() {
+        smol::block_on(async {
+            let session = WorkflowSession::new(false);
+            let handle = session.spawn(true).await;
+            let workflow = handle.workflow.clone().expect(NO_RUNTIME);
+            let run = trust_and_start(&workflow).await;
+            wait_for_run(&handle.event_rx, &run.run_id, RunStatus::Completed).await;
+            assert_eq!(workflow.pending_completions(), 1);
+
+            handle.input_tx.send(prompt(PROMPT)).unwrap();
+            wait_for_turn(&handle.event_rx).await;
+            handle.input_tx.send(prompt(SECOND_PROMPT)).unwrap();
+            wait_for_turn(&handle.event_rx).await;
+
+            let prompts = session.provider.user_prompts();
+            let reported =
+                format!("{COMPLETION_HEADING}\nReport: {ANSWER}{COMPLETION_SEPARATOR}{PROMPT}");
+            assert!(prompts.contains(&reported), "got {prompts:?}");
+            assert!(
+                prompts.contains(&SECOND_PROMPT.to_owned()),
+                "{REPORTED_ONCE}: got {prompts:?}"
+            );
+            assert_eq!(workflow.pending_completions(), 0);
+            assert!(!workflow.state().runs[0].outbox_pending);
+
+            let InteractiveHandle { input_tx, task, .. } = handle;
+            drop(input_tx);
+            task.await;
+            assert_eq!(
+                workflow.request(WorkflowRequest::List).await,
+                Err(WorkflowError::Unavailable)
+            );
+        });
+    }
+
+    #[test]
+    fn client_eof_interrupts_an_active_run_before_the_session_closes() {
+        smol::block_on(async {
+            let session = WorkflowSession::new(true);
+            let handle = session.spawn(true).await;
+            let workflow = handle.workflow.clone().expect(NO_RUNTIME);
+            let run = trust_and_start(&workflow).await;
+            session
+                .started
+                .recv_async()
+                .await
+                .expect(AGENT_NEVER_STARTED);
+            assert_eq!(workflow.active_count(), 1);
+
+            let InteractiveHandle { input_tx, task, .. } = handle;
+            drop(input_tx);
+            task.await;
+
+            let store = WorkflowStore::spawn(session.state_dir.clone(), session_id()).unwrap();
+            let row = store.load_run(run.run_id).await.unwrap().unwrap();
+            store.shutdown().await;
+            assert_eq!(row.status, WorkflowRunStatus::Interrupted);
+        });
+    }
+
+    #[test]
+    fn a_session_without_workflow_mode_attaches_no_runtime() {
+        smol::block_on(async {
+            let session = WorkflowSession::new(false);
+            let handle = session.spawn(false).await;
+            assert!(handle.workflow.is_none());
+            let InteractiveHandle { input_tx, task, .. } = handle;
+            drop(input_tx);
+            task.await;
+        });
+    }
+
+    fn completed_run(result: Option<Value>) -> RunSnapshot {
+        RunSnapshot {
+            run_id: "run-1".into(),
+            display_name: "echo-2".into(),
+            workflow_name: WORKFLOW_NAME.into(),
+            source_kind: caudra_workflow::SourceKind::Project,
+            objective: None,
+            status: RunStatus::Completed,
+            pause_kind: None,
+            pause_message: None,
+            revision: 1,
+            execution_epoch: 0,
+            phase: None,
+            phases: Vec::new(),
+            agent_budget: 1,
+            usage: caudra_workflow::RunUsage::default(),
+            roster: Vec::new(),
+            result,
+            error: None,
+            logs: Vec::new(),
+            outbox_pending: true,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    #[test]
+    fn a_completion_block_names_the_run_and_carries_its_report_and_scratch_path() {
+        let run = completed_run(Some(serde_json::json!({
+            "report": ANSWER,
+            "path": "/tmp/scratch/notes.md",
+        })));
+
+        assert_eq!(
+            completion_block(&run),
+            format!(
+                "Workflow echo-2 (echo) finished with status completed.\nReport: {ANSWER}\nScratch file: /tmp/scratch/notes.md"
+            )
+        );
+    }
+
+    #[test]
+    fn a_completion_block_bounds_a_result_without_a_report() {
+        let run = completed_run(Some(Value::String("x".repeat(COMPLETION_TEXT_LIMIT + 1))));
+
+        let block = completion_block(&run);
+
+        assert!(block.ends_with(TRUNCATED_SUFFIX));
+        assert!(block.len() < COMPLETION_TEXT_LIMIT + COMPLETION_HEADING.len() + 64);
+    }
+
+    #[test]
+    fn a_completion_block_reports_a_pause_and_an_error() {
+        let run = RunSnapshot {
+            status: RunStatus::Paused,
+            pause_message: Some("check the draft".into()),
+            error: Some("boom".into()),
+            ..completed_run(None)
+        };
+
+        assert_eq!(
+            completion_block(&run),
+            "Workflow echo-2 (echo) finished with status paused.\nPaused: check the draft\nError: boom"
+        );
     }
 }

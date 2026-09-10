@@ -43,6 +43,7 @@ mod tool_output;
 pub mod tools;
 pub use tools::ToolFilter;
 pub mod types;
+pub mod workflow;
 pub use stored_session::{
     StoredSession, latest_stored_session, load_stored_session, open_stored_session,
 };
@@ -132,7 +133,6 @@ pub struct AgentInput {
     pub thinking: ThinkingConfig,
     pub fast: bool,
     /// No `Default` on this struct so adding a field forces every call site to update.
-    pub workflow: bool,
     pub prompt: Option<Box<McpPromptRef>>,
     /// Resume with no turn of the caller's own: the run starts from history as
     /// it stands, and the agent decides what the request tail still needs.

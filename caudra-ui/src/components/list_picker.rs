@@ -376,6 +376,11 @@ impl<T: PickerItem> ListPicker<T> {
         self.error_text = text;
     }
 
+    #[cfg(test)]
+    pub fn error_text(&self) -> Option<&str> {
+        self.error_text.as_deref()
+    }
+
     pub fn set_info_text(&mut self, text: Option<String>) {
         self.info_text = text;
     }
@@ -1731,7 +1736,7 @@ mod tests {
             t.width() + trailing + pad + detail.width() + DETAIL_RIGHT_PAD as usize
         };
 
-        let long = "  ".to_string() + &"x".repeat(60);
+        let long = "  ".to_string() + "x".repeat(60).as_str();
         assert_eq!(end_col(&long, 0), end_col("  hi", 0));
         assert!(end_col(&long, 0) <= width as usize);
 

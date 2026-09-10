@@ -62,7 +62,6 @@ All fields are optional. Typos in field names cause an error right away.
 |-------|------|---------|-------------|
 | `always_yolo` | bool | `false` | Start every session with YOLO mode (skip permission prompts, deny rules still apply) |
 | `always_fast` | bool | `false` | Start every session with Anthropic fast mode (Opus only; ignored otherwise) |
-| `always_workflow` | bool | `false` | Start every session with workflow context for custom Lua tools |
 | `always_thinking` | bool \| string | `false` | Start every session with extended thinking (true/"adaptive", "off", an effort level ("minimal" to "max"), or a token budget) |
 
 ### `ui`
@@ -128,7 +127,7 @@ How many lines of output an open card shows per tool before it says how many it 
 | `read` | 3 | `file_read` |
 | `write` | 7 | `file_write`, `file_edit`, `file_apply_patch`, `image_generate`, `memory` |
 | `web` | 3 | `webfetch`, `websearch` |
-| `other` | 3 | `batch`, `execution_environment`, `question`, `skill`, `todo_write`, `tool_output`, `view_image` |
+| `other` | 3 | `batch`, `execution_environment`, `question`, `skill`, `todo_write`, `tool_output`, `view_image`, `workflow` |
 
 ### `agent`
 

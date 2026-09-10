@@ -180,7 +180,6 @@ async fn system_prompt(
 /// Optional fields:
 ///   `only` (string[]?) - include only these tool names.
 ///   `except` (string[]?) - exclude these tool names.
-///   `workflow` (boolean?) - use workflow-mode descriptions. Default: `false`.
 ///   `spec` (string?) - evaluate capability exclusions against this model spec.
 /// @return (table?, string?) Array of tool definition tables, or `(nil, err)` on failure.
 /// @example
@@ -201,7 +200,6 @@ async fn tools(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>, opts: Table) -> LuaResu
 
     let only: Option<Vec<String>> = opts.get("only")?;
     let except: Option<Vec<String>> = opts.get("except")?;
-    let workflow: bool = opts.get::<Option<bool>>("workflow")?.unwrap_or(false);
     let spec_str: Option<String> = opts.get("spec")?;
 
     let mut parsed = match spec_str.as_deref() {
@@ -229,7 +227,7 @@ async fn tools(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>, opts: Table) -> LuaResu
     let ctx_desc = DescriptionContext {
         filter: &filter,
         audience,
-        workflow,
+        workflows_available: false,
     };
     // Base definitions only: the session injects MCP definitions per
     // request, so baking them into a tools array would freeze the catalog.
@@ -482,7 +480,7 @@ async fn open_lua_task(
         agent_ctx,
         subagent::TaskOptions {
             name: name.unwrap_or_default(),
-            task_id,
+            task_id: subagent::TaskIdentity::continue_or_derive(task_id),
             profile: opts.get("profile").map_err(lua_err)?,
             mode,
             local_definitions,

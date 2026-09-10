@@ -500,7 +500,6 @@ pub fn run(mut cli: Cli) -> Result<ExitCode> {
             prompt_slots,
             prompt_profiles: stack.prompt_profiles,
             fast,
-            workflow: stack.config.always_workflow,
             thinking,
             model_policy: Arc::new(stack.config.provider.model_policy.clone()),
             plugin_rules: stack.plugin_host.plugin_rules(),
@@ -533,7 +532,6 @@ pub fn run(mut cli: Cli) -> Result<ExitCode> {
             timeouts,
             stack.plugin_host.event_handle(),
             fast,
-            stack.config.always_workflow,
             thinking,
             stack.default_prompt_profile,
             Arc::clone(&stack.prompt_profiles),
@@ -564,7 +562,6 @@ pub fn run(mut cli: Cli) -> Result<ExitCode> {
             let session = &mut tab.session;
             if setup::session_history_head(session).is_none() {
                 session.meta.fast |= stack.config.always_fast;
-                session.meta.workflow |= stack.config.always_workflow;
                 if let Some(thinking) = &stack.config.always_thinking {
                     session.meta.thinking = Some(thinking.clone());
                 }

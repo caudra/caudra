@@ -628,7 +628,6 @@ mod tests {
                 preamble: Vec::new(),
                 thinking: Default::default(),
                 fast: false,
-                workflow: false,
                 prompt: None,
                 resume: false,
             }),

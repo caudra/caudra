@@ -49,6 +49,8 @@ pub(crate) mod tools_modal;
 pub(crate) mod usage_modal;
 pub(crate) mod which_key;
 pub(crate) mod workbench;
+pub(crate) mod workflow_catalog_picker;
+pub(crate) mod workflow_picker;
 
 use std::process::ExitCode;
 use std::sync::Arc;

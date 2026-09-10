@@ -173,6 +173,24 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         scope: ChatScope::Any,
     },
     BuiltinCommand {
+        name: "/workflows",
+        description: "Browse, trust, and launch workflows",
+        max_args: 0,
+        scope: ChatScope::MainOnly,
+    },
+    BuiltinCommand {
+        name: "/workflow",
+        description: "Start a workflow, or list, pause, resume, and stop runs",
+        max_args: usize::MAX,
+        scope: ChatScope::MainOnly,
+    },
+    BuiltinCommand {
+        name: "/deep-research",
+        description: "Research a question with the deep-research workflow",
+        max_args: usize::MAX,
+        scope: ChatScope::MainOnly,
+    },
+    BuiltinCommand {
         name: "/sessions",
         description: "Browse and switch sessions",
         max_args: 0,
@@ -279,12 +297,6 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         description: "Toggle Anthropic fast mode (Opus only)",
         max_args: 0,
         scope: ChatScope::Any,
-    },
-    BuiltinCommand {
-        name: "/workflow",
-        description: "Toggle workflow context for custom Lua tools",
-        max_args: 0,
-        scope: ChatScope::MainOnly,
     },
     BuiltinCommand {
         name: "/exit",

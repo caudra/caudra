@@ -146,6 +146,11 @@ Some pickers add extra bindings on top of the defaults:
 | Session Picker | `Ctrl+G` | Name session with a small model |
 | Session Picker | `Ctrl+D` | Delete session (press twice) |
 | Stash Picker | `Ctrl+D` | Delete stash entry (press twice) |
+| Workflow Runs | `p` | Pause the selected run |
+| Workflow Runs | `r` | Resume the selected run |
+| Workflow Runs | `x` | Stop the selected run |
+| Workflow Runs | `Enter` | Open the selected agent's transcript |
+| Workflow Catalog | `Enter` | Launch a trusted workflow, or trust an untrusted one |
 | Workbench Explorer | `Ctrl+X h` | Show hidden files |
 | Workbench Explorer | `C` | Fold the tree back to its top level |
 | Workbench Editor | `Ctrl+S` | Save the active file |
@@ -175,7 +180,7 @@ Some pickers add extra bindings on top of the defaults:
 
 Child contexts inherit their parent's bindings and add their own.
 
-- **Pickers** is the base for: Rewind Picker, Theme Picker, Model Picker, Queue, Commands, Search, File Picker, Stash Picker, Session Picker
+- **Pickers** is the base for: Rewind Picker, Theme Picker, Model Picker, Queue, Commands, Search, File Picker, Stash Picker, Session Picker, Workflow Runs, Workflow Catalog
 - **Workbench** is the base for: Workbench Explorer, Workbench Editor, Workbench Source Control, Workbench Search
 
 ## Overriding Keybindings

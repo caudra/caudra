@@ -323,7 +323,6 @@ enum Caps {
     /// previews, but dispatching tools is structurally impossible.
     Start {
         config: AgentConfig,
-        workflow: bool,
         audience: ToolAudience,
         session_id: Option<SessionRef>,
         read_only: bool,
@@ -369,7 +368,6 @@ impl LuaCtx {
             ctx,
             Caps::Start {
                 config: ctx.config.clone(),
-                workflow: ctx.workflow,
                 audience: ctx.audience,
                 session_id: ctx.session_id.clone(),
                 read_only: !matches!(ctx.mode, caudra_agent::AgentMode::Build)
@@ -413,14 +411,6 @@ impl LuaCtx {
         match &self.caps {
             Caps::Handler { agent, .. } => Some(&agent.config),
             Caps::Start { config, .. } => Some(config),
-            Caps::Restore { .. } => None,
-        }
-    }
-
-    fn workflow(&self) -> Option<bool> {
-        match &self.caps {
-            Caps::Handler { agent, .. } => Some(agent.workflow),
-            Caps::Start { workflow, .. } => Some(*workflow),
             Caps::Restore { .. } => None,
         }
     }
@@ -508,13 +498,6 @@ fn tool_output_context_arg(value: i64, name: &str) -> Result<usize, String> {
 impl UserData for LuaCtx {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_method("cancelled", |_, this, ()| Ok(this.cancel.is_cancelled()));
-
-        methods.add_method("workflow", |_, this, ()| {
-            let Some(workflow) = this.workflow() else {
-                return Ok(this.cap_err_pair("workflow"));
-            };
-            Ok((Some(workflow), None))
-        });
 
         methods.add_method("audience", |_, this, ()| {
             let Some(audience) = this.audience() else {

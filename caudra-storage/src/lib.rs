@@ -24,6 +24,11 @@ pub mod usage_ledger;
 pub mod version;
 pub mod view;
 pub mod workbench;
+#[path = "sessions/workflow.rs"]
+pub mod workflow;
+pub mod workflow_scratch;
+pub mod workflow_source;
+pub mod workflow_trust;
 
 use std::env;
 use std::fs::{self, File, OpenOptions};

@@ -4,6 +4,8 @@ use std::fmt::Write;
 use strum::EnumIter;
 use unicode_width::UnicodeWidthStr;
 
+use crate::components::workflow_picker;
+
 /// Spelled once because three tables quote it.
 const SHIFT_TAB_LABEL: &str = "Shift+Tab";
 
@@ -290,6 +292,8 @@ pub enum KeybindContext {
     FilePicker,
     StashPicker,
     SessionPicker,
+    WorkflowPicker,
+    WorkflowCatalogPicker,
     Workbench,
     WorkbenchExplorer,
     WorkbenchEditor,
@@ -317,6 +321,8 @@ impl KeybindContext {
             Self::FilePicker => "File Picker",
             Self::StashPicker => "Stash Picker",
             Self::SessionPicker => "Session Picker",
+            Self::WorkflowPicker => "Workflow Runs",
+            Self::WorkflowCatalogPicker => "Workflow Catalog",
             Self::Workbench => "Workbench",
             Self::WorkbenchExplorer => "Workbench Explorer",
             Self::WorkbenchEditor => "Workbench Editor",
@@ -335,7 +341,9 @@ impl KeybindContext {
             | Self::Search
             | Self::FilePicker
             | Self::StashPicker
-            | Self::SessionPicker => Some(Self::Picker),
+            | Self::SessionPicker
+            | Self::WorkflowPicker
+            | Self::WorkflowCatalogPicker => Some(Self::Picker),
             Self::WorkbenchExplorer
             | Self::WorkbenchEditor
             | Self::WorkbenchSourceControl
@@ -986,6 +994,36 @@ pub const KEYBINDS: &[Keybind] = &[
         label: KeyLabel::Single(key::DELETE.label),
         description: "Delete stash entry (press twice)",
         context: KeybindContext::StashPicker,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(workflow_picker::PAUSE_LABEL),
+        description: "Pause the selected run",
+        context: KeybindContext::WorkflowPicker,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(workflow_picker::RESUME_LABEL),
+        description: "Resume the selected run",
+        context: KeybindContext::WorkflowPicker,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(workflow_picker::STOP_LABEL),
+        description: "Stop the selected run",
+        context: KeybindContext::WorkflowPicker,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single("Enter"),
+        description: "Open the selected agent's transcript",
+        context: KeybindContext::WorkflowPicker,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single("Enter"),
+        description: "Launch a trusted workflow, or trust an untrusted one",
+        context: KeybindContext::WorkflowCatalogPicker,
         platform: Platform::All,
     },
     Keybind {

@@ -36,6 +36,7 @@ const PREVIEW_KEYS: &[(&str, &str)] = &[
     ("webfetch", "url"),
     ("task", "description"),
     ("skill", "name"),
+    ("workflow", "action"),
     ("code_map", "path"),
     ("code_context", "task"),
     ("code_refs", "symbol"),

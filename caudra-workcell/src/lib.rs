@@ -3569,14 +3569,13 @@ mod tests {
             ToolAudience::RESEARCH_SUB,
             ToolAudience::GENERAL_SUB,
             ToolAudience::INTERPRETER,
-            ToolAudience::WORKFLOW,
         ] {
             let definitions = registry.definitions(
                 &caudra_agent::template::Vars::new(),
                 &DescriptionContext {
                     filter: &caudra_agent::tools::ToolFilter::All,
                     audience,
-                    workflow: audience == ToolAudience::WORKFLOW,
+                    workflows_available: false,
                 },
                 false,
             );

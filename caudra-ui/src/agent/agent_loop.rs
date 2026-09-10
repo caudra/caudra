@@ -18,6 +18,7 @@ use caudra_agent::tools::{
     BuiltinDeferral, DeferralSession, DeferredTool, DescriptionContext, FileReadTracker, PathLocks,
     ToolAudience, ToolDefinitions, ToolFilter, ToolRegistry, deferral,
 };
+use caudra_agent::workflow::WorkflowHandle;
 use caudra_agent::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentParams, AgentRunParams, CancelMap,
     CancelToken, CancelTrigger, DoneReason, Envelope, EventSender, GoalHandle, History,
@@ -33,6 +34,7 @@ use tracing::error;
 
 use super::cancel_map::RunCancelMap;
 use super::shared_queue::{QueueItem, QueueReceiver};
+use super::workflow::SharedMode;
 use super::{BtwPrompt, ModelSlot, SharedBtwPrompt};
 
 pub(super) struct AgentLoop {
@@ -72,6 +74,10 @@ pub(super) struct AgentLoop {
     goal: GoalHandle,
     system_prompt_profile: Option<Arc<SystemPromptProfile>>,
     prompt_profiles: Arc<PromptProfileCatalog>,
+    workflow: Option<WorkflowHandle>,
+    /// Published on every run so workflow agents start under the mode the
+    /// user last committed, however long ago their run was launched.
+    mode: SharedMode,
 }
 
 impl AgentLoop {
@@ -87,7 +93,7 @@ impl AgentLoop {
         mcp_handle: Option<McpHandle>,
         permissions: Arc<PermissionManager>,
         agent_tx: flume::Sender<Envelope>,
-        answer_rx: flume::Receiver<String>,
+        answer_rx: Arc<async_lock::Mutex<flume::Receiver<String>>>,
         queue: Arc<QueueReceiver>,
         cancel_map: Arc<RunCancelMap>,
         retry_now: Nudge,
@@ -102,6 +108,8 @@ impl AgentLoop {
         goal: GoalHandle,
         system_prompt_profile: Option<Arc<SystemPromptProfile>>,
         prompt_profiles: Arc<PromptProfileCatalog>,
+        workflow: Option<WorkflowHandle>,
+        mode: SharedMode,
     ) -> Self {
         let restored_history = History::restored(initial_history);
         let initial_messages = restored_history
@@ -138,7 +146,7 @@ impl AgentLoop {
             path_locks: PathLocks::fresh(),
             min_run_id: 0,
             agent_tx,
-            answer_rx: Arc::new(async_lock::Mutex::new(answer_rx)),
+            answer_rx,
             queue,
             session_id,
             mailbox,
@@ -150,6 +158,8 @@ impl AgentLoop {
             goal,
             system_prompt_profile,
             prompt_profiles,
+            workflow,
+            mode,
         }
     }
 
@@ -316,11 +326,7 @@ impl AgentLoop {
         // Built once MCP has settled, so a `/btw` fired before the first prompt
         // carries the same tools the live request will.
         let slot = self.model_slot.load();
-        self.rebuild_tools(
-            &slot.model,
-            &caudra_providers::ThinkingConfig::default(),
-            false,
-        );
+        self.rebuild_tools(&slot.model, &caudra_providers::ThinkingConfig::default());
         self.context_system = self.publish_btw_prompt(
             &caudra_agent::prompt::ResolvedSlots::default(),
             RequestOptions::default(),
@@ -393,7 +399,8 @@ impl AgentLoop {
             let current = self.read_instructions().await;
             self.instructions.drift(current, self.history.epoch())
         };
-        self.rebuild_tools(&slot.model, &input.thinking, input.workflow);
+        self.rebuild_tools(&slot.model, &input.thinking);
+        self.mode.store(Arc::new(input.mode.clone()));
 
         if let Some(ref prompt_ref) = input.prompt {
             let Some(ref mcp) = self.mcp else {
@@ -476,6 +483,7 @@ impl AgentLoop {
                 audience: ToolAudience::MAIN,
                 tool_filter,
                 model_policy: Arc::clone(&self.model_policy),
+                workflow: self.workflow.clone(),
             },
             AgentRunParams {
                 history: &mut self.history,
@@ -520,13 +528,8 @@ impl AgentLoop {
 
     /// Base tools only. MCP definitions are injected per request by
     /// `Agent::request_tools`; baking them here would freeze the catalog.
-    fn rebuild_tools(
-        &mut self,
-        model: &Model,
-        thinking: &caudra_providers::ThinkingConfig,
-        workflow: bool,
-    ) {
-        let definitions = self.build_tools(model, thinking, workflow);
+    fn rebuild_tools(&mut self, model: &Model, thinking: &caudra_providers::ThinkingConfig) {
+        let definitions = self.build_tools(model, thinking);
         self.tools = definitions.declared;
         self.deferred = definitions.deferred;
     }
@@ -535,7 +538,6 @@ impl AgentLoop {
         &self,
         model: &Model,
         thinking: &caudra_providers::ThinkingConfig,
-        workflow: bool,
     ) -> ToolDefinitions {
         let examples = model.supports_tool_examples();
         let filter = ToolFilter::from_config(&self.config, model, &[]);
@@ -549,7 +551,7 @@ impl AgentLoop {
         let ctx = DescriptionContext {
             filter: &filter,
             audience: ToolAudience::MAIN,
-            workflow,
+            workflows_available: self.workflow.is_some(),
         };
         ToolRegistry::global().definitions_split(
             &vars,

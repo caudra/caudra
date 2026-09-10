@@ -5037,8 +5037,7 @@ fn start_ctx_capabilities() {
     let body = recv_live_buf(&rx, START_TOOL_USE_ID).expect("probe publishes a buf");
     let text = body.take().text();
     assert_eq!(
-        text,
-        "call_tool_err finish_err deadline_err config_ok cancelled_ok workflow_ok audience_ok tol_ok",
+        text, "call_tool_err finish_err deadline_err config_ok cancelled_ok audience_ok tol_ok",
         "start ctx capability matrix mismatch"
     );
 }
@@ -5088,9 +5087,8 @@ caudra.api.register_tool({{
         parts[3] = pair_err(ctx:set_deadline(5)) and "deadline_err" or "deadline_ok"
         parts[4] = type(ctx:config()) == "table" and "config_ok" or "config_bad"
         parts[5] = ctx:cancelled() == false and "cancelled_ok" or "cancelled_bad"
-        parts[6] = type(ctx:workflow()) == "boolean" and "workflow_ok" or "workflow_bad"
-        parts[7] = type(ctx:audience()) == "string" and "audience_ok" or "audience_bad"
-        parts[8] = type(ctx:tool_output_lines()) == "table" and "tol_ok" or "tol_bad"
+        parts[6] = type(ctx:audience()) == "string" and "audience_ok" or "audience_bad"
+        parts[7] = type(ctx:tool_output_lines()) == "table" and "tol_ok" or "tol_bad"
         local buf = caudra.ui.buf()
         buf:set_lines({{ table.concat(parts, " ") }})
         ctx:live_buf(buf)

@@ -41,7 +41,6 @@ pub(crate) struct SessionState {
     pub warnings: Vec<String>,
     pub thinking: ThinkingConfig,
     pub fast: bool,
-    pub workflow: bool,
     pub system_prompt_profile_name: String,
     pub system_prompt_profile: Option<Arc<SystemPromptProfile>>,
     pub system_prompt_profile_override: bool,
@@ -146,7 +145,6 @@ impl SessionState {
                 .filter(|_| model.supports_thinking())
                 .unwrap_or_default(),
             fast,
-            workflow: session.meta.workflow,
             system_prompt_profile_name: BUILTIN_PROFILE_NAME.to_owned(),
             system_prompt_profile: None,
             system_prompt_profile_override: false,

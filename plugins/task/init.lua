@@ -246,7 +246,7 @@ caudra.api.register_tool({
   effect = "orchestrator",
   description = description,
   kind = "execute",
-  audiences = { "main", "workflow" },
+  audiences = { "main" },
   examples = examples,
   schema = schema,
   handler = handler,

@@ -879,7 +879,6 @@ available.
 
   - `only` (`string[]?`) include only these tool names.
   - `except` (`string[]?`) exclude these tool names.
-  - `workflow` (`boolean?`) use workflow-mode descriptions. Default: `false`.
   - `spec` (`string?`) evaluate capability exclusions against this model spec.
 
 **Returns:** (`table?`, `string?`) Array of tool definition tables, or `(nil, err)` on failure.

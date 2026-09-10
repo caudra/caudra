@@ -166,7 +166,6 @@ pub fn run(
     timeouts: caudra_providers::Timeouts,
     lua_handle: EventHandle,
     fast: bool,
-    workflow: bool,
     thinking: caudra_providers::ThinkingConfig,
     system_prompt_profile: Option<Arc<caudra_agent::prompt::profile::SystemPromptProfile>>,
     prompt_profiles: Arc<caudra_agent::prompt::profile::PromptProfileCatalog>,
@@ -220,7 +219,6 @@ pub fn run(
         mcp_handle,
         initial_wd: cwd,
         fast,
-        workflow,
         model_policy,
         plugin_rules,
         goal,
@@ -306,6 +304,9 @@ pub fn run(
             | AgentEvent::Injected { .. }
             | AgentEvent::ToolsLoaded { .. }
             | AgentEvent::PromptProgress { .. } => {}
+            // One-shot print spawns no workflow runtime (`workflow: None`), so
+            // nothing can launch a run here and the event has no consumer.
+            AgentEvent::Workflow(_) => {}
             AgentEvent::GoalEvaluating { .. } => {}
             AgentEvent::GoalEvaluation {
                 cost: goal_cost,

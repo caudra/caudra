@@ -7,7 +7,7 @@ group = "Reference"
 
 # Tools
 
-Caudra ships with 26 built-in tools in this reference (26 on by default, 0 opt-in via plugin options). Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
+Caudra ships with 27 built-in tools in this reference (27 on by default, 0 opt-in via plugin options). Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
 
 First-party file, web, shell, index, Python, and environment tools run through protocol-neutral Workcell contracts. Workcell owns schemas, validation, execution bounds, atomic file changes, network policy, subprocess cleanup, cancellation, and the bundled worker lifecycle. Caudra owns registration, authorization, retained session output, and model or UI presentation. Release builds pin an exact Workcell revision.
 
@@ -258,6 +258,18 @@ Launch an autonomous subagent to perform tasks independently. Best combined with
 | `mode` | string | no | Subagent mode. Defaults to "plan" for a new task; omitted continuations retain their stored mode. |
 | `profile` | string | no | System prompt profile. Defaults to the parent profile for a new task; use "builtin" explicitly for Caudra's built-in prompt. Omitted continuations retain their stored profile. |
 | `output_schema` | string | no | JSON Schema (object) the subagent's final result must match. When set, the result is returned as a validated JSON string. |
+
+### `workflow` {#workflow}
+
+Run durable, multi-agent workflows: scripted plans that launch subagents in phases, keep a journal, and can be paused and resumed.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `action` | string | yes | What to do. |
+| `name` | string | no | Workflow name, for validate and start. |
+| `args` | string | no | Object the script receives as `args` on start. |
+| `agent_budget` | integer | no | Most agents the run may launch, for start and resume. |
+| `run_id` | string | no | Run id, for status, pause, resume, and stop. |
 
 ### `todo_write` {#todo_write}
 

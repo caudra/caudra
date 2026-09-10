@@ -49,6 +49,7 @@ use crate::cancel::{CancelMap, CancelToken};
 use crate::context::ContextPublisher;
 use crate::mcp::McpSession;
 use crate::permissions::PermissionManager;
+use crate::workflow::WorkflowHandle;
 use crate::{
     AgentConfig, AgentMode, EventSender, SharedBuf, SubagentHistoryStore, SubagentProgress,
 };
@@ -62,7 +63,8 @@ use caudra_storage::tool_outputs::ToolOutputStore;
 pub struct DescriptionContext<'a> {
     pub filter: &'a ToolFilter,
     pub audience: ToolAudience,
-    pub workflow: bool,
+    /// Whether the session runs a workflow runtime the `workflow` tool can reach.
+    pub workflows_available: bool,
 }
 
 impl DescriptionContext<'_> {
@@ -316,6 +318,7 @@ pub const TASK_TOOL_NAME: &str = "task";
 pub const TODOWRITE_TOOL_NAME: &str = "todo_write";
 pub const TOOL_OUTPUT_TOOL_NAME: &str = "tool_output";
 pub const VIEW_IMAGE_TOOL_NAME: &str = "view_image";
+pub const WORKFLOW_TOOL_NAME: &str = "workflow";
 
 /// Containers own nested tool calls: their result is the list of children
 /// rather than output of their own. Callers use this to follow the children
@@ -470,7 +473,6 @@ pub struct ToolContext {
     pub subagent_cancels: Arc<CancelMap<String>>,
     pub subagent_history: SubagentHistoryStore,
     pub registry: Arc<ToolRegistry>,
-    pub workflow: bool,
     pub audience: ToolAudience,
     pub tool_filter: ToolFilter,
     pub local_tools: LocalTools,
@@ -481,6 +483,9 @@ pub struct ToolContext {
     /// it for its own call only.
     pub live_sink: Option<flume::Sender<ToolLive>>,
     pub model_policy: Arc<ModelPolicy>,
+    /// The session's workflow runtime. Only the main agent holds one: an
+    /// agent a workflow launched must not launch workflows of its own.
+    pub workflow: Option<WorkflowHandle>,
 }
 
 impl ToolContext {
@@ -714,13 +719,13 @@ pub fn interpreter_ctx(
         subagent_cancels: Arc::new(CancelMap::new()),
         subagent_history: SubagentHistoryStore::default(),
         registry,
-        workflow: false,
         audience: ToolAudience::MAIN,
         tool_filter: ToolFilter::All,
         local_tools: LocalTools::default(),
         tool_name_aliases: None,
         live_sink: None,
         model_policy: Arc::new(ModelPolicy::default()),
+        workflow: None,
     }
 }
 

@@ -2,6 +2,7 @@ mod agent_loop;
 mod cancel_map;
 mod command_router;
 pub(crate) mod shared_queue;
+mod workflow;
 
 use std::collections::HashSet;
 use std::mem;
@@ -12,14 +13,16 @@ use arc_swap::ArcSwap;
 use caudra_agent::context::{ContextKey, ContextStore};
 use caudra_agent::permissions::PermissionManager;
 use caudra_agent::prompt::profile::PromptProfileCatalog;
-use caudra_agent::prompt::profile::SystemPromptProfile;
+use caudra_agent::prompt::profile::{BUILTIN_PROFILE_NAME, SystemPromptProfile};
+use caudra_agent::workflow::WorkflowHandle;
 use caudra_agent::{
-    AgentConfig, CancelMap, CancelToken, Envelope, HistorySnapshot, McpCommand, McpConfigErrors,
-    McpHandle, McpSnapshotReader, Nudge, SessionMailbox, SharedHistory, SubagentHistoryStore,
-    ToolOutputLines,
+    AgentConfig, AgentMode, CancelMap, CancelToken, Envelope, HistorySnapshot, McpCommand,
+    McpConfigErrors, McpHandle, McpSnapshotReader, Nudge, SessionMailbox, SharedHistory,
+    SubagentHistoryStore, ToolOutputLines,
 };
 use caudra_config::ModelPolicy;
 use caudra_lua::EventHandle;
+use caudra_storage::StateDir;
 use caudra_storage::id::SessionRef;
 use caudra_storage::sessions::SessionLease;
 
@@ -34,6 +37,7 @@ use crate::app::App;
 use self::agent_loop::AgentLoop;
 use self::command_router::spawn_command_router;
 pub(crate) use self::shared_queue::{QueueSender, QueuedMessage};
+use self::workflow::{SharedMode, WorkflowSession, WorkflowSpawn, answer_channel};
 
 pub(crate) struct ModelSlot {
     pub(crate) model: Model,
@@ -86,12 +90,17 @@ pub(crate) struct AgentHandles {
     model_policy: Arc<ModelPolicy>,
     prompt_profiles: Arc<PromptProfileCatalog>,
     mailbox: Option<SessionMailbox>,
+    /// Session-lifetime: `respawn` carries it over untouched and only a change
+    /// of session id replaces it.
+    workflow: Option<WorkflowSession>,
     task: smol::Task<()>,
 }
 
 impl AgentHandles {
     /// MCP is shared across sessions and agent respawns; the event loop starts it
     /// once and shuts it down at exit. Only the agent loop task lives here.
+    /// The workflow runtime needs `state_dir` alongside a session id; without
+    /// both the session runs with no workflow support.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn spawn(
         model_slot: &Arc<ArcSwap<ModelSlot>>,
@@ -110,6 +119,7 @@ impl AgentHandles {
         subagent_history: SubagentHistoryStore,
         system_prompt_profile: Option<Arc<SystemPromptProfile>>,
         prompt_profiles: Arc<PromptProfileCatalog>,
+        state_dir: Option<StateDir>,
     ) -> Self {
         spawn_agent_internal(
             flume::unbounded(),
@@ -129,7 +139,20 @@ impl AgentHandles {
             subagent_history,
             system_prompt_profile,
             Arc::clone(&prompt_profiles),
+            WorkflowSlot::Fresh(state_dir),
         )
+    }
+
+    pub(crate) fn workflow_handle(&self) -> Option<WorkflowHandle> {
+        self.workflow.as_ref().map(WorkflowSession::handle)
+    }
+
+    /// Interrupts every run of this session and waits for the runtime to
+    /// close. Idempotent, so exit can call it ahead of the agent join.
+    pub(crate) fn shutdown_workflow(&mut self) {
+        if let Some(workflow) = self.workflow.take() {
+            workflow.shutdown();
+        }
     }
 
     pub(crate) fn mcp_reader(&self) -> McpSnapshotReader {
@@ -159,6 +182,7 @@ impl AgentHandles {
             }
         }
         app.state.goal = self.goal.clone();
+        app.workflow.set_handle(self.workflow_handle());
         let restore_tx =
             caudra_agent::EventSender::new(self.agent_tx.clone(), crate::app::RESTORE_RUN_ID);
         app.restore_event_tx = Some(restore_tx.clone());
@@ -184,8 +208,17 @@ impl AgentHandles {
             .unwrap_or_default()
     }
 
+    /// Background subagents plus the workflow runs in progress: both keep
+    /// working after the turn that started them, and both must be over before
+    /// the session counts as quiescent.
     pub(crate) fn active_background_tasks(&self) -> usize {
-        self.subagent_cancels.active_count()
+        self.subagent_cancels.active_count() + self.active_workflow_runs()
+    }
+
+    pub(crate) fn active_workflow_runs(&self) -> usize {
+        self.workflow
+            .as_ref()
+            .map_or(0, WorkflowSession::active_runs)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -217,6 +250,20 @@ impl AgentHandles {
             warn!(error = %e, "failed to reload auth, continuing with existing credentials");
         }
         let subagent_history = stored_subagent_history(&app.state.session);
+        // The runtime follows the session, not the loop: a respawn under the
+        // same id keeps every run going, and a loaded or reset session gets
+        // its own only once the previous one has stopped and drained.
+        let workflow = match self.workflow.take() {
+            Some(current) if current.session_id() == app.state.session.id => {
+                WorkflowSlot::Reuse(current)
+            }
+            stale => {
+                if let Some(stale) = stale {
+                    stale.shutdown();
+                }
+                WorkflowSlot::Fresh(Some(app.storage.clone()))
+            }
+        };
         let new = spawn_agent_internal(
             (self.agent_tx.clone(), self.agent_rx.clone()),
             model_slot,
@@ -235,6 +282,7 @@ impl AgentHandles {
             subagent_history,
             app.state.system_prompt_profile.clone(),
             Arc::clone(&self.prompt_profiles),
+            workflow,
         );
         let old = mem::replace(self, new);
         // Repoint the app at the new queue before dropping `old`, otherwise the app keeps
@@ -285,6 +333,15 @@ pub(crate) fn join_all(tasks: Vec<smol::Task<()>>, timeout: Duration) {
     });
 }
 
+/// Where a new agent generation gets its workflow runtime from.
+enum WorkflowSlot {
+    /// Keep the session's runtime; the new loop only gets a fresh handle.
+    Reuse(WorkflowSession),
+    /// Open one for this session, when there is a state directory to keep
+    /// its runs in.
+    Fresh(Option<StateDir>),
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_agent_internal(
     (agent_tx, agent_rx): (flume::Sender<Envelope>, flume::Receiver<Envelope>),
@@ -304,9 +361,13 @@ fn spawn_agent_internal(
     subagent_history: SubagentHistoryStore,
     system_prompt_profile: Option<Arc<SystemPromptProfile>>,
     prompt_profiles: Arc<PromptProfileCatalog>,
+    workflow: WorkflowSlot,
 ) -> AgentHandles {
     let (cmd_tx, cmd_rx) = flume::unbounded::<AgentCommand>();
-    let (answer_tx, answer_rx) = flume::unbounded::<String>();
+    let (answer_tx, answer_rx) = match &workflow {
+        WorkflowSlot::Reuse(current) => current.answer_channel(),
+        WorkflowSlot::Fresh(_) => answer_channel(),
+    };
     let (queue_tx, queue_rx) = shared_queue::queue();
     let queue_rx = Arc::new(queue_rx);
     // Keep the incoming items visible if restore validation fails. A valid
@@ -324,6 +385,44 @@ fn spawn_agent_internal(
     let mailbox = session_id
         .as_ref()
         .map(|session_id| SessionMailbox::register(session_id.id()));
+    let task_prompt_profile_name: Arc<str> = Arc::from(
+        system_prompt_profile
+            .as_ref()
+            .map_or(BUILTIN_PROFILE_NAME, |profile| profile.name()),
+    );
+    // Before the loop, so its `workflow` tool reaches the runtime from the
+    // first turn.
+    let workflow = match workflow {
+        WorkflowSlot::Reuse(current) => Some(current),
+        WorkflowSlot::Fresh(state_dir) => {
+            state_dir
+                .zip(session_id.as_ref())
+                .and_then(|(state_dir, session_id)| {
+                    WorkflowSession::spawn(WorkflowSpawn {
+                        state_dir,
+                        session_id: session_id.id(),
+                        model_slot,
+                        config: &config,
+                        tool_output_lines,
+                        permissions,
+                        mcp_handle: mcp_handle.as_ref(),
+                        timeouts,
+                        lua_handle: &lua_handle,
+                        model_policy: &model_policy,
+                        subagent_history: &subagent_history,
+                        prompt_profiles: &prompt_profiles,
+                        task_prompt_profile_name: Arc::clone(&task_prompt_profile_name),
+                        context_publisher: context_publisher.clone(),
+                        answer: (answer_tx.clone(), Arc::clone(&answer_rx)),
+                        events: agent_tx.clone(),
+                    })
+                })
+        }
+    };
+    let mode: SharedMode = workflow.as_ref().map_or_else(
+        || Arc::new(ArcSwap::from_pointee(AgentMode::default())),
+        WorkflowSession::mode,
+    );
 
     spawn_command_router(
         cmd_rx,
@@ -358,6 +457,8 @@ fn spawn_agent_internal(
         goal.clone(),
         system_prompt_profile,
         Arc::clone(&prompt_profiles),
+        workflow.as_ref().map(WorkflowSession::handle),
+        mode,
     );
 
     let task = smol::spawn(async move {
@@ -382,6 +483,7 @@ fn spawn_agent_internal(
         model_policy,
         prompt_profiles,
         mailbox,
+        workflow,
         task,
     }
 }
@@ -597,6 +699,7 @@ mod tests {
             SubagentHistoryStore::default(),
             None,
             Arc::new(PromptProfileCatalog::default()),
+            None,
         );
         (handles, model_slot, permissions)
     }

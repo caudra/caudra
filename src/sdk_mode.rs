@@ -22,6 +22,8 @@ use caudra_agent::permissions::{
 use caudra_agent::prompt::ResolvedSlots;
 use caudra_agent::prompt::profile::{BUILTIN_PROFILE_NAME, PromptProfileCatalog};
 use caudra_agent::tools::QUESTION_TOOL_NAME;
+use caudra_agent::types::WorkflowProvenance;
+use caudra_agent::workflow::WorkflowHandle;
 use caudra_agent::{
     AgentConfig, AgentEvent, AgentInput, AgentMode, DoneReason, Envelope, History,
     PermissionsConfig, StoredSession,
@@ -37,6 +39,9 @@ use caudra_storage::permission_state::PermissionRuleRecord;
 use caudra_storage::sessions::{SessionError, SessionLease};
 use caudra_storage::tool_outputs::{ToolOutputRef, ToolOutputStore};
 use caudra_storage::{StateDir, StorageError};
+use caudra_workflow::{
+    LaunchRequest, WorkflowError, WorkflowEvent, WorkflowRequest, WorkflowResponse,
+};
 use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
 use flume::{Receiver, Sender};
@@ -45,6 +50,30 @@ use serde_json::Value;
 use tracing::warn;
 
 use crate::cli::Cli;
+
+const WORKFLOW_SYSTEM_SUBTYPE: &str = "workflow";
+const WORKFLOW_LIST: &str = "workflow_list";
+const WORKFLOW_VALIDATE: &str = "workflow_validate";
+const WORKFLOW_START: &str = "workflow_start";
+const WORKFLOW_STATUS: &str = "workflow_status";
+const WORKFLOW_PAUSE: &str = "workflow_pause";
+const WORKFLOW_RESUME: &str = "workflow_resume";
+const WORKFLOW_STOP: &str = "workflow_stop";
+const WORKFLOW_TRUST: &str = "workflow_trust";
+const WORKFLOW_ACK: &str = "workflow_ack";
+/// Every `control_request` subtype the workflow runtime answers, as the
+/// init message advertises them.
+const WORKFLOW_CONTROLS: &[&str] = &[
+    WORKFLOW_LIST,
+    WORKFLOW_VALIDATE,
+    WORKFLOW_START,
+    WORKFLOW_STATUS,
+    WORKFLOW_PAUSE,
+    WORKFLOW_RESUME,
+    WORKFLOW_STOP,
+    WORKFLOW_TRUST,
+    WORKFLOW_ACK,
+];
 
 const TOOL_NAME_MAP: &[(&str, &str)] = &[
     ("file_apply_patch", "FileApplyPatch"),
@@ -158,6 +187,9 @@ struct AssistantPayload {
     message: AssistantMessage,
     #[serde(skip_serializing_if = "Option::is_none")]
     parent_tool_use_id: Option<String>,
+    /// Set on an agent a workflow run launched, as `workflow_*` keys.
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    workflow: Option<WorkflowProvenance>,
 }
 
 #[derive(Serialize)]
@@ -175,6 +207,17 @@ struct UserPayload {
     message: UserMessage,
     #[serde(skip_serializing_if = "Option::is_none")]
     parent_tool_use_id: Option<String>,
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    workflow: Option<WorkflowProvenance>,
+}
+
+/// The `system` / `workflow` body: the run's event plus the envelope's
+/// `workflow_*` provenance keys, so a client can key it by run.
+#[derive(Serialize)]
+struct WorkflowSystemPayload<'a> {
+    event: &'a WorkflowEvent,
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    workflow: Option<&'a WorkflowProvenance>,
 }
 
 #[derive(Serialize)]
@@ -534,7 +577,6 @@ pub struct SdkParams {
     pub prompt_slots: ResolvedSlots,
     pub prompt_profiles: Arc<PromptProfileCatalog>,
     pub fast: bool,
-    pub workflow: bool,
     pub thinking: ThinkingConfig,
     pub model_policy: Arc<ModelPolicy>,
     pub plugin_rules: Arc<PluginRuleStore>,
@@ -558,7 +600,6 @@ pub fn run(params: SdkParams) -> Result<()> {
         prompt_slots,
         prompt_profiles,
         fast,
-        workflow,
         thinking,
         model_policy,
         plugin_rules,
@@ -649,6 +690,20 @@ pub fn run(params: SdkParams) -> Result<()> {
     )?;
 
     let startup_model = model.clone();
+    let shared = Arc::new(Mutex::new(Shared {
+        model: startup_model.clone(),
+        permission_mode: requested_permission_mode,
+        turn_start: Instant::now(),
+        pending: HashMap::new(),
+        resolved_permission_requests: HashSet::new(),
+    }));
+    // Workflow agents start under whatever mode the client last set, which
+    // may be long after the prompt that launched their run.
+    let workflow_mode = Arc::new({
+        let shared = Arc::clone(&shared);
+        let cwd = cwd.clone();
+        move || shared.lock().unwrap().permission_mode.agent_mode(&cwd)
+    });
     let handle = smol::block_on(headless::spawn_interactive(InteractiveParams {
         model,
         config,
@@ -671,14 +726,15 @@ pub fn run(params: SdkParams) -> Result<()> {
         session_yolo,
         system_prompt_override,
         append_system_prompt: cli.append_system_prompt.clone().filter(|s| !s.is_empty()),
-        workflow,
         model_policy: Arc::clone(&model_policy),
         plugin_rules,
         local_tools: Default::default(),
+        workflow_mode: Some(workflow_mode),
     }))
     .map_err(|error| eyre!(error))?;
     let permission_mode =
         effective_permission_mode(requested_permission_mode, handle.permissions.is_yolo());
+    shared.lock().unwrap().permission_mode = permission_mode;
 
     let (out_tx, out_rx) = flume::unbounded::<String>();
     let writer_thread = std::thread::spawn(move || {
@@ -701,25 +757,20 @@ pub fn run(params: SdkParams) -> Result<()> {
         .collect();
     writer.emit_system(
         "init",
-        serde_json::json!({
-            "cwd": working_dir,
-            "tools": tools,
-            "model": startup_model.id,
-            "permissionMode": permission_mode.as_str(),
-            "apiKeySource": "none",
-            "mcp_servers": sdk_mcp_servers,
-            "slash_commands": [],
-            "output_style": "default",
-        }),
+        init_payload(
+            serde_json::json!({
+                "cwd": working_dir,
+                "tools": tools,
+                "model": startup_model.id,
+                "permissionMode": permission_mode.as_str(),
+                "apiKeySource": "none",
+                "mcp_servers": sdk_mcp_servers,
+                "slash_commands": [],
+                "output_style": "default",
+            }),
+            handle.workflow.is_some(),
+        ),
     )?;
-
-    let shared = Arc::new(Mutex::new(Shared {
-        model: startup_model.clone(),
-        permission_mode,
-        turn_start: Instant::now(),
-        pending: HashMap::new(),
-        resolved_permission_requests: HashSet::new(),
-    }));
 
     let pump = EventPump {
         writer: writer.clone(),
@@ -774,7 +825,6 @@ pub fn run(params: SdkParams) -> Result<()> {
                     preamble: Vec::new(),
                     thinking: thinking.clone(),
                     fast,
-                    workflow,
                     prompt: None,
                     resume: false,
                 };
@@ -1413,10 +1463,118 @@ fn handle_control_request(
                 ),
             }
         }
-        other => writer.emit_control_response(
-            &cr.request_id,
-            None,
-            Some(format!("unsupported: {other}")),
+        other => match workflow_request(other, &cr.request.extra) {
+            Some(Ok(request)) => {
+                forward_workflow_request(writer, handle.workflow.as_ref(), &cr.request_id, request);
+                Ok(())
+            }
+            Some(Err(message)) => writer.emit_control_response(&cr.request_id, None, Some(message)),
+            None => writer.emit_control_response(
+                &cr.request_id,
+                None,
+                Some(format!("unsupported: {other}")),
+            ),
+        },
+    }
+}
+
+/// The init message with what the session can do beyond the Claude Code
+/// shape: `workflows` says whether a runtime is attached, and
+/// `workflow_controls` names the `control_request` subtypes it answers.
+fn init_payload(mut payload: Value, workflows: bool) -> Value {
+    let controls: &[&str] = if workflows { WORKFLOW_CONTROLS } else { &[] };
+    payload["workflows"] = Value::Bool(workflows);
+    payload["workflow_controls"] = serde_json::json!(controls);
+    payload
+}
+
+/// `None` when `subtype` is not a workflow control; `Some(Err)` names the
+/// field a workflow control lacks.
+fn workflow_request(subtype: &str, extra: &Value) -> Option<Result<WorkflowRequest, String>> {
+    let text = |field: &str| {
+        extra
+            .get(field)
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| format!("{subtype} requires a string {field}"))
+    };
+    let agent_budget = || {
+        extra
+            .get("agent_budget")
+            .and_then(Value::as_u64)
+            .map(|budget| u32::try_from(budget).unwrap_or(u32::MAX))
+    };
+    let request = match subtype {
+        WORKFLOW_LIST => Ok(WorkflowRequest::List),
+        WORKFLOW_VALIDATE => text("name").map(|name| WorkflowRequest::Validate { name }),
+        WORKFLOW_START => text("name").map(|name| {
+            WorkflowRequest::Start(LaunchRequest {
+                name,
+                args: match extra.get("args") {
+                    Some(args @ Value::Object(_)) => args.clone(),
+                    _ => Value::Object(serde_json::Map::new()),
+                },
+                agent_budget: agent_budget(),
+            })
+        }),
+        WORKFLOW_STATUS => Ok(WorkflowRequest::Status {
+            run_id: text("run_id").ok(),
+        }),
+        WORKFLOW_PAUSE => text("run_id").map(|run_id| WorkflowRequest::Pause { run_id }),
+        WORKFLOW_RESUME => text("run_id").map(|run_id| WorkflowRequest::Resume {
+            run_id,
+            agent_budget: agent_budget(),
+        }),
+        WORKFLOW_STOP => text("run_id").map(|run_id| WorkflowRequest::Stop { run_id }),
+        WORKFLOW_TRUST => text("name")
+            .and_then(|name| text("digest").map(|digest| WorkflowRequest::Trust { name, digest })),
+        WORKFLOW_ACK => text("run_id").and_then(|run_id| {
+            extra
+                .get("revision")
+                .and_then(Value::as_u64)
+                .map(|revision| WorkflowRequest::AckCompletion { run_id, revision })
+                .ok_or_else(|| format!("{subtype} requires an integer revision"))
+        }),
+        _ => return None,
+    };
+    Some(request)
+}
+
+/// Answers off the stdin thread: a pause or stop waits for the run's agents
+/// to stop, and the client's permission replies must keep flowing meanwhile.
+fn forward_workflow_request(
+    writer: &SdkWriter,
+    workflow: Option<&WorkflowHandle>,
+    request_id: &str,
+    request: WorkflowRequest,
+) {
+    let writer = writer.clone();
+    let workflow = workflow.cloned();
+    let request_id = request_id.to_owned();
+    smol::spawn(async move {
+        let answer = match workflow {
+            Some(workflow) => workflow.request(request).await,
+            None => Err(WorkflowError::Unavailable),
+        };
+        let (response, error) = workflow_control_response(answer);
+        if let Err(error) = writer.emit_control_response(&request_id, response, error) {
+            warn!(%error, request_id, "workflow control response not delivered");
+        }
+    })
+    .detach();
+}
+
+/// A success carries the runtime's answer under `workflow`; a failure is an
+/// error response whose message is the error's text, with the structured
+/// error under `workflow_error`.
+fn workflow_control_response(
+    answer: Result<WorkflowResponse, WorkflowError>,
+) -> (Option<Value>, Option<String>) {
+    match answer {
+        Ok(response) => (Some(serde_json::json!({ "workflow": response })), None),
+        Err(error) => (
+            Some(serde_json::json!({ "workflow_error": error })),
+            Some(error.to_string()),
         ),
     }
 }
@@ -1756,6 +1914,15 @@ impl EventPump {
             | AgentEvent::Injected { .. }
             | AgentEvent::ToolsLoaded { .. }
             | AgentEvent::PromptProgress { .. } => {}
+            AgentEvent::Workflow(event) => {
+                self.writer.emit_system(
+                    WORKFLOW_SYSTEM_SUBTYPE,
+                    serde_json::to_value(WorkflowSystemPayload {
+                        event,
+                        workflow: envelope.workflow.as_ref(),
+                    })?,
+                )?;
+            }
             AgentEvent::StreamReset => {
                 if self.include_partial_messages {
                     let events = self.synth.finish_message(&TokenUsage::default());
@@ -1811,6 +1978,7 @@ impl EventPump {
                         usage: tc.usage,
                     },
                     parent_tool_use_id,
+                    workflow: envelope.workflow.clone(),
                 }))?;
             }
             AgentEvent::ToolResultsSubmitted { message } => {
@@ -1820,6 +1988,7 @@ impl EventPump {
                         content: serde_json::to_value(&message.content)?,
                     },
                     parent_tool_use_id,
+                    workflow: envelope.workflow.clone(),
                 }))?;
             }
             AgentEvent::PermissionRequest(request) => {
@@ -1929,9 +2098,12 @@ fn map_tool_names_in_content(content: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use caudra_agent::SubagentInfo;
     use caudra_agent::permissions::PermissionRequest;
     use caudra_agent::tools::PermissionScopes;
+    use caudra_agent::types::WORKFLOW_EVENT_RUN_ID;
     use caudra_providers::{ContentBlock, Message, Role};
+    use caudra_workflow::{RunSnapshot, RunStatus, RunUsage, SourceKind};
     use tempfile::TempDir;
     use test_case::test_case;
 
@@ -2130,6 +2302,7 @@ mod tests {
                 content: serde_json::to_value(&message.content).unwrap(),
             },
             parent_tool_use_id: None,
+            workflow: None,
         };
 
         let json = serde_json::to_value(payload).unwrap();
@@ -2582,12 +2755,14 @@ mod tests {
             },
             subagent: None,
             run_id: 0,
+            workflow: None,
         })
         .unwrap();
         pump.handle(Envelope {
             event: AgentEvent::StreamReset,
             subagent: None,
             run_id: 0,
+            workflow: None,
         })
         .unwrap();
 
@@ -2895,6 +3070,7 @@ mod tests {
             event: AgentEvent::PermissionRequest(Box::new(request)),
             subagent: None,
             run_id: 0,
+            workflow: None,
         })
         .unwrap();
 
@@ -3158,5 +3334,221 @@ mod tests {
         assert_eq!(mapped[0]["type"], "text");
         assert_eq!(mapped[1]["name"], "FileRead");
         assert_eq!(mapped[2]["name"], "unknown_native");
+    }
+
+    const RUN_ID: &str = "run-1";
+    const WORKFLOW_NAME: &str = "review";
+    const DIGEST: &str = "sha256:abc";
+    const EPOCH: u64 = 2;
+    const CALL_KEY: u64 = 7;
+    const PHASE: &str = "Gather";
+    const REVISION: u64 = 3;
+    const AGENT_BUDGET: u32 = 4;
+    const UNKNOWN_RUN_MESSAGE: &str = "unknown workflow run \"run-1\"";
+
+    fn provenance() -> WorkflowProvenance {
+        WorkflowProvenance {
+            run_id: RUN_ID.into(),
+            epoch: EPOCH,
+            call_key: CALL_KEY,
+            phase: Some(PHASE.into()),
+        }
+    }
+
+    fn snapshot() -> RunSnapshot {
+        RunSnapshot {
+            run_id: RUN_ID.into(),
+            display_name: WORKFLOW_NAME.into(),
+            workflow_name: WORKFLOW_NAME.into(),
+            source_kind: SourceKind::Project,
+            objective: None,
+            status: RunStatus::Completed,
+            pause_kind: None,
+            pause_message: None,
+            revision: REVISION,
+            execution_epoch: EPOCH,
+            phase: Some(PHASE.into()),
+            phases: vec![PHASE.into()],
+            agent_budget: AGENT_BUDGET,
+            usage: RunUsage::default(),
+            roster: Vec::new(),
+            result: None,
+            error: None,
+            logs: Vec::new(),
+            outbox_pending: true,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    fn workflow_envelope(event: AgentEvent, subagent: Option<SubagentInfo>) -> Envelope {
+        Envelope {
+            event,
+            subagent,
+            run_id: WORKFLOW_EVENT_RUN_ID,
+            workflow: Some(provenance()),
+        }
+    }
+
+    fn next_message(out_rx: &Receiver<String>) -> Value {
+        serde_json::from_str(&out_rx.try_recv().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn a_workflow_snapshot_is_a_system_workflow_message_keyed_by_run() {
+        let (mut pump, out_rx, _) =
+            permission_event_pump(permission_manager(), PermissionMode::Default);
+
+        pump.handle(workflow_envelope(
+            AgentEvent::Workflow(Box::new(WorkflowEvent::Snapshot(Box::new(snapshot())))),
+            None,
+        ))
+        .unwrap();
+
+        let message = next_message(&out_rx);
+        assert_eq!(message["type"], "system");
+        assert_eq!(message["subtype"], WORKFLOW_SYSTEM_SUBTYPE);
+        assert_eq!(message["event"]["kind"], "snapshot");
+        assert_eq!(message["event"]["run_id"], RUN_ID);
+        assert_eq!(message["event"]["status"], "completed");
+        assert_eq!(message["workflow_run_id"], RUN_ID);
+        assert_eq!(message["workflow_epoch"], EPOCH);
+        assert_eq!(message["workflow_call_key"], CALL_KEY);
+        assert_eq!(message["workflow_phase"], PHASE);
+        assert!(out_rx.is_empty());
+    }
+
+    #[test]
+    fn a_workflow_child_event_keeps_its_parent_and_workflow_keys() {
+        let (mut pump, out_rx, _) =
+            permission_event_pump(permission_manager(), PermissionMode::Default);
+
+        pump.handle(workflow_envelope(
+            AgentEvent::ToolResultsSubmitted {
+                message: Box::new(Message::user("done".into())),
+            },
+            Some(SubagentInfo {
+                parent_tool_use_id: "wf-call".into(),
+                task_id: "task-1".into(),
+                name: "worker".into(),
+                prompt: None,
+                model: None,
+                answer_tx: None,
+                steer_tx: None,
+            }),
+        ))
+        .unwrap();
+
+        let message = next_message(&out_rx);
+        assert_eq!(message["type"], "user");
+        assert_eq!(message["parent_tool_use_id"], "wf-call");
+        assert_eq!(message["workflow_run_id"], RUN_ID);
+        assert_eq!(message["workflow_epoch"], EPOCH);
+    }
+
+    #[test_case(WORKFLOW_LIST, serde_json::json!({}) => WorkflowRequest::List; "list")]
+    #[test_case(WORKFLOW_VALIDATE, serde_json::json!({"name": WORKFLOW_NAME}) => WorkflowRequest::Validate { name: WORKFLOW_NAME.into() }; "validate")]
+    #[test_case(WORKFLOW_START, serde_json::json!({"name": WORKFLOW_NAME, "args": {"branch": "main"}, "agent_budget": AGENT_BUDGET}) => WorkflowRequest::Start(LaunchRequest { name: WORKFLOW_NAME.into(), args: serde_json::json!({"branch": "main"}), agent_budget: Some(AGENT_BUDGET) }); "start")]
+    #[test_case(WORKFLOW_START, serde_json::json!({"name": WORKFLOW_NAME}) => WorkflowRequest::Start(LaunchRequest { name: WORKFLOW_NAME.into(), args: serde_json::json!({}), agent_budget: None }); "start_defaults_to_empty_args")]
+    #[test_case(WORKFLOW_STATUS, serde_json::json!({}) => WorkflowRequest::Status { run_id: None }; "status_all")]
+    #[test_case(WORKFLOW_STATUS, serde_json::json!({"run_id": RUN_ID}) => WorkflowRequest::Status { run_id: Some(RUN_ID.into()) }; "status_one")]
+    #[test_case(WORKFLOW_PAUSE, serde_json::json!({"run_id": RUN_ID}) => WorkflowRequest::Pause { run_id: RUN_ID.into() }; "pause")]
+    #[test_case(WORKFLOW_RESUME, serde_json::json!({"run_id": RUN_ID, "agent_budget": AGENT_BUDGET}) => WorkflowRequest::Resume { run_id: RUN_ID.into(), agent_budget: Some(AGENT_BUDGET) }; "resume")]
+    #[test_case(WORKFLOW_STOP, serde_json::json!({"run_id": RUN_ID}) => WorkflowRequest::Stop { run_id: RUN_ID.into() }; "stop")]
+    #[test_case(WORKFLOW_TRUST, serde_json::json!({"name": WORKFLOW_NAME, "digest": DIGEST}) => WorkflowRequest::Trust { name: WORKFLOW_NAME.into(), digest: DIGEST.into() }; "trust")]
+    #[test_case(WORKFLOW_ACK, serde_json::json!({"run_id": RUN_ID, "revision": REVISION}) => WorkflowRequest::AckCompletion { run_id: RUN_ID.into(), revision: REVISION }; "ack")]
+    fn workflow_controls_map_to_runtime_requests(subtype: &str, extra: Value) -> WorkflowRequest {
+        workflow_request(subtype, &extra).unwrap().unwrap()
+    }
+
+    #[test_case(WORKFLOW_VALIDATE, serde_json::json!({}); "validate_without_name")]
+    #[test_case(WORKFLOW_TRUST, serde_json::json!({"name": WORKFLOW_NAME}); "trust_without_digest")]
+    #[test_case(WORKFLOW_ACK, serde_json::json!({"run_id": RUN_ID}); "ack_without_revision")]
+    #[test_case(WORKFLOW_STOP, serde_json::json!({"run_id": 7}); "stop_with_a_non_string_run_id")]
+    fn a_workflow_control_missing_a_field_is_refused_by_name(subtype: &str, extra: Value) {
+        let message = workflow_request(subtype, &extra).unwrap().unwrap_err();
+        assert!(message.starts_with(subtype), "got: {message}");
+    }
+
+    #[test]
+    fn a_non_workflow_subtype_is_not_a_workflow_control() {
+        assert!(workflow_request("interrupt", &serde_json::json!({})).is_none());
+    }
+
+    #[test]
+    fn a_runtime_error_is_an_error_control_response_with_the_structured_error() {
+        let (out_tx, out_rx) = flume::unbounded();
+        let writer = SdkWriter {
+            session_id: SessionRef::generate(),
+            out_tx,
+        };
+        let (response, error) = workflow_control_response(Err(WorkflowError::UnknownRun {
+            run_id: RUN_ID.into(),
+        }));
+
+        writer
+            .emit_control_response("req_9", response, error)
+            .unwrap();
+
+        let message = next_message(&out_rx);
+        assert_eq!(message["type"], "control_response");
+        assert_eq!(message["response"]["subtype"], "error");
+        assert_eq!(message["response"]["request_id"], "req_9");
+        assert_eq!(message["response"]["error"], UNKNOWN_RUN_MESSAGE);
+        assert_eq!(
+            message["response"]["response"]["workflow_error"],
+            serde_json::json!({"kind": "unknown_run", "detail": {"run_id": RUN_ID}})
+        );
+    }
+
+    #[test]
+    fn a_runtime_answer_is_a_success_control_response_under_workflow() {
+        let (out_tx, out_rx) = flume::unbounded();
+        let writer = SdkWriter {
+            session_id: SessionRef::generate(),
+            out_tx,
+        };
+        let (response, error) = workflow_control_response(Ok(WorkflowResponse::Acked(true)));
+
+        writer
+            .emit_control_response("req_9", response, error)
+            .unwrap();
+
+        let message = next_message(&out_rx);
+        assert_eq!(message["response"]["subtype"], "success");
+        assert_eq!(
+            message["response"]["response"]["workflow"],
+            serde_json::json!({"kind": "acked", "detail": true})
+        );
+    }
+
+    #[test]
+    fn a_control_without_a_runtime_answers_unavailable() {
+        let (out_tx, out_rx) = flume::unbounded();
+        let writer = SdkWriter {
+            session_id: SessionRef::generate(),
+            out_tx,
+        };
+
+        forward_workflow_request(&writer, None, "req_1", WorkflowRequest::List);
+
+        let message: Value =
+            serde_json::from_str(&smol::block_on(out_rx.recv_async()).unwrap()).unwrap();
+        assert_eq!(message["response"]["subtype"], "error");
+        assert_eq!(
+            message["response"]["error"],
+            WorkflowError::Unavailable.to_string()
+        );
+    }
+
+    #[test_case(true => (true, WORKFLOW_CONTROLS.len()); "with_a_runtime")]
+    #[test_case(false => (false, 0); "without_a_runtime")]
+    fn init_advertises_workflow_support(workflows: bool) -> (bool, usize) {
+        let payload = init_payload(serde_json::json!({"cwd": "/tmp"}), workflows);
+        assert_eq!(payload["cwd"], "/tmp");
+        (
+            payload["workflows"].as_bool().unwrap(),
+            payload["workflow_controls"].as_array().unwrap().len(),
+        )
     }
 }

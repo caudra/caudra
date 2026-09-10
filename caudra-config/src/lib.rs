@@ -142,6 +142,7 @@ pub const CAUDRA_NATIVE_TOOL_NAMES: &[&str] = &[
     "todo_write",
     "tool_output",
     "view_image",
+    "workflow",
 ];
 
 pub const WORKCELL_NATIVE_TOOL_NAMES: &[&str] = &[
@@ -359,14 +360,6 @@ pub const TOP_LEVEL_FIELDS: &[ConfigField] = &[
         description: "Start every session with Anthropic fast mode (Opus only; ignored otherwise)",
     },
     ConfigField {
-        name: "always_workflow",
-        ty: "bool",
-        default: ConfigValue::Bool(false),
-        min: None,
-        env: None,
-        description: "Start every session with workflow context for custom Lua tools",
-    },
-    ConfigField {
         name: "always_thinking",
         ty: "bool | string",
         default: ConfigValue::Bool(false),
@@ -461,7 +454,6 @@ impl AlwaysThinking {
 pub struct RawConfig {
     pub always_yolo: Option<bool>,
     pub always_fast: Option<bool>,
-    pub always_workflow: Option<bool>,
     pub always_thinking: Option<AlwaysThinking>,
     #[serde(default)]
     pub ui: UiFileConfig,
@@ -474,14 +466,7 @@ pub struct RawConfig {
 
 impl RawConfig {
     pub fn merge(&mut self, overlay: RawConfig) {
-        merge_option!(
-            self,
-            overlay,
-            always_yolo,
-            always_fast,
-            always_workflow,
-            always_thinking
-        );
+        merge_option!(self, overlay, always_yolo, always_fast, always_thinking);
         self.ui.merge(overlay.ui);
         self.agent.merge(overlay.agent);
         self.provider.merge(overlay.provider);
@@ -505,7 +490,6 @@ impl RawConfig {
         Ok(Config {
             always_yolo: self.always_yolo.unwrap_or(false),
             always_fast: self.always_fast.unwrap_or(false),
-            always_workflow: self.always_workflow.unwrap_or(false),
             always_thinking: self
                 .always_thinking
                 .map(AlwaysThinking::resolve)
@@ -1321,7 +1305,6 @@ pub struct PermissionsConfig {
 pub struct Config {
     pub always_yolo: bool,
     pub always_fast: bool,
-    pub always_workflow: bool,
     pub always_thinking: Option<StoredThinking>,
     pub ui: UiConfig,
     pub agent: AgentConfig,
@@ -1546,6 +1529,7 @@ impl ToolOutputLines {
                 "todo_write",
                 "tool_output",
                 "view_image",
+                "workflow",
             ],
         ),
     ];
@@ -3052,37 +3036,22 @@ mod tests {
     fn merge_always_flags_overlay_wins() {
         let mut base = RawConfig {
             always_fast: Some(false),
-            always_workflow: Some(false),
             always_thinking: Some(AlwaysThinking::Mode("off".into())),
             ..Default::default()
         };
         let overlay = RawConfig {
             always_fast: Some(true),
-            always_workflow: Some(true),
             always_thinking: Some(AlwaysThinking::Toggle(true)),
             ..Default::default()
         };
         base.merge(overlay);
 
         assert_eq!(base.always_fast, Some(true), "overlay wins");
-        assert_eq!(base.always_workflow, Some(true), "overlay wins");
         assert_eq!(
             base.always_thinking,
             Some(AlwaysThinking::Toggle(true)),
             "overlay wins"
         );
-    }
-
-    #[test]
-    fn always_workflow_resolves_default_and_set() {
-        let defaults = RawConfig::default().into_config(false).unwrap();
-        assert!(!defaults.always_workflow, "absent resolves to false");
-
-        let raw = RawConfig {
-            always_workflow: Some(true),
-            ..Default::default()
-        };
-        assert!(raw.into_config(false).unwrap().always_workflow);
     }
 
     #[test_case(AlwaysThinking::Toggle(true), StoredThinking::Adaptive ; "toggle_true")]
@@ -3198,7 +3167,6 @@ mod tests {
         let mut config = Config {
             always_yolo: false,
             always_fast: false,
-            always_workflow: false,
             always_thinking: None,
             ui: UiConfig::default(),
             agent: AgentConfig::default(),

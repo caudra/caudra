@@ -94,7 +94,7 @@ pub(crate) async fn limit(done: &mut ToolDoneEvent, ctx: &ToolContext) {
         limits.max_lines,
         limits.max_bytes,
     );
-    let model_output = preview_body + &trailer;
+    let model_output = preview_body + trailer.as_str();
     done.model_output = Some(hard_bound(
         &model_output,
         limits.max_lines,

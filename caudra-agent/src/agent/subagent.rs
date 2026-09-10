@@ -1,7 +1,8 @@
 //! Subagent sessions: a child agent with its own history, tools, and cancel
 //! scope, whose events are relayed to the parent stamped with its identity.
 //!
-//! Both the native `task` tool and `caudra.agent.session` open sessions
+//! The native `task` tool and the workflow engine (both through
+//! [`crate::agent::task_runner`]) and `caudra.agent.session` open sessions
 //! through here. The task path resolves its model, prompt, and tools from a
 //! profile; the generic path takes them from the caller.
 
@@ -183,6 +184,7 @@ impl ProgressRelay {
             event: AgentEvent::SubagentProgress { progress },
             subagent: subagent_info.get().cloned(),
             run_id: parent_tx.run_id(),
+            workflow: envelope.workflow.clone(),
         });
     }
 }
@@ -281,6 +283,11 @@ impl Subagent {
         self.closed
     }
 
+    /// Tokens every prompt of this session has consumed so far.
+    pub fn usage(&self) -> TokenUsage {
+        self.usage
+    }
+
     /// `None` resumes: the subagent picks its own history back up with no new
     /// instruction, which is all a caller continuing an interrupted task has
     /// to say.
@@ -335,7 +342,6 @@ impl Subagent {
                 preamble: Vec::new(),
                 thinking: self.thinking.clone(),
                 fast: self.fast,
-                workflow: false,
                 prompt: None,
             })
             .await;
@@ -424,12 +430,41 @@ struct Resolved {
     active_prompt_profile_name: Option<Arc<str>>,
 }
 
+/// How a task session is named, and whether it starts from history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskIdentity {
+    /// A new task named after the calling tool use, as the `task` tool does.
+    Derive,
+    /// A new task under an id the caller chose, such as a workflow engine
+    /// that must find the same task again after a restart.
+    Fresh(String),
+    /// Continues an earlier task's history.
+    Continue(String),
+}
+
+impl TaskIdentity {
+    /// The `task` tool's contract: a task id means resume, none means start.
+    pub fn continue_or_derive(task_id: Option<String>) -> Self {
+        task_id.map_or(Self::Derive, Self::Continue)
+    }
+
+    pub fn is_continuation(&self) -> bool {
+        matches!(self, Self::Continue(_))
+    }
+
+    fn requested(&self) -> Option<&str> {
+        match self {
+            Self::Derive => None,
+            Self::Fresh(id) | Self::Continue(id) => Some(id),
+        }
+    }
+}
+
 /// A `task` call: model, prompt, tools, and mode all come from the profile,
 /// so the caller supplies only what identifies the work.
 pub struct TaskOptions {
     pub name: String,
-    /// Continues an earlier task's history when set.
-    pub task_id: Option<String>,
+    pub task_id: TaskIdentity,
     pub profile: Option<String>,
     pub mode: Option<SubagentTaskMode>,
     /// Tool definitions the subagent sees on top of the registry's, paired
@@ -453,14 +488,14 @@ pub struct GenericOptions {
 }
 
 pub async fn open_task(ctx: &ToolContext, opts: TaskOptions) -> Result<Subagent, String> {
-    let ids = Identity::derive(ctx, opts.task_id.as_deref());
+    let ids = Identity::derive(ctx, opts.task_id.requested());
     let default_spec = SubagentTaskSpec {
         profile_name: ctx.default_task_prompt_profile_name.to_string(),
         mode: SubagentTaskMode::Plan,
         ..SubagentTaskSpec::default()
     };
     let (task_id, history_lease) = match opts.task_id {
-        Some(_) => (
+        TaskIdentity::Continue(_) => (
             ids.task_id.clone(),
             ctx.subagent_history
                 .continue_task_with_defaults(
@@ -473,7 +508,7 @@ pub async fn open_task(ctx: &ToolContext, opts: TaskOptions) -> Result<Subagent,
                 )
                 .map_err(|error| error.to_string())?,
         ),
-        None => {
+        TaskIdentity::Derive | TaskIdentity::Fresh(_) => {
             let spec = SubagentTaskSpec {
                 profile_name: opts.profile.unwrap_or(default_spec.profile_name),
                 mode: opts.mode.unwrap_or(SubagentTaskMode::Plan),
@@ -560,7 +595,7 @@ pub async fn open_task(ctx: &ToolContext, opts: TaskOptions) -> Result<Subagent,
         &DescriptionContext {
             filter: &base_filter,
             audience,
-            workflow: false,
+            workflows_available: false,
         },
         model.supports_tool_examples(),
         &deferral::deferred_names(
@@ -653,14 +688,16 @@ struct Identity {
 }
 
 impl Identity {
-    fn derive(ctx: &ToolContext, continued: Option<&str>) -> Self {
+    /// `requested` names the task outright, continued or fresh; without it
+    /// the task takes the calling tool use's id.
+    fn derive(ctx: &ToolContext, requested: Option<&str>) -> Self {
         let parent_tool_use_id = ctx.tool_use_id.clone().unwrap_or_else(generated_session_id);
         Self {
             root_tool_use_id: ctx
                 .root_tool_use_id
                 .clone()
                 .unwrap_or_else(|| parent_tool_use_id.clone()),
-            task_id: continued
+            task_id: requested
                 .map(str::to_owned)
                 .unwrap_or_else(|| parent_tool_use_id.clone()),
             parent_tool_use_id,
@@ -668,7 +705,9 @@ impl Identity {
     }
 }
 
-fn generated_session_id() -> String {
+/// Roots a subagent launched from outside any tool call, such as a plugin
+/// session or a `call_tool` bridge.
+pub fn generated_session_id() -> String {
     format!("session-{}", CaudraId::generate())
 }
 
@@ -742,7 +781,7 @@ fn build(
     .for_mode(&resolved.mode);
 
     let (sub_tx, sub_rx) = flume::unbounded::<Envelope>();
-    let sub_event_tx = EventSender::new(sub_tx, ctx.event_tx.run_id());
+    let sub_event_tx = ctx.event_tx.rebind(sub_tx);
     let parent_tx = ctx.event_tx.clone();
     let (answer_tx, answer_rx) = flume::unbounded::<String>();
     let (steer_tx, steer_rx) = steering_queue();
@@ -805,6 +844,7 @@ fn build(
             audience: resolved.audience,
             tool_filter,
             model_policy: Arc::clone(&ctx.model_policy),
+            workflow: None,
         },
         system: resolved.system,
         tools: resolved.tools,
@@ -861,8 +901,11 @@ mod tests {
     };
     use caudra_providers::{Billing, Message};
     use caudra_storage::usage_ledger::LedgerPurpose;
+    use test_case::test_case;
 
     const RUN_ID: u64 = 7;
+    const CHILD_WORKFLOW_RUN: &str = "wf-child";
+    const PARENT_WORKFLOW_RUN: &str = "wf-parent";
     const PARENT_ID: &str = "task-1";
     const TOOL_ID: &str = "toolu_01";
     const COLLIDING_SUBAGENT_NAME: &str = "collision";
@@ -962,7 +1005,7 @@ mod tests {
                 &ctx,
                 TaskOptions {
                     name: COLLIDING_SUBAGENT_NAME.into(),
-                    task_id: None,
+                    task_id: TaskIdentity::Derive,
                     profile: Some(crate::prompt::profile::BUILTIN_PROFILE_NAME.into()),
                     mode: Some(SubagentTaskMode::Plan),
                     local_definitions: Vec::new(),
@@ -989,6 +1032,7 @@ mod tests {
             event,
             subagent: None,
             run_id: RUN_ID,
+            workflow: None,
         }
     }
 
@@ -1140,6 +1184,49 @@ mod tests {
                 (THINKING_LABEL.to_owned(), 0, Some(PARENT_ID.to_owned())),
             ]
         );
+    }
+
+    fn provenance(run_id: &str) -> crate::types::WorkflowProvenance {
+        crate::types::WorkflowProvenance {
+            run_id: run_id.into(),
+            epoch: 1,
+            call_key: 1,
+            phase: None,
+        }
+    }
+
+    /// A workflow agent's events must reach the parent attributed to the
+    /// workflow run: a child envelope that names one keeps it, and one that
+    /// does not takes the parent sender's, on relayed and synthesized
+    /// progress envelopes alike.
+    #[test_case(Some(CHILD_WORKFLOW_RUN), CHILD_WORKFLOW_RUN; "the_childs_own_run_wins")]
+    #[test_case(None, PARENT_WORKFLOW_RUN; "the_parent_sender_fills_the_gap")]
+    fn relay_keeps_workflow_provenance(child: Option<&str>, expected: &str) {
+        let (sub_tx, sub_rx) = flume::unbounded();
+        let (parent_raw_tx, parent_rx) = flume::unbounded();
+        let (usage_tx, _usage_rx) = flume::unbounded();
+
+        let mut child_envelope = envelope(text_delta());
+        child_envelope.workflow = child.map(provenance);
+        sub_tx.send(child_envelope).unwrap();
+        drop(sub_tx);
+
+        smol::block_on(relay_session_events(
+            sub_rx,
+            EventSender::new(parent_raw_tx, RUN_ID).with_workflow(provenance(PARENT_WORKFLOW_RUN)),
+            parent_info(),
+            usage_tx,
+            None,
+        ));
+
+        let forwarded: Vec<Envelope> = parent_rx.drain().collect();
+        assert_eq!(forwarded.len(), 2, "one relayed delta and its progress");
+        assert!(forwarded.iter().all(|envelope| {
+            envelope
+                .workflow
+                .as_ref()
+                .is_some_and(|workflow| workflow.run_id == expected)
+        }));
     }
 
     fn relayed_progress(rx: &flume::Receiver<Envelope>) -> Vec<(String, u32, Option<String>)> {

@@ -140,6 +140,22 @@ impl App {
             ) {
                 return actions;
             }
+        } else if self.workflow_picker.is_open() {
+            if let Some(actions) = self.route_overlay_mouse(
+                event,
+                |app, event| app.workflow_picker.handle_mouse(event),
+                |app, action| app.handle_workflow_picker_action(action),
+            ) {
+                return actions;
+            }
+        } else if self.workflow_catalog_picker.is_open() {
+            if let Some(actions) = self.route_overlay_mouse(
+                event,
+                |app, event| app.workflow_catalog_picker.handle_mouse(event),
+                |app, action| app.handle_workflow_catalog_action(action),
+            ) {
+                return actions;
+            }
         } else if self.mcp_picker.is_open() {
             if let Some(actions) = self.route_overlay_mouse(
                 event,
@@ -794,6 +810,10 @@ impl App {
                 self.clear_control_hovers();
                 self.toggle_usage_modal()
             }
+            StatusBarHitTarget::Workflows if self.is_main_chat() => {
+                self.clear_control_hovers();
+                self.execute_workflow("")
+            }
             // The countdown is cleared here rather than left to the next event:
             // the agent may spend a moment on the request, and a chip stuck at
             // "retrying in 0s" reads like the click missed.
@@ -917,6 +937,8 @@ impl App {
         dismiss!(self.permissions_picker);
         dismiss!(self.stash_picker);
         dismiss!(self.memory_picker);
+        dismiss!(self.workflow_picker);
+        dismiss!(self.workflow_catalog_picker);
         dismiss!(self.task_picker, {
             let action = self.task_picker.cancel();
             self.handle_task_picker_action(action)

@@ -27,8 +27,9 @@ const SNAPSHOTTING_LABEL: &str = "snapshotting workspace";
 /// click does, and the seconds left stop mattering once you mean to skip them.
 const RETRY_NOW_LABEL: &str = " · retry now";
 const FAST_LABEL: &str = " [fast]";
-const WORKFLOW_LABEL: &str = " [workflow]";
-const WORKFLOW_SHORT_LABEL: &str = " [wf]";
+const WORKFLOW_PREFIX: &str = " [wf:";
+const WORKFLOW_WAITING_SEPARATOR: &str = "+";
+const WORKFLOW_SUFFIX: &str = "]";
 const YOLO_LABEL: &str = " [yolo]";
 const YOLO_SHORT_LABEL: &str = " [!]";
 const THINKING_PREFIX: &str = "thinking: ";
@@ -45,6 +46,21 @@ const PLAIN_MODEL_FLOOR: usize = 1;
 /// Marks a figure a subscription already covers. One column is all the bar can
 /// spare to say the number is a price rather than a bill.
 const NOT_BILLED_MARK: &str = "~";
+
+/// `[wf:2]` for the runs working now, `[wf:2+1]` once some are parked waiting
+/// on someone, and nothing while the session has neither.
+pub fn workflow_chip(active: usize, waiting: usize) -> Option<String> {
+    if active == 0 && waiting == 0 {
+        return None;
+    }
+    let mut label = format!("{WORKFLOW_PREFIX}{active}");
+    if waiting > 0 {
+        label.push_str(WORKFLOW_WAITING_SEPARATOR);
+        label.push_str(&waiting.to_string());
+    }
+    label.push_str(WORKFLOW_SUFFIX);
+    Some(label)
+}
 
 /// What to draw in the bar's one cost slot. Billed spend wins the slot when a
 /// session mixes the two, because that is the number someone pays; the tilde
@@ -66,6 +82,7 @@ pub enum StatusBarHitTarget {
     Goal,
     Context,
     Usage,
+    Workflows,
     Retry,
 }
 
@@ -119,7 +136,9 @@ pub struct StatusBarContext<'a> {
     /// word "thinking" in front of it only when it has the columns to spare.
     pub thinking: Option<Cow<'static, str>>,
     pub fast: bool,
-    pub workflow: bool,
+    /// Already rendered by [`workflow_chip`], so fitting the bar measures a
+    /// string rather than formatting one per rung.
+    pub workflows: Option<String>,
     pub yolo: bool,
     pub restoring: bool,
     /// A working-tree capture is in flight. It walks and hashes every file the
@@ -152,11 +171,12 @@ enum ModelTier {
     Chopped,
 }
 
-/// `[workflow]` and `[yolo]` spelled out, or squeezed to `[wf]` and `[!]`.
+/// `[yolo]` spelled out, squeezed to `[!]`, or nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FlagTier {
+enum YoloTier {
     Named,
     Sigil,
+    Hidden,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -175,12 +195,12 @@ enum Reduction {
     DropGlobalSpend,
     CompactContext,
     ShortThinking,
-    ShortFlags,
+    ShortYolo,
     LeafModel,
     DropSpend,
     DropContext,
-    DropWorkflow,
     DropFast,
+    DropWorkflows,
     DropThinking,
     ChopModel,
     DropYolo,
@@ -193,12 +213,12 @@ const LADDER: [Reduction; 12] = [
     Reduction::DropGlobalSpend,
     Reduction::CompactContext,
     Reduction::ShortThinking,
-    Reduction::ShortFlags,
+    Reduction::ShortYolo,
     Reduction::LeafModel,
     Reduction::DropSpend,
     Reduction::DropContext,
-    Reduction::DropWorkflow,
     Reduction::DropFast,
+    Reduction::DropWorkflows,
     Reduction::DropThinking,
     Reduction::ChopModel,
     Reduction::DropYolo,
@@ -246,11 +266,10 @@ struct Fit {
     global_spend: bool,
     context: ContextTier,
     thinking: ThinkingTier,
-    flags: FlagTier,
     model: ModelTier,
     fast: bool,
-    workflow: bool,
-    yolo: bool,
+    workflows: bool,
+    yolo: YoloTier,
 }
 
 impl Fit {
@@ -259,11 +278,10 @@ impl Fit {
         global_spend: true,
         context: ContextTier::Counts,
         thinking: ThinkingTier::Named,
-        flags: FlagTier::Named,
         model: ModelTier::Full,
         fast: true,
-        workflow: true,
-        yolo: true,
+        workflows: true,
+        yolo: YoloTier::Named,
     };
 
     fn apply(&mut self, step: Reduction) {
@@ -271,15 +289,15 @@ impl Fit {
             Reduction::DropGlobalSpend => self.global_spend = false,
             Reduction::CompactContext => self.context = ContextTier::Percent,
             Reduction::ShortThinking => self.thinking = ThinkingTier::Level,
-            Reduction::ShortFlags => self.flags = FlagTier::Sigil,
+            Reduction::ShortYolo => self.yolo = YoloTier::Sigil,
             Reduction::LeafModel => self.model = ModelTier::Leaf,
             Reduction::DropSpend => self.spend = false,
             Reduction::DropContext => self.context = ContextTier::Hidden,
-            Reduction::DropWorkflow => self.workflow = false,
             Reduction::DropFast => self.fast = false,
+            Reduction::DropWorkflows => self.workflows = false,
             Reduction::DropThinking => self.thinking = ThinkingTier::Hidden,
             Reduction::ChopModel => self.model = ModelTier::Chopped,
-            Reduction::DropYolo => self.yolo = false,
+            Reduction::DropYolo => self.yolo = YoloTier::Hidden,
         }
     }
 
@@ -303,8 +321,16 @@ impl Fit {
     fn chip_width(self, ctx: &StatusBarContext<'_>) -> usize {
         self.thinking_width(ctx)
             + usize::from(ctx.fast && self.fast) * FAST_LABEL.width()
-            + usize::from(ctx.workflow && self.workflow) * self.flags.workflow_label().width()
-            + usize::from(ctx.yolo && self.yolo) * self.flags.yolo_label().width()
+            + self.workflow_label(ctx).map_or(0, UnicodeWidthStr::width)
+            + self.yolo_label(ctx).map_or(0, UnicodeWidthStr::width)
+    }
+
+    fn workflow_label<'a>(self, ctx: &'a StatusBarContext<'_>) -> Option<&'a str> {
+        ctx.workflows.as_deref().filter(|_| self.workflows)
+    }
+
+    fn yolo_label(self, ctx: &StatusBarContext<'_>) -> Option<&'static str> {
+        self.yolo.label().filter(|_| ctx.yolo)
     }
 
     fn thinking_width(self, ctx: &StatusBarContext<'_>) -> usize {
@@ -344,18 +370,12 @@ impl Fit {
     }
 }
 
-impl FlagTier {
-    fn workflow_label(self) -> &'static str {
+impl YoloTier {
+    fn label(self) -> Option<&'static str> {
         match self {
-            Self::Named => WORKFLOW_LABEL,
-            Self::Sigil => WORKFLOW_SHORT_LABEL,
-        }
-    }
-
-    fn yolo_label(self) -> &'static str {
-        match self {
-            Self::Named => YOLO_LABEL,
-            Self::Sigil => YOLO_SHORT_LABEL,
+            Self::Named => Some(YOLO_LABEL),
+            Self::Sigil => Some(YOLO_SHORT_LABEL),
+            Self::Hidden => None,
         }
     }
 }
@@ -720,14 +740,16 @@ fn right_side<'a>(
     if ctx.fast && fit.fast {
         chips.push(Span::styled(FAST_LABEL, theme::current().status_dim));
     }
-    if ctx.workflow && fit.workflow {
-        chips.push(Span::styled(
-            fit.flags.workflow_label(),
-            theme::current().status_dim,
-        ));
+    if let Some(label) = fit.workflow_label(ctx) {
+        control(
+            &mut chips,
+            StatusBarHitTarget::Workflows,
+            label,
+            theme::current().status_notice,
+        );
     }
-    if ctx.yolo && fit.yolo {
-        chips.push(Span::styled(fit.flags.yolo_label(), theme::current().error));
+    if let Some(label) = fit.yolo_label(ctx) {
+        chips.push(Span::styled(label, theme::current().error));
     }
     let counters = Style::new().fg(theme::current().foreground);
     if let Some(text) = fit.context_text(&spend) {
@@ -984,11 +1006,14 @@ mod tests {
     const LADDER_MODEL_ID: &str = "anthropic/claude-opus-5";
     const LADDER_MODEL_LEAF: &str = "claude-opus-5";
     const LADDER_THINKING: &str = "xhigh";
+    const LADDER_WORKFLOWS_ACTIVE: usize = 2;
+    const LADDER_WORKFLOWS_WAITING: usize = 1;
+    const LADDER_WORKFLOW_CHIP: &str = "[wf:2+1]";
     const LADDER_CWD: &str = "~/projects/caudra:main";
     const PERCENT_MARK: &str = "%";
     /// A budget the ladder answers with a squeezed thinking chip: wide enough
     /// to keep the control, too narrow to spell the word in front of it.
-    const SHORT_THINKING_BUDGET: usize = 40;
+    const SHORT_THINKING_BUDGET: usize = 36;
     const SHORT_THINKING_CHIP: &str = "[xhigh]";
     /// Room for every rung, so both figures are on screen at their full tier.
     const WIDE_BUDGET: usize = 120;
@@ -1036,6 +1061,7 @@ mod tests {
         goal: Option<&'a GoalSnapshot>,
         retry_info: Option<&'a RetryInfo>,
         snapshotting: bool,
+        workflows: Option<String>,
     }
 
     impl Default for Fixture<'_> {
@@ -1050,6 +1076,7 @@ mod tests {
                 goal: None,
                 retry_info: None,
                 snapshotting: false,
+                workflows: None,
             }
         }
     }
@@ -1065,6 +1092,7 @@ mod tests {
             goal,
             retry_info,
             snapshotting,
+            workflows,
         } = fixture;
         let bar = StatusBar::new(FLASH_TTL);
         let mut terminal =
@@ -1092,7 +1120,7 @@ mod tests {
             retry_info,
             thinking: Some(THINKING_LEVEL.into()),
             fast: false,
-            workflow: false,
+            workflows,
             yolo,
             restoring: false,
             snapshotting,
@@ -1151,7 +1179,7 @@ mod tests {
             retry_info: None,
             thinking: Some(LADDER_THINKING.into()),
             fast: true,
-            workflow: true,
+            workflows: workflow_chip(LADDER_WORKFLOWS_ACTIVE, LADDER_WORKFLOWS_WAITING),
             yolo: true,
             restoring: false,
             snapshotting: false,
@@ -1168,7 +1196,7 @@ mod tests {
     enum Chip {
         Thinking,
         Fast,
-        Workflow,
+        Workflows,
         Yolo,
         Context,
     }
@@ -1200,7 +1228,7 @@ mod tests {
         [
             Chip::Thinking,
             Chip::Fast,
-            Chip::Workflow,
+            Chip::Workflows,
             Chip::Yolo,
             Chip::Context,
         ]
@@ -1208,9 +1236,7 @@ mod tests {
         .filter(|chip| match chip {
             Chip::Thinking => text.contains(LADDER_THINKING),
             Chip::Fast => text.contains(FAST_LABEL.trim()),
-            Chip::Workflow => {
-                text.contains(WORKFLOW_LABEL.trim()) || text.contains(WORKFLOW_SHORT_LABEL.trim())
-            }
+            Chip::Workflows => text.contains(WORKFLOW_PREFIX.trim()),
             Chip::Yolo => {
                 text.contains(YOLO_LABEL.trim()) || text.contains(YOLO_SHORT_LABEL.trim())
             }
@@ -1261,6 +1287,25 @@ mod tests {
         });
     }
 
+    #[test_case(0, 0 => None ; "nothing_running_draws_nothing")]
+    #[test_case(3, 0 => Some(" [wf:3]".to_owned()) ; "active_alone")]
+    #[test_case(0, 2 => Some(" [wf:0+2]".to_owned()) ; "waiting_alone_keeps_the_active_count")]
+    #[test_case(2, 1 => Some(format!(" {LADDER_WORKFLOW_CHIP}")) ; "both")]
+    fn the_workflow_chip_counts_active_and_waiting(
+        active: usize,
+        waiting: usize,
+    ) -> Option<String> {
+        workflow_chip(active, waiting)
+    }
+
+    #[test]
+    fn a_wide_bar_draws_the_workflow_chip() {
+        with_ladder_ctx(|ctx| {
+            let side = right_side(ctx, LADDER_CWD, WIDE_BUDGET);
+            assert!(side_text(&side).contains(LADDER_WORKFLOW_CHIP));
+        });
+    }
+
     /// Yolo skips permission prompts for the rest of the session, so the bar
     /// may not trade that warning for a token count or a reasoning level.
     #[test_case(3   ; "model_floor_only")]
@@ -1306,6 +1351,7 @@ mod tests {
     /// columns to a modal.
     #[test_case(StatusBarHitTarget::Context, COUNTS_GLYPHS ; "counter_opens_context")]
     #[test_case(StatusBarHitTarget::Usage, MONEY_GLYPHS    ; "money_opens_usage")]
+    #[test_case(StatusBarHitTarget::Workflows, LADDER_WORKFLOW_CHIP ; "workflow_chip_opens_runs")]
     fn a_figure_is_hit_on_its_own_glyphs(target: StatusBarHitTarget, expected: &str) {
         with_ladder_ctx(|ctx| {
             let side = right_side(ctx, LADDER_CWD, WIDE_BUDGET);

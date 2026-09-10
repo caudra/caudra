@@ -1,0 +1,217 @@
+//! One workflow runtime per session. Agent loops come and go with every
+//! respawn; the runtime outlives them all and only follows a change of
+//! session id, so a run keeps going through a model switch or a revert.
+
+use std::env;
+use std::sync::Arc;
+use std::time::Duration;
+
+use arc_swap::ArcSwap;
+use async_lock::Mutex as AsyncMutex;
+use caudra_agent::agent::task_runner::{
+    HostExtras, ModeResolver, ModelResolver, SubagentTaskRunner, WorkflowHostContext,
+};
+use caudra_agent::context::ContextPublisher;
+use caudra_agent::mcp::McpSession;
+use caudra_agent::permissions::PermissionManager;
+use caudra_agent::prompt::profile::PromptProfileCatalog;
+use caudra_agent::tools::{FileReadTracker, PathLocks, ToolAudience, ToolFilter, ToolRegistry};
+use caudra_agent::workflow::{RuntimeDeps, WorkflowHandle, WorkflowRuntime};
+use caudra_agent::{
+    AgentConfig, AgentMode, AgentParams, CancelMap, Envelope, McpHandle, SubagentHistoryStore,
+    ToolOutputLines, agent,
+};
+use caudra_config::ModelPolicy;
+use caudra_lua::EventHandle;
+use caudra_providers::Timeouts;
+use caudra_storage::StateDir;
+use caudra_storage::id::{CaudraId, SessionRef};
+use futures_lite::future;
+use smol::Timer;
+use tracing::{info, warn};
+
+use super::ModelSlot;
+
+/// How long a session waits for its runs to interrupt and journal before
+/// letting the runtime go. Past this the store may miss the final row, which
+/// the next open repairs by marking the run interrupted.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// The mode the agent loop last committed to a turn. Workflow agents read it
+/// when they start, so a run that outlives the turn which launched it is
+/// capped by what the user allows now.
+pub(crate) type SharedMode = Arc<ArcSwap<AgentMode>>;
+
+/// What the workflow host captures once, drawn from the same inputs the
+/// session's first agent loop starts with.
+pub(crate) struct WorkflowSpawn<'a> {
+    pub(crate) state_dir: StateDir,
+    pub(crate) session_id: CaudraId,
+    pub(crate) model_slot: &'a Arc<ArcSwap<ModelSlot>>,
+    pub(crate) config: &'a AgentConfig,
+    pub(crate) tool_output_lines: ToolOutputLines,
+    pub(crate) permissions: &'a Arc<PermissionManager>,
+    pub(crate) mcp_handle: Option<&'a McpHandle>,
+    pub(crate) timeouts: Timeouts,
+    pub(crate) lua_handle: &'a EventHandle,
+    pub(crate) model_policy: &'a Arc<ModelPolicy>,
+    pub(crate) subagent_history: &'a SubagentHistoryStore,
+    pub(crate) prompt_profiles: &'a Arc<PromptProfileCatalog>,
+    pub(crate) task_prompt_profile_name: Arc<str>,
+    pub(crate) context_publisher: ContextPublisher,
+    pub(crate) answer: AnswerChannel,
+    pub(crate) events: flume::Sender<Envelope>,
+}
+
+/// The channel a `question` is answered on. Workflow agents ask through the
+/// same one as the main loop, so it belongs to the session, and a respawned
+/// loop inherits it rather than leaving the runtime's questions unanswerable.
+pub(crate) type AnswerChannel = (
+    flume::Sender<String>,
+    Arc<AsyncMutex<flume::Receiver<String>>>,
+);
+
+pub(crate) fn answer_channel() -> AnswerChannel {
+    let (tx, rx) = flume::unbounded();
+    (tx, Arc::new(AsyncMutex::new(rx)))
+}
+
+pub(crate) struct WorkflowSession {
+    session_id: CaudraId,
+    runtime: WorkflowRuntime,
+    handle: WorkflowHandle,
+    mode: SharedMode,
+    answer: AnswerChannel,
+}
+
+impl WorkflowSession {
+    /// `None` when the runtime cannot open its store: the session then runs
+    /// without workflows rather than not at all.
+    pub(crate) fn spawn(spawn: WorkflowSpawn<'_>) -> Option<Self> {
+        let cwd = env::current_dir().unwrap_or_else(|_| spawn.permissions.project_cwd());
+        let slot = spawn.model_slot.load();
+        let tool_filter = ToolFilter::from_config(spawn.config, &slot.model, &[]);
+        let base = AgentParams {
+            provider: Arc::clone(&slot.provider),
+            model: slot.model.clone(),
+            config: spawn.config.clone(),
+            tool_output_lines: spawn.tool_output_lines,
+            permissions: Arc::clone(spawn.permissions),
+            session_id: Some(SessionRef::from(spawn.session_id)),
+            root_tool_use_id: None,
+            mailbox: None,
+            context_publisher: Some(spawn.context_publisher),
+            timeouts: spawn.timeouts,
+            file_tracker: FileReadTracker::fresh(),
+            path_locks: PathLocks::fresh(),
+            prompt_slots: Arc::new(spawn.lua_handle.collect_prompt_slots(spawn.config)),
+            prompt_profiles: Arc::clone(spawn.prompt_profiles),
+            default_task_prompt_profile_name: Arc::clone(&spawn.task_prompt_profile_name),
+            active_prompt_profile_name: Some(spawn.task_prompt_profile_name),
+            subagent_cancels: Arc::new(CancelMap::new()),
+            subagent_history: spawn.subagent_history.clone(),
+            registry: Arc::clone(ToolRegistry::global_arc()),
+            audience: ToolAudience::MAIN,
+            tool_filter,
+            model_policy: Arc::clone(spawn.model_policy),
+            workflow: None,
+        };
+        drop(slot);
+        let mode: SharedMode = Arc::new(ArcSwap::from_pointee(AgentMode::default()));
+        let mode_resolver: ModeResolver = Arc::new({
+            let mode = Arc::clone(&mode);
+            move || AgentMode::clone(&mode.load())
+        });
+        let model_resolver: ModelResolver = Arc::new({
+            let model_slot = Arc::clone(spawn.model_slot);
+            move || {
+                let slot = model_slot.load();
+                (Arc::clone(&slot.provider), Arc::new(slot.model.clone()))
+            }
+        });
+        // The runtime's own registrations, separate from the per-generation
+        // map the agent loop's cancel sweep clears.
+        let subagent_cancels = Arc::new(CancelMap::new());
+        let mcp = spawn.mcp_handle.map(|handle| {
+            McpSession::new(handle.clone(), &[]).with_disabled_tools(&spawn.config.disabled_tools)
+        });
+        let loaded_instructions = agent::load_instructions(&cwd.to_string_lossy()).loaded;
+        let host = WorkflowHostContext::from_agent_params(
+            &base,
+            HostExtras {
+                mcp,
+                loaded_instructions,
+                user_response_rx: Some(Arc::clone(&spawn.answer.1)),
+            },
+            model_resolver,
+            Arc::clone(&mode_resolver),
+            Arc::clone(&subagent_cancels),
+        );
+        let runtime = smol::block_on(WorkflowRuntime::spawn(RuntimeDeps {
+            state_dir: spawn.state_dir,
+            session_id: spawn.session_id,
+            cwd,
+            user_config_dir: None,
+            runner: Arc::new(SubagentTaskRunner::new(Arc::new(host))),
+            events: spawn.events,
+            mode: mode_resolver,
+            subagent_cancels,
+        }))
+        .map_err(|error| {
+            warn!(%error, session_id = %spawn.session_id, "workflow runtime unavailable for this session")
+        })
+        .ok()?;
+        info!(session_id = %spawn.session_id, "workflow runtime started");
+        Some(Self {
+            session_id: spawn.session_id,
+            handle: runtime.handle(),
+            runtime,
+            mode,
+            answer: spawn.answer,
+        })
+    }
+
+    pub(crate) fn session_id(&self) -> CaudraId {
+        self.session_id
+    }
+
+    pub(crate) fn answer_channel(&self) -> AnswerChannel {
+        (self.answer.0.clone(), Arc::clone(&self.answer.1))
+    }
+
+    pub(crate) fn handle(&self) -> WorkflowHandle {
+        self.handle.clone()
+    }
+
+    pub(crate) fn mode(&self) -> SharedMode {
+        Arc::clone(&self.mode)
+    }
+
+    /// Runs whose script is executing right now, which no agent turn owns.
+    pub(crate) fn active_runs(&self) -> usize {
+        self.handle.active_count()
+    }
+
+    /// Interrupts every run and waits for its agents and store to close, so
+    /// nothing of this session's runtime survives into the next one.
+    pub(crate) fn shutdown(self) {
+        info!(session_id = %self.session_id, "workflow runtime shutting down");
+        let closed = smol::block_on(future::or(
+            async {
+                self.runtime.shutdown().await;
+                true
+            },
+            async {
+                Timer::after(SHUTDOWN_TIMEOUT).await;
+                false
+            },
+        ));
+        if !closed {
+            warn!(
+                session_id = %self.session_id,
+                timeout = ?SHUTDOWN_TIMEOUT,
+                "workflow runtime did not close in time, abandoning it"
+            );
+        }
+    }
+}

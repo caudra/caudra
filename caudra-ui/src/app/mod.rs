@@ -18,6 +18,7 @@ pub(crate) mod tasks;
 #[cfg(test)]
 pub(crate) mod tests;
 pub(crate) mod view;
+pub(crate) mod workflow;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -74,6 +75,8 @@ use crate::components::tools_modal::ToolsModal;
 use crate::components::usage_modal::{UsageFetchState, UsageModal, UsageScope};
 use crate::components::which_key::WhichKey;
 use crate::components::workbench::styles as workbench_styles;
+use crate::components::workflow_catalog_picker::WorkflowCatalogPicker;
+use crate::components::workflow_picker::WorkflowPicker;
 use crate::components::{
     Action, DisplayMessage, DisplayRole, DisplaySource, ExitRequest, Overlay, RetryInfo, Status,
     is_ctrl,
@@ -146,8 +149,6 @@ const FAST_UNSUPPORTED_MSG: &str = "Fast mode requires an Anthropic Opus 4.6+ mo
 const THINKING_UNSUPPORTED_MSG: &str = "Thinking requires a model that supports it";
 const FAST_ON_MSG: &str = "Fast mode: on";
 const FAST_OFF_MSG: &str = "Fast mode: off";
-const WORKFLOW_ON_MSG: &str = "Workflow mode: on";
-const WORKFLOW_OFF_MSG: &str = "Workflow mode: off";
 const AUTO_VIEW_MSG: &str = "View: auto (the newest card stays open)";
 const COMPACT_VIEW_MSG: &str = "View: compact";
 const EXPANDED_VIEW_MSG: &str = "View: expanded";
@@ -304,6 +305,9 @@ pub struct App {
     permission_config_trust_deferred: bool,
     pub(super) memory_picker: MemoryPicker,
     pub(super) task_picker: TaskPicker,
+    pub(super) workflow_picker: WorkflowPicker,
+    pub(super) workflow_catalog_picker: WorkflowCatalogPicker,
+    pub(crate) workflow: workflow::WorkflowUi,
     pub(super) question_form: QuestionForm,
     pub(super) session_picker: SessionPicker,
     /// Published by the event loop, which is the only thing that can see
@@ -507,6 +511,9 @@ impl App {
             permission_config_trust_deferred: false,
             memory_picker: MemoryPicker::new(),
             task_picker: TaskPicker::new(),
+            workflow_picker: WorkflowPicker::new(),
+            workflow_catalog_picker: WorkflowCatalogPicker::new(),
+            workflow: workflow::WorkflowUi::new(),
             question_form: QuestionForm::new(),
             session_picker: SessionPicker::new(),
             live_sessions: Arc::default(),
@@ -1117,6 +1124,8 @@ impl App {
         try_picker!(self.permissions_picker);
         try_picker!(self.stash_picker);
         try_picker!(self.memory_picker);
+        try_picker!(self.workflow_picker);
+        try_picker!(self.workflow_catalog_picker);
         // Not `try_picker!`: scrolling the task list previews the task behind
         // the float, and only the app can carry that out.
         if self.task_picker.is_open() {
@@ -1472,6 +1481,14 @@ impl App {
         if self.memory_picker.is_open() {
             let action = self.memory_picker.handle_key(key);
             return Some(self.handle_memory_picker_action(action));
+        }
+        if self.workflow_picker.is_open() {
+            let action = self.workflow_picker.handle_key(key);
+            return Some(self.handle_workflow_picker_action(action));
+        }
+        if self.workflow_catalog_picker.is_open() {
+            let action = self.workflow_catalog_picker.handle_key(key);
+            return Some(self.handle_workflow_catalog_action(action));
         }
 
         // Last of the overlays. The workbench is a full-screen view, not a
@@ -2282,7 +2299,6 @@ impl App {
             preamble: Vec::new(),
             thinking: self.state.thinking.clone(),
             fast: self.state.fast,
-            workflow: false,
             prompt: None,
             resume: false,
         };
@@ -2700,6 +2716,13 @@ impl App {
     }
 
     fn handle_agent_event(&mut self, envelope: Envelope) -> Vec<Action> {
+        // Sent under their own run id, ahead of the stale-run filter: a run
+        // outlives the turn that launched it and reports through every one
+        // after it.
+        if let AgentEvent::Workflow(event) = envelope.event {
+            self.on_workflow_event(*event);
+            return vec![];
+        }
         if envelope.run_id == RESTORE_RUN_ID {
             let (id, snapshot, theme_gen, is_header) = match envelope.event {
                 AgentEvent::ToolSnapshot {
@@ -3471,6 +3494,9 @@ impl App {
             "/stash-list" => self.run_builtin(BuiltinAction::StashList),
             "/memory" => self.memory_browse(),
             "/tasks" => self.tasks_browse(),
+            "/workflows" => self.workflows_browse(),
+            "/workflow" => self.execute_workflow(&cmd.args),
+            "/deep-research" => self.execute_deep_research(&cmd.args),
             "/sessions" => self.sessions_browse(),
             "/rename" => self.rename_session(&cmd.args),
             "/model" => {
@@ -3527,18 +3553,6 @@ impl App {
                     Ok(()) => self.flash(if fast { FAST_ON_MSG } else { FAST_OFF_MSG }.into()),
                     Err(msg) => self.flash(msg),
                 }
-                vec![]
-            }
-            "/workflow" => {
-                self.state.workflow = !self.state.workflow;
-                self.flash(
-                    if self.state.workflow {
-                        WORKFLOW_ON_MSG
-                    } else {
-                        WORKFLOW_OFF_MSG
-                    }
-                    .into(),
-                );
                 vec![]
             }
             "/exit" => self.quit(),
@@ -3765,7 +3779,7 @@ impl App {
         self.subagent_input_box.set_cwd(cwd);
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 31] {
+    fn overlays(&self) -> [&dyn Overlay; 33] {
         [
             &self.workbench,
             &self.logs_modal,
@@ -3795,13 +3809,15 @@ impl App {
             &self.stash_picker,
             &self.memory_picker,
             &self.task_picker,
+            &self.workflow_picker,
+            &self.workflow_catalog_picker,
             &self.question_form,
             &self.session_picker,
             &self.permission_prompt,
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 31] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 33] {
         [
             &mut self.workbench,
             &mut self.logs_modal,
@@ -3831,6 +3847,8 @@ impl App {
             &mut self.stash_picker,
             &mut self.memory_picker,
             &mut self.task_picker,
+            &mut self.workflow_picker,
+            &mut self.workflow_catalog_picker,
             &mut self.question_form,
             &mut self.session_picker,
             &mut self.permission_prompt,
@@ -3967,6 +3985,7 @@ impl App {
             | self.mention_popup.tick()
             | self.refresh_memory_picker_if_stale()
             | self.refresh_session_picker()
+            | self.poll_workflow_replies()
             | self.tick_workbench()
             | Dirty::any(self.chats.iter_mut().map(Chat::tick))
     }
@@ -4234,6 +4253,8 @@ impl App {
         try_picker!(self.stash_picker);
         try_picker!(self.memory_picker);
         try_picker!(self.task_picker);
+        try_picker!(self.workflow_picker);
+        try_picker!(self.workflow_catalog_picker);
         try_picker!(self.session_picker);
         try_picker!(self.question_form);
         try_picker!(self.login_picker);

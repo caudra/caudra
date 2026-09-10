@@ -92,6 +92,96 @@ echo '{"type":"user","message":{"content":"explain this repo"}}' \
   | caudra --print --input-format stream-json --max-turns 3
 ```
 
+### Workflows
+
+A stream-json session runs a workflow runtime beside the agent. Scripts under `.caudra/workflows/<name>.rhai` in the project can be started, watched, paused, and resumed from the wire, and the model can reach the same runtime through the [`workflow` tool](/docs/tools/#workflow). Runs outlive individual turns and are journaled, so a session resumed with `--resume` can pick a run up where it stopped.
+
+The `init` message says whether the runtime is attached and which controls it answers:
+
+```json
+{"type":"system","subtype":"init","workflows":true,
+ "workflow_controls":["workflow_list","workflow_validate","workflow_start","workflow_status",
+                      "workflow_pause","workflow_resume","workflow_stop","workflow_trust","workflow_ack"],...}
+```
+
+When the runtime failed to start, `workflows` is `false`, `workflow_controls` is empty, and every workflow control answers with the `unavailable` error. One-shot `--print` and the [ACP server](/docs/acp/) attach no runtime.
+
+#### Controls
+
+A workflow control is a `control_request` whose `subtype` is one of the advertised names. Its arguments sit beside `subtype`:
+
+```json
+{"type":"control_request","request_id":"r1",
+ "request":{"subtype":"workflow_start","name":"review","args":{"branch":"main"},"agent_budget":8}}
+```
+
+| Subtype | Arguments | Answer `kind` |
+|---------|-----------|---------------|
+| `workflow_list` | | `catalog`: `entries` (with `name`, `digest`, `trusted`, `source_kind`, `phases`) and `invalid` |
+| `workflow_validate` | `name` | `validation`: `ok` and a `report` |
+| `workflow_start` | `name`, `args` (object, default `{}`), `agent_budget` | `started`: the new run |
+| `workflow_status` | `run_id` (optional) | `runs` for every run, `run` for one |
+| `workflow_pause` | `run_id` | `run`, once its agents have stopped |
+| `workflow_resume` | `run_id`, `agent_budget` (optional) | `run` |
+| `workflow_stop` | `run_id` | `run`, once its agents have stopped |
+| `workflow_trust` | `name`, `digest` | `trusted` |
+| `workflow_ack` | `run_id`, `revision` | `acked`: `true` when the notice was still pending |
+
+The answer lands in a `control_response` under `response.response.workflow`, as a `kind` / `detail` pair:
+
+```json
+{"type":"control_response","response":{"subtype":"success","request_id":"r1",
+ "response":{"workflow":{"kind":"started","detail":{"run_id":"run-1","status":"active",...}}}}}
+```
+
+A refused request is an `error` response. `error` carries the message and `response.workflow_error` the structured cause:
+
+```json
+{"type":"control_response","response":{"subtype":"error","request_id":"r2",
+ "error":"unknown workflow run \"run-9\"",
+ "response":{"workflow_error":{"kind":"unknown_run","detail":{"run_id":"run-9"}}}}}
+```
+
+A control that lacks a required argument, such as `workflow_stop` without `run_id`, is refused the same way before it reaches the runtime.
+
+Pause and stop wait for the run's agents to finish stopping, and permission requests keep flowing in the meantime. Answer them as usual.
+
+#### Trust
+
+A project workflow runs only after its content digest has been trusted. Take the digest from `workflow_list` and pass it to `workflow_trust`. Starting an untrusted script answers with `trust_required`, whose `detail` carries the `name`, `digest`, and `path` to trust. A script that changes on disk gets a new digest and must be trusted again.
+
+#### Run events
+
+Every change to a run arrives as a `system` message with subtype `workflow`. `event.kind` is `snapshot` for a new run state and `log` for a line of run output. The `workflow_*` keys identify the run, its execution epoch, and the phase that produced the event:
+
+```json
+{"type":"system","subtype":"workflow",
+ "event":{"kind":"snapshot","run_id":"run-1","status":"active","phase":"gather","revision":3,...},
+ "workflow_run_id":"run-1","workflow_epoch":1,"workflow_call_key":0,"workflow_phase":"gather"}
+```
+
+Agents a workflow launches stream as subagents. Their `assistant` and `user` messages carry the same `workflow_*` keys beside `parent_tool_use_id`, so a client can group them by run.
+
+#### Completion context
+
+A finished, failed, or paused run leaves a completion notice. Caudra prepends the pending notices to the content of the next `user` message, one block per run, and acknowledges each one so it is delivered once per `(run_id, revision)`. There is no automatic model turn: the report reaches the model with your next prompt.
+
+```
+Workflow review (review) finished with status completed.
+Report: Two findings, both in src/auth.rs ...
+Scratch file: /tmp/caudra/review/run-1.md
+
+<your prompt>
+```
+
+`Report:` is the `report` string of the run's result. Without one, the whole result is inlined as `Result:`. Either is cut at 8 KiB. A paused run adds `Paused:` with its message and a failed run adds `Error:`.
+
+Send `workflow_ack` yourself only when you handle a notice from a `snapshot` event directly and do not want it in the next prompt.
+
+#### Restart and resume
+
+Closing stdin marks every active run `interrupted` before the session saves, and the same happens when the process dies. Resume the session with `--resume <ID>` and call `workflow_resume` with the run id: the run replays its journal and continues from the last committed phase. A resume is at-least-once. Work that an agent had started but not committed runs again.
+
 ## Examples
 
 Pipe compiler errors back for a fix:

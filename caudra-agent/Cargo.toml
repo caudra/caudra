@@ -16,6 +16,7 @@ tracing = { workspace = true }
 ignore = { workspace = true }
 strum = { workspace = true }
 caudra-storage = { workspace = true }
+caudra-workflow = { workspace = true }
 grep-regex = { workspace = true }
 grep-searcher = { workspace = true }
 similar = { workspace = true }

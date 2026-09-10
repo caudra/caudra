@@ -963,7 +963,7 @@ pub fn tools(cli: &Cli, enabled_only: bool, json: bool, names: bool, schemas: bo
         let ctx = DescriptionContext {
             filter: &filter,
             audience: ToolAudience::MAIN,
-            workflow: false,
+            workflows_available: false,
         };
         let mut defs = reg.definitions(
             &caudra_agent::template::env_vars(),
@@ -1186,7 +1186,7 @@ pub fn prompt(
         let ctx = DescriptionContext {
             filter: &filter,
             audience: ToolAudience::MAIN,
-            workflow: false,
+            workflows_available: false,
         };
         let defs = reg.definitions(&vars, &ctx, model.supports_tool_examples());
         if names {

@@ -18,6 +18,10 @@ use crate::tools::ToolEffect;
 
 pub const NO_FILES_FOUND: &str = "No files found";
 pub const INDEX_TRUNCATED: &str = "[truncated]";
+/// The `run_id` every [`AgentEvent::Workflow`] envelope carries. Workflow runs
+/// outlive agent turns, so they never belong to one. One below the UI's
+/// restore sentinel, which already claims `u64::MAX`.
+pub const WORKFLOW_EVENT_RUN_ID: u64 = u64::MAX - 1;
 
 const SECONDS_PER_MINUTE: u64 = 60;
 const TALLY_SEPARATOR: &str = " · ";
@@ -1258,6 +1262,9 @@ pub enum AgentEvent {
         total: u32,
         cache: u32,
     },
+    /// A workflow run moved. Always sent under [`WORKFLOW_EVENT_RUN_ID`] with
+    /// the run's provenance on the envelope.
+    Workflow(Box<caudra_workflow::WorkflowEvent>),
 }
 
 #[derive(Debug, Serialize)]
@@ -1737,45 +1744,89 @@ pub struct SubagentInfo {
     pub steer_tx: Option<crate::SteeringQueue>,
 }
 
+/// Which workflow run an event belongs to, so a consumer can attribute an
+/// agent the workflow engine launched to the run and call that launched it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowProvenance {
+    #[serde(rename = "workflow_run_id")]
+    pub run_id: String,
+    #[serde(rename = "workflow_epoch")]
+    pub epoch: u64,
+    #[serde(rename = "workflow_call_key")]
+    pub call_key: u64,
+    #[serde(rename = "workflow_phase", skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct EventSender {
     tx: Sender<Envelope>,
     run_id: u64,
+    workflow: Option<WorkflowProvenance>,
 }
 
 impl EventSender {
     pub fn new(tx: Sender<Envelope>, run_id: u64) -> Self {
-        Self { tx, run_id }
+        Self {
+            tx,
+            run_id,
+            workflow: None,
+        }
+    }
+
+    /// Every envelope sent from here on carries `workflow`.
+    pub fn with_workflow(mut self, workflow: WorkflowProvenance) -> Self {
+        self.workflow = Some(workflow);
+        self
+    }
+
+    /// The same run and provenance on another channel.
+    pub fn rebind(&self, tx: Sender<Envelope>) -> Self {
+        Self {
+            tx,
+            run_id: self.run_id,
+            workflow: self.workflow.clone(),
+        }
     }
 
     pub fn send(&self, event: impl Into<AgentEvent>) -> Result<(), AgentError> {
         self.tx
-            .try_send(Envelope {
-                event: event.into(),
-                subagent: None,
-                run_id: self.run_id,
-            })
+            .try_send(self.envelope(event.into()))
             .map_err(|_| AgentError::Channel)
     }
 
-    pub fn send_envelope(&self, envelope: Envelope) -> Result<(), AgentError> {
+    /// An envelope that already names its workflow keeps it: a relayed child
+    /// event may come from a run other than this sender's.
+    pub fn send_envelope(&self, mut envelope: Envelope) -> Result<(), AgentError> {
+        if envelope.workflow.is_none() {
+            envelope.workflow = self.workflow.clone();
+        }
         self.tx.try_send(envelope).map_err(|_| AgentError::Channel)
     }
 
     pub fn try_send(&self, event: impl Into<AgentEvent>) {
-        let _ = self.tx.try_send(Envelope {
-            event: event.into(),
-            subagent: None,
-            run_id: self.run_id,
-        });
+        let _ = self.tx.try_send(self.envelope(event.into()));
     }
 
     pub fn run_id(&self) -> u64 {
         self.run_id
     }
 
+    pub fn workflow(&self) -> Option<&WorkflowProvenance> {
+        self.workflow.as_ref()
+    }
+
     pub fn raw_tx(&self) -> &Sender<Envelope> {
         &self.tx
+    }
+
+    fn envelope(&self, event: AgentEvent) -> Envelope {
+        Envelope {
+            event,
+            subagent: None,
+            run_id: self.run_id,
+            workflow: self.workflow.clone(),
+        }
     }
 }
 
@@ -1786,6 +1837,8 @@ pub struct Envelope {
     #[serde(flatten, skip_serializing_if = "Option::is_none")]
     pub subagent: Option<SubagentInfo>,
     pub run_id: u64,
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<WorkflowProvenance>,
 }
 
 #[cfg(test)]
@@ -2731,5 +2784,115 @@ mod tests {
         let summary = streaming_reasoning_summary(visible, buffered);
         assert_eq!(summary.title, None);
         assert_eq!(summary.body, visible);
+    }
+
+    const WORKFLOW_RUN_ID: &str = "wf-run-1";
+    const WORKFLOW_EPOCH: u64 = 3;
+    const WORKFLOW_CALL_KEY: u64 = 42;
+    const WORKFLOW_PHASE: &str = "review";
+    const OTHER_WORKFLOW_RUN_ID: &str = "wf-run-2";
+
+    fn provenance() -> WorkflowProvenance {
+        WorkflowProvenance {
+            run_id: WORKFLOW_RUN_ID.into(),
+            epoch: WORKFLOW_EPOCH,
+            call_key: WORKFLOW_CALL_KEY,
+            phase: Some(WORKFLOW_PHASE.into()),
+        }
+    }
+
+    fn workflow_sender() -> (EventSender, flume::Receiver<Envelope>) {
+        let (tx, rx) = flume::unbounded();
+        (EventSender::new(tx, 1).with_workflow(provenance()), rx)
+    }
+
+    #[test]
+    fn a_workflow_sender_stamps_every_event_it_sends() {
+        let (sender, rx) = workflow_sender();
+
+        sender.send(AgentEvent::AuthRequired).unwrap();
+        sender.try_send(AgentEvent::AuthRequired);
+
+        let stamped: Vec<Envelope> = rx.drain().collect();
+        assert_eq!(stamped.len(), 2);
+        assert!(
+            stamped
+                .iter()
+                .all(|envelope| envelope.workflow.as_ref() == Some(&provenance()))
+        );
+    }
+
+    #[test]
+    fn a_workflow_sender_fills_in_an_unstamped_envelope_but_keeps_a_stamped_one() {
+        let (sender, rx) = workflow_sender();
+        let foreign = WorkflowProvenance {
+            run_id: OTHER_WORKFLOW_RUN_ID.into(),
+            ..provenance()
+        };
+
+        sender
+            .send_envelope(Envelope {
+                event: AgentEvent::AuthRequired,
+                subagent: None,
+                run_id: 1,
+                workflow: None,
+            })
+            .unwrap();
+        sender
+            .send_envelope(Envelope {
+                event: AgentEvent::AuthRequired,
+                subagent: None,
+                run_id: 1,
+                workflow: Some(foreign.clone()),
+            })
+            .unwrap();
+
+        let stamped: Vec<Option<WorkflowProvenance>> =
+            rx.drain().map(|envelope| envelope.workflow).collect();
+        assert_eq!(stamped, [Some(provenance()), Some(foreign)]);
+    }
+
+    #[test]
+    fn a_rebound_sender_keeps_its_run_and_provenance() {
+        let (sender, _rx) = workflow_sender();
+        let (tx, rx) = flume::unbounded();
+
+        sender.rebind(tx).send(AgentEvent::AuthRequired).unwrap();
+
+        let envelope = rx.try_recv().unwrap();
+        assert_eq!(envelope.run_id, sender.run_id());
+        assert_eq!(envelope.workflow.as_ref(), Some(&provenance()));
+    }
+
+    #[test]
+    fn provenance_serializes_flattened_under_workflow_keys() {
+        let (sender, rx) = workflow_sender();
+        sender.send(AgentEvent::AuthRequired).unwrap();
+
+        let json = serde_json::to_value(rx.try_recv().unwrap()).unwrap();
+
+        assert_eq!(json["workflow_run_id"], WORKFLOW_RUN_ID);
+        assert_eq!(json["workflow_epoch"], WORKFLOW_EPOCH);
+        assert_eq!(json["workflow_call_key"], WORKFLOW_CALL_KEY);
+        assert_eq!(json["workflow_phase"], WORKFLOW_PHASE);
+        assert_eq!(json["run_id"], 1);
+    }
+
+    #[test]
+    fn an_envelope_without_provenance_serializes_without_workflow_keys() {
+        let (tx, rx) = flume::unbounded();
+        EventSender::new(tx, 1)
+            .send(AgentEvent::AuthRequired)
+            .unwrap();
+
+        let json = serde_json::to_value(rx.try_recv().unwrap()).unwrap();
+
+        let keys: Vec<&String> = json
+            .as_object()
+            .unwrap()
+            .keys()
+            .filter(|key| key.starts_with("workflow_"))
+            .collect();
+        assert!(keys.is_empty(), "unexpected keys: {keys:?}");
     }
 }

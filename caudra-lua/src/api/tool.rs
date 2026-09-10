@@ -87,7 +87,6 @@ fn dctx_json(ctx: &DescriptionContext) -> Value {
     let mut obj = json!({
         "audience": ctx.audience.name().unwrap_or("main"),
         "policy": if ctx.policy().is_read_only() { "read_only" } else { "standard" },
-        "workflow": ctx.workflow,
     });
     let mut filter = ctx.filter;
     while let ToolFilter::ReadOnly(inner) = filter {
@@ -1986,7 +1985,7 @@ mod tests {
         let ctx = DescriptionContext {
             filter: &ToolFilter::All,
             audience: ToolAudience::MAIN,
-            workflow: false,
+            workflows_available: false,
         };
         assert_eq!(tool.description(&ctx), "test");
     }

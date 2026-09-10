@@ -17,28 +17,18 @@ const ECHO_PREFIX: &str = "echo:";
 const FAIL_MSG: &str = "fixture blew up";
 const ERROR_PREFIX: &str = "[ERROR] ";
 const GATHER_HINT_SUBSTR: &str = "`gather(...)` keeps the other results";
-const TASK_PREFIX: &str = "task:";
-const WORKFLOW_NOTE_SUBSTR: &str = "Workflow mode: orchestrate subagents";
 const INTERP_ECHO_SIG: &str = "- interp_echo(msg: str, count: int = None, flag: bool = None, items: list = None, raw: any = None) -> str";
-const WF_TASK_SIG: &str = "- wf_task(prompt: str, model_tier: str = None) -> str";
 const SUB_TOOL_SIG: &str = "- sub_tool() -> str";
 
 fn fixture_plugin() -> String {
     format!(
         r#"
 caudra.api.register_tool({{
-    name = "wf_task",
-    description = "workflow-only fixture",
-    audiences = {{ "main", "workflow" }},
-    schema = {{
-        type = "object",
-        required = {{ "prompt" }},
-        properties = {{
-            prompt = {{ type = "string" }},
-            model_tier = {{ type = "string" }},
-        }},
-    }},
-    handler = function(input) return "{TASK_PREFIX}" .. input.prompt end,
+    name = "main_only",
+    description = "main-only fixture",
+    audiences = {{ "main" }},
+    schema = {{ type = "object", properties = {{}}, additionalProperties = false }},
+    handler = function() return "" end,
 }})
 caudra.api.register_tool({{
     name = "interp_echo",
@@ -94,19 +84,14 @@ fn setup_native() -> (Arc<ToolRegistry>, PluginHost) {
     setup_with(Arc::clone(ToolRegistry::global_arc()))
 }
 
-fn describe(
-    reg: &ToolRegistry,
-    filter: &ToolFilter,
-    audience: ToolAudience,
-    workflow: bool,
-) -> String {
+fn describe(reg: &ToolRegistry, filter: &ToolFilter, audience: ToolAudience) -> String {
     reg.get("python_execution")
         .expect("python_execution registered")
         .tool
         .description(&DescriptionContext {
             filter,
             audience,
-            workflow,
+            workflows_available: false,
         })
         .into_owned()
 }
@@ -127,54 +112,39 @@ fn exec_code(reg: &ToolRegistry, ctx: &ToolContext, code: &str) -> Result<String
         })
 }
 
-fn run_code_in(code: &str, workflow: bool) -> Result<String, String> {
+fn run_code(code: &str) -> Result<String, String> {
     let (reg, _host) = setup_native();
     let mut ctx = stub_ctx(&AgentMode::Build);
     ctx.registry = Arc::clone(&reg);
-    ctx.workflow = workflow;
     exec_code(&reg, &ctx, code)
 }
 
-fn run_code(code: &str) -> Result<String, String> {
-    run_code_in(code, false)
-}
-
 #[test]
-fn describe_main_hides_workflow_and_sub_tools() {
+fn describe_main_hides_non_interpreter_and_sub_tools() {
     let (reg, _host) = setup();
-    let desc = describe(&reg, &ToolFilter::All, ToolAudience::MAIN, false);
+    let desc = describe(&reg, &ToolFilter::All, ToolAudience::MAIN);
     assert!(
         desc.lines().any(|l| l == INTERP_ECHO_SIG),
         "expected exact line {INTERP_ECHO_SIG:?} in: {desc}"
     );
-    assert!(!desc.contains("wf_task"), "got: {desc}");
-    assert!(!desc.contains("sub_tool"), "got: {desc}");
-    assert!(!desc.contains(WORKFLOW_NOTE_SUBSTR), "got: {desc}");
-}
-
-#[test]
-fn describe_workflow_adds_workflow_tools_and_note() {
-    let (reg, _host) = setup();
-    let desc = describe(&reg, &ToolFilter::All, ToolAudience::MAIN, true);
-    assert!(desc.contains(WF_TASK_SIG), "got: {desc}");
-    assert!(desc.contains(WORKFLOW_NOTE_SUBSTR), "got: {desc}");
+    assert!(!desc.contains("main_only"), "got: {desc}");
     assert!(!desc.contains("sub_tool"), "got: {desc}");
 }
 
 #[test]
 fn describe_general_sub_scopes_to_sub_audience() {
     let (reg, _host) = setup();
-    let desc = describe(&reg, &ToolFilter::All, ToolAudience::GENERAL_SUB, false);
+    let desc = describe(&reg, &ToolFilter::All, ToolAudience::GENERAL_SUB);
     assert!(desc.contains(SUB_TOOL_SIG), "got: {desc}");
     assert!(!desc.contains("interp_echo"), "got: {desc}");
-    assert!(!desc.contains("wf_task"), "got: {desc}");
+    assert!(!desc.contains("main_only"), "got: {desc}");
 }
 
 #[test]
 fn except_filter_removes_tool_from_description() {
     let (reg, _host) = setup();
     let filter = ToolFilter::AllExcept(vec!["interp_echo".to_owned()]);
-    let desc = describe(&reg, &filter, ToolAudience::MAIN, false);
+    let desc = describe(&reg, &filter, ToolAudience::MAIN);
     assert!(!desc.contains("interp_echo"), "got: {desc}");
 }
 
@@ -232,19 +202,10 @@ fn traceback_lines_are_numbered_from_the_users_first_line() {
 }
 
 #[test]
-fn workflow_tool_not_callable_when_workflow_false() {
-    let err = run_code("await wf_task(prompt='x')")
-        .expect_err("workflow tool must not be in the fn-map when workflow=false");
-    assert!(err.contains("wf_task"), "got: {err}");
-}
-
-/// Regression guard: the old `ctx:agent_context()` take() used to reset
-/// audience/workflow reads, leaving workflow tools uncallable.
-#[test]
-fn workflow_tool_callable_when_workflow_true() {
-    let out = run_code_in("result = await wf_task(prompt='x')\nprint(result)", true)
-        .expect("workflow tool must be callable when workflow=true");
-    assert!(out.contains(&format!("{TASK_PREFIX}x")), "got: {out}");
+fn non_interpreter_tool_not_callable_from_script() {
+    let err = run_code("await main_only()")
+        .expect_err("a tool without the interpreter audience must not be in the fn-map");
+    assert!(err.contains("main_only"), "got: {err}");
 }
 
 // --- script rendering ---

@@ -18,6 +18,7 @@ pub mod task;
 pub mod todo_write;
 mod tool_output;
 mod view_image;
+pub mod workflow;
 
 use std::sync::Arc;
 
@@ -76,6 +77,11 @@ fn entries() -> Vec<(Arc<dyn Tool>, ToolSource, ToolEffect)> {
             ToolEffect::ReadOnly,
             view_image::DESCRIPTION,
         ),
+        entry(
+            workflow::WorkflowTool,
+            ToolEffect::Orchestrator,
+            workflow::DESCRIPTION,
+        ),
     ]
 }
 
@@ -109,7 +115,7 @@ pub fn static_description(tool: &dyn Tool) -> String {
     tool.description(&DescriptionContext {
         filter: &filter,
         audience: ToolAudience::MAIN,
-        workflow: false,
+        workflows_available: false,
     })
     .into_owned()
 }

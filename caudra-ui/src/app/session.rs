@@ -372,7 +372,6 @@ impl App {
                 .collect(),
             thinking: Some(state.thinking.clone().into()),
             fast: state.fast,
-            workflow: state.workflow,
             active_goal: state.goal.snapshot().map(|goal| {
                 Box::new(StoredActiveGoal {
                     condition: goal.condition.to_string(),
@@ -1353,7 +1352,6 @@ impl App {
             plan_written: self.state.plan.is_ready(),
             thinking: Some(self.state.thinking.clone().into()),
             fast: self.state.fast,
-            workflow: self.state.workflow,
             ..SessionMeta::default()
         };
         child.replace_messages(ancestor.clone());

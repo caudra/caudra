@@ -38,6 +38,7 @@ use crate::permissions::PermissionManager;
 use crate::template::Vars;
 use crate::tools::{BuiltinDeferral, DeferralSession, DeferredTool};
 use crate::tools::{Deadline, FileReadTracker, LocalTools, PathLocks, ToolAudience, ToolContext};
+use crate::workflow::WorkflowHandle;
 use crate::{
     AgentConfig, AgentError, AgentEvent, AgentInput, AgentMode, DoneReason, EventSender,
     ExtractedCommand, InterruptSource, Mention, QueueConsumedItem, SessionMailbox,
@@ -135,6 +136,8 @@ pub struct AgentParams {
     pub audience: ToolAudience,
     pub tool_filter: crate::tools::ToolFilter,
     pub model_policy: Arc<ModelPolicy>,
+    /// The session's workflow runtime, reachable through the `workflow` tool.
+    pub workflow: Option<WorkflowHandle>,
 }
 
 pub struct AgentRunParams<'h> {
@@ -200,9 +203,9 @@ pub struct Agent<'h> {
     registry: Arc<crate::tools::ToolRegistry>,
     audience: ToolAudience,
     tool_filter: crate::tools::ToolFilter,
-    workflow: bool,
     local_tools: LocalTools,
     model_policy: Arc<ModelPolicy>,
+    workflow: Option<WorkflowHandle>,
     goal: GoalHandle,
     goal_evaluator: Option<ResolvedEvaluator>,
     goal_blocks: u32,
@@ -264,9 +267,9 @@ impl<'h> Agent<'h> {
             registry: params.registry,
             audience: params.audience,
             tool_filter: params.tool_filter,
-            workflow: false,
             local_tools: LocalTools::default(),
             model_policy: params.model_policy,
+            workflow: params.workflow,
             goal: GoalHandle::default(),
             goal_evaluator: None,
             goal_blocks: 0,
@@ -533,7 +536,6 @@ impl<'h> Agent<'h> {
         ));
         standing.extend(mode_switch_notice(self.history.as_slice(), &latest.mode));
         self.mode = latest.mode.clone();
-        self.workflow = latest.workflow;
         self.opts = RequestOptions {
             thinking: latest.thinking.clone(),
             fast: latest.fast,
@@ -1293,13 +1295,13 @@ impl<'h> Agent<'h> {
             subagent_cancels: Arc::clone(&self.subagent_cancels),
             subagent_history: self.subagent_history.clone(),
             registry: Arc::clone(&self.registry),
-            workflow: self.workflow,
             audience: self.audience,
             tool_filter: self.tool_filter.clone(),
             local_tools: Arc::clone(&self.local_tools),
             tool_name_aliases: None,
             live_sink: None,
             model_policy: Arc::clone(&self.model_policy),
+            workflow: self.workflow.clone(),
         }
     }
 
@@ -2040,6 +2042,7 @@ mod tests {
                 audience: ToolAudience::MAIN,
                 tool_filter: crate::tools::ToolFilter::All,
                 model_policy: Arc::new(ModelPolicy::default()),
+                workflow: None,
             },
             AgentRunParams {
                 history,
@@ -2063,7 +2066,6 @@ mod tests {
             preamble: Vec::new(),
             thinking: Default::default(),
             fast: false,
-            workflow: false,
             prompt: None,
             resume: false,
         }

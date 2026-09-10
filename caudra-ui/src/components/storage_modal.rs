@@ -612,6 +612,9 @@ mod tests {
     const SNAPSHOT_BYTES: u64 = 7 * 1024 * 1024 * 1024;
     const TOOL_OUTPUT_BYTES: u64 = 128 * 1024 * 1024;
     const ARCHIVE_BYTES: u64 = 512 * 1024;
+    const WORKFLOW_RUN_COUNT: u64 = 24;
+    const WORKFLOW_CALL_COUNT: u64 = 960;
+    const WORKFLOW_BYTES: u64 = 3 * 1024 * 1024;
     const BIG_STORE: &str = "big-store-session";
     const SMALL_STORE: &str = "small-store-session";
     const ORPHAN_STORE: &str = "orphan-store-session";
@@ -640,6 +643,9 @@ mod tests {
             tool_output_count: 5_120,
             subagent_item_count: 812,
             logical_bytes: 212 * 1024 * 1024,
+            workflow_run_count: WORKFLOW_RUN_COUNT,
+            workflow_call_count: WORKFLOW_CALL_COUNT,
+            workflow_bytes: WORKFLOW_BYTES,
             tool_output_file_bytes: TOOL_OUTPUT_BYTES,
             snapshot_bytes: SNAPSHOT_BYTES,
             archive_bytes: ARCHIVE_BYTES,

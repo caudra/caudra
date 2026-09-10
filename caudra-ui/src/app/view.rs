@@ -7,7 +7,7 @@ use crate::components::keybindings;
 use crate::components::keybindings::KeybindContext;
 use crate::components::queue_panel;
 use crate::components::split_layout::{MIN_CHAT_ROWS, SplitLayout, carve};
-use crate::components::status_bar::{StatusBarContext, UsageStats};
+use crate::components::status_bar::{StatusBarContext, UsageStats, workflow_chip};
 use crate::components::usage_modal::UsageModalContext;
 use crate::selection::{self, SelectableZone, SelectionZone, ZoneRegistry};
 use crate::theme;
@@ -440,6 +440,8 @@ impl App {
         render_if_open!(self.stash_picker);
         render_if_open!(self.memory_picker);
         render_if_open!(self.task_picker);
+        render_if_open!(self.workflow_picker);
+        render_if_open!(self.workflow_catalog_picker);
         render_if_open!(self.session_picker);
 
         overlay_rect
@@ -582,7 +584,10 @@ impl App {
             retry_info: self.retry_info.as_ref(),
             thinking,
             fast: self.state.fast,
-            workflow: self.state.workflow,
+            workflows: {
+                let (active, waiting) = self.workflow_counts();
+                workflow_chip(active, waiting)
+            },
             yolo: self.permissions.is_yolo(),
             restoring: self.restoring.load(Ordering::Relaxed),
             snapshotting: self.is_snapshotting(),

@@ -157,7 +157,6 @@ impl App {
             preamble: Vec::new(),
             thinking: self.state.thinking.clone(),
             fast: self.state.fast,
-            workflow: self.state.workflow,
             prompt: None,
             resume: false,
         }

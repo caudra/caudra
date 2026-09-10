@@ -48,7 +48,7 @@ const SECTIONS: &[(&str, &[&str])] = &[
     ),
     (
         "Agent & Knowledge",
-        &["task", "todo_write", "memory", "skill"],
+        &["task", "workflow", "todo_write", "memory", "skill"],
     ),
     ("Media", &["image_generate"]),
     ("Web", &["webfetch", "websearch"]),
@@ -410,7 +410,7 @@ pub fn generate() -> String {
         &DescriptionContext {
             filter: &ToolFilter::All,
             audience: ToolAudience::MAIN,
-            workflow: false,
+            workflows_available: false,
         },
         false,
     );

@@ -314,7 +314,7 @@ fn tempdir_app() -> (TempDir, StateDir, Arc<StorageWriter>, App) {
     (tmp, dir, writer, app)
 }
 
-fn mouse_event(kind: MouseEventKind, column: u16, row: u16) -> Msg {
+pub(crate) fn mouse_event(kind: MouseEventKind, column: u16, row: u16) -> Msg {
     Msg::Mouse(MouseEvent {
         kind,
         column,
@@ -332,6 +332,7 @@ fn agent_msg_with_run_id(event: AgentEvent, run_id: u64) -> Msg {
         event,
         subagent: None,
         run_id,
+        workflow: None,
     }))
 }
 
@@ -396,6 +397,7 @@ fn subagent_msg_with_run_id(
         event,
         subagent: Some(subagent_info(parent_id, name.unwrap_or("Agent"))),
         run_id,
+        workflow: None,
     }))
 }
 
@@ -411,6 +413,7 @@ fn subagent_msg_with_prompt(
         event,
         subagent: Some(info),
         run_id: 1,
+        workflow: None,
     }))
 }
 
@@ -421,6 +424,7 @@ fn subagent_msg_with_model(event: AgentEvent, parent_id: &str, name: &str, model
         event,
         subagent: Some(info),
         run_id: 1,
+        workflow: None,
     }))
 }
 
@@ -429,6 +433,7 @@ fn subagent_msg_with_info(event: AgentEvent, subagent: SubagentInfo) -> Msg {
         event,
         subagent: Some(subagent),
         run_id: 1,
+        workflow: None,
     }))
 }
 
@@ -2392,7 +2397,6 @@ fn task_composer_executes_an_allowed_command() {
 #[test_case("/continue" ; "resume")]
 #[test_case("/model" ; "model")]
 #[test_case("/goal" ; "goal")]
-#[test_case("/workflow" ; "workflow")]
 #[test_case("/btw" ; "btw")]
 fn task_composer_blocks_a_main_only_command(command: &str) {
     let (mut app, steer_tx) = focused_task_composer();
@@ -4113,7 +4117,7 @@ fn the_task_hint_stops_taking_clicks_once_streaming_takes_the_row() {
     assert_eq!(app.task_hint_hit, Rect::ZERO);
 }
 
-fn status_hit(
+pub(crate) fn status_hit(
     app: &mut App,
     target: StatusBarHitTarget,
 ) -> crate::components::status_bar::StatusBarHit {
@@ -4140,7 +4144,7 @@ fn thinking_chip(app: &mut App) -> String {
         .collect()
 }
 
-fn click_status(app: &mut App, target: StatusBarHitTarget) -> Vec<Action> {
+pub(crate) fn click_status(app: &mut App, target: StatusBarHitTarget) -> Vec<Action> {
     let hit = status_hit(app, target);
     app.update(mouse_event(
         MouseEventKind::Down(MouseButton::Left),
@@ -4560,6 +4564,7 @@ fn clicking_completed_task_in_main_chat_focuses_its_stable_chat() {
         event: AgentEvent::TextDelta { text: "hi".into() },
         subagent: Some(info),
         run_id: 1,
+        workflow: None,
     })));
     finish_subagent(&mut app, PARENT_TOOL_ID, false);
 
@@ -8865,7 +8870,6 @@ fn fork_copies_execution_settings_but_resets_conversation_state() {
     app.state.plan = PlanState::Ready(plan.clone());
     app.state.thinking = ThinkingConfig::Adaptive;
     app.state.fast = true;
-    app.state.workflow = true;
     app.state.system_prompt_profile_name = "review".into();
     app.permissions
         .load_structured_conversation_rules(vec![conversation_permission_record()]);
@@ -8895,7 +8899,6 @@ fn fork_copies_execution_settings_but_resets_conversation_state() {
     assert!(child.meta.plan_written);
     assert_eq!(child.meta.thinking, Some(StoredThinking::Adaptive));
     assert!(child.meta.fast);
-    assert!(child.meta.workflow);
     assert_eq!(child.meta.system_prompt_profile.as_deref(), Some("review"));
     assert!(child.meta.structured_permission_rules.is_empty());
     assert_eq!(child.meta.yolo, None);
@@ -9163,6 +9166,7 @@ fn app_with_subagent_tx(id: &str) -> (App, flume::Receiver<String>, flume::Recei
         event: AgentEvent::TextDelta { text: "x".into() },
         subagent: Some(subagent_info_with_tx(id, "research", Some(sub_tx))),
         run_id: 1,
+        workflow: None,
     })));
     (app, sub_rx, main_rx)
 }
@@ -9299,6 +9303,7 @@ fn stale_auth_required_after_cancel_is_dropped() {
         event: AgentEvent::AuthRequired,
         subagent: None,
         run_id: 1,
+        workflow: None,
     })));
     assert_eq!(app.pending_input, PendingInput::None);
     assert_eq!(app.chats[0].message_count(), count_before);
@@ -11319,30 +11324,10 @@ fn fast_toggle_on_off_on_opus() {
     assert_eq!(app.status_bar.flash_text(), Some(FAST_OFF_MSG));
 }
 
-#[test]
-fn workflow_toggle_flows_into_agent_input() {
-    let mut app = test_app();
-    let msg = QueuedMessage {
-        text: "hi".into(),
-        images: Vec::new(),
-        mentions: Vec::new(),
-        paste_ranges: Vec::new(),
-    };
-    assert!(!app.build_agent_input(&msg).workflow);
-
-    app.execute_command(cmd("/workflow"), 0);
-    assert!(app.build_agent_input(&msg).workflow);
-    assert_eq!(app.status_bar.flash_text(), Some(WORKFLOW_ON_MSG));
-
-    app.execute_command(cmd("/workflow"), 0);
-    assert!(!app.build_agent_input(&msg).workflow);
-    assert_eq!(app.status_bar.flash_text(), Some(WORKFLOW_OFF_MSG));
-}
-
-/// Workflow sessions have synthetic ids that no ToolDone matches, so
+/// Sessions spawned from Lua have synthetic ids that no ToolDone matches, so
 /// SubagentHistory is what finishes their chat.
 #[test]
-fn subagent_history_finishes_workflow_chat() {
+fn subagent_history_finishes_lua_spawned_chat() {
     let mut app = test_app();
     app.status = Status::Streaming;
     app.run_id = 1;
@@ -11357,8 +11342,8 @@ fn subagent_history_finishes_workflow_chat() {
     app.update(agent_msg_with_run_id(
         AgentEvent::SubagentHistory {
             task_id: "session-abc".into(),
-            parent_tool_use_id: "workflow-parent".into(),
-            root_tool_use_id: "workflow-parent".into(),
+            parent_tool_use_id: "lua-parent".into(),
+            root_tool_use_id: "lua-parent".into(),
             name: "researcher".into(),
             model: SONNET_SPEC.into(),
             messages: vec![],

@@ -299,7 +299,7 @@ impl Chat {
                 self.messages_panel
                     .push(DisplayMessage::new(DisplayRole::Notice, text));
             }
-            AgentEvent::SubagentHistory { .. } => {}
+            AgentEvent::SubagentHistory { .. } | AgentEvent::Workflow(_) => {}
             AgentEvent::LiveToolBuf { id, body } => {
                 self.messages_panel.register_live_buf(id, body);
             }

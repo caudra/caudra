@@ -225,7 +225,7 @@ impl App {
         Some((line, hit))
     }
 
-    fn preview_task(&mut self, id: &str) {
+    pub(super) fn preview_task(&mut self, id: &str) {
         if let Err(error) = self.focus_task(id) {
             self.flash(error);
         }

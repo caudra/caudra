@@ -34,7 +34,6 @@ bitflags! {
         const RESEARCH_SUB = 0b0000_0010;
         const GENERAL_SUB  = 0b0000_0100;
         const INTERPRETER  = 0b0000_1000;
-        const WORKFLOW     = 0b0001_0000;
     }
 }
 
@@ -49,7 +48,6 @@ pub const AUDIENCE_NAMES: &[(ToolAudience, &str)] = &[
     (ToolAudience::RESEARCH_SUB, "research_sub"),
     (ToolAudience::GENERAL_SUB, "general_sub"),
     (ToolAudience::INTERPRETER, "interpreter"),
-    (ToolAudience::WORKFLOW, "workflow"),
 ];
 
 impl ToolAudience {
@@ -950,7 +948,7 @@ mod tests {
         let ctx = DescriptionContext {
             filter: &filter,
             audience: ToolAudience::MAIN,
-            workflow: false,
+            workflows_available: false,
         };
         let vars = Vars::new();
         let defs = reg.definitions(&vars, &ctx, false);
@@ -1120,7 +1118,7 @@ mod tests {
             let ctx = DescriptionContext {
                 filter: &filter,
                 audience,
-                workflow: false,
+                workflows_available: false,
             };
             reg.definitions(&vars, &ctx, false)
                 .as_array()
@@ -1215,7 +1213,7 @@ mod tests {
         let ctx = DescriptionContext {
             filter: &filter,
             audience: ToolAudience::MAIN,
-            workflow: false,
+            workflows_available: false,
         };
         let names: Vec<_> = reg
             .definitions(&Vars::new(), &ctx, false)
@@ -1258,7 +1256,7 @@ mod tests {
         let ctx = DescriptionContext {
             filter: &crate::tools::ToolFilter::All,
             audience: ToolAudience::RESEARCH_SUB,
-            workflow: false,
+            workflows_available: false,
         };
 
         let definitions = reg.definitions(&Vars::new(), &ctx, false);
@@ -1284,7 +1282,7 @@ mod tests {
         let ctx = DescriptionContext {
             filter: &filter,
             audience: ToolAudience::MAIN,
-            workflow: false,
+            workflows_available: false,
         };
 
         let definitions = reg.definitions(&Vars::new(), &ctx, false);

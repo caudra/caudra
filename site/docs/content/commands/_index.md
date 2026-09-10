@@ -31,6 +31,9 @@ Commands marked Main only act on the main session's turn or history. They stay l
 | `/stash-list` | Browse stashed prompts |  |
 | `/memory` | View, edit, and delete memory files |  |
 | `/tasks` | Browse tasks and steer running subagents |  |
+| `/workflows` | Browse, trust, and launch workflows | Main only |
+| `/workflow` | Start a workflow, or list, pause, resume, and stop runs | Main only |
+| `/deep-research` | Research a question with the deep-research workflow | Main only |
 | `/sessions` | Browse and switch sessions |  |
 | `/rename` | Rename the current session |  |
 | `/model` | Switch model | Main only |
@@ -49,7 +52,6 @@ Commands marked Main only act on the main session's turn or history. They stay l
 | `/yolo` | Toggle YOLO mode (skip all permission prompts) |  |
 | `/thinking` | Set reasoning (off, adaptive/provider default, effort, or token budget) |  |
 | `/fast` | Toggle Anthropic fast mode (Opus only) |  |
-| `/workflow` | Toggle workflow context for custom Lua tools | Main only |
 | `/exit` | Exit the application |  |
 | `/reload` | Reload plugins and config |  |
 | `/workbench` | Open the file explorer, editor and source control view |  |
@@ -86,7 +88,23 @@ An input box appears while the focused task is running. Press Enter to queue gui
 
 That input box is a full composer. Typing `/` opens the palette, `Ctrl+S` inserts a file path, `Ctrl+X e` edits the draft in your editor, and `Ctrl+V` attaches an image to the guidance. A custom `/project:` or `/user:` command expands its template and steers the focused task rather than the main session.
 
-Commands that reach the main session's turn or history have no task equivalent, so `/compact`, `/continue`, `/model`, `/system-prompt`, `/workflow`, `/btw`, the `/goal` family, and MCP prompts are drawn dimmed and report their scope when run. Return to Main to use them. `/context`, `/tools`, `/skills`, `/queue`, `/review`, and the stash commands already follow the focused transcript.
+Commands that reach the main session's turn or history have no task equivalent, so `/compact`, `/continue`, `/model`, `/system-prompt`, `/btw`, the `/goal` family, the workflow commands, and MCP prompts are drawn dimmed and report their scope when run. Return to Main to use them. `/context`, `/tools`, `/skills`, `/queue`, `/review`, and the stash commands already follow the focused transcript.
+
+## Workflows
+
+A workflow is a script that launches subagents in phases, keeps a journal, and can be paused and resumed. Each session runs one workflow runtime, and a run keeps going through model switches and cancelled turns: `Esc Esc` stops the main turn and leaves every run alone. A run belongs to the session that started it and stays with that session when you switch to another.
+
+`/workflows` opens the catalog: every script from the built-ins, the project's `.caudra/workflows/`, and your user config, with the ones that failed to parse listed under it. A project or user script runs only after its content digest has been trusted. `Enter` on an untrusted entry shows the digest and asks you to confirm it, and a script that changes on disk needs trusting again. `Enter` on a trusted entry fills the composer with `/workflow <name> ` so you can add the arguments.
+
+`/workflow <name> [--agent-budget N] [args]` starts a run. Arguments written as a JSON object are handed to the script as they are. Any other text becomes its `query` and `objective`. `--agent-budget` caps how many agents the run may admit. Starting an untrusted script reports it and points you at `/workflows`. `/deep-research <query>` is `/workflow deep-research <query>`.
+
+`/workflow` alone, or `/workflow runs`, opens the runs picker. Each run lists its phase, agents admitted, tokens used, and the agents it launched, with their state. Press `p` to pause the selected run, `r` to resume it, and `x` to stop it. `Enter` on an agent row opens that agent's transcript, the same view the [task picker](#tasks) gives. The same controls take a name from the command line: `/workflow pause <run>`, `/workflow resume <run>`, and `/workflow stop <run>`, where `<run>` is the display name shown in the picker or the run id.
+
+The status bar shows `[wf:N]` while N runs are working, and `[wf:N+M]` once M runs are paused or out of budget and waiting on you.
+
+A run that finishes, fails, pauses, or runs out of budget leaves a notice. Caudra waits until the session is idle, then starts one turn of its own whose first message carries every pending notice, drawn in the transcript as an injected message, so the model reads the report and can act on it. The notice names the run and its status, then the `report` string of its result or the whole result when there is none, the scratch file path when the script wrote one, and the pause message or error. Reports are cut at 8 KiB. Each notice is delivered once per run revision and acknowledged in the runtime, which is the same rule the [headless surface](/docs/headless/#completion-context) follows.
+
+Closing Caudra interrupts every active run, and an interrupted run is over. Pause a run you mean to pick up later: resuming a paused run replays its journal and continues from the last committed phase, and work an agent had started but not committed runs again. The model reaches the same runtime through the [`workflow` tool](/docs/tools/#workflow).
 
 ## Completion goals
 
@@ -155,7 +173,6 @@ Prompt text and tool input are not written to the log unless you opt in. See [Te
 - **`/yolo`**: skip permission prompts for this session (deny rules still apply). The toggle survives a resume, and `--yolo` only sets the starting value. Config: `always_yolo = true`.
 - **`/thinking`**: extended thinking. Optional arg: `off`, `adaptive`, an effort level (`minimal` … `max`), or a token budget number. The level is remembered across restarts. Config: `always_thinking` overrides the remembered level.
 - **`/fast`**: Anthropic fast mode (Opus only; ignored on other models). Config: `always_fast = true`.
-- **`/workflow`**: expose workflow mode to custom Lua tool descriptions and handlers. Native `python_execution` remains isolated. Config: `always_workflow = true`.
 - **`/view`**: cycle the transcript through auto, compact, and expanded. Auto is the default: every card falls back to a single row except the newest one, which stays open until a newer card replaces it. Compact draws every tool call as one row; expanded gives each its own card. Only calls that changed nothing can be hidden, so writes, edits, and shell commands stay open in every mode. An open card shows as much of its body as `ui.tool_output_lines` allows for that tool; clicking shows all of it, and clicking again puts it back. A card you opened yourself stays open as the transcript grows. `task` and `batch` keep their child rows throughout, and each child answers the same question its own card would: a child that changed something draws its body within that tool's `ui.tool_output_lines` budget, and every other child folds to its row until you click it. The choice is remembered across restarts.
 - **Plan / build**: not a slash command. Press `Tab` in the input to toggle plan mode (plan-file writes only). Caudra opens in plan mode, and a resumed session reopens in the mode it was left in. A toggle reaches the agent with your next message, so until you send one the status bar shows the pending switch as `[PLAN→BUILD]` (`[P→B]` on a narrow terminal) rather than the new mode.
 - **`/reload`**: rebuild plugins and config without leaving the app.

@@ -638,6 +638,7 @@ impl SpawnCtx {
             subagent_history,
             system_prompt_profile.clone(),
             Arc::clone(&self.prompt_profiles),
+            Some(self.storage.clone()),
         );
         let mut app = App::new(
             &self.model_slot.load().model,
@@ -1548,16 +1549,20 @@ impl<'t> EventLoop<'t> {
             .fire_autocmd("SessionFocusChanged", data);
     }
 
+    /// One turn per quiet session for everything that arrived while it was
+    /// busy: mailbox wakes and settled workflow runs share the preamble, so a
+    /// burst of either wakes the model once.
     fn start_mailbox_runs(&mut self) -> Dirty {
         let ready: Vec<_> = self
             .sessions
-            .iter()
+            .iter_mut()
             .enumerate()
             .filter_map(|(index, runtime)| {
                 if !runtime.quiescent() {
                     return None;
                 }
-                let preamble = runtime.handles.claim_mailbox_wake();
+                let mut preamble = runtime.handles.claim_mailbox_wake();
+                preamble.extend(runtime.app.claim_workflow_completions());
                 (!preamble.is_empty()).then_some((index, preamble))
             })
             .collect();
@@ -1729,7 +1734,10 @@ impl<'t> EventLoop<'t> {
         if !self.sessions[i].quiescent() {
             return Err(DELETE_BUSY_ERR.into());
         }
-        let SessionRuntime { handles, lease, .. } = self.remove_runtime(i);
+        let SessionRuntime {
+            mut handles, lease, ..
+        } = self.remove_runtime(i);
+        handles.shutdown_workflow();
         handles.cancel();
         Ok(lease)
     }
@@ -2700,8 +2708,12 @@ impl<'t> EventLoop<'t> {
         if let Some(ref h) = self.ctx.mcp_handle {
             mcp::kill_process_groups(&h.reader().load().pids);
         }
+        // Workflows first: their runs are interrupted and journaled while the
+        // store is still open, and their agents are gone before the loops
+        // are asked to quiesce.
         for rt in &mut self.sessions {
             rt.app.prepare_shutdown();
+            rt.handles.shutdown_workflow();
             let _ = rt.handles.cmd_tx.try_send(AgentCommand::CancelAll);
         }
         let kill_mcp_ms = lap();
