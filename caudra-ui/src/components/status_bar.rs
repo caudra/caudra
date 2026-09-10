@@ -4,7 +4,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use super::command::ChatScope;
-use super::{RetryInfo, Status, hover_style};
+use super::{RetryInfo, Status, escape_terminal_controls, hover_style};
 
 use crate::animation::spinner_frame;
 use crate::theme;
@@ -19,6 +19,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::repaint::{Cadence, Dirty};
 use caudra_agent::GoalSnapshot;
+use caudra_workflow::{RunSnapshot, RunStatus};
 
 const TRUNCATE_PREFIX: &str = "..";
 const CWD_MODEL_SEPARATOR: &str = "  ";
@@ -30,6 +31,7 @@ const RETRY_NOW_LABEL: &str = " · retry now";
 const FAST_LABEL: &str = " [fast]";
 const WORKFLOW_PREFIX: &str = " [wf:";
 const WORKFLOW_WAITING_SEPARATOR: &str = "+";
+const WORKFLOW_PHASE_SEPARATOR: &str = " \u{b7} ";
 const WORKFLOW_SUFFIX: &str = "]";
 const YOLO_LABEL: &str = " [yolo]";
 const YOLO_SHORT_LABEL: &str = " [!]";
@@ -48,19 +50,54 @@ const PLAIN_MODEL_FLOOR: usize = 1;
 /// spare to say the number is a price rather than a bill.
 const NOT_BILLED_MARK: &str = "~";
 
-/// `[wf:2]` for the runs working now, `[wf:2+1]` once some are parked waiting
-/// on someone, and nothing while the session has neither.
-pub fn workflow_chip(active: usize, waiting: usize) -> Option<String> {
-    if active == 0 && waiting == 0 {
+/// What the bar says about the session's runs: the chip that names what is
+/// going on, and the count it falls back to when the columns run out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowChip {
+    pub named: String,
+    pub counts: String,
+}
+
+/// `[wf: deep-research · Research 2/4]` for the one run working now,
+/// `[wf:2+1 · Research]` once there are several or some are parked waiting on
+/// someone, with the newest run's phase; `[wf:2+1]` is the count alone.
+/// Nothing while the session has neither. Runs come newest first.
+pub fn workflow_chip(runs: &[RunSnapshot]) -> Option<WorkflowChip> {
+    let active: Vec<&RunSnapshot> = runs
+        .iter()
+        .filter(|run| run.status == RunStatus::Active)
+        .collect();
+    let waiting = runs
+        .iter()
+        .filter(|run| matches!(run.status, RunStatus::Paused | RunStatus::BudgetLimited))
+        .count();
+    if active.is_empty() && waiting == 0 {
         return None;
     }
-    let mut label = format!("{WORKFLOW_PREFIX}{active}");
+    let mut count = active.len().to_string();
     if waiting > 0 {
-        label.push_str(WORKFLOW_WAITING_SEPARATOR);
-        label.push_str(&waiting.to_string());
+        count.push_str(WORKFLOW_WAITING_SEPARATOR);
+        count.push_str(&waiting.to_string());
     }
-    label.push_str(WORKFLOW_SUFFIX);
-    Some(label)
+    let head = match active.as_slice() {
+        [only] if waiting == 0 => format!(" {}", escape_terminal_controls(&only.display_name)),
+        _ => count.clone(),
+    };
+    let mut named = format!("{WORKFLOW_PREFIX}{head}");
+    if let Some(run) = active.first()
+        && let Some(phase) = &run.phase
+    {
+        named.push_str(WORKFLOW_PHASE_SEPARATOR);
+        named.push_str(&escape_terminal_controls(phase));
+        if let Some((at, of)) = run.phase_position() {
+            named.push_str(&format!(" {at}/{of}"));
+        }
+    }
+    named.push_str(WORKFLOW_SUFFIX);
+    Some(WorkflowChip {
+        named,
+        counts: format!("{WORKFLOW_PREFIX}{count}{WORKFLOW_SUFFIX}"),
+    })
 }
 
 /// What to draw in the bar's one cost slot. Billed spend wins the slot when a
@@ -155,9 +192,9 @@ pub struct StatusBarContext<'a> {
     /// word "thinking" in front of it only when it has the columns to spare.
     pub thinking: Option<Cow<'static, str>>,
     pub fast: bool,
-    /// Already rendered by [`workflow_chip`], so fitting the bar measures a
-    /// string rather than formatting one per rung.
-    pub workflows: Option<String>,
+    /// Already rendered by [`workflow_chip`], so fitting the bar measures
+    /// strings rather than formatting one per rung.
+    pub workflows: Option<WorkflowChip>,
     pub yolo: bool,
     pub restoring: bool,
     /// A working-tree capture is in flight. It walks and hashes every file the
@@ -191,6 +228,14 @@ enum ModelTier {
     Chopped,
 }
 
+/// `[wf: deep-research · Research 2/4]`, squeezed to `[wf:1]`, or nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkflowTier {
+    Named,
+    Counts,
+    Hidden,
+}
+
 /// `[yolo]` spelled out, squeezed to `[!]`, or nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum YoloTier {
@@ -216,6 +261,7 @@ enum Reduction {
     CompactContext,
     ShortThinking,
     ShortYolo,
+    ShortWorkflows,
     LeafModel,
     DropSpend,
     DropContext,
@@ -229,11 +275,12 @@ enum Reduction {
 /// Cheap abbreviations come before anything is lost, and yolo goes last: a
 /// session that skips permission prompts has to say so at any width that can
 /// hold three columns.
-const LADDER: [Reduction; 12] = [
+const LADDER: [Reduction; 13] = [
     Reduction::DropGlobalSpend,
     Reduction::CompactContext,
     Reduction::ShortThinking,
     Reduction::ShortYolo,
+    Reduction::ShortWorkflows,
     Reduction::LeafModel,
     Reduction::DropSpend,
     Reduction::DropContext,
@@ -288,7 +335,7 @@ struct Fit {
     thinking: ThinkingTier,
     model: ModelTier,
     fast: bool,
-    workflows: bool,
+    workflows: WorkflowTier,
     yolo: YoloTier,
 }
 
@@ -300,7 +347,7 @@ impl Fit {
         thinking: ThinkingTier::Named,
         model: ModelTier::Full,
         fast: true,
-        workflows: true,
+        workflows: WorkflowTier::Named,
         yolo: YoloTier::Named,
     };
 
@@ -310,11 +357,12 @@ impl Fit {
             Reduction::CompactContext => self.context = ContextTier::Percent,
             Reduction::ShortThinking => self.thinking = ThinkingTier::Level,
             Reduction::ShortYolo => self.yolo = YoloTier::Sigil,
+            Reduction::ShortWorkflows => self.workflows = WorkflowTier::Counts,
             Reduction::LeafModel => self.model = ModelTier::Leaf,
             Reduction::DropSpend => self.spend = false,
             Reduction::DropContext => self.context = ContextTier::Hidden,
             Reduction::DropFast => self.fast = false,
-            Reduction::DropWorkflows => self.workflows = false,
+            Reduction::DropWorkflows => self.workflows = WorkflowTier::Hidden,
             Reduction::DropThinking => self.thinking = ThinkingTier::Hidden,
             Reduction::ChopModel => self.model = ModelTier::Chopped,
             Reduction::DropYolo => self.yolo = YoloTier::Hidden,
@@ -348,7 +396,12 @@ impl Fit {
     }
 
     fn workflow_label<'a>(self, ctx: &'a StatusBarContext<'_>) -> Option<&'a str> {
-        ctx.workflows.as_deref().filter(|_| self.workflows)
+        let chip = ctx.workflows.as_ref()?;
+        match self.workflows {
+            WorkflowTier::Named => Some(&chip.named),
+            WorkflowTier::Counts => Some(&chip.counts),
+            WorkflowTier::Hidden => None,
+        }
     }
 
     fn yolo_label(self, ctx: &StatusBarContext<'_>) -> Option<&'static str> {
@@ -1040,7 +1093,11 @@ mod tests {
     const LADDER_THINKING: &str = "xhigh";
     const LADDER_WORKFLOWS_ACTIVE: usize = 2;
     const LADDER_WORKFLOWS_WAITING: usize = 1;
-    const LADDER_WORKFLOW_CHIP: &str = "[wf:2+1]";
+    const LADDER_WORKFLOW_CHIP: &str = "[wf:2+1 \u{b7} Research 2/3]";
+    const LADDER_WORKFLOW_COUNTS: &str = "[wf:2+1]";
+    const RUN_NAME: &str = "deep-research";
+    const RUN_PHASE: &str = "Research";
+    const SHORT_WORKFLOWS_MSG: &str = "a squeezed workflow chip must fall back to its counts";
     const LADDER_CWD: &str = "~/projects/caudra:main";
     const PERCENT_MARK: &str = "%";
     /// A budget the ladder answers with a squeezed thinking chip: wide enough
@@ -1081,6 +1138,45 @@ mod tests {
             .unwrap()
     }
 
+    fn run(status: RunStatus, phase: Option<&str>) -> RunSnapshot {
+        RunSnapshot {
+            run_id: RUN_NAME.into(),
+            display_name: RUN_NAME.into(),
+            workflow_name: RUN_NAME.into(),
+            source_kind: caudra_workflow::SourceKind::Builtin,
+            objective: None,
+            status,
+            pause_kind: None,
+            pause_message: None,
+            revision: 1,
+            execution_epoch: 1,
+            phase: phase.map(str::to_owned),
+            phases: vec!["Plan".into(), RUN_PHASE.into(), "Report".into()],
+            phase_history: Vec::new(),
+            agent_budget: 8,
+            usage: caudra_workflow::RunUsage::default(),
+            roster: Vec::new(),
+            result: None,
+            error: None,
+            logs: Vec::new(),
+            outbox_pending: false,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    /// `active` runs in their research phase ahead of `waiting` paused ones.
+    fn runs(active: usize, waiting: usize) -> Vec<RunSnapshot> {
+        std::iter::repeat_with(|| run(RunStatus::Active, Some(RUN_PHASE)))
+            .take(active)
+            .chain(std::iter::repeat_with(|| run(RunStatus::Paused, None)).take(waiting))
+            .collect()
+    }
+
+    fn ladder_workflows() -> Option<WorkflowChip> {
+        workflow_chip(&runs(LADDER_WORKFLOWS_ACTIVE, LADDER_WORKFLOWS_WAITING))
+    }
+
     /// Everything the bar's tests vary, defaulting to a plain idle bar at
     /// `BAR_WIDTH`, so each test names only what it actually exercises.
     struct Fixture<'a> {
@@ -1093,7 +1189,7 @@ mod tests {
         goal: Option<&'a GoalSnapshot>,
         retry_info: Option<&'a RetryInfo>,
         snapshotting: bool,
-        workflows: Option<String>,
+        workflows: Option<WorkflowChip>,
         main_chat: bool,
     }
 
@@ -1213,7 +1309,7 @@ mod tests {
             retry_info: None,
             thinking: Some(LADDER_THINKING.into()),
             fast: true,
-            workflows: workflow_chip(LADDER_WORKFLOWS_ACTIVE, LADDER_WORKFLOWS_WAITING),
+            workflows: ladder_workflows(),
             yolo: true,
             restoring: false,
             snapshotting: false,
@@ -1321,14 +1417,22 @@ mod tests {
     }
 
     #[test_case(0, 0 => None ; "nothing_running_draws_nothing")]
-    #[test_case(3, 0 => Some(" [wf:3]".to_owned()) ; "active_alone")]
-    #[test_case(0, 2 => Some(" [wf:0+2]".to_owned()) ; "waiting_alone_keeps_the_active_count")]
-    #[test_case(2, 1 => Some(format!(" {LADDER_WORKFLOW_CHIP}")) ; "both")]
-    fn the_workflow_chip_counts_active_and_waiting(
+    #[test_case(1, 0 => Some((" [wf: deep-research \u{b7} Research 2/3]".to_owned(), " [wf:1]".to_owned())) ; "one_active_run_is_named_with_its_phase")]
+    #[test_case(3, 0 => Some((" [wf:3 \u{b7} Research 2/3]".to_owned(), " [wf:3]".to_owned())) ; "several_active_runs_are_counted_with_the_newest_phase")]
+    #[test_case(0, 2 => Some((" [wf:0+2]".to_owned(), " [wf:0+2]".to_owned())) ; "waiting_alone_keeps_the_active_count")]
+    #[test_case(2, 1 => Some((format!(" {LADDER_WORKFLOW_CHIP}"), format!(" {LADDER_WORKFLOW_COUNTS}"))) ; "both")]
+    fn the_workflow_chip_names_the_runs_and_counts_them(
         active: usize,
         waiting: usize,
-    ) -> Option<String> {
-        workflow_chip(active, waiting)
+    ) -> Option<(String, String)> {
+        workflow_chip(&runs(active, waiting)).map(|chip| (chip.named, chip.counts))
+    }
+
+    #[test]
+    fn a_run_without_a_declared_phase_is_named_alone() {
+        let chip = workflow_chip(&[run(RunStatus::Active, None)]).unwrap();
+
+        assert_eq!(chip.named, " [wf: deep-research]");
     }
 
     #[test]
@@ -1336,6 +1440,40 @@ mod tests {
         with_ladder_ctx(|ctx| {
             let side = right_side(ctx, LADDER_CWD, WIDE_BUDGET);
             assert!(side_text(&side).contains(LADDER_WORKFLOW_CHIP));
+        });
+    }
+
+    /// Narrowing the bar squeezes the named chip to its counts before it
+    /// drops the chip, so the tiers seen walking down are named, then counts,
+    /// then nothing, with the counts tier actually visited.
+    #[test]
+    fn a_narrowing_bar_squeezes_the_workflow_chip_before_dropping_it() {
+        with_ladder_ctx(|ctx| {
+            let tiers: Vec<WorkflowTier> = (0..=WIDE_BUDGET)
+                .rev()
+                .map(|budget| {
+                    let text = side_text(&right_side(ctx, LADDER_CWD, budget));
+                    if text.contains(LADDER_WORKFLOW_CHIP) {
+                        WorkflowTier::Named
+                    } else if text.contains(LADDER_WORKFLOW_COUNTS) {
+                        WorkflowTier::Counts
+                    } else {
+                        WorkflowTier::Hidden
+                    }
+                })
+                .collect();
+            let mut seen = tiers.clone();
+            seen.dedup();
+
+            assert_eq!(
+                seen,
+                vec![
+                    WorkflowTier::Named,
+                    WorkflowTier::Counts,
+                    WorkflowTier::Hidden
+                ],
+                "{SHORT_WORKFLOWS_MSG}: {tiers:?}"
+            );
         });
     }
 
@@ -1896,7 +2034,7 @@ mod tests {
             main_chat: false,
             goal: Some(&goal),
             retry_info: Some(&retry),
-            workflows: workflow_chip(LADDER_WORKFLOWS_ACTIVE, LADDER_WORKFLOWS_WAITING),
+            workflows: ladder_workflows(),
             ..Default::default()
         });
 

@@ -9,9 +9,11 @@ use std::borrow::Cow;
 
 use caudra_agent::workflow::WorkflowHandle;
 use caudra_providers::Message;
+#[cfg(test)]
+use caudra_workflow::RunStatus;
 use caudra_workflow::{
-    LaunchRequest, RunSnapshot, RunStatus, WorkflowError, WorkflowEvent, WorkflowRequest,
-    WorkflowResponse,
+    LaunchRequest, LogLine, MAX_RUN_LOG_ENTRIES, RunSnapshot, WorkflowError, WorkflowEvent,
+    WorkflowRequest, WorkflowResponse,
 };
 use serde_json::{Value, json};
 use tracing::{debug, warn};
@@ -19,8 +21,9 @@ use tracing::{debug, warn};
 use crate::app::App;
 use crate::components::Action;
 use crate::components::command::CommandAction;
+use crate::components::logs_modal::LogsAction;
 use crate::components::workflow_catalog_picker::WorkflowCatalogAction;
-use crate::components::workflow_picker::{RunControl, WorkflowPickerAction};
+use crate::components::workflow_inspector::{InspectorAction, RunControl};
 use crate::repaint::Dirty;
 
 pub(crate) const UNAVAILABLE_MSG: &str = "Workflows are unavailable in this session";
@@ -30,6 +33,7 @@ pub(crate) const DEEP_RESEARCH_USAGE: &str = "Usage: /deep-research <query>";
 pub(crate) const TRUST_HINT: &str = "run /workflows to review and trust it";
 pub(crate) const DEEP_RESEARCH_WORKFLOW: &str = "deep-research";
 const RUNS_SUBCOMMAND: &str = "runs";
+const HISTORY_LIMIT: Option<usize> = None;
 const BUDGET_FLAG: &str = "--agent-budget";
 const QUERY_ARG: &str = "query";
 const OBJECTIVE_ARG: &str = "objective";
@@ -66,6 +70,8 @@ pub(crate) enum Intent {
     Launch,
     Trust,
     Control(RunControl),
+    Inspect,
+    History,
     Ack,
 }
 
@@ -131,6 +137,7 @@ impl WorkflowUi {
         &self.runs
     }
 
+    #[cfg(test)]
     pub(crate) fn count(&self, status: RunStatus) -> usize {
         self.runs.iter().filter(|run| run.status == status).count()
     }
@@ -144,6 +151,17 @@ impl WorkflowUi {
             Some(index) => self.runs[index] = snapshot,
             None => self.runs.insert(0, snapshot),
         }
+    }
+
+    /// A line the run logged since its last snapshot, kept to the same tail
+    /// the runtime keeps. The run it names, when the mirror knows it.
+    pub(crate) fn apply_log(&mut self, run_id: &str, line: LogLine) -> Option<&RunSnapshot> {
+        let run = self.runs.iter_mut().find(|run| run.run_id == run_id)?;
+        if run.logs.len() >= MAX_RUN_LOG_ENTRIES {
+            run.logs.remove(0);
+        }
+        run.logs.push(line);
+        Some(run)
     }
 
     /// The run a user named, by display name first and run id second.
@@ -230,7 +248,7 @@ impl App {
             return Vec::new();
         }
         if args.is_empty() || args == RUNS_SUBCOMMAND {
-            self.workflow_picker.open(self.workflow.runs().to_vec());
+            self.open_workflow_inspector(None);
             return Vec::new();
         }
         let (head, rest) = split_word(args);
@@ -283,16 +301,52 @@ impl App {
         }
     }
 
-    pub(super) fn handle_workflow_picker_action(
+    /// Opens the inspector on the mirror and asks the runtime for what the
+    /// mirror does not hold: earlier sessions' runs once, and the selected
+    /// run's detail whenever the selection or the run moves.
+    pub(super) fn open_workflow_inspector(&mut self, preferred: Option<&str>) {
+        if !self.workflow.available() {
+            self.flash(UNAVAILABLE_MSG.into());
+            return;
+        }
+        let first = self
+            .workflow_inspector
+            .open(self.workflow.runs().to_vec(), preferred);
+        self.workflow.dispatch(
+            Intent::History,
+            WorkflowRequest::History {
+                limit: HISTORY_LIMIT,
+            },
+        );
+        if let Some(run_id) = first {
+            self.inspect_workflow(run_id);
+        }
+    }
+
+    fn inspect_workflow(&mut self, run_id: String) {
+        self.workflow
+            .dispatch(Intent::Inspect, WorkflowRequest::Inspect { run_id });
+    }
+
+    pub(super) fn handle_workflow_inspector_action(
         &mut self,
-        action: WorkflowPickerAction,
+        action: InspectorAction,
     ) -> Vec<Action> {
         match action {
-            WorkflowPickerAction::Consumed | WorkflowPickerAction::Close => {}
-            WorkflowPickerAction::Control { control, run_id } => {
+            InspectorAction::Consumed => {}
+            InspectorAction::Close => self.workflow_inspector.close(),
+            InspectorAction::Inspect(run_id) => self.inspect_workflow(run_id),
+            InspectorAction::Control { control, run_id } => {
                 self.control_workflow(control, run_id);
             }
-            WorkflowPickerAction::OpenTranscript(task_id) => self.preview_task(&task_id),
+            InspectorAction::OpenTranscript(task_id) => {
+                self.workflow_inspector.close();
+                self.preview_task(&task_id);
+            }
+            InspectorAction::Copy { text, label } => {
+                self.handle_logs_action(LogsAction::Copy { text, label });
+            }
+            InspectorAction::Flash(message) => self.flash(message.into()),
         }
         Vec::new()
     }
@@ -314,12 +368,35 @@ impl App {
         }
     }
 
-    /// A run moved. Only snapshots reach the mirror; log lines are the
-    /// runtime's journal, not the screen's.
+    /// A run moved, or said something. Both reach the mirror and the run's
+    /// transcript card; the inspector re-reads the mirror on a snapshot.
     pub(super) fn on_workflow_event(&mut self, event: WorkflowEvent) {
-        if let WorkflowEvent::Snapshot(snapshot) = event {
-            self.workflow.apply(*snapshot);
-            self.refresh_workflow_picker();
+        match event {
+            WorkflowEvent::Snapshot(snapshot) => {
+                self.main_chat().workflow_card_update(&snapshot);
+                self.workflow.apply(*snapshot);
+                self.refresh_workflow_inspector();
+            }
+            WorkflowEvent::Log {
+                run_id,
+                at,
+                message,
+                ..
+            } => {
+                let line = LogLine { at, message };
+                if let Some(run) = self.workflow.apply_log(&run_id, line).cloned() {
+                    self.main_chat().workflow_card_update(&run);
+                }
+            }
+        }
+    }
+
+    /// Brings every card the transcript holds up to what the mirror knows,
+    /// for a restored session whose cards were drawn from stored results.
+    pub(crate) fn refresh_workflow_cards(&mut self) {
+        let runs = self.workflow.runs().to_vec();
+        for run in &runs {
+            self.main_chat().workflow_card_update(run);
         }
     }
 
@@ -340,8 +417,9 @@ impl App {
             (Intent::Catalog, Err(error)) => self.workflow_catalog_picker.fail(error.to_string()),
             (Intent::Launch, Ok(WorkflowResponse::Started(snapshot))) => {
                 self.flash(format!("Started {}", snapshot.display_name));
+                self.main_chat().workflow_card_start(&snapshot);
                 self.workflow.apply(*snapshot);
-                self.refresh_workflow_picker();
+                self.refresh_workflow_inspector();
             }
             (Intent::Launch, Err(WorkflowError::TrustRequired { name, .. })) => {
                 self.flash(format!("Workflow {name} is not trusted; {TRUST_HINT}"));
@@ -359,8 +437,20 @@ impl App {
                     control.past_tense(),
                     snapshot.display_name
                 ));
+                self.main_chat().workflow_card_update(&snapshot);
                 self.workflow.apply(*snapshot);
-                self.refresh_workflow_picker();
+                self.refresh_workflow_inspector();
+            }
+            (Intent::Inspect, Ok(WorkflowResponse::Detail(detail))) => {
+                self.workflow_inspector.fill_detail(*detail);
+            }
+            (Intent::History, Ok(WorkflowResponse::History(history))) => {
+                if let Some(run_id) = self.workflow_inspector.fill_history(history) {
+                    self.inspect_workflow(run_id);
+                }
+            }
+            (Intent::Inspect | Intent::History, Err(error)) => {
+                debug!(%error, "workflow inspection could not be answered");
             }
             (Intent::Ack, Ok(WorkflowResponse::Acked(acked))) => {
                 if !acked {
@@ -377,9 +467,15 @@ impl App {
         }
     }
 
-    fn refresh_workflow_picker(&mut self) {
-        if self.workflow_picker.is_open() {
-            self.workflow_picker.refresh(self.workflow.runs().to_vec());
+    fn refresh_workflow_inspector(&mut self) {
+        if !self.workflow_inspector.is_open() {
+            return;
+        }
+        if let Some(run_id) = self
+            .workflow_inspector
+            .refresh(self.workflow.runs().to_vec())
+        {
+            self.inspect_workflow(run_id);
         }
     }
 
@@ -389,8 +485,8 @@ impl App {
         self.workflow.claim_completions()
     }
 
-    /// The status bar's `wf:` chip: runs working now, and runs waiting on
-    /// someone.
+    /// Runs working now, and runs waiting on someone.
+    #[cfg(test)]
     pub(crate) fn workflow_counts(&self) -> (usize, usize) {
         (
             self.workflow.count(RunStatus::Active),
@@ -499,7 +595,9 @@ mod tests {
 
     use caudra_agent::types::WORKFLOW_EVENT_RUN_ID;
     use caudra_agent::{AgentEvent, Envelope};
-    use caudra_workflow::{CatalogEntry, RunUsage, SourceKind, WorkflowCatalog};
+    use caudra_workflow::{
+        CatalogEntry, RunDetail, RunHistoryEntry, RunUsage, SourceKind, WorkflowCatalog,
+    };
     use crossterm::event::{KeyCode, MouseEventKind};
     use test_case::test_case;
 
@@ -508,7 +606,10 @@ mod tests {
     use crate::app::tests::{click_status, mouse_event, status_hit, test_app};
     use crate::components::command::ParsedCommand;
     use crate::components::key;
+    use crate::components::keybindings::{key as kb, leader};
     use crate::components::status_bar::StatusBarHitTarget;
+    use crate::components::{DisplayRole, ToolStatus, workflow_card};
+    use caudra_agent::ToolOutput;
 
     const RUN_ID: &str = "run-1";
     const DISPLAY_NAME: &str = "deep-research-1";
@@ -518,6 +619,10 @@ mod tests {
     const FAILURE: &str = "script raised";
     const ONE_ANNOUNCEMENT: &str = "a pending completion is announced exactly once";
     const ACK_AT_READ_REVISION: &str = "the ack must name the revision the notice was read at";
+    const LOG_MESSAGE: &str = "searching the docs";
+    const CARD_DRAWN: &str = "a slash launch draws the run's card in the transcript";
+    const CARD_FOLLOWS: &str = "the card must follow the run's snapshots";
+    const LOG_MIRRORED: &str = "a log line must reach the mirror's tail";
 
     pub(crate) fn run(status: RunStatus) -> RunSnapshot {
         RunSnapshot {
@@ -708,9 +813,35 @@ mod tests {
         )
     }
 
+    /// What opening the inspector on one mirrored run ships: the earlier
+    /// sessions once, then the selected run's detail.
+    fn inspector_requests() -> Vec<WorkflowRequest> {
+        vec![
+            WorkflowRequest::History {
+                limit: HISTORY_LIMIT,
+            },
+            WorkflowRequest::Inspect {
+                run_id: RUN_ID.into(),
+            },
+        ]
+    }
+
     fn snapshot_envelope(snapshot: RunSnapshot) -> Msg {
+        workflow_envelope(WorkflowEvent::Snapshot(Box::new(snapshot)))
+    }
+
+    fn log_envelope(message: &str) -> Msg {
+        workflow_envelope(WorkflowEvent::Log {
+            run_id: RUN_ID.into(),
+            revision: 7,
+            at: 5,
+            message: message.into(),
+        })
+    }
+
+    fn workflow_envelope(event: WorkflowEvent) -> Msg {
         Msg::Agent(Box::new(Envelope {
-            event: AgentEvent::Workflow(Box::new(WorkflowEvent::Snapshot(Box::new(snapshot)))),
+            event: AgentEvent::Workflow(Box::new(event)),
             subagent: None,
             run_id: WORKFLOW_EVENT_RUN_ID,
             workflow: None,
@@ -775,18 +906,18 @@ mod tests {
 
     #[test_case("" ; "bare")]
     #[test_case("runs" ; "runs")]
-    fn the_workflow_command_alone_opens_the_runs_picker(args: &str) {
+    fn the_workflow_command_alone_opens_the_inspector(args: &str) {
         let mut app = scripted_app();
         app.workflow.apply(run(RunStatus::Active));
 
         workflow_command(&mut app, "/workflow", args);
 
-        assert!(app.workflow_picker.is_open());
-        assert!(app.workflow.sent.is_empty());
+        assert!(app.workflow_inspector.is_open());
+        assert_eq!(app.workflow.sent, inspector_requests());
     }
 
     #[test]
-    fn the_footer_chip_hovers_and_opens_the_runs_picker() {
+    fn the_footer_chip_hovers_and_opens_the_inspector() {
         let mut app = scripted_app();
         app.workflow.apply(run(RunStatus::Active));
         let hit = status_hit(&mut app, StatusBarHitTarget::Workflows);
@@ -795,9 +926,53 @@ mod tests {
 
         assert!(click_status(&mut app, StatusBarHitTarget::Workflows).is_empty());
 
-        assert!(app.workflow_picker.is_open());
+        assert!(app.workflow_inspector.is_open());
         assert_eq!(app.status_hover, None);
-        assert!(app.workflow.sent.is_empty());
+        assert_eq!(app.workflow.sent, inspector_requests());
+    }
+
+    #[test]
+    fn the_leader_key_opens_the_inspector() {
+        let mut app = scripted_app();
+
+        app.update(Msg::Key(kb::LEADER.to_key_event()));
+        app.update(Msg::Key(leader::WORKFLOWS.to_key_event()));
+
+        assert!(app.workflow_inspector.is_open());
+        assert_eq!(
+            app.workflow.sent,
+            vec![WorkflowRequest::History {
+                limit: HISTORY_LIMIT
+            }]
+        );
+    }
+
+    #[test]
+    fn a_detail_reply_lands_in_the_inspector_and_history_lists_earlier_runs() {
+        let mut app = scripted_app();
+        app.workflow.apply(run(RunStatus::Active));
+        workflow_command(&mut app, "/workflow", "");
+
+        app.on_workflow_reply(Reply {
+            intent: Intent::Inspect,
+            result: Ok(WorkflowResponse::Detail(Box::new(RunDetail {
+                run: run(RunStatus::Active),
+                calls: Vec::new(),
+                events: Vec::new(),
+                journal_trimmed: false,
+            }))),
+        });
+        app.on_workflow_reply(Reply {
+            intent: Intent::History,
+            result: Ok(WorkflowResponse::History(vec![RunHistoryEntry {
+                run: run(RunStatus::Completed),
+                session_id: "session-old".into(),
+                session_title: "earlier".into(),
+            }])),
+        });
+
+        assert_eq!(app.workflow_inspector.history_count(), 1);
+        assert_eq!(app.workflow_inspector.selected(), Some(RUN_ID));
     }
 
     #[test_case("pause", RunStatus::Active, WorkflowRequest::Pause { run_id: RUN_ID.into() } ; "pause")]
@@ -920,6 +1095,68 @@ mod tests {
             Some(format!("Started {DISPLAY_NAME}").as_str())
         );
         assert_eq!(app.workflow_counts(), (1, 0));
+        let card = app.main_chat().message_at(0).unwrap().clone();
+        assert!(
+            matches!(&card.role, DisplayRole::Tool(tool) if tool.id == workflow_card::card_id(RUN_ID)),
+            "{CARD_DRAWN}"
+        );
+        assert!(
+            matches!(
+                card.tool_output.as_deref(),
+                Some(ToolOutput::WorkflowRun(_))
+            ),
+            "{CARD_DRAWN}"
+        );
+    }
+
+    #[test]
+    fn snapshots_and_logs_move_the_card_along() {
+        let mut app = scripted_app();
+        app.on_workflow_reply(Reply {
+            intent: Intent::Launch,
+            result: Ok(WorkflowResponse::Started(Box::new(run(RunStatus::Active)))),
+        });
+
+        app.update(log_envelope(LOG_MESSAGE));
+        assert_eq!(
+            app.workflow.runs()[0]
+                .logs
+                .last()
+                .map(|line| line.message.as_str()),
+            Some(LOG_MESSAGE),
+            "{LOG_MIRRORED}"
+        );
+        assert!(
+            matches!(
+                app.main_chat().message_at(0).unwrap().tool_output.as_deref(),
+                Some(ToolOutput::WorkflowRun(drawn)) if drawn.logs.len() == 1
+            ),
+            "{CARD_FOLLOWS}"
+        );
+
+        let mut done = run(RunStatus::Completed);
+        done.revision = 8;
+        app.update(snapshot_envelope(done));
+
+        let card = app.main_chat().message_at(0).unwrap().clone();
+        let Some(ToolOutput::WorkflowRun(drawn)) = card.tool_output.as_deref() else {
+            panic!("{CARD_DRAWN}");
+        };
+        assert_eq!(drawn.status, RunStatus::Completed, "{CARD_FOLLOWS}");
+        assert!(
+            matches!(&card.role, DisplayRole::Tool(tool) if tool.status == ToolStatus::Success),
+            "{CARD_FOLLOWS}"
+        );
+    }
+
+    #[test]
+    fn a_log_for_an_unknown_run_is_ignored() {
+        let mut app = scripted_app();
+
+        app.update(log_envelope(LOG_MESSAGE));
+
+        assert!(app.workflow.runs().is_empty());
+        assert_eq!(app.main_chat().message_count(), 0);
     }
 
     #[test]
@@ -955,14 +1192,15 @@ mod tests {
     }
 
     #[test]
-    fn a_snapshot_refreshes_an_open_runs_picker() {
+    fn a_snapshot_refreshes_an_open_inspector() {
         let mut app = scripted_app();
         workflow_command(&mut app, "/workflow", "");
 
         app.update(snapshot_envelope(run(RunStatus::Active)));
 
-        assert!(app.workflow_picker.is_open());
-        assert_eq!(app.workflow_picker.run_count(), 1);
+        assert!(app.workflow_inspector.is_open());
+        assert_eq!(app.workflow_inspector.run_count(), 1);
+        assert_eq!(app.workflow_inspector.selected(), Some(RUN_ID));
     }
 
     #[test]

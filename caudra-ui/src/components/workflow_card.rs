@@ -1,0 +1,275 @@
+//! The transcript card of a workflow run: how a `ToolOutput::WorkflowRun`
+//! draws, what its header says, and which tool status its run maps to. One
+//! place, so a card a slash command opened and a card the `workflow` tool
+//! returned cannot drift apart.
+
+use caudra_agent::types::{PhaseMark, WorkflowRunCard};
+use caudra_workflow::{RosterState, RunStatus};
+use ratatui::style::Style;
+use ratatui::text::{Line, Span};
+
+use crate::components::{ToolStatus, escape_terminal_controls, format_compact, format_elapsed};
+use crate::theme;
+
+/// The tool id of a card a slash command opened, ahead of its run id. A
+/// card the `workflow` tool drew keeps the tool call's id and is found by
+/// the run its output names.
+pub(crate) const CARD_ID_PREFIX: &str = "workflow:";
+pub(crate) const CARD_SUMMARY_PREFIX: &str = "workflow ";
+const SEPARATOR: &str = " \u{b7} ";
+const PHASE_ARROW: &str = " \u{203a} ";
+const RUNNING_MARK: &str = "\u{25cf} ";
+const FAILED_MARK: &str = "\u{2717} ";
+const LOG_PREFIX: &str = "+";
+const AGENTS_SUFFIX: &str = " agents";
+const TOKENS_SUFFIX: &str = " tokens";
+const SCRATCH_LABEL: &str = "Scratch file: ";
+const PAUSED_LABEL: &str = "Paused: ";
+const ERROR_LABEL: &str = "Error: ";
+
+pub(crate) fn card_id(run_id: &str) -> String {
+    format!("{CARD_ID_PREFIX}{run_id}")
+}
+
+pub(crate) fn summary(card: &WorkflowRunCard) -> String {
+    format!(
+        "{CARD_SUMMARY_PREFIX}{}",
+        escape_terminal_controls(&card.display_name)
+    )
+}
+
+/// `active · Research · 3/128 agents · 41k tokens`, and how long a settled
+/// run took.
+pub(crate) fn annotation(card: &WorkflowRunCard) -> String {
+    let mut text = format!(
+        "{}{SEPARATOR}{}/{}{AGENTS_SUFFIX}{SEPARATOR}{}{TOKENS_SUFFIX}",
+        card.headline(),
+        card.usage.agents_admitted,
+        card.agent_budget,
+        format_compact(card.usage.tokens_used)
+    );
+    if card.status.is_terminal() {
+        text.push_str(SEPARATOR);
+        text.push_str(&format_elapsed(
+            card.updated_at.saturating_sub(card.created_at),
+        ));
+    }
+    text
+}
+
+/// A run that can still move is in progress; one that ended well succeeded;
+/// anything else ended short of what it set out to do.
+pub(crate) fn status(status: RunStatus) -> ToolStatus {
+    match status {
+        RunStatus::Active | RunStatus::Paused | RunStatus::BudgetLimited => ToolStatus::InProgress,
+        RunStatus::Completed => ToolStatus::Success,
+        RunStatus::Interrupted | RunStatus::Cancelled | RunStatus::Failed => ToolStatus::Error,
+    }
+}
+
+/// The phase strip, the agents still working or that failed, the last log
+/// lines while the run is going, and what it produced once it is not.
+pub(crate) fn render(card: &WorkflowRunCard) -> Vec<Line<'static>> {
+    let t = theme::current();
+    let mut lines = Vec::new();
+    let strip = card.phase_strip();
+    if !strip.is_empty() {
+        lines.push(phase_strip_line(&strip));
+    }
+    for agent in &card.roster {
+        let (mark, style) = match agent.state {
+            RosterState::Running => (RUNNING_MARK, t.accent),
+            RosterState::Failed => (FAILED_MARK, t.tool_error),
+            RosterState::Pending | RosterState::Completed | RosterState::Cancelled => continue,
+        };
+        let mut spans = vec![
+            Span::styled(mark, style),
+            Span::raw(escape_terminal_controls(&agent.label)),
+        ];
+        if let Some(phase) = &agent.phase {
+            spans.push(Span::styled(
+                format!("{SEPARATOR}{}", escape_terminal_controls(phase)),
+                t.tool_dim,
+            ));
+        }
+        spans.push(Span::styled(
+            format!(
+                "{SEPARATOR}{}{TOKENS_SUFFIX}{SEPARATOR}{}",
+                format_compact(agent.tokens_used),
+                format_elapsed(agent.duration_ms / 1_000)
+            ),
+            t.tool_dim,
+        ));
+        lines.push(Line::from(spans));
+    }
+    if card.status.is_terminal() {
+        if let Some(preview) = &card.result_preview {
+            lines.extend(
+                preview
+                    .lines()
+                    .map(|line| Line::raw(escape_terminal_controls(line))),
+            );
+        }
+        if let Some(path) = &card.scratch_path {
+            lines.push(labelled(SCRATCH_LABEL, path, t.tool_path));
+        }
+    } else {
+        for log in &card.logs {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!(
+                        "{LOG_PREFIX}{} ",
+                        format_elapsed(log.at.saturating_sub(card.created_at))
+                    ),
+                    t.tool_dim,
+                ),
+                Span::raw(escape_terminal_controls(&log.message)),
+            ]));
+        }
+    }
+    if let Some(message) = &card.pause_message {
+        lines.push(labelled(PAUSED_LABEL, message, t.tool_warning));
+    }
+    if let Some(error) = &card.error {
+        lines.push(labelled(ERROR_LABEL, error, t.tool_error));
+    }
+    lines
+}
+
+pub(crate) fn phase_strip_line(strip: &[(String, PhaseMark)]) -> Line<'static> {
+    let t = theme::current();
+    let mut spans = Vec::with_capacity(strip.len() * 2);
+    for (index, (title, mark)) in strip.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::styled(PHASE_ARROW, t.tool_dim));
+        }
+        let style = match mark {
+            PhaseMark::Done => t.tool_success,
+            PhaseMark::Current => t.accent,
+            PhaseMark::Pending => t.tool_dim,
+        };
+        spans.push(Span::styled(
+            format!("{} {}", escape_terminal_controls(title), mark.glyph()),
+            style,
+        ));
+    }
+    Line::from(spans)
+}
+
+pub(crate) fn status_span(status: RunStatus) -> Span<'static> {
+    let t = theme::current();
+    let style = match status {
+        RunStatus::Active => t.accent,
+        RunStatus::Paused | RunStatus::BudgetLimited => t.tool_warning,
+        RunStatus::Completed => t.tool_success,
+        RunStatus::Interrupted | RunStatus::Cancelled | RunStatus::Failed => t.tool_error,
+    };
+    Span::styled(status.to_string(), style)
+}
+
+fn labelled(label: &'static str, text: &str, style: Style) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(label, theme::current().tool_dim),
+        Span::styled(escape_terminal_controls(text), style),
+    ])
+}
+
+#[cfg(test)]
+mod tests {
+    use caudra_workflow::{AgentRosterEntry, LogLine, RunSnapshot, RunUsage, SourceKind};
+    use serde_json::json;
+    use test_case::test_case;
+
+    use super::*;
+
+    const RUN_ID: &str = "run-1";
+    const REPORT: &str = "Findings: 42.";
+    const LOG: &str = "searching";
+    const LIVE_LOGS: &str = "a live card shows its log tail, a settled one its report";
+
+    fn run(status: RunStatus) -> RunSnapshot {
+        RunSnapshot {
+            run_id: RUN_ID.into(),
+            display_name: "deep-research".into(),
+            workflow_name: "deep-research".into(),
+            source_kind: SourceKind::Builtin,
+            objective: None,
+            status,
+            pause_kind: None,
+            pause_message: None,
+            revision: 1,
+            execution_epoch: 1,
+            phase: Some("Research".into()),
+            phases: vec!["Plan".into(), "Research".into(), "Report".into()],
+            phase_history: Vec::new(),
+            agent_budget: 8,
+            usage: RunUsage {
+                agents_admitted: 3,
+                tokens_used: 41_250,
+            },
+            roster: vec![AgentRosterEntry {
+                call_key: 1,
+                label: "researcher".into(),
+                phase: None,
+                task_id: None,
+                state: RosterState::Running,
+                tokens_used: 0,
+                duration_ms: 0,
+            }],
+            result: Some(json!({ "report": REPORT })),
+            error: None,
+            logs: vec![LogLine {
+                at: 10,
+                message: LOG.into(),
+            }],
+            outbox_pending: false,
+            created_at: 0,
+            updated_at: 134,
+        }
+    }
+
+    fn text(lines: &[Line<'static>]) -> String {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test_case(RunStatus::Active => "active · Research · 3/8 agents · 41k tokens" ; "live")]
+    #[test_case(RunStatus::Completed => "completed · Research · 3/8 agents · 41k tokens · 2m14s" ; "settled_adds_its_duration")]
+    fn the_annotation_reads_the_headline_and_usage(status: RunStatus) -> String {
+        annotation(&WorkflowRunCard::from(&run(status)))
+    }
+
+    #[test_case(RunStatus::Active => ToolStatus::InProgress ; "active")]
+    #[test_case(RunStatus::Paused => ToolStatus::InProgress ; "paused")]
+    #[test_case(RunStatus::Completed => ToolStatus::Success ; "completed")]
+    #[test_case(RunStatus::Cancelled => ToolStatus::Error ; "cancelled")]
+    fn run_status_maps_to_a_tool_status(run_status: RunStatus) -> ToolStatus {
+        status(run_status)
+    }
+
+    #[test]
+    fn a_live_card_shows_the_strip_the_roster_and_the_log_tail() {
+        let body = text(&render(&WorkflowRunCard::from(&run(RunStatus::Active))));
+
+        assert!(body.starts_with("Plan ✓ › Research ● › Report ○"), "{body}");
+        assert!(body.contains("● researcher"), "{body}");
+        assert!(body.contains(&format!("+10s {LOG}")), "{LIVE_LOGS}: {body}");
+        assert!(!body.contains(REPORT), "{LIVE_LOGS}: {body}");
+    }
+
+    #[test]
+    fn a_settled_card_shows_the_report_instead_of_the_logs() {
+        let body = text(&render(&WorkflowRunCard::from(&run(RunStatus::Completed))));
+
+        assert!(body.contains(REPORT), "{LIVE_LOGS}: {body}");
+        assert!(!body.contains(LOG), "{LIVE_LOGS}: {body}");
+    }
+}

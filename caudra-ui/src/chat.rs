@@ -9,13 +9,17 @@ use std::time::Duration;
 use crate::app::tasks::{TaskOutcome, TaskStatus};
 use crate::components::messages::{MessagesPanel, PromptProgress};
 use crate::components::tool_display::append_annotation;
-use crate::components::{DisplayMessage, DisplayRole, DisplaySource, ToolRole, ToolStatus};
+use crate::components::{
+    DisplayMessage, DisplayRole, DisplaySource, ToolRole, ToolStatus, workflow_card,
+};
 use crate::markdown::truncate_output;
 
 use crate::selection::Selection;
 use caudra_agent::permissions::PermissionRequest;
-use caudra_agent::tools::{FILE_WRITE_TOOL_NAME, ToolEffect, ToolInvocation, ToolRegistry};
-use caudra_agent::types::QuestionEvent;
+use caudra_agent::tools::{
+    FILE_WRITE_TOOL_NAME, ToolEffect, ToolInvocation, ToolRegistry, WORKFLOW_TOOL_NAME,
+};
+use caudra_agent::types::{QuestionEvent, WorkflowRunCard};
 use caudra_agent::{
     AgentEvent, BatchToolEntry, BufferSnapshot, COMPACTION_ANCHOR, Mention, SubagentProgress,
     ToolDoneEvent, ToolOutput, ToolStartEvent,
@@ -24,6 +28,7 @@ use caudra_config::{ToolOutputLines, UiConfig};
 use caudra_lua::WinView;
 use caudra_providers::{CaudraId, HistoryItem, HistoryItemKind, UserOrigin};
 use caudra_storage::view::ViewMode;
+use caudra_workflow::RunSnapshot;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Color;
@@ -643,6 +648,34 @@ impl Chat {
 
     pub fn shell_tool_done(&mut self, event: ToolDoneEvent) {
         self.messages_panel.tool_done(event);
+    }
+
+    /// Draws the card of a run a slash command launched. Transient like a
+    /// `!` shell block: the runtime keeps the run, the transcript keeps the
+    /// conversation.
+    pub fn workflow_card_start(&mut self, run: &RunSnapshot) {
+        let card = WorkflowRunCard::from(run);
+        self.messages_panel.tool_start(ToolStartEvent {
+            id: workflow_card::card_id(&run.run_id),
+            tool: WORKFLOW_TOOL_NAME.into(),
+            effect: ToolEffect::Orchestrator,
+            summary: workflow_card::summary(&card),
+            render_header: None,
+            annotation: Some(workflow_card::annotation(&card)),
+            input: None,
+            raw_input: None,
+            output: Some(ToolOutput::WorkflowRun(Box::new(card))),
+        });
+    }
+
+    pub fn workflow_card_update(&mut self, run: &RunSnapshot) -> bool {
+        self.messages_panel.workflow_card_update(run)
+    }
+
+    /// The run whose card a click at `row` landed on.
+    pub fn workflow_run_at(&self, row: u16, area: Rect) -> Option<String> {
+        let tool_id = self.messages_panel.tool_id_at(row, area)?;
+        self.messages_panel.workflow_run_for(tool_id)
     }
 
     #[cfg(test)]

@@ -6,7 +6,7 @@ use crate::markdown::{expand_notice, should_truncate, text_to_painted, truncatio
 use crate::theme;
 
 use super::tool_display::{batch_sigil_style, compact_args_for, compact_sigil_label, header_spans};
-use super::{ToolProgress, is_collapsible};
+use super::{ToolProgress, is_collapsible, workflow_card};
 use caudra_agent::diff::{DiffHunk, DiffLine, DiffSpan, compute_hunks};
 use caudra_agent::types::Answer;
 use caudra_agent::types::{TodoItem, TodoStatus};
@@ -1483,6 +1483,7 @@ pub fn render_tool_content(
         }
         Some(ToolOutput::TodoList(items)) => (render_todos(items), false),
         Some(ToolOutput::Answers(answers)) => (render_answers(answers), false),
+        Some(ToolOutput::WorkflowRun(card)) => (workflow_card::render(card), false),
         // Each child owns how much of itself it shows, so the card reports no
         // truncation of its own: there is no one thing for it to open.
         Some(ToolOutput::Batch { entries, .. }) if !entries.is_empty() => {

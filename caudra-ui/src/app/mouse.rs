@@ -141,11 +141,11 @@ impl App {
             ) {
                 return actions;
             }
-        } else if self.workflow_picker.is_open() {
+        } else if self.workflow_inspector.is_open() {
             if let Some(actions) = self.route_overlay_mouse(
                 event,
-                |app, event| app.workflow_picker.handle_mouse(event),
-                |app, action| app.handle_workflow_picker_action(action),
+                |app, event| app.workflow_inspector.handle_mouse(event),
+                |app, action| app.handle_workflow_inspector_action(action),
             ) {
                 return actions;
             }
@@ -509,6 +509,12 @@ impl App {
                         }
                         if zone == SelectionZone::Messages {
                             let area = self.msg_area();
+                            if self.active_chat == 0
+                                && let Some(run_id) = self.chats[0].workflow_run_at(event.row, area)
+                            {
+                                self.open_workflow_inspector(Some(&run_id));
+                                return Vec::new();
+                            }
                             if self.active_chat == 0
                                 && let Some(task_id) = self.task_id_at(event.row, area)
                                 && self.focus_task(&task_id).is_ok()
@@ -947,7 +953,7 @@ impl App {
         dismiss!(self.permissions_picker);
         dismiss!(self.stash_picker);
         dismiss!(self.memory_picker);
-        dismiss!(self.workflow_picker);
+        dismiss!(self.workflow_inspector);
         dismiss!(self.workflow_catalog_picker);
         dismiss!(self.task_picker, {
             let action = self.task_picker.cancel();

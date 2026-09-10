@@ -18,7 +18,7 @@ use super::{
     DisplayMessage, DisplayRole, DisplaySource, ToolProgress, ToolRole, ToolStatus,
     apply_scroll_delta,
     code_view::{BatchProgressMap, BatchViewMap, Disclosure, RowTarget},
-    review,
+    review, workflow_card,
 };
 use crate::animation::spinner_str;
 use crate::components::keybindings::key;
@@ -32,8 +32,10 @@ use crate::selection::Selection;
 use crate::splash::{ColorTransition, Splash};
 use crate::theme;
 use crate::update;
+use caudra_agent::types::WorkflowRunCard;
 use caudra_config::{ClockFormat, ToolOutputLines, UiConfig};
 use caudra_markdown::render::SpanSource;
+use caudra_workflow::RunSnapshot;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::mem;
@@ -1315,6 +1317,47 @@ impl MessagesPanel {
             self.settle_child_progress(tool_id, index);
         }
         self.rebuild_tool_segment(tool_id);
+    }
+
+    /// Brings the card of `run` up to its latest state, whether a slash
+    /// command opened the card under the run's own id or the `workflow` tool
+    /// drew it under the call's. `false` when the transcript has no card for
+    /// the run.
+    pub fn workflow_card_update(&mut self, run: &RunSnapshot) -> bool {
+        let card = WorkflowRunCard::from(run);
+        let slash_id = workflow_card::card_id(&run.run_id);
+        let Some(msg) = self.messages.iter_mut().rfind(|msg| match &msg.role {
+            DisplayRole::Tool(tool) => {
+                tool.id == slash_id
+                    || matches!(
+                        msg.tool_output.as_deref(),
+                        Some(ToolOutput::WorkflowRun(existing)) if existing.run_id == run.run_id
+                    )
+            }
+            _ => false,
+        }) else {
+            return false;
+        };
+        let DisplayRole::Tool(tool) = &mut msg.role else {
+            return false;
+        };
+        tool.status = workflow_card::status(run.status);
+        let tool_id = tool.id.clone();
+        msg.annotation = Some(workflow_card::annotation(&card));
+        msg.tool_output = Some(Arc::new(ToolOutput::WorkflowRun(Box::new(card))));
+        self.rebuild_tool_segment(&tool_id);
+        true
+    }
+
+    /// The run whose card carries `tool_id`, when it is a workflow card.
+    pub fn workflow_run_for(&self, tool_id: &str) -> Option<String> {
+        self.messages
+            .iter()
+            .rfind(|msg| matches!(&msg.role, DisplayRole::Tool(tool) if tool.id == tool_id))
+            .and_then(|msg| match msg.tool_output.as_deref() {
+                Some(ToolOutput::WorkflowRun(card)) => Some(card.run_id.clone()),
+                _ => None,
+            })
     }
 
     /// A dispatched batch child reporting in. Its id is the batch's own with

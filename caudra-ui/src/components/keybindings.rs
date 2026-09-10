@@ -4,7 +4,7 @@ use std::fmt::Write;
 use strum::EnumIter;
 use unicode_width::UnicodeWidthStr;
 
-use crate::components::workflow_picker;
+use crate::components::workflow_inspector;
 
 /// Spelled once because three tables quote it.
 const SHIFT_TAB_LABEL: &str = "Shift+Tab";
@@ -249,6 +249,7 @@ pub mod leader {
     pub const PLAN_TOGGLE: Bind = leader_bind!('t');
     pub const VIEW_TOGGLE: Bind = leader_bind!('v');
     pub const WORKBENCH: Bind = leader_bind!('w');
+    pub const WORKFLOWS: Bind = leader_bind!('k');
     pub const INTERRUPT_PROMPT: Bind = leader_bind!('x');
     pub const COPY_MESSAGE: Bind = leader_bind!('y');
     pub const HELP: Bind = leader_bind!('?');
@@ -295,7 +296,7 @@ pub enum KeybindContext {
     FilePicker,
     StashPicker,
     SessionPicker,
-    WorkflowPicker,
+    WorkflowInspector,
     WorkflowCatalogPicker,
     Workbench,
     WorkbenchExplorer,
@@ -324,7 +325,7 @@ impl KeybindContext {
             Self::FilePicker => "File Picker",
             Self::StashPicker => "Stash Picker",
             Self::SessionPicker => "Session Picker",
-            Self::WorkflowPicker => "Workflow Runs",
+            Self::WorkflowInspector => "Workflow Inspector",
             Self::WorkflowCatalogPicker => "Workflow Catalog",
             Self::Workbench => "Workbench",
             Self::WorkbenchExplorer => "Workbench Explorer",
@@ -345,7 +346,7 @@ impl KeybindContext {
             | Self::FilePicker
             | Self::StashPicker
             | Self::SessionPicker
-            | Self::WorkflowPicker
+            | Self::WorkflowInspector
             | Self::WorkflowCatalogPicker => Some(Self::Picker),
             Self::WorkbenchExplorer
             | Self::WorkbenchEditor
@@ -528,6 +529,12 @@ pub const KEYBINDS: &[Keybind] = &[
     Keybind {
         label: KeyLabel::Single(leader::TASKS.label),
         description: "Open tasks",
+        context: KeybindContext::General,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(leader::WORKFLOWS.label),
+        description: "Open the workflow inspector",
         context: KeybindContext::General,
         platform: Platform::All,
     },
@@ -1000,27 +1007,57 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::All,
     },
     Keybind {
-        label: KeyLabel::Single(workflow_picker::PAUSE_LABEL),
+        label: KeyLabel::Single(workflow_inspector::PAUSE_LABEL),
         description: "Pause the selected run",
-        context: KeybindContext::WorkflowPicker,
+        context: KeybindContext::WorkflowInspector,
         platform: Platform::All,
     },
     Keybind {
-        label: KeyLabel::Single(workflow_picker::RESUME_LABEL),
+        label: KeyLabel::Single(workflow_inspector::RESUME_LABEL),
         description: "Resume the selected run",
-        context: KeybindContext::WorkflowPicker,
+        context: KeybindContext::WorkflowInspector,
         platform: Platform::All,
     },
     Keybind {
-        label: KeyLabel::Single(workflow_picker::STOP_LABEL),
+        label: KeyLabel::Single(workflow_inspector::STOP_LABEL),
         description: "Stop the selected run",
-        context: KeybindContext::WorkflowPicker,
+        context: KeybindContext::WorkflowInspector,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Alt("Tab", SHIFT_TAB_LABEL),
+        description: "Next or previous section",
+        context: KeybindContext::WorkflowInspector,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single("1-6"),
+        description: "Jump to a section",
+        context: KeybindContext::WorkflowInspector,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Alt("Left", "Right"),
+        description: "Focus the run list or the section",
+        context: KeybindContext::WorkflowInspector,
         platform: Platform::All,
     },
     Keybind {
         label: KeyLabel::Single("Enter"),
-        description: "Open the selected agent's transcript",
-        context: KeybindContext::WorkflowPicker,
+        description: "Open the selected agent's transcript, or expand a call",
+        context: KeybindContext::WorkflowInspector,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(workflow_inspector::COPY_LABEL),
+        description: "Copy the visible section",
+        context: KeybindContext::WorkflowInspector,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(workflow_inspector::FILTER_LABEL),
+        description: "Filter the run list",
+        context: KeybindContext::WorkflowInspector,
         platform: Platform::All,
     },
     Keybind {

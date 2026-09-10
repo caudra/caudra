@@ -49,8 +49,9 @@ pub(crate) mod tools_modal;
 pub(crate) mod usage_modal;
 pub(crate) mod which_key;
 pub(crate) mod workbench;
+pub(crate) mod workflow_card;
 pub(crate) mod workflow_catalog_picker;
-pub(crate) mod workflow_picker;
+pub(crate) mod workflow_inspector;
 
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -195,20 +196,20 @@ pub(crate) fn hint_hits<K: AsRef<str>, V: AsRef<str>>(
 /// Where each logical line starts once wrapping has been applied, so a hit
 /// rect can be placed on a line the reader sees rather than the one it was
 /// written as.
-struct VisualRows {
+pub(crate) struct VisualRows {
     starts: Vec<u16>,
-    total: u16,
+    pub(crate) total: u16,
 }
 
 impl VisualRows {
-    fn row_of(&self, line: u16) -> u16 {
+    pub(crate) fn row_of(&self, line: u16) -> u16 {
         self.starts
             .get(line as usize)
             .copied()
             .unwrap_or(self.total)
     }
 
-    fn height_of(&self, line: u16) -> u16 {
+    pub(crate) fn height_of(&self, line: u16) -> u16 {
         self.row_of(line + 1).saturating_sub(self.row_of(line))
     }
 }
@@ -256,7 +257,7 @@ pub(crate) fn hanging_lines(
 
 /// Measured with the same widget that draws them, so the two can never
 /// disagree about where a wrap falls.
-fn visual_rows(lines: &[Line<'static>], width: u16) -> VisualRows {
+pub(crate) fn visual_rows(lines: &[Line<'static>], width: u16) -> VisualRows {
     let width = width.max(1);
     let mut starts = Vec::with_capacity(lines.len());
     let mut total = 0;
@@ -343,6 +344,38 @@ pub(crate) fn format_integer(value: u64) -> String {
 
 pub(crate) fn format_usize(value: usize) -> String {
     format_integer(u64::try_from(value).unwrap_or(u64::MAX))
+}
+
+/// `41k`, `1.2M`: a count at the width a chip or a card row can spare.
+pub(crate) fn format_compact(value: u64) -> String {
+    const THOUSAND: u64 = 1_000;
+    const MILLION: u64 = 1_000_000;
+    if value >= MILLION {
+        format!("{:.1}M", value as f64 / MILLION as f64)
+    } else if value >= THOUSAND {
+        format!("{}k", value / THOUSAND)
+    } else {
+        value.to_string()
+    }
+}
+
+/// `2m14s`, `1h03m`, `41s`: a span of seconds as a run card reads it.
+pub(crate) fn format_elapsed(seconds: u64) -> String {
+    const MINUTE: u64 = 60;
+    const HOUR: u64 = 3_600;
+    if seconds >= HOUR {
+        format!("{}h{:02}m", seconds / HOUR, seconds % HOUR / MINUTE)
+    } else if seconds >= MINUTE {
+        format!("{}m{:02}s", seconds / MINUTE, seconds % MINUTE)
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+pub(crate) fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
 }
 
 pub(crate) fn escape_terminal_controls(text: &str) -> String {

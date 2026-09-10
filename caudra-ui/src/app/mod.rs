@@ -77,7 +77,7 @@ use crate::components::usage_modal::{UsageFetchState, UsageModal, UsageScope};
 use crate::components::which_key::WhichKey;
 use crate::components::workbench::styles as workbench_styles;
 use crate::components::workflow_catalog_picker::WorkflowCatalogPicker;
-use crate::components::workflow_picker::WorkflowPicker;
+use crate::components::workflow_inspector::WorkflowInspector;
 use crate::components::{
     Action, DisplayMessage, DisplayRole, DisplaySource, ExitRequest, Overlay, RetryInfo, Status,
     is_ctrl,
@@ -316,7 +316,7 @@ pub struct App {
     permission_config_trust_deferred: bool,
     pub(super) memory_picker: MemoryPicker,
     pub(super) task_picker: TaskPicker,
-    pub(super) workflow_picker: WorkflowPicker,
+    pub(super) workflow_inspector: WorkflowInspector,
     pub(super) workflow_catalog_picker: WorkflowCatalogPicker,
     pub(crate) workflow: workflow::WorkflowUi,
     pub(super) question_form: QuestionForm,
@@ -527,7 +527,7 @@ impl App {
             permission_config_trust_deferred: false,
             memory_picker: MemoryPicker::new(),
             task_picker: TaskPicker::new(),
-            workflow_picker: WorkflowPicker::new(),
+            workflow_inspector: WorkflowInspector::new(),
             workflow_catalog_picker: WorkflowCatalogPicker::new(),
             workflow: workflow::WorkflowUi::new(),
             question_form: QuestionForm::new(),
@@ -1142,7 +1142,13 @@ impl App {
         try_picker!(self.permissions_picker);
         try_picker!(self.stash_picker);
         try_picker!(self.memory_picker);
-        try_picker!(self.workflow_picker);
+        // Not `try_picker!`: the wheel walks the run list or scrolls the
+        // section depending on which pane it is over.
+        if self.workflow_inspector.is_open() {
+            let action = self.workflow_inspector.scroll_at(pos, delta);
+            self.handle_workflow_inspector_action(action);
+            return None;
+        }
         try_picker!(self.workflow_catalog_picker);
         // Not `try_picker!`: scrolling the task list previews the task behind
         // the float, and only the app can carry that out.
@@ -1552,9 +1558,9 @@ impl App {
             let action = self.memory_picker.handle_key(key);
             return Some(self.handle_memory_picker_action(action));
         }
-        if self.workflow_picker.is_open() {
-            let action = self.workflow_picker.handle_key(key);
-            return Some(self.handle_workflow_picker_action(action));
+        if self.workflow_inspector.is_open() {
+            let action = self.workflow_inspector.handle_key(key);
+            return Some(self.handle_workflow_inspector_action(action));
         }
         if self.workflow_catalog_picker.is_open() {
             let action = self.workflow_catalog_picker.handle_key(key);
@@ -2200,6 +2206,9 @@ impl App {
 
         if leader::TASKS.matches(key) {
             return self.tasks_browse();
+        }
+        if leader::WORKFLOWS.matches(key) {
+            return self.execute_workflow("");
         }
         if leader::SESSION_PICKER.matches(key) {
             return self.sessions_browse();
@@ -3908,7 +3917,7 @@ impl App {
             &self.stash_picker,
             &self.memory_picker,
             &self.task_picker,
-            &self.workflow_picker,
+            &self.workflow_inspector,
             &self.workflow_catalog_picker,
             &self.question_form,
             &self.session_picker,
@@ -3946,7 +3955,7 @@ impl App {
             &mut self.stash_picker,
             &mut self.memory_picker,
             &mut self.task_picker,
-            &mut self.workflow_picker,
+            &mut self.workflow_inspector,
             &mut self.workflow_catalog_picker,
             &mut self.question_form,
             &mut self.session_picker,
@@ -4354,7 +4363,10 @@ impl App {
         try_picker!(self.stash_picker);
         try_picker!(self.memory_picker);
         try_picker!(self.task_picker);
-        try_picker!(self.workflow_picker);
+        if let Some(action) = self.workflow_inspector.handle_paste(text) {
+            self.handle_workflow_inspector_action(action);
+            return;
+        }
         try_picker!(self.workflow_catalog_picker);
         try_picker!(self.session_picker);
         try_picker!(self.question_form);

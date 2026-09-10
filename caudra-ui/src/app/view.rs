@@ -440,7 +440,7 @@ impl App {
         render_if_open!(self.stash_picker);
         render_if_open!(self.memory_picker);
         render_if_open!(self.task_picker);
-        render_if_open!(self.workflow_picker);
+        render_if_open!(self.workflow_inspector);
         render_if_open!(self.workflow_catalog_picker);
         render_if_open!(self.session_picker);
 
@@ -584,10 +584,7 @@ impl App {
             retry_info: self.retry_info.as_ref(),
             thinking,
             fast: self.state.fast,
-            workflows: {
-                let (active, waiting) = self.workflow_counts();
-                workflow_chip(active, waiting)
-            },
+            workflows: workflow_chip(self.workflow.runs()),
             yolo: self.permissions.is_yolo(),
             restoring: self.restoring.load(Ordering::Relaxed),
             snapshotting: self.is_snapshotting(),
