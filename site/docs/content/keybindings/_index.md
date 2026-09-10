@@ -33,6 +33,7 @@ Typing anything takes the focus back, and so does `Esc`. Clicking the transcript
 | `Ctrl+O` / `Ctrl+X o` | Open plan in editor |
 | `Ctrl+X t` | Toggle plan / todo panel |
 | `Ctrl+X a` | Open tasks |
+| `Ctrl+X k` | Open the workflow inspector |
 | `Ctrl+X l` | Browse sessions |
 | `Ctrl+X n` | Start a new session |
 | `Ctrl+X v` | Toggle compact / expanded transcript |
@@ -152,10 +153,15 @@ Some pickers add extra bindings on top of the defaults:
 | Session Picker | `Ctrl+G` | Name session with a small model |
 | Session Picker | `Ctrl+D` | Delete session (press twice) |
 | Stash Picker | `Ctrl+D` | Delete stash entry (press twice) |
-| Workflow Runs | `p` | Pause the selected run |
-| Workflow Runs | `r` | Resume the selected run |
-| Workflow Runs | `x` | Stop the selected run |
-| Workflow Runs | `Enter` | Open the selected agent's transcript |
+| Workflow Inspector | `p` | Pause the selected run |
+| Workflow Inspector | `r` | Resume the selected run |
+| Workflow Inspector | `s` | Stop the selected run |
+| Workflow Inspector | `Tab` / `Shift+Tab` | Next or previous section |
+| Workflow Inspector | `1-6` | Jump to a section |
+| Workflow Inspector | `Left` / `Right` | Focus the run list or the section |
+| Workflow Inspector | `Enter` | Open the selected agent's transcript, or expand a call |
+| Workflow Inspector | `y` | Copy the visible section |
+| Workflow Inspector | `/` | Filter the run list |
 | Workflow Catalog | `Enter` | Launch a trusted workflow, or trust an untrusted one |
 | Workbench Explorer | `Ctrl+X h` | Show hidden files |
 | Workbench Explorer | `C` | Fold the tree back to its top level |
@@ -186,7 +192,7 @@ Some pickers add extra bindings on top of the defaults:
 
 Child contexts inherit their parent's bindings and add their own.
 
-- **Pickers** is the base for: Rewind Picker, Theme Picker, Model Picker, Queue, Commands, Search, File Picker, Stash Picker, Session Picker, Workflow Runs, Workflow Catalog
+- **Pickers** is the base for: Rewind Picker, Theme Picker, Model Picker, Queue, Commands, Search, File Picker, Stash Picker, Session Picker, Workflow Inspector, Workflow Catalog
 - **Workbench** is the base for: Workbench Explorer, Workbench Editor, Workbench Source Control, Workbench Search
 
 ## Overriding Keybindings

@@ -269,7 +269,8 @@ Run durable, multi-agent workflows: scripted plans that launch subagents in phas
 | `name` | string | no | Workflow name, for validate and start. |
 | `args` | string | no | Object the script receives as `args` on start. |
 | `agent_budget` | integer | no | Most agents the run may launch, for start and resume. |
-| `run_id` | string | no | Run id, for status, pause, resume, and stop. |
+| `run_id` | string | no | Run id, for status, inspect, pause, resume, and stop. |
+| `limit` | integer | no | Most runs a history answer lists. |
 
 ### `todo_write` {#todo_write}
 

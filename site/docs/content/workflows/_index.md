@@ -30,22 +30,42 @@ Plain text after the name becomes `args.query` and `args.objective`. A JSON obje
 
 The model can launch workflows too, through the `workflow` tool, when the session has a runtime. It sees the same catalog you do and the same trust rules. See [Tools](/docs/tools/#workflow) for the tool contract.
 
-## Watch and control
+## Watching a run
 
-`/workflow` (or `/workflow runs`) opens the run list: display name, status, current phase, agents admitted against the budget, and elapsed time. The detail pane shows the objective, the agent roster with token counts, recent log lines, and the result, pause message, or error. Inside the list:
+A launch draws a card in the transcript, whether you typed the command or the model called the `workflow` tool. The header names the run and reads its status, phase, agents admitted against the budget, and tokens spent. Below it sits the phase strip, the agents working right now, and the last three log lines. When the run settles the log lines give way to the report, the scratch file path, and any error. The card of a slash launch is not saved with the session. A card the tool drew is part of the tool result and comes back on restore, brought up to date from the runtime.
+
+The status bar keeps a chip while any run is going. One active run shows as `[wf: deep-research · Research 2/4]`, with its phase and where that phase sits among the ones the script declared. Several runs, or runs parked waiting on someone, show as `[wf:2+1 · Research]` with the newest run's phase. A narrow bar drops the phase before it drops the chip. Click the chip to open the inspector.
+
+Workflow agents are ordinary subagents. They ask for permission through the normal prompts, respect the current permission mode as a ceiling, share `task_max_concurrent` with `task` calls, and open in the same transcript viewer. They do not appear as task cards in the main transcript.
+
+Pressing Esc cancels the main turn and leaves workflow runs alone. Stop them from the inspector.
+
+## The inspector
+
+`/workflow` (or `/workflow runs`, or the leader key followed by `k`) opens the inspector. Clicking a run card or the status bar chip opens it on that run. The left pane lists runs grouped as running, waiting, finished, and earlier sessions. Type `/` to filter by name or session title. The right pane has six sections, reached with Tab, Shift+Tab, or the digits `1` to `6`:
+
+| Section | Contents |
+|---------|----------|
+| Overview | Status, phase, elapsed time, agents, tokens, objective, the phase strip, and the last log lines |
+| Phases | Every phase the run entered with its start offset and duration |
+| Agents | The roster with state, phase, tokens, and duration. Enter opens the agent's transcript |
+| Calls | The journal: each `agent`, `parallel`, and `write_scratch_file` call with its state and timing. Enter expands a call's result preview or error |
+| Logs | The stored timeline of phase changes and `log` lines, following the tail |
+| Result | The report or result JSON, the scratch file path, and the pause message or error |
 
 | Key | Action |
 |-----|--------|
 | `p` | Pause the selected active run |
 | `r` | Resume a paused, failed, or cancelled run |
-| `x` | Stop the run |
-| Enter | Open the selected agent's transcript |
+| `s` | Stop the run |
+| Left / Right | Move focus between the run list and the section |
+| Up / Down | Walk the list, the section rows, or scroll the section text |
+| `y` | Copy the visible section as text |
+| Esc | Close |
+
+Runs of earlier sessions can be read but not controlled. Resume one from the session that launched it.
 
 The same controls exist as text: `/workflow pause <name>`, `/workflow resume <name>`, `/workflow stop <name>`. Launch the same workflow twice and the second run is `deep-research-2`.
-
-Workflow agents are ordinary subagents. They ask for permission through the normal prompts, respect the current permission mode as a ceiling, share `task_max_concurrent` with `task` calls, and open in the same transcript viewer. They do not appear as task cards in the main transcript.
-
-Pressing Esc cancels the main turn and leaves workflow runs alone. Stop them from the run list.
 
 ## Where definitions live
 
@@ -125,7 +145,9 @@ Run statuses: `active`, `paused`, `budget_limited`, `interrupted`, `completed`, 
 
 `write_scratch_file` writes below the state directory under `workflow_scratch/<session>/<run>/`. Names are single path components. Each run may write 64 files, 1 MiB each, 16 MiB in total. Scratch files count toward the session's storage and are removed with it.
 
-Runs and their journals live in the session database and are deleted with the session. Trimming a session drops the journals and marks unfinished runs `interrupted`. A fork does not copy running workflows.
+Runs and their journals live in the session database and are deleted with the session. Each run also keeps a timeline of its phase changes and `log` lines, up to 512 rows, the oldest log lines going first. The inspector reads it, and so does the `workflow` tool's `inspect` action. Trimming a session drops the journals and timelines and marks unfinished runs `interrupted`. A fork does not copy running workflows.
+
+Runs of earlier sessions in the same state directory stay readable. The inspector lists the twenty most recent under "Earlier sessions", and the `workflow` tool's `history` action returns up to fifty with the session that ran each one.
 
 ## Limits
 

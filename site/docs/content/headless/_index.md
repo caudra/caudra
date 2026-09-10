@@ -121,6 +121,8 @@ A workflow control is a `control_request` whose `subtype` is one of the advertis
 | `workflow_validate` | `name` | `validation`: `ok` and a `report` |
 | `workflow_start` | `name`, `args` (object, default `{}`), `agent_budget` | `started`: the new run |
 | `workflow_status` | `run_id` (optional) | `runs` for every run, `run` for one |
+| `workflow_inspect` | `run_id` | `detail`: the `run`, its journal as `calls`, its timeline as `events`, and `journal_trimmed` |
+| `workflow_history` | `limit` (optional, default 20) | `history`: runs of other sessions, newest first, each with `session_id` and `session_title` |
 | `workflow_pause` | `run_id` | `run`, once its agents have stopped |
 | `workflow_resume` | `run_id`, `agent_budget` (optional) | `run` |
 | `workflow_stop` | `run_id` | `run`, once its agents have stopped |
@@ -156,9 +158,13 @@ Every change to a run arrives as a `system` message with subtype `workflow`. `ev
 
 ```json
 {"type":"system","subtype":"workflow",
- "event":{"kind":"snapshot","run_id":"run-1","status":"active","phase":"gather","revision":3,...},
+ "event":{"kind":"snapshot","run_id":"run-1","status":"active","phase":"gather","revision":3,
+          "phase_history":[{"title":"gather","started_at":1730000000}],
+          "logs":[{"at":1730000012,"message":"3 sources found"}],...},
  "workflow_run_id":"run-1","workflow_epoch":1,"workflow_call_key":0,"workflow_phase":"gather"}
 ```
+
+A snapshot carries `phase_history`, every phase the run entered with its start time in seconds since the epoch, and `logs`, the last 200 lines with the same stamp. A `log` event carries one line with `at`, `message`, and the `revision` it belongs to. `workflow_inspect` returns the stored timeline in full as `events`, each with a `seq`, `at`, `kind` of `phase` or `log`, and `text`.
 
 Agents a workflow launches stream as subagents. Their `assistant` and `user` messages carry the same `workflow_*` keys beside `parent_tool_use_id`, so a client can group them by run.
 
