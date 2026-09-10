@@ -1375,9 +1375,10 @@ pub type BatchViewMap = HashMap<String, BatchViews>;
 /// The child reports of every batch that has any, by parent tool id.
 pub type BatchProgressMap = HashMap<String, ChildProgress>;
 
-/// The batch child a body line belongs to, by its roster index, so a click can
-/// name a row after the async highlight has replaced the spans under it. A
-/// child is folded or whole, so its summary row and its body are one control.
+/// What a body line belongs to, so a click can name a row after the async
+/// highlight has replaced the spans under it: a batch child by its roster
+/// index, or the scratch file line of a workflow card. A child is folded or
+/// whole, so its summary row and its body are one control.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct RowTarget(pub usize);
 
@@ -1483,7 +1484,11 @@ pub fn render_tool_content(
         }
         Some(ToolOutput::TodoList(items)) => (render_todos(items), false),
         Some(ToolOutput::Answers(answers)) => (render_answers(answers), false),
-        Some(ToolOutput::WorkflowRun(card)) => (workflow_card::render(card), false),
+        Some(ToolOutput::WorkflowRun(card)) => {
+            let (card_lines, rows) = workflow_card::render(card);
+            output_rows = rows;
+            (card_lines, false)
+        }
         // Each child owns how much of itself it shows, so the card reports no
         // truncation of its own: there is no one thing for it to open.
         Some(ToolOutput::Batch { entries, .. }) if !entries.is_empty() => {

@@ -22,6 +22,7 @@ pub(crate) mod view;
 pub(crate) mod workflow;
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -2061,10 +2062,19 @@ impl App {
     /// The stored layout is skipped: the reader asked for one file, and opening
     /// a session's worth of tabs around it would bury the answer.
     pub(crate) fn open_workbench_at(&mut self, mention: &Mention) {
+        self.open_workbench_file(&mention.path, mention.lines.clone());
+    }
+
+    /// A file Caudra named itself, such as a workflow's scratch file, opened
+    /// the way a mention is.
+    pub(crate) fn open_workbench_file(
+        &mut self,
+        path: &Path,
+        lines: Option<RangeInclusive<usize>>,
+    ) {
         self.sync_workbench_theme();
         let cwd = PathBuf::from(&self.state.session.cwd);
-        self.workbench
-            .open_at(&cwd, &mention.path, mention.lines.clone());
+        self.workbench.open_at(&cwd, path, lines);
     }
 
     /// The workbench paints from a palette resolved once, so a theme change

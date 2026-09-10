@@ -9,6 +9,7 @@ use std::time::Duration;
 use crate::app::tasks::{TaskOutcome, TaskStatus};
 use crate::components::messages::{MessagesPanel, PromptProgress};
 use crate::components::tool_display::append_annotation;
+use crate::components::workflow_card::CardHit;
 use crate::components::{
     DisplayMessage, DisplayRole, DisplaySource, ToolRole, ToolStatus, workflow_card,
 };
@@ -672,10 +673,9 @@ impl Chat {
         self.messages_panel.workflow_card_update(run)
     }
 
-    /// The run whose card a click at `row` landed on.
-    pub fn workflow_run_at(&self, row: u16, area: Rect) -> Option<String> {
-        let tool_id = self.messages_panel.tool_id_at(row, area)?;
-        self.messages_panel.workflow_run_for(tool_id)
+    /// The run, or the scratch file, whose card a click at `row` landed on.
+    pub(crate) fn workflow_hit_at(&self, row: u16, area: Rect) -> Option<CardHit> {
+        self.messages_panel.workflow_hit_at(row, area)
     }
 
     #[cfg(test)]

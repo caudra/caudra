@@ -38,7 +38,6 @@ const BUDGET_FLAG: &str = "--agent-budget";
 const QUERY_ARG: &str = "query";
 const OBJECTIVE_ARG: &str = "objective";
 const REPORT_FIELD: &str = "report";
-const PATH_FIELD: &str = "path";
 const REPORT_LABEL: &str = "\nReport: ";
 const RESULT_LABEL: &str = "\nResult: ";
 const SCRATCH_LABEL: &str = "\nScratch file: ";
@@ -343,6 +342,10 @@ impl App {
                 self.workflow_inspector.close();
                 self.preview_task(&task_id);
             }
+            InspectorAction::OpenFile(path) => {
+                self.workflow_inspector.close();
+                self.open_workbench_file(&path, None);
+            }
             InspectorAction::Copy { text, label } => {
                 self.handle_logs_action(LogsAction::Copy { text, label });
             }
@@ -565,10 +568,10 @@ pub(crate) fn completion_notice(run: &RunSnapshot) -> String {
                 text.push_str(&bounded(&result.to_string()));
             }
         }
-        if let Some(path) = result.get(PATH_FIELD).and_then(Value::as_str) {
-            text.push_str(SCRATCH_LABEL);
-            text.push_str(path);
-        }
+    }
+    if let Some(path) = run.scratch_path() {
+        text.push_str(SCRATCH_LABEL);
+        text.push_str(path);
     }
     if let Some(message) = &run.pause_message {
         text.push_str(PAUSED_LABEL);

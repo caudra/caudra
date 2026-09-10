@@ -18,6 +18,8 @@ pub const MAX_PHASE_HISTORY: usize = 64;
 /// How much of a call's result or error an inspection quotes.
 pub const MAX_CALL_PREVIEW_BYTES: usize = 512;
 const CALL_PREVIEW_MARKER: &str = "…";
+/// The result field a script fills with the scratch file it wrote.
+const RESULT_PATH_FIELD: &str = "path";
 
 macro_rules! text_enum {
     ($name:ident { $($variant:ident = $text:literal),+ $(,)? }) => {
@@ -276,6 +278,11 @@ impl RunSnapshot {
         let phase = self.phase.as_deref()?;
         let index = self.phases.iter().position(|title| title == phase)?;
         Some((index + 1, self.phases.len()))
+    }
+
+    /// The scratch file the run's result names, once it has one.
+    pub fn scratch_path(&self) -> Option<&str> {
+        self.result.as_ref()?.get(RESULT_PATH_FIELD)?.as_str()
     }
 }
 

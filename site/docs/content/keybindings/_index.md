@@ -159,7 +159,7 @@ Some pickers add extra bindings on top of the defaults:
 | Workflow Inspector | `Tab` / `Shift+Tab` | Next or previous section |
 | Workflow Inspector | `1-6` | Jump to a section |
 | Workflow Inspector | `Left` / `Right` | Focus the run list or the section |
-| Workflow Inspector | `Enter` | Open the selected agent's transcript, or expand a call |
+| Workflow Inspector | `Enter` | Open the selected agent's transcript, a scratch file, or expand a call |
 | Workflow Inspector | `y` | Copy the visible section |
 | Workflow Inspector | `/` | Filter the run list |
 | Workflow Catalog | `Enter` | Launch a trusted workflow, or trust an untrusted one |

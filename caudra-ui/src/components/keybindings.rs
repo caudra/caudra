@@ -1044,7 +1044,7 @@ pub const KEYBINDS: &[Keybind] = &[
     },
     Keybind {
         label: KeyLabel::Single("Enter"),
-        description: "Open the selected agent's transcript, or expand a call",
+        description: "Open the selected agent's transcript, a scratch file, or expand a call",
         context: KeybindContext::WorkflowInspector,
         platform: Platform::All,
     },

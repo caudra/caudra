@@ -32,7 +32,7 @@ The model can launch workflows too, through the `workflow` tool, when the sessio
 
 ## Watching a run
 
-A launch draws a card in the transcript, whether you typed the command or the model called the `workflow` tool. The header names the run and reads its status, phase, agents admitted against the budget, and tokens spent. Below it sits the phase strip, the agents working right now, and the last three log lines. When the run settles the log lines give way to the report, the scratch file path, and any error. The card of a slash launch is not saved with the session. A card the tool drew is part of the tool result and comes back on restore, brought up to date from the runtime.
+A launch draws a card in the transcript, whether you typed the command or the model called the `workflow` tool. The header names the run and reads its status, phase, agents admitted against the budget, and tokens spent. Below it sits the phase strip, the agents working right now, and the last three log lines. When the run settles the log lines give way to the report, the scratch file path, and any error. Click the scratch file path to open it in the [workbench](/docs/workbench/). Click anywhere else on the card to open the inspector on that run. The card of a slash launch is not saved with the session. A card the tool drew is part of the tool result and comes back on restore, brought up to date from the runtime.
 
 The status bar keeps a chip while any run is going. One active run shows as `[wf: deep-research · Research 2/4]`, with its phase and where that phase sits among the ones the script declared. Several runs, or runs parked waiting on someone, show as `[wf:2+1 · Research]` with the newest run's phase. A narrow bar drops the phase before it drops the chip. Click the chip to open the inspector.
 
@@ -49,9 +49,9 @@ Pressing Esc cancels the main turn and leaves workflow runs alone. Stop them fro
 | Overview | Status, phase, elapsed time, agents, tokens, objective, the phase strip, and the last log lines |
 | Phases | Every phase the run entered with its start offset and duration |
 | Agents | The roster with state, phase, tokens, and duration. Enter opens the agent's transcript |
-| Calls | The journal: each `agent`, `parallel`, and `write_scratch_file` call with its state and timing. Enter expands a call's result preview or error |
+| Calls | The journal: each `agent`, `parallel`, and `write_scratch_file` call with its state and timing. Enter expands a call's result preview or error, or opens the file a `write_scratch_file` call wrote |
 | Logs | The stored timeline of phase changes and `log` lines, following the tail |
-| Result | The report or result JSON, the scratch file path, and the pause message or error |
+| Result | The report or result JSON, the scratch file path, and the pause message or error. Enter, or a click on the path, opens the scratch file in the workbench |
 
 | Key | Action |
 |-----|--------|

@@ -30,7 +30,6 @@ pub const MAX_CARD_PREVIEW_BYTES: usize = 2048;
 /// Log lines a card keeps under its roster while the run works.
 pub const CARD_LOG_LINES: usize = 3;
 const CARD_REPORT_FIELD: &str = "report";
-const CARD_PATH_FIELD: &str = "path";
 const CARD_PREVIEW_MARKER: &str = "…";
 const CARD_PHASE_SEPARATOR: &str = " › ";
 const CARD_ANNOTATION_SEPARATOR: &str = " · ";
@@ -523,12 +522,6 @@ impl From<&RunSnapshot> for WorkflowRunCard {
                 format!("{}{CARD_PREVIEW_MARKER}", &text[..end])
             }
         });
-        let scratch_path = run
-            .result
-            .as_ref()
-            .and_then(|result| result.get(CARD_PATH_FIELD))
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned);
         let logs = run
             .logs
             .iter()
@@ -550,7 +543,7 @@ impl From<&RunSnapshot> for WorkflowRunCard {
             roster: run.roster.clone(),
             logs,
             result_preview,
-            scratch_path,
+            scratch_path: run.scratch_path().map(str::to_owned),
             pause_message: run.pause_message.clone(),
             error: run.error.clone(),
             created_at: run.created_at,

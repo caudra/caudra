@@ -19,6 +19,7 @@ use super::{
     apply_scroll_delta,
     code_view::{BatchProgressMap, BatchViewMap, Disclosure, RowTarget},
     review, workflow_card,
+    workflow_card::CardHit,
 };
 use crate::animation::spinner_str;
 use crate::components::keybindings::key;
@@ -39,7 +40,7 @@ use caudra_workflow::RunSnapshot;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::mem;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -1349,15 +1350,32 @@ impl MessagesPanel {
         true
     }
 
-    /// The run whose card carries `tool_id`, when it is a workflow card.
-    pub fn workflow_run_for(&self, tool_id: &str) -> Option<String> {
-        self.messages
+    /// What a click at `row` on a workflow card names: its scratch file when
+    /// the row is the line that lists one, else the run itself.
+    pub(crate) fn workflow_hit_at(&self, row: u16, area: Rect) -> Option<CardHit> {
+        if area.height == 0 {
+            return None;
+        }
+        let width = self.viewport_width;
+        let doc_row = (row.saturating_sub(area.y)) as u32 + self.scroll_top as u32;
+        let (_, segment, start) = self.cache.segment_at_row(doc_row, width)?;
+        let rel = u16::try_from(doc_row - start).ok()?;
+        if rel < segment.chrome(width).margin_top {
+            return None;
+        }
+        let tool_id = segment.tool_id.as_deref()?;
+        let card = self
+            .messages
             .iter()
             .rfind(|msg| matches!(&msg.role, DisplayRole::Tool(tool) if tool.id == tool_id))
             .and_then(|msg| match msg.tool_output.as_deref() {
-                Some(ToolOutput::WorkflowRun(card)) => Some(card.run_id.clone()),
+                Some(ToolOutput::WorkflowRun(card)) => Some(card),
                 _ => None,
-            })
+            })?;
+        match (&card.scratch_path, segment.row_target_at(rel, width)) {
+            (Some(path), Some(_)) => Some(CardHit::ScratchFile(PathBuf::from(path))),
+            _ => Some(CardHit::Run(card.run_id.clone())),
+        }
     }
 
     /// A dispatched batch child reporting in. Its id is the batch's own with

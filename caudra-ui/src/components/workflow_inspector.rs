@@ -7,10 +7,12 @@
 //! runtime for a run's detail when the selection or the run moves, and
 //! every control names the run it acts on.
 
+use std::path::PathBuf;
+
 use caudra_agent::types::{PhaseMark, WorkflowRunCard};
 use caudra_workflow::{
-    CallState, RosterState, RunCall, RunDetail, RunEventKind, RunHistoryEntry, RunSnapshot,
-    RunStatus,
+    CallKind, CallState, RosterState, RunCall, RunDetail, RunEventKind, RunHistoryEntry,
+    RunSnapshot, RunStatus,
 };
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
@@ -85,7 +87,6 @@ const ERROR_LABEL: &str = "Error: ";
 const SCRATCH_LABEL: &str = "Scratch file: ";
 const RESULT_LABEL: &str = "Result: ";
 const REPORT_FIELD: &str = "report";
-const PATH_FIELD: &str = "path";
 const CALL_PREFIX: &str = "#";
 const TOKENS_UNIT: &str = " tokens";
 const AGENT_SLASH: &str = "/";
@@ -200,7 +201,8 @@ impl Section {
         Self::ALL[index]
     }
 
-    /// Sections whose rows a cursor walks and Enter acts on.
+    /// Sections whose rows a cursor walks. Enter also acts on the result,
+    /// which has one thing to open and no cursor to place.
     fn has_items(self) -> bool {
         matches!(self, Self::Agents | Self::Calls)
     }
@@ -271,6 +273,8 @@ pub enum InspectorAction {
         run_id: String,
     },
     OpenTranscript(String),
+    /// A scratch file, to open in the workbench.
+    OpenFile(PathBuf),
     Copy {
         text: String,
         label: &'static str,
@@ -529,18 +533,18 @@ impl WorkflowInspector {
                 None => InspectorAction::Consumed,
             };
         }
-        if self.body_area.contains(pos) && self.section.has_items() {
+        if self.body_area.contains(pos) {
             self.pane = Pane::Detail;
             let row = event.row - self.body_area.y + self.scroll.offset();
             let hit = self
                 .item_rows
                 .iter()
                 .position(|(start, height)| (*start..start.saturating_add(*height)).contains(&row));
-            if let Some(index) = hit {
-                if index == self.cursor && self.section == Section::Calls {
-                    return self.activate();
-                }
-                self.cursor = index;
+            match (self.section, hit) {
+                (Section::Result, Some(_)) => return self.activate(),
+                (Section::Calls, Some(index)) if index == self.cursor => return self.activate(),
+                (_, Some(index)) => self.cursor = index,
+                (_, None) => {}
             }
         }
         InspectorAction::Consumed
@@ -651,12 +655,22 @@ impl WorkflowInspector {
                 None => InspectorAction::Consumed,
             },
             Section::Calls => {
-                if let Some(call) = self.calls().get(self.cursor) {
-                    let key = call.call_key;
-                    self.expanded_call = (self.expanded_call != Some(key)).then_some(key);
+                let Some(call) = self.calls().get(self.cursor) else {
+                    return InspectorAction::Consumed;
+                };
+                if call.kind == CallKind::ScratchFile
+                    && let Some(path) = &call.result_preview
+                {
+                    return InspectorAction::OpenFile(PathBuf::from(path));
                 }
+                let key = call.call_key;
+                self.expanded_call = (self.expanded_call != Some(key)).then_some(key);
                 InspectorAction::Consumed
             }
+            Section::Result => match self.selected_run().and_then(RunSnapshot::scratch_path) {
+                Some(path) => InspectorAction::OpenFile(PathBuf::from(path)),
+                None => InspectorAction::Consumed,
+            },
             _ => InspectorAction::Consumed,
         }
     }
@@ -918,6 +932,7 @@ impl WorkflowInspector {
             })
             .collect();
         if self.pane == Pane::Detail
+            && self.section.has_items()
             && let Some(&(top, height)) = self.item_rows.get(self.cursor)
         {
             self.scroll.reveal(top, height);
@@ -950,7 +965,7 @@ impl WorkflowInspector {
             Section::Agents => self.agent_lines(run),
             Section::Calls => self.call_lines(),
             Section::Logs => (self.log_lines(run), Vec::new()),
-            Section::Result => (result_lines(run), Vec::new()),
+            Section::Result => result_lines(run),
         }
     }
 
@@ -1281,9 +1296,12 @@ fn phase_lines(run: &RunSnapshot, now: u64) -> Vec<Line<'static>> {
         .collect()
 }
 
-fn result_lines(run: &RunSnapshot) -> Vec<Line<'static>> {
+/// The report or the raw result, then the scratch file line, which is the
+/// section's one item so a click can land on it.
+fn result_lines(run: &RunSnapshot) -> (Vec<Line<'static>>, Vec<usize>) {
     let t = theme::current();
     let mut lines = Vec::new();
+    let mut starts = Vec::new();
     if let Some(result) = &run.result {
         match result.get(REPORT_FIELD).and_then(serde_json::Value::as_str) {
             Some(report) => lines.extend(report.lines().map(|line| Line::raw(line.to_owned()))),
@@ -1294,10 +1312,11 @@ fn result_lines(run: &RunSnapshot) -> Vec<Line<'static>> {
                 lines.extend(pretty.lines().map(|line| Line::raw(line.to_owned())));
             }
         }
-        if let Some(path) = result.get(PATH_FIELD).and_then(serde_json::Value::as_str) {
-            lines.push(Line::default());
-            lines.push(labelled(SCRATCH_LABEL, path, t.tool_path));
-        }
+    }
+    if let Some(path) = run.scratch_path() {
+        lines.push(Line::default());
+        starts.push(lines.len());
+        lines.push(labelled(SCRATCH_LABEL, path, t.tool_path));
     }
     if let Some(message) = &run.pause_message {
         lines.push(labelled(PAUSED_LABEL, message, t.tool_warning));
@@ -1306,8 +1325,8 @@ fn result_lines(run: &RunSnapshot) -> Vec<Line<'static>> {
         lines.push(labelled(ERROR_LABEL, error, t.tool_error));
     }
     match lines.is_empty() {
-        true => vec![Line::styled(NO_RESULT, t.tool_dim)],
-        false => lines,
+        true => (vec![Line::styled(NO_RESULT, t.tool_dim)], starts),
+        false => (lines, starts),
     }
 }
 
@@ -1379,6 +1398,9 @@ mod tests {
     const STALE_DETAIL: &str = "a detail for another run must be dropped";
     const REINSPECT: &str = "a moved run must be inspected again";
     const FOLLOW_RUN: &str = "the selection follows its run, not its position";
+    const SCRATCH_PATH: &str = "/state/workflow_scratch/session/run-1/report.md";
+    const OPENS_SCRATCH: &str = "Enter opens the scratch file the run wrote";
+    const NO_SCRATCH: &str = "a result without a scratch file has nothing to open";
 
     pub(crate) fn run(
         run_id: &str,
@@ -1538,6 +1560,68 @@ mod tests {
             inspector.handle_key(key_event(KeyCode::Enter)),
             InspectorAction::Flash(NO_TRANSCRIPT)
         );
+    }
+
+    fn scratch_call() -> RunCall {
+        RunCall {
+            call_key: 2,
+            kind: CallKind::ScratchFile,
+            state: CallState::Completed,
+            label: Some("report.md".into()),
+            task_id: None,
+            tokens_used: 0,
+            duration_ms: 0,
+            started_at: 1,
+            finished_at: Some(1),
+            result_preview: Some(SCRATCH_PATH.into()),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn enter_on_the_result_opens_the_scratch_file() {
+        let mut settled = run(RUN_ID, RunStatus::Completed, Vec::new());
+        settled.result = Some(serde_json::json!({ "report": "done", "path": SCRATCH_PATH }));
+        let mut inspector = open_with(vec![settled]);
+        let _ = inspector.handle_key(key_event(KeyCode::Char('6')));
+
+        let action = inspector.handle_key(key_event(KeyCode::Enter));
+
+        assert_eq!(
+            action,
+            InspectorAction::OpenFile(PathBuf::from(SCRATCH_PATH)),
+            "{OPENS_SCRATCH}"
+        );
+    }
+
+    #[test]
+    fn enter_on_a_result_without_a_scratch_file_does_nothing() {
+        let mut inspector = open_with(vec![run(RUN_ID, RunStatus::Completed, Vec::new())]);
+        let _ = inspector.handle_key(key_event(KeyCode::Char('6')));
+
+        let action = inspector.handle_key(key_event(KeyCode::Enter));
+
+        assert_eq!(action, InspectorAction::Consumed, "{NO_SCRATCH}");
+    }
+
+    #[test]
+    fn enter_on_a_scratch_call_opens_its_file() {
+        let mut inspector = open_with(vec![run(RUN_ID, RunStatus::Completed, Vec::new())]);
+        let mut with_scratch = detail(run(RUN_ID, RunStatus::Completed, Vec::new()));
+        with_scratch.calls.push(scratch_call());
+        inspector.fill_detail(with_scratch);
+        let _ = inspector.handle_key(key_event(KeyCode::Char('4')));
+        let _ = inspector.handle_key(key_event(KeyCode::Right));
+        let _ = inspector.handle_key(key_event(KeyCode::Down));
+
+        let action = inspector.handle_key(key_event(KeyCode::Enter));
+
+        assert_eq!(
+            action,
+            InspectorAction::OpenFile(PathBuf::from(SCRATCH_PATH)),
+            "{OPENS_SCRATCH}"
+        );
+        assert_eq!(inspector.expanded_call, None, "{OPENS_SCRATCH}");
     }
 
     #[test]

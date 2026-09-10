@@ -3,11 +3,14 @@
 //! place, so a card a slash command opened and a card the `workflow` tool
 //! returned cannot drift apart.
 
+use std::path::PathBuf;
+
 use caudra_agent::types::{PhaseMark, WorkflowRunCard};
 use caudra_workflow::{RosterState, RunStatus};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
+use crate::components::code_view::RowTarget;
 use crate::components::{ToolStatus, escape_terminal_controls, format_compact, format_elapsed};
 use crate::theme;
 
@@ -24,8 +27,18 @@ const LOG_PREFIX: &str = "+";
 const AGENTS_SUFFIX: &str = " agents";
 const TOKENS_SUFFIX: &str = " tokens";
 const SCRATCH_LABEL: &str = "Scratch file: ";
+/// The one row target a card carries: a run has at most one scratch file.
+const SCRATCH_ROW: usize = 0;
 const PAUSED_LABEL: &str = "Paused: ";
 const ERROR_LABEL: &str = "Error: ";
+
+/// What a click on a card names: the run itself, or the scratch file its
+/// result line lists.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum CardHit {
+    Run(String),
+    ScratchFile(PathBuf),
+}
 
 pub(crate) fn card_id(run_id: &str) -> String {
     format!("{CARD_ID_PREFIX}{run_id}")
@@ -68,10 +81,13 @@ pub(crate) fn status(status: RunStatus) -> ToolStatus {
 }
 
 /// The phase strip, the agents still working or that failed, the last log
-/// lines while the run is going, and what it produced once it is not.
-pub(crate) fn render(card: &WorkflowRunCard) -> Vec<Line<'static>> {
+/// lines while the run is going, and what it produced once it is not. The
+/// rows run parallel to the lines and mark the one that lists the scratch
+/// file, so a click can name it after a reflow.
+pub(crate) fn render(card: &WorkflowRunCard) -> (Vec<Line<'static>>, Vec<Option<RowTarget>>) {
     let t = theme::current();
     let mut lines = Vec::new();
+    let mut scratch_line = None;
     let strip = card.phase_strip();
     if !strip.is_empty() {
         lines.push(phase_strip_line(&strip));
@@ -111,6 +127,7 @@ pub(crate) fn render(card: &WorkflowRunCard) -> Vec<Line<'static>> {
             );
         }
         if let Some(path) = &card.scratch_path {
+            scratch_line = Some(lines.len());
             lines.push(labelled(SCRATCH_LABEL, path, t.tool_path));
         }
     } else {
@@ -133,7 +150,10 @@ pub(crate) fn render(card: &WorkflowRunCard) -> Vec<Line<'static>> {
     if let Some(error) = &card.error {
         lines.push(labelled(ERROR_LABEL, error, t.tool_error));
     }
-    lines
+    let rows = (0..lines.len())
+        .map(|line| (Some(line) == scratch_line).then_some(RowTarget(SCRATCH_ROW)))
+        .collect();
+    (lines, rows)
 }
 
 pub(crate) fn phase_strip_line(strip: &[(String, PhaseMark)]) -> Line<'static> {
@@ -186,6 +206,9 @@ mod tests {
     const REPORT: &str = "Findings: 42.";
     const LOG: &str = "searching";
     const LIVE_LOGS: &str = "a live card shows its log tail, a settled one its report";
+    const SCRATCH_PATH: &str = "/state/workflow_scratch/session/run-1/report.md";
+    const NO_SCRATCH_ROW: &str = "a card without a scratch file carries no row target";
+    const ONE_SCRATCH_ROW: &str = "the scratch line is the card's only row target";
 
     fn run(status: RunStatus) -> RunSnapshot {
         RunSnapshot {
@@ -257,8 +280,10 @@ mod tests {
 
     #[test]
     fn a_live_card_shows_the_strip_the_roster_and_the_log_tail() {
-        let body = text(&render(&WorkflowRunCard::from(&run(RunStatus::Active))));
+        let (lines, rows) = render(&WorkflowRunCard::from(&run(RunStatus::Active)));
+        let body = text(&lines);
 
+        assert!(rows.iter().all(Option::is_none), "{NO_SCRATCH_ROW}");
         assert!(body.starts_with("Plan ✓ › Research ● › Report ○"), "{body}");
         assert!(body.contains("● researcher"), "{body}");
         assert!(body.contains(&format!("+10s {LOG}")), "{LIVE_LOGS}: {body}");
@@ -267,9 +292,30 @@ mod tests {
 
     #[test]
     fn a_settled_card_shows_the_report_instead_of_the_logs() {
-        let body = text(&render(&WorkflowRunCard::from(&run(RunStatus::Completed))));
+        let (lines, rows) = render(&WorkflowRunCard::from(&run(RunStatus::Completed)));
+        let body = text(&lines);
 
         assert!(body.contains(REPORT), "{LIVE_LOGS}: {body}");
         assert!(!body.contains(LOG), "{LIVE_LOGS}: {body}");
+        assert!(rows.iter().all(Option::is_none), "{NO_SCRATCH_ROW}");
+    }
+
+    #[test]
+    fn the_scratch_line_of_a_settled_card_is_its_one_row_target() {
+        let mut settled = run(RunStatus::Completed);
+        settled.result = Some(json!({ "report": REPORT, "path": SCRATCH_PATH }));
+
+        let (lines, rows) = render(&WorkflowRunCard::from(&settled));
+
+        let targets: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter_map(|(line, row)| row.map(|_| line))
+            .collect();
+        assert_eq!(targets.len(), 1, "{ONE_SCRATCH_ROW}");
+        assert!(
+            text(&lines[targets[0]..=targets[0]]).ends_with(SCRATCH_PATH),
+            "{ONE_SCRATCH_ROW}"
+        );
     }
 }

@@ -8,6 +8,7 @@ use crate::components::input::InputHit;
 use crate::components::permission_prompt::PromptMouse;
 use crate::components::queue_panel::{QueueAction, QueueHit, QueueHitTarget};
 use crate::components::status_bar::{StatusBarHit, StatusBarHitTarget};
+use crate::components::workflow_card::CardHit;
 use crate::selection::{self, ContentRegion, EdgeScroll, Selection, SelectionState, SelectionZone};
 use caudra_agent::Mention;
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
@@ -510,9 +511,16 @@ impl App {
                         if zone == SelectionZone::Messages {
                             let area = self.msg_area();
                             if self.active_chat == 0
-                                && let Some(run_id) = self.chats[0].workflow_run_at(event.row, area)
+                                && let Some(hit) = self.chats[0].workflow_hit_at(event.row, area)
                             {
-                                self.open_workflow_inspector(Some(&run_id));
+                                match hit {
+                                    CardHit::Run(run_id) => {
+                                        self.open_workflow_inspector(Some(&run_id));
+                                    }
+                                    CardHit::ScratchFile(path) => {
+                                        self.open_workbench_file(&path, None);
+                                    }
+                                }
                                 return Vec::new();
                             }
                             if self.active_chat == 0

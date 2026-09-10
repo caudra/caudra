@@ -547,8 +547,13 @@ impl Manager {
 
 /// A journal row as the inspector shows it. The label is what the script
 /// gave the agent, else the start of its prompt, else the scratch file name.
+/// A string result is quoted bare, so a scratch call previews its path.
 fn run_call(call: &WorkflowCallRow) -> RunCall {
     let request: Value = serde_json::from_str(&call.request).unwrap_or(Value::Null);
+    let result_preview = call.result.as_deref().map(|text| {
+        let value: Value = serde_json::from_str(text).unwrap_or(Value::Null);
+        call_preview(value.as_str().unwrap_or(text))
+    });
     let label = [CALL_LABEL_FIELD, CALL_NAME_FIELD, CALL_PROMPT_FIELD]
         .iter()
         .find_map(|field| request.get(field).and_then(Value::as_str))
@@ -567,7 +572,7 @@ fn run_call(call: &WorkflowCallRow) -> RunCall {
         duration_ms: call.duration_ms,
         started_at: call.started_at,
         finished_at: call.finished_at,
-        result_preview: call.result.as_deref().map(call_preview),
+        result_preview,
         error: call.error.clone(),
     }
 }
@@ -728,6 +733,7 @@ complete(first.output.echo);
     const NAMES_ARE_UNIQUE: &str = "two runs of one workflow must not share a display name";
     const OLD_HANDLE_IS_DEAD: &str = "a handle must report unavailable after shutdown";
     const TIMELINE_IS_KEPT: &str = "phases and log lines must be stored with the run";
+    const SCRATCH_PREVIEW_IS_ITS_PATH: &str = "a scratch call previews the bare path it wrote";
     const HISTORY_IS_FOREIGN: &str = "history must list only other sessions' runs";
 
     /// Answers each agent by its label: `block-*` parks until released or
@@ -1133,6 +1139,11 @@ complete(first.output.echo);
             assert_eq!(detail.calls[0].label.as_deref(), Some("worker-1"));
             assert!(detail.calls[0].result_preview.is_some());
             assert_eq!(detail.calls[1].label.as_deref(), Some(SCRATCH_FILE));
+            assert_eq!(
+                detail.calls[1].result_preview.as_deref(),
+                detail.run.scratch_path(),
+                "{SCRATCH_PREVIEW_IS_ITS_PATH}"
+            );
             assert_eq!(detail.events.len(), 2, "{TIMELINE_IS_KEPT}");
             assert!(!detail.journal_trimmed);
             assert!(matches!(unknown, Err(WorkflowError::UnknownRun { .. })));
