@@ -17,6 +17,12 @@ pub struct HistoryItem {
     pub id: CaudraId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<CaudraId>,
+    /// The last item a compaction summary replaced. Compaction starts a new
+    /// chain, because the model is meant to see the summary instead of the
+    /// turns behind it, so this is the only record that those turns led here.
+    /// The transcript crosses it; the request never does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<CaudraId>,
     pub group_id: CaudraId,
     #[serde(flatten)]
     pub kind: HistoryItemKind,
@@ -195,6 +201,7 @@ pub fn expand_message(message: &Message, parent_id: Option<CaudraId>) -> Vec<His
             let item = HistoryItem {
                 id,
                 parent_id,
+                supersedes: None,
                 group_id,
                 kind,
             };
@@ -263,6 +270,118 @@ pub fn active_history_items(
     path.reverse();
     validate_item_structure(&path)?;
     Ok(path)
+}
+
+/// Returns the path a reader scrolls: the active path plus every stretch a
+/// compaction summary replaced. Compaction starts a fresh chain so the request
+/// carries the summary rather than the turns behind it, and that leaves those
+/// turns in the store with nothing pointing at them. Branches abandoned by a
+/// fork or a revert stay out, which is the whole reason the seam is recorded
+/// rather than inferred from what happens to be stored.
+///
+/// Structure is deliberately not validated, unlike [`active_history_items`]. A
+/// path that crosses a seam is not a valid request and is never projected into
+/// one; it is only ever read.
+pub fn transcript_history_items(
+    items: &[HistoryItem],
+    head: Option<CaudraId>,
+) -> Result<Vec<HistoryItem>, HistoryProjectionError> {
+    let index = validate_history_graph(items)?;
+    let Some(head) = head else {
+        return Ok(Vec::new());
+    };
+    if !index.contains_key(&head) {
+        return Err(HistoryProjectionError::MissingHead { head_id: head });
+    }
+
+    let mut segments = Vec::new();
+    let mut visited = HashSet::new();
+    let mut resume = Some((head, false));
+    while let Some((start, reconstructed)) = resume {
+        let mut segment = Vec::new();
+        let mut current = Some(start);
+        while let Some(id) = current.filter(|id| visited.insert(*id)) {
+            let item = &items[index[&id]];
+            segment.push(item.clone());
+            current = item.parent_id;
+        }
+        segment.reverse();
+        resume = superseded_by(items, &index, &segment, &visited);
+        segments.push((segment, reconstructed));
+    }
+
+    let mut path: Vec<HistoryItem> = Vec::new();
+    let mut reconstructed_join = false;
+    for (segment, reconstructed) in segments.into_iter().rev() {
+        if reconstructed_join {
+            trim_repeated_tail(&mut path, &segment);
+        }
+        reconstructed_join = reconstructed;
+        path.extend(segment);
+    }
+    Ok(path)
+}
+
+/// Where the transcript resumes below a segment's root, and whether that answer
+/// was reconstructed rather than read. A recorded `supersedes` is authoritative.
+/// Sessions compacted before the field existed record nothing, so a root whose
+/// summary follows it resumes from the item stored just before it, which is the
+/// head compaction replaced. Guessing wrong only changes what is drawn above the
+/// border, never what a request carries.
+fn superseded_by(
+    items: &[HistoryItem],
+    index: &HashMap<CaudraId, usize>,
+    segment: &[HistoryItem],
+    visited: &HashSet<CaudraId>,
+) -> Option<(CaudraId, bool)> {
+    let root = segment.first().filter(|root| root.parent_id.is_none())?;
+    if let Some(id) = root.supersedes {
+        return index.contains_key(&id).then_some((id, false));
+    }
+    // Not the immediate child: a summarizer that thinks first puts its
+    // reasoning between the anchor and the summary. What marks the root is that
+    // the summary arrives before any further turn.
+    let introduces_a_summary = segment
+        .iter()
+        .skip(1)
+        .take_while(|item| !matches!(item.kind, HistoryItemKind::User { .. }))
+        .any(is_compaction_summary);
+    if !introduces_a_summary {
+        return None;
+    }
+    let previous = items.get(index[&root.id].checked_sub(1)?)?;
+    (!visited.contains(&previous.id)).then_some((previous.id, true))
+}
+
+/// Drops the turns a reconstructed seam would show twice. Compaction re-expands
+/// the turns it preserved with fresh ids, so those copies sit both at the end of
+/// the stretch it replaced and again after the summary. A recorded seam names
+/// the last turn it summarized and needs none of this.
+fn trim_repeated_tail(older: &mut Vec<HistoryItem>, newer: &[HistoryItem]) {
+    let Some(summary) = newer.iter().position(is_compaction_summary) else {
+        return;
+    };
+    let preserved = &newer[summary + 1..];
+    let mut overlap = older.len().min(preserved.len());
+    while overlap > 0
+        && !older[older.len() - overlap..]
+            .iter()
+            .zip(preserved)
+            .all(|(left, right)| left.kind == right.kind)
+    {
+        overlap -= 1;
+    }
+    older.truncate(older.len() - overlap);
+}
+
+fn is_compaction_summary(item: &HistoryItem) -> bool {
+    matches!(
+        &item.kind,
+        HistoryItemKind::AssistantText {
+            is_compaction_summary: true,
+            ..
+        }
+    )
 }
 
 /// Merges an active runtime path into the persisted all-node graph by item ID.
@@ -870,6 +989,10 @@ mod tests {
     const TOOL_NAME: &str = "read";
     const MENTION_TEXT: &str = "<file path=\"a.rs\">fn main() {}</file>";
     const SYNTHETIC_TEXT: &str = "# Goal check-in";
+    const ANCHOR_TEXT: &str = "What did we do so far?";
+    const SUMMARY_TEXT: &str = "## Objective";
+    const FIRST_TURN: &str = "start the work";
+    const PRESERVED_TURN: &str = "and keep going";
     const REASONING_DURATION_MS: u64 = 9_700;
 
     fn image(data: &str) -> ImageSource {
@@ -885,6 +1008,7 @@ mod tests {
         HistoryItem {
             id: CaudraId::generate(),
             parent_id,
+            supersedes: None,
             group_id,
             kind,
         }
@@ -1322,6 +1446,170 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    fn summary(text: &str) -> Message {
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Text { text: text.into() }],
+            is_compaction_summary: true,
+            ..Default::default()
+        }
+    }
+
+    /// Builds a store shaped like a compacted session: an orphaned stretch, then
+    /// a fresh chain rooted at the anchor. `supersedes` names the last item the
+    /// summary replaced, or nothing at all for a session compacted before the
+    /// field existed.
+    fn compacted_store(
+        replaced: &[Message],
+        preserved: &[Message],
+        record_seam: bool,
+    ) -> (Vec<HistoryItem>, CaudraId) {
+        let mut items = Vec::new();
+        for message in replaced {
+            append_message(&mut items, message);
+        }
+        let superseded = items.last().map(|item| item.id);
+
+        let mut fresh = Vec::new();
+        for message in [
+            Message::synthetic(ANCHOR_TEXT.into()),
+            summary(SUMMARY_TEXT),
+        ]
+        .iter()
+        .chain(preserved)
+        {
+            append_message(&mut fresh, message);
+        }
+        if record_seam {
+            fresh[0].supersedes = superseded;
+        }
+        let head = fresh.last().unwrap().id;
+        items.extend(fresh);
+        (items, head)
+    }
+
+    /// The request must keep stopping at the seam. A transcript that reads more
+    /// than the request sends is the entire point, so the two walks disagreeing
+    /// on the same store is the property under test.
+    #[test]
+    fn a_recorded_seam_is_crossed_by_the_transcript_and_not_by_the_request() {
+        let replaced = [Message::user(FIRST_TURN.into())];
+        let (items, head) = compacted_store(&replaced, &[], true);
+
+        let active = active_history_items(&items, Some(head)).unwrap();
+        let transcript = transcript_history_items(&items, Some(head)).unwrap();
+
+        assert_eq!(active.len(), 2);
+        assert_eq!(user_texts(&transcript), [FIRST_TURN, ANCHOR_TEXT]);
+    }
+
+    /// A branch left behind by a fork or a revert has no seam, so nothing points
+    /// at it and the transcript must not wander into it.
+    #[test]
+    fn an_unrecorded_root_stops_both_walks() {
+        let replaced = [Message::user(FIRST_TURN.into())];
+        let (mut items, head) = compacted_store(&replaced, &[], false);
+        for item in &mut items {
+            if let HistoryItemKind::AssistantText {
+                is_compaction_summary,
+                ..
+            } = &mut item.kind
+            {
+                *is_compaction_summary = false;
+            }
+        }
+
+        let transcript = transcript_history_items(&items, Some(head)).unwrap();
+
+        assert_eq!(user_texts(&transcript), [ANCHOR_TEXT]);
+    }
+
+    #[test]
+    fn every_seam_is_crossed_when_a_session_compacts_more_than_once() {
+        let (first, first_head) = compacted_store(&[Message::user(FIRST_TURN.into())], &[], true);
+        let mut items = first;
+        let mut second = Vec::new();
+        for message in [
+            Message::synthetic(ANCHOR_TEXT.into()),
+            summary(SUMMARY_TEXT),
+        ] {
+            append_message(&mut second, &message);
+        }
+        second[0].supersedes = Some(first_head);
+        let head = second.last().unwrap().id;
+        items.extend(second);
+
+        let transcript = transcript_history_items(&items, Some(head)).unwrap();
+
+        assert_eq!(
+            user_texts(&transcript),
+            [FIRST_TURN, ANCHOR_TEXT, ANCHOR_TEXT]
+        );
+    }
+
+    /// A store that points a seam back into the stretch it introduced would walk
+    /// forever. Terminating matters more than diagnosing, since this path only
+    /// ever draws a transcript.
+    #[test]
+    fn a_seam_cycle_terminates() {
+        let (mut items, head) = compacted_store(&[Message::user(FIRST_TURN.into())], &[], true);
+        items[0].supersedes = Some(head);
+
+        let transcript = transcript_history_items(&items, Some(head)).unwrap();
+
+        assert_eq!(user_texts(&transcript), [FIRST_TURN, ANCHOR_TEXT]);
+    }
+
+    /// Sessions compacted before the seam was recorded still have to scroll, so
+    /// the walk falls back to store order. Compaction re-expands the turns it
+    /// preserved with fresh ids, so without the trim they would be drawn once
+    /// above the border and once below it.
+    #[test]
+    fn an_unrecorded_compaction_reattaches_by_store_order_without_repeating_the_tail() {
+        let preserved = [Message::user(PRESERVED_TURN.into())];
+        let replaced = [Message::user(FIRST_TURN.into()), preserved[0].clone()];
+        let (items, head) = compacted_store(&replaced, &preserved, false);
+
+        let transcript = transcript_history_items(&items, Some(head)).unwrap();
+
+        assert_eq!(
+            user_texts(&transcript),
+            [FIRST_TURN, ANCHOR_TEXT, PRESERVED_TURN]
+        );
+    }
+
+    /// A summarizer that thinks first puts its reasoning between the anchor and
+    /// the summary, so the summary is not the anchor's child. Every stored
+    /// session written before the summarizer stopped reasoning has this shape.
+    #[test]
+    fn a_reconstructed_seam_survives_reasoning_ahead_of_the_summary() {
+        let mut summary = summary(SUMMARY_TEXT);
+        summary
+            .content
+            .insert(0, ContentBlock::thinking("weighing it".into(), None));
+        let mut items = Vec::new();
+        append_message(&mut items, &Message::user(FIRST_TURN.into()));
+        let mut fresh = Vec::new();
+        append_message(&mut fresh, &Message::synthetic(ANCHOR_TEXT.into()));
+        append_message(&mut fresh, &summary);
+        let head = fresh.last().unwrap().id;
+        items.extend(fresh);
+
+        let transcript = transcript_history_items(&items, Some(head)).unwrap();
+
+        assert_eq!(user_texts(&transcript), [FIRST_TURN, ANCHOR_TEXT]);
+    }
+
+    fn user_texts(items: &[HistoryItem]) -> Vec<&str> {
+        items
+            .iter()
+            .filter_map(|item| match &item.kind {
+                HistoryItemKind::User { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
     }
 
     /// A restored mention preamble and a restored goal check-in were both

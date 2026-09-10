@@ -565,6 +565,7 @@ mod tests {
         let item = |call_id: &str, task_id: Option<&str>| HistoryItem {
             id: caudra_storage::id::CaudraId::generate(),
             parent_id: None,
+            supersedes: None,
             group_id: caudra_storage::id::CaudraId::generate(),
             kind: HistoryItemKind::ToolCall {
                 call_id: call_id.into(),
@@ -590,6 +591,7 @@ mod tests {
         let batch_call = HistoryItem {
             id: caudra_storage::id::CaudraId::generate(),
             parent_id: None,
+            supersedes: None,
             group_id: caudra_storage::id::CaudraId::generate(),
             kind: HistoryItemKind::ToolCall {
                 call_id: "batch-call".into(),

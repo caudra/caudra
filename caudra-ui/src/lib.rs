@@ -45,7 +45,7 @@ use std::time::Instant;
 
 use caudra_providers::{
     HistoryItem, HistoryProjectionError, Message, active_history_items, expand_message,
-    resolve_history_head,
+    resolve_history_head, transcript_history_items,
 };
 use caudra_storage::StateDir;
 use caudra_storage::id::CaudraId;
@@ -75,6 +75,15 @@ pub(crate) fn active_session_history(
     session: &AppSession,
 ) -> Result<Vec<HistoryItem>, HistoryProjectionError> {
     active_history_items(session.messages(), session_history_head(session))
+}
+
+/// What the transcript draws, which is more than what the next request carries.
+/// A compaction replaces turns in the request and leaves them in the store, so
+/// this crosses back over that seam while [`active_session_history`] stops at it.
+pub(crate) fn transcript_session_history(
+    session: &AppSession,
+) -> Result<Vec<HistoryItem>, HistoryProjectionError> {
+    transcript_history_items(session.messages(), session_history_head(session))
 }
 
 pub(crate) fn history_items(messages: &[Message]) -> Vec<HistoryItem> {

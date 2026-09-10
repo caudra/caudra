@@ -21,7 +21,7 @@ pub use error::AgentError;
 pub use history::{
     AssistantTextState, CaudraId, HistoryItem, HistoryItemKind, HistoryProjectionError, UserOrigin,
     active_history_items, expand_message, merge_history_items, project_messages,
-    resolve_history_head,
+    resolve_history_head, transcript_history_items,
 };
 pub use model::{
     Billing, FastPricing, Model, ModelEntry, ModelError, ModelFamily, ModelInfo, ModelPricing,

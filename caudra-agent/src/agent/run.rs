@@ -34,8 +34,8 @@ use crate::mcp::{McpRequestSnapshot, McpSession};
 use crate::nudge::Nudge;
 use crate::permissions::PermissionManager;
 use crate::template::Vars;
-use crate::tools::{Deadline, FileReadTracker, LocalTools, PathLocks, ToolAudience, ToolContext};
 use crate::tools::{BuiltinDeferral, DeferralSession, DeferredTool};
+use crate::tools::{Deadline, FileReadTracker, LocalTools, PathLocks, ToolAudience, ToolContext};
 use crate::{
     AgentConfig, AgentError, AgentEvent, AgentInput, AgentMode, DoneReason, EventSender,
     ExtractedCommand, InterruptSource, Mention, QueueConsumedItem, SessionMailbox,

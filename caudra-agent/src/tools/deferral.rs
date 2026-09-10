@@ -73,10 +73,9 @@ impl BuiltinDeferral {
         match (setting, class) {
             (DeferBuiltinTools::Never, _) => Self::EagerByConfig,
             (DeferBuiltinTools::Always, _) => Self::Lazy,
-            (
-                DeferBuiltinTools::Auto,
-                Some(ModelPurpose::Balanced | ModelPurpose::Best),
-            ) => Self::EagerByClass,
+            (DeferBuiltinTools::Auto, Some(ModelPurpose::Balanced | ModelPurpose::Best)) => {
+                Self::EagerByClass
+            }
             (DeferBuiltinTools::Auto, _) => Self::Lazy,
         }
     }

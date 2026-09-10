@@ -33,8 +33,8 @@ use crate::prompt::ResolvedSlots;
 use crate::prompt::profile::{BUILTIN_PROFILE_NAME, PromptProfileCatalog};
 use crate::template;
 use crate::tools::{
-    BuiltinDeferral, DeferralSession, DeferredTool, DescriptionContext, FileReadTracker, LocalTools,
-    PathLocks, ToolAudience, ToolDefinitions, ToolFilter, ToolRegistry, deferral,
+    BuiltinDeferral, DeferralSession, DeferredTool, DescriptionContext, FileReadTracker,
+    LocalTools, PathLocks, ToolAudience, ToolDefinitions, ToolFilter, ToolRegistry, deferral,
 };
 use crate::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, DoneReason,

@@ -118,12 +118,34 @@ impl History {
     }
 
     pub fn replace(&mut self, messages: Vec<Message>) {
+        self.replace_superseding(messages, None);
+    }
+
+    /// Swaps the conversation and records the last item the new root replaced.
+    /// Compaction is the only caller with something to record: it deliberately
+    /// starts a chain the request reads instead of the turns behind it, and
+    /// without this the transcript has no way back to them.
+    pub fn replace_superseding(&mut self, messages: Vec<Message>, supersedes: Option<CaudraId>) {
+        let mut items = expand_messages(&messages);
+        if let Some(root) = items.first_mut() {
+            root.supersedes = supersedes;
+        }
         self.snapshot = HistorySnapshot {
             epoch: next_epoch(),
-            messages: Arc::new(expand_messages(&messages)),
+            messages: Arc::new(items),
         };
         self.messages = messages;
         self.publish();
+    }
+
+    /// The last item covered by the first `message_count` messages, which is
+    /// what a compaction records as superseded before it swaps the list.
+    pub fn item_at_message_boundary(&self, message_count: usize) -> Option<CaudraId> {
+        let items = self.active_items();
+        item_len_for_message_count(items, message_count)
+            .checked_sub(1)
+            .and_then(|index| items.get(index))
+            .map(|item| item.id)
     }
 
     pub fn truncate(&mut self, len: usize) {
@@ -329,6 +351,7 @@ fn append_unavailable_results(
     items.extend(call_ids.iter().map(|call_id| HistoryItem {
         id: CaudraId::generate(),
         parent_id: None,
+        supersedes: None,
         group_id,
         kind: HistoryItemKind::ToolResult {
             call_id: call_id.clone(),

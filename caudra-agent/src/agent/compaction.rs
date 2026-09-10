@@ -181,11 +181,18 @@ fn finish_compact(
 
     let tail = history.as_slice()[head_end..].to_vec();
     let preserved = tail.len();
+    // Read before the swap, and taken at the boundary rather than at the head:
+    // the preserved tail is re-expanded with fresh ids below the summary, so
+    // pointing at the head would draw those turns on both sides of the seam.
+    let superseded = history.item_at_message_boundary(head_end);
     let mut new_history = Vec::with_capacity(preserved + 2);
     new_history.push(Message::synthetic(COMPACTION_ANCHOR.into()));
     new_history.push(response.message);
     new_history.extend(tail);
-    history.replace(repair_tool_pairs(Cow::Owned(new_history)).into_owned());
+    history.replace_superseding(
+        repair_tool_pairs(Cow::Owned(new_history)).into_owned(),
+        superseded,
+    );
     info!(
         model = %model.id,
         duration_ms = compact_start.elapsed().as_millis() as u64,
@@ -614,6 +621,67 @@ mod tests {
                 "the preserved tail must not be summarized as well"
             );
         });
+    }
+
+    /// Compaction starts a fresh chain, which leaves the turns it summarized in
+    /// the store with nothing pointing at them. The seam is the only way a
+    /// reader gets back to them, and it has to name the last turn the summary
+    /// replaced rather than the head: the preserved tail is re-expanded below
+    /// the summary, so naming the head would draw it on both sides of the
+    /// border.
+    #[test]
+    fn compact_records_a_seam_the_transcript_crosses_and_the_request_does_not() {
+        smol::block_on(async {
+            const OLD: &str = "first";
+            const RECENT: &str = "second";
+
+            let provider = MockProvider::new(vec![Ok(text_response(StopReason::EndTurn))]);
+            let (raw_tx, _rx) = flume::unbounded();
+            let mut history = History::new(vec![
+                Message::user(OLD.into()),
+                assistant_text("reply one"),
+                Message::user(RECENT.into()),
+                assistant_text("reply two"),
+            ]);
+            let mut stored = history.active_items().to_vec();
+
+            compact(
+                &provider,
+                &default_model(),
+                &mut history,
+                &EventSender::new(raw_tx, 0),
+                &AgentConfig::default(),
+            )
+            .await
+            .unwrap();
+
+            caudra_providers::merge_history_items(&mut stored, history.active_items()).unwrap();
+            let head = history.item_head();
+
+            let transcript = caudra_providers::transcript_history_items(&stored, head).unwrap();
+            assert_eq!(
+                user_turns(&transcript),
+                [OLD, COMPACTION_ANCHOR, RECENT],
+                "the reader must reach every turn exactly once"
+            );
+
+            let active = caudra_providers::active_history_items(&stored, head).unwrap();
+            assert_eq!(
+                user_turns(&active),
+                [COMPACTION_ANCHOR, RECENT],
+                "the request must still stop at the seam"
+            );
+        });
+    }
+
+    fn user_turns(items: &[caudra_providers::HistoryItem]) -> Vec<&str> {
+        items
+            .iter()
+            .filter_map(|item| match &item.kind {
+                caudra_providers::HistoryItemKind::User { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
     }
 
     #[test]

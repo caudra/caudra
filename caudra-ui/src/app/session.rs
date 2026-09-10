@@ -496,7 +496,11 @@ impl App {
         let restoring = Arc::new(AtomicBool::new(true));
         self.restoring = restoring.clone();
 
-        let active_history = match crate::active_session_history(&self.state.session) {
+        // The transcript, not the request: a compaction leaves the turns it
+        // summarized in the store, and this is the reader's only way back to
+        // them. The subagent and tool-output reachability below reads the same
+        // path on purpose, so a card drawn above the border keeps its output.
+        let active_history = match crate::transcript_session_history(&self.state.session) {
             Ok(history) => history,
             Err(error) => {
                 self.status_bar

@@ -8626,6 +8626,48 @@ fn fork_copies_only_reachable_managed_outputs_including_nested_subagents() {
     ));
 }
 
+/// Reloading a compacted session used to stop at the border, because the
+/// transcript and the request read the same walk and compaction starts a chain
+/// the request is meant to begin at. The turns were never deleted, only left
+/// unreachable, so a reader could not scroll back to what they had written.
+#[test]
+fn a_restored_compacted_session_scrolls_past_the_border() {
+    const EARLIER: &str = "the turn the summary replaced";
+    const SUMMARY: &str = "## Objective";
+
+    let mut app = test_app();
+    let mut items = crate::history_items(&[Message::user(EARLIER.into())]);
+    let superseded = items.last().unwrap().id;
+    let mut compacted = crate::history_items(&[
+        Message::synthetic(caudra_agent::COMPACTION_ANCHOR.into()),
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Text {
+                text: SUMMARY.into(),
+            }],
+            is_compaction_summary: true,
+            ..Default::default()
+        },
+    ]);
+    compacted[0].supersedes = Some(superseded);
+    let head = compacted.last().unwrap().id;
+    items.extend(compacted);
+    let session = app.state.session_mut();
+    session.replace_messages(items);
+    session.meta.history_head = Some(head);
+
+    app.restore_display();
+
+    let chat = app.main_chat();
+    assert_eq!(chat.message_at(0).map(|m| m.text.as_str()), Some(EARLIER));
+    assert_eq!(
+        chat.message_at(1).map(|m| &m.role),
+        Some(&DisplayRole::Notice),
+        "the border still separates the summary from what it replaced"
+    );
+    assert_eq!(chat.message_at(2).map(|m| m.text.as_str()), Some(SUMMARY));
+}
+
 #[test]
 fn compacted_fork_copies_subagent_artifacts_without_top_level_refs() {
     let (_temp, storage, _, mut app) = tempdir_app();

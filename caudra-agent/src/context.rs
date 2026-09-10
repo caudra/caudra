@@ -422,8 +422,14 @@ impl BuiltinToolsInput<'_> {
             .iter()
             .map(|entry| {
                 let name = entry.name();
-                let report =
-                    builtin_report(name, self.filter, &[], self.config, self.model, self.deferral);
+                let report = builtin_report(
+                    name,
+                    self.filter,
+                    &[],
+                    self.config,
+                    self.model,
+                    self.deferral,
+                );
                 let state = match report.state {
                     ToolState::On => ContextBuiltinState::Declared,
                     ToolState::Lazy => ContextBuiltinState::Deferred,

@@ -2,8 +2,8 @@ use caudra_config::AgentConfig;
 use caudra_providers::Model;
 
 use crate::tools::{
-    BuiltinDeferral, ToolFilter, VIEW_IMAGE_TOOL_NAME, capability_exclusions, credential_exclusions,
-    deferral,
+    BuiltinDeferral, ToolFilter, VIEW_IMAGE_TOOL_NAME, capability_exclusions,
+    credential_exclusions, deferral,
 };
 
 pub const REASON_DISALLOWED_FLAG: &str = "--disallowed-tools";
