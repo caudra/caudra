@@ -2885,6 +2885,8 @@ mod tests {
     #[test_case("cat \"my file.txt\"" => true ; "a quoted operand is one word, not two")]
     #[test_case("find . -name '*.rs'" => true ; "a quoted glob is an ordinary argument")]
     #[test_case("sed -n '1,140p' Cargo.toml" => true ; "a sed script that only prints")]
+    #[test_case("cd src && rg -n needle ." => true ; "a move into the project before reading")]
+    #[test_case("cd /tmp && cat x" => false ; "a move out of it")]
     #[test_case("sed -i 's/a/b/' Cargo.toml" => false ; "a sed script that writes in place")]
     #[test_case("cat /etc/shadow" => false ; "a read that leaves the project")]
     #[test_case("cat ../../secret" => false ; "a read that climbs out of it")]

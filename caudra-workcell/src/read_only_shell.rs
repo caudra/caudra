@@ -7,7 +7,7 @@
 //! Deciding what a word means from its raw text is what leaked `$HOME`, then a
 //! brace expansion, so the decoding is not repeated here.
 
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
 use caudra_agent::permissions::{physical_boundary_check, sed_only_prints};
 use workcell::shell::{ShellCommandAnalysis, ShellCommandScope, ShellWord};
@@ -62,13 +62,16 @@ const FIND_DENIED_FLAGS: &[&str] = &[
     "-delete", "-exec", "-execdir", "-fls", "-fprint", "-fprintf", "-ok", "-okdir",
 ];
 const SED: &str = "sed";
+const CD: &str = "cd";
+/// `cd -` is `$OLDPWD`, which the command does not say the location of.
+const PREVIOUS_DIRECTORY: &str = "-";
 /// `awk` is absent on purpose rather than deny-listed: `system()` and `print >`
 /// are reached from inside the script, so no flag list can exclude them. The
 /// same is true of `sed`, which is why `sed` is recognized by its script rather
 /// than by its flags and is not in the list below.
 const READ_ONLY_COMMANDS: &[&str] = &[
-    "basename", "cat", "date", "df", "dirname", "du", "echo", "file", "head", "jq", "ls", "printf",
-    "pwd", "readlink", "realpath", "stat", "tail", "tree", "uname", "wc", "which",
+    "basename", "cat", "cd", "date", "df", "dirname", "du", "echo", "file", "head", "jq", "ls",
+    "printf", "pwd", "readlink", "realpath", "stat", "tail", "tree", "uname", "wc", "which",
 ];
 
 /// Reports whether every command in an analyzed line only observes.
@@ -111,16 +114,47 @@ fn scope_is_read_only(scope: &ShellCommandScope) -> bool {
 /// what `file_read` has to ask about. The workdir is checked too, because Caudra
 /// runs the shell unconfined and a relative operand is only inside when its base
 /// is.
+/// A `cd` moves the directory every later operand resolves against, so the
+/// scopes are walked in source order carrying that directory rather than judged
+/// independently against the workdir. Workcell sorts them by `start_byte`, and
+/// marks a subshell, an expansion, and a substitution opaque, so a `cd` that
+/// applied to only part of the line never reaches here. One inside a loop or a
+/// conditional is followed as though it ran, which costs a prompt rather than an
+/// allowance.
 pub(crate) fn stays_in_project(
     analysis: &ShellCommandAnalysis,
     workdir: &Path,
     project: &Path,
 ) -> bool {
-    workdir.starts_with(project)
-        && analysis
-            .scopes
-            .iter()
-            .all(|scope| scope_stays_in_project(scope, workdir, project))
+    if !workdir.starts_with(project) {
+        return false;
+    }
+    let mut current = workdir.to_path_buf();
+    for scope in &analysis.scopes {
+        if scope.executable == CD {
+            match cd_target(scope, &current, project) {
+                Some(target) => current = target,
+                None => return false,
+            }
+        } else if !scope_stays_in_project(scope, &current, project) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Where a `cd` leaves the shell, or `None` when the command does not say, or
+/// says somewhere outside the project.
+fn cd_target(scope: &ShellCommandScope, current: &Path, project: &Path) -> Option<PathBuf> {
+    // No operand is `$HOME`, and two is the substitution form `cd old new`.
+    let [target] = literal_arguments(scope)?[..] else {
+        return None;
+    };
+    if target == PREVIOUS_DIRECTORY || !stays_inside(target) {
+        return None;
+    }
+    let moved = current.join(target);
+    (physical_boundary_check(project, &moved) == Some(true)).then_some(moved)
 }
 
 fn scope_stays_in_project(scope: &ShellCommandScope, workdir: &Path, project: &Path) -> bool {
@@ -282,6 +316,7 @@ mod tests {
     #[test_case("find . -exec rm x ;" => false ; "find_exec")]
     #[test_case("ls -la" => true ; "ls")]
     #[test_case("cat Cargo.toml" => true ; "cat")]
+    #[test_case("cd crates" => true ; "cd_moves_nothing_on_disk")]
     #[test_case("echo === callers ===" => true ; "echo")]
     #[test_case("printf %s-%s a b" => true ; "printf")]
     #[test_case("sed -n 1,140p f" => true ; "sed_printing_a_slice")]
@@ -350,6 +385,26 @@ mod tests {
         )
     }
 
+    /// Models restate the directory they are already in and then read, 1,422
+    /// times in this machine's history. Every later operand is judged against
+    /// the directory the `cd` reached, so following it is what makes the line
+    /// answerable at all.
+    #[test_case(&["cd crates", "cat core/lib.rs"] => true ; "a_relative_move_within_the_project")]
+    #[test_case(&["cd /home/dev/project/crates", "cat lib.rs"] => true ; "the_absolute_form_models_send")]
+    #[test_case(&["cd /home/dev/project", "rg needle src"] => true ; "the_project_root_restated")]
+    #[test_case(&["cat a", "cd crates", "cat b"] => true ; "a_read_on_either_side_of_the_move")]
+    #[test_case(&["cd crates", "cat ../../secret"] => false ; "a_climb_out_of_the_directory_it_reached")]
+    #[test_case(&["cd /tmp", "cat x"] => false ; "a_move_out_of_the_project")]
+    #[test_case(&["cd", "cat x"] => false ; "no_operand_is_the_home_directory")]
+    #[test_case(&["cd -", "cat x"] => false ; "a_dash_is_the_previous_directory")]
+    #[test_case(&["cd ~", "cat x"] => false ; "a_tilde_is_the_home_directory")]
+    #[test_case(&["cd ..", "cat x"] => false ; "a_parent_segment_leaves_the_project")]
+    #[test_case(&["cd a b", "cat x"] => false ; "two_operands_are_the_substitution_form")]
+    #[test_case(&["rg needle src", "cd /tmp"] => false ; "a_trailing_move_counts_too")]
+    fn a_directory_change_is_followed(commands: &[&str]) -> bool {
+        stays_in_project(&analysis(commands), Path::new(PROJECT), Path::new(PROJECT))
+    }
+
     /// An undecodable word stands for text that is not in the line, so where it
     /// points cannot be read off it either.
     #[test_case(Some(vec![ShellWord::Undecodable]) => false ; "a_word_that_does_not_mean_its_own_text")]
@@ -379,12 +434,17 @@ mod tests {
     /// A project can contain a symlink pointing anywhere, and nothing in a
     /// command's text says so. `cat notes.md` is confined by every textual rule
     /// there is and still reads whatever the link names.
-    #[test_case("cat inside.md" => true ; "a real file inside the project")]
-    #[test_case("cat notes.md" => false ; "a symlink to a file outside it")]
-    #[test_case("cat linked/id_rsa" => false ; "a path through a symlinked directory")]
-    #[test_case("cat missing.md" => true ; "a name that resolves to nothing is not a path we read")]
-    #[test_case("find . -name *.rs" => true ; "a pattern argument still resolves to nothing")]
-    fn a_symlink_out_of_the_project_is_not_confined(command: &str) -> bool {
+    #[test_case(&["cat inside.md"] => true ; "a real file inside the project")]
+    #[test_case(&["cat notes.md"] => false ; "a symlink to a file outside it")]
+    #[test_case(&["cat linked/id_rsa"] => false ; "a path through a symlinked directory")]
+    #[test_case(&["cat missing.md"] => true ; "a name that resolves to nothing is not a path we read")]
+    #[test_case(&["find . -name *.rs"] => true ; "a pattern argument still resolves to nothing")]
+    #[test_case(&["cd linked"] => false ; "a move through a symlinked directory")]
+    // `sub/escape` leaves the project and `escape` names nothing, so the answer
+    // is only right when the operand is resolved against the directory the `cd`
+    // reached. Against the workdir it resolves to nothing and reads as confined.
+    #[test_case(&["cd sub", "cat escape"] => false ; "a link the move brings into reach")]
+    fn a_symlink_out_of_the_project_is_not_confined(commands: &[&str]) -> bool {
         let project = tempfile::tempdir().expect("project");
         let outside = tempfile::tempdir().expect("outside");
         let secret = outside.path().join("id_rsa");
@@ -393,9 +453,12 @@ mod tests {
         std::os::unix::fs::symlink(&secret, project.path().join("notes.md")).expect("file link");
         std::os::unix::fs::symlink(outside.path(), project.path().join("linked"))
             .expect("dir link");
+        std::fs::create_dir(project.path().join("sub")).expect("subdirectory");
+        std::os::unix::fs::symlink(&secret, project.path().join("sub/escape"))
+            .expect("nested link");
         let root = project.path().canonicalize().expect("canonical project");
 
-        stays_in_project(&analysis(&[command]), &root, &root)
+        stays_in_project(&analysis(commands), &root, &root)
     }
 
     /// The bound is the project, not the directory the command runs from, so a
