@@ -84,11 +84,13 @@ const COPIED: &str = "Copied section";
 pub(crate) const PAUSE_LABEL: &str = "p";
 pub(crate) const RESUME_LABEL: &str = "r";
 pub(crate) const STOP_LABEL: &str = "s";
+pub(crate) const TRANSCRIPT_LABEL: &str = "t";
 pub(crate) const COPY_LABEL: &str = "y";
 pub(crate) const FILTER_LABEL: &str = "/";
 const PAUSE_KEY: char = ascii_key(PAUSE_LABEL);
 const RESUME_KEY: char = ascii_key(RESUME_LABEL);
 const STOP_KEY: char = ascii_key(STOP_LABEL);
+const TRANSCRIPT_KEY: char = ascii_key(TRANSCRIPT_LABEL);
 const COPY_KEY: char = ascii_key(COPY_LABEL);
 const FILTER_KEY: char = ascii_key(FILTER_LABEL);
 const SECTION_GAP: &str = "  ";
@@ -122,7 +124,7 @@ const AGENTS_UNIT: &str = " agents";
 const DONE_UNIT: &str = " done";
 const ADMITTED_UNIT: &str = " admitted";
 const AGENT_SLASH: &str = "/";
-const FOOTER: [(&str, &str, FooterCommand); 7] = [
+const FOOTER: [(&str, &str, FooterCommand); 8] = [
     (
         PAUSE_LABEL,
         "Pause",
@@ -135,6 +137,7 @@ const FOOTER: [(&str, &str, FooterCommand); 7] = [
     ),
     (STOP_LABEL, "Stop", FooterCommand::Control(RunControl::Stop)),
     ("Enter", "Open", FooterCommand::Activate),
+    (TRANSCRIPT_LABEL, "Transcript", FooterCommand::Transcript),
     (COPY_LABEL, "Copy", FooterCommand::Copy),
     (FILTER_LABEL, "Filter", FooterCommand::Filter),
     ("Esc", "Close", FooterCommand::Close),
@@ -199,6 +202,7 @@ struct BudgetPrompt {
 enum FooterCommand {
     Control(RunControl),
     Activate,
+    Transcript,
     Copy,
     Filter,
     Close,
@@ -479,19 +483,17 @@ impl WorkflowInspector {
             .insert(call_key, ToolProgress::live(report));
     }
 
-    /// Activity outlives no agent: an entry is kept only while the roster
-    /// still says the agent it belongs to is running.
+    /// Activity outlives the agent that reported it but not the run that
+    /// dispatched it: an entry survives as long as the roster still lists its
+    /// agent, so a settled agent keeps its last report and a vanished run
+    /// takes every one of them with it.
     fn prune_live(&mut self) {
         let runs = &self.runs;
         self.live.retain(|run_id, agents| {
             let Some(run) = runs.iter().find(|run| run.run_id == *run_id) else {
                 return false;
             };
-            agents.retain(|call_key, _| {
-                run.roster
-                    .iter()
-                    .any(|agent| agent.call_key == *call_key && agent.state == RosterState::Running)
-            });
+            agents.retain(|call_key, _| run.roster.iter().any(|agent| agent.call_key == *call_key));
             !agents.is_empty()
         });
     }
@@ -632,6 +634,7 @@ impl WorkflowInspector {
             KeyCode::Char(PAUSE_KEY) if plain => return self.control(RunControl::Pause),
             KeyCode::Char(RESUME_KEY) if plain => return self.control(RunControl::Resume),
             KeyCode::Char(STOP_KEY) if plain => return self.control(RunControl::Stop),
+            KeyCode::Char(TRANSCRIPT_KEY) if plain => return self.open_transcript(),
             KeyCode::Char(COPY_KEY) if plain => return self.copy(),
             _ => {
                 self.scroll.handle_key(key);
@@ -772,6 +775,7 @@ impl WorkflowInspector {
         match FOOTER.get(index).map(|(_, _, command)| *command) {
             Some(FooterCommand::Control(control)) => self.control(control),
             Some(FooterCommand::Activate) => self.activate(),
+            Some(FooterCommand::Transcript) => self.open_transcript(),
             Some(FooterCommand::Copy) => self.copy(),
             Some(FooterCommand::Filter) => {
                 self.filter_focused = true;
@@ -864,14 +868,8 @@ impl WorkflowInspector {
     fn activate(&mut self) -> InspectorAction {
         match self.section {
             Section::Timeline => self.open_timeline_row(),
-            Section::Agents => match self
-                .selected_run()
-                .and_then(|run| agent_order(run).get(self.cursor).map(|at| &run.roster[*at]))
-            {
-                Some(agent) => match &agent.task_id {
-                    Some(task_id) => InspectorAction::OpenTranscript(task_id.clone()),
-                    None => InspectorAction::Flash(NO_TRANSCRIPT),
-                },
+            Section::Agents => match self.cursor_agent().map(|agent| agent.call_key) {
+                Some(call_key) => self.expand_call(call_key),
                 None => InspectorAction::Consumed,
             },
             Section::Result => match self.selected_run().and_then(RunSnapshot::scratch_path) {
@@ -879,6 +877,42 @@ impl WorkflowInspector {
                 None => InspectorAction::Consumed,
             },
             _ => InspectorAction::Consumed,
+        }
+    }
+
+    /// The agent the cursor is on: named directly in the roster, or reached
+    /// through the call a timeline row stands for.
+    fn cursor_agent(&self) -> Option<&AgentRosterEntry> {
+        let run = self.selected_run()?;
+        match self.section {
+            Section::Agents => {
+                let index = *agent_order(run).get(self.cursor)?;
+                run.roster.get(index)
+            }
+            Section::Timeline => {
+                let TimelineRow::Call { call, .. } =
+                    self.timeline_rows(now_secs()).get(self.cursor)?.clone()
+                else {
+                    return None;
+                };
+                let call_key = self.detail.as_ref()?.calls.get(call)?.call_key;
+                run.roster.iter().find(|agent| agent.call_key == call_key)
+            }
+            _ => None,
+        }
+    }
+
+    fn cursor_task_id(&self) -> Option<&str> {
+        self.cursor_agent()?.task_id.as_deref()
+    }
+
+    /// The transcript of whatever agent the cursor is on, from either the
+    /// timeline or the roster, so a reader never has to change section to
+    /// read what an agent actually said.
+    fn open_transcript(&mut self) -> InspectorAction {
+        match self.cursor_task_id() {
+            Some(task_id) => InspectorAction::OpenTranscript(task_id.to_owned()),
+            None => InspectorAction::Flash(NO_TRANSCRIPT),
         }
     }
 
@@ -1574,12 +1608,10 @@ impl WorkflowInspector {
         (lines, starts)
     }
 
-    /// The last progress report of an agent that is still running, when one
-    /// has landed. A stopped agent is described by the roster instead.
+    /// The last progress an agent reported, whether or not it is still going.
+    /// A settled agent keeps its final activity, because what it was doing
+    /// when it stopped is the part a reader is looking for.
     fn activity(&self, run: &RunSnapshot, agent: &AgentRosterEntry) -> Option<&ToolProgress> {
-        if agent.state != RosterState::Running {
-            return None;
-        }
         self.live.get(&run.run_id)?.get(&agent.call_key)
     }
 
@@ -1615,9 +1647,9 @@ impl WorkflowInspector {
                 state,
                 Span::styled(escape_terminal_controls(&agent.label), t.bold),
             ];
-            match self.activity(run, agent) {
-                Some(progress) => spans.extend(activity_spans(progress)),
-                None => spans.push(Span::styled(
+            match agent.state {
+                RosterState::Running => {}
+                _ => spans.push(Span::styled(
                     format!(
                         "{SEPARATOR}{}{TOKENS_UNIT}{SEPARATOR}{}",
                         format_compact(agent.tokens_used),
@@ -1626,10 +1658,29 @@ impl WorkflowInspector {
                     t.tool_dim,
                 )),
             }
+            if let Some(progress) = self.activity(run, agent) {
+                spans.extend(activity_spans(progress, agent.state));
+            }
             starts.push(lines.len());
             lines.push(Line::from(spans));
+            if let Some(call) = self.agent_call(agent.call_key)
+                && self.expanded_call == Some(agent.call_key)
+            {
+                lines.extend(self.body_lines(call));
+            }
         }
         (lines, starts)
+    }
+
+    /// The journal row an agent came from, once the detail has landed. The
+    /// roster and the journal are two halves of one row: the roster knows the
+    /// phase and the state, the journal knows what was asked and answered.
+    fn agent_call(&self, call_key: u64) -> Option<&RunCall> {
+        self.detail
+            .as_ref()?
+            .calls
+            .iter()
+            .find(|call| call.call_key == call_key)
     }
 
     fn footer_line(&self) -> FooterLine {
@@ -1657,6 +1708,7 @@ impl WorkflowInspector {
                     controllable && run.is_some_and(|run| control.applies_to(run.status))
                 }
                 FooterCommand::Activate => self.section.has_items() && self.item_count() > 0,
+                FooterCommand::Transcript => self.cursor_task_id().is_some(),
                 FooterCommand::Copy => run.is_some(),
                 FooterCommand::Filter | FooterCommand::Close => true,
             };
@@ -1780,11 +1832,20 @@ fn roster_tally(run: &RunSnapshot) -> String {
 
 /// `· shell cargo test · 3 tools · 1m2s`, the shape a subagent's task header
 /// already uses, so a workflow agent reads like any other agent.
-fn activity_spans(progress: &ToolProgress) -> Vec<Span<'static>> {
+///
+/// What an agent is doing, or was doing when it stopped. A settled agent's
+/// last report is dimmed throughout and drops the running tally, which its
+/// roster row already states in final form.
+fn activity_spans(progress: &ToolProgress, state: RosterState) -> Vec<Span<'static>> {
     let t = theme::current();
+    let running = state == RosterState::Running;
+    let label = match running {
+        true => t.tool_prefix,
+        false => t.tool_dim,
+    };
     let mut spans = vec![
         Span::raw(SEPARATOR),
-        Span::styled(progress.report.activity.label().to_owned(), t.tool_prefix),
+        Span::styled(progress.report.activity.label().to_owned(), label),
     ];
     if let Some(detail) = progress.report.activity.detail() {
         spans.push(Span::styled(
@@ -1792,13 +1853,15 @@ fn activity_spans(progress: &ToolProgress) -> Vec<Span<'static>> {
             t.tool_dim,
         ));
     }
-    spans.push(Span::styled(
-        format!(
-            "{SEPARATOR}{}",
-            SubagentProgress::tally(progress.report.tools, progress.elapsed())
-        ),
-        t.tool_dim,
-    ));
+    if running {
+        spans.push(Span::styled(
+            format!(
+                "{SEPARATOR}{}",
+                SubagentProgress::tally(progress.report.tools, progress.elapsed())
+            ),
+            t.tool_dim,
+        ));
+    }
     spans
 }
 
@@ -1978,6 +2041,11 @@ mod tests {
     const TOOLS_RUN: u32 = 3;
     const TOOLS_TALLY: &str = "3 tools";
     const ACTIVITY_IS_TALLIED: &str = "a running agent counts the tools it has called";
+    const TIMELINE_REACHES_THE_TRANSCRIPT: &str =
+        "the transcript key must reach an agent from its timeline row";
+    const ROSTER_JOINS_THE_JOURNAL: &str =
+        "an agent row must open the request and result its call journaled";
+    const ACTIVITY_OUTLIVES_ITS_AGENT: &str = "a settled agent must keep what it was last doing";
     const ACTIVITY_IS_DROPPED: &str = "activity does not outlive the agent it described";
     const GROUPS_ARE_HEADED: &str = "a group of agents is headed by its phase";
     const GROUPS_FOLLOW_THE_PLAN: &str = "phase groups follow the order the run declares";
@@ -2180,7 +2248,7 @@ mod tests {
     /// The second row, so a cursor that did not follow the pointer would sit
     /// on the first one and the press would only move it.
     #[test]
-    fn a_hovered_agent_row_opens_on_one_click() {
+    fn a_hovered_agent_row_expands_on_one_click() {
         let mut terminal = terminal();
         let mut inspector = open_with(vec![run(RUN_ID, RunStatus::Active, roster(2))]);
         let _ = inspector.handle_key(key_event(KeyCode::Char('3')));
@@ -2196,10 +2264,14 @@ mod tests {
             row,
         ));
 
-        match action {
-            InspectorAction::OpenTranscript(task_id) => assert_eq!(task_id, task_id_of(1)),
-            action => panic!("{ONE_CLICK_OPENS}: {action:?}"),
-        }
+        assert_eq!(
+            action,
+            InspectorAction::LoadCallBody {
+                run_id: RUN_ID.into(),
+                call_key: 1,
+            },
+            "{ONE_CLICK_OPENS}"
+        );
     }
 
     #[test]
@@ -2523,7 +2595,7 @@ mod tests {
     }
 
     #[test]
-    fn an_agent_that_stopped_drops_its_activity() {
+    fn an_agent_that_stopped_keeps_its_last_activity() {
         let mut inspector = open_with(vec![fanned_out()]);
         inspector.set_progress(RUN_ID, EARLY_KEY, tool_progress());
         let mut settled = fanned_out();
@@ -2535,9 +2607,65 @@ mod tests {
         let text = section_text(&mut inspector, '3');
 
         assert!(
-            !text.contains(RUNNING_TOOL),
-            "{ACTIVITY_IS_DROPPED}: {text}"
+            text.contains(RUNNING_TOOL),
+            "{ACTIVITY_OUTLIVES_ITS_AGENT}: {text}"
         );
+    }
+
+    #[test]
+    fn the_transcript_key_reaches_an_agent_from_the_timeline_too() {
+        let mut walking = run(RUN_ID, RunStatus::Active, vec![agent(Some(TASK_ID))]);
+        walking.roster[0].call_key = 1;
+        let mut inspector = open_with(vec![walking.clone()]);
+        inspector.fill_detail(detail(walking));
+        let _ = inspector.handle_key(key_event(KeyCode::Char('2')));
+
+        let action = inspector.handle_key(key_event(KeyCode::Char(TRANSCRIPT_KEY)));
+
+        assert_eq!(
+            action,
+            InspectorAction::OpenTranscript(TASK_ID.into()),
+            "{TIMELINE_REACHES_THE_TRANSCRIPT}"
+        );
+    }
+
+    #[test]
+    fn an_agent_row_opens_the_journal_row_it_came_from() {
+        let mut walking = run(RUN_ID, RunStatus::Active, vec![agent(Some(TASK_ID))]);
+        walking.roster[0].call_key = 1;
+        let mut inspector = open_with(vec![walking.clone()]);
+        inspector.fill_detail(detail(walking));
+        let _ = inspector.handle_key(key_event(KeyCode::Char('3')));
+
+        let asked = inspector.handle_key(key_event(KeyCode::Enter));
+        inspector.fill_call_bodies(RUN_ID, Some(1), vec![body(1)]);
+
+        assert_eq!(
+            asked,
+            InspectorAction::LoadCallBody {
+                run_id: RUN_ID.into(),
+                call_key: 1,
+            },
+            "{ROSTER_JOINS_THE_JOURNAL}"
+        );
+        let text = section_text(&mut inspector, '3');
+        assert!(
+            text.contains(FULL_PROMPT),
+            "{ROSTER_JOINS_THE_JOURNAL}: {text}"
+        );
+        assert!(
+            text.contains(FULL_RESULT),
+            "{ROSTER_JOINS_THE_JOURNAL}: {text}"
+        );
+    }
+
+    #[test]
+    fn a_run_that_left_the_list_takes_its_activity_with_it() {
+        let mut inspector = open_with(vec![fanned_out()]);
+        inspector.set_progress(RUN_ID, EARLY_KEY, tool_progress());
+
+        let _ = inspector.refresh(vec![run(OTHER_RUN_ID, RunStatus::Active, Vec::new())]);
+
         assert!(inspector.live.is_empty(), "{ACTIVITY_IS_DROPPED}");
     }
 
@@ -2576,7 +2704,7 @@ mod tests {
     }
 
     #[test]
-    fn enter_on_an_agent_row_opens_its_transcript() {
+    fn the_transcript_key_opens_the_agent_under_the_cursor() {
         let mut inspector = open_with(vec![run(
             RUN_ID,
             RunStatus::Active,
@@ -2585,19 +2713,19 @@ mod tests {
         let _ = inspector.handle_key(key_event(KeyCode::Char('3')));
         assert_eq!(inspector.section(), Section::Agents);
 
-        match inspector.handle_key(key_event(KeyCode::Enter)) {
+        match inspector.handle_key(key_event(KeyCode::Char(TRANSCRIPT_KEY))) {
             InspectorAction::OpenTranscript(task_id) => assert_eq!(task_id, TASK_ID),
             action => panic!("{TRANSCRIPT}: {action:?}"),
         }
     }
 
     #[test]
-    fn enter_on_an_agent_without_a_transcript_says_so() {
+    fn the_transcript_key_on_an_agent_without_one_says_so() {
         let mut inspector = open_with(vec![run(RUN_ID, RunStatus::Active, vec![agent(None)])]);
         let _ = inspector.handle_key(key_event(KeyCode::Char('3')));
 
         assert_eq!(
-            inspector.handle_key(key_event(KeyCode::Enter)),
+            inspector.handle_key(key_event(KeyCode::Char(TRANSCRIPT_KEY))),
             InspectorAction::Flash(NO_TRANSCRIPT)
         );
     }

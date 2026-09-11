@@ -1025,7 +1025,7 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::All,
     },
     Keybind {
-        label: KeyLabel::Single("1-6"),
+        label: KeyLabel::Single("1-4"),
         description: "Jump to a section",
         context: KeybindContext::WorkflowInspector,
         platform: Platform::All,
@@ -1038,7 +1038,13 @@ pub const KEYBINDS: &[Keybind] = &[
     },
     Keybind {
         label: KeyLabel::Single("Enter"),
-        description: "Open the selected agent's transcript, a scratch file, or expand a call",
+        description: "Open the row under the cursor: a phase's agents, a scratch file, or a call's prompt and result",
+        context: KeybindContext::WorkflowInspector,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(workflow_inspector::TRANSCRIPT_LABEL),
+        description: "Open the transcript of the agent under the cursor",
         context: KeybindContext::WorkflowInspector,
         platform: Platform::All,
     },
