@@ -32,7 +32,7 @@ The model can launch workflows too, through the `workflow` tool, when the sessio
 
 ## Watching a run
 
-A launch draws a card in the transcript, whether you typed the command or the model called the `workflow` tool. The header names the run and reads its status, phase, agents admitted against the budget, and tokens spent. Below it sits the phase strip, the agents working right now, and the last three log lines. When the run settles the log lines give way to the report, the scratch file path, and any error. Click the scratch file path to open it in the [workbench](/docs/workbench/). Click anywhere else on the card to open the inspector on that run. The card of a slash launch is not saved with the session. A card the tool drew is part of the tool result and comes back on restore, brought up to date from the runtime.
+A launch draws a card in the transcript, whether you typed the command or the model called the `workflow` tool. The header names the run and reads its status, phase, agents admitted against the budget, and tokens spent. Below it sits the phase strip, the agents working right now, and the last three log lines. When the run settles the log lines give way to the report, the scratch file path, and any error. A run that spent its budget says so on the card and asks for a higher one. Click the scratch file path to open it in the [workbench](/docs/workbench/). Click anywhere else on the card to open the inspector on that run. The card of a slash launch is not saved with the session. A card the tool drew is part of the tool result and comes back on restore, brought up to date from the runtime.
 
 The status bar keeps a chip while any run is going. One active run shows as `[wf: deep-research · Research 2/4]`, with its phase and where that phase sits among the ones the script declared. Several runs, or runs parked waiting on someone, show as `[wf:2+1 · Research]` with the newest run's phase. A narrow bar drops the phase before it drops the chip. Click the chip to open the inspector.
 
@@ -42,13 +42,13 @@ Pressing Esc cancels the main turn and leaves workflow runs alone. Stop them fro
 
 ## The inspector
 
-`/workflow` (or `/workflow runs`, or the leader key followed by `k`) opens the inspector. Clicking a run card or the status bar chip opens it on that run. The left pane lists runs grouped as running, waiting, finished, and earlier sessions. Type `/` to filter by name or session title. The right pane has six sections, reached with Tab, Shift+Tab, or the digits `1` to `6`:
+`/workflow` (or `/workflow runs`, or the leader key followed by `k`) opens the inspector. Clicking a run card or the status bar chip opens it on that run. The left pane lists runs grouped as running, waiting, finished, and earlier sessions. Each row names the run, then its phase or the session that ran it, and holds its clock at the right edge. Type `/` to filter by name or session title. The right pane has six sections, reached with Tab, Shift+Tab, or the digits `1` to `6`:
 
 | Section | Contents |
 |---------|----------|
-| Overview | Status, phase, elapsed time, agents, tokens, objective, the phase strip, and the last log lines |
-| Phases | Every phase the run entered with its start offset and duration |
-| Agents | The roster with state, phase, tokens, and duration. Enter opens the agent's transcript |
+| Overview | Status, phase, elapsed time, agents landed against the roster, agents admitted against the budget, tokens, objective, the phase strip, and the last log lines |
+| Phases | Every phase the run entered with its start offset, its duration, and the agents it dispatched, then the phases the script declares and the run has not reached. Enter moves to the first agent of a phase |
+| Agents | The roster gathered under the phase that dispatched each agent. A running agent reports what it is doing, the tools it has called, and its clock. A stopped one reports its tokens and duration. Enter opens the agent's transcript |
 | Calls | The journal: each `agent`, `parallel`, and `write_scratch_file` call with its state and timing. Enter expands a call's result preview or error, or opens the file a `write_scratch_file` call wrote |
 | Logs | The stored timeline of phase changes and `log` lines, following the tail |
 | Result | The report or result JSON, the scratch file path, and the pause message or error. Enter, or a click on the path, opens the scratch file in the workbench |
@@ -56,16 +56,18 @@ Pressing Esc cancels the main turn and leaves workflow runs alone. Stop them fro
 | Key | Action |
 |-----|--------|
 | `p` | Pause the selected active run |
-| `r` | Resume a paused, failed, or cancelled run |
+| `r` | Resume a paused, failed, or cancelled run, or ask for a higher budget when the run spent the one it had |
 | `s` | Stop the run |
 | Left / Right | Move focus between the run list and the section |
 | Up / Down | Walk the list, the section rows, or scroll the section text |
 | `y` | Copy the visible section as text |
 | Esc | Close |
 
+A control that does not apply to the selected run stays where it is and says why when you press it.
+
 Runs of earlier sessions can be read but not controlled. Resume one from the session that launched it.
 
-The same controls exist as text: `/workflow pause <name>`, `/workflow resume <name>`, `/workflow stop <name>`. Launch the same workflow twice and the second run is `deep-research-2`.
+The same controls exist as text: `/workflow pause <name>`, `/workflow resume <name> [budget]`, `/workflow stop <name>`. A name can be a prefix of the run name or of its id, and a prefix that several runs answer to lists them instead of picking one. Launch the same workflow twice and the second run is `deep-research-2`.
 
 ## Where definitions live
 
@@ -139,7 +141,7 @@ Resume is not exactly-once for the outside world. An agent that edited files bef
 
 A run that was active when the process exited becomes `interrupted` and does not resume. External effects have no stable identity across processes, so replaying them would be a guess. Start a new run.
 
-Run statuses: `active`, `paused`, `budget_limited`, `interrupted`, `completed`, `cancelled`, `failed`. A `budget_limited` run resumes only with an `agent_budget` above the count already admitted.
+Run statuses: `active`, `paused`, `budget_limited`, `interrupted`, `completed`, `cancelled`, `failed`. A `budget_limited` run resumes only with an `agent_budget` above the count already admitted. Pressing `r` in the inspector asks for one and offers a step up from what the run spent, and `/workflow resume <name> <budget>` carries it from the command line.
 
 ## Artifacts and storage
 
