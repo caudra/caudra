@@ -2882,6 +2882,20 @@ impl App {
             self.on_workflow_event(*event);
             return vec![];
         }
+        // A workflow agent reports under the workflow's run id like the run
+        // itself, so its digest is read here rather than behind the
+        // stale-run filter. It has no task header to land on either: the
+        // inspector's roster row is where a reader looks for it.
+        if let AgentEvent::SubagentProgress { progress } = &envelope.event
+            && let Some(workflow) = &envelope.workflow
+        {
+            self.workflow_inspector.set_progress(
+                &workflow.run_id,
+                workflow.call_key,
+                progress.clone(),
+            );
+            return vec![];
+        }
         if envelope.run_id == RESTORE_RUN_ID {
             let (id, snapshot, theme_gen, is_header) = match envelope.event {
                 AgentEvent::ToolSnapshot {

@@ -7,12 +7,14 @@
 //! runtime for a run's detail when the selection or the run moves, and
 //! every control names the run it acts on.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
+use caudra_agent::SubagentProgress;
 use caudra_agent::types::{PhaseMark, WorkflowRunCard};
 use caudra_workflow::{
-    CallKind, CallState, MAX_AGENT_BUDGET, RosterState, RunCall, RunDetail, RunEventKind,
-    RunHistoryEntry, RunSnapshot, RunStatus,
+    AgentRosterEntry, CallKind, CallState, MAX_AGENT_BUDGET, RosterState, RunCall, RunDetail,
+    RunEventKind, RunHistoryEntry, RunSnapshot, RunStatus,
 };
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
@@ -26,8 +28,8 @@ use crate::components::modal::{FooterHits, FooterLine, Modal};
 use crate::components::scrollbar::render_vertical_scrollbar;
 use crate::components::workflow_card::{phase_strip_line, status_span};
 use crate::components::{
-    ModalScroll, Overlay, escape_terminal_controls, format_compact, format_elapsed, format_integer,
-    input_line_with_cursor, now_secs, visual_rows,
+    ModalScroll, Overlay, ToolProgress, escape_terminal_controls, format_compact, format_elapsed,
+    format_integer, input_line_with_cursor, now_secs, visual_rows,
 };
 use crate::repaint::Cadence;
 use crate::text_buffer::TextBuffer;
@@ -351,6 +353,10 @@ pub struct WorkflowInspector {
     tab_hits: Vec<(Rect, Section)>,
     footer: FooterLine,
     footer_hits: FooterHits,
+    /// What each running agent is doing, by run and by the call that
+    /// launched it. The roster carries no activity, so it arrives on the
+    /// agent's own event stream and is dropped when the agent stops.
+    live: HashMap<String, HashMap<u64, ToolProgress>>,
 }
 
 impl WorkflowInspector {
@@ -379,6 +385,7 @@ impl WorkflowInspector {
             tab_hits: Vec::new(),
             footer: FooterLine::default(),
             footer_hits: FooterHits::default(),
+            live: HashMap::new(),
         }
     }
 
@@ -387,6 +394,7 @@ impl WorkflowInspector {
     pub fn open(&mut self, runs: Vec<RunSnapshot>, preferred: Option<&str>) -> Option<String> {
         self.open = true;
         self.runs = runs;
+        self.prune_live();
         self.history.clear();
         self.filter.clear();
         self.filter_focused = false;
@@ -410,6 +418,7 @@ impl WorkflowInspector {
             return None;
         }
         self.runs = runs;
+        self.prune_live();
         let Some(selected) = self.selected.clone() else {
             return requested(self.settle_selection());
         };
@@ -425,6 +434,33 @@ impl WorkflowInspector {
             return Some(selected);
         }
         None
+    }
+
+    /// What one of a run's agents is doing now. Reports arrive whether the
+    /// inspector is open or not, so that a run opened mid-flight reads as
+    /// busy straight away rather than after the next report.
+    pub fn set_progress(&mut self, run_id: &str, call_key: u64, report: SubagentProgress) {
+        self.live
+            .entry(run_id.to_owned())
+            .or_default()
+            .insert(call_key, ToolProgress::live(report));
+    }
+
+    /// Activity outlives no agent: an entry is kept only while the roster
+    /// still says the agent it belongs to is running.
+    fn prune_live(&mut self) {
+        let runs = &self.runs;
+        self.live.retain(|run_id, agents| {
+            let Some(run) = runs.iter().find(|run| run.run_id == *run_id) else {
+                return false;
+            };
+            agents.retain(|call_key, _| {
+                run.roster
+                    .iter()
+                    .any(|agent| agent.call_key == *call_key && agent.state == RosterState::Running)
+            });
+            !agents.is_empty()
+        });
     }
 
     pub fn fill_detail(&mut self, detail: RunDetail) {
@@ -482,6 +518,11 @@ impl WorkflowInspector {
     #[cfg(test)]
     pub(crate) fn history_count(&self) -> usize {
         self.history.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn live_count(&self) -> usize {
+        self.live.values().map(HashMap::len).sum()
     }
 
     /// The wheel over the list walks the selection; over the body it scrolls
@@ -1295,6 +1336,15 @@ impl WorkflowInspector {
         (lines, starts)
     }
 
+    /// The last progress report of an agent that is still running, when one
+    /// has landed. A stopped agent is described by the roster instead.
+    fn activity(&self, run: &RunSnapshot, agent: &AgentRosterEntry) -> Option<&ToolProgress> {
+        if agent.state != RosterState::Running {
+            return None;
+        }
+        self.live.get(&run.run_id)?.get(&agent.call_key)
+    }
+
     /// The roster gathered under the phase that dispatched each agent, so a
     /// fan-out reads as the phase that opened it rather than as one long
     /// list. A run whose agents carry no phase keeps the plain list.
@@ -1322,20 +1372,24 @@ impl WorkflowInspector {
                 RosterState::Running => Span::styled(spinner.to_owned(), t.spinner),
                 state => Span::styled(format!("{state} "), roster_style(state)),
             };
-            starts.push(lines.len());
-            lines.push(Line::from(vec![
+            let mut spans = vec![
                 Span::styled(self.cursor_mark(position), t.accent),
                 state,
                 Span::styled(escape_terminal_controls(&agent.label), t.bold),
-                Span::styled(
+            ];
+            match self.activity(run, agent) {
+                Some(progress) => spans.extend(activity_spans(progress)),
+                None => spans.push(Span::styled(
                     format!(
                         "{SEPARATOR}{}{TOKENS_UNIT}{SEPARATOR}{}",
                         format_compact(agent.tokens_used),
                         format_elapsed(agent.duration_ms / 1_000)
                     ),
                     t.tool_dim,
-                ),
-            ]));
+                )),
+            }
+            starts.push(lines.len());
+            lines.push(Line::from(spans));
         }
         (lines, starts)
     }
@@ -1589,6 +1643,30 @@ fn roster_tally(run: &RunSnapshot) -> String {
     format!("{done}{AGENT_SLASH}{}{DONE_UNIT}", run.roster.len())
 }
 
+/// `· shell cargo test · 3 tools · 1m2s`, the shape a subagent's task header
+/// already uses, so a workflow agent reads like any other agent.
+fn activity_spans(progress: &ToolProgress) -> Vec<Span<'static>> {
+    let t = theme::current();
+    let mut spans = vec![
+        Span::raw(SEPARATOR),
+        Span::styled(progress.report.activity.label().to_owned(), t.tool_prefix),
+    ];
+    if let Some(detail) = progress.report.activity.detail() {
+        spans.push(Span::styled(
+            format!(" {}", escape_terminal_controls(detail)),
+            t.tool_dim,
+        ));
+    }
+    spans.push(Span::styled(
+        format!(
+            "{SEPARATOR}{}",
+            SubagentProgress::tally(progress.report.tools, progress.elapsed())
+        ),
+        t.tool_dim,
+    ));
+    spans
+}
+
 /// `· 2/5 agents` for a phase that dispatched any, counting the ones that
 /// have stopped against the ones it opened.
 fn agent_tally(run: &RunSnapshot, phase: &str) -> Option<String> {
@@ -1691,7 +1769,11 @@ fn call_style(state: CallState) -> Style {
 
 #[cfg(test)]
 mod tests {
-    use caudra_workflow::{AgentRosterEntry, CallKind, PhaseRecord, RunUsage, SourceKind};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use caudra_agent::SubagentActivity;
+    use caudra_workflow::{CallKind, PhaseRecord, RunUsage, SourceKind};
     use test_case::test_case;
 
     use super::*;
@@ -1728,6 +1810,14 @@ mod tests {
     const PENDING_IS_LISTED: &str = "a declared phase the run has not reached is listed";
     const EARLY_AGENT: &str = "scout";
     const LATE_AGENT: &str = "writer";
+    const EARLY_KEY: u64 = 1;
+    const LATE_KEY: u64 = 2;
+    const RUNNING_TOOL: &str = "shell";
+    const TOOL_SUMMARY: &str = "cargo nextest run";
+    const TOOLS_RUN: u32 = 3;
+    const TOOLS_TALLY: &str = "3 tools";
+    const ACTIVITY_IS_TALLIED: &str = "a running agent counts the tools it has called";
+    const ACTIVITY_IS_DROPPED: &str = "activity does not outlive the agent it described";
     const GROUPS_ARE_HEADED: &str = "a group of agents is headed by its phase";
     const GROUPS_FOLLOW_THE_PLAN: &str = "phase groups follow the order the run declares";
     const PHASE_OPENS_ITS_GROUP: &str = "opening a phase moves the cursor to the agents it opened";
@@ -1975,8 +2065,9 @@ mod tests {
         );
     }
 
-    fn phased(label: &str, phase: &str) -> AgentRosterEntry {
+    fn phased(call_key: u64, label: &str, phase: &str) -> AgentRosterEntry {
         AgentRosterEntry {
+            call_key,
             label: label.into(),
             phase: Some(phase.into()),
             ..agent(None)
@@ -1990,8 +2081,8 @@ mod tests {
             RUN_ID,
             RunStatus::Active,
             vec![
-                phased(LATE_AGENT, PHASE_TWO),
-                phased(EARLY_AGENT, PHASE_ONE),
+                phased(LATE_KEY, LATE_AGENT, PHASE_TWO),
+                phased(EARLY_KEY, EARLY_AGENT, PHASE_ONE),
             ],
         );
         walking.phases = vec![PHASE_ONE.into(), PHASE_TWO.into()];
@@ -2041,6 +2132,45 @@ mod tests {
 
         assert_eq!(action, InspectorAction::Flash(NO_AGENTS_IN_PHASE));
         assert_eq!(inspector.section, Section::Phases);
+    }
+
+    fn tool_progress() -> SubagentProgress {
+        SubagentProgress {
+            activity: SubagentActivity::tool(Arc::from(RUNNING_TOOL), TOOL_SUMMARY),
+            tools: TOOLS_RUN,
+            elapsed: Duration::ZERO,
+        }
+    }
+
+    #[test]
+    fn a_running_agent_says_what_it_is_doing() {
+        let mut inspector = open_with(vec![fanned_out()]);
+        inspector.set_progress(RUN_ID, EARLY_KEY, tool_progress());
+
+        let text = section_text(&mut inspector, '3');
+
+        assert!(text.contains(RUNNING_TOOL), "{text}");
+        assert!(text.contains(TOOL_SUMMARY), "{text}");
+        assert!(text.contains(TOOLS_TALLY), "{ACTIVITY_IS_TALLIED}: {text}");
+    }
+
+    #[test]
+    fn an_agent_that_stopped_drops_its_activity() {
+        let mut inspector = open_with(vec![fanned_out()]);
+        inspector.set_progress(RUN_ID, EARLY_KEY, tool_progress());
+        let mut settled = fanned_out();
+        for agent in &mut settled.roster {
+            agent.state = RosterState::Completed;
+        }
+
+        let _ = inspector.refresh(vec![settled]);
+        let text = section_text(&mut inspector, '3');
+
+        assert!(
+            !text.contains(RUNNING_TOOL),
+            "{ACTIVITY_IS_DROPPED}: {text}"
+        );
+        assert!(inspector.live.is_empty(), "{ACTIVITY_IS_DROPPED}");
     }
 
     #[test]

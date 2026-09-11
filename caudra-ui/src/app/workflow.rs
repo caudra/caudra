@@ -611,9 +611,10 @@ fn bounded(body: &str) -> Cow<'_, str> {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use std::time::Duration;
 
-    use caudra_agent::types::WORKFLOW_EVENT_RUN_ID;
-    use caudra_agent::{AgentEvent, Envelope};
+    use caudra_agent::types::{WORKFLOW_EVENT_RUN_ID, WorkflowProvenance};
+    use caudra_agent::{AgentEvent, Envelope, SubagentActivity, SubagentProgress};
     use caudra_workflow::{
         CatalogEntry, RunDetail, RunHistoryEntry, RunUsage, SourceKind, WorkflowCatalog,
     };
@@ -642,6 +643,7 @@ mod tests {
     const CARD_DRAWN: &str = "a slash launch draws the run's card in the transcript";
     const CARD_FOLLOWS: &str = "the card must follow the run's snapshots";
     const LOG_MIRRORED: &str = "a log line must reach the mirror's tail";
+    const NO_CARD_CHURN: &str = "an agent's activity must not touch the transcript";
 
     pub(crate) fn run(status: RunStatus) -> RunSnapshot {
         RunSnapshot {
@@ -865,6 +867,39 @@ mod tests {
             run_id: WORKFLOW_EVENT_RUN_ID,
             workflow: None,
         }))
+    }
+
+    /// The progress digest of an agent a workflow run launched, stamped with
+    /// the run and call it belongs to.
+    fn agent_progress_envelope() -> Msg {
+        Msg::Agent(Box::new(Envelope {
+            event: AgentEvent::SubagentProgress {
+                progress: SubagentProgress {
+                    activity: SubagentActivity::Responding,
+                    tools: 1,
+                    elapsed: Duration::ZERO,
+                },
+            },
+            subagent: None,
+            run_id: WORKFLOW_EVENT_RUN_ID,
+            workflow: Some(WorkflowProvenance {
+                run_id: RUN_ID.into(),
+                epoch: 0,
+                call_key: 1,
+                phase: None,
+            }),
+        }))
+    }
+
+    /// A workflow agent has no task header, so its digest is addressed to the
+    /// inspector's roster instead of to the transcript.
+    #[test]
+    fn a_workflow_agents_progress_reaches_the_inspector() {
+        let mut app = scripted_app();
+        app.update(agent_progress_envelope());
+
+        assert_eq!(app.workflow_inspector.live_count(), 1);
+        assert_eq!(app.main_chat().message_count(), 0, "{NO_CARD_CHURN}");
     }
 
     #[test_case("/workflow", "review" ; "workflow")]
