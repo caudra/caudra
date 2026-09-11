@@ -10,11 +10,13 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+mod timeline;
+
 use caudra_agent::SubagentProgress;
 use caudra_agent::types::{PhaseMark, WorkflowRunCard};
 use caudra_workflow::{
     AgentRosterEntry, CallKind, CallState, MAX_AGENT_BUDGET, RosterState, RunCall, RunCallBody,
-    RunDetail, RunEventKind, RunHistoryEntry, RunSnapshot, RunStatus,
+    RunDetail, RunHistoryEntry, RunSnapshot, RunStatus,
 };
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
@@ -27,6 +29,7 @@ use crate::animation::{animation_elapsed_ms, spinner_str};
 use crate::components::modal::{FooterHits, FooterLine, Modal};
 use crate::components::scrollbar::{Scrollbar, ScrollbarMouse};
 use crate::components::workflow_card::{phase_strip_line, status_span};
+use crate::components::workflow_inspector::timeline::{TimelineRow, span_bar, timeline};
 use crate::components::{
     ModalScroll, Overlay, ToolProgress, escape_terminal_controls, format_compact, format_elapsed,
     format_integer, hover_style, input_line_with_cursor, now_secs, visual_rows,
@@ -51,12 +54,18 @@ const EMPTY_HINT: &str = "Start one with /workflow <name>, or /workflows to brow
 const NO_MATCH: &str = "No run matches";
 const NO_SELECTION: &str = "Select a run";
 const LOADING: &str = "Loading\u{2026}";
-const NO_PHASES: &str = "No phases yet";
+const NO_TIMELINE: &str = "This run recorded nothing";
+const NEST_INDENT: &str = "  ";
+const FAILED_UNIT: &str = " failed";
+/// What the row's text needs before a bar may have the rest of the width.
+const BAR_RESERVED_COLS: usize = 48;
+const BAR_MAX_WIDTH: usize = 24;
+const CALL_RUNNING_GLYPH: &str = "\u{25b8}";
+const CALL_DONE_GLYPH: &str = "\u{2713}";
+const CALL_FAILED_GLYPH: &str = "\u{2717}";
 const NO_AGENTS: &str = "No agents yet";
 const NO_AGENTS_IN_PHASE: &str = "This phase dispatched no agents";
 const UNPHASED_GROUP: &str = "No phase";
-const NO_CALLS: &str = "No calls yet";
-const NO_LOGS: &str = "No log lines yet";
 const NO_RESULT: &str = "No result yet";
 const JOURNAL_TRIMMED: &str = "Journal trimmed: the calls are no longer stored";
 pub(crate) const FOREIGN_RUN: &str = "Runs of earlier sessions can only be viewed";
@@ -90,7 +99,6 @@ const GROUP_EARLIER: &str = "Earlier sessions";
 const CURSOR_MARK: &str = "\u{203a} ";
 const NO_MARK: &str = "  ";
 const SEPARATOR: &str = " \u{b7} ";
-const ARROW: &str = "\u{2192} ";
 const EXPAND_INDENT: &str = "      ";
 const STATUS_LABEL: &str = "Status: ";
 const PHASE_LABEL: &str = "Phase: ";
@@ -199,30 +207,19 @@ enum FooterCommand {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Section {
     Overview,
-    Phases,
+    Timeline,
     Agents,
-    Calls,
-    Logs,
     Result,
 }
 
 impl Section {
-    const ALL: [Self; 6] = [
-        Self::Overview,
-        Self::Phases,
-        Self::Agents,
-        Self::Calls,
-        Self::Logs,
-        Self::Result,
-    ];
+    const ALL: [Self; 4] = [Self::Overview, Self::Timeline, Self::Agents, Self::Result];
 
     fn label(self) -> &'static str {
         match self {
             Self::Overview => "Overview",
-            Self::Phases => "Phases",
+            Self::Timeline => "Timeline",
             Self::Agents => "Agents",
-            Self::Calls => "Calls",
-            Self::Logs => "Logs",
             Self::Result => "Result",
         }
     }
@@ -248,13 +245,14 @@ impl Section {
     /// Sections whose rows a cursor walks. Enter also acts on the result,
     /// which has one thing to open and no cursor to place.
     fn has_items(self) -> bool {
-        matches!(self, Self::Phases | Self::Agents | Self::Calls)
+        matches!(self, Self::Timeline | Self::Agents)
     }
 
-    /// Logs follow their tail; everything else opens at the top.
+    /// The timeline follows its tail, because the newest row is the one a
+    /// reader watching a live run wants. Everything else opens at the top.
     fn scroll(self) -> ModalScroll {
         match self {
-            Self::Logs => ModalScroll::new(),
+            Self::Timeline => ModalScroll::new(),
             _ => ModalScroll::new_top(),
         }
     }
@@ -760,9 +758,7 @@ impl WorkflowInspector {
             self.pane = Pane::Detail;
             match (self.section, hit) {
                 (Section::Result, Some(_)) => return self.activate(),
-                (Section::Phases | Section::Agents | Section::Calls, Some(index))
-                    if index == self.cursor =>
-                {
+                (Section::Timeline | Section::Agents, Some(index)) if index == self.cursor => {
                     return self.activate();
                 }
                 (_, Some(index)) => self.cursor = index,
@@ -867,7 +863,7 @@ impl WorkflowInspector {
 
     fn activate(&mut self) -> InspectorAction {
         match self.section {
-            Section::Phases => self.open_phase(),
+            Section::Timeline => self.open_timeline_row(),
             Section::Agents => match self
                 .selected_run()
                 .and_then(|run| agent_order(run).get(self.cursor).map(|at| &run.roster[*at]))
@@ -878,18 +874,6 @@ impl WorkflowInspector {
                 },
                 None => InspectorAction::Consumed,
             },
-            Section::Calls => {
-                let Some(call) = self.calls().get(self.cursor) else {
-                    return InspectorAction::Consumed;
-                };
-                if call.kind == CallKind::ScratchFile
-                    && let Some(path) = &call.result_preview
-                {
-                    return InspectorAction::OpenFile(PathBuf::from(path));
-                }
-                let key = call.call_key;
-                self.expand_call(key)
-            }
             Section::Result => match self.selected_run().and_then(RunSnapshot::scratch_path) {
                 Some(path) => InspectorAction::OpenFile(PathBuf::from(path)),
                 None => InspectorAction::Consumed,
@@ -960,21 +944,39 @@ impl WorkflowInspector {
         lines
     }
 
-    /// A phase row is a link into the roster: opening it lands the cursor on
-    /// the first agent that phase dispatched.
-    fn open_phase(&mut self) -> InspectorAction {
-        let Some(run) = self.selected_run() else {
+    /// What the row under the cursor opens: a scratch call opens its file, an
+    /// agent call opens its body, and a phase is a link into the roster that
+    /// lands the cursor on the first agent it dispatched. The rest are the
+    /// record speaking for itself and have nothing behind them.
+    fn open_timeline_row(&mut self) -> InspectorAction {
+        let Some(row) = self.timeline_rows(now_secs()).get(self.cursor).cloned() else {
             return InspectorAction::Consumed;
         };
-        let Some(title) = phase_titles(run)
-            .get(self.cursor)
-            .map(|title| title.to_string())
-        else {
+        match row {
+            TimelineRow::Phase { title, .. } => self.open_phase(&title),
+            TimelineRow::Call { call, .. } => {
+                let Some(call) = self.detail.as_ref().and_then(|d| d.calls.get(call)) else {
+                    return InspectorAction::Consumed;
+                };
+                if call.kind == CallKind::ScratchFile
+                    && let Some(path) = &call.result_preview
+                {
+                    return InspectorAction::OpenFile(PathBuf::from(path));
+                }
+                let key = call.call_key;
+                self.expand_call(key)
+            }
+            _ => InspectorAction::Consumed,
+        }
+    }
+
+    fn open_phase(&mut self, title: &str) -> InspectorAction {
+        let Some(run) = self.selected_run() else {
             return InspectorAction::Consumed;
         };
         let Some(at) = agent_order(run)
             .iter()
-            .position(|index| run.roster[*index].phase.as_deref() == Some(title.as_str()))
+            .position(|index| run.roster[*index].phase.as_deref() == Some(title))
         else {
             return InspectorAction::Flash(NO_AGENTS_IN_PHASE);
         };
@@ -1091,15 +1093,18 @@ impl WorkflowInspector {
             .map(|entry| entry.session_title.as_str())
     }
 
-    fn calls(&self) -> &[RunCall] {
-        self.detail.as_ref().map_or(&[], |detail| &detail.calls)
+    /// The run's record as rows, or nothing until its journal has landed.
+    fn timeline_rows(&self, now: u64) -> Vec<TimelineRow> {
+        let (Some(run), Some(detail)) = (self.selected_run(), self.detail.as_ref()) else {
+            return Vec::new();
+        };
+        timeline(run, detail, now)
     }
 
     fn item_count(&self) -> usize {
         match self.section {
-            Section::Phases => self.selected_run().map_or(0, |run| phase_titles(run).len()),
+            Section::Timeline => self.timeline_rows(now_secs()).len(),
             Section::Agents => self.selected_run().map_or(0, |run| run.roster.len()),
-            Section::Calls => self.calls().len(),
             _ => 0,
         }
     }
@@ -1351,10 +1356,8 @@ impl WorkflowInspector {
         };
         match self.section {
             Section::Overview => (self.overview_lines(run, now), Vec::new()),
-            Section::Phases => self.phase_lines(run, now),
+            Section::Timeline => self.timeline_lines(run, now),
             Section::Agents => self.agent_lines(run),
-            Section::Calls => self.call_lines(),
-            Section::Logs => (self.log_lines(run), Vec::new()),
             Section::Result => result_lines(run),
         }
     }
@@ -1427,76 +1430,147 @@ impl WorkflowInspector {
         lines
     }
 
-    /// What the run has walked, then what the script still declares ahead of
-    /// it. The entered phases are listed in the order they happened, repeats
-    /// included, because the timeline is the record; the declared phases it
-    /// has not reached follow as pending, because that is the part still to
-    /// come.
-    fn phase_lines(&self, run: &RunSnapshot, now: u64) -> (Vec<Line<'static>>, Vec<usize>) {
+    /// The run's record as one ordered list. Phases are the spine, and the
+    /// calls and log lines that happened inside one are indented under it, so
+    /// the join a reader used to perform across four sections is already done.
+    fn timeline_lines(&self, run: &RunSnapshot, now: u64) -> (Vec<Line<'static>>, Vec<usize>) {
         let t = theme::current();
-        let titles = phase_titles(run);
-        if titles.is_empty() {
-            return (vec![Line::styled(NO_PHASES, t.tool_dim)], Vec::new());
-        }
-        let end = match run.status.is_terminal() {
-            true => run.updated_at,
-            false => now,
+        let Some(detail) = &self.detail else {
+            return (vec![Line::styled(LOADING, t.tool_dim)], Vec::new());
         };
-        let last = run.phase_history.len().saturating_sub(1);
-        let mut lines: Vec<Line<'static>> = run
-            .phase_history
-            .iter()
-            .enumerate()
-            .map(|(index, record)| {
-                let next_start = run
-                    .phase_history
-                    .get(index + 1)
-                    .map_or(end, |next| next.started_at);
-                let (mark, style) = match index == last && !run.status.is_terminal() {
-                    true => (PhaseMark::Current, t.accent),
-                    false => (PhaseMark::Done, t.tool_success),
-                };
-                // A phase entered twice would otherwise claim its agents twice
-                // over, reading as more agents than the run ever dispatched.
-                let final_visit = run
-                    .phase_history
-                    .iter()
-                    .rposition(|other| other.title == record.title)
-                    == Some(index);
-                let mut spans = vec![
-                    Span::styled(self.cursor_mark(index), t.accent),
-                    Span::styled(format!("{} ", mark.glyph()), style),
-                    Span::styled(escape_terminal_controls(&record.title), t.bold),
-                    Span::styled(
+        let rows = timeline(run, detail, now);
+        let window = (
+            run.created_at,
+            match run.status.is_terminal() {
+                true => run.updated_at,
+                false => now,
+            },
+        );
+        let bar_width = usize::from(self.body_area.width)
+            .saturating_sub(BAR_RESERVED_COLS)
+            .min(BAR_MAX_WIDTH);
+        if rows.is_empty() {
+            return (vec![Line::styled(NO_TIMELINE, t.tool_dim)], Vec::new());
+        }
+        let spinner = spinner_str(animation_elapsed_ms());
+        let mut lines: Vec<Line<'static>> = Vec::with_capacity(rows.len());
+        let mut starts = Vec::with_capacity(rows.len());
+        if detail.journal_trimmed {
+            lines.push(Line::styled(JOURNAL_TRIMMED, t.tool_warning));
+        }
+        for (position, row) in rows.iter().enumerate() {
+            starts.push(lines.len());
+            let mut spans = vec![Span::styled(self.cursor_mark(position), t.accent)];
+            if row.is_nested() {
+                spans.push(Span::raw(NEST_INDENT));
+            }
+            match row {
+                TimelineRow::Phase {
+                    title,
+                    at,
+                    end,
+                    agents,
+                    failed,
+                } => {
+                    let running = *end >= now && !run.status.is_terminal();
+                    let (mark, style) = match running {
+                        true => (PhaseMark::Current, t.accent),
+                        false => (PhaseMark::Done, t.tool_success),
+                    };
+                    spans.push(Span::styled(format!("{} ", mark.glyph()), style));
+                    spans.push(Span::styled(escape_terminal_controls(title), t.bold));
+                    spans.push(Span::styled(
                         format!(
                             "{SEPARATOR}{}{SEPARATOR}{}",
-                            offset_text(record.started_at.saturating_sub(run.created_at)),
-                            format_elapsed(next_start.saturating_sub(record.started_at))
+                            offset_text(at.saturating_sub(run.created_at)),
+                            format_elapsed(end.saturating_sub(*at))
                         ),
                         t.tool_dim,
-                    ),
-                ];
-                if final_visit && let Some(tally) = agent_tally(run, &record.title) {
-                    spans.push(Span::styled(tally, t.tool_dim));
+                    ));
+                    if *agents > 0 {
+                        spans.push(Span::styled(
+                            format!("{SEPARATOR}{agents}{AGENTS_UNIT}"),
+                            t.tool_dim,
+                        ));
+                    }
+                    if *failed > 0 {
+                        spans.push(Span::styled(
+                            format!("{SEPARATOR}{failed}{FAILED_UNIT}"),
+                            t.tool_error,
+                        ));
+                    }
                 }
-                Line::from(spans)
-            })
-            .collect();
-        let walked = run.phase_history.len();
-        lines.extend(
-            titles
-                .iter()
-                .skip(walked)
-                .enumerate()
-                .map(|(offset, title)| {
-                    Line::from(vec![
-                        Span::styled(self.cursor_mark(walked + offset), t.accent),
-                        Span::styled(format!("{} ", PhaseMark::Pending.glyph()), t.tool_dim),
-                        Span::styled(escape_terminal_controls(title), t.tool_dim),
-                    ])
-                }),
-        );
-        let starts = (0..lines.len()).collect();
+                TimelineRow::Pending { title } => {
+                    spans.push(Span::styled(
+                        format!("{} ", PhaseMark::Pending.glyph()),
+                        t.tool_dim,
+                    ));
+                    spans.push(Span::styled(escape_terminal_controls(title), t.tool_dim));
+                }
+                TimelineRow::Call { at, end, call } => {
+                    let call = &detail.calls[*call];
+                    match call.state {
+                        CallState::Started => {
+                            spans.push(Span::styled(spinner.to_owned(), t.spinner));
+                        }
+                        state => spans.push(Span::styled(
+                            format!("{} ", call_glyph(state)),
+                            call_style(state),
+                        )),
+                    }
+                    spans.push(Span::styled(
+                        escape_terminal_controls(&call_name(call)),
+                        t.bold,
+                    ));
+                    spans.push(Span::styled(
+                        format!(
+                            "{SEPARATOR}{}{SEPARATOR}{}",
+                            offset_text(at.saturating_sub(run.created_at)),
+                            format_elapsed(end.saturating_sub(*at))
+                        ),
+                        t.tool_dim,
+                    ));
+                    if call.tokens_used > 0 {
+                        spans.push(Span::styled(
+                            format!("{SEPARATOR}{}", format_compact(call.tokens_used)),
+                            t.tool_dim,
+                        ));
+                    }
+                }
+                TimelineRow::Log { at, message } => {
+                    spans.push(Span::styled(
+                        offset_text(at.saturating_sub(run.created_at)),
+                        t.tool_dim,
+                    ));
+                    spans.push(Span::raw(SEPARATOR));
+                    spans.push(Span::raw(escape_terminal_controls(message)));
+                }
+                TimelineRow::Settled { at, status } => {
+                    spans.push(status_span(*status));
+                    spans.push(Span::styled(
+                        format!(
+                            "{SEPARATOR}{}",
+                            offset_text(at.saturating_sub(run.created_at))
+                        ),
+                        t.tool_dim,
+                    ));
+                }
+            }
+            if let Some(span) = row.span() {
+                let bar = span_bar(span, window, bar_width);
+                if !bar.is_empty() {
+                    spans.push(Span::raw(SEPARATOR));
+                    spans.push(Span::styled(bar, t.tool_dim));
+                }
+            }
+            lines.push(Line::from(spans));
+            if let TimelineRow::Call { call, .. } = row {
+                let call = &detail.calls[*call];
+                if self.expanded_call == Some(call.call_key) {
+                    lines.extend(self.body_lines(call));
+                }
+            }
+        }
         (lines, starts)
     }
 
@@ -1556,100 +1630,6 @@ impl WorkflowInspector {
             lines.push(Line::from(spans));
         }
         (lines, starts)
-    }
-
-    fn call_lines(&self) -> (Vec<Line<'static>>, Vec<usize>) {
-        let t = theme::current();
-        let Some(detail) = &self.detail else {
-            return (vec![Line::styled(LOADING, t.tool_dim)], Vec::new());
-        };
-        let mut lines = Vec::with_capacity(detail.calls.len() + 1);
-        let mut starts = Vec::with_capacity(detail.calls.len());
-        if detail.journal_trimmed {
-            lines.push(Line::styled(JOURNAL_TRIMMED, t.tool_warning));
-        }
-        if detail.calls.is_empty() && !detail.journal_trimmed {
-            lines.push(Line::styled(NO_CALLS, t.tool_dim));
-        }
-        for (index, call) in detail.calls.iter().enumerate() {
-            starts.push(lines.len());
-            let mark = match self.pane == Pane::Detail && index == self.cursor {
-                true => CURSOR_MARK,
-                false => NO_MARK,
-            };
-            let mut spans = vec![
-                Span::styled(mark, t.accent),
-                Span::styled(format!("{CALL_PREFIX}{} ", call.call_key), t.tool_dim),
-                Span::raw(call.kind.to_string()),
-                Span::raw(SEPARATOR),
-                Span::styled(call.state.to_string(), call_style(call.state)),
-            ];
-            if let Some(label) = &call.label {
-                spans.push(Span::styled(
-                    format!("{SEPARATOR}{}", escape_terminal_controls(label)),
-                    t.bold,
-                ));
-            }
-            let finished = call
-                .finished_at
-                .map(|at| at.saturating_sub(call.started_at));
-            spans.push(Span::styled(
-                format!(
-                    "{SEPARATOR}{}{TOKENS_UNIT}{SEPARATOR}{}",
-                    format_compact(call.tokens_used),
-                    finished
-                        .map_or_else(|| format_elapsed(call.duration_ms / 1_000), format_elapsed)
-                ),
-                t.tool_dim,
-            ));
-            lines.push(Line::from(spans));
-            if self.expanded_call == Some(call.call_key) {
-                lines.extend(self.body_lines(call));
-            }
-        }
-        (lines, starts)
-    }
-
-    /// The stored timeline once the detail is in, and the snapshot's own
-    /// log tail until then.
-    fn log_lines(&self, run: &RunSnapshot) -> Vec<Line<'static>> {
-        let t = theme::current();
-        let lines: Vec<Line<'static>> = match &self.detail {
-            Some(detail) => detail
-                .events
-                .iter()
-                .map(|event| match event.kind {
-                    RunEventKind::Phase => Line::from(vec![
-                        Span::styled(
-                            offset_text(event.at.saturating_sub(run.created_at)),
-                            t.tool_dim,
-                        ),
-                        Span::styled(ARROW, t.accent),
-                        Span::styled(escape_terminal_controls(&event.text), t.accent),
-                    ]),
-                    RunEventKind::Log => log_line(
-                        event.at.saturating_sub(run.created_at),
-                        &event.text,
-                        Style::default(),
-                    ),
-                })
-                .collect(),
-            None => run
-                .logs
-                .iter()
-                .map(|log| {
-                    log_line(
-                        log.at.saturating_sub(run.created_at),
-                        &log.message,
-                        Style::default(),
-                    )
-                })
-                .collect(),
-        };
-        match lines.is_empty() {
-            true => vec![Line::styled(NO_LOGS, t.tool_dim)],
-            false => lines,
-        }
     }
 
     fn footer_line(&self) -> FooterLine {
@@ -1822,25 +1802,6 @@ fn activity_spans(progress: &ToolProgress) -> Vec<Span<'static>> {
     spans
 }
 
-/// `· 2/5 agents` for a phase that dispatched any, counting the ones that
-/// have stopped against the ones it opened.
-fn agent_tally(run: &RunSnapshot, phase: &str) -> Option<String> {
-    let dispatched = run
-        .roster
-        .iter()
-        .filter(|agent| agent.phase.as_deref() == Some(phase));
-    let total = dispatched.clone().count();
-    if total == 0 {
-        return None;
-    }
-    let done = dispatched
-        .filter(|agent| !matches!(agent.state, RosterState::Running | RosterState::Pending))
-        .count();
-    Some(format!("{SEPARATOR}{done}/{total}{AGENTS_UNIT}"))
-}
-
-/// The report or the raw result, then the scratch file line, which is the
-/// section's one item so a click can land on it.
 fn result_lines(run: &RunSnapshot) -> (Vec<Line<'static>>, Vec<usize>) {
     let t = theme::current();
     let mut lines = Vec::new();
@@ -1913,6 +1874,23 @@ fn roster_style(state: RosterState) -> Style {
     }
 }
 
+/// What a call is called on a timeline row: the label the script gave it,
+/// else the first line of its prompt, else its position in the journal.
+fn call_name(call: &RunCall) -> String {
+    call.label
+        .as_deref()
+        .or_else(|| call.prompt.as_deref().and_then(|text| text.lines().next()))
+        .map_or_else(|| format!("{CALL_PREFIX}{}", call.call_key), str::to_owned)
+}
+
+fn call_glyph(state: CallState) -> &'static str {
+    match state {
+        CallState::Started => CALL_RUNNING_GLYPH,
+        CallState::Completed => CALL_DONE_GLYPH,
+        CallState::Failed => CALL_FAILED_GLYPH,
+    }
+}
+
 fn call_style(state: CallState) -> Style {
     let t = theme::current();
     match state {
@@ -1928,7 +1906,7 @@ mod tests {
     use std::time::Duration;
 
     use caudra_agent::SubagentActivity;
-    use caudra_workflow::{CallKind, PhaseRecord, RunUsage, SourceKind};
+    use caudra_workflow::{CallKind, PhaseRecord, RunEvent, RunEventKind, RunUsage, SourceKind};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::style::Modifier;
@@ -1982,7 +1960,11 @@ mod tests {
     const PHASE_TWO: &str = "Report";
     const ELAPSED_SECS: u64 = 134;
     const ELAPSED_TEXT: &str = "2m14s";
-    const ONE_OF_ONE_AGENT: &str = "1/1 agents";
+    const ONE_AGENT: &str = "1 agents";
+    const CALL_LABEL: &str = "researcher";
+    const LOG_LINE: &str = "dispatching the workers";
+    const TIMELINE_IS_ONE_ORDER: &str =
+        "a phase, the calls it opened, and the lines logged beside them must read in that order";
     const ROSTER_TALLY: &str = "0/1 done";
     const CLOCK_IS_LAST: &str = "the clock holds the right edge of a run row";
     const PHASE_COUNTS_ITS_OWN: &str = "a phase row counts the agents it dispatched";
@@ -2051,7 +2033,7 @@ mod tests {
                 call_key: 1,
                 kind: CallKind::Agent,
                 state: CallState::Completed,
-                label: Some("researcher".into()),
+                label: Some(CALL_LABEL.into()),
                 prompt: Some(PROMPT_PREVIEW.into()),
                 task_id: Some(TASK_ID.into()),
                 tokens_used: 10,
@@ -2173,7 +2155,7 @@ mod tests {
         let (hit, section) = *inspector
             .tab_hits
             .iter()
-            .find(|(_, section)| *section == Section::Calls)
+            .find(|(_, section)| *section == Section::Agents)
             .expect(NO_SUCH_ROW);
 
         let _ = inspector.handle_mouse(mouse_at(MouseEventKind::Moved, hit.x, hit.y));
@@ -2392,7 +2374,7 @@ mod tests {
     }
 
     #[test]
-    fn the_phases_section_lists_what_is_left_and_what_each_phase_dispatched() {
+    fn the_timeline_joins_the_phases_the_calls_and_the_log_into_one_order() {
         let mut walking = run(RUN_ID, RunStatus::Active, vec![agent(None)]);
         walking.phases = vec![PHASE_ONE.into(), PHASE_TWO.into()];
         walking.phase = Some(PHASE_ONE.into());
@@ -2402,15 +2384,26 @@ mod tests {
         }];
         walking.roster[0].phase = Some(PHASE_ONE.into());
         walking.roster[0].state = RosterState::Completed;
-        let mut inspector = open_with(vec![walking]);
+        let mut inspector = open_with(vec![walking.clone()]);
+        let mut journal = detail(walking);
+        journal.events.push(RunEvent {
+            seq: 0,
+            at: 1,
+            kind: RunEventKind::Log,
+            text: LOG_LINE.into(),
+        });
+        inspector.fill_detail(journal);
 
         let text = section_text(&mut inspector, '2');
 
-        assert!(text.contains(PHASE_ONE), "{text}");
+        let phase = text.find(PHASE_ONE).expect(&text);
+        let call = text.find(CALL_LABEL).expect(&text);
+        let logged = text.find(LOG_LINE).expect(&text);
         assert!(
-            text.contains(ONE_OF_ONE_AGENT),
-            "{PHASE_COUNTS_ITS_OWN}: {text}"
+            phase < call && call < logged,
+            "{TIMELINE_IS_ONE_ORDER}: {text}"
         );
+        assert!(text.contains(ONE_AGENT), "{PHASE_COUNTS_ITS_OWN}: {text}");
         assert!(
             text.contains(&format!("{} {PHASE_TWO}", PhaseMark::Pending.glyph())),
             "{PENDING_IS_LISTED}: {text}"
@@ -2438,11 +2431,34 @@ mod tests {
             ],
         );
         walking.phases = vec![PHASE_ONE.into(), PHASE_TWO.into()];
+        walking.phase_history = vec![
+            PhaseRecord {
+                title: PHASE_ONE.into(),
+                started_at: 0,
+            },
+            PhaseRecord {
+                title: PHASE_TWO.into(),
+                started_at: 1,
+            },
+        ];
         walking
     }
 
-    /// Puts the cursor on the second phase row.
+    /// The timeline is the journal joined to the snapshot, so a run with no
+    /// calls still needs one before it has any rows to walk.
+    fn walked(run: RunSnapshot) -> RunDetail {
+        RunDetail {
+            run,
+            calls: Vec::new(),
+            events: Vec::new(),
+            journal_trimmed: false,
+        }
+    }
+
+    /// Puts the cursor on the second phase row of the timeline.
     fn walk_to_second_phase(inspector: &mut WorkflowInspector) {
+        let run = inspector.selected_run().cloned().expect(NO_SUCH_ROW);
+        inspector.fill_detail(walked(run));
         let _ = inspector.handle_key(key_event(KeyCode::Char('2')));
         let _ = inspector.handle_key(key_event(KeyCode::Right));
         let _ = inspector.handle_key(key_event(KeyCode::Down));
@@ -2483,7 +2499,7 @@ mod tests {
         let action = inspector.handle_key(key_event(KeyCode::Enter));
 
         assert_eq!(action, InspectorAction::Flash(NO_AGENTS_IN_PHASE));
-        assert_eq!(inspector.section, Section::Phases);
+        assert_eq!(inspector.section, Section::Timeline);
     }
 
     fn tool_progress() -> SubagentProgress {
@@ -2608,7 +2624,7 @@ mod tests {
         let mut settled = run(RUN_ID, RunStatus::Completed, Vec::new());
         settled.result = Some(serde_json::json!({ "report": "done", "path": SCRATCH_PATH }));
         let mut inspector = open_with(vec![settled]);
-        let _ = inspector.handle_key(key_event(KeyCode::Char('6')));
+        let _ = inspector.handle_key(key_event(KeyCode::Char('4')));
 
         let action = inspector.handle_key(key_event(KeyCode::Enter));
 
@@ -2622,7 +2638,7 @@ mod tests {
     #[test]
     fn enter_on_a_result_without_a_scratch_file_does_nothing() {
         let mut inspector = open_with(vec![run(RUN_ID, RunStatus::Completed, Vec::new())]);
-        let _ = inspector.handle_key(key_event(KeyCode::Char('6')));
+        let _ = inspector.handle_key(key_event(KeyCode::Char('4')));
 
         let action = inspector.handle_key(key_event(KeyCode::Enter));
 
@@ -2635,7 +2651,7 @@ mod tests {
         let mut with_scratch = detail(run(RUN_ID, RunStatus::Completed, Vec::new()));
         with_scratch.calls.push(scratch_call());
         inspector.fill_detail(with_scratch);
-        let _ = inspector.handle_key(key_event(KeyCode::Char('4')));
+        let _ = inspector.handle_key(key_event(KeyCode::Char('2')));
         let _ = inspector.handle_key(key_event(KeyCode::Right));
         let _ = inspector.handle_key(key_event(KeyCode::Down));
 
@@ -2653,7 +2669,7 @@ mod tests {
     fn enter_on_a_call_toggles_its_preview() {
         let mut inspector = open_with(vec![run(RUN_ID, RunStatus::Active, Vec::new())]);
         inspector.fill_detail(detail(run(RUN_ID, RunStatus::Active, Vec::new())));
-        let _ = inspector.handle_key(key_event(KeyCode::Char('4')));
+        let _ = inspector.handle_key(key_event(KeyCode::Char('2')));
 
         let _ = inspector.handle_key(key_event(KeyCode::Enter));
         assert_eq!(inspector.expanded_call, Some(1));
@@ -2665,7 +2681,7 @@ mod tests {
     fn an_opened_call_asks_for_its_body_once() {
         let mut inspector = open_with(vec![run(RUN_ID, RunStatus::Active, Vec::new())]);
         inspector.fill_detail(detail(run(RUN_ID, RunStatus::Active, Vec::new())));
-        let _ = inspector.handle_key(key_event(KeyCode::Char('4')));
+        let _ = inspector.handle_key(key_event(KeyCode::Char('2')));
 
         let asked = inspector.handle_key(key_event(KeyCode::Enter));
 
@@ -2689,12 +2705,12 @@ mod tests {
     fn a_landed_body_replaces_the_preview() {
         let mut inspector = open_with(vec![run(RUN_ID, RunStatus::Active, Vec::new())]);
         inspector.fill_detail(detail(run(RUN_ID, RunStatus::Active, Vec::new())));
-        let _ = inspector.handle_key(key_event(KeyCode::Char('4')));
+        let _ = inspector.handle_key(key_event(KeyCode::Char('2')));
         let _ = inspector.handle_key(key_event(KeyCode::Enter));
 
         inspector.fill_call_bodies(RUN_ID, Some(1), vec![body(1)]);
 
-        let text = section_text(&mut inspector, '4');
+        let text = section_text(&mut inspector, '2');
         assert!(text.contains(FULL_PROMPT), "{BODY_WINS}");
         assert!(text.contains(FULL_RESULT), "{BODY_WINS}");
         assert!(!text.contains(PROMPT_PREVIEW), "{BODY_WINS}");
@@ -2704,13 +2720,13 @@ mod tests {
     fn a_body_for_another_run_is_dropped() {
         let mut inspector = open_with(vec![run(RUN_ID, RunStatus::Active, Vec::new())]);
         inspector.fill_detail(detail(run(RUN_ID, RunStatus::Active, Vec::new())));
-        let _ = inspector.handle_key(key_event(KeyCode::Char('4')));
+        let _ = inspector.handle_key(key_event(KeyCode::Char('2')));
         let _ = inspector.handle_key(key_event(KeyCode::Enter));
 
         inspector.fill_call_bodies(OTHER_RUN_ID, Some(1), vec![body(1)]);
 
         assert!(
-            !section_text(&mut inspector, '4').contains(FULL_RESULT),
+            !section_text(&mut inspector, '2').contains(FULL_RESULT),
             "{STALE_BODY}"
         );
     }
@@ -2722,12 +2738,12 @@ mod tests {
         bare.calls[0].prompt = None;
         bare.calls[0].result_preview = None;
         inspector.fill_detail(bare);
-        let _ = inspector.handle_key(key_event(KeyCode::Char('4')));
+        let _ = inspector.handle_key(key_event(KeyCode::Char('2')));
         let _ = inspector.handle_key(key_event(KeyCode::Enter));
 
         inspector.fill_call_bodies(RUN_ID, Some(1), Vec::new());
 
-        assert!(section_text(&mut inspector, '4').contains(BODY_MISSING));
+        assert!(section_text(&mut inspector, '2').contains(BODY_MISSING));
     }
 
     fn body(call_key: u64) -> RunCallBody {
@@ -2744,7 +2760,7 @@ mod tests {
         let mut inspector = open_with(vec![run(RUN_ID, RunStatus::Active, Vec::new())]);
 
         let _ = inspector.handle_key(key_event(KeyCode::Tab));
-        assert_eq!(inspector.section(), Section::Phases);
+        assert_eq!(inspector.section(), Section::Timeline);
         let _ = inspector.handle_key(key_event(KeyCode::BackTab));
         let _ = inspector.handle_key(key_event(KeyCode::BackTab));
         assert_eq!(inspector.section(), Section::Result);
