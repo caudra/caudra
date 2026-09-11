@@ -2404,6 +2404,27 @@ fn a_dispatched_subagents_progress_lands_on_its_row() {
     );
 }
 
+/// Renders, then clicks the roster row `child_id` was drawn on. The row has to
+/// be found after the frame it is measured in, since the roster only takes its
+/// shape once the card is laid out.
+fn click_roster_row(app: &mut App, child_id: &str) {
+    let _ = rendered(app);
+    let area = app.msg_area();
+    let row = (area.y..area.bottom())
+        .find(|&row| app.chats[0].dispatched_id_at(row, area).as_deref() == Some(child_id))
+        .expect("the roster drew a row for the child");
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        area.x + 2,
+        row,
+    ));
+    app.update(mouse_event(
+        MouseEventKind::Up(MouseButton::Left),
+        area.x + 2,
+        row,
+    ));
+}
+
 /// A batch child's row sits inside the batch's own card, so the card answers
 /// for it and every row on the roster opened the same transcript. Docs promise
 /// that clicking a task call opens the subagent it dispatched.
@@ -2417,22 +2438,8 @@ fn clicking_a_dispatched_child_opens_that_childs_transcript() {
         &child_id,
         Some(SUBAGENT_NAME),
     ));
-    let _ = rendered(&mut app);
-    let area = app.msg_area();
-    let row = (area.y..area.bottom())
-        .find(|&row| app.chats[0].dispatched_id_at(row, area).as_deref() == Some(&*child_id))
-        .expect("the roster drew a row for the child");
 
-    app.update(mouse_event(
-        MouseEventKind::Down(MouseButton::Left),
-        area.x + 2,
-        row,
-    ));
-    app.update(mouse_event(
-        MouseEventKind::Up(MouseButton::Left),
-        area.x + 2,
-        row,
-    ));
+    click_roster_row(&mut app, &child_id);
 
     assert_eq!(
         app.chats[app.active_chat].task_id().map(|id| &**id),
@@ -2453,26 +2460,69 @@ fn clicking_a_child_that_dispatched_nothing_still_folds_it() {
         &format!("{TASK_ID}:1"),
         Some(SUBAGENT_NAME),
     ));
-    let _ = rendered(&mut app);
-    let area = app.msg_area();
-    let row = (area.y..area.bottom())
-        .find(|&row| {
-            app.chats[0].dispatched_id_at(row, area).as_deref() == Some(&*format!("{TASK_ID}:0"))
-        })
-        .expect("the roster drew a row for the child");
 
-    app.update(mouse_event(
-        MouseEventKind::Down(MouseButton::Left),
-        area.x + 2,
-        row,
-    ));
-    app.update(mouse_event(
-        MouseEventKind::Up(MouseButton::Left),
-        area.x + 2,
-        row,
-    ));
+    click_roster_row(&mut app, &format!("{TASK_ID}:0"));
 
     assert_eq!(app.active_chat, 0, "an undispatched child opens no chat");
+}
+
+/// A batch child's brief streams into a chat before the child runs, and that
+/// row is the only way the pointer reaches it. Nothing has dispatched yet, so
+/// the row has to answer for itself rather than through `parent_task_ids`.
+#[test]
+fn clicking_a_delegating_child_opens_the_chat_it_is_still_being_given() {
+    let mut app = streaming_app();
+    let child_id = format!("{TASK_ID}:1");
+    app.update(delegation_msg(vec![delegation(
+        &child_id,
+        Some(DELEGATE_NAME),
+        Some(DELEGATE_PROMPT),
+    )]));
+    app.update(agent_msg(batch_roster(TASK_ID, 2)));
+
+    click_roster_row(&mut app, &child_id);
+
+    assert_eq!(
+        app.chats[app.active_chat].task_id().map(|id| &**id),
+        Some(&*child_id),
+        "the click opened the chat the brief is being written into"
+    );
+    app.chats[app.active_chat].flush();
+    assert_eq!(
+        app.chats[app.active_chat].last_message_text(),
+        DELEGATE_PROMPT,
+        "the brief was already on screen when the chat opened"
+    );
+}
+
+/// The child dispatching for real adopts the chat its brief opened, so the row
+/// keeps pointing at the same transcript instead of gaining a second one.
+#[test]
+fn a_predicted_child_row_survives_adoption_as_the_same_target() {
+    let mut app = streaming_app();
+    let child_id = format!("{TASK_ID}:1");
+    app.update(delegation_msg(vec![delegation(
+        &child_id,
+        Some(DELEGATE_NAME),
+        Some(DELEGATE_PROMPT),
+    )]));
+    app.update(agent_msg(batch_roster(TASK_ID, 2)));
+    click_roster_row(&mut app, &child_id);
+    let predicted = app.active_chat;
+    app.active_chat = 0;
+
+    app.update(subagent_msg(
+        progress_event(SubagentActivity::Responding, 1),
+        &child_id,
+        Some(SUBAGENT_NAME),
+    ));
+    click_roster_row(&mut app, &child_id);
+
+    assert_eq!(
+        app.active_chat, predicted,
+        "the dispatched child reused the chat its brief opened"
+    );
+    assert_eq!(app.chats.len(), 2, "adoption left no second chat behind");
 }
 
 #[test]

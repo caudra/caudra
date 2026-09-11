@@ -1150,19 +1150,16 @@ impl App {
     /// The transcript a click at `row` would open. A batch child is asked
     /// about first: its row sits inside the batch's card, so the card's own id
     /// answers for it and would send every roster row to the same place.
+    ///
+    /// Either id names the call the row would publish under, which is what a
+    /// delegation still being written is filed under too. So a dispatched call
+    /// resolves through `parent_task_ids` and a predicted one answers for
+    /// itself; a row that delegates nothing names no chat either way.
     fn task_id_at(&self, row: u16, area: Rect) -> Option<String> {
-        let dispatched = self.chats[0]
+        let id = self.chats[0]
             .dispatched_id_at(row, area)
-            .and_then(|id| self.parent_task_ids.get(&id).cloned());
-        dispatched.or_else(|| {
-            let tool_id = self.chats[0].tool_id_at(row, area)?;
-            Some(
-                self.parent_task_ids
-                    .get(tool_id)
-                    .cloned()
-                    .unwrap_or_else(|| tool_id.to_owned()),
-            )
-        })
+            .or_else(|| self.chats[0].tool_id_at(row, area).map(str::to_owned))?;
+        Some(self.parent_task_ids.get(&id).cloned().unwrap_or(id))
     }
 
     fn update_transcript_hover(&mut self, row: u16, col: u16) {
