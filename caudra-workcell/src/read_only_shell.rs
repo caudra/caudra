@@ -9,7 +9,7 @@
 
 use std::path::{Component, Path};
 
-use caudra_agent::permissions::physical_boundary_check;
+use caudra_agent::permissions::{physical_boundary_check, sed_only_prints};
 use workcell::shell::{ShellCommandAnalysis, ShellCommandScope, ShellWord};
 
 const GIT: &str = "git";
@@ -55,9 +55,11 @@ const FIND: &str = "find";
 const FIND_DENIED_FLAGS: &[&str] = &[
     "-delete", "-exec", "-execdir", "-fls", "-fprint", "-fprintf", "-ok", "-okdir",
 ];
-/// `sed` and `awk` are absent on purpose rather than deny-listed: `sed -i`
-/// writes, `sed`'s `w` command writes from inside the script, and `awk` has
-/// `system()` and `print >`. None can be made safe by rejecting flags.
+const SED: &str = "sed";
+/// `awk` is absent on purpose rather than deny-listed: `system()` and `print >`
+/// are reached from inside the script, so no flag list can exclude them. The
+/// same is true of `sed`, which is why `sed` is recognized by its script rather
+/// than by its flags and is not in the list below.
 const READ_ONLY_COMMANDS: &[&str] = &[
     "basename", "cat", "date", "df", "dirname", "du", "file", "head", "jq", "ls", "pwd",
     "readlink", "realpath", "stat", "tail", "tree", "uname", "wc", "which",
@@ -90,6 +92,7 @@ fn scope_is_read_only(scope: &ShellCommandScope) -> bool {
         }
         RG => !denies(&arguments, RG_DENIED_FLAGS),
         FIND => !denies(&arguments, FIND_DENIED_FLAGS),
+        SED => sed_only_prints(&arguments),
         executable => READ_ONLY_COMMANDS.contains(&executable),
     }
 }
@@ -182,7 +185,7 @@ fn denies(arguments: &[&str], denied: &[&str]) -> bool {
 mod tests {
     use std::path::Path;
 
-    use super::{FIND, GIT, RG, is_read_only, stays_in_project};
+    use super::{FIND, GIT, RG, SED, is_read_only, stays_in_project};
     use test_case::test_case;
     use workcell::shell::{ShellCommandAnalysis, ShellCommandScope, ShellWord};
 
@@ -242,7 +245,9 @@ mod tests {
     #[test_case("find . -exec rm x ;" => false ; "find_exec")]
     #[test_case("ls -la" => true ; "ls")]
     #[test_case("cat Cargo.toml" => true ; "cat")]
-    #[test_case("sed -i s/a/b/ f" => false ; "sed_is_excluded_entirely")]
+    #[test_case("sed -n 1,140p f" => true ; "sed_printing_a_slice")]
+    #[test_case("sed -i s/a/b/ f" => false ; "sed_in_place_writes")]
+    #[test_case("sed -n 1w/tmp/x f" => false ; "sed_writing_from_inside_the_script")]
     #[test_case("awk -f script.awk" => false ; "awk_is_excluded_entirely")]
     #[test_case("rm -rf build" => false ; "rm")]
     #[test_case("cargo build" => false ; "cargo_is_not_allowlisted")]
@@ -267,6 +272,7 @@ mod tests {
     #[test_case(GIT => false ; "git_could_be_hiding_dash_c")]
     #[test_case(RG => false ; "ripgrep_could_be_hiding_pre")]
     #[test_case(FIND => false ; "find_could_be_hiding_exec")]
+    #[test_case(SED => false ; "sed_could_be_hiding_its_script")]
     #[test_case("cat" => false ; "and_a_plain_reader_would_read_something_unnamed")]
     fn an_undecodable_word_is_never_read_only(executable: &str) -> bool {
         is_read_only(
