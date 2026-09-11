@@ -990,7 +990,7 @@ impl App {
         self.chats[self.active_chat].win_view()
     }
 
-    pub(crate) fn set_scroll_top(&mut self, top: u16) {
+    pub(crate) fn set_scroll_top(&mut self, top: u32) {
         self.active_chat().set_scroll_top(top);
     }
 

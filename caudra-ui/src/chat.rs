@@ -350,7 +350,7 @@ impl Chat {
         self.messages_panel.scroll(delta);
     }
 
-    pub fn set_scroll_top(&mut self, top: u16) {
+    pub fn set_scroll_top(&mut self, top: u32) {
         self.messages_panel.set_scroll_top(top);
     }
 
@@ -378,7 +378,7 @@ impl Chat {
         self.messages_panel.scroll_to_segment(segment_index);
     }
 
-    pub fn restore_scroll(&mut self, scroll_top: u16, auto_scroll: bool) {
+    pub fn restore_scroll(&mut self, scroll_top: u32, auto_scroll: bool) {
         self.messages_panel.restore_scroll(scroll_top, auto_scroll);
     }
 
@@ -413,7 +413,7 @@ impl Chat {
             .view(frame, area, has_selection, message_actions_enabled);
     }
 
-    pub fn scroll_top(&self) -> u16 {
+    pub fn scroll_top(&self) -> u32 {
         self.messages_panel.scroll_top()
     }
 

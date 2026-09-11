@@ -16,7 +16,7 @@ use super::tool_display::{
 };
 use super::{
     DisplayMessage, DisplayRole, DisplaySource, ToolProgress, ToolRole, ToolStatus,
-    apply_scroll_delta,
+    apply_scroll_rows,
     code_view::{BatchProgressMap, BatchViewMap, Disclosure, RowTarget},
     review, workflow_card,
     workflow_card::CardHit,
@@ -752,13 +752,13 @@ pub struct MessagesPanel {
     /// to it, and that is the one case where the buffer is not the model's.
     streaming_role: DisplayRole,
     started_at: Instant,
-    scroll_top: u16,
+    scroll_top: u32,
     auto_scroll: bool,
     viewport_height: u16,
     viewport_width: u16,
     viewport_area: Rect,
     cache: SegmentCache,
-    last_total_lines: u16,
+    last_total_lines: u32,
     hl_worker: RenderWorker,
     theme_generation: u64,
     highlight_segment: Option<usize>,
@@ -846,7 +846,7 @@ impl MessagesPanel {
             ),
             streaming_role: DisplayRole::Assistant,
             started_at: Instant::now(),
-            scroll_top: u16::MAX,
+            scroll_top: u32::MAX,
             auto_scroll: true,
             viewport_height: 24,
             viewport_width: crossterm::terminal::size().map_or(80, |(w, _)| w.saturating_sub(1)),
@@ -908,9 +908,7 @@ impl MessagesPanel {
         }
         // Anchor before the cache goes: the modes have wildly different
         // heights, so a raw line offset would land anywhere.
-        let anchor = self
-            .cache
-            .anchor_at(self.scroll_top as u32, self.viewport_width);
+        let anchor = self.cache.anchor_at(self.scroll_top, self.viewport_width);
         self.cache.clear();
         if let Some((seg_idx, _)) = anchor.filter(|_| !self.auto_scroll) {
             self.pending_scroll_segment = Some(seg_idx);
@@ -1357,7 +1355,7 @@ impl MessagesPanel {
             return None;
         }
         let width = self.viewport_width;
-        let doc_row = (row.saturating_sub(area.y)) as u32 + self.scroll_top as u32;
+        let doc_row = self.doc_row(row, area);
         let (_, segment, start) = self.cache.segment_at_row(doc_row, width)?;
         let rel = u16::try_from(doc_row - start).ok()?;
         if rel < segment.chrome(width).margin_top {
@@ -1607,7 +1605,8 @@ impl MessagesPanel {
             seg.update_with_reuse(tl, &self.hl_worker, compact);
         } else {
             let compact = self.compact();
-            let mut seg = Segment::with_tool(inst_id, SegmentKind::Instruction);
+            let msg_index = self.cache.get(parent_idx).and_then(|s| s.msg_index);
+            let mut seg = Segment::with_tool(inst_id, SegmentKind::Instruction, msg_index);
             seg.search_text = tl.search_text.clone();
             seg.apply_highlight(tl, &self.hl_worker, compact);
             self.cache.insert(parent_idx + 1, seg);
@@ -1694,13 +1693,22 @@ impl MessagesPanel {
         }
     }
 
+    /// Only tests care how many; the panel itself only ever asks whether.
+    #[cfg(test)]
     pub fn in_progress_count(&self) -> usize {
-        self.messages
-            .iter()
-            .filter(
-                |m| matches!(&m.role, DisplayRole::Tool(t) if t.status == ToolStatus::InProgress),
-            )
-            .count()
+        self.messages.iter().filter(|m| Self::is_running(m)).count()
+    }
+
+    /// Searched from the tail because a running call is the newest thing in
+    /// the transcript, so this settles in a handful of steps where counting
+    /// walks every message. It runs once per loop turn from `cadence`, which
+    /// is far more often than a frame.
+    fn has_in_progress(&self) -> bool {
+        self.messages.iter().rev().any(Self::is_running)
+    }
+
+    fn is_running(msg: &DisplayMessage) -> bool {
+        matches!(&msg.role, DisplayRole::Tool(t) if t.status == ToolStatus::InProgress)
     }
 
     #[cfg(test)]
@@ -1806,12 +1814,12 @@ impl MessagesPanel {
     }
 
     pub fn scroll(&mut self, delta: i32) {
-        self.set_scroll_top(apply_scroll_delta(self.scroll_top, delta));
+        self.set_scroll_top(apply_scroll_rows(self.scroll_top, delta));
     }
 
     /// Always unpins, and the next `view` re-pins if this lands on the
     /// bottom line.
-    pub fn set_scroll_top(&mut self, top: u16) {
+    pub fn set_scroll_top(&mut self, top: u32) {
         self.clear_hover();
         self.scroll_top = top.min(self.max_scroll());
         self.auto_scroll = false;
@@ -1838,12 +1846,11 @@ impl MessagesPanel {
             .iter()
             .take(segment_index)
             .map(|s| s.height(width) as u32)
-            .sum::<u32>()
-            .min(u16::MAX as u32) as u16;
+            .sum::<u32>();
         self.set_scroll_top(offset);
     }
 
-    pub fn restore_scroll(&mut self, scroll_top: u16, auto_scroll: bool) {
+    pub fn restore_scroll(&mut self, scroll_top: u32, auto_scroll: bool) {
         self.clear_hover();
         self.scroll_top = scroll_top;
         self.auto_scroll = auto_scroll;
@@ -1865,7 +1872,7 @@ impl MessagesPanel {
         if area.height == 0 {
             return None;
         }
-        let doc_row = (row.saturating_sub(area.y)) as u32 + self.scroll_top as u32;
+        let doc_row = self.doc_row(row, area);
         let (_, segment, start) = self.cache.segment_at_row(doc_row, self.viewport_width)?;
         let rel = u16::try_from(doc_row - start).ok()?;
         (rel >= segment.chrome(self.viewport_width).margin_top)
@@ -1881,7 +1888,7 @@ impl MessagesPanel {
         if area.height == 0 {
             return None;
         }
-        let doc_row = (row.saturating_sub(area.y)) as u32 + self.scroll_top as u32;
+        let doc_row = self.doc_row(row, area);
         let (_, segment, start) = self.cache.segment_at_row(doc_row, self.viewport_width)?;
         let rel = u16::try_from(doc_row - start).ok()?;
         let tool_id = segment.tool_id.as_deref()?;
@@ -1893,7 +1900,7 @@ impl MessagesPanel {
         if area.height == 0 || row < area.y || row >= area.bottom() {
             return None;
         }
-        let doc_row = (row - area.y) as u32 + self.scroll_top as u32;
+        let doc_row = self.doc_row(row, area);
         let (_, segment, start) = self.cache.segment_at_row(doc_row, self.viewport_width)?;
         let rel = u16::try_from(doc_row - start).ok()?;
         if rel < segment.chrome(self.viewport_width).margin_top {
@@ -1911,11 +1918,13 @@ impl MessagesPanel {
             .as_deref()
             .and_then(segment::instruction_parent)
             .or(segment.tool_id.as_deref())?;
-        self.messages.iter().rev().find_map(|message| {
-            matches!(&message.role, DisplayRole::Tool(tool) if tool.id == tool_id)
-                .then_some(message.source)
-                .flatten()
-        })
+        // `rfind`, not `find_map`: a card whose message carries no source is
+        // the answer, not a reason to keep walking to the front of the
+        // transcript.
+        self.messages
+            .iter()
+            .rfind(|message| matches!(&message.role, DisplayRole::Tool(tool) if tool.id == tool_id))
+            .and_then(|message| message.source)
     }
 
     fn message_action_source(&self, segment: &Segment) -> Option<DisplaySource> {
@@ -1977,7 +1986,7 @@ impl MessagesPanel {
             return None;
         }
         let width = self.viewport_width;
-        let doc_row = (row - area.y) as u32 + self.scroll_top as u32;
+        let doc_row = self.doc_row(row, area);
         let rel_col = col - area.x;
         if let Some((_, segment, start)) = self.cache.segment_at_row(doc_row, width) {
             let rel_row = u16::try_from(doc_row - start).ok()?;
@@ -2004,7 +2013,7 @@ impl MessagesPanel {
             return None;
         }
         let width = self.viewport_width;
-        let doc_row = (row - area.y) as u32 + self.scroll_top as u32;
+        let doc_row = self.doc_row(row, area);
         let (_, segment, start) = self.cache.segment_at_row(doc_row, width)?;
         if segment.kind() != SegmentKind::User {
             return None;
@@ -2039,7 +2048,7 @@ impl MessagesPanel {
             return None;
         }
         let width = self.viewport_width;
-        let doc_row = (row - area.y) as u32 + self.scroll_top as u32;
+        let doc_row = self.doc_row(row, area);
         let Some((_, segment, start)) = self.cache.segment_at_row(doc_row, width) else {
             if let Some(target) = self.streaming_link_at(doc_row, col - area.x, width) {
                 return Some(HoverTarget::Link(target));
@@ -2211,7 +2220,7 @@ impl MessagesPanel {
         let width = self.viewport_width;
         let mut rows: Vec<(DiagramKey, u16)> = Vec::new();
         for offset in 0..self.viewport_height {
-            let doc_row = self.scroll_top as u32 + offset as u32;
+            let doc_row = self.scroll_top.saturating_add(u32::from(offset));
             let Some((_, segment, start)) = self.cache.segment_at_row(doc_row, width) else {
                 continue;
             };
@@ -2311,7 +2320,7 @@ impl MessagesPanel {
             return false;
         }
         self.clear_hover();
-        let doc_row = (row.saturating_sub(area.y)) as u32 + self.scroll_top as u32;
+        let doc_row = self.doc_row(row, area);
         let width = self.viewport_width;
         // Both fallbacks toggle thinking: a row past the cached segments
         // belongs to the still-streaming indicator, and a segment without a
@@ -2508,7 +2517,7 @@ impl MessagesPanel {
         Cadence::any([
             // A running tool draws a spinner. Its output arriving is data, and
             // `tick` reports that separately.
-            Cadence::when(self.in_progress_count() > 0, Cadence::SPINNER),
+            Cadence::when(self.has_in_progress(), Cadence::SPINNER),
             Cadence::when(!self.streaming_thinking.is_empty(), Cadence::SPINNER),
             Cadence::when(smooth, Cadence::SMOOTH),
             Cadence::when(self.show_idle_splash(), self.idle_splash.cadence()),
@@ -2613,7 +2622,7 @@ impl MessagesPanel {
         if let Some(seg_idx) = self.pending_scroll_segment.take() {
             self.scroll_to_segment(seg_idx.min(self.cache.len().saturating_sub(1)));
         }
-        if self.in_progress_count() > 0 {
+        if self.has_in_progress() {
             self.update_spinners();
             self.refresh_live_progress();
         }
@@ -2701,6 +2710,13 @@ impl MessagesPanel {
             if cursor.past_bottom() {
                 break;
             }
+            let height = seg.height(width);
+            // Everything below is per-segment work whose only consumer is the
+            // paint, so a segment scrolled off the top is dropped before any
+            // of it runs rather than inside `render`.
+            if cursor.skip_above(height) {
+                continue;
+            }
             let highlight = self.highlight_segment == Some(i);
             let hover = self
                 .hover_feedback_for_segment(seg)
@@ -2716,7 +2732,7 @@ impl MessagesPanel {
             });
             let action_area = cursor.render(
                 (seg.lines(), Some(seg.links())),
-                seg.height(width),
+                height,
                 seg.chrome(width),
                 segment_styles(seg.kind(), accent, compact),
                 RenderFeedback {
@@ -2841,16 +2857,25 @@ impl MessagesPanel {
                 .retain(|link| !bar_area.contains(link.position));
         }
 
-        if total_lines > area.height {
+        if total_lines > u32::from(area.height) {
             render_vertical_scrollbar(frame, area, total_lines, self.scroll_top);
         }
     }
 
-    fn max_scroll(&self) -> u16 {
-        self.last_total_lines.saturating_sub(self.viewport_height)
+    /// The document row under a viewport row. Saturating because `scroll_top`
+    /// starts at `u32::MAX` to pin the first frame to the bottom, and that
+    /// sentinel stands until `resolve_scroll` has a height to clamp it
+    /// against.
+    fn doc_row(&self, row: u16, area: Rect) -> u32 {
+        u32::from(row.saturating_sub(area.y)).saturating_add(self.scroll_top)
     }
 
-    pub fn scroll_top(&self) -> u16 {
+    fn max_scroll(&self) -> u32 {
+        self.last_total_lines
+            .saturating_sub(u32::from(self.viewport_height))
+    }
+
+    pub fn scroll_top(&self) -> u32 {
         self.scroll_top
     }
 
@@ -3594,7 +3619,6 @@ impl MessagesPanel {
         if let Some(blocks) = instructions {
             self.upsert_instruction_segment(tool_id, &blocks, seg_idx);
         }
-        self.cache.update_margins(self.viewport_width);
     }
 
     fn rebuild_line_cache(&mut self) {
@@ -3611,7 +3635,7 @@ impl MessagesPanel {
                 let id = t.id.clone();
                 let search_text = tl.search_text.clone();
                 let compact = self.compact();
-                let mut seg = Segment::with_tool(id.clone(), SegmentKind::ToolBlock);
+                let mut seg = Segment::with_tool(id.clone(), SegmentKind::ToolBlock, Some(i));
                 seg.search_text = search_text;
                 seg.apply_highlight(tl, &self.hl_worker, compact);
                 self.cache.push(seg);
@@ -3648,11 +3672,10 @@ impl MessagesPanel {
 
     /// Clamps `scroll_top` against the document height and applies the bottom
     /// pin, returning the total the scrollbar draws from.
-    fn resolve_scroll(&mut self, width: u16, streaming_sum: u32, has_selection: bool) -> u16 {
-        let total_lines: u16 =
-            (self.cache.total_height(width) + streaming_sum).min(u16::MAX as u32) as u16;
+    fn resolve_scroll(&mut self, width: u16, streaming_sum: u32, has_selection: bool) -> u32 {
+        let total_lines = self.cache.total_height(width) + streaming_sum;
         self.last_total_lines = total_lines;
-        let max_scroll = total_lines.saturating_sub(self.viewport_height);
+        let max_scroll = total_lines.saturating_sub(u32::from(self.viewport_height));
         self.scroll_top = self.scroll_top.min(max_scroll);
         if !has_selection {
             if self.scroll_top >= max_scroll {
@@ -3679,7 +3702,7 @@ impl MessagesPanel {
         // that is exactly when the viewport is the document tail.
         let pinned_to_bottom = self.auto_scroll && !has_selection;
         let anchor = (!pinned_to_bottom)
-            .then(|| self.cache.anchor_at(self.scroll_top as u32, width))
+            .then(|| self.cache.anchor_at(self.scroll_top, width))
             .flatten();
         let viewport = self.viewport_height as u32;
         let margin = viewport.saturating_mul(REFLOW_MARGIN_VIEWPORTS);
@@ -3715,7 +3738,7 @@ impl MessagesPanel {
         if let Some(anchor) = anchor
             && self.cache.len() == len_before
         {
-            self.scroll_top = self.cache.anchor_offset(anchor, width).min(u16::MAX as u32) as u16;
+            self.scroll_top = self.cache.anchor_offset(anchor, width);
         }
     }
 

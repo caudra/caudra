@@ -3160,7 +3160,7 @@ fn focus_queue(app: &mut App) {
 
 /// Off both ends of the document so every blocked key would visibly move it:
 /// the top and half-page binds clamp it to 0, and unpinning is observable.
-const OVERLAY_SEED_SCROLL: u16 = 5;
+const OVERLAY_SEED_SCROLL: u32 = 5;
 
 #[test_case(open_help as fn(&mut App) ; "help_modal")]
 #[test_case(open_search               ; "search_modal")]
@@ -3426,7 +3426,7 @@ fn steerable_task_app() -> App {
 fn transcript_scroll_keys_reach_every_chat(build: fn() -> App) {
     let mut app = build();
     fill_transcript(&mut app);
-    let half = app.active_chat().half_page() as u16;
+    let half = app.active_chat().half_page() as u32;
 
     // The first page press is what hands a composer-owning chat its focus.
     app.update(Msg::Key(kb::PAGE_UP.to_key_event()));
@@ -3509,7 +3509,7 @@ fn the_transcript_scrolls_by_key_while_a_question_is_open() {
     let mut app = question_app();
     let _ = rendered(&mut app);
     app.active_chat().enable_auto_scroll();
-    let half = app.active_chat().half_page() as u16;
+    let half = app.active_chat().half_page() as u32;
 
     app.update(Msg::Key(kb::DOC_TOP.to_key_event()));
     assert_eq!(app.active_chat().scroll_top(), 0, "Home");
@@ -5321,7 +5321,7 @@ fn scroll_preserves_dragging_and_updates_cursor() {
     );
 
     let (start, end) = app.selection_state.as_ref().unwrap().sel().normalized();
-    let anchor_row = scroll_before as u32 + DRAG_ROW as u32;
+    let anchor_row = scroll_before + DRAG_ROW as u32;
     assert_eq!(start.row, anchor_row, "anchor keeps its doc row");
     assert_eq!(
         end.row,
@@ -9892,7 +9892,7 @@ fn send_to_agent_unknown_subagent_falls_back_to_main() {
 
 #[test_case(42, false ; "restores_scroll_position")]
 #[test_case(0,  true  ; "restores_auto_scroll")]
-fn search_escape_restores_scroll(scroll_top: u16, auto_scroll: bool) {
+fn search_escape_restores_scroll(scroll_top: u32, auto_scroll: bool) {
     let mut app = test_app();
     app.active_chat().restore_scroll(scroll_top, auto_scroll);
 
@@ -10626,7 +10626,7 @@ fn the_press_that_dismisses_a_modal_does_not_act_on_what_is_under_it() {
     assert_eq!(app.state.mode, mode);
 }
 
-const SEARCH_SCROLL_TOP: u16 = 3;
+const SEARCH_SCROLL_TOP: u32 = 3;
 const RESTORED_SCROLL: &str = "dismissing the search owes the transcript its scroll back";
 
 #[test]

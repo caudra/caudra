@@ -98,10 +98,14 @@ pub(super) struct Segment {
     links: LinkMap,
     pub search_text: String,
     pub tool_id: Option<String>,
-    /// Backlink to `self.messages`, set only by `with_lines`. A click on a
-    /// collapsed thinking indicator has no tool_id to route by, so this is
-    /// how the click finds its message. It looks unused; delete it and the
-    /// show_thinking toggle breaks.
+    /// Backlink to `self.messages`. A click on a collapsed thinking indicator
+    /// has no tool_id to route by, so this is how the click finds its message,
+    /// and it is what makes `segment_source` O(1) rather than a scan per
+    /// segment per frame. It looks unused; delete it and the show_thinking
+    /// toggle breaks.
+    ///
+    /// Safe to hold because every path that renumbers `messages` (`replace`,
+    /// `remove`, `load_messages`) drops the whole cache.
     pub msg_index: Option<usize>,
     kind: SegmentKind,
     margin_top: u16,
@@ -125,10 +129,11 @@ pub(super) struct Segment {
 }
 
 impl Segment {
-    pub fn with_tool(tool_id: String, kind: SegmentKind) -> Self {
+    pub fn with_tool(tool_id: String, kind: SegmentKind, msg_index: Option<usize>) -> Self {
         Self {
             tool_id: Some(tool_id),
             kind,
+            msg_index,
             ..Self::default()
         }
     }
@@ -178,6 +183,29 @@ impl Segment {
 
     pub fn content_height(&self, width: u16) -> u16 {
         wrapped_line_count(&self.lines, self.content_width(width))
+    }
+
+    /// A row that reads as one entry in a list rather than as its own block,
+    /// so consecutive ones sit flush instead of being parted by a blank row.
+    /// Reasoning is prose the model wrote, not a call it made, so it stays a
+    /// block in every mode and never joins the list.
+    ///
+    /// Deliberately not `content_height(width) <= 1`, which is the same
+    /// answer: that clones every span into a `Paragraph` to re-wrap it, and
+    /// [`SegmentCache::update_margins`] asks this of every segment several
+    /// times a frame. A word wrap never breaks a line that already fits, so
+    /// one line is one row exactly when it is no wider than the content box.
+    pub fn is_dense_row(&self, width: u16) -> bool {
+        if self.kind != SegmentKind::ToolInline || self.lines.len() > 1 {
+            return false;
+        }
+        let Some(line) = self.lines.first() else {
+            return true;
+        };
+        let content_width = self.content_width(width);
+        // A zero-width box cannot wrap, which is what `wrapped_line_count`
+        // reports by handing back the line count untouched.
+        content_width == 0 || line.width() <= content_width as usize
     }
 
     pub fn provenance(&self) -> Option<&Provenance> {
@@ -499,21 +527,6 @@ fn tool_kind(current: SegmentKind, lines: &ToolLines, compact: bool) -> SegmentK
     }
 }
 
-/// A row that reads as one entry in a list rather than as its own block.
-/// Reasoning is prose the model wrote, not a call it made, so it stays a
-/// block in every mode and never joins the list.
-fn dense_kind(kind: SegmentKind) -> bool {
-    kind == SegmentKind::ToolInline
-}
-
-/// Single-line tool rows read as a list, so they sit flush against each other.
-/// A row that wraps or carries a body has stopped being a list entry and is
-/// given air on both sides, or it runs into its neighbours and the eye cannot
-/// tell where one call ends and the next begins.
-fn stacks_flush(previous: (SegmentKind, u16), current: (SegmentKind, u16)) -> bool {
-    dense_kind(previous.0) && dense_kind(current.0) && previous.1 <= 1 && current.1 <= 1
-}
-
 pub(super) struct SegmentCache {
     segments: Vec<Segment>,
     msg_count: usize,
@@ -614,13 +627,20 @@ impl SegmentCache {
         self.segments.len()
     }
 
+    /// Single-line tool rows read as a list, so they sit flush against each
+    /// other. A row that wraps or carries a body has stopped being a list
+    /// entry and is given air on both sides, or it runs into its neighbours
+    /// and the eye cannot tell where one call ends and the next begins.
+    ///
+    /// Runs several times a frame, so it must stay proportional to the
+    /// transcript with a trivial constant: see [`Segment::is_dense_row`].
     pub fn update_margins(&mut self, width: u16) {
-        let mut previous = None;
+        let mut previous: Option<bool> = None;
         for segment in &mut self.segments {
-            let current = (segment.kind(), segment.content_height(width));
-            let margin = previous.map_or(0, |previous| u16::from(!stacks_flush(previous, current)));
+            let dense = segment.is_dense_row(width);
+            let margin = previous.map_or(0, |was_dense| u16::from(!(was_dense && dense)));
             segment.set_margin_top(margin);
-            previous = Some(current);
+            previous = Some(dense);
         }
     }
 
@@ -653,6 +673,11 @@ mod tests {
     use test_case::test_case;
 
     const OTHER_THEME: &str = "dracula";
+    const WIDTH: u16 = 40;
+    /// What [`SegmentChrome`] leaves an inline row at [`WIDTH`].
+    const INLINE_CONTENT_WIDTH: usize = 37;
+    const EXPECT_DENSE_AGREES: &str =
+        "the wrap-free dense test must answer exactly what re-wrapping would";
 
     fn seg_with_base(line_count: usize, base: Option<usize>) -> Segment {
         Segment {
@@ -680,6 +705,38 @@ mod tests {
 
         assert_eq!(cache.segments[0].margin_top, 0);
         assert_eq!(cache.segments[1].margin_top, 0);
+    }
+
+    /// `is_dense_row` is the allocation-free spelling of "this inline row
+    /// draws as one row". Let the two drift and margins stop agreeing with
+    /// the heights the layout is measured from.
+    #[test_case(SegmentKind::ToolInline, 1 ; "inline_fits")]
+    #[test_case(SegmentKind::ToolInline, INLINE_CONTENT_WIDTH ; "inline_exactly_fills")]
+    #[test_case(SegmentKind::ToolInline, INLINE_CONTENT_WIDTH + 1 ; "inline_overflows_by_one")]
+    #[test_case(SegmentKind::ToolInline, 0 ; "inline_empty")]
+    #[test_case(SegmentKind::ToolBlock, 1 ; "block_is_never_dense")]
+    #[test_case(SegmentKind::Assistant, 1 ; "prose_is_never_dense")]
+    fn is_dense_row_agrees_with_the_wrapped_height(kind: SegmentKind, text_len: usize) {
+        let mut segment =
+            Segment::with_lines(vec![Line::raw("x".repeat(text_len))], String::new(), None);
+        segment.set_kind(kind);
+
+        let by_wrap = kind == SegmentKind::ToolInline && segment.content_height(WIDTH) <= 1;
+        assert_eq!(
+            segment.is_dense_row(WIDTH),
+            by_wrap,
+            "{EXPECT_DENSE_AGREES}"
+        );
+    }
+
+    #[test]
+    fn a_multi_line_inline_row_is_not_dense() {
+        let mut segment =
+            Segment::with_lines(vec![Line::raw("a"), Line::raw("b")], String::new(), None);
+        segment.set_kind(SegmentKind::ToolInline);
+
+        assert!(segment.content_height(WIDTH) > 1);
+        assert!(!segment.is_dense_row(WIDTH), "{EXPECT_DENSE_AGREES}");
     }
 
     #[test]

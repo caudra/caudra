@@ -151,7 +151,9 @@ pub struct Selection {
 
 fn screen_to_doc(screen_row: u16, area: Rect, scroll_offset: u32) -> u32 {
     let clamped = screen_row.clamp(area.y, area.y + area.height.saturating_sub(1));
-    scroll_offset + (clamped - area.y) as u32
+    // Saturating because the transcript's offset starts at `u32::MAX` until
+    // its first frame resolves a height to clamp against.
+    scroll_offset.saturating_add(u32::from(clamped - area.y))
 }
 
 fn clamp_col(col: u16, area: Rect) -> u16 {

@@ -45,7 +45,7 @@ pub(super) struct RenderFeedback {
 }
 
 pub(super) struct RenderCursor {
-    skip: u16,
+    skip: u32,
     y: u16,
     bottom: u16,
     viewport: Rect,
@@ -53,7 +53,7 @@ pub(super) struct RenderCursor {
 }
 
 impl RenderCursor {
-    pub fn new(scroll_top: u16, viewport: Rect, terminal_links: Vec<TerminalLink>) -> Self {
+    pub fn new(scroll_top: u32, viewport: Rect, terminal_links: Vec<TerminalLink>) -> Self {
         Self {
             skip: scroll_top,
             y: viewport.y,
@@ -65,6 +65,19 @@ impl RenderCursor {
 
     pub fn past_bottom(&self) -> bool {
         self.y >= self.bottom
+    }
+
+    /// Consumes a segment sitting entirely above the viewport, reporting
+    /// whether it did. Lets a caller drop the per-segment hover and action
+    /// lookups for rows that will never be painted, which is most of them in
+    /// a long transcript.
+    pub fn skip_above(&mut self, h: u16) -> bool {
+        let h = u32::from(h);
+        if self.skip >= h {
+            self.skip -= h;
+            return true;
+        }
+        false
     }
 
     pub fn into_terminal_links(self) -> Vec<TerminalLink> {
@@ -81,15 +94,16 @@ impl RenderCursor {
         frame: &mut Frame,
     ) -> Option<Rect> {
         let (lines, links) = content;
-        if self.skip >= h {
-            self.skip -= h;
+        if self.skip_above(h) {
             return None;
         }
         if self.y >= self.bottom {
             return None;
         }
         let (style, rail_style) = styles;
-        let skipped = self.skip;
+        // `skip_above` returned false, so what is left to skip lies inside
+        // this segment and fits the height it was measured against.
+        let skipped = self.skip.min(u32::from(h)) as u16;
         let visible_h = h
             .saturating_sub(skipped)
             .min(self.bottom.saturating_sub(self.y));

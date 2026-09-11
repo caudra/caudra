@@ -287,12 +287,20 @@ pub(crate) fn visual_line_count(text_len: usize, width: usize) -> usize {
     text_len.div_ceil(width).max(1)
 }
 
-pub(crate) fn apply_scroll_delta(offset: u16, delta: i32) -> u16 {
+/// A positive delta scrolls towards the top of the document, so it lowers the
+/// offset. The transcript counts rows in `u32` because a long session runs
+/// past 65535 of them; every other surface is bounded by its own content and
+/// stays in `u16`.
+pub(crate) fn apply_scroll_rows(offset: u32, delta: i32) -> u32 {
     if delta > 0 {
-        offset.saturating_sub(delta as u16)
+        offset.saturating_sub(delta.unsigned_abs())
     } else {
-        offset.saturating_add(delta.unsigned_abs() as u16)
+        offset.saturating_add(delta.unsigned_abs())
     }
+}
+
+pub(crate) fn apply_scroll_delta(offset: u16, delta: i32) -> u16 {
+    apply_scroll_rows(u32::from(offset), delta).min(u32::from(u16::MAX)) as u16
 }
 
 /// Splits `cells` between `weights` by largest remainder, so the parts always

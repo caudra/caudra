@@ -1079,7 +1079,7 @@ impl App {
 
     pub(super) fn scroll_offset(&self, zone: SelectionZone) -> u32 {
         match zone {
-            SelectionZone::Messages => self.chats[self.active_chat].scroll_top() as u32,
+            SelectionZone::Messages => self.chats[self.active_chat].scroll_top(),
             SelectionZone::Input => self.active_input_box().scroll_y() as u32,
             SelectionZone::Overlay => 0,
         }

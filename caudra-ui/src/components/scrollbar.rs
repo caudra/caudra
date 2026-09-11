@@ -19,11 +19,19 @@ pub fn enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
 }
 
-pub fn render_vertical_scrollbar(frame: &mut Frame, area: Rect, content_len: u16, position: u16) {
+/// `impl Into<u32>` so the transcript, whose row space outgrew `u16`, and every
+/// content-bounded surface, which has not, both call it unchanged.
+pub fn render_vertical_scrollbar(
+    frame: &mut Frame,
+    area: Rect,
+    content_len: impl Into<u32>,
+    position: impl Into<u32>,
+) {
     if !ENABLED.load(Ordering::Relaxed) {
         return;
     }
-    let max_scroll = content_len.saturating_sub(area.height);
+    let (content_len, position) = (content_len.into(), position.into());
+    let max_scroll = content_len.saturating_sub(u32::from(area.height));
     let mut state = ScrollbarState::default()
         .content_length(max_scroll as usize + 1)
         .position(position as usize);

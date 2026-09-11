@@ -42,7 +42,7 @@ pub enum SearchAction {
     QueryChanged,
     Navigate,
     Select(usize),
-    Close(Option<(u16, bool)>),
+    Close(Option<(u32, bool)>),
 }
 
 pub struct SearchModal {
@@ -52,7 +52,7 @@ pub struct SearchModal {
     scroll_offset: usize,
     viewport_height: usize,
     open: bool,
-    saved_scroll: Option<(u16, bool)>,
+    saved_scroll: Option<(u32, bool)>,
     matcher: Matcher,
     /// Where the modal last drew, so a wheel event can tell whether it landed
     /// on the results or on the transcript behind them.
@@ -100,7 +100,7 @@ impl SearchModal {
         }
     }
 
-    pub fn open(&mut self, scroll_top: u16, auto_scroll: bool) {
+    pub fn open(&mut self, scroll_top: u32, auto_scroll: bool) {
         self.reset();
         self.open = true;
         self.saved_scroll = Some((scroll_top, auto_scroll));

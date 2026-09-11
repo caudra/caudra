@@ -1267,9 +1267,50 @@ fn set_tool_turn_usage_updates_exact_tool_and_keeps_annotation() {
     assert_eq!(panel.messages[0].annotation.as_deref(), Some(MODEL));
 }
 
+/// A long session runs well past 65535 rows. Both the document height and the
+/// scroll offset used to clamp there, which froze the transcript part way and
+/// made the scrollbar report a document that had stopped growing.
+#[test]
+fn a_transcript_past_u16_rows_reaches_both_ends() {
+    const ROWS: u32 = u16::MAX as u32 + 500;
+    const HEIGHT: u16 = 24;
+    const REACHES_TOP: &str = "a document past 65535 rows must still scroll to its first row";
+    const REACHES_BOTTOM: &str = "a document past 65535 rows must still scroll to its last row";
+    const FULL_HEIGHT: &str = "the document height must not clamp at 65535 rows";
+
+    // Segments straight into the cache: the point is the row arithmetic, and
+    // driving 70000 rows through the markdown painter would test that instead.
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.push(DisplayMessage::new(DisplayRole::Assistant, "seed".into()));
+    render(&mut panel, 80, HEIGHT);
+    while panel.last_total_lines < ROWS {
+        panel.cache.push(segment::Segment::with_lines(
+            vec![Line::raw("x"); HEIGHT as usize],
+            String::new(),
+            None,
+        ));
+        panel.last_total_lines += u32::from(HEIGHT);
+    }
+    render(&mut panel, 80, HEIGHT);
+
+    assert!(panel.last_total_lines >= ROWS, "{FULL_HEIGHT}");
+    assert_eq!(panel.win_view().line_count, panel.last_total_lines);
+    let bottom = panel.max_scroll();
+    assert!(bottom > u32::from(u16::MAX), "{FULL_HEIGHT}");
+    assert_eq!(panel.scroll_top(), bottom, "{REACHES_BOTTOM}");
+
+    panel.scroll_to_top();
+    render(&mut panel, 80, HEIGHT);
+    assert_eq!(panel.scroll_top(), 0, "{REACHES_TOP}");
+
+    panel.enable_auto_scroll();
+    render(&mut panel, 80, HEIGHT);
+    assert_eq!(panel.scroll_top(), bottom, "{REACHES_BOTTOM}");
+}
+
 #[test]
 fn win_view_clamps_a_restored_offset_past_the_end() {
-    const LINES: u16 = 15;
+    const LINES: u32 = 15;
     const HEIGHT: u16 = 10;
 
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
@@ -1278,7 +1319,7 @@ fn win_view_clamps_a_restored_offset_past_the_end() {
         .set_buffer(&"a\n".repeat(LINES as usize));
     render(&mut panel, 80, HEIGHT);
 
-    panel.restore_scroll(u16::MAX, true);
+    panel.restore_scroll(u32::MAX, true);
 
     let view = panel.win_view();
     assert_eq!(view.scroll_top, panel.max_scroll());
@@ -1719,10 +1760,7 @@ fn extract_entire_document(panel: &mut MessagesPanel) -> String {
     let selection = make_sel(
         area,
         (0, 0),
-        (
-            u32::from(panel.last_total_lines.saturating_sub(1)),
-            WIDTH - 1,
-        ),
+        (panel.last_total_lines.saturating_sub(1), WIDTH - 1),
     );
     panel.extract_selection_text(&selection, area)
 }
@@ -2034,11 +2072,7 @@ fn title_only_open_streaming_thinking_still_copies_its_header() {
     panel.streaming_thinking.set_buffer("**Solo trace**");
     render(&mut panel, 80, 20);
     let area = Rect::new(0, 0, 80, 20);
-    let selection = make_sel(
-        area,
-        (0, 0),
-        (u32::from(panel.last_total_lines.saturating_sub(1)), 79),
-    );
+    let selection = make_sel(area, (0, 0), (panel.last_total_lines.saturating_sub(1), 79));
 
     assert_eq!(
         panel.extract_selection_text(&selection, area),
@@ -4090,7 +4124,7 @@ fn big_widen_keeps_no_stale_segment_in_the_viewport() {
     // 3x widen: content shrinks and the bottom pin pulls up, so a single
     // pre-reflow pass would leave stale segments in the viewport.
     let vh = 30u32;
-    let top = panel.scroll_top() as u32;
+    let top = panel.scroll_top();
     let mut offset: u32 = 0;
     for seg in panel.cache.segments() {
         let h = seg.height(240) as u32;
@@ -4132,7 +4166,7 @@ fn resize_low_in_a_tall_segment_leaves_no_stale_segment_in_the_viewport() {
 
     // Five rows from the bottom of the tall first segment: the rest of the
     // viewport is filled by the segments after it.
-    panel.set_scroll_top(TALL_LINES as u16 - 5);
+    panel.set_scroll_top(TALL_LINES as u32 - 5);
     render(&mut panel, 80, VIEWPORT_HEIGHT);
     assert!(
         !panel.auto_scroll(),
@@ -4141,7 +4175,7 @@ fn resize_low_in_a_tall_segment_leaves_no_stale_segment_in_the_viewport() {
 
     render(&mut panel, 40, VIEWPORT_HEIGHT);
 
-    let top = panel.scroll_top() as u32;
+    let top = panel.scroll_top();
     let mut offset: u32 = 0;
     for seg in panel.cache.segments() {
         let h = seg.height(39) as u32;
@@ -4172,14 +4206,14 @@ fn anchored_resize_keeps_the_topmost_visible_segment() {
     );
     let before = panel
         .cache
-        .anchor_at(panel.scroll_top() as u32, 79)
+        .anchor_at(panel.scroll_top(), 79)
         .expect("scroll_top lands inside a segment");
 
     render(&mut panel, 40, 10);
 
     let after = panel
         .cache
-        .anchor_at(panel.scroll_top() as u32, 39)
+        .anchor_at(panel.scroll_top(), 39)
         .expect("scroll_top still lands inside a segment after the resize");
     assert_eq!(
         after.0, before.0,
@@ -6606,3 +6640,4 @@ fn a_prefilling_prompt_draws_its_rate_beside_the_bar(width: u16, shows_rate: boo
     );
     assert_eq!(text.contains("2.0k tok/s"), shows_rate, "{NARROW_RATE_MSG}");
 }
+
