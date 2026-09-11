@@ -22,6 +22,7 @@ const GIT_READ_SUBCOMMANDS: &[&str] = &[
     "ls-files",
     "ls-tree",
     "reflog",
+    "rev-list",
     "rev-parse",
     "shortlog",
     "show",
@@ -254,6 +255,7 @@ mod tests {
     #[test_case("git log --oneline -20" => true ; "git_log")]
     #[test_case("git status --short" => true ; "git_status")]
     #[test_case("git --no-pager diff" => true ; "a_harmless_global_flag_still_finds_the_subcommand")]
+    #[test_case("git rev-list --count HEAD" => true ; "git_rev_list")]
     #[test_case("git push origin main" => false ; "git_push_is_not_a_read_subcommand")]
     #[test_case("git -c core.pager=sh log" => false ; "git_dash_c_can_run_a_pager")]
     #[test_case("git -C /elsewhere log" => false ; "git_dash_big_c_leaves_the_repository")]
