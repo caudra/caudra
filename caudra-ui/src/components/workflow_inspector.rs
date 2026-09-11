@@ -29,7 +29,7 @@ use crate::components::scrollbar::{Scrollbar, ScrollbarMouse};
 use crate::components::workflow_card::{phase_strip_line, status_span};
 use crate::components::{
     ModalScroll, Overlay, ToolProgress, escape_terminal_controls, format_compact, format_elapsed,
-    format_integer, input_line_with_cursor, now_secs, visual_rows,
+    format_integer, hover_style, input_line_with_cursor, now_secs, visual_rows,
 };
 use crate::repaint::Cadence;
 use crate::text_buffer::TextBuffer;
@@ -352,6 +352,13 @@ pub struct WorkflowInspector {
     list_rows: Vec<(u16, String)>,
     item_rows: Vec<(u16, u16)>,
     tab_hits: Vec<(Rect, Section)>,
+    /// Where the pointer last was, kept rather than resolved, so each pane
+    /// answers for its own geometry on the frame it is drawn.
+    pointer: Option<Position>,
+    /// Whether the body may scroll to show the cursor. A cursor the pointer
+    /// moved is already under the pointer, and revealing it would slide the
+    /// rows out from under the hand that pointed at them.
+    reveal_cursor: bool,
     footer: FooterLine,
     footer_hits: FooterHits,
     /// What each running agent is doing, by run and by the call that
@@ -385,6 +392,8 @@ impl WorkflowInspector {
             list_rows: Vec::new(),
             item_rows: Vec::new(),
             tab_hits: Vec::new(),
+            pointer: None,
+            reveal_cursor: true,
             footer: FooterLine::default(),
             footer_hits: FooterHits::default(),
             live: HashMap::new(),
@@ -404,6 +413,8 @@ impl WorkflowInspector {
         self.section = Section::Overview;
         self.selected = None;
         self.footer_hits.reset();
+        self.pointer = None;
+        self.reveal_cursor = true;
         let wanted = preferred
             .filter(|id| self.session_run(id).is_some())
             .map(str::to_owned);
@@ -555,6 +566,7 @@ impl WorkflowInspector {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> InspectorAction {
+        self.reveal_cursor = true;
         if self.budget.is_some() {
             return self.handle_budget_key(key);
         }
@@ -655,17 +667,28 @@ impl WorkflowInspector {
             }
         }
         let pos = Position::new(event.column, event.row);
+        self.pointer = Some(pos);
+        self.reveal_cursor = true;
         if let Some(index) = self.footer_hits.handle_mouse(event) {
             return self.footer_command(index);
         }
-        if event.kind != MouseEventKind::Down(MouseButton::Left) {
+        // A move paints the tabs and the run list from `pointer` on the next
+        // frame, so it only has to reach the body, where hovering a row is
+        // what puts the cursor on it.
+        let hovering = event.kind == MouseEventKind::Moved;
+        if !hovering && event.kind != MouseEventKind::Down(MouseButton::Left) {
             return InspectorAction::Consumed;
         }
         if let Some((_, section)) = self.tab_hits.iter().find(|(hit, _)| hit.contains(pos)) {
-            self.set_section(*section);
+            if !hovering {
+                self.set_section(*section);
+            }
             return InspectorAction::Consumed;
         }
         if self.list_area.contains(pos) {
+            if hovering {
+                return InspectorAction::Consumed;
+            }
             self.pane = Pane::Runs;
             let row = event.row - self.list_area.y + self.list_offset;
             let hit = self
@@ -679,15 +702,28 @@ impl WorkflowInspector {
             };
         }
         if self.body_area.contains(pos) {
-            self.pane = Pane::Detail;
             let row = event.row - self.body_area.y + self.scroll.offset();
             let hit = self
                 .item_rows
                 .iter()
                 .position(|(start, height)| (*start..start.saturating_add(*height)).contains(&row));
+            if hovering {
+                // Only a row the cursor can land on takes the pane: the cursor
+                // is the one thing the pane makes visible, so a graze over a
+                // section without rows must not move the keys.
+                if let Some(index) = hit.filter(|_| self.section.has_items()) {
+                    self.pane = Pane::Detail;
+                    self.cursor = index;
+                    self.reveal_cursor = false;
+                }
+                return InspectorAction::Consumed;
+            }
+            self.pane = Pane::Detail;
             match (self.section, hit) {
                 (Section::Result, Some(_)) => return self.activate(),
-                (Section::Phases | Section::Calls, Some(index)) if index == self.cursor => {
+                (Section::Phases | Section::Agents | Section::Calls, Some(index))
+                    if index == self.cursor =>
+                {
                     return self.activate();
                 }
                 (_, Some(index)) => self.cursor = index,
@@ -1096,6 +1132,12 @@ impl WorkflowInspector {
         let mut group = None;
         let spinner = spinner_str(animation_elapsed_ms());
         let now = now_secs();
+        // The offset the last frame settled on is the one the pointer was
+        // reported against, and it is clamped again below.
+        let hovered = self
+            .pointer
+            .filter(|at| area.contains(*at))
+            .map(|at| at.y - area.y + self.list_offset);
         for entry in &entries {
             if group != Some(entry.group) {
                 group = Some(entry.group);
@@ -1107,7 +1149,14 @@ impl WorkflowInspector {
                 selected_row = Some(row);
             }
             rows.push((row, entry.run.run_id.clone()));
-            lines.push(list_row(entry, selected, spinner, now, area.width));
+            let style = hover_style(
+                match selected {
+                    true => t.item_selected,
+                    false => t.item,
+                },
+                hovered == Some(row),
+            );
+            lines.push(list_row(entry, style, spinner, now, area.width));
         }
         if lines.is_empty() {
             match self.runs.is_empty() && self.history.is_empty() {
@@ -1145,8 +1194,12 @@ impl WorkflowInspector {
                 true => t.item_selected,
                 false => t.tool_dim,
             };
-            hits.push((Rect::new(x, area.y, width, 1), section));
-            spans.push(Span::styled(text, style));
+            let hit = Rect::new(x, area.y, width, 1);
+            hits.push((hit, section));
+            spans.push(Span::styled(
+                text,
+                hover_style(style, self.pointer.is_some_and(|at| hit.contains(at))),
+            ));
             spans.push(Span::raw(SECTION_GAP));
             x = x
                 .saturating_add(width)
@@ -1167,7 +1220,8 @@ impl WorkflowInspector {
                 (rows.row_of(line), rows.height_of(line))
             })
             .collect();
-        if self.pane == Pane::Detail
+        if self.reveal_cursor
+            && self.pane == Pane::Detail
             && self.section.has_items()
             && let Some(&(top, height)) = self.item_rows.get(self.cursor)
         {
@@ -1575,16 +1629,12 @@ fn requested(action: InspectorAction) -> Option<String> {
 /// reader scans, so the name and the phase give way to it instead.
 fn list_row(
     entry: &Entry<'_>,
-    selected: bool,
+    style: Style,
     spinner: &'static str,
     now: u64,
     width: u16,
 ) -> Line<'static> {
     let t = theme::current();
-    let style = match selected {
-        true => t.item_selected,
-        false => t.item,
-    };
     let mark = match entry.run.status == RunStatus::Active {
         true => spinner.to_owned(),
         false => NO_MARK.to_owned(),
@@ -1783,11 +1833,29 @@ mod tests {
 
     use caudra_agent::SubagentActivity;
     use caudra_workflow::{CallKind, PhaseRecord, RunUsage, SourceKind};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::style::Modifier;
     use test_case::test_case;
 
     use super::*;
     use crate::components::key as key_event;
 
+    const FRAME_WIDTH: u16 = 100;
+    const FRAME_HEIGHT: u16 = 24;
+    /// More agents than the body can show, so the cursor has to scroll to it.
+    const TALL_ROSTER: u64 = 40;
+    const NO_SUCH_ROW: &str = "the row was drawn on the frame under test";
+    const ROW_STARTS_PLAIN: &str = "an unpointed row carries no hover mark";
+    const ROW_MARKS_THE_POINTER: &str = "a run row marks itself while the pointer is on it";
+    const ROW_RELEASES_THE_POINTER: &str = "a run row drops its mark when the pointer leaves";
+    const HOVER_IS_NOT_A_CLICK: &str = "hovering must not act, only mark";
+    const TAB_MARKS_THE_POINTER: &str = "a section tab marks itself while the pointer is on it";
+    const CLICK_STILL_SWITCHES: &str = "pressing a tab still switches to it";
+    const ONE_CLICK_OPENS: &str = "a click opens the row the pointer already put the cursor on";
+    const HOVER_PLACES_THE_CURSOR: &str = "the pointer puts the cursor on the row under it";
+    const POINTER_DOES_NOT_SCROLL: &str = "a cursor the pointer moved is already in view";
+    const KEYS_STILL_SCROLL: &str = "the keys still scroll the cursor into view";
     const RUN_ID: &str = "run-1";
     const OTHER_RUN_ID: &str = "run-2";
     const OLD_RUN_ID: &str = "run-old";
@@ -1907,6 +1975,178 @@ mod tests {
         let mut inspector = WorkflowInspector::new();
         let _ = inspector.open(runs, None);
         inspector
+    }
+
+    fn task_id_of(index: u64) -> String {
+        format!("{RUN_ID}:{index}")
+    }
+
+    fn roster(count: u64) -> Vec<AgentRosterEntry> {
+        (0..count)
+            .map(|index| AgentRosterEntry {
+                call_key: index,
+                task_id: Some(task_id_of(index)),
+                ..agent(None)
+            })
+            .collect()
+    }
+
+    fn mouse_at(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        }
+    }
+
+    fn draw(inspector: &mut WorkflowInspector, terminal: &mut Terminal<TestBackend>) {
+        terminal
+            .draw(|frame| {
+                inspector.view(frame, frame.area());
+            })
+            .unwrap();
+    }
+
+    fn terminal() -> Terminal<TestBackend> {
+        Terminal::new(TestBackend::new(FRAME_WIDTH, FRAME_HEIGHT)).unwrap()
+    }
+
+    fn reversed_at(terminal: &Terminal<TestBackend>, row: u16) -> bool {
+        let buffer = terminal.backend().buffer();
+        (0..FRAME_WIDTH).any(|column| {
+            buffer[(column, row)]
+                .style()
+                .add_modifier
+                .contains(Modifier::REVERSED)
+        })
+    }
+
+    /// The screen row a run's list row was last drawn on.
+    fn screen_row_of(inspector: &WorkflowInspector, run_id: &str) -> u16 {
+        let row = inspector
+            .list_rows
+            .iter()
+            .find(|(_, id)| id == run_id)
+            .map(|(row, _)| *row)
+            .expect(NO_SUCH_ROW);
+        inspector.list_area.y + row - inspector.list_offset
+    }
+
+    #[test]
+    fn a_hovered_run_row_marks_itself_without_selecting() {
+        let mut terminal = terminal();
+        let mut inspector = open_with(vec![
+            run(RUN_ID, RunStatus::Active, Vec::new()),
+            run(OTHER_RUN_ID, RunStatus::Completed, Vec::new()),
+        ]);
+        draw(&mut inspector, &mut terminal);
+        let row = screen_row_of(&inspector, OTHER_RUN_ID);
+        assert!(!reversed_at(&terminal, row), "{ROW_STARTS_PLAIN}");
+
+        let action =
+            inspector.handle_mouse(mouse_at(MouseEventKind::Moved, inspector.list_area.x, row));
+        draw(&mut inspector, &mut terminal);
+
+        assert_eq!(action, InspectorAction::Consumed, "{HOVER_IS_NOT_A_CLICK}");
+        assert_eq!(inspector.selected(), Some(RUN_ID), "{HOVER_IS_NOT_A_CLICK}");
+        assert!(reversed_at(&terminal, row), "{ROW_MARKS_THE_POINTER}");
+
+        let _ = inspector.handle_mouse(mouse_at(
+            MouseEventKind::Moved,
+            inspector.body_area.x,
+            inspector.body_area.y,
+        ));
+        draw(&mut inspector, &mut terminal);
+
+        assert!(!reversed_at(&terminal, row), "{ROW_RELEASES_THE_POINTER}");
+    }
+
+    #[test]
+    fn a_hovered_section_tab_marks_itself_without_switching() {
+        let mut terminal = terminal();
+        let mut inspector = open_with(vec![run(RUN_ID, RunStatus::Active, Vec::new())]);
+        draw(&mut inspector, &mut terminal);
+        let (hit, section) = *inspector
+            .tab_hits
+            .iter()
+            .find(|(_, section)| *section == Section::Calls)
+            .expect(NO_SUCH_ROW);
+
+        let _ = inspector.handle_mouse(mouse_at(MouseEventKind::Moved, hit.x, hit.y));
+        draw(&mut inspector, &mut terminal);
+
+        assert_eq!(
+            inspector.section(),
+            Section::Overview,
+            "{HOVER_IS_NOT_A_CLICK}"
+        );
+        assert!(reversed_at(&terminal, hit.y), "{TAB_MARKS_THE_POINTER}");
+
+        let _ = inspector.handle_mouse(mouse_at(
+            MouseEventKind::Down(MouseButton::Left),
+            hit.x,
+            hit.y,
+        ));
+
+        assert_eq!(inspector.section(), section, "{CLICK_STILL_SWITCHES}");
+    }
+
+    /// The second row, so a cursor that did not follow the pointer would sit
+    /// on the first one and the press would only move it.
+    #[test]
+    fn a_hovered_agent_row_opens_on_one_click() {
+        let mut terminal = terminal();
+        let mut inspector = open_with(vec![run(RUN_ID, RunStatus::Active, roster(2))]);
+        let _ = inspector.handle_key(key_event(KeyCode::Char('3')));
+        draw(&mut inspector, &mut terminal);
+        let (start, _) = inspector.item_rows[1];
+        let column = inspector.body_area.x;
+        let row = inspector.body_area.y + start - inspector.scroll.offset();
+
+        let _ = inspector.handle_mouse(mouse_at(MouseEventKind::Moved, column, row));
+        let action = inspector.handle_mouse(mouse_at(
+            MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+        ));
+
+        match action {
+            InspectorAction::OpenTranscript(task_id) => assert_eq!(task_id, task_id_of(1)),
+            action => panic!("{ONE_CLICK_OPENS}: {action:?}"),
+        }
+    }
+
+    #[test]
+    fn a_pointer_driven_cursor_does_not_scroll_the_body() {
+        let mut terminal = terminal();
+        let mut inspector = open_with(vec![run(RUN_ID, RunStatus::Active, roster(TALL_ROSTER))]);
+        let _ = inspector.handle_key(key_event(KeyCode::Char('3')));
+        draw(&mut inspector, &mut terminal);
+
+        let _ = inspector.handle_mouse(mouse_at(
+            MouseEventKind::Moved,
+            inspector.body_area.x,
+            inspector.body_area.y,
+        ));
+        draw(&mut inspector, &mut terminal);
+
+        assert_eq!(inspector.cursor, 0, "{HOVER_PLACES_THE_CURSOR}");
+
+        let before = inspector.scroll.offset();
+        inspector.cursor = TALL_ROSTER as usize - 1;
+        draw(&mut inspector, &mut terminal);
+
+        assert_eq!(
+            inspector.scroll.offset(),
+            before,
+            "{POINTER_DOES_NOT_SCROLL}"
+        );
+
+        let _ = inspector.handle_key(key_event(KeyCode::Down));
+        draw(&mut inspector, &mut terminal);
+
+        assert!(inspector.scroll.offset() > before, "{KEYS_STILL_SCROLL}");
     }
 
     #[test_case(None, RUN_ID ; "the_newest_by_default")]
@@ -2041,7 +2281,7 @@ mod tests {
             session_title: None,
         };
 
-        let row = list_row(&entry, true, "", ELAPSED_SECS, LIST_MAX_WIDTH);
+        let row = list_row(&entry, Style::default(), "", ELAPSED_SECS, LIST_MAX_WIDTH);
 
         let text: String = row.spans.iter().map(|span| span.content.as_ref()).collect();
         assert!(text.contains(PHASE_ONE), "{text}");

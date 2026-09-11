@@ -36,6 +36,15 @@ const MENTION_MISSED: &str = "the pointer sat on a mention the panel did not res
 const MENTION_CLAIMED: &str = "a message the reader did not write answered with a mention";
 const MENTION_MARKED_GLYPHS: &str = "a hovered mention repainted the message around it";
 const TOOL_ID: &str = "t1";
+const WORKFLOW_TOOL_ID: &str = "workflow:run-1";
+const WORKFLOW_RUN_ID: &str = "run-1";
+const WORKFLOW_RUN_NAME: &str = "deep-research-run-1";
+const WORKFLOW_NAME: &str = "deep-research";
+const WORKFLOW_SCRATCH: &str = "/state/workflow_scratch/run-1/report.md";
+const CARD_IS_ONE_TARGET: &str =
+    "a press anywhere on a workflow card opens its run, so the card marks itself as one target";
+const SCRATCH_ROW_IS_ITS_OWN: &str =
+    "the row naming the scratch file opens the file, so it marks only itself";
 const INJECTED_BODY: &str =
     "<system-reminder>\n# Environment\n\n- Date: 2026-09-10\n</system-reminder>";
 const INJECTED_HEADING: &str = "Environment";
@@ -616,6 +625,97 @@ fn render(panel: &mut MessagesPanel, width: u16, height: u16) -> ratatui::Termin
 
 fn rebuild(panel: &mut MessagesPanel) {
     render(panel, 80, 24);
+}
+
+fn workflow_card(
+    status: caudra_workflow::RunStatus,
+    scratch: Option<&str>,
+) -> caudra_agent::types::WorkflowRunCard {
+    caudra_agent::types::WorkflowRunCard {
+        run_id: WORKFLOW_RUN_ID.into(),
+        display_name: WORKFLOW_RUN_NAME.into(),
+        workflow_name: WORKFLOW_NAME.into(),
+        status,
+        phase: None,
+        phases: Vec::new(),
+        phase_history: Vec::new(),
+        agent_budget: 8,
+        usage: caudra_workflow::RunUsage::default(),
+        roster: Vec::new(),
+        logs: Vec::new(),
+        result_preview: None,
+        scratch_path: scratch.map(str::to_owned),
+        pause_message: None,
+        error: None,
+        created_at: 0,
+        updated_at: 0,
+    }
+}
+
+fn panel_with_a_workflow_card(
+    status: caudra_workflow::RunStatus,
+    scratch: Option<&str>,
+) -> MessagesPanel {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    let mut message = DisplayMessage::new(
+        DisplayRole::Tool(Box::new(ToolRole {
+            id: WORKFLOW_TOOL_ID.into(),
+            effect: ToolEffect::Unknown,
+            status: ToolStatus::InProgress,
+            name: WORKFLOW_NAME.into(),
+        })),
+        String::new(),
+    );
+    message.tool_output = Some(Arc::new(ToolOutput::WorkflowRun(Box::new(workflow_card(
+        status, scratch,
+    )))));
+    panel.push(message);
+    panel
+}
+
+/// The card obeys none of the expand and collapse rules the other tool cards
+/// hover by, so the only thing that can answer for it is the click's own
+/// function. Every row it would act on has to mark itself as such.
+#[test_case(caudra_workflow::RunStatus::Active, None, false ; "a_live_run")]
+#[test_case(caudra_workflow::RunStatus::Completed, Some(WORKFLOW_SCRATCH), true ; "a_run_that_wrote_a_report")]
+fn a_workflow_card_marks_exactly_what_a_press_would_do(
+    status: caudra_workflow::RunStatus,
+    scratch: Option<&str>,
+    expect_scratch: bool,
+) {
+    let mut panel = panel_with_a_workflow_card(status, scratch);
+    let terminal = render(&mut panel, 80, 24);
+    let area = terminal.backend().buffer().area;
+    let mut marked_run = false;
+    let mut marked_scratch = false;
+
+    for row in area.y..area.bottom() {
+        let Some(hit) = panel.workflow_hit_at(row, area) else {
+            continue;
+        };
+        panel.update_hover(row, area.x, area, false, Path::new(NO_PROJECT));
+        let feedback = match &panel.hover {
+            Some(HoverTarget::Tool { id, feedback }) if id == WORKFLOW_TOOL_ID => *feedback,
+            other => panic!("{CARD_IS_ONE_TARGET}: row {row} hovered {other:?}"),
+        };
+        match hit {
+            CardHit::Run(run_id) => {
+                assert_eq!(run_id, WORKFLOW_RUN_ID);
+                assert_eq!(feedback, HoverFeedback::Chrome, "{CARD_IS_ONE_TARGET}");
+                marked_run = true;
+            }
+            CardHit::ScratchFile(_) => {
+                assert!(
+                    matches!(feedback, HoverFeedback::Row(_)),
+                    "{SCRATCH_ROW_IS_ITS_OWN}: {feedback:?}"
+                );
+                marked_scratch = true;
+            }
+        }
+    }
+
+    assert!(marked_run, "{CARD_IS_ONE_TARGET}");
+    assert_eq!(marked_scratch, expect_scratch, "{SCRATCH_ROW_IS_ITS_OWN}");
 }
 
 #[test]

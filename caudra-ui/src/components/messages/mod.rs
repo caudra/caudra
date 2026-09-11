@@ -2098,6 +2098,22 @@ impl MessagesPanel {
                 .then_some(HoverTarget::CachedThinking(msg_index));
         };
 
+        // A workflow card answers to the click's own function rather than to
+        // the expand and collapse rules below, which it does not obey: a press
+        // anywhere on it opens the inspector.
+        if let Some(hit) = self.workflow_hit_at(row, area) {
+            let feedback = match hit {
+                CardHit::ScratchFile(_) => segment
+                    .source_line_at(rel, width)
+                    .map_or(HoverFeedback::Chrome, HoverFeedback::Row),
+                CardHit::Run(_) => HoverFeedback::Chrome,
+            };
+            return Some(HoverTarget::Tool {
+                id: tool_id.to_owned(),
+                feedback,
+            });
+        }
+
         // A compact snapshot tool has not reached Lua yet, so the first click
         // is served locally and the row has to advertise itself.
         let native_toggle = (!self.has_snapshot(tool_id) || self.card_closed(tool_id))
