@@ -603,7 +603,11 @@ mod tests {
     fn the_hit_strip_widens_only_for_touch(area: Rect, touch: bool, width: u16) {
         let hit = hit_area(area, touch);
 
-        assert_eq!((hit.right(), hit.width), (area.right(), width), "{WRONG_HIT}");
+        assert_eq!(
+            (hit.right(), hit.width),
+            (area.right(), width),
+            "{WRONG_HIT}"
+        );
     }
 
     #[test]
