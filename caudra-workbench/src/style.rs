@@ -36,6 +36,9 @@ pub struct WorkbenchStyles {
     pub diff_new_emphasis: Style,
     pub diff_line_nr: Style,
     pub match_highlight: Style,
+    /// A match on the selected row, which the plain one cannot paint: it carries
+    /// no background, so it would punch the selection bar out of the run.
+    pub match_highlight_selected: Style,
     /// The match the cursor is on, told apart from the rest of them.
     pub current_match: Style,
     pub agent_touched: Style,
@@ -74,6 +77,7 @@ impl Default for WorkbenchStyles {
             diff_new_emphasis: Style::default().bg(Color::Rgb(0x2a, 0x4a, 0x30)),
             diff_line_nr: dim,
             match_highlight: Style::default().fg(Color::Black).bg(Color::Yellow),
+            match_highlight_selected: Style::default().fg(Color::Black).bg(Color::Yellow),
             current_match: Style::default().fg(Color::Black).bg(Color::Cyan),
             agent_touched: Style::default().fg(Color::Magenta),
         }

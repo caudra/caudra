@@ -712,6 +712,31 @@ fn contrast_floor(role: &str) -> f32 {
     }
 }
 
+/// How the characters a fuzzy search matched are picked out of the row they sit
+/// in.
+///
+/// The accent is the first choice, but it is chosen to stand against the theme
+/// background and nothing else, so on a selected row it lands on the selection
+/// bar instead. Every bundled theme misses the text floor that way, and the two
+/// opencode themes tint with the very colour the bar is painted in. Where the
+/// accent cannot be read, the row keeps its own already-clamped foreground and
+/// the match is carried by weight and an underline, which no palette can erase.
+fn derive_match_style(base: Style, accent: Style, background: Color) -> Style {
+    let tint = match (accent.fg, base.bg.unwrap_or(background)) {
+        (Some(Color::Rgb(fr, fg, fb)), Color::Rgb(br, bg, bb))
+            if contrast_ratio((fr, fg, fb), (br, bg, bb)) >= MIN_CONTRAST_TEXT =>
+        {
+            accent.fg
+        }
+        _ => None,
+    };
+
+    match tint {
+        Some(fg) => base.fg(fg).add_modifier(Modifier::BOLD),
+        None => base.add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+    }
+}
+
 fn resolve_style(def: &StyleDef, palette: &HashMap<String, Color>) -> Style {
     let mut style = Style::new();
     if let Some(fg) = def.fg.as_ref().and_then(|n| resolve_color(n, palette)) {
@@ -911,6 +936,20 @@ impl Theme {
                 .unwrap_or_default()
         };
 
+        // A declared match role is patched onto the row it paints over before it
+        // is clamped, so a theme that names only a foreground keeps the
+        // selection bar and is measured against it rather than the background.
+        let match_style = |ui_key: &str, base: Style| -> Style {
+            match ui.get(ui_key) {
+                Some(d) => ensure_contrast(
+                    base.patch(resolve_style(d, &palette)),
+                    background,
+                    MIN_CONTRAST_TEXT,
+                ),
+                None => derive_match_style(base, style("accent"), background),
+            }
+        };
+
         let derived_color = |ui_key: &str, scopes: &[&str]| -> Color {
             if let Some(c) = palette.get(ui_key) {
                 return *c;
@@ -1039,26 +1078,8 @@ impl Theme {
             item_selected: style("item_selected"),
             item: style("item"),
             item_desc: style("item_desc"),
-            item_match: {
-                let s = style("item_match");
-                if s == Style::default() {
-                    style("item")
-                        .fg(style("accent").fg.unwrap_or_default())
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    s
-                }
-            },
-            item_match_selected: {
-                let s = style("item_match_selected");
-                if s == Style::default() {
-                    style("item_selected")
-                        .fg(style("accent").fg.unwrap_or_default())
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    s
-                }
-            },
+            item_match: match_style("item_match", style("item")),
+            item_match_selected: match_style("item_match_selected", style("item_selected")),
             panel_border: style("panel_border"),
             panel_title: style("panel_title"),
             cursor: style("cursor"),
@@ -1562,6 +1583,93 @@ mod tests {
                 );
             }
         }
+    }
+
+    const MATCH_UNREADABLE: &str = "matched characters must clear the text contrast floor";
+    const MATCH_INDISTINCT: &str = "matched characters must not be painted as the row around them";
+
+    /// Matched characters are painted over the row they sit in, so the selected
+    /// variant is measured against the selection bar and not the background.
+    /// Every bundled theme fails that when the accent is used unconditionally,
+    /// and the opencode pair tints with the bar's own colour.
+    #[test]
+    fn bundled_themes_match_highlight_is_readable() {
+        for entry in BUNDLED_THEMES {
+            let t = bundled(entry.name);
+            for (role, style) in [
+                ("item_match", t.item_match),
+                ("item_match_selected", t.item_match_selected),
+            ] {
+                let fg = rgb(style
+                    .fg
+                    .unwrap_or_else(|| panic!("{}: {role} must set fg", entry.name)));
+                let ratio = contrast_ratio(fg, rgb(style.bg.unwrap_or(t.background)));
+                assert!(
+                    ratio >= MIN_CONTRAST_TEXT,
+                    "{}: {role} contrast {ratio:.2} is below {MIN_CONTRAST_TEXT:.1}: {MATCH_UNREADABLE}",
+                    entry.name,
+                );
+            }
+        }
+    }
+
+    /// Readable is not enough: a match painted in the row's own colour with no
+    /// weight of its own says nothing about which characters were typed.
+    #[test]
+    fn bundled_themes_match_highlight_is_distinguishable() {
+        for entry in BUNDLED_THEMES {
+            let t = bundled(entry.name);
+            for (role, matched, base) in [
+                ("item_match", t.item_match, t.item),
+                (
+                    "item_match_selected",
+                    t.item_match_selected,
+                    t.item_selected,
+                ),
+            ] {
+                assert!(
+                    matched.fg != base.fg || matched.add_modifier != base.add_modifier,
+                    "{}: {role} is identical to the row it paints over: {MATCH_INDISTINCT}",
+                    entry.name,
+                );
+            }
+        }
+    }
+
+    /// Both opencode themes name one colour for `accent` and for the selection
+    /// bar, so the tint is exactly the bar it lands on and has to be given up.
+    #[test_case("opencode"; "dark")]
+    #[test_case("opencode_light"; "light")]
+    fn colliding_accent_falls_back_to_modifiers(name: &str) {
+        let t = bundled(name);
+        assert_eq!(t.item_match_selected.fg, t.item_selected.fg);
+        assert!(
+            t.item_match_selected
+                .add_modifier
+                .contains(Modifier::BOLD | Modifier::UNDERLINED),
+            "{name}: {MATCH_INDISTINCT}",
+        );
+    }
+
+    /// A theme that names a match role gets it, foreground only, over the row's
+    /// own background rather than over the terminal's.
+    #[test]
+    fn declared_match_role_overrides_derivation() {
+        const DECLARED: &str = r##"
+            [palette]
+            background = "#000000"
+            foreground = "#ffffff"
+            bar = "#3b7dd8"
+            lime = "#c0ff00"
+
+            [ui]
+            item_selected = { fg = "background", bg = "bar" }
+            item_match_selected = { fg = "lime" }
+        "##;
+
+        let t = Theme::from_toml(DECLARED).expect("theme must parse");
+        assert_eq!(t.item_match_selected.fg, Some(Color::Rgb(0xc0, 0xff, 0x00)));
+        assert_eq!(t.item_match_selected.bg, Some(Color::Rgb(0x3b, 0x7d, 0xd8)));
     }
 
     /// A `[ui]` entry naming a missing palette key is silently dropped by

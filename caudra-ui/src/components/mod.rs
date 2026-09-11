@@ -53,6 +53,7 @@ pub(crate) mod workflow_card;
 pub(crate) mod workflow_catalog_picker;
 pub(crate) mod workflow_inspector;
 
+use std::mem;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -66,7 +67,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::selection::wrap_breaks;
 
@@ -83,6 +84,49 @@ pub(crate) fn chevron_span() -> ratatui::text::Span<'static> {
 /// foreground resolves to the terminal's default color instead of the theme's.
 pub(crate) fn input_text_style() -> Style {
     Style::new().fg(crate::theme::current().foreground)
+}
+
+/// The runs of `text` a fuzzy search matched, painted apart from the rest of it.
+///
+/// `indices` are character positions into `text`, ascending, as every nucleo
+/// matcher reports them. `max_width` is a display-column budget, so a row of
+/// wide glyphs stops at the same place a row of narrow ones does; the caller
+/// supplies any indent or padding around what comes back.
+pub(crate) fn match_spans(
+    text: &str,
+    indices: &[u32],
+    base: Style,
+    matched: Style,
+    max_width: Option<usize>,
+) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut in_match = false;
+    let mut run = String::new();
+    let mut width = 0usize;
+
+    for (i, ch) in text.chars().enumerate() {
+        if let Some(budget) = max_width {
+            let cw = ch.width().unwrap_or(0);
+            if width + cw > budget {
+                break;
+            }
+            width += cw;
+        }
+
+        let is_match = indices.binary_search(&(i as u32)).is_ok();
+        if is_match != in_match && !run.is_empty() {
+            let style = if in_match { matched } else { base };
+            spans.push(Span::styled(mem::take(&mut run), style));
+        }
+        in_match = is_match;
+        run.push(ch);
+    }
+
+    if !run.is_empty() {
+        spans.push(Span::styled(run, if in_match { matched } else { base }));
+    }
+
+    spans
 }
 
 /// A single-line prompt with the cursor painted onto the cell it occupies.

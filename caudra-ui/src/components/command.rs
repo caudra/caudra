@@ -1,4 +1,3 @@
-use std::mem;
 use std::sync::Arc;
 
 use caudra_agent::command::CustomCommand;
@@ -9,11 +8,12 @@ use nucleo::pattern::{CaseMatching, Normalization};
 use nucleo::{Config, Matcher, Nucleo, Utf32String};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph};
 
 use crate::components::list_picker::{DISABLED_DIM, PickerItem};
+use crate::components::match_spans;
 use crate::theme;
 
 const TICK_TIMEOUT_MS: u64 = 10;
@@ -952,7 +952,8 @@ impl CommandPalette {
 
                 if selected {
                     let s = t.item_selected;
-                    let highlighted_name = self.build_highlighted_spans(&name, &m.indices, dim(s));
+                    let highlighted_name =
+                        match_spans(&name, &m.indices, dim(s), dim(t.item_match_selected), None);
                     let mut spans = vec![Span::styled(" ".repeat(PAD), s)];
                     spans.extend(highlighted_name);
                     spans.push(Span::styled(" ".repeat(name_pad), s));
@@ -961,7 +962,7 @@ impl CommandPalette {
                     Line::from(spans)
                 } else {
                     let highlighted_name =
-                        self.build_highlighted_spans(&name, &m.indices, dim(t.item));
+                        match_spans(&name, &m.indices, dim(t.item), dim(t.item_match), None);
                     let mut spans = vec![Span::raw(" ".repeat(PAD))];
                     spans.extend(highlighted_name);
                     spans.push(Span::raw(" ".repeat(name_pad)));
@@ -989,39 +990,6 @@ impl CommandPalette {
         self.scroll_offset = scroll_offset;
 
         Some(popup)
-    }
-
-    fn build_highlighted_spans(&self, text: &str, indices: &[u32], base: Style) -> Vec<Span<'_>> {
-        if indices.is_empty() {
-            return vec![Span::styled(text.to_string(), base)];
-        }
-
-        let t = theme::current();
-        let highlight = base
-            .fg(t.accent.fg.unwrap_or(t.foreground))
-            .add_modifier(Modifier::BOLD);
-
-        let mut spans = Vec::new();
-        let mut in_match = false;
-        let mut run = String::new();
-
-        for (i, ch) in text.chars().enumerate() {
-            let is_match = indices.binary_search(&(i as u32)).is_ok();
-            if is_match != in_match && !run.is_empty() {
-                spans.push(Span::styled(
-                    mem::take(&mut run),
-                    if in_match { highlight } else { base },
-                ));
-            }
-            in_match = is_match;
-            run.push(ch);
-        }
-
-        if !run.is_empty() {
-            spans.push(Span::styled(run, if in_match { highlight } else { base }));
-        }
-
-        spans
     }
 }
 

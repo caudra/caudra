@@ -1706,10 +1706,9 @@ fn search_row(
 /// The line number, then the matching text with the match itself picked out, so
 /// the eye lands on the same thing the cursor would.
 fn hit_row(hit: &Hit, selected: bool, styles: &WorkbenchStyles, width: u16) -> Line<'static> {
-    let style = if selected {
-        styles.selected
-    } else {
-        styles.text
+    let (style, matched) = match selected {
+        true => (styles.selected, styles.match_highlight_selected),
+        false => (styles.text, styles.match_highlight),
     };
     let number = format!("{LEAF_INDENT}{}{SUMMARY_GAP}", hit.line);
     let budget = (width as usize).saturating_sub(number.chars().count());
@@ -1719,7 +1718,7 @@ fn hit_row(hit: &Hit, selected: bool, styles: &WorkbenchStyles, width: u16) -> L
     let mut spans = vec![Span::styled(number, styles.gutter)];
     for (slice, painted) in [
         (&text[..start], style),
-        (&text[start..end], styles.match_highlight),
+        (&text[start..end], matched),
         (&text[end..], style),
     ] {
         if !slice.is_empty() {

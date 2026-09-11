@@ -9,16 +9,15 @@ use nucleo::pattern::{CaseMatching, Normalization};
 use nucleo::{Config, Matcher, Nucleo};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
-use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use tracing::warn;
-use unicode_width::UnicodeWidthChar;
 
 use crate::animation::spinner_frame;
 use crate::components::Overlay;
 use crate::components::file_walk::{self, Walk};
 use crate::components::keybindings::key;
+use crate::components::match_spans;
 use crate::components::modal::Modal;
 use crate::components::scrollbar::{Scrollbar, ScrollbarMouse};
 use crate::repaint::{Cadence, Dirty};
@@ -563,38 +562,13 @@ fn build_highlighted_line<'a>(
     selected: bool,
     t: &'a theme::Theme,
 ) -> Line<'a> {
-    let base = if selected { t.item_selected } else { t.item };
-    let highlight = base
-        .fg(t.accent.fg.unwrap_or(t.foreground))
-        .add_modifier(Modifier::BOLD);
+    let (base, matched) = match selected {
+        true => (t.item_selected, t.item_match_selected),
+        false => (t.item, t.item_match),
+    };
 
     let mut spans = vec![Span::styled(LABEL_INDENT, base)];
-    let mut in_match = false;
-    let mut run = String::new();
-    let mut width = 0usize;
-
-    for (i, ch) in text.chars().enumerate() {
-        let cw = ch.width().unwrap_or(0);
-        if width + cw > max_width {
-            break;
-        }
-        width += cw;
-
-        let is_match = indices.binary_search(&(i as u32)).is_ok();
-        if is_match != in_match && !run.is_empty() {
-            spans.push(Span::styled(
-                mem::take(&mut run),
-                if in_match { highlight } else { base },
-            ));
-        }
-        in_match = is_match;
-        run.push(ch);
-    }
-
-    if !run.is_empty() {
-        spans.push(Span::styled(run, if in_match { highlight } else { base }));
-    }
-
+    spans.extend(match_spans(text, indices, base, matched, Some(max_width)));
     Line::from(spans)
 }
 

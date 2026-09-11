@@ -2,6 +2,7 @@ use std::cmp::Reverse;
 
 use crate::components::Overlay;
 use crate::components::keybindings::key;
+use crate::components::match_spans;
 use crate::components::modal::Modal;
 use crate::components::scrollbar::{Scrollbar, ScrollbarMouse};
 use crate::text_buffer::TextBuffer;
@@ -11,7 +12,6 @@ use nucleo_matcher::pattern::{Atom, AtomKind, CaseMatching, Normalization};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
-use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
@@ -448,40 +448,13 @@ fn build_highlighted_line<'a>(
     is_selected: bool,
     t: &'a theme::Theme,
 ) -> Line<'a> {
-    let index_set: std::collections::HashSet<u32> = indices.iter().copied().collect();
-    let base_style = if is_selected { t.item_selected } else { t.item };
-    let match_style = base_style
-        .fg(t.accent.fg.unwrap_or(t.foreground))
-        .add_modifier(Modifier::BOLD);
+    let (base, matched) = match is_selected {
+        true => (t.item_selected, t.item_match_selected),
+        false => (t.item, t.item_match),
+    };
 
-    let mut spans = vec![Span::styled(LABEL_INDENT, base_style)];
-    let mut current_highlighted = false;
-    let mut run = String::new();
-
-    for (char_pos, ch) in text.chars().enumerate().take(max_width) {
-        let is_match = index_set.contains(&(char_pos as u32));
-
-        if is_match != current_highlighted && !run.is_empty() {
-            let style = if current_highlighted {
-                match_style
-            } else {
-                base_style
-            };
-            spans.push(Span::styled(std::mem::take(&mut run), style));
-        }
-        current_highlighted = is_match;
-        run.push(ch);
-    }
-
-    if !run.is_empty() {
-        let style = if current_highlighted {
-            match_style
-        } else {
-            base_style
-        };
-        spans.push(Span::styled(run, style));
-    }
-
+    let mut spans = vec![Span::styled(LABEL_INDENT, base)];
+    spans.extend(match_spans(text, indices, base, matched, Some(max_width)));
     Line::from(spans)
 }
 

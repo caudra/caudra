@@ -996,7 +996,7 @@ fn render_list<T: PickerItem>(
         let t = theme::current();
         let (mut style, mut detail_style) = match (i == selected, highlighted) {
             (true, true) => {
-                let s = t.item_selected.fg(t.accent.fg.unwrap_or(t.foreground));
+                let s = t.item_match_selected;
                 (s, theme::dim_style(s, DETAIL_DIM))
             }
             (true, false) => (t.item_selected, t.item_selected),
