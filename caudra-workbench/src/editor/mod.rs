@@ -7,9 +7,10 @@ pub mod history;
 pub mod render;
 
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use tracing::info;
 
 use buffer::Buffer;
 use caudra_highlight::StyledSegment;
@@ -98,8 +99,18 @@ impl Tab {
         }
     }
 
+    /// The one place a file is read into a tab, and so the one place the cost
+    /// of reading it is worth recording: opening and previewing both land here,
+    /// and both skip it entirely when the path already has a tab.
     pub fn open(path: &Path, theme_generation: u64) -> Result<Self, LoadError> {
-        Ok(Self::from_load(path, read::load(path)?, theme_generation))
+        let started = Instant::now();
+        let loaded = read::load(path)?;
+        info!(
+            lines = loaded.lines.len(),
+            read_ms = started.elapsed().as_millis() as u64,
+            "workbench file read"
+        );
+        Ok(Self::from_load(path, loaded, theme_generation))
     }
 
     /// A tab that shows text the workbench produced rather than a file it read,

@@ -504,20 +504,43 @@ impl Workbench {
     }
 
     pub fn open(&mut self, root: &Path) {
-        if self.root != root {
+        let started = Instant::now();
+        let mut phase_start = started;
+        let mut lap = || {
+            let elapsed = phase_start.elapsed().as_millis() as u64;
+            phase_start = Instant::now();
+            elapsed
+        };
+        // A watch only reports what happened while it was running, so reopening
+        // the same root rereads the panes rather than trusting the last visit.
+        let reused = self.root == root;
+        if reused {
+            self.tree.reload();
+        } else {
             self.root = root.to_path_buf();
             self.tree = Tree::new(root, self.show_hidden);
-            self.scm.open(root);
             self.touched.clear();
-        } else {
-            // A watch only reports what happened while it was running, so the
-            // panes are reread here rather than trusting the last visit.
-            self.tree.reload();
-            self.scm.refresh();
         }
+        let tree_ms = lap();
+        if reused {
+            self.scm.refresh();
+        } else {
+            self.scm.open(root);
+        }
+        let scm_ms = lap();
         self.watch = Watch::start(&self.root);
+        let watch_ms = lap();
         self.apply_marks();
         self.open = true;
+        tracing::info!(
+            reused,
+            tree_ms,
+            scm_ms,
+            watch_ms,
+            marks_ms = lap(),
+            total_ms = started.elapsed().as_millis() as u64,
+            "workbench opened"
+        );
     }
 
     pub fn toggle(&mut self, root: &Path) {
@@ -2335,11 +2358,27 @@ impl Workbench {
     }
 
     fn open_path(&mut self, path: &Path) {
+        let started = Instant::now();
+        let mut phase_start = started;
+        let mut lap = || {
+            let elapsed = phase_start.elapsed().as_millis() as u64;
+            phase_start = Instant::now();
+            elapsed
+        };
         match self.editor.open(path, self.theme_generation) {
             Ok(()) => {
+                let open_ms = lap();
                 self.focus = Focus::Editor;
                 self.tree.reveal(path);
+                let reveal_ms = lap();
                 self.follow_cursor();
+                tracing::info!(
+                    open_ms,
+                    reveal_ms,
+                    follow_ms = lap(),
+                    total_ms = started.elapsed().as_millis() as u64,
+                    "workbench file opened"
+                );
             }
             Err(error) => self.flash = Some(error.to_string()),
         }

@@ -6,6 +6,7 @@
 //! cap is a repository the tree is the better way through anyway.
 
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use ignore::WalkBuilder;
 use nucleo::pattern::{CaseMatching, Normalization, Pattern};
@@ -54,12 +55,23 @@ impl QuickOpen {
     /// palette costs a match rather than a full crawl of the tree. What makes
     /// the list stale is [`QuickOpen::invalidate`].
     pub fn open(&mut self, root: &Path, show_hidden: bool) {
-        if self.files.is_empty() {
+        let started = Instant::now();
+        let walked = self.files.is_empty();
+        if walked {
             self.files = walk(root, show_hidden);
         }
+        let walk_ms = started.elapsed().as_millis() as u64;
+        let rescan_start = Instant::now();
         self.query.clear();
         self.open = true;
         self.rescan();
+        tracing::info!(
+            walked,
+            walk_ms,
+            rescan_ms = rescan_start.elapsed().as_millis() as u64,
+            files = self.files.len(),
+            "workbench palette opened"
+        );
     }
 
     pub fn close(&mut self) {
