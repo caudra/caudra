@@ -240,6 +240,9 @@ async fn render(handle: &WorkflowHandle, request: WorkflowRequest) -> ToolExecRe
         Ok(WorkflowResponse::Run(run)) => plain(render_runs(std::slice::from_ref(&run))),
         Ok(WorkflowResponse::Runs(runs)) => plain(render_runs(&runs)),
         Ok(WorkflowResponse::Detail(detail)) => plain(render_detail(&detail)),
+        Ok(WorkflowResponse::CallBodies(bodies)) => {
+            plain(serde_json::to_string_pretty(&bodies).unwrap_or_else(|error| error.to_string()))
+        }
         Ok(WorkflowResponse::History(entries)) => plain(render_history(&entries)),
         Ok(WorkflowResponse::Trusted { name }) => plain(format!("{name} is now trusted.")),
         Ok(WorkflowResponse::Acked(_) | WorkflowResponse::Ack) => plain(String::new()),

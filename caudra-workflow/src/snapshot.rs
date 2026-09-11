@@ -17,6 +17,9 @@ pub const MAX_RUN_LOG_ENTRIES: usize = 200;
 pub const MAX_PHASE_HISTORY: usize = 64;
 /// How much of a call's result or error an inspection quotes.
 pub const MAX_CALL_PREVIEW_BYTES: usize = 512;
+/// How much of a call's request or result a body fetch carries. A body is
+/// asked for one call at a time, so it can afford what a whole journal cannot.
+pub const MAX_CALL_BODY_BYTES: usize = 64 * 1024;
 const CALL_PREVIEW_MARKER: &str = "…";
 /// The result field a script fills with the scratch file it wrote.
 const RESULT_PATH_FIELD: &str = "path";
@@ -159,6 +162,10 @@ pub struct RunCall {
     pub state: CallState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// The opening of what the script asked for, so a row says what it was
+    /// told and not only what it was called.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
     pub tokens_used: u64,
@@ -168,6 +175,19 @@ pub struct RunCall {
     pub finished_at: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_preview: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// One call's request and result as they were journaled, cut only at
+/// [`MAX_CALL_BODY_BYTES`]. This is what a reader opens when the preview on
+/// the row is not enough.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunCallBody {
+    pub call_key: u64,
+    pub request: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -195,10 +215,19 @@ pub struct RunHistoryEntry {
 
 /// `text` cut to [`MAX_CALL_PREVIEW_BYTES`] on a character boundary.
 pub fn call_preview(text: &str) -> String {
-    if text.len() <= MAX_CALL_PREVIEW_BYTES {
+    cut(text, MAX_CALL_PREVIEW_BYTES)
+}
+
+/// `text` cut to [`MAX_CALL_BODY_BYTES`] on a character boundary.
+pub fn call_body(text: &str) -> String {
+    cut(text, MAX_CALL_BODY_BYTES)
+}
+
+fn cut(text: &str, limit: usize) -> String {
+    if text.len() <= limit {
         return text.to_owned();
     }
-    let end = text.floor_char_boundary(MAX_CALL_PREVIEW_BYTES);
+    let end = text.floor_char_boundary(limit);
     format!("{}{CALL_PREVIEW_MARKER}", &text[..end])
 }
 

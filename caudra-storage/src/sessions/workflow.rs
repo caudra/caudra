@@ -656,6 +656,22 @@ impl SessionDatabase {
         })
     }
 
+    /// One journaled call, or `None` when the run never recorded that key.
+    /// Unlike the whole journal this is read for display, so a single row is
+    /// bounded by its own size rather than by the replay bounds.
+    pub fn load_workflow_call(
+        &self,
+        run_id: &str,
+        call_key: u64,
+    ) -> Result<Option<WorkflowCallRow>, SessionError> {
+        let connection = self.connection();
+        let mut statement = connection.prepare(&format!(
+            "SELECT {CALL_COLUMNS} FROM workflow_calls WHERE run_id = ?1 AND call_key = ?2"
+        ))?;
+        let mut rows = statement.query(params![run_id, signed(call_key)?])?;
+        rows.next()?.map(read_call).transpose()
+    }
+
     /// The journal of one run in call order. A journal past the row or byte
     /// bound is refused whole rather than truncated, because a partial journal
     /// replays as a different run.

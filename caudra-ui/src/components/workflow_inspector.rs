@@ -13,8 +13,8 @@ use std::path::PathBuf;
 use caudra_agent::SubagentProgress;
 use caudra_agent::types::{PhaseMark, WorkflowRunCard};
 use caudra_workflow::{
-    AgentRosterEntry, CallKind, CallState, MAX_AGENT_BUDGET, RosterState, RunCall, RunDetail,
-    RunEventKind, RunHistoryEntry, RunSnapshot, RunStatus,
+    AgentRosterEntry, CallKind, CallState, MAX_AGENT_BUDGET, RosterState, RunCall, RunCallBody,
+    RunDetail, RunEventKind, RunHistoryEntry, RunSnapshot, RunStatus,
 };
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
@@ -103,6 +103,10 @@ const PAUSED_LABEL: &str = "Paused: ";
 const ERROR_LABEL: &str = "Error: ";
 const SCRATCH_LABEL: &str = "Scratch file: ";
 const RESULT_LABEL: &str = "Result: ";
+const PROMPT_HEADING: &str = "Prompt";
+const RESULT_HEADING: &str = "Result";
+const ERROR_HEADING: &str = "Error";
+const BODY_MISSING: &str = "This call left nothing in the journal";
 const REPORT_FIELD: &str = "report";
 const CALL_PREFIX: &str = "#";
 const TOKENS_UNIT: &str = " tokens";
@@ -320,6 +324,11 @@ pub enum InspectorAction {
     },
     /// A scratch file, to open in the workbench.
     OpenFile(PathBuf),
+    /// The reader expanded a call whose body is not loaded yet.
+    LoadCallBody {
+        run_id: String,
+        call_key: u64,
+    },
     Copy {
         text: String,
         label: &'static str,
@@ -365,6 +374,18 @@ pub struct WorkflowInspector {
     /// launched it. The roster carries no activity, so it arrives on the
     /// agent's own event stream and is dropped when the agent stops.
     live: HashMap<String, HashMap<u64, ToolProgress>>,
+    /// Untruncated call text, by call key, for the selected run only. A row's
+    /// preview stands in until its body lands, and the map is dropped whole
+    /// when the selection moves, because the keys belong to one run.
+    bodies: HashMap<u64, BodyState>,
+}
+
+/// A call body's journey from asked-for to readable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BodyState {
+    Requested,
+    Loaded(RunCallBody),
+    Missing,
 }
 
 impl WorkflowInspector {
@@ -397,6 +418,7 @@ impl WorkflowInspector {
             footer: FooterLine::default(),
             footer_hits: FooterHits::default(),
             live: HashMap::new(),
+            bodies: HashMap::new(),
         }
     }
 
@@ -482,6 +504,22 @@ impl WorkflowInspector {
         }
     }
 
+    /// Bodies for the run they were asked about. A key that came back with
+    /// nothing is remembered as missing, so the row stops asking.
+    pub fn fill_call_bodies(&mut self, run_id: &str, asked: Option<u64>, bodies: Vec<RunCallBody>) {
+        if self.selected.as_deref() != Some(run_id) {
+            return;
+        }
+        if let Some(call_key) = asked
+            && !bodies.iter().any(|body| body.call_key == call_key)
+        {
+            self.bodies.insert(call_key, BodyState::Missing);
+        }
+        for body in bodies {
+            self.bodies.insert(body.call_key, BodyState::Loaded(body));
+        }
+    }
+
     /// The runs of earlier sessions. The run to inspect when nothing of this
     /// session was there to select.
     pub fn fill_history(&mut self, history: Vec<RunHistoryEntry>) -> Option<String> {
@@ -503,6 +541,7 @@ impl WorkflowInspector {
         self.history.clear();
         self.detail = None;
         self.selected = None;
+        self.bodies.clear();
         self.list_rows.clear();
         self.item_rows.clear();
         self.tab_hits.clear();
@@ -803,6 +842,7 @@ impl WorkflowInspector {
         self.selected = run_id;
         self.detail = None;
         self.expanded_call = None;
+        self.bodies.clear();
         self.cursor = 0;
         self.scroll = self.section.scroll();
         match &self.selected {
@@ -848,8 +888,7 @@ impl WorkflowInspector {
                     return InspectorAction::OpenFile(PathBuf::from(path));
                 }
                 let key = call.call_key;
-                self.expanded_call = (self.expanded_call != Some(key)).then_some(key);
-                InspectorAction::Consumed
+                self.expand_call(key)
             }
             Section::Result => match self.selected_run().and_then(RunSnapshot::scratch_path) {
                 Some(path) => InspectorAction::OpenFile(PathBuf::from(path)),
@@ -857,6 +896,68 @@ impl WorkflowInspector {
             },
             _ => InspectorAction::Consumed,
         }
+    }
+
+    /// Toggles a call open. Opening one whose body has never been asked for
+    /// asks once: the row reads from its preview until the answer lands, and
+    /// a second open costs nothing.
+    fn expand_call(&mut self, call_key: u64) -> InspectorAction {
+        if self.expanded_call == Some(call_key) {
+            self.expanded_call = None;
+            return InspectorAction::Consumed;
+        }
+        self.expanded_call = Some(call_key);
+        let Some(run_id) = self.selected.clone() else {
+            return InspectorAction::Consumed;
+        };
+        if self.bodies.contains_key(&call_key) {
+            return InspectorAction::Consumed;
+        }
+        self.bodies.insert(call_key, BodyState::Requested);
+        InspectorAction::LoadCallBody { run_id, call_key }
+    }
+
+    /// What an opened call shows: what it was asked, what it answered, and
+    /// what went wrong. The stored body replaces the row's preview once it
+    /// lands, so the reader never has to know which one they are looking at.
+    fn body_lines(&self, call: &RunCall) -> Vec<Line<'static>> {
+        let t = theme::current();
+        let body = match self.bodies.get(&call.call_key) {
+            Some(BodyState::Loaded(body)) => Some(body),
+            _ => None,
+        };
+        let mut lines = Vec::new();
+        let request = body
+            .map(|body| body.request.as_str())
+            .or(call.prompt.as_deref());
+        if let Some(request) = request {
+            lines.push(Line::styled(PROMPT_HEADING, t.tool_dim));
+            lines.extend(indented(request, Style::default()));
+        }
+        let error = body
+            .and_then(|body| body.error.as_deref())
+            .or(call.error.as_deref());
+        if let Some(error) = error {
+            lines.push(Line::styled(ERROR_HEADING, t.tool_dim));
+            lines.extend(indented(error, t.tool_error));
+        }
+        let result = body
+            .and_then(|body| body.result.as_deref())
+            .or(call.result_preview.as_deref());
+        if let Some(result) = result {
+            lines.push(Line::styled(RESULT_HEADING, t.tool_dim));
+            lines.extend(indented(result, Style::default()));
+        }
+        if body.is_none() && lines.is_empty() {
+            lines.push(Line::styled(
+                match self.bodies.get(&call.call_key) {
+                    Some(BodyState::Missing) => BODY_MISSING,
+                    _ => LOADING,
+                },
+                t.tool_dim,
+            ));
+        }
+        lines
     }
 
     /// A phase row is a link into the roster: opening it lands the cursor on
@@ -1503,12 +1604,7 @@ impl WorkflowInspector {
             ));
             lines.push(Line::from(spans));
             if self.expanded_call == Some(call.call_key) {
-                if let Some(error) = &call.error {
-                    lines.extend(indented(error, t.tool_error));
-                }
-                if let Some(preview) = &call.result_preview {
-                    lines.extend(indented(preview, Style::default()));
-                }
+                lines.extend(self.body_lines(call));
             }
         }
         (lines, starts)
@@ -1860,6 +1956,12 @@ mod tests {
     const OTHER_RUN_ID: &str = "run-2";
     const OLD_RUN_ID: &str = "run-old";
     const TASK_ID: &str = "run-1:1";
+    const PROMPT_PREVIEW: &str = "research the thing";
+    const FULL_PROMPT: &str = "every last detail of what was asked";
+    const FULL_RESULT: &str = "here is everything that was found";
+    const ASKS_ONCE: &str = "an open call asks for its body exactly once";
+    const BODY_WINS: &str = "a landed body replaces the row's preview";
+    const STALE_BODY: &str = "a body for a run that is no longer selected must be dropped";
     const SESSION_TITLE: &str = "yesterday's research";
     const WRONG_RUN: &str = "a control must name the selected run";
     const INERT_KEY: &str = "a control the run cannot take must do nothing";
@@ -1950,6 +2052,7 @@ mod tests {
                 kind: CallKind::Agent,
                 state: CallState::Completed,
                 label: Some("researcher".into()),
+                prompt: Some(PROMPT_PREVIEW.into()),
                 task_id: Some(TASK_ID.into()),
                 tokens_used: 10,
                 duration_ms: 1_000,
@@ -2489,6 +2592,7 @@ mod tests {
             kind: CallKind::ScratchFile,
             state: CallState::Completed,
             label: Some("report.md".into()),
+            prompt: None,
             task_id: None,
             tokens_used: 0,
             duration_ms: 0,
@@ -2555,6 +2659,84 @@ mod tests {
         assert_eq!(inspector.expanded_call, Some(1));
         let _ = inspector.handle_key(key_event(KeyCode::Enter));
         assert_eq!(inspector.expanded_call, None);
+    }
+
+    #[test]
+    fn an_opened_call_asks_for_its_body_once() {
+        let mut inspector = open_with(vec![run(RUN_ID, RunStatus::Active, Vec::new())]);
+        inspector.fill_detail(detail(run(RUN_ID, RunStatus::Active, Vec::new())));
+        let _ = inspector.handle_key(key_event(KeyCode::Char('4')));
+
+        let asked = inspector.handle_key(key_event(KeyCode::Enter));
+
+        assert_eq!(
+            asked,
+            InspectorAction::LoadCallBody {
+                run_id: RUN_ID.into(),
+                call_key: 1,
+            },
+            "{ASKS_ONCE}"
+        );
+        let _ = inspector.handle_key(key_event(KeyCode::Enter));
+        assert_eq!(
+            inspector.handle_key(key_event(KeyCode::Enter)),
+            InspectorAction::Consumed,
+            "{ASKS_ONCE}"
+        );
+    }
+
+    #[test]
+    fn a_landed_body_replaces_the_preview() {
+        let mut inspector = open_with(vec![run(RUN_ID, RunStatus::Active, Vec::new())]);
+        inspector.fill_detail(detail(run(RUN_ID, RunStatus::Active, Vec::new())));
+        let _ = inspector.handle_key(key_event(KeyCode::Char('4')));
+        let _ = inspector.handle_key(key_event(KeyCode::Enter));
+
+        inspector.fill_call_bodies(RUN_ID, Some(1), vec![body(1)]);
+
+        let text = section_text(&mut inspector, '4');
+        assert!(text.contains(FULL_PROMPT), "{BODY_WINS}");
+        assert!(text.contains(FULL_RESULT), "{BODY_WINS}");
+        assert!(!text.contains(PROMPT_PREVIEW), "{BODY_WINS}");
+    }
+
+    #[test]
+    fn a_body_for_another_run_is_dropped() {
+        let mut inspector = open_with(vec![run(RUN_ID, RunStatus::Active, Vec::new())]);
+        inspector.fill_detail(detail(run(RUN_ID, RunStatus::Active, Vec::new())));
+        let _ = inspector.handle_key(key_event(KeyCode::Char('4')));
+        let _ = inspector.handle_key(key_event(KeyCode::Enter));
+
+        inspector.fill_call_bodies(OTHER_RUN_ID, Some(1), vec![body(1)]);
+
+        assert!(
+            !section_text(&mut inspector, '4').contains(FULL_RESULT),
+            "{STALE_BODY}"
+        );
+    }
+
+    #[test]
+    fn a_call_the_journal_lost_says_so_instead_of_loading() {
+        let mut inspector = open_with(vec![run(RUN_ID, RunStatus::Active, Vec::new())]);
+        let mut bare = detail(run(RUN_ID, RunStatus::Active, Vec::new()));
+        bare.calls[0].prompt = None;
+        bare.calls[0].result_preview = None;
+        inspector.fill_detail(bare);
+        let _ = inspector.handle_key(key_event(KeyCode::Char('4')));
+        let _ = inspector.handle_key(key_event(KeyCode::Enter));
+
+        inspector.fill_call_bodies(RUN_ID, Some(1), Vec::new());
+
+        assert!(section_text(&mut inspector, '4').contains(BODY_MISSING));
+    }
+
+    fn body(call_key: u64) -> RunCallBody {
+        RunCallBody {
+            call_key,
+            request: FULL_PROMPT.into(),
+            result: Some(FULL_RESULT.into()),
+            error: None,
+        }
     }
 
     #[test]

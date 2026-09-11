@@ -6,7 +6,9 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::catalog::{LaunchRequest, WorkflowCatalog};
-use crate::snapshot::{RunDetail, RunHistoryEntry, RunSnapshot, RunStatus, SourceKind};
+use crate::snapshot::{
+    RunCallBody, RunDetail, RunHistoryEntry, RunSnapshot, RunStatus, SourceKind,
+};
 
 const SCOPE_SEPARATOR: &str = ", ";
 
@@ -25,6 +27,13 @@ pub enum WorkflowRequest {
     /// One run with its journal and timeline, from any session.
     Inspect {
         run_id: String,
+    },
+    /// Untruncated request and result text for one journaled call, or for
+    /// every call of the run when `call_key` is absent.
+    CallBodies {
+        run_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call_key: Option<u64>,
     },
     /// Recent runs of other sessions, newest first.
     History {
@@ -68,6 +77,7 @@ pub enum WorkflowResponse {
     Runs(Vec<RunSnapshot>),
     Run(Box<RunSnapshot>),
     Detail(Box<RunDetail>),
+    CallBodies(Vec<RunCallBody>),
     History(Vec<RunHistoryEntry>),
     Trusted {
         name: String,

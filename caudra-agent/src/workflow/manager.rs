@@ -18,10 +18,10 @@ use caudra_storage::workflow::{
 };
 use caudra_workflow::{
     CallKey, CallKind, CallState, DEFAULT_AGENT_BUDGET, Journal, JournalEntry, LaunchRequest,
-    MAX_ACTIVE_RUNS, MAX_AGENT_BUDGET, RunCall, RunDetail, RunHistoryEntry, RunSnapshot, RunStatus,
-    RunUsage, SmokeResult, WORKFLOW_ABI_VERSION, WORKFLOW_LANGUAGE_VERSION, WorkflowError,
-    WorkflowOutcome, WorkflowRequest, WorkflowResponse, WorkflowState, call_preview, hash_request,
-    validate,
+    MAX_ACTIVE_RUNS, MAX_AGENT_BUDGET, RunCall, RunCallBody, RunDetail, RunHistoryEntry,
+    RunSnapshot, RunStatus, RunUsage, SmokeResult, WORKFLOW_ABI_VERSION, WORKFLOW_LANGUAGE_VERSION,
+    WorkflowError, WorkflowOutcome, WorkflowRequest, WorkflowResponse, WorkflowState, call_body,
+    call_preview, hash_request, validate,
 };
 use flume::Receiver;
 use serde_json::Value;
@@ -176,6 +176,9 @@ impl Manager {
             WorkflowRequest::Start(launch) => self.start(launch).await,
             WorkflowRequest::Status { run_id } => self.status(run_id.as_deref()),
             WorkflowRequest::Inspect { run_id } => self.inspect(&run_id).await,
+            WorkflowRequest::CallBodies { run_id, call_key } => {
+                self.call_bodies(&run_id, call_key).await
+            }
             WorkflowRequest::History { limit } => self.history(limit).await,
             WorkflowRequest::Pause { run_id } => self.interrupt(&run_id, RunStatus::Paused).await,
             WorkflowRequest::Stop { run_id } => self.interrupt(&run_id, RunStatus::Cancelled).await,
@@ -417,6 +420,29 @@ impl Manager {
         })))
     }
 
+    /// The untruncated text of one call, or of every call the run journaled.
+    /// A key the run never recorded answers with nothing rather than an error,
+    /// because a trimmed journal is a normal state and not a failure.
+    async fn call_bodies(
+        &self,
+        run_id: &str,
+        call_key: Option<u64>,
+    ) -> Result<WorkflowResponse, WorkflowError> {
+        let rows = match call_key {
+            Some(key) => self
+                .env
+                .store
+                .load_call(run_id.to_owned(), key)
+                .await?
+                .into_iter()
+                .collect(),
+            None => self.env.store.load_calls(run_id.to_owned()).await?,
+        };
+        Ok(WorkflowResponse::CallBodies(
+            rows.iter().map(run_call_body).collect(),
+        ))
+    }
+
     async fn history(&self, limit: Option<usize>) -> Result<WorkflowResponse, WorkflowError> {
         let limit = limit.unwrap_or(DEFAULT_HISTORY_RUNS).min(MAX_HISTORY_RUNS);
         let rows = self.env.store.load_history(limit).await?;
@@ -558,6 +584,10 @@ fn run_call(call: &WorkflowCallRow) -> RunCall {
         .iter()
         .find_map(|field| request.get(field).and_then(Value::as_str))
         .map(|text| call_preview(text.lines().next().unwrap_or_default()));
+    let prompt = request
+        .get(CALL_PROMPT_FIELD)
+        .and_then(Value::as_str)
+        .map(call_preview);
     RunCall {
         call_key: call.call_key,
         kind: call_kind(call.kind),
@@ -567,6 +597,7 @@ fn run_call(call: &WorkflowCallRow) -> RunCall {
             WorkflowCallState::Failed => CallState::Failed,
         },
         label,
+        prompt,
         task_id: call.task_id.clone(),
         tokens_used: call.tokens_used,
         duration_ms: call.duration_ms,
@@ -574,6 +605,33 @@ fn run_call(call: &WorkflowCallRow) -> RunCall {
         finished_at: call.finished_at,
         result_preview,
         error: call.error.clone(),
+    }
+}
+
+/// A journal row as a reader opens it: the request and result as stored, cut
+/// only where a body has to end. A string result is unquoted, so a scratch
+/// call reads as its path rather than as JSON.
+fn run_call_body(call: &WorkflowCallRow) -> RunCallBody {
+    RunCallBody {
+        call_key: call.call_key,
+        request: call_body(&pretty_json(&call.request)),
+        result: call
+            .result
+            .as_deref()
+            .map(|text| call_body(&pretty_json(text))),
+        error: call.error.as_deref().map(call_body),
+    }
+}
+
+/// Stored JSON re-rendered for reading. A bare string unwraps to itself and
+/// anything unparseable is passed through untouched.
+fn pretty_json(text: &str) -> String {
+    let Ok(value) = serde_json::from_str::<Value>(text) else {
+        return text.to_owned();
+    };
+    match value.as_str() {
+        Some(text) => text.to_owned(),
+        None => serde_json::to_string_pretty(&value).unwrap_or_else(|_| text.to_owned()),
     }
 }
 
@@ -673,6 +731,15 @@ mod tests {
     const FIRST_KEY: u64 = 1;
     const SECOND_KEY: u64 = 2;
     const THIRD_KEY: u64 = 3;
+    const UNKNOWN_KEY: u64 = 99;
+    /// What `ECHO_BODY` asks its first agent for.
+    const FIRST_PROMPT: &str = "hello";
+    const PROMPT_IS_CARRIED: &str = "a call row must say what its agent was asked";
+    const ONE_BODY_IS_ONE_CALL: &str = "a keyed body request must answer for that call alone";
+    const BODY_CARRIES_THE_REQUEST: &str = "a body must carry the request the journal stored";
+    const ALL_BODIES_ARE_THE_JOURNAL: &str = "an unkeyed body request must answer for every call";
+    const SCRATCH_BODY_IS_ITS_PATH: &str = "a scratch body must read as its path, not as JSON";
+    const UNKNOWN_KEY_IS_EMPTY: &str = "a key the run never recorded must answer with nothing";
 
     const ECHO: &str = "echo";
     const ECHO_BODY: &str = r#"
@@ -1147,8 +1214,72 @@ complete(first.output.echo);
             assert_eq!(detail.events.len(), 2, "{TIMELINE_IS_KEPT}");
             assert!(!detail.journal_trimmed);
             assert!(matches!(unknown, Err(WorkflowError::UnknownRun { .. })));
+            assert_eq!(
+                detail.calls[0].prompt.as_deref(),
+                Some(FIRST_PROMPT),
+                "{PROMPT_IS_CARRIED}"
+            );
             runtime.shutdown().await;
         });
+    }
+
+    #[test]
+    fn call_bodies_answer_for_one_call_or_for_all_of_them() {
+        smol::block_on(async {
+            let fixture = Fixture::new();
+            fixture.user_workflow(ECHO, ECHO_BODY);
+            let runtime = fixture.spawn().await;
+            let handle = runtime.handle();
+            let started = start(&handle, ECHO, None).await;
+            fixture
+                .wait_for(&started.run_id, RunStatus::Completed)
+                .await;
+
+            let one = call_bodies(&handle, &started.run_id, Some(FIRST_KEY)).await;
+            let all = call_bodies(&handle, &started.run_id, None).await;
+            let missing = call_bodies(&handle, &started.run_id, Some(UNKNOWN_KEY)).await;
+
+            assert_eq!(
+                one.iter().map(|body| body.call_key).collect::<Vec<_>>(),
+                [FIRST_KEY],
+                "{ONE_BODY_IS_ONE_CALL}"
+            );
+            assert!(
+                one[0].request.contains(FIRST_PROMPT),
+                "{BODY_CARRIES_THE_REQUEST}"
+            );
+            assert_eq!(
+                all.iter().map(|body| body.call_key).collect::<Vec<_>>(),
+                [FIRST_KEY, SECOND_KEY],
+                "{ALL_BODIES_ARE_THE_JOURNAL}"
+            );
+            assert!(
+                all[1]
+                    .result
+                    .as_deref()
+                    .is_some_and(|path| path.ends_with(SCRATCH_FILE)),
+                "{SCRATCH_BODY_IS_ITS_PATH}"
+            );
+            assert!(missing.is_empty(), "{UNKNOWN_KEY_IS_EMPTY}");
+            runtime.shutdown().await;
+        });
+    }
+
+    async fn call_bodies(
+        handle: &WorkflowHandle,
+        run_id: &str,
+        call_key: Option<u64>,
+    ) -> Vec<RunCallBody> {
+        match handle
+            .request(WorkflowRequest::CallBodies {
+                run_id: run_id.to_owned(),
+                call_key,
+            })
+            .await
+        {
+            Ok(WorkflowResponse::CallBodies(bodies)) => bodies,
+            other => panic!("{other:?}"),
+        }
     }
 
     /// History is for looking back at other sessions: this session's runs

@@ -181,6 +181,20 @@ impl WorkflowStore {
         .await
     }
 
+    pub async fn load_call(
+        &self,
+        run_id: String,
+        call_key: u64,
+    ) -> Result<Option<WorkflowCallRow>, WorkflowError> {
+        self.call(move |worker| {
+            worker
+                .database
+                .load_workflow_call(&run_id, call_key)
+                .map_err(storage)
+        })
+        .await
+    }
+
     pub async fn load_calls(&self, run_id: String) -> Result<Vec<WorkflowCallRow>, WorkflowError> {
         self.call(move |worker| {
             worker
@@ -296,6 +310,8 @@ mod tests {
     const SCRATCH_CONTENT: &str = "first draft";
     const STALE_LOSES: &str = "a stale writer must not overwrite newer state";
     const CALLS_ARE_ORDERED: &str = "a journal must load in call order";
+    const ONE_CALL_LOADS_ALONE: &str = "a single call must load by its key";
+    const UNKNOWN_CALL_IS_ABSENT: &str = "a key the run never recorded must read as absent";
     const OUTBOX_ACK_IS_EXACT: &str = "an ack must only clear the revision it delivered";
     const FAILURES_ARE_REPLIES: &str = "a failing command must answer with its error, not die";
     const CLOSED_IS_UNAVAILABLE: &str = "a stopped store must refuse rather than hang";
@@ -407,6 +423,17 @@ mod tests {
             assert_eq!(calls[1].state, WorkflowCallState::Completed);
             assert_eq!(calls[1].result.as_deref(), Some(RESULT));
             assert_eq!(calls[0].state, WorkflowCallState::Started);
+
+            let one = store.load_call(RUN_ID.into(), 1).await.unwrap();
+            assert_eq!(
+                one.map(|call| call.result),
+                Some(Some(RESULT.to_owned())),
+                "{ONE_CALL_LOADS_ALONE}"
+            );
+            assert!(
+                store.load_call(RUN_ID.into(), 99).await.unwrap().is_none(),
+                "{UNKNOWN_CALL_IS_ABSENT}"
+            );
 
             assert_eq!(
                 store.pending_outbox().await.unwrap(),

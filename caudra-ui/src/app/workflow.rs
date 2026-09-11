@@ -66,13 +66,19 @@ pub(crate) struct WorkflowUi {
 }
 
 /// What the app meant by a request, so its answer knows where to land.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Intent {
     Catalog,
     Launch,
     Trust,
     Control(RunControl),
     Inspect,
+    /// The run and call the bodies were asked about, so a reply that outlived
+    /// its selection can be told apart from one that still applies.
+    CallBodies {
+        run_id: String,
+        call_key: Option<u64>,
+    },
     History,
     Ack,
 }
@@ -411,6 +417,18 @@ impl App {
                 self.workflow_inspector.close();
                 self.open_workbench_file(&path, None);
             }
+            InspectorAction::LoadCallBody { run_id, call_key } => {
+                self.workflow.dispatch(
+                    Intent::CallBodies {
+                        run_id: run_id.clone(),
+                        call_key: Some(call_key),
+                    },
+                    WorkflowRequest::CallBodies {
+                        run_id,
+                        call_key: Some(call_key),
+                    },
+                );
+            }
             InspectorAction::Copy { text, label } => {
                 self.handle_logs_action(LogsAction::Copy { text, label });
             }
@@ -512,12 +530,16 @@ impl App {
             (Intent::Inspect, Ok(WorkflowResponse::Detail(detail))) => {
                 self.workflow_inspector.fill_detail(*detail);
             }
+            (Intent::CallBodies { run_id, call_key }, Ok(WorkflowResponse::CallBodies(bodies))) => {
+                self.workflow_inspector
+                    .fill_call_bodies(&run_id, call_key, bodies);
+            }
             (Intent::History, Ok(WorkflowResponse::History(history))) => {
                 if let Some(run_id) = self.workflow_inspector.fill_history(history) {
                     self.inspect_workflow(run_id);
                 }
             }
-            (Intent::Inspect | Intent::History, Err(error)) => {
+            (Intent::Inspect | Intent::CallBodies { .. } | Intent::History, Err(error)) => {
                 debug!(%error, "workflow inspection could not be answered");
             }
             (Intent::Ack, Ok(WorkflowResponse::Acked(acked))) => {
