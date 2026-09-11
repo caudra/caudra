@@ -61,8 +61,8 @@ const SED: &str = "sed";
 /// same is true of `sed`, which is why `sed` is recognized by its script rather
 /// than by its flags and is not in the list below.
 const READ_ONLY_COMMANDS: &[&str] = &[
-    "basename", "cat", "date", "df", "dirname", "du", "file", "head", "jq", "ls", "pwd",
-    "readlink", "realpath", "stat", "tail", "tree", "uname", "wc", "which",
+    "basename", "cat", "date", "df", "dirname", "du", "echo", "file", "head", "jq", "ls", "printf",
+    "pwd", "readlink", "realpath", "stat", "tail", "tree", "uname", "wc", "which",
 ];
 
 /// Reports whether every command in an analyzed line only observes.
@@ -245,6 +245,8 @@ mod tests {
     #[test_case("find . -exec rm x ;" => false ; "find_exec")]
     #[test_case("ls -la" => true ; "ls")]
     #[test_case("cat Cargo.toml" => true ; "cat")]
+    #[test_case("echo === callers ===" => true ; "echo")]
+    #[test_case("printf %s-%s a b" => true ; "printf")]
     #[test_case("sed -n 1,140p f" => true ; "sed_printing_a_slice")]
     #[test_case("sed -i s/a/b/ f" => false ; "sed_in_place_writes")]
     #[test_case("sed -n 1w/tmp/x f" => false ; "sed_writing_from_inside_the_script")]
@@ -258,6 +260,7 @@ mod tests {
     /// A line is only as safe as its worst command, and an unaccounted-for
     /// fragment makes the reviewed text describe less than the line does.
     #[test_case(&["git log", "ls"], false => true ; "every_command_observes")]
+    #[test_case(&["sed -n 1,10p f", "echo ===", "cat f"], false => true ; "a_read_wrapped_in_glue")]
     #[test_case(&["git log", "rm -rf build"], false => false ; "one_writer_taints_the_line")]
     #[test_case(&["git log"], true => false ; "opaque_is_never_read_only")]
     #[test_case(&[], false => false ; "no_scopes_is_never_read_only")]
