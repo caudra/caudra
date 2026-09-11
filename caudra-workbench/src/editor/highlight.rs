@@ -23,13 +23,14 @@ use syntect::highlighting::HighlightState;
 use syntect::parsing::ParseState;
 
 const CHECKPOINT_STRIDE: usize = 100;
-/// How far above the viewport a walk may start when no checkpoint is within
-/// reach. Without a bound, jumping into a large file re-parses everything above
-/// the target. A grammar resynchronises within a few dozen lines in practice,
-/// so this is generous, and any line the walk did not truly fold over is only
-/// at risk of being coloured as if a block comment or raw string above it had
-/// closed.
-const MAX_LOOKBACK: usize = 500;
+/// How far above a target a walk may start when nothing nearer is within
+/// reach. Without a bound, colouring a line low in a large file re-parses
+/// everything above it. A grammar resynchronises within a few dozen lines in
+/// practice, so this is generous, and any line the walk did not truly fold over
+/// is only at risk of being coloured as if a block comment or raw string above
+/// it had closed. Shared with the diff renderer, which has the same problem
+/// from the other direction.
+pub(crate) const MAX_LOOKBACK: usize = 500;
 /// How many highlighted lines to hold on to. A viewport is tens of rows, so
 /// this covers a long scroll in either direction without keeping a second copy
 /// of a large file in memory.

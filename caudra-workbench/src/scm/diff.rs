@@ -8,17 +8,20 @@
 //! are drawn from, so both surfaces agree on what changed and on which part of
 //! a line changed within it.
 
+use std::collections::HashMap;
 use std::ops::Range;
 
-use caudra_diff::{DiffLine, compute_hunks, emphasis_ranges, span_text};
+use caudra_diff::{DiffHunk, DiffLine, compute_hunks, emphasis_ranges, span_text};
 use caudra_highlight::{Highlighter, StyledSegment};
 
 use crate::editor::DiffKind;
+use crate::editor::highlight::MAX_LOOKBACK;
 
 const IDENTICAL: &str = "@@ no changes @@";
 const GAP: &str = "@@ \u{2026} @@";
-/// Past this many lines on a side, highlighting it whole to colour the handful
-/// of rows a diff actually shows costs more than the colour is worth.
+/// Past this many lines parsed, colouring costs more than the colour is worth.
+/// Only what the hunks reach is parsed, so this is reached by a change scattered
+/// through a file rather than merely by a large one.
 const MAX_HIGHLIGHT_LINES: usize = 20_000;
 
 /// One row of a rendered diff: the text without any `-`/`+` prefix, which side
@@ -57,30 +60,75 @@ impl Diff {
 /// has two files, each with its own parser state, so each side is coloured by
 /// its own highlighter and a row takes the colours of the side it came from.
 ///
-/// Colouring a side whole is the price of a tab that shows only its hunks; it
-/// is paid once when the tab opens rather than per viewport, because a
-/// synthetic buffer's rows are not its file's rows and the viewport highlighter
-/// has no way to map between them. `None` past the cap, where a flat diff costs
-/// less than the wait.
-fn side_colours(path: &str, content: &str) -> Option<Vec<Vec<StyledSegment>>> {
-    if content.lines().count() > MAX_HIGHLIGHT_LINES {
-        return None;
+/// A diff shows only its hunks, so only the lines those reach are parsed, each
+/// from a bounded distance above itself. Colouring both sides whole is what a
+/// tab used to cost: two seconds to put eight rows on screen for a one-line
+/// change in a six-thousand-line file, because the price scaled with the file
+/// rather than with the change. The lines a lookback did not truly fold over
+/// are at risk only of being coloured as if a block comment or raw string that
+/// opened above it had closed.
+fn side_colours(path: &str, content: &str, windows: &[Range<usize>]) -> SideColours {
+    let lines: Vec<&str> = content.lines().collect();
+    let mut colours = HashMap::new();
+    for window in windows {
+        // Each window starts above what it is for, so it needs its own parser:
+        // resuming the last one would be resuming it across the gap that made
+        // this a separate window.
+        let mut highlighter = Highlighter::for_path(path);
+        for line in window.start..window.end.min(lines.len() + 1) {
+            colours.insert(
+                line,
+                highlighter.highlight_line(&format!("{}\n", lines[line - 1])),
+            );
+        }
     }
-    let mut highlighter = Highlighter::for_path(path);
-    Some(
-        content
-            .lines()
-            .map(|line| highlighter.highlight_line(&format!("{line}\n")))
-            .collect(),
-    )
+    colours
+}
+
+/// The 1-indexed line range each hunk covers on each side, which is every line
+/// a row of it can ask about.
+fn touched(hunks: &[DiffHunk]) -> (Vec<Range<usize>>, Vec<Range<usize>>) {
+    let mut before = Vec::new();
+    let mut after = Vec::new();
+    for hunk in hunks {
+        let (mut last_before, mut last_after) = (hunk.before_start, hunk.after_start);
+        for line in &hunk.lines {
+            let (on_before, on_after) = line.sides();
+            last_before += usize::from(on_before);
+            last_after += usize::from(on_after);
+        }
+        before.push(hunk.before_start..last_before);
+        after.push(hunk.after_start..last_after);
+    }
+    (before, after)
+}
+
+/// What has to be parsed to colour `wanted`: every range reached back by the
+/// lookback, and anything that then overlaps merged, since walking through a
+/// short gap costs less than starting a parser over above the next hunk.
+fn windows(wanted: &[Range<usize>]) -> Vec<Range<usize>> {
+    let mut windows: Vec<Range<usize>> = Vec::new();
+    for range in wanted {
+        let start = range.start.saturating_sub(MAX_LOOKBACK).max(1);
+        match windows.last_mut() {
+            Some(last) if start <= last.end => last.end = last.end.max(range.end),
+            _ => windows.push(start..range.end),
+        }
+    }
+    windows
+}
+
+fn parsed_lines(windows: &[Range<usize>]) -> usize {
+    windows.iter().map(|window| window.end - window.start).sum()
 }
 
 /// The colours of a 1-indexed line on one side.
-fn colours_at(side: &[Vec<StyledSegment>], line: usize) -> Vec<StyledSegment> {
-    side.get(line - 1).cloned().unwrap_or_default()
+fn colours_at(side: &SideColours, line: usize) -> Vec<StyledSegment> {
+    side.get(&line).cloned().unwrap_or_default()
 }
 
-type SideColours = (Vec<Vec<StyledSegment>>, Vec<Vec<StyledSegment>>);
+type SideColours = HashMap<usize, Vec<StyledSegment>>;
+type Sides = (SideColours, SideColours);
 
 pub fn unified(path: &str, old: &str, new: &str) -> Diff {
     let hunks = compute_hunks(old, new);
@@ -90,7 +138,15 @@ pub fn unified(path: &str, old: &str, new: &str) -> Diff {
         return diff;
     }
 
-    let colours = side_colours(path, old).zip(side_colours(path, new));
+    let (before, after) = touched(&hunks);
+    let (before, after) = (windows(&before), windows(&after));
+    let affordable = parsed_lines(&before) + parsed_lines(&after) <= MAX_HIGHLIGHT_LINES;
+    let colours = affordable.then(|| {
+        (
+            side_colours(path, old, &before),
+            side_colours(path, new, &after),
+        )
+    });
     for (index, hunk) in hunks.iter().enumerate() {
         if index > 0 {
             diff.push(GAP.to_owned(), DiffKind::Header);
@@ -103,7 +159,7 @@ pub fn unified(path: &str, old: &str, new: &str) -> Diff {
     diff
 }
 
-fn row(line: &DiffLine, cursor: &mut (usize, usize), colours: Option<&SideColours>) -> DiffRow {
+fn row(line: &DiffLine, cursor: &mut (usize, usize), colours: Option<&Sides>) -> DiffRow {
     let (before, after) = *cursor;
     let (on_before, on_after) = line.sides();
     cursor.0 += usize::from(on_before);
@@ -150,18 +206,56 @@ fn row(line: &DiffLine, cursor: &mut (usize, usize), colours: Option<&SideColour
 mod tests {
     use test_case::test_case;
 
-    use super::{DiffKind, IDENTICAL, unified};
+    use super::{DiffKind, IDENTICAL, unified, windows};
 
     const PATH: &str = "x.rs";
+    const LARGE: usize = 5_000;
     const HEADER_FIRST: &str = "a hunk that is not the first must be marked as a jump";
     const NO_CHANGES: &str = "identical sides must render as a single notice";
     const KIND_WRONG: &str = "a row's kind must agree with the side it came from";
     const NO_PREFIX: &str = "a row's text is the line, not the patch line";
     const EMPHASIS: &str = "a changed row must mark the characters that changed";
     const REINDENT: &str = "a re-indented line is one row, marking only its margin";
+    const NOT_COLOURED: &str = "a changed row must carry the colours of the line it came from";
+    const WINDOW_SPLIT: &str = "hunks within a lookback of each other must be parsed in one pass";
+    const WINDOW_MERGED: &str = "hunks a lookback apart must not drag the parse across the gap";
 
     fn kinds(diff: &super::Diff) -> Vec<DiffKind> {
         diff.rows.iter().map(|row| row.kind).collect()
+    }
+
+    /// The colours no longer come from parsing the file whole, so a change that
+    /// nothing above it was parsed for is the case worth holding: a hunk at the
+    /// bottom of a large file still has to arrive coloured.
+    #[test]
+    fn a_hunk_far_down_a_file_is_still_coloured() {
+        let old: String = (0..LARGE)
+            .map(|index| format!("let line{index} = {index};\n"))
+            .collect();
+        let last = LARGE - 1;
+        let new = old.replace(
+            &format!("let line{last} = {last};"),
+            &format!("let line{last} = {LARGE};"),
+        );
+
+        let diff = unified(PATH, &old, &new);
+        let added = diff
+            .rows
+            .iter()
+            .find(|row| row.kind == DiffKind::Added)
+            .expect("an added row");
+
+        assert!(!added.segments.is_empty(), "{NOT_COLOURED}");
+    }
+
+    #[test]
+    fn nearby_hunks_share_one_parse_and_distant_ones_do_not() {
+        assert_eq!(windows(&[10..20, 30..40]), vec![1..40], "{WINDOW_SPLIT}");
+        assert_eq!(
+            windows(&[10..20, 10_000..10_010]).len(),
+            2,
+            "{WINDOW_MERGED}"
+        );
     }
 
     #[test]
