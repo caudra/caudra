@@ -31,6 +31,7 @@ const SCRATCH_LABEL: &str = "Scratch file: ";
 const SCRATCH_ROW: usize = 0;
 const PAUSED_LABEL: &str = "Paused: ";
 const ERROR_LABEL: &str = "Error: ";
+const BUDGET_LIMITED: &str = "Budget limited: resume it with a higher agent budget";
 
 /// What a click on a card names: the run itself, or the scratch file its
 /// result line lists.
@@ -143,6 +144,9 @@ pub(crate) fn render(card: &WorkflowRunCard) -> (Vec<Line<'static>>, Vec<Option<
                 Span::raw(escape_terminal_controls(&log.message)),
             ]));
         }
+    }
+    if card.status == RunStatus::BudgetLimited {
+        lines.push(Line::styled(BUDGET_LIMITED, t.tool_warning));
     }
     if let Some(message) = &card.pause_message {
         lines.push(labelled(PAUSED_LABEL, message, t.tool_warning));

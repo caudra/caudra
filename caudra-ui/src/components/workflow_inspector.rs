@@ -11,8 +11,8 @@ use std::path::PathBuf;
 
 use caudra_agent::types::{PhaseMark, WorkflowRunCard};
 use caudra_workflow::{
-    CallKind, CallState, RosterState, RunCall, RunDetail, RunEventKind, RunHistoryEntry,
-    RunSnapshot, RunStatus,
+    CallKind, CallState, MAX_AGENT_BUDGET, RosterState, RunCall, RunDetail, RunEventKind,
+    RunHistoryEntry, RunSnapshot, RunStatus,
 };
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
@@ -43,6 +43,7 @@ const H_PAD: u16 = 1;
 /// The tab strip above the body and the footer below it.
 const CHROME_ROWS: u16 = 2;
 const EMPTY_TEXT: &str = "No workflow runs yet";
+const EMPTY_HINT: &str = "Start one with /workflow <name>, or /workflows to browse";
 const NO_MATCH: &str = "No run matches";
 const NO_SELECTION: &str = "Select a run";
 const LOADING: &str = "Loading\u{2026}";
@@ -54,6 +55,16 @@ const NO_RESULT: &str = "No result yet";
 const JOURNAL_TRIMMED: &str = "Journal trimmed: the calls are no longer stored";
 pub(crate) const FOREIGN_RUN: &str = "Runs of earlier sessions can only be viewed";
 pub(crate) const NO_TRANSCRIPT: &str = "This agent has no transcript";
+const PAUSE_INERT: &str = "Only an active run can be paused";
+const RESUME_INERT: &str = "Only a paused, failed, or cancelled run can be resumed";
+const STOP_INERT: &str = "This run has already finished";
+const BUDGET_MAXED: &str = "The maximum agent budget is spent; start a new run";
+const BUDGET_INVALID: &str = "Enter an agent budget above the agents already admitted";
+const BUDGET_LABEL: &str = "Agent budget: ";
+/// What a budget-limited run is offered on top of what it already spent.
+const BUDGET_STEP: u32 = 64;
+const BUDGET_LIMITED_HINT: &str = "Budget limited: r resumes with a higher agent budget";
+const FAILED_HINT: &str = "Failed: r resumes from the journal";
 const COPIED: &str = "Copied section";
 pub(crate) const PAUSE_LABEL: &str = "p";
 pub(crate) const RESUME_LABEL: &str = "r";
@@ -107,6 +118,8 @@ const FOOTER: [(&str, &str, FooterCommand); 7] = [
     (FILTER_LABEL, "Filter", FooterCommand::Filter),
     ("Esc", "Close", FooterCommand::Close),
 ];
+/// The prompt takes every key, so its footer names no click targets.
+const BUDGET_FOOTER: [(&str, &str); 2] = [("Enter", "Resume"), ("Esc", "Cancel")];
 
 /// The keybinding tables quote the label; the inspector matches the key.
 /// One spelling feeds both.
@@ -141,6 +154,24 @@ impl RunControl {
             ),
         }
     }
+
+    /// Why the key did nothing, for a run the control cannot act on. A
+    /// dimmed control that stays silent teaches nothing.
+    const fn inert_reason(self) -> &'static str {
+        match self {
+            Self::Pause => PAUSE_INERT,
+            Self::Resume => RESUME_INERT,
+            Self::Stop => STOP_INERT,
+        }
+    }
+}
+
+/// The budget a budget-limited run is being resumed with, while it is being
+/// typed. Mutually exclusive with the filter: one input owns the row.
+struct BudgetPrompt {
+    run_id: String,
+    admitted: u32,
+    input: TextBuffer,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -273,6 +304,11 @@ pub enum InspectorAction {
         run_id: String,
     },
     OpenTranscript(String),
+    /// A budget-limited run, and the raised budget to resume it with.
+    ResumeWithBudget {
+        run_id: String,
+        agent_budget: u32,
+    },
     /// A scratch file, to open in the workbench.
     OpenFile(PathBuf),
     Copy {
@@ -291,6 +327,7 @@ pub struct WorkflowInspector {
     detail: Option<RunDetail>,
     filter: TextBuffer,
     filter_focused: bool,
+    budget: Option<BudgetPrompt>,
     pane: Pane,
     cursor: usize,
     expanded_call: Option<u64>,
@@ -320,6 +357,7 @@ impl WorkflowInspector {
             detail: None,
             filter: TextBuffer::new(String::new()),
             filter_focused: false,
+            budget: None,
             pane: Pane::Runs,
             cursor: 0,
             expanded_call: None,
@@ -404,6 +442,7 @@ impl WorkflowInspector {
 
     pub fn close(&mut self) {
         self.open = false;
+        self.budget = None;
         self.runs.clear();
         self.history.clear();
         self.detail = None;
@@ -451,7 +490,14 @@ impl WorkflowInspector {
     /// A paste lands in the filter when it has the focus. `None` when the
     /// inspector did not take it.
     pub fn handle_paste(&mut self, text: &str) -> Option<InspectorAction> {
-        if !self.open || !self.filter_focused {
+        if !self.open {
+            return None;
+        }
+        if let Some(prompt) = &mut self.budget {
+            prompt.input.insert_text(text);
+            return Some(InspectorAction::Consumed);
+        }
+        if !self.filter_focused {
             return None;
         }
         self.filter.insert_text(text);
@@ -459,6 +505,9 @@ impl WorkflowInspector {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> InspectorAction {
+        if self.budget.is_some() {
+            return self.handle_budget_key(key);
+        }
         if self.filter_focused {
             return self.handle_filter_key(key);
         }
@@ -472,7 +521,10 @@ impl WorkflowInspector {
                     self.set_section(section);
                 }
             }
-            KeyCode::Char(FILTER_KEY) if plain => self.filter_focused = true,
+            KeyCode::Char(FILTER_KEY) if plain => {
+                self.budget = None;
+                self.filter_focused = true;
+            }
             KeyCode::Left => self.pane = Pane::Runs,
             KeyCode::Right => self.pane = Pane::Detail,
             KeyCode::Up => return self.step(-1),
@@ -487,6 +539,41 @@ impl WorkflowInspector {
             }
         }
         InspectorAction::Consumed
+    }
+
+    /// The prompt owns every key while it is up, so a digit cannot reach the
+    /// section tabs and Esc leaves the inspector standing.
+    fn handle_budget_key(&mut self, key: KeyEvent) -> InspectorAction {
+        match key.code {
+            KeyCode::Esc => self.budget = None,
+            KeyCode::Enter => return self.resume_with_budget(),
+            _ => {
+                if let Some(prompt) = &mut self.budget {
+                    prompt.input.handle_key(key);
+                }
+            }
+        }
+        InspectorAction::Consumed
+    }
+
+    /// A budget has to be a number the run has not already spent, else the
+    /// runtime would refuse the resume and the prompt would have lied.
+    fn resume_with_budget(&mut self) -> InspectorAction {
+        let Some(prompt) = &self.budget else {
+            return InspectorAction::Consumed;
+        };
+        let asked = prompt.input.value().trim().parse::<u32>().ok();
+        let Some(agent_budget) =
+            asked.filter(|budget| *budget > prompt.admitted && *budget <= MAX_AGENT_BUDGET)
+        else {
+            return InspectorAction::Flash(BUDGET_INVALID);
+        };
+        let run_id = prompt.run_id.clone();
+        self.budget = None;
+        InspectorAction::ResumeWithBudget {
+            run_id,
+            agent_budget,
+        }
     }
 
     fn handle_filter_key(&mut self, key: KeyEvent) -> InspectorAction {
@@ -675,7 +762,7 @@ impl WorkflowInspector {
         }
     }
 
-    fn control(&self, control: RunControl) -> InspectorAction {
+    fn control(&mut self, control: RunControl) -> InspectorAction {
         let Some(run) = self.selected_run() else {
             return InspectorAction::Consumed;
         };
@@ -683,12 +770,43 @@ impl WorkflowInspector {
             return InspectorAction::Flash(FOREIGN_RUN);
         }
         if !control.applies_to(run.status) {
-            return InspectorAction::Consumed;
+            return InspectorAction::Flash(control.inert_reason());
+        }
+        // A bare resume of a budget-limited run is refused by the runtime:
+        // the only way on is a higher budget, so ask for one.
+        if control == RunControl::Resume && run.status == RunStatus::BudgetLimited {
+            return self.ask_budget();
         }
         InspectorAction::Control {
             control,
             run_id: run.run_id.clone(),
         }
+    }
+
+    fn ask_budget(&mut self) -> InspectorAction {
+        let Some(run) = self.selected_run() else {
+            return InspectorAction::Consumed;
+        };
+        let admitted = run.usage.agents_admitted;
+        let run_id = run.run_id.clone();
+        if admitted >= MAX_AGENT_BUDGET {
+            return InspectorAction::Flash(BUDGET_MAXED);
+        }
+        let suggested = admitted
+            .saturating_add(BUDGET_STEP)
+            .min(MAX_AGENT_BUDGET)
+            .to_string();
+        let mut input = TextBuffer::new(suggested.clone());
+        // Behind the suggestion, so accepting it is Enter and replacing it is
+        // backspace rather than a cursor trip.
+        input.set_cursor(0, suggested.chars().count());
+        self.filter_focused = false;
+        self.budget = Some(BudgetPrompt {
+            run_id,
+            admitted,
+            input,
+        });
+        InspectorAction::Consumed
     }
 
     fn copy(&self) -> InspectorAction {
@@ -709,6 +827,19 @@ impl WorkflowInspector {
         InspectorAction::Copy {
             text,
             label: COPIED,
+        }
+    }
+
+    /// What a stalled run of this session is waiting for the reader to do.
+    /// A run of an earlier session is read-only, so it is told nothing.
+    fn next_move(&self, run: &RunSnapshot) -> Option<&'static str> {
+        if self.is_foreign(&run.run_id) {
+            return None;
+        }
+        match run.status {
+            RunStatus::BudgetLimited => Some(BUDGET_LIMITED_HINT),
+            RunStatus::Failed => Some(FAILED_HINT),
+            _ => None,
         }
     }
 
@@ -807,7 +938,8 @@ impl WorkflowInspector {
         ])
         .areas(padded);
         let filtering = self.filter_focused || !self.filter.value().is_empty();
-        let footer_rows = 1 + u16::from(filtering);
+        let input_row = filtering || self.budget.is_some();
+        let footer_rows = 1 + u16::from(input_row);
         let panes_height = padded.height.saturating_sub(footer_rows);
         let list = Rect {
             height: panes_height,
@@ -830,9 +962,17 @@ impl WorkflowInspector {
         self.render_body(frame, body);
 
         let mut row = padded.y.saturating_add(panes_height);
-        if filtering {
+        if input_row {
+            let line = match &self.budget {
+                Some(prompt) => {
+                    let mut spans = vec![Span::styled(BUDGET_LABEL, theme::current().tool_dim)];
+                    spans.extend(input_line_with_cursor(&prompt.input).spans);
+                    Line::from(spans)
+                }
+                None => input_line_with_cursor(&self.filter),
+            };
             frame.render_widget(
-                Paragraph::new(input_line_with_cursor(&self.filter)),
+                Paragraph::new(line),
                 Rect {
                     y: row,
                     height: 1,
@@ -877,11 +1017,14 @@ impl WorkflowInspector {
             lines.push(list_row(entry, selected, spinner, area.width));
         }
         if lines.is_empty() {
-            let text = match self.runs.is_empty() && self.history.is_empty() {
-                true => EMPTY_TEXT,
-                false => NO_MATCH,
-            };
-            lines.push(Line::styled(text, t.tool_dim));
+            match self.runs.is_empty() && self.history.is_empty() {
+                true => {
+                    lines.push(Line::styled(EMPTY_TEXT, t.tool_dim));
+                    lines.push(Line::default());
+                    lines.push(Line::styled(EMPTY_HINT, t.tool_dim));
+                }
+                false => lines.push(Line::styled(NO_MATCH, t.tool_dim)),
+            }
         }
         self.list_rows = rows;
         let total = u16::try_from(lines.len()).unwrap_or(u16::MAX);
@@ -1018,6 +1161,9 @@ impl WorkflowInspector {
         }
         if let Some(error) = &run.error {
             lines.push(labelled(ERROR_LABEL, error, t.tool_error));
+        }
+        if let Some(hint) = self.next_move(run) {
+            lines.push(Line::styled(hint, t.tool_warning));
         }
         if !card.logs.is_empty() {
             lines.push(Line::default());
@@ -1177,6 +1323,17 @@ impl WorkflowInspector {
 
     fn footer_line(&self) -> FooterLine {
         let t = theme::current();
+        if self.budget.is_some() {
+            let mut footer = FooterLine::default();
+            for (index, (key, description)) in BUDGET_FOOTER.iter().enumerate() {
+                if index > 0 {
+                    footer.text(SECTION_GAP, Style::default());
+                }
+                footer.text(*key, t.keybind_key);
+                footer.text(format!(" {description}"), t.tool_dim);
+            }
+            return footer;
+        }
         let run = self.selected_run();
         let controllable = run.is_some_and(|run| !self.is_foreign(&run.run_id));
         let mut footer = FooterLine::default();
@@ -1401,6 +1558,11 @@ mod tests {
     const SCRATCH_PATH: &str = "/state/workflow_scratch/session/run-1/report.md";
     const OPENS_SCRATCH: &str = "Enter opens the scratch file the run wrote";
     const NO_SCRATCH: &str = "a result without a scratch file has nothing to open";
+    const ADMITTED: u32 = 8;
+    const SUGGESTED_BUDGET: &str = "72";
+    const SUGGESTS_A_STEP_UP: &str = "the prompt offers a budget above what the run spent";
+    const PROMPT_STANDS: &str = "a refused budget leaves the prompt up to correct";
+    const PROMPT_IS_NOT_THE_MODAL: &str = "escaping the prompt must not close the inspector";
 
     pub(crate) fn run(
         run_id: &str,
@@ -1498,27 +1660,109 @@ mod tests {
         assert_eq!(inspector.selected(), Some(expected));
     }
 
-    #[test_case(RunStatus::Active, PAUSE_KEY, Some(RunControl::Pause) ; "pause_active")]
-    #[test_case(RunStatus::Active, STOP_KEY, Some(RunControl::Stop) ; "stop_active")]
-    #[test_case(RunStatus::Paused, RESUME_KEY, Some(RunControl::Resume) ; "resume_paused")]
-    #[test_case(RunStatus::Completed, PAUSE_KEY, None ; "pause_completed_is_inert")]
-    #[test_case(RunStatus::Active, RESUME_KEY, None ; "resume_active_is_inert")]
+    #[test_case(RunStatus::Active, PAUSE_KEY, Ok(RunControl::Pause) ; "pause_active")]
+    #[test_case(RunStatus::Active, STOP_KEY, Ok(RunControl::Stop) ; "stop_active")]
+    #[test_case(RunStatus::Paused, RESUME_KEY, Ok(RunControl::Resume) ; "resume_paused")]
+    #[test_case(RunStatus::Completed, PAUSE_KEY, Err(PAUSE_INERT) ; "pause_completed_says_why")]
+    #[test_case(RunStatus::Active, RESUME_KEY, Err(RESUME_INERT) ; "resume_active_says_why")]
+    #[test_case(RunStatus::Completed, STOP_KEY, Err(STOP_INERT) ; "stop_completed_says_why")]
     fn control_keys_follow_the_run_status(
         status: RunStatus,
         key: char,
-        expected: Option<RunControl>,
+        expected: Result<RunControl, &str>,
     ) {
         let mut inspector = open_with(vec![run(RUN_ID, status, Vec::new())]);
         match (
             inspector.handle_key(key_event(KeyCode::Char(key))),
             expected,
         ) {
-            (InspectorAction::Control { control, run_id }, Some(expected)) => {
+            (InspectorAction::Control { control, run_id }, Ok(expected)) => {
                 assert_eq!(control, expected);
                 assert_eq!(run_id, RUN_ID, "{WRONG_RUN}");
             }
-            (InspectorAction::Consumed, None) => {}
+            (InspectorAction::Flash(reason), Err(expected)) => assert_eq!(reason, expected),
             (action, _) => panic!("{INERT_KEY}: {action:?}"),
+        }
+    }
+
+    fn budget_limited(admitted: u32) -> RunSnapshot {
+        let mut limited = run(RUN_ID, RunStatus::BudgetLimited, Vec::new());
+        limited.usage = RunUsage {
+            agents_admitted: admitted,
+            tokens_used: 0,
+        };
+        limited
+    }
+
+    #[test]
+    fn resuming_a_budget_limited_run_asks_for_a_higher_budget() {
+        let mut inspector = open_with(vec![budget_limited(ADMITTED)]);
+
+        let asked = inspector.handle_key(key_event(KeyCode::Char(RESUME_KEY)));
+        let prompt = inspector.budget.as_ref().map(|prompt| prompt.input.value());
+
+        assert_eq!(asked, InspectorAction::Consumed);
+        assert_eq!(
+            prompt.as_deref(),
+            Some(SUGGESTED_BUDGET),
+            "{SUGGESTS_A_STEP_UP}"
+        );
+        assert_eq!(
+            inspector.handle_key(key_event(KeyCode::Enter)),
+            InspectorAction::ResumeWithBudget {
+                run_id: RUN_ID.into(),
+                agent_budget: ADMITTED + BUDGET_STEP,
+            }
+        );
+        assert!(inspector.budget.is_none());
+    }
+
+    #[test]
+    fn a_budget_the_run_already_spent_is_refused() {
+        let mut inspector = open_with(vec![budget_limited(ADMITTED)]);
+        let _ = inspector.handle_key(key_event(KeyCode::Char(RESUME_KEY)));
+        for _ in 0..SUGGESTED_BUDGET.len() {
+            let _ = inspector.handle_key(key_event(KeyCode::Backspace));
+        }
+        let _ = inspector.handle_key(key_event(KeyCode::Char('1')));
+
+        let action = inspector.handle_key(key_event(KeyCode::Enter));
+
+        assert_eq!(action, InspectorAction::Flash(BUDGET_INVALID));
+        assert!(inspector.budget.is_some(), "{PROMPT_STANDS}");
+    }
+
+    #[test]
+    fn escape_closes_the_budget_prompt_and_leaves_the_inspector_open() {
+        let mut inspector = open_with(vec![budget_limited(ADMITTED)]);
+        let _ = inspector.handle_key(key_event(KeyCode::Char(RESUME_KEY)));
+
+        let action = inspector.handle_key(key_event(KeyCode::Esc));
+
+        assert_eq!(action, InspectorAction::Consumed);
+        assert!(inspector.budget.is_none());
+        assert!(inspector.is_open(), "{PROMPT_IS_NOT_THE_MODAL}");
+    }
+
+    #[test]
+    fn a_run_that_spent_the_maximum_budget_has_nothing_left_to_raise() {
+        let mut inspector = open_with(vec![budget_limited(MAX_AGENT_BUDGET)]);
+
+        let action = inspector.handle_key(key_event(KeyCode::Char(RESUME_KEY)));
+
+        assert_eq!(action, InspectorAction::Flash(BUDGET_MAXED));
+        assert!(inspector.budget.is_none());
+    }
+
+    #[test]
+    fn the_overview_tells_a_stalled_run_what_to_do() {
+        let mut inspector = open_with(vec![budget_limited(ADMITTED)]);
+
+        match inspector.handle_key(key_event(KeyCode::Char(COPY_KEY))) {
+            InspectorAction::Copy { text, .. } => {
+                assert!(text.contains(BUDGET_LIMITED_HINT), "{text}");
+            }
+            action => panic!("{action:?}"),
         }
     }
 

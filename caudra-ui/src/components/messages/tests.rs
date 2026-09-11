@@ -6640,4 +6640,3 @@ fn a_prefilling_prompt_draws_its_rate_beside_the_bar(width: u16, shows_rate: boo
     );
     assert_eq!(text.contains("2.0k tok/s"), shows_rate, "{NARROW_RATE_MSG}");
 }
-

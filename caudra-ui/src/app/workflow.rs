@@ -295,6 +295,10 @@ impl App {
             },
             RunControl::Stop => WorkflowRequest::Stop { run_id },
         };
+        self.dispatch_control(control, request);
+    }
+
+    fn dispatch_control(&mut self, control: RunControl, request: WorkflowRequest) {
         if !self.workflow.dispatch(Intent::Control(control), request) {
             self.flash(UNAVAILABLE_MSG.into());
         }
@@ -341,6 +345,18 @@ impl App {
             InspectorAction::OpenTranscript(task_id) => {
                 self.workflow_inspector.close();
                 self.preview_task(&task_id);
+            }
+            InspectorAction::ResumeWithBudget {
+                run_id,
+                agent_budget,
+            } => {
+                self.dispatch_control(
+                    RunControl::Resume,
+                    WorkflowRequest::Resume {
+                        run_id,
+                        agent_budget: Some(agent_budget),
+                    },
+                );
             }
             InspectorAction::OpenFile(path) => {
                 self.workflow_inspector.close();
