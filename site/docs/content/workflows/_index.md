@@ -42,16 +42,28 @@ Pressing Esc cancels the main turn and leaves workflow runs alone. Stop them fro
 
 ## The inspector
 
-`/workflow` (or `/workflow runs`, or the leader key followed by `k`) opens the inspector. Clicking a run card or the status bar chip opens it on that run. The left pane lists runs grouped as running, waiting, finished, and earlier sessions. Each row names the run, then its phase or the session that ran it, and holds its clock at the right edge. Type `/` to filter by name or session title. The pointer marks whatever it rests on: a run row or a section tab marks itself without acting, and a row inside a section takes the cursor, so a single click opens it. The right pane has six sections, reached with Tab, Shift+Tab, or the digits `1` to `6`:
+`/workflow` (or `/workflow runs`, or the leader key followed by `k`) opens the inspector. Clicking a run card or the status bar chip opens it on that run. The left pane lists runs grouped as running, waiting, finished, and earlier sessions. Each row names the run, then its phase or the session that ran it, and holds its clock at the right edge. Type `/` to filter by name or session title. The pointer marks whatever it rests on: a run row or a section tab marks itself without acting, and a row inside a section takes the cursor, so a single click opens it. The right pane has four sections, reached with Tab, Shift+Tab, or the digits `1` to `4`:
 
 | Section | Contents |
 |---------|----------|
 | Overview | Status, phase, elapsed time, agents landed against the roster, agents admitted against the budget, tokens, objective, the phase strip, and the last log lines |
-| Phases | Every phase the run entered with its start offset, its duration, and the agents it dispatched, then the phases the script declares and the run has not reached. Enter moves to the first agent of a phase |
-| Agents | The roster gathered under the phase that dispatched each agent. A running agent reports what it is doing, the tools it has called, and its clock. A stopped one reports its tokens and duration. Enter opens the agent's transcript |
-| Calls | The journal: each `agent`, `parallel`, and `write_scratch_file` call with its state and timing. Enter expands a call's result preview or error, or opens the file a `write_scratch_file` call wrote |
-| Logs | The stored timeline of phase changes and `log` lines, following the tail |
+| Timeline | Everything the run did, in the order it did it |
+| Agents | The roster gathered under the phase that dispatched each agent, as a ledger of who ran and what they cost |
 | Result | The report or result JSON, the scratch file path, and the pause message or error. Enter, or a click on the path, opens the scratch file in the workbench |
+
+### The timeline
+
+The timeline is the record. It puts the phases a run entered, the `agent`, `parallel`, and `write_scratch_file` calls it made, the lines it logged, and how it settled onto one clock, so reading what happened does not mean matching timestamps across several lists by eye.
+
+Calls and log lines are indented under the phase that was open when they happened. A call belongs to the phase that held the clock at the moment it started, so a phase the run entered twice counts each visit separately. Phases the script declares and the run never reached trail the walked ones, dimmed. The final row is how the run ended.
+
+Every phase and every call carries a bar scaled to the whole run. A phase that took most of the run looks like it, and a fan-out whose agents ran at the same time shows overlapping bars while one that serialised shows a staircase. A pane too narrow for a useful bar leaves it out.
+
+Enter opens the row under the cursor. On a phase it moves to the first agent that phase dispatched. On a `write_scratch_file` call it opens the file. On an agent call it opens what that agent was asked and what it answered, fetched in full from the journal rather than cut to a preview.
+
+### Agent rows
+
+An Agents row reports the phase that dispatched it, its state, its tokens, and its duration. A running agent also reports what it is doing and the tools it has called. An agent that stopped keeps the last thing it was doing, dimmed. Enter opens the same request and result a timeline row opens, because the roster and the journal are two views of one call.
 
 | Key | Action |
 |-----|--------|
@@ -60,10 +72,16 @@ Pressing Esc cancels the main turn and leaves workflow runs alone. Stop them fro
 | `s` | Stop the run |
 | Left / Right | Move focus between the run list and the section |
 | Up / Down | Walk the list, the section rows, or scroll the section text |
+| Enter | Open the row under the cursor |
+| `t` | Open the transcript of the agent under the cursor, from the timeline or the roster |
+| `o` | Open the script the run executed |
+| `e` | Copy the whole run as markdown, every prompt and result included |
 | `y` | Copy the visible section as text |
 | Esc | Close |
 
-A control that does not apply to the selected run stays where it is and says why when you press it.
+A control that does not apply to the selected run stays where it is and says why when you press it. A builtin workflow is compiled into Caudra, so `o` reports that there is no file to open.
+
+A transcript is a chat rather than an overlay, so opening one closes the inspector. Reopening it returns to the run you left.
 
 Runs of earlier sessions can be read but not controlled. Resume one from the session that launched it.
 
