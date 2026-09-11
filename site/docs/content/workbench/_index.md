@@ -145,9 +145,11 @@ Bursts of writes settle before the panes react, so a build or a `git checkout` c
 │     one.rs    M │
 │     two.rs    U │
 │ ▾ GRAPH         │
-│ ● 4f2a1c fix …  │
-│ ◉ 91be07 merge  │
-│ │○ 0cd334 wip   │
+│ ● ▾ 4f2a1c fix  │
+│ │   src/        │
+│ │     one.rs  M │
+│ ◉ ▸ 91be07 merg │
+│ │○▸ 0cd334 wip  │
 └─────────────────┘
 ```
 
@@ -157,20 +159,24 @@ Resting the pointer on a row brings up what it can do, to the left of the git le
 
 Drag a header to resize the section above it, and click one to fold that section away. A section with nothing in it is drawn folded. The bottom open section takes whatever room is left, so resizing the terminal moves that border and leaves the others where you dragged them. `Ctrl+X ↑` and `Ctrl+X ↓` do the same from the keyboard.
 
-The two change sections nest paths as folders. A folder with one child is joined onto its parent, so `src/main/rust` is one row rather than three. `T` switches both sections to flat full paths, and the `TREE` or `FLAT` label on the right of the sidebar header does the same with the mouse.
+All three sections nest paths as folders. A folder with one child is joined onto its parent, so `src/main/rust` is one row rather than three. `T` switches them to flat full paths, and the `TREE` or `FLAT` label on the right of the sidebar header does the same with the mouse.
 
-Rows in `GRAPH` carry a rail glyph: `●` for a commit on the chain of first parents, `◉` for a merge, and `│○` for a commit a merge brought in. The rail is one lane wide, so it says where a commit sits against the first-parent chain rather than drawing every branch. `Enter` opens the whole commit as a read-only tab: the message, the author, and the diff against its first parent, up to 100 files.
+Rows in `GRAPH` carry a rail glyph: `●` for a commit on the chain of first parents, `◉` for a merge, and `│○` for a commit a merge brought in. The rail is one lane wide, so it says where a commit sits against the first-parent chain rather than drawing every branch.
+
+`Enter` on a commit opens it into the paths it changed, laid out as a tree under it and marked with the same git letters the change sections use. `Enter` on one of those paths opens the diff for that path alone, read against the commit's first parent. Only the path you open is read, so a commit touching hundreds of files costs one tree walk to list and one file to show. The listing stops at 100 paths and says so.
+
+Any number of commits can stay open at once, and a folder folded under one commit stays open under another. A commit's diff and the working tree's diff of the same path are separate tabs.
 
 | Key | Action |
 |-----|--------|
 | `Space` | Stage or unstage the file, the folder, or the whole section |
-| `D` or `Enter` | Open the diff, the commit, or fold what the cursor is on |
+| `D` or `Enter` | Open the diff, or fold what the cursor is on |
 | `X` | Discard changes, twice to confirm |
-| `T` | Switch the change sections between tree and flat |
-| `Left` / `Right` | Fold and unfold a folder or a section |
+| `T` | Switch between tree and flat |
+| `Left` / `Right` | Fold and unfold a folder, a commit, or a section |
 | `Ctrl+X ↑` / `Ctrl+X ↓` | Resize the section the cursor is in |
 
-Diffs and commits open as read-only tabs. Discarding is destructive. On one file it asks for a second press of the same key or a second click of `↺`. On a folder or a whole section it raises a dialog instead, because a row says how many paths it covers and not what is in them.
+Diffs open as read-only tabs. Discarding is destructive. On one file it asks for a second press of the same key or a second click of `↺`. On a folder or a whole section it raises a dialog instead, because a row says how many paths it covers and not what is in them.
 
 Caudra reads and writes the repository directly with [gix](https://github.com/GitoxideLabs/gitoxide), so nothing here shells out to `git`. Staging works on whole files. Hunk-level staging, committing, and branch operations are not part of this view, so use the terminal or ask the agent.
 

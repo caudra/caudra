@@ -20,7 +20,7 @@ use crate::fs::tree::{GitMark, Row as TreeRow};
 use crate::menu::{Item, Menu};
 use crate::scm::diff::DiffRow;
 use crate::scm::graph::Rail;
-use crate::scm::repo::{Change, Commit};
+use crate::scm::repo::{Change, Commit, CommitPath};
 use crate::scm::tree::{Dir, SEPARATOR};
 use crate::scm::{Row as ScmRow, Scm, Section};
 use crate::scroll::ScrollHint;
@@ -51,6 +51,10 @@ const SUMMARY_GAP: &str = " ";
 const RAIL_TRUNK: &str = "\u{25cf} ";
 const RAIL_MERGE: &str = "\u{25c9} ";
 const RAIL_SIDE: &str = "\u{2502}\u{25cb}";
+/// The rail under an expanded commit, which keeps drawing the lines still live
+/// beside it so its files do not leave a hole in the graph column.
+const RAIL_UNDER_TRUNK: &str = "\u{2502} ";
+const RAIL_UNDER_SIDE: &str = "\u{2502}\u{2502}";
 const TREE_LABEL: &str = "TREE";
 const FLAT_LABEL: &str = "FLAT";
 const FOLD_LABEL: &str = "FOLD";
@@ -1199,7 +1203,7 @@ pub(crate) fn header_trailing(count: usize) -> u16 {
 /// change carries a git letter, so a folder's controls reach the margin.
 pub(crate) fn row_trailing(row: ScmRow) -> u16 {
     match row {
-        ScmRow::Change { .. } => CHANGE_TRAILING,
+        ScmRow::Change { .. } | ScmRow::CommitFile { .. } => CHANGE_TRAILING,
         _ => 0,
     }
 }
@@ -1494,9 +1498,27 @@ fn scm_row(
             None => Line::default(),
         },
         ScmRow::Commit(index) => match (scm.commit(index), scm.rail(index)) {
-            (Some(commit), Some(rail)) => commit_row(commit, rail, selected, styles, width),
+            (Some(commit), Some(rail)) => commit_row(
+                commit,
+                rail,
+                scm.is_expanded(index),
+                selected,
+                styles,
+                width,
+            ),
             _ => Line::default(),
         },
+        ScmRow::CommitFile {
+            commit,
+            index,
+            depth,
+        } => match (scm.commit_file(commit, index), scm.rail(commit)) {
+            (Some(file), Some(rail)) => {
+                commit_file_row(file, rail, depth, scm.is_flat(), selected, styles, width)
+            }
+            _ => Line::default(),
+        },
+        ScmRow::Note(text) => note_row(text, styles, width),
     }
 }
 
@@ -1581,11 +1603,48 @@ fn change_row(
     chrome::status_line(left, right, width, styles.background)
 }
 
-/// Author on the right, rail, hash and summary on the left, so a narrow sidebar
-/// drops the author rather than the line that identifies the commit.
+/// Author on the right, rail, fold marker, hash and summary on the left, so a
+/// narrow sidebar drops the author rather than the line that identifies the
+/// commit. The marker says the row opens into what the commit changed.
 fn commit_row(
     commit: &Commit,
     rail: Rail,
+    expanded: bool,
+    selected: bool,
+    styles: &WorkbenchStyles,
+    width: u16,
+) -> Line<'static> {
+    let style = match selected {
+        true => styles.selected,
+        false => styles.text,
+    };
+    let fold = match expanded {
+        true => EXPANDED_MARK,
+        false => COLLAPSED_MARK,
+    };
+    let mark = rail_mark(rail);
+    let budget = (width as usize)
+        .saturating_sub(commit.id.len() + mark.width() + fold.width() + SUMMARY_GAP.len());
+    let left = vec![
+        Span::styled(mark, styles.dim),
+        Span::styled(fold, styles.dim),
+        Span::styled(commit.id.clone(), styles.accent),
+        Span::styled(
+            format!("{SUMMARY_GAP}{}", chrome::fit(&commit.summary, budget)),
+            style,
+        ),
+    ];
+    let right = vec![Span::styled(commit.author.clone(), styles.dim)];
+    chrome::status_line(left, right, width, styles.background)
+}
+
+/// One path an expanded commit touched, drawn like a change row but over the
+/// rail instead of a control strip: nothing in the graph can be staged.
+fn commit_file_row(
+    file: &CommitPath,
+    rail: Rail,
+    depth: usize,
+    flat: bool,
     selected: bool,
     styles: &WorkbenchStyles,
     width: u16,
@@ -1595,21 +1654,52 @@ fn commit_row(
         false => styles.text,
     };
     let mark = match rail {
+        Rail::Side => RAIL_UNDER_SIDE,
+        _ => RAIL_UNDER_TRUNK,
+    };
+    let right = vec![Span::styled(
+        format!("{CONTROL_GAP}{}", file.mark.letter()),
+        git_style(file.mark, styles),
+    )];
+    let budget = (width as usize).saturating_sub(CHANGE_TRAILING as usize + mark.width());
+    let label = match flat {
+        true => chrome::fit_end(&file.relative, budget),
+        false => {
+            let name = file
+                .relative
+                .rsplit(SEPARATOR)
+                .next()
+                .unwrap_or(&file.relative);
+            chrome::fit(
+                &format!(
+                    "{:indent$}{LEAF_INDENT}{name}",
+                    "",
+                    indent = depth * DEPTH_INDENT
+                ),
+                budget,
+            )
+        }
+    };
+    let left = vec![Span::styled(mark, styles.dim), Span::styled(label, style)];
+    chrome::status_line(left, right, width, styles.background)
+}
+
+/// What an expanded commit says instead of a path, when it has none to list.
+fn note_row(text: &'static str, styles: &WorkbenchStyles, width: u16) -> Line<'static> {
+    let label = format!("{RAIL_UNDER_TRUNK}{LEAF_INDENT}{text}");
+    Line::from(Span::styled(
+        chrome::fit(&label, width as usize),
+        styles.dim,
+    ))
+    .style(styles.background)
+}
+
+const fn rail_mark(rail: Rail) -> &'static str {
+    match rail {
         Rail::Trunk => RAIL_TRUNK,
         Rail::Merge => RAIL_MERGE,
         Rail::Side => RAIL_SIDE,
-    };
-    let budget = (width as usize).saturating_sub(commit.id.len() + mark.width() + 1);
-    let left = vec![
-        Span::styled(mark, styles.dim),
-        Span::styled(commit.id.clone(), styles.accent),
-        Span::styled(
-            format!("{SUMMARY_GAP}{}", chrome::fit(&commit.summary, budget)),
-            style,
-        ),
-    ];
-    let right = vec![Span::styled(commit.author.clone(), styles.dim)];
-    chrome::status_line(left, right, width, styles.background)
+    }
 }
 
 fn field_row(
@@ -1952,11 +2042,12 @@ mod tests {
 
     use super::menu_panel;
     use super::{
-        CHANGE_TRAILING, Control, DiffColumns, DiffKind, DiffRow, Editor, Focus, GitMark,
-        MENU_MARK, MIN_CODE_COLUMNS, ScmRow, Section, SidebarView, Style, Tab, TabHit, TabPart,
-        Toggle, TreeRow, Workbench, WorkbenchStyles, control_at, diff_gutter, header_at, keys,
-        on_menu_mark, scm_controls, scroll_column, tab_at, toggle_at, tree_row, tree_style,
-        visible_range,
+        CHANGE_TRAILING, COLLAPSED_MARK, Commit, CommitPath, Control, DiffColumns, DiffKind,
+        DiffRow, EXPANDED_MARK, Editor, Focus, GitMark, Line, MENU_MARK, MIN_CODE_COLUMNS,
+        RAIL_TRUNK, RAIL_UNDER_SIDE, RAIL_UNDER_TRUNK, Rail, ScmRow, Section, SidebarView, Style,
+        Tab, TabHit, TabPart, Toggle, TreeRow, Workbench, WorkbenchStyles, commit_file_row,
+        commit_row, control_at, diff_gutter, header_at, keys, on_menu_mark, scm_controls,
+        scroll_column, tab_at, toggle_at, tree_row, tree_style, visible_range,
     };
     use crate::fs::tree::EntryKind;
     use crate::menu::Menu;
@@ -1977,6 +2068,8 @@ mod tests {
     const PANEL_OFF_FRAME: &str = "the panel ran off the frame it was given";
     const TREE_NAME: &str = "a.rs";
     const TREE_WIDTH: u16 = 40;
+    const COMMIT_ID: &str = "abc1234";
+    const GRAPH_WIDTH: u16 = 48;
     /// Room for the longest menu either target builds, with edges close enough
     /// to reach. Away from the origin, so a clamp that forgets where the frame
     /// starts is caught.
@@ -2298,6 +2391,71 @@ mod tests {
     #[test_case(3 => format!("{MENU_MARK} \u{2502} \u{2502} \u{2502}   {TREE_NAME}") ; "and every level after it adds another")]
     fn a_nested_row_stands_under_a_rule_for_each_level(depth: usize) -> String {
         painted(&entry(EntryKind::File, depth))
+    }
+
+    /// What one graph row reads as once painted, without the filler that pads
+    /// it out to the sidebar's width.
+    fn graph_text(line: &Line<'static>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>()
+            .trim_end()
+            .to_owned()
+    }
+
+    fn a_commit(id: &str) -> Commit {
+        Commit {
+            id: id.to_owned(),
+            summary: "did a thing".to_owned(),
+            author: "Tester".to_owned(),
+            parents: Vec::new(),
+        }
+    }
+
+    #[test_case(false => format!("{RAIL_TRUNK}{COLLAPSED_MARK}{COMMIT_ID}") ; "a closed commit says it opens")]
+    #[test_case(true => format!("{RAIL_TRUNK}{EXPANDED_MARK}{COMMIT_ID}") ; "an open one says it closes")]
+    fn a_commit_row_says_whether_it_is_showing_what_it_changed(expanded: bool) -> String {
+        let line = commit_row(
+            &a_commit(COMMIT_ID),
+            Rail::Trunk,
+            expanded,
+            false,
+            &WorkbenchStyles::default(),
+            GRAPH_WIDTH,
+        );
+
+        assert!(graph_text(&line).ends_with("Tester"), "{WRONG_PAINT}");
+        line.spans[..3]
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    #[test_case(Rail::Trunk => RAIL_UNDER_TRUNK.to_owned() ; "a file under the trunk keeps the trunk beside it")]
+    #[test_case(Rail::Merge => RAIL_UNDER_TRUNK.to_owned() ; "and so does one under a merge")]
+    #[test_case(Rail::Side => RAIL_UNDER_SIDE.to_owned() ; "one under a side branch keeps both lines")]
+    fn a_path_under_a_commit_keeps_the_rail_unbroken(rail: Rail) -> String {
+        let file = CommitPath {
+            relative: TREE_NAME.to_owned(),
+            mark: GitMark::Modified,
+        };
+
+        let line = commit_file_row(
+            &file,
+            rail,
+            1,
+            false,
+            false,
+            &WorkbenchStyles::default(),
+            GRAPH_WIDTH,
+        );
+
+        assert!(
+            graph_text(&line).ends_with(GitMark::Modified.letter()),
+            "{WRONG_PAINT}"
+        );
+        line.spans[0].content.as_ref().to_owned()
     }
 
     #[test]

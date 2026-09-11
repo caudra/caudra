@@ -12,7 +12,6 @@ use std::path::{Path, PathBuf};
 use gix::ObjectId;
 use gix::Repository;
 use gix::bstr::{BStr, ByteSlice};
-use gix::date::time::format::ISO8601;
 use gix::index::entry::{Flags, Mode, Stage, Stat};
 use gix::object::tree::diff::{Action, Change as TreeChange};
 use gix::status::index_worktree::Item as WorktreeItem;
@@ -62,21 +61,20 @@ pub struct Commit {
     pub parents: Vec<String>,
 }
 
-/// What a commit says about itself, and the two sides of every path it touched.
-/// Rendering it is [`crate::scm::diff::commit`]'s job: this side only reads.
+/// Every path one commit touched, which is what the graph lists under it. The
+/// two sides of any one of them are read later, and only for the path a reader
+/// actually opened.
 #[derive(Debug, Default, PartialEq, Eq)]
-pub struct CommitDetail {
-    pub header: Vec<String>,
-    pub files: Vec<CommitFile>,
+pub struct CommitFiles {
+    pub files: Vec<CommitPath>,
     /// Set when [`COMMIT_DIFF_FILES`] cut the walk short.
     pub truncated: bool,
 }
 
-#[derive(Debug, PartialEq, Eq)]
-pub struct CommitFile {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitPath {
     pub relative: String,
-    pub old: String,
-    pub new: String,
+    pub mark: GitMark,
 }
 
 pub struct Repo {
@@ -192,12 +190,67 @@ impl Repo {
         Ok(log)
     }
 
-    /// Everything a commit tab shows: the commit's own words, then the two
-    /// sides of each path it changed against its first parent. A root commit is
-    /// read against the empty tree, so the first commit of a repository is a
-    /// diff rather than an error.
-    pub fn commit_detail(&self, id: &str) -> Result<CommitDetail, ScmError> {
+    /// Every path a commit changed against its first parent, and how. No blob
+    /// is read: the graph lists these under the commit, and only the one a
+    /// reader opens is ever fetched.
+    ///
+    /// A root commit is read against the empty tree, so the first commit of a
+    /// repository lists its files rather than failing.
+    pub fn commit_files(&self, id: &str) -> Result<CommitFiles, ScmError> {
         let repo = self.open()?;
+        let (tree, parent) = self.sides_of(&repo, id)?;
+
+        let mut files = Vec::new();
+        let mut truncated = false;
+        parent
+            .changes()
+            .map_err(|error| ScmError::Read(error.to_string()))?
+            .options(|options| {
+                options.track_rewrites(None);
+            })
+            .for_each_to_obtain_tree(&tree, |change| {
+                if files.len() >= COMMIT_DIFF_FILES {
+                    truncated = true;
+                    return Ok::<Action, Infallible>(Action::Break(()));
+                }
+                let relative = change.location().to_str_lossy().into_owned();
+                let mark = match change {
+                    TreeChange::Addition { entry_mode, .. } if entry_mode.is_blob() => {
+                        GitMark::Added
+                    }
+                    TreeChange::Deletion { entry_mode, .. } if entry_mode.is_blob() => {
+                        GitMark::Deleted
+                    }
+                    TreeChange::Modification { entry_mode, .. } if entry_mode.is_blob() => {
+                        GitMark::Modified
+                    }
+                    _ => return Ok(Action::Continue(())),
+                };
+                files.push(CommitPath { relative, mark });
+                Ok(Action::Continue(()))
+            })
+            .map_err(|error| ScmError::Read(error.to_string()))?;
+
+        Ok(CommitFiles { files, truncated })
+    }
+
+    /// The two sides of one path a commit touched. A path absent from a side
+    /// reads as empty, which is what an addition and a deletion are.
+    pub fn commit_sides(&self, id: &str, relative: &str) -> Result<(String, String), ScmError> {
+        let repo = self.open()?;
+        let (mut tree, mut parent) = self.sides_of(&repo, id)?;
+        let old = entry_id(&mut parent, relative)?;
+        let new = entry_id(&mut tree, relative)?;
+        Ok((blob_text(&repo, old)?, blob_text(&repo, new)?))
+    }
+
+    /// A commit's tree and the tree it is read against, which is its first
+    /// parent's or the empty one.
+    fn sides_of<'a>(
+        &self,
+        repo: &'a Repository,
+        id: &str,
+    ) -> Result<(gix::Tree<'a>, gix::Tree<'a>), ScmError> {
         let object = repo
             .rev_parse_single(id)
             .map_err(|error| ScmError::Read(error.to_string()))?;
@@ -215,58 +268,7 @@ impl Repo {
                 .map_err(|error| ScmError::Read(error.to_string()))?,
             None => repo.empty_tree(),
         };
-
-        // Ids are collected first and read afterwards: the walk holds a borrow
-        // of the repository, and blobs are cheaper to fetch in a plain loop
-        // than inside a callback that has to answer for its own errors.
-        let mut touched: Vec<(String, Option<ObjectId>, Option<ObjectId>)> = Vec::new();
-        let mut truncated = false;
-        parent
-            .changes()
-            .map_err(|error| ScmError::Read(error.to_string()))?
-            .options(|options| {
-                options.track_rewrites(None);
-            })
-            .for_each_to_obtain_tree(&tree, |change| {
-                if touched.len() >= COMMIT_DIFF_FILES {
-                    truncated = true;
-                    return Ok::<Action, Infallible>(Action::Break(()));
-                }
-                let relative = change.location().to_str_lossy().into_owned();
-                let sides = match change {
-                    TreeChange::Addition { id, entry_mode, .. } if entry_mode.is_blob() => {
-                        (None, Some(id.detach()))
-                    }
-                    TreeChange::Deletion { id, entry_mode, .. } if entry_mode.is_blob() => {
-                        (Some(id.detach()), None)
-                    }
-                    TreeChange::Modification {
-                        previous_id,
-                        id,
-                        entry_mode,
-                        ..
-                    } if entry_mode.is_blob() => (Some(previous_id.detach()), Some(id.detach())),
-                    _ => return Ok(Action::Continue(())),
-                };
-                let (old, new) = sides;
-                touched.push((relative, old, new));
-                Ok(Action::Continue(()))
-            })
-            .map_err(|error| ScmError::Read(error.to_string()))?;
-
-        let mut files = Vec::with_capacity(touched.len());
-        for (relative, old, new) in touched {
-            files.push(CommitFile {
-                relative,
-                old: blob_text(&repo, old)?,
-                new: blob_text(&repo, new)?,
-            });
-        }
-        Ok(CommitDetail {
-            header: commit_header(&commit, object.detach())?,
-            files,
-            truncated,
-        })
+        Ok((tree, parent))
     }
 
     /// The two sides of a change, as text. `staged` picks `HEAD` against the
@@ -448,38 +450,12 @@ impl Repo {
     }
 }
 
-/// The commit's own words, ahead of its diff. Read as `DiffKind::Header`, so
-/// what the author wrote is told apart from what they changed.
-fn commit_header(commit: &gix::Commit<'_>, id: ObjectId) -> Result<Vec<String>, ScmError> {
-    let author = commit
-        .author()
+/// What `relative` points at in `tree`, or nothing where the path is not in it.
+fn entry_id(tree: &mut gix::Tree<'_>, relative: &str) -> Result<Option<ObjectId>, ScmError> {
+    let entry = tree
+        .peel_to_entry_by_path(Path::new(relative))
         .map_err(|error| ScmError::Read(error.to_string()))?;
-    let when = author
-        .time()
-        .map(|time| time.format_or_unix(ISO8601))
-        .unwrap_or_default();
-    let message = commit
-        .message()
-        .map_err(|error| ScmError::Read(error.to_string()))?;
-    let mut header = vec![
-        format!("commit {id}"),
-        format!(
-            "Author: {} <{}>",
-            author.name.to_str_lossy(),
-            author.email.to_str_lossy()
-        ),
-        format!("Date:   {when}"),
-        String::new(),
-    ];
-    let summary = message.summary().to_str_lossy().into_owned();
-    let body = message.body.map(|body| body.to_str_lossy().into_owned());
-    header.push(format!("    {summary}"));
-    if let Some(body) = body {
-        header.push(String::new());
-        header.extend(body.lines().map(|line| format!("    {line}")));
-    }
-    header.push(String::new());
-    Ok(header)
+    Ok(entry.map(|entry| entry.id().detach()))
 }
 
 /// A side of a change, which is empty where the path did not exist yet or does
@@ -567,7 +543,6 @@ mod tests {
     const TEST_EMAIL: &str = "test@example.invalid";
     const TEST_TIME: &str = "1700000000 +0000";
     const NO_PARENT: &str = "the commit does not name the parents it was built on";
-    const NO_HEADER: &str = "the commit tab does not say who wrote it or what they wrote";
 
     /// A repository with one committed file, so both `HEAD` and the index have
     /// something to say.
@@ -770,13 +745,16 @@ mod tests {
         let (_tmp, repo) = repository();
         let id = repo.log().unwrap()[0].id.clone();
 
-        let detail = repo.commit_detail(&id).unwrap();
+        let listed = repo.commit_files(&id).unwrap();
 
-        assert_eq!(detail.files.len(), 1, "{NOT_LISTED}");
-        assert_eq!(detail.files[0].relative, "tracked.txt");
-        assert!(detail.files[0].old.is_empty(), "{WRONG_SIDE}");
-        assert_eq!(detail.files[0].new, "one\ntwo\n");
-        assert!(!detail.truncated, "{NOT_LISTED}");
+        assert_eq!(listed.files.len(), 1, "{NOT_LISTED}");
+        assert_eq!(listed.files[0].relative, "tracked.txt");
+        assert_eq!(listed.files[0].mark, GitMark::Added, "{WRONG_SIDE}");
+        assert!(!listed.truncated, "{NOT_LISTED}");
+
+        let (old, new) = repo.commit_sides(&id, "tracked.txt").unwrap();
+        assert!(old.is_empty(), "{WRONG_SIDE}");
+        assert_eq!(new, "one\ntwo\n", "{WRONG_SIDE}");
     }
 
     #[test]
@@ -787,31 +765,43 @@ mod tests {
         repo.stage("tracked.txt").unwrap();
         repo.stage("added.txt").unwrap();
         commit(tmp.path(), "second");
+        let id = repo.log().unwrap()[0].id.clone();
 
-        let detail = repo.commit_detail(&repo.log().unwrap()[0].id).unwrap();
+        let listed = repo.commit_files(&id).unwrap();
 
-        let touched: Vec<&str> = detail
+        let touched: Vec<(&str, GitMark)> = listed
             .files
             .iter()
-            .map(|file| file.relative.as_str())
+            .map(|file| (file.relative.as_str(), file.mark))
             .collect();
-        assert_eq!(touched, vec!["added.txt", "tracked.txt"], "{NOT_LISTED}");
-        assert_eq!(detail.files[1].old, "one\ntwo\n", "{WRONG_SIDE}");
-        assert_eq!(detail.files[1].new, "one\nthree\n", "{WRONG_SIDE}");
+        assert_eq!(
+            touched,
+            vec![
+                ("added.txt", GitMark::Added),
+                ("tracked.txt", GitMark::Modified)
+            ],
+            "{NOT_LISTED}"
+        );
+
+        let (old, new) = repo.commit_sides(&id, "tracked.txt").unwrap();
+        assert_eq!(old, "one\ntwo\n", "{WRONG_SIDE}");
+        assert_eq!(new, "one\nthree\n", "{WRONG_SIDE}");
     }
 
     #[test]
-    fn a_commit_header_carries_the_author_and_the_message() {
-        let (_tmp, repo) = repository();
-        let header = repo
-            .commit_detail(&repo.log().unwrap()[0].id)
-            .unwrap()
-            .header
-            .join("\n");
+    fn a_path_a_commit_deleted_reads_as_empty_on_the_new_side() {
+        let (tmp, repo) = repository();
+        fs::remove_file(tmp.path().join("tracked.txt")).unwrap();
+        repo.stage("tracked.txt").unwrap();
+        commit(tmp.path(), "second");
+        let id = repo.log().unwrap()[0].id.clone();
 
-        assert!(header.starts_with("commit "), "{NO_HEADER}");
-        assert!(header.contains(TEST_AUTHOR), "{NO_HEADER}");
-        assert!(header.contains("    initial"), "{NO_HEADER}");
+        let listed = repo.commit_files(&id).unwrap();
+
+        assert_eq!(listed.files[0].mark, GitMark::Deleted, "{WRONG_SIDE}");
+        let (old, new) = repo.commit_sides(&id, "tracked.txt").unwrap();
+        assert_eq!(old, "one\ntwo\n", "{WRONG_SIDE}");
+        assert!(new.is_empty(), "{WRONG_SIDE}");
     }
 
     #[test]

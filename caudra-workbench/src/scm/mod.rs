@@ -16,13 +16,13 @@ pub mod graph;
 pub mod repo;
 pub mod tree;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crate::fs::tree::GitMark;
 use graph::Rail;
-use repo::{Change, Commit, Repo, ScmError};
-use tree::{Dir, SEPARATOR};
+use repo::{Change, Commit, CommitFiles, CommitPath, Repo, ScmError};
+use tree::{Dir, Layout, Node, SEPARATOR};
 
 /// The body rows a section asks for before the frame has any say. Eight lists a
 /// useful number of files without crowding out the two sections underneath.
@@ -34,6 +34,12 @@ pub const MIN_SECTION_ROWS: u16 = 1;
 const STAGED_TITLE: &str = "STAGED CHANGES";
 const UNSTAGED_TITLE: &str = "CHANGES";
 const GRAPH_TITLE: &str = "GRAPH";
+
+/// What an expanded commit says when the walk found no blob to list, which is a
+/// commit that only moved a reference or changed a mode.
+const EMPTY_COMMIT: &str = "no files changed";
+/// What an expanded commit says when its walk hit the per-commit cap.
+const CUT_SHORT: &str = "more files not listed";
 
 /// One band of the pane. The declaration order is the order they are stacked,
 /// which is the order [`Section::ALL`] and every layout pass walk them in.
@@ -73,8 +79,20 @@ impl Section {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Row {
     Directory(usize),
-    Change { index: usize, depth: usize },
+    Change {
+        index: usize,
+        depth: usize,
+    },
     Commit(usize),
+    /// One path an expanded commit touched: where the commit sits in the log,
+    /// and where the path sits in what that commit changed.
+    CommitFile {
+        commit: usize,
+        index: usize,
+        depth: usize,
+    },
+    /// One line an expanded commit has to say for itself instead of a path.
+    Note(&'static str),
 }
 
 /// Where the pane's one cursor is. `row` is `None` on the section's header,
@@ -143,8 +161,13 @@ pub struct Scm {
     cursor: Cursor,
     /// Folders the reader closed, keyed on the repository-relative path. Shared
     /// by both change sections, so a path that is both staged and dirty folds
-    /// the same way under each.
+    /// the same way under each; a folder under a commit is keyed under that
+    /// commit's id, so two commits touching the same folder fold apart.
     folded: HashSet<String>,
+    /// What every expanded commit changed, by commit id. A commit is in here
+    /// exactly while it is open, which makes the map both the answer to "is it
+    /// expanded" and the read that answer was built from.
+    opened: HashMap<String, CommitFiles>,
     /// Whether the change sections nest their paths under folders. Tree is the
     /// default; flat is the escape hatch for a wide change set.
     flat: bool,
@@ -205,6 +228,10 @@ impl Scm {
             }
         }
         self.rails = graph::rails(&self.log);
+        // A commit that has fallen out of the window has no row to hang its
+        // files off, so its read is dropped rather than kept forever.
+        self.opened
+            .retain(|id, _| self.log.iter().any(|commit| &commit.id == id));
         self.rebuild(previous);
     }
 
@@ -264,6 +291,19 @@ impl Scm {
 
     pub fn commit(&self, index: usize) -> Option<&Commit> {
         self.log.get(index)
+    }
+
+    pub fn commit_file(&self, commit: usize, index: usize) -> Option<&CommitPath> {
+        let id = &self.log.get(commit)?.id;
+        self.opened.get(id)?.files.get(index)
+    }
+
+    /// Whether a commit is showing what it changed, which is what its row's
+    /// fold marker says.
+    pub fn is_expanded(&self, commit: usize) -> bool {
+        self.log
+            .get(commit)
+            .is_some_and(|entry| self.opened.contains_key(&entry.id))
     }
 
     pub fn rail(&self, index: usize) -> Option<Rail> {
@@ -377,66 +417,73 @@ impl Scm {
     /// what `Left` means in a tree, and it is the only way back to a header
     /// without walking the whole section.
     pub fn fold(&mut self) {
-        match self.cursor.row {
-            None => self.set_collapsed(self.cursor.section, true),
-            Some(row) => match self.dir_at(self.cursor.section, row) {
-                Some(index) if self.dir_expanded(self.cursor.section, index) => {
-                    self.fold_dir(self.cursor.section, index, true);
-                }
-                _ => self.cursor.row = self.parent_of(self.cursor.section, row),
-            },
+        let section = self.cursor.section;
+        let Some(row) = self.cursor.row else {
+            self.set_collapsed(section, true);
+            return;
+        };
+        if let Some(index) = self.dir_at(section, row)
+            && self.dir_expanded(section, index)
+        {
+            self.fold_dir(section, index, true);
+            return;
         }
+        if let Some(commit) = self.commit_at(section, row)
+            && self.fold_commit(commit, true)
+        {
+            return;
+        }
+        self.cursor.row = self.parent_of(section, row);
     }
 
     /// Unfolds what the cursor is on. Reports whether it had anything to open,
     /// so the caller can fall through to opening a file instead.
     pub fn unfold(&mut self) -> bool {
-        match self.cursor.row {
-            None if self.is_collapsed(self.cursor.section) => {
-                self.set_collapsed(self.cursor.section, false);
-                true
+        let section = self.cursor.section;
+        let Some(row) = self.cursor.row else {
+            let collapsed = self.is_collapsed(section);
+            if collapsed {
+                self.set_collapsed(section, false);
             }
+            return collapsed;
+        };
+        if let Some(index) = self.dir_at(section, row) {
+            if !self.dir_expanded(section, index) {
+                self.fold_dir(section, index, false);
+            }
+            return true;
+        }
+        match self.commit_at(section, row) {
+            Some(commit) => self.fold_commit(commit, false) || self.is_expanded(commit),
             None => false,
-            Some(row) => match self.dir_at(self.cursor.section, row) {
-                Some(index) if !self.dir_expanded(self.cursor.section, index) => {
-                    self.fold_dir(self.cursor.section, index, false);
-                    true
-                }
-                Some(_) => true,
-                None => false,
-            },
         }
     }
 
     /// Folds or unfolds whatever the cursor is on. Reports whether it was
-    /// something foldable, so `Enter` can go on to open a file or a commit.
+    /// something foldable, so `Enter` can go on to open a file.
     pub fn toggle_fold(&mut self) -> bool {
-        match self.cursor.row {
-            None => {
-                self.toggle_collapsed(self.cursor.section);
+        let section = self.cursor.section;
+        let Some(row) = self.cursor.row else {
+            self.toggle_collapsed(section);
+            return true;
+        };
+        if let Some(index) = self.dir_at(section, row) {
+            let expanded = self.dir_expanded(section, index);
+            self.fold_dir(section, index, expanded);
+            return true;
+        }
+        match self.commit_at(section, row) {
+            Some(commit) => {
+                self.fold_commit(commit, self.is_expanded(commit));
                 true
             }
-            Some(row) => match self.dir_at(self.cursor.section, row) {
-                Some(index) => {
-                    let expanded = self.dir_expanded(self.cursor.section, index);
-                    self.fold_dir(self.cursor.section, index, expanded);
-                    true
-                }
-                None => false,
-            },
+            None => false,
         }
     }
 
     pub fn selected_change(&self) -> Option<&Change> {
         match self.row_at(self.cursor.section, self.cursor.row?)? {
             Row::Change { index, .. } => self.changes.get(index),
-            _ => None,
-        }
-    }
-
-    pub fn selected_commit(&self) -> Option<&Commit> {
-        match self.row_at(self.cursor.section, self.cursor.row?)? {
-            Row::Commit(index) => self.log.get(index),
             _ => None,
         }
     }
@@ -543,13 +590,31 @@ impl Scm {
         )))
     }
 
-    /// The rendered contents of the selected commit, and the commit itself.
-    pub fn selected_commit_diff(&self) -> Result<Option<(Commit, diff::Diff)>, ScmError> {
-        let Some((repo, commit)) = self.repo.as_ref().zip(self.selected_commit()) else {
+    /// The path under a commit the cursor is on, and the commit listing it.
+    pub fn selected_commit_file(&self) -> Option<(&Commit, &CommitPath)> {
+        let Row::CommitFile { commit, index, .. } =
+            self.row_at(self.cursor.section, self.cursor.row?)?
+        else {
+            return None;
+        };
+        self.log.get(commit).zip(self.commit_file(commit, index))
+    }
+
+    /// The rendered diff for that one path, read against the commit's first
+    /// parent. Only this path's blobs are fetched.
+    pub fn selected_commit_file_diff(
+        &self,
+    ) -> Result<Option<(Commit, CommitPath, diff::Diff)>, ScmError> {
+        let Some((repo, (commit, file))) = self.repo.as_ref().zip(self.selected_commit_file())
+        else {
             return Ok(None);
         };
-        let detail = repo.commit_detail(&commit.id)?;
-        Ok(Some((commit.clone(), diff::commit(&detail))))
+        let (old, new) = repo.commit_sides(&commit.id, &file.relative)?;
+        Ok(Some((
+            commit.clone(),
+            file.clone(),
+            diff::unified(&file.relative, &old, &new),
+        )))
     }
 
     /// The marks the explorer paints at the end of its rows. A path changed in
@@ -677,18 +742,22 @@ impl Scm {
         self.rebuild(previous);
     }
 
-    /// The folder holding the row, which `Left` steps out to. A row at the top
-    /// level has none, and the header stands in for it.
+    /// What holds the row, which `Left` steps out to: the folder around it, or
+    /// the commit it was listed under. A row at the top level of a change
+    /// section has neither, and the header stands in for it.
     fn parent_of(&self, section: Section, row: usize) -> Option<usize> {
         let depth = match self.row_at(section, row)? {
-            Row::Change { depth, .. } => depth,
+            Row::Change { depth, .. } | Row::CommitFile { depth, .. } => depth,
             Row::Directory(index) => self.dir(section, index)?.depth,
+            Row::Note(_) => 1,
             Row::Commit(_) => return None,
         };
         (0..row).rev().find(|candidate| {
-            self.dir_at(section, *candidate)
+            let holds_it = self
+                .dir_at(section, *candidate)
                 .and_then(|index| self.dir(section, index))
-                .is_some_and(|dir| dir.depth < depth)
+                .is_some_and(|dir| dir.depth < depth);
+            holds_it || self.commit_at(section, *candidate).is_some()
         })
     }
 
@@ -702,16 +771,27 @@ impl Scm {
                 .filter(|(_, change)| change.staged == staged)
                 .map(|(index, change)| (index, change.relative.as_str()))
                 .collect();
-            let (rows, dirs) = tree::rows(&paths, self.flat, &self.folded);
+            let layout = Layout {
+                flat: self.flat,
+                ..Layout::default()
+            };
+            let (nodes, dirs) = tree::rows(&paths, layout, &self.folded);
             let state = &mut self.sections[section.index()];
             state.count = paths.len();
-            state.rows = rows;
+            state.rows = nodes
+                .into_iter()
+                .map(|node| match node {
+                    Node::Dir(index) => Row::Directory(index),
+                    Node::Leaf { index, depth } => Row::Change { index, depth },
+                })
+                .collect();
             state.dirs = dirs;
         }
+        let (rows, dirs) = self.graph_rows();
         let graph = &mut self.sections[Section::Graph.index()];
         graph.count = self.log.len();
-        graph.rows = (0..self.log.len()).map(Row::Commit).collect();
-        graph.dirs = Vec::new();
+        graph.rows = rows;
+        graph.dirs = dirs;
 
         if let Some(anchor) = previous {
             let found = anchor
@@ -729,6 +809,95 @@ impl Scm {
         self.clamp_cursor();
     }
 
+    /// The graph's body: every commit, and under each expanded one the tree of
+    /// paths it touched. Dir indices are shifted as the section's one `dirs`
+    /// list grows, so a folder row still names the folder the pane holds.
+    fn graph_rows(&self) -> (Vec<Row>, Vec<Dir>) {
+        let mut rows = Vec::with_capacity(self.log.len());
+        let mut dirs = Vec::new();
+        for (commit, entry) in self.log.iter().enumerate() {
+            rows.push(Row::Commit(commit));
+            let Some(files) = self.opened.get(&entry.id) else {
+                continue;
+            };
+            if files.files.is_empty() {
+                rows.push(Row::Note(EMPTY_COMMIT));
+                continue;
+            }
+            let paths: Vec<(usize, &str)> = files
+                .files
+                .iter()
+                .enumerate()
+                .map(|(index, file)| (index, file.relative.as_str()))
+                .collect();
+            let scope = commit_scope(&entry.id);
+            let layout = Layout {
+                flat: self.flat,
+                scope: &scope,
+                depth: 1,
+            };
+            let (nodes, found) = tree::rows(&paths, layout, &self.folded);
+            let base = dirs.len();
+            rows.extend(nodes.into_iter().map(|node| match node {
+                Node::Dir(index) => Row::Directory(index + base),
+                Node::Leaf { index, depth } => Row::CommitFile {
+                    commit,
+                    index,
+                    depth,
+                },
+            }));
+            dirs.extend(found);
+            if files.truncated {
+                rows.push(Row::Note(CUT_SHORT));
+            }
+        }
+        (rows, dirs)
+    }
+
+    /// Reads what a commit changed and opens it, or closes one already open.
+    /// Answers whether the graph changed, which is what tells `Right` on an
+    /// open commit from `Right` on a closed one.
+    fn fold_commit(&mut self, commit: usize, fold: bool) -> bool {
+        let Some(id) = self.log.get(commit).map(|entry| entry.id.clone()) else {
+            return false;
+        };
+        if fold {
+            let was_open = self.opened.remove(&id).is_some();
+            // The folders under it are gone with it, and leaving their keys
+            // behind would fold them again the next time it is opened.
+            let scope = commit_scope(&id);
+            self.folded.retain(|path| !path.starts_with(&scope));
+            if was_open {
+                let previous = self.anchor();
+                self.rebuild(previous);
+            }
+            return was_open;
+        }
+        if self.opened.contains_key(&id) {
+            return false;
+        }
+        let Some(repo) = &self.repo else {
+            return false;
+        };
+        match repo.commit_files(&id) {
+            Ok(files) => drop(self.opened.insert(id, files)),
+            Err(error) => {
+                self.error = Some(error.to_string());
+                return false;
+            }
+        }
+        let previous = self.anchor();
+        self.rebuild(previous);
+        true
+    }
+
+    fn commit_at(&self, section: Section, row: usize) -> Option<usize> {
+        match self.row_at(section, row)? {
+            Row::Commit(index) => Some(index),
+            _ => None,
+        }
+    }
+
     fn anchor(&self) -> Option<Anchor> {
         let section = self.cursor.section;
         Some(Anchor {
@@ -743,6 +912,15 @@ impl Scm {
             Row::Change { index, .. } => Some(self.changes.get(index)?.relative.clone()),
             Row::Directory(index) => Some(self.dir(section, index)?.path.clone()),
             Row::Commit(index) => Some(self.log.get(index)?.id.clone()),
+            Row::CommitFile { commit, index, .. } => {
+                let file = self.commit_file(commit, index)?;
+                Some(format!(
+                    "{}{}",
+                    commit_scope(&self.log.get(commit)?.id),
+                    file.relative
+                ))
+            }
+            Row::Note(_) => None,
         }
     }
 
@@ -763,19 +941,31 @@ impl Scm {
     }
 }
 
+/// What a commit's folders and files are keyed under, which keeps the same
+/// folder in two commits — and in a change section — three separate folds.
+fn commit_scope(id: &str) -> String {
+    format!("{id}{SEPARATOR}")
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
     use test_case::test_case;
 
-    use super::{Change, Cursor, GitMark, Row, Scm, Section};
+    use super::{
+        CUT_SHORT, Change, Commit, CommitFiles, CommitPath, Cursor, EMPTY_COMMIT, GitMark, Row,
+        Scm, Section, graph,
+    };
 
     const WRONG_STOP: &str = "the cursor is not where walking the pane should have put it";
     const SELECTION_LOST: &str = "the cursor must stay on the change it was on";
     const MARK_WRONG: &str = "the explorer must show the worktree's mark";
     const WRONG_SCOPE: &str = "the staging scope does not cover the paths the cursor names";
     const WRONG_COUNT: &str = "the section counts the wrong number of paths";
+    const GRAPH_SHAPE: &str = "the graph does not have the shape its commits describe";
+    const ONE: &str = "one";
+    const TWO: &str = "two";
 
     fn change(relative: &str, staged: bool, mark: GitMark) -> Change {
         Change {
@@ -1120,5 +1310,193 @@ mod tests {
             change("src/deep/merge.rs", false, GitMark::Conflicted),
         ]);
         scm.folder_marks()(&PathBuf::from(path))
+    }
+
+    fn commit(id: &str) -> Commit {
+        Commit {
+            id: id.to_owned(),
+            summary: format!("{id} summary"),
+            author: "Tester".to_owned(),
+            parents: Vec::new(),
+        }
+    }
+
+    fn touched(paths: &[&str]) -> CommitFiles {
+        CommitFiles {
+            files: paths
+                .iter()
+                .map(|relative| CommitPath {
+                    relative: (*relative).to_owned(),
+                    mark: GitMark::Modified,
+                })
+                .collect(),
+            truncated: false,
+        }
+    }
+
+    /// A graph of two commits, each having touched the same folder, with
+    /// `opened` standing in for the reads a repository would have answered.
+    fn graph(opened: &[(&str, CommitFiles)]) -> Scm {
+        let mut scm = Scm {
+            log: vec![commit(ONE), commit(TWO)],
+            opened: opened
+                .iter()
+                .map(|(id, files)| {
+                    (
+                        (*id).to_owned(),
+                        CommitFiles {
+                            files: files.files.clone(),
+                            truncated: files.truncated,
+                        },
+                    )
+                })
+                .collect(),
+            ..Scm::default()
+        };
+        scm.rails = graph::rails(&scm.log);
+        scm.rebuild(None);
+        scm
+    }
+
+    #[test]
+    fn a_collapsed_commit_lists_itself_and_nothing_under_it() {
+        let scm = graph(&[]);
+
+        assert_eq!(
+            scm.rows(Section::Graph),
+            &[Row::Commit(0), Row::Commit(1)],
+            "{GRAPH_SHAPE}"
+        );
+    }
+
+    #[test]
+    fn an_expanded_commit_nests_the_paths_it_touched_under_itself() {
+        let scm = graph(&[(ONE, touched(&["src/a.rs", "top.rs"]))]);
+
+        assert_eq!(
+            scm.rows(Section::Graph),
+            &[
+                Row::Commit(0),
+                Row::Directory(0),
+                Row::CommitFile {
+                    commit: 0,
+                    index: 0,
+                    depth: 2
+                },
+                Row::CommitFile {
+                    commit: 0,
+                    index: 1,
+                    depth: 1
+                },
+                Row::Commit(1),
+            ],
+            "{GRAPH_SHAPE}"
+        );
+        assert_eq!(scm.count(Section::Graph), 2, "{WRONG_COUNT}");
+    }
+
+    #[test]
+    fn two_expanded_commits_keep_their_own_folders() {
+        let scm = graph(&[(ONE, touched(&["src/a.rs"])), (TWO, touched(&["src/b.rs"]))]);
+
+        let dirs: Vec<&str> = (0..2)
+            .filter_map(|index| scm.dir(Section::Graph, index))
+            .map(|dir| dir.path.as_str())
+            .collect();
+        assert_eq!(dirs, vec!["one/src", "two/src"], "{GRAPH_SHAPE}");
+        assert_eq!(
+            scm.rows(Section::Graph).last(),
+            Some(&Row::CommitFile {
+                commit: 1,
+                index: 0,
+                depth: 2
+            }),
+            "{GRAPH_SHAPE}"
+        );
+    }
+
+    #[test]
+    fn folding_a_folder_under_one_commit_leaves_the_other_open() {
+        let mut scm = graph(&[(ONE, touched(&["src/a.rs"])), (TWO, touched(&["src/b.rs"]))]);
+
+        scm.fold_dir(Section::Graph, 0, true);
+
+        assert_eq!(
+            scm.rows(Section::Graph),
+            &[
+                Row::Commit(0),
+                Row::Directory(0),
+                Row::Commit(1),
+                Row::Directory(1),
+                Row::CommitFile {
+                    commit: 1,
+                    index: 0,
+                    depth: 2
+                },
+            ],
+            "{GRAPH_SHAPE}"
+        );
+    }
+
+    #[test]
+    fn a_commit_that_changed_nothing_says_so_in_one_row() {
+        let scm = graph(&[(ONE, touched(&[]))]);
+
+        assert_eq!(
+            scm.rows(Section::Graph),
+            &[Row::Commit(0), Row::Note(EMPTY_COMMIT), Row::Commit(1)],
+            "{GRAPH_SHAPE}"
+        );
+    }
+
+    #[test]
+    fn a_commit_cut_short_says_so_under_the_paths_it_did_list() {
+        let mut files = touched(&["top.rs"]);
+        files.truncated = true;
+
+        let scm = graph(&[(ONE, files)]);
+
+        assert_eq!(
+            scm.rows(Section::Graph).get(2),
+            Some(&Row::Note(CUT_SHORT)),
+            "{GRAPH_SHAPE}"
+        );
+    }
+
+    #[test]
+    fn stepping_out_of_a_path_at_the_top_level_lands_on_its_commit() {
+        let mut scm = graph(&[(ONE, touched(&["top.rs"]))]);
+        scm.select(Section::Graph, Some(1));
+
+        scm.fold();
+
+        assert_eq!(scm.cursor().row, Some(0), "{WRONG_STOP}");
+    }
+
+    #[test]
+    fn the_cursor_stays_on_a_path_under_a_commit_across_a_rebuild() {
+        let mut scm = graph(&[(ONE, touched(&["src/a.rs", "top.rs"]))]);
+        scm.select(Section::Graph, Some(3));
+
+        let previous = scm.anchor();
+        scm.rebuild(previous);
+
+        assert_eq!(
+            scm.rows(Section::Graph)[scm.cursor().row.expect("a row")],
+            Row::CommitFile {
+                commit: 0,
+                index: 1,
+                depth: 1
+            },
+            "{SELECTION_LOST}"
+        );
+    }
+
+    #[test]
+    fn nothing_in_the_graph_can_be_staged() {
+        let mut scm = graph(&[(ONE, touched(&["top.rs"]))]);
+        scm.select(Section::Graph, Some(1));
+
+        assert_eq!(scm.scope_len(), 0, "{WRONG_SCOPE}");
     }
 }

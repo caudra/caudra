@@ -2109,11 +2109,11 @@ impl Workbench {
         self.open_scm_selection();
     }
 
-    /// Opens whatever the cursor is on as a read-only tab, which is a diff for
-    /// a change and the whole commit for a row of the graph.
+    /// Opens whatever the cursor is on as a read-only tab: a diff for a change,
+    /// and a diff for one path of a commit in the graph.
     fn open_scm_selection(&mut self) {
         match self.scm.cursor().section {
-            Section::Graph => self.open_commit(),
+            Section::Graph => self.open_commit_file(),
             _ => self.open_diff(),
         }
     }
@@ -2231,14 +2231,14 @@ impl Workbench {
         self.focus = Focus::Editor;
     }
 
-    /// Opens the selected commit as a read-only tab.
+    /// Opens one path of a commit as a read-only diff tab.
     ///
-    /// Every commit tab is filed under the repository's own directory, so a
-    /// second commit replaces the first rather than stacking up, and the path
-    /// can never collide with a file: [`Editor::push`] keeps one tab per path,
-    /// and no file tab is ever opened on a directory.
-    fn open_commit(&mut self) {
-        let opened = match self.scm.selected_commit_diff() {
+    /// The tab is filed under the commit's own hash rather than the worktree
+    /// path, so a commit's view of a file and the working tree's are two tabs:
+    /// [`Editor::push`] keeps one tab per path. The name still ends in the real
+    /// one, which is what the highlighter reads the language from.
+    fn open_commit_file(&mut self) {
+        let opened = match self.scm.selected_commit_file_diff() {
             Ok(Some(opened)) => opened,
             Ok(None) => return,
             Err(error) => {
@@ -2249,10 +2249,11 @@ impl Workbench {
         let Some(workdir) = self.scm.workdir().map(Path::to_path_buf) else {
             return;
         };
-        let (commit, rendered) = opened;
-        let title = format!("{} {}", commit.id, commit.summary);
+        let (commit, file, rendered) = opened;
+        let title = format!("{} \u{2194} {}", file.relative, commit.id);
+        let path = workdir.join(&commit.id).join(&file.relative);
         self.editor.push(Tab::synthetic(
-            &workdir,
+            &path,
             title,
             rendered.rows,
             self.theme_generation,
@@ -2710,6 +2711,9 @@ mod tests {
     const CHANGE_MISSING: &str = "the change the test made is not under the cursor";
     const MARK_MISSING: &str = "the explorer row is missing its source control mark";
     const DIFF_EDITABLE: &str = "a diff tab must be read-only";
+    const COMMIT_OPENED_WHOLE: &str = "a commit must open into its paths, not into one document";
+    const COMMIT_NOT_LISTED: &str = "the graph does not list what the commit changed";
+    const DIFF_DISPLACED: &str = "a commit's diff replaced the working tree's diff of that path";
     const DISCARD_UNARMED: &str = "a discard must take exactly two goes at the same row";
     const NO_HITS: &str = "the search did not find what the fixture put there";
     const WRONG_LINE: &str = "the editor did not land on the line the match was on";
@@ -5000,7 +5004,7 @@ mod tests {
     }
 
     #[test]
-    fn enter_on_a_commit_opens_it_as_a_tab_that_cannot_be_edited() {
+    fn enter_on_a_commit_lists_what_it_changed_and_opens_no_tab() {
         let (_dir, mut workbench) = repository();
         workbench.handle_key(key(keys::STAGE_TOGGLE.code));
         commit_all(&mut workbench);
@@ -5008,10 +5012,69 @@ mod tests {
 
         workbench.handle_key(key(KeyCode::Enter));
 
-        let tab = workbench.editor.active().expect("a commit tab");
+        assert!(workbench.editor.active().is_none(), "{COMMIT_OPENED_WHOLE}");
+        assert_eq!(
+            workbench.scm.rows(Section::Graph).len(),
+            2,
+            "{COMMIT_NOT_LISTED}"
+        );
+        assert_eq!(
+            workbench.scm.commit_file(0, 0).map(|file| &file.relative),
+            Some(&OPENED_FILE.to_owned()),
+            "{COMMIT_NOT_LISTED}"
+        );
+    }
+
+    #[test]
+    fn enter_on_a_path_under_a_commit_opens_that_path_alone() {
+        let (_dir, mut workbench) = repository();
+        workbench.handle_key(key(keys::STAGE_TOGGLE.code));
+        commit_all(&mut workbench);
+        workbench.scm.select(Section::Graph, Some(0));
+        workbench.handle_key(key(KeyCode::Enter));
+
+        workbench.scm.select(Section::Graph, Some(1));
+        workbench.handle_key(key(KeyCode::Enter));
+
+        let tab = workbench.editor.active().expect("a commit file tab");
         assert!(tab.diff_rows().is_some(), "{DIFF_EDITABLE}");
         assert!(!tab.is_editable(), "{DIFF_EDITABLE}");
-        assert!(tab.title.contains("initial"), "{DIFF_EDITABLE}");
+        assert!(tab.title.starts_with(OPENED_FILE), "{COMMIT_NOT_LISTED}");
+    }
+
+    #[test]
+    fn a_commit_folds_away_the_paths_it_listed() {
+        let (_dir, mut workbench) = repository();
+        workbench.handle_key(key(keys::STAGE_TOGGLE.code));
+        commit_all(&mut workbench);
+        workbench.scm.select(Section::Graph, Some(0));
+        workbench.handle_key(key(KeyCode::Enter));
+
+        workbench.handle_key(key(KeyCode::Enter));
+
+        assert!(!workbench.scm.is_expanded(0), "{COMMIT_NOT_LISTED}");
+        assert_eq!(
+            workbench.scm.rows(Section::Graph).len(),
+            1,
+            "{COMMIT_NOT_LISTED}"
+        );
+    }
+
+    #[test]
+    fn a_commit_diff_does_not_displace_the_working_tree_diff_of_the_same_path() {
+        let (_dir, mut workbench) = repository();
+        workbench.handle_key(key(keys::STAGE_TOGGLE.code));
+        workbench.scm.select(Section::Staged, Some(0));
+        workbench.handle_key(key(KeyCode::Enter));
+        commit_all(&mut workbench);
+
+        workbench.handle_leader(press(keys::VIEW_SOURCE_CONTROL));
+        workbench.scm.select(Section::Graph, Some(0));
+        workbench.handle_key(key(KeyCode::Enter));
+        workbench.scm.select(Section::Graph, Some(1));
+        workbench.handle_key(key(KeyCode::Enter));
+
+        assert_eq!(workbench.editor.tabs().len(), 2, "{DIFF_DISPLACED}");
     }
 
     #[test]

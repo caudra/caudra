@@ -14,11 +14,8 @@ use caudra_diff::{DiffLine, compute_hunks, emphasis_ranges, span_text};
 use caudra_highlight::{Highlighter, StyledSegment};
 
 use crate::editor::DiffKind;
-use crate::scm::repo::CommitDetail;
 
 const IDENTICAL: &str = "@@ no changes @@";
-const EMPTY_COMMIT: &str = "@@ no file changes @@";
-const CUT_SHORT: &str = "@@ more files changed than this tab shows @@";
 const GAP: &str = "@@ \u{2026} @@";
 /// Past this many lines on a side, highlighting it whole to colour the handful
 /// of rows a diff actually shows costs more than the colour is worth.
@@ -147,30 +144,6 @@ fn row(line: &DiffLine, cursor: &mut (usize, usize), colours: Option<&SideColour
         emphasis,
         segments,
     }
-}
-
-/// A whole commit as one scrollable column: what the author wrote, then every
-/// path they touched, each under the `--- a/… +++ b/…` heading a reader of
-/// `git show` already knows how to skim.
-pub fn commit(detail: &CommitDetail) -> Diff {
-    let mut diff = Diff::default();
-    for line in &detail.header {
-        diff.push(line.clone(), DiffKind::Header);
-    }
-    for file in &detail.files {
-        diff.push(format!("--- a/{}", file.relative), DiffKind::Removed);
-        diff.push(format!("+++ b/{}", file.relative), DiffKind::Added);
-        diff.rows
-            .extend(unified(&file.relative, &file.old, &file.new).rows);
-        diff.push(String::new(), DiffKind::Context);
-    }
-    if detail.files.is_empty() {
-        diff.push(EMPTY_COMMIT.to_owned(), DiffKind::Header);
-    }
-    if detail.truncated {
-        diff.push(CUT_SHORT.to_owned(), DiffKind::Header);
-    }
-    diff
 }
 
 #[cfg(test)]
