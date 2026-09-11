@@ -467,20 +467,36 @@ fn merge_prompt(flag: Option<String>, piped: Option<String>) -> Option<String> {
 }
 
 pub fn run(mut cli: Cli) -> Result<ExitCode> {
+    // Every phase up to `init_logging` runs without a subscriber, so its cost is
+    // invisible unless it is measured here and reported once the sink exists.
+    let started = Instant::now();
+    let mut phase_start = started;
+    let mut lap = || {
+        let elapsed = phase_start.elapsed().as_millis() as u64;
+        phase_start = Instant::now();
+        elapsed
+    };
     let persistent_storage = StateDir::resolve().context("resolve data directory")?;
+    let state_dir_ms = lap();
     caudra_providers::model_registry::load_from_storage(&persistent_storage)
         .context("load model purpose bindings")?;
+    let model_registry_ms = lap();
 
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
 
     load_env_files(&cwd);
+    let env_files_ms = lap();
     let _workcell_host = super::register_builtin_tools(&cwd)?;
+    let register_tools_ms = lap();
 
     let (mut stack, _) = build_stack(&cli, &cwd, &persistent_storage, None)?;
+    let build_stack_ms = lap();
     let ephemeral = cli.ephemeral || stack.config.storage.ephemeral;
     let (storage, _ephemeral_root) = super::run_storage(persistent_storage, ephemeral)?;
+    let run_storage_ms = lap();
 
     let _logging = setup::init_logging(&stack.config.storage);
+    let init_logging_ms = lap();
     setup::init_telemetry(&stack.config.telemetry);
     setup::install_panic_log_hook();
     setup::warn_ignored_provider_fields();
@@ -558,6 +574,20 @@ pub fn run(mut cli: Cli) -> Result<ExitCode> {
         &cwd,
         &storage,
     )?;
+    let resolve_sessions_ms = lap();
+    tracing::info!(
+        state_dir_ms,
+        model_registry_ms,
+        env_files_ms,
+        register_tools_ms,
+        build_stack_ms,
+        run_storage_ms,
+        init_logging_ms,
+        resolve_sessions_ms,
+        total_ms = started.elapsed().as_millis() as u64,
+        "startup phases"
+    );
+
     let mut tabs = resolved.tabs;
     let mut focused = resolved.focused;
     let mut warnings = resolved.warnings;

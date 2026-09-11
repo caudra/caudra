@@ -602,12 +602,21 @@ impl SpawnCtx {
     }
 
     fn spawn_runtime(&self, tab: SessionTab) -> Result<SessionRuntime, String> {
+        let started = Instant::now();
+        let mut phase_start = started;
+        let mut lap = || {
+            let elapsed = phase_start.elapsed().as_millis() as u64;
+            phase_start = Instant::now();
+            elapsed
+        };
         let SessionTab { session, lease } = tab;
         lease
             .validate(&self.storage, session.id)
             .map_err(|error| error.to_string())?;
+        let session_id = session.id;
         let (session, snapshot_store) =
             prepare_session_for_runtime(&self.storage, &self.storage_writer, session)?;
+        let prepare_ms = lap();
         let initial_history = match crate::active_session_history(&session) {
             Ok(history) => history,
             Err(error) => {
@@ -644,6 +653,7 @@ impl SpawnCtx {
             Arc::clone(&self.prompt_profiles),
             Some(self.storage.clone()),
         );
+        let agent_spawn_ms = lap();
         let mut app = App::new(
             &self.model_slot.load().model,
             session,
@@ -665,6 +675,7 @@ impl SpawnCtx {
             Arc::clone(&self.model_policy),
             Arc::clone(&self.prompt_profiles),
         );
+        let app_new_ms = lap();
         app.live_sessions = Arc::clone(&self.live_sessions);
         app.state.system_prompt_profile_name = system_prompt_profile_name;
         app.state.system_prompt_profile = system_prompt_profile;
@@ -676,6 +687,15 @@ impl SpawnCtx {
         if restore_session {
             app.restore_resumed_session();
         }
+        info!(
+            session_id = %session_id,
+            prepare_ms,
+            agent_spawn_ms,
+            app_new_ms,
+            restore_ms = lap(),
+            total_ms = started.elapsed().as_millis() as u64,
+            "session runtime spawned"
+        );
         let (shell_tx, shell_rx) = flume::unbounded::<ShellEvent>();
         let (snapshot_tx, snapshot_rx) = flume::unbounded::<WorkspaceSnapshotDone>();
         Ok(SessionRuntime {
@@ -927,6 +947,14 @@ impl<'t> EventLoop<'t> {
             herdr_reporter,
         } = params;
 
+        let started = Instant::now();
+        let mut phase_start = started;
+        let mut lap = || {
+            let elapsed = phase_start.elapsed().as_millis() as u64;
+            phase_start = Instant::now();
+            elapsed
+        };
+
         // Apply the config theme before the warmup thread spawns, or warmup
         // could bake the syntax palette from the old theme.
         let auto_theme = start_theme(&ui_config, &mut startup_warnings);
@@ -941,6 +969,7 @@ impl<'t> EventLoop<'t> {
             canonical_cwd(&std::env::current_dir().context("read current working directory")?)
                 .map_err(|error| eyre!(error))?;
         let (mcp_handle, mcp_config_errors) = smol::block_on(mcp::start(&cwd));
+        let mcp_ms = lap();
 
         let provider: Arc<dyn Provider> = if needs_login {
             Arc::from(caudra_providers::provider::from_model_fallback(
@@ -996,15 +1025,26 @@ impl<'t> EventLoop<'t> {
             live_sessions: Arc::default(),
         };
 
+        let provider_ms = lap();
+
         let active = sessions.iter().map(|tab| tab.session.id).collect();
         recover_stored_sessions_in_cwd(&ctx.storage, &ctx.storage_writer, &cwd, &active)
             .map_err(|error| eyre!(error))?;
+        let recover_sessions_ms = lap();
 
         let mut runtimes: Vec<SessionRuntime> = sessions
             .into_iter()
             .map(|tab| ctx.spawn_runtime(tab))
             .collect::<Result<_, _>>()
             .map_err(|error| eyre!(error))?;
+        info!(
+            mcp_ms,
+            provider_ms,
+            recover_sessions_ms,
+            spawn_runtimes_ms = lap(),
+            total_ms = started.elapsed().as_millis() as u64,
+            "event loop startup phases"
+        );
         if runtimes.is_empty() {
             return Err(eyre!("event loop needs at least one session"));
         }

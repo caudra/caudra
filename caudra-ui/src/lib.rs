@@ -127,9 +127,27 @@ pub enum RunOutcome {
 
 pub fn run(params: EventLoopParams, initial_prompt: Option<String>) -> Result<RunOutcome> {
     let report = {
+        // Nothing between the last `caudra` startup phase and the first frame is
+        // logged otherwise, so a slow open has nowhere left to hide.
+        let started = Instant::now();
+        let mut phase_start = started;
+        let mut lap = || {
+            let elapsed = phase_start.elapsed().as_millis() as u64;
+            phase_start = Instant::now();
+            elapsed
+        };
         let (_guard, mut terminal) = terminal::TerminalGuard::init()?;
+        let terminal_ms = lap();
         color_compat::init();
+        let color_compat_ms = lap();
         let el = event_loop::EventLoop::new(&mut terminal, params)?;
+        tracing::info!(
+            terminal_ms,
+            color_compat_ms,
+            event_loop_new_ms = lap(),
+            total_ms = started.elapsed().as_millis() as u64,
+            "ui startup phases"
+        );
         el.run(initial_prompt)?
     };
     Ok(match report.exit {

@@ -1,5 +1,6 @@
 use std::env;
 use std::sync::Arc;
+use std::time::Instant;
 
 use color_eyre::Result;
 use color_eyre::eyre::Context;
@@ -21,13 +22,26 @@ pub fn run(
     no_jit: bool,
     profile_arg: Option<String>,
 ) -> Result<()> {
+    // Every phase up to `init_logging` runs without a subscriber, so its cost is
+    // invisible unless it is measured here and reported once the sink exists.
+    let started = Instant::now();
+    let mut phase_start = started;
+    let mut lap = || {
+        let elapsed = phase_start.elapsed().as_millis() as u64;
+        phase_start = Instant::now();
+        elapsed
+    };
     let storage = StateDir::resolve().context("resolve data directory")?;
+    let state_dir_ms = lap();
     caudra_providers::model_registry::load_from_storage(&storage)
         .context("load model purpose bindings")?;
+    let model_registry_ms = lap();
 
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
     load_env_files(&cwd);
+    let env_files_ms = lap();
     let _workcell_host = super::register_builtin_tools(&cwd)?;
+    let register_tools_ms = lap();
 
     let mut plugin_host = PluginHost::with_jit(Arc::clone(ToolRegistry::global_arc()), !no_jit)
         .context("initialize lua plugin host")?;
@@ -66,12 +80,24 @@ pub fn run(
         &storage,
         StoredMode::Build,
     )?;
+    let build_stack_ms = lap();
 
     let _logging = setup::init_logging(&config.storage);
+    let init_logging_ms = lap();
     setup::init_telemetry(&config.telemetry);
     setup::install_panic_log_hook();
     setup::warn_ignored_provider_fields();
     setup::report_startup(setup::MODE_ACP, &model, &cwd);
+    tracing::info!(
+        state_dir_ms,
+        model_registry_ms,
+        env_files_ms,
+        register_tools_ms,
+        build_stack_ms,
+        init_logging_ms,
+        total_ms = started.elapsed().as_millis() as u64,
+        "startup phases"
+    );
 
     let prompt_slots = plugin_host
         .event_handle()

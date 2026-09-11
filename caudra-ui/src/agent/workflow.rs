@@ -4,7 +4,7 @@
 
 use std::env;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use async_lock::Mutex as AsyncMutex;
@@ -139,7 +139,10 @@ impl WorkflowSession {
         let mcp = spawn.mcp_handle.map(|handle| {
             McpSession::new(handle.clone(), &[]).with_disabled_tools(&spawn.config.disabled_tools)
         });
+        let started = Instant::now();
         let loaded_instructions = agent::load_instructions(&cwd.to_string_lossy()).loaded;
+        let instructions_ms = started.elapsed().as_millis() as u64;
+        let runtime_start = Instant::now();
         let host = WorkflowHostContext::from_agent_params(
             &base,
             HostExtras {
@@ -151,6 +154,8 @@ impl WorkflowSession {
             Arc::clone(&mode_resolver),
             Arc::clone(&subagent_cancels),
         );
+        let host_ms = runtime_start.elapsed().as_millis() as u64;
+        let block_on_start = Instant::now();
         let runtime = smol::block_on(WorkflowRuntime::spawn(RuntimeDeps {
             state_dir: spawn.state_dir,
             session_id: spawn.session_id,
@@ -165,7 +170,14 @@ impl WorkflowSession {
             warn!(%error, session_id = %spawn.session_id, "workflow runtime unavailable for this session")
         })
         .ok()?;
-        info!(session_id = %spawn.session_id, "workflow runtime started");
+        info!(
+            session_id = %spawn.session_id,
+            instructions_ms,
+            host_ms,
+            block_on_ms = block_on_start.elapsed().as_millis() as u64,
+            runtime_spawn_ms = runtime_start.elapsed().as_millis() as u64,
+            "workflow runtime started"
+        );
         Some(Self {
             session_id: spawn.session_id,
             handle: runtime.handle(),
