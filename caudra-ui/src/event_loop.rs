@@ -2409,23 +2409,27 @@ impl<'t> EventLoop<'t> {
                 }
             }
             Action::Bind(purpose, binding) => {
-                caudra_providers::model_registry::set_binding_and_persist(
+                let result = caudra_providers::model_registry::set_binding_and_persist(
                     purpose,
                     binding.clone(),
                     &self.ctx.storage,
                 );
-                self.sessions[idx]
-                    .app
-                    .flash(format!("{} model: {binding}", purpose.label()));
+                let message = match result {
+                    Ok(()) => format!("{} model: {binding}", purpose.label()),
+                    Err(error) => format!("Failed to bind {} model: {error}", purpose.label()),
+                };
+                self.sessions[idx].app.flash(message);
             }
             Action::Unbind(purpose) => {
-                caudra_providers::model_registry::clear_binding_and_persist(
+                let result = caudra_providers::model_registry::clear_binding_and_persist(
                     purpose,
                     &self.ctx.storage,
                 );
-                self.sessions[idx]
-                    .app
-                    .flash(format!("{} model: {UNBOUND_FLASH}", purpose.label()));
+                let message = match result {
+                    Ok(()) => format!("{} model: {UNBOUND_FLASH}", purpose.label()),
+                    Err(error) => format!("Failed to unbind {} model: {error}", purpose.label()),
+                };
+                self.sessions[idx].app.flash(message);
             }
             Action::Compact => {
                 let rt = &mut self.sessions[idx];
@@ -2531,12 +2535,7 @@ impl<'t> EventLoop<'t> {
                 }
             }
             Action::Btw(question) => {
-                let slot = self.ctx.model_slot.load();
-                self.sessions[idx].app.start_btw(
-                    question,
-                    Arc::clone(&slot.provider),
-                    slot.model.clone(),
-                );
+                self.sessions[idx].app.start_btw(question);
             }
             Action::Suspend => {
                 let _pause = self.input.pause();

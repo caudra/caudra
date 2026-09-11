@@ -33,5 +33,6 @@ pub use instructions::{
 };
 pub use provider_projection::{project as project_for_provider, project_for_target};
 pub use run::{
-    Agent, AgentParams, AgentRunParams, estimate_message_tokens, resolve_compaction_model,
+    Agent, AgentParams, AgentRunParams, ModelRoute, estimate_message_tokens,
+    resolve_compaction_model, resolve_model_for_purpose, resolve_purpose_model,
 };

@@ -776,11 +776,9 @@ pub enum NotificationMethod {
 /// Whether the tools in [`DEFERRED_BUILTIN_TOOLS`] start outside the request
 /// array.
 ///
-/// `Auto` reads the class the active provider files the model under: Balanced
-/// and Best take them all upfront, because they choose well from a long list
-/// and a mid-session load resets a prompt-cache prefix they were already
-/// paying to keep. Fast defers, and so does a model nobody classified, since
-/// guessing capability is what a blank class exists to refuse.
+/// `Auto` declares them upfront for a model known to be non-small, because it
+/// can choose well from a long list and a mid-session load resets a prompt-cache
+/// prefix it was already paying to keep. Small and unknown models defer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DeferBuiltinTools {
@@ -1651,7 +1649,7 @@ pub struct AgentConfig {
 
     #[config(
         default = true,
-        desc = "Name a new session by summarizing its first prompt with a small model"
+        desc = "Name a new session by summarizing its first prompt with the Title model"
     )]
     pub generate_titles: bool,
 
@@ -1671,7 +1669,7 @@ pub struct AgentConfig {
         default = DeferBuiltinTools::Auto,
         ty = "string",
         default_doc = "auto",
-        desc = "When the on-demand built-in tools start outside the request array: `auto` defers them for a Fast or unclassified model and declares them upfront for Balanced and Best, `always` defers for every model, `never` declares them upfront"
+        desc = "When the on-demand built-in tools start outside the request array: `auto` defers them for a small model or one with no supply metadata and declares them upfront for a known non-small model, `always` defers for every model, `never` declares them upfront"
     )]
     pub defer_builtin_tools: DeferBuiltinTools,
 

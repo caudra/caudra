@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use caudra_agent::{
-    AgentInput, EditableQueue, EditableQueueReceiver, ExtractedCommand, ImageSource,
+    AgentInput, AgentMode, EditableQueue, EditableQueueReceiver, ExtractedCommand, ImageSource,
     InterruptSource, Mention, PromptAdmission, QueueDelivery, QueueItemId, QueuedInterrupt,
     editable_queue,
 };
@@ -89,6 +89,12 @@ enum MovementLane {
     Hidden,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ModelLane {
+    Chat,
+    Plan,
+}
+
 impl QueueItem {
     pub(crate) fn run_id(&self) -> u64 {
         match self {
@@ -119,6 +125,16 @@ impl QueueItem {
             Self::Message {
                 displayed: true, ..
             } => Some(MovementLane::Hidden),
+            Self::Compact { .. } => None,
+        }
+    }
+
+    fn model_lane(&self) -> Option<ModelLane> {
+        match self {
+            Self::Message { input, .. } => Some(match input.mode {
+                AgentMode::Plan(_) => ModelLane::Plan,
+                AgentMode::Build | AgentMode::ReadOnly => ModelLane::Chat,
+            }),
             Self::Compact { .. } => None,
         }
     }
@@ -187,6 +203,7 @@ pub(crate) struct QueueReceiver {
     claim_gate: Arc<Mutex<()>>,
     active: Arc<AtomicBool>,
     active_run_id: Arc<AtomicU64>,
+    active_plan: AtomicBool,
     processing: Arc<AtomicBool>,
 }
 
@@ -212,6 +229,7 @@ pub(crate) fn queue() -> (QueueSender, QueueReceiver) {
             claim_gate,
             active,
             active_run_id,
+            active_plan: AtomicBool::new(false),
             processing,
         },
     )
@@ -519,10 +537,12 @@ impl QueueReceiver {
             if claimed.is_empty() {
                 continue;
             }
-            if let Some(run_id) = claimed.iter().rev().find_map(|(_, item)| match item {
-                QueueItem::Message { run_id, .. } => Some(*run_id),
+            if let Some((run_id, lane)) = claimed.iter().rev().find_map(|(_, item)| match item {
+                QueueItem::Message { run_id, .. } => item.model_lane().map(|lane| (*run_id, lane)),
                 QueueItem::Compact { .. } => None,
             }) {
+                self.active_plan
+                    .store(lane == ModelLane::Plan, Ordering::Relaxed);
                 self.active_run_id.store(run_id, Ordering::Relaxed);
                 self.active.store(true, Ordering::Release);
             }
@@ -542,8 +562,15 @@ impl QueueReceiver {
             return Vec::new();
         }
         let run_id = self.active_run_id.load(Ordering::Relaxed);
+        let lane = if self.active_plan.load(Ordering::Relaxed) {
+            ModelLane::Plan
+        } else {
+            ModelLane::Chat
+        };
         self.queue.claim_all_matching(|item| {
-            item.admission() == PromptAdmission::Steer && item.run_id() == run_id
+            item.admission() == PromptAdmission::Steer
+                && item.run_id() == run_id
+                && item.model_lane() == Some(lane)
         })
     }
 
@@ -553,6 +580,7 @@ impl QueueReceiver {
 
     #[cfg(test)]
     pub(crate) fn set_active_run(&self, run_id: u64) {
+        self.active_plan.store(false, Ordering::Relaxed);
         self.active_run_id.store(run_id, Ordering::Relaxed);
         self.active.store(true, Ordering::Release);
     }
@@ -607,6 +635,7 @@ impl InterruptSource for QueueReceiver {
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
+    use std::path::PathBuf;
     use std::sync::{Arc, Barrier, Mutex};
     use std::thread;
 
@@ -614,15 +643,20 @@ mod tests {
     use test_case::test_case;
 
     const PADDED_DRAFT: &str = "  ab cd  ";
+    const PLAN_PATH: &str = ".caudra/plans/test.md";
 
     fn msg(displayed: bool) -> QueueItem {
+        msg_with_mode(displayed, AgentMode::Build)
+    }
+
+    fn msg_with_mode(displayed: bool, mode: AgentMode) -> QueueItem {
         QueueItem::Message {
             text: "t".into(),
             image_count: 0,
             paste_ranges: Vec::new(),
             input: Box::new(AgentInput {
                 message: String::new(),
-                mode: Default::default(),
+                mode,
                 images: Vec::new(),
                 mentions: Vec::new(),
                 preamble: Vec::new(),
@@ -635,6 +669,14 @@ mod tests {
             admission: PromptAdmission::Queue,
             displayed,
         }
+    }
+
+    fn steer(mode: AgentMode) -> QueueItem {
+        let mut item = msg_with_mode(false, mode);
+        if let QueueItem::Message { admission, .. } = &mut item {
+            *admission = PromptAdmission::Steer;
+        }
+        item
     }
 
     #[test_case(3..5, Some(1..3) ; "shifts_by_leading_whitespace")]
@@ -777,6 +819,39 @@ mod tests {
         };
         assert_eq!(inputs.len(), 2);
         assert!(tx.is_empty());
+    }
+
+    #[test]
+    fn active_plan_run_only_claims_plan_steers() {
+        let (tx, rx) = queue();
+        tx.push(msg_with_mode(
+            false,
+            AgentMode::Plan(PathBuf::from(PLAN_PATH)),
+        ));
+        assert_eq!(rx.claim_idle(0).len(), 1);
+        tx.push(steer(AgentMode::Build));
+        tx.push(steer(AgentMode::Plan(PathBuf::from(PLAN_PATH))));
+
+        let Some(ExtractedCommand::Interrupt(input, ..)) = rx.poll() else {
+            panic!("expected a plan steer");
+        };
+        assert!(matches!(input.mode, AgentMode::Plan(_)));
+        assert_eq!(tx.len(), 1);
+    }
+
+    #[test]
+    fn active_chat_run_only_claims_non_plan_steers() {
+        let (tx, rx) = queue();
+        tx.push(msg_with_mode(false, AgentMode::ReadOnly));
+        assert_eq!(rx.claim_idle(0).len(), 1);
+        tx.push(steer(AgentMode::Plan(PathBuf::from(PLAN_PATH))));
+        tx.push(steer(AgentMode::Build));
+
+        let Some(ExtractedCommand::Interrupt(input, ..)) = rx.poll() else {
+            panic!("expected a chat-lane steer");
+        };
+        assert!(matches!(input.mode, AgentMode::Build));
+        assert_eq!(tx.len(), 1);
     }
 
     #[test]

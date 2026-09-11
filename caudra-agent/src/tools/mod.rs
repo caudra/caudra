@@ -438,6 +438,8 @@ where
 pub struct ToolContext {
     pub provider: Arc<dyn Provider>,
     pub model: Arc<Model>,
+    pub chat_provider: Arc<dyn Provider>,
+    pub chat_model: Arc<Model>,
     pub event_tx: EventSender,
     pub mode: AgentMode,
     /// The session this run belongs to. A subagent inherits its parent's,
@@ -692,6 +694,8 @@ pub fn interpreter_ctx(
     ToolContext {
         provider: Arc::clone(&PROVIDER),
         model: Arc::clone(&MODEL),
+        chat_provider: Arc::clone(&PROVIDER),
+        chat_model: Arc::clone(&MODEL),
         event_tx: event_tx.clone(),
         mode: mode.clone(),
         session_id: None,

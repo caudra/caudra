@@ -176,6 +176,43 @@ pub enum ModelFamily {
     Synthetic,
 }
 
+/// Provider-supplied size and default facts, kept separate so a known model is
+/// not mistaken for a preferred one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelFacts {
+    /// Whether the provider deliberately presents this as a small model.
+    pub small: bool,
+    /// Whether this is the preferred model in its size lane.
+    pub default: bool,
+}
+
+/// Marker suitable for presenting model supply metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelMarker {
+    Small,
+    Fast,
+    Best,
+}
+
+impl ModelFacts {
+    pub const fn class(&self) -> ModelPurpose {
+        if self.small {
+            ModelPurpose::Fast
+        } else {
+            ModelPurpose::Best
+        }
+    }
+
+    pub const fn marker(&self) -> Option<ModelMarker> {
+        match (self.small, self.default) {
+            (true, false) => Some(ModelMarker::Small),
+            (true, true) => Some(ModelMarker::Fast),
+            (false, true) => Some(ModelMarker::Best),
+            (false, false) => None,
+        }
+    }
+}
+
 /// Const-constructible mirror of [`ReasoningOption`], so the static tables can
 /// carry a correction for a model the catalog gets wrong or has not reached.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,13 +243,13 @@ pub(crate) fn reasoning_options_from_static(options: &[StaticReasoningOption]) -
 #[derive(Debug)]
 pub struct ModelEntry {
     pub prefixes: &'static [&'static str],
-    /// Which slot this model is the curated answer for when `default` is set.
-    /// A recommendation the resolver may use, never a claim carried on a
-    /// resolved [`Model`].
-    pub purpose: ModelPurpose,
+    /// Whether this is a deliberately small model. False means known non-small,
+    /// not that it is the provider's flagship.
+    pub small: bool,
     pub family: ModelFamily,
     /// Gates vision-only tools (`view_image`) and image blocks at request time.
     pub vision: bool,
+    /// The preferred model within its small or non-small lane.
     pub default: bool,
     pub pricing: ModelPricing,
     pub max_output_tokens: Option<u32>,
@@ -220,6 +257,20 @@ pub struct ModelEntry {
     /// Corrects the catalog where it describes the model rather than the
     /// request caudra sends. `None` defers to discovery and models.dev.
     pub reasoning_options: Option<&'static [StaticReasoningOption]>,
+}
+
+impl ModelEntry {
+    pub const fn facts(&self) -> ModelFacts {
+        ModelFacts {
+            small: self.small,
+            default: self.default,
+        }
+    }
+
+    /// Compatibility size class for routing callers.
+    pub const fn class(&self) -> ModelPurpose {
+        self.facts().class()
+    }
 }
 
 /// Whether a resolved window is an input budget rather than the API total.
@@ -335,6 +386,12 @@ pub struct Model {
     pub billing: Billing,
 }
 
+#[derive(Clone, Copy)]
+enum CatalogAccess {
+    Warm,
+    IfAvailable,
+}
+
 /// `ManifestRegistry::for_slug` resolves a custom slug to its base provider's
 /// manifest so stubs still get thinking, display-name, and window defaults. Those
 /// are transport concerns. Lineage is not: a custom provider's base is its wire
@@ -361,9 +418,13 @@ impl Model {
     /// caught up to yet), fall back to the provider defaults so it still resolves.
     fn from_base(manifest: &ProviderManifest, slug: &str, model_id: &str) -> Self {
         let static_entry = lookup_entry(manifest.models, model_id).ok();
-        // Discovery keys `known_models` by the builtin slug, so a dynamic or
-        // custom slug reads metadata through its base.
-        let discovered = model_registry::discovered(manifest.slug, model_id);
+        // A wrapper's own listing wins. Before it has listed, metadata already
+        // discovered through the builtin remains a useful fallback.
+        let discovered = model_registry::discovered(slug, model_id).or_else(|| {
+            (slug != manifest.slug)
+                .then(|| model_registry::discovered(manifest.slug, model_id))
+                .flatten()
+        });
         let discovered = discovered.as_ref();
         let family = inherited_lineage(manifest, slug, static_entry);
         let discovered_pricing = discovered.and_then(|info| info.pricing.as_ref());
@@ -560,17 +621,40 @@ impl Model {
         ManifestRegistry::for_slug(&self.provider).map_or("Unknown", |m| m.display_name)
     }
 
-    /// Which model serves `purpose` while `chat` is the conversation model.
+    /// Which model serves `purpose` while `anchor` is the caller's current model.
     ///
     /// A binding the user made wins. Otherwise each purpose falls back to its
-    /// own rule, and every rule ends at `chat`, so resolution never invents an
+    /// own rule, and every rule ends at `anchor`, so resolution never invents an
     /// id the active provider does not serve.
     pub fn resolve(
         purpose: ModelPurpose,
-        chat: &Self,
+        anchor: &Self,
         policy: &ModelPolicy,
     ) -> Result<Self, ModelError> {
-        Self::resolve_seen(purpose, chat, policy, &mut Vec::new())
+        Self::resolve_seen(
+            purpose,
+            anchor,
+            policy,
+            &mut Vec::new(),
+            CatalogAccess::Warm,
+        )
+    }
+
+    /// Non-warming variant of [`Self::resolve`] for latency-sensitive callers.
+    /// An exact binding whose catalog provider is not already available returns
+    /// [`ModelError::UnsupportedProvider`] without loading the catalog.
+    pub fn resolve_if_available(
+        purpose: ModelPurpose,
+        anchor: &Self,
+        policy: &ModelPolicy,
+    ) -> Result<Self, ModelError> {
+        Self::resolve_seen(
+            purpose,
+            anchor,
+            policy,
+            &mut Vec::new(),
+            CatalogAccess::IfAvailable,
+        )
     }
 
     /// [`Self::resolve`] against a binding the caller already read, so a caller
@@ -578,67 +662,95 @@ impl Model {
     pub fn resolve_binding(
         purpose: ModelPurpose,
         binding: Option<&Binding>,
-        chat: &Self,
+        anchor: &Self,
         policy: &ModelPolicy,
+    ) -> Result<Self, ModelError> {
+        Self::resolve_captured_binding(purpose, binding, anchor, policy, CatalogAccess::Warm)
+    }
+
+    /// Non-warming variant of [`Self::resolve_binding`].
+    pub fn resolve_binding_if_available(
+        purpose: ModelPurpose,
+        binding: Option<&Binding>,
+        anchor: &Self,
+        policy: &ModelPolicy,
+    ) -> Result<Self, ModelError> {
+        Self::resolve_captured_binding(purpose, binding, anchor, policy, CatalogAccess::IfAvailable)
+    }
+
+    fn resolve_captured_binding(
+        purpose: ModelPurpose,
+        binding: Option<&Binding>,
+        anchor: &Self,
+        policy: &ModelPolicy,
+        catalog_access: CatalogAccess,
     ) -> Result<Self, ModelError> {
         let seen = &mut vec![purpose];
         match binding {
-            Some(binding) => Self::follow(binding, chat, policy, seen),
-            None => Self::auto(purpose, chat, policy, seen),
+            Some(binding) => Self::follow(binding, anchor, policy, seen, catalog_access),
+            None => Self::auto(purpose, anchor, policy, seen, catalog_access),
         }
     }
 
     fn resolve_seen(
         purpose: ModelPurpose,
-        chat: &Self,
+        anchor: &Self,
         policy: &ModelPolicy,
         seen: &mut Vec<ModelPurpose>,
+        catalog_access: CatalogAccess,
     ) -> Result<Self, ModelError> {
         if seen.contains(&purpose) {
             return Err(ModelError::PurposeCycle(purpose));
         }
         seen.push(purpose);
         match model_registry::binding(purpose) {
-            Some(binding) => Self::follow(&binding, chat, policy, seen),
-            None => Self::auto(purpose, chat, policy, seen),
+            Some(binding) => Self::follow(&binding, anchor, policy, seen, catalog_access),
+            None => Self::auto(purpose, anchor, policy, seen, catalog_access),
         }
     }
 
     fn follow(
         binding: &Binding,
-        chat: &Self,
+        anchor: &Self,
         policy: &ModelPolicy,
         seen: &mut Vec<ModelPurpose>,
+        catalog_access: CatalogAccess,
     ) -> Result<Self, ModelError> {
         match binding {
-            // A bound spec may name a catalogue sub-provider this process has
-            // not fetched yet, so an unknown provider is worth one warm retry
-            // before it counts as unresolvable.
-            Binding::Exact(spec) => match Self::from_spec_with_policy(spec, policy) {
-                Err(ModelError::UnsupportedProvider(_)) => {
-                    crate::warm_catalog();
-                    Self::from_spec_with_policy(spec, policy)
+            Binding::Exact(spec) => {
+                match (catalog_access, Self::from_spec_with_policy(spec, policy)) {
+                    (CatalogAccess::Warm, Err(ModelError::UnsupportedProvider(_))) => {
+                        crate::warm_catalog();
+                        Self::from_spec_with_policy(spec, policy)
+                    }
+                    (_, result) => result,
                 }
-                result => result,
-            },
-            Binding::Same(other) => Self::resolve_seen(*other, chat, policy, seen),
+            }
+            Binding::Same(other) => {
+                Self::resolve_seen(*other, anchor, policy, seen, catalog_access)
+            }
         }
     }
 
     fn auto(
         purpose: ModelPurpose,
-        chat: &Self,
+        anchor: &Self,
         policy: &ModelPolicy,
         seen: &mut Vec<ModelPurpose>,
+        catalog_access: CatalogAccess,
     ) -> Result<Self, ModelError> {
         match purpose {
-            // Compaction reads the whole conversation, so the cheap slot is the
-            // wrong default: a small window cannot hold what it must summarize.
-            ModelPurpose::Chat | ModelPurpose::Compact => Ok(chat.clone()),
+            ModelPurpose::Chat
+            | ModelPurpose::Plan
+            | ModelPurpose::Subagent
+            | ModelPurpose::Compact => Ok(anchor.clone()),
             ModelPurpose::Title | ModelPurpose::Goal => {
-                Self::resolve_seen(ModelPurpose::Fast, chat, policy, seen)
+                Self::resolve_seen(ModelPurpose::Fast, anchor, policy, seen, catalog_access)
             }
-            slot => Ok(Self::provider_default(slot, chat, policy).unwrap_or_else(|| chat.clone())),
+            ModelPurpose::Fast | ModelPurpose::Best => {
+                Ok(Self::provider_default(purpose, anchor, policy)
+                    .unwrap_or_else(|| anchor.clone()))
+            }
         }
     }
 
@@ -646,10 +758,14 @@ impl Model {
     /// curated table, then the cheapest price the provider reported.
     ///
     /// Only Fast consults price. It is a sound proxy for cheap and an unsound one
-    /// for capable, so Balanced and Best stop at the curated table and let the
-    /// caller fall back to the model the user already chose.
-    fn provider_default(purpose: ModelPurpose, chat: &Self, policy: &ModelPolicy) -> Option<Self> {
-        let slug = chat.provider.as_ref();
+    /// for capable, so Best stops at the curated table and lets the caller fall
+    /// back to the model the user already chose.
+    fn provider_default(
+        purpose: ModelPurpose,
+        anchor: &Self,
+        policy: &ModelPolicy,
+    ) -> Option<Self> {
+        let slug = anchor.provider.as_ref();
         let cheapest = (purpose == ModelPurpose::Fast)
             .then(|| {
                 model_registry::cheapest_known(slug)
@@ -669,26 +785,30 @@ impl Model {
             .find_map(|spec| Self::from_spec(&spec).ok())
     }
 
-    /// Which capability slot the active provider files this model under, if
-    /// any. The inverse of [`Self::provider_default`], and it answers in the
-    /// same order: what the operator declared in `providers.toml`, then the
-    /// curated table.
+    /// Supply facts declared by the operator or the curated provider table.
+    /// Aggregators borrow the upstream provider's facts after removing their
+    /// vendor prefix.
     ///
-    /// `None` is the honest answer for a model nobody classified. Nothing
-    /// infers one from price or list position, because those were guesses.
-    pub fn class_of(provider: &str, model_id: &str) -> Option<ModelPurpose> {
-        ModelPurpose::CLASSES
-            .into_iter()
-            .find(|purpose| custom::declares_purpose(provider, *purpose, model_id))
-            .or_else(|| ManifestRegistry::purpose_for_model(provider, model_id))
+    /// `None` is the honest answer for a model nobody described. Nothing infers
+    /// facts from price or discovery order.
+    pub fn facts_of(provider: &str, model_id: &str) -> Option<ModelFacts> {
+        custom::facts_for_model(provider, model_id)
+            .or_else(|| ManifestRegistry::facts_for_model(provider, model_id))
             .or_else(|| {
-                // An aggregator has no catalogue of its own, but it serves other
-                // vendors' models under a vendor-prefixed id. Those are the same
-                // weights the vendor's own curated entry describes, so route to
-                // it instead of reporting nothing.
                 let (vendor, upstream) = model_id.split_once('/')?;
-                ManifestRegistry::purpose_for_model(builtin_for_vendor(vendor), upstream)
+                ManifestRegistry::facts_for_model(builtin_for_vendor(vendor), upstream)
             })
+    }
+
+    pub fn marker_of(provider: &str, model_id: &str) -> Option<ModelMarker> {
+        Self::facts_of(provider, model_id).and_then(|facts| facts.marker())
+    }
+
+    /// Compatibility view of [`Self::facts_of`] for routing consumers. It
+    /// classifies every known model by size, including non-default models that
+    /// intentionally have no [`ModelMarker`].
+    pub fn class_of(provider: &str, model_id: &str) -> Option<ModelPurpose> {
+        Self::facts_of(provider, model_id).map(|facts| facts.class())
     }
 
     /// Curated default for a builtin provider, with no conversation to fall back
@@ -872,6 +992,7 @@ impl AddAssign for TokenUsage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use caudra_storage::StateDir;
     use test_case::test_case;
 
     fn policy(allowed: &[&str], excluded: &[&str]) -> ModelPolicy {
@@ -888,18 +1009,22 @@ mod tests {
         .unwrap()
     }
 
-    const SLOTS: [ModelPurpose; 3] = ModelPurpose::CLASSES;
-    /// DeepSeek curates no cheap model, so its Fast slot has no candidate.
-    const NO_FAST_SLOT: &str = "deepseek";
+    const SLOTS: [ModelPurpose; 2] = ModelPurpose::CLASSES;
+    /// These providers curate no deliberately small model.
+    const NO_FAST_DEFAULTS: [&str; 2] = ["deepseek", "xai"];
 
     const AGGREGATOR: &str = "tensorx";
     const ALIASED_VENDOR_MODEL: &str = "z-ai/glm-4.5-air";
     const UNCLASSIFIABLE: &str = "ollama";
+    const UNKNOWN_CATALOG_PROVIDER: &str = "caudra-cold-catalog-test-provider";
+    const UNKNOWN_CATALOG_SPEC: &str = "caudra-cold-catalog-test-provider/model";
 
     const OPENAI_CHAT_SPEC: &str = "openai/gpt-5.6-sol";
 
     #[test_case("anthropic", "claude-haiku-4-5", Some(ModelPurpose::Fast) ; "curated_table")]
     #[test_case("anthropic", "claude-opus-4-6", Some(ModelPurpose::Best) ; "curated_best")]
+    #[test_case("anthropic", "claude-sonnet-4-6", Some(ModelPurpose::Best) ; "known_non_small")]
+    #[test_case("openai", "gpt-4.1-nano", Some(ModelPurpose::Fast) ; "longest_prefix_wins")]
     #[test_case(UNCLASSIFIABLE, "llama3", None ; "no_table_means_no_class")]
     fn class_of_reads_the_providers_own_answer(
         provider: &str,
@@ -909,10 +1034,34 @@ mod tests {
         assert_eq!(Model::class_of(provider, model_id), expected);
     }
 
+    #[test_case("zai", "glm-4.5-air", Some(ModelMarker::Small) ; "small_non_default")]
+    #[test_case("anthropic", "claude-haiku-4-5", Some(ModelMarker::Fast) ; "small_default")]
+    #[test_case("anthropic", "claude-fable-5", Some(ModelMarker::Best) ; "non_small_default")]
+    #[test_case("anthropic", "claude-sonnet-4-6", None ; "non_small_non_default")]
+    #[test_case(UNCLASSIFIABLE, "llama3", None ; "unknown_facts")]
+    fn marker_of_preserves_size_and_default_status(
+        provider: &str,
+        model_id: &str,
+        expected: Option<ModelMarker>,
+    ) {
+        assert_eq!(Model::marker_of(provider, model_id), expected);
+    }
+
     /// Aggregators carry no catalogue, and they spell some vendors differently
     /// than caudra does, so the class has to survive both hops.
     #[test]
-    fn an_aggregator_borrows_the_class_of_an_aliased_vendor() {
+    fn an_aggregator_borrows_the_facts_of_an_aliased_vendor() {
+        assert_eq!(
+            Model::facts_of(AGGREGATOR, ALIASED_VENDOR_MODEL),
+            Some(ModelFacts {
+                small: true,
+                default: false,
+            })
+        );
+        assert_eq!(
+            Model::marker_of(AGGREGATOR, ALIASED_VENDOR_MODEL),
+            Some(ModelMarker::Small)
+        );
         assert_eq!(
             Model::class_of(AGGREGATOR, ALIASED_VENDOR_MODEL),
             Some(ModelPurpose::Fast)
@@ -1071,6 +1220,89 @@ mod tests {
         assert_eq!(model.spec(), chat.spec());
     }
 
+    #[test_case(ModelPurpose::Chat, OPENAI_CHAT_SPEC ; "chat_keeps_anchor")]
+    #[test_case(ModelPurpose::Plan, OPENAI_CHAT_SPEC ; "plan_keeps_anchor")]
+    #[test_case(ModelPurpose::Subagent, OPENAI_CHAT_SPEC ; "subagent_keeps_anchor")]
+    #[test_case(ModelPurpose::Compact, OPENAI_CHAT_SPEC ; "compact_keeps_anchor")]
+    #[test_case(ModelPurpose::Title, "openai/gpt-5.6-luna" ; "title_uses_fast")]
+    #[test_case(ModelPurpose::Goal, "openai/gpt-5.6-luna" ; "goal_uses_fast")]
+    #[test_case(ModelPurpose::Fast, "openai/gpt-5.6-luna" ; "fast_uses_small_default")]
+    #[test_case(ModelPurpose::Best, "openai/gpt-5.6-sol" ; "best_uses_non_small_default")]
+    fn automatic_purpose_resolution_uses_the_expected_lane(purpose: ModelPurpose, expected: &str) {
+        let anchor = Model::from_spec(OPENAI_CHAT_SPEC).unwrap();
+
+        let model = Model::resolve(purpose, &anchor, &policy(&[], &[])).unwrap();
+        let non_warming = Model::resolve_if_available(purpose, &anchor, &policy(&[], &[])).unwrap();
+
+        assert_eq!(model.spec(), expected);
+        assert_eq!(non_warming.spec(), model.spec());
+    }
+
+    #[test]
+    fn non_warming_resolution_leaves_an_unknown_exact_provider_cold() {
+        assert!(crate::catalog_providers_if_available().is_none());
+        let anchor = Model::from_spec(OPENAI_CHAT_SPEC).unwrap();
+        let binding = Binding::Exact(UNKNOWN_CATALOG_SPEC.to_string());
+        let model_policy = policy(&[], &[]);
+
+        let captured_error = Model::resolve_binding_if_available(
+            ModelPurpose::Plan,
+            Some(&binding),
+            &anchor,
+            &model_policy,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            captured_error,
+            ModelError::UnsupportedProvider(provider)
+                if provider == UNKNOWN_CATALOG_PROVIDER
+        ));
+
+        let temp = tempfile::tempdir().unwrap();
+        let state_dir = StateDir::from_path(temp.path().to_path_buf());
+        model_registry::set_binding_and_persist(ModelPurpose::Plan, binding, &state_dir).unwrap();
+        let purpose_error =
+            Model::resolve_if_available(ModelPurpose::Plan, &anchor, &model_policy).unwrap_err();
+        assert!(matches!(
+            purpose_error,
+            ModelError::UnsupportedProvider(provider)
+                if provider == UNKNOWN_CATALOG_PROVIDER
+        ));
+        assert!(crate::catalog_providers_if_available().is_none());
+        model_registry::clear_binding_and_persist(ModelPurpose::Plan, &state_dir).unwrap();
+    }
+
+    #[test]
+    fn captured_non_warming_resolution_matches_resolution_for_an_available_model() {
+        let anchor = Model::from_spec(OPENAI_CHAT_SPEC).unwrap();
+        let binding = Binding::Exact("anthropic/claude-haiku-4-5".to_string());
+        let model_policy = policy(&[], &[]);
+
+        let resolved =
+            Model::resolve_binding(ModelPurpose::Fast, Some(&binding), &anchor, &model_policy)
+                .unwrap();
+        let non_warming = Model::resolve_binding_if_available(
+            ModelPurpose::Fast,
+            Some(&binding),
+            &anchor,
+            &model_policy,
+        )
+        .unwrap();
+
+        assert_eq!(non_warming.spec(), resolved.spec());
+    }
+
+    #[test_case("anthropic", ModelPurpose::Fast, "claude-haiku-4-5" ; "anthropic_small")]
+    #[test_case("anthropic", ModelPurpose::Best, "claude-fable-5" ; "anthropic_flagship")]
+    #[test_case("openai", ModelPurpose::Fast, "gpt-5.6-luna" ; "openai_small")]
+    #[test_case("openai", ModelPurpose::Best, "gpt-5.6-sol" ; "openai_flagship")]
+    fn curated_defaults_select_by_size_lane(provider: &str, purpose: ModelPurpose, expected: &str) {
+        assert_eq!(
+            Model::curated_default(provider, purpose).unwrap().id,
+            expected
+        );
+    }
+
     #[test]
     fn from_spec_unknown_catalogue_subprovider_is_unsupported() {
         // The on-disk models.dev cache may populate the catalog in a
@@ -1180,7 +1412,7 @@ mod tests {
             if manifest.accepts_arbitrary_models {
                 continue;
             }
-            let model = Model::curated_default(manifest.slug, ModelPurpose::Balanced).unwrap();
+            let model = Model::curated_default(manifest.slug, ModelPurpose::Best).unwrap();
             let round = Model::from_spec(&model.spec()).unwrap();
             assert_eq!(round.id, model.id);
             assert_eq!(round.provider, model.provider);
@@ -1208,19 +1440,20 @@ mod tests {
     #[test]
     fn every_curated_slot_resolves_to_a_usable_model() {
         for manifest in ManifestRegistry::builtins() {
-            if manifest.accepts_arbitrary_models {
+            if manifest.models.is_empty() {
                 continue;
             }
             let slug: Arc<str> = Arc::from(manifest.slug);
             for &purpose in &SLOTS {
-                if manifest.slug == NO_FAST_SLOT && purpose == ModelPurpose::Fast {
+                if NO_FAST_DEFAULTS.contains(&manifest.slug) && purpose == ModelPurpose::Fast {
                     continue;
                 }
                 let model = Model::curated_default(manifest.slug, purpose).unwrap();
                 assert_eq!(model.provider, slug);
-                let max_output = model.max_output_tokens.unwrap();
-                assert!(max_output > 0);
-                assert!(model.context_window >= max_output);
+                if let Some(max_output) = model.max_output_tokens {
+                    assert!(max_output > 0);
+                    assert!(model.context_window >= max_output);
+                }
             }
         }
     }
@@ -1228,17 +1461,17 @@ mod tests {
     #[test]
     fn exactly_one_default_per_provider_slot() {
         for manifest in ManifestRegistry::builtins() {
-            if manifest.accepts_arbitrary_models {
+            if manifest.models.is_empty() {
                 continue;
             }
             let entries = manifest.models;
             for &purpose in &SLOTS {
-                if manifest.slug == NO_FAST_SLOT && purpose == ModelPurpose::Fast {
+                if NO_FAST_DEFAULTS.contains(&manifest.slug) && purpose == ModelPurpose::Fast {
                     continue;
                 }
                 let count = entries
                     .iter()
-                    .filter(|e| e.purpose == purpose && e.default)
+                    .filter(|e| e.class() == purpose && e.default)
                     .count();
                 assert_eq!(
                     count, 1,
@@ -1374,6 +1607,37 @@ mod tests {
         );
         assert_eq!(wrapped.spec(), format!("my-ollama-wrap/{model_id}"));
         assert_eq!(wrapped.context_window, expected_window);
+    }
+
+    #[test]
+    fn wrapper_discovery_wins_over_metadata_from_its_base_provider() {
+        let model_id = "test-wrapper-specific-discovery";
+        let wrapper_slug = "test-openai-wrapper";
+        let base_window = 64_000;
+        let wrapper_window = 192_000;
+        model_registry::set_known_models(
+            "openai",
+            vec![ModelInfo {
+                context_window: Some(base_window),
+                ..ModelInfo::id_only(model_id.into())
+            }],
+        );
+        model_registry::set_known_models(
+            wrapper_slug,
+            vec![ModelInfo {
+                context_window: Some(wrapper_window),
+                ..ModelInfo::id_only(model_id.into())
+            }],
+        );
+
+        let model = Model::from_base(
+            ManifestRegistry::get("openai").unwrap(),
+            wrapper_slug,
+            model_id,
+        );
+
+        assert_eq!(model.spec(), format!("{wrapper_slug}/{model_id}"));
+        assert_eq!(model.context_window, wrapper_window);
     }
 
     /// "We could not read a price" must never reach the picker as "free", so

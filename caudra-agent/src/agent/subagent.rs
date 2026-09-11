@@ -3,8 +3,8 @@
 //!
 //! The native `task` tool and the workflow engine (both through
 //! [`crate::agent::task_runner`]) and `caudra.agent.session` open sessions
-//! through here. The task path resolves its model, prompt, and tools from a
-//! profile; the generic path takes them from the caller.
+//! through here. The task path resolves its prompt and tools from a profile;
+//! both paths use the Subagent model purpose unless explicitly overridden.
 
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
@@ -13,13 +13,15 @@ use async_lock::Mutex as AsyncMutex;
 use serde_json::Value as JsonValue;
 use tracing::info;
 
-use caudra_providers::model::Model;
+use caudra_providers::model::{Model, ModelPurpose};
+use caudra_providers::model_registry::Binding;
 use caudra_providers::provider;
 use caudra_providers::{
     ContentBlock, HistoryItem, Message, Role, ThinkingConfig, TokenUsage, add_cost, expand_message,
 };
 use caudra_storage::id::CaudraId;
 
+use super::{ModelRoute, resolve_model_for_purpose};
 use crate::cancel::{CancelMap, CancelSlot};
 use crate::prompt::PromptId;
 use crate::tools::registry::ToolRegistry;
@@ -460,8 +462,8 @@ impl TaskIdentity {
     }
 }
 
-/// A `task` call: model, prompt, tools, and mode all come from the profile,
-/// so the caller supplies only what identifies the work.
+/// A `task` call: the profile may override the Subagent model and thinking;
+/// prompt, tools, and mode otherwise come from task policy.
 pub struct TaskOptions {
     pub name: String,
     pub task_id: TaskIdentity,
@@ -473,7 +475,8 @@ pub struct TaskOptions {
     pub local_tools: LocalTools,
 }
 
-/// A plugin-defined session: the caller brings its own prompt and tools.
+/// A plugin-defined session: the caller brings its own prompt and tools, and
+/// may replace the Subagent model with an exact spec.
 pub struct GenericOptions {
     pub name: String,
     pub task_id: Option<String>,
@@ -527,6 +530,7 @@ pub async fn open_task(ctx: &ToolContext, opts: TaskOptions) -> Result<Subagent,
 
     let bindings = ctx.prompt_profiles.bind_for_tasks(
         &ctx.model,
+        &ctx.chat_model,
         &ctx.opts.thinking,
         &ctx.model_policy,
         ctx.timeouts,
@@ -538,11 +542,10 @@ pub async fn open_task(ctx: &ToolContext, opts: TaskOptions) -> Result<Subagent,
         .resolve(&spec.profile_name)
         .map_err(|error| error.to_string())?;
 
-    let model_spec = profile
+    let model_binding = profile
         .as_deref()
-        .and_then(|profile| profile.subagent_model())
-        .map(str::to_owned);
-    let (model, provider) = resolve_provider(ctx, model_spec.as_deref()).await?;
+        .and_then(|profile| profile.subagent_model());
+    let (model, provider) = resolve_provider(ctx, model_binding).await?;
     announce_model(ctx, &model);
 
     let thinking = profile
@@ -648,7 +651,8 @@ pub async fn open_generic(ctx: &ToolContext, opts: GenericOptions) -> Result<Sub
         ),
         None => reserve_fresh(ctx, ids.task_id.clone(), None)?,
     };
-    let (model, provider) = resolve_provider(ctx, opts.model_spec.as_deref()).await?;
+    let model_binding = opts.model_spec.map(Binding::Exact);
+    let (model, provider) = resolve_provider(ctx, model_binding.as_ref()).await?;
     announce_model(ctx, &model);
     build(
         ctx,
@@ -738,17 +742,25 @@ fn reserve_fresh(
 
 async fn resolve_provider(
     ctx: &ToolContext,
-    model_spec: Option<&str>,
+    binding_override: Option<&Binding>,
 ) -> Result<(Model, Arc<dyn provider::Provider>), String> {
-    let Some(spec) = model_spec else {
-        return Ok((Model::clone(&ctx.model), Arc::clone(&ctx.provider)));
-    };
-    let mut model =
-        Model::from_spec_with_policy(spec, &ctx.model_policy).map_err(|error| error.to_string())?;
-    let provider = provider::from_model_async(&mut model, ctx.timeouts)
-        .await
-        .map_err(|error| error.to_string())?;
-    Ok((model, Arc::from(provider)))
+    let (provider, model) = resolve_model_for_purpose(
+        ModelRoute {
+            provider: &ctx.provider,
+            model: &ctx.model,
+        },
+        ModelRoute {
+            provider: &ctx.chat_provider,
+            model: &ctx.chat_model,
+        },
+        ModelPurpose::Subagent,
+        binding_override,
+        ctx.timeouts,
+        &ctx.model_policy,
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    Ok((model, provider))
 }
 
 /// A standalone task shows its model via `SubagentInfo` on the header; a
@@ -822,6 +834,8 @@ fn build(
         params: AgentParams {
             provider: resolved.provider,
             model: resolved.model,
+            chat_provider: Arc::clone(&ctx.chat_provider),
+            chat_model: Model::clone(&ctx.chat_model),
             config: ctx.config.clone(),
             tool_output_lines: caudra_config::ToolOutputLines::default(),
             permissions: Arc::clone(&ctx.permissions),
@@ -908,6 +922,7 @@ mod tests {
     const PARENT_WORKFLOW_RUN: &str = "wf-parent";
     const PARENT_ID: &str = "task-1";
     const TOOL_ID: &str = "toolu_01";
+    const PLAN_MODEL_SPEC: &str = "openai/gpt-5.4";
     const COLLIDING_SUBAGENT_NAME: &str = "collision";
     const INHERITED_PROFILE: &str = "parent-default";
     const SUBAGENT_SYSTEM: &str = "system";
@@ -952,6 +967,66 @@ mod tests {
             mcp: Some(false),
             local_tools: LocalTools::default(),
         }
+    }
+
+    #[test_case(false ; "unbound_global")]
+    #[test_case(true ; "exact_same_model")]
+    fn generic_subagent_reuses_the_parent_when_resolution_keeps_its_model(exact: bool) {
+        smol::block_on(async {
+            let ctx = crate::tools::test_support::stub_ctx(&AgentMode::Build);
+            let mut options = generic_options();
+            options.model_spec = exact.then(|| ctx.model.spec());
+
+            let mut subagent = open_generic(&ctx, options).await.unwrap();
+
+            assert_eq!(subagent.params.model.spec(), ctx.model.spec());
+            assert!(Arc::ptr_eq(&subagent.params.provider, &ctx.provider));
+            subagent.close();
+        });
+    }
+
+    #[test]
+    fn nested_subagent_keeps_the_selected_chat_anchor() {
+        smol::block_on(async {
+            let mut ctx = crate::tools::test_support::stub_ctx(&AgentMode::Build);
+            let chat_model = Arc::clone(&ctx.chat_model);
+            ctx.model = Arc::new(Model::from_spec(PLAN_MODEL_SPEC).unwrap());
+
+            let mut subagent = open_generic(&ctx, generic_options()).await.unwrap();
+
+            assert_eq!(subagent.params.model.spec(), ctx.model.spec());
+            assert_eq!(subagent.params.chat_model.spec(), chat_model.spec());
+            assert!(Arc::ptr_eq(
+                &subagent.params.chat_provider,
+                &ctx.chat_provider
+            ));
+            subagent.close();
+        });
+    }
+
+    #[test_case(SubagentTaskMode::Plan ; "plan")]
+    #[test_case(SubagentTaskMode::Build ; "build")]
+    fn task_mode_does_not_select_the_subagent_model(mode: SubagentTaskMode) {
+        smol::block_on(async {
+            let ctx = crate::tools::test_support::stub_ctx(&AgentMode::Build);
+            let mut subagent = open_task(
+                &ctx,
+                TaskOptions {
+                    name: COLLIDING_SUBAGENT_NAME.into(),
+                    task_id: TaskIdentity::Derive,
+                    profile: Some(crate::prompt::profile::BUILTIN_PROFILE_NAME.into()),
+                    mode: Some(mode),
+                    local_definitions: Vec::new(),
+                    local_tools: LocalTools::default(),
+                },
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(subagent.params.model.spec(), ctx.model.spec());
+            assert!(Arc::ptr_eq(&subagent.params.provider, &ctx.provider));
+            subagent.close();
+        });
     }
 
     #[test]

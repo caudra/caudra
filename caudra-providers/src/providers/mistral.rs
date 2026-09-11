@@ -4,7 +4,7 @@ use caudra_storage::id::SessionRef;
 use flume::Sender;
 use serde_json::{Value, json};
 
-use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelPurpose, ThinkingSupport};
+use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ThinkingSupport};
 use crate::provider::{BoxFuture, Provider};
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
 
@@ -60,7 +60,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
                 "mistral-medium-3-5",
                 "mistral-medium-2604",
             ],
-            purpose: ModelPurpose::Best,
+            small: false,
             family: ModelFamily::Generic,
             vision: true,
             default: true,
@@ -78,7 +78,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["glm-5-2", "zai-glm-5-2"],
-            purpose: ModelPurpose::Best,
+            small: false,
             family: ModelFamily::Glm,
             vision: false,
             default: false,
@@ -96,10 +96,10 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["mistral-small-latest", "mistral-small-2603"],
-            purpose: ModelPurpose::Balanced,
+            small: false,
             family: ModelFamily::Generic,
             vision: true,
-            default: true,
+            default: false,
             pricing: ModelPricing {
                 input: 0.15,
                 output: 0.60,
@@ -114,7 +114,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["ministral-14b-latest", "ministral-14b-2512"],
-            purpose: ModelPurpose::Fast,
+            small: true,
             family: ModelFamily::Generic,
             vision: false,
             default: true,

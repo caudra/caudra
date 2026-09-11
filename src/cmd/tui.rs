@@ -461,7 +461,8 @@ fn merge_prompt(flag: Option<String>, piped: Option<String>) -> Option<String> {
 
 pub fn run(mut cli: Cli) -> Result<ExitCode> {
     let persistent_storage = StateDir::resolve().context("resolve data directory")?;
-    caudra_providers::model_registry::load_from_storage(&persistent_storage);
+    caudra_providers::model_registry::load_from_storage(&persistent_storage)
+        .context("load model purpose bindings")?;
 
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
 

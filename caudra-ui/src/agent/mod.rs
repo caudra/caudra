@@ -44,11 +44,12 @@ pub(crate) struct ModelSlot {
     pub(crate) provider: Arc<dyn Provider>,
 }
 
-/// Every input the provider hashes into its cache prefix, published as one
-/// unit. Swapping system and tools separately could pair a stale system with
-/// fresh tools, which is exactly the mismatch that costs `/btw` a cache hit.
-#[derive(Default)]
+/// The complete `/btw` request prefix and the route that built it, published
+/// as one unit so a model switch cannot pair a new provider with stale tools
+/// or system text.
 pub(crate) struct BtwPrompt {
+    pub(crate) provider: Arc<dyn Provider>,
+    pub(crate) model: Model,
     pub(crate) system: String,
     pub(crate) tools: Value,
     pub(crate) opts: RequestOptions,
@@ -81,6 +82,8 @@ pub(crate) struct AgentHandles {
     pub(crate) history: SharedHistory,
     pub(crate) btw_prompt: SharedBtwPrompt,
     pub(crate) context_store: ContextStore,
+    /// Resolved for the active lane without replacing the selected Chat slot.
+    pub(crate) effective_model_slot: Arc<ArcSwap<ModelSlot>>,
     pub(crate) mcp_handle: Option<McpHandle>,
     pub(crate) mcp_config_errors: McpConfigErrors,
     pub(crate) queue: QueueSender,
@@ -169,6 +172,7 @@ impl AgentHandles {
         app.forget_merged_history();
         app.btw_prompt = Some(Arc::clone(&self.btw_prompt));
         app.context_store = Some(self.context_store.clone());
+        app.effective_model_slot = Some(Arc::clone(&self.effective_model_slot));
         app.queue.set_shared(self.queue.clone());
         if self.goal.status().is_none() {
             match app.state.goal.status() {
@@ -376,7 +380,14 @@ fn spawn_agent_internal(
     let shared_history: SharedHistory = Arc::new(ArcSwap::from_pointee(HistorySnapshot::new(
         initial_history.clone(),
     )));
-    let btw_prompt: SharedBtwPrompt = Arc::new(ArcSwap::from_pointee(BtwPrompt::default()));
+    let initial_model = model_slot.load();
+    let btw_prompt: SharedBtwPrompt = Arc::new(ArcSwap::from_pointee(BtwPrompt {
+        provider: Arc::clone(&initial_model.provider),
+        model: initial_model.model.clone(),
+        system: String::new(),
+        tools: Value::Null,
+        opts: RequestOptions::default(),
+    }));
     let context_store = ContextStore::new();
     let context_publisher = context_store.publisher(ContextKey::Main);
     let (init_trigger, init_cancel) = CancelToken::new();
@@ -391,6 +402,10 @@ fn spawn_agent_internal(
             .as_ref()
             .map_or(BUILTIN_PROFILE_NAME, |profile| profile.name()),
     );
+    let effective_model_slot = match &workflow {
+        WorkflowSlot::Reuse(current) => current.effective_model_slot(),
+        WorkflowSlot::Fresh(_) => Arc::new(ArcSwap::new(model_slot.load_full())),
+    };
     // Before the loop, so its `workflow` tool reaches the runtime from the
     // first turn.
     let workflow = match workflow {
@@ -403,6 +418,7 @@ fn spawn_agent_internal(
                         state_dir,
                         session_id: session_id.id(),
                         model_slot,
+                        effective_model_slot: &effective_model_slot,
                         config: &config,
                         tool_output_lines,
                         permissions,
@@ -434,6 +450,7 @@ fn spawn_agent_internal(
 
     let agent_loop = AgentLoop::new(
         Arc::clone(model_slot),
+        Arc::clone(&effective_model_slot),
         config,
         tool_output_lines,
         initial_history,
@@ -475,6 +492,7 @@ fn spawn_agent_internal(
         history: shared_history,
         btw_prompt,
         context_store,
+        effective_model_slot,
         mcp_handle,
         mcp_config_errors,
         queue: queue_tx,

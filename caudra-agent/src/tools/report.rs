@@ -14,7 +14,7 @@ pub const REASON_COMPANION: &str = "always on (internal companion)";
 pub const REASON_NO_SUBSCRIPTION: &str = "no ChatGPT subscription";
 pub const REASON_OTHER_EDITOR: &str = "model uses the other editing tool";
 pub const REASON_DEFERRED: &str = "deferred behind tool_search";
-pub const REASON_EAGER_CLASS: &str = "declared upfront on a balanced or best model";
+pub const REASON_EAGER_CLASS: &str = "declared upfront on a known non-small model";
 pub const REASON_EAGER_CONFIG: &str = "lazy loading disabled by config";
 /// `tool_search` has no registry entry. The request array grows one whenever
 /// something is deferred, so every listing derives the row from that rather

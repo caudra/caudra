@@ -4,7 +4,7 @@ mod platform;
 
 pub use platform::Xai;
 
-use crate::model::{ModelEntry, ModelFamily, ModelPricing, ModelPurpose, StaticReasoningOption};
+use crate::model::{ModelEntry, ModelFamily, ModelPricing, StaticReasoningOption};
 
 const GROK_CONTEXT_WINDOW: u32 = 500_000;
 const GROK_4_3_CONTEXT_WINDOW: u32 = 1_000_000;
@@ -37,7 +37,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
     const MODELS: &[ModelEntry] = &[
         ModelEntry {
             prefixes: &["grok-4.6"],
-            purpose: ModelPurpose::Best,
+            small: false,
             family: ModelFamily::Generic,
             vision: true,
             default: true,
@@ -55,7 +55,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["grok-4.5"],
-            purpose: ModelPurpose::Best,
+            small: false,
             family: ModelFamily::Generic,
             vision: true,
             default: false,
@@ -73,10 +73,10 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["grok-4.3"],
-            purpose: ModelPurpose::Balanced,
+            small: false,
             family: ModelFamily::Generic,
             vision: true,
-            default: true,
+            default: false,
             pricing: ModelPricing {
                 input: 1.25,
                 output: 2.50,
@@ -99,19 +99,11 @@ mod tests {
 
     use super::*;
 
-    #[test_case("grok-4.6", ModelPurpose::Best, 2.0, 6.0, 0.5, GROK_CONTEXT_WINDOW)]
-    #[test_case("grok-4.5", ModelPurpose::Best, 2.0, 6.0, 0.5, GROK_CONTEXT_WINDOW)]
-    #[test_case(
-        "grok-4.3",
-        ModelPurpose::Balanced,
-        1.25,
-        2.5,
-        0.2,
-        GROK_4_3_CONTEXT_WINDOW
-    )]
+    #[test_case("grok-4.6", 2.0, 6.0, 0.5, GROK_CONTEXT_WINDOW)]
+    #[test_case("grok-4.5", 2.0, 6.0, 0.5, GROK_CONTEXT_WINDOW)]
+    #[test_case("grok-4.3", 1.25, 2.5, 0.2, GROK_4_3_CONTEXT_WINDOW)]
     fn curated_models_have_expected_metadata(
         model_id: &str,
-        purpose: ModelPurpose,
         input: f64,
         output: f64,
         cache_read: f64,
@@ -122,7 +114,7 @@ mod tests {
             .find(|model| model.prefixes.contains(&model_id))
             .expect("curated xAI model should be registered");
 
-        assert_eq!(model.purpose, purpose);
+        assert!(!model.small);
         assert!(model.vision);
         assert_eq!(model.context_window, context_window);
         assert_eq!(model.max_output_tokens, Some(GROK_MAX_OUTPUT_TOKENS));

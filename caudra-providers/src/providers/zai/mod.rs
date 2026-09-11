@@ -7,7 +7,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use tracing::warn;
 
-use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelPurpose, ThinkingSupport};
+use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ThinkingSupport};
 use crate::provider::{BoxFuture, Provider};
 use crate::providers::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 use crate::{
@@ -113,7 +113,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
     const MODELS: &[ModelEntry] = &[
         ModelEntry {
             prefixes: &["glm-5-code"],
-            purpose: ModelPurpose::Best,
+            small: false,
             family: ModelFamily::Glm,
             vision: false,
             default: true,
@@ -131,7 +131,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["glm-5.2"],
-            purpose: ModelPurpose::Best,
+            small: false,
             family: ModelFamily::Glm,
             vision: false,
             default: false,
@@ -149,7 +149,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["glm-5.1", "glm-5"],
-            purpose: ModelPurpose::Best,
+            small: false,
             family: ModelFamily::Glm,
             vision: false,
             default: false,
@@ -167,7 +167,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["glm-4.7-flash"],
-            purpose: ModelPurpose::Fast,
+            small: true,
             family: ModelFamily::Glm,
             vision: false,
             default: true,
@@ -185,10 +185,10 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["glm-4.7", "glm-4.6"],
-            purpose: ModelPurpose::Balanced,
+            small: false,
             family: ModelFamily::Glm,
             vision: false,
-            default: true,
+            default: false,
             pricing: ModelPricing {
                 input: 0.60,
                 output: 2.20,
@@ -203,7 +203,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["glm-4.5-flash"],
-            purpose: ModelPurpose::Fast,
+            small: true,
             family: ModelFamily::Glm,
             vision: false,
             default: false,
@@ -221,7 +221,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["glm-4.5-air"],
-            purpose: ModelPurpose::Fast,
+            small: true,
             family: ModelFamily::Glm,
             vision: false,
             default: false,
@@ -239,7 +239,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["glm-4.5"],
-            purpose: ModelPurpose::Balanced,
+            small: false,
             family: ModelFamily::Glm,
             vision: false,
             default: false,

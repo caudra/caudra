@@ -14,7 +14,9 @@ use super::ResolvedAuth;
 use super::openai::responses;
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 use crate::manifest::ManifestRegistry;
-use crate::model::{Billing, FastPricing, Model, ModelFamily, ModelPricing, ThinkingSupport};
+use crate::model::{
+    Billing, FastPricing, Model, ModelFacts, ModelFamily, ModelPricing, ThinkingSupport,
+};
 use crate::provider::{BoxFuture, Provider, ProviderKind};
 use crate::providers::Timeouts;
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig};
@@ -114,14 +116,37 @@ pub fn declared_purpose(slug: &str, purpose: ModelPurpose) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Whether `slug` declares `model_id` under `purpose`. Prefix-matched, so one
-/// declaration covers a whole family of fine-tunes and a picker can label every
-/// one of them rather than only the id that wins the slot.
-pub fn declares_purpose(slug: &str, purpose: ModelPurpose, model_id: &str) -> bool {
-    ProvidersConfig::load()
-        .get(slug)
-        .and_then(|def| def.purposes.get(&purpose))
-        .is_some_and(|models| models.matches(model_id))
+/// Facts declared in `providers.toml`. Each lane is declaration-ordered, so its
+/// first matching prefix determines whether the model is that lane's default;
+/// the more specific match wins when Fast and Best overlap.
+pub fn facts_for_model(slug: &str, model_id: &str) -> Option<ModelFacts> {
+    let config = ProvidersConfig::load();
+    let def = config.get(slug)?;
+    facts_from_def(def, model_id)
+}
+
+fn facts_from_def(def: &ProviderDef, model_id: &str) -> Option<ModelFacts> {
+    ModelPurpose::CLASSES
+        .into_iter()
+        .filter_map(|purpose| {
+            def.purposes.get(&purpose).and_then(|models| {
+                models
+                    .iter()
+                    .enumerate()
+                    .find(|(_, prefix)| model_id.starts_with(prefix))
+                    .map(|(index, prefix)| {
+                        (
+                            prefix.len(),
+                            ModelFacts {
+                                small: purpose == ModelPurpose::Fast,
+                                default: index == 0,
+                            },
+                        )
+                    })
+            })
+        })
+        .max_by_key(|(prefix_len, _)| *prefix_len)
+        .map(|(_, facts)| facts)
 }
 
 /// A `providers.toml` entry whose id matches no live model silently voids every
@@ -359,7 +384,7 @@ impl Provider for CustomOpenAiProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::ModelInfo;
+    use crate::model::{ModelInfo, ModelMarker};
     use crate::types::ThinkingConfig;
 
     const ANTHROPIC_KEY_LEAKED: &str =
@@ -370,6 +395,48 @@ mod tests {
             r#"{{"protocol":"openai","models":[{{"id":"{model_id}"}}]}}"#
         ))
         .unwrap()
+    }
+
+    fn purpose_def() -> ProviderDef {
+        serde_json::from_str(
+            r#"{
+                "purposes": {
+                    "fast": ["small", "small-special", "tiny"],
+                    "best": ["large", "medium"]
+                }
+            }"#,
+        )
+        .unwrap()
+    }
+
+    #[test_case::test_case("small-v2", true, true, Some(ModelMarker::Fast) ; "small_default")]
+    #[test_case::test_case("tiny-v2", true, false, Some(ModelMarker::Small) ; "small_non_default")]
+    #[test_case::test_case("large-v2", false, true, Some(ModelMarker::Best) ; "non_small_default")]
+    #[test_case::test_case("medium-v2", false, false, None ; "non_small_non_default")]
+    fn custom_facts_preserve_lane_and_default(
+        model_id: &str,
+        small: bool,
+        default: bool,
+        marker: Option<ModelMarker>,
+    ) {
+        let facts = facts_from_def(&purpose_def(), model_id).unwrap();
+
+        assert_eq!(facts.small, small);
+        assert_eq!(facts.default, default);
+        assert_eq!(facts.marker(), marker);
+    }
+
+    #[test]
+    fn custom_default_comes_from_the_first_matching_prefix() {
+        let facts = facts_from_def(&purpose_def(), "small-special-v2").unwrap();
+
+        assert_eq!(
+            facts,
+            ModelFacts {
+                small: true,
+                default: true,
+            }
+        );
     }
 
     /// The protocol says how to frame the request, never what the weights are:

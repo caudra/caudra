@@ -9,9 +9,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::warn;
 
-use crate::model::{
-    Model, ModelEntry, ModelFamily, ModelPricing, ModelPurpose, StaticReasoningOption,
-};
+use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, StaticReasoningOption};
 use crate::provider::{BoxFuture, Provider};
 use crate::{
     AgentError, ContentBlock, Message, ProviderEvent, RequestOptions, Role, StopReason,
@@ -39,7 +37,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
     const MODELS: &[ModelEntry] = &[
         ModelEntry {
             prefixes: &["gemini-2.5-pro"],
-            purpose: ModelPurpose::Best,
+            small: false,
             family: ModelFamily::Gemini,
             vision: true,
             default: true,
@@ -60,10 +58,10 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["gemini-2.5-flash"],
-            purpose: ModelPurpose::Balanced,
+            small: false,
             family: ModelFamily::Gemini,
             vision: true,
-            default: true,
+            default: false,
             pricing: ModelPricing {
                 input: 0.15,
                 output: 0.60,
@@ -84,7 +82,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["gemini-2.0-flash-lite"],
-            purpose: ModelPurpose::Fast,
+            small: true,
             family: ModelFamily::Gemini,
             vision: true,
             default: true,

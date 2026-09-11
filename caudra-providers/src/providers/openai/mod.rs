@@ -5,7 +5,7 @@ pub(crate) mod responses;
 
 pub use platform::OpenAi;
 
-use crate::model::{ModelEntry, ModelFamily, ModelPricing, ModelPurpose, StaticReasoningOption};
+use crate::model::{ModelEntry, ModelFamily, ModelPricing, StaticReasoningOption};
 
 const GPT_5_6_CONTEXT_WINDOW: u32 = 372_000;
 const GPT_5_6_MAX_OUTPUT_TOKENS: u32 = 128_000;
@@ -42,7 +42,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
     const MODELS: &[ModelEntry] = &[
         ModelEntry {
             prefixes: &["gpt-5.6-luna"],
-            purpose: ModelPurpose::Fast,
+            small: true,
             family: ModelFamily::Gpt,
             vision: true,
             default: true,
@@ -60,10 +60,10 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["gpt-5.6-terra"],
-            purpose: ModelPurpose::Balanced,
+            small: false,
             family: ModelFamily::Gpt,
             vision: true,
-            default: true,
+            default: false,
             pricing: ModelPricing {
                 input: 2.50,
                 output: 15.00,
@@ -78,7 +78,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["gpt-5.6-sol"],
-            purpose: ModelPurpose::Best,
+            small: false,
             family: ModelFamily::Gpt,
             vision: true,
             default: true,
@@ -96,7 +96,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["gpt-5.4-nano"],
-            purpose: ModelPurpose::Fast,
+            small: true,
             family: ModelFamily::Gpt,
             vision: true,
             default: false,
@@ -114,7 +114,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["gpt-5.4-mini"],
-            purpose: ModelPurpose::Fast,
+            small: true,
             family: ModelFamily::Gpt,
             vision: true,
             default: false,
@@ -132,7 +132,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["gpt-4.1-nano"],
-            purpose: ModelPurpose::Fast,
+            small: true,
             family: ModelFamily::Gpt,
             vision: true,
             default: false,
@@ -150,7 +150,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["gpt-4.1-mini"],
-            purpose: ModelPurpose::Balanced,
+            small: false,
             family: ModelFamily::Gpt,
             vision: true,
             default: false,
@@ -168,7 +168,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["gpt-4.1"],
-            purpose: ModelPurpose::Balanced,
+            small: false,
             family: ModelFamily::Gpt,
             vision: true,
             default: false,
@@ -186,7 +186,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["o4-mini"],
-            purpose: ModelPurpose::Balanced,
+            small: false,
             family: ModelFamily::Gpt,
             vision: true,
             default: false,
@@ -204,7 +204,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["gpt-5.5"],
-            purpose: ModelPurpose::Best,
+            small: false,
             family: ModelFamily::Gpt,
             vision: true,
             default: false,
@@ -222,7 +222,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["gpt-5.4"],
-            purpose: ModelPurpose::Best,
+            small: false,
             family: ModelFamily::Gpt,
             vision: true,
             default: false,
@@ -240,7 +240,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["o3"],
-            purpose: ModelPurpose::Best,
+            small: false,
             family: ModelFamily::Gpt,
             vision: true,
             default: false,
@@ -258,7 +258,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["gpt-5.3-codex"],
-            purpose: ModelPurpose::Best,
+            small: false,
             family: ModelFamily::Gpt,
             vision: true,
             default: false,
@@ -276,7 +276,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["gpt-5.2-codex"],
-            purpose: ModelPurpose::Best,
+            small: false,
             family: ModelFamily::Gpt,
             vision: true,
             default: false,
@@ -294,7 +294,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["gpt-5.2"],
-            purpose: ModelPurpose::Best,
+            small: false,
             family: ModelFamily::Gpt,
             vision: true,
             default: false,
@@ -312,7 +312,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["gpt-5.1-codex-mini"],
-            purpose: ModelPurpose::Balanced,
+            small: false,
             family: ModelFamily::Gpt,
             vision: true,
             default: false,
@@ -330,7 +330,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["gpt-5.1-codex-max"],
-            purpose: ModelPurpose::Best,
+            small: false,
             family: ModelFamily::Gpt,
             vision: true,
             default: false,
@@ -348,7 +348,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["gpt-5.1-codex"],
-            purpose: ModelPurpose::Best,
+            small: false,
             family: ModelFamily::Gpt,
             vision: true,
             default: false,
@@ -374,12 +374,12 @@ mod tests {
 
     use super::*;
 
-    #[test_case("gpt-5.6-luna", ModelPurpose::Fast, 1.0, 0.1, 1.25, 6.0)]
-    #[test_case("gpt-5.6-terra", ModelPurpose::Balanced, 2.5, 0.25, 3.125, 15.0)]
-    #[test_case("gpt-5.6-sol", ModelPurpose::Best, 5.0, 0.5, 6.25, 30.0)]
+    #[test_case("gpt-5.6-luna", true, 1.0, 0.1, 1.25, 6.0)]
+    #[test_case("gpt-5.6-terra", false, 2.5, 0.25, 3.125, 15.0)]
+    #[test_case("gpt-5.6-sol", false, 5.0, 0.5, 6.25, 30.0)]
     fn gpt_5_6_models_have_expected_tier_and_short_context_pricing(
         model_id: &str,
-        purpose: ModelPurpose,
+        small: bool,
         input: f64,
         cache_read: f64,
         cache_write: f64,
@@ -390,7 +390,7 @@ mod tests {
             .find(|model| model.prefixes.contains(&model_id))
             .expect("GPT-5.6 model should be registered");
 
-        assert_eq!(model.purpose, purpose);
+        assert_eq!(model.small, small);
         assert_eq!(model.context_window, GPT_5_6_CONTEXT_WINDOW);
         assert_eq!(model.pricing.input, input);
         assert_eq!(model.pricing.cache_read, cache_read);

@@ -9,7 +9,7 @@ use caudra_config::ModelPolicy;
 #[cfg(test)]
 use caudra_config::ToolKey;
 use caudra_providers::Timeouts;
-use caudra_providers::model::Model;
+use caudra_providers::model::{Model, ModelPurpose};
 use caudra_providers::provider::{self, Provider};
 #[cfg(test)]
 use caudra_providers::{ContentBlock, Message, Role};
@@ -44,10 +44,10 @@ use crate::tools::{
 };
 use crate::workflow::{RuntimeDeps, WorkflowHandle, WorkflowRuntime};
 use crate::{
-    Agent, AgentConfig, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, DoneReason,
-    Envelope, EventSender, GoalHandle, ImageSource, McpHandle, McpSession, PermissionsConfig,
-    SessionMailbox, StoredSession, SubagentHistorySnapshot, SubagentHistoryStore, ToolOutput,
-    ToolOutputLines, open_stored_session,
+    Agent, AgentConfig, AgentError, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams,
+    DoneReason, Envelope, EventSender, GoalHandle, ImageSource, McpHandle, McpSession,
+    PermissionsConfig, SessionMailbox, StoredSession, SubagentHistorySnapshot,
+    SubagentHistoryStore, ToolOutput, ToolOutputLines, open_stored_session,
 };
 
 /// Bytes of a run's report or result carried into the next prompt.
@@ -632,6 +632,7 @@ struct AgentSetup {
 
 struct TaskDescriptionContext<'a> {
     prompt_profiles: &'a PromptProfileCatalog,
+    chat_model: &'a Model,
     thinking: &'a crate::ThinkingConfig,
     model_policy: &'a ModelPolicy,
     timeouts: Timeouts,
@@ -665,6 +666,39 @@ fn setup(
     }
 }
 
+fn main_turn_purpose(mode: &AgentMode) -> Option<ModelPurpose> {
+    matches!(mode, AgentMode::Plan(_)).then_some(ModelPurpose::Plan)
+}
+
+async fn resolve_main_turn_model(
+    mode: &AgentMode,
+    chat_provider: &Arc<dyn Provider>,
+    chat_model: &Model,
+    timeouts: Timeouts,
+    model_policy: &ModelPolicy,
+) -> Result<(Arc<dyn Provider>, Model), AgentError> {
+    match main_turn_purpose(mode) {
+        Some(purpose) => {
+            agent::resolve_model_for_purpose(
+                agent::ModelRoute {
+                    provider: chat_provider,
+                    model: chat_model,
+                },
+                agent::ModelRoute {
+                    provider: chat_provider,
+                    model: chat_model,
+                },
+                purpose,
+                None,
+                timeouts,
+                model_policy,
+            )
+            .await
+        }
+        None => Ok((Arc::clone(chat_provider), chat_model.clone())),
+    }
+}
+
 /// Base definitions only, split into declared and deferred. MCP definitions
 /// are injected per request by `Agent::request_tools`; storing them here would
 /// freeze the catalog.
@@ -678,9 +712,13 @@ fn tool_definitions(
     task: TaskDescriptionContext<'_>,
 ) -> ToolDefinitions {
     let filter = ToolFilter::from_config(config, model, excluded_tools);
-    let bindings =
-        task.prompt_profiles
-            .bind_for_tasks(model, task.thinking, task.model_policy, task.timeouts);
+    let bindings = task.prompt_profiles.bind_for_tasks(
+        model,
+        task.chat_model,
+        task.thinking,
+        task.model_policy,
+        task.timeouts,
+    );
     let vars = vars.clone().set(
         "{task_system_prompt_profiles}",
         bindings.task_tool_summary("Caudra's built-in task prompt"),
@@ -742,6 +780,7 @@ pub fn spawn(mut params: HeadlessParams) -> HeadlessHandle {
         false,
         TaskDescriptionContext {
             prompt_profiles: &params.prompt_profiles,
+            chat_model: &params.model,
             thinking: &params.thinking,
             model_policy: &params.model_policy,
             timeouts: params.timeouts,
@@ -796,8 +835,10 @@ pub fn spawn(mut params: HeadlessParams) -> HeadlessHandle {
             let mut history = History::new(Vec::new());
             let mut agent = Agent::new(
                 AgentParams {
-                    provider,
-                    model,
+                    provider: Arc::clone(&provider),
+                    model: model.clone(),
+                    chat_provider: provider,
+                    chat_model: model,
                     config: params.config,
                     tool_output_lines: ToolOutputLines::default(),
                     permissions: Arc::new(PermissionManager::new_persistent(
@@ -922,12 +963,46 @@ pub struct InteractiveHandle {
     pub answer_tx: flume::Sender<String>,
     pub cancel_tx: flume::Sender<()>,
     pub model_tx: flume::Sender<Model>,
+    pub model_route: Option<InteractiveModelRoute>,
     pub session_id: SessionRef,
     pub session_lease: Arc<SessionLease>,
     pub permissions: Arc<PermissionManager>,
     /// The session's workflow runtime, when `workflow_mode` asked for one.
     pub workflow: Option<WorkflowHandle>,
     pub task: smol::Task<()>,
+}
+
+type LiveModel = (Arc<dyn Provider>, Arc<Model>);
+
+#[derive(Clone)]
+pub struct InteractiveModelRoute {
+    model: Arc<ArcSwap<LiveModel>>,
+    timeouts: Timeouts,
+}
+
+impl InteractiveModelRoute {
+    fn install(&self, provider: Arc<dyn Provider>, model: Model) {
+        self.model.store(Arc::new((provider, Arc::new(model))));
+    }
+
+    async fn set(&self, mut model: Model) -> Result<Model, AgentError> {
+        let provider = provider::from_model_async(&mut model, self.timeouts).await?;
+        self.install(Arc::from(provider), model.clone());
+        Ok(model)
+    }
+}
+
+impl InteractiveHandle {
+    pub async fn set_model(&self, model: Model) -> Result<Model, AgentError> {
+        let model = match &self.model_route {
+            Some(route) => route.set(model).await?,
+            None => model,
+        };
+        self.model_tx
+            .send(model.clone())
+            .map_err(|_| AgentError::Channel)?;
+        Ok(model)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -999,7 +1074,7 @@ pub async fn spawn_prepared_interactive(prepared: PreparedInteractive) -> Intera
         instructions,
         tools,
         deferred,
-        mut tool_filter,
+        tool_filter,
     } = setup(
         &model,
         &params.config,
@@ -1007,6 +1082,7 @@ pub async fn spawn_prepared_interactive(prepared: PreparedInteractive) -> Intera
         workflows_available,
         TaskDescriptionContext {
             prompt_profiles: &params.prompt_profiles,
+            chat_model: &model,
             thinking: &params.thinking,
             model_policy: &params.model_policy,
             timeouts: params.timeouts,
@@ -1060,6 +1136,8 @@ pub async fn spawn_prepared_interactive(prepared: PreparedInteractive) -> Intera
     let base = AgentParams {
         provider: Arc::clone(&provider),
         model: model.clone(),
+        chat_provider: Arc::clone(&provider),
+        chat_model: model.clone(),
         config: params.config.clone(),
         tool_output_lines: ToolOutputLines::default(),
         permissions: Arc::clone(&permissions),
@@ -1129,6 +1207,10 @@ pub async fn spawn_prepared_interactive(prepared: PreparedInteractive) -> Intera
         None => None,
     };
     let workflow = runtime.as_ref().map(WorkflowRuntime::handle);
+    let model_route = workflow.as_ref().map(|_| InteractiveModelRoute {
+        model: Arc::clone(&live_model),
+        timeouts: params.timeouts,
+    });
     let base = AgentParams {
         workflow: workflow.clone(),
         ..base
@@ -1137,6 +1219,7 @@ pub async fn spawn_prepared_interactive(prepared: PreparedInteractive) -> Intera
     let task = smol::spawn({
         let permissions = Arc::clone(&permissions);
         let workflow = workflow.clone();
+        let live_model = Arc::clone(&live_model);
         async move {
             let event_forwarder = smol::spawn({
                 let store = Arc::clone(&store);
@@ -1200,28 +1283,54 @@ pub async fn spawn_prepared_interactive(prepared: PreparedInteractive) -> Intera
                     .filter(|candidate| params.model_policy.allows(&candidate.spec()))
                     && new_model.spec() != model.spec()
                 {
-                    match provider::from_model_async(&mut new_model, params.timeouts).await {
-                        Ok(p) => {
-                            provider = Arc::from(p);
-                            tool_filter = ToolFilter::from_config(
-                                &params.config,
-                                &new_model,
-                                &params.excluded_tools,
-                            );
-                            model = new_model;
-                            live_model
-                                .store(Arc::new((Arc::clone(&provider), Arc::new(model.clone()))));
-                        }
-                        Err(e) => {
-                            error!(error = %e, "provider error");
-                            let _ = error_tx.send(AgentEvent::Error {
-                                message: e.user_message(),
-                            });
-                            run_id += 1;
-                            continue;
+                    let routed = live_model.load_full();
+                    if routed.1.spec() == new_model.spec() {
+                        provider = Arc::clone(&routed.0);
+                        model = Model::clone(&routed.1);
+                    } else {
+                        match provider::from_model_async(&mut new_model, params.timeouts).await {
+                            Ok(p) => {
+                                provider = Arc::from(p);
+                                model = new_model;
+                                live_model.store(Arc::new((
+                                    Arc::clone(&provider),
+                                    Arc::new(model.clone()),
+                                )));
+                            }
+                            Err(e) => {
+                                error!(error = %e, "provider error");
+                                let _ = error_tx.send(AgentEvent::Error {
+                                    message: e.user_message(),
+                                });
+                                run_id += 1;
+                                continue;
+                            }
                         }
                     }
                 }
+
+                let (turn_provider, turn_model) = match resolve_main_turn_model(
+                    &input.mode,
+                    &provider,
+                    &model,
+                    params.timeouts,
+                    &params.model_policy,
+                )
+                .await
+                {
+                    Ok(resolved) => resolved,
+                    Err(e) => {
+                        error!(error = %e, "failed to resolve turn model");
+                        let _ = error_tx.send(AgentEvent::Error {
+                            message: e.user_message(),
+                        });
+                        cancel_task.cancel().await;
+                        run_id += 1;
+                        continue;
+                    }
+                };
+                let turn_tool_filter =
+                    ToolFilter::from_config(&params.config, &turn_model, &params.excluded_tools);
 
                 if let Some(workflow) = &workflow
                     && let Some(context) =
@@ -1232,13 +1341,14 @@ pub async fn spawn_prepared_interactive(prepared: PreparedInteractive) -> Intera
 
                 let definitions = tool_definitions(
                     &vars,
-                    &model,
+                    &turn_model,
                     &params.config,
                     &params.excluded_tools,
                     ToolRegistry::global(),
                     workflows_available,
                     TaskDescriptionContext {
                         prompt_profiles: &params.prompt_profiles,
+                        chat_model: &model,
                         thinking: &input.thinking,
                         model_policy: &params.model_policy,
                         timeouts: params.timeouts,
@@ -1255,7 +1365,7 @@ pub async fn spawn_prepared_interactive(prepared: PreparedInteractive) -> Intera
                     agent::build_system_prompt(
                         baseline.text(),
                         &params.prompt_slots,
-                        &tool_filter,
+                        &turn_tool_filter,
                         params.system_prompt_profile.as_deref(),
                     )
                 });
@@ -1268,16 +1378,18 @@ pub async fn spawn_prepared_interactive(prepared: PreparedInteractive) -> Intera
 
                 let mut agent = Agent::new(
                     AgentParams {
-                        provider: Arc::clone(&provider),
-                        model: model.clone(),
-                        tool_filter: tool_filter.clone(),
+                        provider: turn_provider,
+                        model: turn_model.clone(),
+                        chat_provider: Arc::clone(&provider),
+                        chat_model: model.clone(),
+                        tool_filter: turn_tool_filter,
                         subagent_cancels: Arc::new(CancelMap::new()),
                         ..base.clone()
                     },
                     AgentRunParams {
                         history: &mut history,
                         system,
-                        environment: Some(agent::environment_block(&vars, &model)),
+                        environment: Some(agent::environment_block(&vars, &turn_model)),
                         instructions,
                         event_tx,
                         tools: definitions.declared,
@@ -1343,6 +1455,7 @@ pub async fn spawn_prepared_interactive(prepared: PreparedInteractive) -> Intera
         answer_tx,
         cancel_tx,
         model_tx,
+        model_route,
         session_id: session_ref,
         session_lease,
         permissions,
@@ -1460,6 +1573,20 @@ mod tests {
     const SESSION_ID: &str = "CNK1hV6GWoysH3KQMm5wu";
     const CWD: &str = "/project";
     const MODEL_SPEC: &str = "anthropic/claude-test";
+
+    #[test_case(AgentMode::Build, None ; "build_uses_chat")]
+    #[test_case(AgentMode::ReadOnly, None ; "read_only_uses_chat")]
+    #[test_case(
+        AgentMode::Plan(PathBuf::from("plan.md")),
+        Some(ModelPurpose::Plan);
+        "plan_uses_plan"
+    )]
+    fn main_turn_model_purpose_depends_only_on_plan_mode(
+        mode: AgentMode,
+        expected: Option<ModelPurpose>,
+    ) {
+        assert_eq!(main_turn_purpose(&mode), expected);
+    }
 
     fn session_id() -> CaudraId {
         SESSION_ID.parse().unwrap()
@@ -2041,6 +2168,7 @@ complete(#{ report: first.output });
     const NO_RUNTIME: &str = "the session must attach a workflow runtime";
     const AGENT_NEVER_STARTED: &str = "the workflow agent never reached the provider";
     const REPORTED_ONCE: &str = "a completion is reported in one prompt only";
+    const UPDATED_MODEL_ID: &str = "updated-chat-model";
 
     /// Answers every request with `ANSWER`, or parks forever once built to
     /// hang. Each request's messages are kept, and `started` fires per
@@ -2049,6 +2177,7 @@ complete(#{ report: first.output });
         hang: bool,
         started: flume::Sender<()>,
         requests: std::sync::Mutex<Vec<Vec<Message>>>,
+        models: std::sync::Mutex<Vec<String>>,
     }
 
     impl ScriptedProvider {
@@ -2069,12 +2198,16 @@ complete(#{ report: first.output });
                 })
                 .collect()
         }
+
+        fn models(&self) -> Vec<String> {
+            self.models.lock().unwrap().clone()
+        }
     }
 
     impl Provider for ScriptedProvider {
         fn stream_message<'a>(
             &'a self,
-            _: &'a Model,
+            model: &'a Model,
             messages: &'a [Message],
             _: &'a str,
             _: &'a Value,
@@ -2084,6 +2217,7 @@ complete(#{ report: first.output });
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async move {
                 self.requests.lock().unwrap().push(messages.to_vec());
+                self.models.lock().unwrap().push(model.id.clone());
                 let _ = self.started.send(());
                 if self.hang {
                     futures_lite::future::pending().await
@@ -2138,6 +2272,7 @@ complete(#{ report: first.output });
                     hang,
                     started: started_tx,
                     requests: std::sync::Mutex::new(Vec::new()),
+                    models: std::sync::Mutex::new(Vec::new()),
                 }),
                 started,
                 _temp: temp,
@@ -2262,6 +2397,32 @@ complete(#{ report: first.output });
             prompt: None,
             resume: false,
         }
+    }
+
+    #[test]
+    fn workflow_model_route_updates_without_another_main_prompt() {
+        smol::block_on(async {
+            let session = WorkflowSession::new(false);
+            let handle = session.spawn(true).await;
+            let workflow = handle.workflow.clone().expect(NO_RUNTIME);
+            let route = handle.model_route.as_ref().expect(NO_RUNTIME);
+            let mut model = Model::from_spec(MODEL_SPEC).unwrap();
+            model.id = UPDATED_MODEL_ID.into();
+            route.install(Arc::clone(&session.provider) as Arc<dyn Provider>, model);
+
+            let run = trust_and_start(&workflow).await;
+            session
+                .started
+                .recv_async()
+                .await
+                .expect(AGENT_NEVER_STARTED);
+            wait_for_run(&handle.event_rx, &run.run_id, RunStatus::Completed).await;
+
+            assert_eq!(session.provider.models(), vec![UPDATED_MODEL_ID]);
+            let InteractiveHandle { input_tx, task, .. } = handle;
+            drop(input_tx);
+            task.await;
+        });
     }
 
     #[test]

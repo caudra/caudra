@@ -7,30 +7,53 @@ group = "Reference"
 
 # Providers
 
-Caudra talks to LLM providers over their HTTP APIs. Each workload resolves through a **purpose**: **Chat** is the conversation, **Fast**, **Balanced**, and **Best** name how much capability a caller is asking for, and **Title**, **Compact**, and **Goal** are the background workloads. Binding a purpose says which model serves it; leaving one unbound lets Caudra pick.
+Caudra talks to LLM providers over their HTTP APIs. Model jobs decide which configured or discovered model serves each kind of work.
 
-Open the model picker with `/model`. Use `Tab` and `Shift+Tab` to switch between Chat, Fast, Balanced, Best, Title, Compact, and Goal. `Enter` binds the highlighted row to the displayed purpose, and uppercase `R` clears the binding.
+## Model jobs
 
-A purpose is bound either to an exact `provider/model-id` or to another purpose, and every binding lives in the `model.purposes` row of Caudra's SQLite state database. Chat is the model the conversation runs on; the rest bind a workload.
+Caudra routes work through eight jobs: **Chat**, **Plan**, **Subagent**, **Compact**, **Title**, **Goal**, **Fast**, and **Best**. A global binding can pin a job to an exact `provider/model-id` or make it follow Chat, Plan, Fast, or Best. Explicit bindings report an error when their model is unavailable or disallowed.
 
-An unbound purpose is not an error, it just means the caller applies its own rule. Compact uses the chat model, because compaction reads the whole conversation and a small window cannot hold what it must summarize. Title and Goal follow Fast. Fast, Balanced, and Best ask the active provider: a `purposes` declaration in `providers.toml` first, then Caudra's curated table for that provider. Fast then tries the cheapest model the provider published a price for, or on a local runtime where everything is priced at zero, the one with the fewest parameters. Balanced and Best stop at the curated table, because cheapness is a sound proxy for the Fast slot and an unsound one for capability. Anything still unresolved falls back to the chat model. See [Sessions](/docs/sessions/#titles) for what Title does.
+`/model` opens a Jobs overview and the model list. Selecting a model on this page changes Chat. Selecting the Chat row jumps to its current model. Select another job to open its assignment page, press `Esc` to return to the overview, and use uppercase `R` to clear the open job's binding. `/goal-model` opens Goal directly. Jobs are opened from the overview rather than cycled with `Tab`.
 
-## Model classes
+Bindings are saved globally in the `model.purposes` row of Caudra's SQLite state database and apply across sessions. Unbound jobs use these rules:
 
-The picker and `caudra models` show a dim **Fast**, **Balanced**, or **Best** beside a model: how its provider classifies it, taken from `purposes` in `providers.toml` first and then the curated table. Aggregators such as OpenRouter carry no catalog of their own, so a vendor-prefixed id borrows the class of the upstream vendor's entry.
+| Job | Default when unbound |
+|-----|----------------------|
+| Chat | The anchor model |
+| Plan | The anchor model |
+| Subagent | The model currently running its parent |
+| Compact | The model currently running the caller |
+| Title | Fast |
+| Goal | Fast |
+| Fast | Provider `fast` config, curated preferred small model, cheapest priced model, fewest-parameter model, then the anchor |
+| Best | Provider `best` config, curated flagship, then the anchor |
 
-A blank class means nobody classified that model, which is the normal state for local runtimes and custom endpoints. Caudra does not infer one from price or list position. Declare `purposes` for that provider to fill it in.
+The anchor is the selected Chat model when a main turn starts. A Plan binding can select a distinct model, which Caudra uses for main turns sent in Plan mode. An explicit global Subagent binding overrides parent inheritance. A prompt profile's `subagent_model` overrides the global Subagent binding for tasks using that profile. See [System Prompt Profiles](/docs/system-prompts/#configure-subagents).
 
-The class also decides which built-in tools reach the model upfront. Fast and unclassified models load the on-demand tools through `tool_search`, while Balanced and Best receive all of them in the first request. See [Tools loaded on demand](/docs/tools/#which-models-defer).
+See [Sessions](/docs/sessions/#titles) for Title and [Completion goals](/docs/commands/#completion-goals) for Goal.
 
-`purposes` entries match by prefix, so an endpoint serving a family of fine-tunes needs one line rather than one per variant:
+## Supply metadata
+
+Provider catalogs record whether a model is small and whether it is the preferred model in its size lane. The tables below and `caudra models` render those facts with three markers:
+
+| Marker | Meaning |
+|--------|---------|
+| Small | A small alternative |
+| Fast | The preferred small model |
+| Best | The provider's flagship |
+
+A known non-small alternative and a model with no supply facts both have no marker. Markers describe provider supply. They are not capability tiers, and price or list order never creates one. Fast may still use price or parameter count as its final provider fallback without adding a marker.
+
+Aggregators such as OpenRouter borrow supply facts from the upstream vendor entry in a vendor-prefixed model id. Tool deferral also uses the small fact: small and unknown models defer on-demand tools, while known non-small models receive them upfront. See [Tools loaded on demand](/docs/tools/#which-models-defer).
+
+Provider `purposes` entries in `providers.toml` define the same supply facts. `fast` entries are small and `best` entries are non-small. The first entry in each list is preferred, so it receives the Fast or Best marker. Later `fast` entries receive Small, while later `best` entries remain unmarked. Entries match by prefix, so an endpoint serving a family of fine-tunes needs one line rather than one per variant:
 
 ```toml
 [my-server.purposes]
 fast = "qwen3.8-27b"   # covers qwen3.8-27b, qwen3.8-27b-canary, qwen3.8-27b-math7, ...
 ```
 
-The first entry doubles as the id that wins the slot, so it has to name a model the endpoint actually serves. A prefix that matches nothing live would send requests to an id that does not exist.
+The first entry also names the model that wins automatic resolution, so it has to name a model the endpoint actually serves. A prefix that matches nothing live would send requests to an id that does not exist.
 
 ## Auth Reloading
 
@@ -65,22 +88,22 @@ The built-in provider still owns the slug, so `protocol`, `api_key_env`, `discov
 - **API**: `https://api.anthropic.com/v1/messages`
 - **Features**: Prompt caching, thinking mode (adaptive/budgeted), advanced tool use
 
-| Purpose | Models | Pricing (in/out per 1M tokens) | Context |
+| Marker | Models | Pricing (in/out per 1M tokens) | Context |
 |---------|--------|-------------------------------|---------|
 | Fast | **claude-haiku-4-5** (default) | $1.00 / $5.00 | 200K ctx / 64K out |
-| Balanced | claude-sonnet-4-5 | $3.00 / $15.00 | 200K ctx / 64K out |
-| Balanced | claude-sonnet-4-6 | $3.00 / $15.00 | 372K ctx / 64K out |
-| Balanced | **claude-sonnet-5** (default) | $2.00 / $10.00 | 372K ctx / 128K out |
-| Balanced | claude-sonnet-4 | $3.00 / $15.00 | 200K ctx / 64K out |
-| Best | claude-opus-4-5 | $5.00 / $25.00 | 200K ctx / 64K out |
-| Best | claude-opus-4-6 | $5.00 / $25.00 | 372K ctx / 128K out |
-| Best | claude-opus-4-7 | $5.00 / $25.00 | 372K ctx / 128K out |
-| Best | claude-opus-4-8 | $5.00 / $25.00 | 372K ctx / 128K out |
-| Best | **claude-opus-5** (default) | $5.00 / $25.00 | 372K ctx / 128K out |
-| Best | claude-fable-5 | $10.00 / $50.00 | 372K ctx / 128K out |
-| Best | claude-opus-4-0, claude-opus-4-1 | $15.00 / $75.00 | 200K ctx / 32K out |
+|  | claude-sonnet-4-5 | $3.00 / $15.00 | 200K ctx / 64K out |
+|  | claude-sonnet-4-6 | $3.00 / $15.00 | 372K ctx / 64K out |
+|  | claude-sonnet-5 | $2.00 / $10.00 | 372K ctx / 128K out |
+|  | claude-sonnet-4 | $3.00 / $15.00 | 200K ctx / 64K out |
+|  | claude-opus-4-5 | $5.00 / $25.00 | 200K ctx / 64K out |
+|  | claude-opus-4-6 | $5.00 / $25.00 | 372K ctx / 128K out |
+|  | claude-opus-4-7 | $5.00 / $25.00 | 372K ctx / 128K out |
+|  | claude-opus-4-8 | $5.00 / $25.00 | 372K ctx / 128K out |
+|  | claude-opus-5 | $5.00 / $25.00 | 372K ctx / 128K out |
+| Best | **claude-fable-5** (default) | $10.00 / $50.00 | 372K ctx / 128K out |
+|  | claude-opus-4-0, claude-opus-4-1 | $15.00 / $75.00 | 200K ctx / 32K out |
 
-Defaults: claude-haiku-4-5 (fast), claude-sonnet-5 (balanced), claude-opus-5 (best)
+Routing defaults: claude-haiku-4-5 (Fast), claude-fable-5 (Best)
 
 Run `caudra auth login anthropic` to sign in to a Claude subscription through browser OAuth. Caudra stores the tokens in its state directory, refreshes them automatically, and shows subscription limits through `/usage`. Subscription requests always go to `api.anthropic.com`, even when `ANTHROPIC_BASE_URL` is set.
 
@@ -108,28 +131,28 @@ You can override the model with `ANTHROPIC_MODEL` and the endpoint with `ANTHROP
 - **Env var**: `OPENAI_API_KEY` (also supports OAuth device flow)
 - **API**: `https://api.openai.com/v1`
 
-| Purpose | Models | Pricing (in/out per 1M tokens) | Context |
+| Marker | Models | Pricing (in/out per 1M tokens) | Context |
 |---------|--------|-------------------------------|---------|
 | Fast | **gpt-5.6-luna** (default) | $1.00 / $6.00 | 372K ctx / 128K out |
-| Fast | gpt-5.4-nano | $0.20 / $1.25 | 400K ctx / 128K out |
-| Fast | gpt-5.4-mini | $0.75 / $4.50 | 400K ctx / 128K out |
-| Fast | gpt-4.1-nano | $0.10 / $0.40 | 1047K ctx / 32K out |
-| Balanced | **gpt-5.6-terra** (default) | $2.50 / $15.00 | 372K ctx / 128K out |
-| Balanced | gpt-4.1-mini | $0.40 / $1.60 | 1047K ctx / 32K out |
-| Balanced | gpt-4.1 | $2.00 / $8.00 | 1047K ctx / 32K out |
-| Balanced | o4-mini | $1.10 / $4.40 | 200K ctx / 100K out |
-| Balanced | gpt-5.1-codex-mini | $0.25 / $2.00 | 400K ctx / 128K out |
+| Small | gpt-5.4-nano | $0.20 / $1.25 | 400K ctx / 128K out |
+| Small | gpt-5.4-mini | $0.75 / $4.50 | 400K ctx / 128K out |
+| Small | gpt-4.1-nano | $0.10 / $0.40 | 1047K ctx / 32K out |
+|  | gpt-5.6-terra | $2.50 / $15.00 | 372K ctx / 128K out |
 | Best | **gpt-5.6-sol** (default) | $5.00 / $30.00 | 372K ctx / 128K out |
-| Best | gpt-5.5 | $5.00 / $30.00 | 1050K ctx / 128K out |
-| Best | gpt-5.4 | $2.50 / $15.00 | 1050K ctx / 128K out |
-| Best | o3 | $2.00 / $8.00 | 200K ctx / 100K out |
-| Best | gpt-5.3-codex | $1.75 / $14.00 | 400K ctx / 128K out |
-| Best | gpt-5.2-codex | $1.75 / $14.00 | 400K ctx / 128K out |
-| Best | gpt-5.2 | $1.75 / $14.00 | 400K ctx / 128K out |
-| Best | gpt-5.1-codex-max | $1.25 / $10.00 | 400K ctx / 128K out |
-| Best | gpt-5.1-codex | $1.25 / $10.00 | 400K ctx / 128K out |
+|  | gpt-4.1-mini | $0.40 / $1.60 | 1047K ctx / 32K out |
+|  | gpt-4.1 | $2.00 / $8.00 | 1047K ctx / 32K out |
+|  | o4-mini | $1.10 / $4.40 | 200K ctx / 100K out |
+|  | gpt-5.5 | $5.00 / $30.00 | 1050K ctx / 128K out |
+|  | gpt-5.4 | $2.50 / $15.00 | 1050K ctx / 128K out |
+|  | o3 | $2.00 / $8.00 | 200K ctx / 100K out |
+|  | gpt-5.3-codex | $1.75 / $14.00 | 400K ctx / 128K out |
+|  | gpt-5.2-codex | $1.75 / $14.00 | 400K ctx / 128K out |
+|  | gpt-5.2 | $1.75 / $14.00 | 400K ctx / 128K out |
+|  | gpt-5.1-codex-mini | $0.25 / $2.00 | 400K ctx / 128K out |
+|  | gpt-5.1-codex-max | $1.25 / $10.00 | 400K ctx / 128K out |
+|  | gpt-5.1-codex | $1.25 / $10.00 | 400K ctx / 128K out |
 
-Defaults: gpt-5.6-luna (fast), gpt-5.6-terra (balanced), gpt-5.6-sol (best)
+Routing defaults: gpt-5.6-luna (Fast), gpt-5.6-sol (Best)
 
 ### Google
 
@@ -137,13 +160,13 @@ Defaults: gpt-5.6-luna (fast), gpt-5.6-terra (balanced), gpt-5.6-sol (best)
 - **API**: `https://generativelanguage.googleapis.com/v1beta`
 - **Features**: Native Gemini API with thinking support
 
-| Purpose | Models | Pricing (in/out per 1M tokens) | Context |
+| Marker | Models | Pricing (in/out per 1M tokens) | Context |
 |---------|--------|-------------------------------|---------|
 | Fast | **gemini-2.0-flash-lite** (default) | $0.07 / $0.30 | 1048K ctx / 65K out |
-| Balanced | **gemini-2.5-flash** (default) | $0.15 / $0.60 | 1048K ctx / 65K out |
 | Best | **gemini-2.5-pro** (default) | $1.25 / $5.00 | 1048K ctx / 65K out |
+|  | gemini-2.5-flash | $0.15 / $0.60 | 1048K ctx / 65K out |
 
-Defaults: gemini-2.5-pro (best), gemini-2.5-flash (balanced), gemini-2.0-flash-lite (fast)
+Routing defaults: gemini-2.0-flash-lite (Fast), gemini-2.5-pro (Best)
 
 ### Copilot
 
@@ -151,33 +174,33 @@ Defaults: gemini-2.5-pro (best), gemini-2.5-flash (balanced), gemini-2.0-flash-l
 - **API**: `https://api.githubcopilot.com (or GraphQL-discovered Copilot API endpoint)`
 - **Features**: Native Copilot Chat HTTP API with model endpoint discovery
 
-| Purpose | Models | Pricing (in/out per 1M tokens) | Context |
+| Marker | Models | Pricing (in/out per 1M tokens) | Context |
 |---------|--------|-------------------------------|---------|
-| Fast | gpt-5-mini | $0.25 / $2.00 | 200K ctx / 100K out |
-| Fast | gpt-5.4-mini | $0.75 / $4.50 | 200K ctx / 100K out |
-| Fast | gpt-5.4-nano | $0.20 / $1.25 | 200K ctx / 100K out |
-| Fast | claude-haiku-4.5 | $1.00 / $5.00 | 200K ctx / 64K out |
-| Fast | gemini-3.5-flash | $1.50 / $9.00 | 200K ctx / 65K out |
-| Fast | mai-code-1-flash-picker | $0.75 / $4.50 | 200K ctx / 100K out |
+| Small | gpt-5-mini | $0.25 / $2.00 | 200K ctx / 100K out |
+| Small | gpt-5.4-mini | $0.75 / $4.50 | 200K ctx / 100K out |
+| Small | gpt-5.4-nano | $0.20 / $1.25 | 200K ctx / 100K out |
+| Small | claude-haiku-4.5 | $1.00 / $5.00 | 200K ctx / 64K out |
+| Small | gemini-3.5-flash | $1.50 / $9.00 | 200K ctx / 65K out |
+| Small | mai-code-1-flash-picker | $0.75 / $4.50 | 200K ctx / 100K out |
 | Fast | **gpt-5.6-luna** (default) | $0.20 / $1.20 | 200K ctx / 100K out |
-| Balanced | gemini-3.6-flash | $0.75 / $3.75 | 200K ctx / 65K out |
-| Balanced | gemini-3.7-flash | $0.75 / $3.75 | 200K ctx / 65K out |
-| Balanced | claude-sonnet-4.5, claude-sonnet-4.6 | $3.00 / $15.00 | 200K ctx / 64K out |
-| Balanced | claude-sonnet-5 | $2.00 / $10.00 | 200K ctx / 100K out |
-| Balanced | kimi-k2.7-code | $0.95 / $4.00 | 200K ctx / 100K out |
-| Balanced | gemini-3.1-pro-preview | $2.00 / $12.00 | 200K ctx / 65K out |
-| Balanced | **gpt-5.6-terra** (default) | $2.00 / $12.00 | 200K ctx / 100K out |
-| Balanced | grok-4.5 | $2.00 / $6.00 | 200K ctx / 100K out |
-| Balanced | grok-4.6 | $2.00 / $6.00 | 200K ctx / 100K out |
-| Best | gpt-5.5 | $5.00 / $30.00 | 200K ctx / 100K out |
-| Best | kimi-k3 | $3.00 / $15.00 | 200K ctx / 100K out |
-| Best | gpt-5.4 | $2.50 / $15.00 | 200K ctx / 100K out |
-| Best | gpt-5.6-sol | $5.00 / $30.00 | 200K ctx / 100K out |
-| Best | gpt-5.3-codex | $1.75 / $14.00 | 200K ctx / 100K out |
+|  | gemini-3.6-flash | $0.75 / $3.75 | 200K ctx / 65K out |
+|  | gemini-3.7-flash | $0.75 / $3.75 | 200K ctx / 65K out |
+|  | claude-sonnet-4.5, claude-sonnet-4.6 | $3.00 / $15.00 | 200K ctx / 64K out |
+|  | claude-sonnet-5 | $2.00 / $10.00 | 200K ctx / 100K out |
+|  | gpt-5.5 | $5.00 / $30.00 | 200K ctx / 100K out |
+|  | kimi-k2.7-code | $0.95 / $4.00 | 200K ctx / 100K out |
+|  | kimi-k3 | $3.00 / $15.00 | 200K ctx / 100K out |
+|  | gemini-3.1-pro-preview | $2.00 / $12.00 | 200K ctx / 65K out |
+|  | gpt-5.4 | $2.50 / $15.00 | 200K ctx / 100K out |
+|  | gpt-5.6-sol | $5.00 / $30.00 | 200K ctx / 100K out |
+|  | gpt-5.6-terra | $2.00 / $12.00 | 200K ctx / 100K out |
+|  | gpt-5.3-codex | $1.75 / $14.00 | 200K ctx / 100K out |
 | Best | **claude-opus-5, claude-opus-4.8, claude-opus-4.7, claude-opus-4.6, claude-opus-4.5** (default) | $5.00 / $25.00 | 200K ctx / 64K out |
-| Best | claude-opus-4.8-fast, claude-fable-5 | $10.00 / $50.00 | 200K ctx / 100K out |
+|  | claude-opus-4.8-fast, claude-fable-5 | $10.00 / $50.00 | 200K ctx / 100K out |
+|  | grok-4.5 | $2.00 / $6.00 | 200K ctx / 100K out |
+|  | grok-4.6 | $2.00 / $6.00 | 200K ctx / 100K out |
 
-Defaults: gpt-5.6-luna (fast), gpt-5.6-terra (balanced), claude-opus-5 (best)
+Routing defaults: gpt-5.6-luna (Fast), claude-opus-5 (Best)
 
 ### Ollama
 
@@ -200,14 +223,14 @@ Connects to any OpenAI-compatible `/v1` endpoint. Point `LLAMA_CPP_HOST` to your
 - **Env var**: `MISTRAL_API_KEY`
 - **API**: `https://api.mistral.ai/v1`
 
-| Purpose | Models | Pricing (in/out per 1M tokens) | Context |
+| Marker | Models | Pricing (in/out per 1M tokens) | Context |
 |---------|--------|-------------------------------|---------|
 | Fast | **ministral-14b-latest, ministral-14b-2512** (default) | $0.20 / $0.20 | 262K ctx |
-| Balanced | **mistral-small-latest, mistral-small-2603** (default) | $0.15 / $0.60 | 262K ctx |
 | Best | **mistral-medium-latest, mistral-medium-3.5, mistral-medium-3-5, mistral-medium-2604** (default) | $1.50 / $7.50 | 262K ctx |
-| Best | glm-5-2, zai-glm-5-2 | $1.40 / $4.40 | 1000K ctx |
+|  | glm-5-2, zai-glm-5-2 | $1.40 / $4.40 | 1000K ctx |
+|  | mistral-small-latest, mistral-small-2603 | $0.15 / $0.60 | 262K ctx |
 
-Defaults: mistral-medium-latest (best), mistral-small-latest (balanced), ministral-14b-latest (fast)
+Routing defaults: ministral-14b-latest (Fast), mistral-medium-latest (Best)
 
 ### Z.AI
 
@@ -216,18 +239,18 @@ Defaults: mistral-medium-latest (best), mistral-small-latest (balanced), ministr
   - `https://api.z.ai/api/paas/v4`
   - `https://api.z.ai/api/coding/paas/v4`
 
-| Purpose | Models | Pricing (in/out per 1M tokens) | Context |
+| Marker | Models | Pricing (in/out per 1M tokens) | Context |
 |---------|--------|-------------------------------|---------|
 | Fast | **glm-4.7-flash** (default) | $0.00 / $0.00 | 200K ctx / 131K out |
-| Fast | glm-4.5-flash | $0.00 / $0.00 | 131K ctx / 98K out |
-| Fast | glm-4.5-air | $0.20 / $1.10 | 131K ctx / 98K out |
-| Balanced | **glm-4.7, glm-4.6** (default) | $0.60 / $2.20 | 200K ctx / 131K out |
-| Balanced | glm-4.5 | $0.60 / $2.20 | 131K ctx / 98K out |
+| Small | glm-4.5-flash | $0.00 / $0.00 | 131K ctx / 98K out |
+| Small | glm-4.5-air | $0.20 / $1.10 | 131K ctx / 98K out |
 | Best | **glm-5-code** (default) | $1.20 / $5.00 | 200K ctx / 131K out |
-| Best | glm-5.2 | $1.00 / $3.20 | 1000K ctx / 131K out |
-| Best | glm-5.1, glm-5 | $1.00 / $3.20 | 200K ctx / 131K out |
+|  | glm-5.2 | $1.00 / $3.20 | 1000K ctx / 131K out |
+|  | glm-5.1, glm-5 | $1.00 / $3.20 | 200K ctx / 131K out |
+|  | glm-4.7, glm-4.6 | $0.60 / $2.20 | 200K ctx / 131K out |
+|  | glm-4.5 | $0.60 / $2.20 | 131K ctx / 98K out |
 
-Defaults: glm-5-code (best), glm-4.7-flash (fast), glm-4.7 (balanced)
+Routing defaults: glm-4.7-flash (Fast), glm-5-code (Best)
 
 ### DeepSeek
 
@@ -236,12 +259,12 @@ Defaults: glm-5-code (best), glm-4.7-flash (fast), glm-4.7 (balanced)
 - **Features**: Thinking mode toggle (on/off), open-weight models
 - **Peak pricing**: the prices below are off-peak; each turn is billed as it happens, at 2x during 01:00-04:00, 06:00-10:00 UTC
 
-| Purpose | Models | Pricing (in/out per 1M tokens) | Context |
+| Marker | Models | Pricing (in/out per 1M tokens) | Context |
 |---------|--------|-------------------------------|---------|
-| Balanced | **deepseek-v4-flash** (default) | $0.22 / $0.66 | 1000K ctx / 384K out |
+|  | deepseek-v4-flash | $0.22 / $0.66 | 1000K ctx / 384K out |
 | Best | **deepseek-v4-pro** (default) | $0.66 / $1.98 | 1000K ctx / 384K out |
 
-Defaults: deepseek-v4-flash (balanced), deepseek-v4-pro (best)
+Routing defaults: deepseek-v4-pro (Best)
 
 ### OpenRouter
 
@@ -257,13 +280,13 @@ OpenRouter aggregates models from many providers behind a single API key. Browse
 - **API**: `https://api.synthetic.new/openai/v1`
 - **Features**: Reasoning effort support (low/medium/high), open-weight models
 
-| Purpose | Models | Pricing (in/out per 1M tokens) | Context |
+| Marker | Models | Pricing (in/out per 1M tokens) | Context |
 |---------|--------|-------------------------------|---------|
 | Fast | **hf:zai-org/GLM-4.7-Flash** (default) | $0.10 / $0.50 | 200K ctx / 131K out |
-| Balanced | **hf:deepseek-ai/DeepSeek-V3.2** (default) | $0.56 / $1.68 | 200K ctx / 131K out |
 | Best | **hf:moonshotai/Kimi-K2.5** (default) | $0.45 / $3.40 | 200K ctx / 131K out |
+|  | hf:deepseek-ai/DeepSeek-V3.2 | $0.56 / $1.68 | 200K ctx / 131K out |
 
-Defaults: hf:moonshotai/Kimi-K2.5 (best), hf:deepseek-ai/DeepSeek-V3.2 (balanced), hf:zai-org/GLM-4.7-Flash (fast)
+Routing defaults: hf:zai-org/GLM-4.7-Flash (Fast), hf:moonshotai/Kimi-K2.5 (Best)
 
 ### TensorX
 
@@ -298,13 +321,13 @@ The default is `false`.
   - `https://cli-chat-proxy.grok.com/v1`
 - **Features**: OAuth login, account-specific model catalog, Grok reasoning (low/medium/high/xhigh)
 
-| Purpose | Models | Pricing (in/out per 1M tokens) | Context |
+| Marker | Models | Pricing (in/out per 1M tokens) | Context |
 |---------|--------|-------------------------------|---------|
-| Balanced | **grok-4.3** (default) | $1.25 / $2.50 | 1000K ctx / 131K out |
 | Best | **grok-4.6** (default) | $2.00 / $6.00 | 500K ctx / 131K out |
-| Best | grok-4.5 | $2.00 / $6.00 | 500K ctx / 131K out |
+|  | grok-4.5 | $2.00 / $6.00 | 500K ctx / 131K out |
+|  | grok-4.3 | $1.25 / $2.50 | 1000K ctx / 131K out |
 
-Defaults: grok-4.6 (best), grok-4.3 (balanced)
+Routing defaults: grok-4.6 (Best)
 
 OAuth uses the same first-party xAI client as the official Grok CLI (`caudra auth login xai`). Browser login (PKCE) is the desktop default; device code is recommended over SSH or in a container. Tokens refresh automatically. After login, Caudra fetches your account catalog from `GET /v1/models-v2` on the Grok CLI proxy and caches it for 15 minutes. `XAI_BASE_URL` only redirects the public API-key endpoint, never the OAuth proxy.
 
@@ -394,7 +417,7 @@ supports_vision = false
 | `discover_models` | bool | When true, also probe the provider's model list endpoint (default false) |
 | `enable_free_models` | bool | Opencode only. Show free catalog models (default false) |
 | `model_defaults` | table | Model fields applied to every model of this provider (see below) |
-| `purposes` | table | Model id prefixes per workload: `chat`, `fast`, `balanced`, `best`, `title`, `compact`, `goal`. A string or a list, first entry winning the slot. Outranked by a binding made in the picker |
+| `purposes` | table | Model id prefixes for `fast` and `best`. A string or ordered list. Fast entries are small, Best entries are non-small, and the first entry is preferred. A global job binding wins |
 | `models` | array | Declared models for custom providers (see below) |
 | `overrides` | table | Aperture only. Per-upstream model overrides (see below) |
 

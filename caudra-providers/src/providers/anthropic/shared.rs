@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 
 use crate::model::{
-    FastPricing, Model, ModelEntry, ModelFamily, ModelPricing, ModelPurpose, StaticReasoningOption,
+    FastPricing, Model, ModelEntry, ModelFamily, ModelPricing, StaticReasoningOption,
 };
 use crate::{
     AgentError, ContentBlock, EMPTY_RESPONSE_MARKER, INVALID_TOOL_JSON_KEY, Message, ProviderEvent,
@@ -662,7 +662,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
     const MODELS: &[ModelEntry] = &[
         ModelEntry {
             prefixes: &["claude-haiku-4-5"],
-            purpose: ModelPurpose::Fast,
+            small: true,
             family: ModelFamily::Claude,
             vision: true,
             default: true,
@@ -680,7 +680,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["claude-sonnet-4-5"],
-            purpose: ModelPurpose::Balanced,
+            small: false,
             family: ModelFamily::Claude,
             vision: true,
             default: false,
@@ -698,7 +698,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["claude-sonnet-4-6"],
-            purpose: ModelPurpose::Balanced,
+            small: false,
             family: ModelFamily::Claude,
             vision: true,
             default: false,
@@ -716,10 +716,10 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["claude-sonnet-5"],
-            purpose: ModelPurpose::Balanced,
+            small: false,
             family: ModelFamily::Claude,
             vision: true,
-            default: true,
+            default: false,
             // Introductory rates until 2026-09-01, then 3.00 / 15.00 / 3.75 / 0.30.
             pricing: ModelPricing {
                 input: 2.00,
@@ -735,7 +735,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["claude-sonnet-4"],
-            purpose: ModelPurpose::Balanced,
+            small: false,
             family: ModelFamily::Claude,
             vision: true,
             default: false,
@@ -753,7 +753,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["claude-opus-4-5"],
-            purpose: ModelPurpose::Best,
+            small: false,
             family: ModelFamily::Claude,
             vision: true,
             default: false,
@@ -771,7 +771,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["claude-opus-4-6"],
-            purpose: ModelPurpose::Best,
+            small: false,
             family: ModelFamily::Claude,
             vision: true,
             default: false,
@@ -790,7 +790,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["claude-opus-4-7"],
-            purpose: ModelPurpose::Best,
+            small: false,
             family: ModelFamily::Claude,
             vision: true,
             default: false,
@@ -809,7 +809,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["claude-opus-4-8"],
-            purpose: ModelPurpose::Best,
+            small: false,
             family: ModelFamily::Claude,
             vision: true,
             default: false,
@@ -830,10 +830,10 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["claude-opus-5"],
-            purpose: ModelPurpose::Best,
+            small: false,
             family: ModelFamily::Claude,
             vision: true,
-            default: true,
+            default: false,
             pricing: ModelPricing {
                 input: 5.00,
                 output: 25.00,
@@ -851,10 +851,10 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["claude-fable-5"],
-            purpose: ModelPurpose::Best,
+            small: false,
             family: ModelFamily::Claude,
             vision: true,
-            default: false,
+            default: true,
             pricing: ModelPricing {
                 input: 10.00,
                 output: 50.00,
@@ -869,7 +869,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["claude-opus-4-0", "claude-opus-4-1"],
-            purpose: ModelPurpose::Best,
+            small: false,
             family: ModelFamily::Claude,
             vision: true,
             default: false,

@@ -1,4 +1,5 @@
 use std::env;
+use std::fmt::Write as _;
 use std::io::{self, Write};
 use std::path::Path;
 use std::sync::Arc;
@@ -18,11 +19,15 @@ use caudra_config::providers::{
     resolve_base_url, resolve_default_model, resolve_display_name, resolve_login_url, slugify,
 };
 use caudra_config::{
-    Config, DefaultEffect, PermissionsConfig, ToolKey, load_env_files, load_permissions,
+    Config, DefaultEffect, ModelPolicy, PermissionsConfig, ToolKey, load_env_files,
+    load_permissions,
 };
 use caudra_lua::PluginHost;
+use caudra_providers::model_registry::{self, Binding};
 use caudra_providers::provider::fetch_all_models;
-use caudra_providers::{Model, ModelPurpose, ProviderData, Timeouts, catalog_providers};
+use caudra_providers::{
+    Model, ModelMarker, ModelPurpose, ProviderData, Timeouts, catalog_providers,
+};
 use caudra_providers::{anthropic_auth, copilot_auth, dynamic, openai_auth, xai_auth};
 use caudra_storage::StateDir;
 use caudra_storage::auth::{
@@ -40,7 +45,12 @@ const AUTH_STATUS_ENV: &str = "\x1b[33m~ env  \x1b[0m";
 const AUTH_STATUS_KEY: &str = "\x1b[32m✓ key  \x1b[0m";
 const AUTH_STATUS_OAUTH: &str = "\x1b[32m✓ oauth\x1b[0m";
 const PROVIDER_SLUG_WIDTH: usize = 14;
-const CLASS_GAP: &str = "  ";
+const MODEL_COLUMN_GAP: &str = "  ";
+const MODEL_JOB_HEADING: &str = "Job";
+const MODEL_BINDING_HEADING: &str = "Binding";
+const MODEL_RESOLVED_HEADING: &str = "Resolved";
+const MODEL_DEFAULT_BINDING: &str = "default";
+const MODEL_RESOLUTION_ERROR: &str = "error: ";
 const SKILLS_HEADING: &str = "Skills";
 const SKILL_DIRS_HEADING: &str = "Directories";
 const NO_SKILLS_FOUND: &str = "No skills found.";
@@ -630,44 +640,131 @@ pub fn auth_status(storage: &StateDir) -> Result<()> {
     Ok(())
 }
 
-/// Specs stay first, and a batch with nothing classified stays unpadded, so
+fn model_marker_label(marker: ModelMarker) -> &'static str {
+    match marker {
+        ModelMarker::Small => "Small",
+        ModelMarker::Fast => "Fast",
+        ModelMarker::Best => "Best",
+    }
+}
+
+/// Specs stay first, and a batch with no supply markers stays unpadded, so
 /// piping `caudra models` into another command keeps working unchanged.
 ///
 /// Width is per batch because batches stream in as each provider answers, and
 /// buffering every provider to align one column would hold back the output.
 fn model_lines(specs: &[String]) -> Vec<String> {
-    let classes: Vec<Option<ModelPurpose>> = specs
+    let markers: Vec<Option<ModelMarker>> = specs
         .iter()
         .map(|spec| {
             spec.split_once('/')
-                .and_then(|(provider, id)| Model::class_of(provider, id))
+                .and_then(|(provider, id)| Model::marker_of(provider, id))
         })
         .collect();
     let width = specs
         .iter()
-        .zip(&classes)
-        .filter(|(_, class)| class.is_some())
+        .zip(&markers)
+        .filter(|(_, marker)| marker.is_some())
         .map(|(spec, _)| spec.chars().count())
         .max();
     specs
         .iter()
-        .zip(classes)
-        .map(|(spec, class)| match (class, width) {
-            (Some(class), Some(width)) => {
-                format!("{spec:<width$}{CLASS_GAP}{}", class.label())
+        .zip(markers)
+        .map(|(spec, marker)| match (marker, width) {
+            (Some(marker), Some(width)) => {
+                format!(
+                    "{spec:<width$}{MODEL_COLUMN_GAP}{}",
+                    model_marker_label(marker)
+                )
             }
             _ => spec.clone(),
         })
         .collect()
 }
 
-pub fn models(no_plugins: bool, no_jit: bool) -> Result<()> {
+struct ModelJobRow {
+    job: &'static str,
+    binding: String,
+    resolved: String,
+}
+
+fn model_job_rows(anchor: &Model, policy: &ModelPolicy) -> Vec<ModelJobRow> {
+    ModelPurpose::ALL
+        .into_iter()
+        .map(|purpose| {
+            let binding = model_registry::binding(purpose);
+            model_job_row(purpose, binding, anchor, policy)
+        })
+        .collect()
+}
+
+fn model_job_row(
+    purpose: ModelPurpose,
+    binding: Option<Binding>,
+    anchor: &Model,
+    policy: &ModelPolicy,
+) -> ModelJobRow {
+    let resolved = Model::resolve_binding_if_available(purpose, binding.as_ref(), anchor, policy)
+        .map(|model| model.spec())
+        .unwrap_or_else(|error| format!("{MODEL_RESOLUTION_ERROR}{error}"));
+    ModelJobRow {
+        job: purpose.label(),
+        binding: binding
+            .as_ref()
+            .map_or_else(|| MODEL_DEFAULT_BINDING.to_owned(), ToString::to_string),
+        resolved,
+    }
+}
+
+fn render_model_jobs(rows: &[ModelJobRow]) -> String {
+    let job_width = rows
+        .iter()
+        .map(|row| row.job.chars().count())
+        .chain([MODEL_JOB_HEADING.len()])
+        .max()
+        .unwrap_or_default();
+    let binding_width = rows
+        .iter()
+        .map(|row| row.binding.chars().count())
+        .chain([MODEL_BINDING_HEADING.len()])
+        .max()
+        .unwrap_or_default();
+    let mut output = String::new();
+    let _ = writeln!(
+        output,
+        "{MODEL_JOB_HEADING:<job_width$}{MODEL_COLUMN_GAP}{MODEL_BINDING_HEADING:<binding_width$}{MODEL_COLUMN_GAP}{MODEL_RESOLVED_HEADING}"
+    );
+    for row in rows {
+        let _ = writeln!(
+            output,
+            "{:<job_width$}{MODEL_COLUMN_GAP}{:<binding_width$}{MODEL_COLUMN_GAP}{}",
+            row.job, row.binding, row.resolved
+        );
+    }
+    output
+}
+
+fn print_model_jobs(model_arg: Option<&str>, config: &Config) -> Result<()> {
+    let storage = StateDir::resolve().context("resolve data directory")?;
+    model_registry::load_from_storage(&storage).context("load model purpose bindings")?;
+    let anchor = resolve_model(model_arg, &config.provider, &storage)?;
+    print!(
+        "{}",
+        render_model_jobs(&model_job_rows(&anchor, &config.provider.model_policy))
+    );
+    Ok(())
+}
+
+pub fn models(jobs: bool, model_arg: Option<&str>, no_plugins: bool, no_jit: bool) -> Result<()> {
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
     load_env_files(&cwd);
 
     let host = PluginHost::with_jit(Arc::clone(ToolRegistry::global_arc()), !no_jit)
         .context("initialize lua plugin host")?;
     let config = load_effective_config(&host, no_plugins, &cwd)?;
+    if jobs {
+        return print_model_jobs(model_arg, &config);
+    }
 
     smol::block_on(fetch_all_models(
         &config.provider.model_policy,
@@ -1175,6 +1272,7 @@ pub fn prompt(
             .unwrap_or_default();
         let bindings = prompt_profiles.bind_for_tasks(
             &model,
+            &model,
             &thinking,
             &config.provider.model_policy,
             caudra_providers::Timeouts::default(),
@@ -1272,34 +1370,42 @@ mod auth_tests {
         assert!(login_route("google", Some(AuthMethod::Oauth)).is_err());
     }
 
-    const CURATED_SPEC: &str = "anthropic/claude-haiku-4-5";
+    const FAST_SPEC: &str = "anthropic/claude-haiku-4-5";
+    const SMALL_SPEC: &str = "openai/gpt-5.4-nano";
+    const BEST_SPEC: &str = "openai/gpt-5.6-sol";
     const UNCURATED_SPEC: &str = "ollama/llama3";
     const AGGREGATED_SPEC: &str = "openrouter/anthropic/claude-haiku-4-5";
+    const UNAVAILABLE_RESOLUTION: &str = "error: unavailable";
 
-    #[test]
-    fn a_listed_model_carries_its_class() {
-        let lines = model_lines(&[CURATED_SPEC.into()]);
+    #[test_case(FAST_SPEC, ModelMarker::Fast ; "fast_default")]
+    #[test_case(SMALL_SPEC, ModelMarker::Small ; "small_non_default")]
+    #[test_case(BEST_SPEC, ModelMarker::Best ; "best_default")]
+    fn a_listed_model_carries_its_supply_marker(spec: &str, marker: ModelMarker) {
+        let lines = model_lines(&[spec.into()]);
         assert_eq!(
             lines,
             vec![format!(
-                "{CURATED_SPEC}{CLASS_GAP}{}",
-                ModelPurpose::Fast.label()
+                "{spec}{MODEL_COLUMN_GAP}{}",
+                model_marker_label(marker)
             )]
         );
     }
 
-    /// An aggregator has no catalogue of its own, so the class has to come from
-    /// the vendor named in the model id.
+    /// An aggregator has no catalogue of its own, so the marker has to come
+    /// from the vendor named in the model id.
     #[test]
-    fn an_aggregated_model_borrows_the_upstream_class() {
+    fn an_aggregated_model_borrows_the_upstream_marker() {
         let lines = model_lines(&[AGGREGATED_SPEC.into()]);
-        assert!(lines[0].ends_with(ModelPurpose::Fast.label()), "{lines:?}");
+        assert!(
+            lines[0].ends_with(model_marker_label(ModelMarker::Fast)),
+            "{lines:?}"
+        );
     }
 
-    /// A batch nobody classified must pipe exactly as it did before the column
+    /// A batch with no markers must pipe exactly as it did before the column
     /// existed, with no trailing padding.
     #[test]
-    fn an_unclassified_batch_stays_bare() {
+    fn an_unmarked_batch_stays_bare() {
         assert_eq!(
             model_lines(&[UNCURATED_SPEC.into()]),
             vec![UNCURATED_SPEC.to_string()]
@@ -1307,10 +1413,58 @@ mod auth_tests {
     }
 
     #[test]
-    fn a_mixed_batch_aligns_on_the_widest_classified_spec() {
-        let lines = model_lines(&[CURATED_SPEC.into(), UNCURATED_SPEC.into()]);
-        assert_eq!(lines[1], UNCURATED_SPEC, "unclassified rows stay bare");
-        assert!(lines[0].starts_with(CURATED_SPEC));
+    fn a_mixed_batch_aligns_on_the_widest_marked_spec() {
+        let lines = model_lines(&[FAST_SPEC.into(), UNCURATED_SPEC.into()]);
+        assert_eq!(lines[1], UNCURATED_SPEC, "unmarked rows stay bare");
+        assert!(lines[0].starts_with(FAST_SPEC));
+    }
+
+    #[test]
+    fn model_jobs_renderer_aligns_plain_text_and_keeps_rows_after_errors() {
+        let rows = [
+            ModelJobRow {
+                job: "Chat",
+                binding: MODEL_DEFAULT_BINDING.into(),
+                resolved: "provider/chat".into(),
+            },
+            ModelJobRow {
+                job: "Subagent",
+                binding: "same as fast".into(),
+                resolved: UNAVAILABLE_RESOLUTION.into(),
+            },
+            ModelJobRow {
+                job: "Title",
+                binding: MODEL_DEFAULT_BINDING.into(),
+                resolved: "provider/title".into(),
+            },
+        ];
+
+        let rendered = render_model_jobs(&rows);
+        let expected = format!(
+            "Job       Binding       Resolved\n\
+Chat      default       provider/chat\n\
+Subagent  same as fast  {UNAVAILABLE_RESOLUTION}\n\
+Title     default       provider/title\n"
+        );
+
+        assert_eq!(rendered, expected);
+        assert!(!rendered.contains('\x1b'));
+    }
+
+    #[test]
+    fn model_job_resolution_keeps_policy_errors_visible() {
+        let anchor = Model::from_spec(FAST_SPEC).unwrap();
+        let policy = ModelPolicy::new(&[], &[BEST_SPEC.to_string()]).unwrap();
+        let row = model_job_row(
+            ModelPurpose::Goal,
+            Some(Binding::Exact(BEST_SPEC.into())),
+            &anchor,
+            &policy,
+        );
+
+        assert_eq!(row.binding, BEST_SPEC);
+        assert!(row.resolved.starts_with(MODEL_RESOLUTION_ERROR));
+        assert!(row.resolved.contains("not allowed"));
     }
 
     #[test_case("1", Some(Protocol::Openai) ; "chat_by_number")]

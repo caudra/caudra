@@ -1,8 +1,7 @@
-use caudra_providers::EFFORT_LEVELS;
-use caudra_providers::ModelPurpose;
 use caudra_providers::manifest::ManifestRegistry;
 use caudra_providers::model::ModelEntry;
 use caudra_providers::provider::ProviderKind;
+use caudra_providers::{EFFORT_LEVELS, ModelMarker};
 use std::fmt::Write;
 use strum::IntoEnumIterator;
 
@@ -13,28 +12,51 @@ weight = 5
 group = "Reference"
 +++"#;
 
-const PURPOSE_PICKER_NOTE: &str = r#"Open the model picker with `/model`. Use `Tab` and `Shift+Tab` to switch between Chat, Fast, Balanced, Best, Title, Compact, and Goal. `Enter` binds the highlighted row to the displayed purpose, and uppercase `R` clears the binding.
+const MODEL_JOBS_NOTE: &str = r#"## Model jobs
 
-A purpose is bound either to an exact `provider/model-id` or to another purpose, and every binding lives in the `model.purposes` row of Caudra's SQLite state database. Chat is the model the conversation runs on; the rest bind a workload.
+Caudra routes work through eight jobs: **Chat**, **Plan**, **Subagent**, **Compact**, **Title**, **Goal**, **Fast**, and **Best**. A global binding can pin a job to an exact `provider/model-id` or make it follow Chat, Plan, Fast, or Best. Explicit bindings report an error when their model is unavailable or disallowed.
 
-An unbound purpose is not an error, it just means the caller applies its own rule. Compact uses the chat model, because compaction reads the whole conversation and a small window cannot hold what it must summarize. Title and Goal follow Fast. Fast, Balanced, and Best ask the active provider: a `purposes` declaration in `providers.toml` first, then Caudra's curated table for that provider. Fast then tries the cheapest model the provider published a price for, or on a local runtime where everything is priced at zero, the one with the fewest parameters. Balanced and Best stop at the curated table, because cheapness is a sound proxy for the Fast slot and an unsound one for capability. Anything still unresolved falls back to the chat model. See [Sessions](/docs/sessions/#titles) for what Title does.
+`/model` opens a Jobs overview and the model list. Selecting a model on this page changes Chat. Selecting the Chat row jumps to its current model. Select another job to open its assignment page, press `Esc` to return to the overview, and use uppercase `R` to clear the open job's binding. `/goal-model` opens Goal directly. Jobs are opened from the overview rather than cycled with `Tab`.
 
-## Model classes
+Bindings are saved globally in the `model.purposes` row of Caudra's SQLite state database and apply across sessions. Unbound jobs use these rules:
 
-The picker and `caudra models` show a dim **Fast**, **Balanced**, or **Best** beside a model: how its provider classifies it, taken from `purposes` in `providers.toml` first and then the curated table. Aggregators such as OpenRouter carry no catalog of their own, so a vendor-prefixed id borrows the class of the upstream vendor's entry.
+| Job | Default when unbound |
+|-----|----------------------|
+| Chat | The anchor model |
+| Plan | The anchor model |
+| Subagent | The model currently running its parent |
+| Compact | The model currently running the caller |
+| Title | Fast |
+| Goal | Fast |
+| Fast | Provider `fast` config, curated preferred small model, cheapest priced model, fewest-parameter model, then the anchor |
+| Best | Provider `best` config, curated flagship, then the anchor |
 
-A blank class means nobody classified that model, which is the normal state for local runtimes and custom endpoints. Caudra does not infer one from price or list position. Declare `purposes` for that provider to fill it in.
+The anchor is the selected Chat model when a main turn starts. A Plan binding can select a distinct model, which Caudra uses for main turns sent in Plan mode. An explicit global Subagent binding overrides parent inheritance. A prompt profile's `subagent_model` overrides the global Subagent binding for tasks using that profile. See [System Prompt Profiles](/docs/system-prompts/#configure-subagents).
 
-The class also decides which built-in tools reach the model upfront. Fast and unclassified models load the on-demand tools through `tool_search`, while Balanced and Best receive all of them in the first request. See [Tools loaded on demand](/docs/tools/#which-models-defer).
+See [Sessions](/docs/sessions/#titles) for Title and [Completion goals](/docs/commands/#completion-goals) for Goal.
 
-`purposes` entries match by prefix, so an endpoint serving a family of fine-tunes needs one line rather than one per variant:
+## Supply metadata
+
+Provider catalogs record whether a model is small and whether it is the preferred model in its size lane. The tables below and `caudra models` render those facts with three markers:
+
+| Marker | Meaning |
+|--------|---------|
+| Small | A small alternative |
+| Fast | The preferred small model |
+| Best | The provider's flagship |
+
+A known non-small alternative and a model with no supply facts both have no marker. Markers describe provider supply. They are not capability tiers, and price or list order never creates one. Fast may still use price or parameter count as its final provider fallback without adding a marker.
+
+Aggregators such as OpenRouter borrow supply facts from the upstream vendor entry in a vendor-prefixed model id. Tool deferral also uses the small fact: small and unknown models defer on-demand tools, while known non-small models receive them upfront. See [Tools loaded on demand](/docs/tools/#which-models-defer).
+
+Provider `purposes` entries in `providers.toml` define the same supply facts. `fast` entries are small and `best` entries are non-small. The first entry in each list is preferred, so it receives the Fast or Best marker. Later `fast` entries receive Small, while later `best` entries remain unmarked. Entries match by prefix, so an endpoint serving a family of fine-tunes needs one line rather than one per variant:
 
 ```toml
 [my-server.purposes]
 fast = "qwen3.8-27b"   # covers qwen3.8-27b, qwen3.8-27b-canary, qwen3.8-27b-math7, ...
 ```
 
-The first entry doubles as the id that wins the slot, so it has to name a model the endpoint actually serves. A prefix that matches nothing live would send requests to an id that does not exist."#;
+The first entry also names the model that wins automatic resolution, so it has to name a model the endpoint actually serves. A prefix that matches nothing live would send requests to an id that does not exist."#;
 
 const AUTH_RELOADING: &str = r#"## Auth Reloading
 
@@ -229,7 +251,7 @@ supports_vision = false
 | `discover_models` | bool | When true, also probe the provider's model list endpoint (default false) |
 | `enable_free_models` | bool | Opencode only. Show free catalog models (default false) |
 | `model_defaults` | table | Model fields applied to every model of this provider (see below) |
-| `purposes` | table | Model id prefixes per workload: `chat`, `fast`, `balanced`, `best`, `title`, `compact`, `goal`. A string or a list, first entry winning the slot. Outranked by a binding made in the picker |
+| `purposes` | table | Model id prefixes for `fast` and `best`. A string or ordered list. Fast entries are small, Best entries are non-small, and the first entry is preferred. A global job binding wins |
 | `models` | array | Declared models for custom providers (see below) |
 | `overrides` | table | Aperture only. Per-upstream model overrides (see below) |
 
@@ -382,6 +404,14 @@ fn format_context(entry: &ModelEntry) -> String {
     }
 }
 
+fn marker_label(marker: ModelMarker) -> &'static str {
+    match marker {
+        ModelMarker::Small => "Small",
+        ModelMarker::Fast => "Fast",
+        ModelMarker::Best => "Best",
+    }
+}
+
 struct ProviderSection {
     kind: ProviderKind,
     name: &'static str,
@@ -491,22 +521,21 @@ fn build_sections() -> Vec<ProviderSection> {
 fn write_model_table(out: &mut String, entries: &[ModelEntry]) {
     let _ = writeln!(
         out,
-        "| Purpose | Models | Pricing (in/out per 1M tokens) | Context |"
+        "| Marker | Models | Pricing (in/out per 1M tokens) | Context |"
     );
     let _ = writeln!(
         out,
         "|---------|--------|-------------------------------|---------|"
     );
 
-    // A row per model, not per purpose: prices and context sizes differ inside
-    // a purpose, so one merged row would quote a single model's numbers for all.
-    for purpose in ModelPurpose::CLASSES {
-        for entry in entries.iter().filter(|e| e.purpose == purpose) {
+    for small in [true, false] {
+        for entry in entries.iter().filter(|entry| entry.small == small) {
             let names = entry.prefixes.join(", ");
+            let marker = entry.facts().marker().map(marker_label).unwrap_or_default();
             let _ = writeln!(
                 out,
                 "| {} | {} | {} | {} |",
-                purpose.label(),
+                marker,
                 if entry.default {
                     format!("**{names}** (default)")
                 } else {
@@ -518,15 +547,20 @@ fn write_model_table(out: &mut String, entries: &[ModelEntry]) {
         }
     }
 
-    let defaults: Vec<String> = entries
-        .iter()
+    let defaults: Vec<String> = [true, false]
+        .into_iter()
+        .flat_map(|small| entries.iter().filter(move |entry| entry.small == small))
         .filter(|e| e.default)
-        .map(|e| format!("{} ({})", e.prefixes.first().unwrap_or(&"?"), e.purpose,))
+        .filter_map(|entry| {
+            let prefix = entry.prefixes.first()?;
+            let marker = entry.facts().marker()?;
+            Some(format!("{prefix} ({})", marker_label(marker)))
+        })
         .collect();
 
     if !defaults.is_empty() {
         let _ = writeln!(out);
-        let _ = writeln!(out, "Defaults: {}", defaults.join(", "));
+        let _ = writeln!(out, "Routing defaults: {}", defaults.join(", "));
     }
 }
 
@@ -612,14 +646,10 @@ pub fn generate() -> String {
     let _ = writeln!(out, "# Providers\n");
     let _ = writeln!(
         out,
-        "Caudra talks to LLM providers over their HTTP APIs. Each workload \
-         resolves through a **purpose**: **Chat** is the conversation, **Fast**, \
-         **Balanced**, and **Best** name how much capability a caller is asking \
-         for, and **Title**, **Compact**, and **Goal** are the background \
-         workloads. Binding a purpose says which model serves it; leaving one \
-         unbound lets Caudra pick.\n"
+        "Caudra talks to LLM providers over their HTTP APIs. Model jobs decide \
+         which configured or discovered model serves each kind of work.\n"
     );
-    let _ = writeln!(out, "{PURPOSE_PICKER_NOTE}\n");
+    let _ = writeln!(out, "{MODEL_JOBS_NOTE}\n");
     let _ = writeln!(out, "{AUTH_RELOADING}\n");
     let _ = writeln!(out, "{BASE_URL_OVERRIDES}\n");
     let _ = writeln!(out, "## Built-in Providers\n");

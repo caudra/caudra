@@ -804,9 +804,9 @@ The returned table has fields: `id` (string), `provider` (string),
 
 - `{ctx}` (`LuaCtx`) Agent context.
 - `{opts?}` (`table?`) Optional fields:
-  - `purpose` (`string?`) which binding to resolve, one of `"chat"`, `"fast"`,
-    `"balanced"`, `"best"`, `"title"`, `"compact"`, `"goal"`. Resolves to the
-    model the user bound, or that purpose's default.
+  - `purpose` (`string?`) which binding to resolve, one of `"chat"`, `"plan"`,
+    `"subagent"`, `"compact"`, `"title"`, `"goal"`, `"fast"`, `"best"`.
+    Resolves to the model the user bound, or that purpose's default.
   - `spec` (`string?`) exact `provider/model` spec, e.g. `"anthropic/claude-haiku-4-5"`.
     Takes precedence over `purpose`.
 
@@ -952,9 +952,10 @@ print(out)
 caudra.agent.session({ctx}, {opts})
 ```
 
-Create a new subagent session. The session inherits the parent model and
-MCP handle unless you override them. You get back a `Session` object that
-you can send messages to with `:prompt()`.
+Create a new subagent session. The session uses the global Subagent model,
+which inherits the parent model when unbound, and inherits the MCP handle.
+You can override either. You get back a `Session` object that you can send
+messages to with `:prompt()`.
 
 This is the main way to spin up a sub-conversation with its own history
 and tool set.
@@ -963,7 +964,7 @@ and tool set.
 
 - `{ctx}` (`LuaCtx`) Agent context.
 - `{opts}` (`table`) Optional fields:
-  - `model_spec` (`string?`) model spec string to use instead of the parent model.
+  - `model_spec` (`string?`) exact model spec to use instead of the Subagent binding.
   - `system` (`string?`) system prompt. Defaults to empty.
   - `tools` (`table?`) tool definitions array (from `caudra.agent.tools()`).
   - `local_tools` (`table?`) map of `name -> spec` for Lua-backed tools. Each spec
@@ -987,13 +988,16 @@ and tool set.
   - `profile` (`string?`) task system prompt profile. Requires `task = true`.
   - `mode` (`string?`) task mode: `plan` or `build`. Requires `task = true`.
 
-  Task sessions derive model, thinking, system prompt, tools, audience, and
+  Task sessions derive their model from the Subagent binding or an explicit
 
 
-  MCP access from the profile and mode. Do not combine `task = true` with the
+  profile selector. Thinking may also come from the profile; system prompt,
 
 
-  corresponding generic session options.
+  tools, audience, and MCP access follow profile and mode. Do not combine
+
+
+  `task = true` with the corresponding generic session options.
 
 
 **Returns:** ([`Session?`](#caudra-agent-Session), `string?`) Session handle, or `(nil, err)` on failure.

@@ -146,11 +146,10 @@ Some pickers add extra bindings on top of the defaults:
 | Queue | `.` | Open item actions |
 | Queue | `r` | Replace current run |
 | Commands | `Tab` | Complete command |
-| Model Picker | `Tab` / `Shift+Tab` | Switch model purpose |
-| Model Picker | `R` | Reset model purpose |
+| Model Picker | `R` | Clear job binding |
 | Session Picker | `Ctrl+N` | New session |
 | Session Picker | `Ctrl+R` | Rename session |
-| Session Picker | `Ctrl+G` | Name session with a small model |
+| Session Picker | `Ctrl+G` | Generate session title |
 | Session Picker | `Ctrl+D` | Delete session (press twice) |
 | Stash Picker | `Ctrl+D` | Delete stash entry (press twice) |
 | Workflow Inspector | `p` | Pause the selected run |

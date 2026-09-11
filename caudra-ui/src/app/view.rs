@@ -545,33 +545,46 @@ impl App {
         let chat_name = (self.chats.len() > 1).then_some(chat.name.as_str());
         let mode = self.mode_label();
         let main_chat = render_chat == 0;
+        let effective_model = main_chat.then(|| self.status_main_model()).flatten();
+        let model = effective_model
+            .as_ref()
+            .map_or(&self.state.model, |slot| &slot.model);
+        let effective_model_spec = effective_model.as_ref().map(|slot| slot.model.spec());
+        let effective_context = effective_model
+            .as_ref()
+            .and_then(|_| self.active_context_snapshot());
         // What the request will actually carry, not what was asked for: a
         // model can refuse to stop reasoning, and the badge has to say so.
-        let thinking = (main_chat && self.state.model.supports_thinking()).then(|| {
+        let thinking = (main_chat && model.supports_thinking()).then(|| {
             RequestOptions {
                 thinking: self.state.thinking.clone(),
                 fast: self.state.fast,
             }
-            .clamped(&self.state.model)
+            .clamped(model)
             .thinking
-            .resolve(&self.state.model)
+            .resolve(model)
             .to_string()
             .into()
         });
         let ctx = StatusBarContext {
             status: &self.status,
             mode,
-            model_id: chat
-                .model_id
-                .as_deref()
-                .unwrap_or(&self.state.session.model),
+            model_id: effective_model_spec.as_deref().unwrap_or_else(|| {
+                chat.model_id
+                    .as_deref()
+                    .unwrap_or(&self.state.session.model)
+            }),
             stats: UsageStats {
                 global_cost: self.state.cost,
                 global_subscription_cost: self.state.subscription_cost,
-                context_size: chat.context_size,
+                context_size: effective_context
+                    .as_ref()
+                    .map_or(chat.context_size, |snapshot| snapshot.usage.used()),
                 cost: chat.cost,
                 subscription_cost: chat.subscription_cost,
-                context_window: if chat.context_window > 0 {
+                context_window: if let Some(slot) = effective_model.as_ref() {
+                    slot.model.context_window
+                } else if chat.context_window > 0 {
                     chat.context_window
                 } else {
                     self.state.model.context_window

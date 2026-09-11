@@ -20,14 +20,14 @@ use caudra_agent::tools::{
 };
 use caudra_agent::workflow::WorkflowHandle;
 use caudra_agent::{
-    Agent, AgentConfig, AgentEvent, AgentInput, AgentParams, AgentRunParams, CancelMap,
+    Agent, AgentConfig, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, CancelMap,
     CancelToken, CancelTrigger, DoneReason, Envelope, EventSender, GoalHandle, History,
     InstructionBaseline, Instructions, McpCommand, Nudge, PromptRole, SessionMailbox,
     SharedHistory, SubagentHistoryStore, ToolOutputLines,
 };
 use caudra_config::ModelPolicy;
 use caudra_lua::EventHandle;
-use caudra_providers::{AgentError, HistoryItem, Message, Model, RequestOptions};
+use caudra_providers::{AgentError, HistoryItem, Message, Model, ModelPurpose, RequestOptions};
 use caudra_storage::id::SessionRef;
 use serde_json::Value;
 use tracing::error;
@@ -39,6 +39,7 @@ use super::{BtwPrompt, ModelSlot, SharedBtwPrompt};
 
 pub(super) struct AgentLoop {
     model_slot: Arc<ArcSwap<ModelSlot>>,
+    effective_model_slot: Arc<ArcSwap<ModelSlot>>,
     config: AgentConfig,
     tool_output_lines: ToolOutputLines,
     vars: Vars,
@@ -84,6 +85,7 @@ impl AgentLoop {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         model_slot: Arc<ArcSwap<ModelSlot>>,
+        effective_model_slot: Arc<ArcSwap<ModelSlot>>,
         config: AgentConfig,
         tool_output_lines: ToolOutputLines,
         initial_history: Vec<HistoryItem>,
@@ -125,6 +127,7 @@ impl AgentLoop {
         };
         Self {
             model_slot,
+            effective_model_slot,
             config,
             tool_output_lines,
             vars: Vars::default(),
@@ -326,7 +329,11 @@ impl AgentLoop {
         // Built once MCP has settled, so a `/btw` fired before the first prompt
         // carries the same tools the live request will.
         let slot = self.model_slot.load();
-        self.rebuild_tools(&slot.model, &caudra_providers::ThinkingConfig::default());
+        self.rebuild_tools(
+            &slot.model,
+            &slot.model,
+            &caudra_providers::ThinkingConfig::default(),
+        );
         self.context_system = self.publish_btw_prompt(
             &caudra_agent::prompt::ResolvedSlots::default(),
             RequestOptions::default(),
@@ -336,7 +343,7 @@ impl AgentLoop {
     }
 
     async fn do_compact(&mut self, event_tx: &EventSender) -> Result<(), AgentError> {
-        let slot = self.model_slot.load();
+        let slot = self.model_slot.load_full();
         let (provider, model) = agent::resolve_compaction_model(
             &slot.provider,
             &slot.model,
@@ -353,7 +360,8 @@ impl AgentLoop {
         .await?;
         self.goal
             .record_external_usage(usage, model.billed_cost(&usage, false), model.billing);
-        self.publish_prepared_context(&slot);
+        let effective_slot = self.effective_model_slot.load();
+        self.publish_prepared_context(&effective_slot);
         Ok(())
     }
 
@@ -388,7 +396,28 @@ impl AgentLoop {
         let Some(input) = inputs.last_mut() else {
             return Ok(());
         };
-        let slot = self.model_slot.load();
+        let selected_slot = self.model_slot.load_full();
+        let purpose = model_purpose(&input.mode);
+        let effective_slot = if purpose == ModelPurpose::Plan {
+            let (provider, model) = agent::resolve_model_for_purpose(
+                agent::ModelRoute {
+                    provider: &selected_slot.provider,
+                    model: &selected_slot.model,
+                },
+                agent::ModelRoute {
+                    provider: &selected_slot.provider,
+                    model: &selected_slot.model,
+                },
+                purpose,
+                None,
+                self.timeouts,
+                &self.model_policy,
+            )
+            .await?;
+            Arc::new(ModelSlot { model, provider })
+        } else {
+            Arc::clone(&selected_slot)
+        };
 
         let old_cwd = self.vars.apply("{cwd}").into_owned();
         self.vars = template::env_vars();
@@ -399,7 +428,8 @@ impl AgentLoop {
             let current = self.read_instructions().await;
             self.instructions.drift(current, self.history.epoch())
         };
-        self.rebuild_tools(&slot.model, &input.thinking);
+        self.rebuild_tools(&effective_slot.model, &selected_slot.model, &input.thinking);
+        self.effective_model_slot.store(Arc::clone(&effective_slot));
         self.mode.store(Arc::new(input.mode.clone()));
 
         if let Some(ref prompt_ref) = input.prompt {
@@ -438,7 +468,7 @@ impl AgentLoop {
             .lua_handle
             .collect_prompt_slots_async(&self.config)
             .await;
-        let tool_filter = ToolFilter::from_config(&self.config, &slot.model, &[]);
+        let tool_filter = ToolFilter::from_config(&self.config, &effective_slot.model, &[]);
         let system = agent::build_system_prompt(
             self.instructions.text(),
             &prompt_slots,
@@ -461,8 +491,10 @@ impl AgentLoop {
 
         let mut agent = Agent::new(
             AgentParams {
-                provider: Arc::clone(&slot.provider),
-                model: slot.model.clone(),
+                provider: Arc::clone(&effective_slot.provider),
+                model: effective_slot.model.clone(),
+                chat_provider: Arc::clone(&selected_slot.provider),
+                chat_model: selected_slot.model.clone(),
                 config: self.config.clone(),
                 tool_output_lines: self.tool_output_lines,
                 permissions: Arc::clone(&self.permissions),
@@ -488,7 +520,7 @@ impl AgentLoop {
             AgentRunParams {
                 history: &mut self.history,
                 system,
-                environment: Some(agent::environment_block(&self.vars, &slot.model)),
+                environment: Some(agent::environment_block(&self.vars, &effective_slot.model)),
                 instructions,
                 event_tx,
                 tools: self.tools.clone(),
@@ -528,8 +560,13 @@ impl AgentLoop {
 
     /// Base tools only. MCP definitions are injected per request by
     /// `Agent::request_tools`; baking them here would freeze the catalog.
-    fn rebuild_tools(&mut self, model: &Model, thinking: &caudra_providers::ThinkingConfig) {
-        let definitions = self.build_tools(model, thinking);
+    fn rebuild_tools(
+        &mut self,
+        model: &Model,
+        chat_model: &Model,
+        thinking: &caudra_providers::ThinkingConfig,
+    ) {
+        let definitions = self.build_tools(model, chat_model, thinking);
         self.tools = definitions.declared;
         self.deferred = definitions.deferred;
     }
@@ -537,13 +574,18 @@ impl AgentLoop {
     fn build_tools(
         &self,
         model: &Model,
+        chat_model: &Model,
         thinking: &caudra_providers::ThinkingConfig,
     ) -> ToolDefinitions {
         let examples = model.supports_tool_examples();
         let filter = ToolFilter::from_config(&self.config, model, &[]);
-        let bindings =
-            self.prompt_profiles
-                .bind_for_tasks(model, thinking, &self.model_policy, self.timeouts);
+        let bindings = self.prompt_profiles.bind_for_tasks(
+            model,
+            chat_model,
+            thinking,
+            &self.model_policy,
+            self.timeouts,
+        );
         let vars = self.vars.clone().set(
             "{task_system_prompt_profiles}",
             bindings.task_tool_summary("Caudra's built-in task prompt"),
@@ -582,9 +624,17 @@ impl AgentLoop {
     /// the agent seeds its own session from. A load that happens mid-turn is not reflected until
     /// the next publish.
     fn request_tools(&self, mcp: Option<&McpRequestSnapshot>) -> Value {
-        let mut tools = self.tools.clone();
+        self.request_tools_from(self.tools.clone(), self.deferred.clone(), mcp)
+    }
+
+    fn request_tools_from(
+        &self,
+        mut tools: Value,
+        deferred: Vec<DeferredTool>,
+        mcp: Option<&McpRequestSnapshot>,
+    ) -> Value {
         let mut sections: Vec<String> = DeferralSession::new(
-            self.deferred.clone(),
+            deferred,
             deferral::loaded_tool_names(self.history.as_slice()),
         )
         .request_snapshot()
@@ -598,10 +648,8 @@ impl AgentLoop {
         tools
     }
 
-    /// Always pins `Build` mode: btw never acts on tools, so Plan-mode constraints would only
-    /// confuse the model. Everything else must match the live request byte for byte, because a
-    /// divergent tools array or system prompt costs btw the provider cache prefix and makes it
-    /// re-read the whole history as fresh input tokens.
+    /// Always pins the selected Chat model: btw never acts on tools, so the
+    /// active Plan model must not leak into its cache prefix.
     fn publish_btw_prompt(
         &self,
         prompt_slots: &caudra_agent::prompt::ResolvedSlots,
@@ -609,6 +657,7 @@ impl AgentLoop {
     ) -> String {
         let slot = self.model_slot.load();
         let tool_filter = ToolFilter::from_config(&self.config, &slot.model, &[]);
+        let definitions = self.build_tools(&slot.model, &slot.model, &opts.thinking);
         let system = agent::build_system_prompt(
             self.instructions.text(),
             prompt_slots,
@@ -617,8 +666,14 @@ impl AgentLoop {
         );
         let mcp = self.mcp.as_ref().map(McpSession::request_snapshot);
         self.btw_prompt.store(Arc::new(BtwPrompt {
+            provider: Arc::clone(&slot.provider),
+            model: slot.model.clone(),
             system: system.clone(),
-            tools: self.request_tools(mcp.as_ref()),
+            tools: self.request_tools_from(
+                definitions.declared,
+                definitions.deferred,
+                mcp.as_ref(),
+            ),
             opts,
         }));
         system
@@ -636,6 +691,7 @@ impl AgentLoop {
         let options = self.context_options.clamped(&slot.model);
         let task_profiles = self.prompt_profiles.bind_for_tasks(
             &slot.model,
+            &self.model_slot.load().model,
             &options.thinking,
             &self.model_policy,
             self.timeouts,
@@ -694,6 +750,13 @@ impl AgentLoop {
     }
 }
 
+fn model_purpose(mode: &AgentMode) -> ModelPurpose {
+    match mode {
+        AgentMode::Plan(_) => ModelPurpose::Plan,
+        AgentMode::Build | AgentMode::ReadOnly => ModelPurpose::Chat,
+    }
+}
+
 fn spawn_oauth_for_needs_auth(handle: &McpHandle) {
     let snapshot = handle.reader().load().clone();
     for info in snapshot.infos.iter() {
@@ -737,5 +800,23 @@ fn spawn_oauth_for_needs_auth(handle: &McpHandle) {
             tracing::info!(server = %server_name, "MCP server authenticated via OAuth");
         })
         .detach();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use test_case::test_case;
+
+    use super::*;
+
+    const PLAN_PATH: &str = ".caudra/plans/test.md";
+
+    #[test_case(AgentMode::Build, ModelPurpose::Chat ; "build_uses_chat")]
+    #[test_case(AgentMode::ReadOnly, ModelPurpose::Chat ; "read_only_uses_chat")]
+    #[test_case(AgentMode::Plan(PathBuf::from(PLAN_PATH)), ModelPurpose::Plan ; "plan_uses_plan")]
+    fn input_mode_selects_model_purpose(mode: AgentMode, purpose: ModelPurpose) {
+        assert_eq!(model_purpose(&mode), purpose);
     }
 }

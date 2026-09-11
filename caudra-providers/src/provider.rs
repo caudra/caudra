@@ -415,6 +415,15 @@ pub struct ModelBatch {
     pub warnings: Vec<String>,
 }
 
+fn register_listed_models(slug: &str, models: Vec<ModelInfo>) -> Vec<String> {
+    let specs = models
+        .iter()
+        .map(|model| format!("{slug}/{}", model.id))
+        .collect();
+    crate::model_registry::set_known_models(slug, models);
+    specs
+}
+
 /// Offline version of model discovery: returns specs from static tables
 /// and configured dynamic providers. See [`fetch_all_models`] for live lookups.
 /// Never blocks on catalog download; catalog-backed providers appear only once
@@ -481,9 +490,7 @@ pub async fn fetch_all_models(
         smol::spawn(async move {
             let batch = match provider.list_models().await {
                 Ok(models) => {
-                    let mut specs: Vec<String> =
-                        models.iter().map(|m| format!("{slug}/{}", m.id)).collect();
-                    crate::model_registry::set_known_models(slug, models);
+                    let mut specs = register_listed_models(slug, models);
                     for entry in manifest.models {
                         for prefix in entry.prefixes {
                             let spec = format!("{slug}/{prefix}");
@@ -542,7 +549,7 @@ pub async fn fetch_all_models(
             let batch = match dynamic::create(&slug, timeouts) {
                 Ok(provider) => match provider.list_models().await {
                     Ok(models) => ModelBatch {
-                        models: models.iter().map(|m| format!("{slug}/{}", m.id)).collect(),
+                        models: register_listed_models(&slug, models),
                         warnings: Vec::new(),
                     },
                     Err(e) => static_fallback(e.to_string()),
@@ -560,18 +567,21 @@ pub async fn fetch_all_models(
         for cat in catalog {
             if ProviderKind::from_str(&cat.slug).is_ok()
                 || dynamic::base_for_slug(&cat.slug).is_some()
+                || crate::providers::custom::base_kind(&cat.slug).is_some()
                 || OPENCODE_FAMILY_SLUGS.contains(&cat.slug.as_str())
             {
                 continue;
             }
-            if !provider_available(&cat.slug) {
-                continue;
-            }
             let slug = cat.slug;
-            let models: Vec<String> = cat.models.keys().map(|id| format!("{slug}/{id}")).collect();
+            let Ok(provider) = provider_for_slug(&slug, timeouts) else {
+                continue;
+            };
+            let Ok(models) = provider.list_models().await else {
+                continue;
+            };
             let _ = tx_catalog
                 .send_async(ModelBatch {
-                    models,
+                    models: register_listed_models(&slug, models),
                     warnings: Vec::new(),
                 })
                 .await;
@@ -625,9 +635,11 @@ pub async fn fetch_all_models(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::ModelPricing;
 
     const LISTED_ONCE: &str =
         "a model both declared and discovered must reach the picker once, not twice";
+    const DISCOVERED_SLUG: &str = "test-dynamic-model-registry";
 
     /// A `providers.toml` entry and the `/models` response that also lists it
     /// arrive as separate batches, so only the merge point can tell they are
@@ -650,6 +662,50 @@ mod tests {
             .collect();
 
         assert_eq!(listed, ["local/qwen", "local/other"], "{LISTED_ONCE}");
+    }
+
+    #[test]
+    fn listed_models_are_registered_under_the_routing_slug() {
+        let specs = register_listed_models(
+            DISCOVERED_SLUG,
+            vec![
+                ModelInfo {
+                    context_window: Some(64_000),
+                    pricing: Some(ModelPricing {
+                        input: 2.0,
+                        output: 3.0,
+                        ..ModelPricing::ZERO
+                    }),
+                    ..ModelInfo::id_only("dear".into())
+                },
+                ModelInfo {
+                    context_window: Some(128_000),
+                    pricing: Some(ModelPricing {
+                        input: 0.5,
+                        output: 1.0,
+                        ..ModelPricing::ZERO
+                    }),
+                    ..ModelInfo::id_only("cheap".into())
+                },
+            ],
+        );
+
+        assert_eq!(
+            specs,
+            [
+                format!("{DISCOVERED_SLUG}/dear"),
+                format!("{DISCOVERED_SLUG}/cheap")
+            ]
+        );
+        assert_eq!(
+            crate::model_registry::cheapest_known(DISCOVERED_SLUG).as_deref(),
+            Some("cheap")
+        );
+        assert_eq!(
+            crate::model_registry::discovered(DISCOVERED_SLUG, "cheap")
+                .and_then(|model| model.context_window),
+            Some(128_000)
+        );
     }
 
     fn policy(allowed: &[&str], excluded: &[&str]) -> ModelPolicy {

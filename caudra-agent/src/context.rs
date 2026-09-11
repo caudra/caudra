@@ -1180,6 +1180,7 @@ mod tests {
         let profiles = PromptProfileCatalog::default();
         let task_profiles = profiles.bind_for_tasks(
             &model,
+            &model,
             &caudra_providers::ThinkingConfig::default(),
             &caudra_config::ModelPolicy::default(),
             caudra_providers::Timeouts::default(),

@@ -2,8 +2,7 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use caudra_agent::CancelToken;
-use caudra_providers::provider::Provider;
-use caudra_providers::{AgentError, Message, Model, ProviderEvent, StopReason, project_messages};
+use caudra_providers::{AgentError, Message, ProviderEvent, StopReason, project_messages};
 use caudra_storage::id::SessionRef;
 use flume::Sender;
 use futures_lite::future;
@@ -28,12 +27,7 @@ pub(crate) fn btw_question(question: &str) -> Message {
 }
 
 impl App {
-    pub(crate) fn start_btw(
-        &mut self,
-        question: String,
-        provider: Arc<dyn Provider>,
-        model: Model,
-    ) {
+    pub(crate) fn start_btw(&mut self, question: String) {
         let items = self
             .shared_history
             .as_ref()
@@ -60,12 +54,16 @@ impl App {
 
         // Mirrors what the live request puts on the wire, so the provider can reuse the cached
         // prefix instead of re-reading the whole history as fresh input tokens.
-        let transport = provider.reasoning_transport(&model);
-        let mut messages =
-            match caudra_agent::project_for_target(&messages, &prompt.tools, &model, transport) {
-                Cow::Borrowed(_) => messages,
-                Cow::Owned(projected) => projected,
-            };
+        let transport = prompt.provider.reasoning_transport(&prompt.model);
+        let mut messages = match caudra_agent::project_for_target(
+            &messages,
+            &prompt.tools,
+            &prompt.model,
+            transport,
+        ) {
+            Cow::Borrowed(_) => messages,
+            Cow::Owned(projected) => projected,
+        };
         // The mirror is verbatim, so mid-turn it can end on an open tool call.
         // Providers reject that, so close them off on our own copy.
         caudra_agent::close_dangling_tool_calls(&mut messages, caudra_agent::UNAVAILABLE_RESULT);
@@ -76,28 +74,19 @@ impl App {
         self.btw_modal.open(&question, rx, trigger);
 
         let session_id = SessionRef::from(self.state.session.id);
-        smol::spawn(run_btw(
-            provider,
-            model,
-            prompt,
-            messages,
-            tx,
-            Some(session_id),
-            cancel,
-        ))
-        .detach();
+        smol::spawn(run_btw(prompt, messages, tx, Some(session_id), cancel)).detach();
     }
 }
 
 async fn run_btw(
-    provider: Arc<dyn Provider>,
-    model: Model,
     prompt: Arc<BtwPrompt>,
     messages: Vec<Message>,
     btw_tx: Sender<BtwEvent>,
     session_id: Option<SessionRef>,
     cancel: CancelToken,
 ) {
+    let provider = Arc::clone(&prompt.provider);
+    let model = prompt.model.clone();
     // btw bypasses `stream_with_retry`, the only other place options meet a model, so it has to
     // clamp for itself or it sends options the live request would have gated away.
     let opts = prompt.opts.clamped(&model);
@@ -163,9 +152,57 @@ async fn run_btw(
 
 #[cfg(test)]
 mod tests {
+    use arc_swap::ArcSwap;
+    use caudra_providers::provider::{BoxFuture, Provider};
+    use caudra_providers::{Model, RequestOptions, StreamResponse};
+    use serde_json::json;
+
     use super::*;
 
     const Q: &str = "why sqlite?";
+    const FIRST_MODEL: &str = "anthropic/claude-sonnet-4-20250514";
+    const SECOND_MODEL: &str = "openai/gpt-5.4";
+    const SYSTEM: &str = "system";
+
+    struct RecordingProvider(flume::Sender<String>);
+
+    impl Provider for RecordingProvider {
+        fn stream_message<'a>(
+            &'a self,
+            model: &'a Model,
+            _: &'a [Message],
+            _: &'a str,
+            _: &'a serde_json::Value,
+            _: &'a flume::Sender<ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&'a SessionRef>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(async move {
+                self.0.send(model.spec()).unwrap();
+                Ok(StreamResponse {
+                    message: Message::default(),
+                    stop_reason: Some(StopReason::EndTurn),
+                    ..Default::default()
+                })
+            })
+        }
+
+        fn list_models(
+            &self,
+        ) -> BoxFuture<'_, Result<Vec<caudra_providers::ModelInfo>, AgentError>> {
+            Box::pin(async { unimplemented!() })
+        }
+    }
+
+    fn prompt(spec: &str, called: flume::Sender<String>) -> BtwPrompt {
+        BtwPrompt {
+            provider: Arc::new(RecordingProvider(called)),
+            model: Model::from_spec(spec).unwrap(),
+            system: SYSTEM.into(),
+            tools: json!([]),
+            opts: RequestOptions::default(),
+        }
+    }
 
     fn user_text(msg: &Message) -> String {
         msg.content
@@ -194,5 +231,30 @@ mod tests {
             !BTW_REMINDER.contains("NO tools"),
             "claiming there are no tools contradicts the definitions on the wire"
         );
+    }
+
+    #[test]
+    fn a_captured_prompt_keeps_its_model_provider_pair_across_a_switch() {
+        smol::block_on(async {
+            let (first_tx, first_rx) = flume::unbounded();
+            let (second_tx, second_rx) = flume::unbounded();
+            let shared = ArcSwap::from_pointee(prompt(FIRST_MODEL, first_tx));
+            let captured = shared.load_full();
+            shared.store(Arc::new(prompt(SECOND_MODEL, second_tx)));
+            let (event_tx, event_rx) = flume::unbounded();
+
+            run_btw(
+                captured,
+                vec![Message::user(Q.into())],
+                event_tx,
+                None,
+                CancelToken::none(),
+            )
+            .await;
+
+            assert_eq!(first_rx.try_recv().unwrap(), FIRST_MODEL);
+            assert!(second_rx.try_recv().is_err());
+            assert!(matches!(event_rx.try_recv(), Ok(BtwEvent::Done(_))));
+        });
     }
 }

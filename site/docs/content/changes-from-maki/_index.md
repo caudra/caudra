@@ -47,11 +47,11 @@ Maki provided the native Rust TUI, Lua plugin system, provider integrations, MCP
 
 **Why:** Separating execution contracts from the agent and protocol layers keeps validation and cleanup consistent across the TUI, headless mode, and ACP. Workcell can evolve and be tested independently, while the pinned release source remains reproducible. Bounded results control context growth, and retained output keeps omitted evidence available after truncation, compaction, cancellation, and session forks.
 
-## Model-aware reasoning and workload roles
+## Model-aware reasoning and routing jobs
 
-**What changed:** [Reasoning controls](/docs/providers/) resolve against the selected model's declared toggle, effort levels, or token limits. Chat, Goal, Compact, Title, Fast, Balanced, and Best are separate model purposes with their own assignments and fallbacks.
+**What changed:** [Reasoning controls](/docs/providers/) resolve against the selected model's declared toggle, effort levels, or token limits. Chat, Plan, Subagent, Compact, Title, Goal, Fast, and Best are separate model jobs. Plan-mode main turns can use a distinct model, and unbound subagents inherit the model currently running their parent. Provider catalogs carry small and default supply facts for Fast and Best routing rather than capability tiers.
 
-**Why:** Provider-wide reasoning tables can advertise unsupported settings and send invalid requests. Model-declared controls keep the UI and request payload aligned with the model that will receive them.
+**Why:** Provider-wide reasoning tables can advertise unsupported settings and send invalid requests. Model-declared controls keep the UI and request payload aligned with the model that receives them. Separate jobs make routing explicit, while supply facts avoid unsupported claims about model capability.
 
 ## Source-faithful terminal review
 

@@ -14,8 +14,8 @@ use super::anthropic::shared;
 use super::openai::responses;
 use super::openai_compat;
 use crate::model::{
-    Billing, Model, ModelEntry, ModelFamily, ModelInfo, ModelPricing, ModelPurpose,
-    StaticReasoningOption, lookup_entry,
+    Billing, Model, ModelEntry, ModelFamily, ModelInfo, ModelPricing, StaticReasoningOption,
+    lookup_entry,
 };
 use crate::provider::{BoxFuture, Provider};
 use crate::{
@@ -107,7 +107,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
     const MODELS: &[ModelEntry] = &[
         ModelEntry {
             prefixes: &["gpt-5-mini"],
-            purpose: ModelPurpose::Fast,
+            small: true,
             family: ModelFamily::Generic,
             vision: true,
             default: false,
@@ -125,7 +125,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["gpt-5.4-mini"],
-            purpose: ModelPurpose::Fast,
+            small: true,
             family: ModelFamily::Generic,
             vision: true,
             default: false,
@@ -143,7 +143,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["gpt-5.4-nano"],
-            purpose: ModelPurpose::Fast,
+            small: true,
             family: ModelFamily::Generic,
             vision: true,
             default: false,
@@ -161,7 +161,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["claude-haiku-4.5"],
-            purpose: ModelPurpose::Fast,
+            small: true,
             family: ModelFamily::Generic,
             vision: true,
             default: false,
@@ -179,7 +179,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["gemini-3.5-flash"],
-            purpose: ModelPurpose::Fast,
+            small: true,
             family: ModelFamily::Generic,
             vision: true,
             default: false,
@@ -197,7 +197,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["gemini-3.6-flash"],
-            purpose: ModelPurpose::Balanced,
+            small: false,
             family: ModelFamily::Generic,
             vision: true,
             default: false,
@@ -215,7 +215,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["gemini-3.7-flash"],
-            purpose: ModelPurpose::Balanced,
+            small: false,
             family: ModelFamily::Generic,
             vision: true,
             default: false,
@@ -233,7 +233,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["mai-code-1-flash-picker"],
-            purpose: ModelPurpose::Fast,
+            small: true,
             family: ModelFamily::Generic,
             vision: true,
             default: false,
@@ -251,7 +251,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["claude-sonnet-4.5", "claude-sonnet-4.6"],
-            purpose: ModelPurpose::Balanced,
+            small: false,
             family: ModelFamily::Generic,
             vision: true,
             default: false,
@@ -269,7 +269,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["claude-sonnet-5"],
-            purpose: ModelPurpose::Balanced,
+            small: false,
             family: ModelFamily::Generic,
             vision: true,
             default: false,
@@ -287,7 +287,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["gpt-5.5"],
-            purpose: ModelPurpose::Best,
+            small: false,
             family: ModelFamily::Generic,
             vision: true,
             default: false,
@@ -305,7 +305,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["kimi-k2.7-code"],
-            purpose: ModelPurpose::Balanced,
+            small: false,
             family: ModelFamily::Generic,
             vision: true,
             default: false,
@@ -323,7 +323,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["kimi-k3"],
-            purpose: ModelPurpose::Best,
+            small: false,
             family: ModelFamily::Generic,
             vision: true,
             default: false,
@@ -341,7 +341,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["gemini-3.1-pro-preview"],
-            purpose: ModelPurpose::Balanced,
+            small: false,
             family: ModelFamily::Generic,
             vision: true,
             default: false,
@@ -359,7 +359,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["gpt-5.6-luna"],
-            purpose: ModelPurpose::Fast,
+            small: true,
             family: ModelFamily::Generic,
             vision: true,
             default: true,
@@ -377,7 +377,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["gpt-5.4"],
-            purpose: ModelPurpose::Best,
+            small: false,
             family: ModelFamily::Generic,
             vision: true,
             default: false,
@@ -395,7 +395,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["gpt-5.6-sol"],
-            purpose: ModelPurpose::Best,
+            small: false,
             family: ModelFamily::Generic,
             vision: true,
             default: false,
@@ -413,10 +413,10 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["gpt-5.6-terra"],
-            purpose: ModelPurpose::Balanced,
+            small: false,
             family: ModelFamily::Generic,
             vision: true,
-            default: true,
+            default: false,
             pricing: ModelPricing {
                 input: 2.00,
                 output: 12.00,
@@ -431,7 +431,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["gpt-5.3-codex"],
-            purpose: ModelPurpose::Best,
+            small: false,
             family: ModelFamily::Generic,
             vision: true,
             default: false,
@@ -455,7 +455,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
                 "claude-opus-4.6",
                 "claude-opus-4.5",
             ],
-            purpose: ModelPurpose::Best,
+            small: false,
             family: ModelFamily::Generic,
             vision: true,
             default: true,
@@ -473,7 +473,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["claude-opus-4.8-fast", "claude-fable-5"],
-            purpose: ModelPurpose::Best,
+            small: false,
             family: ModelFamily::Generic,
             vision: true,
             default: false,
@@ -491,7 +491,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["grok-4.5"],
-            purpose: ModelPurpose::Balanced,
+            small: false,
             family: ModelFamily::Generic,
             vision: true,
             default: false,
@@ -509,7 +509,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["grok-4.6"],
-            purpose: ModelPurpose::Balanced,
+            small: false,
             family: ModelFamily::Generic,
             vision: true,
             default: false,
@@ -1185,7 +1185,6 @@ mod tests {
 
     use super::*;
     use crate::TokenUsage;
-    use crate::manifest::ManifestRegistry;
     use crate::providers::ResolvedAuth;
     use test_case::test_case;
 
@@ -1275,22 +1274,15 @@ mod tests {
         assert_eq!(model.model_info().supports_thinking, Some(expected));
     }
 
-    #[test_case(ModelPurpose::Fast, "gpt-5.6-luna"; "fast defaults to luna")]
-    #[test_case(ModelPurpose::Balanced, "gpt-5.6-terra"; "balanced defaults to terra")]
-    #[test_case(ModelPurpose::Best, "claude-opus-5"; "best defaults to opus")]
-    fn manifest_has_exactly_one_default_per_purpose(purpose: ModelPurpose, expected_prefix: &str) {
+    #[test_case(true, "gpt-5.6-luna"; "small defaults to luna")]
+    #[test_case(false, "claude-opus-5"; "non_small_defaults_to_opus")]
+    fn manifest_has_exactly_one_default_per_lane(small: bool, expected_prefix: &str) {
         let defaults: Vec<_> = models()
             .iter()
-            .filter(|entry| entry.default && entry.purpose == purpose)
+            .filter(|entry| entry.default && entry.small == small)
             .collect();
         assert_eq!(defaults.len(), 1);
         assert_eq!(defaults[0].prefixes[0], expected_prefix);
-        assert_eq!(
-            ManifestRegistry::find_default_for_purpose("copilot", purpose)
-                .unwrap()
-                .prefixes[0],
-            expected_prefix
-        );
     }
 
     #[test_case("copilot/gpt-5.6-luna", 1_000_000, 1_000_000, 0.20 + 1.20; "luna default rates")]

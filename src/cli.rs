@@ -258,7 +258,11 @@ pub enum Command {
         action: AuthAction,
     },
     /// List all available models
-    Models,
+    Models {
+        /// Show the effective model for every model job
+        #[arg(long)]
+        jobs: bool,
+    },
     /// Run the index tool on a file to see how it looks like
     Index { path: String },
     /// Manage MCP server authentication
@@ -641,7 +645,9 @@ mod tests {
     use test_case::test_case;
 
     const LOGS_NOT_PARSED: &str = "expected the logs subcommand";
+    const MODELS_NOT_PARSED: &str = "expected the models subcommand";
     const TRIM_NOT_PARSED: &str = "expected the storage trim subcommand";
+    const MODEL_SPEC: &str = "openai/gpt-5";
 
     #[test_case("FileRead", "file_read")]
     #[test_case("Shell", "shell")]
@@ -690,6 +696,34 @@ mod tests {
     #[test]
     fn the_logs_subcommand_rejects_an_unknown_level() {
         assert!(Cli::try_parse_from(["caudra", "logs", "--level", "chatty"]).is_err());
+    }
+
+    #[test_case(&["caudra", "models"], false, None ; "plain_listing")]
+    #[test_case(&["caudra", "models", "--jobs"], true, None ; "jobs")]
+    #[test_case(
+        &["caudra", "--model", MODEL_SPEC, "models", "--jobs"],
+        true,
+        Some(MODEL_SPEC)
+        ; "global_model_before_subcommand"
+    )]
+    #[test_case(
+        &["caudra", "models", "--jobs", "-m", MODEL_SPEC],
+        true,
+        Some(MODEL_SPEC)
+        ; "global_model_after_subcommand"
+    )]
+    fn models_modes_use_the_global_model_option(
+        args: &[&str],
+        expected_jobs: bool,
+        expected_model: Option<&str>,
+    ) {
+        let cli = Cli::try_parse_from(args).unwrap();
+        let Some(Command::Models { jobs }) = cli.command else {
+            panic!("{MODELS_NOT_PARSED}");
+        };
+
+        assert_eq!(jobs, expected_jobs);
+        assert_eq!(cli.model.as_deref(), expected_model);
     }
 
     #[test]

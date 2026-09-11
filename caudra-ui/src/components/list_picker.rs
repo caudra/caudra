@@ -30,6 +30,9 @@ pub(crate) const DISABLED_DIM: f32 = 0.45;
 
 pub trait PickerItem {
     fn label(&self) -> &str;
+    fn search_text(&self) -> &str {
+        self.label()
+    }
     fn suffix(&self) -> Option<&str> {
         None
     }
@@ -169,7 +172,7 @@ impl<T: PickerItem> State<T> {
             .enumerate()
             .filter_map(|(idx, item)| {
                 pattern
-                    .score(Utf32Str::new(item.label(), &mut buf), matcher)
+                    .score(Utf32Str::new(item.search_text(), &mut buf), matcher)
                     .map(|score| (idx, score))
             })
             .collect();
@@ -605,6 +608,7 @@ impl<T: PickerItem> ListPicker<T> {
         s.selected_item_index().map(|i| &s.items[i])
     }
 
+    #[cfg(test)]
     pub fn selected_index(&self) -> Option<usize> {
         self.state.as_ref().and_then(|s| s.selected_item_index())
     }
@@ -1126,6 +1130,21 @@ mod tests {
         }
     }
 
+    struct SearchEntry {
+        label: &'static str,
+        search_text: &'static str,
+    }
+
+    impl PickerItem for SearchEntry {
+        fn label(&self) -> &str {
+            self.label
+        }
+
+        fn search_text(&self) -> &str {
+            self.search_text
+        }
+    }
+
     /// The running-task spinner is drawn here and nowhere else, so this is the
     /// only place that can tell the loop to keep painting it.
     #[test]
@@ -1232,6 +1251,29 @@ mod tests {
 
         p.handle_key(key(KeyCode::Char('l')));
         assert_eq!(ready_state(&p).filtered, vec![0]);
+    }
+
+    #[test]
+    fn search_uses_item_haystack_without_changing_its_label() {
+        let mut p = ListPicker::new();
+        p.open(
+            vec![
+                SearchEntry {
+                    label: "shared-id",
+                    search_text: "shared-id anthropic/shared-id Anthropic Best",
+                },
+                SearchEntry {
+                    label: "shared-id",
+                    search_text: "shared-id zai/shared-id Z.AI Fast",
+                },
+            ],
+            " Test ",
+        );
+
+        p.handle_paste("zai/shared-id");
+
+        assert_eq!(ready_state(&p).filtered, vec![1]);
+        assert_eq!(p.selected_item().unwrap().label(), "shared-id");
     }
 
     /// Search lines used to hand-roll a keymap that dropped every control

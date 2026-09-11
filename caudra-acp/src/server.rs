@@ -1219,6 +1219,7 @@ mod tests {
             answer_tx,
             cancel_tx: flume::unbounded().0,
             model_tx: flume::unbounded().0,
+            model_route: None,
             session_id,
             session_lease,
             permissions,

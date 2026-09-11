@@ -31,6 +31,7 @@ use std::time::{Duration, Instant};
 use caudra_workbench::{Layout as WorkbenchLayout, Workbench, WorkbenchAction};
 
 use crate::AppSession;
+use crate::agent::ModelSlot;
 use crate::app::tasks::TaskOutcome;
 use crate::chat::Chat;
 use crate::chat::{CANCELLED_TEXT, ChatEventResult, DONE_TEXT, ERROR_TEXT};
@@ -105,7 +106,8 @@ use caudra_lua::{
     BuiltinAction, EventHandle, HintReader, HintSnapshot, KeymapReader, LuaCommandReader, WinView,
 };
 use caudra_providers::{
-    Billing, ContentBlock, Message, Model, ResolvedThinking, ThinkingConfig, TokenUsage, add_cost,
+    Billing, ContentBlock, Message, Model, ModelPurpose, ResolvedThinking, ThinkingConfig,
+    TokenUsage, add_cost,
 };
 use caudra_storage::StateDir;
 use caudra_storage::id::CaudraId;
@@ -389,6 +391,7 @@ pub struct App {
     pub(crate) shared_history: Option<SharedHistory>,
     pub(crate) btw_prompt: Option<crate::agent::SharedBtwPrompt>,
     pub(crate) context_store: Option<ContextStore>,
+    pub(crate) effective_model_slot: Option<Arc<ArcSwap<ModelSlot>>>,
     pub(crate) image_paste_rx: Vec<flume::Receiver<Result<ImageSource, String>>>,
     storage_writer: Arc<StorageWriter>,
     last_sent: Option<Sent>,
@@ -591,6 +594,7 @@ impl App {
             shared_history: None,
             btw_prompt: None,
             context_store: None,
+            effective_model_slot: None,
             image_paste_rx: vec![],
             storage_writer,
             last_sent: None,
@@ -712,9 +716,51 @@ impl App {
         }
 
         let snapshot = store.latest(&ContextKey::Main)?;
-        (snapshot.model.spec == self.state.model.spec()
-            && snapshot.window.tokens == self.state.model.context_window)
-            .then_some(snapshot)
+        if let Some(model_slot) = self.status_main_model() {
+            return (snapshot.model.spec == model_slot.model.spec()
+                && snapshot.window.tokens == model_slot.model.context_window)
+                .then_some(snapshot);
+        }
+        match self.state.applied_mode {
+            Mode::Build => (snapshot.model.spec == self.state.model.spec()
+                && snapshot.window.tokens == self.state.model.context_window)
+                .then_some(snapshot),
+            Mode::Plan => {
+                let expected = Model::resolve_if_available(
+                    ModelPurpose::Plan,
+                    &self.state.model,
+                    &self.model_policy,
+                )
+                .ok()?;
+                (snapshot.model.spec == expected.spec()
+                    && snapshot.window.tokens == expected.context_window)
+                    .then_some(snapshot)
+            }
+        }
+    }
+
+    fn status_main_model(&self) -> Option<Arc<ModelSlot>> {
+        if matches!(self.status, Status::Streaming) {
+            return self
+                .effective_model_slot
+                .as_ref()
+                .map(|slot| slot.load_full());
+        }
+        if self.state.applied_mode != Mode::Plan {
+            return None;
+        }
+        let snapshot = self.context_store.as_ref()?.latest(&ContextKey::Main)?;
+        let expected =
+            Model::resolve_if_available(ModelPurpose::Plan, &self.state.model, &self.model_policy)
+                .ok()?;
+        self.effective_model_slot
+            .as_ref()
+            .map(|slot| slot.load_full())
+            .filter(|slot| {
+                slot.model.spec() == expected.spec()
+                    && snapshot.model.spec == slot.model.spec()
+                    && snapshot.window.tokens == slot.model.context_window
+            })
     }
 
     fn active_subagent_can_steer(&self) -> bool {
@@ -2014,7 +2060,8 @@ impl App {
                 self.active_chat = (self.active_chat + 1).min(self.chats.len() - 1);
             }
             BuiltinAction::ModelPicker => {
-                self.model_picker.open(&self.state.model.spec());
+                self.model_picker
+                    .open(&self.state.model, &self.model_policy);
                 return vec![Action::RefreshModels];
             }
             BuiltinAction::ViewToggle => {
@@ -3618,7 +3665,8 @@ impl App {
             "/sessions" => self.sessions_browse(),
             "/rename" => self.rename_session(&cmd.args),
             "/model" => {
-                self.model_picker.open(&self.state.model.spec());
+                self.model_picker
+                    .open(&self.state.model, &self.model_policy);
                 vec![Action::RefreshModels]
             }
             "/system-prompt" => {
@@ -3740,7 +3788,8 @@ impl App {
 
     fn open_goal_model_picker(&mut self) -> Vec<Action> {
         self.model_picker.open_purpose(
-            &self.state.model.spec(),
+            &self.state.model,
+            &self.model_policy,
             caudra_providers::ModelPurpose::Goal,
         );
         vec![Action::RefreshModels]

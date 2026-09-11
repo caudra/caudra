@@ -140,10 +140,10 @@ How many lines of output an open card shows per tool before it says how many it 
 | `compaction_buffer` | u32 \| string | `20%, or 10% when the model's window excludes output` | - | Context reserved for compaction: token count or percent of the context window (e.g. "20%") |
 | `compaction_instructions` | String | `none` | - | Extra instructions appended to the compaction summary prompt |
 | `post_compaction_instructions` | String | `none` | - | Extra instructions the agent receives after any compaction (e.g. re-read plan.md) |
-| `generate_titles` | bool | `true` | - | Name a new session by summarizing its first prompt with a small model |
+| `generate_titles` | bool | `true` | - | Name a new session by summarizing its first prompt with the Title model |
 | `stale_read_check` | bool | `true` | - | Block a write to a file that changed on disk since it was read, and point a failed edit or patch at the change |
 | `shell_output_filter` | bool | `true` | - | Filter completed model-facing shell output with built-in rules |
-| `defer_builtin_tools` | string | `auto` | - | When the on-demand built-in tools start outside the request array: `auto` defers them for a Fast or unclassified model and declares them upfront for Balanced and Best, `always` defers for every model, `never` declares them upfront |
+| `defer_builtin_tools` | string | `auto` | - | When the on-demand built-in tools start outside the request array: `auto` defers them for a small model or one with no supply metadata and declares them upfront for a known non-small model, `always` defers for every model, `never` declares them upfront |
 | `disabled_tools` | string[] | `[]` | - | Tools to withhold from the model: built-in names, `server.tool`, or `server.*` for a whole MCP server. A project list extends the global one |
 
 ### `provider`
@@ -276,7 +276,7 @@ Caudra follows platform directory conventions. On Linux and macOS that is XDG. O
 | Logs | `~/.local/logs/caudra/` | `%APPDATA%\caudra\` |
 | Cache | `~/.cache/caudra/` | `%LOCALAPPDATA%\caudra\` |
 
-Config holds `init.lua`, `permissions.toml`, `mcp.toml`, `providers.toml`, and `commands/`. State holds sessions, auth tokens, memories, plans, and model-purpose bindings. The install script puts the binary under `%LOCALAPPDATA%\caudra` on Windows; that is separate from these runtime dirs.
+Config holds `init.lua`, `permissions.toml`, `mcp.toml`, `providers.toml`, and `commands/`. State holds sessions, auth tokens, memories, plans, and model-job bindings. The install script puts the binary under `%LOCALAPPDATA%\caudra` on Windows; that is separate from these runtime dirs.
 
 State that belongs to one project sits under `…/state/caudra/projects/<project-id>/`, where the id is the project directory name plus a hash of its path. Memory notes and plan-mode documents both live there, so removing that directory clears everything Caudra kept for the project.
 

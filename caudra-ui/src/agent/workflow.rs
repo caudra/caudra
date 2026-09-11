@@ -48,6 +48,7 @@ pub(crate) struct WorkflowSpawn<'a> {
     pub(crate) state_dir: StateDir,
     pub(crate) session_id: CaudraId,
     pub(crate) model_slot: &'a Arc<ArcSwap<ModelSlot>>,
+    pub(crate) effective_model_slot: &'a Arc<ArcSwap<ModelSlot>>,
     pub(crate) config: &'a AgentConfig,
     pub(crate) tool_output_lines: ToolOutputLines,
     pub(crate) permissions: &'a Arc<PermissionManager>,
@@ -81,6 +82,7 @@ pub(crate) struct WorkflowSession {
     runtime: WorkflowRuntime,
     handle: WorkflowHandle,
     mode: SharedMode,
+    effective_model_slot: Arc<ArcSwap<ModelSlot>>,
     answer: AnswerChannel,
 }
 
@@ -94,6 +96,8 @@ impl WorkflowSession {
         let base = AgentParams {
             provider: Arc::clone(&slot.provider),
             model: slot.model.clone(),
+            chat_provider: Arc::clone(&slot.provider),
+            chat_model: slot.model.clone(),
             config: spawn.config.clone(),
             tool_output_lines: spawn.tool_output_lines,
             permissions: Arc::clone(spawn.permissions),
@@ -167,6 +171,7 @@ impl WorkflowSession {
             handle: runtime.handle(),
             runtime,
             mode,
+            effective_model_slot: Arc::clone(spawn.effective_model_slot),
             answer: spawn.answer,
         })
     }
@@ -185,6 +190,10 @@ impl WorkflowSession {
 
     pub(crate) fn mode(&self) -> SharedMode {
         Arc::clone(&self.mode)
+    }
+
+    pub(crate) fn effective_model_slot(&self) -> Arc<ArcSwap<ModelSlot>> {
+        Arc::clone(&self.effective_model_slot)
     }
 
     /// Runs whose script is executing right now, which no agent turn owns.

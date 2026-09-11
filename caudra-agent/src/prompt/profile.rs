@@ -5,10 +5,13 @@ use std::path::Path;
 use std::sync::{Arc, LazyLock, Mutex};
 
 use caudra_config::ModelPolicy;
-use caudra_providers::{Model, ThinkingConfig, Timeouts, provider};
+use caudra_providers::model_registry::Binding;
+use caudra_providers::{Model, ModelPurpose, ThinkingConfig, Timeouts, provider};
 use caudra_storage::thinking::{StoredThinking, ThinkingParseError};
 use serde::Deserialize;
 use thiserror::Error;
+
+use crate::agent::resolve_purpose_model;
 
 pub const BUILTIN_PROFILE_NAME: &str = "builtin";
 
@@ -56,7 +59,7 @@ pub struct SystemPromptProfile {
     name: Arc<str>,
     description: Option<Arc<str>>,
     layout: PromptProfileLayout,
-    subagent_model: Option<Arc<str>>,
+    subagent_model: Option<Binding>,
     subagent_thinking: Option<StoredThinking>,
     body: Arc<str>,
     path: Arc<Path>,
@@ -75,8 +78,8 @@ impl SystemPromptProfile {
         self.layout
     }
 
-    pub fn subagent_model(&self) -> Option<&str> {
-        self.subagent_model.as_deref()
+    pub fn subagent_model(&self) -> Option<&Binding> {
+        self.subagent_model.as_ref()
     }
 
     pub fn subagent_thinking(&self) -> Option<&StoredThinking> {
@@ -215,6 +218,7 @@ impl PromptProfileCatalog {
     pub fn bind_for_tasks(
         &self,
         parent_model: &Model,
+        chat_model: &Model,
         parent_thinking: &ThinkingConfig,
         model_policy: &ModelPolicy,
         timeouts: Timeouts,
@@ -225,6 +229,7 @@ impl PromptProfileCatalog {
             match validate_task_profile(
                 profile,
                 parent_model,
+                chat_model,
                 parent_thinking,
                 model_policy,
                 timeouts,
@@ -309,6 +314,7 @@ fn task_tool_summary<'a>(
 fn validate_task_profile(
     profile: &SystemPromptProfile,
     parent_model: &Model,
+    chat_model: &Model,
     parent_thinking: &ThinkingConfig,
     model_policy: &ModelPolicy,
     timeouts: Timeouts,
@@ -316,11 +322,18 @@ fn validate_task_profile(
     if profile.subagent_model().is_none() && profile.subagent_thinking().is_none() {
         return Ok(());
     }
-    let mut model = match profile.subagent_model() {
-        Some(spec) => Model::from_spec_with_policy(spec, model_policy)
-            .map_err(|error| format!("subagent model {spec:?} is unavailable: {error}"))?,
-        None => Model::clone(parent_model),
-    };
+    let binding = profile.subagent_model();
+    let mut model = resolve_purpose_model(
+        ModelPurpose::Subagent,
+        binding,
+        parent_model,
+        chat_model,
+        model_policy,
+    )
+    .map_err(|error| match binding {
+        Some(binding) => format!("subagent model {binding:?} is unavailable: {error}"),
+        None => format!("global subagent model is unavailable: {error}"),
+    })?;
     provider::adjust_model(&mut model, timeouts)
         .map_err(|error| format!("cannot inspect subagent model {:?}: {error}", model.spec()))?;
     let thinking = profile
@@ -386,7 +399,9 @@ enum PromptProfileError {
     UnclosedFrontmatter,
     #[error("invalid frontmatter: {0}")]
     InvalidFrontmatter(#[from] serde_yaml::Error),
-    #[error("invalid subagent model {model:?}; expected qualified provider/model syntax")]
+    #[error(
+        "invalid subagent model {model:?}; expected qualified provider/model syntax or one of: chat, plan, fast, best"
+    )]
     InvalidSubagentModel { model: String },
     #[error("invalid subagent thinking: {0}")]
     InvalidSubagentThinking(#[from] ThinkingParseError),
@@ -415,8 +430,16 @@ fn validate_profile_name(name: &str) -> Result<(), PromptProfileError> {
     Ok(())
 }
 
-fn parse_subagent_model(model: String) -> Result<Arc<str>, PromptProfileError> {
+fn parse_subagent_model(model: String) -> Result<Binding, PromptProfileError> {
     let model = model.trim();
+    if let Ok(purpose) = model.parse::<ModelPurpose>() {
+        return ModelPurpose::TARGETS
+            .contains(&purpose)
+            .then_some(Binding::Same(purpose))
+            .ok_or_else(|| PromptProfileError::InvalidSubagentModel {
+                model: model.to_owned(),
+            });
+    }
     let valid = model.split_once('/').is_some_and(|(provider, model_id)| {
         !provider.is_empty()
             && provider.as_bytes()[0].is_ascii_alphanumeric()
@@ -436,7 +459,7 @@ fn parse_subagent_model(model: String) -> Result<Arc<str>, PromptProfileError> {
             model: model.to_owned(),
         });
     }
-    Ok(Arc::from(model))
+    Ok(Binding::Exact(model.to_owned()))
 }
 
 fn bounded_summary_description(description: &str) -> String {
@@ -575,6 +598,7 @@ mod tests {
     use caudra_providers::{Model, ThinkingConfig};
     use caudra_storage::thinking::StoredThinking;
     use tempfile::TempDir;
+    use test_case::test_case;
 
     use super::*;
 
@@ -626,7 +650,10 @@ mod tests {
 
         let catalog = discover(dir.path());
         let review = catalog.get("review").unwrap();
-        assert_eq!(review.subagent_model(), Some("custom-provider/org/model"));
+        assert_eq!(
+            review.subagent_model(),
+            Some(&Binding::Exact("custom-provider/org/model".into()))
+        );
         assert_eq!(
             review.subagent_thinking(),
             Some(&StoredThinking::Effort {
@@ -664,8 +691,13 @@ mod tests {
         let parent = Model::from_spec("anthropic/claude-sonnet-4-6").unwrap();
         let policy = ModelPolicy::new(&[], &["openai/gpt-5.4".into()]).unwrap();
 
-        let bindings =
-            catalog.bind_for_tasks(&parent, &ThinkingConfig::Off, &policy, Timeouts::default());
+        let bindings = catalog.bind_for_tasks(
+            &parent,
+            &parent,
+            &ThinkingConfig::Off,
+            &policy,
+            Timeouts::default(),
+        );
 
         assert!(bindings.resolve("plain").unwrap().is_some());
         assert!(matches!(
@@ -686,7 +718,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_subagent_model_syntax_without_requiring_known_provider() {
+    fn rejects_invalid_subagent_model_selectors_without_requiring_known_provider() {
         let dir = TempDir::new().unwrap();
         let profiles = profile_dir(&dir);
         for (name, model) in [
@@ -696,6 +728,10 @@ mod tests {
             ("empty-segment", "provider/org//model"),
             ("bad-provider", "provider.name/model"),
             ("whitespace", "provider/model name"),
+            ("self", "subagent"),
+            ("compact", "compact"),
+            ("title", "title"),
+            ("goal", "goal"),
         ] {
             fs::write(
                 profiles.join(format!("{name}.md")),
@@ -712,7 +748,7 @@ mod tests {
         let catalog = discover(dir.path());
         assert_eq!(
             catalog.get("unknown").unwrap().subagent_model(),
-            Some("not-installed/model")
+            Some(&Binding::Exact("not-installed/model".into()))
         );
         for name in [
             "unqualified",
@@ -721,10 +757,25 @@ mod tests {
             "empty-segment",
             "bad-provider",
             "whitespace",
+            "self",
+            "compact",
+            "title",
+            "goal",
         ] {
             let error = catalog.resolve(Some(name)).unwrap_err();
             assert!(error.to_string().contains("qualified provider/model"));
         }
+    }
+
+    #[test_case("chat", ModelPurpose::Chat ; "chat")]
+    #[test_case("plan", ModelPurpose::Plan ; "plan")]
+    #[test_case("fast", ModelPurpose::Fast ; "fast")]
+    #[test_case("best", ModelPurpose::Best ; "best")]
+    fn parses_named_subagent_model_targets(selector: &str, purpose: ModelPurpose) {
+        assert_eq!(
+            parse_subagent_model(selector.to_owned()).unwrap(),
+            Binding::Same(purpose)
+        );
     }
 
     #[test]

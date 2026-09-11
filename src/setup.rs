@@ -111,7 +111,7 @@ fn from_spec_or_warm_catalog(spec: &str) -> Result<Model, ModelError> {
 }
 
 fn auto_detect_model(policy: &caudra_config::ModelPolicy) -> Option<Model> {
-    for purpose in [ModelPurpose::Best, ModelPurpose::Balanced] {
+    for purpose in [ModelPurpose::Best, ModelPurpose::Fast] {
         for &slug in PROVIDER_PRIORITY {
             if caudra_providers::provider::provider_available(slug)
                 && let Some(model) = Model::curated_default(slug, purpose)

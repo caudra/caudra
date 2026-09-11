@@ -1,6 +1,6 @@
 use caudra_storage::thinking::ReasoningOptions;
 
-use crate::model::{ModelEntry, ModelFamily, ModelPurpose};
+use crate::model::{ModelEntry, ModelFacts, ModelFamily, ModelPurpose};
 use crate::pricing::PricingSchedule;
 use crate::providers::{
     anthropic, aperture, copilot, custom, deepseek, dynamic, google, llama_cpp, mistral, ollama,
@@ -287,52 +287,76 @@ impl ManifestRegistry {
         BUILTINS
     }
 
-    /// Keyed by the real builtin slug, never a borrowed base: a custom provider
-    /// serves whatever its operator loaded, so inheriting a curated default
-    /// through its protocol would name an id that provider does not have.
+    fn model_supply_manifest(slug: &str) -> Option<&'static ProviderManifest> {
+        let dynamic_base = dynamic::base_for_slug(slug).map(|base| base.to_string());
+        Self::model_supply_manifest_with_base(slug, dynamic_base.as_deref())
+    }
+
+    fn model_supply_manifest_with_base(
+        slug: &str,
+        dynamic_base: Option<&str>,
+    ) -> Option<&'static ProviderManifest> {
+        Self::get(slug).or_else(|| dynamic_base.and_then(Self::get))
+    }
+
+    fn facts_from_manifest(manifest: &ProviderManifest, model_id: &str) -> Option<ModelFacts> {
+        manifest
+            .models
+            .iter()
+            .flat_map(|entry| entry.prefixes.iter().map(move |prefix| (prefix, entry)))
+            .filter(|(prefix, _)| model_id.starts_with(*prefix))
+            .max_by_key(|(prefix, _)| prefix.len())
+            .map(|(_, entry)| entry.facts())
+    }
+
+    fn prefixes_from_manifest(
+        manifest: &ProviderManifest,
+        purpose: ModelPurpose,
+    ) -> Vec<&'static str> {
+        let mut entries: Vec<_> = manifest
+            .models
+            .iter()
+            .filter(|entry| entry.class() == purpose)
+            .collect();
+        entries.sort_by_key(|entry| !entry.default);
+        entries
+            .iter()
+            .flat_map(|entry| entry.prefixes)
+            .copied()
+            .collect()
+    }
+
+    /// Builtins and wrappers around a real builtin inherit its curated default.
+    /// Custom protocol aliases do not: their protocol says nothing about which
+    /// model ids the operator serves.
     pub fn find_default_for_purpose(
         slug: &str,
         purpose: ModelPurpose,
     ) -> Option<&'static ModelEntry> {
-        Self::get(slug)?
+        Self::model_supply_manifest(slug)?
             .models
             .iter()
-            .find(|e| e.default && e.purpose == purpose)
+            .find(|entry| entry.default && entry.class() == purpose)
     }
 
-    /// Which slot the curated table files `model_id` under. The longest prefix
-    /// wins, so a table listing both a family and one of its members answers
-    /// with the member rather than whichever entry happens to come first.
+    /// Facts from the most specific curated prefix matching `model_id`.
+    pub fn facts_for_model(slug: &str, model_id: &str) -> Option<ModelFacts> {
+        Self::facts_from_manifest(Self::model_supply_manifest(slug)?, model_id)
+    }
+
+    /// Which size lane the curated table files `model_id` under.
     pub fn purpose_for_model(slug: &str, model_id: &str) -> Option<ModelPurpose> {
-        Self::get(slug)?
-            .models
-            .iter()
-            .filter_map(|entry| {
-                entry
-                    .prefixes
-                    .iter()
-                    .filter(|prefix| model_id.starts_with(*prefix))
-                    .map(|prefix| (prefix.len(), entry.purpose))
-                    .max()
-            })
-            .max()
-            .map(|(_, purpose)| purpose)
+        Self::facts_for_model(slug, model_id).map(|facts| facts.class())
     }
 
     /// Every curated candidate for a slot, the declared default first, so a
     /// caller filtering on a model policy can take the next best rather than
     /// giving up on the provider.
     pub fn prefixes_for_purpose(slug: &str, purpose: ModelPurpose) -> Vec<&'static str> {
-        let Some(manifest) = Self::get(slug) else {
+        let Some(manifest) = Self::model_supply_manifest(slug) else {
             return Vec::new();
         };
-        let mut entries: Vec<_> = manifest
-            .models
-            .iter()
-            .filter(|e| e.purpose == purpose)
-            .collect();
-        entries.sort_by_key(|e| !e.default);
-        entries.iter().flat_map(|e| e.prefixes).copied().collect()
+        Self::prefixes_from_manifest(manifest, purpose)
     }
 }
 
@@ -383,6 +407,36 @@ mod tests {
         let manifest = ManifestRegistry::for_slug("anthropic").unwrap();
         assert_eq!(manifest.slug, "anthropic");
         assert_eq!(manifest.display_name, "Anthropic");
+    }
+
+    #[test]
+    fn dynamic_model_supply_inherits_base_facts_and_candidates() {
+        let manifest = ManifestRegistry::model_supply_manifest_with_base(
+            "test-openai-wrapper",
+            Some("openai"),
+        )
+        .unwrap();
+        let facts = ManifestRegistry::facts_from_manifest(manifest, "gpt-4.1-nano");
+        let candidates = ManifestRegistry::prefixes_from_manifest(manifest, ModelPurpose::Fast);
+
+        assert_eq!(manifest.slug, "openai");
+        assert_eq!(
+            facts,
+            Some(ModelFacts {
+                small: true,
+                default: false,
+            })
+        );
+        assert_eq!(candidates.first().copied(), Some("gpt-5.6-luna"));
+        assert_eq!(
+            format!("{}/{}", "test-openai-wrapper", candidates[0]),
+            "test-openai-wrapper/gpt-5.6-luna"
+        );
+    }
+
+    #[test]
+    fn custom_protocol_aliases_do_not_inherit_model_supply() {
+        assert!(ManifestRegistry::model_supply_manifest_with_base("custom-openai", None).is_none());
     }
 
     #[test]

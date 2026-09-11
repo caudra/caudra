@@ -6,11 +6,11 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use tracing::{Instrument, debug, error, info, info_span, warn};
 
-use caudra_providers::model_registry::Binding;
-use caudra_providers::provider::Provider;
+use caudra_providers::model_registry::{self, Binding};
+use caudra_providers::provider::{self, Provider};
 use caudra_providers::{
-    Billing, ContentBlock, EMPTY_RESPONSE_MARKER, Message, Model, ModelPurpose, RequestOptions,
-    Role, StopReason, StreamResponse, TokenUsage, estimate_tokens_cached,
+    Billing, ContentBlock, EMPTY_RESPONSE_MARKER, Message, Model, ModelError, ModelPurpose,
+    RequestOptions, Role, StopReason, StreamResponse, Timeouts, TokenUsage, estimate_tokens_cached,
 };
 
 use super::compaction;
@@ -88,6 +88,87 @@ const RESUME_PROMPT: &str =
 /// Reported in place of a spec when nothing is bound to the goal evaluator.
 const UNBOUND_EVALUATOR: &str = "default";
 
+/// Resolves an explicit or global binding against the selected Chat model.
+/// With no binding, the caller's effective model is the automatic fallback.
+pub fn resolve_purpose_model(
+    purpose: ModelPurpose,
+    binding_override: Option<&Binding>,
+    default_model: &Model,
+    chat_model: &Model,
+    model_policy: &ModelPolicy,
+) -> Result<Model, ModelError> {
+    let binding = model_registry::binding(purpose);
+    resolve_captured_purpose_model(
+        purpose,
+        binding_override,
+        binding.as_ref(),
+        default_model,
+        chat_model,
+        model_policy,
+    )
+}
+
+fn resolve_captured_purpose_model(
+    purpose: ModelPurpose,
+    binding_override: Option<&Binding>,
+    purpose_binding: Option<&Binding>,
+    default_model: &Model,
+    chat_model: &Model,
+    model_policy: &ModelPolicy,
+) -> Result<Model, ModelError> {
+    let binding = binding_override.or(purpose_binding);
+    match binding {
+        Some(binding) => Model::resolve_binding(purpose, Some(binding), chat_model, model_policy),
+        None => Model::resolve_binding(purpose, None, default_model, model_policy),
+    }
+}
+
+pub struct ModelRoute<'a> {
+    pub provider: &'a Arc<dyn Provider>,
+    pub model: &'a Model,
+}
+
+/// Resolves a purpose and pairs it with a provider ready to serve the model.
+/// An existing effective or Chat provider is reused when its model wins.
+pub async fn resolve_model_for_purpose(
+    default: ModelRoute<'_>,
+    chat: ModelRoute<'_>,
+    purpose: ModelPurpose,
+    binding_override: Option<&Binding>,
+    timeouts: Timeouts,
+    model_policy: &ModelPolicy,
+) -> Result<(Arc<dyn Provider>, Model), AgentError> {
+    let default_anchor = default.model.clone();
+    let chat_anchor = chat.model.clone();
+    let policy = model_policy.clone();
+    let binding = binding_override.cloned();
+    let mut model = smol::unblock(move || {
+        resolve_purpose_model(
+            purpose,
+            binding.as_ref(),
+            &default_anchor,
+            &chat_anchor,
+            &policy,
+        )
+    })
+    .await
+    .map_err(|error| AgentError::Config {
+        message: format!("cannot resolve the {purpose} model: {error}"),
+    })?;
+
+    if model.provider == default.model.provider && model.id == default.model.id {
+        default.provider.adjust_model(&mut model);
+        return Ok((Arc::clone(default.provider), model));
+    }
+    if model.provider == chat.model.provider && model.id == chat.model.id {
+        chat.provider.adjust_model(&mut model);
+        return Ok((Arc::clone(chat.provider), model));
+    }
+
+    let provider = provider::from_model_async(&mut model, timeouts).await?;
+    Ok((Arc::from(provider), model))
+}
+
 pub fn resolve_compaction_model(
     provider: &Arc<dyn Provider>,
     model: &Model,
@@ -116,6 +197,8 @@ enum TurnOutcome {
 pub struct AgentParams {
     pub provider: Arc<dyn Provider>,
     pub model: Model,
+    pub chat_provider: Arc<dyn Provider>,
+    pub chat_model: Model,
     pub config: AgentConfig,
     pub tool_output_lines: ToolOutputLines,
     pub permissions: Arc<PermissionManager>,
@@ -160,6 +243,8 @@ pub struct AgentRunParams<'h> {
 pub struct Agent<'h> {
     provider: Arc<dyn Provider>,
     model: Arc<Model>,
+    chat_provider: Arc<dyn Provider>,
+    chat_model: Arc<Model>,
     history: &'h mut History,
     system: String,
     environment: Option<String>,
@@ -214,17 +299,35 @@ pub struct Agent<'h> {
 
 impl<'h> Agent<'h> {
     pub fn new(params: AgentParams, run: AgentRunParams<'h>) -> Self {
+        let shared_route = Arc::ptr_eq(&params.provider, &params.chat_provider)
+            && params.model.provider == params.chat_model.provider
+            && params.model.id == params.chat_model.id;
         let mut model = params.model;
         params.provider.adjust_model(&mut model);
+        let chat_model = if shared_route {
+            model.clone()
+        } else {
+            let mut chat_model = params.chat_model;
+            params.chat_provider.adjust_model(&mut chat_model);
+            chat_model
+        };
         // Seeded before the history moves in: a restored session keeps the
         // tools it already searched for rather than hunting them again.
         let deferral = DeferralSession::new(
             run.deferred,
             crate::tools::deferral::loaded_tool_names(run.history.as_slice()),
         );
+        let model = Arc::new(model);
+        let chat_model = if shared_route {
+            Arc::clone(&model)
+        } else {
+            Arc::new(chat_model)
+        };
         Self {
             provider: params.provider,
-            model: Arc::new(model),
+            model,
+            chat_provider: params.chat_provider,
+            chat_model,
             config: params.config,
             tool_output_lines: params.tool_output_lines,
             permissions: params.permissions,
@@ -280,6 +383,14 @@ impl<'h> Agent<'h> {
     pub fn with_mcp(mut self, mcp: Option<McpSession>) -> Self {
         self.mcp = mcp;
         self
+    }
+
+    fn readjust_model(&mut self) {
+        let chat_follows_model = Arc::ptr_eq(&self.model, &self.chat_model);
+        self.provider.adjust_model(Arc::make_mut(&mut self.model));
+        if chat_follows_model {
+            self.chat_model = Arc::clone(&self.model);
+        }
     }
 
     pub fn with_user_response_rx(
@@ -684,6 +795,7 @@ impl<'h> Agent<'h> {
         let options = self.opts.clamped(&self.model);
         let task_profiles = self.prompt_profiles.bind_for_tasks(
             &self.model,
+            &self.chat_model,
             &options.thinking,
             &self.model_policy,
             self.timeouts,
@@ -1119,7 +1231,7 @@ impl<'h> Agent<'h> {
             error!(error = %err, attempts = self.reauth_attempts, "max re-auth attempts reached");
             return Err(err);
         }
-        let Some(rx) = &self.user_response_rx else {
+        let Some(rx) = self.user_response_rx.as_ref().map(Arc::clone) else {
             error!(error = %err, model = %self.model.id, turns = self.num_turns, "stream_message failed");
             return Err(err);
         };
@@ -1153,14 +1265,14 @@ impl<'h> Agent<'h> {
             match wake {
                 Wake::Response(Ok(_)) => {
                     self.provider.refresh_auth().await?;
-                    self.provider.adjust_model(Arc::make_mut(&mut self.model));
+                    self.readjust_model();
                     self.event_tx.send(AgentEvent::AuthRestored)?;
                     return Ok(TurnOutcome::Continue);
                 }
                 Wake::Response(Err(_)) | Wake::Cancelled => return Err(AgentError::Cancelled),
                 Wake::Poll => match self.provider.reload_auth_if_changed().await {
                     Ok(true) => {
-                        self.provider.adjust_model(Arc::make_mut(&mut self.model));
+                        self.readjust_model();
                         self.event_tx.send(AgentEvent::AuthRestored)?;
                         return Ok(TurnOutcome::Continue);
                     }
@@ -1269,6 +1381,8 @@ impl<'h> Agent<'h> {
         ToolContext {
             provider: Arc::clone(&self.provider),
             model: Arc::clone(&self.model),
+            chat_provider: Arc::clone(&self.chat_provider),
+            chat_model: Arc::clone(&self.chat_model),
             event_tx: self.event_tx.clone(),
             mode: self.mode.clone(),
             session_id: self.session_id.clone(),
@@ -1643,6 +1757,9 @@ mod tests {
     const INSTRUCTIONS_CHANGED: &str =
         "<system-reminder>\n# Instructions changed\n\n+ be brief\n</system-reminder>";
     const MENTION_BODY: &str = "<file path=\"a.rs\">fn main() {}</file>";
+    const OVERRIDE_MODEL_SPEC: &str = "openai/gpt-5.4";
+    const PLAN_MODEL_SPEC: &str = "openai/gpt-5.4";
+    const PROFILE_MODEL_SPEC: &str = "anthropic/claude-opus-4-6";
     const MODEL_UNAVAILABLE: &str = r#"{"error":{"code":"model_not_found","message":"model 'claude-haiku-4-5' not found","param":"model","type":"invalid_request_error"}}"#;
 
     struct MockInterruptSource {
@@ -1930,6 +2047,96 @@ mod tests {
         Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap()
     }
 
+    #[derive(Clone, Copy)]
+    enum TestBinding {
+        None,
+        Exact(&'static str),
+        Chat,
+    }
+
+    impl TestBinding {
+        fn binding(self) -> Option<Binding> {
+            match self {
+                Self::None => None,
+                Self::Exact(spec) => Some(Binding::Exact(spec.into())),
+                Self::Chat => Some(Binding::Same(ModelPurpose::Chat)),
+            }
+        }
+    }
+
+    #[test_case(TestBinding::None, TestBinding::None, PLAN_MODEL_SPEC ; "unbound_inherits_effective_plan")]
+    #[test_case(TestBinding::Exact(PROFILE_MODEL_SPEC), TestBinding::None, PROFILE_MODEL_SPEC ; "global_exact_override")]
+    #[test_case(TestBinding::Chat, TestBinding::None, "anthropic/claude-sonnet-4-20250514" ; "global_same_chat_override")]
+    #[test_case(TestBinding::Exact(PLAN_MODEL_SPEC), TestBinding::Exact(PROFILE_MODEL_SPEC), PROFILE_MODEL_SPEC ; "profile_exact_override")]
+    #[test_case(TestBinding::Exact(PLAN_MODEL_SPEC), TestBinding::Chat, "anthropic/claude-sonnet-4-20250514" ; "profile_same_chat_override")]
+    fn subagent_binding_uses_effective_default_and_selected_chat_anchor(
+        global: TestBinding,
+        profile: TestBinding,
+        expected: &str,
+    ) {
+        let chat = default_model();
+        let plan = Model::from_spec(PLAN_MODEL_SPEC).unwrap();
+        let global = global.binding();
+        let profile = profile.binding();
+
+        let resolved = resolve_captured_purpose_model(
+            ModelPurpose::Subagent,
+            profile.as_ref(),
+            global.as_ref(),
+            &plan,
+            &chat,
+            &ModelPolicy::default(),
+        )
+        .unwrap();
+
+        assert_eq!(resolved.spec(), expected);
+    }
+
+    #[test_case(ModelPurpose::Plan ; "plan")]
+    #[test_case(ModelPurpose::Subagent ; "subagent")]
+    fn explicit_purpose_override_does_not_consult_the_global_binding(purpose: ModelPurpose) {
+        let model = resolve_purpose_model(
+            purpose,
+            Some(&Binding::Exact(OVERRIDE_MODEL_SPEC.into())),
+            &default_model(),
+            &default_model(),
+            &ModelPolicy::default(),
+        )
+        .unwrap();
+
+        assert_eq!(model.spec(), OVERRIDE_MODEL_SPEC);
+    }
+
+    #[test_case(ModelPurpose::Plan ; "plan")]
+    #[test_case(ModelPurpose::Subagent ; "subagent")]
+    fn unchanged_purpose_model_reuses_the_running_provider(purpose: ModelPurpose) {
+        smol::block_on(async {
+            let current_provider: Arc<dyn Provider> = Arc::new(MockProvider::new(Vec::new()));
+            let current_model = default_model();
+            let binding = Binding::Exact(current_model.spec());
+
+            let (resolved_provider, resolved_model) = resolve_model_for_purpose(
+                ModelRoute {
+                    provider: &current_provider,
+                    model: &current_model,
+                },
+                ModelRoute {
+                    provider: &current_provider,
+                    model: &current_model,
+                },
+                purpose,
+                Some(&binding),
+                Timeouts::default(),
+                &ModelPolicy::default(),
+            )
+            .await
+            .unwrap();
+
+            assert!(Arc::ptr_eq(&resolved_provider, &current_provider));
+            assert_eq!(resolved_model.spec(), current_model.spec());
+        });
+    }
+
     fn text_response(stop_reason: StopReason) -> StreamResponse {
         StreamResponse {
             message: Message {
@@ -2006,10 +2213,14 @@ mod tests {
         history: &mut History,
     ) -> (Agent<'_>, flume::Receiver<Envelope>) {
         let (raw_tx, event_rx) = flume::unbounded();
+        let provider: Arc<dyn Provider> = Arc::new(provider);
+        let model = default_model();
         let agent = Agent::new(
             AgentParams {
-                provider: Arc::new(provider),
-                model: default_model(),
+                provider: Arc::clone(&provider),
+                model: model.clone(),
+                chat_provider: provider,
+                chat_model: model,
                 config: AgentConfig::default(),
                 tool_output_lines: ToolOutputLines::default(),
                 permissions: Arc::new(PermissionManager::new_nonpersistent(

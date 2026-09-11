@@ -1455,11 +1455,17 @@ fn handle_control_request(
         }
         "set_model" => {
             match resolve_set_model(cr.request.extra.get("model"), startup_model, model_policy) {
-                Some(model) => {
-                    let _ = handle.model_tx.send(model.clone());
-                    shared.lock().unwrap().model = model;
-                    writer.emit_control_response(&cr.request_id, ok, None)
-                }
+                Some(model) => match smol::block_on(handle.set_model(model)) {
+                    Ok(model) => {
+                        shared.lock().unwrap().model = model;
+                        writer.emit_control_response(&cr.request_id, ok, None)
+                    }
+                    Err(error) => writer.emit_control_response(
+                        &cr.request_id,
+                        None,
+                        Some(error.user_message()),
+                    ),
+                },
                 None => writer.emit_control_response(
                     &cr.request_id,
                     None,

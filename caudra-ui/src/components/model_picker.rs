@@ -6,34 +6,43 @@ use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 use ratatui::text::{Line, Span};
 
-use caudra_providers::ModelPurpose;
+use caudra_config::ModelPolicy;
 use caudra_providers::dynamic;
 use caudra_providers::model_registry::{self, Binding};
 use caudra_providers::provider::ProviderKind;
+use caudra_providers::{Model, ModelPurpose};
 
 use crate::components::Overlay;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
 use crate::repaint::{Cadence, Dirty, Watch};
 use crate::theme;
 
+const HOME_TITLE: &str = " Models ";
+const JOBS_SECTION: &str = "Jobs";
 const TARGET_SECTION: &str = "Binding";
 const DEFAULT_ROW: &str = "Default";
-const DEFAULT_DETAIL: &str = "unbound";
-const SAME_DETAIL: &str = "follows another slot";
+const DEFAULT_DETAIL: &str = "automatic resolution";
+const SAME_PREFIX: &str = "Same as ";
+const SAME_DETAIL: &str = "follow this job";
 const SAVED_DETAIL: &str = "saved exact model";
 const RECENT_SECTION: &str = "Recent";
 const FREE_LABEL: &str = "Free";
 const DETAIL_SEPARATOR: &str = " · ";
 const LOADING_MODELS: &str = "Loading models...";
 const NO_MATCHES: &str = "No matches";
+const DEFAULT_BINDING: &str = "default";
+const PINNED_BINDING: &str = "pinned";
+const UNAVAILABLE_PREFIX: &str = "Unavailable: ";
+const JOB_KEY_PREFIX: &str = "@job:";
+const PICKER_WIDTH_PERCENT: u16 = 90;
 
-fn model_footer_line() -> Line<'static> {
+fn home_footer_line() -> Line<'static> {
     let t = theme::current();
     Line::from(vec![
         Span::styled("  Enter", t.keybind_key),
-        Span::styled(" select", t.tool_dim),
-        Span::styled("  Tab/Shift+Tab", t.keybind_key),
-        Span::styled(" purpose", t.tool_dim),
+        Span::styled(" select/open", t.tool_dim),
+        Span::styled("  Esc", t.keybind_key),
+        Span::styled(" close", t.tool_dim),
     ])
 }
 
@@ -43,15 +52,18 @@ fn assignment_footer_line() -> Line<'static> {
         Span::styled("  Enter", t.keybind_key),
         Span::styled(" assign", t.tool_dim),
         Span::styled("  R", t.keybind_key),
-        Span::styled(" reset", t.tool_dim),
-        Span::styled("  Tab/Shift+Tab", t.keybind_key),
-        Span::styled(" purpose", t.tool_dim),
+        Span::styled(" unbind", t.tool_dim),
+        Span::styled("  Esc", t.keybind_key),
+        Span::styled(" back", t.tool_dim),
     ])
 }
 
 fn is_reset_key(key: KeyEvent) -> bool {
-    matches!(key.code, KeyCode::Char('R'))
-        || (key.code == KeyCode::Char('r') && key.modifiers.contains(KeyModifiers::SHIFT))
+    match key.code {
+        KeyCode::Char('R') => key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT,
+        KeyCode::Char('r') => key.modifiers == KeyModifiers::SHIFT,
+        _ => false,
+    }
 }
 
 pub enum ModelPickerAction {
@@ -68,18 +80,53 @@ struct ModelEntry {
     provider_display: String,
     suffix: Option<String>,
     detail: String,
-    /// Every slot pointed at this row, so one accent cannot hide that a model
-    /// serves several workloads.
+    search_text: String,
     claimed_by: Vec<ModelPurpose>,
-    /// What selecting this row binds the open purpose to. `None` unbinds.
     binds: Option<Binding>,
+    job: Option<ModelPurpose>,
     selected: bool,
     free: bool,
+}
+
+impl ModelEntry {
+    fn rebuild_search_text(&mut self) {
+        self.search_text = format!(
+            "{} {} {} {} {}",
+            self.id,
+            self.spec,
+            self.provider_display,
+            self.suffix.as_deref().unwrap_or_default(),
+            self.detail
+        );
+    }
+
+    fn with_search_text(mut self) -> Self {
+        self.rebuild_search_text();
+        self
+    }
+
+    fn identity(&self) -> RowIdentity {
+        if let Some(purpose) = self.job {
+            return RowIdentity::Job(purpose);
+        }
+        if self.suffix.is_some() {
+            return RowIdentity::RecentModel(self.spec.clone());
+        }
+        match &self.binds {
+            Some(Binding::Same(target)) => RowIdentity::Binding(Some(*target)),
+            Some(Binding::Exact(_)) => RowIdentity::ExactModel(self.spec.clone()),
+            None => RowIdentity::Binding(None),
+        }
+    }
 }
 
 impl PickerItem for ModelEntry {
     fn label(&self) -> &str {
         &self.id
+    }
+
+    fn search_text(&self) -> &str {
+        &self.search_text
     }
 
     fn suffix(&self) -> Option<&str> {
@@ -103,15 +150,24 @@ fn title_for(purpose: ModelPurpose) -> String {
     format!(" Models · {} ", purpose.label())
 }
 
-fn shifted(purpose: ModelPurpose, backwards: bool) -> ModelPurpose {
-    let all = ModelPurpose::ALL;
-    let index = all.iter().position(|p| *p == purpose).unwrap_or(0);
-    let next = if backwards {
-        index.checked_sub(1).unwrap_or(all.len() - 1)
-    } else {
-        (index + 1) % all.len()
-    };
-    all[next]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PickerPage {
+    Home,
+    Job(ModelPurpose),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RowIdentity {
+    Job(ModelPurpose),
+    Binding(Option<ModelPurpose>),
+    RecentModel(String),
+    ExactModel(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SelectionAnchor {
+    page: PickerPage,
+    row: RowIdentity,
 }
 
 pub struct ModelPicker {
@@ -119,12 +175,12 @@ pub struct ModelPicker {
     models: Arc<ArcSwapOption<Vec<String>>>,
     available: Watch<Vec<String>>,
     recents: Vec<String>,
-    current_spec: String,
-    purpose: ModelPurpose,
+    current_model: Option<Model>,
+    model_policy: Option<ModelPolicy>,
+    page: PickerPage,
     binding: Option<Binding>,
     needs_rebuild: bool,
-    /// User-moved entry to restore on refresh: `(was_recent, spec)`.
-    anchor: Option<(bool, String)>,
+    anchor: Option<SelectionAnchor>,
 }
 
 impl ModelPicker {
@@ -132,12 +188,14 @@ impl ModelPicker {
         Self {
             picker: ListPicker::new()
                 .with_relevance_order()
-                .with_footer_builder(model_footer_line),
+                .with_width_percent(PICKER_WIDTH_PERCENT)
+                .with_footer_builder(home_footer_line),
             models,
             available: Watch::default(),
             recents: Vec::new(),
-            current_spec: String::new(),
-            purpose: ModelPurpose::Chat,
+            current_model: None,
+            model_policy: None,
+            page: PickerPage::Home,
             binding: None,
             needs_rebuild: false,
             anchor: None,
@@ -149,29 +207,64 @@ impl ModelPicker {
         self.needs_rebuild = true;
     }
 
-    pub fn open(&mut self, current_spec: &str) {
-        self.open_purpose(current_spec, ModelPurpose::Chat);
-    }
-
-    pub fn open_purpose(&mut self, current_spec: &str, purpose: ModelPurpose) {
-        self.purpose = purpose;
-        self.current_spec = current_spec.to_owned();
-        self.binding = model_registry::binding(purpose);
+    pub fn open(&mut self, current_model: &Model, model_policy: &ModelPolicy) {
+        self.current_model = Some(current_model.clone());
+        self.model_policy = Some(model_policy.clone());
         self.anchor = None;
         self.needs_rebuild = false;
-        self.picker.set_footer_builder(self.footer_builder());
         let _ = self.available.poll(self.models.load_full());
         self.sync_empty_text();
-        let entries = self.load_entries();
-        self.picker.open(entries, title_for(purpose));
-        self.preselect_purpose();
+        self.open_home_page();
     }
 
-    fn footer_builder(&self) -> fn() -> Line<'static> {
-        if self.purpose == ModelPurpose::Chat {
-            model_footer_line
-        } else {
-            assignment_footer_line
+    pub fn open_purpose(
+        &mut self,
+        current_model: &Model,
+        model_policy: &ModelPolicy,
+        purpose: ModelPurpose,
+    ) {
+        self.open(current_model, model_policy);
+        if purpose != ModelPurpose::Chat {
+            self.open_job_page(purpose);
+        }
+    }
+
+    fn open_home_page(&mut self) {
+        self.page = PickerPage::Home;
+        self.binding = None;
+        self.picker.set_footer_builder(home_footer_line);
+        let entries = self.load_entries();
+        self.picker.open(entries, HOME_TITLE);
+        self.preselect_page();
+        self.capture_anchor();
+    }
+
+    fn open_job_page(&mut self, purpose: ModelPurpose) {
+        self.page = PickerPage::Job(purpose);
+        self.binding = model_registry::binding(purpose);
+        self.anchor = None;
+        self.picker.set_footer_builder(assignment_footer_line);
+        let entries = self.load_entries();
+        self.picker.open(entries, title_for(purpose));
+        self.preselect_page();
+        self.capture_anchor();
+    }
+
+    fn return_home(&mut self, purpose: ModelPurpose) {
+        self.anchor = None;
+        self.open_home_page();
+        self.picker
+            .select_item_by(|entry| entry.job == Some(purpose));
+        self.capture_anchor();
+    }
+
+    fn select_current_model_row(&mut self) {
+        if !self.picker.is_open() {
+            self.open_home_page();
+        }
+        if let Some(spec) = self.current_model.as_ref().map(Model::spec) {
+            self.preselect_spec(&spec);
+            self.capture_anchor();
         }
     }
 
@@ -188,15 +281,16 @@ impl ModelPicker {
             return Dirty::NO;
         }
         self.needs_rebuild = false;
+        if let PickerPage::Job(purpose) = self.page {
+            self.binding = model_registry::binding(purpose);
+        }
         self.sync_empty_text();
         let entries = self.load_entries();
         self.picker.replace_items(entries);
-        if let Some((was_recent, spec)) = &self.anchor {
-            self.picker
-                .select_item_by(|e| e.spec == *spec && e.suffix().is_some() == *was_recent);
-        } else {
-            self.preselect_purpose();
+        if !self.restore_anchor() {
+            self.preselect_page();
         }
+        self.capture_anchor();
         Dirty::YES
     }
 
@@ -211,21 +305,26 @@ impl ModelPicker {
 
     fn load_entries(&self) -> Vec<ModelEntry> {
         let specs = self.available.get();
-        let mut entries = if self.purpose == ModelPurpose::Chat {
-            Vec::new()
-        } else {
-            binding_entries(self.purpose)
+        let current_spec = self
+            .current_model
+            .as_ref()
+            .map(Model::spec)
+            .unwrap_or_default();
+        let mut entries = match self.page {
+            PickerPage::Home => self.job_entries(),
+            PickerPage::Job(purpose) => binding_entries(purpose),
         };
         for entry in &mut entries {
-            self.mark_selection(entry);
+            self.mark_selection(entry, &current_spec);
         }
 
         let mut recents = Vec::new();
         for spec in &self.recents {
             if let Some(mut e) = parse_model_entry(spec) {
-                self.mark_selection(&mut e);
+                self.mark_selection(&mut e, &current_spec);
                 e.suffix = Some(std::mem::take(&mut e.provider_display));
                 e.provider_display = RECENT_SECTION.to_string();
+                e.rebuild_search_text();
                 recents.push(e);
             }
         }
@@ -234,23 +333,23 @@ impl ModelPicker {
                 s.iter()
                     .filter_map(|spec| {
                         let mut entry = parse_model_entry(spec)?;
-                        self.mark_selection(&mut entry);
+                        self.mark_selection(&mut entry, &current_spec);
                         Some(entry)
                     })
                     .collect()
             })
             .unwrap_or_default();
-        if self.purpose == ModelPurpose::Chat
-            && !self.current_spec.is_empty()
-            && !recents.iter().any(|entry| entry.spec == self.current_spec)
-            && !full.iter().any(|entry| entry.spec == self.current_spec)
-            && let Some(mut current) = parse_model_entry(&self.current_spec)
+        if !current_spec.is_empty()
+            && !recents.iter().any(|entry| entry.spec == current_spec)
+            && !full.iter().any(|entry| entry.spec == current_spec)
+            && let Some(mut current) = parse_model_entry(&current_spec)
         {
-            self.mark_selection(&mut current);
+            self.mark_selection(&mut current, &current_spec);
             full.push(current);
         }
         sort_models(&mut full);
-        if let Some(spec) = self.bound_spec()
+        if matches!(self.page, PickerPage::Job(_))
+            && let Some(spec) = self.bound_spec()
             && !recents.iter().any(|entry| entry.spec == spec)
             && !full.iter().any(|entry| entry.spec == spec)
         {
@@ -261,13 +360,22 @@ impl ModelPicker {
         entries
     }
 
-    /// Chat picks a session model, every other purpose picks a binding, so what
-    /// counts as the current row differs.
-    fn mark_selection(&self, entry: &mut ModelEntry) {
-        entry.selected = if self.purpose == ModelPurpose::Chat {
-            entry.spec == self.current_spec
-        } else {
-            entry.binds == self.binding
+    fn job_entries(&self) -> Vec<ModelEntry> {
+        let (Some(current_model), Some(model_policy)) =
+            (self.current_model.as_ref(), self.model_policy.as_ref())
+        else {
+            return Vec::new();
+        };
+        ModelPurpose::ALL
+            .into_iter()
+            .map(|purpose| job_entry(purpose, current_model, model_policy))
+            .collect()
+    }
+
+    fn mark_selection(&self, entry: &mut ModelEntry, current_spec: &str) {
+        entry.selected = match self.page {
+            PickerPage::Home => entry.job.is_none() && entry.spec == current_spec,
+            PickerPage::Job(_) => entry.job.is_none() && entry.binds == self.binding,
         };
     }
 
@@ -278,14 +386,19 @@ impl ModelPicker {
         }
     }
 
-    fn preselect_purpose(&mut self) {
-        if self.purpose == ModelPurpose::Chat {
-            let spec = self.current_spec.clone();
-            self.preselect_spec(&spec);
-        } else if let Some(spec) = self.bound_spec().map(str::to_owned) {
-            self.preselect_spec(&spec);
-        } else {
-            self.picker.select_item_by(|entry| entry.selected);
+    fn preselect_page(&mut self) {
+        match self.page {
+            PickerPage::Home => {
+                self.picker
+                    .select_item_by(|entry| entry.job == Some(ModelPurpose::Chat));
+            }
+            PickerPage::Job(_) => {
+                if let Some(spec) = self.bound_spec().map(str::to_owned) {
+                    self.preselect_spec(&spec);
+                } else {
+                    self.picker.select_item_by(|entry| entry.selected);
+                }
+            }
         }
     }
 
@@ -312,20 +425,32 @@ impl ModelPicker {
 
     pub fn scroll(&mut self, delta: i32) {
         self.picker.scroll(delta);
+        self.capture_anchor();
     }
 
     fn track_anchor<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
-        let before = self.picker.selected_index();
         let result = f(self);
-        if let (Some(before), Some(after)) = (before, self.picker.selected_index())
-            && before != after
-        {
-            self.anchor = self
-                .picker
-                .selected_item()
-                .map(|e| (e.suffix().is_some(), e.spec.clone()));
-        }
+        self.capture_anchor();
         result
+    }
+
+    fn capture_anchor(&mut self) {
+        self.anchor = self.picker.selected_item().map(|entry| SelectionAnchor {
+            page: self.page,
+            row: entry.identity(),
+        });
+    }
+
+    fn restore_anchor(&mut self) -> bool {
+        let Some(anchor) = self
+            .anchor
+            .clone()
+            .filter(|anchor| anchor.page == self.page)
+        else {
+            return false;
+        };
+        self.picker
+            .select_item_by(|entry| entry.identity() == anchor.row)
     }
 
     pub fn handle_paste(&mut self, text: &str) -> bool {
@@ -344,32 +469,23 @@ impl ModelPicker {
     }
 
     fn handle_key_inner(&mut self, key: KeyEvent) -> ModelPickerAction {
-        let backwards = match key.code {
-            KeyCode::BackTab => Some(true),
-            KeyCode::Tab => Some(key.modifiers.contains(KeyModifiers::SHIFT)),
-            _ => None,
-        };
-        if let Some(backwards) = backwards {
-            self.purpose = shifted(self.purpose, backwards);
-            self.binding = model_registry::binding(self.purpose);
-            self.anchor = None;
-            self.picker.set_title(title_for(self.purpose));
-            self.picker.set_footer_builder(self.footer_builder());
-            let entries = self.load_entries();
-            self.picker.replace_items(entries);
-            self.preselect_purpose();
+        if key.code == KeyCode::Esc
+            && let PickerPage::Job(purpose) = self.page
+        {
+            self.return_home(purpose);
             return ModelPickerAction::Consumed;
         }
-        if is_reset_key(key) {
+        if is_reset_key(key)
+            && let PickerPage::Job(purpose) = self.page
+        {
+            self.binding = None;
             self.anchor = None;
             self.picker.clear_search();
+            let entries = self.load_entries();
+            self.picker.replace_items(entries);
+            self.preselect_page();
             self.needs_rebuild = true;
-            if self.purpose == ModelPurpose::Chat {
-                self.preselect_purpose();
-                return ModelPickerAction::Consumed;
-            }
-            self.binding = None;
-            return ModelPickerAction::Unbind(self.purpose);
+            return ModelPickerAction::Unbind(purpose);
         }
         let action = self.picker.handle_key(key);
         self.map_picker_action(action)
@@ -378,17 +494,27 @@ impl ModelPicker {
     fn map_picker_action(&mut self, action: PickerAction<ModelEntry>) -> ModelPickerAction {
         match action {
             PickerAction::Consumed => ModelPickerAction::Consumed,
-            PickerAction::Select(entry) if self.purpose == ModelPurpose::Chat => {
-                ModelPickerAction::Select(entry.spec)
-            }
-            PickerAction::Select(entry) => {
-                self.binding = entry.binds.clone();
-                self.needs_rebuild = true;
-                match entry.binds {
-                    Some(binding) => ModelPickerAction::Bind(self.purpose, binding),
-                    None => ModelPickerAction::Unbind(self.purpose),
+            PickerAction::Select(entry) => match self.page {
+                PickerPage::Home => match entry.job {
+                    Some(purpose) => {
+                        if purpose == ModelPurpose::Chat {
+                            self.select_current_model_row();
+                        } else {
+                            self.open_job_page(purpose);
+                        }
+                        ModelPickerAction::Consumed
+                    }
+                    None => ModelPickerAction::Select(entry.spec),
+                },
+                PickerPage::Job(purpose) => {
+                    self.binding = entry.binds.clone();
+                    self.needs_rebuild = true;
+                    match entry.binds {
+                        Some(binding) => ModelPickerAction::Bind(purpose, binding),
+                        None => ModelPickerAction::Unbind(purpose),
+                    }
                 }
-            }
+            },
             PickerAction::Close => ModelPickerAction::Close,
             PickerAction::Toggle(..) => ModelPickerAction::Consumed,
         }
@@ -399,16 +525,70 @@ impl ModelPicker {
     }
 }
 
+fn job_entry(
+    purpose: ModelPurpose,
+    current_model: &Model,
+    model_policy: &ModelPolicy,
+) -> ModelEntry {
+    let binding = model_registry::binding(purpose);
+    job_entry_with_binding(purpose, binding, current_model, model_policy)
+}
+
+fn job_entry_with_binding(
+    purpose: ModelPurpose,
+    binding: Option<Binding>,
+    current_model: &Model,
+    model_policy: &ModelPolicy,
+) -> ModelEntry {
+    let suffix = match binding.as_ref() {
+        None => DEFAULT_BINDING.to_string(),
+        Some(Binding::Same(target)) => format!("same as {}", target.label()),
+        Some(Binding::Exact(_)) => PINNED_BINDING.to_string(),
+    };
+    let detail = match Model::resolve_binding_if_available(
+        purpose,
+        binding.as_ref(),
+        current_model,
+        model_policy,
+    ) {
+        Ok(model) => model.spec(),
+        Err(error) => {
+            let unavailable = format!("{UNAVAILABLE_PREFIX}{error}");
+            match binding.as_ref() {
+                Some(Binding::Exact(spec)) => {
+                    format!("{spec}{DETAIL_SEPARATOR}{unavailable}")
+                }
+                _ => unavailable,
+            }
+        }
+    };
+    ModelEntry {
+        spec: format!("{JOB_KEY_PREFIX}{purpose}"),
+        id: purpose.label().to_string(),
+        provider_display: JOBS_SECTION.to_string(),
+        suffix: Some(suffix),
+        detail,
+        search_text: String::new(),
+        claimed_by: Vec::new(),
+        binds: binding,
+        job: Some(purpose),
+        selected: false,
+        free: false,
+    }
+    .with_search_text()
+}
+
 /// Rows that bind a purpose to something other than one exact model: the unbound
 /// default, plus every slot this purpose may follow.
 fn binding_entries(purpose: ModelPurpose) -> Vec<ModelEntry> {
     std::iter::once(binding_row(DEFAULT_ROW, DEFAULT_DETAIL, None))
         .chain(
-            ModelPurpose::CLASSES
+            ModelPurpose::TARGETS
                 .into_iter()
-                .filter(|target| *target != purpose)
+                .filter(|target| !model_registry::binding_would_cycle(purpose, *target))
                 .map(|target| {
-                    binding_row(target.label(), SAME_DETAIL, Some(Binding::Same(target)))
+                    let label = format!("{SAME_PREFIX}{}", target.label());
+                    binding_row(&label, SAME_DETAIL, Some(Binding::Same(target)))
                 }),
         )
         .collect()
@@ -425,11 +605,14 @@ fn binding_row(id: &str, detail: &str, binds: Option<Binding>) -> ModelEntry {
         provider_display: TARGET_SECTION.into(),
         suffix: None,
         detail: detail.into(),
+        search_text: String::new(),
         claimed_by: Vec::new(),
         binds,
+        job: None,
         selected: false,
         free: false,
     }
+    .with_search_text()
 }
 
 /// A bound spec the provider no longer lists still has to be visible, otherwise
@@ -445,11 +628,14 @@ fn saved_binding_entry(spec: &str) -> ModelEntry {
         provider_display: TARGET_SECTION.into(),
         suffix: None,
         detail: SAVED_DETAIL.into(),
+        search_text: String::new(),
         claimed_by: Vec::new(),
         binds: Some(Binding::Exact(spec.to_string())),
+        job: None,
         selected: true,
         free: false,
     }
+    .with_search_text()
 }
 
 fn sort_models(models: &mut [ModelEntry]) {
@@ -518,17 +704,22 @@ fn parse_model_entry(spec: &str) -> Option<ModelEntry> {
     let claimed_by = model_registry::purposes_bound_to(spec);
     let free = caudra_providers::Model::from_spec(spec).is_ok_and(|model| model.is_free());
     let class = caudra_providers::Model::class_of(provider_str, model_id);
-    Some(ModelEntry {
-        spec: spec.to_string(),
-        id: model_id.to_string(),
-        provider_display,
-        suffix: None,
-        detail: row_detail(class, &claimed_by, free),
-        claimed_by,
-        binds: Some(Binding::Exact(spec.to_string())),
-        selected: false,
-        free,
-    })
+    Some(
+        ModelEntry {
+            spec: spec.to_string(),
+            id: model_id.to_string(),
+            provider_display,
+            suffix: None,
+            detail: row_detail(class, &claimed_by, free),
+            search_text: String::new(),
+            claimed_by,
+            binds: Some(Binding::Exact(spec.to_string())),
+            job: None,
+            selected: false,
+            free,
+        }
+        .with_search_text(),
+    )
 }
 
 #[cfg(test)]
@@ -545,11 +736,38 @@ mod tests {
     const SAME_SIZED_LIST: &str = "a republished list of the same length is still a new list";
     const SWAPPED_SPEC: &str = "zai/glm-5";
     const SONNET_SPEC: &str = "anthropic/claude-sonnet-4-20250514";
+    const OPUS_SPEC: &str = "anthropic/claude-opus-4-6-20260101";
     const MISSING_SPEC: &str = "catalog-provider/vendor/model";
     const UNCLASSIFIED_SPEC: &str = "anthropic/claude-nothing-curated";
     const MODEL_QUERY: &str = "view";
     const BEST_MATCH_SPEC: &str = "anthropic/view";
     const WEAKER_MATCH_SPEC: &str = "zai/xxview";
+    const NO_MODEL_QUERY: &str = "zzzz-no-model";
+    const SHARED_MODEL_ID: &str = "shared-model";
+    const ANTHROPIC_SHARED_SPEC: &str = "anthropic/shared-model";
+    const ZAI_SHARED_SPEC: &str = "zai/shared-model";
+    const ASYNC_SPEC: &str = "anthropic/search-only-model";
+
+    fn current_model(spec: &str) -> Model {
+        Model::from_spec(spec).unwrap()
+    }
+
+    fn open_picker(picker: &mut ModelPicker, spec: &str) {
+        picker.open(&current_model(spec), &ModelPolicy::default());
+    }
+
+    fn open_job_picker(picker: &mut ModelPicker, spec: &str, purpose: ModelPurpose) {
+        picker.open_purpose(&current_model(spec), &ModelPolicy::default(), purpose);
+    }
+
+    fn navigate_to_model(picker: &mut ModelPicker, spec: &str, section: &str) {
+        let selected = picker.track_anchor(|picker| {
+            picker
+                .picker
+                .select_item_by(|entry| entry.spec == spec && entry.section() == Some(section))
+        });
+        assert!(selected);
+    }
 
     /// A provider that republishes the same number of specs has still changed
     /// the list. Comparing lengths calls that no change, and the picker goes on
@@ -557,18 +775,17 @@ mod tests {
     #[test]
     fn a_same_sized_model_list_owes_a_frame() {
         let models = Arc::new(ArcSwapOption::empty());
-        models.store(Some(Arc::new(vec![
-            "anthropic/claude-sonnet-4-20250514".into(),
-        ])));
+        models.store(Some(Arc::new(vec![OPUS_SPEC.into()])));
         let mut p = ModelPicker::new(Arc::clone(&models));
-        p.open("");
+        open_picker(&mut p, SONNET_SPEC);
         assert_eq!(p.refresh(), Dirty::NO);
 
         models.store(Some(Arc::new(vec![SWAPPED_SPEC.into()])));
         assert_eq!(p.refresh(), Dirty::YES, "{SAME_SIZED_LIST}");
-        assert_eq!(
-            p.picker.selected_item().map(|e| e.spec.as_str()),
-            Some(SWAPPED_SPEC),
+        let entries = p.load_entries();
+        assert!(entries.iter().any(|entry| entry.spec == SWAPPED_SPEC));
+        assert!(
+            !entries.iter().any(|entry| entry.spec == OPUS_SPEC),
             "{SAME_SIZED_LIST}"
         );
     }
@@ -576,9 +793,9 @@ mod tests {
     fn test_models() -> Arc<ArcSwapOption<Vec<String>>> {
         let models = Arc::new(ArcSwapOption::empty());
         models.store(Some(Arc::new(vec![
-            "anthropic/claude-sonnet-4-20250514".into(),
-            "anthropic/claude-opus-4-6-20260101".into(),
-            "zai/glm-5".into(),
+            SONNET_SPEC.into(),
+            OPUS_SPEC.into(),
+            SWAPPED_SPEC.into(),
         ])));
         models
     }
@@ -598,7 +815,8 @@ mod tests {
     fn empty_picker_distinguishes_loading_from_no_matches() {
         let models = Arc::new(ArcSwapOption::empty());
         let mut picker = ModelPicker::new(Arc::clone(&models));
-        picker.open("");
+        open_picker(&mut picker, SONNET_SPEC);
+        picker.handle_paste(NO_MODEL_QUERY);
         assert!(render(&mut picker).contains(LOADING_MODELS));
 
         models.store(Some(Arc::new(Vec::new())));
@@ -611,7 +829,7 @@ mod tests {
     #[test_case(kb::QUIT.to_key_event()    ; "ctrl_c_closes")]
     fn close_keys(cancel_key: KeyEvent) {
         let mut p = ModelPicker::new(test_models());
-        p.open("");
+        open_picker(&mut p, SONNET_SPEC);
         let action = p.handle_key(cancel_key);
         assert!(matches!(action, ModelPickerAction::Close));
         assert!(!p.is_open());
@@ -620,70 +838,236 @@ mod tests {
     #[test]
     fn refresh_updates_items_and_preserves_search() {
         let models = Arc::new(ArcSwapOption::empty());
-        models.store(Some(Arc::new(vec![
-            "anthropic/claude-sonnet-4-20250514".into(),
-        ])));
+        models.store(Some(Arc::new(vec![SONNET_SPEC.into()])));
         let mut p = ModelPicker::new(models.clone());
-        p.open("");
+        open_picker(&mut p, SONNET_SPEC);
 
-        p.handle_key(key(KeyCode::Char('o')));
-        p.handle_key(key(KeyCode::Char('p')));
+        p.handle_paste("search-only");
 
-        models.store(Some(Arc::new(vec![
-            "anthropic/claude-sonnet-4-20250514".into(),
-            "anthropic/claude-opus-4-6-20260101".into(),
-        ])));
+        models.store(Some(Arc::new(vec![SONNET_SPEC.into(), ASYNC_SPEC.into()])));
         let _ = p.refresh();
 
         let action = p.handle_key(key(KeyCode::Enter));
         assert!(
-            matches!(action, ModelPickerAction::Select(ref s) if s.contains("opus")),
-            "after refresh, 'op' filter should match opus"
+            matches!(action, ModelPickerAction::Select(ref s) if s == ASYNC_SPEC),
+            "after refresh, the active filter should match the arrived model"
         );
     }
 
     #[test]
-    fn open_preselects_current_model() {
+    fn home_selects_chat_and_marks_the_current_model() {
         let mut p = ModelPicker::new(test_models());
-        p.open("anthropic/claude-opus-4-6-20260101");
-        let action = p.handle_key(key(KeyCode::Enter));
-        assert!(
-            matches!(action, ModelPickerAction::Select(ref s) if s == "anthropic/claude-opus-4-6-20260101")
+        open_picker(&mut p, OPUS_SPEC);
+
+        assert_eq!(
+            p.picker.selected_item().and_then(|entry| entry.job),
+            Some(ModelPurpose::Chat)
         );
+        let current = p
+            .load_entries()
+            .into_iter()
+            .find(|entry| entry.spec == OPUS_SPEC && entry.suffix().is_none())
+            .unwrap();
+        assert!(current.selected);
     }
 
     #[test]
     fn open_retains_current_model_missing_from_discovery() {
-        let current = "anthropic/claude-sonnet-4-20250514";
         let models = Arc::new(ArcSwapOption::from_pointee(Vec::new()));
         let mut picker = ModelPicker::new(models);
 
-        picker.open(current);
+        open_picker(&mut picker, SONNET_SPEC);
+        navigate_to_model(&mut picker, SONNET_SPEC, "Anthropic");
         let action = picker.handle_key(key(KeyCode::Enter));
 
-        assert!(matches!(action, ModelPickerAction::Select(spec) if spec == current));
+        assert!(matches!(action, ModelPickerAction::Select(spec) if spec == SONNET_SPEC));
     }
 
     #[test]
-    fn binding_picker_points_a_purpose_at_another_slot() {
+    fn home_starts_with_resolved_jobs_in_purpose_order() {
         let mut p = ModelPicker::new(test_models());
-        p.open_purpose("", ModelPurpose::Goal);
-        p.handle_key(key(KeyCode::Down));
+        open_picker(&mut p, SONNET_SPEC);
+
+        let entries = p.load_entries();
+        let jobs: Vec<_> = entries.iter().filter_map(|entry| entry.job).collect();
+        assert_eq!(jobs, ModelPurpose::ALL);
+
+        let chat = entries
+            .iter()
+            .find(|entry| entry.job == Some(ModelPurpose::Chat))
+            .unwrap();
+        assert_eq!(chat.section(), Some(JOBS_SECTION));
+        assert_eq!(chat.suffix(), Some(DEFAULT_BINDING));
+        assert_eq!(chat.detail(), Some(SONNET_SPEC));
+
+        let screen = render(&mut p);
+        assert!(screen.contains(JOBS_SECTION));
+        assert!(screen.contains("Chat"));
+        assert!(screen.contains(DEFAULT_BINDING));
+        assert!(screen.contains(SONNET_SPEC));
+    }
+
+    #[test]
+    fn job_rows_show_direct_binding_and_resolution_errors() {
+        let current = current_model(SONNET_SPEC);
+        let pinned = job_entry_with_binding(
+            ModelPurpose::Goal,
+            Some(Binding::Exact(OPUS_SPEC.into())),
+            &current,
+            &ModelPolicy::default(),
+        );
+        assert_eq!(pinned.suffix(), Some(PINNED_BINDING));
+        assert_eq!(pinned.detail(), Some(OPUS_SPEC));
+
+        let policy = ModelPolicy::new(&[], &[SONNET_SPEC.to_string()]).unwrap();
+        let entry = job_entry_with_binding(
+            ModelPurpose::Goal,
+            Some(Binding::Exact(SONNET_SPEC.into())),
+            &current,
+            &policy,
+        );
+
+        assert_eq!(entry.suffix(), Some(PINNED_BINDING));
+        assert!(entry.detail.starts_with(SONNET_SPEC));
+        assert!(entry.detail.contains(UNAVAILABLE_PREFIX));
+
+        let same = job_entry_with_binding(
+            ModelPurpose::Goal,
+            Some(Binding::Same(ModelPurpose::Fast)),
+            &current,
+            &ModelPolicy::default(),
+        );
+        assert_eq!(same.suffix(), Some("same as Fast"));
+    }
+
+    #[test]
+    fn non_chat_job_drills_down_and_escape_returns_to_selected_job() {
+        let mut p = ModelPicker::new(test_models());
+        open_picker(&mut p, SONNET_SPEC);
+        p.picker
+            .select_item_by(|entry| entry.job == Some(ModelPurpose::Plan));
+
+        assert!(matches!(
+            p.handle_key(key(KeyCode::Enter)),
+            ModelPickerAction::Consumed
+        ));
+        assert_eq!(p.page, PickerPage::Job(ModelPurpose::Plan));
+
+        assert!(matches!(
+            p.handle_key(key(KeyCode::Esc)),
+            ModelPickerAction::Consumed
+        ));
+        assert_eq!(p.page, PickerPage::Home);
+        assert_eq!(
+            p.picker.selected_item().and_then(|entry| entry.job),
+            Some(ModelPurpose::Plan)
+        );
+
+        assert!(matches!(
+            p.handle_key(key(KeyCode::Esc)),
+            ModelPickerAction::Close
+        ));
+        assert!(!p.is_open());
+    }
+
+    #[test]
+    fn chat_job_enter_moves_to_the_current_exact_model() {
+        let mut p = ModelPicker::new(test_models());
+        open_picker(&mut p, SONNET_SPEC);
+        p.picker
+            .select_item_by(|entry| entry.job == Some(ModelPurpose::Chat));
+
+        assert!(matches!(
+            p.handle_key(key(KeyCode::Enter)),
+            ModelPickerAction::Consumed
+        ));
+        assert_eq!(p.page, PickerPage::Home);
+        assert!(p.is_open());
+        let selected = p.picker.selected_item().unwrap();
+        assert_eq!(selected.job, None);
+        assert_eq!(selected.spec, SONNET_SPEC);
+        assert_eq!(selected.section(), Some("Anthropic"));
+    }
+
+    #[test]
+    fn purpose_open_has_home_beneath_it() {
+        let mut p = ModelPicker::new(test_models());
+        open_job_picker(&mut p, SONNET_SPEC, ModelPurpose::Goal);
+        assert_eq!(p.page, PickerPage::Job(ModelPurpose::Goal));
+
+        assert!(matches!(
+            p.handle_key(key(KeyCode::Esc)),
+            ModelPickerAction::Consumed
+        ));
+        assert_eq!(p.page, PickerPage::Home);
+        assert_eq!(
+            p.picker.selected_item().and_then(|entry| entry.job),
+            Some(ModelPurpose::Goal)
+        );
+    }
+
+    #[test]
+    fn job_to_home_selection_survives_same_index_refresh() {
+        let models = test_models();
+        let mut p = ModelPicker::new(Arc::clone(&models));
+        open_job_picker(&mut p, SONNET_SPEC, ModelPurpose::Goal);
+        for _ in 0..5 {
+            p.handle_key(key(KeyCode::Down));
+        }
+        assert_eq!(p.picker.selected_index(), Some(5));
+
+        p.handle_key(key(KeyCode::Esc));
+        assert_eq!(p.picker.selected_index(), Some(5));
+        models.store(Some(Arc::new(vec![
+            SONNET_SPEC.into(),
+            OPUS_SPEC.into(),
+            SWAPPED_SPEC.into(),
+        ])));
+
+        assert_eq!(p.refresh(), Dirty::YES);
+        assert_eq!(
+            p.picker.selected_item().and_then(|entry| entry.job),
+            Some(ModelPurpose::Goal)
+        );
+    }
+
+    #[test]
+    fn scroll_anchors_the_selected_row_for_refresh() {
+        let mut p = ModelPicker::new(test_models());
+        open_picker(&mut p, SONNET_SPEC);
+        p.picker
+            .select_item_by(|entry| entry.job == Some(ModelPurpose::Plan));
+
+        p.scroll(-1);
+        p.needs_rebuild = true;
+
+        assert_eq!(p.refresh(), Dirty::YES);
+        assert_eq!(
+            p.picker.selected_item().and_then(|entry| entry.job),
+            Some(ModelPurpose::Plan)
+        );
+    }
+
+    #[test]
+    fn binding_picker_points_a_job_at_another_target() {
+        let mut p = ModelPicker::new(test_models());
+        open_job_picker(&mut p, SONNET_SPEC, ModelPurpose::Goal);
+        p.picker
+            .select_item_by(|entry| entry.binds == Some(Binding::Same(ModelPurpose::Chat)));
 
         let action = p.handle_key(key(KeyCode::Enter));
 
         assert!(matches!(
             action,
-            ModelPickerAction::Bind(ModelPurpose::Goal, Binding::Same(ModelPurpose::Fast))
+            ModelPickerAction::Bind(ModelPurpose::Goal, Binding::Same(ModelPurpose::Chat))
         ));
     }
 
     #[test]
-    fn binding_picker_binds_an_exact_model() {
+    fn exact_model_search_on_job_page_binds_the_model() {
         let mut p = ModelPicker::new(test_models());
-        p.open_purpose("", ModelPurpose::Goal);
-        p.picker
-            .select_item_by(|entry| entry.spec == SWAPPED_SPEC && entry.suffix().is_none());
+        open_job_picker(&mut p, SONNET_SPEC, ModelPurpose::Goal);
+        p.handle_paste("glm");
 
         let action = p.handle_key(key(KeyCode::Enter));
 
@@ -693,16 +1077,29 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn current_model_is_an_exact_job_candidate_without_discovery() {
+        let models = Arc::new(ArcSwapOption::from_pointee(Vec::new()));
+        let mut p = ModelPicker::new(models);
+        open_job_picker(&mut p, SONNET_SPEC, ModelPurpose::Goal);
+        navigate_to_model(&mut p, SONNET_SPEC, "Anthropic");
+
+        assert!(matches!(
+            p.handle_key(key(KeyCode::Enter)),
+            ModelPickerAction::Bind(ModelPurpose::Goal, Binding::Exact(spec))
+                if spec == SONNET_SPEC
+        ));
+    }
+
     /// A bound model the provider stopped listing still has to show up selected,
     /// or the purpose would read as unbound and the next Enter would change it.
     #[test]
     fn binding_picker_keeps_a_bound_model_missing_from_discovery() {
         let mut p = ModelPicker::new(test_models());
-        p.open_purpose("", ModelPurpose::Goal);
+        open_job_picker(&mut p, SONNET_SPEC, ModelPurpose::Goal);
         p.binding = Some(Binding::Exact(MISSING_SPEC.into()));
-        p.needs_rebuild = true;
-
-        assert_eq!(p.refresh(), Dirty::YES);
+        p.picker.replace_items(p.load_entries());
+        p.preselect_page();
         let action = p.handle_key(key(KeyCode::Enter));
 
         assert!(matches!(
@@ -722,7 +1119,7 @@ mod tests {
             BEST_MATCH_SPEC.into(),
         ])));
         let mut p = ModelPicker::new(models);
-        p.open("");
+        open_picker(&mut p, SONNET_SPEC);
         for c in MODEL_QUERY.chars() {
             p.handle_key(key(KeyCode::Char(c)));
         }
@@ -734,46 +1131,104 @@ mod tests {
     }
 
     #[test]
-    fn tab_switches_purpose_and_reset_unbinds() {
-        let spec = "anthropic/claude-opus-4-6-20260101";
+    fn search_accepts_a_qualified_documented_model_spec() {
         let mut p = ModelPicker::new(test_models());
-        p.open(spec);
+        open_picker(&mut p, OPUS_SPEC);
+
+        p.handle_paste(SONNET_SPEC);
+
+        let selected = p.picker.selected_item().unwrap();
+        assert_eq!(selected.spec, SONNET_SPEC);
+        assert_eq!(selected.label(), "claude-sonnet-4-20250514");
+    }
+
+    #[test]
+    fn qualified_search_disambiguates_identical_model_ids() {
+        let models = Arc::new(ArcSwapOption::from_pointee(vec![
+            ANTHROPIC_SHARED_SPEC.into(),
+            ZAI_SHARED_SPEC.into(),
+        ]));
+        let mut p = ModelPicker::new(models);
+        open_picker(&mut p, OPUS_SPEC);
+
+        p.handle_paste(ZAI_SHARED_SPEC);
+
+        let selected = p.picker.selected_item().unwrap();
+        assert_eq!(selected.spec, ZAI_SHARED_SPEC);
+        assert_eq!(selected.label(), SHARED_MODEL_ID);
+    }
+
+    #[test]
+    fn search_accepts_provider_display_name() {
+        let mut p = ModelPicker::new(test_models());
+        open_picker(&mut p, OPUS_SPEC);
+
+        p.handle_paste("Z.AI");
+
+        assert_eq!(
+            p.picker.selected_item().map(|entry| entry.spec.as_str()),
+            Some(SWAPPED_SPEC)
+        );
+    }
+
+    #[test]
+    fn tab_and_shift_tab_do_not_change_pages() {
+        let mut p = ModelPicker::new(test_models());
+        open_picker(&mut p, OPUS_SPEC);
 
         assert!(matches!(
             p.handle_key(key(KeyCode::Tab)),
             ModelPickerAction::Consumed
         ));
-        p.picker
-            .select_item_by(|entry| entry.spec == spec && entry.suffix().is_none());
-        let assign = p.handle_key(key(KeyCode::Enter));
+        assert_eq!(p.page, PickerPage::Home);
+        assert!(matches!(
+            p.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)),
+            ModelPickerAction::Consumed
+        ));
+        assert_eq!(p.page, PickerPage::Home);
+
+        open_job_picker(&mut p, OPUS_SPEC, ModelPurpose::Plan);
+        assert!(matches!(
+            p.handle_key(key(KeyCode::Tab)),
+            ModelPickerAction::Consumed
+        ));
+        assert_eq!(p.page, PickerPage::Job(ModelPurpose::Plan));
+    }
+
+    #[test]
+    fn uppercase_r_unbinds_on_job_page_while_lowercase_r_searches() {
+        let mut p = ModelPicker::new(test_models());
+        open_job_picker(&mut p, SONNET_SPEC, ModelPurpose::Plan);
 
         assert!(matches!(
-            assign,
-            ModelPickerAction::Bind(ModelPurpose::Fast, Binding::Exact(value)) if value == spec
+            p.handle_key(key(KeyCode::Char('r'))),
+            ModelPickerAction::Consumed
         ));
-        p.open_purpose(spec, ModelPurpose::Fast);
-        let reset = p.handle_key(key(KeyCode::Char('R')));
+        assert_eq!(p.picker.search_text(), "r");
+
         assert!(matches!(
-            reset,
-            ModelPickerAction::Unbind(ModelPurpose::Fast)
+            p.handle_key(key(KeyCode::Char('R'))),
+            ModelPickerAction::Unbind(ModelPurpose::Plan)
         ));
+        assert_eq!(p.page, PickerPage::Job(ModelPurpose::Plan));
         assert!(p.is_open());
     }
 
     #[test]
-    fn lowercase_g_remains_available_to_search() {
-        let mut p = ModelPicker::new(test_models());
-        p.open("anthropic/claude-opus-4-6-20260101");
+    fn assignment_targets_come_from_targets_and_exclude_self() {
+        let entries = binding_entries(ModelPurpose::Plan);
+        let targets: Vec<_> = entries
+            .iter()
+            .filter_map(|entry| match entry.binds {
+                Some(Binding::Same(target)) => Some(target),
+                _ => None,
+            })
+            .collect();
 
-        p.handle_key(key(KeyCode::Char('g')));
-        p.handle_key(key(KeyCode::Char('l')));
-        p.handle_key(key(KeyCode::Char('m')));
-        let action = p.handle_key(key(KeyCode::Enter));
-
-        assert!(matches!(
-            action,
-            ModelPickerAction::Select(spec) if spec == SWAPPED_SPEC
-        ));
+        assert_eq!(
+            targets,
+            [ModelPurpose::Chat, ModelPurpose::Fast, ModelPurpose::Best]
+        );
     }
 
     #[test]
@@ -790,7 +1245,7 @@ mod tests {
     fn a_curated_model_shows_its_class() {
         assert_eq!(
             parse_model_entry(SONNET_SPEC).unwrap().detail,
-            ModelPurpose::Balanced.label()
+            ModelPurpose::Best.label()
         );
     }
 
@@ -819,93 +1274,23 @@ mod tests {
         assert!(parse_model_entry("no-slash").is_none());
     }
 
-    #[test_case(1, ModelPurpose::Fast     ; "fast")]
-    #[test_case(2, ModelPurpose::Balanced ; "balanced")]
-    #[test_case(3, ModelPurpose::Best     ; "best")]
-    #[test_case(4, ModelPurpose::Title    ; "title")]
-    #[test_case(5, ModelPurpose::Compact  ; "compact")]
-    #[test_case(6, ModelPurpose::Goal     ; "goal")]
-    fn tabbed_purpose_binds_selected_exact_model(tabs: usize, want: ModelPurpose) {
-        let mut p = ModelPicker::new(test_models());
-        p.open(SONNET_SPEC);
-        for _ in 0..tabs {
-            p.handle_key(key(KeyCode::Tab));
-        }
-        p.picker
-            .select_item_by(|entry| entry.spec == SONNET_SPEC && entry.suffix().is_none());
-        let action = p.handle_key(key(KeyCode::Enter));
-        assert!(
-            matches!(&action, ModelPickerAction::Bind(purpose, Binding::Exact(spec))
-                if spec == SONNET_SPEC && *purpose == want),
-            "expected Bind({want:?}, {SONNET_SPEC}), got something else",
-        );
-        assert!(!p.is_open());
-    }
-
-    #[test]
-    fn shift_tab_wraps_from_chat_to_the_last_purpose() {
-        let mut p = ModelPicker::new(test_models());
-        p.open(SONNET_SPEC);
-        p.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT));
-        p.picker
-            .select_item_by(|entry| entry.spec == SONNET_SPEC && entry.suffix().is_none());
-
-        assert!(matches!(
-            p.handle_key(key(KeyCode::Enter)),
-            ModelPickerAction::Bind(ModelPurpose::Goal, Binding::Exact(spec)) if spec == SONNET_SPEC
-        ));
-    }
-
-    #[test]
-    fn uppercase_r_unbinds_while_lowercase_r_filters() {
-        let mut p = ModelPicker::new(test_models());
-        p.open("");
-        p.handle_key(key(KeyCode::Tab));
-
-        assert!(matches!(
-            p.handle_key(key(KeyCode::Char('r'))),
-            ModelPickerAction::Consumed
-        ));
-        assert!(matches!(
-            p.handle_key(key(KeyCode::Char('R'))),
-            ModelPickerAction::Unbind(ModelPurpose::Fast)
-        ));
-        assert!(p.is_open());
-    }
-
-    #[test]
-    fn uppercase_r_clears_chat_search_and_reselects_current_model() {
-        let current = "anthropic/claude-sonnet-4-20250514";
-        let mut p = ModelPicker::new(test_models());
-        p.open(current);
-        p.handle_paste("glm");
-
-        assert!(matches!(
-            p.handle_key(key(KeyCode::Char('R'))),
-            ModelPickerAction::Consumed
-        ));
-        assert!(matches!(
-            p.handle_key(key(KeyCode::Enter)),
-            ModelPickerAction::Select(spec) if spec == current
-        ));
-    }
-
     #[test]
     fn refresh_preserves_selection_for_current_model() {
         let models = Arc::new(ArcSwapOption::empty());
         let mut p = ModelPicker::new(models.clone());
-        p.open("anthropic/claude-opus-4-6-20260101");
+        open_picker(&mut p, OPUS_SPEC);
+        navigate_to_model(&mut p, OPUS_SPEC, "Anthropic");
 
         models.store(Some(Arc::new(vec![
-            "anthropic/claude-sonnet-4-20250514".into(),
-            "anthropic/claude-opus-4-6-20260101".into(),
-            "zai/glm-5".into(),
+            SONNET_SPEC.into(),
+            OPUS_SPEC.into(),
+            SWAPPED_SPEC.into(),
         ])));
         let _ = p.refresh();
 
         let action = p.handle_key(key(KeyCode::Enter));
         assert!(
-            matches!(action, ModelPickerAction::Select(ref s) if s == "anthropic/claude-opus-4-6-20260101"),
+            matches!(action, ModelPickerAction::Select(ref s) if s == OPUS_SPEC),
             "after async model arrival, current model should still be selected"
         );
     }
@@ -914,74 +1299,64 @@ mod tests {
     fn recents_include_current_model_preselected() {
         let models = test_models();
         let mut p = ModelPicker::new(models);
-        p.set_recents(vec![
-            "zai/glm-5".into(),
-            "anthropic/claude-sonnet-4-20250514".into(),
-        ]);
-        p.open("anthropic/claude-opus-4-6-20260101");
+        p.set_recents(vec![SWAPPED_SPEC.into(), SONNET_SPEC.into()]);
+        open_picker(&mut p, OPUS_SPEC);
 
-        p.picker.select(0);
+        p.picker.select_item_by(|entry| {
+            entry.spec == SWAPPED_SPEC && entry.section() == Some(RECENT_SECTION)
+        });
         let action = p.handle_key(key(KeyCode::Enter));
         assert!(
-            matches!(action, ModelPickerAction::Select(ref s) if s == "zai/glm-5"),
+            matches!(action, ModelPickerAction::Select(ref s) if s == SWAPPED_SPEC),
             "first entry should be the most recent model",
         );
 
-        p.set_recents(vec![
-            "zai/glm-5".into(),
-            "anthropic/claude-sonnet-4-20250514".into(),
-        ]);
-        p.open("zai/glm-5");
+        p.set_recents(vec![SWAPPED_SPEC.into(), SONNET_SPEC.into()]);
+        open_picker(&mut p, SWAPPED_SPEC);
+        navigate_to_model(&mut p, SWAPPED_SPEC, "Z.AI");
         let action = p.handle_key(key(KeyCode::Enter));
         assert!(
-            matches!(action, ModelPickerAction::Select(ref s) if s == "zai/glm-5"),
+            matches!(action, ModelPickerAction::Select(ref s) if s == SWAPPED_SPEC),
             "current model should be preselected in its provider section",
         );
     }
 
     #[test]
-    fn reopen_preselects_current_model_in_provider_section() {
+    fn provider_model_rows_keep_the_fast_selection_flow() {
         let models = test_models();
         let mut p = ModelPicker::new(models);
-        p.set_recents(vec![
-            "zai/glm-5".into(),
-            "anthropic/claude-sonnet-4-20250514".into(),
-        ]);
-        p.open("anthropic/claude-sonnet-4-20250514");
+        p.set_recents(vec![SWAPPED_SPEC.into(), SONNET_SPEC.into()]);
+        open_picker(&mut p, SONNET_SPEC);
+        navigate_to_model(&mut p, SONNET_SPEC, "Anthropic");
         p.handle_key(key(KeyCode::Down));
         let action = p.handle_key(key(KeyCode::Enter));
         assert!(
-            matches!(action, ModelPickerAction::Select(ref s) if s == "zai/glm-5"),
+            matches!(action, ModelPickerAction::Select(ref s) if s == SWAPPED_SPEC),
             "selecting the provider entry should return its spec",
         );
 
-        p.open("zai/glm-5");
-
-        let entry = p.picker.selected_item().expect("selection on reopen");
-        assert_eq!(entry.spec, "zai/glm-5");
-        assert_eq!(
-            entry.section(),
-            Some("Z.AI"),
-            "selection should land on the provider entry, not the Recent copy",
-        );
+        open_picker(&mut p, SWAPPED_SPEC);
+        navigate_to_model(&mut p, SWAPPED_SPEC, "Z.AI");
+        assert!(matches!(
+            p.handle_key(key(KeyCode::Enter)),
+            ModelPickerAction::Select(spec) if spec == SWAPPED_SPEC
+        ));
     }
 
     #[test]
     fn refresh_keeps_selection_on_provider_entry() {
         let models = test_models();
         let mut p = ModelPicker::new(models);
-        p.set_recents(vec![
-            "zai/glm-5".into(),
-            "anthropic/claude-sonnet-4-20250514".into(),
-        ]);
-        p.open("anthropic/claude-sonnet-4-20250514");
+        p.set_recents(vec![SWAPPED_SPEC.into(), SONNET_SPEC.into()]);
+        open_picker(&mut p, SONNET_SPEC);
+        navigate_to_model(&mut p, SONNET_SPEC, "Anthropic");
         p.handle_key(key(KeyCode::Down));
         p.needs_rebuild = true;
 
         let _ = p.refresh();
 
         let entry = p.picker.selected_item().expect("selection after refresh");
-        assert_eq!(entry.spec, "zai/glm-5");
+        assert_eq!(entry.spec, SWAPPED_SPEC);
         assert_eq!(
             entry.section(),
             Some("Z.AI"),
@@ -990,34 +1365,31 @@ mod tests {
     }
 
     #[test]
-    fn refresh_after_collapse_anchors_to_provider_entry() {
+    fn refresh_after_collapse_keeps_current_model_rows() {
         let models = test_models();
         let mut p = ModelPicker::new(models.clone());
-        p.set_recents(vec![
-            "zai/glm-5".into(),
-            "anthropic/claude-sonnet-4-20250514".into(),
-        ]);
-        p.open("anthropic/claude-sonnet-4-20250514");
+        p.set_recents(vec![SWAPPED_SPEC.into(), SONNET_SPEC.into()]);
+        open_picker(&mut p, SONNET_SPEC);
 
         models.store(None);
         let _ = p.refresh();
-        let entry = p.picker.selected_item().expect("selection during collapse");
-        assert_eq!(entry.spec, "anthropic/claude-sonnet-4-20250514");
-        assert_eq!(entry.section(), Some("Recent"));
+        assert!(
+            p.load_entries().iter().any(|entry| {
+                entry.spec == SONNET_SPEC && entry.section() == Some(RECENT_SECTION)
+            })
+        );
 
         models.store(Some(Arc::new(vec![
-            "anthropic/claude-sonnet-4-20250514".into(),
-            "anthropic/claude-opus-4-6-20260101".into(),
-            "zai/glm-5".into(),
+            SONNET_SPEC.into(),
+            OPUS_SPEC.into(),
+            SWAPPED_SPEC.into(),
         ])));
         let _ = p.refresh();
 
-        let entry = p.picker.selected_item().expect("selection after arrival");
-        assert_eq!(entry.spec, "anthropic/claude-sonnet-4-20250514");
-        assert_eq!(
-            entry.section(),
-            Some("Anthropic"),
-            "cursor should migrate to the provider entry once it arrives",
+        assert!(
+            p.load_entries()
+                .iter()
+                .any(|entry| { entry.spec == SONNET_SPEC && entry.section() == Some("Anthropic") })
         );
     }
 
@@ -1025,24 +1397,22 @@ mod tests {
     fn refresh_preserves_navigation_to_recent_entry() {
         let models = test_models();
         let mut p = ModelPicker::new(models.clone());
-        p.set_recents(vec![
-            "zai/glm-5".into(),
-            "anthropic/claude-sonnet-4-20250514".into(),
-        ]);
-        p.open("anthropic/claude-sonnet-4-20250514");
+        p.set_recents(vec![SWAPPED_SPEC.into(), SONNET_SPEC.into()]);
+        open_picker(&mut p, SONNET_SPEC);
         models.store(None);
         let _ = p.refresh();
-        p.handle_key(key(KeyCode::Down));
+        p.handle_key(key(KeyCode::Up));
+        p.handle_key(key(KeyCode::Up));
 
         models.store(Some(Arc::new(vec![
-            "anthropic/claude-sonnet-4-20250514".into(),
-            "anthropic/claude-opus-4-6-20260101".into(),
-            "zai/glm-5".into(),
+            SONNET_SPEC.into(),
+            OPUS_SPEC.into(),
+            SWAPPED_SPEC.into(),
         ])));
         let _ = p.refresh();
 
         let entry = p.picker.selected_item().expect("selection after arrival");
-        assert_eq!(entry.spec, "zai/glm-5");
+        assert_eq!(entry.spec, SWAPPED_SPEC);
         assert_eq!(
             entry.section(),
             Some("Recent"),
@@ -1054,25 +1424,22 @@ mod tests {
     fn refresh_preserves_selection_with_active_search() {
         let models = test_models();
         let mut p = ModelPicker::new(models.clone());
-        p.set_recents(vec![
-            "zai/glm-5".into(),
-            "anthropic/claude-sonnet-4-20250514".into(),
-        ]);
-        p.open("anthropic/claude-sonnet-4-20250514");
+        p.set_recents(vec![SWAPPED_SPEC.into(), SONNET_SPEC.into()]);
+        open_picker(&mut p, SONNET_SPEC);
         p.handle_paste("glm");
 
         models.store(None);
         let _ = p.refresh();
         models.store(Some(Arc::new(vec![
-            "anthropic/claude-sonnet-4-20250514".into(),
-            "anthropic/claude-opus-4-6-20260101".into(),
-            "zai/glm-5".into(),
+            SONNET_SPEC.into(),
+            OPUS_SPEC.into(),
+            SWAPPED_SPEC.into(),
         ])));
         let _ = p.refresh();
 
         let entry = p.picker.selected_item().expect("selection after refresh");
-        assert_eq!(entry.spec, "zai/glm-5");
-        assert_eq!(entry.section(), Some("Z.AI"));
+        assert_eq!(entry.spec, SWAPPED_SPEC);
+        assert_eq!(entry.section(), Some(RECENT_SECTION));
     }
 
     fn discovered(id: &str, pricing: ModelPricing) -> ModelInfo {
@@ -1132,8 +1499,12 @@ mod tests {
             OX_SPEC.into(),
         ])));
         let mut p = ModelPicker::new(models);
-        p.open("");
-        let entries = p.load_entries();
+        open_picker(&mut p, SONNET_SPEC);
+        let entries: Vec<_> = p
+            .load_entries()
+            .into_iter()
+            .filter(|entry| entry.spec.starts_with("openrouter/"))
+            .collect();
         let ids: Vec<&str> = entries.iter().map(|e| e.id.as_str()).collect();
         assert_eq!(ids, ["stealth/ox-alpha", PAID_ID]);
     }

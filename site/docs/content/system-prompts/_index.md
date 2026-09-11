@@ -94,7 +94,9 @@ subagent_thinking: high
 Prioritize exploitable findings and concrete fixes.
 ```
 
-`subagent_model` uses a qualified `provider/model` name. `subagent_thinking` accepts `off`, `adaptive`, an effort level, or a positive token budget. Omitted fields inherit the parent model and thinking setting. These fields do not change the main agent.
+`subagent_model` accepts an exact qualified `provider/model` name or the same-as target `chat`, `plan`, `fast`, or `best`. A named target follows that job's current binding and default. A profile value overrides the global Subagent binding. If the profile omits it, the global binding applies. When both are unbound, the subagent inherits the model currently running its parent.
+
+`subagent_thinking` accepts `off`, `adaptive`, an effort level, or a positive token budget. It inherits the parent's thinking setting when omitted. These fields do not change the main agent. See [Model jobs](/docs/providers/#model-jobs) for routing rules.
 
 Caudra validates each profile against the effective subagent model. An explicit thinking setting must be supported exactly. Caudra does not snap effort levels, clamp budgets, or translate between effort and budget modes for a profile. An incompatible profile remains available to the main agent, but Caudra warns and removes it from the task profile list.
 

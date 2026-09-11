@@ -2,9 +2,9 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::process;
-
-use serde::{Deserialize, Serialize};
 use std::str::FromStr;
+
+use serde::{Deserialize, Deserializer, Serialize};
 use tracing::debug;
 
 use caudra_storage::paths;
@@ -24,53 +24,58 @@ const OPENCODE_SLUG: &str = "opencode";
 #[serde(rename_all = "lowercase")]
 pub enum ModelPurpose {
     Chat,
-    Fast,
-    Balanced,
-    Best,
-    Title,
+    Plan,
+    Subagent,
     Compact,
+    Title,
     Goal,
+    Fast,
+    Best,
 }
 
 impl ModelPurpose {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Chat,
-        Self::Fast,
-        Self::Balanced,
-        Self::Best,
-        Self::Title,
+        Self::Plan,
+        Self::Subagent,
         Self::Compact,
+        Self::Title,
         Self::Goal,
+        Self::Fast,
+        Self::Best,
     ];
 
-    /// The purposes that name how much capability a caller wants, as opposed to
-    /// which workload is asking. Only these carry a curated model table, and
-    /// only these are worth pointing another purpose at.
-    pub const CLASSES: [Self; 3] = [Self::Fast, Self::Balanced, Self::Best];
+    /// The purposes that select a size lane and may classify provider models.
+    pub const CLASSES: [Self; 2] = [Self::Fast, Self::Best];
+
+    /// Purposes that make useful binding targets in the model picker.
+    pub const TARGETS: [Self; 4] = [Self::Chat, Self::Plan, Self::Fast, Self::Best];
 
     /// Title-cased name for pickers and docs. `Display` stays lowercase so it
     /// matches what the config and state rows hold.
     pub const fn label(self) -> &'static str {
         match self {
             Self::Chat => "Chat",
-            Self::Fast => "Fast",
-            Self::Balanced => "Balanced",
-            Self::Best => "Best",
-            Self::Title => "Title",
+            Self::Plan => "Plan",
+            Self::Subagent => "Subagent",
             Self::Compact => "Compact",
+            Self::Title => "Title",
             Self::Goal => "Goal",
+            Self::Fast => "Fast",
+            Self::Best => "Best",
         }
     }
 
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Chat => "chat",
-            Self::Fast => "fast",
-            Self::Balanced => "balanced",
-            Self::Best => "best",
-            Self::Title => "title",
+            Self::Plan => "plan",
+            Self::Subagent => "subagent",
             Self::Compact => "compact",
+            Self::Title => "title",
             Self::Goal => "goal",
+            Self::Fast => "fast",
+            Self::Best => "best",
         }
     }
 }
@@ -94,9 +99,38 @@ impl FromStr for ModelPurpose {
 
 #[derive(Debug, thiserror::Error)]
 #[error(
-    "unknown model purpose '{0}', expected one of: chat, fast, balanced, best, title, compact, goal"
+    "unknown model purpose '{0}', expected one of: chat, plan, subagent, compact, title, goal, fast, best"
 )]
 pub struct UnknownPurpose(pub String);
+
+fn deserialize_purposes<'de, D>(
+    deserializer: D,
+) -> Result<HashMap<ModelPurpose, PurposeModels>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let purposes: HashMap<ModelPurpose, PurposeModels> = HashMap::deserialize(deserializer)?;
+    if let Some(purpose) = ModelPurpose::ALL
+        .into_iter()
+        .find(|purpose| purposes.contains_key(purpose) && !ModelPurpose::CLASSES.contains(purpose))
+    {
+        return Err(serde::de::Error::custom(format!(
+            "model purpose '{purpose}' cannot classify provider models; expected fast or best"
+        )));
+    }
+    if let (Some(fast), Some(best)) = (
+        purposes.get(&ModelPurpose::Fast),
+        purposes.get(&ModelPurpose::Best),
+    ) && let Some(prefix) = fast
+        .iter()
+        .find(|fast_prefix| best.iter().any(|best_prefix| best_prefix == *fast_prefix))
+    {
+        return Err(serde::de::Error::custom(format!(
+            "model prefix '{prefix}' cannot be assigned to both fast and best"
+        )));
+    }
+    Ok(purposes)
+}
 
 /// Model id prefixes a provider offers for one purpose, best first.
 ///
@@ -109,23 +143,46 @@ pub struct UnknownPurpose(pub String);
 /// Prefixes are what make a server full of fine-tune variants declarable. One
 /// `qwen3.8-27b` covers every `qwen3.8-27b-*` the endpoint loads, without the
 /// config needing an edit each time a new one appears.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(from = "OneOrMany", into = "OneOrMany")]
-pub struct PurposeModels(Vec<String>);
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "OneOrMany", into = "OneOrMany")]
+pub struct PurposeModels(OneOrMany);
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 enum OneOrMany {
     One(String),
     Many(Vec<String>),
 }
 
-impl From<OneOrMany> for PurposeModels {
-    fn from(value: OneOrMany) -> Self {
-        match value {
-            OneOrMany::One(id) => Self(vec![id]),
-            OneOrMany::Many(ids) => Self(ids),
+impl OneOrMany {
+    fn as_slice(&self) -> &[String] {
+        match self {
+            Self::One(id) => std::slice::from_ref(id),
+            Self::Many(ids) => ids,
         }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+enum InvalidPurposeModels {
+    #[error("a model purpose must declare at least one model prefix")]
+    Empty,
+    #[error("model purpose prefix at index {0} must not be empty or whitespace-only")]
+    EmptyPrefix(usize),
+}
+
+impl TryFrom<OneOrMany> for PurposeModels {
+    type Error = InvalidPurposeModels;
+
+    fn try_from(value: OneOrMany) -> Result<Self, Self::Error> {
+        let prefixes = value.as_slice();
+        if prefixes.is_empty() {
+            return Err(InvalidPurposeModels::Empty);
+        }
+        if let Some(index) = prefixes.iter().position(|prefix| prefix.trim().is_empty()) {
+            return Err(InvalidPurposeModels::EmptyPrefix(index));
+        }
+        Ok(Self(value))
     }
 }
 
@@ -133,27 +190,27 @@ impl From<OneOrMany> for PurposeModels {
 /// file on upsert does not reformat a hand-written one-liner into a list.
 impl From<PurposeModels> for OneOrMany {
     fn from(value: PurposeModels) -> Self {
-        match <[String; 1]>::try_from(value.0) {
-            Ok([id]) => Self::One(id),
-            Err(ids) => Self::Many(ids),
-        }
+        value.0
     }
 }
 
 impl PurposeModels {
     /// The id that wins the slot when several are declared.
     pub fn preferred(&self) -> Option<&str> {
-        self.0.first().map(String::as_str)
+        self.0.as_slice().first().map(String::as_str)
     }
 
     /// Whether `model_id` is one this purpose covers. Prefix, not equality, so a
     /// family of fine-tunes is one line rather than one line each.
     pub fn matches(&self, model_id: &str) -> bool {
-        self.0.iter().any(|prefix| model_id.starts_with(prefix))
+        self.0
+            .as_slice()
+            .iter()
+            .any(|prefix| model_id.starts_with(prefix))
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &str> {
-        self.0.iter().map(String::as_str)
+        self.0.as_slice().iter().map(String::as_str)
     }
 }
 
@@ -361,9 +418,13 @@ pub struct ProviderDef {
     /// knows about. A matching `models` entry overrides it field by field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_defaults: Option<ModelFields>,
-    /// Which model id serves each workload while this provider is active.
-    /// Checked-in bindings, outranked by an assignment made in the picker.
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    /// Which model ids are small or flagship choices for this provider.
+    /// Checked-in defaults, outranked by an assignment made in the picker.
+    #[serde(
+        default,
+        skip_serializing_if = "HashMap::is_empty",
+        deserialize_with = "deserialize_purposes"
+    )]
     pub purposes: HashMap<ModelPurpose, PurposeModels>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub models: Vec<ModelDef>,
@@ -692,7 +753,7 @@ context_window = 8192
         let parsed: ProvidersConfig = toml::from_str(DEFAULTS_TOML).unwrap();
         let def = parsed.get("local").unwrap();
 
-        assert_eq!(def.purposes.get(&ModelPurpose::Balanced), None);
+        assert_eq!(def.purposes.get(&ModelPurpose::Plan), None);
         assert_eq!(def.purposes.get(&ModelPurpose::Title), None);
     }
 
@@ -800,16 +861,131 @@ compaction = "x"
         assert!(error.to_string().contains(UNKNOWN_PURPOSE), "{error}");
     }
 
+    const NON_CLASS_PURPOSE: &str = "cannot classify provider models; expected fast or best";
+    const EMPTY_PURPOSE_MODELS: &str = "must declare at least one model prefix";
+    const EMPTY_PURPOSE_PREFIX: &str = "must not be empty or whitespace-only";
+    const DUPLICATE_PURPOSE_PREFIX: &str = "cannot be assigned to both fast and best";
+
+    #[test_case("chat" ; "chat")]
+    #[test_case("plan" ; "plan")]
+    #[test_case("subagent" ; "subagent")]
+    #[test_case("compact" ; "compact")]
+    #[test_case("title" ; "title")]
+    #[test_case("goal" ; "goal")]
+    fn provider_purposes_reject_workload_keys(purpose: &str) {
+        let input = format!("[local.purposes]\n{purpose} = \"model\"\n");
+        let error = toml::from_str::<ProvidersConfig>(&input).unwrap_err();
+
+        assert!(error.to_string().contains(NON_CLASS_PURPOSE), "{error}");
+    }
+
+    #[test_case("fast = []", EMPTY_PURPOSE_MODELS ; "empty_list")]
+    #[test_case("fast = \"\"", EMPTY_PURPOSE_PREFIX ; "empty_string")]
+    #[test_case("fast = \"   \"", EMPTY_PURPOSE_PREFIX ; "whitespace_string")]
+    #[test_case("fast = [\"small\", \"\\t\"]", EMPTY_PURPOSE_PREFIX ; "whitespace_list_entry")]
+    fn provider_purposes_reject_empty_model_prefixes(declaration: &str, expected: &str) {
+        let input = format!("[local.purposes]\n{declaration}\n");
+        let error = toml::from_str::<ProvidersConfig>(&input).unwrap_err();
+
+        assert!(error.to_string().contains(expected), "{error}");
+    }
+
+    #[test]
+    fn provider_purposes_reject_the_same_prefix_in_both_lanes() {
+        let input = r#"
+[local.purposes]
+fast = ["shared", "small"]
+best = ["large", "shared"]
+"#;
+        let error = toml::from_str::<ProvidersConfig>(input).unwrap_err();
+
+        assert!(
+            error.to_string().contains(DUPLICATE_PURPOSE_PREFIX),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn provider_purposes_allow_distinct_overlapping_prefixes() {
+        let input = r#"
+[local.purposes]
+fast = "gpt-4"
+best = "gpt-4.1"
+"#;
+
+        assert!(toml::from_str::<ProvidersConfig>(input).is_ok());
+    }
+
+    #[test_case("\"model\"", false ; "one")]
+    #[test_case("[\"model\"]", true ; "singleton_many")]
+    #[test_case("[\"model\", \"other\"]", true ; "many")]
+    fn purpose_models_preserve_their_one_or_many_shape(value: &str, expected_array: bool) {
+        let input = format!("[local.purposes]\nfast = {value}\n");
+        let parsed: ProvidersConfig = toml::from_str(&input).unwrap();
+        let rewritten = toml::to_string_pretty(&parsed).unwrap();
+        let rewritten_value: toml::Value = toml::from_str(&rewritten).unwrap();
+        let fast = &rewritten_value["local"]["purposes"]["fast"];
+
+        assert_eq!(fast.is_array(), expected_array, "{rewritten}");
+        let reparsed: ProvidersConfig = toml::from_str(&rewritten).unwrap();
+        assert_eq!(
+            reparsed.get("local").unwrap().purposes[&ModelPurpose::Fast],
+            parsed.get("local").unwrap().purposes[&ModelPurpose::Fast]
+        );
+    }
+
+    #[test]
+    fn purpose_models_validate_without_trimming_model_ids() {
+        let input = "[local.purposes]\nfast = \" model \"\n";
+        let parsed: ProvidersConfig = toml::from_str(input).unwrap();
+
+        assert_eq!(
+            parsed.get("local").unwrap().purposes[&ModelPurpose::Fast].preferred(),
+            Some(" model ")
+        );
+    }
+
     #[test_case("chat", ModelPurpose::Chat ; "chat")]
-    #[test_case("fast", ModelPurpose::Fast ; "fast")]
-    #[test_case("balanced", ModelPurpose::Balanced ; "balanced")]
-    #[test_case("best", ModelPurpose::Best ; "best")]
-    #[test_case("title", ModelPurpose::Title ; "title")]
+    #[test_case("plan", ModelPurpose::Plan ; "plan")]
+    #[test_case("subagent", ModelPurpose::Subagent ; "subagent")]
     #[test_case("compact", ModelPurpose::Compact ; "compact")]
+    #[test_case("title", ModelPurpose::Title ; "title")]
     #[test_case("goal", ModelPurpose::Goal ; "goal")]
+    #[test_case("fast", ModelPurpose::Fast ; "fast")]
+    #[test_case("best", ModelPurpose::Best ; "best")]
     fn purpose_parses_and_renders_the_same_name(input: &str, expected: ModelPurpose) {
         assert_eq!(input.parse::<ModelPurpose>().unwrap(), expected);
         assert_eq!(expected.to_string(), input);
+    }
+
+    #[test]
+    fn purpose_sets_keep_routing_order() {
+        assert_eq!(
+            ModelPurpose::ALL,
+            [
+                ModelPurpose::Chat,
+                ModelPurpose::Plan,
+                ModelPurpose::Subagent,
+                ModelPurpose::Compact,
+                ModelPurpose::Title,
+                ModelPurpose::Goal,
+                ModelPurpose::Fast,
+                ModelPurpose::Best,
+            ]
+        );
+        assert_eq!(
+            ModelPurpose::CLASSES,
+            [ModelPurpose::Fast, ModelPurpose::Best]
+        );
+        assert_eq!(
+            ModelPurpose::TARGETS,
+            [
+                ModelPurpose::Chat,
+                ModelPurpose::Plan,
+                ModelPurpose::Fast,
+                ModelPurpose::Best,
+            ]
+        );
     }
 
     #[test]

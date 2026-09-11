@@ -24,8 +24,9 @@ pub use history::{
     resolve_history_head, transcript_history_items,
 };
 pub use model::{
-    Billing, FastPricing, Model, ModelEntry, ModelError, ModelFamily, ModelInfo, ModelPricing,
-    ModelPurpose, PricingTier, StaticReasoningOption, ThinkingSupport, TokenUsage, format_tokens,
+    Billing, FastPricing, Model, ModelEntry, ModelError, ModelFacts, ModelFamily, ModelInfo,
+    ModelMarker, ModelPricing, ModelPurpose, PricingTier, StaticReasoningOption, ThinkingSupport,
+    TokenUsage, format_tokens,
 };
 pub use pricing::{ModelSpend, SessionSpend, model_cost, settle_session};
 pub use providers::Timeouts;

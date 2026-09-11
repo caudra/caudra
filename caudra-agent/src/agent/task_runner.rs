@@ -17,7 +17,7 @@ use std::time::Instant;
 use arc_swap::ArcSwap;
 use async_lock::{Mutex as AsyncMutex, Semaphore};
 use caudra_config::{ModelPolicy, ToolOutputLines};
-use caudra_providers::model::Model;
+use caudra_providers::model::{Model, ModelPurpose};
 use caudra_providers::provider::Provider;
 use caudra_providers::{RequestOptions, Timeouts, ToolNameAliases};
 use caudra_storage::id::SessionRef;
@@ -394,8 +394,8 @@ fn lock(captured: &Mutex<Captured>) -> MutexGuard<'_, Captured> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Resolves the provider and model at launch time, because the TUI swaps
-/// models while a session runs.
+/// Resolves the selected Chat provider and model at launch time, because the
+/// TUI and interactive hosts swap them while a session runs.
 pub type ModelResolver = Arc<dyn Fn() -> (Arc<dyn Provider>, Arc<Model>) + Send + Sync>;
 
 /// The user's mode as it stands when an agent starts, so a workflow that
@@ -512,18 +512,41 @@ impl WorkflowHostContext {
 
     /// A context for one launched agent: its own cancel scope and event
     /// channel, rooted at `call_id`, with nothing inherited from a tool call.
-    pub fn tool_context(
+    pub async fn tool_context(
         &self,
         cancel: CancelToken,
         events: EventSender,
         call_id: &str,
-    ) -> ToolContext {
-        let (provider, model) = (self.model)();
-        ToolContext {
+    ) -> Result<ToolContext, String> {
+        let mode = (self.mode)();
+        let (chat_provider, chat_model) = (self.model)();
+        let (provider, model) = if matches!(mode, AgentMode::Plan(_)) {
+            crate::agent::resolve_model_for_purpose(
+                crate::agent::ModelRoute {
+                    provider: &chat_provider,
+                    model: &chat_model,
+                },
+                crate::agent::ModelRoute {
+                    provider: &chat_provider,
+                    model: &chat_model,
+                },
+                ModelPurpose::Plan,
+                None,
+                self.timeouts,
+                &self.model_policy,
+            )
+            .await
+            .map_err(|error| error.user_message())?
+        } else {
+            (Arc::clone(&chat_provider), Model::clone(&chat_model))
+        };
+        Ok(ToolContext {
             provider,
-            model,
+            model: Arc::new(model),
+            chat_provider,
+            chat_model,
             event_tx: events,
-            mode: (self.mode)(),
+            mode,
             session_id: self.session_id.clone(),
             context_publisher: self.context_publisher.clone(),
             tool_output_store: self.tool_output_store.clone(),
@@ -555,7 +578,7 @@ impl WorkflowHostContext {
             live_sink: None,
             model_policy: Arc::clone(&self.model_policy),
             workflow: None,
-        }
+        })
     }
 }
 
@@ -579,7 +602,15 @@ impl TaskRunner for SubagentTaskRunner {
         events: EventSender,
     ) -> TaskFuture<'_> {
         Box::pin(async move {
-            let ctx = self.host.tool_context(cancel, events, &request.call_id);
+            let started = Instant::now();
+            let ctx = match self
+                .host
+                .tool_context(cancel, events, &request.call_id)
+                .await
+            {
+                Ok(ctx) => ctx,
+                Err(message) => return finish(started, None, 0, Err(message.into())),
+            };
             run_task(&ctx, request).await
         })
     }
@@ -609,6 +640,8 @@ mod tests {
     const REQUIRED_FIELD: &str = "answer";
     const PARTIAL: &str = "half a transcript";
     const BOOM: &str = "boom";
+    const CURRENT_CHAT_ID: &str = "current-chat";
+    const PLAN_PATH: &str = ".caudra/plans/current.md";
     const FIRST_TURN: TokenUsage = TokenUsage {
         input: 100,
         output: 20,
@@ -836,6 +869,49 @@ mod tests {
         expected: Option<SubagentTaskMode>,
     ) {
         assert_eq!(clamp_mode(&task, requested, &ceiling), expected);
+    }
+
+    #[test]
+    fn workflow_context_uses_current_chat_with_one_captured_mode() {
+        smol::block_on(async {
+            let base = stub_ctx_with(&AgentMode::Build, None, Some(CALL_ID));
+            let mut current_chat = Model::clone(&base.model);
+            current_chat.id = CURRENT_CHAT_ID.into();
+            let selected = Arc::new(ArcSwap::from_pointee((
+                Arc::clone(&base.provider),
+                Arc::new(current_chat),
+            )));
+            let mode = Arc::new(ArcSwap::from_pointee(AgentMode::Plan(PLAN_PATH.into())));
+            let model_resolver: ModelResolver = Arc::new({
+                let selected = Arc::clone(&selected);
+                let mode = Arc::clone(&mode);
+                move || {
+                    mode.store(Arc::new(AgentMode::Build));
+                    let selected = selected.load();
+                    (Arc::clone(&selected.0), Arc::clone(&selected.1))
+                }
+            });
+            let mode_resolver: ModeResolver = Arc::new({
+                let mode = Arc::clone(&mode);
+                move || AgentMode::clone(&mode.load())
+            });
+            let host = WorkflowHostContext::from_tool_context(
+                &base,
+                model_resolver,
+                mode_resolver,
+                Arc::new(CancelMap::new()),
+            );
+            let (event_tx, _event_rx) = flume::unbounded();
+            let ctx = host
+                .tool_context(CancelToken::none(), EventSender::new(event_tx, 0), CALL_ID)
+                .await
+                .unwrap();
+
+            assert!(matches!(ctx.mode, AgentMode::Plan(_)));
+            assert_eq!(ctx.model.id, CURRENT_CHAT_ID);
+            assert_eq!(ctx.chat_model.id, CURRENT_CHAT_ID);
+            assert!(Arc::ptr_eq(&ctx.provider, &ctx.chat_provider));
+        });
     }
 
     /// Answers each request from a script; hangs on the last when told to,

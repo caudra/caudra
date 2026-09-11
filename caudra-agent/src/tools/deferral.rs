@@ -12,13 +12,12 @@
 //! that are one mode of work carry a group and load together. The code graph
 //! is five tools and one decision.
 //!
-//! That prefix is also why deferral is per model rather than global. A Fast
-//! model gains from the shorter array and rebuilds its prefix cheaply; a
-//! Balanced or Best one would spend a large prefix to load what it was going
-//! to reach for anyway. [`BuiltinDeferral`] is that decision, taken once per
-//! definitions build and carried as a value, because reading it is a
-//! `providers.toml` parse ([`Model::class_of`]) and the tool report asks per
-//! registry entry.
+//! That prefix is also why deferral is per model rather than global. A small
+//! model gains from the shorter array and rebuilds its prefix cheaply; a known
+//! non-small one would spend a large prefix to load what it was going to reach
+//! for anyway. [`BuiltinDeferral`] is that decision, taken once per definitions
+//! build and carried as a value, because reading it is a `providers.toml` parse
+//! ([`Model::class_of`]) and the tool report asks per registry entry.
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -73,9 +72,7 @@ impl BuiltinDeferral {
         match (setting, class) {
             (DeferBuiltinTools::Never, _) => Self::EagerByConfig,
             (DeferBuiltinTools::Always, _) => Self::Lazy,
-            (DeferBuiltinTools::Auto, Some(ModelPurpose::Balanced | ModelPurpose::Best)) => {
-                Self::EagerByClass
-            }
+            (DeferBuiltinTools::Auto, Some(ModelPurpose::Best)) => Self::EagerByClass,
             (DeferBuiltinTools::Auto, _) => Self::Lazy,
         }
     }
@@ -460,6 +457,7 @@ mod tests {
         "Inspect the execution host's environment. Each call collects a fresh snapshot.";
     const NOTHING_DEFERRED: &str = "a catalog with nothing left to load is dead weight";
     const BEST_SPEC: &str = "anthropic/claude-opus-4-8";
+    const NON_SMALL_SPEC: &str = "anthropic/claude-sonnet-4-6";
     const FAST_SPEC: &str = "anthropic/claude-haiku-4-5";
     const DEFERRABLE: &str = "code_map";
 
@@ -643,12 +641,11 @@ mod tests {
         assert_eq!(names(&tools), [TOOL_SEARCH_TOOL_NAME]);
     }
 
-    /// Only a Fast model, and a model nobody classified, pays for the shorter
-    /// array. Everything else would spend a cache prefix loading what it was
-    /// going to reach for.
+    /// Only a small model, and a model nobody classified, pays for the shorter
+    /// array. A known non-small model would spend a cache prefix loading what it
+    /// was going to reach for.
     #[test_case(DeferBuiltinTools::Auto, Some(ModelPurpose::Fast), BuiltinDeferral::Lazy ; "auto_defers_for_fast")]
     #[test_case(DeferBuiltinTools::Auto, None, BuiltinDeferral::Lazy ; "auto_defers_for_an_unclassified_model")]
-    #[test_case(DeferBuiltinTools::Auto, Some(ModelPurpose::Balanced), BuiltinDeferral::EagerByClass ; "auto_declares_for_balanced")]
     #[test_case(DeferBuiltinTools::Auto, Some(ModelPurpose::Best), BuiltinDeferral::EagerByClass ; "auto_declares_for_best")]
     #[test_case(DeferBuiltinTools::Always, Some(ModelPurpose::Best), BuiltinDeferral::Lazy ; "always_outranks_the_class")]
     #[test_case(DeferBuiltinTools::Never, Some(ModelPurpose::Fast), BuiltinDeferral::EagerByConfig ; "never_outranks_the_class")]
@@ -663,6 +660,7 @@ mod tests {
     /// The rule above is only worth anything if the lookup it wraps files real
     /// models where the curated table says it does.
     #[test_case(BEST_SPEC, BuiltinDeferral::EagerByClass ; "a_best_model_takes_them_upfront")]
+    #[test_case(NON_SMALL_SPEC, BuiltinDeferral::EagerByClass ; "any_known_non_small_model_takes_them_upfront")]
     #[test_case(FAST_SPEC, BuiltinDeferral::Lazy ; "a_fast_model_defers")]
     fn resolve_reads_the_class_of_a_real_model(spec: &str, expected: BuiltinDeferral) {
         let model = Model::from_spec(spec).unwrap();

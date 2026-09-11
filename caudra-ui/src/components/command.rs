@@ -204,7 +204,7 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     },
     BuiltinCommand {
         name: "/model",
-        description: "Switch model",
+        description: "Switch chat model or assign job models",
         max_args: 0,
         scope: ChatScope::MainOnly,
     },
@@ -276,7 +276,7 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     },
     BuiltinCommand {
         name: "/goal-model",
-        description: "Choose the completion goal evaluator",
+        description: "Assign the completion goal model",
         max_args: 0,
         scope: ChatScope::MainOnly,
     },

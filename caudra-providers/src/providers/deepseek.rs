@@ -6,7 +6,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use tracing::warn;
 
-use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelPurpose};
+use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing};
 use crate::pricing::{PricingSchedule, PricingWindow};
 use crate::provider::{BoxFuture, Provider};
 use crate::types::{ProviderUsage, UsageLimit};
@@ -51,10 +51,10 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
     const MODELS: &[ModelEntry] = &[
         ModelEntry {
             prefixes: &["deepseek-v4-flash"],
-            purpose: ModelPurpose::Balanced,
+            small: false,
             family: ModelFamily::Generic,
             vision: false,
-            default: true,
+            default: false,
             pricing: ModelPricing {
                 input: 0.22,
                 output: 0.66,
@@ -69,7 +69,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
         },
         ModelEntry {
             prefixes: &["deepseek-v4-pro"],
-            purpose: ModelPurpose::Best,
+            small: false,
             family: ModelFamily::Generic,
             vision: false,
             default: true,

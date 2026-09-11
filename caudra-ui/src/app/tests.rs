@@ -41,6 +41,7 @@ use caudra_config::{
 };
 use caudra_lua::test_support::{HintWriterHandle, hint_writer_pair};
 use caudra_lua::{BuiltinAction, HintReader, KeymapReader, LuaCommandInfo, LuaCommandReader};
+use caudra_providers::model_registry::{self, Binding};
 use caudra_providers::{
     Billing, ContentBlock, HistoryItemKind, Message, Role, THINKING_USAGE, TokenUsage, UserOrigin,
     expand_message, project_messages,
@@ -167,6 +168,11 @@ const SKILLS_COMMAND: &str = "/skills";
 const SKILLS_EXCESS_ARGS_COMMAND: &str = "/skills all";
 const CONTEXT_EXISTING_MESSAGE: &str = "existing conversation";
 const MAIN_CONTEXT_SPEC: &str = "test/main-context";
+const PLAN_CONTEXT_SPEC: &str = "anthropic/plan-context";
+const PLAN_CONTEXT_MODEL_ID: &str = "plan-context";
+const PLAN_CONTEXT_WINDOW_LABEL: &str = "128.0k";
+const PLAN_STATUS_MODEL_MISSING: &str = "status bar must show the running Plan model";
+const PLAN_STATUS_WINDOW_MISSING: &str = "status bar must show the running Plan context window";
 const TASK_CONTEXT_SPEC: &str = "test/task-context";
 const INITIAL_CONTEXT_PROVIDER: &str = "Initial context provider";
 const UPDATED_CONTEXT_PROVIDER: &str = "Updated context provider";
@@ -1988,6 +1994,97 @@ fn active_context_snapshot_rejects_stale_main_window() {
     app.context_store = Some(store);
 
     assert!(app.active_context_snapshot().is_none());
+}
+
+#[test]
+fn active_context_snapshot_accepts_the_running_plan_model() {
+    let mut app = test_app();
+    let mut model = test_model();
+    model.id = PLAN_CONTEXT_MODEL_ID.into();
+    model.context_window = CHAT_CONTEXT_WINDOW;
+    let provider = caudra_providers::provider::from_model_fallback(
+        &mut model,
+        caudra_providers::Timeouts::default(),
+    );
+    app.effective_model_slot = Some(Arc::new(ArcSwap::from_pointee(crate::agent::ModelSlot {
+        model,
+        provider: Arc::from(provider),
+    })));
+    app.status = Status::Streaming;
+    let store = ContextStore::new();
+    store
+        .publisher(ContextKey::Main)
+        .publish(context_snapshot(PLAN_CONTEXT_SPEC, CHAT_CONTEXT_WINDOW));
+    app.context_store = Some(store);
+
+    let snapshot = app.active_context_snapshot().unwrap();
+    assert_ne!(app.state.model.spec(), PLAN_CONTEXT_SPEC);
+    assert_eq!(snapshot.model.spec, PLAN_CONTEXT_SPEC);
+    assert_eq!(snapshot.window.tokens, CHAT_CONTEXT_WINDOW);
+    let screen = rendered_wide(&mut app, 160);
+    assert!(
+        screen.contains(PLAN_CONTEXT_SPEC),
+        "{PLAN_STATUS_MODEL_MISSING}"
+    );
+    assert!(
+        screen.contains(PLAN_CONTEXT_WINDOW_LABEL),
+        "{PLAN_STATUS_WINDOW_MISSING}"
+    );
+}
+
+#[test]
+fn idle_plan_status_uses_the_last_validated_effective_snapshot() {
+    let mut app = test_app();
+    let previous = model_registry::binding(ModelPurpose::Plan);
+    model_registry::set_binding_and_persist(
+        ModelPurpose::Plan,
+        Binding::Exact(PLAN_CONTEXT_SPEC.into()),
+        &app.storage,
+    )
+    .unwrap();
+    let mut model = test_model();
+    model.id = PLAN_CONTEXT_MODEL_ID.into();
+    model.context_window = CHAT_CONTEXT_WINDOW;
+    let provider = caudra_providers::provider::from_model_fallback(
+        &mut model,
+        caudra_providers::Timeouts::default(),
+    );
+    app.effective_model_slot = Some(Arc::new(ArcSwap::from_pointee(crate::agent::ModelSlot {
+        model,
+        provider: Arc::from(provider),
+    })));
+    app.state.mode = Mode::Plan;
+    app.state.applied_mode = Mode::Plan;
+    let store = ContextStore::new();
+    store
+        .publisher(ContextKey::Main)
+        .publish(context_snapshot(PLAN_CONTEXT_SPEC, CHAT_CONTEXT_WINDOW));
+    app.context_store = Some(store);
+
+    let snapshot = app.active_context_snapshot();
+    let screen = rendered_wide(&mut app, 160);
+    match previous {
+        Some(binding) => {
+            model_registry::set_binding_and_persist(ModelPurpose::Plan, binding, &app.storage)
+        }
+        None => model_registry::clear_binding_and_persist(ModelPurpose::Plan, &app.storage),
+    }
+    .unwrap();
+
+    assert_eq!(
+        snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.model.spec.as_str()),
+        Some(PLAN_CONTEXT_SPEC)
+    );
+    assert!(
+        screen.contains(PLAN_CONTEXT_SPEC),
+        "{PLAN_STATUS_MODEL_MISSING}"
+    );
+    assert!(
+        screen.contains(PLAN_CONTEXT_WINDOW_LABEL),
+        "{PLAN_STATUS_WINDOW_MISSING}"
+    );
 }
 
 #[test]
@@ -10338,7 +10435,7 @@ fn picker_overlay_blocks_plan_row_clicks() {
     app.plan_form.on_plan_ready();
     let _ = rendered(&mut app);
     let row = app.plan_form.row_area(2).unwrap();
-    app.model_picker.open(&app.state.model.spec());
+    app.model_picker.open(&app.state.model, &app.model_policy);
     let _ = rendered(&mut app);
 
     app.update(mouse_event(
@@ -10397,8 +10494,7 @@ fn open_goal_modal(app: &mut App) {
 }
 
 fn open_model_picker(app: &mut App) {
-    let spec = app.state.model.spec();
-    app.model_picker.open(&spec);
+    app.model_picker.open(&app.state.model, &app.model_policy);
 }
 
 fn open_command_modal(app: &mut App) {

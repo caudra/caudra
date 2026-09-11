@@ -107,7 +107,15 @@ The TUI `/login` command offers the same method choice for Anthropic and OpenAI.
 
 ### `caudra models`
 
-Lists every model Caudra currently knows about (built-ins, discovered, catalog). One model spec per line. Warnings from discovery go to stderr.
+```bash
+caudra models
+caudra models --jobs
+caudra models --jobs --model anthropic/claude-sonnet-4-6
+```
+
+The plain command streams every model Caudra currently knows about from built-ins, discovery, and catalogs. Each line starts with its model spec and may end with a Small, Fast, or Best supply marker. Warnings from discovery go to stderr.
+
+`--jobs` prints a table with **Job**, **Binding**, and **Resolved** columns for Chat, Plan, Subagent, Compact, Title, Goal, Fast, and Best. The optional global `--model` sets the anchor used to resolve the table and may appear before or after `models`. Without it, the normal saved, configured, or detected model becomes the anchor. It resolves from configuration and locally available model metadata, avoiding the all-provider discovery pass used by the plain command. See [Providers](/docs/providers/#model-jobs) for bindings, defaults, and marker meanings.
 
 ### `caudra mcp`
 
@@ -177,7 +185,7 @@ Resolves config the way a real run does, so the output reflects `agent.disabled_
 
 A tool that is off carries the rule that turned it off: `--disallowed-tools`, `disabled by config`, `not in --allowed-tools`, `model has no vision support`, `model uses the other editing tool`, or `no ChatGPT subscription`. A `deny` or `allow` default from [Permissions](/docs/permissions/) appears next to the tool it applies to. See [Disabling tools](/docs/tools/#disabling-tools).
 
-A tool marked `lazy` is available and starts outside the request array, so the model reaches it through `tool_search` rather than seeing it upfront. Built-in and MCP tools can both be lazy. Which built-ins are lazy depends on the model you select with `-m`: a Fast or unclassified model defers them, a Balanced or Best one lists them `on` with the note `declared upfront on a balanced or best model`. See [Tools loaded on demand](/docs/tools/#tools-loaded-on-demand).
+A tool marked `lazy` is available and starts outside the request array, so the model reaches it through `tool_search` rather than seeing it upfront. Built-in and MCP tools can both be lazy. Which built-ins are lazy depends on the model you select with `-m`: a small or supply-unknown model defers them, while a known non-small model lists them `on` with the note `declared upfront on a known non-small model`. See [Tools loaded on demand](/docs/tools/#tools-loaded-on-demand).
 
 ### `caudra skills`
 

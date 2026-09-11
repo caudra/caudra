@@ -4,6 +4,12 @@ use caudra_ui::{BUILTIN_COMMANDS, ChatScope};
 
 const MAIN_ONLY_MARK: &str = "Main only";
 
+const MODEL_JOBS: &str = r#"## Model jobs
+
+`/model` opens a Jobs overview and model list. Selecting a model there changes Chat. `/goal-model` opens the Goal assignment page directly.
+
+See [Providers](/docs/providers/#model-jobs) for the jobs, picker controls, assignments, automatic resolution, and supply markers."#;
+
 const ALIASING: &str = r#"## Aliasing commands
 
 Prefer a different name for a command? `caudra.api.run_command` runs any slash command exactly as typing it would, so an alias is a one-line handler in your `init.lua` instead of a reimplementation.
@@ -69,9 +75,7 @@ const GOALS: &str = r#"## Completion goals
 
 At the end of each natural work turn, a separate model call evaluates the condition against a private copy of the transcript. The evaluator has no tools and its messages do not enter the conversation. A met goal clears itself. An unmet goal adds hidden guidance and starts another work turn. A genuinely impossible goal stops with the evaluator's reason and clears itself.
 
-Run `/goal-model` to bind the Goal purpose. `/goal model` is also accepted as an alias. Left unbound, Goal follows Fast, which asks the active provider and ends at the conversation model if nothing answers. Binding it to Fast, Balanced, or Best follows that purpose instead; binding it to an exact model may use another provider. An explicit binding reports an error rather than silently falling back when the model is unavailable or disallowed.
-
-The binding is saved globally in the `model.purposes` row of Caudra's SQLite state database and applies across sessions. The same Goal purpose is available from `/model` with `Tab`. Press uppercase `R` there to clear the binding.
+Run `/goal-model` to open the Goal assignment page directly. `/goal model` is also accepted as an alias. Left unbound, Goal follows Fast. See [Model jobs](#model-jobs) for other assignments and failure behavior.
 
 Run `/goal` without arguments to open the status panel. It shows the condition, evaluator, elapsed time, evaluation count, spend, latest reason, and automatic-continuation limit. Use Left and Right or `-` and `+` to adjust the limit for the current session. The footer shows a compact indicator while a goal is active, and clicking that indicator opens the panel.
 
@@ -186,6 +190,9 @@ pub fn generate() -> String {
 
     writeln!(out).unwrap();
     writeln!(out, "{RESUMING}").unwrap();
+
+    writeln!(out).unwrap();
+    writeln!(out, "{MODEL_JOBS}").unwrap();
 
     writeln!(out).unwrap();
     writeln!(out, "## Sessions").unwrap();

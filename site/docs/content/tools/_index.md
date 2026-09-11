@@ -39,9 +39,9 @@ Loading changes the tool array, so the provider's prompt cache prefix resets and
 
 ### Which models defer
 
-That cache reset is why deferral depends on the model. Caudra defers for a model its provider classifies **Fast**, and for a model nobody classified, where a shorter array helps the model choose and the prefix is cheap to rebuild. A **Balanced** or **Best** model takes all 8 upfront, because it picks well from a long list and would spend a large prefix loading a tool it was going to reach for anyway.
+That cache reset is why deferral depends on model supply. Caudra defers for every model recorded as small, whether marked **Small** or **Fast**, and for a model with no supply facts. A known non-small model takes all 8 upfront because it would spend a large prefix loading a tool it was likely to need.
 
-Declare `purposes` in `providers.toml` to classify a model your provider does not ([Providers](/docs/providers/#model-classes)), or set `agent.defer_builtin_tools` to `always` or `never` to decide for every model ([Configuration](/docs/configuration/#agent)).
+Declare `fast` and `best` under `purposes` in `providers.toml` to describe model supply ([Providers](/docs/providers/#supply-metadata)), or set `agent.defer_builtin_tools` to `always` or `never` to decide for every model ([Configuration](/docs/configuration/#agent)).
 
 Listing a tool in `--allowed-tools` asks for it upfront and skips the search. [`caudra tools`](/docs/cli/) marks a deferred tool `lazy` and says `deferred behind tool_search`.
 

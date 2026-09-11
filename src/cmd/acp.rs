@@ -21,7 +21,8 @@ pub fn run(
     profile_arg: Option<String>,
 ) -> Result<()> {
     let storage = StateDir::resolve().context("resolve data directory")?;
-    caudra_providers::model_registry::load_from_storage(&storage);
+    caudra_providers::model_registry::load_from_storage(&storage)
+        .context("load model purpose bindings")?;
 
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
     load_env_files(&cwd);

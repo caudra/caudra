@@ -965,14 +965,8 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::All,
     },
     Keybind {
-        label: KeyLabel::Alt("Tab", SHIFT_TAB_LABEL),
-        description: "Switch model purpose",
-        context: KeybindContext::ModelPicker,
-        platform: Platform::All,
-    },
-    Keybind {
         label: KeyLabel::Single("R"),
-        description: "Reset model purpose",
+        description: "Clear job binding",
         context: KeybindContext::ModelPicker,
         platform: Platform::All,
     },
@@ -990,7 +984,7 @@ pub const KEYBINDS: &[Keybind] = &[
     },
     Keybind {
         label: KeyLabel::Single(key::GENERATE_TITLE.label),
-        description: "Name session with a small model",
+        description: "Generate session title",
         context: KeybindContext::SessionPicker,
         platform: Platform::All,
     },

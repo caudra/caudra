@@ -36,7 +36,7 @@ Commands marked Main only act on the main session's turn or history. They stay l
 | `/deep-research` | Research a question with the deep-research workflow | Main only |
 | `/sessions` | Browse and switch sessions |  |
 | `/rename` | Rename the current session |  |
-| `/model` | Switch model | Main only |
+| `/model` | Switch chat model or assign job models | Main only |
 | `/system-prompt` | Switch system prompt profile | Main only |
 | `/review` | Review the last reply passage by passage |  |
 | `/theme` | Switch color theme |  |
@@ -48,7 +48,7 @@ Commands marked Main only act on the main session's turn or history. They stay l
 | `/btw` | Ask a quick question (no tools, no history pollution) | Main only |
 | `/goal` | Work until a completion condition is met | Main only |
 | `/goal-clear` | Stop the active completion goal | Main only |
-| `/goal-model` | Choose the completion goal evaluator | Main only |
+| `/goal-model` | Assign the completion goal model | Main only |
 | `/yolo` | Toggle YOLO mode (skip all permission prompts) |  |
 | `/thinking` | Set reasoning (off, adaptive/provider default, effort, or token budget) |  |
 | `/fast` | Toggle Anthropic fast mode (Opus only) |  |
@@ -65,6 +65,12 @@ What Caudra sends depends on where the turn stopped. A turn cancelled inside a t
 `/continue` also works after a turn that ended normally, which is how you ask for more work without writing a prompt. It reports why it did nothing when the session is busy or when the session has no history yet.
 
 Subagents resume the same way. A `task` call that passes a `task_id` may omit `prompt`, which continues that subagent from its existing messages with nothing new to act on.
+
+## Model jobs
+
+`/model` opens a Jobs overview and model list. Selecting a model there changes Chat. `/goal-model` opens the Goal assignment page directly.
+
+See [Providers](/docs/providers/#model-jobs) for the jobs, picker controls, assignments, automatic resolution, and supply markers.
 
 ## Sessions
 
@@ -112,9 +118,7 @@ Closing Caudra interrupts every active run, and an interrupted run is over. Paus
 
 At the end of each natural work turn, a separate model call evaluates the condition against a private copy of the transcript. The evaluator has no tools and its messages do not enter the conversation. A met goal clears itself. An unmet goal adds hidden guidance and starts another work turn. A genuinely impossible goal stops with the evaluator's reason and clears itself.
 
-Run `/goal-model` to bind the Goal purpose. `/goal model` is also accepted as an alias. Left unbound, Goal follows Fast, which asks the active provider and ends at the conversation model if nothing answers. Binding it to Fast, Balanced, or Best follows that purpose instead; binding it to an exact model may use another provider. An explicit binding reports an error rather than silently falling back when the model is unavailable or disallowed.
-
-The binding is saved globally in the `model.purposes` row of Caudra's SQLite state database and applies across sessions. The same Goal purpose is available from `/model` with `Tab`. Press uppercase `R` there to clear the binding.
+Run `/goal-model` to open the Goal assignment page directly. `/goal model` is also accepted as an alias. Left unbound, Goal follows Fast. See [Model jobs](#model-jobs) for other assignments and failure behavior.
 
 Run `/goal` without arguments to open the status panel. It shows the condition, evaluator, elapsed time, evaluation count, spend, latest reason, and automatic-continuation limit. Use Left and Right or `-` and `+` to adjust the limit for the current session. The footer shows a compact indicator while a goal is active, and clicking that indicator opens the panel.
 
