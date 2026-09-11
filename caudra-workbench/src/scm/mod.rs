@@ -203,6 +203,18 @@ impl Scm {
     /// Rereads the repository. The log costs a walk, so it is only reread when
     /// the graph is open to show it.
     pub fn refresh(&mut self) {
+        self.reread(true);
+    }
+
+    /// Rereads the worktree and leaves the log where it is. Nothing a file
+    /// write does can move the commit graph, and walking it is the expensive
+    /// half of a refresh, so the watcher takes this path unless git itself is
+    /// what moved.
+    pub fn refresh_worktree(&mut self) {
+        self.reread(false);
+    }
+
+    fn reread(&mut self, graph: bool) {
         // Read before the lists are replaced: the rows index into them, so a
         // cursor read afterwards would name whatever slid into its slot.
         let previous = self.anchor();
@@ -218,7 +230,7 @@ impl Scm {
                 self.error = Some(error.to_string());
             }
         }
-        if !self.sections[Section::Graph.index()].collapsed {
+        if graph && !self.sections[Section::Graph.index()].collapsed {
             match repo.log() {
                 Ok(log) => self.log = log,
                 Err(error) => {

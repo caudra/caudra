@@ -9,18 +9,22 @@
 use std::collections::HashSet;
 use std::mem;
 use std::path::{Path, PathBuf};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use flume::Receiver;
+use ignore::WalkBuilder;
 use notify::event::ModifyKind;
 use notify::{
     Event, EventKind, RecommendedWatcher, RecursiveMode, Result as Watched, Watcher as _,
 };
+use tracing::info;
 
 use crate::fs::tree::GIT_DIR;
 
 /// How long the tree has to stay quiet before a burst is reported.
 const SETTLE: Duration = Duration::from_millis(200);
+const REGISTER_THREAD_NAME: &str = "workbench-watch";
 
 /// What moved under the root since the last drain.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -78,38 +82,106 @@ impl Settle {
     }
 }
 
-/// A recursive watch over the workbench root. Dropping it stops the watch, so
-/// closing the workbench does not leave a thread holding kernel handles for a
-/// tree nobody is looking at.
+/// A watch over the parts of the root the repository does not ignore.
+///
+/// Registering an inotify watch costs one `inotify_add_watch` per directory
+/// under what is asked for, and `notify` blocks the caller until every one of
+/// them is in. A recursive watch on the root of a Rust checkout therefore walks
+/// `target`, which holds the overwhelming majority of the directories and none
+/// of the source, so the watch is placed on each subtree git tracks instead.
+/// Registration then runs on its own thread, so opening the workbench costs
+/// nothing that scales with the tree.
+///
+/// Dropping this stops the watch, so closing the workbench does not leave a
+/// thread holding kernel handles for a tree nobody is looking at.
 pub struct Watch {
     events: Receiver<Watched<Event>>,
     settle: Settle,
     /// Held only to keep the watch alive; every event arrives on the channel.
-    _watcher: RecommendedWatcher,
+    /// Empty until registration hands it over.
+    watcher: Option<RecommendedWatcher>,
+    registered: Receiver<RecommendedWatcher>,
 }
 
 impl Watch {
-    /// A tree that cannot be watched is not worth an error. The panes still
-    /// refresh on demand, so the workbench opens either way.
+    /// Returns before the watch is live, which costs at most the events of the
+    /// few milliseconds registration takes; the panes are read as the workbench
+    /// opens anyway. A tree that cannot be watched is not worth an error
+    /// either, since they still refresh on demand.
     pub fn start(root: &Path) -> Option<Self> {
         let (sender, events) = flume::unbounded();
         let mut watcher = notify::recommended_watcher(sender).ok()?;
-        watcher.watch(root, RecursiveMode::Recursive).ok()?;
+        let (done, registered) = flume::bounded(1);
+        let root = root.to_path_buf();
+        thread::Builder::new()
+            .name(REGISTER_THREAD_NAME.to_owned())
+            .spawn(move || {
+                let started = Instant::now();
+                // The root itself is watched shallowly, so an entry appearing
+                // beside the subtrees is still noticed without pulling in what
+                // sits under its neighbours.
+                let shallow = watcher.watch(&root, RecursiveMode::NonRecursive).is_ok();
+                let subtrees = subtrees(&root);
+                let watched = subtrees
+                    .iter()
+                    .filter(|dir| watcher.watch(dir, RecursiveMode::Recursive).is_ok())
+                    .count();
+                info!(
+                    shallow,
+                    subtrees = subtrees.len(),
+                    watched,
+                    register_ms = started.elapsed().as_millis() as u64,
+                    "workbench watch started"
+                );
+                // A workbench closed mid-registration has already dropped the
+                // receiver, and the watcher falling out of the refused send is
+                // what stops the watch.
+                let _ = done.send(watcher);
+            })
+            .ok()?;
         Some(Self {
             events,
             settle: Settle::default(),
-            _watcher: watcher,
+            watcher: None,
+            registered,
         })
+    }
+
+    /// Whether the watch is live. Registration runs on its own thread, so a
+    /// change made before this holds is one the watch never saw.
+    pub fn is_live(&mut self) -> bool {
+        if let Ok(watcher) = self.registered.try_recv() {
+            self.watcher = Some(watcher);
+        }
+        self.watcher.is_some()
     }
 
     /// Empty until the tree has been quiet for [`SETTLE`], so a caller can ask
     /// on every frame without paying for a walk on every write.
     pub fn drain(&mut self) -> Changes {
+        self.is_live();
         let now = Instant::now();
         self.settle
             .absorb(fold(self.events.try_iter().flatten()), now);
         self.settle.take(now)
     }
+}
+
+/// The directories under `root` the repository does not ignore, which are the
+/// ones a watch is worth placing on. Dotted directories are kept, since
+/// `.github` and `.cargo` hold source; `.git` is dropped, since watching it
+/// reports every loose object git writes. `WalkBuilder`'s defaults already
+/// apply the ignore rules, the global excludes and the parents above the root.
+fn subtrees(root: &Path) -> Vec<PathBuf> {
+    WalkBuilder::new(root)
+        .max_depth(Some(1))
+        .hidden(false)
+        .filter_entry(|entry| entry.file_name() != GIT_DIR)
+        .build()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path() != root && entry.file_type().is_some_and(|kind| kind.is_dir()))
+        .map(|entry| entry.path().to_path_buf())
+        .collect()
 }
 
 /// Kept apart from the watch so the classification can be tested against
@@ -144,14 +216,24 @@ fn in_git_dir(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::path::PathBuf;
-    use std::time::Instant;
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     use notify::event::{CreateKind, MetadataKind, ModifyKind, RemoveKind, RenameMode};
     use notify::{Event, EventKind};
+    use tempfile::TempDir;
     use test_case::test_case;
 
-    use super::{Changes, SETTLE, Settle, fold};
+    use super::{Changes, SETTLE, Settle, Watch, fold, subtrees};
+
+    /// Bounds a failure rather than pacing a success: a working watch answers in
+    /// tens of milliseconds and the test ends there, while a broken one is only
+    /// distinguishable from a slow one by giving up eventually.
+    const DELIVERY_DEADLINE: Duration = Duration::from_secs(10);
+    /// Short enough that the test ends as soon as the burst settles.
+    const POLL: Duration = Duration::from_millis(10);
 
     const NOT_LISTED: &str = "a path that changed is missing from the drained set";
     const WRONG_SHAPE: &str = "the tree was told the wrong thing about its shape";
@@ -159,6 +241,10 @@ mod tests {
         "a path under .git was reported as a file rather than as repository state";
     const TOO_EAGER: &str = "a burst was reported before the tree went quiet";
     const HELD_BACK: &str = "a settled burst was not reported";
+    const WRONG_TREES: &str =
+        "the watch must cover the source trees and skip .git and whatever the repository ignores";
+    const NEVER_LIVE: &str = "the watch never finished registering";
+    const NOT_DELIVERED: &str = "a write under a watched subtree never reached the drain";
 
     const CONTENT: EventKind = EventKind::Modify(ModifyKind::Data(notify::event::DataChange::Any));
     const CREATED: EventKind = EventKind::Create(CreateKind::File);
@@ -261,6 +347,58 @@ mod tests {
 
         assert!(settle.take(start + SETTLE).structural, "{HELD_BACK}");
         assert!(settle.take(start + SETTLE * 2).is_empty(), "{HELD_BACK}");
+    }
+
+    /// The watch is now a set of subtrees rather than one recursive watch on
+    /// the root, and nothing else covers the case where that set is registered
+    /// but delivers nothing: the panes would simply stop noticing the disk.
+    #[test]
+    fn a_write_under_a_watched_subtree_is_delivered() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::create_dir(root.join("src")).unwrap();
+        let mut watch = Watch::start(root).expect("a watch over a plain directory");
+
+        let deadline = Instant::now() + DELIVERY_DEADLINE;
+        while !watch.is_live() {
+            assert!(Instant::now() < deadline, "{NEVER_LIVE}");
+            thread::yield_now();
+        }
+
+        let path = root.join("src/a.rs");
+        fs::write(&path, "fn main() {}\n").unwrap();
+        let delivered = loop {
+            let changes = watch.drain();
+            if !changes.is_empty() {
+                break changes;
+            }
+            assert!(Instant::now() < deadline, "{NOT_DELIVERED}");
+            thread::sleep(POLL);
+        };
+
+        assert!(delivered.files.contains(&path), "{NOT_DELIVERED}");
+    }
+
+    /// `target` is the whole reason the watch stopped being recursive: it holds
+    /// far more directories than the source does and none of them are source.
+    #[test]
+    fn only_the_trees_the_repository_keeps_are_watched() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join(".git/objects")).unwrap();
+        fs::create_dir_all(root.join("target/debug")).unwrap();
+        fs::create_dir(root.join("src")).unwrap();
+        fs::create_dir(root.join(".github")).unwrap();
+        fs::write(root.join(".gitignore"), "target\n").unwrap();
+        fs::write(root.join("Cargo.toml"), "").unwrap();
+
+        let mut watched: Vec<String> = subtrees(root)
+            .iter()
+            .filter_map(|path| Some(path.file_name()?.to_string_lossy().into_owned()))
+            .collect();
+        watched.sort();
+
+        assert_eq!(watched, vec![".github", "src"], "{WRONG_TREES}");
     }
 
     #[test]

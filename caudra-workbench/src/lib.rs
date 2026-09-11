@@ -615,16 +615,43 @@ impl Workbench {
         if changes.is_empty() {
             return false;
         }
+        let started = Instant::now();
+        let mut phase_start = started;
+        let mut lap = || {
+            let elapsed = phase_start.elapsed().as_millis() as u64;
+            phase_start = Instant::now();
+            elapsed
+        };
+        let files = changes.files.len();
         for path in &changes.files {
             self.reload_tab(path);
         }
+        let tabs_ms = lap();
         self.touched.extend(changes.files);
         if changes.structural {
             self.tree.reload();
             self.palette.invalidate();
         }
-        self.scm.refresh();
+        let tree_ms = lap();
+        if changes.git {
+            self.scm.refresh();
+        } else {
+            self.scm.refresh_worktree();
+        }
+        let scm_ms = lap();
         self.apply_marks();
+        tracing::info!(
+            files,
+            structural = changes.structural,
+            git = changes.git,
+            tabs_ms,
+            tree_ms,
+            scm_ms,
+            marks_ms = lap(),
+            total_ms = started.elapsed().as_millis() as u64,
+            touched = self.touched.len(),
+            "workbench absorbed changes"
+        );
         true
     }
 
