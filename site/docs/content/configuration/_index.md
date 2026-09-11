@@ -70,6 +70,7 @@ All fields are optional. Typos in field names cause an error right away.
 |-------|------|---------|-----|-----|-------------|
 | `splash_animation` | bool | `true` | - | - | Show splash animation on startup |
 | `scrollbar` | bool | `true` | - | - | Show vertical scrollbar in scrollable areas |
+| `touch` | string | `auto` | - | - | Touch-friendly pointer handling: auto, on, or off. Widens the scrollbar's hit zone so a finger can tap it, scrolls one line per wheel event instead of mouse_scroll_lines, and leaves text selection to the terminal. Auto detects Termux around Caudra itself, which SSH does not carry, so set this to on when reaching Caudra from a phone over SSH |
 | `notifications` | string | `auto` | - | - | Terminal notification method: auto, osc9, bell, or off |
 | `math` | string | `unicode` | - | - | How LaTeX maths renders: unicode (approximate with Unicode) or raw (show the LaTeX source) |
 | `mermaid` | string | `unicode` | - | - | How mermaid flowcharts render: unicode (draw them with box-drawing characters) or off (leave the fence as code) |

@@ -15,6 +15,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
+use std::sync::atomic::{AtomicBool, Ordering};
 use unicode_width::UnicodeWidthStr;
 
 use crate::chrome;
@@ -32,6 +33,42 @@ const MESSAGE_HINT: &str = "message";
 /// Columns between the position hint and the bar, so the chip does not touch
 /// the thumb it describes.
 const HINT_GAP: u16 = 1;
+/// How wide a press on the bar may land under touch. A fingertip covers several
+/// cells and reports their centroid, so a one-column target is unhittable while
+/// three is comfortable. Paint stays one column wide either way.
+const TOUCH_HIT_COLUMNS: u16 = 3;
+
+/// Whether the pointer is a finger, a property of the attached terminal and so
+/// the same for every surface. Read by [`ScrollTrack::new`], which sits well
+/// below anything holding the config, and by the surfaces that decide whether a
+/// press can become a drag at all.
+static TOUCH: AtomicBool = AtomicBool::new(false);
+
+/// Set at startup from the resolved `ui.touch`. A later call wins, so a read
+/// that happens first cannot latch the answer the way a `OnceLock` would.
+pub fn set_touch(on: bool) {
+    TOUCH.store(on, Ordering::Relaxed);
+}
+
+pub fn touch() -> bool {
+    TOUCH.load(Ordering::Relaxed)
+}
+
+/// The strip a press may land on, given the surface [`ScrollTrack::new`] was
+/// handed. Wider than the paint under touch, clamped to the surface so a narrow
+/// pane cannot claim presses from its neighbour, and exactly the painted column
+/// otherwise.
+fn hit_area(area: Rect, touch: bool) -> Rect {
+    let width = match touch {
+        true => TOUCH_HIT_COLUMNS.min(area.width),
+        false => 1,
+    };
+    Rect {
+        x: area.right() - width,
+        width,
+        ..area
+    }
+}
 
 /// Rounds to nearest rather than truncating, so the thumb sits where the eye
 /// expects it at both ends of the track.
@@ -123,6 +160,10 @@ impl ScrollGrab {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScrollTrack {
     area: Rect,
+    /// Where a press counts, which is the painted column plus a margin under
+    /// touch. Kept beside the paint rather than recomputed, so hit-testing and
+    /// rendering cannot drift apart.
+    hit: Rect,
     total: u32,
     position: u32,
 }
@@ -144,6 +185,7 @@ impl ScrollTrack {
                 width: 1,
                 ..area
             },
+            hit: hit_area(area, touch()),
             total,
             position: position.min(total - height),
         })
@@ -184,7 +226,7 @@ impl ScrollTrack {
     }
 
     pub fn contains(&self, at: Position) -> bool {
-        self.area.contains(at)
+        self.hit.contains(at)
     }
 
     /// The ends of the document belong to the ends of the track by definition,
@@ -369,7 +411,14 @@ impl Scrollbar {
             return;
         };
         track.render(buf, style, self.state());
-        if let Some(hint) = self.hint.as_ref().filter(|_| self.grab.is_some()) {
+        // A touch grab lives only between the press and the release of one tap,
+        // which is long enough to catch a frame and flash a chip nobody can act
+        // on.
+        if let Some(hint) = self
+            .hint
+            .as_ref()
+            .filter(|_| self.grab.is_some() && !touch())
+        {
             render_hint(buf, track, hint, style);
         }
     }
@@ -409,12 +458,29 @@ mod tests {
         width: 1,
         height: 10,
     };
+    /// A surface wide enough for the touch margin to have somewhere to go.
+    const PANE: Rect = Rect {
+        x: 4,
+        y: 0,
+        width: 20,
+        height: 10,
+    };
     const WRONG_THUMB: &str = "the thumb is not where the content says it is";
     const WRONG_OFFSET: &str = "the drag landed on the wrong offset";
     const WRONG_TRACK: &str = "the track was built for content that does not overflow";
+    const WRONG_HIT: &str = "the press did not land where the bar accepts one";
+    const WRONG_PAINT: &str = "the bar painted a different strip than it was placed on";
 
     fn track(total: u32, position: u32) -> ScrollTrack {
         ScrollTrack::new(BAR, total, position).expect("overflowing content")
+    }
+
+    /// Mirrors what [`ScrollTrack::new`] does under touch; the flag itself is a
+    /// process-wide `OnceLock` that a test cannot set without racing its peers.
+    fn touch_track(area: Rect, total: u32) -> ScrollTrack {
+        let mut track = ScrollTrack::new(area, total, 0).expect("overflowing content");
+        track.hit = hit_area(area, true);
+        track
     }
 
     #[test_case(10 ; "content exactly fills the pane")]
@@ -529,5 +595,41 @@ mod tests {
             "{WRONG_OFFSET}"
         );
         assert_eq!(track.offset_at(&grab, thumb, false), 1800, "{WRONG_OFFSET}");
+    }
+
+    #[test_case(PANE, false, 1 ; "a pointer gets the painted column alone")]
+    #[test_case(PANE, true, TOUCH_HIT_COLUMNS ; "a finger gets a margin beside it")]
+    #[test_case(BAR, true, 1 ; "a one column surface has no margin to give")]
+    fn the_hit_strip_widens_only_for_touch(area: Rect, touch: bool, width: u16) {
+        let hit = hit_area(area, touch);
+
+        assert_eq!((hit.right(), hit.width), (area.right(), width), "{WRONG_HIT}");
+    }
+
+    #[test]
+    fn a_finger_may_press_beside_the_bar() {
+        let track = touch_track(PANE, 100);
+        let thumb = track.thumb().0;
+
+        for column in track.area().x + 1 - TOUCH_HIT_COLUMNS..=track.area().x {
+            assert!(track.contains(Position::new(column, thumb)), "{WRONG_HIT}");
+        }
+        assert!(
+            !track.contains(Position::new(track.area().x - TOUCH_HIT_COLUMNS, thumb)),
+            "{WRONG_HIT}"
+        );
+    }
+
+    #[test]
+    fn the_widened_strip_does_not_widen_the_paint() {
+        let track = touch_track(PANE, 100);
+        let mut buf = Buffer::empty(PANE);
+
+        track.render(&mut buf, Style::default(), ThumbState::Idle);
+
+        let painted = (PANE.x..PANE.right())
+            .filter(|&x| buf[(x, track.thumb().0)].symbol() == SCROLLBAR_THUMB)
+            .collect::<Vec<_>>();
+        assert_eq!(painted, vec![track.area().x], "{WRONG_PAINT}");
     }
 }

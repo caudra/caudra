@@ -1293,18 +1293,21 @@ fn emphasize(line: Line<'static>, hovered: bool, styles: &WorkbenchStyles) -> Li
     Line::from(spans).style(base)
 }
 
-/// Splits a pane into the rows and the column its scrollbar takes. A pane whose
-/// content already fits keeps its full width, so the bar shows up only where it
-/// has something to say. The rect it reports is the one the caller records for
-/// hit-testing, which is what stops a click landing on the bar's column from
-/// acting on the row painted beside it.
+/// Splits a pane into the rows the content gets and the pane the bar is placed
+/// against. A pane whose content already fits keeps its full width, so the bar
+/// shows up only where it has something to say.
+///
+/// The second rect is the whole pane rather than the reserved column:
+/// `ScrollTrack` paints itself into the last column of whatever it is handed,
+/// and it needs the pane to know how far a touch press may stray from the bar
+/// before it would land in the pane next door.
 fn scroll_column(enabled: bool, area: Rect, total: usize) -> (Rect, Option<Rect>) {
     if !enabled || area.width < SCROLLBAR_MIN_WIDTH || total <= area.height as usize {
         return (area, None);
     }
-    let [rows, bar] =
+    let [rows, _] =
         Layout::horizontal([Constraint::Min(1), Constraint::Length(SCROLLBAR_WIDTH)]).areas(area);
-    (rows, Some(bar))
+    (rows, Some(area))
 }
 
 fn overwrite(buf: &mut Surface, at: (u16, u16), symbol: &str, style: Style) {
@@ -1999,6 +2002,9 @@ mod tests {
 
         assert_eq!(bar.is_some(), expected, "{WRONG_BAR}");
         assert_eq!(rows.width, area.width - u16::from(expected), "{WRONG_BAR}");
+        // The pane, not the reserved column: the bar measures its own touch
+        // margin against what the pane can spare.
+        assert_eq!(bar, expected.then_some(area), "{WRONG_BAR}");
     }
 
     /// A bar in a one-column pane would be the whole pane.

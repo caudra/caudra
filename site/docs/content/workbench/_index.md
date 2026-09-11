@@ -73,6 +73,14 @@ The bar is also a handle. Press the thumb and drag it and the pane follows. Pres
 
 Dragging a bar moves the window and leaves the cursor where it was, the way scrolling a buffer does. The next arrow key pulls the window back to it.
 
+### Touch
+
+Touch handling widens the strip a press on a scrollbar may land on to three columns, so a fingertip can reach a bar that is still painted one column wide. It also moves the content one line per wheel event rather than `ui.mouse_scroll_lines`, which keeps the text under your finger as you drag.
+
+Caudra turns it on by itself when it finds Termux around it, which works when Caudra runs on the phone. Reaching Caudra on another machine by SSH is the more common way to use a phone as a terminal, and no Termux variable survives that trip, so set `ui.touch` to `on` in the config on the host you connect to. Set it to `off` for a Bluetooth mouse in Termux.
+
+Termux reports a finger drag as wheel events, so a thumb cannot be dragged with a finger. Tap the track and the pane jumps to that point. Text selection stays with the terminal, where a long press already handles it, so Caudra starts no selection of its own while touch handling is on.
+
 ## Context menu
 
 Every explorer row and every tab carries a `⋮` at its left. Click it to open a menu for that row or tab. The right button does the same from anywhere on the row or the tab, and `Ctrl+X .` opens the menu over whatever the cursor is already on. Opening a tab menu leaves the file on screen alone.

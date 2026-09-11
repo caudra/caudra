@@ -72,6 +72,8 @@ use crate::terminal;
 const DRAIN_BUDGET: usize = 256;
 /// How much further one notch of an Alt-held wheel carries.
 const FAST_SCROLL_FACTOR: u32 = 4;
+/// One row of finger travel moves the content one row.
+const TOUCH_SCROLL_LINES: u32 = 1;
 const AGENT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 /// How long the final snapshot of one session may wait for the artifact lock.
 /// Budgeted per session so a workspace of tabs cannot multiply into a stall,
@@ -965,6 +967,8 @@ impl<'t> EventLoop<'t> {
             caudra_config::MermaidStyle::Off => caudra_markdown::render::MermaidStyle::Off,
         }
         .set_global();
+
+        caudra_workbench::scroll::set_touch(ui_config.touch.enabled(terminal::detect_touch));
 
         let notifier = terminal::TerminalNotifier::new(ui_config.notifications);
         let ctx = SpawnCtx {
@@ -2011,7 +2015,7 @@ impl<'t> EventLoop<'t> {
     fn translate_mouse(&mut self, mouse: CtMouseEvent) -> (Option<Msg>, Option<Event>) {
         match mouse.kind {
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
-                let scroll_lines = self.focused_app().ui_config.mouse_scroll_lines;
+                let scroll_lines = scroll_lines(self.focused_app().ui_config.mouse_scroll_lines);
                 let (msg, leftover) = self.aggregate_scroll(mouse, scroll_lines);
                 (Some(msg), leftover)
             }
@@ -2843,6 +2847,16 @@ fn install_fork_draft(session: &mut AppSession, draft: ForkDraft) {
             data: image.data.to_string(),
         })
         .collect();
+}
+
+/// Under touch a wheel event is one row of finger travel, not one notch of a
+/// detented wheel, so any multiplier makes the content outrun the finger.
+/// `ui.touch = "off"` is the way back to the configured value.
+fn scroll_lines(configured: u32) -> u32 {
+    match caudra_workbench::scroll::touch() {
+        true => TOUCH_SCROLL_LINES,
+        false => configured,
+    }
 }
 
 fn scroll_delta(kind: MouseEventKind, lines: u32) -> i32 {

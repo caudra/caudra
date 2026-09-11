@@ -467,18 +467,25 @@ impl App {
                             );
                         }
                     }
-                    let scroll = self.scroll_offset(zone.zone);
-                    self.selection_state = Some(SelectionState::Dragging {
-                        sel: Selection::start(
-                            event.row,
-                            event.column,
-                            zone.area,
-                            zone.zone,
-                            scroll,
-                        ),
-                        edge_scroll: None,
-                        last_drag_col: event.column,
-                    });
+                    // A sweep needs a held drag, which touch never reports: the
+                    // press above is half of a tap that has already released.
+                    // Starting a selection here would leave one pinned open on
+                    // every tap, and the terminal's own long-press selection is
+                    // the one that works anyway.
+                    if !caudra_workbench::scroll::touch() {
+                        let scroll = self.scroll_offset(zone.zone);
+                        self.selection_state = Some(SelectionState::Dragging {
+                            sel: Selection::start(
+                                event.row,
+                                event.column,
+                                zone.area,
+                                zone.zone,
+                                scroll,
+                            ),
+                            edge_scroll: None,
+                            last_drag_col: event.column,
+                        });
+                    }
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) => {

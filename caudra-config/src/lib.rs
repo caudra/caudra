@@ -669,6 +669,7 @@ pub struct PluginFileConfig {
 pub struct UiFileConfig {
     pub splash_animation: Option<bool>,
     pub scrollbar: Option<bool>,
+    pub touch: Option<TouchMode>,
     pub notifications: Option<NotificationMethod>,
     pub math: Option<MathStyle>,
     pub mermaid: Option<MermaidStyle>,
@@ -693,6 +694,7 @@ impl UiFileConfig {
             overlay,
             splash_animation,
             scrollbar,
+            touch,
             math,
             mermaid,
             notifications,
@@ -1321,6 +1323,30 @@ pub struct Config {
     pub plugins: PluginsConfig,
 }
 
+/// Whether the pointer driving Caudra is a finger. Tri-state because the only
+/// signal is an environment variable, and a Bluetooth mouse in Termux or an SSH
+/// session out of one both make the guess wrong in opposite directions.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+pub enum TouchMode {
+    #[default]
+    #[serde(rename = "auto")]
+    Auto,
+    #[serde(rename = "on")]
+    On,
+    #[serde(rename = "off")]
+    Off,
+}
+
+impl TouchMode {
+    pub fn enabled(self, detect: impl FnOnce() -> bool) -> bool {
+        match self {
+            Self::Auto => detect(),
+            Self::On => true,
+            Self::Off => false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 pub enum ClockFormat {
     #[serde(rename = "12h")]
@@ -1340,6 +1366,14 @@ pub struct UiConfig {
 
     #[config(default = true, desc = "Show vertical scrollbar in scrollable areas")]
     pub scrollbar: bool,
+
+    #[config(
+        default = TouchMode::Auto,
+        ty = "string",
+        default_doc = "auto",
+        desc = "Touch-friendly pointer handling: auto, on, or off. Widens the scrollbar's hit zone so a finger can tap it, scrolls one line per wheel event instead of mouse_scroll_lines, and leaves text selection to the terminal. Auto detects Termux around Caudra itself, which SSH does not carry, so set this to on when reaching Caudra from a phone over SSH"
+    )]
+    pub touch: TouchMode,
 
     #[config(
         default = NotificationMethod::Auto,
@@ -1428,6 +1462,7 @@ impl UiConfig {
         Self {
             splash_animation: f.splash_animation.unwrap_or(true),
             scrollbar: f.scrollbar.unwrap_or(true),
+            touch: f.touch.unwrap_or_default(),
             notifications: f.notifications.unwrap_or_default(),
             math: f.math.unwrap_or_default(),
             mermaid: f.mermaid.unwrap_or_default(),
@@ -3167,6 +3202,16 @@ mod tests {
             raw.into_config(false).unwrap().agent.generate_titles,
             expected
         );
+    }
+
+    const WRONG_TOUCH: &str = "touch mode consulted the terminal when it was told not to";
+
+    #[test_case(TouchMode::Auto, true,  true  ; "auto follows a terminal that reports touch")]
+    #[test_case(TouchMode::Auto, false, false ; "auto follows a terminal that does not")]
+    #[test_case(TouchMode::On,   false, true  ; "on overrides a terminal that does not")]
+    #[test_case(TouchMode::Off,  true,  false ; "off overrides a terminal that does")]
+    fn touch_mode_resolves_against_detection(mode: TouchMode, detected: bool, expected: bool) {
+        assert_eq!(mode.enabled(|| detected), expected, "{WRONG_TOUCH}");
     }
 
     #[test_case("provider", "connect_timeout_secs", 0 ; "provider_zero_connect_timeout")]

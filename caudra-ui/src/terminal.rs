@@ -34,6 +34,15 @@ const STRING_TERMINATOR: &str = "\u{1b}\\";
 const TMUX_QUERY_TIMEOUT: Duration = Duration::from_millis(500);
 const KEYBOARD_ENHANCEMENTS: KeyboardEnhancementFlags =
     KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES;
+/// Termux exports this from v0.107, but not on every install or upgrade path,
+/// so it confirms Termux and never rules it out.
+const TERMUX_VERSION: &str = "TERMUX_VERSION";
+/// Every Termux shell gets `PREFIX=/data/data/com.termux/files/usr`, which has
+/// been true far longer than `TERMUX_VERSION` has existed. The package name is
+/// what makes it Termux rather than any other build environment that likes the
+/// name `PREFIX`.
+const PREFIX: &str = "PREFIX";
+const TERMUX_PACKAGE: &str = "/com.termux/";
 
 pub(crate) struct TerminalGuard;
 
@@ -90,6 +99,20 @@ impl TerminalNotifier {
     pub(crate) fn notify(&self, message: &str) -> std::io::Result<()> {
         write_sequence(&notification_sequence(self.notifier, self.mux, message))
     }
+}
+
+/// Whether the pointer is a finger. Termux is the only terminal that both runs
+/// Caudra and reports touch, and it identifies itself in the environment, so
+/// there is nothing to query the terminal about.
+pub(crate) fn detect_touch() -> bool {
+    is_termux(
+        std::env::var_os(TERMUX_VERSION).is_some(),
+        std::env::var(PREFIX).ok().as_deref(),
+    )
+}
+
+fn is_termux(version: bool, prefix: Option<&str>) -> bool {
+    version || prefix.is_some_and(|prefix| prefix.contains(TERMUX_PACKAGE))
 }
 
 fn detect_osc9_support() -> bool {
@@ -485,6 +508,22 @@ mod tests {
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
     use test_case::test_case;
+
+    const WRONG_TERMUX: &str = "the environment was read as the wrong terminal";
+    const TERMUX_PREFIX: &str = "/data/data/com.termux/files/usr";
+
+    #[test_case(false, Some(TERMUX_PREFIX), true ; "the prefix alone identifies an older termux")]
+    #[test_case(true, None, true ; "the version alone identifies one that exports it")]
+    #[test_case(false, Some("/usr/local"), false ; "a desktop prefix is not termux")]
+    #[test_case(false, Some("/opt/com.termux.example"), false ; "a lookalike path is not termux")]
+    #[test_case(false, None, false ; "an environment with neither is not termux")]
+    fn termux_is_recognised_without_its_version(
+        version: bool,
+        prefix: Option<&str>,
+        expected: bool,
+    ) {
+        assert_eq!(is_termux(version, prefix), expected, "{WRONG_TERMUX}");
+    }
 
     #[test]
     fn keyboard_enhancements_preserve_text_input() {
