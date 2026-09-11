@@ -177,8 +177,24 @@ fn denies(arguments: &[&str], denied: &[&str]) -> bool {
                 || argument
                     .strip_prefix(flag)
                     .is_some_and(|rest| rest.starts_with('='))
+                || hides_in_cluster(argument, flag)
         })
     })
+}
+
+/// A one-letter flag can travel inside a cluster, where `rg -iz` is `rg -i -z`.
+/// Matching whole words would read the cluster as a word of its own and miss it.
+///
+/// A cluster is only a cluster for a single-letter flag, so no long flag is
+/// tested this way, and a pattern that happens to carry the letter costs a
+/// prompt rather than an allowance.
+fn hides_in_cluster(argument: &str, flag: &str) -> bool {
+    let Some(letter) = flag.strip_prefix('-').filter(|rest| rest.len() == 1) else {
+        return false;
+    };
+    argument
+        .strip_prefix('-')
+        .is_some_and(|cluster| !cluster.starts_with('-') && cluster.contains(letter))
 }
 
 #[cfg(test)]
@@ -240,6 +256,8 @@ mod tests {
     #[test_case("rg pattern src" => true ; "ripgrep")]
     #[test_case("rg --pre ./run.sh pattern" => false ; "ripgrep_pre_runs_a_program")]
     #[test_case("rg -z pattern" => false ; "ripgrep_search_zip")]
+    #[test_case("rg -iz pattern" => false ; "ripgrep_search_zip_inside_a_cluster")]
+    #[test_case("git --no-pager diff" => true ; "a_long_flag_is_not_a_cluster")]
     #[test_case("find . -name *.rs" => true ; "find_by_name")]
     #[test_case("find . -delete" => false ; "find_delete")]
     #[test_case("find . -exec rm x ;" => false ; "find_exec")]
