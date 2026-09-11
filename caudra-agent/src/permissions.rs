@@ -27,8 +27,10 @@ use crate::{AgentEvent, EventSender};
 mod command_arity;
 #[allow(dead_code)]
 pub(crate) mod command_pattern;
+mod sed_script;
 mod structured;
 pub use command_pattern::{PatternFault, PatternGrade, grade_command_pattern};
+pub use sed_script::sed_only_prints;
 pub use structured::*;
 
 pub const DEFAULT_DENY_GUIDANCE: &str =
