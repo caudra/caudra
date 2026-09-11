@@ -57,6 +57,8 @@ The timeline is the record. It puts the phases a run entered, the `agent`, `para
 
 Calls and log lines are indented under the phase that was open when they happened. A call belongs to the phase that held the clock at the moment it started, so a phase the run entered twice counts each visit separately. Phases the script declares and the run never reached trail the walked ones, dimmed. The final row is how the run ended.
 
+Every row reads in the same columns: when it happened on the run's clock, then what it is called, then how long it took, then its bar. A label too long for its column is cut instead of pushing the columns along, so the clocks and the durations stack down the section rather than wandering with the length of the names beside them.
+
 Every phase and every call carries a bar scaled to the whole run. A phase that took most of the run looks like it, and a fan-out whose agents ran at the same time shows overlapping bars while one that serialised shows a staircase. A pane too narrow for a useful bar leaves it out.
 
 Enter opens the row under the cursor. On a phase it moves to the first agent that phase dispatched. On a `write_scratch_file` call it opens the file. On an agent call it opens what that agent was asked and what it answered, fetched in full from the journal rather than cut to a preview.

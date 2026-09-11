@@ -58,6 +58,18 @@ impl TimelineRow {
         matches!(self, Self::Call { .. } | Self::Log { .. })
     }
 
+    /// When the row happened on the run's clock. A phase the run has not
+    /// reached has not happened, and so has no reading.
+    pub(crate) const fn at(&self) -> Option<u64> {
+        match self {
+            Self::Phase { at, .. }
+            | Self::Call { at, .. }
+            | Self::Log { at, .. }
+            | Self::Settled { at, .. } => Some(*at),
+            Self::Pending { .. } => None,
+        }
+    }
+
     /// The span the row occupies on the run's clock, when it has one.
     pub(crate) const fn span(&self) -> Option<(u64, u64)> {
         match self {

@@ -24,10 +24,11 @@ use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::animation::{animation_elapsed_ms, spinner_str};
 use crate::components::modal::{FooterHits, FooterLine, Modal};
-use crate::components::scrollbar::{Scrollbar, ScrollbarMouse};
+use crate::components::scrollbar::{ScrollHint, Scrollbar, ScrollbarMouse};
 use crate::components::workflow_card::{phase_strip_line, status_span};
 use crate::components::workflow_inspector::timeline::{TimelineRow, span_bar, timeline};
 use crate::components::{
@@ -57,9 +58,23 @@ const LOADING: &str = "Loading\u{2026}";
 const NO_TIMELINE: &str = "This run recorded nothing";
 const NEST_INDENT: &str = "  ";
 const FAILED_UNIT: &str = " failed";
-/// What the row's text needs before a bar may have the rest of the width.
-const BAR_RESERVED_COLS: usize = 48;
+/// A timeline row is a grid: the clock, the glyph, the label, the duration
+/// and the bar sit in the same columns on every row, so a reader scans one
+/// column down the run rather than hunting along each line in turn.
+const MARK_COLS: usize = 2;
+const ELAPSED_COLS: usize = 7;
+const CLOCK_COLS: usize = ELAPSED_COLS + 1;
+/// A glyph and the space after it, and the blank a row without one stands in
+/// its place, so nothing after the glyph column moves.
+const GLYPH_PAD: &str = "  ";
+const DURATION_COLS: usize = 6;
+const COLUMN_GAP: &str = "  ";
+const LABEL_MIN_COLS: usize = 12;
+const LABEL_MAX_COLS: usize = 32;
+/// What a row keeps clear for the tallies that follow its bar.
+const TALLY_COLS: usize = 20;
 const BAR_MAX_WIDTH: usize = 24;
+const ELLIPSIS: char = '\u{2026}';
 const CALL_RUNNING_GLYPH: &str = "\u{25b8}";
 const CALL_DONE_GLYPH: &str = "\u{2713}";
 const CALL_FAILED_GLYPH: &str = "\u{2717}";
@@ -378,9 +393,10 @@ pub struct WorkflowInspector {
     /// Where the pointer last was, kept rather than resolved, so each pane
     /// answers for its own geometry on the frame it is drawn.
     pointer: Option<Position>,
-    /// Whether the body may scroll to show the cursor. A cursor the pointer
-    /// moved is already under the pointer, and revealing it would slide the
-    /// rows out from under the hand that pointed at them.
+    /// A pending request to put the cursor in view, consumed by the next
+    /// draw. Only a key that moves the cursor asks: a cursor the pointer
+    /// moved is already under the pointer, and a scroll is an instruction
+    /// about the view that the cursor must not undo on the next frame.
     reveal_cursor: bool,
     footer: FooterLine,
     footer_hits: FooterHits,
@@ -430,7 +446,7 @@ impl WorkflowInspector {
             item_rows: Vec::new(),
             tab_hits: Vec::new(),
             pointer: None,
-            reveal_cursor: true,
+            reveal_cursor: false,
             footer: FooterLine::default(),
             footer_hits: FooterHits::default(),
             live: HashMap::new(),
@@ -453,7 +469,7 @@ impl WorkflowInspector {
         self.selected = None;
         self.footer_hits.reset();
         self.pointer = None;
-        self.reveal_cursor = true;
+        self.reveal_cursor = false;
         let wanted = preferred
             .filter(|id| self.session_run(id).is_some())
             .map(str::to_owned);
@@ -604,6 +620,7 @@ impl WorkflowInspector {
             return self.step_selection(-delta.signum() as isize);
         }
         self.scroll.scroll(delta);
+        self.reveal_cursor = false;
         InspectorAction::Consumed
     }
 
@@ -625,7 +642,6 @@ impl WorkflowInspector {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> InspectorAction {
-        self.reveal_cursor = true;
         if self.budget.is_some() {
             return self.handle_budget_key(key);
         }
@@ -659,7 +675,9 @@ impl WorkflowInspector {
             KeyCode::Char(EXPORT_KEY) if plain => return self.export(),
             KeyCode::Char(COPY_KEY) if plain => return self.copy(),
             _ => {
-                self.scroll.handle_key(key);
+                if self.scroll.handle_key(key) {
+                    self.reveal_cursor = false;
+                }
             }
         }
         InspectorAction::Consumed
@@ -725,12 +743,12 @@ impl WorkflowInspector {
             ScrollbarMouse::Consumed => return InspectorAction::Consumed,
             ScrollbarMouse::ScrollTo(top) => {
                 self.scroll.scroll_to(top as u16);
+                self.reveal_cursor = false;
                 return InspectorAction::Consumed;
             }
         }
         let pos = Position::new(event.column, event.row);
         self.pointer = Some(pos);
-        self.reveal_cursor = true;
         if let Some(index) = self.footer_hits.handle_mouse(event) {
             return self.footer_command(index);
         }
@@ -776,7 +794,6 @@ impl WorkflowInspector {
                 if let Some(index) = hit.filter(|_| self.section.has_items()) {
                     self.pane = Pane::Detail;
                     self.cursor = index;
-                    self.reveal_cursor = false;
                 }
                 return InspectorAction::Consumed;
             }
@@ -830,6 +847,7 @@ impl WorkflowInspector {
                 if count > 0 {
                     self.cursor =
                         (self.cursor as isize + delta).clamp(0, count as isize - 1) as usize;
+                    self.reveal_cursor = true;
                 }
                 InspectorAction::Consumed
             }
@@ -1511,12 +1529,17 @@ impl WorkflowInspector {
         {
             self.scroll.reveal(top, height);
         }
+        self.reveal_cursor = false;
         frame.render_widget(
             Paragraph::new(lines)
                 .wrap(Wrap { trim: false })
                 .scroll((self.scroll.offset(), 0)),
             area,
         );
+        self.scrollbar.set_hint(ScrollHint::lines(
+            u32::from(self.scroll.offset()) + 1,
+            u32::from(rows.total),
+        ));
         self.scrollbar
             .draw(frame, area, rows.total, self.scroll.offset());
     }
@@ -1624,12 +1647,10 @@ impl WorkflowInspector {
                 false => now,
             },
         );
-        let bar_width = usize::from(self.body_area.width)
-            .saturating_sub(BAR_RESERVED_COLS)
-            .min(BAR_MAX_WIDTH);
         if rows.is_empty() {
             return (vec![Line::styled(NO_TIMELINE, t.tool_dim)], Vec::new());
         }
+        let (label_cols, bar_width) = timeline_columns(self.body_area.width);
         let spinner = spinner_str(animation_elapsed_ms());
         let mut lines: Vec<Line<'static>> = Vec::with_capacity(rows.len());
         let mut starts = Vec::with_capacity(rows.len());
@@ -1638,10 +1659,18 @@ impl WorkflowInspector {
         }
         for (position, row) in rows.iter().enumerate() {
             starts.push(lines.len());
-            let mut spans = vec![Span::styled(self.cursor_mark(position), t.accent)];
-            if row.is_nested() {
-                spans.push(Span::raw(NEST_INDENT));
-            }
+            let mut spans = vec![
+                Span::styled(self.cursor_mark(position), t.accent),
+                Span::styled(clock_column(row, run.created_at), t.tool_dim),
+            ];
+            let label_cols = match row.is_nested() {
+                true => {
+                    spans.push(Span::raw(NEST_INDENT));
+                    label_cols.saturating_sub(NEST_INDENT.len())
+                }
+                false => label_cols,
+            };
+            let mut tally: Vec<Span<'static>> = Vec::new();
             match row {
                 TimelineRow::Phase {
                     title,
@@ -1656,24 +1685,20 @@ impl WorkflowInspector {
                         false => (PhaseMark::Done, t.tool_success),
                     };
                     spans.push(Span::styled(format!("{} ", mark.glyph()), style));
-                    spans.push(Span::styled(escape_terminal_controls(title), t.bold));
+                    spans.push(Span::styled(label_column(title, label_cols), t.bold));
                     spans.push(Span::styled(
-                        format!(
-                            "{SEPARATOR}{}{SEPARATOR}{}",
-                            offset_text(at.saturating_sub(run.created_at)),
-                            format_elapsed(end.saturating_sub(*at))
-                        ),
+                        duration_column(end.saturating_sub(*at)),
                         t.tool_dim,
                     ));
                     if *agents > 0 {
-                        spans.push(Span::styled(
-                            format!("{SEPARATOR}{agents}{AGENTS_UNIT}"),
+                        tally.push(Span::styled(
+                            format!("{COLUMN_GAP}{agents}{AGENTS_UNIT}"),
                             t.tool_dim,
                         ));
                     }
                     if *failed > 0 {
-                        spans.push(Span::styled(
-                            format!("{SEPARATOR}{failed}{FAILED_UNIT}"),
+                        tally.push(Span::styled(
+                            format!("{COLUMN_GAP}{failed}{FAILED_UNIT}"),
                             t.tool_error,
                         ));
                     }
@@ -1697,50 +1722,37 @@ impl WorkflowInspector {
                         )),
                     }
                     spans.push(Span::styled(
-                        escape_terminal_controls(&call_name(call)),
+                        label_column(&call_name(call), label_cols),
                         t.bold,
                     ));
                     spans.push(Span::styled(
-                        format!(
-                            "{SEPARATOR}{}{SEPARATOR}{}",
-                            offset_text(at.saturating_sub(run.created_at)),
-                            format_elapsed(end.saturating_sub(*at))
-                        ),
+                        duration_column(end.saturating_sub(*at)),
                         t.tool_dim,
                     ));
                     if call.tokens_used > 0 {
-                        spans.push(Span::styled(
-                            format!("{SEPARATOR}{}", format_compact(call.tokens_used)),
+                        tally.push(Span::styled(
+                            format!("{COLUMN_GAP}{}", format_compact(call.tokens_used)),
                             t.tool_dim,
                         ));
                     }
                 }
-                TimelineRow::Log { at, message } => {
-                    spans.push(Span::styled(
-                        offset_text(at.saturating_sub(run.created_at)),
-                        t.tool_dim,
-                    ));
-                    spans.push(Span::raw(SEPARATOR));
+                TimelineRow::Log { message, .. } => {
+                    spans.push(Span::raw(GLYPH_PAD));
                     spans.push(Span::raw(escape_terminal_controls(message)));
                 }
-                TimelineRow::Settled { at, status } => {
+                TimelineRow::Settled { status, .. } => {
+                    spans.push(Span::raw(GLYPH_PAD));
                     spans.push(status_span(*status));
-                    spans.push(Span::styled(
-                        format!(
-                            "{SEPARATOR}{}",
-                            offset_text(at.saturating_sub(run.created_at))
-                        ),
-                        t.tool_dim,
-                    ));
                 }
             }
             if let Some(span) = row.span() {
                 let bar = span_bar(span, window, bar_width);
                 if !bar.is_empty() {
-                    spans.push(Span::raw(SEPARATOR));
+                    spans.push(Span::raw(COLUMN_GAP));
                     spans.push(Span::styled(bar, t.tool_dim));
                 }
             }
+            spans.extend(tally);
             lines.push(Line::from(spans));
             if let TimelineRow::Call { call, .. } = row {
                 let call = &detail.calls[*call];
@@ -2052,7 +2064,57 @@ fn log_line(offset: u64, message: &str, style: Style) -> Line<'static> {
 }
 
 fn offset_text(seconds: u64) -> String {
-    format!("+{:<7}", format_elapsed(seconds))
+    format!("+{:<ELAPSED_COLS$}", format_elapsed(seconds))
+}
+
+/// What a timeline row leads with: when it happened on the run's own clock,
+/// blank for a phase the run has not reached.
+fn clock_column(row: &TimelineRow, created_at: u64) -> String {
+    match row.at() {
+        Some(at) => offset_text(at.saturating_sub(created_at)),
+        None => " ".repeat(CLOCK_COLS),
+    }
+}
+
+/// How long a row lasted, right aligned so the readings stack by magnitude
+/// rather than by however wide the label before them happened to be.
+fn duration_column(seconds: u64) -> String {
+    format!("{:>DURATION_COLS$}", format_elapsed(seconds))
+}
+
+/// The label and bar widths at this pane width. Both give way to the fixed
+/// columns around them and share what is left, so a wider pane spends it on
+/// longer names and longer bars rather than on moving the columns.
+fn timeline_columns(width: u16) -> (usize, usize) {
+    let fixed =
+        MARK_COLS + CLOCK_COLS + GLYPH_PAD.len() + DURATION_COLS + COLUMN_GAP.len() + TALLY_COLS;
+    let free = usize::from(width).saturating_sub(fixed);
+    let label = (free / 2).clamp(LABEL_MIN_COLS, LABEL_MAX_COLS);
+    (label, free.saturating_sub(label).min(BAR_MAX_WIDTH))
+}
+
+/// A label at exactly `cols` columns, cut with an ellipsis when it is longer,
+/// so the column after it starts in the same place on every row.
+fn label_column(text: &str, cols: usize) -> String {
+    let mut text = escape_terminal_controls(text);
+    let width = UnicodeWidthStr::width(text.as_str());
+    if width <= cols {
+        text.push_str(&" ".repeat(cols - width));
+        return text;
+    }
+    let mut cut = String::with_capacity(cols);
+    let mut used = 0;
+    for character in text.chars() {
+        let next = used + UnicodeWidthChar::width(character).unwrap_or(0);
+        if next > cols.saturating_sub(1) {
+            break;
+        }
+        cut.push(character);
+        used = next;
+    }
+    cut.push(ELLIPSIS);
+    cut.push_str(&" ".repeat(cols.saturating_sub(used + 1)));
+    cut
 }
 
 fn labelled(label: &'static str, text: &str, style: Style) -> Line<'static> {
@@ -2122,6 +2184,7 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
+    use crate::components::buffer_text;
     use crate::components::key as key_event;
 
     const FRAME_WIDTH: u16 = 100;
@@ -2171,6 +2234,20 @@ mod tests {
     const ELAPSED_TEXT: &str = "2m14s";
     const ONE_AGENT: &str = "1 agents";
     const CALL_LABEL: &str = "researcher";
+    const LONG_CALL: &str = "researcher-with-a-name-too-long-for-one-column";
+    const PHASE_SECS: u64 = 90;
+    const PHASE_ELAPSED: &str = "1m30s";
+    const CALL_AT: u64 = 3;
+    const CALL_SECS: u64 = 12;
+    const CALL_ELAPSED: &str = "12s";
+    const COLUMNS_LINE_UP: &str = "every timeline row must end its duration in the same column";
+    const WHEEL_ROWS: i32 = 3;
+    const SCROLL_STICKS: &str = "a scrolled section must stay where the scroll put it";
+    const TAIL_IS_FOLLOWED: &str = "a live timeline must keep showing its newest row";
+    const POSITION_HINT: &str = "line 1/";
+    const SCROLL_OUTRANKS: &str =
+        "a scroll and a cursor move in one frame must leave the view where the scroll put it";
+    const HINT_IS_SHOWN: &str = "a held bar must say where in the section the view is";
     const LOG_LINE: &str = "dispatching the workers";
     const TIMELINE_IS_ONE_ORDER: &str =
         "a phase, the calls it opened, and the lines logged beside them must read in that order";
@@ -2630,6 +2707,173 @@ mod tests {
             text.contains(&format!("{} {PHASE_TWO}", PhaseMark::Pending.glyph())),
             "{PENDING_IS_LISTED}: {text}"
         );
+    }
+
+    /// A completed run whose phase and whose call ran for different lengths
+    /// of time under labels of different lengths, which is what the columns
+    /// have to survive.
+    fn timed_run() -> (RunSnapshot, RunDetail) {
+        let mut walked = run(RUN_ID, RunStatus::Completed, Vec::new());
+        walked.updated_at = PHASE_SECS;
+        walked.phase_history = vec![PhaseRecord {
+            title: PHASE_ONE.into(),
+            started_at: 0,
+        }];
+        let mut journal = detail(walked.clone());
+        journal.calls[0].label = Some(LONG_CALL.into());
+        journal.calls[0].started_at = CALL_AT;
+        journal.calls[0].finished_at = Some(CALL_AT + CALL_SECS);
+        (walked, journal)
+    }
+
+    fn line_text(line: &Line<'static>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    /// Where `needle` ends in `line`, in the columns a terminal draws it in.
+    fn end_column(line: &str, needle: &str) -> Option<usize> {
+        let byte = line.find(needle)? + needle.len();
+        Some(UnicodeWidthStr::width(&line[..byte]))
+    }
+
+    #[test]
+    fn timeline_rows_end_their_duration_in_the_same_column() {
+        let (walked, journal) = timed_run();
+        let mut inspector = open_with(vec![walked.clone()]);
+        inspector.fill_detail(journal);
+
+        let (lines, _) = inspector.timeline_lines(&walked, PHASE_SECS);
+
+        let rows: Vec<String> = lines.iter().map(line_text).collect();
+        let phase = end_column(&rows[0], PHASE_ELAPSED).expect(&rows[0]);
+        let call = end_column(&rows[1], CALL_ELAPSED).expect(&rows[1]);
+        assert_eq!(phase, call, "{COLUMNS_LINE_UP}: {rows:?}");
+    }
+
+    /// A journal with more rows than the body can show, drawn once so the
+    /// section has its geometry and the cursor is on a row of it.
+    fn tall_timeline(terminal: &mut Terminal<TestBackend>) -> WorkflowInspector {
+        let mut inspector = open_with(vec![run(RUN_ID, RunStatus::Active, vec![agent(None)])]);
+        let walking = inspector.selected_run().cloned().expect(NO_SUCH_ROW);
+        let events = (0..TALL_ROSTER)
+            .map(|index| RunEvent {
+                seq: index,
+                at: index,
+                kind: RunEventKind::Log,
+                text: format!("{LOG_LINE} {index}"),
+            })
+            .collect();
+        inspector.fill_detail(RunDetail {
+            events,
+            ..detail(walking)
+        });
+        let _ = inspector.handle_key(key_event(KeyCode::Char('2')));
+        let _ = inspector.handle_key(key_event(KeyCode::Right));
+        let _ = inspector.handle_key(key_event(KeyCode::Down));
+        draw(&mut inspector, terminal);
+        inspector
+    }
+
+    #[test]
+    fn a_scroll_key_leaves_the_timeline_where_it_put_it() {
+        let mut terminal = terminal();
+        let mut inspector = tall_timeline(&mut terminal);
+        let before = inspector.scroll.offset();
+
+        let _ = inspector.handle_key(key_event(KeyCode::PageDown));
+        draw(&mut inspector, &mut terminal);
+
+        assert!(inspector.scroll.offset() > before, "{SCROLL_STICKS}");
+    }
+
+    #[test]
+    fn the_wheel_leaves_the_timeline_where_it_put_it() {
+        let mut terminal = terminal();
+        let mut inspector = tall_timeline(&mut terminal);
+        let before = inspector.scroll.offset();
+        let over_body = Position::new(inspector.body_area.x, inspector.body_area.y);
+
+        let _ = inspector.scroll_at(over_body, -WHEEL_ROWS);
+        draw(&mut inspector, &mut terminal);
+
+        assert!(inspector.scroll.offset() > before, "{SCROLL_STICKS}");
+    }
+
+    /// The section follows its tail, so the cursor is a place in the list
+    /// and not a leash on the view: one move of it must not pin every frame
+    /// after to the row it landed on.
+    #[test]
+    fn a_live_timeline_follows_its_tail_after_the_cursor_moves() {
+        let mut terminal = terminal();
+        let mut inspector = tall_timeline(&mut terminal);
+
+        draw(&mut inspector, &mut terminal);
+
+        let screen = buffer_text(terminal.backend().buffer());
+        let last = format!("{LOG_LINE} {}", TALL_ROSTER - 1);
+        assert!(screen.contains(&last), "{TAIL_IS_FOLLOWED}: {screen}");
+    }
+
+    fn press_bar(inspector: &mut WorkflowInspector, row: u16) {
+        let column = inspector.body_area.x + inspector.body_area.width - 1;
+        let _ = inspector.handle_mouse(mouse_at(
+            MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+        ));
+    }
+
+    /// Pressing the head of the track lands the view on the first row, so the
+    /// chip carries a reading nothing else on the frame can be showing.
+    #[test]
+    fn a_held_bar_says_where_in_the_section_the_view_is() {
+        let mut terminal = terminal();
+        let mut inspector = tall_timeline(&mut terminal);
+
+        let head = inspector.body_area.y;
+        press_bar(&mut inspector, head);
+        draw(&mut inspector, &mut terminal);
+
+        let screen = buffer_text(terminal.backend().buffer());
+        assert!(screen.contains(POSITION_HINT), "{HINT_IS_SHOWN}: {screen}");
+    }
+
+    fn scroll_by_key(inspector: &mut WorkflowInspector) {
+        let _ = inspector.handle_key(key_event(KeyCode::PageUp));
+    }
+
+    fn scroll_by_wheel(inspector: &mut WorkflowInspector) {
+        let over_body = Position::new(inspector.body_area.x, inspector.body_area.y);
+        let _ = inspector.scroll_at(over_body, WHEEL_ROWS);
+    }
+
+    fn scroll_by_bar(inspector: &mut WorkflowInspector) {
+        press_bar(
+            inspector,
+            inspector.body_area.y + inspector.body_area.height - 1,
+        );
+    }
+
+    /// Input arrives in batches and the frame is drawn once for all of it, so
+    /// a scroll and a cursor move can land on the same frame. The scroll is
+    /// the instruction about the view, and it is the later one.
+    #[test_case(scroll_by_key ; "a scroll key")]
+    #[test_case(scroll_by_wheel ; "the wheel")]
+    #[test_case(scroll_by_bar ; "the bar")]
+    fn a_scroll_outranks_a_cursor_move_in_the_frame_they_share(scroll: fn(&mut WorkflowInspector)) {
+        let mut terminal = terminal();
+        let mut inspector = tall_timeline(&mut terminal);
+        draw(&mut inspector, &mut terminal);
+        let _ = inspector.handle_key(key_event(KeyCode::Down));
+
+        scroll(&mut inspector);
+        let scrolled = inspector.scroll.offset();
+        draw(&mut inspector, &mut terminal);
+
+        assert_eq!(inspector.scroll.offset(), scrolled, "{SCROLL_OUTRANKS}");
     }
 
     fn phased(call_key: u64, label: &str, phase: &str) -> AgentRosterEntry {
