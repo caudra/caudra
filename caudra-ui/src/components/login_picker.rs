@@ -10,7 +10,7 @@ use caudra_storage::StateDir;
 use caudra_storage::auth::{
     ProviderAuthKind, ProviderCredentials, save_provider_credentials, try_load_provider_auth,
 };
-use caudra_storage::model::persist_model;
+use caudra_storage::model::persist_model_for_every_mode;
 
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
 use crate::components::modal::Modal;
@@ -458,7 +458,7 @@ impl LoginPicker {
                         providers::resolve_default_model(&slug_c, config.get(&slug_c))
                     };
                     if let Some(model) = &default_model {
-                        persist_model(&storage, model);
+                        persist_model_for_every_mode(&storage, model);
                     }
 
                     let verb = if has_key {

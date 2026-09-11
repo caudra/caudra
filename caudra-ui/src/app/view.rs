@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::sync::atomic::Ordering;
 
 use crate::components::Overlay;
@@ -566,14 +567,30 @@ impl App {
             .to_string()
             .into()
         });
+        // A toggle swaps the selection to the model its mode was left on, and
+        // neither the mode nor the swap reaches the agent until the next message
+        // carries them. Until it does, the slot names the model still in force
+        // and puts the one arriving behind the arrow.
+        let leaving = (main_chat
+            && self.state.applied_mode != self.state.mode
+            && self.state.applied_model != self.state.session.model)
+            .then(|| {
+                effective_model_spec
+                    .as_deref()
+                    .unwrap_or(&self.state.applied_model)
+            });
         let ctx = StatusBarContext {
             status: &self.status,
             mode,
-            model_id: effective_model_spec.as_deref().unwrap_or_else(|| {
-                chat.model_id
-                    .as_deref()
-                    .unwrap_or(&self.state.session.model)
-            }),
+            model_id: match leaving {
+                Some(_) => &self.state.session.model,
+                None => effective_model_spec.as_deref().unwrap_or_else(|| {
+                    chat.model_id
+                        .as_deref()
+                        .unwrap_or(&self.state.session.model)
+                }),
+            },
+            pending_model: leaving.map(Cow::Borrowed),
             stats: UsageStats {
                 global_cost: self.state.cost,
                 global_subscription_cost: self.state.subscription_cost,

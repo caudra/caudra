@@ -9,6 +9,7 @@ use caudra_agent::tools::ToolRegistry;
 use caudra_config::{load_env_files, load_permissions};
 use caudra_lua::PluginHost;
 use caudra_storage::StateDir;
+use caudra_storage::sessions::StoredMode;
 
 use crate::setup;
 
@@ -59,7 +60,12 @@ pub fn run(
         stream: config.provider.stream_timeout,
     };
 
-    let model = setup::resolve_model(model_arg.as_deref(), &config.provider, &storage)?;
+    let model = setup::resolve_model(
+        model_arg.as_deref(),
+        &config.provider,
+        &storage,
+        StoredMode::Build,
+    )?;
 
     let _logging = setup::init_logging(&config.storage);
     setup::init_telemetry(&config.telemetry);

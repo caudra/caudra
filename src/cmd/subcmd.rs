@@ -34,7 +34,8 @@ use caudra_storage::auth::{
     ProviderAuth, ProviderCredentials, delete_provider_credentials, load_provider_credentials,
     save_provider_credentials, try_load_provider_auth,
 };
-use caudra_storage::model::persist_model;
+use caudra_storage::model::persist_model_for_every_mode;
+use caudra_storage::sessions::StoredMode;
 
 use crate::cli::{AuthMethod, Cli, normalize_tool_name};
 use crate::setup::resolve_model;
@@ -197,7 +198,7 @@ fn login_provider(slug: &str, storage: &StateDir) -> Result<()> {
         resolve_default_model(slug, config.get(slug))
     };
     if let Some(model) = &default_model {
-        persist_model(storage, model);
+        persist_model_for_every_mode(storage, model);
     }
 
     println!();
@@ -747,7 +748,7 @@ fn render_model_jobs(rows: &[ModelJobRow]) -> String {
 fn print_model_jobs(model_arg: Option<&str>, config: &Config) -> Result<()> {
     let storage = StateDir::resolve().context("resolve data directory")?;
     model_registry::load_from_storage(&storage).context("load model purpose bindings")?;
-    let anchor = resolve_model(model_arg, &config.provider, &storage)?;
+    let anchor = resolve_model(model_arg, &config.provider, &storage, StoredMode::Build)?;
     print!(
         "{}",
         render_model_jobs(&model_job_rows(&anchor, &config.provider.model_policy))
@@ -1044,7 +1045,12 @@ pub fn tools(cli: &Cli, enabled_only: bool, json: bool, names: bool, schemas: bo
         .context("load builtin plugins")?;
 
     let storage = StateDir::resolve().context("resolve data directory")?;
-    let mut model = resolve_model(cli.model.as_deref(), &config.provider, &storage)?;
+    let mut model = resolve_model(
+        cli.model.as_deref(),
+        &config.provider,
+        &storage,
+        StoredMode::Build,
+    )?;
     caudra_providers::provider::adjust_model(&mut model, Timeouts::default())?;
     let filter = ToolFilter::from_config(&config.agent, &model, &[]);
 
@@ -1260,7 +1266,8 @@ pub fn prompt(
         .resolve(profile_name)
         .context("resolve system prompt profile")?;
     let storage = StateDir::resolve().context("resolve data directory")?;
-    let mut model = crate::setup::resolve_model(model_arg, &config.provider, &storage)?;
+    let mut model =
+        crate::setup::resolve_model(model_arg, &config.provider, &storage, StoredMode::Build)?;
     caudra_providers::provider::adjust_model(&mut model, caudra_providers::Timeouts::default())?;
     let filter = ToolFilter::from_config(&config.agent, &model, &[]);
 

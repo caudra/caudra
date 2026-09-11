@@ -49,6 +49,9 @@ const PLAIN_MODEL_FLOOR: usize = 1;
 /// Marks a figure a subscription already covers. One column is all the bar can
 /// spare to say the number is a price rather than a bill.
 const NOT_BILLED_MARK: &str = "~";
+/// Joins the model a pending mode switch leaves to the one it arrives on,
+/// matching the glyph the mode label uses for the same switch.
+const MODEL_TRANSITION_ARROW: &str = "\u{2192}";
 
 /// What the bar says about the session's runs: the chip that names what is
 /// going on, and the count it falls back to when the columns run out.
@@ -183,6 +186,10 @@ pub struct StatusBarContext<'a> {
     pub status: &'a Status,
     pub mode: ModeLabel,
     pub model_id: &'a str,
+    /// The model the pending mode switch leaves behind, drawn as
+    /// `[leaving\u{2192}arriving]`. `None` once the switch has settled, which is
+    /// every frame where the mode label names a mode rather than a transition.
+    pub pending_model: Option<Cow<'a, str>>,
     pub stats: UsageStats,
     pub auto_scroll: bool,
     pub chat_name: Option<&'a str>,
@@ -262,6 +269,7 @@ enum Reduction {
     ShortThinking,
     ShortYolo,
     ShortWorkflows,
+    DropTransition,
     LeafModel,
     DropSpend,
     DropContext,
@@ -274,13 +282,16 @@ enum Reduction {
 
 /// Cheap abbreviations come before anything is lost, and yolo goes last: a
 /// session that skips permission prompts has to say so at any width that can
-/// hold three columns.
-const LADDER: [Reduction; 13] = [
+/// hold three columns. The pending pair goes early: once the chips are already
+/// abbreviating, the model the next turn runs on is worth more than the one it
+/// is leaving.
+const LADDER: [Reduction; 14] = [
     Reduction::DropGlobalSpend,
     Reduction::CompactContext,
     Reduction::ShortThinking,
     Reduction::ShortYolo,
     Reduction::ShortWorkflows,
+    Reduction::DropTransition,
     Reduction::LeafModel,
     Reduction::DropSpend,
     Reduction::DropContext,
@@ -334,6 +345,7 @@ struct Fit {
     context: ContextTier,
     thinking: ThinkingTier,
     model: ModelTier,
+    transition: bool,
     fast: bool,
     workflows: WorkflowTier,
     yolo: YoloTier,
@@ -346,6 +358,7 @@ impl Fit {
         context: ContextTier::Counts,
         thinking: ThinkingTier::Named,
         model: ModelTier::Full,
+        transition: true,
         fast: true,
         workflows: WorkflowTier::Named,
         yolo: YoloTier::Named,
@@ -358,6 +371,7 @@ impl Fit {
             Reduction::ShortThinking => self.thinking = ThinkingTier::Level,
             Reduction::ShortYolo => self.yolo = YoloTier::Sigil,
             Reduction::ShortWorkflows => self.workflows = WorkflowTier::Counts,
+            Reduction::DropTransition => self.transition = false,
             Reduction::LeafModel => self.model = ModelTier::Leaf,
             Reduction::DropSpend => self.spend = false,
             Reduction::DropContext => self.context = ContextTier::Hidden,
@@ -370,21 +384,30 @@ impl Fit {
     }
 
     /// Everything right of the cwd, which takes whatever this leaves behind.
-    fn width(self, ctx: &StatusBarContext<'_>, spend: &SpendText) -> usize {
-        self.model_width(ctx) + self.chip_width(ctx) + self.spend_width(spend)
+    fn width(self, ctx: &StatusBarContext<'_>, spend: &SpendText, pair: Option<&str>) -> usize {
+        self.model_width(ctx, pair) + self.chip_width(ctx) + self.spend_width(spend)
     }
 
     /// Clamped up to the floor so [`Reduction::ChopModel`] can never widen a
     /// short id, which would let the ladder grow instead of shrink.
-    fn model_width(self, ctx: &StatusBarContext<'_>) -> usize {
+    fn model_width(self, ctx: &StatusBarContext<'_>, pair: Option<&str>) -> usize {
         let floor = model_floor(ctx);
-        let named = |id: &str| {
-            id.width() + usize::from(clickable(ctx, StatusBarHitTarget::Model)) * BRACKET_WIDTH
-        };
-        match self.model {
-            ModelTier::Full => named(ctx.model_id).max(floor),
-            ModelTier::Leaf => named(model_leaf(ctx.model_id)).max(floor),
-            ModelTier::Chopped => floor,
+        if self.model == ModelTier::Chopped {
+            return floor;
+        }
+        let named = self.model_id(ctx, pair).width()
+            + usize::from(clickable(ctx, StatusBarHitTarget::Model)) * BRACKET_WIDTH;
+        named.max(floor)
+    }
+
+    /// What the model slot names: the pending pair while it survives the ladder,
+    /// else the selection at whatever length is left. The pair is already two
+    /// leaves, so [`Reduction::LeafModel`] has nothing left to take from it.
+    fn model_id<'a>(self, ctx: &'a StatusBarContext<'_>, pair: Option<&'a str>) -> &'a str {
+        match pair.filter(|_| self.transition) {
+            Some(pair) => pair,
+            None if self.model == ModelTier::Full => ctx.model_id,
+            None => model_leaf(ctx.model_id),
         }
     }
 
@@ -775,9 +798,24 @@ fn right_side<'a>(
     budget: usize,
 ) -> RightSide<'a> {
     let spend = SpendText::new(&ctx.stats);
+    // Both sides drop the provider they share: a switch names two models the
+    // user just chose between, and the columns a repeated prefix takes are
+    // columns the cwd does not get. Two providers stay, because a model served
+    // by both is a switch that the leaves alone would draw as a no-op. Built
+    // once, because the ladder measures it per rung.
+    let pair = ctx.pending_model.as_deref().map(|leaving| {
+        let shared = model_provider(leaving) == model_provider(ctx.model_id);
+        let named = |id| if shared { model_leaf(id) } else { id };
+        format!(
+            "{}{MODEL_TRANSITION_ARROW}{}",
+            named(leaving),
+            named(ctx.model_id)
+        )
+    });
+    let pair = pair.as_deref();
     let mut fit = Fit::FULL;
     for step in LADDER {
-        if fit.width(ctx, &spend) <= budget {
+        if fit.width(ctx, &spend, pair) <= budget {
             break;
         }
         fit.apply(step);
@@ -829,7 +867,7 @@ fn right_side<'a>(
     }
 
     let residue = budget.saturating_sub(chips.iter().map(Span::width).sum::<usize>());
-    let model = model_text(ctx, fit.model, residue);
+    let model = model_text(ctx, fit, residue, pair);
     let separator = if model.is_empty() {
         ""
     } else {
@@ -895,11 +933,21 @@ fn model_floor(ctx: &StatusBarContext<'_>) -> usize {
     }
 }
 
-fn model_text<'a>(ctx: &'a StatusBarContext<'_>, tier: ModelTier, budget: usize) -> Cow<'a, str> {
-    let id = match tier {
-        ModelTier::Full => ctx.model_id,
-        ModelTier::Leaf | ModelTier::Chopped => model_leaf(ctx.model_id),
-    };
+fn model_text<'a>(
+    ctx: &'a StatusBarContext<'_>,
+    fit: Fit,
+    budget: usize,
+    pair: Option<&str>,
+) -> Cow<'a, str> {
+    match pair.filter(|_| fit.transition) {
+        // The pair is assembled per frame and outlives neither the context nor
+        // this call, so what survives into the span has to be owned.
+        Some(pair) => Cow::Owned(model_fitted(ctx, pair, budget).into_owned()),
+        None => model_fitted(ctx, fit.model_id(ctx, None), budget),
+    }
+}
+
+fn model_fitted<'a>(ctx: &StatusBarContext<'_>, id: &'a str, budget: usize) -> Cow<'a, str> {
     if clickable(ctx, StatusBarHitTarget::Model) {
         bracketed_tail(id, budget)
     } else {
@@ -913,6 +961,15 @@ fn model_leaf(id: &str) -> &str {
     match id.rsplit_once('/') {
         Some((_, leaf)) if !leaf.is_empty() => leaf,
         _ => id,
+    }
+}
+
+/// Exactly what [`model_leaf`] drops, so the two agree on where an id ends and
+/// cannot disagree about whether a pair shares a provider.
+fn model_provider(id: &str) -> Option<&str> {
+    match id.rsplit_once('/') {
+        Some((provider, leaf)) if !leaf.is_empty() => Some(provider),
+        _ => None,
     }
 }
 
@@ -1090,6 +1147,17 @@ mod tests {
     const THINKING_LEVEL: &str = "off";
     const LADDER_MODEL_ID: &str = "anthropic/claude-opus-5";
     const LADDER_MODEL_LEAF: &str = "claude-opus-5";
+    const LEAVING_MODEL_ID: &str = "anthropic/claude-sonnet-5";
+    const MODEL_PAIR: &str = "claude-sonnet-5\u{2192}claude-opus-5";
+    /// The ladder model under another provider, so the leaves alone cannot tell
+    /// the two apart.
+    const REHOSTED_MODEL_ID: &str = "openrouter/claude-opus-5";
+    const REHOSTED_PAIR: &str = "openrouter/claude-opus-5\u{2192}anthropic/claude-opus-5";
+    const PAIR_MISSING: &str = "a pending switch must name both models";
+    const PROVIDER_DROPPED: &str = "a switch that only changes provider must name both";
+    const PROVIDER_KEPT: &str = "a pending switch must spend no columns on the provider";
+    const PAIR_KEPT: &str = "the pair must go before the model it is arriving on is shortened";
+    const PAIR_RETURNED: &str = "a narrower bar must never show the pair again";
     const LADDER_THINKING: &str = "xhigh";
     const LADDER_WORKFLOWS_ACTIVE: usize = 2;
     const LADDER_WORKFLOWS_WAITING: usize = 1;
@@ -1191,6 +1259,8 @@ mod tests {
         snapshotting: bool,
         workflows: Option<WorkflowChip>,
         main_chat: bool,
+        model_id: &'a str,
+        pending_model: Option<&'a str>,
     }
 
     impl Default for Fixture<'_> {
@@ -1207,6 +1277,8 @@ mod tests {
                 snapshotting: false,
                 workflows: None,
                 main_chat: true,
+                model_id: MODEL_ID,
+                pending_model: None,
             }
         }
     }
@@ -1224,6 +1296,8 @@ mod tests {
             snapshotting,
             workflows,
             main_chat,
+            model_id,
+            pending_model,
         } = fixture;
         let bar = StatusBar::new(FLASH_TTL);
         let mut terminal =
@@ -1235,7 +1309,8 @@ mod tests {
                 short: MODE_SHORT_LABEL.into(),
                 style: Style::new(),
             },
-            model_id: MODEL_ID,
+            model_id,
+            pending_model: pending_model.map(Cow::Borrowed),
             stats: UsageStats {
                 global_cost,
                 global_subscription_cost: None,
@@ -1286,6 +1361,11 @@ mod tests {
     /// Every flag on, a long model id and a real path: the widest the bar ever
     /// has to squeeze, so each rung of the ladder gets exercised.
     fn with_ladder_ctx(f: impl FnOnce(&StatusBarContext<'_>)) {
+        with_ladder_ctx_leaving(None, f);
+    }
+
+    /// The same bar mid mode switch, `leaving` naming the model it is leaving.
+    fn with_ladder_ctx_leaving(leaving: Option<&str>, f: impl FnOnce(&StatusBarContext<'_>)) {
         let ctx = StatusBarContext {
             status: &Status::Idle,
             mode: ModeLabel {
@@ -1294,6 +1374,7 @@ mod tests {
                 style: Style::new(),
             },
             model_id: LADDER_MODEL_ID,
+            pending_model: leaving.map(Cow::Borrowed),
             stats: UsageStats {
                 global_cost: Some(SESSION_COST),
                 global_subscription_cost: None,
@@ -1587,6 +1668,88 @@ mod tests {
     #[test_case("anthropic/", "anthropic/"                 ; "trailing_slash_keeps_the_id")]
     fn model_leaf_cases(id: &str, expected: &str) {
         assert_eq!(model_leaf(id), expected);
+    }
+
+    /// A switch names two models the user just chose between, so the provider
+    /// both share is the first thing to go: those columns say nothing and the
+    /// cwd has better uses for them.
+    #[test]
+    fn a_pending_model_switch_drops_the_provider_on_both_sides() {
+        with_ladder_ctx_leaving(Some(LEAVING_MODEL_ID), |ctx| {
+            let text = side_text(&right_side(ctx, LADDER_CWD, WIDE_BUDGET));
+
+            assert!(text.contains(MODEL_PAIR), "{PAIR_MISSING}: {text}");
+            assert!(!text.contains(LADDER_MODEL_ID), "{PROVIDER_KEPT}: {text}");
+            assert!(!text.contains(LEAVING_MODEL_ID), "{PROVIDER_KEPT}: {text}");
+        });
+    }
+
+    /// The same model served by two providers is a switch the leaves alone
+    /// would draw as `claude-opus-5\u{2192}claude-opus-5`: a no-op, and the wrong
+    /// answer about which endpoint the next turn reaches.
+    #[test]
+    fn a_switch_between_providers_keeps_them_both() {
+        with_ladder_ctx_leaving(Some(REHOSTED_MODEL_ID), |ctx| {
+            let text = side_text(&right_side(ctx, LADDER_CWD, WIDE_BUDGET));
+
+            assert!(text.contains(REHOSTED_PAIR), "{PROVIDER_DROPPED}: {text}");
+        });
+    }
+
+    /// A settled bar is the bar as it was: one model, provider and all.
+    #[test]
+    fn a_settled_model_draws_no_arrow() {
+        with_ladder_ctx(|ctx| {
+            let text = side_text(&right_side(ctx, LADDER_CWD, WIDE_BUDGET));
+
+            assert!(text.contains(LADDER_MODEL_ID), "{text}");
+            assert!(!text.contains(MODEL_TRANSITION_ARROW), "{text}");
+        });
+    }
+
+    /// The pair costs roughly twice what one name does, so it goes before the
+    /// bar starts eating into the model the next turn will actually run on.
+    #[test]
+    fn a_narrowing_bar_drops_the_transition_before_it_shortens_the_model() {
+        with_ladder_ctx_leaving(Some(LEAVING_MODEL_ID), |ctx| {
+            let widths: Vec<usize> = (0..=WIDE_BUDGET).rev().collect();
+            let texts: Vec<String> = widths
+                .iter()
+                .map(|budget| side_text(&right_side(ctx, LADDER_CWD, *budget)))
+                .collect();
+
+            let dropped = texts
+                .iter()
+                .position(|text| !text.contains(MODEL_TRANSITION_ARROW))
+                .expect(PAIR_KEPT);
+            assert!(
+                texts[dropped].contains(LADDER_MODEL_ID),
+                "{PAIR_KEPT}: {}",
+                texts[dropped]
+            );
+            assert!(
+                texts[dropped..]
+                    .iter()
+                    .all(|text| !text.contains(MODEL_TRANSITION_ARROW)),
+                "{PAIR_RETURNED}"
+            );
+        });
+    }
+
+    /// Whatever the ladder leaves, the model still answers the pointer on
+    /// exactly the glyphs it drew.
+    #[test_case(WIDE_BUDGET, MODEL_PAIR              ; "the_pair_while_it_fits")]
+    #[test_case(SHORT_THINKING_BUDGET, LADDER_MODEL_LEAF ; "the_leaf_once_it_does_not")]
+    fn the_model_control_covers_what_was_drawn(budget: usize, expected: &str) {
+        with_ladder_ctx_leaving(Some(LEAVING_MODEL_ID), |ctx| {
+            let side = right_side(ctx, LADDER_CWD, budget);
+
+            assert_eq!(
+                hit_glyphs(&side, StatusBarHitTarget::Model),
+                format!("[{expected}]"),
+                "{FIGURE_HIT_MSG}"
+            );
+        });
     }
 
     #[test_case("~/projects/caudra:main", 30, "~/projects/caudra:main" ; "fits_untouched")]

@@ -20,7 +20,7 @@ use caudra_providers::model::Model;
 use caudra_storage::StateDir;
 use caudra_storage::id::CaudraId;
 use caudra_storage::sessions::sweep::{SweepPolicy, sweep_if_due};
-use caudra_storage::sessions::{SessionDatabase, SessionLease};
+use caudra_storage::sessions::{SessionDatabase, SessionLease, StoredMode};
 use caudra_storage::state::{WorkspaceTabs, read_workspace_tabs};
 use caudra_ui::{AppSession, ExitSummary, HerdrReporter, RunOutcome, SessionTab};
 
@@ -216,7 +216,14 @@ fn build_stack(
 
     let commands = discover_commands(cli.no_commands);
 
-    let model_result = setup::resolve_model(cli.model.as_deref(), &config.provider, storage);
+    // A fresh session opens in plan; a resumed one overrides this with the model
+    // it stored.
+    let model_result = setup::resolve_model(
+        cli.model.as_deref(),
+        &config.provider,
+        storage,
+        StoredMode::Plan,
+    );
     let (model, needs_login) = match (model_result, fallback_model) {
         (Ok(m), _) => (m, false),
         (Err(e), Some(last_model)) => {

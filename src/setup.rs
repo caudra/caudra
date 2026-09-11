@@ -11,6 +11,7 @@ use caudra_storage::StateDir;
 use caudra_storage::id::CaudraId;
 use caudra_storage::log::{LogSinkGuard, RotatingFileWriter};
 use caudra_storage::model::read_model;
+use caudra_storage::sessions::StoredMode;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer};
@@ -52,10 +53,13 @@ pub fn load_session(id: CaudraId, storage: &StateDir) -> Result<StoredSession> {
     caudra_agent::open_stored_session(id, storage).context("load persisted session")
 }
 
+/// The model a run opens on. `mode` picks which remembered choice answers, since
+/// plan and build each keep their own.
 pub fn resolve_model(
     explicit: Option<&str>,
     provider_config: &caudra_config::ProviderConfig,
     storage: &StateDir,
+    mode: StoredMode,
 ) -> Result<Model> {
     let policy = &provider_config.model_policy;
     if let Some(spec) = explicit {
@@ -66,7 +70,7 @@ pub fn resolve_model(
         }
         return from_spec_or_warm_catalog(spec).context("invalid --model spec");
     }
-    if let Some(spec) = read_model(storage) {
+    if let Some(spec) = read_model(storage, mode) {
         if policy.allows(&spec)
             && let Ok(m) = from_spec_or_warm_catalog(&spec)
         {

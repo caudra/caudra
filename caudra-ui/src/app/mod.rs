@@ -859,6 +859,9 @@ impl App {
         self.state.mode == Mode::Plan && self.plan_form.is_visible()
     }
 
+    /// Reconciles the session to a model it was handed. Every live session is
+    /// pushed through here whenever the shared slot moves, so it must not record
+    /// a choice: use [`Self::select_model`] for one the user made.
     pub(crate) fn update_model(&mut self, model: &Model) {
         // A level chosen for the model being switched to outranks whatever the
         // previous model was on; a level is only meaningful against the ladder
@@ -869,7 +872,27 @@ impl App {
         }
         self.state.update_model(model);
         self.chats[0].context_window = model.context_window;
-        persist_model(&self.storage, &self.state.session.model);
+    }
+
+    /// A model the user chose, remembered against the mode they chose it in.
+    /// That is `state.mode` rather than `applied_mode`: while a switch is
+    /// pending the mode on screen is the one the pick is meant for.
+    pub(crate) fn select_model(&mut self, model: &Model) {
+        self.update_model(model);
+        persist_model(
+            &self.storage,
+            self.state.mode.into(),
+            &self.state.session.model,
+        );
+        // A pick made with nothing pending is the model the next turn runs on,
+        // so it becomes the baseline the status bar measures a later toggle
+        // against. Leaving it stale would draw the transition from a model that
+        // was already replaced.
+        if self.state.applied_mode == self.state.mode {
+            self.state
+                .applied_model
+                .clone_from(&self.state.session.model);
+        }
     }
 
     /// The one place a chosen level lands, so every spelling of the choice

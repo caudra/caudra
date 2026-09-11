@@ -173,6 +173,17 @@ const PLAN_CONTEXT_MODEL_ID: &str = "plan-context";
 const PLAN_CONTEXT_WINDOW_LABEL: &str = "128.0k";
 const PLAN_STATUS_MODEL_MISSING: &str = "status bar must show the running Plan model";
 const PLAN_STATUS_WINDOW_MISSING: &str = "status bar must show the running Plan context window";
+const TEST_MODEL_SPEC: &str = "anthropic/test-model";
+const OTHER_MODEL_ID: &str = "other-model";
+const OTHER_MODEL_SPEC: &str = "anthropic/other-model";
+const MODEL_UNASKED: &str = "a toggle must ask for the model its mode was left on";
+const MODEL_CHURNED: &str = "a toggle must not ask for the model already selected";
+const BINDING_OVERRIDDEN: &str = "a bound Plan job must decide what a plan run uses";
+const POLICY_IGNORED: &str = "a model the policy refuses must not be asked for";
+const BASELINE_EARLY: &str = "a swapped model must stay pending until a message carries it";
+const BASELINE_UNSETTLED: &str = "a message must settle the model it carried";
+const BASELINE_WRONG: &str = "the baseline must be the model the next turn runs on";
+const PICK_MISFILED: &str = "a choice must be remembered against the mode it was made in";
 const TASK_CONTEXT_SPEC: &str = "test/task-context";
 const INITIAL_CONTEXT_PROVIDER: &str = "Initial context provider";
 const UPDATED_CONTEXT_PROVIDER: &str = "Updated context provider";
@@ -11653,6 +11664,197 @@ fn toggling_back_before_sending_clears_the_pending_label() {
     app.update(Msg::Key(key(KeyCode::Tab)));
     app.update(Msg::Key(key(KeyCode::Tab)));
     assert_eq!(&*app.mode_label().full, "[PLAN]");
+}
+
+/// The model the runtime would have installed, since the app only asks for one.
+fn other_model() -> caudra_providers::Model {
+    caudra_providers::Model {
+        id: OTHER_MODEL_ID.into(),
+        ..test_model()
+    }
+}
+
+fn tab(app: &mut App) -> Vec<Action> {
+    app.update(Msg::Key(key(KeyCode::Tab)))
+}
+
+fn asked_for(actions: &[Action]) -> Option<&str> {
+    match actions {
+        [Action::ChangeModel(spec)] => Some(spec),
+        _ => None,
+    }
+}
+
+fn restore_plan_binding(previous: Option<Binding>, storage: &StateDir) {
+    match previous {
+        Some(binding) => {
+            model_registry::set_binding_and_persist(ModelPurpose::Plan, binding, storage)
+        }
+        None => model_registry::clear_binding_and_persist(ModelPurpose::Plan, storage),
+    }
+    .unwrap();
+}
+
+/// Plan and build each keep the model they were left on, so a toggle asks for
+/// the other one rather than planning on whatever last wrote code.
+#[test]
+fn toggling_modes_asks_for_the_model_that_mode_remembers() {
+    let mut app = test_app();
+    caudra_storage::model::persist_model(&app.storage, StoredMode::Build, OTHER_MODEL_SPEC);
+
+    let actions = tab(&mut app);
+
+    assert_eq!(app.state.mode, Mode::Build);
+    assert_eq!(
+        asked_for(&actions),
+        Some(OTHER_MODEL_SPEC),
+        "{MODEL_UNASKED}"
+    );
+}
+
+/// A mode that was never used on its own inherits the other's, which is the
+/// same model already selected, so nothing is asked for.
+#[test]
+fn a_mode_with_no_remembered_model_asks_for_nothing() {
+    let mut app = test_app();
+
+    let actions = tab(&mut app);
+
+    assert_eq!(asked_for(&actions), None, "{MODEL_CHURNED}");
+}
+
+#[test]
+fn toggling_back_before_sending_asks_for_the_first_model_again() {
+    let mut app = test_app();
+    let plan_model = app.state.model.clone();
+    caudra_storage::model::persist_model(&app.storage, StoredMode::Plan, &plan_model.spec());
+    caudra_storage::model::persist_model(&app.storage, StoredMode::Build, OTHER_MODEL_SPEC);
+
+    tab(&mut app);
+    app.select_model(&other_model());
+    let actions = tab(&mut app);
+
+    assert_eq!(app.state.mode, Mode::Plan);
+    assert_eq!(
+        asked_for(&actions),
+        Some(plan_model.spec().as_str()),
+        "{MODEL_UNASKED}"
+    );
+}
+
+/// A bound Plan job already decides what a plan run uses, whatever the
+/// selection says, so moving the selection would only make the bar name a model
+/// the run ignores.
+#[test_case(Mode::Plan ; "entering_build")]
+#[test_case(Mode::Build ; "entering_plan")]
+fn a_bound_plan_job_leaves_the_selection_alone(from: Mode) {
+    let mut app = test_app();
+    app.state.mode = from;
+    app.state.applied_mode = from;
+    caudra_storage::model::persist_model(&app.storage, StoredMode::Build, OTHER_MODEL_SPEC);
+    caudra_storage::model::persist_model(&app.storage, StoredMode::Plan, PLAN_CONTEXT_SPEC);
+    let previous = model_registry::binding(ModelPurpose::Plan);
+    model_registry::set_binding_and_persist(
+        ModelPurpose::Plan,
+        Binding::Exact(PLAN_CONTEXT_SPEC.into()),
+        &app.storage,
+    )
+    .unwrap();
+
+    let actions = tab(&mut app);
+
+    restore_plan_binding(previous, &app.storage);
+    assert_eq!(asked_for(&actions), None, "{BINDING_OVERRIDDEN}");
+}
+
+/// The remembered model outlives the policy that allowed it, so a toggle must
+/// not flash a rejection on every press.
+#[test]
+fn a_disallowed_remembered_model_is_not_asked_for() {
+    let mut app = test_app();
+    caudra_storage::model::persist_model(&app.storage, StoredMode::Build, OTHER_MODEL_SPEC);
+    let raw: caudra_config::RawConfig = serde_json::from_value(serde_json::json!({
+        "provider": {"allowed_models": [app.state.model.spec()]}
+    }))
+    .unwrap();
+    app.model_policy = Arc::new(raw.into_config(false).unwrap().provider.model_policy);
+
+    let actions = tab(&mut app);
+
+    assert_eq!(asked_for(&actions), None, "{POLICY_IGNORED}");
+}
+
+/// Both halves of the switch reach the agent on the same message, so both stop
+/// being pending there.
+#[test]
+fn sending_a_message_settles_the_model_alongside_the_mode() {
+    let mut app = test_app();
+    let other = other_model();
+    tab(&mut app);
+    app.select_model(&other);
+    assert_ne!(app.state.applied_model, other.spec(), "{BASELINE_EARLY}");
+
+    app.build_agent_input(&QueuedMessage {
+        text: "go".into(),
+        images: Vec::new(),
+        mentions: Vec::new(),
+        paste_ranges: Vec::new(),
+    });
+
+    assert_eq!(app.state.applied_mode, Mode::Build);
+    assert_eq!(
+        app.state.applied_model,
+        other.spec(),
+        "{BASELINE_UNSETTLED}"
+    );
+}
+
+/// A pick made with nothing pending is the model the next turn runs on, so it
+/// becomes what a later toggle is measured against. One made mid switch must
+/// not move that baseline, or the transition loses the model it started from.
+#[test_case(false, OTHER_MODEL_SPEC ; "nothing_pending_moves_the_baseline")]
+#[test_case(true, TEST_MODEL_SPEC   ; "a_pending_switch_keeps_it")]
+fn a_pick_moves_the_baseline_only_when_nothing_is_pending(pending: bool, expected: &str) {
+    let mut app = test_app();
+    if pending {
+        tab(&mut app);
+    }
+
+    app.select_model(&other_model());
+
+    assert_eq!(app.state.applied_model, expected, "{BASELINE_WRONG}");
+}
+
+/// While a switch is pending the mode on screen is the one the pick is for, so
+/// that is the mode it is remembered against.
+#[test]
+fn a_pick_is_remembered_against_the_mode_on_screen() {
+    let mut app = test_app();
+    tab(&mut app);
+
+    app.select_model(&other_model());
+
+    assert_eq!(
+        caudra_storage::model::read_model(&app.storage, StoredMode::Build).as_deref(),
+        Some(OTHER_MODEL_SPEC),
+        "{PICK_MISFILED}"
+    );
+}
+
+/// A session reconciled to a model the shared slot moved to has not chosen it,
+/// so nothing may be recorded: a background session in the other mode would
+/// otherwise overwrite that mode's choice.
+#[test]
+fn reconciling_to_the_shared_slot_records_nothing() {
+    let mut app = test_app();
+
+    app.update_model(&other_model());
+
+    assert_eq!(
+        caudra_storage::model::read_model(&app.storage, StoredMode::Plan),
+        None,
+        "{PICK_MISFILED}"
+    );
 }
 
 #[test]

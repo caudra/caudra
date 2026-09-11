@@ -37,6 +37,9 @@ pub(crate) struct SessionState {
     /// message, so while this trails `mode` the status bar shows the pending
     /// transition rather than claiming a switch that has not happened.
     pub applied_mode: Mode,
+    /// The model spec that went with it, so a selection the mode toggle swapped
+    /// in draws as a transition for exactly as long as the mode does.
+    pub applied_model: String,
     pub plan: PlanState,
     pub warnings: Vec<String>,
     pub thinking: ThinkingConfig,
@@ -129,6 +132,8 @@ impl SessionState {
             });
         }
 
+        let applied_model = model.spec();
+
         Self {
             // Saved model may differ from the live one (updated, removed, etc).
             // Reconcile so the UI badge and agent always see the truth.
@@ -158,6 +163,7 @@ impl SessionState {
             turns,
             mode,
             applied_mode: mode,
+            applied_model,
             plan,
             warnings,
         }

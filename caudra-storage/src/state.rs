@@ -272,7 +272,11 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(crate::model::read_model(&dir), None, "{IGNORED}");
+        assert_eq!(
+            crate::model::read_model(&dir, crate::sessions::StoredMode::Build),
+            None,
+            "{IGNORED}"
+        );
         assert!(crate::model::read_recents(&dir).is_empty(), "{IGNORED}");
         assert_eq!(crate::theme::read_theme_name(&dir), None, "{IGNORED}");
         assert_eq!(crate::view::read(&dir), None, "{IGNORED}");
@@ -304,11 +308,11 @@ mod tests {
             "{IGNORED}"
         );
 
-        crate::model::persist_model(&dir, "current/model");
+        crate::model::persist_model(&dir, crate::sessions::StoredMode::Build, "current/model");
         crate::theme::persist_theme_name(&dir, "current-theme");
         crate::mcp_trust::trust_project(&dir, &project, "legacy-server", LEGACY_DIGEST).unwrap();
         assert_eq!(
-            crate::model::read_model(&dir).as_deref(),
+            crate::model::read_model(&dir, crate::sessions::StoredMode::Build).as_deref(),
             Some("current/model")
         );
         for (name, content) in LEGACY_STATE_FILES {

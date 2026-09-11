@@ -2564,7 +2564,7 @@ impl<'t> EventLoop<'t> {
         let new_provider = from_model(&mut new_model, self.ctx.timeouts)
             .map_err(|e| format!("{PROVIDER_INIT_ERR}: {e}"))?;
         let app = self.focused_app();
-        app.update_model(&new_model);
+        app.select_model(&new_model);
         app.record_recent_model(spec);
         app.usage_slot.store(None);
         self.ctx.model_slot.store(Arc::new(ModelSlot {

@@ -6,6 +6,8 @@ use crate::components::status_bar::ModeLabel;
 use crate::theme;
 use caudra_agent::mentions;
 use caudra_agent::{AgentInput, AgentMode, Mention};
+use caudra_providers::ModelPurpose;
+use caudra_providers::model_registry;
 use caudra_storage::StateDir;
 use caudra_storage::plans;
 use ratatui::style::{Color, Modifier, Style};
@@ -118,7 +120,25 @@ impl App {
             Mode::Build => self.enter_plan(),
             Mode::Plan => self.state.mode = Mode::Build,
         };
-        vec![]
+        self.remembered_model()
+    }
+
+    /// Asks for the model the new mode was last used with, so plan and build
+    /// each keep the one they were left on.
+    ///
+    /// Silent when the Plan job carries a binding: that binding already decides
+    /// what a plan run uses, whatever the selection says, so moving the
+    /// selection here would only make the status bar name a model the run
+    /// ignores.
+    fn remembered_model(&self) -> Vec<super::Action> {
+        if model_registry::binding(ModelPurpose::Plan).is_some() {
+            return vec![];
+        }
+        caudra_storage::model::read_model(&self.storage, self.state.mode.into())
+            .filter(|spec| *spec != self.state.model.spec() && self.model_policy.allows(spec))
+            .map(super::Action::ChangeModel)
+            .into_iter()
+            .collect()
     }
 
     pub(super) fn agent_mode(&self) -> AgentMode {
@@ -146,9 +166,11 @@ impl App {
     }
 
     /// The one place the mode is committed to the agent, so it is also where a
-    /// pending toggle stops being pending.
+    /// pending toggle stops being pending. The model the toggle swapped in
+    /// settles with it, having reached the agent by the same message.
     pub(crate) fn build_agent_input(&mut self, msg: &QueuedMessage) -> AgentInput {
         self.state.applied_mode = self.state.mode;
+        self.state.applied_model = self.state.model.spec();
         AgentInput {
             message: msg.text.clone(),
             mode: self.agent_mode(),
