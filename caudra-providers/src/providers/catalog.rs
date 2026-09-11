@@ -207,6 +207,9 @@ impl ProviderData {
 #[derive(Clone, Debug)]
 pub struct CatalogMeta {
     pub context: u32,
+    /// Whether [`context`](Self::context) came from `limit.input`, which grants
+    /// the output allowance on top of it rather than carving it out.
+    pub context_excludes_output: bool,
     pub output: u32,
     pub input_price: f64,
     pub output_price: f64,
@@ -230,6 +233,7 @@ impl CatalogMeta {
             context: limit
                 .and_then(|l| l.input.or(l.context))
                 .unwrap_or(FALLBACK_CATALOG_CONTEXT),
+            context_excludes_output: limit.is_some_and(|l| l.input.is_some()),
             output: limit
                 .and_then(|l| l.output)
                 .unwrap_or(FALLBACK_CATALOG_OUTPUT),
@@ -1027,6 +1031,7 @@ pub(crate) fn free_model_if_available(slug: &str, model_id: &str) -> bool {
 #[derive(Debug, Clone)]
 pub struct CatalogMetaView {
     pub context: u32,
+    pub context_excludes_output: bool,
     pub output: u32,
     pub input_price: f64,
     pub output_price: f64,
@@ -1042,6 +1047,7 @@ impl From<&CatalogMeta> for CatalogMetaView {
     fn from(meta: &CatalogMeta) -> Self {
         Self {
             context: meta.context,
+            context_excludes_output: meta.context_excludes_output,
             output: meta.output,
             input_price: meta.input_price,
             output_price: meta.output_price,
@@ -1102,6 +1108,7 @@ mod tests {
                     "paid-model".into(),
                     CatalogMeta {
                         context: 128_000,
+                        context_excludes_output: false,
                         output: 64_000,
                         input_price: 1.0,
                         output_price: 2.0,
@@ -1117,6 +1124,7 @@ mod tests {
                     "free-model".into(),
                     CatalogMeta {
                         context: 128_000,
+                        context_excludes_output: false,
                         output: 64_000,
                         input_price: 0.0,
                         output_price: 0.0,
@@ -1411,6 +1419,27 @@ mod tests {
             CatalogMeta::from_model(&model).context,
             expected,
             "{PROMPT_BUDGET_IS_INPUT}"
+        );
+    }
+
+    const OUTPUT_CARVED_FROM_A_BUDGET: &str = "a window taken from limit.input already excludes the output allowance, so reserving \
+         room for a reply inside it holds back twice";
+
+    #[test_case(
+        r#"{"limit": {"context": 1050000, "input": 922000, "output": 128000}}"#, true
+        ; "a published input budget grants output on top"
+    )]
+    #[test_case(
+        r#"{"limit": {"context": 200000, "output": 64000}}"#, false
+        ; "a total window carves the output out of itself"
+    )]
+    #[test_case(r#"{}"#, false ; "an unpublished window is a total")]
+    fn catalog_meta_says_whether_its_window_excludes_output(json: &str, expected: bool) {
+        let model: super::schema::CatalogModel = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            CatalogMeta::from_model(&model).context_excludes_output,
+            expected,
+            "{OUTPUT_CARVED_FROM_A_BUDGET}"
         );
     }
 

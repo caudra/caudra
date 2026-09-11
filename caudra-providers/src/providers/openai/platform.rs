@@ -630,10 +630,12 @@ impl Provider for OpenAi {
         if self.is_oauth()
             && let Some(plan_context_window) = coding_plan_context_window(&model.id)
         {
-            model.context_window = baseline_context_window.min(plan_context_window);
             // The plan windows are `total - max_output_tokens`, so the output
-            // allowance sits on top rather than inside them.
-            model.window_excludes_output = model.context_window == plan_context_window;
+            // allowance sits on top rather than inside them. That holds only
+            // where the plan window is the one in force: a model whose own
+            // window is narrower keeps its own terms.
+            model.window_excludes_output = plan_context_window <= baseline_context_window;
+            model.context_window = baseline_context_window.min(plan_context_window);
         } else {
             model.context_window = baseline_context_window;
             model.window_excludes_output = false;

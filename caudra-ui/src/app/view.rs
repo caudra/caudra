@@ -566,9 +566,10 @@ impl App {
             .as_ref()
             .map_or(&self.state.model, |slot| &slot.model);
         let effective_model_spec = effective_model.as_ref().map(|slot| slot.model.spec());
-        let effective_context = effective_model
-            .as_ref()
-            .and_then(|_| self.active_context_snapshot());
+        // Read whether or not a turn is running: the snapshot now carries the
+        // provider's own count, so it is the same number the chat records at
+        // turn end and the bar no longer jumps between two ways of measuring.
+        let effective_context = main_chat.then(|| self.main_context_snapshot()).flatten();
         // What the request will actually carry, not what was asked for: a
         // model can refuse to stop reasoning, and the badge has to say so.
         let thinking = (main_chat && model.supports_thinking()).then(|| {
@@ -611,7 +612,7 @@ impl App {
                 global_subscription_cost: self.state.subscription_cost,
                 context_size: effective_context
                     .as_ref()
-                    .map_or(chat.context_size, |snapshot| snapshot.usage.used()),
+                    .map_or(chat.context_size, |snapshot| snapshot.used()),
                 cost: chat.cost,
                 subscription_cost: chat.subscription_cost,
                 context_window: if let Some(slot) = effective_model.as_ref() {
@@ -621,6 +622,9 @@ impl App {
                 } else {
                     self.state.model.context_window
                 },
+                compaction_border: effective_context
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.window.compaction_border()),
                 show_global: self.chats.len() > 1,
             },
             auto_scroll: chat.auto_scroll(),

@@ -364,6 +364,7 @@ mod tests {
                 reserve: ContextReserve::Disabled,
             },
             usage: ContextUsage::default(),
+            measured: None,
             inventory: ContextInventory {
                 builtins: ContextBuiltinInventory {
                     tools: vec![

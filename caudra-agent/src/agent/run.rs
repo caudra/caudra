@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::env;
+use std::slice;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -65,6 +66,16 @@ const TOOL_RESULT_BLOCK_FRAMING: &str = r#"{"type":"tool_result","tool_use_id":"
 const TOOL_RESULT_ERROR_FRAMING: &str = r#"{"is_error":true}"#;
 const IMAGE_BLOCK_FRAMING: &str =
     r#"{"type":"image","source":{"type":"base64","media_type":"","data":""}}"#;
+/// Base64 characters an opaque blob spends per token of what it encodes.
+///
+/// Signatures and encrypted reasoning travel as ciphertext but are never billed
+/// as such: the provider decrypts the item and charges the reasoning inside it.
+/// A token is roughly four characters of that plaintext, which is four bytes of
+/// ciphertext, which base64 inflates by a third. Counting the armour with a
+/// tokenizer instead charges one token per two or three characters, so a
+/// reasoning-heavy transcript reads about twice its true size and the
+/// conversation appears to overflow a window it fits in.
+const OPAQUE_BLOB_CHARS_PER_TOKEN: usize = 5;
 const NUDGE_PROMPT: &str = "You just executed tool calls but returned an empty response. Please process the tool results above and continue with the task. Always end your turn with a text response.";
 /// Nothing is pending, so this asks for the closing response the system
 /// prompt requires rather than for tool results to be processed.
@@ -193,6 +204,32 @@ enum TurnOutcome {
     Done(DoneReason),
 }
 
+/// The last request the provider billed, and where the transcript stood when it
+/// was sent.
+///
+/// Auto-compaction and the status bar both need one number for how full the
+/// window is, and only the provider can supply it. The estimate is kept for what
+/// it is good at — how much the transcript has *grown* since — which needs no
+/// tokenizer agreement, only that the same counter answers at both ends.
+#[derive(Debug, Clone, Copy)]
+struct MeasuredContext {
+    reported: u32,
+    history_len: usize,
+}
+
+impl MeasuredContext {
+    /// `None` once the transcript is shorter than it was when the count was
+    /// taken: compaction and rollback replace what was billed, so the anchor no
+    /// longer describes anything and would otherwise hold a stale high count.
+    fn extended_by(self, history: &[Message]) -> Option<u32> {
+        let appended = history.get(self.history_len..)?;
+        Some(
+            self.reported
+                .saturating_add(estimate_message_tokens(appended)),
+        )
+    }
+}
+
 #[derive(Clone)]
 pub struct AgentParams {
     pub provider: Arc<dyn Provider>,
@@ -258,7 +295,7 @@ pub struct Agent<'h> {
     cancel: CancelToken,
     retry_now: Nudge,
     total_usage: TokenUsage,
-    context_size: u32,
+    measured: Option<MeasuredContext>,
     num_turns: u32,
     recent_calls: RecentCalls,
     auto_compact: bool,
@@ -345,7 +382,7 @@ impl<'h> Agent<'h> {
             cancel: CancelToken::none(),
             retry_now: Nudge::default(),
             total_usage: TokenUsage::default(),
-            context_size: 0,
+            measured: None,
             num_turns: 0,
             recent_calls: RecentCalls::new(),
             auto_compact: compaction::auto_compact_enabled(),
@@ -826,6 +863,7 @@ impl<'h> Agent<'h> {
             base_tools: &self.tools,
             full_tools,
             projected_messages,
+            measured: self.context_size(),
             inventory,
         }));
     }
@@ -853,6 +891,7 @@ impl<'h> Agent<'h> {
         if self.cancel.is_cancelled() {
             return Err(AgentError::Cancelled);
         }
+        let sent_at_history_len = self.history.len();
         let stream_result = {
             let (tools, mcp) = self.request_tools();
             let provider_history = self.projected_history(tools.as_ref());
@@ -942,6 +981,10 @@ impl<'h> Agent<'h> {
             "API response received"
         );
 
+        self.measured = Some(MeasuredContext {
+            reported: response.usage.total_input(),
+            history_len: sent_at_history_len,
+        });
         self.emit_turn_complete(&response)?;
         let usage = response.usage;
         self.total_usage += usage;
@@ -951,14 +994,9 @@ impl<'h> Agent<'h> {
                 .billed_cost(&usage, self.opts.clamped(&self.model).fast),
             self.model.billing,
         );
-        self.context_size = usage.total_input();
 
         if has_tools {
-            let history_len_before = self.history.len();
             self.process_tool_calls(response).await?;
-            self.context_size = self.context_size.saturating_add(estimate_message_tokens(
-                &self.history.as_slice()[history_len_before..],
-            ));
         } else {
             let has_reasoning = response.message.content.iter().any(|block| {
                 matches!(
@@ -1297,7 +1335,13 @@ impl<'h> Agent<'h> {
                     .model
                     .billed_cost(&response.usage, self.opts.clamped(&self.model).fast),
                 billing: self.model.billing,
-                context_size: Some(response.usage.context_tokens()),
+                // The reply reaches history after this fires but is replayed by
+                // the next request all the same, so count it here too. Leaving
+                // it out is what the session would persist, and the bar would
+                // drop by a turn's worth of tokens on reload.
+                context_size: self.context_size().map(|size| {
+                    size.saturating_add(estimate_message_tokens(slice::from_ref(&response.message)))
+                }),
                 context_window: self.model.context_window,
             })))
     }
@@ -1419,20 +1463,29 @@ impl<'h> Agent<'h> {
         }
     }
 
+    /// How full the window is: the provider's own count for the last request it
+    /// billed, extended by everything appended since. `None` before the first
+    /// response, when nothing has been billed to anchor on.
+    fn context_size(&self) -> Option<u32> {
+        self.measured
+            .and_then(|measured| measured.extended_by(self.history.as_slice()))
+    }
+
     async fn try_auto_compact(&mut self) -> Result<bool, AgentError> {
-        if !self.auto_compact
-            || !compaction::is_overflow(
-                &TokenUsage {
-                    input: self.context_size,
-                    ..Default::default()
-                },
-                &self.model,
-                self.config.compaction_buffer,
-            )
-        {
+        let Some(context_size) = self.context_size().filter(|_| self.auto_compact) else {
+            return Ok(false);
+        };
+        if !compaction::is_overflow(
+            &TokenUsage {
+                input: context_size,
+                ..Default::default()
+            },
+            &self.model,
+            self.config.compaction_buffer,
+        ) {
             return Ok(false);
         }
-        info!(context_size = self.context_size, "auto-compacting");
+        info!(context_size, "auto-compacting");
         self.event_tx.send(AgentEvent::Compacting)?;
         self.do_compact().await?;
         Ok(true)
@@ -1634,20 +1687,22 @@ fn message_block_tokens(block: &ContentBlock) -> u32 {
             let mut tokens = framed_tokens(THINKING_BLOCK_FRAMING, [thinking.as_str()]);
             if let Some(signature) = signature {
                 add_estimated_tokens(&mut tokens, THINKING_SIGNATURE_FRAMING);
-                add_estimated_tokens(&mut tokens, signature);
+                add_opaque_blob_tokens(&mut tokens, signature);
             }
             if let Some(responses) = responses {
                 add_estimated_tokens(&mut tokens, RESPONSES_REASONING_FRAMING);
                 add_estimated_tokens(&mut tokens, &responses.item_id);
                 if let Some(encrypted_content) = &responses.encrypted_content {
                     add_estimated_tokens(&mut tokens, RESPONSES_ENCRYPTED_CONTENT_FRAMING);
-                    add_estimated_tokens(&mut tokens, encrypted_content);
+                    add_opaque_blob_tokens(&mut tokens, encrypted_content);
                 }
             }
             tokens
         }
         ContentBlock::RedactedThinking { data } => {
-            framed_tokens(REDACTED_THINKING_BLOCK_FRAMING, [data.as_str()])
+            let mut tokens = estimate_tokens_cached(REDACTED_THINKING_BLOCK_FRAMING);
+            add_opaque_blob_tokens(&mut tokens, data);
+            tokens
         }
         ContentBlock::ToolUse {
             id,
@@ -1659,7 +1714,7 @@ fn message_block_tokens(block: &ContentBlock) -> u32 {
             add_estimated_tokens(&mut tokens, &input.to_string());
             if let Some(thought_signature) = thought_signature {
                 add_estimated_tokens(&mut tokens, TOOL_USE_SIGNATURE_FRAMING);
-                add_estimated_tokens(&mut tokens, thought_signature);
+                add_opaque_blob_tokens(&mut tokens, thought_signature);
             }
             tokens
         }
@@ -1701,6 +1756,13 @@ fn add_estimated_tokens(total: &mut u32, text: &str) {
     *total = total.saturating_add(estimate_tokens_cached(text));
 }
 
+/// Charges base64 armour for what it encodes rather than for how it is spelled.
+/// See [`OPAQUE_BLOB_CHARS_PER_TOKEN`].
+fn add_opaque_blob_tokens(total: &mut u32, blob: &str) {
+    let tokens = blob.len() / OPAQUE_BLOB_CHARS_PER_TOKEN;
+    *total = total.saturating_add(u32::try_from(tokens).unwrap_or(u32::MAX));
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{HashMap, VecDeque};
@@ -1724,7 +1786,10 @@ mod tests {
     const AUTH_ERROR_STATUS: u16 = 401;
     const AUTH_ERROR_MESSAGE: &str = "expired";
     const EXPECTED_AUTH_ERROR: &str = "expected terminal authentication error";
-    const ADJUSTED_CONTEXT_WINDOW: u32 = 1;
+    /// Distinctive so `adjust_model` is provably what set it, but wide enough
+    /// that a two-message transcript does not trip auto-compaction on its way
+    /// through the run these tests are actually about.
+    const ADJUSTED_CONTEXT_WINDOW: u32 = 111_111;
     const PUBLISHED_CONTEXT_WINDOW: u32 = 123_456;
     const CAPTURED_CONTEXT_MISSING: &str = "current request must publish before provider dispatch";
     const PREPARED_CONTEXT_MISSING: &str = "completed turn must publish its next request";
@@ -3833,10 +3898,11 @@ mod tests {
         assert!(!agent.should_generate_title("   \n\t"));
     }
 
-    #[test_case(true,  170_000, true  ; "enabled_and_over_threshold")]
-    #[test_case(true,  150_000, false ; "enabled_but_below_threshold")]
-    #[test_case(false, 170_000, false ; "disabled_even_over_threshold")]
-    fn try_auto_compact_behavior(enabled: bool, context_size: u32, expected: bool) {
+    #[test_case(true,  Some(170_000), true  ; "enabled_and_over_threshold")]
+    #[test_case(true,  Some(150_000), false ; "enabled_but_below_threshold")]
+    #[test_case(false, Some(170_000), false ; "disabled_even_over_threshold")]
+    #[test_case(true,  None,          false ; "nothing_billed_yet_is_not_an_overflow")]
+    fn try_auto_compact_behavior(enabled: bool, reported: Option<u32>, expected: bool) {
         smol::block_on(async {
             let responses = if expected {
                 vec![text_response(StopReason::EndTurn)]
@@ -3847,7 +3913,10 @@ mod tests {
             let (mut agent, event_rx) = make_agent(MockProvider::new(responses), &mut history);
             agent.model = Arc::new(small_context_model(200_000, 8_192));
             agent.auto_compact = enabled;
-            agent.context_size = context_size;
+            agent.measured = reported.map(|reported| MeasuredContext {
+                reported,
+                history_len: agent.history.len(),
+            });
             let result = agent.try_auto_compact().await.unwrap();
 
             assert_eq!(result, expected);
@@ -3860,6 +3929,105 @@ mod tests {
                 expected,
             );
         });
+    }
+
+    const ANCHOR_IGNORED: &str =
+        "the provider's count must anchor the size, not an estimate of the whole transcript";
+    const GROWTH_UNCOUNTED: &str = "what was appended after the count must be added to it";
+    const STALE_ANCHOR_KEPT: &str =
+        "an anchor older than the transcript describes messages that no longer exist";
+
+    /// The estimate is only ever asked how much was appended, so a transcript it
+    /// counts wildly wrong in absolute terms still reports the provider's number.
+    #[test]
+    fn a_measured_context_reports_what_the_provider_billed() {
+        const REPORTED: u32 = 300_000;
+        let history = [Message::user("go".into()), Message::user("again".into())];
+        let measured = MeasuredContext {
+            reported: REPORTED,
+            history_len: history.len(),
+        };
+
+        assert_eq!(
+            measured.extended_by(&history),
+            Some(REPORTED),
+            "{ANCHOR_IGNORED}"
+        );
+    }
+
+    #[test]
+    fn a_measured_context_adds_only_what_arrived_after_it() {
+        const REPORTED: u32 = 300_000;
+        let history = [Message::user("go".into()), Message::user("again".into())];
+        let measured = MeasuredContext {
+            reported: REPORTED,
+            history_len: 1,
+        };
+
+        let size = measured.extended_by(&history).expect(GROWTH_UNCOUNTED);
+        assert_eq!(
+            size,
+            REPORTED + estimate_message_tokens(&history[1..]),
+            "{GROWTH_UNCOUNTED}"
+        );
+        assert!(size > REPORTED, "{GROWTH_UNCOUNTED}");
+    }
+
+    /// Compaction replaces what was billed. Carrying the old count forward would
+    /// hold the pre-compaction size and compact again immediately.
+    #[test]
+    fn a_measured_context_expires_when_the_transcript_shrinks_under_it() {
+        let measured = MeasuredContext {
+            reported: 300_000,
+            history_len: 4,
+        };
+
+        assert_eq!(
+            measured.extended_by(&[Message::user("summary".into())]),
+            None,
+            "{STALE_ANCHOR_KEPT}"
+        );
+    }
+
+    const CIPHERTEXT_AS_PROSE: &str =
+        "an encrypted reasoning item must be charged for what it encodes, not for its armour";
+    const ARMOUR_IS_CHEAPER_THAN_PROSE: &str = "base64 tokenizes worse than anything it stands in for, so counting it as text \
+         must cost strictly more than the rate that replaced it";
+
+    /// Reasoning items are decrypted before they are billed, so the provider
+    /// charges the reasoning inside rather than the base64 it travelled as. A
+    /// tokenizer run over the armour roughly doubles the bill, which is what
+    /// made a transcript read past its window while it still fitted.
+    #[test]
+    fn encrypted_reasoning_is_charged_at_the_rate_of_what_it_encodes() {
+        const CIPHERTEXT_LEN: usize = 40_000;
+        let ciphertext = "aGVsbG8".repeat(CIPHERTEXT_LEN / "aGVsbG8".len());
+        let block = ContentBlock::Thinking {
+            thinking: String::new(),
+            signature: None,
+            responses: Some(caudra_providers::ResponsesReasoning {
+                item_id: "rs_1".into(),
+                encrypted_content: Some(ciphertext.clone()),
+            }),
+            interrupted: false,
+            duration_ms: None,
+        };
+
+        let charged = message_block_tokens(&block);
+        let framing = estimate_tokens_cached(THINKING_BLOCK_FRAMING)
+            + estimate_tokens_cached(RESPONSES_REASONING_FRAMING)
+            + estimate_tokens_cached(RESPONSES_ENCRYPTED_CONTENT_FRAMING)
+            + estimate_tokens_cached("rs_1");
+
+        assert_eq!(
+            charged - framing,
+            u32::try_from(ciphertext.len() / OPAQUE_BLOB_CHARS_PER_TOKEN).unwrap(),
+            "{CIPHERTEXT_AS_PROSE}"
+        );
+        assert!(
+            estimate_tokens_cached(&ciphertext) > charged - framing,
+            "{ARMOUR_IS_CHEAPER_THAN_PROSE}"
+        );
     }
 
     #[test]

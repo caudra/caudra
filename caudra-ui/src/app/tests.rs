@@ -507,6 +507,7 @@ fn context_snapshot(spec: &str, window: u32) -> ContextSnapshot {
             reserve: ContextReserve::Disabled,
         },
         usage: ContextUsage::default(),
+        measured: None,
         inventory: ContextInventory::default(),
     }
 }

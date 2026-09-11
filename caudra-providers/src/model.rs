@@ -23,7 +23,7 @@ use crate::providers::{anthropic, custom, dynamic};
 use crate::types::ThinkingFields;
 
 const PER_MILLION: f64 = 1_000_000.0;
-const ANTHROPIC_SLUG: &str = "anthropic";
+pub(crate) const ANTHROPIC_SLUG: &str = "anthropic";
 const GPT_PREFIX: &str = "gpt-";
 const GPT_4_PREFIX: &str = "gpt-4";
 const OPEN_WEIGHTS_PREFIX: &str = "gpt-oss";
@@ -275,14 +275,6 @@ impl ModelEntry {
     }
 }
 
-/// Whether a resolved window is an input budget rather than the API total.
-/// Anthropic is the only static table that declares one; the OpenAI plan windows
-/// are set at runtime by `openai::platform::adjust_model`, since they depend on
-/// which credentials are in play.
-pub(crate) fn window_excludes_output(manifest_slug: &str, context_window: u32) -> bool {
-    manifest_slug == ANTHROPIC_SLUG && anthropic::shared::window_excludes_output(context_window)
-}
-
 pub(crate) fn lookup_entry<'a>(
     entries: &'a [ModelEntry],
     model_id: &str,
@@ -452,12 +444,24 @@ impl Model {
             .or_else(|| static_entry.and_then(|entry| entry.max_output_tokens))
             .or_else(|| catalog.map(|meta| meta.output))
             .or(manifest.fallback_max_output);
-        let context_window = discovered
+        // Whichever source supplies the window also says whether it is an input
+        // budget, because only the source knows. Asking the resolved number
+        // instead would flag any window that happened to equal one caudra caps
+        // itself at, and miss one that a provider reported for itself.
+        let (context_window, window_excludes_output) = discovered
             .and_then(|info| info.context_window)
-            .or_else(|| anthropic::shared::long_context_window(model_id))
-            .or_else(|| static_entry.map(|entry| entry.context_window))
-            .or_else(|| catalog.map(|meta| meta.context))
-            .unwrap_or(manifest.fallback_context_window);
+            .map(|window| (window, false))
+            .or_else(|| anthropic::shared::long_context_window(model_id).map(|w| (w, false)))
+            .or_else(|| {
+                static_entry.map(|entry| {
+                    (
+                        entry.context_window,
+                        anthropic::shared::declares_input_budget(manifest.slug, entry),
+                    )
+                })
+            })
+            .or_else(|| catalog.map(|meta| (meta.context, meta.context_excludes_output)))
+            .unwrap_or((manifest.fallback_context_window, false));
         // The static entry wins over the catalog on purpose: it is where caudra
         // records what a *request* accepts, which is not always what the model
         // is capable of. Discovery still wins over both, since the provider
@@ -482,7 +486,7 @@ impl Model {
             discovered_free: discovered_pricing.is_some_and(ModelPricing::is_zero),
             max_output_tokens,
             context_window,
-            window_excludes_output: window_excludes_output(manifest.slug, context_window),
+            window_excludes_output,
             thinking_fields: None,
             reasoning_options,
             billing: Billing::default(),
@@ -517,7 +521,7 @@ impl Model {
             discovered_free: false,
             max_output_tokens: Some(meta.output),
             context_window: meta.context,
-            window_excludes_output: false,
+            window_excludes_output: meta.context_excludes_output,
             thinking_fields: None,
             reasoning_options: meta.reasoning_options,
             billing: Billing::default(),

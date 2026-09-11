@@ -950,6 +950,7 @@ mod tests {
             model: model.into(),
             window: ContextWindow::new(model, false, None),
             usage: ContextUsage::default(),
+            measured: None,
             inventory: ContextInventory::default(),
         }
     }

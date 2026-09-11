@@ -402,6 +402,7 @@ mod tests {
     fn meta_with(reasoning_options: ReasoningOptions, tiers: Vec<PricingTier>) -> CatalogMetaView {
         CatalogMetaView {
             context: 922_000,
+            context_excludes_output: true,
             output: 128_000,
             input_price: 10.0,
             output_price: 50.0,

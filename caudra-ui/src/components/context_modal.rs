@@ -296,6 +296,23 @@ fn summary_lines(snapshot: &ContextSnapshot, width: u16, theme: &Theme) -> Vec<L
         ),
     ];
 
+    // The breakdown below is an estimate throughout, and o200k is exact only for
+    // the GPT-4o/5 family. Auto-compaction and the status bar decide on the
+    // provider's own count, so it belongs beside the estimate rather than behind
+    // it: the two disagreeing is information, not noise.
+    if let Some(measured) = snapshot.measured {
+        lines.push(labeled_line(
+            "Measured",
+            format!(
+                "{} / {} tokens ({})",
+                format_tokens(measured),
+                format_tokens(window),
+                format_percentage(measured, window)
+            ),
+            theme,
+        ));
+    }
+
     if snapshot.readiness == ContextReadiness::PreparedNextRequest {
         lines.push(Line::from(vec![
             Span::styled("◇ ", theme.status_notice),
@@ -319,7 +336,7 @@ fn summary_lines(snapshot: &ContextSnapshot, width: u16, theme: &Theme) -> Vec<L
             theme.error,
         ));
     } else if snapshot.window.reserve.is_enabled() {
-        let over_threshold = used.saturating_sub(snapshot.usage.threshold(&snapshot.window));
+        let over_threshold = used.saturating_sub(snapshot.window.threshold());
         if over_threshold > 0 {
             lines.push(capacity_warning(
                 format!(
@@ -359,7 +376,7 @@ fn compaction_line(snapshot: &ContextSnapshot, theme: &Theme) -> Line<'static> {
     match snapshot.window.reserve {
         ContextReserve::Disabled => labeled_line("Auto-compact", "disabled".to_owned(), theme),
         ContextReserve::Enabled(reserve) => {
-            let threshold = snapshot.usage.threshold(&snapshot.window);
+            let threshold = snapshot.window.threshold();
             labeled_line(
                 "Auto-compact",
                 format!(
@@ -412,7 +429,7 @@ fn grid_cells(snapshot: &ContextSnapshot) -> Vec<GridKind> {
         return vec![GridKind::Free; GRID_CELL_COUNT];
     }
 
-    let threshold = snapshot.usage.threshold(&snapshot.window);
+    let threshold = snapshot.window.threshold();
     let displayed_used = snapshot.usage.used().min(window);
     let free = threshold.saturating_sub(displayed_used);
     let reserve = window.saturating_sub(displayed_used).saturating_sub(free);
@@ -999,6 +1016,7 @@ mod tests {
                 skills: 70,
                 messages: 200,
             },
+            measured: None,
             inventory: ContextInventory {
                 profiles: ContextProfileInventory {
                     profiles: vec![ContextProfile {

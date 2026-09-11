@@ -727,6 +727,10 @@ impl AgentLoop {
                 base_tools: &self.tools,
                 full_tools: &tools,
                 projected_messages: messages.as_ref(),
+                // Published between runs, when nothing the provider billed
+                // describes this transcript: startup has yet to send a request,
+                // and a manual compaction just replaced the one it had.
+                measured: None,
                 inventory,
             }));
     }

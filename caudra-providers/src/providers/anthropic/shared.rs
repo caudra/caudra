@@ -9,7 +9,8 @@ use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 
 use crate::model::{
-    FastPricing, Model, ModelEntry, ModelFamily, ModelPricing, StaticReasoningOption,
+    ANTHROPIC_SLUG, FastPricing, Model, ModelEntry, ModelFamily, ModelPricing,
+    StaticReasoningOption,
 };
 use crate::{
     AgentError, ContentBlock, EMPTY_RESPONSE_MARKER, INVALID_TOOL_JSON_KEY, Message, ProviderEvent,
@@ -52,10 +53,13 @@ pub(crate) fn long_context_window(model_id: &str) -> Option<u32> {
         .then_some(LONG_CONTEXT_WINDOW)
 }
 
-/// Only the window caudra caps itself excludes output. `LONG_CONTEXT_WINDOW` is
-/// Anthropic's real ceiling and therefore a total, so this matches on equality.
-pub(crate) fn window_excludes_output(context_window: u32) -> bool {
-    context_window == WIDE_CONTEXT_WINDOW
+/// Whether a static entry's own declared window is an input budget rather than
+/// the API total. Only the window caudra caps itself is one, and only this table
+/// declares any, so the question is scoped to an entry the manifest owns: a
+/// window discovered from a provider or published by models.dev answers for
+/// itself and never reaches here.
+pub(crate) fn declares_input_budget(manifest_slug: &str, entry: &ModelEntry) -> bool {
+    manifest_slug == ANTHROPIC_SLUG && entry.context_window == WIDE_CONTEXT_WINDOW
 }
 
 pub(super) const MESSAGE_CACHE_BREAKPOINTS: usize = 2;
@@ -946,6 +950,10 @@ mod tests {
     #[test_case("anthropic/claude-sonnet-4-5", NARROW_CONTEXT_WINDOW, false ; "sonnet_4_5_stays_narrow")]
     #[test_case("anthropic/claude-haiku-4-5", NARROW_CONTEXT_WINDOW,  false ; "haiku_4_5_stays_narrow")]
     #[test_case("anthropic/claude-opus-5-1m", LONG_CONTEXT_WINDOW,    false ; "suffix_still_opts_into_the_ceiling")]
+    // Only this table declares input budgets. An OpenAI entry at the same number
+    // is an API total, and a rule that read the resolved window rather than its
+    // source would have reserved the wrong share of it.
+    #[test_case("openai/gpt-5.6-sol", WIDE_CONTEXT_WINDOW,            false ; "another_table_at_the_same_number_is_a_total")]
     fn context_window_matches_the_declared_tier(spec: &str, expected: u32, excludes_output: bool) {
         let model = Model::from_spec(spec).unwrap();
         assert_eq!(model.context_window, expected);

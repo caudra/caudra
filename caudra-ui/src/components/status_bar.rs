@@ -160,6 +160,9 @@ pub struct UsageStats {
     pub cost: Option<f64>,
     pub subscription_cost: Option<f64>,
     pub context_window: u32,
+    /// Where auto-compaction fires, as a share of the window. `None` when it is
+    /// switched off and the window is the only limit that matters.
+    pub compaction_border: Option<u32>,
     pub show_global: bool,
 }
 
@@ -253,9 +256,9 @@ enum YoloTier {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ContextTier {
-    /// `12.0k/200.0k (6%)`.
+    /// `12.0k/200.0k (6%/90%)`.
     Counts,
-    /// `6%`.
+    /// `6%/90%`.
     Percent,
     Hidden,
 }
@@ -265,6 +268,7 @@ enum ContextTier {
 #[derive(Debug, Clone, Copy)]
 enum Reduction {
     DropGlobalSpend,
+    DropCompactionBorder,
     CompactContext,
     ShortThinking,
     ShortYolo,
@@ -285,8 +289,9 @@ enum Reduction {
 /// hold three columns. The pending pair goes early: once the chips are already
 /// abbreviating, the model the next turn runs on is worth more than the one it
 /// is leaving.
-const LADDER: [Reduction; 14] = [
+const LADDER: [Reduction; 15] = [
     Reduction::DropGlobalSpend,
+    Reduction::DropCompactionBorder,
     Reduction::CompactContext,
     Reduction::ShortThinking,
     Reduction::ShortYolo,
@@ -309,24 +314,36 @@ const LADDER: [Reduction; 14] = [
 struct SpendText {
     counts: String,
     percent: String,
+    /// The share of the window auto-compaction fires at, drawn beside the share
+    /// in use so the bar says how far off it is rather than only how full it is.
+    border: Option<String>,
+    over_border: bool,
     spend: Option<String>,
     global: Option<String>,
 }
 
 impl SpendText {
     fn new(stats: &UsageStats) -> Self {
-        let pct = if stats.context_window > 0 {
-            (stats.context_size as f64 / stats.context_window as f64 * 100.0) as u32
-        } else {
-            0
+        let share = |tokens: u32| {
+            if stats.context_window == 0 {
+                return 0;
+            }
+            (f64::from(tokens) / f64::from(stats.context_window) * 100.0) as u32
         };
+        let pct = share(stats.context_size);
         Self {
             counts: format!(
-                "  {}/{} ({pct}%) ",
+                "{}/{}",
                 format_tokens(stats.context_size),
                 format_tokens(stats.context_window),
             ),
-            percent: format!("  {pct}% "),
+            percent: format!("{pct}%"),
+            border: stats
+                .compaction_border
+                .map(|border| format!("{}%", share(border))),
+            over_border: stats
+                .compaction_border
+                .is_some_and(|border| stats.context_size >= border),
             spend: spend(stats.cost, stats.subscription_cost).map(|cost| format!("{cost} ")),
             global: spend(stats.global_cost, stats.global_subscription_cost)
                 .filter(|_| stats.show_global)
@@ -343,6 +360,7 @@ struct Fit {
     spend: bool,
     global_spend: bool,
     context: ContextTier,
+    compaction_border: bool,
     thinking: ThinkingTier,
     model: ModelTier,
     transition: bool,
@@ -356,6 +374,7 @@ impl Fit {
         spend: true,
         global_spend: true,
         context: ContextTier::Counts,
+        compaction_border: true,
         thinking: ThinkingTier::Named,
         model: ModelTier::Full,
         transition: true,
@@ -367,6 +386,7 @@ impl Fit {
     fn apply(&mut self, step: Reduction) {
         match step {
             Reduction::DropGlobalSpend => self.global_spend = false,
+            Reduction::DropCompactionBorder => self.compaction_border = false,
             Reduction::CompactContext => self.context = ContextTier::Percent,
             Reduction::ShortThinking => self.thinking = ThinkingTier::Level,
             Reduction::ShortYolo => self.yolo = YoloTier::Sigil,
@@ -443,14 +463,19 @@ impl Fit {
     }
 
     fn spend_width(self, spend: &SpendText) -> usize {
-        self.context_text(spend).map_or(0, UnicodeWidthStr::width)
+        self.context_text(spend)
+            .map_or(0, |context| context.width())
             + self.money_text(spend).map_or(0, |money| money.width())
     }
 
-    fn context_text(self, spend: &SpendText) -> Option<&str> {
+    fn context_text(self, spend: &SpendText) -> Option<Cow<'_, str>> {
+        let share = match spend.border.as_deref().filter(|_| self.compaction_border) {
+            Some(border) => Cow::Owned(format!("{}/{border}", spend.percent)),
+            None => Cow::Borrowed(spend.percent.as_str()),
+        };
         match self.context {
-            ContextTier::Counts => Some(&spend.counts),
-            ContextTier::Percent => Some(&spend.percent),
+            ContextTier::Counts => Some(Cow::Owned(format!("  {} ({share}) ", spend.counts))),
+            ContextTier::Percent => Some(Cow::Owned(format!("  {share} "))),
             ContextTier::Hidden => None,
         }
     }
@@ -860,7 +885,14 @@ fn right_side<'a>(
     }
     let counters = Style::new().fg(theme::current().foreground);
     if let Some(text) = fit.context_text(&spend) {
-        control(&mut chips, StatusBarHitTarget::Context, text, counters);
+        // Past the border the next turn compacts, which is worth saying even at
+        // a width that had to drop the border itself.
+        let style = if spend.over_border {
+            theme::current().todo_in_progress
+        } else {
+            counters
+        };
+        control(&mut chips, StatusBarHitTarget::Context, &text, style);
     }
     if let Some(text) = fit.money_text(&spend) {
         control(&mut chips, StatusBarHitTarget::Usage, &text, counters);
@@ -1172,9 +1204,14 @@ mod tests {
     /// to keep the control, too narrow to spell the word in front of it.
     const SHORT_THINKING_BUDGET: usize = 36;
     const SHORT_THINKING_CHIP: &str = "[xhigh]";
-    /// Room for every rung, so both figures are on screen at their full tier.
-    const WIDE_BUDGET: usize = 120;
-    const COUNTS_GLYPHS: &str = "12.0k/200.0k (6%)";
+    /// Room for every rung, so both figures are on screen at their full tier,
+    /// the counter's border included.
+    const WIDE_BUDGET: usize = 124;
+    /// 90% of [`crate::components::TEST_CONTEXT_WINDOW`], the share a window
+    /// that already excludes its output allowance compacts at.
+    const COMPACTION_BORDER: u32 = 180_000;
+    const COUNTS_GLYPHS: &str = "12.0k/200.0k (6%/90%)";
+    const BARE_COUNTS_GLYPHS: &str = "12.0k/200.0k (6%)";
     const MONEY_GLYPHS: &str = "$0.250  \u{03a3}$1.500";
     const MISSING_HIT_MSG: &str = "the control was drawn without a hit";
     const FIGURE_HIT_MSG: &str = "a figure's hit must cover its glyphs and no padding";
@@ -1319,6 +1356,7 @@ mod tests {
                 cost: Some(CHAT_COST),
                 subscription_cost: None,
                 context_window: crate::components::TEST_CONTEXT_WINDOW,
+                compaction_border: None,
                 show_global,
             },
             auto_scroll: true,
@@ -1383,6 +1421,7 @@ mod tests {
                 cost: Some(CHAT_COST),
                 subscription_cost: None,
                 context_window: crate::components::TEST_CONTEXT_WINDOW,
+                compaction_border: Some(COMPACTION_BORDER),
                 show_global: true,
             },
             auto_scroll: true,
@@ -1706,6 +1745,56 @@ mod tests {
             assert!(text.contains(LADDER_MODEL_ID), "{text}");
             assert!(!text.contains(MODEL_TRANSITION_ARROW), "{text}");
         });
+    }
+
+    const BORDER_MISSING: &str =
+        "the bar must say where auto-compaction fires, not only how full the window is";
+    const BORDER_OUTLIVED_THE_COUNTS: &str =
+        "a bar too narrow for the counts is too narrow for the border beside them";
+    const BORDER_WITHOUT_COMPACTION: &str =
+        "a session that never auto-compacts has no border to draw";
+
+    /// The window is the denominator, so the share in use says nothing about
+    /// when the transcript will be summarised. The border does.
+    #[test]
+    fn the_counter_says_where_auto_compaction_fires() {
+        with_ladder_ctx(|ctx| {
+            let text = side_text(&right_side(ctx, LADDER_CWD, WIDE_BUDGET));
+            assert!(text.contains(COUNTS_GLYPHS), "{BORDER_MISSING}: {text}");
+        });
+    }
+
+    /// First rung after the session total: the border is the cheapest thing on
+    /// the bar to lose, and the counts it annotates must outlive it.
+    #[test]
+    fn a_narrowing_bar_drops_the_border_before_the_counts() {
+        with_ladder_ctx(|ctx| {
+            let texts: Vec<String> = (0..=WIDE_BUDGET)
+                .rev()
+                .map(|budget| side_text(&right_side(ctx, LADDER_CWD, budget)))
+                .collect();
+
+            let dropped = texts
+                .iter()
+                .position(|text| !text.contains(COUNTS_GLYPHS))
+                .expect(BORDER_MISSING);
+            assert!(
+                texts[dropped].contains(BARE_COUNTS_GLYPHS),
+                "{BORDER_OUTLIVED_THE_COUNTS}: {}",
+                texts[dropped]
+            );
+        });
+    }
+
+    /// The plain fixture leaves auto-compaction off, so the counter has nothing
+    /// to annotate and must say only what it knows.
+    #[test]
+    fn a_session_without_auto_compaction_draws_no_border() {
+        let text = render(None, false, false);
+        assert!(
+            text.contains(BARE_COUNTS_GLYPHS),
+            "{BORDER_WITHOUT_COMPACTION}: {text}"
+        );
     }
 
     /// The pair costs roughly twice what one name does, so it goes before the

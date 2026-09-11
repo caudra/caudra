@@ -13,11 +13,11 @@ Everything the model knows about your project passes through one context window,
 
 `/context` shows a compact snapshot of the context Caudra would send for the transcript currently open. Clicking the token counter in the status bar opens the same view. Main has one context. Each task has its own system prompt, tool set, and transcript, so opening a task and running `/context` reports that task alone. Return to Main to inspect Main. A task restored after restart has no request snapshot until the task is continued.
 
-The summary shows the active model and window size, estimated tokens grouped by source, the compaction reserve, and the space available before automatic compaction. `/context all` adds item-level built-in tool, MCP tool, profile, memory, and skill inventories. Opening either view does not add its report to the transcript.
+The summary shows the active model and window size, estimated tokens grouped by source, the compaction reserve, and the space available before automatic compaction. Once a call has been billed it also shows the size the provider measured, which is the figure the status bar draws and the one automatic compaction decides on. `/context all` adds item-level built-in tool, MCP tool, profile, memory, and skill inventories. Opening either view does not add its report to the transcript.
 
 `/tools` answers a narrower question: which tools the model can reach right now. It lists every built-in and MCP tool with its state, its token cost, and the rule behind that state. Tools turned off by configuration appear there and nowhere else, because they cost no context.
 
-Every token count in the report is an estimate. Caudra uses local estimates for text and images. Provider tokenizers and wire formats vary, so the input total reported after a completed call can differ.
+The per-source breakdown is an estimate. Caudra counts text and images locally with one tokenizer, which is exact only for the GPT-4o and GPT-5 families, so the total a provider bills for the same request can differ. The measured line and the status bar carry the provider's own count instead, extended by a local estimate of whatever arrived after it.
 
 `/context` shows current capacity. `/usage` shows cumulative spend:
 
@@ -157,6 +157,8 @@ The `/context` report uses this provider projection rather than counting the raw
 Long sessions eventually approach the model's context limit. Caudra reserves a slice of the window (`agent.compaction_buffer`) and before running out it summarizes everything that came before the most recent turns. Those recent turns carry over word for word, up to a quarter of the usable window and at most 15,000 tokens, so the work in flight keeps its exact detail. The cut always lands on one of your messages, which keeps every tool call paired with its result. When a session compacts more than once, the earlier summary is folded into the new one rather than summarized again. `/context` shows this compaction reserve separately from occupied context. The reserve is held capacity rather than content or spend. `/compact` triggers compaction early, and `agent.compaction_instructions` steers what the summary keeps.
 
 The default reserve is 20%, because for most models the context window is the total the prompt and the response share, so the slice has to fit a whole reply. Where the window is an input budget instead and the output allowance sits on top of it, as with the wide Claude windows and the OpenAI Coding Plan models, the reserve only absorbs estimation drift and drops to 10%. Setting `agent.compaction_buffer` yourself overrides both.
+
+The reserve moves the point where compaction fires below the window, so the status bar counter names both: `300.1k/372.0k (81%/90%)` reads as 81% of the window in use and compaction at 90%. The counter turns amber once the border is behind you. A narrow terminal drops the border first, then the counts, then the figure itself.
 
 Compaction replaces the summarized turns in the session's on-disk log with the summary and keeps the preserved ones after it. The dropped turns are not lost: before the rewrite, Caudra parks the previous log at `sessions/archive/<session-id>/<n>.jsonl` in the [state directory](/docs/configuration/#directory-layout). It keeps the newest three per session, and at most 32 MB of them. The names count up, so the highest number is the newest.
 

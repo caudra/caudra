@@ -2018,6 +2018,7 @@ mod tests {
             base_tools: &base_tools,
             full_tools: &full_tools,
             projected_messages: &[],
+            measured: None,
             inventory: ContextInventory {
                 mcp: ContextMcpInventory::from_statuses(request.tool_inventory()),
                 ..ContextInventory::default()

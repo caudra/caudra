@@ -139,6 +139,16 @@ impl ContextWindow {
             },
         }
     }
+
+    /// Where auto-compaction fires. Equal to the window itself when it is off.
+    pub fn threshold(&self) -> u32 {
+        self.tokens.saturating_sub(self.reserve.tokens())
+    }
+
+    /// [`threshold`](Self::threshold), but only where it is a limit of its own.
+    pub fn compaction_border(&self) -> Option<u32> {
+        self.reserve.is_enabled().then(|| self.threshold())
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -167,12 +177,8 @@ impl ContextUsage {
         .fold(0, u32::saturating_add)
     }
 
-    pub fn threshold(&self, window: &ContextWindow) -> u32 {
-        window.tokens.saturating_sub(window.reserve.tokens())
-    }
-
     pub fn free(&self, window: &ContextWindow) -> u32 {
-        self.threshold(window).saturating_sub(self.used())
+        window.threshold().saturating_sub(self.used())
     }
 
     pub fn percentage(&self, window: &ContextWindow) -> u32 {
@@ -541,7 +547,20 @@ pub struct ContextSnapshot {
     pub model: ContextModel,
     pub window: ContextWindow,
     pub usage: ContextUsage,
+    /// The same request as [`usage`](Self::usage), but anchored on the count the
+    /// provider last charged. `None` until a response has been billed.
+    pub measured: Option<u32>,
     pub inventory: ContextInventory,
+}
+
+impl ContextSnapshot {
+    /// What to compare against the window. Prefers the provider's own count,
+    /// which is the one auto-compaction decides on; the estimate stands in only
+    /// until the first response arrives, and remains available beside it as the
+    /// per-category breakdown.
+    pub fn used(&self) -> u32 {
+        self.measured.unwrap_or_else(|| self.usage.used())
+    }
 }
 
 pub struct ContextCapture<'a> {
@@ -553,6 +572,7 @@ pub struct ContextCapture<'a> {
     pub base_tools: &'a Value,
     pub full_tools: &'a Value,
     pub projected_messages: &'a [Message],
+    pub measured: Option<u32>,
     pub inventory: ContextInventory,
 }
 
@@ -576,6 +596,7 @@ impl ContextSnapshot {
                 capture.compaction_buffer,
             ),
             usage: accounting.usage,
+            measured: capture.measured,
             inventory,
         }
     }
@@ -1254,6 +1275,7 @@ mod tests {
             base_tools: &base_tools,
             full_tools: &full_tools,
             projected_messages: &messages,
+            measured: None,
             inventory,
         });
 
@@ -1922,6 +1944,7 @@ mod tests {
             base_tools: &empty_tools,
             full_tools: &empty_tools,
             projected_messages: &[],
+            measured: None,
             inventory,
         });
         assert_eq!(snapshot.usage.memory, 0);
@@ -1971,7 +1994,7 @@ mod tests {
             tokens: window_tokens,
             reserve,
         };
-        assert_eq!(usage.threshold(&window), threshold);
+        assert_eq!(window.threshold(), threshold);
         assert_eq!(usage.free(&window), free);
         assert_eq!(usage.percentage(&window), percentage);
         assert_eq!(usage.over_window(&window), over_window);
@@ -1999,6 +2022,7 @@ mod tests {
                 reserve: ContextReserve::Disabled,
             },
             usage: ContextUsage::default(),
+            measured: None,
             inventory: ContextInventory::default(),
         }
     }

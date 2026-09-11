@@ -719,12 +719,19 @@ impl App {
     }
 
     pub(super) fn active_context_snapshot(&self) -> Option<Arc<ContextSnapshot>> {
-        let store = self.context_store.as_ref()?;
         if let Some(task_id) = self.active_subagent_id() {
-            return store.latest(&ContextKey::task(task_id));
+            return self
+                .context_store
+                .as_ref()?
+                .latest(&ContextKey::task(task_id));
         }
+        self.main_context_snapshot()
+    }
 
-        let snapshot = store.latest(&ContextKey::Main)?;
+    /// The main chat's snapshot, whatever chat is focused, and only while it
+    /// still describes the model in force.
+    pub(super) fn main_context_snapshot(&self) -> Option<Arc<ContextSnapshot>> {
+        let snapshot = self.context_store.as_ref()?.latest(&ContextKey::Main)?;
         if let Some(model_slot) = self.status_main_model() {
             return (snapshot.model.spec == model_slot.model.spec()
                 && snapshot.window.tokens == model_slot.model.context_window)
