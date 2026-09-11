@@ -7,8 +7,12 @@ pub use platform::OpenAi;
 
 use crate::model::{ModelEntry, ModelFamily, ModelPricing, StaticReasoningOption};
 
-const GPT_5_6_CONTEXT_WINDOW: u32 = 372_000;
-const GPT_5_6_MAX_OUTPUT_TOKENS: u32 = 128_000;
+/// Working window for the long-context OpenAI models: gpt-5.6 luna/terra/sol
+/// and the gpt-astra family. Deliberately below what the API accepts — astra
+/// alone advertises 1,050,000 — because the window is what caudra fills before
+/// compacting, and cost and latency scale with it.
+const WIDE_CONTEXT_WINDOW: u32 = 372_000;
+const WIDE_MAX_OUTPUT_TOKENS: u32 = 128_000;
 
 inventory::submit!(caudra_config::providers::BuiltInProvider {
     slug: "openai",
@@ -37,9 +41,35 @@ const EFFORT_TO_HIGH: &[StaticReasoningOption] = &[StaticReasoningOption::Effort
 /// The o-series predates the explicit opt-out, so it always reasons.
 const EFFORT_TO_HIGH_NO_NONE: &[StaticReasoningOption] =
     &[StaticReasoningOption::Effort(&["low", "medium", "high"])];
+/// The gpt-astra family reasons unconditionally, so it drops the `none` the
+/// gpt-5.6 ladder offers while keeping the rungs above it.
+const EFFORT_TO_MAX_NO_NONE: &[StaticReasoningOption] = &[StaticReasoningOption::Effort(&[
+    "low", "medium", "high", "xhigh", "max",
+])];
 
 pub(crate) const fn models() -> &'static [ModelEntry] {
     const MODELS: &[ModelEntry] = &[
+        ModelEntry {
+            prefixes: &["gpt-6-astra"],
+            small: false,
+            family: ModelFamily::Gpt,
+            vision: true,
+            default: false,
+            // The tier above 272k that models.dev publishes cannot be spelled
+            // here: this table is a const and a non-empty `tiers` is not
+            // const-constructible. `from_base` reads it from the catalog.
+            pricing: ModelPricing {
+                input: 10.00,
+                output: 50.00,
+                cache_write: 12.50,
+                cache_read: 1.00,
+                fast: None,
+                tiers: Vec::new(),
+            },
+            max_output_tokens: Some(WIDE_MAX_OUTPUT_TOKENS),
+            context_window: WIDE_CONTEXT_WINDOW,
+            reasoning_options: Some(EFFORT_TO_MAX_NO_NONE),
+        },
         ModelEntry {
             prefixes: &["gpt-5.6-luna"],
             small: true,
@@ -54,8 +84,8 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
                 fast: None,
                 tiers: Vec::new(),
             },
-            max_output_tokens: Some(GPT_5_6_MAX_OUTPUT_TOKENS),
-            context_window: GPT_5_6_CONTEXT_WINDOW,
+            max_output_tokens: Some(WIDE_MAX_OUTPUT_TOKENS),
+            context_window: WIDE_CONTEXT_WINDOW,
             reasoning_options: Some(EFFORT_WITH_MAX),
         },
         ModelEntry {
@@ -72,8 +102,8 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
                 fast: None,
                 tiers: Vec::new(),
             },
-            max_output_tokens: Some(GPT_5_6_MAX_OUTPUT_TOKENS),
-            context_window: GPT_5_6_CONTEXT_WINDOW,
+            max_output_tokens: Some(WIDE_MAX_OUTPUT_TOKENS),
+            context_window: WIDE_CONTEXT_WINDOW,
             reasoning_options: Some(EFFORT_WITH_MAX),
         },
         ModelEntry {
@@ -90,8 +120,8 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
                 fast: None,
                 tiers: Vec::new(),
             },
-            max_output_tokens: Some(GPT_5_6_MAX_OUTPUT_TOKENS),
-            context_window: GPT_5_6_CONTEXT_WINDOW,
+            max_output_tokens: Some(WIDE_MAX_OUTPUT_TOKENS),
+            context_window: WIDE_CONTEXT_WINDOW,
             reasoning_options: Some(EFFORT_WITH_MAX),
         },
         ModelEntry {
@@ -391,7 +421,7 @@ mod tests {
             .expect("GPT-5.6 model should be registered");
 
         assert_eq!(model.small, small);
-        assert_eq!(model.context_window, GPT_5_6_CONTEXT_WINDOW);
+        assert_eq!(model.context_window, WIDE_CONTEXT_WINDOW);
         assert_eq!(model.pricing.input, input);
         assert_eq!(model.pricing.cache_read, cache_read);
         assert_eq!(model.pricing.cache_write, cache_write);

@@ -31,7 +31,7 @@ pub(crate) const LONG_CONTEXT_WINDOW: u32 = 1_000_000;
 
 /// Long-context models accept 1M tokens natively, with no beta header. This is
 /// the working window we run them at, capped well below that ceiling to bound
-/// cost and latency, and aligned with `GPT_5_6_PLAN_CONTEXT_WINDOW`. Unlike the
+/// cost and latency, and aligned with `WIDE_PLAN_CONTEXT_WINDOW`. Unlike the
 /// 200k entries, it is an *input* budget: `max_output_tokens` is granted on top
 /// of it rather than carved out of it.
 pub(crate) const WIDE_CONTEXT_WINDOW: u32 = 372_000;

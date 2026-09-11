@@ -1,7 +1,8 @@
 use caudra_storage::thinking::ReasoningOptions;
 
-use crate::model::{ModelEntry, ModelFacts, ModelFamily, ModelPurpose};
+use crate::model::{ModelEntry, ModelFacts, ModelFamily, ModelPricing, ModelPurpose};
 use crate::pricing::PricingSchedule;
+use crate::providers::catalog::CatalogMetaView;
 use crate::providers::{
     anthropic, aperture, copilot, custom, deepseek, dynamic, google, llama_cpp, mistral, ollama,
     openai, openrouter, synthetic, tensorx, xai, zai,
@@ -27,15 +28,37 @@ pub struct ProviderManifest {
 }
 
 impl ProviderManifest {
-    /// Reasoning options models.dev publishes for this model. Never triggers a
-    /// fetch, so a cold catalog simply leaves the decision to the static table
-    /// and discovery.
-    pub fn catalog_reasoning_options(&self, model_id: &str) -> Option<ReasoningOptions> {
-        let slug = self.catalog_slug?;
-        crate::providers::catalog::model_meta_if_available(slug, model_id)
-            .map(|meta| meta.reasoning_options)
-            .filter(|options| !options.is_empty())
+    /// What models.dev publishes about this model. Never triggers a fetch, so a
+    /// cold catalog simply leaves every decision to the static table and
+    /// discovery. Returned whole rather than field by field because each lookup
+    /// takes the catalog guard and clones, and `Model::from_base` needs four of
+    /// them for the same model.
+    pub fn catalog_meta(&self, model_id: &str) -> Option<CatalogMetaView> {
+        crate::providers::catalog::model_meta_if_available(self.catalog_slug?, model_id)
     }
+}
+
+/// An entry the catalog has not classified carries an empty ladder, which must
+/// not outrank the static table's.
+pub(crate) fn catalog_reasoning_options(
+    meta: Option<&CatalogMetaView>,
+) -> Option<ReasoningOptions> {
+    meta.map(|meta| meta.reasoning_options.clone())
+        .filter(|options| !options.is_empty())
+}
+
+/// Rates models.dev publishes, including the tiers a static [`ModelEntry`]
+/// cannot carry: that table is a `const` and a non-empty `Vec` is not
+/// const-constructible.
+pub(crate) fn catalog_pricing(meta: Option<&CatalogMetaView>) -> Option<ModelPricing> {
+    meta.map(|meta| ModelPricing {
+        input: meta.input_price,
+        output: meta.output_price,
+        cache_write: meta.cache_write,
+        cache_read: meta.cache_read,
+        fast: None,
+        tiers: meta.pricing_tiers.clone(),
+    })
 }
 
 const ANTHROPIC: ProviderManifest = ProviderManifest {
@@ -363,10 +386,73 @@ impl ManifestRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::PricingTier;
     use crate::provider::ProviderKind;
     use caudra_config::providers::BuiltInProvider;
+    use caudra_storage::thinking::ReasoningOption;
     use std::str::FromStr;
     use strum::IntoEnumIterator;
+
+    const NO_CATALOG_NO_RATES: &str = "a cold catalog must not invent rates";
+    const TIERS_COME_FROM_CATALOG: &str =
+        "the static table cannot hold tiers, so the catalog is the only source";
+    const EMPTY_LADDER_IS_NOT_AN_ANSWER: &str =
+        "an unclassified catalog entry must not outrank the static ladder";
+
+    fn meta_with(reasoning_options: ReasoningOptions, tiers: Vec<PricingTier>) -> CatalogMetaView {
+        CatalogMetaView {
+            context: 922_000,
+            output: 128_000,
+            input_price: 10.0,
+            output_price: 50.0,
+            cache_read: 1.0,
+            cache_write: 12.5,
+            supports_thinking: true,
+            supports_vision: true,
+            reasoning_options,
+            pricing_tiers: tiers,
+        }
+    }
+
+    #[test]
+    fn catalog_pricing_is_absent_without_a_catalog() {
+        assert!(catalog_pricing(None).is_none(), "{NO_CATALOG_NO_RATES}");
+    }
+
+    #[test]
+    fn catalog_pricing_carries_rates_and_tiers() {
+        let tier = PricingTier {
+            above: 272_000,
+            input: 20.0,
+            output: 75.0,
+            cache_write: 25.0,
+            cache_read: 2.0,
+        };
+        let meta = meta_with(ReasoningOptions::default(), vec![tier]);
+
+        let pricing = catalog_pricing(Some(&meta)).expect(TIERS_COME_FROM_CATALOG);
+
+        assert_eq!(pricing.input, 10.0);
+        assert_eq!(pricing.tiers.len(), 1, "{TIERS_COME_FROM_CATALOG}");
+        assert_eq!(pricing.tiers[0].above, 272_000, "{TIERS_COME_FROM_CATALOG}");
+    }
+
+    #[test]
+    fn an_empty_catalog_ladder_does_not_answer() {
+        let meta = meta_with(ReasoningOptions::default(), Vec::new());
+        assert!(
+            catalog_reasoning_options(Some(&meta)).is_none(),
+            "{EMPTY_LADDER_IS_NOT_AN_ANSWER}"
+        );
+
+        let classified = meta_with(
+            ReasoningOptions::new(vec![ReasoningOption::Effort {
+                values: vec!["high".into()],
+            }]),
+            Vec::new(),
+        );
+        assert!(catalog_reasoning_options(Some(&classified)).is_some());
+    }
 
     #[test]
     fn every_builtin_manifest_with_provider_kind_matches_kind_fields() {

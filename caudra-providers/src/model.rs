@@ -15,7 +15,9 @@ use caudra_storage::thinking::{ReasoningOption, ReasoningOptions};
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
-use crate::manifest::{ManifestRegistry, ProviderManifest};
+use crate::manifest::{
+    ManifestRegistry, ProviderManifest, catalog_pricing, catalog_reasoning_options,
+};
 use crate::model_registry::{self, Binding};
 use crate::providers::{anthropic, custom, dynamic};
 use crate::types::ThinkingFields;
@@ -427,19 +429,34 @@ impl Model {
         });
         let discovered = discovered.as_ref();
         let family = inherited_lineage(manifest, slug, static_entry);
+        // One lookup feeds pricing, limits and the reasoning ladder below.
+        let catalog = manifest.catalog_meta(model_id);
+        let catalog = catalog.as_ref();
         let discovered_pricing = discovered.and_then(|info| info.pricing.as_ref());
+        // A static entry's rates win, but it cannot carry tiers, so the catalog
+        // still supplies those when the two describe the same model.
         let pricing = discovered_pricing
-            .or_else(|| static_entry.map(|entry| &entry.pricing))
             .cloned()
+            .or_else(|| {
+                static_entry.map(|entry| ModelPricing {
+                    tiers: catalog_pricing(catalog)
+                        .map(|catalog| catalog.tiers)
+                        .unwrap_or_default(),
+                    ..entry.pricing.clone()
+                })
+            })
+            .or_else(|| catalog_pricing(catalog))
             .unwrap_or_default();
         let max_output_tokens = discovered
             .and_then(|info| info.max_output_tokens)
             .or_else(|| static_entry.and_then(|entry| entry.max_output_tokens))
+            .or_else(|| catalog.map(|meta| meta.output))
             .or(manifest.fallback_max_output);
         let context_window = discovered
             .and_then(|info| info.context_window)
             .or_else(|| anthropic::shared::long_context_window(model_id))
             .or_else(|| static_entry.map(|entry| entry.context_window))
+            .or_else(|| catalog.map(|meta| meta.context))
             .unwrap_or(manifest.fallback_context_window);
         // The static entry wins over the catalog on purpose: it is where caudra
         // records what a *request* accepts, which is not always what the model
@@ -452,7 +469,7 @@ impl Model {
                     .and_then(|entry| entry.reasoning_options)
                     .map(reasoning_options_from_static)
             })
-            .or_else(|| manifest.catalog_reasoning_options(model_id))
+            .or_else(|| catalog_reasoning_options(catalog))
             .unwrap_or_default();
         Self {
             id: model_id.to_string(),
@@ -495,7 +512,7 @@ impl Model {
                 cache_write: meta.cache_write,
                 cache_read: meta.cache_read,
                 fast: None,
-                tiers: Vec::new(),
+                tiers: meta.pricing_tiers,
             },
             discovered_free: false,
             max_output_tokens: Some(meta.output),

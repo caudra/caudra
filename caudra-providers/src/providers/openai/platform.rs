@@ -10,15 +10,15 @@ use serde::Deserialize;
 use serde_json::Value;
 use tracing::{debug, info, warn};
 
-use crate::model::{Billing, Model};
+use crate::model::{Billing, Model, ModelInfo};
 use crate::provider::{BoxFuture, Provider};
 use crate::{
     AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse, UsageLimit,
 };
 
 use super::auth;
-use crate::providers::ResolvedAuth;
 use crate::providers::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
+use crate::providers::{ResolvedAuth, catalog};
 
 static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
     slug: "openai",
@@ -33,6 +33,7 @@ static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
 // Codex models are matched by their `-codex` substring in
 // `coding_plan_context_window`, so they never need listing here.
 pub(crate) const PLAN_MODELS: &[&str] = &[
+    "gpt-6-astra",
     "gpt-5.6-luna",
     "gpt-5.6-terra",
     "gpt-5.6-sol",
@@ -43,7 +44,10 @@ pub(crate) const PLAN_MODELS: &[&str] = &[
 ];
 
 const CODEX_PLAN_CONTEXT_WINDOW: u32 = 272_000;
-const GPT_5_6_PLAN_CONTEXT_WINDOW: u32 = 372_000;
+/// Plan window for the long-context families, gpt-5.6 and gpt-astra. Neither is
+/// published; `adjust_model` clamps to the smaller of this and the model's own
+/// window, so this only ever narrows what the static table already declared.
+const WIDE_PLAN_CONTEXT_WINDOW: u32 = 372_000;
 const USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const EMPTY_USAGE_ERROR: &str =
     "OpenAI usage response contained no plan or rate limits; the endpoint schema likely changed";
@@ -77,11 +81,32 @@ fn coding_plan_context_window(model_id: &str) -> Option<u32> {
     if !PLAN_MODELS.contains(&model_id) {
         return None;
     }
-    Some(if model_id.starts_with("gpt-5.6-") {
-        GPT_5_6_PLAN_CONTEXT_WINDOW
-    } else {
-        CODEX_PLAN_CONTEXT_WINDOW
-    })
+    Some(
+        if model_id.starts_with("gpt-5.6-") || model_id.starts_with("gpt-6-") {
+            WIDE_PLAN_CONTEXT_WINDOW
+        } else {
+            CODEX_PLAN_CONTEXT_WINDOW
+        },
+    )
+}
+
+/// Models an OAuth session may run. The subscription sells a different set to
+/// the metered API, and models.dev describes only the latter, so the catalog can
+/// widen the candidates but never decide entitlement: `is_codex_model` does.
+/// Drawing on it anyway means a new `-codex` release needs no edit here.
+fn coding_plan_models() -> Vec<ModelInfo> {
+    let statics = super::models()
+        .iter()
+        .flat_map(|e| e.prefixes.iter().copied());
+    let catalog = catalog::model_ids_if_available(CONFIG.slug);
+    let mut ids: Vec<String> = statics
+        .map(str::to_string)
+        .chain(catalog)
+        .filter(|id| is_codex_model(id))
+        .collect();
+    ids.sort();
+    ids.dedup();
+    ids.into_iter().map(ModelInfo::id_only).collect()
 }
 
 #[derive(Deserialize, Default)]
@@ -525,16 +550,10 @@ impl Provider for OpenAi {
         }
     }
 
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
+    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
         Box::pin(async move {
             if self.is_oauth() {
-                let models = super::models()
-                    .iter()
-                    .flat_map(|e| e.prefixes.iter())
-                    .filter(|id| is_codex_model(id))
-                    .map(|&s| crate::model::ModelInfo::id_only(s.to_string()))
-                    .collect();
-                return Ok(models);
+                return Ok(coding_plan_models());
             }
             self.with_oauth_retry(false, |auth| async move {
                 self.compat.do_list_models(&auth).await
@@ -637,18 +656,26 @@ mod tests {
     const TEST_REFRESH: &str = "test-refresh";
     const TEST_AUTH_STATUS: u16 = 401;
     const TEST_AUTH_ERROR: &str = "expired";
+    const MISSING_PLAN_MODEL: &str =
+        "a model named in PLAN_MODELS must reach the coding-plan listing";
+    const UNENTITLED_PLAN_MODEL: &str =
+        "the coding-plan listing offered a model the subscription cannot run";
+    const DUPLICATE_PLAN_MODEL: &str =
+        "a model both tabled and published by the catalog must be listed once";
 
     fn effort(level: &str) -> ThinkingConfig {
         ThinkingConfig::Effort(level.into())
     }
 
+    #[test_case("gpt-6-astra")]
     #[test_case("gpt-5.6-luna")]
     #[test_case("gpt-5.6-terra")]
     #[test_case("gpt-5.6-sol")]
-    fn gpt_5_6_models_use_coding_plan(model_id: &str) {
+    fn named_plan_models_use_coding_plan(model_id: &str) {
         assert!(is_codex_model(model_id));
     }
 
+    #[test_case("gpt-6-astra", Some(372_000))]
     #[test_case("gpt-5.6-luna", Some(372_000))]
     #[test_case("gpt-5.6-terra", Some(372_000))]
     #[test_case("gpt-5.6-sol", Some(372_000))]
@@ -656,9 +683,31 @@ mod tests {
     #[test_case("gpt-5.3-codex", Some(272_000))]
     #[test_case("gpt-5.7-codex", Some(272_000) ; "unlisted codex model still routes")]
     #[test_case("gpt-5.6-terra-preview", None ; "non-codex near-match is rejected")]
+    #[test_case("gpt-6-astra-preview", None ; "non-codex gpt-6 near-match is rejected")]
     #[test_case("gpt-5.4-nano", None)]
     fn coding_plan_context_window_resolves_plan_models(model_id: &str, expected: Option<u32>) {
         assert_eq!(coding_plan_context_window(model_id), expected);
+    }
+
+    /// The OAuth listing draws on models.dev to pick up releases the static
+    /// table has not reached, but the catalog describes the metered API. An id
+    /// it publishes that the subscription cannot run must not be offered.
+    #[test]
+    fn the_coding_plan_listing_offers_only_entitled_models() {
+        let ids: Vec<String> = coding_plan_models().into_iter().map(|m| m.id).collect();
+
+        assert!(
+            ids.iter().any(|id| id == "gpt-6-astra"),
+            "{MISSING_PLAN_MODEL}"
+        );
+        assert!(
+            ids.iter().all(|id| is_codex_model(id)),
+            "{UNENTITLED_PLAN_MODEL}"
+        );
+        assert!(
+            ids.windows(2).all(|pair| pair[0] != pair[1]),
+            "{DUPLICATE_PLAN_MODEL}"
+        );
     }
 
     #[test]

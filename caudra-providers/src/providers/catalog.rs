@@ -223,8 +223,12 @@ impl CatalogMeta {
         let cost = model.cost.as_ref();
         let limit = model.limit.as_ref();
         Self {
+            // `input` is the real prompt budget where the catalog distinguishes
+            // it, and `context` counts the output allowance too. Caudra measures
+            // a conversation against this, so taking the total would overstate
+            // what fits by however much the model may reply.
             context: limit
-                .and_then(|l| l.context)
+                .and_then(|l| l.input.or(l.context))
                 .unwrap_or(FALLBACK_CATALOG_CONTEXT),
             output: limit
                 .and_then(|l| l.output)
@@ -401,6 +405,13 @@ impl CatalogData {
 
     fn meta(&self, provider: &str, model_id: &str) -> Option<&CatalogMeta> {
         self.metadata.get(provider)?.get(model_id)
+    }
+
+    fn model_ids(&self, provider: &str) -> Vec<String> {
+        self.metadata
+            .get(provider)
+            .map(|models| models.keys().cloned().collect())
+            .unwrap_or_default()
     }
 
     pub(crate) fn lookup(
@@ -984,6 +995,23 @@ pub fn model_meta_if_available(slug: &str, model_id: &str) -> Option<CatalogMeta
     guard.meta(slug, model_id).map(CatalogMetaView::from)
 }
 
+/// Every model id models.dev publishes for a provider, only if the catalog has
+/// already been downloaded. Never triggers a fetch, so a cold catalog yields an
+/// empty list and callers fall back to whatever they knew statically.
+///
+/// The ids are what the catalog *describes*, not what the caller is entitled to
+/// run: a provider selling both a metered API and a subscription appears here as
+/// one list. Filter before offering them.
+pub fn model_ids_if_available(slug: &str) -> Vec<String> {
+    let Some(catalog) = SHARED_CATALOG.get() else {
+        return Vec::new();
+    };
+    let Ok(guard) = catalog.lock() else {
+        return Vec::new();
+    };
+    guard.model_ids(slug)
+}
+
 /// True when the model is an OpenCode-family catalog entry that is free by
 /// the same [`is_free_model`] definition gating `enable_free_models` (zero
 /// input and output price). Never triggers a fetch.
@@ -1358,6 +1386,47 @@ mod tests {
         assert_eq!(model.limit.as_ref().unwrap().context, Some(64000));
         assert!(model.cost.is_none());
         assert!(model.provider.is_none());
+    }
+
+    const PROMPT_BUDGET_IS_INPUT: &str =
+        "a catalog model that distinguishes input from context must budget on input";
+    const TIERS_SURVIVE_THE_VIEW: &str =
+        "tiered rates must reach the model, or a long prompt bills at the base rate";
+
+    /// models.dev publishes both a total window and, for a sixth of the catalog,
+    /// the prompt budget inside it. Only the latter is what a conversation is
+    /// measured against.
+    #[test_case(
+        r#"{"limit": {"context": 1050000, "input": 922000, "output": 128000}}"#, 922_000
+        ; "input wins where the catalog distinguishes it"
+    )]
+    #[test_case(
+        r#"{"limit": {"context": 200000, "output": 64000}}"#, 200_000
+        ; "context is the budget where no input is published"
+    )]
+    #[test_case(r#"{}"#, crate::providers::catalog::FALLBACK_CATALOG_CONTEXT ; "no limits at all falls back")]
+    fn catalog_meta_budgets_the_prompt_not_the_total(json: &str, expected: u32) {
+        let model: super::schema::CatalogModel = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            CatalogMeta::from_model(&model).context,
+            expected,
+            "{PROMPT_BUDGET_IS_INPUT}"
+        );
+    }
+
+    #[test]
+    fn catalog_meta_view_carries_pricing_tiers() {
+        let model: super::schema::CatalogModel = serde_json::from_str(
+            r#"{"cost": {"input": 10.0, "output": 50.0,
+                 "tiers": [{"input": 20.0, "output": 75.0, "tier": {"size": 272000}}]}}"#,
+        )
+        .unwrap();
+
+        let view = super::CatalogMetaView::from(&CatalogMeta::from_model(&model));
+        let tier = view.pricing_tiers.first().expect(TIERS_SURVIVE_THE_VIEW);
+
+        assert_eq!(tier.above, 272_000, "{TIERS_SURVIVE_THE_VIEW}");
+        assert_eq!(tier.input, 20.0, "{TIERS_SURVIVE_THE_VIEW}");
     }
 
     #[test]
