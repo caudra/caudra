@@ -841,6 +841,7 @@ dependencies = [
  "base64 0.23.1",
  "bitflags 2.13.1",
  "caudra-config",
+ "caudra-diff",
  "caudra-otel",
  "caudra-providers",
  "caudra-storage",
@@ -902,6 +903,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "caudra-diff"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "similar",
+ "test-case",
 ]
 
 [[package]]
@@ -1130,6 +1140,7 @@ dependencies = [
  "base64 0.23.1",
  "caudra-agent",
  "caudra-config",
+ "caudra-diff",
  "caudra-highlight",
  "caudra-lua",
  "caudra-markdown",
@@ -1174,6 +1185,7 @@ dependencies = [
 name = "caudra-workbench"
 version = "0.1.0"
 dependencies = [
+ "caudra-diff",
  "caudra-highlight",
  "crossterm",
  "flume",
@@ -1188,7 +1200,6 @@ dependencies = [
  "nucleo",
  "ratatui",
  "serde",
- "similar",
  "syntect",
  "tempfile",
  "test-case",

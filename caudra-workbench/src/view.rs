@@ -18,6 +18,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::editor::{DiffKind, Editor, Tab, VisualRow, render};
 use crate::fs::tree::{GitMark, Row as TreeRow};
 use crate::menu::{Item, Menu};
+use crate::scm::diff::DiffRow;
 use crate::scm::graph::Rail;
 use crate::scm::repo::{Change, Commit};
 use crate::scm::tree::{Dir, SEPARATOR};
@@ -67,6 +68,15 @@ const DEPTH_INDENT: usize = 2;
 /// deep row says which folder it belongs to.
 const GUIDE: &str = "\u{2502} ";
 const GUTTER_GAP: u16 = 1;
+/// The columns a diff pane needs before a second gutter of line numbers is
+/// worth what it takes away from the code.
+const MIN_CODE_COLUMNS: u16 = 60;
+const MARK_UNCHANGED: char = ' ';
+const MARK_REMOVED: char = '-';
+const MARK_ADDED: char = '+';
+/// A line the alignment matched whose whitespace moved. Neither side of it is
+/// new, so neither `-` nor `+` describes it.
+const MARK_REINDENTED: char = '~';
 const CONFLICT_NOTICE: &str = "Changed on disk since it was opened";
 const FIND_PROMPT: &str = "Find: ";
 const GOTO_PROMPT: &str = "Go to line: ";
@@ -825,7 +835,10 @@ impl Workbench {
         }
 
         let lines = tab.buffer.line_count();
-        let gutter = digits(lines) + GUTTER_GAP;
+        let columns = tab
+            .diff_rows()
+            .map(|rows| DiffColumns::for_pane(rows, area.width));
+        let gutter = columns.map_or_else(|| digits(lines) + GUTTER_GAP, DiffColumns::width);
         let [numbers, text] =
             Layout::horizontal([Constraint::Length(gutter), Constraint::Min(1)]).areas(area);
         // Taken off the text rather than the gutter, and taken from the rect
@@ -842,12 +855,11 @@ impl Workbench {
         let last = rows.last().map_or(0, |row| row.line + 1);
         tab.highlight(first, last);
         let tab = &*tab;
-        let segments = tab.segments(first, last);
         for (offset, row) in rows.iter().enumerate() {
             chrome::render_line(
                 buf,
                 line_at(numbers, offset),
-                gutter_row(tab, *row, &self.styles, focused, gutter),
+                gutter_row(tab, *row, &self.styles, focused, gutter, columns),
             );
             chrome::render_line(
                 buf,
@@ -855,7 +867,7 @@ impl Workbench {
                 text_row(
                     tab,
                     row.line,
-                    segments.get(row.line - first).map(Vec::as_slice),
+                    tab.colours(row.line, first, last),
                     &self.styles,
                     focused,
                     (row.start, row.span),
@@ -1746,29 +1758,92 @@ fn git_style(mark: GitMark, styles: &WorkbenchStyles) -> Style {
 /// The line number, or the blank that stands in its place where a wrapped line
 /// carries on. Both are the same width in the same style, so a continuation
 /// reads as part of the line above rather than as a line of its own.
+///
+/// A diff tab numbers the file rather than the rendered column, and says with a
+/// marker which side each number belongs to. Given the room it shows both
+/// sides, the way a side-by-side diff does.
 fn gutter_row(
     tab: &Tab,
     row: VisualRow,
     styles: &WorkbenchStyles,
     focused: bool,
     width: u16,
+    columns: Option<DiffColumns>,
 ) -> Line<'static> {
-    let style = match focused && tab.buffer.cursor().line == row.line {
-        true => styles.text,
-        false => match tab.diff_kinds().is_some() {
-            true => styles.diff_line_nr,
-            false => styles.gutter,
-        },
+    let on_cursor = focused && tab.buffer.cursor().line == row.line;
+    let diff = tab.diff_rows().and_then(|rows| rows.get(row.line));
+    let style = match (on_cursor, diff.is_some()) {
+        (true, _) => styles.text,
+        (false, true) => styles.diff_line_nr,
+        (false, false) => styles.gutter,
     };
-    let number = match row.index {
-        0 => (row.line + 1).to_string(),
-        _ => String::new(),
+    let text = match (diff, columns) {
+        (Some(diff), Some(columns)) if row.index == 0 => diff_gutter(diff, columns),
+        (Some(_), _) => " ".repeat(width as usize),
+        _ => {
+            let number = match row.index {
+                0 => (row.line + 1).to_string(),
+                _ => String::new(),
+            };
+            let gap = GUTTER_GAP as usize;
+            format!("{number:>inner$}{:gap$}", "", inner = width as usize - gap)
+        }
+    };
+    Line::from(Span::styled(text, style))
+}
+
+/// How a diff tab spends its gutter. Two columns of numbers say which line each
+/// side of a change sits on, the way a side-by-side diff does, but they cost
+/// the code the room to read; a narrow pane gets one column and leans on the
+/// marker to say which side the number belongs to.
+#[derive(Clone, Copy)]
+enum DiffColumns {
+    Both(u16),
+    One(u16),
+}
+
+impl DiffColumns {
+    fn for_pane(rows: &[DiffRow], pane: u16) -> Self {
+        let widest = |pick: fn(&DiffRow) -> Option<usize>| {
+            digits(rows.iter().filter_map(pick).max().unwrap_or(1))
+        };
+        let inner = widest(|row| row.before).max(widest(|row| row.after));
+        let both = Self::Both(inner);
+        match pane.saturating_sub(both.width()) >= MIN_CODE_COLUMNS {
+            true => both,
+            false => Self::One(inner),
+        }
+    }
+
+    fn width(self) -> u16 {
+        match self {
+            Self::Both(inner) => inner * 2 + 3 + GUTTER_GAP,
+            Self::One(inner) => inner + 2 + GUTTER_GAP,
+        }
+    }
+}
+
+fn diff_gutter(row: &DiffRow, columns: DiffColumns) -> String {
+    let mark = match row.kind {
+        DiffKind::Added => MARK_ADDED,
+        DiffKind::Removed => MARK_REMOVED,
+        DiffKind::Reindented => MARK_REINDENTED,
+        DiffKind::Context | DiffKind::Header => MARK_UNCHANGED,
+    };
+    let number = |line: Option<usize>, width: u16| match line {
+        Some(line) => format!("{line:>width$}", width = width as usize),
+        None => " ".repeat(width as usize),
+    };
+    let body = match columns {
+        DiffColumns::Both(inner) => format!(
+            "{} {} {mark}",
+            number(row.before, inner),
+            number(row.after, inner)
+        ),
+        DiffColumns::One(inner) => format!("{} {mark}", number(row.before.or(row.after), inner)),
     };
     let gap = GUTTER_GAP as usize;
-    Line::from(Span::styled(
-        format!("{number:>width$}{:gap$}", "", width = width as usize - gap),
-        style,
-    ))
+    format!("{body}{:gap$}", "")
 }
 
 /// The base colour of a row, its syntax segments and everything painted over
@@ -1781,18 +1856,33 @@ fn text_row(
     focused: bool,
     window: (usize, usize),
 ) -> Line<'static> {
-    let base = match tab.diff_kinds().and_then(|kinds| kinds.get(line)) {
-        Some(DiffKind::Added) => styles.diff_new,
-        Some(DiffKind::Removed) => styles.diff_old,
-        Some(DiffKind::Header) => styles.title,
-        _ => styles.text,
+    let diff = tab.diff_rows().and_then(|rows| rows.get(line));
+    let (base, fill) = match diff.map(|row| row.kind) {
+        Some(DiffKind::Added | DiffKind::Reindented) => (styles.diff_new, Some(styles.diff_new)),
+        Some(DiffKind::Removed) => (styles.diff_old, Some(styles.diff_old)),
+        Some(DiffKind::Header) => (styles.title, None),
+        _ => (styles.text, None),
     };
 
-    let mut overlays = Vec::new();
+    // Emphasis goes down first so a find match and the selection still paint
+    // over it: what the reader asked to see outranks what the diff points at.
+    let mut overlays: Vec<(Range<usize>, Style)> = diff
+        .into_iter()
+        .flat_map(|row| row.emphasis.iter().cloned())
+        .map(|range| {
+            (
+                range,
+                match diff.map(|row| row.kind) {
+                    Some(DiffKind::Removed) => styles.diff_old_emphasis,
+                    _ => styles.diff_new_emphasis,
+                },
+            )
+        })
+        .collect();
     let current = tab.find.current();
     for found in tab.find.on_line(line) {
         let style = match Some(*found) == current {
-            true => styles.diff_new_emphasis,
+            true => styles.current_match,
             false => styles.match_highlight,
         };
         overlays.push((found.start..found.end, style));
@@ -1816,6 +1906,7 @@ fn text_row(
         text: tab.buffer.line(line),
         segments,
         base,
+        fill,
         overlays: &overlays,
     }
     .paint(window.0, window.1)
@@ -1862,10 +1953,11 @@ mod tests {
 
     use super::menu_panel;
     use super::{
-        CHANGE_TRAILING, Control, Editor, Focus, GitMark, MENU_MARK, ScmRow, Section, SidebarView,
-        Style, Tab, TabHit, TabPart, Toggle, TreeRow, Workbench, WorkbenchStyles, control_at,
-        header_at, keys, on_menu_mark, scm_controls, scroll_column, tab_at, toggle_at, tree_row,
-        tree_style, visible_range,
+        CHANGE_TRAILING, Control, DiffColumns, DiffKind, DiffRow, Editor, Focus, GitMark,
+        MENU_MARK, MIN_CODE_COLUMNS, ScmRow, Section, SidebarView, Style, Tab, TabHit, TabPart,
+        Toggle, TreeRow, Workbench, WorkbenchStyles, control_at, diff_gutter, header_at, keys,
+        on_menu_mark, scm_controls, scroll_column, tab_at, toggle_at, tree_row, tree_style,
+        visible_range,
     };
     use crate::fs::tree::EntryKind;
     use crate::menu::Menu;
@@ -1902,6 +1994,55 @@ mod tests {
         Rect::new(x, 0, 80, 1)
     }
 
+    const GUTTER_SIDES: &str = "a diff gutter names the file's lines, not the column's";
+    const GUTTER_ROOM: &str = "a gutter must not grow past the room the pane has for code";
+
+    fn numbered(before: Option<usize>, after: Option<usize>, kind: DiffKind) -> DiffRow {
+        DiffRow {
+            before,
+            after,
+            kind,
+            ..DiffRow::default()
+        }
+    }
+
+    #[test_case(Some(9), Some(12), DiffKind::Context, "  9  12   " ; "context numbers both")]
+    #[test_case(Some(9), None, DiffKind::Removed, "  9     - " ; "a removal numbers the before side")]
+    #[test_case(None, Some(12), DiffKind::Added, "     12 + " ; "an addition numbers the after side")]
+    #[test_case(Some(9), Some(12), DiffKind::Reindented, "  9  12 ~ " ; "a reindent is neither")]
+    fn a_wide_diff_gutter_numbers_both_sides(
+        before: Option<usize>,
+        after: Option<usize>,
+        kind: DiffKind,
+        expected: &str,
+    ) {
+        let rows = [numbered(Some(999), Some(12), DiffKind::Context)];
+        let columns = DiffColumns::for_pane(&rows, 120);
+
+        assert_eq!(
+            diff_gutter(&numbered(before, after, kind), columns),
+            expected,
+            "{GUTTER_SIDES}"
+        );
+    }
+
+    #[test_case(120, "  9 - " ; "a wide pane still fits one column when both would not")]
+    #[test_case(40, "  9 - " ; "a narrow pane spends its columns on the code")]
+    fn a_narrow_diff_gutter_numbers_the_side_the_marker_names(pane: u16, expected: &str) {
+        let rows = [numbered(Some(999), Some(999), DiffKind::Context)];
+        let columns = DiffColumns::for_pane(&rows, pane);
+        let painted = diff_gutter(&numbered(Some(9), None, DiffKind::Removed), columns);
+
+        assert!(
+            columns.width() + MIN_CODE_COLUMNS <= pane || matches!(columns, DiffColumns::One(_)),
+            "{GUTTER_ROOM}"
+        );
+        assert_eq!(painted.len(), columns.width() as usize, "{GUTTER_ROOM}");
+        if pane < 60 {
+            assert_eq!(painted, expected, "{GUTTER_SIDES}");
+        }
+    }
+
     /// Two two-column titles, so every tab spans ` ab \u{d7} ` and the second
     /// starts where the first ended.
     fn editor(dirty: bool) -> Editor {
@@ -1910,8 +2051,7 @@ mod tests {
             let mut tab = Tab::synthetic(
                 Path::new(title),
                 title.to_owned(),
-                vec![String::new()],
-                Vec::new(),
+                vec![DiffRow::default()],
                 0,
             );
             if dirty {

@@ -1614,6 +1614,24 @@ mod tests {
         }
     }
 
+    const BODY_IDENTITY: &str = "a body line is the indent plus what the renderer was told it had, or a filled diff row wraps";
+
+    /// A diff row is padded to the width the limits carry, and every body line
+    /// is then prefixed with the indent. The two must add back up to the width
+    /// the card paints into, or each filled row wraps and the diff doubles.
+    #[test_case(120 ; "wide")]
+    #[test_case(40 ; "narrow")]
+    #[test_case(1 ; "narrower than the indent")]
+    fn the_body_width_and_its_indent_account_for_the_card(width: u16) {
+        let body = test_rctx(width).limits_for(None, false, 0).width;
+
+        assert_eq!(
+            body.saturating_add(TOOL_BODY_INDENT_WIDTH),
+            width.max(TOOL_BODY_INDENT_WIDTH),
+            "{BODY_IDENTITY}"
+        );
+    }
+
     fn exp(full: bool) -> Disclosure {
         Disclosure {
             full,

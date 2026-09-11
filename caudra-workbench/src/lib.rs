@@ -615,7 +615,7 @@ impl Workbench {
         let mut tabs = Vec::new();
         let mut active = 0;
         for (index, tab) in self.editor.tabs().iter().enumerate() {
-            if tab.diff_kinds().is_some() {
+            if tab.diff_rows().is_some() {
                 continue;
             }
             if index == active_tab {
@@ -2225,8 +2225,7 @@ impl Workbench {
         self.editor.push(Tab::synthetic(
             &change.path,
             title,
-            rendered.lines,
-            rendered.kinds,
+            rendered.rows,
             self.theme_generation,
         ));
         self.focus = Focus::Editor;
@@ -2255,8 +2254,7 @@ impl Workbench {
         self.editor.push(Tab::synthetic(
             &workdir,
             title,
-            rendered.lines,
-            rendered.kinds,
+            rendered.rows,
             self.theme_generation,
         ));
         self.focus = Focus::Editor;
@@ -4164,7 +4162,7 @@ mod tests {
 
         let tab = workbench.editor.active().expect("a diff tab");
         assert!(!tab.is_editable(), "{DIFF_EDITABLE}");
-        assert!(tab.diff_kinds().is_some(), "{DIFF_EDITABLE}");
+        assert!(tab.diff_rows().is_some(), "{DIFF_EDITABLE}");
         assert_eq!(workbench.focus(), Focus::Editor, "{WRONG_PANE}");
     }
 
@@ -4411,7 +4409,7 @@ mod tests {
                 .editor
                 .active()
                 .expect(NO_TAB)
-                .diff_kinds()
+                .diff_rows()
                 .is_none(),
             "{CONTROL_IGNORED}: a diff opened instead of the file"
         );
@@ -4525,7 +4523,7 @@ mod tests {
                 .editor
                 .active()
                 .expect(NO_TAB)
-                .diff_kinds()
+                .diff_rows()
                 .is_none(),
             "{CONTROL_IGNORED}: a diff opened instead of the file"
         );
@@ -4914,7 +4912,7 @@ mod tests {
                 .editor
                 .active()
                 .expect(NO_TAB)
-                .diff_kinds()
+                .diff_rows()
                 .is_some(),
             "{WRONG_ROW}"
         );
@@ -5011,7 +5009,7 @@ mod tests {
         workbench.handle_key(key(KeyCode::Enter));
 
         let tab = workbench.editor.active().expect("a commit tab");
-        assert!(tab.diff_kinds().is_some(), "{DIFF_EDITABLE}");
+        assert!(tab.diff_rows().is_some(), "{DIFF_EDITABLE}");
         assert!(!tab.is_editable(), "{DIFF_EDITABLE}");
         assert!(tab.title.contains("initial"), "{DIFF_EDITABLE}");
     }
@@ -5287,7 +5285,7 @@ mod tests {
                 .editor
                 .active()
                 .expect("a tab")
-                .diff_kinds()
+                .diff_rows()
                 .is_some(),
             "{WRONG_LAYOUT}"
         );

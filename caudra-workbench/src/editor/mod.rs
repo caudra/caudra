@@ -18,14 +18,21 @@ use highlight::ViewportHighlighter;
 use history::History;
 
 use crate::fs::read::{self, LineEnding, LoadError, ReadOnly, SaveError};
+use crate::scm::diff::DiffRow;
 
 /// What a line is, in a diff tab. A source tab has none of these and is
-/// syntax-highlighted instead. Source control is what produces them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// syntax-highlighted from its own buffer instead. Source control is what
+/// produces them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum DiffKind {
+    #[default]
     Context,
     Added,
     Removed,
+    /// Matched on both sides, but its whitespace moved. Neither added nor
+    /// removed, so it is tinted like the side it now reads as and marked apart
+    /// from both.
+    Reindented,
     Header,
 }
 
@@ -41,7 +48,7 @@ pub struct Tab {
     /// Set when the file could not be opened as text. The tab shows the reason
     /// rather than a buffer of replacement characters.
     notice: Option<ReadOnly>,
-    diff_kinds: Option<Vec<DiffKind>>,
+    diff_rows: Option<Vec<DiffRow>>,
     modified: Option<SystemTime>,
     /// The file changed underneath an edited buffer. Neither copy can be thrown
     /// away without being asked, so the tab says so and waits.
@@ -80,7 +87,7 @@ impl Tab {
             line_ending: loaded.line_ending,
             trailing_newline: loaded.trailing_newline,
             notice: loaded.read_only,
-            diff_kinds: None,
+            diff_rows: None,
             modified: loaded.modified,
             conflict: false,
             preview: false,
@@ -100,21 +107,20 @@ impl Tab {
     pub fn synthetic(
         path: &Path,
         title: String,
-        lines: Vec<String>,
-        kinds: Vec<DiffKind>,
+        rows: Vec<DiffRow>,
         theme_generation: u64,
     ) -> Self {
         Self {
             title,
             path: path.to_path_buf(),
-            buffer: Buffer::new(lines),
+            buffer: Buffer::new(rows.iter().map(|row| row.text.clone()).collect()),
             find: Find::default(),
             history: History::default(),
             highlighter: ViewportHighlighter::new(&path.to_string_lossy(), theme_generation),
             line_ending: LineEnding::default(),
             trailing_newline: true,
             notice: None,
-            diff_kinds: Some(kinds),
+            diff_rows: Some(rows),
             modified: None,
             conflict: false,
             preview: false,
@@ -135,15 +141,15 @@ impl Tab {
     }
 
     pub fn is_editable(&self) -> bool {
-        self.notice.is_none() && self.diff_kinds.is_none()
+        self.notice.is_none() && self.diff_rows.is_none()
     }
 
     pub fn notice(&self) -> Option<ReadOnly> {
         self.notice
     }
 
-    pub fn diff_kinds(&self) -> Option<&[DiffKind]> {
-        self.diff_kinds.as_deref()
+    pub fn diff_rows(&self) -> Option<&[DiffRow]> {
+        self.diff_rows.as_deref()
     }
 
     pub fn is_dirty(&self) -> bool {
@@ -176,15 +182,27 @@ impl Tab {
     /// Works out the syntax colours for the rows about to be drawn. A diff tab
     /// is coloured by its [`DiffKind`]s instead, so it asks for none.
     pub fn highlight(&mut self, first: usize, last: usize) {
-        if self.diff_kinds.is_none() {
+        if self.diff_rows.is_none() {
             self.highlighter.fill(self.buffer.lines(), first, last);
         }
     }
 
-    /// The colours [`Self::highlight`] worked out, borrowed rather than copied
-    /// out so a frame costs no allocation.
-    pub fn segments(&self, first: usize, last: usize) -> &[Vec<StyledSegment>] {
-        self.highlighter.cached(first, last)
+    /// The colours for one buffer line, borrowed rather than copied out so a
+    /// frame costs no allocation.
+    ///
+    /// A diff tab carries its own, worked out per side when the tab was built,
+    /// because its rows are not its file's rows and a single highlighter run
+    /// over the rendered column would read a removal and its replacement as
+    /// consecutive code.
+    pub fn colours(&self, line: usize, first: usize, last: usize) -> Option<&[StyledSegment]> {
+        match &self.diff_rows {
+            Some(rows) => rows.get(line).map(|row| row.segments.as_slice()),
+            None => self
+                .highlighter
+                .cached(first, last)
+                .get(line - first)
+                .map(Vec::as_slice),
+        }
     }
 
     /// Counts changes to the text, so a caller can tell a motion from an edit
@@ -604,7 +622,7 @@ impl Editor {
 #[cfg(test)]
 mod tests {
     use super::buffer::Cursor;
-    use super::{DiffKind, Editor, Tab};
+    use super::{DiffKind, DiffRow, Editor, Tab};
     use std::fs;
     use tempfile::TempDir;
 
@@ -614,6 +632,7 @@ mod tests {
     const NO_CLOBBER: &str = "a dirty buffer must not be replaced by what is on disk";
     const NO_ACTIVE: &str = "the tab just pushed must be the active one";
     const DIFF_READ_ONLY: &str = "a diff is not a file and must never be written back";
+    const BUFFER_IS_THE_LINE: &str = "a diff row's buffer text is the line, not the patch line";
 
     fn fixture() -> (TempDir, std::path::PathBuf) {
         let tmp = TempDir::new().unwrap();
@@ -781,32 +800,30 @@ mod tests {
         assert_eq!(editor.tabs().len(), 1);
     }
 
+    fn diff_row(text: &str, kind: DiffKind) -> DiffRow {
+        DiffRow {
+            text: text.to_owned(),
+            kind,
+            ..DiffRow::default()
+        }
+    }
+
     #[test]
-    fn a_synthetic_tab_carries_its_diff_kinds_and_refuses_to_be_edited() {
+    fn a_synthetic_tab_carries_its_diff_rows_and_refuses_to_be_edited() {
         let (_tmp, path) = fixture();
         let mut editor = Editor::default();
-        let tab = Tab::synthetic(
-            &path,
-            "main.rs (diff)".to_owned(),
-            vec![
-                "@@ -1 +1 @@".to_owned(),
-                " same".to_owned(),
-                "-old".to_owned(),
-                "+new".to_owned(),
-            ],
-            vec![
-                DiffKind::Header,
-                DiffKind::Context,
-                DiffKind::Removed,
-                DiffKind::Added,
-            ],
-            0,
-        );
-        editor.push(tab);
+        let rows = vec![
+            diff_row("@@ -1 +1 @@", DiffKind::Header),
+            diff_row("same", DiffKind::Context),
+            diff_row("old", DiffKind::Removed),
+            diff_row("new", DiffKind::Added),
+        ];
+        editor.push(Tab::synthetic(&path, "main.rs (diff)".to_owned(), rows, 0));
 
         let tab = editor.active().expect(NO_ACTIVE);
         assert!(!tab.is_editable(), "{DIFF_READ_ONLY}");
-        assert_eq!(tab.diff_kinds().map(<[DiffKind]>::len), Some(4));
+        assert_eq!(tab.diff_rows().map(<[DiffRow]>::len), Some(4));
+        assert_eq!(tab.buffer.line(2), "old", "{BUFFER_IS_THE_LINE}");
         assert!(tab.notice().is_none(), "a diff is shown, not refused");
 
         assert!(
@@ -825,8 +842,7 @@ mod tests {
         editor.push(Tab::synthetic(
             &path,
             "main.rs (diff)".to_owned(),
-            vec!["+new".to_owned()],
-            vec![DiffKind::Added],
+            vec![diff_row("new", DiffKind::Added)],
             0,
         ));
 

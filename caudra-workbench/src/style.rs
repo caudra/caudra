@@ -36,6 +36,8 @@ pub struct WorkbenchStyles {
     pub diff_new_emphasis: Style,
     pub diff_line_nr: Style,
     pub match_highlight: Style,
+    /// The match the cursor is on, told apart from the rest of them.
+    pub current_match: Style,
     pub agent_touched: Style,
 }
 
@@ -64,12 +66,15 @@ impl Default for WorkbenchStyles {
             git_deleted: Style::default().fg(Color::Red),
             git_untracked: Style::default().fg(Color::Green),
             git_conflicted: Style::default().fg(Color::Red),
-            diff_old: Style::default().fg(Color::Red),
-            diff_new: Style::default().fg(Color::Green),
-            diff_old_emphasis: Style::default().fg(Color::Red).bg(Color::DarkGray),
-            diff_new_emphasis: Style::default().fg(Color::Green).bg(Color::DarkGray),
+            // Backgrounds, not foregrounds: a diff row is a band the syntax
+            // colours show through, so a foreground here would erase them.
+            diff_old: Style::default().bg(Color::Rgb(0x3d, 0x1c, 0x1c)),
+            diff_new: Style::default().bg(Color::Rgb(0x1c, 0x30, 0x20)),
+            diff_old_emphasis: Style::default().bg(Color::Rgb(0x5c, 0x2a, 0x2a)),
+            diff_new_emphasis: Style::default().bg(Color::Rgb(0x2a, 0x4a, 0x30)),
             diff_line_nr: dim,
             match_highlight: Style::default().fg(Color::Black).bg(Color::Yellow),
+            current_match: Style::default().fg(Color::Black).bg(Color::Cyan),
             agent_touched: Style::default().fg(Color::Magenta),
         }
     }

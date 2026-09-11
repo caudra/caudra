@@ -7,7 +7,6 @@ use crate::theme;
 
 use super::tool_display::{batch_sigil_style, compact_args_for, compact_sigil_label, header_spans};
 use super::{ToolProgress, is_collapsible, workflow_card};
-use caudra_agent::diff::{DiffHunk, DiffLine, DiffSpan, compute_hunks};
 use caudra_agent::types::Answer;
 use caudra_agent::types::{TodoItem, TodoStatus};
 use caudra_agent::{
@@ -16,10 +15,12 @@ use caudra_agent::{
     InstructionBlock, PatchedFile, SearchCap, SubagentProgress, ToolInput, ToolOutput,
 };
 use caudra_config::ToolOutputLines;
+use caudra_diff::{DiffHunk, DiffLine, DiffSpan, compute_hunks};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use syntect::parsing::SyntaxReference;
 use syntect::util::LinesWithEndings;
+use unicode_width::UnicodeWidthStr;
 
 pub(crate) const MAX_INSTRUCTION_LINES: usize = 15;
 const BATCH_CHILD_INDENT: &str = "  ";
@@ -44,6 +45,15 @@ const GREP_SUMMARY_INDENT: &str = "  ";
 /// is rebuilt on every resize and theme change, so that cost is paid again
 /// each time.
 const MAX_REDIFF_LINES: usize = 4096;
+/// The columns a diff body needs before a second gutter of line numbers is
+/// worth what it takes away from the code.
+const MIN_CODE_COLUMNS: usize = 60;
+const MARK_UNCHANGED: char = ' ';
+const MARK_REMOVED: char = '-';
+const MARK_ADDED: char = '+';
+/// A line the alignment matched whose whitespace moved. Neither side of it is
+/// new, so neither `-` nor `+` describes it.
+const MARK_REINDENTED: char = '~';
 
 pub(crate) fn instruction_limit(expanded: bool) -> usize {
     if expanded {
@@ -183,21 +193,84 @@ impl<'a> FileWalker<'a> {
     }
 }
 
+/// How a diff row's gutter is laid out. Two columns of numbers say which line
+/// each side of a change sits on, the way a side-by-side diff does, but they
+/// cost the code the room to read; a narrow card gets one column instead and
+/// leans on the marker to say which side the number belongs to.
+#[derive(Clone, Copy)]
+struct DiffGutter {
+    before_width: usize,
+    after_width: Option<usize>,
+}
+
+impl DiffGutter {
+    fn new(before_max: usize, after_max: usize, width: u16) -> Self {
+        let (before, after) = (nr_width(before_max), nr_width(after_max));
+        let two_columns = before + after + 4;
+        let fits = width != UNCONSTRAINED_WIDTH
+            && usize::from(width) >= two_columns.saturating_add(MIN_CODE_COLUMNS);
+        match fits {
+            true => Self {
+                before_width: before,
+                after_width: Some(after),
+            },
+            false => Self {
+                before_width: nr_width(before_max.max(after_max)),
+                after_width: None,
+            },
+        }
+    }
+
+    fn span(
+        self,
+        before: Option<usize>,
+        after: Option<usize>,
+        mark: char,
+        base: Style,
+    ) -> Span<'static> {
+        let number = |nr: Option<usize>, width: usize| match nr {
+            Some(nr) => format!("{nr:>width$}"),
+            None => " ".repeat(width),
+        };
+        let text = match self.after_width {
+            Some(after_width) => format!(
+                "{} {} {mark} ",
+                number(before, self.before_width),
+                number(after, after_width)
+            ),
+            None => format!("{} {mark} ", number(before.or(after), self.before_width)),
+        };
+        Span::styled(text, base.patch(theme::current().diff_line_nr))
+    }
+}
+
+/// The last line number each side reaches, which is what the gutter is sized
+/// against.
+fn hunk_extents(hunks: &[DiffHunk]) -> (usize, usize) {
+    hunks.iter().fold((1, 1), |(before, after), hunk| {
+        let (before_rows, after_rows) = hunk.lines.iter().fold((0, 0), |(b, a), line| {
+            let (on_before, on_after) = line.sides();
+            (b + usize::from(on_before), a + usize::from(on_after))
+        });
+        (
+            before.max(hunk.before_start + before_rows.saturating_sub(1)),
+            after.max(hunk.after_start + after_rows.saturating_sub(1)),
+        )
+    })
+}
+
 fn render_diff(
     syntax: Option<&'static SyntaxReference>,
     before: &str,
     after: &str,
+    width: u16,
 ) -> Vec<Line<'static>> {
     let hunks = compute_hunks(before, after);
-    let Some(last) = hunks.last() else {
+    if hunks.is_empty() {
         return Vec::new();
-    };
-    let numbered = last
-        .lines
-        .iter()
-        .filter(|l| !matches!(l, DiffLine::Added(_)))
-        .count();
-    let w = nr_width(last.before_start + numbered.saturating_sub(1));
+    }
+    let (before_max, after_max) = hunk_extents(&hunks);
+    let gutter = DiffGutter::new(before_max, after_max, width);
 
     let mut walkers = syntax.map(|s| (FileWalker::new(before, s), FileWalker::new(after, s)));
 
@@ -211,65 +284,94 @@ fn render_diff(
             after.skip_to(hunk.after_start);
         }
 
-        let mut line_nr = hunk.before_start;
+        let mut cursor = (hunk.before_start, hunk.after_start);
         for dl in &hunk.lines {
-            lines.push(render_hunk_line(dl, walkers.as_mut(), &mut line_nr, w));
+            lines.push(render_hunk_line(
+                dl,
+                walkers.as_mut(),
+                &mut cursor,
+                gutter,
+                width,
+            ));
         }
     }
 
     lines
 }
 
-fn numbered_gutter(line_nr: &mut usize, w: usize) -> Span<'static> {
-    let span = gutter(&format!("{line_nr:>w$}"));
-    *line_nr += 1;
-    span
-}
-
-/// Unchanged lines step both walkers but take spans from `after`.
-/// Removed/added lines only step their own side.
+/// Unchanged and re-indented lines step both walkers but take spans from
+/// `after`. Removed and added lines only step their own side.
 fn render_hunk_line(
     dl: &DiffLine,
     walkers: Option<&mut (FileWalker<'_>, FileWalker<'_>)>,
-    line_nr: &mut usize,
-    w: usize,
+    cursor: &mut (usize, usize),
+    gutter: DiffGutter,
+    width: u16,
 ) -> Line<'static> {
     let theme = theme::current();
-    match dl {
-        DiffLine::Unchanged(t) => {
-            let after_spans = walkers.and_then(|(before, after)| {
+    let (before_nr, after_nr) = *cursor;
+    let (on_before, on_after) = dl.sides();
+    cursor.0 += usize::from(on_before);
+    cursor.1 += usize::from(on_after);
+    let numbers = (on_before.then_some(before_nr), on_after.then_some(after_nr));
+
+    let (mark, base, spans) = match dl {
+        DiffLine::Unchanged(text) => {
+            let syntax = walkers.and_then(|(before, after)| {
                 before.skip();
                 after.highlight_next()
             });
-            let mut spans = vec![numbered_gutter(line_nr, w), Span::raw("  ")];
-            spans.extend(syntax_to_spans(after_spans, t));
-            Line::from(spans)
+            let mut spans = vec![gutter.span(numbers.0, numbers.1, MARK_UNCHANGED, Style::new())];
+            spans.extend(syntax_to_spans(syntax, text));
+            return Line::from(spans);
+        }
+        DiffLine::Reindented { after, .. } => {
+            let syntax = walkers.and_then(|(before, walker)| {
+                before.skip();
+                walker.highlight_next()
+            });
+            (
+                MARK_REINDENTED,
+                theme.diff_new,
+                diff_change_spans(after, syntax, theme.diff_new, theme.diff_new_emphasis),
+            )
         }
         DiffLine::Removed(ds) => {
-            let before_spans = walkers.and_then(|(before, _)| before.highlight_next());
-            let mut spans = vec![numbered_gutter(line_nr, w)];
-            spans.extend(diff_change_spans(
-                "- ",
-                ds,
-                before_spans,
+            let syntax = walkers.and_then(|(before, _)| before.highlight_next());
+            (
+                MARK_REMOVED,
                 theme.diff_old,
-                theme.diff_old_emphasis,
-            ));
-            Line::from(spans)
+                diff_change_spans(ds, syntax, theme.diff_old, theme.diff_old_emphasis),
+            )
         }
         DiffLine::Added(ds) => {
-            let after_spans = walkers.and_then(|(_, after)| after.highlight_next());
-            let mut spans = vec![gutter(&" ".repeat(w))];
-            spans.extend(diff_change_spans(
-                "+ ",
-                ds,
-                after_spans,
+            let syntax = walkers.and_then(|(_, after)| after.highlight_next());
+            (
+                MARK_ADDED,
                 theme.diff_new,
-                theme.diff_new_emphasis,
-            ));
-            Line::from(spans)
+                diff_change_spans(ds, syntax, theme.diff_new, theme.diff_new_emphasis),
+            )
         }
+    };
+
+    let mut row = vec![gutter.span(numbers.0, numbers.1, mark, base)];
+    row.extend(spans);
+    fill_row(&mut row, width, base);
+    Line::from(row)
+}
+
+/// Runs a changed row's tint out to the edge of the card, so a diff reads as
+/// bands of colour rather than as ragged highlights that stop wherever the code
+/// happens to end. Unchanged rows are left alone, as they are in VS Code.
+fn fill_row(spans: &mut Vec<Span<'static>>, width: u16, base: Style) {
+    if width == UNCONSTRAINED_WIDTH {
+        return;
     }
+    let drawn: usize = spans.iter().map(|span| span.content.width()).sum();
+    let Some(padding) = usize::from(width).checked_sub(drawn).filter(|pad| *pad > 0) else {
+        return;
+    };
+    spans.push(Span::styled(" ".repeat(padding), base));
 }
 
 fn syntax_to_spans(syntax: Option<Vec<Span<'static>>>, text: &str) -> Vec<Span<'static>> {
@@ -280,37 +382,35 @@ fn syntax_to_spans(syntax: Option<Vec<Span<'static>>>, text: &str) -> Vec<Span<'
 }
 
 fn diff_change_spans(
-    prefix: &'static str,
     ds: &[DiffSpan],
     syntax: Option<Vec<Span<'static>>>,
     base: Style,
     emph: Style,
 ) -> Vec<Span<'static>> {
-    let mut spans = vec![Span::styled(
-        prefix,
-        base.patch(theme::current().code_block),
-    )];
     match syntax {
-        Some(syn) => spans.extend(merge_syntax_with_diff(&syn, ds, base, emph)),
+        Some(syn) => merge_syntax_with_diff(&syn, ds, base, emph),
         None => {
             let full: String = ds.iter().map(|s| s.text.as_str()).collect();
-            spans.push(Span::styled(
+            vec![Span::styled(
                 caudra_highlight::normalize_text(&full),
-                base.patch(theme::current().code_block),
-            ));
+                theme::current().code_block.patch(base),
+            )]
         }
     }
-    spans
 }
 
-/// The `-a` of a `@@ -a,b +c,d @@` header, which is where the hunk's numbering
-/// restarts. `None` for any line that is not a hunk header.
-fn hunk_start(line: &str) -> Option<usize> {
-    line.strip_prefix("@@ -")?
-        .split(&[',', ' '][..])
-        .next()?
-        .parse()
-        .ok()
+/// The `-a` and `+c` of a `@@ -a,b +c,d @@` header, which is where the hunk's
+/// numbering restarts on each side. `None` for any line that is not a hunk
+/// header, and for a header whose before side does not parse; a missing after
+/// side falls back to the before one rather than losing the hunk.
+fn hunk_start(line: &str) -> Option<(usize, usize)> {
+    let mut fields = line.strip_prefix("@@ -")?.split(' ');
+    let number = |field: Option<&str>| field?.split(',').next()?.parse().ok();
+    let before: usize = number(fields.next())?;
+    Some((
+        before,
+        number(fields.next().and_then(|f| f.strip_prefix('+'))).unwrap_or(before),
+    ))
 }
 
 /// The side of the file a hunk's body line belongs to. A `\ No newline at end
@@ -337,19 +437,27 @@ fn side(raw: &str) -> Side<'_> {
 /// lines it describes.
 struct PatchHunk<'a> {
     before_start: usize,
+    after_start: usize,
     body: Vec<&'a str>,
 }
 
 impl PatchHunk<'_> {
-    /// The last line number the hunk prints, which is what the gutter is sized
-    /// against. Added lines are unnumbered, so only the before side counts.
-    fn before_end(&self) -> usize {
-        let numbered = self
+    /// The last line number the hunk prints on each side, which is what the
+    /// gutter is sized against.
+    fn ends(&self) -> (usize, usize) {
+        let (before, after) = self
             .body
             .iter()
-            .filter(|raw| matches!(side(raw), Side::Before(_) | Side::Both(_)))
-            .count();
-        self.before_start + numbered.saturating_sub(1)
+            .fold((0usize, 0usize), |(before, after), raw| match side(raw) {
+                Side::Before(_) => (before + 1, after),
+                Side::After(_) => (before, after + 1),
+                Side::Both(_) => (before + 1, after + 1),
+                Side::Neither => (before, after),
+            });
+        (
+            self.before_start + before.saturating_sub(1),
+            self.after_start + after.saturating_sub(1),
+        )
     }
 
     /// The two file states the hunk describes, for the diff the card computes
@@ -401,8 +509,9 @@ fn patch_hunks(patch: &str) -> Vec<PatchHunk<'_>> {
     let mut hunks: Vec<PatchHunk> = Vec::new();
     for raw in patch.lines() {
         match hunk_start(raw) {
-            Some(before_start) => hunks.push(PatchHunk {
+            Some((before_start, after_start)) => hunks.push(PatchHunk {
                 before_start,
+                after_start,
                 body: Vec::new(),
             }),
             None => {
@@ -426,9 +535,15 @@ fn patch_hunks(patch: &str) -> Vec<PatchHunk<'_>> {
 /// Syntax highlighting is left out on purpose, because a hunk carries only its
 /// own context and a highlighter fed that much guesses wrong more than it
 /// helps.
-fn render_unified_patch(patch: &str) -> Vec<Line<'static>> {
+fn render_unified_patch(patch: &str, width: u16) -> Vec<Line<'static>> {
     let hunks = patch_hunks(patch);
-    let width = nr_width(hunks.iter().map(PatchHunk::before_end).max().unwrap_or(1));
+    let (before_max, after_max) = hunks.iter().map(PatchHunk::ends).fold(
+        (1, 1),
+        |(before, after), (hunk_before, hunk_after)| {
+            (before.max(hunk_before), after.max(hunk_after))
+        },
+    );
+    let gutter = DiffGutter::new(before_max, after_max, width);
     let mut lines = Vec::new();
     for hunk in &hunks {
         let groups = if hunk.body.len() > MAX_REDIFF_LINES {
@@ -445,9 +560,12 @@ fn render_unified_patch(patch: &str) -> Vec<Line<'static>> {
             if !lines.is_empty() {
                 lines.push(gap_ellipsis());
             }
-            let mut line_nr = hunk.before_start + group.before_start - 1;
+            let mut cursor = (
+                hunk.before_start + group.before_start - 1,
+                hunk.after_start + group.after_start - 1,
+            );
             for dl in &group.lines {
-                lines.push(render_hunk_line(dl, None, &mut line_nr, width));
+                lines.push(render_hunk_line(dl, None, &mut cursor, gutter, width));
             }
         }
     }
@@ -738,7 +856,7 @@ fn indent_all(lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
 
 /// Each file gets its own heading, because a patch that touches three files
 /// is otherwise three diffs with nothing saying where one ends.
-fn render_patch(files: &[PatchedFile]) -> Vec<Line<'static>> {
+fn render_patch(files: &[PatchedFile], width: u16) -> Vec<Line<'static>> {
     let theme = theme::current();
     let mut lines = Vec::new();
     for file in files {
@@ -752,7 +870,7 @@ fn render_patch(files: &[PatchedFile]) -> Vec<Line<'static>> {
                 theme.tool_annotation,
             ),
         ]));
-        lines.extend(render_unified_patch(&file.patch));
+        lines.extend(render_unified_patch(&file.patch, width));
     }
     lines
 }
@@ -1449,10 +1567,11 @@ pub fn render_tool_content(
                 highlight.then(|| caudra_highlight::syntax_for_path(path)),
                 before,
                 after,
+                limits.width,
             ),
             false,
         ),
-        Some(ToolOutput::Patch { files }) => (render_patch(files), false),
+        Some(ToolOutput::Patch { files }) => (render_patch(files, limits.width), false),
         Some(ToolOutput::GrepResult { entries, capped }) => {
             render_grep_results(entries, capped.as_ref(), limits.budget, highlight)
         }
@@ -1598,12 +1717,15 @@ mod tests {
 
     const PATCH: &str = "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -8,3 +8,4 @@\n context\n-gone\n+added\n+also added\n";
     const NUMBERED_MSG: &str = "context and removed lines carry their real file line number";
-    const BLANK_GUTTER_MSG: &str = "an added line has no line number on the before side";
+    const AFTER_GUTTER_MSG: &str = "an added line is numbered from the side it exists on";
     const HUNK_GAP_MSG: &str = "a jump between hunks must be marked, not silently closed";
     const HEADING_MSG: &str = "each file names itself and its size";
 
     fn patch_text(files: &[PatchedFile]) -> Vec<String> {
-        render_patch(files).iter().map(line_text).collect()
+        render_patch(files, UNCONSTRAINED_WIDTH)
+            .iter()
+            .map(line_text)
+            .collect()
     }
 
     fn one_file(patch: &str) -> Vec<PatchedFile> {
@@ -1621,16 +1743,16 @@ mod tests {
     fn a_patch_numbers_its_lines_from_the_hunk_header() {
         let rendered = patch_text(&one_file(PATCH));
         assert!(
-            rendered.contains(&"8   context".to_owned()),
+            rendered.contains(&" 8   context".to_owned()),
             "{NUMBERED_MSG}: {rendered:?}"
         );
         assert!(
-            rendered.contains(&"9 - gone".to_owned()),
+            rendered.contains(&" 9 - gone".to_owned()),
             "{NUMBERED_MSG}: {rendered:?}"
         );
         assert!(
-            rendered.contains(&"  + added".to_owned()),
-            "{BLANK_GUTTER_MSG}: {rendered:?}"
+            rendered.contains(&" 9 + added".to_owned()),
+            "{AFTER_GUTTER_MSG}: {rendered:?}"
         );
     }
 
@@ -1673,10 +1795,10 @@ mod tests {
     const INTERLEAVED: &[&str] = &[
         "1   alpha",
         "2 - beta",
-        "  + BETA",
+        "2 + BETA",
         "3   gamma",
         "4 - delta",
-        "  + DELTA",
+        "4 + DELTA",
     ];
     const INTERLEAVED_MSG: &str =
         "a change belongs beside the line it replaces, not after the whole region";
@@ -1684,6 +1806,87 @@ mod tests {
         "@@ -1,2 +1,2 @@\n keep\n-gone\n\\ No newline at end of file\n+added\n";
     const NO_NEWLINE_MSG: &str = "the no-newline marker is not a line of either file";
     const OVERSIZED_MSG: &str = "a hunk too large to diff again is drawn as the wire wrote it";
+    const WRAPS: &str = "a changed row must fill the body exactly, or every one of them wraps";
+    const NO_TINT: &str = "an unchanged row keeps the card's own background";
+    const BOTH_SIDES: &str = "a wide body numbers both sides of a change";
+    const ONE_SIDE: &str = "a narrow body spends its columns on the code";
+    const MARGIN_ONLY: &str = "a re-indented line is one row marking only its margin";
+
+    /// A changed row is padded to exactly the body width it was given. One
+    /// column over and the paragraph wraps it, doubling every line of every
+    /// diff; the card's own half of that identity is pinned in `tool_display`.
+    #[test_case(76 ; "wide")]
+    #[test_case(44 ; "narrow")]
+    fn a_changed_row_fills_the_body_without_overflowing_it(body: u16) {
+        let lines = render_diff(None, "keep\nold\n", "keep\nnew\n", body);
+        let widths: Vec<usize> = lines.iter().map(line_width).collect();
+
+        assert_eq!(
+            widths,
+            vec![line_width(&lines[0]), body.into(), body.into()],
+            "{WRAPS}"
+        );
+    }
+
+    fn line_width(line: &Line<'static>) -> usize {
+        line.spans.iter().map(|s| s.content.width()).sum()
+    }
+
+    #[test]
+    fn an_unchanged_row_is_not_filled() {
+        let lines = render_diff(None, "keep\nold\n", "keep\nnew\n", 80);
+        let context = &lines[0];
+
+        assert!(line_width(context) < 80, "{NO_TINT}");
+        assert!(
+            context.spans.iter().all(|span| span.style.bg.is_none()),
+            "{NO_TINT}: {context:?}"
+        );
+    }
+
+    #[test_case(80, "2 2 ~ " ; "wide body numbers both sides")]
+    #[test_case(30, "2 ~ " ; "narrow body numbers one")]
+    fn the_gutter_answers_to_the_room_it_has(width: u16, gutter: &str) {
+        let lines = render_diff(
+            None,
+            "fn f() {\nbody\n}\n",
+            "fn f() {\n    body\n}\n",
+            width,
+        );
+        let reindented = lines
+            .iter()
+            .find(|line| line.spans[0].content.contains(MARK_REINDENTED))
+            .unwrap_or_else(|| panic!("{MARGIN_ONLY}: {lines:?}"));
+
+        assert_eq!(
+            reindented.spans[0].content.as_ref(),
+            gutter,
+            "{}",
+            if width > 60 { BOTH_SIDES } else { ONE_SIDE }
+        );
+    }
+
+    /// The edit the whole change is shaped around: the body of a block moves
+    /// right, and must not come back as a removal and an insertion.
+    #[test]
+    fn a_wrapped_block_draws_one_row_per_line() {
+        let before = "fn f() {\n    work();\n}\n";
+        let after = "fn f() {\n    if c {\n        work();\n    }\n}\n";
+        let rows: Vec<String> = render_diff(None, before, after, UNCONSTRAINED_WIDTH)
+            .iter()
+            .map(line_text)
+            .collect();
+
+        assert!(
+            !rows.iter().any(|row| row.contains(MARK_REMOVED)),
+            "{MARGIN_ONLY}: {rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.contains(MARK_REINDENTED) && row.ends_with("        work();")),
+            "{MARGIN_ONLY}: {rows:?}"
+        );
+    }
 
     /// The rows under the file's heading.
     fn patch_rows(patch: &str) -> Vec<String> {
@@ -1701,7 +1904,7 @@ mod tests {
     fn a_no_newline_marker_costs_no_line_number() {
         assert_eq!(
             patch_rows(NO_NEWLINE_PATCH),
-            ["1   keep", "2 - gone", "  + added"],
+            ["1   keep", "2 - gone", "2 + added"],
             "{NO_NEWLINE_MSG}"
         );
     }
@@ -1764,6 +1967,7 @@ mod tests {
             Some(caudra_highlight::syntax_for_path("test.rs")),
             before,
             after,
+            UNCONSTRAINED_WIDTH,
         );
 
         let expected = fg_in_context("test.rs", "/*\nalpha\nbravo\ncharlie\n", "delta", "delta");
@@ -1781,6 +1985,7 @@ mod tests {
             Some(caudra_highlight::syntax_for_path("test.rs")),
             before,
             after,
+            UNCONSTRAINED_WIDTH,
         );
 
         let expected = fg_in_context("test.rs", "/*\ndoc\n", "fn x() {}", "fn");

@@ -39,6 +39,7 @@ pub(crate) fn styles() -> WorkbenchStyles {
         diff_new_emphasis: t.diff_new_emphasis,
         diff_line_nr: t.diff_line_nr,
         match_highlight: t.item_match,
+        current_match: t.item_selected,
         agent_touched: t.accent,
     }
 }

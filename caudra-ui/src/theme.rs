@@ -1476,6 +1476,39 @@ mod tests {
         assert!(load_by_name("nonexistent").is_err());
     }
 
+    const DIFF_BANDS: &str = "a diff row is a band of background the syntax colours show through, so both shades must be backgrounds";
+    const DIFF_SHADES: &str =
+        "the characters that changed must be a stronger shade than the line they sit on";
+
+    /// A diff paints the whole changed row in one shade and the characters that
+    /// changed in another, over the top. Two shades that match leave an edit
+    /// looking like a whole line rewritten, which is the thing the emphasis
+    /// exists to disprove.
+    #[test]
+    fn every_theme_separates_a_changed_line_from_the_characters_that_changed() {
+        for entry in BUNDLED_THEMES {
+            let theme = Theme::from_toml(entry.toml).expect("theme must parse");
+            for (line, emphasis, role) in [
+                (theme.diff_old, theme.diff_old_emphasis, "diff_old"),
+                (theme.diff_new, theme.diff_new_emphasis, "diff_new"),
+            ] {
+                let (line, emphasis) = (
+                    line.bg
+                        .unwrap_or_else(|| panic!("{}: {role} {DIFF_BANDS}", entry.name)),
+                    emphasis
+                        .bg
+                        .unwrap_or_else(|| panic!("{}: {role}_emphasis {DIFF_BANDS}", entry.name)),
+                );
+                assert_ne!(
+                    rgb(line),
+                    rgb(emphasis),
+                    "{}: {role} {DIFF_SHADES}",
+                    entry.name
+                );
+            }
+        }
+    }
+
     fn theme_tables(toml_str: &str) -> (HashMap<String, Color>, toml::Table) {
         let table: toml::Table = toml::from_str(toml_str).expect("theme must parse");
         let palette = table

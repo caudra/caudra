@@ -109,7 +109,7 @@ impl Menu {
     /// The menu for a tab. A diff has no file behind it, so it offers nothing
     /// that names one.
     pub(crate) fn for_tab(tab: &Tab, index: usize, at: (u16, u16)) -> Self {
-        let on_disk = tab.diff_kinds().is_none();
+        let on_disk = tab.diff_rows().is_none();
         let mut items = Vec::with_capacity(ITEMS);
         items.extend([
             Item::Action(Action::Close),
@@ -329,13 +329,7 @@ mod tests {
     /// everything that names a file is left off.
     #[test]
     fn a_diff_tab_offers_only_the_closes() {
-        let tab = Tab::synthetic(
-            Path::new(FILE_NAME),
-            FILE_NAME.to_owned(),
-            Vec::new(),
-            Vec::new(),
-            0,
-        );
+        let tab = Tab::synthetic(Path::new(FILE_NAME), FILE_NAME.to_owned(), Vec::new(), 0);
 
         let offered = actions(&Menu::for_tab(&tab, 1, ANYWHERE));
 

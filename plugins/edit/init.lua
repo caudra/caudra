@@ -157,9 +157,12 @@ local function apply_highlights(view, fmt, jobs, ext)
   end)
 end
 
--- Mirrors the standalone Rust diff render (code_view.rs): numbered gutter
--- on removed lines, blank gutter + `+` on added lines, and no truncation
--- ever, a diff is exactly the change and hiding part of it lies.
+-- A worked example of painting a diff from Lua, not a copy of what Caudra
+-- itself draws: the native renderer aligns lines on their trimmed content,
+-- marks the characters that changed, and fills each changed row to the card's
+-- edge, none of which this needs in order to show how the API is used. What it
+-- does share is the rule that a diff is never truncated, because a diff is
+-- exactly the change and hiding part of it lies.
 local function diff_view(blocks, path)
   local buf = caudra.ui.buf()
   local view = ToolView.new(buf, { max_lines = math.huge, keep = "head" })

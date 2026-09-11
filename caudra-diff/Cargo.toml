@@ -1,0 +1,16 @@
+[package]
+name = "caudra-diff"
+description = "Structured line and inline diffs shared by Caudra's renderers."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+similar = { workspace = true }
+
+[dev-dependencies]
+test-case = { workspace = true }

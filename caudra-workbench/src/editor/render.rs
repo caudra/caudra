@@ -36,6 +36,10 @@ pub struct Row<'a> {
     /// segments the highlighter produces can be handed over as they are.
     pub segments: Option<&'a [StyledSegment]>,
     pub base: Style,
+    /// Runs the row's colour out to the pane's edge rather than stopping where
+    /// the text does, so a diff reads as bands rather than as ragged
+    /// highlights. `None` for a row that should keep the background it sits on.
+    pub fill: Option<Style>,
     /// Character ranges painted over the syntax colours, later entries winning.
     /// A range may reach one past the end of the line to show a cursor or a
     /// selection that swallowed the newline.
@@ -67,7 +71,8 @@ impl Row<'_> {
     }
 
     /// The line as one style per character, overlays applied, padded with
-    /// blanks where an overlay reaches past the end of the text.
+    /// blanks where an overlay reaches past the end of the text or where the
+    /// row asked to be filled to the edge.
     fn cells(&self, limit: usize) -> Vec<(char, Style)> {
         let mut cells: Vec<(char, Style)> = self.text.chars().zip(self.char_styles()).collect();
 
@@ -77,9 +82,10 @@ impl Row<'_> {
             .map(|(range, _)| range.end)
             .max()
             .unwrap_or_default()
+            .max(self.fill.map_or(0, |_| limit))
             .min(limit);
         if reach > cells.len() {
-            cells.resize(reach, (BLANK, self.base));
+            cells.resize(reach, (BLANK, self.fill.unwrap_or(self.base)));
         }
 
         for (range, style) in self.overlays {
@@ -244,12 +250,69 @@ mod tests {
             text,
             segments: None,
             base: Style::default(),
+            fill: None,
             overlays: &[],
         }
     }
 
     fn painted(row: &Row<'_>, h_scroll: usize, width: usize) -> String {
         row.paint(h_scroll, width).to_string()
+    }
+
+    const FILL_SHORT: &str = "a filled row must reach the pane's edge";
+    const FILL_STYLE: &str = "the blanks a fill adds carry the fill's own colour";
+
+    #[test_case(0, 6, "abc   " ; "short of the edge")]
+    #[test_case(0, 3, "abc" ; "exactly the edge")]
+    #[test_case(1, 3, "bc " ; "scrolled")]
+    fn a_filled_row_reaches_the_edge(h_scroll: usize, width: usize, expected: &str) {
+        let fill = Style::default().bg(Color::Green);
+        let row = Row {
+            fill: Some(fill),
+            ..plain("abc")
+        };
+
+        assert_eq!(painted(&row, h_scroll, width), expected, "{FILL_SHORT}");
+    }
+
+    #[test]
+    fn a_fill_colours_the_blanks_it_adds() {
+        let fill = Style::default().bg(Color::Green);
+        let row = Row {
+            fill: Some(fill),
+            ..plain("ab")
+        };
+        let painted = row.paint(0, 5);
+
+        assert_eq!(
+            painted.spans.last().map(|span| span.style.bg),
+            Some(Some(Color::Green)),
+            "{FILL_STYLE}: {painted:?}"
+        );
+    }
+
+    /// The diff paints emphasis first so a find match still shows through it.
+    #[test]
+    fn a_later_overlay_wins_over_an_earlier_one() {
+        let overlays = [
+            (0..4, Style::default().bg(Color::Green)),
+            (1..2, Style::default().bg(Color::Yellow)),
+        ];
+        let row = Row {
+            overlays: &overlays,
+            ..plain("abcd")
+        };
+        let painted = row.paint(0, 4);
+
+        assert_eq!(
+            painted
+                .spans
+                .iter()
+                .find(|s| s.content == "b")
+                .map(|s| s.style.bg),
+            Some(Some(Color::Yellow)),
+            "{WRONG_STYLE}: {painted:?}"
+        );
     }
 
     #[test_case("abc", 0, 3, "abc" ; "a short line is printed whole")]
@@ -326,6 +389,7 @@ mod tests {
             text: "abc",
             segments: None,
             base: Style::default().fg(Color::White),
+            fill: None,
             overlays: &[(1..2, selection)],
         };
 
@@ -353,6 +417,7 @@ mod tests {
             text: "ab",
             segments: None,
             base: Style::default(),
+            fill: None,
             overlays: &[(2..3, Style::default().bg(Color::Blue))],
         };
 
@@ -382,6 +447,7 @@ mod tests {
             text: "let x",
             segments: Some(&segments),
             base: Style::default(),
+            fill: None,
             overlays: &[],
         };
 
@@ -415,6 +481,7 @@ mod tests {
             text: "abc",
             segments: Some(&segments),
             base: Style::default(),
+            fill: None,
             overlays: &[],
         };
 

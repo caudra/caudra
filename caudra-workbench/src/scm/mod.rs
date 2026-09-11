@@ -537,7 +537,10 @@ impl Scm {
             return Ok(None);
         };
         let (old, new) = repo.sides(&change.relative, change.staged)?;
-        Ok(Some((change.clone(), diff::unified(&old, &new))))
+        Ok(Some((
+            change.clone(),
+            diff::unified(&change.relative, &old, &new),
+        )))
     }
 
     /// The rendered contents of the selected commit, and the commit itself.

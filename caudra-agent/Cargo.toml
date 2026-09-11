@@ -8,6 +8,7 @@ authors.workspace = true
 [dependencies]
 caudra-providers = { workspace = true }
 caudra-config = { workspace = true }
+caudra-diff = { workspace = true }
 caudra-otel = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

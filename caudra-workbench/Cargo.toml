@@ -9,6 +9,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+caudra-diff = { workspace = true }
 caudra-highlight = { workspace = true }
 crossterm = { workspace = true }
 flume = { workspace = true }
@@ -23,7 +24,6 @@ notify = { workspace = true }
 nucleo = { workspace = true }
 ratatui = { workspace = true }
 serde = { workspace = true }
-similar = { workspace = true }
 syntect = { workspace = true }
 thiserror = { workspace = true }
 unicode-width = { workspace = true }
