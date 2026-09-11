@@ -94,6 +94,9 @@ const PROGRESS_MAX_BYTES: usize = 64 * 1024;
 const PROGRESS_TRUNCATED: &str = "[earlier output truncated]\n";
 const BYTES_PER_MIB: usize = 1024 * 1024;
 const NORMALIZED_COMMAND_ATTRIBUTE: &str = "normalized_command";
+/// The one redirect destination that reaches nothing: writes to it are
+/// discarded and reads from it yield end of file.
+const NULL_DEVICE: &str = "/dev/null";
 /// Caudra owns authorization, so Workcell always hands over the mutation
 /// tools and every write still passes through the permission layer first.
 /// Withholding them here would hide tools the user is allowed to approve.
@@ -1912,7 +1915,8 @@ fn shell_prepared(
 /// Shell analysis strips redirection nodes from each scope's source, so a file
 /// redirect, heredoc, or here-string would leave the reviewed text describing
 /// less than the command actually does. File descriptor duplication such as
-/// `2>&1` names no operand and stays reviewable.
+/// `2>&1` names no operand and stays reviewable, and so does a redirect to
+/// `/dev/null`, which names one that reaches nothing.
 fn shell_command_hides_operands(command: &str) -> bool {
     let bytes = command.as_bytes();
     let mut index = 0;
@@ -1942,10 +1946,13 @@ fn shell_command_hides_operands(command: &str) -> bool {
                     .map_or(bytes.len(), |offset| index + offset);
             }
             b'<' | b'>' => {
-                if !duplicates_descriptor(bytes, index) {
+                if duplicates_descriptor(bytes, index) {
+                    index += 2;
+                } else if let Some(end) = discards_output(bytes, index) {
+                    index = end;
+                } else {
                     return true;
                 }
-                index += 2;
                 comment_eligible = false;
             }
             b';' | b'|' | b'&' | b'(' | b')' => {
@@ -1995,6 +2002,32 @@ fn duplicates_descriptor(bytes: &[u8], index: usize) -> bool {
     if bytes.get(cursor) == Some(&b'-') {
         cursor += 1;
     }
+    ends_redirect(bytes, cursor)
+}
+
+/// Where a redirect to the null device ends, or `None` when it names something
+/// else.
+///
+/// Writes to `/dev/null` are discarded and reads from it yield end of file, so
+/// naming it drops no operand the review needed to see. A path that merely
+/// begins with it names a different file and stays hidden.
+fn discards_output(bytes: &[u8], index: usize) -> Option<usize> {
+    let mut cursor = index;
+    while bytes
+        .get(cursor)
+        .is_some_and(|byte| matches!(byte, b'<' | b'>'))
+    {
+        cursor += 1;
+    }
+    while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+        cursor += 1;
+    }
+    let end = cursor + NULL_DEVICE.len();
+    (bytes.get(cursor..end) == Some(NULL_DEVICE.as_bytes()) && ends_redirect(bytes, end))
+        .then_some(end)
+}
+
+fn ends_redirect(bytes: &[u8], cursor: usize) -> bool {
     bytes.get(cursor).is_none_or(|byte| {
         byte.is_ascii_whitespace() || matches!(byte, b';' | b'|' | b'&' | b'(' | b')' | b'<' | b'>')
     })
@@ -2802,12 +2835,21 @@ mod tests {
     #[test_case("cat >& combined", true; "descriptor_syntax_file_target")]
     #[test_case("cat >&2log", true; "descriptor_prefixed_file_target")]
     #[test_case("cat <input", true; "input_redirect")]
+    #[test_case("cat >/dev/nullx", true; "a_path_beginning_with_the_device")]
+    #[test_case("cat >/dev/nul", true; "a_path_shorter_than_the_device")]
+    #[test_case("cat >/dev/null/../../etc/passwd", true; "a_path_leading_through_the_device")]
+    #[test_case("cat >& /dev/null", true; "the_device_behind_a_descriptor_ampersand")]
     #[test_case("cat <<EOF\nvalue\nEOF", true; "heredoc")]
     #[test_case("cat <<<value", true; "here_string")]
     #[test_case("git status # '\n> victim", true; "quote_in_comment_before_redirect")]
     #[test_case("printf foo#bar > output", true; "hash_inside_word_before_redirect")]
     #[test_case(r"printf $'a\'b' > output", true; "redirect_after_ansi_c_quote")]
     #[test_case("cargo check 2>&1 | head -40", false; "stderr_to_stdout")]
+    #[test_case("git log --oneline 2>/dev/null | head -60", false; "stderr_discarded")]
+    #[test_case("cargo check >/dev/null 2>&1", false; "discarded_then_duplicated")]
+    #[test_case("cat &>/dev/null", false; "both_streams_discarded")]
+    #[test_case("cat 2>> /dev/null", false; "appended_to_the_device")]
+    #[test_case("cat < /dev/null", false; "read_from_the_device")]
     #[test_case("cargo check >&2", false; "stdout_to_stderr")]
     #[test_case("cargo check 1>&2", false; "explicit_stdout_to_stderr")]
     #[test_case("exec 3<&0", false; "input_descriptor_duplicate")]
@@ -2886,6 +2928,7 @@ mod tests {
     #[test_case("find . -name '*.rs'" => true ; "a quoted glob is an ordinary argument")]
     #[test_case("sed -n '1,140p' Cargo.toml" => true ; "a sed script that only prints")]
     #[test_case("cd src && rg -n needle ." => true ; "a move into the project before reading")]
+    #[test_case("git log --oneline -3 2>/dev/null | head -20" => true ; "a read that discards its stderr")]
     #[test_case("cd /tmp && cat x" => false ; "a move out of it")]
     #[test_case("sed -i 's/a/b/' Cargo.toml" => false ; "a sed script that writes in place")]
     #[test_case("cat /etc/shadow" => false ; "a read that leaves the project")]
