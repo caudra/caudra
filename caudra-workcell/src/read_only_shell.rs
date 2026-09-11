@@ -61,6 +61,17 @@ const FIND: &str = "find";
 const FIND_DENIED_FLAGS: &[&str] = &[
     "-delete", "-exec", "-execdir", "-fls", "-fprint", "-fprintf", "-ok", "-okdir",
 ];
+const SORT: &str = "sort";
+/// Two of these write the result somewhere other than stdout, one writes its
+/// temporary files into a directory of the caller's choosing, and one runs a
+/// program of its own.
+const SORT_DENIED_FLAGS: &[&str] = &[
+    "--compress-program",
+    "--output",
+    "--temporary-directory",
+    "-T",
+    "-o",
+];
 const SED: &str = "sed";
 const CD: &str = "cd";
 /// `cd -` is `$OLDPWD`, which the command does not say the location of.
@@ -71,7 +82,7 @@ const PREVIOUS_DIRECTORY: &str = "-";
 /// than by its flags and is not in the list below.
 const READ_ONLY_COMMANDS: &[&str] = &[
     "basename", "cat", "cd", "date", "df", "dirname", "du", "echo", "file", "head", "jq", "ls",
-    "printf", "pwd", "readlink", "realpath", "stat", "tail", "tree", "uname", "wc", "which",
+    "printf", "ps", "pwd", "readlink", "realpath", "stat", "tail", "tree", "uname", "wc", "which",
 ];
 
 /// Reports whether every command in an analyzed line only observes.
@@ -102,6 +113,7 @@ fn scope_is_read_only(scope: &ShellCommandScope) -> bool {
         RG => !denies(&arguments, RG_DENIED_FLAGS),
         GREP => !denies(&arguments, GREP_DENIED_FLAGS),
         FIND => !denies(&arguments, FIND_DENIED_FLAGS),
+        SORT => !denies(&arguments, SORT_DENIED_FLAGS),
         SED => sed_only_prints(&arguments),
         executable => READ_ONLY_COMMANDS.contains(&executable),
     }
@@ -317,6 +329,12 @@ mod tests {
     #[test_case("ls -la" => true ; "ls")]
     #[test_case("cat Cargo.toml" => true ; "cat")]
     #[test_case("cd crates" => true ; "cd_moves_nothing_on_disk")]
+    #[test_case("ps aux" => true ; "ps")]
+    #[test_case("sort -u f" => true ; "sort_to_stdout")]
+    #[test_case("sort -o out f" => false ; "sort_writing_to_a_file")]
+    #[test_case("sort -uo out f" => false ; "sort_writing_from_inside_a_cluster")]
+    #[test_case("sort --compress-program gzip f" => false ; "sort_running_a_program")]
+    #[test_case("sort -T /etc f" => false ; "sort_writing_temporaries_elsewhere")]
     #[test_case("echo === callers ===" => true ; "echo")]
     #[test_case("printf %s-%s a b" => true ; "printf")]
     #[test_case("sed -n 1,140p f" => true ; "sed_printing_a_slice")]
