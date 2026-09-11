@@ -39,6 +39,8 @@ const MAX_HEIGHT_PERCENT: u16 = 85;
 const LIST_MAX_WIDTH: u16 = 34;
 const LIST_PERCENT: u16 = 35;
 const PANE_GAP: u16 = 1;
+/// Blank columns a list row keeps between its text and its clock.
+const PANE_GAP_COLS: usize = 1;
 const H_PAD: u16 = 1;
 /// The tab strip above the body and the footer below it.
 const CHROME_ROWS: u16 = 2;
@@ -100,6 +102,9 @@ const RESULT_LABEL: &str = "Result: ";
 const REPORT_FIELD: &str = "report";
 const CALL_PREFIX: &str = "#";
 const TOKENS_UNIT: &str = " tokens";
+const AGENTS_UNIT: &str = " agents";
+const DONE_UNIT: &str = " done";
+const ADMITTED_UNIT: &str = " admitted";
 const AGENT_SLASH: &str = "/";
 const FOOTER: [(&str, &str, FooterCommand); 7] = [
     (
@@ -1003,6 +1008,7 @@ impl WorkflowInspector {
         let mut selected_row = None;
         let mut group = None;
         let spinner = spinner_str(animation_elapsed_ms());
+        let now = now_secs();
         for entry in &entries {
             if group != Some(entry.group) {
                 group = Some(entry.group);
@@ -1014,7 +1020,7 @@ impl WorkflowInspector {
                 selected_row = Some(row);
             }
             rows.push((row, entry.run.run_id.clone()));
-            lines.push(list_row(entry, selected, spinner, area.width));
+            lines.push(list_row(entry, selected, spinner, now, area.width));
         }
         if lines.is_empty() {
             match self.runs.is_empty() && self.history.is_empty() {
@@ -1137,8 +1143,10 @@ impl WorkflowInspector {
             Span::raw(format_elapsed(run.elapsed_secs(now))),
             Span::raw(SEPARATOR),
             Span::raw(AGENTS_LABEL),
+            Span::raw(roster_tally(run)),
+            Span::raw(SEPARATOR),
             Span::raw(format!(
-                "{}{AGENT_SLASH}{}",
+                "{}{AGENT_SLASH}{}{ADMITTED_UNIT}",
                 run.usage.agents_admitted, run.agent_budget
             )),
             Span::raw(SEPARATOR),
@@ -1389,7 +1397,16 @@ fn requested(action: InspectorAction) -> Option<String> {
     }
 }
 
-fn list_row(entry: &Entry<'_>, selected: bool, spinner: &'static str, width: u16) -> Line<'static> {
+/// `● deep-research · Research            2m14s`. The clock is right
+/// aligned and never yields: how long a run has been going is the column a
+/// reader scans, so the name and the phase give way to it instead.
+fn list_row(
+    entry: &Entry<'_>,
+    selected: bool,
+    spinner: &'static str,
+    now: u64,
+    width: u16,
+) -> Line<'static> {
     let t = theme::current();
     let style = match selected {
         true => t.item_selected,
@@ -1406,26 +1423,48 @@ fn list_row(entry: &Entry<'_>, selected: bool, spinner: &'static str, width: u16
     };
     let name = escape_terminal_controls(&entry.run.display_name);
     let detail = escape_terminal_controls(&detail);
-    let room = usize::from(width).saturating_sub(mark.len() + name.len() + SEPARATOR.len());
+    let elapsed = format_elapsed(entry.run.elapsed_secs(now));
+    let width = usize::from(width);
+    let mut used = mark.chars().count() + name.chars().count();
     let mut spans = vec![Span::styled(mark, t.spinner), Span::styled(name, style)];
+    let room = width
+        .saturating_sub(used + SEPARATOR.chars().count() + elapsed.chars().count() + PANE_GAP_COLS);
     if room > 0 {
         let detail: String = detail.chars().take(room).collect();
+        used += SEPARATOR.chars().count() + detail.chars().count();
         spans.push(Span::styled(format!("{SEPARATOR}{detail}"), t.item_desc));
     }
+    let pad = width.saturating_sub(used + elapsed.chars().count());
+    spans.push(Span::raw(" ".repeat(pad)));
+    spans.push(Span::styled(elapsed, t.tool_dim));
     Line::from(spans)
 }
 
+/// What the run has walked, then what the script still declares ahead of
+/// it. The entered phases are listed in the order they happened, repeats
+/// included, because the timeline is the record; the declared phases it has
+/// not reached follow as pending, because that is the part still to come.
 fn phase_lines(run: &RunSnapshot, now: u64) -> Vec<Line<'static>> {
     let t = theme::current();
-    if run.phase_history.is_empty() {
+    let pending = run
+        .phases
+        .iter()
+        .filter(|title| {
+            !run.phase_history
+                .iter()
+                .any(|record| record.title == **title)
+        })
+        .collect::<Vec<_>>();
+    if run.phase_history.is_empty() && pending.is_empty() {
         return vec![Line::styled(NO_PHASES, t.tool_dim)];
     }
     let end = match run.status.is_terminal() {
         true => run.updated_at,
         false => now,
     };
-    let last = run.phase_history.len() - 1;
-    run.phase_history
+    let last = run.phase_history.len().saturating_sub(1);
+    let mut lines: Vec<Line<'static>> = run
+        .phase_history
         .iter()
         .enumerate()
         .map(|(index, record)| {
@@ -1437,7 +1476,14 @@ fn phase_lines(run: &RunSnapshot, now: u64) -> Vec<Line<'static>> {
                 true => (PhaseMark::Current, t.accent),
                 false => (PhaseMark::Done, t.tool_success),
             };
-            Line::from(vec![
+            // A phase entered twice would otherwise claim its agents twice
+            // over, reading as more agents than the run ever dispatched.
+            let final_visit = run
+                .phase_history
+                .iter()
+                .rposition(|other| other.title == record.title)
+                == Some(index);
+            let mut spans = vec![
                 Span::styled(format!("{} ", mark.glyph()), style),
                 Span::styled(escape_terminal_controls(&record.title), t.bold),
                 Span::styled(
@@ -1448,9 +1494,48 @@ fn phase_lines(run: &RunSnapshot, now: u64) -> Vec<Line<'static>> {
                     ),
                     t.tool_dim,
                 ),
-            ])
+            ];
+            if final_visit && let Some(tally) = agent_tally(run, &record.title) {
+                spans.push(Span::styled(tally, t.tool_dim));
+            }
+            Line::from(spans)
         })
-        .collect()
+        .collect();
+    lines.extend(pending.into_iter().map(|title| {
+        Line::from(vec![
+            Span::styled(format!("{} ", PhaseMark::Pending.glyph()), t.tool_dim),
+            Span::styled(escape_terminal_controls(title), t.tool_dim),
+        ])
+    }));
+    lines
+}
+
+/// `3/8 done` across the whole roster, so the overview says how much of the
+/// fleet has landed and not only how much of the budget is spent.
+fn roster_tally(run: &RunSnapshot) -> String {
+    let done = run
+        .roster
+        .iter()
+        .filter(|agent| !matches!(agent.state, RosterState::Running | RosterState::Pending))
+        .count();
+    format!("{done}{AGENT_SLASH}{}{DONE_UNIT}", run.roster.len())
+}
+
+/// `· 2/5 agents` for a phase that dispatched any, counting the ones that
+/// have stopped against the ones it opened.
+fn agent_tally(run: &RunSnapshot, phase: &str) -> Option<String> {
+    let dispatched = run
+        .roster
+        .iter()
+        .filter(|agent| agent.phase.as_deref() == Some(phase));
+    let total = dispatched.clone().count();
+    if total == 0 {
+        return None;
+    }
+    let done = dispatched
+        .filter(|agent| !matches!(agent.state, RosterState::Running | RosterState::Pending))
+        .count();
+    Some(format!("{SEPARATOR}{done}/{total}{AGENTS_UNIT}"))
 }
 
 /// The report or the raw result, then the scratch file line, which is the
@@ -1538,7 +1623,7 @@ fn call_style(state: CallState) -> Style {
 
 #[cfg(test)]
 mod tests {
-    use caudra_workflow::{AgentRosterEntry, CallKind, RunUsage, SourceKind};
+    use caudra_workflow::{AgentRosterEntry, CallKind, PhaseRecord, RunUsage, SourceKind};
     use test_case::test_case;
 
     use super::*;
@@ -1563,6 +1648,16 @@ mod tests {
     const SUGGESTS_A_STEP_UP: &str = "the prompt offers a budget above what the run spent";
     const PROMPT_STANDS: &str = "a refused budget leaves the prompt up to correct";
     const PROMPT_IS_NOT_THE_MODAL: &str = "escaping the prompt must not close the inspector";
+    const SHORT_NAME: &str = "deep-research";
+    const PHASE_ONE: &str = "Research";
+    const PHASE_TWO: &str = "Report";
+    const ELAPSED_SECS: u64 = 134;
+    const ELAPSED_TEXT: &str = "2m14s";
+    const ONE_OF_ONE_AGENT: &str = "1/1 agents";
+    const ROSTER_TALLY: &str = "0/1 done";
+    const CLOCK_IS_LAST: &str = "the clock holds the right edge of a run row";
+    const PHASE_COUNTS_ITS_OWN: &str = "a phase row counts the agents it dispatched";
+    const PENDING_IS_LISTED: &str = "a declared phase the run has not reached is listed";
 
     pub(crate) fn run(
         run_id: &str,
@@ -1752,6 +1847,68 @@ mod tests {
 
         assert_eq!(action, InspectorAction::Flash(BUDGET_MAXED));
         assert!(inspector.budget.is_none());
+    }
+
+    /// The section as a reader sees it, which is what `y` hands over.
+    fn section_text(inspector: &mut WorkflowInspector, section: char) -> String {
+        let _ = inspector.handle_key(key_event(KeyCode::Char(section)));
+        match inspector.handle_key(key_event(KeyCode::Char(COPY_KEY))) {
+            InspectorAction::Copy { text, .. } => text,
+            action => panic!("{action:?}"),
+        }
+    }
+
+    #[test]
+    fn a_run_row_carries_its_clock() {
+        let mut walking = run(RUN_ID, RunStatus::Active, Vec::new());
+        walking.display_name = SHORT_NAME.into();
+        walking.phase = Some(PHASE_ONE.into());
+        let entry = Entry {
+            group: Group::Running,
+            run: &walking,
+            session_title: None,
+        };
+
+        let row = list_row(&entry, true, "", ELAPSED_SECS, LIST_MAX_WIDTH);
+
+        let text: String = row.spans.iter().map(|span| span.content.as_ref()).collect();
+        assert!(text.contains(PHASE_ONE), "{text}");
+        assert!(text.ends_with(ELAPSED_TEXT), "{CLOCK_IS_LAST}: {text}");
+    }
+
+    #[test]
+    fn the_phases_section_lists_what_is_left_and_what_each_phase_dispatched() {
+        let mut walking = run(RUN_ID, RunStatus::Active, vec![agent(None)]);
+        walking.phases = vec![PHASE_ONE.into(), PHASE_TWO.into()];
+        walking.phase = Some(PHASE_ONE.into());
+        walking.phase_history = vec![PhaseRecord {
+            title: PHASE_ONE.into(),
+            started_at: 0,
+        }];
+        walking.roster[0].phase = Some(PHASE_ONE.into());
+        walking.roster[0].state = RosterState::Completed;
+        let mut inspector = open_with(vec![walking]);
+
+        let text = section_text(&mut inspector, '2');
+
+        assert!(text.contains(PHASE_ONE), "{text}");
+        assert!(
+            text.contains(ONE_OF_ONE_AGENT),
+            "{PHASE_COUNTS_ITS_OWN}: {text}"
+        );
+        assert!(
+            text.contains(&format!("{} {PHASE_TWO}", PhaseMark::Pending.glyph())),
+            "{PENDING_IS_LISTED}: {text}"
+        );
+    }
+
+    #[test]
+    fn the_overview_counts_the_roster_beside_the_budget() {
+        let mut inspector = open_with(vec![run(RUN_ID, RunStatus::Active, vec![agent(None)])]);
+
+        let text = section_text(&mut inspector, '1');
+
+        assert!(text.contains(ROSTER_TALLY), "{text}");
     }
 
     #[test]
