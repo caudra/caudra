@@ -168,11 +168,19 @@ fn resolves_inside(operand: &str, workdir: &Path, project: &Path) -> bool {
     physical_boundary_check(project, &workdir.join(operand)) == Some(true)
 }
 
+/// The two forms resolution cannot be trusted to judge.
+///
+/// `join` treats `~` as an ordinary component, so `~/.ssh/id_rsa` would resolve
+/// to a file inside the project that happens not to exist and pass. A `..`
+/// climbing out of a path that does not exist has nothing to canonicalize
+/// against, so it has to be read off the text.
+///
+/// An absolute path has neither problem and is left to resolution: `join`
+/// replaces the base with it, and a path inside the project is inside the
+/// project however it was spelled.
 fn stays_inside(operand: &str) -> bool {
-    let path = Path::new(operand);
-    !path.is_absolute()
-        && !operand.starts_with('~')
-        && !path
+    !operand.starts_with('~')
+        && !Path::new(operand)
             .components()
             .any(|component| component == Component::ParentDir)
 }
@@ -325,6 +333,7 @@ mod tests {
     #[test_case("rg pattern src/deep/nested" => true ; "so_does_a_nested_one")]
     #[test_case("git log --oneline -20" => true ; "flags_are_not_paths")]
     #[test_case("git diff HEAD~1" => true ; "a_tilde_inside_a_revision_is_not_a_home_directory")]
+    #[test_case("cat /home/dev/project/notes.md" => true ; "an_absolute_operand_inside_is_inside")]
     #[test_case("cat /etc/shadow" => false ; "an_absolute_operand_escapes")]
     #[test_case("cat ~/.ssh/id_rsa" => false ; "a_home_operand_escapes")]
     #[test_case("cat ../../secret" => false ; "a_parent_segment_escapes")]
