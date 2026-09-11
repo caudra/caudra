@@ -6,6 +6,7 @@ pub(super) const MAX_PATTERN_TOKENS: usize = 8;
 const MAX_PREFIX_LITERALS: usize = 3;
 const WILDCARD_TOKEN: &str = "*";
 pub(super) const WILDCARD_SUFFIX: &str = " *";
+const SED: &str = "sed";
 
 pub(crate) const BUILTIN_ASK_PATTERNS: &[&str] = &[
     "rm *",
@@ -166,10 +167,10 @@ pub(crate) fn reusable_prefix(command: &str) -> Option<String> {
     }
 
     let literals = match super::command_arity::curated_literals(&prefix) {
-        Some(curated) => curated_literals(&prefix, curated)?,
+        Some((named, curated)) => curated_literals(&prefix, named, curated)?,
         None => heuristic_literals(&prefix, tokens.len())?,
     };
-    if overlaps_builtin_ask(literals) {
+    if overlaps_builtin_ask(literals) || !sed_prefix_is_offerable(&prefix) {
         return None;
     }
 
@@ -178,16 +179,29 @@ pub(crate) fn reusable_prefix(command: &str) -> Option<String> {
 }
 
 /// A curated entry is a deliberate decision, so it may keep a bare executable or
-/// the whole command where the heuristic may not. It still refuses to reach past
-/// a flag, because `git -C /repo commit` would otherwise yield `git -C *`, and
-/// past a token that did not decode, which is why it counts against the prefix
-/// rather than against the command.
-fn curated_literals(prefix: &[String], literals: usize) -> Option<&[String]> {
+/// the whole command where the heuristic may not. Past the tokens the entry
+/// named, it still refuses to reach over a flag, because `git -C /repo commit`
+/// would otherwise yield `git -C *`, and over a token that did not decode, which
+/// is why it counts against the prefix rather than against the command.
+fn curated_literals(prefix: &[String], named: usize, literals: usize) -> Option<&[String]> {
     (literals <= prefix.len()
-        && prefix[1..literals]
+        && prefix[named..literals]
             .iter()
             .all(|token| is_subcommand_word(token)))
     .then(|| &prefix[..literals])
+}
+
+/// `sed -n *` covers `sed -n '1w /etc/x'` too, because `-n` says nothing about
+/// the script. Offering the rung only for a call whose own script only prints
+/// keeps the suggestion and the read-only classifier on one definition.
+fn sed_prefix_is_offerable(prefix: &[String]) -> bool {
+    prefix.first().is_none_or(|executable| executable != SED)
+        || super::sed_only_prints(
+            &prefix[1..]
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<&str>>(),
+        )
 }
 
 /// Without curation the leading tokens are only guessed to be subcommands, so a
@@ -542,6 +556,11 @@ mod tests {
     #[test_case("go build ./...", Some("go build *"))]
     #[test_case("go run ./cmd/app", None; "curated prefix stops at a path operand")]
     #[test_case("docker -H tcp://host run nginx", None; "curated prefix stops at a flag")]
+    #[test_case("sed -n '1,140p' src/main.rs", Some("sed -n *"); "a curated entry may name a flag")]
+    #[test_case(r#"sed -n '1,2p' "$F""#, Some("sed -n *"); "an operand does not decide the question")]
+    #[test_case("sed -i 's/a/b/' f.rs", None; "a writing sed is offered nothing")]
+    #[test_case("sed -n '1w /tmp/x' f.rs", None; "a printing flag over a writing script")]
+    #[test_case(r#"sed -n "$SCRIPT" f.rs"#, None; "a script outside the command is offered nothing")]
     #[test_case("git checkout main --force", None; "prefix of a builtin ask family")]
     #[test_case("ssh host run backup", None; "extends a builtin ask family")]
     fn derives_only_reusable_static_prefixes(command: &str, expected: Option<&str>) {
