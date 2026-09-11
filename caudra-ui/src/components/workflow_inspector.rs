@@ -51,6 +51,8 @@ const NO_SELECTION: &str = "Select a run";
 const LOADING: &str = "Loading\u{2026}";
 const NO_PHASES: &str = "No phases yet";
 const NO_AGENTS: &str = "No agents yet";
+const NO_AGENTS_IN_PHASE: &str = "This phase dispatched no agents";
+const UNPHASED_GROUP: &str = "No phase";
 const NO_CALLS: &str = "No calls yet";
 const NO_LOGS: &str = "No log lines yet";
 const NO_RESULT: &str = "No result yet";
@@ -240,7 +242,7 @@ impl Section {
     /// Sections whose rows a cursor walks. Enter also acts on the result,
     /// which has one thing to open and no cursor to place.
     fn has_items(self) -> bool {
-        matches!(self, Self::Agents | Self::Calls)
+        matches!(self, Self::Phases | Self::Agents | Self::Calls)
     }
 
     /// Logs follow their tail; everything else opens at the top.
@@ -634,7 +636,9 @@ impl WorkflowInspector {
                 .position(|(start, height)| (*start..start.saturating_add(*height)).contains(&row));
             match (self.section, hit) {
                 (Section::Result, Some(_)) => return self.activate(),
-                (Section::Calls, Some(index)) if index == self.cursor => return self.activate(),
+                (Section::Phases | Section::Calls, Some(index)) if index == self.cursor => {
+                    return self.activate();
+                }
                 (_, Some(index)) => self.cursor = index,
                 (_, None) => {}
             }
@@ -736,9 +740,10 @@ impl WorkflowInspector {
 
     fn activate(&mut self) -> InspectorAction {
         match self.section {
+            Section::Phases => self.open_phase(),
             Section::Agents => match self
                 .selected_run()
-                .and_then(|run| run.roster.get(self.cursor))
+                .and_then(|run| agent_order(run).get(self.cursor).map(|at| &run.roster[*at]))
             {
                 Some(agent) => match &agent.task_id {
                     Some(task_id) => InspectorAction::OpenTranscript(task_id.clone()),
@@ -765,6 +770,29 @@ impl WorkflowInspector {
             },
             _ => InspectorAction::Consumed,
         }
+    }
+
+    /// A phase row is a link into the roster: opening it lands the cursor on
+    /// the first agent that phase dispatched.
+    fn open_phase(&mut self) -> InspectorAction {
+        let Some(run) = self.selected_run() else {
+            return InspectorAction::Consumed;
+        };
+        let Some(title) = phase_titles(run)
+            .get(self.cursor)
+            .map(|title| title.to_string())
+        else {
+            return InspectorAction::Consumed;
+        };
+        let Some(at) = agent_order(run)
+            .iter()
+            .position(|index| run.roster[*index].phase.as_deref() == Some(title.as_str()))
+        else {
+            return InspectorAction::Flash(NO_AGENTS_IN_PHASE);
+        };
+        self.set_section(Section::Agents);
+        self.cursor = at;
+        InspectorAction::Consumed
     }
 
     fn control(&mut self, control: RunControl) -> InspectorAction {
@@ -881,9 +909,17 @@ impl WorkflowInspector {
 
     fn item_count(&self) -> usize {
         match self.section {
+            Section::Phases => self.selected_run().map_or(0, |run| phase_titles(run).len()),
             Section::Agents => self.selected_run().map_or(0, |run| run.roster.len()),
             Section::Calls => self.calls().len(),
             _ => 0,
+        }
+    }
+
+    fn cursor_mark(&self, position: usize) -> &'static str {
+        match self.pane == Pane::Detail && position == self.cursor {
+            true => CURSOR_MARK,
+            false => NO_MARK,
         }
     }
 
@@ -1110,7 +1146,7 @@ impl WorkflowInspector {
         };
         match self.section {
             Section::Overview => (self.overview_lines(run, now), Vec::new()),
-            Section::Phases => (phase_lines(run, now), Vec::new()),
+            Section::Phases => self.phase_lines(run, now),
             Section::Agents => self.agent_lines(run),
             Section::Calls => self.call_lines(),
             Section::Logs => (self.log_lines(run), Vec::new()),
@@ -1186,48 +1222,122 @@ impl WorkflowInspector {
         lines
     }
 
+    /// What the run has walked, then what the script still declares ahead of
+    /// it. The entered phases are listed in the order they happened, repeats
+    /// included, because the timeline is the record; the declared phases it
+    /// has not reached follow as pending, because that is the part still to
+    /// come.
+    fn phase_lines(&self, run: &RunSnapshot, now: u64) -> (Vec<Line<'static>>, Vec<usize>) {
+        let t = theme::current();
+        let titles = phase_titles(run);
+        if titles.is_empty() {
+            return (vec![Line::styled(NO_PHASES, t.tool_dim)], Vec::new());
+        }
+        let end = match run.status.is_terminal() {
+            true => run.updated_at,
+            false => now,
+        };
+        let last = run.phase_history.len().saturating_sub(1);
+        let mut lines: Vec<Line<'static>> = run
+            .phase_history
+            .iter()
+            .enumerate()
+            .map(|(index, record)| {
+                let next_start = run
+                    .phase_history
+                    .get(index + 1)
+                    .map_or(end, |next| next.started_at);
+                let (mark, style) = match index == last && !run.status.is_terminal() {
+                    true => (PhaseMark::Current, t.accent),
+                    false => (PhaseMark::Done, t.tool_success),
+                };
+                // A phase entered twice would otherwise claim its agents twice
+                // over, reading as more agents than the run ever dispatched.
+                let final_visit = run
+                    .phase_history
+                    .iter()
+                    .rposition(|other| other.title == record.title)
+                    == Some(index);
+                let mut spans = vec![
+                    Span::styled(self.cursor_mark(index), t.accent),
+                    Span::styled(format!("{} ", mark.glyph()), style),
+                    Span::styled(escape_terminal_controls(&record.title), t.bold),
+                    Span::styled(
+                        format!(
+                            "{SEPARATOR}{}{SEPARATOR}{}",
+                            offset_text(record.started_at.saturating_sub(run.created_at)),
+                            format_elapsed(next_start.saturating_sub(record.started_at))
+                        ),
+                        t.tool_dim,
+                    ),
+                ];
+                if final_visit && let Some(tally) = agent_tally(run, &record.title) {
+                    spans.push(Span::styled(tally, t.tool_dim));
+                }
+                Line::from(spans)
+            })
+            .collect();
+        let walked = run.phase_history.len();
+        lines.extend(
+            titles
+                .iter()
+                .skip(walked)
+                .enumerate()
+                .map(|(offset, title)| {
+                    Line::from(vec![
+                        Span::styled(self.cursor_mark(walked + offset), t.accent),
+                        Span::styled(format!("{} ", PhaseMark::Pending.glyph()), t.tool_dim),
+                        Span::styled(escape_terminal_controls(title), t.tool_dim),
+                    ])
+                }),
+        );
+        let starts = (0..lines.len()).collect();
+        (lines, starts)
+    }
+
+    /// The roster gathered under the phase that dispatched each agent, so a
+    /// fan-out reads as the phase that opened it rather than as one long
+    /// list. A run whose agents carry no phase keeps the plain list.
     fn agent_lines(&self, run: &RunSnapshot) -> (Vec<Line<'static>>, Vec<usize>) {
         let t = theme::current();
         if run.roster.is_empty() {
             return (vec![Line::styled(NO_AGENTS, t.tool_dim)], Vec::new());
         }
         let spinner = spinner_str(animation_elapsed_ms());
-        let lines = run
-            .roster
-            .iter()
-            .enumerate()
-            .map(|(index, agent)| {
-                let mark = match self.pane == Pane::Detail && index == self.cursor {
-                    true => CURSOR_MARK,
-                    false => NO_MARK,
-                };
-                let state = match agent.state {
-                    RosterState::Running => Span::styled(spinner.to_owned(), t.spinner),
-                    state => Span::styled(format!("{state} "), roster_style(state)),
-                };
-                let mut spans = vec![
-                    Span::styled(mark, t.accent),
-                    state,
-                    Span::styled(escape_terminal_controls(&agent.label), t.bold),
-                ];
-                if let Some(phase) = &agent.phase {
-                    spans.push(Span::styled(
-                        format!("{SEPARATOR}{}", escape_terminal_controls(phase)),
-                        t.tool_dim,
-                    ));
+        let grouped = run.roster.iter().any(|agent| agent.phase.is_some());
+        let mut lines: Vec<Line<'static>> = Vec::with_capacity(run.roster.len());
+        let mut starts = Vec::with_capacity(run.roster.len());
+        let mut group: Option<&str> = None;
+        for (position, index) in agent_order(run).into_iter().enumerate() {
+            let agent = &run.roster[index];
+            let header = agent.phase.as_deref().unwrap_or(UNPHASED_GROUP);
+            if grouped && group != Some(header) {
+                if group.is_some() {
+                    lines.push(Line::default());
                 }
-                spans.push(Span::styled(
+                lines.push(Line::styled(escape_terminal_controls(header), t.tool_dim));
+                group = Some(header);
+            }
+            let state = match agent.state {
+                RosterState::Running => Span::styled(spinner.to_owned(), t.spinner),
+                state => Span::styled(format!("{state} "), roster_style(state)),
+            };
+            starts.push(lines.len());
+            lines.push(Line::from(vec![
+                Span::styled(self.cursor_mark(position), t.accent),
+                state,
+                Span::styled(escape_terminal_controls(&agent.label), t.bold),
+                Span::styled(
                     format!(
                         "{SEPARATOR}{}{TOKENS_UNIT}{SEPARATOR}{}",
                         format_compact(agent.tokens_used),
                         format_elapsed(agent.duration_ms / 1_000)
                     ),
                     t.tool_dim,
-                ));
-                Line::from(spans)
-            })
-            .collect();
-        ((lines), (0..run.roster.len()).collect())
+                ),
+            ]));
+        }
+        (lines, starts)
     }
 
     fn call_lines(&self) -> (Vec<Line<'static>>, Vec<usize>) {
@@ -1440,74 +1550,32 @@ fn list_row(
     Line::from(spans)
 }
 
-/// What the run has walked, then what the script still declares ahead of
-/// it. The entered phases are listed in the order they happened, repeats
-/// included, because the timeline is the record; the declared phases it has
-/// not reached follow as pending, because that is the part still to come.
-fn phase_lines(run: &RunSnapshot, now: u64) -> Vec<Line<'static>> {
-    let t = theme::current();
-    let pending = run
-        .phases
-        .iter()
-        .filter(|title| {
-            !run.phase_history
-                .iter()
-                .any(|record| record.title == **title)
-        })
-        .collect::<Vec<_>>();
-    if run.phase_history.is_empty() && pending.is_empty() {
-        return vec![Line::styled(NO_PHASES, t.tool_dim)];
-    }
-    let end = match run.status.is_terminal() {
-        true => run.updated_at,
-        false => now,
-    };
-    let last = run.phase_history.len().saturating_sub(1);
-    let mut lines: Vec<Line<'static>> = run
-        .phase_history
-        .iter()
-        .enumerate()
-        .map(|(index, record)| {
-            let next_start = run
-                .phase_history
-                .get(index + 1)
-                .map_or(end, |next| next.started_at);
-            let (mark, style) = match index == last && !run.status.is_terminal() {
-                true => (PhaseMark::Current, t.accent),
-                false => (PhaseMark::Done, t.tool_success),
-            };
-            // A phase entered twice would otherwise claim its agents twice
-            // over, reading as more agents than the run ever dispatched.
-            let final_visit = run
-                .phase_history
-                .iter()
-                .rposition(|other| other.title == record.title)
-                == Some(index);
-            let mut spans = vec![
-                Span::styled(format!("{} ", mark.glyph()), style),
-                Span::styled(escape_terminal_controls(&record.title), t.bold),
-                Span::styled(
-                    format!(
-                        "{SEPARATOR}{}{SEPARATOR}{}",
-                        offset_text(record.started_at.saturating_sub(run.created_at)),
-                        format_elapsed(next_start.saturating_sub(record.started_at))
-                    ),
-                    t.tool_dim,
-                ),
-            ];
-            if final_visit && let Some(tally) = agent_tally(run, &record.title) {
-                spans.push(Span::styled(tally, t.tool_dim));
-            }
-            Line::from(spans)
-        })
-        .collect();
-    lines.extend(pending.into_iter().map(|title| {
-        Line::from(vec![
-            Span::styled(format!("{} ", PhaseMark::Pending.glyph()), t.tool_dim),
-            Span::styled(escape_terminal_controls(title), t.tool_dim),
-        ])
-    }));
-    lines
+/// Every phase row in display order: the ones the run walked, repeats
+/// included, then the declared ones it has not reached.
+fn phase_titles(run: &RunSnapshot) -> Vec<&str> {
+    let walked = run.phase_history.iter().map(|record| record.title.as_str());
+    let pending = run.phases.iter().map(String::as_str).filter(|title| {
+        !run.phase_history
+            .iter()
+            .any(|record| record.title == *title)
+    });
+    walked.chain(pending).collect()
+}
+
+/// Roster indices in display order: the agents of a phase together, phases
+/// in the order the run walked or declared them, unphased agents last. The
+/// sort is stable, so a phase keeps its dispatch order.
+fn agent_order(run: &RunSnapshot) -> Vec<usize> {
+    let titles = phase_titles(run);
+    let mut order: Vec<usize> = (0..run.roster.len()).collect();
+    order.sort_by_key(|index| match &run.roster[*index].phase {
+        Some(phase) => titles
+            .iter()
+            .position(|title| *title == phase)
+            .unwrap_or(titles.len()),
+        None => titles.len() + 1,
+    });
+    order
 }
 
 /// `3/8 done` across the whole roster, so the overview says how much of the
@@ -1658,6 +1726,11 @@ mod tests {
     const CLOCK_IS_LAST: &str = "the clock holds the right edge of a run row";
     const PHASE_COUNTS_ITS_OWN: &str = "a phase row counts the agents it dispatched";
     const PENDING_IS_LISTED: &str = "a declared phase the run has not reached is listed";
+    const EARLY_AGENT: &str = "scout";
+    const LATE_AGENT: &str = "writer";
+    const GROUPS_ARE_HEADED: &str = "a group of agents is headed by its phase";
+    const GROUPS_FOLLOW_THE_PLAN: &str = "phase groups follow the order the run declares";
+    const PHASE_OPENS_ITS_GROUP: &str = "opening a phase moves the cursor to the agents it opened";
 
     pub(crate) fn run(
         run_id: &str,
@@ -1900,6 +1973,74 @@ mod tests {
             text.contains(&format!("{} {PHASE_TWO}", PhaseMark::Pending.glyph())),
             "{PENDING_IS_LISTED}: {text}"
         );
+    }
+
+    fn phased(label: &str, phase: &str) -> AgentRosterEntry {
+        AgentRosterEntry {
+            label: label.into(),
+            phase: Some(phase.into()),
+            ..agent(None)
+        }
+    }
+
+    /// A run whose roster is stored out of phase order, so display order has
+    /// to be the grouping and not the storage.
+    fn fanned_out() -> RunSnapshot {
+        let mut walking = run(
+            RUN_ID,
+            RunStatus::Active,
+            vec![
+                phased(LATE_AGENT, PHASE_TWO),
+                phased(EARLY_AGENT, PHASE_ONE),
+            ],
+        );
+        walking.phases = vec![PHASE_ONE.into(), PHASE_TWO.into()];
+        walking
+    }
+
+    /// Puts the cursor on the second phase row.
+    fn walk_to_second_phase(inspector: &mut WorkflowInspector) {
+        let _ = inspector.handle_key(key_event(KeyCode::Char('2')));
+        let _ = inspector.handle_key(key_event(KeyCode::Right));
+        let _ = inspector.handle_key(key_event(KeyCode::Down));
+    }
+
+    #[test]
+    fn agents_gather_under_the_phase_that_dispatched_them() {
+        let mut inspector = open_with(vec![fanned_out()]);
+
+        let text = section_text(&mut inspector, '3');
+
+        let early = text.find(EARLY_AGENT).expect(&text);
+        let late = text.find(LATE_AGENT).expect(&text);
+        let header = text.find(PHASE_ONE).expect(&text);
+        assert!(header < early, "{GROUPS_ARE_HEADED}: {text}");
+        assert!(early < late, "{GROUPS_FOLLOW_THE_PLAN}: {text}");
+    }
+
+    #[test]
+    fn opening_a_phase_row_lands_on_its_first_agent() {
+        let mut inspector = open_with(vec![fanned_out()]);
+        walk_to_second_phase(&mut inspector);
+
+        let action = inspector.handle_key(key_event(KeyCode::Enter));
+
+        assert_eq!(action, InspectorAction::Consumed);
+        assert_eq!(inspector.section, Section::Agents);
+        assert_eq!(inspector.cursor, 1, "{PHASE_OPENS_ITS_GROUP}");
+    }
+
+    #[test]
+    fn a_phase_that_dispatched_nothing_says_so() {
+        let mut walking = fanned_out();
+        walking.roster.remove(0);
+        let mut inspector = open_with(vec![walking]);
+        walk_to_second_phase(&mut inspector);
+
+        let action = inspector.handle_key(key_event(KeyCode::Enter));
+
+        assert_eq!(action, InspectorAction::Flash(NO_AGENTS_IN_PHASE));
+        assert_eq!(inspector.section, Section::Phases);
     }
 
     #[test]
