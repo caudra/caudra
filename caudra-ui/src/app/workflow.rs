@@ -684,13 +684,15 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
-    use crate::app::Msg;
-    use crate::app::tests::{click_status, mouse_event, status_hit, test_app};
+    use crate::app::tests::{
+        cancel_app, click_status, end_turn, mouse_event, status_hit, streaming_app, test_app,
+    };
+    use crate::app::{MISSING_TOOL_COMPLETION, Msg};
     use crate::components::command::ParsedCommand;
     use crate::components::key;
     use crate::components::keybindings::{key as kb, leader};
     use crate::components::status_bar::StatusBarHitTarget;
-    use crate::components::{DisplayRole, ToolStatus, workflow_card};
+    use crate::components::{DisplayMessage, DisplayRole, ToolStatus, workflow_card};
     use caudra_agent::ToolOutput;
 
     const RUN_ID: &str = "run-1";
@@ -706,6 +708,7 @@ mod tests {
     const CARD_FOLLOWS: &str = "the card must follow the run's snapshots";
     const LOG_MIRRORED: &str = "a log line must reach the mirror's tail";
     const NO_CARD_CHURN: &str = "an agent's activity must not touch the transcript";
+    const CARD_SURVIVES: &str = "a run that is still going keeps its card";
     const OTHER_RUN_ID: &str = "run-2";
     const OTHER_DISPLAY_NAME: &str = "deep-research-2";
     const NAME_PREFIX: &str = "deep-research-";
@@ -1306,6 +1309,60 @@ mod tests {
             ),
             "{CARD_DRAWN}"
         );
+    }
+
+    /// A launched run mid-turn, which is when both sweeps can reach its card.
+    fn app_watching_a_run() -> App {
+        let mut app = streaming_app();
+        app.workflow.script();
+        app.on_workflow_reply(Reply {
+            intent: Intent::Launch,
+            result: Ok(WorkflowResponse::Started(Box::new(run(RunStatus::Active)))),
+        });
+        app
+    }
+
+    fn drawn_card(app: &mut App) -> DisplayMessage {
+        app.main_chat().message_at(0).unwrap().clone()
+    }
+
+    fn assert_card_is_live(card: &DisplayMessage) {
+        assert!(
+            matches!(
+                card.tool_output.as_deref(),
+                Some(ToolOutput::WorkflowRun(_))
+            ),
+            "{CARD_SURVIVES}"
+        );
+        assert!(
+            matches!(&card.role, DisplayRole::Tool(tool) if tool.status == ToolStatus::InProgress),
+            "{CARD_SURVIVES}"
+        );
+    }
+
+    /// The card of a run that is still going is a live view, not a call the
+    /// turn is waiting on: the sweep that ends a turn would otherwise stamp
+    /// it as unfinished and replace the card with that error.
+    #[test]
+    fn a_live_run_card_survives_the_end_of_the_turn() {
+        let mut app = app_watching_a_run();
+
+        end_turn(&mut app);
+
+        let card = drawn_card(&mut app);
+        assert_card_is_live(&card);
+        assert!(!card.text.contains(MISSING_TOOL_COMPLETION), "{card:?}");
+    }
+
+    /// Cancelling the turn leaves workflow runs alone, so the card of one
+    /// still going must not be marked failed either.
+    #[test]
+    fn a_live_run_card_survives_a_cancelled_turn() {
+        let mut app = app_watching_a_run();
+
+        cancel_app(&mut app);
+
+        assert_card_is_live(&drawn_card(&mut app));
     }
 
     #[test]

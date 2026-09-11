@@ -3129,7 +3129,7 @@ fn batch_subagent_done_marker(is_error: bool, expected_text: &str, expected_role
     assert_eq!(app.chats[1].last_message_role(), Some(expected_role));
 }
 
-fn streaming_app() -> App {
+pub(crate) fn streaming_app() -> App {
     let mut app = test_app();
     app.status = Status::Streaming;
     app.run_id = 1;

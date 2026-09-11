@@ -1647,6 +1647,7 @@ impl MessagesPanel {
                 if let DisplayRole::Tool(t) = &m.role
                     && t.status == ToolStatus::InProgress
                     && !excluded.contains(&t.id)
+                    && !Self::is_live_workflow(m)
                 {
                     Some((t.id.clone(), Arc::clone(&t.name)))
                 } else {
@@ -1677,6 +1678,9 @@ impl MessagesPanel {
             .messages
             .iter_mut()
             .filter_map(|msg| {
+                if Self::is_live_workflow(msg) {
+                    return None;
+                }
                 if let DisplayRole::Tool(t) = &mut msg.role
                     && t.status == ToolStatus::InProgress
                 {
@@ -1713,6 +1717,13 @@ impl MessagesPanel {
 
     fn is_running(msg: &DisplayMessage) -> bool {
         matches!(&msg.role, DisplayRole::Tool(t) if t.status == ToolStatus::InProgress)
+    }
+
+    /// A workflow card is a live view of a run that outlives the turn that
+    /// started it, not a call waiting to report. The sweeps that end a turn
+    /// leave it to the runtime, which keeps repainting it from snapshots.
+    fn is_live_workflow(msg: &DisplayMessage) -> bool {
+        matches!(msg.tool_output.as_deref(), Some(ToolOutput::WorkflowRun(_)))
     }
 
     #[cfg(test)]
