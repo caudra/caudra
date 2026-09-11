@@ -453,6 +453,19 @@ impl ModalScroll {
     pub fn scroll(&mut self, delta: i32) {
         self.offset = apply_scroll_delta(self.offset, delta);
         self.clamp();
+        self.repin();
+    }
+
+    /// Lands on a row rather than stepping towards one, which is what a
+    /// scrollbar drag hands over. Re-pins at the bottom like a wheel does, so
+    /// dragging to the end resumes following a growing modal.
+    pub fn scroll_to(&mut self, offset: u16) {
+        self.offset = offset;
+        self.clamp();
+        self.repin();
+    }
+
+    fn repin(&mut self) {
         if self.max_offset > 0 {
             self.auto_scroll = self.offset >= self.max_offset;
         }

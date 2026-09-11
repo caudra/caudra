@@ -12,7 +12,7 @@ use ratatui::widgets::{Paragraph, Wrap};
 
 use crate::components::keybindings::key;
 use crate::components::modal::{CHROME_LINES, FooterHits, FooterLine, Modal};
-use crate::components::scrollbar::render_vertical_scrollbar;
+use crate::components::scrollbar::{Scrollbar, ScrollbarMouse};
 use crate::components::{
     ModalScroll, Overlay, apportion, escape_terminal_controls, format_integer, format_usize,
 };
@@ -36,6 +36,7 @@ pub struct ContextModal {
     open: bool,
     expanded: bool,
     scroll: ModalScroll,
+    scrollbar: Scrollbar,
     popup: Rect,
     footer: FooterHits,
 }
@@ -46,6 +47,7 @@ impl ContextModal {
             open: false,
             expanded: false,
             scroll: ModalScroll::new_top(),
+            scrollbar: Scrollbar::default(),
             popup: Rect::default(),
             footer: FooterHits::default(),
         }
@@ -87,6 +89,14 @@ impl ContextModal {
     }
 
     pub fn handle_mouse(&mut self, event: MouseEvent) {
+        match self.scrollbar.handle(&event) {
+            ScrollbarMouse::Ignored => {}
+            ScrollbarMouse::Consumed => return,
+            ScrollbarMouse::ScrollTo(top) => {
+                self.scroll.scroll_to(top as u16);
+                return;
+            }
+        }
         if self.footer.handle_mouse(event).is_some() {
             self.open(!self.expanded);
         }
@@ -146,9 +156,7 @@ impl ContextModal {
                 .scroll((offset, 0)),
             padded,
         );
-        if total > padded.height {
-            render_vertical_scrollbar(frame, inner, total, offset);
-        }
+        self.scrollbar.draw(frame, inner, total, offset);
 
         self.popup = popup;
         popup
@@ -959,6 +967,7 @@ mod tests {
 
     use super::*;
     use crate::components::key as key_event;
+    use caudra_workbench::scroll::SCROLLBAR_THUMB;
 
     const MODEL_SPEC: &str = "test/large";
     const MCP_TOOL: &str = "issues.fetch";
@@ -968,6 +977,7 @@ mod tests {
     const MEMORY_FILE: &str = "project.md";
     const SKILL: &str = "deploy";
     const HOVER_MISSED: &str = "the footer command must reverse under the pointer";
+    const BAR_SCROLL_MISSED: &str = "a press on the bar's column must scroll the body";
 
     fn snapshot() -> ContextSnapshot {
         ContextSnapshot {
@@ -1187,6 +1197,37 @@ mod tests {
         modal.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), expanded_hit));
         modal.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), expanded_hit));
         assert!(!modal.expanded);
+    }
+
+    #[test]
+    fn a_press_on_the_bar_scrolls_the_body() {
+        const WIDTH: u16 = 100;
+        const HEIGHT: u16 = 16;
+
+        let backend = TestBackend::new(WIDTH, HEIGHT);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut modal = ContextModal::new();
+        let snapshot = snapshot();
+        modal.open(true);
+        let mut popup = Rect::default();
+        terminal
+            .draw(|frame| {
+                popup = modal.view(frame, frame.area(), Some(&snapshot));
+            })
+            .unwrap();
+
+        let thumb = (0..HEIGHT)
+            .flat_map(|y| (0..WIDTH).map(move |x| Position::new(x, y)))
+            .find(|at| terminal.backend().buffer()[(at.x, at.y)].symbol() == SCROLLBAR_THUMB)
+            .expect(BAR_SCROLL_MISSED);
+        let bottom_of_track = Rect::new(thumb.x, popup.bottom() - 2, 1, 1);
+
+        modal.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            bottom_of_track,
+        ));
+
+        assert!(modal.scroll.offset() > 0, "{BAR_SCROLL_MISSED}");
     }
 
     #[test_case(1, 100 ; "one_column")]

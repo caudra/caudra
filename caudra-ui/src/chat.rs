@@ -6,6 +6,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crossterm::event::MouseEvent;
+
 use crate::app::tasks::{TaskOutcome, TaskStatus};
 use crate::components::messages::{MessagesPanel, PromptProgress};
 use crate::components::tool_display::append_annotation;
@@ -352,6 +354,10 @@ impl Chat {
 
     pub fn set_scroll_top(&mut self, top: u32) {
         self.messages_panel.set_scroll_top(top);
+    }
+
+    pub fn handle_scrollbar(&mut self, event: &MouseEvent) -> bool {
+        self.messages_panel.handle_scrollbar(event)
     }
 
     pub fn half_page(&self) -> i32 {

@@ -9,7 +9,7 @@ use caudra_providers::{
 };
 use caudra_storage::sessions::StoredTokenUsage;
 use caudra_storage::usage_ledger::{LifetimeUsage, UsageSlice};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
 use ratatui::Frame;
@@ -21,7 +21,7 @@ use ratatui::widgets::Paragraph;
 use crate::components::ModalScroll;
 use crate::components::keybindings::{Bind, key};
 use crate::components::modal::Modal;
-use crate::components::scrollbar::render_vertical_scrollbar;
+use crate::components::scrollbar::{Scrollbar, ScrollbarMouse};
 use crate::repaint::{Dirty, Watch};
 use crate::theme;
 
@@ -89,6 +89,7 @@ pub struct UsageModal {
     open: bool,
     scope: UsageScope,
     scroll: ModalScroll,
+    scrollbar: Scrollbar,
     quota: Watch<UsageFetchState>,
     popup: Rect,
 }
@@ -99,6 +100,7 @@ impl UsageModal {
             open: false,
             scope: UsageScope::default(),
             scroll: ModalScroll::new_top(),
+            scrollbar: Scrollbar::default(),
             quota: Watch::default(),
             popup: Rect::default(),
         }
@@ -146,6 +148,19 @@ impl UsageModal {
         self.scroll.reset();
     }
 
+    /// The modal reads nothing else from the pointer, so the bar is all there
+    /// is to offer and a bool is all there is to say.
+    pub fn handle_mouse(&mut self, event: &MouseEvent) -> bool {
+        match self.scrollbar.handle(event) {
+            ScrollbarMouse::Ignored => false,
+            ScrollbarMouse::Consumed => true,
+            ScrollbarMouse::ScrollTo(top) => {
+                self.scroll.scroll_to(top as u16);
+                true
+            }
+        }
+    }
+
     pub fn scroll(&mut self, delta: i32) {
         self.scroll.scroll(delta);
     }
@@ -189,9 +204,7 @@ impl UsageModal {
 
         frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), inner);
 
-        if total > viewport_h {
-            render_vertical_scrollbar(frame, inner, total, scroll);
-        }
+        self.scrollbar.draw(frame, inner, total, scroll);
 
         let hint = Line::from(vec![
             Span::raw(" "),

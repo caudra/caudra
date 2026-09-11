@@ -25,7 +25,7 @@ use ratatui::widgets::{Paragraph, Wrap};
 
 use crate::animation::{animation_elapsed_ms, spinner_str};
 use crate::components::modal::{FooterHits, FooterLine, Modal};
-use crate::components::scrollbar::render_vertical_scrollbar;
+use crate::components::scrollbar::{Scrollbar, ScrollbarMouse};
 use crate::components::workflow_card::{phase_strip_line, status_span};
 use crate::components::{
     ModalScroll, Overlay, ToolProgress, escape_terminal_controls, format_compact, format_elapsed,
@@ -341,6 +341,7 @@ pub struct WorkflowInspector {
     cursor: usize,
     expanded_call: Option<u64>,
     scroll: ModalScroll,
+    scrollbar: Scrollbar,
     list_offset: u16,
     popup: Rect,
     list_area: Rect,
@@ -375,6 +376,7 @@ impl WorkflowInspector {
             cursor: 0,
             expanded_call: None,
             scroll: Section::Overview.scroll(),
+            scrollbar: Scrollbar::default(),
             list_offset: 0,
             popup: Rect::default(),
             list_area: Rect::default(),
@@ -644,6 +646,14 @@ impl WorkflowInspector {
     }
 
     pub fn handle_mouse(&mut self, event: MouseEvent) -> InspectorAction {
+        match self.scrollbar.handle(&event) {
+            ScrollbarMouse::Ignored => {}
+            ScrollbarMouse::Consumed => return InspectorAction::Consumed,
+            ScrollbarMouse::ScrollTo(top) => {
+                self.scroll.scroll_to(top as u16);
+                return InspectorAction::Consumed;
+            }
+        }
         let pos = Position::new(event.column, event.row);
         if let Some(index) = self.footer_hits.handle_mouse(event) {
             return self.footer_command(index);
@@ -1169,9 +1179,8 @@ impl WorkflowInspector {
                 .scroll((self.scroll.offset(), 0)),
             area,
         );
-        if rows.total > area.height {
-            render_vertical_scrollbar(frame, area, rows.total, self.scroll.offset());
-        }
+        self.scrollbar
+            .draw(frame, area, rows.total, self.scroll.offset());
     }
 
     /// The selected section as lines, and the logical line each of its

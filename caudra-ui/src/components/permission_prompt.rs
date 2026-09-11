@@ -13,7 +13,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
 use serde_json::{Map, Value};
 
-use crate::components::scrollbar::render_vertical_scrollbar;
+use crate::components::scrollbar::{Scrollbar, ScrollbarMouse};
 use crate::components::{
     ModalScroll, Overlay, VisualRows, escape_terminal_controls, hint_line_hovered, hover_style,
     is_ctrl, visual_rows,
@@ -260,6 +260,7 @@ pub struct PermissionPrompt {
     state: PromptState,
     buffer: TextBuffer,
     scroll: ModalScroll,
+    scrollbar: Scrollbar,
     selected_option: String,
     /// Where each command row sits on its ladder, positional with the
     /// request's resources.
@@ -321,6 +322,7 @@ impl PermissionPrompt {
             state: PromptState::Normal,
             buffer: TextBuffer::new(String::new()),
             scroll: ModalScroll::new_top(),
+            scrollbar: Scrollbar::default(),
             selected_option: "allow_exact".into(),
             scopes: Vec::new(),
             pending_reveal: None,
@@ -680,9 +682,7 @@ impl PermissionPrompt {
                 .scroll((offset, 0)),
             body_area,
         );
-        if scrolling {
-            render_vertical_scrollbar(frame, body_area, total, offset);
-        }
+        self.scrollbar.draw(frame, body_area, total, offset);
         let footer_rows = self.footer_rows(footer_width, scrolling);
         frame.render_widget(
             Paragraph::new(self.footer_lines(footer_width, scrolling)),
@@ -777,6 +777,14 @@ impl PermissionPrompt {
     pub(crate) fn handle_mouse(&mut self, event: MouseEvent) -> PromptMouse {
         if !self.is_open() {
             return PromptMouse::Passthrough;
+        }
+        match self.scrollbar.handle(&event) {
+            ScrollbarMouse::Ignored => {}
+            ScrollbarMouse::Consumed => return PromptMouse::Consumed,
+            ScrollbarMouse::ScrollTo(top) => {
+                self.scroll.scroll_to(top as u16);
+                return PromptMouse::Consumed;
+            }
         }
         let pos = Position::new(event.column, event.row);
         match event.kind {
@@ -3090,6 +3098,31 @@ mod tests {
             prompt.scroll(-1);
         }
         assert!(narrower_than_full_width, "no authority was ever clickable");
+    }
+
+    /// The body's last column, which the row hits stop short of and the bar
+    /// owns.
+    const BAR_COLUMN: u16 = ROOMY_WIDTH - 2;
+    /// The first row inside the border, which the bar reads as the top of the
+    /// document whatever rounding put the thumb where it is.
+    const BODY_TOP_ROW: u16 = 1;
+    const EXPECT_BODY_SCROLLED: &str = "the cramped body has to scroll off its first row";
+    const EXPECT_BAR_SEEKED: &str = "the press on the bar has to move the body";
+
+    #[test]
+    fn a_press_on_the_scrollbar_seeks_the_body() {
+        let mut prompt = prompt_with_authorities();
+        render(&mut prompt, ROOMY_WIDTH, CRAMPED_HEIGHT);
+        prompt.scroll(-(BODY_PROBE_ROWS as i32));
+        render(&mut prompt, ROOMY_WIDTH, CRAMPED_HEIGHT);
+        assert!(prompt.scroll.offset() > 0, "{EXPECT_BODY_SCROLLED}");
+
+        let track_top = Rect::new(BAR_COLUMN, BODY_TOP_ROW, 1, 1);
+        assert!(matches!(
+            prompt.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), track_top)),
+            PromptMouse::Consumed
+        ));
+        assert_eq!(prompt.scroll.offset(), 0, "{EXPECT_BAR_SEEKED}");
     }
 
     #[test_case(HINT_ESC, KeyCode::Esc ; "named_esc")]

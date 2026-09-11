@@ -57,7 +57,7 @@ impl Section {
         }
     }
 
-    const fn index(self) -> usize {
+    pub(crate) const fn index(self) -> usize {
         self as usize
     }
 
@@ -366,6 +366,11 @@ impl Scm {
         let state = &mut self.sections[section.index()];
         let max = state.rows.len().saturating_sub(viewport);
         state.scroll = state.scroll.saturating_add_signed(delta).min(max);
+    }
+
+    pub fn set_scroll(&mut self, section: Section, top: usize, viewport: usize) {
+        let state = &mut self.sections[section.index()];
+        state.scroll = top.min(state.rows.len().saturating_sub(viewport));
     }
 
     /// Folds what the cursor is on, or steps out to whatever holds it. This is

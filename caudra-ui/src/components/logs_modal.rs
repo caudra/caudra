@@ -22,7 +22,7 @@ use ratatui::widgets::Paragraph;
 
 use crate::components::keybindings::key;
 use crate::components::modal::Modal;
-use crate::components::scrollbar::render_vertical_scrollbar;
+use crate::components::scrollbar::{Scrollbar, ScrollbarMouse};
 use crate::components::{
     Overlay, escape_terminal_controls, hint_line, hover_style, input_line_with_cursor, is_ctrl,
 };
@@ -138,6 +138,7 @@ pub struct LogsModal {
     /// it up. Recomputed each frame because the footer reflows with the path.
     level_hit: Rect,
     level_hovered: bool,
+    scrollbar: Scrollbar,
 }
 
 impl LogsModal {
@@ -164,6 +165,7 @@ impl LogsModal {
             rows: Vec::new(),
             level_hit: Rect::default(),
             level_hovered: false,
+            scrollbar: Scrollbar::default(),
         }
     }
 
@@ -427,6 +429,13 @@ impl LogsModal {
         self.clamp_selection();
     }
 
+    /// The bar names the row it wants at the top; the window only knows how to
+    /// travel, since a distance is what decides whether it has to read further
+    /// back in the file.
+    fn scroll_view_to(&mut self, top: usize) {
+        self.scroll_view(top as isize - self.view_top as isize);
+    }
+
     /// Keeps the cursor on a visible row, so copying or expanding after a
     /// wheel acts on something the reader can see.
     fn clamp_selection(&mut self) {
@@ -498,6 +507,14 @@ impl LogsModal {
     }
 
     pub fn handle_mouse(&mut self, event: MouseEvent) -> LogsAction {
+        match self.scrollbar.handle(&event) {
+            ScrollbarMouse::Ignored => {}
+            ScrollbarMouse::Consumed => return LogsAction::Consumed,
+            ScrollbarMouse::ScrollTo(top) => {
+                self.scroll_view_to(top as usize);
+                return LogsAction::Consumed;
+            }
+        }
         let pos = Position::new(event.column, event.row);
         match event.kind {
             MouseEventKind::ScrollUp => self.scroll_view(-1),
@@ -578,20 +595,18 @@ impl LogsModal {
         self.level_hit = hit_rect(footer, level);
         frame.render_widget(Paragraph::new(line), footer);
         let len = u16::try_from(self.window_len()).unwrap_or(u16::MAX);
-        if len > body_height {
-            let offset = u16::try_from(self.view_top).unwrap_or(u16::MAX);
-            // Against the body, not the whole modal: the search, hint, and
-            // status rows do not scroll and must not wear a track.
-            render_vertical_scrollbar(
-                frame,
-                Rect {
-                    height: body_height,
-                    ..inner
-                },
-                len,
-                offset,
-            );
-        }
+        let offset = u16::try_from(self.view_top).unwrap_or(u16::MAX);
+        // Against the body, not the whole modal: the search, hint, and status
+        // rows do not scroll and must not wear a track.
+        self.scrollbar.draw(
+            frame,
+            Rect {
+                height: body_height,
+                ..inner
+            },
+            len,
+            offset,
+        );
 
         self.popup = popup;
         popup
@@ -1237,6 +1252,7 @@ mod tests {
     const SEEDED: usize = 60;
     const OFF_CHIP: u16 = 250;
     const OFF_SCREEN: &str = "the cursor must stay on a visible row";
+    const BAR_IGNORED: &str = "a press on the bar's column must scroll the pane";
 
     /// Seeds a log directory and opens against it, so the tests never touch the
     /// real one and never depend on what a previous run happened to write.
@@ -1362,6 +1378,25 @@ mod tests {
         modal.handle_mouse(wheel(MouseEventKind::Down(MouseButton::Left), 1, 4));
 
         assert_eq!(modal.selected, 11);
+    }
+
+    #[test]
+    fn a_press_on_the_bar_scrolls_the_pane() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut modal = seeded_modal(tmp.path());
+        let _ = drawn(&mut modal);
+        assert!(modal.view_top > 0);
+
+        // The first row of a track is the top of the document by definition, so
+        // the press lands there wherever rounding painted the thumb.
+        let column = modal.body.right() + H_PAD - 1;
+        modal.handle_mouse(wheel(
+            MouseEventKind::Down(MouseButton::Left),
+            column,
+            modal.body.y,
+        ));
+
+        assert_eq!(modal.view_top, 0, "{BAR_IGNORED}");
     }
 
     const TOOL_RECORD: &str = r#"{"timestamp":"2026-09-09T14:22:07.418123Z","level":"INFO","fields":{"message":"tool result"},"target":"caudra::tool","spans":[{"name":"turn","session_id":"s-1","turn_id":4},{"name":"tool","tool_use_id":"tu-9"}]}"#;

@@ -1,4 +1,4 @@
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
@@ -8,7 +8,7 @@ use unicode_width::UnicodeWidthChar;
 
 use super::Overlay;
 use super::modal::Modal;
-use super::scrollbar::render_vertical_scrollbar;
+use super::scrollbar::{Scrollbar, ScrollbarMouse};
 use crate::input_document::{PasteId, paste_summary_label};
 use crate::text_buffer::TextBuffer;
 use crate::theme;
@@ -43,6 +43,7 @@ pub(crate) struct PasteEditor {
     scroll_y: u16,
     follow_cursor: bool,
     editor_area: Rect,
+    scrollbar: Scrollbar,
 }
 
 impl PasteEditor {
@@ -54,6 +55,7 @@ impl PasteEditor {
             scroll_y: 0,
             follow_cursor: true,
             editor_area: Rect::default(),
+            scrollbar: Scrollbar::default(),
         }
     }
 
@@ -128,6 +130,19 @@ impl PasteEditor {
         }
         self.buffer.set_cursor(row.y, x);
         self.follow_cursor = true;
+    }
+
+    /// The editor reads the pointer only for the caret, which the host routes
+    /// through `handle_click`, so the bar is all this takes.
+    pub fn handle_mouse(&mut self, event: &MouseEvent) -> bool {
+        match self.scrollbar.handle(event) {
+            ScrollbarMouse::Ignored => false,
+            ScrollbarMouse::Consumed => true,
+            ScrollbarMouse::ScrollTo(top) => {
+                self.scroll_y = top as u16;
+                true
+            }
+        }
     }
 
     pub fn scroll(&mut self, delta: i32) {
@@ -231,9 +246,7 @@ impl PasteEditor {
                 .style(Style::new().fg(theme::current().foreground)),
             area,
         );
-        if max_scroll > 0 {
-            render_vertical_scrollbar(frame, area, total, self.scroll_y);
-        }
+        self.scrollbar.draw(frame, area, total, self.scroll_y);
     }
 
     fn render_hint(&self, frame: &mut Frame, area: Rect) {

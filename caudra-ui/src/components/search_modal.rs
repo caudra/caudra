@@ -3,7 +3,7 @@ use std::cmp::Reverse;
 use crate::components::Overlay;
 use crate::components::keybindings::key;
 use crate::components::modal::Modal;
-use crate::components::scrollbar::render_vertical_scrollbar;
+use crate::components::scrollbar::{Scrollbar, ScrollbarMouse};
 use crate::text_buffer::TextBuffer;
 use crate::theme;
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
@@ -59,6 +59,7 @@ pub struct SearchModal {
     popup: Rect,
     row_hits: Vec<SearchRowHit>,
     mouse_down: Option<usize>,
+    scrollbar: Scrollbar,
 }
 
 impl SearchModal {
@@ -75,6 +76,7 @@ impl SearchModal {
             popup: Rect::default(),
             row_hits: Vec::new(),
             mouse_down: None,
+            scrollbar: Scrollbar::default(),
         }
     }
 
@@ -166,6 +168,15 @@ impl SearchModal {
     }
 
     pub fn handle_mouse(&mut self, event: MouseEvent) -> SearchAction {
+        match self.scrollbar.handle(&event) {
+            ScrollbarMouse::Ignored => {}
+            ScrollbarMouse::Consumed => return SearchAction::Consumed,
+            ScrollbarMouse::ScrollTo(top) => {
+                self.scroll_offset = top as usize;
+                self.invalidate_mouse_geometry();
+                return SearchAction::Consumed;
+            }
+        }
         let position = Position::new(event.column, event.row);
         match event.kind {
             MouseEventKind::Down(MouseButton::Left) => {
@@ -335,10 +346,12 @@ impl SearchModal {
         self.render_list(frame, list_area, viewport_h);
         self.render_search(frame, search_area);
 
-        let total = self.matches.len() as u16;
-        if total > viewport_h as u16 {
-            render_vertical_scrollbar(frame, list_area, total, self.scroll_offset as u16);
-        }
+        self.scrollbar.draw(
+            frame,
+            list_area,
+            self.matches.len() as u32,
+            self.scroll_offset as u32,
+        );
 
         popup
     }
@@ -478,6 +491,11 @@ mod tests {
     use crossterm::event::{KeyEventKind, KeyEventState, KeyModifiers};
     use test_case::test_case;
 
+    const BAR_LOST_THE_PRESS: &str = "the row under the scrollbar took the press";
+    /// More matches than the 80x24 test terminal can show, so the bar has a
+    /// track to press on.
+    const OVERFLOWING_MATCHES: usize = 50;
+
     fn key_event(code: KeyCode) -> KeyEvent {
         KeyEvent {
             code,
@@ -613,6 +631,30 @@ mod tests {
             SearchAction::Navigate
         ));
         assert_eq!(modal.selected, hit.match_index);
+    }
+
+    #[test]
+    fn pressing_the_scrollbar_scrolls_instead_of_navigating() {
+        let texts: Vec<String> = (0..OVERFLOWING_MATCHES)
+            .map(|i| format!("item {i}"))
+            .collect();
+        let borrowed: Vec<&str> = texts.iter().map(String::as_str).collect();
+        let mut modal = modal_with_query("item", &borrowed);
+        render(&mut modal);
+        let last = *modal.row_hits.last().unwrap();
+        let bar = Rect::new(last.area.right() - 1, last.area.y, 1, 1);
+
+        let action = modal.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), bar));
+
+        assert!(
+            matches!(action, SearchAction::Consumed),
+            "{BAR_LOST_THE_PRESS}"
+        );
+        assert_eq!(
+            modal.scroll_offset,
+            OVERFLOWING_MATCHES - modal.viewport_height,
+            "{BAR_LOST_THE_PRESS}"
+        );
     }
 
     #[test]

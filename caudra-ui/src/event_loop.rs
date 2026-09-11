@@ -40,7 +40,7 @@ use caudra_storage::sessions::{
 };
 use caudra_storage::state::WorkspaceTabs;
 use crossterm::event::{
-    Event, KeyEventKind, MouseButton, MouseEvent as CtMouseEvent, MouseEventKind,
+    Event, KeyEventKind, KeyModifiers, MouseButton, MouseEvent as CtMouseEvent, MouseEventKind,
 };
 use serde_json::json;
 use tracing::{info, warn};
@@ -70,6 +70,8 @@ use crate::terminal;
 
 /// Max events handled per frame so a flood cannot starve rendering.
 const DRAIN_BUDGET: usize = 256;
+/// How much further one notch of an Alt-held wheel carries.
+const FAST_SCROLL_FACTOR: u32 = 4;
 const AGENT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 /// How long the final snapshot of one session may wait for the artifact lock.
 /// Budgeted per session so a workspace of tabs cannot multiply into a stall,
@@ -2023,18 +2025,24 @@ impl<'t> EventLoop<'t> {
 
     /// Sums queued scroll events into one delta; the first non-scroll event
     /// drained along the way is returned so it isn't lost.
+    ///
+    /// Aggregation stops when the modifiers change, so releasing Alt partway
+    /// through a burst cannot retroactively scale the notches already queued
+    /// under it.
     fn aggregate_scroll(&self, first: CtMouseEvent, scroll_lines: u32) -> (Msg, Option<Event>) {
-        let mut delta = scroll_delta(first.kind, scroll_lines);
+        let step = scroll_step(first.modifiers, scroll_lines);
+        let mut delta = scroll_delta(first.kind, step);
         let mut leftover = None;
         while let Ok(next) = self.input.receiver().try_recv() {
             match next {
                 Event::Mouse(m)
-                    if matches!(
-                        m.kind,
-                        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
-                    ) =>
+                    if m.modifiers == first.modifiers
+                        && matches!(
+                            m.kind,
+                            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                        ) =>
                 {
-                    delta += scroll_delta(m.kind, scroll_lines);
+                    delta += scroll_delta(m.kind, step);
                 }
                 other => {
                     leftover = Some(other);
@@ -2845,6 +2853,16 @@ fn scroll_delta(kind: MouseEventKind, lines: u32) -> i32 {
     }
 }
 
+/// Alt turns the wheel into the coarse one. Shift is deliberately left alone:
+/// terminals widely translate it into `ScrollLeft`/`ScrollRight` themselves,
+/// which this app already spends on panning a diagram.
+fn scroll_step(modifiers: KeyModifiers, lines: u32) -> u32 {
+    match modifiers.contains(KeyModifiers::ALT) {
+        true => lines.saturating_mul(FAST_SCROLL_FACTOR),
+        false => lines,
+    }
+}
+
 /// Only the two transitions worth interrupting for: a background session that
 /// wants an answer, and one that just finished. Everything else is noise.
 fn background_flash(title: &str, previous: SessionStatus, status: SessionStatus) -> Option<String> {
@@ -2867,6 +2885,14 @@ mod tests {
     const OBSERVATION: &str = "failed";
     const SHELL_RESULT: &str = "command finished";
     const HERDR_BLOCKER: &str = "Permission requested";
+    const WRONG_STEP: &str = "a notch of the wheel carried the wrong distance";
+
+    #[test_case(KeyModifiers::NONE, 3 ; "a plain notch is the configured size")]
+    #[test_case(KeyModifiers::ALT, 12 ; "alt multiplies it")]
+    #[test_case(KeyModifiers::SHIFT, 3 ; "shift is left to the terminal")]
+    fn alt_is_the_only_modifier_the_wheel_reads(modifiers: KeyModifiers, expected: u32) {
+        assert_eq!(scroll_step(modifiers, 3), expected, "{WRONG_STEP}");
+    }
 
     #[test]
     fn fork_draft_makes_empty_history_session_restorable() {

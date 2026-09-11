@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use caudra_agent::{SharedBuf, SnapshotLine, SpanStyle};
 use caudra_lua::{Anchor, Axis, Border, FloatConfig, Split, TitlePos, WinCommand, WinEvent};
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyEvent, MouseEvent};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
@@ -13,7 +13,7 @@ use crate::components::split_layout::SplitReq;
 use crate::components::{
     Overlay,
     keybindings::key_event_to_string,
-    scrollbar::render_vertical_scrollbar,
+    scrollbar::{Scrollbar, ScrollbarMouse},
     tool_display::{SPINNER_STYLE_NAME, SPINNER_STYLE_PREFIX, resolve_span_style},
 };
 use crate::repaint::{Cadence, Dirty};
@@ -68,6 +68,9 @@ struct FloatWindow {
     last_content: Rect,
     cursor: usize,
     visible: bool,
+    /// Per window: a grab has to know which one it is holding, and two windows
+    /// are on screen at once as soon as a plugin opens a split beside a float.
+    scrollbar: Scrollbar,
     event_tx: flume::Sender<WinEvent>,
     cmd_rx: flume::Receiver<WinCommand>,
 }
@@ -79,6 +82,10 @@ impl FloatWindow {
             self.config.reserved_bottom,
             self.cached_lines.len(),
         )
+    }
+
+    fn set_scroll(&mut self, offset: usize) {
+        self.scroll_offset = offset.min(self.layout().max_offset(self.viewport_h));
     }
 
     /// Positive `delta` scrolls up (closer to the top of the buffer, smaller
@@ -208,6 +215,7 @@ impl FloatManager {
             last_content: Rect::default(),
             cursor: 0,
             visible,
+            scrollbar: Scrollbar::default(),
             event_tx,
             cmd_rx,
         };
@@ -488,14 +496,12 @@ impl FloatManager {
             frame.render_widget(Paragraph::new(pinned), pa);
         }
 
-        if scrollable as u16 > win.viewport_h {
-            render_vertical_scrollbar(
-                frame,
-                scroll_area,
-                scrollable as u16,
-                win.scroll_offset as u16,
-            );
-        }
+        win.scrollbar.draw(
+            frame,
+            scroll_area,
+            scrollable as u32,
+            win.scroll_offset as u32,
+        );
 
         if Some(win.id) == self.focused_id {
             self.focused_rect = Some(popup);
@@ -523,6 +529,23 @@ impl FloatManager {
         }
         self.remove_windows(|w| w.id == fid);
         true
+    }
+
+    /// Every window is offered the event, because a split and a panel can both
+    /// be on screen with the centred float and each owns its own bar. `any`
+    /// stops at the one that takes it, and the rest have already recorded
+    /// whatever hover the pass gave them.
+    pub fn handle_mouse(&mut self, event: &MouseEvent) -> bool {
+        self.windows
+            .iter_mut()
+            .any(|win| match win.scrollbar.handle(event) {
+                ScrollbarMouse::Ignored => false,
+                ScrollbarMouse::Consumed => true,
+                ScrollbarMouse::ScrollTo(top) => {
+                    win.set_scroll(top as usize);
+                    true
+                }
+            })
     }
 
     pub fn scroll(&mut self, delta: i32) {
@@ -1645,6 +1668,7 @@ mod tests {
             last_content: Rect::default(),
             cursor: 0,
             visible: true,
+            scrollbar: Scrollbar::default(),
             event_tx,
             cmd_rx,
         }

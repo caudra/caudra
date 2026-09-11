@@ -288,6 +288,10 @@ impl Tree {
         self.scroll = self.scroll.saturating_add_signed(delta).min(max);
     }
 
+    pub fn set_scroll(&mut self, top: usize, viewport: usize) {
+        self.scroll = top.min(self.rows.len().saturating_sub(viewport));
+    }
+
     fn select_path(&mut self, path: &Path) {
         if let Some(index) = self.rows.iter().position(|row| row.path == path) {
             self.selected = index;

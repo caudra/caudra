@@ -15,6 +15,7 @@ mod menu;
 mod pointer;
 mod quick_open;
 mod scm;
+pub mod scroll;
 mod search;
 mod style;
 mod view;
@@ -42,6 +43,7 @@ use menu::{Action as MenuAction, Menu, Target};
 use pointer::Clicks;
 use quick_open::QuickOpen;
 use scm::{MIN_SECTION_ROWS, Scm, Section};
+use scroll::{Scrollbar, ScrollbarMouse};
 use search::Search;
 use view::{Control, TabHit, TabPart, Toggle};
 
@@ -346,6 +348,45 @@ enum Drag {
     Menu,
 }
 
+/// Which bar a grab is holding. The sidebar's three views share one, because
+/// only one of them is ever drawn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Bar {
+    Sidebar,
+    Palette,
+    Text,
+    Section(Section),
+}
+
+#[derive(Default)]
+struct Bars {
+    sidebar: Scrollbar,
+    palette: Scrollbar,
+    text: Scrollbar,
+    sections: [Scrollbar; Section::COUNT],
+}
+
+impl Bars {
+    fn slot(&mut self, bar: Bar) -> &mut Scrollbar {
+        match bar {
+            Bar::Sidebar => &mut self.sidebar,
+            Bar::Palette => &mut self.palette,
+            Bar::Text => &mut self.text,
+            Bar::Section(section) => &mut self.sections[section.index()],
+        }
+    }
+}
+
+/// `None` when the bar did not want the event, `Some(None)` when it took it
+/// without moving, `Some(Some(offset))` when it scrolled.
+fn taken(outcome: ScrollbarMouse) -> Option<Option<u32>> {
+    match outcome {
+        ScrollbarMouse::Ignored => None,
+        ScrollbarMouse::Consumed => Some(None),
+        ScrollbarMouse::ScrollTo(offset) => Some(Some(offset)),
+    }
+}
+
 pub struct Workbench {
     open: bool,
     root: PathBuf,
@@ -365,6 +406,9 @@ pub struct Workbench {
     /// Bumped on every palette change so open tabs know to rehighlight.
     theme_generation: u64,
     panes: PaneRects,
+    /// One per bar drawn, so a grab knows which pane it is holding and a drag
+    /// survives the pointer wandering out of that pane's column.
+    bars: Bars,
     tree: Tree,
     editor: Editor,
     palette: QuickOpen,
@@ -427,6 +471,7 @@ impl Workbench {
             scrollbars: true,
             theme_generation: 0,
             panes: PaneRects::default(),
+            bars: Bars::default(),
             tree: Tree::default(),
             editor: Editor::default(),
             palette: QuickOpen::default(),
@@ -667,6 +712,9 @@ impl Workbench {
             self.menu = None;
             return WorkbenchAction::Consumed;
         }
+        if let Some(action) = self.scrollbar_mouse(&event) {
+            return action;
+        }
         let delta = match event.kind {
             MouseEventKind::ScrollUp => -SCROLL_LINES,
             MouseEventKind::ScrollDown => SCROLL_LINES,
@@ -714,6 +762,56 @@ impl Workbench {
         };
         self.scroll(event.column, event.row, delta);
         WorkbenchAction::Consumed
+    }
+
+    /// Offers an event to every bar that was drawn, newest pane first. Skipped
+    /// while a panel is up, because the menu and the dialog are painted over
+    /// the bars and a press on them belongs to the panel.
+    ///
+    /// A bar that returns `Ignored` has to fall through: the column of a bar
+    /// that is not showing belongs to whatever is painted there.
+    fn scrollbar_mouse(&mut self, event: &MouseEvent) -> Option<WorkbenchAction> {
+        if self.menu.is_some() || self.confirm.is_some() {
+            return None;
+        }
+        if let Some(offset) = taken(self.bars.palette.handle(event)) {
+            if let Some(offset) = offset {
+                let rows = self.panes.palette.height as usize;
+                self.palette.set_scroll(offset as usize, rows);
+            }
+            return Some(WorkbenchAction::Consumed);
+        }
+        if let Some(offset) = taken(self.bars.text.handle(event)) {
+            if let Some(offset) = offset
+                && let Some(tab) = self.editor.active_mut()
+            {
+                tab.set_scroll(offset as usize);
+            }
+            return Some(WorkbenchAction::Consumed);
+        }
+        if let Some(offset) = taken(self.bars.sidebar.handle(event)) {
+            if let Some(offset) = offset {
+                let rows = self.panes.rows.height as usize;
+                match self.sidebar {
+                    SidebarView::Explorer => self.tree.set_scroll(offset as usize, rows),
+                    SidebarView::Search => self.search.set_scroll(offset as usize, rows),
+                    SidebarView::SourceControl => {}
+                }
+            }
+            return Some(WorkbenchAction::Consumed);
+        }
+        let hit = Section::ALL
+            .into_iter()
+            .enumerate()
+            .find_map(|(index, section)| {
+                taken(self.bars.sections[index].handle(event)).map(|offset| (section, offset))
+            });
+        let (section, offset) = hit?;
+        if let Some(offset) = offset {
+            let rows = self.panes.sections[section.index()].body.height as usize;
+            self.scm.set_scroll(section, offset as usize, rows);
+        }
+        Some(WorkbenchAction::Consumed)
     }
 
     /// A wheel turn over `(column, row)`, worth `delta` rows and negative
@@ -2566,10 +2664,11 @@ mod tests {
         Section, SidebarView, Target, Toggle, Workbench, WorkbenchAction, WorkbenchStyles, keys,
         layout, layout_sections, scm,
     };
-    use crate::chrome::{ELLIPSIS, SCROLLBAR_THUMB};
+    use crate::chrome::ELLIPSIS;
     use crate::editor::{VisualRow, render};
     use crate::fs::tree::GitMark;
     use crate::menu::Item as MenuItem;
+    use crate::scroll::SCROLLBAR_THUMB;
     use crate::search;
     use crate::view::{
         CARET, Control, MENU_HINTS, MENU_MARK, MORE_LEFT, MORE_RIGHT, NAME_HINTS, NOT_A_REPOSITORY,
@@ -5469,6 +5568,41 @@ mod tests {
                 .any(|rects| rects.body.right() < sidebar.right()),
             "{WRONG_BAR}"
         );
+    }
+
+    /// The bar is the only fast way down a long tree. Dragging it moves the
+    /// window and nothing else: the selection stays where the keyboard left it,
+    /// the way scrolling a buffer never moves a caret.
+    #[test]
+    fn dragging_the_tree_bar_scrolls_without_moving_the_selection() {
+        let (_dir, mut workbench) = tall_project();
+        draw(&mut workbench, 80, 24);
+        let rows = workbench.panes.rows;
+        let selected = workbench.tree.selected_index();
+
+        workbench.handle_mouse(click(rows.right(), rows.y + 1));
+        workbench.handle_mouse(drag(rows.right(), rows.bottom() - 1));
+        draw(&mut workbench, 80, 24);
+
+        let max = workbench.tree.rows().len() - rows.height as usize;
+        assert_eq!(workbench.tree.scroll(), max, "{WRONG_BAR}");
+        assert_eq!(workbench.tree.selected_index(), selected, "{WRONG_CLICK}");
+    }
+
+    /// Releasing hands the pane back, so the next keyboard move is free to pull
+    /// the window to the selection again.
+    #[test]
+    fn releasing_the_bar_lets_the_selection_pull_the_window_back() {
+        let (_dir, mut workbench) = tall_project();
+        draw(&mut workbench, 80, 24);
+        let rows = workbench.panes.rows;
+
+        workbench.handle_mouse(click(rows.right(), rows.y + 1));
+        workbench.handle_mouse(drag(rows.right(), rows.bottom() - 1));
+        workbench.handle_mouse(release(rows.right(), rows.bottom() - 1));
+        draw(&mut workbench, 80, 24);
+
+        assert_eq!(workbench.tree.scroll(), 0, "{WRONG_BAR}");
     }
 
     /// The bar owns its column, so a press there acts on nothing rather than on

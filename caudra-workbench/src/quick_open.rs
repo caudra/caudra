@@ -142,6 +142,10 @@ impl QuickOpen {
         self.scroll = self.scroll.min(self.matches.len().saturating_sub(viewport));
     }
 
+    pub fn set_scroll(&mut self, top: usize, viewport: usize) {
+        self.scroll = top.min(self.matches.len().saturating_sub(viewport));
+    }
+
     /// An empty query lists the priority paths and then the rest as walked, so
     /// the palette is useful before anything is typed.
     fn rescan(&mut self) {

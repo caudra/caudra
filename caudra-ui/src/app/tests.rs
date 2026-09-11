@@ -71,6 +71,8 @@ const WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 /// the session's own provider the way a real one does.
 const TEST_PROVIDER: &str = "anthropic";
 const SNAPSHOT_ERR: &str = "snapshot store lock is poisoned";
+const MISSING_ZONE: &str = "the transcript must have registered a zone";
+const BAR_IGNORED: &str = "the pointer moved the view somewhere it should not have";
 const ARMING_LEADER_IS_INERT_MSG: &str = "arming the leader waits for a second key, it never acts";
 const MENTION_POPUP_CLOSED: &str = "typing @ over a matching path must open the popup";
 const MENTION_POPUP_LINGERED: &str = "choosing a file must close the popup";
@@ -5376,6 +5378,106 @@ fn pending_copy_ignores_drag_and_tick() {
 
     let _ = app.tick_edge_scroll();
     assert!(app.selection_state.as_ref().unwrap().is_pending_copy());
+}
+
+/// The bar is the fast way down a long transcript, and it has to beat the
+/// selection to the press or dragging it would sweep text instead.
+#[test]
+fn dragging_the_transcript_bar_scrolls_and_selects_nothing() {
+    let mut app = test_app();
+    for index in 0..60 {
+        app.main_chat().push_user_message(format!("line {index}"));
+    }
+    let _ = rendered(&mut app);
+    let area = app
+        .zones
+        .find(SelectionZone::Messages)
+        .expect(MISSING_ZONE)
+        .area;
+    let bar = area.right() - 1;
+    app.active_chat().scroll_to_top();
+
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        bar,
+        area.y + 1,
+    ));
+    app.update(mouse_event(
+        MouseEventKind::Drag(MouseButton::Left),
+        bar,
+        area.bottom() - 1,
+    ));
+
+    assert!(app.chats[0].scroll_top() > 0, "{BAR_IGNORED}");
+    assert!(app.selection_state.is_none(), "{BAR_IGNORED}");
+}
+
+/// A middle press anchors, and every tick after it carries the view further
+/// the further the pointer has wandered. Rows per tick, so no clock is needed.
+#[test]
+fn a_middle_press_scrolls_until_it_is_pressed_again() {
+    let mut app = test_app();
+    for index in 0..60 {
+        app.main_chat().push_user_message(format!("line {index}"));
+    }
+    let _ = rendered(&mut app);
+    let area = app
+        .zones
+        .find(SelectionZone::Messages)
+        .expect(MISSING_ZONE)
+        .area;
+    app.active_chat().scroll_to_top();
+
+    let origin = area.y + 2;
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Middle),
+        area.x + 1,
+        origin,
+    ));
+    app.update(mouse_event(
+        MouseEventKind::Moved,
+        area.x + 1,
+        area.bottom() - 1,
+    ));
+    for _ in 0..3 {
+        assert_eq!(app.tick_autoscroll(), Dirty::YES, "{BAR_IGNORED}");
+    }
+    let reached = app.chats[0].scroll_top();
+    assert!(reached > 0, "{BAR_IGNORED}");
+
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Middle),
+        area.x + 1,
+        origin,
+    ));
+    assert_eq!(app.tick_autoscroll(), Dirty::NO, "{BAR_IGNORED}");
+    assert_eq!(app.chats[0].scroll_top(), reached, "{BAR_IGNORED}");
+}
+
+/// Parking the pointer on the origin has to hold the view still, or the
+/// gesture would start moving the moment it was armed.
+#[test]
+fn autoscroll_holds_still_inside_its_dead_zone() {
+    let mut app = test_app();
+    for index in 0..60 {
+        app.main_chat().push_user_message(format!("line {index}"));
+    }
+    let _ = rendered(&mut app);
+    let area = app
+        .zones
+        .find(SelectionZone::Messages)
+        .expect(MISSING_ZONE)
+        .area;
+    app.active_chat().scroll_to_top();
+
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Middle),
+        area.x + 1,
+        area.y + 4,
+    ));
+
+    assert_eq!(app.tick_autoscroll(), Dirty::NO, "{BAR_IGNORED}");
+    assert_eq!(app.chats[0].scroll_top(), 0, "{BAR_IGNORED}");
 }
 
 #[test]

@@ -4,12 +4,11 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState, StatefulWidget, Widget};
+use ratatui::widgets::Widget;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 pub const ELLIPSIS: char = '…';
 pub const VERTICAL: &str = "│";
-pub const SCROLLBAR_THUMB: &str = "▐";
 
 /// Truncates on display width rather than bytes, so a CJK path or an emoji in a
 /// filename cannot overflow the pane it is drawn into.
@@ -76,26 +75,6 @@ pub fn vertical_rule(buf: &mut Buffer, area: Rect, style: Style) {
             cell.set_style(style);
         }
     }
-}
-
-/// The thumb alone, with no track, no arrows, and no room of its own: callers
-/// reserve the column and only call this when the content overflows it.
-///
-/// `caudra-ui` draws the same bar over a `Frame` for the transcript and its
-/// modals. The workbench paints into a `Buffer`, and cannot depend on the crate
-/// that owns it, so this is a deliberate second copy rather than a missed reuse.
-pub fn vertical_scrollbar(buf: &mut Buffer, area: Rect, total: usize, at: usize, style: Style) {
-    let scrolled = total.saturating_sub(area.height as usize);
-    let mut state = ScrollbarState::default()
-        .content_length(scrolled + 1)
-        .position(at);
-    Scrollbar::new(ScrollbarOrientation::VerticalRight)
-        .thumb_symbol(SCROLLBAR_THUMB)
-        .thumb_style(style)
-        .track_symbol(None)
-        .begin_symbol(None)
-        .end_symbol(None)
-        .render(area, buf, &mut state);
 }
 
 pub fn render_line(buf: &mut Buffer, area: Rect, line: Line<'_>) {

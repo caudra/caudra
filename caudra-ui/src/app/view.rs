@@ -28,6 +28,9 @@ use super::{App, Mode, Status};
 const MAIN_GUTTER_WIDE: u16 = 2;
 const MAIN_GUTTER_NARROW: u16 = 1;
 const MESSAGE_VERTICAL_PADDING: u16 = 1;
+/// Marks where a middle press anchored autoscroll. Without it the view moves
+/// with nothing on screen to say why, or how to aim it.
+pub(crate) const AUTOSCROLL_ORIGIN: &str = "\u{2295}";
 
 struct ViewLayout {
     msg_area: Rect,
@@ -63,6 +66,18 @@ impl App {
         overlay_rect = self.render_top_modals(frame, overlay_rect);
         self.register_zones(&layout, overlay_rect);
         self.apply_selection(frame, render_chat);
+        self.render_autoscroll_origin(frame);
+    }
+
+    fn render_autoscroll_origin(&self, frame: &mut Frame) {
+        let Some(at) = self.autoscroll.as_ref().map(|auto| auto.origin()) else {
+            return;
+        };
+        let buf = frame.buffer_mut();
+        if let Some(cell) = buf.cell_mut(at) {
+            cell.set_symbol(AUTOSCROLL_ORIGIN);
+            cell.set_style(theme::current().accent);
+        }
     }
 
     /// The workbench replaces the transcript outright. Caudra's own status bar

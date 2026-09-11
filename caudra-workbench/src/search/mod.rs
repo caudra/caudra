@@ -199,6 +199,10 @@ impl Search {
         self.scroll = self.scroll.saturating_add_signed(delta).min(max);
     }
 
+    pub fn set_scroll(&mut self, top: usize, viewport: usize) {
+        self.scroll = top.min(self.rows.len().saturating_sub(viewport));
+    }
+
     /// Where the selected row points: a file, and the line to land on.
     pub fn selection(&self) -> Option<(PathBuf, usize)> {
         match self.rows.get(self.selected)? {

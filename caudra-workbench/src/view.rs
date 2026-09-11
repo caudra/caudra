@@ -22,10 +22,11 @@ use crate::scm::graph::Rail;
 use crate::scm::repo::{Change, Commit};
 use crate::scm::tree::{Dir, SEPARATOR};
 use crate::scm::{Row as ScmRow, Scm, Section};
+use crate::scroll::ScrollHint;
 use crate::search::engine::Hit;
 use crate::search::{Field as SearchField, Row as SearchRow, Search};
 use crate::{
-    Ask, Choice, Focus, SidebarView, Workbench, WorkbenchStyles, chrome, keys, layout,
+    Ask, Bar, Choice, Focus, SidebarView, Workbench, WorkbenchStyles, chrome, keys, layout,
     layout_sections,
 };
 
@@ -346,7 +347,11 @@ impl Workbench {
         );
 
         let height = body.height as usize;
-        self.search.clamp_scroll(height);
+        // A bar drag is the user moving the window on purpose, so the cursor
+        // stays where it is rather than dragging the window back to itself.
+        if !self.bars.sidebar.is_dragging() {
+            self.search.clamp_scroll(height);
+        }
         if !self.search.has_results() {
             self.panes.rows = body;
             let notice = match (self.search.error(), self.search.is_running()) {
@@ -379,7 +384,7 @@ impl Workbench {
             let line = emphasize(line, pointed == Some(offset) && !chosen, &self.styles);
             chrome::render_line(buf, line_at(rows, offset), line);
         }
-        self.scrollbar(buf, bar, total, scroll);
+        self.scrollbar(buf, Bar::Sidebar, bar, total, scroll);
     }
 
     /// Three stacked sections, each with a pinned title row over a list that
@@ -440,7 +445,9 @@ impl Workbench {
         focused: bool,
     ) -> Rect {
         let height = area.height as usize;
-        self.scm.clamp_scroll(section, height);
+        if !self.bars.sections[section.index()].is_dragging() {
+            self.scm.clamp_scroll(section, height);
+        }
         if height == 0 {
             return area;
         }
@@ -466,7 +473,7 @@ impl Workbench {
             let line = emphasize(line, on_row.is_some() && !chosen, &self.styles);
             chrome::render_line(buf, line_at(rows, offset), line);
         }
-        self.scrollbar(buf, bar, total, scroll);
+        self.scrollbar(buf, Bar::Section(section), bar, total, scroll);
         rows
     }
 
@@ -497,7 +504,9 @@ impl Workbench {
 
     fn render_tree(&mut self, buf: &mut Surface, area: Rect, focused: bool) {
         let height = area.height as usize;
-        self.tree.clamp_scroll(height);
+        if !self.bars.sidebar.is_dragging() {
+            self.tree.clamp_scroll(height);
+        }
         if self.tree.rows().is_empty() {
             self.panes.rows = area;
             placeholder(buf, area, EMPTY_TREE, self.styles.dim);
@@ -525,7 +534,7 @@ impl Workbench {
             let line = emphasize(line, pointed == Some(offset) && !chosen, &self.styles);
             chrome::render_line(buf, line_at(rows, offset), line);
         }
-        self.scrollbar(buf, bar, self.tree.rows().len(), scroll);
+        self.scrollbar(buf, Bar::Sidebar, bar, self.tree.rows().len(), scroll);
     }
 
     fn render_editor(&mut self, buf: &mut Surface, area: Rect) {
@@ -570,7 +579,9 @@ impl Workbench {
             Constraint::Length(1),
         ])
         .areas(panel);
-        self.palette.clamp_scroll(rows.height as usize);
+        if !self.bars.palette.is_dragging() {
+            self.palette.clamp_scroll(rows.height as usize);
+        }
         let (rows, bar) = scroll_column(self.scrollbars, rows, self.palette.len());
         self.panes.palette = rows;
 
@@ -609,7 +620,7 @@ impl Workbench {
                 )),
             );
         }
-        self.scrollbar(buf, bar, self.palette.len(), scroll);
+        self.scrollbar(buf, Bar::Palette, bar, self.palette.len(), scroll);
         chrome::render_line(
             buf,
             rule,
@@ -778,9 +789,25 @@ impl Workbench {
         }
     }
 
-    fn scrollbar(&self, buf: &mut Surface, bar: Option<Rect>, total: usize, at: usize) {
-        if let Some(bar) = bar {
-            chrome::vertical_scrollbar(buf, bar, total, at, self.styles.border);
+    /// Records the strip the bar owns and paints it. A pane whose content fits
+    /// hands over no rect, which clears the slot and with it any drag that was
+    /// in flight when the content shrank.
+    fn scrollbar(
+        &mut self,
+        buf: &mut Surface,
+        bar: Bar,
+        area: Option<Rect>,
+        total: usize,
+        at: usize,
+    ) {
+        let style = self.styles.border;
+        let slot = self.bars.slot(bar);
+        match area {
+            Some(area) => {
+                slot.place(area, total as u32, at as u32);
+                slot.render(buf, style);
+            }
+            None => slot.place(Rect::ZERO, 0, 0),
         }
     }
 
@@ -835,7 +862,10 @@ impl Workbench {
                 ),
             );
         }
-        self.scrollbar(buf, bar, lines, first);
+        self.bars
+            .text
+            .set_hint(ScrollHint::lines(first as u32 + 1, lines as u32));
+        self.scrollbar(buf, Bar::Text, bar, lines, first);
     }
 
     fn render_prompt(&self, buf: &mut Surface, area: Rect, label: &str, input: &str, caret: bool) {

@@ -11,7 +11,7 @@ use ratatui::widgets::{Paragraph, Wrap};
 use super::ModalScroll;
 use super::Overlay;
 use super::modal::{FooterHits, FooterLine, Modal};
-use super::scrollbar::render_vertical_scrollbar;
+use super::scrollbar::{Scrollbar, ScrollbarMouse};
 use crate::theme;
 
 const WIDTH_PERCENT: u16 = 72;
@@ -27,6 +27,7 @@ const UNBOUND_EVALUATOR: &str = "default (fast, then chat)";
 pub struct GoalModal {
     open: bool,
     scroll: ModalScroll,
+    scrollbar: Scrollbar,
     popup: Rect,
     footer: FooterHits,
     /// Which footer was last drawn. A click is answered from the same table
@@ -39,6 +40,7 @@ impl Default for GoalModal {
         Self {
             open: false,
             scroll: ModalScroll::new_top(),
+            scrollbar: Scrollbar::default(),
             popup: Rect::default(),
             footer: FooterHits::default(),
             active: false,
@@ -92,6 +94,14 @@ impl GoalModal {
     /// The command line a footer click asked for, left to the host to run: the
     /// footer names session commands, not modal state.
     pub fn handle_mouse(&mut self, event: MouseEvent) -> Option<&'static str> {
+        match self.scrollbar.handle(&event) {
+            ScrollbarMouse::Ignored => {}
+            ScrollbarMouse::Consumed => return None,
+            ScrollbarMouse::ScrollTo(top) => {
+                self.scroll.scroll_to(top as u16);
+                return None;
+            }
+        }
         self.footer
             .handle_mouse(event)
             .and_then(|index| footer_commands(self.active).get(index).copied())
@@ -142,9 +152,7 @@ impl GoalModal {
                 .scroll((offset, 0)),
             padded,
         );
-        if total > padded.height {
-            render_vertical_scrollbar(frame, inner, total, offset);
-        }
+        self.scrollbar.draw(frame, inner, total, offset);
         self.popup = popup;
         popup
     }
@@ -321,12 +329,16 @@ mod tests {
     use ratatui::style::Modifier;
 
     use super::*;
+    use caudra_workbench::scroll::SCROLLBAR_THUMB;
 
     const WIDTH: u16 = 120;
     const HEIGHT: u16 = 40;
+    /// Short enough that the status outgrows the modal and earns a bar.
+    const CRAMPED_HEIGHT: u16 = 10;
     const CONDITION: &str = "the suite is green";
     const REASON: &str = "every test passed";
     const HOVER_MISSED: &str = "the footer command must reverse under the pointer";
+    const BAR_SCROLL_MISSED: &str = "a press on the bar's column must scroll the body";
 
     fn finished() -> GoalStatus {
         GoalStatus::Finished(GoalResult {
@@ -417,6 +429,38 @@ mod tests {
             modal.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), hit)),
             Some(GOAL_MODEL)
         );
+    }
+
+    #[test]
+    fn a_press_on_the_bar_scrolls_the_body() {
+        let status = finished();
+        let mut modal = GoalModal::default();
+        modal.open();
+        let mut terminal = Terminal::new(TestBackend::new(WIDTH, CRAMPED_HEIGHT)).unwrap();
+        let mut popup = Rect::default();
+        terminal
+            .draw(|frame| {
+                popup = modal.view(
+                    frame,
+                    frame.area(),
+                    Some(&status),
+                    None,
+                    MAX_GOAL_CONTINUATION_LIMIT,
+                );
+            })
+            .unwrap();
+
+        let thumb = (0..CRAMPED_HEIGHT)
+            .flat_map(|y| (0..WIDTH).map(move |x| Position::new(x, y)))
+            .find(|at| terminal.backend().buffer()[(at.x, at.y)].symbol() == SCROLLBAR_THUMB)
+            .expect(BAR_SCROLL_MISSED);
+
+        modal.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            Rect::new(thumb.x, popup.bottom() - 2, 1, 1),
+        ));
+
+        assert!(modal.scroll.offset() > 0, "{BAR_SCROLL_MISSED}");
     }
 
     #[test]

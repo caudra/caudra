@@ -44,7 +44,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use super::scrollbar::render_vertical_scrollbar;
+use crossterm::event::MouseEvent;
+
+use super::scrollbar::{ScrollHint, Scrollbar, ScrollbarMouse};
 use super::streaming_content::StreamingContent;
 use caudra_agent::mentions::{self, Mention};
 use caudra_agent::tools::ToolEffect;
@@ -754,6 +756,7 @@ pub struct MessagesPanel {
     started_at: Instant,
     scroll_top: u32,
     auto_scroll: bool,
+    scrollbar: Scrollbar,
     viewport_height: u16,
     viewport_width: u16,
     viewport_area: Rect,
@@ -848,6 +851,7 @@ impl MessagesPanel {
             started_at: Instant::now(),
             scroll_top: u32::MAX,
             auto_scroll: true,
+            scrollbar: Scrollbar::default(),
             viewport_height: 24,
             viewport_width: crossterm::terminal::size().map_or(80, |(w, _)| w.saturating_sub(1)),
             viewport_area: Rect::default(),
@@ -2857,8 +2861,30 @@ impl MessagesPanel {
                 .retain(|link| !bar_area.contains(link.position));
         }
 
-        if total_lines > u32::from(area.height) {
-            render_vertical_scrollbar(frame, area, total_lines, self.scroll_top);
+        if let Some(index) = self
+            .cache
+            .segment_at_row(self.scroll_top, self.viewport_width)
+            .and_then(|(_, segment, _)| segment.msg_index)
+        {
+            self.scrollbar.set_hint(ScrollHint::messages(
+                index as u32 + 1,
+                self.cache.msg_count() as u32,
+            ));
+        }
+        self.scrollbar
+            .draw(frame, area, total_lines, self.scroll_top);
+    }
+
+    /// The bar takes the press before any selection starts, or dragging it
+    /// would sweep a selection down the transcript instead of scrolling it.
+    pub fn handle_scrollbar(&mut self, event: &MouseEvent) -> bool {
+        match self.scrollbar.handle(event) {
+            ScrollbarMouse::Ignored => false,
+            ScrollbarMouse::Consumed => true,
+            ScrollbarMouse::ScrollTo(top) => {
+                self.set_scroll_top(top);
+                true
+            }
         }
     }
 

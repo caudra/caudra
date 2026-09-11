@@ -23,9 +23,62 @@ use super::{App, KeyFocus};
 pub(super) const EDGE_SCROLL_LINES: i32 = 1;
 pub(super) const EDGE_SCROLL_INTERVAL: Duration = Duration::from_millis(25);
 const MESSAGE_ACTIONS_UNAVAILABLE: &str = "Message actions unavailable here";
+/// Rows either side of the origin that scroll nothing, so parking the pointer
+/// where it started holds the view still.
+const AUTOSCROLL_DEAD_ZONE: i32 = 2;
+/// Divides the squared distance. Small enough that the first rows past the
+/// dead zone creep, large enough that the edge of a tall pane still flies.
+const AUTOSCROLL_RAMP: i32 = 6;
+/// Rows per tick at full tilt. The tick runs on [`Cadence::SMOOTH`], so this is
+/// a rate per frame rather than per second.
+const AUTOSCROLL_MAX_ROWS: i32 = 8;
+
+/// Velocity scrolling anchored on a middle press: the view moves on its own,
+/// and how fast is the pointer's distance from where the press landed.
+pub(crate) struct Autoscroll {
+    origin: Position,
+    pointer: Position,
+}
+
+impl Autoscroll {
+    pub(crate) fn origin(&self) -> Position {
+        self.origin
+    }
+}
+
+/// Quadratic rather than linear so one gesture covers both a nudge and a leap
+/// through a long document. Negative is upwards, matching the wheel.
+fn autoscroll_rows(distance: i32) -> i32 {
+    let past = distance.abs() - AUTOSCROLL_DEAD_ZONE;
+    if past <= 0 {
+        return 0;
+    }
+    let speed = (past * past / AUTOSCROLL_RAMP).clamp(1, AUTOSCROLL_MAX_ROWS);
+    match distance > 0 {
+        true => -speed,
+        false => speed,
+    }
+}
 
 impl App {
     pub(super) fn handle_mouse(&mut self, event: MouseEvent) -> Vec<crate::components::Action> {
+        let at = Position::new(event.column, event.row);
+        match event.kind {
+            MouseEventKind::Down(MouseButton::Middle) => {
+                self.toggle_autoscroll(at);
+                return Vec::new();
+            }
+            // Pointer distance from the origin is the throttle, so every report
+            // of where it is moves it, held button or not.
+            MouseEventKind::Moved | MouseEventKind::Drag(_) => {
+                if let Some(auto) = &mut self.autoscroll {
+                    auto.pointer = at;
+                    return Vec::new();
+                }
+            }
+            MouseEventKind::Down(_) => self.autoscroll = None,
+            _ => {}
+        }
         if event.kind == MouseEventKind::Down(MouseButton::Left)
             && let Some(actions) = self.dismiss_at(Position::new(event.column, event.row))
         {
@@ -38,7 +91,10 @@ impl App {
         }
         if self.paste_editor.is_open() {
             self.clear_control_hovers();
-            if event.kind == MouseEventKind::Down(MouseButton::Left) {
+            // Ahead of the click, or a drag down the bar would drag the caret.
+            if !self.paste_editor.handle_mouse(&event)
+                && event.kind == MouseEventKind::Down(MouseButton::Left)
+            {
                 self.paste_editor.handle_click(event.row, event.column);
             }
             return Vec::new();
@@ -92,6 +148,15 @@ impl App {
             || self.float_mgr.is_open();
         if passive_modal_open {
             self.clear_control_hovers();
+            // None of these reads the pointer for anything but its bar, and at
+            // most one is up, so the first taker wins and the rest no-op.
+            if self.help_modal.handle_mouse(&event)
+                || self.usage_modal.handle_mouse(&event)
+                || self.btw_modal.handle_mouse(&event)
+                || self.float_mgr.handle_mouse(&event)
+            {
+                return Vec::new();
+            }
         } else if self.permission_prompt.is_open() {
             self.clear_control_hovers();
             match self.permission_prompt.handle_mouse(event) {
@@ -289,6 +354,17 @@ impl App {
         // the overlay chain and only when nothing modal is drawn over it.
         if !self.has_modal_overlay() && self.todo_panel.handle_mouse(event) {
             self.clear_control_hovers();
+            return Vec::new();
+        }
+        // Ahead of the selection below, which would otherwise read a press on
+        // a bar as the start of a sweep down the surface behind it. Both
+        // columns sit outside the areas selection measures against, so nothing
+        // else wants them.
+        if !self.has_modal_overlay()
+            && (self.chats[self.active_chat].handle_scrollbar(&event)
+                || self.active_input_box_mut().handle_scrollbar(&event))
+        {
+            self.clear_selection_unless_pending_copy();
             return Vec::new();
         }
         match event.kind {
@@ -686,6 +762,36 @@ impl App {
             sel.area.bottom().saturating_sub(1)
         };
         sel.update(edge_row, col, scroll);
+    }
+
+    /// Drives the view while a middle press holds it. Rows per tick rather than
+    /// per second, so the rate is the cadence's and the test is a loop.
+    pub fn tick_autoscroll(&mut self) -> Dirty {
+        let Some(auto) = &self.autoscroll else {
+            return Dirty::NO;
+        };
+        let distance = i32::from(auto.pointer.y) - i32::from(auto.origin.y);
+        let delta = autoscroll_rows(distance);
+        if delta == 0 {
+            return Dirty::NO;
+        }
+        // Through the wheel's own entry point, so autoscroll reaches exactly
+        // what a wheel over the origin would have reached.
+        let (column, row) = (auto.origin.x, auto.origin.y);
+        self.handle_scroll(column, row, delta);
+        Dirty::YES
+    }
+
+    /// A second middle press puts it away, which is the only way out that does
+    /// not also do something else.
+    fn toggle_autoscroll(&mut self, at: Position) {
+        self.autoscroll = match self.autoscroll {
+            Some(_) => None,
+            None => Some(Autoscroll {
+                origin: at,
+                pointer: at,
+            }),
+        };
     }
 
     pub fn tick_edge_scroll(&mut self) -> Dirty {

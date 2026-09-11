@@ -12,7 +12,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 
 use crate::components::modal::{CHROME_LINES, Modal};
-use crate::components::scrollbar::render_vertical_scrollbar;
+use crate::components::scrollbar::{Scrollbar, ScrollbarMouse};
 use crate::components::{ModalScroll, Overlay, escape_terminal_controls};
 use crate::theme::{self, Theme};
 
@@ -37,6 +37,7 @@ const ON_DEMAND: &str = "on demand";
 pub struct SkillsModal {
     open: bool,
     scroll: ModalScroll,
+    scrollbar: Scrollbar,
     popup: Rect,
     inventory: Vec<SkillInventoryEntry>,
     dirs: Vec<SkillDirCandidate>,
@@ -47,6 +48,7 @@ impl SkillsModal {
         Self {
             open: false,
             scroll: ModalScroll::new_top(),
+            scrollbar: Scrollbar::default(),
             popup: Rect::default(),
             inventory: Vec::new(),
             dirs: Vec::new(),
@@ -64,6 +66,7 @@ impl SkillsModal {
     pub fn close(&mut self) {
         self.open = false;
         self.scroll.reset();
+        self.scrollbar = Scrollbar::default();
         self.popup = Rect::default();
     }
 
@@ -86,6 +89,14 @@ impl SkillsModal {
     }
 
     pub fn handle_mouse(&mut self, event: MouseEvent) {
+        match self.scrollbar.handle(&event) {
+            ScrollbarMouse::Ignored => {}
+            ScrollbarMouse::Consumed => return,
+            ScrollbarMouse::ScrollTo(top) => {
+                self.scroll.scroll_to(top as u16);
+                return;
+            }
+        }
         match event.kind {
             MouseEventKind::ScrollUp => self.scroll(-1),
             MouseEventKind::ScrollDown => self.scroll(1),
@@ -133,9 +144,7 @@ impl SkillsModal {
                 .scroll((offset, 0)),
             padded,
         );
-        if total > padded.height {
-            render_vertical_scrollbar(frame, inner, total, offset);
-        }
+        self.scrollbar.draw(frame, inner, total, offset);
 
         self.popup = popup;
         popup

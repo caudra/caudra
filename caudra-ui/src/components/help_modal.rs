@@ -4,10 +4,10 @@ use crate::components::keybindings::{
     ALT_SEP, KEYBINDS, KeyLabel, KeybindContext, all_contexts, key,
 };
 use crate::components::modal::Modal;
-use crate::components::scrollbar::render_vertical_scrollbar;
+use crate::components::scrollbar::{Scrollbar, ScrollbarMouse};
 use crate::theme;
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 use ratatui::text::{Line, Span};
@@ -27,6 +27,7 @@ const INPUT_PREFIXES: &[(&str, &str)] = &[
 pub struct HelpModal {
     open: bool,
     scroll: ModalScroll,
+    scrollbar: Scrollbar,
     popup: Rect,
 }
 
@@ -83,6 +84,7 @@ impl HelpModal {
         Self {
             open: false,
             scroll: ModalScroll::new_top(),
+            scrollbar: Scrollbar::default(),
             popup: Rect::default(),
         }
     }
@@ -103,6 +105,19 @@ impl HelpModal {
     pub fn close(&mut self) {
         self.open = false;
         self.scroll.reset();
+    }
+
+    /// The modal reads nothing else from the pointer, so the bar is all there
+    /// is to offer and a bool is all there is to say.
+    pub fn handle_mouse(&mut self, event: &MouseEvent) -> bool {
+        match self.scrollbar.handle(event) {
+            ScrollbarMouse::Ignored => false,
+            ScrollbarMouse::Consumed => true,
+            ScrollbarMouse::ScrollTo(top) => {
+                self.scroll.scroll_to(top as u16);
+                true
+            }
+        }
     }
 
     pub fn scroll(&mut self, delta: i32) {
@@ -216,9 +231,7 @@ impl HelpModal {
         let paragraph = Paragraph::new(lines).scroll((scroll, 0));
         frame.render_widget(paragraph, inner);
 
-        if total > viewport_h {
-            render_vertical_scrollbar(frame, inner, total, scroll);
-        }
+        self.scrollbar.draw(frame, inner, total, scroll);
 
         self.popup = popup;
         popup

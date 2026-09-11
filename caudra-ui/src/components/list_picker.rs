@@ -8,7 +8,7 @@ use crate::animation::{animation_elapsed_ms, spinner_str};
 use crate::components::Overlay;
 use crate::components::keybindings::key;
 use crate::components::modal::Modal;
-use crate::components::scrollbar::render_vertical_scrollbar;
+use crate::components::scrollbar::{Scrollbar, ScrollbarMouse};
 use crate::repaint::Cadence;
 use crate::text_buffer::{EditResult, TextBuffer};
 use crate::theme;
@@ -90,6 +90,7 @@ struct State<T> {
     popup_area: Rect,
     row_hits: Vec<PickerRowHit>,
     mouse_down: Option<usize>,
+    scrollbar: Scrollbar,
     enabled: Option<Vec<bool>>,
     toggleable: Option<Vec<bool>>,
     matcher: Matcher,
@@ -130,6 +131,7 @@ impl<T: PickerItem> State<T> {
             popup_area: Rect::default(),
             row_hits: Vec::new(),
             mouse_down: None,
+            scrollbar: Scrollbar::default(),
             enabled: None,
             toggleable: None,
             matcher: Matcher::new(Config::DEFAULT),
@@ -268,6 +270,23 @@ impl<T: PickerItem> State<T> {
         let max_offset =
             find_scroll_offset_for_bottom(&self.filtered, &self.items, self.viewport_height);
         self.scroll_offset = self.scroll_offset.min(max_offset);
+    }
+
+    /// The bar counts visual rows, which section headers stretch past the item
+    /// count, so a dragged row is walked back to the item that owns it.
+    fn scroll_to_visual(&mut self, visual_offset: usize) {
+        let max_offset =
+            find_scroll_offset_for_bottom(&self.filtered, &self.items, self.viewport_height);
+        let mut rows = 0;
+        self.scroll_offset = max_offset;
+        for offset in 0..self.filtered.len() {
+            rows += 1 + section_gap(&self.filtered, &self.items, offset, 0);
+            if rows > visual_offset {
+                self.scroll_offset = offset.min(max_offset);
+                break;
+            }
+        }
+        self.invalidate_mouse_geometry();
     }
 
     fn selected_item_index(&self) -> Option<usize> {
@@ -474,6 +493,14 @@ impl<T: PickerItem> ListPicker<T> {
         let Some(state) = self.state.as_mut() else {
             return PickerAction::Close;
         };
+        match state.scrollbar.handle(&event) {
+            ScrollbarMouse::Ignored => {}
+            ScrollbarMouse::Consumed => return PickerAction::Consumed,
+            ScrollbarMouse::ScrollTo(top) => {
+                state.scroll_to_visual(top as usize);
+                return PickerAction::Consumed;
+            }
+        }
         let position = Position::new(event.column, event.row);
         match event.kind {
             MouseEventKind::Down(MouseButton::Left) => {
@@ -804,10 +831,9 @@ fn render_ready<T: PickerItem>(
     }
 
     let total_visual = visual_rows_in_range(&s.filtered, &s.items, 0, s.filtered.len());
-    if total_visual as u16 > viewport_h {
-        let visual_offset = visual_rows_in_range(&s.filtered, &s.items, 0, s.scroll_offset);
-        render_vertical_scrollbar(frame, list_area, total_visual as u16, visual_offset as u16);
-    }
+    let visual_offset = visual_rows_in_range(&s.filtered, &s.items, 0, s.scroll_offset);
+    s.scrollbar
+        .draw(frame, list_area, total_visual as u32, visual_offset as u32);
 
     s.popup_area = popup;
     popup
@@ -1074,6 +1100,10 @@ mod tests {
 
     const SECTION_A: &str = "A";
     const SECTION_B: &str = "B";
+    const BAR_LOST_THE_PRESS: &str = "the row under the scrollbar took the press";
+    /// More items than the 80x24 test terminal can show, so the bar has a
+    /// track to press on.
+    const OVERFLOWING_ITEMS: usize = 50;
 
     fn ready_state<T>(p: &ListPicker<T>) -> &State<T> {
         p.state.as_ref().expect("expected open state")
@@ -1382,6 +1412,30 @@ mod tests {
 
         assert!(matches!(action, PickerAction::Consumed));
         assert!(picker.is_open());
+    }
+
+    /// A highlighted row is painted over the bar's column, so the bar has to
+    /// be offered the press before the row beneath it takes it.
+    #[test]
+    fn pressing_the_scrollbar_scrolls_instead_of_selecting() {
+        let labels: Vec<String> = (0..OVERFLOWING_ITEMS)
+            .map(|i| format!("item {i}"))
+            .collect();
+        let mut picker = ListPicker::new();
+        picker.open(labels, " Test ");
+        render(&mut picker);
+        let last = *ready_state(&picker).row_hits.last().unwrap();
+        let bar = Rect::new(last.area.right() - 1, last.area.y, 1, 1);
+
+        picker.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), bar));
+
+        let state = ready_state(&picker);
+        assert_eq!(
+            state.scroll_offset,
+            OVERFLOWING_ITEMS - state.viewport_height,
+            "{BAR_LOST_THE_PRESS}"
+        );
+        assert!(state.mouse_down.is_none(), "{BAR_LOST_THE_PRESS}");
     }
 
     #[test]

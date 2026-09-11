@@ -20,7 +20,7 @@ use crate::components::Overlay;
 use crate::components::file_walk::{self, Walk};
 use crate::components::keybindings::key;
 use crate::components::modal::Modal;
-use crate::components::scrollbar::render_vertical_scrollbar;
+use crate::components::scrollbar::{Scrollbar, ScrollbarMouse};
 use crate::repaint::{Cadence, Dirty};
 use crate::text_buffer::{EditResult, TextBuffer};
 use crate::theme;
@@ -70,6 +70,7 @@ struct Session {
     popup_area: Rect,
     row_hits: Vec<FileRowHit>,
     mouse_down: Option<String>,
+    scrollbar: Scrollbar,
 
     cancel: Arc<AtomicBool>,
     done_rx: flume::Receiver<Walk>,
@@ -120,6 +121,7 @@ impl FilePickerModal {
             popup_area: Rect::default(),
             row_hits: Vec::new(),
             mouse_down: None,
+            scrollbar: Scrollbar::default(),
             cancel,
             done_rx,
             started_at: Instant::now(),
@@ -211,6 +213,14 @@ impl FilePickerModal {
         let Some(s) = &mut self.session else {
             return FilePickerModalAction::Close;
         };
+        match s.scrollbar.handle(&event) {
+            ScrollbarMouse::Ignored => {}
+            ScrollbarMouse::Consumed => return FilePickerModalAction::Consumed,
+            ScrollbarMouse::ScrollTo(top) => {
+                scroll_to(s, top as usize);
+                return FilePickerModalAction::Consumed;
+            }
+        }
         let position = Position::new(event.column, event.row);
         match event.kind {
             MouseEventKind::Down(MouseButton::Left) => {
@@ -356,9 +366,8 @@ impl FilePickerModal {
         render_list(frame, list_area, s);
         render_search(frame, search_area, s);
 
-        if match_count > s.viewport_height as u16 {
-            render_vertical_scrollbar(frame, list_area, match_count, s.scroll_offset as u16);
-        }
+        s.scrollbar
+            .draw(frame, list_area, match_count, s.scroll_offset as u32);
 
         popup
     }
@@ -454,6 +463,16 @@ fn ensure_visible(s: &mut Session) {
     if s.scroll_offset != previous_offset {
         invalidate_mouse_geometry(s);
     }
+}
+
+/// `ensure_visible` pulls the offset back onto the selection, so a dragged
+/// offset only holds if the selection travels with it.
+fn scroll_to(s: &mut Session, offset: usize) {
+    s.scroll_offset = offset;
+    let last = s.matches.len().saturating_sub(1);
+    let bottom = (offset + s.viewport_height.saturating_sub(1)).min(last);
+    s.selected = s.selected.clamp(offset.min(last), bottom);
+    invalidate_mouse_geometry(s);
 }
 
 fn invalidate_mouse_geometry(s: &mut Session) {
@@ -600,6 +619,11 @@ mod tests {
     const NEVER_CONVERGED: &str = "picker never rebuilt its matches from later ticks";
     const NEVER_CLOSED: &str = "picker never closed on an empty walk";
 
+    const BAR_LOST_THE_PRESS: &str = "the row under the scrollbar took the press";
+    /// More matches than the 80x24 test terminal can show, so the bar has a
+    /// track to press on.
+    const OVERFLOWING_MATCHES: usize = 50;
+
     const MAIN_PATH: &str = "src/main.rs";
     const README_PATH: &str = "docs/readme.md";
     const README_QUERY: &str = "readme";
@@ -666,6 +690,7 @@ mod tests {
             popup_area: Rect::default(),
             row_hits: Vec::new(),
             mouse_down: None,
+            scrollbar: Scrollbar::default(),
             cancel: Arc::new(AtomicBool::new(false)),
             done_rx,
             started_at: Instant::now(),
@@ -1129,6 +1154,26 @@ mod tests {
         let action = picker.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), hit.area));
 
         assert!(matches!(action, FilePickerModalAction::Consumed));
+    }
+
+    /// The bar is painted over the last column of the rows, so it has to take
+    /// the press before the row beneath it arms a click.
+    #[test]
+    fn pressing_the_scrollbar_scrolls_instead_of_selecting() {
+        let mut picker = picker_with_matches(OVERFLOWING_MATCHES);
+        render(&mut picker);
+        let last_row = *picker.session.as_ref().unwrap().row_hits.last().unwrap();
+        let bar = Rect::new(last_row.area.right() - 1, last_row.area.y, 1, 1);
+
+        picker.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), bar));
+
+        let session = picker.session.as_ref().unwrap();
+        assert_eq!(
+            session.scroll_offset,
+            OVERFLOWING_MATCHES - session.viewport_height,
+            "{BAR_LOST_THE_PRESS}"
+        );
+        assert!(session.mouse_down.is_none(), "{BAR_LOST_THE_PRESS}");
     }
 
     #[test]

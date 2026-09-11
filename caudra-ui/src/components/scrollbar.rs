@@ -1,11 +1,24 @@
+//! Caudra's side of the shared scrollbar: the `ui.scrollbar` setting, and the
+//! `Frame` its surfaces draw into.
+//!
+//! The geometry, the paint and the drag live in [`caudra_workbench::scroll`],
+//! which the workbench draws from too, so a bar behaves the same wherever it
+//! is shown.
+
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crossterm::event::MouseEvent;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
-use ratatui::widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState};
 
-pub const SCROLLBAR_THUMB: &str = "\u{2590}";
+use caudra_workbench::scroll;
+
+pub use caudra_workbench::scroll::{ScrollHint, ScrollbarMouse};
+
+/// A `ListPicker` renders highlighted rows over the bar's column, so the thumb
+/// resets both channels rather than inheriting the row's background.
+const THUMB: Style = Style::new().fg(Color::Reset).bg(Color::Reset);
 
 static ENABLED: AtomicBool = AtomicBool::new(true);
 
@@ -13,37 +26,47 @@ pub fn set_enabled(enabled: bool) {
     ENABLED.store(enabled, Ordering::Relaxed);
 }
 
-/// Read by surfaces that draw their own bar rather than calling
-/// [`render_vertical_scrollbar`], which is the workbench.
+/// Read by surfaces that draw their own bar rather than holding a
+/// [`Scrollbar`], which is the workbench.
 pub fn enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
 }
 
-/// `impl Into<u32>` so the transcript, whose row space outgrew `u16`, and every
-/// content-bounded surface, which has not, both call it unchanged.
-pub fn render_vertical_scrollbar(
-    frame: &mut Frame,
-    area: Rect,
-    content_len: impl Into<u32>,
-    position: impl Into<u32>,
-) {
-    if !ENABLED.load(Ordering::Relaxed) {
-        return;
+/// One surface's bar. Held as a field, placed while rendering and consulted
+/// while handling the mouse, which is how every other hit region here works.
+///
+/// `impl Into<u32>` on the totals so the transcript, whose row space outgrew
+/// `u16`, and every content-bounded surface, which has not, both call it
+/// unchanged.
+#[derive(Clone, Debug, Default)]
+pub struct Scrollbar(scroll::Scrollbar);
+
+impl Scrollbar {
+    /// Records the strip and paints it. Turning bars off leaves no track, so
+    /// there is nothing to grab and nothing to take a press: the column goes
+    /// back to whatever is drawn there.
+    pub fn draw(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        total: impl Into<u32>,
+        position: impl Into<u32>,
+    ) {
+        if !enabled() {
+            self.0.place(Rect::ZERO, 0, 0);
+            return;
+        }
+        self.0.place(area, total.into(), position.into());
+        self.0.render(frame.buffer_mut(), THUMB);
     }
-    let (content_len, position) = (content_len.into(), position.into());
-    let max_scroll = content_len.saturating_sub(u32::from(area.height));
-    let mut state = ScrollbarState::default()
-        .content_length(max_scroll as usize + 1)
-        .position(position as usize);
 
-    let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
-        .thumb_symbol(SCROLLBAR_THUMB)
-        // ListPicker renders highlighted rows over the scrollbar track; resetting
-        // the thumb style keeps its color stable instead of inheriting row bg.
-        .thumb_style(Style::new().fg(Color::Reset).bg(Color::Reset))
-        .track_symbol(None)
-        .begin_symbol(None)
-        .end_symbol(None);
+    /// Only drawn while a drag is live, and only worth setting on a surface
+    /// wide enough to spare the columns beside its bar.
+    pub fn set_hint(&mut self, hint: ScrollHint) {
+        self.0.set_hint(hint);
+    }
 
-    frame.render_stateful_widget(scrollbar, area, &mut state);
+    pub fn handle(&mut self, event: &MouseEvent) -> ScrollbarMouse {
+        self.0.handle(event)
+    }
 }

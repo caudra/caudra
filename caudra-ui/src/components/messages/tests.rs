@@ -1,7 +1,6 @@
 use super::segment;
 use super::*;
 use crate::chat::{DONE_TEXT, ERROR_TEXT};
-use crate::components::scrollbar::SCROLLBAR_THUMB;
 use crate::components::tool_display::NOTICE_PREFIX;
 use crate::repaint::expect::{OWED, QUIET};
 use crate::selection::{Selection, SelectionZone};
@@ -17,6 +16,7 @@ use caudra_agent::{
     SnapshotLine, SnapshotSpan, SpanStyle, SubagentActivity, SubagentProgress, ToolInput,
     ToolOutput,
 };
+use caudra_workbench::scroll::SCROLLBAR_THUMB;
 use ratatui::backend::TestBackend;
 use ratatui::style::Modifier;
 use std::collections::HashSet;

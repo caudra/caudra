@@ -10,7 +10,7 @@ use ratatui::widgets::{Paragraph, Wrap};
 
 use crate::components::keybindings::key;
 use crate::components::modal::{CHROME_LINES, FooterHits, FooterLine, Modal};
-use crate::components::scrollbar::render_vertical_scrollbar;
+use crate::components::scrollbar::{Scrollbar, ScrollbarMouse};
 use crate::components::{
     ModalScroll, Overlay, apportion, escape_terminal_controls, format_integer, format_usize,
 };
@@ -60,6 +60,7 @@ pub struct StorageModal {
     open: bool,
     expanded: bool,
     scroll: ModalScroll,
+    scrollbar: Scrollbar,
     popup: Rect,
     footer: FooterHits,
     report: Watch<StorageFetchState>,
@@ -71,6 +72,7 @@ impl StorageModal {
             open: false,
             expanded: false,
             scroll: ModalScroll::new_top(),
+            scrollbar: Scrollbar::default(),
             popup: Rect::default(),
             footer: FooterHits::default(),
             report: Watch::default(),
@@ -125,6 +127,14 @@ impl StorageModal {
     /// grows, and re-walking the state directory to show rows already in hand
     /// would stall the very frame the click asked for.
     pub fn handle_mouse(&mut self, event: MouseEvent) {
+        match self.scrollbar.handle(&event) {
+            ScrollbarMouse::Ignored => {}
+            ScrollbarMouse::Consumed => return,
+            ScrollbarMouse::ScrollTo(top) => {
+                self.scroll.scroll_to(top as u16);
+                return;
+            }
+        }
         if self.footer.handle_mouse(event).is_some() {
             self.open(!self.expanded);
         }
@@ -186,9 +196,7 @@ impl StorageModal {
                 .scroll((offset, 0)),
             padded,
         );
-        if total > padded.height {
-            render_vertical_scrollbar(frame, inner, total, offset);
-        }
+        self.scrollbar.draw(frame, inner, total, offset);
 
         self.popup = popup;
         popup
@@ -625,6 +633,7 @@ mod tests {
     const MISSING_HIDDEN: &str = "a collapsed list must account for what it hid";
     const MISSING_SNAPSHOTS: &str = "the snapshot total must be visible";
     const HOVER_MISSED: &str = "the footer command must reverse under the pointer";
+    const BAR_IGNORED: &str = "a press on the bar's column must scroll the body";
 
     fn stats() -> SessionStorageStats {
         SessionStorageStats {
@@ -847,6 +856,32 @@ mod tests {
         modal.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), hit));
         modal.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), hit));
         assert!(modal.is_expanded());
+    }
+
+    #[test]
+    fn a_press_on_the_bar_scrolls_the_body() {
+        const WIDTH: u16 = 120;
+        const HEIGHT: u16 = 20;
+
+        let backend = TestBackend::new(WIDTH, HEIGHT);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut modal = StorageModal::new();
+        let slot = ArcSwapOption::from(Some(Arc::new(report(stores(COLLAPSED_STORES + 3)))));
+        modal.open(true);
+        let _ = modal.poll(&slot);
+        terminal
+            .draw(|frame| {
+                modal.view(frame, frame.area());
+            })
+            .unwrap();
+        assert_eq!(modal.scroll.offset(), 0);
+
+        // The last row of a track is the end of the document by definition, so
+        // the press lands there wherever rounding painted the thumb.
+        let bar = Rect::new(modal.popup.right() - 2, modal.popup.bottom() - 2, 1, 1);
+        modal.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), bar));
+
+        assert!(modal.scroll.offset() > 0, "{BAR_IGNORED}");
     }
 
     /// The click that expands must not throw away the measurement: re-walking

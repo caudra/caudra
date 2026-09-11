@@ -123,6 +123,7 @@ use ratatui::layout::{Position, Rect};
 pub(crate) use crate::agent::QueuedMessage;
 pub use crate::components::RestoreMode;
 pub(crate) use mode::{Mode, PlanState, PlanTrigger};
+use mouse::Autoscroll;
 #[cfg(test)]
 use mouse::EDGE_SCROLL_LINES;
 pub(crate) use queue::{MessageQueue, SubmitOutcome};
@@ -380,6 +381,9 @@ pub struct App {
     goal_deferred: bool,
     pub(super) zones: ZoneRegistry,
     pub(super) selection_state: Option<SelectionState>,
+    /// Velocity scrolling anchored on a middle press, which reaches the far end
+    /// of a long document without a bar and without a wheel.
+    pub(super) autoscroll: Option<Autoscroll>,
     pub(super) clipboard: ClipboardState,
     pub(super) last_esc: Option<Instant>,
     pub(super) last_exit: Option<Instant>,
@@ -584,6 +588,7 @@ impl App {
             goal_deferred: false,
             zones: ZoneRegistry::new(),
             selection_state: None,
+            autoscroll: None,
             clipboard: ClipboardState::new(),
             last_esc: None,
             last_exit: None,
@@ -1029,7 +1034,10 @@ impl App {
 
     pub fn update(&mut self, msg: Msg) -> Vec<Action> {
         match msg {
-            Msg::Key(key) => self.handle_key(key),
+            Msg::Key(key) => {
+                self.autoscroll = None;
+                self.handle_key(key)
+            }
             Msg::Paste(text) => {
                 self.sync_subagent_input_target();
                 let text = text.replace("\r\n", "\n").replace('\r', "\n");
@@ -1061,6 +1069,7 @@ impl App {
             }
             Msg::Mouse(event) => self.handle_mouse(event),
             Msg::Scroll { column, row, delta } => {
+                self.autoscroll = None;
                 self.handle_scroll(column, row, delta);
                 vec![]
             }
@@ -4172,6 +4181,7 @@ impl App {
         // `|` never short-circuits: every poller must run on every tick.
         self.float_mgr.tick()
             | self.tick_edge_scroll()
+            | self.tick_autoscroll()
             | self.tick_error_expiry()
             | self.poll_image_paste()
             | self.tick_btw()
@@ -4372,6 +4382,7 @@ impl App {
             self.selection_state
                 .as_ref()
                 .map_or(Cadence::IDLE, SelectionState::cadence),
+            Cadence::when(self.autoscroll.is_some(), Cadence::SMOOTH),
             Cadence::any(self.chats.iter().map(Chat::cadence)),
             self.which_key.cadence(),
         ])

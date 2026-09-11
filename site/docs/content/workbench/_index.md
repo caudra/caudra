@@ -56,7 +56,10 @@ The workbench takes the mouse the way an IDE does.
 | Drag a source control header | Resize the section above it |
 | Drag the divider | Resize the sidebar |
 | Wheel over a pane | Scroll that pane |
+| Alt and the wheel | Scroll four times as far |
 | Sideways wheel over the buffer | Pan the text left or right |
+| Drag a scrollbar | Move that pane to anywhere in its content |
+| Click a scrollbar track | Jump there, and keep dragging from that point |
 
 In the buffer, click to place the cursor and drag to select. A drag that runs past the top or bottom edge scrolls the buffer and keeps the selection growing. Click twice to take the word under the pointer, three times to take the whole line. Letting go puts whatever is selected on the system clipboard, so `Ctrl+C` is a second way rather than the only one. `Shift+Delete` and `Backspace` also work on that selection.
 
@@ -64,7 +67,11 @@ In source control, in search, and in the `Ctrl+P` file picker, one click does wh
 
 Whatever the pointer rests on is highlighted, so you can see what a click would hit. A row that is already selected is left as it is.
 
-A pane whose content runs past its bottom gives up its last column to a scrollbar, so you can see how much is off screen. Panes that fit keep their full width, and setting `ui.scrollbar` to `false` turns the bars off here as it does everywhere else. The bar is a marker rather than a handle: use the wheel or the arrow keys to move.
+A pane whose content runs past its bottom gives up its last column to a scrollbar, so you can see how much is off screen. Panes that fit keep their full width, and setting `ui.scrollbar` to `false` turns the bars off here as it does everywhere else.
+
+The bar is also a handle. Press the thumb and drag it and the pane follows. Press the track anywhere else and the thumb jumps there and stays held, so one press covers both the coarse move and the fine one. Sliding off the column does not drop the drag. A short track over a long file is hundreds of lines per row, so hold `Alt` while dragging to cover an eighth of the distance and land on the line you wanted. The editor shows which line the thumb is on while you drag it.
+
+Dragging a bar moves the window and leaves the cursor where it was, the way scrolling a buffer does. The next arrow key pulls the window back to it.
 
 ## Context menu
 

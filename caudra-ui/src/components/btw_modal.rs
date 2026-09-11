@@ -1,13 +1,13 @@
 use crate::components::ModalScroll;
 use crate::components::Overlay;
 use crate::components::modal::Modal;
-use crate::components::scrollbar::render_vertical_scrollbar;
+use crate::components::scrollbar::{Scrollbar, ScrollbarMouse};
 use crate::components::streaming_content::StreamingContent;
 use crate::theme;
 
 use caudra_agent::CancelTrigger;
 use caudra_providers::{Billing, TokenUsage};
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 use ratatui::text::{Line, Span};
@@ -42,6 +42,7 @@ pub struct BtwModal {
     question: String,
     answer: StreamingContent,
     scroll: ModalScroll,
+    scrollbar: Scrollbar,
     rx: Option<flume::Receiver<BtwEvent>>,
     /// Dropping this cancels the in-flight request, so every teardown path that
     /// already funnels through [`BtwModal::close`] cancels for free.
@@ -63,6 +64,7 @@ impl BtwModal {
                 ms_per_char,
             ),
             scroll: ModalScroll::new(),
+            scrollbar: Scrollbar::default(),
             rx: None,
             cancel: None,
             pending_usage: None,
@@ -148,6 +150,19 @@ impl BtwModal {
         self.scroll.scroll(delta);
     }
 
+    /// The modal reads nothing else from the pointer, so the bar is all there
+    /// is to offer and a bool is all there is to say.
+    pub fn handle_mouse(&mut self, event: &MouseEvent) -> bool {
+        match self.scrollbar.handle(event) {
+            ScrollbarMouse::Ignored => false,
+            ScrollbarMouse::Consumed => true,
+            ScrollbarMouse::ScrollTo(top) => {
+                self.scroll.scroll_to(top as u16);
+                true
+            }
+        }
+    }
+
     pub fn handle_key(&mut self, key_event: KeyEvent) {
         match key_event.code {
             KeyCode::Esc | KeyCode::Enter | KeyCode::Char(' ') => {
@@ -202,9 +217,7 @@ impl BtwModal {
             .scroll((scroll, 0));
         frame.render_widget(paragraph, padded);
 
-        if total > viewport_h {
-            render_vertical_scrollbar(frame, inner, total, scroll);
-        }
+        self.scrollbar.draw(frame, inner, total, scroll);
 
         self.popup = popup;
         popup

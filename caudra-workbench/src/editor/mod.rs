@@ -165,6 +165,14 @@ impl Tab {
         self.h_scroll
     }
 
+    /// Lands the pane on a buffer line. The bar counts in buffer lines even
+    /// when wrapping makes a row a slice of one, so a drag arrives here in the
+    /// same unit the thumb was painted from.
+    pub fn set_scroll(&mut self, line: usize) {
+        self.scroll = line.min(self.buffer.line_count().saturating_sub(1));
+        self.scroll_row = 0;
+    }
+
     /// Works out the syntax colours for the rows about to be drawn. A diff tab
     /// is coloured by its [`DiffKind`]s instead, so it asks for none.
     pub fn highlight(&mut self, first: usize, last: usize) {

@@ -28,7 +28,7 @@ use ratatui::widgets::{Paragraph, Widget, Wrap};
 
 use super::messages::{ASSISTANT_LABEL, ReviewTarget};
 use super::modal::Modal;
-use super::scrollbar::render_vertical_scrollbar;
+use super::scrollbar::{Scrollbar, ScrollbarMouse};
 use super::{DisplaySource, Overlay, hint_line};
 use crate::markdown;
 use crate::provenance::{LineProvenance, Provenance};
@@ -101,6 +101,7 @@ pub(crate) struct ReviewModal {
     mode: Mode,
     buffer: TextBuffer,
     scroll: u16,
+    scrollbar: Scrollbar,
     rows_total: u16,
     width: u16,
     content: Rect,
@@ -118,6 +119,7 @@ impl ReviewModal {
             },
             buffer: TextBuffer::new(String::new()),
             scroll: 0,
+            scrollbar: Scrollbar::default(),
             rows_total: 0,
             width: 0,
             content: Rect::default(),
@@ -181,6 +183,14 @@ impl ReviewModal {
     pub fn handle_mouse(&mut self, event: MouseEvent) -> ReviewAction {
         if self.target.is_none() {
             return ReviewAction::Passthrough;
+        }
+        match self.scrollbar.handle(&event) {
+            ScrollbarMouse::Ignored => {}
+            ScrollbarMouse::Consumed => return ReviewAction::Consumed,
+            ScrollbarMouse::ScrollTo(top) => {
+                self.scroll = top as u16;
+                return ReviewAction::Consumed;
+            }
         }
         if let MouseEventKind::ScrollUp | MouseEventKind::ScrollDown = event.kind {
             let delta = if event.kind == MouseEventKind::ScrollUp {
@@ -554,7 +564,7 @@ impl ReviewModal {
         frame.render_widget(Paragraph::new(lines), area);
     }
 
-    fn render_passage(&self, frame: &mut Frame, area: Rect) {
+    fn render_passage(&mut self, frame: &mut Frame, area: Rect) {
         let Some(target) = &self.target else { return };
         frame.render_widget(
             Paragraph::new(target.lines.clone())
@@ -576,9 +586,8 @@ impl ReviewModal {
             selection::apply_highlight(frame.buffer_mut(), area, &sel);
         }
 
-        if self.rows_total > area.height {
-            render_vertical_scrollbar(frame, area, self.rows_total, self.scroll);
-        }
+        self.scrollbar
+            .draw(frame, area, self.rows_total, self.scroll);
     }
 
     fn view_note(&mut self, frame: &mut Frame, area: Rect) -> Rect {

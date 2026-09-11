@@ -12,7 +12,7 @@ use crate::theme;
 use caudra_agent::PromptAdmission;
 use caudra_agent::mentions::{self, Mention};
 use caudra_storage::input_history::InputHistory;
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use std::mem;
 use std::ops::Range;
 use std::path::PathBuf;
@@ -24,7 +24,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Paragraph};
 
-use super::scrollbar::render_vertical_scrollbar;
+use super::scrollbar::{Scrollbar, ScrollbarMouse};
 use super::{apply_scroll_delta, hover_style};
 use crate::selection::LineBreaks;
 
@@ -164,6 +164,7 @@ pub struct InputBox {
     max_input_lines: u16,
     last_total_lines: u16,
     last_content_height: u16,
+    scrollbar: Scrollbar,
     hover: Option<InputHit>,
     /// Resolves the relative paths a mention names. Mentions stay inert until
     /// the app hands the composer the session's working directory.
@@ -282,6 +283,7 @@ impl InputBox {
             max_input_lines,
             last_total_lines: 1,
             last_content_height: 1,
+            scrollbar: Scrollbar::default(),
             hover: None,
             cwd: PathBuf::new(),
         }
@@ -642,9 +644,8 @@ impl InputBox {
             .scroll((self.scroll_y, 0));
         frame.render_widget(paragraph, content_area);
 
-        if max_scroll > 0 {
-            render_vertical_scrollbar(frame, content_area, total_vl, self.scroll_y);
-        }
+        self.scrollbar
+            .draw(frame, content_area, total_vl, self.scroll_y);
     }
 
     fn max_scroll(&self) -> u16 {
@@ -658,6 +659,20 @@ impl InputBox {
 
     pub fn history(&self) -> &InputHistory {
         &self.history
+    }
+
+    /// The composer routes the rest of the pointer through `handle_click`, so
+    /// the bar is offered on its own and ahead of it: a drag on the bar must
+    /// not move the caret.
+    pub fn handle_scrollbar(&mut self, event: &MouseEvent) -> bool {
+        match self.scrollbar.handle(event) {
+            ScrollbarMouse::Ignored => false,
+            ScrollbarMouse::Consumed => true,
+            ScrollbarMouse::ScrollTo(top) => {
+                self.scroll_y = top as u16;
+                true
+            }
+        }
     }
 
     pub fn scroll(&mut self, delta: i32) {
@@ -1157,7 +1172,7 @@ fn token_spans(line: &str, tokens: &[(Range<usize>, Style)]) -> Vec<Span<'static
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::components::scrollbar::SCROLLBAR_THUMB;
+    use caudra_workbench::scroll::SCROLLBAR_THUMB;
     use crossterm::event::KeyModifiers;
     use ratatui::layout::Rect;
     use test_case::test_case;
