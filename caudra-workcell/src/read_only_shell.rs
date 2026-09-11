@@ -50,6 +50,11 @@ const RG_DENIED_FLAGS: &[&str] = &[
     "--search-zip",
     "-z",
 ];
+const GREP: &str = "grep";
+/// grep has no flag that runs a program or unpacks an archive, unlike ripgrep.
+/// The one that leaves the project follows every symlink it finds rather than
+/// only the ones named on the command line, which no textual check can see.
+const GREP_DENIED_FLAGS: &[&str] = &["--dereference-recursive", "-R"];
 const FIND: &str = "find";
 /// Each of these makes find execute, delete, or write.
 const FIND_DENIED_FLAGS: &[&str] = &[
@@ -91,6 +96,7 @@ fn scope_is_read_only(scope: &ShellCommandScope) -> bool {
                     .is_some_and(|subcommand| GIT_READ_SUBCOMMANDS.contains(subcommand))
         }
         RG => !denies(&arguments, RG_DENIED_FLAGS),
+        GREP => !denies(&arguments, GREP_DENIED_FLAGS),
         FIND => !denies(&arguments, FIND_DENIED_FLAGS),
         SED => sed_only_prints(&arguments),
         executable => READ_ONLY_COMMANDS.contains(&executable),
@@ -258,6 +264,9 @@ mod tests {
     #[test_case("rg -z pattern" => false ; "ripgrep_search_zip")]
     #[test_case("rg -iz pattern" => false ; "ripgrep_search_zip_inside_a_cluster")]
     #[test_case("git --no-pager diff" => true ; "a_long_flag_is_not_a_cluster")]
+    #[test_case("grep -rn needle src" => true ; "grep_recursively")]
+    #[test_case("grep -R needle src" => false ; "grep_dereferencing_every_symlink")]
+    #[test_case("grep -Rn needle src" => false ; "grep_dereferencing_from_inside_a_cluster")]
     #[test_case("find . -name *.rs" => true ; "find_by_name")]
     #[test_case("find . -delete" => false ; "find_delete")]
     #[test_case("find . -exec rm x ;" => false ; "find_exec")]
@@ -278,7 +287,7 @@ mod tests {
     /// A line is only as safe as its worst command, and an unaccounted-for
     /// fragment makes the reviewed text describe less than the line does.
     #[test_case(&["git log", "ls"], false => true ; "every_command_observes")]
-    #[test_case(&["sed -n 1,10p f", "echo ===", "cat f"], false => true ; "a_read_wrapped_in_glue")]
+    #[test_case(&["sed -n 1,10p f", "echo ===", "grep -n y f"], false => true ; "a_read_wrapped_in_glue")]
     #[test_case(&["git log", "rm -rf build"], false => false ; "one_writer_taints_the_line")]
     #[test_case(&["git log"], true => false ; "opaque_is_never_read_only")]
     #[test_case(&[], false => false ; "no_scopes_is_never_read_only")]
