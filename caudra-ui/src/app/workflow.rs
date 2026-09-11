@@ -12,8 +12,8 @@ use caudra_providers::Message;
 #[cfg(test)]
 use caudra_workflow::RunStatus;
 use caudra_workflow::{
-    LaunchRequest, LogLine, MAX_RUN_LOG_ENTRIES, RunSnapshot, WorkflowError, WorkflowEvent,
-    WorkflowRequest, WorkflowResponse,
+    LaunchRequest, LogLine, MAX_AGENT_BUDGET, MAX_RUN_LOG_ENTRIES, RunSnapshot, WorkflowError,
+    WorkflowEvent, WorkflowRequest, WorkflowResponse,
 };
 use serde_json::{Value, json};
 use tracing::{debug, warn};
@@ -27,8 +27,11 @@ use crate::components::workflow_inspector::{InspectorAction, RunControl};
 use crate::repaint::Dirty;
 
 pub(crate) const UNAVAILABLE_MSG: &str = "Workflows are unavailable in this session";
-pub(crate) const WORKFLOW_USAGE: &str =
-    "Usage: /workflow [runs | <name> [--agent-budget N] [args] | pause|resume|stop <run>]";
+pub(crate) const WORKFLOW_USAGE: &str = "Usage: /workflow [runs | <name> [--agent-budget N] [args] | pause|stop <run> | resume <run> [budget]]";
+const UNKNOWN_RUN: &str = "Unknown workflow run: ";
+const AMBIGUOUS: &str = "Several runs match";
+const BUDGET_RANGE: &str = "An agent budget must be between 1 and";
+const MAX_CANDIDATES: usize = 5;
 pub(crate) const DEEP_RESEARCH_USAGE: &str = "Usage: /deep-research <query>";
 pub(crate) const TRUST_HINT: &str = "run /workflows to review and trust it";
 pub(crate) const DEEP_RESEARCH_WORKFLOW: &str = "deep-research";
@@ -77,6 +80,15 @@ pub(crate) enum Intent {
 pub(crate) struct Reply {
     pub(crate) intent: Intent,
     pub(crate) result: Result<WorkflowResponse, WorkflowError>,
+}
+
+/// What a run selector named: nothing, the run id of exactly one run, or the
+/// display names of the several it could have meant.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Resolution {
+    Miss,
+    One(String),
+    Many(Vec<String>),
 }
 
 impl WorkflowUi {
@@ -164,11 +176,36 @@ impl WorkflowUi {
     }
 
     /// The run a user named, by display name first and run id second.
-    pub(crate) fn find(&self, target: &str) -> Option<&RunSnapshot> {
+    fn find(&self, target: &str) -> Option<&RunSnapshot> {
         self.runs
             .iter()
             .find(|run| run.display_name == target)
             .or_else(|| self.runs.iter().find(|run| run.run_id == target))
+    }
+
+    /// What a selector named. An exact display name or run id wins outright;
+    /// otherwise a prefix of either names the run, so a user can type the
+    /// part of it they can read. A prefix several runs answer to is reported
+    /// as the choice it is rather than resolved to the first of them.
+    pub(crate) fn resolve(&self, target: &str) -> Resolution {
+        if let Some(run) = self.find(target) {
+            return Resolution::One(run.run_id.clone());
+        }
+        let candidates: Vec<&RunSnapshot> = self
+            .runs
+            .iter()
+            .filter(|run| run.display_name.starts_with(target) || run.run_id.starts_with(target))
+            .collect();
+        match candidates.as_slice() {
+            [] => Resolution::Miss,
+            [run] => Resolution::One(run.run_id.clone()),
+            many => Resolution::Many(
+                many.iter()
+                    .take(MAX_CANDIDATES)
+                    .map(|run| run.display_name.clone())
+                    .collect(),
+            ),
+        }
     }
 
     /// Ships `request` and answers through the reply channel. `false` when
@@ -279,19 +316,31 @@ impl App {
             self.flash(WORKFLOW_USAGE.into());
             return;
         }
-        let Some(run_id) = self.workflow.find(target).map(|run| run.run_id.clone()) else {
-            self.flash(format!("Unknown workflow run: {target}"));
-            return;
+        // Resume is the only control that takes an argument, because a
+        // budget-limited run has no other way on.
+        let (target, agent_budget) = match control {
+            RunControl::Resume => trailing_budget(target),
+            RunControl::Pause | RunControl::Stop => (target, None),
         };
-        self.control_workflow(control, run_id);
+        if agent_budget.is_some_and(|budget| !(1..=MAX_AGENT_BUDGET).contains(&budget)) {
+            self.flash(format!("{BUDGET_RANGE} {MAX_AGENT_BUDGET}"));
+            return;
+        }
+        match self.workflow.resolve(target) {
+            Resolution::One(run_id) => self.control_workflow(control, run_id, agent_budget),
+            Resolution::Miss => self.flash(format!("{UNKNOWN_RUN}{target}")),
+            Resolution::Many(names) => {
+                self.flash(format!("{AMBIGUOUS} {target}: {}", names.join(", ")));
+            }
+        }
     }
 
-    fn control_workflow(&mut self, control: RunControl, run_id: String) {
+    fn control_workflow(&mut self, control: RunControl, run_id: String, agent_budget: Option<u32>) {
         let request = match control {
             RunControl::Pause => WorkflowRequest::Pause { run_id },
             RunControl::Resume => WorkflowRequest::Resume {
                 run_id,
-                agent_budget: None,
+                agent_budget,
             },
             RunControl::Stop => WorkflowRequest::Stop { run_id },
         };
@@ -340,7 +389,7 @@ impl App {
             InspectorAction::Close => self.workflow_inspector.close(),
             InspectorAction::Inspect(run_id) => self.inspect_workflow(run_id),
             InspectorAction::Control { control, run_id } => {
-                self.control_workflow(control, run_id);
+                self.control_workflow(control, run_id, None);
             }
             InspectorAction::OpenTranscript(task_id) => {
                 self.workflow_inspector.close();
@@ -530,6 +579,19 @@ impl RunControl {
     }
 }
 
+/// A run selector and the budget written after it, when the last word is a
+/// number. A run named by a number alone is still a selector, because a
+/// selector is the one argument resume cannot do without.
+fn trailing_budget(target: &str) -> (&str, Option<u32>) {
+    let Some((head, tail)) = target.rsplit_once(char::is_whitespace) else {
+        return (target, None);
+    };
+    match tail.parse::<u32>() {
+        Ok(budget) => (head.trim_end(), Some(budget)),
+        Err(_) => (target, None),
+    }
+}
+
 fn split_word(text: &str) -> (&str, &str) {
     text.split_once(char::is_whitespace).unwrap_or((text, ""))
 }
@@ -644,6 +706,12 @@ mod tests {
     const CARD_FOLLOWS: &str = "the card must follow the run's snapshots";
     const LOG_MIRRORED: &str = "a log line must reach the mirror's tail";
     const NO_CARD_CHURN: &str = "an agent's activity must not touch the transcript";
+    const OTHER_RUN_ID: &str = "run-2";
+    const OTHER_DISPLAY_NAME: &str = "deep-research-2";
+    const NAME_PREFIX: &str = "deep-research-";
+    const RAISED_BUDGET: u32 = 24;
+    const AMBIGUITY_IS_NOT_A_GUESS: &str =
+        "a selector several runs answer to controls none of them";
 
     pub(crate) fn run(status: RunStatus) -> RunSnapshot {
         RunSnapshot {
@@ -1043,6 +1111,83 @@ mod tests {
         workflow_command(&mut app, "/workflow", &format!("{verb} {DISPLAY_NAME}"));
 
         assert_eq!(app.workflow.sent, vec![expected]);
+    }
+
+    /// A second run whose display name shares the first one's prefix.
+    fn sibling() -> RunSnapshot {
+        let mut other = run(RunStatus::Active);
+        other.run_id = OTHER_RUN_ID.into();
+        other.display_name = OTHER_DISPLAY_NAME.into();
+        other
+    }
+
+    #[test]
+    fn a_prefix_names_the_only_run_it_matches() {
+        let mut app = scripted_app();
+        app.workflow.apply(run(RunStatus::Active));
+
+        workflow_command(&mut app, "/workflow", &format!("stop {NAME_PREFIX}"));
+
+        assert_eq!(
+            app.workflow.sent,
+            vec![WorkflowRequest::Stop {
+                run_id: RUN_ID.into()
+            }]
+        );
+    }
+
+    #[test]
+    fn a_prefix_several_runs_answer_to_is_a_choice() {
+        let mut app = scripted_app();
+        app.workflow.apply(run(RunStatus::Active));
+        app.workflow.apply(sibling());
+
+        workflow_command(&mut app, "/workflow", &format!("stop {NAME_PREFIX}"));
+
+        let flash = app.status_bar.flash_text().unwrap_or_default().to_owned();
+        assert!(flash.starts_with(AMBIGUOUS), "{flash}");
+        assert!(flash.contains(DISPLAY_NAME), "{flash}");
+        assert!(flash.contains(OTHER_DISPLAY_NAME), "{flash}");
+        assert!(app.workflow.sent.is_empty(), "{AMBIGUITY_IS_NOT_A_GUESS}");
+    }
+
+    #[test]
+    fn resume_takes_the_budget_written_after_the_run() {
+        let mut app = scripted_app();
+        app.workflow.apply(run(RunStatus::BudgetLimited));
+
+        workflow_command(
+            &mut app,
+            "/workflow",
+            &format!("resume {DISPLAY_NAME} {RAISED_BUDGET}"),
+        );
+
+        assert_eq!(
+            app.workflow.sent,
+            vec![WorkflowRequest::Resume {
+                run_id: RUN_ID.into(),
+                agent_budget: Some(RAISED_BUDGET),
+            }]
+        );
+    }
+
+    #[test_case(0 ; "zero")]
+    #[test_case(MAX_AGENT_BUDGET + 1 ; "above_the_ceiling")]
+    fn a_budget_the_runtime_would_refuse_is_refused_here(budget: u32) {
+        let mut app = scripted_app();
+        app.workflow.apply(run(RunStatus::BudgetLimited));
+
+        workflow_command(
+            &mut app,
+            "/workflow",
+            &format!("resume {DISPLAY_NAME} {budget}"),
+        );
+
+        assert_eq!(
+            app.status_bar.flash_text(),
+            Some(format!("{BUDGET_RANGE} {MAX_AGENT_BUDGET}").as_str())
+        );
+        assert!(app.workflow.sent.is_empty());
     }
 
     #[test]
