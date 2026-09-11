@@ -386,6 +386,61 @@ impl Scm {
         }
     }
 
+    /// Points the cursor at the change for `relative`, opening whatever folder
+    /// hides it, so the pane agrees with what the editor is showing. A path the
+    /// repository has nothing to say about leaves the cursor where it is rather
+    /// than moving it somewhere arbitrary.
+    pub fn reveal(&mut self, relative: &str) {
+        // A path can be listed on both sides at once, and the cursor may
+        // already be on either of them. Moving it to the other one would
+        // overrule the reader for no gain, so being on it at all is enough.
+        let on_it = self
+            .cursor
+            .row
+            .and_then(|row| self.identity(self.cursor.section, row))
+            .is_some_and(|identity| identity == relative);
+        if on_it {
+            return;
+        }
+        let Some(section) = self.section_of(relative) else {
+            return;
+        };
+        if self.unfold_above(relative) {
+            let previous = self.anchor();
+            self.rebuild(previous);
+        }
+        if let Some(row) = self.row_of(section, relative) {
+            self.select(section, Some(row));
+        }
+    }
+
+    /// Which side lists `relative`. The working tree wins when both do: it is
+    /// the copy the editor has open.
+    fn section_of(&self, relative: &str) -> Option<Section> {
+        self.changes
+            .iter()
+            .filter(|change| change.relative == relative)
+            .map(|change| change.staged)
+            .min()
+            .map(|staged| match staged {
+                true => Section::Staged,
+                false => Section::Unstaged,
+            })
+    }
+
+    /// Opens every folder above `relative`, since a path inside a folded one
+    /// has no row to put the cursor on. Reports whether anything moved, because
+    /// the rows only take account of it after a rebuild.
+    fn unfold_above(&mut self, relative: &str) -> bool {
+        let mut opened = false;
+        let mut at = relative;
+        while let Some((parent, _)) = at.rsplit_once('/') {
+            opened |= self.folded.remove(parent);
+            at = parent;
+        }
+        opened
+    }
+
     /// Lands the cursor on a stop the pointer named. A row past the end of a
     /// section is ignored rather than clamped: it is empty space under the
     /// list, and clicking nothing should select nothing.
@@ -919,7 +974,7 @@ impl Scm {
         })
     }
 
-    fn identity(&self, section: Section, row: usize) -> Option<String> {
+    pub(crate) fn identity(&self, section: Section, row: usize) -> Option<String> {
         match self.row_at(section, row)? {
             Row::Change { index, .. } => Some(self.changes.get(index)?.relative.clone()),
             Row::Directory(index) => Some(self.dir(section, index)?.path.clone()),
@@ -976,6 +1031,8 @@ mod tests {
     const WRONG_SCOPE: &str = "the staging scope does not cover the paths the cursor names";
     const WRONG_COUNT: &str = "the section counts the wrong number of paths";
     const GRAPH_SHAPE: &str = "the graph does not have the shape its commits describe";
+    const NOT_REVEALED: &str = "the cursor must land on the change for the path revealed";
+    const CURSOR_MOVED: &str = "the cursor must stay where the reader left it";
     const ONE: &str = "one";
     const TWO: &str = "two";
 
@@ -1188,6 +1245,67 @@ mod tests {
         let mut scm = pane(vec![change("dirty.rs", false, GitMark::Modified)]);
         scm.select(Section::Graph, None);
         assert!(scm.scope().is_empty(), "{WRONG_SCOPE}");
+    }
+
+    #[test]
+    fn revealing_a_path_lands_the_cursor_on_its_change() {
+        let mut scm = nested();
+        scm.select(Section::Unstaged, Some(3));
+
+        scm.reveal("src/b.rs");
+
+        assert_eq!(
+            scm.identity(Section::Unstaged, scm.cursor().row.unwrap())
+                .as_deref(),
+            Some("src/b.rs"),
+            "{NOT_REVEALED}"
+        );
+    }
+
+    /// A path inside a folded folder has no row at all, so revealing it has to
+    /// open the folder before it has anything to land on.
+    #[test]
+    fn revealing_a_path_opens_the_folder_hiding_it() {
+        let mut scm = nested();
+        scm.select(Section::Unstaged, Some(0));
+        scm.fold();
+        assert_eq!(scm.rows(Section::Unstaged).len(), 2, "{WRONG_STOP}");
+
+        scm.reveal("src/a.rs");
+
+        assert_eq!(
+            scm.identity(Section::Unstaged, scm.cursor().row.unwrap())
+                .as_deref(),
+            Some("src/a.rs"),
+            "{NOT_REVEALED}"
+        );
+    }
+
+    #[test]
+    fn revealing_a_path_the_repository_does_not_list_leaves_the_cursor_alone() {
+        let mut scm = nested();
+        scm.select(Section::Unstaged, Some(1));
+        let before = scm.cursor();
+
+        scm.reveal("untouched.rs");
+
+        assert_eq!(scm.cursor(), before, "{CURSOR_MOVED}");
+    }
+
+    /// The working tree wins when a path is on both sides, but only when the
+    /// cursor is not already on the staged row the reader chose.
+    #[test]
+    fn revealing_a_path_the_cursor_is_already_on_does_not_cross_sides() {
+        let mut scm = pane(vec![
+            change("both.rs", true, GitMark::Added),
+            change("both.rs", false, GitMark::Modified),
+        ]);
+        scm.select(Section::Staged, Some(0));
+        let before = scm.cursor();
+
+        scm.reveal("both.rs");
+
+        assert_eq!(scm.cursor(), before, "{CURSOR_MOVED}");
     }
 
     #[test]

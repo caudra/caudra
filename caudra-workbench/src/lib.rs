@@ -562,9 +562,6 @@ impl Workbench {
         // reveals what it can strip its own root from.
         self.open_path(&self.root.join(path));
         self.show_explorer();
-        // The tree marks its row only while it has the focus, so a reveal the
-        // reader cannot see is the same as no reveal.
-        self.focus = Focus::Sidebar;
         let Some(tab) = self.editor.active_mut() else {
             return;
         };
@@ -2279,6 +2276,9 @@ impl Workbench {
             self.theme_generation,
         ));
         self.focus = Focus::Editor;
+        // A diff names a real file, so the explorer has somewhere to go even
+        // though the pane it was opened from is the one already in place.
+        self.reveal_active();
     }
 
     /// Opens one path of a commit as a read-only diff tab.
@@ -2379,7 +2379,11 @@ impl Workbench {
             return;
         };
         match self.editor.preview(&path, self.theme_generation) {
-            Ok(()) => self.follow_cursor(),
+            Ok(()) => {
+                // The tree is already on this row, but source control is not.
+                self.reveal_active();
+                self.follow_cursor();
+            }
             Err(error) => self.flash = Some(error.to_string()),
         }
     }
@@ -2396,7 +2400,7 @@ impl Workbench {
             Ok(()) => {
                 let open_ms = lap();
                 self.focus = Focus::Editor;
-                self.tree.reveal(path);
+                self.reveal_active();
                 let reveal_ms = lap();
                 self.follow_cursor();
                 tracing::info!(
@@ -2500,13 +2504,28 @@ impl Workbench {
         self.sidebar_collapsed = false;
     }
 
-    /// Keeps the tree on whatever the editor is showing, so the sidebar never
-    /// points somewhere else after a tab switch.
+    /// Points both sidebars at whatever the editor is showing: the explorer
+    /// expands down to the file, and source control lands on its change when it
+    /// has one.
+    ///
+    /// Neither pane is brought to the front. Which sidebar is up is the
+    /// reader's choice, and opening a tab is not a reason to overrule it; the
+    /// point is that the pane they do go back to is already in the right place.
     fn reveal_active(&mut self) {
         let Some(path) = self.editor.active().map(|tab| tab.path.clone()) else {
             return;
         };
         self.tree.reveal(&path);
+        // Change paths are relative to the repository, which is not the
+        // workbench root when the workbench was opened below it.
+        let relative = self
+            .scm
+            .workdir()
+            .and_then(|workdir| path.strip_prefix(workdir).ok())
+            .map(|relative| relative.to_string_lossy().into_owned());
+        if let Some(relative) = relative {
+            self.scm.reveal(&relative);
+        }
     }
 
     /// Reports whether the write landed, which is what tells the unsaved-changes
@@ -2792,6 +2811,8 @@ mod tests {
     const WRONG_WIDTH: &str = "the sidebar is not the width it was asked for";
     const WRONG_LAYOUT: &str = "the workbench did not come back the way it was left";
     const WRONG_HOVER: &str = "the row under the pointer is not marked the way it should be";
+    const NOT_TRACKED: &str =
+        "a sidebar without the focus must still mark the row the editor is on, and only that row";
     const WRONG_GEOMETRY: &str = "the sections did not divide the room the way they were asked to";
     const WRONG_ROW: &str = "the pointer did not act on the row it was pointing at";
     const LAYOUT_LOST: &str = "the source control layout did not come back the way it was left";
@@ -3117,7 +3138,7 @@ mod tests {
 
         assert_eq!(workbench.sidebar, SidebarView::Explorer, "{NOT_REVEALED}");
         assert!(!workbench.sidebar_collapsed, "{NOT_REVEALED}");
-        assert_eq!(workbench.focus, Focus::Sidebar, "{NOT_REVEALED}");
+        assert_eq!(workbench.focus, Focus::Editor, "{NOT_REVEALED}");
         assert_eq!(
             workbench.tree.selected().map(|row| row.path.clone()),
             Some(dir.path().join(relative)),
@@ -5984,6 +6005,58 @@ mod tests {
             plain,
             "{WRONG_HOVER}"
         );
+    }
+
+    /// Source control lists paths relative to the repository, and the editor
+    /// holds absolute ones, so the two only meet if the translation between
+    /// them is right. Nothing else exercises it: the ordinary fixture is not a
+    /// repository, so `workdir` is `None` and the reveal never runs.
+    #[test]
+    fn opening_a_file_moves_the_source_control_cursor_to_its_change() {
+        let dir = TempDir::new().expect("a temporary directory");
+        gix::init(dir.path()).expect("a repository");
+        fs::write(dir.path().join("a.txt"), "one\ntwo\nthree\n").expect("a file");
+        let mut workbench = Workbench::new(WorkbenchStyles::default());
+        workbench.open(dir.path());
+        assert!(workbench.scm.is_repository(), "{NOT_TRACKED}");
+
+        open_file(&dir, &mut workbench);
+
+        let cursor = workbench.scm.cursor();
+        assert_eq!(
+            cursor
+                .row
+                .and_then(|row| workbench.scm.identity(cursor.section, row))
+                .as_deref(),
+            Some("a.txt"),
+            "{NOT_TRACKED}"
+        );
+    }
+
+    /// Opening a file takes the focus to the editor, and the explorer used to
+    /// drop its mark the moment that happened. A reveal the reader cannot see
+    /// is the same as no reveal, so the row keeps the bar.
+    #[test]
+    fn the_explorer_marks_the_open_file_while_the_editor_has_the_focus() {
+        let (dir, mut workbench) = project();
+        open_file(&dir, &mut workbench);
+        assert_eq!(workbench.focus, Focus::Editor, "{NOT_TRACKED}");
+        draw(&mut workbench, 80, 24);
+        let rows = workbench.panes.rows;
+        let column = row_body(rows);
+
+        let opened = cell_style(&mut workbench, (column, rows.y + 1));
+        let untouched = cell_style(&mut workbench, (column, rows.y));
+
+        workbench.focus = Focus::Sidebar;
+        draw(&mut workbench, 80, 24);
+
+        assert_eq!(
+            opened,
+            cell_style(&mut workbench, (column, rows.y + 1)),
+            "{NOT_TRACKED}"
+        );
+        assert_ne!(untouched, opened, "{NOT_TRACKED}");
     }
 
     /// The selected row already stands out, so a hover on top of it would be

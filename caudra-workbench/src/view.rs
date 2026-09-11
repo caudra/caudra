@@ -282,8 +282,8 @@ impl Workbench {
         );
 
         match self.sidebar {
-            SidebarView::Explorer => self.render_tree(buf, body, focused),
-            SidebarView::SourceControl => self.render_scm(buf, body, focused),
+            SidebarView::Explorer => self.render_tree(buf, body),
+            SidebarView::SourceControl => self.render_scm(buf, body),
             SidebarView::Search => self.render_search(buf, body, focused),
         }
     }
@@ -404,7 +404,7 @@ impl Workbench {
     /// Three stacked sections, each with a pinned title row over a list that
     /// scrolls under it. The title stays put so the fold handle and the count
     /// never scroll out of reach.
-    fn render_scm(&mut self, buf: &mut Surface, area: Rect, focused: bool) {
+    fn render_scm(&mut self, buf: &mut Surface, area: Rect) {
         if !self.scm.is_repository() || self.scm.error().is_some() {
             let notice = self.scm.error().unwrap_or(NOT_A_REPOSITORY);
             placeholder(buf, area, notice, self.styles.dim);
@@ -421,7 +421,7 @@ impl Workbench {
         let cursor = self.scm.cursor();
         for (index, section) in Section::ALL.into_iter().enumerate() {
             let rects = self.panes.sections[index];
-            let chosen = focused && cursor.section == section && cursor.row.is_none();
+            let chosen = cursor.section == section && cursor.row.is_none();
             let pointer = self.hovering(rects.header);
             let line = section_header(
                 section,
@@ -434,8 +434,7 @@ impl Workbench {
             );
             let line = emphasize(line, pointer.is_some() && !chosen, &self.styles);
             chrome::render_line(buf, rects.header, line);
-            self.panes.sections[index].body =
-                self.render_section(buf, section, rects.body, focused);
+            self.panes.sections[index].body = self.render_section(buf, section, rects.body);
         }
         if self.scm.is_empty() {
             let notice = Rect {
@@ -451,13 +450,7 @@ impl Workbench {
 
     /// Reports the rows it drew into, which is the section's body less
     /// whatever its scrollbar took.
-    fn render_section(
-        &mut self,
-        buf: &mut Surface,
-        section: Section,
-        area: Rect,
-        focused: bool,
-    ) -> Rect {
+    fn render_section(&mut self, buf: &mut Surface, section: Section, area: Rect) -> Rect {
         let height = area.height as usize;
         if !self.bars.sections[section.index()].is_dragging() {
             self.scm.clamp_scroll(section, height);
@@ -472,8 +465,7 @@ impl Workbench {
         let pointer = self.hovering(rows);
         for offset in 0..height.min(total.saturating_sub(scroll)) {
             let row = self.scm.rows(section)[scroll + offset];
-            let chosen =
-                focused && cursor.section == section && cursor.row == Some(scroll + offset);
+            let chosen = cursor.section == section && cursor.row == Some(scroll + offset);
             let on_row = pointer.filter(|at| (at.1 - rows.y) as usize == offset);
             let line = scm_row(
                 &self.scm,
@@ -516,7 +508,7 @@ impl Workbench {
         }
     }
 
-    fn render_tree(&mut self, buf: &mut Surface, area: Rect, focused: bool) {
+    fn render_tree(&mut self, buf: &mut Surface, area: Rect) {
         let height = area.height as usize;
         if !self.bars.sidebar.is_dragging() {
             self.tree.clamp_scroll(height);
@@ -542,7 +534,13 @@ impl Workbench {
             .take(height)
             .enumerate()
         {
-            let chosen = focused && scroll + offset == selected;
+            // Not gated on the focus. The row is what the editor is showing as
+            // much as it is where the arrow keys are, and a pane that drops the
+            // mark the moment anything else is focused cannot answer the only
+            // question it is ever asked from the editor: where am I? Which pane
+            // has the focus is already on the header, which prints the view it
+            // is showing in bold only while it holds it.
+            let chosen = scroll + offset == selected;
             let marked = on_mark && pointed == Some(offset);
             let line = tree_row(row, chosen, marked, &self.styles, rows.width);
             let line = emphasize(line, pointed == Some(offset) && !chosen, &self.styles);
