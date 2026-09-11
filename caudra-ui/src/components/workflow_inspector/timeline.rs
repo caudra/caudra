@@ -211,6 +211,7 @@ mod tests {
             display_name: RUN_ID.into(),
             workflow_name: RUN_ID.into(),
             source_kind: SourceKind::User,
+            source_path: None,
             objective: None,
             status,
             pause_kind: None,

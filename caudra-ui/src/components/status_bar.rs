@@ -1212,6 +1212,7 @@ mod tests {
             display_name: RUN_NAME.into(),
             workflow_name: RUN_NAME.into(),
             source_kind: caudra_workflow::SourceKind::Builtin,
+            source_path: None,
             objective: None,
             status,
             pause_kind: None,

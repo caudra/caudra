@@ -35,6 +35,7 @@ pub(super) fn snapshot_from_row(row: &WorkflowRunRow) -> RunSnapshot {
         display_name: row.display_name.clone(),
         workflow_name: row.workflow_name.clone(),
         source_kind: source_kind(row.source_kind),
+        source_path: row.source_path.clone(),
         objective: row.objective.clone(),
         status: run_status(row.status),
         pause_kind: row.pause_kind.clone(),

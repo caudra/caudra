@@ -1049,6 +1049,18 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::All,
     },
     Keybind {
+        label: KeyLabel::Single(workflow_inspector::SCRIPT_LABEL),
+        description: "Open the script the selected run executed",
+        context: KeybindContext::WorkflowInspector,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(workflow_inspector::EXPORT_LABEL),
+        description: "Copy the whole run as markdown, every prompt and result included",
+        context: KeybindContext::WorkflowInspector,
+        platform: Platform::All,
+    },
+    Keybind {
         label: KeyLabel::Single(workflow_inspector::COPY_LABEL),
         description: "Copy the visible section",
         context: KeybindContext::WorkflowInspector,

@@ -2504,6 +2504,7 @@ complete(#{ report: first.output });
             display_name: "echo-2".into(),
             workflow_name: WORKFLOW_NAME.into(),
             source_kind: caudra_workflow::SourceKind::Project,
+            source_path: None,
             objective: None,
             status: RunStatus::Completed,
             pause_kind: None,

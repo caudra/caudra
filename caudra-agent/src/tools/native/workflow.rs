@@ -426,6 +426,7 @@ mod tests {
             display_name: NAME.into(),
             workflow_name: NAME.into(),
             source_kind: SourceKind::User,
+            source_path: None,
             objective: None,
             status: RunStatus::Active,
             pause_kind: None,

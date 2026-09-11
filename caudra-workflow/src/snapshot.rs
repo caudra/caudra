@@ -237,6 +237,10 @@ pub struct RunSnapshot {
     pub display_name: String,
     pub workflow_name: String,
     pub source_kind: SourceKind,
+    /// Where the script the run executed lives, for a run that came from a
+    /// file. A builtin is embedded and has nowhere to point.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub objective: Option<String>,
     pub status: RunStatus,
@@ -349,6 +353,7 @@ mod tests {
             display_name: RUN_ID.into(),
             workflow_name: RUN_ID.into(),
             source_kind: SourceKind::Builtin,
+            source_path: None,
             objective: None,
             status,
             pause_kind: None,

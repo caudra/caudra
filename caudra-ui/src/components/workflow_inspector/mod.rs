@@ -80,17 +80,24 @@ const BUDGET_LABEL: &str = "Agent budget: ";
 const BUDGET_STEP: u32 = 64;
 const BUDGET_LIMITED_HINT: &str = "Budget limited: r resumes with a higher agent budget";
 const FAILED_HINT: &str = "Failed: r resumes from the journal";
+const NO_SCRIPT: &str = "A builtin workflow is compiled in and has no file to open";
+const NOTHING_TO_EXPORT: &str = "This run has no journal to export yet";
+const EXPORTED: &str = "Copied the run as markdown";
 const COPIED: &str = "Copied section";
 pub(crate) const PAUSE_LABEL: &str = "p";
 pub(crate) const RESUME_LABEL: &str = "r";
 pub(crate) const STOP_LABEL: &str = "s";
 pub(crate) const TRANSCRIPT_LABEL: &str = "t";
+pub(crate) const SCRIPT_LABEL: &str = "o";
+pub(crate) const EXPORT_LABEL: &str = "e";
 pub(crate) const COPY_LABEL: &str = "y";
 pub(crate) const FILTER_LABEL: &str = "/";
 const PAUSE_KEY: char = ascii_key(PAUSE_LABEL);
 const RESUME_KEY: char = ascii_key(RESUME_LABEL);
 const STOP_KEY: char = ascii_key(STOP_LABEL);
 const TRANSCRIPT_KEY: char = ascii_key(TRANSCRIPT_LABEL);
+const SCRIPT_KEY: char = ascii_key(SCRIPT_LABEL);
+const EXPORT_KEY: char = ascii_key(EXPORT_LABEL);
 const COPY_KEY: char = ascii_key(COPY_LABEL);
 const FILTER_KEY: char = ascii_key(FILTER_LABEL);
 const SECTION_GAP: &str = "  ";
@@ -124,7 +131,7 @@ const AGENTS_UNIT: &str = " agents";
 const DONE_UNIT: &str = " done";
 const ADMITTED_UNIT: &str = " admitted";
 const AGENT_SLASH: &str = "/";
-const FOOTER: [(&str, &str, FooterCommand); 8] = [
+const FOOTER: [(&str, &str, FooterCommand); 10] = [
     (
         PAUSE_LABEL,
         "Pause",
@@ -138,6 +145,8 @@ const FOOTER: [(&str, &str, FooterCommand); 8] = [
     (STOP_LABEL, "Stop", FooterCommand::Control(RunControl::Stop)),
     ("Enter", "Open", FooterCommand::Activate),
     (TRANSCRIPT_LABEL, "Transcript", FooterCommand::Transcript),
+    (SCRIPT_LABEL, "Script", FooterCommand::Script),
+    (EXPORT_LABEL, "Export", FooterCommand::Export),
     (COPY_LABEL, "Copy", FooterCommand::Copy),
     (FILTER_LABEL, "Filter", FooterCommand::Filter),
     ("Esc", "Close", FooterCommand::Close),
@@ -203,6 +212,8 @@ enum FooterCommand {
     Control(RunControl),
     Activate,
     Transcript,
+    Script,
+    Export,
     Copy,
     Filter,
     Close,
@@ -326,10 +337,11 @@ pub enum InspectorAction {
     },
     /// A scratch file, to open in the workbench.
     OpenFile(PathBuf),
-    /// The reader expanded a call whose body is not loaded yet.
+    /// A call's body is wanted and not loaded yet, or the whole run's when
+    /// `call_key` is absent.
     LoadCallBody {
         run_id: String,
-        call_key: u64,
+        call_key: Option<u64>,
     },
     Copy {
         text: String,
@@ -380,6 +392,8 @@ pub struct WorkflowInspector {
     /// preview stands in until its body lands, and the map is dropped whole
     /// when the selection moves, because the keys belong to one run.
     bodies: HashMap<u64, BodyState>,
+    /// An export is waiting on the bodies it asked for.
+    exporting: bool,
 }
 
 /// A call body's journey from asked-for to readable.
@@ -421,6 +435,7 @@ impl WorkflowInspector {
             footer_hits: FooterHits::default(),
             live: HashMap::new(),
             bodies: HashMap::new(),
+            exporting: false,
         }
     }
 
@@ -506,9 +521,14 @@ impl WorkflowInspector {
 
     /// Bodies for the run they were asked about. A key that came back with
     /// nothing is remembered as missing, so the row stops asking.
-    pub fn fill_call_bodies(&mut self, run_id: &str, asked: Option<u64>, bodies: Vec<RunCallBody>) {
+    pub fn fill_call_bodies(
+        &mut self,
+        run_id: &str,
+        asked: Option<u64>,
+        bodies: Vec<RunCallBody>,
+    ) -> Option<InspectorAction> {
         if self.selected.as_deref() != Some(run_id) {
-            return;
+            return None;
         }
         if let Some(call_key) = asked
             && !bodies.iter().any(|body| body.call_key == call_key)
@@ -518,6 +538,7 @@ impl WorkflowInspector {
         for body in bodies {
             self.bodies.insert(body.call_key, BodyState::Loaded(body));
         }
+        (asked.is_none() && self.exporting).then(|| self.export_now())
     }
 
     /// The runs of earlier sessions. The run to inspect when nothing of this
@@ -552,7 +573,6 @@ impl WorkflowInspector {
         self.open && self.popup.contains(pos)
     }
 
-    #[cfg(test)]
     pub(crate) fn selected(&self) -> Option<&str> {
         self.selected.as_deref()
     }
@@ -635,6 +655,8 @@ impl WorkflowInspector {
             KeyCode::Char(RESUME_KEY) if plain => return self.control(RunControl::Resume),
             KeyCode::Char(STOP_KEY) if plain => return self.control(RunControl::Stop),
             KeyCode::Char(TRANSCRIPT_KEY) if plain => return self.open_transcript(),
+            KeyCode::Char(SCRIPT_KEY) if plain => return self.open_script(),
+            KeyCode::Char(EXPORT_KEY) if plain => return self.export(),
             KeyCode::Char(COPY_KEY) if plain => return self.copy(),
             _ => {
                 self.scroll.handle_key(key);
@@ -776,6 +798,8 @@ impl WorkflowInspector {
             Some(FooterCommand::Control(control)) => self.control(control),
             Some(FooterCommand::Activate) => self.activate(),
             Some(FooterCommand::Transcript) => self.open_transcript(),
+            Some(FooterCommand::Script) => self.open_script(),
+            Some(FooterCommand::Export) => self.export(),
             Some(FooterCommand::Copy) => self.copy(),
             Some(FooterCommand::Filter) => {
                 self.filter_focused = true;
@@ -916,6 +940,49 @@ impl WorkflowInspector {
         }
     }
 
+    /// The script the run executed. A builtin is compiled in and has no file
+    /// to open, which is a reason rather than a silent refusal.
+    fn open_script(&mut self) -> InspectorAction {
+        match self
+            .selected_run()
+            .and_then(|run| run.source_path.as_deref())
+        {
+            Some(path) => InspectorAction::OpenFile(PathBuf::from(path)),
+            None => InspectorAction::Flash(NO_SCRIPT),
+        }
+    }
+
+    /// The whole run as one markdown artifact. Every call's body is needed,
+    /// so the first press asks for them and the copy follows when they land.
+    fn export(&mut self) -> InspectorAction {
+        let (Some(run_id), Some(detail)) = (self.selected.clone(), self.detail.as_ref()) else {
+            return InspectorAction::Flash(NOTHING_TO_EXPORT);
+        };
+        let loaded = detail
+            .calls
+            .iter()
+            .all(|call| matches!(self.bodies.get(&call.call_key), Some(BodyState::Loaded(_))));
+        if loaded {
+            return self.export_now();
+        }
+        self.exporting = true;
+        InspectorAction::LoadCallBody {
+            run_id,
+            call_key: None,
+        }
+    }
+
+    fn export_now(&mut self) -> InspectorAction {
+        self.exporting = false;
+        let (Some(run), Some(detail)) = (self.selected_run(), self.detail.as_ref()) else {
+            return InspectorAction::Flash(NOTHING_TO_EXPORT);
+        };
+        InspectorAction::Copy {
+            text: self.markdown(run, detail),
+            label: EXPORTED,
+        }
+    }
+
     /// Toggles a call open. Opening one whose body has never been asked for
     /// asks once: the row reads from its preview until the answer lands, and
     /// a second open costs nothing.
@@ -932,7 +999,84 @@ impl WorkflowInspector {
             return InspectorAction::Consumed;
         }
         self.bodies.insert(call_key, BodyState::Requested);
-        InspectorAction::LoadCallBody { run_id, call_key }
+        InspectorAction::LoadCallBody {
+            run_id,
+            call_key: Some(call_key),
+        }
+    }
+
+    /// The run as markdown: the overview, the timeline in order, and every
+    /// call's full prompt and result. The point is an artifact a reader can
+    /// take somewhere else, so nothing here is abbreviated for width.
+    fn markdown(&self, run: &RunSnapshot, detail: &RunDetail) -> String {
+        let now = now_secs();
+        let mut out = format!("# {}\n\n", run.display_name);
+        out.push_str(&format!(
+            "- workflow: {} ({})\n- status: {}\n- elapsed: {}\n- agents: {} of {} admitted\n- tokens: {}\n",
+            run.workflow_name,
+            run.source_kind,
+            run.status,
+            format_elapsed(run.elapsed_secs(now)),
+            run.usage.agents_admitted,
+            run.agent_budget,
+            format_integer(run.usage.tokens_used),
+        ));
+        if let Some(objective) = &run.objective {
+            out.push_str(&format!("- objective: {objective}\n"));
+        }
+        if let Some(error) = &run.error {
+            out.push_str(&format!("- error: {error}\n"));
+        }
+        out.push_str("\n## Timeline\n\n");
+        for row in timeline(run, detail, now) {
+            match row {
+                TimelineRow::Phase {
+                    title,
+                    at,
+                    end,
+                    agents,
+                    failed,
+                } => out.push_str(&format!(
+                    "\n### {title}\n\n- at: {}\n- took: {}\n- agents: {agents} ({failed} failed)\n",
+                    offset_text(at.saturating_sub(run.created_at)),
+                    format_elapsed(end.saturating_sub(at)),
+                )),
+                TimelineRow::Pending { title } => {
+                    out.push_str(&format!("\n### {title} (not reached)\n"));
+                }
+                TimelineRow::Call { at, end, call } => {
+                    let call = &detail.calls[call];
+                    out.push_str(&format!(
+                        "\n#### {} ({} {})\n\n- at: {}\n- took: {}\n- tokens: {}\n",
+                        call_name(call),
+                        call.kind,
+                        call.state,
+                        offset_text(at.saturating_sub(run.created_at)),
+                        format_elapsed(end.saturating_sub(at)),
+                        format_integer(call.tokens_used),
+                    ));
+                    for line in self.body_lines(call) {
+                        out.push_str(
+                            &line
+                                .spans
+                                .iter()
+                                .map(|span| span.content.as_ref())
+                                .collect::<String>(),
+                        );
+                        out.push('\n');
+                    }
+                }
+                TimelineRow::Log { at, message } => out.push_str(&format!(
+                    "- {} {message}\n",
+                    offset_text(at.saturating_sub(run.created_at))
+                )),
+                TimelineRow::Settled { at, status } => out.push_str(&format!(
+                    "\n## {status} at {}\n",
+                    offset_text(at.saturating_sub(run.created_at))
+                )),
+            }
+        }
+        out
     }
 
     /// What an opened call shows: what it was asked, what it answered, and
@@ -1709,6 +1853,8 @@ impl WorkflowInspector {
                 }
                 FooterCommand::Activate => self.section.has_items() && self.item_count() > 0,
                 FooterCommand::Transcript => self.cursor_task_id().is_some(),
+                FooterCommand::Script => run.is_some_and(|run| run.source_path.is_some()),
+                FooterCommand::Export => self.detail.is_some(),
                 FooterCommand::Copy => run.is_some(),
                 FooterCommand::Filter | FooterCommand::Close => true,
             };
@@ -2041,6 +2187,9 @@ mod tests {
     const TOOLS_RUN: u32 = 3;
     const TOOLS_TALLY: &str = "3 tools";
     const ACTIVITY_IS_TALLIED: &str = "a running agent counts the tools it has called";
+    const SCRIPT_PATH: &str = "/project/.caudra/workflows/review.rhai";
+    const EXPORT_ASKS_FIRST: &str = "an export must fetch every body before it copies";
+    const EXPORT_IS_THE_WHOLE_RUN: &str = "an export must carry every call name, prompt and result";
     const TIMELINE_REACHES_THE_TRANSCRIPT: &str =
         "the transcript key must reach an agent from its timeline row";
     const ROSTER_JOINS_THE_JOURNAL: &str =
@@ -2061,6 +2210,7 @@ mod tests {
             display_name: format!("deep-research-{run_id}"),
             workflow_name: "deep-research".into(),
             source_kind: SourceKind::Builtin,
+            source_path: None,
             objective: None,
             status,
             pause_kind: None,
@@ -2268,7 +2418,7 @@ mod tests {
             action,
             InspectorAction::LoadCallBody {
                 run_id: RUN_ID.into(),
-                call_key: 1,
+                call_key: Some(1),
             },
             "{ONE_CLICK_OPENS}"
         );
@@ -2612,6 +2762,61 @@ mod tests {
         );
     }
 
+    #[test_case(Some(SCRIPT_PATH) => InspectorAction::OpenFile(PathBuf::from(SCRIPT_PATH)); "a_script_from_a_file_opens")]
+    #[test_case(None => InspectorAction::Flash(NO_SCRIPT); "a_builtin_says_it_has_no_file")]
+    fn the_script_key_opens_what_the_run_executed(path: Option<&str>) -> InspectorAction {
+        let mut settled = run(RUN_ID, RunStatus::Completed, Vec::new());
+        settled.source_path = path.map(str::to_owned);
+        let mut inspector = open_with(vec![settled]);
+
+        inspector.handle_key(key_event(KeyCode::Char(SCRIPT_KEY)))
+    }
+
+    #[test]
+    fn exporting_asks_for_every_body_then_copies_the_run() {
+        let mut inspector = open_with(vec![run(RUN_ID, RunStatus::Completed, Vec::new())]);
+        inspector.fill_detail(detail(run(RUN_ID, RunStatus::Completed, Vec::new())));
+
+        let asked = inspector.handle_key(key_event(KeyCode::Char(EXPORT_KEY)));
+        let copied = inspector.fill_call_bodies(RUN_ID, None, vec![body(1)]);
+
+        assert_eq!(
+            asked,
+            InspectorAction::LoadCallBody {
+                run_id: RUN_ID.into(),
+                call_key: None,
+            },
+            "{EXPORT_ASKS_FIRST}"
+        );
+        match copied {
+            Some(InspectorAction::Copy { text, label }) => {
+                assert_eq!(label, EXPORTED);
+                assert!(
+                    text.contains(CALL_LABEL),
+                    "{EXPORT_IS_THE_WHOLE_RUN}: {text}"
+                );
+                assert!(
+                    text.contains(FULL_PROMPT),
+                    "{EXPORT_IS_THE_WHOLE_RUN}: {text}"
+                );
+                assert!(
+                    text.contains(FULL_RESULT),
+                    "{EXPORT_IS_THE_WHOLE_RUN}: {text}"
+                );
+            }
+            other => panic!("{EXPORT_IS_THE_WHOLE_RUN}: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_run_with_no_journal_has_nothing_to_export() {
+        let mut inspector = open_with(vec![run(RUN_ID, RunStatus::Completed, Vec::new())]);
+
+        let action = inspector.handle_key(key_event(KeyCode::Char(EXPORT_KEY)));
+
+        assert_eq!(action, InspectorAction::Flash(NOTHING_TO_EXPORT));
+    }
+
     #[test]
     fn the_transcript_key_reaches_an_agent_from_the_timeline_too() {
         let mut walking = run(RUN_ID, RunStatus::Active, vec![agent(Some(TASK_ID))]);
@@ -2644,7 +2849,7 @@ mod tests {
             asked,
             InspectorAction::LoadCallBody {
                 run_id: RUN_ID.into(),
-                call_key: 1,
+                call_key: Some(1),
             },
             "{ROSTER_JOINS_THE_JOURNAL}"
         );
@@ -2817,7 +3022,7 @@ mod tests {
             asked,
             InspectorAction::LoadCallBody {
                 run_id: RUN_ID.into(),
-                call_key: 1,
+                call_key: Some(1),
             },
             "{ASKS_ONCE}"
         );

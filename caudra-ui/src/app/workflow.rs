@@ -36,6 +36,7 @@ pub(crate) const DEEP_RESEARCH_USAGE: &str = "Usage: /deep-research <query>";
 pub(crate) const TRUST_HINT: &str = "run /workflows to review and trust it";
 pub(crate) const DEEP_RESEARCH_WORKFLOW: &str = "deep-research";
 const RUNS_SUBCOMMAND: &str = "runs";
+const RETURN_HINT: &str = "/workflow returns to this run";
 const HISTORY_LIMIT: Option<usize> = None;
 const BUDGET_FLAG: &str = "--agent-budget";
 const QUERY_ARG: &str = "query";
@@ -367,6 +368,8 @@ impl App {
             self.flash(UNAVAILABLE_MSG.into());
             return;
         }
+        let returning = self.workflow_return.take();
+        let preferred = preferred.or(returning.as_deref());
         let first = self
             .workflow_inspector
             .open(self.workflow.runs().to_vec(), preferred);
@@ -398,8 +401,13 @@ impl App {
                 self.control_workflow(control, run_id, None);
             }
             InspectorAction::OpenTranscript(task_id) => {
+                // A transcript is a chat, not an overlay, so the inspector has
+                // to give up the screen. Remembering the run makes the trip a
+                // round one: reopening lands back where the reader left.
+                self.workflow_return = self.workflow_inspector.selected().map(str::to_owned);
                 self.workflow_inspector.close();
                 self.preview_task(&task_id);
+                self.flash(RETURN_HINT.into());
             }
             InspectorAction::ResumeWithBudget {
                 run_id,
@@ -421,12 +429,9 @@ impl App {
                 self.workflow.dispatch(
                     Intent::CallBodies {
                         run_id: run_id.clone(),
-                        call_key: Some(call_key),
+                        call_key,
                     },
-                    WorkflowRequest::CallBodies {
-                        run_id,
-                        call_key: Some(call_key),
-                    },
+                    WorkflowRequest::CallBodies { run_id, call_key },
                 );
             }
             InspectorAction::Copy { text, label } => {
@@ -531,8 +536,12 @@ impl App {
                 self.workflow_inspector.fill_detail(*detail);
             }
             (Intent::CallBodies { run_id, call_key }, Ok(WorkflowResponse::CallBodies(bodies))) => {
-                self.workflow_inspector
-                    .fill_call_bodies(&run_id, call_key, bodies);
+                if let Some(action) = self
+                    .workflow_inspector
+                    .fill_call_bodies(&run_id, call_key, bodies)
+                {
+                    let _ = self.handle_workflow_inspector_action(action);
+                }
             }
             (Intent::History, Ok(WorkflowResponse::History(history))) => {
                 if let Some(run_id) = self.workflow_inspector.fill_history(history) {
@@ -732,6 +741,11 @@ mod tests {
     const NO_CARD_CHURN: &str = "an agent's activity must not touch the transcript";
     const CARD_SURVIVES: &str = "a run that is still going keeps its card";
     const OTHER_RUN_ID: &str = "run-2";
+    const TASK_ID: &str = "run-2:1";
+    const TRANSCRIPT_TAKES_OVER: &str =
+        "a transcript is a chat, so the inspector must give up the screen";
+    const RETURNS_WHERE_IT_LEFT: &str =
+        "reopening must land on the run the transcript was opened from";
     const OTHER_DISPLAY_NAME: &str = "deep-research-2";
     const NAME_PREFIX: &str = "deep-research-";
     const RAISED_BUDGET: u32 = 24;
@@ -744,6 +758,7 @@ mod tests {
             display_name: DISPLAY_NAME.into(),
             workflow_name: DEEP_RESEARCH_WORKFLOW.into(),
             source_kind: SourceKind::Builtin,
+            source_path: None,
             objective: None,
             status,
             pause_kind: None,
@@ -1076,6 +1091,29 @@ mod tests {
         assert!(app.workflow_inspector.is_open());
         assert_eq!(app.status_hover, None);
         assert_eq!(app.workflow.sent, inspector_requests());
+    }
+
+    /// A transcript is a chat, so the inspector has to close. Reopening must
+    /// land back on the run the reader left, not on whichever is newest.
+    #[test]
+    fn reopening_returns_to_the_run_a_transcript_was_opened_from() {
+        let mut app = scripted_app();
+        app.workflow.apply(run(RunStatus::Active));
+        let mut older = run(RunStatus::Completed);
+        older.run_id = OTHER_RUN_ID.into();
+        app.workflow.apply(older);
+        app.open_workflow_inspector(Some(OTHER_RUN_ID));
+
+        let _ = app
+            .handle_workflow_inspector_action(InspectorAction::OpenTranscript(TASK_ID.to_owned()));
+        assert!(!app.workflow_inspector.is_open(), "{TRANSCRIPT_TAKES_OVER}");
+        app.open_workflow_inspector(None);
+
+        assert_eq!(
+            app.workflow_inspector.selected(),
+            Some(OTHER_RUN_ID),
+            "{RETURNS_WHERE_IT_LEFT}"
+        );
     }
 
     #[test]

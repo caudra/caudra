@@ -321,6 +321,9 @@ pub struct App {
     pub(super) memory_picker: MemoryPicker,
     pub(super) task_picker: TaskPicker,
     pub(super) workflow_inspector: WorkflowInspector,
+    /// The run a transcript was opened from, so reopening the inspector
+    /// returns to it rather than to whichever run is newest.
+    pub(super) workflow_return: Option<String>,
     pub(super) workflow_catalog_picker: WorkflowCatalogPicker,
     pub(crate) workflow: workflow::WorkflowUi,
     pub(super) question_form: QuestionForm,
@@ -536,6 +539,7 @@ impl App {
             memory_picker: MemoryPicker::new(),
             task_picker: TaskPicker::new(),
             workflow_inspector: WorkflowInspector::new(),
+            workflow_return: None,
             workflow_catalog_picker: WorkflowCatalogPicker::new(),
             workflow: workflow::WorkflowUi::new(),
             question_form: QuestionForm::new(),

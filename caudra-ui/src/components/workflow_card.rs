@@ -220,6 +220,7 @@ mod tests {
             display_name: "deep-research".into(),
             workflow_name: "deep-research".into(),
             source_kind: SourceKind::Builtin,
+            source_path: None,
             objective: None,
             status,
             pause_kind: None,

@@ -3378,6 +3378,7 @@ mod tests {
             display_name: WORKFLOW_NAME.into(),
             workflow_name: WORKFLOW_NAME.into(),
             source_kind: SourceKind::Project,
+            source_path: None,
             objective: None,
             status: RunStatus::Completed,
             pause_kind: None,

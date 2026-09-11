@@ -164,6 +164,8 @@ Some pickers add extra bindings on top of the defaults:
 | Workflow Inspector | `Left` / `Right` | Focus the run list or the section |
 | Workflow Inspector | `Enter` | Open the row under the cursor: a phase's agents, a scratch file, or a call's prompt and result |
 | Workflow Inspector | `t` | Open the transcript of the agent under the cursor |
+| Workflow Inspector | `o` | Open the script the selected run executed |
+| Workflow Inspector | `e` | Copy the whole run as markdown, every prompt and result included |
 | Workflow Inspector | `y` | Copy the visible section |
 | Workflow Inspector | `/` | Filter the run list |
 | Workflow Catalog | `Enter` | Launch a trusted workflow, or trust an untrusted one |
