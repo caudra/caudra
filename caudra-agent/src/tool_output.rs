@@ -1,4 +1,5 @@
 use std::sync::{Arc, LazyLock};
+use std::thread;
 
 use caudra_storage::StateDir;
 use caudra_storage::sessions::persisted_session_ids;
@@ -12,24 +13,41 @@ use crate::{IndexOutput, TextOutput, ToolDoneEvent, ToolOutput, ToolOutputLimits
 
 const PERSIST_THRESHOLD_BYTES: usize = 8 * 1024;
 const READ_LIMIT: usize = 200;
+const CLEANUP_THREAD_NAME: &str = "tool-output-reclaim";
 
 static DEFAULT_STORE: LazyLock<Option<Arc<ToolOutputStore>>> = LazyLock::new(|| {
     StateDir::resolve()
         .map(|state_dir| {
-            let store = ToolOutputStore::new(state_dir.clone());
-            match persisted_session_ids(&state_dir) {
-                Ok(session_ids) => {
-                    if let Err(error) = store.cleanup_orphans(&session_ids) {
-                        warn!(%error, "failed to clean up orphaned tool outputs");
-                    }
-                }
-                Err(error) => warn!(%error, "failed to enumerate sessions for tool output cleanup"),
+            let store = Arc::new(ToolOutputStore::new(state_dir.clone()));
+            // Reclaiming orphans enumerates every persisted session and walks
+            // the whole tool-output tree. Nothing the store serves depends on
+            // it, but running it here spent that on whichever thread first
+            // touched the store -- at startup, the one that has not drawn a
+            // frame yet. Detached, so a slow filesystem delays only the
+            // reclaim.
+            let sweeper = Arc::clone(&store);
+            if let Err(error) = thread::Builder::new()
+                .name(CLEANUP_THREAD_NAME.to_owned())
+                .spawn(move || reclaim_orphans(&sweeper, &state_dir))
+            {
+                warn!(%error, "tool output cleanup not started");
             }
-            Arc::new(store)
+            store
         })
         .map_err(|error| warn!(%error, "tool output store unavailable"))
         .ok()
 });
+
+fn reclaim_orphans(store: &ToolOutputStore, state_dir: &StateDir) {
+    match persisted_session_ids(state_dir) {
+        Ok(session_ids) => {
+            if let Err(error) = store.cleanup_orphans(&session_ids) {
+                warn!(%error, "failed to clean up orphaned tool outputs");
+            }
+        }
+        Err(error) => warn!(%error, "failed to enumerate sessions for tool output cleanup"),
+    }
+}
 
 pub(crate) fn default_store() -> Option<Arc<ToolOutputStore>> {
     DEFAULT_STORE.clone()

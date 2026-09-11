@@ -506,31 +506,47 @@ fn recover_stored_sessions_in_cwd(
     active: &std::collections::HashSet<CaudraId>,
 ) -> Result<(), String> {
     let cwd_text = cwd.to_string_lossy();
-    let sessions = AppSession::list(&cwd_text, storage)
+    let facts = SessionDatabase::open_state(storage)
+        .and_then(|database| database.session_facts(Some(&cwd_text)))
         .map_err(|error| format!("Failed to scan sessions for workspace recovery: {error}"))?;
-    for summary in sessions {
-        if active.contains(&summary.id) {
+    for facts in facts {
+        if active.contains(&facts.id) {
             continue;
         }
-        let _lease = match SessionLease::acquire(storage, summary.id) {
+        let snapshot_store = App::snapshot_store_for(storage, facts.id, cwd)
+            .map_err(|error| format!("Failed to initialize workspace snapshots: {error}"))?;
+        // Loading a session is proportional to its whole transcript, and a
+        // workspace accumulates hundreds. `recover_pending_workspace_restore`
+        // reads the history only once one of these two says there is something
+        // to recover: `pending_revert` comes out of the facts query, and a
+        // journal without it is the crash between writing one and saving the
+        // other. Both are cheap, and on a healthy workspace both are false for
+        // every session, so nothing is deserialized at all.
+        if !facts.pending_revert
+            && snapshot_store
+                .journal_state()
+                .map_err(|error| format!("Failed to inspect workspace restore journal: {error}"))?
+                .is_none()
+        {
+            continue;
+        }
+        let _lease = match SessionLease::acquire(storage, facts.id) {
             Ok(lease) => lease,
             Err(SessionError::SessionInUse { .. }) => continue,
             Err(error) => {
                 return Err(format!(
                     "Failed to reserve session {} for workspace recovery: {error}",
-                    summary.id
+                    facts.id
                 ));
             }
         };
-        let mut session = load_app_session(summary.id, storage).map_err(|error| {
+        let mut session = load_app_session(facts.id, storage).map_err(|error| {
             format!(
                 "Failed to load session {} for workspace recovery: {error}",
-                summary.id
+                facts.id
             )
         })?;
         validate_session_cwd(&session, cwd)?;
-        let snapshot_store = App::snapshot_store_for(storage, session.id, cwd)
-            .map_err(|error| format!("Failed to initialize workspace snapshots: {error}"))?;
         crate::app::recover_pending_workspace_restore(
             &mut session,
             &snapshot_store,

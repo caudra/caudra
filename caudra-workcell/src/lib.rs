@@ -165,7 +165,7 @@ impl HostInner {
             .await
             .map_err(|error| error.to_string())?;
         let code_graph = code_graph_group(&cwd).await?;
-        let environment = Arc::new(ExecutionEnvironment::collect(Some(&cwd)).await);
+        let environment = Arc::new(ExecutionEnvironment::new(Some(&cwd)).await);
         let groups = ProjectGroups {
             files,
             shell,
@@ -258,7 +258,7 @@ impl WorkcellHost {
             let files = FileToolGroup::new_unconfined(&project_cwd, ALLOW_WRITE, None).await;
             let shell = ShellToolGroup::new_unconfined(&project_cwd).await;
             let code_graph = code_graph_group(&project_cwd).await;
-            let environment = ExecutionEnvironment::collect(Some(&project_cwd)).await;
+            let environment = ExecutionEnvironment::new(Some(&project_cwd)).await;
             let code = if let Some(worker) = worker_source {
                 Some(
                     CodeToolGroup::new(CodeConfiguration {
