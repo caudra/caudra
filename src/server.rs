@@ -438,15 +438,16 @@ impl ServerHandler for WorkcellServer {
         request.capabilities = context.client_capabilities().unwrap_or_default();
         let mut info = self.get_info();
         info.protocol_version = ProtocolVersion::V_2026_07_28;
-        if let Some(execution_environment) = self
+        if let Some(descriptor) = self
             .execution_environment
             .as_ref()
             .filter(|_| requests_execution_environment(&request, &context.meta))
+            .and_then(|environment| environment.discovery_descriptor(self.tool_group_disclosure()))
         {
             let mut extensions = ExtensionCapabilities::new();
             extensions.insert(
                 crate::execution_environment::EXTENSION_ID.into(),
-                execution_environment.discovery_descriptor(self.tool_group_disclosure()),
+                descriptor,
             );
             info.capabilities.extensions = Some(extensions);
         }

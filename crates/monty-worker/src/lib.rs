@@ -81,11 +81,16 @@ fn bundled() -> Result<WorkerArtifact<'static>, WorkerError> {
     Err(WorkerError::BundleUnavailable)
 }
 
+/// Never hashes `artifact.bytes` up front. The declared digest is what names the
+/// cache directory and what every cached file is checked against, so a bundle
+/// whose bytes and digest disagree still fails: the cached path either already
+/// holds bytes matching the digest, or gets written and re-read here and comes
+/// back `Corrupt`. Hashing the bundle on the hot path bought no guarantee the
+/// write-then-verify below does not already give, and cost a full pass over the
+/// embedded worker on every startup, including the common path where those bytes
+/// are never used. The build-time invariant is a test
+/// (`bundled_worker_matches_its_declared_digest`), not a per-launch cost.
 fn extract_at(cache_root: &Path, artifact: WorkerArtifact<'_>) -> Result<WorkerLease, WorkerError> {
-    if sha256_bytes(artifact.bytes) != artifact.digest {
-        return Err(WorkerError::BundledDigest);
-    }
-
     let worker_root = private_subdir(cache_root, "workers")?;
     let monty_root = private_subdir(&worker_root, "monty")?;
     let version_root = private_subdir(&monty_root, artifact.version)?;
@@ -265,10 +270,6 @@ fn retry_rename(source: &Path, destination: &Path) -> Result<(), io::Error> {
     fs::rename(source, destination)
 }
 
-fn sha256_bytes(bytes: &[u8]) -> String {
-    encode_digest(Sha256::digest(bytes).as_slice())
-}
-
 fn sha256_file(path: &Path) -> Result<String, io::Error> {
     let mut file = File::open(path)?;
     let mut digest = Sha256::new();
@@ -368,6 +369,26 @@ mod tests {
             version: "test-version",
             file_name: "monty",
         }
+    }
+
+    /// The build-time invariant `extract_at` no longer pays for at runtime.
+    #[cfg(workcell_bundled_monty_worker)]
+    #[test]
+    fn bundled_worker_matches_its_declared_digest() {
+        let artifact = bundled().expect("bundled artifact");
+        let digest = encode_digest(Sha256::digest(artifact.bytes).as_slice());
+        assert_eq!(digest, artifact.digest);
+    }
+
+    /// Removing the up-front bundle hash must not let bytes that disagree with
+    /// their declared digest reach a lease.
+    #[test]
+    fn a_bundle_disagreeing_with_its_digest_is_refused() {
+        let cache = tempfile::tempdir().expect("tempdir");
+
+        let result = extract_at(cache.path(), artifact(SECOND_WORKER, FIRST_WORKER_DIGEST));
+
+        assert!(matches!(result, Err(WorkerError::BundledDigest)));
     }
 
     #[test]

@@ -63,10 +63,14 @@ pub(crate) struct ExecutionEnvironmentSnapshot {
     proxied: bool,
 }
 
+/// The startup snapshot exists only to answer a discovery handshake. It costs a
+/// full probe sweep to build, so an embedder that never serves discovery
+/// constructs with [`ExecutionEnvironmentDisclosure::new`] and leaves it absent;
+/// `inspect` collects fresh either way.
 #[derive(Clone, Debug)]
 pub struct ExecutionEnvironmentDisclosure {
     root: Option<PathBuf>,
-    startup: ExecutionEnvironmentSnapshot,
+    startup: Option<ExecutionEnvironmentSnapshot>,
     refresh_gate: Arc<Semaphore>,
 }
 
@@ -354,25 +358,39 @@ const fn system_package_manager(
 }
 
 impl ExecutionEnvironmentDisclosure {
+    /// Takes the startup snapshot up front, which a discovery handshake needs
+    /// before any tool call can supply one.
     pub async fn collect(root: Option<&Path>) -> Self {
         let root = canonical_root(root).await;
         Self {
-            startup: ExecutionEnvironmentSnapshot::collect(root.as_deref()).await,
+            startup: Some(ExecutionEnvironmentSnapshot::collect(root.as_deref()).await),
             root,
             refresh_gate: Arc::new(Semaphore::new(1)),
         }
     }
 
+    /// Skips the startup snapshot, and with it a sweep of every command probe.
+    /// For embedders that reach the environment only through [`Self::inspect`].
+    pub async fn new(root: Option<&Path>) -> Self {
+        Self {
+            root: canonical_root(root).await,
+            startup: None,
+            refresh_gate: Arc::new(Semaphore::new(1)),
+        }
+    }
+
+    /// `None` when this disclosure was built without a startup snapshot, which
+    /// is not the same as a snapshot that found nothing.
     pub fn discovery_descriptor(
         &self,
         groups: ToolGroupDisclosure,
-    ) -> serde_json::Map<String, Value> {
-        self.startup.descriptor(groups)
+    ) -> Option<serde_json::Map<String, Value>> {
+        Some(self.startup.as_ref()?.descriptor(groups))
     }
 
     #[must_use]
-    pub fn startup(&self, groups: ToolGroupDisclosure) -> ExecutionEnvironmentOutput {
-        self.startup.output(groups)
+    pub fn startup(&self, groups: ToolGroupDisclosure) -> Option<ExecutionEnvironmentOutput> {
+        Some(self.startup.as_ref()?.output(groups))
     }
 
     pub async fn inspect(
