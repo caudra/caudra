@@ -68,7 +68,11 @@ const INCREMENTAL_AUTO_VACUUM: i64 = 2;
 const PAGE_SIZE: i64 = 4096;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const WAL_AUTO_CHECKPOINT_PAGES: i64 = 1000;
-const JOURNAL_SIZE_LIMIT_BYTES: i64 = 64 * 1024 * 1024;
+/// What `journal_size_limit` keeps. The WAL is a ring buffer that a checkpoint
+/// resets rather than shrinks, and this limit only truncates it back down to
+/// itself, so this is a floor for the observed `-wal` size after any burst, not
+/// a cap on an active WAL. A size alarm therefore has to sit above it.
+pub const WAL_RETENTION_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_PAYLOAD_BYTES: usize = 32 * 1024 * 1024;
 const MAX_METADATA_BYTES: usize = 8 * 1024 * 1024;
 const MAX_IDENTIFIER_BYTES: usize = 256;
@@ -2610,13 +2614,13 @@ fn remove_state_directory(
 
 fn configure(connection: &Connection) -> Result<(), SessionError> {
     // FULL preserves the prior sync-before-ack durability intent. The journal
-    // size limit trims WAL retention after checkpoints; it is not an active-WAL
-    // cap and must never justify deleting live sidecars.
+    // size limit trims WAL retention after checkpoints and must never justify
+    // deleting live sidecars.
     connection.execute_batch(&format!(
         "PRAGMA foreign_keys = ON;\
          PRAGMA synchronous = FULL;\
          PRAGMA wal_autocheckpoint = {WAL_AUTO_CHECKPOINT_PAGES};\
-         PRAGMA journal_size_limit = {JOURNAL_SIZE_LIMIT_BYTES};\
+         PRAGMA journal_size_limit = {WAL_RETENTION_LIMIT_BYTES};\
          PRAGMA trusted_schema = OFF;"
     ))?;
     Ok(())

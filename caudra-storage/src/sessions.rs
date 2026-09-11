@@ -33,6 +33,7 @@ pub mod sweep;
 pub use database::{
     CheckpointResult, LedgerEntry, SESSIONS_DB_FILE, SESSIONS_DB_LOCK_FILE, SessionCursor,
     SessionDatabase, SessionRecreation, SessionStorageStats, TrimReport, UsageBucket,
+    WAL_RETENTION_LIMIT_BYTES,
 };
 pub use lease::SessionLease;
 

@@ -1152,7 +1152,13 @@ impl<'t> EventLoop<'t> {
                     .on_workspace_snapshot(done.run_id, done.result);
                 self.dispatch(i, actions);
             }
-            Wake::Warn(warning) => self.focused_app().flash(warning),
+            Wake::Warn(warning) => {
+                // The one place every background warning passes through. A
+                // flash fades and the user may not be looking, so the log is
+                // what a bug report can still be read out of.
+                warn!(%warning, "background warning shown to the user");
+                self.focused_app().flash(warning);
+            }
             Wake::Title(GeneratedTitle { id, result }) => self.apply_generated_title(id, result),
         }
         Ok(())

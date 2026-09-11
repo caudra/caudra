@@ -19,7 +19,9 @@ use std::time::Duration;
 use caudra_storage::id::CaudraId;
 #[cfg(test)]
 use caudra_storage::sessions::SESSIONS_DB_FILE;
-use caudra_storage::sessions::{SessionCursor, SessionDatabase, SessionError, SessionRecreation};
+use caudra_storage::sessions::{
+    SessionCursor, SessionDatabase, SessionError, SessionRecreation, WAL_RETENTION_LIMIT_BYTES,
+};
 use caudra_storage::state::{WorkspaceTabs, write_workspace_tabs};
 use caudra_storage::usage_ledger::{TurnUsage, UsageLedger};
 use caudra_storage::{StateDir, StorageError};
@@ -31,7 +33,10 @@ const SAVE_FAILED_PREFIX: &str = "Session save failed";
 const SAVE_RECOVERED: &str = "Session save recovered";
 const WORKSPACE_TABS_SAVE_FAILED_PREFIX: &str = "Workspace tabs save failed";
 const STORAGE_WARNING_BYTES: u64 = 1024 * 1024 * 1024;
-const WAL_WARNING_BYTES: u64 = 64 * 1024 * 1024;
+/// A `-wal` sitting at the retention limit is the designed steady state, so an
+/// alarm set there would fire on every burst. Only a WAL that has outgrown what
+/// a reset is allowed to keep says checkpoints are not getting through.
+const WAL_WARNING_BYTES: u64 = 2 * WAL_RETENTION_LIMIT_BYTES;
 const CHECKPOINT_COMMIT_INTERVAL: u32 = 128;
 const CHECKPOINT_STALL_WARNING_COUNT: u32 = 2;
 
@@ -516,20 +521,38 @@ impl Writer {
         if total >= threshold {
             let _ = self.warn_tx.send(format!(
                 "Session storage is {} MiB (database plus WAL)",
-                total / (1024 * 1024)
+                mib(total)
             ));
             self.size_warning_level = self.size_warning_level.saturating_add(1);
         }
-        if stats.wal_bytes >= WAL_WARNING_BYTES && !self.wal_warning_active {
+        if self.wal_outgrew_its_limit(stats.wal_bytes) {
             let _ = self.warn_tx.send(format!(
-                "Session WAL is {} MiB; a reader may be blocking checkpoints",
-                stats.wal_bytes / (1024 * 1024)
+                "Session WAL is {} MiB, past the {} MiB a checkpoint trims to; a reader may be blocking them",
+                mib(stats.wal_bytes),
+                mib(WAL_RETENTION_LIMIT_BYTES)
             ));
-            self.wal_warning_active = true;
-        } else if stats.wal_bytes < WAL_WARNING_BYTES / 2 {
-            self.wal_warning_active = false;
         }
     }
+
+    /// Latches, so one burst warns once. It clears at the retention limit
+    /// rather than at half the alarm: `journal_size_limit` holds the file
+    /// there, so a lower clearing point is never reached and the warning could
+    /// never fire a second time.
+    fn wal_outgrew_its_limit(&mut self, wal_bytes: u64) -> bool {
+        if wal_bytes <= WAL_RETENTION_LIMIT_BYTES {
+            self.wal_warning_active = false;
+            return false;
+        }
+        if wal_bytes < WAL_WARNING_BYTES || self.wal_warning_active {
+            return false;
+        }
+        self.wal_warning_active = true;
+        true
+    }
+}
+
+fn mib(bytes: u64) -> u64 {
+    bytes / (1024 * 1024)
 }
 
 fn retryable(error: &SessionError) -> bool {
@@ -569,6 +592,11 @@ mod tests {
         "a change that has already reported back must be visible in the generation that follows it";
     const GENERATION_RAN_AHEAD: &str =
         "nothing reached disk, so nothing should ask a reader to look again";
+    const WAL_AT_LIMIT_WARNED: &str =
+        "a WAL at the size the retention limit keeps is the steady state, not an alarm";
+    const WAL_GROWTH_SILENT: &str = "a WAL past the alarm must be announced";
+    const WAL_WARNED_TWICE: &str = "one burst must warn once, not once per commit";
+    const WAL_LATCH_STUCK: &str = "falling back to the retention limit must re-arm the warning";
 
     fn state_dir() -> (TempDir, StateDir) {
         let tmp = TempDir::new().unwrap();
@@ -1077,6 +1105,36 @@ mod tests {
         assert_ne!(
             AppSession::load(stored.id, &dir).unwrap().title,
             unrelated.title
+        );
+    }
+
+    /// `journal_size_limit` leaves the file at the retention limit, so a latch
+    /// that cleared below it would arm once and never again.
+    #[test]
+    fn the_wal_warning_clears_where_the_retention_limit_leaves_the_file() {
+        let (_tmp, dir) = state_dir();
+        let (warn_tx, _warn_rx) = flume::unbounded();
+        let mut writer = bare_writer(&dir, warn_tx);
+
+        assert!(
+            !writer.wal_outgrew_its_limit(WAL_RETENTION_LIMIT_BYTES),
+            "{WAL_AT_LIMIT_WARNED}"
+        );
+        assert!(
+            writer.wal_outgrew_its_limit(WAL_WARNING_BYTES),
+            "{WAL_GROWTH_SILENT}"
+        );
+        assert!(
+            !writer.wal_outgrew_its_limit(WAL_WARNING_BYTES),
+            "{WAL_WARNED_TWICE}"
+        );
+        assert!(
+            !writer.wal_outgrew_its_limit(WAL_RETENTION_LIMIT_BYTES),
+            "{WAL_AT_LIMIT_WARNED}"
+        );
+        assert!(
+            writer.wal_outgrew_its_limit(WAL_WARNING_BYTES),
+            "{WAL_LATCH_STUCK}"
         );
     }
 
