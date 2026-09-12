@@ -1435,7 +1435,7 @@ pub struct UiConfig {
 
     #[config(
         default = DEFAULT_SCROLL_CARD_LINES,
-        desc = "Rows of body a shell, write, python_execution or task card draws. The window follows new output while it sits at the bottom and pauses when scrolled up. Click inside a window to give it the wheel, which passes back to the transcript at either edge, and drag the bar in its last column to move it directly. `0` turns scrolling off, restoring the `ui.tool_output_lines` budget for those tools and an unabridged body for a write"
+        desc = "Rows of body a shell, python_execution or task card draws. The window follows new output while it sits at the bottom and pauses when scrolled up. Click inside a window to give it the wheel, which passes back to the transcript at either edge, and drag the bar in its last column to move it directly. `0` turns scrolling off, restoring the `ui.tool_output_lines` budget for those tools. A write is never windowed: its body is the file it wrote, so it is drawn whole at any setting"
     )]
     pub scroll_card_lines: u32,
 

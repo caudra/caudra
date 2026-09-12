@@ -52,7 +52,7 @@ use crossterm::event::MouseEvent;
 use super::scrollbar::{ScrollHint, Scrollbar, ScrollbarMouse};
 use super::streaming_content::StreamingContent;
 use caudra_agent::mentions::{self, Mention};
-use caudra_agent::tools::ToolEffect;
+use caudra_agent::tools::{BATCH_TOOL_NAME, ToolEffect};
 use caudra_agent::{
     BatchToolEntry, BufferSnapshot, EventSender, InstructionBlock, NO_FILES_FOUND,
     ReasoningSummary, SharedBuf, SubagentProgress, ToolDoneEvent, ToolOutput, ToolStartEvent,
@@ -1011,6 +1011,7 @@ impl MessagesPanel {
             policy: CardPolicy {
                 always_collapsed: ui_config.always_collapsed.into(),
                 scroll_card_lines: ui_config.scroll_card_lines,
+                compact: ViewMode::default() == ViewMode::Compact,
             },
             card_scroll: HashMap::new(),
             lua_event_handle,
@@ -1043,6 +1044,7 @@ impl MessagesPanel {
             return;
         }
         self.view = view;
+        self.policy.compact = view == ViewMode::Compact;
         self.clear_hover();
         self.disclosure.clear();
         self.streaming_reasoning_open = None;
@@ -1094,22 +1096,32 @@ impl MessagesPanel {
             && msg_index + 1 == self.messages.len()
     }
 
-    /// Whether the mode alone draws this call's body. A call whose body is
-    /// the only record of what it did stays open in every mode: closing it
-    /// would hide the change. An always-collapsed tool is the other extreme,
-    /// and no mode opens it.
+    /// Whether the mode alone draws this call's body.
+    ///
+    /// Compact answers for every tool and is asked first. The reader asked for
+    /// a list of what ran, and a mode that kept drawing the bodies of writes,
+    /// isolated calls, orchestrators and every unclassified MCP tool was a
+    /// list in name only. A body that is the only record of a change is a
+    /// click away rather than hidden, and it opens whole.
+    ///
+    /// A batch is the one exception, because its body *is* the list of the
+    /// calls it made. Folded it says nothing at all, so the mode would be
+    /// hiding the very thing it is for. Its children fold instead.
+    ///
+    /// Elsewhere the older rule holds: a call whose body is the only record of
+    /// what it did stays open, and an always-collapsed tool is the other
+    /// extreme that no mode opens.
     fn opens_by_default(&self, role: &ToolRole, msg_index: usize) -> bool {
+        if self.view == ViewMode::Compact {
+            return &*role.name == BATCH_TOOL_NAME;
+        }
         if !role.is_collapsible() {
             return true;
         }
         if self.stays_collapsed(&role.name) {
             return false;
         }
-        match self.view {
-            ViewMode::Expanded => true,
-            ViewMode::Compact => false,
-            ViewMode::Auto => self.is_latest(msg_index),
-        }
+        self.view == ViewMode::Expanded || self.is_latest(msg_index)
     }
 
     /// Resolved from the message rather than tracked alongside it, so a

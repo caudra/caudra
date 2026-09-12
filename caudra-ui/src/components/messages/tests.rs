@@ -4898,7 +4898,7 @@ const COMPACT_CLICK_MSG: &str = "a compact row must open on click";
 const COMPACT_RESET_MSG: &str = "flipping density must drop every per-item override";
 const COMPACT_REHIDE_MSG: &str = "clicking through a compact row must end back at its header";
 const COMPACT_HOVER_MSG: &str = "a compact row must highlight exactly when a click would act";
-const CONTAINER_BODY_MSG: &str = "a container must keep its child rows in compact view";
+const CONTAINER_BODY_MSG: &str = "only a batch keeps its child rows in compact view";
 const SHELL_VIEW_STICKY_MSG: &str =
     "re-opening a shell card must restore the last raw/filtered view";
 const SHELL_HOVER_MSG: &str = "the raw/filtered switch must highlight itself, not the card header";
@@ -5226,9 +5226,13 @@ fn an_expanded_card_header_is_inflected_like_its_row(outcome: Option<bool>, expe
     );
 }
 
+/// A tool no registry classified, which is every call arriving through an MCP
+/// server the effect table has never seen.
+const UNCLASSIFIED_TOOL: &str = "mystery_tool";
+
 #[test]
 fn an_unknown_tool_falls_back_to_its_registered_name() {
-    let mut panel = compact_panel(&[("t1", "mystery_tool")]);
+    let mut panel = compact_panel(&[("t1", UNCLASSIFIED_TOOL)]);
     finished(&mut panel, &["t1"]);
     rebuild(&mut panel);
 
@@ -5333,12 +5337,13 @@ fn compact_hover_tracks_clickability_through_the_whole_cycle(tool: &'static str)
     }
 }
 
-/// A container's body is its list of child rows, and those already collapse
-/// to their own headers. Hiding it behind one more click would bury the
-/// structure the row exists to show.
-#[test_case(TASK_TOOL_NAME; "task")]
-#[test_case(BATCH_TOOL_NAME; "batch")]
-fn a_container_row_keeps_its_body_in_compact_view(tool: &'static str) {
+/// A batch's body is the list of the calls it made, so folded it says nothing
+/// at all and compact keeps it. Every other container answers for itself like
+/// any other call: a task carries a subagent's whole result, which is the bulk
+/// the mode was chosen to put away.
+#[test_case(BATCH_TOOL_NAME, true; "a batch keeps its list")]
+#[test_case(TASK_TOOL_NAME, false; "a task folds like any other call")]
+fn compact_keeps_only_a_batchs_child_rows(tool: &'static str, keeps_body: bool) {
     let mut panel = compact_panel(&[("t1", tool)]);
     finished(&mut panel, &["t1"]);
     rebuild(&mut panel);
@@ -5348,8 +5353,9 @@ fn a_container_row_keeps_its_body_in_compact_view(tool: &'static str) {
     finished(&mut plain, &["t1"]);
     rebuild(&mut plain);
 
-    assert!(
+    assert_eq!(
         container > plain.segment_heights()[0],
+        keeps_body,
         "{CONTAINER_BODY_MSG}: {container} rows"
     );
 }
@@ -5600,7 +5606,8 @@ fn expanded_density_keeps_the_status_dot_and_the_card() {
     assert!(panel.segment_heights()[0] > 1);
 }
 
-const MODE_EFFECT_MSG: &str = "the mode decides a read-only card; a writing card decides itself";
+const MODE_EFFECT_MSG: &str = "auto and expanded decide a read-only card and leave a writing card \
+    to itself, and compact decides both";
 const AUTO_TAIL_MSG: &str = "auto must leave the newest card open";
 const AUTO_HANDOFF_MSG: &str = "the card auto opened must close once a newer one takes its place";
 const AUTO_STREAM_MSG: &str = "nothing settled is newest while the model is still writing";
@@ -5620,23 +5627,44 @@ fn mode_panel(view: ViewMode, ids: &[(&str, &'static str)]) -> MessagesPanel {
     panel
 }
 
-/// Read-only calls are the only ones the mode is allowed to hide: a call that
-/// wrote something keeps its body in every mode, or the transcript stops
-/// showing what happened to the workspace.
+/// In auto and expanded a read-only call is the only one the mode may hide: a
+/// call that wrote something keeps its body, or the transcript stops showing
+/// what happened to the workspace. Compact is the one mode that answers for
+/// every tool, because a list with the writes still drawn is not a list.
 #[test_case(ViewMode::Expanded, CODE_MAP_TOOL_NAME, true; "expanded opens a map")]
 #[test_case(ViewMode::Compact, CODE_MAP_TOOL_NAME, false; "compact closes a map")]
 #[test_case(ViewMode::Auto, CODE_MAP_TOOL_NAME, true; "auto opens the newest map")]
 #[test_case(ViewMode::Expanded, FILE_WRITE_TOOL_NAME, true; "expanded opens a write")]
-#[test_case(ViewMode::Compact, FILE_WRITE_TOOL_NAME, true; "compact still opens a write")]
+#[test_case(ViewMode::Compact, FILE_WRITE_TOOL_NAME, false; "compact closes a write too")]
 #[test_case(ViewMode::Auto, FILE_WRITE_TOOL_NAME, true; "auto still opens a write")]
-fn the_mode_only_decides_cards_that_changed_nothing(
-    view: ViewMode,
-    tool: &'static str,
-    open: bool,
-) {
+fn the_mode_decides_which_cards_open(view: ViewMode, tool: &'static str, open: bool) {
     let panel = mode_panel(view, &[("t1", tool)]);
 
     assert_eq!(!panel.card_closed("t1"), open, "{MODE_EFFECT_MSG}");
+}
+
+const COMPACT_FOLDS_MSG: &str = "compact answers for every tool, whatever the call did, so its row \
+    is all there is until the reader asks for more";
+const COMPACT_KEEPS_BATCH_MSG: &str = "a folded batch says nothing at all, so it is the one call \
+    compact leaves open";
+
+/// One call per effect class, because the class is what the older rule keyed
+/// on and each one reached the mode down a different early return. Compact now
+/// answers before any of them.
+#[test_case(FILE_WRITE_TOOL_NAME, false ; "mutating")]
+#[test_case(PYTHON_EXECUTION_TOOL_NAME, false ; "isolated")]
+#[test_case(TASK_TOOL_NAME, false ; "orchestrator")]
+#[test_case(UNCLASSIFIED_TOOL, false ; "unclassified")]
+#[test_case(CODE_MAP_TOOL_NAME, false ; "read only")]
+#[test_case(BATCH_TOOL_NAME, true ; "a batch is the exception")]
+fn compact_folds_every_call_but_a_batch(tool: &'static str, open: bool) {
+    let panel = mode_panel(ViewMode::Compact, &[("t1", tool)]);
+    let message = match open {
+        true => COMPACT_KEEPS_BATCH_MSG,
+        false => COMPACT_FOLDS_MSG,
+    };
+
+    assert_eq!(!panel.card_closed("t1"), open, "{message}");
 }
 
 const ONE_CLICK_MSG: &str = "one click must show the whole body, whatever the mode drew before";
@@ -5708,7 +5736,7 @@ fn a_script_and_its_output_are_disclosed_together() {
         "the script and its output are one disclosure, so a card shows both or neither";
 
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
-    panel.set_view(ViewMode::Compact);
+    panel.set_view(ViewMode::Auto);
     panel.tool_start(ToolStartEvent {
         input: Some(ToolInput::Code {
             language: "python".into(),
@@ -5929,15 +5957,15 @@ fn an_untouched_batch_shows_no_child_bodies(view: ViewMode) {
 }
 
 const EXPECT_CHANGE_SHOWN: &str = "a child whose body is the only record of what it did draws with \
-     the card, in every mode, exactly as its own card would";
+     the card in auto and expanded, exactly as its own card would";
 
-/// The rule a standalone card has always run: no mode may hide a call that
-/// changed something. A batch folded every child regardless, so a whole turn
-/// of edits ran inside one and showed not a single diff.
-#[test_case(ViewMode::Compact ; "compact")]
+/// The rule a standalone card runs outside compact: neither auto nor expanded
+/// may hide a call that changed something. A batch folded every child
+/// regardless, so a whole turn of edits ran inside one and showed not a single
+/// diff. Compact is covered separately, where every child folds.
 #[test_case(ViewMode::Auto ; "auto")]
 #[test_case(ViewMode::Expanded ; "expanded")]
-fn a_batch_child_that_changed_something_shows_it_in_every_mode(view: ViewMode) {
+fn a_batch_child_that_changed_something_shows_it_outside_compact(view: ViewMode) {
     let mut panel = panel_with_tools(&[("t1", BATCH_TOOL)]);
     panel.tool_done(ToolDoneEvent {
         tool: BATCH_TOOL.into(),
@@ -5956,6 +5984,56 @@ fn a_batch_child_that_changed_something_shows_it_in_every_mode(view: ViewMode) {
     let text = seg_text(&panel, "t1");
     assert!(text.contains("child_body_line_a"), "{EXPECT_CHANGE_SHOWN}");
     assert!(!text.contains("child_body_line_b"), "{EXPECT_BODY_HIDDEN}");
+}
+
+const CHILD_FOLDS_IN_COMPACT_MSG: &str = "a batch is open in compact so its list can be read, and a \
+    child drawing its own body puts back the bulk the mode was chosen to remove";
+const CHILD_OPENS_IN_COMPACT_MSG: &str = "a folded child is still one press from its body, or \
+    compact would be the one view that cannot reach a diff at all";
+
+/// The other half of the exception: compact keeps the batch and folds what is
+/// inside it. A child that changed something is the case that matters, since
+/// every other rule lets that one draw.
+#[test]
+fn compact_folds_every_batch_child() {
+    let mut panel = panel_with_tools(&[("t1", BATCH_TOOL)]);
+    panel.tool_done(ToolDoneEvent {
+        tool: BATCH_TOOL.into(),
+        output: ToolOutput::Batch {
+            entries: vec![
+                batch_child(FILE_EDIT_TOOL_NAME, "a"),
+                batch_child(FILE_READ_TOOL_NAME, "b"),
+            ],
+            text: String::new(),
+        },
+        ..done("t1")
+    });
+    panel.set_view(ViewMode::Compact);
+    render(&mut panel, 80, 24);
+
+    let folded = seg_text(&panel, "t1");
+    assert!(
+        folded.contains("read ran"),
+        "{CHILD_FOLDS_IN_COMPACT_MSG}: {folded:?}"
+    );
+    for body in ["child_body_line_a", "child_body_line_b"] {
+        assert!(
+            !folded.contains(body),
+            "{CHILD_FOLDS_IN_COMPACT_MSG}: {folded:?}"
+        );
+    }
+
+    assert!(panel.handle_click(batch_child_row(&panel, 0), Rect::new(0, 0, 80, 24)));
+    render(&mut panel, 80, 24);
+    let opened = seg_text(&panel, "t1");
+    assert!(
+        opened.contains("child_body_line_a"),
+        "{CHILD_OPENS_IN_COMPACT_MSG}: {opened:?}"
+    );
+    assert!(
+        !opened.contains("child_body_line_b"),
+        "{CHILD_FOLDS_IN_COMPACT_MSG}: {opened:?}"
+    );
 }
 
 #[test]
@@ -6187,6 +6265,23 @@ fn a_streaming_child_is_held_to_its_window() {
     assert!(
         !text.contains(&format!("line {}", first - 1)),
         "{CHILD_STREAM_MSG}: {text:?}"
+    );
+}
+
+/// Compact takes the stream too. A live body is the one thing that argues for
+/// drawing a child, and the mode answers that it asked for a list: the row and
+/// its spinner say the call is running, and a press opens it.
+#[test]
+fn compact_folds_a_streaming_child_too() {
+    let mut panel = panel_with_running_shell();
+    panel.set_view(ViewMode::Compact);
+    panel.set_batch_child_output("t1", 0, &shell_stream());
+    render(&mut panel, 80, 24);
+
+    let text = seg_text(&panel, "t1");
+    assert!(
+        !text.contains(&format!("line {}", CHILD_STREAM_LINES - 1)),
+        "{CHILD_FOLDS_IN_COMPACT_MSG}: {text:?}"
     );
 }
 
@@ -7010,7 +7105,10 @@ fn a_completed_batch_read_replaces_its_request_with_the_returned_range() {
 
 const SHELL_COLLAPSE_MSG: &str = "a shell card must obey the view like any other read";
 const SHELL_HEADER_KEPT_MSG: &str = "a closed shell card still names the command that ran";
-const WRITE_STAYS_OPEN_MSG: &str = "a write must stay open: its diff is the only record of it";
+const WRITE_STAYS_OPEN_MSG: &str = "outside compact a write must stay open: its diff is the only \
+    record of it";
+const WRITE_FOLDS_IN_COMPACT_MSG: &str = "compact answers for every tool, so a write folds to its row \
+    like anything else and the diff is one click away";
 
 /// Shell is `Mutating`, so it was exempt from every view rule and stayed open
 /// forever. It is the highest-volume tool there is, which made compact and
@@ -7029,12 +7127,14 @@ fn a_shell_card_closes_like_any_other_read(view: ViewMode) {
     assert!(text.contains("cmd"), "{SHELL_HEADER_KEPT_MSG}: {text:?}");
 }
 
-/// The line the rule draws: a shell command is named by its own header, but a
-/// diff exists nowhere but the body it would be hidden behind.
+/// The line the rule draws outside compact: a shell command is named by its
+/// own header, but a diff exists nowhere but the body it would be hidden
+/// behind. Auto is the case worth pinning, since the write has already fallen
+/// behind a newer message and would fold if the mode alone decided.
 #[test_case(FILE_WRITE_TOOL_NAME ; "write")]
 #[test_case(FILE_EDIT_TOOL_NAME ; "edit")]
-fn a_write_still_ignores_the_view(tool: &'static str) {
-    let mut panel = compact_panel(&[("t1", tool)]);
+fn a_write_ignores_every_view_but_compact(tool: &'static str) {
+    let mut panel = panel_with_tools(&[("t1", tool)]);
     panel.tool_done(long_done("t1", HELD_BODY_LINES));
     panel.push(DisplayMessage::new(DisplayRole::Assistant, "done".into()));
     render(&mut panel, 80, 24);
@@ -7042,6 +7142,21 @@ fn a_write_still_ignores_the_view(tool: &'static str) {
     assert!(
         seg_text(&panel, "t1").contains("line 0"),
         "{WRITE_STAYS_OPEN_MSG}"
+    );
+}
+
+/// Compact is the exception, and it is the whole point of the mode: a session
+/// of writes was unskimmable while every diff drew itself.
+#[test_case(FILE_WRITE_TOOL_NAME ; "write")]
+#[test_case(FILE_EDIT_TOOL_NAME ; "edit")]
+fn a_write_folds_in_compact(tool: &'static str) {
+    let mut panel = compact_panel(&[("t1", tool)]);
+    panel.tool_done(long_done("t1", HELD_BODY_LINES));
+    render(&mut panel, 80, 24);
+
+    assert!(
+        !seg_text(&panel, "t1").contains("line 0"),
+        "{WRITE_FOLDS_IN_COMPACT_MSG}"
     );
 }
 
@@ -7181,7 +7296,9 @@ fn cycling_the_view_leaves_an_always_collapsed_call_at_one_row() {
     }
 }
 
-const WRITE_OPENS_MSG: &str = "a write is not collapsible by mode, so the dense views open it too";
+const WRITE_OPENS_MSG: &str = "a write is not collapsible by mode, so auto opens it too";
+const WRITE_OPENS_WHOLE_MSG: &str = "a press is never answered with a slice: the mode drew no body \
+    at all, so the one it draws now is the whole file";
 const WRITE_SHUTS_MSG: &str = "hiding a diff nobody asked to hide loses the change, but the reader \
     asking is a different thing, and the row still names the file";
 const WRITE_REOPENS_MSG: &str = "a card the reader shut has to come back on the next press, or the \
@@ -7189,11 +7306,10 @@ const WRITE_REOPENS_MSG: &str = "a card the reader shut has to come back on the 
 const BODY_HEAD: &str = "line 0";
 
 /// A write was exempt from every collapse rule, including the reader's own
-/// press, so a long diff could not be put away at all and a session full of
-/// writes could not be skimmed. Expanded is left out on purpose: it gives no
-/// card a header to fall back to, which is a property of the mode rather than
-/// of writes.
-#[test_case(ViewMode::Compact ; "compact")]
+/// press, so a long diff could not be put away at all. Expanded is left out on
+/// purpose: it gives no card a header to fall back to, which is a property of
+/// the mode rather than of writes. Compact is left out because a write starts
+/// folded there, so the same two presses run the other way round.
 #[test_case(ViewMode::Auto ; "auto")]
 fn a_write_shuts_on_a_press_and_comes_back_on_the_next(view: ViewMode) {
     let mut panel = panel_with_tools(&[(TOOL_ID, FILE_WRITE_TOOL_NAME)]);
@@ -7218,6 +7334,32 @@ fn a_write_shuts_on_a_press_and_comes_back_on_the_next(view: ViewMode) {
         seg_text(&panel, TOOL_ID).contains(BODY_HEAD),
         "{WRITE_REOPENS_MSG}"
     );
+}
+
+/// The same two presses in compact, which start from the other end: a write is
+/// folded there, and the press that opens it has to give the whole file rather
+/// than the seven rows the `write` budget would allow.
+#[test]
+fn a_folded_write_opens_whole_and_shuts_again() {
+    let mut panel = compact_panel(&[(TOOL_ID, FILE_WRITE_TOOL_NAME)]);
+    panel.tool_done(long_done(TOOL_ID, WRITTEN_FILE_LINES));
+    rebuild(&mut panel);
+    let area = Rect::new(0, 0, 80, 24);
+    assert!(panel.card_closed(TOOL_ID), "{WRITE_FOLDS_IN_COMPACT_MSG}");
+
+    assert!(panel.handle_click(0, area), "{WRITE_REOPENS_MSG}");
+    rebuild(&mut panel);
+    let text = seg_text(&panel, TOOL_ID);
+    for line in [
+        BODY_HEAD.to_owned(),
+        format!("line {}", WRITTEN_FILE_LINES - 1),
+    ] {
+        assert!(text.contains(&line), "{WRITE_OPENS_WHOLE_MSG}: {text:?}");
+    }
+
+    assert!(panel.handle_click(0, area), "{WRITE_SHUTS_MSG}");
+    rebuild(&mut panel);
+    assert!(panel.card_closed(TOOL_ID), "{WRITE_SHUTS_MSG}");
 }
 
 const SCROLLING_OFF: u32 = 0;
@@ -7266,16 +7408,15 @@ fn scrolling_off_returns_a_shell_body_to_its_budget() {
     assert!(!text.contains(PAUSED), "{NO_WINDOW_MSG}: {text:?}");
 }
 
-/// The other half of the old shape: a write spent no budget at all, so turning
-/// scrolling off has to give back the whole file rather than leave the write
-/// resting at the window height the setting just removed.
-#[test]
-fn scrolling_off_draws_a_write_whole() {
-    let text = long_card_text(
-        without_card_scrolling(),
-        FILE_WRITE_TOOL_NAME,
-        WRITTEN_FILE_LINES,
-    );
+/// A write's body is the file it wrote, so it is neither windowed nor
+/// abridged. Both settings are checked because the point is that
+/// `scroll_card_lines` does not reach a write at all: the tool sat in the
+/// scroll set once, and a window pinned to the tail hid the head of the file
+/// it had just written.
+#[test_case(UiConfig::default() ; "at the default window height")]
+#[test_case(without_card_scrolling() ; "with scrolling off")]
+fn a_write_is_whole_whatever_the_scroll_setting(config: UiConfig) {
+    let text = long_card_text(config, FILE_WRITE_TOOL_NAME, WRITTEN_FILE_LINES);
     let tail = format!("line {}", WRITTEN_FILE_LINES - 1);
 
     assert!(text.contains(BODY_HEAD), "{UNABRIDGED_WRITE_MSG}: {text:?}");
@@ -7321,12 +7462,14 @@ fn a_writes_body_is_not_abridged(tool: &'static str, expect_notice: bool) {
         !expect_notice,
         "{message}: {text:?}"
     );
+    // A window pinned to the tail satisfies every assertion above, which is
+    // how a write stayed abridged unnoticed. Only the head rules one out, and
+    // an abridged edit draws its head too.
+    assert!(text.contains(BODY_HEAD), "{message}: {text:?}");
 }
 
-const LIVE_TAIL_MSG: &str = "a still-arriving file is a window on its tail, so the line that just \
-    landed is the one on screen and the footer says the window is following it";
-const LIVE_WINDOW_MSG: &str = "the window is a fixed height, so the card does not take a row for \
-    every line the tool writes and the lines it passed are counted, not drawn";
+const LIVE_WHOLE_MSG: &str = "a file arriving is still the file, so every line it has written so \
+    far is on screen and no window footer sits under it";
 const NO_LIVE_NOTICE_MSG: &str = "nothing is hidden behind a click while the rest of the file has \
     not arrived";
 const LIVE_BODY_DRAWN_MSG: &str = "the frame is what draws the body, so the card has grown past \
@@ -7334,32 +7477,25 @@ const LIVE_BODY_DRAWN_MSG: &str = "the frame is what draws the body, so the card
 const PER_FRAME_MSG: &str = "the body is rebuilt once a frame rather than once a fragment: per \
     fragment costs the file's length squared";
 
-/// The live body is the window the settled card will rest at, pinned to the
-/// tail and saying so. Drawing the whole file instead grew the card under the
-/// reader for as long as the tool ran.
+/// The live body is what the settled card will rest at, and for a write that
+/// is the whole file. Windowing it to the tail hid the head of the file while
+/// it was being written, which is the half a reader checks.
 #[test]
-fn a_streaming_write_follows_its_tail_in_a_fixed_window() {
+fn a_streaming_write_is_drawn_whole() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
-    let window = UiConfig::default().scroll_card_lines as usize;
-    let above = WRITTEN_FILE_LINES - window;
     let body: String = (0..WRITTEN_FILE_LINES)
         .map(|i| format!("line {i}\n"))
         .collect();
     streaming_write(&mut panel, &[&body]);
 
     let shown = buffer_text(&render(&mut panel, 80, WRITTEN_FILE_LINES as u16 + 8));
-    for line in [above, WRITTEN_FILE_LINES - 1] {
+    for line in [0, WRITTEN_FILE_LINES - 1] {
         assert!(
             shown.contains(&format!("line {line}")),
-            "{LIVE_TAIL_MSG}: {shown}"
+            "{LIVE_WHOLE_MSG}: {shown}"
         );
     }
-    assert!(shown.contains(FOLLOWING), "{LIVE_TAIL_MSG}: {shown}");
-    assert!(!shown.contains("line 0"), "{LIVE_WINDOW_MSG}: {shown}");
-    assert!(
-        shown.contains(&format!("{above} above")),
-        "{LIVE_WINDOW_MSG}: {shown}"
-    );
+    assert!(!shown.contains(FOLLOWING), "{LIVE_WHOLE_MSG}: {shown}");
     assert!(
         !shown.contains(crate::markdown::EXPAND_AFFORDANCE),
         "{NO_LIVE_NOTICE_MSG}: {shown}"
@@ -7610,13 +7746,13 @@ fn scroll_footer_row(panel: &MessagesPanel, tool_id: &str) -> u16 {
 fn clicking_a_paused_windows_footer_follows_the_tail_again() {
     const FOLLOW_CLICK_MSG: &str =
         "the footer that reports a paused window is what takes it back to the tail";
+    const PAUSED_BODY_LINES: usize = 40;
 
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
-    let body: String = (0..WRITTEN_FILE_LINES)
-        .map(|i| format!("line {i}\n"))
-        .collect();
-    streaming_write(&mut panel, &[&body]);
-    let height = WRITTEN_FILE_LINES as u16 + 8;
+    panel.tool_start(start(TOOL_ID, SHELL_TOOL_NAME));
+    panel.tool_done(long_done(TOOL_ID, PAUSED_BODY_LINES));
+    rebuild(&mut panel);
+    let height = PAUSED_BODY_LINES as u16 + 8;
     let area = Rect::new(0, 0, 80, height);
     let terminal = render(&mut panel, 80, height);
     let (column, row) = card_bar_rows(&terminal)[0];

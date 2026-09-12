@@ -12,9 +12,7 @@ use super::tool_display::{
     scroll_footer_text,
 };
 use super::{ToolProgress, is_collapsible, workflow_card};
-use caudra_agent::tools::{
-    FILE_WRITE_TOOL_NAME, PYTHON_EXECUTION_TOOL_NAME, SHELL_TOOL_NAME, TASK_TOOL_NAME,
-};
+use caudra_agent::tools::{PYTHON_EXECUTION_TOOL_NAME, SHELL_TOOL_NAME, TASK_TOOL_NAME};
 use caudra_agent::types::Answer;
 use caudra_agent::types::{TodoItem, TodoStatus};
 use caudra_agent::{
@@ -1762,24 +1760,26 @@ impl ScrollWindow {
     }
 }
 
-/// The tools whose body is long, arrives over time, or both, and so is drawn
-/// in a fixed window that follows the tail rather than abridged with a notice
-/// offering the rest.
-const SCROLL_CARD_TOOLS: &[&str] = &[
-    SHELL_TOOL_NAME,
-    FILE_WRITE_TOOL_NAME,
-    PYTHON_EXECUTION_TOOL_NAME,
-    TASK_TOOL_NAME,
-];
+/// The tools whose body reports on work rather than being the work, and is
+/// long, arrives over time, or both. They are drawn in a fixed window that
+/// follows the tail rather than abridged with a notice offering the rest.
+///
+/// A write is deliberately absent. Its body is the file it wrote, so a window
+/// on the tail hides the head of what it just did, which is the part worth
+/// reading.
+const SCROLL_CARD_TOOLS: &[&str] = &[SHELL_TOOL_NAME, PYTHON_EXECUTION_TOOL_NAME, TASK_TOOL_NAME];
 
-/// What the reader's configuration says about a tool. Carried with the limits
-/// rather than looked up at the card, because a batch child is the same call
-/// without a card of its own and has to answer these the same way or the two
-/// drift.
+/// What the reader's configuration and view mode say about a tool. Carried
+/// with the limits rather than looked up at the card, because a batch child is
+/// the same call without a card of its own and has to answer these the same
+/// way or the two drift.
 #[derive(Clone, Default)]
 pub struct CardPolicy {
     pub always_collapsed: Arc<[String]>,
     pub scroll_card_lines: u32,
+    /// Whether the reader asked for one row per call. Held here so a child
+    /// folds by the same answer its own card would give.
+    pub compact: bool,
 }
 
 impl CardPolicy {
@@ -1918,10 +1918,19 @@ impl RenderLimits {
     /// never-open list still wins: that list is about output nobody wants,
     /// whether it has arrived yet or not.
     ///
+    /// Compact overrides every one of those. The reader asked for one row per
+    /// call, and a batch is only open there because its list is the whole of
+    /// what it has to say, so a child that filled the list with its own body
+    /// would take back what the mode was chosen for. Opening a child by hand
+    /// is still the way out, and it opens whole.
+    ///
     /// The views and the reports name this card's children, so both are
     /// dropped on the way in or a nested batch would read them as its own.
     fn child(&self, index: usize, entry: &BatchToolEntry) -> Option<Self> {
         let open = self.views.is_open(index);
+        if self.policy.compact && !open {
+            return None;
+        }
         let streaming = entry.output.is_none()
             && self.live.get(&index).is_some_and(|tail| !tail.is_empty())
             && !self.policy.stays_collapsed(&entry.tool);
