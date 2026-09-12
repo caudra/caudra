@@ -661,6 +661,73 @@ def session_workload(conn, models, cwd):
     return out
 
 
+def cost_attribution(conn, models, cwd):
+    """Notional cost per user turn, split by which model actually incurred it.
+
+    A leader's blended cost hides delegation: one expensive subagent session can add a
+    fifth to it while the leader itself never got slower or dearer. Splitting own from
+    delegated is what makes two leaders comparable.
+
+    Restricted to sessions that carry any cost at all, because the unpriced era would
+    otherwise contribute turns with no dollars and halve every figure. That makes the
+    denominator here narrower than section G1's, so the two do not divide.
+    """
+    cwd_filter = "AND s.cwd = ?" if cwd else ""
+    params = [USER_TYPE, TURN_ORIGIN, *models]
+    if cwd:
+        params.append(cwd)
+    rows = conn.execute(
+        f"""WITH marked AS (
+                SELECT h.session_id,
+                       SUM(CASE WHEN json_extract(h.payload, '$.type') = ?
+                                 AND json_extract(h.payload, '$.origin') = ? THEN 1 ELSE 0 END)
+                         OVER (PARTITION BY h.session_id ORDER BY h.ordinal) AS turn_no
+                FROM main_history_items h
+            ),
+            turns AS (
+                SELECT session_id, COUNT(DISTINCT turn_no) AS n FROM marked
+                WHERE turn_no > 0 GROUP BY session_id
+            ),
+            priced AS (
+                SELECT session_id FROM model_usage GROUP BY session_id
+                HAVING SUM(COALESCE(subscription_cost, 0) + COALESCE(cost, 0)) > 0
+            )
+            SELECT {MAIN_MODEL} AS leader, mu.model AS incurred_by,
+                   COUNT(DISTINCT s.id) AS sessions,
+                   SUM(COALESCE(mu.subscription_cost, 0) + COALESCE(mu.cost, 0)) AS notional,
+                   (SELECT SUM(t2.n) FROM turns t2
+                      JOIN sessions s2 ON s2.id = t2.session_id
+                      JOIN priced p2 ON p2.session_id = s2.id
+                     WHERE {MAIN_MODEL.replace("s.model", "s2.model")} = {MAIN_MODEL}) AS leader_turns
+            FROM sessions s
+            JOIN turns t ON t.session_id = s.id
+            JOIN priced p ON p.session_id = s.id
+            JOIN model_usage mu ON mu.session_id = s.id
+            WHERE {MAIN_MODEL} IN ({placeholders(models)}) {cwd_filter}
+              AND COALESCE(mu.subscription_cost, 0) + COALESCE(mu.cost, 0) > 0
+            GROUP BY leader, incurred_by""",
+        params,
+    ).fetchall()
+    totals = defaultdict(float)
+    for leader, _, _, notional, _ in rows:
+        totals[leader] += notional
+    out = [
+        {
+            "leader": leader,
+            "incurred_by": incurred_by,
+            "kind": "own" if leader == incurred_by else "delegated",
+            "sessions": sessions,
+            "user_turns": leader_turns,
+            "notional": notional,
+            "per_user_turn": ratio(notional, leader_turns),
+            "share": ratio(notional, totals[leader]),
+        }
+        for leader, incurred_by, sessions, notional, leader_turns in rows
+    ]
+    out.sort(key=lambda r: (models.index(r["leader"]), -float(r["notional"])))
+    return out
+
+
 def integrity(conn, models, ledger_scoped, roles):
     """Cross-checks that must hold, and reconciliations that expose silent undercounts."""
     lifetime = dict(
@@ -903,6 +970,27 @@ def workload_table(rows):
     )
 
 
+def attribution_table(rows):
+    return table(
+        ["Leader", "Incurred by", "Kind", "Sessions", "User turns", "Notional",
+         "$/user turn", "Share"],
+        ["<", "<", "<", ">", ">", ">", ">", ">"],
+        [
+            [
+                row["leader"],
+                row["incurred_by"],
+                row["kind"],
+                fmt_int(row["sessions"]),
+                fmt_int(row["user_turns"]),
+                fmt_usd(row["notional"]),
+                fmt_usd(row["per_user_turn"]),
+                fmt_pct(row["share"]),
+            ]
+            for row in rows
+        ],
+    )
+
+
 def check_table(rows):
     return table(
         ["Check", "Result", "Detail"],
@@ -990,6 +1078,7 @@ def build_report(conn, models, purpose, cwd):
     buckets = bucket_distribution(conn, models, purpose, cwd)
     thinking = thinking_levels(conn, models, cwd, events)
     workload = session_workload(conn, models, cwd)
+    attribution = cost_attribution(conn, models, cwd)
     audit = integrity(conn, models, ledger, roles)
     return {
         "checks": audit["checks"],
@@ -1059,7 +1148,7 @@ def build_report(conn, models, purpose, cwd):
                 "table": thinking_table(thinking),
             },
             {
-                "title": "G. Session workload decomposition",
+                "title": "G1. Session workload decomposition",
                 "note": "Per session, then summarised across sessions, grouped by the model "
                 "that led the session. Counts everything the session spent including "
                 "subagents on other models, because this asks what a session led by this "
@@ -1068,6 +1157,16 @@ def build_report(conn, models, purpose, cwd):
                 "both: read `p90 s/turn` for what a bad turn feels like.",
                 "data": workload,
                 "table": workload_table(workload),
+            },
+            {
+                "title": "G2. Notional cost per user turn, by who incurred it",
+                "note": "Splits each leader's cost into what the leader itself spent and what "
+                "it delegated away. A blended figure flatters or penalises a leader for the "
+                "company it kept: compare the `own` rows to compare the models. Priced "
+                "sessions only, so the denominator is narrower than G1's and the two do not "
+                "divide into each other.",
+                "data": attribution,
+                "table": attribution_table(attribution),
             },
             {
                 "title": "H1. Integrity checks",
