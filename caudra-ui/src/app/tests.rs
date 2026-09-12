@@ -2388,29 +2388,19 @@ const PAUSED_FOOTER: &str = "below";
 /// Positive is towards the start of the body, as everywhere else.
 const CARD_WHEEL_NOTCHES: i32 = 3;
 
-/// An app holding one open shell card whose body is long enough to be a window.
+/// An app holding one open shell card whose body is long enough to be a
+/// window. The command is still running, because only a running one reports
+/// which edge its window is pinned to: a settled card has no tail left to
+/// follow and its footer reports the counts alone.
 fn app_with_scroll_card() -> App {
     let mut app = app_without_splash();
     app.update(agent_msg(tool_start(SCROLL_CARD_ID, SCROLL_CARD_TOOL)));
-    app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
+    app.update(agent_msg(AgentEvent::ToolOutput {
         id: SCROLL_CARD_ID.into(),
-        tool: SCROLL_CARD_TOOL.into(),
-        output: ToolOutput::Plain(
-            (0..SCROLL_CARD_BODY_LINES)
-                .map(|line| format!("line {line}\n"))
-                .collect::<String>()
-                .into(),
-        ),
-        is_error: false,
-        annotation: None,
-        written_path: None,
-        written_paths: Vec::new(),
-        output_ref: None,
-        output_limits: None,
-        model_suffix: None,
-        model_output: None,
-        model_output_from_ref: false,
-    }))));
+        content: (0..SCROLL_CARD_BODY_LINES)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>(),
+    }));
     app
 }
 
@@ -10477,14 +10467,13 @@ fn changing_projects_closes_stale_permission_config_actions() {
     let temp = TempDir::new().unwrap();
     let project = temp.path().join("destination");
     std::fs::create_dir(&project).unwrap();
-    let snapshot_store =
-        App::snapshot_store_for(
-            &app.storage,
-            app.state.session.id,
-            &project,
-            SnapshotLimits::default(),
-        )
-        .unwrap();
+    let snapshot_store = App::snapshot_store_for(
+        &app.storage,
+        app.state.session.id,
+        &project,
+        SnapshotLimits::default(),
+    )
+    .unwrap();
     assert!(app.permissions_picker.is_open());
 
     app.install_working_directory(&project, snapshot_store, PermissionsConfig::default());
@@ -12438,7 +12427,8 @@ fn ephemeral_snapshots_are_written_to_the_volatile_root() {
     let storage = StateDir::split(volatile.clone(), persistent.clone());
     let session_id = CaudraId::generate();
 
-    let store = App::snapshot_store_for(&storage, session_id, &cwd, SnapshotLimits::default()).unwrap();
+    let store =
+        App::snapshot_store_for(&storage, session_id, &cwd, SnapshotLimits::default()).unwrap();
     store.snapshot_session_start(&cwd).unwrap();
 
     let snapshots = |root: &Path| root.join(caudra_agent::snapshots::SESSION_SNAPSHOTS_DIR);
@@ -13822,8 +13812,13 @@ fn turn_end_keeps_only_the_subagents_that_finished() {
 /// The popup is fed by a walker thread, so a test settles it before asserting
 /// on what it matched.
 fn mention_popup_at(app: &mut App, cwd: &std::path::Path, query: &str) {
-    let store = App::snapshot_store_for(&app.storage, app.state.session.id, cwd, SnapshotLimits::default())
-        .expect("a snapshot store for the project");
+    let store = App::snapshot_store_for(
+        &app.storage,
+        app.state.session.id,
+        cwd,
+        SnapshotLimits::default(),
+    )
+    .expect("a snapshot store for the project");
     app.install_working_directory(cwd, store, PermissionsConfig::default());
     for character in query.chars() {
         app.update(Msg::Key(key(KeyCode::Char(character))));
@@ -13900,7 +13895,7 @@ fn transcript_mention(app: &mut App) -> (TempDir, u16, u16) {
         dir.path(),
         SnapshotLimits::default(),
     )
-        .expect("a snapshot store for the project");
+    .expect("a snapshot store for the project");
     app.install_working_directory(dir.path(), store, PermissionsConfig::default());
     app.main_chat()
         .push_user_message(format!("look at @{MENTIONED_FILE} please"));
@@ -14251,13 +14246,19 @@ fn app_with_wide_spend() -> App {
 fn a_sideways_wheel_pans_the_modal_it_is_over() {
     let mut app = app_with_wide_spend();
 
-    assert!(!rendered(&mut app).contains(LONG_SPEND_TEXT), "{CLIPPED_COST}");
+    assert!(
+        !rendered(&mut app).contains(LONG_SPEND_TEXT),
+        "{CLIPPED_COST}"
+    );
 
     for _ in 0..8 {
         app.update(mouse_event(MouseEventKind::ScrollRight, 5, 5));
     }
 
-    assert!(rendered(&mut app).contains(LONG_SPEND_TEXT), "{WHEEL_DROPPED}");
+    assert!(
+        rendered(&mut app).contains(LONG_SPEND_TEXT),
+        "{WHEEL_DROPPED}"
+    );
 }
 
 /// The chord reaches the modal the same way the wheel does, and the transcript
@@ -14271,7 +14272,10 @@ fn the_pan_chord_reaches_an_open_modal() {
         app.update(Msg::Key(kb::PAN_RIGHT.to_key_event()));
     }
 
-    assert!(rendered(&mut app).contains(LONG_SPEND_TEXT), "{WHEEL_DROPPED}");
+    assert!(
+        rendered(&mut app).contains(LONG_SPEND_TEXT),
+        "{WHEEL_DROPPED}"
+    );
 }
 
 /// `test_app` shares one state dir across the whole run, and the stash is a

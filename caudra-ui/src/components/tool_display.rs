@@ -338,15 +338,27 @@ pub(crate) fn names_tool(pattern: &str, name: &str) -> bool {
     qualifier_suffixes(name).any(|rest| same_key(pattern, rest))
 }
 
-/// What a window says about itself: how much sits either side of it, and which
-/// edge it is pinned to. `None` when the body fits, since then there is no
-/// window to describe.
+/// What a window can say about its tail beyond the counts. `following` and
+/// `paused` both claim output may still arrive, so a call that has answered
+/// says neither and reports only how much sits either side of the window.
+#[derive(Clone, Copy)]
+pub(crate) enum ScrollTail {
+    /// Still running, and this footer is the control that re-pins the window.
+    Resumable,
+    /// Still running, but the footer is not the control: a batch child's rows
+    /// fold the child instead, so it is told where it sits and nothing more.
+    Live,
+    /// Answered. There is nothing left to follow.
+    Settled,
+}
+
+/// What a window says about itself: how much sits either side of it, and, while
+/// output can still reach it, which edge it is pinned to. `None` when the body
+/// fits, since then there is no window to describe.
 ///
 /// A card and a batch child share this so the two never drift into describing
-/// the same state differently. `resumable` is the click hint, which only a
-/// card's own footer earns: a child's rows already belong to the child, so a
-/// press there folds it rather than resuming its follow.
-pub(crate) fn scroll_footer_text(above: usize, below: usize, resumable: bool) -> Option<String> {
+/// the same state differently.
+pub(crate) fn scroll_footer_text(above: usize, below: usize, tail: ScrollTail) -> Option<String> {
     if above == 0 && below == 0 {
         return None;
     }
@@ -357,11 +369,12 @@ pub(crate) fn scroll_footer_text(above: usize, below: usize, resumable: bool) ->
     if below > 0 {
         parts.push(format!("{below} below"));
     }
-    parts.push(match (below, resumable) {
-        (0, _) => FOLLOWING.to_owned(),
-        (_, true) => format!("{PAUSED}{RESUME_HINT}"),
-        (_, false) => PAUSED.to_owned(),
-    });
+    match (tail, below) {
+        (ScrollTail::Settled, _) => {}
+        (_, 0) => parts.push(FOLLOWING.to_owned()),
+        (ScrollTail::Resumable, _) => parts.push(format!("{PAUSED}{RESUME_HINT}")),
+        (ScrollTail::Live, _) => parts.push(PAUSED.to_owned()),
+    }
     Some(format!(
         "{NOTICE_PREFIX}{}",
         parts.join(SCROLL_FOOTER_SEPARATOR)
@@ -1304,11 +1317,15 @@ impl ToolLineBuilder {
         }
     }
 
-    /// Where a window sits and whether it is still chasing the tail. A window
-    /// with nothing either side of it says nothing: the body fits, and a
-    /// footer would only claim otherwise.
+    /// Where a window sits and, while the call is still running, whether it is
+    /// chasing the tail. A window with nothing either side of it says nothing:
+    /// the body fits, and a footer would only claim otherwise.
     fn push_scroll_footer(&mut self, above: usize, below: usize) {
-        let Some(text) = scroll_footer_text(above, below, true) else {
+        let tail = match self.is_in_progress() {
+            true => ScrollTail::Resumable,
+            false => ScrollTail::Settled,
+        };
+        let Some(text) = scroll_footer_text(above, below, tail) else {
             return;
         };
         self.truncation = true;

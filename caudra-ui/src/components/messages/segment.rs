@@ -403,6 +403,26 @@ impl Segment {
         self.rows.get(line).copied().flatten()
     }
 
+    /// The line that names the control at `rel_row`: the first of the run
+    /// carrying the same target. A child is folded or whole, so its summary
+    /// row and its body are one control, and the row the pointer marks has to
+    /// be that same one from anywhere inside it.
+    ///
+    /// Scans back from the hovered line rather than from the start of the
+    /// segment. A control's lines are contiguous, so this costs the control's
+    /// own height rather than the whole card's, on every pointer move.
+    pub fn control_line_at(&self, rel_row: u16, width: u16) -> Option<usize> {
+        let line = self.source_line_at(rel_row, width)?;
+        let target = self.rows.get(line).copied().flatten()?;
+        Some(
+            (0..line)
+                .rev()
+                .take_while(|earlier| self.rows[*earlier] == Some(target))
+                .last()
+                .unwrap_or(line),
+        )
+    }
+
     /// Maps a source line to a 1-based row in the tool's live buffer, or 0
     /// for lines outside it (header etc.). The Lua click-row contract is
     /// computed here and nowhere else, from the base recorded when the

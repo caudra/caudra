@@ -21,8 +21,9 @@ pub(super) enum HoverFeedback {
     /// Only the raw/filtered switch, so hovering it does not also light up an
     /// expand affordance elsewhere on the same card.
     ShellToggle,
-    /// One body line, by its index. A batch child is a control in its own
-    /// right, so it marks itself rather than the card around it.
+    /// The row that names a control nested inside a card, by its line index. A
+    /// batch child is a control in its own right, so it marks itself rather
+    /// than the card around it, the same way a card marks its own header.
     Row(usize),
     Chrome,
 }
@@ -242,25 +243,25 @@ fn hover_lines(
                 line.spans = spans;
             }
         }
-        Some((HoverFeedback::Row(line), _)) => {
-            if let Some(row) = lines.get_mut(line) {
-                row.style = hover_style(row.style, true);
-                for span in &mut row.spans {
-                    span.style = hover_style(span.style, true);
-                }
-            }
-        }
-        Some((HoverFeedback::Chrome, accent)) => {
-            if let Some(header) = lines.first_mut() {
-                header.style = header.style.fg(accent);
-                for span in &mut header.spans {
-                    span.style = span.style.fg(accent);
-                }
-            }
-        }
+        Some((HoverFeedback::Row(line), accent)) => tint_line(lines.get_mut(line), accent),
+        Some((HoverFeedback::Chrome, accent)) => tint_line(lines.first_mut(), accent),
         None => {}
     }
     lines
+}
+
+/// How a control says the pointer is on it when the control is a whole card or
+/// a whole child: the row that names it takes the accent. That row is the
+/// label and not the thing, so reversing it would shout about one line while
+/// the press acts on everything under it.
+fn tint_line(line: Option<&mut Line<'static>>, accent: Color) {
+    let Some(line) = line else {
+        return;
+    };
+    line.style = line.style.fg(accent);
+    for span in &mut line.spans {
+        span.style = span.style.fg(accent);
+    }
 }
 
 fn reverse_affordance(span: Span<'static>, needles: &[&str]) -> Vec<Span<'static>> {

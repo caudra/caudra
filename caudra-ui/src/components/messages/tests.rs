@@ -6107,6 +6107,56 @@ fn hovering_a_batch_child_marks_that_row() {
     );
 }
 
+const CHILD_MARK_MSG: &str = "every row of a child answers for the same control, so the row the \
+    pointer marks is the summary row wherever inside the child it sits";
+const CHILD_MARK_QUIET_MSG: &str = "the marked row is the label and not the thing, so it takes the \
+    accent a card gives its own header rather than being reversed";
+
+/// A child is folded or whole, so its summary row and its body are one control
+/// and a press anywhere in it folds all of it. Marking the hovered line instead
+/// aimed the loudest cue in the vocabulary at a row that answers for nothing on
+/// its own.
+#[test]
+fn hovering_a_childs_body_marks_its_summary_row() {
+    let mut panel = panel_with_batch();
+    let area = Rect::new(0, 0, 80, 24);
+    let summary = batch_child_row(&panel, 0);
+    assert!(panel.handle_click(summary, area), "{CHILD_MARK_MSG}");
+    render(&mut panel, 80, 24);
+
+    panel.update_hover(summary, area.x, area, false, Path::new(NO_PROJECT));
+    let from_summary = hovered_feedback(&panel);
+    panel.update_hover(summary + 1, area.x, area, false, Path::new(NO_PROJECT));
+
+    assert_eq!(from_summary, hovered_feedback(&panel), "{CHILD_MARK_MSG}");
+}
+
+fn hovered_feedback(panel: &MessagesPanel) -> HoverFeedback {
+    match &panel.hover {
+        Some(HoverTarget::Tool { feedback, .. }) => *feedback,
+        other => panic!("{CHILD_MARK_MSG}: {other:?}"),
+    }
+}
+
+/// The same rule a card's header follows, one level down. Reverse video on a
+/// body line read as "this line is the control", which it is not.
+#[test]
+fn a_marked_child_row_is_accented_not_reversed() {
+    let mut panel = panel_with_batch();
+    let area = Rect::new(0, 0, 80, 24);
+    let summary = batch_child_row(&panel, 0);
+    panel.update_hover(summary, area.x, area, false, Path::new(NO_PROJECT));
+    let terminal = render(&mut panel, area.width, area.height);
+
+    let marked = style_of(&terminal, &format!("{FILE_READ_TOOL_NAME} ran"));
+    let sibling = style_of(&terminal, &format!("{FILE_GREP_TOOL_NAME} ran"));
+    assert!(
+        !marked.add_modifier.contains(Modifier::REVERSED),
+        "{CHILD_MARK_QUIET_MSG}"
+    );
+    assert_ne!(marked.fg, sibling.fg, "{CHILD_MARK_QUIET_MSG}");
+}
+
 const EXPECT_FILTERED: &str = "a card the reader never switched shows the filtered view";
 
 /// The raw/filtered switch names a tool id from the session that is going
@@ -6214,6 +6264,12 @@ fn shell_stream() -> String {
     (0..CHILD_STREAM_LINES)
         .map(|line| format!("line {line}\n"))
         .collect()
+}
+
+/// `lines` numbered from zero, so a test can name the head and the tail of a
+/// body without counting.
+fn numbered_body(lines: usize) -> String {
+    (0..lines).map(|line| format!("line {line}\n")).collect()
 }
 
 /// A batch running one shell, with nothing back from it yet.
@@ -7362,6 +7418,72 @@ fn a_folded_write_opens_whole_and_shuts_again() {
     assert!(panel.card_closed(TOOL_ID), "{WRITE_SHUTS_MSG}");
 }
 
+const SETTLED_TAIL_MSG: &str = "a command that has answered has no tail, so its window says where \
+    it sits and claims nothing about output still to come";
+const RUNNING_TAIL_MSG: &str = "while output can still arrive the window says which edge it is \
+    pinned to, so the words track the call rather than being gone";
+const WINDOWED_BODY_LINES: usize = 40;
+
+/// `following` and `paused` both promise more output. Once the call has
+/// answered the promise is false, and the counts are the only part still true.
+/// Checked at both edges because `paused · click to follow` lived at one of
+/// them and `following` at the other.
+#[test_case(0 ; "pinned at the tail")]
+#[test_case(CHILD_SCROLL_UP ; "scrolled up")]
+fn a_settled_window_says_nothing_about_a_tail(notches: i32) {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.tool_start(start(TOOL_ID, SHELL_TOOL_NAME));
+    panel.tool_done(long_done(TOOL_ID, WINDOWED_BODY_LINES));
+    rebuild(&mut panel);
+    let height = WINDOWED_BODY_LINES as u16 + 8;
+    let terminal = render(&mut panel, 80, height);
+    if notches != 0 {
+        let (column, row) = card_bar_rows(&terminal)[0];
+        assert!(panel.arm_card_at(column, row), "{ARM_MSG}");
+        panel.scroll_card_at(column, row, notches);
+    }
+
+    let shown = buffer_text(&render(&mut panel, 80, height));
+    assert!(shown.contains("above"), "{SETTLED_TAIL_MSG}: {shown}");
+    assert!(!shown.contains(FOLLOWING), "{SETTLED_TAIL_MSG}: {shown}");
+    assert!(!shown.contains(PAUSED), "{SETTLED_TAIL_MSG}: {shown}");
+}
+
+/// The same card while the command is still printing.
+#[test]
+fn a_running_window_still_says_which_edge_it_is_on() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.tool_start(start(TOOL_ID, SHELL_TOOL_NAME));
+    panel.tool_output(TOOL_ID, &numbered_body(WINDOWED_BODY_LINES));
+    rebuild(&mut panel);
+
+    let shown = buffer_text(&render(&mut panel, 80, WINDOWED_BODY_LINES as u16 + 8));
+    assert!(shown.contains(FOLLOWING), "{RUNNING_TAIL_MSG}: {shown}");
+}
+
+/// A child answers the same question its own card would, so it loses the words
+/// on the same terms.
+#[test]
+fn a_settled_child_says_nothing_about_a_tail_either() {
+    let mut panel = panel_with_tools(&[("t1", BATCH_TOOL)]);
+    let mut child = batch_child(SHELL_TOOL_NAME, "a");
+    child.output = Some(ToolOutput::Plain(numbered_body(WINDOWED_BODY_LINES).into()));
+    panel.tool_done(ToolDoneEvent {
+        tool: BATCH_TOOL.into(),
+        output: ToolOutput::Batch {
+            entries: vec![child],
+            text: String::new(),
+        },
+        ..done("t1")
+    });
+    render(&mut panel, 80, 24);
+
+    let text = seg_text(&panel, "t1");
+    assert!(text.contains("above"), "{SETTLED_TAIL_MSG}: {text:?}");
+    assert!(!text.contains(FOLLOWING), "{SETTLED_TAIL_MSG}: {text:?}");
+    assert!(!text.contains(PAUSED), "{SETTLED_TAIL_MSG}: {text:?}");
+}
+
 const SCROLLING_OFF: u32 = 0;
 const BUDGET_SHAPE_MSG: &str = "with scrolling off a shell body is abridged again: it keeps its \
     head, drops its tail, and offers the rest behind the notice";
@@ -7742,6 +7864,9 @@ fn scroll_footer_row(panel: &MessagesPanel, tool_id: &str) -> u16 {
 /// is paused. That footer sits just past the window on purpose: a press inside
 /// the window arms the scroller instead of clicking anything, so a footer
 /// counted as part of the window would strand the reader off the tail.
+///
+/// The command is left running, because a settled one has no tail to pause
+/// against and its footer says so by reporting only the counts.
 #[test]
 fn clicking_a_paused_windows_footer_follows_the_tail_again() {
     const FOLLOW_CLICK_MSG: &str =
@@ -7750,7 +7875,7 @@ fn clicking_a_paused_windows_footer_follows_the_tail_again() {
 
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     panel.tool_start(start(TOOL_ID, SHELL_TOOL_NAME));
-    panel.tool_done(long_done(TOOL_ID, PAUSED_BODY_LINES));
+    panel.tool_output(TOOL_ID, &numbered_body(PAUSED_BODY_LINES));
     rebuild(&mut panel);
     let height = PAUSED_BODY_LINES as u16 + 8;
     let area = Rect::new(0, 0, 80, height);

@@ -8,7 +8,7 @@ use crate::provenance::LineProvenance;
 use crate::theme;
 
 use super::tool_display::{
-    batch_sigil_style, compact_args_for, compact_sigil_label, header_spans, names_tool,
+    ScrollTail, batch_sigil_style, compact_args_for, compact_sigil_label, header_spans, names_tool,
     scroll_footer_text,
 };
 use super::{ToolProgress, is_collapsible, workflow_card};
@@ -1024,7 +1024,15 @@ fn child_body(
         }
     };
     match text {
-        Some(lines) => with_script(entry, highlight, limits, child_view(lines, limits)),
+        Some(lines) => {
+            // A child that has answered has no tail left to chase, so its
+            // footer is told to report where the window sits and nothing more.
+            let tail = match entry.output.is_none() {
+                true => ScrollTail::Live,
+                false => ScrollTail::Settled,
+            };
+            with_script(entry, highlight, limits, child_view(lines, limits, tail))
+        }
         None => {
             let content =
                 render_tool_content(entry.input.as_ref(), output, highlight, limits.clone());
@@ -1089,6 +1097,7 @@ fn with_script(
 fn child_view(
     lines: Vec<Line<'static>>,
     limits: &RenderLimits,
+    tail: ScrollTail,
 ) -> (Vec<Line<'static>>, bool, Option<ScrollSpan>) {
     let Some(window) = limits.scroll else {
         let (lines, truncation) = capped(lines, limits.budget);
@@ -1104,7 +1113,7 @@ fn child_view(
         total,
         offset: start,
     };
-    let Some(footer) = scroll_footer_text(start, total - end, false) else {
+    let Some(footer) = scroll_footer_text(start, total - end, tail) else {
         return (shown, false, None);
     };
     shown.push(Line::from(Span::styled(footer, theme::current().tool_dim)));

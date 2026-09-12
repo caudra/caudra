@@ -2490,9 +2490,7 @@ impl MessagesPanel {
         let shell_toggle = segment
             .shell_toggle_line
             .is_some_and(|line| segment.source_line_at(rel, width) == Some(line));
-        let batch_row = segment
-            .row_target_at(rel, width)
-            .and_then(|_| segment.source_line_at(rel, width));
+        let batch_row = segment.control_line_at(rel, width);
         if !native_toggle && !shell_toggle && batch_row.is_none() && !known_task_target {
             return None;
         }
