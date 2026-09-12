@@ -233,6 +233,23 @@ impl<T: PickerItem> State<T> {
         self.ensure_visible();
     }
 
+    fn select_first(&mut self) {
+        if self.filtered.is_empty() {
+            return;
+        }
+        self.selected = 0;
+        self.ensure_visible();
+    }
+
+    fn select_last(&mut self) {
+        let len = self.filtered.len();
+        if len == 0 {
+            return;
+        }
+        self.selected = len - 1;
+        self.ensure_visible();
+    }
+
     fn move_down(&mut self) {
         let len = self.filtered.len();
         if len == 0 {
@@ -590,6 +607,14 @@ impl<T: PickerItem> ListPicker<T> {
             }
             KeyCode::PageDown => {
                 s.page_down();
+                PickerAction::Consumed
+            }
+            KeyCode::Home => {
+                s.select_first();
+                PickerAction::Consumed
+            }
+            KeyCode::End => {
+                s.select_last();
                 PickerAction::Consumed
             }
             KeyCode::Enter => {
@@ -1101,6 +1126,7 @@ mod tests {
     const SECTION_A: &str = "A";
     const SECTION_B: &str = "B";
     const BAR_LOST_THE_PRESS: &str = "the row under the scrollbar took the press";
+    const QUERY_UNTOUCHED: &str = "the navigation key edited the filter line";
     /// More items than the 80x24 test terminal can show, so the bar has a
     /// track to press on.
     const OVERFLOWING_ITEMS: usize = 50;
@@ -1253,6 +1279,38 @@ mod tests {
         for _ in 0..5 {
             p.handle_key(key(KeyCode::PageUp));
         }
+        assert_eq!(ready_state(&p).selected, 0);
+    }
+
+    /// The list owns the navigation keys, so the query they used to edit has
+    /// to come back untouched.
+    #[test_case(KeyCode::Home, 0  ; "home_selects_first")]
+    #[test_case(KeyCode::End,  49 ; "end_selects_last")]
+    fn home_and_end_reach_the_ends_of_the_list(code: KeyCode, expected: usize) {
+        let items: Vec<Entry> = (0..50).map(|i| Entry::new(&format!("Item {i}"))).collect();
+        let mut p = ListPicker::new();
+        p.open(items, " Test ");
+        let s = ready_state_mut(&mut p);
+        s.viewport_height = 10;
+        s.selected = 25;
+        p.handle_key(key(KeyCode::Char('I')));
+
+        p.handle_key(key(code));
+
+        let s = ready_state(&p);
+        assert_eq!(s.selected, expected);
+        assert_eq!(s.search.value(), "I", "{QUERY_UNTOUCHED}");
+    }
+
+    #[test]
+    fn home_and_end_on_an_empty_list_do_nothing() {
+        let mut p = ListPicker::new();
+        p.open(entries(&["A"]), " Test ");
+        p.handle_key(key(KeyCode::Char('z')));
+        assert!(ready_state(&p).filtered.is_empty());
+
+        p.handle_key(key(KeyCode::Home));
+        p.handle_key(key(KeyCode::End));
         assert_eq!(ready_state(&p).selected, 0);
     }
 

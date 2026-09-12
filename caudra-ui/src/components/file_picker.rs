@@ -189,12 +189,16 @@ impl FilePickerModal {
             }
             KeyCode::Up => move_selection(s, -1),
             KeyCode::Down => move_selection(s, 1),
-            _ if key::SCROLL_HALF_UP.matches(key) => {
+            _ if key::SCROLL_HALF_UP.matches(key) || key::PAGE_UP.matches(key) => {
                 move_selection(s, -((s.viewport_height / 2).max(1) as isize))
             }
             _ if key::PAGE_DOWN.matches(key) => {
                 move_selection(s, (s.viewport_height / 2).max(1) as isize)
             }
+            // A whole list's worth of steps lands on the end it was aimed at,
+            // because `move_selection` clamps.
+            _ if key::DOC_TOP.matches(key) => move_selection(s, -(s.matches.len() as isize)),
+            _ if key::DOC_BOTTOM.matches(key) => move_selection(s, s.matches.len() as isize),
             _ if key::SCROLL_LINE_UP.matches(key) => move_selection(s, -1),
             _ if key::SCROLL_LINE_DOWN.matches(key) => move_selection(s, 1),
             // Everything the list itself does not claim edits the search
@@ -594,6 +598,7 @@ mod tests {
     const NEVER_CLOSED: &str = "picker never closed on an empty walk";
 
     const BAR_LOST_THE_PRESS: &str = "the row under the scrollbar took the press";
+    const QUERY_UNTOUCHED: &str = "the navigation key edited the search line";
     /// More matches than the 80x24 test terminal can show, so the bar has a
     /// track to press on.
     const OVERFLOWING_MATCHES: usize = 50;
@@ -960,6 +965,25 @@ mod tests {
         s.selected = start;
         move_selection(s, delta);
         assert_eq!(s.selected, expected);
+    }
+
+    /// The four navigation keys belong to the list, not to the search line
+    /// they used to edit.
+    #[test_case(KeyCode::Home,     25, 0  ; "home_selects_first")]
+    #[test_case(KeyCode::End,      25, 49 ; "end_selects_last")]
+    #[test_case(KeyCode::PageUp,   25, 20 ; "page_up_retreats_a_half_page")]
+    #[test_case(KeyCode::PageDown, 25, 30 ; "page_down_advances_a_half_page")]
+    fn navigation_keys_move_the_match_list(code: KeyCode, start: usize, expected: usize) {
+        let mut picker = picker_with_matches(50);
+        let s = picker.session.as_mut().unwrap();
+        s.viewport_height = 10;
+        s.selected = start;
+
+        picker.handle_key(key(code));
+
+        let s = picker.session.as_ref().unwrap();
+        assert_eq!(s.selected, expected);
+        assert!(s.search.value().is_empty(), "{QUERY_UNTOUCHED}");
     }
 
     #[test]

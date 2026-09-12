@@ -118,6 +118,7 @@ Holding `Alt` while turning the wheel scrolls four times as far. A middle-click 
 | `Esc` | Close |
 | `Type` | Filter |
 | `PageUp` / `PageDown` | Scroll page up / down |
+| `Home` / `End` | First / last item |
 | `Ctrl+U` | Scroll page up |
 
 ## Workbench

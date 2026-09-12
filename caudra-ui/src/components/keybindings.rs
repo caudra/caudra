@@ -899,6 +899,12 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::All,
     },
     Keybind {
+        label: KeyLabel::Alt(key::DOC_TOP.label, key::DOC_BOTTOM.label),
+        description: "First / last item",
+        context: KeybindContext::Picker,
+        platform: Platform::All,
+    },
+    Keybind {
         label: KeyLabel::Single(key::SCROLL_HALF_UP.label),
         description: "Scroll page up",
         context: KeybindContext::Picker,

@@ -155,6 +155,22 @@ impl SearchModal {
                 self.move_down();
                 SearchAction::Navigate
             }
+            KeyCode::PageUp => {
+                self.page(-1);
+                SearchAction::Navigate
+            }
+            KeyCode::PageDown => {
+                self.page(1);
+                SearchAction::Navigate
+            }
+            KeyCode::Home => {
+                self.select(0);
+                SearchAction::Navigate
+            }
+            KeyCode::End => {
+                self.select(self.matches.len().saturating_sub(1));
+                SearchAction::Navigate
+            }
             _ => {
                 if key::DELETE_WORD.matches(key) {
                     self.search.remove_word_before_cursor();
@@ -239,6 +255,22 @@ impl SearchModal {
             self.selected = (self.selected + 1) % self.matches.len();
             self.ensure_visible();
         }
+    }
+
+    /// Clamps where the arrows wrap: a page is a jump rather than a step, so
+    /// running off one end and reappearing at the other reads as a mistake.
+    fn page(&mut self, direction: isize) {
+        let step = self.viewport_height.max(1) as isize;
+        let target = (self.selected as isize + direction * step).max(0);
+        self.select(target as usize);
+    }
+
+    fn select(&mut self, index: usize) {
+        if self.matches.is_empty() {
+            return;
+        }
+        self.selected = index.min(self.matches.len() - 1);
+        self.ensure_visible();
     }
 
     fn ensure_visible(&mut self) {
@@ -465,6 +497,8 @@ mod tests {
     use test_case::test_case;
 
     const BAR_LOST_THE_PRESS: &str = "the row under the scrollbar took the press";
+    const QUERY_UNTOUCHED: &str = "the navigation key edited the query line";
+    const EXPECT_NAVIGATE: &str = "moving the selection has to re-sync the transcript highlight";
     /// More matches than the 80x24 test terminal can show, so the bar has a
     /// track to press on.
     const OVERFLOWING_MATCHES: usize = 50;
@@ -538,6 +572,29 @@ mod tests {
 
         modal.handle_key(key_event(KeyCode::Up));
         assert_eq!(modal.selected, 2);
+    }
+
+    /// A page is a jump, so it clamps where the arrows wrap, and all four
+    /// navigation keys belong to the result list rather than to the query.
+    #[test_case(KeyCode::Home,     0  ; "home_selects_first")]
+    #[test_case(KeyCode::End,      19 ; "end_selects_last")]
+    #[test_case(KeyCode::PageUp,   5  ; "page_up_retreats_a_page")]
+    #[test_case(KeyCode::PageDown, 15 ; "page_down_advances_a_page")]
+    fn navigation_keys_move_the_result_list(code: KeyCode, expected: usize) {
+        let texts: Vec<String> = (0..20).map(|i| format!("item {i}")).collect();
+        let borrowed: Vec<&str> = texts.iter().map(String::as_str).collect();
+        let mut modal = modal_with_query("item", &borrowed);
+        modal.viewport_height = 5;
+        modal.selected = 10;
+
+        let action = modal.handle_key(key_event(code));
+
+        assert!(
+            matches!(action, SearchAction::Navigate),
+            "{EXPECT_NAVIGATE}"
+        );
+        assert_eq!(modal.selected, expected);
+        assert_eq!(modal.search.value(), "item", "{QUERY_UNTOUCHED}");
     }
 
     #[test]

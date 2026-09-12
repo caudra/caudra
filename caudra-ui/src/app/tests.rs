@@ -114,6 +114,9 @@ const TITLE_TEXT: &str = "Sqlite ledger work";
 const GENERATED_TITLE: &str = "Named on demand";
 const PICKER_MISSED_IT: &str = "the picker lists stored sessions from this workspace";
 const PICKER_KEPT_IT: &str = "a session erased from the store must leave the list with it";
+const PICKER_NEEDS_ROWS: &str = "the list has to be longer than one row for an end to exist";
+/// Stored sessions beyond the one this process has open.
+const PICKER_ROWS: usize = 3;
 const TITLE_CONTEXT_SIZE: u32 = 1234;
 const TASK_ID: &str = "task1";
 pub(crate) const RESEARCH_NAME: &str = "research";
@@ -9629,6 +9632,27 @@ fn deleting_a_stored_session_drops_it_from_the_open_picker() {
     assert_eq!(app.refresh_session_picker(), Dirty::YES, "{OWED}");
     assert!(!app.session_picker.ids().contains(&id), "{PICKER_KEPT_IT}");
     assert_eq!(app.refresh_session_picker(), Dirty::NO, "{QUIET}");
+}
+
+/// Home and End used to reach the picker's filter line, because the transcript
+/// binds hand every key to the open overlay and the overlay passed on what its
+/// list did not name. This walks the whole chain, not just the list.
+#[test]
+fn the_navigation_keys_reach_an_open_picker_list() {
+    let (_temp, storage, _writer, mut app) = tempdir_app();
+    for _ in 0..PICKER_ROWS {
+        let mut stored = AppSession::new(&app.state.session.model, &app.state.session.cwd);
+        stored.save(&storage).unwrap();
+    }
+    app.sessions_browse();
+    let last = app.session_picker.ids().len() - 1;
+    assert!(last > 0, "{PICKER_NEEDS_ROWS}");
+
+    app.update(Msg::Key(key(KeyCode::End)));
+    assert_eq!(app.session_picker.selected_index(), Some(last));
+
+    app.update(Msg::Key(key(KeyCode::Home)));
+    assert_eq!(app.session_picker.selected_index(), Some(0));
 }
 
 #[test]

@@ -265,6 +265,11 @@ impl SessionPicker {
         self.picker.selected_item().map(|item| item.id)
     }
 
+    #[cfg(test)]
+    pub fn selected_index(&self) -> Option<usize> {
+        self.picker.selected_index()
+    }
+
     fn start_rename(&mut self) -> SessionPickerAction {
         let Some(item) = self.picker.selected_item() else {
             return SessionPickerAction::Consumed;
