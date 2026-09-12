@@ -28,6 +28,25 @@ pub const SCROLLBAR_THUMB_HORIZONTAL: &str = "▄";
 /// The thumb while it is held. A terminal cannot change the cursor over a
 /// widget, so the thumb has to say for itself that it has been grabbed.
 pub const SCROLLBAR_THUMB_GRABBED: &str = "█";
+/// The step arrows at the ends of a horizontal bar. Solid, to match the thumbs
+/// they flank.
+pub const SCROLLBAR_STEP_BACK: &str = "◀";
+pub const SCROLLBAR_STEP_FORWARD: &str = "▶";
+/// How wide each step zone is. A tap is the only gesture some terminals can
+/// report at all, so the zone is several cells rather than the one it paints.
+const STEP_CELLS: u16 = 3;
+/// How thick a step zone is without touch. Unlike the seek track, which only
+/// widens for a finger, an arrow is always worth a second row: a terminal
+/// driven by touch over SSH cannot be detected, and two corners of an otherwise
+/// inert row is a far smaller claim than a margin the width of the bar.
+const STEP_HIT_ROWS: u16 = 2;
+/// What is left for the track once both arrows are taken. Arrows never take
+/// more than half a row: a seek track shorter than the zones flanking it is a
+/// bar that has become mostly buttons, and a short bar keeps them off entirely.
+const MIN_TRACK_CELLS: u16 = 2 * STEP_CELLS;
+/// A tap on an arrow covers this fraction of a viewport, which is the page step
+/// every other scrollbar takes.
+const STEP_DIVISOR: u32 = 2;
 /// A fine drag covers this fraction of the distance a plain one would. A short
 /// track over a long document is hundreds of lines per row, and landing on a
 /// particular one is otherwise a matter of luck.
@@ -157,6 +176,43 @@ fn hit_area(area: Rect, touch: bool, axis: Axis) -> Rect {
     strip(area, axis, thickness)
 }
 
+/// Splits a horizontal bar's row into a step zone at each end and the seek
+/// track between them. A vertical bar gets none: the wheel every terminal
+/// reports already steps it, and the arrows are there for the one direction
+/// some terminals cannot report at all. A row too short to spare six cells
+/// keeps the whole row and stays a plain track.
+fn split_steps(area: Rect, touch: bool, axis: Axis) -> (Rect, Option<(Rect, Rect)>) {
+    if axis != Axis::Horizontal || area.width < 2 * STEP_CELLS + MIN_TRACK_CELLS {
+        return (area, None);
+    }
+    let thickness = match touch {
+        true => TOUCH_HIT_CELLS,
+        false => STEP_HIT_ROWS,
+    };
+    let zones = strip(area, axis, thickness.min(axis.across(area)));
+    let track = Rect {
+        x: area.x + STEP_CELLS,
+        width: area.width - 2 * STEP_CELLS,
+        ..area
+    };
+    let back = Rect {
+        width: STEP_CELLS,
+        ..zones
+    };
+    let forward = Rect {
+        x: zones.right() - STEP_CELLS,
+        width: STEP_CELLS,
+        ..zones
+    };
+    (track, Some((back, forward)))
+}
+
+/// The one cell a step zone paints: its middle, on the bar's own row, which is
+/// the last row of a zone that reaches up to meet a fingertip.
+fn arrow_cell(zone: Rect) -> (u16, u16) {
+    (zone.x + zone.width / 2, zone.bottom() - 1)
+}
+
 /// Rounds to nearest rather than truncating, so the thumb sits where the eye
 /// expects it at both ends of the track.
 fn round_div(numerator: u64, denominator: u64) -> u64 {
@@ -252,7 +308,13 @@ pub struct ScrollTrack {
     /// touch. Kept beside the paint rather than recomputed, so hit-testing and
     /// rendering cannot drift apart.
     hit: Rect,
+    /// The step zones flanking the track, when the bar is wide enough to wear
+    /// them. Outside `area`, so the thumb never shares a cell with an arrow.
+    steps: Option<(Rect, Rect)>,
     total: u32,
+    /// How much content is on screen, which the arrows make shorter than the
+    /// track: they take cells from the bar without hiding anything.
+    viewport: u32,
     position: u32,
 }
 
@@ -269,16 +331,19 @@ impl ScrollTrack {
     /// The same, along the last row of what it is handed. A caller that wants a
     /// touch margin above the paint hands over more than one row.
     fn place(axis: Axis, area: Rect, total: u32, position: u32) -> Option<Self> {
-        let along = u32::from(axis.along(area));
-        if axis.across(area) == 0 || along == 0 || total <= along {
+        let viewport = u32::from(axis.along(area));
+        if axis.across(area) == 0 || viewport == 0 || total <= viewport {
             return None;
         }
+        let (track, steps) = split_steps(area, touch(), axis);
         Some(Self {
             axis,
-            area: strip(area, axis, 1),
-            hit: hit_area(area, touch(), axis),
+            area: strip(track, axis, 1),
+            hit: hit_area(track, touch(), axis),
+            steps,
             total,
-            position: position.min(total - along),
+            viewport,
+            position: position.min(total - viewport),
         })
     }
 
@@ -291,16 +356,23 @@ impl ScrollTrack {
     }
 
     pub fn max_scroll(&self) -> u32 {
-        self.total - u32::from(self.axis.along(self.area))
+        self.total - self.viewport
     }
 
-    /// The thumb's offset into the track and its length, both in cells.
+    /// The thumb's offset into the track and its length, both in cells. Length
+    /// is the share of the document on screen; offset maps the position onto
+    /// the cells the thumb has left. With no arrows the track is the viewport
+    /// and both reduce to the ratio against `total`.
     fn span(&self) -> (u32, u32) {
         let track = u64::from(self.axis.along(self.area));
-        let total = u64::from(self.total);
-        let length = round_div(track * track, total).clamp(1, track);
+        let length =
+            round_div(track * u64::from(self.viewport), u64::from(self.total)).clamp(1, track);
         let travel = track - length;
-        let start = round_div(u64::from(self.position) * track, total).min(travel);
+        let start = round_div(
+            u64::from(self.position) * travel,
+            u64::from(self.max_scroll()),
+        )
+        .min(travel);
         (start as u32, length as u32)
     }
 
@@ -318,6 +390,21 @@ impl ScrollTrack {
 
     pub fn contains(&self, at: Position) -> bool {
         self.hit.contains(at)
+    }
+
+    /// Where a tap on one of the arrows lands, or `None` when the press is on
+    /// neither. A page rather than a line: a bar exists only once the content
+    /// overflows, and walking a wide table back a column at a time is no
+    /// better than not reaching it.
+    pub fn step_at(&self, at: Position) -> Option<u32> {
+        let (back, forward) = self.steps?;
+        let page = (self.viewport / STEP_DIVISOR).max(1);
+        if back.contains(at) {
+            return Some(self.position.saturating_sub(page));
+        }
+        forward
+            .contains(at)
+            .then(|| (self.position + page).min(self.max_scroll()))
     }
 
     /// The ends of the document belong to the ends of the track by definition,
@@ -405,6 +492,31 @@ impl ScrollTrack {
                 cell.set_style(style);
             }
         }
+        self.render_steps(buf, style);
+    }
+
+    /// An arrow dims once its direction is spent, which is the only way a bar
+    /// that takes taps can say a tap would do nothing.
+    fn render_steps(&self, buf: &mut Buffer, style: Style) {
+        let Some((back, forward)) = self.steps else {
+            return;
+        };
+        for (zone, symbol, spent) in [
+            (back, SCROLLBAR_STEP_BACK, self.position == 0),
+            (
+                forward,
+                SCROLLBAR_STEP_FORWARD,
+                self.position >= self.max_scroll(),
+            ),
+        ] {
+            if let Some(cell) = buf.cell_mut(arrow_cell(zone)) {
+                cell.set_symbol(symbol);
+                cell.set_style(match spent {
+                    true => style.add_modifier(Modifier::DIM),
+                    false => style,
+                });
+            }
+        }
     }
 }
 
@@ -471,6 +583,14 @@ impl Scrollbar {
         };
         let at = Position::new(event.column, event.row);
         let along = self.axis.pointer(event);
+        // A step is a discrete action, so it leaves no grab behind: the release
+        // that follows falls through, which every surface drawing a bar already
+        // ignores.
+        if matches!(event.kind, MouseEventKind::Down(MouseButton::Left))
+            && let Some(offset) = track.step_at(at)
+        {
+            return ScrollbarMouse::ScrollTo(offset);
+        }
         match event.kind {
             MouseEventKind::Moved => {
                 self.hovered = track.contains(at);
@@ -587,6 +707,11 @@ mod tests {
     const WRONG_PAINT: &str = "the bar painted a different strip than it was placed on";
     const AXES_DISAGREE: &str = "the two axes measured the same content differently";
     const WRONG_HINT: &str = "a bar with no room beside it painted a hint anyway";
+    const WRONG_STEP: &str = "the arrow moved the document somewhere else";
+    /// Five times [`PANE`]'s width, so a page is a round number of columns.
+    const PANNED_TOTAL: u32 = 100;
+    const PAGE: u32 = PANE.width as u32 / STEP_DIVISOR;
+    const PANNED_MAX: u32 = PANNED_TOTAL - PANE.width as u32;
 
     fn track(total: u32, position: u32) -> ScrollTrack {
         placed(Axis::Vertical, total, position)
@@ -865,5 +990,136 @@ mod tests {
             .map(|x| buf[(x, PANE.bottom() - 1)].symbol())
             .collect();
         assert!(!text.contains(LINE_HINT), "{WRONG_HINT}");
+    }
+
+    fn panned(position: u32) -> ScrollTrack {
+        ScrollTrack::place(Axis::Horizontal, PANE, PANNED_TOTAL, position).expect("overflow")
+    }
+
+    /// The middle of a step zone, which is also the cell its arrow is painted on.
+    fn tap(zone: Rect) -> Position {
+        let (x, y) = arrow_cell(zone);
+        Position::new(x, y)
+    }
+
+    fn zones(track: &ScrollTrack) -> (Rect, Rect) {
+        track.steps.expect("a bar wide enough to wear arrows")
+    }
+
+    /// Half a viewport, not half a track: the arrows take cells from the bar
+    /// without hiding any content, so a page is still what is on screen.
+    #[test_case(0, PAGE ; "forward from the start")]
+    #[test_case(PAGE, 2 * PAGE ; "forward again from there")]
+    fn a_tap_on_an_arrow_moves_by_half_a_viewport(from: u32, expected: u32) {
+        let track = panned(from);
+        let (back, forward) = zones(&track);
+
+        assert_eq!(track.step_at(tap(forward)), Some(expected), "{WRONG_STEP}");
+        assert_eq!(
+            track.step_at(tap(back)),
+            Some(from.saturating_sub(PAGE)),
+            "{WRONG_STEP}"
+        );
+    }
+
+    #[test_case(0, true ; "back from the start stays there")]
+    #[test_case(PANNED_MAX, false ; "forward from the end stays there")]
+    fn a_step_never_leaves_the_document(from: u32, backwards: bool) {
+        let track = panned(from);
+        let (back, forward) = zones(&track);
+        let zone = match backwards {
+            true => back,
+            false => forward,
+        };
+
+        assert_eq!(track.step_at(tap(zone)), Some(from), "{WRONG_STEP}");
+    }
+
+    /// The arrows sit outside the track, so the thumb never shares a cell with
+    /// one and a tap on an arrow is a step rather than a seek.
+    #[test]
+    fn the_seek_track_stops_short_of_the_arrows() {
+        let track = panned(0);
+        let (back, forward) = zones(&track);
+
+        assert_eq!(
+            (track.area.x, track.area.right()),
+            (back.right(), forward.x),
+            "{WRONG_PAINT}"
+        );
+        assert!(!track.contains(tap(back)), "{WRONG_HIT}");
+        assert!(!track.contains(tap(forward)), "{WRONG_HIT}");
+    }
+
+    /// The thumb's length is the share of the document on screen, which the
+    /// arrows leave alone: measuring it against the shortened track instead
+    /// would report less content than the reader can see.
+    #[test]
+    fn a_thumb_measures_the_viewport_not_the_shortened_track() {
+        let track = panned(0);
+        let along = u32::from(track.axis.along(track.area));
+
+        assert_eq!(along, PANE.width as u32 - 2 * STEP_CELLS as u32, "{WRONG_PAINT}");
+        assert_eq!(track.max_scroll(), PANNED_MAX, "{WRONG_THUMB}");
+        assert_eq!(
+            u32::from(track.thumb().1),
+            round_div(u64::from(along) * u64::from(PANE.width), PANNED_TOTAL as u64) as u32,
+            "{WRONG_THUMB}"
+        );
+    }
+
+    #[test]
+    fn a_thumb_still_reaches_the_end_of_a_shortened_track() {
+        let track = panned(PANNED_MAX);
+        let (start, length) = track.thumb();
+
+        assert_eq!(start + length, track.axis.end(track.area), "{WRONG_THUMB}");
+    }
+
+    /// A finger's margin is measured across the bar either way. Unlike the seek
+    /// track an arrow keeps a second row without touch, because a terminal
+    /// driven by touch over SSH reports nothing that would reveal it.
+    #[test_case(false, STEP_HIT_ROWS ; "a pointer still gets two rows")]
+    #[test_case(true, TOUCH_HIT_CELLS ; "a finger gets the full margin")]
+    fn an_arrow_reaches_up_off_its_row(touch: bool, height: u16) {
+        let (_, steps) = split_steps(PANE, touch, Axis::Horizontal);
+        let (back, forward) = steps.expect("a bar wide enough to wear arrows");
+
+        for zone in [back, forward] {
+            assert_eq!(
+                (zone.bottom(), zone.height, zone.width),
+                (PANE.bottom(), height, STEP_CELLS),
+                "{WRONG_HIT}"
+            );
+        }
+    }
+
+    /// Arrows never take more than half a row, and a vertical bar gets none at
+    /// all: the wheel every terminal reports already steps it.
+    #[test_case(Axis::Horizontal, Rect { width: 2 * STEP_CELLS + MIN_TRACK_CELLS - 1, ..H_BAR } ; "a row too short to spare them")]
+    #[test_case(Axis::Vertical, PANE ; "a vertical bar")]
+    fn a_bar_without_room_keeps_its_whole_track(axis: Axis, area: Rect) {
+        let (track, steps) = split_steps(area, false, axis);
+
+        assert_eq!(track, area, "{WRONG_PAINT}");
+        assert!(steps.is_none(), "{WRONG_PAINT}");
+    }
+
+    /// The arrows are the affordance, so they have to be visible, and a spent
+    /// one has to say so: a tap that would do nothing is otherwise silent.
+    #[test_case(0, SCROLLBAR_STEP_BACK ; "back is spent at the start")]
+    #[test_case(PANNED_MAX, SCROLLBAR_STEP_FORWARD ; "forward is spent at the end")]
+    fn a_spent_arrow_is_painted_dim(position: u32, spent: &str) {
+        let track = panned(position);
+        let mut buf = Buffer::empty(PANE);
+
+        track.render(&mut buf, Style::default(), ThumbState::Idle);
+
+        let (back, forward) = zones(&track);
+        for zone in [back, forward] {
+            let (x, y) = arrow_cell(zone);
+            let dim = buf[(x, y)].style().add_modifier.contains(Modifier::DIM);
+            assert_eq!(dim, buf[(x, y)].symbol() == spent, "{WRONG_PAINT}");
+        }
     }
 }

@@ -21,6 +21,8 @@ Anywhere a scrollbar is shown it can be dragged. Press the thumb and the surface
 
 A modal whose lines run wider than the screen wears a second bar along its bottom border, and drags the same way. `Shift+Left` and `Shift+Right` move it by a column of a table at a time, and a sideways wheel over the modal moves it too. The bar appears only while there is something off the edge to reach.
 
+That bar carries an arrow at each end, and pressing one moves half a screen; an arrow dims once its direction is spent. The arrows are the way across on a phone: Android terminals send no sideways wheel at all, so a swipe that way reports nothing, and a tap is the only gesture left. They are deliberately easy to hit, so a press just above one still counts.
+
 Holding `Alt` while turning the wheel scrolls four times as far. A middle-click anchors the view and scrolls it on its own, faster the further you then move the pointer from the mark, until you middle-click again or touch anything else. `ui.scrollbar` set to `false` hides the bars and with them the drag.
 
 ## General

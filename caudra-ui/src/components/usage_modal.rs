@@ -752,7 +752,7 @@ mod tests {
     use crate::components::{buffer_text, test_model};
     use crate::repaint::expect::{OWED, QUIET};
     use caudra_providers::UsageLimit;
-    use caudra_workbench::scroll::SCROLLBAR_THUMB_HORIZONTAL;
+    use caudra_workbench::scroll::{SCROLLBAR_STEP_FORWARD, SCROLLBAR_THUMB_HORIZONTAL};
     use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
     use std::sync::Arc;
     use test_case::test_case;
@@ -799,12 +799,26 @@ mod tests {
     /// More presses than `PAN_STEP` needs to cross those 25 columns; panning
     /// clamps, so overshooting is the point.
     const PANS_TO_THE_END: usize = 8;
+    /// A tap covers half a viewport, so a couple reach the end of any table this
+    /// modal draws and the rest are absorbed by the clamp.
+    const TAPS_TO_THE_END: usize = 4;
     const RELOAD_HINT: &str = "Ctrl+R reload";
     const COST_UNREACHABLE: &str = "panning must bring the cost column into view";
     const HINT_MISPLACED: &str = "the hint must share the title row, not the bar's row";
     const BAR_UNWANTED: &str = "a table that fits must not wear a pan bar";
     const BAR_MISSING: &str = "a table running off the edge must show what reaches it";
     const TOUCH_MARGIN: &str = "only a finger may press the rows beside the bar";
+
+    /// Where the arrow was painted, read back from the frame so the tap aims at
+    /// what the reader sees rather than at a second copy of the layout.
+    fn arrow_column(rendered: &str, arrow: &str) -> u16 {
+        let arrow = arrow.chars().next().expect("an arrow glyph");
+        let cell = rendered
+            .chars()
+            .position(|symbol| symbol == arrow)
+            .expect("the pan bar painted its arrow");
+        (cell % NARROW_TERMINAL as usize) as u16
+    }
 
     fn slice(label: &str, cost: f64) -> UsageSlice {
         UsageSlice {
@@ -1464,11 +1478,13 @@ mod tests {
         let mut modal = UsageModal::new();
         modal.toggle();
         let breakdown = wide_breakdown();
-        render_at(&mut modal, NARROW_TERMINAL, &breakdown);
-
+        let clipped = render_at(&mut modal, NARROW_TERMINAL, &breakdown);
         modal.handle_mouse(&MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
-            column: modal.popup.right() - 2,
+            // The last cell of the seek track, which the arrow beside it keeps
+            // out of: pressing an end of the track is what reaches an end of
+            // the document.
+            column: arrow_column(&clipped, SCROLLBAR_STEP_FORWARD) - 2,
             row: modal.popup.bottom() - 2,
             modifiers: KeyModifiers::NONE,
         });
@@ -1476,6 +1492,36 @@ mod tests {
         let reached = render_at(&mut modal, NARROW_TERMINAL, &breakdown).contains(RECORDED_TEXT);
         caudra_workbench::scroll::set_touch(false);
         assert_eq!(reached, panned, "{TOUCH_MARGIN}");
+    }
+
+    /// The reported defect: Termux emits no horizontal wheel code at all, so a
+    /// sideways swipe sends nothing and a tap is the only gesture left. It also
+    /// cannot be detected through SSH, so the arrow has to be reachable with
+    /// touch off — including from the row above the one it is painted on, which
+    /// is the whole reason a step zone is two rows tall.
+    #[test_case(0 ; "on the arrow itself")]
+    #[test_case(1 ; "on the row above it")]
+    fn a_tap_on_the_pan_arrow_steps_the_table(rows_up: u16) {
+        let mut modal = UsageModal::new();
+        modal.toggle();
+        let breakdown = wide_breakdown();
+        let clipped = render_at(&mut modal, NARROW_TERMINAL, &breakdown);
+        assert!(!clipped.contains(RECORDED_TEXT), "{COST_UNREACHABLE}");
+        let arrow = arrow_column(&clipped, SCROLLBAR_STEP_FORWARD);
+
+        for _ in 0..TAPS_TO_THE_END {
+            modal.handle_mouse(&MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: arrow,
+                row: modal.popup.bottom() - 1 - rows_up,
+                modifiers: KeyModifiers::NONE,
+            });
+        }
+
+        assert!(
+            render_at(&mut modal, NARROW_TERMINAL, &breakdown).contains(RECORDED_TEXT),
+            "{COST_UNREACHABLE}"
+        );
     }
 
     /// A press on the bar seeks, the same way the vertical one does.

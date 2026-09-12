@@ -108,6 +108,14 @@ fn write_focus(out: &mut String) {
          while there is something off the edge to reach.\n\n",
     );
     out.push_str(
+        "That bar carries an arrow at each end, and pressing one moves half \
+         a screen; an arrow dims once its direction is spent. The arrows \
+         are the way across on a phone: Android terminals send no sideways \
+         wheel at all, so a swipe that way reports nothing, and a tap is \
+         the only gesture left. They are deliberately easy to hit, so a \
+         press just above one still counts.\n\n",
+    );
+    out.push_str(
         "Holding `Alt` while turning the wheel scrolls four times as far. \
          A middle-click anchors the view and scrolls it on its own, faster \
          the further you then move the pointer from the mark, until you \
