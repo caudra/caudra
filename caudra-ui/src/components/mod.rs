@@ -253,6 +253,18 @@ pub(crate) fn hint_hits<K: AsRef<str>, V: AsRef<str>>(pairs: &[(K, V)], area: Re
     hits
 }
 
+/// The area a modal's horizontal bar is handed: its body plus the border row
+/// under it. The bar paints on the last row alone, so it costs the body
+/// nothing, and the rows it is handed over that are what a fingertip's hit
+/// margin is taken from. Handing over the border row by itself paints the same
+/// bar and leaves touch with a one-row target it cannot hit.
+pub(crate) fn bar_area(body: Rect) -> Rect {
+    Rect {
+        height: body.height.saturating_add(1),
+        ..body
+    }
+}
+
 /// Where each logical line starts once wrapping has been applied, so a hit
 /// rect can be placed on a line the reader sees rather than the one it was
 /// written as.

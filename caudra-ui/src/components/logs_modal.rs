@@ -24,7 +24,8 @@ use crate::components::keybindings::key;
 use crate::components::modal::Modal;
 use crate::components::scrollbar::{Scrollbar, ScrollbarMouse};
 use crate::components::{
-    Overlay, escape_terminal_controls, hint_line, hover_style, input_line_with_cursor, is_ctrl,
+    Overlay, bar_area, escape_terminal_controls, hint_line, hover_style, input_line_with_cursor,
+    is_ctrl,
 };
 use crate::repaint::{Cadence, Dirty};
 use crate::selection::wrap_breaks;
@@ -517,15 +518,19 @@ impl LogsModal {
                 return LogsAction::Consumed;
             }
         }
-        match self.pan_bar.handle(&event) {
-            ScrollbarMouse::Ignored => {}
-            ScrollbarMouse::Consumed => return LogsAction::Consumed,
-            ScrollbarMouse::ScrollTo(column) => {
-                self.pan = (column as usize).min(self.max_pan);
-                return LogsAction::Consumed;
+        let pos = Position::new(event.column, event.row);
+        // Under touch the bar's hit margin reaches up off its border row and over
+        // the footer, so the level chip is asked first for the cells it drew on.
+        if !self.level_hit.contains(pos) {
+            match self.pan_bar.handle(&event) {
+                ScrollbarMouse::Ignored => {}
+                ScrollbarMouse::Consumed => return LogsAction::Consumed,
+                ScrollbarMouse::ScrollTo(column) => {
+                    self.pan = (column as usize).min(self.max_pan);
+                    return LogsAction::Consumed;
+                }
             }
         }
-        let pos = Position::new(event.column, event.row);
         match event.kind {
             MouseEventKind::ScrollUp => self.scroll_view(-1),
             MouseEventKind::ScrollDown => self.scroll_view(1),
@@ -618,20 +623,16 @@ impl LogsModal {
             len,
             offset,
         );
-        // The bottom border row, the same place every panning modal puts it. A
-        // wrapped pane has nothing off screen, so it reports no width to pan.
+        // The bottom border row, the same place every panning modal puts it, and
+        // the rows over it for a fingertip to aim at. A wrapped pane has nothing
+        // off screen, so it reports no width to pan.
         let pannable = match self.wrap {
             true => 0,
             false => u16::try_from(widest).unwrap_or(u16::MAX),
         };
         self.pan_bar.draw(
             frame,
-            Rect {
-                x: inner.x,
-                y: popup.bottom().saturating_sub(1),
-                width: inner.width,
-                height: 1,
-            },
+            bar_area(inner),
             pannable,
             u16::try_from(self.pan).unwrap_or(u16::MAX),
         );
@@ -1132,6 +1133,8 @@ pub(crate) fn max_files_or_default(configured: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use caudra_workbench::scroll::SCROLLBAR_THUMB_HORIZONTAL;
+
     use crate::components::{buffer_text, key};
     use crate::theme;
     use test_case::test_case;
@@ -1281,14 +1284,31 @@ mod tests {
     const OFF_CHIP: u16 = 250;
     const OFF_SCREEN: &str = "the cursor must stay on a visible row";
     const BAR_IGNORED: &str = "a press on the bar's column must scroll the pane";
+    const OVERFLOWING_MESSAGE: usize = 200;
+    const NO_PAN_BAR: &str = "the rows must run past the modal for the bar to exist";
+    const NO_CHIP: &str = "the footer must have drawn the chip for the press to land on";
+    const CHIP_LOST: &str = "the pan bar's touch margin swallowed the level chip";
 
     /// Seeds a log directory and opens against it, so the tests never touch the
     /// real one and never depend on what a previous run happened to write.
     fn seeded_modal(dir: &std::path::Path) -> LogsModal {
-        let lines: Vec<String> = (0..SEEDED)
-            .map(|i| {
+        seeded_with(dir, &(0..SEEDED).map(|i| format!("line-{i}")).collect::<Vec<_>>())
+    }
+
+    /// The same seed with a last record too wide for any modal, which is what
+    /// puts a pan bar on the row the level chip shares.
+    fn seeded_modal_overflowing(dir: &std::path::Path) -> LogsModal {
+        let mut messages: Vec<String> = (0..SEEDED).map(|i| format!("line-{i}")).collect();
+        messages.push("x".repeat(OVERFLOWING_MESSAGE));
+        seeded_with(dir, &messages)
+    }
+
+    fn seeded_with(dir: &std::path::Path, messages: &[String]) -> LogsModal {
+        let lines: Vec<String> = messages
+            .iter()
+            .map(|message| {
                 format!(
-                    r#"{{"timestamp":"2026-09-09T14:22:07.418123Z","level":"INFO","fields":{{"message":"line-{i}"}},"target":"caudra::agent"}}"#
+                    r#"{{"timestamp":"2026-09-09T14:22:07.418123Z","level":"INFO","fields":{{"message":"{message}"}},"target":"caudra::agent"}}"#
                 )
             })
             .collect();
@@ -1369,6 +1389,32 @@ mod tests {
         modal.handle_mouse(wheel(MouseEventKind::Down(MouseButton::Left), 5, 9));
 
         assert_eq!(modal.filter.min_level, before.next());
+    }
+
+    /// The pan bar's touch margin reaches off its border row and over the footer
+    /// the chip is drawn on, so the two want the same cells. The chip is the
+    /// smaller target and the one the reader aimed at.
+    #[test]
+    fn a_touch_on_the_level_chip_cycles_it_rather_than_panning() {
+        caudra_workbench::scroll::set_touch(true);
+        let tmp = tempfile::tempdir().unwrap();
+        let mut modal = seeded_modal_overflowing(tmp.path());
+        let before = modal.filter.min_level;
+        let out = drawn(&mut modal);
+        assert!(out.contains(SCROLLBAR_THUMB_HORIZONTAL), "{NO_PAN_BAR}");
+        assert!(modal.level_hit.width > 0, "{NO_CHIP}");
+
+        modal.handle_mouse(wheel(
+            MouseEventKind::Down(MouseButton::Left),
+            modal.level_hit.x,
+            modal.level_hit.y,
+        ));
+
+        let level = modal.filter.min_level;
+        let pan = modal.pan;
+        caudra_workbench::scroll::set_touch(false);
+        assert_eq!(level, before.next(), "{CHIP_LOST}");
+        assert_eq!(pan, 0, "{CHIP_LOST}");
     }
 
     #[test]

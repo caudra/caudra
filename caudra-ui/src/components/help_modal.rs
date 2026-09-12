@@ -1,5 +1,5 @@
-use crate::components::ModalScroll;
 use crate::components::Overlay;
+use crate::components::{ModalScroll, bar_area};
 use crate::components::keybindings::{
     ALT_SEP, KEYBINDS, KeyLabel, KeybindContext, all_contexts, key,
 };
@@ -257,20 +257,12 @@ impl HelpModal {
         frame.render_widget(Paragraph::new(lines).scroll((scroll, pan)), inner);
 
         self.scrollbar.draw(frame, inner, total, scroll);
-        // The bottom border row: the only row the bar can have without taking one
-        // from the reference. Nothing is painted while the rows fit, because a
-        // track is only built for content that overflows.
-        self.pan_bar.draw(
-            frame,
-            Rect {
-                x: inner.x,
-                y: popup.bottom().saturating_sub(1),
-                width: inner.width,
-                height: 1,
-            },
-            content_w,
-            pan,
-        );
+        // Handed the reference and its bottom border: the bar paints on the last
+        // row, which is the only row it can have without taking one from the
+        // reference, and a fingertip's hit margin comes out of the rows over it.
+        // Nothing is painted while the rows fit, because a track is only built
+        // for content that overflows.
+        self.pan_bar.draw(frame, bar_area(inner), content_w, pan);
 
         self.popup = popup;
         popup

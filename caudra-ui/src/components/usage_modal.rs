@@ -19,7 +19,7 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use crate::components::ModalScroll;
+use crate::components::{ModalScroll, bar_area};
 use crate::components::keybindings::{Bind, key};
 use crate::components::modal::Modal;
 use crate::components::scrollbar::{Scrollbar, ScrollbarMouse};
@@ -236,20 +236,12 @@ impl UsageModal {
         frame.render_widget(Paragraph::new(lines).scroll((scroll, pan)), inner);
 
         self.scrollbar.draw(frame, inner, total, scroll);
-        // The bottom border row: the only row the bar can have without taking one
-        // from the table. Nothing is painted while the table fits, because a
-        // track is only built for content that overflows.
-        self.pan_bar.draw(
-            frame,
-            Rect {
-                x: inner.x,
-                y: popup.bottom().saturating_sub(1),
-                width: inner.width,
-                height: 1,
-            },
-            content_w,
-            pan,
-        );
+        // Handed the table and its bottom border, the way the bar above is handed
+        // the whole body: it paints on the last row, which is the only row it can
+        // have without taking one from the table, and a fingertip gets its margin
+        // out of the rows over it. Nothing is painted while the table fits,
+        // because a track is only built for content that overflows.
+        self.pan_bar.draw(frame, bar_area(inner), content_w, pan);
 
         let hint = Line::from(vec![
             Span::raw(" "),
@@ -812,6 +804,7 @@ mod tests {
     const HINT_MISPLACED: &str = "the hint must share the title row, not the bar's row";
     const BAR_UNWANTED: &str = "a table that fits must not wear a pan bar";
     const BAR_MISSING: &str = "a table running off the edge must show what reaches it";
+    const TOUCH_MARGIN: &str = "only a finger may press the rows beside the bar";
 
     fn slice(label: &str, cost: f64) -> UsageSlice {
         UsageSlice {
@@ -1455,6 +1448,34 @@ mod tests {
 
         assert!(!wide.contains(SCROLLBAR_THUMB_HORIZONTAL), "{BAR_UNWANTED}");
         assert!(narrow.contains(SCROLLBAR_THUMB_HORIZONTAL), "{BAR_MISSING}");
+    }
+
+    /// A fingertip covers several rows and reports their centroid, so the one
+    /// border row the bar paints is unhittable by touch. The vertical bar is
+    /// handed the whole body and gets its margin out of it; the horizontal one
+    /// has to get the same margin out of the rows above the border.
+    ///
+    /// Touch also never reports a held drag, so this tap is the whole gesture:
+    /// if it misses, there is no pointer route to the clipped columns at all.
+    #[test_case(true,  true  ; "a finger reaches the row above the border")]
+    #[test_case(false, false ; "a pointer gets the painted row alone")]
+    fn the_pan_bar_takes_a_touch_beside_it(touch: bool, panned: bool) {
+        caudra_workbench::scroll::set_touch(touch);
+        let mut modal = UsageModal::new();
+        modal.toggle();
+        let breakdown = wide_breakdown();
+        render_at(&mut modal, NARROW_TERMINAL, &breakdown);
+
+        modal.handle_mouse(&MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: modal.popup.right() - 2,
+            row: modal.popup.bottom() - 2,
+            modifiers: KeyModifiers::NONE,
+        });
+
+        let reached = render_at(&mut modal, NARROW_TERMINAL, &breakdown).contains(RECORDED_TEXT);
+        caudra_workbench::scroll::set_touch(false);
+        assert_eq!(reached, panned, "{TOUCH_MARGIN}");
     }
 
     /// A press on the bar seeks, the same way the vertical one does.
