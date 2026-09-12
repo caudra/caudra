@@ -73,6 +73,7 @@ use crate::components::status_bar::{StatusBar, StatusBarHit, StatusBarHitTarget}
 use crate::components::storage_modal::{StorageFetchState, StorageModal};
 use crate::components::task_picker::TaskPicker;
 use crate::components::theme_picker::{ThemePicker, ThemePickerAction};
+use crate::components::thinking_picker::{ThinkingPicker, ThinkingPickerAction};
 use crate::components::todo_panel::TodoPanel;
 use crate::components::tools_modal::ToolsModal;
 use crate::components::usage_modal::{UsageFetchState, UsageModal, UsageScope};
@@ -288,6 +289,7 @@ pub struct App {
     pub(super) command_palette: CommandPalette,
     pub(super) command_modal: CommandModal,
     pub(super) theme_picker: ThemePicker,
+    pub(super) thinking_picker: ThinkingPicker,
     pub(super) prompt_profile_picker: PromptProfilePicker,
     pub(super) model_picker: ModelPicker,
     pub(super) login_picker: LoginPicker,
@@ -508,6 +510,7 @@ impl App {
             ),
             command_modal: CommandModal::new(),
             theme_picker: ThemePicker::new(),
+            thinking_picker: ThinkingPicker::new(),
             prompt_profile_picker: PromptProfilePicker::new(Arc::clone(&prompt_profiles)),
             model_picker: ModelPicker::new(available_models),
             login_picker: LoginPicker::new(),
@@ -966,6 +969,8 @@ impl App {
             None => ThinkingConfig::Effort((*first).into()),
         };
         self.apply_thinking(stepped);
+        self.thinking_picker
+            .flash(&self.state.model, &self.state.thinking);
         self.flash(format!("Reasoning effort: {}", self.state.thinking));
     }
 
@@ -1047,6 +1052,10 @@ impl App {
         match msg {
             Msg::Key(key) => {
                 self.autoscroll = None;
+                // Any key drops the reasoning preview. The cycle re-flashes it
+                // a moment later, so only the keys that did not ask for it lose
+                // it.
+                self.thinking_picker.clear_flash();
                 self.handle_key(key)
             }
             Msg::Paste(text) => {
@@ -1228,6 +1237,7 @@ impl App {
         try_picker!(self.review);
         try_picker!(self.model_picker);
         try_picker!(self.prompt_profile_picker);
+        try_picker!(self.thinking_picker);
         try_picker!(self.file_picker);
         try_picker!(self.permissions_picker);
         try_picker!(self.stash_picker);
@@ -1602,6 +1612,11 @@ impl App {
             return Some(self.handle_prompt_profile_picker_action(action));
         }
 
+        if self.thinking_picker.is_open() {
+            let action = self.thinking_picker.handle_key(key);
+            return Some(self.handle_thinking_picker_action(action));
+        }
+
         if self.model_picker.is_open() {
             let action = self.model_picker.handle_key(key);
             return Some(self.handle_model_picker_action(action));
@@ -1887,6 +1902,13 @@ impl App {
                 vec![Action::ChangeSystemPromptProfile(name)]
             }
         }
+    }
+
+    fn handle_thinking_picker_action(&mut self, action: ThinkingPickerAction) -> Vec<Action> {
+        if let ThinkingPickerAction::Select(thinking) = action {
+            self.apply_thinking(thinking);
+        }
+        Vec::new()
     }
 
     fn handle_login_picker_action(&mut self, action: LoginPickerAction) -> Vec<Action> {
@@ -4003,7 +4025,7 @@ impl App {
         self.subagent_input_box.set_cwd(cwd);
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 33] {
+    fn overlays(&self) -> [&dyn Overlay; 34] {
         [
             &self.workbench,
             &self.logs_modal,
@@ -4025,6 +4047,7 @@ impl App {
             &self.review,
             &self.command_modal,
             &self.theme_picker,
+            &self.thinking_picker,
             &self.prompt_profile_picker,
             &self.model_picker,
             &self.login_picker,
@@ -4041,7 +4064,7 @@ impl App {
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 33] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 34] {
         [
             &mut self.workbench,
             &mut self.logs_modal,
@@ -4063,6 +4086,7 @@ impl App {
             &mut self.review,
             &mut self.command_modal,
             &mut self.theme_picker,
+            &mut self.thinking_picker,
             &mut self.prompt_profile_picker,
             &mut self.model_picker,
             &mut self.login_picker,
@@ -4212,6 +4236,7 @@ impl App {
             | self.refresh_session_picker()
             | self.poll_workflow_replies()
             | self.tick_workbench()
+            | self.thinking_picker.tick()
             | Dirty::any(self.chats.iter_mut().map(Chat::tick))
     }
 
@@ -4476,6 +4501,7 @@ impl App {
         try_picker!(self.theme_picker);
         try_picker!(self.prompt_profile_picker);
         try_picker!(self.model_picker);
+        try_picker!(self.thinking_picker);
         try_picker!(self.mcp_picker);
         try_picker!(self.permissions_picker);
         try_picker!(self.stash_picker);

@@ -271,6 +271,14 @@ impl App {
             ) {
                 return actions;
             }
+        } else if self.thinking_picker.is_open() {
+            if let Some(actions) = self.route_overlay_mouse(
+                event,
+                |app, event| app.thinking_picker.handle_mouse(event),
+                |app, action| app.handle_thinking_picker_action(action),
+            ) {
+                return actions;
+            }
         } else if self.message_actions.is_open() {
             if let Some(actions) = self.route_overlay_mouse(
                 event,
@@ -932,7 +940,9 @@ impl App {
                 self.run_builtin(caudra_lua::BuiltinAction::ModelPicker)
             }
             StatusBarHitTarget::Thinking if self.state.model.supports_thinking() => {
-                self.cycle_reasoning_effort();
+                self.clear_control_hovers();
+                self.thinking_picker
+                    .open(&self.state.model, &self.state.thinking);
                 Vec::new()
             }
             StatusBarHitTarget::Goal => {
@@ -1064,6 +1074,7 @@ impl App {
         );
         dismiss!(self.model_picker);
         dismiss!(self.prompt_profile_picker);
+        dismiss!(self.thinking_picker);
         // Debounced onto the screen, so it can be open with nothing drawn for
         // it. A press cannot land outside an overlay that was never there.
         if self.file_picker.is_open() {

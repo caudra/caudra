@@ -43,6 +43,7 @@ pub(crate) mod storage_modal;
 pub(crate) mod streaming_content;
 pub(crate) mod task_picker;
 pub(crate) mod theme_picker;
+pub(crate) mod thinking_picker;
 pub(crate) mod todo_panel;
 pub(crate) mod tool_display;
 pub(crate) mod tools_modal;

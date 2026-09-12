@@ -2196,6 +2196,11 @@ const SIGMA_MISSING: &str = "the status bar must draw the session total";
 const SIGMA_BAR_WIDTH: u16 = 140;
 const THINKING_OFF: &str = "off";
 const THINKING_MINIMAL: &str = "minimal";
+const THINKING_TITLE: &str = crate::components::thinking_picker::TITLE;
+const THINKING_PICKER_SHUT: &str = "the thinking chip must open the picker";
+const THINKING_MOVED: &str = "opening the picker must not change the setting on its own";
+const FLASH_NOT_DRAWN: &str = "the cycle must flash the picker as feedback";
+const FLASH_STOLE_KEYS: &str = "a flashed preview must not answer to input";
 const COST_WAS_NOT_BILLED: &str = "the turn must bill something for the reset to prove anything";
 
 /// A new session opens on a clean bill. The total is never re-derived from the
@@ -4840,14 +4845,16 @@ fn a_clipped_chat_name_hovers_but_does_not_press() {
 }
 
 #[test]
-fn clicking_status_thinking_cycles_from_visible_off_state() {
+fn clicking_status_thinking_opens_the_picker_on_the_visible_off_state() {
     let mut app = test_app();
     let chip = thinking_chip(&mut app);
     assert!(chip.contains(THINKING_OFF), "{chip}");
 
     assert!(click_status(&mut app, StatusBarHitTarget::Thinking).is_empty());
 
-    assert_eq!(app.state.thinking, ThinkingConfig::Effort("minimal".into()));
+    assert!(app.thinking_picker.is_open(), "{THINKING_PICKER_SHUT}");
+    assert_eq!(app.thinking_picker.selected_label(), Some(THINKING_OFF));
+    assert_eq!(app.state.thinking, ThinkingConfig::Off, "{THINKING_MOVED}");
 }
 
 /// A focused task whose own turn has been billed, so the spend figure it owns
@@ -4939,8 +4946,11 @@ fn opening_the_goal_modal_clears_footer_hover() {
     assert_eq!(app.status_hover, None);
 }
 
+/// A model that cannot stop reasoning draws `minimal` while the setting still
+/// says `off`, so the picker has to open on what the chip shows rather than on
+/// a row it does not even offer.
 #[test]
-fn required_thinking_click_advances_from_effective_minimal() {
+fn required_thinking_click_opens_on_the_effective_minimal() {
     let mut app = test_app();
     app.state.model.thinking_override = Some(caudra_providers::ThinkingSupport::Required);
     app.state.thinking = ThinkingConfig::Off;
@@ -4949,7 +4959,8 @@ fn required_thinking_click_advances_from_effective_minimal() {
 
     click_status(&mut app, StatusBarHitTarget::Thinking);
 
-    assert_eq!(app.state.thinking, ThinkingConfig::Effort("low".into()));
+    assert!(app.thinking_picker.is_open(), "{THINKING_PICKER_SHUT}");
+    assert_eq!(app.thinking_picker.selected_label(), Some(THINKING_MINIMAL));
 }
 
 #[test]
@@ -12130,6 +12141,56 @@ fn both_thinking_keys_cycle_the_reasoning_effort(pressed: KeyEvent) {
     app.update(Msg::Key(pressed));
 
     assert_eq!(app.state.thinking, ThinkingConfig::Effort("minimal".into()));
+}
+
+/// The preview is the live feedback for the shortcut, so it has to draw without
+/// ever standing between the next keystroke and the cycle.
+#[test]
+fn cycling_flashes_the_picker_without_capturing_keys() {
+    let mut app = test_app();
+
+    app.update(Msg::Key(kb::THINKING.to_key_event()));
+    assert!(!app.thinking_picker.is_open(), "{FLASH_STOLE_KEYS}");
+    assert_eq!(app.thinking_picker.selected_label(), Some(THINKING_MINIMAL));
+    // The render is the point, and the one step no state assertion reaches:
+    // drawing the preview off `is_open` would leave every other assertion here
+    // passing against a blank screen.
+    assert!(
+        rendered(&mut app).contains(THINKING_TITLE),
+        "{FLASH_NOT_DRAWN}"
+    );
+
+    app.update(Msg::Key(kb::THINKING.to_key_event()));
+
+    assert_eq!(app.state.thinking, ThinkingConfig::Effort("low".into()));
+    assert!(
+        rendered(&mut app).contains(THINKING_TITLE),
+        "{FLASH_NOT_DRAWN}"
+    );
+}
+
+/// A preview that counted as a modal would blank the status-bar hover and
+/// swallow every click behind it for a second.
+#[test]
+fn a_flash_does_not_count_as_a_modal_overlay() {
+    let mut app = test_app();
+
+    app.update(Msg::Key(kb::THINKING.to_key_event()));
+
+    assert!(app.thinking_picker.is_visible(), "{FLASH_NOT_DRAWN}");
+    assert!(!app.any_overlay_open(), "{FLASH_STOLE_KEYS}");
+    assert!(!app.has_modal_overlay(), "{FLASH_STOLE_KEYS}");
+}
+
+#[test]
+fn any_other_key_dismisses_the_flash() {
+    let mut app = test_app();
+    app.update(Msg::Key(kb::THINKING.to_key_event()));
+    assert!(app.thinking_picker.is_visible(), "{FLASH_NOT_DRAWN}");
+
+    app.update(Msg::Key(key(KeyCode::Char('x'))));
+
+    assert!(!app.thinking_picker.is_visible(), "{FLASH_STOLE_KEYS}");
 }
 
 /// `Ctrl+T` used to toggle the plan panel, which answers to the chord now.

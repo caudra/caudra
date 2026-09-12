@@ -450,6 +450,12 @@ impl App {
         render_if_open!(self.theme_picker);
         render_if_open!(self.prompt_profile_picker);
         render_if_open!(self.model_picker);
+        // Not `render_if_open!`: a flashed preview draws without being open, and
+        // it claims no `overlay_rect` because it answers to nothing and must not
+        // suppress a selection under it.
+        if self.thinking_picker.is_visible() {
+            self.thinking_picker.view(frame, full);
+        }
         render_if_open!(self.login_picker);
         render_if_open!(self.mcp_picker);
         render_if_open!(self.permissions_picker);
@@ -785,7 +791,10 @@ impl App {
             contexts.push(KeybindContext::QueueFocus);
         } else if self.rewind_picker.is_open() {
             contexts.push(KeybindContext::RewindPicker);
-        } else if self.theme_picker.is_open() || self.prompt_profile_picker.is_open() {
+        } else if self.theme_picker.is_open()
+            || self.prompt_profile_picker.is_open()
+            || self.thinking_picker.is_open()
+        {
             contexts.push(KeybindContext::ThemePicker);
         } else if self.model_picker.is_open() {
             contexts.push(KeybindContext::ModelPicker);
