@@ -833,6 +833,61 @@ fn toggle_mode_state_machine() {
 }
 
 #[test]
+fn fresh_session_uses_local_plan_until_matching_tool_completion() {
+    const PLAN_NOT_LOCAL: &str = "a fresh plan must be allocated under local persistent storage";
+    const PLAN_NOT_FORWARDED: &str = "the agent plan path must be the one handed to the agent";
+    const PLAN_NOT_COMPLETED: &str = "a successful write to the plan path must complete the plan";
+
+    let (_temp, storage, _writer, mut app) = tempdir_app();
+    let plan_path = app
+        .state
+        .plan
+        .path()
+        .expect("fresh plan path")
+        .to_path_buf();
+
+    assert_eq!(app.state.mode, Mode::Plan);
+    assert_eq!(
+        app.state.plan,
+        PlanState::Drafting(plan_path.clone()),
+        "{PLAN_NOT_LOCAL}"
+    );
+    assert!(
+        plan_path.starts_with(storage.persistent_path()),
+        "{PLAN_NOT_LOCAL}"
+    );
+    assert!(!plan_path.exists());
+    assert!(
+        matches!(app.agent_mode(), AgentMode::Plan(ref path) if path == &plan_path),
+        "{PLAN_NOT_FORWARDED}"
+    );
+
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
+        id: "plan-write".into(),
+        tool: "file_write".into(),
+        output: ToolOutput::Plain("wrote plan".into()),
+        is_error: false,
+        annotation: None,
+        written_path: None,
+        written_paths: vec![plan_path.to_string_lossy().into_owned()],
+        output_ref: None,
+        output_limits: None,
+        model_suffix: None,
+        model_output: None,
+        model_output_from_ref: false,
+    }))));
+
+    assert_eq!(
+        app.state.plan,
+        PlanState::Ready(plan_path),
+        "{PLAN_NOT_COMPLETED}"
+    );
+    assert!(app.plan_form.is_visible(), "{PLAN_NOT_COMPLETED}");
+}
+
+#[test]
 fn the_model_chord_opens_the_model_picker() {
     let mut app = test_app();
 
@@ -2634,11 +2689,11 @@ fn turn_complete_accumulates_usage_by_model() {
 
     let by_model = app.state.session.usage_by_model();
     assert_eq!(by_model.len(), 2);
-    let main = &by_model["main-model"];
+    let main = &by_model[&format!("{TEST_PROVIDER}/main-model")];
     assert_eq!(main.input, 100);
     assert_eq!(main.output, 50);
     assert_eq!(main.cache_read, 10);
-    let sub = &by_model["sub-model"];
+    let sub = &by_model[&format!("{TEST_PROVIDER}/sub-model")];
     assert_eq!(sub.input, 200);
     assert_eq!(sub.output, 75);
 }
@@ -7481,17 +7536,10 @@ fn an_unusable_title_still_records_what_it_cost() {
     assert_eq!(rows[0].cost, GOAL_COST, "{TITLE_SPEND_IS_RECORDED}");
 }
 
-#[test_case("anthropic", "claude-haiku", "claude-haiku" ; "own_provider_reads_bare")]
-#[test_case("openrouter", "vendor/model", "openrouter/vendor/model" ; "foreign_provider_stays_qualified")]
-fn the_session_usage_key_names_a_foreign_provider_only(
-    provider: &str,
-    model: &str,
-    expected: &str,
-) {
-    assert_eq!(
-        session_usage_model(provider, model, TEST_PROVIDER),
-        expected
-    );
+#[test_case("anthropic", "claude-haiku", "anthropic/claude-haiku" ; "own_provider_is_still_named")]
+#[test_case("openrouter", "vendor/model", "openrouter/vendor/model" ; "a_nested_model_id_gains_one_prefix")]
+fn the_session_usage_key_always_names_its_provider(provider: &str, model: &str, expected: &str) {
+    assert_eq!(session_usage_model(provider, model), expected);
 }
 
 #[test]
@@ -10537,7 +10585,7 @@ fn btw_usage_settles_into_the_session_ledger() {
         Some(BTW_COST),
         "the status bar renders the focused chat's cost, not the session total"
     );
-    let billed = &app.state.session.usage_by_model()[BTW_MODEL];
+    let billed = &app.state.session.usage_by_model()[&format!("{TEST_PROVIDER}/{BTW_MODEL}")];
     assert_eq!(billed.input, 100);
     assert_eq!(billed.cost, Some(BTW_COST));
     assert_eq!(

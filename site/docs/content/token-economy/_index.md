@@ -78,6 +78,16 @@ more context and mistakes        one bounded result
 
 Each turn is priced when it happens and that number is stored with the session. Prices move (DeepSeek, for one, doubles every rate during peak UTC hours), so a total re-priced later would be a guess. What you see is what you were billed.
 
+## Cache hit rate
+
+Cached prompt tokens cost a fraction of fresh ones, so the share of your prompt that the provider served from cache is the clearest signal of whether context reuse is working.
+
+`/usage` scores it in a `hit` column: `cache_read / (input + cache_creation + cache_read)`. The denominator is every prompt token the turn sent. Writing a cache counts against the rate, because those tokens were sent in full. The miss rate is the remainder, so a 92% hit means 8% missed. Output tokens are never cacheable and stay out of the arithmetic.
+
+A rate of `—` means the provider reported no prompt tokens for that row, which is different from a hit rate of zero. Some providers report no cache counters at all, and their rows read as pure misses.
+
+Both scopes of `/usage` score each model and, once two providers served the work, each provider. `caudra storage usage` prints the same column, and `--json` carries it as `cache_hit_rate`.
+
 ## Spend on a subscription
 
 A Claude, ChatGPT, or Copilot login pays a flat monthly fee, so its turns never reach an invoice. Caudra still prices them at the provider's published API rates and files the figure separately, labelled `subscription (not billed)`. That is what the same work would have cost through the API.
@@ -90,7 +100,7 @@ Turns recorded before Caudra tracked the two apart are filed as billed spend, so
 
 Deleting a session deletes its transcript. The record of what it cost lives in a separate ledger that no session owns, so trimming and forgetting leave your spending history intact.
 
-Press `g` in `/usage` to switch from this session to everything ever recorded: totals, the models and projects that cost the most, and a month by month breakdown. Press `g` again to go back.
+Press `g` in `/usage` to switch from this session to everything ever recorded: totals, the providers, models, and projects that cost the most, and a month by month breakdown. Press `g` again to go back.
 
 From the shell:
 

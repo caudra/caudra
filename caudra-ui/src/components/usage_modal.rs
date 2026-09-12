@@ -5,7 +5,8 @@ use arc_swap::ArcSwapOption;
 
 use caudra_config::ClockFormat;
 use caudra_providers::{
-    Model, ModelSpend, ProviderUsage, TokenUsage, format_tokens, format_tokens_u64, model_cost,
+    Billing, Model, ModelSpend, ProviderUsage, TokenUsage, add_cost, format_hit_rate,
+    format_tokens, format_tokens_u64, model_cost,
 };
 use caudra_storage::sessions::StoredTokenUsage;
 use caudra_storage::usage_ledger::{LifetimeUsage, UsageSlice};
@@ -40,6 +41,9 @@ pub(crate) const SCOPE_KEY: Bind = Bind {
 const PREFIX: &str = "  ";
 const MODEL_COL_MIN: usize = 16;
 const NUM_COL: usize = 7;
+/// Wide enough for `100%`, and for the dash that says a provider reported no
+/// prompt tokens to score.
+const RATE_COL: usize = 4;
 const COL_GAP: usize = 2;
 const NO_USAGE_ENDPOINT: &str = "no usage endpoint for this provider";
 /// What a subscription figure is: the API list price for the same tokens, with
@@ -194,7 +198,7 @@ impl UsageModal {
                 UsageScope::Session => TITLE,
                 UsageScope::Lifetime => LIFETIME_TITLE,
             },
-            width_percent: 60,
+            width_percent: 70,
             max_height_percent: 70,
         };
         let (popup, inner) = modal.render(frame, area, total);
@@ -239,7 +243,6 @@ fn build_lines(
     theme: &crate::theme::Theme,
 ) -> Vec<Line<'static>> {
     let mut lines: Vec<Line> = Vec::new();
-    let fg = Style::new().fg(theme.foreground);
 
     lines.push(Line::from(Span::styled(
         format!("{PREFIX}Session total"),
@@ -262,35 +265,118 @@ fn build_lines(
         return lines;
     }
 
-    let mut entries: Vec<(&String, &StoredTokenUsage)> = ctx.by_model.iter().collect();
-    entries.sort_by_key(|(_, u)| Reverse(u.total()));
+    let mut models = model_rows(ctx);
+    let providers = provider_rows(&models, &ctx.model.provider);
+    // One provider row would only restate the session total, which already
+    // carries its own rate. The fold earns its lines once there are two.
+    if providers.len() > 1 {
+        lines.extend(breakdown_table("Per provider", &providers, theme));
+    }
+    for row in &mut models {
+        row.trim_provider(&ctx.model.provider);
+    }
+    lines.extend(breakdown_table("Per model", &models, theme));
 
-    let model_w = entries
+    lines
+}
+
+/// One line of a session breakdown, before it is laid out.
+struct BreakdownRow {
+    label: String,
+    usage: StoredTokenUsage,
+    spend: ModelSpend,
+}
+
+impl BreakdownRow {
+    /// Drops the prefix once it names the session's own provider, so the common
+    /// case reads as a bare model id. Presentation only, and run after the fold
+    /// that needs the slug.
+    fn trim_provider(&mut self, provider: &str) {
+        if let Some(model) = self.label.strip_prefix(&format!("{provider}/")) {
+            self.label = model.to_owned();
+        }
+    }
+}
+
+/// The session's models, dearest in tokens first, labelled by the
+/// `provider/model` spec they were recorded under.
+fn model_rows(ctx: &UsageModalContext) -> Vec<BreakdownRow> {
+    let mut entries: Vec<(&String, &StoredTokenUsage)> = ctx.by_model.iter().collect();
+    entries.sort_by_key(|(_, usage)| Reverse(usage.total()));
+    entries
+        .into_iter()
+        .map(|(id, usage)| BreakdownRow {
+            label: id.clone(),
+            usage: *usage,
+            spend: model_cost(id, usage, ctx.model, ctx.fast),
+        })
+        .collect()
+}
+
+/// The same spend folded by whoever served it. Built from the model rows rather
+/// than from the map, so a provider row is exactly the sum of the rows printed
+/// beneath it and the two tables cannot disagree. A slug is everything before
+/// the first slash, matching how a spec is parsed; `fallback` owns anything
+/// recorded before the keys named a provider.
+fn provider_rows(models: &[BreakdownRow], fallback: &str) -> Vec<BreakdownRow> {
+    let mut folded: Vec<BreakdownRow> = Vec::new();
+    for model in models {
+        let provider = model
+            .label
+            .split_once('/')
+            .map_or(fallback, |(slug, _)| slug);
+        match folded.iter_mut().find(|row| row.label == provider) {
+            Some(row) => {
+                row.usage += model.usage;
+                add_cost(&mut row.spend.usd, model.spend.usd);
+                // Any invoiced member makes the figure partly a bill, so the
+                // row must not wear the mark that says nobody was charged.
+                if !model.spend.billing.is_subscription() {
+                    row.spend.billing = Billing::Api;
+                }
+            }
+            None => folded.push(BreakdownRow {
+                label: provider.to_owned(),
+                usage: model.usage,
+                spend: model.spend,
+            }),
+        }
+    }
+    folded.sort_by_key(|row| Reverse(row.usage.total()));
+    folded
+}
+
+fn breakdown_table(
+    heading: &str,
+    rows: &[BreakdownRow],
+    theme: &crate::theme::Theme,
+) -> Vec<Line<'static>> {
+    let fg = Style::new().fg(theme.foreground);
+    let label_w = rows
         .iter()
-        .map(|(id, _)| id.chars().count())
+        .map(|row| row.label.chars().count())
         .max()
         .unwrap_or(0)
         .max(MODEL_COL_MIN);
 
-    lines.push(Line::default());
-    lines.push(Line::from(Span::styled(
-        format!("{PREFIX}Per model"),
-        theme.keybind_section,
-    )));
-    lines.push(Line::from(header_row(model_w, theme)));
-
-    for (id, usage) in entries {
-        let spend = model_cost(id, usage, ctx.model, ctx.fast);
-        lines.push(Line::from(model_row(
-            id,
-            usage,
-            spend,
-            model_w,
+    let mut lines = vec![
+        Line::default(),
+        Line::from(Span::styled(
+            format!("{PREFIX}{heading}"),
+            theme.keybind_section,
+        )),
+        Line::from(header_row(label_w, theme)),
+    ];
+    lines.extend(rows.iter().map(|row| {
+        Line::from(model_row(
+            &row.label,
+            &row.usage,
+            row.spend,
+            label_w,
             fg,
             theme.status_dim,
-        )));
-    }
-
+        ))
+    }));
     lines
 }
 
@@ -321,11 +407,12 @@ fn build_lifetime_lines(
             Span::raw(PREFIX),
             Span::styled(
                 format!(
-                    "in {:<7} out {:<7} cache {:<7} total {:<7} turns {:<7}",
+                    "in {:<7} out {:<7} cache {:<7} total {:<7} hit {:<4} turns {:<7}",
                     format_tokens_u64(lifetime.input),
                     format_tokens_u64(lifetime.output),
                     format_tokens_u64(lifetime.cache_read + lifetime.cache_creation),
                     format_tokens_u64(lifetime.total_tokens()),
+                    format_hit_rate(lifetime.cache_hit_rate()),
                     lifetime.turns(),
                 ),
                 fg,
@@ -361,13 +448,16 @@ fn build_lifetime_lines(
         )));
     }
 
-    for (heading, slices) in [
-        ("Per model", &lifetime.by_model),
-        ("Per project", &lifetime.by_project),
-        ("Per purpose", &lifetime.by_purpose),
-        ("Per month", &lifetime.by_month),
+    // A lone provider row only restates the all-time line above it, rate and
+    // all, so that fold alone has to earn its heading with a second row.
+    for (heading, slices, min_rows) in [
+        ("Per provider", &lifetime.by_provider, 2),
+        ("Per model", &lifetime.by_model, 1),
+        ("Per project", &lifetime.by_project, 1),
+        ("Per purpose", &lifetime.by_purpose, 1),
+        ("Per month", &lifetime.by_month, 1),
     ] {
-        if slices.is_empty() {
+        if slices.len() < min_rows {
             continue;
         }
         lines.push(Line::default());
@@ -396,6 +486,11 @@ fn slice_rows(slices: &[UsageSlice], fg: Style, dim: Style) -> Vec<Line<'static>
                 Span::styled(format!("{:<label_w$}", slice.label), fg),
                 Span::raw(" ".repeat(COL_GAP)),
                 Span::styled(format!("{:>NUM_COL$}", format_tokens_u64(slice.tokens)), fg),
+                Span::raw(" ".repeat(COL_GAP)),
+                Span::styled(
+                    format!("{:>RATE_COL$}", format_hit_rate(slice.cache_hit_rate())),
+                    fg,
+                ),
                 Span::raw(" ".repeat(COL_GAP)),
                 Span::styled(format!("{:>6}", slice.turns), dim),
                 Span::raw(" ".repeat(COL_GAP)),
@@ -438,12 +533,13 @@ fn totals_row(
         Span::raw(PREFIX),
         Span::styled(
             format!(
-                "in {:<7} out {:<7} cache read {:<7} cache write {:<7} total {:<7}",
+                "in {:<7} out {:<7} cache read {:<7} cache write {:<7} total {:<7} hit {:<4}",
                 format_tokens(total.input),
                 format_tokens(total.output),
                 format_tokens(total.cache_read),
                 format_tokens(total.cache_creation),
                 format_tokens(total.context_tokens()),
+                format_hit_rate(total.cache_hit_rate()),
             ),
             Style::new().fg(theme.foreground),
         ),
@@ -472,6 +568,8 @@ fn header_row(model_w: usize, theme: &crate::theme::Theme) -> Vec<Span<'static>>
         gap(),
         h("total"),
         gap(),
+        Span::styled(format!("{:>RATE_COL$}", "hit"), theme.status_dim),
+        gap(),
         Span::styled(format!("{:>6}", "cost"), theme.status_dim),
     ]
 }
@@ -497,6 +595,11 @@ fn model_row(
         num(usage.cache_read),
         gap(),
         num(usage.total()),
+        gap(),
+        Span::styled(
+            format!("{:>RATE_COL$}", format_hit_rate(usage.cache_hit_rate())),
+            fg,
+        ),
         gap(),
         match spend.usd {
             // One column, two meanings: the tilde is the only room there is to
@@ -638,14 +741,27 @@ mod tests {
         "an unpriced turn makes the total a floor, and the modal must say so";
     const CTRL_G_STILL_SCROLLS: &str =
         "Ctrl+g is scroll-to-top and must not reach the bare-g scope key";
+    const FOREIGN_PROVIDER: &str = "openrouter";
+    const PROVIDER_HEADING: &str = "Per provider";
+    /// 3M cached reads against 1M uncached input.
+    const WARM_RATE: &str = "75%";
+    const COLD_RATE: &str = "0%";
+    /// Two models of 1M input and 1M cached reads each, summed: the fold scores
+    /// 2M of 4M prompt tokens.
+    const FOLDED_TOKENS: &str = "4m";
+    const FOLDED_RATE: &str = "50%";
+    const UNKNOWN_IS_NOT_ZERO: &str =
+        "a provider that reported no prompt tokens has no rate, which is not a rate of zero";
 
     fn slice(label: &str, cost: f64) -> UsageSlice {
         UsageSlice {
             label: label.to_string(),
             cost,
-            subscription_cost: 0.0,
+            input: ONE_MILLION as u64 / 2,
+            cache_read: ONE_MILLION as u64 / 2,
             tokens: ONE_MILLION as u64,
             turns: 1,
+            ..UsageSlice::default()
         }
     }
 
@@ -743,6 +859,57 @@ mod tests {
     fn a_lifetime_view_without_numbers_explains_why(usage: Option<LifetimeUsage>, expected: &str) {
         let texts = lifetime_texts(usage.as_ref()).join("\n");
         assert!(texts.contains(expected), "{texts}");
+    }
+
+    /// The lifetime ledger knows the provider outright, so its fold obeys the
+    /// same rule as the session's: one row is the all-time line again.
+    #[test]
+    fn the_lifetime_view_folds_providers_once_there_are_two() {
+        let alone = LifetimeUsage {
+            by_provider: vec![slice(FOREIGN_PROVIDER, RECORDED_COST)],
+            ..lifetime()
+        };
+        assert!(
+            !lifetime_texts(Some(&alone))
+                .join("\n")
+                .contains(PROVIDER_HEADING),
+            "{PROVIDER_HEADING} restates the all-time line when only one provider ever ran"
+        );
+
+        let shared = LifetimeUsage {
+            by_provider: vec![
+                slice(FOREIGN_PROVIDER, RECORDED_COST),
+                slice(LIFETIME_MODEL, RECORDED_COST),
+            ],
+            ..lifetime()
+        };
+        let texts = lifetime_texts(Some(&shared)).join("\n");
+        assert!(texts.contains(PROVIDER_HEADING), "{texts}");
+        assert!(texts.contains(FOREIGN_PROVIDER), "{texts}");
+    }
+
+    /// Every slice carries its own counters now, so a breakdown row scores its
+    /// cache the same way the all-time line above it does.
+    #[test]
+    fn lifetime_rows_carry_a_cache_rate() {
+        let usage = LifetimeUsage {
+            input: ONE_MILLION as u64,
+            cache_read: ONE_MILLION as u64,
+            ..lifetime()
+        };
+        let texts = lifetime_texts(Some(&usage));
+
+        let all_time = texts
+            .iter()
+            .find(|text| text.contains("turns"))
+            .unwrap_or_else(|| panic!("no all-time line: {texts:?}"));
+        assert!(all_time.contains(FOLDED_RATE), "{all_time}");
+
+        let model = texts
+            .iter()
+            .find(|text| text.contains(LIFETIME_MODEL))
+            .unwrap_or_else(|| panic!("no model row: {texts:?}"));
+        assert!(model.contains(FOLDED_RATE), "{model}");
     }
 
     #[test]
@@ -929,6 +1096,117 @@ mod tests {
         let unknown_row = row(UNKNOWN_MODEL);
         assert!(unknown_row.contains(NO_COST_TEXT), "{unknown_row}");
         assert!(!unknown_row.contains(REPRICED_TEXT), "{unknown_row}");
+    }
+
+    fn cached(cache_read: u32, cache_creation: u32) -> StoredTokenUsage {
+        StoredTokenUsage {
+            input: ONE_MILLION,
+            cache_read,
+            cache_creation,
+            ..Default::default()
+        }
+    }
+
+    /// The rate is per row, so a warm model and a cold one are told apart even
+    /// though the session total averages them together.
+    #[test]
+    fn each_row_scores_its_own_cache() {
+        let model = test_model();
+        let by_model = HashMap::from([
+            (
+                format!("{}/warm", model.provider),
+                cached(3 * ONE_MILLION, 0),
+            ),
+            (format!("{}/cold", model.provider), cached(0, 0)),
+        ]);
+
+        let rows = modal_rows(&TokenUsage::default(), None, &by_model, &model);
+        let row = |id: &str| {
+            rows.iter()
+                .find(|text| text.contains(id))
+                .unwrap_or_else(|| panic!("no row for {id}: {rows:?}"))
+                .clone()
+        };
+
+        assert!(row("warm").contains(WARM_RATE), "{:?}", row("warm"));
+        assert!(row("cold").contains(COLD_RATE), "{:?}", row("cold"));
+    }
+
+    /// A provider that reports no prompt tokens at all has no rate to report,
+    /// which is not the same claim as a rate of zero.
+    #[test]
+    fn a_row_with_nothing_cacheable_reports_no_rate() {
+        let model = test_model();
+        let by_model = HashMap::from([(
+            format!("{}/output-only", model.provider),
+            StoredTokenUsage {
+                output: ONE_MILLION,
+                ..Default::default()
+            },
+        )]);
+
+        let rows = modal_rows(&TokenUsage::default(), None, &by_model, &model);
+        let row = rows
+            .iter()
+            .find(|text| text.contains("output-only"))
+            .unwrap_or_else(|| panic!("no row: {rows:?}"));
+        assert!(!row.contains(COLD_RATE), "{UNKNOWN_IS_NOT_ZERO}: {row}");
+    }
+
+    /// The prefix is noise while one provider serves everything, and the only
+    /// thing telling two rows apart once a second one does.
+    #[test]
+    fn a_model_row_drops_the_prefix_of_the_sessions_own_provider() {
+        let model = test_model();
+        let by_model = HashMap::from([
+            (format!("{}/{}", model.provider, model.id), stored(None)),
+            (format!("{FOREIGN_PROVIDER}/{UNKNOWN_MODEL}"), stored(None)),
+        ]);
+
+        let rows = modal_rows(&TokenUsage::default(), None, &by_model, &model).join("\n");
+
+        assert!(
+            !rows.contains(&format!("{}/{}", model.provider, model.id)),
+            "{rows}"
+        );
+        assert!(rows.contains(&model.id), "{rows}");
+        assert!(
+            rows.contains(&format!("{FOREIGN_PROVIDER}/{UNKNOWN_MODEL}")),
+            "{rows}"
+        );
+    }
+
+    /// A lone provider row would only repeat the session total, so the fold
+    /// shows up exactly when it has something to say, and sums its members.
+    #[test]
+    fn the_provider_fold_appears_once_a_second_provider_serves_the_session() {
+        let model = test_model();
+        let mut by_model = HashMap::from([
+            (format!("{}/one", model.provider), cached(ONE_MILLION, 0)),
+            (format!("{}/two", model.provider), cached(ONE_MILLION, 0)),
+        ]);
+
+        let alone = modal_rows(&TokenUsage::default(), None, &by_model, &model).join("\n");
+        assert!(!alone.contains(PROVIDER_HEADING), "{alone}");
+
+        by_model.insert(
+            format!("{FOREIGN_PROVIDER}/{UNKNOWN_MODEL}"),
+            cached(0, ONE_MILLION),
+        );
+        let shared = modal_rows(&TokenUsage::default(), None, &by_model, &model);
+        let heading = shared
+            .iter()
+            .position(|text| text.contains(PROVIDER_HEADING))
+            .unwrap_or_else(|| panic!("no provider fold: {shared:?}"));
+
+        // The fold scores the provider over both its models, not over whichever
+        // row it happened to see first.
+        let own = shared[heading..]
+            .iter()
+            .find(|text| text.contains(&*model.provider))
+            .unwrap_or_else(|| panic!("no row for the session's provider: {shared:?}"));
+        assert!(own.contains(FOLDED_TOKENS), "{own}");
+        assert!(own.contains(FOLDED_RATE), "{own}");
     }
 
     /// A subscription owes nothing, so folding its figure into the headline

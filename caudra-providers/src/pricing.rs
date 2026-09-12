@@ -151,8 +151,9 @@ pub fn settle_session(
     current: &Model,
     fast: bool,
 ) -> SessionSpend {
+    qualify_keys(by_model, &current.provider);
     if by_model.is_empty() && *total != TokenUsage::default() {
-        by_model.insert(current.id.clone(), total.billed(None, current.billing));
+        by_model.insert(current.spec(), total.billed(None, current.billing));
     }
     for (id, usage) in by_model.iter_mut() {
         let (billed, subscription) = model_cost(id, usage, current, fast).columns();
@@ -171,9 +172,29 @@ fn sum(costs: impl Iterator<Item = f64>) -> Option<f64> {
     costs.reduce(|total, cost| total + cost)
 }
 
+/// Puts the provider back in front of every key written before the breakdown
+/// named one. A bare key meant "whoever served this session", and `provider` is
+/// that, so the rewrite recovers exactly what the key already implied and
+/// nothing more. Runs on load, so the ambiguity is resolved once rather than
+/// guessed at by every reader.
+fn qualify_keys(by_model: &mut HashMap<String, StoredTokenUsage>, provider: &str) {
+    let bare: Vec<String> = by_model
+        .keys()
+        .filter(|id| !id.contains('/'))
+        .cloned()
+        .collect();
+    for id in bare {
+        let Some(usage) = by_model.remove(&id) else {
+            continue;
+        };
+        *by_model.entry(format!("{provider}/{id}")).or_default() += usage;
+    }
+}
+
 /// One model's slice of [`settle_session`], as `/usage` breaks it down per row.
-/// Usage is keyed by bare model id, so resolving it needs the session's
-/// provider put back in front.
+/// `id` is a `provider/model` spec once [`qualify_keys`] has run; a bare one
+/// from a caller that skipped settling still resolves, under the session's
+/// provider.
 ///
 /// A row written before Caudra recorded its payer is re-priced under `current`'s
 /// billing mode, the same borrowing that already lets today's rates stand in for
@@ -192,7 +213,7 @@ pub fn model_cost(id: &str, usage: &StoredTokenUsage, current: &Model, fast: boo
             billing: Billing::Subscription,
         };
     }
-    if id == current.id {
+    if id == current.id || id == current.spec() {
         return ModelSpend {
             usd: current.list_cost(&(*usage).into(), fast),
             billing,
@@ -239,6 +260,10 @@ mod tests {
     const FAST_LIST_PRICE: f64 = 12.0;
     /// A real spec, so the bare-id fallback runs against the real tables.
     const SCHEDULED_SPEC: &str = "deepseek/deepseek-v4-pro";
+    /// A provider whose model ids carry a slash of their own.
+    const NESTED_SPEC: &str = "openrouter/vendor/model";
+    const LEGACY_KEYS_QUALIFY: &str =
+        "a breakdown must settle into one row per provider and model, whenever it was written";
 
     fn utc(day: i64, hour: i64, minute: i64, second: i64) -> Timestamp {
         Timestamp::from_second(
@@ -395,6 +420,44 @@ mod tests {
         assert_eq!(
             settle_session(&total, &mut by_model, &current, false).billed,
             Some(LIST_PRICE + RECORDED)
+        );
+    }
+
+    /// Rows written before the breakdown named a provider are bare. Loading one
+    /// beside its qualified twin has to settle into a single row, not into two
+    /// halves of the same session.
+    #[test]
+    fn a_legacy_bare_key_merges_into_its_qualified_row() {
+        let current = model(CURRENT, INPUT_RATE);
+        let qualified = current.spec();
+        let mut by_model = HashMap::from([
+            (CURRENT.to_owned(), stored(Some(RECORDED))),
+            (qualified.clone(), stored(Some(RECORDED))),
+        ]);
+
+        let spend = settle_session(&TokenUsage::default(), &mut by_model, &current, false);
+
+        assert_eq!(
+            by_model.keys().collect::<Vec<_>>(),
+            [&qualified],
+            "{LEGACY_KEYS_QUALIFY}"
+        );
+        assert_eq!(spend.billed, Some(2.0 * RECORDED), "{LEGACY_KEYS_QUALIFY}");
+    }
+
+    /// A provider slug is everything before the first slash, so a model id that
+    /// contains one is already qualified and must not collect a second prefix.
+    #[test]
+    fn a_model_id_that_contains_a_slash_is_already_qualified() {
+        let current = model(CURRENT, INPUT_RATE);
+        let mut by_model = HashMap::from([(NESTED_SPEC.to_owned(), stored(Some(RECORDED)))]);
+
+        settle_session(&TokenUsage::default(), &mut by_model, &current, false);
+
+        assert_eq!(
+            by_model.keys().collect::<Vec<_>>(),
+            [NESTED_SPEC],
+            "{LEGACY_KEYS_QUALIFY}"
         );
     }
 

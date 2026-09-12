@@ -13,6 +13,9 @@ const CACHE_CAPACITY: usize = 4096;
 /// Marks a count as an estimate: o200k is exact only for OpenAI models.
 const TOKEN_ESTIMATE_MARKER: &str = "~";
 const TOKEN_SUFFIX: &str = " tokens";
+/// A rate with nothing to score, told apart from a rate of zero.
+const NO_RATE: &str = "—";
+const PERCENT: f64 = 100.0;
 
 static O200K: LazyLock<&'static CoreBPE> = LazyLock::new(tiktoken_rs::o200k_base_singleton);
 
@@ -75,11 +78,32 @@ pub fn format_tokens_u64(value: u64) -> String {
     format_tokens_wide(value)
 }
 
+/// Renders a cache hit rate for a table column. `None` is a provider that
+/// reported no prompt tokens to score, which every surface must show as
+/// unknown rather than as a 0% hit.
+pub fn format_hit_rate(rate: Option<f64>) -> String {
+    rate.map_or_else(
+        || NO_RATE.to_owned(),
+        |rate| format!("{:.0}%", rate * PERCENT),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use test_case::test_case;
 
-    use super::{CACHE_CAPACITY, estimate_tokens, estimate_tokens_cached, format_tokens_u64};
+    use super::{
+        CACHE_CAPACITY, NO_RATE, estimate_tokens, estimate_tokens_cached, format_hit_rate,
+        format_tokens_u64,
+    };
+
+    #[test_case(None, NO_RATE ; "nothing_to_score_is_not_a_zero_hit")]
+    #[test_case(Some(0.0), "0%" ; "a_real_zero_is_a_number")]
+    #[test_case(Some(0.925), "92%" ; "rounds_to_whole_percent")]
+    #[test_case(Some(1.0), "100%" ; "wholly_cached")]
+    fn hit_rates_tell_unknown_apart_from_zero(rate: Option<f64>, expected: &str) {
+        assert_eq!(format_hit_rate(rate), expected);
+    }
 
     #[test_case(u64::from(u32::MAX), "4295m" ; "largest_session_count")]
     #[test_case(u64::from(u32::MAX) + 1, "4295m" ; "past_session_count")]

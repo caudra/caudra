@@ -4330,7 +4330,7 @@ impl App {
         cost: Option<f64>,
         billing: Billing,
     ) {
-        let key = session_usage_model(provider, model, &self.state.model.provider);
+        let key = session_usage_model(provider, model);
         self.state
             .session_mut()
             .add_model_usage(&key, usage.billed(cost, billing));
@@ -4623,16 +4623,13 @@ impl App {
     }
 }
 
-/// The key `/usage` groups a session's spend under. Bare while the answer came
-/// from the conversation's own provider, so the common case reads as the model
-/// alone, and qualified once a workload resolves elsewhere, so two providers
-/// serving the same model id stay apart.
-fn session_usage_model(provider: &str, model: &str, current_provider: &str) -> String {
-    if provider == current_provider {
-        model.to_owned()
-    } else {
-        format!("{provider}/{model}")
-    }
+/// The key `/usage` groups a session's spend under: always the full spec, so a
+/// row names whoever served it even after the conversation moves to another
+/// provider, and two providers serving the same model id stay apart. The modal
+/// is what drops the prefix when it matches the session's own provider, so the
+/// common case still reads as the model alone.
+fn session_usage_model(provider: &str, model: &str) -> String {
+    format!("{provider}/{model}")
 }
 
 /// A chat's running spend, filed under whoever pays for it. Free of `&self` so

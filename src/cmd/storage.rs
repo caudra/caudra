@@ -8,7 +8,7 @@ use caudra_agent::snapshots::{SESSION_SNAPSHOTS_DIR, SnapshotStore, StoreEntry};
 use caudra_agent::tools::ToolRegistry;
 use caudra_config::{RetentionConfig, load_env_files};
 use caudra_lua::PluginHost;
-use caudra_providers::format_tokens_u64;
+use caudra_providers::{format_hit_rate, format_tokens_u64};
 use caudra_storage::StateDir;
 use caudra_storage::id::CaudraId;
 use caudra_storage::retention::{
@@ -17,7 +17,7 @@ use caudra_storage::retention::{
 use caudra_storage::sessions::sweep::{
     self, Action, ExecuteReport, OutcomeKind, Plan, PruneReport,
 };
-use caudra_storage::sessions::{SESSIONS_DB_FILE, SessionDatabase, UsageBucket};
+use caudra_storage::sessions::{SESSIONS_DB_FILE, SessionDatabase, UsageBucket, cache_hit_rate};
 use caudra_storage::usage_ledger::UsageLedger;
 use color_eyre::Result;
 use color_eyre::eyre::{Context, bail, eyre};
@@ -44,6 +44,7 @@ const EMPTY_POLICY: &str = "refusing to act on an empty policy; pass --keep-* ru
 const BYTE_UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
 const GROUP_WIDTH: usize = 34;
 const TOKEN_WIDTH: usize = 14;
+const RATE_WIDTH: usize = 5;
 const COST_WIDTH: usize = 12;
 const DAY_FORMAT: &str = "%Y-%m-%d";
 const MONTH_FORMAT: &str = "%Y-%m";
@@ -69,6 +70,9 @@ struct UsageRow {
     /// Turns that spent tokens on a model with no price, so `cost` understates
     /// by an unknown amount rather than by zero.
     unpriced_turns: u64,
+    /// Share of prompt tokens served from cache, or `None` when the group had
+    /// none to score. Derived, and filled once the fold is complete.
+    cache_hit_rate: Option<f64>,
 }
 
 #[derive(Serialize)]
@@ -690,6 +694,12 @@ fn group_usage(buckets: &[UsageBucket], group_by: UsageGrouping) -> Vec<UsageRow
         }
     }
     let mut rows: Vec<UsageRow> = grouped.into_values().collect();
+    for row in &mut rows {
+        row.cache_hit_rate = cache_hit_rate(
+            row.cache_read,
+            row.input + row.cache_creation + row.cache_read,
+        );
+    }
     // Both payers rank together, or a subscription-only ledger comes back in
     // alphabetical order with every row tied at zero.
     rows.sort_by(|a, b| {
@@ -744,18 +754,19 @@ fn render_usage(rows: &[UsageRow], group_by: UsageGrouping) -> String {
     };
     let _ = writeln!(
         out,
-        "{heading:GROUP_WIDTH$} {:>TOKEN_WIDTH$} {:>TOKEN_WIDTH$} {:>TOKEN_WIDTH$} {:>COST_WIDTH$} {:>8}",
-        "Input", "Output", "Cached", "Cost", "Turns"
+        "{heading:GROUP_WIDTH$} {:>TOKEN_WIDTH$} {:>TOKEN_WIDTH$} {:>TOKEN_WIDTH$} {:>RATE_WIDTH$} {:>COST_WIDTH$} {:>8}",
+        "Input", "Output", "Cached", "Hit", "Cost", "Turns"
     );
     let mut total = UsageRow::default();
     for row in rows {
         let _ = writeln!(
             out,
-            "{:GROUP_WIDTH$} {:>TOKEN_WIDTH$} {:>TOKEN_WIDTH$} {:>TOKEN_WIDTH$} {:>COST_WIDTH$} {:>8}",
+            "{:GROUP_WIDTH$} {:>TOKEN_WIDTH$} {:>TOKEN_WIDTH$} {:>TOKEN_WIDTH$} {:>RATE_WIDTH$} {:>COST_WIDTH$} {:>8}",
             truncate(&row.group, GROUP_WIDTH),
             format_tokens_u64(row.input),
             format_tokens_u64(row.output),
             format_tokens_u64(row.cache_read + row.cache_creation),
+            format_hit_rate(row.cache_hit_rate),
             // One column, so a row a plan covered says so with a tilde rather
             // than reporting zero next to real tokens.
             match (row.cost, row.subscription_cost) {
@@ -921,6 +932,11 @@ mod tests {
     const UNPRICED_VISIBLE: &str = "a total that cannot price some of its tokens must say so";
     const EPHEMERAL_COUNTED: &str = "ephemeral spend is real money and belongs in the total";
     const PURPOSE_IS_ANSWERABLE: &str = "a bill must be able to name what goals cost";
+    /// [`bucket`] reads 2 of its 13 prompt tokens from cache.
+    const BUCKET_HIT_TEXT: &str = "15%";
+    const NO_RATE_TEXT: &str = "—";
+    const UNKNOWN_IS_NOT_ZERO: &str =
+        "a group with no prompt tokens has no hit rate, which is not a hit rate of zero";
     const WORKSPACE_KEY: &str = "9a3913d670e736996dbc23f4de4fa88f02d249c5081e7cbeaec20d42bc85d002";
     const SESSION_START_MANIFEST: &str = "session-start.json";
 
@@ -1009,6 +1025,38 @@ mod tests {
         let rows = group_usage(&buckets, UsageGrouping::Model);
 
         assert_eq!(rows[0].group, "anthropic/dear");
+    }
+
+    /// The rate is folded from the group's own counters, so `--group-by
+    /// provider` scores a provider over every model it served.
+    #[test]
+    fn rows_score_the_cache_over_the_prompt_tokens_they_folded() {
+        let output_only = UsageBucket {
+            input: 0,
+            cache_creation: 0,
+            cache_read: 0,
+            ..bucket(0, "local", "llama", "/a", 0.0)
+        };
+        let rows = group_usage(
+            &[
+                bucket(0, "anthropic", "opus", "/a", 2.0),
+                bucket(HOUR, "anthropic", "haiku", "/a", 1.0),
+                output_only,
+            ],
+            UsageGrouping::Provider,
+        );
+
+        assert_eq!(rows[0].group, "anthropic");
+        assert_eq!(
+            rows[0].cache_hit_rate,
+            cache_hit_rate(4, 26),
+            "two buckets of 2 cached reads in 13 prompt tokens"
+        );
+        assert_eq!(rows[1].cache_hit_rate, None, "{UNKNOWN_IS_NOT_ZERO}");
+
+        let rendered = render_usage(&rows, UsageGrouping::Provider);
+        assert!(rendered.contains(BUCKET_HIT_TEXT), "{rendered}");
+        assert!(rendered.contains(NO_RATE_TEXT), "{UNKNOWN_IS_NOT_ZERO}");
     }
 
     #[test]

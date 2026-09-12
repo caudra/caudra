@@ -147,6 +147,20 @@ impl StoredTokenUsage {
     pub fn total(&self) -> u32 {
         self.total_input().saturating_add(self.output)
     }
+
+    /// Share of prompt tokens the provider served from its cache. `None` when
+    /// nothing was cacheable, so a provider that reports no cache counters
+    /// reads as unknown rather than as a perfect miss. A cache write is a miss:
+    /// it is a token that had to be sent.
+    pub fn cache_hit_rate(&self) -> Option<f64> {
+        cache_hit_rate(u64::from(self.cache_read), u64::from(self.total_input()))
+    }
+}
+
+/// The one definition of a cache hit rate, shared by the session breakdown, the
+/// lifetime ledger and the CLI so none of them can disagree.
+pub fn cache_hit_rate(cache_read: u64, prompt_tokens: u64) -> Option<f64> {
+    (prompt_tokens > 0).then(|| cache_read as f64 / prompt_tokens as f64)
 }
 
 impl std::ops::AddAssign for StoredTokenUsage {
@@ -1593,6 +1607,29 @@ mod tests {
             cost,
             ..Default::default()
         }
+    }
+
+    /// A cache write is a token that had to be sent, so it counts against the
+    /// rate; a provider that reports no prompt tokens at all reports no rate.
+    #[test_case(0, 0, 0, None ; "nothing_cacheable_has_no_rate")]
+    #[test_case(0, 0, 100, Some(1.0) ; "wholly_cached_is_a_full_hit")]
+    #[test_case(100, 0, 0, Some(0.0) ; "uncached_input_is_a_full_miss")]
+    #[test_case(0, 100, 100, Some(0.5) ; "a_cache_write_counts_as_a_miss")]
+    #[test_case(50, 50, 100, Some(0.5) ; "hits_over_every_prompt_token")]
+    fn cache_hit_rate_scores_prompt_tokens(
+        input: u32,
+        cache_creation: u32,
+        cache_read: u32,
+        expected: Option<f64>,
+    ) {
+        let usage = StoredTokenUsage {
+            input,
+            cache_creation,
+            cache_read,
+            output: 999,
+            ..Default::default()
+        };
+        assert_eq!(usage.cache_hit_rate(), expected);
     }
 
     /// An entry that never reported a price has to come back unpriced rather

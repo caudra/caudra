@@ -10,7 +10,7 @@ use std::sync::Arc;
 use caudra_config::ModelPolicy;
 pub use caudra_config::providers::ModelPurpose;
 use caudra_config::providers::UnknownPurpose;
-use caudra_storage::sessions::StoredTokenUsage;
+use caudra_storage::sessions::{StoredTokenUsage, cache_hit_rate};
 use caudra_storage::thinking::{ReasoningOption, ReasoningOptions};
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
@@ -951,6 +951,11 @@ impl TokenUsage {
 
     pub fn context_tokens(&self) -> u32 {
         self.total_input().saturating_add(self.output)
+    }
+
+    /// See [`caudra_storage::sessions::cache_hit_rate`].
+    pub fn cache_hit_rate(&self) -> Option<f64> {
+        cache_hit_rate(u64::from(self.cache_read), u64::from(self.total_input()))
     }
 
     pub fn format(&self, cost: Option<f64>) -> String {

@@ -17,7 +17,9 @@ use std::collections::BTreeMap;
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
 
-use crate::sessions::{LedgerEntry, SessionDatabase, SessionError, StoredTokenUsage, UsageBucket};
+use crate::sessions::{
+    LedgerEntry, SessionDatabase, SessionError, StoredTokenUsage, UsageBucket, cache_hit_rate,
+};
 use crate::{StateClass, StateDir, now_epoch};
 
 pub const BUCKET_SECONDS: u64 = 60 * 60;
@@ -138,12 +140,16 @@ impl UsageLedger {
     }
 }
 
-/// One line of a lifetime breakdown: a model, a project, a purpose, or a month.
-#[derive(Debug, Clone, PartialEq)]
+/// One line of a lifetime breakdown: a provider, a model, a project, a purpose,
+/// or a month.
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct UsageSlice {
     pub label: String,
     pub cost: f64,
     pub subscription_cost: f64,
+    pub input: u64,
+    pub cache_creation: u64,
+    pub cache_read: u64,
     pub tokens: u64,
     pub turns: u64,
 }
@@ -153,6 +159,16 @@ impl UsageSlice {
     /// spend alone would tie every row of a subscription-only ledger at zero.
     pub fn priced(&self) -> f64 {
         self.cost + self.subscription_cost
+    }
+
+    /// See [`crate::sessions::cache_hit_rate`]. `tokens` includes output, which
+    /// was never cacheable, so the denominator is rebuilt from the prompt
+    /// counters rather than taken from it.
+    pub fn cache_hit_rate(&self) -> Option<f64> {
+        cache_hit_rate(
+            self.cache_read,
+            self.input + self.cache_creation + self.cache_read,
+        )
     }
 }
 
@@ -179,6 +195,7 @@ pub struct LifetimeUsage {
     /// Start of the oldest bucket still recorded, so a total can say how far
     /// back it reaches.
     pub since: Option<i64>,
+    pub by_provider: Vec<UsageSlice>,
     pub by_model: Vec<UsageSlice>,
     pub by_project: Vec<UsageSlice>,
     pub by_purpose: Vec<UsageSlice>,
@@ -193,6 +210,14 @@ impl LifetimeUsage {
             .saturating_add(self.cache_read)
     }
 
+    /// See [`crate::sessions::cache_hit_rate`].
+    pub fn cache_hit_rate(&self) -> Option<f64> {
+        cache_hit_rate(
+            self.cache_read,
+            self.input + self.cache_creation + self.cache_read,
+        )
+    }
+
     pub fn turns(&self) -> u64 {
         self.priced_turns.saturating_add(self.unpriced_turns)
     }
@@ -204,6 +229,7 @@ impl LifetimeUsage {
 
 fn summarize(buckets: &[UsageBucket]) -> LifetimeUsage {
     let mut summary = LifetimeUsage::default();
+    let mut by_provider: BTreeMap<String, UsageSlice> = BTreeMap::new();
     let mut by_model: BTreeMap<String, UsageSlice> = BTreeMap::new();
     let mut by_project: BTreeMap<String, UsageSlice> = BTreeMap::new();
     let mut by_purpose: BTreeMap<String, UsageSlice> = BTreeMap::new();
@@ -228,6 +254,7 @@ fn summarize(buckets: &[UsageBucket]) -> LifetimeUsage {
                 .since
                 .map_or(bucket.bucket_start, |since| since.min(bucket.bucket_start)),
         );
+        add_slice(&mut by_provider, bucket.provider.clone(), bucket);
         add_slice(
             &mut by_model,
             format!("{}/{}", bucket.provider, bucket.model),
@@ -237,6 +264,7 @@ fn summarize(buckets: &[UsageBucket]) -> LifetimeUsage {
         add_slice(&mut by_purpose, bucket.purpose.clone(), bucket);
         add_slice(&mut by_month, month_label(bucket.bucket_start), bucket);
     }
+    summary.by_provider = ranked(by_provider);
     summary.by_model = ranked(by_model);
     summary.by_project = ranked(by_project);
     summary.by_purpose = ranked(by_purpose);
@@ -247,16 +275,16 @@ fn summarize(buckets: &[UsageBucket]) -> LifetimeUsage {
 fn add_slice(slices: &mut BTreeMap<String, UsageSlice>, label: String, bucket: &UsageBucket) {
     let slice = slices.entry(label.clone()).or_insert(UsageSlice {
         label,
-        cost: 0.0,
-        subscription_cost: 0.0,
-        tokens: 0,
-        turns: 0,
+        ..UsageSlice::default()
     });
     if bucket.subscription {
         slice.subscription_cost += bucket.cost;
     } else {
         slice.cost += bucket.cost;
     }
+    slice.input += bucket.input;
+    slice.cache_creation += bucket.cache_creation;
+    slice.cache_read += bucket.cache_read;
     slice.tokens += bucket.input + bucket.output + bucket.cache_creation + bucket.cache_read;
     slice.turns += bucket.priced_turns + bucket.unpriced_turns;
 }
@@ -295,10 +323,16 @@ mod tests {
     use test_case::test_case;
 
     const PROVIDER: &str = "anthropic";
+    const OTHER_PROVIDER: &str = "openrouter";
     const MODEL: &str = "claude-opus-4";
     const OTHER_MODEL: &str = "claude-haiku-4";
     const CWD: &str = "/repo";
     const HOUR: u64 = BUCKET_SECONDS;
+    /// What [`turn`] spends: 40 cached reads out of 10 + 30 + 40 prompt tokens.
+    const TURN_HIT_RATE: f64 = 0.5;
+    const PROVIDER_FOLDS_MODELS: &str =
+        "a provider row is every model it served, dearest provider first";
+    const RATE_EXCLUDES_OUTPUT: &str = "only prompt tokens were ever cacheable";
     const SURVIVES_DELETE: &str = "spend must outlive the session that produced it";
     const EPHEMERAL_PERSISTS: &str = "an ephemeral run spends real money and must record it";
     const NO_VOLATILE_LEDGER: &str = "the ledger belongs to the persistent root";
@@ -615,6 +649,66 @@ mod tests {
         assert_eq!(lifetime.by_model[0].label, format!("{PROVIDER}/{MODEL}"));
         assert_eq!(lifetime.by_project[0].label, CWD);
         assert_eq!(lifetime.since, Some(0));
+    }
+
+    /// The model fold splits what the provider fold joins: two models of one
+    /// provider are one provider row, and one model name under two providers is
+    /// still two.
+    #[test]
+    fn a_lifetime_summary_folds_every_model_of_a_provider_into_one_row() {
+        let (_temp, dir) = state_dir();
+        let ledger = ledger(&dir);
+        ledger.record_at(&turn(MODEL, Some(9.0)), 0).unwrap();
+        ledger.record_at(&turn(OTHER_MODEL, Some(1.0)), 0).unwrap();
+        ledger
+            .record_at(
+                &TurnUsage {
+                    provider: OTHER_PROVIDER.into(),
+                    ..turn(MODEL, Some(4.0))
+                },
+                0,
+            )
+            .unwrap();
+
+        let lifetime = ledger.lifetime().unwrap();
+
+        let providers: Vec<(&str, f64)> = lifetime
+            .by_provider
+            .iter()
+            .map(|slice| (slice.label.as_str(), slice.cost))
+            .collect();
+        assert_eq!(
+            providers,
+            [(PROVIDER, 10.0), (OTHER_PROVIDER, 4.0)],
+            "{PROVIDER_FOLDS_MODELS}"
+        );
+        assert_eq!(lifetime.by_model.len(), 3, "{PROVIDER_FOLDS_MODELS}");
+    }
+
+    /// `tokens` counts output, which was never cacheable, so a slice that
+    /// scored itself from that total would understate every rate.
+    #[test]
+    fn a_slice_scores_its_cache_over_prompt_tokens_only() {
+        let (_temp, dir) = state_dir();
+        ledger(&dir).record_at(&turn(MODEL, Some(1.0)), 0).unwrap();
+
+        let lifetime = ledger(&dir).lifetime().unwrap();
+
+        assert_eq!(
+            lifetime.by_provider[0].cache_hit_rate(),
+            Some(TURN_HIT_RATE),
+            "{RATE_EXCLUDES_OUTPUT}"
+        );
+        assert_eq!(
+            lifetime.by_model[0].cache_hit_rate(),
+            Some(TURN_HIT_RATE),
+            "{RATE_EXCLUDES_OUTPUT}"
+        );
+        assert_eq!(
+            lifetime.cache_hit_rate(),
+            Some(TURN_HIT_RATE),
+            "{RATE_EXCLUDES_OUTPUT}"
+        );
     }
 
     #[test]

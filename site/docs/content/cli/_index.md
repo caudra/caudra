@@ -252,6 +252,8 @@ A session is kept when any rule matches. Pinned sessions, sessions open in any C
 
 `usage` reports spend from a ledger that outlives the sessions that produced it, so trimming and forgetting leave the numbers intact. Group by `model` (default), `provider`, `project`, `purpose`, `day`, `month`, or `total`, narrow with `--since 30d`, and trim the ledger itself with `--prune-older-than`, which takes no other flag. [Token Economy](/docs/token-economy/#lifetime-spend) explains what the columns mean.
 
+The `Hit` column is the share of prompt tokens each group read from cache, and `--json` carries it as `cache_hit_rate`. [Cache hit rate](/docs/token-economy/#cache-hit-rate) defines it.
+
 ## Everyday examples
 
 ```bash
