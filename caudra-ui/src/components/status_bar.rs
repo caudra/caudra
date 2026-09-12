@@ -36,6 +36,12 @@ const WORKFLOW_PHASE_SEPARATOR: &str = " \u{b7} ";
 const WORKFLOW_SUFFIX: &str = "]";
 const YOLO_LABEL: &str = " [yolo]";
 const YOLO_SHORT_LABEL: &str = " [!]";
+/// A level narrower than this is already its own shortest unambiguous form, so
+/// squeezing it would trade legibility for a single column.
+const THINKING_SHORT_FLOOR: usize = 4;
+/// Columns a squeezed level keeps. Two, because the catalog's levels collide on
+/// one - `minimal`, `medium` and `max` all lead with `m` - and separate on two.
+const THINKING_SHORT_WIDTH: usize = 2;
 /// A chip's leading space and its two brackets, which no tier sheds.
 const CHIP_OVERHEAD: usize = 3;
 const BRACKET_WIDTH: usize = 2;
@@ -267,6 +273,43 @@ enum YoloTier {
     Hidden,
 }
 
+/// `[xhigh]`, squeezed to `[xh]`, or nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThinkingTier {
+    Full,
+    Short,
+    Hidden,
+}
+
+impl ThinkingTier {
+    /// A prefix rather than a table, so a level a model declared itself squeezes
+    /// the same way as one from the catalog. Two arms pass the level through
+    /// whatever the pressure: a name already short enough that cutting it would
+    /// buy a column and cost a word, and a token budget, whose leading digits
+    /// would read as a budget orders of magnitude smaller.
+    fn label(self, level: &str) -> Option<&str> {
+        match self {
+            Self::Hidden => None,
+            Self::Full => Some(level),
+            Self::Short if level.width() < THINKING_SHORT_FLOOR => Some(level),
+            Self::Short if level.bytes().all(|byte| byte.is_ascii_digit()) => Some(level),
+            Self::Short => {
+                let mut used = 0;
+                let mut end = 0;
+                for (index, character) in level.char_indices() {
+                    let width = character.width().unwrap_or(0);
+                    if used + width > THINKING_SHORT_WIDTH {
+                        break;
+                    }
+                    used += width;
+                    end = index + character.len_utf8();
+                }
+                Some(&level[..end])
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ContextTier {
     /// `12k/200k (6%/90%)`.
@@ -284,8 +327,9 @@ enum Reduction {
     DropGlobalSpend,
     DropCompactionBorder,
     CompactContext,
-    ShortYolo,
+    ShortThinking,
     ShortWorkflows,
+    ShortYolo,
     DropTransition,
     DropSpend,
     DropContext,
@@ -302,13 +346,21 @@ enum Reduction {
 /// at any width that can hold three columns. The pending pair goes early: once
 /// the chips are already abbreviating, the model the next turn runs on is worth
 /// more than the one it is leaving.
-const LADDER: [Reduction; 14] = [
+///
+/// The three abbreviations go in order of what they cost to read. A reasoning
+/// level is a setting, and the chip's presence already carries the load-bearing
+/// half of it, so the depth is the cheapest word on the bar to shorten. A
+/// workflow phase is live state, but it is also on screen in the workflow view
+/// and its counts survive. Yolo is a warning, and `[!]` is the only rung that
+/// leaves a chip with no word at all.
+const LADDER: [Reduction; 15] = [
     Reduction::LeafModel,
     Reduction::DropGlobalSpend,
     Reduction::DropCompactionBorder,
     Reduction::CompactContext,
-    Reduction::ShortYolo,
+    Reduction::ShortThinking,
     Reduction::ShortWorkflows,
+    Reduction::ShortYolo,
     Reduction::DropTransition,
     Reduction::DropSpend,
     Reduction::DropContext,
@@ -373,7 +425,7 @@ struct Fit {
     global_spend: bool,
     context: ContextTier,
     compaction_border: bool,
-    thinking: bool,
+    thinking: ThinkingTier,
     model: ModelTier,
     transition: bool,
     fast: bool,
@@ -387,7 +439,7 @@ impl Fit {
         global_spend: true,
         context: ContextTier::Counts,
         compaction_border: true,
-        thinking: true,
+        thinking: ThinkingTier::Full,
         model: ModelTier::Full,
         transition: true,
         fast: true,
@@ -401,14 +453,15 @@ impl Fit {
             Reduction::DropGlobalSpend => self.global_spend = false,
             Reduction::DropCompactionBorder => self.compaction_border = false,
             Reduction::CompactContext => self.context = ContextTier::Percent,
-            Reduction::ShortYolo => self.yolo = YoloTier::Sigil,
+            Reduction::ShortThinking => self.thinking = ThinkingTier::Short,
             Reduction::ShortWorkflows => self.workflows = WorkflowTier::Counts,
+            Reduction::ShortYolo => self.yolo = YoloTier::Sigil,
             Reduction::DropTransition => self.transition = false,
             Reduction::DropSpend => self.spend = false,
             Reduction::DropContext => self.context = ContextTier::Hidden,
             Reduction::DropFast => self.fast = false,
             Reduction::DropWorkflows => self.workflows = WorkflowTier::Hidden,
-            Reduction::DropThinking => self.thinking = false,
+            Reduction::DropThinking => self.thinking = ThinkingTier::Hidden,
             Reduction::ChopModel => self.model = ModelTier::Chopped,
             Reduction::DropYolo => self.yolo = YoloTier::Hidden,
         }
@@ -462,10 +515,12 @@ impl Fit {
         self.yolo.label().filter(|_| ctx.yolo)
     }
 
+    fn thinking_label<'a>(self, ctx: &'a StatusBarContext<'_>) -> Option<&'a str> {
+        self.thinking.label(ctx.thinking.as_deref()?)
+    }
+
     fn thinking_width(self, ctx: &StatusBarContext<'_>) -> usize {
-        ctx.thinking
-            .as_deref()
-            .filter(|_| self.thinking)
+        self.thinking_label(ctx)
             .map_or(0, |level| CHIP_OVERHEAD + level.width())
     }
 
@@ -1002,9 +1057,7 @@ fn right_side_animated<'a>(
         }
     };
 
-    if let Some(level) = ctx.thinking.as_deref()
-        && fit.thinking
-    {
+    if let Some(level) = fit.thinking_label(ctx) {
         let label = format!(" [{level}]");
         control(
             &mut chips,
@@ -1464,6 +1517,7 @@ mod tests {
 
     use super::*;
     use crate::repaint::expect::QUIET;
+    use caudra_storage::thinking::EFFORT_LEVELS;
     use tempfile::TempDir;
     use test_case::test_case;
 
@@ -1501,7 +1555,9 @@ mod tests {
     const PERCENT_MARK: &str = "%";
     /// A budget that keeps the compact thinking control on a squeezed bar.
     const SHORT_THINKING_BUDGET: usize = 36;
-    const SHORT_THINKING_CHIP: &str = "[xhigh]";
+    const FULL_THINKING_CHIP: &str = "[xhigh]";
+    const SHORT_THINKING_CHIP: &str = "[xh]";
+    const LEVEL_COLLISION_MSG: &str = "two catalog levels squeeze to the same spelling";
     /// Room for every rung, so both figures are on screen at their full tier,
     /// the counter's border included.
     const WIDE_BUDGET: usize = 124;
@@ -2026,10 +2082,46 @@ mod tests {
             let side = right_side(ctx, LADDER_CWD, WIDE_BUDGET);
             assert_eq!(
                 hit_glyphs(&side, StatusBarHitTarget::Thinking),
-                SHORT_THINKING_CHIP
+                FULL_THINKING_CHIP
             );
             assert!(!side_text(&side).contains("thinking:"));
         });
+    }
+
+    /// Two letters is the shortest form that still separates the catalog, and
+    /// the names already that short keep their word rather than buying a single
+    /// column with it.
+    #[test_case("none",     "no"    ; "shortens_a_four_letter_level")]
+    #[test_case("minimal",  "mi"    ; "shortens_the_longest_level")]
+    #[test_case("medium",   "me"    ; "separates_medium_from_minimal")]
+    #[test_case("xhigh",    "xh"    ; "keeps_the_x_that_ranks_it")]
+    #[test_case("high",     "hi"    ; "shortens_high")]
+    #[test_case("adaptive", "ad"    ; "shortens_the_model_decides_level")]
+    #[test_case("off",      "off"   ; "keeps_off_whole")]
+    #[test_case("low",      "low"   ; "keeps_low_whole")]
+    #[test_case("max",      "max"   ; "keeps_max_whole")]
+    fn a_squeezed_level_keeps_its_shortest_unambiguous_form(level: &str, expected: &str) {
+        assert_eq!(ThinkingTier::Short.label(level), Some(expected));
+    }
+
+    /// A budget is a count, not a name: cutting `32768` to `32` would name a
+    /// budget a thousandth the size, which is worse than spending the columns.
+    #[test_case("32768" ; "five_digits")]
+    #[test_case("8192"  ; "four_digits")]
+    fn a_squeezed_budget_keeps_every_digit(budget: &str) {
+        assert_eq!(ThinkingTier::Short.label(budget), Some(budget));
+    }
+
+    /// The property that justifies two letters instead of one. Fails if the
+    /// catalog ever declares a level that collides with one already there.
+    #[test]
+    fn squeezed_catalog_levels_stay_distinct() {
+        let mut seen: Vec<&str> = Vec::new();
+        for level in EFFORT_LEVELS {
+            let short = ThinkingTier::Short.label(level).expect(LEVEL_COLLISION_MSG);
+            assert!(!seen.contains(&short), "{LEVEL_COLLISION_MSG}: {short}");
+            seen.push(short);
+        }
     }
 
     #[test_case(0,    "abc" ; "holds_at_the_start")]
