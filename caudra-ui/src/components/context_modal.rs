@@ -963,11 +963,22 @@ fn horizontal_padding(width: u16) -> u16 {
 /// A counter beside the border it is racing, as the status bar draws the same
 /// pair, so a reader comparing the two views is comparing one figure.
 fn share_text(tokens: u32, window: &ContextWindow) -> String {
-    let share = format_percentage(tokens, window.tokens);
+    let share = format_compact_percentage(tokens, window.tokens);
     match window.compaction_border() {
-        Some(border) => format!("{share}/{}", format_percentage(border, window.tokens)),
+        Some(border) => format!(
+            "{share}/{}",
+            format_compact_percentage(border, window.tokens)
+        ),
         None => share,
     }
+}
+
+fn format_compact_percentage(tokens: u32, window: u32) -> String {
+    let percentage = format_percentage(tokens, window);
+    if let Some(whole) = percentage.strip_suffix(".0%") {
+        return format!("{whole}%");
+    }
+    percentage
 }
 
 fn format_percentage(tokens: u32, window: u32) -> String {
@@ -1299,7 +1310,7 @@ mod tests {
         ));
         for expected in [
             "Window  1.0k tokens",
-            "Used  ~600 tokens / 1.0k tokens (60.0%/90.0%)",
+            "Used  ~600 tokens / 1.0k tokens (60%/90%)",
             "S System prompt ~100 tokens (10.0%)",
             "· Free ~300 tokens (30.0%)",
             "░ Reserve 100 tokens (10.0%)",
@@ -1338,7 +1349,7 @@ mod tests {
         snapshot.window.tokens = 0;
         snapshot.usage.messages = u32::MAX;
         let lines = build_lines(Some(&snapshot), false, 0, &theme::current());
-        assert!(text(&lines).contains("(0.0%/0.0%)"));
+        assert!(text(&lines).contains("(0%/0%)"));
         assert_eq!(grid_cells(&snapshot).len(), GRID_CELL_COUNT);
     }
 
@@ -1382,7 +1393,7 @@ mod tests {
         };
         let lines = build_lines(Some(&snapshot), false, 100, &theme::current());
         let rendered = text(&lines);
-        assert!(rendered.contains("(150.0%)"), "{rendered}");
+        assert!(rendered.contains("(150%)"), "{rendered}");
         assert!(rendered.contains("~50 tokens over the model window"));
         assert!(
             grid_cells(&snapshot)
@@ -1403,13 +1414,13 @@ mod tests {
     #[test]
     fn the_compaction_border_rides_beside_the_measured_count() {
         let mut snapshot = snapshot();
-        snapshot.measured = Some(700);
+        snapshot.measured = Some(701);
         let rendered = text(&build_lines(Some(&snapshot), false, 100, &theme::current()));
-        assert!(rendered.contains("(70.0%/90.0%)"), "{rendered}");
+        assert!(rendered.contains("(70.1%/90%)"), "{rendered}");
 
         snapshot.window.reserve = ContextReserve::Disabled;
         let rendered = text(&build_lines(Some(&snapshot), false, 100, &theme::current()));
-        assert!(rendered.contains("(70.0%)"), "{rendered}");
+        assert!(rendered.contains("(70.1%)"), "{rendered}");
         assert!(!rendered.contains("%/"), "{rendered}");
     }
 
