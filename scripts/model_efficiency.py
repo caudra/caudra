@@ -646,6 +646,9 @@ def session_workload(conn, models, cwd):
                 "sessions": len(sessions),
                 "user_turns": turns,
                 "median_ms_per_turn": percentile(per_turn, P50),
+                # Mean over sessions, not the pooled total: a handful of slow sessions pull
+                # it far above the median, and that gap is the skew worth seeing.
+                "mean_ms_per_turn": mean(per_turn),
                 "p90_ms_per_turn": percentile(per_turn, P90),
                 "main_ms_per_turn": ratio(sum(s["main_ms"] for s in sessions), turns),
                 "sub_ms_per_turn": ratio(sum(s["sub_ms"] for s in sessions), turns),
@@ -875,16 +878,19 @@ def thinking_table(rows):
 
 def workload_table(rows):
     return table(
-        ["Model", "Sessions", "User turns", "Median s/turn", "p90 s/turn", "Main s/turn",
-         "Sub s/turn", "Sub share", "Resp/turn", "Tools/turn", "Subruns/turn"],
-        ["<", ">", ">", ">", ">", ">", ">", ">", ">", ">", ">"],
+        ["Model", "Sessions", "User turns", "Median s/turn", "Mean s/turn", "p90 s/turn",
+         "Skew", "Main s/turn", "Sub s/turn", "Sub share", "Resp/turn", "Tools/turn",
+         "Subruns/turn"],
+        ["<", ">", ">", ">", ">", ">", ">", ">", ">", ">", ">", ">", ">"],
         [
             [
                 row["model"],
                 fmt_int(row["sessions"]),
                 fmt_int(row["user_turns"]),
                 fmt_dur(row["median_ms_per_turn"]),
+                fmt_dur(row["mean_ms_per_turn"]),
                 fmt_dur(row["p90_ms_per_turn"]),
+                f"{ratio(row['mean_ms_per_turn'], row['median_ms_per_turn']):.1f}x",
                 fmt_dur(row["main_ms_per_turn"]),
                 fmt_dur(row["sub_ms_per_turn"]),
                 fmt_pct(row["mean_sub_share"]),
@@ -949,8 +955,14 @@ CAVEATS = [
         "subagent's; everything else is reported as mixed."
     ),
     (
-        "Unpriced turns are turns whose model had no price entry, so cost is a floor, not a "
-        "measurement. Check the unpriced share before reading any dollar figure."
+        "Cost is notional. Every turn here was covered by a subscription, so no dollar was "
+        "invoiced; the figure is what the usage would have cost at API rates, which is a "
+        "efficiency proxy rather than spend. Read the `Sub` column to confirm."
+    ),
+    (
+        "Unpriced turns are turns whose model had no price entry, so even the notional cost "
+        "is a floor. One model here is around 60% unpriced, so its dollar figure understates "
+        "by an unknown amount and is not comparable with a fully priced model's."
     ),
     (
         "Thinking level is stored per session as a last-value, never per turn and never in "
