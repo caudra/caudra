@@ -2031,6 +2031,19 @@ mod tests {
         assert!(reversed_cells(&mut form).is_empty(), "{EXPECT_UNMARKED}");
     }
 
+    /// The gap between two hints is not part of either, so the pointer marks
+    /// a control only once it is over its glyphs.
+    #[test]
+    fn the_gap_before_a_hint_marks_nothing() {
+        let mut form = opened(two_questions());
+        render(&mut form);
+        let hit = hit_area(&form, FormTarget::Hint(1));
+
+        form.handle_mouse(mouse(MouseEventKind::Moved, hit.x - 1, hit.y));
+        assert_eq!(form.hover, None);
+        assert!(reversed_cells(&mut form).is_empty(), "{EXPECT_UNMARKED}");
+    }
+
     /// The hover marks what a click would press, so a hint that reads as a
     /// button has to act like one.
     #[test]

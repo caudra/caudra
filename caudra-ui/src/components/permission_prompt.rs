@@ -1823,6 +1823,7 @@ mod tests {
     use test_case::test_case;
 
     use crate::components::buffer_text;
+    use crate::components::hint_gap_width;
     use crate::components::keybindings::key as kb;
     use ratatui::style::Modifier;
 
@@ -2923,7 +2924,8 @@ mod tests {
     }
 
     /// The two hints share a row, so a hit rect that is too wide would hand
-    /// the second one's clicks to the first.
+    /// the second one's clicks to the first. The gap between them separates
+    /// the two controls and is claimed by neither.
     #[test]
     fn neighbouring_hints_do_not_share_a_hit() {
         let mut prompt = open_prompt();
@@ -2931,7 +2933,7 @@ mod tests {
         let once = hit_area(&prompt, &hint_target(KEY_ALLOW_ONCE));
         let session = hit_area(&prompt, &hint_target(KEY_ALLOW_SESSION));
         assert_eq!(once.y, session.y);
-        assert_eq!(once.right(), session.x);
+        assert_eq!(session.x, once.right() + hint_gap_width());
     }
 
     /// A label the prompt does not act on must not become a button: an arrow

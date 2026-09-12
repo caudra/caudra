@@ -54,6 +54,7 @@ pub(crate) mod workflow_card;
 pub(crate) mod workflow_catalog_picker;
 pub(crate) mod workflow_inspector;
 
+use std::iter;
 use std::mem;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -65,6 +66,7 @@ use caudra_agent::{BufferSnapshot, ImageSource, SubagentProgress, ToolInput, Too
 use caudra_providers::model_registry::Binding;
 use caudra_providers::{CaudraId, HistoryItem, ModelPurpose};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
@@ -163,30 +165,39 @@ pub(crate) trait Overlay {
 }
 
 /// Leading gap before each hint, and the gap between a key and its label.
-const HINT_GAP: u16 = 2;
-const HINT_KEY_GAP: u16 = 1;
+const HINT_GAP: &str = "  ";
+const HINT_KEY_GAP: &str = " ";
 
-/// One hint's spans and the cells they occupy. Drawing, hit testing and hover
-/// all read this, so a hint cannot be styled in one place and measured in
-/// another, and a hit rect cannot drift off the glyphs it claims to cover.
+/// One hint's spans and the cells they occupy, the gap before it excluded.
+/// Drawing, hit testing and hover all read this, so a hint cannot be styled in
+/// one place and measured in another, and a hit rect cannot drift off the
+/// glyphs it claims to cover.
 fn hint_parts<K: AsRef<str>, V: AsRef<str>>(pairs: &[(K, V)]) -> Vec<(Vec<Span<'static>>, u16)> {
     let t = crate::theme::current();
     pairs
         .iter()
         .map(|(key, desc)| {
-            let mut spans = vec![Span::raw("  ")];
+            let mut spans = Vec::new();
             for (i, part) in key.as_ref().split('/').enumerate() {
                 if i > 0 {
                     spans.push(Span::styled("/", t.tool_dim));
                 }
                 spans.push(Span::styled(part.to_string(), t.keybind_key));
             }
-            spans.push(Span::styled(format!(" {}", desc.as_ref()), t.tool_dim));
-            let key_width = UnicodeWidthStr::width(key.as_ref()) as u16;
-            let desc_width = UnicodeWidthStr::width(desc.as_ref()) as u16;
-            (spans, HINT_GAP + key_width + HINT_KEY_GAP + desc_width)
+            spans.push(Span::styled(
+                format!("{HINT_KEY_GAP}{}", desc.as_ref()),
+                t.tool_dim,
+            ));
+            let width = UnicodeWidthStr::width(key.as_ref())
+                + UnicodeWidthStr::width(HINT_KEY_GAP)
+                + UnicodeWidthStr::width(desc.as_ref());
+            (spans, width as u16)
         })
         .collect()
+}
+
+fn hint_gap_width() -> u16 {
+    UnicodeWidthStr::width(HINT_GAP) as u16
 }
 
 pub(crate) fn hint_line<K: AsRef<str>, V: AsRef<str>>(pairs: &[(K, V)]) -> Line<'static> {
@@ -195,7 +206,8 @@ pub(crate) fn hint_line<K: AsRef<str>, V: AsRef<str>>(pairs: &[(K, V)]) -> Line<
 
 /// The hint bar with one pair marked. A hovered hint reverses whole, key and
 /// description together, so the pointer marks the control rather than half of
-/// it.
+/// it. The gap before a hint separates two controls and belongs to neither, so
+/// it is drawn plain however the pointer moves.
 pub(crate) fn hint_line_hovered<K: AsRef<str>, V: AsRef<str>>(
     pairs: &[(K, V)],
     hovered: Option<usize>,
@@ -205,29 +217,32 @@ pub(crate) fn hint_line_hovered<K: AsRef<str>, V: AsRef<str>>(
         .enumerate()
         .flat_map(|(index, (spans, _))| {
             let on = hovered == Some(index);
-            spans.into_iter().map(move |mut span| {
+            iter::once(Span::raw(HINT_GAP)).chain(spans.into_iter().map(move |mut span| {
                 span.style = hover_style(span.style, on);
                 span
-            })
+            }))
         })
         .collect::<Vec<_>>();
     Line::from(spans)
 }
 
 /// Where each hint pair landed inside `area`, so a click can name the one it
-/// hit. Pairs that run past the right edge are dropped rather than clipped:
-/// a hint the reader cannot fully see is not one they can knowingly press.
+/// hit. The rect covers the hint's own glyphs and not the gap that precedes
+/// it, so the pointer acts on a control only once it is over one. Pairs that
+/// run past the right edge are dropped rather than clipped: a hint the reader
+/// cannot fully see is not one they can knowingly press.
 pub(crate) fn hint_hits<K: AsRef<str>, V: AsRef<str>>(
     pairs: &[(K, V)],
-    area: ratatui::layout::Rect,
-) -> Vec<ratatui::layout::Rect> {
+    area: Rect,
+) -> Vec<Rect> {
     let mut x = area.x;
     let mut hits = Vec::with_capacity(pairs.len());
     for (_, width) in hint_parts(pairs) {
+        x = x.saturating_add(hint_gap_width());
         if x.saturating_add(width) > area.right() {
             break;
         }
-        hits.push(ratatui::layout::Rect {
+        hits.push(Rect {
             x,
             y: area.y,
             width,
@@ -1012,6 +1027,7 @@ pub(crate) fn key(code: crossterm::event::KeyCode) -> crossterm::event::KeyEvent
 mod tests {
     use super::*;
     use caudra_agent::{SnapshotLine, SnapshotSpan, SpanStyle};
+    use ratatui::style::Modifier;
     use test_case::test_case;
 
     const SNAPSHOT_GEN: u64 = 7;
@@ -1170,5 +1186,55 @@ mod tests {
         scroll.update_dimensions(MODAL_TOTAL, MODAL_TOTAL);
         scroll.update_dimensions(MODAL_TOTAL, MODAL_VIEWPORT);
         assert_eq!(scroll.offset(), 0);
+    }
+
+    const HINTS: [(&str, &str); 2] = [("Enter", "submit"), ("Esc", "close")];
+    const HINT_ROW: Rect = Rect::new(4, 9, 40, 1);
+
+    /// The cells one hint occupies, gap excluded. Every pair here is ASCII,
+    /// so a byte is a column.
+    fn control_width((key, desc): (&str, &str)) -> u16 {
+        (key.len() + HINT_KEY_GAP.len() + desc.len()) as u16
+    }
+
+    /// The gap before a hint separates two controls and belongs to neither, so
+    /// a pointer in it is over nothing.
+    #[test]
+    fn hint_hits_cover_the_glyphs_and_not_the_gap_before_them() {
+        let hits = hint_hits(&HINTS, HINT_ROW);
+
+        assert_eq!(hits.len(), HINTS.len());
+        assert_eq!(hits[0].x, HINT_ROW.x + hint_gap_width());
+        assert_eq!(hits[0].width, control_width(HINTS[0]));
+        assert_eq!(hits[1].x, hits[0].right() + hint_gap_width());
+        assert_eq!(hits[1].width, control_width(HINTS[1]));
+        assert!(
+            hits.iter()
+                .all(|hit| hit.y == HINT_ROW.y && hit.height == 1 && hit.right() <= HINT_ROW.right())
+        );
+    }
+
+    /// The gap still costs the room it takes, so a row measured without it
+    /// would offer a hint whose last cells were never drawn.
+    #[test]
+    fn a_hint_the_row_cannot_hold_whole_gets_no_hit() {
+        let width = hint_gap_width() + control_width(HINTS[0]) + hint_gap_width();
+        let row = Rect { width, ..HINT_ROW };
+
+        assert_eq!(hint_hits(&HINTS, row).len(), 1);
+    }
+
+    #[test]
+    fn a_hovered_hint_marks_its_glyphs_and_leaves_the_gap_plain() {
+        let line = hint_line_hovered(&HINTS, Some(1));
+        let marked: Vec<&str> = line
+            .spans
+            .iter()
+            .filter(|span| span.style.add_modifier.contains(Modifier::REVERSED))
+            .map(|span| span.content.as_ref())
+            .collect();
+
+        let description = format!("{HINT_KEY_GAP}{}", HINTS[1].1);
+        assert_eq!(marked, [HINTS[1].0, description.as_str()]);
     }
 }
