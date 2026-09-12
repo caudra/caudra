@@ -10,4 +10,5 @@ runs.csv
 /result
 .maki/
 .caudra/
+external_repos/
 AGENTS.local.md
