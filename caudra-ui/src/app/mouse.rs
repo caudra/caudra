@@ -402,7 +402,9 @@ impl App {
                 if !self.has_modal_overlay() {
                     self.admission_mouse_down = self.admission_hit_at(event.row, event.column);
                     self.task_hint_mouse_down = self.task_hint_hit_at(event.row, event.column);
-                    self.status_mouse_down = self.status_hit_at(event.row, event.column);
+                    self.status_mouse_down = self
+                        .status_hit_at(event.row, event.column)
+                        .filter(|hit| hit.target.accepts_click());
                     self.queue_mouse_down = self.queue_hit_at(event.row, event.column);
                     if self.queue_mouse_down.is_none() {
                         self.unfocus_active_queue();

@@ -23,6 +23,7 @@ color-eyre = { workspace = true }
 tracing = { workspace = true }
 syntect = { workspace = true }
 unicode-width = { workspace = true }
+unicode-segmentation = { workspace = true }
 serde_json = { workspace = true }
 url = { workspace = true }
 arboard = { workspace = true }

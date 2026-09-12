@@ -1309,8 +1309,8 @@ mod tests {
             &theme::current(),
         ));
         for expected in [
-            "Window  1.0k tokens",
-            "Used  ~600 tokens / 1.0k tokens (60%/90%)",
+            "Window  1k tokens",
+            "Used  ~600 tokens / 1k tokens (60%/90%)",
             "S System prompt ~100 tokens (10.0%)",
             "· Free ~300 tokens (30.0%)",
             "░ Reserve 100 tokens (10.0%)",
@@ -1331,7 +1331,7 @@ mod tests {
             );
         }
         for unexpected in [
-            "Window  ~1.0k tokens",
+            "Window  ~1k tokens",
             "reserve ~100 tokens",
             "~3 tools",
             "~1 notes",

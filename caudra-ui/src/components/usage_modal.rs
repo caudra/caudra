@@ -627,7 +627,7 @@ mod tests {
     /// it re-priced the counters.
     const REPRICED_TEXT: &str = "3.000";
     const ONE_MILLION: u32 = 1_000_000;
-    const ONE_MILLION_TEXT: &str = "1.0m";
+    const ONE_MILLION_TEXT: &str = "1m";
     const UNKNOWN_MODEL: &str = "a-model-no-table-has-ever-heard-of";
     const NO_COST_TEXT: &str = "—";
     const LIFETIME_MODEL: &str = "anthropic/claude-opus-5";

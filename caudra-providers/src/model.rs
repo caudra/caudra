@@ -23,6 +23,9 @@ use crate::providers::{anthropic, custom, dynamic};
 use crate::types::ThinkingFields;
 
 const PER_MILLION: f64 = 1_000_000.0;
+const TOKEN_THOUSAND: u64 = 1_000;
+const TOKEN_MILLION: u64 = 1_000_000;
+const TOKEN_TENTHS: u128 = 10;
 pub(crate) const ANTHROPIC_SLUG: &str = "anthropic";
 const GPT_PREFIX: &str = "gpt-";
 const GPT_4_PREFIX: &str = "gpt-4";
@@ -994,10 +997,33 @@ impl TokenUsage {
 }
 
 pub fn format_tokens(tokens: u32) -> String {
-    match tokens {
-        0..1_000 => tokens.to_string(),
-        1_000..1_000_000 => format!("{:.1}k", f64::from(tokens) / 1_000.0),
-        _ => format!("{:.1}m", f64::from(tokens) / 1_000_000.0),
+    format_tokens_wide(u64::from(tokens))
+}
+
+pub(crate) fn format_tokens_wide(tokens: u64) -> String {
+    if tokens < TOKEN_THOUSAND {
+        return tokens.to_string();
+    }
+    let thousand_tenths = rounded_tenths(tokens, TOKEN_THOUSAND);
+    if tokens < TOKEN_MILLION && thousand_tenths < u128::from(TOKEN_THOUSAND) * TOKEN_TENTHS {
+        return compact_tenths(thousand_tenths, "k");
+    }
+    compact_tenths(rounded_tenths(tokens, TOKEN_MILLION), "m")
+}
+
+fn rounded_tenths(value: u64, unit: u64) -> u128 {
+    (u128::from(value) * TOKEN_TENTHS + u128::from(unit) / 2) / u128::from(unit)
+}
+
+fn compact_tenths(tenths: u128, suffix: &str) -> String {
+    if tenths.is_multiple_of(TOKEN_TENTHS) {
+        format!("{}{suffix}", tenths / TOKEN_TENTHS)
+    } else {
+        format!(
+            "{}.{:01}{suffix}",
+            tenths / TOKEN_TENTHS,
+            tenths % TOKEN_TENTHS
+        )
     }
 }
 
@@ -1128,16 +1154,24 @@ mod tests {
     };
 
     #[test_case(999, "999"         ; "under_thousand")]
-    #[test_case(1_000, "1.0k"      ; "thousand")]
-    #[test_case(999_999, "1000.0k" ; "just_under_million")]
-    #[test_case(1_000_000, "1.0m"  ; "million")]
+    #[test_case(1_000, "1k"        ; "thousand")]
+    #[test_case(1_049, "1k"        ; "rounds_down")]
+    #[test_case(1_050, "1.1k"      ; "rounds_up")]
+    #[test_case(12_300, "12.3k"    ; "keeps_a_useful_tenth")]
+    #[test_case(372_000, "372k"    ; "drops_an_empty_tenth")]
+    #[test_case(999_949, "999.9k"  ; "below_unit_promotion")]
+    #[test_case(999_950, "1m"      ; "promotes_after_rounding")]
+    #[test_case(999_999, "1m"      ; "just_under_million")]
+    #[test_case(1_000_000, "1m"    ; "million")]
+    #[test_case(1_050_000, "1.1m"  ; "million_keeps_a_tenth")]
+    #[test_case(u32::MAX, "4295m"  ; "largest_session_count")]
     fn format_tokens_display(tokens: u32, expected: &str) {
         assert_eq!(format_tokens(tokens), expected);
     }
 
     #[test_case(TokenUsage { input: 12_000, output: 456, cache_creation: 200, cache_read: 100 }, None, "12.3k↑ 456↓" ; "without_cost")]
-    #[test_case(TokenUsage { input: 1_000_000, output: 100_000, cache_creation: 200_000, cache_read: 500_000 }, Some(5.4), "1.7m↑ 100.0k↓ $5.400" ; "with_cost")]
-    #[test_case(TokenUsage { input: u32::MAX, output: 1, cache_creation: 1, cache_read: 1 }, None, "4295.0m↑ 1↓" ; "input_saturates")]
+    #[test_case(TokenUsage { input: 1_000_000, output: 100_000, cache_creation: 200_000, cache_read: 500_000 }, Some(5.4), "1.7m↑ 100k↓ $5.400" ; "with_cost")]
+    #[test_case(TokenUsage { input: u32::MAX, output: 1, cache_creation: 1, cache_read: 1 }, None, "4295m↑ 1↓" ; "input_saturates")]
     fn usage_formatting(usage: TokenUsage, cost: Option<f64>, expected: &str) {
         assert_eq!(usage.format(cost), expected);
     }

@@ -172,7 +172,7 @@ const CONTEXT_EXISTING_MESSAGE: &str = "existing conversation";
 const MAIN_CONTEXT_SPEC: &str = "test/main-context";
 const PLAN_CONTEXT_SPEC: &str = "anthropic/plan-context";
 const PLAN_CONTEXT_MODEL_ID: &str = "plan-context";
-const PLAN_CONTEXT_WINDOW_LABEL: &str = "128.0k";
+const PLAN_CONTEXT_WINDOW_LABEL: &str = "128k";
 const PLAN_STATUS_MODEL_MISSING: &str = "status bar must show the running Plan model";
 const PLAN_STATUS_WINDOW_MISSING: &str = "status bar must show the running Plan context window";
 const TEST_MODEL_SPEC: &str = "anthropic/test-model";
@@ -4820,6 +4820,23 @@ fn opening_a_figure_clears_footer_hover(target: StatusBarHitTarget) {
     click_status(&mut app, target);
 
     assert_eq!(app.status_hover, None);
+}
+
+#[test]
+fn a_clipped_chat_name_hovers_but_does_not_press() {
+    let mut app = app_with_subagent();
+    app.chats[0].name = "a-main-chat-name-longer-than-the-footer-can-afford".into();
+    let hit = status_hit(&mut app, StatusBarHitTarget::ChatName);
+
+    app.update(mouse_event(MouseEventKind::Moved, hit.area.x, hit.area.y));
+    assert_eq!(app.status_hover, Some(StatusBarHitTarget::ChatName));
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        hit.area.x,
+        hit.area.y,
+    ));
+
+    assert!(app.status_mouse_down.is_none());
 }
 
 #[test]

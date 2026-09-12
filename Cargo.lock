@@ -1175,6 +1175,7 @@ dependencies = [
  "test-case",
  "toml 1.1.5+spec-1.1.0",
  "tracing",
+ "unicode-segmentation",
  "unicode-width",
  "url",
  "wait-timeout",

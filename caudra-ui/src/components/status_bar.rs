@@ -15,6 +15,7 @@ use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::repaint::{Cadence, Dirty};
@@ -35,17 +36,17 @@ const WORKFLOW_PHASE_SEPARATOR: &str = " \u{b7} ";
 const WORKFLOW_SUFFIX: &str = "]";
 const YOLO_LABEL: &str = " [yolo]";
 const YOLO_SHORT_LABEL: &str = " [!]";
-const THINKING_PREFIX: &str = "thinking: ";
 /// A chip's leading space and its two brackets, which no tier sheds.
 const CHIP_OVERHEAD: usize = 3;
 const BRACKET_WIDTH: usize = 2;
-/// Below the classic 80-column terminal the right side is already abbreviating
-/// chips, and the mode reads just as well as an initial.
-const MODE_SHORT_WIDTH: u16 = 80;
 /// Enough for `[.]`, so a bar too narrow to name the model still offers the
 /// control that changes it.
 const CLICKABLE_MODEL_FLOOR: usize = 3;
 const PLAIN_MODEL_FLOOR: usize = 1;
+const CHAT_NAME_MAX_WIDTH: usize = 24;
+const CHAT_NAME_WIDTH_DIVISOR: usize = 4;
+const MARQUEE_STEP: Duration = Duration::from_millis(120);
+const MARQUEE_PAUSE: Duration = Duration::from_millis(600);
 /// Marks a figure a subscription already covers. One column is all the bar can
 /// spare to say the number is a price rather than a bill.
 const NOT_BILLED_MARK: &str = "~";
@@ -108,10 +109,20 @@ pub fn workflow_chip(runs: &[RunSnapshot]) -> Option<WorkflowChip> {
 /// would otherwise claim the whole figure is notional when part of it is real.
 fn spend(billed: Option<f64>, subscription: Option<f64>) -> Option<String> {
     match (billed, subscription) {
-        (Some(billed), _) => Some(format!("${billed:.3}")),
-        (None, Some(subscription)) => Some(format!("{NOT_BILLED_MARK}${subscription:.3}")),
+        (Some(billed), _) => Some(format!("${}", compact_price(billed))),
+        (None, Some(subscription)) => {
+            Some(format!("{NOT_BILLED_MARK}${}", compact_price(subscription)))
+        }
         (None, None) => None,
     }
+}
+
+fn compact_price(value: f64) -> String {
+    let fixed = format!("{value:.3}");
+    if value > 0.0 && fixed == "0.000" {
+        return fixed;
+    }
+    fixed.trim_end_matches('0').trim_end_matches('.').to_owned()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,6 +136,8 @@ pub enum StatusBarHitTarget {
     Usage,
     Workflows,
     Retry,
+    ChatName,
+    Cwd,
 }
 
 impl StatusBarHitTarget {
@@ -137,11 +150,20 @@ impl StatusBarHitTarget {
     /// runs.
     pub fn scope(self) -> ChatScope {
         match self {
-            Self::BackToMain | Self::Context | Self::Usage | Self::Retry => ChatScope::Any,
+            Self::BackToMain
+            | Self::Context
+            | Self::Usage
+            | Self::Retry
+            | Self::ChatName
+            | Self::Cwd => ChatScope::Any,
             Self::Mode | Self::Model | Self::Thinking | Self::Goal | Self::Workflows => {
                 ChatScope::MainOnly
             }
         }
+    }
+
+    pub fn accepts_click(self) -> bool {
+        !matches!(self, Self::ChatName | Self::Cwd)
     }
 }
 
@@ -176,12 +198,12 @@ pub struct ModeLabel {
 }
 
 impl ModeLabel {
-    fn text(&self, width: u16) -> &Cow<'static, str> {
-        if width < MODE_SHORT_WIDTH {
-            &self.short
-        } else {
-            &self.full
-        }
+    fn full(&self) -> &Cow<'static, str> {
+        &self.full
+    }
+
+    fn short(&self) -> &Cow<'static, str> {
+        &self.short
     }
 }
 
@@ -198,8 +220,8 @@ pub struct StatusBarContext<'a> {
     pub chat_name: Option<&'a str>,
     pub main_chat: bool,
     pub retry_info: Option<&'a RetryInfo>,
-    /// The effective level alone (`off`, `xhigh`, `8192`). The bar spells the
-    /// word "thinking" in front of it only when it has the columns to spare.
+    /// The effective level alone (`off`, `xhigh`, `8192`), drawn directly as a
+    /// compact chip such as `[xhigh]`.
     pub thinking: Option<Cow<'static, str>>,
     pub fast: bool,
     /// Already rendered by [`workflow_chip`], so fitting the bar measures
@@ -218,15 +240,6 @@ pub struct StatusBarContext<'a> {
     pub bash_input: bool,
     pub hovered: Option<StatusBarHitTarget>,
     pub hover_hint: Option<&'a str>,
-}
-
-/// How much of the thinking chip survives: `[thinking: xhigh]`, `[xhigh]`, or
-/// nothing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ThinkingTier {
-    Named,
-    Level,
-    Hidden,
 }
 
 /// `[anthropic/claude-opus-5]`, then the last path segment, then whatever the
@@ -256,7 +269,7 @@ enum YoloTier {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ContextTier {
-    /// `12.0k/200.0k (6%/90%)`.
+    /// `12k/200k (6%/90%)`.
     Counts,
     /// `6%/90%`.
     Percent,
@@ -267,14 +280,13 @@ enum ContextTier {
 /// it, so the bar's width falls monotonically and the search terminates.
 #[derive(Debug, Clone, Copy)]
 enum Reduction {
+    LeafModel,
     DropGlobalSpend,
     DropCompactionBorder,
     CompactContext,
-    ShortThinking,
     ShortYolo,
     ShortWorkflows,
     DropTransition,
-    LeafModel,
     DropSpend,
     DropContext,
     DropFast,
@@ -284,20 +296,20 @@ enum Reduction {
     DropYolo,
 }
 
-/// Cheap abbreviations come before anything is lost, and yolo goes last: a
-/// session that skips permission prompts has to say so at any width that can
-/// hold three columns. The pending pair goes early: once the chips are already
-/// abbreviating, the model the next turn runs on is worth more than the one it
-/// is leaving.
-const LADDER: [Reduction; 15] = [
+/// A provider prefix is the first thing pressure takes: the model leaf carries
+/// the useful identity, and the recovered columns keep every other full tier.
+/// Yolo goes last because a session that skips permission prompts has to say so
+/// at any width that can hold three columns. The pending pair goes early: once
+/// the chips are already abbreviating, the model the next turn runs on is worth
+/// more than the one it is leaving.
+const LADDER: [Reduction; 14] = [
+    Reduction::LeafModel,
     Reduction::DropGlobalSpend,
     Reduction::DropCompactionBorder,
     Reduction::CompactContext,
-    Reduction::ShortThinking,
     Reduction::ShortYolo,
     Reduction::ShortWorkflows,
     Reduction::DropTransition,
-    Reduction::LeafModel,
     Reduction::DropSpend,
     Reduction::DropContext,
     Reduction::DropFast,
@@ -344,10 +356,10 @@ impl SpendText {
             over_border: stats
                 .compaction_border
                 .is_some_and(|border| stats.context_size >= border),
-            spend: spend(stats.cost, stats.subscription_cost).map(|cost| format!("{cost} ")),
+            spend: spend(stats.cost, stats.subscription_cost),
             global: spend(stats.global_cost, stats.global_subscription_cost)
                 .filter(|_| stats.show_global)
-                .map(|global| format!(" \u{03a3}{global} ")),
+                .map(|global| format!("\u{03a3}{global}")),
         }
     }
 }
@@ -361,7 +373,7 @@ struct Fit {
     global_spend: bool,
     context: ContextTier,
     compaction_border: bool,
-    thinking: ThinkingTier,
+    thinking: bool,
     model: ModelTier,
     transition: bool,
     fast: bool,
@@ -375,7 +387,7 @@ impl Fit {
         global_spend: true,
         context: ContextTier::Counts,
         compaction_border: true,
-        thinking: ThinkingTier::Named,
+        thinking: true,
         model: ModelTier::Full,
         transition: true,
         fast: true,
@@ -385,19 +397,18 @@ impl Fit {
 
     fn apply(&mut self, step: Reduction) {
         match step {
+            Reduction::LeafModel => self.model = ModelTier::Leaf,
             Reduction::DropGlobalSpend => self.global_spend = false,
             Reduction::DropCompactionBorder => self.compaction_border = false,
             Reduction::CompactContext => self.context = ContextTier::Percent,
-            Reduction::ShortThinking => self.thinking = ThinkingTier::Level,
             Reduction::ShortYolo => self.yolo = YoloTier::Sigil,
             Reduction::ShortWorkflows => self.workflows = WorkflowTier::Counts,
             Reduction::DropTransition => self.transition = false,
-            Reduction::LeafModel => self.model = ModelTier::Leaf,
             Reduction::DropSpend => self.spend = false,
             Reduction::DropContext => self.context = ContextTier::Hidden,
             Reduction::DropFast => self.fast = false,
             Reduction::DropWorkflows => self.workflows = WorkflowTier::Hidden,
-            Reduction::DropThinking => self.thinking = ThinkingTier::Hidden,
+            Reduction::DropThinking => self.thinking = false,
             Reduction::ChopModel => self.model = ModelTier::Chopped,
             Reduction::DropYolo => self.yolo = YoloTier::Hidden,
         }
@@ -452,14 +463,10 @@ impl Fit {
     }
 
     fn thinking_width(self, ctx: &StatusBarContext<'_>) -> usize {
-        let Some(level) = ctx.thinking.as_deref() else {
-            return 0;
-        };
-        match self.thinking {
-            ThinkingTier::Named => CHIP_OVERHEAD + THINKING_PREFIX.width() + level.width(),
-            ThinkingTier::Level => CHIP_OVERHEAD + level.width(),
-            ThinkingTier::Hidden => 0,
-        }
+        ctx.thinking
+            .as_deref()
+            .filter(|_| self.thinking)
+            .map_or(0, |level| CHIP_OVERHEAD + level.width())
     }
 
     fn spend_width(self, spend: &SpendText) -> usize {
@@ -474,8 +481,8 @@ impl Fit {
             None => Cow::Borrowed(spend.percent.as_str()),
         };
         match self.context {
-            ContextTier::Counts => Some(Cow::Owned(format!("  {} ({share}) ", spend.counts))),
-            ContextTier::Percent => Some(Cow::Owned(format!("  {share} "))),
+            ContextTier::Counts => Some(Cow::Owned(format!(" {} ({share})", spend.counts))),
+            ContextTier::Percent => Some(Cow::Owned(format!(" {share}"))),
             ContextTier::Hidden => None,
         }
     }
@@ -486,8 +493,8 @@ impl Fit {
         let chat = spend.spend.as_deref().filter(|_| self.spend);
         let session = spend.global.as_deref().filter(|_| self.global_spend);
         match (chat, session) {
-            (Some(chat), Some(session)) => Some(Cow::Owned(format!("{chat}{session}"))),
-            (Some(only), None) | (None, Some(only)) => Some(Cow::Borrowed(only)),
+            (Some(chat), Some(session)) => Some(Cow::Owned(format!(" {chat} {session}"))),
+            (Some(only), None) | (None, Some(only)) => Some(Cow::Owned(format!(" {only}"))),
             (None, None) => None,
         }
     }
@@ -509,6 +516,75 @@ pub struct StatusBar {
     cwd_branch: String,
     pub flash_duration: Duration,
     branch_update_rx: Option<flume::Receiver<()>>,
+    marquee: Marquee,
+}
+
+#[derive(Default)]
+struct Marquee {
+    active: Option<MarqueeState>,
+    used: bool,
+}
+
+struct MarqueeState {
+    target: StatusBarHitTarget,
+    source: String,
+    started_at: Instant,
+}
+
+impl Marquee {
+    fn retain(&mut self, target: Option<StatusBarHitTarget>) {
+        self.used = false;
+        if self.active.as_ref().map(|state| state.target) != target {
+            self.active = None;
+        }
+    }
+
+    fn render(
+        &mut self,
+        target: StatusBarHitTarget,
+        source: &str,
+        width: usize,
+        fallback: Cow<'_, str>,
+        hovered: bool,
+    ) -> Cow<'static, str> {
+        if !hovered || source.width() <= width {
+            if self
+                .active
+                .as_ref()
+                .is_some_and(|state| state.target == target)
+            {
+                self.active = None;
+            }
+            return Cow::Owned(fallback.into_owned());
+        }
+        let changed = self
+            .active
+            .as_ref()
+            .is_none_or(|state| state.target != target || state.source != source);
+        if changed {
+            self.active = Some(MarqueeState {
+                target,
+                source: source.to_owned(),
+                started_at: Instant::now(),
+            });
+        }
+        self.used = true;
+        let elapsed = self
+            .active
+            .as_ref()
+            .map_or(Duration::ZERO, |state| state.started_at.elapsed());
+        Cow::Owned(marquee_window(source, width, elapsed))
+    }
+
+    fn active(&self) -> bool {
+        self.active.is_some()
+    }
+
+    fn finish_frame(&mut self) {
+        if !self.used {
+            self.active = None;
+        }
+    }
 }
 
 impl StatusBar {
@@ -519,6 +595,7 @@ impl StatusBar {
             cwd_branch: cwd_branch_label(),
             flash_duration,
             branch_update_rx: spawn_branch_watcher(),
+            marquee: Marquee::default(),
         }
     }
 
@@ -568,6 +645,7 @@ impl StatusBar {
     /// it counts a retry down by the second. It sits next to [`Self::view`] so
     /// a new moving span cannot forget to claim its frames.
     pub fn cadence(
+        &self,
         status: &Status,
         restoring: bool,
         retrying: bool,
@@ -580,11 +658,24 @@ impl StatusBar {
                 Cadence::SPINNER,
             ),
             Cadence::when(goal_active, Cadence::CLOCK),
+            Cadence::when(self.marquee.active(), Cadence::due(MARQUEE_STEP)),
         ])
     }
 
-    pub fn view(&self, frame: &mut Frame, area: Rect, ctx: &StatusBarContext) -> Vec<StatusBarHit> {
+    pub fn view(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        ctx: &StatusBarContext,
+    ) -> Vec<StatusBarHit> {
+        self.marquee.retain(ctx.hovered.filter(|target| {
+            matches!(
+                target,
+                StatusBarHitTarget::ChatName | StatusBarHitTarget::Cwd | StatusBarHitTarget::Model
+            )
+        }));
         if let Some(url) = ctx.hover_hint.filter(|_| self.flash.is_none()) {
+            self.marquee.finish_frame();
             frame.render_widget(
                 Paragraph::new(Line::from(Span::styled(
                     format!(" {url}"),
@@ -619,11 +710,12 @@ impl StatusBar {
             ));
         }
 
-        let mode_label = ctx.mode.text(area.width);
+        let mut mode_width = ctx.mode.full().width();
         let mode_offset = left_spans.iter().map(Span::width).sum::<usize>() + " ".width();
         left_spans.push(Span::raw(" "));
+        let mode_span = left_spans.len();
         left_spans.push(Span::styled(
-            mode_label.clone(),
+            ctx.mode.full().clone(),
             hover_style(
                 ctx.mode.style,
                 clickable(ctx, StatusBarHitTarget::Mode)
@@ -631,7 +723,7 @@ impl StatusBar {
             ),
         ));
 
-        let back_offset = (!ctx.main_chat)
+        let mut back_offset = (!ctx.main_chat)
             .then(|| left_spans.iter().map(Span::width).sum::<usize>() + " ".width());
         if !ctx.main_chat {
             left_spans.push(Span::raw(" "));
@@ -644,15 +736,45 @@ impl StatusBar {
             ));
         }
 
+        let mut chat_hit = None;
         if let Some(name) = ctx.chat_name {
-            left_spans.push(Span::styled(
-                if ctx.main_chat {
-                    format!(" [{name}]")
+            let wrapper_width = usize::from(ctx.main_chat) * BRACKET_WIDTH;
+            let critical_right = model_floor(ctx)
+                + if ctx.yolo {
+                    YOLO_SHORT_LABEL.width()
                 } else {
-                    format!(" {name}")
-                },
-                theme::current().status_dim,
-            ));
+                    0
+                };
+            let available = (area.width as usize)
+                .saturating_sub(left_spans.iter().map(Span::width).sum::<usize>())
+                .saturating_sub(critical_right)
+                .saturating_sub(1);
+            let slot_total = (area.width as usize / CHAT_NAME_WIDTH_DIVISOR)
+                .min(CHAT_NAME_MAX_WIDTH)
+                .min(available);
+            if slot_total > wrapper_width {
+                let slot_width = slot_total - wrapper_width;
+                let clipped = name.width() > slot_width;
+                let fallback = truncate_head(name, slot_width);
+                let visible = self.marquee.render(
+                    StatusBarHitTarget::ChatName,
+                    name,
+                    slot_width,
+                    fallback,
+                    ctx.hovered == Some(StatusBarHitTarget::ChatName),
+                );
+                let label = if ctx.main_chat {
+                    format!("[{visible}]")
+                } else {
+                    visible.into_owned()
+                };
+                let offset = left_spans.iter().map(Span::width).sum::<usize>() + 1;
+                left_spans.push(Span::raw(" "));
+                left_spans.push(Span::styled(label, theme::current().status_dim));
+                if clipped {
+                    chat_hit = Some((offset, slot_width + wrapper_width));
+                }
+            }
         }
 
         if !ctx.auto_scroll {
@@ -662,7 +784,7 @@ impl StatusBar {
             ));
         }
 
-        let goal_hit = ctx.goal.map(|goal| {
+        let mut goal_hit = ctx.goal.map(|goal| {
             let label = format!(
                 "[goal · {} · {}]",
                 goal.evaluations,
@@ -682,7 +804,7 @@ impl StatusBar {
             (offset, width)
         });
 
-        let retry_hit = ctx.retry_info.map(|retry| {
+        let mut retry_hit = ctx.retry_info.map(|retry| {
             let hovered = ctx.hovered == Some(StatusBarHitTarget::Retry);
             let countdown = if hovered {
                 RETRY_NOW_LABEL.to_owned()
@@ -707,6 +829,28 @@ impl StatusBar {
             (offset, width)
         });
 
+        let full_left_width = left_spans.iter().map(Span::width).sum::<usize>();
+        let full_budget = (area.width as usize).saturating_sub(full_left_width);
+        let short_saving = mode_width.saturating_sub(ctx.mode.short().width());
+        let full_rank = right_fit_rank(ctx, full_budget);
+        let short_rank = right_fit_rank(ctx, full_budget.saturating_add(short_saving));
+        if full_rank > 1 && short_rank > 0 && short_rank < full_rank {
+            left_spans[mode_span] = Span::styled(
+                ctx.mode.short().clone(),
+                hover_style(
+                    ctx.mode.style,
+                    clickable(ctx, StatusBarHitTarget::Mode)
+                        && ctx.hovered == Some(StatusBarHitTarget::Mode),
+                ),
+            );
+            mode_width = ctx.mode.short().width();
+            back_offset = back_offset.map(|offset| offset.saturating_sub(short_saving));
+            chat_hit = chat_hit.map(|(offset, width)| (offset.saturating_sub(short_saving), width));
+            goal_hit = goal_hit.map(|(offset, width)| (offset.saturating_sub(short_saving), width));
+            retry_hit =
+                retry_hit.map(|(offset, width)| (offset.saturating_sub(short_saving), width));
+        }
+
         let mut right_spans = Vec::new();
         let mut right_hits = Vec::new();
 
@@ -716,10 +860,11 @@ impl StatusBar {
             }
             _ => {
                 let left_width = left_spans.iter().map(Span::width).sum::<usize>();
-                let side = right_side(
+                let side = right_side_animated(
                     ctx,
                     &self.cwd_branch,
                     (area.width as usize).saturating_sub(left_width),
+                    Some(&mut self.marquee),
                 );
                 right_spans = side.spans;
                 right_hits = side.hits;
@@ -747,7 +892,7 @@ impl StatusBar {
             ctx,
             left_area,
             mode_offset,
-            mode_label.width(),
+            mode_width,
             StatusBarHitTarget::Mode,
         );
         push_hit(
@@ -781,6 +926,17 @@ impl StatusBar {
                 StatusBarHitTarget::Retry,
             );
         }
+        if let Some((offset, width)) = chat_hit {
+            push_hit(
+                &mut hits,
+                ctx,
+                left_area,
+                offset,
+                width,
+                StatusBarHitTarget::ChatName,
+            );
+        }
+        self.marquee.finish_frame();
         hits
     }
 }
@@ -817,34 +973,25 @@ fn push_control<'a>(chips: &mut Vec<Span<'a>>, text: &str, style: Style) -> Opti
 /// Walks [`LADDER`] until the fixed chips and the model fit, then hands the cwd
 /// whatever is left. The cwd goes last because the model names what answers you
 /// and the path is usually already in the shell prompt.
+#[cfg(test)]
 fn right_side<'a>(
     ctx: &'a StatusBarContext<'_>,
     cwd_label: &'a str,
     budget: usize,
 ) -> RightSide<'a> {
+    right_side_animated(ctx, cwd_label, budget, None)
+}
+
+fn right_side_animated<'a>(
+    ctx: &'a StatusBarContext<'_>,
+    cwd_label: &'a str,
+    budget: usize,
+    mut marquee: Option<&mut Marquee>,
+) -> RightSide<'a> {
     let spend = SpendText::new(&ctx.stats);
-    // Both sides drop the provider they share: a switch names two models the
-    // user just chose between, and the columns a repeated prefix takes are
-    // columns the cwd does not get. Two providers stay, because a model served
-    // by both is a switch that the leaves alone would draw as a no-op. Built
-    // once, because the ladder measures it per rung.
-    let pair = ctx.pending_model.as_deref().map(|leaving| {
-        let shared = model_provider(leaving) == model_provider(ctx.model_id);
-        let named = |id| if shared { model_leaf(id) } else { id };
-        format!(
-            "{}{MODEL_TRANSITION_ARROW}{}",
-            named(leaving),
-            named(ctx.model_id)
-        )
-    });
+    let pair = model_pair(ctx);
     let pair = pair.as_deref();
-    let mut fit = Fit::FULL;
-    for step in LADDER {
-        if fit.width(ctx, &spend, pair) <= budget {
-            break;
-        }
-        fit.apply(step);
-    }
+    let (fit, _) = fit_right(ctx, &spend, pair, budget);
 
     let mut chips = Vec::new();
     let mut chip_hits = Vec::new();
@@ -856,12 +1003,9 @@ fn right_side<'a>(
     };
 
     if let Some(level) = ctx.thinking.as_deref()
-        && fit.thinking != ThinkingTier::Hidden
+        && fit.thinking
     {
-        let label = match fit.thinking {
-            ThinkingTier::Named => format!(" [{THINKING_PREFIX}{level}]"),
-            _ => format!(" [{level}]"),
-        };
+        let label = format!(" [{level}]");
         control(
             &mut chips,
             StatusBarHitTarget::Thinking,
@@ -899,22 +1043,61 @@ fn right_side<'a>(
     }
 
     let residue = budget.saturating_sub(chips.iter().map(Span::width).sum::<usize>());
-    let model = model_text(ctx, fit, residue, pair);
+    let model_source = fit.model_id(ctx, pair);
+    let model = if clickable(ctx, StatusBarHitTarget::Model)
+        && residue >= model_floor(ctx)
+        && model_source.width() + BRACKET_WIDTH > residue
+        && ctx.hovered == Some(StatusBarHitTarget::Model)
+    {
+        let width = residue - BRACKET_WIDTH;
+        let fallback = truncate_tail(model_source, width);
+        let inner = marquee.as_deref_mut().map_or(fallback.clone(), |marquee| {
+            marquee.render(
+                StatusBarHitTarget::Model,
+                model_source,
+                width,
+                fallback,
+                true,
+            )
+        });
+        Cow::Owned(format!("[{inner}]"))
+    } else {
+        model_text(ctx, fit, residue, pair)
+    };
     let separator = if model.is_empty() {
         ""
     } else {
         CWD_MODEL_SEPARATOR
     };
-    let cwd = cwd_text(
+    let cwd_static = cwd_text(
         cwd_label,
         residue
             .saturating_sub(model.width())
             .saturating_sub(separator.width()),
     );
+    let cwd = if !cwd_static.is_empty()
+        && cwd_static != cwd_label
+        && ctx.hovered == Some(StatusBarHitTarget::Cwd)
+    {
+        marquee
+            .as_mut()
+            .map_or(Cow::Borrowed(cwd_static), |marquee| {
+                (*marquee).render(
+                    StatusBarHitTarget::Cwd,
+                    cwd_label,
+                    cwd_static.width(),
+                    Cow::Borrowed(cwd_static),
+                    true,
+                )
+            })
+    } else {
+        Cow::Borrowed(cwd_static)
+    };
     let separator = if cwd.is_empty() { "" } else { separator };
 
     let model_offset = cwd.width() + separator.width();
     let model_width = model.width();
+    let cwd_width = cwd.width();
     let mut spans = Vec::with_capacity(chips.len() + 3);
     spans.push(Span::styled(cwd, theme::current().status_dim));
     spans.push(Span::raw(separator));
@@ -929,7 +1112,11 @@ fn right_side<'a>(
     spans.append(&mut chips);
 
     let chips_at = model_offset + model_width;
-    let mut hits = vec![(StatusBarHitTarget::Model, model_offset, model_width)];
+    let mut hits = Vec::new();
+    if cwd_static != cwd_label && !cwd_static.is_empty() {
+        hits.push((StatusBarHitTarget::Cwd, 0, cwd_width));
+    }
+    hits.push((StatusBarHitTarget::Model, model_offset, model_width));
     hits.extend(
         chip_hits
             .into_iter()
@@ -938,15 +1125,61 @@ fn right_side<'a>(
     RightSide { spans, hits }
 }
 
+/// Both sides drop the provider they share. Two providers stay because a model
+/// served by both is a switch the leaves alone would draw as a no-op.
+fn model_pair(ctx: &StatusBarContext<'_>) -> Option<String> {
+    ctx.pending_model.as_deref().map(|leaving| {
+        let shared = model_provider(leaving) == model_provider(ctx.model_id);
+        let named = |id| if shared { model_leaf(id) } else { id };
+        format!(
+            "{}{MODEL_TRANSITION_ARROW}{}",
+            named(leaving),
+            named(ctx.model_id)
+        )
+    })
+}
+
+fn fit_right(
+    ctx: &StatusBarContext<'_>,
+    spend: &SpendText,
+    pair: Option<&str>,
+    budget: usize,
+) -> (Fit, usize) {
+    let mut fit = Fit::FULL;
+    for (index, step) in LADDER.into_iter().enumerate() {
+        if fit.width(ctx, spend, pair) <= budget {
+            return (fit, index);
+        }
+        fit.apply(step);
+    }
+    (fit, LADDER.len())
+}
+
+fn right_fit_rank(ctx: &StatusBarContext<'_>, budget: usize) -> usize {
+    let spend = SpendText::new(&ctx.stats);
+    let pair = model_pair(ctx);
+    fit_right(ctx, &spend, pair.as_deref(), budget).1
+}
+
 /// Whether a control answers the pointer in the chat being drawn. Every
 /// enablement question the bar and [`crate::app::App`] ask goes through here,
 /// so the glyphs, the hit rects and the click cannot disagree.
 fn clickable(ctx: &StatusBarContext<'_>, target: StatusBarHitTarget) -> bool {
+    if !target.accepts_click() {
+        return false;
+    }
     match target {
         StatusBarHitTarget::BackToMain => !ctx.main_chat,
         StatusBarHitTarget::Mode => ctx.main_chat && !ctx.bash_input,
         _ => ctx.main_chat || target.scope() == ChatScope::Any,
     }
+}
+
+fn hoverable(ctx: &StatusBarContext<'_>, target: StatusBarHitTarget) -> bool {
+    matches!(
+        target,
+        StatusBarHitTarget::ChatName | StatusBarHitTarget::Cwd
+    ) || clickable(ctx, target)
 }
 
 fn control_style(ctx: &StatusBarContext<'_>, target: StatusBarHitTarget) -> Style {
@@ -1041,7 +1274,7 @@ fn push_hit(
     let Some(x) = area.x.checked_add(offset) else {
         return;
     };
-    if clickable(ctx, target)
+    if hoverable(ctx, target)
         && area.height > 0
         && width > 0
         && x.saturating_add(width) <= area.right()
@@ -1062,6 +1295,72 @@ fn format_goal_elapsed(duration: Duration) -> String {
     } else {
         format!("{seconds}s")
     }
+}
+
+fn marquee_window(text: &str, width: usize, elapsed: Duration) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    if text.width() <= width {
+        let mut out = text.to_owned();
+        out.push_str(&" ".repeat(width - text.width()));
+        return out;
+    }
+    let mut starts = vec![0];
+    let mut column = 0;
+    for (byte, grapheme) in text.grapheme_indices(true) {
+        if byte > 0 && column <= text.width() - width {
+            starts.push(byte);
+        }
+        column += grapheme.width();
+    }
+    let pause_steps = MARQUEE_PAUSE.as_millis() / MARQUEE_STEP.as_millis();
+    let travel_steps = starts.len().saturating_sub(1) as u128;
+    let cycle = pause_steps * 2 + travel_steps * 2;
+    let tick = elapsed.as_millis() / MARQUEE_STEP.as_millis() % cycle;
+    let frame = if tick < pause_steps {
+        0
+    } else if tick < pause_steps + travel_steps {
+        tick - pause_steps
+    } else if tick < pause_steps * 2 + travel_steps {
+        travel_steps
+    } else {
+        cycle - tick
+    } as usize;
+
+    let mut used = 0;
+    let mut out = String::new();
+    for grapheme in text[starts[frame]..].graphemes(true) {
+        let grapheme_width = grapheme.width();
+        if used + grapheme_width > width {
+            break;
+        }
+        out.push_str(grapheme);
+        used += grapheme_width;
+    }
+    out.push_str(&" ".repeat(width - used));
+    out
+}
+
+fn truncate_head(s: &str, max_width: usize) -> Cow<'_, str> {
+    if s.width() <= max_width {
+        return Cow::Borrowed(s);
+    }
+    if max_width <= TRUNCATE_PREFIX.width() {
+        return Cow::Owned(".".repeat(max_width));
+    }
+    let budget = max_width - TRUNCATE_PREFIX.width();
+    let mut used = 0;
+    let mut end = 0;
+    for (index, character) in s.char_indices() {
+        let width = character.width().unwrap_or(0);
+        if used + width > budget {
+            break;
+        }
+        used += width;
+        end = index + character.len_utf8();
+    }
+    Cow::Owned(format!("{}{TRUNCATE_PREFIX}", &s[..end]))
 }
 
 fn truncate_tail(s: &str, max_width: usize) -> Cow<'_, str> {
@@ -1200,8 +1499,7 @@ mod tests {
     const SHORT_WORKFLOWS_MSG: &str = "a squeezed workflow chip must fall back to its counts";
     const LADDER_CWD: &str = "~/projects/caudra:main";
     const PERCENT_MARK: &str = "%";
-    /// A budget the ladder answers with a squeezed thinking chip: wide enough
-    /// to keep the control, too narrow to spell the word in front of it.
+    /// A budget that keeps the compact thinking control on a squeezed bar.
     const SHORT_THINKING_BUDGET: usize = 36;
     const SHORT_THINKING_CHIP: &str = "[xhigh]";
     /// Room for every rung, so both figures are on screen at their full tier,
@@ -1210,9 +1508,9 @@ mod tests {
     /// 90% of [`crate::components::TEST_CONTEXT_WINDOW`], the share a window
     /// that already excludes its output allowance compacts at.
     const COMPACTION_BORDER: u32 = 180_000;
-    const COUNTS_GLYPHS: &str = "12.0k/200.0k (6%/90%)";
-    const BARE_COUNTS_GLYPHS: &str = "12.0k/200.0k (6%)";
-    const MONEY_GLYPHS: &str = "$0.250  \u{03a3}$1.500";
+    const COUNTS_GLYPHS: &str = "12k/200k (6%/90%)";
+    const BARE_COUNTS_GLYPHS: &str = "12k/200k (6%)";
+    const MONEY_GLYPHS: &str = "$0.25 \u{03a3}$1.5";
     const MISSING_HIT_MSG: &str = "the control was drawn without a hit";
     const FIGURE_HIT_MSG: &str = "a figure's hit must cover its glyphs and no padding";
     const STALE_HIT_MSG: &str = "a hit outlived the figure it was measured on";
@@ -1222,9 +1520,9 @@ mod tests {
     const SHORT_THINKING_MSG: &str = "a squeezed thinking chip must still own its own glyphs";
     const CONTEXT_SIZE: u32 = 12_000;
     const CHAT_COST: f64 = 0.25;
-    const CHAT_COST_TEXT: &str = "$0.250";
+    const CHAT_COST_TEXT: &str = "$0.25";
     const SESSION_COST: f64 = 1.5;
-    const SESSION_COST_TEXT: &str = "\u{03a3}$1.500";
+    const SESSION_COST_TEXT: &str = "\u{03a3}$1.5";
     const SIGMA: char = '\u{03a3}';
     const GOAL_CONDITION: &str = "all focused tests pass";
     const GOAL_CHIP_PREFIX: &str = "[goal \u{b7}";
@@ -1299,6 +1597,7 @@ mod tests {
         main_chat: bool,
         model_id: &'a str,
         pending_model: Option<&'a str>,
+        chat_name: Option<&'a str>,
     }
 
     impl Default for Fixture<'_> {
@@ -1317,6 +1616,7 @@ mod tests {
                 main_chat: true,
                 model_id: MODEL_ID,
                 pending_model: None,
+                chat_name: None,
             }
         }
     }
@@ -1336,8 +1636,9 @@ mod tests {
             main_chat,
             model_id,
             pending_model,
+            chat_name,
         } = fixture;
-        let bar = StatusBar::new(FLASH_TTL);
+        let mut bar = StatusBar::new(FLASH_TTL);
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 1)).unwrap();
         let ctx = StatusBarContext {
@@ -1360,7 +1661,7 @@ mod tests {
                 show_global,
             },
             auto_scroll: true,
-            chat_name: None,
+            chat_name,
             main_chat,
             retry_info,
             thinking: Some(THINKING_LEVEL.into()),
@@ -1703,6 +2004,118 @@ mod tests {
         });
     }
 
+    #[test]
+    fn provider_is_the_first_full_tier_to_go() {
+        with_ladder_ctx(|ctx| {
+            let spend = SpendText::new(&ctx.stats);
+            let full_width = Fit::FULL.width(ctx, &spend, None);
+            let (fit, reductions) = fit_right(ctx, &spend, None, full_width - 1);
+
+            assert_eq!(reductions, 1);
+            assert_eq!(fit.model, ModelTier::Leaf);
+            assert_eq!(fit.global_spend, Fit::FULL.global_spend);
+            assert_eq!(fit.context, Fit::FULL.context);
+            assert_eq!(fit.workflows, Fit::FULL.workflows);
+            assert_eq!(fit.yolo, Fit::FULL.yolo);
+        });
+    }
+
+    #[test]
+    fn thinking_never_spends_columns_naming_itself() {
+        with_ladder_ctx(|ctx| {
+            let side = right_side(ctx, LADDER_CWD, WIDE_BUDGET);
+            assert_eq!(
+                hit_glyphs(&side, StatusBarHitTarget::Thinking),
+                SHORT_THINKING_CHIP
+            );
+            assert!(!side_text(&side).contains("thinking:"));
+        });
+    }
+
+    #[test_case(0,    "abc" ; "holds_at_the_start")]
+    #[test_case(720,  "bcd" ; "moves_forward")]
+    #[test_case(960,  "def" ; "holds_at_the_end")]
+    #[test_case(1680, "cde" ; "moves_backward")]
+    fn marquee_bounces_between_both_ends(elapsed_ms: u64, expected: &str) {
+        assert_eq!(
+            marquee_window("abcdef", 3, Duration::from_millis(elapsed_ms)),
+            expected
+        );
+    }
+
+    #[test]
+    fn marquee_keeps_a_unicode_slots_width() {
+        let text = marquee_window("你好世界", 4, Duration::from_millis(720));
+        assert_eq!(text.width(), 4);
+        assert_eq!(text, "好世");
+    }
+
+    #[test]
+    fn marquee_pads_text_that_is_shorter_than_its_slot() {
+        let text = marquee_window("ok", 4, Duration::ZERO);
+        assert_eq!(text, "ok  ");
+        assert_eq!(text.width(), 4);
+    }
+
+    #[test]
+    fn marquee_resets_when_its_source_changes() {
+        let mut marquee = Marquee::default();
+        let _ = marquee.render(
+            StatusBarHitTarget::ChatName,
+            "abcdef",
+            3,
+            Cow::Borrowed("a.."),
+            true,
+        );
+        marquee.active.as_mut().unwrap().started_at = Instant::now() - Duration::from_millis(720);
+        assert_eq!(
+            marquee.render(
+                StatusBarHitTarget::ChatName,
+                "uvwxyz",
+                3,
+                Cow::Borrowed("u.."),
+                true,
+            ),
+            "uvw"
+        );
+    }
+
+    #[test]
+    fn an_active_marquee_claims_only_its_step_cadence() {
+        let mut bar = StatusBar::new(FLASH_TTL);
+        bar.marquee.active = Some(MarqueeState {
+            target: StatusBarHitTarget::ChatName,
+            source: "a long chat name".into(),
+            started_at: Instant::now(),
+        });
+
+        assert_eq!(
+            bar.cadence(&Status::Idle, false, false, false, false),
+            Cadence::due(MARQUEE_STEP)
+        );
+    }
+
+    #[test]
+    fn a_long_chat_name_is_bounded_and_hover_only() {
+        const LONG_NAME: &str = "a-session-name-longer-than-the-footer-can-afford";
+        let (_, hits, _) = render_at(Fixture {
+            chat_name: Some(LONG_NAME),
+            yolo: true,
+            ..Fixture::default()
+        });
+        let chat = hits
+            .iter()
+            .find(|hit| hit.target == StatusBarHitTarget::ChatName)
+            .expect("a clipped chat name needs a hover target");
+
+        assert!(usize::from(chat.area.width) <= CHAT_NAME_MAX_WIDTH);
+        assert!(!chat.target.accepts_click());
+        assert!(
+            hits.iter()
+                .any(|hit| hit.target == StatusBarHitTarget::Model)
+        );
+    }
+
     #[test_case("anthropic/claude-opus-5", "claude-opus-5" ; "strips_provider_and_org")]
     #[test_case("claude-opus-5", "claude-opus-5"           ; "bare_id_is_its_own_leaf")]
     #[test_case("anthropic/", "anthropic/"                 ; "trailing_slash_keeps_the_id")]
@@ -1797,8 +2210,8 @@ mod tests {
         );
     }
 
-    /// The pair costs roughly twice what one name does, so it goes before the
-    /// bar starts eating into the model the next turn will actually run on.
+    /// The provider is already gone at the first pressure rung. The pair still
+    /// goes before the bar starts character-clipping the arriving model.
     #[test]
     fn a_narrowing_bar_drops_the_transition_before_it_shortens_the_model() {
         with_ladder_ctx_leaving(Some(LEAVING_MODEL_ID), |ctx| {
@@ -1813,7 +2226,7 @@ mod tests {
                 .position(|text| !text.contains(MODEL_TRANSITION_ARROW))
                 .expect(PAIR_KEPT);
             assert!(
-                texts[dropped].contains(LADDER_MODEL_ID),
+                texts[dropped].contains(LADDER_MODEL_LEAF),
                 "{PAIR_KEPT}: {}",
                 texts[dropped]
             );
@@ -1952,14 +2365,15 @@ mod tests {
         });
         assert!(busy.contains(SNAPSHOTTING_LABEL), "{NAMED_MSG}");
 
+        let bar = StatusBar::new(FLASH_TTL);
         assert_eq!(
-            StatusBar::cadence(&Status::Idle, false, false, false, true),
+            bar.cadence(&Status::Idle, false, false, false, true),
             Cadence::SPINNER,
             "{}",
             crate::repaint::expect::OWED
         );
         assert_eq!(
-            StatusBar::cadence(&Status::Idle, false, false, false, false),
+            bar.cadence(&Status::Idle, false, false, false, false),
             Cadence::IDLE,
             "{}",
             crate::repaint::expect::QUIET
@@ -2073,6 +2487,10 @@ mod tests {
     #[test_case(Some(0.123), None,        Some("$0.123")  ; "billed_spend_is_bare")]
     #[test_case(None,        Some(4.567), Some("~$4.567") ; "subscription_is_marked")]
     #[test_case(Some(0.123), Some(4.567), Some("$0.123")  ; "billed_wins_a_mixed_slot")]
+    #[test_case(Some(0.250), None,        Some("$0.25")   ; "empty_hundredth_is_trimmed")]
+    #[test_case(Some(1.500), None,        Some("$1.5")    ; "empty_hundredths_are_trimmed")]
+    #[test_case(Some(0.0004), None,       Some("$0.000")  ; "tiny_real_cost_does_not_claim_zero")]
+    #[test_case(Some(0.0), None,          Some("$0")      ; "known_zero_is_zero")]
     #[test_case(None,        None,        None            ; "nothing_spent_shows_nothing")]
     fn spend_cases(billed: Option<f64>, subscription: Option<f64>, expected: Option<&str>) {
         assert_eq!(spend(billed, subscription).as_deref(), expected);
@@ -2221,22 +2639,35 @@ mod tests {
         );
     }
 
-    /// The label is measured for the click target and drawn from the same
-    /// choice, so a bar that abbreviates one and not the other would leave the
-    /// mode clickable over the wrong columns.
-    #[test_case(MODE_SHORT_WIDTH, MODE_LABEL ; "the_name_survives_at_the_threshold")]
-    #[test_case(MODE_SHORT_WIDTH - 1, MODE_SHORT_LABEL ; "one_column_narrower_abbreviates")]
-    fn a_narrow_bar_abbreviates_the_mode(width: u16, expected: &str) {
-        let (text, hits, _) = render_at(Fixture {
-            width,
-            ..Fixture::default()
+    /// Width alone does not choose the abbreviation: the same terminal keeps
+    /// the full mode on a quiet bar and spends those columns when they preserve
+    /// a richer right-side tier.
+    #[test]
+    fn footer_pressure_abbreviates_the_mode() {
+        let found = (20..=200).find_map(|width| {
+            let quiet = render_at(Fixture {
+                width,
+                ..Fixture::default()
+            });
+            let busy = render_at(Fixture {
+                width,
+                workflows: ladder_workflows(),
+                yolo: true,
+                ..Fixture::default()
+            });
+            (quiet.0.contains(MODE_LABEL) && busy.0.contains(MODE_SHORT_LABEL))
+                .then_some((width, quiet, busy))
         });
-        assert!(text.contains(expected), "{text}");
+        let (width, _, (_, hits, _)) = found.expect("pressure never abbreviated the mode");
         let hit = hits
             .iter()
             .find(|hit| hit.target == StatusBarHitTarget::Mode)
             .expect(EXPECTED_MODE_HIT);
-        assert_eq!(usize::from(hit.area.width), expected.width());
+        assert_eq!(
+            usize::from(hit.area.width),
+            MODE_SHORT_LABEL.width(),
+            "{width}"
+        );
     }
 
     #[test]

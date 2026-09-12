@@ -596,7 +596,7 @@ mod tests {
 
     #[test_case(0, "~0 tokens" ; "an_empty_note_reports_zero")]
     #[test_case(999, "~999 tokens" ; "counts_below_a_thousand_stay_exact")]
-    #[test_case(1_000, "~1.0k tokens" ; "a_thousand_switches_to_the_k_suffix")]
+    #[test_case(1_000, "~1k tokens" ; "a_thousand_switches_to_the_k_suffix")]
     #[test_case(1_304, "~1.3k tokens" ; "larger_counts_round_to_one_decimal")]
     fn token_label_formats(tokens: u32, expected: &str) {
         assert_eq!(token_label(tokens), expected);

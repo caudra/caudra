@@ -4,7 +4,7 @@ use std::sync::{LazyLock, Mutex};
 
 use tiktoken_rs::CoreBPE;
 
-use crate::model::format_tokens;
+use crate::model::{format_tokens, format_tokens_wide};
 
 /// Cleared wholesale on overflow rather than evicted one by one. Tool results
 /// are stable within a turn, so the worst a clear costs is re-counting them
@@ -70,17 +70,24 @@ pub fn token_label(tokens: u32) -> String {
 }
 
 /// [`format_tokens`] takes the `u32` a session counts in; a lifetime total
-/// needs the wider one, and saturating keeps the display honest rather than
-/// wrapping.
+/// needs the wider one.
 pub fn format_tokens_u64(value: u64) -> String {
-    format_tokens(u32::try_from(value).unwrap_or(u32::MAX))
+    format_tokens_wide(value)
 }
 
 #[cfg(test)]
 mod tests {
     use test_case::test_case;
 
-    use super::{CACHE_CAPACITY, estimate_tokens, estimate_tokens_cached};
+    use super::{CACHE_CAPACITY, estimate_tokens, estimate_tokens_cached, format_tokens_u64};
+
+    #[test_case(u64::from(u32::MAX), "4295m" ; "largest_session_count")]
+    #[test_case(u64::from(u32::MAX) + 1, "4295m" ; "past_session_count")]
+    #[test_case(10_000_000_000, "10000m" ; "lifetime_total_is_not_capped")]
+    #[test_case(u64::MAX, "18446744073709.6m" ; "largest_lifetime_total")]
+    fn wide_token_counts_keep_their_value(value: u64, expected: &str) {
+        assert_eq!(format_tokens_u64(value), expected);
+    }
 
     #[test_case("", 0 ; "empty_text_costs_nothing")]
     #[test_case("hello", 1 ; "a_common_word_is_one_token")]

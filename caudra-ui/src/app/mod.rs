@@ -4383,7 +4383,7 @@ impl App {
     pub fn cadence(&self) -> Cadence {
         Cadence::any([
             Cadence::any(self.overlays().into_iter().map(Overlay::cadence)),
-            StatusBar::cadence(
+            self.status_bar.cadence(
                 &self.status,
                 self.restoring.load(Ordering::Relaxed),
                 self.retry_info.is_some(),
