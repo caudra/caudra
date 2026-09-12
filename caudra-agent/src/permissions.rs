@@ -2751,6 +2751,27 @@ mod tests {
         ))
     }
 
+    /// A prompt has to name the authority covering a row, and this rule's
+    /// selector is `Any`. Read off the selector alone it would tell the user
+    /// every command is allowed, when the rule reaches only what the shell tool
+    /// marked. Nothing showed the string before, because a line whose every row
+    /// is confined raises no prompt to read it off.
+    #[test]
+    fn a_confined_read_names_the_reason_rather_than_its_selector() {
+        let mut request = shell_request(&[CONFINED_COMMAND], workcell_shell_subject());
+        mark_confined(&mut request);
+
+        assert_eq!(
+            coverage_with(&default_mgr(), &request, false, &builtin_structured_rules())
+                .covered
+                .swap_remove(0),
+            Some(ResourceCoverage {
+                origin: RuleOrigin::Builtin,
+                authority: CONFINED_READ_AUTHORITY.into(),
+            })
+        );
+    }
+
     /// Coverage is only worth anything if the manager actually consults the
     /// builtin rule when it collects the applicable set, which no test that
     /// hands the rule in directly can show.

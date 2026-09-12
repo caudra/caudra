@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use url::Url;
 
+use super::CONFINED_READ_ATTRIBUTE;
 use super::command_pattern::{PatternFault, grade_command_pattern};
 use crate::tools::PermissionIntent;
 
@@ -57,6 +58,7 @@ const MAX_URL_LADDER_RUNGS: usize = 8;
 const OUTSIDE_HOME_PHRASE: &str = "ALLOW OUTSIDE HOME";
 pub(super) const BROAD_SHELL_PHRASE: &str = "ALLOW BROAD SHELL ACCESS";
 const WORKDIR_ATTRIBUTE: &str = "workdir";
+pub(super) const CONFINED_READ_AUTHORITY: &str = "reads inside the project";
 /// The executable-name-resolved form of a command, set by the shell tool.
 /// Restrictive policy is matched against it as well as the reviewed text, so a
 /// deny cannot be dodged by spelling the executable as a path.
@@ -1219,7 +1221,7 @@ pub fn permission_rules_resource_standing(
             origin: policy.origin,
             authority: constraint.map_or_else(
                 || blanket_authority(&resource.kind),
-                |constraint| selector_authority(&constraint.selector, &resource.kind),
+                |constraint| constraint_authority(constraint, &resource.kind),
             ),
         });
     ResourceStanding { decision, coverage }
@@ -1241,6 +1243,20 @@ fn resource_decision<'a>(
 
 /// How a covering constraint names a resource, for a prompt that has to say why
 /// the resource is already allowed.
+///
+/// An attribute narrows a constraint past whatever its selector says, so the
+/// selector alone would describe the confined-read rule as reaching any command
+/// when it only reaches a command the shell tool already judged.
+fn constraint_authority(
+    constraint: &PermissionResourceConstraint,
+    kind: &PermissionResourceKind,
+) -> String {
+    if constraint.attributes.contains_key(CONFINED_READ_ATTRIBUTE) {
+        return CONFINED_READ_AUTHORITY.into();
+    }
+    selector_authority(&constraint.selector, kind)
+}
+
 fn selector_authority(
     selector: &PermissionResourceSelector,
     kind: &PermissionResourceKind,
