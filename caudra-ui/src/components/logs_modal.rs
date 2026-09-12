@@ -139,6 +139,7 @@ pub struct LogsModal {
     level_hit: Rect,
     level_hovered: bool,
     scrollbar: Scrollbar,
+    pan_bar: Scrollbar,
 }
 
 impl LogsModal {
@@ -166,6 +167,7 @@ impl LogsModal {
             level_hit: Rect::default(),
             level_hovered: false,
             scrollbar: Scrollbar::default(),
+            pan_bar: Scrollbar::horizontal(),
         }
     }
 
@@ -515,6 +517,14 @@ impl LogsModal {
                 return LogsAction::Consumed;
             }
         }
+        match self.pan_bar.handle(&event) {
+            ScrollbarMouse::Ignored => {}
+            ScrollbarMouse::Consumed => return LogsAction::Consumed,
+            ScrollbarMouse::ScrollTo(column) => {
+                self.pan = (column as usize).min(self.max_pan);
+                return LogsAction::Consumed;
+            }
+        }
         let pos = Position::new(event.column, event.row);
         match event.kind {
             MouseEventKind::ScrollUp => self.scroll_view(-1),
@@ -564,7 +574,8 @@ impl LogsModal {
         };
         let width = usize::from(padded.width);
         self.anchor(width, theme);
-        self.max_pan = self.widest_row(theme).saturating_sub(width);
+        let widest = self.widest_row(theme);
+        self.max_pan = widest.saturating_sub(width);
         self.pan = self.pan.min(self.max_pan);
         let (lines, rows) = self.body_lines(width, theme);
         self.rows = rows;
@@ -606,6 +617,23 @@ impl LogsModal {
             },
             len,
             offset,
+        );
+        // The bottom border row, the same place every panning modal puts it. A
+        // wrapped pane has nothing off screen, so it reports no width to pan.
+        let pannable = match self.wrap {
+            true => 0,
+            false => u16::try_from(widest).unwrap_or(u16::MAX),
+        };
+        self.pan_bar.draw(
+            frame,
+            Rect {
+                x: inner.x,
+                y: popup.bottom().saturating_sub(1),
+                width: inner.width,
+                height: 1,
+            },
+            pannable,
+            u16::try_from(self.pan).unwrap_or(u16::MAX),
         );
 
         self.popup = popup;

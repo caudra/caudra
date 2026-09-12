@@ -668,21 +668,35 @@ impl App {
                 self.update_transcript_hover(event.row, event.column);
             }
             MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight => {
+                let delta = match event.kind {
+                    MouseEventKind::ScrollLeft => -super::PAN_STEP,
+                    _ => super::PAN_STEP,
+                };
                 if self.has_modal_overlay() {
+                    self.pan_modal(delta);
                     return Vec::new();
                 }
                 // Hover decides the target, so a sideways wheel only reaches
                 // the diagram the pointer is actually over.
                 self.update_transcript_hover(event.row, event.column);
-                let delta = match event.kind {
-                    MouseEventKind::ScrollLeft => -super::PAN_STEP,
-                    _ => super::PAN_STEP,
-                };
                 self.chats[self.active_chat].pan_hovered_diagram(delta);
             }
             _ => {}
         }
         Vec::new()
+    }
+
+    /// Offers a sideways wheel to the open modal. Only the ones that draw
+    /// unwrapped lines can use it; the rest reflow, so there is nothing off
+    /// screen for a pan to reach and the event is dropped as it was before.
+    /// `/logs` is absent because it answers the wheel in its own `handle_mouse`,
+    /// which runs long before this.
+    fn pan_modal(&mut self, delta: i32) {
+        if self.usage_modal.is_open() {
+            self.usage_modal.pan(delta);
+        } else if self.help_modal.is_open() {
+            self.help_modal.pan(delta);
+        }
     }
 
     pub(super) fn handle_scroll(&mut self, column: u16, row: u16, delta: i32) {

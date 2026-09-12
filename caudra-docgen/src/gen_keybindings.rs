@@ -101,6 +101,13 @@ fn write_focus(out: &mut String) {
          which message the thumb is on.\n\n",
     );
     out.push_str(
+        "A modal whose lines run wider than the screen wears a second bar \
+         along its bottom border, and drags the same way. `Shift+Left` and \
+         `Shift+Right` move it by a column of a table at a time, and a \
+         sideways wheel over the modal moves it too. The bar appears only \
+         while there is something off the edge to reach.\n\n",
+    );
+    out.push_str(
         "Holding `Alt` while turning the wheel scrolls four times as far. \
          A middle-click anchors the view and scrolls it on its own, faster \
          the further you then move the pointer from the mark, until you \

@@ -14250,6 +14250,56 @@ fn a_sideways_wheel_over_prose_pans_nothing() {
     assert_eq!(app.chats[0].panned_diagram_count(), 0);
 }
 
+/// 43 columns of model id, which puts `/usage`'s row well past an 80-column
+/// terminal and leaves the cost column off the modal.
+const LONG_SPEND_MODEL: &str = "a-model-with-a-deliberately-long-identifier";
+const LONG_SPEND_TEXT: &str = "0.750";
+const CLIPPED_COST: &str = "the cost column must start off the edge of a narrow modal";
+const WHEEL_DROPPED: &str = "a sideways wheel over a clipped modal must pan it";
+
+fn app_with_wide_spend() -> App {
+    let mut app = test_app();
+    app.state.session_mut().add_model_usage(
+        LONG_SPEND_MODEL,
+        StoredTokenUsage {
+            input: 1_000_000,
+            cost: Some(0.75),
+            ..StoredTokenUsage::default()
+        },
+    );
+    app.execute_command(cmd("/usage"), 0);
+    app
+}
+
+/// The wheel used to be dropped outright while a modal was open, which left the
+/// clipped half of a wide table unreachable by pointer.
+#[test]
+fn a_sideways_wheel_pans_the_modal_it_is_over() {
+    let mut app = app_with_wide_spend();
+
+    assert!(!rendered(&mut app).contains(LONG_SPEND_TEXT), "{CLIPPED_COST}");
+
+    for _ in 0..8 {
+        app.update(mouse_event(MouseEventKind::ScrollRight, 5, 5));
+    }
+
+    assert!(rendered(&mut app).contains(LONG_SPEND_TEXT), "{WHEEL_DROPPED}");
+}
+
+/// The chord reaches the modal the same way the wheel does, and the transcript
+/// behind it never sees either while one is open.
+#[test]
+fn the_pan_chord_reaches_an_open_modal() {
+    let mut app = app_with_wide_spend();
+    let _ = rendered(&mut app);
+
+    for _ in 0..8 {
+        app.update(Msg::Key(kb::PAN_RIGHT.to_key_event()));
+    }
+
+    assert!(rendered(&mut app).contains(LONG_SPEND_TEXT), "{WHEEL_DROPPED}");
+}
+
 /// `test_app` shares one state dir across the whole run, and the stash is a
 /// single global file, so these tests need their own.
 fn stash_app() -> (TempDir, App) {

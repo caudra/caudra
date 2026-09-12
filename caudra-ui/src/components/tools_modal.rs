@@ -21,7 +21,6 @@ const WIDTH_PERCENT: u16 = 72;
 const MAX_HEIGHT_PERCENT: u16 = 82;
 const H_PAD: u16 = 2;
 const H_PAD_STEP_WIDTH: u16 = 16;
-const BORDER_COLUMNS: u16 = 2;
 const DECLARED_GLYPH: &str = "\u{25cf}";
 const DEFERRED_GLYPH: &str = "\u{25cb}";
 const DISABLED_GLYPH: &str = "\u{d7}";
@@ -312,8 +311,7 @@ fn section_line(title: &str, theme: &Theme) -> Line<'static> {
 }
 
 fn content_width(area: Rect) -> u16 {
-    let width = area.width.saturating_mul(WIDTH_PERCENT) / 100;
-    let inner = width.saturating_sub(BORDER_COLUMNS);
+    let inner = Modal::inner_width(area.width, WIDTH_PERCENT);
     inner.saturating_sub(horizontal_padding(inner).saturating_mul(2))
 }
 

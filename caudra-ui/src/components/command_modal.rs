@@ -267,8 +267,7 @@ impl Overlay for CommandModal {
 /// Columns inside the border, floored above the chevron so the input row
 /// always has somewhere to wrap into.
 fn modal_inner_width(area: Rect, width_percent: u16) -> u16 {
-    ((area.width as u32 * width_percent as u32 / 100).saturating_sub(2) as u16)
-        .max(CHEVRON.width() as u16 + 1)
+    Modal::inner_width(area.width, width_percent).max(CHEVRON.width() as u16 + 1)
 }
 
 /// Zero for empty text, so a command with no description spends no row on it.

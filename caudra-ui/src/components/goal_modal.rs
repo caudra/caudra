@@ -119,8 +119,7 @@ impl GoalModal {
             return Rect::default();
         }
 
-        let width = (area.width as u32 * WIDTH_PERCENT as u32 / 100)
-            .saturating_sub((2 + H_PAD * 2) as u32) as u16;
+        let width = Modal::inner_width(area.width, WIDTH_PERCENT).saturating_sub(H_PAD * 2);
         self.active = is_active(status);
         let mut lines = status_lines(status, evaluator, continuation_limit);
         let total = Paragraph::new(lines.clone())

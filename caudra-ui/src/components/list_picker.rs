@@ -758,8 +758,7 @@ fn render_ready<T: PickerItem>(
         }
     };
     let error_rows = error_text.is_some() as u16;
-    let modal_inner_width =
-        (area.width as u32 * options.width_percent as u32 / 100).saturating_sub(2) as u16;
+    let modal_inner_width = Modal::inner_width(area.width, options.width_percent);
     let requested_info_rows = info_text.map_or(0, |text| {
         Paragraph::new(text)
             .wrap(ratatui::widgets::Wrap { trim: false })

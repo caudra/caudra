@@ -28,6 +28,9 @@ pub struct HelpModal {
     open: bool,
     scroll: ModalScroll,
     scrollbar: Scrollbar,
+    /// A binding's description is as long as it is, so a narrow modal cuts the
+    /// half of the reference that says what a key does.
+    pan_bar: Scrollbar,
     popup: Rect,
 }
 
@@ -85,6 +88,7 @@ impl HelpModal {
             open: false,
             scroll: ModalScroll::new_top(),
             scrollbar: Scrollbar::default(),
+            pan_bar: Scrollbar::horizontal(),
             popup: Rect::default(),
         }
     }
@@ -107,14 +111,23 @@ impl HelpModal {
         self.scroll.reset();
     }
 
-    /// The modal reads nothing else from the pointer, so the bar is all there
-    /// is to offer and a bool is all there is to say.
+    /// The modal reads nothing else from the pointer, so the two bars are all
+    /// there is to offer and a bool is all there is to say. They sit on different
+    /// rows, so at most one of them answers a press.
     pub fn handle_mouse(&mut self, event: &MouseEvent) -> bool {
         match self.scrollbar.handle(event) {
-            ScrollbarMouse::Ignored => false,
-            ScrollbarMouse::Consumed => true,
+            ScrollbarMouse::Ignored => {}
+            ScrollbarMouse::Consumed => return true,
             ScrollbarMouse::ScrollTo(top) => {
                 self.scroll.scroll_to(top as u16);
+                return true;
+            }
+        }
+        match self.pan_bar.handle(event) {
+            ScrollbarMouse::Ignored => false,
+            ScrollbarMouse::Consumed => true,
+            ScrollbarMouse::ScrollTo(column) => {
+                self.scroll.pan_to(column as u16);
                 true
             }
         }
@@ -122,6 +135,12 @@ impl HelpModal {
 
     pub fn scroll(&mut self, delta: i32) {
         self.scroll.scroll(delta);
+    }
+
+    /// A sideways wheel over the modal, which the app routes here rather than
+    /// dropping now that the content can run off the edge.
+    pub fn pan(&mut self, delta: i32) {
+        self.scroll.pan_by(delta);
     }
 
     pub fn handle_key(&mut self, key_event: KeyEvent) -> bool {
@@ -224,14 +243,34 @@ impl HelpModal {
             max_height_percent: 80,
         };
         let (popup, inner) = modal.render(frame, area, total);
-        let viewport_h = inner.height;
-        self.scroll.update_dimensions(total, viewport_h);
+        let content_w = lines
+            .iter()
+            .map(Line::width)
+            .max()
+            .and_then(|width| u16::try_from(width).ok())
+            .unwrap_or(u16::MAX);
+        self.scroll.update_dimensions(total, inner.height);
+        self.scroll.fit_width(content_w, inner.width);
         let scroll = self.scroll.offset();
+        let pan = self.scroll.pan();
 
-        let paragraph = Paragraph::new(lines).scroll((scroll, 0));
-        frame.render_widget(paragraph, inner);
+        frame.render_widget(Paragraph::new(lines).scroll((scroll, pan)), inner);
 
         self.scrollbar.draw(frame, inner, total, scroll);
+        // The bottom border row: the only row the bar can have without taking one
+        // from the reference. Nothing is painted while the rows fit, because a
+        // track is only built for content that overflows.
+        self.pan_bar.draw(
+            frame,
+            Rect {
+                x: inner.x,
+                y: popup.bottom().saturating_sub(1),
+                width: inner.width,
+                height: 1,
+            },
+            content_w,
+            pan,
+        );
 
         self.popup = popup;
         popup
@@ -252,8 +291,21 @@ impl Overlay for HelpModal {
 mod tests {
     use super::*;
     use crate::components::key as key_ev;
+    use caudra_workbench::scroll::SCROLLBAR_THUMB_HORIZONTAL;
     use crossterm::event::KeyCode;
     use test_case::test_case;
+
+    /// A small screen: the modal fills its floor and the reference still runs
+    /// past it.
+    const NARROW_TERMINAL: u16 = 80;
+    /// Wide enough that every row fits inside the modal.
+    const WIDE_TERMINAL: u16 = 300;
+    /// The widest description on the reference's first screenful. A narrow modal
+    /// shows it as far as `expanded transcr` and cuts the rest.
+    const CUT_DESCRIPTION: &str = "expanded transcript";
+    const DESCRIPTION_UNREACHABLE: &str = "panning must bring the description into view";
+    const BAR_UNWANTED: &str = "a reference that fits must not wear a pan bar";
+    const BAR_MISSING: &str = "a row running off the edge must show what reaches it";
 
     #[test_case(key_ev(KeyCode::Esc)       ; "esc_closes")]
     #[test_case(key::QUIT.to_key_event()    ; "ctrl_c_closes")]
@@ -271,5 +323,54 @@ mod tests {
         modal.toggle();
         assert!(modal.handle_key(key_ev(KeyCode::Char('a'))));
         assert!(modal.is_open());
+    }
+
+    /// A description is as long as it is, so on a small screen the half of the
+    /// reference that says what a key does is off the edge.
+    #[test]
+    fn a_description_cut_by_a_narrow_screen_is_reachable_by_panning() {
+        let mut modal = HelpModal::new();
+        modal.toggle();
+
+        let clipped = render_at(&mut modal, NARROW_TERMINAL);
+        assert!(
+            !clipped.contains(CUT_DESCRIPTION),
+            "the description should start off the edge"
+        );
+
+        modal.handle_key(key::PAN_RIGHT.to_key_event());
+
+        assert!(
+            render_at(&mut modal, NARROW_TERMINAL).contains(CUT_DESCRIPTION),
+            "{DESCRIPTION_UNREACHABLE}"
+        );
+    }
+
+    /// Enough rows fit that the widest one always runs past a narrow modal, and
+    /// never past a wide one.
+    #[test]
+    fn the_pan_bar_shows_only_while_a_row_runs_past_the_modal() {
+        let mut modal = HelpModal::new();
+        modal.toggle();
+
+        assert!(
+            render_at(&mut modal, NARROW_TERMINAL).contains(SCROLLBAR_THUMB_HORIZONTAL),
+            "{BAR_MISSING}"
+        );
+        assert!(
+            !render_at(&mut modal, WIDE_TERMINAL).contains(SCROLLBAR_THUMB_HORIZONTAL),
+            "{BAR_UNWANTED}"
+        );
+    }
+
+    fn render_at(modal: &mut HelpModal, width: u16) -> String {
+        let backend = ratatui::backend::TestBackend::new(width, 40);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                modal.view(f, f.area());
+            })
+            .unwrap();
+        crate::components::buffer_text(terminal.backend().buffer())
     }
 }

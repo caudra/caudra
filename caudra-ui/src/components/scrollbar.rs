@@ -42,6 +42,12 @@ pub fn enabled() -> bool {
 pub struct Scrollbar(scroll::Scrollbar);
 
 impl Scrollbar {
+    /// A bar along the bottom row of what it is drawn into, for a surface whose
+    /// lines run wider than it does. `Default` is the vertical bar.
+    pub fn horizontal() -> Self {
+        Self(scroll::Scrollbar::horizontal())
+    }
+
     /// Records the strip and paints it. Turning bars off leaves no track, so
     /// there is nothing to grab and nothing to take a press: the column goes
     /// back to whatever is drawn there.

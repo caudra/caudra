@@ -94,6 +94,10 @@ pub struct UsageModal {
     scope: UsageScope,
     scroll: ModalScroll,
     scrollbar: Scrollbar,
+    /// The token table is as wide as its longest model id, which owes nothing to
+    /// the terminal, so on a small screen the right-hand columns run off the
+    /// modal and this is what reaches them.
+    pan_bar: Scrollbar,
     quota: Watch<UsageFetchState>,
     popup: Rect,
 }
@@ -105,6 +109,7 @@ impl UsageModal {
             scope: UsageScope::default(),
             scroll: ModalScroll::new_top(),
             scrollbar: Scrollbar::default(),
+            pan_bar: Scrollbar::horizontal(),
             quota: Watch::default(),
             popup: Rect::default(),
         }
@@ -152,17 +157,32 @@ impl UsageModal {
         self.scroll.reset();
     }
 
-    /// The modal reads nothing else from the pointer, so the bar is all there
-    /// is to offer and a bool is all there is to say.
+    /// The modal reads nothing else from the pointer, so the two bars are all
+    /// there is to offer and a bool is all there is to say. They sit on different
+    /// rows, so at most one of them answers a press.
     pub fn handle_mouse(&mut self, event: &MouseEvent) -> bool {
         match self.scrollbar.handle(event) {
-            ScrollbarMouse::Ignored => false,
-            ScrollbarMouse::Consumed => true,
+            ScrollbarMouse::Ignored => {}
+            ScrollbarMouse::Consumed => return true,
             ScrollbarMouse::ScrollTo(top) => {
                 self.scroll.scroll_to(top as u16);
+                return true;
+            }
+        }
+        match self.pan_bar.handle(event) {
+            ScrollbarMouse::Ignored => false,
+            ScrollbarMouse::Consumed => true,
+            ScrollbarMouse::ScrollTo(column) => {
+                self.scroll.pan_to(column as u16);
                 true
             }
         }
+    }
+
+    /// A sideways wheel over the modal, which the app routes here rather than
+    /// dropping now that the content can run off the edge.
+    pub fn pan(&mut self, delta: i32) {
+        self.scroll.pan_by(delta);
     }
 
     pub fn scroll(&mut self, delta: i32) {
@@ -202,13 +222,34 @@ impl UsageModal {
             max_height_percent: 70,
         };
         let (popup, inner) = modal.render(frame, area, total);
-        let viewport_h = inner.height;
-        self.scroll.update_dimensions(total, viewport_h);
+        let content_w = lines
+            .iter()
+            .map(Line::width)
+            .max()
+            .and_then(|width| u16::try_from(width).ok())
+            .unwrap_or(u16::MAX);
+        self.scroll.update_dimensions(total, inner.height);
+        self.scroll.fit_width(content_w, inner.width);
         let scroll = self.scroll.offset();
+        let pan = self.scroll.pan();
 
-        frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), inner);
+        frame.render_widget(Paragraph::new(lines).scroll((scroll, pan)), inner);
 
         self.scrollbar.draw(frame, inner, total, scroll);
+        // The bottom border row: the only row the bar can have without taking one
+        // from the table. Nothing is painted while the table fits, because a
+        // track is only built for content that overflows.
+        self.pan_bar.draw(
+            frame,
+            Rect {
+                x: inner.x,
+                y: popup.bottom().saturating_sub(1),
+                width: inner.width,
+                height: 1,
+            },
+            content_w,
+            pan,
+        );
 
         let hint = Line::from(vec![
             Span::raw(" "),
@@ -224,9 +265,12 @@ impl UsageModal {
             ),
         ]);
         let hint_w = hint.width() as u16;
+        // Beside the title rather than under the table: the bottom border row
+        // belongs to the pan bar, and a hint sharing it would be overpainted
+        // exactly when the modal is narrow enough to need both.
         let hint_area = Rect {
             x: popup.x + popup.width.saturating_sub(hint_w + 1),
-            y: popup.y + popup.height.saturating_sub(1),
+            y: popup.y,
             width: hint_w,
             height: 1,
         };
@@ -716,7 +760,8 @@ mod tests {
     use crate::components::{buffer_text, test_model};
     use crate::repaint::expect::{OWED, QUIET};
     use caudra_providers::UsageLimit;
-    use crossterm::event::KeyModifiers;
+    use caudra_workbench::scroll::SCROLLBAR_THUMB_HORIZONTAL;
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
     use std::sync::Arc;
     use test_case::test_case;
 
@@ -752,6 +797,21 @@ mod tests {
     const FOLDED_RATE: &str = "50%";
     const UNKNOWN_IS_NOT_ZERO: &str =
         "a provider that reported no prompt tokens has no rate, which is not a rate of zero";
+    /// Wide enough that the table below fits inside the modal with room to spare.
+    const WIDE_TERMINAL: u16 = 160;
+    /// A small screen: the modal fills its floor and the table still runs past it.
+    const NARROW_TERMINAL: u16 = 80;
+    /// 43 columns of model id, which puts the 95-column row it builds well past
+    /// a narrow modal's 70. No provider slug, so nothing is trimmed off it.
+    const LONG_MODEL: &str = "a-model-with-a-deliberately-long-identifier";
+    /// More presses than `PAN_STEP` needs to cross those 25 columns; panning
+    /// clamps, so overshooting is the point.
+    const PANS_TO_THE_END: usize = 8;
+    const RELOAD_HINT: &str = "Ctrl+R reload";
+    const COST_UNREACHABLE: &str = "panning must bring the cost column into view";
+    const HINT_MISPLACED: &str = "the hint must share the title row, not the bar's row";
+    const BAR_UNWANTED: &str = "a table that fits must not wear a pan bar";
+    const BAR_MISSING: &str = "a table running off the edge must show what reaches it";
 
     fn slice(label: &str, cost: f64) -> UsageSlice {
         UsageSlice {
@@ -1283,14 +1343,22 @@ mod tests {
     }
 
     fn render(modal: &mut UsageModal) -> String {
-        let backend = ratatui::backend::TestBackend::new(120, 30);
+        render_at(modal, WIDE_TERMINAL, &HashMap::new())
+    }
+
+    fn render_at(
+        modal: &mut UsageModal,
+        width: u16,
+        by_model: &HashMap<String, StoredTokenUsage>,
+    ) -> String {
+        let backend = ratatui::backend::TestBackend::new(width, 30);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         let model = test_model();
         let ctx = UsageModalContext {
             total: &TokenUsage::default(),
             total_cost: None,
             subscription_cost: None,
-            by_model: &HashMap::new(),
+            by_model,
             model: &model,
             fast: false,
             clock_format: ClockFormat::Hour24,
@@ -1302,6 +1370,113 @@ mod tests {
             })
             .unwrap();
         buffer_text(terminal.backend().buffer())
+    }
+
+    /// A breakdown whose model id is long enough that the cost column cannot fit
+    /// beside it on a small screen.
+    fn wide_breakdown() -> HashMap<String, StoredTokenUsage> {
+        HashMap::from([(
+            LONG_MODEL.to_string(),
+            StoredTokenUsage {
+                input: ONE_MILLION,
+                cost: Some(RECORDED_COST),
+                ..StoredTokenUsage::default()
+            },
+        )])
+    }
+
+    /// The table is as wide as its longest model id, which owes nothing to the
+    /// terminal: on a small screen its right-hand columns are off the modal, and
+    /// the only way to read them is to pan.
+    #[test]
+    fn a_table_wider_than_the_screen_is_reachable_by_panning() {
+        let mut modal = UsageModal::new();
+        modal.toggle();
+        let breakdown = wide_breakdown();
+
+        let clipped = render_at(&mut modal, NARROW_TERMINAL, &breakdown);
+        assert!(
+            !clipped.contains(RECORDED_TEXT),
+            "the cost column should be off the edge to begin with"
+        );
+
+        for _ in 0..PANS_TO_THE_END {
+            modal.handle_key(key::PAN_RIGHT.to_key_event());
+        }
+        let panned = render_at(&mut modal, NARROW_TERMINAL, &breakdown);
+        assert!(panned.contains(RECORDED_TEXT), "{COST_UNREACHABLE}");
+    }
+
+    /// Panning past the end would scroll the table off the left edge and show a
+    /// blank modal, so it stops at the widest line whatever the reader does.
+    #[test]
+    fn panning_never_runs_off_the_end_of_the_widest_line() {
+        let mut modal = UsageModal::new();
+        modal.toggle();
+        let breakdown = wide_breakdown();
+        render_at(&mut modal, NARROW_TERMINAL, &breakdown);
+
+        for _ in 0..PANS_TO_THE_END * 4 {
+            modal.handle_key(key::PAN_RIGHT.to_key_event());
+        }
+
+        assert!(
+            render_at(&mut modal, NARROW_TERMINAL, &breakdown).contains(RECORDED_TEXT),
+            "{COST_UNREACHABLE}"
+        );
+    }
+
+    /// The bar takes the bottom border row, so the hint it displaced has to be
+    /// somewhere a reader can still see it whether or not the bar is showing.
+    #[test_case(NARROW_TERMINAL ; "narrow enough to wear a bar")]
+    #[test_case(WIDE_TERMINAL   ; "wide enough to need none")]
+    fn the_reload_hint_sits_on_the_title_row(width: u16) {
+        let mut modal = UsageModal::new();
+        modal.toggle();
+
+        let rendered = render_at(&mut modal, width, &wide_breakdown());
+        let title_row = rendered
+            .lines()
+            .find(|line| line.contains(TITLE.trim()))
+            .expect("a drawn modal wears its title");
+
+        assert!(title_row.contains(RELOAD_HINT), "{HINT_MISPLACED}");
+    }
+
+    /// A table that fits has nothing to reach, and a bar over a border it does
+    /// not need is noise.
+    #[test]
+    fn a_table_that_fits_wears_no_pan_bar() {
+        let mut modal = UsageModal::new();
+        modal.toggle();
+
+        let wide = render_at(&mut modal, WIDE_TERMINAL, &wide_breakdown());
+        let narrow = render_at(&mut modal, NARROW_TERMINAL, &wide_breakdown());
+
+        assert!(!wide.contains(SCROLLBAR_THUMB_HORIZONTAL), "{BAR_UNWANTED}");
+        assert!(narrow.contains(SCROLLBAR_THUMB_HORIZONTAL), "{BAR_MISSING}");
+    }
+
+    /// A press on the bar seeks, the same way the vertical one does.
+    #[test]
+    fn a_press_on_the_pan_bar_moves_the_table() {
+        let mut modal = UsageModal::new();
+        modal.toggle();
+        let breakdown = wide_breakdown();
+        render_at(&mut modal, NARROW_TERMINAL, &breakdown);
+        // The bar runs along the bottom border row, inside the corners, and the
+        // last cell of a track is the end of the document by definition.
+        assert!(modal.handle_mouse(&MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: modal.popup.right() - 2,
+            row: modal.popup.bottom() - 1,
+            modifiers: KeyModifiers::NONE,
+        }));
+
+        assert!(
+            render_at(&mut modal, NARROW_TERMINAL, &breakdown).contains(RECORDED_TEXT),
+            "{COST_UNREACHABLE}"
+        );
     }
 
     /// Nothing wakes the loop when the fetch stores its answer, so the modal

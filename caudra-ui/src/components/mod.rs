@@ -76,6 +76,9 @@ use crate::selection::wrap_breaks;
 
 pub(crate) const CHEVRON: &str = "❯ ";
 const DIGIT_GROUP: usize = 3;
+/// Columns a modal pans per key press. Roughly one column of a token table, so
+/// a reader walks the table a field at a time rather than a glyph at a time.
+const PAN_STEP: i32 = 8;
 
 pub(crate) fn chevron_span() -> ratatui::text::Span<'static> {
     ratatui::text::Span::styled(CHEVRON, crate::theme::current().tool_dim)
@@ -463,6 +466,8 @@ pub(crate) struct ModalScroll {
     offset: u16,
     max_offset: u16,
     viewport_h: u16,
+    pan: u16,
+    max_pan: u16,
     auto_scroll: bool,
     default_auto_scroll: bool,
 }
@@ -473,6 +478,8 @@ impl ModalScroll {
             offset: 0,
             max_offset: 0,
             viewport_h: 0,
+            pan: 0,
+            max_pan: 0,
             auto_scroll: true,
             default_auto_scroll: true,
         }
@@ -490,11 +497,40 @@ impl ModalScroll {
         self.offset = 0;
         self.max_offset = 0;
         self.viewport_h = 0;
+        self.pan = 0;
+        self.max_pan = 0;
         self.auto_scroll = self.default_auto_scroll;
     }
 
     pub fn offset(&self) -> u16 {
         self.offset
+    }
+
+    pub fn pan(&self) -> u16 {
+        self.pan
+    }
+
+    /// How far the widest line runs past the viewport. Only the modals that draw
+    /// unwrapped lines call this: everywhere else `max_pan` stays zero, which is
+    /// what keeps the pan keys from being swallowed by a modal that reflows and
+    /// has nothing off screen to reach.
+    pub fn fit_width(&mut self, content_w: u16, viewport_w: u16) {
+        self.max_pan = content_w.saturating_sub(viewport_w);
+        self.pan = self.pan.min(self.max_pan);
+    }
+
+    /// A positive delta moves the view right, towards the end of the line. The
+    /// opposite sign convention to [`Self::scroll`], which counts upwards, and
+    /// the same one the log pane already pans by.
+    pub fn pan_by(&mut self, delta: i32) {
+        let pan = i64::from(self.pan) + i64::from(delta);
+        self.pan_to(pan.clamp(0, i64::from(u16::MAX)) as u16);
+    }
+
+    /// Lands on a column rather than stepping towards one, which is what a
+    /// horizontal bar drag hands over.
+    pub fn pan_to(&mut self, pan: u16) {
+        self.pan = pan.min(self.max_pan);
     }
 
     pub fn update_dimensions(&mut self, total: u16, viewport_h: u16) {
@@ -546,6 +582,10 @@ impl ModalScroll {
         match key_event.code {
             KeyCode::Up => self.scroll(1),
             KeyCode::Down => self.scroll(-1),
+            // Claimed only while there is something off screen to reach, so a
+            // modal whose lines already fit leaves the chord to the transcript.
+            _ if self.max_pan > 0 && key::PAN_LEFT.matches(key_event) => self.pan_by(-PAN_STEP),
+            _ if self.max_pan > 0 && key::PAN_RIGHT.matches(key_event) => self.pan_by(PAN_STEP),
             _ if key::SCROLL_HALF_UP.matches(key_event) || key::PAGE_UP.matches(key_event) => {
                 self.scroll(self.half_page())
             }
@@ -1183,6 +1223,75 @@ mod tests {
         scroll.update_dimensions(MODAL_TOTAL, MODAL_TOTAL);
         scroll.update_dimensions(MODAL_TOTAL, MODAL_VIEWPORT);
         assert_eq!(scroll.offset(), 0);
+    }
+
+    const MODAL_CONTENT_W: u16 = 90;
+    const MODAL_VIEWPORT_W: u16 = 50;
+    const MODAL_MAX_PAN: u16 = MODAL_CONTENT_W - MODAL_VIEWPORT_W;
+    const UNCLAIMED: &str = "a modal with nothing off screen must leave the chord alone";
+
+    fn panning_scroll() -> ModalScroll {
+        let mut scroll = ModalScroll::new_top();
+        scroll.fit_width(MODAL_CONTENT_W, MODAL_VIEWPORT_W);
+        scroll
+    }
+
+    #[test_case(keybindings::key::PAN_RIGHT.to_key_event(), PAN_STEP as u16 ; "right")]
+    #[test_case(keybindings::key::PAN_LEFT.to_key_event(),  0               ; "left_from_the_start")]
+    fn the_pan_chord_walks_the_content_sideways(key_event: KeyEvent, expected: u16) {
+        let mut scroll = panning_scroll();
+
+        assert!(scroll.handle_key(key_event));
+        assert_eq!(scroll.pan(), expected);
+    }
+
+    /// Every modal shares `handle_key`, and most of them reflow instead of
+    /// running off the edge. Claiming the chord there would take it from the
+    /// transcript behind without moving anything.
+    #[test_case(keybindings::key::PAN_LEFT.to_key_event()  ; "left")]
+    #[test_case(keybindings::key::PAN_RIGHT.to_key_event() ; "right")]
+    fn a_modal_that_reflows_never_claims_the_pan_chord(key_event: KeyEvent) {
+        let mut scroll = ModalScroll::new_top();
+        scroll.update_dimensions(MODAL_TOTAL, MODAL_VIEWPORT);
+
+        assert!(!scroll.handle_key(key_event), "{UNCLAIMED}");
+        assert_eq!(scroll.pan(), 0);
+    }
+
+    #[test]
+    fn panning_stops_at_the_widest_line() {
+        let mut scroll = panning_scroll();
+
+        scroll.pan_by(i32::from(MODAL_CONTENT_W) * 2);
+        assert_eq!(scroll.pan(), MODAL_MAX_PAN);
+        scroll.pan_by(-(i32::from(MODAL_CONTENT_W) * 2));
+        assert_eq!(scroll.pan(), 0);
+    }
+
+    /// A modal redrawn into a wider terminal has less to reach, and a pan left
+    /// pointing past the new end would show a blank column.
+    #[test]
+    fn a_wider_viewport_pulls_the_pan_back() {
+        let mut scroll = panning_scroll();
+        scroll.pan_by(i32::from(MODAL_MAX_PAN));
+
+        scroll.fit_width(MODAL_CONTENT_W, MODAL_CONTENT_W - 4);
+        assert_eq!(scroll.pan(), 4);
+
+        scroll.fit_width(MODAL_CONTENT_W, MODAL_CONTENT_W);
+        assert_eq!(scroll.pan(), 0);
+    }
+
+    #[test]
+    fn reset_forgets_the_pan_along_with_the_offset() {
+        let mut scroll = panning_scroll();
+        scroll.pan_by(PAN_STEP);
+        assert_eq!(scroll.pan(), PAN_STEP as u16);
+
+        scroll.reset();
+        assert_eq!(scroll.pan(), 0);
+        scroll.fit_width(MODAL_CONTENT_W, MODAL_VIEWPORT_W);
+        assert_eq!(scroll.pan(), 0, "a reopened modal starts at the left margin");
     }
 
     const HINTS: [(&str, &str); 2] = [("Enter", "submit"), ("Esc", "close")];

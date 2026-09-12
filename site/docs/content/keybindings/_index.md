@@ -19,6 +19,8 @@ Typing anything takes the focus back, and so does `Esc`. Clicking the transcript
 
 Anywhere a scrollbar is shown it can be dragged. Press the thumb and the surface follows the pointer, press the track anywhere else and the thumb jumps there and stays held. Hold `Alt` while dragging to cover an eighth of the distance, which is what makes a long transcript landable. Dragging the transcript bar shows which message the thumb is on.
 
+A modal whose lines run wider than the screen wears a second bar along its bottom border, and drags the same way. `Shift+Left` and `Shift+Right` move it by a column of a table at a time, and a sideways wheel over the modal moves it too. The bar appears only while there is something off the edge to reach.
+
 Holding `Alt` while turning the wheel scrolls four times as far. A middle-click anchors the view and scrolls it on its own, faster the further you then move the pointer from the mark, until you middle-click again or touch anything else. `ui.scrollbar` set to `false` hides the bars and with them the drag.
 
 ## General
@@ -45,6 +47,7 @@ Holding `Alt` while turning the wheel scrolls four times as far. A middle-click 
 | `Ctrl+X p` | Restore the newest stashed prompt |
 | `Ctrl+X m` | Model picker |
 | `Ctrl+Z` | Suspend process (Unix only) |
+| `Shift+Left` / `Shift+Right` | Pan a modal too wide for the screen left / right |
 | `Ctrl+X w` | Open the workbench |
 
 ## Editing

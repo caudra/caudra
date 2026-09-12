@@ -23,10 +23,8 @@ const WIDTH_PERCENT: u16 = 72;
 const MAX_HEIGHT_PERCENT: u16 = 82;
 const H_PAD: u16 = 2;
 const H_PAD_STEP_WIDTH: u16 = 16;
-const BORDER_COLUMNS: u16 = 2;
 const GRID_CELL_COUNT: usize = 100;
 const CATEGORY_COUNT: usize = 4;
-const PERCENT_SCALE: u64 = 100;
 const PERCENT_TENTHS_SCALE: u64 = 1_000;
 const BYTE_UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
 const BYTE_STEP: f64 = 1024.0;
@@ -555,10 +553,7 @@ fn legend_entry(kind: Consumer, bytes: u64, total: u64, theme: &Theme) -> Vec<Sp
 }
 
 fn content_width(area: Rect) -> u16 {
-    let popup_width = u32::from(area.width) * u32::from(WIDTH_PERCENT) / PERCENT_SCALE as u32;
-    let inner_width = u16::try_from(popup_width)
-        .unwrap_or(u16::MAX)
-        .saturating_sub(BORDER_COLUMNS);
+    let inner_width = Modal::inner_width(area.width, WIDTH_PERCENT);
     let horizontal_padding = horizontal_padding(inner_width);
     inner_width.saturating_sub(horizontal_padding.saturating_mul(2))
 }

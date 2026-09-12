@@ -12,6 +12,11 @@ use ratatui::widgets::{Block, BorderType, Clear};
 
 pub const CHROME_LINES: u16 = 2;
 const FOOTER_HIT_ROWS: u16 = 1;
+/// The narrowest a modal may be drawn, clamped to the terminal so the popup can
+/// only ever grow towards the edge and never past it. A percentage alone spends
+/// a small screen's columns on margin and then cuts the content it was making
+/// room for: 70 columns is the widest token table `/usage` builds plus borders.
+const MIN_WIDTH: u16 = 72;
 
 pub struct Modal<'a> {
     pub title: &'a str,
@@ -29,9 +34,12 @@ impl Modal<'_> {
         let [popup] = Layout::vertical([Constraint::Length(total_h)])
             .flex(Flex::Center)
             .areas(area);
-        let [popup] = Layout::horizontal([Constraint::Percentage(self.width_percent)])
-            .flex(Flex::Center)
-            .areas(popup);
+        let [popup] = Layout::horizontal([Constraint::Length(Self::popup_width(
+            area.width,
+            self.width_percent,
+        ))])
+        .flex(Flex::Center)
+        .areas(popup);
 
         frame.render_widget(Clear, popup);
 
@@ -45,6 +53,21 @@ impl Modal<'_> {
         let inner = block.inner(popup);
         frame.render_widget(block, popup);
         (popup, inner)
+    }
+
+    /// The columns inside the border. A caller that has to lay its content out
+    /// before it can name the height to render at reads the width from here, so
+    /// what it wrapped to and the popup it lands in cannot disagree.
+    pub fn inner_width(available: u16, width_percent: u16) -> u16 {
+        Self::popup_width(available, width_percent).saturating_sub(CHROME_LINES)
+    }
+
+    /// The popup's width on a terminal `available` columns wide: its share, but
+    /// never so narrow that [`MIN_WIDTH`] of content would not fit, and never
+    /// wider than the terminal.
+    fn popup_width(available: u16, width_percent: u16) -> u16 {
+        let share = (available as u32 * width_percent as u32 / 100) as u16;
+        share.max(MIN_WIDTH).min(available)
     }
 }
 
@@ -208,6 +231,30 @@ mod tests {
     const GAP: &str = " · ";
     const AREA: Rect = Rect::new(10, 4, 40, 6);
     const TOTAL: u16 = 6;
+    const HALF: u16 = 50;
+    const WRONG_WIDTH: &str = "the popup is not the width the terminal allows it";
+
+    /// A percentage alone leaves a small terminal drawing a sliver and then
+    /// cutting the content it made room for, and a large one is still handed its
+    /// share rather than the whole screen.
+    #[test_case(40, 40 ; "a terminal narrower than the floor is filled")]
+    #[test_case(MIN_WIDTH, MIN_WIDTH ; "a terminal exactly at the floor is filled")]
+    #[test_case(100, MIN_WIDTH ; "a share below the floor is raised to it")]
+    #[test_case(200, 100 ; "a share above the floor is left alone")]
+    fn a_modal_is_never_narrower_than_its_content_floor(available: u16, expected: u16) {
+        assert_eq!(Modal::popup_width(available, HALF), expected, "{WRONG_WIDTH}");
+    }
+
+    /// Callers that wrap their content before they can name its height read the
+    /// width from here, so the two cannot disagree about where the border is.
+    #[test]
+    fn the_inner_width_is_the_popup_less_its_border() {
+        assert_eq!(
+            Modal::inner_width(200, HALF),
+            Modal::popup_width(200, HALF) - CHROME_LINES,
+            "{WRONG_WIDTH}"
+        );
+    }
 
     fn footer() -> FooterLine {
         let mut footer = FooterLine::default();

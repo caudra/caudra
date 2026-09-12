@@ -581,6 +581,12 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::UnixOnly,
     },
     Keybind {
+        label: KeyLabel::Alt(key::PAN_LEFT.label, key::PAN_RIGHT.label),
+        description: "Pan a modal too wide for the screen left / right",
+        context: KeybindContext::General,
+        platform: Platform::All,
+    },
+    Keybind {
         label: KeyLabel::Single("Enter"),
         description: "Submit prompt",
         context: KeybindContext::Editing,
