@@ -61,6 +61,24 @@ impl Provenance {
         &self.source
     }
 
+    /// The rows behind `range`, for a caller that is about to splice the
+    /// painted lines they belong to somewhere else.
+    pub fn lines_in(&self, range: Range<usize>) -> Option<Vec<LineProvenance>> {
+        self.lines.get(range).map(<[LineProvenance]>::to_vec)
+    }
+
+    /// Replaces the rows of a spliced line range. A re-highlighted body changes
+    /// the span count of every line it touches, so its rows have to travel with
+    /// its lines: [`Self::extract`] zips the two and would otherwise read a
+    /// long line against a short row and silently give up.
+    pub fn splice_lines(&mut self, range: Range<usize>, lines: Vec<LineProvenance>) -> bool {
+        if range.start > range.end || range.end > self.lines.len() {
+            return false;
+        }
+        self.lines.splice(range, lines);
+        true
+    }
+
     /// The source byte the cell at (`row`, `column`) was painted from, for a
     /// click to resolve against the text rather than the glyphs.
     ///

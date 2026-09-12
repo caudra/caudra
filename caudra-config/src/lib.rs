@@ -17,6 +17,20 @@ use tracing::warn;
 const PROJECT_DIR: &str = ".caudra";
 const PERMISSIONS_FILE: &str = "permissions.toml";
 const SHELL_PERMISSION_TOOLS: &[&str] = &["bash", "shell"];
+/// Tools whose card never opens on its own. A truncated prefix of one of
+/// these bodies carries nothing: a read and a fetch are windows into a
+/// document, and a glob, a grep and an index are ordered by path or by source
+/// rather than by relevance, so the visible lines are the alphabetically
+/// first ones rather than the answer. Each already states its result in the
+/// row annotation, so the fold loses no summary. The code-graph lookups are
+/// absent on purpose: they rank their rows, so the prefix is the headline.
+const DEFAULT_ALWAYS_COLLAPSED: &[&str] = &[
+    "file_read",
+    "file_glob",
+    "file_grep",
+    "file_index",
+    "webfetch",
+];
 const PROCESS_ONLY_ENV_VARS: &[&str] = &[
     "HERDR_ENV",
     "HERDR_PANE_ID",
@@ -33,6 +47,7 @@ pub const DEFAULT_FLASH_DURATION_MS: u64 = 1500;
 pub const DEFAULT_TYPEWRITER_MS_PER_CHAR: u64 = 4;
 pub const DEFAULT_WHICH_KEY_DELAY_MS: u64 = 250;
 pub const DEFAULT_MOUSE_SCROLL_LINES: u32 = 3;
+pub const DEFAULT_SCROLL_CARD_LINES: u32 = 10;
 pub const DEFAULT_MAX_INPUT_LINES: u32 = 20;
 
 pub const MIN_MAX_INPUT_LINES: u32 = 1;
@@ -677,6 +692,8 @@ pub struct UiFileConfig {
     pub which_key_delay_ms: Option<u64>,
     pub typewriter_ms_per_char: Option<u64>,
     pub mouse_scroll_lines: Option<u32>,
+    pub scroll_card_lines: Option<u32>,
+    pub always_collapsed: Option<Vec<String>>,
     pub show_thinking: Option<bool>,
     pub show_reminders: Option<bool>,
     pub theme: Option<String>,
@@ -702,6 +719,8 @@ impl UiFileConfig {
             which_key_delay_ms,
             typewriter_ms_per_char,
             mouse_scroll_lines,
+            scroll_card_lines,
+            always_collapsed,
             show_thinking,
             show_reminders,
             theme,
@@ -1414,6 +1433,20 @@ pub struct UiConfig {
     #[config(default = DEFAULT_MOUSE_SCROLL_LINES, min = MIN_MOUSE_SCROLL_LINES, desc = "Lines per mouse wheel scroll")]
     pub mouse_scroll_lines: u32,
 
+    #[config(
+        default = DEFAULT_SCROLL_CARD_LINES,
+        desc = "Rows of body a shell, write, python_execution or task card draws. The window follows new output while it sits at the bottom and pauses when scrolled up. Click inside a window to give it the wheel, which passes back to the transcript at either edge, and drag the bar in its last column to move it directly. `0` turns scrolling off, restoring the `ui.tool_output_lines` budget for those tools and an unabridged body for a write"
+    )]
+    pub scroll_card_lines: u32,
+
+    #[config(
+        ty = "string[]",
+        default = "DEFAULT_ALWAYS_COLLAPSED.iter().map(|t| (*t).to_owned()).collect()",
+        default_doc = "[\"file_read\", \"file_glob\", \"file_grep\", \"file_index\", \"webfetch\"]",
+        desc = "Tools whose card never opens on its own: the call stays a single row in every view mode until you click it. A server-qualified name still matches, so `file_read` also covers `mcp_File_read`. Set to `[]` to opt out"
+    )]
+    pub always_collapsed: Vec<String>,
+
     #[config(default = DEFAULT_MAX_INPUT_LINES, min = MIN_MAX_INPUT_LINES, desc = "Maximum visible input lines")]
     pub max_input_lines: u32,
 
@@ -1472,6 +1505,13 @@ impl UiConfig {
                 .typewriter_ms_per_char
                 .unwrap_or(DEFAULT_TYPEWRITER_MS_PER_CHAR),
             mouse_scroll_lines: f.mouse_scroll_lines.unwrap_or(DEFAULT_MOUSE_SCROLL_LINES),
+            scroll_card_lines: f.scroll_card_lines.unwrap_or(DEFAULT_SCROLL_CARD_LINES),
+            always_collapsed: f.always_collapsed.unwrap_or_else(|| {
+                DEFAULT_ALWAYS_COLLAPSED
+                    .iter()
+                    .map(|tool| (*tool).to_owned())
+                    .collect()
+            }),
             max_input_lines: f.max_input_lines.unwrap_or(DEFAULT_MAX_INPUT_LINES),
             show_thinking: f.show_thinking.unwrap_or(true),
             show_reminders: f.show_reminders.unwrap_or(true),
@@ -4061,6 +4101,98 @@ mod tests {
 
         let raw: RawConfig = toml::from_str("[ui]\nmax_input_lines = 5\n").unwrap();
         assert_eq!(raw.ui.max_input_lines.unwrap(), 5);
+    }
+
+    const CARD_DEFAULTS_MSG: &str = "a reader who never wrote a [ui] table still gets the folded \
+        reads and the fixed window the docs promise, so the defaults are part of the contract";
+    const COLLAPSE_LIST_IS_THE_READERS_MSG: &str = "the list replaces the default outright rather \
+        than adding to it, and an empty list is the documented way to opt out, so it must survive \
+        as empty instead of falling back";
+    const SCROLL_CARD_CONFIGURED_MSG: &str = "the window height is the reader's, and 0 is the \
+        documented way to turn scrolling off rather than an unset value";
+    const CARD_OVERLAY_MSG: &str = "a project layer sits nearer the reader than the global one, \
+        so its card settings win field by field";
+    const COLLAPSE_OVERRIDE_TOOL: &str = "shell";
+    const SCROLL_CARD_LINES_OFF: u32 = 0;
+    const CONFIGURED_SCROLL_CARD_LINES: u32 = 40;
+
+    /// Most readers never write a `[ui]` table, so these two defaults are what
+    /// the transcript actually looks like. Losing either silently changes every
+    /// session: an empty collapse list reopens every read, and a zero window
+    /// turns the fixed shell and write cards back into unbounded bodies.
+    #[test]
+    fn card_display_defaults_survive_a_config_that_names_neither() {
+        let config: RawConfig = toml::from_str("").unwrap();
+        let config = config.into_config(false).unwrap();
+
+        assert_eq!(
+            config.ui.always_collapsed, DEFAULT_ALWAYS_COLLAPSED,
+            "{CARD_DEFAULTS_MSG}"
+        );
+        assert_eq!(
+            config.ui.scroll_card_lines, DEFAULT_SCROLL_CARD_LINES,
+            "{CARD_DEFAULTS_MSG}"
+        );
+    }
+
+    /// `unwrap_or_else` on an `Option<Vec<_>>` cannot tell "unset" from "set to
+    /// nothing" unless the deserializer keeps the two apart, and the docs sell
+    /// `[]` as the way out of the feature. A collapse list that fell back to the
+    /// default here would leave a reader unable to turn folding off at all.
+    #[test_case("[]", &[] ; "empty_list_opts_out")]
+    #[test_case("[\"shell\"]", &[COLLAPSE_OVERRIDE_TOOL] ; "named_tool_replaces_the_default")]
+    fn always_collapsed_takes_the_configured_list(list: &str, expected: &[&str]) {
+        let raw: RawConfig = toml::from_str(&format!("[ui]\nalways_collapsed = {list}\n")).unwrap();
+        let config = raw.into_config(false).unwrap();
+
+        assert_eq!(
+            config.ui.always_collapsed, expected,
+            "{COLLAPSE_LIST_IS_THE_READERS_MSG}"
+        );
+    }
+
+    /// `0` is a documented setting rather than an absent one: it restores the
+    /// old budget-plus-notice card. Treating it as unset would silently hand
+    /// back the fixed window the reader just asked to be rid of.
+    #[test_case(SCROLL_CARD_LINES_OFF ; "scrolling_off")]
+    #[test_case(CONFIGURED_SCROLL_CARD_LINES ; "taller_window")]
+    fn scroll_card_lines_takes_the_configured_height(lines: u32) {
+        let raw: RawConfig =
+            toml::from_str(&format!("[ui]\nscroll_card_lines = {lines}\n")).unwrap();
+        let config = raw.into_config(false).unwrap();
+
+        assert_eq!(
+            config.ui.scroll_card_lines, lines,
+            "{SCROLL_CARD_CONFIGURED_MSG}"
+        );
+    }
+
+    /// Both fields ride the same `merge_option!` list, and a field left off it
+    /// is not a compile error — it just silently pins the global value, so a
+    /// project could never soften or tighten either setting.
+    #[test]
+    fn card_display_overlay_wins_over_the_layer_below() {
+        let mut base: RawConfig = toml::from_str(&format!(
+            "[ui]\nscroll_card_lines = {CONFIGURED_SCROLL_CARD_LINES}\nalways_collapsed = []\n"
+        ))
+        .unwrap();
+        base.merge(
+            toml::from_str(&format!(
+                "[ui]\nscroll_card_lines = {SCROLL_CARD_LINES_OFF}\nalways_collapsed = [\"{COLLAPSE_OVERRIDE_TOOL}\"]\n"
+            ))
+            .unwrap(),
+        );
+
+        assert_eq!(
+            base.ui.scroll_card_lines,
+            Some(SCROLL_CARD_LINES_OFF),
+            "{CARD_OVERLAY_MSG}"
+        );
+        assert_eq!(
+            base.ui.always_collapsed.as_deref(),
+            Some([COLLAPSE_OVERRIDE_TOOL.to_owned()].as_slice()),
+            "{CARD_OVERLAY_MSG}"
+        );
     }
 
     #[test_case("[ui]\nsplash_animaton = true\n" ; "top_level_typo")]

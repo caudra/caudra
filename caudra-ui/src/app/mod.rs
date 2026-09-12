@@ -1271,7 +1271,18 @@ impl App {
             return None;
         }
         let zone = self.zone_at(row, column)?.zone;
-        self.scroll_zone(zone, delta);
+        // An armed scroll card under the pointer takes what it can use and
+        // hands back the rest, so the transcript still moves once the card is
+        // at an edge and the reader is never stuck inside one.
+        let delta = match zone {
+            SelectionZone::Messages => {
+                self.chats[self.active_chat].scroll_card_at(column, row, delta)
+            }
+            _ => delta,
+        };
+        if delta != 0 {
+            self.scroll_zone(zone, delta);
+        }
         Some(zone)
     }
 

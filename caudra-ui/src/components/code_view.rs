@@ -1,12 +1,20 @@
 use std::collections::HashMap;
+use std::ops::Range;
 use std::sync::Arc;
 
 use crate::highlight::{fallback_span, highlight_line};
 use crate::markdown::{expand_notice, should_truncate, text_to_painted, truncation_notice};
+use crate::provenance::LineProvenance;
 use crate::theme;
 
-use super::tool_display::{batch_sigil_style, compact_args_for, compact_sigil_label, header_spans};
+use super::tool_display::{
+    batch_sigil_style, compact_args_for, compact_sigil_label, header_spans, names_tool,
+    scroll_footer_text,
+};
 use super::{ToolProgress, is_collapsible, workflow_card};
+use caudra_agent::tools::{
+    FILE_WRITE_TOOL_NAME, PYTHON_EXECUTION_TOOL_NAME, SHELL_TOOL_NAME, TASK_TOOL_NAME,
+};
 use caudra_agent::types::Answer;
 use caudra_agent::types::{TodoItem, TodoStatus};
 use caudra_agent::{
@@ -16,6 +24,8 @@ use caudra_agent::{
 };
 use caudra_config::ToolOutputLines;
 use caudra_diff::{DiffHunk, DiffLine, DiffSpan, compute_hunks};
+use caudra_markdown::Source;
+use caudra_markdown::render::SpanSource;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use syntect::parsing::SyntaxReference;
@@ -54,6 +64,9 @@ const MARK_ADDED: char = '+';
 /// A line the alignment matched whose whitespace moved. Neither side of it is
 /// new, so neither `-` nor `+` describes it.
 const MARK_REINDENTED: char = '~';
+/// Parts a card's source blocks by the blank row drawn between them, so a
+/// selection spanning both copies the gap it saw rather than closing it.
+const BLOCK_GAP: &str = "\n\n";
 
 pub(crate) fn instruction_limit(expanded: bool) -> usize {
     if expanded {
@@ -93,43 +106,243 @@ fn highlight_spans(hl: &mut caudra_highlight::Highlighter, text: &str) -> Vec<Sp
         .collect()
 }
 
+/// The text a body was painted from, with one entry per painted row, so copy
+/// slices bytes instead of reading the glyphs back off the screen. Without it
+/// a code row copies with the line-number gutter it is drawn behind.
+#[derive(Default, Clone)]
+pub struct BodySource {
+    pub text: String,
+    pub rows: Vec<LineProvenance>,
+    /// The rows holding source code, and what to call it, so a copy that ran
+    /// past the block can fence it rather than drop code into prose.
+    pub code: Option<CodeBlock>,
+}
+
+/// Where a card's code sits among its painted rows, and the language a fence
+/// around it should name.
+#[derive(Clone, Debug)]
+pub struct CodeBlock {
+    pub rows: Range<usize>,
+    pub language: Option<String>,
+}
+
+impl BodySource {
+    /// Prepends a chrome span to every row, for a body whose lines are about
+    /// to be indented into a card.
+    pub fn indented(mut self) -> Self {
+        for row in &mut self.rows {
+            row.spans.insert(0, SpanSource::Chrome);
+        }
+        self
+    }
+
+    /// Whether any row names source at all. A card where none does has to copy
+    /// by scraping, or every row of it would reach the clipboard as nothing.
+    pub fn names_source(&self) -> bool {
+        self.rows.iter().any(|row| row.line.is_some())
+    }
+
+    /// Names the code block after the language a tool declared for it.
+    fn named(mut self, language: &str) -> Self {
+        if let Some(code) = self.code.as_mut() {
+            code.language = Some(language.to_owned());
+        }
+        self
+    }
+
+    /// Names the code block after the file it was read from, which is all a
+    /// path-addressed body says about its language.
+    fn named_for_path(self, path: &str) -> Self {
+        let extension = std::path::Path::new(path)
+            .extension()
+            .and_then(|extension| extension.to_str());
+        match extension {
+            Some(extension) => self.named(extension),
+            None => self,
+        }
+    }
+
+    fn push_chrome(&mut self, span_count: usize) {
+        self.rows.push(LineProvenance::chrome(span_count));
+    }
+}
+
+/// Gathers a card's source block by block as it is painted, and marks the rows
+/// no renderer claimed as chrome once the line count has settled.
+///
+/// Deferring that fill is what keeps rows aligned with lines: a later pass
+/// inserts spans into lines already recorded — the status indicator on row
+/// zero — and a span count taken at push time would be wrong by then.
+#[derive(Default)]
+pub struct SourceTrace {
+    text: String,
+    rows: Vec<Option<LineProvenance>>,
+    code: Option<CodeBlock>,
+    abandoned: bool,
+}
+
+impl SourceTrace {
+    /// Places a body's rows at `start`, the line its first row landed on,
+    /// rebasing its ranges onto the text gathered so far.
+    pub fn record(&mut self, start: usize, mut body: BodySource) {
+        if !self.text.is_empty() && !body.text.is_empty() {
+            self.text.push_str(BLOCK_GAP);
+        }
+        let base = self.text.len() as u32;
+        self.text.push_str(&body.text);
+        for row in &mut body.rows {
+            rebase_row(row, base);
+        }
+        if let Some(mut code) = body.code {
+            code.rows.start += start;
+            code.rows.end += start;
+            self.code.get_or_insert(code);
+        }
+        self.rows.resize(start, None);
+        self.rows.extend(body.rows.into_iter().map(Some));
+    }
+
+    /// Gives the card up to the scraping fallback, for a body drawn by
+    /// something that records no source to slice.
+    pub fn abandon(&mut self) {
+        self.abandoned = true;
+    }
+
+    /// One row per painted line, with everything unclaimed marked as chrome.
+    pub fn finish(mut self, lines: &[Line<'static>]) -> Option<BodySource> {
+        if self.abandoned {
+            return None;
+        }
+        self.rows.resize(lines.len(), None);
+        let rows = lines
+            .iter()
+            .zip(self.rows)
+            .map(|(line, row)| row.unwrap_or_else(|| LineProvenance::chrome(line.spans.len())))
+            .collect();
+        Some(BodySource {
+            text: self.text,
+            rows,
+            code: self.code,
+        })
+    }
+}
+
+/// Text drawn one raw line per row behind `chrome_spans` of padding, which is
+/// how a card prints output no renderer claimed.
+pub fn text_body(text: &str, chrome_spans: usize) -> BodySource {
+    let mut at = 0u32;
+    let rows = text
+        .lines()
+        .map(|line| {
+            let range = at..at + line.len() as u32;
+            at = range.end + 1;
+            let mut spans = vec![SpanSource::Chrome; chrome_spans];
+            spans.push(SpanSource::Range(Source::verbatim(range.clone())));
+            LineProvenance {
+                line: Some(range),
+                spans,
+            }
+        })
+        .collect();
+    BodySource {
+        text: text.to_owned(),
+        rows,
+        code: None,
+    }
+}
+
+/// Moves a row's ranges onto text that now sits `by` bytes further in.
+fn rebase_row(row: &mut LineProvenance, by: u32) {
+    if let Some(range) = row.line.as_mut() {
+        range.start += by;
+        range.end += by;
+    }
+    for span in &mut row.spans {
+        if let SpanSource::Range(source) = span {
+            source.range.start += by;
+            source.range.end += by;
+        }
+    }
+}
+
+/// The source behind one painted code row. The gutter names nothing, and the
+/// rest is a slice of the line the row was drawn from.
+///
+/// Tabs expand and trailing newlines vanish on the way to the screen, so a
+/// line that does not survive that round trip is marked atomic: its glyph
+/// offsets no longer count its bytes, and any touch of it copies it whole.
+fn code_row(spans: &[Span<'static>], text: &str, at: u32) -> LineProvenance {
+    let line = at..at + text.len() as u32;
+    let verbatim = caudra_highlight::normalize_text(text) == text;
+    let mut sources = vec![SpanSource::Chrome];
+    let mut offset = at;
+    for span in spans.iter().skip(1) {
+        let end = offset + span.content.len() as u32;
+        sources.push(SpanSource::Range(match verbatim {
+            true => Source::verbatim(offset..end),
+            false => Source::atomic(line.clone()),
+        }));
+        offset = end;
+    }
+    LineProvenance {
+        line: Some(line),
+        spans: sources,
+    }
+}
+
+struct CodeRender {
+    lines: Vec<Line<'static>>,
+    truncated: bool,
+    source: BodySource,
+}
+
 fn render_code(
     mut hl: Option<caudra_highlight::Highlighter>,
     start_line: usize,
     code_lines: &[String],
     total_count: usize,
     max_lines: usize,
-) -> (Vec<Line<'static>>, bool) {
+) -> CodeRender {
     let capped = code_lines.len().min(max_lines);
     let hidden = total_count.saturating_sub(capped);
-    let has_truncation = should_truncate(hidden);
-    let display_count = if has_truncation {
-        capped
-    } else {
-        code_lines.len()
-    };
+    let truncated = should_truncate(hidden);
+    let display_count = if truncated { capped } else { code_lines.len() };
     let max_nr = start_line + display_count.saturating_sub(1);
     let w = nr_width(max_nr);
 
-    let mut lines: Vec<Line<'static>> = code_lines
-        .iter()
-        .take(display_count)
-        .enumerate()
-        .map(|(i, text)| {
-            let nr = start_line + i;
-            let mut spans = vec![gutter(&format!("{nr:>w$}"))];
-            match &mut hl {
-                Some(h) => spans.extend(highlight_spans(h, text)),
-                None => spans.push(fallback_span(text)),
-            }
-            Line::from(spans)
-        })
-        .collect();
-
-    if has_truncation {
-        lines.push(truncation_line(hidden));
+    let shown = &code_lines[..display_count.min(code_lines.len())];
+    let mut source = BodySource {
+        text: shown.join("\n"),
+        rows: Vec::with_capacity(shown.len()),
+        code: None,
+    };
+    let mut at = 0u32;
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(shown.len());
+    for (i, text) in shown.iter().enumerate() {
+        let nr = start_line + i;
+        let mut spans = vec![gutter(&format!("{nr:>w$}"))];
+        match &mut hl {
+            Some(h) => spans.extend(highlight_spans(h, text)),
+            None => spans.push(fallback_span(text)),
+        }
+        source.rows.push(code_row(&spans, text, at));
+        at += text.len() as u32 + 1;
+        lines.push(Line::from(spans));
     }
-    (lines, has_truncation)
+    source.code = Some(CodeBlock {
+        rows: 0..lines.len(),
+        language: None,
+    });
+
+    if truncated {
+        lines.push(truncation_line(hidden));
+        source.push_chrome(1);
+    }
+    CodeRender {
+        lines,
+        truncated,
+        source,
+    }
 }
 
 /// Syntect is stateful, so to color line N you need lines 1..N first.
@@ -644,17 +857,18 @@ fn render_batch(
     entries: &[BatchToolEntry],
     highlight: bool,
     limits: &RenderLimits,
-) -> (Vec<Line<'static>>, Vec<Option<RowTarget>>) {
+) -> (Vec<Line<'static>>, Vec<Option<RowTarget>>, Vec<ScrollSpan>) {
     let t = theme::current();
     let mut lines = Vec::new();
     let mut rows = Vec::new();
+    let mut spans_out = Vec::new();
     let mut previous_has_body = false;
     for (index, entry) in entries.iter().enumerate() {
         let view = limits.child(index, entry);
         // Resolved before the summary row so the separator below knows whether
         // this child is a list entry or a block.
-        let body = view.map(|child| child_body(entry, highlight, &child));
-        let has_body = body.as_ref().is_some_and(|(lines, _)| !lines.is_empty());
+        let body = view.map(|child| child_body(entry, highlight, &child, limits.live.get(&index)));
+        let has_body = body.as_ref().is_some_and(|(lines, ..)| !lines.is_empty());
         // Every row of a child answers for it, whether or not a click would
         // change what is drawn: this is also how a dispatched child's rows are
         // traced back to the subagent they belong to.
@@ -665,19 +879,29 @@ fn render_batch(
         }
         previous_has_body = has_body;
         let (sigil, label) = compact_sigil_label(&entry.tool, entry.status.into());
+        // Once the body carries the script, the row keeps only what the body
+        // does not say. The same trade a card's header makes, and for the same
+        // reason: the body's copy is the numbered, highlighted one.
+        let summary = match has_body && body_repeats_summary(entry) {
+            true => "",
+            false => entry.summary.as_str(),
+        };
+        let gap = if summary.is_empty() { "" } else { " " };
         let mut spans = vec![
             Span::styled(
                 format!("{sigil} "),
                 batch_sigil_style(entry.status, entry.output.as_ref()),
             ),
-            Span::styled(format!("{label} "), t.tool_prefix),
+            Span::styled(format!("{label}{gap}"), t.tool_prefix),
         ];
-        spans.extend(header_spans(
-            &entry.tool,
-            &entry.summary,
-            Style::default(),
-            entry.raw_input.as_ref(),
-        ));
+        if !summary.is_empty() {
+            spans.extend(header_spans(
+                &entry.tool,
+                summary,
+                Style::default(),
+                entry.raw_input.as_ref(),
+            ));
+        }
         if let Some(args) = compact_args_for(
             &entry.tool,
             &entry.summary,
@@ -700,12 +924,15 @@ fn render_batch(
             lines.push(Line::from(child_progress_spans(progress)));
             rows.push(target);
         }
-        if let Some((body, _)) = body {
+        if let Some((body, _, span)) = body {
+            if let Some(span) = span {
+                spans_out.push(span.shifted(lines.len(), Some(index)));
+            }
             rows.resize(rows.len() + body.len(), target);
             lines.extend(indent_all(body));
         }
     }
-    (lines, rows)
+    (lines, rows, spans_out)
 }
 
 /// Whether opening this child would show anything, which is what the folded
@@ -766,32 +993,124 @@ fn child_progress_spans(progress: &ToolProgress) -> Vec<Span<'static>> {
 /// A child's own rendering, structured where the tool produced structure and
 /// its text otherwise, with whether it is holding anything back. Errors read
 /// as plain text: a failed call has no structured result to draw.
+///
+/// `live` is the tail a child that has not answered yet is streaming. A batch
+/// clears its children's live sink, so the only thing a running child would
+/// otherwise draw is the spinner on its summary row, and a long shell inside
+/// a batch would show nothing at all until it finished.
 fn child_body(
     entry: &BatchToolEntry,
     highlight: bool,
     limits: &RenderLimits,
-) -> (Vec<Line<'static>>, bool) {
+    live: Option<&String>,
+) -> (Vec<Line<'static>>, bool, Option<ScrollSpan>) {
     let output = entry.output.as_ref();
-    if entry.status == BatchToolStatus::Error {
-        return capped(
-            text_lines(output.map_or(String::new(), ToolOutput::as_text)),
-            limits.budget,
-        );
-    }
-    match output {
-        Some(ToolOutput::Markdown(text)) => {
-            capped(markdown_lines(&text.text, limits.width), limits.budget)
+    // Every answer that is text goes through one place, so no arm can be the
+    // one that forgets the script. `render_tool_content` draws the script
+    // itself, which is why structured output is the exception here rather than
+    // a case alongside the others.
+    let text = if entry.status == BatchToolStatus::Error {
+        Some(text_lines(
+            output.map_or(String::new(), ToolOutput::as_text),
+        ))
+    } else if let Some(tail) = live.filter(|text| output.is_none() && !text.is_empty()) {
+        Some(text_lines(tail.clone()))
+    } else {
+        match output {
+            Some(ToolOutput::Markdown(text)) => Some(markdown_lines(&text.text, limits.width)),
+            Some(ToolOutput::Plain(text) | ToolOutput::ReadDir(text)) => {
+                Some(text_lines(text.text.clone()))
+            }
+            Some(ToolOutput::Shell(shell)) => Some(text_lines(shell.raw_text())),
+            _ => None,
         }
-        Some(ToolOutput::Plain(text) | ToolOutput::ReadDir(text)) => {
-            capped(text_lines(text.text.clone()), limits.budget)
-        }
-        Some(ToolOutput::Shell(shell)) => capped(text_lines(shell.raw_text()), limits.budget),
-        other => {
+    };
+    match text {
+        Some(lines) => with_script(entry, highlight, limits, child_view(lines, limits)),
+        None => {
             let content =
-                render_tool_content(entry.input.as_ref(), other, highlight, limits.clone());
-            (content.lines, content.truncation)
+                render_tool_content(entry.input.as_ref(), output, highlight, limits.clone());
+            (content.lines, content.truncation, None)
         }
     }
+}
+
+/// Whether an opened child's body prints its summary row again. A shell or
+/// python call's summary is its script's first line, so the row and the script
+/// say the same thing.
+///
+/// Compared rather than assumed from the tool name, because a `task` child's
+/// summary is a description its body never repeats.
+fn body_repeats_summary(entry: &BatchToolEntry) -> bool {
+    matches!(
+        entry.input.as_ref(),
+        Some(ToolInput::Script { code, .. } | ToolInput::Code { code, .. })
+            if code.lines().next() == Some(entry.summary.as_str())
+    )
+}
+
+/// A child draws its script the way its own card does: numbered, highlighted,
+/// and above what the command printed. `render_tool_content` renders structured
+/// output, so a child answering with text took an arm that drew the output
+/// alone and never asked for the script at all, which is why a shell child had
+/// no highlighting while a read child did.
+///
+/// Added above the window rather than inside it, as a card does, so the script
+/// stays in view while the output scrolls under it. A script inside the window
+/// scrolls itself off, which is the one thing the reader asked to see.
+///
+/// Line count does not come into it. A one-line command gets the same numbered,
+/// highlighted row a long one does, and `body_repeats_summary` then takes the
+/// duplicate off the summary row.
+fn with_script(
+    entry: &BatchToolEntry,
+    highlight: bool,
+    limits: &RenderLimits,
+    body: (Vec<Line<'static>>, bool, Option<ScrollSpan>),
+) -> (Vec<Line<'static>>, bool, Option<ScrollSpan>) {
+    let (output, truncation, span) = body;
+    if entry.input.is_none() {
+        return (output, truncation, span);
+    }
+    let mut lines =
+        render_tool_content(entry.input.as_ref(), None, highlight, limits.clone()).lines;
+    if !lines.is_empty() && !output.is_empty() {
+        lines.push(Line::default());
+    }
+    let shift = lines.len();
+    lines.extend(output);
+    (lines, truncation, span.map(|span| span.shift_lines(shift)))
+}
+
+/// Holds a child to its window when it scrolls and to its budget otherwise.
+///
+/// The window takes the footer the budget's notice would have taken. Both say
+/// what is not being shown; a window says it as two edges and which one the
+/// reader is pinned to, because that is what tells them whether output is
+/// still arriving under what they are reading.
+fn child_view(
+    lines: Vec<Line<'static>>,
+    limits: &RenderLimits,
+) -> (Vec<Line<'static>>, bool, Option<ScrollSpan>) {
+    let Some(window) = limits.scroll else {
+        let (lines, truncation) = capped(lines, limits.budget);
+        return (lines, truncation, None);
+    };
+    let total = lines.len();
+    let (start, end) = window.range(total);
+    let mut shown = lines[start..end].to_vec();
+    let span = ScrollSpan {
+        child: None,
+        first: 0,
+        lines: shown.len(),
+        total,
+        offset: start,
+    };
+    let Some(footer) = scroll_footer_text(start, total - end, false) else {
+        return (shown, false, None);
+    };
+    shown.push(Line::from(Span::styled(footer, theme::current().tool_dim)));
+    (shown, true, Some(span))
 }
 
 /// Holds a text body to the budget its own card would hold it to, and says how
@@ -893,8 +1212,7 @@ fn render_patch(files: &[PatchedFile], width: u16) -> Vec<Line<'static>> {
 /// reason a patch hunk is never highlighted either.
 pub(crate) fn render_live_body(body: &str) -> Vec<Line<'static>> {
     let shown: Vec<String> = body.lines().map(String::from).collect();
-    let (lines, _) = render_code(None, 1, &shown, shown.len(), usize::MAX);
-    lines
+    render_code(None, 1, &shown, shown.len(), usize::MAX).lines
 }
 
 /// How many rows the full rendering would take. Counted rather than rendered,
@@ -1213,14 +1531,14 @@ fn render_code_graph(
                 },
                 theme.tool_path,
             )));
-            let (body, _) = render_code(
+            let body = render_code(
                 highlight.then(|| caudra_highlight::Highlighter::for_path(&source.path)),
                 source.line_start,
                 &source.lines,
                 source.lines.len(),
                 body_room.saturating_sub(1),
             );
-            lines.extend(body);
+            lines.extend(body.lines);
         }
     }
 
@@ -1357,10 +1675,10 @@ pub(crate) fn render_instructions(
         let total = code_lines.len();
         let remaining = max_lines.saturating_sub(used);
         let hl = highlight.then(|| caudra_highlight::Highlighter::for_path(&block.path));
-        let (rendered, was_truncated) = render_code(hl, 1, &code_lines, total, remaining);
-        used += rendered.len();
-        truncated |= was_truncated;
-        lines.extend(rendered);
+        let rendered = render_code(hl, 1, &code_lines, total, remaining);
+        used += rendered.lines.len();
+        truncated |= rendered.truncated;
+        lines.extend(rendered.lines);
     }
     truncated
 }
@@ -1414,11 +1732,98 @@ impl BatchViews {
 /// and the reports outlive none of it.
 pub type ChildProgress = Arc<HashMap<usize, ToolProgress>>;
 
+/// The live tail of each child of one batch that has not answered yet, by
+/// index in the roster.
+pub type ChildLive = Arc<HashMap<usize, String>>;
+
+/// A fixed-height window onto a body that may be longer than it. `follow`
+/// pins the window to the tail, so a body still arriving keeps its newest
+/// lines on screen; scrolling up drops the pin and `offset` takes over.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ScrollWindow {
+    pub height: usize,
+    pub offset: usize,
+    pub follow: bool,
+}
+
+impl ScrollWindow {
+    /// The half-open range of `total` lines this window shows. Following
+    /// takes the tail; a paused window is clamped so a body that shrank
+    /// cannot leave it pointing past the end.
+    pub fn range(self, total: usize) -> (usize, usize) {
+        let height = self.height.min(total);
+        let max_start = total - height;
+        let start = if self.follow {
+            max_start
+        } else {
+            self.offset.min(max_start)
+        };
+        (start, start + height)
+    }
+}
+
+/// The tools whose body is long, arrives over time, or both, and so is drawn
+/// in a fixed window that follows the tail rather than abridged with a notice
+/// offering the rest.
+const SCROLL_CARD_TOOLS: &[&str] = &[
+    SHELL_TOOL_NAME,
+    FILE_WRITE_TOOL_NAME,
+    PYTHON_EXECUTION_TOOL_NAME,
+    TASK_TOOL_NAME,
+];
+
+/// What the reader's configuration says about a tool. Carried with the limits
+/// rather than looked up at the card, because a batch child is the same call
+/// without a card of its own and has to answer these the same way or the two
+/// drift.
+#[derive(Clone, Default)]
+pub struct CardPolicy {
+    pub always_collapsed: Arc<[String]>,
+    pub scroll_card_lines: u32,
+}
+
+impl CardPolicy {
+    /// Whether no view mode opens this tool's body.
+    pub fn stays_collapsed(&self, tool: &str) -> bool {
+        self.always_collapsed
+            .iter()
+            .any(|pattern| names_tool(pattern, tool))
+    }
+
+    /// Whether this tool's body is drawn in a fixed window rather than
+    /// abridged to a budget.
+    pub fn scrolls(&self, tool: &str) -> bool {
+        self.scroll_card_lines > 0
+            && SCROLL_CARD_TOOLS
+                .iter()
+                .any(|known| names_tool(known, tool))
+    }
+
+    pub fn window(&self, tool: &str, offset: usize, follow: bool) -> Option<ScrollWindow> {
+        self.scrolls(tool).then_some(ScrollWindow {
+            height: self.scroll_card_lines as usize,
+            offset,
+            follow,
+        })
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct RenderLimits {
     pub budget: usize,
+    /// Present only for a card drawn as a fixed-height scroller. It replaces
+    /// the budget and the notice under it: the window is the whole story of
+    /// how much is shown, and the footer says where it sits.
+    pub scroll: Option<ScrollWindow>,
+    pub policy: CardPolicy,
+    /// Where each scrolling child of this card has its window, by index in
+    /// the roster. A child absent from the map is pinned to its tail.
+    pub child_scroll: Arc<HashMap<usize, ScrollWindow>>,
     pub views: BatchViews,
     pub progress: ChildProgress,
+    /// The tail each child that has not answered yet is streaming, by index
+    /// in the roster.
+    pub live: ChildLive,
     /// Every tool's budget rather than only this card's, because a batch child
     /// rests at the one its own tool would be drawn with.
     pub tool_lines: ToolOutputLines,
@@ -1432,26 +1837,56 @@ impl RenderLimits {
     pub fn new(full: bool, budget: usize, views: BatchViews, tool_lines: ToolOutputLines) -> Self {
         Self {
             budget: if full { usize::MAX } else { budget },
+            scroll: None,
+            policy: CardPolicy::default(),
+            child_scroll: Arc::default(),
             views,
             progress: ChildProgress::default(),
+            live: ChildLive::default(),
             tool_lines,
             width: UNCONSTRAINED_WIDTH,
         }
     }
 
-    pub fn with_progress(self, progress: ChildProgress) -> Self {
-        Self { progress, ..self }
+    pub fn with_scroll(self, scroll: Option<ScrollWindow>) -> Self {
+        Self { scroll, ..self }
+    }
+
+    pub fn with_policy(
+        self,
+        policy: CardPolicy,
+        child_scroll: Arc<HashMap<usize, ScrollWindow>>,
+    ) -> Self {
+        Self {
+            policy,
+            child_scroll,
+            ..self
+        }
+    }
+
+    pub fn with_progress(self, progress: ChildProgress, live: ChildLive) -> Self {
+        Self {
+            progress,
+            live,
+            ..self
+        }
     }
 
     pub fn with_width(self, width: u16) -> Self {
         Self { width, ..self }
     }
 
-    /// Whether any child is still reporting. A live row is redrawn every tick
-    /// from a clock the highlight worker does not have, so a batch holding one
-    /// renders here instead of being sent out and spliced back stale.
-    pub fn has_live_progress(&self) -> bool {
-        self.progress.values().any(ToolProgress::is_live)
+    /// Whether any child is still moving. A report is redrawn every tick from
+    /// a clock the highlight worker does not have, and a stream arrives as
+    /// often as the command prints, so a batch holding either renders here
+    /// instead of being sent out and spliced back stale.
+    ///
+    /// Neither is in the worker's cache key, and neither usefully could be:
+    /// both move on every frame. Without this a streaming child shows the
+    /// first window that reached the worker and then freezes there until the
+    /// call settles.
+    pub fn has_live_rows(&self) -> bool {
+        !self.live.is_empty() || self.progress.values().any(ToolProgress::is_live)
     }
 
     pub fn is_expanded(&self) -> bool {
@@ -1467,20 +1902,50 @@ impl RenderLimits {
     /// says nothing about any of it: the card's own body is the list of what
     /// ran, and each child answers for itself.
     ///
+    /// A tool the reader put on the always-collapsed list folds here too:
+    /// the same call folds whether it was dispatched on its own or inside a
+    /// batch, and a child is the one place the reader cannot reach a view
+    /// mode to say otherwise.
+    ///
+    /// A scrolling child keeps its window whether the reader opened it or
+    /// not. The window is what bounds the row in the first place, so opening
+    /// one cannot be allowed to spill a whole shell log into the list.
+    ///
+    /// A child still streaming is drawn whatever its settled row would fold
+    /// to. A live body is the reason to be watching the call at all, and a
+    /// shell folds once it answers, so without this the one moment its output
+    /// is worth showing is the one moment it is hidden. The reader's
+    /// never-open list still wins: that list is about output nobody wants,
+    /// whether it has arrived yet or not.
+    ///
     /// The views and the reports name this card's children, so both are
     /// dropped on the way in or a nested batch would read them as its own.
     fn child(&self, index: usize, entry: &BatchToolEntry) -> Option<Self> {
-        let budget = if self.views.is_open(index) {
-            usize::MAX
-        } else if is_collapsible(entry.effect, &entry.tool) {
-            return None;
-        } else {
-            self.tool_lines.get(&entry.tool)
+        let open = self.views.is_open(index);
+        let streaming = entry.output.is_none()
+            && self.live.get(&index).is_some_and(|tail| !tail.is_empty())
+            && !self.policy.stays_collapsed(&entry.tool);
+        let scroll = self.child_scroll.get(&index).copied().or_else(|| {
+            self.policy
+                .window(&entry.tool, 0, true)
+                .filter(|_| open || streaming || !is_collapsible(entry.effect, &entry.tool))
+        });
+        let budget = match scroll {
+            Some(window) => window.height,
+            None if open => usize::MAX,
+            None if self.policy.stays_collapsed(&entry.tool) => return None,
+            None if streaming => self.tool_lines.get(&entry.tool),
+            None if is_collapsible(entry.effect, &entry.tool) => return None,
+            None => self.tool_lines.get(&entry.tool),
         };
         Some(Self {
             budget,
+            scroll,
+            policy: self.policy.clone(),
+            child_scroll: Arc::default(),
             views: BatchViews::default(),
             progress: ChildProgress::default(),
+            live: ChildLive::default(),
             tool_lines: self.tool_lines,
             width: self.width.saturating_sub(BATCH_CHILD_INDENT_WIDTH),
         })
@@ -1492,6 +1957,10 @@ pub type BatchViewMap = HashMap<String, BatchViews>;
 
 /// The child reports of every batch that has any, by parent tool id.
 pub type BatchProgressMap = HashMap<String, ChildProgress>;
+
+/// The live output of every batch that has a child still streaming, by parent
+/// tool id.
+pub type BatchLiveMap = HashMap<String, ChildLive>;
 
 /// What a body line belongs to, so a click can name a row after the async
 /// highlight has replaced the spans under it: a batch child by its roster
@@ -1506,6 +1975,51 @@ pub struct ToolContent {
     /// highlighted lines carry the same rows as the ones they replace.
     pub rows: Vec<Option<RowTarget>>,
     pub truncation: bool,
+    pub scroll_spans: Vec<ScrollSpan>,
+    /// Where every painted line came from, or `None` when a renderer in the
+    /// body names no source and copy has to scrape the screen instead. Built
+    /// by the same pass that built `lines`, because the highlighted render
+    /// changes the span count of every code row.
+    pub source: Option<BodySource>,
+}
+
+/// Where one window sits in a body, and how far into that body it sits, so a
+/// bar can be placed beside it and dragged.
+///
+/// Recorded while the body is built, because that is the only point at which
+/// the window and the lines it selected are both in hand. A bar derived any
+/// later would have to guess which rows the window took, and a guess that
+/// disagrees with the paint by one row is a bar that scrolls the wrong thing.
+#[derive(Clone, Copy)]
+pub struct ScrollSpan {
+    /// The batch child this window belongs to, `None` for the card's own body.
+    pub child: Option<usize>,
+    /// Where the window starts among the lines of the segment it is drawn in.
+    pub first: usize,
+    /// Lines of window, which is what the bar's track spans.
+    pub lines: usize,
+    /// Lines of body the window is a view onto, and how far down it sits.
+    pub total: usize,
+    pub offset: usize,
+}
+
+impl ScrollSpan {
+    /// Shifts a span recorded against a body into the segment that body was
+    /// appended to. A child's window is built without knowing where in the
+    /// card its rows will land, and the card's own header sits above it.
+    fn shifted(self, by: usize, child: Option<usize>) -> Self {
+        Self {
+            child,
+            first: self.first + by,
+            ..self
+        }
+    }
+
+    /// The same shift with the owner left alone, for a card appending a body
+    /// whose children have already been named.
+    pub fn shift_lines(self, by: usize) -> Self {
+        self.shifted(by, self.child)
+    }
 }
 
 pub fn render_tool_content(
@@ -1517,6 +2031,9 @@ pub fn render_tool_content(
     let mut lines = Vec::new();
     let mut truncation = false;
     let mut output_rows: Vec<Option<RowTarget>> = Vec::new();
+    let mut output_spans: Vec<ScrollSpan> = Vec::new();
+    let mut trace = SourceTrace::default();
+    let mut output_source: Option<BodySource> = None;
     if let Some((language, code)) = input.map(|i| match i {
         ToolInput::Script { language, code } | ToolInput::Code { language, code } => {
             (language, code)
@@ -1529,9 +2046,13 @@ pub fn render_tool_content(
             .collect();
         let total = code_lines.len();
         let hl = highlight.then(|| caudra_highlight::Highlighter::for_token(language));
-        let (code_result, trunc) = render_code(hl, 1, &code_lines, total, limits.budget);
-        truncation = trunc;
-        lines.extend(code_result);
+        // A card that draws its script at all draws the whole of it. The
+        // script is the record of what ran, it cannot be reconstructed from
+        // the output, and it is bounded by what the model wrote. The budget
+        // belongs to the output, which the tool can make arbitrarily long.
+        let script = render_code(hl, 1, &code_lines, total, total);
+        trace.record(lines.len(), script.source.named(language));
+        lines.extend(script.lines);
     }
     let (output_lines, output_trunc) = match output {
         Some(ToolOutput::ReadCode {
@@ -1539,24 +2060,32 @@ pub fn render_tool_content(
             start_line,
             lines: code_lines,
             ..
-        }) => render_code(
-            highlight.then(|| caudra_highlight::Highlighter::for_path(path)),
-            *start_line,
-            code_lines,
-            code_lines.len(),
-            limits.budget,
-        ),
+        }) => {
+            let code = render_code(
+                highlight.then(|| caudra_highlight::Highlighter::for_path(path)),
+                *start_line,
+                code_lines,
+                code_lines.len(),
+                limits.budget,
+            );
+            output_source = Some(code.source.named_for_path(path));
+            (code.lines, code.truncated)
+        }
         Some(ToolOutput::WriteCode {
             path,
             lines: code_lines,
             ..
-        }) => render_code(
-            highlight.then(|| caudra_highlight::Highlighter::for_path(path)),
-            1,
-            code_lines,
-            code_lines.len(),
-            limits.budget,
-        ),
+        }) => {
+            let code = render_code(
+                highlight.then(|| caudra_highlight::Highlighter::for_path(path)),
+                1,
+                code_lines,
+                code_lines.len(),
+                limits.budget,
+            );
+            output_source = Some(code.source.named_for_path(path));
+            (code.lines, code.truncated)
+        }
         Some(ToolOutput::Diff {
             path,
             before,
@@ -1611,8 +2140,9 @@ pub fn render_tool_content(
         // Each child owns how much of itself it shows, so the card reports no
         // truncation of its own: there is no one thing for it to open.
         Some(ToolOutput::Batch { entries, .. }) if !entries.is_empty() => {
-            let (batch_lines, rows) = render_batch(entries, highlight, &limits);
+            let (batch_lines, rows, spans) = render_batch(entries, highlight, &limits);
             output_rows = rows;
+            output_spans = spans;
             (batch_lines, false)
         }
         Some(ToolOutput::ReadDir(_)) => (Vec::new(), false),
@@ -1627,11 +2157,25 @@ pub fn render_tool_content(
     for (row, target) in rows.iter_mut().skip(lines.len()).zip(output_rows) {
         *row = target;
     }
+    let body_start = lines.len();
+    match output_source {
+        Some(source) => trace.record(body_start, source),
+        // Rows a renderer drew without naming their source cannot be sliced,
+        // and copying them as nothing is worse than scraping them back.
+        None if !output_lines.is_empty() => trace.abandon(),
+        None => {}
+    }
     lines.extend(output_lines);
+    let source = trace.finish(&lines);
     ToolContent {
         lines,
         rows,
         truncation,
+        scroll_spans: output_spans
+            .into_iter()
+            .map(|span| span.shifted(body_start, span.child))
+            .collect(),
+        source,
     }
 }
 
@@ -1705,15 +2249,44 @@ mod tests {
     #[test_case(6,  6,  6                    ; "one_hidden_shows_all")]
     fn render_code_line_count(input_lines: usize, total: usize, expected: usize) {
         let code_lines: Vec<String> = (0..input_lines).map(|i| format!("line {i}")).collect();
-        let (result, _) = render_code(
+        let result = render_code(
             Some(caudra_highlight::Highlighter::for_path("test.rs")),
             1,
             &code_lines,
             total,
             READ_MAX_LINES,
         );
-        assert_eq!(result.len(), expected);
+        assert_eq!(result.lines.len(), expected);
+        assert_eq!(result.source.rows.len(), expected, "{ROWS_PER_LINE}");
     }
+
+    const ROWS_PER_LINE: &str =
+        "provenance needs one row per painted line or extraction gives up on the card";
+
+    /// The gutter is what a copy must not pick up, and the only thing standing
+    /// between the clipboard and it is the first span being marked as chrome.
+    #[test_case(false ; "plain")]
+    #[test_case(true ; "highlighted")]
+    fn a_code_row_names_its_source_behind_a_chrome_gutter(highlight: bool) {
+        const CODE: &str = "fn main() { let x = 1; }";
+        let code_lines = vec![CODE.to_owned()];
+        let hl = highlight.then(|| caudra_highlight::Highlighter::for_path("test.rs"));
+
+        let rendered = render_code(hl, 1, &code_lines, 1, usize::MAX);
+
+        assert_eq!(rendered.source.text, CODE);
+        let row = &rendered.source.rows[0];
+        assert_eq!(row.line, Some(0..CODE.len() as u32));
+        assert_eq!(
+            row.spans.len(),
+            rendered.lines[0].spans.len(),
+            "{SPANS_PER_ROW}"
+        );
+        assert_eq!(row.spans[0], SpanSource::Chrome, "{GUTTER_IS_CHROME}");
+    }
+
+    const SPANS_PER_ROW: &str = "a row's sources must stay parallel to its painted spans";
+    const GUTTER_IS_CHROME: &str = "the line-number gutter must name no source";
 
     const PATCH: &str = "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -8,3 +8,4 @@\n context\n-gone\n+added\n+also added\n";
     const NUMBERED_MSG: &str = "context and removed lines carry their real file line number";
@@ -2446,7 +3019,7 @@ mod tests {
     /// the body itself ends up with.
     fn markdown_child_body(text: &str, width: u16) -> Vec<String> {
         let limits = limits(BatchViews::new([0])).with_width(width + BATCH_CHILD_INDENT_WIDTH);
-        let (lines, _) = render_batch(&[markdown_entry(text)], false, &limits);
+        let (lines, ..) = render_batch(&[markdown_entry(text)], false, &limits);
         lines
             .iter()
             .skip(1)
@@ -2511,7 +3084,8 @@ mod tests {
         views: BatchViews,
     ) -> (Vec<Line<'static>>, Vec<Option<RowTarget>>) {
         let entries = [batch_entry("read", sizes[0]), batch_entry("grep", sizes[1])];
-        render_batch(&entries, false, &limits(views))
+        let (lines, rows, _) = render_batch(&entries, false, &limits(views));
+        (lines, rows)
     }
 
     fn batch(views: BatchViews) -> (Vec<Line<'static>>, Vec<Option<RowTarget>>) {
@@ -2860,7 +3434,7 @@ mod tests {
             batch_entry("read", 2),
             batch_entry("read", 1),
         ];
-        let (lines, rows) = render_batch(&entries, false, &limits(BatchViews::new([1])));
+        let (lines, rows, _) = render_batch(&entries, false, &limits(BatchViews::new([1])));
 
         assert_eq!(blank_rows(&lines), vec![1, 5], "{BATCH_BODY_AIR_MSG}");
         assert_eq!(lines.len(), rows.len(), "the rows stay parallel");
@@ -2874,7 +3448,7 @@ mod tests {
         let whole = 6;
         let opened = RenderLimits::new(true, PARENT_BUDGET, BatchViews::default(), TOOL_LINES);
         let entries = [batch_entry("read", whole), batch_entry("grep", whole)];
-        let (lines, _) = render_batch(&entries, false, &opened);
+        let (lines, ..) = render_batch(&entries, false, &opened);
         assert_eq!(body_count(&lines), 0);
     }
 
@@ -2897,7 +3471,8 @@ mod tests {
         body_lines: usize,
         views: BatchViews,
     ) -> (Vec<Line<'static>>, Vec<Option<RowTarget>>) {
-        render_batch(&[write_entry(body_lines)], false, &limits(views))
+        let (lines, rows, _) = render_batch(&[write_entry(body_lines)], false, &limits(views));
+        (lines, rows)
     }
 
     /// The reported bug: a batch of edits drew a roster of headers and no
@@ -2925,7 +3500,7 @@ mod tests {
             ..batch_entry(SHELL_CHILD, 2)
         };
 
-        let (lines, _) = render_batch(&[entry], false, &limits(BatchViews::default()));
+        let (lines, ..) = render_batch(&[entry], false, &limits(BatchViews::default()));
 
         assert_eq!(body_count(&lines), 0, "{CHANGED_MSG}");
     }

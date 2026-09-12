@@ -318,7 +318,10 @@ fn write_tool_output_section(out: &mut String) {
         out,
         "How many lines of output an open card shows per tool before it says how many it \
          is holding back. Clicking the card shows all of it regardless. \
-         All values are `usize` with a minimum of {MIN_TOOL_OUTPUT_LINES}.\n"
+         All values are `usize` with a minimum of {MIN_TOOL_OUTPUT_LINES}.\n\n\
+         The `bash`, `python_execution`, `task`, and `write` entries apply only when \
+         `ui.scroll_card_lines` is `0`. Above that, those tools draw a fixed window of \
+         that many lines instead, and the budget here goes unused.\n"
     )
     .unwrap();
     writeln!(out, "| Field | Default | Tools |").unwrap();

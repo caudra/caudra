@@ -1,7 +1,7 @@
 use super::segment;
 use super::*;
 use crate::chat::{DONE_TEXT, ERROR_TEXT};
-use crate::components::tool_display::NOTICE_PREFIX;
+use crate::components::tool_display::{FOLLOWING, NOTICE_PREFIX, PAUSED};
 use crate::repaint::expect::{OWED, QUIET};
 use crate::selection::{Selection, SelectionZone};
 use caudra_agent::tools::{
@@ -12,9 +12,9 @@ use caudra_agent::tools::{
     VIEW_IMAGE_TOOL_NAME,
 };
 use caudra_agent::{
-    GrepFileEntry, GrepMatchGroup, NO_FILES_FOUND, SearchCap, ShellFilterInfo, ShellOutput,
-    SnapshotLine, SnapshotSpan, SpanStyle, SubagentActivity, SubagentProgress, ToolInput,
-    ToolOutput,
+    CodeGraphRow, GrepFileEntry, GrepMatchGroup, NO_FILES_FOUND, SearchCap, ShellFilterInfo,
+    ShellOutput, SnapshotLine, SnapshotSpan, SpanStyle, SubagentActivity, SubagentProgress,
+    ToolInput, ToolOutput,
 };
 use caudra_workbench::scroll::SCROLLBAR_THUMB;
 use ratatui::backend::TestBackend;
@@ -35,6 +35,11 @@ const MENTION_PROSE: &str = "look at @src/lib.rs please";
 const MENTION_MISSED: &str = "the pointer sat on a mention the panel did not resolve";
 const MENTION_CLAIMED: &str = "a message the reader did not write answered with a mention";
 const MENTION_MARKED_GLYPHS: &str = "a hovered mention repainted the message around it";
+/// A read-only tool the `always_collapsed` default deliberately leaves out, so
+/// a card built on it answers the view mode rather than the reader's collapse
+/// list. It shares `file_grep`'s row budget, so a test that moved off grep to
+/// keep testing disclosure rests at the same number of rows it always did.
+const CODE_MAP_TOOL_NAME: &str = "code_map";
 const TOOL_ID: &str = "t1";
 const WORKFLOW_TOOL_ID: &str = "workflow:run-1";
 const WORKFLOW_RUN_ID: &str = "run-1";
@@ -68,6 +73,7 @@ fn effect_of(tool: &str) -> ToolEffect {
         | FILE_GREP_TOOL_NAME
         | FILE_GLOB_TOOL_NAME
         | FILE_INDEX_TOOL_NAME
+        | CODE_MAP_TOOL_NAME
         | VIEW_IMAGE_TOOL_NAME
         | TOOL_OUTPUT_TOOL_NAME => ToolEffect::ReadOnly,
         BATCH_TOOL_NAME | TASK_TOOL_NAME => ToolEffect::Orchestrator,
@@ -503,9 +509,18 @@ fn tool_done_grep_shows_matches() {
     assert!(panel.messages[0].tool_output.is_some());
 }
 
-/// "No files found" alone would be a claim the search never established.
+/// "No files found" alone would be a claim the search never established, so
+/// every place the miss is stated has to carry how far the search got with it.
+/// Grep never opens on its own, which leaves the one row the reader is given
+/// answering for the card until they ask for the body.
 #[test]
 fn a_capped_grep_that_matched_nothing_qualifies_the_absence() {
+    const CAP_ANNOTATION: &str = "capped, 40/900 searched";
+    const CAP_DETAIL: &str = "searched 40 of 900 files; more matches may exist";
+    const CARD_OPENS_ON_ASK: &str = "an always-collapsed card still opens when the reader asks";
+    const MISS_RECORDED: &str = "the empty answer is what the card has to qualify, so it is still \
+        the text the card was built from";
+
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     panel.tool_start(start("t1", FILE_GREP_TOOL_NAME));
     panel.tool_done(ToolDoneEvent {
@@ -529,18 +544,23 @@ fn a_capped_grep_that_matched_nothing_qualifies_the_absence() {
         model_output_from_ref: false,
     });
     render(&mut panel, 80, 24);
-    let rendered = seg_text(&panel, "t1");
+    let collapsed = seg_text(&panel, "t1");
+    assert!(panel.toggle_expansion("t1"), "{CARD_OPENS_ON_ASK}");
+    render(&mut panel, 80, 24);
+    let opened = seg_text(&panel, "t1");
 
-    assert!(rendered.contains(NO_FILES_FOUND), "{rendered}");
     assert!(
-        rendered.contains("searched 40 of 900 files; more matches may exist"),
-        "{rendered}"
+        panel.messages[0].text.contains(NO_FILES_FOUND),
+        "{MISS_RECORDED}: {:?}",
+        panel.messages[0].text
     );
+    assert!(collapsed.contains(CAP_ANNOTATION), "{collapsed}");
+    assert!(opened.contains(CAP_DETAIL), "{opened}");
     assert!(
         panel.messages[0]
             .annotation
             .as_deref()
-            .is_some_and(|annotation| annotation.contains("capped, 40/900 searched")),
+            .is_some_and(|annotation| annotation.contains(CAP_ANNOTATION)),
         "{:?}",
         panel.messages[0].annotation
     );
@@ -1989,10 +2009,10 @@ fn selected_open_thinking_header_still_marks_a_card_boundary() {
     assert!(!copied.contains(HIDDEN), "{copied}");
 }
 
-fn panel_with_read_tool(view: ViewMode) -> MessagesPanel {
-    let mut panel = panel_with_tools(&[("t1", FILE_READ_TOOL_NAME)]);
+fn panel_with_copyable_tool(tool: &'static str, view: ViewMode) -> MessagesPanel {
+    let mut panel = panel_with_tools(&[("t1", tool)]);
     panel.tool_done(ToolDoneEvent {
-        tool: FILE_READ_TOOL_NAME.into(),
+        tool: tool.into(),
         output: ToolOutput::Plain("hidden tool output".into()),
         ..done("t1")
     });
@@ -2006,7 +2026,7 @@ fn panel_with_read_tool(view: ViewMode) -> MessagesPanel {
 
 #[test]
 fn collapsed_tool_copies_only_its_visible_header() {
-    let mut panel = panel_with_read_tool(ViewMode::Compact);
+    let mut panel = panel_with_copyable_tool(FILE_READ_TOOL_NAME, ViewMode::Compact);
 
     let copied = extract_entire_document(&mut panel);
 
@@ -2020,11 +2040,11 @@ fn collapsed_tool_copies_only_its_visible_header() {
 
 #[test]
 fn open_tool_copies_its_visible_body() {
-    let mut panel = panel_with_read_tool(ViewMode::Expanded);
+    let mut panel = panel_with_copyable_tool(CODE_MAP_TOOL_NAME, ViewMode::Expanded);
 
     let copied = extract_entire_document(&mut panel);
 
-    assert!(copied.contains("## Tool: `file_read`"), "{copied}");
+    assert!(copied.contains("## Tool: `code_map`"), "{copied}");
     assert!(copied.contains("Status: success | View: open"), "{copied}");
     assert!(copied.contains("hidden tool output"), "{copied}");
 }
@@ -2182,7 +2202,7 @@ fn title_only_open_streaming_thinking_still_copies_its_header() {
 
 #[test]
 fn cross_message_copy_does_not_restore_truncated_tool_output() {
-    let mut panel = panel_with_long_tool(200);
+    let mut panel = panel_with_long_tool(CODE_MAP_TOOL_NAME, 200);
     panel.set_view(ViewMode::Expanded);
     render(&mut panel, 80, 24);
     panel.push(DisplayMessage::new(
@@ -2192,14 +2212,14 @@ fn cross_message_copy_does_not_restore_truncated_tool_output() {
 
     let copied = extract_entire_document(&mut panel);
 
-    assert!(copied.contains("## Tool: `shell`"), "{copied}");
+    assert!(copied.contains("## Tool: `code_map`"), "{copied}");
     assert!(copied.contains("line 0"), "{copied}");
     assert!(!copied.contains("line 50"), "{copied}");
 }
 
 #[test]
 fn tool_fence_outgrows_backticks_in_visible_content() {
-    let fenced = fenced_text("before\n```\nafter");
+    let fenced = fenced_text("before\n```\nafter", None);
 
     assert!(fenced.starts_with("````text\n"), "{fenced}");
     assert!(fenced.ends_with("\n````"), "{fenced}");
@@ -2366,7 +2386,7 @@ fn markdown_block_scanner_matches_commonmark_boundaries() {
     ));
 }
 
-fn panel_with_long_tool(line_count: usize) -> MessagesPanel {
+fn panel_with_long_tool(tool: &'static str, line_count: usize) -> MessagesPanel {
     let body = (0..line_count)
         .map(|i| format!("line {i}"))
         .collect::<Vec<_>>()
@@ -2375,7 +2395,7 @@ fn panel_with_long_tool(line_count: usize) -> MessagesPanel {
     panel.tool_start(ToolStartEvent {
         id: "t1".into(),
         effect: ToolEffect::Unknown,
-        tool: SHELL_TOOL_NAME.into(),
+        tool: tool.into(),
         summary: "cmd".into(),
         annotation: None,
         input: None,
@@ -2384,18 +2404,9 @@ fn panel_with_long_tool(line_count: usize) -> MessagesPanel {
         render_header: None,
     });
     panel.tool_done(ToolDoneEvent {
-        id: "t1".into(),
-        tool: SHELL_TOOL_NAME.into(),
+        tool: tool.into(),
         output: ToolOutput::Plain(body.into()),
-        is_error: false,
-        annotation: None,
-        written_path: None,
-        written_paths: Vec::new(),
-        output_ref: None,
-        output_limits: None,
-        model_suffix: None,
-        model_output: None,
-        model_output_from_ref: false,
+        ..done("t1")
     });
     render(&mut panel, 80, 24);
     panel
@@ -2403,7 +2414,7 @@ fn panel_with_long_tool(line_count: usize) -> MessagesPanel {
 
 #[test]
 fn toggle_expand_collapse_truncated_tool() {
-    let mut panel = panel_with_long_tool(200);
+    let mut panel = panel_with_long_tool(CODE_MAP_TOOL_NAME, 200);
     panel.set_view(ViewMode::Expanded);
     render(&mut panel, 80, 24);
     let area = Rect::new(0, 0, 80, 24);
@@ -2540,7 +2551,7 @@ fn shell_live_output_uses_the_larger_running_budget_and_survives_completion() {
 
 #[test]
 fn native_tool_hover_reverses_only_the_expand_affordance_without_mutating_cache() {
-    let mut panel = panel_with_long_tool(200);
+    let mut panel = panel_with_long_tool(CODE_MAP_TOOL_NAME, 200);
     let area = Rect::new(0, 0, 80, 24);
     let source = panel.messages[0].text.clone();
     let cached = panel.cache.find_by_tool_id("t1").and_then(|index| {
@@ -2581,8 +2592,9 @@ fn native_tool_hover_reverses_only_the_expand_affordance_without_mutating_cache(
 #[test]
 fn expanded_native_tool_hover_accents_header_and_rail_not_body() {
     const HEIGHT: u16 = 240;
+    const MAP_LABEL: &str = "Mapped";
 
-    let mut panel = panel_with_long_tool(200);
+    let mut panel = panel_with_long_tool(CODE_MAP_TOOL_NAME, 200);
     panel.set_view(ViewMode::Expanded);
     let area = Rect::new(0, 0, 80, HEIGHT);
     render(&mut panel, area.width, area.height);
@@ -2593,7 +2605,7 @@ fn expanded_native_tool_hover_accents_header_and_rail_not_body() {
     let terminal = render(&mut panel, area.width, area.height);
     let buffer = terminal.backend().buffer();
     let rail = buffer.cell((area.x, area.y)).unwrap().style();
-    let header = style_of(&terminal, "shell>");
+    let header = style_of(&terminal, MAP_LABEL);
 
     assert_eq!(header.fg, rail.fg, "header and rail share the hover accent");
     assert!(
@@ -2728,7 +2740,7 @@ fn hovering_a_mention_marks_the_status_bar_and_no_glyph() {
 
 #[test]
 fn extract_selection_copies_visible_content_only() {
-    let panel = panel_with_long_tool(200);
+    let panel = panel_with_long_tool(SHELL_TOOL_NAME, 200);
     let area = Rect::new(0, 0, 80, 24);
     let total: u16 = panel.segment_heights().iter().sum();
     let sel = make_sel(area, (0, 0), ((total - 1) as u32, 79));
@@ -2741,56 +2753,53 @@ fn extract_selection_copies_visible_content_only() {
 
 #[test]
 fn toggle_returns_false_for_non_expandable() {
-    let mut panel = panel_with_long_tool(3);
+    let mut panel = panel_with_long_tool(SHELL_TOOL_NAME, 3);
     panel.set_view(ViewMode::Expanded);
     render(&mut panel, 80, 24);
     let area = Rect::new(0, 0, 80, 24);
     assert!(!panel.toggle_expansion_at(area.y, area));
 }
 
-fn panel_with_grep_tool(match_count: usize) -> MessagesPanel {
-    let entries = vec![GrepFileEntry {
-        path: "src/main.rs".into(),
-        groups: (1..=match_count)
-            .map(|i| GrepMatchGroup::single(i, format!("match_{i}")))
-            .collect(),
-    }];
+fn panel_with_map_tool(row_count: usize) -> MessagesPanel {
+    const HEADLINE: &str = "ranked symbols in .";
+    const FOOTER: &str = "[3 files, 9 symbols, 4 edges]";
+
+    let rows = (1..=row_count)
+        .map(|i| CodeGraphRow {
+            name: format!("symbol_{i}"),
+            kind: "function".into(),
+            path: "src/main.rs".into(),
+            line_start: i,
+            line_end: i + 1,
+            inbound: Some(i),
+            outbound: Some(1),
+            hops: None,
+            test_scope: false,
+        })
+        .collect();
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
-    panel.tool_start(ToolStartEvent {
-        id: "t1".into(),
-        effect: ToolEffect::Unknown,
-        tool: FILE_GREP_TOOL_NAME.into(),
-        summary: "grep pattern".into(),
-        annotation: None,
-        input: None,
-        raw_input: None,
-        output: None,
-        render_header: None,
-    });
+    panel.tool_start(start("t1", CODE_MAP_TOOL_NAME));
     panel.tool_done(ToolDoneEvent {
-        id: "t1".into(),
-        tool: FILE_GREP_TOOL_NAME.into(),
-        output: ToolOutput::GrepResult {
-            entries,
-            capped: None,
+        tool: CODE_MAP_TOOL_NAME.into(),
+        output: ToolOutput::CodeGraph {
+            headline: HEADLINE.into(),
+            rows,
+            source: None,
+            footer: FOOTER.into(),
+            state: None,
         },
-        is_error: false,
-        annotation: None,
-        written_path: None,
-        written_paths: Vec::new(),
-        output_ref: None,
-        output_limits: None,
-        model_suffix: None,
-        model_output: None,
-        model_output_from_ref: false,
+        ..done("t1")
     });
     render(&mut panel, 80, 24);
     panel
 }
 
+/// A structured body discloses through the same cycle a plain one does, so the
+/// card cannot grow a second way to be opened out of the renderer it happens
+/// to use.
 #[test]
-fn toggle_expand_collapse_grep_tool() {
-    let mut panel = panel_with_grep_tool(8);
+fn toggle_expand_collapse_map_tool() {
+    let mut panel = panel_with_map_tool(8);
     panel.set_view(ViewMode::Expanded);
     let area = Rect::new(0, 0, 80, 24);
     render(&mut panel, 80, 24);
@@ -3035,7 +3044,7 @@ fn handle_click_on_running_tool_forwards_live_without_recording() {
 
 #[test]
 fn handle_click_returns_toggled_for_truncated_tool_without_snapshot() {
-    let mut panel = panel_with_long_tool(200);
+    let mut panel = panel_with_long_tool(SHELL_TOOL_NAME, 200);
     let area = Rect::new(0, 0, 80, 24);
     assert!(panel.handle_click(area.y, area));
 }
@@ -3749,7 +3758,7 @@ fn streaming_collapsed_thinking_header_responds_to_hover() {
 
 #[test]
 fn transcript_hover_clears_explicitly_and_on_scroll_or_layout_change() {
-    let mut panel = panel_with_long_tool(200);
+    let mut panel = panel_with_long_tool(SHELL_TOOL_NAME, 200);
     let area = Rect::new(0, 0, 80, 24);
 
     panel.update_hover(area.y, area.x, area, false, Path::new(NO_PROJECT));
@@ -4999,7 +5008,7 @@ fn a_dense_call_keeps_the_card_background(view: ViewMode) {
 fn an_expanded_one_line_call_stays_flat() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     panel.set_view(ViewMode::Expanded);
-    panel.tool_start(call_with_summary("t1", FILE_GREP_TOOL_NAME));
+    panel.tool_start(call_with_summary("t1", CODE_MAP_TOOL_NAME));
     let terminal = render(&mut panel, WIDE_ENOUGH_TO_NOT_WRAP, 24);
 
     assert_eq!(
@@ -5079,9 +5088,9 @@ fn a_wrapped_row_takes_air_from_the_rows_around_it(view: ViewMode) {
 /// not run into the dense rows above it.
 #[test]
 fn the_card_auto_opens_separates_from_the_list_above_it() {
-    let mut panel = panel_with_tools(&[("t1", FILE_GREP_TOOL_NAME)]);
+    let mut panel = panel_with_tools(&[("t1", CODE_MAP_TOOL_NAME)]);
     panel.tool_done(done("t1"));
-    panel.tool_start(start("t2", FILE_GREP_TOOL_NAME));
+    panel.tool_start(start("t2", CODE_MAP_TOOL_NAME));
     panel.tool_done(long_done("t2", HELD_BODY_LINES));
     render(&mut panel, WIDE_ENOUGH_TO_NOT_WRAP, 24);
 
@@ -5185,6 +5194,36 @@ fn a_compact_label_is_inflected_by_what_the_call_is_doing(outcome: Option<bool>,
     // read as the token after it rather than from the front of the row.
     let row = first_line_text(&panel, 0);
     assert_eq!(row.split_whitespace().nth(1), Some(expected), "{row:?}");
+}
+
+const EXPANDED_HEADER_LABEL_MSG: &str =
+    "an expanded card says what the call is doing, not what its tool is registered as";
+
+/// The expanded header wrote the bare tool name and an arrow, so the same
+/// shell call read `shell>` on a card and `Ran` on a row one view mode away.
+/// Two spellings of one sentence make the modes look like different products,
+/// and the arrow form leaks a registry key the reader never has to know.
+#[test_case(None, "Running" ; "running")]
+#[test_case(Some(false), "Ran" ; "succeeded")]
+#[test_case(Some(true), "Run" ; "failed")]
+fn an_expanded_card_header_is_inflected_like_its_row(outcome: Option<bool>, expected: &str) {
+    let mut panel = panel_with_tools(&[(TOOL_ID, SHELL_TOOL_NAME)]);
+    panel.set_view(ViewMode::Expanded);
+    if let Some(is_error) = outcome {
+        let mut event = done(TOOL_ID);
+        event.is_error = is_error;
+        panel.tool_done(event);
+    }
+    rebuild(&mut panel);
+
+    // The leading glyph is a spinner while the call runs, so the label is
+    // read as the token after it rather than from the front of the row.
+    let header = first_line_text(&panel, 0);
+    assert_eq!(
+        header.split_whitespace().nth(1),
+        Some(expected),
+        "{EXPANDED_HEADER_LABEL_MSG}: {header:?}"
+    );
 }
 
 #[test]
@@ -5355,7 +5394,7 @@ fn a_truncated_compact_row_cycles_back_to_its_header() {
 
 #[test]
 fn an_expanded_row_stays_put_when_it_has_nothing_left_to_open() {
-    let mut panel = compact_panel(&[("t1", FILE_GREP_TOOL_NAME)]);
+    let mut panel = compact_panel(&[("t1", CODE_MAP_TOOL_NAME)]);
     panel.set_view(ViewMode::Expanded);
     finished(&mut panel, &["t1"]);
     rebuild(&mut panel);
@@ -5550,12 +5589,14 @@ fn live_thinking_duration_always_keeps_tenths(duration: Duration, expected: &str
 
 #[test]
 fn expanded_density_keeps_the_status_dot_and_the_card() {
-    let mut panel = panel_with_tools(&[("t1", FILE_GREP_TOOL_NAME)]);
+    const CARD_HEADER: &str = "● Mapped ";
+
+    let mut panel = panel_with_tools(&[("t1", CODE_MAP_TOOL_NAME)]);
     panel.set_view(ViewMode::Expanded);
     finished(&mut panel, &["t1"]);
     rebuild(&mut panel);
 
-    assert!(first_line_text(&panel, 0).starts_with("● file_grep> "));
+    assert!(first_line_text(&panel, 0).starts_with(CARD_HEADER));
     assert!(panel.segment_heights()[0] > 1);
 }
 
@@ -5582,9 +5623,9 @@ fn mode_panel(view: ViewMode, ids: &[(&str, &'static str)]) -> MessagesPanel {
 /// Read-only calls are the only ones the mode is allowed to hide: a call that
 /// wrote something keeps its body in every mode, or the transcript stops
 /// showing what happened to the workspace.
-#[test_case(ViewMode::Expanded, FILE_GREP_TOOL_NAME, true; "expanded opens a read")]
-#[test_case(ViewMode::Compact, FILE_GREP_TOOL_NAME, false; "compact closes a read")]
-#[test_case(ViewMode::Auto, FILE_GREP_TOOL_NAME, true; "auto opens the newest read")]
+#[test_case(ViewMode::Expanded, CODE_MAP_TOOL_NAME, true; "expanded opens a map")]
+#[test_case(ViewMode::Compact, CODE_MAP_TOOL_NAME, false; "compact closes a map")]
+#[test_case(ViewMode::Auto, CODE_MAP_TOOL_NAME, true; "auto opens the newest map")]
 #[test_case(ViewMode::Expanded, FILE_WRITE_TOOL_NAME, true; "expanded opens a write")]
 #[test_case(ViewMode::Compact, FILE_WRITE_TOOL_NAME, true; "compact still opens a write")]
 #[test_case(ViewMode::Auto, FILE_WRITE_TOOL_NAME, true; "auto still opens a write")]
@@ -5636,7 +5677,7 @@ fn one_click_opens_the_whole_body(view: ViewMode) {
 /// way back out of a full body is the resting budget.
 #[test]
 fn a_full_card_in_expanded_falls_back_to_the_budget() {
-    let mut panel = panel_with_tools(&[("t1", FILE_GREP_TOOL_NAME)]);
+    let mut panel = panel_with_tools(&[("t1", CODE_MAP_TOOL_NAME)]);
     panel.set_view(ViewMode::Expanded);
     panel.tool_done(long_done("t1", CLICKED_BODY_LINES));
     rebuild(&mut panel);
@@ -5657,9 +5698,15 @@ fn a_full_card_in_expanded_falls_back_to_the_budget() {
 }
 
 /// `python_execution` draws a script and an output, which used to be separately
-/// disclosed and so took two clicks past the first to open.
+/// disclosed and so took two clicks past the first to open. They are one
+/// disclosure now: the window the card rests at already carries both, and a
+/// click takes both away or gives both back rather than stepping through them.
 #[test]
-fn a_script_and_its_output_open_together() {
+fn a_script_and_its_output_are_disclosed_together() {
+    const SCRIPT_TAIL: &str = "script 7";
+    const TOGETHER_MSG: &str =
+        "the script and its output are one disclosure, so a card shows both or neither";
+
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     panel.set_view(ViewMode::Compact);
     panel.tool_start(ToolStartEvent {
@@ -5674,15 +5721,27 @@ fn a_script_and_its_output_open_together() {
     });
     panel.tool_done(long_done("t1", CLICKED_BODY_LINES));
     rebuild(&mut panel);
+    let area = Rect::new(0, 0, 80, 24);
 
+    let resting = seg_text(&panel, "t1");
     assert!(
-        panel.handle_click(0, Rect::new(0, 0, 80, 24)),
-        "{COMPACT_CLICK_MSG}"
+        resting.contains(SCRIPT_TAIL) && resting.contains(BODY_TAIL),
+        "{TOGETHER_MSG}"
     );
+
+    assert!(panel.handle_click(0, area), "{COMPACT_CLICK_MSG}");
+    rebuild(&mut panel);
+    let closed = seg_text(&panel, "t1");
+    assert!(
+        !closed.contains(SCRIPT_TAIL) && !closed.contains(BODY_TAIL),
+        "{TOGETHER_MSG}"
+    );
+
+    assert!(panel.handle_click(0, area), "{COMPACT_CLICK_MSG}");
     rebuild(&mut panel);
 
     let text = seg_text(&panel, "t1");
-    assert!(text.contains("script 7"), "{ONE_CLICK_MSG}");
+    assert!(text.contains(SCRIPT_TAIL), "{ONE_CLICK_MSG}");
     assert!(text.contains(BODY_TAIL), "{ONE_CLICK_MSG}");
 }
 
@@ -5690,10 +5749,10 @@ fn a_script_and_its_output_open_together() {
 /// behind it fall back to a row without the reader touching anything.
 #[test]
 fn auto_opens_the_newest_read_and_closes_the_one_before_it() {
-    let mut panel = mode_panel(ViewMode::Auto, &[("t1", FILE_GREP_TOOL_NAME)]);
+    let mut panel = mode_panel(ViewMode::Auto, &[("t1", CODE_MAP_TOOL_NAME)]);
     assert!(!panel.card_closed("t1"), "{AUTO_TAIL_MSG}");
 
-    panel.tool_start(start("t2", FILE_GREP_TOOL_NAME));
+    panel.tool_start(start("t2", CODE_MAP_TOOL_NAME));
     panel.tool_done(done("t2"));
     rebuild(&mut panel);
 
@@ -5705,7 +5764,7 @@ fn auto_opens_the_newest_read_and_closes_the_one_before_it() {
 /// the thing being written and has no claim on staying open.
 #[test]
 fn auto_hands_the_newest_slot_to_the_reply_being_written() {
-    let mut panel = mode_panel(ViewMode::Auto, &[("t1", FILE_GREP_TOOL_NAME)]);
+    let mut panel = mode_panel(ViewMode::Auto, &[("t1", CODE_MAP_TOOL_NAME)]);
     assert!(!panel.card_closed("t1"), "{AUTO_TAIL_MSG}");
 
     panel.streaming_text.set_buffer("answering");
@@ -5832,6 +5891,23 @@ fn batch_row(panel: &MessagesPanel, target: RowTarget) -> u16 {
 
 fn batch_child_row(panel: &MessagesPanel, index: usize) -> u16 {
     batch_row(panel, RowTarget(index))
+}
+
+/// Arms a child's window and offers it a wheel burst, which is what a press
+/// inside it followed by a notch does. Position alone no longer reaches a
+/// window: an unarmed card would eat notches aimed at the transcript behind
+/// it. The press lands on the first body row, since the header is the card's
+/// own control rather than part of the window.
+fn wheel_child(
+    panel: &mut MessagesPanel,
+    terminal: &ratatui::Terminal<TestBackend>,
+    index: usize,
+    delta: i32,
+) -> i32 {
+    let (column, _) = card_bar_rows(terminal)[0];
+    let row = batch_child_row(panel, index) + 1;
+    assert!(panel.arm_card_at(column, row), "{ARM_MSG}");
+    panel.scroll_card_at(column, row, delta)
 }
 
 /// The bug: a batch dumped every child body into the transcript, which is
@@ -6042,6 +6118,413 @@ fn a_dispatched_child_reports_what_it_is_doing() {
     assert!(text.contains(CHILD_TALLY), "{CHILD_ACTIVITY_MSG}: {text:?}");
 }
 
+const CHILD_STREAM_MSG: &str =
+    "a dispatched shell streams its output while it runs, as it does on its own";
+const CHILD_STREAM_LINES: usize = 40;
+const SETTLED_CHILD_MSG: &str = "what a child returned supersedes what it streamed";
+const CHILD_SCROLL_MSG: &str =
+    "a wheel over a streaming child moves its window, and spills once the window is at an edge";
+const CHILD_FOOTER_MSG: &str = "a windowed child reports both edges and which one it is pinned to";
+const SETTLED_SCROLL_MSG: &str = "a settled child scrolls the same as a running one";
+const ARM_MSG: &str =
+    "a window takes the wheel only once pressed, and only while the pointer is in it";
+/// Positive is towards the start of the body, which is a lower offset.
+const CHILD_SCROLL_UP: i32 = 3;
+const CHILD_SCROLL_SPILL: i32 = 4;
+
+fn shell_stream() -> String {
+    (0..CHILD_STREAM_LINES)
+        .map(|line| format!("line {line}\n"))
+        .collect()
+}
+
+/// A batch running one shell, with nothing back from it yet.
+fn panel_with_running_shell() -> MessagesPanel {
+    let mut panel = panel_with_tools(&[("t1", BATCH_TOOL)]);
+    let mut ev = start("t1", BATCH_TOOL);
+    ev.output = Some(ToolOutput::Batch {
+        entries: vec![running_child(SHELL_TOOL_NAME)],
+        text: String::new(),
+    });
+    panel.tool_start(ev);
+    render(&mut panel, 80, 24);
+    panel
+}
+
+/// The reported bug: a shell dispatched inside a batch showed nothing until it
+/// finished, while the same call on its own streams. A batch keeps the live
+/// row for itself and runs each child under an id of its own, so the output
+/// named a header that does not exist and was dropped.
+#[test]
+fn a_dispatched_shell_streams_what_it_is_printing() {
+    let mut panel = panel_with_running_shell();
+
+    assert!(panel.set_batch_child_output("t1", 0, &shell_stream()));
+    render(&mut panel, 80, 24);
+
+    let text = seg_text(&panel, "t1");
+    assert!(
+        text.contains(&format!("line {}", CHILD_STREAM_LINES - 1)),
+        "{CHILD_STREAM_MSG}: {text:?}"
+    );
+}
+
+/// The window bounds the stream, so a command that prints a thousand lines
+/// costs the roster its window and not the thousand. It follows the tail: the
+/// newest output is the reason to be watching.
+#[test]
+fn a_streaming_child_is_held_to_its_window() {
+    let mut panel = panel_with_running_shell();
+    panel.set_batch_child_output("t1", 0, &shell_stream());
+    render(&mut panel, 80, 24);
+
+    let text = seg_text(&panel, "t1");
+    let first = CHILD_STREAM_LINES - caudra_config::DEFAULT_SCROLL_CARD_LINES as usize;
+    assert!(
+        text.contains(&format!("line {first}")),
+        "{CHILD_STREAM_MSG}: {text:?}"
+    );
+    assert!(
+        !text.contains(&format!("line {}", first - 1)),
+        "{CHILD_STREAM_MSG}: {text:?}"
+    );
+}
+
+/// A shell folds to its summary row once it answers, which is the settled rule
+/// and stays. The stream is dropped with it: keeping it would leave the card
+/// drawing output the child has already superseded.
+#[test]
+fn a_settled_child_drops_what_it_streamed() {
+    let mut panel = panel_with_running_shell();
+    panel.set_batch_child_output("t1", 0, &shell_stream());
+    render(&mut panel, 80, 24);
+
+    panel.batch_progress("t1", 0, batch_child(SHELL_TOOL_NAME, "a"));
+    render(&mut panel, 80, 24);
+
+    let text = seg_text(&panel, "t1");
+    assert!(
+        !text.contains(&format!("line {}", CHILD_STREAM_LINES - 1)),
+        "{SETTLED_CHILD_MSG}: {text:?}"
+    );
+    assert!(panel.batch_child_output.is_empty(), "{SETTLED_CHILD_MSG}");
+}
+
+/// The reported follow-up: the first window appeared and then froze until the
+/// command finished. A batch reaches the highlight worker like any other card
+/// and a rebuild reuses the cached answer whenever the key matches, so every
+/// window after the first was spliced straight back over. The stream cannot be
+/// in that key: it moves on every chunk.
+#[test]
+fn a_streaming_child_keeps_up_with_what_it_is_printing() {
+    let mut panel = panel_with_running_shell();
+    panel.set_batch_child_output("t1", 0, "line 0\n");
+    render(&mut panel, 80, 24);
+    settle_highlights(&mut panel);
+
+    panel.set_batch_child_output("t1", 0, &shell_stream());
+    render(&mut panel, 80, 24);
+
+    let text = seg_text(&panel, "t1");
+    assert!(
+        text.contains(&format!("line {}", CHILD_STREAM_LINES - 1)),
+        "{CHILD_STREAM_MSG}: {text:?}"
+    );
+}
+
+/// A child's window said nothing about itself, while the same call outside a
+/// batch reports where its window sits. Without it there is no way to tell
+/// output still arriving from output that has stopped.
+#[test]
+fn a_windowed_child_says_where_its_window_sits() {
+    let mut panel = panel_with_running_shell();
+    panel.set_batch_child_output("t1", 0, &shell_stream());
+    render(&mut panel, 80, 24);
+
+    let above = CHILD_STREAM_LINES - caudra_config::DEFAULT_SCROLL_CARD_LINES as usize;
+    let text = seg_text(&panel, "t1");
+    assert!(
+        text.contains(&format!("{above} above")),
+        "{CHILD_FOOTER_MSG}: {text:?}"
+    );
+    assert!(text.contains(FOLLOWING), "{CHILD_FOOTER_MSG}: {text:?}");
+}
+
+/// Scrolling up pins the window, and the footer has to say so: that is the
+/// difference between a card that has stopped printing and one whose newest
+/// output the reader has scrolled away from.
+#[test]
+fn a_scrolled_child_says_it_is_no_longer_following() {
+    let mut panel = panel_with_running_shell();
+    panel.set_batch_child_output("t1", 0, &shell_stream());
+    let terminal = render(&mut panel, 80, 24);
+
+    wheel_child(&mut panel, &terminal, 0, CHILD_SCROLL_UP);
+    render(&mut panel, 80, 24);
+
+    let text = seg_text(&panel, "t1");
+    assert!(text.contains(PAUSED), "{CHILD_FOOTER_MSG}: {text:?}");
+    assert!(
+        text.contains(&format!("{CHILD_SCROLL_UP} below")),
+        "{CHILD_FOOTER_MSG}: {text:?}"
+    );
+}
+
+/// A batch that has settled no longer renders locally, so it goes back to the
+/// highlight worker, whose cache key had no window in it. Every notch rebuilt
+/// the card and then had the old offset spliced straight back over it, so
+/// scrolling worked while the call ran and stopped the moment it finished.
+#[test]
+fn a_settled_child_can_still_be_scrolled() {
+    let mut panel = panel_with_tools(&[("t1", BATCH_TOOL)]);
+    let mut ev = start("t1", BATCH_TOOL);
+    ev.output = Some(ToolOutput::Batch {
+        entries: vec![caudra_agent::BatchToolEntry {
+            output: Some(ToolOutput::Plain(shell_stream().into())),
+            ..batch_child(SHELL_TOOL_NAME, "x")
+        }],
+        text: String::new(),
+    });
+    panel.tool_start(ev);
+    let terminal = render(&mut panel, 80, 24);
+    settle_highlights(&mut panel);
+
+    let spilled = wheel_child(&mut panel, &terminal, 0, CHILD_SCROLL_UP);
+    render(&mut panel, 80, 24);
+    settle_highlights(&mut panel);
+
+    assert_eq!(spilled, 0, "{SETTLED_SCROLL_MSG}");
+    let text = seg_text(&panel, "t1");
+    let first = CHILD_STREAM_LINES
+        - caudra_config::DEFAULT_SCROLL_CARD_LINES as usize
+        - CHILD_SCROLL_UP as usize;
+    assert!(
+        text.contains(&format!("line {first} ")),
+        "{SETTLED_SCROLL_MSG}: {text:?}"
+    );
+}
+
+/// The second reported follow-up: the wheel did nothing over a running child.
+/// Its window was sized from settled output, which a child that has not
+/// answered does not have, so the card reported nothing to scroll for exactly
+/// as long as there was a reason to scroll it.
+#[test]
+fn a_streaming_child_can_be_scrolled() {
+    let mut panel = panel_with_running_shell();
+    panel.set_batch_child_output("t1", 0, &shell_stream());
+    let terminal = render(&mut panel, 80, 24);
+
+    let spilled = wheel_child(&mut panel, &terminal, 0, CHILD_SCROLL_UP);
+    render(&mut panel, 80, 24);
+
+    assert_eq!(spilled, 0, "{CHILD_SCROLL_MSG}");
+    let text = seg_text(&panel, "t1");
+    let first = CHILD_STREAM_LINES
+        - caudra_config::DEFAULT_SCROLL_CARD_LINES as usize
+        - CHILD_SCROLL_UP as usize;
+    assert!(
+        text.contains(&format!("line {first} ")),
+        "{CHILD_SCROLL_MSG}: {text:?}"
+    );
+}
+
+/// A card must never trap the reader inside it. Once the window is at an edge
+/// the rest of the notches belong to the transcript.
+#[test]
+fn a_child_at_its_edge_gives_the_rest_of_the_wheel_back() {
+    let mut panel = panel_with_running_shell();
+    panel.set_batch_child_output("t1", 0, &shell_stream());
+    let terminal = render(&mut panel, 80, 24);
+
+    let reachable = CHILD_STREAM_LINES - caudra_config::DEFAULT_SCROLL_CARD_LINES as usize;
+    let spilled = wheel_child(
+        &mut panel,
+        &terminal,
+        0,
+        reachable as i32 + CHILD_SCROLL_SPILL,
+    );
+
+    assert_eq!(spilled, CHILD_SCROLL_SPILL, "{CHILD_SCROLL_MSG}");
+}
+
+/// The reported problem: a card under the pointer took every notch aimed at
+/// the transcript behind it. Hovering is not a statement of intent, so an
+/// untouched window has to hand the whole burst back.
+#[test]
+fn an_unarmed_window_leaves_the_wheel_to_the_transcript() {
+    let mut panel = panel_with_running_shell();
+    panel.set_batch_child_output("t1", 0, &shell_stream());
+    let terminal = render(&mut panel, 80, 24);
+    let (column, row) = card_bar_rows(&terminal)[0];
+    let before = seg_text(&panel, "t1");
+
+    let spilled = panel.scroll_card_at(column, row, CHILD_SCROLL_UP);
+    render(&mut panel, 80, 24);
+
+    assert_eq!(spilled, CHILD_SCROLL_UP, "{ARM_MSG}");
+    assert_eq!(seg_text(&panel, "t1"), before, "{ARM_MSG}");
+}
+
+/// A press on the header is the card's own control and must not arm anything,
+/// or the gesture that closes a card would also claim the wheel.
+#[test]
+fn a_press_on_the_header_arms_nothing() {
+    let mut panel = panel_with_running_shell();
+    panel.set_batch_child_output("t1", 0, &shell_stream());
+    let terminal = render(&mut panel, 80, 24);
+    let (column, _) = card_bar_rows(&terminal)[0];
+    let header = batch_child_row(&panel, 0);
+
+    assert!(!panel.arm_card_at(column, header), "{ARM_MSG}");
+}
+
+/// Arming is released when the pointer leaves, so the reader never has to
+/// press somewhere else to give the transcript its wheel back.
+#[test]
+fn a_window_releases_the_wheel_once_the_pointer_leaves() {
+    let mut panel = panel_with_running_shell();
+    panel.set_batch_child_output("t1", 0, &shell_stream());
+    let terminal = render(&mut panel, 80, 24);
+    let (column, row) = card_bar_rows(&terminal)[0];
+    assert!(panel.arm_card_at(column, row), "{ARM_MSG}");
+
+    panel.update_hover(0, 0, Rect::new(0, 0, 80, 24), false, Path::new("/"));
+
+    assert_eq!(
+        panel.scroll_card_at(column, row, CHILD_SCROLL_UP),
+        CHILD_SCROLL_UP,
+        "{ARM_MSG}"
+    );
+}
+
+const CARD_BAR_MSG: &str = "a window inside a card carries a bar, as the transcript does";
+const CARD_BAR_DRAG_MSG: &str = "dragging a card's bar moves that window and nothing else";
+const CARD_BAR_SWEPT_MSG: &str = "a bar outlives neither its window nor the drag anchored to it";
+
+/// Thumb rows of every bar drawn inside a card body, by column. The
+/// transcript's own bar is excluded: it sits in the last column of the
+/// viewport, and a card's sits in the last column of its body.
+fn card_bar_rows(terminal: &ratatui::Terminal<TestBackend>) -> Vec<(u16, u16)> {
+    let buf = terminal.backend().buffer();
+    (0..buf.area.height)
+        .flat_map(|y| (0..buf.area.width - 1).map(move |x| (x, y)))
+        .filter(|&(x, y)| {
+            buf.cell((x, y))
+                .is_some_and(|c: &ratatui::buffer::Cell| c.symbol() == SCROLLBAR_THUMB)
+        })
+        .collect()
+}
+
+fn press_at(column: u16, row: u16) -> MouseEvent {
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
+    MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column,
+        row,
+        modifiers: KeyModifiers::NONE,
+    }
+}
+
+/// A card's body is a window onto something longer, which is the same thing
+/// the transcript is, so it says so the same way.
+#[test]
+fn a_windowed_child_carries_a_bar() {
+    let mut panel = panel_with_running_shell();
+    panel.set_batch_child_output("t1", 0, &shell_stream());
+    let terminal = render(&mut panel, 80, 24);
+
+    let bars = card_bar_rows(&terminal);
+    assert!(!bars.is_empty(), "{CARD_BAR_MSG}");
+    let columns: Vec<u16> = bars.iter().map(|&(x, _)| x).collect();
+    assert!(
+        columns.windows(2).all(|pair| pair[0] == pair[1]),
+        "{CARD_BAR_MSG}: one column, got {columns:?}"
+    );
+}
+
+/// A body that fits has no window, so a bar there would claim a hidden
+/// remainder that does not exist.
+#[test]
+fn a_child_that_fits_carries_no_bar() {
+    let mut panel = panel_with_running_shell();
+    panel.set_batch_child_output("t1", 0, "one line\n");
+    let terminal = render(&mut panel, 80, 24);
+
+    assert!(card_bar_rows(&terminal).is_empty(), "{CARD_BAR_MSG}");
+}
+
+/// The press has to reach the child's window rather than the transcript or a
+/// selection sweep, and it has to move that window absolutely: a press on a
+/// track names a position, not a delta. The top of the track is the start of
+/// the body, wherever the thumb happened to be sitting.
+#[test]
+fn pressing_a_childs_bar_moves_its_window() {
+    let mut panel = panel_with_running_shell();
+    panel.set_batch_child_output("t1", 0, &shell_stream());
+    let terminal = render(&mut panel, 80, 24);
+    let (column, _) = card_bar_rows(&terminal)[0];
+    let track_top = batch_child_row(&panel, 0) + 1;
+
+    assert!(
+        panel.handle_card_scrollbar(&press_at(column, track_top)),
+        "{CARD_BAR_DRAG_MSG}"
+    );
+    render(&mut panel, 80, 24);
+
+    let text = seg_text(&panel, "t1");
+    assert!(text.contains("line 0 "), "{CARD_BAR_DRAG_MSG}: {text:?}");
+    assert!(text.contains(PAUSED), "{CARD_BAR_DRAG_MSG}: {text:?}");
+}
+
+/// The thumb is where the window already is, so grabbing it must not move
+/// anything: that is what makes a drag start from where the reader is looking
+/// instead of jumping under the pointer.
+#[test]
+fn grabbing_a_childs_thumb_leaves_the_window_alone() {
+    let mut panel = panel_with_running_shell();
+    panel.set_batch_child_output("t1", 0, &shell_stream());
+    let terminal = render(&mut panel, 80, 24);
+    let before = seg_text(&panel, "t1");
+    let (column, row) = card_bar_rows(&terminal)[0];
+
+    assert!(
+        panel.handle_card_scrollbar(&press_at(column, row)),
+        "{CARD_BAR_DRAG_MSG}"
+    );
+    render(&mut panel, 80, 24);
+
+    assert_eq!(seg_text(&panel, "t1"), before, "{CARD_BAR_DRAG_MSG}");
+}
+
+/// Placing a bar is also what clears its track, so a window that closes has
+/// to take its bar with it or a drag stays anchored to rows nothing draws.
+#[test]
+fn a_closed_window_takes_its_bar_with_it() {
+    let mut panel = panel_with_running_shell();
+    panel.set_batch_child_output("t1", 0, &shell_stream());
+    render(&mut panel, 80, 24);
+    assert!(!panel.card_bars.is_empty(), "{CARD_BAR_SWEPT_MSG}");
+
+    panel.batch_progress("t1", 0, batch_child(SHELL_TOOL_NAME, "a"));
+    render(&mut panel, 80, 24);
+
+    assert!(panel.card_bars.is_empty(), "{CARD_BAR_SWEPT_MSG}");
+}
+
+/// The index has to name a child of this batch, for the same reason a report
+/// does: output addressed to a roster that has already gone would install a
+/// tail against a card that cannot draw it, and the caller falls back to the
+/// header path on a `false`.
+#[test_case(0, true ; "a child of the roster takes it")]
+#[test_case(9, false ; "an index past the roster does not")]
+fn streamed_output_is_only_taken_for_a_child_that_exists(index: usize, expected: bool) {
+    let mut panel = panel_with_running_shell();
+    assert_eq!(
+        panel.set_batch_child_output("t1", index, &shell_stream()),
+        expected
+    );
+}
+
 /// The index has to name a child of this batch. A report for a roster that has
 /// already gone would otherwise install a row against a card that cannot draw
 /// it, and the caller falls back to the header path on a `false`.
@@ -6149,14 +6632,14 @@ const SPACER_SETUP_MSG: &str = "the test must start from a card with a body to g
 const HELD_BODY_LINES: usize = 5;
 
 fn auto_panel_with_body(lines: usize) -> MessagesPanel {
-    let mut panel = panel_with_tools(&[("t1", FILE_GREP_TOOL_NAME)]);
+    let mut panel = panel_with_tools(&[("t1", CODE_MAP_TOOL_NAME)]);
     panel.tool_done(long_done("t1", lines));
     rebuild(&mut panel);
     panel
 }
 
 fn supersede(panel: &mut MessagesPanel) {
-    panel.tool_start(start("t2", FILE_GREP_TOOL_NAME));
+    panel.tool_start(start("t2", CODE_MAP_TOOL_NAME));
     panel.tool_done(done("t2"));
     rebuild(panel);
 }
@@ -6535,7 +7018,7 @@ const WRITE_STAYS_OPEN_MSG: &str = "a write must stay open: its diff is the only
 #[test_case(ViewMode::Compact ; "compact closes it")]
 #[test_case(ViewMode::Auto ; "auto closes the one behind")]
 fn a_shell_card_closes_like_any_other_read(view: ViewMode) {
-    let mut panel = panel_with_long_tool(TRUNCATING_LINES);
+    let mut panel = panel_with_long_tool(SHELL_TOOL_NAME, TRUNCATING_LINES);
     panel.set_view(view);
     // Auto keeps the newest card open, so give it a newer one to fall behind.
     panel.push(DisplayMessage::new(DisplayRole::Assistant, "done".into()));
@@ -6560,6 +7043,248 @@ fn a_write_still_ignores_the_view(tool: &'static str) {
         seg_text(&panel, "t1").contains("line 0"),
         "{WRITE_STAYS_OPEN_MSG}"
     );
+}
+
+/// The same read wrapped by an MCP server, which is how a call arrives once a
+/// server stands between the model and the tool.
+const QUALIFIED_READ_TOOL_NAME: &str = "mcp_File_read";
+const COLLAPSED_BODY_LINES: usize = 30;
+const ONE_ROW: &[u16] = &[1];
+const STAYS_ONE_ROW_MSG: &str = "a tool on the collapse list is a window into a document, so no \
+    view mode may spend the transcript drawing its alphabetically first lines";
+const QUALIFIED_MATCH_MSG: &str = "the list is written in bare names, so the same read behind a \
+    server qualifier has to fold with it rather than slip through as a tool nobody listed";
+const COLLAPSED_CLICK_MSG: &str = "the fold is a default, not a lock: the reader asking for the \
+    body is the one thing that opens it";
+const COLLAPSED_RECLOSE_MSG: &str = "a card the reader opened by hand has to shut by hand too, or \
+    the only way back to the row is a mode change";
+const OPT_OUT_MSG: &str = "an empty list is the documented opt-out, so a read goes back to \
+    answering the view mode like any other read-only call";
+
+/// A read is `ReadOnly` however it was registered, so the effect is stated
+/// rather than looked up: a qualified name is absent from the test table and
+/// would otherwise arrive as `Unknown`, which is uncollapsible for a reason
+/// that has nothing to do with the collapse list.
+fn read_call_panel(config: UiConfig, view: ViewMode, tool: &'static str) -> MessagesPanel {
+    let mut panel = MessagesPanel::new(config, EventHandle::disconnected_for_test());
+    panel.set_view(view);
+    let mut call = start(TOOL_ID, tool);
+    call.effect = ToolEffect::ReadOnly;
+    panel.tool_start(call);
+    panel.tool_done(long_done(TOOL_ID, COLLAPSED_BODY_LINES));
+    rebuild(&mut panel);
+    panel
+}
+
+fn without_collapse_list() -> UiConfig {
+    UiConfig {
+        always_collapsed: Vec::new(),
+        ..UiConfig::default()
+    }
+}
+
+/// Expanded is the mode that opens everything, and auto opens the newest call,
+/// so without this the list only ever proves itself in compact — where every
+/// card is closed anyway and the list decides nothing.
+#[test_case(ViewMode::Compact ; "compact")]
+#[test_case(ViewMode::Auto ; "auto")]
+#[test_case(ViewMode::Expanded ; "expanded")]
+fn an_always_collapsed_call_stays_one_row_in_every_mode(view: ViewMode) {
+    let panel = read_call_panel(UiConfig::default(), view, FILE_READ_TOOL_NAME);
+
+    assert_eq!(panel.segment_heights(), ONE_ROW, "{STAYS_ONE_ROW_MSG}");
+}
+
+/// Matching on the bare name alone would let the identical read open a card
+/// the moment it came through a server, so the list would quietly stop working
+/// for exactly the sessions that make the most tool calls.
+#[test]
+fn an_always_collapsed_call_folds_under_its_server_qualifier() {
+    let panel = read_call_panel(
+        UiConfig::default(),
+        ViewMode::Expanded,
+        QUALIFIED_READ_TOOL_NAME,
+    );
+    // Without the list the same qualified call opens, so the fold above is the
+    // list matching through the qualifier rather than the card having no body.
+    let unlisted = read_call_panel(
+        without_collapse_list(),
+        ViewMode::Expanded,
+        QUALIFIED_READ_TOOL_NAME,
+    );
+
+    assert_eq!(panel.segment_heights(), ONE_ROW, "{QUALIFIED_MATCH_MSG}");
+    assert!(
+        unlisted.segment_heights()[0] > 1,
+        "{QUALIFIED_MATCH_MSG}: {:?}",
+        unlisted.segment_heights()
+    );
+}
+
+/// `toggle_expansion` is already covered, but the reader has no such function:
+/// they press the row. Nothing proves the press reaches the card, and nothing
+/// proves a second press gives the row back rather than stalling on the body
+/// the way an expanded card without a header to close to does.
+#[test]
+fn an_always_collapsed_card_opens_on_a_press_and_shuts_on_the_next() {
+    let mut panel = read_call_panel(UiConfig::default(), ViewMode::Expanded, FILE_READ_TOOL_NAME);
+    let area = Rect::new(0, 0, 80, 24);
+
+    assert!(panel.handle_click(0, area), "{COLLAPSED_CLICK_MSG}");
+    rebuild(&mut panel);
+    assert!(
+        panel.segment_heights()[0] > 1,
+        "{COLLAPSED_CLICK_MSG}: {:?}",
+        panel.segment_heights()
+    );
+
+    assert!(panel.handle_click(0, area), "{COLLAPSED_RECLOSE_MSG}");
+    rebuild(&mut panel);
+    assert_eq!(panel.segment_heights(), ONE_ROW, "{COLLAPSED_RECLOSE_MSG}");
+}
+
+/// The list is a default, and a default nobody can turn off is a bug. An
+/// empty list has to reach the panel as empty rather than be read as unset.
+#[test_case(ViewMode::Compact, false ; "compact still closes it")]
+#[test_case(ViewMode::Auto, true ; "auto opens the newest")]
+#[test_case(ViewMode::Expanded, true ; "expanded opens it")]
+fn an_empty_collapse_list_hands_a_read_back_to_the_view(view: ViewMode, open: bool) {
+    let panel = read_call_panel(without_collapse_list(), view, FILE_READ_TOOL_NAME);
+
+    assert_eq!(panel.segment_heights()[0] > 1, open, "{OPT_OUT_MSG}");
+}
+
+/// `/view` is one key, and a reader leaning on it walks the whole cycle in
+/// seconds. A mode that opened these calls would make the shortcut unusable in
+/// any session that reads files, which is all of them.
+#[test]
+fn cycling_the_view_leaves_an_always_collapsed_call_at_one_row() {
+    let mut panel = read_call_panel(
+        UiConfig::default(),
+        ViewMode::default(),
+        FILE_READ_TOOL_NAME,
+    );
+    let mut view = ViewMode::default();
+
+    loop {
+        view = view.next();
+        panel.set_view(view);
+        rebuild(&mut panel);
+        assert_eq!(
+            panel.segment_heights(),
+            ONE_ROW,
+            "{STAYS_ONE_ROW_MSG}: {view:?}"
+        );
+        if view == ViewMode::default() {
+            break;
+        }
+    }
+}
+
+const WRITE_OPENS_MSG: &str = "a write is not collapsible by mode, so the dense views open it too";
+const WRITE_SHUTS_MSG: &str = "hiding a diff nobody asked to hide loses the change, but the reader \
+    asking is a different thing, and the row still names the file";
+const WRITE_REOPENS_MSG: &str = "a card the reader shut has to come back on the next press, or the \
+    diff is gone for the rest of the session";
+const BODY_HEAD: &str = "line 0";
+
+/// A write was exempt from every collapse rule, including the reader's own
+/// press, so a long diff could not be put away at all and a session full of
+/// writes could not be skimmed. Expanded is left out on purpose: it gives no
+/// card a header to fall back to, which is a property of the mode rather than
+/// of writes.
+#[test_case(ViewMode::Compact ; "compact")]
+#[test_case(ViewMode::Auto ; "auto")]
+fn a_write_shuts_on_a_press_and_comes_back_on_the_next(view: ViewMode) {
+    let mut panel = panel_with_tools(&[(TOOL_ID, FILE_WRITE_TOOL_NAME)]);
+    panel.set_view(view);
+    panel.tool_done(long_done(TOOL_ID, HELD_BODY_LINES));
+    rebuild(&mut panel);
+    let area = Rect::new(0, 0, 80, 24);
+    assert!(!panel.card_closed(TOOL_ID), "{WRITE_OPENS_MSG}");
+
+    assert!(panel.handle_click(0, area), "{WRITE_SHUTS_MSG}");
+    rebuild(&mut panel);
+    assert!(panel.card_closed(TOOL_ID), "{WRITE_SHUTS_MSG}");
+    assert!(
+        !seg_text(&panel, TOOL_ID).contains(BODY_HEAD),
+        "{WRITE_SHUTS_MSG}"
+    );
+
+    assert!(panel.handle_click(0, area), "{WRITE_REOPENS_MSG}");
+    rebuild(&mut panel);
+    assert!(!panel.card_closed(TOOL_ID), "{WRITE_REOPENS_MSG}");
+    assert!(
+        seg_text(&panel, TOOL_ID).contains(BODY_HEAD),
+        "{WRITE_REOPENS_MSG}"
+    );
+}
+
+const SCROLLING_OFF: u32 = 0;
+const BUDGET_SHAPE_MSG: &str = "with scrolling off a shell body is abridged again: it keeps its \
+    head, drops its tail, and offers the rest behind the notice";
+const NO_WINDOW_MSG: &str = "a card that is not a window must not report one, or the footer \
+    promises a wheel that goes nowhere";
+const UNABRIDGED_WRITE_MSG: &str = "with scrolling off a write has no budget at all, so the file \
+    is drawn whole rather than cut at either end";
+
+fn without_card_scrolling() -> UiConfig {
+    UiConfig {
+        scroll_card_lines: SCROLLING_OFF,
+        ..UiConfig::default()
+    }
+}
+
+fn long_card_text(config: UiConfig, tool: &'static str, lines: usize) -> String {
+    let mut panel = MessagesPanel::new(config, EventHandle::disconnected_for_test());
+    panel.set_view(ViewMode::Expanded);
+    panel.tool_start(start(TOOL_ID, tool));
+    panel.tool_done(long_done(TOOL_ID, lines));
+    rebuild(&mut panel);
+    seg_text(&panel, TOOL_ID)
+}
+
+/// `0` is the escape hatch for readers who want the old card back, so it has
+/// to restore the whole of the old shape and not merely stop scrolling. The
+/// two shapes are opposites — a budget keeps the head and hides the tail, a
+/// window keeps the tail — so the head and the notice are what tell them apart.
+#[test]
+fn scrolling_off_returns_a_shell_body_to_its_budget() {
+    let budget = UiConfig::default().tool_output_lines.get(SHELL_TOOL_NAME);
+    let text = long_card_text(without_card_scrolling(), SHELL_TOOL_NAME, TRUNCATING_LINES);
+    let tail = format!("line {}", TRUNCATING_LINES - 1);
+
+    assert!(text.contains(BODY_HEAD), "{BUDGET_SHAPE_MSG}: {text:?}");
+    assert!(!text.contains(&tail), "{BUDGET_SHAPE_MSG}: {text:?}");
+    assert!(
+        text.contains(&crate::markdown::truncation_notice(
+            TRUNCATING_LINES - budget
+        )),
+        "{BUDGET_SHAPE_MSG}: {text:?}"
+    );
+    assert!(!text.contains(FOLLOWING), "{NO_WINDOW_MSG}: {text:?}");
+    assert!(!text.contains(PAUSED), "{NO_WINDOW_MSG}: {text:?}");
+}
+
+/// The other half of the old shape: a write spent no budget at all, so turning
+/// scrolling off has to give back the whole file rather than leave the write
+/// resting at the window height the setting just removed.
+#[test]
+fn scrolling_off_draws_a_write_whole() {
+    let text = long_card_text(
+        without_card_scrolling(),
+        FILE_WRITE_TOOL_NAME,
+        WRITTEN_FILE_LINES,
+    );
+    let tail = format!("line {}", WRITTEN_FILE_LINES - 1);
+
+    assert!(text.contains(BODY_HEAD), "{UNABRIDGED_WRITE_MSG}: {text:?}");
+    assert!(text.contains(&tail), "{UNABRIDGED_WRITE_MSG}: {text:?}");
+    assert!(
+        !text.contains(crate::markdown::EXPAND_AFFORDANCE),
+        "{UNABRIDGED_WRITE_MSG}: {text:?}"
+    );
+    assert!(!text.contains(FOLLOWING), "{NO_WINDOW_MSG}: {text:?}");
 }
 
 const WRITE_WHOLE_MSG: &str = "a whole-file write is the file: abridging it to seven rows behind a \
@@ -6598,33 +7323,314 @@ fn a_writes_body_is_not_abridged(tool: &'static str, expect_notice: bool) {
     );
 }
 
-const LIVE_WHOLE_MSG: &str = "a still-arriving file is drawn whole, so the card does not jump \
-    when the tool starts";
+const LIVE_TAIL_MSG: &str = "a still-arriving file is a window on its tail, so the line that just \
+    landed is the one on screen and the footer says the window is following it";
+const LIVE_WINDOW_MSG: &str = "the window is a fixed height, so the card does not take a row for \
+    every line the tool writes and the lines it passed are counted, not drawn";
 const NO_LIVE_NOTICE_MSG: &str = "nothing is hidden behind a click while the rest of the file has \
     not arrived";
-const PER_FRAME_MSG: &str = "the body is drawn whole, so it must be rebuilt once a frame rather \
-    than once a fragment: per fragment costs the file's length squared";
+const LIVE_BODY_DRAWN_MSG: &str = "the frame is what draws the body, so the card has grown past \
+    its header by the time it is painted";
+const PER_FRAME_MSG: &str = "the body is rebuilt once a frame rather than once a fragment: per \
+    fragment costs the file's length squared";
 
-/// The live body matches what the finished card will draw, first line to last.
+/// The live body is the window the settled card will rest at, pinned to the
+/// tail and saying so. Drawing the whole file instead grew the card under the
+/// reader for as long as the tool ran.
 #[test]
-fn a_streaming_write_is_drawn_whole() {
+fn a_streaming_write_follows_its_tail_in_a_fixed_window() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    let window = UiConfig::default().scroll_card_lines as usize;
+    let above = WRITTEN_FILE_LINES - window;
     let body: String = (0..WRITTEN_FILE_LINES)
         .map(|i| format!("line {i}\n"))
         .collect();
     streaming_write(&mut panel, &[&body]);
 
     let shown = buffer_text(&render(&mut panel, 80, WRITTEN_FILE_LINES as u16 + 8));
-    for line in [0, WRITTEN_FILE_LINES - 1] {
+    for line in [above, WRITTEN_FILE_LINES - 1] {
         assert!(
             shown.contains(&format!("line {line}")),
-            "{LIVE_WHOLE_MSG}: {shown}"
+            "{LIVE_TAIL_MSG}: {shown}"
         );
     }
+    assert!(shown.contains(FOLLOWING), "{LIVE_TAIL_MSG}: {shown}");
+    assert!(!shown.contains("line 0"), "{LIVE_WINDOW_MSG}: {shown}");
+    assert!(
+        shown.contains(&format!("{above} above")),
+        "{LIVE_WINDOW_MSG}: {shown}"
+    );
     assert!(
         !shown.contains(crate::markdown::EXPAND_AFFORDANCE),
         "{NO_LIVE_NOTICE_MSG}: {shown}"
     );
+}
+
+const CHILD_SCRIPT: &str = "for f in *.rs\ndo\n  echo $f\ndone";
+const CHILD_SCRIPT_TOKENS: [&str; 3] = ["for", "do", "done"];
+const CHILD_SCRIPT_MSG: &str =
+    "a child draws its script the way its own card does, highlighted and numbered";
+const CHILD_ONE_LINER_MSG: &str =
+    "a one-line script is drawn in the body and given up by the summary row";
+const CHILD_LIVE_SCRIPT_MSG: &str =
+    "a child still running shows what it is running, not only what it has printed";
+
+/// Styles of the shell keywords in a child's script, which are plain until the
+/// highlighter has run over them.
+fn script_token_styles(panel: &MessagesPanel, tool_id: &str) -> Vec<Style> {
+    panel
+        .cache
+        .segments()
+        .iter()
+        .find(|s| s.tool_id.as_deref() == Some(tool_id))
+        .unwrap()
+        .lines()
+        .iter()
+        .flat_map(|l| l.spans.iter())
+        .filter(|s| CHILD_SCRIPT_TOKENS.contains(&s.content.trim()))
+        .map(|s| s.style)
+        .collect()
+}
+
+/// A batch whose one child is a shell call carrying `script` and answering
+/// with `output`.
+fn panel_with_script_child(script: &str, output: ToolOutput) -> MessagesPanel {
+    let mut panel = panel_with_tools(&[(TOOL_ID, BATCH_TOOL)]);
+    let mut ev = start(TOOL_ID, BATCH_TOOL);
+    ev.output = Some(ToolOutput::Batch {
+        entries: vec![caudra_agent::BatchToolEntry {
+            input: Some(ToolInput::Script {
+                language: "bash".into(),
+                code: script.into(),
+            }),
+            output: Some(output),
+            ..batch_child(SHELL_TOOL_NAME, "x")
+        }],
+        text: String::new(),
+    });
+    panel.tool_start(ev);
+    panel.set_view(ViewMode::Expanded);
+    panel
+}
+
+fn shell_child_output() -> ToolOutput {
+    shell_done(TOOL_ID, false).output
+}
+
+/// The reported gap: a shell child had no syntax highlighting while a read
+/// child did. A child answering with text took an arm of `child_body` that
+/// drew the output alone, so its script was never rendered and the highlighter
+/// had nothing to run over. Both text arms are covered: a shell child and the
+/// plain answer a python child gives.
+#[test_case(shell_child_output() ; "shell output")]
+#[test_case(ToolOutput::Plain(BATCH_CHILD_BODY.into()) ; "plain output")]
+fn a_child_draws_its_script_highlighted(output: ToolOutput) {
+    let mut panel = panel_with_script_child(CHILD_SCRIPT, output);
+    render(&mut panel, 100, 40);
+    drain_highlight_worker(&mut panel);
+
+    let text = seg_text(&panel, TOOL_ID);
+    for line in CHILD_SCRIPT.lines() {
+        assert!(text.contains(line.trim()), "{CHILD_SCRIPT_MSG}: {text:?}");
+    }
+    let styles = script_token_styles(&panel, TOOL_ID);
+    assert!(!styles.is_empty(), "{CHILD_SCRIPT_MSG}: {text:?}");
+    assert!(
+        styles.iter().any(|style| style.fg.is_some()),
+        "{CHILD_SCRIPT_MSG}: {styles:?}"
+    );
+}
+
+/// A one-line command is the common case and it was the one that showed no
+/// highlighting, so line count must not decide whether the script is drawn.
+/// The summary row then gives the command up rather than printing it twice,
+/// which is the trade a card's header already makes.
+#[test]
+fn a_one_line_child_script_moves_into_the_body() {
+    const ONE_LINER: &str = "echo hello";
+
+    let mut panel = panel_with_script_child(ONE_LINER, shell_child_output());
+    render(&mut panel, 100, 40);
+    settle_highlights(&mut panel);
+
+    let text = seg_text(&panel, TOOL_ID);
+    assert!(
+        text.contains(&format!("1 {ONE_LINER}")),
+        "{CHILD_ONE_LINER_MSG}: {text:?}"
+    );
+    assert_eq!(
+        text.matches(ONE_LINER).count(),
+        1,
+        "{CHILD_ONE_LINER_MSG}: {text:?}"
+    );
+}
+
+/// The reported case: a child still running took the live arm of `child_body`,
+/// which drew the streaming tail and nothing else, so the one card where the
+/// reader most wants to know what is running showed only what it had printed.
+#[test]
+fn a_running_child_draws_the_script_above_its_live_tail() {
+    let mut panel = panel_with_running_shell();
+    let loop_command = CHILD_SCRIPT.lines().next().unwrap();
+    let mut ev = start(TOOL_ID, BATCH_TOOL);
+    ev.output = Some(ToolOutput::Batch {
+        entries: vec![caudra_agent::BatchToolEntry {
+            status: caudra_agent::BatchToolStatus::Running,
+            summary: loop_command.into(),
+            input: Some(ToolInput::Script {
+                language: "bash".into(),
+                code: CHILD_SCRIPT.into(),
+            }),
+            output: None,
+            ..batch_child(SHELL_TOOL_NAME, "x")
+        }],
+        text: String::new(),
+    });
+    panel.tool_start(ev);
+    panel.set_batch_child_output(TOOL_ID, 0, &shell_stream());
+    render(&mut panel, 100, 40);
+
+    let text = seg_text(&panel, TOOL_ID);
+    for line in CHILD_SCRIPT.lines() {
+        assert!(
+            text.contains(line.trim()),
+            "{CHILD_LIVE_SCRIPT_MSG}: {text:?}"
+        );
+    }
+    assert!(
+        text.contains(FOLLOWING),
+        "{CHILD_LIVE_SCRIPT_MSG}: {text:?}"
+    );
+}
+
+const SCRIPT_HEAD: &str = "set -euo pipefail";
+const SCRIPT_TAIL_LINES: usize = 24;
+const RAN_LABEL: &str = "Ran";
+const HEADER_ONCE_MSG: &str =
+    "an open card names the command once, in the copy that is numbered and highlighted";
+const WHOLE_SCRIPT_MSG: &str =
+    "the script is the record of what ran, so an open card draws all of it";
+
+/// A shell call whose script runs past any output budget, with the header the
+/// agent sends for it: the script's first line.
+fn shell_script_card(panel: &mut MessagesPanel) {
+    let script: String = std::iter::once(SCRIPT_HEAD.to_owned())
+        .chain((0..SCRIPT_TAIL_LINES).map(|i| format!("echo step_{i}")))
+        .collect::<Vec<_>>()
+        .join("\n");
+    panel.tool_start(ToolStartEvent {
+        summary: SCRIPT_HEAD.into(),
+        input: Some(ToolInput::Script {
+            language: "bash".into(),
+            code: script,
+        }),
+        ..start(TOOL_ID, SHELL_TOOL_NAME)
+    });
+    panel.tool_done(shell_done(TOOL_ID, false));
+}
+
+/// The reported duplication: an expanded shell card printed the command in its
+/// header and again as line 1 of the script. The header defers to the body,
+/// which is the copy worth reading.
+#[test]
+fn an_open_shell_card_leaves_the_command_to_its_script() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.set_view(ViewMode::Expanded);
+    shell_script_card(&mut panel);
+    render(&mut panel, 100, 40);
+
+    let text = seg_text(&panel, TOOL_ID);
+    assert_eq!(
+        text.matches(SCRIPT_HEAD).count(),
+        1,
+        "{HEADER_ONCE_MSG}: {text:?}"
+    );
+    assert!(text.contains(RAN_LABEL), "{HEADER_ONCE_MSG}: {text:?}");
+}
+
+/// A row with no body has nothing to defer to, so dropping the command there
+/// would leave the reader a bare verb.
+#[test]
+fn a_closed_shell_row_still_names_the_command() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.set_view(ViewMode::Compact);
+    shell_script_card(&mut panel);
+    render(&mut panel, 100, 40);
+
+    let text = seg_text(&panel, TOOL_ID);
+    assert!(text.contains(SCRIPT_HEAD), "{HEADER_ONCE_MSG}: {text:?}");
+}
+
+/// The reported truncation: a long inline script was cut to the output budget
+/// and offered a "click to expand" inside a card that was already open. The
+/// output keeps its budget, since a tool can print without limit, but the
+/// script is bounded by what the model wrote.
+#[test]
+fn an_open_shell_card_draws_its_whole_script() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.set_view(ViewMode::Expanded);
+    shell_script_card(&mut panel);
+    render(&mut panel, 100, 60);
+
+    let text = seg_text(&panel, TOOL_ID);
+    for line in [0, SCRIPT_TAIL_LINES - 1] {
+        assert!(
+            text.contains(&format!("echo step_{line}")),
+            "{WHOLE_SCRIPT_MSG}: {text:?}"
+        );
+    }
+}
+
+/// The screen row of a card's own window footer. `push_card_scroll_span`
+/// measures the window before the footer is pushed, so the footer is the row
+/// just past it, and `handle_click` resolves it by source line as this does.
+fn scroll_footer_row(panel: &MessagesPanel, tool_id: &str) -> u16 {
+    let segment = panel
+        .cache
+        .segments()
+        .iter()
+        .find(|s| s.tool_id.as_deref() == Some(tool_id))
+        .unwrap();
+    let chrome = segment.chrome(80);
+    let width = chrome.content_width(80);
+    let footer = segment
+        .scroll_footer_line
+        .expect("the window drew a footer");
+    (0..segment.content_height(80))
+        .map(|row| chrome.content_start() + row)
+        .find(|row| segment.source_line_at(*row, width) == Some(footer))
+        .expect("the footer was drawn")
+}
+
+/// Pausing a window has to be reversible through the affordance that says it
+/// is paused. That footer sits just past the window on purpose: a press inside
+/// the window arms the scroller instead of clicking anything, so a footer
+/// counted as part of the window would strand the reader off the tail.
+#[test]
+fn clicking_a_paused_windows_footer_follows_the_tail_again() {
+    const FOLLOW_CLICK_MSG: &str =
+        "the footer that reports a paused window is what takes it back to the tail";
+
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    let body: String = (0..WRITTEN_FILE_LINES)
+        .map(|i| format!("line {i}\n"))
+        .collect();
+    streaming_write(&mut panel, &[&body]);
+    let height = WRITTEN_FILE_LINES as u16 + 8;
+    let area = Rect::new(0, 0, 80, height);
+    let terminal = render(&mut panel, 80, height);
+    let (column, row) = card_bar_rows(&terminal)[0];
+
+    assert!(panel.arm_card_at(column, row), "{ARM_MSG}");
+    panel.scroll_card_at(column, row, CHILD_SCROLL_UP);
+    let paused = buffer_text(&render(&mut panel, 80, height));
+    assert!(paused.contains(PAUSED), "{FOLLOW_CLICK_MSG}: {paused}");
+
+    let footer = scroll_footer_row(&panel, TOOL_ID);
+    assert!(panel.handle_click(footer, area), "{FOLLOW_CLICK_MSG}");
+
+    let shown = buffer_text(&render(&mut panel, 80, height));
+    assert!(shown.contains(FOLLOWING), "{FOLLOW_CLICK_MSG}: {shown}");
 }
 
 /// The cost of a write is what made this deferred, so the rate is the point,
@@ -6652,7 +7658,7 @@ fn a_streaming_write_redraws_once_a_frame_not_once_a_fragment() {
     assert_eq!(rows(&panel), settled, "{PER_FRAME_MSG}");
 
     render(&mut panel, 80, WRITTEN_FILE_LINES as u16 + 8);
-    assert!(rows(&panel) > settled, "{LIVE_WHOLE_MSG}");
+    assert!(rows(&panel) > settled, "{LIVE_BODY_DRAWN_MSG}");
 }
 
 const RATE_UNSET_MSG: &str = "one sample measures no interval, so there is no rate to show";
@@ -6739,4 +7745,258 @@ fn a_prefilling_prompt_draws_its_rate_beside_the_bar(width: u16, shows_rate: boo
         "{BAR_ALWAYS_MSG}"
     );
     assert_eq!(text.contains("2.0k tok/s"), shows_rate, "{NARROW_RATE_MSG}");
+}
+
+const COPY_SCRIPT: &str = "printf 'one'\nprintf 'two'";
+const COPY_LANGUAGE: &str = "bash";
+const COPY_FILE_PATH: &str = "src/f.rs";
+const COPY_FILE: &str = "fn main() {\n    println!(\"hi\");\n}";
+const COPY_WIDTH: u16 = 80;
+const COPY_HEIGHT: u16 = 40;
+const SCRIPT_UNGUTTERED_MSG: &str =
+    "a selection inside a code block copies the source, never the line-number gutter";
+const CARD_FENCED_MSG: &str =
+    "a selection past the code block fences it and leaves the output rows beside it";
+const READ_UNGUTTERED_MSG: &str = "a read body copies as the file, not as a numbered listing";
+const READ_TOOL: &str = "read";
+const SHELL_FIRST_LINE: &str = "raw_1";
+const SHELL_LAST_LINE: &str = "raw_8";
+
+/// The document rows a card's code block occupies, and the rows of the whole
+/// card, so a selection can be aimed at either.
+fn code_block_and_card_rows(
+    panel: &MessagesPanel,
+    width: u16,
+) -> (std::ops::Range<u32>, std::ops::Range<u32>) {
+    let mut start = 0u32;
+    for segment in panel.cache.segments() {
+        let height = u32::from(segment.height(width));
+        if let Some((rows, _)) = segment.code_block_rows(width) {
+            let first = start + u32::from(segment.chrome(width).content_start());
+            return (
+                first + u32::from(rows.start)..first + u32::from(rows.end),
+                start..start + height,
+            );
+        }
+        start += height;
+    }
+    panic!("no card recorded a code block");
+}
+
+fn shell_script_panel() -> MessagesPanel {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.set_view(ViewMode::Expanded);
+    panel.tool_start(ToolStartEvent {
+        summary: COPY_SCRIPT.lines().next().unwrap().into(),
+        input: Some(ToolInput::Script {
+            language: COPY_LANGUAGE.into(),
+            code: COPY_SCRIPT.into(),
+        }),
+        ..start(TOOL_ID, SHELL_TOOL_NAME)
+    });
+    panel.tool_done(shell_done(TOOL_ID, false));
+    panel
+}
+
+/// The reported defect: selecting a shell card's script put the gutter on the
+/// clipboard, so what was copied could not be run.
+///
+/// Both passes are covered because the highlighted render splits each row into
+/// one span per token. Provenance built by the unhighlighted pass describes
+/// lines that no longer exist once the worker's result is spliced in, and a
+/// mismatch there falls back to scraping, which is the defect again.
+#[test_case(false ; "before_the_highlight_worker_runs")]
+#[test_case(true ; "after_the_highlight_worker_runs")]
+fn copying_a_script_omits_the_line_number_gutter(highlighted: bool) {
+    let mut panel = shell_script_panel();
+    let area = Rect::new(0, 0, COPY_WIDTH, COPY_HEIGHT);
+    render(&mut panel, COPY_WIDTH, COPY_HEIGHT);
+    if highlighted {
+        drain_highlight_worker(&mut panel);
+    }
+
+    let (code, _) = code_block_and_card_rows(&panel, COPY_WIDTH);
+    let sel = make_sel(area, (code.start, 0), (code.end - 1, COPY_WIDTH - 1));
+
+    assert_eq!(
+        panel.extract_selection_text(&sel, area),
+        COPY_SCRIPT,
+        "{SCRIPT_UNGUTTERED_MSG}"
+    );
+}
+
+/// A selection that ran past the script is a mixture, so the script is fenced
+/// where it sits and the command output stays as it was drawn.
+#[test]
+fn copying_a_whole_card_fences_the_script_and_keeps_the_output() {
+    let mut panel = shell_script_panel();
+    let area = Rect::new(0, 0, COPY_WIDTH, COPY_HEIGHT);
+    render(&mut panel, COPY_WIDTH, COPY_HEIGHT);
+
+    let (_, card) = code_block_and_card_rows(&panel, COPY_WIDTH);
+    let sel = make_sel(area, (card.start, 0), (card.end - 1, COPY_WIDTH - 1));
+    let copied = panel.extract_selection_text(&sel, area);
+
+    assert!(
+        copied.starts_with(&format!("```{COPY_LANGUAGE}\n{COPY_SCRIPT}\n```\n")),
+        "{CARD_FENCED_MSG}: {copied:?}"
+    );
+    for line in [SHELL_FIRST_LINE, SHELL_LAST_LINE] {
+        assert!(copied.contains(line), "{CARD_FENCED_MSG}: {copied:?}");
+    }
+    assert!(!copied.contains("  1 "), "{CARD_FENCED_MSG}: {copied:?}");
+}
+
+/// A read card's body is drawn behind the same gutter, so it copied the same
+/// way and is fixed by the same provenance.
+#[test]
+fn copying_a_read_body_omits_the_line_number_gutter() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.tool_start(start(TOOL_ID, READ_TOOL));
+    panel.tool_done(ToolDoneEvent {
+        id: TOOL_ID.into(),
+        tool: READ_TOOL.into(),
+        output: ToolOutput::ReadCode {
+            path: COPY_FILE_PATH.into(),
+            start_line: 1,
+            lines: COPY_FILE.lines().map(str::to_owned).collect(),
+            total_lines: COPY_FILE.lines().count(),
+            instructions: None,
+        },
+        is_error: false,
+        annotation: None,
+        written_path: None,
+        written_paths: Vec::new(),
+        output_ref: None,
+        output_limits: None,
+        model_suffix: None,
+        model_output: None,
+        model_output_from_ref: false,
+    });
+    let area = Rect::new(0, 0, COPY_WIDTH, COPY_HEIGHT);
+    render(&mut panel, COPY_WIDTH, COPY_HEIGHT);
+    drain_highlight_worker(&mut panel);
+
+    let (code, _) = code_block_and_card_rows(&panel, COPY_WIDTH);
+    let sel = make_sel(area, (code.start, 0), (code.end - 1, COPY_WIDTH - 1));
+
+    assert_eq!(
+        panel.extract_selection_text(&sel, area),
+        COPY_FILE,
+        "{READ_UNGUTTERED_MSG}"
+    );
+}
+
+/// `Provenance::extract` needs one row per painted line and gives up on the
+/// whole card otherwise, which is a silent return to scraping the gutter.
+#[test_case(false ; "before_the_highlight_worker_runs")]
+#[test_case(true ; "after_the_highlight_worker_runs")]
+fn a_cards_source_rows_stay_parallel_to_its_lines(highlighted: bool) {
+    const PARALLEL_MSG: &str = "every painted line of a card needs a source row of its own";
+
+    let mut panel = shell_script_panel();
+    render(&mut panel, COPY_WIDTH, COPY_HEIGHT);
+    if highlighted {
+        drain_highlight_worker(&mut panel);
+    }
+
+    let segment = panel
+        .cache
+        .segments()
+        .iter()
+        .find(|segment| segment.tool_id.as_deref() == Some(TOOL_ID))
+        .expect("the card was built");
+    let provenance = segment.provenance().expect("the card recorded its source");
+
+    assert_eq!(
+        provenance
+            .lines_in(0..segment.lines().len())
+            .map(|r| r.len()),
+        Some(segment.lines().len()),
+        "{PARALLEL_MSG}"
+    );
+}
+
+/// A card's output may be windowed, so the ranges a copy records have to index
+/// the rows that were drawn rather than the line numbers they came from.
+#[test]
+fn copying_a_windowed_output_takes_the_rows_that_were_drawn() {
+    const WINDOWED_MSG: &str = "a windowed card copies the rows it drew, not the ones it hid";
+    const OUTPUT_LINES: usize = 40;
+    const OUTPUT_PREFIX: &str = "line ";
+
+    let mut panel = panel_with_long_tool(SHELL_TOOL_NAME, OUTPUT_LINES);
+    let area = Rect::new(0, 0, COPY_WIDTH, COPY_HEIGHT);
+    render(&mut panel, COPY_WIDTH, COPY_HEIGHT);
+
+    let segment = panel
+        .cache
+        .segments()
+        .iter()
+        .find(|segment| segment.tool_id.as_deref() == Some(TOOL_ID))
+        .expect("the card was built");
+    assert!(segment.scroll_footer_line.is_some(), "{WINDOWED_MSG}");
+    let drawn: Vec<String> = segment
+        .lines()
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+                .trim()
+                .to_owned()
+        })
+        .filter(|text| text.starts_with(OUTPUT_PREFIX))
+        .collect();
+    assert!(drawn.len() < OUTPUT_LINES, "{WINDOWED_MSG}");
+
+    let total = panel.segment_heights().iter().sum::<u16>();
+    let sel = make_sel(area, (0, 0), (u32::from(total), COPY_WIDTH - 1));
+    let copied: Vec<String> = panel
+        .extract_selection_text(&sel, area)
+        .lines()
+        .map(str::to_owned)
+        .collect();
+
+    assert_eq!(copied, drawn, "{WINDOWED_MSG}");
+}
+
+/// A renderer that names no source has to keep copying by scraping the screen,
+/// which is all a diff, a grep or a batch card can do.
+#[test]
+fn a_card_that_records_no_source_still_copies_by_scraping() {
+    const SCRAPE_MSG: &str = "a card whose body records no source still copies what it drew";
+    const ADDED: &str = "gamma";
+
+    let mut panel = panel_with_tools(&[(TOOL_ID, FILE_EDIT_TOOL_NAME)]);
+    panel.tool_done(ToolDoneEvent {
+        tool: FILE_EDIT_TOOL_NAME.into(),
+        output: ToolOutput::Diff {
+            path: COPY_FILE_PATH.into(),
+            before: "alpha\nbeta\n".into(),
+            after: format!("alpha\n{ADDED}\n"),
+            summary: "1 edit".into(),
+        },
+        ..done(TOOL_ID)
+    });
+    panel.set_view(ViewMode::Expanded);
+    let area = Rect::new(0, 0, COPY_WIDTH, COPY_HEIGHT);
+    render(&mut panel, COPY_WIDTH, COPY_HEIGHT);
+
+    let segment = panel
+        .cache
+        .segments()
+        .iter()
+        .find(|segment| segment.tool_id.as_deref() == Some(TOOL_ID))
+        .expect("the card was built");
+    assert!(segment.provenance().is_none(), "{SCRAPE_MSG}");
+
+    let total = panel.segment_heights().iter().sum::<u16>();
+    let sel = make_sel(area, (0, 0), (u32::from(total), COPY_WIDTH - 1));
+
+    assert!(
+        panel.extract_selection_text(&sel, area).contains(ADDED),
+        "{SCRAPE_MSG}"
+    );
 }

@@ -9,7 +9,8 @@ use std::time::Duration;
 
 use tracing::error;
 
-use crate::components::code_view::{self, RenderLimits, RowTarget};
+use crate::components::code_view::{self, BodySource, RenderLimits, RowTarget};
+use crate::provenance::LineProvenance;
 use caudra_agent::{ToolInput, ToolOutput};
 use ratatui::text::Line;
 
@@ -29,6 +30,10 @@ pub struct RenderResult {
     /// Parallel to `lines`. Built by the same pass the main thread runs, so
     /// the highlighted lines carry the rows they replace.
     pub rows: Vec<Option<RowTarget>>,
+    /// Where each highlighted line came from. Highlighting splits a code row
+    /// into one span per token, so the rows built without it describe lines
+    /// these no longer match and have to be replaced along with them.
+    pub source_rows: Option<Vec<LineProvenance>>,
 }
 
 static NEXT_JOB_ID: AtomicU64 = AtomicU64::new(0);
@@ -126,6 +131,7 @@ fn worker_loop(inner: &PoolInner) {
                 id: job.id,
                 lines: content.lines,
                 rows: content.rows,
+                source_rows: content.source.map(|source: BodySource| source.rows),
             })
             .is_err()
         {

@@ -3,13 +3,19 @@ use crate::provenance::Provenance;
 use crate::render_worker::RenderWorker;
 use crate::theme;
 
-use super::super::code_view::{BatchViews, RowTarget};
+use super::super::code_view::{
+    BatchViews, BodySource, CodeBlock, RowTarget, ScrollSpan, ScrollWindow,
+};
 use super::super::tool_display::{HighlightRequest, ToolLines};
 use super::layout::{SegmentChrome, SegmentKind};
+use crate::provenance::LineProvenance;
 use caudra_agent::{ToolInput, ToolOutput};
+use caudra_markdown::render::SpanSource;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 use std::cell::Cell;
+use std::collections::HashMap;
+use std::ops::Range;
 use std::sync::Arc;
 
 const INST_SUFFIX: &str = "__inst";
@@ -46,6 +52,11 @@ struct HighlightKey {
     /// A child view changes which lines the range holds, so reusing across a
     /// fold would splice back the body the reader just put away.
     views: BatchViews,
+    /// A window does the same for the same reason: a wheel notch changes which
+    /// lines the range holds, and without these a scrolled card is rebuilt and
+    /// then has its old offset spliced straight back over it.
+    scroll: Option<ScrollWindow>,
+    child_scroll: Arc<HashMap<usize, ScrollWindow>>,
     /// A body is wrapped to it, so reusing across a resize would splice back
     /// lines broken for the width the terminal used to be.
     width: u16,
@@ -55,6 +66,8 @@ impl PartialEq for HighlightKey {
     fn eq(&self, other: &Self) -> bool {
         self.theme_gen == other.theme_gen
             && self.views == other.views
+            && self.scroll == other.scroll
+            && self.child_scroll == other.child_scroll
             && self.width == other.width
             && same_source(&self.input, &other.input)
             && same_source(&self.output, &other.output)
@@ -81,6 +94,10 @@ impl HighlightKey {
             output: hl.and_then(|h| h.output.clone()),
             theme_gen: theme::generation(),
             views: hl.map(|h| h.limits.views.clone()).unwrap_or_default(),
+            scroll: hl.and_then(|h| h.limits.scroll),
+            child_scroll: hl
+                .map(|h| h.limits.child_scroll.clone())
+                .unwrap_or_default(),
             width: hl.map_or(0, |h| h.limits.width),
         }
     }
@@ -89,9 +106,14 @@ impl HighlightKey {
 #[derive(Default)]
 pub(super) struct Segment {
     lines: Vec<Line<'static>>,
-    /// Set only for segments rendered from markdown. Selection uses it to
-    /// copy the source; without it copy falls back to scraping cells.
+    /// Set for segments whose renderer kept the source behind each painted
+    /// line. Selection uses it to copy that source; without it copy falls back
+    /// to scraping cells, which reads a code row's gutter back as text.
     provenance: Option<Provenance>,
+    /// The painted lines holding a card's code, so a copy that ran past the
+    /// block can fence it rather than drop code into prose. Cleared and
+    /// restored alongside `provenance`, whose rows it indexes.
+    code_block: Option<CodeBlock>,
     /// Drawn diagrams in `lines`, so a hover or a pan can find one by row.
     /// Like `provenance`, cleared by `set_lines` and restored after it.
     diagrams: Vec<DiagramSpan>,
@@ -108,6 +130,11 @@ pub(super) struct Segment {
     /// `remove`, `load_messages`) drops the whole cache.
     pub msg_index: Option<usize>,
     kind: SegmentKind,
+    /// Whether this segment was built as a one-line row rather than a card.
+    /// An expanded transcript also reaches `ToolInline` for a trivial call
+    /// that happens to fit on one line, and that one reads as prose and stays
+    /// flat, so the kind alone cannot answer for the background.
+    pub compact: bool,
     margin_top: u16,
     pub truncation: bool,
     cached_height: Cell<Option<CachedHeight>>,
@@ -116,7 +143,10 @@ pub(super) struct Segment {
     highlight_key: HighlightKey,
     pub spinner_lines: Vec<(usize, usize)>,
     snapshot_base: Option<usize>,
+    snapshot_skip: usize,
     pub shell_toggle_line: Option<usize>,
+    pub scroll_footer_line: Option<usize>,
+    pub scroll_spans: Vec<ScrollSpan>,
     /// What each line belongs to, parallel to `lines`. Spliced alongside them
     /// so a highlighted card keeps the rows a click names.
     rows: Vec<Option<RowTarget>>,
@@ -216,6 +246,29 @@ impl Segment {
         self.provenance = provenance;
     }
 
+    /// Adopts a card's source, refusing it when its rows do not line up with
+    /// the lines they describe: [`Provenance::extract`] would give up anyway,
+    /// and holding it would only hide the mismatch.
+    fn set_source(&mut self, source: Option<BodySource>) {
+        let Some(source) = source.filter(|source| source.rows.len() == self.lines.len()) else {
+            self.provenance = None;
+            self.code_block = None;
+            return;
+        };
+        self.code_block = source.code;
+        self.provenance = Some(Provenance::new(Arc::from(source.text), source.rows));
+    }
+
+    /// The content rows a card's code occupies at `width`, and what to call the
+    /// language, so copy can tell a selection that stayed inside the block from
+    /// one that ran past it.
+    pub fn code_block_rows(&self, width: u16) -> Option<(Range<u16>, Option<&str>)> {
+        let block = self.code_block.as_ref()?;
+        let (first, count) = self.rows_for_lines(block.rows.start, block.rows.len(), width);
+        let start = first.saturating_sub(self.chrome(width).content_start());
+        Some((start..start + count, block.language.as_deref()))
+    }
+
     pub fn diagrams(&self) -> &[DiagramSpan] {
         &self.diagrams
     }
@@ -271,6 +324,7 @@ impl Segment {
         // Line indices moved, so any provenance or row recorded for the old
         // vector no longer lines up.
         self.provenance = None;
+        self.code_block = None;
         self.rows.clear();
         self.stale = false;
         self.invalidate_height();
@@ -327,6 +381,22 @@ impl Segment {
         None
     }
 
+    /// The rows a run of source lines occupies after wrapping, relative to the
+    /// segment's own first row. The inverse of [`Self::source_line_at`], and
+    /// the only place a window's geometry is derived, so a bar drawn beside a
+    /// body cannot disagree with the body by a row.
+    pub fn rows_for_lines(&self, first: usize, count: usize, width: u16) -> (u16, u16) {
+        let chrome = self.chrome(width);
+        let inner = chrome.content_width(width);
+        let first = first.min(self.lines.len());
+        let end = (first + count).min(self.lines.len());
+        let rows = |range: &[Line<'static>]| wrapped_line_count(range, inner);
+        (
+            chrome.content_start() + rows(&self.lines[..first]),
+            rows(&self.lines[first..end]),
+        )
+    }
+
     /// What the row at `rel_row` belongs to, for a click or a hover to name.
     pub fn row_target_at(&self, rel_row: u16, width: u16) -> Option<RowTarget> {
         let line = self.source_line_at(rel_row, width)?;
@@ -339,7 +409,7 @@ impl Segment {
     /// buffer snapshot was laid out.
     pub fn buf_row(&self, source_line: usize) -> usize {
         match self.snapshot_base {
-            Some(base) if source_line >= base => source_line - base + 1,
+            Some(base) if source_line >= base => source_line - base + self.snapshot_skip + 1,
             _ => 0,
         }
     }
@@ -358,11 +428,14 @@ impl Segment {
         }
     }
 
+    /// The highlighted lines to splice back, with the source rows describing
+    /// them. Those rows have a span each, so reusing the lines without them
+    /// leaves copy reading long lines against short rows.
     fn reuse_highlight(
         &self,
         key: &HighlightKey,
         new_range: (usize, usize),
-    ) -> Option<Vec<Line<'static>>> {
+    ) -> Option<(Vec<Line<'static>>, Option<Vec<LineProvenance>>)> {
         if self.pending_highlight.is_some() || self.highlight_key != *key {
             return None;
         }
@@ -373,31 +446,42 @@ impl Segment {
         if (e - s) != (new_range.1 - new_range.0) {
             return None;
         }
-        Some(self.lines[s..e].to_vec())
+        let rows = self
+            .provenance
+            .as_ref()
+            .and_then(|provenance| provenance.lines_in(s..e));
+        Some((self.lines[s..e].to_vec(), rows))
     }
 
     pub fn apply_highlight(&mut self, mut tl: ToolLines, worker: &RenderWorker, compact: bool) {
+        self.compact = compact;
         self.set_kind(tool_kind(self.kind, &tl, compact));
         self.pending_highlight = tl.send_highlight(worker);
         self.highlight_range = tl.highlight.as_ref().map(|h| h.range);
         self.highlight_key = HighlightKey::from_request(tl.highlight.as_ref());
         self.spinner_lines = tl.spinner_lines;
         self.snapshot_base = tl.snapshot_base;
+        self.snapshot_skip = tl.snapshot_skip;
         self.shell_toggle_line = tl.shell_toggle_line;
+        self.scroll_footer_line = tl.scroll_footer_line;
+        self.scroll_spans = std::mem::take(&mut tl.scroll_spans);
         self.content_indent = tl.content_indent;
         self.truncation = tl.truncation;
         let links = std::mem::take(&mut tl.links);
         let rows = std::mem::take(&mut tl.rows);
+        let source = tl.source.take();
         self.set_lines(tl.lines);
         self.set_links(links);
         self.rows = rows;
+        self.set_source(source);
     }
 
     pub fn update_with_reuse(&mut self, mut tl: ToolLines, worker: &RenderWorker, compact: bool) {
+        self.compact = compact;
         self.set_kind(tool_kind(self.kind, &tl, compact));
         let key = HighlightKey::from_request(tl.highlight.as_ref());
         let reused = tl.highlight.as_ref().and_then(|req| {
-            let hl_lines = self.reuse_highlight(&key, req.range)?;
+            let (hl_lines, hl_rows) = self.reuse_highlight(&key, req.range)?;
             let (s, _) = req.range;
             let new_end = s + hl_lines.len();
             let link_rows = hl_lines
@@ -406,20 +490,35 @@ impl Segment {
                 .collect::<Vec<_>>();
             tl.lines.splice(s..req.range.1, hl_lines);
             tl.links.rows.splice(s..req.range.1, link_rows);
+            // The reused lines carry the highlighter's span counts, so their
+            // rows have to come back with them or the two stop lining up.
+            match hl_rows {
+                Some(rows) => {
+                    if let Some(source) = tl.source.as_mut() {
+                        source.rows.splice(s..req.range.1, rows);
+                    }
+                }
+                None => tl.source = None,
+            }
             Some((s, new_end))
         });
         self.truncation = tl.truncation;
         if let Some((s, e)) = reused {
             let links = std::mem::take(&mut tl.links);
             let rows = std::mem::take(&mut tl.rows);
+            let source = tl.source.take();
             self.set_lines(tl.lines);
             self.set_links(links);
             self.rows = rows;
+            self.set_source(source);
             self.highlight_range = Some((s, e));
             self.pending_highlight = None;
             self.spinner_lines = tl.spinner_lines;
             self.snapshot_base = tl.snapshot_base;
+            self.snapshot_skip = tl.snapshot_skip;
             self.shell_toggle_line = tl.shell_toggle_line;
+            self.scroll_footer_line = tl.scroll_footer_line;
+            self.scroll_spans = std::mem::take(&mut tl.scroll_spans);
             self.content_indent = tl.content_indent;
         } else {
             self.apply_highlight(tl, worker, compact);
@@ -434,6 +533,7 @@ impl Segment {
         &mut self,
         lines: Vec<Line<'static>>,
         rows: Vec<Option<RowTarget>>,
+        source_rows: Option<Vec<LineProvenance>>,
     ) {
         if !self.links.is_aligned(&self.lines) {
             self.links = LinkMap::none_for(&self.lines);
@@ -452,6 +552,7 @@ impl Segment {
                     line
                 })
                 .collect();
+            self.splice_source(start..end, source_rows, indented.len());
             let new_end = start + indented.len();
             let link_rows = indented
                 .iter()
@@ -469,6 +570,34 @@ impl Segment {
         self.pending_highlight = None;
     }
 
+    /// Replaces the source rows the splice covers, dropping the whole card's
+    /// provenance when the worker's rows cannot stand in for them. A row count
+    /// that disagrees with the lines it describes is worse than none: copy
+    /// would read a long line against a short row and silently scrape instead.
+    fn splice_source(
+        &mut self,
+        range: Range<usize>,
+        rows: Option<Vec<LineProvenance>>,
+        expected: usize,
+    ) {
+        let indent = !self.content_indent.is_empty();
+        let spliced = match (self.provenance.as_mut(), rows) {
+            (Some(provenance), Some(mut rows)) if rows.len() == expected => {
+                if indent {
+                    for row in &mut rows {
+                        row.spans.insert(0, SpanSource::Chrome);
+                    }
+                }
+                provenance.splice_lines(range, rows)
+            }
+            _ => false,
+        };
+        if !spliced {
+            self.provenance = None;
+            self.code_block = None;
+        }
+    }
+
     /// Stands in for the worker answering with what it was given, which is
     /// what a body with nothing to highlight really returns. Reuse is only
     /// reachable once a result has landed, so a test that never settles is
@@ -481,7 +610,11 @@ impl Segment {
         };
         let lines = self.lines[start..end].to_vec();
         let rows = self.rows[start..end].to_vec();
-        self.apply_highlight_result(lines, rows);
+        let source_rows = self
+            .provenance
+            .as_ref()
+            .and_then(|provenance| provenance.lines_in(start..end));
+        self.apply_highlight_result(lines, rows, source_rows);
     }
 
     /// Keeps recorded line positions (spinners, buffer base) in step when
@@ -503,6 +636,16 @@ impl Segment {
         }
         if let Some(line) = &mut self.shell_toggle_line {
             shift(line);
+        }
+        if let Some(line) = &mut self.scroll_footer_line {
+            shift(line);
+        }
+        for span in &mut self.scroll_spans {
+            shift(&mut span.first);
+        }
+        if let Some(block) = &mut self.code_block {
+            shift(&mut block.rows.start);
+            shift(&mut block.rows.end);
         }
     }
 }
@@ -847,6 +990,7 @@ mod tests {
         seg.apply_highlight_result(
             (0..replacement_lines).map(|_| Line::raw("hl")).collect(),
             vec![None; replacement_lines],
+            None,
         );
         let delta = expected_base as isize - 4;
         assert_eq!(seg.snapshot_base, Some(expected_base));
@@ -874,6 +1018,7 @@ mod tests {
         seg.apply_highlight_result(
             (0..replacement_lines).map(|_| Line::raw("hl")).collect(),
             hl_rows.clone(),
+            None,
         );
 
         assert_eq!(seg.rows.len(), seg.lines.len(), "{EXPECT_ROWS_ALIGNED}");
@@ -896,6 +1041,7 @@ mod tests {
         seg.apply_highlight_result(
             (0..3).map(|_| Line::raw("hl")).collect(),
             vec![Some(RowTarget(0))],
+            None,
         );
 
         assert_eq!(seg.rows.len(), seg.lines.len(), "{EXPECT_ROWS_ALIGNED}");

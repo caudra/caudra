@@ -45,6 +45,9 @@ pub(crate) const CANCELLED_TEXT: &str = "Cancelled";
 /// spinner, so the transcript card marks the border instead of announcing work.
 const COMPACTION_BORDER_TEXT: &str =
     "Context compacted - the turns above were replaced by the summary below.";
+/// What a batch appends to its own id to run a child under, from
+/// `batch::child_tool_use_id`.
+const BATCH_CHILD_ID_SEPARATOR: char = ':';
 const TOOLS_LOADED_PREFIX: &str = "Loaded ";
 const TOOLS_LOADED_SUFFIX: &str = " - the tools array changed, so the prompt cache prefix resets.";
 
@@ -198,9 +201,7 @@ impl Chat {
                 self.messages_panel.tool_input_body(&id, body);
             }
             AgentEvent::ToolStart(e) => self.messages_panel.tool_start(*e),
-            AgentEvent::ToolOutput { id, content } => {
-                self.messages_panel.tool_output(&id, &content)
-            }
+            AgentEvent::ToolOutput { id, content } => self.tool_output(&id, &content),
             AgentEvent::BatchProgress(e) => {
                 self.messages_panel.batch_progress(&e.id, e.index, e.entry)
             }
@@ -352,8 +353,44 @@ impl Chat {
         self.messages_panel.scroll(delta);
     }
 
+    /// Offers the wheel to an armed scroll card under the pointer first,
+    /// returning what is left for the transcript.
+    pub fn scroll_card_at(&mut self, column: u16, row: u16, delta: i32) -> i32 {
+        self.messages_panel.scroll_card_at(column, row, delta)
+    }
+
+    /// Arms the window under the pointer, consuming the press when one is
+    /// there so the card is not folded by the same click.
+    pub fn arm_card_at(&mut self, column: u16, row: u16) -> bool {
+        self.messages_panel.arm_card_at(column, row)
+    }
+
+    /// Whether a release completes an arming press, so the same click does not
+    /// also fold the card.
+    pub fn armed_card_at(&self, column: u16, row: u16) -> bool {
+        self.messages_panel.armed_card_at(column, row)
+    }
+
+    pub fn disarm_card(&mut self) {
+        self.messages_panel.disarm_card();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn card_window_key_at(&self, column: u16, row: u16) -> Option<&str> {
+        self.messages_panel.card_window_key_at(column, row)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn armed_card_key(&self) -> Option<&str> {
+        self.messages_panel.armed_card_key()
+    }
+
     pub fn set_scroll_top(&mut self, top: u32) {
         self.messages_panel.set_scroll_top(top);
+    }
+
+    pub fn handle_card_scrollbar(&mut self, event: &MouseEvent) -> bool {
+        self.messages_panel.handle_card_scrollbar(event)
     }
 
     pub fn handle_scrollbar(&mut self, event: &MouseEvent) -> bool {
@@ -604,9 +641,7 @@ impl Chat {
     /// roster. The suffix is dropped only when it resolves to a real child, so
     /// a tool whose id merely contains a colon still reaches its own header.
     pub fn set_tool_progress(&mut self, tool_id: &str, report: SubagentProgress) {
-        if let Some((batch_id, index)) = tool_id
-            .rsplit_once(':')
-            .and_then(|(head, tail)| Some((head, tail.parse::<usize>().ok()?)))
+        if let Some((batch_id, index)) = batch_child_id(tool_id)
             && self
                 .messages_panel
                 .set_batch_child_progress(batch_id, index, report.clone())
@@ -614,6 +649,20 @@ impl Chat {
             return;
         }
         self.messages_panel.set_tool_progress(tool_id, report);
+    }
+
+    /// Streaming output, addressed the same way a report is: a batch runs its
+    /// children under ids of its own, and one of those names a roster row
+    /// rather than a card.
+    pub fn tool_output(&mut self, tool_id: &str, content: &str) {
+        if let Some((batch_id, index)) = batch_child_id(tool_id)
+            && self
+                .messages_panel
+                .set_batch_child_output(batch_id, index, content)
+        {
+            return;
+        }
+        self.messages_panel.tool_output(tool_id, content);
     }
 
     pub fn load_messages(&mut self, msgs: Vec<DisplayMessage>) {
@@ -728,6 +777,15 @@ impl Chat {
     pub fn tool_turn_usage(&self, tool_id: &str) -> Option<&str> {
         self.messages_panel.tool_turn_usage(tool_id)
     }
+}
+
+/// The batch and roster index an id names, if it is shaped like a dispatched
+/// child's. Only a shape: the caller confirms the child exists before dropping
+/// the suffix, so a tool whose own id merely contains a colon still reaches
+/// its own header.
+fn batch_child_id(tool_id: &str) -> Option<(&str, usize)> {
+    let (parent, index) = tool_id.rsplit_once(BATCH_CHILD_ID_SEPARATOR)?;
+    Some((parent, index.parse().ok()?))
 }
 
 pub fn history_to_display(
@@ -1063,9 +1121,10 @@ fn build_tool_results_map(items: &[HistoryItem]) -> HashMap<&str, ToolResultRef<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use caudra_agent::tools::{BATCH_TOOL_NAME, SHELL_TOOL_NAME};
     use caudra_agent::{
-        AgentEvent, IndexLine, IndexLineSemantic, IndexOutput, IndexSourceRange, ToolDoneEvent,
-        ToolOutput, ToolStartEvent,
+        AgentEvent, BatchToolEntry, BatchToolStatus, IndexLine, IndexLineSemantic, IndexOutput,
+        IndexSourceRange, ToolDoneEvent, ToolOutput, ToolStartEvent,
     };
     use caudra_config::UiConfig;
     use caudra_providers::{ContentBlock, Message, Role};
@@ -1195,6 +1254,71 @@ mod tests {
             None,
         );
         assert_eq!(chat.in_progress_count(), 0);
+    }
+
+    const CHILD_STREAM_MSG: &str =
+        "a batch child's streamed output belongs to the roster row, not to a header";
+    const HEADER_STREAM_MSG: &str = "an id that merely ends in a number still names its own card";
+    const CHILD_TAIL: &str = "building";
+
+    fn batch_start(id: &str, children: usize) -> AgentEvent {
+        let AgentEvent::ToolStart(mut ev) = tool_start(id, BATCH_TOOL_NAME) else {
+            unreachable!("tool_start builds a ToolStart");
+        };
+        ev.output = Some(ToolOutput::Batch {
+            entries: (0..children)
+                .map(|_| BatchToolEntry {
+                    tool: SHELL_TOOL_NAME.into(),
+                    effect: ToolEffect::Unknown,
+                    summary: String::new(),
+                    status: BatchToolStatus::Running,
+                    input: None,
+                    raw_input: None,
+                    output: None,
+                    annotation: None,
+                })
+                .collect(),
+            text: String::new(),
+        });
+        AgentEvent::ToolStart(ev)
+    }
+
+    fn streamed(id: &str, content: &str) -> AgentEvent {
+        AgentEvent::ToolOutput {
+            id: id.into(),
+            content: content.into(),
+        }
+    }
+
+    /// The reported bug. A batch runs each child under its own id with an
+    /// index appended, so a dispatched shell's output was addressed to a
+    /// header that does not exist and the panel dropped it.
+    #[test]
+    fn a_batch_childs_streamed_output_reaches_its_roster_row() {
+        let mut chat = chat();
+        chat.handle_event(batch_start("t1", 2), None);
+        chat.handle_event(streamed("t1:1", CHILD_TAIL), None);
+
+        assert_eq!(
+            chat.messages_panel.batch_child_stream("t1", 1),
+            Some(CHILD_TAIL),
+            "{CHILD_STREAM_MSG}"
+        );
+    }
+
+    /// The suffix is only dropped when it resolves to a real child, so a tool
+    /// whose own id ends in a colon and a number keeps its own body.
+    #[test]
+    fn an_id_that_is_not_a_batch_child_still_streams_to_its_own_card() {
+        let mut chat = chat();
+        chat.handle_event(tool_start("t:1", SHELL_TOOL_NAME), None);
+        chat.handle_event(streamed("t:1", CHILD_TAIL), None);
+
+        assert_eq!(
+            chat.messages_panel.batch_child_stream("t", 1),
+            None,
+            "{HEADER_STREAM_MSG}"
+        );
     }
 
     /// The plan card renders the same file the write card does, so exactly one

@@ -44,6 +44,27 @@ pub(super) struct RenderFeedback {
     pub message_action: Option<(bool, Color)>,
 }
 
+/// Where a segment landed on screen, for placing anything that has to line up
+/// with its rows.
+#[derive(Clone, Copy)]
+pub(super) struct Placement {
+    /// Screen row of the segment's first visible row.
+    pub y: u16,
+    /// Rows of the segment above the viewport.
+    pub skipped: u16,
+    pub visible: u16,
+}
+
+impl Placement {
+    /// The screen rows a run of segment rows takes, clipped to what is on
+    /// screen. `None` when the run is entirely scrolled out.
+    pub fn clip(self, start: u16, span: u16) -> Option<(u16, u16)> {
+        let top = start.max(self.skipped);
+        let bottom = start.saturating_add(span).min(self.skipped + self.visible);
+        (top < bottom).then(|| (self.y + top - self.skipped, bottom - top))
+    }
+}
+
 pub(super) struct RenderCursor {
     skip: u32,
     y: u16,
@@ -65,6 +86,27 @@ impl RenderCursor {
 
     pub fn past_bottom(&self) -> bool {
         self.y >= self.bottom
+    }
+
+    /// Where a segment of height `h` is about to land: the screen row its
+    /// first visible row takes, how much of it is above the viewport, and how
+    /// many of its rows show. `None` when none of it does.
+    ///
+    /// [`Self::render`] places itself through this, so anything drawn beside a
+    /// segment agrees with it by construction rather than by two copies of the
+    /// same arithmetic staying in step.
+    pub fn placement(&self, h: u16) -> Option<Placement> {
+        if self.skip >= u32::from(h) || self.y >= self.bottom {
+            return None;
+        }
+        let skipped = self.skip.min(u32::from(h)) as u16;
+        Some(Placement {
+            y: self.y,
+            skipped,
+            visible: h
+                .saturating_sub(skipped)
+                .min(self.bottom.saturating_sub(self.y)),
+        })
     }
 
     /// Consumes a segment sitting entirely above the viewport, reporting
@@ -94,19 +136,16 @@ impl RenderCursor {
         frame: &mut Frame,
     ) -> Option<Rect> {
         let (lines, links) = content;
+        let placement = self.placement(h);
         if self.skip_above(h) {
             return None;
         }
-        if self.y >= self.bottom {
-            return None;
-        }
+        let Placement {
+            skipped,
+            visible: visible_h,
+            ..
+        } = placement?;
         let (style, rail_style) = styles;
-        // `skip_above` returned false, so what is left to skip lies inside
-        // this segment and fits the height it was measured against.
-        let skipped = self.skip.min(u32::from(h)) as u16;
-        let visible_h = h
-            .saturating_sub(skipped)
-            .min(self.bottom.saturating_sub(self.y));
         let seg_area = Rect::new(self.viewport.x, self.y, self.viewport.width, visible_h);
         let mut base = style.unwrap_or_default();
         if feedback.highlight {

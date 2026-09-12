@@ -368,8 +368,12 @@ impl App {
         // a bar as the start of a sweep down the surface behind it. Both
         // columns sit outside the areas selection measures against, so nothing
         // else wants them.
+        // A card's bar is ahead of the transcript's own: it sits inside the
+        // body rather than beside it, so the transcript's column never claims
+        // it, but the order says which one owns a press either could take.
         if !self.has_modal_overlay()
-            && (self.chats[self.active_chat].handle_scrollbar(&event)
+            && (self.chats[self.active_chat].handle_card_scrollbar(&event)
+                || self.chats[self.active_chat].handle_scrollbar(&event)
                 || self.active_input_box_mut().handle_scrollbar(&event))
         {
             self.clear_selection_unless_pending_copy();
@@ -465,6 +469,11 @@ impl App {
                         }
                     }
                     if zone.zone == SelectionZone::Messages && !self.has_modal_overlay() {
+                        // On the press, not the release: touch reports no held
+                        // drag, so the release path below never runs for a tap.
+                        // It does not consume the press either, or a sweep
+                        // could not start inside a card body.
+                        self.chats[self.active_chat].arm_card_at(event.column, event.row);
                         // Not gated on an opener the way a link is: the
                         // workbench is ours to open.
                         self.mention_mouse_down =
@@ -620,6 +629,12 @@ impl App {
                                 && let Some(task_id) = self.task_id_at(event.row, area)
                                 && self.focus_task(&task_id).is_ok()
                             {
+                                return Vec::new();
+                            }
+                            // The press already armed this window, and that is
+                            // the whole of what it does: the card's own control
+                            // is its header, above the window.
+                            if self.chats[self.active_chat].armed_card_at(event.column, event.row) {
                                 return Vec::new();
                             }
                             self.chats[self.active_chat].handle_click(event.row, area);
@@ -1181,6 +1196,10 @@ impl App {
             .is_some_and(|zone| zone.zone == SelectionZone::Messages)
         {
             self.chats[self.active_chat].clear_hover();
+            // The pointer left the transcript, so it is over no window it
+            // armed. Said here rather than in `clear_hover`, which many paths
+            // call for reasons that have nothing to do with the pointer.
+            self.chats[self.active_chat].disarm_card();
             return;
         }
         let area = self.msg_area();

@@ -2468,6 +2468,113 @@ fn a_dispatched_subagents_progress_lands_on_its_row() {
     );
 }
 
+const ARM_ROUTE_MSG: &str =
+    "a press routed through the real mouse path arms the window it landed in";
+const ARM_WHEEL_MSG: &str = "an armed window takes the wheel that follows the press";
+const ARM_SWEEP_MSG: &str = "arming leaves the press free to start a selection sweep";
+const SCROLL_CARD_BODY_LINES: usize = 40;
+const SCROLL_CARD_TOOL: &str = "shell";
+const FOLLOWING_FOOTER: &str = "following";
+const PAUSED_FOOTER: &str = "below";
+/// Positive is towards the start of the body, as everywhere else.
+const CARD_WHEEL_NOTCHES: i32 = 3;
+
+/// An app holding one open shell card whose body is long enough to be a window.
+fn app_with_scroll_card() -> App {
+    let mut app = app_without_splash();
+    app.update(agent_msg(tool_start(SCROLL_CARD_ID, SCROLL_CARD_TOOL)));
+    app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
+        id: SCROLL_CARD_ID.into(),
+        tool: SCROLL_CARD_TOOL.into(),
+        output: ToolOutput::Plain(
+            (0..SCROLL_CARD_BODY_LINES)
+                .map(|line| format!("line {line}\n"))
+                .collect::<String>()
+                .into(),
+        ),
+        is_error: false,
+        annotation: None,
+        written_path: None,
+        written_paths: Vec::new(),
+        output_ref: None,
+        output_limits: None,
+        model_suffix: None,
+        model_output: None,
+        model_output_from_ref: false,
+    }))));
+    app
+}
+
+const SCROLL_CARD_ID: &str = "scroll-card";
+
+/// The first cell inside the card's drawn window.
+fn card_window_cell(app: &mut App) -> (u16, u16) {
+    let area = app.msg_area();
+    (area.y..area.bottom())
+        .flat_map(|row| (area.x..area.right()).map(move |column| (column, row)))
+        .find(|&(column, row)| app.chats[0].card_window_key_at(column, row).is_some())
+        .expect("the card drew a window")
+}
+
+/// The reported defect: pressing inside a card's window did not arm it, so the
+/// wheel still went to the transcript. Every panel-level arming test calls the
+/// panel directly and so cannot see the routing, which is where it broke.
+///
+/// Touch is the case that was actually broken and is covered here too: a tap
+/// reports no held drag, so `selection_state` never becomes `Dragging` and the
+/// whole release-side click dispatch is skipped. Arming therefore has to
+/// happen on the press.
+#[test_case(false ; "mouse")]
+#[test_case(true ; "touch")]
+fn a_press_in_a_card_window_arms_it_for_the_wheel(touch: bool) {
+    caudra_workbench::scroll::set_touch(touch);
+    let mut app = app_with_scroll_card();
+    let before = rendered(&mut app);
+    assert!(
+        before.contains(FOLLOWING_FOOTER),
+        "{ARM_ROUTE_MSG}: {before:?}"
+    );
+    let (column, row) = card_window_cell(&mut app);
+
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        column,
+        row,
+    ));
+    app.update(mouse_event(
+        MouseEventKind::Up(MouseButton::Left),
+        column,
+        row,
+    ));
+    assert!(app.chats[0].armed_card_key().is_some(), "{ARM_ROUTE_MSG}");
+
+    app.update(Msg::Scroll {
+        column,
+        row,
+        delta: CARD_WHEEL_NOTCHES,
+    });
+    let after = rendered(&mut app);
+    assert!(after.contains(PAUSED_FOOTER), "{ARM_WHEEL_MSG}: {after:?}");
+    caudra_workbench::scroll::set_touch(false);
+}
+
+/// Arming must not consume the press, or a card body's own text could no
+/// longer be swept and copied, which is the other thing that body is for.
+#[test]
+fn arming_a_window_still_lets_a_sweep_start_in_it() {
+    let mut app = app_with_scroll_card();
+    let _ = rendered(&mut app);
+    let (column, row) = card_window_cell(&mut app);
+
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        column,
+        row,
+    ));
+
+    assert!(app.selection_state.is_some(), "{ARM_SWEEP_MSG}");
+}
+
 /// Renders, then clicks the roster row `child_id` was drawn on. The row has to
 /// be found after the frame it is measured in, since the roster only takes its
 /// shape once the card is laid out.

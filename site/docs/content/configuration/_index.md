@@ -78,6 +78,8 @@ All fields are optional. Typos in field names cause an error right away.
 | `which_key_delay_ms` | u64 | `250` | - | - | How long Ctrl+X waits before listing the chords it can still reach (ms). 0 shows the list at once |
 | `typewriter_ms_per_char` | u64 | `4` | - | - | Typewriter effect speed (ms/char) |
 | `mouse_scroll_lines` | u32 | `3` | - | 1 | Lines per mouse wheel scroll |
+| `scroll_card_lines` | u32 | `10` | - | - | Rows of body a shell, write, python_execution or task card draws. The window follows new output while it sits at the bottom and pauses when scrolled up. Click inside a window to give it the wheel, which passes back to the transcript at either edge, and drag the bar in its last column to move it directly. `0` turns scrolling off, restoring the `ui.tool_output_lines` budget for those tools and an unabridged body for a write |
+| `always_collapsed` | string[] | `["file_read", "file_glob", "file_grep", "file_index", "webfetch"]` | - | - | Tools whose card never opens on its own: the call stays a single row in every view mode until you click it. A server-qualified name still matches, so `file_read` also covers `mcp_File_read`. Set to `[]` to opt out |
 | `max_input_lines` | u32 | `20` | - | 1 | Maximum visible input lines |
 | `show_thinking` | bool | `true` | - | - | Show full model reasoning live and persisted. Turn this off to start every reasoning block collapsed behind a Thinking or Thought header that can be clicked to expand |
 | `show_reminders` | bool | `true` | - | - | Show the messages Caudra writes into the conversation on your behalf: standing reminders, goal check-ins, nudges, and continuations. Each is one dim row that expands on click to the exact text the model was sent. Turn this off to keep the transcript to the conversation alone |
@@ -117,6 +119,8 @@ It is off by default, so a normal run reaches only the model provider you config
 ### `ui.tool_output_lines`
 
 How many lines of output an open card shows per tool before it says how many it is holding back. Clicking the card shows all of it regardless. All values are `usize` with a minimum of 1.
+
+The `bash`, `python_execution`, `task`, and `write` entries apply only when `ui.scroll_card_lines` is `0`. Above that, those tools draw a fixed window of that many lines instead, and the budget here goes unused.
 
 | Field | Default | Tools |
 |-------|---------|-------|

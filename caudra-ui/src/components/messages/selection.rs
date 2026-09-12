@@ -1,5 +1,7 @@
+use super::fenced_text;
 use super::layout::SegmentKind;
 use super::segment::{Segment, SegmentCache};
+use crate::provenance::Provenance;
 use crate::selection::{self, LineBreaks, ScreenSelection, Selection};
 
 use ratatui::buffer::Buffer;
@@ -11,6 +13,9 @@ pub(super) struct SelectionFragment {
     pub msg_index: Option<usize>,
     pub tool_id: Option<String>,
     pub text: String,
+    /// The language of the code this fragment is made of, when that is all it
+    /// holds, so the markdown form can name the fence it wraps it in.
+    pub language: Option<String>,
 }
 
 pub(super) fn extract_selection_fragments(
@@ -112,11 +117,13 @@ pub(super) fn extract_segment_fragment(
         end_col,
     };
 
-    let text = segment
+    let (text, language) = segment
         .provenance()
         .and_then(|provenance| {
-            provenance.extract(
-                segment.lines(),
+            extract_with_code_block(
+                segment,
+                provenance,
+                viewport_width,
                 content_width,
                 &screen_selection,
                 rel_start,
@@ -141,14 +148,55 @@ pub(super) fn extract_segment_fragment(
                 &mut text,
                 &breaks,
             );
-            text
+            (text, None)
         });
     Some(SelectionFragment {
         kind: segment.kind(),
         msg_index: segment.msg_index,
         tool_id: segment.tool_id.clone(),
         text,
+        language,
     })
+}
+
+/// Copies the selected rows, keeping a card's code apart from whatever else
+/// the selection swept up.
+///
+/// A selection that stayed inside the block is that code and nothing else, so
+/// it copies raw and names its language for the caller to fence. One that ran
+/// past it is a mixture, and the code is fenced where it sits so the output
+/// beside it does not read as more of the script.
+fn extract_with_code_block(
+    segment: &Segment,
+    provenance: &Provenance,
+    viewport_width: u16,
+    content_width: u16,
+    sel: &ScreenSelection,
+    rel_start: u16,
+    rel_end: u16,
+) -> Option<(String, Option<String>)> {
+    let rows = |from, to| provenance.extract(segment.lines(), content_width, sel, from, to);
+    let Some((block, language)) = segment.code_block_rows(viewport_width) else {
+        return Some((rows(rel_start, rel_end)?, None));
+    };
+    let first = block.start.clamp(rel_start, rel_end);
+    let last = block.end.clamp(first, rel_end);
+
+    let code = rows(first, last)?;
+    if code.is_empty() {
+        return Some((rows(rel_start, rel_end)?, None));
+    }
+    let (above, below) = (rows(rel_start, first)?, rows(last, rel_end)?);
+    if above.is_empty() && below.is_empty() {
+        return Some((code, language.map(str::to_owned)));
+    }
+
+    let text = [above, fenced_text(&code, language), below]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some((text, None))
 }
 
 pub(super) fn join_fragments(fragments: &[SelectionFragment]) -> String {

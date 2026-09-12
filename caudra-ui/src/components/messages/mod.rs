@@ -5,7 +5,7 @@ mod selection;
 #[cfg(test)]
 mod tests;
 
-use self::render::{EXPAND_AFFORDANCE, HoverFeedback, RenderCursor, RenderFeedback};
+use self::render::{EXPAND_AFFORDANCE, HoverFeedback, Placement, RenderCursor, RenderFeedback};
 use self::segment::{Segment, SegmentCache, wrapped_line_count};
 use layout::{SegmentChrome, SegmentKind};
 
@@ -17,7 +17,10 @@ use super::tool_display::{
 use super::{
     DisplayMessage, DisplayRole, DisplaySource, ToolProgress, ToolRole, ToolStatus,
     apply_scroll_rows,
-    code_view::{BatchProgressMap, BatchViewMap, Disclosure, RowTarget},
+    code_view::{
+        BatchLiveMap, BatchProgressMap, BatchViewMap, CardPolicy, Disclosure, RowTarget,
+        ScrollWindow,
+    },
     review, workflow_card,
     workflow_card::CardHit,
 };
@@ -70,6 +73,10 @@ const THOUGHT_PREFIX: &str = "Thought";
 const INJECTED_FALLBACK_TITLE: &str = "injected message";
 const INJECTED_SEARCH_PREFIX: &str = "injected> ";
 const THINKING_SEARCH_PREFIX: &str = "thinking> ";
+/// Separates a batch child's roster index from its parent's tool id. Not a
+/// character a tool id carries, so a child's key can never collide with a
+/// card's.
+const CHILD_SCROLL_INFIX: &str = "#";
 const MILLIS_PER_SECOND: u128 = 1_000;
 const SECONDS_PER_MINUTE: u64 = 60;
 const REFLOW_MARGIN_VIEWPORTS: u32 = 1;
@@ -148,6 +155,9 @@ const COMMONMARK_BLOCK_TAGS: &[&str] = &[
     "track",
     "ul",
 ];
+/// What a copied fence is called when the fragment inside it is not one
+/// language's source: a transcript excerpt is text, not code.
+const PLAIN_FENCE_LANGUAGE: &str = "text";
 const MATH_FENCE: &str = "$$";
 const MATH_BRACKET_CLOSE: &str = "\\]";
 const MATH_BRACKET_OPEN: &str = "\\[";
@@ -607,7 +617,7 @@ fn unclosed_caudra_fenced_block(text: &str) -> Option<MarkdownBlock> {
     open
 }
 
-fn fenced_text(text: &str) -> String {
+fn fenced_text(text: &str, language: Option<&str>) -> String {
     let longest_run = text
         .split(|character| character != '`')
         .map(str::len)
@@ -615,7 +625,8 @@ fn fenced_text(text: &str) -> String {
         .unwrap_or(0);
     let delimiter = "`".repeat(longest_run.saturating_add(1).max(3));
     let newline = if text.ends_with('\n') { "" } else { "\n" };
-    format!("{delimiter}text\n{text}{newline}{delimiter}")
+    let language = language.unwrap_or(PLAIN_FENCE_LANGUAGE);
+    format!("{delimiter}{language}\n{text}{newline}{delimiter}")
 }
 
 fn rendered_markdown_text(text: &str, width: u16) -> String {
@@ -668,6 +679,100 @@ fn tool_status_label(status: ToolStatus) -> &'static str {
 enum CardState {
     Closed,
     Full,
+}
+
+/// What one batch child's window is filed under. A child has no tool id of
+/// its own, so it borrows its parent's and adds the roster index, the way an
+/// instruction segment borrows its parent's with a suffix.
+fn child_scroll_id(parent_id: &str, index: usize) -> String {
+    format!("{parent_id}{CHILD_SCROLL_INFIX}{index}")
+}
+
+/// The parent and index a child's scroll key names, if it is shaped like one.
+/// Only a shape: the caller confirms the child exists before taking it.
+fn split_child_scroll_id(key: &str) -> Option<(&str, usize)> {
+    let (parent, index) = key.rsplit_once(CHILD_SCROLL_INFIX)?;
+    Some((parent, index.parse().ok()?))
+}
+
+/// One window as it was last drawn: the rows it took, and where it sits in
+/// the body it is a view onto.
+///
+/// Collected during the segment loop and used after it, both because painting
+/// a bar needs a mutable borrow the loop is holding, and because the wheel and
+/// the pointer are answered from the same geometry the paint used.
+struct CardWindow {
+    key: String,
+    body: Rect,
+    total: u32,
+    position: u32,
+}
+
+impl CardWindow {
+    /// The bar's column: the last of the body.
+    ///
+    /// One column rather than the whole body, unlike the transcript's own bar,
+    /// because a card body is a click target in its own right and handing the
+    /// pointer to a bar would cost the reader the rest of the card.
+    fn strip(&self) -> Rect {
+        Rect::new(
+            self.body.x + self.body.width - 1,
+            self.body.y,
+            1,
+            self.body.height,
+        )
+    }
+}
+
+/// Every window this segment drew, with the screen rows each took.
+fn collect_card_windows(
+    seg: &segment::Segment,
+    at: Placement,
+    width: u16,
+    viewport: Rect,
+    out: &mut Vec<CardWindow>,
+) {
+    let Some(tool_id) = seg.tool_id.as_deref() else {
+        return;
+    };
+    let chrome = seg.chrome(width);
+    let inner = chrome.content_width(width);
+    if inner == 0 {
+        return;
+    }
+    for span in &seg.scroll_spans {
+        let (start, rows) = seg.rows_for_lines(span.first, span.lines, width);
+        let Some((y, height)) = at.clip(start, rows) else {
+            continue;
+        };
+        out.push(CardWindow {
+            key: match span.child {
+                Some(index) => child_scroll_id(tool_id, index),
+                None => tool_id.to_owned(),
+            },
+            body: Rect::new(viewport.x + chrome.left, y, inner, height),
+            total: span.total as u32,
+            position: span.offset as u32,
+        });
+    }
+}
+
+/// Where one scroll card's window sits. A card starts pinned to the tail and
+/// returns to it the moment the reader scrolls back to the bottom, so the
+/// default is the state most cards are in most of the time.
+#[derive(Clone, Copy)]
+struct CardScroll {
+    offset: usize,
+    follow: bool,
+}
+
+impl Default for CardScroll {
+    fn default() -> Self {
+        Self {
+            offset: 0,
+            follow: true,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -781,6 +886,26 @@ pub struct MessagesPanel {
     /// index. Live chrome rather than part of the roster: `BatchToolEntry` is
     /// persisted, and what a subagent was doing is stale the moment it stops.
     batch_child_progress: BatchProgressMap,
+    /// What each dispatched batch child has streamed so far, by parent tool id
+    /// and child index. A batch keeps the live row for itself, so a child's
+    /// output arrives addressed to an id no header has and is kept here until
+    /// the child's own result supersedes it.
+    batch_child_output: BatchLiveMap,
+    /// One bar per window on screen, keyed exactly as `card_scroll` is, since
+    /// a bar holds the anchor of a drag in progress and several windows can be
+    /// visible at once. Entries for windows that are no longer drawn are swept
+    /// each frame: a stale bar keeps a stale drag alive.
+    card_bars: HashMap<String, Scrollbar>,
+    /// Every window drawn last frame, for routing a press or a notch to the
+    /// one under the pointer.
+    card_windows: Vec<CardWindow>,
+    /// The window the wheel reaches, set by a press inside one and released
+    /// when the pointer leaves it or presses elsewhere.
+    ///
+    /// Without arming, a card under the pointer eats every notch aimed at the
+    /// transcript behind it, which on a transcript of shell output is most of
+    /// them. Hover alone is not enough of a statement of intent.
+    armed_card: Option<String>,
     /// Horizontal offset per drawn diagram. Absent means unpanned, so the
     /// map stays empty for the overwhelming majority of transcripts.
     diagram_pans: HashMap<DiagramKey, u16>,
@@ -795,6 +920,12 @@ pub struct MessagesPanel {
     watched_bufs: VecDeque<(String, Arc<SharedBuf>)>,
     retained_shell_outputs: VecDeque<String>,
     tool_output_lines: ToolOutputLines,
+    /// What the reader configured about tools: which never open, and how
+    /// tall a scroll card's window is.
+    policy: CardPolicy,
+    /// Where each scroll card's window sits, by scroll id. An absent entry is
+    /// pinned to the tail, which is where every card starts.
+    card_scroll: HashMap<String, CardScroll>,
     lua_event_handle: EventHandle,
     restore_event_tx: Option<EventSender>,
     show_thinking: bool,
@@ -866,6 +997,10 @@ impl MessagesPanel {
             shell_raw: HashSet::new(),
             batch_views: BatchViewMap::new(),
             batch_child_progress: BatchProgressMap::new(),
+            batch_child_output: BatchLiveMap::new(),
+            card_bars: HashMap::new(),
+            card_windows: Vec::new(),
+            armed_card: None,
             diagram_pans: HashMap::new(),
             lua_clicks: HashMap::new(),
             dropped_snapshots: DroppedSnapshots::default(),
@@ -873,6 +1008,11 @@ impl MessagesPanel {
             watched_bufs: VecDeque::new(),
             retained_shell_outputs: VecDeque::new(),
             tool_output_lines: ui_config.tool_output_lines,
+            policy: CardPolicy {
+                always_collapsed: ui_config.always_collapsed.into(),
+                scroll_card_lines: ui_config.scroll_card_lines,
+            },
+            card_scroll: HashMap::new(),
             lua_event_handle,
             restore_event_tx: None,
             show_thinking: ui_config.show_thinking,
@@ -925,6 +1065,26 @@ impl MessagesPanel {
         self.view != ViewMode::Expanded
     }
 
+    /// Whether this tool's card never opens on its own. Configured by bare
+    /// name, so a call the same tool makes through an MCP server matches too.
+    fn stays_collapsed(&self, tool: &str) -> bool {
+        self.policy.stays_collapsed(tool)
+    }
+
+    /// Whether this call is drawn as a one-line row rather than a card. The
+    /// mode answers for most tools; an always-collapsed one answers for
+    /// itself, so expanded draws it as the row it would be anywhere else.
+    fn draws_compact(&self, tool: &str) -> bool {
+        self.compact() || self.stays_collapsed(tool)
+    }
+
+    fn card_draws_compact(&self, tool_id: &str) -> bool {
+        self.tool_card(tool_id).map_or_else(
+            || self.compact(),
+            |(_, role)| self.draws_compact(&role.name),
+        )
+    }
+
     /// The card at the end of the transcript is the one being written. Live
     /// reasoning and text draw after every settled card, so while either is
     /// running nothing settled is last.
@@ -936,10 +1096,14 @@ impl MessagesPanel {
 
     /// Whether the mode alone draws this call's body. A call whose body is
     /// the only record of what it did stays open in every mode: closing it
-    /// would hide the change.
+    /// would hide the change. An always-collapsed tool is the other extreme,
+    /// and no mode opens it.
     fn opens_by_default(&self, role: &ToolRole, msg_index: usize) -> bool {
         if !role.is_collapsible() {
             return true;
+        }
+        if self.stays_collapsed(&role.name) {
+            return false;
         }
         match self.view {
             ViewMode::Expanded => true,
@@ -966,23 +1130,36 @@ impl MessagesPanel {
             .is_some_and(|(idx, role)| self.opens_by_default(role, idx))
     }
 
-    /// Whether a click can take this card back to its header. An expanded
-    /// transcript has no header to fall to, and a call that changed something
-    /// has no header worth falling to.
+    /// Whether a click can take this card back to its header. The only bar is
+    /// that there is a row to fall back to, which an expanded transcript does
+    /// not give a card of its own.
+    ///
+    /// A write clears that bar. It cannot be folded *by mode* — hiding a diff
+    /// nobody asked to hide loses the change — but the reader asking for it is
+    /// a different thing, and the row still names the file and carries the
+    /// stat the diff would have shown.
     fn card_can_close(&self, tool_id: &str) -> bool {
-        self.compact()
-            && self
-                .tool_card(tool_id)
-                .is_some_and(|(_, role)| role.is_collapsible())
+        self.card_draws_compact(tool_id) && self.tool_card(tool_id).is_some()
+    }
+
+    /// Whether this card draws its body in a fixed window rather than
+    /// abridging it to a budget.
+    fn card_scrolls(&self, tool_id: &str) -> bool {
+        self.tool_card(tool_id)
+            .is_some_and(|(_, role)| self.rctx(&role.name, tool_id).card_scroll.is_some())
     }
 
     /// `None` means header-only. A card the reader has not spoken about rests
     /// within the tool's row budget; the budget is never what a click opens to,
     /// so an asked-for card is always whole.
+    ///
+    /// A scroll card is the exception: its window is the whole of what it
+    /// shows, so it is never `full` and a click that would have opened one
+    /// closes it instead.
     fn tool_expansion(&self, tool_id: &str, open_by_default: bool) -> Option<Disclosure> {
         let full = match self.disclosure.get(tool_id) {
             Some(CardState::Closed) => return None,
-            Some(CardState::Full) => true,
+            Some(CardState::Full) => !self.card_scrolls(tool_id),
             None if open_by_default => false,
             None => return None,
         };
@@ -990,6 +1167,130 @@ impl MessagesPanel {
             full,
             shell_raw: self.shell_raw.contains(tool_id),
         })
+    }
+
+    /// Re-pins a card's window to the tail, which is also what the reader
+    /// gets by scrolling back down to it.
+    fn follow_card(&mut self, tool_id: &str) {
+        self.card_scroll
+            .insert(tool_id.to_owned(), CardScroll::default());
+        self.rebuild_expanded_tool(tool_id);
+    }
+
+    /// Moves one scroll card's window and reports the notches it could not
+    /// use, which the transcript then scrolls by. A card that swallowed a
+    /// whole burst at its own edge would trap the reader inside it.
+    ///
+    /// `delta` is positive upwards, as everywhere else in the app.
+    fn scroll_window(&mut self, key: &str, delta: i32) -> i32 {
+        let Some((body, rebuild)) = self.window_body(key) else {
+            return delta;
+        };
+        self.move_window(key.to_owned(), &rebuild, body, delta)
+    }
+
+    /// The body a scroll key names and the card to redraw for it: a card's own
+    /// body, or one child of it. The child suffix is only taken when it
+    /// resolves, so a tool whose id happens to carry one still names itself.
+    fn window_body(&self, key: &str) -> Option<(usize, String)> {
+        if let Some((parent, index)) = split_child_scroll_id(key)
+            && let Some(body) = self.child_body_lines(parent, index)
+        {
+            return Some((body, parent.to_owned()));
+        }
+        self.card_body_lines(key).map(|body| (body, key.to_owned()))
+    }
+
+    /// Puts a window at an absolute offset, which is what dragging a bar asks
+    /// for. Landing on the last row re-arms following, exactly as scrolling
+    /// back to the bottom does.
+    fn jump_window(&mut self, key: &str, offset: usize) {
+        let Some((body, rebuild)) = self.window_body(key) else {
+            return;
+        };
+        let max_offset = body.saturating_sub(self.policy.scroll_card_lines as usize);
+        let landed = offset.min(max_offset);
+        self.card_scroll.insert(
+            key.to_owned(),
+            CardScroll {
+                offset: landed,
+                follow: landed == max_offset,
+            },
+        );
+        self.rebuild_expanded_tool(&rebuild);
+    }
+
+    /// `rebuild` is the card to redraw, which for a child is the parent whose
+    /// body it is drawn inside.
+    fn move_window(&mut self, key: String, rebuild: &str, body: usize, delta: i32) -> i32 {
+        let height = self.policy.scroll_card_lines as usize;
+        let max_offset = body.saturating_sub(height);
+        if max_offset == 0 {
+            return delta;
+        }
+        let at = self.card_scroll.get(&key).copied().unwrap_or_default();
+        let offset = if at.follow { max_offset } else { at.offset };
+        // Upwards is towards the start of the body, which is a lower offset.
+        let wanted = offset as i64 - i64::from(delta);
+        let landed = wanted.clamp(0, max_offset as i64) as usize;
+        let used = offset.abs_diff(landed) as i32;
+        if used == 0 {
+            return delta;
+        }
+        self.card_scroll.insert(
+            key,
+            CardScroll {
+                offset: landed,
+                follow: landed == max_offset,
+            },
+        );
+        self.rebuild_expanded_tool(rebuild);
+        (delta.abs() - used) * delta.signum()
+    }
+
+    /// How many lines this card's body holds, or `None` when it is not a
+    /// scroll card or has nothing to scroll.
+    fn card_body_lines(&self, tool_id: &str) -> Option<usize> {
+        if !self.card_scrolls(tool_id) {
+            return None;
+        }
+        let msg = self
+            .messages
+            .iter()
+            .rfind(|m| matches!(&m.role, DisplayRole::Tool(t) if t.id == tool_id))?;
+        if let Some(snapshot) = msg.render_snapshot.as_ref() {
+            return Some(snapshot.lines.len());
+        }
+        if let Some(live) = msg.live_body.as_ref() {
+            return Some(live.lines().count());
+        }
+        let text = msg
+            .tool_output
+            .as_deref()
+            .map(ToolOutput::as_text)
+            .or_else(|| msg.text.split_once('\n').map(|(_, body)| body.to_owned()))?;
+        Some(text.lines().count())
+    }
+
+    fn child_body_lines(&self, parent_id: &str, index: usize) -> Option<usize> {
+        let (msg_idx, _) = self.tool_card(parent_id)?;
+        let ToolOutput::Batch { entries, .. } = self.messages[msg_idx].tool_output.as_deref()?
+        else {
+            return None;
+        };
+        let entry = entries.get(index)?;
+        self.policy
+            .scrolls(&entry.tool)
+            .then(|| match entry.output.as_ref() {
+                Some(output) => output.as_text().lines().count(),
+                // A child that has not answered is drawn from what it has
+                // streamed, so that is what its window moves over. Counting
+                // only settled output leaves a running command unscrollable
+                // for exactly as long as there is a reason to scroll it.
+                None => self
+                    .batch_child_stream(parent_id, index)
+                    .map_or(0, |tail| tail.lines().count()),
+            })
     }
 
     /// Shows the whole body, since that is the only thing a click opens to.
@@ -1024,7 +1325,11 @@ impl MessagesPanel {
             return None;
         }
         let governed = match &self.messages[idx].role {
-            DisplayRole::Tool(t) => t.is_collapsible() && !self.disclosure.contains_key(&t.id),
+            DisplayRole::Tool(t) => {
+                t.is_collapsible()
+                    && !self.stays_collapsed(&t.name)
+                    && !self.disclosure.contains_key(&t.id)
+            }
             _ => false,
         };
         governed.then_some(idx)
@@ -1098,6 +1403,10 @@ impl MessagesPanel {
         self.shell_raw.clear();
         self.batch_views.clear();
         self.batch_child_progress.clear();
+        self.batch_child_output.clear();
+        self.card_bars.clear();
+        self.card_windows.clear();
+        self.armed_card = None;
         self.lua_clicks.clear();
         self.live_bufs.clear();
         self.watched_bufs.clear();
@@ -1318,6 +1627,7 @@ impl MessagesPanel {
         // the only record of work its output does not show.
         if terminal {
             self.settle_child_progress(tool_id, index);
+            self.forget_child_output(tool_id, index);
         }
         self.rebuild_tool_segment(tool_id);
     }
@@ -1402,6 +1712,44 @@ impl MessagesPanel {
         true
     }
 
+    /// A dispatched batch child streaming its output. Its id is the batch's
+    /// own with an index appended, so the envelope names a header that does
+    /// not exist and the tail has to be addressed to the roster instead.
+    ///
+    /// Kept whole, as a standalone card keeps its live output: the window the
+    /// child is drawn in decides how much of it shows, and the sink upstream
+    /// already bounds what a command that prints forever can send.
+    pub fn set_batch_child_output(&mut self, tool_id: &str, index: usize, content: &str) -> bool {
+        if !self.batch_child_exists(tool_id, index) {
+            return false;
+        }
+        Arc::make_mut(
+            self.batch_child_output
+                .entry(tool_id.to_owned())
+                .or_default(),
+        )
+        .insert(index, content.to_owned());
+        self.rebuild_tool_segment(tool_id);
+        true
+    }
+
+    /// What a dispatched child has streamed so far, which is the only place
+    /// its output is held: it has no header of its own to carry it.
+    pub fn batch_child_stream(&self, tool_id: &str, index: usize) -> Option<&str> {
+        Some(self.batch_child_output.get(tool_id)?.get(&index)?.as_str())
+    }
+
+    /// What a child streamed is superseded by what it returned, so the tail is
+    /// dropped the moment its own result can be drawn.
+    fn forget_child_output(&mut self, tool_id: &str, index: usize) {
+        if let Some(children) = self.batch_child_output.get_mut(tool_id)
+            && Arc::make_mut(children).remove(&index).is_some()
+            && children.is_empty()
+        {
+            self.batch_child_output.remove(tool_id);
+        }
+    }
+
     fn batch_child_exists(&self, tool_id: &str, index: usize) -> bool {
         self.messages
             .iter()
@@ -1458,6 +1806,7 @@ impl MessagesPanel {
                 .values_mut()
                 .for_each(ToolProgress::settle);
         }
+        self.batch_child_output.remove(&event.id);
         let Some(msg) = self
             .messages
             .iter_mut()
@@ -1603,12 +1952,12 @@ impl MessagesPanel {
         let tl = build_instructions_lines(blocks, width, exp);
 
         if let Some(seg_idx) = self.cache.find_by_tool_id(&inst_id) {
-            let compact = self.compact();
+            let compact = self.card_draws_compact(parent_id);
             let seg = self.cache.get_mut(seg_idx).unwrap();
             seg.search_text = tl.search_text.clone();
             seg.update_with_reuse(tl, &self.hl_worker, compact);
         } else {
-            let compact = self.compact();
+            let compact = self.card_draws_compact(parent_id);
             let msg_index = self.cache.get(parent_idx).and_then(|s| s.msg_index);
             let mut seg = Segment::with_tool(inst_id, SegmentKind::Instruction, msg_index);
             seg.search_text = tl.search_text.clone();
@@ -1962,6 +2311,7 @@ impl MessagesPanel {
         cwd: &Path,
     ) {
         self.hover = self.hover_target_at(row, col, area, known_task_target, cwd);
+        self.disarm_unless_over(col, row);
     }
 
     pub(crate) fn message_action_at(&self, row: u16, col: u16) -> Option<MessageActionTarget> {
@@ -1974,6 +2324,13 @@ impl MessagesPanel {
 
     pub(crate) fn clear_hover(&mut self) {
         self.hover = None;
+    }
+
+    /// Releases the armed window. Kept apart from `clear_hover` on purpose:
+    /// hover is transient feedback that many paths clear freely, and arming is
+    /// a gesture the reader performed that has to outlive them.
+    pub(crate) fn disarm_card(&mut self) {
+        self.armed_card = None;
     }
 
     /// What the status bar says about whatever the pointer is over. Neither
@@ -2346,6 +2703,23 @@ impl MessagesPanel {
         self.diagram_pans.len()
     }
 
+    /// Offers a wheel burst to the armed window under the pointer, returning
+    /// the notches it did not use. Anything else keeps the whole burst, so the
+    /// transcript scrolls exactly as it always has.
+    ///
+    /// Both conditions are needed: the press says which window the reader
+    /// means, and the pointer says they still mean it. Position alone would
+    /// hand a card every notch that passed over it on the way somewhere else.
+    pub fn scroll_card_at(&mut self, column: u16, row: u16, delta: i32) -> i32 {
+        if delta == 0 {
+            return delta;
+        }
+        let Some(key) = self.armed_at(column, row).map(str::to_owned) else {
+            return delta;
+        };
+        self.scroll_window(&key, delta)
+    }
+
     pub fn handle_click(&mut self, row: u16, area: Rect) -> bool {
         if area.height == 0 {
             return false;
@@ -2420,9 +2794,20 @@ impl MessagesPanel {
         let exp = self
             .tool_expansion(tool_id, self.card_opens_by_default(tool_id))
             .unwrap_or_default();
+        let source_line = seg.source_line_at(rel, width);
+        // The footer is what says the window is paused, so it is also what
+        // takes it back to the tail.
+        if seg
+            .scroll_footer_line
+            .is_some_and(|line| source_line == Some(line))
+        {
+            let tool_id = tool_id.to_owned();
+            self.follow_card(&tool_id);
+            return true;
+        }
         let shell_toggle = seg
             .shell_toggle_line
-            .is_some_and(|line| seg.source_line_at(rel, width) == Some(line));
+            .is_some_and(|line| source_line == Some(line));
         if shell_toggle {
             let tool_id = tool_id.to_owned();
             if !self.shell_raw.remove(&tool_id) {
@@ -2439,6 +2824,11 @@ impl MessagesPanel {
             return true;
         }
         let tool_id = tool_id.to_owned();
+        // A scroll card has two states, not three: the wheel is what reaches
+        // the rest of the body, so a click has only the header to offer.
+        if self.card_scrolls(&tool_id) {
+            return self.close_card(&tool_id);
+        }
         // The whole body is already on screen, so the only move left is the
         // way back: to the header where the mode left one, and to the resting
         // budget where it did not.
@@ -2735,8 +3125,8 @@ impl MessagesPanel {
         );
 
         let accent = self.accent.resolve();
-        let compact = self.compact();
         let mut message_action_hits = Vec::new();
+        let mut windows: Vec<CardWindow> = Vec::new();
         for (i, seg) in self.cache.segments().iter().enumerate() {
             if cursor.past_bottom() {
                 break;
@@ -2761,11 +3151,14 @@ impl MessagesPanel {
                     accent,
                 )
             });
+            // Taken before the render, which consumes the cursor's skip, and
+            // used after it, so the bars paint over the body they belong to.
+            let placement = cursor.placement(height);
             let action_area = cursor.render(
                 (seg.lines(), Some(seg.links())),
                 height,
                 seg.chrome(width),
-                segment_styles(seg.kind(), accent, compact),
+                segment_styles(seg.kind(), accent, seg.compact),
                 RenderFeedback {
                     highlight,
                     hover,
@@ -2773,6 +3166,9 @@ impl MessagesPanel {
                 },
                 frame,
             );
+            if let Some(placement) = placement {
+                collect_card_windows(seg, placement, width, viewport, &mut windows);
+            }
             if let (Some(area), Some(source)) = (action_area, source) {
                 message_action_hits.push(MessageActionHit {
                     area,
@@ -2784,6 +3180,7 @@ impl MessagesPanel {
             }
         }
         self.message_action_hits = message_action_hits;
+        self.place_card_windows(windows, frame);
 
         let mut height_idx = 0usize;
         let streamed: [(&StreamingContent, bool, SegmentKind); 2] = [
@@ -2843,7 +3240,9 @@ impl MessagesPanel {
                             (sc.cached_lines(), Some(sc.links())),
                             h,
                             SegmentChrome::for_kind(kind, width, 0),
-                            segment_styles(kind, accent, compact),
+                            // Streaming text and reasoning, never a tool row,
+                            // so compactness has no arm to reach here.
+                            segment_styles(kind, accent, false),
                             RenderFeedback::default(),
                             frame,
                         );
@@ -2900,6 +3299,120 @@ impl MessagesPanel {
         }
         self.scrollbar
             .draw(frame, area, total_lines, self.scroll_top);
+    }
+
+    /// Records the windows that were drawn and paints a bar beside each,
+    /// forgetting everything that is no longer on screen.
+    ///
+    /// A bar has to be placed every frame it exists, because placing is also
+    /// what clears its track: a window that closed while a drag was live would
+    /// otherwise keep the drag anchored to rows nothing draws any more. The
+    /// arming follows for the same reason.
+    fn place_card_windows(&mut self, windows: Vec<CardWindow>, frame: &mut Frame) {
+        self.card_bars
+            .retain(|key, _| windows.iter().any(|window| &window.key == key));
+        if let Some(armed) = &self.armed_card
+            && !windows.iter().any(|window| &window.key == armed)
+        {
+            self.armed_card = None;
+        }
+        for window in &windows {
+            self.card_bars.entry(window.key.clone()).or_default().draw(
+                frame,
+                window.strip(),
+                window.total,
+                window.position,
+            );
+        }
+        self.card_windows = windows;
+    }
+
+    fn window_at(&self, column: u16, row: u16) -> Option<&CardWindow> {
+        let at = Position::new(column, row);
+        self.card_windows
+            .iter()
+            .find(|window| window.body.contains(at))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn card_window_key_at(&self, column: u16, row: u16) -> Option<&str> {
+        self.window_at(column, row)
+            .map(|window| window.key.as_str())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn armed_card_key(&self) -> Option<&str> {
+        self.armed_card.as_deref()
+    }
+
+    /// Arms the window under the pointer for the wheel, releasing whatever was
+    /// armed before. `true` when a window took the press.
+    ///
+    /// Called on the press rather than the release because touch never reports
+    /// a held drag, so the release path that resolves a click is skipped
+    /// entirely under `ui.touch`. The press is also the gesture the reader
+    /// performs, so it is the honest place for it.
+    ///
+    /// It deliberately does not consume the press: a sweep has to be able to
+    /// start inside a card body, or the body's text could not be selected.
+    pub fn arm_card_at(&mut self, column: u16, row: u16) -> bool {
+        self.armed_card = self.window_at(column, row).map(|window| window.key.clone());
+        self.armed_card.is_some()
+    }
+
+    /// Whether the armed window is the one under the pointer, which is what
+    /// both the wheel and the click ask.
+    ///
+    /// The press says which window the reader means and the pointer says they
+    /// still mean it. Position alone would hand a card every notch that passed
+    /// over it on the way somewhere else.
+    fn armed_at(&self, column: u16, row: u16) -> Option<&str> {
+        self.window_at(column, row)
+            .map(|window| window.key.as_str())
+            .filter(|key| self.armed_card.as_deref() == Some(*key))
+    }
+
+    /// Whether a release at this point completes an arming press, in which
+    /// case it must not also fold the card: a card's own control is its
+    /// header, not the window the reader just aimed at.
+    pub fn armed_card_at(&self, column: u16, row: u16) -> bool {
+        self.armed_at(column, row).is_some()
+    }
+
+    /// Releases the armed window once the pointer is no longer inside it, so
+    /// the wheel goes back to the transcript without needing a press to say
+    /// so.
+    fn disarm_unless_over(&mut self, column: u16, row: u16) {
+        if self.armed_card.is_some()
+            && self.window_at(column, row).map(|window| &window.key) != self.armed_card.as_ref()
+        {
+            self.armed_card = None;
+        }
+    }
+
+    /// A card's bar takes the press before the transcript's own and before any
+    /// selection: the strip is one column inside a card body, and both of the
+    /// others would happily claim it.
+    pub fn handle_card_scrollbar(&mut self, event: &MouseEvent) -> bool {
+        let mut jump = None;
+        let mut consumed = false;
+        for (key, bar) in &mut self.card_bars {
+            match bar.handle(event) {
+                ScrollbarMouse::Ignored => continue,
+                ScrollbarMouse::Consumed => consumed = true,
+                ScrollbarMouse::ScrollTo(offset) => {
+                    jump = Some((key.clone(), offset as usize));
+                }
+            }
+            break;
+        }
+        match jump {
+            Some((key, offset)) => {
+                self.jump_window(&key, offset);
+                true
+            }
+            None => consumed,
+        }
     }
 
     /// The bar takes the press before any selection starts, or dragging it
@@ -3162,6 +3675,7 @@ impl MessagesPanel {
                         Some(&metadata),
                         fragment.text.as_str(),
                         true,
+                        fragment.language.as_deref(),
                     );
                     continue;
                 }
@@ -3174,11 +3688,14 @@ impl MessagesPanel {
                 metadata.as_deref(),
                 body,
                 fenced,
+                None,
             );
         }
         document
     }
 
+    /// `language` names the fence when the body is one language's source, and
+    /// is ignored when the body is not fenced at all.
     fn append_selection_section(
         &self,
         document: &mut String,
@@ -3186,6 +3703,7 @@ impl MessagesPanel {
         metadata: Option<&str>,
         body: &str,
         fenced: bool,
+        language: Option<&str>,
     ) {
         if !document.is_empty() {
             document.push_str("\n\n---\n\n");
@@ -3202,16 +3720,16 @@ impl MessagesPanel {
         }
         document.push_str("\n\n");
         if fenced {
-            document.push_str(&fenced_text(body));
+            document.push_str(&fenced_text(body, language));
         } else {
             let caudra_block = unclosed_caudra_fenced_block(body);
             let commonmark_block = unclosed_markdown_block(body);
             if caudra_block != commonmark_block {
                 // Conflicting parser states have no shared invisible closer.
-                document.push_str(&fenced_text(&rendered_markdown_text(
-                    body,
-                    self.viewport_width,
-                )));
+                document.push_str(&fenced_text(
+                    &rendered_markdown_text(body, self.viewport_width),
+                    language,
+                ));
             } else {
                 document.push_str(body);
             }
@@ -3378,21 +3896,59 @@ impl MessagesPanel {
             .rfind(|m| matches!(&m.role, DisplayRole::Tool(t) if t.id == tool_id))
     }
 
-    fn rctx(&self) -> RenderCtx<'_> {
-        let kind = if self.compact() {
+    /// The context a single card is built in. Compactness is per call rather
+    /// than per panel: an always-collapsed tool draws its row inside an
+    /// expanded transcript, and the row's width comes from the chrome that
+    /// row actually gets.
+    fn rctx(&self, tool: &str, tool_id: &str) -> RenderCtx<'_> {
+        let compact = self.draws_compact(tool);
+        let kind = if compact {
             SegmentKind::ToolInline
         } else {
             SegmentKind::ToolBlock
         };
+        let at = self.card_scroll.get(tool_id).copied().unwrap_or_default();
         RenderCtx {
             started_at: self.started_at,
             width: SegmentChrome::for_kind(kind, self.viewport_width, 0)
                 .content_width(self.viewport_width),
             tool_output_lines: &self.tool_output_lines,
-            compact: self.compact(),
+            card_scroll: self.policy.window(tool, at.offset, at.follow),
+            child_scroll: self.child_windows(tool_id),
+            policy: self.policy.clone(),
+            compact,
             batch_views: &self.batch_views,
             batch_progress: &self.batch_child_progress,
+            batch_live: &self.batch_child_output,
         }
+    }
+
+    /// Where every scrolling child of this card has its window. Built from
+    /// the roster rather than from the scroll map, so a child the reader has
+    /// never touched still gets the window its tool asks for.
+    fn child_windows(&self, tool_id: &str) -> Arc<HashMap<usize, ScrollWindow>> {
+        let Some(ToolOutput::Batch { entries, .. }) = self
+            .tool_card(tool_id)
+            .and_then(|(idx, _)| self.messages[idx].tool_output.as_deref())
+        else {
+            return Arc::default();
+        };
+        let windows: HashMap<usize, ScrollWindow> = entries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| {
+                let at = self
+                    .card_scroll
+                    .get(&child_scroll_id(tool_id, index))
+                    .copied()
+                    .unwrap_or_default();
+                Some((
+                    index,
+                    self.policy.window(&entry.tool, at.offset, at.follow)?,
+                ))
+            })
+            .collect();
+        Arc::new(windows)
     }
 
     pub fn register_live_buf(&mut self, id: String, body: Arc<SharedBuf>) {
@@ -3631,7 +4187,7 @@ impl MessagesPanel {
                 .iter_mut()
                 .find(|s| s.matches_pending_highlight(result.id))
             {
-                seg.apply_highlight_result(result.lines, result.rows);
+                seg.apply_highlight_result(result.lines, result.rows, result.source_rows);
                 dirty = Dirty::YES;
             }
         }
@@ -3656,7 +4212,7 @@ impl MessagesPanel {
         };
 
         let exp = self.tool_expansion(tool_id, opens);
-        let rctx = self.rctx();
+        let rctx = self.rctx(msg.role.tool_name().unwrap_or_default(), tool_id);
         let tl = Self::build_tool_segment_lines(msg, status, &rctx, exp);
 
         let instructions = msg
@@ -3664,7 +4220,7 @@ impl MessagesPanel {
             .as_deref()
             .and_then(|o| o.owned_instructions());
 
-        let compact = self.compact();
+        let compact = rctx.compact;
         let seg = self.cache.get_mut(seg_idx).unwrap();
         seg.search_text = tl.search_text.clone();
         seg.update_with_reuse(tl, &self.hl_worker, compact);
@@ -3684,10 +4240,11 @@ impl MessagesPanel {
             if let DisplayRole::Tool(t) = &msg.role {
                 let exp = self.tool_expansion(&t.id, self.opens_by_default(t, i));
                 let status = t.status;
-                let tl = Self::build_tool_segment_lines(msg, status, &self.rctx(), exp);
+                let rctx = self.rctx(&t.name, &t.id);
+                let tl = Self::build_tool_segment_lines(msg, status, &rctx, exp);
                 let id = t.id.clone();
                 let search_text = tl.search_text.clone();
-                let compact = self.compact();
+                let compact = self.draws_compact(&t.name);
                 let mut seg = Segment::with_tool(id.clone(), SegmentKind::ToolBlock, Some(i));
                 seg.search_text = search_text;
                 seg.apply_highlight(tl, &self.hl_worker, compact);

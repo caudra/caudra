@@ -231,10 +231,7 @@ pub(crate) fn hint_line_hovered<K: AsRef<str>, V: AsRef<str>>(
 /// it, so the pointer acts on a control only once it is over one. Pairs that
 /// run past the right edge are dropped rather than clipped: a hint the reader
 /// cannot fully see is not one they can knowingly press.
-pub(crate) fn hint_hits<K: AsRef<str>, V: AsRef<str>>(
-    pairs: &[(K, V)],
-    area: Rect,
-) -> Vec<Rect> {
+pub(crate) fn hint_hits<K: AsRef<str>, V: AsRef<str>>(pairs: &[(K, V)], area: Rect) -> Vec<Rect> {
     let mut x = area.x;
     let mut hits = Vec::with_capacity(pairs.len());
     for (_, width) in hint_parts(pairs) {
@@ -1209,8 +1206,9 @@ mod tests {
         assert_eq!(hits[1].x, hits[0].right() + hint_gap_width());
         assert_eq!(hits[1].width, control_width(HINTS[1]));
         assert!(
-            hits.iter()
-                .all(|hit| hit.y == HINT_ROW.y && hit.height == 1 && hit.right() <= HINT_ROW.right())
+            hits.iter().all(|hit| hit.y == HINT_ROW.y
+                && hit.height == 1
+                && hit.right() <= HINT_ROW.right())
         );
     }
 

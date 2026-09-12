@@ -4,10 +4,15 @@ use super::code_view;
 use crate::animation::{spinner_frame, spinner_str};
 use crate::theme;
 use caudra_config::{ClockFormat, ToolOutputLines};
-use code_view::{BatchProgressMap, BatchViewMap, BatchViews, Disclosure, RenderLimits, RowTarget};
+use code_view::{
+    BatchLiveMap, BatchProgressMap, BatchViewMap, BatchViews, BodySource, CardPolicy, Disclosure,
+    RenderLimits, RowTarget, ScrollSpan, ScrollWindow, SourceTrace, text_body,
+};
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::fmt::Write;
+use std::iter;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -35,6 +40,13 @@ pub struct RenderCtx<'a> {
     pub started_at: Instant,
     pub width: u16,
     pub tool_output_lines: &'a ToolOutputLines,
+    /// What the reader configured about tools: which never open, and how
+    /// tall a scroll card's window is.
+    pub policy: CardPolicy,
+    /// This card's window, when it is drawn as a scroller, and each scrolling
+    /// child's. Resolved by the panel, which owns where every window sits.
+    pub card_scroll: Option<ScrollWindow>,
+    pub child_scroll: Arc<HashMap<usize, ScrollWindow>>,
     pub compact: bool,
     /// How much of each batch child the reader has asked to see, by parent
     /// tool id. Looked up here rather than passed in, so every path that
@@ -42,6 +54,10 @@ pub struct RenderCtx<'a> {
     pub batch_views: &'a BatchViewMap,
     /// What each batch's dispatched children are doing, by parent tool id.
     pub batch_progress: &'a BatchProgressMap,
+    /// What each batch's still-running children have streamed, by parent tool
+    /// id. A child's own header does not exist, so its output is drawn from
+    /// here or not at all.
+    pub batch_live: &'a BatchLiveMap,
 }
 
 impl RenderCtx<'_> {
@@ -54,9 +70,22 @@ impl RenderCtx<'_> {
             .and_then(|id| self.batch_progress.get(id))
             .cloned()
             .unwrap_or_default();
+        let live = tool_id
+            .and_then(|id| self.batch_live.get(id))
+            .cloned()
+            .unwrap_or_default();
         RenderLimits::new(full, budget, views, *self.tool_output_lines)
-            .with_progress(progress)
+            .with_scroll(self.card_scroll)
+            .with_policy(self.policy.clone(), self.child_scroll.clone())
+            .with_progress(progress, live)
             .with_width(self.width.saturating_sub(TOOL_BODY_INDENT_WIDTH))
+    }
+
+    /// Whether this call is drawn as a fixed-height scroller rather than
+    /// abridged to a budget. Turning the height down to zero gives every tool
+    /// back the notice-and-click it had before.
+    pub fn scrolls(&self, tool: &str) -> bool {
+        self.policy.scrolls(tool)
     }
 
     /// The rows a card rests at, `usize::MAX` for a call with no useful
@@ -73,6 +102,9 @@ impl RenderCtx<'_> {
     /// budget so that a batch reads as the list of what it ran, and several
     /// whole files would bury that list.
     fn resting_budget(&self, tool: &str) -> usize {
+        if self.scrolls(tool) {
+            return self.policy.scroll_card_lines as usize;
+        }
         match tool == FILE_WRITE_TOOL_NAME {
             true => usize::MAX,
             false => self.tool_output_lines.get(tool),
@@ -90,6 +122,12 @@ pub(crate) const SPINNER_STYLE_PREFIX: &str = "spinner:";
 const CODE_OUTPUT_DIVIDER: &str = "  ────────────";
 const ACTIVITY_PREFIX: &str = "  ├ ";
 const ACTIVITY_SEPARATOR: &str = " · ";
+/// A window still chasing the tail, and one the reader pinned by scrolling
+/// up. Named the way the log viewer names the same two states.
+pub(crate) const FOLLOWING: &str = "following";
+pub(crate) const PAUSED: &str = "paused";
+const RESUME_HINT: &str = " · click to follow";
+const SCROLL_FOOTER_SEPARATOR: &str = " · ";
 pub const RAW_AFFORDANCE: &str = "click for raw";
 pub const FILTERED_AFFORDANCE: &str = "click for filtered";
 const COMPACT_LOAD_PREFIX: &str = "↳ Loaded ";
@@ -279,13 +317,55 @@ const fn tool_row(
 /// suffix, so the qualifier has to end where the tool name begins and an
 /// unrelated `myfile_read` cannot pass for `file_read`.
 fn compact_row(name: &str) -> Option<(&'static str, &'static CompactTool)> {
-    let mut rest = name;
-    loop {
-        if let Some((tool, entry)) = COMPACT_TOOLS.iter().find(|(tool, _)| same_key(tool, rest)) {
-            return Some((tool, entry));
-        }
-        rest = rest.split_once(QUALIFIER)?.1;
+    qualifier_suffixes(name)
+        .find_map(|rest| COMPACT_TOOLS.iter().find(|(tool, _)| same_key(tool, rest)))
+        .map(|(tool, entry)| (*tool, entry))
+}
+
+/// The name, then the name with each leading qualifier segment dropped in
+/// turn. Longest first, so a row matching the whole name beats one matching a
+/// tail of it.
+fn qualifier_suffixes(name: &str) -> impl Iterator<Item = &str> {
+    iter::successors(Some(name), |rest| {
+        rest.split_once(QUALIFIER).map(|(_, tail)| tail)
+    })
+}
+
+/// Whether `name` is the tool `pattern` names, matched the way the compact
+/// table matches its rows. Config lists a tool by its bare name, and the call
+/// may still arrive qualified by the server that wrapped it.
+pub(crate) fn names_tool(pattern: &str, name: &str) -> bool {
+    qualifier_suffixes(name).any(|rest| same_key(pattern, rest))
+}
+
+/// What a window says about itself: how much sits either side of it, and which
+/// edge it is pinned to. `None` when the body fits, since then there is no
+/// window to describe.
+///
+/// A card and a batch child share this so the two never drift into describing
+/// the same state differently. `resumable` is the click hint, which only a
+/// card's own footer earns: a child's rows already belong to the child, so a
+/// press there folds it rather than resuming its follow.
+pub(crate) fn scroll_footer_text(above: usize, below: usize, resumable: bool) -> Option<String> {
+    if above == 0 && below == 0 {
+        return None;
     }
+    let mut parts: Vec<String> = Vec::new();
+    if above > 0 {
+        parts.push(format!("{above} above"));
+    }
+    if below > 0 {
+        parts.push(format!("{below} below"));
+    }
+    parts.push(match (below, resumable) {
+        (0, _) => FOLLOWING.to_owned(),
+        (_, true) => format!("{PAUSED}{RESUME_HINT}"),
+        (_, false) => PAUSED.to_owned(),
+    });
+    Some(format!(
+        "{NOTICE_PREFIX}{}",
+        parts.join(SCROLL_FOOTER_SEPARATOR)
+    ))
 }
 
 fn compact_tool(name: &str) -> Option<&'static CompactTool> {
@@ -546,12 +626,24 @@ pub struct ToolLines {
     /// Index of the first live-buffer snapshot line, recorded in the same
     /// pass that lays out `lines`, so click rows can never drift from them.
     pub snapshot_base: Option<usize>,
+    /// Snapshot lines the card's window left above its first drawn row, so a
+    /// click still names the buffer line it landed on.
+    pub snapshot_skip: usize,
     pub shell_toggle_line: Option<usize>,
+    /// The scroll card's footer, which re-pins the window to the tail.
+    pub scroll_footer_line: Option<usize>,
+    /// Every window drawn in these lines, the card's own and each scrolling
+    /// child's, so a bar can be placed beside each.
+    pub scroll_spans: Vec<ScrollSpan>,
     pub content_indent: &'static str,
     pub truncation: bool,
     /// What each line belongs to, parallel to `lines`, so a splice keeps the
     /// two in step and the async highlight cannot lose a click target.
     pub rows: Vec<Option<RowTarget>>,
+    /// Where each line came from, parallel to `lines`, so copy slices the
+    /// script instead of scraping its line-number gutter off the screen.
+    /// `None` when something in the card names no source at all.
+    pub source: Option<BodySource>,
 }
 
 pub struct HighlightRequest {
@@ -590,11 +682,11 @@ impl HighlightRequest {
             | ToolOutput::Image { .. } => None,
             // Children carry their own code and diffs, so a batch reaches the
             // highlighting worker exactly as a lone child would. A batch with
-            // a child still reporting is the exception: its rows carry a clock
-            // the worker has no way to read, so an answer spliced back over
-            // them would freeze what the reader is watching.
+            // a child still reporting or still printing is the exception: its
+            // rows move faster than the worker's cache key, so an answer
+            // spliced back over them would freeze what the reader is watching.
             ToolOutput::Batch { ref entries, .. } => {
-                (!entries.is_empty() && !limits.has_live_progress()).then_some(o)
+                (!entries.is_empty() && !limits.has_live_rows()).then_some(o)
             }
         });
         if input.is_none() && output.is_none() {
@@ -722,6 +814,9 @@ struct ResolvedOutput<'a> {
     text: Option<Cow<'a, str>>,
     full_text: Option<Cow<'a, str>>,
     skipped: usize,
+    /// Lines above and below a scroll card's window. `None` for a body that
+    /// was abridged to a budget instead, which reports itself with `skipped`.
+    scrolled: Option<(usize, usize)>,
 }
 
 fn resolve_output<'a>(
@@ -753,7 +848,11 @@ fn resolve_output<'a>(
     };
 
     let expanded = limits.is_expanded();
-    let (raw_text, already_truncated): (Option<Cow<'a, str>>, usize) = if expanded {
+    // `body` was abridged to the tool's budget on the way in, so anything
+    // that means to show more than the budget has to read the output itself.
+    // A window means exactly that: it is free to sit anywhere in the body.
+    let whole = expanded || limits.scroll.is_some();
+    let (raw_text, already_truncated): (Option<Cow<'a, str>>, usize) = if whole {
         match &full_text {
             Some(t) => (Some(t.clone()), 0),
             None if output.is_some() => {
@@ -761,6 +860,7 @@ fn resolve_output<'a>(
                     text: None,
                     full_text: None,
                     skipped: 0,
+                    scrolled: None,
                 };
             }
             None => match live_output {
@@ -780,11 +880,30 @@ fn resolve_output<'a>(
                     text: None,
                     full_text: None,
                     skipped: 0,
+                    scrolled: None,
                 };
             }
             (None, None) => (None, 0),
         }
     };
+
+    // A window is the reader's own position in the body, so it outranks both
+    // the budget and the expansion a click would otherwise have granted.
+    if let Some(window) = limits.scroll.filter(|_| !expanded) {
+        let (text, scrolled) = match raw_text {
+            Some(t) if !t.is_empty() => {
+                let (kept, above, below) = window_lines(&t, window);
+                (Some(Cow::Owned(kept)), Some((above, below)))
+            }
+            _ => (None, None),
+        };
+        return ResolvedOutput {
+            text,
+            full_text,
+            skipped: 0,
+            scrolled,
+        };
+    }
 
     let keep_tail = matches!(output, Some(ToolOutput::Shell(_)));
     let (text, skipped) = match raw_text {
@@ -808,7 +927,15 @@ fn resolve_output<'a>(
         text,
         full_text,
         skipped,
+        scrolled: None,
     }
+}
+
+/// The window's slice of `text`, with the line counts either side of it.
+fn window_lines(text: &str, window: ScrollWindow) -> (String, usize, usize) {
+    let lines: Vec<&str> = text.lines().collect();
+    let (start, end) = window.range(lines.len());
+    (lines[start..end].join("\n"), start, lines.len() - end)
 }
 
 struct ToolLineBuilder {
@@ -817,9 +944,13 @@ struct ToolLineBuilder {
     search_text: String,
     spinner_lines: Vec<(usize, usize)>,
     snapshot_base: Option<usize>,
+    snapshot_skip: usize,
     shell_toggle_line: Option<usize>,
+    scroll_footer_line: Option<usize>,
+    scroll_spans: Vec<ScrollSpan>,
     content_range: (usize, usize),
     rows: Vec<Option<RowTarget>>,
+    source: SourceTrace,
     width: u16,
     truncation: bool,
     limits: RenderLimits,
@@ -835,9 +966,13 @@ impl ToolLineBuilder {
             search_text: String::new(),
             spinner_lines: Vec::new(),
             snapshot_base: None,
+            snapshot_skip: 0,
             shell_toggle_line: None,
+            scroll_footer_line: None,
+            scroll_spans: Vec::new(),
             content_range: (0, 0),
             rows: Vec::new(),
+            source: SourceTrace::default(),
             width,
             truncation: false,
             limits,
@@ -861,8 +996,12 @@ impl ToolLineBuilder {
         output: Option<&ToolOutput>,
         raw_input: Option<&serde_json::Value>,
     ) {
+        let label = compact_sigil_label(tool_name, self.indicator.into()).1;
+        // An omitted header leaves the label against the annotation, so the
+        // separator goes with the text it separates.
+        let gap = if header.is_empty() { "" } else { " " };
         let mut spans = vec![Span::styled(
-            format!("{tool_name}> "),
+            format!("{label}{gap}"),
             theme::current().tool_prefix,
         )];
         if let Some(snapshot) = render_header {
@@ -887,7 +1026,7 @@ impl ToolLineBuilder {
             };
             spans.extend(header_spans(tool_name, header, style, raw_input));
         }
-        let mut copy = format!("{tool_name}> {header}");
+        let mut copy = format!("{label}{gap}{header}");
         if let Some(ann) = annotation {
             spans.push(Span::styled(
                 format!(" ({ann})"),
@@ -899,8 +1038,8 @@ impl ToolLineBuilder {
         self.search_text = copy;
     }
 
-    /// The one-line form: a sigil in place of the status dot, a short label
-    /// in place of `name> `, and the inputs the header omits.
+    /// The one-line form: a sigil in place of the status dot, and the inputs
+    /// the header omits. The label is the same one an expanded card carries.
     fn push_compact_header(
         &mut self,
         tool_name: &str,
@@ -1061,6 +1200,10 @@ impl ToolLineBuilder {
         let content = code_view::render_tool_content(input, output, false, self.limits.clone());
         self.truncation |= content.truncation;
         let start = self.lines.len();
+        match content.source {
+            Some(source) => self.source.record(start, source.indented()),
+            None => self.source.abandon(),
+        }
         for mut line in content.lines {
             line.spans.insert(0, Span::raw(TOOL_BODY_INDENT));
             self.lines.push(line);
@@ -1068,6 +1211,26 @@ impl ToolLineBuilder {
         self.content_range = (start, self.lines.len());
         self.rows.resize(start, None);
         self.rows.extend(content.rows);
+        self.scroll_spans.extend(
+            content
+                .scroll_spans
+                .into_iter()
+                .map(|span| span.shift_lines(start)),
+        );
+    }
+
+    /// The window this card's own body is drawn in. A child's comes back from
+    /// the renderer, which is the only thing that knows where a child's rows
+    /// landed.
+    fn push_card_scroll_span(&mut self, first: usize, above: usize, below: usize) {
+        let lines = self.lines.len() - first;
+        self.scroll_spans.push(ScrollSpan {
+            child: None,
+            first,
+            lines,
+            total: above + lines + below,
+            offset: above,
+        });
     }
 
     /// Takes the place `push_code_content` would fill, because the call it
@@ -1077,17 +1240,31 @@ impl ToolLineBuilder {
     /// `path` is what the header has said so far, which is all a still-arriving
     /// write has said about itself. A document is drawn the way the settled
     /// card will draw it, so nothing about the body changes when the call runs.
+    /// That includes the card's window: a write 800 lines long does not push
+    /// the transcript down 800 rows on its way past.
     fn push_live_body(&mut self, body: &str, path: &str) {
+        self.source.abandon();
         let start = self.lines.len();
+        let (windowed, scrolled) = match self.limits.scroll {
+            Some(window) => {
+                let (kept, above, below) = window_lines(body, window);
+                (Cow::Owned(kept), Some((above, below)))
+            }
+            None => (Cow::Borrowed(body), None),
+        };
         if renders_as_markdown(path) {
-            self.push_markdown_body(body);
+            self.push_markdown_body(&windowed);
         } else {
-            for mut line in code_view::render_live_body(body) {
+            for mut line in code_view::render_live_body(&windowed) {
                 line.spans.insert(0, Span::raw(TOOL_BODY_INDENT));
                 self.lines.push(line);
             }
         }
         self.content_range = (start, self.lines.len());
+        if let Some((above, below)) = scrolled {
+            self.push_card_scroll_span(start, above, below);
+            self.push_scroll_footer(above, below);
+        }
     }
 
     fn push_resolved_output(&mut self, resolved: &ResolvedOutput<'_>) {
@@ -1103,18 +1280,42 @@ impl ToolLineBuilder {
         }
 
         if let Some(text) = &resolved.text {
+            let body_start = self.lines.len();
             if self.markdown {
                 self.push_markdown_body(text);
             } else {
                 push_text_lines(&mut self.lines, text, TOOL_BODY_INDENT);
+                // The window has already taken its slice, so the ranges index
+                // what was drawn rather than the line numbers it came from.
+                self.source.record(body_start, text_body(text, 1));
             }
             if let Some(full) = &resolved.full_text {
                 self.push_search_text(full);
             } else {
                 self.push_search_text(text);
             }
-            self.push_truncation_count(resolved.skipped);
+            match resolved.scrolled {
+                Some((above, below)) => {
+                    self.push_card_scroll_span(body_start, above, below);
+                    self.push_scroll_footer(above, below);
+                }
+                None => self.push_truncation_count(resolved.skipped),
+            }
         }
+    }
+
+    /// Where a window sits and whether it is still chasing the tail. A window
+    /// with nothing either side of it says nothing: the body fits, and a
+    /// footer would only claim otherwise.
+    fn push_scroll_footer(&mut self, above: usize, below: usize) {
+        let Some(text) = scroll_footer_text(above, below, true) else {
+            return;
+        };
+        self.truncation = true;
+        self.scroll_footer_line = Some(self.lines.len());
+        let mut line = Line::from(Span::styled(text, theme::current().tool_dim));
+        line.spans.insert(0, Span::raw(TOOL_BODY_INDENT));
+        self.lines.push(line);
     }
 
     /// Discloses what the body is not showing: the reductions that ran, and the
@@ -1162,7 +1363,11 @@ impl ToolLineBuilder {
         )));
     }
 
+    /// The markdown renderer keeps its own provenance against the text it
+    /// parsed, which is not the card's source, so a card that draws prose
+    /// copies by scraping rather than by slicing the wrong string.
     fn push_markdown_body(&mut self, text: &str) {
+        self.source.abandon();
         let style = theme::current().assistant;
         let (painted, _) = text_to_painted(
             text,
@@ -1197,18 +1402,37 @@ impl ToolLineBuilder {
         search_fallback: Option<&str>,
         started_at: Instant,
     ) {
+        // A snapshot is spans a plugin painted, not a slice of anything the
+        // card holds, so there is nothing for copy to index into.
+        self.source.abandon();
         let base = self.lines.len();
         self.snapshot_base = Some(base);
         let total = snapshot.lines.len();
+        // The window is applied to the rendered rows rather than to the text,
+        // because a snapshot is already laid out and re-wrapping it here would
+        // disagree with the rows a click resolves against.
+        let (start, end) = match self.limits.scroll {
+            Some(window) => window.range(total),
+            None => (0, total),
+        };
+        self.snapshot_skip = start;
         let frame = spinner_str(started_at.elapsed().as_millis());
-        let (lines, spinners) =
-            snapshot_to_lines_range(snapshot, TOOL_BODY_INDENT, 0..total, frame, self.indicator);
+        let (lines, spinners) = snapshot_to_lines_range(
+            snapshot,
+            TOOL_BODY_INDENT,
+            start..end,
+            frame,
+            self.indicator,
+        );
         self.lines.extend(lines);
         self.spinner_lines
             .extend(spinners.into_iter().map(|(line, span)| (base + line, span)));
         self.push_search_text(&snapshot.text());
         if let Some(text) = search_fallback {
             self.push_search_text(text);
+        }
+        if self.limits.scroll.is_some() {
+            self.push_scroll_footer(start, total - end);
         }
     }
 
@@ -1225,6 +1449,10 @@ impl ToolLineBuilder {
         for (line, row) in self.link_rows {
             links.rows[line] = row;
         }
+        let source = self
+            .source
+            .finish(&self.lines)
+            .filter(BodySource::names_source);
         ToolLines {
             lines: self.lines,
             links,
@@ -1232,10 +1460,14 @@ impl ToolLineBuilder {
             highlight,
             spinner_lines: self.spinner_lines,
             snapshot_base: self.snapshot_base,
+            snapshot_skip: self.snapshot_skip,
             shell_toggle_line: self.shell_toggle_line,
+            scroll_footer_line: self.scroll_footer_line,
+            scroll_spans: self.scroll_spans,
             content_indent,
             truncation: self.truncation,
             rows,
+            source,
         }
     }
 }
@@ -1352,6 +1584,19 @@ pub(crate) fn resolve_span_style(style: &SpanStyle) -> Style {
     }
 }
 
+/// Whether the card's body will print this header again. A shell call's header
+/// is its script's first line, so an open card carries the command twice, and
+/// the body's copy is the better one: numbered, highlighted, and whole.
+///
+/// Compared rather than assumed from the tool name, because the same builder
+/// draws a write, whose header is a path the body never repeats.
+fn header_repeats_script(header: &str, input: Option<&ToolInput>) -> bool {
+    input.is_some_and(|input| {
+        let (ToolInput::Script { code, .. } | ToolInput::Code { code, .. }) = input;
+        code.lines().next() == Some(header)
+    })
+}
+
 /// `expansion` is `None` on a compact row the reader has not opened, which is
 /// the only state that draws a header with no body.
 pub fn build_tool_lines(
@@ -1387,9 +1632,15 @@ pub fn build_tool_lines(
         );
         b.prepend_compact_sigil(tool_name, rctx.started_at);
     } else {
+        // The command still belongs on a row that has no body to defer to.
+        let shown =
+            match expansion.is_some() && header_repeats_script(header, msg.tool_input.as_deref()) {
+                true => "",
+                false => header,
+            };
         b.push_header(
             tool_name,
-            header,
+            shown,
             msg.annotation.as_deref(),
             msg.render_header.as_ref(),
             msg.tool_output.as_deref(),
@@ -1528,6 +1779,7 @@ pub fn build_instructions_lines(
 
     let start = b.lines.len();
     b.truncation |= code_view::render_instructions(blocks, &mut b.lines, b.limits.budget, false);
+    b.source.abandon();
     for line in &mut b.lines[start..] {
         line.spans.insert(0, Span::raw(TOOL_BODY_INDENT));
     }
@@ -1569,10 +1821,14 @@ fn compact_instruction_lines(blocks: &[InstructionBlock]) -> ToolLines {
         highlight: None,
         spinner_lines: Vec::new(),
         snapshot_base: None,
+        snapshot_skip: 0,
         shell_toggle_line: None,
+        scroll_footer_line: None,
+        scroll_spans: Vec::new(),
         content_indent: TOOL_BODY_INDENT,
         rows: Vec::new(),
         truncation: true,
+        source: None,
     }
 }
 
@@ -1595,15 +1851,33 @@ mod tests {
         std::sync::LazyLock::new(BatchViewMap::new);
     static NO_PROGRESS: std::sync::LazyLock<BatchProgressMap> =
         std::sync::LazyLock::new(BatchProgressMap::new);
+    static NO_LIVE: std::sync::LazyLock<BatchLiveMap> = std::sync::LazyLock::new(BatchLiveMap::new);
 
     fn test_rctx(width: u16) -> RenderCtx<'static> {
         RenderCtx {
             started_at: Instant::now(),
             width,
             tool_output_lines: &TOL,
+            // The scroll card is exercised by its own cases, which opt in;
+            // every other case asks about the budget it replaces.
+            policy: CardPolicy::default(),
+            card_scroll: None,
+            child_scroll: Arc::default(),
             compact: false,
             batch_views: &NO_VIEWS,
             batch_progress: &NO_PROGRESS,
+            batch_live: &NO_LIVE,
+        }
+    }
+
+    fn scroll_rctx(width: u16, height: u32, at: ScrollWindow) -> RenderCtx<'static> {
+        RenderCtx {
+            policy: CardPolicy {
+                scroll_card_lines: height,
+                ..CardPolicy::default()
+            },
+            card_scroll: Some(at),
+            ..test_rctx(width)
         }
     }
 
@@ -2666,6 +2940,66 @@ mod tests {
         assert!(expanded_text.contains("line 199"));
         assert!(collapsed_text.contains("line 0"));
         assert!(!collapsed_text.contains("line 199"));
+    }
+
+    const SCROLL_HEIGHT: u32 = 10;
+    const SCROLL_TOTAL: usize = 200;
+    const SCROLL_WINDOW_MSG: &str =
+        "a scroll card shows its window and nothing else, wherever the window sits";
+    const SCROLL_NOTICE_MSG: &str =
+        "the window says how much is shown, so the notice offering the rest is gone";
+
+    fn at(offset: usize, follow: bool) -> ScrollWindow {
+        ScrollWindow {
+            height: SCROLL_HEIGHT as usize,
+            offset,
+            follow,
+        }
+    }
+
+    /// Following pins the window to the tail, which is what makes a command
+    /// still printing readable. Pausing holds the offset the reader scrolled
+    /// to, and the body arriving underneath must not drag it along.
+    #[test_case(at(0, true),   190, 199 ; "following_takes_the_tail")]
+    #[test_case(at(0, false),  0,   9   ; "paused_at_the_top_holds_there")]
+    #[test_case(at(40, false), 40,  49  ; "paused_midway_holds_there")]
+    #[test_case(at(999, false),190, 199 ; "an_offset_past_the_end_is_clamped")]
+    fn a_scroll_card_draws_only_its_window(window: ScrollWindow, first: usize, last: usize) {
+        let msg = bash_output_msg(SCROLL_TOTAL, true);
+        let tl = build_tool_lines(
+            &msg,
+            ToolStatus::InProgress,
+            &scroll_rctx(80, SCROLL_HEIGHT, window),
+            Some(exp(false)),
+        );
+        let text = lines_text(&tl);
+        // The trailing space is the row boundary: without it `line 19` also
+        // matches `line 190` and the window looks wider than it is.
+        let shown: Vec<usize> = (0..SCROLL_TOTAL)
+            .filter(|line| text.contains(&format!("line {line} ")))
+            .collect();
+        assert_eq!(
+            shown,
+            (first..=last).collect::<Vec<_>>(),
+            "{SCROLL_WINDOW_MSG}: {text}"
+        );
+        assert!(!text.contains("click to expand"), "{SCROLL_NOTICE_MSG}");
+    }
+
+    /// The footer is the whole of what a window says about itself, so it has
+    /// to name both edges and which one the reader is pinned to.
+    #[test_case(at(0, true),   FOLLOWING ; "a_followed_window_says_so")]
+    #[test_case(at(40, false), PAUSED    ; "a_held_window_says_so")]
+    fn a_scroll_card_reports_where_its_window_sits(window: ScrollWindow, label: &str) {
+        let msg = bash_output_msg(SCROLL_TOTAL, true);
+        let tl = build_tool_lines(
+            &msg,
+            ToolStatus::InProgress,
+            &scroll_rctx(80, SCROLL_HEIGHT, window),
+            Some(exp(false)),
+        );
+        let text = lines_text(&tl);
+        assert!(text.contains(label), "{SCROLL_NOTICE_MSG}: {text}");
     }
 
     #[test_case(200, true,  false, false ; "expanded_shows_all")]
