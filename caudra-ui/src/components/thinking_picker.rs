@@ -25,8 +25,9 @@ pub enum ThinkingPickerAction {
 
 struct ThinkingItem {
     label: String,
-    /// What the row resolves to on this model, when that is not what the row is
-    /// called: a budget model spells `high` as a token count.
+    /// The mode the row resolves to on this model, when that differs from the
+    /// row's own name: a budget model spells `high` as a token count. The `off`
+    /// row has none, since its only other spelling is a synonym.
     detail: Option<String>,
     config: ThinkingConfig,
     resolved: ResolvedThinking,
@@ -36,7 +37,14 @@ impl ThinkingItem {
     fn new(label: String, config: ThinkingConfig, model: &Model) -> Self {
         let resolved = config.resolve(model);
         let rendered = resolved.to_string();
-        let detail = (rendered != label).then_some(rendered);
+        let detail = match &config {
+            // `off` is the only row whose resolution can be a synonym rather
+            // than a different mode: a model with an explicit opt-out spells off
+            // as `none`, which names no depth and is the one level
+            // `effort_ladder` withholds from the rows.
+            ThinkingConfig::Off => None,
+            _ => (rendered != label).then_some(rendered),
+        };
         Self {
             label,
             detail,
@@ -219,10 +227,11 @@ mod tests {
     use test_case::test_case;
 
     use super::{
-        Cadence, Dirty, Instant, Model, OFF_LABEL, Overlay, ThinkingConfig, ThinkingPicker,
-        ThinkingPickerAction,
+        Cadence, Dirty, Instant, Model, OFF_LABEL, Overlay, ResolvedThinking, ThinkingConfig,
+        ThinkingItem, ThinkingPicker, ThinkingPickerAction,
     };
     use crate::components::{key, test_model};
+    use caudra_storage::thinking::EFFORT_NONE;
 
     const OFF_OFFERED: &str = "a model that can stop reasoning must offer the off row";
     const OFF_WITHHELD: &str = "a model that cannot stop reasoning has no off row to offer";
@@ -233,6 +242,24 @@ mod tests {
     const FLASH_IS_NOT_OPEN: &str = "a flash must not answer to input";
     const FLASH_EXPIRES: &str = "a flash must close itself on the clock";
     const FLASH_OWES_A_FRAME: &str = "a flash must owe the frame that clears it";
+    const OFF_SENDS_THE_OPT_OUT: &str = "off must resolve to the declared opt-out";
+    const OFF_DETAIL_WITHHELD: &str = "the off row must not name the level it sends";
+    const NONE_NOT_A_DEPTH: &str = "an opt-out is not a depth the picker offers";
+    /// The shape a hand-declared ladder takes when the chat template accepts an
+    /// explicit opt-out, which is how `off` comes to resolve to `none`.
+    const OPT_OUT_LEVELS: [&str; 4] = ["none", "low", "medium", "xhigh"];
+
+    fn opt_out_model() -> Model {
+        Model {
+            reasoning_options: ReasoningOptions::new(vec![ReasoningOption::Effort {
+                values: OPT_OUT_LEVELS
+                    .iter()
+                    .map(|level| (*level).to_owned())
+                    .collect(),
+            }]),
+            ..test_model()
+        }
+    }
 
     fn budget_model() -> Model {
         Model {
@@ -248,6 +275,12 @@ mod tests {
         (0..)
             .map_while(|idx| picker.picker.item(idx).map(|item| item.label.clone()))
             .collect()
+    }
+
+    fn row<'a>(picker: &'a ThinkingPicker, label: &str) -> Option<&'a ThinkingItem> {
+        (0..)
+            .map_while(|idx| picker.picker.item(idx))
+            .find(|item| item.label == label)
     }
 
     #[test]
@@ -291,6 +324,38 @@ mod tests {
         picker.open(&required, &ThinkingConfig::Off);
         let selected = picker.picker.selected_item().expect(PRESELECTED);
         assert_eq!(selected.label, "minimal", "{PRESELECTED}");
+    }
+
+    /// A model declaring an explicit opt-out resolves `off` to its own `none`
+    /// spelling. That is the same mode under another name, so naming it would
+    /// read as a second mode, and `none` is the one level the ladder withholds
+    /// from the rows for exactly that reason.
+    #[test]
+    fn the_off_row_does_not_name_the_level_it_sends() {
+        let mut picker = ThinkingPicker::new();
+        picker.open(&opt_out_model(), &ThinkingConfig::Off);
+
+        let off = row(&picker, OFF_LABEL).expect(OFF_OFFERED);
+        assert_eq!(
+            off.resolved,
+            ResolvedThinking::Effort(EFFORT_NONE.to_owned()),
+            "{OFF_SENDS_THE_OPT_OUT}"
+        );
+        assert_eq!(off.detail, None, "{OFF_DETAIL_WITHHELD}");
+        assert!(
+            !labels(&picker).contains(&EFFORT_NONE.to_owned()),
+            "{NONE_NOT_A_DEPTH}"
+        );
+    }
+
+    /// Preselection matches on what a row resolves to, so the synonym has to
+    /// keep landing on the row that sends it.
+    #[test]
+    fn the_off_row_stays_preselected_on_an_opt_out_model() {
+        let mut picker = ThinkingPicker::new();
+        picker.open(&opt_out_model(), &ThinkingConfig::Off);
+        let selected = picker.picker.selected_item().expect(PRESELECTED);
+        assert_eq!(selected.label, OFF_LABEL, "{PRESELECTED}");
     }
 
     /// Two rows resolving to two budgets, so a label match would pick neither.
