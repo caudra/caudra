@@ -181,14 +181,6 @@ impl ContextUsage {
         window.threshold().saturating_sub(self.used())
     }
 
-    pub fn percentage(&self, window: &ContextWindow) -> u32 {
-        if window.tokens == 0 {
-            return 0;
-        }
-        let percentage = u64::from(self.used()) * 100 / u64::from(window.tokens);
-        u32::try_from(percentage).unwrap_or(u32::MAX)
-    }
-
     pub fn over_window(&self, window: &ContextWindow) -> u32 {
         self.used().saturating_sub(window.tokens)
     }
@@ -1973,17 +1965,16 @@ mod tests {
         assert_eq!(window.reserve, expected);
     }
 
-    #[test_case(60, 100, ContextReserve::Enabled(20), 80, 20, 60, 0 ; "within_threshold")]
-    #[test_case(90, 100, ContextReserve::Enabled(20), 80, 0, 90, 0 ; "inside_window_beyond_threshold")]
-    #[test_case(120, 100, ContextReserve::Enabled(20), 80, 0, 120, 20 ; "over_window")]
-    #[test_case(10, 0, ContextReserve::Enabled(0), 0, 0, 0, 10 ; "zero_window")]
+    #[test_case(60, 100, ContextReserve::Enabled(20), 80, 20, 0 ; "within_threshold")]
+    #[test_case(90, 100, ContextReserve::Enabled(20), 80, 0, 0 ; "inside_window_beyond_threshold")]
+    #[test_case(120, 100, ContextReserve::Enabled(20), 80, 0, 20 ; "over_window")]
+    #[test_case(10, 0, ContextReserve::Enabled(0), 0, 0, 10 ; "zero_window")]
     fn usage_helpers_saturate(
         used: u32,
         window_tokens: u32,
         reserve: ContextReserve,
         threshold: u32,
         free: u32,
-        percentage: u32,
         over_window: u32,
     ) {
         let usage = ContextUsage {
@@ -1996,7 +1987,6 @@ mod tests {
         };
         assert_eq!(window.threshold(), threshold);
         assert_eq!(usage.free(&window), free);
-        assert_eq!(usage.percentage(&window), percentage);
         assert_eq!(usage.over_window(&window), over_window);
     }
 

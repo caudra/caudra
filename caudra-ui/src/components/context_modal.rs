@@ -1,6 +1,6 @@
 use caudra_agent::context::{
     ContextBuiltinState, ContextMcpStatus, ContextProfileSource, ContextReadiness, ContextReserve,
-    ContextSnapshot,
+    ContextSnapshot, ContextWindow,
 };
 use caudra_providers::{format_tokens, token_label};
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
@@ -287,10 +287,10 @@ fn summary_lines(snapshot: &ContextSnapshot, width: u16, theme: &Theme) -> Vec<L
         labeled_line(
             "Used",
             format!(
-                "{} / {} tokens ({}%)",
+                "{} / {} tokens ({})",
                 token_label(used),
                 format_tokens(window),
-                snapshot.usage.percentage(&snapshot.window)
+                share_text(used, &snapshot.window)
             ),
             theme,
         ),
@@ -307,7 +307,7 @@ fn summary_lines(snapshot: &ContextSnapshot, width: u16, theme: &Theme) -> Vec<L
                 "{} / {} tokens ({})",
                 format_tokens(measured),
                 format_tokens(window),
-                format_percentage(measured, window)
+                share_text(measured, &snapshot.window)
             ),
             theme,
         ));
@@ -960,6 +960,16 @@ fn horizontal_padding(width: u16) -> u16 {
     (width / H_PAD_STEP_WIDTH).min(H_PAD)
 }
 
+/// A counter beside the border it is racing, as the status bar draws the same
+/// pair, so a reader comparing the two views is comparing one figure.
+fn share_text(tokens: u32, window: &ContextWindow) -> String {
+    let share = format_percentage(tokens, window.tokens);
+    match window.compaction_border() {
+        Some(border) => format!("{share}/{}", format_percentage(border, window.tokens)),
+        None => share,
+    }
+}
+
 fn format_percentage(tokens: u32, window: u32) -> String {
     if window == 0 {
         return "0.0%".to_owned();
@@ -1289,7 +1299,7 @@ mod tests {
         ));
         for expected in [
             "Window  1.0k tokens",
-            "Used  ~600 tokens / 1.0k tokens (60%)",
+            "Used  ~600 tokens / 1.0k tokens (60.0%/90.0%)",
             "S System prompt ~100 tokens (10.0%)",
             "· Free ~300 tokens (30.0%)",
             "░ Reserve 100 tokens (10.0%)",
@@ -1328,7 +1338,7 @@ mod tests {
         snapshot.window.tokens = 0;
         snapshot.usage.messages = u32::MAX;
         let lines = build_lines(Some(&snapshot), false, 0, &theme::current());
-        assert!(text(&lines).contains("(0%)"));
+        assert!(text(&lines).contains("(0.0%/0.0%)"));
         assert_eq!(grid_cells(&snapshot).len(), GRID_CELL_COUNT);
     }
 
@@ -1372,7 +1382,7 @@ mod tests {
         };
         let lines = build_lines(Some(&snapshot), false, 100, &theme::current());
         let rendered = text(&lines);
-        assert!(rendered.contains("(150%)"), "{rendered}");
+        assert!(rendered.contains("(150.0%)"), "{rendered}");
         assert!(rendered.contains("~50 tokens over the model window"));
         assert!(
             grid_cells(&snapshot)
@@ -1388,6 +1398,19 @@ mod tests {
         let lines = build_lines(Some(&snapshot), false, 100, &theme::current());
         assert!(text(&lines).contains("Auto-compact  disabled"));
         assert!(!grid_cells(&snapshot).contains(&GridKind::Reserve));
+    }
+
+    #[test]
+    fn the_compaction_border_rides_beside_the_measured_count() {
+        let mut snapshot = snapshot();
+        snapshot.measured = Some(700);
+        let rendered = text(&build_lines(Some(&snapshot), false, 100, &theme::current()));
+        assert!(rendered.contains("(70.0%/90.0%)"), "{rendered}");
+
+        snapshot.window.reserve = ContextReserve::Disabled;
+        let rendered = text(&build_lines(Some(&snapshot), false, 100, &theme::current()));
+        assert!(rendered.contains("(70.0%)"), "{rendered}");
+        assert!(!rendered.contains("%/"), "{rendered}");
     }
 
     #[test]
