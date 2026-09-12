@@ -119,40 +119,57 @@ fn scope_is_read_only(scope: &ShellCommandScope) -> bool {
     }
 }
 
-/// Reports whether a line can only reach inside the project.
+/// Reports, for each command on a line in source order, whether it only
+/// observes and can only reach inside the project.
 ///
 /// A read-only command still reads, and the project's own read tools are bound
 /// to the project, so granting one without the same bound would make `cat` reach
 /// what `file_read` has to ask about. The workdir is checked too, because Caudra
 /// runs the shell unconfined and a relative operand is only inside when its base
 /// is.
+///
+/// Each command is answered on its own because each is authorized on its own: a
+/// line that runs `cargo` still has to ask about the `cargo`, and the prompt
+/// lists every command, so the reader beside it grants nothing the user did not
+/// already see. Answering for the line as a whole meant one command that writes
+/// cost a prompt for every observer sharing the line, which is what made `cd`
+/// into the directory the shell already sat in ask 1,479 times in this
+/// machine's history.
+///
 /// A `cd` moves the directory every later operand resolves against, so the
-/// scopes are walked in source order carrying that directory rather than judged
-/// independently against the workdir. Workcell sorts them by `start_byte`, and
-/// marks a subshell, an expansion, and a substitution opaque, so a `cd` that
-/// applied to only part of the line never reaches here. One inside a loop or a
-/// conditional is followed as though it ran, which costs a prompt rather than an
-/// allowance.
-pub(crate) fn stays_in_project(
+/// directory is carried across the scopes rather than each being judged against
+/// the workdir. Workcell sorts them by `start_byte`, and marks a subshell, an
+/// expansion, and a substitution opaque, so a `cd` that applied to only part of
+/// the line never reaches here. One inside a loop or a conditional is followed
+/// as though it ran, which costs a prompt rather than an allowance.
+pub(crate) fn confined_reads(
     analysis: &ShellCommandAnalysis,
     workdir: &Path,
     project: &Path,
-) -> bool {
+) -> Vec<bool> {
     if !workdir.starts_with(project) {
-        return false;
+        return vec![false; analysis.scopes.len()];
     }
-    let mut current = workdir.to_path_buf();
+    let mut current = Some(workdir.to_path_buf());
+    let mut confined = Vec::with_capacity(analysis.scopes.len());
     for scope in &analysis.scopes {
+        // A `cd` nothing can place leaves every later operand resolving against
+        // an unknown directory, so it disqualifies the rest of the line rather
+        // than only itself.
+        let Some(directory) = current.take() else {
+            confined.push(false);
+            continue;
+        };
         if scope.executable == CD {
-            match cd_target(scope, &current, project) {
-                Some(target) => current = target,
-                None => return false,
-            }
-        } else if !scope_stays_in_project(scope, &current, project) {
-            return false;
+            current = cd_target(scope, &directory, project);
+            confined.push(current.is_some());
+            continue;
         }
+        confined
+            .push(scope_is_read_only(scope) && scope_stays_in_project(scope, &directory, project));
+        current = Some(directory);
     }
-    true
+    confined
 }
 
 /// Where a `cd` leaves the shell, or `None` when the command does not say, or
@@ -262,11 +279,18 @@ fn hides_in_cluster(argument: &str, flag: &str) -> bool {
 mod tests {
     use std::path::Path;
 
-    use super::{FIND, GIT, RG, SED, is_read_only, stays_in_project};
+    use super::{FIND, GIT, RG, SED, confined_reads, is_read_only};
     use test_case::test_case;
     use workcell::shell::{ShellCommandAnalysis, ShellCommandScope, ShellWord};
 
     const PROJECT: &str = "/home/dev/project";
+
+    /// Whether a whole line is confined, for the cases about how one command's
+    /// operands resolve rather than about which command the answer lands on.
+    fn line_is_confined(analysis: &ShellCommandAnalysis, workdir: &Path, project: &Path) -> bool {
+        let confined = confined_reads(analysis, workdir, project);
+        !confined.is_empty() && confined.iter().all(|command| *command)
+    }
 
     /// Builds what Workcell reports for a line of plain words. Quoting and
     /// expansion are deliberately absent, because decoding them is Workcell's
@@ -396,7 +420,7 @@ mod tests {
     #[test_case("find . -name *.rs" => true ; "a_decoded_glob_is_an_ordinary_argument")]
     #[test_case("rg a.*b src" => true ; "a_decoded_regex_is_not_a_path")]
     fn operands_are_confined_to_the_project(command: &str) -> bool {
-        stays_in_project(
+        line_is_confined(
             &analysis(&[command]),
             Path::new(PROJECT),
             Path::new(PROJECT),
@@ -420,7 +444,7 @@ mod tests {
     #[test_case(&["cd a b", "cat x"] => false ; "two_operands_are_the_substitution_form")]
     #[test_case(&["rg needle src", "cd /tmp"] => false ; "a_trailing_move_counts_too")]
     fn a_directory_change_is_followed(commands: &[&str]) -> bool {
-        stays_in_project(&analysis(commands), Path::new(PROJECT), Path::new(PROJECT))
+        line_is_confined(&analysis(commands), Path::new(PROJECT), Path::new(PROJECT))
     }
 
     /// An undecodable word stands for text that is not in the line, so where it
@@ -428,7 +452,7 @@ mod tests {
     #[test_case(Some(vec![ShellWord::Undecodable]) => false ; "a_word_that_does_not_mean_its_own_text")]
     #[test_case(None => false ; "words_that_were_never_read")]
     fn unreadable_words_are_never_confined(arguments: Option<Vec<ShellWord>>) -> bool {
-        stays_in_project(
+        line_is_confined(
             &one(scope("cat", arguments)),
             Path::new(PROJECT),
             Path::new(PROJECT),
@@ -442,11 +466,21 @@ mod tests {
     #[test_case("/home/dev/other" => false ; "a_sibling_project")]
     #[test_case("/etc" => false ; "somewhere_else_entirely")]
     fn a_workdir_outside_the_project_confines_nothing(workdir: &str) -> bool {
-        stays_in_project(
+        line_is_confined(
             &analysis(&["cat notes.md"]),
             Path::new(workdir),
             Path::new(PROJECT),
         )
+    }
+
+    /// A command with no operands gives the operand check nothing to judge, so
+    /// the workdir is the only thing saying where it reads. Removing the workdir
+    /// bound left every other case passing, because an operand outside the
+    /// project fails on its own resolution.
+    #[test_case("ls" => false ; "a_listing_of_wherever_it_runs")]
+    #[test_case("pwd" => false ; "a_command_naming_the_directory_it_runs_in")]
+    fn a_reader_with_no_operands_is_bound_by_the_workdir(command: &str) -> bool {
+        line_is_confined(&analysis(&[command]), Path::new("/etc"), Path::new(PROJECT))
     }
 
     /// A project can contain a symlink pointing anywhere, and nothing in a
@@ -476,7 +510,7 @@ mod tests {
             .expect("nested link");
         let root = project.path().canonicalize().expect("canonical project");
 
-        stays_in_project(&analysis(commands), &root, &root)
+        line_is_confined(&analysis(commands), &root, &root)
     }
 
     /// The bound is the project, not the directory the command runs from, so a
@@ -491,21 +525,29 @@ mod tests {
         std::fs::write(root.join("docs.md"), "docs").expect("docs");
         std::os::unix::fs::symlink(root.join("docs.md"), workdir.join("link.md")).expect("link");
 
-        assert!(stays_in_project(
+        assert!(line_is_confined(
             &analysis(&["cat link.md"]),
             &workdir,
             &root
         ));
     }
 
-    /// Every command on the line has to stay inside, for the same reason one
-    /// writer taints the line for `is_read_only`.
-    #[test]
-    fn one_escaping_command_taints_the_line() {
-        assert!(!stays_in_project(
-            &analysis(&["cat notes.md", "cat /etc/shadow"]),
-            Path::new(PROJECT),
-            Path::new(PROJECT),
-        ));
+    /// Each command is authorized on its own, so one that escapes or writes
+    /// costs its own prompt and no longer taints the line. Answering for the
+    /// line as a whole is what made a `cd` into the directory the shell already
+    /// sat in ask alongside the `cargo` it preceded.
+    ///
+    /// A `cd` is the one command whose answer reaches the others, because it
+    /// moves what their relative operands resolve against. One that cannot be
+    /// placed leaves the rest unanswerable rather than merely unconfined, so it
+    /// disqualifies them too.
+    #[test_case(&["cat notes.md", "cat /etc/shadow"] => vec![true, false] ; "a_read_beside_one_that_escapes")]
+    #[test_case(&["cat notes.md", "rm -rf build"] => vec![true, false] ; "a_read_beside_a_writer")]
+    #[test_case(&["cargo check", "rg needle src"] => vec![false, true] ; "a_read_after_something_that_executes")]
+    #[test_case(&["cd crates", "cargo build", "cat lib.rs"] => vec![true, false, true] ; "the_reached_directory_survives_a_command_that_executes")]
+    #[test_case(&["cd /tmp", "cat x"] => vec![false, false] ; "a_move_out_of_the_project_disqualifies_the_rest")]
+    #[test_case(&["cd -", "cat notes.md"] => vec![false, false] ; "a_move_nothing_can_place_disqualifies_the_rest")]
+    fn each_command_on_the_line_is_answered_on_its_own(commands: &[&str]) -> Vec<bool> {
+        confined_reads(&analysis(commands), Path::new(PROJECT), Path::new(PROJECT))
     }
 }

@@ -1837,8 +1837,6 @@ fn shell_prepared(
     project: &Path,
 ) -> PreparedInvocation {
     let opaque = shell.analysis().opaque || shell_command_hides_operands(shell.command());
-    let confined_read = read_only_shell::is_read_only(shell.analysis(), opaque)
-        && read_only_shell::stays_in_project(shell.analysis(), shell.workdir(), project);
     let workdir = shell.workdir().to_string_lossy().into_owned();
     let scopes = if opaque || shell.analysis().scopes.is_empty() {
         vec![shell_permission_scope(shell.command(), shell.workdir())]
@@ -1850,19 +1848,33 @@ fn shell_prepared(
             .map(|scope| shell_permission_scope(&scope.source, shell.workdir()))
             .collect()
     };
-    let commands: Vec<(String, Option<String>)> = if opaque || shell.analysis().scopes.is_empty() {
-        vec![(shell.command().into(), None)]
-    } else {
-        shell
-            .analysis()
-            .scopes
-            .iter()
-            .map(|scope| (scope.source.clone(), Some(scope.normalized.clone())))
-            .collect()
-    };
+    // An opaque line describes less than it does, so it stays one resource
+    // holding the whole text, and nothing about it is confined.
+    let commands: Vec<(String, Option<String>, bool)> =
+        if opaque || shell.analysis().scopes.is_empty() {
+            vec![(shell.command().into(), None, false)]
+        } else {
+            shell
+                .analysis()
+                .scopes
+                .iter()
+                .zip(read_only_shell::confined_reads(
+                    shell.analysis(),
+                    shell.workdir(),
+                    project,
+                ))
+                .map(|(scope, confined_read)| {
+                    (
+                        scope.source.clone(),
+                        Some(scope.normalized.clone()),
+                        confined_read,
+                    )
+                })
+                .collect()
+        };
     let resources = commands
         .into_iter()
-        .map(|(command, normalized)| {
+        .map(|(command, normalized, confined_read)| {
             let mut attributes = BTreeMap::from([("workdir".into(), workdir.clone())]);
             if let Some(normalized) = normalized {
                 attributes.insert(NORMALIZED_COMMAND_ATTRIBUTE.into(), normalized);
@@ -3002,7 +3014,7 @@ mod tests {
         matches!(invocation.plan_mode_access(), PlanModeAccess::ReadOnly)
     }
 
-    fn confined_read_preflight_marks(root: &Path, command: &str) -> bool {
+    fn confined_read_preflight_rows(root: &Path, command: &str) -> Vec<bool> {
         let (_host, registry) = host_and_registry(root);
         let ctx = context(root, Arc::clone(&registry), CancelToken::none());
         let invocation = registry
@@ -3016,14 +3028,37 @@ mod tests {
             .expect("shell preflight")
             .expect("shell permission intent");
 
-        !intent.resources.is_empty()
-            && intent.resources.iter().all(|resource| {
+        intent
+            .resources
+            .iter()
+            .map(|resource| {
                 resource
                     .attributes
                     .get(CONFINED_READ_ATTRIBUTE)
                     .map(String::as_str)
                     == Some(CONFINED_READ_VALUE)
             })
+            .collect()
+    }
+
+    fn confined_read_preflight_marks(root: &Path, command: &str) -> bool {
+        let rows = confined_read_preflight_rows(root, command);
+        !rows.is_empty() && rows.iter().all(|resource| *resource)
+    }
+
+    /// The attribute is what the builtin rule turns on, and it is set per
+    /// resource, so only a call through the real preflight shows that a command
+    /// which executes stops tainting the observers beside it. Every row was
+    /// unmarked here until the classifier answered per command, which cost a
+    /// prompt for the `cd` and the `rg` even when the `cargo` was allowed.
+    #[test]
+    fn a_preflight_marks_only_the_commands_that_observe() {
+        let root = TempDir::new().expect("tempdir");
+
+        assert_eq!(
+            confined_read_preflight_rows(root.path(), "cd . && cargo check && rg needle src"),
+            vec![true, false, true]
+        );
     }
 
     #[test]
