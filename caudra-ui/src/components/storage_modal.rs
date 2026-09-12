@@ -52,6 +52,9 @@ pub enum StorageFetchState {
 pub struct StorageReport {
     pub stats: SessionStorageStats,
     pub stores: Vec<StoreEntry>,
+    /// Why this workspace has no store, when that is a verdict rather than an
+    /// absence. Without it an empty list reads as "nothing written yet".
+    pub unavailable: Option<String>,
 }
 
 pub struct StorageModal {
@@ -312,6 +315,12 @@ fn report_lines(
     let mut lines = summary_lines(&report.stats, width, theme);
     lines.extend(database_lines(&report.stats, theme));
     lines.extend(store_lines(&report.stores, expanded, theme));
+    lines.extend(
+        report
+            .unavailable
+            .as_deref()
+            .map(|reason| Line::from(Span::styled(reason.to_owned(), theme.status_notice))),
+    );
     lines
 }
 
@@ -681,9 +690,14 @@ mod tests {
     }
 
     fn report(stores: Vec<StoreEntry>) -> StorageFetchState {
+        report_with(stores, None)
+    }
+
+    fn report_with(stores: Vec<StoreEntry>, unavailable: Option<String>) -> StorageFetchState {
         StorageFetchState::Ready(Box::new(StorageReport {
             stats: stats(),
             stores,
+            unavailable,
         }))
     }
 
@@ -774,6 +788,18 @@ mod tests {
         let rendered = text(&store_lines(&[], false, &theme::current()));
         assert!(rendered.contains(NO_STORES));
         assert!(!rendered.contains("Objects"));
+    }
+
+    /// An empty list reads as "nothing written yet", which is the wrong story
+    /// when the workspace was refused.
+    #[test]
+    fn a_refused_workspace_says_why_it_has_no_store() {
+        const REASON: &str = "workspace is too large to snapshot";
+        const MISSING_REASON: &str = "a refused workspace must explain its empty store list";
+        const WIDTH: u16 = 100;
+        let state = report_with(Vec::new(), Some(REASON.to_owned()));
+        let rendered = text(&build_lines(Some(&state), false, WIDTH, &theme::current()));
+        assert!(rendered.contains(REASON), "{MISSING_REASON}");
     }
 
     #[test]

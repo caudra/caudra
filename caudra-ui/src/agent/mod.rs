@@ -16,9 +16,9 @@ use caudra_agent::prompt::profile::PromptProfileCatalog;
 use caudra_agent::prompt::profile::{BUILTIN_PROFILE_NAME, SystemPromptProfile};
 use caudra_agent::workflow::WorkflowHandle;
 use caudra_agent::{
-    AgentConfig, AgentMode, CancelMap, CancelToken, Envelope, HistorySnapshot, McpCommand,
-    McpConfigErrors, McpHandle, McpSnapshotReader, Nudge, SessionMailbox, SharedHistory,
-    SubagentHistoryStore, ToolOutputLines,
+    AgentConfig, AgentMode, BaselineGate, CancelMap, CancelToken, Envelope, HistorySnapshot,
+    McpCommand, McpConfigErrors, McpHandle, McpSnapshotReader, Nudge, SessionMailbox, SharedHistory,
+    SubagentHistoryStore, ToolOutputLines, WorkspaceBaseline,
 };
 use caudra_config::ModelPolicy;
 use caudra_lua::EventHandle;
@@ -123,6 +123,7 @@ impl AgentHandles {
         system_prompt_profile: Option<Arc<SystemPromptProfile>>,
         prompt_profiles: Arc<PromptProfileCatalog>,
         state_dir: Option<StateDir>,
+        baseline: Arc<WorkspaceBaseline>,
     ) -> Self {
         spawn_agent_internal(
             flume::unbounded(),
@@ -143,6 +144,7 @@ impl AgentHandles {
             system_prompt_profile,
             Arc::clone(&prompt_profiles),
             WorkflowSlot::Fresh(state_dir),
+            baseline,
         )
     }
 
@@ -242,14 +244,6 @@ impl AgentHandles {
         // thing that makes the old loop's in-flight envelopes stale. It lives
         // here so no caller can respawn without it.
         app.run_id += 1;
-        let queue_snapshot_ready = app.state.session.meta.queued_messages.is_empty()
-            || match app.snapshot_history_head() {
-                Ok(()) => true,
-                Err(error) => {
-                    app.flash(format!("Failed to snapshot workspace: {error}"));
-                    false
-                }
-            };
         let slot = model_slot.load();
         if let Err(e) = smol::block_on(slot.provider.reload_auth()) {
             warn!(error = %e, "failed to reload auth, continuing with existing credentials");
@@ -288,14 +282,13 @@ impl AgentHandles {
             app.state.system_prompt_profile.clone(),
             Arc::clone(&self.prompt_profiles),
             workflow,
+            Arc::clone(&app.workspace_baseline),
         );
         let old = mem::replace(self, new);
         // Repoint the app at the new queue before dropping `old`, otherwise the app keeps
         // the last old `QueueSender` alive and the old loop parks in `recv_notify` forever.
         self.apply_to_app(app);
-        if queue_snapshot_ready {
-            app.flush_restored_queue();
-        }
+        app.flush_restored_queue();
         old.cancel();
     }
 
@@ -367,6 +360,7 @@ fn spawn_agent_internal(
     system_prompt_profile: Option<Arc<SystemPromptProfile>>,
     prompt_profiles: Arc<PromptProfileCatalog>,
     workflow: WorkflowSlot,
+    baseline: Arc<WorkspaceBaseline>,
 ) -> AgentHandles {
     let (cmd_tx, cmd_rx) = flume::unbounded::<AgentCommand>();
     let (answer_tx, answer_rx) = match &workflow {
@@ -432,6 +426,7 @@ fn spawn_agent_internal(
                         context_publisher: context_publisher.clone(),
                         answer: (answer_tx.clone(), Arc::clone(&answer_rx)),
                         events: agent_tx.clone(),
+                        baseline: Some(BaselineGate::new(Arc::clone(&baseline), None)),
                     })
                 })
         }
@@ -477,6 +472,7 @@ fn spawn_agent_internal(
         Arc::clone(&prompt_profiles),
         workflow.as_ref().map(WorkflowSession::handle),
         mode,
+        baseline,
     );
 
     let task = smol::spawn(async move {
@@ -719,6 +715,13 @@ mod tests {
             None,
             Arc::new(PromptProfileCatalog::default()),
             None,
+            WorkspaceBaseline::new(
+                Arc::new(caudra_agent::snapshots::SnapshotStore::new(
+                    std::env::temp_dir().join("caudra-agent-test-snapshots"),
+                )),
+                PathBuf::from("/tmp"),
+                true,
+            ),
         );
         (handles, model_slot, permissions)
     }

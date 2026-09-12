@@ -1,14 +1,12 @@
 //! Queue for messages typed while the agent is busy.
 
 use std::borrow::Cow;
-use std::path::PathBuf;
-use std::sync::Arc;
 
 use caudra_agent::AgentInput;
 use caudra_agent::{PromptAdmission, QueueDelivery, QueueItemId, is_run_failure_marker};
 use caudra_providers::{HistoryItemKind, ImageMediaType, ImageSource};
 
-use super::{Action, App, PendingRun, Status, format_with_images};
+use super::{Action, App, Status, format_with_images};
 
 use crate::agent::shared_queue::{QueueItem, QueueSender};
 use crate::components::input::{InputAction, InputState, Submission};
@@ -1250,58 +1248,17 @@ impl App {
         // New work supersedes text held for recovery after an agent error.
         self.recoverable_queue.clear();
         self.recoverable_queue_together = false;
-        // Streaming from here, before the snapshot lands, so the spinner runs
-        // and a second submit queues instead of racing a second run.
+        // Streaming from here, so the spinner runs and a second submit queues
+        // instead of racing a second run.
         self.status = Status::Streaming;
-        let run_id = self.run_id;
-        self.pending_run = Some(PendingRun {
-            run_id,
-            input,
-            display,
-        });
-        vec![Action::SnapshotWorkspace {
-            run_id,
-            store: Arc::clone(&self.snapshot_store),
-            cwd: PathBuf::from(&self.state.session.cwd),
-            head: self.history_head(),
-        }]
-    }
-
-    /// Whether a working-tree capture is between dispatch and reply.
-    ///
-    /// `pending_run` already brackets exactly that window, so the status bar
-    /// reads it rather than carrying a second flag that could disagree.
-    pub(crate) fn is_snapshotting(&self) -> bool {
-        self.pending_run.is_some()
-    }
-
-    /// Second half of [`Self::start_run`], resumed once the capture is done.
-    /// A failure leaves the run unstarted, matching the inline behaviour it
-    /// replaces: the user sees a flash and no message bubble.
-    pub(crate) fn on_workspace_snapshot(
-        &mut self,
-        run_id: u64,
-        result: Result<(), String>,
-    ) -> Vec<Action> {
-        let Some(pending) = self.pending_run.take_if(|run| run.run_id == run_id) else {
-            return Vec::new();
-        };
-        if let Err(error) = result {
-            self.flash(format!("Failed to snapshot workspace: {error}"));
-            self.status = Status::Idle;
-            // The bubble was never drawn and the queue never saw this text, so
-            // dropping `pending` here is the only thing standing between the
-            // user and losing what they typed.
-            if !pending.display.is_empty() {
-                self.input_box.buffer.insert_text(&pending.display);
-            }
-            return Vec::new();
-        }
+        // No workspace capture here: the agent takes one behind the first tool
+        // call that could change a file, so a turn that only reads or only
+        // talks costs nothing and the run starts without waiting on a walk.
         self.fire_session_autocmd("TurnStart", serde_json::json!({}));
-        if !pending.display.is_empty() {
-            self.main_chat().show_user_message(pending.display);
+        if !display.is_empty() {
+            self.main_chat().show_user_message(display);
         }
-        vec![Action::SendMessage(Box::new(pending.input))]
+        vec![Action::SendMessage(Box::new(input))]
     }
 }
 

@@ -42,6 +42,7 @@ use crate::tools::{
     ToolEffect, ToolFilter,
 };
 use crate::types::WorkflowProvenance;
+use crate::workspace_baseline::BaselineGate;
 use crate::{AgentConfig, AgentMode, EventSender};
 
 const STRUCTURED_OUTPUT_DESCRIPTION: &str =
@@ -409,6 +410,9 @@ pub struct WorkflowHostContext {
     pub model: ModelResolver,
     pub permissions: Arc<PermissionManager>,
     pub path_locks: Arc<PathLocks>,
+    /// The session's revert point, so an agent a workflow launches captures it
+    /// before its first write just like one the user's run launched.
+    pub baseline: Option<BaselineGate>,
     pub subagent_history: SubagentHistoryStore,
     pub registry: Arc<ToolRegistry>,
     pub config: AgentConfig,
@@ -454,6 +458,7 @@ impl WorkflowHostContext {
             model,
             permissions: Arc::clone(&params.permissions),
             path_locks: Arc::clone(&params.path_locks),
+            baseline: params.baseline.clone(),
             subagent_history: params.subagent_history.clone(),
             registry: Arc::clone(&params.registry),
             config: params.config.clone(),
@@ -487,6 +492,7 @@ impl WorkflowHostContext {
             model,
             permissions: Arc::clone(&ctx.permissions),
             path_locks: Arc::clone(&ctx.path_locks),
+            baseline: ctx.baseline.clone(),
             subagent_history: ctx.subagent_history.clone(),
             registry: Arc::clone(&ctx.registry),
             config: ctx.config.clone(),
@@ -564,6 +570,7 @@ impl WorkflowHostContext {
             timeouts: self.timeouts,
             file_tracker: FileReadTracker::fresh(),
             path_locks: Arc::clone(&self.path_locks),
+            baseline: self.baseline.clone(),
             prompt_slots: Arc::clone(&self.prompt_slots),
             prompt_profiles: Arc::clone(&self.prompt_profiles),
             default_task_prompt_profile_name: Arc::clone(&self.default_task_prompt_profile_name),

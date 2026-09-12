@@ -139,13 +139,32 @@ Sending a prompt after revert creates a new branch from that point. The abandone
 
 ## File snapshots
 
-Caudra creates a session-start snapshot before the first top-level run. It snapshots the current history head before each later run and the resulting head after completion or cancellation. Reusing a head refreshes its pre-run snapshot, so edits made while idle are included. A file restore selects the nearest available snapshot at or before the chosen item. Several parallel tool calls therefore share one safe run checkpoint.
+Caudra captures the session-start snapshot on the first tool call that may change a file, together with the history head that call's run started from. A turn that only talks, and a turn whose tools only read, capture nothing and leave no store on disk. After each run completes or is cancelled, Caudra snapshots the resulting head, and it does the same on exit, in both cases only for a session that already has a session-start snapshot to bracket.
+
+A capture must finish before the call that triggered it runs, so the file it is about to overwrite is recorded first. If the capture fails, that one tool call fails and the rest of the turn continues. Parallel calls share one capture: the first to arrive takes it and the others wait.
+
+A file restore selects the nearest available snapshot at or before the chosen item, so several parallel tool calls share one safe run checkpoint.
 
 Snapshots are content-addressed with SHA-256 and stored under the Caudra state directory in `session-snapshots/<session-id>/<workspace-hash>/`. The object store contains the complete file bytes under their hashes. A checkpoint manifest maps each relative path to its object hash and Unix mode. Unchanged files reuse the same object instead of storing another copy.
 
-Each session workspace has a 512 MiB retention target. Old checkpoint manifests are removed first. The session-start anchor and data needed by an active revert remain available, so protected data can exceed the target.
+### Limits
 
-In a Git worktree, snapshot walks follow Git ignore rules. Outside Git, Caudra walks all regular files below the session directory. `.git`, symlinks, special files, and paths outside the session directory are not captured. Changing a path between captured and ignored or symlink state is outside the restore guarantee because manifests cannot distinguish that state from absence.
+Snapshot walks follow `.gitignore`, `.ignore`, the global Git ignore file, and `.git/info/exclude`, whether or not the workspace is a Git repository. Nested repositories, `.git`, symlinks, special files, and paths outside the session directory are not captured, and the walk does not cross a filesystem boundary. Changing a path between captured and ignored or symlink state is outside the restore guarantee because manifests cannot distinguish that state from absence.
+
+Objects are stored uncompressed, so a workspace larger than its retention target would sit over budget from the first capture. Caudra measures the tree while walking it and refuses one that does not fit:
+
+| Setting | Default | Effect |
+| --- | --- | --- |
+| `storage.snapshots.enabled` | `true` | `false` turns capture off for every workspace |
+| `storage.snapshots.max_bytes_mb` | `512` | Both the walk ceiling and the retention target |
+| `storage.snapshots.max_files` | `50000` | Walk ceiling on file count |
+| `storage.snapshots.max_file_bytes_mb` | `100` | Files above this are skipped, and the rest of the tree is still captured |
+
+Caudra also refuses a filesystem root and a home directory outright.
+
+A refusal costs file revert rather than the user's work: the tool call proceeds, Caudra reports the reason once, and `/storage` shows it alongside the empty store. The verdict is decided once per workspace and is not re-paid on later calls. Conversation revert is unaffected.
+
+Old checkpoint manifests are removed first when a store passes its retention target. The session-start anchor and data needed by an active revert remain available, so protected data can exceed the target.
 
 Restore compares the current file hash and mode with the source snapshot. If a tracked path changed outside the captured run, restore aborts and reports a conflict. Caudra does not overwrite it automatically. Conversation-only revert remains available when file restore cannot proceed.
 

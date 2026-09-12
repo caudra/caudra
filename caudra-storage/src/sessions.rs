@@ -314,6 +314,11 @@ pub struct SessionMeta {
     /// makes `--yolo` a property of the invocation rather than of the log.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub yolo: Option<bool>,
+    /// Why this workspace has no file revert, once something decided so. Kept
+    /// on the session because the verdict is worth reporting after a restart
+    /// and is not worth re-deciding by walking the tree again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshots_unavailable: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

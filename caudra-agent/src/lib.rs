@@ -44,6 +44,7 @@ pub mod tools;
 pub use tools::ToolFilter;
 pub mod types;
 pub mod workflow;
+pub mod workspace_baseline;
 pub use stored_session::{
     StoredSession, latest_stored_session, load_stored_session, open_stored_session,
 };
@@ -53,6 +54,7 @@ pub use subagent_history::{
     active_task_history_versions, active_task_history_versions_with_batch_state,
     batch_task_history_versions, history_tool_call_ids,
 };
+pub use workspace_baseline::{BaselineGate, BaselineOutcome, WorkspaceBaseline};
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

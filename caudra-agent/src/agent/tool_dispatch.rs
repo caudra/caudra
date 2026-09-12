@@ -16,6 +16,7 @@ use crate::tools::{
     DOOM_LOOP_MESSAGE, LocalToolEntry, READ_ONLY_TOOL_RESTRICTED, TOOL_SEARCH_TOOL_NAME,
     ToolContext, ToolEffect,
 };
+use crate::workspace_baseline::BaselineOutcome;
 use crate::{AgentError, AgentEvent, LuaToolProvenance, ToolDoneEvent, ToolOutput, ToolStartEvent};
 use caudra_config::ToolKey;
 use caudra_providers::INVALID_TOOL_JSON_KEY;
@@ -64,6 +65,8 @@ const SHELL_TOOL: &str = "shell";
 const BASH_COMMAND_FIELD: &str = "command";
 const GIT_COMMIT: &str = "git commit";
 const GH_PR_CREATE: &str = "gh pr create";
+
+const SNAPSHOT_FAILED: &str = "could not snapshot the workspace before changing it";
 
 const ERROR_CANCELLED: &str = "cancelled";
 const ERROR_TIMEOUT: &str = "timeout";
@@ -344,6 +347,10 @@ async fn run_inner(
 
         invocation.start(ctx).await;
 
+        if let Err(message) = ensure_revert_point(ctx, call_effect).await {
+            return done_error(message);
+        }
+
         // Taken after the permission verdict, so a prompt never blocks a
         // sibling's write, and after the start event, so a call waiting on a
         // contended file still renders as a running row. Held across execute:
@@ -414,6 +421,9 @@ async fn run_inner(
             format!("mcp: {mcp_lookup}"),
             input,
         );
+        if let Err(message) = ensure_revert_point(ctx, ToolEffect::Unknown).await {
+            return done_error(message);
+        }
         execute_mcp_tool(ctx, &id, tool_id, mcp_lookup, input).await
     } else {
         let msg = format!("{UNKNOWN_TOOL_PREFIX}: {mcp_lookup}");
@@ -572,12 +582,15 @@ async fn run_local_tool(
         tool_use_id: Some(id.clone()),
         ..ctx.clone()
     };
-    let (output, is_error) = match local.call(input.clone(), tool_ctx).await {
-        Ok(output) => (output, false),
-        Err(e) => {
-            warn!(tool = %name, error = %e, "local tool failed");
-            (e, true)
-        }
+    let (output, is_error) = match ensure_revert_point(ctx, local.effect).await {
+        Err(message) => (message, true),
+        Ok(()) => match local.call(input.clone(), tool_ctx).await {
+            Ok(output) => (output, false),
+            Err(e) => {
+                warn!(tool = %name, error = %e, "local tool failed");
+                (e, true)
+            }
+        },
     };
     let mut output = ToolOutput::Plain(output.into());
     output.set_lua_provenance(LuaToolProvenance {
@@ -598,6 +611,28 @@ async fn run_local_tool(
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+    }
+}
+
+/// The workspace as it stands before the first call of this session that could
+/// change it, which is what a file revert restores.
+///
+/// Asked after the permission verdict, so a denied call captures nothing, and
+/// before execution, so no file changes ahead of the record of its old contents.
+/// A call that cannot change a file skips it, which is the whole point: a
+/// conversational turn leaves no store on disk.
+async fn ensure_revert_point(ctx: &ToolContext, effect: ToolEffect) -> Result<(), String> {
+    if effect.is_safe_in_read_only() {
+        return Ok(());
+    }
+    let Some(gate) = ctx.baseline.as_ref() else {
+        return Ok(());
+    };
+    match gate.ensure().await {
+        // A workspace Caudra will not snapshot costs file revert, not the
+        // user's work, and it has already said so once.
+        BaselineOutcome::Ready | BaselineOutcome::Unavailable(_) => Ok(()),
+        BaselineOutcome::Failed(error) => Err(format!("{SNAPSHOT_FAILED}: {error}")),
     }
 }
 
@@ -980,6 +1015,7 @@ mod tests {
     use super::*;
     use crate::AgentMode;
     use crate::permissions::{PERMISSION_DENIED_PREFIX, PermissionManager};
+    use crate::snapshots::{SnapshotLimits, SnapshotStore};
     use crate::tools::registry::ToolSource;
     use crate::tools::test_support::{GUARDED_TOOL_NAME, GuardedMock};
 
@@ -2468,6 +2504,144 @@ mod tests {
                 !executed.load(Ordering::SeqCst),
                 "execute must not run after denial"
             );
+        });
+    }
+
+    const BASELINE_TOOL: &str = "baseline_probe";
+    const NO_CAPTURE_MSG: &str = "a call that cannot change a file captures nothing";
+    const CAPTURE_MSG: &str = "a call that can change a file captures first";
+    const PROCEED_MSG: &str = "a refused workspace costs revert, not the call";
+    const BLOCKED_MSG: &str = "a failed capture leaves nothing to revert to, so nothing may change";
+
+    /// A store under a regular file can never be created, which is the one
+    /// capture failure a test can provoke without racing the filesystem.
+    enum BaselineStore {
+        Usable(SnapshotLimits),
+        Broken,
+    }
+
+    fn baseline_ctx(
+        effect: ToolEffect,
+        store: BaselineStore,
+        executed: Arc<AtomicBool>,
+    ) -> (TempDir, ToolContext, Arc<SnapshotStore>) {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("tracked.txt"), "alpha").unwrap();
+        let store = match store {
+            BaselineStore::Usable(limits) => {
+                Arc::new(SnapshotStore::new(temp.path().join("snapshots")).with_limits(limits))
+            }
+            BaselineStore::Broken => {
+                let path = temp.path().join("not-a-directory");
+                std::fs::write(&path, "").unwrap();
+                Arc::new(SnapshotStore::new(path))
+            }
+        };
+        let baseline =
+            crate::workspace_baseline::WorkspaceBaseline::new(Arc::clone(&store), root, true);
+        let mut ctx = crate::tools::test_support::stub_ctx(&AgentMode::Build);
+        ctx.baseline = Some(crate::workspace_baseline::BaselineGate::new(baseline, None));
+        ctx.local_tools = Arc::new(HashMap::from([(
+            BASELINE_TOOL.to_owned(),
+            crate::tools::audited_local_tool(effect, move |_input, _ctx| {
+                let executed = Arc::clone(&executed);
+                Box::pin(async move {
+                    executed.store(true, Ordering::SeqCst);
+                    Ok(String::new())
+                })
+            }),
+        )]));
+        (temp, ctx, store)
+    }
+
+    async fn run_baseline_probe(ctx: &ToolContext) -> ToolDoneEvent {
+        run(
+            ToolRegistry::global(),
+            None,
+            "t1".into(),
+            BASELINE_TOOL,
+            &serde_json::json!({}),
+            ctx,
+            Emit::Silent,
+        )
+        .await
+    }
+
+    #[test_case(ToolEffect::ReadOnly, false ; "read_only")]
+    #[test_case(ToolEffect::Isolated, false ; "isolated")]
+    #[test_case(ToolEffect::Mutating, true  ; "mutating")]
+    #[test_case(ToolEffect::Unknown,  true  ; "unclassified")]
+    fn only_a_call_that_could_change_a_file_captures_a_baseline(
+        effect: ToolEffect,
+        expect_capture: bool,
+    ) {
+        smol::block_on(async {
+            let executed = Arc::new(AtomicBool::new(false));
+            let (_temp, ctx, store) = baseline_ctx(
+                effect,
+                BaselineStore::Usable(SnapshotLimits::default()),
+                Arc::clone(&executed),
+            );
+
+            let done = run_baseline_probe(&ctx).await;
+
+            assert!(!done.is_error, "{}", done.output.as_text());
+            assert!(executed.load(Ordering::SeqCst), "{CAPTURE_MSG}");
+            assert_eq!(
+                store.has_session_start(),
+                expect_capture,
+                "{}",
+                if expect_capture {
+                    CAPTURE_MSG
+                } else {
+                    NO_CAPTURE_MSG
+                }
+            );
+        });
+    }
+
+    #[test]
+    fn a_refused_workspace_runs_the_call_without_a_baseline() {
+        smol::block_on(async {
+            let executed = Arc::new(AtomicBool::new(false));
+            let (_temp, ctx, store) = baseline_ctx(
+                ToolEffect::Mutating,
+                BaselineStore::Usable(SnapshotLimits {
+                    max_files: 0,
+                    ..SnapshotLimits::default()
+                }),
+                Arc::clone(&executed),
+            );
+
+            let done = run_baseline_probe(&ctx).await;
+
+            assert!(!done.is_error, "{PROCEED_MSG}: {}", done.output.as_text());
+            assert!(executed.load(Ordering::SeqCst), "{PROCEED_MSG}");
+            assert!(!store.has_session_start(), "{PROCEED_MSG}");
+        });
+    }
+
+    #[test]
+    fn a_failed_capture_blocks_the_call() {
+        smol::block_on(async {
+            let executed = Arc::new(AtomicBool::new(false));
+            let (_temp, ctx, _store) = baseline_ctx(
+                ToolEffect::Mutating,
+                BaselineStore::Broken,
+                Arc::clone(&executed),
+            );
+
+            let done = run_baseline_probe(&ctx).await;
+
+            assert!(done.is_error, "{BLOCKED_MSG}");
+            assert!(
+                done.output.as_text().contains(SNAPSHOT_FAILED),
+                "{BLOCKED_MSG}: {}",
+                done.output.as_text()
+            );
+            assert!(!executed.load(Ordering::SeqCst), "{BLOCKED_MSG}");
         });
     }
 }

@@ -182,6 +182,17 @@ The `bash`, `python_execution`, and `task` entries apply only when `ui.scroll_ca
 
 `trim` and `forget` are keep policies in `restic forget` terms: `keep_last`, `keep_hourly`, `keep_daily`, `keep_weekly`, `keep_monthly`, `keep_yearly` take a count, and `keep_within` plus `keep_within_hourly` through `keep_within_yearly` take a duration such as `"90d"` or `"2y5m7d3h"`. A session is kept when any rule matches. An empty `forget` policy disables automatic deletion. See [Sessions](/docs/sessions/#retention) for what each tier keeps and how the sweep runs.
 
+### `storage.snapshots`
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | bool | `true` | Capture workspace snapshots. `false` keeps existing snapshots restorable but takes no new ones, so file revert stops covering new work |
+| `max_bytes_mb` | u64 | `512` | Largest working tree a capture will take, and the cap on one session's object store. A workspace above it loses file revert rather than paying for a snapshot the store cannot keep |
+| `max_files` | u64 | `50000` | Most files a capture will take, counted after ignore rules |
+| `max_file_bytes_mb` | u64 | `100` | Largest single file a capture will take. A bigger one is left out of the snapshot and left alone on disk, so it cannot be reverted |
+
+A workspace over `max_bytes_mb` or `max_files` is refused rather than captured, and individual files over `max_file_bytes_mb` are skipped while the rest of the tree is still captured. A refusal costs file revert and lets the tool call proceed. See [Sessions](/docs/sessions/#limits) for what a capture covers.
+
 ### `telemetry`
 
 | Field | Type | Default | Env | Description |

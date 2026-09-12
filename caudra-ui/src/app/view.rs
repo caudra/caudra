@@ -642,7 +642,6 @@ impl App {
             workflows: workflow_chip(self.workflow.runs()),
             yolo: self.permissions.is_yolo(),
             restoring: self.restoring.load(Ordering::Relaxed),
-            snapshotting: self.is_snapshotting(),
             goal: goal.as_ref(),
             bash_input: self.is_bash_input(),
             hovered: (!self.has_modal_overlay())

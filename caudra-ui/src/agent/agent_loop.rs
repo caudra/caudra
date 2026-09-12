@@ -20,10 +20,10 @@ use caudra_agent::tools::{
 };
 use caudra_agent::workflow::WorkflowHandle;
 use caudra_agent::{
-    Agent, AgentConfig, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, CancelMap,
-    CancelToken, CancelTrigger, DoneReason, Envelope, EventSender, GoalHandle, History,
-    InstructionBaseline, Instructions, McpCommand, Nudge, PromptRole, SessionMailbox,
-    SharedHistory, SubagentHistoryStore, ToolOutputLines,
+    Agent, AgentConfig, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams,
+    BaselineGate, CancelMap, CancelToken, CancelTrigger, DoneReason, Envelope, EventSender,
+    GoalHandle, History, InstructionBaseline, Instructions, McpCommand, Nudge, PromptRole,
+    SessionMailbox, SharedHistory, SubagentHistoryStore, ToolOutputLines, WorkspaceBaseline,
 };
 use caudra_config::ModelPolicy;
 use caudra_lua::EventHandle;
@@ -79,6 +79,9 @@ pub(super) struct AgentLoop {
     /// Published on every run so workflow agents start under the mode the
     /// user last committed, however long ago their run was launched.
     mode: SharedMode,
+    /// Armed per run with the head the run starts from, and consulted by the
+    /// first tool call that could change a file.
+    baseline: Arc<WorkspaceBaseline>,
 }
 
 impl AgentLoop {
@@ -112,6 +115,7 @@ impl AgentLoop {
         prompt_profiles: Arc<PromptProfileCatalog>,
         workflow: Option<WorkflowHandle>,
         mode: SharedMode,
+        baseline: Arc<WorkspaceBaseline>,
     ) -> Self {
         let restored_history = History::restored(initial_history);
         let initial_messages = restored_history
@@ -163,6 +167,7 @@ impl AgentLoop {
             prompt_profiles,
             workflow,
             mode,
+            baseline,
         }
     }
 
@@ -505,6 +510,12 @@ impl AgentLoop {
                 timeouts: self.timeouts,
                 file_tracker: Arc::clone(&self.file_tracker),
                 path_locks: Arc::clone(&self.path_locks),
+                // The head as it stands before this run's input is appended, so
+                // a capture the run triggers later still brackets the run.
+                baseline: Some(BaselineGate::new(
+                    Arc::clone(&self.baseline),
+                    self.history.item_head(),
+                )),
                 prompt_slots: Arc::new(prompt_slots),
                 prompt_profiles: Arc::clone(&self.prompt_profiles),
                 default_task_prompt_profile_name: Arc::clone(&active_prompt_profile_name),

@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
@@ -395,6 +396,7 @@ impl App {
             },
             goal_continuation_limit: Some(state.goal.continuation_limit()),
             yolo: self.permissions.persisted_yolo(),
+            snapshots_unavailable: self.snapshots_unavailable.clone(),
         }
     }
 
@@ -768,13 +770,6 @@ impl App {
         );
         self.apply_stored_yolo(&self.state.session.meta);
         self.restore_display();
-        if !self.state.session.meta.queued_messages.is_empty()
-            && let Err(error) = self.snapshot_history_head()
-        {
-            self.status_bar
-                .flash(format!("Failed to snapshot workspace: {error}"));
-            return;
-        }
         self.flush_restored_queue();
         for w in self.state.warnings.drain(..) {
             self.status_bar.flash(w);
@@ -820,6 +815,7 @@ impl App {
             &self.storage,
             replacement.id,
             std::path::Path::new(&replacement.cwd),
+            self.snapshots_config.into(),
         ) {
             Ok(store) => store,
             Err(error) => {
@@ -850,8 +846,9 @@ impl App {
         // that just ended needs its id, and the stamp always reads
         // whichever session is current.
         self.fire_session_autocmd("SessionReset", serde_json::json!({}));
+        let replacement_cwd = PathBuf::from(&replacement.cwd);
         self.state.session = Arc::new(replacement);
-        self.snapshot_store = replacement_store;
+        self.rebind_workspace_baseline(replacement_store, replacement_cwd);
         caudra_otel::emit::session_started(
             caudra_otel::emit::START_FRESH,
             Some(&self.state.session.id.to_string()),
@@ -923,6 +920,19 @@ impl App {
             self.status_bar.flash(REVERT_BUSY_MSG.into());
             return Vec::new();
         }
+        // Say why the files cannot move, then do the half that can. A raw
+        // not-found out of the store names a missing manifest rather than the
+        // reason there is no manifest to miss.
+        let mode = match self.file_revert_blocker().filter(|_| mode.restores_files()) {
+            None => mode,
+            Some(blocker) => {
+                self.status_bar.flash(blocker);
+                if !mode.restores_conversation() {
+                    return Vec::new();
+                }
+                RestoreMode::Conversation
+            }
+        };
         self.checkpoint_now();
         let conversation_source = crate::session_history_head(&self.state.session);
         let target = match resolve_revert_target(
@@ -1517,9 +1527,13 @@ impl App {
                 })?;
         }
 
-        let child_snapshots =
-            Self::snapshot_store_for(&self.storage, child.id, std::path::Path::new(&child.cwd))
-                .map_err(|error| format!("Failed to initialize workspace snapshots: {error}"))?;
+        let child_snapshots = Self::snapshot_store_for(
+            &self.storage,
+            child.id,
+            std::path::Path::new(&child.cwd),
+            self.snapshots_config.into(),
+        )
+        .map_err(|error| format!("Failed to initialize workspace snapshots: {error}"))?;
         self.snapshot_store
             .copy_ancestry_to(
                 &child_snapshots,
@@ -1572,6 +1586,7 @@ impl App {
             &self.storage,
             session.id,
             std::path::Path::new(&session.cwd),
+            self.snapshots_config.into(),
         )
         .map_err(|error| format!("Failed to initialize workspace snapshots: {error}"))?;
         recover_pending_workspace_restore(&mut session, &snapshot_store, &self.storage_writer)?;
@@ -1582,7 +1597,8 @@ impl App {
         self.apply_stored_yolo(&session.meta);
         self.state =
             SessionState::from_session(session, fallback_model, &self.storage, &self.model_policy);
-        self.snapshot_store = snapshot_store;
+        let cwd = PathBuf::from(&self.state.session.cwd);
+        self.rebind_workspace_baseline(snapshot_store, cwd);
         for w in self.state.warnings.drain(..) {
             self.status_bar.flash(w);
         }

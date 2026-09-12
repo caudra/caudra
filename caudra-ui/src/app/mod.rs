@@ -96,13 +96,16 @@ use caudra_agent::permissions::{
     PermissionAnswer, PermissionManager, PermissionPolicyError, RevokedRuleScope,
 };
 use caudra_agent::prompt::profile::PromptProfileCatalog;
-use caudra_agent::snapshots::{SESSION_SNAPSHOTS_DIR, SnapshotError, SnapshotStore, workspace_key};
+use caudra_agent::snapshots::{
+    SESSION_SNAPSHOTS_DIR, SnapshotError, SnapshotLimits, SnapshotStore, workspace_key,
+};
+use caudra_agent::workspace_baseline::WorkspaceBaseline;
 use caudra_agent::{
     AgentEvent, AgentInput, AgentMode, Envelope, GoalVerdict, ImageSource, McpConfigErrors,
     McpPromptInfo, McpSnapshotReader, Mention, PromptAdmission, QueueItemId, SharedHistory,
     SteeringQueue, SubagentInfo,
 };
-use caudra_config::{ModelPolicy, PermissionsConfig, UiConfig};
+use caudra_config::{ModelPolicy, PermissionsConfig, SnapshotsConfig, UiConfig};
 use caudra_lua::{
     BuiltinAction, EventHandle, HintReader, HintSnapshot, KeymapReader, LuaCommandReader, WinView,
 };
@@ -151,6 +154,8 @@ const SKILLS_USAGE: &str = "Usage: /skills";
 const AUTH_EXPIRED_MSG: &str = "Authentication failed. Run `caudra auth login` in another terminal; Caudra will resume automatically, or press Enter to retry now.";
 const COPY_FAILED: &str = "Copy failed: ";
 const FLASH_NO_PLAN: &str = "No plan file";
+const NO_FILE_REVERT_MSG: &str = "No file revert for this workspace";
+const NO_FILE_CHANGES_MSG: &str = "Nothing has written to this workspace, so there are no file changes to revert";
 const FAST_UNSUPPORTED_MSG: &str = "Fast mode requires an Anthropic Opus 4.6+ model (API only)";
 const THINKING_UNSUPPORTED_MSG: &str = "Thinking requires a model that supports it";
 const FAST_ON_MSG: &str = "Fast mode: on";
@@ -380,7 +385,6 @@ pub struct App {
     pub(super) pending_input: PendingInput,
     pub(crate) run_id: u64,
     pub(crate) cancelling_run: Option<u64>,
-    pub(super) pending_run: Option<PendingRun>,
     replacement_item: Option<QueueItemId>,
     pub(super) retry_info: Option<RetryInfo>,
     goal_deferred: bool,
@@ -395,6 +399,15 @@ pub struct App {
 
     pub(crate) storage: StateDir,
     pub(crate) snapshot_store: Arc<SnapshotStore>,
+    /// Shared with this session's agents, which is what lets the first mutating
+    /// tool call capture the revert point the UI later restores from.
+    pub(crate) workspace_baseline: Arc<WorkspaceBaseline>,
+    /// Mirrors the baseline's refusal, so the poller can tell a new verdict
+    /// from the one it already reported.
+    pub(crate) snapshots_unavailable: Option<String>,
+    /// Set by the event loop after construction, like `live_sessions`: every
+    /// store this session opens later has to agree with the one it started with.
+    pub(crate) snapshots_config: SnapshotsConfig,
     pub(crate) usage_slot: Arc<ArcSwapOption<UsageFetchState>>,
     pub(crate) storage_slot: Arc<ArcSwapOption<StorageFetchState>>,
     pub(crate) shared_history: Option<SharedHistory>,
@@ -435,29 +448,6 @@ struct PendingSteer {
     draft: InputDraft,
 }
 
-/// A run held between its workspace snapshot being dispatched and that
-/// snapshot landing. `run_id` is what makes a snapshot from a superseded run
-/// stale, so a cancel that bumps `run_id` also drops the reply.
-pub(super) struct PendingRun {
-    run_id: u64,
-    input: AgentInput,
-    display: String,
-}
-
-/// Session start plus the current head, the pair a revert needs to bracket a
-/// run. Free of `App` so the submit path can run it on a blocking thread.
-pub(crate) fn capture_history_head(
-    store: &SnapshotStore,
-    cwd: &Path,
-    head: Option<CaudraId>,
-) -> Result<(), SnapshotError> {
-    store.snapshot_session_start(cwd)?;
-    if let Some(head) = head {
-        store.snapshot(cwd, head)?;
-    }
-    Ok(())
-}
-
 impl App {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -465,6 +455,7 @@ impl App {
         session: AppSession,
         storage: StateDir,
         snapshot_store: Arc<SnapshotStore>,
+        workspace_baseline: Arc<WorkspaceBaseline>,
         available_models: Arc<ArcSwapOption<Vec<String>>>,
         mcp_reader: McpSnapshotReader,
         mcp_config_errors: McpConfigErrors,
@@ -589,7 +580,6 @@ impl App {
             pending_input: PendingInput::None,
             run_id: 0,
             cancelling_run: None,
-            pending_run: None,
             replacement_item: None,
             retry_info: None,
             goal_deferred: false,
@@ -601,6 +591,9 @@ impl App {
             last_exit: None,
             storage,
             snapshot_store,
+            workspace_baseline,
+            snapshots_unavailable: None,
+            snapshots_config: SnapshotsConfig::default(),
             usage_slot: Arc::new(ArcSwapOption::empty()),
             storage_slot: Arc::new(ArcSwapOption::empty()),
             shared_history: None,
@@ -644,11 +637,15 @@ impl App {
         storage: &StateDir,
         session_id: caudra_storage::id::CaudraId,
         cwd: &std::path::Path,
+        limits: SnapshotLimits,
     ) -> Result<Arc<SnapshotStore>, SnapshotError> {
-        Ok(Arc::new(SnapshotStore::new_managed(
-            storage.clone(),
-            Self::snapshot_store_path(storage, session_id, cwd)?,
-        )))
+        Ok(Arc::new(
+            SnapshotStore::new_managed(
+                storage.clone(),
+                Self::snapshot_store_path(storage, session_id, cwd)?,
+            )
+            .with_limits(limits),
+        ))
     }
 
     fn snapshot_store_path(
@@ -663,6 +660,13 @@ impl App {
             .join(workspace_key(cwd)?))
     }
 
+    /// The store and the baseline move together: an agent mid-session must never
+    /// capture one workspace's revert point into another workspace's store.
+    fn rebind_workspace_baseline(&mut self, store: Arc<SnapshotStore>, cwd: PathBuf) {
+        self.workspace_baseline.rebind(Arc::clone(&store), cwd);
+        self.snapshot_store = store;
+    }
+
     pub(super) fn discard_workspace_unrevert(&self) -> Result<(), SnapshotError> {
         self.snapshot_store.discard_unrevert()
     }
@@ -674,16 +678,37 @@ impl App {
             .or_else(|| crate::session_history_head(&self.state.session))
     }
 
-    /// Inline capture, for the shutdown and respawn paths that have nowhere to
-    /// resume to. The submit path uses [`Action::SnapshotWorkspace`] instead,
-    /// because this walks and hashes the whole working tree under a
-    /// machine-global lock and can take tens of seconds.
+    /// Closes the bracket a revert needs: the baseline is one end, `head` the
+    /// other. Inline, and it walks and hashes the whole working tree under a
+    /// machine-global lock.
+    ///
+    /// A session with no baseline has nothing to revert to, so it is not made
+    /// to pay for a walk it will never spend.
     pub(super) fn snapshot_history_head(&self) -> Result<(), SnapshotError> {
-        capture_history_head(
-            &self.snapshot_store,
-            std::path::Path::new(&self.state.session.cwd),
-            self.history_head(),
-        )
+        let Some(head) = self.history_head().filter(|_| self.has_revert_point()) else {
+            return Ok(());
+        };
+        self.snapshot_store
+            .snapshot(std::path::Path::new(&self.state.session.cwd), head)
+            .map(drop)
+    }
+
+    /// Whether a run has captured a baseline for this workspace yet. Until one
+    /// exists there is nothing for a later capture to bracket.
+    pub(super) fn has_revert_point(&self) -> bool {
+        self.snapshot_store.has_session_start()
+    }
+
+    /// Why a file revert cannot run, in the user's terms: either this workspace
+    /// is one Caudra will not snapshot, or nothing has written to it yet.
+    pub(super) fn file_revert_blocker(&self) -> Option<String> {
+        if self.has_revert_point() {
+            return None;
+        }
+        Some(match self.workspace_baseline.unavailable_reason() {
+            Some(reason) => format!("{NO_FILE_REVERT_MSG}: {reason}"),
+            None => NO_FILE_CHANGES_MSG.to_owned(),
+        })
     }
 
     /// [`Self::snapshot_history_head`] with a ceiling on how long it may wait
@@ -2828,13 +2853,7 @@ impl App {
         if self.cancelling_run.is_some() {
             return Vec::new();
         }
-        let had_pending = self.pending_run.is_some();
         let cancelled_run = self.begin_main_cancel(false, true);
-        // A run still waiting on its snapshot never reached the agent, so
-        // there is nothing there to cancel.
-        if had_pending {
-            return Vec::new();
-        }
         vec![Action::CancelAgent {
             run_id: cancelled_run,
         }]
@@ -2844,14 +2863,7 @@ impl App {
         self.cancel_queue_edit();
         let cancelled_run = self.run_id;
         self.run_id += 1;
-        // Dropping the pending run makes its in-flight snapshot stale. The
-        // agent never saw it, so no terminal envelope is coming and nothing
-        // else would move the status off `Streaming`.
-        let had_pending = self.pending_run.take().is_some();
-        if had_pending {
-            self.status = Status::Idle;
-        }
-        self.cancelling_run = (await_terminal && !had_pending).then_some(cancelled_run);
+        self.cancelling_run = await_terminal.then_some(cancelled_run);
         self.retry_info = None;
         self.close_all_overlays();
         self.pending_input = PendingInput::None;
@@ -4023,7 +4035,7 @@ impl App {
         self.state
             .session_mut()
             .set_cwd(cwd.to_string_lossy().into_owned());
-        self.snapshot_store = snapshot_store;
+        self.rebind_workspace_baseline(snapshot_store, cwd.to_path_buf());
         self.status_bar.refresh_cwd();
         self.sync_composer_cwd();
     }
@@ -4235,6 +4247,7 @@ impl App {
             | self.status_bar.clear_expired_hint()
             | self.mcp_picker.refresh()
             | self.tick_permission_config_trust()
+            | self.poll_snapshot_refusal()
             | self.model_picker.refresh()
             | self.usage_modal.poll(&self.usage_slot)
             | self.storage_modal.poll(&self.storage_slot)
@@ -4289,6 +4302,24 @@ impl App {
         let cwd = PathBuf::from(&self.state.session.cwd);
         caudra_storage::workbench::persist(&self.storage, &cwd, &layout);
         self.workbench_layout = Some(layout);
+    }
+
+    /// A refusal is decided inside a tool call, so the UI learns it by polling.
+    /// Reported once per verdict: it is a standing property of the workspace,
+    /// not an event, and repeating it every turn would be noise.
+    fn poll_snapshot_refusal(&mut self) -> Dirty {
+        let reason = self.workspace_baseline.refusal();
+        if reason.as_deref().map(String::as_str) == self.snapshots_unavailable.as_deref() {
+            return Dirty::NO;
+        }
+        self.snapshots_unavailable = reason.as_deref().cloned();
+        let Some(reason) = reason else {
+            return Dirty::NO;
+        };
+        self.status_bar
+            .flash(format!("{NO_FILE_REVERT_MSG}: {reason}"));
+        self.checkpoint();
+        Dirty::YES
     }
 
     fn tick_permission_config_trust(&mut self) -> Dirty {
@@ -4424,7 +4455,6 @@ impl App {
                 self.restoring.load(Ordering::Relaxed),
                 self.retry_info.is_some(),
                 self.state.goal.snapshot().is_some(),
-                self.is_snapshotting(),
             ),
             self.selection_state
                 .as_ref()

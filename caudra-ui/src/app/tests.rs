@@ -29,6 +29,7 @@ use caudra_agent::mcp::config::{McpConfigSource, McpReviewSummary};
 use caudra_agent::permissions::{PermissionManager, PermissionRequest};
 use caudra_agent::snapshots::{RestoreFailureKind, RestoreStatus};
 use caudra_agent::tools::ToolEffect;
+use caudra_agent::workspace_baseline::BaselineOutcome;
 use caudra_agent::{
     DoneReason, GoalResult, GoalStatus, GoalVerdict, HistorySnapshot, ImageMediaType,
     McpConfigErrors, McpServerInfo, McpServerStatus, McpSnapshot, McpSnapshotReader,
@@ -70,7 +71,6 @@ const WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 /// What [`test_model`] answers as, so a turn recorded in a test lands under
 /// the session's own provider the way a real one does.
 const TEST_PROVIDER: &str = "anthropic";
-const SNAPSHOT_ERR: &str = "snapshot store lock is poisoned";
 const MISSING_ZONE: &str = "the transcript must have registered a zone";
 const BAR_IGNORED: &str = "the pointer moved the view somewhere it should not have";
 const ARMING_LEADER_IS_INERT_MSG: &str = "arming the leader waits for a second key, it never acts";
@@ -216,12 +216,16 @@ fn build_app_with_lua(
         .join(session.id.to_string());
     std::fs::create_dir_all(&workspace).unwrap();
     session.set_cwd(workspace.to_string_lossy().into_owned());
-    let snapshot_store = App::snapshot_store_for(&dir, session.id, &workspace).unwrap();
+    let snapshot_store =
+        App::snapshot_store_for(&dir, session.id, &workspace, SnapshotLimits::default()).unwrap();
+    let workspace_baseline =
+        WorkspaceBaseline::new(Arc::clone(&snapshot_store), workspace.clone(), true);
     App::new(
         &model,
         session,
         dir,
         snapshot_store,
+        workspace_baseline,
         Arc::new(ArcSwapOption::empty()),
         McpSnapshotReader::empty(),
         McpConfigErrors::new(PathBuf::new()),
@@ -273,29 +277,6 @@ pub(crate) fn test_app() -> App {
     app
 }
 
-/// Runs the deferred pre-run capture the way the event loop does, so a test
-/// can go from a submit straight to the `SendMessage` it produces. Real
-/// captures against the test workspace, so snapshot assertions still hold.
-fn settle_snapshot(app: &mut App, actions: Vec<Action>) -> Vec<Action> {
-    let mut settled = Vec::new();
-    for action in actions {
-        match action {
-            Action::SnapshotWorkspace {
-                run_id,
-                store,
-                cwd,
-                head,
-            } => {
-                let result =
-                    crate::app::capture_history_head(&store, &cwd, head).map_err(|e| e.to_string());
-                settled.extend(app.on_workspace_snapshot(run_id, result));
-            }
-            other => settled.push(other),
-        }
-    }
-    settled
-}
-
 /// A `test_app` past its idle splash, whose drifting starfield would mask
 /// every other cadence.
 fn app_without_splash() -> App {
@@ -326,6 +307,15 @@ fn app_with_hints() -> (App, HintWriterHandle) {
     app.hints = Watch::seeded(reader.load_full());
     app.hint_reader = reader;
     (app, writer)
+}
+
+/// Stands in for the first write-capable tool call of a run. These tests drive
+/// the app without an agent, so nothing else reaches the dispatch gate that
+/// arms the revert point in production.
+fn arm_revert_point(app: &App) {
+    const ARMED_MSG: &str = "the first write must arm a revert point";
+    let outcome = smol::block_on(app.workspace_baseline.ensure(app.history_head()));
+    assert!(matches!(outcome, BaselineOutcome::Ready), "{ARMED_MSG}");
 }
 
 fn tempdir_app() -> (TempDir, StateDir, Arc<StorageWriter>, App) {
@@ -532,7 +522,6 @@ fn typing_and_submit() {
     app.update(Msg::Key(key(KeyCode::Char('i'))));
 
     let actions = app.update(Msg::Key(key(KeyCode::Enter)));
-    let actions = settle_snapshot(&mut app, actions);
     assert!(matches!(&actions[0], Action::SendMessage(s) if s.message == "hi"));
     assert_eq!(app.status, Status::Streaming);
     // Regression check: the bubble has to be on screen the same frame we
@@ -544,96 +533,26 @@ fn typing_and_submit() {
     assert_eq!(app.main_chat().last_message_text(), "hi");
 }
 
-/// The freeze this defers: the capture walks and hashes the whole working
-/// tree under a machine-global lock, so the submit must not wait on it.
+/// A submit is a conversation, not a write. Paying for a working-tree walk
+/// before the model has even been asked is the cost this removed.
 #[test]
-fn submit_defers_the_workspace_snapshot_off_the_ui_thread() {
+fn submit_captures_nothing_until_a_tool_asks_to_write() {
+    const NO_STORE_MSG: &str = "a submit must not capture a workspace baseline";
     let mut app = test_app();
-    let actions = type_and_submit_unsettled(&mut app, "hi");
+
+    let actions = type_and_submit(&mut app, "hi");
 
     assert!(matches!(
         actions.as_slice(),
-        [Action::SnapshotWorkspace { .. }]
-    ));
-    assert_eq!(app.status, Status::Streaming);
-    assert_eq!(app.main_chat().last_message_text(), "");
-
-    let settled = settle_snapshot(&mut app, actions);
-
-    assert!(matches!(
-        settled.as_slice(),
         [Action::SendMessage(input)] if input.message == "hi"
     ));
-    assert_eq!(app.main_chat().last_message_text(), "hi");
-}
-
-#[test]
-fn a_failed_submit_snapshot_starts_no_run() {
-    let mut app = test_app();
-    let actions = type_and_submit_unsettled(&mut app, "hi");
-    let [Action::SnapshotWorkspace { run_id, .. }] = actions.as_slice() else {
-        panic!("submit must defer its snapshot");
-    };
-
-    let settled = app.on_workspace_snapshot(*run_id, Err(SNAPSHOT_ERR.into()));
-
-    assert!(settled.is_empty());
-    assert_eq!(app.status, Status::Idle);
-    assert_eq!(app.main_chat().last_message_text(), "");
-    assert_eq!(
-        app.status_bar.flash_text(),
-        Some(&*format!("Failed to snapshot workspace: {SNAPSHOT_ERR}"))
-    );
-}
-
-/// The bubble is never drawn and the queue never sees this text, so a failed
-/// snapshot is the one path that can silently destroy what the user typed.
-#[test]
-fn a_failed_submit_snapshot_returns_the_typed_text() {
-    let mut app = test_app();
-    let actions = type_and_submit_unsettled(&mut app, "hi");
-    let [Action::SnapshotWorkspace { run_id, .. }] = actions.as_slice() else {
-        panic!("submit must defer its snapshot");
-    };
-
-    app.on_workspace_snapshot(*run_id, Err(SNAPSHOT_ERR.into()));
-
-    assert_eq!(app.input_box.buffer.value(), "hi");
-}
-
-/// A snapshot that lands after its run was superseded must not start it.
-#[test]
-fn a_stale_submit_snapshot_is_dropped() {
-    let mut app = test_app();
-    let actions = type_and_submit_unsettled(&mut app, "hi");
-    let [Action::SnapshotWorkspace { run_id, .. }] = actions.as_slice() else {
-        panic!("submit must defer its snapshot");
-    };
-    let stale = *run_id;
-    cancel_app(&mut app);
-
-    assert!(app.on_workspace_snapshot(stale, Ok(())).is_empty());
-    assert_eq!(app.status, Status::Idle);
-}
-
-/// Cancelling before the snapshot lands leaves no agent-side run to await, so
-/// the status must not stay stuck in `Streaming`.
-#[test]
-fn cancelling_a_pending_snapshot_needs_no_agent_round_trip() {
-    let mut app = test_app();
-    type_and_submit_unsettled(&mut app, "hi");
-
-    cancel_app(&mut app);
-
-    assert_eq!(app.status, Status::Idle);
-    assert_eq!(app.cancelling_run, None);
+    assert!(!app.snapshot_store.has_session_start(), "{NO_STORE_MSG}");
 }
 
 #[test]
 fn mailbox_wake_starts_without_an_empty_user_bubble() {
     let mut app = test_app();
     let actions = app.start_mailbox_run(vec![Message::observation("failed".into())]);
-    let actions = settle_snapshot(&mut app, actions);
 
     assert!(matches!(
         &actions[..],
@@ -1027,7 +946,6 @@ fn hidden_paste_cannot_trigger_exit() {
     app.update(Msg::Paste("exit\n\n".into()));
 
     let actions = app.update(Msg::Key(key(KeyCode::Enter)));
-    let actions = settle_snapshot(&mut app, actions);
     assert!(matches!(actions.as_slice(), [Action::SendMessage(_)]));
     assert_eq!(app.exit_request, ExitRequest::None);
 }
@@ -1097,7 +1015,6 @@ fn submit_during_streaming_queues_message() {
     let mut app = test_app();
     app.update(Msg::Key(key(KeyCode::Char('a'))));
     let actions = app.update(Msg::Key(key(KeyCode::Enter)));
-    let actions = settle_snapshot(&mut app, actions);
     assert!(matches!(&actions[0], Action::SendMessage(_)));
     assert_eq!(app.status, Status::Streaming);
 
@@ -1384,7 +1301,6 @@ fn submit_prompt_never_interprets_text(text: &str) {
     let mut app = test_app();
     match app.submit_prompt(queued_msg(text)) {
         SubmitOutcome::Started(actions) => {
-            let actions = settle_snapshot(&mut app, actions);
             assert!(matches!(&actions[0], Action::SendMessage(_)))
         }
         _ => panic!("raw prompt must start the agent"),
@@ -1453,13 +1369,6 @@ fn press_chord(app: &mut App, chord: Bind) -> Vec<Action> {
 }
 
 fn type_and_submit(app: &mut App, text: &str) -> Vec<Action> {
-    let actions = type_and_submit_unsettled(app, text);
-    settle_snapshot(app, actions)
-}
-
-/// Stops at the deferred capture, for the tests that are about the deferral
-/// itself rather than the run it eventually starts.
-fn type_and_submit_unsettled(app: &mut App, text: &str) -> Vec<Action> {
     for c in text.chars() {
         app.update(Msg::Key(key(KeyCode::Char(c))));
     }
@@ -3073,7 +2982,6 @@ fn custom_command_falls_back_to_main_when_the_task_cannot_be_steered() {
     app.subagent_steers.remove(TASK_ID);
 
     let actions = app.execute_command(cmd("/project:audit"), 0);
-    let actions = settle_snapshot(&mut app, actions);
 
     assert!(actions.iter().any(|a| matches!(a, Action::SendMessage(..))));
 }
@@ -3449,11 +3357,7 @@ fn continue_command_starts_a_run_with_no_message() {
 
     let actions = app.execute_command(cmd("/continue"), 0);
 
-    let [Action::SnapshotWorkspace { run_id, .. }] = actions.as_slice() else {
-        panic!("continue must defer its snapshot");
-    };
-    let settled = app.on_workspace_snapshot(*run_id, Ok(()));
-    let [Action::SendMessage(input)] = settled.as_slice() else {
+    let [Action::SendMessage(input)] = actions.as_slice() else {
         panic!("continue must start a run");
     };
     assert!(input.message.is_empty());
@@ -7426,7 +7330,6 @@ fn usage_command_toggles_modal() {
 fn goal_command_sets_condition_and_starts_work() {
     let mut app = test_app();
     let actions = app.run_cmdline("/goal all focused tests pass", 0).unwrap();
-    let actions = settle_snapshot(&mut app, actions);
 
     assert_eq!(
         app.state.goal.snapshot().unwrap().condition.as_ref(),
@@ -7666,7 +7569,6 @@ fn deferred_goal_builds_an_automatic_checkin() {
 
     assert!(app.goal_checkin_due());
     let actions = app.start_goal_checkin();
-    let actions = settle_snapshot(&mut app, actions);
     let input = actions
         .iter()
         .find_map(|action| match action {
@@ -8603,6 +8505,30 @@ fn persist_both_restore_intent(app: &mut App, target_head: Option<CaudraId>) -> 
     operation_id
 }
 
+/// A run that never writes must leave the disk as it found it: no store, no
+/// manifests, and nothing for a later exit to close.
+#[test]
+fn a_run_that_writes_nothing_leaves_no_revert_point() {
+    const UNTOUCHED_MSG: &str = "a read-only run must capture no workspace state";
+    let (_temp, _, _, mut app) = tempdir_app();
+    std::fs::write(
+        PathBuf::from(&app.state.session.cwd).join(SNAPSHOT_FILE),
+        FIRST_CONTENT,
+    )
+    .unwrap();
+
+    let actions = app.start_from_queue(&QueuedMessage {
+        text: "next prompt".into(),
+        images: Vec::new(),
+        mentions: Vec::new(),
+        paste_ranges: Vec::new(),
+    });
+    app.update(done_event());
+
+    assert!(matches!(actions.as_slice(), [Action::SendMessage(_)]));
+    assert!(!app.snapshot_store.has_session_start(), "{UNTOUCHED_MSG}");
+}
+
 #[test]
 fn run_snapshots_are_complete_and_associated_with_atomic_heads() {
     let (_temp, _, _, mut app) = tempdir_app();
@@ -8622,7 +8548,7 @@ fn run_snapshots_are_complete_and_associated_with_atomic_heads() {
         mentions: Vec::new(),
         paste_ranges: Vec::new(),
     });
-    let actions = settle_snapshot(&mut app, actions);
+    arm_revert_point(&app);
 
     assert!(matches!(actions.as_slice(), [Action::SendMessage(_)]));
     assert!(app.snapshot_store.has_session_start());
@@ -8663,6 +8589,9 @@ fn cancelled_top_level_snapshots_atomic_head_but_subagent_completion_does_not() 
         assistant_message("partial response"),
     ]);
     let cancelled_head = cancelled.last().unwrap().id;
+    // Armed before the run's own turn lands, the way a write mid-run is: the
+    // head it anchors on is the one the run started from.
+    arm_revert_point(&app);
     app.shared_history = Some(Arc::new(ArcSwap::from_pointee(HistorySnapshot::new(
         cancelled,
     ))));
@@ -8714,6 +8643,7 @@ fn cancellation_stays_non_quiescent_until_the_matching_top_level_terminal_event(
     app.queue.set_shared(shared_queue);
     app.status = Status::Streaming;
     app.run_id = 7;
+    arm_revert_point(&app);
 
     let actions = app.handle_cancel();
 
@@ -9872,12 +9802,47 @@ fn fork_copies_ancestor_snapshots_into_child_store_without_restoring_files() {
         &app.storage,
         forked.session.id,
         std::path::Path::new(&forked.session.cwd),
+        SnapshotLimits::default(),
     )
     .unwrap();
 
     assert!(child.has_session_start());
     assert!(child.has_checkpoint(items[1].id));
     assert_eq!(std::fs::read_to_string(path).unwrap(), CURRENT_CONTENT);
+}
+
+/// A bare not-found out of the store names a missing manifest. The user needs
+/// to hear why there is no manifest to miss.
+#[test]
+fn a_files_revert_without_a_baseline_says_why() {
+    const EXPLAINED_MSG: &str = "a revert with no baseline must name the reason";
+    let mut app = build_rewind_app();
+    let target = app.state.session.messages()[0].id;
+
+    let actions = app.revert_to(target, RestoreMode::Files);
+
+    assert!(actions.is_empty(), "{EXPLAINED_MSG}");
+    assert_eq!(
+        app.status_bar.flash_text(),
+        Some(crate::app::NO_FILE_CHANGES_MSG),
+        "{EXPLAINED_MSG}"
+    );
+}
+
+/// The conversation half is still doable, so refusing the whole request would
+/// cost the user something Caudra can actually deliver.
+#[test]
+fn a_both_revert_without_a_baseline_still_rewinds_the_conversation() {
+    const DOWNGRADED_MSG: &str = "a both revert must fall back to the conversation half";
+    let mut app = build_rewind_app();
+    let target = app.state.session.messages()[0].id;
+
+    let actions = app.revert_to(target, RestoreMode::Both);
+
+    assert!(
+        matches!(actions.as_slice(), [Action::LoadSession(_)]),
+        "{DOWNGRADED_MSG}"
+    );
 }
 
 #[test]
@@ -10513,7 +10478,13 @@ fn changing_projects_closes_stale_permission_config_actions() {
     let project = temp.path().join("destination");
     std::fs::create_dir(&project).unwrap();
     let snapshot_store =
-        App::snapshot_store_for(&app.storage, app.state.session.id, &project).unwrap();
+        App::snapshot_store_for(
+            &app.storage,
+            app.state.session.id,
+            &project,
+            SnapshotLimits::default(),
+        )
+        .unwrap();
     assert!(app.permissions_picker.is_open());
 
     app.install_working_directory(&project, snapshot_store, PermissionsConfig::default());
@@ -11602,7 +11573,6 @@ fn plan_form_menu_options(
         app.update(Msg::Key(key(KeyCode::Down)));
     }
     let actions = app.update(Msg::Key(key(KeyCode::Enter)));
-    let actions = settle_snapshot(&mut app, actions);
     assert!(!app.plan_form.is_visible());
     assert_eq!(app.state.mode, expected_mode);
     assert_eq!(app.state.plan, PlanState::None);
@@ -11628,7 +11598,6 @@ fn plan_form_implement_toggled_parallel() {
     app.update(Msg::Key(key(KeyCode::Down)));
     app.update(Msg::Key(key(KeyCode::Down)));
     let actions = app.update(Msg::Key(key(KeyCode::Enter)));
-    let actions = settle_snapshot(&mut app, actions);
     let expected_msg = implement_msg(!PlanForm::new().parallel());
     assert!(
         actions
@@ -12469,7 +12438,7 @@ fn ephemeral_snapshots_are_written_to_the_volatile_root() {
     let storage = StateDir::split(volatile.clone(), persistent.clone());
     let session_id = CaudraId::generate();
 
-    let store = App::snapshot_store_for(&storage, session_id, &cwd).unwrap();
+    let store = App::snapshot_store_for(&storage, session_id, &cwd, SnapshotLimits::default()).unwrap();
     store.snapshot_session_start(&cwd).unwrap();
 
     let snapshots = |root: &Path| root.join(caudra_agent::snapshots::SESSION_SNAPSHOTS_DIR);
@@ -13853,7 +13822,7 @@ fn turn_end_keeps_only_the_subagents_that_finished() {
 /// The popup is fed by a walker thread, so a test settles it before asserting
 /// on what it matched.
 fn mention_popup_at(app: &mut App, cwd: &std::path::Path, query: &str) {
-    let store = App::snapshot_store_for(&app.storage, app.state.session.id, cwd)
+    let store = App::snapshot_store_for(&app.storage, app.state.session.id, cwd, SnapshotLimits::default())
         .expect("a snapshot store for the project");
     app.install_working_directory(cwd, store, PermissionsConfig::default());
     for character in query.chars() {
@@ -13925,7 +13894,12 @@ fn clicking_a_popup_row_completes_the_mention_it_shows() {
 fn transcript_mention(app: &mut App) -> (TempDir, u16, u16) {
     let dir = TempDir::new().expect("a temporary directory");
     std::fs::write(dir.path().join(MENTIONED_FILE), "body\n").expect("a file");
-    let store = App::snapshot_store_for(&app.storage, app.state.session.id, dir.path())
+    let store = App::snapshot_store_for(
+        &app.storage,
+        app.state.session.id,
+        dir.path(),
+        SnapshotLimits::default(),
+    )
         .expect("a snapshot store for the project");
     app.install_working_directory(dir.path(), store, PermissionsConfig::default());
     app.main_chat()

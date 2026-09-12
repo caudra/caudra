@@ -20,11 +20,12 @@ use caudra_agent::permissions::PermissionManager;
 use caudra_agent::prompt::profile::{
     BUILTIN_PROFILE_NAME, PromptProfileCatalog, SystemPromptProfile,
 };
-use caudra_agent::snapshots::{SESSION_SNAPSHOTS_DIR, SnapshotStore};
+use caudra_agent::snapshots::{SESSION_SNAPSHOTS_DIR, SnapshotLimits, SnapshotStore};
+use caudra_agent::workspace_baseline::WorkspaceBaseline;
 use caudra_agent::{
     AgentConfig, AgentEvent, CancelToken, Envelope, McpCommand, McpConfigErrors, McpHandle, mcp,
 };
-use caudra_config::{ModelPolicy, UiConfig, load_permissions};
+use caudra_config::{ModelPolicy, SnapshotsConfig, UiConfig, load_permissions};
 use caudra_lua::{
     EventHandle, HintReader, KeymapReader, LuaCommandReader, ModelRequest, SessionRequest,
     TaskRequest, UiAction, UiReply,
@@ -124,6 +125,7 @@ pub struct EventLoopParams {
     pub storage: StateDir,
     pub config: AgentConfig,
     pub ui_config: UiConfig,
+    pub snapshots: SnapshotsConfig,
     pub input_history_size: usize,
     pub max_log_files: u32,
     pub permissions: Arc<PermissionManager>,
@@ -330,8 +332,6 @@ struct SessionRuntime {
     handles: AgentHandles,
     shell_tx: flume::Sender<ShellEvent>,
     shell_rx: flume::Receiver<ShellEvent>,
-    snapshot_tx: flume::Sender<WorkspaceSnapshotDone>,
-    snapshot_rx: flume::Receiver<WorkspaceSnapshotDone>,
     last_status: SessionStatus,
     /// Keyed by task id, never by position: a session reset reuses positions,
     /// so a new task would inherit the old one's status.
@@ -474,26 +474,31 @@ fn validate_session_cwd(session: &AppSession, process_cwd: &Path) -> Result<(), 
 /// Blocking, and deliberately so: both halves are disk work. Reported together
 /// because the question `/storage` answers is which of the two is spending the
 /// disk, and one half without the other cannot answer it.
-fn measure_storage(storage: &StateDir) -> StorageFetchState {
+fn measure_storage(storage: &StateDir, unavailable: Option<String>) -> StorageFetchState {
     let stats = match SessionDatabase::open_read_only(storage).and_then(|db| db.stats()) {
         Ok(stats) => stats,
         Err(error) => return StorageFetchState::Error(error.to_string()),
     };
     let stores = SnapshotStore::store_entries(&storage.path().join(SESSION_SNAPSHOTS_DIR));
-    StorageFetchState::Ready(Box::new(StorageReport { stats, stores }))
+    StorageFetchState::Ready(Box::new(StorageReport {
+        stats,
+        stores,
+        unavailable,
+    }))
 }
 
 fn prepare_session_for_runtime(
     storage: &StateDir,
     storage_writer: &StorageWriter,
     mut session: AppSession,
+    limits: SnapshotLimits,
 ) -> Result<(AppSession, Arc<caudra_agent::snapshots::SnapshotStore>), String> {
     let process_cwd = canonical_cwd(
         &std::env::current_dir()
             .map_err(|error| format!("failed to read current directory: {error}"))?,
     )?;
     validate_session_cwd(&session, &process_cwd)?;
-    let snapshot_store = App::snapshot_store_for(storage, session.id, &process_cwd)
+    let snapshot_store = App::snapshot_store_for(storage, session.id, &process_cwd, limits)
         .map_err(|error| format!("Failed to initialize workspace snapshots: {error}"))?;
     crate::app::recover_pending_workspace_restore(&mut session, &snapshot_store, storage_writer)?;
     Ok((session, snapshot_store))
@@ -504,6 +509,7 @@ fn recover_stored_sessions_in_cwd(
     storage_writer: &StorageWriter,
     cwd: &Path,
     active: &std::collections::HashSet<CaudraId>,
+    limits: SnapshotLimits,
 ) -> Result<(), String> {
     let cwd_text = cwd.to_string_lossy();
     let facts = SessionDatabase::open_state(storage)
@@ -513,7 +519,7 @@ fn recover_stored_sessions_in_cwd(
         if active.contains(&facts.id) {
             continue;
         }
-        let snapshot_store = App::snapshot_store_for(storage, facts.id, cwd)
+        let snapshot_store = App::snapshot_store_for(storage, facts.id, cwd, limits)
             .map_err(|error| format!("Failed to initialize workspace snapshots: {error}"))?;
         // Loading a session is proportional to its whole transcript, and a
         // workspace accumulates hundreds. `recover_pending_workspace_restore`
@@ -561,6 +567,7 @@ struct SpawnCtx {
     storage: StateDir,
     config: AgentConfig,
     ui_config: UiConfig,
+    snapshots: SnapshotsConfig,
     input_history_size: usize,
     max_log_files: u32,
     /// Prototype only: every runtime forks its own manager so session
@@ -630,8 +637,17 @@ impl SpawnCtx {
             .validate(&self.storage, session.id)
             .map_err(|error| error.to_string())?;
         let session_id = session.id;
-        let (session, snapshot_store) =
-            prepare_session_for_runtime(&self.storage, &self.storage_writer, session)?;
+        let (session, snapshot_store) = prepare_session_for_runtime(
+            &self.storage,
+            &self.storage_writer,
+            session,
+            self.snapshots.into(),
+        )?;
+        let workspace_baseline = WorkspaceBaseline::new(
+            Arc::clone(&snapshot_store),
+            PathBuf::from(&session.cwd),
+            self.snapshots.enabled,
+        );
         let prepare_ms = lap();
         let initial_history = match crate::active_session_history(&session) {
             Ok(history) => history,
@@ -668,6 +684,7 @@ impl SpawnCtx {
             system_prompt_profile.clone(),
             Arc::clone(&self.prompt_profiles),
             Some(self.storage.clone()),
+            Arc::clone(&workspace_baseline),
         );
         let agent_spawn_ms = lap();
         let mut app = App::new(
@@ -675,6 +692,7 @@ impl SpawnCtx {
             session,
             self.storage.clone(),
             snapshot_store,
+            workspace_baseline,
             Arc::clone(&self.available_models),
             handles.mcp_reader(),
             handles.mcp_config_errors.clone(),
@@ -692,6 +710,7 @@ impl SpawnCtx {
             Arc::clone(&self.prompt_profiles),
         );
         let app_new_ms = lap();
+        app.snapshots_config = self.snapshots;
         app.live_sessions = Arc::clone(&self.live_sessions);
         app.state.system_prompt_profile_name = system_prompt_profile_name;
         app.state.system_prompt_profile = system_prompt_profile;
@@ -713,15 +732,12 @@ impl SpawnCtx {
             "session runtime spawned"
         );
         let (shell_tx, shell_rx) = flume::unbounded::<ShellEvent>();
-        let (snapshot_tx, snapshot_rx) = flume::unbounded::<WorkspaceSnapshotDone>();
         Ok(SessionRuntime {
             app,
             lease,
             handles,
             shell_tx,
             shell_rx,
-            snapshot_tx,
-            snapshot_rx,
             last_status: SessionStatus::Idle,
             last_tasks: Vec::new(),
             notifications: RunNotificationState::default(),
@@ -836,16 +852,8 @@ enum Wake {
     Ui(UiAction),
     Agent(usize, Box<caudra_agent::Envelope>),
     Shell(usize, ShellEvent),
-    Snapshot(usize, WorkspaceSnapshotDone),
     Warn(String),
     Title(GeneratedTitle),
-}
-
-/// A pre-run workspace capture that finished. The error is carried as text
-/// because the only consumer flashes it.
-struct WorkspaceSnapshotDone {
-    run_id: u64,
-    result: Result<(), String>,
 }
 
 /// What a model-written title came back as, for the session that asked. The
@@ -946,6 +954,7 @@ impl<'t> EventLoop<'t> {
             storage,
             config,
             ui_config,
+            snapshots,
             input_history_size,
             max_log_files,
             permissions,
@@ -1020,6 +1029,7 @@ impl<'t> EventLoop<'t> {
             storage,
             config,
             ui_config,
+            snapshots,
             input_history_size,
             max_log_files,
             permissions,
@@ -1044,8 +1054,14 @@ impl<'t> EventLoop<'t> {
         let provider_ms = lap();
 
         let active = sessions.iter().map(|tab| tab.session.id).collect();
-        recover_stored_sessions_in_cwd(&ctx.storage, &ctx.storage_writer, &cwd, &active)
-            .map_err(|error| eyre!(error))?;
+        recover_stored_sessions_in_cwd(
+            &ctx.storage,
+            &ctx.storage_writer,
+            &cwd,
+            &active,
+            ctx.snapshots.into(),
+        )
+        .map_err(|error| eyre!(error))?;
         let recover_sessions_ms = lap();
 
         let mut runtimes: Vec<SessionRuntime> = sessions
@@ -1194,9 +1210,6 @@ impl<'t> EventLoop<'t> {
             sel = sel.recv(&rt.shell_rx, move |res| {
                 res.ok().map(|ev| Wake::Shell(i, ev))
             });
-            sel = sel.recv(&rt.snapshot_rx, move |res| {
-                res.ok().map(|ev| Wake::Snapshot(i, ev))
-            });
         }
         sel.wait_timeout(timeout).ok().flatten()
     }
@@ -1208,12 +1221,6 @@ impl<'t> EventLoop<'t> {
             Wake::Ui(action) => self.handle_ui_action(action),
             Wake::Agent(i, envelope) => self.handle_agent(i, envelope),
             Wake::Shell(i, event) => self.sessions[i].app.handle_shell_event(event),
-            Wake::Snapshot(i, done) => {
-                let actions = self.sessions[i]
-                    .app
-                    .on_workspace_snapshot(done.run_id, done.result);
-                self.dispatch(i, actions);
-            }
             Wake::Warn(warning) => {
                 // The one place every background warning passes through. A
                 // flash fades and the user may not be looking, so the log is
@@ -2218,7 +2225,12 @@ impl<'t> EventLoop<'t> {
         let mut stores = Vec::with_capacity(self.sessions.len());
         for runtime_index in 0..self.sessions.len() {
             let session_id = self.sessions[runtime_index].id();
-            let store = match App::snapshot_store_for(&self.ctx.storage, session_id, &cwd) {
+            let store = match App::snapshot_store_for(
+                &self.ctx.storage,
+                session_id,
+                &cwd,
+                self.ctx.snapshots.into(),
+            ) {
                 Ok(store) => store,
                 Err(error) => {
                     self.sessions[idx].app.flash(format!("cd: {error}"));
@@ -2534,30 +2546,6 @@ impl<'t> EventLoop<'t> {
                     server: server_name,
                 });
             }
-            Action::SnapshotWorkspace {
-                run_id,
-                store,
-                cwd,
-                head,
-            } => {
-                let tx = self.sessions[idx].snapshot_tx.clone();
-                smol::spawn(async move {
-                    let result = smol::unblock(move || {
-                        crate::app::capture_history_head(&store, &cwd, head)
-                            .map_err(|error| error.to_string())
-                    })
-                    .await;
-                    // The run is parked until this lands, so a lost reply is a
-                    // wedged session rather than a missing checkpoint.
-                    if tx.send(WorkspaceSnapshotDone { run_id, result }).is_err() {
-                        warn!(
-                            run_id,
-                            "workspace snapshot reply dropped; run stays pending"
-                        );
-                    }
-                })
-                .detach();
-            }
             Action::ShellCommand {
                 id,
                 command,
@@ -2716,10 +2704,12 @@ impl<'t> EventLoop<'t> {
     /// read-only: a diagnostic must never contend with the session writer.
     fn refresh_storage(&mut self) {
         let storage = self.ctx.storage.clone();
-        let slot = Arc::clone(&self.focused_app().storage_slot);
+        let app = self.focused_app();
+        let unavailable = app.file_revert_blocker();
+        let slot = Arc::clone(&app.storage_slot);
         slot.store(Some(Arc::new(StorageFetchState::Loading)));
         smol::spawn(async move {
-            let state = smol::unblock(move || measure_storage(&storage)).await;
+            let state = smol::unblock(move || measure_storage(&storage, unavailable)).await;
             slot.store(Some(Arc::new(state)));
         })
         .detach();
@@ -2835,14 +2825,20 @@ impl<'t> EventLoop<'t> {
                 step = Instant::now();
                 elapsed
             };
-            match app.snapshot_history_head_within(SHUTDOWN_SNAPSHOT_BUDGET) {
-                Ok(true) => {}
-                Ok(false) => warn!(
+            // Only a session that captured a baseline has a bracket to close.
+            // Exiting one that never wrote must not walk the tree on the way
+            // out for a revert point nothing can reach.
+            match app
+                .has_revert_point()
+                .then(|| app.snapshot_history_head_within(SHUTDOWN_SNAPSHOT_BUDGET))
+            {
+                None | Some(Ok(true)) => {}
+                Some(Ok(false)) => warn!(
                     session_id = %app.state.session.id,
                     budget = ?SHUTDOWN_SNAPSHOT_BUDGET,
                     "artifact lock busy, skipping final workspace snapshot"
                 ),
-                Err(error) => {
+                Some(Err(error)) => {
                     warn!(session_id = %app.state.session.id, %error, "final workspace snapshot failed")
                 }
             }
@@ -3212,7 +3208,7 @@ mod tests {
     }
 
     fn corrupt_restore_journal(storage: &StateDir, session: &AppSession, cwd: &Path) {
-        let store = App::snapshot_store_for(storage, session.id, cwd).unwrap();
+        let store = App::snapshot_store_for(storage, session.id, cwd, SnapshotLimits::default()).unwrap();
         store.snapshot_session_start(cwd).unwrap();
         let store_dir = storage
             .path()
@@ -3237,7 +3233,12 @@ mod tests {
         corrupt_restore_journal(&storage, &session, &cwd);
         let writer = StorageWriter::new(storage.clone(), flume::unbounded().0);
 
-        let error = match prepare_session_for_runtime(&storage, &writer, session.clone()) {
+        let error = match prepare_session_for_runtime(
+            &storage,
+            &writer,
+            session.clone(),
+            SnapshotLimits::default(),
+        ) {
             Ok(_) => panic!("corrupt recovery journal unexpectedly allowed runtime preparation"),
             Err(error) => error,
         };
@@ -3280,6 +3281,7 @@ mod tests {
             &writer,
             &cwd,
             &std::collections::HashSet::new(),
+            SnapshotLimits::default(),
         )
         .unwrap_err();
 
@@ -3314,7 +3316,7 @@ mod tests {
         let target_head = items[0].id;
         let source_head = items[1].id;
         unopened.replace_messages(items);
-        let store = App::snapshot_store_for(&storage, unopened.id, &cwd).unwrap();
+        let store = App::snapshot_store_for(&storage, unopened.id, &cwd, SnapshotLimits::default()).unwrap();
         std::fs::write(&file, "root").unwrap();
         store.snapshot_session_start(&cwd).unwrap();
         std::fs::write(&file, "target").unwrap();
@@ -3352,7 +3354,13 @@ mod tests {
             .unwrap();
         let writer = StorageWriter::new(storage.clone(), flume::unbounded().0);
 
-        recover_stored_sessions_in_cwd(&storage, &writer, &cwd, &std::collections::HashSet::new())
+        recover_stored_sessions_in_cwd(
+            &storage,
+            &writer,
+            &cwd,
+            &std::collections::HashSet::new(),
+            SnapshotLimits::default(),
+        )
             .unwrap();
 
         let recovered = load_app_session(unopened.id, &storage).unwrap();

@@ -18,8 +18,8 @@ use caudra_agent::prompt::profile::PromptProfileCatalog;
 use caudra_agent::tools::{FileReadTracker, PathLocks, ToolAudience, ToolFilter, ToolRegistry};
 use caudra_agent::workflow::{RuntimeDeps, WorkflowHandle, WorkflowRuntime};
 use caudra_agent::{
-    AgentConfig, AgentMode, AgentParams, CancelMap, Envelope, McpHandle, SubagentHistoryStore,
-    ToolOutputLines, agent,
+    AgentConfig, AgentMode, AgentParams, BaselineGate, CancelMap, Envelope, McpHandle,
+    SubagentHistoryStore, ToolOutputLines, agent,
 };
 use caudra_config::ModelPolicy;
 use caudra_lua::EventHandle;
@@ -62,6 +62,9 @@ pub(crate) struct WorkflowSpawn<'a> {
     pub(crate) context_publisher: ContextPublisher,
     pub(crate) answer: AnswerChannel,
     pub(crate) events: flume::Sender<Envelope>,
+    /// The session's, not the runtime's: a workflow agent's write has to be
+    /// recoverable through the same revert point as the user's own run.
+    pub(crate) baseline: Option<BaselineGate>,
 }
 
 /// The channel a `question` is answered on. Workflow agents ask through the
@@ -108,6 +111,7 @@ impl WorkflowSession {
             timeouts: spawn.timeouts,
             file_tracker: FileReadTracker::fresh(),
             path_locks: PathLocks::fresh(),
+            baseline: spawn.baseline.clone(),
             prompt_slots: Arc::new(spawn.lua_handle.collect_prompt_slots(spawn.config)),
             prompt_profiles: Arc::clone(spawn.prompt_profiles),
             default_task_prompt_profile_name: Arc::clone(&spawn.task_prompt_profile_name),

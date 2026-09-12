@@ -5,6 +5,7 @@ use caudra_agent::tools::ToolRegistry;
 use caudra_config::{
     AgentConfig, ConfigField, DEFAULT_MAX_LOG_FILES, DEFAULT_MAX_OUTPUT_LINES,
     DEFAULT_MOUSE_SCROLL_LINES, MIN_TOOL_OUTPUT_LINES, ProviderConfig, RetentionConfig,
+    SnapshotsConfig,
     StorageConfig, TOP_LEVEL_FIELDS, TelemetryConfig, ToolOutputLines, UiConfig,
 };
 use caudra_lua::{OptionSpec, OptionType, PluginHost, PluginOptionSpecs};
@@ -301,6 +302,18 @@ fn write_retention_section(out: &mut String) {
     .unwrap();
 }
 
+fn write_snapshots_section(out: &mut String) {
+    write_section(out, "[storage.snapshots]", SnapshotsConfig::FIELDS);
+    writeln!(
+        out,
+        "A workspace over `max_bytes_mb` or `max_files` is refused rather than captured, \
+         and individual files over `max_file_bytes_mb` are skipped while the rest of the \
+         tree is still captured. A refusal costs file revert and lets the tool call \
+         proceed. See [Sessions](/docs/sessions/#limits) for what a capture covers.\n"
+    )
+    .unwrap();
+}
+
 fn write_telemetry_section(out: &mut String) {
     write_section(out, "[telemetry]", TelemetryConfig::FIELDS);
     writeln!(
@@ -429,6 +442,7 @@ All fields are optional. Typos in field names cause an error right away.
     write_section(&mut out, "[provider]", ProviderConfig::FIELDS);
     write_section(&mut out, "[storage]", StorageConfig::FIELDS);
     write_retention_section(&mut out);
+    write_snapshots_section(&mut out);
     write_telemetry_section(&mut out);
 
     writeln!(out, "## Plugins\n").unwrap();

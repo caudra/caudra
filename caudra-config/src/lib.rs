@@ -71,6 +71,10 @@ pub const DEFAULT_EPHEMERAL: bool = false;
 pub const DEFAULT_RETENTION_SWEEP_INTERVAL_HOURS: u64 = 24;
 pub const DEFAULT_RETENTION_TRIM_KEEP_LAST: u32 = 20;
 pub const DEFAULT_RETENTION_TRIM_KEEP_WITHIN_DAYS: u32 = 90;
+pub const DEFAULT_SNAPSHOTS_ENABLED: bool = true;
+pub const DEFAULT_SNAPSHOT_MAX_BYTES_MB: u64 = 512;
+pub const DEFAULT_SNAPSHOT_MAX_FILES: u64 = 50_000;
+pub const DEFAULT_SNAPSHOT_MAX_FILE_BYTES_MB: u64 = 100;
 
 pub const MIN_OUTPUT_BYTES: usize = 1024;
 pub const MIN_OUTPUT_LINES: usize = 10;
@@ -984,6 +988,7 @@ pub struct StorageFileConfig {
     pub input_history_size: Option<usize>,
     pub ephemeral: Option<bool>,
     pub retention: Option<RetentionFileConfig>,
+    pub snapshots: Option<SnapshotsFileConfig>,
 }
 
 impl StorageFileConfig {
@@ -1002,6 +1007,26 @@ impl StorageFileConfig {
             (None, Some(over)) => self.retention = Some(over),
             _ => {}
         }
+        match (self.snapshots.as_mut(), overlay.snapshots) {
+            (Some(base), Some(over)) => base.merge(over),
+            (None, Some(over)) => self.snapshots = Some(over),
+            _ => {}
+        }
+    }
+}
+
+#[derive(Deserialize, Default, Debug)]
+#[serde(default, deny_unknown_fields)]
+pub struct SnapshotsFileConfig {
+    pub enabled: Option<bool>,
+    pub max_bytes_mb: Option<u64>,
+    pub max_files: Option<u64>,
+    pub max_file_bytes_mb: Option<u64>,
+}
+
+impl SnapshotsFileConfig {
+    fn merge(&mut self, overlay: SnapshotsFileConfig) {
+        merge_option!(self, overlay, enabled, max_bytes_mb, max_files, max_file_bytes_mb);
     }
 }
 
@@ -1970,6 +1995,9 @@ pub struct StorageConfig {
 
     #[config(skip)]
     pub retention: RetentionConfig,
+
+    #[config(skip)]
+    pub snapshots: SnapshotsConfig,
 }
 
 impl Default for StorageConfig {
@@ -1981,6 +2009,7 @@ impl Default for StorageConfig {
             input_history_size: DEFAULT_INPUT_HISTORY_SIZE,
             ephemeral: DEFAULT_EPHEMERAL,
             retention: RetentionConfig::default(),
+            snapshots: SnapshotsConfig::default(),
         }
     }
 }
@@ -1994,6 +2023,80 @@ impl StorageConfig {
             input_history_size: f.input_history_size.unwrap_or(DEFAULT_INPUT_HISTORY_SIZE),
             ephemeral: f.ephemeral.unwrap_or(DEFAULT_EPHEMERAL),
             retention: RetentionConfig::from_file(f.retention.unwrap_or_default()),
+            snapshots: SnapshotsConfig::from_file(f.snapshots.unwrap_or_default()),
+        }
+    }
+}
+
+/// What one workspace capture may cost before Caudra refuses the workspace and
+/// turns file revert off for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotsConfig {
+    pub enabled: bool,
+    /// Doubles as the object-store cap, because a working tree larger than the
+    /// cap is over budget from its very first snapshot.
+    pub max_bytes: u64,
+    pub max_files: u64,
+    pub max_file_bytes: u64,
+}
+
+impl Default for SnapshotsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: DEFAULT_SNAPSHOTS_ENABLED,
+            max_bytes: DEFAULT_SNAPSHOT_MAX_BYTES_MB * 1024 * 1024,
+            max_files: DEFAULT_SNAPSHOT_MAX_FILES,
+            max_file_bytes: DEFAULT_SNAPSHOT_MAX_FILE_BYTES_MB * 1024 * 1024,
+        }
+    }
+}
+
+impl SnapshotsConfig {
+    pub const FIELDS: &[ConfigField] = &[
+        ConfigField {
+            name: "enabled",
+            ty: "bool",
+            default: ConfigValue::Bool(DEFAULT_SNAPSHOTS_ENABLED),
+            min: None,
+            env: None,
+            description: "Capture workspace snapshots. `false` keeps existing snapshots restorable but takes no new ones, so file revert stops covering new work",
+        },
+        ConfigField {
+            name: "max_bytes_mb",
+            ty: "u64",
+            default: ConfigValue::U64(DEFAULT_SNAPSHOT_MAX_BYTES_MB),
+            min: None,
+            env: None,
+            description: "Largest working tree a capture will take, and the cap on one session's object store. A workspace above it loses file revert rather than paying for a snapshot the store cannot keep",
+        },
+        ConfigField {
+            name: "max_files",
+            ty: "u64",
+            default: ConfigValue::U64(DEFAULT_SNAPSHOT_MAX_FILES),
+            min: None,
+            env: None,
+            description: "Most files a capture will take, counted after ignore rules",
+        },
+        ConfigField {
+            name: "max_file_bytes_mb",
+            ty: "u64",
+            default: ConfigValue::U64(DEFAULT_SNAPSHOT_MAX_FILE_BYTES_MB),
+            min: None,
+            env: None,
+            description: "Largest single file a capture will take. A bigger one is left out of the snapshot and left alone on disk, so it cannot be reverted",
+        },
+    ];
+
+    fn from_file(f: SnapshotsFileConfig) -> Self {
+        Self {
+            enabled: f.enabled.unwrap_or(DEFAULT_SNAPSHOTS_ENABLED),
+            max_bytes: f.max_bytes_mb.unwrap_or(DEFAULT_SNAPSHOT_MAX_BYTES_MB) * 1024 * 1024,
+            max_files: f.max_files.unwrap_or(DEFAULT_SNAPSHOT_MAX_FILES),
+            max_file_bytes: f
+                .max_file_bytes_mb
+                .unwrap_or(DEFAULT_SNAPSHOT_MAX_FILE_BYTES_MB)
+                * 1024
+                * 1024,
         }
     }
 }

@@ -629,6 +629,7 @@ pub fn run(mut cli: Cli) -> Result<ExitCode> {
                 storage: storage.clone(),
                 config: stack.config.agent.clone(),
                 ui_config: stack.config.ui.clone(),
+                snapshots: stack.config.storage.snapshots,
                 input_history_size: stack.config.storage.input_history_size,
                 max_log_files: stack.config.storage.max_log_files,
                 permissions: Arc::new(

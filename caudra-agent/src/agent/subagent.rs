@@ -848,6 +848,7 @@ fn build(
             // Shared, not fresh: a subagent tracks its own reads but must not
             // write a file a sibling agent is writing.
             path_locks: Arc::clone(&ctx.path_locks),
+            baseline: ctx.baseline.clone(),
             prompt_slots: Arc::clone(&ctx.prompt_slots),
             prompt_profiles: Arc::clone(&ctx.prompt_profiles),
             default_task_prompt_profile_name: resolved.default_task_prompt_profile_name,

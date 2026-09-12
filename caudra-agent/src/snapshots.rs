@@ -34,9 +34,49 @@ const UNIX_FILE_MODE_MASK: u32 = 0o7777;
 static STORE_LOCK: Mutex<()> = Mutex::new(());
 
 pub const DEFAULT_SNAPSHOT_CAP_BYTES: u64 = 512 * 1024 * 1024;
+pub const DEFAULT_SNAPSHOT_MAX_FILES: u64 = 50_000;
+pub const DEFAULT_SNAPSHOT_MAX_FILE_BYTES: u64 = 100 * 1024 * 1024;
 pub const SESSION_SNAPSHOTS_DIR: &str = "session-snapshots";
 
+const LIMIT_MAX_FILES: &str = "max_files";
+const LIMIT_MAX_BYTES: &str = "max_bytes";
+const ROOT_IS_FILESYSTEM_ROOT: &str = "it is the filesystem root";
+const ROOT_IS_HOME: &str = "it is the home directory";
+
 type RelPath = String;
+
+/// What one capture may cost before it is refused. `max_bytes` doubles as the
+/// object-store cap: `session-start` is a permanent GC root and objects are
+/// stored uncompressed, so a working tree above the cap is over budget from the
+/// very first snapshot and the two numbers must not disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotLimits {
+    pub max_bytes: u64,
+    pub max_files: u64,
+    pub max_file_bytes: u64,
+}
+
+impl Default for SnapshotLimits {
+    fn default() -> Self {
+        Self {
+            max_bytes: DEFAULT_SNAPSHOT_CAP_BYTES,
+            max_files: DEFAULT_SNAPSHOT_MAX_FILES,
+            max_file_bytes: DEFAULT_SNAPSHOT_MAX_FILE_BYTES,
+        }
+    }
+}
+
+/// `enabled` has no place here: a store that cannot capture must still restore
+/// what it already holds, so the switch belongs to whoever asks for a capture.
+impl From<caudra_config::SnapshotsConfig> for SnapshotLimits {
+    fn from(config: caudra_config::SnapshotsConfig) -> Self {
+        Self {
+            max_bytes: config.max_bytes,
+            max_files: config.max_files,
+            max_file_bytes: config.max_file_bytes,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileEntry {
@@ -220,6 +260,29 @@ pub enum SnapshotError {
     RestoreOperationNotApplied(CaudraId),
     #[error("snapshot store lock is poisoned")]
     LockPoisoned,
+    #[error(
+        "workspace is too large to snapshot: {files} files and {bytes} bytes, over {exceeded} = {limit}"
+    )]
+    WorkspaceTooLarge {
+        files: u64,
+        bytes: u64,
+        exceeded: &'static str,
+        limit: u64,
+    },
+    #[error("{root} cannot be snapshotted: {reason}")]
+    WorkspaceUnsupported { root: String, reason: &'static str },
+}
+
+impl SnapshotError {
+    /// Whether this is a deliberate refusal of the workspace rather than a
+    /// failure to carry out a capture. A refusal turns file revert off and lets
+    /// the work continue; a failure does not.
+    pub fn is_workspace_refusal(&self) -> bool {
+        matches!(
+            self,
+            Self::WorkspaceTooLarge { .. } | Self::WorkspaceUnsupported { .. }
+        )
+    }
 }
 
 trait ContentHasher: Send + Sync {
@@ -293,6 +356,7 @@ struct UnrevertRecord {
 pub struct SnapshotStore {
     dir: PathBuf,
     cap_bytes: u64,
+    limits: SnapshotLimits,
     hasher: Arc<dyn ContentHasher>,
     artifact_state: Option<StateDir>,
 }
@@ -383,14 +447,25 @@ impl SnapshotStore {
         store
     }
 
+    /// The object-store cap alone, leaving the capture budget at its default.
+    /// Eviction and refusal are separate concerns: a test that wants a store to
+    /// overflow after a handful of files must not thereby refuse to capture them.
     pub fn with_cap(snapshots_dir: PathBuf, cap_bytes: u64) -> Self {
         Self::with_hasher(snapshots_dir, cap_bytes, Arc::new(Sha256Hasher))
+    }
+
+    /// The capture budget, whose `max_bytes` is also the object-store cap.
+    pub fn with_limits(mut self, limits: SnapshotLimits) -> Self {
+        self.cap_bytes = limits.max_bytes;
+        self.limits = limits;
+        self
     }
 
     fn with_hasher(snapshots_dir: PathBuf, cap_bytes: u64, hasher: Arc<dyn ContentHasher>) -> Self {
         Self {
             dir: snapshots_dir,
             cap_bytes,
+            limits: SnapshotLimits::default(),
             hasher,
             artifact_state: None,
         }
@@ -483,6 +558,7 @@ impl SnapshotStore {
             kind,
             files = stats.files,
             bytes = stats.bytes,
+            skipped_large = stats.skipped_large,
             walk_us = micros(stats.walk),
             content_us = micros(stats.content),
             hash_us = micros(stats.hash),
@@ -948,10 +1024,12 @@ impl SnapshotStore {
 
     fn capture(&self, root: &Path) -> Result<(Manifest, CaptureStats), SnapshotError> {
         let start = Instant::now();
-        let files = self.walk_working_tree(root)?;
+        let walked = self.walk_working_tree(root)?;
+        let files = walked.files;
         let mut stats = CaptureStats {
             walk: start.elapsed(),
             files: files.len() as u64,
+            skipped_large: walked.skipped_large,
             ..CaptureStats::default()
         };
         let content_start = Instant::now();
@@ -1031,23 +1109,35 @@ impl SnapshotStore {
         }
     }
 
-    fn walk_working_tree(&self, root: &Path) -> Result<Vec<WalkedFile>, SnapshotError> {
-        let git_worktree = root.ancestors().any(|path| path.join(".git").exists());
+    /// Enumerates what a capture would hash, and refuses before hashing any of
+    /// it when the tree is beyond the budget. Everything here reads metadata
+    /// only, so refusing a 900k-file home directory costs the inodes up to the
+    /// ceiling rather than the whole tree.
+    fn walk_working_tree(&self, root: &Path) -> Result<WalkedTree, SnapshotError> {
+        if let Some(reason) = unsupported_root(root) {
+            return Err(SnapshotError::WorkspaceUnsupported {
+                root: root.display().to_string(),
+                reason,
+            });
+        }
         let excluded = fs::canonicalize(&self.dir)
             .or_else(|_| std::path::absolute(&self.dir))
             .unwrap_or_else(|_| self.dir.clone());
         let mut builder = WalkBuilder::new(root);
-        builder.hidden(false);
-        if git_worktree {
-            builder
-                .ignore(true)
-                .git_ignore(true)
-                .git_global(true)
-                .git_exclude(true)
-                .require_git(true);
-        } else {
-            builder.standard_filters(false);
-        }
+        // `require_git(false)`: a `.gitignore` without a repository around it is
+        // still the user saying which paths are disposable, and every other walk
+        // in Caudra honours it. The alternative was no filtering at all outside a
+        // worktree, which is how a session rooted at `$HOME` came to hash it.
+        // `same_file_system`: a network share or external drive mounted inside
+        // the workspace is not part of the project.
+        builder
+            .hidden(false)
+            .ignore(true)
+            .git_ignore(true)
+            .git_global(true)
+            .git_exclude(true)
+            .require_git(false)
+            .same_file_system(true);
         builder.filter_entry(move |entry| {
             if entry.depth() == 0 {
                 return true;
@@ -1062,12 +1152,11 @@ impl SnapshotStore {
             // directory). Descending anyway meant a workspace whose 357
             // tracked files sat beside a 928k-file data repository read and
             // hashed all 7 GB of it on every capture.
-            !(git_worktree
-                && entry.file_type().is_some_and(|kind| kind.is_dir())
+            !(entry.file_type().is_some_and(|kind| kind.is_dir())
                 && entry.path().join(".git").exists())
         });
 
-        let mut files = Vec::new();
+        let mut walked = WalkedTree::default();
         for result in builder.build() {
             let entry = result.map_err(|error| io::Error::other(error.to_string()))?;
             if !entry.file_type().is_some_and(|kind| kind.is_file()) {
@@ -1084,13 +1173,31 @@ impl SnapshotStore {
             let metadata = entry
                 .metadata()
                 .map_err(|error| io::Error::other(error.to_string()))?;
-            files.push(WalkedFile {
+            // Skipped rather than refused: one oversized blob beside a normal
+            // project should not cost the project its revert. `restore` only
+            // touches paths named by a manifest, so a skipped file is never
+            // deleted, it just cannot be restored. It is also what keeps
+            // `read_claimed`'s whole-file read bounded.
+            if metadata.len() > self.limits.max_file_bytes {
+                walked.skipped_large += 1;
+                continue;
+            }
+            walked.bytes += metadata.len();
+            walked.files.push(WalkedFile {
                 relative: relative.to_owned(),
                 absolute: entry.path().to_path_buf(),
                 metadata,
             });
+            if let Some((exceeded, limit)) = self.limits.exceeded_by(&walked) {
+                return Err(SnapshotError::WorkspaceTooLarge {
+                    files: walked.files.len() as u64,
+                    bytes: walked.bytes,
+                    exceeded,
+                    limit,
+                });
+            }
         }
-        Ok(files)
+        Ok(walked)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1632,6 +1739,47 @@ struct WalkedFile {
     metadata: fs::Metadata,
 }
 
+/// What one walk found, before any of it is read.
+#[derive(Default)]
+struct WalkedTree {
+    files: Vec<WalkedFile>,
+    bytes: u64,
+    skipped_large: u64,
+}
+
+impl SnapshotLimits {
+    fn exceeded_by(&self, walked: &WalkedTree) -> Option<(&'static str, u64)> {
+        if walked.files.len() as u64 > self.max_files {
+            Some((LIMIT_MAX_FILES, self.max_files))
+        } else if walked.bytes > self.max_bytes {
+            Some((LIMIT_MAX_BYTES, self.max_bytes))
+        } else {
+            None
+        }
+    }
+}
+
+/// Roots no project lives at, refused before a single directory is read. A home
+/// directory is never a project root, and these are the cases no ignore file
+/// would ever catch, because neither has one.
+///
+/// Deliberately not here: a root that is a filesystem mount point. A
+/// bind-mounted project root is how a container normally sees its project, so
+/// refusing one would disable revert for every such setup. `same_file_system`
+/// already stops the walk from leaving the device, and the size ceiling covers
+/// what is left.
+fn unsupported_root(root: &Path) -> Option<&'static str> {
+    if root.parent().is_none() {
+        return Some(ROOT_IS_FILESYSTEM_ROOT);
+    }
+    // Canonical on both sides: the root arrives resolved, and a home directory
+    // reached through a symlink is still the home directory.
+    caudra_storage::paths::home()
+        .map(|home| fs::canonicalize(&home).unwrap_or(home))
+        .is_some_and(|home| home == root)
+        .then_some(ROOT_IS_HOME)
+}
+
 /// Where the time in one `capture` went.
 #[derive(Default)]
 struct CaptureStats {
@@ -1646,6 +1794,9 @@ struct CaptureStats {
     /// Verifying present objects and durably writing absent ones.
     object_write: Duration,
     objects_written: u64,
+    /// Files the walk left out for exceeding `max_file_bytes`, and so the count
+    /// of paths this snapshot cannot restore.
+    skipped_large: u64,
 }
 
 #[derive(Default)]
@@ -3014,12 +3165,19 @@ mod tests {
     const NESTED_REPO_MSG: &str = "a nested repository belongs to itself, not to this worktree";
 
     /// The parent's own files still have to be captured; only the nested
-    /// repository is out of scope.
-    #[test_case(true  ; "unregistered_clone_is_a_boundary")]
-    #[test_case(false ; "submodule_gitlink_is_a_boundary")]
-    fn a_nested_repository_is_not_part_of_this_worktree(nested_git_is_dir: bool) {
+    /// repository is out of scope. A repository nested in a plain directory is
+    /// just as much its own worktree as one nested in another repository.
+    #[test_case(true, true   ; "unregistered_clone_is_a_boundary")]
+    #[test_case(true, false  ; "submodule_gitlink_is_a_boundary")]
+    #[test_case(false, true  ; "a_boundary_without_an_enclosing_repository")]
+    fn a_nested_repository_is_not_part_of_this_worktree(
+        parent_is_repository: bool,
+        nested_git_is_dir: bool,
+    ) {
         let (_temp, root, snapshots) = setup();
-        fs::create_dir(root.join(".git")).unwrap();
+        if parent_is_repository {
+            fs::create_dir(root.join(".git")).unwrap();
+        }
         write(&root, "kept.txt", ALPHA);
         fs::create_dir_all(root.join("training-data")).unwrap();
         if nested_git_is_dir {
@@ -3054,14 +3212,153 @@ mod tests {
         assert!(!manifest.keys().any(|path| path.starts_with(".git/")));
     }
 
-    #[test]
-    fn non_git_walk_does_not_treat_gitignore_as_an_exclusion() {
+    const NON_GIT_IGNORE_MSG: &str =
+        "an ignore file states intent with or without a repository around it";
+
+    /// Without this, a directory that is not a repository had no filtering at
+    /// all, which is how a session rooted at a home directory came to hash it.
+    #[test_case(".gitignore" ; "gitignore")]
+    #[test_case(".ignore"    ; "ignore")]
+    fn a_walk_outside_a_repository_honors_ignore_files(ignore_file: &str) {
         let (_temp, root, snapshots) = setup();
-        write(&root, ".gitignore", "*.ignored\n");
-        write(&root, "included.ignored", BETA);
+        write(&root, ignore_file, "*.ignored\nheavy/\n");
+        write(&root, "kept.txt", ALPHA);
+        write(&root, "secret.ignored", BETA);
+        write(&root, "heavy/blob.bin", BETA);
         let store = SnapshotStore::new(snapshots);
 
         let manifest = store.snapshot_session_start(&root).unwrap();
-        assert!(manifest.contains_key("included.ignored"));
+        assert!(manifest.contains_key("kept.txt"), "{NON_GIT_IGNORE_MSG}");
+        assert!(
+            !manifest.contains_key("secret.ignored"),
+            "{NON_GIT_IGNORE_MSG}"
+        );
+        assert!(
+            !manifest.contains_key("heavy/blob.bin"),
+            "{NON_GIT_IGNORE_MSG}"
+        );
+    }
+
+    const REFUSAL_MSG: &str = "a tree over the budget is refused, not captured";
+    const UNHASHED_MSG: &str = "a refusal must cost metadata only, never a hash";
+
+    /// The point of deciding from the walk is that the expensive half never
+    /// runs, so the hasher is the assertion: a refusal that had already read
+    /// and hashed the tree would be no cheaper than capturing it.
+    #[test_case(
+        SnapshotLimits { max_files: 1, ..SnapshotLimits::default() },
+        LIMIT_MAX_FILES,
+        1
+        ; "over_the_file_ceiling"
+    )]
+    #[test_case(
+        SnapshotLimits { max_bytes: 4, ..SnapshotLimits::default() },
+        LIMIT_MAX_BYTES,
+        4
+        ; "over_the_byte_ceiling"
+    )]
+    fn a_tree_over_the_budget_is_refused_before_anything_is_hashed(
+        limits: SnapshotLimits,
+        expected_limit_name: &str,
+        expected_limit: u64,
+    ) {
+        let (_temp, root, snapshots) = setup();
+        write(&root, "one.txt", ALPHA);
+        write(&root, "two.txt", BETA);
+        let hasher = Arc::new(CountingHasher::new());
+        let store =
+            SnapshotStore::with_hasher(snapshots, u64::MAX, hasher.clone()).with_limits(limits);
+
+        let error = store.snapshot_session_start(&root).unwrap_err();
+        assert!(error.is_workspace_refusal(), "{REFUSAL_MSG}: {error}");
+        let SnapshotError::WorkspaceTooLarge {
+            exceeded, limit, ..
+        } = error
+        else {
+            panic!("{REFUSAL_MSG}: {error}");
+        };
+        assert_eq!(exceeded, expected_limit_name, "{REFUSAL_MSG}");
+        assert_eq!(limit, expected_limit, "{REFUSAL_MSG}");
+        assert_eq!(hasher.count(), 0, "{UNHASHED_MSG}");
+        assert!(!store.has_session_start(), "{REFUSAL_MSG}");
+    }
+
+    const OVERSIZED_MSG: &str =
+        "an oversized file is left out of the snapshot and left alone on disk";
+
+    #[test]
+    fn an_oversized_file_is_skipped_and_never_restored_over() {
+        let (_temp, root, snapshots) = setup();
+        let big = vec![b'x'; 64];
+        write(&root, "small.txt", ALPHA);
+        write(&root, "big.bin", &big);
+        let store = SnapshotStore::new(snapshots).with_limits(SnapshotLimits {
+            max_file_bytes: 32,
+            ..SnapshotLimits::default()
+        });
+
+        let manifest = store.snapshot_session_start(&root).unwrap();
+        assert!(manifest.contains_key("small.txt"), "{OVERSIZED_MSG}");
+        assert!(!manifest.contains_key("big.bin"), "{OVERSIZED_MSG}");
+
+        write(&root, "small.txt", "changed");
+        let after = vec![b'y'; 64];
+        write(&root, "big.bin", &after);
+        let head = checkpoint(1);
+        store.snapshot(&root, head).unwrap();
+
+        store.restore(&root, &[head], &[]).unwrap();
+        assert_eq!(
+            fs::read_to_string(root.join("small.txt")).unwrap(),
+            ALPHA,
+            "{OVERSIZED_MSG}"
+        );
+        assert_eq!(
+            fs::read(root.join("big.bin")).unwrap(),
+            after,
+            "{OVERSIZED_MSG}"
+        );
+    }
+
+    const UNSUPPORTED_ROOT_MSG: &str = "a root no project lives at is refused without a walk";
+
+    #[test]
+    fn the_filesystem_root_and_the_home_directory_are_refused() {
+        assert_eq!(
+            unsupported_root(Path::new("/")),
+            Some(ROOT_IS_FILESYSTEM_ROOT),
+            "{UNSUPPORTED_ROOT_MSG}"
+        );
+        let home = caudra_storage::paths::home().expect("a home directory");
+        assert_eq!(
+            unsupported_root(&home),
+            Some(ROOT_IS_HOME),
+            "{UNSUPPORTED_ROOT_MSG}"
+        );
+        assert_eq!(
+            unsupported_root(&home.join("projects/app")),
+            None,
+            "{UNSUPPORTED_ROOT_MSG}"
+        );
+    }
+
+    #[test]
+    fn capturing_the_home_directory_is_refused() {
+        let temp = TempDir::new().unwrap();
+        let home = caudra_storage::paths::home().expect("a home directory");
+        let store = SnapshotStore::new(temp.path().join("snapshots"));
+
+        let error = store.snapshot_session_start(&home).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                SnapshotError::WorkspaceUnsupported {
+                    reason: ROOT_IS_HOME,
+                    ..
+                }
+            ),
+            "{UNSUPPORTED_ROOT_MSG}: {error}"
+        );
+        assert!(error.is_workspace_refusal(), "{UNSUPPORTED_ROOT_MSG}");
     }
 }
