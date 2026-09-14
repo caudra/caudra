@@ -11,8 +11,8 @@ use layout::{SegmentChrome, SegmentKind};
 
 use super::tool_display::{
     RenderCtx, ToolLines, append_annotation, append_right_info, assistant_style,
-    build_instructions_lines, build_tool_lines, done_style, error_style, format_timestamp_now,
-    notice_style, thinking_style, truncate_to_header, user_style,
+    build_instructions_lines, build_tool_lines, done_style, draws_live_script, error_style,
+    format_timestamp_now, notice_style, thinking_style, truncate_to_header, user_style,
 };
 use super::{
     DisplayMessage, DisplayRole, DisplaySource, ToolProgress, ToolRole, ToolStatus,
@@ -1274,7 +1274,11 @@ impl MessagesPanel {
             return Some(snapshot.lines.len());
         }
         if let Some(live) = msg.live_body.as_ref() {
-            return Some(live.lines().count());
+            // A streaming script is drawn whole, so there is no window over it
+            // to move. Sizing one from it would leave the reader's offset
+            // waiting for the output, which then opens part-scrolled.
+            let script = msg.role.tool_name().is_some_and(draws_live_script);
+            return (!script).then(|| live.lines().count());
         }
         let text = msg
             .tool_output

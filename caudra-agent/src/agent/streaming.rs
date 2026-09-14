@@ -932,7 +932,16 @@ mod tests {
 
     #[test]
     fn a_tool_with_no_body_to_count_publishes_no_size() {
-        assert!(sizes("shell", &body(STEPPED_LINES)).is_empty());
+        assert!(sizes(READ, &body(STEPPED_LINES)).is_empty());
+    }
+
+    /// A long command is as long a wait as a long write, and a closed row has
+    /// only the header to say so.
+    #[test]
+    fn a_command_is_counted_too() {
+        let mut fragments = vec![r#"{"command": "first"#];
+        fragments.extend(std::iter::repeat_n(NEWLINE, STEPPED_LINES));
+        assert_eq!(sizes(SHELL, &fragments), [FIRST_STEP, SECOND_STEP]);
     }
 
     /// An edit is as long a wait as a write, and the header is the only place
@@ -977,7 +986,19 @@ mod tests {
 
     #[test]
     fn a_tool_with_no_body_publishes_none() {
-        assert!(published_body("shell", &[r#"{"command": "ls"}"#]).is_empty());
+        assert!(published_body(READ, &[r#"{"filePath": "a.rs"}"#]).is_empty());
+    }
+
+    /// The header is one space-joined line, so the body is the only thing that
+    /// can show a command the way it was written.
+    #[test]
+    fn a_command_is_published_as_a_body_and_previewed_as_a_line() {
+        let fragments = [r#"{"command": "cd /tmp\nl"#, r#"s -la"}"#];
+        assert_eq!(published_body(SHELL, &fragments), "cd /tmp\nls -la");
+        assert_eq!(
+            previews(SHELL, &fragments).last().map(String::as_str),
+            Some("cd /tmp ls -la")
+        );
     }
 
     /// A half-written diff is worse than the line count beside it, so these

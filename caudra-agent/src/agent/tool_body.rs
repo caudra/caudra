@@ -36,7 +36,8 @@ const UNICODE_ESCAPE_DIGITS: u8 = 4;
 /// What a card can do with a body before the call runs.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Body {
-    /// Drawn as it arrives: a whole file is legible half-written.
+    /// Drawn as it arrives: a whole file, and a script, are legible
+    /// half-written.
     Drawn,
     /// Counted and dropped: a diff is legible as a diff and as nothing else.
     Counted,
@@ -50,6 +51,12 @@ enum Body {
 /// a pattern or a query, and has nothing long enough to be worth showing or
 /// counting.
 ///
+/// A script belongs here for the same reason a whole file does: it is the
+/// record of what ran, it is legible half-written, and its card draws it as
+/// numbered lines either way. Nothing but its own length bounds it, so a
+/// heredoc spends the whole stream arriving and the header alone can only
+/// show a space-joined prefix of it.
+///
 /// An edit counts both of its sides. The count answers how long the wait is,
 /// not how big the change is, and the side being replaced is half of that
 /// wait: it arrives first, so counting only the new side leaves the header
@@ -59,6 +66,8 @@ const BODY_ARGS: &[(&str, &[&str], Body)] = &[
     ("file_write", &["content"], Body::Drawn),
     ("file_edit", &["oldString", "newString"], Body::Counted),
     ("file_apply_patch", &["patchText"], Body::Named),
+    ("shell", &["command"], Body::Drawn),
+    ("python_execution", &["code"], Body::Drawn),
 ];
 
 /// The arguments `tool` writes and what becomes of them, `None` for a tool
@@ -363,9 +372,12 @@ mod tests {
     const WRITE: &str = "file_write";
     const EDIT: &str = "file_edit";
     const PATCH: &str = "file_apply_patch";
+    const SHELL: &str = "shell";
     const CONTENT_KEYS: &[&str] = &["content"];
     const EDIT_KEYS: &[&str] = &["oldString", "newString"];
     const PATCH_TEXT_KEYS: &[&str] = &["patchText"];
+    const COMMAND_KEYS: &[&str] = &["command"];
+    const CODE_KEYS: &[&str] = &["code"];
     /// What a header reads once it stops naming files one by one.
     const COUNTED_FILES: &str = " files";
     const EXPECT_NAMED: &str = "a patch that declares files earns a header";
@@ -408,7 +420,9 @@ mod tests {
     #[test_case("mcp_File_write", Some((CONTENT_KEYS, Body::Drawn)) ; "a_qualified_name_resolves")]
     #[test_case(EDIT, Some((EDIT_KEYS, Body::Counted)) ; "an_edit_reads_both_sides")]
     #[test_case(PATCH, Some((PATCH_TEXT_KEYS, Body::Named)) ; "a_patch_reads_its_envelope")]
-    #[test_case("shell", None ; "a_tool_with_no_body")]
+    #[test_case(SHELL, Some((COMMAND_KEYS, Body::Drawn)) ; "a_command_is_drawn")]
+    #[test_case("python_execution", Some((CODE_KEYS, Body::Drawn)) ; "a_script_is_drawn")]
+    #[test_case("file_read", None ; "a_tool_with_no_body")]
     fn a_tools_body_arguments(tool: &str, expected: Option<(&[&str], Body)>) {
         assert_eq!(body_arg(tool), expected);
         assert_eq!(BodyStream::new(tool).is_some(), expected.is_some());
@@ -421,6 +435,20 @@ mod tests {
             &[r#"{"filePath": "a.rs", "content": "fn "#, r#"x() {}"}"#],
         );
         assert_eq!(decoded, "fn x() {}");
+    }
+
+    /// A heredoc is the case the header could never show: the newlines it is
+    /// made of are what the header collapses into spaces.
+    #[test]
+    fn a_command_keeps_the_newlines_its_header_collapses() {
+        let decoded = published(
+            SHELL,
+            &[
+                r#"{"command": "python3 - <<'PY'\nimp"#,
+                r#"ort re\nprint(re)\nPY", "timeout": 1000}"#,
+            ],
+        );
+        assert_eq!(decoded, "python3 - <<'PY'\nimport re\nprint(re)\nPY");
     }
 
     #[test]

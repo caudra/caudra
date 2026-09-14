@@ -7851,6 +7851,86 @@ fn a_closed_shell_row_still_names_the_command() {
     assert!(text.contains(SCRIPT_HEAD), "{HEADER_ONCE_MSG}: {text:?}");
 }
 
+/// The command as its fragments arrive, and the one-line header the agent
+/// publishes alongside them: every newline is a space, so the header can never
+/// be the script.
+const COMMAND_FRAGMENTS: &[&str] = &[SCRIPT_HEAD, "\necho one", "\necho two"];
+const STREAMED_COMMAND_HEADER: &str = "set -euo pipefail echo one echo two";
+const LIVE_COMMAND_MSG: &str =
+    "an open card draws the command line by line while it streams, not once the call has run";
+
+/// Feeds a shell call the way the agent does: a pending row, then the header
+/// and body of each fragment.
+fn streaming_shell(panel: &mut MessagesPanel) {
+    panel.tool_pending(TOOL_ID.into(), SHELL_TOOL_NAME);
+    let mut arrived = String::new();
+    for fragment in COMMAND_FRAGMENTS {
+        arrived.push_str(fragment);
+        let header = arrived.split_whitespace().collect::<Vec<_>>().join(" ");
+        panel.tool_input_preview(TOOL_ID, Some(header), None);
+        panel.tool_input_body(TOOL_ID, Some((*fragment).into()));
+    }
+}
+
+/// The reported wait: an open card showed the space-joined header and nothing
+/// else until the whole command had arrived. It draws the script instead, and
+/// the settled card that replaces it draws the same thing, so nothing moves.
+#[test]
+fn an_open_shell_card_draws_its_command_as_it_streams() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.set_view(ViewMode::Expanded);
+    streaming_shell(&mut panel);
+    render(&mut panel, 100, 40);
+
+    let text = seg_text(&panel, TOOL_ID);
+    for line in COMMAND_FRAGMENTS.iter().map(|f| f.trim()) {
+        assert!(text.contains(line), "{LIVE_COMMAND_MSG}: {text:?}");
+    }
+    assert!(
+        !text.contains(STREAMED_COMMAND_HEADER),
+        "{HEADER_ONCE_MSG}: {text:?}"
+    );
+}
+
+/// A closed row is the one state with no body to defer to, so it keeps the
+/// header it has always had.
+#[test]
+fn a_closed_shell_row_names_a_streaming_command() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.set_view(ViewMode::Compact);
+    streaming_shell(&mut panel);
+    render(&mut panel, 100, 40);
+
+    let text = seg_text(&panel, TOOL_ID);
+    assert!(
+        text.contains(STREAMED_COMMAND_HEADER),
+        "{HEADER_ONCE_MSG}: {text:?}"
+    );
+}
+
+/// The card the streamed one becomes: the same script, from the call's real
+/// input, and the command still named exactly once.
+#[test]
+fn a_started_shell_card_replaces_what_it_streamed() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.set_view(ViewMode::Expanded);
+    streaming_shell(&mut panel);
+    render(&mut panel, 100, 40);
+    shell_script_card(&mut panel);
+    render(&mut panel, 100, 40);
+
+    let text = seg_text(&panel, TOOL_ID);
+    assert_eq!(
+        text.matches(SCRIPT_HEAD).count(),
+        1,
+        "{HEADER_ONCE_MSG}: {text:?}"
+    );
+    assert!(
+        !text.contains(COMMAND_FRAGMENTS[1].trim()),
+        "{LIVE_COMMAND_MSG}: {text:?}, the streamed body outlived the call"
+    );
+}
+
 /// The reported truncation: a long inline script was cut to the output budget
 /// and offered a "click to expand" inside a card that was already open. The
 /// output keeps its budget, since a tool can print without limit, but the

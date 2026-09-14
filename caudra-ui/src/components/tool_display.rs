@@ -29,7 +29,10 @@ use crate::markdown::{
 use caudra_agent::{
     BatchToolStatus, BufferSnapshot, InstructionBlock, NO_FILES_FOUND, ShellOutput, SnapshotSpan,
     SpanStyle, SubagentProgress, ToolInput, ToolOutput,
-    tools::{FILE_READ_TOOL_NAME, FILE_WRITE_TOOL_NAME, humanize_duration},
+    tools::{
+        FILE_READ_TOOL_NAME, FILE_WRITE_TOOL_NAME, PYTHON_EXECUTION_TOOL_NAME, SHELL_TOOL_NAME,
+        humanize_duration,
+    },
 };
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -152,6 +155,10 @@ const QUERY_KEYS: &[(&str, &str)] = &[
     ("code_impact", "symbol"),
     ("code_expand", "symbol"),
 ];
+/// The tools whose streaming body is a script rather than a file. Both draw
+/// it as numbered lines whole, so it is rendered here the way the settled card
+/// renders it and never through the window their output is drawn in.
+const LIVE_SCRIPT_TOOLS: &[&str] = &[SHELL_TOOL_NAME, PYTHON_EXECUTION_TOOL_NAME];
 const MILLIS_PER_SECOND: u64 = 1_000;
 
 /// Duration inputs and the millis one of their units is worth, so a bracket
@@ -1280,6 +1287,25 @@ impl ToolLineBuilder {
         }
     }
 
+    /// The script a still-streaming call is spelling out, drawn the way the
+    /// settled card draws it: every line, numbered from one.
+    ///
+    /// Deliberately not `push_live_body`. A shell or python call is drawn as a
+    /// scroller, so a window on the tail would clip the command to the height
+    /// its *output* is given and then let it jump to its full length the
+    /// moment the call starts. The script is bounded by what the model wrote,
+    /// and `render_tool_content` draws all of it for that reason.
+    fn push_live_script(&mut self, code: &str) {
+        self.source.abandon();
+        let start = self.lines.len();
+        for mut line in code_view::render_live_body(code) {
+            line.spans.insert(0, Span::raw(TOOL_BODY_INDENT));
+            self.lines.push(line);
+        }
+        self.content_range = (start, self.lines.len());
+        self.push_search_text(code.trim_end());
+    }
+
     fn push_resolved_output(&mut self, resolved: &ResolvedOutput<'_>) {
         if resolved.text.is_none() {
             return;
@@ -1614,6 +1640,14 @@ fn header_repeats_script(header: &str, input: Option<&ToolInput>) -> bool {
     })
 }
 
+/// Whether this tool's streaming body is a script, which an open card draws
+/// whole rather than through the window its output is given.
+pub(super) fn draws_live_script(tool_name: &str) -> bool {
+    LIVE_SCRIPT_TOOLS
+        .iter()
+        .any(|known| names_tool(known, tool_name))
+}
+
 /// `expansion` is `None` on a compact row the reader has not opened, which is
 /// the only state that draws a header with no body.
 pub fn build_tool_lines(
@@ -1628,6 +1662,12 @@ pub fn build_tool_lines(
         None => (msg.text.as_str(), None),
     };
     let expanded = expansion.unwrap_or_default();
+    // The card's own record of what is running, until a snapshot supersedes
+    // it. Resolved before the header, which defers to it.
+    let live = msg
+        .live_body
+        .as_deref()
+        .filter(|_| msg.render_snapshot.is_none());
 
     let mut b = ToolLineBuilder::new(
         rctx.width,
@@ -1650,11 +1690,15 @@ pub fn build_tool_lines(
         b.prepend_compact_sigil(tool_name, rctx.started_at);
     } else {
         // The command still belongs on a row that has no body to defer to.
-        let shown =
-            match expansion.is_some() && header_repeats_script(header, msg.tool_input.as_deref()) {
-                true => "",
-                false => header,
-            };
+        // An open card has one either way: the settled script, or as much of
+        // it as has streamed.
+        let defers = expansion.is_some()
+            && (header_repeats_script(header, msg.tool_input.as_deref())
+                || (live.is_some() && draws_live_script(tool_name)));
+        let shown = match defers {
+            true => "",
+            false => header,
+        };
         b.push_header(
             tool_name,
             shown,
@@ -1686,15 +1730,14 @@ pub fn build_tool_lines(
             TOOL_BODY_INDENT,
         );
     }
-    let has_snapshot = msg.render_snapshot.is_some();
-    match msg.live_body.as_ref().filter(|_| !has_snapshot) {
+    match live {
+        Some(live) if draws_live_script(tool_name) => b.push_live_script(live),
         Some(live) => b.push_live_body(live, header),
         None => b.push_code_content(
             msg.tool_input.as_deref(),
-            if has_snapshot {
-                None
-            } else {
-                msg.tool_output.as_deref()
+            match msg.render_snapshot.is_some() {
+                true => None,
+                false => msg.tool_output.as_deref(),
             },
         ),
     }
@@ -2153,6 +2196,80 @@ mod tests {
         assert!(text.contains(HEADING_TEXT), "{text}");
         assert_eq!(text.contains(HEADING_SOURCE), keeps_markers, "{text}");
         assert_eq!(tl.highlight.is_some(), keeps_markers);
+    }
+
+    /// What the header could show of a multiline command: one space-joined
+    /// line, which is what the reported card was stuck on until the call ran.
+    const STREAMING_COMMAND: &str = "python3 - <<'PY'\nprint(1)\nprint(2)\nPY";
+    const STREAMED_HEADER: &str = "python3 - <<'PY' print(1) print(2) PY";
+    const LIVE_SCRIPT_MSG: &str =
+        "an open card draws the command it is being told, line by line, before the call runs";
+    const LIVE_ONCE_MSG: &str = "the header defers to the body it is about to draw";
+
+    fn streaming_shell_msg(live: &str) -> DisplayMessage {
+        DisplayMessage {
+            live_body: Some(live.to_owned()),
+            ..bash_msg(STREAMED_HEADER, ToolStatus::InProgress, None, None)
+        }
+    }
+
+    /// The reported wait: an open card showed the space-joined preview and
+    /// nothing else until the whole command had streamed.
+    #[test]
+    fn an_open_card_draws_the_command_as_it_streams() {
+        let msg = streaming_shell_msg(STREAMING_COMMAND);
+        let tl = build_tool_lines(
+            &msg,
+            ToolStatus::InProgress,
+            &test_rctx(80),
+            Some(Disclosure::default()),
+        );
+
+        let text = lines_text(&tl);
+        for line in STREAMING_COMMAND.lines() {
+            assert!(text.contains(line), "{LIVE_SCRIPT_MSG}: {text:?}");
+        }
+        assert!(!text.contains(STREAMED_HEADER), "{LIVE_ONCE_MSG}: {text:?}");
+    }
+
+    /// A shell card is a scroller, so routing the command through the live
+    /// *body* would clip it to the height its output gets and then let it jump
+    /// to its full length the moment the call starts.
+    #[test]
+    fn a_streaming_command_is_drawn_whole_rather_than_windowed() {
+        /// Shorter than the command, so a window would have to hide some of it.
+        const WINDOW: u32 = 2;
+        let window = ScrollWindow {
+            height: WINDOW as usize,
+            offset: 0,
+            follow: true,
+        };
+        let msg = streaming_shell_msg(STREAMING_COMMAND);
+        let tl = build_tool_lines(
+            &msg,
+            ToolStatus::InProgress,
+            &scroll_rctx(80, WINDOW, window),
+            Some(Disclosure::default()),
+        );
+
+        let text = lines_text(&tl);
+        for line in STREAMING_COMMAND.lines() {
+            assert!(text.contains(line), "{LIVE_SCRIPT_MSG}: {text:?}");
+        }
+        assert!(!tl.truncation, "{LIVE_SCRIPT_MSG}: {text:?}");
+        assert!(!text.contains(FOLLOWING), "{LIVE_SCRIPT_MSG}: {text:?}");
+    }
+
+    /// A closed row has no body to defer to, so the one-line preview is all it
+    /// has and it keeps it.
+    #[test]
+    fn a_closed_row_still_names_a_streaming_command() {
+        let msg = streaming_shell_msg(STREAMING_COMMAND);
+        let tl = build_tool_lines(&msg, ToolStatus::InProgress, &compact_rctx(80), None);
+
+        let text = lines_text(&tl);
+        assert!(text.contains(STREAMED_HEADER), "{text:?}");
+        assert!(tl.truncation, "{LIVE_SCRIPT_MSG}: {text:?}");
     }
 
     #[test]
