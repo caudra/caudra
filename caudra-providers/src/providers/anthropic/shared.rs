@@ -4,7 +4,7 @@ use std::sync::{Arc, LazyLock};
 
 use flume::Sender;
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 
@@ -13,8 +13,8 @@ use crate::model::{
     StaticReasoningOption,
 };
 use crate::{
-    AgentError, ContentBlock, EMPTY_RESPONSE_MARKER, INVALID_TOOL_JSON_KEY, Message, ProviderEvent,
-    Role, StopReason, StreamResponse, ThinkingConfig, TokenUsage,
+    AgentError, ContentBlock, EMPTY_RESPONSE_MARKER, Message, ProviderEvent, Role, StopReason,
+    StreamResponse, ThinkingConfig, TokenUsage, invalid_tool_input,
 };
 
 pub(super) const BETA_TOOL_EXAMPLES_BEDROCK: &str = "tool-examples-2025-10-29";
@@ -279,19 +279,6 @@ pub(super) fn build_wire_tools(tools: &Value) -> Value {
         last["cache_control"] = json!({"type": "ephemeral"});
     }
     Value::Array(out)
-}
-
-/// A body that never parsed can be as long as the whole output window, and it
-/// travels back to the model inside a tool result. This is enough to see where
-/// generation went wrong without spending the next turn on the wreckage.
-const INVALID_TOOL_JSON_EXCERPT: usize = 2_000;
-
-fn invalid_tool_input(raw: &str) -> Value {
-    let excerpt: String = raw.chars().take(INVALID_TOOL_JSON_EXCERPT).collect();
-    Value::Object(Map::from_iter([(
-        INVALID_TOOL_JSON_KEY.to_string(),
-        Value::String(excerpt),
-    )]))
 }
 
 pub(crate) fn build_request_body_with_system(
@@ -582,7 +569,7 @@ impl EventParser {
                             v
                         }
                         Err(e) => {
-                            warn!(error = %e, json = %self.current_tool_json, "unparseable tool input JSON");
+                            warn!(category = ?e.classify(), line = e.line(), column = e.column(), input_bytes = self.current_tool_json.len(), "unparseable tool input JSON");
                             invalid_tool_input(&self.current_tool_json)
                         }
                     };
@@ -897,7 +884,21 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
 mod tests {
     use test_case::test_case;
 
-    use crate::Model;
+    use crate::{Message, Model, SteeringKind};
+
+    const STEERING_TEXT: &str = "Continue with a useful response.";
+    const STEERING_RULE: &str = "empty_output";
+
+    #[test_case(SteeringKind::Recovery ; "recovery")]
+    #[test_case(SteeringKind::Advisory ; "advisory")]
+    fn steering_metadata_is_not_on_wire(kind: SteeringKind) {
+        let messages = [Message::steering(STEERING_TEXT.into(), STEERING_RULE, kind)];
+        let wire = serde_json::to_value(super::build_wire_messages(&messages)).unwrap();
+        assert_eq!(
+            wire,
+            json!([{"role": "user", "content": [{"type": "text", "text": STEERING_TEXT, "cache_control": {"type": "ephemeral"}}]}])
+        );
+    }
 
     #[test_case("anthropic/claude-sonnet-5", &["low", "medium", "high", "xhigh", "max"] ; "sonnet_5_has_no_minimal")]
     #[test_case("anthropic/claude-opus-5",   &["low", "medium", "high", "xhigh", "max"] ; "opus_5_has_no_minimal")]
@@ -968,10 +969,7 @@ mod tests {
 
     use serde_json::{Value, json};
 
-    use super::{
-        EAGER_INPUT_STREAMING, INVALID_TOOL_JSON_EXCERPT, INVALID_TOOL_JSON_KEY,
-        apply_oauth_request_profile, build_wire_tools, invalid_tool_input,
-    };
+    use super::{EAGER_INPUT_STREAMING, apply_oauth_request_profile, build_wire_tools};
 
     const BUFFERED_TOOL: &str =
         "every tool must ask for eager streaming or its large arguments arrive in one fragment";
@@ -1017,18 +1015,5 @@ mod tests {
             "{BUFFERED_TOOL}"
         );
         assert!(tools[1]["name"].as_str().unwrap().starts_with("mcp_"));
-    }
-
-    const EXCERPT_UNBOUNDED: &str = "a runaway tool body must not travel back whole";
-
-    #[test]
-    fn an_unparseable_tool_input_keeps_a_bounded_excerpt() {
-        let raw = "\u{e9}".repeat(INVALID_TOOL_JSON_EXCERPT * 2);
-        let wrapped = invalid_tool_input(&raw);
-
-        let excerpt = wrapped[INVALID_TOOL_JSON_KEY].as_str().unwrap();
-        assert_eq!(excerpt.chars().count(), INVALID_TOOL_JSON_EXCERPT);
-        assert!(raw.starts_with(excerpt), "{EXCERPT_UNBOUNDED}");
-        assert_eq!(wrapped.as_object().unwrap().len(), 1);
     }
 }

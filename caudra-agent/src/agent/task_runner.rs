@@ -11,6 +11,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::Instant;
 
@@ -54,15 +55,12 @@ const STRUCTURED_OUTPUT_DESCRIPTION: &str =
 const STRUCTURED_OUTPUT_ACK: &str = "Output recorded.";
 const STRUCTURED_OUTPUT_PROMPT_SUFFIX: &str =
     "\n\nWhen finished, call the structured_output tool with your final result.";
-const MAX_NUDGES: usize = 2;
 const MAX_SCHEMA_ERRORS: usize = 3;
 const SCHEMA_COMPILE_ERROR: &str = "invalid output_schema";
 const SCHEMA_ROOT_ERROR: &str = "output_schema must have type object";
 const STRUCTURED_MISSING_ERROR: &str = "subagent finished without calling structured_output";
 const STRUCTURED_INVALID_ERROR: &str = "subagent result does not match output_schema";
 const SUMMARY_MISSING_ERROR: &str = "subagent finished without providing a summary";
-const NUDGE_MISSING: &str = "You did not call the structured_output tool. Call it now with your final result matching its input schema.";
-const NUDGE_SUMMARY: &str = "You finished your work but did not provide a summary. Reply with a concise summary of what you did and found.";
 const INVALID_INPUT_PREFIX: &str =
     "Input does not match the required schema. Fix the errors and call structured_output again:\n";
 const INTERRUPTED_PREFIX: &str = "sub-agent interrupted (";
@@ -187,14 +185,19 @@ pub async fn run_task(ctx: &ToolContext, request: TaskRequest) -> TaskOutcome {
             Some(provenance) => ctx.event_tx.clone().with_workflow(provenance),
             None => ctx.event_tx.clone(),
         },
+        steering_observations: None,
+        steering_order: Vec::new(),
         ..ctx.clone()
     };
     // Compile early: a bad schema costs zero tokens.
     let captured = Arc::new(Mutex::new(Captured::default()));
+    // A validated report satisfies the output contract even without a prose tail.
+    // It does not authorize the agent to suppress cancellation or runtime errors.
+    let report_ready = Arc::new(AtomicBool::new(false));
     let validating = request.output_schema.is_some();
     let (local_definitions, local_tools) = match request.output_schema.as_ref() {
         None => (Vec::new(), LocalTools::default()),
-        Some(schema) => match structured_output_tool(schema, &captured) {
+        Some(schema) => match structured_output_tool(schema, &captured, &report_ready) {
             Ok((definition, tools)) => (vec![definition], tools),
             Err(message) => return finish(started, None, 0, Err(message.into())),
         },
@@ -216,7 +219,7 @@ pub async fn run_task(ctx: &ToolContext, request: TaskRequest) -> TaskOutcome {
     )
     .await
     {
-        Ok(session) => OpenSession(session),
+        Ok(session) => OpenSession(session.with_report_ready(report_ready)),
         Err(message) => return finish(started, None, 0, Err(message.into())),
     };
     let task_id = session.0.id().to_owned();
@@ -292,32 +295,34 @@ async fn converse(
         }
         message
     });
-    let mut result = session.prompt(message).await;
-    for _ in 0..MAX_NUDGES {
-        let Ok(reply) = &result else { break };
-        let Some(nudge) = nudge_for(validating, lock(captured).value.is_some(), &reply.text) else {
+    let mut reply = session.prompt(message).await?;
+    // Only healthy runs with an unmet contract may request another response;
+    // the shared steering state bounds both these prompts and inner repairs.
+    while if validating {
+        lock(captured).value.is_none()
+    } else {
+        reply.text.trim().is_empty()
+    } {
+        let Some(corrected) = session
+            .correct_report(validating)
+            .await
+            .map_err(|mut failure| {
+                if failure.partial.is_none() && !reply.text.trim().is_empty() {
+                    failure.partial = Some(reply.text.clone());
+                }
+                failure
+            })?
+        else {
             break;
         };
-        result = session.prompt(Some(nudge.to_owned())).await;
+        reply = corrected;
     }
 
-    let text = result?.text;
     Ok(report(
         validating,
         std::mem::take(&mut *lock(captured)),
-        text,
+        reply.text,
     )?)
-}
-
-/// What to say to a subagent that finished without reporting, or `None` when
-/// it already has. Splitting the run's only decision out of the loop is what
-/// makes the nudge policy testable without an agent behind it.
-fn nudge_for(validating: bool, reported: bool, text: &str) -> Option<&'static str> {
-    match validating {
-        true if !reported => Some(NUDGE_MISSING),
-        false if text.is_empty() => Some(NUDGE_SUMMARY),
-        _ => None,
-    }
 }
 
 fn cancelled_failure() -> subagent::PromptFailure {
@@ -348,7 +353,9 @@ fn report(validating: bool, captured: Captured, text: String) -> Result<Value, S
             Some(errors) => format!("{STRUCTURED_INVALID_ERROR}:\n{errors}"),
             None => STRUCTURED_MISSING_ERROR.to_owned(),
         }),
-        (false, _) if text.is_empty() => Err(SUMMARY_MISSING_ERROR.to_owned()),
+        (false, _) if text.trim().is_empty() || text == crate::EMPTY_RESPONSE_MARKER => {
+            Err(SUMMARY_MISSING_ERROR.to_owned())
+        }
         (false, _) => Ok(Value::String(text)),
     }
 }
@@ -359,6 +366,7 @@ fn report(validating: bool, captured: Captured, text: String) -> Result<Value, S
 fn structured_output_tool(
     schema: &Value,
     captured: &Arc<Mutex<Captured>>,
+    report_ready: &Arc<AtomicBool>,
 ) -> Result<(Value, LocalTools), String> {
     if schema.get("type").and_then(Value::as_str) != Some("object") {
         return Err(SCHEMA_ROOT_ERROR.to_owned());
@@ -371,9 +379,15 @@ fn structured_output_tool(
         "input_schema": schema,
     });
     let captured = Arc::clone(captured);
+    let report_ready = Arc::clone(report_ready);
     let handler: LocalToolFn =
-        crate::tools::audited_local_tool(ToolEffect::ReadOnly, move |input, _ctx| {
+        crate::tools::audited_local_tool(ToolEffect::ReadOnly, move |input, ctx| {
             let result = record(&validator, &captured, input);
+            if result.is_ok() {
+                report_ready.store(true, Ordering::Release);
+            } else {
+                ctx.mark_tool_result_repairable();
+            }
             Box::pin(async move { result })
         });
     Ok((
@@ -617,6 +631,8 @@ impl WorkflowHostContext {
             live_sink: None,
             model_policy: Arc::clone(&self.model_policy),
             workflow: None,
+            steering_observations: None,
+            steering_order: Vec::new(),
         })
     }
 }
@@ -684,6 +700,7 @@ mod tests {
     use std::borrow::Cow;
     use std::sync::Mutex;
 
+    use caudra_config::steering::SteeringModelConfig;
     use caudra_providers::{
         AgentError, ContentBlock, Message, ProviderEvent, Role, StopReason, StreamResponse,
         TokenUsage,
@@ -714,6 +731,15 @@ mod tests {
     const REQUIRED_FIELD: &str = "answer";
     const PARTIAL: &str = "half a transcript";
     const BOOM: &str = "boom";
+    const CUSTOM_CORRECTION: &str = "Return the requested report using its schema.";
+    const MISSING_REPORT_RULE: &str = "missing_task_report";
+    const EMPTY_RESPONSE_RULE: &str = "empty_response";
+    const SCRIPT_EXHAUSTED: &str = "script exhausted";
+    const COMPACTED_SUMMARY: &str = "Earlier investigation was compacted.";
+    const COMPACTION_HISTORY_MESSAGES: usize = 32;
+    const COMPACTION_HISTORY_REPEATS: usize = 512;
+    const COMPACTION_CONTEXT_WINDOW: u32 = 200_000;
+    const COMPACTION_INPUT_TOKENS: u32 = 190_000;
     const CURRENT_CHAT_ID: &str = "current-chat";
     const PLAN_PATH: &str = ".caudra/plans/current.md";
     const CURSOR_PROBE: &str = "resume_cursor_probe";
@@ -948,7 +974,11 @@ mod tests {
     }
 
     fn tool_for(schema: &Value) -> Result<(Value, LocalTools), String> {
-        structured_output_tool(schema, &Arc::new(Mutex::new(Captured::default())))
+        structured_output_tool(
+            schema,
+            &Arc::new(Mutex::new(Captured::default())),
+            &Arc::new(AtomicBool::new(false)),
+        )
     }
 
     /// `LocalToolEntry` holds boxed closures and cannot be `Debug`, so the
@@ -1042,20 +1072,6 @@ mod tests {
         assert!(report(true, captured, String::new()).is_ok());
     }
 
-    #[test_case(true, false, "", Some(NUDGE_MISSING); "schema_contract_unmet")]
-    #[test_case(true, true, "", None; "schema_contract_met")]
-    #[test_case(false, false, "", Some(NUDGE_SUMMARY); "silent_without_a_schema")]
-    #[test_case(false, false, SUMMARY, None; "summarised_without_a_schema")]
-    #[test_case(true, true, SUMMARY, None; "reported_and_summarised")]
-    fn a_subagent_is_nudged_only_when_it_owes_a_report(
-        validating: bool,
-        reported: bool,
-        text: &str,
-        expected: Option<&str>,
-    ) {
-        assert_eq!(nudge_for(validating, reported, text), expected);
-    }
-
     #[test]
     fn a_captured_value_is_returned_as_json() {
         let captured = Captured {
@@ -1097,10 +1113,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_subagent_that_says_nothing_at_all_is_an_error() {
+    #[test_case(""; "empty")]
+    #[test_case(" \n "; "whitespace")]
+    #[test_case(crate::EMPTY_RESPONSE_MARKER; "marker")]
+    fn a_subagent_that_says_nothing_at_all_is_an_error(text: &str) {
         assert_eq!(
-            report(false, Captured::default(), String::new()),
+            report(false, Captured::default(), text.into()),
             Err(SUMMARY_MISSING_ERROR.to_owned())
         );
     }
@@ -1188,6 +1206,8 @@ mod tests {
     struct ScriptedProvider {
         responses: Mutex<Vec<StreamResponse>>,
         cancel_when_exhausted: Mutex<Option<CancelTrigger>>,
+        requests: Arc<Mutex<Vec<Vec<Message>>>>,
+        cancel_partial: Option<&'static str>,
     }
 
     impl ScriptedProvider {
@@ -1195,6 +1215,8 @@ mod tests {
             Self {
                 responses: Mutex::new(responses),
                 cancel_when_exhausted: Mutex::new(None),
+                requests: Arc::default(),
+                cancel_partial: None,
             }
         }
 
@@ -1202,6 +1224,8 @@ mod tests {
             Self {
                 responses: Mutex::new(Vec::new()),
                 cancel_when_exhausted: Mutex::new(Some(trigger)),
+                requests: Arc::default(),
+                cancel_partial: None,
             }
         }
     }
@@ -1210,14 +1234,15 @@ mod tests {
         fn stream_message<'a>(
             &'a self,
             _: &'a Model,
-            _: &'a [Message],
+            messages: &'a [Message],
             _: &'a str,
             _: &'a Value,
-            _: &'a flume::Sender<ProviderEvent>,
+            events: &'a flume::Sender<ProviderEvent>,
             _: RequestOptions,
             _: Option<&'a SessionRef>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async move {
+                self.requests.lock().unwrap().push(messages.to_vec());
                 let next = {
                     let mut responses = self.responses.lock().unwrap();
                     (!responses.is_empty()).then(|| responses.remove(0))
@@ -1226,7 +1251,16 @@ mod tests {
                     Some(response) => Ok(response),
                     None => {
                         if let Some(trigger) = self.cancel_when_exhausted.lock().unwrap().take() {
+                            if let Some(text) = self.cancel_partial {
+                                events
+                                    .send(ProviderEvent::TextDelta { text: text.into() })
+                                    .unwrap();
+                            }
                             trigger.cancel();
+                        } else {
+                            return Err(AgentError::Config {
+                                message: SCRIPT_EXHAUSTED.into(),
+                            });
                         }
                         futures_lite::future::pending().await
                     }
@@ -1302,15 +1336,17 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_structured_result_is_validated_and_returned_as_json() {
+    #[test_case(SUMMARY; "prose_tail")]
+    #[test_case(""; "empty_tail")]
+    #[test_case(" \n "; "whitespace_tail")]
+    fn a_structured_result_is_validated_and_returned_as_json(tail: &str) {
         smol::block_on(async {
             let expected = json!({ REQUIRED_FIELD: SUMMARY });
             let ctx = ctx_with(
                 AgentMode::Build,
                 ScriptedProvider::new(vec![
                     structured_output_call(expected.clone()),
-                    text_response(SUMMARY, SECOND_TURN),
+                    text_response(tail, SECOND_TURN),
                 ]),
             );
 
@@ -1332,6 +1368,632 @@ mod tests {
                 + SECOND_TURN.total_input()
                 + SECOND_TURN.output;
             assert_eq!(outcome.tokens_used, u64::from(expected_tokens));
+            assert_retired(&ctx, CALL_ID);
+        });
+    }
+
+    #[test_case(0, 1; "no_allowance")]
+    #[test_case(1, 2; "combined_limit")]
+    #[test_case(8, 3; "report_limit")]
+    fn missing_reports_are_bounded_across_fresh_agents(budget: u32, requests: usize) {
+        smol::block_on(async {
+            let provider = ScriptedProvider::new(
+                (0..requests)
+                    .map(|_| text_response(SUMMARY, FIRST_TURN))
+                    .collect(),
+            );
+            let observed = Arc::clone(&provider.requests);
+            let mut ctx = ctx_with(AgentMode::Build, provider);
+            Arc::make_mut(&mut ctx.config.steering).max_recoveries = Some(budget);
+            let outcome = run_task(
+                &ctx,
+                TaskRequest {
+                    output_schema: Some(answer_schema()),
+                    ..request(TaskIdentity::Derive, None)
+                },
+            )
+            .await;
+            let exhausted = AgentError::SteeringExhausted {
+                rule: MISSING_REPORT_RULE.into(),
+            };
+            assert!(!outcome.success);
+            assert!(
+                outcome
+                    .error
+                    .as_deref()
+                    .unwrap()
+                    .contains(&exhausted.to_string())
+            );
+            assert!(outcome.error.as_deref().unwrap().contains(SUMMARY));
+            assert_eq!(observed.lock().unwrap().len(), requests);
+            assert_eq!(
+                outcome.tokens_used,
+                requests as u64 * u64::from(FIRST_TURN.total_input() + FIRST_TURN.output)
+            );
+            assert_retired(&ctx, CALL_ID);
+        });
+    }
+
+    #[test_case(1, true; "first_response")]
+    #[test_case(2, true; "automatic_correction")]
+    #[test_case(1, false; "steering_disabled")]
+    fn missing_reports_cannot_extend_the_invocation_turn_limit(max_turns: u32, enabled: bool) {
+        smol::block_on(async {
+            let provider =
+                ScriptedProvider::new((0..3).map(|_| text_response(SUMMARY, FIRST_TURN)).collect());
+            let observed = Arc::clone(&provider.requests);
+            let mut ctx = ctx_with(AgentMode::Build, provider);
+            ctx.config.max_turns = Some(max_turns);
+            Arc::make_mut(&mut ctx.config.steering).enabled = Some(enabled);
+            let outcome = run_task(
+                &ctx,
+                TaskRequest {
+                    output_schema: Some(answer_schema()),
+                    ..request(TaskIdentity::Derive, None)
+                },
+            )
+            .await;
+            assert!(!outcome.success);
+            assert_eq!(observed.lock().unwrap().len(), max_turns as usize);
+            assert!(
+                outcome
+                    .error
+                    .as_deref()
+                    .unwrap()
+                    .contains(subagent::TURN_LIMIT)
+            );
+            assert!(outcome.error.as_deref().unwrap().contains(SUMMARY));
+        });
+    }
+
+    #[test]
+    fn a_truncated_task_summary_keeps_both_fragments() {
+        smol::block_on(async {
+            let ctx = ctx_with(
+                AgentMode::Build,
+                ScriptedProvider::new(vec![
+                    response(
+                        vec![ContentBlock::Text {
+                            text: PARTIAL.into(),
+                        }],
+                        StopReason::MaxTokens,
+                        FIRST_TURN,
+                    ),
+                    text_response(SUMMARY, SECOND_TURN),
+                ]),
+            );
+            let outcome = run_task(&ctx, request(TaskIdentity::Derive, None)).await;
+            assert_eq!(outcome.error, None);
+            assert_eq!(outcome.output, json!(format!("{PARTIAL}{SUMMARY}")));
+        });
+    }
+
+    #[test_case(true, MISSING_REPORT_RULE; "inner_then_outer")]
+    #[test_case(false, EMPTY_RESPONSE_RULE; "outer_then_inner")]
+    fn inner_and_outer_corrections_share_one_allowance(empty_first: bool, exhausted_rule: &str) {
+        smol::block_on(async {
+            let texts = if empty_first {
+                ["", SUMMARY]
+            } else {
+                [SUMMARY, ""]
+            };
+            let provider = ScriptedProvider::new(
+                texts
+                    .into_iter()
+                    .map(|text| text_response(text, FIRST_TURN))
+                    .collect(),
+            );
+            let observed = Arc::clone(&provider.requests);
+            let mut ctx = ctx_with(AgentMode::Build, provider);
+            Arc::make_mut(&mut ctx.config.steering).max_recoveries = Some(1);
+            let outcome = run_task(
+                &ctx,
+                TaskRequest {
+                    output_schema: Some(answer_schema()),
+                    ..request(TaskIdentity::Derive, None)
+                },
+            )
+            .await;
+            let exhausted = AgentError::SteeringExhausted {
+                rule: exhausted_rule.into(),
+            };
+            assert!(!outcome.success);
+            assert!(
+                outcome
+                    .error
+                    .as_deref()
+                    .unwrap()
+                    .contains(&exhausted.to_string())
+            );
+            assert_eq!(observed.lock().unwrap().len(), texts.len());
+        });
+    }
+
+    #[test]
+    fn a_custom_report_correction_is_host_authored() {
+        smol::block_on(async {
+            let expected = json!({ REQUIRED_FIELD: SUMMARY });
+            let provider = ScriptedProvider::new(vec![
+                text_response(SUMMARY, FIRST_TURN),
+                structured_output_call(expected.clone()),
+                text_response("", SECOND_TURN),
+            ]);
+            let observed = Arc::clone(&provider.requests);
+            let mut ctx = ctx_with(AgentMode::Build, provider);
+            Arc::make_mut(&mut ctx.config.steering)
+                .rules
+                .missing_task_report
+                .prompt = Some(CUSTOM_CORRECTION.into());
+            let outcome = run_task(
+                &ctx,
+                TaskRequest {
+                    output_schema: Some(answer_schema()),
+                    ..request(TaskIdentity::Derive, None)
+                },
+            )
+            .await;
+            assert_eq!(outcome.error, None);
+            assert_eq!(outcome.output, expected);
+            let observed = observed.lock().unwrap();
+            let corrected = &observed[1];
+            let guidance = corrected
+                .iter()
+                .find(|message| {
+                    message.content.iter().any(|block| {
+                        matches!(block,
+                    ContentBlock::Text { text } if text.contains(CUSTOM_CORRECTION))
+                    })
+                })
+                .unwrap();
+            assert!(guidance.is_observation());
+            assert_eq!(
+                guidance.steering.as_ref().unwrap().rule,
+                MISSING_REPORT_RULE
+            );
+            assert_eq!(
+                corrected
+                    .iter()
+                    .filter(|message| super::super::history::is_user_turn(message))
+                    .count(),
+                1,
+            );
+        });
+    }
+
+    #[test_case(true; "master_disabled")]
+    #[test_case(false; "report_rule_disabled")]
+    fn disabled_report_correction_returns_the_unmet_contract(master: bool) {
+        smol::block_on(async {
+            let provider = ScriptedProvider::new(vec![text_response(SUMMARY, FIRST_TURN)]);
+            let observed = Arc::clone(&provider.requests);
+            let mut ctx = ctx_with(AgentMode::Build, provider);
+            if master {
+                Arc::make_mut(&mut ctx.config.steering).enabled = Some(false);
+            } else {
+                Arc::make_mut(&mut ctx.config.steering)
+                    .rules
+                    .missing_task_report
+                    .enabled = Some(false);
+            }
+            let outcome = run_task(
+                &ctx,
+                TaskRequest {
+                    output_schema: Some(answer_schema()),
+                    ..request(TaskIdentity::Derive, None)
+                },
+            )
+            .await;
+            assert!(!outcome.success);
+            assert_eq!(outcome.error.as_deref(), Some(STRUCTURED_MISSING_ERROR));
+            assert_eq!(observed.lock().unwrap().len(), 1);
+        });
+    }
+
+    #[test_case(""; "empty")]
+    #[test_case(crate::EMPTY_RESPONSE_MARKER; "literal_marker")]
+    fn an_empty_marker_is_not_a_task_summary(text: &str) {
+        smol::block_on(async {
+            let provider = ScriptedProvider::new(vec![text_response(text, FIRST_TURN)]);
+            let observed = Arc::clone(&provider.requests);
+            let mut ctx = ctx_with(AgentMode::Build, provider);
+            Arc::make_mut(&mut ctx.config.steering).enabled = Some(false);
+            let outcome = run_task(&ctx, request(TaskIdentity::Derive, None)).await;
+            assert!(!outcome.success);
+            assert_eq!(outcome.error.as_deref(), Some(SUMMARY_MISSING_ERROR));
+            assert_eq!(observed.lock().unwrap().len(), 1);
+        });
+    }
+
+    #[test_case(None, false; "terminal_provider_error")]
+    #[test_case(Some(1), false; "turn_limit")]
+    #[test_case(Some(2), true; "empty_tail_at_turn_limit")]
+    fn a_valid_report_does_not_swallow_a_later_failure(max_turns: Option<u32>, empty_tail: bool) {
+        smol::block_on(async {
+            let mut responses = vec![structured_output_call(json!({ REQUIRED_FIELD: SUMMARY }))];
+            if empty_tail {
+                responses.push(text_response("", SECOND_TURN));
+            }
+            let provider = ScriptedProvider::new(responses);
+            let observed = Arc::clone(&provider.requests);
+            let mut ctx = ctx_with(AgentMode::Build, provider);
+            ctx.config.max_turns = max_turns;
+            let outcome = run_task(
+                &ctx,
+                TaskRequest {
+                    output_schema: Some(answer_schema()),
+                    ..request(TaskIdentity::Derive, None)
+                },
+            )
+            .await;
+            assert!(!outcome.success);
+            assert_eq!(outcome.output, Value::Null);
+            if max_turns.is_some() {
+                assert!(
+                    outcome
+                        .error
+                        .as_deref()
+                        .unwrap()
+                        .contains(subagent::TURN_LIMIT)
+                );
+            }
+            assert_eq!(
+                observed.lock().unwrap().len(),
+                max_turns.unwrap_or(2) as usize
+            );
+            let mut usage = FIRST_TURN;
+            if empty_tail {
+                usage += SECOND_TURN;
+            }
+            assert_eq!(
+                outcome.tokens_used,
+                u64::from(usage.total_input() + usage.output)
+            );
+            assert_retired(&ctx, CALL_ID);
+        });
+    }
+
+    #[test]
+    fn varying_invalid_reports_consume_the_repair_allowance() {
+        smol::block_on(async {
+            let provider = ScriptedProvider::new(vec![
+                structured_output_call(json!({ REQUIRED_FIELD: PARTIAL })),
+                structured_output_call(json!({ REQUIRED_FIELD: PROMPT })),
+            ]);
+            let observed = Arc::clone(&provider.requests);
+            let mut ctx = ctx_with(AgentMode::Build, provider);
+            Arc::make_mut(&mut ctx.config.steering).max_recoveries = Some(1);
+            let outcome = run_task(
+                &ctx,
+                TaskRequest {
+                    output_schema: Some(json!({
+                        "type": "object",
+                        "required": [REQUIRED_FIELD],
+                        "properties": { REQUIRED_FIELD: { "type": "string", "const": SUMMARY } },
+                    })),
+                    ..request(TaskIdentity::Derive, None)
+                },
+            )
+            .await;
+            assert!(!outcome.success);
+            assert_eq!(outcome.output, Value::Null);
+            assert_eq!(observed.lock().unwrap().len(), 2);
+            assert!(!outcome.error.as_deref().unwrap().contains(SCRIPT_EXHAUSTED));
+            assert_eq!(
+                outcome.tokens_used,
+                2 * u64::from(FIRST_TURN.total_input() + FIRST_TURN.output)
+            );
+        });
+    }
+
+    #[test_case(None; "explicit_resume")]
+    #[test_case(Some(PROMPT); "external_prompt")]
+    fn an_external_invocation_refreshes_the_empty_episode(message: Option<&str>) {
+        smol::block_on(async {
+            let provider = ScriptedProvider::new(vec![
+                text_response("", FIRST_TURN),
+                text_response("", FIRST_TURN),
+                text_response("", SECOND_TURN),
+                text_response(SUMMARY, SECOND_TURN),
+            ]);
+            let mut ctx = ctx_with(AgentMode::Build, provider);
+            Arc::make_mut(&mut ctx.config.steering)
+                .rules
+                .empty_response
+                .max_idle = Some(1);
+            let mut session = OpenSession(
+                subagent::open_task(
+                    &ctx,
+                    subagent::TaskOptions {
+                        name: LABEL.into(),
+                        task_id: TaskIdentity::Derive,
+                        profile: None,
+                        mode: None,
+                        local_definitions: Vec::new(),
+                        local_tools: LocalTools::default(),
+                    },
+                )
+                .await
+                .unwrap(),
+            );
+            let failure = session.0.prompt(Some(PROMPT.into())).await.err().unwrap();
+            assert_eq!(
+                failure.error,
+                AgentError::SteeringExhausted {
+                    rule: EMPTY_RESPONSE_RULE.into()
+                }
+                .to_string()
+            );
+            let reply = session
+                .0
+                .prompt(message.map(str::to_owned))
+                .await
+                .map_err(failure_message)
+                .unwrap();
+            assert_eq!(reply.text, SUMMARY);
+            let mut expected_usage = FIRST_TURN;
+            expected_usage += FIRST_TURN;
+            expected_usage += SECOND_TURN;
+            expected_usage += SECOND_TURN;
+            assert_eq!(session.0.usage(), expected_usage);
+        });
+    }
+
+    #[test_case(StopReason::EndTurn, false; "new_answer")]
+    #[test_case(StopReason::MaxTokens, false; "truncation_chain")]
+    #[test_case(StopReason::EndTurn, true; "usage_on_failure")]
+    fn subagent_output_and_usage_survive_compaction(stop: StopReason, fail: bool) {
+        smol::block_on(async {
+            let initial_usage = TokenUsage {
+                input: COMPACTION_INPUT_TOKENS,
+                ..FIRST_TURN
+            };
+            let provider = ScriptedProvider::new(vec![
+                response(
+                    vec![ContentBlock::Text {
+                        text: PARTIAL.into(),
+                    }],
+                    stop,
+                    initial_usage,
+                ),
+                text_response(COMPACTED_SUMMARY, SECOND_TURN),
+                text_response(if fail { "" } else { SUMMARY }, SECOND_TURN),
+            ]);
+            let observed = Arc::clone(&provider.requests);
+            let mut ctx = ctx_with(AgentMode::Build, provider);
+            if fail {
+                Arc::make_mut(&mut ctx.config.steering).max_recoveries = Some(0);
+            }
+            let mut model = Model::clone(&ctx.model);
+            model.context_window = COMPACTION_CONTEXT_WINDOW;
+            ctx.model = Arc::new(model);
+            ctx.subagent_history.reserve(FRESH_ID).unwrap().complete(
+                (0..COMPACTION_HISTORY_MESSAGES)
+                    .map(|_| Message::user(PROMPT.repeat(COMPACTION_HISTORY_REPEATS)))
+                    .collect::<Vec<_>>(),
+            );
+            let mut session = OpenSession(
+                subagent::open_generic(
+                    &ctx,
+                    subagent::GenericOptions {
+                        name: LABEL.into(),
+                        task_id: Some(FRESH_ID.into()),
+                        model_spec: None,
+                        system: PROMPT.into(),
+                        tools: json!([]),
+                        audience: None,
+                        thinking: None,
+                        fast: None,
+                        mcp: Some(false),
+                        local_tools: LocalTools::default(),
+                    },
+                )
+                .await
+                .unwrap(),
+            );
+            let reply = session.0.prompt(None).await;
+            if fail {
+                assert_eq!(
+                    reply.err().unwrap().error,
+                    AgentError::SteeringExhausted {
+                        rule: EMPTY_RESPONSE_RULE.into()
+                    }
+                    .to_string()
+                );
+            } else {
+                let expected = if stop == StopReason::MaxTokens {
+                    format!("{PARTIAL}{SUMMARY}")
+                } else {
+                    SUMMARY.into()
+                };
+                assert_eq!(reply.map_err(failure_message).unwrap().text, expected);
+            }
+            let mut expected_usage = initial_usage;
+            expected_usage += SECOND_TURN;
+            expected_usage += SECOND_TURN;
+            assert_eq!(session.0.usage(), expected_usage);
+            let observed = observed.lock().unwrap();
+            assert_eq!(observed.len(), 3);
+            assert!(observed[2].len() < COMPACTION_HISTORY_MESSAGES);
+            assert!(
+                observed[2]
+                    .iter()
+                    .any(|message| message.is_compaction_summary)
+            );
+        });
+    }
+
+    #[test]
+    fn a_child_resolves_its_effective_model_policy_independently() {
+        smol::block_on(async {
+            let expected = json!({ REQUIRED_FIELD: SUMMARY });
+            let provider = ScriptedProvider::new(vec![
+                text_response(SUMMARY, FIRST_TURN),
+                structured_output_call(expected.clone()),
+                text_response("", SECOND_TURN),
+            ]);
+            let mut ctx = ctx_with(AgentMode::Build, provider);
+            let mut child_model = Model::clone(&ctx.model);
+            child_model.id = CURRENT_CHAT_ID.into();
+            ctx.model = Arc::new(child_model);
+            Arc::make_mut(&mut ctx.config.steering).max_recoveries = Some(0);
+            Arc::make_mut(&mut ctx.config.steering).models.insert(
+                ctx.model.spec(),
+                SteeringModelConfig {
+                    max_recoveries: Some(1),
+                    ..Default::default()
+                },
+            );
+            assert_eq!(
+                ctx.config
+                    .steering
+                    .resolve(&ctx.chat_model.spec())
+                    .max_recoveries,
+                0
+            );
+            let outcome = run_task(
+                &ctx,
+                TaskRequest {
+                    output_schema: Some(answer_schema()),
+                    ..request(TaskIdentity::Derive, None)
+                },
+            )
+            .await;
+            assert_eq!(outcome.error, None);
+            assert_eq!(outcome.output, expected);
+        });
+    }
+
+    #[test_case(None; "explicit_resume")]
+    #[test_case(Some(PROMPT); "external_prompt")]
+    fn an_external_invocation_refreshes_the_report_allowance(message: Option<&str>) {
+        smol::block_on(async {
+            let provider =
+                ScriptedProvider::new((0..4).map(|_| text_response(SUMMARY, FIRST_TURN)).collect());
+            let mut ctx = ctx_with(AgentMode::Build, provider);
+            Arc::make_mut(&mut ctx.config.steering).max_recoveries = Some(1);
+            ctx.config.max_turns = Some(2);
+            let mut session = OpenSession(
+                subagent::open_task(
+                    &ctx,
+                    subagent::TaskOptions {
+                        name: LABEL.into(),
+                        task_id: TaskIdentity::Derive,
+                        profile: None,
+                        mode: None,
+                        local_definitions: Vec::new(),
+                        local_tools: LocalTools::default(),
+                    },
+                )
+                .await
+                .unwrap(),
+            );
+            session
+                .0
+                .prompt(Some(PROMPT.into()))
+                .await
+                .map_err(failure_message)
+                .unwrap();
+            assert!(
+                session
+                    .0
+                    .correct_report(false)
+                    .await
+                    .map_err(failure_message)
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(session.0.correct_report(false).await.is_err());
+            session
+                .0
+                .prompt(message.map(str::to_owned))
+                .await
+                .map_err(failure_message)
+                .unwrap();
+            assert!(
+                session
+                    .0
+                    .correct_report(false)
+                    .await
+                    .map_err(failure_message)
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(session.0.correct_report(false).await.is_err());
+        });
+    }
+
+    #[test_case(true; "closed")]
+    #[test_case(false; "cancelled")]
+    fn report_correction_never_reopens_a_stopped_subagent(closed: bool) {
+        smol::block_on(async {
+            let provider = ScriptedProvider::new(Vec::new());
+            let observed = Arc::clone(&provider.requests);
+            let mut ctx = ctx_with(AgentMode::Build, provider);
+            let (trigger, cancel) = CancelToken::new();
+            ctx.cancel = cancel;
+            let mut session = OpenSession(
+                subagent::open_task(
+                    &ctx,
+                    subagent::TaskOptions {
+                        name: LABEL.into(),
+                        task_id: TaskIdentity::Derive,
+                        profile: None,
+                        mode: None,
+                        local_definitions: Vec::new(),
+                        local_tools: LocalTools::default(),
+                    },
+                )
+                .await
+                .unwrap(),
+            );
+            if closed {
+                session.0.close();
+            } else {
+                trigger.cancel();
+            }
+            let error = session.0.correct_report(false).await.err().unwrap();
+            assert_eq!(
+                error.error,
+                if closed {
+                    subagent::SESSION_CLOSED
+                } else {
+                    subagent::CANCELLED
+                }
+            );
+            assert!(observed.lock().unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn a_valid_report_does_not_swallow_cancellation_or_its_partial_text() {
+        smol::block_on(async {
+            let (trigger, cancel) = CancelToken::new();
+            let provider = ScriptedProvider {
+                cancel_when_exhausted: Mutex::new(Some(trigger)),
+                cancel_partial: Some(PARTIAL),
+                ..ScriptedProvider::new(vec![structured_output_call(
+                    json!({ REQUIRED_FIELD: SUMMARY }),
+                )])
+            };
+            let observed = Arc::clone(&provider.requests);
+            let mut ctx = ctx_with(AgentMode::Build, provider);
+            ctx.cancel = cancel;
+            let outcome = run_task(
+                &ctx,
+                TaskRequest {
+                    output_schema: Some(answer_schema()),
+                    ..request(TaskIdentity::Derive, None)
+                },
+            )
+            .await;
+            assert!(outcome.cancelled && !outcome.success);
+            assert_eq!(outcome.output, Value::Null);
+            assert!(outcome.error.as_deref().unwrap().contains(PARTIAL));
+            assert_eq!(observed.lock().unwrap().len(), 2);
+            assert_eq!(
+                outcome.tokens_used,
+                u64::from(FIRST_TURN.total_input() + FIRST_TURN.output)
+            );
             assert_retired(&ctx, CALL_ID);
         });
     }

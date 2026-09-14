@@ -155,6 +155,141 @@ The `bash`, `python_execution`, and `task` entries apply only when `ui.scroll_ca
 | `defer_builtin_tools` | string | `auto` | - | When the on-demand built-in tools start outside the request array: `auto` defers them for a small model or one with no supply metadata and declares them upfront for a known non-small model, `always` defers for every model, `never` declares them upfront |
 | `disabled_tools` | string[] | `[]` | - | Tools to withhold from the model: built-in names, `server.tool`, or `server.*` for a whole MCP server. A project list extends the global one |
 
+### `agent.steering`
+
+Automatic steering repairs unusable model output and can add bounded guidance about repeated behavior. Configure it inside `agent` in `caudra.setup()`. All fields are optional.
+
+| Field | Type | Default | Limits and meaning |
+|-------|------|---------|--------------------|
+| `enabled` | boolean | `true` | Master switch for optional automatic steering, including repeat-policy blocking. |
+| `preset` | string | `"conservative"` | `"conservative"` or `"enhanced"`. Sets rule defaults before explicit overrides. |
+| `max_recoveries` | integer | `32` | 0–1024 corrective continuations per externally initiated invocation. Zero prevents optional recovery continuations. |
+| `max_advisories` | integer | `4` | 0–1024 advisory injections per invocation. Zero suppresses advisories. |
+| `rules` | table | `{}` | Overrides by rule name, listed below. Omission uses the selected preset. |
+| `models` | table | `{}` | Up to 256 exact `provider/model-id` keys, each with its own overrides. |
+
+#### Presets
+
+Both presets use the same numeric defaults and separate recovery/advisory budgets. They differ in which rules are enabled:
+
+| Rule in `rules` | Conservative | Enhanced | Behavior |
+|-----------------|--------------|----------|----------|
+| `empty_response` | `true` | `true` | Continue after empty output, with separate per-episode limits after recent tools and while idle. |
+| `repeated_tool_call` | `true` | `true` | Refuse the third consecutive identical top-level tool name/input before execution. Native batch children do not acquire this hard blocker. |
+| `protocol_mismatch` | `false` | `true` | Correct an explicit provider tool-use indication with no actual tool calls, up to 2 continuations per episode. |
+| `missing_task_report` | `true` | `true` | Request a missing task summary or required structured report, up to 2 corrections. |
+| `repetition` | `false` | `true` | Advise on short exact tool cycles, including normalized native batch leaf calls, or repeated normalized assistant text. |
+| `tool_planning` | `false` | `true` | Advise after repeated narrow tool choice across responses, with repeated-call/cycle or repeated-error evidence. Successful reads of different files alone are insufficient. |
+| `no_tool_use` | `false` | `true` | Suggest tools when useful after eligible responses without tool attempts, only when the effective tool inventory is nonempty. |
+
+Conservative retains the legacy individual empty-response, top-level repeat, and report-repair rules. It adds a combined ceiling of 32 recovery continuations and correctness fixes for malformed tool arguments, empty reports, and responsiveness during recovery. Enhanced is opt-in. Its stronger detectors are advisory, with at most 4 injections per invocation and a default cooldown of 3 completed model responses for each advisory rule. No performance improvement is assumed.
+
+Advisories only accompany an independently scheduled next request. They never reopen a valid final answer. Tool-looking prose, JSON, XML, code fences, and quoted examples do not independently trigger protocol correction. Caudra does not scrape tool names or arguments from text and execute them. Only actual tool calls pass through normal validation and authorization. Ordinary assistant answers do not have to be JSON.
+
+#### Rule fields
+
+Each table at `agent.steering.rules.<rule>` accepts these common fields:
+
+| Field | Type | Default | Limits and meaning |
+|-------|------|---------|--------------------|
+| `enabled` | boolean | selected preset | Explicit `false` disables this rule. |
+| `prompt` | string | `nil` | Use built-in guidance when omitted. Custom text must be nonblank and at most 16,384 UTF-8 bytes. |
+
+Custom prompts replace guidance only. They are literal user-configured text, without template expansion or executable expressions. They do not change triggers, budgets, enforcement, or factual tool-failure information. A custom prompt cannot authorize a tool or turn a rejected call into an executed one.
+
+The remaining fields are integers. Defaults below are the same in both presets. All ranges are inclusive. Set `enabled = false` to disable a rule rather than setting a positive threshold to zero.
+
+| Field under `rules` | Default | Range | Unit and meaning |
+|---------------------|---------|-------|------------------|
+| `empty_response.max_after_tools` | `20` | 1–1024 | Empty-output continuations per episode after recent tool results. |
+| `empty_response.max_idle` | `2` | 1–1024 | Empty-output continuations per episode without recent tool results. |
+| `empty_response.recent_tool_window` | `5` | 1–4096 | Non-padding history messages inspected for recent tool results. |
+| `repeated_tool_call.threshold` | `3` | 2–1024 | Consecutive identical top-level calls. Refuse the call reaching this threshold. |
+| `protocol_mismatch.max_attempts` | `2` | 1–1024 | Protocol corrective continuations per episode. |
+| `missing_task_report.max_attempts` | `2` | 1–1024 | Additional report-correction prompts per task invocation. |
+| `repetition.window` | `24` | 1–4096 | Recent normalized leaf tool calls retained for cycle detection. |
+| `repetition.cycle_repeats` | `3` | 2–1024 | Exact repetitions of a tool cycle needed for an advisory. |
+| `repetition.max_cycle` | `4` | 2–1024 | Maximum cycle length in leaf calls. Candidate cycle lengths start at 2. |
+| `repetition.text_window` | `8` | 1–4096 | Recent completed assistant responses retained for text repetition. |
+| `repetition.text_repeats` | `3` | 2–1024 | Matching nontrivial normalized assistant responses needed for an advisory. |
+| `repetition.cooldown` | `3` | 1–1024 | Completed model responses between this rule's advisories. |
+| `tool_planning.after_calls` | `6` | 1–1024 | Uses of the same canonical tool, with repetition or error evidence. |
+| `tool_planning.after_responses` | `3` | 1–1024 | Completed model responses across which those tool uses must occur. |
+| `tool_planning.cooldown` | `3` | 1–1024 | Completed model responses between this rule's advisories. |
+| `no_tool_use.after_responses` | `3` | 1–1024 | Eligible completed assistant responses without tool attempts. |
+| `no_tool_use.window` | `8` | 1–4096 | Recent assistant responses inspected for the no-tool pattern. |
+| `no_tool_use.cooldown` | `3` | 1–1024 | Completed model responses between this rule's advisories. |
+
+Validation also requires:
+
+- `repetition.window >= repetition.max_cycle * repetition.cycle_repeats`.
+- `repetition.text_window >= repetition.text_repeats`.
+- `no_tool_use.window >= no_tool_use.after_responses`.
+- `tool_planning.after_calls >= tool_planning.after_responses`.
+
+Unknown fields, invalid types, out-of-range values, and impossible threshold/window combinations are rejected, even for disabled rules. Cooldowns count completed model responses, not seconds, stream chunks, tool children, or injected messages. No-tool eligibility excludes synthetic messages, empty markers, reasoning-only padding, and private title, compaction, or evaluator requests. Recent-pattern windows reset after compaction or a model change without refilling an active invocation's budgets.
+
+Tool-planning guidance asks the model to reconsider its tool choices and identify the next useful action. It does not switch Plan Mode or require a todo list. No-tool guidance permits a direct answer when tools are unnecessary or contrary to the user's instructions.
+
+#### Global and exact-model overrides
+
+This example keeps conservative behavior globally, disables one inherited rule globally, and enables enhanced guidance for one exact model:
+
+```lua
+caudra.setup({
+    agent = {
+        steering = {
+            preset = "conservative",
+            max_recoveries = 32,
+            max_advisories = 4,
+            rules = {
+                no_tool_use = { enabled = false },
+            },
+            models = {
+                ["openai/gpt-5"] = {
+                    preset = "enhanced",
+                    rules = {
+                        no_tool_use = { enabled = true, after_responses = 4 },
+                        tool_planning = {
+                            prompt = "Reassess your recent tool choices. Choose a different useful action if these calls are not helping.",
+                        },
+                    },
+                },
+            },
+        },
+    },
+})
+```
+
+Model entries accept `enabled`, `preset`, `max_recoveries`, `max_advisories`, and `rules` with the same types and limits as the global fields. They cannot contain another `models` table. Omitted fields inherit through the resolution order below.
+
+Keys are case-sensitive exact IDs, at most 512 UTF-8 bytes each. Use a nonempty provider and model suffix separated by `/`. Additional slashes inside the suffix are allowed, but every segment must be nonempty. Whitespace, control characters, `*`, `?`, `[`, `]`, `{`, `}`, and backslashes are rejected. Matching requires no authentication or model discovery. There are no glob overrides, provider-wide layers, capability guesses from model names, or Lua detector callbacks.
+
+Global and project Lua settings merge field by field, with project values taking precedence. Model maps merge by exact key and rules merge by rule name and field. Omission inherits. Explicit `false` and `0` survive merging. An empty table does not clear inherited entries. Disable an inherited model policy or rule with `enabled = false`.
+
+After merging, resolve against the effective routed model for Chat, Plan, or a delegated task:
+
+1. Select the matching model's preset, otherwise the global preset, otherwise `"conservative"`.
+2. Apply that preset's defaults.
+3. Apply explicit global fields and rule fields.
+4. Apply explicit matching model fields and rule fields.
+
+Changing only a model's preset does not erase explicit global rule settings. In the example, removing the model's `no_tool_use` override leaves that rule disabled even under enhanced. A child resolves its own effective model using the inherited unresolved configuration, rather than inheriting the parent's resolved policy or runtime counters.
+
+#### Budgets and safety boundaries
+
+A new externally initiated main-agent or task invocation gets its own allowance. An explicit user/caller resume starts a fresh bounded invocation. Automatic continuations, internal retries, task report-correction prompts, compaction, and mid-run queued instructions do not refill the active allowance, including when report correction constructs a fresh agent. Separately delegated children have independent allowances. Counters are not durable across process restarts or explicit task resume.
+
+Charge one recovery for a completed-response-to-next-request transition caused by empty or truncated output, all-invalid tool calls, a response consisting entirely of repeat-policy refusals, an explicit protocol mismatch, or a missing task report. Corrective tool-error feedback can supply the guidance without a supplemental prompt and still consumes the transition. Malformed-argument and schema repair use this allowance without a separate rule table. Per-rule limits apply underneath the combined recovery cap.
+
+A mixed batch with useful successful siblings proceeds normally. It is not replayed or charged once per child. Transport and authentication retries, ordinary tool execution failures, permission denials, normal successful tool progress, explicit goal evaluation, and manual steering are separate from model-format recovery. The recovery budget does not bound every possible agent loop. Outer turn limits and cancellation still apply.
+
+At most one supplemental steering message is added per request. Recovery takes priority, then repetition, tool planning, and no-tool guidance. Advisory exhaustion only suppresses hints. Recovery exhaustion with an unmet output contract reports a failure and retains partial output. A valid captured structured task report remains usable after an empty tail, but cancellation, transport/permission failures, and hard outer-limit failures do not become success.
+
+The resolved `enabled = false` disables optional automatic recovery, advisories, and repeat-policy blocking. It leaves malformed-input rejection, schema validation, permissions, mode restrictions, cancellation, explicit goals, manual steering, and compaction policy intact. A rule-level switch disables only that rule. Zero budgets prevent the corresponding optional continuations or hints without bypassing input validation or repeat-policy enforcement.
+
+`agent.max_continuation_turns` remains the truncation setting, with its existing default of 3. Its historical eligibility check compares the total successful response count with that limit, rather than counting truncation alone. With steering enabled, an eligible truncation continuation also consumes the combined recovery budget. With steering disabled, truncation continues independently under the unchanged setting. Cancellation, queued user instructions, and outer turn limits take priority over automatic steering.
+
 ### `provider`
 
 | Field | Type | Default | Min | Description |

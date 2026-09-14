@@ -16,6 +16,7 @@ pub mod registry;
 pub mod report;
 pub mod schema;
 
+pub use crate::agent::tool_dispatch::ResponseObservations;
 pub use caudra_config::{
     DEFERRED_BUILTIN_TOOLS, INTERNAL_COMPANION_TOOL_NAMES, all_builtin_tool_names, is_builtin_tool,
     is_deferred_builtin, is_tool_enabled,
@@ -350,6 +351,8 @@ pub fn is_container_tool(name: &str) -> bool {
 pub const PLAN_WRITE_RESTRICTED: &str = "write restricted to plan file in plan mode";
 pub const READ_ONLY_TOOL_RESTRICTED: &str = "tool is not available in strict read-only mode";
 pub const DOOM_LOOP_MESSAGE: &str = "You have called this tool with identical input 3 times in a row. You are stuck in a loop. Break out and try a different approach.";
+pub(crate) const DOOM_LOOP_GUIDANCE: &str =
+    "You are stuck in a loop. Break out and try a different approach.";
 pub const DEADLINE_EXCEEDED: &str = "timeout exceeded";
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -456,6 +459,8 @@ where
 
 #[derive(Clone)]
 pub struct ToolContext {
+    pub steering_observations: Option<ResponseObservations>,
+    pub steering_order: Vec<usize>,
     pub provider: Arc<dyn Provider>,
     pub model: Arc<Model>,
     pub chat_provider: Arc<dyn Provider>,
@@ -519,6 +524,12 @@ pub struct ToolContext {
 }
 
 impl ToolContext {
+    pub fn mark_tool_result_repairable(&self) {
+        if let Some(observations) = &self.steering_observations {
+            observations.mark_repairable();
+        }
+    }
+
     pub fn resolve_tool_name_alias<'a>(&'a self, name: &'a str) -> &'a str {
         self.tool_name_aliases
             .as_ref()
@@ -721,6 +732,8 @@ pub fn interpreter_ctx(
         LazyLock::new(|| Arc::new(Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap()));
     ToolContext {
         provider: Arc::clone(&PROVIDER),
+        steering_observations: None,
+        steering_order: Vec::new(),
         model: Arc::clone(&MODEL),
         chat_provider: Arc::clone(&PROVIDER),
         chat_model: Arc::clone(&MODEL),
@@ -877,6 +890,23 @@ pub mod test_support {
 
     pub fn stub_ctx(mode: &AgentMode) -> ToolContext {
         stub_ctx_with(mode, None, None)
+    }
+
+    /// Capture leaf names and response-wide repairability for cross-crate
+    /// dispatch tests without exposing the runtime's pattern fingerprints.
+    pub fn observe_tool_calls(
+        ctx: &mut ToolContext,
+        window: usize,
+    ) -> impl FnOnce() -> (Vec<String>, bool) + use<> {
+        let observations = ResponseObservations::new(window);
+        ctx.steering_observations = Some(observations.clone());
+        move || {
+            let (facts, all_repairable) = observations.take();
+            (
+                facts.into_iter().map(|fact| fact.name).collect(),
+                all_repairable,
+            )
+        }
     }
 
     #[cfg(test)]

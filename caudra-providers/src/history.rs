@@ -9,7 +9,7 @@ use thiserror::Error;
 
 use crate::types::{
     ContentBlock, EMPTY_RESPONSE_MARKER, ImageSource, Message, MessageKind, ReasoningSource,
-    ResponsesReasoning, Role,
+    ResponsesReasoning, Role, SteeringOrigin,
 };
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -58,6 +58,8 @@ pub enum HistoryItemKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         display_text: Option<String>,
         origin: UserOrigin,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        steering: Option<SteeringOrigin>,
     },
     AssistantText {
         text: String,
@@ -597,6 +599,7 @@ fn user_kind(
         images,
         display_text: message.display_text.clone(),
         origin,
+        steering: message.steering.clone(),
     }
 }
 
@@ -702,6 +705,7 @@ fn assistant_kind(
             images: vec![source.clone()],
             display_text: None,
             origin: UserOrigin::Turn,
+            steering: None,
         },
     }
 }
@@ -853,8 +857,10 @@ fn project_group(items: &[HistoryItem]) -> Message {
                 images,
                 display_text,
                 origin,
+                steering,
             } => {
                 if !has_user_metadata {
+                    message.steering = steering.clone();
                     message.kind = match origin {
                         UserOrigin::Observation => MessageKind::Observation,
                         UserOrigin::Mention => MessageKind::Mention,
@@ -981,7 +987,8 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::types::ImageMediaType;
+    use crate::types::{ImageMediaType, SteeringKind};
+    use test_case::test_case;
 
     const CALL_ONE: &str = "call-one";
     const CALL_TWO: &str = "call-two";
@@ -994,6 +1001,45 @@ mod tests {
     const FIRST_TURN: &str = "start the work";
     const PRESERVED_TURN: &str = "and keep going";
     const REASONING_DURATION_MS: u64 = 9_700;
+    const STEERING_RULE: &str = "empty_output";
+
+    #[test_case(Some(SteeringKind::Recovery) ; "recovery")]
+    #[test_case(Some(SteeringKind::Advisory) ; "advisory")]
+    #[test_case(None ; "legacy_observation")]
+    fn steering_round_trips_canonical_history(kind: Option<SteeringKind>) {
+        let message = match kind {
+            Some(kind) => Message::steering(SYNTHETIC_TEXT.into(), STEERING_RULE, kind),
+            None => Message::observation(SYNTHETIC_TEXT.into()),
+        };
+        let items = expand_message(&message, None);
+        let encoded = serde_json::to_value(&items).unwrap();
+        assert_eq!(
+            encoded[0].get("steering").is_some(),
+            message.steering.is_some()
+        );
+        let restored: Vec<HistoryItem> = serde_json::from_value(encoded).unwrap();
+        assert_eq!(restored, items);
+        let messages = project_messages(&restored).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].steering, message.steering);
+        assert!(messages[0].is_observation());
+        assert_eq!(messages[0].first_text_content(), Some(SYNTHETIC_TEXT));
+        assert!(restored[0].first_user_text().is_none());
+        assert_eq!(expand_message(&messages[0], None)[0].kind, items[0].kind);
+    }
+
+    #[test_case("turn" ; "turn")]
+    #[test_case("synthetic" ; "synthetic")]
+    #[test_case("observation" ; "observation")]
+    fn legacy_user_history_has_no_steering(origin: &str) {
+        let encoded = json!({"type": "user", "text": FIRST_TURN, "origin": origin});
+        let kind: HistoryItemKind = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&kind).unwrap(), encoded);
+        let items = vec![item(kind, CaudraId::generate(), None)];
+        let messages = project_messages(&items).unwrap();
+        assert!(messages[0].steering.is_none());
+        assert_eq!(messages[0].first_text_content(), Some(FIRST_TURN));
+    }
 
     fn image(data: &str) -> ImageSource {
         ImageSource::new(ImageMediaType::Png, Arc::from(data))
@@ -1020,6 +1066,7 @@ mod tests {
             images: Vec::new(),
             display_text: None,
             origin: UserOrigin::Turn,
+            steering: None,
         }
     }
 

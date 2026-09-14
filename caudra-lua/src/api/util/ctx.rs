@@ -264,6 +264,11 @@ impl From<&ToolContext> for AgentContext {
         c.deadline = Deadline::None;
         c.tool_output_lines = ToolOutputLines::default();
         c.local_tools = LocalTools::default();
+        // Nested Lua dispatch is an implementation detail of the outer tool,
+        // not another model-selected attempt. It must neither repair the
+        // parent's failure nor replace its observation by expanding a batch.
+        c.steering_observations = None;
+        c.steering_order.clear();
         Self {
             tool: c,
             caller: None,
@@ -795,16 +800,26 @@ fn resolve_abs_with_cwd(path: String, cwd: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::panic::AssertUnwindSafe;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use caudra_agent::AgentMode;
+    use caudra_agent::agent::tool_dispatch::{self, Emit};
     use caudra_agent::tools::LocalToolFn;
-    use caudra_agent::tools::test_support::stub_ctx_with;
+    use caudra_agent::tools::native::batch::BatchTool;
+    use caudra_agent::tools::registry::ToolSource;
+    use caudra_agent::tools::test_support::{observe_tool_calls, stub_ctx_with};
+    use futures::FutureExt;
+    use serde_json::json;
+    use test_case::test_case;
 
     use super::*;
 
     const TOOL_USE_ID: &str = "tu-1";
     const INSTRUCTION_PATH: &str = "/tmp/nested/AGENTS.md";
     const LOCAL_TOOL_NAME: &str = "sess_tool";
+    const OUTER_FAILURE: &str = "outer wrapper failed";
+    const OBSERVATION_WINDOW: usize = 3;
     /// Arbitrary ids are rejected: `SessionRef` parses base58 or a uuid.
     const SESSION_ID: &str = "CNK1hV6GWoysH3KQMm5wu";
 
@@ -831,6 +846,7 @@ mod tests {
         );
         ctx.local_tools = Arc::new(tools);
         ctx.live_sink = Some(flume::unbounded().0);
+        ctx.steering_order = vec![1, 2];
         ctx
     }
 
@@ -846,6 +862,7 @@ mod tests {
         assert!(matches!(agent.deadline, Deadline::None));
         assert_eq!(agent.tool_output_lines, ToolOutputLines::default());
         assert!(agent.local_tools.is_empty());
+        assert!(agent.steering_order.is_empty());
         assert!(
             !agent
                 .loaded_instructions
@@ -870,6 +887,77 @@ mod tests {
             Some(session_ref()),
             "a dispatched child runs in the same session, unlike tool_use_id"
         );
+    }
+
+    #[test_case(false, false; "invalid_child_then_failure")]
+    #[test_case(false, true; "invalid_child_then_panic")]
+    #[test_case(true, false; "nested_batch_then_outer_failure")]
+    fn nested_dispatch_cannot_mutate_outer_observation(batch: bool, panics: bool) {
+        smol::block_on(async {
+            let mut ctx = populated_ctx();
+            let observations = observe_tool_calls(&mut ctx, OBSERVATION_WINDOW);
+            ctx.registry
+                .register(
+                    Arc::new(BatchTool),
+                    ToolSource::Native {
+                        owner: LOCAL_TOOL_NAME.into(),
+                        contract: caudra_agent::tools::BATCH_TOOL_NAME.into(),
+                        trusted: true,
+                    },
+                )
+                .unwrap();
+            let reached_outer_failure = Arc::new(AtomicBool::new(false));
+            let reached = Arc::clone(&reached_outer_failure);
+            ctx.local_tools = Arc::new(HashMap::from([(
+                LOCAL_TOOL_NAME.into(),
+                caudra_agent::tools::local_tool(move |_, parent| {
+                    let reached = Arc::clone(&reached);
+                    Box::pin(async move {
+                        let nested = AgentContext::from(&parent).to_tool_context();
+                        let input = if batch {
+                            json!({"tool_calls": [{"tool": "unknown_child", "parameters": {}}]})
+                        } else {
+                            json!({"tool_calls": []})
+                        };
+                        let done = tool_dispatch::run(
+                            &nested.registry,
+                            None,
+                            String::new(),
+                            caudra_agent::tools::BATCH_TOOL_NAME,
+                            &input,
+                            &nested,
+                            Emit::Silent,
+                        )
+                        .await;
+                        assert_eq!(done.is_error, !batch);
+                        reached.store(true, Ordering::SeqCst);
+                        assert!(!panics, "{OUTER_FAILURE}");
+                        Err(OUTER_FAILURE.into())
+                    })
+                }),
+            )]));
+            let input = json!({});
+            let result = AssertUnwindSafe(tool_dispatch::run(
+                &ctx.registry,
+                None,
+                TOOL_USE_ID.into(),
+                LOCAL_TOOL_NAME,
+                &input,
+                &ctx,
+                Emit::Silent,
+            ))
+            .catch_unwind()
+            .await;
+            assert!(reached_outer_failure.load(Ordering::SeqCst));
+            if panics {
+                assert!(result.is_err());
+            } else {
+                let done = result.unwrap();
+                assert!(done.is_error);
+                assert_eq!(done.output.as_text(), OUTER_FAILURE);
+            }
+            assert_eq!(observations(), (vec![LOCAL_TOOL_NAME.into()], false));
+        });
     }
 
     #[test]

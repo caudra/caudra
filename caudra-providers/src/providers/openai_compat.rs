@@ -10,6 +10,7 @@ use tracing::{debug, warn};
 use super::ResolvedAuth;
 use crate::{
     AgentError, ContentBlock, Message, ProviderEvent, Role, StopReason, StreamResponse, TokenUsage,
+    invalid_tool_input,
 };
 
 const STREAM_DONE: &str = "[DONE]";
@@ -710,18 +711,21 @@ pub async fn parse_sse(
                 v
             }
             Err(e) => {
-                warn!(error = %e, tool = %acc.name, json = %acc.arguments, "malformed tool JSON, falling back to {{}}");
-                Value::Object(Default::default())
+                warn!(category = ?e.classify(), line = e.line(), column = e.column(), input_bytes = acc.arguments.len(), "malformed tool JSON");
+                invalid_tool_input(&acc.arguments)
             }
         };
         let id = if acc.id.is_empty() {
-            warn!(raw_name = %acc.name, raw_args = %acc.arguments, "provider sent empty tool_use id; substituting placeholder");
+            warn!(
+                input_bytes = acc.arguments.len(),
+                "provider sent empty tool_use id; substituting placeholder"
+            );
             format!("caudra_unnamed_{idx}")
         } else {
             acc.id
         };
         let name = if acc.name.is_empty() {
-            warn!(%id, raw_args = %acc.arguments, "provider sent empty tool_use name; substituting placeholder");
+            warn!(%id, input_bytes = acc.arguments.len(), "provider sent empty tool_use name; substituting placeholder");
             "caudra_unknown_tool".to_owned()
         } else {
             acc.name
@@ -744,10 +748,72 @@ pub async fn parse_sse(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::SteeringKind;
     use futures_lite::io::Cursor;
     use test_case::test_case;
 
     const TEST_STREAM_TIMEOUT: Duration = Duration::from_secs(300);
+    const STEERING_TEXT: &str = "Continue with a useful response.";
+    const STEERING_RULE: &str = "empty_output";
+    const INVALID_CALL_ID: &str = "original-invalid-call";
+    const VALID_CALL_ID: &str = "original-valid-call";
+    const TOOL_NAME: &str = "read";
+
+    #[test_case(SteeringKind::Recovery ; "recovery")]
+    #[test_case(SteeringKind::Advisory ; "advisory")]
+    fn steering_metadata_is_not_on_wire(kind: SteeringKind) {
+        let wire = convert_messages(
+            &[Message::steering(STEERING_TEXT.into(), STEERING_RULE, kind)],
+            "",
+        );
+        assert_eq!(
+            wire,
+            vec![
+                json!({"role": "system", "content": ""}),
+                json!({"role": "user", "content": STEERING_TEXT})
+            ]
+        );
+    }
+
+    #[test_case("{broken" ; "malformed")]
+    #[test_case("{\"path\":" ; "truncated")]
+    #[test_case("" ; "empty")]
+    #[test_case("  " ; "whitespace")]
+    fn invalid_tool_arguments_preserve_siblings_and_pairing(raw: &str) {
+        smol::block_on(async {
+            let chunk = json!({"choices": [{"delta": {"tool_calls": [
+                {"index": 0, "id": INVALID_CALL_ID, "function": {"name": TOOL_NAME, "arguments": raw}},
+                {"index": 1, "id": VALID_CALL_ID, "function": {"name": TOOL_NAME, "arguments": "{}"}}
+            ]}, "finish_reason": "tool_calls"}]});
+            let sse = format!("data: {chunk}\n\ndata: {STREAM_DONE}\n");
+            let (tx, _rx) = flume::unbounded();
+            let response = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+                .await
+                .unwrap();
+            let tools: Vec<_> = response.message.tool_uses().collect();
+            assert_eq!(
+                tools,
+                vec![
+                    (INVALID_CALL_ID, TOOL_NAME, &invalid_tool_input(raw)),
+                    (VALID_CALL_ID, TOOL_NAME, &json!({})),
+                ]
+            );
+            assert_eq!(response.stop_reason, Some(StopReason::ToolUse));
+            let result = Message {
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: INVALID_CALL_ID.into(),
+                    content: String::new(),
+                    is_error: true,
+                    output_ref: None,
+                }],
+                ..Default::default()
+            };
+            let wire = convert_messages(&[response.message, result], "");
+            assert_eq!(wire[1]["tool_calls"][0]["id"], INVALID_CALL_ID);
+            assert_eq!(wire[1]["tool_calls"][1]["id"], VALID_CALL_ID);
+            assert_eq!(wire[2]["tool_call_id"], INVALID_CALL_ID);
+        });
+    }
 
     #[test]
     fn default_model_parser_reads_context_and_output_length() {
@@ -1064,7 +1130,7 @@ data: [DONE]\n";
     }
 
     #[test]
-    fn parse_sse_malformed_tool_json_yields_empty_object() {
+    fn parse_sse_malformed_tool_json_preserves_invalid_input() {
         smol::block_on(async {
             let sse = "\
 data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"bash\",\"arguments\":\"\"}}]}}]}\n\
@@ -1083,7 +1149,8 @@ data: [DONE]\n";
             let tools: Vec<_> = resp.message.tool_uses().collect();
             assert_eq!(tools.len(), 1);
             assert_eq!(tools[0].1, "bash");
-            assert_eq!(*tools[0].2, Value::Object(Default::default()));
+            assert_eq!(tools[0].0, "c1");
+            assert_eq!(*tools[0].2, invalid_tool_input("{broken"));
         })
     }
 

@@ -85,6 +85,8 @@ pub enum AgentError {
     Timeout { secs: u64 },
     #[error("compaction returned no summary")]
     EmptySummary,
+    #[error("automatic recovery exhausted for {rule}")]
+    SteeringExhausted { rule: String },
 }
 
 impl AgentError {
@@ -120,6 +122,7 @@ impl AgentError {
             Self::Cancelled => "cancelled",
             Self::Timeout { .. } => "timeout",
             Self::EmptySummary => "empty_summary",
+            Self::SteeringExhausted { .. } => "steering_exhausted",
         }
     }
 
@@ -150,6 +153,7 @@ impl AgentError {
             | Self::Json(_)
             | Self::Cancelled
             | Self::EmptySummary
+            | Self::SteeringExhausted { .. }
             | Self::HttpRequest(_) => false,
         }
     }
@@ -261,6 +265,9 @@ impl AgentError {
             Self::Channel => "internal error, try again".into(),
             Self::Cancelled => "cancelled".into(),
             Self::EmptySummary => "compaction returned no summary, history kept as is".into(),
+            Self::SteeringExhausted { rule } => format!(
+                "automatic recovery limit reached for {rule}; review the partial output and resume or adjust steering limits"
+            ),
         }
     }
 
@@ -507,6 +514,11 @@ mod tests {
     use test_case::test_case;
 
     const BODY: &str = "bad input";
+    const STEERING_RULE: &str = "empty_output";
+    const STEERING_KIND: &str = "steering_exhausted";
+    const STEERING_MESSAGE: &str = "automatic recovery limit reached for empty_output; review the partial output and resume or adjust steering limits";
+    const STEERING_DISPLAY: &str = "automatic recovery exhausted for empty_output";
+
     const ANTHROPIC_RATE_LIMIT: &str = r#"{"type":"error","error":{"type":"rate_limit_error","message":"This request would exceed your organization's rate limit"}}"#;
     const ANTHROPIC_RATE_LIMIT_DETAIL: &str =
         "rate limited: rate_limit_error: This request would exceed your organization's rate limit";
@@ -526,6 +538,20 @@ mod tests {
     const CREDIT_TEXT: &str = "Your credit balance is too low. Please try again later.";
     const HTTP_DATE_OFFSET_SECS: i64 = 300;
     const HTTP_DATE_TOLERANCE_SECS: u64 = 5;
+
+    #[test_case(STEERING_RULE)]
+    fn steering_exhaustion_is_not_a_transport_retry(rule: &str) {
+        let error = AgentError::SteeringExhausted { rule: rule.into() };
+        assert_eq!(error.kind(), STEERING_KIND);
+        assert_eq!(error.user_message(), STEERING_MESSAGE);
+        assert_eq!(error.to_string(), STEERING_DISPLAY);
+        assert_eq!(error.retry_message(), STEERING_DISPLAY);
+        assert!(!error.is_retryable());
+        assert!(!error.should_rotate_key());
+        assert!(!error.is_context_overflow());
+        assert_eq!(error.status(), None);
+        assert_eq!(error.retry_after(), None);
+    }
 
     fn api(status: u16) -> AgentError {
         AgentError::api(status, String::new())
@@ -570,11 +596,7 @@ mod tests {
     #[test_case(400, OVERFLOW_TEXT, false     ; "overflow_outranks_transient_wording")]
     #[test_case(402, CREDIT_TEXT, false       ; "billing_never_transient")]
     #[test_case(401, OVERLOADED_TEXT, false   ; "auth_never_transient")]
-    fn transient_wording_overrides_a_misleading_status(
-        status: u16,
-        message: &str,
-        expected: bool,
-    ) {
+    fn transient_wording_overrides_a_misleading_status(status: u16, message: &str, expected: bool) {
         assert_eq!(api_msg(status, message).is_retryable(), expected);
     }
 

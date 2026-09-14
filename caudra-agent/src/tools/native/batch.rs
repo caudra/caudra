@@ -233,21 +233,46 @@ impl Child {
 }
 
 impl BatchCall {
-    async fn run(self: Box<Self>, ctx: &ToolContext) -> ToolExecResult {
+    async fn run(mut self: Box<Self>, ctx: &ToolContext) -> ToolExecResult {
+        for child in &mut self.children {
+            if child.rejection.is_none()
+                && ctx.resolve_tool_name_alias(&child.tool) == crate::tools::BATCH_TOOL_NAME
+            {
+                child.rejection = Some(NESTED_ERROR);
+            }
+        }
         let entries: Vec<BatchToolEntry> = self.children.iter().map(Child::pending_entry).collect();
         let entries = Arc::new(Mutex::new(entries));
+        // Reserve the complete child roster before any child executes, so
+        // concurrent completion cannot choose the collector's bounded prefix.
+        if let Some(observations) = &ctx.steering_observations {
+            observations.expand();
+        }
+        let runnable: Vec<_> = self
+            .children
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, child)| {
+                let mut child_ctx = child_context(ctx, index);
+                tool_dispatch::observe_context(&mut child_ctx, &child.tool, &child.params);
+                if child.rejection.is_some() {
+                    child_ctx.mark_tool_result_repairable();
+                    if !ctx.cancel.is_cancelled()
+                        && let Some(observations) = &child_ctx.steering_observations
+                    {
+                        observations.finish(true);
+                    }
+                    None
+                } else {
+                    Some((index, child, child_ctx))
+                }
+            })
+            .collect();
         let mut set = TaskSet::new();
-        for (index, child) in self.children.into_iter().enumerate() {
-            if child.rejection.is_some() {
-                continue;
-            }
+        for (index, child, ctx) in runnable {
             // The registry, MCP session, and context are all shared handles,
             // so a child task borrows nothing from this frame.
-            let (registry, mcp, ctx) = (
-                Arc::clone(&ctx.registry),
-                ctx.mcp.clone(),
-                child_context(ctx, index),
-            );
+            let (registry, mcp, ctx) = (Arc::clone(&ctx.registry), ctx.mcp.clone(), ctx);
             let entries = Arc::clone(&entries);
             set.spawn(async move {
                 let done = tool_dispatch::run(
@@ -317,6 +342,7 @@ impl BatchCall {
 fn child_context(ctx: &ToolContext, index: usize) -> ToolContext {
     let mut child = ctx.clone();
     child.tool_use_id = Some(child_tool_use_id(ctx.tool_use_id.as_deref(), index));
+    child.steering_order.push(index);
     child.live_sink = None;
     child
 }
@@ -431,8 +457,9 @@ fn render_llm(entries: &[BatchToolEntry]) -> String {
 mod tests {
     use super::*;
     use crate::AgentMode;
+    use crate::agent::tool_dispatch::{ResponseObservations, ToolOutcome};
     use crate::tools::STALE_READ_MSG;
-    use crate::tools::registry::ToolRegistry;
+    use crate::tools::registry::{ToolRegistry, ToolSource};
     use crate::tools::test_support::{stub_ctx, stub_ctx_with};
     use futures_lite::future;
     use serde_json::json;
@@ -449,6 +476,165 @@ mod tests {
     const PARK: &str = "park";
     const RELEASE: &str = "release";
     const DEADLINE_REASON: &str = crate::tools::DEADLINE_EXCEEDED;
+
+    fn observed_batch_ctx() -> ToolContext {
+        let ctx = stub_ctx(&AgentMode::Build);
+        ctx.registry
+            .register(
+                Arc::new(BatchTool),
+                ToolSource::Native {
+                    owner: super::super::OWNER.into(),
+                    contract: crate::tools::BATCH_TOOL_NAME.into(),
+                    trusted: true,
+                },
+            )
+            .unwrap();
+        ctx
+    }
+
+    #[test_case(json!([]); "empty_batch")]
+    #[test_case(json!([{"parameters": {}}]); "invalid_child")]
+    fn rejected_batch_inputs_are_repairable(calls: Value) {
+        smol::block_on(async {
+            let mut ctx = observed_batch_ctx();
+            let observations = ResponseObservations::new(1);
+            ctx.steering_observations = Some(observations.clone());
+            let result = tool_dispatch::run(
+                &ctx.registry,
+                None,
+                READ.into(),
+                crate::tools::BATCH_TOOL_NAME,
+                &json!({"tool_calls": calls}),
+                &ctx,
+                Emit::Silent,
+            )
+            .await;
+            assert!(result.is_error);
+            let (facts, all_repairable) = observations.take();
+            assert!(all_repairable);
+            assert_eq!(facts.len(), 1);
+            assert_eq!(facts[0].outcome, ToolOutcome::Repairable);
+        });
+    }
+
+    #[test_case(false; "success_after_repairable_sibling")]
+    #[test_case(true; "panic_after_repairable_sibling")]
+    fn batch_observes_leaves_without_replaying_or_counting_the_wrapper(panics: bool) {
+        smol::block_on(async {
+            let mut ctx = observed_batch_ctx();
+            let executed = Arc::new(AtomicUsize::new(0));
+            let count = Arc::clone(&executed);
+            ctx.local_tools = Arc::new(HashMap::from([(
+                READ.into(),
+                crate::tools::local_tool(move |_, _| {
+                    let count = Arc::clone(&count);
+                    Box::pin(async move {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        assert!(!panics, "{FAILURE}");
+                        Ok(BODY.into())
+                    })
+                }),
+            )]));
+            let observations = ResponseObservations::new(2);
+            ctx.steering_observations = Some(observations.clone());
+            ctx.steering_order = vec![0];
+            let result = tool_dispatch::run(
+                &ctx.registry,
+                None,
+                READ.into(),
+                crate::tools::BATCH_TOOL_NAME,
+                &calls(json!([
+                    {"tool": crate::tools::BATCH_TOOL_NAME, "parameters": {}},
+                    {"tool": READ, "parameters": {}}
+                ])),
+                &ctx,
+                Emit::Silent,
+            )
+            .await;
+            assert!(!result.is_error);
+            let (facts, all_repairable) = observations.take();
+            assert_eq!(executed.load(Ordering::SeqCst), 1);
+            assert_eq!(facts.len(), 2);
+            assert_eq!(facts[0].outcome, ToolOutcome::Repairable);
+            assert_eq!(facts[1].name, READ);
+            assert_eq!(
+                facts[1].outcome,
+                if panics {
+                    ToolOutcome::Failure
+                } else {
+                    ToolOutcome::Success
+                }
+            );
+            assert!(!all_repairable);
+        });
+    }
+
+    #[test]
+    fn aliased_nested_batches_and_overflow_are_all_repairable() {
+        smol::block_on(async {
+            let mut ctx = observed_batch_ctx();
+            ctx.tool_name_aliases = Some(Arc::new(HashMap::from([(
+                READ.into(),
+                crate::tools::BATCH_TOOL_NAME.into(),
+            )])));
+            let observations = ResponseObservations::new(1);
+            ctx.steering_observations = Some(observations.clone());
+            let children = vec![json!({"tool": READ, "parameters": {}}); MAX_BATCH_SIZE + 1];
+            let result = tool_dispatch::run(
+                &ctx.registry,
+                None,
+                READ.into(),
+                crate::tools::BATCH_TOOL_NAME,
+                &calls(json!(children)),
+                &ctx,
+                Emit::Silent,
+            )
+            .await;
+            assert!(!result.is_error);
+            let (facts, all_repairable) = observations.take();
+            assert_eq!(facts.len(), 1);
+            assert!(all_repairable);
+        });
+    }
+
+    #[test]
+    fn batch_fingerprints_use_normalized_child_parameters() {
+        smol::block_on(async {
+            let mut ctx = observed_batch_ctx();
+            ctx.tool_name_aliases = Some(Arc::new(HashMap::from([(GREP.into(), READ.into())])));
+            ctx.local_tools = Arc::new(HashMap::from([(
+                READ.into(),
+                crate::tools::local_tool(|input, _| {
+                    Box::pin(async move {
+                        assert_eq!(input, json!({"path": PATTERN}));
+                        Ok(BODY.into())
+                    })
+                }),
+            )]));
+            let observations = ResponseObservations::new(2);
+            ctx.steering_observations = Some(observations.clone());
+            let result = tool_dispatch::run(
+                &ctx.registry,
+                None,
+                READ.into(),
+                crate::tools::BATCH_TOOL_NAME,
+                &calls(json!([
+                    {"tool": GREP, "path": PATTERN},
+                    {"tool": READ, "parameters": {"path": PATTERN}}
+                ])),
+                &ctx,
+                Emit::Silent,
+            )
+            .await;
+            assert!(!result.is_error);
+            let (facts, all_repairable) = observations.take();
+            assert!(!all_repairable);
+            assert_eq!(facts.len(), 2);
+            assert_eq!(facts[0], facts[1]);
+            assert_eq!(facts[0].name, READ);
+            assert_eq!(facts[0].outcome, ToolOutcome::Success);
+        });
+    }
 
     fn parsed(input: Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
         BatchTool.parse(&input)

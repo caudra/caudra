@@ -1,7 +1,10 @@
 use std::borrow::Cow;
 use std::env;
 use std::slice;
-use std::sync::Arc;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -11,7 +14,8 @@ use caudra_providers::model_registry::{self, Binding};
 use caudra_providers::provider::{self, Provider};
 use caudra_providers::{
     Billing, ContentBlock, EMPTY_RESPONSE_MARKER, Message, Model, ModelError, ModelPurpose,
-    RequestOptions, Role, StopReason, StreamResponse, Timeouts, TokenUsage, estimate_tokens_cached,
+    ReasoningSource, RequestOptions, Role, StopReason, StreamResponse, Timeouts, TokenUsage,
+    estimate_tokens_cached,
 };
 
 use super::compaction;
@@ -25,9 +29,10 @@ use super::history::{
 use super::instructions::LoadedInstructions;
 use super::mention_preamble;
 use super::provider_projection;
+use super::steering::{self, Recovery, RecoveryAction, SharedSteering, Steering};
 use super::streaming::{StreamError, stream_with_retry};
 use super::title;
-use super::tool_dispatch::{self, RecentCalls};
+use super::tool_dispatch::{self, RecentCalls, ResponseObservations, ToolObservation};
 use crate::cancel::{CancelMap, CancelToken};
 use crate::context::{
     BuiltinToolsInput, ContextCapture, ContextInventory, ContextPublisher, ContextReadiness,
@@ -79,18 +84,6 @@ const IMAGE_BLOCK_FRAMING: &str =
 /// reasoning-heavy transcript reads about twice its true size and the
 /// conversation appears to overflow a window it fits in.
 const OPAQUE_BLOB_CHARS_PER_TOKEN: usize = 5;
-const NUDGE_PROMPT: &str = "You just executed tool calls but returned an empty response. Please process the tool results above and continue with the task. Always end your turn with a text response.";
-/// Nothing is pending, so this asks for the closing response the system
-/// prompt requires rather than for tool results to be processed.
-const IDLE_NUDGE_PROMPT: &str = "You ended your turn without a response. Continue the task, and always end your turn with a text response summarizing what you did.";
-/// A model that stalls once often stalls again on the retry, so it gets
-/// plenty of chances before the turn ends empty handed.
-const MAX_NUDGES: u32 = 20;
-/// With no tool results to resume from there is nothing to salvage, so a
-/// model that answers nothing twice is finished rather than wedged.
-const MAX_IDLE_NUDGES: u32 = 2;
-/// Counted over non-padding messages.
-const RECENT_TOOL_WINDOW: usize = 5;
 /// Without this note a cancelled reply replays in history as a finished
 /// turn, and a model resuming its own cut-off text can wedge the session
 /// (seen with llama.cpp stuck on an unterminated tool call).
@@ -307,8 +300,15 @@ pub struct Agent<'h> {
     retry_now: Nudge,
     total_usage: TokenUsage,
     measured: Option<MeasuredContext>,
+    // Legacy truncation eligibility uses this Agent's response count. Invocation
+    // hard limits instead use Steering, which survives automatic report corrections.
     num_turns: u32,
     recent_calls: RecentCalls,
+    steering: SharedSteering,
+    shared_steering: bool,
+    report_ready: Option<Arc<AtomicBool>>,
+    response_text: Option<String>,
+    continuing_response: bool,
     auto_compact: bool,
     loaded_instructions: LoadedInstructions,
     rollback_len: usize,
@@ -376,6 +376,8 @@ impl<'h> Agent<'h> {
         } else {
             Arc::new(chat_model)
         };
+        let steering = Steering::new(params.config.steering.resolve(&model.spec()));
+        let recent_calls = RecentCalls::with_threshold(steering.repeat_threshold());
         Self {
             provider: params.provider,
             model,
@@ -400,7 +402,12 @@ impl<'h> Agent<'h> {
             total_usage: TokenUsage::default(),
             measured: None,
             num_turns: 0,
-            recent_calls: RecentCalls::new(),
+            recent_calls,
+            steering: Arc::new(Mutex::new(steering)),
+            shared_steering: false,
+            report_ready: None,
+            response_text: None,
+            continuing_response: false,
             auto_compact: compaction::auto_compact_enabled(),
             loaded_instructions: LoadedInstructions::new(),
             rollback_len: 0,
@@ -443,11 +450,36 @@ impl<'h> Agent<'h> {
         self
     }
 
+    pub(crate) fn with_steering(mut self, steering: SharedSteering) -> Self {
+        self.recent_calls =
+            RecentCalls::with_threshold(steering::lock(&steering).repeat_threshold());
+        self.steering = steering;
+        self.shared_steering = true;
+        self
+    }
+
+    pub(crate) fn with_report_ready(mut self, ready: Arc<AtomicBool>) -> Self {
+        self.report_ready = Some(ready);
+        self
+    }
+
+    pub fn response_text(&self) -> Option<&str> {
+        self.response_text.as_deref()
+    }
+
+    pub(crate) fn usage(&self) -> TokenUsage {
+        self.total_usage
+    }
+
     fn readjust_model(&mut self) {
         let chat_follows_model = Arc::ptr_eq(&self.model, &self.chat_model);
         self.provider.adjust_model(Arc::make_mut(&mut self.model));
         if chat_follows_model {
             self.chat_model = Arc::clone(&self.model);
+        }
+        let mut steering = steering::lock(&self.steering);
+        if steering.bind_model(&self.model, &self.config.steering) {
+            self.recent_calls = RecentCalls::with_threshold(steering.repeat_threshold());
         }
     }
 
@@ -547,6 +579,19 @@ impl<'h> Agent<'h> {
         queued: bool,
     ) -> Result<DoneReason, AgentError> {
         self.goal_blocks = 0;
+        self.response_text = None;
+        self.continuing_response = false;
+        if !self.shared_steering {
+            let state = Steering::new(self.config.steering.resolve(&self.model.spec()));
+            self.recent_calls = RecentCalls::with_threshold(state.repeat_threshold());
+            self.steering = Arc::new(Mutex::new(state));
+        }
+        {
+            let mut steering = steering::lock(&self.steering);
+            if steering.bind_model(&self.model, &self.config.steering) {
+                self.recent_calls = RecentCalls::with_threshold(steering.repeat_threshold());
+            }
+        }
         if inputs.last().is_some_and(|input| input.resume) {
             self.prepare_resume();
         }
@@ -814,16 +859,22 @@ impl<'h> Agent<'h> {
     }
 
     async fn run_loop(&mut self) -> Result<DoneReason, AgentError> {
+        let mut initial = true;
         loop {
-            if let Some(max) = self.config.max_turns
-                && self.num_turns >= max
-            {
+            if self.cancel.is_cancelled() {
+                return Err(AgentError::Cancelled);
+            }
+            if steering::lock(&self.steering).turn_limit_reached(self.config.max_turns) {
                 if let Some(goal) = self.goal.snapshot() {
                     self.event_tx.send(AgentEvent::GoalTurnLimit {
                         evaluations: goal.evaluations,
                     })?;
                 }
                 return Ok(DoneReason::MaxTurns);
+            }
+            if initial {
+                self.inject_advisory();
+                initial = false;
             }
             match self.turn().await? {
                 TurnOutcome::Continue => {}
@@ -996,7 +1047,7 @@ impl<'h> Agent<'h> {
                     self.history.push(Message {
                         role: Role::Assistant,
                         content,
-                        reasoning_source: Some(caudra_providers::ReasoningSource::new(
+                        reasoning_source: Some(ReasoningSource::new(
                             &self.model,
                             self.provider.reasoning_transport(&self.model),
                         )),
@@ -1033,9 +1084,9 @@ impl<'h> Agent<'h> {
             reported: response.usage.total_input(),
             history_len: sent_at_history_len,
         });
-        self.emit_turn_complete(&response)?;
         let usage = response.usage;
         self.total_usage += usage;
+        self.emit_turn_complete(&response)?;
         self.goal.record_usage(
             usage,
             self.model
@@ -1043,57 +1094,149 @@ impl<'h> Agent<'h> {
             self.model.billing,
         );
 
-        if has_tools {
-            self.process_tool_calls(response).await?;
+        // Settle the response before deciding whether another request is needed.
+        // Tool feedback is already sufficient for repair; charging it must not
+        // add a second prompt or replay successful siblings.
+        let protocol = !has_tools && stop_reason == Some(StopReason::ToolUse);
+        // A synthetic resume preserves the transcript's padding tail, but starts
+        // a new episode. Only empties from this invocation can spend its allowance;
+        // automatic corrections and queued input retain the same response count.
+        let nudges = u64::from(self.history.recent_nudges())
+            .min(steering::lock(&self.steering).responses()) as u32;
+        let recent_tool_window = steering::lock(&self.steering)
+            .policy()
+            .rules
+            .empty_response
+            .recent_tool_window;
+        let after_tools = self.history.has_recent_tool_results(recent_tool_window);
+        response.message.reasoning_source = Some(ReasoningSource::new(
+            &self.model,
+            self.provider.reasoning_transport(&self.model),
+        ));
+        let empty = !has_tools && steering::visible_text(&response.message).is_none();
+        let (observations, all_repairable) = if has_tools {
+            self.response_text = None;
+            self.process_tool_calls(response).await?
         } else {
-            let has_reasoning = response.message.content.iter().any(|block| {
-                matches!(
-                    block,
-                    ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. }
-                )
-            });
-            if response.message.first_text_content().is_some() {
-                self.push_assistant_message(response.message);
-            } else if has_reasoning {
+            // Keep only a single answer, joining requests solely when truncation
+            // scheduled the continuation. This run-local buffer survives compaction
+            // without pulling in tool commentary or an earlier invocation's report.
+            let text = steering::visible_text(&response.message);
+            if self.continuing_response {
+                if let Some(text) = text {
+                    self.response_text.get_or_insert_default().push_str(&text);
+                }
+            } else {
+                self.response_text = text;
+            }
+            if empty {
+                response
+                    .message
+                    .content
+                    .retain(|block| !matches!(block, ContentBlock::Text { .. }));
                 response.message.content.push(ContentBlock::Text {
                     text: EMPTY_RESPONSE_MARKER.into(),
                 });
-                self.push_assistant_message(response.message);
-                if stop_reason != Some(StopReason::MaxTokens) && self.recover_stalled_turn(false)? {
-                    self.publish_prepared_context();
-                    return Ok(TurnOutcome::Continue);
+            }
+            self.push_assistant_message(response.message);
+            (Vec::new(), false)
+        };
+        self.continuing_response = false;
+        steering::lock(&self.steering).observe(observations, protocol);
+        if self.cancel.is_cancelled() {
+            return Err(AgentError::Cancelled);
+        }
+        // User control and context maintenance precede steering. Neither can
+        // replenish the invocation allowance, and the turn limit wins before
+        // a recovery is charged or another request is promised.
+        let queued = self.handle_queued_command().await?;
+        if self.cancel.is_cancelled() {
+            return Err(AgentError::Cancelled);
+        }
+        let turn_limit_reached =
+            steering::lock(&self.steering).turn_limit_reached(self.config.max_turns);
+        if turn_limit_reached {
+            if !has_tools
+                && !empty
+                && !protocol
+                && !queued
+                && stop_reason != Some(StopReason::MaxTokens)
+            {
+                return self.goal_completion(stop_reason.into()).await;
+            }
+            return Ok(TurnOutcome::Continue);
+        }
+        let compacted = self.try_auto_compact().await?;
+        if self.cancel.is_cancelled() {
+            return Err(AgentError::Cancelled);
+        }
+        if queued {
+            self.publish_prepared_context();
+            return Ok(TurnOutcome::Continue);
+        }
+        // A captured structured report satisfies missing prose only. This is
+        // deliberately not an error handler: cancellation, failed dispatch,
+        // protocol mismatches and hard limits keep their own outcomes.
+        let usable_report = empty
+            && !protocol
+            && self
+                .report_ready
+                .as_ref()
+                .is_some_and(|ready| ready.load(Ordering::Acquire));
+        let protocol_enabled = {
+            let state = steering::lock(&self.steering);
+            state.policy().enabled && state.policy().rules.protocol_mismatch.enabled
+        };
+        let recovery = if all_repairable {
+            Some(Recovery::ToolRepair)
+        } else if protocol && protocol_enabled {
+            Some(Recovery::Protocol)
+        } else if usable_report {
+            None
+        } else if !has_tools
+            && stop_reason == Some(StopReason::MaxTokens)
+            && self.num_turns <= self.config.max_continuation_turns
+        {
+            Some(Recovery::Truncated)
+        } else if empty {
+            Some(Recovery::Empty {
+                after_tools,
+                nudges,
+            })
+        } else {
+            None
+        };
+        if let Some(recovery) = recovery {
+            let is_empty = matches!(recovery, Recovery::Empty { .. });
+            let is_truncated = matches!(recovery, Recovery::Truncated);
+            let action = steering::lock(&self.steering).recover(recovery)?;
+            if let RecoveryAction::Continue(message) = action {
+                self.continuing_response = is_truncated;
+                if let Some(message) = message {
+                    if is_empty {
+                        self.event_tx.send(AgentEvent::Nudge)?;
+                    }
+                    self.push_injected(*message);
                 }
-            } else if self.recover_stalled_turn(true)? {
                 self.publish_prepared_context();
                 return Ok(TurnOutcome::Continue);
             }
-
-            if stop_reason == Some(StopReason::MaxTokens)
-                && self.num_turns <= self.config.max_continuation_turns
-            {
-                warn!(
-                    self.num_turns,
-                    "response truncated (max_tokens), re-prompting"
-                );
-                return Ok(TurnOutcome::Continue);
-            }
         }
-
-        if self.handle_queued_command().await? {
-            self.publish_prepared_context();
-            return Ok(TurnOutcome::Continue);
+        if usable_report {
+            return Ok(TurnOutcome::Done(DoneReason::EndTurn));
         }
-        if self.try_auto_compact().await? {
-            return Ok(TurnOutcome::Continue);
-        }
-
-        if has_tools {
-            Ok(TurnOutcome::Continue)
+        let outcome = if has_tools || compacted {
+            TurnOutcome::Continue
         } else {
-            let outcome = self.goal_completion(stop_reason.into()).await?;
-            self.publish_prepared_context();
-            Ok(outcome)
+            self.goal_completion(stop_reason.into()).await?
+        };
+        // Hints can decorate an independently scheduled request, never create
+        // one by reopening a normal final answer.
+        if matches!(outcome, TurnOutcome::Continue) && !compacted {
+            self.inject_advisory();
         }
+        self.publish_prepared_context();
+        Ok(outcome)
     }
 
     async fn goal_completion(
@@ -1409,47 +1552,45 @@ impl<'h> Agent<'h> {
         })
     }
 
-    /// Returns true when the model was nudged to try again. A wholly empty
-    /// response needs assistant padding; retained reasoning already occupies
-    /// that turn and must not be followed by another assistant message.
-    fn recover_stalled_turn(&mut self, pad_empty_response: bool) -> Result<bool, AgentError> {
-        let after_tools = self.history.has_recent_tool_results(RECENT_TOOL_WINDOW);
-        let nudges = self.history.recent_nudges();
-        if pad_empty_response {
-            self.push_assistant_message(Message::empty_marker());
+    fn inject_advisory(&mut self) {
+        if self
+            .history
+            .as_slice()
+            .iter()
+            .rev()
+            .take_while(|message| !matches!(message.role, Role::Assistant))
+            .any(|message| message.steering.is_some())
+        {
+            return;
         }
-        let nudge_limit = if after_tools {
-            MAX_NUDGES
-        } else {
-            MAX_IDLE_NUDGES
-        };
-        if nudges >= nudge_limit {
-            return Ok(false);
-        }
-
-        warn!(
-            nudges = nudges + 1,
-            after_tools, "turn ended without a response, nudging model to continue"
+        let has_tools = self
+            .request_tools()
+            .0
+            .as_array()
+            .is_some_and(|tools| !tools.is_empty());
+        let message = steering::lock(&self.steering).advisory(
+            self.history.as_slice(),
+            &self.model,
+            has_tools,
         );
-        self.event_tx.send(AgentEvent::Nudge)?;
-        self.push_injected(Message::synthetic(
-            if after_tools {
-                NUDGE_PROMPT
-            } else {
-                IDLE_NUDGE_PROMPT
-            }
-            .into(),
-        ));
-        Ok(true)
+        if let Some(message) = message {
+            self.push_injected(message);
+        }
     }
 
-    async fn process_tool_calls(&mut self, response: StreamResponse) -> Result<(), AgentError> {
+    async fn process_tool_calls(
+        &mut self,
+        response: StreamResponse,
+    ) -> Result<(Vec<ToolObservation>, bool), AgentError> {
         let tool_uses = response
             .message
             .tool_uses()
             .map(|(id, name, input)| (id.to_owned(), name.to_owned(), input.clone()))
             .collect();
+        let observations =
+            ResponseObservations::new(steering::lock(&self.steering).observation_window());
         let ctx = ToolContext {
+            steering_observations: Some(observations.clone()),
             tool_name_aliases: response.tool_name_aliases.clone(),
             ..self.tool_context()
         };
@@ -1466,7 +1607,8 @@ impl<'h> Agent<'h> {
         if result.is_ok() {
             self.publish_prepared_context();
         }
-        result
+        result?;
+        Ok(observations.take())
     }
 
     fn tool_context(&self) -> ToolContext {
@@ -1510,6 +1652,8 @@ impl<'h> Agent<'h> {
             tool_filter: self.tool_filter.clone(),
             local_tools: Arc::clone(&self.local_tools),
             tool_name_aliases: None,
+            steering_observations: None,
+            steering_order: Vec::new(),
             live_sink: None,
             model_policy: Arc::clone(&self.model_policy),
             workflow: self.workflow.clone(),
@@ -1565,6 +1709,9 @@ impl<'h> Agent<'h> {
         self.total_usage += usage;
         self.goal.record_usage(usage, cost, compact_model.billing);
         self.rollback_len = self.history.len();
+        steering::lock(&self.steering).reset_patterns();
+        self.recent_calls =
+            RecentCalls::with_threshold(steering::lock(&self.steering).repeat_threshold());
         self.event_tx.send(AgentEvent::CompactionDone)?;
         self.push_injected(Message::synthetic(compaction::continue_message(
             &self.config,
@@ -1832,6 +1979,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
+    use caudra_config::steering::{SteeringConfig, SteeringPreset};
     use caudra_providers::provider::{BoxFuture, Provider};
     use caudra_providers::{
         ContentBlock, Message, Model, ProviderEvent, RequestOptions, Role, StopReason,
@@ -1842,12 +1990,22 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
+    use crate::cancel::CancelTrigger;
     use crate::context::{ContextKey, ContextStore};
     use crate::mcp::tool_names;
     use crate::permissions::PermissionManager;
     use crate::{Envelope, QueueItemId};
 
     const AUTH_ERROR_STATUS: u16 = 401;
+    const MAX_NUDGES: u32 = 20;
+    const MAX_IDLE_NUDGES: u32 = 2;
+    const STEERING_EMPTY: &str = "empty_response";
+    const STEERING_PROTOCOL: &str = "protocol_mismatch";
+    const STEERING_TOOL_REPAIR: &str = "tool_repair";
+    const VISIBLE_RESPONSE: &str = "response";
+    const STEERING_CUSTOM: &str = "Custom runtime guidance.";
+    const INVALID_TOOL: &str = "invalid_tool";
+    const LARGE_CONTEXT: u32 = 170_000;
     const AUTH_ERROR_MESSAGE: &str = "expired";
     const EXPECTED_AUTH_ERROR: &str = "expected terminal authentication error";
     /// Distinctive so `adjust_model` is provably what set it, but wide enough
@@ -3908,6 +4066,68 @@ mod tests {
         });
     }
 
+    #[test_case(true; "steering_enabled")]
+    #[test_case(false; "steering_disabled")]
+    fn rebuilt_agents_share_hard_limits_without_changing_truncation_counting(enabled: bool) {
+        smol::block_on(async {
+            let mut history = History::default();
+            let (mut first, _events) = make_agent(
+                MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+                &mut history,
+            );
+            Arc::make_mut(&mut first.config.steering).enabled = Some(enabled);
+            first.run(default_input()).await.unwrap();
+            let steering = Arc::clone(&first.steering);
+            drop(first);
+            let (agent, _events) = make_agent(
+                MockProvider::new(vec![text_response(StopReason::MaxTokens)]),
+                &mut history,
+            );
+            let mut agent = agent.with_steering(steering);
+            agent.config.max_turns = Some(2);
+            assert_eq!(
+                agent.run(default_input()).await.unwrap(),
+                DoneReason::MaxTurns
+            );
+            assert_eq!(agent.num_turns, 1);
+            assert_eq!(steering::lock(&agent.steering).responses(), 2);
+        });
+    }
+
+    #[test_case(true; "tool_commentary")]
+    #[test_case(false; "empty_padding")]
+    fn truncation_output_excludes_earlier_commentary_and_padding(tool: bool) {
+        smol::block_on(async {
+            let mut earlier = if tool {
+                tool_call_response("glob", RESUME_TOOL_ID)
+            } else {
+                empty_response()
+            };
+            if tool {
+                earlier.message.content.insert(
+                    0,
+                    ContentBlock::Text {
+                        text: PARTIAL_RESPONSE.into(),
+                    },
+                );
+            }
+            let mut history = History::default();
+            let (mut agent, _events) = make_agent(
+                MockProvider::new(vec![
+                    earlier,
+                    text_response(StopReason::MaxTokens),
+                    text_response(StopReason::EndTurn),
+                ]),
+                &mut history,
+            );
+            agent.run(default_input()).await.unwrap();
+            assert_eq!(
+                agent.response_text(),
+                Some(format!("{VISIBLE_RESPONSE}{VISIBLE_RESPONSE}").as_str())
+            );
+        });
+    }
+
     #[test_case(Some(true),  true,  true  ; "after_tool_use_turn")]
     #[test_case(Some(false), true,  true  ; "after_text_only_turn")]
     #[test_case(None,        false, false ; "channel_empty")]
@@ -4615,7 +4835,14 @@ mod tests {
         smol::block_on(async {
             let mut history = History::new(Vec::new());
             let (mut agent, event_rx) = make_agent(MockProvider::new(responses), &mut history);
-            let _ = agent.run(default_input()).await;
+            let result = agent.run(default_input()).await;
+            assert_eq!(agent.num_turns, expected_turns);
+            if expected_nudges == MAX_NUDGES as usize || expected_nudges == MAX_IDLE_NUDGES as usize
+            {
+                assert!(matches!(result, Err(AgentError::SteeringExhausted { .. })));
+            } else {
+                assert!(result.is_ok());
+            }
             drop(agent);
             let events = drain_events(&event_rx);
 
@@ -4624,15 +4851,6 @@ mod tests {
                 .filter(|e| matches!(e.event, AgentEvent::Nudge))
                 .count();
             assert_eq!(nudges, expected_nudges);
-
-            let done = events
-                .iter()
-                .find_map(|e| match &e.event {
-                    AgentEvent::Done { num_turns, .. } => Some(*num_turns),
-                    _ => None,
-                })
-                .expect("expected Done event");
-            assert_eq!(done, expected_turns);
 
             assert!(
                 history
@@ -4668,6 +4886,409 @@ mod tests {
                 .filter(|e| matches!(e.event, AgentEvent::Nudge))
                 .count();
             assert_eq!(nudges, MAX_NUDGES as usize + 1);
+        });
+    }
+
+    #[test_case(empty_response(); "fully_empty")]
+    #[test_case(thinking_response(); "reasoning_only")]
+    #[test_case(assistant_response(vec![ContentBlock::Text { text: " \n\t ".into() }]); "whitespace")]
+    fn empty_variants_have_the_same_episode_budget(response: StreamResponse) {
+        smol::block_on(async {
+            let mut history = History::default();
+            let responses = (0..3)
+                .map(|_| assistant_response(response.message.content.clone()))
+                .collect();
+            let (mut agent, events) = make_agent(MockProvider::new(responses), &mut history);
+            assert!(
+                matches!(agent.run(default_input()).await, Err(AgentError::SteeringExhausted { rule }) if rule == STEERING_EMPTY)
+            );
+            assert_eq!(agent.num_turns, 3);
+            assert_eq!(agent.response_text(), None);
+            assert_eq!(
+                events
+                    .try_iter()
+                    .filter(|event| matches!(event.event, AgentEvent::Nudge))
+                    .count(),
+                2
+            );
+        });
+    }
+
+    #[test_case("A normal final answer."; "prose")]
+    #[test_case(r#"{"name":"shell","arguments":{"command":"pwd"}}"#; "tool_json")]
+    #[test_case("```json\n{\"tool\":\"shell\"}\n```"; "fenced_example")]
+    fn enhanced_steering_never_reopens_final_text(text: &str) {
+        smol::block_on(async {
+            let mut history = History::default();
+            let (mut agent, _events) = make_agent(
+                MockProvider::new(vec![assistant_response(vec![ContentBlock::Text {
+                    text: text.into(),
+                }])]),
+                &mut history,
+            );
+            Arc::make_mut(&mut agent.config.steering).preset = Some(SteeringPreset::Enhanced);
+            Arc::make_mut(&mut agent.config.steering)
+                .rules
+                .no_tool_use
+                .after_responses = Some(1);
+            agent.tools = serde_json::json!([{"name":"shell"}]);
+            assert_eq!(
+                agent.run(default_input()).await.unwrap(),
+                DoneReason::EndTurn
+            );
+            assert_eq!(agent.num_turns, 1);
+            assert_eq!(agent.response_text(), Some(text));
+            assert!(
+                !agent
+                    .history
+                    .as_slice()
+                    .iter()
+                    .any(|message| message.steering.is_some())
+            );
+        });
+    }
+
+    #[test_case(false; "no_visible_tools")]
+    #[test_case(true; "visible_tools")]
+    fn no_tool_hint_crosses_user_turns_without_reopening_them(has_tools: bool) {
+        smol::block_on(async {
+            let mut history = History::new(
+                (0..3)
+                    .flat_map(|_| {
+                        [
+                            Message::user(GO.into()),
+                            text_response(StopReason::EndTurn).message,
+                        ]
+                    })
+                    .collect(),
+            );
+            for run in 0..2 {
+                let (mut agent, _events) = make_agent(
+                    MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+                    &mut history,
+                );
+                Arc::make_mut(&mut agent.config.steering).preset = Some(SteeringPreset::Enhanced);
+                if has_tools {
+                    agent.tools = serde_json::json!([{"name":"shell"}]);
+                }
+                assert_eq!(
+                    agent.run(default_input()).await.unwrap(),
+                    DoneReason::EndTurn
+                );
+                assert_eq!(agent.num_turns, 1);
+                assert_eq!(
+                    agent
+                        .history
+                        .as_slice()
+                        .iter()
+                        .filter(|message| message.steering.is_some())
+                        .count(),
+                    usize::from(has_tools),
+                    "{run}"
+                );
+            }
+        });
+    }
+
+    #[test_case(false; "no_captured_report")]
+    #[test_case(true; "captured_report")]
+    fn ready_report_does_not_swallow_protocol_failure(ready: bool) {
+        smol::block_on(async {
+            let mut history = History::default();
+            let (agent, _events) = make_agent(
+                MockProvider::new(vec![text_response(StopReason::ToolUse)]),
+                &mut history,
+            );
+            let mut agent = agent.with_report_ready(Arc::new(AtomicBool::new(ready)));
+            Arc::make_mut(&mut agent.config.steering).preset = Some(SteeringPreset::Enhanced);
+            Arc::make_mut(&mut agent.config.steering).max_recoveries = Some(0);
+            assert!(
+                matches!(agent.run(default_input()).await, Err(AgentError::SteeringExhausted { rule }) if rule == STEERING_PROTOCOL)
+            );
+        });
+    }
+
+    #[test_case(false; "text_protocol_mismatch")]
+    #[test_case(true; "empty_protocol_mismatch")]
+    fn explicit_tool_stop_has_two_corrections(empty: bool) {
+        smol::block_on(async {
+            let mut response = if empty {
+                empty_response()
+            } else {
+                text_response(StopReason::ToolUse)
+            };
+            response.stop_reason = Some(StopReason::ToolUse);
+            let mut history = History::default();
+            let responses = (0..3)
+                .map(|_| StreamResponse {
+                    message: response.message.clone(),
+                    stop_reason: response.stop_reason,
+                    ..Default::default()
+                })
+                .collect();
+            let (mut agent, _events) = make_agent(MockProvider::new(responses), &mut history);
+            Arc::make_mut(&mut agent.config.steering).preset = Some(SteeringPreset::Enhanced);
+            assert!(
+                matches!(agent.run(default_input()).await, Err(AgentError::SteeringExhausted { rule }) if rule == STEERING_PROTOCOL)
+            );
+            assert_eq!(agent.num_turns, 3);
+            assert_eq!(
+                agent
+                    .history
+                    .as_slice()
+                    .iter()
+                    .filter(|message| message.steering.is_some())
+                    .count(),
+                2
+            );
+        });
+    }
+
+    #[test_case(false; "invalid_arguments")]
+    #[test_case(true; "repeat_refusals")]
+    fn tool_feedback_charges_one_transition_without_supplemental_prompt(repeated: bool) {
+        smol::block_on(async {
+            let mut history = History::default();
+            let responses = (0..3).map(|index| tool_use_response(INVALID_TOOL,
+                if repeated { serde_json::json!({}) } else { serde_json::json!({caudra_providers::INVALID_TOOL_JSON_KEY: format!("{{{index}")}) }
+            )).collect();
+            let (mut agent, _events) = make_agent(MockProvider::new(responses), &mut history);
+            Arc::make_mut(&mut agent.config.steering).max_recoveries =
+                Some(if repeated { 0 } else { 2 });
+            assert!(
+                matches!(agent.run(default_input()).await, Err(AgentError::SteeringExhausted { rule }) if rule == STEERING_TOOL_REPAIR)
+            );
+            assert_eq!(agent.num_turns, 3);
+            assert!(
+                !agent
+                    .history
+                    .as_slice()
+                    .iter()
+                    .any(|message| message.steering.is_some())
+            );
+            assert_eq!(
+                agent
+                    .history
+                    .as_slice()
+                    .iter()
+                    .flat_map(|message| &message.content)
+                    .filter(|block| matches!(block, ContentBlock::ToolResult { .. }))
+                    .count(),
+                3
+            );
+            assert!(agent.tool_context().steering_observations.is_none());
+        });
+    }
+
+    #[test_case(None, StopReason::EndTurn, true; "valid_report_missing_prose")]
+    #[test_case(None, StopReason::MaxTokens, true; "valid_report_truncated_empty_tail")]
+    #[test_case(Some(1), StopReason::EndTurn, false; "turn_limit_wins")]
+    fn ready_report_only_relaxes_the_prose_contract(
+        max_turns: Option<u32>,
+        stop: StopReason,
+        usable: bool,
+    ) {
+        smol::block_on(async {
+            let mut response = empty_response();
+            response.stop_reason = Some(stop);
+            let mut history = History::default();
+            let (agent, _events) = make_agent(MockProvider::new(vec![response]), &mut history);
+            let mut agent = agent.with_report_ready(Arc::new(AtomicBool::new(true)));
+            Arc::make_mut(&mut agent.config.steering).max_recoveries = Some(0);
+            agent.config.max_turns = max_turns;
+            assert_eq!(
+                agent.run(default_input()).await.unwrap(),
+                if usable {
+                    DoneReason::EndTurn
+                } else {
+                    DoneReason::MaxTurns
+                }
+            );
+            assert_eq!(agent.response_text(), None);
+        });
+    }
+
+    #[test_case(empty_response(); "empty")]
+    #[test_case(text_response(StopReason::MaxTokens); "truncated")]
+    fn queued_input_preempts_exhausted_recovery(response: StreamResponse) {
+        smol::block_on(async {
+            let mut history = History::default();
+            let (agent, _events) = make_agent(
+                MockProvider::new(vec![response, text_response(StopReason::EndTurn)]),
+                &mut history,
+            );
+            let source = MockInterruptSource::new(vec![ExtractedCommand::Interrupt(
+                default_input(),
+                0,
+                QueueItemId::new(),
+            )]);
+            let mut agent = agent.with_interrupt_source(source);
+            Arc::make_mut(&mut agent.config.steering).max_recoveries = Some(0);
+            assert_eq!(
+                agent.run(default_input()).await.unwrap(),
+                DoneReason::EndTurn
+            );
+            assert_eq!(agent.num_turns, 2);
+            assert!(
+                !agent
+                    .history
+                    .as_slice()
+                    .iter()
+                    .any(|message| message.steering.is_some())
+            );
+        });
+    }
+
+    struct CancelAtBoundary(Mutex<Option<CancelTrigger>>);
+
+    impl InterruptSource for CancelAtBoundary {
+        fn poll(&self) -> Option<ExtractedCommand> {
+            if let Some(trigger) = self.0.lock().unwrap().take() {
+                trigger.cancel();
+            }
+            None
+        }
+    }
+
+    #[test_case(false; "empty_contract")]
+    #[test_case(true; "ready_report")]
+    fn cancellation_at_response_boundary_preempts_contracts(ready: bool) {
+        smol::block_on(async {
+            let (trigger, cancel) = CancelToken::new();
+            let mut history = History::default();
+            let (agent, _events) =
+                make_agent(MockProvider::new(vec![empty_response()]), &mut history);
+            let mut agent = agent
+                .with_cancel(cancel)
+                .with_report_ready(Arc::new(AtomicBool::new(ready)))
+                .with_interrupt_source(Arc::new(CancelAtBoundary(Mutex::new(Some(trigger)))));
+            Arc::make_mut(&mut agent.config.steering).max_recoveries = Some(0);
+            assert_eq!(
+                agent.run(default_input()).await.unwrap(),
+                DoneReason::Cancelled
+            );
+            assert!(
+                !agent
+                    .history
+                    .as_slice()
+                    .iter()
+                    .any(|message| message.steering.is_some())
+            );
+        });
+    }
+
+    #[test_case(false; "correction_run")]
+    #[test_case(true; "external_invocation")]
+    fn rebuilt_agents_only_refill_on_external_invocations(external: bool) {
+        smol::block_on(async {
+            let policy = SteeringConfig {
+                max_recoveries: Some(2),
+                ..Default::default()
+            }
+            .resolve(&default_model().spec());
+            let shared = Arc::new(Mutex::new(Steering::new(policy)));
+            let mut history = History::default();
+            let (agent, _events) = make_agent(
+                MockProvider::new(vec![empty_response(), text_response(StopReason::EndTurn)]),
+                &mut history,
+            );
+            agent
+                .with_steering(Arc::clone(&shared))
+                .run(default_input())
+                .await
+                .unwrap();
+            let correction = steering::lock(&shared)
+                .report_correction(false)
+                .unwrap()
+                .unwrap();
+            let responses = if external {
+                vec![empty_response(), text_response(StopReason::EndTurn)]
+            } else {
+                vec![empty_response()]
+            };
+            let (agent, _events) = make_agent(MockProvider::new(responses), &mut history);
+            let mut agent = if external {
+                agent
+            } else {
+                agent.with_steering(shared)
+            };
+            let input = if external {
+                default_input()
+            } else {
+                AgentInput {
+                    message: String::new(),
+                    preamble: vec![correction],
+                    ..default_input()
+                }
+            };
+            let result = agent.run(input).await;
+            if external {
+                assert_eq!(result.unwrap(), DoneReason::EndTurn);
+            } else {
+                assert!(
+                    matches!(result, Err(AgentError::SteeringExhausted { rule }) if rule == STEERING_EMPTY)
+                );
+            }
+        });
+    }
+
+    #[test_case(false; "retains_latest_text")]
+    #[test_case(true; "empty_latest_clears_text")]
+    fn response_text_survives_compaction_but_not_an_empty_latest_response(empty_latest: bool) {
+        smol::block_on(async {
+            let mut history = History::new(vec![Message::user(GO.into()); 10]);
+            let mut responses = vec![
+                text_response(StopReason::EndTurn),
+                text_response(StopReason::EndTurn),
+            ];
+            if empty_latest {
+                responses.push(empty_response());
+            }
+            let (mut agent, _events) = make_agent(MockProvider::new(responses), &mut history);
+            assert_eq!(
+                agent.run(default_input()).await.unwrap(),
+                DoneReason::EndTurn
+            );
+            assert_eq!(agent.response_text(), Some(VISIBLE_RESPONSE));
+            agent.do_compact().await.unwrap();
+            assert_eq!(agent.response_text(), Some(VISIBLE_RESPONSE));
+            if empty_latest {
+                Arc::make_mut(&mut agent.config.steering).enabled = Some(false);
+                agent.run(default_input()).await.unwrap();
+                assert_eq!(agent.response_text(), None);
+            }
+        });
+    }
+
+    #[test_case(0; "already_exhausted")]
+    #[test_case(1; "one_recovery")]
+    fn empty_recovery_compacts_before_charging_without_refill(budget: u32) {
+        smol::block_on(async {
+            let mut response = empty_response();
+            response.usage.input = LARGE_CONTEXT;
+            let mut responses = vec![response, text_response(StopReason::EndTurn)];
+            if budget > 0 {
+                responses.push(empty_response());
+            }
+            let mut history = History::new(vec![Message::user(GO.into()); 10]);
+            let (mut agent, events) = make_agent(MockProvider::new(responses), &mut history);
+            agent.auto_compact = true;
+            agent.model = Arc::new(small_context_model(200_000, 8_192));
+            Arc::make_mut(&mut agent.config.steering).max_recoveries = Some(budget);
+            Arc::make_mut(&mut agent.config.steering)
+                .rules
+                .empty_response
+                .prompt = Some(STEERING_CUSTOM.into());
+            assert!(
+                matches!(agent.run(default_input()).await, Err(AgentError::SteeringExhausted { rule }) if rule == STEERING_EMPTY)
+            );
+            assert_eq!(agent.num_turns, budget + 1);
+            let events = drain_events(&events);
+            assert!(has_event(&events, |event| matches!(
+                event,
+                AgentEvent::CompactionDone
+            )));
+            assert_eq!(events.iter().filter(|event| matches!(&event.event, AgentEvent::Injected { text } if text == STEERING_CUSTOM)).count(), budget as usize);
         });
     }
 

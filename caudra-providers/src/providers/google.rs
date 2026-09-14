@@ -690,11 +690,40 @@ async fn parse_sse(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ReasoningOptions;
+    use crate::{ReasoningOptions, SteeringKind};
     use std::sync::Arc;
     use test_case::test_case;
 
     const GEMINI_API_KEY: &str = "test-key";
+    const STEERING_TEXT: &str = "Continue with a useful response.";
+    const STEERING_RULE: &str = "empty_output";
+    const TOOL_NAME: &str = "read";
+    const TEST_STREAM_TIMEOUT: Duration = Duration::from_secs(30);
+
+    #[test_case(json!({"name": TOOL_NAME}), Value::Null ; "omitted_arguments")]
+    #[test_case(json!({"name": TOOL_NAME, "args": {}}), json!({}) ; "empty_object")]
+    fn parse_sse_preserves_argument_semantics(call: Value, expected: Value) {
+        let chunk = json!({"candidates": [{"content": {"parts": [{"functionCall": call}]}, "finishReason": "STOP"}]});
+        let body = isahc::AsyncBody::from(format!("data: {chunk}\n\n"));
+        let response = isahc::Response::builder().status(200).body(body).unwrap();
+        let (tx, _rx) = flume::unbounded();
+        let result = smol::block_on(parse_sse(response, &tx, TEST_STREAM_TIMEOUT)).unwrap();
+        let tools: Vec<_> = result.message.tool_uses().collect();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].1, TOOL_NAME);
+        assert_eq!(tools[0].2, &expected);
+    }
+
+    #[test_case(SteeringKind::Recovery ; "recovery")]
+    #[test_case(SteeringKind::Advisory ; "advisory")]
+    fn steering_metadata_is_not_on_wire(kind: SteeringKind) {
+        let wire =
+            convert_messages(&[Message::steering(STEERING_TEXT.into(), STEERING_RULE, kind)]);
+        assert_eq!(
+            wire,
+            vec![json!({"role": "user", "parts": [{"text": STEERING_TEXT}]})]
+        );
+    }
 
     fn test_auth() -> Arc<Mutex<ResolvedAuth>> {
         Arc::new(Mutex::new(ResolvedAuth {

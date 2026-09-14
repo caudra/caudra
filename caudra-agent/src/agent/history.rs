@@ -523,6 +523,7 @@ pub(super) fn is_user_turn(message: &Message) -> bool {
 /// bookkeeping, not conversation.
 fn is_system_padding(m: &Message) -> bool {
     is_empty_marker(m)
+        || m.steering.is_some()
         || (m.display_text.as_deref() == Some("")
             && m.content
                 .iter()
@@ -625,7 +626,7 @@ fn one_line(reason: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use caudra_providers::{ContentBlock, Message, Role};
+    use caudra_providers::{ContentBlock, Message, Role, SteeringKind};
     use test_case::test_case;
 
     use super::*;
@@ -634,6 +635,27 @@ mod tests {
     const SECOND: &str = "second";
     const GO: &str = "go";
     const FAILURE: &str = "inference engine is unavailable";
+    const EMPTY_RULE: &str = "empty_response";
+
+    #[test_case(false; "live")]
+    #[test_case(true; "canonical_round_trip")]
+    fn steering_provenance_preserves_the_empty_episode(restored: bool) {
+        let history = History::new(vec![
+            make_tool_use_msg(&[FIRST]),
+            make_tool_result_msg(&[FIRST]),
+            Message::empty_marker(),
+            Message::steering(SECOND.into(), EMPTY_RULE, SteeringKind::Recovery),
+        ]);
+        let mut history = if restored {
+            History::restored(history.into_items()).unwrap()
+        } else {
+            history
+        };
+        assert_eq!(history.recent_nudges(), 1);
+        assert!(history.has_recent_tool_results(1));
+        history.push(Message::user(SECOND.into()));
+        assert_eq!(history.recent_nudges(), 0);
+    }
 
     #[track_caller]
     fn assert_ends_with_cancel_marker(history: &History) {

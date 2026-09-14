@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use caudra_config_macro::ConfigSection;
@@ -40,7 +41,10 @@ const PROCESS_ONLY_ENV_VARS: &[&str] = &[
 ];
 
 pub mod providers;
+pub mod steering;
 pub mod workcell;
+
+pub use steering::SteeringConfig;
 
 pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 50 * 1024;
 pub const DEFAULT_MAX_OUTPUT_LINES: usize = 2000;
@@ -400,6 +404,8 @@ pub const TOP_LEVEL_FIELDS: &[ConfigField] = &[
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
+    #[error("invalid config: agent.steering.{field}: {message}")]
+    InvalidSteering { field: String, message: String },
     #[error("invalid config: {section}.{field} = {value} is below minimum ({min})")]
     BelowMinimum {
         section: &'static str,
@@ -518,7 +524,7 @@ impl RawConfig {
         let skill_workflow_dev =
             self.skill_flag(SKILL_WORKFLOW_DEV_FIELD, DEFAULT_SKILL_WORKFLOW_DEV)?;
         let disabled_tools = self.resolve_disabled_tools()?;
-        Ok(Config {
+        let config = Config {
             always_yolo: self.always_yolo.unwrap_or(false),
             always_fast: self.always_fast.unwrap_or(false),
             always_thinking: self
@@ -540,7 +546,10 @@ impl RawConfig {
             telemetry: self.telemetry,
             permissions: PermissionsConfig::default(),
             plugins: PluginsConfig::from_plugins(self.plugins),
-        })
+        };
+        // Validate merged steering for every loader, without extending legacy field validation.
+        config.agent.steering.validate()?;
+        Ok(config)
     }
 
     /// A `plugins.<name>` key that matches no bundled plugin is a typo or an
@@ -920,6 +929,7 @@ impl<'de> Deserialize<'de> for CompactionBuffer {
 #[derive(Deserialize, Default, Debug)]
 #[serde(default, deny_unknown_fields)]
 pub struct AgentFileConfig {
+    pub steering: Option<SteeringConfig>,
     pub system_prompt_profile: Option<String>,
     pub max_output_bytes: Option<usize>,
     pub max_output_lines: Option<usize>,
@@ -936,6 +946,9 @@ pub struct AgentFileConfig {
 
 impl AgentFileConfig {
     fn merge(&mut self, overlay: AgentFileConfig) {
+        if let Some(steering) = overlay.steering {
+            self.steering.get_or_insert_default().merge(steering);
+        }
         merge_option!(
             self,
             overlay,
@@ -1181,8 +1194,6 @@ pub enum PermissionTarget {
     Global,
     Project(PathBuf),
 }
-
-use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ToolKey {
@@ -1721,6 +1732,10 @@ impl Default for ToolOutputLines {
 #[derive(Debug, Clone, ConfigSection, Serialize)]
 #[config(section = "agent")]
 pub struct AgentConfig {
+    // Sharing immutable policy keeps tool contexts from cloning the full model map.
+    #[config(skip, default = "Arc::default()")]
+    pub steering: Arc<SteeringConfig>,
+
     #[config(
         ty = "String",
         default = "None",
@@ -1828,6 +1843,7 @@ impl AgentConfig {
     ) -> Self {
         Self {
             no_rtk,
+            steering: Arc::new(file.steering.unwrap_or_default()),
             system_prompt_profile: file
                 .system_prompt_profile
                 .filter(|profile| profile != "builtin"),
@@ -2435,6 +2451,7 @@ impl Config {
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.ui.validate_all()?;
         self.agent.validate()?;
+        self.agent.steering.validate()?;
         self.provider.validate()?;
         self.storage.validate()?;
         Ok(())

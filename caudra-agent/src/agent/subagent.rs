@@ -6,7 +6,8 @@
 //! through here. The task path resolves its prompt and tools from a profile;
 //! both paths use the Subagent model purpose unless explicitly overridden.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use async_lock::Mutex as AsyncMutex;
@@ -21,6 +22,7 @@ use caudra_providers::{
 };
 use caudra_storage::id::CaudraId;
 
+use super::steering::{SharedSteering, Steering};
 use super::{ModelRoute, resolve_model_for_purpose};
 use crate::cancel::{CancelMap, CancelSlot};
 use crate::prompt::PromptId;
@@ -40,6 +42,7 @@ pub const STRUCTURED_OUTPUT_TOOL: &str = "structured_output";
 pub const BUILTIN_TASK_PROFILE_DESCRIPTION: &str = "Caudra\'s built-in task prompt";
 pub const SESSION_CLOSED: &str = "session closed";
 pub const CANCELLED: &str = "cancelled";
+pub(super) const TURN_LIMIT: &str = "subagent reached its maximum turn limit";
 const DEFAULT_SESSION_AUDIENCE: ToolAudience = ToolAudience::GENERAL_SUB;
 /// A thought\'s title is its first bold line. Past this the block is into
 /// prose and will never resolve one, so it stops being accumulated and a
@@ -48,8 +51,8 @@ const THOUGHT_TITLE_SCAN_LIMIT: usize = 200;
 
 /// Forwards subagent events to the parent, stamped with the subagent identity.
 /// Usage takes two paths: live on the tool header while the run goes on (last
-/// turn's tokens plus the run's summed cost), and one total per run on
-/// `usage_tx`, which `prompt` waits for. Progress takes the same two paths, so
+/// turn's tokens plus the run's summed cost), and a Done barrier on
+/// `usage_tx`, which `prompt` drains. Progress takes the same two paths, so
 /// a standalone task and a batch child both report the same run.
 async fn relay_session_events(
     sub_rx: flume::Receiver<Envelope>,
@@ -223,6 +226,8 @@ pub struct Subagent {
     usage_rx: flume::Receiver<TokenUsage>,
     start: Instant,
     closed: bool,
+    steering: SharedSteering,
+    report_ready: Option<Arc<AtomicBool>>,
 }
 
 impl Subagent {
@@ -293,12 +298,84 @@ impl Subagent {
     /// instruction, which is all a caller continuing an interrupted task has
     /// to say.
     pub async fn prompt(&mut self, message: Option<String>) -> Result<PromptResult, PromptFailure> {
-        if self.closed {
+        self.ensure_open()?;
+        // Only an external prompt or explicit resume starts a new invocation budget.
+        // Automatic report corrections rebuild Agent but retain this shared state.
+        self.steering = Arc::new(Mutex::new(Steering::new(
+            self.params
+                .config
+                .steering
+                .resolve(&self.params.model.spec()),
+        )));
+        if let Some(ready) = &self.report_ready {
+            ready.store(false, Ordering::Release);
+        }
+        let resume = message.is_none();
+        self.prompt_inner(message, Vec::new(), resume).await
+    }
+
+    pub(crate) fn with_report_ready(mut self, ready: Arc<AtomicBool>) -> Self {
+        self.report_ready = Some(ready);
+        self
+    }
+
+    pub(crate) async fn correct_report(
+        &mut self,
+        validating: bool,
+    ) -> Result<Option<PromptResult>, PromptFailure> {
+        self.ensure_open()?;
+        if self
+            .steering
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .turn_limit_reached(self.params.config.max_turns)
+        {
             return Err(PromptFailure {
-                error: SESSION_CLOSED.to_owned(),
+                error: TURN_LIMIT.into(),
                 partial: None,
             });
         }
+        let correction = self
+            .steering
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .report_correction(validating)
+            .map_err(|error| PromptFailure {
+                error: error.to_string(),
+                partial: None,
+            })?;
+        let Some(correction) = correction else {
+            return Ok(None);
+        };
+        // The preamble preserves host provenance without introducing a user turn
+        // or the separate continuation instruction attached to explicit resume.
+        self.prompt_inner(None, vec![correction], false)
+            .await
+            .map(Some)
+    }
+
+    fn ensure_open(&self) -> Result<(), PromptFailure> {
+        if self.closed || self.child_cancel.is_cancelled() {
+            return Err(PromptFailure {
+                error: if self.closed {
+                    SESSION_CLOSED
+                } else {
+                    CANCELLED
+                }
+                .to_owned(),
+                partial: None,
+            });
+        }
+        Ok(())
+    }
+
+    async fn prompt_inner(
+        &mut self,
+        message: Option<String>,
+        preamble: Vec<Message>,
+        resume: bool,
+    ) -> Result<PromptResult, PromptFailure> {
+        self.ensure_open()?;
         // The first prompt is what names the subagent in the parent's UI, so
         // the identity is published here rather than at open time.
         if self.subagent_info.get().is_none() {
@@ -331,28 +408,44 @@ impl Subagent {
         .with_interrupt_source(interrupt_source)
         .with_cancel(self.child_cancel.clone())
         .with_mcp(self.mcp.clone())
-        .with_local_tools(Arc::clone(&self.local_tools));
+        .with_local_tools(Arc::clone(&self.local_tools))
+        .with_steering(Arc::clone(&self.steering));
+        if let Some(ready) = &self.report_ready {
+            agent = agent.with_report_ready(Arc::clone(ready));
+        }
 
         let result = agent
             .run(AgentInput {
-                resume: message.is_none(),
+                resume,
                 message: message.unwrap_or_default(),
                 mode: self.mode.clone(),
                 images: Vec::new(),
                 mentions: Vec::new(),
-                preamble: Vec::new(),
+                preamble,
                 thinking: self.thinking.clone(),
                 fast: self.fast,
                 prompt: None,
             })
             .await;
+        // Compaction can replace the transcript, invalidating its old length as
+        // an output boundary. The agent's run-local response survives that rewrite.
+        let text = agent.response_text().unwrap_or_default().to_owned();
+        // Agent owns completed billing, including compaction and evaluation. Read
+        // it before drop even on errors, which deliberately do not emit Done.
+        self.usage += agent.usage();
         drop(agent);
-        // Only this call's messages count: older turns may hold stale preamble
-        // text, and the agent loop's empty-response retry leaves a synthetic
-        // "(empty)" assistant marker that must not pass for a real response.
-        // Auto-compaction can shrink the history mid-run, so clamp the start:
-        // after a rewrite the tail is this call's output either way.
-        let turn = &self.history.as_slice()[history_len.min(self.history.len())..];
+        // Consume every emitted Done, including cancellation and turn-limit exits,
+        // so a later explicit invocation cannot read a stale usage total. Provider
+        // errors do not emit Done and must not wait for the relay.
+        if result.is_ok() {
+            match self.usage_rx.recv_async().await {
+                Ok(_) => {}
+                Err(_) => tracing::warn!(
+                    name = %self.name,
+                    "subagent event relay stopped before Done"
+                ),
+            }
+        }
         // A subagent can be cancelled on its own, and its caller should hear
         // about that instead of taking a half-finished answer for a real one,
         // so cancel reads like an error here even though the run ended
@@ -360,28 +453,20 @@ impl Subagent {
         let cut_short = match &result {
             Err(error) => Some(error.to_string()),
             Ok(DoneReason::Cancelled) => Some(CANCELLED.to_owned()),
+            Ok(DoneReason::MaxTurns) => Some(TURN_LIMIT.to_owned()),
             Ok(_) => None,
         };
         if let Some(error) = cut_short {
+            let turn = &self.history.as_slice()[history_len.min(self.history.len())..];
             let partial = assistant_text(turn).join("\n");
+            let partial = if partial.is_empty() { text } else { partial };
             return Err(PromptFailure {
                 error,
                 partial: (!partial.is_empty()).then_some(partial),
             });
         }
-        // Waiting here doubles as an ordering barrier: the relay reaches
-        // `Done` only after every `TurnComplete`, so all our `ToolLive::Usage`
-        // messages sit in the live channel before `dispatch_racing_live`
-        // drains it for the last time.
-        match self.usage_rx.recv_async().await {
-            Ok(usage) => self.usage += usage,
-            Err(_) => tracing::warn!(
-                name = %self.name,
-                "subagent usage tracker stopped, token counts may lag"
-            ),
-        }
         Ok(PromptResult {
-            text: last_assistant_text(turn).unwrap_or_default(),
+            text,
             duration: self.start.elapsed(),
             input_tokens: self.usage.total_input(),
             output_tokens: self.usage.output,
@@ -398,17 +483,6 @@ fn assistant_text(turn: &[Message]) -> Vec<&str> {
             _ => None,
         })
         .collect()
-}
-
-fn last_assistant_text(turn: &[Message]) -> Option<String> {
-    turn.iter()
-        .rfind(|message| matches!(message.role, Role::Assistant))?
-        .content
-        .iter()
-        .find_map(|block| match block {
-            ContentBlock::Text { text } => Some(text.clone()),
-            _ => None,
-        })
 }
 
 /// Everything both openers must decide before a [`Subagent`] can exist.
@@ -835,6 +909,10 @@ fn build(
         .map(|publisher| publisher.for_task(resolved.task_id.clone()));
 
     Ok(Subagent {
+        steering: Arc::new(Mutex::new(Steering::new(
+            ctx.config.steering.resolve(&resolved.model.spec()),
+        ))),
+        report_ready: None,
         params: AgentParams {
             provider: resolved.provider,
             model: resolved.model,

@@ -11,7 +11,7 @@ use crate::model::Model;
 use crate::providers::ResolvedAuth;
 use crate::{
     AgentError, ContentBlock, Message, ProviderEvent, ResponsesReasoning, Role, StopReason,
-    StreamResponse, ThinkingConfig, TokenUsage,
+    StreamResponse, ThinkingConfig, TokenUsage, invalid_tool_input,
 };
 
 const RESPONSES_PATH: &str = "/responses";
@@ -688,8 +688,8 @@ pub(crate) async fn parse_sse(
                 v
             }
             Err(e) => {
-                warn!(error = %e, tool = %acc.name, json = %acc.arguments, "malformed tool JSON, falling back to {{}}");
-                Value::Object(Default::default())
+                warn!(category = ?e.classify(), line = e.line(), column = e.column(), input_bytes = acc.arguments.len(), "malformed tool JSON");
+                invalid_tool_input(&acc.arguments)
             }
         };
         content_blocks.push(ContentBlock::tool_use(acc.call_id, acc.name, input));
@@ -726,12 +726,83 @@ fn parse_usage(u: &Value) -> TokenUsage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::SteeringKind;
     use futures_lite::io::Cursor;
     use serde_json::json;
+    use test_case::test_case;
 
     const TEST_STREAM_TIMEOUT: Duration = Duration::from_secs(300);
     const EXPECT_TRANSIENT_RETRY: &str =
         "a provider outage reported over SSE must stay retryable end to end";
+    const STEERING_TEXT: &str = "Continue with a useful response.";
+    const STEERING_RULE: &str = "empty_output";
+    const INVALID_CALL_ID: &str = "original-invalid-call";
+    const VALID_CALL_ID: &str = "original-valid-call";
+    const TOOL_NAME: &str = "read";
+
+    #[test_case(SteeringKind::Recovery ; "recovery")]
+    #[test_case(SteeringKind::Advisory ; "advisory")]
+    fn steering_metadata_is_not_on_wire(kind: SteeringKind) {
+        let wire = convert_input(&[Message::steering(STEERING_TEXT.into(), STEERING_RULE, kind)]);
+        assert_eq!(
+            wire,
+            json!([{"type": "message", "role": "user", "content": [{"type": "input_text", "text": STEERING_TEXT}]}])
+        );
+    }
+
+    #[test_case("{broken", false ; "malformed_delta")]
+    #[test_case("{broken", true ; "malformed_done")]
+    #[test_case("{\"path\":", true ; "truncated_done")]
+    #[test_case("", false ; "empty_delta")]
+    #[test_case("  ", true ; "whitespace_done")]
+    fn invalid_tool_arguments_preserve_siblings_and_pairing(raw: &str, done: bool) {
+        smol::block_on(async {
+            let mut sse = String::new();
+            for (index, (call_id, arguments)) in [(INVALID_CALL_ID, raw), (VALID_CALL_ID, "{}")]
+                .into_iter()
+                .enumerate()
+            {
+                let added = json!({"output_index": index, "item": {"type": "function_call", "call_id": call_id, "name": TOOL_NAME}});
+                sse.push_str(&format!(
+                    "event: response.output_item.added\ndata: {added}\n\n"
+                ));
+                if done {
+                    let item = json!({"output_index": index, "item": {"type": "function_call", "call_id": call_id, "name": TOOL_NAME, "arguments": arguments}});
+                    sse.push_str(&format!(
+                        "event: response.output_item.done\ndata: {item}\n\n"
+                    ));
+                } else {
+                    let delta = json!({"output_index": index, "delta": arguments});
+                    sse.push_str(&format!(
+                        "event: response.function_call_arguments.delta\ndata: {delta}\n\n"
+                    ));
+                }
+            }
+            let (response, _) = run_sse(&sse).await;
+            let response = response.unwrap();
+            let tools: Vec<_> = response.message.tool_uses().collect();
+            assert_eq!(
+                tools,
+                vec![
+                    (INVALID_CALL_ID, TOOL_NAME, &invalid_tool_input(raw)),
+                    (VALID_CALL_ID, TOOL_NAME, &json!({})),
+                ]
+            );
+            let result = Message {
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: INVALID_CALL_ID.into(),
+                    content: String::new(),
+                    is_error: true,
+                    output_ref: None,
+                }],
+                ..Default::default()
+            };
+            let wire = convert_input(&[response.message, result]);
+            assert_eq!(wire[0]["call_id"], INVALID_CALL_ID);
+            assert_eq!(wire[1]["call_id"], VALID_CALL_ID);
+            assert_eq!(wire[2]["call_id"], INVALID_CALL_ID);
+        });
+    }
 
     async fn run_sse(sse: &str) -> (Result<StreamResponse, AgentError>, Vec<ProviderEvent>) {
         let (tx, rx) = flume::unbounded();
@@ -1084,7 +1155,7 @@ data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"o
     }
 
     #[test]
-    fn parse_sse_malformed_tool_json_yields_empty_object() {
+    fn parse_sse_malformed_tool_json_preserves_invalid_input() {
         smol::block_on(async {
             let sse = "\
 event: response.output_item.added\n\
@@ -1102,7 +1173,8 @@ data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"ou
             let tools: Vec<_> = resp.message.tool_uses().collect();
             assert_eq!(tools.len(), 1);
             assert_eq!(tools[0].1, "bash");
-            assert_eq!(*tools[0].2, Value::Object(Default::default()));
+            assert_eq!(tools[0].0, "c1");
+            assert_eq!(*tools[0].2, invalid_tool_input("{broken"));
         })
     }
 

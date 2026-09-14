@@ -5,6 +5,7 @@ mod instructions;
 pub mod mention_preamble;
 mod provider_projection;
 mod run;
+pub(crate) mod steering;
 mod streaming;
 pub mod subagent;
 pub mod task_runner;

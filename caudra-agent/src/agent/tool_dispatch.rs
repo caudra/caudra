@@ -1,8 +1,8 @@
 use std::borrow::Cow;
-use std::collections::VecDeque;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::{BTreeMap, VecDeque};
 use std::hash::{Hash, Hasher};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -13,7 +13,7 @@ use crate::permissions::canonical_json;
 use crate::task_set::TaskSet;
 use crate::tools::registry::{PlanModeAccess, ToolInvocation, ToolRegistry};
 use crate::tools::{
-    DOOM_LOOP_MESSAGE, LocalToolEntry, READ_ONLY_TOOL_RESTRICTED, TOOL_SEARCH_TOOL_NAME,
+    DOOM_LOOP_GUIDANCE, LocalToolEntry, READ_ONLY_TOOL_RESTRICTED, TOOL_SEARCH_TOOL_NAME,
     ToolContext, ToolEffect,
 };
 use crate::workspace_baseline::BaselineOutcome;
@@ -49,6 +49,7 @@ impl Emit<'_> {
     }
 }
 
+#[cfg(test)]
 const DOOM_LOOP_THRESHOLD: usize = 3;
 const MCP_BLOCKED_IN_PLAN: &str = "MCP tools are not available in plan mode";
 const UNKNOWN_TOOL_PREFIX: &str = "unknown tool";
@@ -79,11 +80,193 @@ const ERROR_OTHER: &str = "error";
 /// `similar` returns a coarser but still valid one.
 const DIFF_TIMEOUT: Duration = Duration::from_millis(100);
 
-pub(super) struct RecentCalls(VecDeque<(String, u64)>);
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ToolOutcome {
+    Success,
+    Repairable,
+    Failure,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ToolObservation {
+    pub name: String,
+    pub fingerprint: u64,
+    pub outcome: ToolOutcome,
+}
+
+#[derive(Clone)]
+pub struct ResponseObservations {
+    shared: Arc<Mutex<ObservationState>>,
+    attempt: Option<Arc<Mutex<ObservationAttempt>>>,
+}
+
+struct ObservationState {
+    limit: usize,
+    facts: BTreeMap<Vec<usize>, ToolObservation>,
+    attempts: usize,
+    repairable: usize,
+}
+
+struct ObservationAttempt {
+    order: Vec<usize>,
+    outcome: ToolOutcome,
+    repairable: bool,
+    expanded: bool,
+}
+
+impl ResponseObservations {
+    pub(crate) fn new(limit: usize) -> Self {
+        Self {
+            shared: Arc::new(Mutex::new(ObservationState {
+                limit,
+                facts: BTreeMap::new(),
+                attempts: 0,
+                repairable: 0,
+            })),
+            attempt: None,
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, ObservationState> {
+        self.shared
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    /// Retain only the earliest leaf paths, not the first tasks to finish. A
+    /// reservation starts as Failure so a panic or cancellation cannot look
+    /// repairable merely because validation marked it before unwinding.
+    fn reserve(&self, order: Vec<usize>, name: &str, input: &Value) -> Self {
+        let mut state = self.lock();
+        state.attempts += 1;
+        if state.limit > 0
+            && (state.facts.len() < state.limit
+                || state
+                    .facts
+                    .last_key_value()
+                    .is_some_and(|(last, _)| &order < last))
+        {
+            let mut hasher = DefaultHasher::new();
+            name.hash(&mut hasher);
+            canonical_json(input).hash(&mut hasher);
+            state.facts.insert(
+                order.clone(),
+                ToolObservation {
+                    name: name.to_owned(),
+                    fingerprint: hasher.finish(),
+                    outcome: ToolOutcome::Failure,
+                },
+            );
+            if state.facts.len() > state.limit {
+                state.facts.pop_last();
+            }
+        }
+        Self {
+            shared: Arc::clone(&self.shared),
+            attempt: Some(Arc::new(Mutex::new(ObservationAttempt {
+                order,
+                outcome: ToolOutcome::Failure,
+                repairable: false,
+                expanded: false,
+            }))),
+        }
+    }
+
+    pub(crate) fn mark_repairable(&self) {
+        if let Some(attempt) = &self.attempt {
+            attempt
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .repairable = true;
+        }
+    }
+
+    /// Response-wide totals include attempts evicted from the bounded pattern
+    /// window; one ordinary failure or success anywhere prevents all-repairable.
+    pub(crate) fn finish(&self, is_error: bool) {
+        let Some(attempt) = &self.attempt else { return };
+        let mut attempt = attempt.lock().unwrap_or_else(|error| error.into_inner());
+        if attempt.expanded {
+            return;
+        }
+        let outcome = if !is_error {
+            ToolOutcome::Success
+        } else if attempt.repairable {
+            ToolOutcome::Repairable
+        } else {
+            ToolOutcome::Failure
+        };
+        let mut state = self.lock();
+        state.repairable -= usize::from(attempt.outcome == ToolOutcome::Repairable);
+        state.repairable += usize::from(outcome == ToolOutcome::Repairable);
+        if let Some(fact) = state.facts.get_mut(&attempt.order) {
+            fact.outcome = outcome.clone();
+        }
+        attempt.outcome = outcome;
+    }
+
+    /// A parsed batch contributes its children, not a successful wrapper.
+    /// Removing the parent before reserving its ordered descendants preserves
+    /// the deterministic prefix even when later roots expand first.
+    pub(crate) fn expand(&self) {
+        let Some(attempt) = &self.attempt else { return };
+        let mut attempt = attempt.lock().unwrap_or_else(|error| error.into_inner());
+        if !attempt.expanded {
+            let mut state = self.lock();
+            state.attempts -= 1;
+            state.repairable -= usize::from(attempt.outcome == ToolOutcome::Repairable);
+            state.facts.remove(&attempt.order);
+            attempt.expanded = true;
+        }
+    }
+
+    pub(crate) fn take(&self) -> (Vec<ToolObservation>, bool) {
+        let mut state = self.lock();
+        let all_repairable = state.attempts > 0 && state.attempts == state.repairable;
+        let facts = std::mem::take(&mut state.facts).into_values().collect();
+        state.attempts = 0;
+        state.repairable = 0;
+        (facts, all_repairable)
+    }
+}
+
+pub(crate) fn observe_context(ctx: &mut ToolContext, name: &str, input: &Value) {
+    if let Some(observations) = &ctx.steering_observations {
+        let name = canonical_tool_name(name, ctx);
+        let name = if ctx.registry.get(name).is_none()
+            && !ctx.local_tools.contains_key(name)
+            && ctx.mcp.is_some()
+            && name.contains(MCP_NAME_SEPARATOR)
+        {
+            Cow::Owned(crate::mcp::internal_tool_name(name))
+        } else {
+            Cow::Borrowed(name)
+        };
+        ctx.steering_observations =
+            Some(observations.reserve(ctx.steering_order.clone(), &name, input));
+    }
+}
+
+pub(super) struct RecentCalls {
+    calls: VecDeque<(String, u64)>,
+    threshold: usize,
+}
 
 impl RecentCalls {
+    #[cfg(test)]
     pub(super) fn new() -> Self {
-        Self(VecDeque::new())
+        Self::with_threshold(DOOM_LOOP_THRESHOLD)
+    }
+
+    pub(super) fn with_threshold(threshold: usize) -> Self {
+        Self {
+            calls: VecDeque::new(),
+            threshold,
+        }
+    }
+
+    pub(super) fn threshold(&self) -> usize {
+        self.threshold
     }
 
     fn hash_input(input: &Value) -> u64 {
@@ -93,20 +276,26 @@ impl RecentCalls {
     }
 
     fn is_doom_loop(&self, name: &str, input: &Value) -> bool {
+        if self.threshold == 0 {
+            return false;
+        }
         let hash = Self::hash_input(input);
-        self.0.len() >= DOOM_LOOP_THRESHOLD - 1
+        self.calls.len() >= self.threshold - 1
             && self
-                .0
+                .calls
                 .iter()
                 .rev()
-                .take(DOOM_LOOP_THRESHOLD - 1)
+                .take(self.threshold - 1)
                 .all(|(n, h)| n == name && *h == hash)
     }
 
     fn record(&mut self, name: String, input: &Value) {
-        self.0.push_back((name, Self::hash_input(input)));
-        if self.0.len() > DOOM_LOOP_THRESHOLD {
-            self.0.pop_front();
+        if self.threshold == 0 {
+            return;
+        }
+        self.calls.push_back((name, Self::hash_input(input)));
+        if self.calls.len() > self.threshold {
+            self.calls.pop_front();
         }
     }
 }
@@ -122,6 +311,18 @@ pub async fn run(
     ctx: &ToolContext,
     mut emit: Emit<'_>,
 ) -> ToolDoneEvent {
+    let mut observed_ctx;
+    let ctx = if ctx
+        .steering_observations
+        .as_ref()
+        .is_some_and(|observations| observations.attempt.is_none())
+    {
+        observed_ctx = ctx.clone();
+        observe_context(&mut observed_ctx, name, input);
+        &observed_ctx
+    } else {
+        ctx
+    };
     // Resolved unconditionally now that the report also feeds the log file,
     // which is where "which tool took nine seconds" gets answered.
     let canonical = canonical_tool_name(name, ctx);
@@ -132,6 +333,11 @@ pub async fn run(
         .instrument(span)
         .await;
     crate::tool_output::limit(&mut done, ctx).await;
+    if !ctx.cancel.is_cancelled()
+        && let Some(observations) = &ctx.steering_observations
+    {
+        observations.finish(done.is_error);
+    }
     report(&done, canonical, &source, input, started.elapsed());
     done
 }
@@ -195,6 +401,7 @@ async fn run_inner(
     // Before every gate and lookup: arguments that never parsed cannot be
     // judged, so there is nothing to permit and nothing to run.
     if let Some(raw) = input.get(INVALID_TOOL_JSON_KEY).and_then(Value::as_str) {
+        ctx.mark_tool_result_repairable();
         return done_error(format!("{name} {INVALID_INPUT_MESSAGE} {raw}"));
     }
 
@@ -247,10 +454,10 @@ async fn run_inner(
                 warn!(
                     tool = %name,
                     source = %entry.source.as_log_field(),
-                    input_preview = %crate::tools::schema::preview(&input.to_string()),
                     error = %e,
                     "tool input parse failed"
                 );
+                ctx.mark_tool_result_repairable();
                 return done_error(e.to_string());
             }
         };
@@ -552,6 +759,11 @@ fn run_tool_search(
         query.to_owned(),
         input,
     );
+    // Search bypasses invocation parsing. Only invalid input is repairable;
+    // a valid search with no catalog match is still a successful attempt.
+    if !query.chars().any(char::is_alphanumeric) {
+        ctx.mark_tool_result_repairable();
+    }
     let builtin = ctx
         .deferral
         .as_ref()
@@ -883,20 +1095,48 @@ pub(super) async fn process_tool_calls(
     ctx: &ToolContext,
 ) -> Result<(), AgentError> {
     let mut immediate_errors: Vec<ToolDoneEvent> = Vec::new();
-    let mut runnable: Vec<(String, String, Value)> = Vec::new();
+    let mut runnable = Vec::new();
+    let mut repeat_message = None;
 
-    for (id, name, input) in tool_uses {
+    for (index, (id, name, input)) in tool_uses.into_iter().enumerate() {
+        let mut tool_ctx = ToolContext {
+            tool_use_id: Some(id.clone()),
+            root_tool_use_id: ctx.root_tool_use_id.clone().or_else(|| Some(id.clone())),
+            steering_order: vec![index],
+            ..ctx.clone()
+        };
+        observe_context(&mut tool_ctx, &name, &input);
         debug!(
             tool = %name,
             id = %id,
-            input_preview = %crate::tools::schema::preview(&input.to_string()),
             "parsing tool call"
         );
         if recent_calls.is_doom_loop(&name, &input) {
             warn!(tool = %name, "doom loop detected, skipping execution");
-            immediate_errors.push(ToolDoneEvent::error(id.clone(), DOOM_LOOP_MESSAGE));
+            tool_ctx.mark_tool_result_repairable();
+            if !ctx.cancel.is_cancelled()
+                && let Some(observations) = &tool_ctx.steering_observations
+            {
+                observations.finish(true);
+            }
+            // Resolve model overrides only if a refusal needs guidance, and
+            // reuse the message for every blocked call in this response.
+            let message = repeat_message.get_or_insert_with(|| {
+                let policy = ctx.config.steering.resolve(&ctx.model.spec());
+                let guidance = policy
+                    .rules
+                    .repeated_tool_call
+                    .prompt
+                    .as_deref()
+                    .unwrap_or(DOOM_LOOP_GUIDANCE);
+                format!(
+                    "You have called this tool with identical input {} times in a row. {guidance}",
+                    recent_calls.threshold(),
+                )
+            });
+            immediate_errors.push(ToolDoneEvent::error(id.clone(), message.clone()));
         } else {
-            runnable.push((id, name.clone(), input.clone()));
+            runnable.push((id, name.clone(), input.clone(), tool_ctx));
         }
         recent_calls.record(name, &input);
     }
@@ -907,14 +1147,9 @@ pub(super) async fn process_tool_calls(
 
     let mut set = TaskSet::new();
     let mut spawned_ids: Vec<String> = Vec::new();
-    for (id, name, input) in runnable {
+    for (id, name, input, tool_ctx) in runnable {
         spawned_ids.push(id.clone());
         let event_tx_clone = ctx.event_tx.clone();
-        let tool_ctx = ToolContext {
-            tool_use_id: Some(id.clone()),
-            root_tool_use_id: ctx.root_tool_use_id.clone().or_else(|| Some(id.clone())),
-            ..ctx.clone()
-        };
         let mcp_owned = mcp.cloned();
         set.spawn(async move {
             let done = run(
@@ -1075,11 +1310,325 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
-    use crate::AgentMode;
+    use crate::agent::history::History;
+    use crate::cancel::CancelToken;
     use crate::permissions::{PERMISSION_DENIED_PREFIX, PermissionManager};
     use crate::snapshots::{SnapshotLimits, SnapshotStore};
     use crate::tools::registry::ToolSource;
     use crate::tools::test_support::{GUARDED_TOOL_NAME, GuardedMock};
+    use crate::{AgentMode, EventSender};
+
+    const OBSERVED_TOOL: &str = "observed";
+    const OBSERVED_ERROR: &str = "invalid JSON permission denied";
+    const OBSERVATION_WINDOW: usize = 3;
+    const REPEAT_GUIDANCE: &str = "Inspect the previous result before choosing another tool.";
+    const MODEL_REPEAT_GUIDANCE: &str = "Use a different query for this model.";
+    const REPEAT_TWO_PREFIX: &str =
+        "You have called this tool with identical input 2 times in a row. ";
+
+    #[test_case(&[0, 1, 2, 3]; "input_order")]
+    #[test_case(&[3, 1, 0, 2]; "shuffled_completion")]
+    fn observations_follow_reserved_order_and_count_truncated_success(order: &[usize]) {
+        let observations = ResponseObservations::new(OBSERVATION_WINDOW);
+        let slots: Vec<_> = (0..=OBSERVATION_WINDOW)
+            .map(|index| observations.reserve(vec![index], &index.to_string(), &Value::Null))
+            .collect();
+        for &index in order {
+            if index < OBSERVATION_WINDOW {
+                slots[index].mark_repairable();
+            }
+            slots[index].finish(index < OBSERVATION_WINDOW);
+        }
+        let (facts, all_repairable) = observations.take();
+        assert_eq!(
+            facts
+                .iter()
+                .map(|fact| fact.name.as_str())
+                .collect::<Vec<_>>(),
+            ["0", "1", "2"]
+        );
+        assert!(
+            facts
+                .iter()
+                .all(|fact| fact.outcome == ToolOutcome::Repairable)
+        );
+        assert!(!all_repairable);
+    }
+
+    #[test_case(&[0, 1, 2]; "input_order")]
+    #[test_case(&[2, 0, 1]; "shuffled_expansion")]
+    fn observations_bound_reservations_by_leaf_order(order: &[usize]) {
+        let observations = ResponseObservations::new(OBSERVATION_WINDOW);
+        let parents: Vec<_> = (0..OBSERVATION_WINDOW)
+            .map(|index| observations.reserve(vec![index], "batch", &Value::Null))
+            .collect();
+        for &index in order {
+            parents[index].expand();
+            for child in 0..OBSERVATION_WINDOW {
+                let slot = observations.reserve(
+                    vec![index, child],
+                    &format!("{index}:{child}"),
+                    &Value::Null,
+                );
+                slot.mark_repairable();
+                slot.finish(true);
+            }
+            parents[index].finish(false);
+        }
+        let (facts, all_repairable) = observations.take();
+        assert_eq!(
+            facts
+                .iter()
+                .map(|fact| fact.name.as_str())
+                .collect::<Vec<_>>(),
+            ["0:0", "0:1", "0:2"]
+        );
+        assert!(all_repairable);
+    }
+
+    #[test_case(0; "no_pattern_slots")]
+    #[test_case(1; "one_pattern_slot")]
+    fn observations_account_for_unsettled_attempts_outside_the_window(limit: usize) {
+        let observations = ResponseObservations::new(limit);
+        let first = observations.reserve(vec![0], OBSERVED_TOOL, &Value::Null);
+        first.mark_repairable();
+        first.finish(true);
+        let unsettled = observations.reserve(vec![1], OBSERVED_TOOL, &Value::Null);
+        unsettled.mark_repairable();
+        assert!(!observations.take().1);
+        assert_eq!(ResponseObservations::new(limit).take(), (Vec::new(), false));
+    }
+
+    #[test_case(&[0, 1], false; "earlier_root_first")]
+    #[test_case(&[1, 0], false; "later_root_first")]
+    #[test_case(&[1, 0], true; "completion_after_eviction")]
+    fn observations_bound_uneven_batches(order: &[usize], finish_after_expansion: bool) {
+        const BATCH_SIZES: [usize; 2] = [2, 3];
+        let observations = ResponseObservations::new(OBSERVATION_WINDOW);
+        let parents: Vec<_> = (0..BATCH_SIZES.len())
+            .map(|index| observations.reserve(vec![index], "batch", &Value::Null))
+            .collect();
+        let mut children = Vec::new();
+        for &index in order {
+            parents[index].expand();
+            for child in 0..BATCH_SIZES[index] {
+                let slot = observations.reserve(
+                    vec![index, child],
+                    &format!("{index}:{child}"),
+                    &Value::Null,
+                );
+                let repairable = (index, child) != (1, 2);
+                if repairable {
+                    slot.mark_repairable();
+                }
+                if !finish_after_expansion {
+                    slot.finish(repairable);
+                }
+                children.push((slot, repairable));
+            }
+            parents[index].finish(false);
+        }
+        if finish_after_expansion {
+            for (slot, repairable) in children.into_iter().rev() {
+                slot.finish(repairable);
+            }
+        }
+        let (facts, all_repairable) = observations.take();
+        assert_eq!(
+            facts
+                .iter()
+                .map(|fact| fact.name.as_str())
+                .collect::<Vec<_>>(),
+            ["0:0", "0:1", "1:0"]
+        );
+        assert!(
+            facts
+                .iter()
+                .all(|fact| fact.outcome == ToolOutcome::Repairable)
+        );
+        assert!(!all_repairable);
+    }
+
+    #[test_case(3, None, None; "legacy_message")]
+    #[test_case(2, None, None; "nondefault_threshold")]
+    #[test_case(2, Some(REPEAT_GUIDANCE), None; "custom_guidance")]
+    #[test_case(2, Some(REPEAT_GUIDANCE), Some(MODEL_REPEAT_GUIDANCE); "model_guidance")]
+    fn repeat_refusal_message_uses_threshold_and_resolved_guidance(
+        threshold: usize,
+        prompt: Option<&str>,
+        model_prompt: Option<&str>,
+    ) {
+        smol::block_on(async {
+            let mut ctx = local_ctx(OBSERVED_TOOL, |_| Ok(String::new()));
+            let (tx, rx) = flume::unbounded();
+            ctx.event_tx = EventSender::new(tx, 0);
+            Arc::make_mut(&mut ctx.config.steering)
+                .rules
+                .repeated_tool_call
+                .prompt = prompt.map(str::to_owned);
+            if let Some(prompt) = model_prompt {
+                Arc::make_mut(&mut ctx.config.steering)
+                    .models
+                    .entry(ctx.model.spec())
+                    .or_default()
+                    .rules
+                    .repeated_tool_call
+                    .prompt = Some(prompt.into());
+            }
+            let mut recent = RecentCalls::with_threshold(threshold);
+            for _ in 1..threshold {
+                recent.record(OBSERVED_TOOL.into(), &Value::Null);
+            }
+            let mut history = History::new(Vec::new());
+            process_tool_calls(
+                (0..2)
+                    .map(|index| (index.to_string(), OBSERVED_TOOL.into(), Value::Null))
+                    .collect(),
+                &mut recent,
+                None,
+                &mut history,
+                &ctx.event_tx,
+                &ctx,
+            )
+            .await
+            .unwrap();
+            let results: Vec<_> = rx
+                .try_iter()
+                .filter_map(|envelope| match envelope.event {
+                    AgentEvent::ToolDone(done) => Some(done),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(results.len(), 2);
+            let expected = if threshold == DOOM_LOOP_THRESHOLD {
+                crate::tools::DOOM_LOOP_MESSAGE.to_owned()
+            } else {
+                format!(
+                    "{REPEAT_TWO_PREFIX}{}",
+                    model_prompt.or(prompt).unwrap_or(DOOM_LOOP_GUIDANCE)
+                )
+            };
+            for done in results {
+                assert!(done.is_error);
+                assert_eq!(done.output.as_text(), expected);
+            }
+        });
+    }
+
+    #[test_case(0, false; "disabled")]
+    #[test_case(3, true; "legacy_threshold")]
+    #[test_case(4, false; "higher_threshold")]
+    fn repeat_threshold_is_configurable(threshold: usize, blocked: bool) {
+        let mut recent = RecentCalls::with_threshold(threshold);
+        for _ in 0..2 {
+            recent.record(OBSERVED_TOOL.into(), &Value::Null);
+        }
+        assert_eq!(recent.is_doom_loop(OBSERVED_TOOL, &Value::Null), blocked);
+        if threshold == 0 {
+            assert!(recent.calls.is_empty());
+        }
+    }
+
+    #[test_case(0, ToolOutcome::Success; "disabled_guard_executes")]
+    #[test_case(3, ToolOutcome::Repairable; "repeat_refusal_is_observed")]
+    fn top_level_repeat_policy_contributes_observations(threshold: usize, expected: ToolOutcome) {
+        smol::block_on(async {
+            let observations = ResponseObservations::new(1);
+            let mut ctx = local_ctx(OBSERVED_TOOL, |_| Ok(String::new()));
+            let (tx, _rx) = flume::unbounded();
+            ctx.event_tx = EventSender::new(tx, 0);
+            ctx.steering_observations = Some(observations.clone());
+            let mut recent = RecentCalls::with_threshold(threshold);
+            for _ in 0..2 {
+                recent.record(OBSERVED_TOOL.into(), &Value::Null);
+            }
+            let mut history = History::new(Vec::new());
+            process_tool_calls(
+                vec![(OBSERVED_TOOL.into(), OBSERVED_TOOL.into(), Value::Null)],
+                &mut recent,
+                None,
+                &mut history,
+                &ctx.event_tx,
+                &ctx,
+            )
+            .await
+            .unwrap();
+            let (facts, all_repairable) = observations.take();
+            assert_eq!(all_repairable, expected == ToolOutcome::Repairable);
+            assert_eq!(facts[0].outcome, expected);
+        });
+    }
+
+    #[test_case(false, false, ToolOutcome::Failure; "error_text_is_not_a_signal")]
+    #[test_case(true, false, ToolOutcome::Repairable; "host_validation_error")]
+    #[test_case(true, true, ToolOutcome::Failure; "cancellation_is_not_repairable")]
+    fn local_validation_observations_are_explicit(
+        mark: bool,
+        cancelled: bool,
+        expected: ToolOutcome,
+    ) {
+        smol::block_on(async {
+            let observations = ResponseObservations::new(1);
+            let mut ctx = crate::tools::test_support::stub_ctx(&AgentMode::Build);
+            ctx.local_tools = Arc::new(HashMap::from([(
+                OBSERVED_TOOL.into(),
+                crate::tools::local_tool(move |_, ctx| {
+                    Box::pin(async move {
+                        if mark {
+                            ctx.mark_tool_result_repairable();
+                        }
+                        Err(OBSERVED_ERROR.into())
+                    })
+                }),
+            )]));
+            ctx.steering_observations = Some(observations.clone());
+            if cancelled {
+                let (trigger, token) = CancelToken::new();
+                ctx.cancel = token;
+                trigger.cancel();
+            }
+            let done = run(
+                &ctx.registry,
+                None,
+                OBSERVED_TOOL.into(),
+                OBSERVED_TOOL,
+                &Value::Null,
+                &ctx,
+                Emit::Silent,
+            )
+            .await;
+            assert!(done.is_error);
+            let (facts, all_repairable) = observations.take();
+            assert_eq!(all_repairable, expected == ToolOutcome::Repairable);
+            assert_eq!(facts[0].outcome, expected);
+        });
+    }
+
+    #[test]
+    fn observations_canonicalize_aliases_and_json_keys() {
+        let observations = ResponseObservations::new(2);
+        let mut ctx = local_ctx(OBSERVED_TOOL, |_| Ok(String::new()));
+        ctx.tool_name_aliases = Some(Arc::new(HashMap::from([(
+            "alias".into(),
+            OBSERVED_TOOL.into(),
+        )])));
+        ctx.steering_observations = Some(observations.clone());
+        ctx.steering_order = vec![0];
+        observe_context(
+            &mut ctx,
+            "functions.alias",
+            &serde_json::from_str(r#"{"b":{"z":1,"a":2},"a":0}"#).unwrap(),
+        );
+        ctx.steering_order = vec![1];
+        observe_context(
+            &mut ctx,
+            OBSERVED_TOOL,
+            &serde_json::from_str(r#"{"a":0,"b":{"a":2,"z":1}}"#).unwrap(),
+        );
+        let (facts, _) = observations.take();
+        assert_eq!(facts[0], facts[1]);
+        assert_eq!(facts[0].name, OBSERVED_TOOL);
+    }
 
     fn recent_calls(entries: &[(&str, Value)]) -> RecentCalls {
         let mut rc = RecentCalls::new();
@@ -1169,7 +1718,9 @@ mod tests {
         const TRUNCATED: &str = r#"{"path": "/a", "content": "half a fi"#;
 
         smol::block_on(async {
-            let ctx = local_ctx("batch", |_| panic!("{RAN_ANYWAY}"));
+            let mut ctx = local_ctx("batch", |_| panic!("{RAN_ANYWAY}"));
+            let observations = ResponseObservations::new(1);
+            ctx.steering_observations = Some(observations.clone());
             let done = run(
                 ToolRegistry::global(),
                 None,
@@ -1183,6 +1734,9 @@ mod tests {
 
             assert!(done.is_error, "{RAN_ANYWAY}");
             assert!(done.output.as_text().contains(TRUNCATED), "{RAW_TEXT_LOST}");
+            let (facts, all_repairable) = observations.take();
+            assert!(all_repairable);
+            assert_eq!(facts[0].outcome, ToolOutcome::Repairable);
         });
     }
 
@@ -1428,10 +1982,14 @@ mod tests {
 
     #[test_case(serde_json::json!({"query": "  "}) ; "blank_query")]
     #[test_case(serde_json::json!({}) ; "missing_query")]
+    #[test_case(serde_json::json!({"query": 42}) ; "nonstring_query")]
+    #[test_case(serde_json::json!({"query": "!?"}) ; "no_search_tokens")]
     fn tool_search_bad_query_is_error_event(input: Value) {
         smol::block_on(async {
             let mcp = crate::mcp::stub_session(&[("srv.tool", "")]);
-            let ctx = crate::tools::test_support::stub_ctx(&AgentMode::Build);
+            let mut ctx = crate::tools::test_support::stub_ctx(&AgentMode::Build);
+            let observations = ResponseObservations::new(1);
+            ctx.steering_observations = Some(observations.clone());
             let done = run(
                 ToolRegistry::global(),
                 Some(&mcp),
@@ -1447,6 +2005,49 @@ mod tests {
                 done.output.as_text(),
                 crate::tools::deferral::SEARCH_EMPTY_QUERY
             );
+            let (facts, all_repairable) = observations.take();
+            assert!(all_repairable);
+            assert_eq!(facts[0].outcome, ToolOutcome::Repairable);
+        });
+    }
+
+    #[test_case(serde_json::json!({}), ToolOutcome::Repairable; "missing_query")]
+    #[test_case(serde_json::json!({"query": false}), ToolOutcome::Repairable; "nonstring_query")]
+    #[test_case(serde_json::json!({"query": " \t"}), ToolOutcome::Repairable; "blank_query")]
+    #[test_case(serde_json::json!({"query": "!?"}), ToolOutcome::Repairable; "no_search_tokens")]
+    #[test_case(serde_json::json!({"query": "unmatched"}), ToolOutcome::Success; "valid_no_match")]
+    #[test_case(serde_json::json!({"query": "issue"}), ToolOutcome::Success; "valid_match")]
+    fn deferred_builtin_search_observes_input_validation(input: Value, expected: ToolOutcome) {
+        use crate::tools::{DeferralSession, DeferredTool};
+
+        smol::block_on(async {
+            let mut ctx = crate::tools::test_support::stub_ctx(&AgentMode::Build);
+            ctx.deferral = Some(DeferralSession::new(
+                vec![DeferredTool::new(
+                    "fetch_issue",
+                    None,
+                    serde_json::json!({
+                        "name": "fetch_issue", "description": "Fetch an issue", "input_schema": {"type": "object"}
+                    }),
+                )],
+                std::iter::empty(),
+            ));
+            let observations = ResponseObservations::new(1);
+            ctx.steering_observations = Some(observations.clone());
+            let done = run(
+                &ctx.registry,
+                None,
+                "t1".into(),
+                TOOL_SEARCH_TOOL_NAME,
+                &input,
+                &ctx,
+                Emit::Silent,
+            )
+            .await;
+            assert_eq!(done.is_error, expected == ToolOutcome::Repairable);
+            let (facts, all_repairable) = observations.take();
+            assert_eq!(all_repairable, expected == ToolOutcome::Repairable);
+            assert_eq!(facts[0].outcome, expected);
         });
     }
 

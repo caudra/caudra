@@ -25,6 +25,7 @@ use crate::TokenUsage;
 use crate::model::Model;
 
 const LOCAL_BUDGET_FIELD: &str = "thinking_budget_tokens";
+const INVALID_TOOL_JSON_EXCERPT: usize = 2_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImageMediaType {
@@ -288,6 +289,19 @@ impl ContentBlock {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SteeringOrigin {
+    pub rule: String,
+    pub kind: SteeringKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SteeringKind {
+    Recovery,
+    Advisory,
+}
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub role: Role,
@@ -298,6 +312,8 @@ pub struct Message {
     /// load unchanged.
     #[serde(default, skip_serializing_if = "MessageKind::is_turn")]
     pub kind: MessageKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub steering: Option<SteeringOrigin>,
     /// Host-only producer identity used to gate provider-private replay.
     #[serde(skip)]
     pub reasoning_source: Option<ReasoningSource>,
@@ -358,6 +374,16 @@ impl Message {
 
     pub fn is_observation(&self) -> bool {
         self.kind == MessageKind::Observation
+    }
+
+    pub fn steering(text: String, rule: &str, kind: SteeringKind) -> Self {
+        Self {
+            steering: Some(SteeringOrigin {
+                rule: rule.to_owned(),
+                kind,
+            }),
+            ..Self::observation(text)
+        }
     }
 
     pub fn user(text: String) -> Self {
@@ -451,6 +477,14 @@ impl Message {
             .iter()
             .any(|b| matches!(b, ContentBlock::ToolUse { .. }))
     }
+}
+
+pub fn invalid_tool_input(raw: &str) -> Value {
+    let excerpt: String = raw.chars().take(INVALID_TOOL_JSON_EXCERPT).collect();
+    Value::Object(Map::from_iter([(
+        INVALID_TOOL_JSON_KEY.to_string(),
+        Value::String(excerpt),
+    )]))
 }
 
 impl TitleSource for Message {
@@ -1009,6 +1043,46 @@ mod tests {
     use super::*;
     use crate::model::ThinkingSupport as Support;
     use test_case::test_case;
+
+    const STEERING_RULE: &str = "empty_output";
+    const STEERING_TEXT: &str = "Continue with a useful response.";
+
+    #[test_case("", 0 ; "empty")]
+    #[test_case("{broken", 1 ; "short")]
+    #[test_case("é", INVALID_TOOL_JSON_EXCERPT ; "at_limit")]
+    #[test_case("\u{1f980}", INVALID_TOOL_JSON_EXCERPT + 1 ; "unicode_truncated")]
+    fn invalid_tool_input_preserves_bounded_excerpt(unit: &str, count: usize) {
+        let raw = unit.repeat(count);
+        let wrapped = invalid_tool_input(&raw);
+        let excerpt = wrapped[INVALID_TOOL_JSON_KEY].as_str().unwrap();
+        assert_eq!(
+            excerpt.chars().count(),
+            raw.chars().count().min(INVALID_TOOL_JSON_EXCERPT)
+        );
+        assert!(raw.starts_with(excerpt));
+        assert_eq!(wrapped.as_object().unwrap().len(), 1);
+    }
+
+    #[test_case(SteeringKind::Recovery, "recovery" ; "recovery")]
+    #[test_case(SteeringKind::Advisory, "advisory" ; "advisory")]
+    fn steering_message_serde(kind: SteeringKind, serialized_kind: &str) {
+        let message = Message::steering(STEERING_TEXT.into(), STEERING_RULE, kind);
+        let encoded = serde_json::to_value(&message).unwrap();
+        assert_eq!(encoded["steering"]["rule"], STEERING_RULE);
+        assert_eq!(encoded["steering"]["kind"], serialized_kind);
+        let decoded: Message = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.steering, message.steering);
+        assert!(decoded.is_observation());
+        assert_eq!(decoded.first_text_content(), Some(STEERING_TEXT));
+        assert!(decoded.first_user_text().is_none());
+    }
+
+    #[test_case(json!({"role": "user", "content": [{"type": "text", "text": STEERING_TEXT}]}))]
+    fn legacy_message_has_no_steering(encoded: Value) {
+        let message: Message = serde_json::from_value(encoded.clone()).unwrap();
+        assert!(message.steering.is_none());
+        assert_eq!(serde_json::to_value(message).unwrap(), encoded);
+    }
 
     #[test_case("end_turn", StopReason::EndTurn   ; "end_turn")]
     #[test_case("tool_use", StopReason::ToolUse   ; "tool_use")]
