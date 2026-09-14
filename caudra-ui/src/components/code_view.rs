@@ -1232,7 +1232,7 @@ pub(crate) fn render_live_body(body: &str) -> Vec<Line<'static>> {
 /// How many rows the full rendering would take. Counted rather than rendered,
 /// so deciding to condense never costs the highlighting of results nobody is
 /// going to see.
-fn grep_height(entries: &[GrepFileEntry], multi: bool) -> usize {
+fn grep_height(entries: &[GrepFileEntry]) -> usize {
     entries
         .iter()
         .map(|entry| {
@@ -1243,7 +1243,7 @@ fn grep_height(entries: &[GrepFileEntry], multi: bool) -> usize {
                 0
             };
             let lines: usize = entry.groups.iter().map(|group| group.lines.len()).sum();
-            usize::from(multi) + separators + lines
+            1 + separators + lines
         })
         .sum()
 }
@@ -1299,7 +1299,6 @@ fn render_grep_lines(
     entries: &[GrepFileEntry],
     mut budget: usize,
     highlight: bool,
-    multi: bool,
 ) -> Vec<Line<'static>> {
     let mut out = Vec::new();
     let global_max_nr = entries
@@ -1319,13 +1318,11 @@ fn render_grep_lines(
             break;
         }
 
-        if multi {
-            out.push(Line::from(Span::styled(
-                entry.path.clone(),
-                theme::current().tool_path,
-            )));
-            budget -= 1;
-        }
+        out.push(Line::from(Span::styled(
+            entry.path.clone(),
+            theme::current().tool_path,
+        )));
+        budget -= 1;
 
         let syntax = highlight.then(|| caudra_highlight::syntax_for_path(&entry.path));
         let has_context = entry.groups.iter().any(|g| g.lines.len() > 1);
@@ -1396,25 +1393,23 @@ fn render_grep_matches(
     max_lines: usize,
     highlight: bool,
 ) -> (Vec<Line<'static>>, bool) {
-    let multi = entries.len() > 1;
-    let height = grep_height(entries, multi);
+    let height = grep_height(entries);
     if height <= max_lines {
-        return (render_grep_lines(entries, height, highlight, multi), false);
+        return (render_grep_lines(entries, height, highlight), false);
     }
-    if multi {
+    if entries.len() > 1 {
         return (render_grep_summary(entries, max_lines), true);
     }
 
     // One file has no distribution to summarise, so it names itself and the
     // matches take what room is left. The count is left to the card header.
-    let theme = theme::current();
-    let path = entries.first().map(|e| e.path.clone()).unwrap_or_default();
-    let mut out = vec![Line::from(Span::styled(path, theme.tool_path))];
-    let (shown, hidden) = within(height, max_lines.saturating_sub(2));
-    out.extend(render_grep_lines(entries, shown, highlight, false));
+    // The name takes its row before the matches are budgeted, because a match
+    // the card cannot place is one the reader cannot act on.
+    let (shown, hidden) = within(height.saturating_sub(1), max_lines.saturating_sub(2));
+    let mut out = render_grep_lines(entries, shown + 1, highlight);
     out.push(Line::from(Span::styled(
         expand_notice(&format!("{hidden} lines")),
-        theme.tool_dim,
+        theme::current().tool_dim,
     )));
     (out, true)
 }
@@ -2676,7 +2671,7 @@ mod tests {
     const GREP_SHAPE: &str = "a grep too big to show has to say how much matched and where";
 
     #[test_case(&[("a.rs", &[1,2,3,4,5,6,7,8,9,10_usize] as &[usize])], 3, 3 ; "one_file_condenses_to_its_budget")]
-    #[test_case(&[("a.rs", &[1_usize,2])],                              5, 2 ; "no_truncation_when_fits")]
+    #[test_case(&[("a.rs", &[1_usize,2])],                              5, 3 ; "no_truncation_when_fits")]
     #[test_case(&[("a.rs", &[1_usize,2,3]), ("b.rs", &[10,20])],        4, 3 ; "two_files_name_themselves_then_notice")]
     #[test_case(&[("a.rs", &[1_usize,2])],                              1, 2 ; "the_way_back_outranks_a_single_row")]
     fn render_grep_line_count(files: &[(&str, &[usize])], max: usize, expected: usize) {
@@ -2760,6 +2755,18 @@ mod tests {
         assert_eq!(rendered.last().unwrap(), &expand_notice(gained));
     }
 
+    /// The reported bug: a grep whose matches all fit named line numbers and
+    /// nothing else, and the card header names the directory the search was
+    /// pointed at rather than the file that matched, so which file it was could
+    /// not be recovered from the card at all.
+    #[test]
+    fn a_single_file_grep_that_fits_still_names_its_file() {
+        let rendered = grep_text(&[("a.rs", &[1_usize, 2])], 10);
+        assert_eq!(rendered[0], "a.rs");
+        assert!(rendered[1].contains("code at a.rs:1"));
+        assert!(!rendered.iter().any(|l| l.contains(EXPAND_AFFORDANCE)));
+    }
+
     /// One file has no distribution to summarise, so it names itself and the
     /// matches keep the room.
     #[test]
@@ -2789,25 +2796,30 @@ mod tests {
         spans_text(&line.spans)
     }
 
+    /// A match row is its gutter and its text; a row naming a file is the name
+    /// alone. Telling them apart by shape rather than by looking for a path
+    /// keeps the check honest when the match text quotes a path itself.
     #[test]
     fn multi_file_grep_headers_and_alignment() {
         let entries = grep_entries(&[("a.rs", &[1]), ("b.rs", &[100])]);
         let (lines, _) = render_grep_results(&entries, None, 10, false);
 
-        let texts: Vec<String> = lines.iter().map(line_text).collect();
-        assert!(texts.iter().any(|t| t.contains("a.rs")));
-        assert!(texts.iter().any(|t| t.contains("b.rs")));
-
-        let gutter_width =
-            |line: &str| line.find(|c: char| c.is_alphabetic()).unwrap_or(usize::MAX);
-        let content_gutters: Vec<usize> = texts
+        let named: Vec<String> = lines
             .iter()
-            .filter(|t| !t.contains(".rs"))
-            .map(|t| gutter_width(t))
+            .filter(|line| line.spans.len() == 1)
+            .map(line_text)
             .collect();
-        assert!(
-            content_gutters.windows(2).all(|w| w[0] == w[1]),
-            "gutter widths should be uniform across files: {content_gutters:?}"
+        assert_eq!(named, vec!["a.rs".to_owned(), "b.rs".to_owned()]);
+
+        let gutters: Vec<usize> = lines
+            .iter()
+            .filter(|line| line.spans.len() > 1)
+            .map(|line| line.spans[0].content.chars().count())
+            .collect();
+        assert_eq!(
+            gutters,
+            vec![nr_width(100) + 1; 2],
+            "gutter widths should be uniform across files"
         );
     }
 
