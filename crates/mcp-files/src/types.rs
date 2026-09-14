@@ -42,6 +42,11 @@ pub struct FilesystemLimits {
     pub max_glob_generated_bytes: usize,
     pub max_glob_match_steps: usize,
     pub max_diff_bytes: usize,
+    /// How large a file may be for a write to carry the content it replaced.
+    ///
+    /// A caller that draws the write as a diff needs the old side, which the patch alone does not
+    /// supply. Over this bound the write carries nothing and the caller falls back to the patch.
+    pub max_previous_bytes: usize,
     pub max_patch_result_bytes: usize,
     /// Whether broad traversal applies `.gitignore` rules.
     ///
@@ -93,6 +98,9 @@ impl Default for FilesystemLimits {
             // truncates instead of failing.
             max_glob_match_steps: 400_000_000,
             max_diff_bytes: 16 * 1024,
+            // Room for any ordinary source file or document, far under `max_file_bytes`. A file
+            // larger than this is one whose old side costs more to carry than the diff is worth.
+            max_previous_bytes: 1024 * 1024,
             max_patch_result_bytes: 4 * 1024 * 1024,
             honor_gitignore: true,
             prune_nested_repositories: false,
@@ -129,6 +137,7 @@ impl FilesystemLimits {
             ("maxGlobGeneratedBytes", self.max_glob_generated_bytes),
             ("maxGlobMatchSteps", self.max_glob_match_steps),
             ("maxDiffBytes", self.max_diff_bytes),
+            ("maxPreviousBytes", self.max_previous_bytes),
             ("maxPatchResultBytes", self.max_patch_result_bytes),
             ("maxGitignoreFiles", self.max_gitignore_files),
             ("maxGitignoreBytes", self.max_gitignore_bytes),
@@ -400,6 +409,12 @@ pub struct FileWriteOutput {
     pub existed: bool,
     pub applied: bool,
     pub diff: FileDiff,
+    // The content the write replaced, carried when the file existed and fitted `max_previous_bytes`
+    // so a caller can draw the write as a diff. `None` covers both a created file and one too large
+    // to carry; `Some("")` is a file that was there and empty, which a sentinel could not tell from
+    // either.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous: Option<String>,
 }
 
 impl FileWriteOutput {
@@ -408,6 +423,7 @@ impl FileWriteOutput {
             .saturating_add(self.path.capacity())
             .saturating_add(self.relative_path.capacity())
             .saturating_add(self.diff.retained_bytes())
+            .saturating_add(self.previous.as_ref().map_or(0, String::capacity))
     }
 }
 
@@ -525,4 +541,43 @@ pub struct ResolvedDirectory {
 
 fn is_false(value: &bool) -> bool {
     !*value
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FileDiff, FileWriteKind, FileWriteOutput};
+
+    const REPLACED: &str = "the content a write replaced";
+
+    fn write_output(previous: Option<String>) -> FileWriteOutput {
+        FileWriteOutput {
+            kind: FileWriteKind::Write,
+            path: "/root/notes.txt".into(),
+            relative_path: "notes.txt".into(),
+            existed: true,
+            applied: true,
+            diff: FileDiff {
+                file: "/root/notes.txt".into(),
+                relative_path: "notes.txt".into(),
+                patch: String::new(),
+                additions: 0,
+                deletions: 0,
+                truncated: false,
+            },
+            previous,
+        }
+    }
+
+    /// The remote host charges a prepared write for what it holds, so a carried
+    /// old side that went unreported would be retained for free.
+    #[test]
+    fn a_carried_old_side_is_charged_to_the_bytes_a_write_retains() {
+        let carried = write_output(Some(REPLACED.to_owned()));
+        let bare = write_output(None);
+
+        assert_eq!(
+            carried.retained_bytes() - bare.retained_bytes(),
+            REPLACED.len()
+        );
+    }
 }

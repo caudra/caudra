@@ -1000,6 +1000,88 @@ async fn file_write_creates_missing_parent_directories_without_escaping_the_root
     );
 }
 
+/// A caller can only draw a write as a diff if it is handed the side the write
+/// replaced, so that content rides along up to `max_previous_bytes`.
+///
+/// The empty-file case is why the field is an `Option`: `Some("")` and `None`
+/// are different answers, and a sentinel string could not tell them apart.
+#[tokio::test]
+async fn a_write_carries_the_content_it_replaced_until_that_content_outgrows_its_bound() {
+    let fixture = fixture();
+    fs::write(fixture.root.join("empty.txt"), "").expect("empty fixture file");
+    let files = FileToolGroup::new(&fixture.root, true, None)
+        .await
+        .expect("tool group");
+
+    let created = files
+        .file_write(
+            FileWriteInput {
+                file_path: "fresh.txt".into(),
+                content: "one\n".into(),
+            },
+            &token(),
+        )
+        .await
+        .expect("create");
+    assert!(!created.existed);
+    assert_eq!(created.previous, None, "a new file has no other side");
+
+    let overwritten = files
+        .file_write(
+            FileWriteInput {
+                file_path: "fresh.txt".into(),
+                content: "two\n".into(),
+            },
+            &token(),
+        )
+        .await
+        .expect("overwrite");
+    assert!(overwritten.existed);
+    assert_eq!(overwritten.previous.as_deref(), Some("one\n"));
+
+    let emptied = files
+        .file_write(
+            FileWriteInput {
+                file_path: "empty.txt".into(),
+                content: "filled\n".into(),
+            },
+            &token(),
+        )
+        .await
+        .expect("overwrite of an empty file");
+    assert_eq!(
+        emptied.previous.as_deref(),
+        Some(""),
+        "a file that was there and empty is not a file that was absent"
+    );
+
+    let bounded = FileToolGroup::new(
+        &fixture.root,
+        true,
+        Some(FilesystemLimits {
+            max_previous_bytes: 2,
+            ..FilesystemLimits::default()
+        }),
+    )
+    .await
+    .expect("bounded tool group");
+    let dropped = bounded
+        .file_write(
+            FileWriteInput {
+                file_path: "fresh.txt".into(),
+                content: "three\n".into(),
+            },
+            &token(),
+        )
+        .await
+        .expect("overwrite above the bound");
+    assert!(dropped.existed);
+    assert_eq!(
+        dropped.previous, None,
+        "an old side above the bound is dropped rather than carried"
+    );
+}
+
 #[tokio::test]
 async fn writes_edits_and_applies_add_update_move_and_delete_patches() {
     let fixture = fixture();

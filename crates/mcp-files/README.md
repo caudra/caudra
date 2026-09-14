@@ -124,6 +124,11 @@ fit. `file_read`, `file_write`, and `file_edit` are bounded instead by `maxReadB
 a full-window read is a larger frame than 64,000 bytes, and halving the read window to hold one
 number would cost more than it buys.
 
+A write's structured record additionally carries `previous`, the content it replaced, so a caller can
+draw the write as a diff rather than as a wall of new text. It is the one field sized by the file
+rather than by the request, so `maxPreviousBytes` bounds it separately and a file above that bound
+reports no `previous` at all, leaving the caller the patch it already had.
+
 ## Compatibility
 
 Shared fixtures under `fixtures/mcp-conformance` define deterministic catalog, model-text, structured

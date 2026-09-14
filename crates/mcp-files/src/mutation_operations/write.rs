@@ -27,9 +27,10 @@ impl FilesystemCore {
                 Err(error) if error.is_not_found() => None,
                 Err(error) => return Err(error),
             };
-        let old_content = snapshot
-            .as_ref()
-            .map_or("", |snapshot| snapshot.content.as_str());
+        let (existing, version) = snapshot
+            .map(|snapshot| (snapshot.content, snapshot.version))
+            .unzip();
+        let old_content = existing.as_deref().unwrap_or_default();
         enforce_preparation_peak(
             old_content
                 .len()
@@ -49,15 +50,12 @@ impl FilesystemCore {
             kind: FileWriteKind::Write,
             path: path_string(file_path),
             relative_path,
-            existed: snapshot.is_some(),
+            existed: existing.is_some(),
             applied: false,
             diff,
+            previous: existing.filter(|content| content.len() <= self.limits.max_previous_bytes),
         };
-        Ok((
-            input.content,
-            snapshot.map(|snapshot| snapshot.version),
-            output,
-        ))
+        Ok((input.content, version, output))
     }
 }
 

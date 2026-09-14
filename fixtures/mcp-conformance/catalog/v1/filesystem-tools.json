@@ -503,6 +503,12 @@
             },
             "diff": {
               "$ref": "#/definitions/FileDiff"
+            },
+            "previous": {
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           "required": [
