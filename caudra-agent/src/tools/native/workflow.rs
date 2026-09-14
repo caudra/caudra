@@ -3,10 +3,13 @@
 //! answers immediately and the run's progress is read back through `status`.
 
 use std::borrow::Cow;
+use std::fmt::Write;
+use std::time::Duration;
 
 use caudra_workflow::{
-    CatalogEntry, InvalidEntry, LaunchRequest, RunDetail, RunHistoryEntry, RunSnapshot,
-    WorkflowCatalog, WorkflowError, WorkflowRequest, WorkflowResponse,
+    AgentRosterEntry, CatalogEntry, InvalidEntry, LaunchRequest, RosterState, RunCall, RunCallBody,
+    RunDetail, RunHistoryEntry, RunSnapshot, WorkflowCatalog, WorkflowError, WorkflowRequest,
+    WorkflowResponse,
 };
 use serde_json::Value;
 
@@ -15,7 +18,7 @@ use crate::tools::registry::{
 };
 use crate::tools::schema::{ParamKind, ParamSchema, Property, to_json_schema, validate};
 use crate::tools::{DescriptionContext, ToolAudience, ToolContext};
-use crate::types::{ToolOutput, WorkflowRunCard};
+use crate::types::{ToolOutput, WorkflowRunCard, format_live_duration};
 use crate::workflow::WorkflowHandle;
 
 pub const DESCRIPTION: &str = "Run durable, multi-agent workflows: scripted plans that launch subagents in phases, keep a journal, and can be paused and resumed.
@@ -71,10 +74,28 @@ const PROJECT_DIR_LABEL: &str =
 const USER_DIR_LABEL: &str = "User scripts (trusted as written): ";
 const STATUS_HINT: &str = "The run continues in the background. Check on it with";
 const NO_HISTORY: &str = "No earlier sessions ran a workflow.";
-const HISTORY_SESSION_ID_FIELD: &str = "session_id";
-const HISTORY_SESSION_TITLE_FIELD: &str = "session_title";
+const NO_RUNS: &str = "No workflow runs in this session.";
+const PHASES_LABEL: &str = "phases: ";
+const AGENTS_LABEL: &str = "agents: ";
+const ROSTER_LABEL: &str = "roster: ";
+const RESULT_LABEL: &str = "result: ";
+const REQUEST_LABEL: &str = "request: ";
+const ERROR_LABEL: &str = "error: ";
+const PAUSED_LABEL: &str = "paused: ";
+const CALLS_LABEL: &str = "calls:";
+const TIMELINE_LABEL: &str = "timeline:";
+const JOURNAL_TRIMMED: &str = "journal trimmed: earlier calls are gone";
+const LOG_PREFIX: &str = "+ ";
+const RESULT_ARROW: &str = "\u{2192} ";
+const INDENT: &str = "  ";
+const FIELD_SEPARATOR: &str = " \u{b7} ";
+const PHASE_SEPARATOR: &str = " \u{203a} ";
+const LIST_SEPARATOR: &str = ", ";
+const BLOCK_SEPARATOR: &str = "\n\n";
 /// Log lines kept per run in a `status` answer.
 const MAX_STATUS_LOGS: usize = 20;
+/// Agents listed individually. The tally above them counts every one.
+const MAX_ROSTER_ROWS: usize = 10;
 /// Bytes of a run's `result` kept in a `status` answer.
 const MAX_STATUS_RESULT_BYTES: usize = 8 * 1024;
 const TRUNCATED_RESULT_SUFFIX: &str = "…[truncated]";
@@ -240,9 +261,7 @@ async fn render(handle: &WorkflowHandle, request: WorkflowRequest) -> ToolExecRe
         Ok(WorkflowResponse::Run(run)) => plain(render_runs(std::slice::from_ref(&run))),
         Ok(WorkflowResponse::Runs(runs)) => plain(render_runs(&runs)),
         Ok(WorkflowResponse::Detail(detail)) => plain(render_detail(&detail)),
-        Ok(WorkflowResponse::CallBodies(bodies)) => {
-            plain(serde_json::to_string_pretty(&bodies).unwrap_or_else(|error| error.to_string()))
-        }
+        Ok(WorkflowResponse::CallBodies(bodies)) => plain(render_call_bodies(&bodies)),
         Ok(WorkflowResponse::History(entries)) => plain(render_history(&entries)),
         Ok(WorkflowResponse::Trusted { name }) => plain(format!("{name} is now trusted.")),
         Ok(WorkflowResponse::Acked(_) | WorkflowResponse::Ack) => plain(String::new()),
@@ -291,67 +310,200 @@ fn invalid_line(entry: &InvalidEntry) -> String {
     format!("- {} [{}]: {}", entry.path, entry.source_kind, entry.error)
 }
 
-/// Snapshots as JSON, with the parts that grow without bound cut down: only
-/// the newest log lines, and a `result` capped in bytes.
+/// One block per run, because `status` is polled: a run serialized as its
+/// snapshot costs about 170 lines of braces and quoted key names every turn,
+/// and says no more than a dozen lines of it do.
 fn render_runs(runs: &[RunSnapshot]) -> String {
-    let bounded: Vec<Value> = runs.iter().map(bounded_snapshot).collect();
-    serde_json::to_string_pretty(&bounded).unwrap_or_else(|error| error.to_string())
-}
-
-fn bounded_snapshot(run: &RunSnapshot) -> Value {
-    serde_json::to_value(bounded_run(run)).unwrap_or(Value::Null)
-}
-
-fn bounded_run(run: &RunSnapshot) -> RunSnapshot {
-    let mut run = run.clone();
-    let excess = run.logs.len().saturating_sub(MAX_STATUS_LOGS);
-    run.logs.drain(..excess);
-    if let Some(result) = run.result.take() {
-        let text = result.to_string();
-        run.result = Some(if text.len() > MAX_STATUS_RESULT_BYTES {
-            let end = text.floor_char_boundary(MAX_STATUS_RESULT_BYTES);
-            Value::String(format!("{}{TRUNCATED_RESULT_SUFFIX}", &text[..end]))
-        } else {
-            result
-        });
+    if runs.is_empty() {
+        return NO_RUNS.to_owned();
     }
-    run
+    runs.iter()
+        .map(run_block)
+        .collect::<Vec<_>>()
+        .join(BLOCK_SEPARATOR)
 }
 
-/// The whole run as JSON. Calls and events are already bounded by the
-/// runtime; only the snapshot's own growing parts are cut.
+/// The run's identity, where it has got to, what it has spent, and whatever it
+/// has to report. `run_id` leads because every other action takes one.
+fn run_block(run: &RunSnapshot) -> String {
+    let card = WorkflowRunCard::from(run);
+    let mut lines = vec![format!(
+        "{} {} ({}) {}",
+        run.run_id,
+        run.display_name,
+        run.workflow_name,
+        card.headline()
+    )];
+    let strip: Vec<String> = card
+        .phase_strip()
+        .into_iter()
+        .map(|(title, mark)| format!("{title} {}", mark.glyph()))
+        .collect();
+    if !strip.is_empty() {
+        lines.push(format!("{PHASES_LABEL}{}", strip.join(PHASE_SEPARATOR)));
+    }
+    lines.push(format!(
+        "{AGENTS_LABEL}{}/{}{FIELD_SEPARATOR}{} tokens{FIELD_SEPARATOR}{}",
+        run.usage.agents_admitted,
+        run.agent_budget,
+        run.usage.tokens_used,
+        format_live_duration(Duration::from_secs(
+            run.updated_at.saturating_sub(run.created_at)
+        ))
+    ));
+    lines.extend(roster_lines(&run.roster));
+    lines.extend(
+        run.logs
+            .iter()
+            .rev()
+            .take(MAX_STATUS_LOGS)
+            .rev()
+            .map(|log| format!("{LOG_PREFIX}{}", log.message)),
+    );
+    if let Some(message) = &run.pause_message {
+        lines.push(format!("{PAUSED_LABEL}{message}"));
+    }
+    if let Some(result) = &run.result {
+        lines.push(format!("{RESULT_LABEL}{}", bounded_result(result)));
+    }
+    if let Some(error) = &run.error {
+        lines.push(format!("{ERROR_LABEL}{error}"));
+    }
+    lines.join("\n")
+}
+
+/// The tally, then only the agents a reader would act on. A completed agent is
+/// counted; a run at its budget would otherwise list a hundred of them.
+fn roster_lines(roster: &[AgentRosterEntry]) -> Vec<String> {
+    if roster.is_empty() {
+        return Vec::new();
+    }
+    let tally = [
+        RosterState::Running,
+        RosterState::Pending,
+        RosterState::Completed,
+        RosterState::Failed,
+        RosterState::Cancelled,
+    ]
+    .into_iter()
+    .filter_map(|state| {
+        let count = roster.iter().filter(|agent| agent.state == state).count();
+        (count > 0).then(|| format!("{count} {state}"))
+    })
+    .collect::<Vec<_>>()
+    .join(LIST_SEPARATOR);
+    let mut lines = vec![format!("{ROSTER_LABEL}{tally}")];
+    lines.extend(
+        roster
+            .iter()
+            .filter(|agent| matches!(agent.state, RosterState::Running | RosterState::Failed))
+            .take(MAX_ROSTER_ROWS)
+            .map(|agent| {
+                format!(
+                    "{INDENT}{} {} {} tokens {}",
+                    agent.label,
+                    agent.state,
+                    agent.tokens_used,
+                    format_live_duration(Duration::from_millis(agent.duration_ms))
+                )
+            }),
+    );
+    lines
+}
+
+fn bounded_result(result: &Value) -> String {
+    let text = result.to_string();
+    if text.len() <= MAX_STATUS_RESULT_BYTES {
+        return text;
+    }
+    let end = text.floor_char_boundary(MAX_STATUS_RESULT_BYTES);
+    format!("{}{TRUNCATED_RESULT_SUFFIX}", &text[..end])
+}
+
+/// The run, then its journal and timeline a row apiece. An inspection is asked
+/// for deliberately, so it keeps every call — as lines rather than as objects.
 fn render_detail(detail: &RunDetail) -> String {
-    let bounded = RunDetail {
-        run: bounded_run(&detail.run),
-        calls: detail.calls.clone(),
-        events: detail.events.clone(),
-        journal_trimmed: detail.journal_trimmed,
-    };
-    serde_json::to_string_pretty(&bounded).unwrap_or_else(|error| error.to_string())
+    let mut out = run_block(&detail.run);
+    if detail.journal_trimmed {
+        out.push('\n');
+        out.push_str(JOURNAL_TRIMMED);
+    }
+    if !detail.calls.is_empty() {
+        out.push('\n');
+        out.push_str(CALLS_LABEL);
+        for call in &detail.calls {
+            out.push('\n');
+            out.push_str(&call_line(call));
+        }
+    }
+    if !detail.events.is_empty() {
+        out.push('\n');
+        out.push_str(TIMELINE_LABEL);
+        for event in &detail.events {
+            out.push('\n');
+            let _ = write!(out, "{INDENT}{} {}", event.kind, event.text);
+        }
+    }
+    out
+}
+
+fn call_line(call: &RunCall) -> String {
+    let mut line = format!(
+        "{INDENT}#{} {} {}",
+        call.call_key,
+        call.kind.as_str(),
+        call.state
+    );
+    if let Some(label) = &call.label {
+        let _ = write!(line, " {label}");
+    }
+    let _ = write!(
+        line,
+        " {} tokens {}",
+        call.tokens_used,
+        format_live_duration(Duration::from_millis(call.duration_ms))
+    );
+    if let Some(error) = &call.error {
+        let _ = write!(line, " {ERROR_LABEL}{error}");
+    } else if let Some(preview) = &call.result_preview {
+        let _ = write!(line, " {RESULT_ARROW}{preview}");
+    }
+    line
+}
+
+fn render_call_bodies(bodies: &[RunCallBody]) -> String {
+    bodies
+        .iter()
+        .map(|body| {
+            let mut out = format!("#{} {REQUEST_LABEL}{}", body.call_key, body.request);
+            if let Some(result) = &body.result {
+                let _ = write!(out, "\n{RESULT_LABEL}{result}");
+            }
+            if let Some(error) = &body.error {
+                let _ = write!(out, "\n{ERROR_LABEL}{error}");
+            }
+            out
+        })
+        .collect::<Vec<_>>()
+        .join(BLOCK_SEPARATOR)
 }
 
 fn render_history(entries: &[RunHistoryEntry]) -> String {
     if entries.is_empty() {
         return NO_HISTORY.to_owned();
     }
-    let bounded: Vec<Value> = entries
+    entries
         .iter()
         .map(|entry| {
-            let mut value = bounded_snapshot(&entry.run);
-            if let Value::Object(map) = &mut value {
-                map.insert(
-                    HISTORY_SESSION_ID_FIELD.to_owned(),
-                    Value::String(entry.session_id.clone()),
-                );
-                map.insert(
-                    HISTORY_SESSION_TITLE_FIELD.to_owned(),
-                    Value::String(entry.session_title.clone()),
-                );
-            }
-            value
+            format!(
+                "{} ({}){FIELD_SEPARATOR}{}",
+                entry.session_title,
+                entry.session_id,
+                run_block(&entry.run)
+            )
         })
-        .collect();
-    serde_json::to_string_pretty(&bounded).unwrap_or_else(|error| error.to_string())
+        .collect::<Vec<_>>()
+        .join(BLOCK_SEPARATOR)
 }
 
 fn plain(text: String) -> ToolExecResult {
@@ -388,6 +540,7 @@ mod tests {
     const LOGS_ARE_BOUNDED: &str = "status must keep only the newest log lines";
     const RESULT_IS_BOUNDED: &str = "status must cap a run's result";
     const CARD_IS_DRAWN: &str = "a start must answer with a run card for the transcript";
+    const NO_JSON_FOR_THE_MODEL: &str = "a run must reach the model as lines, not as a record";
     const SESSION_ID: &str = "session-1";
     const SESSION_TITLE: &str = "Earlier work";
 
@@ -608,7 +761,7 @@ mod tests {
     }
 
     #[test]
-    fn inspect_and_history_relay_the_runtime_as_json() {
+    fn inspect_and_history_read_as_lines_rather_than_as_records() {
         let ctx = with_runtime(|request| match request {
             WorkflowRequest::Inspect { .. } => Ok(WorkflowResponse::Detail(Box::new(RunDetail {
                 run: snapshot(),
@@ -629,15 +782,22 @@ mod tests {
         let (_, detail) = execute(json!({"action": "inspect", "run_id": RUN_ID}), &ctx);
         let (_, history) = execute(json!({"action": "history"}), &ctx);
 
-        let detail: Value = serde_json::from_str(&detail).unwrap();
-        assert_eq!(detail["journal_trimmed"], json!(true), "{RUNTIME_ANSWERS}");
-        assert_eq!(detail["run"]["run_id"], json!(RUN_ID), "{RUNTIME_ANSWERS}");
-        let history: Vec<Value> = serde_json::from_str(&history).unwrap();
-        assert_eq!(
-            history[0][HISTORY_SESSION_TITLE_FIELD],
-            json!(SESSION_TITLE)
+        for text in [&detail, &history] {
+            assert!(text.contains(RUN_ID), "{RUNTIME_ANSWERS}: {text}");
+            assert!(
+                serde_json::from_str::<Value>(text).is_err(),
+                "{NO_JSON_FOR_THE_MODEL}: {text}"
+            );
+        }
+        assert!(
+            detail.contains(JOURNAL_TRIMMED),
+            "{RUNTIME_ANSWERS}: {detail}"
         );
-        assert_eq!(history[0][HISTORY_SESSION_ID_FIELD], json!(SESSION_ID));
+        assert!(
+            history.contains(SESSION_TITLE),
+            "{RUNTIME_ANSWERS}: {history}"
+        );
+        assert!(history.contains(SESSION_ID), "{RUNTIME_ANSWERS}: {history}");
     }
 
     #[test]
@@ -684,12 +844,16 @@ mod tests {
         let (is_error, text) = execute(json!({"action": "status", "run_id": RUN_ID}), &ctx);
 
         assert!(!is_error);
-        let runs: Vec<Value> = serde_json::from_str(&text).unwrap();
-        assert_eq!(runs.len(), 1);
-        let logs = runs[0]["logs"].as_array().unwrap();
+        let logs: Vec<&str> = text
+            .lines()
+            .filter_map(|line| line.strip_prefix(LOG_PREFIX))
+            .collect();
         assert_eq!(logs.len(), MAX_STATUS_LOGS, "{LOGS_ARE_BOUNDED}");
-        assert_eq!(logs[0]["message"], json!("line 5"), "{LOGS_ARE_BOUNDED}");
-        let result = runs[0]["result"].as_str().unwrap();
+        assert_eq!(logs[0], "line 5", "{LOGS_ARE_BOUNDED}");
+        let result = text
+            .lines()
+            .find_map(|line| line.strip_prefix(RESULT_LABEL))
+            .expect(RESULT_IS_BOUNDED);
         assert!(
             result.ends_with(TRUNCATED_RESULT_SUFFIX),
             "{RESULT_IS_BOUNDED}"

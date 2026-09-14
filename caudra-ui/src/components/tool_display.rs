@@ -731,6 +731,7 @@ impl HighlightRequest {
             | ToolOutput::TodoList(_)
             | ToolOutput::Answers(_)
             | ToolOutput::Shell(_)
+            | ToolOutput::Environment { .. }
             | ToolOutput::WorkflowRun(_)
             | ToolOutput::Image { .. } => None,
             // Children carry their own code and diffs, so a batch reaches the

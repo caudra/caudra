@@ -11,7 +11,7 @@ use super::tool_display::{
     ScrollTail, activity_detail, activity_label, batch_sigil_style, compact_args_for,
     compact_sigil_label, header_spans, names_tool, scroll_footer_text,
 };
-use super::{ToolProgress, is_collapsible, workflow_card};
+use super::{ToolProgress, environment_card, is_collapsible, workflow_card};
 use caudra_agent::tools::{PYTHON_EXECUTION_TOOL_NAME, SHELL_TOOL_NAME, TASK_TOOL_NAME};
 use caudra_agent::types::Answer;
 use caudra_agent::types::{TodoItem, TodoStatus};
@@ -89,7 +89,7 @@ fn gap_ellipsis() -> Line<'static> {
     ])
 }
 
-fn truncation_line(truncated: usize) -> Line<'static> {
+pub(super) fn truncation_line(truncated: usize) -> Line<'static> {
     Line::from(Span::styled(
         truncation_notice(truncated),
         theme::current().tool_dim,
@@ -1250,7 +1250,7 @@ fn grep_height(entries: &[GrepFileEntry]) -> usize {
 
 /// A notice costs the row it saves, so hiding exactly one of anything is
 /// never worth it. Answers with how many to show and how many that hides.
-fn within(total: usize, room: usize) -> (usize, usize) {
+pub(super) fn within(total: usize, room: usize) -> (usize, usize) {
     let shown = total.min(room);
     if total - shown == 1 {
         (total, 0)
@@ -1791,6 +1791,9 @@ pub struct CardPolicy {
     /// Whether the reader asked for one row per call. Held here so a child
     /// folds by the same answer its own card would give.
     pub compact: bool,
+    /// Whether the reader asked for the whole transcript open. A card small
+    /// enough to draw entire answers to it the way it answers a click.
+    pub expanded: bool,
 }
 
 impl CardPolicy {
@@ -1902,6 +1905,17 @@ impl RenderLimits {
 
     pub fn is_expanded(&self) -> bool {
         self.budget == usize::MAX
+    }
+
+    /// What a card whose body is bounded by its own shape is drawn within. A
+    /// reader who opened the whole transcript asked for this card too, and
+    /// such a card has no unbounded body to protect them from.
+    pub fn bounded_budget(&self) -> usize {
+        if self.policy.expanded {
+            usize::MAX
+        } else {
+            self.budget
+        }
     }
 
     /// How much of one child to draw, or `None` to fold it to its summary row.
@@ -2150,6 +2164,19 @@ pub fn render_tool_content(
                 render_instructions(blocks, &mut instruction_lines, limits.budget, highlight);
             (instruction_lines, trunc)
         }
+        Some(ToolOutput::Environment {
+            headline,
+            summary,
+            facts,
+            commands,
+        }) => environment_card::render(
+            headline,
+            summary,
+            facts,
+            commands,
+            limits.bounded_budget(),
+            limits.width,
+        ),
         Some(ToolOutput::TodoList(items)) => (render_todos(items), false),
         Some(ToolOutput::Answers(answers)) => (render_answers(answers), false),
         Some(ToolOutput::WorkflowRun(card)) => {

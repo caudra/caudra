@@ -11,6 +11,7 @@ pub use workcell::host_contract;
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt::Write;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -29,8 +30,8 @@ use caudra_agent::tools::{
     expand_tilde,
 };
 use caudra_agent::{
-    AgentEvent, CodeGraphRow, CodeGraphSource, GrepFileEntry, GrepMatchGroup, INDEX_TRUNCATED,
-    IndexDirectoryEntry as AgentIndexDirectoryEntry,
+    AgentEvent, CodeGraphRow, CodeGraphSource, EnvironmentCommand, EnvironmentFact, GrepFileEntry,
+    GrepMatchGroup, INDEX_TRUNCATED, IndexDirectoryEntry as AgentIndexDirectoryEntry,
     IndexDirectoryEntryKind as AgentIndexDirectoryEntryKind, IndexLine as AgentIndexLine,
     IndexLineSemantic as AgentIndexLineSemantic, IndexOutput as AgentIndexOutput,
     IndexSourceRange as AgentIndexSourceRange, PatchedFile, SearchCap, SharedBuf,
@@ -54,7 +55,9 @@ use workcell::code_graph::{
     RankedSymbol, ReachedSymbol, SelectorRefusal, SymbolRef, crawl_filesystem_limits, fit,
 };
 use workcell::environment::{
-    ExecutionEnvironmentError, ExecutionEnvironmentResult, ToolGroupDisclosure,
+    ExecutionEnvironmentError, ExecutionEnvironmentExecution, ExecutionEnvironmentOutput,
+    ExecutionEnvironmentResult, OsDescriptor, SystemPackageManagerDescriptor, ToolGroupDisclosure,
+    WorkspaceDescriptor,
 };
 use workcell::files::{
     FileApplyPatchInput, FileApplyPatchOutput, FileDiff, FileEditInput, FileEditOutput,
@@ -132,6 +135,26 @@ const PROXY_ALL_VARS: &[&str] = &["ALL_PROXY", "all_proxy"];
 const PROXY_HTTP_VARS: &[&str] = &["HTTP_PROXY", "http_proxy"];
 const PROXY_HTTPS_VARS: &[&str] = &["HTTPS_PROXY", "https_proxy"];
 const PROXY_BYPASS_VARS: &[&str] = &["NO_PROXY", "no_proxy"];
+
+/// The labels an environment result is read by, and the few host answers the
+/// rendering has to recognise rather than repeat.
+const ENVIRONMENT_SEPARATOR: &str = " \u{b7} ";
+const ENVIRONMENT_RUNTIME_LABEL: &str = "runtime";
+const ENVIRONMENT_CONTAINER_LABEL: &str = "container";
+const ENVIRONMENT_PACKAGES_LABEL: &str = "packages";
+const ENVIRONMENT_WORKSPACE_LABEL: &str = "workspace";
+const ENVIRONMENT_GROUPS_LABEL: &str = "groups";
+const ENVIRONMENT_INHERITANCE_LABEL: &str = "env";
+const ENVIRONMENT_LIST_SEPARATOR: &str = ", ";
+const ENVIRONMENT_NONE: &str = "none";
+/// A platform with no sudo to test says so; saying it on every Windows result
+/// would spend a column on a question that cannot be asked there.
+const SUDO_NOT_APPLICABLE: &str = "not-applicable";
+const GIT_REPOSITORY_YES: &str = "yes";
+const GIT_REPOSITORY_NO: &str = "no";
+/// A diff on its own reads as a change that landed, so a result that changed
+/// nothing says so where the model cannot miss it.
+const NOT_APPLIED: &str = "[not applied: nothing was written]";
 
 #[derive(Debug, thiserror::Error)]
 pub enum HostError {
@@ -3203,10 +3226,6 @@ fn exact_custom_prepared(
     }
 }
 
-fn model_text(output: &impl Serialize) -> String {
-    serde_json::to_string_pretty(output).expect("Workcell structured output serializes")
-}
-
 fn text_output(text: String, state: Value) -> TextOutput {
     TextOutput {
         text,
@@ -3235,12 +3254,25 @@ fn markdown_code(language: &str, text: &str) -> String {
     format!("```{language}\n{}\n```", text.trim_end())
 }
 
+/// The record is what the card draws from; the model reads the rendering.
+/// `ReadCode` numbers its lines and names the offset that continues the file,
+/// which is the form the tool documents and the form a batched read has always
+/// returned. Serializing the record instead sent the text twice, once escaped
+/// into a JSON string, and dropped the line numbers on the way.
 fn file_read_result(output: FileReadOutput) -> ToolExecResult {
-    let exact = model_text(&output);
     let state = serde_json::to_value(&output).expect("file read output serializes");
     let tool_output = match output {
-        FileReadOutput::Directory { entries, .. } => {
-            ToolOutput::ReadDir(text_output(entries.join("\n"), state))
+        FileReadOutput::Directory {
+            entries, truncated, ..
+        } => {
+            let mut listing = entries.join("\n");
+            // The record carried a flag. A listing has to say it in words, or a
+            // capped directory reads as a complete one.
+            if truncated {
+                listing.push('\n');
+                listing.push_str(INDEX_TRUNCATED);
+            }
+            ToolOutput::ReadDir(text_output(listing, state))
         }
         FileReadOutput::File {
             path,
@@ -3256,7 +3288,7 @@ fn file_read_result(output: FileReadOutput) -> ToolExecResult {
             instructions: None,
         },
     };
-    ToolExecResult::from(Ok::<_, String>(tool_output)).with_model_output(Some(exact))
+    ToolExecResult::from(Ok::<_, String>(tool_output))
 }
 
 /// A search reports its own truncation notice, so the rendering Workcell writes
@@ -3431,8 +3463,10 @@ fn directory_listing_with_truncation(listing: &str, truncated: bool, max_bytes: 
     }
 }
 
+/// A write reports what it did, not what it wrote: the content is the model's
+/// own, and echoing it back as an escaped patch inside a JSON wrapper charged
+/// for it twice.
 fn file_write_result(output: FileWriteOutput, content: String) -> ToolExecResult {
-    let exact = model_text(&output);
     let written = output.applied.then(|| output.path.clone());
     let result = if output.applied {
         ToolExecResult::from(Ok::<_, String>(ToolOutput::WriteCode {
@@ -3440,14 +3474,14 @@ fn file_write_result(output: FileWriteOutput, content: String) -> ToolExecResult
             byte_count: content.len(),
             lines: content.lines().map(str::to_owned).collect(),
         }))
-        .with_model_output(Some(exact))
     } else {
         // Nothing was written, so there is no content to show. The diff is
-        // the whole report, and it reads as one.
+        // the whole report, and it reads as one — but a diff alone reads as a
+        // write that landed, so the result says which this was.
         ToolExecResult::from(Ok::<_, String>(ToolOutput::Patch {
             files: vec![patched_file(&output.diff)],
         }))
-        .with_model_output(Some(exact))
+        .with_model_suffix(Some(NOT_APPLIED.to_owned()))
     };
     result.with_written_paths(written.into_iter().collect())
 }
@@ -3458,7 +3492,6 @@ fn file_edit_result(
     new_string: String,
     replace_all: bool,
 ) -> ToolExecResult {
-    let exact = model_text(&output);
     let written = output.applied.then(|| output.path.clone());
     let result = if replace_all {
         // Every match moved at once, so there is no single before/after pair
@@ -3466,7 +3499,6 @@ fn file_edit_result(
         ToolExecResult::from(Ok::<_, String>(ToolOutput::Patch {
             files: vec![patched_file(&output.diff)],
         }))
-        .with_model_output(Some(exact))
     } else {
         ToolExecResult::from(Ok::<_, String>(ToolOutput::Diff {
             path: output.path.clone(),
@@ -3474,7 +3506,11 @@ fn file_edit_result(
             after: new_string,
             summary: output.diff.patch.clone(),
         }))
-        .with_model_output(Some(exact))
+    };
+    let result = if output.applied {
+        result
+    } else {
+        result.with_model_suffix(Some(NOT_APPLIED.to_owned()))
     };
     result.with_written_paths(written.into_iter().collect())
 }
@@ -3505,7 +3541,6 @@ fn applied_patch_paths(output: &FileApplyPatchOutput) -> Vec<String> {
 }
 
 fn file_patch_result(output: FileApplyPatchOutput) -> ToolExecResult {
-    let exact = model_text(&output);
     let written = applied_patch_paths(&output);
     let files = output
         .files
@@ -3517,9 +3552,13 @@ fn file_patch_result(output: FileApplyPatchOutput) -> ToolExecResult {
             deletions: file.deletions,
         })
         .collect();
-    ToolExecResult::from(Ok::<_, String>(ToolOutput::Patch { files }))
-        .with_model_output(Some(exact))
-        .with_written_paths(written)
+    let result = ToolExecResult::from(Ok::<_, String>(ToolOutput::Patch { files }));
+    let result = if output.applied {
+        result
+    } else {
+        result.with_model_suffix(Some(NOT_APPLIED.to_owned()))
+    };
+    result.with_written_paths(written)
 }
 
 fn websearch_result(execution: WebExecution<WebsearchOutput>) -> ToolExecResult {
@@ -3732,9 +3771,168 @@ fn code_result(execution: CodeExecution) -> ToolExecResult {
     .with_error(is_error)
 }
 
+/// The host as a card rather than as its record. Workcell's `model_text` is the
+/// same descriptor pretty-printed, which costs the model 168 lines to say what
+/// fourteen say, so the mapping renders the descriptor once and both the card
+/// and the model read that.
 fn environment_result(result: ExecutionEnvironmentResult) -> ToolExecResult {
-    let display = markdown_code("json", &result.model_text);
-    text_result(&result.output, display, true, result.model_text)
+    let output = result.output;
+    let headline = environment_headline(&output.os);
+    let summary = environment_summary(&output.execution);
+    let facts = environment_facts(&output);
+    let commands = output
+        .commands
+        .into_iter()
+        .map(|command| EnvironmentCommand {
+            id: command.id.to_owned(),
+            available: command.available,
+            version: command.version,
+        })
+        .collect();
+    ToolExecResult::from(Ok::<_, String>(ToolOutput::Environment {
+        headline,
+        summary,
+        facts,
+        commands,
+    }))
+}
+
+/// `ubuntu 24.04 · linux/x86_64 · kernel 6.18.5`. The distribution leads when
+/// there is one, because it is the name a reader recognises the host by.
+fn environment_headline(os: &OsDescriptor) -> String {
+    let mut parts = Vec::new();
+    if let Some(distribution) = &os.distribution {
+        parts.push(distribution.clone());
+    }
+    parts.push(format!("{}/{}", os.family, os.architecture));
+    if let Some(kernel) = &os.kernel_release {
+        parts.push(format!("kernel {kernel}"));
+    }
+    if os.wsl {
+        parts.push("wsl".to_owned());
+    }
+    parts.join(ENVIRONMENT_SEPARATOR)
+}
+
+/// What a command runs in, what it can reach, and what it may do. The second
+/// line of the card, and the last one a collapsed card still shows.
+fn environment_summary(execution: &ExecutionEnvironmentExecution) -> String {
+    let mut parts = vec![
+        execution.shell.to_owned(),
+        format!("{} sandbox", execution.sandbox),
+        format!("network {}", execution.network_access),
+    ];
+    if let Some(root) = execution.privilege.effective_root {
+        parts.push(if root { "root" } else { "not root" }.to_owned());
+    }
+    if execution.privilege.non_interactive_sudo != SUDO_NOT_APPLICABLE {
+        parts.push(format!("sudo {}", execution.privilege.non_interactive_sudo));
+    }
+    parts.join(ENVIRONMENT_SEPARATOR)
+}
+
+fn environment_facts(output: &ExecutionEnvironmentOutput) -> Vec<EnvironmentFact> {
+    let runtime = format!(
+        "{} {}{ENVIRONMENT_SEPARATOR}{}",
+        output.runtime.name, output.runtime.version, output.scope
+    );
+    let container = if output.container.evidence.is_empty() {
+        output.container.kind.to_owned()
+    } else {
+        format!(
+            "{} ({})",
+            output.container.kind,
+            output.container.evidence.join(ENVIRONMENT_LIST_SEPARATOR)
+        )
+    };
+    let mut facts = vec![
+        fact(ENVIRONMENT_RUNTIME_LABEL, runtime),
+        fact(ENVIRONMENT_CONTAINER_LABEL, container),
+        fact(
+            ENVIRONMENT_PACKAGES_LABEL,
+            system_package_manager_fact(&output.os.system_package_manager),
+        ),
+        fact(
+            ENVIRONMENT_WORKSPACE_LABEL,
+            workspace_fact(&output.workspace),
+        ),
+    ];
+    let groups = enabled_tool_groups(output.tool_groups);
+    if !groups.is_empty() {
+        facts.push(fact(ENVIRONMENT_GROUPS_LABEL, groups.join(" ")));
+    }
+    facts.push(fact(
+        ENVIRONMENT_INHERITANCE_LABEL,
+        output.execution.environment_inheritance.to_owned(),
+    ));
+    facts
+}
+
+fn fact(label: &str, value: String) -> EnvironmentFact {
+    EnvironmentFact {
+        label: label.to_owned(),
+        value,
+    }
+}
+
+/// `apt 2.8.3 (apt-get)`. The executable is named only when it differs from the
+/// manager, which is the case a caller would otherwise get wrong.
+fn system_package_manager_fact(manager: &SystemPackageManagerDescriptor) -> String {
+    if !manager.available {
+        return ENVIRONMENT_NONE.to_owned();
+    }
+    let mut value = manager.name.to_owned();
+    if let Some(version) = &manager.version {
+        let _ = write!(value, " {version}");
+    }
+    if let Some(executable) = manager.executable
+        && executable != manager.name
+    {
+        let _ = write!(value, " ({executable})");
+    }
+    value
+}
+
+fn workspace_fact(workspace: &WorkspaceDescriptor) -> String {
+    let mut parts = vec![match workspace.git.repository {
+        GIT_REPOSITORY_YES => "git repository".to_owned(),
+        GIT_REPOSITORY_NO => "no git repository".to_owned(),
+        other => format!("git {other}"),
+    }];
+    match (
+        &workspace.package_manager.declared,
+        &workspace.package_manager.inferred,
+    ) {
+        (Some(declared), _) => parts.push(match &declared.version {
+            Some(version) => format!("{} {version} declared", declared.name),
+            None => format!("{} declared", declared.name),
+        }),
+        (None, Some(inferred)) => parts.push(format!("{inferred} inferred")),
+        (None, None) => {}
+    }
+    parts.push(if workspace.package_manager.lockfiles.is_empty() {
+        "no lockfiles".to_owned()
+    } else {
+        workspace
+            .package_manager
+            .lockfiles
+            .join(ENVIRONMENT_LIST_SEPARATOR)
+    });
+    parts.join(ENVIRONMENT_SEPARATOR)
+}
+
+/// Only the groups that loaded. A disabled group is not a fact about the host.
+fn enabled_tool_groups(groups: ToolGroupDisclosure) -> Vec<&'static str> {
+    [
+        (groups.files, "files"),
+        (groups.web, "web"),
+        (groups.shell, "shell"),
+        (groups.code, "code"),
+        (groups.code_graph, "code-graph"),
+    ]
+    .into_iter()
+    .filter_map(|(enabled, name)| enabled.then_some(name))
+    .collect()
 }
 
 fn environment_error(error: ExecutionEnvironmentError) -> String {
@@ -3888,8 +4086,17 @@ mod tests {
     const EXPECT_MENTION_NOTE: &str = "a mention that read nothing still tells the model why";
     const EXPECT_MENTION_HIDDEN: &str = "mention context never shows up in the transcript";
     const PATCH_STRUCTURED_MSG: &str = "a patch reports the files it changed, not a diff blob";
+    const EXPECT_APPLIED_UNMARKED: &str = "a change that landed is reported by its diff alone";
+    const EXPECT_NO_JSON_FOR_THE_MODEL: &str =
+        "the model reads a rendering; serializing the record spends the payload twice";
+    const EXPECT_SAME_AS_BATCHED: &str =
+        "a call reads the same whether it was made directly or inside a batch";
     const FILTERABLE_MAKEFILE: &str = "all:\n\t@echo \"make[1]: Entering directory '/x'\"\n\t@echo \"real build line\"\n\t@echo \"make[1]: Leaving directory '/x'\"\n";
     const SHELL_CANCELLED: &str = "Shell execution cancelled";
+    const LOCKFILE: &str = "package-lock.json";
+    /// The descriptor pretty-prints to about 170 lines on a populated host; a
+    /// rendering that ever approached that would have stopped being one.
+    const ENVIRONMENT_MAX_MODEL_LINES: usize = 40;
 
     #[test]
     fn selected_remote_endpoint_cannot_also_be_generic_mcp() {
@@ -3964,7 +4171,7 @@ mod tests {
             total_lines: 1,
             truncated: false,
         };
-        let model_output = model_text(&output);
+        let model_output = output.model_text().into_owned();
         let embedded = file_read_result(output.clone());
         let remote = remote_result(
             ToolKind::FileRead,
@@ -6265,7 +6472,7 @@ mod tests {
     fn execution_environment_uses_the_active_session_working_directory() {
         let startup_root = TempDir::new().expect("startup tempdir");
         let session_root = TempDir::new().expect("session tempdir");
-        std::fs::write(session_root.path().join("package-lock.json"), "{}").unwrap();
+        std::fs::write(session_root.path().join(LOCKFILE), "{}").unwrap();
         let (_host, registry) = host_and_registry(startup_root.path());
         let ctx = context(
             session_root.path(),
@@ -6282,17 +6489,50 @@ mod tests {
         smol::block_on(invocation.preflight(&ctx)).expect("environment preflight");
         let result = smol::block_on(invocation.execute(&ctx));
         let output = result.output.expect("successful environment inspection");
-        let ToolOutput::Markdown(text) = &output else {
-            panic!("expected highlighted JSON environment output");
+        let ToolOutput::Environment {
+            headline, facts, ..
+        } = &output
+        else {
+            panic!("expected a structured environment result");
         };
-        assert!(text.text.starts_with("```json\n{"));
-        assert!(text.text.ends_with("\n```"));
-        let lockfiles = output.state().expect("structured environment")["workspace"]
-            ["packageManager"]["lockfiles"]
-            .as_array()
-            .expect("lockfiles");
 
-        assert!(lockfiles.iter().any(|name| name == "package-lock.json"));
+        assert!(!headline.is_empty());
+        let workspace = facts
+            .iter()
+            .find(|fact| fact.label == ENVIRONMENT_WORKSPACE_LABEL)
+            .expect("a workspace fact");
+        assert!(workspace.value.contains(LOCKFILE));
+    }
+
+    /// The reading copy is the card's own rendering, so a session that lists
+    /// twenty commands costs the model lines rather than the descriptor's
+    /// braces, quoted keys and indentation.
+    #[test]
+    fn an_environment_result_reads_as_lines_rather_than_as_its_descriptor() {
+        let root = TempDir::new().expect("tempdir");
+        let (_host, registry) = host_and_registry(root.path());
+        let ctx = context(root.path(), Arc::clone(&registry), CancelToken::none());
+        let invocation = registry
+            .get("execution_environment")
+            .expect("registered environment")
+            .tool
+            .parse(&json!({}))
+            .expect("valid environment input");
+
+        smol::block_on(invocation.preflight(&ctx)).expect("environment preflight");
+        let result = smol::block_on(invocation.execute(&ctx));
+        assert!(result.model_output.is_none(), "the rendering is the text");
+        let text = result
+            .output
+            .expect("successful environment inspection")
+            .as_text();
+
+        assert!(serde_json::from_str::<Value>(&text).is_err());
+        assert!(text.lines().count() < ENVIRONMENT_MAX_MODEL_LINES);
+        assert!(
+            text.contains(caudra_agent::ENVIRONMENT_COMMANDS_LABEL),
+            "{text}"
+        );
     }
 
     #[test]
@@ -6330,14 +6570,7 @@ mod tests {
             result.written_paths,
             [root.path().join("created.txt").display().to_string()]
         );
-        let model_output: Value = serde_json::from_str(
-            result
-                .model_output
-                .as_deref()
-                .expect("exact Workcell model output"),
-        )
-        .expect("structured model output");
-        assert_eq!(model_output["applied"], true);
+        assert!(result.model_suffix.is_none(), "{EXPECT_APPLIED_UNMARKED}");
 
         let ToolOutput::Patch { files } = result.output.expect("patch output") else {
             panic!("{PATCH_STRUCTURED_MSG}");
@@ -6385,6 +6618,54 @@ mod tests {
             .tool
             .parse(&json!({ "patchText": patch_text }))
             .expect("valid patch input")
+    }
+
+    fn rendering_invocation(
+        registry: &ToolRegistry,
+        tool: &str,
+        path: &Path,
+    ) -> Box<dyn ToolInvocation> {
+        let input = match tool {
+            "file_write" => json!({ "filePath": path, "content": EDIT_APPLIED }),
+            "file_edit" => json!({ "filePath": path, "oldString": "beta", "newString": "gamma" }),
+            "file_apply_patch" => json!({ "patchText": update_patch("beta") }),
+            _ => json!({ "filePath": path }),
+        };
+        registry
+            .get(tool)
+            .unwrap_or_else(|| panic!("registered {tool}"))
+            .tool
+            .parse(&input)
+            .expect("valid input")
+    }
+
+    /// Every first-party file tool hands the model a rendering, never the
+    /// record its card is drawn from. Serializing the record sent the payload
+    /// twice, once escaped inside a JSON string, and made a direct call read
+    /// differently from the same call inside a batch, which renders its
+    /// children through `as_text`.
+    #[test_case("file_read" ; "read")]
+    #[test_case("file_write" ; "write")]
+    #[test_case("file_edit" ; "edit")]
+    #[test_case("file_apply_patch" ; "patch")]
+    fn a_file_result_reads_as_its_rendering_rather_than_as_its_record(tool: &str) {
+        let root = TempDir::new().expect("tempdir");
+        let path = seeded(root.path());
+        let (_host, registry) = host_and_registry(root.path());
+        let ctx = context(root.path(), Arc::clone(&registry), CancelToken::none());
+        let invocation = rendering_invocation(&registry, tool, &path);
+
+        smol::block_on(invocation.preflight(&ctx)).expect("preflight");
+        let result = smol::block_on(invocation.execute(&ctx));
+        let output = result.output.expect("a successful call");
+        let batched = output.as_text();
+        let direct = result.model_output.unwrap_or_else(|| batched.clone());
+
+        assert_eq!(direct, batched, "{EXPECT_SAME_AS_BATCHED}");
+        assert!(
+            serde_json::from_str::<Value>(&direct).is_err(),
+            "{EXPECT_NO_JSON_FOR_THE_MODEL}: {direct}"
+        );
     }
 
     fn seeded(root: &Path) -> PathBuf {

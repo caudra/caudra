@@ -3,6 +3,7 @@ pub(crate) mod code_view;
 pub mod command;
 pub(crate) mod command_modal;
 pub(crate) mod context_modal;
+pub(crate) mod environment_card;
 pub(crate) mod file_picker;
 pub(crate) mod file_walk;
 pub(crate) mod form;

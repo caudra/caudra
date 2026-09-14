@@ -35,6 +35,16 @@ const CARD_PREVIEW_MARKER: &str = "…";
 const CARD_PHASE_SEPARATOR: &str = " › ";
 const CARD_ANNOTATION_SEPARATOR: &str = " · ";
 
+/// Labels for the two command rows an environment result ends with. The card
+/// and the model text use the same words, so a reader and the model are looking
+/// at the same thing.
+pub const ENVIRONMENT_COMMANDS_LABEL: &str = "commands";
+pub const ENVIRONMENT_MISSING_LABEL: &str = "missing";
+/// What an installed command with no parseable version reads as. A version
+/// parser declining the output says nothing about the command being there.
+pub const ENVIRONMENT_NO_VERSION: &str = "(no version)";
+const ENVIRONMENT_LIST_SEPARATOR: &str = ", ";
+
 const SECONDS_PER_MINUTE: u64 = 60;
 const TALLY_SEPARATOR: &str = " · ";
 const THOUGHT_TITLE_FENCE: &str = "**";
@@ -410,6 +420,27 @@ impl CodeGraphRow {
     }
 }
 
+/// One labelled line of an environment card, e.g. `packages` / `apt 2.8.3`.
+/// The adapter decides what a fact is called and how its value reads, so the
+/// card and the model text share one vocabulary and neither restates the
+/// host's JSON key names.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvironmentFact {
+    pub label: String,
+    pub value: String,
+}
+
+/// One probed command. `available` and `version` answer different questions: a
+/// command can resolve and start yet print nothing a version parser accepts, so
+/// a missing version is never evidence of a missing command.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvironmentCommand {
+    pub id: String,
+    pub available: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+}
+
 /// The body `code_expand` returns alongside its neighbours.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CodeGraphSource {
@@ -705,6 +736,15 @@ pub enum ToolOutput {
         state: Option<serde_json::Value>,
     },
     Shell(ShellOutput),
+    /// What the host looks like right now. `headline` and `summary` are the two
+    /// lines that make the rest interpretable, so a collapsed card shows them
+    /// and nothing else; `facts` are the labelled rows under them.
+    Environment {
+        headline: String,
+        summary: String,
+        facts: Vec<EnvironmentFact>,
+        commands: Vec<EnvironmentCommand>,
+    },
     /// `text` is what the model was told; `entries` is the same run written
     /// for a reader. Sessions written while batch was a Lua plugin carry only
     /// `text`, so `entries` defaults to empty and the body falls back to it.
@@ -843,6 +883,7 @@ impl ToolOutput {
                     .to_string(),
             ),
             Self::WorkflowRun(card) => Some(card.headline()),
+            Self::Environment { headline, .. } => Some(headline.clone()),
             _ => None,
         }
     }
@@ -911,6 +952,7 @@ impl ToolOutput {
             | Self::Shell(_)
             | Self::TodoList(_)
             | Self::Answers(_)
+            | Self::Environment { .. }
             | Self::WorkflowRun(_) => Some(self.as_display_text()),
             _ => None,
         }
@@ -975,6 +1017,45 @@ impl ToolOutput {
                     out.extend(source.lines.iter().cloned());
                 }
                 out.push(footer.clone());
+                out.join("\n")
+            }
+            Self::Environment {
+                headline,
+                summary,
+                facts,
+                commands,
+            } => {
+                let mut out = vec![headline.clone(), summary.clone()];
+                out.extend(
+                    facts
+                        .iter()
+                        .map(|fact| format!("{}: {}", fact.label, fact.value)),
+                );
+                let present: Vec<String> = commands
+                    .iter()
+                    .filter(|command| command.available)
+                    .map(|command| match &command.version {
+                        Some(version) => format!("{} {version}", command.id),
+                        None => format!("{} {ENVIRONMENT_NO_VERSION}", command.id),
+                    })
+                    .collect();
+                if !present.is_empty() {
+                    out.push(format!(
+                        "{ENVIRONMENT_COMMANDS_LABEL}: {}",
+                        present.join(ENVIRONMENT_LIST_SEPARATOR)
+                    ));
+                }
+                let missing: Vec<&str> = commands
+                    .iter()
+                    .filter(|command| !command.available)
+                    .map(|command| command.id.as_str())
+                    .collect();
+                if !missing.is_empty() {
+                    out.push(format!(
+                        "{ENVIRONMENT_MISSING_LABEL}: {}",
+                        missing.join(ENVIRONMENT_LIST_SEPARATOR)
+                    ));
+                }
                 out.join("\n")
             }
             Self::Index(IndexOutput::File { skeleton, .. }) => skeleton.clone(),
@@ -2129,6 +2210,48 @@ mod tests {
         .expect("a roster from an older session still loads");
 
         assert_eq!(entry.effect, ToolEffect::Unknown, "{EXPECT_UNCLASSIFIED}");
+    }
+
+    const ENVIRONMENT_HEADLINE: &str = "ubuntu 24.04 · linux/x86_64";
+    const ENVIRONMENT_SUMMARY: &str = "bash · container sandbox · not root";
+    const ENVIRONMENT_TEXT: &str = "ubuntu 24.04 · linux/x86_64\n\
+         bash · container sandbox · not root\n\
+         runtime: workcell-mcp 0.1.0\n\
+         commands: bash 5.2.21, kubectl (no version)\n\
+         missing: zsh";
+
+    /// A command that ran but named no version is still a command that is
+    /// there, and the rendering has to keep those two facts apart.
+    #[test]
+    fn an_environment_result_renders_as_labelled_lines() {
+        let output = ToolOutput::Environment {
+            headline: ENVIRONMENT_HEADLINE.into(),
+            summary: ENVIRONMENT_SUMMARY.into(),
+            facts: vec![EnvironmentFact {
+                label: "runtime".into(),
+                value: "workcell-mcp 0.1.0".into(),
+            }],
+            commands: vec![
+                EnvironmentCommand {
+                    id: "bash".into(),
+                    available: true,
+                    version: Some("5.2.21".into()),
+                },
+                EnvironmentCommand {
+                    id: "kubectl".into(),
+                    available: true,
+                    version: None,
+                },
+                EnvironmentCommand {
+                    id: "zsh".into(),
+                    available: false,
+                    version: None,
+                },
+            ],
+        };
+
+        assert_eq!(output.as_text(), ENVIRONMENT_TEXT);
+        assert_eq!(output.annotation().as_deref(), Some(ENVIRONMENT_HEADLINE));
     }
 
     #[test]

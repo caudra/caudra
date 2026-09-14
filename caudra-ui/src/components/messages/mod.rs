@@ -1012,6 +1012,7 @@ impl MessagesPanel {
                 always_collapsed: ui_config.always_collapsed.into(),
                 scroll_card_lines: ui_config.scroll_card_lines,
                 compact: ViewMode::default() == ViewMode::Compact,
+                expanded: ViewMode::default() == ViewMode::Expanded,
             },
             card_scroll: HashMap::new(),
             lua_event_handle,
@@ -1045,6 +1046,7 @@ impl MessagesPanel {
         }
         self.view = view;
         self.policy.compact = view == ViewMode::Compact;
+        self.policy.expanded = view == ViewMode::Expanded;
         self.clear_hover();
         self.disclosure.clear();
         self.streaming_reasoning_open = None;

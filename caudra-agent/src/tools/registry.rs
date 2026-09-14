@@ -207,6 +207,14 @@ impl ToolExecResult {
         self
     }
 
+    /// Context the model reads after the body, and the reader never sees. Used
+    /// for what a rendering cannot say by itself, such as a diff that was only
+    /// ever a preview.
+    pub fn with_model_suffix(mut self, model_suffix: Option<String>) -> Self {
+        self.model_suffix = model_suffix;
+        self
+    }
+
     pub fn with_annotation(mut self, annotation: Option<String>) -> Self {
         self.annotation = annotation;
         self

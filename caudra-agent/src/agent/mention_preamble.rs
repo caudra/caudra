@@ -95,9 +95,13 @@ async fn resolve(mention: &Mention, resolution: &Resolution<'_>, budget: &mut us
     if result.is_error {
         return note(mention, &result.output.err().unwrap_or_default());
     }
-    let Some(body) = result.model_output else {
+    // A read renders its own body now, so the model output is set only when a
+    // remote hands one over. Either way the mention inlines what the model
+    // would have read had it made the call itself.
+    let Ok(output) = result.output else {
         return note(mention, "not inlined: the read returned nothing");
     };
+    let body = result.model_output.unwrap_or_else(|| output.as_text());
     *budget = budget.saturating_sub(body.len());
     Message::mention(format!("{}\n{body}\n</file>", open_tag(mention)))
 }

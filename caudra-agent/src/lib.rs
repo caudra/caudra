@@ -71,13 +71,14 @@ pub use editable_queue::{
 };
 pub use types::{
     AgentEvent, BatchProgressEvent, BatchToolEntry, BatchToolStatus, BufferSnapshot, CodeGraphRow,
-    CodeGraphSource, Delegation, DoneReason, Envelope, EventSender, GrepFileEntry, GrepLine,
-    GrepMatchGroup, INDEX_TRUNCATED, IndexDirectoryEntry, IndexDirectoryEntryKind, IndexLine,
-    IndexLineSemantic, IndexOutput, IndexSourceRange, InstructionBlock, LuaToolProvenance,
-    NO_FILES_FOUND, PatchedFile, QueueConsumedItem, SearchCap, SharedBuf, ShellFilterInfo,
-    ShellOutput, SnapshotLine, SnapshotSpan, SpanStyle, SubagentActivity, SubagentInfo,
-    SubagentProgress, TextOutput, ToolDoneEvent, ToolInput, ToolOutput, ToolOutputLimits,
-    ToolStartEvent, TurnCompleteEvent,
+    CodeGraphSource, Delegation, DoneReason, ENVIRONMENT_COMMANDS_LABEL, ENVIRONMENT_MISSING_LABEL,
+    ENVIRONMENT_NO_VERSION, Envelope, EnvironmentCommand, EnvironmentFact, EventSender,
+    GrepFileEntry, GrepLine, GrepMatchGroup, INDEX_TRUNCATED, IndexDirectoryEntry,
+    IndexDirectoryEntryKind, IndexLine, IndexLineSemantic, IndexOutput, IndexSourceRange,
+    InstructionBlock, LuaToolProvenance, NO_FILES_FOUND, PatchedFile, QueueConsumedItem, SearchCap,
+    SharedBuf, ShellFilterInfo, ShellOutput, SnapshotLine, SnapshotSpan, SpanStyle,
+    SubagentActivity, SubagentInfo, SubagentProgress, TextOutput, ToolDoneEvent, ToolInput,
+    ToolOutput, ToolOutputLimits, ToolStartEvent, TurnCompleteEvent,
 };
 pub use types::{
     ReasoningSummary, format_live_duration, reasoning_summary, streaming_reasoning_summary,
