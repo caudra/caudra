@@ -2377,6 +2377,8 @@ fn a_progress_report_for_no_known_call_is_dropped() {
 }
 
 const DISPATCHED_TOOL: &str = "file_grep";
+/// The verb the row shows for `DISPATCHED_TOOL`, which names itself nowhere.
+const DISPATCHED_LABEL: &str = "Grepping";
 
 fn batch_roster(id: &str, children: usize) -> AgentEvent {
     let AgentEvent::ToolStart(mut start) = tool_start(id, "batch") else {
@@ -2423,7 +2425,7 @@ fn a_dispatched_subagents_progress_lands_on_its_row() {
     assert_eq!(parent_progress(&app, 0), None);
     let rendered = rendered(&mut app);
     assert!(
-        rendered.contains(DISPATCHED_TOOL),
+        rendered.contains(DISPATCHED_LABEL),
         "a dispatched child says what it is doing: {rendered}"
     );
 }

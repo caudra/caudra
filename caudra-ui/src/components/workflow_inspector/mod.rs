@@ -29,6 +29,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::animation::{animation_elapsed_ms, spinner_str};
 use crate::components::modal::{FooterHits, FooterLine, Modal};
 use crate::components::scrollbar::{ScrollHint, Scrollbar, ScrollbarMouse};
+use crate::components::tool_display::{activity_detail, activity_label};
 use crate::components::workflow_card::{phase_strip_line, status_span};
 use crate::components::workflow_inspector::timeline::{TimelineRow, span_bar, timeline};
 use crate::components::{
@@ -1988,7 +1989,7 @@ fn roster_tally(run: &RunSnapshot) -> String {
     format!("{done}{AGENT_SLASH}{}{DONE_UNIT}", run.roster.len())
 }
 
-/// `· shell cargo test · 3 tools · 1m2s`, the shape a subagent's task header
+/// `· Running cargo test · 3 tools · 1m2s`, the shape a subagent's task header
 /// already uses, so a workflow agent reads like any other agent.
 ///
 /// What an agent is doing, or was doing when it stopped. A settled agent's
@@ -2003,13 +2004,10 @@ fn activity_spans(progress: &ToolProgress, state: RosterState) -> Vec<Span<'stat
     };
     let mut spans = vec![
         Span::raw(SEPARATOR),
-        Span::styled(progress.report.activity.label().to_owned(), label),
+        Span::styled(activity_label(&progress.report.activity), label),
     ];
-    if let Some(detail) = progress.report.activity.detail() {
-        spans.push(Span::styled(
-            format!(" {}", escape_terminal_controls(detail)),
-            t.tool_dim,
-        ));
+    if let Some(detail) = activity_detail(&progress.report.activity) {
+        spans.push(Span::styled(format!(" {detail}"), t.tool_dim));
     }
     if running {
         spans.push(Span::styled(
@@ -2260,6 +2258,8 @@ mod tests {
     const EARLY_KEY: u64 = 1;
     const LATE_KEY: u64 = 2;
     const RUNNING_TOOL: &str = "shell";
+    /// The verb the row shows for `RUNNING_TOOL`, which names itself nowhere.
+    const RUNNING_LABEL: &str = "Running";
     const TOOL_SUMMARY: &str = "cargo nextest run";
     const TOOLS_RUN: u32 = 3;
     const TOOLS_TALLY: &str = "3 tools";
@@ -2983,7 +2983,7 @@ mod tests {
 
         let text = section_text(&mut inspector, '3');
 
-        assert!(text.contains(RUNNING_TOOL), "{text}");
+        assert!(text.contains(RUNNING_LABEL), "{text}");
         assert!(text.contains(TOOL_SUMMARY), "{text}");
         assert!(text.contains(TOOLS_TALLY), "{ACTIVITY_IS_TALLIED}: {text}");
     }
@@ -3001,7 +3001,7 @@ mod tests {
         let text = section_text(&mut inspector, '3');
 
         assert!(
-            text.contains(RUNNING_TOOL),
+            text.contains(RUNNING_LABEL),
             "{ACTIVITY_OUTLIVES_ITS_AGENT}: {text}"
         );
     }

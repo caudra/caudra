@@ -8,8 +8,8 @@ use crate::provenance::LineProvenance;
 use crate::theme;
 
 use super::tool_display::{
-    ScrollTail, batch_sigil_style, compact_args_for, compact_sigil_label, header_spans, names_tool,
-    scroll_footer_text,
+    ScrollTail, activity_detail, activity_label, batch_sigil_style, compact_args_for,
+    compact_sigil_label, header_spans, names_tool, scroll_footer_text,
 };
 use super::{ToolProgress, is_collapsible, workflow_card};
 use caudra_agent::tools::{PYTHON_EXECUTION_TOOL_NAME, SHELL_TOOL_NAME, TASK_TOOL_NAME};
@@ -973,10 +973,10 @@ fn child_progress_spans(progress: &ToolProgress) -> Vec<Span<'static>> {
     let mut spans = vec![Span::styled(CHILD_ACTIVITY_PREFIX, theme.tool_dim)];
     if progress.is_live() {
         spans.push(Span::styled(
-            progress.report.activity.label().to_owned(),
+            activity_label(&progress.report.activity),
             theme.tool_prefix,
         ));
-        if let Some(detail) = progress.report.activity.detail() {
+        if let Some(detail) = activity_detail(&progress.report.activity) {
             spans.push(Span::styled(format!(" {detail}"), theme.tool_dim));
         }
         spans.push(Span::styled(CHILD_ACTIVITY_SEPARATOR, theme.tool_dim));
@@ -1182,20 +1182,27 @@ fn indent_all(lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
 
 /// Each file gets its own heading, because a patch that touches three files
 /// is otherwise three diffs with nothing saying where one ends.
+///
+/// A patch that touches one is the exception. There is no boundary to mark,
+/// and the card header already names that file and carries the same counts, so
+/// the heading would be the row above it spelled a second time.
 fn render_patch(files: &[PatchedFile], width: u16) -> Vec<Line<'static>> {
     let theme = theme::current();
+    let needs_headings = files.len() > 1;
     let mut lines = Vec::new();
     for file in files {
         if !lines.is_empty() {
             lines.push(Line::default());
         }
-        lines.push(Line::from(vec![
-            Span::styled(file.path.clone(), theme.tool_prefix),
-            Span::styled(
-                format!(" +{} -{}", file.additions, file.deletions),
-                theme.tool_annotation,
-            ),
-        ]));
+        if needs_headings {
+            lines.push(Line::from(vec![
+                Span::styled(file.path.clone(), theme.tool_prefix),
+                Span::styled(
+                    format!(" +{} -{}", file.additions, file.deletions),
+                    theme.tool_annotation,
+                ),
+            ]));
+        }
         lines.extend(render_unified_patch(&file.patch, width));
     }
     lines
@@ -2311,6 +2318,11 @@ mod tests {
     const AFTER_GUTTER_MSG: &str = "an added line is numbered from the side it exists on";
     const HUNK_GAP_MSG: &str = "a jump between hunks must be marked, not silently closed";
     const HEADING_MSG: &str = "each file names itself and its size";
+    const FIRST_PATH: &str = "src/lib.rs";
+    const SECOND_PATH: &str = "src/main.rs";
+    const LONE_HEADING_MSG: &str =
+        "the card header already names a lone file, so the body must not name it again";
+    const WIRE_HEADER_MSG: &str = "file headers belong to the wire format";
 
     fn patch_text(files: &[PatchedFile]) -> Vec<String> {
         render_patch(files, UNCONSTRAINED_WIDTH)
@@ -2319,13 +2331,21 @@ mod tests {
             .collect()
     }
 
-    fn one_file(patch: &str) -> Vec<PatchedFile> {
-        vec![PatchedFile {
-            path: "src/lib.rs".into(),
+    fn patched(path: &str, patch: &str) -> PatchedFile {
+        PatchedFile {
+            path: path.into(),
             patch: patch.into(),
             additions: 2,
             deletions: 1,
-        }]
+        }
+    }
+
+    fn one_file(patch: &str) -> Vec<PatchedFile> {
+        vec![patched(FIRST_PATH, patch)]
+    }
+
+    fn two_files(patch: &str) -> Vec<PatchedFile> {
+        vec![patched(FIRST_PATH, patch), patched(SECOND_PATH, patch)]
     }
 
     /// Numbering restarts at each `@@` header, so a hunk deep in a file reads
@@ -2347,16 +2367,39 @@ mod tests {
         );
     }
 
-    /// The `---`/`+++` header names the file twice over, which the heading
-    /// already does, so it must not reach the transcript.
+    /// The `---`/`+++` header names the file twice over, which the card header
+    /// has already done, so it must not reach the transcript.
     #[test]
     fn a_patch_drops_the_file_header_lines() {
         let rendered = patch_text(&one_file(PATCH)).join("\n");
         assert!(
             !rendered.contains("+++") && !rendered.contains("--- a/"),
-            "file headers belong to the wire format: {rendered}"
+            "{WIRE_HEADER_MSG}: {rendered}"
         );
-        assert!(rendered.contains("src/lib.rs +2 -1"), "{HEADING_MSG}");
+    }
+
+    /// The card header already names a lone file and carries its counts, so a
+    /// heading would be that row spelled a second time.
+    #[test]
+    fn a_lone_file_gets_no_heading() {
+        let rendered = patch_text(&one_file(PATCH));
+        assert!(
+            !rendered.iter().any(|row| row.contains(FIRST_PATH)),
+            "{LONE_HEADING_MSG}: {rendered:?}"
+        );
+    }
+
+    /// Two diffs have to say where one ends, which is a job no card header can
+    /// do once it has degraded to reporting a count of files.
+    #[test]
+    fn several_files_each_keep_their_heading() {
+        let rendered = patch_text(&two_files(PATCH)).join("\n");
+        for path in [FIRST_PATH, SECOND_PATH] {
+            assert!(
+                rendered.contains(&format!("{path} +2 -1")),
+                "{HEADING_MSG}: {rendered}"
+            );
+        }
     }
 
     #[test]
@@ -2479,9 +2522,10 @@ mod tests {
         );
     }
 
-    /// The rows under the file's heading.
+    /// Every row of a one-file patch is a diff row, its naming having been left
+    /// to the card header.
     fn patch_rows(patch: &str) -> Vec<String> {
-        patch_text(&one_file(patch)).split_off(1)
+        patch_text(&one_file(patch))
     }
 
     /// An applied chunk arrives as the whole region it matched followed by the

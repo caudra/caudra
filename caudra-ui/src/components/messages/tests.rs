@@ -6227,6 +6227,8 @@ fn loading_a_session_forgets_the_child_views() {
 const CHILD_ACTIVITY_MSG: &str = "a dispatched child says what it is doing while it runs";
 const CHILD_TALLY: &str = "2 tools";
 const RUNNING_TOOL: &str = "file_grep";
+/// The verb the row shows for `RUNNING_TOOL`, which names itself nowhere.
+const RUNNING_LABEL: &str = "Grepping";
 
 fn running_child(tool: &str) -> caudra_agent::BatchToolEntry {
     caudra_agent::BatchToolEntry {
@@ -6270,7 +6272,7 @@ fn a_dispatched_child_reports_what_it_is_doing() {
 
     let text = seg_text(&panel, "t1");
     assert!(
-        text.contains(RUNNING_TOOL),
+        text.contains(RUNNING_LABEL),
         "{CHILD_ACTIVITY_MSG}: {text:?}"
     );
     assert!(text.contains(CHILD_TALLY), "{CHILD_ACTIVITY_MSG}: {text:?}");
@@ -6767,6 +6769,7 @@ fn a_progress_row_belongs_to_the_child_it_reports_on() {
 #[test]
 fn a_later_report_is_not_overwritten_by_the_cached_one() {
     const LATER_TOOL: &str = "file_read";
+    const LATER_LABEL: &str = "Reading";
     let mut panel = panel_with_running_batch();
     panel.set_batch_child_progress("t1", 0, child_report());
     render(&mut panel, 80, 24);
@@ -6784,9 +6787,9 @@ fn a_later_report_is_not_overwritten_by_the_cached_one() {
     render(&mut panel, 80, 24);
 
     let text = seg_text(&panel, "t1");
-    assert!(text.contains(LATER_TOOL), "{CHILD_ACTIVITY_MSG}: {text:?}");
+    assert!(text.contains(LATER_LABEL), "{CHILD_ACTIVITY_MSG}: {text:?}");
     assert!(
-        !text.contains(RUNNING_TOOL),
+        !text.contains(RUNNING_LABEL),
         "{CHILD_ACTIVITY_MSG}: {text:?}"
     );
 }

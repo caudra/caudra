@@ -1,4 +1,4 @@
-use super::{DisplayMessage, ToolProgress, ToolStatus};
+use super::{DisplayMessage, ToolProgress, ToolStatus, escape_terminal_controls};
 
 use super::code_view;
 use crate::animation::{spinner_frame, spinner_str};
@@ -28,7 +28,7 @@ use crate::markdown::{
 };
 use caudra_agent::{
     BatchToolStatus, BufferSnapshot, InstructionBlock, NO_FILES_FOUND, ShellOutput, SnapshotSpan,
-    SpanStyle, SubagentProgress, ToolInput, ToolOutput,
+    SpanStyle, SubagentActivity, SubagentProgress, ToolInput, ToolOutput,
     tools::{
         FILE_READ_TOOL_NAME, FILE_WRITE_TOOL_NAME, PYTHON_EXECUTION_TOOL_NAME, SHELL_TOOL_NAME,
         humanize_duration,
@@ -397,6 +397,39 @@ fn query_key(name: &str) -> Option<&'static str> {
     QUERY_KEYS
         .iter()
         .find_map(|(query_tool, key)| (*query_tool == tool).then_some(*key))
+}
+
+/// The activity as a row says it. A tool answers with the verb its own card
+/// header uses, so a watcher reads `Reading` rather than `file_read`, and a
+/// name the table has never heard of answers with itself, which is all there
+/// is to say about it.
+///
+/// Always the present tense. The row reports what the agent is doing, or was
+/// doing when it stopped, and the past tense would assert that a call finished
+/// when the agent may well have been cut off mid-way through it.
+pub(super) fn activity_label(activity: &SubagentActivity) -> String {
+    match activity {
+        SubagentActivity::Tool { name, .. } => compact_tool(name).map_or_else(
+            || name.to_string(),
+            |entry| entry.label(Tense::Present).to_owned(),
+        ),
+        phase => capitalized(phase.label()),
+    }
+}
+
+/// What the activity is working on, with control characters neutralised: the
+/// summary is built from tool input, which the agent does not author.
+pub(super) fn activity_detail(activity: &SubagentActivity) -> Option<String> {
+    activity.detail().map(escape_terminal_controls)
+}
+
+/// A phase label is authored lowercase to read mid-sentence, but on this row it
+/// stands where a tool's inflected verb would and has to match it.
+fn capitalized(label: &str) -> String {
+    let mut rest = label.chars();
+    rest.next().map_or_else(String::new, |first| {
+        first.to_uppercase().chain(rest).collect()
+    })
 }
 
 /// How a tool introduces itself on a one-line row. A name the table has never
@@ -1165,10 +1198,10 @@ impl ToolLineBuilder {
         let theme = theme::current();
         if self.is_in_progress() {
             out.push(Span::styled(
-                progress.report.activity.label().to_owned(),
+                activity_label(&progress.report.activity),
                 theme.tool_prefix,
             ));
-            if let Some(detail) = progress.report.activity.detail() {
+            if let Some(detail) = activity_detail(&progress.report.activity) {
                 out.push(Span::styled(format!(" {detail}"), theme.tool_dim));
             }
             out.push(Span::styled(ACTIVITY_SEPARATOR, theme.tool_dim));
@@ -3359,7 +3392,7 @@ mod tests {
             .collect();
         assert_eq!(
             progress_line,
-            "  ├ shell cargo nextest run · 3 tools · 1m 3.4s"
+            "  ├ Running cargo nextest run · 3 tools · 1m 3.4s"
         );
     }
 
@@ -3424,8 +3457,50 @@ mod tests {
         assert_eq!(tl.lines.len(), 1);
         let text = lines_text(&tl);
         assert!(
-            text.contains(" · shell cargo nextest run · 3 tools · 1m 3.4s"),
+            text.contains(" · Running cargo nextest run · 3 tools · 1m 3.4s"),
             "{text}"
+        );
+    }
+
+    const ACTIVITY_VERB_MSG: &str = "an activity row names a tool by the verb its card header uses";
+    const UNTABLED_TOOL: &str = "mcp_Some_unknown";
+    const UNTABLED_MSG: &str = "a tool the table has never heard of answers with itself";
+    const PHASE_CASE_MSG: &str = "a phase heads its row like the tool verbs beside it";
+    const CONTROL_SUMMARY: &str = "lib.rs\u{1b}[2J";
+    const DETAIL_ESCAPE_MSG: &str =
+        "a summary is built from tool input, so the row must not pass its controls on";
+
+    #[test_case("shell", "Running" ; "shell")]
+    #[test_case("file_read", "Reading" ; "read")]
+    #[test_case("file_grep", "Grepping" ; "grep")]
+    #[test_case("task", "Delegating" ; "task")]
+    fn an_activity_names_its_tool_by_verb(tool: &str, expected: &str) {
+        let activity = SubagentActivity::tool(Arc::from(tool), "");
+        assert_eq!(activity_label(&activity), expected, "{ACTIVITY_VERB_MSG}");
+    }
+
+    #[test]
+    fn an_untabled_tool_answers_with_its_own_name() {
+        let activity = SubagentActivity::tool(Arc::from(UNTABLED_TOOL), "");
+        assert_eq!(activity_label(&activity), UNTABLED_TOOL, "{UNTABLED_MSG}");
+    }
+
+    #[test]
+    fn a_phase_is_capitalised_like_the_verbs_beside_it() {
+        assert_eq!(
+            activity_label(&SubagentActivity::Responding),
+            "Responding",
+            "{PHASE_CASE_MSG}"
+        );
+    }
+
+    #[test]
+    fn an_activity_detail_carries_no_control_characters() {
+        let activity = SubagentActivity::tool(Arc::from(SHELL_TOOL_NAME), CONTROL_SUMMARY);
+        let detail = activity_detail(&activity).expect("a summary was given");
+        assert!(
+            !detail.contains('\u{1b}'),
+            "{DETAIL_ESCAPE_MSG}: {detail:?}"
         );
     }
 
