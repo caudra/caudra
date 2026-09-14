@@ -327,7 +327,7 @@ enum Caps {
     /// `start` runs after permission checks: it reads config and publishes
     /// previews, but dispatching tools is structurally impossible.
     Start {
-        config: AgentConfig,
+        config: Box<AgentConfig>,
         audience: ToolAudience,
         session_id: Option<SessionRef>,
         read_only: bool,
@@ -372,7 +372,7 @@ impl LuaCtx {
         Self::new(
             ctx,
             Caps::Start {
-                config: ctx.config.clone(),
+                config: Box::new(ctx.config.clone()),
                 audience: ctx.audience,
                 session_id: ctx.session_id.clone(),
                 read_only: !matches!(ctx.mode, caudra_agent::AgentMode::Build)
