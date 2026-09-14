@@ -2490,6 +2490,27 @@ fn long_done(id: &str, lines: usize) -> ToolDoneEvent {
     }
 }
 
+/// The same body in the shape the tool really reports it.
+///
+/// A write that created a file settles into `WriteCode`, and that is the one
+/// body exempt from the card's budget — a write reporting plain text is held
+/// to its budget like anything else, so a fixture that reported one would be
+/// testing a card no write can produce.
+fn body_done(tool: &str, id: &str, lines: usize) -> ToolDoneEvent {
+    if tool != FILE_WRITE_TOOL_NAME {
+        return long_done(id, lines);
+    }
+    let body: Vec<String> = (0..lines).map(|i| format!("line {i}")).collect();
+    ToolDoneEvent {
+        output: ToolOutput::WriteCode {
+            path: WRITTEN_FILE_PATH.into(),
+            byte_count: body.iter().map(String::len).sum(),
+            lines: body,
+        },
+        ..done(id)
+    }
+}
+
 fn shell_toggle_row(panel: &MessagesPanel) -> u16 {
     let segment = panel
         .cache
@@ -7670,7 +7691,7 @@ fn a_write_shuts_on_a_press_and_comes_back_on_the_next(view: ViewMode) {
 #[test]
 fn a_folded_write_opens_whole_and_shuts_again() {
     let mut panel = compact_panel(&[(TOOL_ID, FILE_WRITE_TOOL_NAME)]);
-    panel.tool_done(long_done(TOOL_ID, WRITTEN_FILE_LINES));
+    panel.tool_done(body_done(FILE_WRITE_TOOL_NAME, TOOL_ID, WRITTEN_FILE_LINES));
     rebuild(&mut panel);
     let area = Rect::new(0, 0, 80, 24);
     assert!(panel.card_closed(TOOL_ID), "{WRITE_FOLDS_IN_COMPACT_MSG}");
@@ -7775,7 +7796,7 @@ fn long_card_text(config: UiConfig, tool: &'static str, lines: usize) -> String 
     let mut panel = MessagesPanel::new(config, EventHandle::disconnected_for_test());
     panel.set_view(ViewMode::Expanded);
     panel.tool_start(start(TOOL_ID, tool));
-    panel.tool_done(long_done(TOOL_ID, lines));
+    panel.tool_done(body_done(tool, TOOL_ID, lines));
     rebuild(&mut panel);
     seg_text(&panel, TOOL_ID)
 }
@@ -7829,6 +7850,7 @@ const EDIT_BUDGETED_MSG: &str = "a diff is already only the part that changed, s
 /// Comfortably past the `write` budget, so a card drawing every row can only
 /// be one that spends no budget at all.
 const WRITTEN_FILE_LINES: usize = 40;
+const WRITTEN_FILE_PATH: &str = "notes.txt";
 
 /// A write draws its file whole, an edit rests at its budget. Both are checked
 /// together because they share the one `write` budget in the config, so the
@@ -7837,7 +7859,7 @@ const WRITTEN_FILE_LINES: usize = 40;
 #[test_case(FILE_EDIT_TOOL_NAME, true ; "an_edit_rests_at_its_budget")]
 fn a_writes_body_is_not_abridged(tool: &'static str, expect_notice: bool) {
     let mut panel = panel_with_tools(&[("t1", tool)]);
-    panel.tool_done(long_done("t1", WRITTEN_FILE_LINES));
+    panel.tool_done(body_done(tool, "t1", WRITTEN_FILE_LINES));
     render(&mut panel, 80, 24);
 
     let text = seg_text(&panel, "t1");

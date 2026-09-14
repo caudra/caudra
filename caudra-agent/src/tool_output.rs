@@ -904,6 +904,7 @@ mod tests {
                     patch: "@@ -1 +1 @@\n-before\n+after".into(),
                     additions: 1,
                     deletions: 1,
+                    truncated: false,
                 })
                 .collect(),
         }

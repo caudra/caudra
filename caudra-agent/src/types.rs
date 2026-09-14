@@ -783,6 +783,12 @@ pub struct PatchedFile {
     pub patch: String,
     pub additions: usize,
     pub deletions: usize,
+    /// Whether the patch was cut short of the change it describes.
+    ///
+    /// Workcell shortens a receipt past its byte bound rather than refusing the
+    /// mutation, so the counts above can describe more than the patch shows.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
 }
 
 /// Saturating arithmetic so callers can't overflow with any combination of inputs.

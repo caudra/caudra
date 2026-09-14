@@ -3466,22 +3466,46 @@ fn directory_listing_with_truncation(listing: &str, truncated: bool, max_bytes: 
 /// A write reports what it did, not what it wrote: the content is the model's
 /// own, and echoing it back as an escaped patch inside a JSON wrapper charged
 /// for it twice.
+///
+/// What it did depends on what was there. A create is its content, because a
+/// new file has no other side and a diff of one is every line with a `+`. An
+/// overwrite is a change, and is shown as one whenever Workcell could carry the
+/// content it replaced within `maxPreviousBytes`. Above that bound, and when
+/// nothing was written at all, the patch is the whole report.
 fn file_write_result(output: FileWriteOutput, content: String) -> ToolExecResult {
-    let written = output.applied.then(|| output.path.clone());
-    let result = if output.applied {
-        ToolExecResult::from(Ok::<_, String>(ToolOutput::WriteCode {
-            path: output.path.clone(),
+    let FileWriteOutput {
+        path,
+        existed,
+        applied,
+        diff,
+        previous,
+        ..
+    } = output;
+    let written = applied.then(|| path.clone());
+    let result = match (applied, existed, previous) {
+        (true, false, _) => ToolOutput::WriteCode {
+            path,
             byte_count: content.len(),
             lines: content.lines().map(str::to_owned).collect(),
-        }))
+        },
+        (true, true, Some(before)) => ToolOutput::Diff {
+            path,
+            before,
+            after: content,
+            summary: diff.patch,
+        },
+        // Either nothing was written, or the old side was too large to carry.
+        // A diff alone reads as a write that landed, so a result that did not
+        // land says so below.
+        _ => ToolOutput::Patch {
+            files: vec![patched_file(&diff)],
+        },
+    };
+    let result = ToolExecResult::from(Ok::<_, String>(result));
+    let result = if applied {
+        result
     } else {
-        // Nothing was written, so there is no content to show. The diff is
-        // the whole report, and it reads as one — but a diff alone reads as a
-        // write that landed, so the result says which this was.
-        ToolExecResult::from(Ok::<_, String>(ToolOutput::Patch {
-            files: vec![patched_file(&output.diff)],
-        }))
-        .with_model_suffix(Some(NOT_APPLIED.to_owned()))
+        result.with_model_suffix(Some(NOT_APPLIED.to_owned()))
     };
     result.with_written_paths(written.into_iter().collect())
 }
@@ -3521,6 +3545,7 @@ fn patched_file(diff: &FileDiff) -> PatchedFile {
         patch: diff.patch.clone(),
         additions: diff.additions,
         deletions: diff.deletions,
+        truncated: diff.truncated,
     }
 }
 
@@ -3550,6 +3575,7 @@ fn file_patch_result(output: FileApplyPatchOutput) -> ToolExecResult {
             patch: file.patch.clone(),
             additions: file.additions,
             deletions: file.deletions,
+            truncated: file.truncated,
         })
         .collect();
     let result = ToolExecResult::from(Ok::<_, String>(ToolOutput::Patch { files }));
@@ -6132,9 +6158,10 @@ mod tests {
                 kind: workcell::files::FileWriteKind::Write,
                 path: "/project/src/lib.rs".into(),
                 relative_path: "src/lib.rs".into(),
-                existed: true,
+                existed: false,
                 applied: true,
                 diff: diff.clone(),
+                previous: None,
             },
             "fn new() {}\n".into(),
         )
@@ -6186,6 +6213,59 @@ mod tests {
             patch,
             ToolOutput::Patch { files } if files.len() == 1 && files[0].path == "src/lib.rs"
         ));
+    }
+
+    const OLD_CONTENT: &str = "fn old() {}\n";
+    const NEW_CONTENT: &str = "fn new() {}\n";
+    const WRITE_CODE_CARD: &str = "write-code";
+    const DIFF_CARD: &str = "diff";
+    const PATCH_CARD: &str = "patch";
+
+    fn write_result(applied: bool, existed: bool, previous: Option<&str>) -> ToolOutput {
+        file_write_result(
+            FileWriteOutput {
+                kind: workcell::files::FileWriteKind::Write,
+                path: "/project/src/lib.rs".into(),
+                relative_path: "src/lib.rs".into(),
+                existed,
+                applied,
+                diff: workcell::files::FileDiff {
+                    file: "/project/src/lib.rs".into(),
+                    relative_path: "src/lib.rs".into(),
+                    patch: "@@ -1,1 +1,1 @@\n-fn old() {}\n+fn new() {}".into(),
+                    additions: 1,
+                    deletions: 1,
+                    truncated: false,
+                },
+                previous: previous.map(str::to_owned),
+            },
+            NEW_CONTENT.into(),
+        )
+        .output
+        .expect("write output")
+    }
+
+    /// A create is its content and an overwrite is a change, so the card a
+    /// write settles into is decided by what the path held before it ran.
+    #[test_case(true, true, Some(OLD_CONTENT) => DIFF_CARD ; "an_overwrite_shows_the_side_it_replaced")]
+    #[test_case(true, false, None => WRITE_CODE_CARD ; "a_new_file_has_no_other_side_to_show")]
+    #[test_case(true, true, None => PATCH_CARD ; "an_old_side_too_large_to_carry_falls_back_to_the_patch")]
+    #[test_case(false, true, Some(OLD_CONTENT) => PATCH_CARD ; "a_write_that_never_landed_reports_only_the_patch")]
+    fn a_write_is_drawn_from_what_the_path_held_before_it(
+        applied: bool,
+        existed: bool,
+        previous: Option<&str>,
+    ) -> &'static str {
+        match write_result(applied, existed, previous) {
+            ToolOutput::WriteCode { .. } => WRITE_CODE_CARD,
+            ToolOutput::Diff { before, after, .. } => {
+                assert_eq!(before, OLD_CONTENT);
+                assert_eq!(after, NEW_CONTENT);
+                DIFF_CARD
+            }
+            ToolOutput::Patch { .. } => PATCH_CARD,
+            other => panic!("unexpected write output: {other:?}"),
+        }
     }
 
     #[test]

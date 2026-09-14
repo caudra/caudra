@@ -47,6 +47,9 @@ const QUEUED_ANNOTATION: &str = "queued";
 /// What the markdown renderer calls a width it should not wrap to.
 const UNCONSTRAINED_WIDTH: u16 = 0;
 const GREP_COUNT_SEP: &str = " \u{b7} ";
+/// Workcell cuts a receipt at a byte bound and reports no line count for what
+/// it dropped, so this says that the patch is short without inventing a number.
+const PATCH_TRUNCATED: &str = "\u{2026} patch shortened";
 const GREP_SUMMARY_INDENT: &str = "  ";
 /// Past this many lines in one hunk, diffing its two sides again costs more
 /// than the grouping it buys, so the wire's own order is drawn instead. A card
@@ -1204,6 +1207,12 @@ fn render_patch(files: &[PatchedFile], width: u16) -> Vec<Line<'static>> {
             ]));
         }
         lines.extend(render_unified_patch(&file.patch, width));
+        if file.truncated {
+            lines.push(Line::from(Span::styled(
+                PATCH_TRUNCATED.to_owned(),
+                theme.tool_dim,
+            )));
+        }
     }
     lines
 }
@@ -2125,16 +2134,18 @@ pub fn render_tool_content(
             before,
             after,
             ..
-        }) => (
+        }) => capped(
             render_diff(
                 highlight.then(|| caudra_highlight::syntax_for_path(path)),
                 before,
                 after,
                 limits.width,
             ),
-            false,
+            limits.budget,
         ),
-        Some(ToolOutput::Patch { files }) => (render_patch(files, limits.width), false),
+        Some(ToolOutput::Patch { files }) => {
+            capped(render_patch(files, limits.width), limits.budget)
+        }
         Some(ToolOutput::GrepResult { entries, capped }) => {
             render_grep_results(entries, capped.as_ref(), limits.budget, highlight)
         }
@@ -2345,6 +2356,7 @@ mod tests {
     const LONE_HEADING_MSG: &str =
         "the card header already names a lone file, so the body must not name it again";
     const WIRE_HEADER_MSG: &str = "file headers belong to the wire format";
+    const SHORTENED_MSG: &str = "a patch cut short must say so, and one that is whole must not";
 
     fn patch_text(files: &[PatchedFile]) -> Vec<String> {
         render_patch(files, UNCONSTRAINED_WIDTH)
@@ -2359,6 +2371,7 @@ mod tests {
             patch: patch.into(),
             additions: 2,
             deletions: 1,
+            truncated: false,
         }
     }
 
@@ -2386,6 +2399,58 @@ mod tests {
         assert!(
             rendered.contains(&" 9 + added".to_owned()),
             "{AFTER_GUTTER_MSG}: {rendered:?}"
+        );
+    }
+
+    const BUDGET_ROWS: usize = 2;
+    const BUDGET_MSG: &str =
+        "a card holds its diff to the rows it was given, and says the body goes on";
+    const OPENED_MSG: &str = "an opened card draws the whole body it was withholding";
+
+    fn tool_content(output: &ToolOutput, budget: usize) -> ToolContent {
+        render_tool_content(
+            None,
+            Some(output),
+            false,
+            RenderLimits::new(false, budget, BatchViews::default(), TOOL_LINES),
+        )
+    }
+
+    /// Both cards reported `false` for truncation no matter how long they ran,
+    /// which is also what withheld the affordance that would have opened them.
+    #[test_case(ToolOutput::Diff {
+        path: FIRST_PATH.into(),
+        before: "a\nb\nc\nd\ne\n".into(),
+        after: "A\nB\nC\nD\nE\n".into(),
+        summary: String::new(),
+    } ; "a_diff")]
+    #[test_case(ToolOutput::Patch { files: two_files(PATCH) } ; "a_patch")]
+    fn an_edit_card_keeps_the_budget_it_was_given(output: ToolOutput) {
+        let held = tool_content(&output, BUDGET_ROWS);
+        assert!(held.truncation, "{BUDGET_MSG}");
+        assert_eq!(held.lines.len(), BUDGET_ROWS + 1, "{BUDGET_MSG}");
+
+        let whole = tool_content(&output, usize::MAX);
+        assert!(!whole.truncation, "{OPENED_MSG}");
+        assert!(whole.lines.len() > BUDGET_ROWS + 1, "{OPENED_MSG}");
+    }
+
+    /// A shortened patch describes less than its counts claim, and a reader
+    /// with no notice would take the part it shows for the whole change.
+    #[test]
+    fn a_shortened_patch_says_that_it_stops_early() {
+        let mut files = one_file(PATCH);
+        assert!(
+            !patch_text(&files).iter().any(|row| row == PATCH_TRUNCATED),
+            "{SHORTENED_MSG}"
+        );
+
+        files[0].truncated = true;
+        let rendered = patch_text(&files);
+        assert_eq!(
+            rendered.last().map(String::as_str),
+            Some(PATCH_TRUNCATED),
+            "{SHORTENED_MSG}: {rendered:?}"
         );
     }
 

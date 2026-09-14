@@ -94,24 +94,24 @@ impl RenderCtx<'_> {
     /// The rows a card rests at, `usize::MAX` for a call with no useful
     /// abridgement.
     ///
-    /// A whole-file write is the only tool whose body *is* its result rather
-    /// than a report of one. Seven lines of a file say nothing its header did
-    /// not, and the notice offering the rest is on every write, so abridging
-    /// it buys a click and costs the thing the card is for. An edit and a
-    /// patch keep the budget they share with it: a diff is already only the
-    /// part that changed.
+    /// A created file is the only body that *is* its result rather than a
+    /// report of one. Seven lines of it say nothing its header did not, and the
+    /// notice offering the rest is on every write, so abridging it buys a click
+    /// and costs the thing the card is for. Everything else a write settles
+    /// into is already only the part that changed, and keeps the budget it
+    /// shares with an edit and a patch.
     ///
     /// A batch child is deliberately not asked: it rests at its own tool's
     /// budget so that a batch reads as the list of what it ran, and several
     /// whole files would bury that list.
-    fn resting_budget(&self, tool: &str) -> usize {
+    fn resting_budget(&self, tool: &str, output: Option<&ToolOutput>) -> usize {
         if self.scrolls(tool) {
             return self.policy.scroll_card_lines as usize;
         }
-        match tool == FILE_WRITE_TOOL_NAME {
-            true => usize::MAX,
-            false => self.tool_output_lines.get(tool),
+        if tool == FILE_WRITE_TOOL_NAME && matches!(output, Some(ToolOutput::WriteCode { .. })) {
+            return usize::MAX;
         }
+        self.tool_output_lines.get(tool)
     }
 }
 
@@ -1292,10 +1292,11 @@ impl ToolLineBuilder {
     /// what it is about to do.
     ///
     /// `path` is what the header has said so far, which is all a still-arriving
-    /// write has said about itself. A document is drawn the way the settled
-    /// card will draw it, so nothing about the body changes when the call runs.
-    /// That includes the card's window: a write 800 lines long does not push
-    /// the transcript down 800 rows on its way past.
+    /// write has said about itself, and it cannot say whether that path already
+    /// exists. So a document is drawn the way a *created* file settles, and an
+    /// overwrite changes at settle time into the diff of what it replaced.
+    /// What does not change is the card's window: a write 800 lines long does
+    /// not push the transcript down 800 rows on its way past.
     fn push_live_body(&mut self, body: &str, path: &str) {
         self.source.abandon();
         let start = self.lines.len();
@@ -1709,7 +1710,7 @@ pub fn build_tool_lines(
         rctx.limits_for(
             msg.role.tool_id(),
             expanded.full,
-            rctx.resting_budget(tool_name),
+            rctx.resting_budget(tool_name, msg.tool_output.as_deref()),
         ),
     );
     b.apply_output_format(msg.tool_output.as_deref());
@@ -2213,6 +2214,35 @@ mod tests {
         let text = lines_text(&tl);
         assert!(text.contains(HEADING_TEXT), "{text}");
         assert_eq!(text.contains(HEADING_SOURCE), keeps_markers, "{text}");
+    }
+
+    const UNBOUNDED_MSG: &str =
+        "a created file is its own result, so the card that holds it is not abridged";
+    const BOUNDED_MSG: &str = "a diff is already only the part that changed, so it keeps a budget";
+
+    /// The exemption belongs to the body that *is* a result, not to the tool
+    /// that produced it: the same tool now also settles into a diff and a
+    /// patch, and neither has any claim on an unlimited card.
+    #[test]
+    fn only_a_written_file_escapes_the_card_budget() {
+        let rctx = test_rctx(80);
+        assert_eq!(
+            rctx.resting_budget(FILE_WRITE_TOOL_NAME, Some(&write_output(SOURCE_PATH))),
+            usize::MAX,
+            "{UNBOUNDED_MSG}"
+        );
+
+        let overwrite = ToolOutput::Diff {
+            path: SOURCE_PATH.into(),
+            before: HEADING_SOURCE.into(),
+            after: HEADING_TEXT.into(),
+            summary: String::new(),
+        };
+        assert_eq!(
+            rctx.resting_budget(FILE_WRITE_TOOL_NAME, Some(&overwrite)),
+            TOL.get(FILE_WRITE_TOOL_NAME),
+            "{BOUNDED_MSG}"
+        );
     }
 
     /// The settled card draws what the streaming one drew, and a document that

@@ -686,6 +686,39 @@ mod tests {
             .cloned()
     }
 
+    const OVERWRITTEN_PATH: &str = "/home/user/project/src/lib.rs";
+    const NATIVE_DIFF_MSG: &str =
+        "an editor gets a diff it can render, not a fenced blob it has to parse";
+
+    /// Now that an overwrite settles into a diff, this branch carries every
+    /// `file_write` that replaced something, not just a single-match edit.
+    #[test]
+    fn a_two_sided_edit_crosses_as_a_native_diff() {
+        let event = done_event(
+            "file_write",
+            ToolOutput::Diff {
+                path: OVERWRITTEN_PATH.into(),
+                before: "fn old() {}\n".into(),
+                after: "fn new() {}\n".into(),
+                summary: String::new(),
+            },
+            false,
+            Some(OVERWRITTEN_PATH),
+        );
+        let json = serde_json::to_value(tool_done(&event, Path::new(CWD), Some(Path::new(HOME))))
+            .expect("serialize");
+        assert_eq!(
+            json["content"],
+            json!([{
+                "type": "diff",
+                "path": OVERWRITTEN_PATH,
+                "oldText": "fn old() {}\n",
+                "newText": "fn new() {}\n",
+            }]),
+            "{NATIVE_DIFF_MSG}: {json}"
+        );
+    }
+
     #[test]
     fn done_written_path_reports_location_without_line() {
         let event = done_event(

@@ -1381,6 +1381,23 @@ fn classify_error(text: &str) -> &'static str {
     }
 }
 
+/// What an editing tool moved, in the shape the metric counts, or `None` for a
+/// call that edited nothing.
+///
+/// A patch already carries its own counts, computed by Workcell over the same
+/// content, so they are summed rather than recomputed from text this side never
+/// holds whole.
+fn edited_lines(output: &ToolOutput) -> Option<(u64, u64)> {
+    match output {
+        ToolOutput::Diff { before, after, .. } => Some(changed_lines(before, after)),
+        ToolOutput::Patch { files } => Some((
+            files.iter().map(|file| file.additions as u64).sum(),
+            files.iter().map(|file| file.deletions as u64).sum(),
+        )),
+        _ => None,
+    }
+}
+
 fn changed_lines(before: &str, after: &str) -> (u64, u64) {
     let mut added = 0;
     let mut removed = 0;
@@ -1425,11 +1442,10 @@ fn report(done: &ToolDoneEvent, name: &str, source: &str, input: &Value, took: D
         error_type: error_text.as_deref().map(classify_error),
         tool_input: tool_input.as_deref(),
     });
-    if let ToolOutput::Diff { before, after, .. } = &done.output {
-        let (added, removed) = changed_lines(before, after);
-        caudra_otel::emit::lines_of_code(added, removed);
-    }
     if !done.is_error {
+        if let Some((added, removed)) = edited_lines(&done.output) {
+            caudra_otel::emit::lines_of_code(added, removed);
+        }
         git_activity(name, input);
     }
 }
@@ -3666,5 +3682,46 @@ mod telemetry_tests {
     fn diffs_count_added_and_removed_lines() {
         assert_eq!(changed_lines(BEFORE, AFTER), (2, 1));
         assert_eq!(changed_lines(BEFORE, BEFORE), (0, 0));
+    }
+
+    fn patched(additions: usize, deletions: usize) -> crate::PatchedFile {
+        crate::PatchedFile {
+            path: "src/lib.rs".into(),
+            patch: String::new(),
+            additions,
+            deletions,
+            truncated: false,
+        }
+    }
+
+    /// Most editing lands as a patch — every `file_apply_patch`, every
+    /// `file_edit --replace_all`, and a write whose old side was too large to
+    /// carry — so counting only the two-sided form reported close to nothing.
+    #[test]
+    fn a_patch_counts_the_lines_it_moved_across_every_file() {
+        assert_eq!(
+            edited_lines(&ToolOutput::Patch {
+                files: vec![patched(3, 1), patched(4, 2)],
+            }),
+            Some((7, 3))
+        );
+        assert_eq!(
+            edited_lines(&ToolOutput::Diff {
+                path: "src/lib.rs".into(),
+                before: BEFORE.into(),
+                after: AFTER.into(),
+                summary: String::new(),
+            }),
+            Some((2, 1))
+        );
+        assert_eq!(
+            edited_lines(&ToolOutput::WriteCode {
+                path: "src/lib.rs".into(),
+                byte_count: AFTER.len(),
+                lines: AFTER.lines().map(str::to_owned).collect(),
+            }),
+            None,
+            "a created file replaced nothing, so it moved no lines"
+        );
     }
 }
