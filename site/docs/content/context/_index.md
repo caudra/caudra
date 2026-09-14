@@ -129,7 +129,7 @@ Part of what the model reads was written by Caudra rather than typed by you. The
 
 None of this lives in the system prompt. Anything that changes during a session would invalidate the cached prefix on every change, so it reaches the model as a message instead, and it is sent only when it differs from the last time Caudra said it.
 
-Each one is appended after the message it steers, so the transcript reads in the order it happened and rewinding a turn takes that turn's reminders with it.
+Where one lands depends on whether anything else still holds a copy. A standing reminder — the environment, a mode announcement, an instruction diff — is appended after the message it steers, and rewinding that message takes the reminder with it, because Caudra re-sends it on the next turn anyway. A one-shot notice — a finished background task, a settled workflow, the output of a `/!` command, an MCP prompt's canned exchange — is appended before the message, because it happened first and the transcript is the only place it still exists, so a rewind has to spare it.
 
 Each one appears in the transcript as a dim row folded to its heading. Click the row to read the exact text the model was sent, and click again to fold it back. Mentioned file contents are the exception: the model gets them, and the transcript shows the `@path` you typed rather than the body behind it.
 

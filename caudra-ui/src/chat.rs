@@ -1900,6 +1900,36 @@ mod tests {
         assert_eq!(display[3].role, DisplayRole::Assistant);
     }
 
+    /// An arrival is written above the message because it landed before it, and
+    /// the replay says so. Live it draws below, because the row is emitted when
+    /// the run claims the notice rather than when the notice arrived; the replay
+    /// is the order that actually happened.
+    #[test]
+    fn a_restored_arrival_stays_above_the_turn_that_followed_it() {
+        let msgs = vec![
+            Message::observation(INJECTED_TEXT.into()),
+            Message::user(USER_TEXT.into()),
+            Message::observation(SYNTHETIC_TEXT.into()),
+        ];
+        let items = crate::history_items(&msgs);
+
+        let display =
+            history_to_display(&items, &empty_outputs(), &ToolOutputLines::default(), true).0;
+
+        let rows: Vec<(&DisplayRole, &str)> = display
+            .iter()
+            .map(|message| (&message.role, message.text.as_str()))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                (&DisplayRole::Injected, INJECTED_TEXT),
+                (&DisplayRole::User, USER_TEXT),
+                (&DisplayRole::Injected, SYNTHETIC_TEXT),
+            ]
+        );
+    }
+
     /// A continuation belongs to no turn of its own, so it stays where it
     /// happened rather than joining the turn above it.
     #[test]

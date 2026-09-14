@@ -689,12 +689,20 @@ impl<'h> Agent<'h> {
         }
     }
 
-    /// The preamble trails the message it steers. The user typed that message
-    /// first and watched it land first, so a transcript that hoisted the
-    /// reminders above it would rewrite what they remember happening, and a
-    /// revert that cut the message would strand them there. Trailing also puts
-    /// the standing block closest to the point the model generates from, which
-    /// is what makes the most recent block of a kind the one in force.
+    /// Two kinds of harness-authored message bracket the turn, and which side
+    /// they land on follows from whether anything else still holds a copy.
+    ///
+    /// What arrived since the last turn leads the message: a shell result, a
+    /// finished background task, a settled workflow, an MCP prompt's canned
+    /// exchange. It happened before the user typed, its source dropped it the
+    /// moment it was claimed, and so a rewind that cut it would destroy it.
+    ///
+    /// What the turn needs to know trails the message: the environment, an
+    /// instruction diff, the mode, the bodies behind the mentioned paths. Every
+    /// one is re-derived whenever the transcript lacks it, so a rewind may take
+    /// it freely, and trailing puts it closest to the point the model generates
+    /// from, which is what makes the most recent block of a kind the one in
+    /// force.
     async fn push_user_inputs(&mut self, mut inputs: Vec<AgentInput>, queued: bool) -> String {
         let Some(latest) = inputs.last() else {
             return String::new();
@@ -716,11 +724,12 @@ impl<'h> Agent<'h> {
             fast: latest.fast,
         };
 
-        let mut preamble = standing;
+        let mut arrivals = Vec::new();
         for input in &mut inputs {
-            preamble.append(&mut input.preamble);
-            preamble.append(&mut self.mention_preamble(&input.mentions).await);
+            arrivals.append(&mut input.preamble);
+            standing.append(&mut self.mention_preamble(&input.mentions).await);
         }
+        self.push_arrivals(arrivals);
 
         let mut telemetry = Vec::with_capacity(inputs.len());
         for input in inputs {
@@ -737,7 +746,9 @@ impl<'h> Agent<'h> {
             };
             self.history.push(message);
         }
-        self.push_input_context(preamble);
+        for message in standing {
+            self.push_injected(message);
+        }
         telemetry.join("\n\n")
     }
 
@@ -767,8 +778,17 @@ impl<'h> Agent<'h> {
         .await
     }
 
-    fn push_input_context(&mut self, preamble: Vec<Message>) {
-        for message in preamble {
+    /// The mailbox drains here because a notice waiting in it is an arrival by
+    /// the same definition as the rest: it landed before the turn and the
+    /// mailbox no longer holds it.
+    ///
+    /// A restored transcript therefore draws these above the message, while a
+    /// live one draws them below it, because the row is emitted when the run
+    /// claims the notice rather than when the notice arrived. The restored order
+    /// is the true one. Closing the gap means drawing the row on arrival, not
+    /// reordering what the model was sent.
+    fn push_arrivals(&mut self, arrivals: Vec<Message>) {
+        for message in arrivals {
             self.push_injected(message);
         }
         if let Some(mailbox) = &self.mailbox {
@@ -1100,7 +1120,7 @@ impl<'h> Agent<'h> {
                     },
                 )
                 .await?;
-                self.push_input_context(Vec::new());
+                self.push_arrivals(Vec::new());
                 return Ok(TurnOutcome::Continue);
             }
             return Ok(TurnOutcome::Done(done_reason));
@@ -1864,6 +1884,10 @@ mod tests {
         "<system-reminder>\n# Environment\n\n- Date: 2026-09-10\n</system-reminder>";
     const EXPECTED_ENVIRONMENT_NOTICE: &str = "a changed environment must be announced";
     const EXPECTED_USER_TURN: &str = "the fixture opens on the message the user typed";
+    const EXPECTED_REQUEST: &str = "a run must send at least one message";
+    const NO_PREFILL: &str = "an arrival must never leave the request ending on the assistant";
+    const SHELL_RESULT: &str = "I ran: $ ls\n\nOutput:\na.rs";
+    const PROMPT_SEED: &str = "Here is how I review code.";
     const INSTRUCTIONS_CHANGED: &str =
         "<system-reminder>\n# Instructions changed\n\n+ be brief\n</system-reminder>";
     const MENTION_BODY: &str = "<file path=\"a.rs\">fn main() {}</file>";
@@ -3101,7 +3125,7 @@ mod tests {
     }
 
     #[test]
-    fn run_ingests_the_user_message_then_preamble_then_mailbox() {
+    fn run_ingests_preamble_then_mailbox_then_user_message() {
         smol::block_on(async {
             let id = caudra_storage::id::CaudraId::generate();
             let mailbox = SessionMailbox::register(id);
@@ -3118,9 +3142,9 @@ mod tests {
             agent.run(input).await.unwrap();
             drop(agent);
 
-            assert_eq!(history.as_slice()[0].user_text(), Some("hello"));
-            assert_eq!(history.as_slice()[1].user_text(), Some("preamble"));
-            assert_eq!(history.as_slice()[2].user_text(), Some("mailbox"));
+            assert_eq!(history.as_slice()[0].user_text(), Some("preamble"));
+            assert_eq!(history.as_slice()[1].user_text(), Some("mailbox"));
+            assert_eq!(history.as_slice()[2].user_text(), Some("hello"));
         });
     }
 
@@ -3478,6 +3502,73 @@ mod tests {
         });
     }
 
+    /// The whole split in one run. The shell result arrived before the prompt
+    /// and nothing else still holds it, so it keeps its place above. The
+    /// environment is re-sent whenever the transcript lacks it, so it lands
+    /// below, where a rewind of the prompt takes it along.
+    #[test]
+    fn an_arrival_leads_the_turn_whose_reminders_trail_it() {
+        smol::block_on(async {
+            let mut history = History::new(Vec::new());
+            let (mut agent, _event_rx) = make_agent(
+                MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+                &mut history,
+            );
+            agent.environment = Some(ENVIRONMENT.to_owned());
+            let mut input = default_input();
+            input.preamble = vec![Message::user(SHELL_RESULT.into())];
+
+            agent.run(input).await.unwrap();
+            drop(agent);
+
+            let texts: Vec<_> = history
+                .as_slice()
+                .iter()
+                .filter(|message| matches!(message.role, Role::User))
+                .filter_map(Message::user_text)
+                .collect();
+            assert_eq!(texts, [SHELL_RESULT, "hello", ENVIRONMENT]);
+        });
+    }
+
+    /// An MCP prompt seeds a canned exchange and may close it on an assistant
+    /// message. Trailing the turn, that message would be the request's last,
+    /// which is a prefill the provider rejects once reasoning is on.
+    #[test]
+    fn an_assistant_arrival_never_leaves_the_request_on_a_prefill() {
+        smol::block_on(async {
+            let captured: Arc<Mutex<Vec<Message>>> = Arc::default();
+            let mut history = History::new(Vec::new());
+            let (mut agent, _event_rx) = make_agent(
+                RequestCapturingProvider {
+                    captured: Arc::clone(&captured),
+                },
+                &mut history,
+            );
+            let mut input = default_input();
+            input.preamble = vec![Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: PROMPT_SEED.into(),
+                }],
+                ..Default::default()
+            }];
+
+            agent.run(input).await.unwrap();
+            drop(agent);
+
+            let request = captured.lock().unwrap().clone();
+            assert_eq!(
+                request.first().and_then(Message::first_text_content),
+                Some(PROMPT_SEED)
+            );
+            assert!(
+                matches!(request.last().expect(EXPECTED_REQUEST).role, Role::User),
+                "{NO_PREFILL}"
+            );
+        });
+    }
+
     #[test]
     fn queued_input_drains_preamble_and_mailbox() {
         smol::block_on(async {
@@ -3504,9 +3595,9 @@ mod tests {
                 .iter()
                 .map(Message::user_text)
                 .collect::<Vec<_>>();
-            assert_eq!(text, [Some("hello"), Some("preamble"), Some("mailbox")]);
+            assert_eq!(text, [Some("preamble"), Some("mailbox"), Some("hello")]);
+            assert!(history.as_slice()[0].is_observation());
             assert!(history.as_slice()[1].is_observation());
-            assert!(history.as_slice()[2].is_observation());
         });
     }
 

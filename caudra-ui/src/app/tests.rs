@@ -8737,6 +8737,37 @@ fn reverting_the_first_turn_takes_its_reminders_with_it() {
     assert_eq!(app.input_box.buffer.value(), "first prompt");
 }
 
+/// The other half of the same rule. A shell result landed before the prompt and
+/// nothing else still holds it, so the rewind has to spare it; the environment
+/// is re-sent whenever the transcript lacks it, so the rewind takes it.
+#[test]
+fn reverting_a_turn_keeps_the_arrivals_that_preceded_it() {
+    const KEPT_MSG: &str = "an arrival is the only copy left, so a rewind must spare it";
+    const SHELL_RESULT: &str = "I ran: $ ls\n\nOutput:\na.rs";
+    let mut app = test_app();
+    let items = crate::history_items(&[
+        Message::user(SHELL_RESULT.into()),
+        Message::user("first prompt".into()),
+        Message::observation(caudra_agent::prompt::ENVIRONMENT_MARKER.into()),
+        assistant_message("response"),
+    ]);
+    let prompt = items[1].id;
+    app.state.session_mut().replace_messages(items);
+
+    app.revert_to(prompt, RestoreMode::Conversation);
+
+    let active = crate::active_session_history(&app.state.session).unwrap();
+    let texts: Vec<_> = active
+        .iter()
+        .filter_map(|item| match &item.kind {
+            caudra_providers::HistoryItemKind::User { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(texts, [SHELL_RESULT], "{KEPT_MSG}");
+    assert_eq!(app.input_box.buffer.value(), "first prompt");
+}
+
 #[test]
 fn unrevert_restores_exact_original_head_and_clears_the_rewound_draft() {
     let mut app = build_rewind_app();
