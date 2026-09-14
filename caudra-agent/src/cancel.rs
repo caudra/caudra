@@ -13,12 +13,25 @@ use event_listener::Event;
 struct Shared {
     cancelled: AtomicBool,
     event: Event,
+    /// Consulted by [`Shared::is_cancelled`] so a child never reports itself
+    /// live while its parent is already cancelled. The forwarder task that
+    /// wakes parked waiters is scheduled, and until it runs the child's own
+    /// flag is still clear.
+    parent: Option<Arc<Shared>>,
 }
 
 impl Shared {
     fn fire(&self) {
         self.cancelled.store(true, Ordering::Release);
         self.event.notify(usize::MAX);
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+            || self
+                .parent
+                .as_ref()
+                .is_some_and(|parent| parent.is_cancelled())
     }
 }
 
@@ -29,22 +42,30 @@ pub struct CancelTrigger(Arc<Shared>);
 
 impl CancelToken {
     pub fn new() -> (CancelTrigger, Self) {
-        let shared = Arc::new(Shared {
-            cancelled: AtomicBool::new(false),
-            event: Event::new(),
-        });
+        Self::rooted(None)
+    }
+
+    fn rooted(parent: Option<Arc<Shared>>) -> (CancelTrigger, Self) {
+        let shared = Self::shared(parent);
         (CancelTrigger(Arc::clone(&shared)), Self(shared))
     }
 
+    /// Deliberately trigger-less: [`CancelTrigger`] fires on drop, so handing
+    /// one out here would cancel the token the moment it was discarded.
     pub fn none() -> Self {
-        Self(Arc::new(Shared {
+        Self(Self::shared(None))
+    }
+
+    fn shared(parent: Option<Arc<Shared>>) -> Arc<Shared> {
+        Arc::new(Shared {
             cancelled: AtomicBool::new(false),
             event: Event::new(),
-        }))
+            parent,
+        })
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.0.cancelled.load(Ordering::Acquire)
+        self.0.is_cancelled()
     }
 
     pub async fn race<T>(&self, future: impl Future<Output = T>) -> Result<T, String> {
@@ -71,8 +92,10 @@ impl CancelToken {
         }
     }
 
+    /// The child observes the parent's cancellation the moment it happens; the
+    /// forwarder exists to wake waiters already parked on the child's event.
     pub fn child(&self) -> (CancelTrigger, Self) {
-        let (child_trigger, child_token) = Self::new();
+        let (child_trigger, child_token) = Self::rooted(Some(Arc::clone(&self.0)));
         let parent = self.clone();
         let child_shared = Arc::clone(&child_token.0);
         smol::spawn(async move {
@@ -268,6 +291,46 @@ mod tests {
             assert!(child_token.is_cancelled());
             assert!(!parent_token.is_cancelled());
         });
+    }
+
+    /// The token for work nothing can cancel. It owns no trigger, so there is
+    /// nothing whose drop could quietly cancel it.
+    #[test]
+    fn none_is_never_cancelled() {
+        let token = CancelToken::none();
+
+        assert!(!token.is_cancelled());
+        assert!(!token.clone().is_cancelled());
+        assert!(!token.child().1.is_cancelled());
+    }
+
+    /// Callers such as `ensure_open` read the flag without awaiting, so a child
+    /// that lagged its parent by a scheduler hop would let an already cancelled
+    /// subagent issue one more model request. No `block_on` here: the forwarder
+    /// task must be irrelevant to the answer.
+    #[test]
+    fn a_child_observes_its_parent_without_awaiting() {
+        let (parent_trigger, parent_token) = CancelToken::new();
+        let (_child_trigger, child_token) = parent_token.child();
+        let (_grandchild_trigger, grandchild_token) = child_token.child();
+
+        parent_trigger.cancel();
+
+        assert!(child_token.is_cancelled());
+        assert!(grandchild_token.is_cancelled());
+    }
+
+    /// Cancelling a child says nothing about the work its parent still has in
+    /// flight, so the chain is read in one direction only.
+    #[test]
+    fn a_cancelled_child_leaves_its_parent_running() {
+        let (_parent_trigger, parent_token) = CancelToken::new();
+        let (child_trigger, child_token) = parent_token.child();
+
+        child_trigger.cancel();
+
+        assert!(child_token.is_cancelled());
+        assert!(!parent_token.is_cancelled());
     }
 
     #[test]
