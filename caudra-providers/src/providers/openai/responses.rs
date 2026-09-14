@@ -730,6 +730,8 @@ mod tests {
     use serde_json::json;
 
     const TEST_STREAM_TIMEOUT: Duration = Duration::from_secs(300);
+    const EXPECT_TRANSIENT_RETRY: &str =
+        "a provider outage reported over SSE must stay retryable end to end";
 
     async fn run_sse(sse: &str) -> (Result<StreamResponse, AgentError>, Vec<ProviderEvent>) {
         let (tx, rx) = flume::unbounded();
@@ -833,6 +835,24 @@ data: {\"error\":{\"message\":\"Server overloaded\",\"type\":\"overloaded_error\
                 }
                 other => panic!("expected Api error, got: {other:?}"),
             }
+        })
+    }
+
+    /// OpenAI ends an overloaded stream with this type, and nothing else in the
+    /// pipeline carries the type forward: if the status map loses it, the retry
+    /// loop sees a terminal 400 and the run dies on the first blip.
+    #[test]
+    fn parse_sse_service_unavailable_error_is_retryable() {
+        smol::block_on(async {
+            let sse = "\
+event: error\n\
+data: {\"error\":{\"message\":\"Our servers are currently overloaded. Please try again later.\",\"type\":\"service_unavailable_error\"}}\n\
+\n";
+
+            let (err, _) = run_sse(sse).await;
+            let err = err.unwrap_err();
+            assert_eq!(err.status(), Some(503));
+            assert!(err.is_retryable(), "{EXPECT_TRANSIENT_RETRY}");
         })
     }
 

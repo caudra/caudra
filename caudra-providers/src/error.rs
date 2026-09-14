@@ -42,6 +42,19 @@ const RETRY_OVERLOADED_LABEL: &str = "Provider is overloaded";
 const GATEWAY_401: &str = "authentication failed: request was blocked by a gateway or proxy, your token may be missing or expired, run `caudra auth login` or check your API key";
 const GATEWAY_403: &str = "forbidden: request was blocked by a gateway or proxy, check your account and provider settings";
 
+/// Auth and billing never become healthy by waiting, whatever the body says.
+const NEVER_TRANSIENT_STATUSES: [u16; 3] = [401, 402, 403];
+/// A provider that names its own outage is worth retrying even when it labelled
+/// the failure with a status that says otherwise. Phrases are narrow on purpose:
+/// "try again later" rather than "try again", which genuine refusals also say.
+const TRANSIENT_PHRASES: [&str; 5] = [
+    "overloaded",
+    "try again later",
+    "temporarily unavailable",
+    "service unavailable",
+    "please retry",
+];
+
 #[derive(Debug, thiserror::Error)]
 pub enum AgentError {
     #[error("API error ({status}): {message}")]
@@ -122,7 +135,14 @@ impl AgentError {
             return false;
         }
         match self {
-            Self::Api { status, .. } => *status == 429 || *status >= 500,
+            Self::Api {
+                status, message, ..
+            } => {
+                *status == 408
+                    || *status == 429
+                    || *status >= 500
+                    || (!NEVER_TRANSIENT_STATUSES.contains(status) && is_transient_message(message))
+            }
             Self::Io(_) | Self::Http(_) | Self::Timeout { .. } => true,
             Self::Config { .. }
             | Self::Tool { .. }
@@ -265,6 +285,13 @@ impl AgentError {
             _ => self.to_string(),
         }
     }
+}
+
+fn is_transient_message(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    TRANSIENT_PHRASES
+        .iter()
+        .any(|phrase| message.contains(phrase))
 }
 
 fn model_unavailable_message(message: &str) -> bool {
@@ -489,6 +516,14 @@ mod tests {
         "rate limited: insufficient_quota: You exceeded your current quota";
     const GATEWAY_HTML: &str = "<!DOCTYPE html>\n<html><body>502 Bad Gateway</body></html>";
     const REDUNDANT_CODE: &str = r#"{"error":{"code":"overloaded","message":"overloaded, retry"}}"#;
+    /// The two texts OpenAI streams as `service_unavailable_error`, which reaches
+    /// `AgentError` labelled 400 because the SSE type map has no server status for it.
+    const OVERLOADED_TEXT: &str = "Our servers are currently overloaded. Please try again later.";
+    const VERIFY_ACCESS_TEXT: &str = "Unable to verify model access right now. Please retry.";
+    const PLAIN_BAD_REQUEST: &str = "invalid request";
+    const OVERFLOW_TEXT: &str =
+        "This model's maximum context length is 200000 tokens. Please try again later.";
+    const CREDIT_TEXT: &str = "Your credit balance is too low. Please try again later.";
     const HTTP_DATE_OFFSET_SECS: i64 = 300;
     const HTTP_DATE_TOLERANCE_SECS: u64 = 5;
 
@@ -519,6 +554,7 @@ mod tests {
         map
     }
 
+    #[test_case(408, true  ; "request_timeout")]
     #[test_case(429, true  ; "rate_limit")]
     #[test_case(500, true  ; "server_error")]
     #[test_case(529, true  ; "overloaded")]
@@ -526,6 +562,20 @@ mod tests {
     #[test_case(401, false ; "unauthorized")]
     fn api_retryable(status: u16, expected: bool) {
         assert_eq!(api(status).is_retryable(), expected);
+    }
+
+    #[test_case(400, OVERLOADED_TEXT, true   ; "overloaded_behind_a_400")]
+    #[test_case(400, VERIFY_ACCESS_TEXT, true ; "please_retry_behind_a_400")]
+    #[test_case(400, PLAIN_BAD_REQUEST, false ; "plain_bad_request")]
+    #[test_case(400, OVERFLOW_TEXT, false     ; "overflow_outranks_transient_wording")]
+    #[test_case(402, CREDIT_TEXT, false       ; "billing_never_transient")]
+    #[test_case(401, OVERLOADED_TEXT, false   ; "auth_never_transient")]
+    fn transient_wording_overrides_a_misleading_status(
+        status: u16,
+        message: &str,
+        expected: bool,
+    ) {
+        assert_eq!(api_msg(status, message).is_retryable(), expected);
     }
 
     #[test_case(401, true  ; "unauthorized")]

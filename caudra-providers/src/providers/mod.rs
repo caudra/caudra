@@ -127,13 +127,18 @@ impl SseErrorPayload {
     pub fn into_agent_error(self) -> AgentError {
         let status = match self.error.r#type.as_str() {
             "overloaded_error" => 529,
+            "service_unavailable" | "service_unavailable_error" => 503,
             "api_error" | "server_error" => 500,
             "rate_limit_error" | "rate_limit_exceeded" | "tokens" => 429,
             "request_too_large" => 413,
+            "timeout_error" | "request_timeout" => 408,
             "not_found_error" => 404,
             "permission_error" => 403,
             "billing_error" | "insufficient_quota" => 402,
             "authentication_error" | "invalid_api_key" => 401,
+            // Deliberately 400 rather than a server status: `invalid_request_error`
+            // arrives here, and `AgentError::is_context_overflow` only inspects 400
+            // and 413, so widening this would cost compaction its trigger.
             _ => 400,
         };
         AgentError::api(status, self.error.message)
@@ -321,11 +326,53 @@ mod tests {
     const EXPECT_NO_RENEWAL: &str = "a blank or comment line must not renew the stream deadline";
     const EXPECT_RENEWAL: &str = "a data line must renew the stream deadline";
 
+    /// Deliberately free of the wording `AgentError::is_retryable` treats as
+    /// transient, so these cases measure the type-to-status map and nothing else.
+    const SSE_MESSAGE: &str = "provider rejected the request";
+    const EXPECT_RETRYABLE: &str = "a transient SSE error type must map to a retryable status";
+    const EXPECT_TERMINAL: &str = "a client-fault SSE error type must map to a terminal status";
+
     #[test_case("a b", "a%20b" ; "space")]
     #[test_case("a:b", "a%3Ab" ; "colon")]
     #[test_case("abc", "abc"   ; "passthrough")]
     fn urlenc_encodes(input: &str, expected: &str) {
         assert_eq!(urlenc(input), expected);
+    }
+
+    fn sse_error(r#type: &str) -> AgentError {
+        SseErrorPayload {
+            error: SseErrorDetail {
+                r#type: r#type.to_owned(),
+                message: SSE_MESSAGE.to_owned(),
+            },
+        }
+        .into_agent_error()
+    }
+
+    #[test_case("overloaded_error", 529, true            ; "overloaded")]
+    #[test_case("service_unavailable_error", 503, true   ; "service_unavailable_error")]
+    #[test_case("service_unavailable", 503, true         ; "service_unavailable")]
+    #[test_case("server_error", 500, true                ; "server_error")]
+    #[test_case("rate_limit_error", 429, true            ; "rate_limited")]
+    #[test_case("timeout_error", 408, true               ; "timeout")]
+    #[test_case("request_timeout", 408, true             ; "request_timeout")]
+    #[test_case("request_too_large", 413, false          ; "too_large")]
+    #[test_case("authentication_error", 401, false       ; "unauthenticated")]
+    #[test_case("invalid_request_error", 400, false      ; "invalid_request")]
+    #[test_case("", 400, false                           ; "missing_type")]
+    fn sse_error_type_maps_to_status(r#type: &str, expected: u16, retryable: bool) {
+        let error = sse_error(r#type);
+        assert_eq!(error.status(), Some(expected));
+        assert_eq!(
+            error.is_retryable(),
+            retryable,
+            "{}",
+            if retryable {
+                EXPECT_RETRYABLE
+            } else {
+                EXPECT_TERMINAL
+            }
+        );
     }
 
     struct NeverReader;
