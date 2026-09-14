@@ -3,12 +3,52 @@ use std::mem::size_of;
 use crate::{FilesystemError, FilesystemLimits};
 
 #[derive(Clone, Copy, Debug)]
-enum Token {
+pub(crate) enum Token {
     RecursiveDirectories,
     Recursive,
     SegmentStar,
     Any,
     Literal(u16),
+    /// Index into the matcher's own class table.
+    ///
+    /// Held indirectly so `Token` stays `Copy` and the matching row loop keeps a
+    /// fixed element size. `tokenize` never emits one: bracket expressions are
+    /// the gitignore dialect, and `file_glob` treats `[` as an ordinary literal.
+    Class(u16),
+}
+
+/// A bracket expression, expanded into inclusive UTF-16 ranges.
+///
+/// Members are restricted to the basic multilingual plane at parse time, so a
+/// range can never be half a surrogate pair and compare against a code unit
+/// that means nothing on its own.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct CharClass {
+    pub(crate) negated: bool,
+    pub(crate) ranges: Vec<(u16, u16)>,
+}
+
+impl CharClass {
+    pub(crate) fn retained_bytes(&self) -> usize {
+        size_of::<Self>().saturating_add(
+            self.ranges
+                .capacity()
+                .saturating_mul(size_of::<(u16, u16)>()),
+        )
+    }
+
+    /// A class never matches a separator, however it was written. A path
+    /// component pattern that could swallow `/` would silently become recursive.
+    fn contains(&self, unit: u16) -> bool {
+        if unit == u16::from(b'/') {
+            return false;
+        }
+        let listed = self
+            .ranges
+            .iter()
+            .any(|(low, high)| unit >= *low && unit <= *high);
+        listed != self.negated
+    }
 }
 
 #[derive(Debug)]
@@ -127,6 +167,7 @@ impl GlobMatcher {
         let matched = self.alternatives.iter().any(|tokens| {
             matches_tokens(
                 tokens,
+                &[],
                 &scratch.value,
                 &mut scratch.current,
                 &mut scratch.next,
@@ -310,8 +351,9 @@ fn tokenize(pattern: &str) -> Vec<Token> {
     tokens
 }
 
-fn matches_tokens(
+pub(crate) fn matches_tokens(
     tokens: &[Token],
+    classes: &[CharClass],
     value: &[u16],
     current: &mut Vec<bool>,
     next: &mut Vec<bool>,
@@ -353,6 +395,16 @@ fn matches_tokens(
             Token::Literal(expected) => {
                 for index in 0..value.len() {
                     current[index] = value[index] == *expected && next[index + 1];
+                }
+            }
+            Token::Class(class) => {
+                // An index the table does not carry matches nothing. Parsing
+                // rejects such a pattern outright, so this is unreachable rather
+                // than a permissive fallback.
+                let class = classes.get(usize::from(*class));
+                for index in 0..value.len() {
+                    current[index] =
+                        class.is_some_and(|class| class.contains(value[index])) && next[index + 1];
                 }
             }
         }

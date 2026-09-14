@@ -44,6 +44,7 @@ pub async fn run(
             proxy: options.proxy,
             shell_policy,
             shell_output_filter: options.shell_output_filter,
+            honor_gitignore: options.honor_gitignore,
             code: CodeConfiguration {
                 worker: options.code_worker.as_deref().map_or(
                     WorkerSource::Discover {

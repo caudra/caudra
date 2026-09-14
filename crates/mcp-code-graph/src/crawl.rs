@@ -49,7 +49,7 @@ impl CrawlSkip {
 }
 
 /// What the crawl found, and what it could not finish.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Crawled {
     pub inputs: Vec<SourceInput>,
     /// Files discovered but not ingested, with the reason, sorted by path.
@@ -60,6 +60,35 @@ pub struct Crawled {
     pub truncated: Option<CrawlTruncation>,
     /// Whether the underlying traversal examined every candidate it produced.
     pub scan_complete: bool,
+    /// Entries the tree's own `.gitignore` rules excluded.
+    pub files_ignored: usize,
+    /// Whether every applicable ignore rule was read.
+    ///
+    /// False means the exclusions are a subset of what the tree asked for, so the map is a superset
+    /// of the intended one. That is a different claim from a truncated scan, which is a subset.
+    pub ignore_complete: bool,
+    /// Directories not mapped because they are separate repositories, root-relative and sorted.
+    ///
+    /// Reported for the same reason a skipped file is: a map that silently omits a repository
+    /// cannot be told apart from a map of a tree that never held one.
+    pub pruned_repositories: Vec<String>,
+}
+
+/// Hand-written because two of these fields assert completeness, and `bool`'s default asserts the
+/// opposite. An empty crawl examined nothing and hid nothing; it did not fail to read the rules.
+impl Default for Crawled {
+    fn default() -> Self {
+        Self {
+            inputs: Vec::new(),
+            skipped: Vec::new(),
+            bytes_read: 0,
+            truncated: None,
+            scan_complete: true,
+            files_ignored: 0,
+            ignore_complete: true,
+            pruned_repositories: Vec::new(),
+        }
+    }
 }
 
 /// Which bound stopped the crawl.
@@ -94,6 +123,13 @@ pub fn crawl_filesystem_limits(limits: &CodeGraphLimits) -> FilesystemLimits {
     FilesystemLimits {
         max_search_results: limits.max_files,
         max_traversal_entries: limits.max_traversal_entries,
+        honor_gitignore: limits.honor_gitignore,
+        // A map does not cross a repository boundary its root is inside. Ranking is global and
+        // normalized, so a vendored repository's symbols compete with the host project's in one
+        // vector, and its files spend a budget sized for the project that was asked about. A text
+        // search has neither problem and keeps descending, which is why this is set here and not in
+        // the defaults.
+        prune_nested_repositories: true,
         ..FilesystemLimits::default()
     }
 }
@@ -121,6 +157,8 @@ pub async fn crawl(
 
     let mut crawled = Crawled {
         scan_complete: listing.scan_complete,
+        files_ignored: listing.ignored,
+        ignore_complete: listing.ignore_complete,
         // The listing caps itself at the same file ceiling, so a tree larger than the ceiling is
         // truncated before this loop ever runs. Reading the flag here is what keeps that from
         // looking like a complete map of a small repository.
@@ -140,6 +178,12 @@ pub async fn crawl(
             format!("{scope}/{relative}")
         }
     };
+
+    crawled.pruned_repositories = listing
+        .pruned_repositories
+        .into_iter()
+        .map(&qualify)
+        .collect();
 
     // The traversal already returns a stable order, but the engine's determinism contract starts
     // with a byte sort over paths and it must not depend on that promise holding elsewhere.
@@ -385,5 +429,146 @@ mod tests {
             .expect("crawl");
         assert_eq!(crawled.inputs.len(), 1);
         assert_eq!(crawled.inputs[0].path, "a.rs");
+    }
+
+    /// Marks a directory as a repository root the way a checkout does.
+    fn repository(root: &Path, relative: &str) {
+        std::fs::create_dir_all(root.join(relative).join(".git")).expect("repository");
+    }
+
+    #[tokio::test]
+    async fn a_nested_repository_is_not_mapped_with_the_project_around_it() {
+        let limits = CodeGraphLimits::default();
+        let directory = tree(&[
+            ("own.rs", "fn own() {}"),
+            ("vendor/inner/foreign.rs", "fn foreign() {}"),
+        ]);
+        repository(directory.path(), ".");
+        repository(directory.path(), "vendor/inner");
+
+        let crawled = crawl(
+            &group(directory.path(), &limits).await,
+            None,
+            &limits,
+            None,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("crawl");
+        let paths: Vec<_> = crawled
+            .inputs
+            .iter()
+            .map(|input| input.path.clone())
+            .collect();
+        assert_eq!(paths, vec!["own.rs".to_owned()]);
+        assert_eq!(crawled.pruned_repositories, vec!["vendor/inner".to_owned()]);
+    }
+
+    /// A pruned path is named relative to the root, not to the scope, so it can be pasted straight
+    /// back in as the next call's `path`.
+    #[tokio::test]
+    async fn a_pruned_repository_is_named_the_way_the_scope_would_be() {
+        let limits = CodeGraphLimits::default();
+        let directory = tree(&[("vendor/inner/foreign.rs", "fn foreign() {}")]);
+        repository(directory.path(), ".");
+        repository(directory.path(), "vendor/inner");
+
+        let crawled = crawl(
+            &group(directory.path(), &limits).await,
+            Some("vendor"),
+            &limits,
+            None,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("crawl");
+        assert_eq!(crawled.pruned_repositories, vec!["vendor/inner".to_owned()]);
+
+        let mapped = crawl(
+            &group(directory.path(), &limits).await,
+            Some("vendor/inner"),
+            &limits,
+            None,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("crawl");
+        assert_eq!(mapped.inputs.len(), 1);
+        assert!(mapped.pruned_repositories.is_empty());
+    }
+
+    /// Negative fixture for the enclosing-repository gate. A root that only holds checkouts has no
+    /// boundary to respect, and pruning there would map it to nothing at all.
+    #[tokio::test]
+    async fn a_root_that_merely_holds_a_checkout_still_maps_it() {
+        let limits = CodeGraphLimits::default();
+        let directory = tree(&[("project/main.rs", "fn main() {}")]);
+        repository(directory.path(), "project");
+
+        let crawled = crawl(
+            &group(directory.path(), &limits).await,
+            None,
+            &limits,
+            None,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("crawl");
+        assert_eq!(crawled.inputs.len(), 1);
+        assert!(crawled.pruned_repositories.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_ignored_source_file_is_absent_from_the_map() {
+        let limits = CodeGraphLimits::default();
+        let directory = tree(&[
+            (".gitignore", "generated.rs\n"),
+            ("generated.rs", "fn generated() {}"),
+            ("written.rs", "fn written() {}"),
+        ]);
+        repository(directory.path(), ".");
+
+        let crawled = crawl(
+            &group(directory.path(), &limits).await,
+            None,
+            &limits,
+            None,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("crawl");
+        let paths: Vec<_> = crawled
+            .inputs
+            .iter()
+            .map(|input| input.path.clone())
+            .collect();
+        assert_eq!(paths, vec!["written.rs".to_owned()]);
+        assert_eq!(crawled.files_ignored, 1);
+        assert!(crawled.ignore_complete);
+    }
+
+    #[tokio::test]
+    async fn disabling_gitignore_restores_the_ignored_file() {
+        let limits = CodeGraphLimits {
+            honor_gitignore: false,
+            ..CodeGraphLimits::default()
+        };
+        let directory = tree(&[
+            (".gitignore", "generated.rs\n"),
+            ("generated.rs", "fn generated() {}"),
+        ]);
+        repository(directory.path(), ".");
+
+        let crawled = crawl(
+            &group(directory.path(), &limits).await,
+            None,
+            &limits,
+            None,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("crawl");
+        assert_eq!(crawled.inputs.len(), 1);
+        assert_eq!(crawled.files_ignored, 0);
     }
 }

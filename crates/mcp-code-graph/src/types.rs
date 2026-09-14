@@ -135,6 +135,19 @@ pub struct GraphSummary {
     pub truncated_by: Vec<String>,
     /// Whether the traversal examined every candidate it produced.
     pub scan_complete: bool,
+    /// Files the tree's own `.gitignore` rules kept out of the map.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub files_ignored: usize,
+    /// Directories not mapped because they are separate repositories.
+    ///
+    /// A vendored repository's symbols would compete with this project's in one rank vector, so the
+    /// map stops at the boundary. Naming one as `path` maps it on its own terms.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub pruned_repositories: Vec<String>,
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 /// One ranked symbol.

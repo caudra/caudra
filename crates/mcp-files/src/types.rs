@@ -6,6 +6,20 @@ use std::path::PathBuf;
 
 use crate::text::FileVersion;
 
+/// Serde helpers keeping the traversal disclosure fields off the wire when they
+/// carry no information, so an ordinary listing looks exactly as it did before.
+const fn yes() -> bool {
+    true
+}
+
+fn is_yes(value: &bool) -> bool {
+    *value
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
+}
+
 /// Resource bounds are deliberately independent so deployments can tighten one
 /// attack surface without unexpectedly changing another operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -29,6 +43,23 @@ pub struct FilesystemLimits {
     pub max_glob_match_steps: usize,
     pub max_diff_bytes: usize,
     pub max_patch_result_bytes: usize,
+    /// Whether broad traversal applies `.gitignore` rules.
+    ///
+    /// On by default, because a search that spends its budget on build output answers a question
+    /// nobody asked. An explicitly named path is never excluded, so a caller can still reach an
+    /// ignored tree by naming it.
+    pub honor_gitignore: bool,
+    /// Whether broad traversal stops at a directory that is itself a repository.
+    ///
+    /// Off by default. The code graph turns it on because a vendored repository's symbols compete
+    /// with the host project's in one rank vector; a text search has no such problem and keeps
+    /// descending.
+    pub prune_nested_repositories: bool,
+    pub max_gitignore_files: usize,
+    pub max_gitignore_bytes: usize,
+    pub max_gitignore_patterns: usize,
+    pub max_gitignore_retained_bytes: usize,
+    pub max_gitignore_match_steps: usize,
 }
 
 impl Default for FilesystemLimits {
@@ -63,6 +94,17 @@ impl Default for FilesystemLimits {
             max_glob_match_steps: 400_000_000,
             max_diff_bytes: 16 * 1024,
             max_patch_result_bytes: 4 * 1024 * 1024,
+            honor_gitignore: true,
+            prune_nested_repositories: false,
+            // One ignore file per directory of a large repository, with room to spare. A tree that
+            // needs more than this is one where the rules themselves are the traversal cost.
+            max_gitignore_files: 1_000,
+            max_gitignore_bytes: 64 * 1024,
+            max_gitignore_patterns: 1_000,
+            max_gitignore_retained_bytes: 1024 * 1024,
+            // A whole-traversal budget, like `max_glob_match_steps`. Exhausting it stops rule
+            // evaluation and reports incomplete ignore data rather than failing the listing.
+            max_gitignore_match_steps: 400_000_000,
         }
     }
 }
@@ -88,6 +130,14 @@ impl FilesystemLimits {
             ("maxGlobMatchSteps", self.max_glob_match_steps),
             ("maxDiffBytes", self.max_diff_bytes),
             ("maxPatchResultBytes", self.max_patch_result_bytes),
+            ("maxGitignoreFiles", self.max_gitignore_files),
+            ("maxGitignoreBytes", self.max_gitignore_bytes),
+            ("maxGitignorePatterns", self.max_gitignore_patterns),
+            (
+                "maxGitignoreRetainedBytes",
+                self.max_gitignore_retained_bytes,
+            ),
+            ("maxGitignoreMatchSteps", self.max_gitignore_match_steps),
         ] {
             if value == 0 {
                 return Err(crate::FilesystemError::message(format!(
@@ -230,6 +280,20 @@ pub struct FileGlobOutput {
     /// the traversal or the match work budget stopped the scan early.
     pub scan_complete: bool,
     pub truncated: bool,
+    /// Entries excluded by `.gitignore` rules. An empty result under ignore
+    /// rules must be distinguishable from an empty tree.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub ignored: usize,
+    /// Whether every applicable ignore rule was read and applied. False when a
+    /// bound stopped rule collection, which means the exclusions are a subset of
+    /// what the repository asked for.
+    #[serde(default = "yes", skip_serializing_if = "is_yes")]
+    pub ignore_complete: bool,
+    /// Directories not traversed because they are themselves repositories,
+    /// relative to the searched directory. Populated only when the group is
+    /// configured to prune them; naming one as `path` traverses it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pruned_repositories: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -257,6 +321,13 @@ pub struct FileGrepOutput {
     /// Candidate files the traversal listed. A lower bound when `truncated`.
     pub files_listed: usize,
     pub truncated: bool,
+    /// Entries excluded by `.gitignore` rules. A search that found nothing and a
+    /// search that was not allowed to look are different answers.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub ignored: usize,
+    /// Whether every applicable ignore rule was read and applied.
+    #[serde(default = "yes", skip_serializing_if = "is_yes")]
+    pub ignore_complete: bool,
     #[serde(skip)]
     #[schemars(skip)]
     pub(crate) revisions: HashMap<String, FileVersion>,

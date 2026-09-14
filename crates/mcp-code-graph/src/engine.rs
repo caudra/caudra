@@ -89,6 +89,13 @@ impl CodeGraph {
             .map(|reason| vec![reason.name().to_owned()])
             .unwrap_or_default();
         let skipped_by_crawl = crawled.skipped.len();
+        if !crawled.ignore_complete {
+            // Not a truncated scan: the exclusions are the subset, so the map is a superset of the
+            // intended one. Named separately for that reason.
+            truncated_by.push("gitignore_rules".to_owned());
+        }
+        let files_ignored = crawled.files_ignored;
+        let pruned_repositories = crawled.pruned_repositories;
 
         let ingested = ingest_cached(crawled.inputs, limits.ingest, cache);
         if ingested.truncation.files {
@@ -128,6 +135,8 @@ impl CodeGraph {
             pr_converged: ranking.converged,
             truncated_by,
             scan_complete: crawled.scan_complete,
+            files_ignored,
+            pruned_repositories,
         };
 
         Self {

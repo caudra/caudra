@@ -127,6 +127,10 @@ pub struct RawOptions {
     #[arg(long)]
     pub no_shell_output_filter: bool,
 
+    /// Traverse files a repository's `.gitignore` excludes.
+    #[arg(long)]
+    pub no_gitignore: bool,
+
     /// Path to the `monty` worker binary used by the code tool group.
     #[arg(long)]
     pub code_worker: Option<PathBuf>,
@@ -214,6 +218,7 @@ pub struct CliOptions {
     pub shell_policy_file: Option<PathBuf>,
     pub yolo: bool,
     pub shell_output_filter: bool,
+    pub honor_gitignore: bool,
     pub code_worker: Option<PathBuf>,
     pub code_worker_cache: Option<PathBuf>,
     pub code_type_check: bool,
@@ -252,6 +257,7 @@ impl fmt::Debug for CliOptions {
             )
             .field("yolo", &self.yolo)
             .field("shell_output_filter", &self.shell_output_filter)
+            .field("honor_gitignore", &self.honor_gitignore)
             .field(
                 "code_worker",
                 &self.code_worker.as_ref().map(|_| "[CONFIGURED]"),
@@ -488,6 +494,15 @@ impl RawOptions {
                 Some(_) => return Err(CliError::InvalidEnvironment),
             }
         };
+        let honor_gitignore = if self.no_gitignore {
+            false
+        } else {
+            match environment_value(environment, "WORKCELL_MCP_GITIGNORE")?.as_deref() {
+                None | Some("true") => true,
+                Some("false") => false,
+                Some(_) => return Err(CliError::InvalidEnvironment),
+            }
+        };
         let web_icons = if self.web_icons {
             true
         } else {
@@ -655,6 +670,7 @@ impl RawOptions {
             shell_policy_file,
             yolo,
             shell_output_filter,
+            honor_gitignore,
             code_worker,
             code_worker_cache: code_worker_cache.or_else(default_code_worker_cache),
             code_type_check,
@@ -1092,6 +1108,37 @@ mod tests {
                 .resolve(&environment)
                 .unwrap();
         assert!(!disabled.shell_output_filter);
+    }
+
+    /// Ignore rules narrow what a search reports, so an operator who wants the untouched tree needs
+    /// a way to say so at startup. Tool input is not that way: traversal policy is configuration.
+    #[test]
+    fn gitignore_is_honored_by_default_and_opt_out() {
+        let environment = StartupEnvironment::load(None).unwrap();
+        let default = RawOptions::try_parse_from(["workcell-mcp", "/"])
+            .unwrap()
+            .resolve(&environment)
+            .unwrap();
+        assert!(default.honor_gitignore);
+
+        let disabled = RawOptions::try_parse_from(["workcell-mcp", "--no-gitignore", "/"])
+            .unwrap()
+            .resolve(&environment)
+            .unwrap();
+        assert!(!disabled.honor_gitignore);
+    }
+
+    #[test]
+    fn an_unrecognized_gitignore_environment_value_fails_startup() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("server.env");
+        std::fs::write(&path, "WORKCELL_MCP_GITIGNORE=maybe\n").unwrap();
+        let environment = StartupEnvironment::load(Some(&path)).unwrap();
+        let raw = RawOptions::try_parse_from(["workcell-mcp", "/"]).unwrap();
+        assert_eq!(
+            raw.resolve(&environment).unwrap_err(),
+            CliError::InvalidEnvironment
+        );
     }
 
     #[test]

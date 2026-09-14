@@ -69,6 +69,12 @@ impl ModelText for FileGlobOutput {
                 )
             });
         }
+        append_traversal_notes(
+            &mut text,
+            self.ignored,
+            self.ignore_complete,
+            &self.pruned_repositories,
+        );
         Cow::Owned(text)
     }
 }
@@ -93,8 +99,43 @@ impl ModelText for FileGrepOutput {
                 self.matches, self.files_scanned, self.files_listed
             ));
         }
+        append_traversal_notes(&mut text, self.ignored, self.ignore_complete, &[]);
         Cow::Owned(text)
     }
+}
+
+/// States what the traversal declined to look at.
+///
+/// A result narrowed by ignore rules or a repository boundary reads exactly like a result from a
+/// tree that never held those files. The reader needs to know which it got, and how to ask again.
+fn append_traversal_notes(
+    text: &mut String,
+    ignored: usize,
+    ignore_complete: bool,
+    pruned_repositories: &[String],
+) {
+    let mut notes = Vec::new();
+    if ignored > 0 {
+        notes.push(format!("{ignored} entries excluded by .gitignore"));
+    }
+    if !ignore_complete {
+        notes.push(
+            "ignore rules were only partly read, so the exclusions are incomplete".to_owned(),
+        );
+    }
+    if !pruned_repositories.is_empty() {
+        notes.push(format!(
+            "not traversed because they are separate repositories: {}; pass one as `path` to search it",
+            pruned_repositories.join(", ")
+        ));
+    }
+    if notes.is_empty() {
+        return;
+    }
+    if !text.is_empty() {
+        text.push('\n');
+    }
+    text.push_str(&format!("[{}]", notes.join("; ")));
 }
 
 impl ModelText for FileWriteOutput {
@@ -137,6 +178,9 @@ mod tests {
             total,
             scan_complete,
             truncated,
+            ignored: 0,
+            ignore_complete: true,
+            pruned_repositories: Vec::new(),
         }
     }
 
@@ -175,6 +219,8 @@ mod tests {
             files_scanned: 3,
             files_listed: 40,
             truncated: true,
+            ignored: 0,
+            ignore_complete: true,
             revisions: Default::default(),
         };
         assert_eq!(

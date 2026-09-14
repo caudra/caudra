@@ -5,6 +5,7 @@
 mod catalog;
 mod diff;
 mod error;
+mod gitignore;
 mod glob;
 #[cfg(test)]
 mod glob_tests;

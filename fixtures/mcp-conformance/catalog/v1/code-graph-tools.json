@@ -16,7 +16,7 @@
       {
         "name": "code_map",
         "title": "Rank symbols in a tree",
-        "description": "Rank every symbol in a source tree by importance and return the top ones. Start here when you do not know a codebase.\n\n- Importance is personalized PageRank over a call graph recovered from source text by name.\n- Rows carry the defining file and line span, plus in/out reference counts.\n- `path` scopes the map to a subdirectory; absent, or empty, means the whole configured root.\n- Counts are FLOORS. Dynamic dispatch, callbacks, function pointers, trait objects and macro-generated call sites contribute no edge, so a count of 0 means none was found, never that none exists.\n- Crawling, parsing, ranking and result size are bounded by host-only policy, and every bound that fires is named in the result.",
+        "description": "Rank every symbol in a source tree by importance and return the top ones. Start here when you do not know a codebase.\n\n- Importance is personalized PageRank over a call graph recovered from source text by name.\n- Rows carry the defining file and line span, plus in/out reference counts.\n- `path` scopes the map to a subdirectory; absent, or empty, means the whole configured root.\n- The map stops at a directory that is its own repository, and at files the repository's .gitignore excludes. Anything skipped that way is named in the result; pass a nested repository as `path` to map it on its own terms.\n- Counts are FLOORS. Dynamic dispatch, callbacks, function pointers, trait objects and macro-generated call sites contribute no edge, so a count of 0 means none was found, never that none exists.\n- Crawling, parsing, ranking and result size are bounded by host-only policy, and every bound that fires is named in the result.",
         "inputSchema": {
           "$schema": "http://json-schema.org/draft-07/schema#",
           "type": "object",
@@ -204,6 +204,19 @@
                 "scanComplete": {
                   "type": "boolean",
                   "description": "Whether the traversal examined every candidate it produced."
+                },
+                "filesIgnored": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0,
+                  "description": "Files the tree's own `.gitignore` rules kept out of the map."
+                },
+                "prunedRepositories": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "Directories not mapped because they are separate repositories.\n\nA vendored repository's symbols would compete with this project's in one rank vector, so the\nmap stops at the boundary. Naming one as `path` maps it on its own terms."
                 }
               },
               "required": [
@@ -217,7 +230,9 @@
                 "prIterations",
                 "prConverged",
                 "truncatedBy",
-                "scanComplete"
+                "scanComplete",
+                "filesIgnored",
+                "prunedRepositories"
               ],
               "description": "What the graph run itself had to say.\n\nPresent on every result. A ranking produced from a truncated crawl and one produced from a\ncomplete crawl are different claims, and nothing downstream can tell them apart without this."
             }
@@ -461,6 +476,19 @@
                 "scanComplete": {
                   "type": "boolean",
                   "description": "Whether the traversal examined every candidate it produced."
+                },
+                "filesIgnored": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0,
+                  "description": "Files the tree's own `.gitignore` rules kept out of the map."
+                },
+                "prunedRepositories": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "Directories not mapped because they are separate repositories.\n\nA vendored repository's symbols would compete with this project's in one rank vector, so the\nmap stops at the boundary. Naming one as `path` maps it on its own terms."
                 }
               },
               "required": [
@@ -474,7 +502,9 @@
                 "prIterations",
                 "prConverged",
                 "truncatedBy",
-                "scanComplete"
+                "scanComplete",
+                "filesIgnored",
+                "prunedRepositories"
               ],
               "description": "What the graph run itself had to say.\n\nPresent on every result. A ranking produced from a truncated crawl and one produced from a\ncomplete crawl are different claims, and nothing downstream can tell them apart without this."
             }
@@ -789,6 +819,19 @@
                 "scanComplete": {
                   "type": "boolean",
                   "description": "Whether the traversal examined every candidate it produced."
+                },
+                "filesIgnored": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0,
+                  "description": "Files the tree's own `.gitignore` rules kept out of the map."
+                },
+                "prunedRepositories": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "Directories not mapped because they are separate repositories.\n\nA vendored repository's symbols would compete with this project's in one rank vector, so the\nmap stops at the boundary. Naming one as `path` maps it on its own terms."
                 }
               },
               "required": [
@@ -802,7 +845,9 @@
                 "prIterations",
                 "prConverged",
                 "truncatedBy",
-                "scanComplete"
+                "scanComplete",
+                "filesIgnored",
+                "prunedRepositories"
               ],
               "description": "What the graph run itself had to say.\n\nPresent on every result. A ranking produced from a truncated crawl and one produced from a\ncomplete crawl are different claims, and nothing downstream can tell them apart without this."
             }
@@ -1106,6 +1151,19 @@
                 "scanComplete": {
                   "type": "boolean",
                   "description": "Whether the traversal examined every candidate it produced."
+                },
+                "filesIgnored": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0,
+                  "description": "Files the tree's own `.gitignore` rules kept out of the map."
+                },
+                "prunedRepositories": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "Directories not mapped because they are separate repositories.\n\nA vendored repository's symbols would compete with this project's in one rank vector, so the\nmap stops at the boundary. Naming one as `path` maps it on its own terms."
                 }
               },
               "required": [
@@ -1119,7 +1177,9 @@
                 "prIterations",
                 "prConverged",
                 "truncatedBy",
-                "scanComplete"
+                "scanComplete",
+                "filesIgnored",
+                "prunedRepositories"
               ],
               "description": "What the graph run itself had to say.\n\nPresent on every result. A ranking produced from a truncated crawl and one produced from a\ncomplete crawl are different claims, and nothing downstream can tell them apart without this."
             }
@@ -1374,6 +1434,19 @@
                 "scanComplete": {
                   "type": "boolean",
                   "description": "Whether the traversal examined every candidate it produced."
+                },
+                "filesIgnored": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0,
+                  "description": "Files the tree's own `.gitignore` rules kept out of the map."
+                },
+                "prunedRepositories": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "Directories not mapped because they are separate repositories.\n\nA vendored repository's symbols would compete with this project's in one rank vector, so the\nmap stops at the boundary. Naming one as `path` maps it on its own terms."
                 }
               },
               "required": [
@@ -1387,7 +1460,9 @@
                 "prIterations",
                 "prConverged",
                 "truncatedBy",
-                "scanComplete"
+                "scanComplete",
+                "filesIgnored",
+                "prunedRepositories"
               ],
               "description": "What the graph run itself had to say.\n\nPresent on every result. A ranking produced from a truncated crawl and one produced from a\ncomplete crawl are different claims, and nothing downstream can tell them apart without this."
             }

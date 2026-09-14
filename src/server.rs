@@ -53,14 +53,14 @@ use workcell_host_contract::{
 };
 use workcell_mcp_code::{CodeBuildError, CodeConfiguration, CodeInput, CodeToolGroup};
 use workcell_mcp_code_graph::{
-    CodeContextInput, CodeExpandInput, CodeGraphToolGroup, CodeImpactInput, CodeMapInput,
-    CodeRefsInput, GraphProgress, GraphProgressSink, ModelText as GraphModelText, SelectorRefusal,
-    Shrinkable,
+    CodeContextInput, CodeExpandInput, CodeGraphLimits, CodeGraphToolGroup, CodeImpactInput,
+    CodeMapInput, CodeRefsInput, GraphProgress, GraphProgressSink, ModelText as GraphModelText,
+    SelectorRefusal, Shrinkable,
 };
 use workcell_mcp_files::{
     FileApplyPatchInput, FileEditInput, FileGlobInput, FileGrepInput, FileReadInput, FileResource,
-    FileResourceAccess, FileToolGroup, FileWriteInput, IndexInput, ModelText as FileModelText,
-    RootResourceKind, WorkspaceError, root_relative_resource_id,
+    FileResourceAccess, FileToolGroup, FileWriteInput, FilesystemLimits, IndexInput,
+    ModelText as FileModelText, RootResourceKind, WorkspaceError, root_relative_resource_id,
 };
 use workcell_mcp_shell::{
     ShellInput, ShellPermissionPolicy, ShellProgressChunk, ShellProgressSink, ShellToolGroup,
@@ -128,6 +128,8 @@ pub struct ToolConfiguration<'a> {
     pub proxy: ProxyConfiguration,
     pub shell_policy: ShellPermissionPolicy,
     pub shell_output_filter: bool,
+    /// Applies to every group that traverses: the file tools and the code graph.
+    pub honor_gitignore: bool,
     pub code: CodeConfiguration<'a>,
     pub max_transfer_bytes: usize,
     pub snapshot_root: Option<&'a Path>,
@@ -228,12 +230,16 @@ impl WorkcellServer {
             "snapshots": tools.snapshot_root.is_some(),
         }))
         .map_err(|_| ServerBuildError::CatalogSerialization)?;
+        let filesystem_limits = FilesystemLimits {
+            honor_gitignore: tools.honor_gitignore,
+            ..FilesystemLimits::default()
+        };
         let files = if groups.contains(&ToolGroup::Files) {
             Some(
                 FileToolGroup::new(
                     root.ok_or(ServerBuildError::Filesystem)?,
                     tools.allow_write,
-                    None,
+                    Some(filesystem_limits),
                 )
                 .await
                 .map_err(|_| ServerBuildError::Filesystem)?,
@@ -244,8 +250,12 @@ impl WorkcellServer {
         // Constructed over its own read-only `FileToolGroup` so the group stands alone when the
         // files tools are not exposed. Confinement is identical; only reads are ever performed.
         let code_graph = if groups.contains(&ToolGroup::CodeGraph) {
+            let limits = CodeGraphLimits {
+                honor_gitignore: tools.honor_gitignore,
+                ..CodeGraphLimits::default()
+            };
             Some(Arc::new(
-                CodeGraphToolGroup::new(root.ok_or(ServerBuildError::Filesystem)?, None)
+                CodeGraphToolGroup::new(root.ok_or(ServerBuildError::Filesystem)?, Some(limits))
                     .await
                     .map_err(|_| ServerBuildError::Filesystem)?,
             ))
@@ -3383,6 +3393,7 @@ mod tests {
             proxy: ProxyConfiguration::direct(),
             shell_policy: ShellPermissionPolicy::restricted(),
             shell_output_filter: true,
+            honor_gitignore: true,
             code: CodeConfiguration {
                 worker: WorkerSource::Discover {
                     bundled_cache_root: None,

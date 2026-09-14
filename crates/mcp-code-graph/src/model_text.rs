@@ -50,6 +50,17 @@ fn footer(summary: &GraphSummary) -> String {
     if !summary.scan_complete {
         parts.push("scan stopped early".to_owned());
     }
+    if summary.files_ignored > 0 {
+        parts.push(format!("{} ignored", summary.files_ignored));
+    }
+    if !summary.pruned_repositories.is_empty() {
+        // The reader needs the names, not a count: the next call is `path=<one of them>`, and a
+        // count alone would leave a map that omits a whole subtree looking complete.
+        parts.push(format!(
+            "stopped at nested repositories {} (pass one as `path` to map it)",
+            summary.pruned_repositories.join(", ")
+        ));
+    }
     if !summary.truncated_by.is_empty() {
         parts.push(format!("truncated by {}", summary.truncated_by.join(", ")));
     }

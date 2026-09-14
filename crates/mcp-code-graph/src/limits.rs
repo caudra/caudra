@@ -21,6 +21,8 @@ pub struct CodeGraphLimits {
     pub max_total_bytes: usize,
     /// Wall-clock ceiling on the crawl.
     pub crawl_deadline: Duration,
+    /// Whether the crawl applies `.gitignore` rules. Host-owned, on by default.
+    pub honor_gitignore: bool,
     /// Symbols returned when the caller names no limit.
     pub default_result_limit: usize,
     /// Symbols returned however large a limit the caller names.
@@ -43,6 +45,7 @@ impl Default for CodeGraphLimits {
             max_source_bytes: 4 * 1024 * 1024,
             max_total_bytes: 512 * 1024 * 1024,
             crawl_deadline: Duration::from_secs(60),
+            honor_gitignore: true,
             default_result_limit: 200,
             max_result_limit: 2_000,
             max_expand_bytes: 32 * 1024,

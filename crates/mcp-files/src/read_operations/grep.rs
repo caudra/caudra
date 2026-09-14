@@ -44,10 +44,7 @@ impl FilesystemCore {
             }
         })?;
         let listed = if metadata.is_file() {
-            ListedFiles {
-                paths: vec![requested.clone()],
-                truncated: false,
-            }
+            ListedFiles::single(requested.clone())
         } else {
             list_files(self, &requested, token).await?
         };
@@ -61,6 +58,8 @@ impl FilesystemCore {
         let mut glob_match_steps = self.limits.max_glob_match_steps;
         let mut scratch = MatchScratch::default();
         let files_listed = listed.paths.len();
+        let ignored = listed.ignored;
+        let ignore_complete = listed.ignore_complete;
         let mut files_scanned = 0usize;
         let mut revisions = HashMap::new();
         'files: for file in listed.paths {
@@ -127,6 +126,8 @@ impl FilesystemCore {
             files_listed,
             rows,
             truncated,
+            ignored,
+            ignore_complete,
             revisions,
         })
     }

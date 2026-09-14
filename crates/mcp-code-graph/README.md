@@ -70,12 +70,19 @@ Medians of seven runs on a 32-core Linux host against `ripwire 0.4.0`:
 | Tree | ripwire, cache warm | this, no cache | gap to close | ripwire, cache cleared |
 | --- | --- | --- | --- | --- |
 | ripwire's own C++ source, 153 files / 8.6 MB | **117 ms** | 377 ms | 3.2x | 596 ms |
-| this workspace's Rust crates, 359 files | **55 ms** | 135 ms | 2.5x | 438 ms |
+| this workspace's Rust crates, 691 files | **72 ms** | 226 ms | 3.1x | 501 ms |
 | ripwire's test corpus, 1154 small files | **103 ms** | 331 ms | 3.2x | 533 ms |
 
-Read it two ways. Against a cache we do not have, we are 2.5–3.2x behind, and closing that is what a
+Only the middle row was re-measured when repository-boundary pruning and `.gitignore` support landed;
+its tree had also grown from 359 files to 691 since the first measurement. Measured immediately
+before and after that change on the same host, the medians were 220 ms and 210 ms, so the filters are
+cost-neutral within run-to-run noise: they add one `open` per directory that has an ignore file and
+no syscall at all to detect either a boundary or an ignore file, since both are already in the
+directory scan.
+
+Read it two ways. Against a cache we do not have, we are 3.1–3.2x behind, and closing that is what a
 persistent cache would have to buy. Against the same pipeline doing the same work — the last column,
-ripwire's cache cleared before every run — we are 1.6–3.2x ahead, so the gap is the cache and not the
+ripwire's cache cleared before every run — we are 1.6–2.2x ahead, so the gap is the cache and not the
 ranking.
 
 Numbers from one host are not a portability claim, and the last column moves with page-cache state.

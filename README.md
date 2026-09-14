@@ -927,6 +927,30 @@ that carry real source in many projects. Skipping applies only to broad traversa
 these directories as the `path` searches inside it. Binary classification uses bounded content
 inspection rather than filename extensions.
 
+Broad traversal also applies the repository's own `.gitignore` rules, so a search spends its budget
+on the tree a reader cares about rather than on generated output no fixed name list can predict.
+Only per-directory `.gitignore` files inside the configured root are read. `$GIT_DIR/info/exclude` is
+unreachable, because every path carrying a `.git` component is protected, and `core.excludesFile`
+lives outside the root; neither is worked around, since a traversal filter is not a reason to widen
+what the process can open. When a search is scoped to a subdirectory, the rules its ancestors already
+imposed still apply, collected up to the enclosing repository root. The traversal root itself is
+never excluded, so naming an ignored directory as the `path` searches it. `file_glob` and `file_grep`
+report how many entries were excluded and whether every rule was read, because a result narrowed by
+ignore rules is otherwise indistinguishable from one produced by an empty tree. `--no-gitignore` or
+`WORKCELL_MCP_GITIGNORE=false` turns the whole behaviour off; it is startup configuration, and no
+tool argument can negotiate it.
+
+Pattern support covers anchoring, trailing-slash directory-only rules, `!` negation, `*`, `?`, `**`,
+bracket expressions, and backslash escapes. A line that cannot be represented exactly, such as a
+POSIX named class, is dropped rather than approximated, because a pattern that half-compiles hides
+files its author never named. Ignore-file count, per-file size, pattern count, retained pattern
+bytes, and matching work are all bounded; a bound that bites stops rule collection and is reported,
+rather than leaving a partial rule set applied as though it were complete.
+
+The traversal does not stop at a nested repository. A vendored checkout holds readable code that a
+text search should find, so `file_glob` and `file_grep` descend into it. The code graph makes the
+opposite choice for its own reasons; see [Code graph tools](#code-graph-tools).
+
 Confinement is a property of the server's constructor, not of the crate. Native hosts may opt into
 unconfined resolution, which disables both root confinement and protected-path denial; see
 [Embedding](#embedding).
@@ -1169,6 +1193,21 @@ through the same confined resolver the filesystem tools use and never opens a pa
 - `confidence` on `code_context` is derived from how far the top result separates from the rest. It
   measures separation, never correctness, and a single result is always low.
 - `path` scopes any of them to a subdirectory. Absent, or empty, means the whole configured root.
+- **A map does not cross a repository boundary its root is inside.** Ranking is global and normalized,
+  so a vendored checkout's symbols compete with the project's in one rank vector and can dominate the
+  top of a map, and its files spend a crawl budget sized for the project that was asked about. A
+  directory holding a `.git` entry — a nested clone, a submodule, or a linked worktree, since the
+  entry is a file for the latter two — is therefore not descended into. The boundary is recognized
+  from the directory's own entries, which the scan already produced, so detection costs no syscall of
+  its own. Every pruned repository is named in the result, root-relative: passing one as `path` maps
+  it on its own terms. If the configured root is not itself inside a repository there is no boundary
+  to respect, and the crawl descends normally, which is what keeps a root that merely holds a
+  checkout from mapping to nothing. `file_glob` and `file_grep` make the opposite choice and keep
+  descending, because a text search is not distorted by a foreign tree.
+- The crawl honours `.gitignore` on the same terms as the filesystem tools, and reports how many
+  files were excluded. Incomplete ignore rules are named in `truncatedBy` as `gitignore_rules`,
+  separately from a truncated scan: incomplete rules make the map a superset of the intended one,
+  while a truncated scan makes it a subset, and those are different claims.
 - Crawling, parsing, ranking, extraction worker count, and result size are bounded by host-only
   policy. A bound that fires is named in the result. Results are fitted to a 64,000-byte envelope by
   binary search over retained rows, measured on the serialized envelope rather than estimated.

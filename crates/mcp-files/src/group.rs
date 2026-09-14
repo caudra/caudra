@@ -1364,6 +1364,8 @@ mod tests {
             files_listed: 1,
             rows,
             truncated: false,
+            ignored: 0,
+            ignore_complete: true,
             revisions: Default::default(),
         };
         assert!(
@@ -1395,6 +1397,8 @@ mod tests {
             files_scanned: 1,
             files_listed: 1,
             truncated: false,
+            ignored: 0,
+            ignore_complete: true,
             revisions: Default::default(),
         };
         let structured = serde_json::to_value(&output).expect("structured output");

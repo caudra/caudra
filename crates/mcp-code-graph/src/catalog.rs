@@ -21,6 +21,7 @@ const MAP_DESCRIPTION: &str = r#"Rank every symbol in a source tree by importanc
 - Importance is personalized PageRank over a call graph recovered from source text by name.
 - Rows carry the defining file and line span, plus in/out reference counts.
 - `path` scopes the map to a subdirectory; absent, or empty, means the whole configured root.
+- The map stops at a directory that is its own repository, and at files the repository's .gitignore excludes. Anything skipped that way is named in the result; pass a nested repository as `path` to map it on its own terms.
 - Counts are FLOORS. Dynamic dispatch, callbacks, function pointers, trait objects and macro-generated call sites contribute no edge, so a count of 0 means none was found, never that none exists.
 - Crawling, parsing, ranking and result size are bounded by host-only policy, and every bound that fires is named in the result."#;
 

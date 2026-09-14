@@ -68,6 +68,7 @@ async fn fixture_server_with_options(
             proxy: ProxyConfiguration::direct(),
             shell_policy,
             shell_output_filter: true,
+            honor_gitignore: true,
             code: CodeConfiguration {
                 worker: WorkerSource::Discover {
                     bundled_cache_root: None,
@@ -816,6 +817,7 @@ async fn authenticated_snapshot_restore_is_negotiated_and_uses_the_common_ledger
             proxy: ProxyConfiguration::direct(),
             shell_policy: ShellPermissionPolicy::restricted(),
             shell_output_filter: true,
+            honor_gitignore: true,
             code: CodeConfiguration {
                 worker: WorkerSource::Discover {
                     bundled_cache_root: None,
@@ -1012,6 +1014,7 @@ async fn authenticated_snapshot_restore_is_negotiated_and_uses_the_common_ledger
             proxy: ProxyConfiguration::direct(),
             shell_policy: ShellPermissionPolicy::restricted(),
             shell_output_filter: true,
+            honor_gitignore: true,
             code: CodeConfiguration {
                 worker: WorkerSource::Discover {
                     bundled_cache_root: None,
@@ -1106,6 +1109,7 @@ async fn authenticated_remote_mutation_is_prepared_once_replayed_and_released() 
             proxy: ProxyConfiguration::direct(),
             shell_policy: ShellPermissionPolicy::restricted(),
             shell_output_filter: true,
+            honor_gitignore: true,
             code: CodeConfiguration {
                 worker: WorkerSource::Discover {
                     bundled_cache_root: None,
@@ -1329,6 +1333,7 @@ async fn authenticated_scm_is_negotiated_structured_and_uses_the_common_ledger()
             proxy: ProxyConfiguration::direct(),
             shell_policy: ShellPermissionPolicy::restricted(),
             shell_output_filter: true,
+            honor_gitignore: true,
             code: CodeConfiguration {
                 worker: WorkerSource::Discover {
                     bundled_cache_root: None,
@@ -1529,6 +1534,7 @@ async fn authenticated_workspace_operations_bind_cursors_mutations_and_direct_ex
             proxy: ProxyConfiguration::direct(),
             shell_policy: policy,
             shell_output_filter: false,
+            honor_gitignore: true,
             code: CodeConfiguration {
                 worker: WorkerSource::Discover {
                     bundled_cache_root: None,
@@ -1964,6 +1970,7 @@ async fn authenticated_watch_replays_changes_and_assets_remain_allowlisted_bytes
             proxy: ProxyConfiguration::direct(),
             shell_policy: ShellPermissionPolicy::restricted(),
             shell_output_filter: true,
+            honor_gitignore: true,
             code: CodeConfiguration {
                 worker: WorkerSource::Discover {
                     bundled_cache_root: None,
@@ -2909,6 +2916,7 @@ async fn stdio_serves_the_full_catalog_including_python_execution() {
             proxy: ProxyConfiguration::direct(),
             shell_policy: ShellPermissionPolicy::restricted(),
             shell_output_filter: true,
+            honor_gitignore: true,
             code: CodeConfiguration {
                 worker: WorkerSource::Path(&worker),
                 type_check: true,
@@ -3013,6 +3021,7 @@ async fn write_authority_decides_whether_mutation_tools_exist_at_all() {
                 proxy: ProxyConfiguration::direct(),
                 shell_policy: ShellPermissionPolicy::restricted(),
                 shell_output_filter: true,
+                honor_gitignore: true,
                 code: CodeConfiguration {
                     worker: WorkerSource::Discover {
                         bundled_cache_root: None,
@@ -3078,6 +3087,7 @@ async fn transfer_tools_mint_urls_that_the_files_route_serves_under_the_same_cre
             proxy: ProxyConfiguration::direct(),
             shell_policy: ShellPermissionPolicy::restricted(),
             shell_output_filter: true,
+            honor_gitignore: true,
             code: CodeConfiguration {
                 worker: WorkerSource::Discover {
                     bundled_cache_root: None,
