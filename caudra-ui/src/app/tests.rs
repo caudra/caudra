@@ -3544,6 +3544,9 @@ fn scroll_shortcuts_toggle_auto_scroll() {
     assert!(app.chats[0].auto_scroll());
 }
 
+const RESUME_PINS_BOTTOM: &str = "resuming must put the transcript back on its last line";
+const RESUME_NEEDS_SCROLLBACK: &str = "the transcript must outgrow its viewport to scroll at all";
+
 const TRANSCRIPT_LINES: usize = 50;
 const TRANSCRIPT_AREA: Rect = Rect {
     x: 0,
@@ -4903,6 +4906,94 @@ fn opening_model_picker_clears_footer_hover() {
 
     assert!(app.model_picker.is_open());
     assert_eq!(app.status_hover, None);
+}
+
+/// The label is drawn only while the transcript has stopped following, so the
+/// click that resumes it also takes the control away.
+#[test]
+fn clicking_the_paused_footer_resumes_auto_scroll() {
+    let mut app = test_app();
+    fill_transcript(&mut app);
+    let _ = rendered(&mut app);
+    let bottom = app.active_chat().scroll_top();
+    assert!(bottom > 0, "{RESUME_NEEDS_SCROLLBACK}");
+
+    app.update(Msg::Key(kb::SCROLL_TOP.to_key_event()));
+    assert!(!app.chats[0].auto_scroll());
+    let hit = status_hit(&mut app, StatusBarHitTarget::ResumeAutoScroll);
+    app.update(mouse_event(MouseEventKind::Moved, hit.area.x, hit.area.y));
+    assert_eq!(app.status_hover, Some(StatusBarHitTarget::ResumeAutoScroll));
+
+    assert!(click_status(&mut app, StatusBarHitTarget::ResumeAutoScroll).is_empty());
+
+    assert!(app.chats[0].auto_scroll());
+    assert_eq!(app.status_hover, None);
+    let _ = rendered(&mut app);
+    assert_eq!(
+        app.active_chat().scroll_top(),
+        bottom,
+        "{RESUME_PINS_BOTTOM}"
+    );
+    assert!(
+        app.status_hits
+            .iter()
+            .all(|hit| hit.target != StatusBarHitTarget::ResumeAutoScroll)
+    );
+}
+
+#[test]
+fn a_resumed_transcript_follows_new_output() {
+    let mut app = test_app();
+    fill_transcript(&mut app);
+    app.update(Msg::Key(kb::SCROLL_TOP.to_key_event()));
+    click_status(&mut app, StatusBarHitTarget::ResumeAutoScroll);
+    let _ = rendered(&mut app);
+    let bottom = app.active_chat().scroll_top();
+
+    app.active_chat()
+        .push(DisplayMessage::new(DisplayRole::User, "one more".into()));
+    let _ = rendered(&mut app);
+
+    assert!(app.active_chat().scroll_top() > bottom);
+}
+
+/// A task transcript pauses on its own, so resuming it must leave the main
+/// chat waiting behind it exactly as it was.
+#[test]
+fn a_subagent_footer_resumes_only_its_own_transcript() {
+    let mut app = read_only_task_app();
+    fill_transcript(&mut app);
+    app.update(Msg::Key(kb::SCROLL_TOP.to_key_event()));
+    assert!(!app.chats[app.active_chat].auto_scroll());
+    let main_scroll = app.chats[0].scroll_top();
+
+    click_status(&mut app, StatusBarHitTarget::ResumeAutoScroll);
+
+    assert!(app.chats[app.active_chat].auto_scroll());
+    assert_eq!(app.chats[0].scroll_top(), main_scroll);
+}
+
+/// A press that leaves the label before it is released is not a click, so the
+/// transcript stays where the reader put it.
+#[test]
+fn releasing_off_the_resume_control_leaves_the_transcript_paused() {
+    let mut app = test_app();
+    fill_transcript(&mut app);
+    app.update(Msg::Key(kb::SCROLL_TOP.to_key_event()));
+    let hit = status_hit(&mut app, StatusBarHitTarget::ResumeAutoScroll);
+
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        hit.area.x,
+        hit.area.y,
+    ));
+    app.update(mouse_event(
+        MouseEventKind::Up(MouseButton::Left),
+        hit.area.right(),
+        hit.area.y,
+    ));
+
+    assert!(!app.chats[0].auto_scroll());
 }
 
 /// The footer draws no price until a turn has been billed, and no price means

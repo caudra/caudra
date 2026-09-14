@@ -1009,6 +1009,13 @@ impl App {
                 self.clear_control_hovers();
                 self.execute_workflow("")
             }
+            // The label goes as soon as the transcript follows again, so the
+            // hover it was drawn under has nothing left to sit on.
+            StatusBarHitTarget::ResumeAutoScroll => {
+                self.clear_control_hovers();
+                self.active_chat().enable_auto_scroll();
+                Vec::new()
+            }
             // The countdown is cleared here rather than left to the next event:
             // the agent may spend a moment on the request, and a chip stuck at
             // "retrying in 0s" reads like the click missed.

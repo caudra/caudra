@@ -34,6 +34,8 @@ const WORKFLOW_PHASE_SEPARATOR: &str = " \u{b7} ";
 const WORKFLOW_SUFFIX: &str = "]";
 const YOLO_LABEL: &str = " [yolo]";
 const YOLO_SHORT_LABEL: &str = " [!]";
+/// Says the transcript has stopped following, and clicking it starts again.
+const AUTO_SCROLL_PAUSED_LABEL: &str = "auto-scroll paused";
 /// A level narrower than this is already its own shortest unambiguous form, so
 /// squeezing it would trade legibility for a single column.
 const THINKING_SHORT_FLOOR: usize = 4;
@@ -142,6 +144,7 @@ pub enum StatusBarHitTarget {
     Retry,
     ChatName,
     Cwd,
+    ResumeAutoScroll,
 }
 
 impl StatusBarHitTarget {
@@ -159,7 +162,8 @@ impl StatusBarHitTarget {
             | Self::Usage
             | Self::Retry
             | Self::ChatName
-            | Self::Cwd => ChatScope::Any,
+            | Self::Cwd
+            | Self::ResumeAutoScroll => ChatScope::Any,
             Self::Mode | Self::Model | Self::Thinking | Self::Goal | Self::Workflows => {
                 ChatScope::MainOnly
             }
@@ -831,12 +835,18 @@ impl StatusBar {
             }
         }
 
-        if !ctx.auto_scroll {
+        let mut resume_hit = (!ctx.auto_scroll).then(|| {
+            let offset = left_spans.iter().map(Span::width).sum::<usize>() + " ".width();
+            left_spans.push(Span::raw(" "));
             left_spans.push(Span::styled(
-                " auto-scroll paused",
-                theme::current().status_dim,
+                AUTO_SCROLL_PAUSED_LABEL,
+                hover_style(
+                    theme::current().status_dim,
+                    ctx.hovered == Some(StatusBarHitTarget::ResumeAutoScroll),
+                ),
             ));
-        }
+            (offset, AUTO_SCROLL_PAUSED_LABEL.width())
+        });
 
         let mut goal_hit = ctx.goal.map(|goal| {
             let label = format!(
@@ -900,6 +910,8 @@ impl StatusBar {
             mode_width = ctx.mode.short().width();
             back_offset = back_offset.map(|offset| offset.saturating_sub(short_saving));
             chat_hit = chat_hit.map(|(offset, width)| (offset.saturating_sub(short_saving), width));
+            resume_hit =
+                resume_hit.map(|(offset, width)| (offset.saturating_sub(short_saving), width));
             goal_hit = goal_hit.map(|(offset, width)| (offset.saturating_sub(short_saving), width));
             retry_hit =
                 retry_hit.map(|(offset, width)| (offset.saturating_sub(short_saving), width));
@@ -988,6 +1000,16 @@ impl StatusBar {
                 offset,
                 width,
                 StatusBarHitTarget::ChatName,
+            );
+        }
+        if let Some((offset, width)) = resume_hit {
+            push_hit(
+                &mut hits,
+                ctx,
+                left_area,
+                offset,
+                width,
+                StatusBarHitTarget::ResumeAutoScroll,
             );
         }
         self.marquee.finish_frame();
@@ -1585,6 +1607,15 @@ mod tests {
     const RETRY_COUNTDOWN_PREFIX: &str = "retrying in";
     const RETRY_ATTEMPT_MARK: &str = "(#3)";
     const MISSING_RETRY_HIT_MSG: &str = "a visible retry countdown must be clickable";
+    const MISSING_RESUME_HIT_MSG: &str = "a paused transcript must be resumable from the footer";
+    const UNCLICKABLE_LABEL_MSG: &str = "the bar drew the resume label without a hit to click it";
+
+    fn resume_glyphs(text: &str, hit: &StatusBarHit) -> String {
+        text.chars()
+            .skip(usize::from(hit.area.x))
+            .take(usize::from(hit.area.width))
+            .collect()
+    }
 
     fn active_goal() -> GoalSnapshot {
         caudra_agent::GoalHandle::default()
@@ -1648,6 +1679,7 @@ mod tests {
         model_id: &'a str,
         pending_model: Option<&'a str>,
         chat_name: Option<&'a str>,
+        auto_scroll: bool,
     }
 
     impl Default for Fixture<'_> {
@@ -1666,6 +1698,7 @@ mod tests {
                 model_id: MODEL_ID,
                 pending_model: None,
                 chat_name: None,
+                auto_scroll: true,
             }
         }
     }
@@ -1685,6 +1718,7 @@ mod tests {
             model_id,
             pending_model,
             chat_name,
+            auto_scroll,
         } = fixture;
         let mut bar = StatusBar::new(FLASH_TTL, ".", false);
         let mut terminal =
@@ -1708,7 +1742,7 @@ mod tests {
                 compaction_border: None,
                 show_global,
             },
-            auto_scroll: true,
+            auto_scroll,
             chat_name,
             main_chat,
             retry_info,
@@ -2502,6 +2536,103 @@ mod tests {
         assert!(chip.starts_with(GOAL_CHIP_PREFIX), "{chip}");
         assert!(chip.ends_with(']'), "{chip}");
         assert_eq!(text.chars().nth(usize::from(hit.area.x) - 1), Some(' '));
+    }
+
+    /// The label is the whole control: the space ahead of it separates it from
+    /// whatever the bar drew last and must not answer the pointer.
+    #[test]
+    fn a_paused_transcript_offers_a_resume_control() {
+        let (text, hits, _) = render_at(Fixture {
+            auto_scroll: false,
+            ..Default::default()
+        });
+        let hit = hits
+            .iter()
+            .find(|hit| hit.target == StatusBarHitTarget::ResumeAutoScroll)
+            .expect(MISSING_RESUME_HIT_MSG);
+
+        assert_eq!(resume_glyphs(&text, hit), AUTO_SCROLL_PAUSED_LABEL);
+        assert_eq!(text.chars().nth(usize::from(hit.area.x) - 1), Some(' '));
+        assert!(hit.target.accepts_click());
+    }
+
+    #[test]
+    fn a_following_transcript_has_no_resume_control() {
+        let (text, hits, _) = render_at(Fixture::default());
+
+        assert!(!text.contains(AUTO_SCROLL_PAUSED_LABEL));
+        assert!(
+            hits.iter()
+                .all(|hit| hit.target != StatusBarHitTarget::ResumeAutoScroll)
+        );
+    }
+
+    /// A squeezed bar shortens the mode label the resume label is measured
+    /// from, so the hit has to travel with the glyphs. A bar too narrow to
+    /// draw the label whole offers nothing to click instead of a clipped
+    /// target that lies about what it covers.
+    #[test_case(20        ; "too_narrow_to_draw_the_label")]
+    #[test_case(24        ; "shortened_mode")]
+    #[test_case(30        ; "full_mode")]
+    #[test_case(36        ; "shortened_mode_beside_the_model")]
+    #[test_case(60        ; "roomy")]
+    #[test_case(BAR_WIDTH ; "wide")]
+    fn a_resume_hit_tracks_the_label_it_was_drawn_on(width: u16) {
+        let (text, hits, _) = render_at(Fixture {
+            width,
+            auto_scroll: false,
+            ..Default::default()
+        });
+
+        match hits
+            .iter()
+            .find(|hit| hit.target == StatusBarHitTarget::ResumeAutoScroll)
+        {
+            Some(hit) => assert_eq!(resume_glyphs(&text, hit), AUTO_SCROLL_PAUSED_LABEL),
+            None => assert!(
+                !text.contains(AUTO_SCROLL_PAUSED_LABEL),
+                "{UNCLICKABLE_LABEL_MSG}"
+            ),
+        }
+    }
+
+    #[test]
+    fn hovering_the_resume_control_highlights_its_label_alone() {
+        let (_, hits, styles) = render_at(Fixture {
+            auto_scroll: false,
+            hovered: Some(StatusBarHitTarget::ResumeAutoScroll),
+            ..Default::default()
+        });
+        let hit = hits
+            .iter()
+            .find(|hit| hit.target == StatusBarHitTarget::ResumeAutoScroll)
+            .expect(MISSING_RESUME_HIT_MSG);
+        let start = usize::from(hit.area.x);
+        let end = usize::from(hit.area.right());
+
+        assert!(!styles[start - 1].add_modifier.contains(Modifier::REVERSED));
+        assert!(
+            styles[start..end]
+                .iter()
+                .all(|style| style.add_modifier.contains(Modifier::REVERSED))
+        );
+    }
+
+    /// A task transcript pauses and resumes on its own, so the control is not
+    /// one of the session settings a subagent chat draws inert.
+    #[test]
+    fn a_subagent_transcript_resumes_from_its_own_footer() {
+        let (_, hits, _) = render_at(Fixture {
+            auto_scroll: false,
+            main_chat: false,
+            ..Default::default()
+        });
+
+        assert_eq!(StatusBarHitTarget::ResumeAutoScroll.scope(), ChatScope::Any);
+        assert!(
+            hits.iter()
+                .any(|hit| hit.target == StatusBarHitTarget::ResumeAutoScroll)
+        );
     }
 
     #[test]
