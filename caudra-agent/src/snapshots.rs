@@ -1090,7 +1090,15 @@ impl SnapshotStore {
             };
 
             let read_start = Instant::now();
-            let bytes = fs::read(&file.absolute)?;
+            // The walk and the read are separate passes over a working tree
+            // nothing has frozen, so a file can be gone by the time its turn
+            // comes. It is then simply not in the snapshot; failing the whole
+            // capture would let any concurrent build or editor break it.
+            let bytes = match fs::read(&file.absolute) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
             let hash = self.hasher.hash(&bytes);
             part.hash += read_start.elapsed();
             part.bytes += bytes.len() as u64;
@@ -2136,6 +2144,34 @@ mod tests {
             .find(|outcome| outcome.path == path)
             .unwrap()
             .kind
+    }
+
+    fn walked(root: &Path, relative: &str) -> WalkedFile {
+        let absolute = root.join(relative);
+        WalkedFile {
+            relative: relative.to_owned(),
+            metadata: fs::metadata(&absolute).unwrap(),
+            absolute,
+        }
+    }
+
+    /// The walk lists what to hash and the read hashes it, with nothing holding
+    /// the tree still in between. A build or an editor clearing a file in that
+    /// window must cost the capture that one file, not all of it.
+    #[test]
+    fn a_file_deleted_between_the_walk_and_the_read_is_left_out() {
+        let (_temp, root, snapshots) = setup();
+        write(&root, "kept.txt", ALPHA);
+        write(&root, "vanishes.txt", BETA);
+        let store = SnapshotStore::new(snapshots);
+        store.ensure_dirs().unwrap();
+        let files = [walked(&root, "kept.txt"), walked(&root, "vanishes.txt")];
+        fs::remove_file(root.join("vanishes.txt")).unwrap();
+
+        let part = store.read_claimed(&files, &AtomicUsize::new(0)).unwrap();
+
+        let captured: Vec<_> = part.entries.iter().map(|(path, _)| path.as_str()).collect();
+        assert_eq!(captured, ["kept.txt"]);
     }
 
     #[test]
