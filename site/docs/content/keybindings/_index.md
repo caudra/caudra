@@ -162,6 +162,7 @@ Some pickers add extra bindings on top of the defaults:
 | Session Picker | `F3` | Migrate directory sessions |
 | Session Relocation | `Ctrl+O` | Enter a custom destination directory |
 | Session Relocation | `Ctrl+R` | Change relocation source or destination selection |
+| Session Relocation | `Space` | Toggle the selected historical project usage row in bulk confirmation |
 | Session Picker | `Ctrl+R` | Rename session |
 | Session Picker | `Ctrl+G` | Generate session title |
 | Session Picker | `Ctrl+D` | Delete session (press twice) |

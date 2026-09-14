@@ -45,6 +45,14 @@ const FILES_UNCHANGED: &str =
 const CLOSING_LABEL: &str = "Other open tabs to save and close";
 const AFFECTED_LABEL: &str = "Affected sessions";
 const DESTINATIONS_LABEL: &str = "destinations";
+const PROJECT_USAGE: &str = "Include historical project usage";
+const PROJECT_USAGE_SCOPE: &str = "ALL recorded lifetime usage under the exact source cwd, including forgotten and ephemeral sessions.";
+const PROJECT_USAGE_AGGREGATED: &str =
+    "The ledger is historically aggregated; individual session contributions cannot be selected.";
+const PROJECT_USAGE_PRECONDITION: &str = "Before confirming with usage included, close OTHER processes using the source, including ephemeral processes.";
+const PROJECT_USAGE_UNCHANGED: &str = "Lifetime project usage attribution will stay unchanged.";
+const SESSION_USAGE_UNCHANGED: &str =
+    "This session retains its own counters. Lifetime project usage attribution stays unchanged.";
 
 #[derive(Debug)]
 pub enum SessionRelocationAction {
@@ -57,6 +65,7 @@ enum EntryKind {
     Source(String),
     Destination(CaudraId, String),
     Custom,
+    ProjectUsage,
     Confirm,
 }
 
@@ -89,6 +98,7 @@ struct Flow {
     locations: Vec<SessionLocation>,
     source_cwd: Option<String>,
     other_open_count: usize,
+    include_project_usage: bool,
     stage: Stage,
 }
 
@@ -123,6 +133,7 @@ impl SessionRelocationPicker {
             current_cwd,
             locations,
             other_open_count,
+            include_project_usage: bulk,
             stage: Stage::Destination,
         });
         if bulk {
@@ -211,10 +222,28 @@ impl SessionRelocationPicker {
                     self.show_custom(destination);
                     return SessionRelocationAction::Consumed;
                 }
-                if event.code == KeyCode::Enter {
-                    return self.confirm();
+                if key::RELOCATION_USAGE.matches(event) {
+                    if self
+                        .picker
+                        .selected_item()
+                        .is_some_and(|entry| matches!(entry.kind, EntryKind::ProjectUsage))
+                    {
+                        self.toggle_project_usage();
+                    }
+                    return SessionRelocationAction::Consumed;
                 }
-                return SessionRelocationAction::Consumed;
+                if !matches!(
+                    event.code,
+                    KeyCode::Enter
+                        | KeyCode::Up
+                        | KeyCode::Down
+                        | KeyCode::PageUp
+                        | KeyCode::PageDown
+                        | KeyCode::Home
+                        | KeyCode::End
+                ) {
+                    return SessionRelocationAction::Consumed;
+                }
             }
             Stage::Destination if key::RELOCATION_CUSTOM.matches(event) => {
                 self.show_custom(String::new());
@@ -403,6 +432,7 @@ impl SessionRelocationPicker {
                 sessions,
                 source_cwd: flow.source_cwd.clone(),
                 destination,
+                include_project_usage: flow.include_project_usage,
             })
         });
         let request = match result {
@@ -413,6 +443,19 @@ impl SessionRelocationPicker {
                 return;
             }
         };
+        if let Some(flow) = &mut self.flow {
+            flow.stage = Stage::Confirm(request, donor);
+        }
+        self.show_confirmation();
+    }
+
+    fn show_confirmation(&mut self) {
+        let Some(flow) = &self.flow else {
+            return;
+        };
+        let Stage::Confirm(request, _) = &flow.stage else {
+            return;
+        };
         let source = request
             .source_cwd
             .as_deref()
@@ -422,24 +465,65 @@ impl SessionRelocationPicker {
         } else {
             flow.other_open_count
         };
-        let info = format!(
+        let mut info = format!(
             "Source: {source}\nDestination: {}\n{AFFECTED_LABEL}: {}\n{CLOSING_LABEL}: {closing}\n{FILES_UNCHANGED}",
             request.destination,
             request.sessions.len(),
         );
-        if let Some(flow) = &mut self.flow {
-            flow.stage = Stage::Confirm(request, donor);
+        let mut items = Vec::new();
+        if request.source_cwd.is_some() {
+            info.push_str(&format!(
+                "\n{PROJECT_USAGE_SCOPE}\n{PROJECT_USAGE_AGGREGATED}\n{}",
+                if request.include_project_usage {
+                    PROJECT_USAGE_PRECONDITION
+                } else {
+                    PROJECT_USAGE_UNCHANGED
+                }
+            ));
+            items.push(Entry {
+                label: format!(
+                    "[{}] {PROJECT_USAGE} ({} toggles this row)",
+                    if request.include_project_usage {
+                        "x"
+                    } else {
+                        " "
+                    },
+                    key::RELOCATION_USAGE.label,
+                ),
+                kind: EntryKind::ProjectUsage,
+            });
+        } else {
+            info.push_str(&format!("\n{SESSION_USAGE_UNCHANGED}"));
         }
+        items.push(Entry {
+            label: CONFIRM.into(),
+            kind: EntryKind::Confirm,
+        });
         self.picker.set_error_text(None);
         self.picker.set_info_text(Some(info));
         self.picker.set_footer_builder(confirm_footer);
-        self.picker.open(
-            vec![Entry {
-                label: CONFIRM.into(),
-                kind: EntryKind::Confirm,
-            }],
-            CONFIRM_TITLE,
-        );
+        self.picker.open(items, CONFIRM_TITLE);
+        self.picker
+            .select_item_by(|entry| matches!(entry.kind, EntryKind::Confirm));
+    }
+
+    fn toggle_project_usage(&mut self) {
+        let Some(Flow {
+            stage: Stage::Confirm(request, _),
+            include_project_usage,
+            ..
+        }) = &mut self.flow
+        else {
+            return;
+        };
+        if request.source_cwd.is_none() {
+            return;
+        }
+        *include_project_usage = !*include_project_usage;
+        request.include_project_usage = *include_project_usage;
+        self.show_confirmation();
+        self.picker
+            .select_item_by(|entry| matches!(entry.kind, EntryKind::ProjectUsage));
     }
 
     fn confirm(&mut self) -> SessionRelocationAction {
@@ -479,6 +563,7 @@ impl SessionRelocationPicker {
                 }
                 EntryKind::Destination(id, cwd) => self.preview(cwd.clone(), Some((id, cwd))),
                 EntryKind::Custom => self.show_custom(String::new()),
+                EntryKind::ProjectUsage => self.toggle_project_usage(),
                 EntryKind::Confirm => return self.confirm(),
             },
             PickerAction::Consumed | PickerAction::Toggle(..) => {}
@@ -559,8 +644,9 @@ fn custom_footer() -> Line<'static> {
 
 fn confirm_footer() -> Line<'static> {
     hint_line(&[
-        ("Enter", "confirm"),
-        (key::RENAME_SESSION.label, "change selection"),
+        ("↑↓", "select"),
+        ("Enter", "activate"),
+        (key::RENAME_SESSION.label, "selection"),
         ("Tab", DESTINATIONS_LABEL),
         (key::RELOCATION_CUSTOM.label, "directory"),
         ("Esc", "cancel"),
@@ -586,8 +672,10 @@ mod tests {
     use super::{
         AFFECTED_LABEL, CANNOT_OPEN, CLOSING_LABEL, CONFIRM, CUSTOM_DIRECTORY, DESTINATIONS_LABEL,
         EMPTY_DESTINATION, EMPTY_SELECTION, EntryKind, FILES_UNCHANGED, MISSING_HOME,
-        NOT_DIRECTORY, SAME_DIRECTORY, SessionRelocationAction, SessionRelocationPicker, Stage,
-        UNSUPPORTED_TILDE, resolve_destination,
+        NOT_DIRECTORY, PROJECT_USAGE, PROJECT_USAGE_AGGREGATED, PROJECT_USAGE_PRECONDITION,
+        PROJECT_USAGE_SCOPE, PROJECT_USAGE_UNCHANGED, SAME_DIRECTORY, SESSION_USAGE_UNCHANGED,
+        SessionRelocationAction, SessionRelocationPicker, Stage, UNSUPPORTED_TILDE,
+        resolve_destination,
     };
     use crate::components::keybindings::key;
 
@@ -653,6 +741,10 @@ mod tests {
     }
 
     fn render(picker: &mut SessionRelocationPicker) -> (String, Position) {
+        render_hit(picker, CONFIRM)
+    }
+
+    fn render_hit(picker: &mut SessionRelocationPicker, label: &str) -> (String, Position) {
         let mut terminal = Terminal::new(TestBackend::new(SCREEN_WIDTH, SCREEN_HEIGHT)).unwrap();
         terminal
             .draw(|frame| {
@@ -666,13 +758,30 @@ mod tests {
             let line: String = (0..SCREEN_WIDTH)
                 .map(|x| buffer.cell((x, y)).unwrap().symbol())
                 .collect();
-            if let Some(x) = line.find(CONFIRM) {
+            if let Some(x) = line.find(label) {
                 confirm = Position::new(line[..x].chars().count() as u16, y);
             }
             text.push_str(line.trim_end());
             text.push('\n');
         }
         (text, confirm)
+    }
+
+    fn click(picker: &mut SessionRelocationPicker, position: Position) -> SessionRelocationAction {
+        let event = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: position.x,
+            row: position.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(matches!(
+            picker.handle_mouse(event),
+            SessionRelocationAction::Consumed
+        ));
+        picker.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            ..event
+        })
     }
 
     #[test_case("target with spaces", "target with spaces"; "relative_spaces")]
@@ -768,6 +877,12 @@ mod tests {
         let mut picker = opened(root.path(), false, Some(destination.clone()));
         let (text, confirm) = render(&mut picker);
         assert!(text.contains(FILES_UNCHANGED));
+        assert!(text.contains(SESSION_USAGE_UNCHANGED));
+        assert!(!text.contains(PROJECT_USAGE));
+        assert!(matches!(
+            picker.handle_key(key::RELOCATION_USAGE.to_key_event()),
+            SessionRelocationAction::Consumed
+        ));
         assert!(text.contains(&format!("{CLOSING_LABEL}: {OTHER_OPEN_COUNT}")));
         assert!(text.contains(&format!("{AFFECTED_LABEL}: 1")));
         assert!(picker.contains(confirm));
@@ -797,6 +912,7 @@ mod tests {
             vec![location(CURRENT, &root.path().join(SOURCE))]
         );
         assert_eq!(request.source_cwd, None);
+        assert!(!request.include_project_usage);
         assert_eq!(request.destination, destination);
         assert_eq!(donor, None);
         assert!(!picker.is_open());
@@ -875,7 +991,193 @@ mod tests {
         };
         assert_eq!(request.sessions, vec![expected]);
         assert_eq!(request.source_cwd.as_deref(), old.to_str());
+        assert!(request.include_project_usage);
         assert!(!old.exists());
+    }
+
+    #[test_case(KeyCode::Char(' '), false; "space")]
+    #[test_case(KeyCode::Enter, false; "enter")]
+    #[test_case(KeyCode::Enter, true; "mouse")]
+    fn bulk_usage_can_be_excluded_before_confirmation(code: KeyCode, mouse: bool) {
+        let root = workspace();
+        let mut picker = opened(
+            root.path(),
+            true,
+            Some(path_string(&root.path().join(TARGET))),
+        );
+        picker.handle_key(press(KeyCode::Enter));
+        let (text, usage) = render_hit(&mut picker, PROJECT_USAGE);
+        assert!(text.contains(&format!("[x] {PROJECT_USAGE}")));
+        assert!(text.contains(PROJECT_USAGE_SCOPE));
+        assert!(text.contains(PROJECT_USAGE_AGGREGATED));
+        assert!(text.contains(PROJECT_USAGE_PRECONDITION));
+        assert!(text.contains(key::RELOCATION_USAGE.label));
+        assert!(!text.contains(SESSION_USAGE_UNCHANGED));
+        let action = if mouse {
+            click(&mut picker, usage)
+        } else {
+            picker.handle_key(press(KeyCode::Up));
+            picker.handle_key(press(code))
+        };
+        assert!(matches!(action, SessionRelocationAction::Consumed));
+        let (text, confirm) = render(&mut picker);
+        assert!(text.contains(&format!("[ ] {PROJECT_USAGE}")));
+        assert!(text.contains(PROJECT_USAGE_UNCHANGED));
+        assert!(!text.contains(PROJECT_USAGE_PRECONDITION));
+        let action = if mouse {
+            click(&mut picker, confirm)
+        } else {
+            picker.handle_key(press(KeyCode::Down));
+            picker.handle_key(press(KeyCode::Enter))
+        };
+        let SessionRelocationAction::Confirm(request, None) = action else {
+            panic!("{action:?}")
+        };
+        assert!(!request.include_project_usage);
+        assert_eq!(request.sessions.len(), 2);
+        assert_eq!(
+            request.source_cwd,
+            Some(path_string(&root.path().join(SOURCE)))
+        );
+        assert!(!picker.is_open());
+    }
+
+    #[test_case(1; "up")]
+    #[test_case(-1; "down")]
+    fn scrolling_cancels_a_pressed_usage_toggle(delta: i32) {
+        let root = workspace();
+        let mut picker = opened(
+            root.path(),
+            true,
+            Some(path_string(&root.path().join(TARGET))),
+        );
+        picker.handle_key(press(KeyCode::Enter));
+        let (_, usage) = render_hit(&mut picker, PROJECT_USAGE);
+        let event = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: usage.x,
+            row: usage.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        picker.handle_mouse(event);
+        picker.scroll(delta);
+        assert!(matches!(
+            picker.handle_mouse(MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                ..event
+            }),
+            SessionRelocationAction::Consumed
+        ));
+        assert!(
+            render(&mut picker)
+                .0
+                .contains(&format!("[x] {PROJECT_USAGE}"))
+        );
+        picker.handle_key(press(KeyCode::End));
+        let SessionRelocationAction::Confirm(request, _) = picker.handle_key(press(KeyCode::Enter))
+        else {
+            panic!()
+        };
+        assert!(request.include_project_usage);
+    }
+
+    #[test_case(false; "opt_out")]
+    #[test_case(true; "opt_back_in")]
+    fn bulk_usage_choice_survives_source_destination_and_custom_navigation(include: bool) {
+        let root = workspace();
+        let destination = path_string(&root.path().join(TARGET));
+        let mut picker = opened(root.path(), true, Some(destination));
+        let replacement = location(CHILD, &root.path().join(HOME));
+        picker
+            .flow
+            .as_mut()
+            .unwrap()
+            .locations
+            .push(replacement.clone());
+        picker.handle_key(press(KeyCode::Enter));
+        picker.handle_key(press(KeyCode::Up));
+        picker.handle_key(key::RELOCATION_USAGE.to_key_event());
+        if include {
+            picker.handle_key(key::RELOCATION_USAGE.to_key_event());
+        }
+        picker.handle_key(key::RENAME_SESSION.to_key_event());
+        picker.picker.select_item_by(
+            |entry| matches!(&entry.kind, EntryKind::Source(cwd) if *cwd == replacement.cwd),
+        );
+        picker.handle_key(press(KeyCode::Enter));
+        picker.handle_key(key::RELOCATION_CUSTOM.to_key_event());
+        picker.handle_key(key::RENAME_SESSION.to_key_event());
+        picker.handle_key(press(KeyCode::Enter));
+        picker.handle_key(key::RELOCATION_CUSTOM.to_key_event());
+        picker.handle_key(press(KeyCode::Tab));
+        picker.handle_key(key::RELOCATION_CUSTOM.to_key_event());
+        picker.handle_paste(&path_string(&root.path().join(OLD)));
+        picker.handle_key(press(KeyCode::Enter));
+        assert!(picker.picker.error_text().unwrap().starts_with(CANNOT_OPEN));
+        picker.handle_key(press(KeyCode::Tab));
+        let donor = location(DONOR, &root.path().join(TARGET));
+        picker.picker.select_item_by(
+            |entry| matches!(&entry.kind, EntryKind::Destination(id, _) if *id == donor.id),
+        );
+        picker.handle_key(press(KeyCode::Enter));
+        let text = render(&mut picker).0;
+        assert_eq!(text.contains(PROJECT_USAGE_PRECONDITION), include);
+        let SessionRelocationAction::Confirm(request, selected) =
+            picker.handle_key(press(KeyCode::Enter))
+        else {
+            panic!()
+        };
+        assert_eq!(request.include_project_usage, include);
+        assert_eq!(request.source_cwd.as_ref(), Some(&replacement.cwd));
+        assert_eq!(request.sessions, vec![replacement]);
+        assert_eq!(selected, Some((donor.id, donor.cwd)));
+    }
+
+    #[test_case(false, false; "confirmed_then_single")]
+    #[test_case(false, true; "confirmed_then_bulk")]
+    #[test_case(true, false; "cancelled_then_single")]
+    #[test_case(true, true; "cancelled_then_bulk")]
+    fn new_flow_resets_usage_choice(cancel: bool, bulk: bool) {
+        let root = workspace();
+        let destination = path_string(&root.path().join(TARGET));
+        let mut picker = opened(root.path(), true, Some(destination.clone()));
+        picker.handle_key(press(KeyCode::Enter));
+        picker.handle_key(press(KeyCode::Up));
+        picker.handle_key(key::RELOCATION_USAGE.to_key_event());
+        picker.handle_key(press(KeyCode::Down));
+        let action = picker.handle_key(press(if cancel { KeyCode::Esc } else { KeyCode::Enter }));
+        if cancel {
+            assert!(matches!(action, SessionRelocationAction::Closed));
+        } else {
+            assert!(
+                matches!(action, SessionRelocationAction::Confirm(request, _) if !request.include_project_usage)
+            );
+        }
+        assert!(!picker.is_open());
+        assert!(matches!(
+            picker.handle_key(press(KeyCode::Enter)),
+            SessionRelocationAction::Consumed
+        ));
+        let current = location(CURRENT, &root.path().join(SOURCE));
+        picker.open(
+            current.id,
+            current.cwd.clone(),
+            vec![current],
+            bulk,
+            Some(destination),
+            OTHER_OPEN_COUNT,
+        );
+        if bulk {
+            picker.handle_key(press(KeyCode::Enter));
+        }
+        let text = render(&mut picker).0;
+        assert_eq!(text.contains(&format!("[x] {PROJECT_USAGE}")), bulk);
+        let SessionRelocationAction::Confirm(request, None) =
+            picker.handle_key(press(KeyCode::Enter))
+        else {
+            panic!()
+        };
+        assert_eq!(request.include_project_usage, bulk);
     }
 
     #[test_case(false; "current")]

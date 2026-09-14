@@ -124,6 +124,10 @@ pub enum SessionError {
     RelocationBlocked { id: CaudraId, reason: &'static str },
     #[error("session relocation requires an absolute local destination directory")]
     InvalidRelocationDestination,
+    #[error("project usage relocation requires an absolute local source directory")]
+    InvalidRelocationSource,
+    #[error("including project usage requires a full source-directory relocation")]
+    ProjectUsageRequiresSource,
     #[error("session relocation requires persistent storage")]
     RelocationUnavailable,
 }
@@ -541,6 +545,19 @@ pub struct SessionRelocation {
     pub sessions: Vec<SessionLocation>,
     pub source_cwd: Option<String>,
     pub destination: String,
+    pub include_project_usage: bool,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ProjectUsageRelocation {
+    pub buckets_moved: usize,
+    pub buckets_merged: usize,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SessionRelocationResult {
+    pub sessions_moved: usize,
+    pub project_usage: Option<ProjectUsageRelocation>,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

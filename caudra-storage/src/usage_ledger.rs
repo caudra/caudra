@@ -106,7 +106,7 @@ impl UsageLedger {
         self.record_at(turn, now_epoch())
     }
 
-    fn record_at(&self, turn: &TurnUsage, now: u64) -> Result<(), SessionError> {
+    pub fn record_at(&self, turn: &TurnUsage, now: u64) -> Result<(), SessionError> {
         self.database.record_usage(&LedgerEntry {
             bucket_start: bucket_for(now),
             provider: &turn.provider,
@@ -319,6 +319,8 @@ fn month_label(bucket_start: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sessions::{ProjectUsageRelocation, Session};
+    use serde_json::Value;
     use tempfile::TempDir;
     use test_case::test_case;
 
@@ -327,6 +329,7 @@ mod tests {
     const MODEL: &str = "claude-opus-4";
     const OTHER_MODEL: &str = "claude-haiku-4";
     const CWD: &str = "/repo";
+    const RELOCATED_CWD: &str = "/relocated";
     const HOUR: u64 = BUCKET_SECONDS;
     /// What [`turn`] spends: 40 cached reads out of 10 + 30 + 40 prompt tokens.
     const TURN_HIT_RATE: f64 = 0.5;
@@ -736,10 +739,80 @@ mod tests {
     }
 
     #[test]
-    fn spend_outlives_the_session_that_produced_it() {
-        use crate::sessions::Session;
-        use serde_json::Value;
+    fn relocating_forgotten_and_ephemeral_usage_changes_only_project_reporting() {
+        let (_temp, dir) = state_dir();
+        let mut session: Session<Value, Value, Value> = Session::new(MODEL, CWD);
+        session.save(&dir).unwrap();
+        let mut persistent = ledger(&dir);
+        persistent.record_at(&turn(MODEL, Some(7.0)), 0).unwrap();
+        Session::<Value, Value, Value>::delete(session.id, &dir).unwrap();
+        let ephemeral = ledger(&StateDir::split(
+            dir.path().join("volatile"),
+            dir.path().to_path_buf(),
+        ));
+        ephemeral
+            .record_at(
+                &TurnUsage {
+                    purpose: LedgerPurpose::Goal,
+                    ..subscription_turn(OTHER_MODEL, Some(2.5), true)
+                },
+                HOUR,
+            )
+            .unwrap();
+        ephemeral.record_at(&turn(MODEL, None), 0).unwrap();
+        persistent
+            .record_at(
+                &TurnUsage {
+                    cwd: RELOCATED_CWD.into(),
+                    ..turn(MODEL, Some(1.5))
+                },
+                0,
+            )
+            .unwrap();
 
+        let mut before = persistent.lifetime().unwrap();
+        assert!(
+            persistent
+                .database
+                .persisted_session_ids()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            persistent
+                .database
+                .relocate_project_usage(CWD, RELOCATED_CWD)
+                .unwrap(),
+            ProjectUsageRelocation {
+                buckets_moved: 3,
+                buckets_merged: 1
+            }
+        );
+        let mut after = persistent.lifetime().unwrap();
+        assert_eq!(after.by_project.len(), 1);
+        let project = &after.by_project[0];
+        assert_eq!(project.label, RELOCATED_CWD);
+        assert_eq!(project.cost, before.cost);
+        assert_eq!(project.subscription_cost, before.subscription_cost);
+        assert_eq!(project.tokens, before.total_tokens());
+        assert_eq!(project.turns, before.turns());
+        before.by_project.clear();
+        after.by_project.clear();
+        assert_eq!(after, before);
+
+        persistent.record_at(&turn(MODEL, Some(0.0)), HOUR).unwrap();
+        assert!(
+            persistent
+                .lifetime()
+                .unwrap()
+                .by_project
+                .iter()
+                .any(|project| project.label == CWD)
+        );
+    }
+
+    #[test]
+    fn spend_outlives_the_session_that_produced_it() {
         let (_temp, dir) = state_dir();
         let mut session: Session<Value, Value, Value> = Session::new(MODEL, CWD);
         session.save(&dir).unwrap();

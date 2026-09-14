@@ -80,6 +80,7 @@ const RELOCATION_WRITE_VERSION: i64 = 7;
 const RELOCATION_OTHER_OPEN_COUNT: usize = 2;
 const RELOCATION_CONFIRM_TITLE: &str = "Confirm session relocation";
 const RELOCATION_CONFIRM: &str = "Confirm relocation";
+const RELOCATION_PROJECT_USAGE: &str = "Include historical project usage";
 /// What [`test_model`] answers as, so a turn recorded in a test lands under
 /// the session's own provider the way a real one does.
 const TEST_PROVIDER: &str = "anthropic";
@@ -10159,11 +10160,19 @@ fn relocation_cancellation_preserves_the_draft(close_all: bool) {
     assert_eq!(app.input_box.buffer.value(), RELOCATION_DRAFT);
 }
 
-#[test_case(false, false; "composer_keyboard")]
-#[test_case(true, false; "workbench_keyboard")]
-#[test_case(false, true; "composer_mouse")]
-#[test_case(true, true; "workbench_mouse")]
-fn relocation_custom_destination_paste_reaches_confirmation(workbench: bool, mouse: bool) {
+#[test_case(false, false, false; "composer_keyboard")]
+#[test_case(true, false, false; "workbench_keyboard")]
+#[test_case(false, true, false; "composer_mouse")]
+#[test_case(true, true, false; "workbench_mouse")]
+#[test_case(false, false, true; "bulk_composer_keyboard")]
+#[test_case(true, false, true; "bulk_workbench_keyboard")]
+#[test_case(false, true, true; "bulk_composer_mouse")]
+#[test_case(true, true, true; "bulk_workbench_mouse")]
+fn relocation_custom_destination_paste_reaches_confirmation(
+    workbench: bool,
+    mouse: bool,
+    bulk: bool,
+) {
     let (_temp, storage, writer, mut app) = tempdir_app();
     let destination = TempDir::new().unwrap();
     let destination = destination.path().canonicalize().unwrap();
@@ -10182,10 +10191,13 @@ fn relocation_custom_destination_paste_reaches_confirmation(workbench: bool, mou
     }
     app.open_session_relocation(
         vec![location.clone()],
-        false,
+        bulk,
         None,
         RELOCATION_OTHER_OPEN_COUNT,
     );
+    if bulk {
+        assert!(app.update(Msg::Key(key(KeyCode::Enter))).is_empty());
+    }
     assert!(
         app.update(Msg::Key(kb::RELOCATION_CUSTOM.to_key_event()))
             .is_empty()
@@ -10195,6 +10207,25 @@ fn relocation_custom_destination_paste_reaches_confirmation(workbench: bool, mou
     assert!(app.update(Msg::Key(key(KeyCode::Enter))).is_empty());
     assert!(rendered(&mut app).contains(RELOCATION_CONFIRM_TITLE));
     assert!(app.update(Msg::Paste(RELOCATION_DRAFT.into())).is_empty());
+    if bulk {
+        if mouse {
+            let (row, column) = screen_hit(&mut app, RELOCATION_PROJECT_USAGE);
+            for kind in [
+                MouseEventKind::Down(MouseButton::Left),
+                MouseEventKind::Up(MouseButton::Left),
+            ] {
+                assert!(app.update(mouse_event(kind, column, row)).is_empty());
+            }
+        } else {
+            assert!(app.update(Msg::Key(key(KeyCode::Up))).is_empty());
+            assert!(
+                app.update(Msg::Key(kb::RELOCATION_USAGE.to_key_event()))
+                    .is_empty()
+            );
+            assert!(app.update(Msg::Key(key(KeyCode::Down))).is_empty());
+        }
+        assert!(rendered(&mut app).contains(&format!("[ ] {RELOCATION_PROJECT_USAGE}")));
+    }
     let actions = if mouse {
         let (row, column) = screen_hit(&mut app, RELOCATION_CONFIRM);
         assert!(
@@ -10237,8 +10268,9 @@ fn relocation_custom_destination_paste_reaches_confirmation(workbench: bool, mou
     assert!(matches!(
         &actions[..],
         [Action::RelocateSessions { request, donor: None }]
-            if request.sessions == [location]
-                && request.source_cwd.is_none()
+            if request.source_cwd == bulk.then(|| location.cwd.clone())
+                && request.sessions == [location]
+                && !request.include_project_usage
                 && request.destination == destination_text
     ));
     assert!(!app.session_relocation_picker.is_open());

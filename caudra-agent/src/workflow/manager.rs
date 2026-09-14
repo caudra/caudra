@@ -1094,8 +1094,12 @@ complete(first.output.echo);
                 sessions: database.local_session_locations().unwrap(),
                 source_cwd: Some(self.project.to_string_lossy().into_owned()),
                 destination: destination.to_string_lossy().into_owned(),
+                include_project_usage: true,
             };
-            assert_eq!(database.relocate_sessions(&request).unwrap(), 1);
+            assert_eq!(
+                database.relocate_sessions(&request).unwrap().sessions_moved,
+                1
+            );
             self.project = destination;
         }
 

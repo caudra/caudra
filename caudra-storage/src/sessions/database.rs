@@ -43,8 +43,9 @@ use tracing::warn;
 
 use super::lease::SessionLease;
 use super::{
-    SESSION_VERSION, Session, SessionError, SessionLocation, SessionRelocation, SessionSummary,
-    StoredSubagent, StoredSubagentOutcome, StoredSubagentTaskSpec, StoredTokenUsage, next_epoch,
+    ProjectUsageRelocation, SESSION_VERSION, Session, SessionError, SessionLocation,
+    SessionRelocation, SessionRelocationResult, SessionSummary, StoredSubagent,
+    StoredSubagentOutcome, StoredSubagentTaskSpec, StoredTokenUsage, next_epoch,
 };
 use crate::id::CaudraId;
 use crate::retention::SessionFacts;
@@ -885,7 +886,9 @@ impl SessionDatabase {
             Some(cost) => (cost, 1, 0),
             None => (0.0, 0, 1),
         };
-        self.connection.execute(
+        // RAISE(FAIL) can retain statement changes; a failed contribution must be safe to retry.
+        let transaction = self.connection.unchecked_transaction()?;
+        transaction.execute(
             "INSERT INTO usage_ledger (bucket_start, provider, model, cwd, purpose, ephemeral, \
                  subscription, input_tokens, output_tokens, cache_creation, cache_read, cost, \
                  priced_turns, unpriced_turns) \
@@ -916,7 +919,23 @@ impl SessionDatabase {
                 unpriced,
             ],
         )?;
+        transaction.commit()?;
         Ok(())
+    }
+
+    /// Reattributes all recorded usage for one exact cwd, even without surviving sessions.
+    pub fn relocate_project_usage(
+        &mut self,
+        source: &str,
+        destination: &str,
+    ) -> Result<ProjectUsageRelocation, SessionError> {
+        validate_relocation_paths(Some(source), destination)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let result = relocate_project_usage_on(&transaction, source, destination)?;
+        transaction.commit()?;
+        Ok(result)
     }
 
     pub fn usage_buckets(&self, since: Option<i64>) -> Result<Vec<UsageBucket>, SessionError> {
@@ -1469,7 +1488,7 @@ impl SessionDatabase {
     pub fn relocate_sessions(
         &mut self,
         request: &SessionRelocation,
-    ) -> Result<usize, SessionError> {
+    ) -> Result<SessionRelocationResult, SessionError> {
         self.relocate_sessions_with_tabs(request, &None)
     }
 
@@ -1477,13 +1496,13 @@ impl SessionDatabase {
         &mut self,
         request: &SessionRelocation,
         destination_tabs: &Option<WorkspaceTabs>,
-    ) -> Result<usize, SessionError> {
+    ) -> Result<SessionRelocationResult, SessionError> {
         if self.state_dir.is_ephemeral() {
             return Err(SessionError::RelocationUnavailable);
         }
-        validate_len("destination cwd", request.destination.len(), MAX_PATH_BYTES)?;
-        if !Path::new(&request.destination).is_absolute() || request.destination.contains('\0') {
-            return Err(SessionError::InvalidRelocationDestination);
+        validate_relocation_paths(request.source_cwd.as_deref(), &request.destination)?;
+        if request.include_project_usage && request.source_cwd.is_none() {
+            return Err(SessionError::ProjectUsageRequiresSource);
         }
         let transaction = self
             .connection
@@ -1600,17 +1619,29 @@ impl SessionDatabase {
                 .or_default()
                 .insert(expected.id);
         }
+        let moved = sources.values().map(HashSet::len).sum();
+        let project_usage = if moved > 0 && request.include_project_usage {
+            request
+                .source_cwd
+                .as_deref()
+                .map(|source| relocate_project_usage_on(&transaction, source, &request.destination))
+                .transpose()?
+        } else {
+            None
+        };
         for (source, moved) in &sources {
             remove_relocated_workspace_tabs(&transaction, source, moved)?;
         }
-        let moved = sources.values().map(HashSet::len).sum();
         if moved > 0
             && let Some(tabs) = destination_tabs
         {
             write_relocated_workspace_tabs(&transaction, &request.destination, tabs)?;
         }
         transaction.commit()?;
-        Ok(moved)
+        Ok(SessionRelocationResult {
+            sessions_moved: moved,
+            project_usage,
+        })
     }
 
     pub fn latest_id(&self, cwd: &str) -> Result<Option<CaudraId>, SessionError> {
@@ -2349,6 +2380,60 @@ impl Drop for PreparedArchive {
             crate::sync_parent_dir(&self.pending_path);
         }
     }
+}
+
+fn validate_relocation_paths(source: Option<&str>, destination: &str) -> Result<(), SessionError> {
+    validate_len("destination cwd", destination.len(), MAX_PATH_BYTES)?;
+    if !Path::new(destination).is_absolute() || destination.contains('\0') {
+        return Err(SessionError::InvalidRelocationDestination);
+    }
+    if let Some(source) = source {
+        validate_len("source cwd", source.len(), MAX_PATH_BYTES)?;
+        if !Path::new(source).is_absolute() || source.contains('\0') {
+            return Err(SessionError::InvalidRelocationSource);
+        }
+    }
+    Ok(())
+}
+
+fn relocate_project_usage_on(
+    transaction: &Transaction<'_>,
+    source: &str,
+    destination: &str,
+) -> Result<ProjectUsageRelocation, SessionError> {
+    if source == destination {
+        return Ok(ProjectUsageRelocation::default());
+    }
+    let buckets_merged: i64 = transaction.query_row(
+        "SELECT count(*) FROM usage_ledger AS source JOIN usage_ledger AS destination \
+         USING (bucket_start, provider, model, purpose, ephemeral, subscription) \
+         WHERE source.cwd = ?1 AND destination.cwd = ?2",
+        params![source, destination],
+        |row| row.get(0),
+    )?;
+    let buckets_moved = transaction.execute(
+        "INSERT INTO usage_ledger (bucket_start, provider, model, cwd, purpose, ephemeral, \
+             subscription, input_tokens, output_tokens, cache_creation, cache_read, cost, \
+             priced_turns, unpriced_turns) \
+         SELECT bucket_start, provider, model, ?2, purpose, ephemeral, subscription, \
+             input_tokens, output_tokens, cache_creation, cache_read, cost, priced_turns, unpriced_turns \
+         FROM usage_ledger WHERE cwd = ?1 \
+         ON CONFLICT(bucket_start, provider, model, cwd, purpose, ephemeral, subscription) \
+         DO UPDATE SET \
+             input_tokens = input_tokens + excluded.input_tokens, \
+             output_tokens = output_tokens + excluded.output_tokens, \
+             cache_creation = cache_creation + excluded.cache_creation, \
+             cache_read = cache_read + excluded.cache_read, \
+             cost = cost + excluded.cost, \
+             priced_turns = priced_turns + excluded.priced_turns, \
+             unpriced_turns = unpriced_turns + excluded.unpriced_turns",
+        params![source, destination],
+    )?;
+    transaction.execute("DELETE FROM usage_ledger WHERE cwd = ?1", params![source])?;
+    Ok(ProjectUsageRelocation {
+        buckets_moved,
+        buckets_merged: from_i64_usize(buckets_merged, "usage_ledger collisions")?,
+    })
 }
 
 fn local_session_locations_on(
@@ -3921,6 +4006,7 @@ mod tests {
     use super::*;
     use crate::sessions::{Session, StoredSubagentOutcome, TitleSource};
     use crate::state::{WorkspaceTabs, project_scope, read_workspace_tabs, write_workspace_tabs};
+    use crate::usage_ledger::BUCKET_SECONDS;
     use crate::workflow::{WorkflowEventKind, WorkflowRunPatch, WorkflowRunRow, WorkflowUpdate};
     use crate::workflow_scratch::WORKFLOW_SCRATCH_DIR;
     use caudra_workspace::{
@@ -3968,6 +4054,9 @@ mod tests {
     const RELOCATION_PLAN: &str = "/project/plan.md";
     const RELOCATION_FAILURE: &str = "injected relocation failure";
     const RELOCATION_RUN: &str = "relocation-run";
+    const LEDGER_PROVIDER: &str = "test/provider";
+    const OTHER_LEDGER_PROVIDER: &str = "other/provider";
+    const OTHER_LEDGER_MODEL: &str = "other/model";
     const SESSIONS_BEFORE_WORKSPACE_BINDING: &str = r#"
 DROP INDEX sessions_workspace_updated;
 ALTER TABLE sessions DROP COLUMN workspace_cursor_label;
@@ -4047,6 +4136,7 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
                 .collect(),
             source_cwd: bulk.then(|| cwd.to_owned()),
             destination: RELOCATION_DESTINATION.into(),
+            include_project_usage: bulk,
         }
     }
 
@@ -4071,6 +4161,322 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
             .append_workflow_event(RELOCATION_RUN, WorkflowEventKind::Log, RELOCATION_DRAFT)
             .unwrap();
         database.load_workflow_run(RELOCATION_RUN).unwrap().unwrap()
+    }
+
+    fn ledger_entry(cwd: &str) -> LedgerEntry<'_> {
+        LedgerEntry {
+            bucket_start: 0,
+            provider: LEDGER_PROVIDER,
+            model: MODEL,
+            cwd,
+            purpose: LedgerPurpose::Chat,
+            ephemeral: false,
+            subscription: false,
+            usage: StoredTokenUsage {
+                input: 2,
+                output: 3,
+                cache_creation: 5,
+                cache_read: 7,
+                ..StoredTokenUsage::default()
+            },
+            cost: Some(LEDGER_COST),
+        }
+    }
+
+    fn seed_colliding_usage(database: &SessionDatabase) -> Vec<UsageBucket> {
+        for cwd in [CWD, RELOCATION_DESTINATION, RELOCATION_NESTED] {
+            database.record_usage(&ledger_entry(cwd)).unwrap();
+        }
+        database.usage_buckets(None).unwrap()
+    }
+
+    #[test_case(false; "disjoint")]
+    #[test_case(true; "colliding")]
+    fn project_usage_relocation_preserves_full_key_and_every_measure(collision: bool) {
+        let (_temp, state_dir) = state_dir();
+        let mut database = SessionDatabase::open(&state_dir).unwrap();
+        let entries = [
+            ledger_entry(CWD),
+            LedgerEntry {
+                bucket_start: BUCKET_SECONDS as i64,
+                ..ledger_entry(CWD)
+            },
+            LedgerEntry {
+                provider: OTHER_LEDGER_PROVIDER,
+                ..ledger_entry(CWD)
+            },
+            LedgerEntry {
+                model: OTHER_LEDGER_MODEL,
+                ..ledger_entry(CWD)
+            },
+            LedgerEntry {
+                purpose: LedgerPurpose::Goal,
+                ..ledger_entry(CWD)
+            },
+            LedgerEntry {
+                ephemeral: true,
+                ..ledger_entry(CWD)
+            },
+            LedgerEntry {
+                subscription: true,
+                ..ledger_entry(CWD)
+            },
+        ];
+        for mut entry in entries {
+            database.record_usage(&entry).unwrap();
+            entry.cost = None;
+            database.record_usage(&entry).unwrap();
+            entry.cost = Some(0.0);
+            database.record_usage(&entry).unwrap();
+        }
+        if collision {
+            database
+                .record_usage(&ledger_entry(RELOCATION_DESTINATION))
+                .unwrap();
+        }
+        for cwd in [RELOCATION_NESTED, MISSING_LEGACY_CWD] {
+            database.record_usage(&ledger_entry(cwd)).unwrap();
+        }
+        let before = database.usage_buckets(None).unwrap();
+        let result = database
+            .relocate_project_usage(CWD, RELOCATION_DESTINATION)
+            .unwrap();
+        assert_eq!(
+            result,
+            ProjectUsageRelocation {
+                buckets_moved: 7,
+                buckets_merged: usize::from(collision)
+            }
+        );
+        let after = database.usage_buckets(None).unwrap();
+        assert!(!after.iter().any(|row| row.cwd == CWD));
+        assert_eq!(after.len(), before.len() - result.buckets_merged);
+        for source in before.iter().filter(|row| row.cwd == CWD) {
+            let mut expected = source.clone();
+            expected.cwd = RELOCATION_DESTINATION.into();
+            if let Some(destination) = before.iter().find(|row| {
+                row.cwd == RELOCATION_DESTINATION
+                    && row.bucket_start == source.bucket_start
+                    && row.provider == source.provider
+                    && row.model == source.model
+                    && row.purpose == source.purpose
+                    && row.ephemeral == source.ephemeral
+                    && row.subscription == source.subscription
+            }) {
+                expected.input += destination.input;
+                expected.output += destination.output;
+                expected.cache_creation += destination.cache_creation;
+                expected.cache_read += destination.cache_read;
+                expected.cost += destination.cost;
+                expected.priced_turns += destination.priced_turns;
+                expected.unpriced_turns += destination.unpriced_turns;
+            }
+            assert!(after.contains(&expected));
+        }
+        for row in before
+            .iter()
+            .filter(|row| row.cwd != CWD && row.cwd != RELOCATION_DESTINATION)
+        {
+            assert!(after.contains(row));
+        }
+        assert_eq!(
+            database
+                .relocate_project_usage(CWD, RELOCATION_DESTINATION)
+                .unwrap(),
+            ProjectUsageRelocation::default()
+        );
+        assert_eq!(
+            database
+                .relocate_project_usage(RELOCATION_DESTINATION, RELOCATION_DESTINATION)
+                .unwrap(),
+            ProjectUsageRelocation::default()
+        );
+        assert_eq!(database.usage_buckets(None).unwrap(), after);
+    }
+
+    #[test_case("", RELOCATION_DESTINATION; "empty_source")]
+    #[test_case("relative", RELOCATION_DESTINATION; "relative_source")]
+    #[test_case("/source\0", RELOCATION_DESTINATION; "nul_source")]
+    #[test_case(CWD, ""; "empty_destination")]
+    #[test_case(CWD, "relative"; "relative_destination")]
+    #[test_case(CWD, "/destination\0"; "nul_destination")]
+    fn project_usage_relocation_rejects_invalid_paths(source: &str, destination: &str) {
+        let (_temp, state_dir) = state_dir();
+        let mut database = SessionDatabase::open(&state_dir).unwrap();
+        let before = seed_colliding_usage(&database);
+        assert!(matches!(
+            database.relocate_project_usage(source, destination),
+            Err(SessionError::InvalidRelocationSource | SessionError::InvalidRelocationDestination)
+        ));
+        assert_eq!(database.usage_buckets(None).unwrap(), before);
+    }
+
+    #[test_case(false, false, false, true; "single")]
+    #[test_case(true, false, false, true; "bulk_optout")]
+    #[test_case(true, true, false, true; "bulk_inclusive")]
+    #[test_case(true, true, true, true; "same_directory")]
+    #[test_case(true, true, false, false; "bulk_empty_ledger")]
+    fn session_relocation_reports_usage_only_for_actual_inclusive_bulk(
+        bulk: bool,
+        include_usage: bool,
+        same: bool,
+        has_usage: bool,
+    ) {
+        let (_temp, state_dir) = state_dir();
+        let mut database = SessionDatabase::open(&state_dir).unwrap();
+        database.save(&TestSession::new(MODEL, CWD), None).unwrap();
+        let before = if has_usage {
+            seed_colliding_usage(&database)
+        } else {
+            Vec::new()
+        };
+        let mut request = relocation_request(&database, CWD, bulk);
+        request.include_project_usage = include_usage;
+        if same {
+            request.destination = CWD.into();
+        }
+        let result = database.relocate_sessions(&request).unwrap();
+        assert_eq!(result.sessions_moved, usize::from(!same));
+        if include_usage && !same {
+            assert_eq!(
+                result.project_usage,
+                Some(ProjectUsageRelocation {
+                    buckets_moved: usize::from(has_usage),
+                    buckets_merged: usize::from(has_usage),
+                })
+            );
+            assert!(
+                !database
+                    .usage_buckets(None)
+                    .unwrap()
+                    .iter()
+                    .any(|row| row.cwd == CWD)
+            );
+        } else {
+            assert_eq!(result.project_usage, None);
+            assert_eq!(database.usage_buckets(None).unwrap(), before);
+        }
+    }
+
+    #[test_case(false; "empty_selection")]
+    #[test_case(true; "last_surviving_session")]
+    fn project_usage_requires_explicit_bulk_source(has_session: bool) {
+        let (_temp, state_dir) = state_dir();
+        let mut database = SessionDatabase::open(&state_dir).unwrap();
+        if has_session {
+            database.save(&TestSession::new(MODEL, CWD), None).unwrap();
+        }
+        let before = seed_colliding_usage(&database);
+        let mut request = relocation_request(&database, CWD, false);
+        request.include_project_usage = true;
+        assert!(matches!(
+            database.relocate_sessions(&request),
+            Err(SessionError::ProjectUsageRequiresSource)
+        ));
+        assert_eq!(
+            database.local_session_locations().unwrap(),
+            request.sessions
+        );
+        assert_eq!(database.usage_buckets(None).unwrap(), before);
+    }
+
+    #[test]
+    fn empty_bulk_does_not_repair_usage_without_sessions() {
+        let (_temp, state_dir) = state_dir();
+        let mut database = SessionDatabase::open(&state_dir).unwrap();
+        let before = seed_colliding_usage(&database);
+        let request = relocation_request(&database, CWD, true);
+        assert_eq!(
+            database.relocate_sessions(&request).unwrap(),
+            SessionRelocationResult::default()
+        );
+        assert_eq!(database.usage_buckets(None).unwrap(), before);
+    }
+
+    #[test_case(false; "insert")]
+    #[test_case(true; "update")]
+    fn failed_usage_contribution_rolls_back_before_retry(existing: bool) {
+        let (_temp, state_dir) = state_dir();
+        let database = SessionDatabase::open(&state_dir).unwrap();
+        let entry = ledger_entry(CWD);
+        if existing {
+            database.record_usage(&entry).unwrap();
+        }
+        let before = database.usage_buckets(None).unwrap();
+        let operation = if existing { "UPDATE" } else { "INSERT" };
+        database.connection.execute_batch(&format!(
+            "CREATE TRIGGER usage_failure AFTER {operation} ON usage_ledger BEGIN SELECT RAISE(FAIL, '{RELOCATION_FAILURE}'); END"
+        )).unwrap();
+        assert!(
+            database
+                .record_usage(&entry)
+                .unwrap_err()
+                .to_string()
+                .contains(RELOCATION_FAILURE)
+        );
+        assert_eq!(database.usage_buckets(None).unwrap(), before);
+        database
+            .connection
+            .execute_batch("DROP TRIGGER usage_failure")
+            .unwrap();
+        database.record_usage(&entry).unwrap();
+        let after = database.usage_buckets(None).unwrap();
+        assert_eq!(
+            after[0].input,
+            u64::from(entry.usage.input) * (1 + u64::from(existing))
+        );
+        assert_eq!(after[0].priced_turns, 1 + u64::from(existing));
+    }
+
+    #[test]
+    fn project_usage_overflow_rolls_back_without_clamping() {
+        let (_temp, state_dir) = state_dir();
+        let mut database = SessionDatabase::open(&state_dir).unwrap();
+        seed_colliding_usage(&database);
+        database
+            .connection
+            .execute(
+                "UPDATE usage_ledger SET input_tokens = ?1 WHERE cwd = ?2",
+                params![i64::MAX, RELOCATION_DESTINATION],
+            )
+            .unwrap();
+        let before = database.usage_buckets(None).unwrap();
+        assert!(matches!(
+            database.relocate_project_usage(CWD, RELOCATION_DESTINATION),
+            Err(SessionError::Sqlite(_))
+        ));
+        assert_eq!(database.usage_buckets(None).unwrap(), before);
+    }
+
+    #[test]
+    fn project_usage_source_delete_failure_rolls_back_merge() {
+        let (_temp, state_dir) = state_dir();
+        let mut database = SessionDatabase::open(&state_dir).unwrap();
+        let before = seed_colliding_usage(&database);
+        database.connection.execute_batch(&format!(
+            "CREATE TRIGGER usage_failure AFTER DELETE ON usage_ledger BEGIN SELECT RAISE(FAIL, '{RELOCATION_FAILURE}'); END"
+        )).unwrap();
+        assert!(
+            database
+                .relocate_project_usage(CWD, RELOCATION_DESTINATION)
+                .unwrap_err()
+                .to_string()
+                .contains(RELOCATION_FAILURE)
+        );
+        assert_eq!(database.usage_buckets(None).unwrap(), before);
+        database
+            .connection
+            .execute_batch("DROP TRIGGER usage_failure")
+            .unwrap();
+        assert_eq!(
+            database
+                .relocate_project_usage(CWD, RELOCATION_DESTINATION)
+                .unwrap(),
+            ProjectUsageRelocation {
+                buckets_moved: 1,
+                buckets_merged: 1
+            }
+        );
     }
 
     #[test]
@@ -4105,7 +4511,10 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         let before = root_on(&database.connection, session.id).unwrap();
         let request = relocation_request(&database, MISSING_LEGACY_CWD, false);
 
-        assert_eq!(database.relocate_sessions(&request).unwrap(), 1);
+        assert_eq!(
+            database.relocate_sessions(&request).unwrap().sessions_moved,
+            1
+        );
 
         let after = root_on(&database.connection, session.id).unwrap();
         assert_eq!(after.cwd, RELOCATION_DESTINATION);
@@ -4165,7 +4574,7 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         }
 
         assert_eq!(
-            database.relocate_sessions(&request).unwrap(),
+            database.relocate_sessions(&request).unwrap().sessions_moved,
             request.sessions.len()
         );
 
@@ -4202,7 +4611,7 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
     fn relocation_inventory_and_bulk_exclude_remote_and_include_legacy_unbound() {
         let (_temp, state_dir) = state_dir();
         let mut database = SessionDatabase::open(&state_dir).unwrap();
-        let local = TestSession::new(MODEL, REMOTE_CWD);
+        let local = TestSession::new(MODEL, CWD);
         let remote = TestSession::new_with_workspace(
             MODEL,
             REMOTE_CWD,
@@ -4218,10 +4627,13 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
                 params![local.id.as_bytes().as_slice()],
             )
             .unwrap();
-        let request = relocation_request(&database, REMOTE_CWD, true);
+        let request = relocation_request(&database, CWD, true);
         assert_eq!(request.sessions.len(), 1);
         assert_eq!(request.sessions[0].id, local.id);
-        assert_eq!(database.relocate_sessions(&request).unwrap(), 1);
+        assert_eq!(
+            database.relocate_sessions(&request).unwrap().sessions_moved,
+            1
+        );
         let root = root_on(&database.connection, remote.id).unwrap();
         assert_eq!(root.cwd, REMOTE_CWD);
         let remote_request = SessionRelocation {
@@ -4234,6 +4646,7 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
             }],
             source_cwd: None,
             destination: RELOCATION_DESTINATION.into(),
+            include_project_usage: false,
         };
         assert!(matches!(
             database.relocate_sessions(&remote_request),
@@ -4256,6 +4669,7 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
     fn relocation_bulk_revalidates_membership_from_another_connection(delete: bool, insert: bool) {
         let (_temp, state_dir) = state_dir();
         let mut database = SessionDatabase::open(&state_dir).unwrap();
+        let usage_before = seed_colliding_usage(&database);
         let first = TestSession::new(MODEL, CWD);
         let second = TestSession::new(MODEL, CWD);
         database.save(&first, None).unwrap();
@@ -4274,16 +4688,19 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
             Err(SessionError::RelocationSelectionChanged)
         ));
         assert_eq!(database.local_session_locations().unwrap(), before);
+        assert_eq!(database.usage_buckets(None).unwrap(), usage_before);
     }
 
-    #[test_case(false; "version_conflict_after_first_update")]
-    #[test_case(true; "missing_id_after_first_update")]
-    fn relocation_explicit_failure_rolls_back_prior_rows(missing: bool) {
+    #[test_case(false, false; "version_conflict_after_first_update")]
+    #[test_case(true, false; "missing_id_after_first_update")]
+    #[test_case(false, true; "bulk_version_conflict_after_first_update")]
+    fn relocation_selection_failure_rolls_back_prior_rows(missing: bool, bulk: bool) {
         let (_temp, state_dir) = state_dir();
         let mut database = SessionDatabase::open(&state_dir).unwrap();
+        let usage_before = seed_colliding_usage(&database);
         database.save(&TestSession::new(MODEL, CWD), None).unwrap();
         database.save(&TestSession::new(MODEL, CWD), None).unwrap();
-        let mut request = relocation_request(&database, CWD, false);
+        let mut request = relocation_request(&database, CWD, bulk);
         if missing {
             request.sessions[1].id = CaudraId::generate();
         } else {
@@ -4306,8 +4723,11 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
             ));
         }
         assert_eq!(database.local_session_locations().unwrap(), before);
+        assert_eq!(database.usage_buckets(None).unwrap(), usage_before);
     }
 
+    #[test_case(Some(LEDGER_TABLE), WorkflowRunStatus::Failed; "ledger_failure_failed_run")]
+    #[test_case(Some(LEDGER_TABLE), WorkflowRunStatus::Cancelled; "ledger_failure_cancelled_run")]
     #[test_case(None, WorkflowRunStatus::Failed; "session_failure_failed_run")]
     #[test_case(None, WorkflowRunStatus::Cancelled; "session_failure_cancelled_run")]
     #[test_case(Some(CWD), WorkflowRunStatus::Failed; "source_layout_failure_failed_run")]
@@ -4322,6 +4742,7 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         let mut database = SessionDatabase::open(&state_dir).unwrap();
         database.save(&TestSession::new(MODEL, CWD), None).unwrap();
         database.save(&TestSession::new(MODEL, CWD), None).unwrap();
+        let usage_before = seed_colliding_usage(&database);
         let request = relocation_request(&database, CWD, true);
         let workflow = relocation_workflow(&database, request.sessions[0].id, status);
         let tabs = WorkspaceTabs {
@@ -4341,9 +4762,15 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
             &destination_tabs,
         )
         .unwrap();
-        let trigger = if let Some(scope) = failure_scope {
+        let trigger = if failure_scope == Some(LEDGER_TABLE) {
             format!(
-                "CREATE TRIGGER relocation_failure BEFORE UPDATE ON state WHEN OLD.scope = '{}' BEGIN SELECT RAISE(ABORT, '{RELOCATION_FAILURE}'); END",
+                "CREATE TRIGGER relocation_failure AFTER UPDATE ON usage_ledger BEGIN SELECT RAISE(FAIL, '{RELOCATION_FAILURE}'); END"
+            )
+        } else if let Some(scope) = failure_scope {
+            format!(
+                "CREATE TRIGGER relocation_failure BEFORE UPDATE ON state WHEN OLD.scope = '{}' \
+                 AND NOT EXISTS(SELECT 1 FROM usage_ledger WHERE cwd = '{CWD}') \
+                 BEGIN SELECT RAISE(ABORT, '{RELOCATION_FAILURE}'); END",
                 project_scope(Path::new(scope))
             )
         } else {
@@ -4367,6 +4794,7 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
                 .contains(RELOCATION_FAILURE)
         );
         assert_eq!(database.local_session_locations().unwrap(), before);
+        assert_eq!(database.usage_buckets(None).unwrap(), usage_before);
         assert_eq!(
             database.load_workflow_run(RELOCATION_RUN).unwrap().unwrap(),
             workflow
@@ -4482,7 +4910,7 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
                 request.sessions
             );
         } else {
-            assert_eq!(result.unwrap(), usize::from(!noop));
+            assert_eq!(result.unwrap().sessions_moved, usize::from(!noop));
         }
         let moved = database.load_workflow_run(RELOCATION_RUN).unwrap().unwrap();
         if !noop
@@ -4529,7 +4957,10 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         let sibling = TestSession::new(MODEL, CWD);
         database.save(&sibling, None).unwrap();
         let workflow = relocation_workflow(&database, sibling.id, status);
-        assert_eq!(database.relocate_sessions(&request).unwrap(), 1);
+        assert_eq!(
+            database.relocate_sessions(&request).unwrap().sessions_moved,
+            1
+        );
         assert_eq!(
             database.load_workflow_run(RELOCATION_RUN).unwrap().unwrap(),
             workflow
@@ -4553,7 +4984,7 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
             database
                 .relocate_sessions_with_tabs(&request, &Some(WorkspaceTabs::default()))
                 .unwrap(),
-            0
+            SessionRelocationResult::default()
         );
         assert_eq!(
             read_workspace_tabs(&state_dir, Path::new(CWD)).unwrap(),
@@ -4577,9 +5008,16 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
             Err(SessionError::RelocationSelectionChanged)
         ));
         request.source_cwd = Some(MISSING_LEGACY_CWD.into());
-        assert_eq!(database.relocate_sessions(&request).unwrap(), 0);
+        assert_eq!(
+            database.relocate_sessions(&request).unwrap(),
+            SessionRelocationResult::default()
+        );
         request.source_cwd = None;
-        assert_eq!(database.relocate_sessions(&request).unwrap(), 0);
+        request.include_project_usage = false;
+        assert_eq!(
+            database.relocate_sessions(&request).unwrap(),
+            SessionRelocationResult::default()
+        );
         assert_eq!(database.local_session_locations().unwrap(), before);
     }
 

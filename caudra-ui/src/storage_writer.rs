@@ -25,7 +25,7 @@ use caudra_storage::sessions::{
 };
 use caudra_storage::state::{WorkspaceTabs, write_workspace_tabs};
 use caudra_storage::usage_ledger::{TurnUsage, UsageLedger};
-use caudra_storage::{StateDir, StorageError};
+use caudra_storage::{StateDir, StorageError, now_epoch};
 use tracing::warn;
 
 use crate::AppSession;
@@ -43,12 +43,13 @@ const CHECKPOINT_STALL_WARNING_COUNT: u32 = 2;
 const WRITER_UNAVAILABLE: &str = "storage writer unavailable";
 const WRITER_TIMEOUT: &str = "storage writer operation timed out";
 const WRITER_DRAIN_FAILED: &str = "storage writer stopped with unsaved session operations";
+const USAGE_DRAIN_FAILED: &str = "storage writer stopped with unsaved usage contributions";
 
 type Pending = Arc<Mutex<HashMap<CaudraId, Entry>>>;
 type PendingWorkspaceTabs = Arc<Mutex<Option<WorkspaceTabsRequest>>>;
 /// Turns accumulate rather than coalescing: the ledger sums spend, so a
 /// dropped turn is money the lifetime total never learns about.
-type PendingUsage = Arc<Mutex<Vec<TurnUsage>>>;
+type PendingUsage = Arc<Mutex<Vec<QueuedUsage>>>;
 
 type DeleteCallback = Box<dyn FnOnce(Result<(), SessionError>) + Send>;
 type SaveCallback = flume::Sender<Result<(), SessionError>>;
@@ -66,6 +67,12 @@ enum Entry {
 struct WorkspaceTabsRequest {
     cwd: PathBuf,
     tabs: WorkspaceTabs,
+}
+
+#[cfg_attr(test, derive(Debug, Clone, PartialEq))]
+struct QueuedUsage {
+    turn: TurnUsage,
+    enqueued_at: u64,
 }
 
 pub struct StorageWriter {
@@ -140,10 +147,14 @@ impl StorageWriter {
     /// Records what a turn spent. Never coalesced and never dropped on a
     /// superseding write: two turns in one bucket must both reach the sum.
     pub fn record_usage(&self, turn: TurnUsage) {
+        let usage = QueuedUsage {
+            turn,
+            enqueued_at: now_epoch(),
+        };
         self.usage
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .push(turn);
+            .push(usage);
         match self.wake.try_send(()) {
             Ok(()) | Err(flume::TrySendError::Full(())) => {}
             Err(flume::TrySendError::Disconnected(())) => {
@@ -355,7 +366,7 @@ impl Writer {
     }
 
     fn flush_usage(&mut self, pending: &PendingUsage) {
-        let turns = mem::take(&mut *pending.lock().unwrap_or_else(|e| e.into_inner()));
+        let mut turns = mem::take(&mut *pending.lock().unwrap_or_else(|e| e.into_inner()));
         if turns.is_empty() {
             return;
         }
@@ -364,15 +375,27 @@ impl Writer {
             None => match UsageLedger::open(&self.dir) {
                 Ok(ledger) => self.ledger.insert(ledger),
                 Err(error) => {
-                    warn!(%error, turns = turns.len(), "usage ledger unavailable; spend not recorded");
+                    warn!(%error, turns = turns.len(), "usage ledger unavailable; spend retained for retry");
+                    pending
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .extend(turns);
                     return;
                 }
             },
         };
-        for turn in &turns {
-            if let Err(error) = ledger.record(turn) {
-                warn!(%error, model = turn.model, "usage ledger write failed");
+        turns.retain(|usage| match ledger.record_at(&usage.turn, usage.enqueued_at) {
+            Ok(()) => false,
+            Err(error) => {
+                warn!(%error, model = usage.turn.model, "usage ledger write failed; spend retained for retry");
+                true
             }
+        });
+        if !turns.is_empty() {
+            pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend(turns);
         }
     }
 
@@ -407,6 +430,9 @@ impl Writer {
         }
         if !self.failing.is_empty() || !lock(pending).is_empty() {
             return Err(StorageError::Io(io::Error::other(WRITER_DRAIN_FAILED)).into());
+        }
+        if !usage.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+            return Err(StorageError::Io(io::Error::other(USAGE_DRAIN_FAILED)).into());
         }
         if let Some((_, error)) = self.workspace_tabs_errors.drain().next() {
             return Err(error);
@@ -639,13 +665,17 @@ fn retryable(error: &SessionError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use caudra_storage::usage_ledger::LedgerPurpose;
+    use caudra_storage::sessions::SessionRelocation;
+    use caudra_storage::usage_ledger::{BUCKET_SECONDS, LedgerPurpose, bucket_for};
+    use jiff::civil::DateTime;
+    use jiff::tz::TimeZone;
     use tempfile::TempDir;
     use test_case::test_case;
 
     const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
     const MODEL: &str = "test-model";
     const CWD: &str = "/tmp/writer";
+    const RELOCATION_DESTINATION: &str = "/tmp/writer-relocated";
     const MSG_PREFIX: &str = "msg-";
     const RESUMED_MSG: &str = "resumed";
     const TOOL_ID: &str = "tool-1";
@@ -667,6 +697,9 @@ mod tests {
     const WORKSPACE: &str = "workspace";
     const OTHER_WORKSPACE: &str = "other-workspace";
     const BLOCKED_PARENT: &str = "blocked-parent";
+    const MONTH_START: &str = "2020-02-01T00:00:00";
+    const PREVIOUS_MONTH: &str = "2020-01";
+    const NEXT_MONTH: &str = "2020-02";
 
     fn state_dir() -> (TempDir, StateDir) {
         let tmp = TempDir::new().unwrap();
@@ -1162,6 +1195,240 @@ mod tests {
             cost,
             subscription: false,
         }
+    }
+
+    fn queued_spend(cost: Option<f64>, enqueued_at: u64) -> QueuedUsage {
+        QueuedUsage {
+            turn: spend(MODEL, cost),
+            enqueued_at,
+        }
+    }
+
+    #[test_case(false; "normal_drain")]
+    #[test_case(true; "final_drain")]
+    fn unavailable_usage_ledger_retains_every_turn_until_recovery(final_drain: bool) {
+        let (_tmp, dir) = state_dir();
+        block_session_database(&dir);
+        let (warn_tx, _warn_rx) = flume::unbounded();
+        let mut writer = bare_writer(&dir, warn_tx);
+        let turns = vec![queued_spend(Some(1.0), 0), queued_spend(Some(2.0), 0)];
+        let usage: PendingUsage = Arc::new(Mutex::new(turns.clone()));
+
+        writer.drain(&Arc::default(), &Arc::default(), &usage);
+        assert_eq!(*usage.lock().unwrap(), turns);
+        assert!(writer.ledger.is_none());
+        let error = writer
+            .finish(&Arc::default(), &Arc::default(), &usage)
+            .unwrap_err();
+        assert_writer_error(error, io::ErrorKind::Other, USAGE_DRAIN_FAILED);
+        assert_eq!(*usage.lock().unwrap(), turns);
+
+        fs::remove_dir(dir.path().join(SESSIONS_DB_FILE)).unwrap();
+        usage.lock().unwrap().push(queued_spend(None, 0));
+        if !final_drain {
+            writer.drain(&Arc::default(), &Arc::default(), &usage);
+            assert!(usage.lock().unwrap().is_empty());
+        }
+        writer
+            .finish(&Arc::default(), &Arc::default(), &usage)
+            .unwrap();
+        assert!(usage.lock().unwrap().is_empty());
+        let total = UsageLedger::open(&dir).unwrap().lifetime().unwrap();
+        assert_eq!(total.cost, 3.0);
+        assert_eq!(total.input, 3);
+        assert_eq!(total.output, 6);
+        assert_eq!(total.priced_turns, 2);
+        assert_eq!(total.unpriced_turns, 1);
+    }
+
+    #[test_case(0; "first_write_fails")]
+    #[test_case(1; "middle_write_fails")]
+    #[test_case(2; "last_write_fails")]
+    fn usage_retry_does_not_replay_committed_turns(failed_index: usize) {
+        let (_tmp, dir) = state_dir();
+        let (warn_tx, _warn_rx) = flume::unbounded();
+        let mut writer = bare_writer(&dir, warn_tx);
+        let mut turns = vec![queued_spend(Some(1.0), 0), queued_spend(Some(2.0), 0)];
+        turns.insert(failed_index, queued_spend(Some(f64::NAN), 0));
+        let usage: PendingUsage = Arc::new(Mutex::new(turns));
+
+        writer.flush_usage(&usage);
+
+        assert_eq!(usage.lock().unwrap().len(), 1);
+        assert!(usage.lock().unwrap()[0].turn.cost.unwrap().is_nan());
+        let error = writer
+            .finish(&Arc::default(), &Arc::default(), &usage)
+            .unwrap_err();
+        assert_writer_error(error, io::ErrorKind::Other, USAGE_DRAIN_FAILED);
+        let total = UsageLedger::open(&dir).unwrap().lifetime().unwrap();
+        assert_eq!(total.cost, 3.0);
+        assert_eq!(total.priced_turns, 2);
+        assert_eq!(total.input, 2);
+
+        usage.lock().unwrap()[0].turn.cost = Some(3.0);
+        writer.flush_usage(&usage);
+        writer
+            .finish(&Arc::default(), &Arc::default(), &usage)
+            .unwrap();
+
+        assert!(usage.lock().unwrap().is_empty());
+        let total = UsageLedger::open(&dir).unwrap().lifetime().unwrap();
+        assert_eq!(total.cost, 6.0);
+        assert_eq!(total.priced_turns, 3);
+        assert_eq!(total.input, 3);
+        assert_eq!(total.output, 6);
+    }
+
+    #[test_case(false; "ledger_open_failure")]
+    #[test_case(true; "ledger_write_failure")]
+    fn usage_retry_preserves_enqueue_hour_and_month(write_failure: bool) {
+        let month_start = MONTH_START
+            .parse::<DateTime>()
+            .unwrap()
+            .to_zoned(TimeZone::system())
+            .unwrap()
+            .timestamp()
+            .as_second() as u64;
+        let boundary = bucket_for(month_start + BUCKET_SECONDS - 1) as u64;
+        let enqueued_at = boundary - 1;
+        let (_tmp, dir) = state_dir();
+        if !write_failure {
+            block_session_database(&dir);
+        }
+        let (warn_tx, _warn_rx) = flume::unbounded();
+        let mut writer = bare_writer(&dir, warn_tx);
+        let usage: PendingUsage = Arc::new(Mutex::new(vec![queued_spend(
+            Some(if write_failure { f64::NAN } else { 1.0 }),
+            enqueued_at,
+        )]));
+
+        writer.flush_usage(&usage);
+        assert_eq!(usage.lock().unwrap().len(), 1);
+        assert_eq!(usage.lock().unwrap()[0].enqueued_at, enqueued_at);
+        let error = writer
+            .finish(&Arc::default(), &Arc::default(), &usage)
+            .unwrap_err();
+        assert_writer_error(error, io::ErrorKind::Other, USAGE_DRAIN_FAILED);
+        assert_eq!(usage.lock().unwrap()[0].enqueued_at, enqueued_at);
+
+        if write_failure {
+            usage.lock().unwrap()[0].turn.cost = Some(1.0);
+        } else {
+            fs::remove_dir(dir.path().join(SESSIONS_DB_FILE)).unwrap();
+        }
+        usage
+            .lock()
+            .unwrap()
+            .push(queued_spend(Some(2.0), boundary));
+        writer.flush_usage(&usage);
+        writer
+            .finish(&Arc::default(), &Arc::default(), &usage)
+            .unwrap();
+
+        assert!(usage.lock().unwrap().is_empty());
+        let ledger = UsageLedger::open(&dir).unwrap();
+        let buckets = ledger.buckets(None).unwrap();
+        assert_eq!(buckets.len(), 2);
+        for (timestamp, cost) in [(enqueued_at, 1.0), (boundary, 2.0)] {
+            let bucket = buckets
+                .iter()
+                .find(|bucket| bucket.bucket_start == bucket_for(timestamp))
+                .unwrap();
+            assert_eq!(bucket.cost, cost);
+            assert_eq!(bucket.priced_turns, 1);
+        }
+        let total = ledger.lifetime().unwrap();
+        assert_eq!(total.by_month.len(), 2);
+        for (month, cost) in [(PREVIOUS_MONTH, 1.0), (NEXT_MONTH, 2.0)] {
+            let slice = total
+                .by_month
+                .iter()
+                .find(|slice| slice.label == month)
+                .unwrap();
+            assert_eq!(slice.cost, cost);
+            assert_eq!(slice.turns, 1);
+        }
+    }
+
+    #[test_case(false; "ledger_open_failure")]
+    #[test_case(true; "ledger_write_failure")]
+    fn checked_shutdown_reports_unsaved_usage(write_failure: bool) {
+        let (_tmp, dir) = state_dir();
+        if !write_failure {
+            block_session_database(&dir);
+        }
+        let (writer, _warn_rx) = writer(&dir);
+        let usage = Arc::clone(&writer.usage);
+        writer.record_usage(spend(
+            MODEL,
+            Some(if write_failure { f64::NAN } else { 1.0 }),
+        ));
+        if write_failure {
+            writer
+                .save_sync(Arc::new(AppSession::new(MODEL, CWD)))
+                .unwrap();
+        }
+
+        let error = writer.shutdown_checked(DRAIN_TIMEOUT).unwrap_err();
+
+        assert_writer_error(error, io::ErrorKind::Other, USAGE_DRAIN_FAILED);
+        assert_eq!(usage.lock().unwrap().len(), 1);
+        assert_eq!(Arc::strong_count(&usage), 1);
+    }
+
+    #[test]
+    fn queued_usage_is_drained_before_relocation_and_merged_once() {
+        let (_tmp, dir) = state_dir();
+        let (writer, _warn_rx) = writer(&dir);
+        let session = Arc::new(AppSession::new(MODEL, CWD));
+        writer.save_sync(Arc::clone(&session)).unwrap();
+        let release = pause_writer(&writer);
+        writer.record_usage(spend(MODEL, Some(1.0)));
+        writer.record_usage(spend(MODEL, Some(2.0)));
+        let mut destination_turn = spend(MODEL, Some(3.0));
+        destination_turn.cwd = RELOCATION_DESTINATION.into();
+        writer.record_usage(destination_turn);
+        assert_eq!(writer.usage.lock().unwrap().len(), 3);
+        release.send(()).unwrap();
+        writer.shutdown_checked(DRAIN_TIMEOUT).unwrap();
+
+        let ledger = UsageLedger::open(&dir).unwrap();
+        let before = ledger.lifetime().unwrap();
+        assert_eq!(before.cost, 6.0);
+        assert_eq!(before.priced_turns, 3);
+        let mut database = SessionDatabase::open(&dir).unwrap();
+        let result = database
+            .relocate_sessions(&SessionRelocation {
+                sessions: database.local_session_locations().unwrap(),
+                source_cwd: Some(CWD.into()),
+                destination: RELOCATION_DESTINATION.into(),
+                include_project_usage: true,
+            })
+            .unwrap();
+
+        assert_eq!(result.sessions_moved, 1);
+        assert!(result.project_usage.unwrap().buckets_moved > 0);
+        assert_eq!(
+            AppSession::load(session.id, &dir).unwrap().cwd,
+            RELOCATION_DESTINATION
+        );
+        assert!(
+            ledger
+                .buckets(None)
+                .unwrap()
+                .iter()
+                .all(|bucket| bucket.cwd == RELOCATION_DESTINATION)
+        );
+        let after = ledger.lifetime().unwrap();
+        assert_eq!(after.cost, before.cost);
+        assert_eq!(after.input, before.input);
+        assert_eq!(after.output, before.output);
+        assert_eq!(after.priced_turns, before.priced_turns);
+        let repeated = database
+            .relocate_project_usage(CWD, RELOCATION_DESTINATION)
+            .unwrap();
+        assert_eq!(repeated.buckets_moved, 0);
+        assert_eq!(ledger.lifetime().unwrap(), after);
     }
 
     #[test]

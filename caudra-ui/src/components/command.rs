@@ -258,13 +258,13 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     },
     BuiltinCommand {
         name: "/move-session",
-        description: "Move the current session to an existing directory (optional directory)",
+        description: "Move the current session; retain its counters and lifetime project attribution (optional directory)",
         max_args: 1,
         scope: ChatScope::MainOnly,
     },
     BuiltinCommand {
         name: "/migrate-sessions",
-        description: "Migrate sessions with one exact stored cwd (optional destination directory)",
+        description: "Migrate sessions with one exact stored cwd; historical project usage included by default (optional destination directory)",
         max_args: 1,
         scope: ChatScope::MainOnly,
     },

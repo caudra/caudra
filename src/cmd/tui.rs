@@ -22,7 +22,8 @@ use caudra_storage::StateDir;
 use caudra_storage::id::CaudraId;
 use caudra_storage::sessions::sweep::{SweepPolicy, sweep_if_due};
 use caudra_storage::sessions::{
-    SessionDatabase, SessionLease, SessionLocation, SessionRelocation, StoredMode,
+    SessionDatabase, SessionLease, SessionLocation, SessionRelocation, SessionRelocationResult,
+    StoredMode,
 };
 use caudra_storage::state::{WorkspaceTabs, read_workspace_tabs};
 use caudra_storage::workspace_binding::StoredWorkspaceBinding;
@@ -54,6 +55,9 @@ const RELOCATION_ROLLBACK_FAILED: &str =
 const PROJECT_ENV_PATH: &str = ".caudra/.env";
 const RELOCATION_ENV_RESTART: &str =
     "Run caudra --continue from the destination to load its environment safely";
+const RELOCATION_USAGE_UNCHANGED: &str = "Historical project usage attribution was left unchanged";
+const RELOCATION_USAGE_EMPTY: &str =
+    "No historical project usage was recorded for the source directory";
 
 /// Runs the retention sweep on its own thread while the TUI is open. Dropping
 /// the sender wakes and stops the thread. Every step the sweep takes is
@@ -403,7 +407,7 @@ fn relocate_stopped_sessions(
         open,
     });
     let mut installed_cwd = false;
-    let result = (|| -> Result<usize> {
+    let result = (|| -> Result<SessionRelocationResult> {
         if storage.is_ephemeral()
             || tabs.iter().any(|tab| {
                 tab.session
@@ -449,8 +453,8 @@ fn relocate_stopped_sessions(
             .relocate_sessions_with_tabs(&relocation.request, &destination_tabs)
             .context("commit session relocation")
     })();
-    let count = match result {
-        Ok(count) => count,
+    let result = match result {
+        Ok(result) => result,
         Err(error) => {
             if installed_cwd {
                 change_cwd(original_cwd).wrap_err_with(|| {
@@ -470,22 +474,29 @@ fn relocate_stopped_sessions(
             ));
         }
     };
-    if count == 0 {
+    if result.sessions_moved == 0 {
         return Ok((
             ResolvedSessions {
                 tabs,
                 focused,
-                warnings: vec![
-                    "No sessions moved; the selection is empty or already at the destination"
-                        .into(),
-                ],
+                warnings: vec![format!(
+                    "No sessions moved; the selection is empty or already at the destination. {RELOCATION_USAGE_UNCHANGED}"
+                )],
             },
             None,
         ));
     }
+    let usage = match result.project_usage {
+        Some(usage) if usage.buckets_moved == 0 => RELOCATION_USAGE_EMPTY.into(),
+        Some(usage) => format!(
+            "Historical project usage migrated: {} bucket(s) moved ({} merged into existing destination buckets)",
+            usage.buckets_moved, usage.buckets_merged
+        ),
+        None => RELOCATION_USAGE_UNCHANGED.into(),
+    };
     let committed = format!(
-        "Relocation committed: moved {count} session(s) to {}. Active source plans and approvals were detached. Files and old workspace snapshots were not moved",
-        relocation.request.destination
+        "Relocation committed: moved {} session(s) to {}. {usage}. Active source plans and approvals were detached. Files and old workspace snapshots were not moved",
+        result.sessions_moved, relocation.request.destination
     );
     let mut retained = Vec::new();
     for tab in tabs {
@@ -1156,7 +1167,9 @@ fn exit_report(summary: &ExitSummary, rich: bool) -> String {
 mod tests {
     use super::*;
     use caudra_config::RawConfig;
+    use caudra_storage::sessions::{LedgerEntry, StoredTokenUsage};
     use caudra_storage::state::write_workspace_tabs;
+    use caudra_storage::usage_ledger::{BUCKET_SECONDS, LedgerPurpose};
     use color_eyre::eyre::eyre;
     use std::fs;
     #[cfg(unix)]
@@ -1177,6 +1190,15 @@ mod tests {
     const INJECTED_CWD_FAILURE: &str = "injected working directory failure";
     const INJECTED_CONFIG_FAILURE: &str = "injected destination config failure";
     const RELOCATION_COMMITTED: &str = "Relocation committed";
+    const RELOCATION_USAGE_MIGRATED: &str = "Historical project usage migrated: 2 bucket(s) moved (1 merged into existing destination buckets)";
+    const RELOCATION_TEST_USAGE: StoredTokenUsage = StoredTokenUsage {
+        input: 11,
+        output: 7,
+        cache_creation: 5,
+        cache_read: 3,
+        cost: Some(0.25),
+        subscription_cost: None,
+    };
 
     fn relocation_test_tab(storage: &StateDir, cwd: &Path) -> SessionTab {
         let mut session = AppSession::new(TEST_MODEL, &cwd.to_string_lossy());
@@ -1210,6 +1232,7 @@ mod tests {
                 sessions,
                 source_cwd: bulk.then(|| source.to_string_lossy().into_owned()),
                 destination: destination.to_string_lossy().into_owned(),
+                include_project_usage: bulk,
             },
             donor: None,
             leases,
@@ -1367,7 +1390,14 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        assert!(committed.unwrap().contains(RELOCATION_COMMITTED));
+        let committed = committed.unwrap();
+        assert!(committed.contains(RELOCATION_COMMITTED));
+        assert!(committed.contains(if bulk {
+            RELOCATION_USAGE_EMPTY
+        } else {
+            RELOCATION_USAGE_UNCHANGED
+        }));
+        assert_eq!(resolved.warnings, [committed]);
         assert_eq!(installed, slice::from_ref(&destination));
         assert_eq!(resolved.focused, usize::from(bulk));
         let expected_tabs = WorkspaceTabs {
@@ -1424,6 +1454,105 @@ mod tests {
             Some(restored.tabs[restored.focused].session.id),
             expected_tabs.focused
         );
+    }
+
+    #[test_case(true, true, true, RELOCATION_USAGE_MIGRATED; "bulk_usage")]
+    #[test_case(true, false, true, RELOCATION_USAGE_UNCHANGED; "bulk_opt_out")]
+    #[test_case(false, false, true, RELOCATION_USAGE_UNCHANGED; "single_session")]
+    #[test_case(true, true, false, RELOCATION_USAGE_EMPTY; "empty_source_ledger")]
+    fn relocation_reports_usage_and_preserves_destination(
+        bulk: bool,
+        include_usage: bool,
+        source_usage: bool,
+        expected_report: &str,
+    ) {
+        for live in [true, false] {
+            let temp = tempfile::tempdir().unwrap();
+            let storage = StateDir::from_path(temp.path().join("state"));
+            let source = temp.path().join("source");
+            let destination = fs::canonicalize(temp.path()).unwrap();
+            let invoking = temp.path().join("invoking");
+            let mut tabs = vec![relocation_test_tab(&storage, &source)];
+            let id = tabs[0].session.id;
+            let mut handoff = relocation_handoff(&storage, &tabs, &source, &destination, bulk);
+            assert_eq!(handoff.request.include_project_usage, bulk);
+            assert_eq!(handoff.request.source_cwd.is_some(), bulk);
+            handoff.request.include_project_usage = include_usage;
+            if !live {
+                handoff.leases.push(Arc::clone(&tabs[0].lease));
+                tabs = vec![relocation_test_tab(&storage, &invoking)];
+            }
+            let database = SessionDatabase::open_state(&storage).unwrap();
+            for (cwd, bucket_start) in [
+                (&destination, 0),
+                (&source, 0),
+                (&source, BUCKET_SECONDS as i64),
+            ] {
+                if cwd == &source && !source_usage {
+                    continue;
+                }
+                database
+                    .record_usage(&LedgerEntry {
+                        bucket_start,
+                        provider: TEST_MODEL,
+                        model: TEST_MODEL,
+                        cwd: &cwd.to_string_lossy(),
+                        purpose: LedgerPurpose::Chat,
+                        ephemeral: false,
+                        subscription: false,
+                        usage: RELOCATION_TEST_USAGE,
+                        cost: RELOCATION_TEST_USAGE.cost,
+                    })
+                    .unwrap();
+            }
+            let before = database.usage_buckets(None).unwrap();
+            let mut installed = Vec::new();
+            let (resolved, committed) =
+                relocate_stopped_sessions(tabs, 0, handoff, &storage, &invoking, |path| {
+                    installed.push(path.to_path_buf());
+                    Ok(())
+                })
+                .unwrap();
+            let committed = committed.unwrap();
+            assert!(committed.contains(expected_report), "{committed}");
+            assert_eq!(resolved.warnings, [committed]);
+            assert_eq!(installed.len(), usize::from(live));
+            assert_eq!(
+                resolved.tabs[0].session.cwd,
+                if live { &destination } else { &invoking }.to_string_lossy()
+            );
+            assert_eq!(
+                setup::load_session(id, &storage).unwrap().cwd,
+                destination.to_string_lossy()
+            );
+            let after = database.usage_buckets(None).unwrap();
+            if !include_usage || !source_usage {
+                assert_eq!(after, before);
+                continue;
+            }
+            let mut expected = before
+                .iter()
+                .filter(|bucket| bucket.cwd == source.to_string_lossy())
+                .cloned()
+                .collect::<Vec<_>>();
+            let destination_bucket = before
+                .iter()
+                .find(|bucket| bucket.cwd == destination.to_string_lossy())
+                .unwrap();
+            for bucket in &mut expected {
+                bucket.cwd = destination.to_string_lossy().into_owned();
+                if bucket.bucket_start == destination_bucket.bucket_start {
+                    bucket.input += destination_bucket.input;
+                    bucket.output += destination_bucket.output;
+                    bucket.cache_creation += destination_bucket.cache_creation;
+                    bucket.cache_read += destination_bucket.cache_read;
+                    bucket.cost += destination_bucket.cost;
+                    bucket.priced_turns += destination_bucket.priced_turns;
+                    bucket.unpriced_turns += destination_bucket.unpriced_turns;
+                }
+            }
+            assert_eq!(after, expected);
+        }
     }
 
     #[test_case(false, false; "closed_source")]
@@ -1496,8 +1625,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn relocation_same_directory_keeps_siblings_and_versions() {
+    #[test_case(false; "single_session")]
+    #[test_case(true; "bulk")]
+    fn relocation_same_directory_keeps_siblings_and_versions(bulk: bool) {
         let temp = tempfile::tempdir().unwrap();
         let storage = StateDir::from_path(temp.path().join("state"));
         let cwd = fs::canonicalize(temp.path()).unwrap();
@@ -1505,7 +1635,7 @@ mod tests {
             relocation_test_tab(&storage, &cwd),
             relocation_test_tab(&storage, &cwd),
         ];
-        let handoff = relocation_handoff(&storage, &tabs, &cwd, &cwd, false);
+        let handoff = relocation_handoff(&storage, &tabs, &cwd, &cwd, bulk);
         let path = cwd.join(PROJECT_ENV_PATH);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, "").unwrap();
@@ -1531,6 +1661,7 @@ mod tests {
             })
             .unwrap();
         assert!(committed.is_none());
+        assert!(resolved.warnings[0].contains(RELOCATION_USAGE_UNCHANGED));
         assert_eq!(resolved.tabs.len(), 2);
         assert_eq!(resolved.focused, 1);
         assert_eq!(read_workspace_tabs(&storage, &cwd).unwrap(), Some(layout));

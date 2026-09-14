@@ -3963,6 +3963,7 @@ mod tests {
                 sessions: vec![expected],
                 source_cwd: Some(app.state.session.cwd.clone()),
                 destination: RELOCATION_DESTINATION.into(),
+                include_project_usage: true,
             },
             &current,
             None,
@@ -4000,6 +4001,7 @@ mod tests {
             sessions: vec![selected],
             source_cwd: Some(RELOCATION_SOURCE.into()),
             destination: RELOCATION_DESTINATION.into(),
+            include_project_usage: true,
         };
         match change {
             "empty" => request.sessions.clear(),
@@ -4016,6 +4018,7 @@ mod tests {
                 .push(relocation_location(RELOCATION_SOURCE)),
             "individual" => {
                 request.source_cwd = None;
+                request.include_project_usage = false;
                 current.push(relocation_location(RELOCATION_SOURCE));
             }
             "metadata" => {

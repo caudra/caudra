@@ -100,6 +100,8 @@ Turns recorded before Caudra tracked the two apart are filed as billed spend, so
 
 Deleting a session deletes its transcript. The record of what it cost lives in a separate ledger that no session owns, so trimming and forgetting leave your spending history intact.
 
+Project totals use the exact directory recorded for each turn. [Bulk session migration](/docs/sessions/#moving-sessions-to-another-directory) includes historical project usage by default, with an option to leave it unchanged. Moving one session preserves its own counters without reattributing the shared ledger.
+
 Press `g` in `/usage` to switch from this session to everything ever recorded: totals, the providers, models, and projects that cost the most, and a month by month breakdown. Press `g` again to go back.
 
 From the shell:

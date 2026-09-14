@@ -230,6 +230,11 @@ pub mod key {
         label: "F3",
     };
     pub const RELOCATION_CUSTOM: Bind = ctrl_bind!('o');
+    pub const RELOCATION_USAGE: Bind = Bind {
+        code: KeyCode::Char(' '),
+        modifiers: KeyModifiers::NONE,
+        label: "Space",
+    };
     pub const REFRESH: Bind = ctrl_bind!('r');
     pub const SUSPEND: Bind = ctrl_bind!('z');
     pub const DELETE: Bind = ctrl_bind!('d');
@@ -1027,6 +1032,12 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::All,
     },
     Keybind {
+        label: KeyLabel::Single(key::RELOCATION_USAGE.label),
+        description: "Toggle the selected historical project usage row in bulk confirmation",
+        context: KeybindContext::SessionRelocation,
+        platform: Platform::All,
+    },
+    Keybind {
         label: KeyLabel::Single(key::RENAME_SESSION.label),
         description: "Rename session",
         context: KeybindContext::SessionPicker,
@@ -1400,6 +1411,7 @@ mod tests {
 
     #[test_case(key::MOVE_SESSION; "move_current")]
     #[test_case(key::MIGRATE_SESSIONS; "migrate")]
+    #[test_case(key::RELOCATION_USAGE; "historical_usage")]
     fn relocation_bindings_do_not_collide_with_picker_actions(binding: Bind) {
         for other in [
             key::NEW_SESSION,
@@ -1408,10 +1420,15 @@ mod tests {
             key::DELETE,
             key::QUIT,
             key::HELP,
+            key::RELOCATION_CUSTOM,
         ] {
             assert!(!other.matches(binding.to_key_event()));
         }
         assert_ne!(key::MOVE_SESSION.code, key::MIGRATE_SESSIONS.code);
+        assert!(!matches!(
+            binding.code,
+            KeyCode::Tab | KeyCode::BackTab | KeyCode::Enter | KeyCode::Up | KeyCode::Down
+        ));
     }
 
     #[test_case(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL), "ctrl+d")]

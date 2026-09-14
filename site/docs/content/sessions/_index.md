@@ -21,6 +21,18 @@ Caudra releases ownership on normal exit, process termination, or a crash. A
 running process that has stopped responding still owns its session. Forking an
 active session remains available because the child receives a new ID.
 
+## Moving sessions to another directory
+
+Use `/migrate-sessions` to move every saved local session with one exact stored working directory. The source directory may already be gone. Choose a destination directory and review the confirmation before applying the move.
+
+The bulk confirmation checks **Include historical project usage** by default. Toggle it off to leave lifetime project attribution unchanged. When included, the move reattributes all usage recorded for that exact source directory, including deleted sessions and ephemeral runs. It covers every model, purpose, and payer category, but excludes child directories with a different recorded cwd. Overlapping destination buckets are added together without replacing existing destination spend. The completion message reports usage buckets moved and merged, or an empty source ledger, separately from sessions moved.
+
+A single-session move retains that session's own counters but leaves the shared lifetime usage ledger attributed to its recorded project. The ledger cannot identify one session's contribution, so single-session moves do not offer the historical usage option.
+
+Before a whole-project rename, stop other Caudra processes using the source directory, including ephemeral runs. Caudra drains the invoking runtime's usage writes before committing the move and aborts if that drain fails. Only ledger rows present at the relocation transaction are reattributed. There is no permanent redirect, so new work started at the old directory records usage there again.
+
+Session IDs and conversations are preserved. Active source plans and approvals are detached. Files and old workspace snapshots are not moved. If moving live tabs requires a project environment reload, Caudra exits after committing and asks you to run `caudra --continue` from the destination.
+
 ## Ephemeral sessions
 
 Run `caudra --ephemeral` for a session that leaves no session record behind. Set `storage.ephemeral = true` to make this the default.
