@@ -29,6 +29,7 @@ use super::history::{
 use super::instructions::LoadedInstructions;
 use super::mention_preamble;
 use super::provider_projection;
+use super::speculative::SpeculativeRuns;
 use super::steering::{self, Recovery, RecoveryAction, SharedSteering, Steering};
 use super::streaming::{StreamError, stream_with_retry};
 use super::title;
@@ -304,6 +305,13 @@ pub struct Agent<'h> {
     // hard limits instead use Steering, which survives automatic report corrections.
     num_turns: u32,
     recent_calls: RecentCalls,
+    /// What the last response called its tools, kept because the next one
+    /// names them the same way. Only the response carries the map, and a
+    /// `batch` child started mid-stream needs it a response early.
+    tool_name_aliases: Option<caudra_providers::ToolNameAliases>,
+    /// The children of this turn's `batch` calls, started as their arguments
+    /// arrived rather than after the message closed.
+    speculative: Option<Arc<SpeculativeRuns>>,
     steering: SharedSteering,
     shared_steering: bool,
     report_ready: Option<Arc<AtomicBool>>,
@@ -403,6 +411,8 @@ impl<'h> Agent<'h> {
             measured: None,
             num_turns: 0,
             recent_calls,
+            tool_name_aliases: None,
+            speculative: None,
             steering: Arc::new(Mutex::new(steering)),
             shared_steering: false,
             report_ready: None,
@@ -990,7 +1000,15 @@ impl<'h> Agent<'h> {
         if self.cancel.is_cancelled() {
             return Err(AgentError::Cancelled);
         }
+        // Whatever the previous turn started and nobody took is reported
+        // before this request, not after the one that abandoned it: the model
+        // must learn what already ran before it decides what to run next.
+        self.report_speculative();
         let sent_at_history_len = self.history.len();
+        self.speculative = self
+            .config
+            .eager_batch_dispatch
+            .then(|| Arc::new(SpeculativeRuns::new(&self.tool_context(), self.mcp.clone())));
         let stream_result = {
             let (tools, mcp) = self.request_tools();
             let provider_history = self.projected_history(tools.as_ref());
@@ -1011,6 +1029,7 @@ impl<'h> Agent<'h> {
                 &self.retry_now,
                 self.opts.clone(),
                 self.session_id.as_ref(),
+                self.speculative.as_ref(),
             )
             .await
         };
@@ -1589,9 +1608,11 @@ impl<'h> Agent<'h> {
             .collect();
         let observations =
             ResponseObservations::new(steering::lock(&self.steering).observation_window());
+        self.tool_name_aliases = response.tool_name_aliases.clone();
         let ctx = ToolContext {
             steering_observations: Some(observations.clone()),
             tool_name_aliases: response.tool_name_aliases.clone(),
+            speculative: self.speculative.clone(),
             ..self.tool_context()
         };
         self.push_assistant_message(response.message);
@@ -1609,6 +1630,15 @@ impl<'h> Agent<'h> {
         }
         result?;
         Ok(observations.take())
+    }
+
+    /// Hands the model whatever the last response started early and never
+    /// asked for, so it does not do that work a second time.
+    fn report_speculative(&mut self) {
+        let Some(message) = self.speculative.take().and_then(|runs| runs.drain_report()) else {
+            return;
+        };
+        self.history.push(message);
     }
 
     fn tool_context(&self) -> ToolContext {
@@ -1651,12 +1681,13 @@ impl<'h> Agent<'h> {
             audience: self.audience,
             tool_filter: self.tool_filter.clone(),
             local_tools: Arc::clone(&self.local_tools),
-            tool_name_aliases: None,
+            tool_name_aliases: self.tool_name_aliases.clone(),
             steering_observations: None,
             steering_order: Vec::new(),
             live_sink: None,
             model_policy: Arc::clone(&self.model_policy),
             workflow: self.workflow.clone(),
+            speculative: None,
         }
     }
 

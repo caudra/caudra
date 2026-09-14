@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use caudra_providers::provider::Provider;
@@ -12,6 +13,7 @@ use caudra_storage::log::target;
 use serde_json::Value;
 use tracing::{info, warn};
 
+use super::speculative::SpeculativeRuns;
 use super::tool_body::BodyStream;
 use super::tool_delegation::{Delegated, DelegationStream};
 use super::tool_preview;
@@ -67,6 +69,10 @@ struct Changed {
     /// One per delegating call the fragment moved: the call itself, or the
     /// `batch` children writing their briefs.
     delegations: Vec<Delegation>,
+    /// The `batch` children whose arguments the fragment finished, whole.
+    /// Dispatched after the fragment's own event has gone out, so a child's
+    /// first progress never arrives before the row it belongs to.
+    ready: Vec<(usize, String)>,
 }
 
 /// The argument JSON of one tool call as it arrives, kept only until the
@@ -93,10 +99,10 @@ struct PendingInput {
 }
 
 impl PendingInput {
-    fn new(id: String, name: String) -> Self {
+    fn new(id: String, name: String, dispatching: bool) -> Self {
         Self {
             body: BodyStream::new(&name),
-            roster: RosterStream::new(&name),
+            roster: RosterStream::new(&name, dispatching),
             delegation: DelegationStream::new(&name),
             name,
             id,
@@ -125,9 +131,11 @@ impl PendingInput {
                     delegation(batch::child_tool_use_id(Some(&self.id), index), delegated)
                 })
                 .collect();
+            let ready = rostered.ready;
             let Some(entries) = rostered.entries else {
                 return Changed {
                     delegations,
+                    ready,
                     ..Changed::default()
                 };
             };
@@ -135,6 +143,7 @@ impl PendingInput {
                 preview: self.published(batch::roster_header(entries.len())),
                 roster: Some(entries),
                 delegations,
+                ready,
                 ..Changed::default()
             };
         }
@@ -168,6 +177,7 @@ impl PendingInput {
             body,
             roster: None,
             delegations,
+            ready: Vec::new(),
         }
     }
 
@@ -221,6 +231,7 @@ async fn forward_provider_events(
     prx: flume::Receiver<ProviderEvent>,
     event_tx: Option<&EventSender>,
     progress_only: bool,
+    speculative: Option<Arc<SpeculativeRuns>>,
 ) -> ForwardedStream {
     let mut streamed = String::new();
     let mut reasoning = Vec::new();
@@ -244,6 +255,9 @@ async fn forward_provider_events(
             });
         }
         let forward = !progress_only || matches!(&pe, ProviderEvent::PromptProgress { .. });
+        // The call whose children this fragment finished, and the children
+        // themselves. Dispatched below, once the row they report on exists.
+        let mut ready = (String::new(), Vec::new());
         let ae = match pe {
             ProviderEvent::TextDelta { text } => {
                 streamed.push_str(&text);
@@ -253,7 +267,10 @@ async fn forward_provider_events(
             ProviderEvent::ThinkingBoundary => AgentEvent::ThinkingBoundary,
             ProviderEvent::ToolUseStart { id, name } => {
                 let name = canonical_tool_name(&name).to_owned();
-                pending_inputs.insert(id.clone(), PendingInput::new(id.clone(), name.clone()));
+                pending_inputs.insert(
+                    id.clone(),
+                    PendingInput::new(id.clone(), name.clone(), speculative.is_some()),
+                );
                 AgentEvent::ToolPending { id, name }
             }
             ProviderEvent::ToolInputDelta { id, delta } => {
@@ -264,6 +281,7 @@ async fn forward_provider_events(
                     continue;
                 };
                 let changed = pending.absorb(&delta);
+                ready = (id.clone(), changed.ready);
                 AgentEvent::ToolInputDelta {
                     id,
                     name: pending.name.clone(),
@@ -290,6 +308,16 @@ async fn forward_provider_events(
                 break;
             }
             forwarded = true;
+        }
+        // After the send, never before it: the row a child reports on is
+        // published by this fragment's own event, and the queue is ordered, so
+        // an already-sent roster cannot be overtaken by a child the next line
+        // starts.
+        let (batch_id, children) = ready;
+        if let Some(runs) = speculative.as_ref() {
+            for (index, element) in children {
+                runs.start(&batch_id, index, &element);
+            }
         }
     }
     if let Some(started) = run_started {
@@ -370,6 +398,7 @@ pub(crate) async fn stream_with_retry(
     retry_now: &Nudge,
     opts: RequestOptions,
     session_id: Option<&SessionRef>,
+    speculative: Option<&Arc<SpeculativeRuns>>,
 ) -> Result<StreamResponse, StreamError> {
     stream_with_retry_inner(
         provider,
@@ -383,6 +412,7 @@ pub(crate) async fn stream_with_retry(
         retry_now,
         opts,
         session_id,
+        speculative,
     )
     .await
 }
@@ -411,6 +441,7 @@ pub(crate) async fn stream_silent_with_retry(
         &Nudge::default(),
         opts,
         session_id,
+        None,
     )
     .await
 }
@@ -428,6 +459,7 @@ async fn stream_with_retry_inner(
     retry_now: &Nudge,
     opts: RequestOptions,
     session_id: Option<&SessionRef>,
+    speculative: Option<&Arc<SpeculativeRuns>>,
 ) -> Result<StreamResponse, StreamError> {
     let opts = opts.clamped(model);
     let messages = caudra_providers::adapt_images_for_model(model, messages);
@@ -441,7 +473,10 @@ async fn stream_with_retry_inner(
         let (ptx, prx) = flume::unbounded();
         let forwarder = smol::spawn({
             let event_tx = event_tx.cloned();
-            async move { forward_provider_events(prx, event_tx.as_ref(), progress_only).await }
+            let speculative = speculative.cloned();
+            async move {
+                forward_provider_events(prx, event_tx.as_ref(), progress_only, speculative).await
+            }
         });
         let result = futures_lite::future::race(
             provider.stream_message(
@@ -561,6 +596,14 @@ async fn stream_with_retry_inner(
                     error = %e,
                     "retryable, will retry"
                 );
+                // The attempt's children outlive their ids: the message they
+                // were dispatched for is gone, so whatever they went on to
+                // report would name a row the retry will never draw. What
+                // already answered is kept, and the retried message either
+                // claims it or reports it.
+                if let Some(runs) = speculative {
+                    runs.abandon_unfinished();
+                }
                 // Listening before the event goes out: a nudge is dropped when
                 // nothing is waiting, and announcing the wait first invites one
                 // to arrive in the gap before it starts.
@@ -715,12 +758,82 @@ mod tests {
 
         let (etx, erx) = flume::unbounded();
         let sender = crate::EventSender::new(etx, 0);
-        smol::block_on(forward_provider_events(prx, Some(&sender), false));
+        smol::block_on(forward_provider_events(prx, Some(&sender), false, None));
         drop(sender);
         erx.drain()
             .map(|envelope| envelope.event)
             .filter(|event| matches!(event, AgentEvent::ToolInputDelta { .. }))
             .collect()
+    }
+
+    /// The early start, end to end: a batch whose whole argument lands in one
+    /// fragment starts every child from that fragment, and each reports on a
+    /// roster the reader was given first.
+    #[test]
+    fn a_batch_starts_its_children_from_the_fragment_that_closed_them() {
+        let (etx, erx) = flume::unbounded();
+        let sender = crate::EventSender::new(etx, 0);
+        let mut ctx = crate::tools::test_support::stub_ctx_with(
+            &crate::AgentMode::Build,
+            Some(&sender),
+            None,
+        );
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = std::sync::Arc::clone(&ran);
+        ctx.local_tools = std::sync::Arc::new(std::collections::HashMap::from([(
+            READ.into(),
+            crate::tools::local_tool(move |_, _| {
+                let count = std::sync::Arc::clone(&count);
+                Box::pin(async move {
+                    count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(String::new())
+                })
+            }),
+        )]));
+        let runs = Arc::new(SpeculativeRuns::new(&ctx, None));
+
+        let (ptx, prx) = flume::unbounded();
+        ptx.send(ProviderEvent::ToolUseStart {
+            id: TOOL_ID.into(),
+            name: BATCH.into(),
+        })
+        .unwrap();
+        ptx.send(ProviderEvent::ToolInputDelta {
+            id: TOOL_ID.into(),
+            delta: format!(
+                r#"{{"tool_calls": [{{"tool": "{READ}", "parameters": {{"path": "a.rs"}}}}, {{"tool": "{READ}", "parameters": {{"path": "b.rs"}}}}]}}"#
+            ),
+        })
+        .unwrap();
+        drop(ptx);
+        smol::block_on(async {
+            forward_provider_events(prx, Some(&sender), false, Some(Arc::clone(&runs))).await;
+            runs.settled().await;
+        });
+        drop(sender);
+
+        let events: Vec<_> = erx.drain().map(|envelope| envelope.event).collect();
+        let roster = events.iter().position(|event| {
+            matches!(
+                event,
+                AgentEvent::ToolInputDelta {
+                    roster: Some(_),
+                    ..
+                }
+            )
+        });
+        let progress = events
+            .iter()
+            .position(|event| matches!(event, AgentEvent::BatchProgress(_)));
+        assert_eq!(
+            ran.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "both children start from the fragment that closed them"
+        );
+        assert!(
+            roster < progress,
+            "the roster is published before the children report on it: {roster:?} then {progress:?}"
+        );
     }
 
     #[test]
@@ -740,7 +853,7 @@ mod tests {
 
         let (etx, erx) = flume::unbounded();
         let sender = crate::EventSender::new(etx, 0);
-        let forwarded = smol::block_on(forward_provider_events(prx, Some(&sender), true));
+        let forwarded = smol::block_on(forward_provider_events(prx, Some(&sender), true, None));
         drop(sender);
         let events: Vec<_> = erx.drain().map(|envelope| envelope.event).collect();
 
@@ -899,7 +1012,7 @@ mod tests {
 
         let (etx, erx) = flume::unbounded();
         let sender = crate::EventSender::new(etx, 0);
-        smol::block_on(forward_provider_events(prx, Some(&sender), false));
+        smol::block_on(forward_provider_events(prx, Some(&sender), false, None));
         drop(sender);
         assert_eq!(erx.drain().count(), 0);
     }
@@ -1132,7 +1245,7 @@ mod tests {
         }
         drop(tx);
 
-        let forwarded = smol::block_on(forward_provider_events(rx, None, false));
+        let forwarded = smol::block_on(forward_provider_events(rx, None, false, None));
         assert_eq!(forwarded.streamed, "x");
         assert_eq!(forwarded.reasoning.len(), 2);
         assert_eq!(forwarded.reasoning[0].text, "ab");
@@ -1155,7 +1268,7 @@ mod tests {
         }
         drop(tx);
 
-        let forwarded = smol::block_on(forward_provider_events(rx, None, false));
+        let forwarded = smol::block_on(forward_provider_events(rx, None, false, None));
         assert_eq!(forwarded.reasoning.len(), 2);
         assert_eq!(forwarded.reasoning[0].text, "first");
         assert_eq!(forwarded.reasoning[1].text, "second");
@@ -1184,7 +1297,7 @@ mod tests {
         }
         drop(tx);
 
-        let forwarded = smol::block_on(forward_provider_events(rx, None, false));
+        let forwarded = smol::block_on(forward_provider_events(rx, None, false, None));
 
         assert_eq!(forwarded.reasoning.len(), 1);
         assert_eq!(forwarded.reasoning[0].text, "first second");
@@ -1197,7 +1310,7 @@ mod tests {
             .unwrap();
         drop(tx);
 
-        let forwarded = smol::block_on(forward_provider_events(rx, None, false));
+        let forwarded = smol::block_on(forward_provider_events(rx, None, false, None));
         assert!(forwarded.reasoning.is_empty());
     }
 

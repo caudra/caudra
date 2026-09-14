@@ -12,6 +12,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 use serde_json::{Map, Value};
 
+use crate::agent::speculative::Peeked;
 use crate::agent::tool_dispatch::{self, Emit};
 use crate::tools::registry::{
     ExecFuture, HeaderFuture, HeaderResult, ParseError, Tool, ToolExecResult, ToolInvocation,
@@ -193,9 +194,31 @@ impl ToolInvocation for BatchCall {
 
     /// Publishing the roster up front is what lets progress events name a
     /// child by index instead of resending the whole batch each time.
-    fn start_output(&self, _ctx: &ToolContext) -> Option<ToolOutput> {
+    ///
+    /// A child already running from the stream keeps the row it has earned:
+    /// this output replaces whatever the roster drew, so a pending row here
+    /// would take a running child back to the start and leave it there.
+    fn start_output(&self, ctx: &ToolContext) -> Option<ToolOutput> {
+        let mut entries: Vec<BatchToolEntry> =
+            self.children.iter().map(Child::pending_entry).collect();
+        if let Some(runs) = &ctx.speculative {
+            let calls = self
+                .children
+                .iter()
+                .map(|child| (child.tool.as_str(), &child.params));
+            let peeked = runs.peek_all(calls);
+            for ((entry, child), peeked) in entries.iter_mut().zip(&self.children).zip(peeked) {
+                if let Some(started) = peeked
+                    .as_ref()
+                    .filter(|_| child.rejection.is_none())
+                    .and_then(Peeked::entry)
+                {
+                    *entry = started;
+                }
+            }
+        }
         Some(ToolOutput::Batch {
-            entries: self.children.iter().map(Child::pending_entry).collect(),
+            entries,
             text: String::new(),
         })
     }
@@ -274,6 +297,33 @@ impl BatchCall {
             // so a child task borrows nothing from this frame.
             let (registry, mcp, ctx) = (Arc::clone(&ctx.registry), ctx.mcp.clone(), ctx);
             let entries = Arc::clone(&entries);
+            // A child the stream already started is taken over rather than
+            // started again: the work is the same work, and running it twice
+            // is exactly what the early start was for.
+            if let Some(adopted) = ctx
+                .speculative
+                .as_ref()
+                .and_then(|runs| runs.claim(&child.tool, &child.params))
+            {
+                set.spawn(async move {
+                    if let Some(start) = adopted.start() {
+                        publish(&entries, index, &ctx, |entry| {
+                            *entry = started_entry(start);
+                        });
+                    }
+                    let done = adopted.finish().await;
+                    // The adopting context reserved this child, and the run
+                    // that answered it never did, so the verdict is recorded
+                    // here instead of by the dispatch that produced it.
+                    if !ctx.cancel.is_cancelled()
+                        && let Some(observations) = &ctx.steering_observations
+                    {
+                        observations.finish(done.is_error);
+                    }
+                    publish(&entries, index, &ctx, |entry| settle_entry(entry, &done));
+                });
+                continue;
+            }
             set.spawn(async move {
                 let done = tool_dispatch::run(
                     &registry,
@@ -296,25 +346,12 @@ impl BatchCall {
                     // name past here is looking at the tool the registry knows.
                     Emit::Capture(&mut |start: &ToolStartEvent| {
                         publish(&entries, index, &ctx, |entry| {
-                            entry.status = BatchToolStatus::Running;
-                            entry.tool = start.tool.to_string();
-                            entry.effect = start.effect;
-                            entry.summary = start.summary.clone();
-                            entry.input = start.input.clone();
-                            entry.raw_input = start.raw_input.clone();
+                            *entry = started_entry(start);
                         });
                     }),
                 )
                 .await;
-                publish(&entries, index, &ctx, |entry| {
-                    entry.status = if done.is_error {
-                        BatchToolStatus::Error
-                    } else {
-                        BatchToolStatus::Success
-                    };
-                    entry.annotation = done.annotation.clone();
-                    entry.output = Some(done.output.clone());
-                });
+                publish(&entries, index, &ctx, |entry| settle_entry(entry, &done));
             });
         }
         // A panicked child leaves its entry mid-flight, so anything still
@@ -357,6 +394,57 @@ pub(crate) fn child_tool_use_id(parent: Option<&str>, index: usize) -> String {
     }
 }
 
+/// The call one element describes, or `None` when it is one this tool refuses
+/// anyway. A refusal belongs to the batch's own answer, so a speculative run
+/// never stands in for it.
+pub(crate) fn dispatchable(entry: &Value, ctx: &ToolContext) -> Option<(String, Value)> {
+    let child = normalize(entry).ok()?;
+    let runnable = child.rejection.is_none()
+        && ctx.resolve_tool_name_alias(&child.tool) != crate::tools::BATCH_TOOL_NAME;
+    runnable.then_some((child.tool, child.params))
+}
+
+/// The roster row a child draws once it has introduced itself. The header is
+/// the one the call published rather than a bare tool name, and the name is
+/// the one the registry knows rather than the wire alias the model used.
+pub(crate) fn started_entry(start: &ToolStartEvent) -> BatchToolEntry {
+    BatchToolEntry {
+        tool: start.tool.to_string(),
+        effect: start.effect,
+        summary: start.summary.clone(),
+        status: BatchToolStatus::Running,
+        input: start.input.clone(),
+        raw_input: start.raw_input.clone(),
+        output: None,
+        annotation: None,
+    }
+}
+
+/// The same row once the child has answered.
+pub(crate) fn settle_entry(entry: &mut BatchToolEntry, done: &crate::ToolDoneEvent) {
+    entry.status = if done.is_error {
+        BatchToolStatus::Error
+    } else {
+        BatchToolStatus::Success
+    };
+    entry.annotation = done.annotation.clone();
+    entry.output = Some(done.output.clone());
+}
+
+/// Addresses one child's row on the batch that owns it, which is the only row
+/// a child has: `ctx` is the child's, and the batch's id is its own with the
+/// index suffix dropped.
+pub(crate) fn publish_child(ctx: &ToolContext, index: usize, entry: BatchToolEntry) {
+    let Some(id) = batch_id(ctx) else { return };
+    let _ = ctx
+        .event_tx
+        .send(AgentEvent::BatchProgress(Box::new(BatchProgressEvent {
+            id,
+            index,
+            entry,
+        })));
+}
+
 fn publish(
     entries: &Mutex<Vec<BatchToolEntry>>,
     index: usize,
@@ -371,14 +459,7 @@ fn publish(
         update(entry);
         entry.clone()
     };
-    let Some(id) = batch_id(ctx) else { return };
-    let _ = ctx
-        .event_tx
-        .send(AgentEvent::BatchProgress(Box::new(BatchProgressEvent {
-            id,
-            index,
-            entry,
-        })));
+    publish_child(ctx, index, entry);
 }
 
 /// The child ids are the batch's own with an index appended, so the batch row
@@ -457,6 +538,7 @@ fn render_llm(entries: &[BatchToolEntry]) -> String {
 mod tests {
     use super::*;
     use crate::AgentMode;
+    use crate::agent::speculative::SpeculativeRuns;
     use crate::agent::tool_dispatch::{ResponseObservations, ToolOutcome};
     use crate::tools::STALE_READ_MSG;
     use crate::tools::registry::{ToolRegistry, ToolSource};
@@ -476,6 +558,9 @@ mod tests {
     const PARK: &str = "park";
     const RELEASE: &str = "release";
     const DEADLINE_REASON: &str = crate::tools::DEADLINE_EXCEEDED;
+    const BATCH_ID: &str = "batch-1";
+    const RAN_TWICE: &str = "an adopted child must not be run a second time";
+    const NEVER_STARTED: &str = "the stream must have started the child before the batch runs";
 
     fn observed_batch_ctx() -> ToolContext {
         let ctx = stub_ctx(&AgentMode::Build);
@@ -631,6 +716,126 @@ mod tests {
             assert!(!all_repairable);
             assert_eq!(facts.len(), 2);
             assert_eq!(facts[0], facts[1]);
+            assert_eq!(facts[0].name, READ);
+            assert_eq!(facts[0].outcome, ToolOutcome::Success);
+        });
+    }
+
+    /// The model's answer to a batch over `children`, with whatever the
+    /// stream started already in `ctx`.
+    async fn run_batch(ctx: &ToolContext, children: Value) -> String {
+        tool_dispatch::run(
+            &ctx.registry,
+            None,
+            BATCH_ID.into(),
+            crate::tools::BATCH_TOOL_NAME,
+            &calls(children),
+            ctx,
+            Emit::Silent,
+        )
+        .await
+        .output
+        .as_text()
+    }
+
+    /// A context whose one tool numbers its calls, so the answer says which
+    /// run produced it: the first belongs to the stream, a second could only
+    /// come from the batch starting the work over.
+    fn counting_batch_ctx() -> (ToolContext, Arc<AtomicUsize>) {
+        let mut ctx = observed_batch_ctx();
+        ctx.tool_use_id = Some(BATCH_ID.into());
+        let ran = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&ran);
+        ctx.local_tools = Arc::new(HashMap::from([(
+            READ.into(),
+            crate::tools::local_tool(move |_, _| {
+                let count = Arc::clone(&count);
+                Box::pin(async move {
+                    let nth = count.fetch_add(1, Ordering::SeqCst) + 1;
+                    Ok(format!("{BODY} {nth}"))
+                })
+            }),
+        )]));
+        (ctx, ran)
+    }
+
+    fn nth_body(nth: usize) -> String {
+        format!("{BODY} {nth}")
+    }
+
+    fn child(path: &str) -> Value {
+        json!({ "tool": READ, "parameters": { "path": path } })
+    }
+
+    /// The whole point: a child the stream started is the child the batch
+    /// answers with, run once.
+    #[test]
+    fn a_child_the_stream_started_is_adopted_rather_than_run_again() {
+        smol::block_on(async {
+            let (mut ctx, ran) = counting_batch_ctx();
+            let runs = Arc::new(SpeculativeRuns::new(&ctx, None));
+            runs.start(BATCH_ID, 0, &child(PATTERN).to_string());
+            runs.settled().await;
+            assert_eq!(ran.load(Ordering::SeqCst), 1, "{NEVER_STARTED}");
+            ctx.speculative = Some(Arc::clone(&runs));
+            let text = run_batch(&ctx, json!([child(PATTERN)])).await;
+            assert_eq!(
+                text,
+                format!(
+                    "## {READ}\n{}\n\nAll 1 tools executed successfully.",
+                    nth_body(1)
+                ),
+                "the answer is the run the stream started"
+            );
+            assert_eq!(ran.load(Ordering::SeqCst), 1, "{RAN_TWICE}");
+        });
+    }
+
+    /// A child whose arguments changed is a different call, so the answer has
+    /// to come from running it, not from the run it no longer matches.
+    #[test]
+    fn a_child_the_model_rewrote_is_run_for_what_it_now_says() {
+        smol::block_on(async {
+            let (mut ctx, ran) = counting_batch_ctx();
+            let runs = Arc::new(SpeculativeRuns::new(&ctx, None));
+            runs.start(BATCH_ID, 0, &child("stale.rs").to_string());
+            runs.settled().await;
+            assert_eq!(ran.load(Ordering::SeqCst), 1, "{NEVER_STARTED}");
+            ctx.speculative = Some(Arc::clone(&runs));
+            let text = run_batch(&ctx, json!([child(PATTERN)])).await;
+            assert!(text.contains(&nth_body(2)), "the stale run is not reused");
+            assert_eq!(ran.load(Ordering::SeqCst), 2);
+            let report = runs.drain_report().expect("the stale run is reported");
+            assert!(
+                report
+                    .first_text_content()
+                    .unwrap_or_default()
+                    .contains("stale.rs"),
+                "the model is told what already ran"
+            );
+        });
+    }
+
+    /// An adopted child is the one the response reserved, and its verdict has
+    /// to reach that reservation: the dispatch that produced it was made
+    /// before the response existed.
+    #[test]
+    fn an_adopted_child_still_reports_its_outcome_to_the_response() {
+        smol::block_on(async {
+            let (mut ctx, ran) = counting_batch_ctx();
+            let runs = Arc::new(SpeculativeRuns::new(&ctx, None));
+            runs.start(BATCH_ID, 0, &child(PATTERN).to_string());
+            runs.settled().await;
+            assert_eq!(ran.load(Ordering::SeqCst), 1, "{NEVER_STARTED}");
+            ctx.speculative = Some(Arc::clone(&runs));
+            let observations = ResponseObservations::new(2);
+            ctx.steering_observations = Some(observations.clone());
+            ctx.steering_order = vec![0];
+            let text = run_batch(&ctx, json!([child(PATTERN)])).await;
+            assert!(text.contains(&nth_body(1)), "{RAN_TWICE}");
+            assert_eq!(ran.load(Ordering::SeqCst), 1, "{RAN_TWICE}");
+            let (facts, _) = observations.take();
+            assert_eq!(facts.len(), 1);
             assert_eq!(facts[0].name, READ);
             assert_eq!(facts[0].outcome, ToolOutcome::Success);
         });
@@ -1074,7 +1279,6 @@ mod tests {
         );
     }
 
-    const BATCH_ID: &str = "batch-1";
     const EXPECT_RUNNING_SUMMARY: &str =
         "a child names what it is acting on while it runs, not only once it is done";
 

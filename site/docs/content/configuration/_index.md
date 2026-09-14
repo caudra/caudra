@@ -151,6 +151,7 @@ The `bash`, `python_execution`, and `task` entries apply only when `ui.scroll_ca
 | `post_compaction_instructions` | String | `none` | - | Extra instructions the agent receives after any compaction (e.g. re-read plan.md) |
 | `generate_titles` | bool | `true` | - | Name a new session by summarizing its first prompt with the Title model |
 | `stale_read_check` | bool | `true` | - | Block a write to a file that changed on disk since it was read, and point a failed edit or patch at the change |
+| `eager_batch_dispatch` | bool | `true` | - | Start each `batch` child as soon as its arguments finish streaming, instead of waiting for the whole message |
 | `shell_output_filter` | bool | `true` | - | Filter completed model-facing shell output with built-in rules |
 | `defer_builtin_tools` | string | `auto` | - | When the on-demand built-in tools start outside the request array: `auto` defers them for a small model or one with no supply metadata and declares them upfront for a known non-small model, `always` defers for every model, `never` declares them upfront |
 | `disabled_tools` | string[] | `[]` | - | Tools to withhold from the model: built-in names, `server.tool`, or `server.*` for a whole MCP server. A project list extends the global one |

@@ -95,6 +95,10 @@ enum State {
 struct Child {
     /// The element's raw JSON, dropped once the row can no longer change.
     text: String,
+    /// The same JSON, kept whole until the element closes so the call can be
+    /// dispatched from it. `None` unless the reader was built to dispatch,
+    /// since every other reader settles long before the element ends.
+    raw: Option<String>,
     /// `None` until the name's closing quote arrives: a half-written name
     /// resolves to no tool, and the row it would draw is worse than no row.
     tool: Option<String>,
@@ -109,9 +113,10 @@ struct Child {
 }
 
 impl Child {
-    fn opened() -> Self {
+    fn opened(dispatching: bool) -> Self {
         Self {
             text: String::from(OBJECT_OPEN),
+            raw: dispatching.then(|| String::from(OBJECT_OPEN)),
             ..Self::default()
         }
     }
@@ -119,6 +124,9 @@ impl Child {
     fn absorb(&mut self, c: char) {
         if !self.settled {
             self.text.push(c);
+        }
+        if let Some(raw) = self.raw.as_mut() {
+            raw.push(c);
         }
         if let Some(stream) = self.delegation.as_mut() {
             stream.push(c, &mut self.revealed);
@@ -181,6 +189,9 @@ pub(super) struct Rostered {
     pub(super) entries: Option<Vec<BatchToolEntry>>,
     /// What each delegating child revealed, by its index in the list.
     pub(super) delegated: Vec<(usize, Delegated)>,
+    /// The elements that closed in this fragment, whole, by index. Empty
+    /// unless the reader was built to dispatch.
+    pub(super) ready: Vec<(usize, String)>,
 }
 
 /// The roster of one `batch` call as its argument fragments arrive.
@@ -197,15 +208,23 @@ pub(super) struct RosterStream {
     tracked: bool,
     /// A row was added, or one changed, since the last publication.
     changed: bool,
+    /// Whether an element is kept whole so the call can be dispatched before
+    /// the message it belongs to is finished.
+    dispatching: bool,
+    /// The elements that closed since the last publication.
+    ready: Vec<(usize, String)>,
 }
 
 impl RosterStream {
     /// `None` for every tool that is not `batch`. Names are matched the way
     /// [`super::tool_preview`] matches them, so `mcp_Batch` resolves too.
-    pub(super) fn new(tool: &str) -> Option<Self> {
+    pub(super) fn new(tool: &str, dispatching: bool) -> Option<Self> {
         candidates(tool)
             .any(|rest| same_key(BATCH_TOOL_NAME, rest))
-            .then(Self::default)
+            .then(|| Self {
+                dispatching,
+                ..Self::default()
+            })
     }
 
     /// What this fragment left behind: the roster, when it changed a row, and
@@ -228,6 +247,7 @@ impl RosterStream {
             entries: std::mem::take(&mut self.changed)
                 .then(|| self.children.iter().map_while(Child::entry).collect()),
             delegated,
+            ready: std::mem::take(&mut self.ready),
         }
     }
 
@@ -270,7 +290,7 @@ impl RosterStream {
     fn open(&mut self) {
         self.tracked = self.children.len() < MAX_BATCH_SIZE;
         if self.tracked {
-            self.children.push(Child::opened());
+            self.children.push(Child::opened(self.dispatching));
         }
     }
 
@@ -283,13 +303,17 @@ impl RosterStream {
     }
 
     /// The element's own closing brace: a last read of a text that is now
-    /// whole, then the buffer goes.
+    /// whole, then the buffer goes. The element itself is handed over here,
+    /// which is the earliest moment the call it describes can be run.
     fn close(&mut self) {
         self.refresh();
         if self.tracked
-            && let Some(child) = self.children.last_mut()
+            && let Some((index, child)) = self.children.iter_mut().enumerate().next_back()
         {
             child.settle();
+            if let Some(raw) = child.raw.take() {
+                self.ready.push((index, raw));
+            }
         }
         self.tracked = false;
     }
@@ -403,7 +427,7 @@ mod tests {
 
     /// Every brief the fragments revealed, folded per child index.
     fn delegated(fragments: &[&str]) -> Vec<(usize, String, String)> {
-        let mut stream = RosterStream::new(BATCH).unwrap();
+        let mut stream = RosterStream::new(BATCH, false).unwrap();
         let mut folded: Vec<(usize, String, String)> = Vec::new();
         for fragment in fragments {
             for (index, revealed) in stream.absorb(fragment).delegated {
@@ -443,7 +467,7 @@ mod tests {
 
     /// Every roster published, in order, so the growth itself can be asserted.
     fn published(fragments: &[&str]) -> Vec<Vec<(String, String)>> {
-        let mut stream = RosterStream::new(BATCH).unwrap();
+        let mut stream = RosterStream::new(BATCH, false).unwrap();
         fragments
             .iter()
             .filter_map(|fragment| stream.absorb(fragment).entries)
@@ -456,7 +480,7 @@ mod tests {
     #[test_case(SHELL, false ; "any_other_tool")]
     #[test_case("rebatch", false ; "a_name_merely_ending_in_batch")]
     fn only_a_batch_has_a_roster(tool: &str, expected: bool) {
-        assert_eq!(RosterStream::new(tool).is_some(), expected);
+        assert_eq!(RosterStream::new(tool, false).is_some(), expected);
     }
 
     #[test]
@@ -553,7 +577,7 @@ mod tests {
 
     #[test]
     fn a_fragment_that_changes_no_row_publishes_nothing() {
-        let mut stream = RosterStream::new(BATCH).unwrap();
+        let mut stream = RosterStream::new(BATCH, false).unwrap();
         assert!(stream.absorb(r#"{"tool_calls": [{"too"#).entries.is_none());
         let named = stream
             .absorb(r#"l": "shell", "parameters": {"command": "ls"}}"#)
@@ -570,7 +594,7 @@ mod tests {
     /// streamed child is drawn by the same path a dispatched one is.
     #[test]
     fn a_streamed_child_is_a_pending_roster_row() {
-        let mut stream = RosterStream::new(BATCH).unwrap();
+        let mut stream = RosterStream::new(BATCH, false).unwrap();
         let entries = stream
             .absorb(r#"{"tool_calls": [{"tool": "shell", "parameters": {"command": "ls"}}"#)
             .entries
@@ -690,6 +714,77 @@ mod tests {
             published.last().map(Vec::as_slice),
             Some([row(TASK, "Rename the workflow")].as_slice())
         );
+    }
+
+    /// Every element the fragments closed, whole, by index. What a reader
+    /// built to dispatch has to be handed, and in the fragment that closed it.
+    fn ready(fragments: &[&str]) -> Vec<Vec<(usize, String)>> {
+        let mut stream = RosterStream::new(BATCH, true).unwrap();
+        fragments
+            .iter()
+            .map(|fragment| stream.absorb(fragment).ready)
+            .collect()
+    }
+
+    #[test]
+    fn a_closed_element_is_handed_over_whole_and_only_once() {
+        let ready = ready(&[
+            r#"{"tool_calls": [{"tool": "shell", "parameters": {"command": "ls"#,
+            r#""}}, {"tool": "file_read", "parameters": {"filePath": "a.rs"}}]}"#,
+        ]);
+        assert_eq!(
+            ready,
+            [
+                vec![],
+                vec![
+                    (
+                        0,
+                        r#"{"tool": "shell", "parameters": {"command": "ls"}}"#.to_owned()
+                    ),
+                    (
+                        1,
+                        r#"{"tool": "file_read", "parameters": {"filePath": "a.rs"}}"#.to_owned()
+                    ),
+                ],
+            ],
+            "an element is handed over in the fragment that closed it, and never again"
+        );
+    }
+
+    /// The buffer is the one thing a dispatching reader cannot economise on,
+    /// and a delegating child is exactly the one that stops being rescanned.
+    #[test]
+    fn a_delegating_child_is_handed_over_with_its_whole_prompt() {
+        let body = "x".repeat(OVERSIZED_BODY);
+        let element = format!(r#"{{"tool": "task", "parameters": {{"prompt": "{body}"}}}}"#);
+        let ready = ready(&[&format!(r#"{{"tool_calls": [{element}]}}"#)]);
+        assert_eq!(ready, [vec![(0, element)]]);
+    }
+
+    /// The cap is the batch's to report, so nothing past it is ever started.
+    #[test]
+    fn children_past_the_cap_are_never_handed_over() {
+        let mut json = String::from(r#"{"tool_calls": ["#);
+        for index in 0..MAX_BATCH_SIZE + 5 {
+            json.push_str(&format!(
+                r#"{{"tool": "shell", "parameters": {{"command": "c{index}"}}}}, "#
+            ));
+        }
+        let handed: Vec<usize> = ready(&[&json])
+            .concat()
+            .into_iter()
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(handed, (0..MAX_BATCH_SIZE).collect::<Vec<_>>());
+    }
+
+    /// A reader nobody dispatches from keeps its economy: the element buffer
+    /// is the one cost worth avoiding when there is no call to start.
+    #[test]
+    fn a_reader_that_does_not_dispatch_hands_nothing_over() {
+        let mut stream = RosterStream::new(BATCH, false).unwrap();
+        let json = r#"{"tool_calls": [{"tool": "shell", "parameters": {"command": "ls"}}]}"#;
+        assert!(stream.absorb(json).ready.is_empty());
     }
 
     /// An index has to mean the child it looks like, so a roster is a prefix

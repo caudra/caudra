@@ -673,6 +673,15 @@ fn canonical_tool_name<'a>(name: &'a str, ctx: &'a ToolContext) -> &'a str {
     ctx.resolve_tool_name_alias(name)
 }
 
+/// Whether this context already knows how to run `name` itself. Speculative
+/// dispatch asks before it starts anything: a name it cannot resolve now is a
+/// name whose meaning depends on the alias map the response has yet to carry,
+/// and running the wrong tool early is worse than running the right one late.
+pub(crate) fn resolves_natively(ctx: &ToolContext, name: &str) -> bool {
+    let name = canonical_tool_name(name, ctx);
+    ctx.registry.get(name).is_some() || ctx.local_tools.contains_key(name)
+}
+
 fn set_lua_provenance(
     output: &mut ToolOutput,
     source: &crate::tools::ToolSource,

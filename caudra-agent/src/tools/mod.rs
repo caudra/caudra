@@ -521,6 +521,11 @@ pub struct ToolContext {
     /// The session's workflow runtime. Only the main agent holds one: an
     /// agent a workflow launched must not launch workflows of its own.
     pub workflow: Option<WorkflowHandle>,
+    /// The `batch` children this response started before the message asking
+    /// for them was whole. Set for the turn's own context only: a child that
+    /// could start children of its own would keep the store alive through the
+    /// context it inherited.
+    pub speculative: Option<Arc<crate::agent::speculative::SpeculativeRuns>>,
 }
 
 impl ToolContext {
@@ -734,6 +739,7 @@ pub fn interpreter_ctx(
         provider: Arc::clone(&PROVIDER),
         steering_observations: None,
         steering_order: Vec::new(),
+        speculative: None,
         model: Arc::clone(&MODEL),
         chat_provider: Arc::clone(&PROVIDER),
         chat_model: Arc::clone(&MODEL),

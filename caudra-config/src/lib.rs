@@ -939,6 +939,7 @@ pub struct AgentFileConfig {
     pub post_compaction_instructions: Option<String>,
     pub generate_titles: Option<bool>,
     pub stale_read_check: Option<bool>,
+    pub eager_batch_dispatch: Option<bool>,
     pub shell_output_filter: Option<bool>,
     pub defer_builtin_tools: Option<DeferBuiltinTools>,
     pub disabled_tools: Option<Vec<String>>,
@@ -961,6 +962,7 @@ impl AgentFileConfig {
             post_compaction_instructions,
             generate_titles,
             stale_read_check,
+            eager_batch_dispatch,
             shell_output_filter,
             defer_builtin_tools
         );
@@ -1789,6 +1791,12 @@ pub struct AgentConfig {
 
     #[config(
         default = true,
+        desc = "Start each `batch` child as soon as its arguments finish streaming, instead of waiting for the whole message"
+    )]
+    pub eager_batch_dispatch: bool,
+
+    #[config(
+        default = true,
         desc = "Filter completed model-facing shell output with built-in rules"
     )]
     pub shell_output_filter: bool,
@@ -1857,6 +1865,7 @@ impl AgentConfig {
             post_compaction_instructions: file.post_compaction_instructions,
             generate_titles: file.generate_titles.unwrap_or(true),
             stale_read_check: file.stale_read_check.unwrap_or(true),
+            eager_batch_dispatch: file.eager_batch_dispatch.unwrap_or(true),
             shell_output_filter: !no_rtk && file.shell_output_filter.unwrap_or(true),
             defer_builtin_tools: file.defer_builtin_tools.unwrap_or_default(),
             max_turns: None,

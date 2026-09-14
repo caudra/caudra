@@ -81,6 +81,7 @@ pub(super) async fn compact_history(
             retry_now,
             RequestOptions::default(),
             None,
+            None,
         )
         .await
         {

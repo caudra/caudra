@@ -187,6 +187,7 @@ pub async fn run_task(ctx: &ToolContext, request: TaskRequest) -> TaskOutcome {
         },
         steering_observations: None,
         steering_order: Vec::new(),
+        speculative: None,
         ..ctx.clone()
     };
     // Compile early: a bad schema costs zero tokens.
@@ -633,6 +634,7 @@ impl WorkflowHostContext {
             workflow: None,
             steering_observations: None,
             steering_order: Vec::new(),
+            speculative: None,
         })
     }
 }
