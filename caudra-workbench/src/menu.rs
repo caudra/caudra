@@ -3,11 +3,10 @@
 //! One list per target, stated once, so the painter and the pointer read the
 //! same items in the same order.
 
-use std::path::PathBuf;
-
 use unicode_width::UnicodeWidthStr;
 
 use crate::editor::Tab;
+use crate::fs::backend::WorkbenchPath;
 use crate::fs::tree::Row;
 
 /// Room for the widest list either target builds, so opening a menu is one
@@ -71,7 +70,7 @@ pub(crate) enum Item {
 /// the menu, so neither the row nor the strip can move underneath it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Target {
-    Row(PathBuf),
+    Row(WorkbenchPath),
     Tab(usize),
 }
 
@@ -226,6 +225,7 @@ impl Menu {
 mod tests {
     use super::{Action, Item, Menu, Target};
     use crate::editor::Tab;
+    use crate::fs::backend::WorkbenchPath;
     use crate::fs::tree::{EntryKind, Row};
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -240,7 +240,8 @@ mod tests {
 
     fn row(kind: EntryKind) -> Row {
         Row {
-            path: PathBuf::from(FILE_NAME),
+            path: WorkbenchPath::Local(FILE_NAME.into()),
+            resource: None,
             name: FILE_NAME.to_owned(),
             depth: 0,
             kind,
@@ -279,7 +280,7 @@ mod tests {
             expected,
             "{WRONG_ITEMS}"
         );
-        assert_eq!(menu.target(), &Target::Row(PathBuf::from(FILE_NAME)));
+        assert_eq!(menu.target(), &Target::Row(PathBuf::from(FILE_NAME).into()));
     }
 
     #[test]

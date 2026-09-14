@@ -4,9 +4,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use caudra_providers::model::Model;
+use caudra_workspace::{ResourceId, ResourceRevision, WorkspacePath};
 
 use crate::command::find_project_ancestor_dirs;
 use crate::prompt::profile::SystemPromptProfile;
+use crate::remote_project_context::RemoteProjectContext;
 use crate::template::Vars;
 
 const INSTRUCTION_FILES: &[&str] = &[
@@ -27,8 +29,17 @@ const LOCAL_INSTRUCTION_FILE: &str = "AGENTS.local.md";
 /// of the system prompt it patches rather than any one path.
 const INSTRUCTIONS_DISPLAY_PATH: &str = "instructions";
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum InstructionSource {
+    Local(PathBuf),
+    Remote {
+        resource_id: ResourceId,
+        revision: ResourceRevision,
+    },
+}
+
 #[derive(Clone, Default)]
-pub struct LoadedInstructions(Arc<Mutex<HashSet<PathBuf>>>);
+pub struct LoadedInstructions(Arc<Mutex<HashSet<InstructionSource>>>);
 
 impl LoadedInstructions {
     pub fn new() -> Self {
@@ -36,8 +47,23 @@ impl LoadedInstructions {
     }
 
     pub fn contains_or_insert(&self, path: PathBuf) -> bool {
+        self.contains_or_insert_source(InstructionSource::Local(path))
+    }
+
+    pub fn contains_or_insert_remote(
+        &self,
+        resource_id: ResourceId,
+        revision: ResourceRevision,
+    ) -> bool {
+        self.contains_or_insert_source(InstructionSource::Remote {
+            resource_id,
+            revision,
+        })
+    }
+
+    fn contains_or_insert_source(&self, source: InstructionSource) -> bool {
         let mut set = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        !set.insert(path)
+        !set.insert(source)
     }
 }
 
@@ -62,6 +88,21 @@ pub fn build_system_prompt(
 ) -> String {
     crate::prompt::assemble_system(
         &slots.with_native_hints(tool_filter),
+        instructions,
+        crate::prompt::STANDING_PROMPT,
+        profile,
+    )
+}
+
+pub fn build_system_prompt_for_remote(
+    instructions: &str,
+    slots: &crate::prompt::ResolvedSlots,
+    tool_filter: &crate::tools::ToolFilter,
+    profile: Option<&SystemPromptProfile>,
+    store: &caudra_storage::local_documents::LocalDocumentStore,
+) -> String {
+    crate::prompt::assemble_system(
+        &slots.with_native_hints_for_store(tool_filter, store),
         instructions,
         crate::prompt::STANDING_PROMPT,
         profile,
@@ -252,6 +293,74 @@ pub(crate) fn load_instructions_in(cwd: &str, xdg_config: Option<&Path>) -> Inst
     let mut instr = Instructions::default();
     instr.text = render(collect_instruction_files(cwd, xdg_config, &instr.loaded));
     instr
+}
+
+pub fn load_remote_instructions(context: &RemoteProjectContext) -> Instructions {
+    load_remote_instructions_in(context, caudra_storage::paths::config_dir().ok().as_deref())
+}
+
+pub(crate) fn load_remote_instructions_in(
+    context: &RemoteProjectContext,
+    xdg_config: Option<&Path>,
+) -> Instructions {
+    let mut instructions = Instructions::default();
+    let mut files = Vec::new();
+    if let Some(path) = caudra_storage::paths::user_config_dir(xdg_config, "AGENTS.md")
+        && let Some((canonical, content)) = read_instruction(&path, &instructions.loaded)
+    {
+        files.push((
+            InstructionScope::Global,
+            canonical.display().to_string(),
+            content,
+        ));
+    }
+    for instruction in context.applicable_instructions(&WorkspacePath::root()) {
+        if instructions.loaded.contains_or_insert_remote(
+            instruction.source.resource_id.clone(),
+            instruction.source.revision.clone(),
+        ) {
+            continue;
+        }
+        files.push((
+            InstructionScope::Project,
+            instruction.source.source_label(),
+            instruction.content.clone(),
+        ));
+    }
+    instructions.text = render(files);
+    if !context.skills().is_empty() {
+        instructions.text.push_str("\n\n<available_skills>\n");
+        for skill in context.skills() {
+            instructions
+                .text
+                .push_str(&format!("- {}: {}\n", skill.name, skill.description));
+        }
+        instructions.text.push_str("</available_skills>");
+    }
+    instructions
+}
+
+pub fn find_remote_nested_instructions(
+    context: &RemoteProjectContext,
+    path: &WorkspacePath,
+    loaded: &LoadedInstructions,
+) -> Vec<(String, String)> {
+    context
+        .applicable_instructions(path)
+        .into_iter()
+        .filter(|instruction| {
+            !loaded.contains_or_insert_remote(
+                instruction.source.resource_id.clone(),
+                instruction.source.revision.clone(),
+            )
+        })
+        .map(|instruction| {
+            (
+                instruction.source.source_label(),
+                instruction.content.clone(),
+            )
+        })
+        .collect()
 }
 
 pub fn find_subdirectory_instructions(

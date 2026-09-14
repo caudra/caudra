@@ -5,6 +5,7 @@
 //! same guards — decode bombs, oversized files, formats no provider takes — so
 //! the pipeline lives here and the callers only decide how to present it.
 
+use std::collections::BTreeMap;
 use std::io::Cursor;
 
 use base64::Engine;
@@ -12,6 +13,15 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use image::{DynamicImage, ImageFormat, ImageReader};
 
 use caudra_providers::{ImageMediaType, ImageSource};
+use caudra_workspace::{
+    ReadBytesRequest, ResourceId, ResourceKind, ResourceRevision, ResourceScope, ResourceSelector,
+    WorkspacePath, WorkspaceSession,
+};
+
+use crate::permissions::{
+    PermissionResource, PermissionResourceAccess, PermissionResourceKind, RemotePermissionIdentity,
+    canonical_json_sha256,
+};
 
 /// Anthropic rejects images over 5MB base64; 3MB raw is ~4MB encoded, which
 /// leaves headroom. Also keeps generation request bodies small.
@@ -69,6 +79,15 @@ pub(crate) struct PreparedImage {
     pub note: String,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct RemoteImageResource {
+    pub path: WorkspacePath,
+    pub scope: ResourceScope,
+    pub resource_id: ResourceId,
+    pub revision: ResourceRevision,
+    pub size_bytes: u64,
+}
+
 /// Read, validate, and shrink `path` until a provider will accept it.
 pub(crate) fn prepare(path: &str) -> Result<PreparedImage, String> {
     let meta = std::fs::metadata(path).map_err(|_| format!("error: path not found: {path}"))?;
@@ -84,8 +103,19 @@ pub(crate) fn prepare(path: &str) -> Result<PreparedImage, String> {
     }
 
     let bytes = std::fs::read(path).map_err(|e| format!("cannot read {path}: {e}"))?;
+    prepare_bytes(path, &bytes)
+}
+
+pub(crate) fn prepare_bytes(path: &str, bytes: &[u8]) -> Result<PreparedImage, String> {
+    if bytes.len() as u64 > MAX_INPUT_BYTES {
+        return Err(format!(
+            "{path} is too large to view ({}; limit {})",
+            format_size(bytes.len() as u64),
+            format_size(MAX_INPUT_BYTES)
+        ));
+    }
     let (format, width, height) =
-        probe(&bytes).map_err(|e| format!("{path} is not an image {e}"))?;
+        probe(bytes).map_err(|e| format!("{path} is not an image {e}"))?;
     let source_media = media_type(format).ok_or_else(|| {
         format!(
             "unsupported image format {}: only png, jpeg, gif, and webp can be viewed",
@@ -96,12 +126,12 @@ pub(crate) fn prepare(path: &str) -> Result<PreparedImage, String> {
     // Decode fully even on the pass-through path: a corrupt file shipped
     // undecoded poisons message history and fails every later request.
     let decoded =
-        decode(&bytes, format, width, height).map_err(|e| format!("cannot decode {path}: {e}"))?;
+        decode(bytes, format, width, height).map_err(|e| format!("cannot decode {path}: {e}"))?;
 
     let size = bytes.len() as u64;
     if size <= MAX_RAW_BYTES && width.max(height) <= MAX_EDGE {
         return Ok(PreparedImage {
-            source: source(source_media, &bytes),
+            source: source(source_media, bytes),
             width,
             height,
             bytes: size,
@@ -159,6 +189,166 @@ pub(crate) fn prepare(path: &str) -> Result<PreparedImage, String> {
         bytes: encoded.len() as u64,
         note,
     })
+}
+
+pub(crate) async fn resolve_remote(
+    session: &WorkspaceSession,
+    path: &WorkspacePath,
+) -> Result<RemoteImageResource, String> {
+    let service = session
+        .workspace()
+        .services()
+        .read
+        .as_ref()
+        .ok_or_else(|| "remote image reads are unavailable".to_owned())?;
+    let resource = service
+        .resolve(session.binding(), session.cursor(), path)
+        .await
+        .map_err(|error| format!("cannot resolve remote image {path}: {error}"))?;
+    let resolved_path = resource
+        .path
+        .clone()
+        .ok_or_else(|| format!("remote image {path} returned no path"))?;
+    if resource.kind != ResourceKind::File || resource.project != *session.binding().project() {
+        return Err(format!("remote image {resolved_path} is not a file"));
+    }
+    let resource_id = resource.scope.resource_id().clone();
+    let stat = service
+        .stat(
+            session.binding(),
+            session.cursor(),
+            &ResourceSelector::Id(resource_id.clone()),
+        )
+        .await
+        .map_err(|error| format!("cannot inspect remote image {resolved_path}: {error}"))?;
+    if stat.kind != ResourceKind::File
+        || stat.project != resource.project
+        || stat.path.as_ref() != Some(&resolved_path)
+        || stat.scope != resource.scope
+        || stat.revision != resource.revision
+        || stat.size_bytes != resource.size_bytes
+    {
+        return Err(format!(
+            "remote image {resolved_path} changed while it was being resolved"
+        ));
+    }
+    let revision = stat
+        .revision
+        .ok_or_else(|| format!("remote image {resolved_path} has no revision"))?;
+    let size_bytes = stat
+        .size_bytes
+        .ok_or_else(|| format!("remote image {resolved_path} has no size"))?;
+    if size_bytes > MAX_INPUT_BYTES {
+        return Err(format!(
+            "{resolved_path} is too large to view ({}; limit {})",
+            format_size(size_bytes),
+            format_size(MAX_INPUT_BYTES)
+        ));
+    }
+    Ok(RemoteImageResource {
+        path: resolved_path,
+        scope: stat.scope,
+        resource_id,
+        revision,
+        size_bytes,
+    })
+}
+
+pub(crate) async fn read_remote(
+    session: &WorkspaceSession,
+    resource: &RemoteImageResource,
+) -> Result<PreparedImage, String> {
+    let service = session
+        .workspace()
+        .services()
+        .read
+        .as_ref()
+        .ok_or_else(|| "remote image reads are unavailable".to_owned())?;
+    let max_bytes = resource.size_bytes.max(1);
+    let content = service
+        .read_bytes(
+            session.binding(),
+            session.cursor(),
+            &ReadBytesRequest {
+                resource: ResourceSelector::Id(resource.resource_id.clone()),
+                byte_offset: 0,
+                max_bytes,
+                if_revision: Some(resource.revision.clone()),
+            },
+        )
+        .await
+        .map_err(|error| format!("cannot read remote image {}: {error}", resource.path))?;
+    if content.resource_id != resource.resource_id
+        || content.revision != resource.revision
+        || content.range.start != 0
+        || content.range.end_exclusive != content.bytes.len() as u64
+        || content.total_bytes != Some(resource.size_bytes)
+        || content.bytes.len() as u64 != resource.size_bytes
+        || content.truncated
+        || content.next_byte_offset.is_some()
+    {
+        return Err(format!(
+            "remote image {} returned a stale or incomplete byte range",
+            resource.path
+        ));
+    }
+    prepare_bytes(resource.path.as_str(), &content.bytes)
+}
+
+pub(crate) fn remote_permission_resource(
+    session: &WorkspaceSession,
+    scope: &ResourceScope,
+    path: &WorkspacePath,
+    access: PermissionResourceAccess,
+    mutating: bool,
+) -> PermissionResource {
+    PermissionResource {
+        kind: PermissionResourceKind::RemoteFile {
+            identity: RemotePermissionIdentity::from_binding(session.binding()),
+        },
+        value: scope
+            .ancestors()
+            .iter()
+            .chain(std::iter::once(scope.resource_id()))
+            .map(ResourceId::as_str)
+            .collect::<Vec<_>>()
+            .join("\u{1f}"),
+        access: Some(access),
+        protected: mutating,
+        requires_prompt: mutating,
+        attributes: BTreeMap::from([("display_path".to_owned(), path.as_str().to_owned())]),
+    }
+}
+
+pub(crate) fn unresolved_remote_permission_resource(
+    session: &WorkspaceSession,
+    path: &WorkspacePath,
+    access: PermissionResourceAccess,
+) -> PermissionResource {
+    let identity = RemotePermissionIdentity::from_binding(session.binding());
+    let opaque_path = canonical_json_sha256(&serde_json::json!({
+        "identity": &identity,
+        "cursor": session.cursor(),
+        "path": path,
+    }));
+    let value = session
+        .cursor()
+        .scope()
+        .ancestors()
+        .iter()
+        .chain(std::iter::once(session.cursor().scope().resource_id()))
+        .map(ResourceId::as_str)
+        .chain(std::iter::once(opaque_path.as_str()))
+        .collect::<Vec<_>>()
+        .join("\u{1f}");
+    PermissionResource {
+        kind: PermissionResourceKind::RemoteFile { identity },
+        value,
+        access: Some(access),
+        protected: true,
+        requires_prompt: true,
+        attributes: BTreeMap::from([("display_path".to_owned(), path.as_str().to_owned())]),
+    }
 }
 
 fn source(media_type: ImageMediaType, bytes: &[u8]) -> ImageSource {

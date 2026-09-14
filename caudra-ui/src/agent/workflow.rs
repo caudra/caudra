@@ -26,6 +26,8 @@ use caudra_lua::EventHandle;
 use caudra_providers::Timeouts;
 use caudra_storage::StateDir;
 use caudra_storage::id::{CaudraId, SessionRef};
+use caudra_storage::local_documents::LocalDocumentStore;
+use caudra_workspace::WorkspaceSession;
 use futures_lite::future;
 use smol::Timer;
 use tracing::{info, warn};
@@ -65,6 +67,10 @@ pub(crate) struct WorkflowSpawn<'a> {
     /// The session's, not the runtime's: a workflow agent's write has to be
     /// recoverable through the same revert point as the user's own run.
     pub(crate) baseline: Option<BaselineGate>,
+    pub(crate) workspace_session: Option<WorkspaceSession>,
+    pub(crate) remote_project_context:
+        Option<Arc<caudra_agent::remote_project_context::RemoteProjectContext>>,
+    pub(crate) local_documents: Option<Arc<LocalDocumentStore>>,
 }
 
 /// The channel a `question` is answered on. Workflow agents ask through the
@@ -93,9 +99,20 @@ impl WorkflowSession {
     /// `None` when the runtime cannot open its store: the session then runs
     /// without workflows rather than not at all.
     pub(crate) fn spawn(spawn: WorkflowSpawn<'_>) -> Option<Self> {
-        let cwd = env::current_dir().unwrap_or_else(|_| spawn.permissions.project_cwd());
+        let cwd = match &spawn.workspace_session {
+            Some(workspace) => match smol::block_on(caudra_agent::workspace_logical_cwd(workspace))
+            {
+                Ok(cwd) => cwd.into(),
+                Err(error) => {
+                    warn!(%error, "remote workflow cwd unavailable");
+                    return None;
+                }
+            },
+            None => env::current_dir().unwrap_or_else(|_| spawn.permissions.project_cwd()),
+        };
         let slot = spawn.model_slot.load();
-        let tool_filter = ToolFilter::from_config(spawn.config, &slot.model, &[]);
+        let tool_filter = ToolFilter::from_config(spawn.config, &slot.model, &[])
+            .for_remote_workspace(spawn.workspace_session.is_some());
         let base = AgentParams {
             provider: Arc::clone(&slot.provider),
             model: slot.model.clone(),
@@ -105,6 +122,11 @@ impl WorkflowSession {
             tool_output_lines: spawn.tool_output_lines,
             permissions: Arc::clone(spawn.permissions),
             session_id: Some(SessionRef::from(spawn.session_id)),
+            workspace_session: spawn.workspace_session,
+            remote_project_context: spawn.remote_project_context.clone(),
+            local_documents: spawn.local_documents,
+            task_environment: caudra_agent::template::env_vars()
+                .set("{cwd}", cwd.to_string_lossy().into_owned()),
             root_tool_use_id: None,
             mailbox: None,
             context_publisher: Some(spawn.context_publisher),
@@ -144,7 +166,10 @@ impl WorkflowSession {
             McpSession::new(handle.clone(), &[]).with_disabled_tools(&spawn.config.disabled_tools)
         });
         let started = Instant::now();
-        let loaded_instructions = agent::load_instructions(&cwd.to_string_lossy()).loaded;
+        let loaded_instructions = spawn.remote_project_context.as_ref().map_or_else(
+            || agent::load_instructions(&cwd.to_string_lossy()).loaded,
+            |context| agent::load_remote_instructions(context).loaded,
+        );
         let instructions_ms = started.elapsed().as_millis() as u64;
         let runtime_start = Instant::now();
         let host = WorkflowHostContext::from_agent_params(
@@ -165,6 +190,7 @@ impl WorkflowSession {
             session_id: spawn.session_id,
             cwd,
             user_config_dir: None,
+            remote_project_context: spawn.remote_project_context,
             runner: Arc::new(SubagentTaskRunner::new(Arc::new(host))),
             events: spawn.events,
             mode: mode_resolver,

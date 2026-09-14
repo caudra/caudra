@@ -1,6 +1,6 @@
 use std::env;
 use std::fmt::Write as _;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -11,17 +11,14 @@ use caudra_agent::mcp::{McpSession, config as mcp_config, oauth as mcp_oauth};
 use caudra_agent::tools::native::skill::{self, SkillDirCandidate, SkillInventoryEntry};
 use caudra_agent::tools::report::{CATALOG_SOURCE, REASON_CATALOG, REASON_CONFIG, REASON_DEFERRED};
 use caudra_agent::tools::{
-    BuiltinDeferral, DescriptionContext, RegisteredTool, SHELL_TOOL_NAME, TOOL_SEARCH_TOOL_NAME,
-    ToolAudience, ToolFilter, ToolRegistry, ToolState, builtin_report, is_tool_enabled,
+    BuiltinDeferral, DescriptionContext, SHELL_TOOL_NAME, TOOL_SEARCH_TOOL_NAME, ToolAudience,
+    ToolFilter, ToolRegistry, ToolState, builtin_report, is_tool_enabled,
 };
 use caudra_config::providers::{
     Protocol, ProviderDef, ProvidersConfig, all_builtins, builtin_provider, resolve_api_key_env,
     resolve_base_url, resolve_default_model, resolve_display_name, resolve_login_url, slugify,
 };
-use caudra_config::{
-    Config, DefaultEffect, ModelPolicy, PermissionsConfig, ToolKey, load_env_files,
-    load_permissions,
-};
+use caudra_config::{Config, DefaultEffect, ModelPolicy, PermissionsConfig, ToolKey};
 use caudra_lua::PluginHost;
 use caudra_providers::model_registry::{self, Binding};
 use caudra_providers::provider::fetch_all_models;
@@ -31,8 +28,10 @@ use caudra_providers::{
 use caudra_providers::{anthropic_auth, copilot_auth, dynamic, openai_auth, xai_auth};
 use caudra_storage::StateDir;
 use caudra_storage::auth::{
-    ProviderAuth, ProviderCredentials, delete_provider_credentials, load_provider_credentials,
-    save_provider_credentials, try_load_provider_auth,
+    MAX_WORKCELL_BEARER_TOKEN_BYTES, ProviderAuth, ProviderCredentials, WorkcellCredential,
+    WorkcellCredentialName, delete_provider_credentials, delete_workcell_credential,
+    list_workcell_credentials, load_provider_credentials, save_provider_credentials,
+    save_workcell_credential, try_load_provider_auth,
 };
 use caudra_storage::model::persist_model_for_every_mode;
 use caudra_storage::sessions::StoredMode;
@@ -75,6 +74,60 @@ pub fn auth_login(
     match provider {
         Some(provider) => login_slug(&slugify(provider), method, storage)?,
         None => login_interactive(storage)?,
+    }
+    Ok(())
+}
+
+pub fn workcell_credential_set(
+    name: &WorkcellCredentialName,
+    from_stdin: bool,
+    storage: &StateDir,
+) -> Result<()> {
+    let token = if from_stdin {
+        read_workcell_bearer(io::stdin().lock()).context("read Workcell bearer token from stdin")?
+    } else {
+        rpassword::prompt_password("Workcell bearer token: ")
+            .context("read hidden Workcell bearer token")?
+    };
+    let credential = WorkcellCredential::new(token).context("validate Workcell bearer token")?;
+    save_workcell_credential(storage, name, &credential).context("save Workcell credential")?;
+    println!("Saved Workcell credential '{name}'.");
+    Ok(())
+}
+
+fn read_workcell_bearer(reader: impl Read) -> Result<String> {
+    let limit = MAX_WORKCELL_BEARER_TOKEN_BYTES as u64 + 3;
+    let mut token = String::new();
+    reader.take(limit).read_to_string(&mut token)?;
+    if token.len() > MAX_WORKCELL_BEARER_TOKEN_BYTES + 2 {
+        bail!("Workcell bearer token exceeds {MAX_WORKCELL_BEARER_TOKEN_BYTES} bytes");
+    }
+    if token.ends_with('\n') {
+        token.pop();
+        if token.ends_with('\r') {
+            token.pop();
+        }
+    }
+    Ok(token)
+}
+
+pub fn workcell_credential_list(storage: &StateDir) -> Result<()> {
+    let credentials = list_workcell_credentials(storage).context("list Workcell credentials")?;
+    if credentials.is_empty() {
+        println!("No Workcell credentials stored.");
+        return Ok(());
+    }
+    for credential in credentials {
+        println!("{}\t{}", credential.name, credential.updated_at_millis);
+    }
+    Ok(())
+}
+
+pub fn workcell_credential_delete(name: &WorkcellCredentialName, storage: &StateDir) -> Result<()> {
+    if delete_workcell_credential(storage, name).context("delete Workcell credential")? {
+        println!("Deleted Workcell credential '{name}'.");
+    } else {
+        println!("Workcell credential '{name}' was not stored.");
     }
     Ok(())
 }
@@ -756,15 +809,21 @@ fn print_model_jobs(model_arg: Option<&str>, config: &Config) -> Result<()> {
     Ok(())
 }
 
-pub fn models(jobs: bool, model_arg: Option<&str>, no_plugins: bool, no_jit: bool) -> Result<()> {
+pub fn models(cli: &Cli, jobs: bool) -> Result<()> {
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
-    load_env_files(&cwd);
+    let storage = StateDir::resolve().context("resolve data directory")?;
+    let runtime = super::workcell_runtime::WorkcellRuntime::initialize(
+        &cli.workcell,
+        &cwd,
+        &storage,
+        ToolRegistry::global(),
+    )?;
 
-    let host = PluginHost::with_jit(Arc::clone(ToolRegistry::global_arc()), !no_jit)
+    let host = PluginHost::with_jit(Arc::clone(ToolRegistry::global_arc()), !cli.no_jit)
         .context("initialize lua plugin host")?;
-    let config = load_effective_config(&host, no_plugins, &cwd)?;
+    let config = load_effective_config(&host, cli.no_plugins, &cwd, runtime.is_remote())?;
     if jobs {
-        return print_model_jobs(model_arg, &config);
+        return print_model_jobs(cli.model.as_deref(), &config);
     }
 
     smol::block_on(fetch_all_models(
@@ -782,31 +841,37 @@ pub fn models(jobs: bool, model_arg: Option<&str>, no_plugins: bool, no_jit: boo
     Ok(())
 }
 
-fn load_effective_config(host: &PluginHost, no_plugins: bool, cwd: &Path) -> Result<Config> {
-    host.load_init_files_or_skip(no_plugins, cwd)
-        .context("load init.lua files")?
+fn load_effective_config(
+    host: &PluginHost,
+    no_plugins: bool,
+    cwd: &Path,
+    remote: bool,
+) -> Result<Config> {
+    let raw = if remote {
+        host.load_global_init_file_or_skip(no_plugins)
+    } else {
+        host.load_init_files_or_skip(no_plugins, cwd)
+    };
+    raw.context("load init.lua files")?
         .unwrap_or_default()
         .into_config(false)
         .context("invalid config")
 }
 
-pub fn index(path: &str, no_plugins: bool, no_jit: bool) -> Result<()> {
+pub fn index(cli: &Cli, path: &str) -> Result<()> {
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
-    load_env_files(&cwd);
-    let _workcell_host = super::register_builtin_tools(&cwd)?;
+    let storage = StateDir::resolve().context("resolve data directory")?;
+    let runtime = super::workcell_runtime::WorkcellRuntime::initialize(
+        &cli.workcell,
+        &cwd,
+        &storage,
+        ToolRegistry::global(),
+    )?;
 
-    let mut host = PluginHost::with_jit(Arc::clone(ToolRegistry::global_arc()), !no_jit)
+    let mut host = PluginHost::with_jit(Arc::clone(ToolRegistry::global_arc()), !cli.no_jit)
         .context("initialize lua plugin host")?;
 
-    let raw_config = host
-        .load_init_files_or_skip(no_plugins, &cwd)
-        .context("load init.lua files")?;
-
-    let mut config = raw_config
-        .unwrap_or_default()
-        .into_config(false)
-        .context("invalid config")?;
-    config.permissions = load_permissions(&cwd);
+    let config = super::load_config(&host, cli, &cwd, runtime.is_remote())?;
     super::configure_native_tools(&config.agent);
     super::install_native_permission_rules(&host.plugin_rules(), &cwd);
 
@@ -815,10 +880,45 @@ pub fn index(path: &str, no_plugins: bool, no_jit: bool) -> Result<()> {
 
     ensure_index_enabled(&config.agent)?;
     let reg = ToolRegistry::global_arc();
-    let entry = reg
-        .get("file_index")
-        .ok_or_else(|| color_eyre::eyre::eyre!("index tool not registered"))?;
-    print!("{}", execute_index(entry, path, config.agent, &cwd)?);
+    let project_cwd = if runtime.is_remote() {
+        Path::new(&runtime.display().cwd)
+    } else {
+        &cwd
+    };
+    let mut ctx = caudra_agent::tools::cli_tool_ctx(project_cwd);
+    ctx.workspace_session = runtime.workspace_session().cloned();
+    ctx.remote_project_context = runtime.remote_project_context().cloned();
+    ctx.permissions = Arc::new(
+        caudra_agent::permissions::PermissionManager::new_persistent(
+            config.permissions.clone(),
+            project_cwd.to_path_buf(),
+            host.plugin_rules(),
+        ),
+    );
+    ctx.permissions.replace_remote_permission_asset(
+        runtime
+            .remote_project_context()
+            .and_then(|context| context.permissions()),
+    )?;
+    ctx.config = config.agent;
+    print!("{}", execute_index(reg, path, ctx)?);
+    Ok(())
+}
+
+pub fn remote_control(cli: &Cli, args: &[String]) -> Result<()> {
+    let args = args.join(" ");
+    caudra_workspace::WorkspaceControlCommand::parse(&args)
+        .map_err(color_eyre::eyre::Error::msg)?;
+    if !cli.workcell.is_set() {
+        bail!("Select a remote Workcell profile or endpoint for remote control");
+    }
+    let storage = StateDir::resolve().context("resolve data directory")?;
+    let workspace = super::workcell_runtime::connect_control(&cli.workcell, &storage)?;
+    let output = smol::block_on(caudra_workspace::execute_workspace_control(
+        &workspace, &args,
+    ))
+    .map_err(color_eyre::eyre::Error::msg)?;
+    println!("{output}");
     Ok(())
 }
 
@@ -830,29 +930,34 @@ fn ensure_index_enabled(config: &caudra_config::AgentConfig) -> Result<()> {
 }
 
 fn execute_index(
-    entry: RegisteredTool,
+    registry: &ToolRegistry,
     path: &str,
-    config: caudra_config::AgentConfig,
-    project_cwd: &Path,
+    ctx: caudra_agent::tools::ToolContext,
 ) -> Result<String> {
     let input = serde_json::json!({"path": path});
-    let inv = entry
-        .tool
-        .parse(&input)
-        .map_err(|e| color_eyre::eyre::eyre!("parse index input: {e}"))?;
-    let mut ctx = caudra_agent::tools::cli_tool_ctx(project_cwd);
-    ctx.config = config;
-    let result = smol::block_on(async { inv.execute(&ctx).await });
-    match result.output {
-        Ok(output) => Ok(output.as_text()),
-        Err(e) => bail!("index failed: {e}"),
+    let result = smol::block_on(caudra_agent::agent::tool_dispatch::run(
+        registry,
+        None,
+        "cli-index".into(),
+        "file_index",
+        &input,
+        &ctx,
+        caudra_agent::agent::tool_dispatch::Emit::Silent,
+    ));
+    if result.is_error {
+        bail!("index failed: {}", result.output.as_text());
     }
+    Ok(result.output.as_text())
 }
 
-pub fn mcp_auth(server: &str, storage: &StateDir) -> Result<()> {
+pub fn mcp_auth(server: &str, storage: &StateDir, global_only: bool) -> Result<()> {
     smol::block_on(async {
         let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
-        let (config, _) = mcp_config::load_config(&cwd);
+        let (config, _) = if global_only {
+            mcp_config::load_global_config(&cwd)
+        } else {
+            mcp_config::load_config(&cwd)
+        };
         let raw = config
             .mcp
             .get(server)
@@ -1032,19 +1137,23 @@ fn print_group(heading: &str, rows: &[ToolRow]) {
 
 pub fn tools(cli: &Cli, enabled_only: bool, json: bool, names: bool, schemas: bool) -> Result<()> {
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
-    load_env_files(&cwd);
-    let _workcell_host = super::register_builtin_tools(&cwd)?;
+    let storage = StateDir::resolve().context("resolve data directory")?;
+    let runtime = super::workcell_runtime::WorkcellRuntime::initialize(
+        &cli.workcell,
+        &cwd,
+        &storage,
+        ToolRegistry::global(),
+    )?;
 
     let reg = ToolRegistry::global_arc();
     let mut host =
         PluginHost::with_jit(Arc::clone(reg), !cli.no_jit).context("initialize lua plugin host")?;
-    let config = super::load_config(&host, cli, &cwd)?;
+    let config = super::load_config(&host, cli, &cwd, runtime.is_remote())?;
     super::configure_native_tools(&config.agent);
     super::install_native_permission_rules(&host.plugin_rules(), &cwd);
     host.load_production_builtins(&config.plugins)
         .context("load builtin plugins")?;
 
-    let storage = StateDir::resolve().context("resolve data directory")?;
     let mut model = resolve_model(
         cli.model.as_deref(),
         &config.provider,
@@ -1054,7 +1163,11 @@ pub fn tools(cli: &Cli, enabled_only: bool, json: bool, names: bool, schemas: bo
     caudra_providers::provider::adjust_model(&mut model, Timeouts::default())?;
     let filter = ToolFilter::from_config(&config.agent, &model, &[]);
 
-    let (mcp_handle, mcp_errors) = smol::block_on(caudra_agent::mcp::start_connected(&cwd));
+    let (mcp_handle, mcp_errors) = if runtime.is_remote() {
+        smol::block_on(caudra_agent::mcp::start_global_connected(&cwd))
+    } else {
+        smol::block_on(caudra_agent::mcp::start_connected(&cwd))
+    };
     if !mcp_errors.is_empty() {
         eprintln!("warning: {mcp_errors}");
     }
@@ -1068,11 +1181,14 @@ pub fn tools(cli: &Cli, enabled_only: bool, json: bool, names: bool, schemas: bo
             audience: ToolAudience::MAIN,
             workflows_available: false,
         };
-        let mut defs = reg.definitions(
-            &caudra_agent::template::env_vars(),
-            &ctx,
-            model.supports_tool_examples(),
-        );
+        let vars = if runtime.is_remote() {
+            caudra_agent::template::env_vars()
+                .set("{cwd}", runtime.display().cwd.clone())
+                .set("{platform}", runtime.display().platform.clone())
+        } else {
+            caudra_agent::template::env_vars()
+        };
+        let mut defs = reg.definitions(&vars, &ctx, model.supports_tool_examples());
         if let Some(mcp) = &mcp {
             mcp.request_snapshot().extend_tools(&mut defs);
         }
@@ -1121,13 +1237,18 @@ pub fn tools(cli: &Cli, enabled_only: bool, json: bool, names: bool, schemas: bo
 /// disagree with the one the model sees.
 pub fn skills(cli: &Cli, name: Option<&str>, names: bool, json: bool, dirs: bool) -> Result<()> {
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
-    load_env_files(&cwd);
-    let _workcell_host = super::register_builtin_tools(&cwd)?;
+    let storage = StateDir::resolve().context("resolve data directory")?;
+    let runtime = super::workcell_runtime::WorkcellRuntime::initialize(
+        &cli.workcell,
+        &cwd,
+        &storage,
+        ToolRegistry::global(),
+    )?;
 
     let reg = ToolRegistry::global_arc();
     let mut host =
         PluginHost::with_jit(Arc::clone(reg), !cli.no_jit).context("initialize lua plugin host")?;
-    let config = super::load_config(&host, cli, &cwd)?;
+    let config = super::load_config(&host, cli, &cwd, runtime.is_remote())?;
     super::configure_native_tools(&config.agent);
     host.load_production_builtins(&config.plugins)
         .context("load builtin plugins")?;
@@ -1225,6 +1346,7 @@ pub fn prompt(
     no_rtk: bool,
     model_arg: Option<&str>,
     profile_arg: Option<&str>,
+    workcell: &crate::cli::WorkcellSelectorArgs,
 ) -> Result<()> {
     use crate::cli::PromptVariant;
     use caudra_agent::agent::{build_system_prompt, environment_block, load_instruction_text};
@@ -1238,16 +1360,30 @@ pub fn prompt(
         bail!("--plan can only be used with the 'system' prompt variant");
     }
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
-    load_env_files(&cwd);
-    let _workcell_host = super::register_builtin_tools(&cwd)?;
+    let storage = StateDir::resolve().context("resolve data directory")?;
+    let runtime = super::workcell_runtime::WorkcellRuntime::initialize(
+        workcell,
+        &cwd,
+        &storage,
+        ToolRegistry::global(),
+    )?;
 
-    let vars = template::env_vars();
+    let vars = if runtime.is_remote() {
+        template::env_vars()
+            .set("{cwd}", runtime.display().cwd.clone())
+            .set("{platform}", runtime.display().platform.clone())
+    } else {
+        template::env_vars()
+    };
     let reg = ToolRegistry::global_arc();
     let mut host =
         PluginHost::with_jit(Arc::clone(reg), !no_jit).context("initialize lua plugin host")?;
-    let raw_config = host
-        .load_init_files_or_skip(no_plugins, &cwd)
-        .context("load init.lua files")?;
+    let raw_config = if runtime.is_remote() {
+        host.load_global_init_file_or_skip(no_plugins)
+    } else {
+        host.load_init_files_or_skip(no_plugins, &cwd)
+    }
+    .context("load init.lua files")?;
     let config = raw_config
         .unwrap_or_default()
         .into_config(no_rtk)
@@ -1258,14 +1394,17 @@ pub fn prompt(
         .context("load builtin plugins")?;
 
     let cwd_str = cwd.to_string_lossy();
-    let instructions = load_instruction_text(&cwd_str);
+    let instructions = if let Some(context) = runtime.remote_project_context() {
+        caudra_agent::agent::load_remote_instructions(context).text
+    } else {
+        load_instruction_text(&cwd_str)
+    };
     let slots = host.event_handle().collect_prompt_slots(&config.agent);
     let prompt_profiles = caudra_agent::prompt::profile::PromptProfileCatalog::discover_user();
     let profile_name = profile_arg.or(config.agent.system_prompt_profile.as_deref());
     let system_prompt_profile = prompt_profiles
         .resolve(profile_name)
         .context("resolve system prompt profile")?;
-    let storage = StateDir::resolve().context("resolve data directory")?;
     let mut model =
         crate::setup::resolve_model(model_arg, &config.provider, &storage, StoredMode::Build)?;
     caudra_providers::provider::adjust_model(&mut model, caudra_providers::Timeouts::default())?;
@@ -1359,7 +1498,43 @@ pub fn prompt(
 #[cfg(test)]
 mod auth_tests {
     use super::*;
+    use caudra_agent::permissions::PermissionManager;
+    use caudra_agent::tools::cli_tool_ctx;
+    use caudra_config::{Effect, PermissionRule};
+    use caudra_workcell::WorkcellHost;
+    use tempfile::TempDir;
     use test_case::test_case;
+
+    #[test_case(Effect::Allow; "authorized")]
+    #[test_case(Effect::Deny; "denied")]
+    fn index_subcommand_uses_permission_dispatch(effect: Effect) {
+        const SOURCE: &str = "pub fn indexed() {}";
+        const FILE: &str = "source.rs";
+        let root = TempDir::new().unwrap();
+        std::fs::write(root.path().join(FILE), SOURCE).unwrap();
+        let host = WorkcellHost::new(root.path(), None).unwrap();
+        let registry = ToolRegistry::new();
+        host.register(&registry).unwrap();
+        let mut ctx = cli_tool_ctx(root.path());
+        ctx.permissions = Arc::new(PermissionManager::new_nonpersistent(
+            PermissionsConfig {
+                rules: vec![PermissionRule {
+                    tool: ToolKey::native("file_index"),
+                    scope: Some("*".into()),
+                    effect,
+                }],
+                ..PermissionsConfig::default()
+            },
+            root.path().to_path_buf(),
+            Arc::default(),
+        ));
+        let result = execute_index(&registry, FILE, ctx);
+        if effect == Effect::Allow {
+            assert!(result.unwrap().contains("indexed"));
+        } else {
+            assert!(result.is_err());
+        }
+    }
 
     #[test_case("OpenAI", None, LoginRoute::OpenAiOauth ; "normalized_openai_defaults_to_oauth")]
     #[test_case("Anthropic", None, LoginRoute::AnthropicOauth ; "normalized_anthropic_defaults_to_oauth")]
@@ -1375,6 +1550,23 @@ mod auth_tests {
     #[test]
     fn oauth_method_rejects_non_subscription_provider() {
         assert!(login_route("google", Some(AuthMethod::Oauth)).is_err());
+    }
+
+    #[test]
+    fn workcell_stdin_token_strips_only_the_line_ending() {
+        const TOKEN: &str = "bearer-private-value";
+
+        assert_eq!(
+            read_workcell_bearer(format!("{TOKEN}\r\n").as_bytes()).unwrap(),
+            TOKEN
+        );
+    }
+
+    #[test]
+    fn workcell_stdin_token_is_bounded_before_storage() {
+        let input = "x".repeat(MAX_WORKCELL_BEARER_TOKEN_BYTES + 3);
+
+        assert!(read_workcell_bearer(input.as_bytes()).is_err());
     }
 
     const FAST_SPEC: &str = "anthropic/claude-haiku-4-5";

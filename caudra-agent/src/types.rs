@@ -11,6 +11,7 @@ use caudra_storage::usage_ledger::LedgerPurpose;
 use caudra_workflow::{
     AgentRosterEntry, LogLine, PhaseRecord, RosterState, RunSnapshot, RunStatus, RunUsage,
 };
+use caudra_workspace::LocalDocumentRef;
 use flume::Sender;
 use serde::{Deserialize, Serialize};
 use strum::Display;
@@ -1104,6 +1105,8 @@ pub struct ToolDoneEvent {
     pub written_path: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub written_paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub remote_written_paths: bool,
     pub output_ref: Option<ToolOutputRef>,
     #[serde(skip)]
     pub output_limits: Option<ToolOutputLimits>,
@@ -1129,6 +1132,7 @@ impl ToolDoneEvent {
             annotation: None,
             written_path: None,
             written_paths: Vec::new(),
+            remote_written_paths: false,
             output_ref: None,
             output_limits: None,
             model_suffix: None,
@@ -1182,8 +1186,26 @@ impl ToolDoneEvent {
     }
 
     pub fn wrote_to(&self, plan_path: &Path) -> bool {
-        self.written_paths()
-            .any(|written_path| Path::new(written_path) == plan_path)
+        !self.remote_written_paths
+            && self
+                .written_paths()
+                .any(|written_path| Path::new(written_path) == plan_path)
+    }
+
+    pub fn wrote_document(&self, reference: &LocalDocumentRef) -> bool {
+        if self.is_error {
+            return false;
+        }
+        let (kind, id) = match reference {
+            LocalDocumentRef::Plan(reference) => ("plan", reference.as_str()),
+            LocalDocumentRef::Memory(reference) => ("memory", reference.as_str()),
+        };
+        self.annotation.as_deref().is_some_and(|annotation| {
+            annotation
+                .strip_prefix("local_document:")
+                .and_then(|value| value.split_once(";revision:"))
+                .is_some_and(|(written, _)| written == format!("{kind}:{id}"))
+        })
     }
 }
 
@@ -2306,6 +2328,7 @@ mod tests {
                 annotation: None,
                 written_path: None,
                 written_paths: Vec::new(),
+                remote_written_paths: false,
                 output_ref: None,
                 output_limits: None,
                 model_suffix: None,
@@ -2320,6 +2343,7 @@ mod tests {
                 annotation: None,
                 written_path: None,
                 written_paths: Vec::new(),
+                remote_written_paths: false,
                 output_ref: None,
                 output_limits: None,
                 model_suffix: None,
@@ -2348,6 +2372,7 @@ mod tests {
                 annotation: None,
                 written_path: None,
                 written_paths: Vec::new(),
+                remote_written_paths: false,
                 output_ref: None,
                 output_limits: None,
                 model_suffix: None,
@@ -2387,6 +2412,7 @@ mod tests {
             annotation: None,
             written_path: None,
             written_paths: Vec::new(),
+            remote_written_paths: false,
             output_ref: Some(output_ref.clone()),
             output_limits: None,
             model_suffix: Some("model context".into()),
@@ -2425,6 +2451,7 @@ mod tests {
             annotation: None,
             written_path: Some("/tmp/file.rs".into()),
             written_paths: Vec::new(),
+            remote_written_paths: false,
             output_ref: None,
             output_limits: None,
             model_suffix: None,
@@ -2461,6 +2488,7 @@ mod tests {
             annotation: None,
             written_path: None,
             written_paths: Vec::new(),
+            remote_written_paths: false,
             output_ref: None,
             output_limits: None,
             model_suffix: None,
@@ -2556,12 +2584,14 @@ mod tests {
             annotation: None,
             written_path: Some("/plans/slug.md".into()),
             written_paths: Vec::new(),
+            remote_written_paths: false,
             output_ref: None,
             output_limits: None,
             model_suffix: None,
             model_output: None,
             model_output_from_ref: false,
         };
+        assert!(ok_event.wrote_to(Path::new("/plans/slug.md")));
         assert!(!ok_event.wrote_to(Path::new("/plans/other.md")));
 
         let err_event = ToolDoneEvent {
@@ -2581,6 +2611,7 @@ mod tests {
             annotation: None,
             written_path: Some("/project/first.rs".into()),
             written_paths: vec!["/project/first.rs".into(), "/project/second.rs".into()],
+            remote_written_paths: false,
             output_ref: None,
             output_limits: None,
             model_suffix: None,
@@ -2600,6 +2631,28 @@ mod tests {
             serialized["written_paths"],
             serde_json::json!(["/project/first.rs", "/project/second.rs"])
         );
+    }
+
+    #[test]
+    fn remote_written_path_never_completes_a_local_plan() {
+        let plan = "/project/plan.md";
+        let event = ToolDoneEvent {
+            id: "call".into(),
+            tool: Arc::from("file_write"),
+            output: ToolOutput::Plain("written remotely".into()),
+            is_error: false,
+            annotation: None,
+            written_path: Some(plan.into()),
+            written_paths: vec![plan.into()],
+            remote_written_paths: true,
+            output_ref: None,
+            output_limits: None,
+            model_suffix: None,
+            model_output: None,
+            model_output_from_ref: false,
+        };
+        assert_eq!(event.written_path(), Some(plan));
+        assert!(!event.wrote_to(Path::new(plan)));
     }
 
     #[test]
@@ -2836,6 +2889,7 @@ mod tests {
             annotation: None,
             written_path,
             written_paths: Vec::new(),
+            remote_written_paths: false,
             output_ref: None,
             output_limits: None,
             model_suffix: None,

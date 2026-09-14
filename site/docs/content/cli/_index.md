@@ -39,6 +39,7 @@ When interactive Caudra starts in a Herdr pane, it automatically reports native 
 | `--max-turns`, `--session-id`, `--fork-session` | no | no | yes |
 | `--permission-mode` | no | no | yes |
 | `--include-partial-messages` | no | no | yes |
+| `--workcell-profile` or direct Workcell selectors | yes | yes | yes |
 
 ### Shared flags (detail)
 
@@ -70,6 +71,26 @@ When interactive Caudra starts in a Herdr pane, it automatically reports native 
 | `--permission-mode <MODE>` | SDK: `default`, `acceptEdits`, `plan`, or `bypassPermissions` |
 | `--include-partial-messages` | Stream partial deltas in SDK mode |
 
+### Remote Workcell selection
+
+```bash
+caudra --workcell-profile dev
+caudra --workcell-profile dev --continue
+caudra --workcell-profile dev -p --prompt "summarize the architecture"
+caudra --workcell-profile dev acp
+caudra --workcell-endpoint https://workcell.example/mcp \
+  --workcell-cwd projects/app --workcell-credential-ref credential:dev
+```
+
+| Flag | Description |
+|------|-------------|
+| `--workcell-profile <NAME>` | Select `[workcell.profiles.NAME]` from the local user `workcell.toml` |
+| `--workcell-endpoint <URL>` | Direct endpoint selection. Requires `--workcell-cwd` |
+| `--workcell-cwd <PATH>` | Root-relative remote directory, such as `.` or `projects/app`. Requires `--workcell-endpoint` |
+| `--workcell-credential-ref <credential:NAME>` | Saved bearer credential. Requires both direct endpoint and cwd flags |
+
+These flags are global. A profile cannot be combined with any direct selector. With no selector, Caudra uses embedded Workcell. Selection errors and remote failures stop the operation without local fallback. See [Remote Workspaces](/docs/remote-workspaces/) for server setup, endpoint restrictions, and resume identity.
+
 ### Tool name lists
 
 `--allowed-tools` / `--disallowed-tools` accept PascalCase (`FileRead,FileEdit,Shell`) or snake_case (`file_read,file_edit,shell`). Caudra converts PascalCase to snake_case and checks the result against the built-in tool names. Unknown names fail with the complete list of valid names.
@@ -91,12 +112,29 @@ Several other Claude Code flags are accepted and ignored so existing scripts kee
 
 ## Subcommands
 
+### `caudra remote`
+
+Inspect or recover the selected remote workspace without running a model:
+
+```bash
+caudra --workcell-profile dev remote status
+caudra --workcell-profile dev remote pending
+caudra --workcell-profile dev remote reconnect
+caudra --workcell-profile dev remote reconcile
+caudra --workcell-profile dev remote acknowledge OPERATION_ID --accept-possible-effects
+```
+
+A remote selector is required. With no action, `remote` shows status. Acknowledgement releases a local safety block and accepts that the operation may have had effects or may still be running. It does not cancel, undo, or resend the operation. See [recovery commands](/docs/remote-workspaces/#recovery-commands) for the TUI and SDK forms and the inspection steps to take first.
+
 ### `caudra auth`
 
 ```bash
 caudra auth login [provider] [--method oauth|api-key]
 caudra auth logout <provider>
 caudra auth status
+caudra auth workcell set <NAME> [--stdin]
+caudra auth workcell list
+caudra auth workcell delete <NAME>
 ```
 
 `login` stores credentials under the state directory and can write plan or base URL choices into `providers.toml` (see [Configuration](/docs/configuration/#directory-layout) for the platform path). The picker asks for subscription OAuth or an API key when you choose Anthropic or OpenAI. Named Anthropic and OpenAI logins default to OAuth. Pass `--method api-key` to store a key instead.
@@ -104,6 +142,8 @@ caudra auth status
 Anthropic OAuth is experimental. The command explains the Anthropic terms limitation before opening the browser. OpenAI uses a device authorization flow. xAI and Copilot retain their dedicated named login flows. Other providers prompt for an API key and a plan when more than one plan exists. The interactive picker can also create custom providers.
 
 The TUI `/login` command offers the same method choice for Anthropic and OpenAI. `status` distinguishes saved OAuth, saved API keys, environment credentials, configured endpoints, and missing credentials.
+
+`auth workcell set` reads a bearer token from a hidden terminal prompt, or from stdin with `--stdin`. It stores or replaces a named credential, referenced as `credential:NAME`. `list` shows names and update times without bearer values. Credentials are stored in owner-only local files, without OS-keyring encryption. They are separate from provider login and MCP OAuth credentials.
 
 ### `caudra models`
 

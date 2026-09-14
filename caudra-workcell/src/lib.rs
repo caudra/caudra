@@ -1,17 +1,25 @@
 #![forbid(unsafe_code)]
 
 mod read_only_shell;
+mod remote;
+
+pub use remote::{
+    NamedBearerCredential, PendingRemoteOperation, RemoteConnectionStatus, RemoteEvent,
+    RemotePreparedToolCall, RemoteToolResultEnvelope, RemoteWorkcellClient, RemoteWorkcellError,
+};
+pub use workcell::host_contract;
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use caudra_agent::patch;
 use caudra_agent::permissions::{
     CONFINED_READ_ATTRIBUTE, CONFINED_READ_VALUE, PermissionAuthorityProfile, PermissionResource,
-    PermissionResourceAccess, PermissionResourceKind, PermissionRisk,
+    PermissionResourceAccess, PermissionResourceKind, PermissionRisk, RemotePermissionIdentity,
     filesystem_permission_resource, shell_permission_scope,
 };
 use caudra_agent::tools::{
@@ -25,16 +33,18 @@ use caudra_agent::{
     IndexDirectoryEntry as AgentIndexDirectoryEntry,
     IndexDirectoryEntryKind as AgentIndexDirectoryEntryKind, IndexLine as AgentIndexLine,
     IndexLineSemantic as AgentIndexLineSemantic, IndexOutput as AgentIndexOutput,
-    IndexSourceRange as AgentIndexSourceRange, PatchedFile, SearchCap,
+    IndexSourceRange as AgentIndexSourceRange, PatchedFile, SearchCap, SharedBuf,
     ShellFilterInfo as AgentShellFilterInfo, ShellOutput as AgentShellOutput, SnapshotLine,
     TextOutput, ToolInput, ToolOutput,
 };
+use caudra_workspace::{
+    OperationProgressKind, OperationState, OperationStatus, PreparedToolCall, ToolPrepareRequest,
+};
 use futures_lite::future;
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use tokio::runtime::{Builder, Runtime};
 use tokio_util::sync::CancellationToken;
-use workcell::ToolSpec;
 #[cfg(test)]
 use workcell::code::bundled_worker_available;
 use workcell::code::{CodeConfiguration, CodeExecution, CodeInput, Outcome, WorkerSource};
@@ -65,6 +75,7 @@ use workcell::web::{
     WebsearchOutput,
 };
 use workcell::{CodeToolGroup, ExecutionEnvironment};
+use workcell::{OwnedToolSpec, ToolSpec};
 
 pub const OWNER: &str = "workcell";
 /// Shared with the tests so a wording change cannot silently pass an assertion.
@@ -94,6 +105,17 @@ const PROGRESS_MAX_BYTES: usize = 64 * 1024;
 const PROGRESS_TRUNCATED: &str = "[earlier output truncated]\n";
 const BYTES_PER_MIB: usize = 1024 * 1024;
 const NORMALIZED_COMMAND_ATTRIBUTE: &str = "normalized_command";
+const REMOTE_PROGRESS_GAP: &str = "remote progress gap";
+const REMOTE_INDETERMINATE: &str =
+    "Remote Workcell outcome is indeterminate; do not retry automatically";
+const REMOTE_FORGOTTEN: &str =
+    "Remote Workcell forgot the operation outcome; do not retry automatically";
+const REMOTE_DISPLAY_MAX_CHARS: usize = 512;
+const REMOTE_POLL_INITIAL: Duration = Duration::from_millis(100);
+const REMOTE_POLL_MAX: Duration = Duration::from_secs(2);
+const REMOTE_EXECUTION_TIMEOUT: Duration = Duration::from_secs(600);
+const REMOTE_RECONCILE_TIMEOUT: Duration = Duration::from_secs(10);
+const REMOTE_RECONCILE_MAX_POLLS: usize = 4;
 /// The one redirect destination that reaches nothing: writes to it are
 /// discarded and reads from it yield end of file.
 const NULL_DEVICE: &str = "/dev/null";
@@ -406,7 +428,210 @@ impl WorkcellHost {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, thiserror::Error)]
+pub enum RemoteHostRegistrationError {
+    #[error("remote Workcell endpoint is also configured as generic MCP")]
+    GenericMcpCollision,
+    #[error(transparent)]
+    Registry(#[from] RegistryError),
+}
+
+#[derive(Clone)]
+pub struct RemoteWorkcellHost {
+    client: RemoteWorkcellClient,
+}
+
+impl RemoteWorkcellHost {
+    pub fn new(client: RemoteWorkcellClient) -> Self {
+        Self { client }
+    }
+
+    pub fn client(&self) -> &RemoteWorkcellClient {
+        &self.client
+    }
+
+    pub fn register(&self, registry: &ToolRegistry) -> Result<(), RemoteHostRegistrationError> {
+        self.register_with_generic_mcp_endpoints(registry, std::iter::empty::<&str>())
+    }
+
+    pub fn register_with_generic_mcp_endpoints<I, S>(
+        &self,
+        registry: &ToolRegistry,
+        endpoints: I,
+    ) -> Result<(), RemoteHostRegistrationError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let selected = self.client.endpoint();
+        if generic_mcp_endpoint_collision(selected, endpoints) {
+            return Err(RemoteHostRegistrationError::GenericMcpCollision);
+        }
+        registry.register_many_audited(self.entries())?;
+        Ok(())
+    }
+
+    fn entries(&self) -> Vec<(Arc<dyn Tool>, ToolSource, ToolEffect)> {
+        canonical_remote_specs()
+            .into_iter()
+            .filter_map(|spec| {
+                let verified = self.client.canonical_catalog().get(spec.name)?;
+                let kind = ToolKind::from_name(spec.name)?;
+                let source = self.source(verified);
+                Some((
+                    Arc::new(RemoteWorkcellTool {
+                        kind,
+                        spec: verified.clone(),
+                        client: self.client.clone(),
+                    }) as Arc<dyn Tool>,
+                    source,
+                    kind.effect(),
+                ))
+            })
+            .collect()
+    }
+
+    fn source(&self, spec: &OwnedToolSpec) -> ToolSource {
+        ToolSource::RemoteWorkcell {
+            identity: Arc::new(RemotePermissionIdentity::from_binding(
+                self.client.session_binding(),
+            )),
+            contract: format!(
+                "{}@{}/{}",
+                spec.contract_id, spec.contract_version, spec.result_version
+            )
+            .into(),
+        }
+    }
+}
+
+fn generic_mcp_endpoint_collision<I, S>(selected: &url::Url, endpoints: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    endpoints.into_iter().any(|endpoint| {
+        url::Url::parse(endpoint.as_ref()).is_ok_and(|endpoint| endpoint == *selected)
+    })
+}
+
+fn canonical_remote_specs() -> Vec<ToolSpec> {
+    let mut expected = workcell::files::specs(ALLOW_WRITE);
+    let year = jiff::Timestamp::now()
+        .strftime("%Y")
+        .to_string()
+        .parse()
+        .unwrap_or(2026);
+    expected.extend(workcell::web::specs(
+        year,
+        &WebsearchExecutionConfiguration::default(),
+    ));
+    expected.extend(workcell::shell::specs());
+    expected.extend(workcell::code_graph::specs());
+    expected.extend(workcell::code::specs());
+    expected.push(workcell::environment::spec());
+    expected
+}
+
+fn canonical_remote_catalog(tools: &[OwnedToolSpec]) -> bool {
+    let expected = canonical_remote_specs();
+    let actual: Vec<_> = tools
+        .iter()
+        .filter(|spec| ToolKind::from_name(&spec.name).is_some())
+        .collect();
+    actual.len() == expected.len()
+        && expected.iter().all(|expected| {
+            actual
+                .iter()
+                .find(|actual| actual.name == expected.name)
+                .is_some_and(|actual| {
+                    actual.input_schema == expected.input_schema
+                        && actual.output_schema == expected.output_schema
+                        && actual.annotations == expected.annotations
+                        && actual.presentation == expected.presentation
+                        && actual.contract_id == expected.contract_id
+                        && actual.contract_version == expected.contract_version
+                        && actual.result_version == expected.result_version
+                })
+        })
+}
+
+struct RemoteWorkcellTool {
+    kind: ToolKind,
+    spec: OwnedToolSpec,
+    client: RemoteWorkcellClient,
+}
+
+impl Tool for RemoteWorkcellTool {
+    fn name(&self) -> &str {
+        &self.spec.name
+    }
+
+    fn description(&self, _ctx: &DescriptionContext) -> Cow<'_, str> {
+        Cow::Borrowed(&self.spec.description)
+    }
+
+    fn schema(&self) -> Value {
+        Value::Object(self.spec.input_schema.clone())
+    }
+
+    fn audience(&self) -> ToolAudience {
+        self.kind.audience()
+    }
+
+    fn tool_kind(&self) -> Option<&str> {
+        Some(self.kind.presentation_kind())
+    }
+
+    fn parse(&self, input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
+        reject_remote_unknown_fields(&self.spec, input).map_err(ParseError::custom)?;
+        let raw_input = input.clone();
+        let input = Input::parse(self.kind, input.clone()).map_err(ParseError::custom)?;
+        Ok(Box::new(RemoteWorkcellInvocation {
+            client: self.client.clone(),
+            kind: self.kind,
+            input,
+            raw_input,
+            prepared: tokio::sync::Mutex::new(RemotePreparedState::default()),
+        }))
+    }
+}
+
+fn reject_remote_unknown_fields(spec: &OwnedToolSpec, input: &Value) -> Result<(), String> {
+    let Some(input) = input.as_object() else {
+        return Ok(());
+    };
+    let properties = spec
+        .input_schema
+        .get("properties")
+        .and_then(Value::as_object);
+    if let Some(field) = input
+        .keys()
+        .find(|field| properties.is_none_or(|properties| !properties.contains_key(*field)))
+    {
+        return Err(format!(
+            "Invalid arguments for tool {}: unknown field `{field}`",
+            spec.name
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct RemotePreparedState {
+    call: Option<RemotePreparedToolCall>,
+    execution_started: bool,
+}
+
+struct RemoteWorkcellInvocation {
+    client: RemoteWorkcellClient,
+    kind: ToolKind,
+    input: Input,
+    raw_input: Value,
+    prepared: tokio::sync::Mutex<RemotePreparedState>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum ToolKind {
     FileRead,
     FileGlob,
@@ -1044,44 +1269,952 @@ fn search_header(pattern: &str, path: Option<&str>) -> String {
     }
 }
 
+fn input_header(input: &Input) -> String {
+    match input {
+        Input::FileRead(input) => input.file_path.clone(),
+        Input::FileGlob(input) => search_header(&input.pattern, input.path.as_deref()),
+        Input::FileGrep(input) => search_header(&input.pattern, input.path.as_deref()),
+        Input::FileWrite(input) => input.file_path.clone(),
+        Input::FileEdit(input) => input.file_path.clone(),
+        Input::FileApplyPatch(input) => patch::header(&input.patch_text),
+        Input::Index(input) => input.path.clone(),
+        Input::Websearch(input) => input.query.clone(),
+        Input::Webfetch(input) => input.url.clone(),
+        Input::Shell(input) => input.command.lines().next().unwrap_or_default().into(),
+        Input::Code(input) => format!("{} lines", input.code.lines().count()),
+        Input::CodeMap(input) => input.path.clone().unwrap_or_else(|| ".".into()),
+        Input::CodeContext(input) => search_header(&input.task, input.path.as_deref()),
+        Input::CodeRefs(input) => search_header(&input.symbol, input.path.as_deref()),
+        Input::CodeImpact(input) => search_header(&input.symbol, input.path.as_deref()),
+        Input::CodeExpand(input) => search_header(&input.symbol, input.path.as_deref()),
+        Input::Environment => "execution environment".into(),
+    }
+}
+
+fn input_start_input(input: &Input) -> Option<ToolInput> {
+    match input {
+        Input::Shell(input) => Some(ToolInput::Code {
+            language: "bash".into(),
+            code: input.command.clone(),
+        }),
+        Input::Code(input) => Some(ToolInput::Code {
+            language: "python".into(),
+            code: input.code.clone(),
+        }),
+        _ => None,
+    }
+}
+
+impl RemoteWorkcellInvocation {
+    async fn prepare(&self, ctx: &ToolContext) -> Result<PermissionIntent, String> {
+        let mut state = self.prepared.lock().await;
+        if let Some(call) = &state.call {
+            return Ok(self.permission_intent(call));
+        }
+        let session = ctx
+            .workspace_session
+            .as_ref()
+            .ok_or_else(|| "Remote Workcell workspace context is unavailable".to_owned())?;
+        let call = self
+            .client
+            .prepare_canonical_tool(
+                session.binding(),
+                session.cursor(),
+                &ToolPrepareRequest {
+                    name: self.kind.name().to_owned(),
+                    input: self.raw_input.clone(),
+                },
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let intent = self.permission_intent(&call);
+        state.call = Some(call);
+        Ok(intent)
+    }
+
+    fn permission_intent(&self, call: &RemotePreparedToolCall) -> PermissionIntent {
+        let intent = &call.intent;
+        let identity = RemotePermissionIdentity::from_binding(&call.binding);
+        let resources = intent
+            .resources
+            .iter()
+            .map(|resource| {
+                let display = bounded_remote_display(resource.display.as_str());
+                let remote_kind = match self.kind {
+                    ToolKind::FileRead
+                    | ToolKind::FileGlob
+                    | ToolKind::FileGrep
+                    | ToolKind::FileWrite
+                    | ToolKind::FileEdit
+                    | ToolKind::FileApplyPatch
+                    | ToolKind::Index
+                    | ToolKind::CodeMap
+                    | ToolKind::CodeContext
+                    | ToolKind::CodeRefs
+                    | ToolKind::CodeImpact
+                    | ToolKind::CodeExpand => None,
+                    ToolKind::Websearch => Some("query"),
+                    ToolKind::Webfetch => Some("url"),
+                    ToolKind::Shell => Some("command"),
+                    ToolKind::Code => Some("code"),
+                    ToolKind::Environment => Some("environment"),
+                };
+                let kind = if let Some(resource_kind) = remote_kind {
+                    PermissionResourceKind::RemoteResource {
+                        identity: identity.clone(),
+                        resource_kind: resource_kind.into(),
+                    }
+                } else if matches!(
+                    resource.access,
+                    host_contract::ResourceAccess::Search | host_contract::ResourceAccess::Traverse
+                ) || matches!(
+                    self.kind,
+                    ToolKind::FileGlob
+                        | ToolKind::FileGrep
+                        | ToolKind::Index
+                        | ToolKind::CodeMap
+                        | ToolKind::CodeContext
+                        | ToolKind::CodeRefs
+                        | ToolKind::CodeImpact
+                        | ToolKind::CodeExpand
+                ) {
+                    PermissionResourceKind::RemoteDirectory {
+                        identity: identity.clone(),
+                    }
+                } else {
+                    PermissionResourceKind::RemoteFile {
+                        identity: identity.clone(),
+                    }
+                };
+                let access = match resource.access {
+                    host_contract::ResourceAccess::Inspect
+                    | host_contract::ResourceAccess::Read => PermissionResourceAccess::Read,
+                    host_contract::ResourceAccess::Search
+                    | host_contract::ResourceAccess::Traverse => PermissionResourceAccess::Search,
+                    host_contract::ResourceAccess::Write
+                    | host_contract::ResourceAccess::ReadWrite
+                    | host_contract::ResourceAccess::Delete => PermissionResourceAccess::Write,
+                    host_contract::ResourceAccess::Execute => PermissionResourceAccess::Execute,
+                    host_contract::ResourceAccess::Connect => PermissionResourceAccess::Connect,
+                };
+                let mut attributes = BTreeMap::new();
+                let display_attribute = match self.kind {
+                    ToolKind::Websearch => "display_query",
+                    ToolKind::Webfetch => "display_url",
+                    ToolKind::Shell => "display_command",
+                    ToolKind::Code => "display_code",
+                    ToolKind::Environment => "display_environment",
+                    _ => "display_path",
+                };
+                attributes.insert(display_attribute.into(), display);
+                attributes.insert(
+                    "operation_kind".into(),
+                    format!("{:?}", intent.kind).to_lowercase(),
+                );
+                if let Some(revision) = &resource.revision {
+                    attributes.insert(
+                        "resource_revision".into(),
+                        bounded_remote_display(revision.as_str()),
+                    );
+                }
+                let scope = resource
+                    .scope
+                    .iter()
+                    .map(workcell::host_contract::ResourceId::as_str)
+                    .collect::<Vec<_>>()
+                    .join("\u{1f}");
+                PermissionResource {
+                    kind,
+                    value: scope,
+                    access: Some(access),
+                    protected: intent.mutating,
+                    requires_prompt: intent.mutating,
+                    attributes,
+                }
+            })
+            .collect();
+        let risk = if intent.mutating {
+            PermissionRisk::High
+        } else if matches!(
+            intent.kind,
+            host_contract::OperationKind::Execute | host_contract::OperationKind::Transfer
+        ) {
+            PermissionRisk::Medium
+        } else {
+            PermissionRisk::Low
+        };
+        PermissionIntent::new(
+            PermissionScopes::single(
+                serde_json::to_string(intent).unwrap_or_else(|_| self.kind.name().to_owned()),
+            ),
+            resources,
+            risk,
+        )
+        .with_authority(PermissionAuthorityProfile::RemoteResource)
+    }
+
+    async fn take_prepared(&self) -> Result<RemotePreparedToolCall, String> {
+        let mut state = self.prepared.lock().await;
+        let call = state
+            .call
+            .take()
+            .ok_or_else(|| "Remote Workcell invocation was not prepared".to_owned())?;
+        state.execution_started = true;
+        Ok(call)
+    }
+
+    async fn execute_remote(
+        &self,
+        ctx: &ToolContext,
+        call: RemotePreparedToolCall,
+    ) -> ToolExecResult {
+        let mut progress = RemoteProgress::new(ctx);
+        let session = match ctx.workspace_session.as_ref() {
+            Some(session) => session,
+            None => return Err("Remote Workcell workspace context is unavailable".into()).into(),
+        };
+        if session.binding() != &call.binding || session.cursor() != &call.cursor {
+            let _ = self
+                .client
+                .release_canonical_tool(&call.binding, &call.cursor, &call.prepared)
+                .await;
+            return Err("Remote Workcell workspace context changed after preparation".into())
+                .into();
+        }
+        let timeout = match ctx.deadline.remaining() {
+            Ok(remaining) => remaining
+                .unwrap_or(REMOTE_EXECUTION_TIMEOUT)
+                .min(REMOTE_EXECUTION_TIMEOUT),
+            Err(_) => Duration::ZERO,
+        };
+        let deadline = Instant::now() + timeout;
+        let executed = ctx
+            .cancel
+            .race(future::race(
+                async {
+                    Some(
+                        self.client
+                            .execute_canonical_tool(
+                                session.binding(),
+                                session.cursor(),
+                                &call.prepared,
+                            )
+                            .await,
+                    )
+                },
+                async {
+                    smol::Timer::at(deadline).await;
+                    None
+                },
+            ))
+            .await;
+        let mut status = match executed {
+            Ok(Some(Ok(status))) => status,
+            _ => match self.reconcile(&call, &mut progress).await {
+                Some(status) => status,
+                None => return indeterminate_result(&call.prepared, REMOTE_INDETERMINATE),
+            },
+        };
+        let mut delay = REMOTE_POLL_INITIAL;
+        let mut replay_attempts = 0;
+        loop {
+            let incomplete = !progress.publish(&status);
+            if incomplete {
+                replay_attempts += 1;
+                if replay_attempts > REMOTE_RECONCILE_MAX_POLLS {
+                    let _ = self.client.abandon_operation(&call.prepared.operation);
+                    return if call.intent.mutating {
+                        indeterminate_result(&call.prepared, REMOTE_PROGRESS_GAP)
+                    } else {
+                        Err(REMOTE_PROGRESS_GAP.into()).into()
+                    };
+                }
+            }
+            if incomplete || matches!(status.state, OperationState::Running) {
+                let polled = ctx
+                    .cancel
+                    .race(future::race(
+                        async {
+                            smol::Timer::after(delay).await;
+                            Some(
+                                self.client
+                                    .canonical_tool_status_after(
+                                        session.binding(),
+                                        session.cursor(),
+                                        &status.handle,
+                                        Some(progress.after_sequence()),
+                                    )
+                                    .await,
+                            )
+                        },
+                        async {
+                            smol::Timer::at(deadline).await;
+                            None
+                        },
+                    ))
+                    .await;
+                delay = (delay * 2).min(REMOTE_POLL_MAX);
+                status = match polled {
+                    Ok(Some(Ok(status))) => status,
+                    _ => match self.reconcile(&call, &mut progress).await {
+                        Some(status) => status,
+                        None => return indeterminate_result(&call.prepared, REMOTE_INDETERMINATE),
+                    },
+                };
+                continue;
+            }
+            match status.state {
+                OperationState::Completed { result, .. } => {
+                    return remote_result(self.kind, &self.input, result);
+                }
+                OperationState::Failed { error, .. } => {
+                    return ToolExecResult::from(Err(error.message))
+                        .with_annotation(Some("remote Workcell failure".into()));
+                }
+                OperationState::Cancelled {
+                    side_effects_possible,
+                } => {
+                    let message = if side_effects_possible {
+                        REMOTE_INDETERMINATE
+                    } else {
+                        "Remote Workcell execution cancelled"
+                    };
+                    return ToolExecResult::from(Err(message.into())).with_annotation(
+                        side_effects_possible
+                            .then(|| "remote outcome may include mutations".into()),
+                    );
+                }
+                OperationState::Forgotten | OperationState::NeverSeen => {
+                    return indeterminate_result(&call.prepared, REMOTE_FORGOTTEN);
+                }
+                OperationState::Running | OperationState::Indeterminate { .. } => {
+                    return indeterminate_result(&call.prepared, REMOTE_INDETERMINATE);
+                }
+                OperationState::Prepared => {
+                    return Err("Remote Workcell execution did not start".into()).into();
+                }
+            }
+        }
+    }
+
+    async fn reconcile(
+        &self,
+        call: &RemotePreparedToolCall,
+        progress: &mut RemoteProgress,
+    ) -> Option<OperationStatus<RemoteToolResultEnvelope>> {
+        let _ = self.client.abandon_operation(&call.prepared.operation);
+        future::race(
+            async {
+                let _ = self
+                    .client
+                    .cancel_canonical_tool(&call.binding, &call.cursor, &call.prepared.operation)
+                    .await;
+                let mut delay = REMOTE_POLL_INITIAL;
+                for _ in 0..REMOTE_RECONCILE_MAX_POLLS {
+                    smol::Timer::after(delay).await;
+                    if let Ok(status) = self
+                        .client
+                        .canonical_tool_status_after(
+                            &call.binding,
+                            &call.cursor,
+                            &call.prepared.operation,
+                            Some(progress.after_sequence()),
+                        )
+                        .await
+                        && progress.publish(&status)
+                        && !matches!(
+                            status.state,
+                            OperationState::Running | OperationState::Prepared
+                        )
+                    {
+                        return Some(status);
+                    }
+                    delay = (delay * 2).min(REMOTE_POLL_MAX);
+                }
+                None
+            },
+            async {
+                smol::Timer::after(REMOTE_RECONCILE_TIMEOUT).await;
+                None
+            },
+        )
+        .await
+    }
+}
+
+fn bounded_remote_display(value: &str) -> String {
+    value.chars().take(REMOTE_DISPLAY_MAX_CHARS).collect()
+}
+
+impl ToolKind {
+    fn name(self) -> &'static str {
+        NATIVE_TOOL_NAMES
+            .iter()
+            .copied()
+            .find(|name| Self::from_name(name) == Some(self))
+            .unwrap_or("unknown")
+    }
+}
+
+impl ToolInvocation for RemoteWorkcellInvocation {
+    fn start_header(&self) -> HeaderFuture {
+        HeaderFuture::Ready(HeaderResult::plain(input_header(&self.input)))
+    }
+
+    fn start_input(&self) -> Option<ToolInput> {
+        input_start_input(&self.input)
+    }
+
+    fn plan_mode_access(&self) -> PlanModeAccess {
+        self.prepared
+            .try_lock()
+            .ok()
+            .and_then(|state| state.call.as_ref().map(|call| call.intent.mutating))
+            .map_or(PlanModeAccess::Refused, |mutating| {
+                if mutating {
+                    PlanModeAccess::Prompted
+                } else {
+                    PlanModeAccess::ReadOnly
+                }
+            })
+    }
+
+    fn call_effect(&self, registered: ToolEffect) -> ToolEffect {
+        self.prepared
+            .try_lock()
+            .ok()
+            .and_then(|state| state.call.as_ref().map(|call| call.intent.mutating))
+            .map_or(registered, |mutating| {
+                if mutating {
+                    registered
+                } else {
+                    ToolEffect::ReadOnly
+                }
+            })
+    }
+
+    fn preflight<'a>(
+        &'a self,
+        ctx: &'a ToolContext,
+    ) -> BoxFuture<'a, Result<Option<PermissionIntent>, String>> {
+        Box::pin(async move { self.prepare(ctx).await.map(Some) })
+    }
+
+    fn permission_input(&self) -> Option<&Value> {
+        Some(&self.raw_input)
+    }
+
+    fn abandon<'a>(&'a self, _ctx: &'a ToolContext) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            let call = {
+                let mut state = self.prepared.lock().await;
+                if state.execution_started {
+                    None
+                } else {
+                    state.call.take()
+                }
+            };
+            if let Some(call) = call {
+                let _ = self
+                    .client
+                    .release_canonical_tool(&call.binding, &call.cursor, &call.prepared)
+                    .await;
+            }
+        })
+    }
+
+    fn execute<'a>(self: Box<Self>, ctx: &'a ToolContext) -> ExecFuture<'a> {
+        Box::pin(async move {
+            let call = match self.take_prepared().await {
+                Ok(call) => call,
+                Err(error) => return Err(error).into(),
+            };
+            self.execute_remote(ctx, call).await
+        })
+    }
+}
+
+struct RemoteProgress {
+    sink: Option<flume::Sender<ToolLive>>,
+    buffer: Arc<SharedBuf>,
+    buffer_published: bool,
+    next_sequence: Option<u64>,
+    reported_gap: Option<u64>,
+}
+
+impl RemoteProgress {
+    fn new(ctx: &ToolContext) -> Self {
+        Self {
+            sink: ctx.live_sink.clone(),
+            buffer: Arc::new(SharedBuf::new()),
+            buffer_published: false,
+            next_sequence: None,
+            reported_gap: None,
+        }
+    }
+
+    fn after_sequence(&self) -> u64 {
+        self.next_sequence.unwrap_or(1) - 1
+    }
+
+    fn publish(&mut self, status: &OperationStatus<RemoteToolResultEnvelope>) -> bool {
+        let sink = &self.sink;
+        let first = status.progress_metadata.first_retained_sequence;
+        let gap = (status.progress_metadata.gap_before_first && self.next_sequence.is_none())
+            || self
+                .next_sequence
+                .zip(first)
+                .is_some_and(|(expected, first)| first > expected);
+        if gap && self.reported_gap != first {
+            let _ = sink
+                .as_ref()
+                .map(|sink| sink.try_send(ToolLive::Annotation(REMOTE_PROGRESS_GAP.into())));
+            self.reported_gap = first;
+        }
+        let mut expected = self.next_sequence.unwrap_or(1);
+        for item in &status.progress {
+            if item.sequence < expected {
+                continue;
+            }
+            if item.sequence > expected && self.reported_gap != Some(item.sequence) {
+                let _ = sink
+                    .as_ref()
+                    .map(|sink| sink.try_send(ToolLive::Annotation(REMOTE_PROGRESS_GAP.into())));
+                self.reported_gap = Some(item.sequence);
+            }
+            if item.sequence > expected {
+                return false;
+            }
+            expected = item.sequence.saturating_add(1);
+            self.next_sequence = Some(expected);
+            match item.kind {
+                OperationProgressKind::Stdout | OperationProgressKind::Stderr => {
+                    self.buffer.append(SnapshotLine::plain(item.chunk.clone()));
+                    if !self.buffer_published {
+                        let _ = sink
+                            .as_ref()
+                            .map(|sink| sink.try_send(ToolLive::Buf(Arc::clone(&self.buffer))));
+                        self.buffer_published = true;
+                    }
+                }
+                OperationProgressKind::Started
+                | OperationProgressKind::Exited
+                | OperationProgressKind::Unknown(_) => {
+                    if !item.chunk.is_empty() {
+                        let _ = sink
+                            .as_ref()
+                            .map(|sink| sink.try_send(ToolLive::Annotation(item.chunk.clone())));
+                    }
+                }
+            }
+        }
+        expected == status.progress_metadata.next_sequence
+    }
+}
+
+fn indeterminate_result(prepared: &PreparedToolCall, message: &str) -> ToolExecResult {
+    let invocation = prepared
+        .operation
+        .invocation_id
+        .as_ref()
+        .map_or("unknown", |id| id.as_str());
+    ToolExecResult::from(Err(format!("{message} (invocation {invocation})"))).with_annotation(Some(
+        "remote mutation outcome unknown; non-retryable".into(),
+    ))
+}
+
+fn remote_result(
+    kind: ToolKind,
+    input: &Input,
+    envelope: RemoteToolResultEnvelope,
+) -> ToolExecResult {
+    let RemoteToolResultEnvelope {
+        model_output,
+        structured_content,
+        is_error,
+    } = envelope;
+    let parsed = match kind {
+        ToolKind::FileRead => deserialize_remote(&structured_content)
+            .map(|output| remote_file_read_result(output, &model_output)),
+        ToolKind::FileGlob => deserialize_remote(&structured_content).map(file_glob_result),
+        ToolKind::FileGrep => deserialize_remote(&structured_content).map(file_grep_result),
+        ToolKind::FileWrite => deserialize_remote(&structured_content).map(|output| {
+            let Input::FileWrite(input) = input else {
+                unreachable!("tool kind and parsed input are paired")
+            };
+            file_write_result(output, input.content.clone())
+        }),
+        ToolKind::FileEdit => deserialize_remote(&structured_content).map(|output| {
+            let Input::FileEdit(input) = input else {
+                unreachable!("tool kind and parsed input are paired")
+            };
+            file_edit_result(
+                output,
+                input.old_string.clone(),
+                input.new_string.clone(),
+                input.replace_all.unwrap_or(false),
+            )
+        }),
+        ToolKind::FileApplyPatch => deserialize_remote(&structured_content).map(file_patch_result),
+        ToolKind::Index => deserialize_remote(&structured_content)
+            .map(|output| remote_index_result(output, &model_output)),
+        ToolKind::Shell => remote_shell_result(&structured_content, model_output.clone()),
+        ToolKind::Code => Ok(text_result(
+            &structured_content,
+            model_output.clone(),
+            false,
+            model_output.clone(),
+        )
+        .with_error(is_error || structured_content["outcome"] != "completed")),
+        ToolKind::Websearch => Ok(text_result(
+            &structured_content,
+            model_output.clone(),
+            true,
+            model_output.clone(),
+        )),
+        ToolKind::Webfetch => {
+            let markdown = structured_content["format"] == "markdown";
+            Ok(text_result(
+                &structured_content,
+                model_output.clone(),
+                markdown,
+                model_output.clone(),
+            ))
+        }
+        ToolKind::CodeMap
+        | ToolKind::CodeContext
+        | ToolKind::CodeRefs
+        | ToolKind::CodeImpact
+        | ToolKind::CodeExpand => {
+            remote_code_graph_result(kind, structured_content, model_output.clone())
+        }
+        ToolKind::Environment => Ok(text_result(
+            &structured_content,
+            markdown_code("json", &model_output),
+            true,
+            model_output.clone(),
+        )),
+    };
+    match parsed {
+        Ok(result) => result
+            .with_error(is_error)
+            .with_model_output(Some(model_output))
+            .with_remote_written_paths(),
+        Err(error) => Err(format!("invalid remote Workcell result: {error}")).into(),
+    }
+}
+
+fn deserialize_remote<T: DeserializeOwned>(value: &Value) -> Result<T, serde_json::Error> {
+    serde_json::from_value(value.clone())
+}
+
+fn remote_file_read_result(output: FileReadOutput, model_output: &str) -> ToolExecResult {
+    let output = match output {
+        FileReadOutput::Directory {
+            path,
+            relative_path,
+            entry_details,
+            truncated,
+            ..
+        } => FileReadOutput::Directory {
+            path,
+            relative_path,
+            entries: model_output.lines().map(str::to_owned).collect(),
+            entry_details,
+            truncated,
+        },
+        FileReadOutput::File {
+            path,
+            relative_path,
+            text,
+            line_start,
+            line_end,
+            total_lines,
+            truncated,
+            ..
+        } => FileReadOutput::File {
+            path,
+            relative_path,
+            numbered_text: model_output.to_owned(),
+            text,
+            line_start,
+            line_end,
+            total_lines,
+            truncated,
+        },
+    };
+    file_read_result(output)
+}
+
+fn remote_index_result(output: WorkcellIndexOutput, model_output: &str) -> ToolExecResult {
+    let output = match output {
+        WorkcellIndexOutput::File {
+            path,
+            relative_path,
+            language,
+            lines,
+            source_line_count,
+            parse_error,
+            truncated,
+            ..
+        } => WorkcellIndexOutput::File {
+            path,
+            relative_path,
+            language,
+            skeleton: model_output.to_owned(),
+            lines,
+            source_line_count,
+            parse_error,
+            truncated,
+        },
+        WorkcellIndexOutput::Directory {
+            path,
+            relative_path,
+            entries,
+            total_count,
+            truncated,
+            ..
+        } => WorkcellIndexOutput::Directory {
+            path,
+            relative_path,
+            entries,
+            total_count,
+            truncated,
+            listing: model_output.to_owned(),
+        },
+    };
+    index_result(output, IndexLimits::default().max_model_output_bytes)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RemoteShellOutput {
+    relative_workdir: String,
+    timeout_ms: u64,
+    duration_ms: u64,
+    exit_code: Option<i32>,
+    signal: Option<i32>,
+    timed_out: bool,
+    output_limit_exceeded: bool,
+    final_sequence: u64,
+    stdout_utf8_bytes: u64,
+    stderr_utf8_bytes: u64,
+    stdout: String,
+    stderr: String,
+    stdout_capture_truncated: bool,
+    stderr_capture_truncated: bool,
+    stdout_preview_truncated: bool,
+    stderr_preview_truncated: bool,
+    stdout_redraws_collapsed: u64,
+    stderr_redraws_collapsed: u64,
+}
+
+fn remote_shell_result(
+    value: &Value,
+    model_output: String,
+) -> Result<ToolExecResult, serde_json::Error> {
+    let output: RemoteShellOutput = deserialize_remote(value)?;
+    let is_error = output.exit_code != Some(0) || output.timed_out || output.output_limit_exceeded;
+    let output = AgentShellOutput {
+        model_text: model_output.clone(),
+        relative_workdir: output.relative_workdir,
+        timeout_ms: output.timeout_ms,
+        duration_ms: output.duration_ms,
+        exit_code: output.exit_code,
+        signal: output.signal,
+        timed_out: output.timed_out,
+        output_limit_exceeded: output.output_limit_exceeded,
+        final_sequence: output.final_sequence,
+        stdout_utf8_bytes: output.stdout_utf8_bytes,
+        stderr_utf8_bytes: output.stderr_utf8_bytes,
+        stdout: output.stdout,
+        stderr: output.stderr,
+        stdout_capture_truncated: output.stdout_capture_truncated,
+        stderr_capture_truncated: output.stderr_capture_truncated,
+        stdout_preview_truncated: output.stdout_preview_truncated,
+        stderr_preview_truncated: output.stderr_preview_truncated,
+        stdout_redraws_collapsed: output.stdout_redraws_collapsed,
+        stderr_redraws_collapsed: output.stderr_redraws_collapsed,
+        filter: None,
+    };
+    Ok(
+        ToolExecResult::from(Ok::<_, String>(ToolOutput::Shell(output)))
+            .with_model_output(Some(model_output))
+            .with_error(is_error),
+    )
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RemoteGraphSymbol {
+    name: String,
+    kind: String,
+    path: String,
+    line_start: usize,
+    line_end: usize,
+    callers: Option<usize>,
+    calls: Option<usize>,
+    test_scope: Option<bool>,
+    hops: Option<usize>,
+}
+
+fn graph_rows(value: &Value) -> Result<Vec<CodeGraphRow>, serde_json::Error> {
+    let symbols: Vec<RemoteGraphSymbol> = deserialize_remote(value)?;
+    Ok(symbols
+        .into_iter()
+        .map(|symbol| CodeGraphRow {
+            name: symbol.name,
+            kind: symbol.kind,
+            path: symbol.path,
+            line_start: symbol.line_start,
+            line_end: symbol.line_end,
+            inbound: symbol.callers,
+            outbound: symbol.calls,
+            hops: symbol.hops,
+            test_scope: symbol.test_scope.unwrap_or(false),
+        })
+        .collect())
+}
+
+fn remote_code_graph_result(
+    kind: ToolKind,
+    value: Value,
+    model_output: String,
+) -> Result<ToolExecResult, serde_json::Error> {
+    if value["refused"] == true {
+        let candidates = value["didYouMean"].as_array().map_or(0, Vec::len);
+        return Ok(
+            ToolExecResult::from(Ok::<_, String>(ToolOutput::Plain(text_output(
+                model_output.clone(),
+                value,
+            ))))
+            .with_model_output(Some(model_output))
+            .with_annotation(Some(if candidates == 0 {
+                "no match".into()
+            } else {
+                format!("no match \u{b7} {candidates} candidates")
+            })),
+        );
+    }
+    let string = |name: &str| value[name].as_str().unwrap_or_default().to_owned();
+    let usize_value = |name: &str| value[name].as_u64().unwrap_or_default() as usize;
+    let (headline, rows, source, annotation) = match kind {
+        ToolKind::CodeMap => (
+            format!("ranked symbols in {}", string("path")),
+            graph_rows(&value["symbols"])?,
+            None,
+            shown_of(usize_value("shown"), usize_value("total"), "symbols"),
+        ),
+        ToolKind::CodeContext => (
+            format!(
+                "read as {} ({}); confidence {} at {}% separation",
+                string("shape"),
+                string("shapeReason"),
+                string("confidence"),
+                usize_value("marginPercent")
+            ),
+            graph_rows(&value["results"])?,
+            None,
+            format!(
+                "{} \u{b7} {} confidence",
+                shown_of(usize_value("shown"), usize_value("totalMatched"), "matches"),
+                string("confidence")
+            ),
+        ),
+        ToolKind::CodeRefs => (
+            format!(
+                "{} of {}, each row one {}",
+                string("direction"),
+                string("symbol"),
+                string("unit")
+            ),
+            graph_rows(&value["references"])?,
+            None,
+            shown_of(usize_value("shown"), usize_value("total"), &string("unit")),
+        ),
+        ToolKind::CodeImpact => (
+            format!(
+                "{} symbols reach {} within {} hops; {} of them are tests",
+                usize_value("total"),
+                string("symbol"),
+                usize_value("depth"),
+                value["testsReaching"].as_array().map_or(0, Vec::len)
+            ),
+            graph_rows(&value["reached"])?,
+            None,
+            format!(
+                "{} \u{b7} {} tests",
+                shown_of(usize_value("shown"), usize_value("total"), "reached"),
+                value["testsReaching"].as_array().map_or(0, Vec::len)
+            ),
+        ),
+        ToolKind::CodeExpand => {
+            let callers = graph_rows(&value["callers"])?;
+            let callees = graph_rows(&value["callees"])?;
+            let rows = callers
+                .into_iter()
+                .map(|mut row| {
+                    row.inbound = Some(1);
+                    row
+                })
+                .chain(callees.into_iter().map(|mut row| {
+                    row.outbound = Some(1);
+                    row
+                }))
+                .collect();
+            let source_text = string("source");
+            (
+                format!(
+                    "{} {} {}:{}-{}",
+                    string("symbol"),
+                    string("kind"),
+                    string("path"),
+                    usize_value("lineStart"),
+                    usize_value("lineEnd")
+                ),
+                rows,
+                Some(CodeGraphSource {
+                    path: string("path"),
+                    kind: string("kind"),
+                    line_start: usize_value("lineStart"),
+                    lines: source_text.lines().map(str::to_owned).collect(),
+                    whole_file_reason: value["servedWholeFile"].as_str().map(str::to_owned),
+                }),
+                format!(
+                    "{} callers \u{b7} {} callees",
+                    value["callers"].as_array().map_or(0, Vec::len),
+                    value["callees"].as_array().map_or(0, Vec::len)
+                ),
+            )
+        }
+        _ => unreachable!("only code graph tools use this adapter"),
+    };
+    let footer = model_output
+        .lines()
+        .next_back()
+        .unwrap_or_default()
+        .to_owned();
+    Ok(ToolExecResult::from(Ok::<_, String>(ToolOutput::CodeGraph {
+        headline,
+        rows,
+        source,
+        footer,
+        state: Some(value),
+    }))
+    .with_model_output(Some(model_output))
+    .with_annotation(Some(annotation)))
+}
+
 impl ToolInvocation for WorkcellInvocation {
     fn start_header(&self) -> HeaderFuture {
-        HeaderFuture::Ready(HeaderResult::plain(match &self.input {
-            Input::FileRead(input) => input.file_path.clone(),
-            Input::FileGlob(input) => search_header(&input.pattern, input.path.as_deref()),
-            Input::FileGrep(input) => search_header(&input.pattern, input.path.as_deref()),
-            Input::FileWrite(input) => input.file_path.clone(),
-            Input::FileEdit(input) => input.file_path.clone(),
-            Input::FileApplyPatch(input) => patch::header(&input.patch_text),
-            Input::Index(input) => input.path.clone(),
-            Input::Websearch(input) => input.query.clone(),
-            Input::Webfetch(input) => input.url.clone(),
-            Input::Shell(input) => input.command.lines().next().unwrap_or_default().into(),
-            Input::Code(input) => format!("{} lines", input.code.lines().count()),
-            Input::CodeMap(input) => input.path.clone().unwrap_or_else(|| ".".into()),
-            Input::CodeContext(input) => search_header(&input.task, input.path.as_deref()),
-            Input::CodeRefs(input) => search_header(&input.symbol, input.path.as_deref()),
-            Input::CodeImpact(input) => search_header(&input.symbol, input.path.as_deref()),
-            Input::CodeExpand(input) => search_header(&input.symbol, input.path.as_deref()),
-            Input::Environment => "execution environment".into(),
-        }))
+        HeaderFuture::Ready(HeaderResult::plain(input_header(&self.input)))
     }
 
     /// A patch is deliberately absent: its result is the same diff, rendered
     /// with real line numbers, so echoing the request above it says
     /// everything twice and truncates both halves.
     fn start_input(&self) -> Option<ToolInput> {
-        match &self.input {
-            Input::Shell(input) => Some(ToolInput::Code {
-                language: "bash".into(),
-                code: input.command.clone(),
-            }),
-            Input::Code(input) => Some(ToolInput::Code {
-                language: "python".into(),
-                code: input.code.clone(),
-            }),
-            _ => None,
-        }
+        input_start_input(&self.input)
     }
 
     fn mutation_targets(&self, _ctx: &ToolContext) -> Vec<PathBuf> {
@@ -2739,7 +3872,9 @@ mod tests {
     use caudra_agent::tools::{FileReadTracker, STALE_READ_MSG, interpreter_ctx};
     use caudra_agent::{AgentMode, ContentBlock, Envelope, EventSender, Mention, Message};
     use caudra_config::{DefaultEffect, Effect, PermissionRule, PermissionsConfig, ToolKey};
+    use caudra_workspace::{OperationHandle, OperationId, OperationProgress, SequenceMetadata};
     use serde_json::json;
+    use std::any::TypeId;
     use std::ops::RangeInclusive;
     use std::sync::Arc;
     use tempfile::TempDir;
@@ -2754,6 +3889,173 @@ mod tests {
     const EXPECT_MENTION_HIDDEN: &str = "mention context never shows up in the transcript";
     const PATCH_STRUCTURED_MSG: &str = "a patch reports the files it changed, not a diff blob";
     const FILTERABLE_MAKEFILE: &str = "all:\n\t@echo \"make[1]: Entering directory '/x'\"\n\t@echo \"real build line\"\n\t@echo \"make[1]: Leaving directory '/x'\"\n";
+    const SHELL_CANCELLED: &str = "Shell execution cancelled";
+
+    #[test]
+    fn selected_remote_endpoint_cannot_also_be_generic_mcp() {
+        let selected = url::Url::parse("https://workcell.example/mcp").unwrap();
+        assert!(generic_mcp_endpoint_collision(
+            &selected,
+            ["https://other.example/mcp", selected.as_str()]
+        ));
+        assert!(!generic_mcp_endpoint_collision(
+            &selected,
+            ["https://workcell.example/other"]
+        ));
+    }
+
+    #[test]
+    fn remote_catalog_requires_canonical_order_contracts_schemas_and_effects() {
+        let specs = canonical_remote_specs();
+        let names: Vec<_> = specs.iter().map(|spec| spec.name).collect();
+        assert_eq!(
+            names,
+            [
+                "file_read",
+                "file_glob",
+                "file_grep",
+                "file_write",
+                "file_edit",
+                "file_apply_patch",
+                "file_index",
+                "websearch",
+                "webfetch",
+                "shell",
+                "code_map",
+                "code_context",
+                "code_refs",
+                "code_impact",
+                "code_expand",
+                "python_execution",
+                "execution_environment",
+            ]
+        );
+        let catalog: Vec<_> = specs.iter().map(OwnedToolSpec::from).collect();
+        assert!(canonical_remote_catalog(&catalog));
+        for spec in &catalog {
+            let expected = match spec.name.as_str() {
+                "python_execution" => ToolEffect::Isolated,
+                "file_write"
+                | "file_edit"
+                | "file_apply_patch"
+                | "shell"
+                | "execution_environment" => ToolEffect::Mutating,
+                _ => ToolEffect::ReadOnly,
+            };
+            assert_eq!(ToolKind::from_name(&spec.name).unwrap().effect(), expected);
+        }
+        let mut reordered = catalog.clone();
+        reordered.reverse();
+        assert!(canonical_remote_catalog(&reordered));
+        let mut changed = catalog;
+        changed[0].contract_id = "different.contract".into();
+        assert!(!canonical_remote_catalog(&changed));
+    }
+
+    #[test]
+    fn remote_file_result_uses_the_embedded_specialized_adapter() {
+        let output = FileReadOutput::File {
+            path: "remote/src/lib.rs".into(),
+            relative_path: "src/lib.rs".into(),
+            text: "fn main() {}".into(),
+            numbered_text: "1: fn main() {}".into(),
+            line_start: 1,
+            line_end: 1,
+            total_lines: 1,
+            truncated: false,
+        };
+        let model_output = model_text(&output);
+        let embedded = file_read_result(output.clone());
+        let remote = remote_result(
+            ToolKind::FileRead,
+            &Input::FileRead(FileReadInput {
+                file_path: "remote/src/lib.rs".into(),
+                offset: None,
+                limit: None,
+            }),
+            RemoteToolResultEnvelope {
+                model_output: model_output.clone(),
+                structured_content: serde_json::to_value(output).expect("structured result"),
+                is_error: false,
+            },
+        );
+        assert_eq!(
+            remote.output.unwrap().as_text(),
+            embedded.output.unwrap().as_text()
+        );
+        assert_eq!(remote.model_output.as_deref(), Some(model_output.as_str()));
+        assert!(remote.remote_written_paths);
+    }
+
+    #[test_case(true; "retention_gap")]
+    #[test_case(false; "intra_page_gap")]
+    fn remote_progress_reports_a_gap_before_ordered_output(retention_gap: bool) {
+        let root = TempDir::new().unwrap();
+        let registry = Arc::new(ToolRegistry::new());
+        let (_, cancel) = CancelToken::new();
+        let mut ctx = context(root.path(), registry, cancel);
+        let (sender, receiver) = flume::unbounded();
+        ctx.live_sink = Some(sender);
+        let execution_id = OperationId::new("execution").unwrap();
+        let mut status = OperationStatus {
+            handle: OperationHandle {
+                preparation_id: OperationId::new("preparation").unwrap(),
+                invocation_id: Some(OperationId::new("invocation").unwrap()),
+                execution_id: Some(execution_id.clone()),
+                expires_at_unix_ms: Some(1),
+            },
+            state: OperationState::Running,
+            progress: vec![
+                OperationProgress {
+                    execution_id: execution_id.clone(),
+                    sequence: 4,
+                    kind: OperationProgressKind::Started,
+                    chunk: String::new(),
+                },
+                OperationProgress {
+                    execution_id,
+                    sequence: if retention_gap { 5 } else { 6 },
+                    kind: OperationProgressKind::Stdout,
+                    chunk: "ordered output".into(),
+                },
+            ],
+            progress_metadata: SequenceMetadata {
+                first_retained_sequence: Some(4),
+                next_sequence: if retention_gap { 6 } else { 7 },
+                gap_before_first: retention_gap,
+            },
+        };
+        let mut progress = RemoteProgress::new(&ctx);
+        assert!(!progress.publish(&status));
+        assert!(matches!(
+            receiver.recv().unwrap(),
+            ToolLive::Annotation(message) if message == REMOTE_PROGRESS_GAP
+        ));
+        assert!(!progress.publish(&status));
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(progress.after_sequence(), 0);
+        let mut without_sink = RemoteProgress::new(&ctx);
+        without_sink.sink = None;
+        assert!(!without_sink.publish(&status));
+        assert_eq!(without_sink.next_sequence, progress.next_sequence);
+        status.progress[0].sequence = 1;
+        status.progress[1].sequence = 3;
+        status.progress_metadata.first_retained_sequence = Some(1);
+        status.progress_metadata.next_sequence = 4;
+        assert!(!progress.publish(&status));
+        assert_eq!(progress.after_sequence(), 1);
+        status.progress[0].sequence = 2;
+        assert!(progress.publish(&status));
+        assert_eq!(progress.after_sequence(), 3);
+        let published = receiver.len();
+        assert!(progress.publish(&status));
+        assert_eq!(receiver.len(), published);
+        status.progress.clear();
+        assert!(progress.publish(&status));
+        status.progress_metadata.next_sequence = 5;
+        assert!(!progress.publish(&status));
+        assert_eq!(progress.after_sequence(), 3);
+    }
 
     fn context(root: &Path, registry: Arc<ToolRegistry>, cancel: CancelToken) -> ToolContext {
         context_with_mode(
@@ -2808,6 +4110,276 @@ mod tests {
         let registry = Arc::new(ToolRegistry::new());
         host.register(&registry).expect("Workcell registration");
         (host, registry)
+    }
+
+    /// Websearch's prose includes the current year. Removing only descriptions
+    /// keeps this deterministic while freezing every validation keyword.
+    fn schema_contract(value: &Value) -> Value {
+        match value {
+            Value::Object(object) => Value::Object(
+                object
+                    .iter()
+                    .filter(|(key, _)| key.as_str() != "description")
+                    .map(|(key, value)| (key.clone(), schema_contract(value)))
+                    .collect(),
+            ),
+            Value::Array(values) => Value::Array(values.iter().map(schema_contract).collect()),
+            value => value.clone(),
+        }
+    }
+
+    fn canonical_input_schemas() -> Vec<(&'static str, Value)> {
+        const DRAFT_07: &str = "http://json-schema.org/draft-07/schema#";
+        const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+
+        vec![
+            (
+                "file_read",
+                json!({
+                    "$schema": DRAFT_07,
+                    "type": "object",
+                    "properties": {
+                        "filePath": { "type": "string", "minLength": 1 },
+                        "offset": { "type": "integer", "minimum": 1, "maximum": MAX_SAFE_INTEGER },
+                        "limit": { "type": "integer", "minimum": 0, "maximum": MAX_SAFE_INTEGER }
+                    },
+                    "required": ["filePath"]
+                }),
+            ),
+            (
+                "file_glob",
+                json!({
+                    "$schema": DRAFT_07,
+                    "type": "object",
+                    "properties": {
+                        "pattern": { "type": "string", "minLength": 1 },
+                        "path": { "type": "string", "minLength": 1 }
+                    },
+                    "required": ["pattern"]
+                }),
+            ),
+            (
+                "file_grep",
+                json!({
+                    "$schema": DRAFT_07,
+                    "type": "object",
+                    "properties": {
+                        "pattern": { "type": "string", "minLength": 1 },
+                        "path": { "type": "string", "minLength": 1 },
+                        "include": { "type": "string", "minLength": 1 }
+                    },
+                    "required": ["pattern"]
+                }),
+            ),
+            (
+                "file_write",
+                json!({
+                    "$schema": DRAFT_07,
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "filePath": { "type": "string", "minLength": 1 },
+                        "content": { "type": "string" }
+                    },
+                    "required": ["filePath", "content"]
+                }),
+            ),
+            (
+                "file_edit",
+                json!({
+                    "$schema": DRAFT_07,
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "filePath": { "type": "string", "minLength": 1 },
+                        "oldString": { "type": "string", "minLength": 1 },
+                        "newString": { "type": "string" },
+                        "replaceAll": { "type": "boolean" }
+                    },
+                    "required": ["filePath", "oldString", "newString"]
+                }),
+            ),
+            (
+                "file_apply_patch",
+                json!({
+                    "$schema": DRAFT_07,
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": { "patchText": { "type": "string", "minLength": 1 } },
+                    "required": ["patchText"]
+                }),
+            ),
+            (
+                "file_index",
+                json!({
+                    "$schema": DRAFT_07,
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": { "path": { "type": "string", "minLength": 1 } },
+                    "required": ["path"]
+                }),
+            ),
+            (
+                "websearch",
+                json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "query": { "type": "string", "maxLength": 512 },
+                        "limit": { "type": "integer", "minimum": 1, "maximum": 25 },
+                        "timeoutSec": { "type": "integer", "minimum": 1, "maximum": 60 }
+                    },
+                    "required": ["query"]
+                }),
+            ),
+            (
+                "webfetch",
+                json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "url": { "type": "string" },
+                        "format": { "type": "string", "enum": ["markdown", "text", "html"] },
+                        "pdfMode": { "type": "string", "enum": ["extract", "attachment"] },
+                        "timeout": { "type": "integer", "minimum": 1, "maximum": 60 }
+                    },
+                    "required": ["url"]
+                }),
+            ),
+            (
+                "shell",
+                json!({
+                    "$schema": DRAFT_07,
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "command": { "type": "string", "minLength": 1 },
+                        "timeout": { "type": "integer", "minimum": 1, "maximum": 600_000, "default": 120_000 },
+                        "workdir": { "type": "string", "minLength": 1 }
+                    },
+                    "required": ["command"]
+                }),
+            ),
+            (
+                "python_execution",
+                json!({
+                    "$schema": DRAFT_07,
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "code": { "type": "string", "minLength": 1, "maxLength": 65_536 },
+                        "timeout": { "type": "integer", "minimum": 1, "maximum": 30_000, "default": 5_000 }
+                    },
+                    "required": ["code"]
+                }),
+            ),
+            (
+                "code_map",
+                json!({
+                    "$schema": DRAFT_07,
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "path": { "type": "string" },
+                        "limit": { "type": "integer", "minimum": 1 }
+                    }
+                }),
+            ),
+            (
+                "code_context",
+                json!({
+                    "$schema": DRAFT_07,
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "task": { "type": "string", "minLength": 1 },
+                        "path": { "type": "string" },
+                        "limit": { "type": "integer", "minimum": 1 }
+                    },
+                    "required": ["task"]
+                }),
+            ),
+            (
+                "code_refs",
+                json!({
+                    "$schema": DRAFT_07,
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "symbol": { "type": "string", "minLength": 1 },
+                        "direction": { "type": "string", "enum": ["callers", "callees"], "default": "callers" },
+                        "path": { "type": "string" },
+                        "limit": { "type": "integer", "minimum": 1 }
+                    },
+                    "required": ["symbol"]
+                }),
+            ),
+            (
+                "code_impact",
+                json!({
+                    "$schema": DRAFT_07,
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "symbol": { "type": "string", "minLength": 1 },
+                        "depth": { "type": "integer", "minimum": 1, "maximum": 8, "default": 3 },
+                        "path": { "type": "string" },
+                        "limit": { "type": "integer", "minimum": 1 }
+                    },
+                    "required": ["symbol"]
+                }),
+            ),
+            (
+                "code_expand",
+                json!({
+                    "$schema": DRAFT_07,
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "symbol": { "type": "string", "minLength": 1 },
+                        "path": { "type": "string" }
+                    },
+                    "required": ["symbol"]
+                }),
+            ),
+            (
+                "execution_environment",
+                json!({
+                    "$schema": DRAFT_07,
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {}
+                }),
+            ),
+        ]
+    }
+
+    fn assert_embedded_file_read(host: &WorkcellHost) {
+        const NOT_EMBEDDED: &str = "the default constructor must register the in-process Workcell";
+
+        let registry = ToolRegistry::new();
+        host.register(&registry).expect("Workcell registration");
+        let registered = registry.get("file_read").expect("registered file_read");
+        assert_eq!(
+            registered.tool.as_ref().type_id(),
+            TypeId::of::<WorkcellTool>(),
+            "{NOT_EMBEDDED}"
+        );
+        assert!(
+            matches!(registered.source, ToolSource::Native { ref owner, trusted: true, .. } if owner.as_ref() == OWNER),
+            "{NOT_EMBEDDED}"
+        );
+    }
+
+    #[test]
+    fn default_public_constructors_start_embedded_workcell() {
+        let root = TempDir::new().expect("tempdir");
+        let development = WorkcellHost::new(root.path(), None).expect("development Workcell host");
+        let production =
+            WorkcellHost::new_production(root.path(), None).expect("production Workcell host");
+
+        assert_embedded_file_read(&development);
+        assert_embedded_file_read(&production);
     }
 
     /// A future mtime stands in for another process touching the file, without
@@ -3465,6 +5037,26 @@ mod tests {
         assert_eq!(shown, "compiling\n 50%");
     }
 
+    #[test_case(workcell::code_graph::GraphPhase::Crawl, 0, "crawl" ; "crawl_started")]
+    #[test_case(workcell::code_graph::GraphPhase::Crawl, 64, "crawl 64 files" ; "crawl_progress")]
+    #[test_case(workcell::code_graph::GraphPhase::Parse, 12, "parse 12 files" ; "parse_progress")]
+    #[test_case(workcell::code_graph::GraphPhase::Rank, 12, "rank 12 files" ; "rank_progress")]
+    fn code_graph_progress_is_exposed_as_a_live_annotation(
+        phase: workcell::code_graph::GraphPhase,
+        files: usize,
+        expected: &str,
+    ) {
+        let (live_sink, live) = flume::bounded(1);
+        let sink = GraphPhaseSink { live_sink };
+
+        smol::block_on(sink.publish(GraphProgress { phase, files }));
+
+        let ToolLive::Annotation(annotation) = live.recv().expect("one progress annotation") else {
+            panic!("graph progress must use the annotation surface");
+        };
+        assert_eq!(annotation, expected);
+    }
+
     /// Exercised through `from_values` rather than the process environment:
     /// env vars are global to the test binary and would race every other test.
     #[test_case(None, None, None ; "no_proxy_configured")]
@@ -3532,6 +5124,104 @@ mod tests {
         let mut known: Vec<&str> = NATIVE_TOOL_NAMES.to_vec();
         known.sort_unstable();
         assert_eq!(published, known);
+    }
+
+    #[test]
+    fn documented_catalog_preserves_canonical_order_contracts_and_effects() {
+        let root = TempDir::new().expect("tempdir");
+        let host = WorkcellHost::new(root.path(), None).expect("Workcell host");
+        let registry = ToolRegistry::new();
+        host.register_documented_tools(&registry)
+            .expect("Workcell registration");
+        let expected = [
+            ("file_read", "file.read.v1", ToolEffect::ReadOnly, "read"),
+            ("file_glob", "file.glob.v1", ToolEffect::ReadOnly, "search"),
+            ("file_grep", "file.grep.v1", ToolEffect::ReadOnly, "search"),
+            ("file_write", "file.write.v1", ToolEffect::Mutating, "edit"),
+            ("file_edit", "file.edit.v1", ToolEffect::Mutating, "edit"),
+            (
+                "file_apply_patch",
+                "file.patch.v1",
+                ToolEffect::Mutating,
+                "edit",
+            ),
+            ("file_index", "file.index.v1", ToolEffect::ReadOnly, "read"),
+            ("websearch", "web.search.v1", ToolEffect::ReadOnly, "search"),
+            ("webfetch", "web.fetch.v1", ToolEffect::ReadOnly, "fetch"),
+            (
+                "shell",
+                "shell.execution.v1",
+                ToolEffect::Mutating,
+                "execute",
+            ),
+            ("code_map", "code.map.v1", ToolEffect::ReadOnly, "search"),
+            (
+                "code_context",
+                "code.context.v1",
+                ToolEffect::ReadOnly,
+                "search",
+            ),
+            ("code_refs", "code.refs.v1", ToolEffect::ReadOnly, "search"),
+            (
+                "code_impact",
+                "code.impact.v1",
+                ToolEffect::ReadOnly,
+                "search",
+            ),
+            (
+                "code_expand",
+                "code.expand.v1",
+                ToolEffect::ReadOnly,
+                "read",
+            ),
+            (
+                "python_execution",
+                "python.execution.v1",
+                ToolEffect::Isolated,
+                "execute",
+            ),
+            (
+                "execution_environment",
+                "execution-environment.snapshot.v1",
+                ToolEffect::Mutating,
+                "execute",
+            ),
+        ];
+        let snapshot = registry.iter();
+        let names: Vec<&str> = snapshot.iter().map(|entry| entry.name()).collect();
+        let expected_names: Vec<&str> = expected.iter().map(|entry| entry.0).collect();
+
+        assert_eq!(names, expected_names);
+        for (registered, (name, contract, effect, presentation)) in snapshot.iter().zip(expected) {
+            assert_eq!(registered.name(), name);
+            assert_eq!(registered.effect, effect, "{name}");
+            assert_eq!(registered.tool.tool_kind(), Some(presentation), "{name}");
+            assert!(matches!(
+                &registered.source,
+                ToolSource::Native {
+                    owner,
+                    contract: registered_contract,
+                    trusted: true,
+                } if owner.as_ref() == OWNER && registered_contract.as_ref() == contract
+            ));
+        }
+    }
+
+    #[test]
+    fn documented_catalog_input_schema_contracts_are_stable() {
+        let root = TempDir::new().expect("tempdir");
+        let host = WorkcellHost::new(root.path(), None).expect("Workcell host");
+        let registry = ToolRegistry::new();
+        host.register_documented_tools(&registry)
+            .expect("Workcell registration");
+
+        for (name, expected) in canonical_input_schemas() {
+            let registered = registry
+                .get(name)
+                .unwrap_or_else(|| panic!("registered {name}"));
+            let actual = schema_contract(&registered.tool.schema());
+            assert_eq!(actual, expected, "input schema contract changed for {name}");
+        }
     }
 
     #[test]
@@ -4142,22 +5832,25 @@ mod tests {
 
     #[test]
     fn a_capped_grep_carries_how_far_it_searched_into_the_result() {
-        let result = file_grep_result(FileGrepOutput {
-            cwd: "/project".into(),
-            relative_path: ".".into(),
-            pattern: "needle".into(),
-            include: None,
-            rows: vec![workcell::files::FileGrepRow {
-                path: "/project/a.rs".into(),
-                relative_path: "a.rs".into(),
-                line: 3,
-                text: "needle".into(),
-            }],
-            matches: 1,
-            files_scanned: 40,
-            files_listed: 900,
-            truncated: true,
-        });
+        let result = file_grep_result(
+            serde_json::from_value(serde_json::json!({
+                "cwd": "/project",
+                "relativePath": ".",
+                "pattern": "needle",
+                "include": null,
+                "rows": [{
+                    "path": "/project/a.rs",
+                    "relativePath": "a.rs",
+                    "line": 3,
+                    "text": "needle",
+                }],
+                "matches": 1,
+                "filesScanned": 40,
+                "filesListed": 900,
+                "truncated": true,
+            }))
+            .expect("grep fixture"),
+        );
         let model = result.model_output.clone().expect("model text");
         assert!(
             model.contains("[truncated: showing 1 matches from 40 of 900 files searched]"),
@@ -4189,22 +5882,25 @@ mod tests {
             ToolOutput::ReadCode { path, .. } if path.ends_with("lib.rs")
         ));
 
-        let grep = file_grep_result(FileGrepOutput {
-            cwd: "/project".into(),
-            relative_path: ".".into(),
-            pattern: "main".into(),
-            include: Some("*.rs".into()),
-            rows: vec![workcell::files::FileGrepRow {
-                path: "/project/src/lib.rs".into(),
-                relative_path: "src/lib.rs".into(),
-                line: 1,
-                text: "fn main() {}".into(),
-            }],
-            matches: 1,
-            files_scanned: 1,
-            files_listed: 1,
-            truncated: false,
-        })
+        let grep = file_grep_result(
+            serde_json::from_value(serde_json::json!({
+                "cwd": "/project",
+                "relativePath": ".",
+                "pattern": "main",
+                "include": "*.rs",
+                "rows": [{
+                    "path": "/project/src/lib.rs",
+                    "relativePath": "src/lib.rs",
+                    "line": 1,
+                    "text": "fn main() {}",
+                }],
+                "matches": 1,
+                "filesScanned": 1,
+                "filesListed": 1,
+                "truncated": false,
+            }))
+            .expect("grep fixture"),
+        )
         .output
         .expect("grep output");
         assert!(matches!(
@@ -4409,6 +6105,7 @@ mod tests {
                 whole_file: &whole_file,
                 slice: &slice,
                 vision: false,
+                remote_context: None,
             },
         ));
 
@@ -4439,6 +6136,7 @@ mod tests {
                 whole_file: &ctx,
                 slice: &ctx,
                 vision: false,
+                remote_context: None,
             },
         ));
 
@@ -4884,7 +6582,7 @@ mod tests {
 
         let result = smol::block_on(invocation.execute(&ctx));
         assert!(result.is_error);
-        assert!(result.output.is_err());
+        assert_eq!(result.output.expect_err(SHELL_CANCELLED), SHELL_CANCELLED);
     }
 
     #[test]
@@ -4990,7 +6688,8 @@ mod tests {
         ));
 
         assert!(!done.is_error, "{}", done.output.as_text());
-        assert_eq!(std::fs::read_to_string(plan).unwrap(), "approved plan");
+        assert!(done.wrote_to(&plan));
+        assert_eq!(std::fs::read_to_string(&plan).unwrap(), "approved plan");
     }
 
     const MISSING_NAME: &str = "does-not-exist.txt";

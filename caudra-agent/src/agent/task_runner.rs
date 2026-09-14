@@ -21,7 +21,9 @@ use caudra_providers::model::{Model, ModelPurpose};
 use caudra_providers::provider::Provider;
 use caudra_providers::{RequestOptions, Timeouts, ToolNameAliases};
 use caudra_storage::id::SessionRef;
+use caudra_storage::local_documents::LocalDocumentStore;
 use caudra_storage::tool_outputs::ToolOutputStore;
+use caudra_workspace::WorkspaceSession;
 use jsonschema::Validator;
 use serde_json::Value;
 use tracing::info;
@@ -36,12 +38,14 @@ use crate::permissions::PermissionManager;
 use crate::prompt::ResolvedSlots;
 use crate::prompt::profile::PromptProfileCatalog;
 use crate::subagent_history::{SubagentHistoryStore, SubagentTaskMode};
+use crate::template::Vars;
 use crate::tools::registry::ToolRegistry;
 use crate::tools::{
     Deadline, FileReadTracker, LocalToolFn, LocalTools, PathLocks, ToolAudience, ToolContext,
     ToolEffect, ToolFilter,
 };
 use crate::types::WorkflowProvenance;
+use crate::workflow::WorkspaceRebind;
 use crate::workspace_baseline::BaselineGate;
 use crate::{AgentConfig, AgentMode, EventSender};
 
@@ -117,6 +121,13 @@ pub struct TaskOutcome {
 pub type TaskFuture<'a> = Pin<Box<dyn Future<Output = TaskOutcome> + Send + 'a>>;
 
 pub trait TaskRunner: Send + Sync {
+    fn rebind_workspace(
+        &self,
+        _workspace: &WorkspaceRebind,
+    ) -> Result<Arc<dyn TaskRunner>, String> {
+        Err("task runner does not support workspace transitions".into())
+    }
+
     fn run(&self, request: TaskRequest, cancel: CancelToken, events: EventSender)
     -> TaskFuture<'_>;
 }
@@ -254,7 +265,11 @@ fn clamp_mode(
     ceiling: &AgentMode,
 ) -> Option<SubagentTaskMode> {
     match (task.is_continuation(), requested, ceiling) {
-        (false, Some(SubagentTaskMode::Build), AgentMode::ReadOnly | AgentMode::Plan(_)) => {
+        (
+            false,
+            Some(SubagentTaskMode::Build),
+            AgentMode::ReadOnly | AgentMode::Plan(_) | AgentMode::RemotePlan(_),
+        ) => {
             info!(ceiling = ?ceiling, "build task clamped to plan under a read-only parent");
             Some(SubagentTaskMode::Plan)
         }
@@ -406,6 +421,7 @@ pub type ModeResolver = Arc<dyn Fn() -> AgentMode + Send + Sync>;
 /// The durable part of a session's [`ToolContext`], captured once so the
 /// workflow engine can launch agents long after the tool call that would
 /// have carried them is gone.
+#[derive(Clone)]
 pub struct WorkflowHostContext {
     pub model: ModelResolver,
     pub permissions: Arc<PermissionManager>,
@@ -425,6 +441,10 @@ pub struct WorkflowHostContext {
     pub tool_output_store: Option<Arc<ToolOutputStore>>,
     pub tool_output_lines: ToolOutputLines,
     pub session_id: Option<SessionRef>,
+    pub workspace_session: Option<WorkspaceSession>,
+    pub remote_project_context: Option<Arc<crate::remote_project_context::RemoteProjectContext>>,
+    pub local_documents: Option<Arc<LocalDocumentStore>>,
+    pub task_environment: Vars,
     pub loaded_instructions: LoadedInstructions,
     /// Read when each task starts; its answer caps that task.
     pub mode: ModeResolver,
@@ -471,6 +491,10 @@ impl WorkflowHostContext {
             tool_output_store: crate::tool_output::default_store(),
             tool_output_lines: params.tool_output_lines,
             session_id: params.session_id.clone(),
+            workspace_session: params.workspace_session.clone(),
+            remote_project_context: params.remote_project_context.clone(),
+            local_documents: params.local_documents.clone(),
+            task_environment: params.task_environment.clone(),
             loaded_instructions: extras.loaded_instructions,
             mode,
             subagent_cancels,
@@ -505,6 +529,10 @@ impl WorkflowHostContext {
             tool_output_store: ctx.tool_output_store.clone(),
             tool_output_lines: ctx.tool_output_lines,
             session_id: ctx.session_id.clone(),
+            workspace_session: ctx.workspace_session.clone(),
+            remote_project_context: ctx.remote_project_context.clone(),
+            local_documents: ctx.local_documents.clone(),
+            task_environment: ctx.task_environment.clone(),
             loaded_instructions: ctx.loaded_instructions.clone(),
             mode,
             subagent_cancels,
@@ -526,7 +554,7 @@ impl WorkflowHostContext {
     ) -> Result<ToolContext, String> {
         let mode = (self.mode)();
         let (chat_provider, chat_model) = (self.model)();
-        let (provider, model) = if matches!(mode, AgentMode::Plan(_)) {
+        let (provider, model) = if mode.is_planning() {
             crate::agent::resolve_model_for_purpose(
                 crate::agent::ModelRoute {
                     provider: &chat_provider,
@@ -554,6 +582,10 @@ impl WorkflowHostContext {
             event_tx: events,
             mode,
             session_id: self.session_id.clone(),
+            workspace_session: self.workspace_session.clone(),
+            remote_project_context: self.remote_project_context.clone(),
+            local_documents: self.local_documents.clone(),
+            task_environment: self.task_environment.clone(),
             context_publisher: self.context_publisher.clone(),
             tool_output_store: self.tool_output_store.clone(),
             tool_use_id: Some(call_id.to_owned()),
@@ -602,6 +634,30 @@ impl SubagentTaskRunner {
 }
 
 impl TaskRunner for SubagentTaskRunner {
+    fn rebind_workspace(&self, workspace: &WorkspaceRebind) -> Result<Arc<dyn TaskRunner>, String> {
+        if self.host.subagent_cancels.active_count() != 0 {
+            return Err("workflow agents must be quiescent before changing workspace".into());
+        }
+        let mut host = self.host.as_ref().clone();
+        let previous = host
+            .workspace_session
+            .as_ref()
+            .ok_or("cannot rebind a local workflow to remote")?;
+        if previous.binding().authority() != workspace.workspace.binding().authority()
+            || previous.binding().principal() != workspace.workspace.binding().principal()
+            || previous.binding().project() != workspace.workspace.binding().project()
+        {
+            return Err("workflow workspace identity changed".into());
+        }
+        host.workspace_session = Some(workspace.workspace.clone());
+        host.remote_project_context = Some(Arc::clone(&workspace.context));
+        host.task_environment = host.task_environment.set("{cwd}", workspace.cwd.clone());
+        host.loaded_instructions =
+            crate::agent::load_remote_instructions(&workspace.context).loaded;
+        host.path_locks = PathLocks::fresh();
+        Ok(Arc::new(Self::new(Arc::new(host))))
+    }
+
     fn run(
         &self,
         request: TaskRequest,
@@ -625,6 +681,7 @@ impl TaskRunner for SubagentTaskRunner {
 
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
     use std::sync::Mutex;
 
     use caudra_providers::{
@@ -636,8 +693,18 @@ mod tests {
 
     use super::*;
     use crate::cancel::CancelTrigger;
+    use crate::tools::DescriptionContext;
     use crate::tools::registry::BoxFuture;
+    use crate::tools::registry::{
+        ExecFuture, HeaderFuture, HeaderResult, ParseError, Tool, ToolInvocation, ToolSource,
+    };
     use crate::tools::test_support::stub_ctx_with;
+    use crate::workflow::{RuntimeDeps, WorkflowRuntime, WorkspaceRebind};
+    use caudra_storage::{StateDir, id::CaudraId};
+    use caudra_workflow::{
+        LaunchRequest, RunStatus, WorkflowEvent, WorkflowRequest, WorkflowResponse,
+    };
+    use caudra_workspace::WorkspacePath;
 
     const CALL_ID: &str = "toolu_01";
     const FRESH_ID: &str = "wf-run-1-call-7";
@@ -649,6 +716,8 @@ mod tests {
     const BOOM: &str = "boom";
     const CURRENT_CHAT_ID: &str = "current-chat";
     const PLAN_PATH: &str = ".caudra/plans/current.md";
+    const CURSOR_PROBE: &str = "resume_cursor_probe";
+    const CURSOR_WORKFLOW: &str = r#"let meta = #{ name: "echo", description: "cursor test" }; let result = agent("probe the cursor"); complete(result.output);"#;
     const FIRST_TURN: TokenUsage = TokenUsage {
         input: 100,
         output: 20,
@@ -662,6 +731,199 @@ mod tests {
         cache_read: 0,
     };
 
+    struct CursorProbe(Arc<Mutex<Vec<(String, String)>>>);
+
+    impl Tool for CursorProbe {
+        fn name(&self) -> &str {
+            CURSOR_PROBE
+        }
+        fn description(&self, _: &DescriptionContext) -> Cow<'_, str> {
+            Cow::Borrowed("Probe the bound remote cursor")
+        }
+        fn schema(&self) -> Value {
+            json!({"type":"object","properties":{}})
+        }
+        fn parse(&self, _: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
+            Ok(Box::new(Self(Arc::clone(&self.0))))
+        }
+    }
+
+    impl ToolInvocation for CursorProbe {
+        fn start_header(&self) -> HeaderFuture {
+            HeaderFuture::Ready(HeaderResult::plain(CURSOR_PROBE.into()))
+        }
+        fn execute<'a>(self: Box<Self>, ctx: &'a ToolContext) -> ExecFuture<'a> {
+            Box::pin(async move {
+                let workspace = ctx.workspace_session.as_ref().unwrap();
+                let cwd = crate::workspace_logical_cwd(workspace).await.unwrap();
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((workspace.cursor().cwd_handle().as_str().into(), cwd.clone()));
+                Ok(crate::ToolOutput::Plain(crate::TextOutput {
+                    text: cwd,
+                    instructions: None,
+                    state: None,
+                    lua_provenance: None,
+                }))
+                .into()
+            })
+        }
+    }
+
+    #[test]
+    fn subsequent_workflow_agent_executes_with_rebuilt_cursor_and_context() {
+        smol::block_on(async {
+            let temp = tempfile::tempdir().unwrap();
+            let (workspace, service) =
+                crate::stored_session::tests::remote_workspace("runner", CURSOR_WORKFLOW);
+            let context = crate::remote_project_context::load_remote_project_context(&workspace)
+                .await
+                .unwrap();
+            let provider = Arc::new(ScriptedProvider::new(vec![
+                response(
+                    vec![ContentBlock::tool_use("probe", CURSOR_PROBE, json!({}))],
+                    StopReason::ToolUse,
+                    FIRST_TURN,
+                ),
+                text_response(SUMMARY, SECOND_TURN),
+            ]));
+            let mut ctx = stub_ctx_with(&AgentMode::Build, None, Some(CALL_ID));
+            ctx.session_id = Some(SessionRef::from(CaudraId::generate()));
+            let state_dir = StateDir::from_path(temp.path().into());
+            let binding =
+                caudra_storage::workspace_binding::StoredWorkspaceBinding::new_with_cursor(
+                    workspace.binding().clone(),
+                    workspace.cursor().clone(),
+                    None,
+                )
+                .unwrap();
+            let mut stored = crate::StoredSession::new_with_workspace("test/model", ".", binding);
+            stored.id = ctx.session_id.as_ref().unwrap().id();
+            stored.save(&state_dir).unwrap();
+            ctx.workspace_session = Some(workspace.clone());
+            ctx.remote_project_context = Some(Arc::clone(&context));
+            ctx.permissions.set_session_yolo(Some(true));
+            ctx.registry = Arc::new(ToolRegistry::new());
+            let observed = Arc::new(Mutex::new(Vec::new()));
+            ctx.registry
+                .register_audited(
+                    Arc::new(CursorProbe(Arc::clone(&observed))),
+                    ToolSource::Native {
+                        owner: CURSOR_PROBE.into(),
+                        contract: CURSOR_PROBE.into(),
+                        trusted: true,
+                    },
+                    ToolEffect::ReadOnly,
+                )
+                .unwrap();
+            let model: ModelResolver = Arc::new({
+                let model = Arc::clone(&ctx.model);
+                move || (provider.clone(), model.clone())
+            });
+            let mode: ModeResolver = Arc::new(|| AgentMode::Build);
+            let cancels = Arc::new(CancelMap::new());
+            let host =
+                WorkflowHostContext::from_tool_context(&ctx, model, mode.clone(), cancels.clone());
+            let (events, received) = flume::unbounded();
+            let runtime = WorkflowRuntime::spawn(RuntimeDeps {
+                state_dir,
+                session_id: ctx.session_id.as_ref().unwrap().id(),
+                cwd: ".".into(),
+                user_config_dir: Some(temp.path().join("config")),
+                remote_project_context: Some(context),
+                runner: Arc::new(SubagentTaskRunner::new(Arc::new(host))),
+                events,
+                mode,
+                subagent_cancels: cancels,
+            })
+            .await
+            .unwrap();
+            let handle = runtime.handle();
+            let resolved = workspace
+                .workspace()
+                .services()
+                .read
+                .as_ref()
+                .unwrap()
+                .resolve_directory(
+                    workspace.binding(),
+                    workspace.cursor(),
+                    &WorkspacePath::new("nested").unwrap(),
+                )
+                .await
+                .unwrap();
+            let nested = workspace.with_cursor(resolved).unwrap();
+            service
+                .revision
+                .store(2, std::sync::atomic::Ordering::SeqCst);
+            let context = crate::remote_project_context::load_remote_project_context(&nested)
+                .await
+                .unwrap();
+            let transition = handle.suspend().await.unwrap();
+            transition
+                .rebind(WorkspaceRebind {
+                    workspace: nested.clone(),
+                    context,
+                    cwd: "nested".into(),
+                })
+                .await
+                .unwrap();
+            transition.commit().await.unwrap();
+            let WorkflowResponse::Catalog(catalog) =
+                handle.request(WorkflowRequest::List).await.unwrap()
+            else {
+                panic!("catalog");
+            };
+            let entry = catalog
+                .entries
+                .iter()
+                .find(|entry| entry.name == "echo")
+                .unwrap();
+            handle
+                .request(WorkflowRequest::Trust {
+                    name: "echo".into(),
+                    digest: entry.digest.clone(),
+                })
+                .await
+                .unwrap();
+            let WorkflowResponse::Started(run) = handle
+                .request(WorkflowRequest::Start(LaunchRequest {
+                    name: "echo".into(),
+                    args: json!({}),
+                    agent_budget: None,
+                }))
+                .await
+                .unwrap()
+            else {
+                panic!("started");
+            };
+            loop {
+                let envelope = received.recv_async().await.unwrap();
+                if let crate::AgentEvent::Workflow(event) = envelope.event
+                    && let WorkflowEvent::Snapshot(snapshot) = *event
+                    && snapshot.run_id == run.run_id
+                    && snapshot.status != RunStatus::Active
+                {
+                    assert_eq!(
+                        snapshot.status,
+                        RunStatus::Completed,
+                        "{:?}",
+                        snapshot.error
+                    );
+                    break;
+                }
+            }
+            assert_eq!(
+                *observed.lock().unwrap(),
+                vec![(
+                    nested.cursor().cwd_handle().as_str().into(),
+                    "nested".into()
+                )]
+            );
+            runtime.shutdown().await;
+        });
+    }
     fn answer_schema() -> Value {
         json!({
             "type": "object",

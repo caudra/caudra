@@ -6,6 +6,7 @@ edition.workspace = true
 authors.workspace = true
 
 [dependencies]
+caudra-workspace = { workspace = true }
 flume = { workspace = true }
 getrandom = { workspace = true }
 isahc = { workspace = true }

@@ -150,6 +150,8 @@ pub struct McpServerInfo {
 
 #[derive(Deserialize, Default)]
 pub struct McpConfig {
+    #[serde(skip)]
+    pub local_execution: LocalExecutionPolicy,
     /// Defer tools behind `tool_search` only when more than this many
     /// non-`always_load` tools exist. `None` means the built-in default;
     /// 0 always defers, a large value disables deferral.
@@ -214,6 +216,7 @@ pub struct RawHttpFields {
 
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
+    pub local_execution: LocalExecutionPolicy,
     pub name: String,
     pub timeout: Duration,
     /// Skip deferral: every tool from this server enters the context upfront
@@ -268,8 +271,10 @@ impl McpConfig {
                 let source = self.sources.get(name).copied().unwrap_or_default();
                 let status = if !raw.enabled || disabled.contains(name) {
                     McpServerStatus::Disabled
-                } else if source == McpConfigSource::Project
-                    && requires_project_trust(&raw.transport)
+                } else if (source == McpConfigSource::Project
+                    && requires_project_trust(&raw.transport))
+                    || (self.local_execution == LocalExecutionPolicy::RemoteLocal
+                        && matches!(raw.transport, RawTransport::Stdio(_)))
                 {
                     McpServerStatus::AwaitingTrust
                 } else {
@@ -296,6 +301,15 @@ impl McpConfig {
             })
             .collect()
     }
+}
+
+/// Launch-context isolation only: client-local extensions remain trusted host code,
+/// with unrestricted filesystem access, not sandboxed remote workspace tools.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LocalExecutionPolicy {
+    #[default]
+    Embedded,
+    RemoteLocal,
 }
 
 pub fn parse_server(name: String, server: RawServerConfig) -> Result<ServerConfig, McpError> {
@@ -348,6 +362,7 @@ pub fn parse_server(name: String, server: RawServerConfig) -> Result<ServerConfi
         }
     };
     Ok(ServerConfig {
+        local_execution: LocalExecutionPolicy::Embedded,
         name,
         timeout: Duration::from_millis(server.timeout),
         always_load: server.always_load,
@@ -627,6 +642,37 @@ pub fn load_config(cwd: &Path) -> (McpConfig, McpConfigErrors) {
     (merged, errors)
 }
 
+pub fn load_global_config(cwd: &Path) -> (McpConfig, McpConfigErrors) {
+    load_global_config_from(cwd, global_config_dir().as_deref())
+}
+
+fn load_global_config_from(cwd: &Path, global_dir: Option<&Path>) -> (McpConfig, McpConfigErrors) {
+    let mut merged = McpConfig {
+        local_execution: LocalExecutionPolicy::RemoteLocal,
+        ..Default::default()
+    };
+    let mut errors = McpConfigErrors::new(cwd.to_path_buf());
+    if let Some(global_dir) = global_dir {
+        merge_config(
+            &mut merged,
+            &mut errors,
+            &global_dir.join(MCP_CONFIG_FILE),
+            McpConfigSource::Global,
+        );
+    }
+    (merged, errors)
+}
+
+pub fn http_endpoints(config: &McpConfig) -> impl Iterator<Item = &str> {
+    config
+        .mcp
+        .values()
+        .filter_map(|server| match &server.transport {
+            RawTransport::Http(http) => Some(http.url.as_str()),
+            RawTransport::Stdio(_) => None,
+        })
+}
+
 pub fn persist_enabled(
     config_path: &Path,
     server_name: &str,
@@ -700,6 +746,9 @@ mod tests {
     use super::*;
     use test_case::test_case;
 
+    const GLOBAL_SERVER: &str = "global-server";
+    const PROJECT_CANARY: &str = "project-canary";
+
     fn stdio_raw(cmd: &[&str]) -> RawServerConfig {
         RawServerConfig {
             enabled: true,
@@ -741,6 +790,35 @@ mod tests {
         cfg.timeout = timeout;
         let err = parse_server("srv".into(), cfg).unwrap_err();
         assert!(err.to_string().contains("timeout"));
+    }
+
+    #[test]
+    fn global_only_loader_does_not_read_project_mcp_config() {
+        let root = tempfile::tempdir().unwrap();
+        let global = root.path().join("global");
+        let project = root.path().join("project");
+        fs::create_dir_all(&global).unwrap();
+        fs::create_dir_all(project.join(".caudra")).unwrap();
+        fs::write(
+            global.join(MCP_CONFIG_FILE),
+            format!("[mcp.{GLOBAL_SERVER}]\ncommand = ['true']\n"),
+        )
+        .unwrap();
+        fs::write(
+            project.join(".caudra").join(MCP_CONFIG_FILE),
+            format!("[mcp.{PROJECT_CANARY}]\ncommand = ['false']\n"),
+        )
+        .unwrap();
+
+        let (config, errors) = load_global_config_from(&project, Some(&global));
+
+        assert!(errors.is_empty());
+        assert!(config.mcp.contains_key(GLOBAL_SERVER));
+        assert!(!config.mcp.contains_key(PROJECT_CANARY));
+        assert_eq!(
+            config.sources.get(GLOBAL_SERVER),
+            Some(&McpConfigSource::Global)
+        );
     }
 
     #[test]

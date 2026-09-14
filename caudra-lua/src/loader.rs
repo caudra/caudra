@@ -267,6 +267,25 @@ impl PluginHost {
         self.load_init_files(cwd)
     }
 
+    pub fn load_global_init_file_or_skip(
+        &self,
+        no_plugins: bool,
+    ) -> Result<Option<RawConfig>, PluginError> {
+        if no_plugins {
+            return Ok(None);
+        }
+        let mut merged = None;
+        if let Some(global_dir) = caudra_config::global_config_dir() {
+            self.run_init_file(
+                &global_dir.join("init.lua"),
+                "global/init.lua",
+                PermissionRulePolicy::Trusted,
+                &mut merged,
+            )?;
+        }
+        Ok(merged)
+    }
+
     fn run_init_file(
         &self,
         path: &Path,

@@ -8,6 +8,7 @@ authors.workspace = true
 [dependencies]
 caudra-config-macro = { workspace = true }
 caudra-storage = { workspace = true }
+caudra-workspace = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -16,6 +17,10 @@ tracing = { workspace = true }
 dotenvy = { workspace = true }
 inventory = { workspace = true }
 globset = { workspace = true }
+url = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true, features = ["fs", "process"] }
 
 [dev-dependencies]
 test-case = { workspace = true }

@@ -37,6 +37,14 @@ const SECTIONS: &[(&str, &[&str])] = &[
         ],
     ),
     (
+        "Local Documents",
+        &[
+            "local_document_read",
+            "local_document_write",
+            "local_document_apply_patch",
+        ],
+    ),
+    (
         "Execution & Control",
         &[
             "batch",
@@ -443,7 +451,8 @@ pub fn generate() -> String {
     writeln!(
         out,
         "Caudra ships with {total} built-in tools in this reference \
-         ({default_n} on by default, {opt_in_n} opt-in via plugin options). \
+         ({default_n} requiring no plugin opt-in, {opt_in_n} opt-in via plugin options). \
+         Availability depends on the selected workspace backend. \
          Tools marked **opt-in** are off until you enable them under `plugins` \
          in [Configuration](/docs/configuration/)."
     )
@@ -452,6 +461,11 @@ pub fn generate() -> String {
     writeln!(
         out,
         "First-party file, web, shell, index, Python, and environment tools run through protocol-neutral Workcell contracts. Workcell owns schemas, validation, execution bounds, atomic file changes, network policy, subprocess cleanup, cancellation, and the bundled worker lifecycle. Caudra owns registration, authorization, retained session output, and model or UI presentation. Release builds pin an exact Workcell revision."
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "\nRemote Workcell selection replaces the first-party execution backend. Startup requires the complete compatible catalog and workspace capabilities, even when a tool is disabled for the model. A missing or incompatible remote tool never falls back to local execution. The Local Documents section below describes remote-only tools for client-owned plans and memory by opaque reference. They are absent from embedded sessions. This development feature requires a matching Workcell build beyond the current release pin. See [Remote Workspaces](/docs/remote-workspaces/)."
     )
     .unwrap();
     write_disabling_section(&mut out);

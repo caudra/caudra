@@ -236,6 +236,22 @@ impl ResolvedSlots {
     /// registry serves filters that exclude them. Applying the hints here ties
     /// each one to its tool actually being offered.
     pub fn with_native_hints(&self, filter: &crate::tools::ToolFilter) -> Cow<'_, Self> {
+        self.with_native_hints_and_memory(filter, None)
+    }
+
+    pub fn with_native_hints_for_store<'a>(
+        &'a self,
+        filter: &crate::tools::ToolFilter,
+        store: &'a caudra_storage::local_documents::LocalDocumentStore,
+    ) -> Cow<'a, Self> {
+        self.with_native_hints_and_memory(filter, Some(store))
+    }
+
+    fn with_native_hints_and_memory<'a>(
+        &'a self,
+        filter: &crate::tools::ToolFilter,
+        store: Option<&caudra_storage::local_documents::LocalDocumentStore>,
+    ) -> Cow<'a, Self> {
         let hints: Vec<_> = NATIVE_HINTS
             .iter()
             .filter(|(tool, ..)| filter.matches(tool))
@@ -259,8 +275,12 @@ impl ResolvedSlots {
         // The memory tag index is scanned from disk, so unlike the fixed hints
         // it cannot live in a const table. It only reaches the system prompt:
         // a subagent gets the tool, not the whole project's tag vocabulary.
+        let memory_line = store.map_or_else(
+            crate::tools::native::memory::prompt_tag_line_for_cwd,
+            crate::tools::native::memory::prompt_tag_line_for_store,
+        );
         if filter.matches(crate::tools::MEMORY_TOOL_NAME)
-            && let Some(line) = crate::tools::native::memory::prompt_tag_line_for_cwd()
+            && let Some(line) = memory_line
         {
             slots.insert(
                 PromptId::System,

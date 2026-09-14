@@ -1292,7 +1292,10 @@ mod tests {
     /// Seeds a log directory and opens against it, so the tests never touch the
     /// real one and never depend on what a previous run happened to write.
     fn seeded_modal(dir: &std::path::Path) -> LogsModal {
-        seeded_with(dir, &(0..SEEDED).map(|i| format!("line-{i}")).collect::<Vec<_>>())
+        seeded_with(
+            dir,
+            &(0..SEEDED).map(|i| format!("line-{i}")).collect::<Vec<_>>(),
+        )
     }
 
     /// The same seed with a last record too wide for any modal, which is what

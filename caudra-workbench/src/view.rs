@@ -5,7 +5,6 @@
 //! [`PaneRects`] is what paging and scrolling read back.
 
 use std::ops::Range;
-use std::path::Path;
 
 use caudra_highlight::StyledSegment;
 use ratatui::Frame;
@@ -16,6 +15,7 @@ use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
 use crate::editor::{DiffKind, Editor, Tab, VisualRow, render};
+use crate::fs::backend::WorkbenchPath;
 use crate::fs::tree::{GitMark, Row as TreeRow};
 use crate::menu::{Item, Menu};
 use crate::scm::diff::DiffRow;
@@ -62,6 +62,7 @@ const TREE_HINT: &str = "tree";
 const FLAT_HINT: &str = "flat";
 const COUNT_GAP: &str = " ";
 const EMPTY_TREE: &str = "Nothing to show";
+const LOADING_TREE: &str = "Loading remote files…";
 const DIRTY_MARK: &str = "\u{25cf}";
 const AGENT_MARK: &str = "\u{25e6}";
 const EXPANDED_MARK: &str = "\u{25be} ";
@@ -383,7 +384,7 @@ impl Workbench {
         self.panes.rows = rows;
         let scroll = self.search.scroll();
         let selected = self.search.selected_index();
-        let root = self.root.clone();
+        let root = self.backend_root();
         let pointed = self.hovered_row(rows);
         for (offset, row) in self
             .search
@@ -515,7 +516,12 @@ impl Workbench {
         }
         if self.tree.rows().is_empty() {
             self.panes.rows = area;
-            placeholder(buf, area, EMPTY_TREE, self.styles.dim);
+            let notice = if self.remote_backend.is_some() && !self.remote_pending.is_empty() {
+                LOADING_TREE
+            } else {
+                EMPTY_TREE
+            };
+            placeholder(buf, area, notice, self.styles.dim);
             return;
         }
         let (rows, bar) = scroll_column(self.scrollbars, area, self.tree.rows().len());
@@ -733,10 +739,15 @@ impl Workbench {
     /// Names what goes, relative to the project so a deep path is still one
     /// line, and counts what goes with it when it is a folder.
     fn delete_question(&self, under: usize) -> String {
-        let Some(path) = self.tree.selected().map(|row| row.path.clone()) else {
+        let path = self
+            .delete_target
+            .as_ref()
+            .map(|entry| entry.path.clone())
+            .or_else(|| self.tree.selected().map(|row| row.path.clone()));
+        let Some(path) = path else {
             return String::new();
         };
-        let named = path.strip_prefix(&self.root).unwrap_or(&path).display();
+        let named = path.display_relative(&self.backend_root());
         match under {
             0 => format!("{DELETE_QUESTION}{named}{ONE_PATH}"),
             _ => format!("{DELETE_QUESTION}{named}{WITH_MORE}{under}{MORE_PATHS}"),
@@ -908,9 +919,20 @@ impl Workbench {
         let half = area.width as usize / 2;
         let left = match (&self.flash, self.editor.active()) {
             (Some(message), _) => vec![Span::styled(chrome::fit(message, half), self.styles.error)],
-            (None, Some(tab)) => status_left(tab, self.relative(&tab.path), &self.styles, half),
+            (None, _)
+                if self.sidebar == SidebarView::SourceControl
+                    && self.scm.repository_state().is_some() =>
+            {
+                vec![Span::styled(
+                    chrome::fit(&self.scm.repository_state().unwrap_or_default(), half),
+                    self.styles.dim,
+                )]
+            }
+            (None, Some(tab)) => {
+                status_left(tab, &self.relative_path(&tab.path), &self.styles, half)
+            }
             (None, None) => vec![Span::styled(
-                chrome::fit_end(&self.root.display().to_string(), half),
+                chrome::fit_end(&self.backend_root().display(), half),
                 self.styles.dim,
             )],
         };
@@ -1764,24 +1786,21 @@ fn toggle_row(
 fn search_row(
     search: &Search,
     row: SearchRow,
-    root: &Path,
+    root: &WorkbenchPath,
     selected: bool,
     styles: &WorkbenchStyles,
     width: u16,
 ) -> Line<'static> {
     match row {
         SearchRow::File(index) => match search.file(index) {
-            Some(path) => {
-                let relative = path.strip_prefix(root).unwrap_or(path);
-                Line::from(Span::styled(
-                    chrome::fit_end(&relative.display().to_string(), width as usize),
-                    if selected {
-                        styles.selected
-                    } else {
-                        styles.directory
-                    },
-                ))
-            }
+            Some(path) => Line::from(Span::styled(
+                chrome::fit_end(&path.display_relative(root), width as usize),
+                if selected {
+                    styles.selected
+                } else {
+                    styles.directory
+                },
+            )),
             None => Line::default(),
         },
         SearchRow::Hit(index) => match search.hit(index) {
@@ -2001,7 +2020,7 @@ fn text_row(
 
 fn status_left(
     tab: &Tab,
-    path: &Path,
+    path: &str,
     styles: &WorkbenchStyles,
     width: usize,
 ) -> Vec<Span<'static>> {
@@ -2009,10 +2028,7 @@ fn status_left(
     if tab.is_dirty() {
         spans.push(Span::styled(DIRTY_MARK, styles.accent));
     }
-    spans.push(Span::styled(
-        chrome::fit_end(&path.display().to_string(), width),
-        styles.dim,
-    ));
+    spans.push(Span::styled(chrome::fit_end(path, width), styles.dim));
     if tab.conflict {
         spans.push(Span::styled(HINT_GAP, styles.dim));
         spans.push(Span::styled(CONFLICT_NOTICE, styles.error));
@@ -2047,6 +2063,7 @@ mod tests {
         commit_row, control_at, diff_gutter, header_at, keys, on_menu_mark, scm_controls,
         scroll_column, tab_at, toggle_at, tree_row, tree_style, visible_range,
     };
+    use crate::fs::backend::WorkbenchPath;
     use crate::fs::tree::EntryKind;
     use crate::menu::Menu;
 
@@ -2334,7 +2351,8 @@ mod tests {
     /// One entry of the explorer, so a case only has to say what it changes.
     fn entry(kind: EntryKind, depth: usize) -> TreeRow {
         TreeRow {
-            path: Path::new(TREE_NAME).to_path_buf(),
+            path: WorkbenchPath::Local(Path::new(TREE_NAME).to_path_buf()),
+            resource: None,
             name: TREE_NAME.to_owned(),
             depth,
             kind,

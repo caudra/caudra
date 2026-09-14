@@ -55,6 +55,7 @@ Commands marked Main only act on the main session's turn or history. They stay l
 | `/exit` | Exit the application |  |
 | `/reload` | Reload plugins and config |  |
 | `/workbench` | Open the file explorer, editor and source control view |  |
+| `/remote` | Remote status, pending operations, reconnect, reconcile or explicit acknowledgement | Main only |
 
 ## Resuming after an interruption
 

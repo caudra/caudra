@@ -1,0 +1,11 @@
+{
+  "jsonrpc": "2.0",
+  "id": 7,
+  "error": {
+    "code": -32602,
+    "message": "workspace resource revision is stale",
+    "data": {
+      "code": "stale_resource"
+    }
+  }
+}

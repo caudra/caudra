@@ -18,7 +18,7 @@ use caudra_agent::tools::{
     BuiltinDeferral, DeferralSession, DeferredTool, DescriptionContext, FileReadTracker, PathLocks,
     ToolAudience, ToolDefinitions, ToolFilter, ToolRegistry, deferral,
 };
-use caudra_agent::workflow::WorkflowHandle;
+use caudra_agent::workflow::{WorkflowHandle, WorkspaceRebind};
 use caudra_agent::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams,
     BaselineGate, CancelMap, CancelToken, CancelTrigger, DoneReason, Envelope, EventSender,
@@ -29,6 +29,8 @@ use caudra_config::ModelPolicy;
 use caudra_lua::EventHandle;
 use caudra_providers::{AgentError, HistoryItem, Message, Model, ModelPurpose, RequestOptions};
 use caudra_storage::id::SessionRef;
+use caudra_storage::local_documents::LocalDocumentStore;
+use caudra_workspace::WorkspaceSession;
 use serde_json::Value;
 use tracing::error;
 
@@ -82,6 +84,9 @@ pub(super) struct AgentLoop {
     /// Armed per run with the head the run starts from, and consulted by the
     /// first tool call that could change a file.
     baseline: Arc<WorkspaceBaseline>,
+    workspace_session: Option<WorkspaceSession>,
+    remote_project_context: Option<Arc<caudra_agent::remote_project_context::RemoteProjectContext>>,
+    local_documents: Option<Arc<LocalDocumentStore>>,
 }
 
 impl AgentLoop {
@@ -116,6 +121,11 @@ impl AgentLoop {
         workflow: Option<WorkflowHandle>,
         mode: SharedMode,
         baseline: Arc<WorkspaceBaseline>,
+        workspace_session: Option<WorkspaceSession>,
+        remote_project_context: Option<
+            Arc<caudra_agent::remote_project_context::RemoteProjectContext>,
+        >,
+        local_documents: Option<Arc<LocalDocumentStore>>,
     ) -> Self {
         let restored_history = History::restored(initial_history);
         let initial_messages = restored_history
@@ -168,6 +178,9 @@ impl AgentLoop {
             workflow,
             mode,
             baseline,
+            workspace_session,
+            remote_project_context,
+            local_documents,
         }
     }
 
@@ -319,7 +332,26 @@ impl AgentLoop {
 
     async fn initialize(&mut self) -> bool {
         self.vars = template::env_vars();
-        self.reload_instructions().await;
+        if let Some(workspace) = &self.workspace_session {
+            match caudra_agent::workspace_logical_cwd(workspace).await {
+                Ok(cwd) => self.vars = self.vars.clone().set("{cwd}", cwd),
+                Err(message) => {
+                    self.emit_error(
+                        self.min_run_id,
+                        AgentError::Tool {
+                            tool: "remote_project_context".into(),
+                            message,
+                        },
+                    );
+                    return false;
+                }
+            }
+        }
+        let initialized = self.reload_instructions().await;
+        if let Err(error) = initialized {
+            self.emit_error(self.min_run_id, error);
+            return false;
+        }
         if self.init_cancel.is_cancelled() {
             return false;
         }
@@ -424,14 +456,19 @@ impl AgentLoop {
             Arc::clone(&selected_slot)
         };
 
-        let old_cwd = self.vars.apply("{cwd}").into_owned();
-        self.vars = template::env_vars();
-        let instructions = if *self.vars.apply("{cwd}") != old_cwd {
-            self.reload_instructions().await;
-            None
-        } else {
-            let current = self.read_instructions().await;
+        let instructions = if self.workspace_session.is_some() {
+            let current = self.read_instructions().await?;
             self.instructions.drift(current, self.history.epoch())
+        } else {
+            let old_cwd = self.vars.apply("{cwd}").into_owned();
+            self.vars = template::env_vars();
+            if *self.vars.apply("{cwd}") != old_cwd {
+                self.reload_instructions().await?;
+                None
+            } else {
+                let current = self.read_instructions().await?;
+                self.instructions.drift(current, self.history.epoch())
+            }
         };
         self.rebuild_tools(&effective_slot.model, &selected_slot.model, &input.thinking);
         self.effective_model_slot.store(Arc::clone(&effective_slot));
@@ -473,12 +510,26 @@ impl AgentLoop {
             .lua_handle
             .collect_prompt_slots_async(&self.config)
             .await;
-        let tool_filter = ToolFilter::from_config(&self.config, &effective_slot.model, &[]);
-        let system = agent::build_system_prompt(
-            self.instructions.text(),
-            &prompt_slots,
-            &tool_filter,
-            self.system_prompt_profile.as_deref(),
+        let tool_filter = ToolFilter::from_config(&self.config, &effective_slot.model, &[])
+            .for_remote_workspace(self.workspace_session.is_some());
+        let system = self.local_documents.as_ref().map_or_else(
+            || {
+                agent::build_system_prompt(
+                    self.instructions.text(),
+                    &prompt_slots,
+                    &tool_filter,
+                    self.system_prompt_profile.as_deref(),
+                )
+            },
+            |store| {
+                agent::build_system_prompt_for_remote(
+                    self.instructions.text(),
+                    &prompt_slots,
+                    &tool_filter,
+                    self.system_prompt_profile.as_deref(),
+                    store,
+                )
+            },
         );
         self.context_system.clone_from(&system);
         self.context_options = opts.clone();
@@ -504,6 +555,10 @@ impl AgentLoop {
                 tool_output_lines: self.tool_output_lines,
                 permissions: Arc::clone(&self.permissions),
                 session_id: self.session_id.clone(),
+                workspace_session: self.workspace_session.clone(),
+                remote_project_context: self.remote_project_context.clone(),
+                local_documents: self.local_documents.clone(),
+                task_environment: caudra_agent::template::env_vars(),
                 root_tool_use_id: None,
                 mailbox: self.mailbox.clone(),
                 context_publisher: Some(self.context_publisher.clone()),
@@ -589,7 +644,8 @@ impl AgentLoop {
         thinking: &caudra_providers::ThinkingConfig,
     ) -> ToolDefinitions {
         let examples = model.supports_tool_examples();
-        let filter = ToolFilter::from_config(&self.config, model, &[]);
+        let filter = ToolFilter::from_config(&self.config, model, &[])
+            .for_remote_workspace(self.workspace_session.is_some());
         let bindings = self.prompt_profiles.bind_for_tasks(
             model,
             chat_model,
@@ -617,16 +673,75 @@ impl AgentLoop {
         )
     }
 
-    async fn read_instructions(&self) -> Instructions {
+    async fn read_instructions(&mut self) -> Result<Instructions, AgentError> {
+        if let Some(workspace) = &self.workspace_session {
+            let context =
+                match caudra_agent::remote_project_context::load_remote_project_context(workspace)
+                    .await
+                {
+                    Ok(context) => context,
+                    Err(error) => {
+                        self.permissions.invalidate_remote_permission_asset();
+                        return Err(AgentError::Tool {
+                            tool: "remote_project_context".into(),
+                            message: format!("Remote project context unavailable: {error}"),
+                        });
+                    }
+                };
+            let changed = self
+                .remote_project_context
+                .as_ref()
+                .is_none_or(|old| old.manifest_revision() != context.manifest_revision());
+            let transition = if changed {
+                caudra_agent::workflow::prepare_workspace_transition(
+                    self.workflow.as_ref(),
+                    self.subagent_cancels.active_count(),
+                    WorkspaceRebind {
+                        workspace: workspace.clone(),
+                        context: Arc::clone(&context),
+                        cwd: self.vars.apply("{cwd}").into_owned(),
+                    },
+                )
+                .await
+                .map_err(|message| {
+                    self.permissions.invalidate_remote_permission_asset();
+                    AgentError::Tool {
+                        tool: "remote_project_context".into(),
+                        message,
+                    }
+                })?
+            } else {
+                None
+            };
+            self.permissions
+                .replace_remote_permission_asset(context.permissions())
+                .map_err(|error| AgentError::Tool {
+                    tool: "remote_permissions".into(),
+                    message: format!("Remote permission policy unavailable: {error}"),
+                })?;
+            let instructions = agent::load_remote_instructions(&context);
+            self.remote_project_context = Some(context);
+            if let Some(transition) = transition {
+                transition
+                    .commit()
+                    .await
+                    .map_err(|error| AgentError::Tool {
+                        tool: "workflow".into(),
+                        message: error.to_string(),
+                    })?;
+            }
+            return Ok(instructions);
+        }
         let cwd = self.vars.apply("{cwd}").into_owned();
-        smol::unblock(move || agent::load_instructions(&cwd)).await
+        Ok(smol::unblock(move || agent::load_instructions(&cwd)).await)
     }
 
     /// Rewrites the system prompt to match disk, so it is only free while the
     /// prefix cache is cold anyway: at startup, or on a change of directory.
-    async fn reload_instructions(&mut self) {
-        let current = self.read_instructions().await;
+    async fn reload_instructions(&mut self) -> Result<(), AgentError> {
+        let current = self.read_instructions().await?;
         self.instructions = InstructionBaseline::adopt(current, self.history.epoch());
+        Ok(())
     }
 
     /// The array a request actually carries. `self.tools` is the declared base, and a run
@@ -667,13 +782,27 @@ impl AgentLoop {
         opts: RequestOptions,
     ) -> String {
         let slot = self.model_slot.load();
-        let tool_filter = ToolFilter::from_config(&self.config, &slot.model, &[]);
+        let tool_filter = ToolFilter::from_config(&self.config, &slot.model, &[])
+            .for_remote_workspace(self.workspace_session.is_some());
         let definitions = self.build_tools(&slot.model, &slot.model, &opts.thinking);
-        let system = agent::build_system_prompt(
-            self.instructions.text(),
-            prompt_slots,
-            &tool_filter,
-            self.system_prompt_profile.as_deref(),
+        let system = self.local_documents.as_ref().map_or_else(
+            || {
+                agent::build_system_prompt(
+                    self.instructions.text(),
+                    prompt_slots,
+                    &tool_filter,
+                    self.system_prompt_profile.as_deref(),
+                )
+            },
+            |store| {
+                agent::build_system_prompt_for_remote(
+                    self.instructions.text(),
+                    prompt_slots,
+                    &tool_filter,
+                    self.system_prompt_profile.as_deref(),
+                    store,
+                )
+            },
         );
         let mcp = self.mcp.as_ref().map(McpSession::request_snapshot);
         self.btw_prompt.store(Arc::new(BtwPrompt {
@@ -720,7 +849,8 @@ impl AgentLoop {
             ),
             Some(&BuiltinToolsInput {
                 registry: ToolRegistry::global(),
-                filter: &ToolFilter::from_config(&self.config, &slot.model, &[]),
+                filter: &ToolFilter::from_config(&self.config, &slot.model, &[])
+                    .for_remote_workspace(self.workspace_session.is_some()),
                 config: &self.config,
                 model: &slot.model,
                 deferral: BuiltinDeferral::resolve(&self.config, &slot.model),
@@ -767,7 +897,7 @@ impl AgentLoop {
 
 fn model_purpose(mode: &AgentMode) -> ModelPurpose {
     match mode {
-        AgentMode::Plan(_) => ModelPurpose::Plan,
+        AgentMode::Plan(_) | AgentMode::RemotePlan(_) => ModelPurpose::Plan,
         AgentMode::Build | AgentMode::ReadOnly => ModelPurpose::Chat,
     }
 }

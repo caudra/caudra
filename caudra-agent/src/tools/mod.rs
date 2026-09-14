@@ -49,6 +49,7 @@ use crate::cancel::{CancelMap, CancelToken};
 use crate::context::ContextPublisher;
 use crate::mcp::McpSession;
 use crate::permissions::PermissionManager;
+use crate::template::Vars;
 use crate::workflow::WorkflowHandle;
 use crate::workspace_baseline::BaselineGate;
 use crate::{
@@ -59,7 +60,9 @@ use caudra_providers::Model;
 use caudra_providers::RequestOptions;
 use caudra_providers::provider::Provider;
 use caudra_storage::id::SessionRef;
+use caudra_storage::local_documents::LocalDocumentStore;
 use caudra_storage::tool_outputs::ToolOutputStore;
+use caudra_workspace::WorkspaceSession;
 
 pub struct DescriptionContext<'a> {
     pub filter: &'a ToolFilter,
@@ -115,6 +118,14 @@ impl ToolFilter {
             Self::ReadOnly(Box::new(self))
         } else {
             self
+        }
+    }
+
+    pub fn for_remote_workspace(self, remote: bool) -> Self {
+        if remote {
+            self
+        } else {
+            self.excluding(LOCAL_DOCUMENT_TOOL_NAMES)
         }
     }
 
@@ -311,6 +322,14 @@ pub const FILE_WRITE_TOOL_NAME: &str = "file_write";
 pub const IMAGE_GENERATE_TOOL_NAME: &str = "image_generate";
 /// The only backend `image_generate` can reach today.
 const OPENAI_PROVIDER_SLUG: &str = "openai";
+pub const LOCAL_DOCUMENT_APPLY_PATCH_TOOL_NAME: &str = "local_document_apply_patch";
+pub const LOCAL_DOCUMENT_READ_TOOL_NAME: &str = "local_document_read";
+pub const LOCAL_DOCUMENT_WRITE_TOOL_NAME: &str = "local_document_write";
+pub const LOCAL_DOCUMENT_TOOL_NAMES: &[&str] = &[
+    LOCAL_DOCUMENT_APPLY_PATCH_TOOL_NAME,
+    LOCAL_DOCUMENT_READ_TOOL_NAME,
+    LOCAL_DOCUMENT_WRITE_TOOL_NAME,
+];
 pub const MEMORY_TOOL_NAME: &str = "memory";
 pub const QUESTION_TOOL_NAME: &str = "question";
 pub const SHELL_TOOL_NAME: &str = "shell";
@@ -447,6 +466,10 @@ pub struct ToolContext {
     /// so a tool can always tell which conversation it is serving. `None`
     /// when there is no session at all, like the `caudra index` one-shot.
     pub session_id: Option<SessionRef>,
+    pub workspace_session: Option<WorkspaceSession>,
+    pub remote_project_context: Option<Arc<crate::remote_project_context::RemoteProjectContext>>,
+    pub local_documents: Option<Arc<LocalDocumentStore>>,
+    pub task_environment: Vars,
     pub context_publisher: Option<ContextPublisher>,
     pub tool_output_store: Option<Arc<ToolOutputStore>>,
     pub tool_use_id: Option<String>,
@@ -704,6 +727,10 @@ pub fn interpreter_ctx(
         event_tx: event_tx.clone(),
         mode: mode.clone(),
         session_id: None,
+        workspace_session: None,
+        remote_project_context: None,
+        local_documents: None,
+        task_environment: crate::template::env_vars(),
         context_publisher: None,
         tool_output_store: None,
         tool_use_id: None,
@@ -1360,6 +1387,17 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for name in &names {
             assert!(seen.insert(name), "duplicate builtin tool name: {name}");
+        }
+    }
+
+    #[test]
+    fn local_document_tools_are_exposed_only_for_remote_workspaces() {
+        let embedded = ToolFilter::All.for_remote_workspace(false);
+        let remote = ToolFilter::All.for_remote_workspace(true);
+
+        for name in LOCAL_DOCUMENT_TOOL_NAMES {
+            assert!(!embedded.matches(name));
+            assert!(remote.matches(name));
         }
     }
 }

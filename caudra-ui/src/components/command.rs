@@ -316,6 +316,12 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         max_args: 0,
         scope: ChatScope::Any,
     },
+    BuiltinCommand {
+        name: "/remote",
+        description: "Remote status, pending operations, reconnect, reconcile or explicit acknowledgement",
+        max_args: 3,
+        scope: ChatScope::MainOnly,
+    },
 ];
 
 pub struct ParsedCommand {
@@ -437,6 +443,13 @@ impl CommandPalette {
             mouse_down: None,
             task_focused: false,
         }
+    }
+
+    pub(crate) fn set_custom_commands(&mut self, commands: Arc<[CustomCommand]>) {
+        self.custom = commands;
+        self.nucleo = Self::build_nucleo(&self.custom, &self.mcp_prompts, &self.lua_commands);
+        self.filtered.clear();
+        self.selected = 0;
     }
 
     /// Every command the palette knows, in display order. The one place that
@@ -1086,7 +1099,9 @@ mod tests {
                 content: "Review $ARGUMENTS".into(),
                 scope: caudra_agent::command::CommandScope::Project,
                 accepts_args: true,
-                source: PathBuf::from(".caudra/commands/review.md"),
+                source: caudra_agent::command::CommandSource::Local(PathBuf::from(
+                    ".caudra/commands/review.md",
+                )),
             },
             CustomCommand {
                 name: "fix".into(),
@@ -1094,7 +1109,9 @@ mod tests {
                 content: "Fix the code".into(),
                 scope: caudra_agent::command::CommandScope::User,
                 accepts_args: false,
-                source: PathBuf::from("/config/caudra/commands/fix.md"),
+                source: caudra_agent::command::CommandSource::Local(PathBuf::from(
+                    "/config/caudra/commands/fix.md",
+                )),
             },
         ])
     }

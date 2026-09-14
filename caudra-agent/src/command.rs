@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use tracing::{debug, warn};
 
+use crate::remote_project_context::RemoteAssetIdentity;
+
 /// Tier lists, highest priority first. The first directory that exists is the
 /// only one read, so a Caudra directory shuts out the compatibility ones.
 const PROJECT_COMMAND_DIRS: &[&str] =
@@ -66,7 +68,22 @@ pub struct CustomCommand {
     pub accepts_args: bool,
     /// The file this came from, so a shadowed or missing command can be traced
     /// to a directory rather than guessed at.
-    pub source: PathBuf,
+    pub source: CommandSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommandSource {
+    Local(PathBuf),
+    Remote(Box<RemoteAssetIdentity>),
+}
+
+impl std::fmt::Display for CommandSource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Local(path) => path.display().fmt(formatter),
+            Self::Remote(source) => formatter.write_str(&source.source_label()),
+        }
+    }
 }
 
 impl CustomCommand {
@@ -93,6 +110,40 @@ pub fn discover_commands(cwd: &Path) -> Vec<CustomCommand> {
         caudra_storage::paths::home().as_deref(),
         caudra_storage::paths::config_dir().ok().as_deref(),
     )
+}
+
+pub fn discover_remote_commands(
+    context: &crate::remote_project_context::RemoteProjectContext,
+) -> Vec<CustomCommand> {
+    discover_remote_commands_in(
+        context.commands(),
+        caudra_storage::paths::home().as_deref(),
+        caudra_storage::paths::config_dir().ok().as_deref(),
+    )
+}
+
+fn discover_remote_commands_in(
+    project: &[CustomCommand],
+    home: Option<&Path>,
+    config: Option<&Path>,
+) -> Vec<CustomCommand> {
+    let mut commands = HashMap::new();
+    let global = caudra_storage::paths::user_config_dir(config, COMMANDS_SUBDIR)
+        .into_iter()
+        .chain(home.into_iter().flat_map(|home| {
+            GLOBAL_THIRD_PARTY_COMMAND_DIRS
+                .iter()
+                .map(move |relative| home.join(relative))
+        }));
+    if let Some(directory) = first_existing(global) {
+        scan_command_dir(&directory, CommandScope::User, &mut commands);
+    }
+    for command in project {
+        commands.insert(command.name.clone(), command.clone());
+    }
+    let mut commands: Vec<_> = commands.into_values().collect();
+    commands.sort_by(|left, right| left.name.cmp(&right.name));
+    commands
 }
 
 /// One tier group: the first directory that exists is the only one read.
@@ -182,7 +233,26 @@ fn parse_command(content: &str, path: &Path, scope: CommandScope) -> Option<Cust
         content: body.to_string(),
         scope,
         accepts_args,
-        source: path.to_path_buf(),
+        source: CommandSource::Local(path.to_path_buf()),
+    })
+}
+
+pub(crate) fn parse_remote_command(
+    content: &str,
+    source: RemoteAssetIdentity,
+) -> Option<CustomCommand> {
+    let name_from_file = source.path.file_name().strip_suffix(".md")?.to_owned();
+    let (frontmatter, body) = parse_frontmatter(content);
+    if body.is_empty() {
+        return None;
+    }
+    Some(CustomCommand {
+        name: frontmatter.name.unwrap_or(name_from_file),
+        description: frontmatter.description.unwrap_or_default(),
+        content: body.to_owned(),
+        scope: CommandScope::Project,
+        accepts_args: frontmatter.argument_hint.is_some() || body.contains(ARGUMENTS_PLACEHOLDER),
+        source: CommandSource::Remote(Box::new(source)),
     })
 }
 
@@ -241,13 +311,14 @@ mod tests {
             content: "body".into(),
             scope,
             accepts_args: false,
-            source: PathBuf::from("/fake/review.md"),
+            source: CommandSource::Local(PathBuf::from("/fake/review.md")),
         };
         assert_eq!(cmd.display_name(), expected);
     }
 
-    #[test]
-    fn discover_project_overrides_global() {
+    #[test_case(false; "local")]
+    #[test_case(true; "remote_context")]
+    fn discover_project_overrides_global(remote: bool) {
         let project = TempDir::new().unwrap();
         let cmd_dir = project.path().join(".caudra/commands");
         fs::create_dir_all(&cmd_dir).unwrap();
@@ -269,7 +340,13 @@ mod tests {
             .unwrap();
         }
 
-        let commands = discover_commands_inner(project.path(), None, Some(config.path()));
+        let commands = if remote {
+            let fetched = discover_commands_inner(project.path(), None, None);
+            fs::remove_dir_all(project.path()).unwrap();
+            discover_remote_commands_in(&fetched, None, Some(config.path()))
+        } else {
+            discover_commands_inner(project.path(), None, Some(config.path()))
+        };
         let overlap: Vec<_> = commands.iter().filter(|c| c.name == "overlap").collect();
         assert_eq!(overlap.len(), 1);
         assert_eq!(overlap[0].description, "Project version");
@@ -311,7 +388,10 @@ mod tests {
         let commands = discover_commands_inner(dir.path(), None, None);
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0].name, "b-cmd");
-        assert_eq!(commands[0].source, path.join("b-cmd.md"));
+        assert_eq!(
+            commands[0].source,
+            CommandSource::Local(path.join("b-cmd.md"))
+        );
     }
 
     /// OpenCode writes `description`, `agent`, `model` and `subtask`. The two

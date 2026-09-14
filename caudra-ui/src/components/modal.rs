@@ -242,7 +242,11 @@ mod tests {
     #[test_case(100, MIN_WIDTH ; "a share below the floor is raised to it")]
     #[test_case(200, 100 ; "a share above the floor is left alone")]
     fn a_modal_is_never_narrower_than_its_content_floor(available: u16, expected: u16) {
-        assert_eq!(Modal::popup_width(available, HALF), expected, "{WRONG_WIDTH}");
+        assert_eq!(
+            Modal::popup_width(available, HALF),
+            expected,
+            "{WRONG_WIDTH}"
+        );
     }
 
     /// Callers that wrap their content before they can name its height read the

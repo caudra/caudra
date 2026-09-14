@@ -9,7 +9,9 @@ use caudra_agent::{AgentInput, AgentMode, Mention};
 use caudra_providers::ModelPurpose;
 use caudra_providers::model_registry;
 use caudra_storage::StateDir;
+use caudra_storage::local_documents::LocalDocumentStore;
 use caudra_storage::plans;
+use caudra_workspace::{LocalDocumentRef, PlanRef, WorkspaceSession};
 use ratatui::style::{Color, Modifier, Style};
 
 use super::App;
@@ -51,30 +53,43 @@ pub(crate) enum PlanState {
     None,
     Drafting(PathBuf),
     Ready(PathBuf),
+    RemoteDrafting(PlanRef),
+    RemoteReady(PlanRef),
 }
 
 impl PlanState {
     pub(crate) fn path(&self) -> Option<&Path> {
         match self {
-            Self::None => Option::None,
+            Self::None | Self::RemoteDrafting(_) | Self::RemoteReady(_) => Option::None,
             Self::Drafting(p) | Self::Ready(p) => Some(p),
+        }
+    }
+
+    pub(crate) fn reference(&self) -> Option<&PlanRef> {
+        match self {
+            Self::RemoteDrafting(reference) | Self::RemoteReady(reference) => Some(reference),
+            Self::None | Self::Drafting(_) | Self::Ready(_) => None,
         }
     }
 
     pub(crate) fn mark_ready(&mut self) {
         if let Self::Drafting(p) = self {
             *self = Self::Ready(std::mem::take(p));
+        } else if let Self::RemoteDrafting(reference) = self {
+            *self = Self::RemoteReady(reference.clone());
         }
     }
 
     pub(crate) fn mark_drafting(&mut self) {
         if let Self::Ready(p) = self {
             *self = Self::Drafting(std::mem::take(p));
+        } else if let Self::RemoteReady(reference) = self {
+            *self = Self::RemoteDrafting(reference.clone());
         }
     }
 
     pub(crate) fn is_ready(&self) -> bool {
-        matches!(self, Self::Ready(_))
+        matches!(self, Self::Ready(_) | Self::RemoteReady(_))
     }
 
     pub(crate) fn allocate_path(&mut self, storage: &StateDir, cwd: &Path) {
@@ -84,6 +99,25 @@ impl PlanState {
                     .unwrap_or_else(|_| PathBuf::from("plans/plan.md")),
             );
         }
+    }
+
+    pub(crate) fn allocate_remote(
+        &mut self,
+        store: &LocalDocumentStore,
+        workspace: &WorkspaceSession,
+        session_id: &str,
+    ) -> Result<(), String> {
+        if matches!(self, Self::None) {
+            let reference = store
+                .create_plan(workspace.binding().project().key(), session_id)
+                .map_err(|error| error.to_string())?;
+            *self = Self::RemoteDrafting(reference);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn document_ref(&self) -> Option<LocalDocumentRef> {
+        self.reference().cloned().map(LocalDocumentRef::Plan)
     }
 }
 
@@ -109,9 +143,20 @@ impl App {
         }
     }
 
-    pub(super) fn enter_plan(&mut self) {
-        let cwd = PathBuf::from(&self.state.session.cwd);
-        self.state.plan.allocate_path(&self.storage, &cwd);
+    pub(crate) fn enter_plan(&mut self) {
+        if let (Some(store), Some(workspace)) = (&self.local_documents, &self.workspace_session) {
+            if let Err(error) = self.state.plan.allocate_remote(
+                store,
+                workspace,
+                &self.state.session.id.to_string(),
+            ) {
+                self.flash(error);
+                return;
+            }
+        } else {
+            let cwd = PathBuf::from(&self.state.session.cwd);
+            self.state.plan.allocate_path(&self.storage, &cwd);
+        }
         self.state.mode = Mode::Plan;
     }
 
@@ -143,9 +188,10 @@ impl App {
 
     pub(super) fn agent_mode(&self) -> AgentMode {
         match self.state.mode {
-            Mode::Plan => match self.state.plan.path() {
-                Some(p) => AgentMode::Plan(p.to_path_buf()),
-                None => {
+            Mode::Plan => match (&self.state.plan.path(), self.state.plan.reference()) {
+                (Some(p), _) => AgentMode::Plan((*p).to_path_buf()),
+                (_, Some(reference)) => AgentMode::RemotePlan(reference.clone()),
+                (None, None) => {
                     debug_assert!(false, "Plan mode without path - invariant violated");
                     AgentMode::Build
                 }
@@ -158,6 +204,12 @@ impl App {
     /// entry restored from a previous session, where the paths were checked
     /// against a working directory that may since have changed.
     pub(crate) fn scan_mentions(&self, text: &str) -> Vec<Mention> {
+        if self.workspace_session.is_some() {
+            return mentions::scan_remote(text)
+                .into_iter()
+                .map(|(_, mention)| mention)
+                .collect();
+        }
         let root = Path::new(&self.state.session.cwd);
         mentions::scan(text, |path| root.join(path).exists())
             .into_iter()

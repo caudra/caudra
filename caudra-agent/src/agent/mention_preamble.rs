@@ -12,11 +12,14 @@
 //! not what it says now.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use caudra_providers::{ImageMediaType, Message};
+use caudra_workspace::{ReadTextRequest, ResourceKind, ResourceSelector, TextRange, WorkspacePath};
 use serde_json::json;
 
-use crate::mentions::Mention;
+use crate::mentions::{Mention, MentionTarget};
+use crate::remote_project_context::RemoteProjectContext;
 use crate::tools::image_bytes;
 use crate::tools::{ToolContext, ToolRegistry};
 
@@ -40,6 +43,7 @@ pub struct Resolution<'a> {
     /// Discards the read: seeing 20 lines is not grounds for editing the file.
     pub slice: &'a ToolContext,
     pub vision: bool,
+    pub remote_context: Option<&'a Arc<RemoteProjectContext>>,
 }
 
 pub async fn build(mentions: &[Mention], resolution: Resolution<'_>) -> Vec<Message> {
@@ -49,7 +53,7 @@ pub async fn build(mentions: &[Mention], resolution: Resolution<'_>) -> Vec<Mess
     for mention in mentions {
         if seen
             .iter()
-            .any(|other| other.path == mention.path && other.lines == mention.lines)
+            .any(|other| other.target == mention.target && other.lines == mention.lines)
         {
             continue;
         }
@@ -60,7 +64,13 @@ pub async fn build(mentions: &[Mention], resolution: Resolution<'_>) -> Vec<Mess
 }
 
 async fn resolve(mention: &Mention, resolution: &Resolution<'_>, budget: &mut usize) -> Message {
-    if is_image(&mention.path) {
+    if matches!(mention.target, MentionTarget::Remote(_)) {
+        return resolve_remote(mention, resolution, budget).await;
+    }
+    let Some(path) = mention.local_path() else {
+        return note(mention, "not inlined: invalid client-local attachment");
+    };
+    if is_image(path) {
         return image(mention, resolution.root, resolution.vision);
     }
     if *budget == 0 {
@@ -69,7 +79,7 @@ async fn resolve(mention: &Mention, resolution: &Resolution<'_>, budget: &mut us
     let Some(tool) = resolution.registry.get(READ_TOOL) else {
         return note(mention, UNAVAILABLE_ERROR);
     };
-    let mut input = json!({ "filePath": mention.path.to_string_lossy() });
+    let mut input = json!({ "filePath": path.to_string_lossy() });
     if let Some(lines) = &mention.lines {
         input["offset"] = json!(lines.start());
         input["limit"] = json!(lines.end() - lines.start() + 1);
@@ -92,6 +102,155 @@ async fn resolve(mention: &Mention, resolution: &Resolution<'_>, budget: &mut us
     Message::mention(format!("{}\n{body}\n</file>", open_tag(mention)))
 }
 
+async fn resolve_remote(
+    mention: &Mention,
+    resolution: &Resolution<'_>,
+    budget: &mut usize,
+) -> Message {
+    let Some(path) = mention.remote_path() else {
+        return note(mention, "not inlined: invalid remote path");
+    };
+    if is_image_name(path.as_str()) {
+        return remote_image(mention, resolution, path).await;
+    }
+    if *budget == 0 {
+        return note(mention, BUDGET_ERROR);
+    }
+    let Some(session) = resolution.whole_file.workspace_session.as_ref() else {
+        return note(mention, "not inlined: the remote workspace is unavailable");
+    };
+    let Some(service) = session.workspace().services().read.as_ref() else {
+        return note(mention, "not inlined: remote reads are unavailable");
+    };
+    let resource = match service
+        .resolve(session.binding(), session.cursor(), path)
+        .await
+    {
+        Ok(resource) => resource,
+        Err(_) => {
+            return note(
+                mention,
+                "not inlined: the remote path could not be resolved",
+            );
+        }
+    };
+    if resource.kind != ResourceKind::File || resource.path.as_ref() != Some(path) {
+        return note(mention, "not inlined: the remote path is not a file");
+    }
+    let resource_id = resource.scope.resource_id().clone();
+    let stat = match service
+        .stat(
+            session.binding(),
+            session.cursor(),
+            &ResourceSelector::Id(resource_id.clone()),
+        )
+        .await
+    {
+        Ok(stat) => stat,
+        Err(_) => {
+            return note(
+                mention,
+                "not inlined: the remote file could not be inspected",
+            );
+        }
+    };
+    if stat.kind != ResourceKind::File
+        || stat.path.as_ref() != Some(path)
+        || stat.scope.resource_id() != &resource_id
+        || stat.revision != resource.revision
+    {
+        return note(
+            mention,
+            "not inlined: the remote file changed before it was read",
+        );
+    }
+    let range = mention.lines.as_ref().and_then(|lines| {
+        Some(TextRange {
+            start_line: u32::try_from(*lines.start()).ok()?,
+            end_line: Some(u32::try_from(*lines.end()).ok()?),
+        })
+    });
+    let max_bytes = u32::try_from((*budget).min(MAX_TOTAL_BYTES)).unwrap_or(MAX_TOTAL_BYTES as u32);
+    let content = match service
+        .read_text(
+            session.binding(),
+            session.cursor(),
+            &ReadTextRequest {
+                resource: ResourceSelector::Id(resource_id.clone()),
+                range,
+                byte_offset: 0,
+                max_bytes,
+            },
+        )
+        .await
+    {
+        Ok(content) => content,
+        Err(_) => return note(mention, "not inlined: the remote file could not be read"),
+    };
+    if content.path != *path
+        || content.resource_id != resource_id
+        || stat.revision.as_ref() != Some(&content.revision)
+        || content.text.len() > max_bytes as usize
+    {
+        return note(
+            mention,
+            "not inlined: the remote read did not match the requested file",
+        );
+    }
+    *budget = budget.saturating_sub(content.text.len());
+    let nested = resolution
+        .remote_context
+        .into_iter()
+        .flat_map(|context| {
+            crate::agent::find_remote_nested_instructions(
+                context,
+                path,
+                &resolution.whole_file.loaded_instructions,
+            )
+        })
+        .map(|(source, content)| {
+            format!(
+                "<instructions scope=\"project\" path=\"{source}\">\n{content}\n</instructions>\n"
+            )
+        })
+        .collect::<String>();
+    let truncation = if content.truncated {
+        "\n[remote read truncated]"
+    } else {
+        ""
+    };
+    Message::mention(format!(
+        "{nested}{}\n{}{truncation}\n</file>",
+        open_tag(mention),
+        content.text
+    ))
+}
+
+async fn remote_image(
+    mention: &Mention,
+    resolution: &Resolution<'_>,
+    path: &WorkspacePath,
+) -> Message {
+    if !resolution.vision {
+        return note(mention, NO_VISION_ERROR);
+    }
+    let Some(session) = resolution.whole_file.workspace_session.as_ref() else {
+        return note(mention, "not inlined: the remote workspace is unavailable");
+    };
+    let prepared = match image_bytes::resolve_remote(session, path).await {
+        Ok(resource) => image_bytes::read_remote(session, &resource).await,
+        Err(error) => Err(error),
+    };
+    match prepared {
+        Ok(prepared) => Message::user_display_with_images(
+            format!("{}\n</file>", open_tag(mention)),
+            String::new(),
+            vec![prepared.source],
+        ),
+        Err(error) => note(mention, &error),
+    }
+}
+
 /// An image is handed over as a real image block when the model can see one.
 /// The read budget does not apply: images are billed by the provider as tiles,
 /// not by the byte, and `prepare` already shrinks them to fit.
@@ -99,7 +258,10 @@ fn image(mention: &Mention, root: &Path, vision: bool) -> Message {
     if !vision {
         return note(mention, NO_VISION_ERROR);
     }
-    let path = root.join(&mention.path);
+    let Some(local_path) = mention.local_path() else {
+        return note(mention, "not inlined: invalid client-local image path");
+    };
+    let path = root.join(local_path);
     match image_bytes::prepare(&path.to_string_lossy()) {
         Ok(prepared) => Message::user_display_with_images(
             format!("{}\n</file>", open_tag(mention)),
@@ -111,7 +273,7 @@ fn image(mention: &Mention, root: &Path, vision: bool) -> Message {
 }
 
 fn open_tag(mention: &Mention) -> String {
-    let path = mention.path.display();
+    let path = mention.display_path();
     match &mention.lines {
         Some(lines) => format!(
             "<file path=\"{path}\" lines=\"{}-{}\">",
@@ -139,6 +301,19 @@ fn is_image(path: &Path) -> bool {
         .into_iter()
         .any(|media| media.mime().trim_start_matches("image/") == extension)
         || extension == "jpg"
+}
+
+fn is_image_name(path: &str) -> bool {
+    Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            let extension = extension.to_ascii_lowercase();
+            ImageMediaType::ALL
+                .into_iter()
+                .any(|media| media.mime().trim_start_matches("image/") == extension)
+                || extension == "jpg"
+        })
 }
 
 #[cfg(test)]

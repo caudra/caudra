@@ -27,6 +27,7 @@ The docs are sorted by what you came here to do:
   </div>
   <div class="card-grid">
     <a class="card" href="/docs/skills/"><span class="card-title">Skills</span><span class="card-desc">Write Markdown playbooks the agent loads on demand.</span></a>
+    <a class="card" href="/docs/remote-workspaces/"><span class="card-title">Remote Workspaces</span><span class="card-desc">Connect to Workcell with explicit workspace identity and remote execution.</span></a>
     <a class="card" href="/docs/sessions/"><span class="card-title">Sessions</span><span class="card-desc">Fork conversation points and restore chat or workspace state.</span></a>
     <a class="card" href="/docs/review/"><span class="card-title">Review</span><span class="card-desc">Mark passages of a reply and send notes on them back.</span></a>
     <a class="card" href="/docs/workbench/"><span class="card-title">Workbench</span><span class="card-desc">File explorer, editor, source control, and search beside the transcript.</span></a>

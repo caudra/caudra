@@ -16,6 +16,10 @@ Two places, both optional:
 
 When both exist, project settings override global ones. Neither file is required.
 
+Remote sessions load only the client's global executable configuration. They do not load either checkout's project `init.lua`, project environment files, or project MCP configuration. Remote project context uses a bounded declarative asset manifest instead. See [Remote Workspaces](/docs/remote-workspaces/#project-context-and-trust).
+
+Remote endpoint profiles live in a separate user `workcell.toml`, with `version = 1` and tables named `[workcell.profiles.NAME]`. They are not `caudra.setup()` settings. See [profile configuration](/docs/remote-workspaces/#configure-a-profile) for the exact fields and credential rules.
+
 ## Example
 
 ```lua
@@ -129,8 +133,8 @@ The `bash`, `python_execution`, and `task` entries apply only when `ui.scroll_ca
 | `task` | 12 | `task` |
 | `index` | 3 | `file_index`, `code_map`, `code_context`, `code_refs`, `code_impact`, `code_expand` |
 | `grep` | 3 | `file_grep`, `file_glob` |
-| `read` | 3 | `file_read` |
-| `write` | 7 | `file_write`, `file_edit`, `file_apply_patch`, `image_generate`, `memory` |
+| `read` | 3 | `file_read`, `local_document_read` |
+| `write` | 7 | `file_write`, `file_edit`, `file_apply_patch`, `image_generate`, `local_document_apply_patch`, `local_document_write`, `memory` |
 | `web` | 3 | `webfetch`, `websearch` |
 | `other` | 3 | `batch`, `execution_environment`, `question`, `skill`, `todo_write`, `tool_output`, `view_image`, `workflow` |
 

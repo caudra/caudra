@@ -1,8 +1,6 @@
 //! The control surface a workflow runtime exposes to its callers. Requests,
 //! responses, and errors all serialize, so an SDK can carry them unchanged.
 
-use std::path::PathBuf;
-
 use serde::{Deserialize, Serialize};
 
 use crate::catalog::{LaunchRequest, WorkflowCatalog};
@@ -98,11 +96,11 @@ pub enum WorkflowError {
         name: String,
         scopes: Vec<SourceKind>,
     },
-    #[error("workflow {name:?} at {} is not trusted (digest {digest})", path.display())]
+    #[error("workflow {name:?} at {path} is not trusted (digest {digest})")]
     TrustRequired {
         name: String,
         digest: String,
-        path: PathBuf,
+        path: String,
     },
     #[error("workflow {name:?} is invalid: {error}")]
     Invalid { name: String, error: String },

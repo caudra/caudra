@@ -93,6 +93,38 @@ pub fn revoke_workflow_trust(
     )?
 }
 
+pub fn is_remote_workflow_trusted(
+    state_dir: &StateDir,
+    asset: &caudra_workspace::ProjectAssetTrustKey,
+    digest: &str,
+) -> Result<bool, StorageError> {
+    validate_digest(digest)?;
+    let scope = state::remote_asset_scope(asset);
+    Ok(state::get::<String>(state_dir, &scope, TRUST)?.is_some_and(|stored| stored == digest))
+}
+
+pub fn trust_remote_workflow(
+    state_dir: &StateDir,
+    asset: &caudra_workspace::ProjectAssetTrustKey,
+    digest: &str,
+) -> Result<(), StorageError> {
+    validate_digest(digest)?;
+    state::set(
+        state_dir,
+        &state::remote_asset_scope(asset),
+        TRUST,
+        &digest.to_owned(),
+    )
+}
+
+pub fn revoke_remote_workflow_trust(
+    state_dir: &StateDir,
+    asset: &caudra_workspace::ProjectAssetTrustKey,
+) -> Result<(), StorageError> {
+    state::delete(state_dir, &state::remote_asset_scope(asset), TRUST)?;
+    Ok(())
+}
+
 fn scope(project_root: &Path) -> Result<String, StorageError> {
     Ok(project_scope(&project_root.canonicalize()?))
 }

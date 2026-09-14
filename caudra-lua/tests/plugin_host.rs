@@ -993,13 +993,17 @@ caudra.api.register_tool({{
     let old_invocation = first_entry.tool.parse(&json!({})).unwrap();
     let first = match first_entry.source {
         ToolSource::Lua { contract, .. } => contract,
-        ToolSource::Native { .. } | ToolSource::Mcp { .. } => unreachable!(),
+        ToolSource::Native { .. } | ToolSource::Mcp { .. } | ToolSource::RemoteWorkcell { .. } => {
+            unreachable!()
+        }
     };
 
     host.load_source("contract_plugin", &source("two")).unwrap();
     let second = match reg.get("contract_probe").unwrap().source {
         ToolSource::Lua { contract, .. } => contract,
-        ToolSource::Native { .. } | ToolSource::Mcp { .. } => unreachable!(),
+        ToolSource::Native { .. } | ToolSource::Mcp { .. } | ToolSource::RemoteWorkcell { .. } => {
+            unreachable!()
+        }
     };
 
     assert_ne!(first, second);
@@ -1032,14 +1036,18 @@ caudra.api.register_tool({{
     host.load_plugin_file(&init).unwrap();
     let first = match reg.get("module_contract_probe").unwrap().source {
         ToolSource::Lua { contract, .. } => contract,
-        ToolSource::Native { .. } | ToolSource::Mcp { .. } => unreachable!(),
+        ToolSource::Native { .. } | ToolSource::Mcp { .. } | ToolSource::RemoteWorkcell { .. } => {
+            unreachable!()
+        }
     };
 
     std::fs::write(&module, "return 'two'").unwrap();
     host.load_plugin_file(&init).unwrap();
     let second = match reg.get("module_contract_probe").unwrap().source {
         ToolSource::Lua { contract, .. } => contract,
-        ToolSource::Native { .. } | ToolSource::Mcp { .. } => unreachable!(),
+        ToolSource::Native { .. } | ToolSource::Mcp { .. } | ToolSource::RemoteWorkcell { .. } => {
+            unreachable!()
+        }
     };
 
     assert_ne!(first, second);

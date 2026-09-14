@@ -28,7 +28,7 @@ use serde_json::Value;
 use tracing::{info, warn};
 
 use super::catalog::Catalog;
-use super::handle::{Reply, WorkflowHandle};
+use super::handle::{Reply, RuntimeRequest, WorkflowHandle, WorkspaceRebind};
 use super::run::{ActiveRun, Interrupt, RunEnv, RunSpec, launch};
 use super::state::{
     Published, publish, restore_timeline, run_event, run_status, snapshot_from_row,
@@ -63,6 +63,7 @@ pub struct RuntimeDeps {
     /// The user's config directory, whose `workflows/` scope the catalog
     /// scans. `None` uses the real one; tests point at a tempdir.
     pub user_config_dir: Option<PathBuf>,
+    pub remote_project_context: Option<Arc<crate::remote_project_context::RemoteProjectContext>>,
     pub runner: Arc<dyn TaskRunner>,
     pub events: flume::Sender<Envelope>,
     /// Read when each agent starts, so the user's current mode caps it.
@@ -108,6 +109,7 @@ impl WorkflowRuntime {
             session_id: deps.session_id,
             cwd: deps.cwd,
             user_config_dir,
+            remote_project_context: deps.remote_project_context,
             env: RunEnv {
                 store,
                 runner: deps.runner,
@@ -117,6 +119,8 @@ impl WorkflowRuntime {
             },
             root,
             active: HashMap::new(),
+            suspended: None,
+            pending_workspace: None,
         };
         Ok(Self {
             handle,
@@ -145,22 +149,91 @@ struct Manager {
     session_id: CaudraId,
     cwd: PathBuf,
     user_config_dir: Option<PathBuf>,
+    remote_project_context: Option<Arc<crate::remote_project_context::RemoteProjectContext>>,
     env: RunEnv,
     root: CancelToken,
     active: HashMap<String, ActiveRun>,
+    suspended: Option<Arc<()>>,
+    pending_workspace: Option<(Arc<dyn TaskRunner>, WorkspaceRebind)>,
 }
 
 impl Manager {
     /// Serves until `Shutdown` arrives or every handle is gone; either way
     /// the runs are interrupted and the store closed before the task ends.
-    async fn serve(mut self, inbox: Receiver<(WorkflowRequest, Reply)>) {
+    async fn serve(mut self, inbox: Receiver<(RuntimeRequest, Reply)>) {
         while let Ok((request, reply)) = inbox.recv_async().await {
-            if matches!(request, WorkflowRequest::Shutdown) {
+            if matches!(request, RuntimeRequest::Workflow(WorkflowRequest::Shutdown)) {
                 self.shutdown().await;
                 let _ = reply.send(Ok(WorkflowResponse::Ack));
                 return;
             }
-            let response = self.handle(request).await;
+            let response = match request {
+                RuntimeRequest::Workflow(request) => self.handle(request).await,
+                RuntimeRequest::Suspend(token) => {
+                    if self.suspended.is_some()
+                        || self
+                            .env
+                            .published
+                            .load()
+                            .runs
+                            .iter()
+                            .any(|run| run.status == RunStatus::Active)
+                    {
+                        Err(internal(
+                            "workflow runs must be quiescent before changing workspace",
+                        ))
+                    } else {
+                        for (_, run) in std::mem::take(&mut self.active) {
+                            run.task.await;
+                        }
+                        self.suspended = Some(token);
+                        Ok(WorkflowResponse::Ack)
+                    }
+                }
+                RuntimeRequest::Release(token) => {
+                    if self
+                        .suspended
+                        .as_ref()
+                        .is_some_and(|current| Arc::ptr_eq(current, &token))
+                    {
+                        self.pending_workspace = None;
+                        self.suspended = None;
+                    }
+                    Ok(WorkflowResponse::Ack)
+                }
+                RuntimeRequest::Commit(token) => {
+                    if self
+                        .suspended
+                        .as_ref()
+                        .is_some_and(|current| Arc::ptr_eq(current, &token))
+                        && let Some((runner, workspace)) = self.pending_workspace.take()
+                    {
+                        self.env.runner = runner;
+                        self.cwd = workspace.cwd.into();
+                        self.remote_project_context = Some(workspace.context);
+                        Ok(WorkflowResponse::Ack)
+                    } else {
+                        Err(internal("workspace transition was not prepared"))
+                    }
+                }
+                RuntimeRequest::Rebind(token, workspace) => {
+                    if self
+                        .suspended
+                        .as_ref()
+                        .is_none_or(|current| !Arc::ptr_eq(current, &token))
+                    {
+                        Err(internal("workspace transition is not suspended"))
+                    } else {
+                        match self.env.runner.rebind_workspace(&workspace) {
+                            Ok(runner) => {
+                                self.pending_workspace = Some((runner, workspace));
+                                Ok(WorkflowResponse::Ack)
+                            }
+                            Err(error) => Err(internal(error)),
+                        }
+                    }
+                }
+            };
             let _ = reply.send(response);
         }
         self.shutdown().await;
@@ -170,6 +243,14 @@ impl Manager {
         &mut self,
         request: WorkflowRequest,
     ) -> Result<WorkflowResponse, WorkflowError> {
+        if self.suspended.is_some()
+            && matches!(
+                request,
+                WorkflowRequest::Start(_) | WorkflowRequest::Resume { .. }
+            )
+        {
+            return Err(internal("workspace transition in progress"));
+        }
         match request {
             WorkflowRequest::List => Ok(WorkflowResponse::Catalog(self.scan().await.to_catalog())),
             WorkflowRequest::Validate { name } => self.validate(name).await,
@@ -197,6 +278,9 @@ impl Manager {
 
     async fn scan(&self) -> Catalog {
         let state_dir = self.state_dir.clone();
+        if let Some(context) = &self.remote_project_context {
+            return Catalog::scan_remote(&state_dir, context, self.user_config_dir.as_deref());
+        }
         let cwd = self.cwd.clone();
         let user_config_dir = self.user_config_dir.clone();
         smol::unblock(move || Catalog::scan_with(&state_dir, &cwd, user_config_dir.as_deref()))
@@ -215,11 +299,12 @@ impl Manager {
 
     async fn start(&mut self, launch: LaunchRequest) -> Result<WorkflowResponse, WorkflowError> {
         let resolved = self.scan().await.resolve(&launch.name)?;
+        let source_label = resolved.source_label();
         if !resolved.trusted {
             return Err(WorkflowError::TrustRequired {
                 name: launch.name,
                 digest: resolved.digest,
-                path: resolved.path.unwrap_or_default(),
+                path: source_label,
             });
         }
         let agent_budget = launch.agent_budget.unwrap_or(DEFAULT_AGENT_BUDGET);
@@ -233,9 +318,7 @@ impl Manager {
             display_name: self.unique_display_name(&resolved.meta.name),
             workflow_name: resolved.meta.name,
             source_kind: stored_source_kind(resolved.source_kind),
-            source_path: resolved
-                .path
-                .map(|path| path.to_string_lossy().into_owned()),
+            source_path: Some(source_label),
             source_digest: resolved.digest,
             language_version: WORKFLOW_LANGUAGE_VERSION,
             abi_version: WORKFLOW_ABI_VERSION,
@@ -664,7 +747,7 @@ fn mode_label(mode: &AgentMode) -> &'static str {
     match mode {
         AgentMode::Build => MODE_BUILD,
         AgentMode::ReadOnly => MODE_READ_ONLY,
-        AgentMode::Plan(_) => MODE_PLAN,
+        AgentMode::Plan(_) | AgentMode::RemotePlan(_) => MODE_PLAN,
     }
 }
 
@@ -965,6 +1048,7 @@ complete(first.output.echo);
                 session_id,
                 cwd: self.project.clone(),
                 user_config_dir: Some(self.config.clone()),
+                remote_project_context: None,
                 runner: Arc::clone(&self.runner) as Arc<dyn TaskRunner>,
                 events: self.events_tx.clone(),
                 mode: Arc::new(|| AgentMode::Build),

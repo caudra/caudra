@@ -12,12 +12,21 @@
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
+use async_lock::Mutex;
+use caudra_workspace::{
+    Mutation, MutationCondition, MutationKind, MutationRequest, OperationState, ResourceId,
+    ResourceRevision, WorkspacePath, WorkspaceSession, WriteContent,
+};
 use serde_json::Value;
 
-use crate::tools::image_bytes::prepare;
+use crate::permissions::{PermissionAuthorityProfile, PermissionResourceAccess, PermissionRisk};
+use crate::tools::image_bytes::{
+    RemoteImageResource, prepare, read_remote, remote_permission_resource, resolve_remote,
+    unresolved_remote_permission_resource,
+};
 use crate::tools::registry::{
-    ExecFuture, HeaderFuture, HeaderResult, ParseError, PermissionScopes, PlanModeAccess, Tool,
-    ToolExecResult, ToolInvocation,
+    ExecFuture, HeaderFuture, HeaderResult, ParseError, PermissionIntent, PermissionScopes,
+    PlanModeAccess, Tool, ToolExecResult, ToolInvocation,
 };
 use crate::tools::schema::{ParamKind, ParamSchema, Property, to_json_schema, validate};
 use crate::tools::{
@@ -34,9 +43,12 @@ pub const DESCRIPTION: &str = "Generate a raster image from a text prompt and sa
 - Returns the saved path only. Call `view_image` on it when you need to see the result.
 - One image per call. For several distinct assets, call once per asset.
 - Reference images are passed with `images` and are described in prompt order; label their roles in `prompt`, e.g. \"Image 1: style reference\".
-- Never overwrites: an existing `out` path is versioned to `-v2`, `-v3`, and so on.";
+- Never overwrites: local outputs are versioned; remote output conflicts require a newly authorized path.";
 
 const MAX_VERSION: u32 = 999;
+const REMOTE_OUTPUT_CONFLICT: &str =
+    "remote output already exists; choose and authorize a different path";
+const CONFLICT_CODE: &str = "conflict";
 const PNG_EXTENSION: &str = "png";
 const SAVED: &str = "Generated image saved to";
 const VIEW_HINT: &str = "Call view_image on it to see the result.";
@@ -109,7 +121,8 @@ impl Tool for ImageGenerate {
 fn parse_call(input: &Value) -> Result<ImageGenerateCall, ParseError> {
     let input = validate(&SCHEMA, input.clone())?;
     let prompt = required_str(&input, "prompt")?.to_owned();
-    let out = resolve_path(required_str(&input, "out")?).map_err(ParseError::custom)?;
+    let raw_out = required_str(&input, "out")?.to_owned();
+    let out = resolve_path(&raw_out).map_err(ParseError::custom)?;
 
     let quality = match input.get("quality").and_then(Value::as_str) {
         Some(raw) => ImageQuality::from_wire(raw)
@@ -117,21 +130,25 @@ fn parse_call(input: &Value) -> Result<ImageGenerateCall, ParseError> {
         None => ImageQuality::default(),
     };
 
-    let references = match input.get("images").and_then(Value::as_array) {
+    let raw_references = match input.get("images").and_then(Value::as_array) {
         Some(paths) => paths
             .iter()
             .map(|path| {
-                let raw = path
-                    .as_str()
-                    .ok_or_else(|| ParseError::custom("images entries must be strings"))?;
-                resolve_path(raw).map_err(ParseError::custom)
+                path.as_str()
+                    .map(ToOwned::to_owned)
+                    .ok_or_else(|| ParseError::custom("images entries must be strings"))
             })
             .collect::<Result<Vec<_>, _>>()?,
         None => Vec::new(),
     };
+    let references = raw_references
+        .iter()
+        .map(|path| resolve_path(path).map_err(ParseError::custom))
+        .collect::<Result<Vec<_>, _>>()?;
 
     Ok(ImageGenerateCall {
         prompt,
+        raw_out,
         out,
         quality,
         size: input
@@ -139,6 +156,8 @@ fn parse_call(input: &Value) -> Result<ImageGenerateCall, ParseError> {
             .and_then(Value::as_str)
             .map(ToOwned::to_owned),
         references,
+        raw_references,
+        remote: Mutex::new(None),
     })
 }
 
@@ -152,10 +171,19 @@ fn required_str<'a>(input: &'a Value, key: &str) -> Result<&'a str, ParseError> 
 
 struct ImageGenerateCall {
     prompt: String,
+    raw_out: String,
     out: String,
     quality: ImageQuality,
     size: Option<String>,
     references: Vec<String>,
+    raw_references: Vec<String>,
+    remote: Mutex<Option<RemoteGeneratePlan>>,
+}
+
+#[derive(Clone)]
+struct RemoteGeneratePlan {
+    out: WorkspacePath,
+    references: Vec<RemoteImageResource>,
 }
 
 impl ToolInvocation for ImageGenerateCall {
@@ -171,8 +199,20 @@ impl ToolInvocation for ImageGenerateCall {
         Some(Path::new(&self.out))
     }
 
-    fn read_targets(&self, _ctx: &ToolContext) -> Vec<PathBuf> {
-        self.references.iter().map(PathBuf::from).collect()
+    fn mutation_targets(&self, ctx: &ToolContext) -> Vec<PathBuf> {
+        if ctx.workspace_session.is_some() {
+            Vec::new()
+        } else {
+            vec![PathBuf::from(&self.out)]
+        }
+    }
+
+    fn read_targets(&self, ctx: &ToolContext) -> Vec<PathBuf> {
+        if ctx.workspace_session.is_some() {
+            Vec::new()
+        } else {
+            self.references.iter().map(PathBuf::from).collect()
+        }
     }
 
     fn plan_mode_access(&self) -> PlanModeAccess {
@@ -185,10 +225,40 @@ impl ToolInvocation for ImageGenerateCall {
         ))))
     }
 
-    fn execute<'a>(self: Box<Self>, _ctx: &'a ToolContext) -> ExecFuture<'a> {
+    fn preflight<'a>(
+        &'a self,
+        ctx: &'a ToolContext,
+    ) -> BoxFuture<'a, Result<Option<PermissionIntent>, String>> {
         Box::pin(async move {
-            match self.run().await {
-                Ok(output) => ToolExecResult::from(Ok(output)),
+            let Some(session) = ctx.workspace_session.as_ref() else {
+                return Ok(None);
+            };
+            let out = WorkspacePath::new(self.raw_out.clone())
+                .map_err(|error| format!("invalid remote output path: {error}"))?;
+            let mut references = Vec::with_capacity(self.raw_references.len());
+            for raw in &self.raw_references {
+                let path = WorkspacePath::new(raw.clone())
+                    .map_err(|error| format!("invalid remote reference path: {error}"))?;
+                references.push(resolve_remote(session, &path).await?);
+            }
+            let plan = RemoteGeneratePlan { out, references };
+            let intent = remote_generate_intent(session, &plan);
+            *self.remote.lock().await = Some(plan);
+            Ok(Some(intent))
+        })
+    }
+
+    fn remote_workspace_effect(&self, ctx: &ToolContext) -> bool {
+        ctx.workspace_session.is_some()
+    }
+
+    fn execute<'a>(self: Box<Self>, ctx: &'a ToolContext) -> ExecFuture<'a> {
+        Box::pin(async move {
+            match self.run(ctx).await {
+                Ok((output, Some(path))) => ToolExecResult::from(Ok(output))
+                    .with_written_path(Some(path))
+                    .with_remote_written_paths(),
+                Ok((output, None)) => ToolExecResult::from(Ok(output)),
                 Err(message) => ToolExecResult::from(Err(message)),
             }
         })
@@ -196,9 +266,24 @@ impl ToolInvocation for ImageGenerateCall {
 }
 
 impl ImageGenerateCall {
-    async fn run(self) -> Result<ToolOutput, String> {
-        let paths = self.references.clone();
-        let references = smol::unblock(move || read_references(&paths)).await?;
+    async fn run(self, ctx: &ToolContext) -> Result<(ToolOutput, Option<String>), String> {
+        let remote_plan = if let Some(session) = ctx.workspace_session.as_ref() {
+            Some(match self.remote.lock().await.clone() {
+                Some(plan) => plan,
+                None => self.resolve_remote_plan(session).await?,
+            })
+        } else {
+            None
+        };
+        let references = match (ctx.workspace_session.as_ref(), remote_plan.as_ref()) {
+            (Some(session), Some(plan)) => {
+                read_remote_references(session, &plan.references).await?
+            }
+            _ => {
+                let paths = self.references.clone();
+                smol::unblock(move || read_references(&paths)).await?
+            }
+        };
         let state_dir = StateDir::resolve().map_err(|e| e.to_string())?;
 
         let bytes = generate(
@@ -213,8 +298,34 @@ impl ImageGenerateCall {
         .await
         .map_err(|e| e.to_string())?;
 
-        let requested = self.out.clone();
-        smol::unblock(move || save(&requested, &bytes)).await
+        match (ctx.workspace_session.as_ref(), remote_plan) {
+            (Some(session), Some(plan)) => {
+                let saved = save_remote(session, &plan.out, bytes).await?;
+                let path = saved.path.as_str().to_owned();
+                Ok((remote_saved_output(&saved, &plan.out), Some(path)))
+            }
+            _ => {
+                let requested = self.out.clone();
+                smol::unblock(move || save(&requested, &bytes))
+                    .await
+                    .map(|output| (output, None))
+            }
+        }
+    }
+
+    async fn resolve_remote_plan(
+        &self,
+        session: &WorkspaceSession,
+    ) -> Result<RemoteGeneratePlan, String> {
+        let out = WorkspacePath::new(self.raw_out.clone())
+            .map_err(|error| format!("invalid remote output path: {error}"))?;
+        let mut references = Vec::with_capacity(self.raw_references.len());
+        for raw in &self.raw_references {
+            let path = WorkspacePath::new(raw.clone())
+                .map_err(|error| format!("invalid remote reference path: {error}"))?;
+            references.push(resolve_remote(session, &path).await?);
+        }
+        Ok(RemoteGeneratePlan { out, references })
     }
 }
 
@@ -223,6 +334,148 @@ fn read_references(paths: &[String]) -> Result<Vec<ImageSource>, String> {
         .iter()
         .map(|path| prepare(path).map(|image| image.source))
         .collect()
+}
+
+async fn read_remote_references(
+    session: &WorkspaceSession,
+    resources: &[RemoteImageResource],
+) -> Result<Vec<ImageSource>, String> {
+    let mut references = Vec::with_capacity(resources.len());
+    for resource in resources {
+        references.push(read_remote(session, resource).await?.source);
+    }
+    Ok(references)
+}
+
+fn remote_generate_intent(
+    session: &WorkspaceSession,
+    plan: &RemoteGeneratePlan,
+) -> PermissionIntent {
+    let mut resources = Vec::with_capacity(plan.references.len() + 1);
+    resources.push(unresolved_remote_permission_resource(
+        session,
+        &plan.out,
+        PermissionResourceAccess::Write,
+    ));
+    resources.extend(plan.references.iter().map(|reference| {
+        remote_permission_resource(
+            session,
+            &reference.scope,
+            &reference.path,
+            PermissionResourceAccess::Read,
+            false,
+        )
+    }));
+    PermissionIntent::new(
+        PermissionScopes::single(format!("generate remote image {}", plan.out)),
+        resources,
+        PermissionRisk::High,
+    )
+    .with_authority(PermissionAuthorityProfile::RemoteResource)
+}
+
+#[derive(Debug)]
+struct RemoteSavedImage {
+    path: WorkspacePath,
+    resource_id: ResourceId,
+    revision: ResourceRevision,
+    versioned: bool,
+}
+
+async fn save_remote(
+    session: &WorkspaceSession,
+    requested: &WorkspacePath,
+    bytes: Vec<u8>,
+) -> Result<RemoteSavedImage, String> {
+    let service = session
+        .workspace()
+        .services()
+        .mutation
+        .as_ref()
+        .ok_or_else(|| "remote image writes are unavailable".to_owned())?;
+    {
+        let candidate = requested.clone();
+        let request = MutationRequest {
+            mutations: vec![Mutation::Write {
+                path: candidate.clone(),
+                content: WriteContent::Bytes(bytes.clone()),
+                condition: MutationCondition::MustNotExist,
+            }],
+        };
+        let status = match service
+            .execute(session.binding(), session.cursor(), &request)
+            .await
+        {
+            Ok(status) => status,
+            Err(caudra_workspace::WorkspaceError::Conflict) => {
+                return Err(REMOTE_OUTPUT_CONFLICT.into());
+            }
+            Err(error) => return Err(format!("cannot write remote image {candidate}: {error}")),
+        };
+        let result = match status.state {
+            OperationState::Completed { result, .. } => result,
+            OperationState::Failed {
+                error,
+                side_effects_possible: false,
+            } if error.code.as_str() == CONFLICT_CODE => return Err(REMOTE_OUTPUT_CONFLICT.into()),
+            OperationState::Failed { error, .. } => {
+                return Err(format!(
+                    "remote image write failed (code {})",
+                    error.code.as_str()
+                ));
+            }
+            OperationState::Cancelled { .. } => {
+                return Err("remote image write was cancelled".to_owned());
+            }
+            OperationState::Indeterminate { .. } => {
+                return Err("remote image write outcome is indeterminate".to_owned());
+            }
+            OperationState::NeverSeen
+            | OperationState::Prepared
+            | OperationState::Running
+            | OperationState::Forgotten => {
+                return Err("remote image write did not reach a durable terminal state".to_owned());
+            }
+        };
+        if !result.committed
+            || result.rolled_back
+            || result.results.len() != 1
+            || result.results[0].kind != MutationKind::Create
+            || result.results[0].path != candidate
+            || result.results[0].destination.is_some()
+        {
+            return Err("remote image write returned an invalid mutation result".to_owned());
+        }
+        let mutation_revision = result.results[0]
+            .revision
+            .as_ref()
+            .ok_or_else(|| "remote image write returned no revision".to_owned())?;
+        let resource = resolve_remote(session, &candidate).await?;
+        if &resource.revision != mutation_revision || resource.size_bytes != bytes.len() as u64 {
+            return Err("remote image write could not be verified".to_owned());
+        }
+        Ok(RemoteSavedImage {
+            path: resource.path,
+            resource_id: resource.resource_id,
+            revision: resource.revision,
+            versioned: false,
+        })
+    }
+}
+
+fn remote_saved_output(saved: &RemoteSavedImage, requested: &WorkspacePath) -> ToolOutput {
+    let mut message = format!(
+        "{SAVED} {} (resource {}, revision {}). {VIEW_HINT}",
+        saved.path,
+        saved.resource_id.as_str(),
+        saved.revision.as_str()
+    );
+    if saved.versioned {
+        message.push_str(&format!(
+            " The requested path {requested} already existed, so the new image was versioned rather than overwriting it."
+        ));
+    }
+    ToolOutput::Plain(message.into())
 }
 
 fn save(requested: &str, bytes: &[u8]) -> Result<ToolOutput, String> {
@@ -274,6 +527,19 @@ fn non_overwriting_path(requested: &str) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex as StdMutex};
+
+    use async_trait::async_trait;
+    use caudra_workspace::{
+        AuthenticatedPrincipalId, AuthorityIdentity, ByteContent, CancellationResult, CwdHandle,
+        ListPage, ListRequest, MutationEntryResult, MutationResult, OperationError,
+        OperationHandle, OperationPhase, OperationProgress, OperationStatus, ProjectIdentity,
+        ProjectKey, ReadBytesRequest, ReadTextRequest, ResourceScope, ResourceSelector,
+        SequenceMetadata, SessionBindingId, SessionWorkspaceBinding, SourceTrustAnchor,
+        TextContent, WorkspaceCapabilities, WorkspaceCapability, WorkspaceCursor, WorkspaceError,
+        WorkspaceHandle, WorkspaceMutationService, WorkspaceReadService, WorkspaceResource,
+        WorkspaceServices,
+    };
     use test_case::test_case;
 
     use super::*;
@@ -286,6 +552,269 @@ mod tests {
     const MSG_EXPECTED_ONE_OF: &str = "expected one of";
     const BLANK_PROMPT: &str = "prompt is required";
     const EXHAUSTED: &str = "is taken in";
+    const REMOTE_OUT: &str = "generated/remote-only-output-canary.png";
+    const REMOTE_SECRET: &str = "https://secret.example bearer-secret";
+
+    #[derive(Clone, Copy)]
+    enum MutationOutcome {
+        Complete,
+        Conflict,
+        Indeterminate,
+        FailedWithSecret,
+        ReplaceResult,
+    }
+
+    struct ImageMutationService {
+        binding: SessionWorkspaceBinding,
+        bytes: Vec<u8>,
+        conflict_first: bool,
+        outcome: MutationOutcome,
+        attempts: StdMutex<Vec<Mutation>>,
+        latest_path: StdMutex<Option<WorkspacePath>>,
+    }
+
+    impl ImageMutationService {
+        fn resource(&self, path: WorkspacePath) -> WorkspaceResource {
+            WorkspaceResource {
+                project: self.binding.project().clone(),
+                scope: ResourceScope::new(
+                    vec![ResourceId::new("root").unwrap()],
+                    ResourceId::new("generated-resource").unwrap(),
+                )
+                .unwrap(),
+                path: Some(path),
+                kind: caudra_workspace::ResourceKind::File,
+                revision: Some(ResourceRevision::new("generated-revision").unwrap()),
+                size_bytes: Some(self.bytes.len() as u64),
+            }
+        }
+
+        fn status(&self, state: OperationState<MutationResult>) -> OperationStatus<MutationResult> {
+            OperationStatus {
+                handle: OperationHandle {
+                    preparation_id: caudra_workspace::OperationId::new("prepare").unwrap(),
+                    invocation_id: Some(caudra_workspace::OperationId::new("invoke").unwrap()),
+                    execution_id: Some(caudra_workspace::OperationId::new("execute").unwrap()),
+                    expires_at_unix_ms: None,
+                },
+                state,
+                progress: Vec::<OperationProgress>::new(),
+                progress_metadata: SequenceMetadata {
+                    first_retained_sequence: None,
+                    next_sequence: 0,
+                    gap_before_first: false,
+                },
+            }
+        }
+    }
+
+    #[async_trait]
+    impl WorkspaceReadService for ImageMutationService {
+        async fn resolve(
+            &self,
+            _binding: &SessionWorkspaceBinding,
+            _cursor: &WorkspaceCursor,
+            path: &WorkspacePath,
+        ) -> Result<WorkspaceResource, WorkspaceError> {
+            Ok(self.resource(path.clone()))
+        }
+
+        async fn resolve_directory(
+            &self,
+            _binding: &SessionWorkspaceBinding,
+            _cursor: &WorkspaceCursor,
+            _path: &WorkspacePath,
+        ) -> Result<caudra_workspace::ResolvedWorkspaceDirectory, WorkspaceError> {
+            Err(WorkspaceError::Unavailable)
+        }
+
+        async fn stat(
+            &self,
+            _binding: &SessionWorkspaceBinding,
+            _cursor: &WorkspaceCursor,
+            resource: &ResourceSelector,
+        ) -> Result<WorkspaceResource, WorkspaceError> {
+            assert!(
+                matches!(resource, ResourceSelector::Id(id) if id.as_str() == "generated-resource")
+            );
+            let path = self.latest_path.lock().unwrap().clone().unwrap();
+            Ok(self.resource(path))
+        }
+
+        async fn list(
+            &self,
+            _binding: &SessionWorkspaceBinding,
+            _cursor: &WorkspaceCursor,
+            _request: &ListRequest,
+        ) -> Result<ListPage, WorkspaceError> {
+            Err(WorkspaceError::Unavailable)
+        }
+
+        async fn read_text(
+            &self,
+            _binding: &SessionWorkspaceBinding,
+            _cursor: &WorkspaceCursor,
+            _request: &ReadTextRequest,
+        ) -> Result<TextContent, WorkspaceError> {
+            Err(WorkspaceError::Unavailable)
+        }
+
+        async fn read_bytes(
+            &self,
+            _binding: &SessionWorkspaceBinding,
+            _cursor: &WorkspaceCursor,
+            _request: &ReadBytesRequest,
+        ) -> Result<ByteContent, WorkspaceError> {
+            Err(WorkspaceError::Unavailable)
+        }
+    }
+
+    #[async_trait]
+    impl WorkspaceMutationService for ImageMutationService {
+        async fn execute(
+            &self,
+            _binding: &SessionWorkspaceBinding,
+            _cursor: &WorkspaceCursor,
+            request: &MutationRequest,
+        ) -> Result<OperationStatus<MutationResult>, WorkspaceError> {
+            let mutation = request.mutations.first().unwrap().clone();
+            let Mutation::Write {
+                path,
+                content,
+                condition,
+            } = &mutation
+            else {
+                panic!("image generation must only write")
+            };
+            assert_eq!(condition, &MutationCondition::MustNotExist);
+            assert!(matches!(content, WriteContent::Bytes(bytes) if bytes == &self.bytes));
+            let mut attempts = self.attempts.lock().unwrap();
+            attempts.push(mutation.clone());
+            if self.conflict_first && attempts.len() == 1 {
+                return Err(WorkspaceError::Conflict);
+            }
+            *self.latest_path.lock().unwrap() = Some(path.clone());
+            let state = match self.outcome {
+                MutationOutcome::Conflict => OperationState::Failed {
+                    error: OperationError {
+                        code: caudra_workspace::OperationId::new(CONFLICT_CODE).unwrap(),
+                        message: "condition did not match".to_owned(),
+                    },
+                    side_effects_possible: false,
+                },
+                MutationOutcome::Indeterminate => OperationState::Indeterminate {
+                    side_effects_possible: true,
+                },
+                MutationOutcome::FailedWithSecret => OperationState::Failed {
+                    error: OperationError {
+                        code: caudra_workspace::OperationId::new("remote-failure").unwrap(),
+                        message: REMOTE_SECRET.to_owned(),
+                    },
+                    side_effects_possible: true,
+                },
+                MutationOutcome::Complete | MutationOutcome::ReplaceResult => {
+                    OperationState::Completed {
+                        result: MutationResult {
+                            committed: true,
+                            rolled_back: false,
+                            atomic_across_files: true,
+                            results: vec![MutationEntryResult {
+                                kind: if matches!(self.outcome, MutationOutcome::ReplaceResult) {
+                                    MutationKind::Write
+                                } else {
+                                    MutationKind::Create
+                                },
+                                path: path.clone(),
+                                destination: None,
+                                revision: Some(
+                                    ResourceRevision::new("generated-revision").unwrap(),
+                                ),
+                            }],
+                        },
+                        side_effects_possible: true,
+                    }
+                }
+            };
+            Ok(self.status(state))
+        }
+
+        async fn status(
+            &self,
+            _binding: &SessionWorkspaceBinding,
+            _cursor: &WorkspaceCursor,
+            _operation: &OperationHandle,
+        ) -> Result<OperationStatus<MutationResult>, WorkspaceError> {
+            Err(WorkspaceError::Unavailable)
+        }
+
+        async fn cancel(
+            &self,
+            _binding: &SessionWorkspaceBinding,
+            _cursor: &WorkspaceCursor,
+            _operation: &OperationHandle,
+        ) -> Result<CancellationResult, WorkspaceError> {
+            Ok(CancellationResult {
+                state: OperationPhase::Cancelled,
+                cancellation_requested: true,
+            })
+        }
+    }
+
+    fn remote_session(
+        bytes: Vec<u8>,
+        conflict_first: bool,
+        outcome: MutationOutcome,
+    ) -> (WorkspaceSession, Arc<ImageMutationService>) {
+        let authority = AuthorityIdentity::new(
+            SourceTrustAnchor::new("test-anchor").unwrap(),
+            "test-authority",
+            "test-workspace",
+            "test-generation",
+            "test-namespace",
+        )
+        .unwrap();
+        let principal = AuthenticatedPrincipalId::new(authority.clone(), "principal").unwrap();
+        let project = ProjectIdentity::new(authority.clone(), ProjectKey::new("project").unwrap());
+        let binding = SessionWorkspaceBinding::new(
+            SessionBindingId::new("session").unwrap(),
+            authority.clone(),
+            principal,
+            project,
+        )
+        .unwrap();
+        let service = Arc::new(ImageMutationService {
+            binding: binding.clone(),
+            bytes,
+            conflict_first,
+            outcome,
+            attempts: StdMutex::new(Vec::new()),
+            latest_path: StdMutex::new(None),
+        });
+        let workspace = WorkspaceHandle::new(
+            authority,
+            WorkspaceCapabilities::from([
+                WorkspaceCapability::Resolve,
+                WorkspaceCapability::Stat,
+                WorkspaceCapability::MutationExecute,
+            ]),
+            WorkspaceServices {
+                read: Some(service.clone()),
+                mutation: Some(service.clone()),
+                ..WorkspaceServices::default()
+            },
+        )
+        .unwrap();
+        let cursor = WorkspaceCursor::new(
+            &binding,
+            ResourceScope::root(ResourceId::new("root").unwrap()),
+            1,
+            CwdHandle::new("cwd").unwrap(),
+        );
+        (
+            WorkspaceSession::new(workspace, binding, cursor).unwrap(),
+            service,
+        )
+    }
 
     fn call(input: Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
         ImageGenerate.parse(&input)
@@ -465,5 +994,138 @@ mod tests {
     fn generation_is_blocked_in_plan_mode() {
         let parsed = call(serde_json::json!({"prompt": PROMPT, "out": "a.png"})).unwrap();
         assert_eq!(parsed.plan_mode_access(), PlanModeAccess::Refused);
+    }
+
+    #[test]
+    fn remote_generation_does_not_write_an_unauthorized_version_on_conflict() {
+        let bytes = png(2, 2);
+        let (session, service) = remote_session(bytes.clone(), true, MutationOutcome::Complete);
+        let requested = WorkspacePath::new(REMOTE_OUT).unwrap();
+
+        let error = smol::block_on(save_remote(&session, &requested, bytes)).unwrap_err();
+        assert_eq!(error, REMOTE_OUTPUT_CONFLICT);
+        let attempts = service.attempts.lock().unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert!(attempts.iter().all(|mutation| matches!(
+            mutation,
+            Mutation::Write {
+                condition: MutationCondition::MustNotExist,
+                ..
+            }
+        )));
+        assert!(!Path::new(REMOTE_OUT).exists());
+    }
+
+    #[test]
+    fn remote_generation_output_authority_is_path_and_cursor_specific() {
+        let (session, _) = remote_session(Vec::new(), false, MutationOutcome::Complete);
+        let first_path = WorkspacePath::new("generated/first.png").unwrap();
+        let second_path = WorkspacePath::new("generated/second.png").unwrap();
+        let first = remote_generate_intent(
+            &session,
+            &RemoteGeneratePlan {
+                out: first_path.clone(),
+                references: Vec::new(),
+            },
+        );
+        let second = remote_generate_intent(
+            &session,
+            &RemoteGeneratePlan {
+                out: second_path,
+                references: Vec::new(),
+            },
+        );
+
+        assert_ne!(first.resources[0].value, second.resources[0].value);
+        assert_ne!(first.resources[0].value, "root");
+        assert!(!first.resources[0].value.contains(first_path.as_str()));
+        assert!(matches!(
+            &first.resources[0].kind,
+            crate::permissions::PermissionResourceKind::RemoteFile { identity }
+                if identity.authority.workspace_generation() == "test-generation"
+                    && identity.principal.subject() == "principal"
+                    && identity.project.key().as_str() == "project"
+        ));
+    }
+
+    #[test]
+    fn remote_generation_does_not_retry_a_terminal_create_conflict() {
+        let bytes = png(2, 2);
+        let (conflict_session, conflict_service) =
+            remote_session(bytes.clone(), false, MutationOutcome::Conflict);
+        let requested = WorkspacePath::new(REMOTE_OUT).unwrap();
+
+        let error =
+            smol::block_on(save_remote(&conflict_session, &requested, bytes.clone())).unwrap_err();
+
+        assert_eq!(error, REMOTE_OUTPUT_CONFLICT);
+        assert_eq!(conflict_service.attempts.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn remote_generation_rejects_a_replace_result_for_a_create() {
+        let bytes = png(2, 2);
+        let (session, _) = remote_session(bytes.clone(), false, MutationOutcome::ReplaceResult);
+        let error = smol::block_on(save_remote(
+            &session,
+            &WorkspacePath::new(REMOTE_OUT).unwrap(),
+            bytes,
+        ))
+        .unwrap_err();
+
+        assert!(error.contains("invalid mutation result"), "{error}");
+    }
+
+    #[test]
+    fn remote_generation_never_retries_an_indeterminate_mutation() {
+        let bytes = png(2, 2);
+        let (session, service) =
+            remote_session(bytes.clone(), false, MutationOutcome::Indeterminate);
+        let error = smol::block_on(save_remote(
+            &session,
+            &WorkspacePath::new(REMOTE_OUT).unwrap(),
+            bytes,
+        ))
+        .unwrap_err();
+
+        assert!(error.contains("outcome is indeterminate"), "{error}");
+        assert_eq!(service.attempts.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn remote_generation_does_not_leak_transport_secrets() {
+        let bytes = png(2, 2);
+        let (session, _) = remote_session(bytes.clone(), false, MutationOutcome::FailedWithSecret);
+        let error = smol::block_on(save_remote(
+            &session,
+            &WorkspacePath::new(REMOTE_OUT).unwrap(),
+            bytes,
+        ))
+        .unwrap_err();
+
+        assert!(!error.contains(REMOTE_SECRET), "{error}");
+        assert!(!error.contains("secret.example"), "{error}");
+        assert!(error.contains("remote-failure"), "{error}");
+    }
+
+    #[test]
+    fn remote_result_contains_only_display_path_and_opaque_file_identity() {
+        let saved = RemoteSavedImage {
+            path: WorkspacePath::new(REMOTE_OUT).unwrap(),
+            resource_id: ResourceId::new("opaque-resource").unwrap(),
+            revision: ResourceRevision::new("opaque-revision").unwrap(),
+            versioned: false,
+        };
+        let message = text(&remote_saved_output(
+            &saved,
+            &WorkspacePath::new(REMOTE_OUT).unwrap(),
+        ));
+
+        assert!(message.contains(REMOTE_OUT), "{message}");
+        assert!(message.contains("opaque-resource"), "{message}");
+        assert!(message.contains("opaque-revision"), "{message}");
+        assert!(!message.contains("/tmp/"), "{message}");
+        assert!(!message.contains("https://"), "{message}");
+        assert!(!message.contains("bearer"), "{message}");
     }
 }

@@ -29,6 +29,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
+use caudra_workspace::WorkspacePath;
 use rusqlite::backup::Backup;
 use rusqlite::limits::Limit;
 use rusqlite::{
@@ -51,6 +52,7 @@ use crate::tool_outputs::{TOOL_OUTPUT_DIR, delete_session_outputs};
 use crate::usage_ledger::LedgerPurpose;
 use crate::workflow::{SESSION_WORKFLOW_BYTES, trim_workflow_runs, workflow_totals};
 use crate::workflow_scratch::{remove_session as remove_scratch_session, session_scratch_bytes};
+use crate::workspace_binding::StoredWorkspaceBinding;
 use crate::{
     StateDir, StorageError, lock_session_artifacts, shared_existing_state_lock, shared_state_lock,
 };
@@ -58,7 +60,7 @@ use crate::{
 pub const SESSIONS_DB_FILE: &str = "sessions.sqlite3";
 pub const SESSIONS_DB_LOCK_FILE: &str = "sessions.sqlite3.lock";
 
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 const APPLICATION_ID: i64 = i32::from_be_bytes(*b"CAUD") as i64;
 /// Pages copied per step of the pre-migration backup. The whole file is copied
 /// under the initialization lock, so this only bounds how long the backup holds
@@ -332,7 +334,26 @@ const MIGRATIONS: &[Migration] = &[
         to: 6,
         sql: WORKFLOW_EVENTS_TABLE,
     },
+    Migration {
+        from: 6,
+        to: 7,
+        sql: SESSION_WORKSPACE_BINDING_COLUMNS,
+    },
 ];
+
+const SESSION_WORKSPACE_BINDING_COLUMNS: &str = r#"
+ALTER TABLE sessions ADD COLUMN workspace_binding TEXT NOT NULL DEFAULT '{}' CHECK(json_valid(workspace_binding));
+ALTER TABLE sessions ADD COLUMN workspace_source TEXT NOT NULL DEFAULT '';
+ALTER TABLE sessions ADD COLUMN workspace_authority TEXT NOT NULL DEFAULT '';
+ALTER TABLE sessions ADD COLUMN workspace_principal TEXT NOT NULL DEFAULT '';
+ALTER TABLE sessions ADD COLUMN workspace_project TEXT NOT NULL DEFAULT '';
+ALTER TABLE sessions ADD COLUMN workspace_cursor TEXT NOT NULL DEFAULT '';
+ALTER TABLE sessions ADD COLUMN workspace_cursor_label TEXT;
+CREATE INDEX sessions_workspace_updated ON sessions(
+    workspace_source, workspace_authority, workspace_principal,
+    workspace_project, workspace_cursor, updated_at DESC, id DESC
+);
+"#;
 
 // Session state in this schema is canonical. The one exception is
 // `usage_ledger`, which is a second durable representation on purpose: its
@@ -354,6 +375,13 @@ CREATE TABLE sessions (
     subagent_item_count  INTEGER NOT NULL DEFAULT 0,
     token_usage          TEXT NOT NULL CHECK(json_valid(token_usage)),
     metadata             TEXT NOT NULL CHECK(json_valid(metadata)),
+    workspace_binding    TEXT NOT NULL DEFAULT '{}' CHECK(json_valid(workspace_binding)),
+    workspace_source     TEXT NOT NULL DEFAULT '',
+    workspace_authority  TEXT NOT NULL DEFAULT '',
+    workspace_principal  TEXT NOT NULL DEFAULT '',
+    workspace_project    TEXT NOT NULL DEFAULT '',
+    workspace_cursor     TEXT NOT NULL DEFAULT '',
+    workspace_cursor_label TEXT,
     last_opened_at       INTEGER,
     pinned               INTEGER NOT NULL DEFAULT 0 CHECK(pinned IN (0, 1)),
     trimmed_at           INTEGER
@@ -361,6 +389,11 @@ CREATE TABLE sessions (
 
 CREATE INDEX sessions_cwd_updated
     ON sessions(cwd, updated_at DESC, id DESC);
+
+CREATE INDEX sessions_workspace_updated ON sessions(
+    workspace_source, workspace_authority, workspace_principal,
+    workspace_project, workspace_cursor, updated_at DESC, id DESC
+);
 
 CREATE TABLE state (
     scope      TEXT NOT NULL,
@@ -585,6 +618,13 @@ enum CleanupGuard {
 struct SerializedRoot {
     token_usage: String,
     metadata: String,
+    workspace_binding: String,
+    workspace_source: String,
+    workspace_authority: String,
+    workspace_principal: String,
+    workspace_project: String,
+    workspace_cursor: String,
+    workspace_cursor_label: Option<String>,
 }
 
 struct SerializedSession {
@@ -622,6 +662,13 @@ struct RootRow {
     subagent_item_count: usize,
     token_usage: String,
     metadata: String,
+    workspace_binding: String,
+    workspace_source: String,
+    workspace_authority: String,
+    workspace_principal: String,
+    workspace_project: String,
+    workspace_cursor: String,
+    workspace_cursor_label: Option<String>,
 }
 
 impl SessionDatabase {
@@ -1226,6 +1273,14 @@ impl SessionDatabase {
         U: Serialize,
         T: Serialize,
     {
+        if session
+            .workspace_binding
+            .as_deref()
+            .is_some_and(|binding| !binding.is_local())
+            && WorkspacePath::new(&session.cwd).is_err()
+        {
+            return Err(SessionError::InvalidRemoteCwd);
+        }
         if let Some(cursor) = cursor {
             if cursor.session_id != session.id {
                 return Err(SessionError::IdMismatch {
@@ -1402,6 +1457,88 @@ impl SessionDatabase {
             .optional()?
             .map(|bytes| id_from_bytes(&bytes, "sessions.id"))
             .transpose()
+    }
+
+    pub fn list_for_workspace(
+        &self,
+        binding: &StoredWorkspaceBinding,
+    ) -> Result<Vec<SessionSummary>, SessionError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, title, updated_at FROM sessions WHERE workspace_source = ?1 \
+             AND workspace_authority = ?2 AND workspace_principal = ?3 \
+             AND workspace_project = ?4 AND workspace_cursor = ?5 \
+             AND workspace_cursor_label IS ?6 \
+             ORDER BY updated_at DESC, id DESC",
+        )?;
+        let mut rows = statement.query(params![
+            binding.trust_anchor().as_str(),
+            binding.authority_storage_key(),
+            binding.principal_id(),
+            binding.project_key().as_str(),
+            binding.cwd_handle().as_str(),
+            binding.cursor_label(),
+        ])?;
+        let mut summaries = Vec::new();
+        while let Some(row) = rows.next()? {
+            summaries.push(SessionSummary {
+                id: id_from_row(row, 0)?,
+                title: row.get(1)?,
+                updated_at: from_i64(row.get(2)?, "sessions.updated_at")?,
+            });
+        }
+        Ok(summaries)
+    }
+
+    pub fn latest_id_for_workspace(
+        &self,
+        binding: &StoredWorkspaceBinding,
+    ) -> Result<Option<CaudraId>, SessionError> {
+        self.connection
+            .query_row(
+                "SELECT id FROM sessions WHERE workspace_source = ?1 \
+                 AND workspace_authority = ?2 AND workspace_principal = ?3 \
+                  AND workspace_project = ?4 AND workspace_cursor = ?5 \
+                  AND workspace_cursor_label IS ?6 \
+                 ORDER BY updated_at DESC, id DESC LIMIT 1",
+                params![
+                    binding.trust_anchor().as_str(),
+                    binding.authority_storage_key(),
+                    binding.principal_id(),
+                    binding.project_key().as_str(),
+                    binding.cwd_handle().as_str(),
+                    binding.cursor_label(),
+                ],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()?
+            .map(|bytes| id_from_bytes(&bytes, "sessions.id"))
+            .transpose()
+    }
+
+    pub fn list_for_workspace_identity(
+        &self,
+        binding: &StoredWorkspaceBinding,
+    ) -> Result<Vec<SessionSummary>, SessionError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, title, updated_at FROM sessions WHERE workspace_source = ?1 \
+             AND workspace_authority = ?2 AND workspace_principal = ?3 \
+             AND workspace_project = ?4 ORDER BY updated_at DESC, id DESC",
+        )?;
+        let mut rows = statement.query(params![
+            binding.trust_anchor().as_str(),
+            binding.authority_storage_key(),
+            binding.principal_id(),
+            binding.project_key().as_str()
+        ])?;
+        let mut summaries = Vec::new();
+        while let Some(row) = rows.next()? {
+            summaries.push(SessionSummary {
+                id: id_from_row(row, 0)?,
+                title: row.get(1)?,
+                updated_at: from_i64(row.get(2)?, "sessions.updated_at")?,
+            });
+        }
+        Ok(summaries)
     }
 
     pub fn write_version(&self, id: CaudraId) -> Result<Option<i64>, SessionError> {
@@ -2138,6 +2275,20 @@ where
     }
     let token_usage = deserialize_json(&root.token_usage, "token usage")?;
     let meta = deserialize_json(&root.metadata, "session metadata")?;
+    let workspace_binding: StoredWorkspaceBinding =
+        deserialize_json(&root.workspace_binding, "sessions.workspace_binding")?;
+    if workspace_binding.trust_anchor().as_str() != root.workspace_source
+        || !workspace_binding.matches_authority_storage_key(&root.workspace_authority)
+        || workspace_binding.principal_id() != root.workspace_principal
+        || workspace_binding.project_key().as_str() != root.workspace_project
+        || workspace_binding.cwd_handle().as_str() != root.workspace_cursor
+        || workspace_binding.cursor_label() != root.workspace_cursor_label.as_deref()
+    {
+        return Err(SessionError::CorruptDatabaseValue {
+            field: "sessions.workspace_binding",
+            reason: "query columns do not match serialized identity".into(),
+        });
+    }
     let write_version = Arc::new(std::sync::atomic::AtomicI64::new(root.write_version));
     let session = Session {
         version: root.format_version,
@@ -2145,6 +2296,7 @@ where
         title: root.title,
         cwd: root.cwd,
         model: root.model,
+        workspace_binding: Some(Box::new(workspace_binding)),
         messages: Arc::new(messages),
         token_usage,
         tool_outputs,
@@ -2166,7 +2318,7 @@ where
         &session,
         root.write_version,
         root.logical_bytes,
-        root.token_usage.len() + root.metadata.len(),
+        root.token_usage.len() + root.metadata.len() + root.workspace_binding.len(),
         task_spec_bytes,
     );
     Ok((session, cursor))
@@ -2177,7 +2329,9 @@ fn root_on(connection: &Connection, id: CaudraId) -> Result<RootRow, SessionErro
         .query_row(
             "SELECT format_version, title, cwd, model, created_at, updated_at, \
                         write_version, logical_bytes, history_item_count, tool_output_count,\
-                        subagent_item_count, token_usage, metadata \
+                        subagent_item_count, token_usage, metadata, workspace_binding,\
+                        workspace_source, workspace_authority, workspace_principal,\
+                        workspace_project, workspace_cursor, workspace_cursor_label \
                  FROM sessions WHERE id = ?1",
             params![id.as_bytes().as_slice()],
             |row| {
@@ -2195,6 +2349,13 @@ fn root_on(connection: &Connection, id: CaudraId) -> Result<RootRow, SessionErro
                     row.get::<_, i64>(10)?,
                     row.get::<_, String>(11)?,
                     row.get::<_, String>(12)?,
+                    row.get::<_, String>(13)?,
+                    row.get::<_, String>(14)?,
+                    row.get::<_, String>(15)?,
+                    row.get::<_, String>(16)?,
+                    row.get::<_, String>(17)?,
+                    row.get::<_, String>(18)?,
+                    row.get::<_, Option<String>>(19)?,
                 ))
             },
         )
@@ -2215,6 +2376,13 @@ fn root_on(connection: &Connection, id: CaudraId) -> Result<RootRow, SessionErro
                 subagent_item_count,
                 token_usage,
                 metadata,
+                workspace_binding,
+                workspace_source,
+                workspace_authority,
+                workspace_principal,
+                workspace_project,
+                workspace_cursor,
+                workspace_cursor_label,
             )| {
                 Ok(RootRow {
                     format_version: u32::try_from(format_version).map_err(|_| {
@@ -2244,6 +2412,13 @@ fn root_on(connection: &Connection, id: CaudraId) -> Result<RootRow, SessionErro
                     )?,
                     token_usage,
                     metadata,
+                    workspace_binding,
+                    workspace_source,
+                    workspace_authority,
+                    workspace_principal,
+                    workspace_project,
+                    workspace_cursor,
+                    workspace_cursor_label,
                 })
             },
         )
@@ -2293,14 +2468,26 @@ impl SerializedRoot {
     where
         U: Serialize,
     {
+        let binding = session
+            .workspace_binding
+            .as_deref()
+            .cloned()
+            .unwrap_or_else(|| StoredWorkspaceBinding::local_from_cwd(&session.cwd));
         Ok(Self {
             token_usage: serialize_json(&session.token_usage, "token usage", MAX_PAYLOAD_BYTES)?,
             metadata: serialize_json(&session.meta, "session metadata", MAX_METADATA_BYTES)?,
+            workspace_binding: serialize_json(&binding, "workspace binding", MAX_METADATA_BYTES)?,
+            workspace_source: binding.trust_anchor().as_str().to_owned(),
+            workspace_authority: binding.authority_storage_key(),
+            workspace_principal: binding.principal_id().to_owned(),
+            workspace_project: binding.project_key().as_str().to_owned(),
+            workspace_cursor: binding.cwd_handle().as_str().to_owned(),
+            workspace_cursor_label: binding.cursor_label().map(str::to_owned),
         })
     }
 
     fn bytes(&self) -> usize {
-        self.token_usage.len() + self.metadata.len()
+        self.token_usage.len() + self.metadata.len() + self.workspace_binding.len()
     }
 }
 
@@ -2682,6 +2869,9 @@ fn migrate_to_current(
         };
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Exclusive)?;
         transaction.execute_batch(step.sql)?;
+        if step.to == 7 {
+            backfill_workspace_bindings(&transaction)?;
+        }
         transaction.pragma_update(None, "user_version", step.to)?;
         transaction.commit()?;
         current = step.to;
@@ -2692,6 +2882,38 @@ fn migrate_to_current(
         backup = %backup.display(),
         "migrated session database schema"
     );
+    Ok(())
+}
+
+fn backfill_workspace_bindings(transaction: &Transaction<'_>) -> Result<(), SessionError> {
+    let rows = {
+        let mut statement = transaction.prepare("SELECT id, cwd FROM sessions")?;
+        statement
+            .query_map([], |row| {
+                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    for (id, cwd) in rows {
+        let binding = StoredWorkspaceBinding::local_from_cwd(&cwd);
+        let serialized = serialize_json(&binding, "workspace binding", MAX_METADATA_BYTES)?;
+        transaction.execute(
+            "UPDATE sessions SET workspace_binding = ?1, workspace_source = ?2, \
+             workspace_authority = ?3, workspace_principal = ?4, workspace_project = ?5, \
+             workspace_cursor = ?6, workspace_cursor_label = ?7, \
+             logical_bytes = logical_bytes + length(CAST(?1 AS BLOB)) WHERE id = ?8",
+            params![
+                serialized,
+                binding.trust_anchor().as_str(),
+                binding.authority_storage_key(),
+                binding.principal_id(),
+                binding.project_key().as_str(),
+                binding.cwd_handle().as_str(),
+                binding.cursor_label(),
+                id,
+            ],
+        )?;
+    }
     Ok(())
 }
 
@@ -2802,6 +3024,9 @@ fn validate_scalars<M, U, T>(session: &Session<M, U, T>) -> Result<(), SessionEr
         validate_identifier("system prompt profile", profile)?;
     }
     if let Some(path) = &session.meta.plan_path {
+        validate_len("plan path", path.len(), MAX_PATH_BYTES)?;
+    }
+    if let Some(crate::sessions::StoredPlanTarget::LocalPath { path }) = &session.meta.plan_target {
         validate_len("plan path", path.len(), MAX_PATH_BYTES)?;
     }
     validate_len(
@@ -2927,8 +3152,10 @@ fn insert_root<M, U, T>(
         "INSERT INTO sessions (\
              id, format_version, title, cwd, model, created_at, updated_at, write_version,\
              logical_bytes, history_item_count, tool_output_count, subagent_item_count,\
-             token_usage, metadata\
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, ?9, ?10, ?11, ?12, ?13)",
+             token_usage, metadata, workspace_binding, workspace_source, workspace_authority,\
+             workspace_principal, workspace_project, workspace_cursor, workspace_cursor_label\
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, ?9, ?10, ?11, ?12, ?13,\
+                   ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
         params![
             session.id.as_bytes().as_slice(),
             i64::from(session.version),
@@ -2950,6 +3177,13 @@ fn insert_root<M, U, T>(
             )?,
             serialized.root.token_usage,
             serialized.root.metadata,
+            serialized.root.workspace_binding,
+            serialized.root.workspace_source,
+            serialized.root.workspace_authority,
+            serialized.root.workspace_principal,
+            serialized.root.workspace_project,
+            serialized.root.workspace_cursor,
+            serialized.root.workspace_cursor_label,
         ],
     )?;
     Ok(())
@@ -3000,13 +3234,32 @@ fn update_root_values<M, U, T>(
     logical_bytes: usize,
     expected: i64,
 ) -> Result<(), SessionError> {
+    let stored_binding: Option<String> = transaction
+        .query_row(
+            "SELECT workspace_binding FROM sessions WHERE id = ?1",
+            params![session.id.as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(stored) = stored_binding.as_deref() {
+        let stored: StoredWorkspaceBinding =
+            deserialize_json(stored, "sessions.workspace_binding")?;
+        let next: StoredWorkspaceBinding =
+            deserialize_json(&root.workspace_binding, "sessions.workspace_binding")?;
+        if !stored.same_workspace_identity(&next) {
+            return Err(SessionError::WorkspaceIdentityImmutable);
+        }
+    }
     let changed = transaction.execute(
         "UPDATE sessions SET \
              format_version = ?1, title = ?2, cwd = ?3, model = ?4,\
              created_at = ?5, updated_at = ?6, write_version = write_version + 1,\
              logical_bytes = ?7, history_item_count = ?8, tool_output_count = ?9,\
-             subagent_item_count = ?10, token_usage = ?11, metadata = ?12 \
-         WHERE id = ?13 AND write_version = ?14",
+             subagent_item_count = ?10, token_usage = ?11, metadata = ?12,\
+             workspace_binding = ?13, workspace_source = ?14, workspace_authority = ?15,\
+             workspace_principal = ?16, workspace_project = ?17, workspace_cursor = ?18,\
+             workspace_cursor_label = ?19 \
+         WHERE id = ?20 AND write_version = ?21",
         params![
             i64::from(session.version),
             session.title,
@@ -3027,6 +3280,13 @@ fn update_root_values<M, U, T>(
             )?,
             root.token_usage,
             root.metadata,
+            root.workspace_binding,
+            root.workspace_source,
+            root.workspace_authority,
+            root.workspace_principal,
+            root.workspace_project,
+            root.workspace_cursor,
+            root.workspace_cursor_label,
             session.id.as_bytes().as_slice(),
             expected,
         ],
@@ -3470,13 +3730,20 @@ mod tests {
     use super::*;
     use crate::sessions::{Session, StoredSubagentOutcome, TitleSource};
     use crate::workflow_scratch::WORKFLOW_SCRATCH_DIR;
+    use caudra_workspace::{
+        AuthenticatedPrincipalId, AuthorityIdentity, CwdHandle, ProjectIdentity, ProjectKey,
+        SessionBindingId, SessionWorkspaceBinding, SourceTrustAnchor,
+    };
     use serde::{Deserialize, Serialize};
     use serde_json::{Value, json};
     use tempfile::TempDir;
     use test_case::test_case;
 
     const CWD: &str = "/project";
+    const REMOTE_CWD: &str = ".";
+    const MISSING_LEGACY_CWD: &str = "/definitely/missing/legacy/project";
     const MODEL: &str = "test/model";
+    const NEXT_GENERATION: &str = "next-generation";
     const ARTIFACT_NAME: &str = "artifact";
     const LARGE_OUTPUT_ID: &str = "large";
     const FOREIGN_APPLICATION_ID: i64 = 1;
@@ -3502,6 +3769,16 @@ mod tests {
     const TRIM_DROPS_LARGE: &str = "trim must drop rich outputs above the threshold";
     const ARTIFACTS_REMOVED: &str = "trim must remove every artifact directory";
     const VERSION_UNCHANGED: &str = "mark_opened must not bump write_version";
+    const SESSIONS_BEFORE_WORKSPACE_BINDING: &str = r#"
+DROP INDEX sessions_workspace_updated;
+ALTER TABLE sessions DROP COLUMN workspace_cursor_label;
+ALTER TABLE sessions DROP COLUMN workspace_cursor;
+ALTER TABLE sessions DROP COLUMN workspace_project;
+ALTER TABLE sessions DROP COLUMN workspace_principal;
+ALTER TABLE sessions DROP COLUMN workspace_authority;
+ALTER TABLE sessions DROP COLUMN workspace_source;
+ALTER TABLE sessions DROP COLUMN workspace_binding;
+"#;
 
     #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
     struct TestMessage(String);
@@ -3529,6 +3806,158 @@ mod tests {
             model: Some(MODEL.into()),
             outcome,
         }
+    }
+
+    fn remote_binding(
+        source: &str,
+        principal: &str,
+        project: &str,
+        cursor: &str,
+    ) -> StoredWorkspaceBinding {
+        let authority = AuthorityIdentity::new(
+            SourceTrustAnchor::new(source).unwrap(),
+            "authority",
+            "workspace",
+            "generation",
+            "namespace",
+        )
+        .unwrap();
+        let principal = AuthenticatedPrincipalId::new(authority.clone(), principal).unwrap();
+        let project = ProjectIdentity::new(authority.clone(), ProjectKey::new(project).unwrap());
+        StoredWorkspaceBinding::new(
+            SessionWorkspaceBinding::new(
+                SessionBindingId::new(format!("binding-{source}-{cursor}")).unwrap(),
+                authority,
+                principal,
+                project,
+            )
+            .unwrap(),
+            CwdHandle::new(cursor).unwrap(),
+            Some(cursor.into()),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn workspace_lookup_separates_origin_principal_project_and_nested_cursor() {
+        let (_temp, state_dir) = state_dir();
+        let mut database = SessionDatabase::open(&state_dir).unwrap();
+        let exact = remote_binding("origin-a", "principal-a", "project", "root");
+        let nested = remote_binding("origin-a", "principal-a", "project", "nested");
+        let other_principal = remote_binding("origin-a", "principal-b", "project", "root");
+        let other_origin = remote_binding("origin-b", "principal-a", "project", "root");
+        for binding in [&exact, &nested, &other_principal, &other_origin] {
+            database
+                .save(
+                    &TestSession::new_with_workspace(MODEL, REMOTE_CWD, binding.clone()),
+                    None,
+                )
+                .unwrap();
+        }
+
+        assert_eq!(database.list_for_workspace(&exact).unwrap().len(), 1);
+        assert_eq!(database.list_for_workspace(&nested).unwrap().len(), 1);
+        assert_eq!(database.list(REMOTE_CWD).unwrap().len(), 4);
+        assert_eq!(
+            database.list_for_workspace_identity(&exact).unwrap().len(),
+            2
+        );
+    }
+
+    #[test]
+    fn workspace_lookup_separates_remote_generations_on_the_same_cursor() {
+        let (_temp, state_dir) = state_dir();
+        let mut database = SessionDatabase::open(&state_dir).unwrap();
+        let first = remote_binding("origin", "principal", "project", "cursor");
+        let second = StoredWorkspaceBinding::new(
+            first.binding().clone(),
+            first.cwd_handle().clone(),
+            Some(NEXT_GENERATION.into()),
+        )
+        .unwrap();
+        for binding in [&first, &second] {
+            database
+                .save(
+                    &TestSession::new_with_workspace(MODEL, REMOTE_CWD, binding.clone()),
+                    None,
+                )
+                .unwrap();
+        }
+
+        assert_eq!(database.list_for_workspace(&first).unwrap().len(), 1);
+        assert_eq!(database.list_for_workspace(&second).unwrap().len(), 1);
+        assert!(!first.exact_scope_eq(&second));
+    }
+
+    #[test]
+    fn a_saved_workspace_identity_cannot_be_replaced() {
+        let (_temp, state_dir) = state_dir();
+        let mut database = SessionDatabase::open(&state_dir).unwrap();
+        let mut session = TestSession::new_with_workspace(
+            MODEL,
+            REMOTE_CWD,
+            remote_binding("origin", "principal", "project", "cursor"),
+        );
+        let cursor = database.save(&session, None).unwrap();
+        session.workspace_binding = Some(Box::new(remote_binding(
+            "changed-origin",
+            "principal",
+            "project",
+            "cursor",
+        )));
+
+        assert!(matches!(
+            database.save(&session, Some(&cursor)),
+            Err(SessionError::WorkspaceIdentityImmutable)
+        ));
+    }
+
+    #[test_case("/client/canary")]
+    #[test_case("../escape")]
+    #[test_case("nested/../../escape")]
+    fn remote_cwd_persistence_rejects_host_paths_and_traversal(cwd: &str) {
+        let (_temp, state_dir) = state_dir();
+        let mut database = SessionDatabase::open(&state_dir).unwrap();
+        let session = TestSession::new_with_workspace(
+            MODEL,
+            cwd,
+            remote_binding("origin", "principal", "project", "cursor"),
+        );
+        assert!(matches!(
+            database.save(&session, None),
+            Err(SessionError::InvalidRemoteCwd)
+        ));
+        assert!(database.list(cwd).unwrap().is_empty());
+    }
+
+    #[test]
+    fn fresh_cursor_is_persisted_but_workspace_generation_is_immutable() {
+        let (_temp, state_dir) = state_dir();
+        let mut database = SessionDatabase::open(&state_dir).unwrap();
+        let old = remote_binding("origin", "principal", "project", "cursor");
+        let mut session = TestSession::new_with_workspace(MODEL, REMOTE_CWD, old.clone());
+        let cursor = database.save(&session, None).unwrap();
+        let fresh = remote_binding("origin", "principal", "project", "nested");
+        session.replace_workspace_cursor(fresh.clone()).unwrap();
+        session.set_cwd("nested".into());
+        let cursor = database.save(&session, Some(&cursor)).unwrap();
+        assert_eq!(database.list_for_workspace_identity(&old).unwrap().len(), 1);
+        assert_eq!(database.list_for_workspace(&fresh).unwrap().len(), 1);
+        let serialized = serde_json::to_string(&fresh)
+            .unwrap()
+            .replace("\"generation\"", "\"changed-generation\"");
+        let changed: StoredWorkspaceBinding = serde_json::from_str(&serialized).unwrap();
+        session.workspace_binding = Some(Box::new(changed.clone()));
+        assert!(matches!(
+            database.save(&session, Some(&cursor)),
+            Err(SessionError::WorkspaceIdentityImmutable)
+        ));
+        assert!(
+            database
+                .list_for_workspace_identity(&changed)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -4402,6 +4831,9 @@ mod tests {
         connection.execute_batch("VACUUM").unwrap();
         connection.execute_batch(SCHEMA).unwrap();
         connection
+            .execute_batch(SESSIONS_BEFORE_WORKSPACE_BINDING)
+            .unwrap();
+        connection
             .execute_batch(MODEL_USAGE_BEFORE_SUBSCRIPTION)
             .unwrap();
         connection
@@ -4413,8 +4845,12 @@ mod tests {
             .execute(
                 "INSERT INTO sessions (id, format_version, title, cwd, model, created_at,\
                  updated_at, token_usage, metadata) \
-                 VALUES (?1, ?2, 'kept', '/repo', 'm', 1, 1, '{}', '{}')",
-                params![id.as_bytes().as_slice(), i64::from(SESSION_VERSION)],
+                 VALUES (?1, ?2, 'kept', ?3, 'm', 1, 1, '{}', '{}')",
+                params![
+                    id.as_bytes().as_slice(),
+                    i64::from(SESSION_VERSION),
+                    MISSING_LEGACY_CWD
+                ],
             )
             .unwrap();
         drop(connection);
@@ -4431,6 +4867,11 @@ mod tests {
         assert_eq!(database.stats().unwrap().schema_version, SCHEMA_VERSION);
         assert_eq!(database.persisted_session_ids().unwrap(), vec![id]);
         assert_eq!(database.usage_buckets(None).unwrap(), Vec::new());
+        let loaded = database.load::<TestMessage, Value, Value>(id).unwrap();
+        assert_eq!(
+            loaded.workspace_binding(),
+            Some(&StoredWorkspaceBinding::local_from_cwd(MISSING_LEGACY_CWD))
+        );
     }
 
     /// [`SCHEMA`] is always current, so a seeded old database has to give back
@@ -4451,6 +4892,9 @@ mod tests {
             .unwrap();
         connection.execute_batch("VACUUM").unwrap();
         connection.execute_batch(SCHEMA).unwrap();
+        connection
+            .execute_batch(SESSIONS_BEFORE_WORKSPACE_BINDING)
+            .unwrap();
         connection
             .execute_batch(MODEL_USAGE_BEFORE_SUBSCRIPTION)
             .unwrap();
@@ -4527,6 +4971,9 @@ mod tests {
             .unwrap();
         connection.execute_batch("VACUUM").unwrap();
         connection.execute_batch(SCHEMA).unwrap();
+        connection
+            .execute_batch(SESSIONS_BEFORE_WORKSPACE_BINDING)
+            .unwrap();
         connection.execute_batch(USAGE_LEDGER_TABLE).unwrap();
         connection
             .pragma_update(None, "application_id", APPLICATION_ID)
@@ -4548,6 +4995,9 @@ mod tests {
             .unwrap();
         connection.execute_batch("VACUUM").unwrap();
         connection.execute_batch(SCHEMA).unwrap();
+        connection
+            .execute_batch(SESSIONS_BEFORE_WORKSPACE_BINDING)
+            .unwrap();
         connection.execute_batch(USAGE_LEDGER_TABLE).unwrap();
         connection.execute_batch(WORKFLOW_TABLES).unwrap();
         connection
@@ -4566,7 +5016,16 @@ mod tests {
             )
             .unwrap();
         statement
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .query_map([], |row| {
+                let kind = row.get(0)?;
+                let name: String = row.get(1)?;
+                let sql = if name == "sessions" {
+                    Some("<current sessions schema>".to_owned())
+                } else {
+                    row.get(2)?
+                };
+                Ok((kind, name, sql))
+            })
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap()

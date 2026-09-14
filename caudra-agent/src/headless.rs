@@ -1,7 +1,8 @@
 use std::borrow::Cow;
 use std::collections::HashSet;
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use async_lock::Mutex;
@@ -19,12 +20,20 @@ use caudra_providers::{
 };
 use caudra_storage::StateDir;
 use caudra_storage::id::{CaudraId, SessionRef};
+use caudra_storage::local_documents::LocalDocumentStore;
 use caudra_storage::permission_state::PermissionRuleRecord;
 use caudra_storage::sessions::{
-    SessionCursor, SessionDatabase, SessionLease, StoredSubagent, StoredSubagentOutcome,
+    SessionCursor, SessionDatabase, SessionLease, StoredMode, StoredPlanTarget, StoredSubagent,
+    StoredSubagentOutcome,
 };
+use caudra_storage::workspace_binding::StoredWorkspaceBinding;
 use caudra_workflow::{RunSnapshot, WorkflowRequest, WorkflowResponse};
+use caudra_workspace::{
+    CommandText, DirectoryNavigation, ExecRequest, LocalDocumentRef, OperationProgressKind,
+    OperationState, OperationStatus, WorkspaceCursor, WorkspaceError, WorkspaceSession,
+};
 use flume::Receiver;
+use serde::Deserialize;
 use serde_json::Value;
 use tracing::{error, warn};
 
@@ -42,18 +51,26 @@ use crate::tools::{
     BuiltinDeferral, DeferralSession, DeferredTool, DescriptionContext, FileReadTracker,
     LocalTools, PathLocks, ToolAudience, ToolDefinitions, ToolFilter, ToolRegistry, deferral,
 };
-use crate::workflow::{RuntimeDeps, WorkflowHandle, WorkflowRuntime};
+use crate::workflow::{RuntimeDeps, WorkflowHandle, WorkflowRuntime, WorkspaceRebind};
 use crate::{
     Agent, AgentConfig, AgentError, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams,
-    DoneReason, Envelope, EventSender, GoalHandle, ImageSource, McpHandle, McpSession,
-    PermissionsConfig, SessionMailbox, StoredSession, SubagentHistorySnapshot,
-    SubagentHistoryStore, ToolOutput, ToolOutputLines, open_stored_session,
+    BaselineGate, DoneReason, Envelope, EventSender, GoalHandle, ImageSource, McpHandle,
+    McpSession, PermissionsConfig, SessionMailbox, StoredSession, SubagentHistorySnapshot,
+    SubagentHistoryStore, ToolOutput, ToolOutputLines, WorkspaceBaseline, open_stored_session,
 };
 
 /// Bytes of a run's report or result carried into the next prompt.
 const COMPLETION_TEXT_LIMIT: usize = 8 * 1024;
 const TRUNCATED_SUFFIX: &str = "…[truncated]";
 const COMPLETION_SEPARATOR: &str = "\n\n";
+const REMOTE_COMMAND_TIMEOUT: Duration = Duration::from_secs(300);
+const REMOTE_COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const REMOTE_COMMAND_PROGRESS_GAP: &str = "[remote progress gap]";
+const REMOTE_COMMAND_CANCELLED: &str = "Remote command cancelled";
+const REMOTE_COMMAND_FAILED: &str = "Remote command failed";
+const REMOTE_COMMAND_INDETERMINATE: &str =
+    "Remote command outcome is indeterminate; it will not be retried";
+const REMOTE_COMMAND_TRUNCATED: &str = "[truncated]";
 
 struct SessionStore {
     dir: StateDir,
@@ -67,14 +84,22 @@ struct SessionStore {
 }
 
 impl SessionStore {
+    fn history_head(&self) -> Option<CaudraId> {
+        self.session
+            .meta
+            .history_head
+            .or_else(|| self.session.messages().last().map(|item| item.id))
+    }
+
     fn open(
         session_id: CaudraId,
         cwd: &str,
         model_spec: &str,
         lease: Arc<SessionLease>,
+        workspace_binding: Option<&StoredWorkspaceBinding>,
     ) -> Result<Self, caudra_storage::sessions::SessionError> {
         let dir = StateDir::resolve()?;
-        Self::open_in_with_lease(dir, session_id, cwd, model_spec, lease)
+        Self::open_in_with_lease(dir, session_id, cwd, model_spec, lease, workspace_binding)
     }
 
     #[cfg(test)]
@@ -85,7 +110,7 @@ impl SessionStore {
         model_spec: &str,
     ) -> Result<Self, caudra_storage::sessions::SessionError> {
         let lease = Arc::new(SessionLease::acquire(&dir, session_id)?);
-        Self::open_in_with_lease(dir, session_id, cwd, model_spec, lease)
+        Self::open_in_with_lease(dir, session_id, cwd, model_spec, lease, None)
     }
 
     fn open_in_with_lease(
@@ -94,14 +119,27 @@ impl SessionStore {
         cwd: &str,
         model_spec: &str,
         lease: Arc<SessionLease>,
+        workspace_binding: Option<&StoredWorkspaceBinding>,
     ) -> Result<Self, caudra_storage::sessions::SessionError> {
         lease.validate(&dir, session_id)?;
         match open_stored_session(session_id, &dir) {
-            Ok(session) => Ok(Self::from_session(dir, session, false, lease)),
+            Ok(mut session) => {
+                StoredWorkspaceBinding::validate_resume(
+                    session.workspace_binding(),
+                    workspace_binding,
+                )?;
+                if let Some(binding) = workspace_binding.filter(|binding| !binding.is_local()) {
+                    session.replace_workspace_cursor(binding.clone())?;
+                }
+                Ok(Self::from_session(dir, session, false, lease))
+            }
             Err(caudra_storage::sessions::SessionError::Storage(
                 caudra_storage::StorageError::NotFound(_),
             )) => {
-                let mut session = StoredSession::new(model_spec, cwd);
+                let mut session = workspace_binding.map_or_else(
+                    || StoredSession::new(model_spec, cwd),
+                    |binding| StoredSession::new_with_workspace(model_spec, cwd, binding.clone()),
+                );
                 session.id = session_id;
                 let mut store = Self::from_session(dir, session, true, lease);
                 store.save()?;
@@ -243,6 +281,26 @@ impl SessionStore {
         }
     }
 
+    fn set_mode(&mut self, mode: &AgentMode) {
+        match mode {
+            AgentMode::Build => self.session.meta.mode = Some(StoredMode::Build),
+            AgentMode::Plan(path) => {
+                let path = path.to_string_lossy().into_owned();
+                self.session.meta.mode = Some(StoredMode::Plan);
+                self.session.meta.plan_path = Some(path.clone());
+                self.session.meta.plan_target = Some(StoredPlanTarget::LocalPath { path });
+            }
+            AgentMode::RemotePlan(reference) => {
+                self.session.meta.mode = Some(StoredMode::Plan);
+                self.session.meta.plan_path = None;
+                self.session.meta.plan_target = Some(StoredPlanTarget::PlanRef {
+                    reference: reference.clone(),
+                });
+            }
+            AgentMode::ReadOnly => {}
+        }
+    }
+
     fn verify_start_version(
         &self,
         expected_write_version: Option<i64>,
@@ -359,6 +417,25 @@ impl SessionStore {
                 self.session.set_title_if_auto(title.clone());
             }
             AgentEvent::ToolDone(done) => {
+                let local_plan_written = self
+                    .session
+                    .meta
+                    .plan_target
+                    .as_ref()
+                    .and_then(|target| match target {
+                        StoredPlanTarget::PlanRef { reference } => {
+                            Some(LocalDocumentRef::Plan(reference.clone()))
+                        }
+                        StoredPlanTarget::LocalPath { .. } => None,
+                    })
+                    .is_some_and(|reference| done.wrote_document(&reference));
+                let local_path_written = self
+                    .session
+                    .meta
+                    .plan_path
+                    .as_deref()
+                    .is_some_and(|path| done.wrote_to(Path::new(path)));
+                self.session.meta.plan_written |= local_plan_written || local_path_written;
                 self.session
                     .insert_tool_output(done.id.clone(), done.output.clone());
                 let mut subagents = self.session.subagents().to_vec();
@@ -611,6 +688,355 @@ pub struct HeadlessParams {
     pub model_policy: Arc<ModelPolicy>,
     pub plugin_rules: Arc<PluginRuleStore>,
     pub goal: GoalHandle,
+    pub remote_environment: Option<RemoteEnvironment>,
+    pub workspace_session: Option<WorkspaceSession>,
+    pub remote_project_context: Option<Arc<crate::remote_project_context::RemoteProjectContext>>,
+    pub local_documents: Option<Arc<LocalDocumentStore>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteEnvironment {
+    pub cwd: String,
+    pub platform: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteCommandOutput {
+    pub output: String,
+    pub is_error: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RemoteCommandResult {
+    exit_code: Option<i32>,
+    signal: Option<i32>,
+    timed_out: bool,
+    output_limit_exceeded: bool,
+    stdout: String,
+    stderr: String,
+}
+
+struct BoundedRemoteOutput {
+    text: String,
+    max_lines: usize,
+    max_bytes: usize,
+    lines: usize,
+    ends_with_newline: bool,
+    truncated: bool,
+}
+
+impl BoundedRemoteOutput {
+    fn new(max_lines: usize, max_bytes: usize) -> Self {
+        Self {
+            text: String::new(),
+            max_lines: max_lines.max(1),
+            max_bytes: max_bytes.max(1),
+            lines: 0,
+            ends_with_newline: false,
+            truncated: false,
+        }
+    }
+
+    fn push(&mut self, text: &str) {
+        if self.truncated {
+            return;
+        }
+        for character in text.chars() {
+            let starts_line = self.text.is_empty() || self.ends_with_newline;
+            if self.text.len().saturating_add(character.len_utf8()) > self.max_bytes
+                || self.lines + usize::from(starts_line) > self.max_lines
+            {
+                self.truncated = true;
+                return;
+            }
+            self.text.push(character);
+            if starts_line {
+                self.lines += 1;
+            }
+            self.ends_with_newline = character == '\n';
+        }
+    }
+
+    fn finish(mut self) -> String {
+        if self.truncated {
+            self.marker(REMOTE_COMMAND_TRUNCATED);
+        }
+        self.text
+    }
+
+    fn marker(&mut self, marker: &str) {
+        let separator = usize::from(!self.text.is_empty() && !self.text.ends_with('\n'));
+        while self
+            .text
+            .len()
+            .saturating_add(separator)
+            .saturating_add(marker.len())
+            > self.max_bytes
+            || remote_output_line_count(&self.text)
+                .saturating_add(separator)
+                .saturating_add(1)
+                > self.max_lines
+        {
+            if self.text.pop().is_none() {
+                break;
+            }
+        }
+        if !self.text.is_empty() && !self.text.ends_with('\n') {
+            self.text.push('\n');
+        }
+        let remaining = self.max_bytes.saturating_sub(self.text.len());
+        self.text.extend(marker.chars().take(remaining));
+        self.truncated = false;
+    }
+}
+
+fn remote_output_line_count(text: &str) -> usize {
+    if text.is_empty() {
+        return 0;
+    }
+    text.bytes().filter(|byte| *byte == b'\n').count() + usize::from(!text.ends_with('\n'))
+}
+
+pub fn direct_shell_command(prompt: &str) -> Option<&str> {
+    let command = prompt
+        .strip_prefix("!!")
+        .or_else(|| prompt.strip_prefix('!'))?
+        .trim();
+    (!command.is_empty()).then_some(command)
+}
+
+pub async fn execute_remote_command(
+    workspace: &WorkspaceSession,
+    baseline: &WorkspaceBaseline,
+    command: &str,
+    cancel: &CancelToken,
+    max_output_lines: usize,
+    max_output_bytes: usize,
+    mut progress: impl FnMut(&str),
+) -> RemoteCommandOutput {
+    let baseline = match baseline.ensure_current().await {
+        crate::BaselineOutcome::Ready => Ok(()),
+        crate::BaselineOutcome::Unavailable(reason) => Err(reason.to_string()),
+        crate::BaselineOutcome::Failed(error) => Err(error.to_string()),
+    };
+    if let Err(output) = baseline {
+        return RemoteCommandOutput {
+            output,
+            is_error: true,
+        };
+    }
+    let result = run_remote_command(
+        workspace,
+        command,
+        cancel,
+        max_output_lines,
+        max_output_bytes,
+        &mut progress,
+    )
+    .await;
+    match result {
+        Ok(output) => RemoteCommandOutput {
+            output,
+            is_error: false,
+        },
+        Err(output) => RemoteCommandOutput {
+            output,
+            is_error: true,
+        },
+    }
+}
+
+async fn run_remote_command(
+    workspace: &WorkspaceSession,
+    command: &str,
+    cancel: &CancelToken,
+    max_output_lines: usize,
+    max_output_bytes: usize,
+    progress: &mut impl FnMut(&str),
+) -> Result<String, String> {
+    if cancel.is_cancelled() {
+        return Err(REMOTE_COMMAND_CANCELLED.into());
+    }
+    let service = workspace
+        .workspace()
+        .services()
+        .exec
+        .as_ref()
+        .ok_or_else(|| "Remote command execution is unavailable".to_owned())?;
+    let request = ExecRequest {
+        command: CommandText::new(command).map_err(|error| error.to_string())?,
+        timeout_ms: Some(REMOTE_COMMAND_TIMEOUT.as_millis() as u64),
+    };
+    let mut status = service
+        .execute(workspace.binding(), workspace.cursor(), &request)
+        .await
+        .map_err(remote_command_error)?;
+    let mut output = BoundedRemoteOutput::new(max_output_lines, max_output_bytes);
+    let mut next_sequence = None;
+    let mut reported_gap = false;
+    let mut cancelling = cancel.is_cancelled();
+
+    loop {
+        append_remote_command_progress(&status, &mut output, &mut next_sequence, &mut reported_gap);
+        if !output.text.is_empty() {
+            progress(&output.text);
+        }
+        match &status.state {
+            OperationState::Completed { result, .. } => {
+                let terminal = remote_command_terminal(result, output)?;
+                progress(&terminal);
+                return Ok(terminal);
+            }
+            OperationState::Failed { .. } => {
+                output.marker(REMOTE_COMMAND_FAILED);
+                return Err(output.finish());
+            }
+            OperationState::Cancelled {
+                side_effects_possible,
+            } => {
+                output.marker(if *side_effects_possible {
+                    REMOTE_COMMAND_INDETERMINATE
+                } else {
+                    REMOTE_COMMAND_CANCELLED
+                });
+                return Err(output.finish());
+            }
+            OperationState::Indeterminate { .. }
+            | OperationState::Forgotten
+            | OperationState::NeverSeen => {
+                output.marker(REMOTE_COMMAND_INDETERMINATE);
+                return Err(output.finish());
+            }
+            OperationState::Prepared => {
+                output.marker("Remote command did not start");
+                return Err(output.finish());
+            }
+            OperationState::Running => {}
+        }
+
+        if cancelling {
+            let _ = service
+                .cancel(workspace.binding(), workspace.cursor(), &status.handle)
+                .await;
+            status = service
+                .status(workspace.binding(), workspace.cursor(), &status.handle)
+                .await
+                .map_err(remote_command_error)?;
+            smol::Timer::after(REMOTE_COMMAND_POLL_INTERVAL).await;
+            continue;
+        }
+        match cancel
+            .race(async {
+                smol::Timer::after(REMOTE_COMMAND_POLL_INTERVAL).await;
+                service
+                    .status(workspace.binding(), workspace.cursor(), &status.handle)
+                    .await
+            })
+            .await
+        {
+            Ok(result) => status = result.map_err(remote_command_error)?,
+            Err(_) => cancelling = true,
+        }
+    }
+}
+
+fn append_remote_command_progress(
+    status: &OperationStatus<Value>,
+    output: &mut BoundedRemoteOutput,
+    next_sequence: &mut Option<u64>,
+    reported_gap: &mut bool,
+) {
+    let first = status.progress_metadata.first_retained_sequence;
+    let gap = status.progress_metadata.gap_before_first
+        || next_sequence
+            .zip(first)
+            .is_some_and(|(expected, actual)| actual > expected);
+    if gap && !*reported_gap {
+        output.push(REMOTE_COMMAND_PROGRESS_GAP);
+        output.push("\n");
+        *reported_gap = true;
+    }
+    if next_sequence.is_none() {
+        *next_sequence = first;
+    }
+    for item in &status.progress {
+        if next_sequence.is_some_and(|expected| item.sequence < expected) {
+            continue;
+        }
+        if next_sequence.is_some_and(|expected| item.sequence > expected) && !*reported_gap {
+            output.push(REMOTE_COMMAND_PROGRESS_GAP);
+            output.push("\n");
+            *reported_gap = true;
+        }
+        *next_sequence = Some(item.sequence.saturating_add(1));
+        match &item.kind {
+            OperationProgressKind::Stdout | OperationProgressKind::Stderr => {
+                output.push(&item.chunk)
+            }
+            OperationProgressKind::Started
+            | OperationProgressKind::Exited
+            | OperationProgressKind::Unknown(_)
+                if !item.chunk.is_empty() =>
+            {
+                output.push("[");
+                output.push(&item.chunk);
+                output.push("]\n");
+            }
+            OperationProgressKind::Started
+            | OperationProgressKind::Exited
+            | OperationProgressKind::Unknown(_) => {}
+        }
+    }
+}
+
+fn remote_command_terminal(
+    value: &Value,
+    mut output: BoundedRemoteOutput,
+) -> Result<String, String> {
+    let result: RemoteCommandResult = serde_json::from_value(value.clone())
+        .map_err(|_| "Remote command returned an invalid result".to_owned())?;
+    if output.text.is_empty() {
+        output.push(&result.stdout);
+        output.push(&result.stderr);
+    }
+    let mut statuses = Vec::new();
+    if result.timed_out {
+        statuses.push("timed out".to_owned());
+    }
+    if result.output_limit_exceeded {
+        statuses.push("output limit exceeded".to_owned());
+    }
+    if let Some(code) = result.exit_code {
+        statuses.push(format!("exit code {code}"));
+    } else if let Some(signal) = result.signal {
+        statuses.push(format!("signal {signal}"));
+    } else if statuses.is_empty() {
+        statuses.push("exit unknown".to_owned());
+    }
+    output.push("\n[shell status: ");
+    output.push(&statuses.join("; "));
+    output.push("]");
+    let output = output.finish();
+    if result.exit_code == Some(0) && !result.timed_out && !result.output_limit_exceeded {
+        Ok(output)
+    } else {
+        Err(output)
+    }
+}
+
+fn remote_command_error(error: WorkspaceError) -> String {
+    match error {
+        WorkspaceError::PolicyDenied | WorkspaceError::PermissionDenied => {
+            "Remote command was denied by policy".into()
+        }
+        WorkspaceError::Cancelled => REMOTE_COMMAND_CANCELLED.into(),
+        WorkspaceError::IndeterminateOutcome => REMOTE_COMMAND_INDETERMINATE.into(),
+        WorkspaceError::PendingOperation { .. } => {
+            "Remote command is blocked by a pending remote operation".into()
+        }
+        _ => "Remote command execution failed".into(),
+    }
 }
 
 pub struct HeadlessHandle {
@@ -636,6 +1062,8 @@ struct TaskDescriptionContext<'a> {
     thinking: &'a crate::ThinkingConfig,
     model_policy: &'a ModelPolicy,
     timeouts: Timeouts,
+    remote_workspace: bool,
+    remote_project_context: Option<&'a Arc<crate::remote_project_context::RemoteProjectContext>>,
 }
 
 fn setup(
@@ -644,9 +1072,21 @@ fn setup(
     excluded_tools: &[&'static str],
     workflows_available: bool,
     task: TaskDescriptionContext<'_>,
+    remote_environment: Option<&RemoteEnvironment>,
+    remote_workspace: bool,
 ) -> AgentSetup {
-    let vars = template::env_vars();
-    let instructions = agent::load_instructions(&vars.apply("{cwd}"));
+    let vars = if let Some(environment) = remote_environment {
+        template::env_vars()
+            .set("{cwd}", environment.cwd.clone())
+            .set("{platform}", environment.platform.clone())
+    } else {
+        template::env_vars()
+    };
+    let instructions = match task.remote_project_context {
+        Some(context) => agent::load_remote_instructions(context),
+        None if remote_environment.is_none() => agent::load_instructions(&vars.apply("{cwd}")),
+        None => agent::Instructions::default(),
+    };
     let definitions = tool_definitions(
         &vars,
         model,
@@ -662,12 +1102,13 @@ fn setup(
         instructions,
         tools: definitions.declared,
         deferred: definitions.deferred,
-        tool_filter: ToolFilter::from_config(config, model, excluded_tools),
+        tool_filter: ToolFilter::from_config(config, model, excluded_tools)
+            .for_remote_workspace(remote_workspace),
     }
 }
 
 fn main_turn_purpose(mode: &AgentMode) -> Option<ModelPurpose> {
-    matches!(mode, AgentMode::Plan(_)).then_some(ModelPurpose::Plan)
+    mode.is_planning().then_some(ModelPurpose::Plan)
 }
 
 async fn resolve_main_turn_model(
@@ -711,7 +1152,8 @@ fn tool_definitions(
     workflows_available: bool,
     task: TaskDescriptionContext<'_>,
 ) -> ToolDefinitions {
-    let filter = ToolFilter::from_config(config, model, excluded_tools);
+    let filter = ToolFilter::from_config(config, model, excluded_tools)
+        .for_remote_workspace(task.remote_workspace);
     let bindings = task.prompt_profiles.bind_for_tasks(
         model,
         task.chat_model,
@@ -784,14 +1226,31 @@ pub fn spawn(mut params: HeadlessParams) -> HeadlessHandle {
             thinking: &params.thinking,
             model_policy: &params.model_policy,
             timeouts: params.timeouts,
+            remote_workspace: params.workspace_session.is_some(),
+            remote_project_context: params.remote_project_context.as_ref(),
         },
+        params.remote_environment.as_ref(),
+        params.workspace_session.is_some(),
     );
 
-    let system = agent::build_system_prompt(
-        &instructions.text,
-        &params.prompt_slots,
-        &tool_filter,
-        params.system_prompt_profile.as_deref(),
+    let system = params.local_documents.as_ref().map_or_else(
+        || {
+            agent::build_system_prompt(
+                &instructions.text,
+                &params.prompt_slots,
+                &tool_filter,
+                params.system_prompt_profile.as_deref(),
+            )
+        },
+        |store| {
+            agent::build_system_prompt_for_remote(
+                &instructions.text,
+                &params.prompt_slots,
+                &tool_filter,
+                params.system_prompt_profile.as_deref(),
+                store,
+            )
+        },
     );
 
     let mcp = params
@@ -833,6 +1292,60 @@ pub fn spawn(mut params: HeadlessParams) -> HeadlessHandle {
                 };
             let error_tx = event_tx.clone();
             let mut history = History::new(Vec::new());
+            let permissions = Arc::new(PermissionManager::new_persistent(
+                params.permissions_config,
+                working_dir_path,
+                params.plugin_rules,
+            ));
+            if let Err(error) = permissions.replace_remote_permission_asset(
+                params
+                    .remote_project_context
+                    .as_ref()
+                    .and_then(|context| context.permissions()),
+            ) {
+                let _ = error_tx.send(AgentEvent::Error {
+                    message: format!("Remote permission policy unavailable: {error}"),
+                });
+                return;
+            }
+            let workspace_baseline = match params.workspace_session.as_ref() {
+                Some(workspace) => {
+                    let binding = match StoredWorkspaceBinding::new_with_cursor(
+                        workspace.binding().clone(),
+                        workspace.cursor().clone(),
+                        None,
+                    ) {
+                        Ok(binding) => binding,
+                        Err(error) => {
+                            let _ = error_tx.send(AgentEvent::Error {
+                                message: format!(
+                                    "Remote workspace snapshot identity is invalid: {error}"
+                                ),
+                            });
+                            return;
+                        }
+                    };
+                    let storage = match StateDir::resolve() {
+                        Ok(storage) => storage,
+                        Err(error) => {
+                            let _ = error_tx.send(AgentEvent::Error {
+                                message: format!(
+                                    "Remote workspace snapshot storage is unavailable: {error}"
+                                ),
+                            });
+                            return;
+                        }
+                    };
+                    Some(WorkspaceBaseline::new_workspace_session(
+                        storage,
+                        session_id,
+                        workspace.clone(),
+                        binding,
+                        true,
+                    ))
+                }
+                None => None,
+            };
             let mut agent = Agent::new(
                 AgentParams {
                     provider: Arc::clone(&provider),
@@ -841,19 +1354,19 @@ pub fn spawn(mut params: HeadlessParams) -> HeadlessHandle {
                     chat_model: model,
                     config: params.config,
                     tool_output_lines: ToolOutputLines::default(),
-                    permissions: Arc::new(PermissionManager::new_persistent(
-                        params.permissions_config,
-                        working_dir_path,
-                        params.plugin_rules,
-                    )),
+                    permissions,
                     session_id: Some(session_ref_clone.clone()),
+                    workspace_session: params.workspace_session.clone(),
+                    remote_project_context: params.remote_project_context.clone(),
+                    local_documents: params.local_documents.clone(),
+                    task_environment: vars.clone(),
                     root_tool_use_id: None,
                     mailbox: Some(mailbox.clone()),
                     context_publisher: None,
                     timeouts: params.timeouts,
                     file_tracker: FileReadTracker::fresh(),
                     path_locks: PathLocks::fresh(),
-                    baseline: None,
+                    baseline: workspace_baseline.map(|baseline| BaselineGate::new(baseline, None)),
                     prompt_slots: Arc::new(params.prompt_slots),
                     prompt_profiles: Arc::clone(&params.prompt_profiles),
                     default_task_prompt_profile_name: Arc::clone(&active_prompt_profile_name),
@@ -881,11 +1394,18 @@ pub fn spawn(mut params: HeadlessParams) -> HeadlessHandle {
             .with_background_wait()
             .with_mcp(mcp);
 
-            let root = params.initial_wd.clone();
-            let mentions = mentions::scan(&params.prompt, |path| root.join(path).exists())
-                .into_iter()
-                .map(|(_, mention)| mention)
-                .collect();
+            let mentions = if params.remote_environment.is_some() {
+                mentions::scan_remote(&params.prompt)
+                    .into_iter()
+                    .map(|(_, mention)| mention)
+                    .collect()
+            } else {
+                let root = params.initial_wd.clone();
+                mentions::scan(&params.prompt, |path| root.join(path).exists())
+                    .into_iter()
+                    .map(|(_, mention)| mention)
+                    .collect()
+            };
             let result = agent
                 .run(AgentInput {
                     message: params.prompt,
@@ -955,6 +1475,11 @@ pub struct InteractiveParams {
     /// capped by the mode this returns as each of them starts. `None` leaves
     /// the `workflow` tool reporting unavailable.
     pub workflow_mode: Option<ModeResolver>,
+    pub workspace_binding: Option<StoredWorkspaceBinding>,
+    pub remote_environment: Option<RemoteEnvironment>,
+    pub workspace_session: Option<WorkspaceSession>,
+    pub remote_project_context: Option<Arc<crate::remote_project_context::RemoteProjectContext>>,
+    pub local_documents: Option<Arc<LocalDocumentStore>>,
 }
 
 pub struct InteractiveHandle {
@@ -970,7 +1495,25 @@ pub struct InteractiveHandle {
     pub permissions: Arc<PermissionManager>,
     /// The session's workflow runtime, when `workflow_mode` asked for one.
     pub workflow: Option<WorkflowHandle>,
+    workspace_change_tx: flume::Sender<WorkspaceChangeRequest>,
+    remote_workspace: Option<Arc<StdMutex<RemoteWorkspaceState>>>,
+    workspace_baseline: Option<Arc<WorkspaceBaseline>>,
     pub task: smol::Task<()>,
+}
+
+struct RemoteWorkspaceState {
+    session: WorkspaceSession,
+    binding: StoredWorkspaceBinding,
+    cwd: String,
+}
+
+struct WorkspaceChangeRequest {
+    previous: WorkspaceCursor,
+    session: WorkspaceSession,
+    binding: StoredWorkspaceBinding,
+    context: Arc<crate::remote_project_context::RemoteProjectContext>,
+    cwd: String,
+    response: flume::Sender<Result<(), String>>,
 }
 
 type LiveModel = (Arc<dyn Provider>, Arc<Model>);
@@ -994,6 +1537,45 @@ impl InteractiveModelRoute {
 }
 
 impl InteractiveHandle {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn for_test(
+        session_lease: Arc<SessionLease>,
+        permissions: Arc<PermissionManager>,
+        answer_tx: flume::Sender<String>,
+    ) -> Self {
+        Self {
+            event_rx: flume::unbounded().1,
+            tool_names: Vec::new(),
+            input_tx: flume::unbounded().0,
+            answer_tx,
+            cancel_tx: flume::unbounded().0,
+            model_tx: flume::unbounded().0,
+            model_route: None,
+            session_id: SessionRef::from(session_lease.id()),
+            session_lease,
+            permissions,
+            workflow: None,
+            workspace_change_tx: flume::unbounded().0,
+            remote_workspace: None,
+            workspace_baseline: None,
+            task: smol::spawn(async {}),
+        }
+    }
+    pub fn remote_cwd(&self) -> Option<String> {
+        self.remote_workspace
+            .as_ref()
+            .and_then(|state| state.lock().ok().map(|state| state.cwd.clone()))
+    }
+    pub fn remote_workspace_session(&self) -> Option<WorkspaceSession> {
+        self.remote_workspace
+            .as_ref()
+            .and_then(|state| state.lock().ok().map(|state| state.session.clone()))
+    }
+
+    pub fn remote_workspace_baseline(&self) -> Option<Arc<WorkspaceBaseline>> {
+        self.workspace_baseline.clone()
+    }
+
     pub async fn set_model(&self, model: Model) -> Result<Model, AgentError> {
         let model = match &self.model_route {
             Some(route) => route.set(model).await?,
@@ -1003,6 +1585,77 @@ impl InteractiveHandle {
             .send(model.clone())
             .map_err(|_| AgentError::Channel)?;
         Ok(model)
+    }
+
+    pub async fn change_remote_directory(&self, path: &str) -> Result<String, String> {
+        let state = self
+            .remote_workspace
+            .as_ref()
+            .ok_or_else(|| "cd: remote workspace is unavailable".to_owned())?;
+        let (workspace, stored_binding) = {
+            let state = state
+                .lock()
+                .map_err(|_| "cd: remote workspace state is unavailable".to_owned())?;
+            (state.session.clone(), state.binding.clone())
+        };
+        let path = DirectoryNavigation::new(path)
+            .map_err(|_| "cd: invalid remote workspace path".to_owned())?;
+        let service = workspace
+            .workspace()
+            .services()
+            .read
+            .as_ref()
+            .ok_or_else(|| "cd: remote directory resolution is unavailable".to_owned())?;
+        let resolved = service
+            .navigate_directory(workspace.binding(), workspace.cursor(), &path)
+            .await
+            .map_err(|_| "cd: remote directory could not be resolved".to_owned())?;
+        let cwd = resolved
+            .resource
+            .path
+            .as_ref()
+            .map(ToString::to_string)
+            .ok_or_else(|| "cd: remote directory response is invalid".to_owned())?;
+        let workspace = workspace
+            .with_cursor(resolved)
+            .map_err(|_| "cd: remote directory response is invalid or stale".to_owned())?;
+        let binding = stored_binding
+            .with_cursor(workspace.cursor().clone())
+            .map_err(|_| "cd: remote workspace identity changed".to_owned())?;
+        let context =
+            match crate::remote_project_context::load_remote_project_context(&workspace).await {
+                Ok(context) => context,
+                Err(_) => {
+                    return Err("cd: remote project context could not be refreshed".to_owned());
+                }
+            };
+        let (response, received) = flume::bounded(1);
+        self.workspace_change_tx
+            .send_async(WorkspaceChangeRequest {
+                previous: stored_binding
+                    .cursor()
+                    .ok_or("cd: remote cursor is unavailable")?
+                    .clone(),
+                session: workspace.clone(),
+                binding: binding.clone(),
+                context,
+                cwd: cwd.clone(),
+                response,
+            })
+            .await
+            .map_err(|_| "cd: session is no longer running".to_owned())?;
+        received
+            .recv_async()
+            .await
+            .map_err(|_| "cd: session is no longer running".to_owned())??;
+        Ok(cwd)
+    }
+
+    pub async fn remote_control(&self, args: &str) -> Result<String, String> {
+        let workspace = self
+            .remote_workspace_session()
+            .ok_or_else(|| "Remote workspace control is unavailable".to_owned())?;
+        caudra_workspace::execute_workspace_control(&workspace, args).await
     }
 }
 
@@ -1016,6 +1669,7 @@ pub struct PreparedInteractive {
     model: Model,
     provider: Arc<dyn Provider>,
     store: SessionStore,
+    workspace_baseline: Option<Arc<WorkspaceBaseline>>,
 }
 
 impl PreparedInteractive {
@@ -1027,6 +1681,11 @@ impl PreparedInteractive {
 pub async fn prepare_interactive(
     mut params: InteractiveParams,
 ) -> Result<PreparedInteractive, InteractiveStartError> {
+    if params.remote_environment.is_some() != params.workspace_session.is_some() {
+        return Err(InteractiveStartError(
+            "remote workspace and environment must be supplied together".into(),
+        ));
+    }
     let history = History::restored(std::mem::take(&mut params.initial_history))
         .map_err(|error| InteractiveStartError(format!("Failed to restore history: {error}")))?;
     let mut model = params.model.clone();
@@ -1036,13 +1695,60 @@ pub async fn prepare_interactive(
         .map_err(|error| InteractiveStartError(error.user_message()))?;
     let working_dir = params.initial_wd.to_string_lossy().into_owned();
     let session_id = params.session_id.id();
-    let mut store = SessionStore::open(
-        session_id,
-        &working_dir,
-        &model.spec(),
-        Arc::clone(&params.session_lease),
-    )
-    .map_err(|error| InteractiveStartError(format!("Session persistence unavailable: {error}")))?;
+    let mut store = if let Some(workspace) = params.workspace_session.clone() {
+        let dir = StateDir::resolve().map_err(|error| InteractiveStartError(error.to_string()))?;
+        params
+            .session_lease
+            .validate(&dir, session_id)
+            .map_err(|error| InteractiveStartError(error.to_string()))?;
+        let mut session = match crate::load_stored_session(session_id, &dir) {
+            Ok(session) => session,
+            Err(caudra_storage::sessions::SessionError::Storage(
+                caudra_storage::StorageError::NotFound(_),
+            )) => {
+                let binding = params.workspace_binding.clone().ok_or_else(|| {
+                    InteractiveStartError("remote workspace binding missing".into())
+                })?;
+                let mut session =
+                    StoredSession::new_with_workspace(&model.spec(), &working_dir, binding);
+                session.id = session_id;
+                session
+            }
+            Err(error) => return Err(InteractiveStartError(error.to_string())),
+        };
+        StoredWorkspaceBinding::validate_resume_identity(
+            session.workspace_binding(),
+            params.workspace_binding.as_ref(),
+        )
+        .map_err(|error| InteractiveStartError(error.to_string()))?;
+        let workspace = crate::resume_workspace_session(&mut session, &dir, &workspace)
+            .await
+            .map_err(InteractiveStartError)?;
+        params.initial_wd = session.cwd.clone().into();
+        if let Some(environment) = &mut params.remote_environment {
+            environment.cwd = session.cwd.clone();
+        }
+        params.remote_project_context = Some(
+            crate::remote_project_context::load_remote_project_context(&workspace)
+                .await
+                .map_err(|error| InteractiveStartError(error.to_string()))?,
+        );
+        params.workspace_session = Some(workspace);
+        params.workspace_binding = session.workspace_binding().cloned();
+        let created = session.persisted_write_version().is_none();
+        SessionStore::from_session(dir, session, created, Arc::clone(&params.session_lease))
+    } else {
+        SessionStore::open(
+            session_id,
+            &working_dir,
+            &model.spec(),
+            Arc::clone(&params.session_lease),
+            params.workspace_binding.as_ref(),
+        )
+        .map_err(|error| {
+            InteractiveStartError(format!("Session persistence unavailable: {error}"))
+        })?
+    };
     store
         .verify_start_version(params.expected_write_version)
         .map_err(|error| {
@@ -1052,26 +1758,59 @@ pub async fn prepare_interactive(
     store
         .save()
         .map_err(|error| InteractiveStartError(format!("Failed to persist session: {error}")))?;
+    let workspace_baseline = match (
+        params.workspace_session.clone(),
+        params.workspace_binding.clone(),
+    ) {
+        (Some(workspace), Some(binding)) => Some(WorkspaceBaseline::new_workspace_session(
+            store.dir.clone(),
+            session_id,
+            workspace,
+            binding,
+            true,
+        )),
+        (None, None) => None,
+        _ => {
+            return Err(InteractiveStartError(
+                "Remote workspace snapshot identity is unavailable".into(),
+            ));
+        }
+    };
+    if let Some(baseline) = &workspace_baseline {
+        baseline.set_current_head(store.history_head());
+        if let Some(status) = baseline.reconcile_remote_restore().await.map_err(|error| {
+            InteractiveStartError(format!("Remote snapshot recovery failed: {error}"))
+        })? {
+            return Err(InteractiveStartError(format!(
+                "Remote snapshot recovery is required before this session can mutate ({:?})",
+                status.state
+            )));
+        }
+    }
     Ok(PreparedInteractive {
         params,
         history,
         model,
         provider,
         store,
+        workspace_baseline,
     })
 }
 
-pub async fn spawn_prepared_interactive(prepared: PreparedInteractive) -> InteractiveHandle {
+pub async fn spawn_prepared_interactive(
+    prepared: PreparedInteractive,
+) -> Result<InteractiveHandle, InteractiveStartError> {
     let PreparedInteractive {
         mut params,
         mut history,
         mut model,
         mut provider,
         store,
+        workspace_baseline,
     } = prepared;
     let workflows_available = params.workflow_mode.is_some();
     let AgentSetup {
-        vars,
+        mut vars,
         instructions,
         tools,
         deferred,
@@ -1087,7 +1826,11 @@ pub async fn spawn_prepared_interactive(prepared: PreparedInteractive) -> Intera
             thinking: &params.thinking,
             model_policy: &params.model_policy,
             timeouts: params.timeouts,
+            remote_workspace: params.workspace_session.is_some(),
+            remote_project_context: params.remote_project_context.as_ref(),
         },
+        params.remote_environment.as_ref(),
+        params.workspace_session.is_some(),
     );
 
     let mut baseline = agent::InstructionBaseline::adopt(instructions, history.epoch());
@@ -1103,6 +1846,7 @@ pub async fn spawn_prepared_interactive(prepared: PreparedInteractive) -> Intera
     let session_lease = Arc::clone(&params.session_lease);
     let subagent_history = store.subagent_history.clone();
     let state_dir = store.dir.clone();
+    let initial_history_head = store.history_head();
     let store = Arc::new(Mutex::new(Some(store)));
 
     let (raw_tx, event_rx) = flume::unbounded::<Envelope>();
@@ -1111,6 +1855,18 @@ pub async fn spawn_prepared_interactive(prepared: PreparedInteractive) -> Intera
     let (answer_tx, answer_rx) = flume::unbounded::<String>();
     let (cancel_tx, cancel_rx) = flume::bounded::<()>(1);
     let (model_tx, model_rx) = flume::unbounded::<Model>();
+    let (workspace_change_tx, workspace_change_rx) = flume::unbounded::<WorkspaceChangeRequest>();
+    let remote_workspace = params
+        .workspace_session
+        .clone()
+        .zip(params.workspace_binding.clone())
+        .map(|(session, binding)| {
+            Arc::new(StdMutex::new(RemoteWorkspaceState {
+                session,
+                binding,
+                cwd: params.initial_wd.to_string_lossy().into_owned(),
+            }))
+        });
 
     let mut permissions_config = params.permissions_config;
     permissions_config.yolo |= params.yolo;
@@ -1120,6 +1876,16 @@ pub async fn spawn_prepared_interactive(prepared: PreparedInteractive) -> Intera
         Arc::clone(&params.plugin_rules),
         state_dir.clone(),
     ));
+    if let Err(error) = permissions.replace_remote_permission_asset(
+        params
+            .remote_project_context
+            .as_ref()
+            .and_then(|context| context.permissions()),
+    ) {
+        return Err(InteractiveStartError(format!(
+            "Remote permission policy unavailable: {error}"
+        )));
+    }
     permissions.load_structured_conversation_rules(std::mem::take(
         &mut params.structured_permission_rules,
     ));
@@ -1143,13 +1909,19 @@ pub async fn spawn_prepared_interactive(prepared: PreparedInteractive) -> Intera
         tool_output_lines: ToolOutputLines::default(),
         permissions: Arc::clone(&permissions),
         session_id: Some(session_ref.clone()),
+        workspace_session: params.workspace_session.clone(),
+        remote_project_context: params.remote_project_context.clone(),
+        local_documents: params.local_documents.clone(),
+        task_environment: vars.clone(),
         root_tool_use_id: None,
         mailbox: Some(SessionMailbox::register(session_id)),
         context_publisher: None,
         timeouts: params.timeouts,
         file_tracker: FileReadTracker::fresh(),
         path_locks: PathLocks::fresh(),
-        baseline: None,
+        baseline: workspace_baseline
+            .as_ref()
+            .map(|baseline| BaselineGate::new(Arc::clone(baseline), initial_history_head)),
         prompt_slots: Arc::clone(&params.prompt_slots),
         prompt_profiles: Arc::clone(&params.prompt_profiles),
         default_task_prompt_profile_name: Arc::clone(&active_prompt_profile_name),
@@ -1193,10 +1965,11 @@ pub async fn spawn_prepared_interactive(prepared: PreparedInteractive) -> Intera
             // A runtime that fails to open leaves the `workflow` tool reporting
             // unavailable rather than taking the session down.
             WorkflowRuntime::spawn(RuntimeDeps {
-                state_dir,
+                state_dir: state_dir.clone(),
                 session_id,
                 cwd: params.initial_wd.clone(),
                 user_config_dir: None,
+                remote_project_context: params.remote_project_context.clone(),
                 runner: Arc::new(SubagentTaskRunner::new(Arc::new(host))),
                 events: agent_tx.clone(),
                 mode,
@@ -1213,23 +1986,30 @@ pub async fn spawn_prepared_interactive(prepared: PreparedInteractive) -> Intera
         model: Arc::clone(&live_model),
         timeouts: params.timeouts,
     });
-    let base = AgentParams {
+    let mut base = AgentParams {
         workflow: workflow.clone(),
         ..base
     };
 
+    let handle_workspace_baseline = workspace_baseline.clone();
     let task = smol::spawn({
         let permissions = Arc::clone(&permissions);
         let workflow = workflow.clone();
         let live_model = Arc::clone(&live_model);
+        let remote_workspace = remote_workspace.clone();
         async move {
             let event_forwarder = smol::spawn({
                 let store = Arc::clone(&store);
                 let raw_tx = raw_tx.clone();
+                let workspace_baseline = workspace_baseline.clone();
                 async move {
                     while let Ok(envelope) = agent_rx.recv_async().await {
                         let persistence_error = if let Some(store) = &mut *store.lock().await {
-                            store.record_event(&envelope).err()
+                            let result = store.record_event(&envelope).err();
+                            if let Some(baseline) = &workspace_baseline {
+                                baseline.set_current_head(store.history_head());
+                            }
+                            result
                         } else {
                             None
                         };
@@ -1258,7 +2038,134 @@ pub async fn spawn_prepared_interactive(prepared: PreparedInteractive) -> Intera
             let mut run_id: u64 = 0;
             let mut acked_completions = HashSet::new();
 
-            while let Ok(mut input) = input_rx.recv_async().await {
+            loop {
+                enum NextInput {
+                    Prompt(Result<AgentInput, flume::RecvError>),
+                    Workspace(Box<Result<WorkspaceChangeRequest, flume::RecvError>>),
+                }
+                let next = futures_lite::future::race(
+                    async { NextInput::Prompt(input_rx.recv_async().await) },
+                    async {
+                        NextInput::Workspace(Box::new(workspace_change_rx.recv_async().await))
+                    },
+                )
+                .await;
+                let mut input = match next {
+                    NextInput::Prompt(Ok(input)) => input,
+                    NextInput::Prompt(Err(_)) => break,
+                    NextInput::Workspace(change) => {
+                        let Ok(change) = *change else {
+                            continue;
+                        };
+                        if !input_rx.is_empty()
+                            || params
+                                .workspace_session
+                                .as_ref()
+                                .is_none_or(|workspace| workspace.cursor() != &change.previous)
+                        {
+                            let _ = change.response.send(Err(
+                                "cd: session has queued work or its cursor changed".into(),
+                            ));
+                            continue;
+                        }
+                        let transition = match crate::workflow::prepare_workspace_transition(
+                            workflow.as_ref(),
+                            base.subagent_cancels.active_count(),
+                            WorkspaceRebind {
+                                workspace: change.session.clone(),
+                                context: Arc::clone(&change.context),
+                                cwd: change.cwd.clone(),
+                            },
+                        )
+                        .await
+                        {
+                            Ok(transition) => transition,
+                            Err(error) => {
+                                let _ = change.response.send(Err(error));
+                                continue;
+                            }
+                        };
+                        let result = if permissions
+                            .replace_remote_permission_asset(change.context.permissions())
+                            .is_err()
+                        {
+                            Err("cd: remote permission policy could not be refreshed".to_owned())
+                        } else {
+                            let persisted = if let Some(store) = &mut *store.lock().await {
+                                let previous = store.session.clone();
+                                let result = store
+                                    .session
+                                    .replace_workspace_cursor(change.binding.clone())
+                                    .and_then(|()| {
+                                        store.session.set_cwd(change.cwd.clone());
+                                        store.save()
+                                    });
+                                if result.is_err() {
+                                    store.session = previous;
+                                }
+                                result.map_err(|_| {
+                                    "cd: remote workspace cursor could not be persisted".to_owned()
+                                })
+                            } else {
+                                Err("cd: session persistence is unavailable".to_owned())
+                            };
+                            if persisted.is_ok() {
+                                if let Some(baseline) = &workspace_baseline {
+                                    baseline.rebind_workspace_session(
+                                        state_dir.clone(),
+                                        session_id,
+                                        change.session.clone(),
+                                        change.binding.clone(),
+                                    );
+                                }
+                                vars = vars.clone().set("{cwd}", change.cwd.clone());
+                                base.workspace_session = Some(change.session.clone());
+                                base.remote_project_context = Some(Arc::clone(&change.context));
+                                base.task_environment = vars.clone();
+                                params.workspace_session = Some(change.session.clone());
+                                params.remote_project_context = Some(change.context);
+                                if let Some(environment) = &mut params.remote_environment {
+                                    environment.cwd = change.cwd.clone();
+                                }
+                            }
+                            persisted
+                        };
+                        let persisted = result.is_ok();
+                        let result = match (result, transition) {
+                            (Ok(()), Some(transition)) => {
+                                transition.commit().await.map_err(|error| error.to_string())
+                            }
+                            (result, _) => result,
+                        };
+                        if result.is_ok() {
+                            if let Some(state) = &remote_workspace {
+                                match state.lock() {
+                                    Ok(mut state) => {
+                                        state.session = change.session;
+                                        state.binding = change.binding;
+                                        state.cwd = change.cwd;
+                                    }
+                                    Err(_) => {
+                                        permissions.invalidate_remote_permission_asset();
+                                        let _ = change.response.send(Err(
+                                            "remote workspace state is unavailable".into(),
+                                        ));
+                                        break;
+                                    }
+                                }
+                            }
+                        } else {
+                            permissions.invalidate_remote_permission_asset();
+                        }
+                        let fatal = persisted && result.is_err();
+                        let _ = change.response.send(result);
+                        if fatal {
+                            break;
+                        }
+                        continue;
+                    }
+                };
+                let input_mode = input.mode.clone();
                 let (trigger, cancel) = CancelToken::new();
                 let cancel_task = smol::spawn({
                     let cancel_rx = cancel_rx.clone();
@@ -1278,6 +2185,76 @@ pub async fn spawn_prepared_interactive(prepared: PreparedInteractive) -> Intera
 
                 let event_tx = EventSender::new(agent_tx.clone(), run_id);
                 let error_tx = event_tx.clone();
+
+                if let Some(workspace) = &params.workspace_session {
+                    match crate::remote_project_context::load_remote_project_context(workspace)
+                        .await
+                    {
+                        Ok(context) => {
+                            let changed =
+                                params.remote_project_context.as_ref().is_none_or(|old| {
+                                    old.manifest_revision() != context.manifest_revision()
+                                });
+                            let transition = if changed {
+                                match crate::workflow::prepare_workspace_transition(
+                                    workflow.as_ref(),
+                                    base.subagent_cancels.active_count(),
+                                    WorkspaceRebind {
+                                        workspace: workspace.clone(),
+                                        context: Arc::clone(&context),
+                                        cwd: vars.apply("{cwd}").into_owned(),
+                                    },
+                                )
+                                .await
+                                {
+                                    Ok(transition) => transition,
+                                    Err(message) => {
+                                        permissions.invalidate_remote_permission_asset();
+                                        let _ = error_tx.send(AgentEvent::Error { message });
+                                        cancel_task.cancel().await;
+                                        run_id += 1;
+                                        continue;
+                                    }
+                                }
+                            } else {
+                                None
+                            };
+                            if let Err(error) =
+                                permissions.replace_remote_permission_asset(context.permissions())
+                            {
+                                let _ = error_tx.send(AgentEvent::Error {
+                                    message: format!(
+                                        "Remote permission policy unavailable: {error}"
+                                    ),
+                                });
+                                cancel_task.cancel().await;
+                                run_id += 1;
+                                continue;
+                            }
+                            base.remote_project_context = Some(Arc::clone(&context));
+                            params.remote_project_context = Some(context);
+                            if let Some(transition) = transition
+                                && let Err(error) = transition.commit().await
+                            {
+                                let _ = error_tx.send(AgentEvent::Error {
+                                    message: error.to_string(),
+                                });
+                                cancel_task.cancel().await;
+                                run_id += 1;
+                                continue;
+                            }
+                        }
+                        Err(error) => {
+                            permissions.invalidate_remote_permission_asset();
+                            let _ = error_tx.send(AgentEvent::Error {
+                                message: format!("Remote project context unavailable: {error}"),
+                            });
+                            cancel_task.cancel().await;
+                            run_id += 1;
+                            continue;
+                        }
+                    }
+                }
 
                 if let Some(mut new_model) = model_rx
                     .try_iter()
@@ -1332,7 +2309,8 @@ pub async fn spawn_prepared_interactive(prepared: PreparedInteractive) -> Intera
                     }
                 };
                 let turn_tool_filter =
-                    ToolFilter::from_config(&params.config, &turn_model, &params.excluded_tools);
+                    ToolFilter::from_config(&params.config, &turn_model, &params.excluded_tools)
+                        .for_remote_workspace(params.workspace_session.is_some());
 
                 if let Some(workflow) = &workflow
                     && let Some(context) =
@@ -1354,21 +2332,41 @@ pub async fn spawn_prepared_interactive(prepared: PreparedInteractive) -> Intera
                         thinking: &input.thinking,
                         model_policy: &params.model_policy,
                         timeouts: params.timeouts,
+                        remote_workspace: params.workspace_session.is_some(),
+                        remote_project_context: params.remote_project_context.as_ref(),
                     },
                 );
 
                 let instructions = {
-                    let cwd = vars.apply("{cwd}").into_owned();
-                    let current = smol::unblock(move || agent::load_instructions(&cwd)).await;
+                    let current = match &params.remote_project_context {
+                        Some(context) => agent::load_remote_instructions(context),
+                        None => {
+                            let cwd = vars.apply("{cwd}").into_owned();
+                            smol::unblock(move || agent::load_instructions(&cwd)).await
+                        }
+                    };
                     baseline.drift(current, history.epoch())
                 };
 
                 let mut system = params.system_prompt_override.clone().unwrap_or_else(|| {
-                    agent::build_system_prompt(
-                        baseline.text(),
-                        &params.prompt_slots,
-                        &turn_tool_filter,
-                        params.system_prompt_profile.as_deref(),
+                    params.local_documents.as_ref().map_or_else(
+                        || {
+                            agent::build_system_prompt(
+                                baseline.text(),
+                                &params.prompt_slots,
+                                &turn_tool_filter,
+                                params.system_prompt_profile.as_deref(),
+                            )
+                        },
+                        |store| {
+                            agent::build_system_prompt_for_remote(
+                                baseline.text(),
+                                &params.prompt_slots,
+                                &turn_tool_filter,
+                                params.system_prompt_profile.as_deref(),
+                                store,
+                            )
+                        },
                     )
                 });
                 if let Some(append) = &params.append_system_prompt {
@@ -1378,6 +2376,18 @@ pub async fn spawn_prepared_interactive(prepared: PreparedInteractive) -> Intera
 
                 while answer_rx.lock().await.try_recv().is_ok() {}
 
+                let history_head = store
+                    .lock()
+                    .await
+                    .as_ref()
+                    .and_then(SessionStore::history_head);
+                if let Some(workspace_baseline) = &workspace_baseline {
+                    workspace_baseline.set_current_head(history_head);
+                }
+                base.baseline = workspace_baseline
+                    .as_ref()
+                    .map(|baseline| BaselineGate::new(Arc::clone(baseline), history_head));
+
                 let mut agent = Agent::new(
                     AgentParams {
                         provider: turn_provider,
@@ -1385,7 +2395,6 @@ pub async fn spawn_prepared_interactive(prepared: PreparedInteractive) -> Intera
                         chat_provider: Arc::clone(&provider),
                         chat_model: model.clone(),
                         tool_filter: turn_tool_filter,
-                        subagent_cancels: Arc::new(CancelMap::new()),
                         ..base.clone()
                     },
                     AgentRunParams {
@@ -1416,6 +2425,7 @@ pub async fn spawn_prepared_interactive(prepared: PreparedInteractive) -> Intera
                 }
 
                 if let Some(store) = &mut *store.lock().await {
+                    store.set_mode(&input_mode);
                     if matches!(result, Ok(DoneReason::Cancelled)) {
                         store.kill_unfinished_subagents();
                     }
@@ -1450,7 +2460,7 @@ pub async fn spawn_prepared_interactive(prepared: PreparedInteractive) -> Intera
         }
     });
 
-    InteractiveHandle {
+    Ok(InteractiveHandle {
         event_rx,
         tool_names,
         input_tx,
@@ -1462,15 +2472,18 @@ pub async fn spawn_prepared_interactive(prepared: PreparedInteractive) -> Intera
         session_lease,
         permissions,
         workflow,
+        workspace_change_tx,
+        remote_workspace,
+        workspace_baseline: handle_workspace_baseline,
         task,
-    }
+    })
 }
 
 pub async fn spawn_interactive(
     params: InteractiveParams,
 ) -> Result<InteractiveHandle, InteractiveStartError> {
     let prepared = prepare_interactive(params).await?;
-    Ok(spawn_prepared_interactive(prepared).await)
+    spawn_prepared_interactive(prepared).await
 }
 
 /// What finished since the last prompt, as one block per run for the next
@@ -1575,6 +2588,41 @@ mod tests {
     const SESSION_ID: &str = "CNK1hV6GWoysH3KQMm5wu";
     const CWD: &str = "/project";
     const MODEL_SPEC: &str = "anthropic/claude-test";
+
+    #[test_case("!pwd", Some("pwd"); "visible_command")]
+    #[test_case("!! pwd", Some("pwd"); "hidden_command")]
+    #[test_case("!  printf ok", Some("printf ok"); "extra_spacing")]
+    #[test_case("!", None; "empty_command")]
+    #[test_case("not a command", None; "ordinary_prompt")]
+    #[test_case(" !pwd", None; "leading_space")]
+    fn direct_shell_commands_require_a_nonempty_leading_sigil(
+        prompt: &str,
+        expected: Option<&str>,
+    ) {
+        assert_eq!(direct_shell_command(prompt), expected);
+    }
+
+    #[test]
+    fn remote_command_terminal_reports_nonzero_exit_without_duplicate_streams() {
+        let mut output = BoundedRemoteOutput::new(20, 1024);
+        output.push("streamed\n");
+        let result = remote_command_terminal(
+            &serde_json::json!({
+                "exitCode": 7,
+                "signal": null,
+                "timedOut": false,
+                "outputLimitExceeded": false,
+                "stdout": "duplicate stdout",
+                "stderr": "duplicate stderr"
+            }),
+            output,
+        )
+        .expect_err("nonzero exit must fail");
+
+        assert!(result.contains("streamed"));
+        assert!(result.contains("exit code 7"));
+        assert!(!result.contains("duplicate"));
+    }
 
     #[test_case(AgentMode::Build, None ; "build_uses_chat")]
     #[test_case(AgentMode::ReadOnly, None ; "read_only_uses_chat")]
@@ -1787,6 +2835,39 @@ mod tests {
         assert_eq!(loaded.model, "other/model");
     }
 
+    #[test_case(true, false)]
+    #[test_case(false, true)]
+    fn session_store_resume_rejects_cross_authority(stored_remote: bool, expected_remote: bool) {
+        let tmp = TempDir::new().unwrap();
+        let dir = StateDir::from_path(tmp.path().to_path_buf());
+        let local = StoredWorkspaceBinding::local_from_cwd(CWD);
+        let remote: StoredWorkspaceBinding = serde_json::from_str(
+            &serde_json::to_string(&local)
+                .unwrap()
+                .replace("caudra:local:v1", "https://remote.example"),
+        )
+        .unwrap();
+        let mut session = StoredSession::new_with_workspace(
+            MODEL_SPEC,
+            ".",
+            if stored_remote { remote.clone() } else { local },
+        );
+        session.save(&dir).unwrap();
+        let lease = Arc::new(SessionLease::acquire(&dir, session.id).unwrap());
+        let result = SessionStore::open_in_with_lease(
+            dir,
+            session.id,
+            CWD,
+            MODEL_SPEC,
+            lease,
+            expected_remote.then_some(&remote),
+        );
+        assert!(matches!(
+            result,
+            Err(caudra_storage::sessions::SessionError::WorkspaceRebindRequired)
+        ));
+    }
+
     #[test]
     fn newer_cursor_never_authenticates_an_older_headless_snapshot() {
         let tmp = TempDir::new().unwrap();
@@ -1898,6 +2979,42 @@ mod tests {
                 && subagent.root_tool_use_id.as_deref() == Some("batch-call")
                 && subagent.outcome == StoredSubagentOutcome::Done
         }));
+    }
+
+    #[test]
+    fn only_the_stored_remote_plan_marks_the_session_written() {
+        let tmp = TempDir::new().unwrap();
+        let mut store = store_in(&tmp);
+        let expected =
+            caudra_workspace::PlanRef::new(format!("plan-{}", "a".repeat(32))).expect("plan ref");
+        let other =
+            caudra_workspace::PlanRef::new(format!("plan-{}", "b".repeat(32))).expect("plan ref");
+        store.session.meta.plan_target = Some(StoredPlanTarget::PlanRef {
+            reference: expected.clone(),
+        });
+
+        let record = |store: &mut SessionStore, reference: &caudra_workspace::PlanRef| {
+            let mut done = crate::ToolDoneEvent::error("write".into(), "written");
+            done.is_error = false;
+            done.annotation = Some(format!(
+                "local_document:plan:{};revision:{}",
+                reference.as_str(),
+                "c".repeat(64)
+            ));
+            store
+                .record_event(&Envelope {
+                    event: AgentEvent::ToolDone(Box::new(done)),
+                    subagent: None,
+                    run_id: 0,
+                    workflow: None,
+                })
+                .unwrap();
+        };
+
+        record(&mut store, &other);
+        assert!(!store.session.meta.plan_written);
+        record(&mut store, &expected);
+        assert!(store.session.meta.plan_written);
     }
 
     #[test]
@@ -2180,6 +3297,7 @@ complete(#{ report: first.output });
         started: flume::Sender<()>,
         requests: std::sync::Mutex<Vec<Vec<Message>>>,
         models: std::sync::Mutex<Vec<String>>,
+        systems: std::sync::Mutex<Vec<String>>,
     }
 
     impl ScriptedProvider {
@@ -2211,7 +3329,7 @@ complete(#{ report: first.output });
             &'a self,
             model: &'a Model,
             messages: &'a [Message],
-            _: &'a str,
+            system: &'a str,
             _: &'a Value,
             _: &'a flume::Sender<ProviderEvent>,
             _: RequestOptions,
@@ -2220,6 +3338,7 @@ complete(#{ report: first.output });
             Box::pin(async move {
                 self.requests.lock().unwrap().push(messages.to_vec());
                 self.models.lock().unwrap().push(model.id.clone());
+                self.systems.lock().unwrap().push(system.to_owned());
                 let _ = self.started.send(());
                 if self.hang {
                     futures_lite::future::pending().await
@@ -2275,6 +3394,7 @@ complete(#{ report: first.output });
                     started: started_tx,
                     requests: std::sync::Mutex::new(Vec::new()),
                     models: std::sync::Mutex::new(Vec::new()),
+                    systems: std::sync::Mutex::new(Vec::new()),
                 }),
                 started,
                 _temp: temp,
@@ -2282,18 +3402,51 @@ complete(#{ report: first.output });
         }
 
         async fn spawn(&self, workflows: bool) -> InteractiveHandle {
+            self.spawn_in(workflows, None).await
+        }
+
+        async fn spawn_in(
+            &self,
+            workflows: bool,
+            workspace: Option<WorkspaceSession>,
+        ) -> InteractiveHandle {
+            let binding = workspace.as_ref().map(|workspace| {
+                StoredWorkspaceBinding::new_with_cursor(
+                    workspace.binding().clone(),
+                    workspace.cursor().clone(),
+                    None,
+                )
+                .unwrap()
+            });
+            let cwd = if workspace.is_some() {
+                PathBuf::from(".")
+            } else {
+                self.project.clone()
+            };
+            let context = match &workspace {
+                Some(workspace) => Some(
+                    crate::remote_project_context::load_remote_project_context(workspace)
+                        .await
+                        .unwrap(),
+                ),
+                None => None,
+            };
             let lease = Arc::new(SessionLease::acquire(&self.state_dir, session_id()).unwrap());
             let store = SessionStore::open_in_with_lease(
                 self.state_dir.clone(),
                 session_id(),
-                &self.project.to_string_lossy(),
+                &cwd.to_string_lossy(),
                 MODEL_SPEC,
                 Arc::clone(&lease),
+                binding.as_ref(),
             )
             .unwrap();
             let params = InteractiveParams {
                 model: Model::from_spec(MODEL_SPEC).unwrap(),
-                config: AgentConfig::default(),
+                config: AgentConfig {
+                    generate_titles: false,
+                    ..AgentConfig::default()
+                },
                 permissions_config: PermissionsConfig::default(),
                 timeouts: Timeouts::default(),
                 prompt_slots: Arc::new(ResolvedSlots::default()),
@@ -2303,7 +3456,7 @@ complete(#{ report: first.output });
                 prompt_profiles: Arc::new(PromptProfileCatalog::default()),
                 excluded_tools: Vec::new(),
                 mcp_handle: None,
-                initial_wd: self.project.clone(),
+                initial_wd: cwd.clone(),
                 session_id: SessionRef::from(session_id()),
                 session_lease: lease,
                 expected_write_version: None,
@@ -2317,6 +3470,14 @@ complete(#{ report: first.output });
                 plugin_rules: Arc::default(),
                 local_tools: LocalTools::default(),
                 workflow_mode: workflows.then(|| Arc::new(|| AgentMode::Build) as ModeResolver),
+                workspace_binding: binding,
+                remote_environment: workspace.as_ref().map(|_| RemoteEnvironment {
+                    cwd: cwd.to_string_lossy().into_owned(),
+                    platform: "remote".into(),
+                }),
+                workspace_session: workspace,
+                remote_project_context: context,
+                local_documents: None,
             };
             spawn_prepared_interactive(PreparedInteractive {
                 params,
@@ -2324,8 +3485,10 @@ complete(#{ report: first.output });
                 model: Model::from_spec(MODEL_SPEC).unwrap(),
                 provider: Arc::clone(&self.provider) as Arc<dyn Provider>,
                 store,
+                workspace_baseline: None,
             })
             .await
+            .unwrap()
         }
     }
 
@@ -2421,6 +3584,178 @@ complete(#{ report: first.output });
             wait_for_run(&handle.event_rx, &run.run_id, RunStatus::Completed).await;
 
             assert_eq!(session.provider.models(), vec![UPDATED_MODEL_ID]);
+            let InteractiveHandle { input_tx, task, .. } = handle;
+            drop(input_tx);
+            task.await;
+        });
+    }
+
+    #[test]
+    fn interactive_policy_is_installed_before_dispatch_removed_and_failed_closed_on_refresh() {
+        smol::block_on(async {
+            let session = WorkflowSession::new(false);
+            let (workspace, service) =
+                crate::remote_project_context::tests::AssetService::permission_fixture();
+            let handle = session.spawn_in(false, Some(workspace)).await;
+            let (events, _) = flume::unbounded();
+            let events = EventSender::new(events, 0);
+            let check = || async {
+                handle
+                    .permissions
+                    .enforce(
+                        &ToolKey::native("file_read"),
+                        &crate::tools::PermissionScopes::single("opaque-file".into()),
+                        &serde_json::json!({}),
+                        &events,
+                        None,
+                        "initial-deny",
+                        &CancelToken::none(),
+                        None,
+                    )
+                    .await
+            };
+            assert!(check().await.is_err());
+            assert!(session.provider.models().is_empty());
+            service.remove_permissions();
+            handle.input_tx.send(prompt(PROMPT)).unwrap();
+            wait_for_turn(&handle.event_rx).await;
+            assert!(check().await.is_ok());
+            let requests = session.provider.models().len();
+            service.corrupt_permissions();
+            handle.input_tx.send(prompt(PROMPT)).unwrap();
+            loop {
+                if let AgentEvent::Error { .. } = handle.event_rx.recv_async().await.unwrap().event
+                {
+                    break;
+                }
+            }
+            assert_eq!(session.provider.models().len(), requests);
+            assert!(check().await.is_err());
+            service.remove_permissions();
+            handle.input_tx.send(prompt(PROMPT)).unwrap();
+            wait_for_turn(&handle.event_rx).await;
+            assert!(check().await.is_ok());
+            let InteractiveHandle { input_tx, task, .. } = handle;
+            drop(input_tx);
+            task.await;
+        });
+    }
+
+    #[test]
+    fn remote_cd_rebuilds_subsequent_workflow_agents_and_persists_logical_cursor() {
+        smol::block_on(async {
+            let session = WorkflowSession::new(false);
+            let (workspace, service) =
+                crate::stored_session::tests::remote_workspace("workflow-cd", WORKFLOW_SOURCE);
+            let handle = session.spawn_in(true, Some(workspace)).await;
+            let workflow = handle.workflow.clone().unwrap();
+            let transition = workflow.suspend().await.unwrap();
+            assert!(workflow.suspend().await.is_err());
+            assert!(
+                workflow
+                    .request(WorkflowRequest::Start(caudra_workflow::LaunchRequest {
+                        name: WORKFLOW_NAME.into(),
+                        args: serde_json::json!({}),
+                        agent_budget: None,
+                    }))
+                    .await
+                    .is_err()
+            );
+            drop(transition);
+            assert_eq!(
+                handle.change_remote_directory("nested").await.unwrap(),
+                "nested"
+            );
+            let run = trust_and_start(&workflow).await;
+            wait_for_run(&handle.event_rx, &run.run_id, RunStatus::Completed).await;
+            let prompts = format!("{:?}", session.provider.systems.lock().unwrap());
+            assert!(prompts.contains("nested"), "{prompts}");
+            let loaded = crate::load_stored_session(session_id(), &session.state_dir).unwrap();
+            assert_eq!(loaded.cwd, "nested");
+            assert_eq!(
+                loaded.workspace_binding().unwrap().cursor(),
+                Some(handle.remote_workspace_session().unwrap().cursor())
+            );
+            service
+                .revision
+                .store(2, std::sync::atomic::Ordering::SeqCst);
+            handle.input_tx.send(prompt(PROMPT)).unwrap();
+            wait_for_turn(&handle.event_rx).await;
+            let run = trust_and_start(&workflow).await;
+            wait_for_run(&handle.event_rx, &run.run_id, RunStatus::Completed).await;
+            assert_eq!(handle.remote_cwd().as_deref(), Some("nested"));
+            assert!(
+                session
+                    .provider
+                    .systems
+                    .lock()
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .contains("nested")
+            );
+            let InteractiveHandle { input_tx, task, .. } = handle;
+            drop(input_tx);
+            task.await;
+        });
+    }
+
+    #[test]
+    fn remote_cd_persistence_conflict_keeps_the_previous_cursor() {
+        const PERSISTENCE_ERROR: &str = "cd: remote workspace cursor could not be persisted";
+        smol::block_on(async {
+            let session = WorkflowSession::new(false);
+            let (workspace, _) =
+                crate::stored_session::tests::remote_workspace("cd-persistence", "");
+            let handle = session.spawn_in(false, Some(workspace)).await;
+            let before = handle.remote_workspace_session().unwrap();
+            let mut competing =
+                crate::load_stored_session(session_id(), &session.state_dir).unwrap();
+            competing.set_title("competing writer".into());
+            competing.save(&session.state_dir).unwrap();
+
+            assert_eq!(
+                handle.change_remote_directory("nested").await.unwrap_err(),
+                PERSISTENCE_ERROR
+            );
+            assert_eq!(handle.remote_cwd().as_deref(), Some("."));
+            assert_eq!(
+                handle.remote_workspace_session().unwrap().cursor(),
+                before.cursor()
+            );
+            let stored = crate::load_stored_session(session_id(), &session.state_dir).unwrap();
+            assert_eq!(stored.cwd, ".");
+            assert!(session.provider.models().is_empty());
+            let InteractiveHandle { input_tx, task, .. } = handle;
+            drop(input_tx);
+            task.await;
+        });
+    }
+
+    #[test]
+    fn active_remote_workflow_blocks_cwd_and_authoritative_revision_changes() {
+        smol::block_on(async {
+            let session = WorkflowSession::new(true);
+            let (workspace, service) =
+                crate::stored_session::tests::remote_workspace("workflow-busy", WORKFLOW_SOURCE);
+            let handle = session.spawn_in(true, Some(workspace)).await;
+            let workflow = handle.workflow.clone().unwrap();
+            trust_and_start(&workflow).await;
+            session.started.recv_async().await.unwrap();
+            assert!(handle.change_remote_directory("nested").await.is_err());
+            assert_eq!(handle.remote_cwd().as_deref(), Some("."));
+            service
+                .revision
+                .store(2, std::sync::atomic::Ordering::SeqCst);
+            handle.input_tx.send(prompt(PROMPT)).unwrap();
+            loop {
+                let envelope = handle.event_rx.recv_async().await.unwrap();
+                if let AgentEvent::Error { message } = envelope.event {
+                    assert!(message.contains("quiescent"), "{message}");
+                    break;
+                }
+            }
+            assert_eq!(session.provider.models().len(), 1);
             let InteractiveHandle { input_tx, task, .. } = handle;
             drop(input_tx);
             task.await;

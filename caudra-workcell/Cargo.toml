@@ -10,20 +10,23 @@ rust-version.workspace = true
 
 [dependencies]
 caudra-agent = { workspace = true }
+caudra-config = { workspace = true }
 caudra-storage = { workspace = true }
+caudra-workspace = { workspace = true }
 async-trait = { workspace = true }
 futures-lite = { workspace = true }
 flume = { workspace = true }
+isahc = { workspace = true }
 jiff = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+smol = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
+url = { workspace = true }
 workcell = { workspace = true }
 
 [dev-dependencies]
-caudra-config = { workspace = true }
-smol = { workspace = true }
 tempfile = { workspace = true }
 test-case = { workspace = true }

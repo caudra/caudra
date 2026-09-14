@@ -492,6 +492,17 @@ impl Chat {
             .update_hover(row, col, area, known_task_target, cwd);
     }
 
+    pub(crate) fn update_hover_remote(
+        &mut self,
+        row: u16,
+        col: u16,
+        area: Rect,
+        known_task_target: bool,
+    ) {
+        self.messages_panel
+            .update_hover_remote(row, col, area, known_task_target);
+    }
+
     pub(crate) fn clear_hover(&mut self) {
         self.messages_panel.clear_hover();
     }
@@ -510,6 +521,10 @@ impl Chat {
 
     pub(crate) fn mention_at(&self, row: u16, col: u16, area: Rect, cwd: &Path) -> Option<Mention> {
         self.messages_panel.mention_at(row, col, area, cwd)
+    }
+
+    pub(crate) fn mention_at_remote(&self, row: u16, col: u16, area: Rect) -> Option<Mention> {
+        self.messages_panel.mention_at_remote(row, col, area)
     }
 
     pub(crate) fn message_action_at(
@@ -1162,6 +1177,7 @@ mod tests {
             annotation: None,
             written_path,
             written_paths: Vec::new(),
+            remote_written_paths: false,
             output_ref: None,
             output_limits: None,
             model_suffix: None,

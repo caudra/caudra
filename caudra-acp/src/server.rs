@@ -38,7 +38,10 @@ use caudra_providers::{Message, expand_message};
 use caudra_storage::StateDir;
 use caudra_storage::id::{CaudraId, SessionRef};
 use caudra_storage::permission_state::PermissionRuleRecord;
-use caudra_storage::sessions::{SessionError, SessionLease, StoredTokenUsage};
+use caudra_storage::sessions::{
+    SessionError, SessionLease, StoredMode, StoredPlanTarget, StoredTokenUsage,
+};
+use caudra_storage::workspace_binding::StoredWorkspaceBinding;
 use color_eyre::eyre::Context;
 use flume::{Receiver, Sender, WeakSender};
 use serde::Serialize;
@@ -84,6 +87,14 @@ struct SessionState {
     pending: PendingState,
     /// Resolves the relative paths an `@` mention names in a prompt.
     cwd: PathBuf,
+    remote: bool,
+}
+
+struct SessionInitialState {
+    cwd: PathBuf,
+    remote: bool,
+    cost: Option<f64>,
+    mode: AgentMode,
 }
 
 struct Server {
@@ -260,7 +271,7 @@ async fn handle_request(
             Ok(()) => return,
             Err(e) => Err(e),
         },
-        "session/set_mode" => handle_set_mode(srv, raw),
+        "session/set_mode" => handle_set_mode(srv, raw, params),
         "session/set_config_option" => handle_set_config(srv, raw),
         _ => Err(AcpError::method_not_found()),
     };
@@ -276,8 +287,12 @@ async fn new_session(
     let session_id = SessionRef::generate();
     let session_lease = acquire_session_lease(session_id.id())?;
     let (profile_name, profile) = resolve_prompt_profile(params, None)?;
-    preflight_mcp(&req.cwd, &req.mcp_servers).await?;
-    let cwd = req.cwd.clone();
+    let remote = params.remote_environment.is_some();
+    preflight_mcp(&req.cwd, &req.mcp_servers, remote).await?;
+    let cwd = params.remote_environment.as_ref().map_or_else(
+        || req.cwd.clone(),
+        |environment| environment.cwd.clone().into(),
+    );
     let (mut prepared, pending) = prepare_session(
         srv,
         params,
@@ -293,9 +308,12 @@ async fn new_session(
     )
     .await?;
     close_session(srv).await;
-    let mcp = start_mcp(&cwd, &req.mcp_servers).await;
+    let mcp = start_mcp(&cwd, &req.mcp_servers, remote).await;
     prepared.set_mcp_handle(mcp.clone());
-    let handle = headless::spawn_prepared_interactive(prepared).await;
+    let handle = headless::spawn_prepared_interactive(prepared)
+        .await
+        .map_err(|error| AcpError::internal_error().data(json_str(&error)))?;
+    let cwd = handle.remote_cwd().map(PathBuf::from).unwrap_or(cwd);
     caudra_otel::emit::session_started(
         caudra_otel::emit::START_FRESH,
         Some(handle.session_id.as_str()),
@@ -303,7 +321,19 @@ async fn new_session(
     let spec = params.model.spec();
     let resp = methods::new_session_response(handle.session_id.as_str())
         .config_options(vec![methods::model_config_option(&spec, &srv.model_specs)]);
-    install_session(srv, handle, mcp, spec, pending, cwd, None);
+    install_session(
+        srv,
+        handle,
+        mcp,
+        spec,
+        pending,
+        SessionInitialState {
+            cwd,
+            remote,
+            cost: None,
+            mode: AgentMode::Build,
+        },
+    );
     Ok(AgentResponse::NewSessionResponse(resp))
 }
 
@@ -329,22 +359,36 @@ async fn load_session(
     }
     let session_lease = acquire_session_lease(session_ref.id())?;
     let mut restored = load_history(session_ref.id())?;
+    if StoredWorkspaceBinding::validate_resume_identity(
+        restored.workspace_binding.as_ref(),
+        params.workspace_binding.as_ref(),
+    )
+    .is_err()
+    {
+        return Err(AcpError::invalid_params().data(json_str(
+            "session workspace identity changed; fork or explicitly rebind the session",
+        )));
+    }
     let (profile_name, profile) =
         resolve_prompt_profile(params, restored.system_prompt_profile.as_deref())?;
     let history = History::restored(restored.history)
         .map_err(|error| AcpError::internal_error().data(json_str(&error)))?;
-    preflight_mcp(&req.cwd, &req.mcp_servers).await?;
+    let remote = params.remote_environment.is_some();
+    preflight_mcp(&req.cwd, &req.mcp_servers, remote).await?;
     let sid = SessionId::from(session_ref.to_string());
     let home = caudra_storage::paths::home();
     let replay_cwd = restored.cwd.as_deref().unwrap_or(&req.cwd);
     let replay_updates = translate::replay_history(history.as_slice(), replay_cwd, home.as_deref());
-    let cwd = req.cwd.clone();
+    let cwd = params.remote_environment.as_ref().map_or_else(
+        || req.cwd.clone(),
+        |environment| environment.cwd.clone().into(),
+    );
     let (mut prepared, pending) = prepare_session(
         srv,
         params,
         SessionStart {
             cwd: cwd.clone(),
-            session_id: session_ref,
+            session_id: session_ref.clone(),
             session_lease,
             expected_write_version: restored.write_version,
             history: history.into_items(),
@@ -357,9 +401,12 @@ async fn load_session(
     )
     .await?;
     close_session(srv).await;
-    let mcp = start_mcp(&cwd, &req.mcp_servers).await;
+    let mcp = start_mcp(&cwd, &req.mcp_servers, remote).await;
     prepared.set_mcp_handle(mcp.clone());
-    let handle = headless::spawn_prepared_interactive(prepared).await;
+    let handle = headless::spawn_prepared_interactive(prepared)
+        .await
+        .map_err(|error| AcpError::internal_error().data(json_str(&error)))?;
+    let cwd = handle.remote_cwd().map(PathBuf::from).unwrap_or(cwd);
     for update in replay_updates {
         session_update(&srv.out_tx, &sid, update);
     }
@@ -368,8 +415,6 @@ async fn load_session(
         Some(handle.session_id.as_str()),
     );
     let spec = params.model.spec();
-    let resp = methods::load_session_response()
-        .config_options(vec![methods::model_config_option(&spec, &srv.model_specs)]);
     // Priced against the model the session recorded, not the one selected now
     // (which may cost 10x more or less). Later turns add their own exact cost.
     let recorded_model = Model::from_spec(&restored.model).unwrap_or_else(|_| params.model.clone());
@@ -379,7 +424,91 @@ async fn load_session(
         &recorded_model,
         RESTORED_FAST,
     );
-    install_session(srv, handle, mcp, spec, pending, cwd, restored_cost.billed);
+    let restored_mode = match (
+        restored.mode,
+        restored.plan_target.as_ref(),
+        restored.plan_path.as_deref(),
+    ) {
+        (Some(StoredMode::Plan), Some(StoredPlanTarget::PlanRef { reference }), _) => params
+            .workspace_session
+            .as_ref()
+            .zip(params.local_documents.as_ref())
+            .and_then(|(workspace, store)| {
+                store
+                    .read(
+                        workspace.binding().project().key(),
+                        Some(session_ref.as_str()),
+                        &caudra_workspace::LocalDocumentRef::Plan(reference.clone()),
+                    )
+                    .ok()
+                    .map(|_| AgentMode::RemotePlan(reference.clone()))
+            })
+            .unwrap_or(AgentMode::Build),
+        (Some(StoredMode::Plan), Some(StoredPlanTarget::LocalPath { path }), _)
+            if params.workspace_session.is_some() =>
+        {
+            params
+                .workspace_session
+                .as_ref()
+                .zip(params.local_documents.as_ref())
+                .and_then(|(workspace, store)| {
+                    store
+                        .adopt_legacy_plan(
+                            workspace.binding().project().key(),
+                            session_ref.as_str(),
+                            Path::new(path),
+                        )
+                        .ok()
+                })
+                .map(AgentMode::RemotePlan)
+                .unwrap_or(AgentMode::Build)
+        }
+        (Some(StoredMode::Plan), Some(StoredPlanTarget::LocalPath { path }), _)
+            if Path::new(path).is_file() =>
+        {
+            AgentMode::Plan(path.into())
+        }
+        (Some(StoredMode::Plan), None, Some(path)) if Path::new(path).is_file() => {
+            if let Some((workspace, store)) = params
+                .workspace_session
+                .as_ref()
+                .zip(params.local_documents.as_ref())
+            {
+                store
+                    .adopt_legacy_plan(
+                        workspace.binding().project().key(),
+                        session_ref.as_str(),
+                        Path::new(path),
+                    )
+                    .map(AgentMode::RemotePlan)
+                    .unwrap_or(AgentMode::Build)
+            } else {
+                AgentMode::Plan(path.into())
+            }
+        }
+        _ => AgentMode::Build,
+    };
+    let restored_mode_id = if restored_mode.is_planning() {
+        methods::MODE_PLAN
+    } else {
+        methods::MODE_BUILD
+    };
+    let resp = methods::load_session_response()
+        .modes(methods::mode_state(restored_mode_id))
+        .config_options(vec![methods::model_config_option(&spec, &srv.model_specs)]);
+    install_session(
+        srv,
+        handle,
+        mcp,
+        spec,
+        pending,
+        SessionInitialState {
+            cwd,
+            remote,
+            cost: restored_cost.billed,
+            mode: restored_mode,
+        },
+    );
     Ok(AgentResponse::LoadSessionResponse(resp))
 }
 
@@ -439,6 +568,11 @@ async fn prepare_session(
         // ACP has no wire shape for workflow runs, so a session under it
         // gets no runtime and the `workflow` tool reports unavailable.
         workflow_mode: None,
+        workspace_binding: params.workspace_binding.clone(),
+        remote_environment: params.remote_environment.clone(),
+        workspace_session: params.workspace_session.clone(),
+        remote_project_context: params.remote_project_context.clone(),
+        local_documents: params.local_documents.clone(),
     })
     .await
     .map_err(|error| AcpError::internal_error().data(json_str(&error)))?;
@@ -574,8 +708,12 @@ fn pairs<T>(items: &[T], split: impl Fn(&T) -> (&String, &String)) -> HashMap<St
 
 /// MCP is per session: the client picks the cwd and may inject its own servers.
 /// Returns as soon as the config is read, the first prompt waits for the tools.
-async fn start_mcp(cwd: &Path, servers: &[McpServer]) -> Option<McpHandle> {
-    let (handle, errors) = mcp::start_with_extra(cwd, injected_servers(servers)).await;
+async fn start_mcp(cwd: &Path, servers: &[McpServer], remote: bool) -> Option<McpHandle> {
+    let (handle, errors) = if remote {
+        mcp::start_global(cwd).await
+    } else {
+        mcp::start_with_extra(cwd, injected_servers(servers)).await
+    };
     if !errors.is_empty() {
         warn!(%errors, "MCP config errors");
     }
@@ -598,7 +736,15 @@ async fn start_mcp(cwd: &Path, servers: &[McpServer]) -> Option<McpHandle> {
     handle
 }
 
-async fn preflight_mcp(cwd: &Path, servers: &[McpServer]) -> Result<(), AcpError> {
+async fn preflight_mcp(cwd: &Path, servers: &[McpServer], remote: bool) -> Result<(), AcpError> {
+    if remote {
+        if !servers.is_empty() {
+            return Err(AcpError::invalid_params().data(json_str(
+                "session MCP servers are disabled for remote Workcell sessions",
+            )));
+        }
+        return Ok(());
+    }
     let (awaiting, errors) = mcp::pending_startup_trust(cwd, injected_servers(servers)).await;
     if !errors.is_empty() {
         warn!(%errors, "MCP config errors");
@@ -656,25 +802,25 @@ fn install_session(
     mcp: Option<McpHandle>,
     current_model: String,
     pending: PendingState,
-    cwd: PathBuf,
-    initial_cost: Option<f64>,
+    initial: SessionInitialState,
 ) {
     start_event_pump(
         handle.event_rx.clone(),
         handle.session_id.clone(),
         srv.out_tx.clone(),
         Arc::clone(&pending),
-        cwd.clone(),
+        initial.cwd.clone(),
         caudra_storage::paths::home(),
-        initial_cost,
+        initial.cost,
     );
     srv.session = Some(SessionState {
         handle,
         mcp,
-        current_mode: AgentMode::Build,
+        current_mode: initial.mode,
         current_model,
         pending,
-        cwd,
+        cwd: initial.cwd,
+        remote: initial.remote,
     });
 }
 
@@ -690,6 +836,10 @@ struct Restored {
     yolo: Option<bool>,
     system_prompt_profile: Option<String>,
     write_version: Option<i64>,
+    workspace_binding: Option<caudra_storage::workspace_binding::StoredWorkspaceBinding>,
+    mode: Option<StoredMode>,
+    plan_target: Option<StoredPlanTarget>,
+    plan_path: Option<String>,
 }
 
 fn load_history(session_id: CaudraId) -> Result<Restored, AcpError> {
@@ -698,9 +848,8 @@ fn load_history(session_id: CaudraId) -> Result<Restored, AcpError> {
     load_history_from(&storage, session_id)
 }
 
-/// History plus the absolute cwd the session recorded in its header. Tool
-/// inputs from a past run resolve against that cwd, not the client's current
-/// one; a non-absolute recording falls back to the caller's cwd.
+/// Remote cwd stays logical; only local legacy relative recordings fall back
+/// to the caller's cwd when replayed.
 fn load_history_from(
     storage: &caudra_storage::StateDir,
     session_id: CaudraId,
@@ -708,7 +857,11 @@ fn load_history_from(
     let session = open_stored_session(session_id, storage).map_err(|e| {
         AcpError::resource_not_found(Some(format!("session/{session_id}"))).data(json_str(&e))
     })?;
-    let recorded = if Path::new(&session.cwd).is_absolute() {
+    let recorded = if session
+        .workspace_binding()
+        .is_some_and(|binding| !binding.is_local())
+        || Path::new(&session.cwd).is_absolute()
+    {
         Some(PathBuf::from(&session.cwd))
     } else {
         None
@@ -729,6 +882,10 @@ fn load_history_from(
         yolo: session.meta.yolo,
         system_prompt_profile: session.meta.system_prompt_profile.clone(),
         write_version: session.persisted_write_version(),
+        workspace_binding: session.workspace_binding().cloned(),
+        mode: session.meta.mode,
+        plan_target: session.meta.plan_target.clone(),
+        plan_path: session.meta.plan_path.clone(),
         history,
     })
 }
@@ -738,10 +895,17 @@ fn handle_prompt(srv: &mut Server, raw: &Value, id: &RequestId) -> Result<(), Ac
     let session = srv.session.as_ref().ok_or_else(no_session)?;
 
     let (message, images) = extract_prompt_content(&req.prompt);
-    let mentions = caudra_agent::mentions::scan(&message, |path| session.cwd.join(path).exists())
-        .into_iter()
-        .map(|(_, mention)| mention)
-        .collect();
+    let mentions = if session.remote {
+        caudra_agent::mentions::scan_remote(&message)
+            .into_iter()
+            .map(|(_, mention)| mention)
+            .collect()
+    } else {
+        caudra_agent::mentions::scan(&message, |path| session.cwd.join(path).exists())
+            .into_iter()
+            .map(|(_, mention)| mention)
+            .collect()
+    };
     let input = AgentInput {
         message,
         mode: session.current_mode.clone(),
@@ -763,12 +927,22 @@ fn handle_prompt(srv: &mut Server, raw: &Value, id: &RequestId) -> Result<(), Ac
     Ok(())
 }
 
-fn handle_set_mode(srv: &mut Server, raw: &Value) -> Result<AgentResponse, AcpError> {
+fn handle_set_mode(
+    srv: &mut Server,
+    raw: &Value,
+    params: &AcpParams,
+) -> Result<AgentResponse, AcpError> {
     let req: SetSessionModeRequest = parse_params(raw)?;
     let mode_str = req.mode_id.0.to_string();
     let session = srv.session.as_mut().ok_or_else(no_session)?;
-    session.current_mode = methods::mode_id_to_agent_mode(&mode_str, &session.cwd)
-        .ok_or_else(|| AcpError::new(-32602, format!("unknown mode: {mode_str}")))?;
+    session.current_mode = methods::mode_id_to_agent_mode_for_session(
+        &mode_str,
+        &session.cwd,
+        params.workspace_session.as_ref(),
+        params.local_documents.as_deref(),
+        session.handle.session_id.as_str(),
+    )
+    .ok_or_else(|| AcpError::new(-32602, format!("unknown mode: {mode_str}")))?;
 
     let sid = SessionId::from(session.handle.session_id.to_string());
     session_update(
@@ -1104,7 +1278,7 @@ fn parse_params<T: serde::de::DeserializeOwned>(raw: &Value) -> Result<T, AcpErr
         .map_err(|e| AcpError::invalid_params().data(json_str(&e)))
 }
 
-fn json_str(e: &impl std::fmt::Display) -> Value {
+fn json_str(e: &(impl std::fmt::Display + ?Sized)) -> Value {
     Value::String(e.to_string())
 }
 
@@ -1212,20 +1386,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let handle = InteractiveHandle {
-            event_rx: flume::unbounded().1,
-            tool_names: Vec::new(),
-            input_tx: flume::unbounded().0,
-            answer_tx,
-            cancel_tx: flume::unbounded().0,
-            model_tx: flume::unbounded().0,
-            model_route: None,
-            session_id,
-            session_lease,
-            permissions,
-            workflow: None,
-            task: smol::spawn(async {}),
-        };
+        let handle = InteractiveHandle::for_test(session_lease, permissions, answer_tx);
         let server = Server {
             out_tx,
             model_specs: Vec::new(),
@@ -1239,6 +1400,7 @@ mod tests {
                 current_model: String::new(),
                 pending: Arc::new(Mutex::new(Pending { prompt: None, asks })),
                 cwd: PathBuf::new(),
+                remote: false,
             }),
         };
         (server, answer_rx, out_rx)
@@ -1673,6 +1835,37 @@ mod tests {
             )
             .billed,
             Some(RECORDED_COST)
+        );
+    }
+
+    #[test]
+    fn remote_history_keeps_logical_cwd_and_rejects_embedded_resume() {
+        let temp = TempDir::new().unwrap();
+        let storage = StateDir::from_path(temp.path().into());
+        let local = StoredWorkspaceBinding::local_from_cwd(".");
+        let remote: StoredWorkspaceBinding = serde_json::from_str(
+            &serde_json::to_string(&local)
+                .unwrap()
+                .replace("caudra:local:v1", "https://remote.example"),
+        )
+        .unwrap();
+        let mut session = caudra_agent::StoredSession::new_with_workspace(
+            "anthropic/test",
+            "nested/child",
+            remote.clone(),
+        );
+        session.save(&storage).unwrap();
+        let restored = load_history_from(&storage, session.id).unwrap();
+        assert_eq!(restored.cwd, Some(PathBuf::from("nested/child")));
+        assert!(
+            StoredWorkspaceBinding::validate_resume_identity(
+                restored.workspace_binding.as_ref(),
+                None
+            )
+            .is_err()
+        );
+        assert!(
+            StoredWorkspaceBinding::validate_resume_identity(Some(&local), Some(&remote)).is_err()
         );
     }
 

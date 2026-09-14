@@ -16,6 +16,7 @@ use caudra_agent::agent::estimate_message_tokens;
 use caudra_agent::snapshots::{
     ConflictPolicy, RestoreReport, RestoreStatus, RestoreTarget, SnapshotError, SnapshotStore,
 };
+use caudra_agent::workspace_baseline::WorkspaceBaseline;
 use caudra_agent::{GoalHandle, GoalStatus};
 use caudra_providers::{
     HistoryItem, HistoryItemKind, ImageSource, Model, TokenUsage, active_history_items,
@@ -24,9 +25,9 @@ use caudra_providers::{
 use caudra_storage::id::CaudraId;
 use caudra_storage::sessions::{
     PendingConversationRevert, PendingRestoreKind, PendingRestoreOperation, PendingRestorePhase,
-    SessionLease, SessionMeta, StoredActiveGoal, StoredGoalResult, StoredImage, StoredPasteRange,
-    StoredPromptAdmission, StoredQueuedDraft, StoredQueuedPrompt, StoredSubagent,
-    StoredSubagentOutcome,
+    SessionDatabase, SessionLease, SessionMeta, StoredActiveGoal, StoredGoalResult, StoredImage,
+    StoredPasteRange, StoredPlanTarget, StoredPromptAdmission, StoredQueuedDraft,
+    StoredQueuedPrompt, StoredSubagent, StoredSubagentOutcome,
 };
 use caudra_storage::tool_outputs::{ToolOutputId, ToolOutputRef, ToolOutputStore};
 use ratatui::layout::Rect;
@@ -48,6 +49,21 @@ fn as_millis(duration: Duration) -> u64 {
     duration.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
+fn plan_target(plan: &PlanState) -> Option<StoredPlanTarget> {
+    plan.path().map_or_else(
+        || {
+            plan.reference()
+                .cloned()
+                .map(|reference| StoredPlanTarget::PlanRef { reference })
+        },
+        |path| {
+            Some(StoredPlanTarget::LocalPath {
+                path: path.to_string_lossy().into_owned(),
+            })
+        },
+    )
+}
+
 fn stored_subagent_outcome(outcome: Option<TaskOutcome>) -> StoredSubagentOutcome {
     match outcome {
         None | Some(TaskOutcome::Unknown) => StoredSubagentOutcome::Unknown,
@@ -66,9 +82,18 @@ fn restored_subagent_outcome(outcome: StoredSubagentOutcome) -> (TaskOutcome, &'
     }
 }
 
+#[derive(Clone)]
 struct RevertTarget {
     head: Option<CaudraId>,
     draft: Option<(String, Vec<ImageSource>)>,
+}
+
+pub(super) struct RemoteRestoreConfirmation {
+    conversation_source: Option<CaudraId>,
+    target: RevertTarget,
+    pending: PendingConversationRevert,
+    mode: RestoreMode,
+    pub(super) prepared: caudra_workspace::PreparedSnapshotOperation,
 }
 
 /// What `App::checkpoint` last handed to the writer: which session, how far
@@ -167,10 +192,30 @@ impl App {
                     .as_ref()
                     .and_then(|pending| pending.file_status.as_ref())
                     .is_some_and(file_restore_succeeded);
-            if commits_file_revert && let Err(error) = self.discard_workspace_unrevert() {
-                self.status_bar
-                    .flash(format!("Failed to commit reverted workspace: {error}"));
-                return;
+            if commits_file_revert {
+                let committed = if self.workspace_baseline.is_remote() {
+                    self.workspace_baseline
+                        .pending_remote_restore()
+                        .map_err(|error| error.to_string())
+                        .and_then(|restore| {
+                            restore.map_or(Ok(()), |restore| {
+                                smol::block_on(
+                                    self.workspace_baseline
+                                        .acknowledge_remote_restore(&restore.restore_id),
+                                )
+                                .map(drop)
+                                .map_err(|error| error.to_string())
+                            })
+                        })
+                } else {
+                    self.discard_workspace_unrevert()
+                        .map_err(|error| error.to_string())
+                };
+                if let Err(error) = committed {
+                    self.status_bar
+                        .flash(format!("Failed to commit reverted workspace: {error}"));
+                    return;
+                }
             }
             let mut merged = self.state.session.messages().to_vec();
             match merge_history_items(&mut merged, &snapshot.messages) {
@@ -209,6 +254,8 @@ impl App {
             }
         }
         AppSession::checkpoint(&mut self.state.session, None, meta, self.state.token_usage);
+        self.workspace_baseline
+            .set_current_head(self.history_head());
 
         if !self.has_content() {
             // A draft typed and then deleted is already on disk, and a file with
@@ -290,6 +337,7 @@ impl App {
             pending_revert: state.session.meta.pending_revert.clone(),
             mode: Some(state.mode.into()),
             plan_path: state.plan.path().map(|p| p.to_string_lossy().into_owned()),
+            plan_target: plan_target(&state.plan),
             plan_written: state.plan.is_ready(),
             structured_permission_rules: self.permissions.structured_conversation_rules_snapshot(),
             context_size: state.context_size,
@@ -802,7 +850,16 @@ impl App {
             self.status_bar.flash(REVERT_BUSY_MSG.into());
             return Vec::new();
         }
-        let replacement = AppSession::new(&self.state.session.model, &self.state.session.cwd);
+        let replacement = self.state.session.workspace_binding().map_or_else(
+            || AppSession::new(&self.state.session.model, &self.state.session.cwd),
+            |binding| {
+                AppSession::new_with_workspace(
+                    &self.state.session.model,
+                    &self.state.session.cwd,
+                    binding.clone(),
+                )
+            },
+        );
         let lease = match SessionLease::acquire(&self.storage, replacement.id) {
             Ok(lease) => Arc::new(lease),
             Err(error) => {
@@ -811,17 +868,26 @@ impl App {
                 return Vec::new();
             }
         };
-        let replacement_store = match Self::snapshot_store_for(
-            &self.storage,
-            replacement.id,
-            std::path::Path::new(&replacement.cwd),
-            self.snapshots_config.into(),
-        ) {
-            Ok(store) => store,
-            Err(error) => {
-                self.status_bar
-                    .flash(format!("Failed to initialize workspace snapshots: {error}"));
-                return Vec::new();
+        let replacement_store = if self.workspace_baseline.is_remote() {
+            Arc::new(SnapshotStore::new(
+                self.storage
+                    .path()
+                    .join("remote-snapshot-metadata")
+                    .join(replacement.id.to_string()),
+            ))
+        } else {
+            match Self::snapshot_store_for(
+                &self.storage,
+                replacement.id,
+                std::path::Path::new(&replacement.cwd),
+                self.snapshots_config.into(),
+            ) {
+                Ok(store) => store,
+                Err(error) => {
+                    self.status_bar
+                        .flash(format!("Failed to initialize workspace snapshots: {error}"));
+                    return Vec::new();
+                }
             }
         };
         if let Err(error) = self.retire_current_session() {
@@ -848,7 +914,20 @@ impl App {
         self.fire_session_autocmd("SessionReset", serde_json::json!({}));
         let replacement_cwd = PathBuf::from(&replacement.cwd);
         self.state.session = Arc::new(replacement);
-        self.rebind_workspace_baseline(replacement_store, replacement_cwd);
+        if let (Some(workspace), Some(binding)) = (
+            self.workspace_session.clone(),
+            self.state.session.workspace_binding().cloned(),
+        ) {
+            self.workspace_baseline.rebind_workspace_session(
+                self.storage.clone(),
+                self.state.session.id,
+                workspace,
+                binding,
+            );
+            self.snapshot_store = replacement_store;
+        } else {
+            self.rebind_workspace_baseline(replacement_store, replacement_cwd);
+        }
         caudra_otel::emit::session_started(
             caudra_otel::emit::START_FRESH,
             Some(&self.state.session.id.to_string()),
@@ -947,7 +1026,8 @@ impl App {
             }
         };
         let previous = self.state.session.meta.pending_revert.clone();
-        if previous.is_none()
+        if !self.workspace_baseline.is_remote()
+            && previous.is_none()
             && mode.restores_files()
             && let Err(error) = self.discard_workspace_unrevert()
         {
@@ -981,6 +1061,16 @@ impl App {
             file_status,
             restore_operation: None,
         };
+
+        if self.workspace_baseline.is_remote() && mode.restores_files() {
+            return self.revert_remote_workspace(
+                conversation_source,
+                target,
+                pending,
+                mode,
+                policy,
+            );
+        }
 
         if !mode.restores_files() {
             let actual_head = if mode.restores_conversation() {
@@ -1110,6 +1200,182 @@ impl App {
         self.finish_conversation_restore(conversation_source, target)
     }
 
+    fn revert_remote_workspace(
+        &mut self,
+        conversation_source: Option<CaudraId>,
+        target: RevertTarget,
+        mut pending: PendingConversationRevert,
+        mode: RestoreMode,
+        policy: ConflictPolicy,
+    ) -> Vec<Action> {
+        if policy == ConflictPolicy::Overwrite {
+            self.status_bar
+                .flash("Remote snapshot conflicts cannot be overwritten automatically".into());
+            return Vec::new();
+        }
+        let prepared = match self.remote_restore_confirmation.take() {
+            Some(confirmation)
+                if confirmation.conversation_source == conversation_source
+                    && confirmation.target.head == target.head
+                    && confirmation.mode == mode =>
+            {
+                pending = confirmation.pending;
+                confirmation.prepared
+            }
+            previous => {
+                if let Some(previous) = previous {
+                    let _ = smol::block_on(
+                        self.workspace_baseline
+                            .release_remote_prepared(&previous.prepared),
+                    );
+                }
+                let prepared = match smol::block_on(
+                    self.workspace_baseline.prepare_remote_restore(target.head),
+                ) {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        self.status_bar
+                            .flash(format!("Remote workspace restore preview failed: {error}"));
+                        return Vec::new();
+                    }
+                };
+                let change_count = match &prepared.preview {
+                    caudra_workspace::SnapshotOperationPreview::Restore(preview) => {
+                        preview.changes.len()
+                    }
+                    _ => {
+                        self.status_bar
+                            .flash("Remote workspace restore preview was invalid".into());
+                        return Vec::new();
+                    }
+                };
+                self.remote_restore_confirmation = Some(RemoteRestoreConfirmation {
+                    conversation_source,
+                    target,
+                    pending,
+                    mode,
+                    prepared,
+                });
+                self.status_bar.flash(format!(
+                    "Remote restore preview: {change_count} change{}. Repeat rewind to confirm",
+                    if change_count == 1 { "" } else { "s" }
+                ));
+                return Vec::new();
+            }
+        };
+        let change_count = match &prepared.preview {
+            caudra_workspace::SnapshotOperationPreview::Restore(preview) => preview.changes.len(),
+            _ => {
+                self.status_bar
+                    .flash("Remote workspace restore preview was invalid".into());
+                return Vec::new();
+            }
+        };
+        let operation_id = CaudraId::generate();
+        pending.restore_operation = Some(PendingRestoreOperation {
+            id: operation_id,
+            kind: PendingRestoreKind::Revert,
+            phase: PendingRestorePhase::Intent,
+            target_workspace_head: target.head.into(),
+            conversation_target: mode.restores_conversation().then_some(target.head.into()),
+            overwrite: false,
+        });
+        let before_intent = Arc::clone(&self.state.session);
+        self.state
+            .session_mut()
+            .set_conversation_state(conversation_source, Some(pending));
+        if let Err(error) = self.save_session_barrier() {
+            self.state.session = before_intent;
+            let _ = smol::block_on(self.workspace_baseline.release_remote_prepared(&prepared));
+            self.status_bar.flash(format!(
+                "Failed to save remote workspace restore intent: {error}"
+            ));
+            return Vec::new();
+        }
+        self.status_bar.flash(format!(
+            "Restoring {change_count} remote workspace change{}",
+            if change_count == 1 { "" } else { "s" }
+        ));
+        let status = match smol::block_on(
+            self.workspace_baseline
+                .execute_remote_restore(prepared, target.head),
+        ) {
+            Ok(status) => status,
+            Err(error) => {
+                self.status_bar.flash(format!(
+                    "Remote workspace restore requires recovery before more changes: {error}"
+                ));
+                return Vec::new();
+            }
+        };
+        let definitive = matches!(
+            status.state,
+            caudra_workspace::SnapshotRestoreState::Completed
+                | caudra_workspace::SnapshotRestoreState::Acknowledged
+        ) && !status.reconciliation_required;
+        if !definitive {
+            if let Some(mut pending) = self.state.session.meta.pending_revert.clone() {
+                pending.file_status = serde_json::to_value(&status).ok();
+                self.state
+                    .session_mut()
+                    .set_conversation_state(conversation_source, Some(pending));
+                let _ = self.save_session_barrier();
+            }
+            let state = match status.state {
+                caudra_workspace::SnapshotRestoreState::Partial => "partial",
+                caudra_workspace::SnapshotRestoreState::Indeterminate => "indeterminate",
+                _ => "still in progress",
+            };
+            self.status_bar.flash(format!(
+                "Remote workspace restore is {state}; recovery is required before more changes"
+            ));
+            return Vec::new();
+        }
+
+        let Some(mut applied) = self.state.session.meta.pending_revert.clone() else {
+            self.status_bar
+                .flash("Remote workspace restore intent disappeared".into());
+            return Vec::new();
+        };
+        applied.workspace_head = Some(target.head.into());
+        applied.file_status = serde_json::to_value(&status).ok();
+        if let Some(operation) = applied.restore_operation.as_mut() {
+            operation.phase = PendingRestorePhase::FilesApplied;
+        }
+        let conversation_target = if mode.restores_conversation() {
+            target.head
+        } else {
+            conversation_source
+        };
+        self.state
+            .session_mut()
+            .set_conversation_state(conversation_target, Some(applied));
+        if let Err(error) = self.save_session_barrier() {
+            self.status_bar.flash(format!(
+                "Remote workspace restore completed, but transcript recovery is required: {error}"
+            ));
+            return Vec::new();
+        }
+        let Some(mut completed) = self.state.session.meta.pending_revert.clone() else {
+            return Vec::new();
+        };
+        completed.restore_operation = None;
+        self.state
+            .session_mut()
+            .set_conversation_state(conversation_target, Some(completed));
+        if let Err(error) = self.save_session_barrier() {
+            self.status_bar.flash(format!(
+                "Remote workspace restore acknowledgement needs recovery: {error}"
+            ));
+            return Vec::new();
+        }
+        if mode.restores_conversation() {
+            self.finish_conversation_restore(conversation_source, target)
+        } else {
+            Vec::new()
+        }
+    }
+
     fn finish_conversation_restore(
         &mut self,
         previous_head: Option<CaudraId>,
@@ -1151,6 +1417,9 @@ impl App {
         if let Err(error) = checkpoint_chain(self.state.session.messages(), pending.original_head) {
             self.status_bar.flash(error);
             return Vec::new();
+        }
+        if self.workspace_baseline.is_remote() {
+            return self.unrevert_remote_workspace(pending);
         }
         if let Some(file_status) = &pending.file_status {
             let Ok(status) = serde_json::from_value::<RestoreStatus>(file_status.clone()) else {
@@ -1265,6 +1534,130 @@ impl App {
         vec![Action::LoadSession(Box::new(loaded))]
     }
 
+    fn unrevert_remote_workspace(&mut self, mut pending: PendingConversationRevert) -> Vec<Action> {
+        let Some(file_status) = pending.file_status.as_ref() else {
+            let current_head = crate::session_history_head(&self.state.session);
+            self.state
+                .session_mut()
+                .set_conversation_state(pending.original_head, None);
+            self.update_context_for_head(current_head);
+            return self.finish_remote_unrevert_display();
+        };
+        let status = match serde_json::from_value::<caudra_workspace::SnapshotRestoreStatus>(
+            file_status.clone(),
+        ) {
+            Ok(status)
+                if matches!(
+                    status.state,
+                    caudra_workspace::SnapshotRestoreState::Completed
+                        | caudra_workspace::SnapshotRestoreState::Acknowledged
+                ) && !status.reconciliation_required =>
+            {
+                status
+            }
+            _ => {
+                self.status_bar
+                    .flash("Remote workspace restore is not complete; recovery is required".into());
+                return Vec::new();
+            }
+        };
+        let prepared = match smol::block_on(
+            self.workspace_baseline
+                .prepare_remote_unrevert(&status.restore_id),
+        ) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.status_bar
+                    .flash(format!("Remote workspace unrevert preview failed: {error}"));
+                return Vec::new();
+            }
+        };
+        self.checkpoint_now();
+        let current_head = crate::session_history_head(&self.state.session);
+        pending.restore_operation = Some(PendingRestoreOperation {
+            id: CaudraId::generate(),
+            kind: PendingRestoreKind::Unrevert,
+            phase: PendingRestorePhase::Intent,
+            target_workspace_head: pending_original_workspace_head(&pending).into(),
+            conversation_target: Some(pending.original_head.into()),
+            overwrite: false,
+        });
+        let before_intent = Arc::clone(&self.state.session);
+        self.state
+            .session_mut()
+            .set_conversation_state(current_head, Some(pending.clone()));
+        if let Err(error) = self.save_session_barrier() {
+            self.state.session = before_intent;
+            let _ = smol::block_on(self.workspace_baseline.release_remote_prepared(&prepared));
+            self.status_bar.flash(format!(
+                "Failed to save remote workspace unrevert intent: {error}"
+            ));
+            return Vec::new();
+        }
+        let restore = match smol::block_on(self.workspace_baseline.execute_remote_unrevert(
+            prepared,
+            pending_original_workspace_head(&pending),
+            status.restore_id,
+        )) {
+            Ok(status) => status,
+            Err(error) => {
+                self.status_bar.flash(format!(
+                    "Remote workspace unrevert requires recovery before more changes: {error}"
+                ));
+                return Vec::new();
+            }
+        };
+        if !matches!(
+            restore.state,
+            caudra_workspace::SnapshotRestoreState::Completed
+                | caudra_workspace::SnapshotRestoreState::Acknowledged
+        ) || restore.reconciliation_required
+        {
+            if let Some(mut pending) = self.state.session.meta.pending_revert.clone() {
+                pending.file_status = serde_json::to_value(&restore).ok();
+                self.state
+                    .session_mut()
+                    .set_conversation_state(current_head, Some(pending));
+                let _ = self.save_session_barrier();
+            }
+            self.status_bar.flash(
+                "Remote workspace unrevert is partial or indeterminate; recovery is required"
+                    .into(),
+            );
+            return Vec::new();
+        }
+        self.state
+            .session_mut()
+            .set_conversation_state(pending.original_head, None);
+        self.update_context_for_head(current_head);
+        if let Err(error) = self.save_session_barrier() {
+            self.state.session = before_intent;
+            self.status_bar.flash(format!(
+                "Remote workspace unrevert completed, but transcript recovery is required: {error}"
+            ));
+            return Vec::new();
+        }
+        if let Err(error) = smol::block_on(
+            self.workspace_baseline
+                .acknowledge_remote_restore(&restore.restore_id),
+        ) {
+            self.status_bar.flash(format!(
+                "Remote workspace unrevert completed, but acknowledgement is required: {error}"
+            ));
+            return Vec::new();
+        }
+        self.finish_remote_unrevert_display()
+    }
+
+    fn finish_remote_unrevert_display(&mut self) -> Vec<Action> {
+        self.reset_ui_chrome();
+        self.restore_display();
+        self.input_box.discard();
+        let loaded = self.install_local_history();
+        self.checkpoint_now();
+        vec![Action::LoadSession(Box::new(loaded))]
+    }
+
     fn sync_live_meta(&mut self) {
         let meta = self.build_meta();
         AppSession::checkpoint(&mut self.state.session, None, meta, self.state.token_usage);
@@ -1343,7 +1736,16 @@ impl App {
         )?;
         let ancestor = active_history_items(self.state.session.messages(), target.head)
             .map_err(|error| format!("Failed to read session history: {error}"))?;
-        let mut child = AppSession::new(&self.state.session.model, &self.state.session.cwd);
+        let mut child = self.state.session.workspace_binding().map_or_else(
+            || AppSession::new(&self.state.session.model, &self.state.session.cwd),
+            |binding| {
+                AppSession::new_with_workspace(
+                    &self.state.session.model,
+                    &self.state.session.cwd,
+                    binding.clone(),
+                )
+            },
+        );
         let lease = Arc::new(
             SessionLease::acquire(&self.storage, child.id)
                 .map_err(|error| format!("Failed to reserve fork session: {error}"))?,
@@ -1360,11 +1762,20 @@ impl App {
                 .plan
                 .path()
                 .map(|path| path.to_string_lossy().into_owned()),
+            plan_target: plan_target(&self.state.plan),
             plan_written: self.state.plan.is_ready(),
             thinking: Some(self.state.thinking.clone().into()),
             fast: self.state.fast,
             ..SessionMeta::default()
         };
+        if matches!(
+            child.meta.plan_target,
+            Some(StoredPlanTarget::PlanRef { .. })
+        ) {
+            child.meta.plan_target = None;
+            child.meta.plan_path = None;
+            child.meta.plan_written = false;
+        }
         child.replace_messages(ancestor.clone());
         child.set_title(self.next_fork_title()?);
 
@@ -1527,19 +1938,21 @@ impl App {
                 })?;
         }
 
-        let child_snapshots = Self::snapshot_store_for(
-            &self.storage,
-            child.id,
-            std::path::Path::new(&child.cwd),
-            self.snapshots_config.into(),
-        )
-        .map_err(|error| format!("Failed to initialize workspace snapshots: {error}"))?;
-        self.snapshot_store
-            .copy_ancestry_to(
-                &child_snapshots,
-                &ancestor.iter().map(|item| item.id).collect::<Vec<_>>(),
+        if !self.workspace_baseline.is_remote() {
+            let child_snapshots = Self::snapshot_store_for(
+                &self.storage,
+                child.id,
+                std::path::Path::new(&child.cwd),
+                self.snapshots_config.into(),
             )
-            .map_err(|error| format!("Failed to copy workspace snapshots: {error}"))?;
+            .map_err(|error| format!("Failed to initialize workspace snapshots: {error}"))?;
+            self.snapshot_store
+                .copy_ancestry_to(
+                    &child_snapshots,
+                    &ancestor.iter().map(|item| item.id).collect::<Vec<_>>(),
+                )
+                .map_err(|error| format!("Failed to copy workspace snapshots: {error}"))?;
+        }
 
         Ok(ForkedSession {
             session: child,
@@ -1552,8 +1965,18 @@ impl App {
 
     fn next_fork_title(&self) -> Result<String, String> {
         let (base, own_number) = split_fork_title(&self.state.session.title);
-        let sessions = AppSession::list(&self.state.session.cwd, &self.storage)
-            .map_err(|error| format!("Failed to number fork: {error}"))?;
+        let sessions = if self.workspace_baseline.is_remote() {
+            let binding = self
+                .state
+                .session
+                .workspace_binding()
+                .ok_or_else(|| "Remote session workspace identity is unavailable".to_owned())?;
+            SessionDatabase::open_state(&self.storage)
+                .and_then(|database| database.list_for_workspace(binding))
+        } else {
+            AppSession::list(&self.state.session.cwd, &self.storage)
+        }
+        .map_err(|error| format!("Failed to number fork: {error}"))?;
         let number = sessions
             .iter()
             .filter_map(|session| {
@@ -1582,14 +2005,73 @@ impl App {
         mut session: AppSession,
         fallback_model: &Model,
     ) -> Result<LoadedSession, String> {
-        let snapshot_store = Self::snapshot_store_for(
-            &self.storage,
-            session.id,
-            std::path::Path::new(&session.cwd),
-            self.snapshots_config.into(),
-        )
-        .map_err(|error| format!("Failed to initialize workspace snapshots: {error}"))?;
-        recover_pending_workspace_restore(&mut session, &snapshot_store, &self.storage_writer)?;
+        if self.workspace_session.is_none() {
+            caudra_storage::workspace_binding::StoredWorkspaceBinding::validate_resume(
+                session.workspace_binding(),
+                None,
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        let remote_target = self
+            .workspace_session
+            .clone()
+            .map(|workspace| {
+                let binding =
+                    caudra_storage::workspace_binding::StoredWorkspaceBinding::new_with_cursor(
+                        workspace.binding().clone(),
+                        workspace.cursor().clone(),
+                        session
+                            .workspace_binding()
+                            .and_then(|binding| binding.cursor_label().map(str::to_owned)),
+                    )
+                    .map_err(|error| {
+                        format!("Remote workspace snapshot identity is invalid: {error}")
+                    })?;
+                if session
+                    .workspace_binding()
+                    .is_none_or(|stored| !stored.exact_scope_eq(&binding))
+                {
+                    return Err("Session belongs to a different remote workspace cursor".to_owned());
+                }
+                Ok((workspace, binding))
+            })
+            .transpose()?;
+        let snapshot_store = if let Some((workspace, binding)) = &remote_target {
+            session
+                .replace_workspace_cursor(binding.clone())
+                .map_err(|error| error.to_string())?;
+            let baseline = WorkspaceBaseline::new_workspace_session(
+                self.storage.clone(),
+                session.id,
+                workspace.clone(),
+                binding.clone(),
+                self.snapshots_config.enabled,
+            );
+            let recovered = smol::block_on(baseline.reconcile_remote_restore())
+                .map_err(|error| format!("Remote workspace snapshot recovery failed: {error}"))?;
+            crate::event_loop::reconcile_remote_session_restore(
+                &mut session,
+                &self.storage_writer,
+                &baseline,
+                recovered,
+            )?;
+            Arc::new(SnapshotStore::new(
+                self.storage
+                    .path()
+                    .join("remote-snapshot-metadata")
+                    .join(session.id.to_string()),
+            ))
+        } else {
+            let store = Self::snapshot_store_for(
+                &self.storage,
+                session.id,
+                std::path::Path::new(&session.cwd),
+                self.snapshots_config.into(),
+            )
+            .map_err(|error| format!("Failed to initialize workspace snapshots: {error}"))?;
+            recover_pending_workspace_restore(&mut session, &store, &self.storage_writer)?;
+            store
+        };
         self.retire_current_session()
             .map_err(|error| format!("Failed to retire current session: {error}"))?;
         self.permissions
@@ -1597,8 +2079,18 @@ impl App {
         self.apply_stored_yolo(&session.meta);
         self.state =
             SessionState::from_session(session, fallback_model, &self.storage, &self.model_policy);
-        let cwd = PathBuf::from(&self.state.session.cwd);
-        self.rebind_workspace_baseline(snapshot_store, cwd);
+        if let Some((workspace, binding)) = remote_target {
+            self.workspace_baseline.rebind_workspace_session(
+                self.storage.clone(),
+                self.state.session.id,
+                workspace,
+                binding,
+            );
+            self.snapshot_store = snapshot_store;
+        } else {
+            let cwd = PathBuf::from(&self.state.session.cwd);
+            self.rebind_workspace_baseline(snapshot_store, cwd);
+        }
         for w in self.state.warnings.drain(..) {
             self.status_bar.flash(w);
         }
@@ -1609,6 +2101,7 @@ impl App {
     }
 
     fn retire_current_session(&mut self) -> Result<(), caudra_storage::sessions::SessionError> {
+        self.release_remote_restore_confirmation();
         self.checkpoint_now();
         if self.has_content() {
             self.storage_writer
@@ -2194,6 +2687,14 @@ fn restore_status_value(result: &Result<RestoreReport, SnapshotError>) -> serde_
 fn file_restore_succeeded(status: &serde_json::Value) -> bool {
     serde_json::from_value::<RestoreStatus>(status.clone())
         .is_ok_and(|status| status.worktree_is_reverted())
+        || serde_json::from_value::<caudra_workspace::SnapshotRestoreStatus>(status.clone())
+            .is_ok_and(|status| {
+                matches!(
+                    status.state,
+                    caudra_workspace::SnapshotRestoreState::Completed
+                        | caudra_workspace::SnapshotRestoreState::Acknowledged
+                ) && !status.reconciliation_required
+            })
 }
 
 fn unrevert_failure_status_value(
@@ -2281,11 +2782,20 @@ impl App {
     fn session_rows(&self) -> Vec<SessionRow> {
         let live = self.live_sessions.load();
         let seen: HashSet<CaudraId> = live.iter().map(|row| row.id).collect();
-        let stored =
-            AppSession::list(&self.state.session.cwd, &self.storage).unwrap_or_else(|error| {
-                tracing::warn!(%error, "failed to list stored sessions");
-                Vec::new()
-            });
+        let stored = if self.workspace_baseline.is_remote() {
+            let Some(binding) = self.state.session.workspace_binding() else {
+                tracing::warn!("failed to list remote sessions without a workspace identity");
+                return live.iter().cloned().collect();
+            };
+            SessionDatabase::open_state(&self.storage)
+                .and_then(|database| database.list_for_workspace_identity(binding))
+        } else {
+            AppSession::list(&self.state.session.cwd, &self.storage)
+        }
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, "failed to list stored sessions");
+            Vec::new()
+        });
         live.iter()
             .cloned()
             .chain(

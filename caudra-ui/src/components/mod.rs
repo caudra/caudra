@@ -680,6 +680,8 @@ pub enum Action {
     RewindSession(rewind_picker::RewindEntry),
     UnrevertSession,
     ChangeWorkingDirectory(PathBuf),
+    ChangeRemoteWorkingDirectory(caudra_workspace::DirectoryNavigation),
+    RemoteControl(String),
     ChangeModel(String),
     ChangeSystemPromptProfile(String),
     RefreshProvider {
@@ -1292,7 +1294,11 @@ mod tests {
         scroll.reset();
         assert_eq!(scroll.pan(), 0);
         scroll.fit_width(MODAL_CONTENT_W, MODAL_VIEWPORT_W);
-        assert_eq!(scroll.pan(), 0, "a reopened modal starts at the left margin");
+        assert_eq!(
+            scroll.pan(),
+            0,
+            "a reopened modal starts at the left margin"
+        );
     }
 
     const HINTS: [(&str, &str); 2] = [("Enter", "submit"), ("Esc", "close")];

@@ -40,6 +40,7 @@ use caudra_storage::sessions::{
     SessionDatabase, SessionError, SessionLease, StoredImage, TitleSource, normalize_title,
 };
 use caudra_storage::state::WorkspaceTabs;
+use caudra_storage::workspace_binding::StoredWorkspaceBinding;
 use crossterm::event::{
     Event, KeyEventKind, KeyModifiers, MouseButton, MouseEvent as CtMouseEvent, MouseEventKind,
 };
@@ -47,7 +48,10 @@ use serde_json::json;
 use tracing::{info, warn};
 
 use crate::agent::{AgentCommand, AgentHandles, ModelSlot, shared_queue::QueueItem};
-use crate::app::shell::{ShellEvent, spawn_shell};
+use crate::app::shell::{
+    RemoteShellTarget, ShellEvent, spawn_remote_cd, spawn_remote_control, spawn_remote_shell,
+    spawn_shell,
+};
 use crate::app::tasks::{TaskStatus, diff_task_states};
 use crate::app::{
     App, Msg, Notification, QueuedMessage, SubmitOutcome, session_has_content, turn_response,
@@ -119,6 +123,7 @@ pub struct EventLoopParams {
     pub model: Model,
     pub needs_login: bool,
     pub commands: Vec<CustomCommand>,
+    pub no_commands: bool,
     pub sessions: Vec<SessionTab>,
     pub focused: usize,
     pub startup_warnings: Vec<String>,
@@ -141,6 +146,10 @@ pub struct EventLoopParams {
     pub default_prompt_profile: Option<Arc<SystemPromptProfile>>,
     pub prompt_profile_override: Option<String>,
     pub herdr_reporter: Option<HerdrReporterHandle>,
+    pub workspace_session: Option<caudra_workspace::WorkspaceSession>,
+    pub remote_project_context:
+        Option<Arc<caudra_agent::remote_project_context::RemoteProjectContext>>,
+    pub local_documents: Option<Arc<caudra_storage::local_documents::LocalDocumentStore>>,
 }
 
 const NEEDS_INPUT_MARK: &str = "\u{25c6}";
@@ -457,7 +466,43 @@ fn matching_workspace_quiescent<'a>(
         .all(|(cwd, quiescent)| canonical_cwd(cwd).is_ok_and(|cwd| cwd != target || quiescent))
 }
 
+fn matching_remote_workspace_quiescent<'a>(
+    target: &StoredWorkspaceBinding,
+    sessions: impl IntoIterator<Item = (Option<&'a StoredWorkspaceBinding>, bool)>,
+) -> bool {
+    sessions.into_iter().all(|(binding, quiescent)| {
+        binding.is_none_or(|binding| !binding.exact_scope_eq(target) || quiescent)
+    })
+}
+
+fn validate_session_focus(
+    session: &AppSession,
+    workspace: Option<&caudra_workspace::WorkspaceSession>,
+) -> Result<(), String> {
+    if let Some(workspace) = workspace {
+        let expected = StoredWorkspaceBinding::new_with_cursor(
+            workspace.binding().clone(),
+            workspace.cursor().clone(),
+            session
+                .workspace_binding()
+                .and_then(|binding| binding.cursor_label().map(str::to_owned)),
+        )
+        .map_err(|error| error.to_string())?;
+        return StoredWorkspaceBinding::validate_resume(
+            session.workspace_binding(),
+            Some(&expected),
+        )
+        .map_err(|error| error.to_string());
+    }
+    StoredWorkspaceBinding::validate_resume(session.workspace_binding(), None)
+        .map_err(|error| error.to_string())?;
+    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    validate_session_cwd(session, &canonical_cwd(&cwd)?)
+}
+
 fn validate_session_cwd(session: &AppSession, process_cwd: &Path) -> Result<(), String> {
+    StoredWorkspaceBinding::validate_resume(session.workspace_binding(), None)
+        .map_err(|error| error.to_string())?;
     let session_cwd = canonical_cwd(Path::new(&session.cwd))?;
     if session_cwd == process_cwd {
         return Ok(());
@@ -492,7 +537,32 @@ fn prepare_session_for_runtime(
     storage_writer: &StorageWriter,
     mut session: AppSession,
     limits: SnapshotLimits,
+    workspace: Option<&caudra_workspace::WorkspaceSession>,
 ) -> Result<(AppSession, Arc<caudra_agent::snapshots::SnapshotStore>), String> {
+    validate_session_focus(&session, workspace)?;
+    if let Some(workspace) = workspace {
+        let binding = StoredWorkspaceBinding::new_with_cursor(
+            workspace.binding().clone(),
+            workspace.cursor().clone(),
+            session
+                .workspace_binding()
+                .and_then(|binding| binding.cursor_label().map(str::to_owned)),
+        )
+        .map_err(|error| error.to_string())?;
+        session
+            .replace_workspace_cursor(binding)
+            .map_err(|error| error.to_string())?;
+        let session_id = session.id;
+        return Ok((
+            session,
+            Arc::new(SnapshotStore::new(
+                storage
+                    .path()
+                    .join("remote-snapshot-metadata")
+                    .join(session_id.to_string()),
+            )),
+        ));
+    }
     let process_cwd = canonical_cwd(
         &std::env::current_dir()
             .map_err(|error| format!("failed to read current directory: {error}"))?,
@@ -502,6 +572,88 @@ fn prepare_session_for_runtime(
         .map_err(|error| format!("Failed to initialize workspace snapshots: {error}"))?;
     crate::app::recover_pending_workspace_restore(&mut session, &snapshot_store, storage_writer)?;
     Ok((session, snapshot_store))
+}
+
+pub(crate) fn reconcile_remote_session_restore(
+    session: &mut AppSession,
+    storage_writer: &StorageWriter,
+    baseline: &WorkspaceBaseline,
+    status: Option<caudra_workspace::SnapshotRestoreStatus>,
+) -> Result<(), String> {
+    let Some(mut pending) = session.meta.pending_revert.clone() else {
+        return Ok(());
+    };
+    let Some(operation) = pending.restore_operation.clone() else {
+        return Ok(());
+    };
+    let Some(status) = status else {
+        pending.restore_operation = None;
+        let head = crate::session_history_head(session);
+        session.set_conversation_state(head, Some(pending));
+        storage_writer
+            .save_sync(Arc::new(session.clone()))
+            .map_err(|error| format!("Failed to clear an undispatched remote restore: {error}"))?;
+        return Ok(());
+    };
+    pending.file_status = serde_json::to_value(&status).ok();
+    let definitive = matches!(
+        status.state,
+        caudra_workspace::SnapshotRestoreState::Completed
+            | caudra_workspace::SnapshotRestoreState::Acknowledged
+    ) && !status.reconciliation_required;
+    if !definitive {
+        let head = crate::session_history_head(session);
+        session.set_conversation_state(head, Some(pending));
+        storage_writer
+            .save_sync(Arc::new(session.clone()))
+            .map_err(|error| format!("Failed to save remote restore recovery state: {error}"))?;
+        return Ok(());
+    }
+
+    pending.workspace_head = Some(operation.target_workspace_head.clone());
+    if let Some(operation) = pending.restore_operation.as_mut() {
+        operation.phase = caudra_storage::sessions::PendingRestorePhase::FilesApplied;
+    }
+    let transition_head = match operation.kind {
+        caudra_storage::sessions::PendingRestoreKind::Revert => operation
+            .conversation_target
+            .as_ref()
+            .map(|head| head.head)
+            .unwrap_or_else(|| crate::session_history_head(session)),
+        caudra_storage::sessions::PendingRestoreKind::Unrevert => pending.original_head,
+    };
+    session.set_conversation_state(transition_head, Some(pending.clone()));
+    storage_writer
+        .save_sync(Arc::new(session.clone()))
+        .map_err(|error| format!("Failed to commit recovered remote restore: {error}"))?;
+    if operation.kind == caudra_storage::sessions::PendingRestoreKind::Unrevert
+        || status.state == caudra_workspace::SnapshotRestoreState::Acknowledged
+    {
+        if status.state == caudra_workspace::SnapshotRestoreState::Acknowledged {
+            baseline
+                .mark_remote_restore_acknowledged(&status.restore_id)
+                .map_err(|error| {
+                    format!("Failed to record remote restore acknowledgement: {error}")
+                })?;
+        } else {
+            smol::block_on(baseline.acknowledge_remote_restore(&status.restore_id)).map_err(
+                |error| format!("Failed to acknowledge recovered remote restore: {error}"),
+            )?;
+        }
+    }
+    match operation.kind {
+        caudra_storage::sessions::PendingRestoreKind::Revert => {
+            pending.restore_operation = None;
+            session.set_conversation_state(transition_head, Some(pending));
+        }
+        caudra_storage::sessions::PendingRestoreKind::Unrevert => {
+            session.set_conversation_state(transition_head, None);
+        }
+    }
+    storage_writer
+        .save_sync(Arc::new(session.clone()))
+        .map_err(|error| format!("Failed to finalize recovered remote restore: {error}"))?;
+    Ok(())
 }
 
 fn recover_stored_sessions_in_cwd(
@@ -575,6 +727,7 @@ struct SpawnCtx {
     permissions: Arc<PermissionManager>,
     timeouts: Timeouts,
     custom_commands: Arc<[CustomCommand]>,
+    no_commands: bool,
     lua_command_reader: LuaCommandReader,
     keymap_reader: KeymapReader,
     hint_reader: HintReader,
@@ -591,6 +744,8 @@ struct SpawnCtx {
     /// One slot shared by every runtime: an `App` can only see its own
     /// session, so the loop publishes the rest here for the picker to read.
     live_sessions: Arc<ArcSwap<Vec<SessionRow>>>,
+    workspace_session: Option<caudra_workspace::WorkspaceSession>,
+    local_documents: Option<Arc<caudra_storage::local_documents::LocalDocumentStore>>,
 }
 
 impl SpawnCtx {
@@ -632,22 +787,80 @@ impl SpawnCtx {
             phase_start = Instant::now();
             elapsed
         };
-        let SessionTab { session, lease } = tab;
+        let SessionTab { mut session, lease } = tab;
         lease
             .validate(&self.storage, session.id)
             .map_err(|error| error.to_string())?;
         let session_id = session.id;
-        let (session, snapshot_store) = prepare_session_for_runtime(
+        let workspace_session = if let Some(workspace) = &self.workspace_session {
+            let workspace = smol::block_on(caudra_agent::resume_workspace_session(
+                &mut session,
+                &self.storage,
+                workspace,
+            ))?;
+            Some(workspace)
+        } else {
+            None
+        };
+        let remote_project_context = workspace_session
+            .as_ref()
+            .map(|workspace| {
+                smol::block_on(
+                    caudra_agent::remote_project_context::load_remote_project_context(workspace),
+                )
+                .map_err(|error| error.to_string())
+            })
+            .transpose()?;
+        let (mut session, snapshot_store) = prepare_session_for_runtime(
             &self.storage,
             &self.storage_writer,
             session,
             self.snapshots.into(),
+            workspace_session.as_ref(),
         )?;
-        let workspace_baseline = WorkspaceBaseline::new(
-            Arc::clone(&snapshot_store),
-            PathBuf::from(&session.cwd),
-            self.snapshots.enabled,
-        );
+        let workspace_baseline = if let Some(workspace) = workspace_session.clone() {
+            let stored =
+                caudra_storage::workspace_binding::StoredWorkspaceBinding::new_with_cursor(
+                    workspace.binding().clone(),
+                    workspace.cursor().clone(),
+                    session
+                        .workspace_binding()
+                        .and_then(|binding| binding.cursor_label().map(str::to_owned)),
+                )
+                .map_err(|error| {
+                    format!("Remote workspace snapshot identity is invalid: {error}")
+                })?;
+            if let Some(binding) = session.workspace_binding()
+                && !binding.exact_scope_eq(&stored)
+            {
+                return Err("Remote session belongs to a different workspace cursor".into());
+            }
+            let baseline = WorkspaceBaseline::new_workspace_session(
+                self.storage.clone(),
+                session.id,
+                workspace,
+                stored,
+                self.snapshots.enabled,
+            );
+            let recovered =
+                smol::block_on(baseline.reconcile_remote_restore()).map_err(|error| {
+                    format!("Remote workspace snapshot recovery is unavailable: {error}")
+                })?;
+            reconcile_remote_session_restore(
+                &mut session,
+                &self.storage_writer,
+                &baseline,
+                recovered,
+            )?;
+            baseline
+        } else {
+            WorkspaceBaseline::new(
+                Arc::clone(&snapshot_store),
+                PathBuf::from(&session.cwd),
+                self.snapshots.enabled,
+            )
+        };
+        workspace_baseline.set_current_head(crate::session_history_head(&session));
         let prepare_ms = lap();
         let initial_history = match crate::active_session_history(&session) {
             Ok(history) => history,
@@ -685,6 +898,9 @@ impl SpawnCtx {
             Arc::clone(&self.prompt_profiles),
             Some(self.storage.clone()),
             Arc::clone(&workspace_baseline),
+            workspace_session.clone(),
+            remote_project_context.clone(),
+            self.local_documents.clone(),
         );
         let agent_spawn_ms = lap();
         let mut app = App::new(
@@ -704,11 +920,52 @@ impl SpawnCtx {
             self.input_history_size,
             self.max_log_files,
             permissions,
-            Arc::clone(&self.custom_commands),
+            if self.no_commands {
+                Arc::from([])
+            } else if let Some(context) = &remote_project_context {
+                Arc::from(caudra_agent::command::discover_remote_commands(context))
+            } else {
+                Arc::clone(&self.custom_commands)
+            },
             self.lua_event_handle.clone(),
             Arc::clone(&self.model_policy),
             Arc::clone(&self.prompt_profiles),
+            workspace_session.clone(),
         );
+        app.local_documents = self.local_documents.clone();
+        app.no_commands = self.no_commands;
+        app.remote_project_context = remote_project_context;
+        if app.workspace_session.is_some()
+            && app.state.mode == crate::app::Mode::Plan
+            && app.state.plan.reference().is_none()
+        {
+            let was_ready = app.state.plan.is_ready();
+            let adopted = app
+                .state
+                .plan
+                .path()
+                .zip(app.workspace_session.as_ref())
+                .zip(app.local_documents.as_ref())
+                .and_then(|((path, workspace), store)| {
+                    store
+                        .adopt_legacy_plan(
+                            workspace.binding().project().key(),
+                            &app.state.session.id.to_string(),
+                            path,
+                        )
+                        .ok()
+                });
+            app.state.plan = adopted.map_or(crate::app::PlanState::None, |reference| {
+                if was_ready {
+                    crate::app::PlanState::RemoteReady(reference)
+                } else {
+                    crate::app::PlanState::RemoteDrafting(reference)
+                }
+            });
+            if matches!(app.state.plan, crate::app::PlanState::None) {
+                app.enter_plan();
+            }
+        }
         let app_new_ms = lap();
         app.snapshots_config = self.snapshots;
         app.live_sessions = Arc::clone(&self.live_sessions);
@@ -948,6 +1205,7 @@ impl<'t> EventLoop<'t> {
             mut model,
             needs_login,
             commands,
+            no_commands,
             sessions,
             focused,
             mut startup_warnings,
@@ -970,6 +1228,9 @@ impl<'t> EventLoop<'t> {
             default_prompt_profile,
             prompt_profile_override,
             herdr_reporter,
+            workspace_session,
+            remote_project_context: _,
+            local_documents,
         } = params;
 
         let started = Instant::now();
@@ -1035,6 +1296,7 @@ impl<'t> EventLoop<'t> {
             permissions,
             timeouts,
             custom_commands: Arc::from(commands),
+            no_commands,
             lua_command_reader,
             keymap_reader,
             hint_reader,
@@ -1049,6 +1311,8 @@ impl<'t> EventLoop<'t> {
             default_prompt_profile,
             prompt_profile_override,
             live_sessions: Arc::default(),
+            workspace_session,
+            local_documents,
         };
 
         let provider_ms = lap();
@@ -1220,7 +1484,7 @@ impl<'t> EventLoop<'t> {
             Wake::InputGone => return Err(eyre!("terminal input reader stopped")),
             Wake::Ui(action) => self.handle_ui_action(action),
             Wake::Agent(i, envelope) => self.handle_agent(i, envelope),
-            Wake::Shell(i, event) => self.sessions[i].app.handle_shell_event(event),
+            Wake::Shell(i, event) => self.handle_shell_event(i, event),
             Wake::Warn(warning) => {
                 // The one place every background warning passes through. A
                 // flash fades and the user may not be looking, so the log is
@@ -1231,6 +1495,66 @@ impl<'t> EventLoop<'t> {
             Wake::Title(GeneratedTitle { id, result }) => self.apply_generated_title(id, result),
         }
         Ok(())
+    }
+
+    fn handle_shell_event(&mut self, index: usize, event: ShellEvent) {
+        let ShellEvent::RemoteDirectoryResolved { previous, result } = event else {
+            self.sessions[index].app.handle_shell_event(event);
+            return;
+        };
+        let Some(current) = self.sessions[index].app.workspace_session.as_ref() else {
+            return;
+        };
+        if current.cursor() != &previous {
+            self.sessions[index]
+                .app
+                .flash("cd: workspace cursor changed while resolving the directory".into());
+            return;
+        }
+        let change = match *result {
+            Ok(change) => change,
+            Err(error) => {
+                self.sessions[index].app.flash(error);
+                return;
+            }
+        };
+        if !self.sessions[index].quiescent() {
+            self.sessions[index].app.flash(
+                "cd: session acquired active or queued work while resolving the directory".into(),
+            );
+            return;
+        }
+        let workspace = change.workspace.clone();
+        let _transition = match self.sessions[index].handles.workflow_handle() {
+            Some(workflow) => match smol::block_on(workflow.suspend()) {
+                Ok(transition) => Some(transition),
+                Err(error) => {
+                    self.sessions[index].app.flash(error.to_string());
+                    return;
+                }
+            },
+            None => None,
+        };
+        let context = Arc::clone(&change.context);
+        let display_path = change.display_path.clone();
+        if let Err(error) = self.sessions[index]
+            .app
+            .install_remote_working_directory(change)
+        {
+            self.sessions[index].app.flash(error);
+            return;
+        }
+        let history = self.sessions[index]
+            .app
+            .shared_history
+            .as_ref()
+            .map(|history| history.load().messages.as_ref().clone())
+            .unwrap_or_default();
+        self.sessions[index]
+            .handles
+            .rebind_workspace(workspace, context);
+        self.respawn_agent(index, history);
+        self.sessions[index].app.flash(format!("cd {display_path}"));
     }
 
     /// The one save trigger. A checkpoint writes only on a real change, so
@@ -1981,11 +2305,10 @@ impl<'t> EventLoop<'t> {
     /// as a new runtime so the session you came from stays live.
     fn focus_session(&mut self, id: CaudraId) -> Result<(), String> {
         if let Some(i) = self.position(id) {
-            let process_cwd = canonical_cwd(
-                &std::env::current_dir()
-                    .map_err(|error| format!("failed to read current directory: {error}"))?,
+            validate_session_focus(
+                &self.sessions[i].app.state.session,
+                self.sessions[i].app.workspace_session.as_ref(),
             )?;
-            validate_session_cwd(&self.sessions[i].app.state.session, &process_cwd)?;
             self.focused = i;
             return Ok(());
         }
@@ -1995,14 +2318,13 @@ impl<'t> EventLoop<'t> {
         );
         let session = open_app_session(id, &self.ctx.storage)
             .map_err(|e| format!("Failed to load session: {e}"))?;
-        let process_cwd = canonical_cwd(
-            &std::env::current_dir()
-                .map_err(|error| format!("failed to read current directory: {error}"))?,
-        )?;
-        validate_session_cwd(&session, &process_cwd)?;
+        if self.ctx.workspace_session.is_none() {
+            validate_session_focus(&session, None)?;
+        }
         let (profile_name, profile, profile_warning) = self.ctx.resolve_prompt_profile(&session);
         let focused = &mut self.sessions[self.focused];
-        if focused.quiescent() && !focused.app.has_content() {
+        if focused.quiescent() && !focused.app.has_content() && self.ctx.workspace_session.is_none()
+        {
             let model = focused.app.state.model.clone();
             let loaded = focused.app.apply_loaded_session(session, &model)?;
             focused.app.state.system_prompt_profile_name = profile_name;
@@ -2162,7 +2484,16 @@ impl<'t> EventLoop<'t> {
         if !self.sessions[idx].work_quiescent() {
             let session = {
                 let current = &self.sessions[idx].app.state.session;
-                AppSession::new(&current.model, &current.cwd)
+                current.workspace_binding().map_or_else(
+                    || AppSession::new(&current.model, &current.cwd),
+                    |binding| {
+                        AppSession::new_with_workspace(
+                            &current.model,
+                            &current.cwd,
+                            binding.clone(),
+                        )
+                    },
+                )
             };
             let lease = match SessionLease::acquire(&self.ctx.storage, session.id) {
                 Ok(lease) => Arc::new(lease),
@@ -2197,6 +2528,17 @@ impl<'t> EventLoop<'t> {
     }
 
     fn workspace_group_quiescent(&self, idx: usize) -> bool {
+        if let Some(target) = self.sessions[idx].app.state.session.workspace_binding() {
+            return matching_remote_workspace_quiescent(
+                target,
+                self.sessions.iter().map(|runtime| {
+                    (
+                        runtime.app.state.session.workspace_binding(),
+                        runtime.quiescent(),
+                    )
+                }),
+            );
+        }
         let Ok(target) = canonical_cwd(Path::new(&self.sessions[idx].app.state.session.cwd)) else {
             return false;
         };
@@ -2222,6 +2564,18 @@ impl<'t> EventLoop<'t> {
             return;
         }
 
+        let mut transitions = Vec::new();
+        for runtime in &self.sessions {
+            if let Some(workflow) = runtime.handles.workflow_handle() {
+                match smol::block_on(workflow.suspend()) {
+                    Ok(transition) => transitions.push(transition),
+                    Err(error) => {
+                        self.sessions[idx].app.flash(error.to_string());
+                        return;
+                    }
+                }
+            }
+        }
         let mut stores = Vec::with_capacity(self.sessions.len());
         for runtime_index in 0..self.sessions.len() {
             let session_id = self.sessions[runtime_index].id();
@@ -2265,10 +2619,20 @@ impl<'t> EventLoop<'t> {
             .permissions
             .set_project_with_config(&cwd, permissions.clone());
         for (runtime, store) in self.sessions.iter_mut().zip(stores) {
+            runtime.handles.shutdown_workflow();
             runtime
                 .app
                 .install_working_directory(&cwd, store, permissions.clone());
             runtime.app.checkpoint_now();
+        }
+        for index in 0..self.sessions.len() {
+            let history = self.sessions[index]
+                .app
+                .shared_history
+                .as_ref()
+                .map(|history| history.load().messages.as_ref().clone())
+                .unwrap_or_default();
+            self.respawn_agent(index, history);
         }
         self.sessions[idx]
             .app
@@ -2445,6 +2809,37 @@ impl<'t> EventLoop<'t> {
                 self.dispatch(idx, actions);
             }
             Action::ChangeWorkingDirectory(cwd) => self.change_working_directory(idx, cwd),
+            Action::RemoteControl(args) => {
+                let runtime = &self.sessions[idx];
+                spawn_remote_control(
+                    runtime.app.workspace_session.clone(),
+                    args,
+                    runtime.shell_tx.clone(),
+                );
+            }
+            Action::ChangeRemoteWorkingDirectory(path) => {
+                let runtime = &mut self.sessions[idx];
+                if !runtime.quiescent() {
+                    runtime.app.flash(
+                        "Cannot change the remote directory while the session has active or queued work"
+                            .into(),
+                    );
+                    return;
+                }
+                let Some(workspace) = runtime.app.workspace_session.clone() else {
+                    runtime
+                        .app
+                        .flash("cd: remote workspace is unavailable".into());
+                    return;
+                };
+                let Some(binding) = runtime.app.state.session.workspace_binding().cloned() else {
+                    runtime
+                        .app
+                        .flash("cd: session workspace binding is unavailable".into());
+                    return;
+                };
+                spawn_remote_cd(workspace, binding, path, runtime.shell_tx.clone());
+            }
             Action::ChangeModel(spec) => {
                 if let Err(e) = self.change_model(&spec) {
                     self.focused_app().flash(e);
@@ -2554,14 +2949,32 @@ impl<'t> EventLoop<'t> {
                 let rt = &mut self.sessions[idx];
                 let (trigger, cancel) = CancelToken::new();
                 rt.app.shell.add_trigger(trigger);
-                spawn_shell(
-                    command,
-                    id,
-                    visible,
-                    rt.shell_tx.clone(),
-                    cancel,
-                    self.ctx.config.clone(),
-                );
+                if let Some(workspace) = rt.app.workspace_session.clone() {
+                    rt.app
+                        .workspace_baseline
+                        .set_current_head(rt.app.history_head());
+                    spawn_remote_shell(
+                        RemoteShellTarget {
+                            workspace,
+                            baseline: Arc::clone(&rt.app.workspace_baseline),
+                        },
+                        command,
+                        id,
+                        visible,
+                        rt.shell_tx.clone(),
+                        cancel,
+                        self.ctx.config.clone(),
+                    );
+                } else {
+                    spawn_shell(
+                        command,
+                        id,
+                        visible,
+                        rt.shell_tx.clone(),
+                        cancel,
+                        self.ctx.config.clone(),
+                    );
+                }
             }
             Action::OpenEditor(path) => {
                 self.open_editor(idx, &path);
@@ -2952,6 +3365,8 @@ mod tests {
     const SHELL_RESULT: &str = "command finished";
     const HERDR_BLOCKER: &str = "Permission requested";
     const WRONG_STEP: &str = "a notch of the wheel carried the wrong distance";
+    const REMOTE_ROOT: &str = "remote-root";
+    const REMOTE_OTHER: &str = "remote-other";
 
     #[test_case(KeyModifiers::NONE, 3 ; "a plain notch is the configured size")]
     #[test_case(KeyModifiers::ALT, 12 ; "alt multiplies it")]
@@ -3182,6 +3597,78 @@ mod tests {
     }
 
     #[test]
+    fn remote_workspace_quiescence_does_not_probe_local_paths() {
+        let target = StoredWorkspaceBinding::local_from_cwd(REMOTE_ROOT);
+        let same = StoredWorkspaceBinding::local_from_cwd(REMOTE_ROOT);
+        let other = StoredWorkspaceBinding::local_from_cwd(REMOTE_OTHER);
+
+        assert!(!matching_remote_workspace_quiescent(
+            &target,
+            [(Some(&same), true), (Some(&same), false)]
+        ));
+        assert!(matching_remote_workspace_quiescent(
+            &target,
+            [(Some(&same), true), (Some(&other), false)]
+        ));
+    }
+
+    #[test]
+    fn remote_focus_never_resolves_client_cwd() {
+        use caudra_workspace::{
+            ResourceId, ResourceScope, WorkspaceCursor, WorkspaceHandle, WorkspaceSession,
+        };
+
+        let local = StoredWorkspaceBinding::local_from_cwd(REMOTE_ROOT);
+        let remote: StoredWorkspaceBinding = serde_json::from_str(
+            &serde_json::to_string(&local)
+                .unwrap()
+                .replace("caudra:local:v1", "https://remote.example"),
+        )
+        .unwrap();
+        let cursor = WorkspaceCursor::new(
+            remote.binding(),
+            ResourceScope::root(ResourceId::new(REMOTE_ROOT).unwrap()),
+            0,
+            remote.cwd_handle().clone(),
+        );
+        let remote = remote.with_cursor(cursor.clone()).unwrap();
+        let workspace = WorkspaceSession::new(
+            WorkspaceHandle::new(
+                remote.binding().authority().clone(),
+                Default::default(),
+                Default::default(),
+            )
+            .unwrap(),
+            remote.binding().clone(),
+            cursor,
+        )
+        .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("does-not-exist");
+        let session = AppSession::new_with_workspace(
+            "test/model",
+            &missing.to_string_lossy(),
+            remote.clone(),
+        );
+        validate_session_focus(&session, Some(&workspace)).unwrap();
+        assert!(!missing.exists());
+        assert!(validate_session_focus(&session, None).is_err());
+        let local = AppSession::new("test/model", &missing.to_string_lossy());
+        assert!(validate_session_focus(&local, Some(&workspace)).is_err());
+        let canary_dir = tempfile::tempdir_in(".").unwrap();
+        let canary_path = canary_dir.path().join("client-canary");
+        let logical_path = format!(
+            "{}/client-canary",
+            canary_dir.path().file_name().unwrap().to_str().unwrap()
+        );
+        const CANARY: &[u8] = b"client file must remain untouched";
+        std::fs::write(&canary_path, CANARY).unwrap();
+        let session = AppSession::new_with_workspace("test/model", &logical_path, remote);
+        validate_session_focus(&session, Some(&workspace)).unwrap();
+        assert_eq!(std::fs::read(&canary_path).unwrap(), CANARY);
+    }
+
+    #[test]
     fn cwd_change_requires_every_tab_idle_and_without_pending_reverts() {
         assert_eq!(
             cwd_change_blocker([(true, false), (false, false)]),
@@ -3208,7 +3695,8 @@ mod tests {
     }
 
     fn corrupt_restore_journal(storage: &StateDir, session: &AppSession, cwd: &Path) {
-        let store = App::snapshot_store_for(storage, session.id, cwd, SnapshotLimits::default()).unwrap();
+        let store =
+            App::snapshot_store_for(storage, session.id, cwd, SnapshotLimits::default()).unwrap();
         store.snapshot_session_start(cwd).unwrap();
         let store_dir = storage
             .path()
@@ -3238,6 +3726,7 @@ mod tests {
             &writer,
             session.clone(),
             SnapshotLimits::default(),
+            None,
         ) {
             Ok(_) => panic!("corrupt recovery journal unexpectedly allowed runtime preparation"),
             Err(error) => error,
@@ -3316,7 +3805,8 @@ mod tests {
         let target_head = items[0].id;
         let source_head = items[1].id;
         unopened.replace_messages(items);
-        let store = App::snapshot_store_for(&storage, unopened.id, &cwd, SnapshotLimits::default()).unwrap();
+        let store = App::snapshot_store_for(&storage, unopened.id, &cwd, SnapshotLimits::default())
+            .unwrap();
         std::fs::write(&file, "root").unwrap();
         store.snapshot_session_start(&cwd).unwrap();
         std::fs::write(&file, "target").unwrap();
@@ -3361,7 +3851,7 @@ mod tests {
             &std::collections::HashSet::new(),
             SnapshotLimits::default(),
         )
-            .unwrap();
+        .unwrap();
 
         let recovered = load_app_session(unopened.id, &storage).unwrap();
         assert_eq!(crate::session_history_head(&recovered), Some(target_head));

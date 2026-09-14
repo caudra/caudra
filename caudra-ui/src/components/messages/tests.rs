@@ -1,5 +1,6 @@
 use super::segment;
 use super::*;
+use crate::animation::test_clock::FrozenSpinner;
 use crate::chat::{DONE_TEXT, ERROR_TEXT};
 use crate::components::tool_display::{FOLLOWING, NOTICE_PREFIX, PAUSED};
 use crate::repaint::expect::{OWED, QUIET};
@@ -317,6 +318,7 @@ fn done(id: &str) -> ToolDoneEvent {
         annotation: None,
         written_path: None,
         written_paths: Vec::new(),
+        remote_written_paths: false,
         output_ref: None,
         output_limits: None,
         model_suffix: None,
@@ -366,6 +368,7 @@ fn shell_done(id: &str, filtered: bool) -> ToolDoneEvent {
         annotation: None,
         written_path: None,
         written_paths: Vec::new(),
+        remote_written_paths: false,
         output_ref: None,
         output_limits: None,
         model_suffix: None,
@@ -406,6 +409,7 @@ fn tool_done_updates_start_status(is_error: bool, expected: ToolStatus) {
         annotation: None,
         written_path: None,
         written_paths: Vec::new(),
+        remote_written_paths: false,
         output_ref: None,
         output_limits: None,
         model_suffix: None,
@@ -441,6 +445,7 @@ fn tool_done_sets_annotation(tool: &'static str, output: ToolOutput, expected: O
         annotation: None,
         written_path: None,
         written_paths: Vec::new(),
+        remote_written_paths: false,
         output_ref: None,
         output_limits: None,
         model_suffix: None,
@@ -465,6 +470,7 @@ fn tool_done_annotation_merge(output: &str, expected: Option<&str>) {
         annotation: None,
         written_path: None,
         written_paths: Vec::new(),
+        remote_written_paths: false,
         output_ref: None,
         output_limits: None,
         model_suffix: None,
@@ -498,6 +504,7 @@ fn tool_done_grep_shows_matches() {
         annotation: None,
         written_path: None,
         written_paths: Vec::new(),
+        remote_written_paths: false,
         output_ref: None,
         output_limits: None,
         model_suffix: None,
@@ -537,6 +544,7 @@ fn a_capped_grep_that_matched_nothing_qualifies_the_absence() {
         annotation: None,
         written_path: None,
         written_paths: Vec::new(),
+        remote_written_paths: false,
         output_ref: None,
         output_limits: None,
         model_suffix: None,
@@ -767,6 +775,7 @@ fn unknown_tool_id_is_noop() {
         annotation: None,
         written_path: None,
         written_paths: Vec::new(),
+        remote_written_paths: false,
         output_ref: None,
         output_limits: None,
         model_suffix: None,
@@ -802,6 +811,7 @@ fn in_progress_tracking() {
         annotation: None,
         written_path: None,
         written_paths: Vec::new(),
+        remote_written_paths: false,
         output_ref: None,
         output_limits: None,
         model_suffix: None,
@@ -818,6 +828,7 @@ fn in_progress_tracking() {
         annotation: None,
         written_path: None,
         written_paths: Vec::new(),
+        remote_written_paths: false,
         output_ref: None,
         output_limits: None,
         model_suffix: None,
@@ -891,6 +902,7 @@ fn events_before_cache_built_render_correctly() {
         annotation: None,
         written_path: None,
         written_paths: Vec::new(),
+        remote_written_paths: false,
         output_ref: None,
         output_limits: None,
         model_suffix: None,
@@ -937,6 +949,7 @@ fn bash_live_output_with_code_input() {
         annotation: None,
         written_path: None,
         written_paths: Vec::new(),
+        remote_written_paths: false,
         output_ref: None,
         output_limits: None,
         model_suffix: None,
@@ -960,6 +973,7 @@ fn cancel_in_progress_marks_pending_as_error(cache_built: bool) {
         annotation: None,
         written_path: None,
         written_paths: Vec::new(),
+        remote_written_paths: false,
         output_ref: None,
         output_limits: None,
         model_suffix: None,
@@ -1062,6 +1076,7 @@ fn tick_drains_the_highlight_worker() {
         annotation: None,
         written_path: None,
         written_paths: Vec::new(),
+        remote_written_paths: false,
         output_ref: None,
         output_limits: None,
         model_suffix: None,
@@ -1112,6 +1127,7 @@ fn tool_done_after_cancel_in_progress_does_not_underflow() {
         annotation: None,
         written_path: None,
         written_paths: Vec::new(),
+        remote_written_paths: false,
         output_ref: None,
         output_limits: None,
         model_suffix: None,
@@ -1164,6 +1180,7 @@ fn search_text_grep_result_includes_structured_output() {
         annotation: None,
         written_path: None,
         written_paths: Vec::new(),
+        remote_written_paths: false,
         output_ref: None,
         output_limits: None,
         model_suffix: None,
@@ -1192,6 +1209,7 @@ fn search_text_diff_output_includes_hunks() {
         annotation: None,
         written_path: None,
         written_paths: Vec::new(),
+        remote_written_paths: false,
         output_ref: None,
         output_limits: None,
         model_suffix: None,
@@ -1215,6 +1233,7 @@ fn search_text_bash_with_code_input() {
         annotation: None,
         written_path: None,
         written_paths: Vec::new(),
+        remote_written_paths: false,
         output_ref: None,
         output_limits: None,
         model_suffix: None,
@@ -2062,6 +2081,7 @@ fn compact_instruction_copy_keeps_its_semantic_label() {
         annotation: None,
         written_path: None,
         written_paths: Vec::new(),
+        remote_written_paths: false,
         output_ref: None,
         output_limits: None,
         model_suffix: None,
@@ -2699,7 +2719,7 @@ fn a_mention_in_a_user_message_answers_the_pointer() {
     let mention = panel.mention_at(row, column, area, Path::new(env!("CARGO_MANIFEST_DIR")));
 
     assert_eq!(
-        mention.map(|mention| mention.path),
+        mention.and_then(|mention| mention.local_path().map(std::path::Path::to_path_buf)),
         Some(std::path::PathBuf::from(MENTION_PATH)),
         "{MENTION_MISSED}"
     );
@@ -2866,6 +2886,7 @@ fn search_text_includes_truncated_bash_output() {
         annotation: None,
         written_path: None,
         written_paths: Vec::new(),
+        remote_written_paths: false,
         output_ref: None,
         output_limits: None,
         model_suffix: None,
@@ -2917,6 +2938,7 @@ fn instruction_segment_has_margin_but_no_own_action_handle() {
         annotation: None,
         written_path: None,
         written_paths: Vec::new(),
+        remote_written_paths: false,
         output_ref: None,
         output_limits: None,
         model_suffix: None,
@@ -2972,6 +2994,7 @@ fn toggle_instruction_segment_expands_and_collapses() {
         annotation: None,
         written_path: None,
         written_paths: Vec::new(),
+        remote_written_paths: false,
         output_ref: None,
         output_limits: None,
         model_suffix: None,
@@ -3010,6 +3033,7 @@ fn handle_click_on_done_tool_records_click_row() {
         annotation: None,
         written_path: None,
         written_paths: Vec::new(),
+        remote_written_paths: false,
         output_ref: None,
         output_limits: None,
         model_suffix: None,
@@ -3077,6 +3101,7 @@ fn tool_done_removes_live_buf_and_snapshots_dirty() {
         annotation: None,
         written_path: None,
         written_paths: Vec::new(),
+        remote_written_paths: false,
         output_ref: None,
         output_limits: None,
         model_suffix: None,
@@ -3369,6 +3394,7 @@ fn tool_done_without_live_buf_preserves_existing_snapshot() {
         annotation: None,
         written_path: None,
         written_paths: Vec::new(),
+        remote_written_paths: false,
         output_ref: None,
         output_limits: None,
         model_suffix: None,
@@ -3398,6 +3424,7 @@ fn tool_done_clean_live_buf_does_not_snapshot() {
         annotation: None,
         written_path: None,
         written_paths: Vec::new(),
+        remote_written_paths: false,
         output_ref: None,
         output_limits: None,
         model_suffix: None,
@@ -3430,6 +3457,7 @@ fn bash_tool_with_snapshot(id: &str) -> MessagesPanel {
         annotation: None,
         written_path: None,
         written_paths: Vec::new(),
+        remote_written_paths: false,
         output_ref: None,
         output_limits: None,
         model_suffix: None,
@@ -4188,6 +4216,7 @@ fn resize_reflows_tool_segment_and_keeps_instruction_segment() {
         annotation: None,
         written_path: None,
         written_paths: Vec::new(),
+        remote_written_paths: false,
         output_ref: None,
         output_limits: None,
         model_suffix: None,
@@ -4386,6 +4415,7 @@ fn theme_switch_repaints_highlighted_code() {
         annotation: None,
         written_path: None,
         written_paths: Vec::new(),
+        remote_written_paths: false,
         output_ref: None,
         output_limits: None,
         model_suffix: None,
@@ -6503,6 +6533,7 @@ fn a_child_at_its_edge_gives_the_rest_of_the_wheel_back() {
 /// untouched window has to hand the whole burst back.
 #[test]
 fn an_unarmed_window_leaves_the_wheel_to_the_transcript() {
+    let _clock = FrozenSpinner::at(0);
     let mut panel = panel_with_running_shell();
     panel.set_batch_child_output("t1", 0, &shell_stream());
     let terminal = render(&mut panel, 80, 24);
@@ -6632,6 +6663,7 @@ fn pressing_a_childs_bar_moves_its_window() {
 /// instead of jumping under the pointer.
 #[test]
 fn grabbing_a_childs_thumb_leaves_the_window_alone() {
+    let _clock = FrozenSpinner::at(0);
     let mut panel = panel_with_running_shell();
     panel.set_batch_child_output("t1", 0, &shell_stream());
     let terminal = render(&mut panel, 80, 24);
@@ -8128,6 +8160,7 @@ fn copying_a_read_body_omits_the_line_number_gutter() {
         annotation: None,
         written_path: None,
         written_paths: Vec::new(),
+        remote_written_paths: false,
         output_ref: None,
         output_limits: None,
         model_suffix: None,

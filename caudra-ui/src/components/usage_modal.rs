@@ -19,10 +19,10 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use crate::components::{ModalScroll, bar_area};
 use crate::components::keybindings::{Bind, key};
 use crate::components::modal::Modal;
 use crate::components::scrollbar::{Scrollbar, ScrollbarMouse};
+use crate::components::{ModalScroll, bar_area};
 use crate::repaint::{Dirty, Watch};
 use crate::theme;
 

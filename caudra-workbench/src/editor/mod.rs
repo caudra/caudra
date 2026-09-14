@@ -18,6 +18,7 @@ use find::Find;
 use highlight::ViewportHighlighter;
 use history::History;
 
+use crate::fs::backend::{LoadedFile, ResourceEntry, WorkbenchPath};
 use crate::fs::read::{self, LineEnding, LoadError, ReadOnly, SaveError};
 use crate::scm::diff::DiffRow;
 
@@ -38,7 +39,8 @@ pub enum DiffKind {
 }
 
 pub struct Tab {
-    pub path: PathBuf,
+    pub path: WorkbenchPath,
+    pub resource: Option<ResourceEntry>,
     pub title: String,
     pub buffer: Buffer,
     pub find: Find,
@@ -80,7 +82,8 @@ impl Tab {
     fn from_load(path: &Path, loaded: read::Loaded, theme_generation: u64) -> Self {
         Self {
             title: title_of(path),
-            path: path.to_path_buf(),
+            path: WorkbenchPath::Local(path.to_path_buf()),
+            resource: None,
             buffer: Buffer::new(loaded.lines),
             find: Find::default(),
             history: History::default(),
@@ -113,6 +116,31 @@ impl Tab {
         Ok(Self::from_load(path, loaded, theme_generation))
     }
 
+    pub fn from_backend(loaded: LoadedFile, theme_generation: u64) -> Self {
+        let path = loaded.entry.path.clone();
+        let display = path.display();
+        Self {
+            title: path.file_name(),
+            path,
+            resource: Some(loaded.entry),
+            buffer: Buffer::new(loaded.lines),
+            find: Find::default(),
+            history: History::default(),
+            highlighter: ViewportHighlighter::new(&display, theme_generation),
+            line_ending: loaded.line_ending,
+            trailing_newline: loaded.trailing_newline,
+            notice: None,
+            diff_rows: None,
+            modified: None,
+            conflict: false,
+            preview: false,
+            revision: 0,
+            scroll: 0,
+            scroll_row: 0,
+            h_scroll: 0,
+        }
+    }
+
     /// A tab that shows text the workbench produced rather than a file it read,
     /// which is how a diff gets scrolling, tabs and focus for free.
     pub fn synthetic(
@@ -121,13 +149,29 @@ impl Tab {
         rows: Vec<DiffRow>,
         theme_generation: u64,
     ) -> Self {
+        Self::synthetic_backend(
+            WorkbenchPath::Local(path.to_path_buf()),
+            title,
+            rows,
+            theme_generation,
+        )
+    }
+
+    pub fn synthetic_backend(
+        path: WorkbenchPath,
+        title: String,
+        rows: Vec<DiffRow>,
+        theme_generation: u64,
+    ) -> Self {
+        let display = path.display();
         Self {
             title,
-            path: path.to_path_buf(),
+            path,
+            resource: None,
             buffer: Buffer::new(rows.iter().map(|row| row.text.clone()).collect()),
             find: Find::default(),
             history: History::default(),
-            highlighter: ViewportHighlighter::new(&path.to_string_lossy(), theme_generation),
+            highlighter: ViewportHighlighter::new(&display, theme_generation),
             line_ending: LineEnding::default(),
             trailing_newline: true,
             notice: None,
@@ -145,10 +189,18 @@ impl Tab {
     /// Points the tab at where its file went. The language is read from the
     /// name, so a rename that changes the extension changes the highlighting
     /// with it.
-    pub fn rename(&mut self, path: &Path, theme_generation: u64) {
-        self.title = title_of(path);
-        self.highlighter = ViewportHighlighter::new(&path.to_string_lossy(), theme_generation);
-        self.path = path.to_path_buf();
+    pub fn rename(
+        &mut self,
+        path: WorkbenchPath,
+        resource: Option<ResourceEntry>,
+        theme_generation: u64,
+    ) {
+        self.title = path.file_name();
+        self.highlighter = ViewportHighlighter::new(&path.display(), theme_generation);
+        self.path = path;
+        if resource.is_some() {
+            self.resource = resource;
+        }
     }
 
     pub fn is_editable(&self) -> bool {
@@ -308,11 +360,14 @@ impl Tab {
     }
 
     pub fn save(&mut self) -> Result<(), SaveError> {
+        let Some(path) = self.path.local() else {
+            return Err(SaveError::ReadOnly(PathBuf::from(self.path.display())));
+        };
         if !self.is_editable() {
-            return Err(SaveError::ReadOnly(self.path.clone()));
+            return Err(SaveError::ReadOnly(path.to_path_buf()));
         }
         let contents = read::encode(self.buffer.lines(), self.line_ending, self.trailing_newline);
-        self.modified = read::save(&self.path, &contents, self.modified)?;
+        self.modified = read::save(path, &contents, self.modified)?;
         self.history.mark_saved();
         self.conflict = false;
         Ok(())
@@ -327,7 +382,10 @@ impl Tab {
             self.conflict = true;
             return Ok(false);
         }
-        let loaded = read::load(&self.path)?;
+        let Some(path) = self.path.local() else {
+            return Ok(false);
+        };
+        let loaded = read::load(path)?;
         let cursor = self.buffer.cursor();
         let scroll = self.scroll;
         self.line_ending = loaded.line_ending;
@@ -349,6 +407,43 @@ impl Tab {
     pub fn discard_and_reload(&mut self) -> Result<(), LoadError> {
         self.history = History::default();
         self.reload_from_disk().map(|_| ())
+    }
+
+    pub fn contents(&self) -> String {
+        read::encode(self.buffer.lines(), self.line_ending, self.trailing_newline)
+    }
+
+    pub fn apply_saved(&mut self, entry: ResourceEntry) {
+        self.path = entry.path.clone();
+        self.resource = Some(entry);
+        self.history.mark_saved();
+        self.conflict = false;
+    }
+
+    pub fn apply_backend_reload(&mut self, loaded: LoadedFile) -> bool {
+        if self.is_dirty() {
+            self.conflict = true;
+            return false;
+        }
+        let cursor = self.buffer.cursor();
+        let scroll = self.scroll;
+        self.path = loaded.entry.path.clone();
+        self.resource = Some(loaded.entry);
+        self.line_ending = loaded.line_ending;
+        self.trailing_newline = loaded.trailing_newline;
+        self.buffer = Buffer::new(loaded.lines);
+        self.buffer.set_cursor(cursor, false);
+        self.scroll = scroll.min(self.buffer.line_count().saturating_sub(1));
+        self.scroll_row = 0;
+        self.history = History::default();
+        self.highlighter.invalidate_from(0);
+        self.conflict = false;
+        true
+    }
+
+    pub fn discard_backend(&mut self, loaded: LoadedFile) {
+        self.history = History::default();
+        self.apply_backend_reload(loaded);
     }
 
     pub fn set_theme_generation(&mut self, generation: u64) {
@@ -530,7 +625,8 @@ impl Editor {
     /// which also protects the one buffer per path invariant the watcher and
     /// the save path both rely on.
     pub fn open(&mut self, path: &Path, theme_generation: u64) -> Result<(), LoadError> {
-        if let Some(index) = self.tabs.iter().position(|tab| tab.path == path) {
+        let identity = WorkbenchPath::Local(path.to_path_buf());
+        if let Some(index) = self.tabs.iter().position(|tab| tab.path == identity) {
             self.active = index;
             self.tabs[index].preview = false;
             return Ok(());
@@ -544,7 +640,8 @@ impl Editor {
     /// next one takes over rather than stacking beside it. A file already open
     /// is raised as it stands, so a tab that was pinned stays pinned.
     pub fn preview(&mut self, path: &Path, theme_generation: u64) -> Result<(), LoadError> {
-        if let Some(index) = self.tabs.iter().position(|tab| tab.path == path) {
+        let identity = WorkbenchPath::Local(path.to_path_buf());
+        if let Some(index) = self.tabs.iter().position(|tab| tab.path == identity) {
             self.active = index;
             return Ok(());
         }
@@ -575,6 +672,27 @@ impl Editor {
         self.active = self.tabs.len() - 1;
     }
 
+    pub fn push_backend(&mut self, mut tab: Tab, preview: bool) {
+        if let Some(index) = self.tabs.iter().position(|open| open.path == tab.path) {
+            self.tabs[index].preview = false;
+            self.active = index;
+            return;
+        }
+        if preview
+            && let Some(index) = self
+                .tabs
+                .iter()
+                .position(|open| open.preview && !open.is_dirty())
+        {
+            tab.preview = true;
+            self.tabs[index] = tab;
+            self.active = index;
+            return;
+        }
+        tab.preview = preview;
+        self.push(tab);
+    }
+
     pub fn close_active(&mut self) -> Option<Tab> {
         if self.tabs.is_empty() {
             return None;
@@ -587,15 +705,36 @@ impl Editor {
     /// Follows a path that moved, taking the tabs under a folder that moved
     /// along with it.
     pub fn rename(&mut self, from: &Path, to: &Path, theme_generation: u64) {
+        self.rename_resource(
+            &WorkbenchPath::Local(from.to_path_buf()),
+            &WorkbenchPath::Local(to.to_path_buf()),
+            None,
+            theme_generation,
+        );
+    }
+
+    pub fn rename_resource(
+        &mut self,
+        from: &WorkbenchPath,
+        to: &WorkbenchPath,
+        resource: Option<ResourceEntry>,
+        theme_generation: u64,
+    ) {
         for tab in &mut self.tabs {
-            let Ok(rest) = tab.path.clone().strip_prefix(from).map(Path::to_path_buf) else {
+            if !tab.path.starts_with(from) {
                 continue;
             };
-            let moved = match rest.as_os_str().is_empty() {
-                true => to.to_path_buf(),
-                false => to.join(rest),
+            let moved = if &tab.path == from {
+                to.clone()
+            } else {
+                let relative = tab.path.display_relative(from);
+                match to.join(&relative) {
+                    Ok(path) => path,
+                    Err(_) => continue,
+                }
             };
-            tab.rename(&moved, theme_generation);
+            let moved_resource = (&tab.path == from).then(|| resource.clone()).flatten();
+            tab.rename(moved, moved_resource, theme_generation);
         }
     }
 

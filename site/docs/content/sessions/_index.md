@@ -9,6 +9,8 @@ group = "Guides"
 
 Caudra stores conversation history as parent-linked items. User prompts, assistant text, reasoning, tool calls, and tool results are separate items. A session head selects the active path through those items. Moving the head keeps the abandoned path available for unrevert and later forks.
 
+For remote sessions, transcripts stay on the client and workspace snapshots stay on the Workcell server. Resume requires the original remote workspace identity and generation. See [Remote session identity and recovery](/docs/remote-workspaces/#cwd-and-resume) before moving an endpoint, replacing a workspace, or recovering an interrupted mutation. The `storage` subcommand is disabled when a remote Workcell selector is supplied.
+
 ## Active sessions
 
 One Caudra runtime can own a session ID at a time. Opening that session from

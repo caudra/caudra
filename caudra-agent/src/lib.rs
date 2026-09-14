@@ -19,10 +19,11 @@ pub(crate) mod task_set;
 pub use agent::{
     Agent, AgentParams, AgentRunParams, COMPACTION_ANCHOR, DEFAULT_GOAL_CONTINUATION_LIMIT,
     GoalError, GoalHandle, GoalResult, GoalSnapshot, GoalStatus, GoalVerdict, History,
-    HistorySnapshot, InstructionBaseline, Instructions, LoadedInstructions, MAX_GOAL_CHARS,
-    MAX_GOAL_CONTINUATION_LIMIT, SharedHistory, UNAVAILABLE_RESULT, close_dangling_tool_calls,
-    find_subdirectory_instructions, goal_checkin_message, goal_kickoff_message,
-    is_instruction_file, is_run_failure_marker, project_for_provider, project_for_target,
+    HistorySnapshot, InstructionBaseline, InstructionSource, Instructions, LoadedInstructions,
+    MAX_GOAL_CHARS, MAX_GOAL_CONTINUATION_LIMIT, SharedHistory, UNAVAILABLE_RESULT,
+    close_dangling_tool_calls, find_subdirectory_instructions, goal_checkin_message,
+    goal_kickoff_message, is_instruction_file, is_run_failure_marker, project_for_provider,
+    project_for_target,
 };
 pub use cancel::{CancelMap, CancelToken, CancelTrigger};
 pub use caudra_config::{AgentConfig, PermissionsConfig, ToolOutputLines};
@@ -35,6 +36,7 @@ pub mod editable_queue;
 pub mod patch;
 pub mod permissions;
 pub mod prompt;
+pub mod remote_project_context;
 pub mod snapshots;
 mod stored_session;
 mod subagent_history;
@@ -47,6 +49,7 @@ pub mod workflow;
 pub mod workspace_baseline;
 pub use stored_session::{
     StoredSession, latest_stored_session, load_stored_session, open_stored_session,
+    resolve_resume_workspace, resume_workspace_session, workspace_logical_cwd,
 };
 pub use subagent_history::{
     SubagentHistoryError, SubagentHistoryLease, SubagentHistoryRecord, SubagentHistorySnapshot,
@@ -86,14 +89,26 @@ pub enum AgentMode {
     Build,
     ReadOnly,
     Plan(PathBuf),
+    RemotePlan(caudra_workspace::PlanRef),
 }
 
 impl AgentMode {
     pub fn plan_path(&self) -> Option<&Path> {
         match self {
             Self::Plan(p) => Some(p),
-            Self::Build | Self::ReadOnly => None,
+            Self::Build | Self::ReadOnly | Self::RemotePlan(_) => None,
         }
+    }
+
+    pub fn plan_ref(&self) -> Option<&caudra_workspace::PlanRef> {
+        match self {
+            Self::RemotePlan(reference) => Some(reference),
+            Self::Build | Self::ReadOnly | Self::Plan(_) => None,
+        }
+    }
+
+    pub fn is_planning(&self) -> bool {
+        matches!(self, Self::Plan(_) | Self::RemotePlan(_))
     }
 
     pub fn is_read_only(&self) -> bool {

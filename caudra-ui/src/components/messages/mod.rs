@@ -2025,6 +2025,7 @@ impl MessagesPanel {
                 annotation: None,
                 written_path: None,
                 written_paths: Vec::new(),
+                remote_written_paths: false,
                 output_ref: None,
                 output_limits: None,
                 model_suffix: None,
@@ -2322,7 +2323,18 @@ impl MessagesPanel {
         known_task_target: bool,
         cwd: &Path,
     ) {
-        self.hover = self.hover_target_at(row, col, area, known_task_target, cwd);
+        self.hover = self.hover_target_at(row, col, area, known_task_target, cwd, false);
+        self.disarm_unless_over(col, row);
+    }
+
+    pub(crate) fn update_hover_remote(
+        &mut self,
+        row: u16,
+        col: u16,
+        area: Rect,
+        known_task_target: bool,
+    ) {
+        self.hover = self.hover_target_at(row, col, area, known_task_target, Path::new(""), true);
         self.disarm_unless_over(col, row);
     }
 
@@ -2388,6 +2400,21 @@ impl MessagesPanel {
     /// and a path the model happens to spell with an `@` was never a request to
     /// open anything.
     pub(crate) fn mention_at(&self, row: u16, col: u16, area: Rect, cwd: &Path) -> Option<Mention> {
+        self.mention_at_mode(row, col, area, cwd, false)
+    }
+
+    pub(crate) fn mention_at_remote(&self, row: u16, col: u16, area: Rect) -> Option<Mention> {
+        self.mention_at_mode(row, col, area, Path::new(""), true)
+    }
+
+    fn mention_at_mode(
+        &self,
+        row: u16,
+        col: u16,
+        area: Rect,
+        cwd: &Path,
+        remote: bool,
+    ) -> Option<Mention> {
         if area.height == 0
             || row < area.y
             || row >= area.bottom()
@@ -2406,7 +2433,12 @@ impl MessagesPanel {
         let (source, byte) = segment.source_at(rel_row, col - area.x, width)?;
         // Provenance counts bytes and the scanner counts chars.
         let offset = source.get(..byte as usize)?.chars().count();
-        mentions::scan_in(&source, cwd)
+        let mentions = if remote {
+            mentions::scan_remote(&source)
+        } else {
+            mentions::scan_in(&source, cwd)
+        };
+        mentions
             .into_iter()
             .find(|(range, _)| range.contains(&offset))
             .map(|(_, mention)| mention)
@@ -2419,6 +2451,7 @@ impl MessagesPanel {
         area: Rect,
         known_task_target: bool,
         cwd: &Path,
+        remote: bool,
     ) -> Option<HoverTarget> {
         if let Some(target) = self.message_action_at(row, col) {
             return Some(HoverTarget::MessageAction(target.segment_index));
@@ -2450,7 +2483,12 @@ impl MessagesPanel {
         }
         // After the link map, so a markdown link keeps its cell wherever the
         // two somehow overlap.
-        if let Some(mention) = self.mention_at(row, col, area, cwd) {
+        let mention = if remote {
+            self.mention_at_remote(row, col, area)
+        } else {
+            self.mention_at(row, col, area, cwd)
+        };
+        if let Some(mention) = mention {
             return Some(HoverTarget::Mention(mention));
         }
         let Some(tool_id) = segment.tool_id.as_deref() else {

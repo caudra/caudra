@@ -171,6 +171,10 @@ pub fn run(
     prompt_profiles: Arc<caudra_agent::prompt::profile::PromptProfileCatalog>,
     model_policy: Arc<ModelPolicy>,
     plugin_rules: Arc<PluginRuleStore>,
+    remote_environment: Option<caudra_agent::headless::RemoteEnvironment>,
+    workspace_session: Option<caudra_workspace::WorkspaceSession>,
+    remote_project_context: Option<Arc<caudra_agent::remote_project_context::RemoteProjectContext>>,
+    local_documents: Option<Arc<caudra_storage::local_documents::LocalDocumentStore>>,
 ) -> Result<()> {
     let prompt = prompt_arg.ok_or_else(|| eyre!(NO_PROMPT))?;
 
@@ -182,8 +186,15 @@ pub fn run(
     config.generate_titles = false;
     let prompt_slots = lua_handle.collect_prompt_slots(&config);
 
-    let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
-    let (mcp_handle, mcp_config_errors) = smol::block_on(caudra_agent::mcp::start_connected(&cwd));
+    let cwd = remote_environment.as_ref().map_or_else(
+        || std::env::current_dir().unwrap_or_else(|_| ".".into()),
+        |environment| environment.cwd.clone().into(),
+    );
+    let (mcp_handle, mcp_config_errors) = if remote_environment.is_some() {
+        smol::block_on(caudra_agent::mcp::start_global_connected(&cwd))
+    } else {
+        smol::block_on(caudra_agent::mcp::start_connected(&cwd))
+    };
     if !mcp_config_errors.is_empty() {
         eprintln!("MCP config error: {mcp_config_errors}");
     }
@@ -222,6 +233,10 @@ pub fn run(
         model_policy,
         plugin_rules,
         goal,
+        remote_environment,
+        workspace_session,
+        remote_project_context,
+        local_documents,
     });
 
     let HeadlessHandle {

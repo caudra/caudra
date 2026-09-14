@@ -5,7 +5,11 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 
+[features]
+test-support = []
+
 [dependencies]
+async-trait = { workspace = true }
 caudra-providers = { workspace = true }
 caudra-config = { workspace = true }
 caudra-diff = { workspace = true }
@@ -17,6 +21,7 @@ tracing = { workspace = true }
 ignore = { workspace = true }
 strum = { workspace = true }
 caudra-storage = { workspace = true }
+caudra-workspace = { workspace = true }
 caudra-workflow = { workspace = true }
 grep-regex = { workspace = true }
 grep-searcher = { workspace = true }
@@ -46,8 +51,8 @@ image = { workspace = true, features = ["jpeg", "gif", "webp"] }
 url = { workspace = true }
 getrandom = { workspace = true }
 fastrand = { workspace = true }
+tempfile = { workspace = true }
 
 
 [dev-dependencies]
 test-case = { workspace = true }
-tempfile = { workspace = true }

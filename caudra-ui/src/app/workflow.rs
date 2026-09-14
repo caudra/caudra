@@ -703,7 +703,6 @@ fn bounded(body: &str) -> Cow<'_, str> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
     use std::time::Duration;
 
     use caudra_agent::types::{WORKFLOW_EVENT_RUN_ID, WorkflowProvenance};
@@ -1484,7 +1483,7 @@ mod tests {
             result: Err(WorkflowError::TrustRequired {
                 name: "review".into(),
                 digest: "abc".into(),
-                path: PathBuf::from("/project/.caudra/workflows/review.rhai"),
+                path: "/project/.caudra/workflows/review.rhai".into(),
             }),
         });
 

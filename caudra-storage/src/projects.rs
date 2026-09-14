@@ -4,13 +4,97 @@
 //! from a hash of the project root, so any drift silently orphans notes and
 //! plans a user already wrote.
 
+use std::fmt;
 use std::path::{Path, PathBuf};
+
+use caudra_workspace::{ProjectKey, SessionWorkspaceBinding};
+
+use crate::workspace_binding::opaque_hash;
+use crate::{StateClass, StateDir, StorageError};
 
 pub(crate) const GIT_MARKER: &str = ".git";
 pub(crate) const PROJECTS_DIR: &str = "projects";
 
 const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+const DOCUMENT_SCOPE_DOMAIN: &str = "remote-local-documents.v1";
+
+#[derive(Clone)]
+pub(crate) enum DocumentProjectScope {
+    Local(LocalProjectAliases),
+    Remote {
+        project: ProjectKey,
+        subdir: PathBuf,
+    },
+}
+
+impl DocumentProjectScope {
+    pub(crate) fn remote(binding: &SessionWorkspaceBinding) -> Self {
+        let authority = binding.authority();
+        let mut identity = Vec::new();
+        for field in [
+            authority.trust_anchor().as_str(),
+            authority.server_id(),
+            authority.workspace_id(),
+            authority.workspace_generation(),
+            authority.resource_namespace_version(),
+            binding.principal().subject(),
+            binding.project().key().as_str(),
+        ] {
+            identity.extend_from_slice(&(field.len() as u64).to_be_bytes());
+            identity.extend_from_slice(field.as_bytes());
+        }
+        Self::Remote {
+            project: binding.project().key().clone(),
+            subdir: Path::new(PROJECTS_DIR).join(format!(
+                "remote-docs-{}",
+                opaque_hash(DOCUMENT_SCOPE_DOMAIN, &identity)
+            )),
+        }
+    }
+
+    pub(crate) fn project_key(&self) -> &ProjectKey {
+        match self {
+            Self::Local(aliases) => aliases.project_key(),
+            Self::Remote { project, .. } => project,
+        }
+    }
+
+    pub(crate) fn read_subdirs(&self) -> Vec<&Path> {
+        match self {
+            Self::Local(aliases) => aliases.read_subdirs(),
+            Self::Remote { subdir, .. } => vec![subdir],
+        }
+    }
+
+    pub(crate) fn ensure_write_subdir(&self, state: &StateDir) -> Result<PathBuf, StorageError> {
+        match self {
+            Self::Local(aliases) => aliases.ensure_write_subdir(state),
+            Self::Remote { subdir, .. } => state
+                .for_class(StateClass::Persistent)
+                .ensure_subdir(subdir),
+        }
+    }
+
+    pub(crate) fn matches_remote(&self, binding: &SessionWorkspaceBinding) -> bool {
+        match (self, Self::remote(binding)) {
+            (
+                Self::Remote { subdir, .. },
+                Self::Remote {
+                    subdir: expected, ..
+                },
+            ) => *subdir == expected,
+            _ => false,
+        }
+    }
+
+    pub(crate) fn reference_namespace(&self) -> &[u8] {
+        match self {
+            Self::Local(aliases) => aliases.project_key().as_str().as_bytes(),
+            Self::Remote { subdir, .. } => subdir.as_os_str().as_encoded_bytes(),
+        }
+    }
+}
 
 /// FNV-1a over the raw bytes, lowercase hex. The Lua original split the state
 /// into 32-bit halves because `bit32` has no 64-bit ops; the arithmetic was
@@ -50,6 +134,102 @@ pub fn project_root(cwd: &Path) -> PathBuf {
 /// The state-directory-relative home for everything scoped to `cwd`'s project.
 pub fn project_subdir(cwd: &Path) -> PathBuf {
     Path::new(PROJECTS_DIR).join(project_id(&project_root(cwd)))
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct LocalProjectAliases {
+    project_key: ProjectKey,
+    legacy_id: LegacyLocalProjectId,
+    keyed_subdir: PathBuf,
+    legacy_subdir: PathBuf,
+}
+
+impl fmt::Debug for LocalProjectAliases {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LocalProjectAliases")
+            .field("project_key", &self.project_key)
+            .field("legacy_id", &self.legacy_id)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct LegacyLocalProjectId(String);
+
+impl LegacyLocalProjectId {
+    pub fn from_root(root: &Path) -> Self {
+        Self(project_id(root))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for LegacyLocalProjectId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("LegacyLocalProjectId")
+            .field(&"<opaque>")
+            .finish()
+    }
+}
+
+impl LocalProjectAliases {
+    pub fn new(cwd: &Path, project_key: ProjectKey) -> Self {
+        let legacy_id = LegacyLocalProjectId::from_root(&project_root(cwd));
+        let keyed_id = format!(
+            "key-{}",
+            opaque_hash("local-project-directory", project_key.as_str().as_bytes())
+        );
+        Self {
+            project_key,
+            legacy_subdir: Path::new(PROJECTS_DIR).join(legacy_id.as_str()),
+            legacy_id,
+            keyed_subdir: Path::new(PROJECTS_DIR).join(keyed_id),
+        }
+    }
+
+    pub fn project_key(&self) -> &ProjectKey {
+        &self.project_key
+    }
+
+    pub fn keyed_subdir(&self) -> &Path {
+        &self.keyed_subdir
+    }
+
+    pub fn legacy_id(&self) -> &LegacyLocalProjectId {
+        &self.legacy_id
+    }
+
+    pub fn legacy_subdir(&self) -> &Path {
+        &self.legacy_subdir
+    }
+
+    pub fn read_subdirs(&self) -> Vec<&Path> {
+        if self.keyed_subdir == self.legacy_subdir {
+            vec![&self.keyed_subdir]
+        } else {
+            vec![&self.keyed_subdir, &self.legacy_subdir]
+        }
+    }
+
+    pub fn resolve_existing(&self, state_dir: &StateDir) -> Option<PathBuf> {
+        self.read_subdirs()
+            .into_iter()
+            .map(|subdir| state_dir.persistent_path().join(subdir))
+            .find(|path| path.is_dir())
+    }
+
+    pub fn ensure_write_subdir(&self, state_dir: &StateDir) -> Result<PathBuf, StorageError> {
+        if let Some(existing) = self.resolve_existing(state_dir) {
+            return Ok(existing);
+        }
+        state_dir
+            .for_class(StateClass::Persistent)
+            .ensure_subdir(&self.keyed_subdir)
+    }
 }
 
 #[cfg(test)]
@@ -111,5 +291,47 @@ mod tests {
         std::fs::create_dir_all(&nested).unwrap();
         std::fs::create_dir_all(root.join(GIT_MARKER)).unwrap();
         assert_eq!(project_subdir(&nested), project_subdir(&root));
+    }
+
+    #[test]
+    fn keyed_projects_dual_read_legacy_state_without_moving_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_dir = StateDir::from_path(temp.path().join("state"));
+        let cwd = temp.path().join("checkout");
+        let aliases = LocalProjectAliases::new(&cwd, ProjectKey::new("authority-project").unwrap());
+        let legacy = state_dir.persistent_path().join(aliases.legacy_subdir());
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("memory.md"), "kept").unwrap();
+
+        assert_eq!(aliases.resolve_existing(&state_dir), Some(legacy.clone()));
+        assert_eq!(
+            aliases.legacy_id().as_str(),
+            project_id(&project_root(&cwd))
+        );
+        assert_eq!(aliases.ensure_write_subdir(&state_dir).unwrap(), legacy);
+        assert!(
+            !state_dir
+                .persistent_path()
+                .join(aliases.keyed_subdir())
+                .exists()
+        );
+    }
+
+    #[test]
+    fn new_project_key_state_is_path_safe_and_created_lazily() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_dir = StateDir::from_path(temp.path().join("state"));
+        let aliases = LocalProjectAliases::new(
+            Path::new("/missing/project"),
+            ProjectKey::new("project/with/path-syntax").unwrap(),
+        );
+
+        assert_eq!(aliases.resolve_existing(&state_dir), None);
+        let created = aliases.ensure_write_subdir(&state_dir).unwrap();
+        assert_eq!(
+            created,
+            state_dir.persistent_path().join(aliases.keyed_subdir())
+        );
+        assert!(created.is_dir());
     }
 }

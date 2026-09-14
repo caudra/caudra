@@ -18,7 +18,8 @@ pub use caudra_storage::permission_state::{
     PermissionArgumentConstraint, PermissionCapabilityFamily, PermissionExecutorKind,
     PermissionLifetime, PermissionResourceAccess, PermissionResourceConstraint,
     PermissionResourceKind, PermissionResourceSelector, PermissionRuleRecord, PermissionSubject,
-    SelectedPermissionArgument, StructuredPermissionEffect, StructuredPermissionRule,
+    RemotePermissionIdentity, SelectedPermissionArgument, StructuredPermissionEffect,
+    StructuredPermissionRule,
 };
 
 const NATIVE_OWNER: &str = "caudra";
@@ -107,6 +108,7 @@ pub enum PermissionAuthorityProfile {
     Url,
     Query,
     Shell,
+    RemoteResource,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -994,7 +996,15 @@ fn operation_matches(
         // Widens which subject a rule reaches, never which operation, so the
         // constraint still has to name the operation exactly.
         Some(PermissionCapabilityFamily::McpServer) | None => {
-            constraint.kind == resource.kind
+            (constraint.kind == resource.kind
+                || matches!(
+                    (&constraint.kind, &resource.kind),
+                    (
+                        PermissionResourceKind::RemoteDirectory { identity: directory },
+                        PermissionResourceKind::RemoteFile { identity: descendant }
+                            | PermissionResourceKind::RemoteDirectory { identity: descendant }
+                    ) if directory == descendant
+                ))
                 && !constraint
                     .access
                     .as_ref()
@@ -1115,10 +1125,11 @@ fn selector_width(selector: &PermissionResourceSelector) -> SelectorWidth {
         PermissionResourceSelector::Subtree { .. }
         | PermissionResourceSelector::FilesystemSubtreeDigest { .. }
         | PermissionResourceSelector::UrlSubtreeDigest { .. }
-        | PermissionResourceSelector::UrlOriginDigest { .. } => SelectorWidth::Region(0, 0),
-        PermissionResourceSelector::Exact { .. } | PermissionResourceSelector::Digest { .. } => {
-            SelectorWidth::Exact
-        }
+        | PermissionResourceSelector::UrlOriginDigest { .. }
+        | PermissionResourceSelector::RemoteSubtree { .. } => SelectorWidth::Region(0, 0),
+        PermissionResourceSelector::Exact { .. }
+        | PermissionResourceSelector::Digest { .. }
+        | PermissionResourceSelector::RemoteResource { .. } => SelectorWidth::Exact,
     }
 }
 
@@ -1270,9 +1281,11 @@ fn selector_authority(
         }
         PermissionResourceSelector::FilesystemSubtreeDigest { .. }
         | PermissionResourceSelector::UrlSubtreeDigest { .. }
-        | PermissionResourceSelector::UrlOriginDigest { .. } => {
+        | PermissionResourceSelector::UrlOriginDigest { .. }
+        | PermissionResourceSelector::RemoteSubtree { .. } => {
             format!("this {} tree", kind_noun(kind))
         }
+        PermissionResourceSelector::RemoteResource { .. } => format!("this {}", kind_noun(kind)),
         PermissionResourceSelector::Any => blanket_authority(kind),
     }
 }
@@ -1284,6 +1297,11 @@ fn blanket_authority(kind: &PermissionResourceKind) -> String {
 fn kind_noun(kind: &PermissionResourceKind) -> String {
     match kind {
         PermissionResourceKind::Custom { name } => safe_summary(name),
+        PermissionResourceKind::RemoteFile { .. } => "remote file".into(),
+        PermissionResourceKind::RemoteDirectory { .. } => "remote directory".into(),
+        PermissionResourceKind::RemoteResource { resource_kind, .. } => {
+            format!("remote {}", safe_summary(resource_kind))
+        }
         other => format!("{other:?}").to_lowercase(),
     }
 }
@@ -1410,6 +1428,8 @@ fn mcp_server(subject: &PermissionSubject) -> Option<&str> {
     match subject {
         PermissionSubject::Mcp { server, .. } if !server.is_empty() => Some(server),
         PermissionSubject::Mcp { .. }
+        | PermissionSubject::RemoteWorkcell { .. }
+        | PermissionSubject::RemoteNative { .. }
         | PermissionSubject::Native { .. }
         | PermissionSubject::Lua { .. }
         | PermissionSubject::UnknownLegacy { .. } => None,
@@ -1423,6 +1443,8 @@ fn is_filesystem_read_subject(subject: &PermissionSubject) -> bool {
         }
         PermissionSubject::Lua { .. }
         | PermissionSubject::Mcp { .. }
+        | PermissionSubject::RemoteWorkcell { .. }
+        | PermissionSubject::RemoteNative { .. }
         | PermissionSubject::UnknownLegacy { .. } => false,
     }
 }
@@ -1454,6 +1476,12 @@ fn selector_matches(
         PermissionResourceSelector::CommandPattern { pattern } => {
             matches!(kind, PermissionResourceKind::Command)
                 && super::command_pattern::matches(pattern, value)
+        }
+        PermissionResourceSelector::RemoteResource { identity, scope } => {
+            remote_resource_matches(kind, value, identity, scope, false)
+        }
+        PermissionResourceSelector::RemoteSubtree { identity, scope } => {
+            remote_resource_matches(kind, value, identity, scope, true)
         }
         PermissionResourceSelector::Exact { value: expected } => match kind {
             PermissionResourceKind::File | PermissionResourceKind::Directory => {
@@ -1493,6 +1521,40 @@ fn resource_value_digest(value: &str, kind: &PermissionResourceKind) -> Option<S
         _ => value.to_owned(),
     };
     Some(canonical_json_sha256(&Value::String(canonical)))
+}
+
+fn remote_resource_matches(
+    kind: &PermissionResourceKind,
+    value: &str,
+    identity: &RemotePermissionIdentity,
+    scope: &[String],
+    descendants: bool,
+) -> bool {
+    let kind_matches = match kind {
+        PermissionResourceKind::RemoteFile { identity: actual }
+        | PermissionResourceKind::RemoteDirectory { identity: actual }
+        | PermissionResourceKind::RemoteResource {
+            identity: actual, ..
+        } => actual == identity,
+        _ => false,
+    };
+    let Some(actual_scope) = remote_scope(value) else {
+        return false;
+    };
+    kind_matches
+        && if descendants {
+            actual_scope.starts_with(scope)
+        } else {
+            actual_scope == scope
+        }
+}
+
+fn remote_scope(value: &str) -> Option<Vec<String>> {
+    let scope = value.split('\u{1f}').map(str::to_owned).collect::<Vec<_>>();
+    (!scope.is_empty()
+        && scope.iter().all(|part| !part.is_empty())
+        && scope.iter().collect::<HashSet<_>>().len() == scope.len())
+    .then_some(scope)
 }
 
 fn scoped_digest(domain: &str, value: &str) -> String {
@@ -2049,6 +2111,20 @@ fn attribute_kind(name: &str) -> PermissionResourceKind {
 /// Widening a single resource means taking this and replacing its selector, so
 /// option generation and answer validation both start here.
 fn resource_constraint(resource: &PermissionResource) -> PermissionResourceConstraint {
+    if let Some(identity) = remote_resource_identity(&resource.kind)
+        && let Some(scope) = remote_scope(&resource.value)
+    {
+        return PermissionResourceConstraint {
+            kind: resource.kind.clone(),
+            selector: PermissionResourceSelector::RemoteResource {
+                identity: identity.clone(),
+                scope,
+            },
+            access: resource.access.clone(),
+            protected: Some(resource.protected),
+            attributes: BTreeMap::new(),
+        };
+    }
     PermissionResourceConstraint {
         kind: resource.kind.clone(),
         selector: PermissionResourceSelector::Digest {
@@ -2070,6 +2146,33 @@ fn resource_constraint(resource: &PermissionResource) -> PermissionResourceConst
             })
             .collect(),
     }
+}
+
+fn remote_resource_identity(kind: &PermissionResourceKind) -> Option<&RemotePermissionIdentity> {
+    match kind {
+        PermissionResourceKind::RemoteFile { identity }
+        | PermissionResourceKind::RemoteDirectory { identity }
+        | PermissionResourceKind::RemoteResource { identity, .. } => Some(identity),
+        _ => None,
+    }
+}
+
+fn reusable_remote_resource_constraint(
+    resource: &PermissionResource,
+) -> PermissionResourceConstraint {
+    let mut constraint = resource_constraint(resource);
+    if matches!(
+        resource.kind,
+        PermissionResourceKind::RemoteDirectory { .. }
+    ) && let PermissionResourceSelector::RemoteResource { identity, scope } =
+        &constraint.selector
+    {
+        constraint.selector = PermissionResourceSelector::RemoteSubtree {
+            identity: identity.clone(),
+            scope: scope.clone(),
+        };
+    }
+    constraint
 }
 
 fn exact_resource_constraints(
@@ -2155,6 +2258,28 @@ fn rule_options(
             None,
         ),
     ];
+
+    if matches!(authority, PermissionAuthorityProfile::RemoteResource)
+        && resources
+            .iter()
+            .all(|resource| remote_resource_identity(&resource.kind).is_some())
+    {
+        options.push(option(
+            "allow_remote_resources",
+            "These remote resources",
+            "Allow these authority-issued resources with different display controls.",
+            StructuredPermissionEffect::Allow,
+            resources
+                .iter()
+                .map(reusable_remote_resource_constraint)
+                .collect(),
+            PermissionArgumentConstraint::Unconstrained,
+            reusable.clone(),
+            true,
+            false,
+            None,
+        ));
+    }
 
     if matches!(authority, PermissionAuthorityProfile::Url)
         && let [resource] = resources
@@ -2931,7 +3056,19 @@ fn presentation_for(
         resources: resources
             .iter()
             .map(|resource| {
-                let mut summary = if resource.kind == PermissionResourceKind::Url {
+                let mut summary = if matches!(
+                    resource.kind,
+                    PermissionResourceKind::RemoteFile { .. }
+                        | PermissionResourceKind::RemoteDirectory { .. }
+                        | PermissionResourceKind::RemoteResource { .. }
+                ) {
+                    resource
+                        .attributes
+                        .iter()
+                        .find(|(name, _)| name.starts_with("display_"))
+                        .map(|(_, value)| value)
+                        .map_or_else(|| "remote resource".into(), |path| safe_summary(path))
+                } else if resource.kind == PermissionResourceKind::Url {
                     redacted_url_summary(&resource.value)
                 } else {
                     safe_summary(&resource.value)
@@ -3116,6 +3253,286 @@ mod tests {
             },
             PermissionExecutorKind::Native,
         )
+    }
+
+    fn remote_identity(
+        anchor: &str,
+        server: &str,
+        workspace: &str,
+        generation: &str,
+        namespace: &str,
+        principal: &str,
+        project: &str,
+    ) -> RemotePermissionIdentity {
+        let authority = caudra_workspace::AuthorityIdentity::new(
+            caudra_workspace::SourceTrustAnchor::new(anchor).unwrap(),
+            server,
+            workspace,
+            generation,
+            namespace,
+        )
+        .unwrap();
+        RemotePermissionIdentity {
+            principal: caudra_workspace::AuthenticatedPrincipalId::new(
+                authority.clone(),
+                principal,
+            )
+            .unwrap(),
+            project: caudra_workspace::ProjectIdentity::new(
+                authority.clone(),
+                caudra_workspace::ProjectKey::new(project).unwrap(),
+            ),
+            authority,
+        }
+    }
+
+    fn default_remote_identity() -> RemotePermissionIdentity {
+        remote_identity(
+            "https://workcell.example",
+            "server",
+            "workspace",
+            "generation",
+            "namespace",
+            "principal",
+            "project",
+        )
+    }
+
+    fn remote_request_with(identity: RemotePermissionIdentity) -> PermissionRequest {
+        remote_request_resource(
+            identity.clone(),
+            PermissionResourceKind::RemoteFile { identity },
+            "root\u{1f}opaque-file",
+        )
+    }
+
+    fn remote_request_resource(
+        identity: RemotePermissionIdentity,
+        kind: PermissionResourceKind,
+        value: &str,
+    ) -> PermissionRequest {
+        let intent = PermissionIntent::new(
+            PermissionScopes::single("remote intent".into()),
+            vec![PermissionResource {
+                kind,
+                value: value.into(),
+                access: Some(PermissionResourceAccess::Read),
+                protected: false,
+                requires_prompt: false,
+                attributes: BTreeMap::from([(
+                    "display_path".into(),
+                    "/path/that/must/not/be/probed".into(),
+                )]),
+            }],
+            PermissionRisk::Low,
+        )
+        .with_authority(PermissionAuthorityProfile::RemoteResource);
+        PermissionRequest::from_intent_with_identity(
+            "remote-request".into(),
+            ToolKey::native("file_read"),
+            &intent,
+            json!({"filePath":"display only"}),
+            Path::new("/local/project"),
+            PermissionSubject::RemoteWorkcell {
+                identity,
+                tool: "file_read".into(),
+                contract: "file.read.v1@v1/v1".into(),
+            },
+            PermissionExecutorKind::RemoteWorkcell,
+        )
+    }
+
+    fn remote_request() -> PermissionRequest {
+        remote_request_with(default_remote_identity())
+    }
+
+    #[test]
+    fn remote_grants_are_isolated_across_every_subject_identity_dimension() {
+        let request = remote_request();
+        let rule = request
+            .options
+            .iter()
+            .find(|option| option.id == "allow_remote_resources")
+            .expect("remote reusable option")
+            .rule
+            .clone();
+        assert!(permission_rule_covers_request(&rule, &request));
+
+        let identities = [
+            (
+                "origin",
+                remote_identity(
+                    "https://clone.example",
+                    "server",
+                    "workspace",
+                    "generation",
+                    "namespace",
+                    "principal",
+                    "project",
+                ),
+            ),
+            (
+                "server",
+                remote_identity(
+                    "https://workcell.example",
+                    "other-server",
+                    "workspace",
+                    "generation",
+                    "namespace",
+                    "principal",
+                    "project",
+                ),
+            ),
+            (
+                "workspace",
+                remote_identity(
+                    "https://workcell.example",
+                    "server",
+                    "other-workspace",
+                    "generation",
+                    "namespace",
+                    "principal",
+                    "project",
+                ),
+            ),
+            (
+                "generation",
+                remote_identity(
+                    "https://workcell.example",
+                    "server",
+                    "workspace",
+                    "other-generation",
+                    "namespace",
+                    "principal",
+                    "project",
+                ),
+            ),
+            (
+                "namespace",
+                remote_identity(
+                    "https://workcell.example",
+                    "server",
+                    "workspace",
+                    "generation",
+                    "other-namespace",
+                    "principal",
+                    "project",
+                ),
+            ),
+            (
+                "principal",
+                remote_identity(
+                    "https://workcell.example",
+                    "server",
+                    "workspace",
+                    "generation",
+                    "namespace",
+                    "other-principal",
+                    "project",
+                ),
+            ),
+            (
+                "project",
+                remote_identity(
+                    "https://workcell.example",
+                    "server",
+                    "workspace",
+                    "generation",
+                    "namespace",
+                    "principal",
+                    "other-project",
+                ),
+            ),
+        ];
+        for (dimension, identity) in identities {
+            let other = remote_request_with(identity);
+            assert!(
+                !permission_rule_covers_request(&rule, &other),
+                "grant crossed {dimension}"
+            );
+        }
+        for dimension in ["tool", "contract"] {
+            let mut other = request.clone();
+            let PermissionSubject::RemoteWorkcell { tool, contract, .. } = &mut other.subject
+            else {
+                unreachable!("remote request has remote subject")
+            };
+            if dimension == "tool" {
+                *tool = "other".into();
+            } else {
+                *contract = "other".into();
+            }
+            assert!(!permission_rule_covers_request(&rule, &other));
+        }
+    }
+
+    #[test]
+    fn remote_resource_selectors_use_opaque_identity_without_local_path_rules() {
+        let request = remote_request();
+        let option = request
+            .options
+            .iter()
+            .find(|option| option.id == "allow_remote_resources")
+            .expect("remote reusable option");
+        let selector = &option.rule.resources[0].selector;
+        assert!(matches!(
+            selector,
+            PermissionResourceSelector::RemoteResource {
+                identity,
+                scope,
+            } if identity == &default_remote_identity()
+                && scope == &["root".to_owned(), "opaque-file".to_owned()]
+        ));
+        assert_eq!(
+            request.presentation.resources[0].summary,
+            "/path/that/must/not/be/probed"
+        );
+
+        let mut other_scope = request.clone();
+        other_scope.resources[0].value = "root\u{1f}other".into();
+        assert!(!permission_rule_covers_request(&option.rule, &other_scope));
+        let mut other_identity = request.clone();
+        other_identity.resources[0].kind = PermissionResourceKind::RemoteFile {
+            identity: remote_identity(
+                "https://clone.example",
+                "server",
+                "workspace",
+                "generation",
+                "namespace",
+                "principal",
+                "project",
+            ),
+        };
+        assert!(!permission_rule_covers_request(
+            &option.rule,
+            &other_identity
+        ));
+    }
+
+    #[test]
+    fn remote_directory_grant_uses_complete_opaque_ancestry() {
+        let identity = default_remote_identity();
+        let request = remote_request_resource(
+            identity.clone(),
+            PermissionResourceKind::RemoteDirectory {
+                identity: identity.clone(),
+            },
+            "root\u{1f}parent\u{1f}directory",
+        );
+        let rule = request
+            .options
+            .iter()
+            .find(|option| option.id == "allow_remote_resources")
+            .unwrap()
+            .rule
+            .clone();
+        let mut descendant = request.clone();
+        descendant.resources[0].kind = PermissionResourceKind::RemoteFile { identity };
+        descendant.resources[0].value = "root\u{1f}parent\u{1f}directory\u{1f}file".into();
+        assert!(permission_rule_covers_request(&rule, &descendant));
+
+        descendant.resources[0].value = "root\u{1f}cloned-directory\u{1f}file".into();
+        assert!(!permission_rule_covers_request(&rule, &descendant));
     }
 
     fn exact_constraint(resource: &PermissionResource) -> PermissionResourceConstraint {

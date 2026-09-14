@@ -10,7 +10,7 @@ use caudra_providers::{
     settle_session,
 };
 use caudra_storage::StateDir;
-use caudra_storage::sessions::StoredMode;
+use caudra_storage::sessions::{StoredMode, StoredPlanTarget};
 
 use crate::AppSession;
 
@@ -85,19 +85,39 @@ impl SessionState {
 
         let mut warnings = Vec::new();
 
-        let mut plan = match &session.meta.plan_path {
-            Some(p) if Path::new(p).exists() => {
+        let mut plan = match &session.meta.plan_target {
+            Some(StoredPlanTarget::PlanRef { reference }) => {
                 if session.meta.plan_written {
-                    PlanState::Ready(PathBuf::from(p))
+                    PlanState::RemoteReady(reference.clone())
                 } else {
-                    PlanState::Drafting(PathBuf::from(p))
+                    PlanState::RemoteDrafting(reference.clone())
                 }
             }
-            Some(_) => {
+            Some(StoredPlanTarget::LocalPath { path }) if Path::new(path).exists() => {
+                if session.meta.plan_written {
+                    PlanState::Ready(PathBuf::from(path))
+                } else {
+                    PlanState::Drafting(PathBuf::from(path))
+                }
+            }
+            Some(StoredPlanTarget::LocalPath { .. }) => {
                 warnings.push(PLAN_FILE_MISSING_WARNING.into());
                 PlanState::None
             }
-            None => PlanState::None,
+            None => match &session.meta.plan_path {
+                Some(path) if Path::new(path).exists() => {
+                    if session.meta.plan_written {
+                        PlanState::Ready(PathBuf::from(path))
+                    } else {
+                        PlanState::Drafting(PathBuf::from(path))
+                    }
+                }
+                Some(_) => {
+                    warnings.push(PLAN_FILE_MISSING_WARNING.into());
+                    PlanState::None
+                }
+                None => PlanState::None,
+            },
         };
 
         if mode == Mode::Plan {

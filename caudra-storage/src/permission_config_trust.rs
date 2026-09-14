@@ -45,6 +45,38 @@ pub fn revoke_project_trust(state_dir: &StateDir, project: &Path) -> Result<(), 
     Ok(())
 }
 
+pub fn is_remote_asset_trusted(
+    state_dir: &StateDir,
+    asset: &caudra_workspace::ProjectAssetTrustKey,
+    digest: &str,
+) -> Result<bool, StorageError> {
+    validate_digest(digest)?;
+    let scope = state::remote_asset_scope(asset);
+    Ok(state::get::<String>(state_dir, &scope, TRUST)?.is_some_and(|stored| stored == digest))
+}
+
+pub fn trust_remote_asset(
+    state_dir: &StateDir,
+    asset: &caudra_workspace::ProjectAssetTrustKey,
+    digest: &str,
+) -> Result<(), StorageError> {
+    validate_digest(digest)?;
+    state::set(
+        state_dir,
+        &state::remote_asset_scope(asset),
+        TRUST,
+        &digest.to_owned(),
+    )
+}
+
+pub fn revoke_remote_asset_trust(
+    state_dir: &StateDir,
+    asset: &caudra_workspace::ProjectAssetTrustKey,
+) -> Result<(), StorageError> {
+    state::delete(state_dir, &state::remote_asset_scope(asset), TRUST)?;
+    Ok(())
+}
+
 fn scope(project: &Path) -> Result<String, StorageError> {
     Ok(project_scope(&project.canonicalize()?))
 }

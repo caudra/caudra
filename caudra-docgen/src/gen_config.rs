@@ -5,8 +5,7 @@ use caudra_agent::tools::ToolRegistry;
 use caudra_config::{
     AgentConfig, ConfigField, DEFAULT_MAX_LOG_FILES, DEFAULT_MAX_OUTPUT_LINES,
     DEFAULT_MOUSE_SCROLL_LINES, MIN_TOOL_OUTPUT_LINES, ProviderConfig, RetentionConfig,
-    SnapshotsConfig,
-    StorageConfig, TOP_LEVEL_FIELDS, TelemetryConfig, ToolOutputLines, UiConfig,
+    SnapshotsConfig, StorageConfig, TOP_LEVEL_FIELDS, TelemetryConfig, ToolOutputLines, UiConfig,
 };
 use caudra_lua::{OptionSpec, OptionType, PluginHost, PluginOptionSpecs};
 
@@ -381,6 +380,10 @@ Two places, both optional:
 - **Project**: `.caudra/init.lua` (relative to your working directory)
 
 When both exist, project settings override global ones. Neither file is required.
+
+Remote sessions load only the client's global executable configuration. They do not load either checkout's project `init.lua`, project environment files, or project MCP configuration. Remote project context uses a bounded declarative asset manifest instead. See [Remote Workspaces](/docs/remote-workspaces/#project-context-and-trust).
+
+Remote endpoint profiles live in a separate user `workcell.toml`, with `version = 1` and tables named `[workcell.profiles.NAME]`. They are not `caudra.setup()` settings. See [profile configuration](/docs/remote-workspaces/#configure-a-profile) for the exact fields and credential rules.
 
 ## Example
 

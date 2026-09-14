@@ -11,11 +11,48 @@ const SPINNER_FRAME_MS: u128 = 80;
 pub const SPINNER_FRAME: Duration = Duration::from_millis(SPINNER_FRAME_MS as u64);
 
 pub fn spinner_frame(elapsed_ms: u128) -> char {
+    #[cfg(test)]
+    let elapsed_ms = test_clock::elapsed(elapsed_ms);
     SPINNER_FRAMES[(elapsed_ms / SPINNER_FRAME_MS) as usize % SPINNER_FRAMES.len()]
 }
 
 pub fn spinner_str(elapsed_ms: u128) -> &'static str {
+    #[cfg(test)]
+    let elapsed_ms = test_clock::elapsed(elapsed_ms);
     SPINNER_STRS[(elapsed_ms / SPINNER_FRAME_MS) as usize % SPINNER_STRS.len()]
+}
+
+#[cfg(test)]
+pub(crate) mod test_clock {
+    use std::{cell::Cell, marker::PhantomData, rc::Rc};
+
+    thread_local! {
+        static ELAPSED: Cell<Option<u128>> = const { Cell::new(None) };
+    }
+
+    pub(crate) struct FrozenSpinner {
+        previous: Option<u128>,
+        thread: PhantomData<Rc<()>>,
+    }
+
+    impl FrozenSpinner {
+        pub(crate) fn at(elapsed_ms: u128) -> Self {
+            Self {
+                previous: ELAPSED.replace(Some(elapsed_ms)),
+                thread: PhantomData,
+            }
+        }
+    }
+
+    impl Drop for FrozenSpinner {
+        fn drop(&mut self) {
+            ELAPSED.set(self.previous);
+        }
+    }
+
+    pub(super) fn elapsed(real: u128) -> u128 {
+        ELAPSED.get().unwrap_or(real)
+    }
 }
 
 /// Spinners need a consistent time reference. Using a static epoch avoids
@@ -184,6 +221,24 @@ mod tests {
         let wrapped = spinner_frame(SPINNER_FRAME_MS * SPINNER_FRAMES.len() as u128);
         assert_eq!(first, wrapped);
         assert_ne!(first, spinner_frame(SPINNER_FRAME_MS));
+    }
+
+    #[test]
+    fn frozen_spinner_controls_both_render_paths_and_restores_time() {
+        use super::test_clock::FrozenSpinner;
+
+        {
+            let _clock = FrozenSpinner::at(0);
+            assert_eq!(spinner_frame(SPINNER_FRAME_MS), SPINNER_FRAMES[0]);
+            assert_eq!(spinner_str(SPINNER_FRAME_MS), SPINNER_STRS[0]);
+            {
+                let _next_frame = FrozenSpinner::at(SPINNER_FRAME_MS);
+                assert_eq!(spinner_frame(0), SPINNER_FRAMES[1]);
+                assert_eq!(spinner_str(0), SPINNER_STRS[1]);
+            }
+            assert_eq!(spinner_frame(SPINNER_FRAME_MS), SPINNER_FRAMES[0]);
+        }
+        assert_eq!(spinner_frame(SPINNER_FRAME_MS), SPINNER_FRAMES[1]);
     }
 
     #[test]

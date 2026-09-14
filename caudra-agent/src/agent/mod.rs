@@ -27,9 +27,10 @@ pub use history::{
     is_run_failure_marker,
 };
 pub use instructions::{
-    InstructionBaseline, InstructionScope, Instructions, LoadedInstructions, build_system_prompt,
-    environment_block, find_subdirectory_instructions, is_instruction_file, load_instruction_text,
-    load_instructions,
+    InstructionBaseline, InstructionScope, InstructionSource, Instructions, LoadedInstructions,
+    build_system_prompt, build_system_prompt_for_remote, environment_block,
+    find_remote_nested_instructions, find_subdirectory_instructions, is_instruction_file,
+    load_instruction_text, load_instructions, load_remote_instructions,
 };
 pub use provider_projection::{project as project_for_provider, project_for_target};
 pub use run::{

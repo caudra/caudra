@@ -17,6 +17,8 @@ use grep_matcher::Matcher;
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
 use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkMatch};
 
+use crate::fs::backend::ResourceEntry;
+use crate::fs::backend::WorkbenchPath;
 use crate::fs::tree::GIT_DIR;
 
 const MAX_HITS: usize = 5_000;
@@ -40,7 +42,8 @@ pub struct Query {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hit {
-    pub path: PathBuf,
+    pub path: WorkbenchPath,
+    pub resource: Option<ResourceEntry>,
     pub line: u64,
     pub text: String,
     /// Char range of the match inside `text`, already clamped to the part of
@@ -240,7 +243,8 @@ impl HitSink<'_> {
         });
         let (text, range) = clamp(text, range);
         Some(Hit {
-            path: self.path.to_path_buf(),
+            path: WorkbenchPath::Local(self.path.to_path_buf()),
+            resource: None,
             line,
             text,
             range,
@@ -343,10 +347,7 @@ mod tests {
     }
 
     fn names(hits: &[Hit]) -> Vec<String> {
-        hits.iter()
-            .filter_map(|hit| hit.path.file_name())
-            .map(|name| name.to_string_lossy().into_owned())
-            .collect()
+        hits.iter().map(|hit| hit.path.file_name()).collect()
     }
 
     #[test]

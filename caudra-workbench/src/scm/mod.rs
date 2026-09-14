@@ -6,11 +6,11 @@
 //! height, and its own fold. One cursor walks all three, so a single set of
 //! arrow keys covers the pane the way it covers a single list.
 //!
-//! Everything here is synchronous. A `git status` over a working tree is fast
-//! enough to run on a keystroke, and a worker would buy latency the pane cannot
-//! spend: the list has to be correct the instant it is drawn, because the next
-//! key stages whatever the cursor is on.
+//! Local repositories retain the synchronous workbench semantics. Workspace
+//! sessions are populated by the asynchronous structured backend and never
+//! inspect the client host repository.
 
+pub mod backend;
 pub mod diff;
 pub mod graph;
 pub mod repo;
@@ -18,6 +18,10 @@ pub mod tree;
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+
+use caudra_workspace::{
+    ScmChangeKind, ScmRepository, ScmRepositoryRevisions, ScmStatusEntry, WorkspacePath,
+};
 
 use crate::fs::tree::GitMark;
 use graph::Rail;
@@ -34,6 +38,7 @@ pub const MIN_SECTION_ROWS: u16 = 1;
 const STAGED_TITLE: &str = "STAGED CHANGES";
 const UNSTAGED_TITLE: &str = "CHANGES";
 const GRAPH_TITLE: &str = "GRAPH";
+const MAX_WARNINGS: usize = 4;
 
 /// What an expanded commit says when the walk found no blob to list, which is a
 /// commit that only moved a reference or changed a mode.
@@ -154,6 +159,8 @@ impl Default for SectionState {
 #[derive(Default)]
 pub struct Scm {
     repo: Option<Repo>,
+    workspace_repo: Option<ScmRepository>,
+    workspace_status: Vec<ScmStatusEntry>,
     changes: Vec<Change>,
     log: Vec<Commit>,
     rails: Vec<Rail>,
@@ -173,6 +180,7 @@ pub struct Scm {
     flat: bool,
     head: Option<String>,
     error: Option<String>,
+    warnings: Vec<String>,
     armed: Option<String>,
 }
 
@@ -197,6 +205,64 @@ impl Scm {
             // Opening the pane lands on something actionable rather than on a
             // title, so the first key does what it looks like it will.
             self.select_first_row();
+        }
+    }
+
+    pub fn open_workspace(&mut self) {
+        let carried = (self.flat, self.sections.clone());
+        *self = Self::default();
+        self.flat = carried.0;
+        self.sections = carried.1;
+        for state in &mut self.sections {
+            state.scroll = 0;
+            state.rows.clear();
+            state.dirs.clear();
+        }
+        self.error = Some("Loading remote source control…".to_owned());
+    }
+
+    pub fn apply_workspace_snapshot(&mut self, snapshot: backend::Snapshot) {
+        let previous = self.anchor();
+        self.head = Some(snapshot.repository.revisions.head.as_str().to_owned());
+        self.workspace_repo = Some(snapshot.repository);
+        self.workspace_status = snapshot.status;
+        self.warnings = snapshot.warnings;
+        self.error = None;
+        self.changes = workspace_changes(&self.workspace_status);
+        self.log = snapshot
+            .commits
+            .into_iter()
+            .map(|commit| Commit {
+                id: commit.id.as_str().to_owned(),
+                summary: commit.summary,
+                author: commit.author_name,
+                parents: commit
+                    .parents
+                    .into_iter()
+                    .map(|parent| parent.as_str().to_owned())
+                    .collect(),
+            })
+            .collect();
+        self.rails = graph::rails(&self.log);
+        self.opened
+            .retain(|id, _| self.log.iter().any(|commit| &commit.id == id));
+        self.rebuild(previous);
+        if self.cursor.row.is_none() {
+            self.select_first_row();
+        }
+    }
+
+    pub fn fail_workspace_refresh(&mut self, error: impl ToString) {
+        let error = error.to_string();
+        if self.workspace_repo.is_some() {
+            if !self.warnings.contains(&error) {
+                if self.warnings.len() == MAX_WARNINGS {
+                    self.warnings.remove(0);
+                }
+                self.warnings.push(error);
+            }
+        } else {
+            self.error = Some(error);
         }
     }
 
@@ -248,7 +314,7 @@ impl Scm {
     }
 
     pub fn is_repository(&self) -> bool {
-        self.repo.is_some()
+        self.repo.is_some() || self.workspace_repo.is_some()
     }
 
     /// The repository's root, which is not the workbench's root when the
@@ -263,6 +329,62 @@ impl Scm {
 
     pub fn error(&self) -> Option<&str> {
         self.error.as_deref()
+    }
+
+    pub fn workspace_repository(&self) -> Option<&ScmRepository> {
+        self.workspace_repo.as_ref()
+    }
+
+    pub fn revisions(&self) -> Option<&ScmRepositoryRevisions> {
+        self.workspace_repo
+            .as_ref()
+            .map(|repository| &repository.revisions)
+    }
+
+    pub fn repository_state(&self) -> Option<String> {
+        let revisions = self.revisions()?;
+        let warning = if self.warnings().is_empty() {
+            ""
+        } else {
+            "  incomplete"
+        };
+        Some(format!(
+            "repo {}  head {}  index {}  worktree {}{warning}",
+            revisions.repository.as_str(),
+            revisions.head.as_str(),
+            revisions.index.as_str(),
+            revisions.worktree.as_str(),
+        ))
+    }
+
+    pub fn workspace_status(&self) -> &[ScmStatusEntry] {
+        &self.workspace_status
+    }
+
+    fn warnings(&self) -> &[String] {
+        &self.warnings
+    }
+
+    pub fn workspace_paths(
+        &self,
+    ) -> Result<Vec<WorkspacePath>, caudra_workspace::WorkspacePathError> {
+        self.scope().into_iter().map(WorkspacePath::new).collect()
+    }
+
+    pub fn discardable_workspace_paths(
+        &self,
+    ) -> Result<Vec<WorkspacePath>, caudra_workspace::WorkspacePathError> {
+        let selected: HashSet<_> = self.workspace_paths()?.into_iter().collect();
+        Ok(self
+            .workspace_status()
+            .iter()
+            .filter(|entry| {
+                selected.contains(&entry.path)
+                    && !entry.untracked
+                    && (entry.unstaged.is_some() || entry.conflicted)
+            })
+            .map(|entry| entry.path.clone())
+            .collect())
     }
 
     pub fn is_flat(&self) -> bool {
@@ -555,6 +677,17 @@ impl Scm {
         }
     }
 
+    pub fn selected_commit(&self) -> Option<&Commit> {
+        let index = self.commit_at(self.cursor.section, self.cursor.row?)?;
+        self.log.get(index)
+    }
+
+    pub fn open_workspace_commit(&mut self, id: &str, files: CommitFiles) {
+        let previous = self.anchor();
+        self.opened.insert(id.to_owned(), files);
+        self.rebuild(previous);
+    }
+
     /// Stages what the cursor covers, or unstages it when the cursor is in the
     /// staged section: one file, everything under one folder, or the whole
     /// section from its header.
@@ -605,6 +738,9 @@ impl Scm {
             return Ok(Discard::Armed(relative));
         }
         self.armed = None;
+        if self.workspace_repo.is_some() {
+            return Ok(Discard::Done(relative));
+        }
         let Some(repo) = &self.repo else {
             return Ok(Discard::Nothing);
         };
@@ -695,6 +831,22 @@ impl Scm {
                 .min_by_key(|change| u8::from(change.staged))
                 .map(|change| change.mark)
         }
+    }
+
+    pub fn workspace_mark(&self, path: &WorkspacePath) -> Option<GitMark> {
+        self.workspace_status
+            .iter()
+            .filter(|entry| &entry.path == path)
+            .map(status_mark)
+            .max_by_key(|mark| mark.rank())
+    }
+
+    pub fn workspace_folder_mark(&self, path: &WorkspacePath) -> Option<GitMark> {
+        self.workspace_status
+            .iter()
+            .filter(|entry| workspace_path_contains(path, &entry.path))
+            .map(status_mark)
+            .max_by_key(|mark| mark.rank())
     }
 
     /// What a closed folder says about everything under it. The loudest mark
@@ -1008,6 +1160,77 @@ impl Scm {
     }
 }
 
+fn workspace_changes(entries: &[ScmStatusEntry]) -> Vec<Change> {
+    let mut changes = Vec::new();
+    for entry in entries {
+        if let Some(kind) = entry.staged {
+            changes.push(Change {
+                relative: entry.path.to_string(),
+                path: entry.path.as_str().into(),
+                staged: true,
+                mark: change_mark(kind, entry.conflicted, false),
+            });
+        }
+        if let Some(kind) = entry
+            .unstaged
+            .or(entry.untracked.then_some(ScmChangeKind::Added))
+        {
+            changes.push(Change {
+                relative: entry.path.to_string(),
+                path: entry.path.as_str().into(),
+                staged: false,
+                mark: change_mark(kind, entry.conflicted, entry.untracked),
+            });
+        } else if entry.conflicted {
+            changes.push(Change {
+                relative: entry.path.to_string(),
+                path: entry.path.as_str().into(),
+                staged: false,
+                mark: GitMark::Conflicted,
+            });
+        }
+    }
+    changes
+}
+
+fn status_mark(entry: &ScmStatusEntry) -> GitMark {
+    let kind = entry
+        .unstaged
+        .or(entry.staged)
+        .unwrap_or(ScmChangeKind::Modified);
+    change_mark(kind, entry.conflicted, entry.untracked)
+}
+
+fn change_mark(kind: ScmChangeKind, conflicted: bool, untracked: bool) -> GitMark {
+    if conflicted || kind == ScmChangeKind::Unmerged {
+        return GitMark::Conflicted;
+    }
+    if untracked {
+        return GitMark::Untracked;
+    }
+    match kind {
+        ScmChangeKind::Added | ScmChangeKind::Copied => GitMark::Added,
+        ScmChangeKind::Deleted => GitMark::Deleted,
+        ScmChangeKind::Modified
+        | ScmChangeKind::Renamed
+        | ScmChangeKind::TypeChanged
+        | ScmChangeKind::Unmerged => GitMark::Modified,
+    }
+}
+
+pub(crate) fn workspace_change_mark(kind: ScmChangeKind) -> GitMark {
+    change_mark(kind, false, false)
+}
+
+fn workspace_path_contains(parent: &WorkspacePath, candidate: &WorkspacePath) -> bool {
+    parent.is_root()
+        || candidate == parent
+        || candidate
+            .as_str()
+            .strip_prefix(parent.as_str())
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
 /// What a commit's folders and files are keyed under, which keeps the same
 /// folder in two commits — and in a change section — three separate folds.
 fn commit_scope(id: &str) -> String {
@@ -1018,6 +1241,10 @@ fn commit_scope(id: &str) -> String {
 mod tests {
     use std::path::PathBuf;
 
+    use caudra_workspace::{
+        ResourceId, ScmChangeKind, ScmCommit, ScmRepository, ScmRepositoryRevisions, ScmRevision,
+        ScmStatusEntry, WorkspacePath,
+    };
     use test_case::test_case;
 
     use super::{
@@ -1035,6 +1262,84 @@ mod tests {
     const CURSOR_MOVED: &str = "the cursor must stay where the reader left it";
     const ONE: &str = "one";
     const TWO: &str = "two";
+
+    fn scm_revision(value: &str) -> ScmRevision {
+        ScmRevision::new(value).expect("valid revision")
+    }
+
+    #[test]
+    fn workspace_snapshot_preserves_both_sides_and_structured_states() {
+        let path = WorkspacePath::new("src/both.rs").expect("valid path");
+        let renamed = WorkspacePath::new("renamed.rs").expect("valid path");
+        let untracked = WorkspacePath::new("new.rs").expect("valid path");
+        let revisions = ScmRepositoryRevisions {
+            repository: scm_revision("repository-1"),
+            head: scm_revision("head-1"),
+            index: scm_revision("index-1"),
+            worktree: scm_revision("worktree-1"),
+        };
+        let snapshot = super::backend::Snapshot {
+            repository: ScmRepository {
+                handle: ResourceId::new("repo-handle").expect("valid handle"),
+                resource_id: ResourceId::new("repo-resource").expect("valid resource"),
+                root: WorkspacePath::root(),
+                identity: scm_revision("repo-identity"),
+                revisions: revisions.clone(),
+            },
+            status: vec![
+                ScmStatusEntry {
+                    path: path.clone(),
+                    staged: Some(ScmChangeKind::Renamed),
+                    unstaged: Some(ScmChangeKind::Modified),
+                    untracked: false,
+                    conflicted: true,
+                },
+                ScmStatusEntry {
+                    path: renamed.clone(),
+                    staged: Some(ScmChangeKind::Renamed),
+                    unstaged: None,
+                    untracked: false,
+                    conflicted: false,
+                },
+                ScmStatusEntry {
+                    path: untracked.clone(),
+                    staged: None,
+                    unstaged: None,
+                    untracked: true,
+                    conflicted: false,
+                },
+            ],
+            commits: vec![ScmCommit {
+                id: scm_revision("commit-1"),
+                parents: vec![scm_revision("parent-1")],
+                author_name: "Author".to_owned(),
+                author_email: "author@example.test".to_owned(),
+                committed_unix_seconds: 1,
+                summary: "summary".to_owned(),
+            }],
+            warnings: vec!["Remote status is incomplete".to_owned()],
+        };
+        let mut scm = Scm::default();
+
+        scm.open_workspace();
+        scm.apply_workspace_snapshot(snapshot);
+
+        assert_eq!(scm.count(Section::Staged), 2, "{WRONG_COUNT}");
+        assert_eq!(scm.count(Section::Unstaged), 2, "{WRONG_COUNT}");
+        assert_eq!(scm.count(Section::Graph), 1, "{WRONG_COUNT}");
+        assert_eq!(
+            scm.workspace_status()[0].staged,
+            Some(ScmChangeKind::Renamed)
+        );
+        assert!(scm.workspace_status()[0].conflicted);
+        assert_eq!(scm.workspace_mark(&untracked), Some(GitMark::Untracked));
+        assert_eq!(scm.revisions(), Some(&revisions));
+        assert!(
+            scm.repository_state()
+                .expect("repository state")
+                .contains("incomplete")
+        );
+    }
 
     fn change(relative: &str, staged: bool, mark: GitMark) -> Change {
         Change {

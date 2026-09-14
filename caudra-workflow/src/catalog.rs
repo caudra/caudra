@@ -18,7 +18,7 @@ pub struct CatalogEntry {
     pub phases: Vec<String>,
     pub source_kind: SourceKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub path: Option<PathBuf>,
+    pub path: Option<String>,
     pub digest: String,
     pub trusted: bool,
     /// Scopes holding a same-named script this entry takes precedence over.
@@ -28,7 +28,7 @@ pub struct CatalogEntry {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InvalidEntry {
-    pub path: PathBuf,
+    pub path: String,
     pub source_kind: SourceKind,
     pub error: String,
 }

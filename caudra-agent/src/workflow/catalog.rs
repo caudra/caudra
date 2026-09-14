@@ -20,6 +20,8 @@ use caudra_workflow::{
 };
 use tracing::{debug, warn};
 
+use crate::remote_project_context::{RemoteAssetIdentity, RemoteProjectContext};
+
 const PROJECT_DIR: &str = ".caudra";
 const WORKFLOWS_SUBDIR: &str = "workflows";
 const SCRIPT_EXTENSION: &str = "rhai";
@@ -38,7 +40,22 @@ pub struct ResolvedWorkflow {
     pub digest: String,
     pub source_kind: SourceKind,
     pub path: Option<PathBuf>,
+    pub remote_source: Option<RemoteAssetIdentity>,
     pub trusted: bool,
+}
+
+impl ResolvedWorkflow {
+    pub fn source_label(&self) -> String {
+        self.remote_source.as_ref().map_or_else(
+            || {
+                self.path.as_ref().map_or_else(
+                    || builtin_path(&self.meta.name).display().to_string(),
+                    |path| path.display().to_string(),
+                )
+            },
+            RemoteAssetIdentity::source_label,
+        )
+    }
 }
 
 struct Discovered {
@@ -98,6 +115,57 @@ impl Catalog {
         catalog
     }
 
+    pub fn scan_remote(
+        state_dir: &StateDir,
+        context: &RemoteProjectContext,
+        user_config: Option<&Path>,
+    ) -> Self {
+        let mut catalog = Self {
+            entries: Vec::new(),
+            invalid: Vec::new(),
+            claims: BTreeMap::new(),
+            project_root: None,
+            user_dir: user_config_dir(user_config, WORKFLOWS_SUBDIR),
+        };
+        let builtins = builtin_candidates(&mut catalog.invalid);
+        catalog.admit(SourceKind::Builtin, builtins);
+        let candidates = context
+            .workflows()
+            .iter()
+            .map(|workflow| {
+                let trusted = workflow
+                    .source
+                    .trust_key()
+                    .ok()
+                    .and_then(|key| {
+                        caudra_storage::workflow_trust::is_remote_workflow_trusted(
+                            state_dir,
+                            &key,
+                            &workflow.digest,
+                        )
+                        .ok()
+                    })
+                    .unwrap_or(false);
+                ResolvedWorkflow {
+                    meta: workflow.meta.clone(),
+                    source: workflow.content.clone(),
+                    digest: workflow.digest.clone(),
+                    source_kind: SourceKind::Project,
+                    path: None,
+                    remote_source: Some(workflow.source.clone()),
+                    trusted,
+                }
+            })
+            .collect();
+        catalog.admit(SourceKind::Project, candidates);
+        if let Some(dir) = catalog.user_dir.clone() {
+            let candidates =
+                scan_directory(&dir, SourceKind::User, &mut catalog.invalid, |_, _| true);
+            catalog.admit(SourceKind::User, candidates);
+        }
+        catalog
+    }
+
     /// Creates the user scope directory so there is a folder to drop scripts
     /// into. Failure leaves the scope empty until the next scan can read it.
     pub fn ensure_user_scope(user_config: Option<&Path>) {
@@ -126,7 +194,16 @@ impl Catalog {
                             .map(|phase| phase.title.clone())
                             .collect(),
                         source_kind: resolved.source_kind,
-                        path: resolved.path.clone(),
+                        path: resolved
+                            .remote_source
+                            .as_ref()
+                            .map(RemoteAssetIdentity::source_label)
+                            .or_else(|| {
+                                resolved
+                                    .path
+                                    .as_ref()
+                                    .map(|path| path.display().to_string())
+                            }),
                         digest: resolved.digest.clone(),
                         trusted: resolved.trusted,
                         shadowed: entry.shadowed.clone(),
@@ -156,9 +233,6 @@ impl Catalog {
         expected_digest: &str,
     ) -> Result<(), WorkflowError> {
         let entry = self.lookup(name)?;
-        let (Some(root), Some(path)) = (&self.project_root, &entry.path) else {
-            return Ok(());
-        };
         if entry.source_kind != SourceKind::Project {
             return Ok(());
         }
@@ -166,9 +240,23 @@ impl Catalog {
             return Err(WorkflowError::TrustRequired {
                 name: name.to_owned(),
                 digest: entry.digest.clone(),
-                path: path.clone(),
+                path: entry.source_label(),
             });
         }
+        if let Some(source) = &entry.remote_source {
+            let key = source
+                .trust_key()
+                .map_err(|error| WorkflowError::Storage(error.to_string()))?;
+            return caudra_storage::workflow_trust::trust_remote_workflow(
+                state_dir,
+                &key,
+                &entry.digest,
+            )
+            .map_err(|error| WorkflowError::Storage(error.to_string()));
+        }
+        let (Some(root), Some(path)) = (&self.project_root, &entry.path) else {
+            return Ok(());
+        };
         let relative = project_relative(root, path).ok_or_else(|| {
             WorkflowError::Internal(format!("{} is outside the project root", path.display()))
         })?;
@@ -244,9 +332,7 @@ impl Catalog {
 
 fn reject(invalid: &mut Vec<InvalidEntry>, candidate: ResolvedWorkflow, error: String) {
     invalid.push(InvalidEntry {
-        path: candidate
-            .path
-            .unwrap_or_else(|| builtin_path(&candidate.meta.name)),
+        path: candidate.source_label(),
         source_kind: candidate.source_kind,
         error,
     });
@@ -279,11 +365,12 @@ fn builtin_candidates(invalid: &mut Vec<InvalidEntry>) -> Vec<ResolvedWorkflow> 
                     digest: digest_of(source),
                     source_kind: SourceKind::Builtin,
                     path: None,
+                    remote_source: None,
                     trusted: true,
                 }),
                 Err(error) => {
                     invalid.push(InvalidEntry {
-                        path: builtin_path(name),
+                        path: builtin_path(name).display().to_string(),
                         source_kind: SourceKind::Builtin,
                         error,
                     });
@@ -304,7 +391,7 @@ fn scan_directory(
         Ok(paths) => paths,
         Err(error) => {
             invalid.push(InvalidEntry {
-                path: dir.to_path_buf(),
+                path: dir.display().to_string(),
                 source_kind: scope,
                 error,
             });
@@ -321,10 +408,11 @@ fn scan_directory(
                 digest,
                 source_kind: scope,
                 path: Some(path),
+                remote_source: None,
             }),
             Err(error) => {
                 invalid.push(InvalidEntry {
-                    path,
+                    path: path.display().to_string(),
                     source_kind: scope,
                     error,
                 });
@@ -539,7 +627,7 @@ mod tests {
             Err(WorkflowError::TrustRequired {
                 name: REVIEW.into(),
                 digest: digest.clone(),
-                path: path.clone(),
+                path: path.display().to_string(),
             }),
             "{TRUST_IS_EXACT}"
         );
@@ -581,7 +669,7 @@ mod tests {
 
         assert_eq!(names(&catalog), [DEEP_RESEARCH_NAME]);
         assert_eq!(catalog.invalid.len(), 1);
-        assert_eq!(catalog.invalid[0].path, link);
+        assert_eq!(catalog.invalid[0].path, link.display().to_string());
         assert_eq!(catalog.invalid[0].source_kind, SourceKind::Project);
         assert!(catalog.invalid[0].error.contains("symbolic link"));
     }
@@ -598,7 +686,7 @@ mod tests {
 
         assert_eq!(names(&catalog), [DEEP_RESEARCH_NAME]);
         assert_eq!(catalog.invalid.len(), 1);
-        assert_eq!(catalog.invalid[0].path, path);
+        assert_eq!(catalog.invalid[0].path, path.display().to_string());
         assert_eq!(catalog.invalid[0].source_kind, SourceKind::User);
         assert!(
             catalog.invalid[0].error.contains(expected),
@@ -617,6 +705,7 @@ mod tests {
             digest: digest_of(&script(REVIEW)),
             source_kind: SourceKind::Project,
             path: Some(fixture.project_workflows().join(file)),
+            remote_source: None,
             trusted: false,
         };
 
@@ -698,7 +787,7 @@ mod tests {
         assert_eq!(
             listed.invalid,
             [InvalidEntry {
-                path,
+                path: path.display().to_string(),
                 source_kind: scope,
                 error: SHADOWS_BUILTIN.into(),
             }]
@@ -745,7 +834,7 @@ mod tests {
         assert_eq!(
             catalog.invalid,
             [InvalidEntry {
-                path: dir,
+                path: dir.display().to_string(),
                 source_kind: SourceKind::Project,
                 error: NOT_A_DIRECTORY.into(),
             }]

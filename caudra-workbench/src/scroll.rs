@@ -483,9 +483,7 @@ impl ScrollTrack {
             ThumbState::Hovered => (self.axis.thumb(), style.add_modifier(Modifier::BOLD)),
             ThumbState::Grabbed => (SCROLLBAR_THUMB_GRABBED, style.add_modifier(Modifier::BOLD)),
         };
-        let end = start
-            .saturating_add(length)
-            .min(self.axis.end(self.area));
+        let end = start.saturating_add(length).min(self.axis.end(self.area));
         for along in start..end {
             if let Some(cell) = buf.cell_mut(self.axis.cell(self.area, along)) {
                 cell.set_symbol(symbol);
@@ -1059,11 +1057,18 @@ mod tests {
         let track = panned(0);
         let along = u32::from(track.axis.along(track.area));
 
-        assert_eq!(along, PANE.width as u32 - 2 * STEP_CELLS as u32, "{WRONG_PAINT}");
+        assert_eq!(
+            along,
+            PANE.width as u32 - 2 * STEP_CELLS as u32,
+            "{WRONG_PAINT}"
+        );
         assert_eq!(track.max_scroll(), PANNED_MAX, "{WRONG_THUMB}");
         assert_eq!(
             u32::from(track.thumb().1),
-            round_div(u64::from(along) * u64::from(PANE.width), PANNED_TOTAL as u64) as u32,
+            round_div(
+                u64::from(along) * u64::from(PANE.width),
+                PANNED_TOTAL as u64
+            ) as u32,
             "{WRONG_THUMB}"
         );
     }

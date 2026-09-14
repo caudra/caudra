@@ -12,11 +12,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
+use caudra_workspace::PlanRef;
 use tracing::warn;
 
 use crate::id::CaudraId;
 use crate::permission_state::PermissionRuleRecord;
 use crate::thinking::StoredThinking;
+use crate::workspace_binding::StoredWorkspaceBinding;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -110,6 +112,12 @@ pub enum SessionError {
     },
     #[error("tool output cleanup failed: {0}")]
     ToolOutputCleanup(#[source] Box<crate::tool_outputs::ToolOutputError>),
+    #[error("a session workspace identity cannot be changed after creation")]
+    WorkspaceIdentityImmutable,
+    #[error("session workspace identity changed; fork or explicitly rebind the session")]
+    WorkspaceRebindRequired,
+    #[error("remote session cwd must be a bounded logical workspace path")]
+    InvalidRemoteCwd,
 }
 
 /// Per-model token breakdown entry. Mirrors the four usage counters tracked by
@@ -276,6 +284,8 @@ pub struct SessionMeta {
     #[serde(default)]
     pub plan_path: Option<String>,
     #[serde(default)]
+    pub plan_target: Option<StoredPlanTarget>,
+    #[serde(default)]
     pub plan_written: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub structured_permission_rules: Vec<PermissionRuleRecord>,
@@ -415,6 +425,8 @@ pub struct Session<M, U, T> {
     pub title: String,
     pub cwd: String,
     pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    workspace_binding: Option<Box<StoredWorkspaceBinding>>,
     messages: Arc<Vec<M>>,
     pub token_usage: U,
     #[serde(default = "HashMap::new")]
@@ -471,6 +483,7 @@ impl<M: Clone, U: Clone, T: Clone> Clone for Session<M, U, T> {
             title: self.title.clone(),
             cwd: self.cwd.clone(),
             model: self.model.clone(),
+            workspace_binding: self.workspace_binding.clone(),
             messages: Arc::clone(&self.messages),
             token_usage: self.token_usage.clone(),
             tool_outputs: self.tool_outputs.clone(),
@@ -512,6 +525,13 @@ pub enum StoredMode {
     #[default]
     Build,
     Plan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum StoredPlanTarget {
+    LocalPath { path: String },
+    PlanRef { reference: PlanRef },
 }
 
 impl fmt::Display for StoredMode {
@@ -687,6 +707,8 @@ enum LogRecord<M, U, T> {
         title: String,
         token_usage: U,
         updated_at: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace_binding: Option<Box<StoredWorkspaceBinding>>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         subagents: Vec<StoredSubagent>,
         #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -781,6 +803,7 @@ where
             title: session.title.clone(),
             token_usage: &session.token_usage,
             updated_at: session.updated_at,
+            workspace_binding: session.workspace_binding.clone(),
             subagents: session.subagents.clone(),
             usage_by_model: session.usage_by_model.clone(),
             subagent_task_specs: session.subagent_task_specs.clone(),
@@ -855,6 +878,14 @@ where
     T: Serialize + DeserializeOwned,
 {
     pub fn new(model: &str, cwd: &str) -> Self {
+        Self::new_with_workspace(model, cwd, StoredWorkspaceBinding::local_from_cwd(cwd))
+    }
+
+    pub fn new_with_workspace(
+        model: &str,
+        cwd: &str,
+        workspace_binding: StoredWorkspaceBinding,
+    ) -> Self {
         let now = now_epoch();
         Self {
             version: SESSION_VERSION,
@@ -862,6 +893,7 @@ where
             title: DEFAULT_TITLE.into(),
             cwd: cwd.into(),
             model: model.into(),
+            workspace_binding: Some(Box::new(workspace_binding)),
             messages: Arc::default(),
             token_usage: U::default(),
             tool_outputs: HashMap::new(),
@@ -912,6 +944,10 @@ where
     pub fn persisted_write_version(&self) -> Option<i64> {
         let version = self.base_write_version.load(Ordering::Acquire);
         (version >= 0).then_some(version)
+    }
+
+    pub fn workspace_binding(&self) -> Option<&StoredWorkspaceBinding> {
+        self.workspace_binding.as_deref()
     }
 
     pub fn set_persisted_write_version(&mut self, version: Option<i64>) {
@@ -1104,6 +1140,41 @@ where
         self.touch_soft();
     }
 
+    pub fn set_workspace_binding(
+        &mut self,
+        binding: StoredWorkspaceBinding,
+    ) -> Result<(), SessionError> {
+        match self.workspace_binding.as_deref() {
+            Some(current) if !current.same_workspace_identity(&binding) => {
+                Err(SessionError::WorkspaceIdentityImmutable)
+            }
+            Some(_) => Ok(()),
+            None => {
+                self.workspace_binding = Some(Box::new(binding));
+                self.touch();
+                Ok(())
+            }
+        }
+    }
+
+    pub fn replace_workspace_cursor(
+        &mut self,
+        binding: StoredWorkspaceBinding,
+    ) -> Result<(), SessionError> {
+        match self.workspace_binding.as_deref() {
+            Some(current) if !current.same_workspace_identity(&binding) => {
+                Err(SessionError::WorkspaceIdentityImmutable)
+            }
+            Some(current) if current == &binding => Ok(()),
+            Some(_) => {
+                self.workspace_binding = Some(Box::new(binding));
+                self.touch();
+                Ok(())
+            }
+            None => self.set_workspace_binding(binding),
+        }
+    }
+
     pub fn set_conversation_state(
         &mut self,
         history_head: Option<CaudraId>,
@@ -1212,10 +1283,28 @@ where
         SessionDatabase::open(dir)?.list(cwd)
     }
 
+    pub fn list_for_workspace(
+        binding: &StoredWorkspaceBinding,
+        dir: &StateDir,
+    ) -> Result<Vec<SessionSummary>, SessionError> {
+        SessionDatabase::open(dir)?.list_for_workspace(binding)
+    }
+
     pub fn latest(cwd: &str, dir: &StateDir) -> Result<Option<Self>, SessionError> {
         let database = SessionDatabase::open(dir)?;
         database
             .latest_id(cwd)?
+            .map(|id| database.load(id))
+            .transpose()
+    }
+
+    pub fn latest_for_workspace(
+        binding: &StoredWorkspaceBinding,
+        dir: &StateDir,
+    ) -> Result<Option<Self>, SessionError> {
+        let database = SessionDatabase::open(dir)?;
+        database
+            .latest_id_for_workspace(binding)?
             .map(|id| database.load(id))
             .transpose()
     }
@@ -1378,6 +1467,18 @@ mod tests {
         assert_eq!(meta.history_head, None);
         assert_eq!(meta.pending_revert, None);
         assert!(meta.structured_permission_rules.is_empty());
+    }
+
+    #[test]
+    fn old_serialized_session_without_workspace_binding_still_loads() {
+        let session = TestSession::new("model", "/legacy/cwd");
+        let mut value = serde_json::to_value(&session).unwrap();
+        value.as_object_mut().unwrap().remove("workspace_binding");
+
+        let restored: TestSession = serde_json::from_value(value).unwrap();
+
+        assert_eq!(restored.cwd, "/legacy/cwd");
+        assert_eq!(restored.workspace_binding(), None);
     }
 
     #[test]

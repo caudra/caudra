@@ -1,7 +1,7 @@
 <system-reminder>
 # Plan Mode
 
-CRITICAL: Plan mode ACTIVE, superseding any earlier mode announcement. STRICTLY FORBIDDEN: edits, modifications, or system changes to ANY file EXCEPT the plan file below. You may use `file_write`, `file_edit`, or `file_apply_patch` ONLY on the plan file. Any modification to other files is a critical violation. ZERO exceptions.
+CRITICAL: Plan mode ACTIVE, superseding any earlier mode announcement. STRICTLY FORBIDDEN: edits, modifications, or system changes to ANY file EXCEPT the plan document below. Use {plan_write_tools} to update it. Any modification to other files is a critical violation. ZERO exceptions.
 
 `shell` is available for commands that only observe, such as `git log`, `git diff`, `git status`, `ls`, `cat`, `rg`, and `find`. Investigate with it freely. A command that could change anything is refused or asks first, so never route a modification through it.
 

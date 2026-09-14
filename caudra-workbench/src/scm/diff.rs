@@ -13,6 +13,7 @@ use std::ops::Range;
 
 use caudra_diff::{DiffHunk, DiffLine, compute_hunks, emphasis_ranges, span_text};
 use caudra_highlight::{Highlighter, StyledSegment};
+use caudra_workspace::{ScmDiffLine, ScmDiffLineKind};
 
 use crate::editor::DiffKind;
 use crate::editor::highlight::MAX_LOOKBACK;
@@ -159,6 +160,65 @@ pub fn unified(path: &str, old: &str, new: &str) -> Diff {
     diff
 }
 
+pub fn structured(
+    path: &str,
+    old: &str,
+    new: &str,
+    lines: Vec<ScmDiffLine>,
+    incomplete: bool,
+) -> Diff {
+    let before = lines
+        .iter()
+        .filter_map(|line| line.old_line.map(|line| line as usize..line as usize + 1))
+        .collect::<Vec<_>>();
+    let after = lines
+        .iter()
+        .filter_map(|line| line.new_line.map(|line| line as usize..line as usize + 1))
+        .collect::<Vec<_>>();
+    let (before, after) = (windows(&before), windows(&after));
+    let affordable = parsed_lines(&before) + parsed_lines(&after) <= MAX_HIGHLIGHT_LINES;
+    let colours = affordable.then(|| {
+        (
+            side_colours(path, old, &before),
+            side_colours(path, new, &after),
+        )
+    });
+    let mut diff = Diff::default();
+    for line in lines {
+        let kind = match line.kind {
+            ScmDiffLineKind::File | ScmDiffLineKind::Binary => DiffKind::Header,
+            ScmDiffLineKind::Context => DiffKind::Context,
+            ScmDiffLineKind::Addition => DiffKind::Added,
+            ScmDiffLineKind::Deletion => DiffKind::Removed,
+        };
+        let segments = colours
+            .as_ref()
+            .map_or_else(Vec::new, |(old, new)| match line.kind {
+                ScmDiffLineKind::Deletion => line
+                    .old_line
+                    .map(|line| colours_at(old, line as usize))
+                    .unwrap_or_default(),
+                ScmDiffLineKind::Context | ScmDiffLineKind::Addition => line
+                    .new_line
+                    .map(|line| colours_at(new, line as usize))
+                    .unwrap_or_default(),
+                ScmDiffLineKind::File | ScmDiffLineKind::Binary => Vec::new(),
+            });
+        diff.rows.push(DiffRow {
+            text: line.text,
+            kind,
+            before: line.old_line.map(|line| line as usize),
+            after: line.new_line.map(|line| line as usize),
+            emphasis: Vec::new(),
+            segments,
+        });
+    }
+    if incomplete {
+        diff.push("@@ remote diff incomplete @@".to_owned(), DiffKind::Header);
+    }
+    diff
+}
+
 fn row(line: &DiffLine, cursor: &mut (usize, usize), colours: Option<&Sides>) -> DiffRow {
     let (before, after) = *cursor;
     let (on_before, on_after) = line.sides();
@@ -204,9 +264,10 @@ fn row(line: &DiffLine, cursor: &mut (usize, usize), colours: Option<&Sides>) ->
 
 #[cfg(test)]
 mod tests {
+    use caudra_workspace::{ScmDiffLine, ScmDiffLineKind, WorkspacePath};
     use test_case::test_case;
 
-    use super::{DiffKind, IDENTICAL, unified, windows};
+    use super::{DiffKind, IDENTICAL, structured, unified, windows};
 
     const PATH: &str = "x.rs";
     const LARGE: usize = 5_000;
@@ -219,6 +280,41 @@ mod tests {
     const NOT_COLOURED: &str = "a changed row must carry the colours of the line it came from";
     const WINDOW_SPLIT: &str = "hunks within a lookback of each other must be parsed in one pass";
     const WINDOW_MERGED: &str = "hunks a lookback apart must not drag the parse across the gap";
+    const STRUCTURE_CHANGED: &str = "structured remote diff rows must be projected exactly";
+
+    #[test]
+    fn structured_rows_keep_protocol_kinds_numbers_and_continuation_notice() {
+        let path = WorkspacePath::new(PATH).expect("valid path");
+        let lines = vec![
+            ScmDiffLine {
+                path: path.clone(),
+                kind: ScmDiffLineKind::File,
+                change: None,
+                old_line: None,
+                new_line: None,
+                text: "@@ hunk 1 @@".to_owned(),
+            },
+            ScmDiffLine {
+                path,
+                kind: ScmDiffLineKind::Deletion,
+                change: None,
+                old_line: Some(7),
+                new_line: None,
+                text: "old".to_owned(),
+            },
+        ];
+
+        let diff = structured(PATH, "old\n", "new\n", lines, true);
+
+        assert_eq!(diff.rows[0].kind, DiffKind::Header, "{STRUCTURE_CHANGED}");
+        assert_eq!(diff.rows[1].kind, DiffKind::Removed, "{STRUCTURE_CHANGED}");
+        assert_eq!(diff.rows[1].before, Some(7), "{STRUCTURE_CHANGED}");
+        assert_eq!(diff.rows[1].after, None, "{STRUCTURE_CHANGED}");
+        assert_eq!(
+            diff.rows[2].text, "@@ remote diff incomplete @@",
+            "{STRUCTURE_CHANGED}"
+        );
+    }
 
     fn kinds(diff: &super::Diff) -> Vec<DiffKind> {
         diff.rows.iter().map(|row| row.kind).collect()

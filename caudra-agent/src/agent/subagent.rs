@@ -24,7 +24,6 @@ use caudra_storage::id::CaudraId;
 use super::{ModelRoute, resolve_model_for_purpose};
 use crate::cancel::{CancelMap, CancelSlot};
 use crate::prompt::PromptId;
-use crate::tools::registry::ToolRegistry;
 use crate::tools::{
     BuiltinDeferral, DeferredTool, DescriptionContext, FileReadTracker, LocalTools, ToolAudience,
     ToolContext, ToolFilter, ToolLive, deferral,
@@ -578,12 +577,17 @@ pub async fn open_task(ctx: &ToolContext, opts: TaskOptions) -> Result<Subagent,
             ToolAudience::GENERAL_SUB,
         ),
     };
-    let vars = crate::template::env_vars().set(
+    let vars = ctx.task_environment.clone().set(
         "{task_system_prompt_profiles}",
         bindings.task_tool_summary(BUILTIN_TASK_PROFILE_DESCRIPTION),
     );
-    let cwd = vars.apply("{cwd}").into_owned();
-    let instructions = smol::unblock(move || crate::agent::load_instruction_text(&cwd)).await;
+    let instructions = match &ctx.remote_project_context {
+        Some(context) => crate::agent::load_remote_instructions(context).text,
+        None => {
+            let cwd = vars.apply("{cwd}").into_owned();
+            smol::unblock(move || crate::agent::load_instruction_text(&cwd)).await
+        }
+    };
     let base_filter = ToolFilter::from_config(&ctx.config, &model, &[]).for_mode(&mode);
     let assembled = crate::prompt::assemble_task_with_filter(
         prompt_id,
@@ -593,7 +597,7 @@ pub async fn open_task(ctx: &ToolContext, opts: TaskOptions) -> Result<Subagent,
         profile.as_deref(),
         contract,
     );
-    let mut definitions = ToolRegistry::global().definitions_split(
+    let mut definitions = ctx.registry.definitions_split(
         &vars,
         &DescriptionContext {
             filter: &base_filter,
@@ -840,6 +844,10 @@ fn build(
             tool_output_lines: caudra_config::ToolOutputLines::default(),
             permissions: Arc::clone(&ctx.permissions),
             session_id: ctx.session_id.clone(),
+            workspace_session: ctx.workspace_session.clone(),
+            remote_project_context: ctx.remote_project_context.clone(),
+            local_documents: ctx.local_documents.clone(),
+            task_environment: ctx.task_environment.clone(),
             root_tool_use_id: Some(ids.root_tool_use_id.clone()),
             mailbox: None,
             context_publisher,
@@ -855,7 +863,7 @@ fn build(
             active_prompt_profile_name: resolved.active_prompt_profile_name,
             subagent_cancels: Arc::new(CancelMap::new()),
             subagent_history: ctx.subagent_history.clone(),
-            registry: Arc::clone(ToolRegistry::global_arc()),
+            registry: Arc::clone(&ctx.registry),
             audience: resolved.audience,
             tool_filter,
             model_policy: Arc::clone(&ctx.model_policy),
@@ -927,6 +935,8 @@ mod tests {
     const COLLIDING_SUBAGENT_NAME: &str = "collision";
     const INHERITED_PROFILE: &str = "parent-default";
     const SUBAGENT_SYSTEM: &str = "system";
+    const REMOTE_CWD: &str = "remote/project";
+    const REMOTE_PLATFORM: &str = "remote-os";
     const PUBLISHER_MISSING: &str = "subagent must inherit a task-scoped context publisher";
     const IGNORED_ERROR: &str = "handled by the session caller";
     const DONE_USAGE: TokenUsage = tokens(150, 30);
@@ -1027,6 +1037,33 @@ mod tests {
 
             assert_eq!(subagent.params.model.spec(), ctx.model.spec());
             assert!(Arc::ptr_eq(&subagent.params.provider, &ctx.provider));
+            subagent.close();
+        });
+    }
+
+    #[test]
+    fn task_subagent_inherits_the_remote_environment() {
+        smol::block_on(async {
+            let mut ctx = crate::tools::test_support::stub_ctx(&AgentMode::Build);
+            ctx.task_environment = crate::template::Vars::new()
+                .set("{cwd}", REMOTE_CWD)
+                .set("{platform}", REMOTE_PLATFORM);
+            let mut subagent = open_task(
+                &ctx,
+                TaskOptions {
+                    name: COLLIDING_SUBAGENT_NAME.into(),
+                    task_id: TaskIdentity::Derive,
+                    profile: Some(crate::prompt::profile::BUILTIN_PROFILE_NAME.into()),
+                    mode: Some(SubagentTaskMode::Build),
+                    local_definitions: Vec::new(),
+                    local_tools: LocalTools::default(),
+                },
+            )
+            .await
+            .unwrap();
+
+            assert!(subagent.system.contains(REMOTE_CWD));
+            assert!(subagent.system.contains(REMOTE_PLATFORM));
             subagent.close();
         });
     }

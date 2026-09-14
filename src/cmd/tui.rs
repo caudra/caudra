@@ -14,7 +14,7 @@ use color_eyre::eyre::Context;
 use caudra_agent::command::{self, CustomCommand};
 use caudra_agent::prompt::profile::{PromptProfileCatalog, SystemPromptProfile};
 use caudra_agent::tools::ToolRegistry;
-use caudra_config::{Config, RetentionConfig, load_env_files};
+use caudra_config::{Config, RetentionConfig};
 use caudra_lua::PluginHost;
 use caudra_providers::model::Model;
 use caudra_storage::StateDir;
@@ -22,6 +22,7 @@ use caudra_storage::id::CaudraId;
 use caudra_storage::sessions::sweep::{SweepPolicy, sweep_if_due};
 use caudra_storage::sessions::{SessionDatabase, SessionLease, StoredMode};
 use caudra_storage::state::{WorkspaceTabs, read_workspace_tabs};
+use caudra_storage::workspace_binding::StoredWorkspaceBinding;
 use caudra_ui::{AppSession, ExitSummary, HerdrReporter, RunOutcome, SessionTab};
 
 use crate::cli::Cli;
@@ -172,6 +173,7 @@ fn build_stack(
     cwd: &Path,
     storage: &StateDir,
     fallback: Option<StackFallback>,
+    remote: bool,
 ) -> Result<(Stack, Vec<String>)> {
     let mut warnings = Vec::new();
 
@@ -185,7 +187,7 @@ fn build_stack(
         None => (None, None),
     };
     let reloading = fallback_model.is_some();
-    let loaded = load_config(&plugin_host, cli, cwd).and_then(|config| {
+    let loaded = load_config(&plugin_host, cli, cwd, remote).and_then(|config| {
         let prompt_profiles = Arc::new(PromptProfileCatalog::discover_user());
         let selected_name = cli
             .system_prompt_profile
@@ -214,7 +216,7 @@ fn build_stack(
         }
     }
 
-    let commands = discover_commands(cli.no_commands);
+    let commands = discover_commands(cli.no_commands || remote);
 
     // A fresh session opens in plan; a resumed one overrides this with the model
     // it stored.
@@ -264,6 +266,7 @@ fn resolve_session(
             .map_err(|e| color_eyre::eyre::eyre!("invalid session id {raw:?}: {e}"))?;
         let lease = Arc::new(SessionLease::acquire(storage, id)?);
         let session = setup::load_session(id, storage)?;
+        StoredWorkspaceBinding::validate_resume(session.workspace_binding(), None)?;
         setup::report_session_start(caudra_otel::emit::START_RESUME, Some(session.id));
         return Ok(SessionTab { session, lease });
     }
@@ -271,6 +274,7 @@ fn resolve_session(
         if let Some(summary) = AppSession::list(cwd, storage)?.into_iter().next() {
             let lease = Arc::new(SessionLease::acquire(storage, summary.id)?);
             let session = setup::load_session(summary.id, storage)?;
+            StoredWorkspaceBinding::validate_resume(session.workspace_binding(), None)?;
             setup::report_session_start(caudra_otel::emit::START_CONTINUE, Some(session.id));
             return Ok(SessionTab { session, lease });
         }
@@ -330,14 +334,30 @@ fn restore_workspace_tabs(
             );
             continue;
         }
-        let Some(stored_cwd) = facts.get(&id) else {
+        let Some(_) = facts.get(&id) else {
             restore_warning(
                 &mut warnings,
                 format!("Stored workspace tab {id} no longer exists"),
             );
             continue;
         };
-        let stored_cwd = match Path::new(stored_cwd).canonicalize() {
+        let opened = (|| -> Result<SessionTab> {
+            let lease = Arc::new(SessionLease::acquire(storage, id)?);
+            let session = caudra_agent::load_stored_session(id, storage)?;
+            StoredWorkspaceBinding::validate_resume(session.workspace_binding(), None)?;
+            Ok(SessionTab { session, lease })
+        })();
+        let tab = match opened {
+            Ok(tab) => tab,
+            Err(error) => {
+                restore_warning(
+                    &mut warnings,
+                    format!("Stored workspace tab {id} is unavailable: {error}"),
+                );
+                continue;
+            }
+        };
+        let stored_cwd = match Path::new(&tab.session.cwd).canonicalize() {
             Ok(stored_cwd) => stored_cwd,
             Err(error) => {
                 restore_warning(
@@ -358,26 +378,15 @@ fn restore_workspace_tabs(
             );
             continue;
         }
-        let lease = match SessionLease::acquire(storage, id) {
-            Ok(lease) => Arc::new(lease),
-            Err(error) => {
-                restore_warning(
-                    &mut warnings,
-                    format!("Stored workspace tab {id} is unavailable: {error}"),
-                );
-                continue;
-            }
-        };
-        match setup::load_session(id, storage) {
-            Ok(session) => {
-                setup::report_session_start(caudra_otel::emit::START_CONTINUE, Some(session.id));
-                tabs.push(SessionTab { session, lease });
-            }
-            Err(error) => restore_warning(
+        if let Err(error) = caudra_storage::sessions::mark_opened(id, storage) {
+            restore_warning(
                 &mut warnings,
-                format!("Stored workspace tab {id} could not be loaded: {error:#}"),
-            ),
+                format!("Stored workspace tab {id} could not be opened: {error}"),
+            );
+            continue;
         }
+        setup::report_session_start(caudra_otel::emit::START_CONTINUE, Some(tab.session.id));
+        tabs.push(tab);
     }
 
     let focused = stored
@@ -405,7 +414,18 @@ fn resolve_sessions(
     model: &str,
     cwd: &Path,
     storage: &StateDir,
+    workspace_binding: Option<&caudra_storage::workspace_binding::StoredWorkspaceBinding>,
 ) -> Result<ResolvedSessions> {
+    if let Some(binding) = workspace_binding {
+        return resolve_remote_sessions(
+            continue_session,
+            session_id,
+            model,
+            cwd.to_string_lossy().as_ref(),
+            storage,
+            binding,
+        );
+    }
     let cwd_str = cwd.to_string_lossy();
     if continue_session && session_id.is_none() {
         let mut warnings = Vec::new();
@@ -439,6 +459,49 @@ fn resolve_sessions(
         tabs: vec![resolve_session(
             false, session_id, model, &cwd_str, storage,
         )?],
+        focused: 0,
+        warnings: Vec::new(),
+    })
+}
+
+fn resolve_remote_sessions(
+    continue_session: bool,
+    session_id: Option<&str>,
+    model: &str,
+    cwd: &str,
+    storage: &StateDir,
+    binding: &caudra_storage::workspace_binding::StoredWorkspaceBinding,
+) -> Result<ResolvedSessions> {
+    let resume_id = if let Some(raw) = session_id {
+        Some(
+            raw.parse::<CaudraId>()
+                .map_err(|error| color_eyre::eyre::eyre!("invalid session id {raw:?}: {error}"))?,
+        )
+    } else if continue_session {
+        SessionDatabase::open_state(storage)?
+            .list_for_workspace_identity(binding)?
+            .first()
+            .map(|session| session.id)
+    } else {
+        None
+    };
+    let tab = if let Some(id) = resume_id {
+        let lease = Arc::new(SessionLease::acquire(storage, id)?);
+        let session = setup::load_session(id, storage)?;
+        StoredWorkspaceBinding::validate_resume_identity(
+            session.workspace_binding(),
+            Some(binding),
+        )?;
+        setup::report_session_start(caudra_otel::emit::START_RESUME, Some(session.id));
+        SessionTab { session, lease }
+    } else {
+        let session = AppSession::new_with_workspace(model, cwd, binding.clone());
+        let lease = Arc::new(SessionLease::acquire(storage, session.id)?);
+        setup::report_session_start(caudra_otel::emit::START_FRESH, Some(session.id));
+        SessionTab { session, lease }
+    };
+    Ok(ResolvedSessions {
+        tabs: vec![tab],
         focused: 0,
         warnings: Vec::new(),
     })
@@ -484,12 +547,21 @@ pub fn run(mut cli: Cli) -> Result<ExitCode> {
 
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
 
-    load_env_files(&cwd);
-    let env_files_ms = lap();
-    let _workcell_host = super::register_builtin_tools(&cwd)?;
-    let register_tools_ms = lap();
+    let workcell_runtime = super::workcell_runtime::WorkcellRuntime::initialize(
+        &cli.workcell,
+        &cwd,
+        &persistent_storage,
+        ToolRegistry::global(),
+    )?;
+    let workcell_runtime_ms = lap();
 
-    let (mut stack, _) = build_stack(&cli, &cwd, &persistent_storage, None)?;
+    let (mut stack, _) = build_stack(
+        &cli,
+        &cwd,
+        &persistent_storage,
+        None,
+        workcell_runtime.is_remote(),
+    )?;
     let build_stack_ms = lap();
     let ephemeral = cli.ephemeral || stack.config.storage.ephemeral;
     let (storage, _ephemeral_root) = super::run_storage(persistent_storage, ephemeral)?;
@@ -527,6 +599,16 @@ pub fn run(mut cli: Cli) -> Result<ExitCode> {
             thinking,
             model_policy: Arc::new(stack.config.provider.model_policy.clone()),
             plugin_rules: stack.plugin_host.plugin_rules(),
+            workspace_binding: workcell_runtime.stored_binding().cloned(),
+            workspace_session: workcell_runtime.workspace_session().cloned(),
+            remote_project_context: workcell_runtime.remote_project_context().cloned(),
+            local_documents: workcell_runtime.local_documents().cloned(),
+            remote_environment: workcell_runtime.is_remote().then(|| {
+                caudra_agent::headless::RemoteEnvironment {
+                    cwd: workcell_runtime.display().cwd.clone(),
+                    platform: workcell_runtime.display().platform.clone(),
+                }
+            }),
         })
         .context("run sdk mode")?;
         return Ok(ExitCode::SUCCESS);
@@ -561,25 +643,37 @@ pub fn run(mut cli: Cli) -> Result<ExitCode> {
             Arc::clone(&stack.prompt_profiles),
             Arc::new(stack.config.provider.model_policy.clone()),
             stack.plugin_host.plugin_rules(),
+            workcell_runtime
+                .is_remote()
+                .then(|| caudra_agent::headless::RemoteEnvironment {
+                    cwd: workcell_runtime.display().cwd.clone(),
+                    platform: workcell_runtime.display().platform.clone(),
+                }),
+            workcell_runtime.workspace_session().cloned(),
+            workcell_runtime.remote_project_context().cloned(),
+            workcell_runtime.local_documents().cloned(),
         )
         .context("run print mode")?;
         return Ok(ExitCode::SUCCESS);
     }
 
     let cwd_str = cwd.to_string_lossy().into_owned();
+    let session_cwd = workcell_runtime
+        .is_remote()
+        .then_some(workcell_runtime.display().cwd.as_str());
     let resolved = resolve_sessions(
         cli.continue_session,
         cli.session.as_deref(),
         &stack.model.spec(),
-        &cwd,
+        session_cwd.map_or(cwd.as_path(), Path::new),
         &storage,
+        workcell_runtime.stored_binding(),
     )?;
     let resolve_sessions_ms = lap();
     tracing::info!(
         state_dir_ms,
         model_registry_ms,
-        env_files_ms,
-        register_tools_ms,
+        workcell_runtime_ms,
         build_stack_ms,
         run_storage_ms,
         init_logging_ms,
@@ -618,11 +712,26 @@ pub fn run(mut cli: Cli) -> Result<ExitCode> {
             Model::from_spec(&focused_tab.model).unwrap_or_else(|_| stack.model.clone())
         };
 
+        let permissions = Arc::new(
+            caudra_agent::permissions::PermissionManager::new_persistent(
+                stack.config.permissions.clone(),
+                cwd.clone(),
+                stack.plugin_host.plugin_rules(),
+            ),
+        );
+        permissions
+            .replace_remote_permission_asset(
+                workcell_runtime
+                    .remote_project_context()
+                    .and_then(|context| context.permissions()),
+            )
+            .context("install initial remote permission policy")?;
         let outcome = caudra_ui::run(
             caudra_ui::EventLoopParams {
                 model,
                 needs_login: stack.needs_login,
                 commands: std::mem::take(&mut stack.commands),
+                no_commands: cli.no_commands,
                 sessions: std::mem::take(&mut tabs),
                 focused,
                 startup_warnings: std::mem::take(&mut warnings),
@@ -632,13 +741,7 @@ pub fn run(mut cli: Cli) -> Result<ExitCode> {
                 snapshots: stack.config.storage.snapshots,
                 input_history_size: stack.config.storage.input_history_size,
                 max_log_files: stack.config.storage.max_log_files,
-                permissions: Arc::new(
-                    caudra_agent::permissions::PermissionManager::new_persistent(
-                        stack.config.permissions.clone(),
-                        cwd.clone(),
-                        stack.plugin_host.plugin_rules(),
-                    ),
-                ),
+                permissions,
                 timeouts: stack.timeouts(),
                 exit_on_done: cli.exit_on_done,
                 lua_command_reader: stack.plugin_host.command_reader(),
@@ -651,6 +754,9 @@ pub fn run(mut cli: Cli) -> Result<ExitCode> {
                 default_prompt_profile: stack.default_prompt_profile.clone(),
                 prompt_profile_override: cli.system_prompt_profile.clone(),
                 herdr_reporter: herdr_reporter.as_ref().map(HerdrReporter::handle),
+                workspace_session: workcell_runtime.workspace_session().cloned(),
+                remote_project_context: workcell_runtime.remote_project_context().cloned(),
+                local_documents: workcell_runtime.local_documents().cloned(),
             },
             initial_prompt.take(),
         )
@@ -700,7 +806,8 @@ pub fn run(mut cli: Cli) -> Result<ExitCode> {
                 stack.plugin_host.begin_shutdown();
                 ToolRegistry::global().clear_lua();
                 teardown.defer(move || drop(stack));
-                let (new_stack, new_warnings) = build_stack(&cli, &cwd, &storage, Some(last_good))?;
+                let (new_stack, new_warnings) =
+                    build_stack(&cli, &cwd, &storage, Some(last_good), false)?;
                 tabs = reloaded;
                 if tabs.is_empty() {
                     let session = AppSession::new(&new_stack.model.spec(), &cwd_str);
@@ -880,15 +987,61 @@ mod tests {
         let storage = StateDir::from_path(temp.path().to_path_buf());
         let mut session = AppSession::new(TEST_MODEL, "/project");
         session.save(&storage).unwrap();
-        let first =
-            resolve_sessions(true, None, TEST_MODEL, Path::new("/project"), &storage).unwrap();
+        let first = resolve_sessions(
+            true,
+            None,
+            TEST_MODEL,
+            Path::new("/project"),
+            &storage,
+            None,
+        )
+        .unwrap();
 
-        let error = resolve_sessions(true, None, TEST_MODEL, Path::new("/project"), &storage)
-            .err()
-            .unwrap();
+        let error = resolve_sessions(
+            true,
+            None,
+            TEST_MODEL,
+            Path::new("/project"),
+            &storage,
+            None,
+        )
+        .err()
+        .unwrap();
 
         assert!(error.to_string().contains("already open"), "{error}");
         drop(first);
+    }
+
+    #[test_case(true)]
+    #[test_case(false)]
+    fn tui_resume_rejects_cross_authority(stored_remote: bool) {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = StateDir::from_path(temp.path().to_path_buf());
+        let local = StoredWorkspaceBinding::local_from_cwd("/project");
+        let remote: StoredWorkspaceBinding = serde_json::from_str(
+            &serde_json::to_string(&local)
+                .unwrap()
+                .replace("caudra:local:v1", "https://remote.example"),
+        )
+        .unwrap();
+        let mut session = AppSession::new_with_workspace(
+            TEST_MODEL,
+            ".",
+            if stored_remote { remote.clone() } else { local },
+        );
+        session.save(&storage).unwrap();
+        let result = resolve_sessions(
+            false,
+            Some(&session.id.to_string()),
+            TEST_MODEL,
+            Path::new("/project"),
+            &storage,
+            (!stored_remote).then_some(&remote),
+        );
+        assert!(result.is_err());
+        if stored_remote {
+            assert!(resolve_session(true, None, TEST_MODEL, ".", &storage).is_err());
+        }
     }
 
     #[test]
@@ -913,7 +1066,8 @@ mod tests {
         )
         .unwrap();
 
-        let resolved = resolve_sessions(true, None, TEST_MODEL, &workspace, &storage).unwrap();
+        let resolved =
+            resolve_sessions(true, None, TEST_MODEL, &workspace, &storage, None).unwrap();
 
         assert_eq!(
             resolved
@@ -969,6 +1123,39 @@ mod tests {
     }
 
     #[test]
+    fn remote_continue_discovers_nested_cwd_by_durable_identity() {
+        use caudra_workspace::{CwdHandle, ResourceId, ResourceScope, WorkspaceCursor};
+        let temp = tempfile::tempdir().unwrap();
+        let storage = StateDir::from_path(temp.path().into());
+        let local = StoredWorkspaceBinding::local_from_cwd(".");
+        let root: StoredWorkspaceBinding = serde_json::from_str(
+            &serde_json::to_string(&local)
+                .unwrap()
+                .replace("caudra:local:v1", "https://remote.example"),
+        )
+        .unwrap();
+        let nested = root
+            .with_cursor(WorkspaceCursor::new(
+                root.binding(),
+                ResourceScope::new(
+                    vec![ResourceId::new("root").unwrap()],
+                    ResourceId::new("nested").unwrap(),
+                )
+                .unwrap(),
+                0,
+                CwdHandle::new("old-nested-handle").unwrap(),
+            ))
+            .unwrap();
+        let mut session = AppSession::new_with_workspace(TEST_MODEL, "nested", nested.clone());
+        session.save(&storage).unwrap();
+        let resolved =
+            resolve_remote_sessions(true, None, TEST_MODEL, ".", &storage, &root).unwrap();
+        assert_eq!(resolved.tabs[0].session.id, session.id);
+        assert_eq!(resolved.tabs[0].session.cwd, "nested");
+        assert_eq!(resolved.tabs[0].session.workspace_binding(), Some(&nested));
+    }
+
+    #[test]
     fn continue_falls_back_to_newest_when_no_workspace_tab_is_usable() {
         let temp = tempfile::tempdir().unwrap();
         let storage = StateDir::from_path(temp.path().join("state"));
@@ -989,7 +1176,8 @@ mod tests {
         )
         .unwrap();
 
-        let resolved = resolve_sessions(true, None, TEST_MODEL, &workspace, &storage).unwrap();
+        let resolved =
+            resolve_sessions(true, None, TEST_MODEL, &workspace, &storage, None).unwrap();
 
         assert_eq!(resolved.tabs.len(), 1);
         assert_eq!(resolved.tabs[0].session.id, newest);
@@ -1070,7 +1258,7 @@ mod tests {
         let mut plugin_host = PluginHost::with_jit(Arc::new(ToolRegistry::new()), true)
             .expect("live host boots under --no-plugins");
 
-        let config = load_config(&plugin_host, &cli, dir.path())
+        let config = load_config(&plugin_host, &cli, dir.path(), false)
             .expect("no-plugins must skip the broken init.lua and still load defaults");
         assert!(
             !config.plugins.names.is_empty(),
@@ -1108,11 +1296,69 @@ mod tests {
         let mut plugin_host =
             PluginHost::with_jit(Arc::new(ToolRegistry::new()), true).expect("live host boots");
 
-        match load_config(&plugin_host, &cli, dir.path()) {
+        match load_config(&plugin_host, &cli, dir.path(), false) {
             Err(_) => {}
             Ok(_) => panic!("broken init.lua must error without --no-plugins"),
         }
 
         plugin_host.begin_shutdown();
+    }
+
+    #[test]
+    fn remote_config_does_not_execute_project_init_lua() {
+        use caudra_agent::tools::ToolRegistry;
+        use clap::Parser;
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("tempdir");
+        let caudra_dir = dir.path().join(".caudra");
+        fs::create_dir_all(&caudra_dir).expect("mkdir .caudra");
+        fs::write(
+            caudra_dir.join("init.lua"),
+            "error('remote project config canary executed')",
+        )
+        .expect("write init.lua");
+        let cli = Cli::parse_from(["caudra"]);
+        let mut plugin_host =
+            PluginHost::with_jit(Arc::new(ToolRegistry::new()), true).expect("live host boots");
+
+        load_config(&plugin_host, &cli, dir.path(), true)
+            .expect("remote startup must skip project init.lua");
+
+        plugin_host.begin_shutdown();
+    }
+
+    #[test_case(0; "zero_turns")]
+    #[test_case(2; "bounded_turns")]
+    fn shared_config_applies_cli_turn_limit_and_tool_policy(max: u32) {
+        use clap::Parser;
+
+        let dir = tempfile::tempdir().unwrap();
+        let max = max.to_string();
+        let cli = Cli::parse_from([
+            "caudra",
+            "--no-plugins",
+            "--print",
+            "--max-turns",
+            &max,
+            "--yolo",
+            "--allowed-tools",
+            "file_index",
+            "--disallowed-tools",
+            "shell",
+        ]);
+        let mut host = PluginHost::with_jit(Arc::new(ToolRegistry::new()), true).unwrap();
+        let config = load_config(&host, &cli, dir.path(), true).unwrap();
+        assert_eq!(config.agent.max_turns, cli.max_turns);
+        assert!(config.permissions.yolo);
+        assert_eq!(config.agent.allowed_tools, ["file_index"]);
+        assert!(
+            config
+                .agent
+                .disabled_tools
+                .iter()
+                .any(|tool| tool == "shell")
+        );
+        host.begin_shutdown();
     }
 }

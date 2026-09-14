@@ -180,8 +180,7 @@ impl BtwModal {
         }
 
         let theme = theme::current();
-        let padded_width =
-            Modal::inner_width(area.width, WIDTH_PERCENT).saturating_sub(H_PAD * 2);
+        let padded_width = Modal::inner_width(area.width, WIDTH_PERCENT).saturating_sub(H_PAD * 2);
 
         let mut lines: Vec<Line> = Vec::new();
         lines.push(Line::from(Span::styled(

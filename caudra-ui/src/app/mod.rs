@@ -28,7 +28,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use caudra_workbench::{Layout as WorkbenchLayout, Workbench, WorkbenchAction};
+use caudra_workbench::{Layout as WorkbenchLayout, MutationGate, Workbench, WorkbenchAction};
 
 use crate::AppSession;
 use crate::agent::ModelSlot;
@@ -155,7 +155,8 @@ const AUTH_EXPIRED_MSG: &str = "Authentication failed. Run `caudra auth login` i
 const COPY_FAILED: &str = "Copy failed: ";
 const FLASH_NO_PLAN: &str = "No plan file";
 const NO_FILE_REVERT_MSG: &str = "No file revert for this workspace";
-const NO_FILE_CHANGES_MSG: &str = "Nothing has written to this workspace, so there are no file changes to revert";
+const NO_FILE_CHANGES_MSG: &str =
+    "Nothing has written to this workspace, so there are no file changes to revert";
 const FAST_UNSUPPORTED_MSG: &str = "Fast mode requires an Anthropic Opus 4.6+ model (API only)";
 const THINKING_UNSUPPORTED_MSG: &str = "Thinking requires a model that supports it";
 const FAST_ON_MSG: &str = "Fast mode: on";
@@ -292,6 +293,7 @@ pub struct App {
     subagent_input_task: Option<String>,
     subagent_drafts: HashMap<String, InputDraft>,
     pub(super) command_palette: CommandPalette,
+    pub(crate) no_commands: bool,
     pub(super) command_modal: CommandModal,
     pub(super) theme_picker: ThemePicker,
     pub(super) thinking_picker: ThinkingPicker,
@@ -398,6 +400,10 @@ pub struct App {
     pub(super) last_exit: Option<Instant>,
 
     pub(crate) storage: StateDir,
+    pub(crate) workspace_session: Option<caudra_workspace::WorkspaceSession>,
+    pub(crate) remote_project_context:
+        Option<Arc<caudra_agent::remote_project_context::RemoteProjectContext>>,
+    pub(crate) local_documents: Option<Arc<caudra_storage::local_documents::LocalDocumentStore>>,
     pub(crate) snapshot_store: Arc<SnapshotStore>,
     /// Shared with this session's agents, which is what lets the first mutating
     /// tool call capture the revert point the UI later restores from.
@@ -428,6 +434,7 @@ pub struct App {
     hints: Watch<HintSnapshot>,
     pub(crate) restore_event_tx: Option<caudra_agent::EventSender>,
     pub(super) restoring: Arc<AtomicBool>,
+    remote_restore_confirmation: Option<session::RemoteRestoreConfirmation>,
     subagent_answers: HashMap<String, flume::Sender<String>>,
     subagent_steers: HashMap<String, SteeringQueue>,
     pending_subagent_steers: HashMap<String, VecDeque<PendingSteer>>,
@@ -471,12 +478,14 @@ impl App {
         lua_event_handle: EventHandle,
         model_policy: Arc<ModelPolicy>,
         prompt_profiles: Arc<PromptProfileCatalog>,
+        workspace_session: Option<caudra_workspace::WorkspaceSession>,
     ) -> Self {
         scrollbar::set_enabled(ui_config.scrollbar);
         let state = SessionState::from_session(session, model, &storage, &model_policy);
         let view = caudra_storage::view::read(&storage).unwrap_or_default();
         let typewriter = ui_config.typewriter_ms_per_char;
         let flash = ui_config.flash_duration();
+        let status_bar = StatusBar::new(flash, &state.session.cwd, workspace_session.is_some());
         let input_box = InputBox::new(
             InputHistory::load(&storage, input_history_size),
             ui_config.max_input_lines,
@@ -499,6 +508,7 @@ impl App {
                 mcp_reader.clone(),
                 lua_command_reader,
             ),
+            no_commands: false,
             command_modal: CommandModal::new(),
             theme_picker: ThemePicker::new(),
             thinking_picker: ThinkingPicker::new(),
@@ -548,7 +558,7 @@ impl App {
             workbench: Workbench::new(workbench_styles()),
             workbench_theme_gen: crate::theme::generation(),
             workbench_layout: None,
-            status_bar: StatusBar::new(flash),
+            status_bar,
             status_hits: Vec::new(),
             status_mouse_down: None,
             status_hover: None,
@@ -590,6 +600,9 @@ impl App {
             last_esc: None,
             last_exit: None,
             storage,
+            workspace_session: workspace_session.clone(),
+            remote_project_context: None,
+            local_documents: None,
             snapshot_store,
             workspace_baseline,
             snapshots_unavailable: None,
@@ -614,6 +627,7 @@ impl App {
             hint_reader,
             restore_event_tx: None,
             restoring: Arc::new(AtomicBool::new(false)),
+            remote_restore_confirmation: None,
             subagent_answers: HashMap::new(),
             subagent_steers: HashMap::new(),
             pending_subagent_steers: HashMap::new(),
@@ -630,6 +644,14 @@ impl App {
         );
         app.chats[0].context_window = app.state.model.context_window;
         app.sync_composer_cwd();
+        if let Some(workspace) = workspace_session
+            && let Err(error) = app.workbench.bind_workspace_with_gate(
+                workspace,
+                remote_workbench_gate(Arc::clone(&app.workspace_baseline)),
+            )
+        {
+            tracing::warn!(%error, "remote workbench backend initialization failed");
+        }
         app
     }
 
@@ -684,19 +706,47 @@ impl App {
     ///
     /// A session with no baseline has nothing to revert to, so it is not made
     /// to pay for a walk it will never spend.
-    pub(super) fn snapshot_history_head(&self) -> Result<(), SnapshotError> {
+    pub(super) fn snapshot_history_head(&mut self) -> Result<(), String> {
         let Some(head) = self.history_head().filter(|_| self.has_revert_point()) else {
             return Ok(());
         };
+        if self.workspace_baseline.is_remote() {
+            let already_captured = self
+                .workspace_baseline
+                .remote_capture(Some(head))
+                .is_ok_and(|capture| capture.is_some());
+            return match smol::block_on(self.workspace_baseline.ensure(Some(head))) {
+                caudra_agent::BaselineOutcome::Ready => {
+                    if !already_captured {
+                        self.status_bar
+                            .flash("Remote workspace snapshot is available".into());
+                    }
+                    Ok(())
+                }
+                caudra_agent::BaselineOutcome::Unavailable(reason) => Err(reason.to_string()),
+                caudra_agent::BaselineOutcome::Failed(error) => Err(error.to_string()),
+            };
+        }
         self.snapshot_store
             .snapshot(std::path::Path::new(&self.state.session.cwd), head)
             .map(drop)
+            .map_err(|error| error.to_string())
     }
 
     /// Whether a run has captured a baseline for this workspace yet. Until one
     /// exists there is nothing for a later capture to bracket.
     pub(super) fn has_revert_point(&self) -> bool {
-        self.snapshot_store.has_session_start()
+        if self.workspace_baseline.is_remote() {
+            self.workspace_baseline
+                .remote_capture(self.history_head())
+                .is_ok_and(|capture| capture.is_some())
+                || self
+                    .workspace_baseline
+                    .remote_capture(None)
+                    .is_ok_and(|capture| capture.is_some())
+        } else {
+            self.snapshot_store.has_session_start()
+        }
     }
 
     /// Why a file revert cannot run, in the user's terms: either this workspace
@@ -721,14 +771,19 @@ impl App {
     /// fidelity for one head; waiting costs the user their terminal, and
     /// blocks every other session queued behind the same lock.
     pub(super) fn snapshot_history_head_within(
-        &self,
+        &mut self,
         budget: Duration,
-    ) -> Result<bool, SnapshotError> {
-        self.snapshot_store.capture_head_within(
-            std::path::Path::new(&self.state.session.cwd),
-            self.history_head(),
-            budget,
-        )
+    ) -> Result<bool, String> {
+        if self.workspace_baseline.is_remote() {
+            return self.snapshot_history_head().map(|()| true);
+        }
+        self.snapshot_store
+            .capture_head_within(
+                std::path::Path::new(&self.state.session.cwd),
+                self.history_head(),
+                budget,
+            )
+            .map_err(|error| error.to_string())
     }
 
     pub(crate) fn main_chat(&mut self) -> &mut Chat {
@@ -848,7 +903,8 @@ impl App {
         let cwd = self.state.session.cwd.clone();
         let input = self.active_input_box();
         let (text, cursor) = (input.buffer.display_text(), input.buffer.cursor_offset());
-        self.mention_popup.sync(&text, cursor, &cwd);
+        self.mention_popup
+            .sync_workspace(&text, cursor, &cwd, self.workspace_session.clone());
     }
 
     /// Splices a completed path over the `@query` that opened the popup. The
@@ -1801,7 +1857,14 @@ impl App {
             }
             WorkbenchAction::SendToComposer { path, lines } => {
                 self.workbench.close();
-                let text = mentions::format(&path, lines.as_ref());
+                let text = match path {
+                    caudra_workbench::WorkbenchPath::Local(path) => {
+                        mentions::format(&path, lines.as_ref())
+                    }
+                    caudra_workbench::WorkbenchPath::Remote(path) => {
+                        mentions::format(std::path::Path::new(path.as_str()), lines.as_ref())
+                    }
+                };
                 if let InputAction::PaletteSync(val) =
                     self.active_input_box_mut().handle_paste_with_spaces(&text)
                 {
@@ -2110,7 +2173,13 @@ impl App {
                 self.command_modal.open(rows);
             }
             BuiltinAction::FilePicker => {
-                self.file_picker.open(&self.state.session.cwd);
+                if let Some(workspace) = self.workspace_session.clone() {
+                    if let Err(error) = self.file_picker.open_workspace(workspace) {
+                        self.flash(error.to_string());
+                    }
+                } else {
+                    self.file_picker.open(&self.state.session.cwd);
+                }
             }
             BuiltinAction::Search => {
                 let top = self.chats[self.active_chat].scroll_top();
@@ -2196,8 +2265,19 @@ impl App {
     fn toggle_workbench(&mut self) {
         let cwd = PathBuf::from(&self.state.session.cwd);
         let opening = !self.workbench.is_open();
-        self.workbench.toggle(&cwd);
+        if let Some(workspace) = self.workspace_session.clone() {
+            if let Err(error) = self.workbench.toggle_workspace(workspace) {
+                self.flash(error.to_string());
+                return;
+            }
+        } else {
+            self.workbench.toggle(&cwd);
+        }
         if !opening || self.workbench_layout.is_some() {
+            return;
+        }
+        if self.workspace_session.is_some() {
+            self.workbench_layout = Some(WorkbenchLayout::default());
             return;
         }
         let layout: WorkbenchLayout =
@@ -2210,7 +2290,13 @@ impl App {
     /// The stored layout is skipped: the reader asked for one file, and opening
     /// a session's worth of tabs around it would bury the answer.
     pub(crate) fn open_workbench_at(&mut self, mention: &Mention) {
-        self.open_workbench_file(&mention.path, mention.lines.clone());
+        if let Some(path) = mention.remote_path() {
+            self.sync_workbench_theme();
+            self.workbench
+                .open_remote_at(path.clone(), mention.lines.clone());
+        } else if let Some(path) = mention.local_path() {
+            self.open_workbench_file(path, mention.lines.clone());
+        }
     }
 
     /// A file Caudra named itself, such as a workflow's scratch file, opened
@@ -3213,7 +3299,12 @@ impl App {
                 self.discard_pending_delegations_under(&e.id);
             }
             if self.state.mode == Mode::Plan
-                && self.state.plan.path().is_some_and(|pp| e.wrote_to(pp))
+                && (self.state.plan.path().is_some_and(|pp| e.wrote_to(pp))
+                    || self
+                        .state
+                        .plan
+                        .document_ref()
+                        .is_some_and(|reference| e.wrote_document(&reference)))
             {
                 self.transition_plan(PlanTrigger::WriteDone);
             }
@@ -3798,6 +3889,9 @@ impl App {
                 vec![]
             }
             "/cd" => self.cmd_cd(&cmd.args),
+            "/remote" => {
+                vec![Action::RemoteControl(cmd.args)]
+            }
             "/yolo" => {
                 let enabled = self.permissions.toggle_yolo();
                 let msg = if enabled {
@@ -3994,6 +4088,20 @@ impl App {
     }
 
     fn cmd_cd(&mut self, args: &str) -> Vec<Action> {
+        if self.workspace_session.is_some() {
+            let requested = if args.trim().is_empty() {
+                "."
+            } else {
+                args.trim()
+            };
+            return match caudra_workspace::DirectoryNavigation::new(requested) {
+                Ok(path) => vec![Action::ChangeRemoteWorkingDirectory(path)],
+                Err(_) => {
+                    self.flash("cd: invalid remote workspace path".into());
+                    Vec::new()
+                }
+            };
+        }
         let path = if args.is_empty() {
             caudra_storage::paths::home().unwrap_or_default()
         } else {
@@ -4029,6 +4137,10 @@ impl App {
         snapshot_store: Arc<SnapshotStore>,
         permissions: PermissionsConfig,
     ) {
+        self.release_remote_restore_confirmation();
+        self.file_picker.close();
+        self.mention_popup.close();
+        self.workbench.bind_local();
         self.permissions_picker.close();
         self.permission_config_trust_deferred = false;
         self.permissions.set_project_with_config(cwd, permissions);
@@ -4036,13 +4148,73 @@ impl App {
             .session_mut()
             .set_cwd(cwd.to_string_lossy().into_owned());
         self.rebind_workspace_baseline(snapshot_store, cwd.to_path_buf());
-        self.status_bar.refresh_cwd();
+        self.status_bar.refresh_cwd(&cwd.to_string_lossy());
         self.sync_composer_cwd();
+    }
+
+    pub(crate) fn install_remote_working_directory(
+        &mut self,
+        change: shell::RemoteDirectoryChange,
+    ) -> Result<(), String> {
+        caudra_workspace::WorkspacePath::new(&change.display_path)
+            .map_err(|error| error.to_string())?;
+        let mut candidate = self.state.session.as_ref().clone();
+        candidate
+            .replace_workspace_cursor(change.binding.clone())
+            .map_err(|_| "cd: session workspace identity changed".to_owned())?;
+        candidate.set_cwd(change.display_path.clone());
+        let candidate = Arc::new(candidate);
+        self.permissions
+            .replace_remote_permission_asset_after(change.context.permissions(), || {
+                self.storage_writer
+                    .save_sync(Arc::clone(&candidate))
+                    .map_err(|_| {
+                        "cd: session persistence failed; directory was not changed".to_owned()
+                    })
+            })
+            .map_err(|error| error.to_string())?;
+        self.release_remote_restore_confirmation();
+        self.file_picker.close();
+        self.mention_popup.close();
+        self.state.session = candidate;
+        self.command_palette
+            .set_custom_commands(if self.no_commands {
+                Arc::from([])
+            } else {
+                Arc::from(caudra_agent::command::discover_remote_commands(
+                    &change.context,
+                ))
+            });
+        self.workspace_baseline.rebind_workspace_session(
+            self.storage.clone(),
+            self.state.session.id,
+            change.workspace.clone(),
+            change.binding,
+        );
+        self.workspace_baseline
+            .set_current_head(self.history_head());
+        self.workspace_session = Some(change.workspace);
+        if let Some(workspace) = self.workspace_session.clone()
+            && let Err(error) = self.workbench.bind_workspace_with_gate(
+                workspace,
+                remote_workbench_gate(Arc::clone(&self.workspace_baseline)),
+            )
+        {
+            tracing::warn!(%error, "remote workbench backend rebind failed");
+        }
+        self.remote_project_context = Some(change.context);
+        self.status_bar.set_remote_cwd(change.display_path);
+        Ok(())
     }
 
     /// Points both composers at the session's working directory, which is what
     /// decides whether an `@path` resolves to a file or stays prose.
     fn sync_composer_cwd(&mut self) {
+        if self.workspace_session.is_some() {
+            self.input_box.set_remote_cwd();
+            self.subagent_input_box.set_remote_cwd();
+            return;
+        }
         let cwd = PathBuf::from(&self.state.session.cwd);
         self.input_box.set_cwd(cwd.clone());
         self.subagent_input_box.set_cwd(cwd);
@@ -4190,6 +4362,7 @@ impl App {
     }
 
     pub(crate) fn prepare_shutdown(&mut self) {
+        self.release_remote_restore_confirmation();
         if self.recoverable_queue.is_empty() {
             self.recoverable_queue = self.queue.pending_prompts();
             self.recoverable_queue_together =
@@ -4197,6 +4370,18 @@ impl App {
         }
         self.queue.clear();
         self.shell.cancel_all();
+    }
+
+    pub(super) fn release_remote_restore_confirmation(&mut self) {
+        let Some(confirmation) = self.remote_restore_confirmation.take() else {
+            return;
+        };
+        if let Err(error) = smol::block_on(
+            self.workspace_baseline
+                .release_remote_prepared(&confirmation.prepared),
+        ) {
+            tracing::warn!(%error, "failed to release remote restore preview");
+        }
     }
 
     pub(crate) fn disconnect_agent_queue(&mut self) {
@@ -4308,6 +4493,11 @@ impl App {
     /// Reported once per verdict: it is a standing property of the workspace,
     /// not an event, and repeating it every turn would be noise.
     fn poll_snapshot_refusal(&mut self) -> Dirty {
+        if self.workspace_baseline.is_remote() && self.workspace_baseline.is_capturing() {
+            self.status_bar
+                .flash("Capturing remote workspace snapshot".into());
+            return Dirty::YES;
+        }
         let reason = self.workspace_baseline.refusal();
         if reason.as_deref().map(String::as_str) == self.snapshots_unavailable.as_deref() {
             return Dirty::NO;
@@ -4630,6 +4820,25 @@ impl App {
                 std::fs::read_to_string(&p).unwrap_or_default(),
                 p.display().to_string(),
             )),
+            PlanState::RemoteReady(reference) => self
+                .workspace_session
+                .as_ref()
+                .zip(self.local_documents.as_ref())
+                .and_then(|(workspace, store)| {
+                    store
+                        .read(
+                            workspace.binding().project().key(),
+                            Some(&self.state.session.id.to_string()),
+                            &caudra_workspace::LocalDocumentRef::Plan(reference.clone()),
+                        )
+                        .ok()
+                })
+                .map(|document| {
+                    (
+                        document.content,
+                        format!("plan reference {}", reference.as_str()),
+                    )
+                }),
             _ => None,
         };
 
@@ -4662,6 +4871,19 @@ impl App {
         actions.extend(self.start_from_queue(&msg));
         actions
     }
+}
+
+fn remote_workbench_gate(baseline: Arc<WorkspaceBaseline>) -> MutationGate {
+    MutationGate::new(move || {
+        let baseline = Arc::clone(&baseline);
+        Box::pin(async move {
+            match baseline.ensure_current().await {
+                caudra_agent::BaselineOutcome::Ready => Ok(()),
+                caudra_agent::BaselineOutcome::Unavailable(reason) => Err(reason.to_string()),
+                caudra_agent::BaselineOutcome::Failed(error) => Err(error.to_string()),
+            }
+        })
+    })
 }
 
 /// The key `/usage` groups a session's spend under: always the full spec, so a

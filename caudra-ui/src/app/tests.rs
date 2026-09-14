@@ -59,6 +59,12 @@ use caudra_storage::thinking::StoredThinking;
 use caudra_storage::tool_outputs::{ToolOutputError, ToolOutputStore};
 use caudra_storage::usage_ledger::{LedgerPurpose, TurnUsage, UsageLedger};
 use caudra_storage::view::ViewMode;
+use caudra_storage::workspace_binding::StoredWorkspaceBinding;
+use caudra_workspace::{
+    CollectionRevision, OperationId, ProjectAsset, ProjectAssetContent, ProjectAssetManifest,
+    SessionWorkspaceBinding, WorkspaceAssetService, WorkspaceCapabilities, WorkspaceCursor,
+    WorkspaceError, WorkspaceHandle, WorkspaceServices, WorkspaceSession,
+};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::buffer::CellDiffOption;
 use ratatui::layout::{Position, Rect};
@@ -248,6 +254,7 @@ fn build_app_with_lua(
         caudra_lua::EventHandle::disconnected_for_test(),
         Arc::new(caudra_config::ModelPolicy::default()),
         Arc::new(caudra_agent::prompt::profile::PromptProfileCatalog::default()),
+        None,
     )
 }
 
@@ -794,6 +801,7 @@ fn fresh_session_uses_local_plan_until_matching_tool_completion() {
         annotation: None,
         written_path: None,
         written_paths: vec![plan_path.to_string_lossy().into_owned()],
+        remote_written_paths: false,
         output_ref: None,
         output_limits: None,
         model_suffix: None,
@@ -853,6 +861,7 @@ fn tool_done_transitions_plan_to_ready(
         annotation: None,
         written_path,
         written_paths: Vec::new(),
+        remote_written_paths: false,
         output_ref: None,
         output_limits: None,
         model_suffix: None,
@@ -861,6 +870,46 @@ fn tool_done_transitions_plan_to_ready(
     }))));
 
     assert_eq!(app.state.plan.is_ready(), expect_ready);
+}
+
+#[test]
+fn tool_done_completes_only_the_matching_remote_plan() {
+    let expected =
+        caudra_workspace::PlanRef::new(format!("plan-{}", "a".repeat(32))).expect("plan ref");
+    let other =
+        caudra_workspace::PlanRef::new(format!("plan-{}", "b".repeat(32))).expect("plan ref");
+    let mut app = test_app();
+    app.state.mode = Mode::Plan;
+    app.state.plan = PlanState::RemoteDrafting(expected.clone());
+    app.status = Status::Streaming;
+    app.run_id = 1;
+
+    let event = |reference: &caudra_workspace::PlanRef| {
+        agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
+            id: "plan-write".into(),
+            tool: "local_document_write".into(),
+            output: ToolOutput::Plain("wrote plan".into()),
+            is_error: false,
+            annotation: Some(format!(
+                "local_document:plan:{};revision:{}",
+                reference.as_str(),
+                "c".repeat(64)
+            )),
+            written_path: None,
+            written_paths: Vec::new(),
+            remote_written_paths: false,
+            output_ref: None,
+            output_limits: None,
+            model_suffix: None,
+            model_output: None,
+            model_output_from_ref: false,
+        })))
+    };
+
+    app.update(event(&other));
+    assert_eq!(app.state.plan, PlanState::RemoteDrafting(expected.clone()));
+    app.update(event(&expected));
+    assert_eq!(app.state.plan, PlanState::RemoteReady(expected));
 }
 
 #[test]
@@ -1538,6 +1587,7 @@ fn tool_lifecycle_events_name_the_session_and_tool() {
         annotation: None,
         written_path: None,
         written_paths: Vec::new(),
+        remote_written_paths: false,
         output_ref: None,
         output_limits: None,
         model_suffix: None,
@@ -1676,6 +1726,7 @@ fn tool_done_msg(id: &str) -> Msg {
         annotation: None,
         written_path: None,
         written_paths: Vec::new(),
+        remote_written_paths: false,
         output_ref: None,
         output_limits: None,
         model_suffix: None,
@@ -2769,6 +2820,7 @@ pub(crate) fn finish_subagent(app: &mut App, id: &str, is_error: bool) {
         annotation: None,
         written_path: None,
         written_paths: Vec::new(),
+        remote_written_paths: false,
         output_ref: None,
         output_limits: None,
         model_suffix: None,
@@ -2943,7 +2995,9 @@ fn with_custom_command(app: &mut App, name: &str, content: &str) {
             content: content.to_string(),
             scope: caudra_agent::command::CommandScope::Project,
             accepts_args: false,
-            source: PathBuf::from("/project/.caudra/commands/custom.md"),
+            source: caudra_agent::command::CommandSource::Local(PathBuf::from(
+                "/project/.caudra/commands/custom.md",
+            )),
         }]),
         McpSnapshotReader::empty(),
         LuaCommandReader::empty(),
@@ -7817,6 +7871,257 @@ fn cd_command_behavior() {
     assert!(flash.starts_with("cd: "), "error flash={flash:?}");
 }
 
+fn remote_workspace_session() -> caudra_workspace::WorkspaceSession {
+    let authority = caudra_workspace::AuthorityIdentity::new(
+        caudra_workspace::SourceTrustAnchor::new("test-source").unwrap(),
+        "authority",
+        "workspace",
+        "generation",
+        "namespace",
+    )
+    .unwrap();
+    let binding = caudra_workspace::SessionWorkspaceBinding::new(
+        caudra_workspace::SessionBindingId::new("tab").unwrap(),
+        authority.clone(),
+        caudra_workspace::AuthenticatedPrincipalId::new(authority.clone(), "principal").unwrap(),
+        caudra_workspace::ProjectIdentity::new(
+            authority.clone(),
+            caudra_workspace::ProjectKey::new("project").unwrap(),
+        ),
+    )
+    .unwrap();
+    let cursor = caudra_workspace::WorkspaceCursor::new(
+        &binding,
+        caudra_workspace::ResourceScope::root(caudra_workspace::ResourceId::new("root").unwrap()),
+        1,
+        caudra_workspace::CwdHandle::new("remote-cwd").unwrap(),
+    );
+    let handle = caudra_workspace::WorkspaceHandle::new(
+        authority,
+        caudra_workspace::WorkspaceCapabilities::default(),
+        caudra_workspace::WorkspaceServices::default(),
+    )
+    .unwrap();
+    caudra_workspace::WorkspaceSession::new(handle, binding, cursor).unwrap()
+}
+
+struct EmptyRemoteAssets;
+
+#[derive(Default)]
+struct TestRemoteControl(std::sync::Mutex<Vec<caudra_workspace::WorkspaceControlCommand>>);
+
+#[async_trait::async_trait]
+impl caudra_workspace::WorkspaceControlService for TestRemoteControl {
+    async fn execute(
+        &self,
+        command: caudra_workspace::WorkspaceControlCommand,
+    ) -> Result<String, WorkspaceError> {
+        self.0.lock().unwrap().push(command);
+        Ok("Remote control response".to_owned())
+    }
+}
+
+#[test_case("status", true; "status")]
+#[test_case("pending", true; "pending")]
+#[test_case("reconnect", true; "reconnect")]
+#[test_case("reconcile", true; "reconcile")]
+#[test_case("acknowledge operation", false; "confirmation_required")]
+#[test_case("acknowledge operation --accept-possible-effects", true; "confirmed")]
+fn remote_ui_command_uses_the_dedicated_controller(args: &str, dispatched: bool) {
+    let mut app = test_app();
+    let original = remote_workspace_session();
+    let control = Arc::new(TestRemoteControl::default());
+    app.workspace_session = Some(
+        WorkspaceSession::new(
+            WorkspaceHandle::new(
+                original.binding().authority().clone(),
+                WorkspaceCapabilities::default(),
+                WorkspaceServices {
+                    control: Some(control.clone()),
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+            original.binding().clone(),
+            original.cursor().clone(),
+        )
+        .unwrap(),
+    );
+    let actions = app.execute_command(
+        ParsedCommand {
+            name: "/remote".into(),
+            args: args.into(),
+        },
+        0,
+    );
+    let [Action::RemoteControl(args)] = actions.as_slice() else {
+        panic!("expected dedicated control action");
+    };
+    let (tx, rx) = flume::bounded(1);
+    super::shell::spawn_remote_control(app.workspace_session.clone(), args.clone(), tx);
+    app.handle_shell_event(smol::block_on(rx.recv_async()).unwrap());
+    assert_eq!(!control.0.lock().unwrap().is_empty(), dispatched);
+}
+
+#[async_trait::async_trait]
+impl WorkspaceAssetService for EmptyRemoteAssets {
+    async fn discover(
+        &self,
+        _: &SessionWorkspaceBinding,
+        _: &WorkspaceCursor,
+    ) -> Result<ProjectAssetManifest, WorkspaceError> {
+        Ok(ProjectAssetManifest {
+            version: OperationId::new("project-assets.v1").unwrap(),
+            revision: CollectionRevision::new("empty").unwrap(),
+            assets: Vec::new(),
+        })
+    }
+
+    async fn read(
+        &self,
+        _: &SessionWorkspaceBinding,
+        _: &WorkspaceCursor,
+        _: &ProjectAsset,
+        _: u32,
+    ) -> Result<ProjectAssetContent, WorkspaceError> {
+        Err(WorkspaceError::Unavailable)
+    }
+}
+
+#[test]
+fn remote_cd_persistence_failure_preserves_live_state() {
+    const SAVE_FAILED: &str = "cd: session persistence failed; directory was not changed";
+    let mut app = test_app();
+    let original = remote_workspace_session();
+    let workspace = WorkspaceSession::new(
+        WorkspaceHandle::new(
+            original.binding().authority().clone(),
+            WorkspaceCapabilities::default(),
+            WorkspaceServices {
+                assets: Some(Arc::new(EmptyRemoteAssets)),
+                ..Default::default()
+            },
+        )
+        .unwrap(),
+        original.binding().clone(),
+        original.cursor().clone(),
+    )
+    .unwrap();
+    let binding = StoredWorkspaceBinding::new_with_cursor(
+        workspace.binding().clone(),
+        workspace.cursor().clone(),
+        None,
+    )
+    .unwrap();
+    app.state.session = Arc::new(AppSession::new_with_workspace("test", ".", binding.clone()));
+    app.workspace_session = Some(workspace.clone());
+    let old_session = Arc::clone(&app.state.session);
+    let old_baseline = Arc::clone(&app.workspace_baseline);
+    let old_context = smol::block_on(
+        caudra_agent::remote_project_context::load_remote_project_context(&workspace),
+    )
+    .unwrap();
+    app.remote_project_context = Some(Arc::clone(&old_context));
+    let old_policy: Vec<_> = app
+        .permissions
+        .active_policy()
+        .into_iter()
+        .map(|entry| (entry.source, entry.rule))
+        .collect();
+    let temp = TempDir::new().unwrap();
+    let blocked = temp.path().join("not-a-directory");
+    std::fs::write(&blocked, b"blocked").unwrap();
+    app.storage_writer = Arc::new(test_writer(StateDir::from_path(blocked)));
+    let candidate_cursor = WorkspaceCursor::new(
+        workspace.binding(),
+        workspace.cursor().scope().clone(),
+        workspace.cursor().generation(),
+        caudra_workspace::CwdHandle::new("candidate").unwrap(),
+    );
+    let binding = binding.with_cursor(candidate_cursor.clone()).unwrap();
+    let workspace = WorkspaceSession::new(
+        workspace.workspace().clone(),
+        workspace.binding().clone(),
+        candidate_cursor,
+    )
+    .unwrap();
+    let error = app
+        .install_remote_working_directory(super::shell::RemoteDirectoryChange {
+            workspace,
+            binding,
+            context: Arc::clone(&old_context),
+            display_path: "nested".into(),
+        })
+        .unwrap_err();
+    assert_eq!(error, SAVE_FAILED);
+    assert!(Arc::ptr_eq(&app.state.session, &old_session));
+    assert!(Arc::ptr_eq(&app.workspace_baseline, &old_baseline));
+    assert!(Arc::ptr_eq(
+        app.remote_project_context.as_ref().unwrap(),
+        &old_context
+    ));
+    assert_eq!(
+        app.workspace_session.as_ref().unwrap().cursor(),
+        original.cursor()
+    );
+    assert_eq!(
+        app.permissions
+            .active_policy()
+            .into_iter()
+            .map(|entry| (entry.source, entry.rule))
+            .collect::<Vec<_>>(),
+        old_policy
+    );
+}
+
+#[test]
+fn remote_cd_never_resolves_a_same_named_local_directory() {
+    let directory = TempDir::new().unwrap();
+    std::fs::create_dir(directory.path().join("canary")).unwrap();
+    let mut app = test_app();
+    app.workspace_session = Some(remote_workspace_session());
+    let original_cwd = app.state.session.cwd.clone();
+
+    let actions = app.execute_command(
+        ParsedCommand {
+            name: "/cd".into(),
+            args: "canary".into(),
+        },
+        0,
+    );
+
+    assert!(matches!(
+        actions.as_slice(),
+        [Action::ChangeRemoteWorkingDirectory(path)] if path.as_str() == "canary"
+    ));
+    assert_eq!(app.state.session.cwd, original_cwd);
+    assert!(directory.path().join("canary").is_dir());
+}
+
+#[test]
+fn remote_cd_defers_parent_navigation_to_the_server_without_changing_the_cursor() {
+    let mut app = test_app();
+    let workspace = remote_workspace_session();
+    let original_cursor = workspace.cursor().clone();
+    app.workspace_session = Some(workspace);
+
+    let actions = app.execute_command(
+        ParsedCommand {
+            name: "/cd".into(),
+            args: "../outside".into(),
+        },
+        0,
+    );
+
+    assert!(
+        matches!(actions.as_slice(), [Action::ChangeRemoteWorkingDirectory(path)] if path.as_str() == "../outside")
+    );
+    assert_eq!(
+        app.workspace_session.as_ref().unwrap().cursor(),
+        &original_cursor
+    );
+}
+
 #[test]
 fn cd_lifecycle_guard_is_deferred_to_the_multi_session_event_loop() {
     let mut cancelling = test_app();
@@ -9768,6 +10073,26 @@ fn fork_copies_execution_settings_but_resets_conversation_state() {
 }
 
 #[test]
+fn fork_discards_remote_plan_authority() {
+    let (_temp, _, _, mut app) = tempdir_app();
+    let reference = caudra_workspace::PlanRef::new(format!("plan-{}", "a".repeat(32))).unwrap();
+    app.state.plan = PlanState::RemoteReady(reference.clone());
+    app.permissions
+        .load_structured_conversation_rules(vec![conversation_permission_record()]);
+    app.permissions.set_session_yolo(Some(true));
+    let items = crate::history_items(&[Message::user("prompt".into())]);
+    let source = DisplaySource::User(items[0].id);
+    app.state.session_mut().replace_messages(items);
+    let child = app.fork_at(source).unwrap().session;
+    assert!(child.meta.plan_target.is_none());
+    assert!(child.meta.plan_path.is_none());
+    assert!(!child.meta.plan_written);
+    assert!(child.meta.structured_permission_rules.is_empty());
+    assert_eq!(child.meta.yolo, None);
+    assert_eq!(app.state.plan, PlanState::RemoteReady(reference));
+}
+
+#[test]
 fn fork_copies_ancestor_snapshots_into_child_store_without_restoring_files() {
     let (_temp, _, _, mut app) = tempdir_app();
     let workspace = PathBuf::from(&app.state.session.cwd);
@@ -11474,6 +11799,7 @@ fn plan_app() -> App {
         annotation: None,
         written_path: Some("test-plan.md".into()),
         written_paths: Vec::new(),
+        remote_written_paths: false,
         output_ref: None,
         output_limits: None,
         model_suffix: None,
@@ -11499,6 +11825,7 @@ fn tool_done_write_opens_plan_form(mode: Mode, expect_form: bool) {
         annotation: None,
         written_path: Some("/tmp/plans/test.md".into()),
         written_paths: Vec::new(),
+        remote_written_paths: false,
         output_ref: None,
         output_limits: None,
         model_suffix: None,
@@ -11537,6 +11864,7 @@ fn re_edit_keeps_plan_form_visible() {
         annotation: None,
         written_path: Some("test-plan.md".into()),
         written_paths: Vec::new(),
+        remote_written_paths: false,
         output_ref: None,
         output_limits: None,
         model_suffix: None,
@@ -11613,6 +11941,7 @@ fn rewrite_plan(app: &mut App) {
         annotation: None,
         written_path: Some("test-plan.md".into()),
         written_paths: Vec::new(),
+        remote_written_paths: false,
         output_ref: None,
         output_limits: None,
         model_suffix: None,
@@ -13754,6 +14083,7 @@ fn two_tool_results_checkpointed_separately_both_reach_disk() {
             annotation: None,
             written_path: None,
             written_paths: Vec::new(),
+            remote_written_paths: false,
             output_ref: None,
             output_limits: None,
             model_suffix: None,
@@ -13841,7 +14171,10 @@ fn typing_an_at_sigil_opens_the_mention_popup_and_completing_splices_in_place() 
     assert!(!app.mention_popup.is_open(), "{MENTION_POPUP_LINGERED}");
     let mentions = app.input_box.mentions();
     assert_eq!(mentions.len(), 1, "{MENTION_UNRESOLVED}");
-    assert_eq!(mentions[0].1.path, std::path::PathBuf::from("target.rs"));
+    assert_eq!(
+        mentions[0].1.local_path(),
+        Some(std::path::Path::new("target.rs"))
+    );
 }
 
 /// Where `needle` was drawn, so a test can press the row the reader sees.

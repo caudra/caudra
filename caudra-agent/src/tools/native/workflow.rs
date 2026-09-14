@@ -247,8 +247,7 @@ async fn render(handle: &WorkflowHandle, request: WorkflowRequest) -> ToolExecRe
         Ok(WorkflowResponse::Trusted { name }) => plain(format!("{name} is now trusted.")),
         Ok(WorkflowResponse::Acked(_) | WorkflowResponse::Ack) => plain(String::new()),
         Err(WorkflowError::TrustRequired { name, digest, path }) => error(format!(
-            "workflow {name:?} at {} is not trusted (digest {digest}). {TRUST_HINT}",
-            path.display()
+            "workflow {name:?} at {path} is not trusted (digest {digest}). {TRUST_HINT}"
         )),
         Err(failure) => error(failure.to_string()),
     }
@@ -289,12 +288,7 @@ fn catalog_line(entry: &CatalogEntry) -> String {
 }
 
 fn invalid_line(entry: &InvalidEntry) -> String {
-    format!(
-        "- {} [{}]: {}",
-        entry.path.display(),
-        entry.source_kind,
-        entry.error
-    )
+    format!("- {} [{}]: {}", entry.path, entry.source_kind, entry.error)
 }
 
 /// Snapshots as JSON, with the parts that grow without bound cut down: only
@@ -529,13 +523,13 @@ mod tests {
                     when_to_use: Some("before merging".into()),
                     phases: vec!["Plan".into(), "Review".into()],
                     source_kind: SourceKind::Project,
-                    path: Some(PathBuf::from(SCRIPT_PATH)),
+                    path: Some(SCRIPT_PATH.into()),
                     digest: DIGEST.into(),
                     trusted: false,
                     shadowed: Vec::new(),
                 }],
                 invalid: vec![InvalidEntry {
-                    path: PathBuf::from("/project/.caudra/workflows/broken.rhai"),
+                    path: "/project/.caudra/workflows/broken.rhai".into(),
                     source_kind: SourceKind::Project,
                     error: "meta: missing name".into(),
                 }],
@@ -662,7 +656,7 @@ mod tests {
             Err(WorkflowError::TrustRequired {
                 name: NAME.into(),
                 digest: DIGEST.into(),
-                path: PathBuf::from(SCRIPT_PATH),
+                path: SCRIPT_PATH.into(),
             })
         });
 

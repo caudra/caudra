@@ -183,6 +183,7 @@ async fn run_inner(
             annotation: None,
             written_path: None,
             written_paths: Vec::new(),
+            remote_written_paths: false,
             output_ref: None,
             output_limits: None,
             model_suffix: None,
@@ -265,10 +266,11 @@ async fn run_inner(
             Err(error) => return done_error(error),
         };
 
-        let planning = ctx.mode.plan_path().is_some();
+        let planning = ctx.mode.is_planning();
         let plan_access = invocation.plan_mode_access();
         if planning && plan_access == PlanModeAccess::Refused {
             warn!(tool = %name, "blocked tool in plan mode");
+            invocation.abandon(ctx).await;
             return done_error(crate::tools::PLAN_WRITE_RESTRICTED.into());
         }
         // A plan-mode grant must not outlive the plan, and no authority from
@@ -282,8 +284,21 @@ async fn run_inner(
         }
 
         let mutation_targets = invocation.mutation_targets(ctx);
+        let remote_plan_target = ctx.mode.plan_ref().is_some_and(|expected| {
+            invocation.local_document_target()
+                == Some(&caudra_workspace::LocalDocumentRef::Plan(expected.clone()))
+        });
+        if ctx.mode.plan_ref().is_some()
+            && !call_effect.is_safe_in_read_only()
+            && !remote_plan_target
+        {
+            warn!(tool = %name, "blocked non-plan local document write in remote plan mode");
+            invocation.abandon(ctx).await;
+            return done_error(crate::tools::PLAN_WRITE_RESTRICTED.into());
+        }
         if planning && !call_effect.is_safe_in_read_only() && !entry.source.is_trusted() {
             warn!(tool = %name, "blocked untrusted effect in plan mode");
+            invocation.abandon(ctx).await;
             return done_error(crate::tools::PLAN_WRITE_RESTRICTED.into());
         }
         // A call that named no target cannot be checked against the plan file,
@@ -292,8 +307,10 @@ async fn run_inner(
             && plan_access == PlanModeAccess::Standard
             && !call_effect.is_safe_in_read_only()
             && mutation_targets.is_empty()
+            && !remote_plan_target
         {
             warn!(tool = %name, "blocked unscoped effect in plan mode");
+            invocation.abandon(ctx).await;
             return done_error(crate::tools::PLAN_WRITE_RESTRICTED.into());
         }
 
@@ -303,31 +320,35 @@ async fn run_inner(
                 .plan_path()
                 .is_some_and(|plan_path| target == plan_path);
             if !is_plan_target {
-                if ctx.mode.plan_path().is_some() {
+                if planning {
                     warn!(
                         tool = %name,
                         target = %target.display(),
                         "blocked write in plan mode"
                     );
+                    invocation.abandon(ctx).await;
                     return done_error(crate::tools::PLAN_WRITE_RESTRICTED.into());
                 }
                 if let Some(reason) = ctx.permissions.boundary_block_reason(target) {
+                    invocation.abandon(ctx).await;
                     return done_error(reason);
                 }
             }
         }
 
-        if let Err(e) = enforce_permission(
-            invocation.as_ref(),
-            prepared_intent.as_ref(),
-            &entry.source,
-            name,
-            input,
-            ctx,
-            &id,
-        )
-        .await
+        if !remote_plan_target
+            && let Err(e) = enforce_permission(
+                invocation.as_ref(),
+                prepared_intent.as_ref(),
+                &entry.source,
+                name,
+                input,
+                ctx,
+                &id,
+            )
+            .await
         {
+            invocation.abandon(ctx).await;
             return done_error(e);
         }
 
@@ -347,7 +368,12 @@ async fn run_inner(
 
         invocation.start(ctx).await;
 
-        if let Err(message) = ensure_revert_point(ctx, call_effect).await {
+        if !remote_plan_target && let Err(message) = ensure_revert_point(ctx, call_effect).await {
+            invocation.abandon(ctx).await;
+            return done_error(message);
+        }
+        if let Err(message) = ctx.deadline.remaining() {
+            invocation.abandon(ctx).await;
             return done_error(message);
         }
 
@@ -385,6 +411,7 @@ async fn run_inner(
                     annotation: result.annotation,
                     written_path,
                     written_paths: result.written_paths,
+                    remote_written_paths: result.remote_written_paths,
                     output_ref: result.output_ref,
                     output_limits: result.output_limits,
                     model_suffix: result.model_suffix,
@@ -402,6 +429,8 @@ async fn run_inner(
                 );
                 let mut done = done_error(message).with_model_suffix(result.model_suffix);
                 set_lua_provenance(&mut done.output, &entry.source, true);
+                done.annotation = result.annotation;
+                done.remote_written_paths = result.remote_written_paths;
                 done.output_limits = result.output_limits;
                 done.output_ref = result.output_ref;
                 done.model_output = result.model_output;
@@ -552,6 +581,7 @@ fn run_tool_search(
         annotation: None,
         written_path: None,
         written_paths: Vec::new(),
+        remote_written_paths: false,
         output_ref: None,
         output_limits: None,
         model_suffix: None,
@@ -606,6 +636,7 @@ async fn run_local_tool(
         annotation: None,
         written_path: None,
         written_paths: Vec::new(),
+        remote_written_paths: false,
         output_ref: None,
         output_limits: None,
         model_suffix: None,
@@ -626,12 +657,19 @@ async fn ensure_revert_point(ctx: &ToolContext, effect: ToolEffect) -> Result<()
         return Ok(());
     }
     let Some(gate) = ctx.baseline.as_ref() else {
+        if ctx.workspace_session.is_some() {
+            return Err(format!(
+                "{SNAPSHOT_FAILED}: remote snapshot baseline is unavailable"
+            ));
+        }
         return Ok(());
     };
     match gate.ensure().await {
         // A workspace Caudra will not snapshot costs file revert, not the
         // user's work, and it has already said so once.
-        BaselineOutcome::Ready | BaselineOutcome::Unavailable(_) => Ok(()),
+        BaselineOutcome::Ready => Ok(()),
+        BaselineOutcome::Unavailable(_) if !gate.is_remote() => Ok(()),
+        BaselineOutcome::Unavailable(reason) => Err(format!("{SNAPSHOT_FAILED}: {reason}")),
         BaselineOutcome::Failed(error) => Err(format!("{SNAPSHOT_FAILED}: {error}")),
     }
 }
@@ -660,9 +698,24 @@ async fn enforce_permission(
         crate::tools::ToolSource::Native {
             owner, contract, ..
         } => Some((
-            crate::permissions::PermissionSubject::Native {
-                owner: owner.to_string(),
-                contract: contract.to_string(),
+            if prepared_intent.is_some_and(|intent| {
+                intent.authority == crate::permissions::PermissionAuthorityProfile::RemoteResource
+            }) {
+                let workspace = ctx.workspace_session.as_ref().ok_or_else(|| {
+                    "remote permission intent has no workspace identity".to_owned()
+                })?;
+                crate::permissions::PermissionSubject::RemoteNative {
+                    identity: crate::permissions::RemotePermissionIdentity::from_binding(
+                        workspace.binding(),
+                    ),
+                    owner: owner.to_string(),
+                    contract: contract.to_string(),
+                }
+            } else {
+                crate::permissions::PermissionSubject::Native {
+                    owner: owner.to_string(),
+                    contract: contract.to_string(),
+                }
             },
             crate::permissions::PermissionExecutorKind::Native,
         )),
@@ -677,6 +730,14 @@ async fn enforce_permission(
                 contract: contract.to_string(),
             },
             crate::permissions::PermissionExecutorKind::Lua,
+        )),
+        crate::tools::ToolSource::RemoteWorkcell { identity, contract } => Some((
+            crate::permissions::PermissionSubject::RemoteWorkcell {
+                identity: identity.as_ref().clone(),
+                tool: name.to_owned(),
+                contract: contract.to_string(),
+            },
+            crate::permissions::PermissionExecutorKind::RemoteWorkcell,
         )),
         crate::tools::ToolSource::Mcp { .. } => None,
     };
@@ -747,6 +808,7 @@ async fn execute_mcp_tool(
         annotation: None,
         written_path: None,
         written_paths: Vec::new(),
+        remote_written_paths: false,
         output_ref: None,
         output_limits: None,
         model_suffix: None,
@@ -758,7 +820,7 @@ async fn execute_mcp_tool(
         return done(format!("{READ_ONLY_TOOL_RESTRICTED}: {tool_name}"), true);
     }
 
-    if ctx.mode.plan_path().is_some() {
+    if ctx.mode.is_planning() {
         return done(MCP_BLOCKED_IN_PLAN.into(), true);
     }
 
@@ -1005,7 +1067,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    use caudra_config::{Effect, PermissionRule, PermissionsConfig, ToolKey};
+    use caudra_config::{DefaultEffect, Effect, PermissionRule, PermissionsConfig, ToolKey};
     use caudra_storage::StateDir;
     use caudra_storage::id::SessionRef;
     use caudra_storage::tool_outputs::ToolOutputStore;
@@ -1649,7 +1711,7 @@ mod tests {
 
     const START_PROBE_NAME: &str = "start_probe";
 
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use crate::ToolInput;
     use crate::tools::{
@@ -1661,11 +1723,13 @@ mod tests {
     struct StartProbe {
         started: Arc<AtomicBool>,
         executed: Arc<AtomicBool>,
+        abandoned: Arc<AtomicUsize>,
     }
 
     struct StartProbeInvocation {
         started: Arc<AtomicBool>,
         executed: Arc<AtomicBool>,
+        abandoned: Arc<AtomicUsize>,
     }
 
     impl ToolInvocation for StartProbeInvocation {
@@ -1680,6 +1744,10 @@ mod tests {
             Box::pin(std::future::ready(Some(PermissionScopes::single(
                 "probe".into(),
             ))))
+        }
+        fn abandon<'a>(&'a self, _ctx: &'a ToolContext) -> BoxFuture<'a, ()> {
+            self.abandoned.fetch_add(1, Ordering::SeqCst);
+            Box::pin(std::future::ready(()))
         }
         fn execute<'a>(self: Box<Self>, _ctx: &'a ToolContext) -> ExecFuture<'a> {
             self.executed.store(true, Ordering::SeqCst);
@@ -1703,6 +1771,7 @@ mod tests {
             Ok(Box::new(StartProbeInvocation {
                 started: Arc::clone(&self.started),
                 executed: Arc::clone(&self.executed),
+                abandoned: Arc::clone(&self.abandoned),
             }))
         }
     }
@@ -2416,7 +2485,11 @@ mod tests {
             );
             ctx.tool_filter = crate::tools::ToolFilter::AllExcept(vec![START_PROBE_NAME.into()]);
             let probe = StartProbe::default();
-            let (started, executed) = (Arc::clone(&probe.started), Arc::clone(&probe.executed));
+            let (started, executed, abandoned) = (
+                Arc::clone(&probe.started),
+                Arc::clone(&probe.executed),
+                Arc::clone(&probe.abandoned),
+            );
             let registry = ToolRegistry::new();
             registry
                 .register(
@@ -2444,6 +2517,7 @@ mod tests {
             assert!(done.output.as_text().contains("disabled"));
             assert!(!started.load(Ordering::SeqCst));
             assert!(!executed.load(Ordering::SeqCst));
+            assert_eq!(abandoned.load(Ordering::SeqCst), 0);
         });
     }
 
@@ -2471,7 +2545,11 @@ mod tests {
             );
 
             let probe = StartProbe::default();
-            let (started, executed) = (Arc::clone(&probe.started), Arc::clone(&probe.executed));
+            let (started, executed, abandoned) = (
+                Arc::clone(&probe.started),
+                Arc::clone(&probe.executed),
+                Arc::clone(&probe.abandoned),
+            );
             let registry = ToolRegistry::new();
             registry
                 .register(
@@ -2504,6 +2582,82 @@ mod tests {
                 !executed.load(Ordering::SeqCst),
                 "execute must not run after denial"
             );
+            assert_eq!(abandoned.load(Ordering::SeqCst), 1);
+        });
+    }
+
+    #[test]
+    fn execution_start_prevents_preflight_abandon() {
+        smol::block_on(async {
+            let permissions = Arc::new(PermissionManager::new_nonpersistent(
+                PermissionsConfig {
+                    default: DefaultEffect::Allow,
+                    ..PermissionsConfig::default()
+                },
+                PathBuf::from("/tmp"),
+                Arc::default(),
+            ));
+            let ctx = crate::tools::test_support::stub_ctx_with_permissions(
+                &AgentMode::Build,
+                permissions,
+            );
+            let probe = StartProbe::default();
+            let abandoned = Arc::clone(&probe.abandoned);
+            let registry = ToolRegistry::new();
+            registry
+                .register(
+                    Arc::new(probe),
+                    ToolSource::Lua {
+                        plugin: "test".into(),
+                        contract: "test-contract".into(),
+                        bundled: true,
+                    },
+                )
+                .unwrap();
+            let done = run(
+                &registry,
+                None,
+                "t1".into(),
+                START_PROBE_NAME,
+                &serde_json::json!({}),
+                &ctx,
+                Emit::Silent,
+            )
+            .await;
+            assert!(!done.is_error);
+            assert_eq!(abandoned.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    #[test]
+    fn plan_refusal_abandons_preflight_once() {
+        smol::block_on(async {
+            let ctx = crate::tools::test_support::stub_ctx(&AgentMode::Plan("/tmp/plan.md".into()));
+            let probe = StartProbe::default();
+            let abandoned = Arc::clone(&probe.abandoned);
+            let registry = ToolRegistry::new();
+            registry
+                .register(
+                    Arc::new(probe),
+                    ToolSource::Lua {
+                        plugin: "test".into(),
+                        contract: "test-contract".into(),
+                        bundled: true,
+                    },
+                )
+                .unwrap();
+            let done = run(
+                &registry,
+                None,
+                "t1".into(),
+                START_PROBE_NAME,
+                &serde_json::json!({}),
+                &ctx,
+                Emit::Silent,
+            )
+            .await;
+            assert!(done.is_error);
+            assert_eq!(abandoned.load(Ordering::SeqCst), 1);
         });
     }
 

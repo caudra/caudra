@@ -169,6 +169,7 @@ pub struct InputBox {
     /// Resolves the relative paths a mention names. Mentions stay inert until
     /// the app hands the composer the session's working directory.
     cwd: PathBuf,
+    remote_workspace: bool,
 }
 
 impl InputBox {
@@ -286,11 +287,18 @@ impl InputBox {
             scrollbar: Scrollbar::default(),
             hover: None,
             cwd: PathBuf::new(),
+            remote_workspace: false,
         }
     }
 
     pub(crate) fn set_cwd(&mut self, cwd: impl Into<PathBuf>) {
         self.cwd = cwd.into();
+        self.remote_workspace = false;
+    }
+
+    pub(crate) fn set_remote_cwd(&mut self) {
+        self.cwd.clear();
+        self.remote_workspace = true;
     }
 
     /// The mentions the composer text resolves, as char ranges into it.
@@ -302,7 +310,11 @@ impl InputBox {
     /// rather than the expanded text also means an `@path` sitting inside
     /// pasted content stays data instead of becoming a request to read a file.
     pub(crate) fn mentions(&self) -> Vec<(Range<usize>, Mention)> {
-        mentions::scan_in(&self.buffer.display_text(), &self.cwd)
+        if self.remote_workspace {
+            mentions::scan_remote(&self.buffer.display_text())
+        } else {
+            mentions::scan_in(&self.buffer.display_text(), &self.cwd)
+        }
     }
 
     pub fn copy_text(&self) -> String {
@@ -379,7 +391,7 @@ impl InputBox {
             return None;
         }
         let mut mentions: Vec<Mention> = self.mentions().into_iter().map(|(_, m)| m).collect();
-        mentions.dedup_by(|left, right| left.path == right.path && left.lines == right.lines);
+        mentions.dedup_by(|left, right| left.target == right.target && left.lines == right.lines);
         if record_history {
             self.history.push(text.clone());
         }
@@ -1302,7 +1314,10 @@ mod tests {
         let InputHit::Mention { mention, .. } = hit else {
             panic!("{EXPECT_MENTION_HIT}");
         };
-        assert_eq!(mention.path, std::path::PathBuf::from("src/lib.rs"));
+        assert_eq!(
+            mention.local_path(),
+            Some(std::path::Path::new("src/lib.rs"))
+        );
     }
 
     #[test]
@@ -1311,8 +1326,8 @@ mod tests {
         let submission = input.take_submission().expect("non-empty submission");
         assert_eq!(submission.mentions.len(), 1);
         assert_eq!(
-            submission.mentions[0].path,
-            std::path::PathBuf::from("src/lib.rs")
+            submission.mentions[0].local_path(),
+            Some(std::path::Path::new("src/lib.rs"))
         );
     }
 

@@ -6,6 +6,7 @@ use color_eyre::eyre::bail;
 
 use caudra_agent::tools::all_builtin_tool_names;
 use caudra_config::is_disableable_tool;
+use caudra_storage::auth::WorkcellCredentialName;
 use caudra_storage::retention::{Duration as RetentionDuration, GroupBy, KeepPolicy};
 
 use crate::print::OutputFormat;
@@ -59,6 +60,9 @@ impl From<LogLevel> for caudra_storage::log::record::Level {
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,
+
+    #[command(flatten)]
+    pub workcell: WorkcellSelectorArgs,
 
     /// Non-interactive mode. Runs the prompt and exits. Compatible with Claude Code's --print flag
     #[arg(short, long)]
@@ -250,6 +254,57 @@ impl Cli {
     }
 }
 
+#[derive(Args, Default)]
+pub struct WorkcellSelectorArgs {
+    /// Select [workcell.profiles.NAME] from the local user workcell.toml (version = 1)
+    #[arg(
+        long = "workcell-profile",
+        value_name = "NAME",
+        global = true,
+        conflicts_with_all = ["endpoint", "cwd", "credential_ref"]
+    )]
+    pub profile: Option<String>,
+
+    /// Select a Workcell endpoint (HTTPS, or HTTP on a numeric loopback address)
+    #[arg(
+        long = "workcell-endpoint",
+        value_name = "URL",
+        global = true,
+        requires = "cwd",
+        conflicts_with = "profile"
+    )]
+    pub endpoint: Option<String>,
+
+    /// Root-relative working directory at the selected Workcell endpoint
+    #[arg(
+        long = "workcell-cwd",
+        value_name = "PATH",
+        global = true,
+        requires = "endpoint",
+        conflicts_with = "profile"
+    )]
+    pub cwd: Option<String>,
+
+    /// Named bearer credential reference (credential:NAME)
+    #[arg(
+        long = "workcell-credential-ref",
+        value_name = "credential:NAME",
+        global = true,
+        requires_all = ["endpoint", "cwd"],
+        conflicts_with = "profile"
+    )]
+    pub credential_ref: Option<String>,
+}
+
+impl WorkcellSelectorArgs {
+    pub fn is_set(&self) -> bool {
+        self.profile.is_some()
+            || self.endpoint.is_some()
+            || self.cwd.is_some()
+            || self.credential_ref.is_some()
+    }
+}
+
 #[derive(Subcommand)]
 pub enum Command {
     /// Manage API authentication
@@ -265,6 +320,12 @@ pub enum Command {
     },
     /// Run the index tool on a file to see how it looks like
     Index { path: String },
+    /// Inspect or recover the selected remote workspace without running a model
+    Remote {
+        /// status, pending, reconnect, reconcile, or acknowledge ID --accept-possible-effects
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Manage MCP server authentication
     Mcp {
         #[command(subcommand)]
@@ -602,6 +663,30 @@ pub enum AuthAction {
     },
     /// Show authentication status for all providers
     Status,
+    /// Manage named Workcell bearer credentials in owner-only local auth state
+    Workcell {
+        #[command(subcommand)]
+        action: WorkcellAuthAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum WorkcellAuthAction {
+    /// Store or replace a named bearer credential (not OS-keyring encrypted)
+    Set {
+        /// Credential name referenced as credential:NAME
+        name: WorkcellCredentialName,
+        /// Read the bearer token from stdin instead of a hidden terminal prompt
+        #[arg(long)]
+        stdin: bool,
+    },
+    /// List credential names and update times without reading bearer values
+    List,
+    /// Delete a named bearer credential
+    Delete {
+        /// Credential name
+        name: WorkcellCredentialName,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -642,6 +727,9 @@ pub fn normalize_tool_name(name: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use caudra_config::workcell::{
+        WorkcellProfiles, WorkcellSelection, WorkcellSelectionError, select_workcell,
+    };
     use test_case::test_case;
 
     const LOGS_NOT_PARSED: &str = "expected the logs subcommand";
@@ -791,6 +879,27 @@ mod tests {
     }
 
     #[test]
+    fn remote_control_preserves_explicit_acknowledgement() {
+        let cli = Cli::try_parse_from([
+            "caudra",
+            "--workcell-profile",
+            "test",
+            "remote",
+            "acknowledge",
+            "operation",
+            "--accept-possible-effects",
+        ])
+        .unwrap();
+        let Some(Command::Remote { args }) = cli.command else {
+            panic!("expected remote control");
+        };
+        assert!(matches!(
+            caudra_workspace::WorkspaceControlCommand::parse(&args.join(" ")).unwrap(),
+            caudra_workspace::WorkspaceControlCommand::Acknowledge(_)
+        ));
+    }
+
+    #[test]
     fn prompt_accepts_leading_hyphen() {
         let cli = Cli::try_parse_from(["caudra", "--prompt", "-v is broken"]).unwrap();
 
@@ -844,5 +953,135 @@ mod tests {
     #[test]
     fn provider_auth_method_requires_provider() {
         assert!(Cli::try_parse_from(["caudra", "auth", "login", "--method", "oauth"]).is_err());
+    }
+
+    fn workcell_selection(cli: &Cli) -> Result<WorkcellSelection, WorkcellSelectionError> {
+        select_workcell(
+            &WorkcellProfiles::default(),
+            cli.workcell.profile.as_deref(),
+            cli.workcell.endpoint.as_deref(),
+            cli.workcell.cwd.as_deref(),
+            cli.workcell.credential_ref.as_deref(),
+        )
+    }
+
+    #[test]
+    fn no_workcell_selector_preserves_the_embedded_default() {
+        let cli = Cli::try_parse_from(["caudra"]).unwrap();
+
+        assert_eq!(workcell_selection(&cli), Ok(WorkcellSelection::Embedded));
+    }
+
+    #[test]
+    fn profile_and_direct_workcell_flags_conflict() {
+        assert!(
+            Cli::try_parse_from([
+                "caudra",
+                "--workcell-profile",
+                "production",
+                "--workcell-endpoint",
+                "https://workcell.example",
+                "--workcell-cwd",
+                "project",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test_case(&["caudra", "--workcell-endpoint", "https://workcell.example"] ; "endpoint_only")]
+    #[test_case(&["caudra", "--workcell-cwd", "project"] ; "cwd_only")]
+    #[test_case(&["caudra", "--workcell-credential-ref", "credential:production"] ; "credential_only")]
+    fn incomplete_direct_workcell_group_is_rejected(args: &[&str]) {
+        assert!(Cli::try_parse_from(args).is_err());
+    }
+
+    #[test]
+    fn direct_remote_workcell_requires_named_credentials() {
+        let cli = Cli::try_parse_from([
+            "caudra",
+            "--workcell-endpoint",
+            "https://workcell.example",
+            "--workcell-cwd",
+            "project",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            workcell_selection(&cli),
+            Err(WorkcellSelectionError::MissingRemoteCredential)
+        );
+    }
+
+    #[test]
+    fn direct_loopback_workcell_may_be_unauthenticated() {
+        let cli = Cli::try_parse_from([
+            "caudra",
+            "--workcell-endpoint",
+            "http://127.0.0.1:8080",
+            "--workcell-cwd",
+            "project",
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            workcell_selection(&cli),
+            Ok(WorkcellSelection::Remote(selection)) if selection.credential_ref.is_none()
+        ));
+    }
+
+    #[test]
+    fn direct_workcell_accepts_only_a_named_credential_reference() {
+        let cli = Cli::try_parse_from([
+            "caudra",
+            "--workcell-endpoint",
+            "https://workcell.example",
+            "--workcell-cwd",
+            "project",
+            "--workcell-credential-ref",
+            "credential:production",
+        ])
+        .unwrap();
+        assert!(workcell_selection(&cli).is_ok());
+
+        let environment_reference = Cli::try_parse_from([
+            "caudra",
+            "--workcell-endpoint",
+            "https://workcell.example",
+            "--workcell-cwd",
+            "project",
+            "--workcell-credential-ref",
+            "env:WORKCELL_TOKEN",
+        ])
+        .unwrap();
+        assert!(matches!(
+            workcell_selection(&environment_reference),
+            Err(WorkcellSelectionError::CredentialRef(_))
+        ));
+    }
+
+    #[test]
+    fn workcell_auth_set_accepts_no_bearer_value_argument() {
+        let cli =
+            Cli::try_parse_from(["caudra", "auth", "workcell", "set", "production", "--stdin"])
+                .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Auth {
+                action: AuthAction::Workcell {
+                    action: WorkcellAuthAction::Set { stdin: true, .. }
+                }
+            })
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "caudra",
+                "auth",
+                "workcell",
+                "set",
+                "production",
+                "bearer-must-not-be-argv",
+            ])
+            .is_err()
+        );
     }
 }

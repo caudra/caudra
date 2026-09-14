@@ -272,7 +272,7 @@ fn build_rows(catalog: &WorkflowCatalog) -> Vec<CatalogRow> {
 fn invalid_text(catalog: &WorkflowCatalog) -> Option<String> {
     let first = catalog.invalid.first()?;
     let more = catalog.invalid.len() - 1;
-    let path = first.path.display();
+    let path = &first.path;
     let text = if more == 0 {
         format!("{INVALID_PREFIX} {path}: {}", first.error)
     } else {
@@ -283,7 +283,6 @@ fn invalid_text(catalog: &WorkflowCatalog) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
 
     use caudra_workflow::{CatalogEntry, InvalidEntry, SourceKind};
     use test_case::test_case;
@@ -305,7 +304,7 @@ mod tests {
             when_to_use: None,
             phases: Vec::new(),
             source_kind,
-            path: Some(PathBuf::from("workflows/deep-research.rhai")),
+            path: Some("workflows/deep-research.rhai".into()),
             digest: DIGEST.into(),
             trusted,
             shadowed: Vec::new(),
@@ -375,7 +374,7 @@ mod tests {
         picker.fill(WorkflowCatalog {
             entries: Vec::new(),
             invalid: vec![InvalidEntry {
-                path: PathBuf::from("bad.rhai"),
+                path: "bad.rhai".into(),
                 source_kind: SourceKind::Project,
                 error: "parse error".into(),
             }],

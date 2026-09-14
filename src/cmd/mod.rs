@@ -3,6 +3,7 @@ mod logs;
 mod storage;
 mod subcmd;
 mod tui;
+mod workcell_runtime;
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -13,10 +14,8 @@ use color_eyre::eyre::Context;
 use caudra_config::Config;
 use caudra_storage::{EphemeralRoot, StateDir};
 
-use crate::cli::{AuthAction, Cli, Command, McpAction, normalize_tool_name};
+use crate::cli::{AuthAction, Cli, Command, McpAction, WorkcellAuthAction, normalize_tool_name};
 use crate::update;
-
-const WORKCELL_CODE_WORKER_ENV: &str = "WORKCELL_MCP_CODE_WORKER";
 
 fn run_storage(persistent: StateDir, ephemeral: bool) -> Result<(StateDir, Option<EphemeralRoot>)> {
     if !ephemeral {
@@ -27,38 +26,36 @@ fn run_storage(persistent: StateDir, ephemeral: bool) -> Result<(StateDir, Optio
     Ok((storage, Some(root)))
 }
 
-/// One choke point for every native tool, so a new entry point cannot boot
-/// with half the built-ins missing. Workcell owns the file, web, shell, and
-/// code contracts; `caudra_agent::tools::native` owns the rest.
-fn register_builtin_tools(cwd: &Path) -> Result<caudra_workcell::WorkcellHost> {
-    let registry = caudra_agent::tools::ToolRegistry::global();
-    let worker = std::env::var_os(WORKCELL_CODE_WORKER_ENV).map(std::path::PathBuf::from);
-    let host = caudra_workcell::WorkcellHost::new_production(cwd, worker.as_deref())
-        .context("initialize native Workcell tools")?;
-    host.register(registry)
-        .context("register native Workcell tools")?;
-    caudra_agent::tools::native::register(registry).context("register native Caudra tools")?;
-    for warning in host.warnings() {
-        eprintln!("warning: {warning}");
-    }
-    Ok(host)
-}
-
 /// Every entry point resolves config here, so the CLI tool flags cannot apply
 /// in the TUI and silently go missing from `caudra tools`.
-fn load_config(plugin_host: &caudra_lua::PluginHost, cli: &Cli, cwd: &Path) -> Result<Config> {
-    let raw_config = plugin_host
-        .load_init_files_or_skip(cli.no_plugins, cwd)
-        .context("load init.lua files")?;
+fn load_config(
+    plugin_host: &caudra_lua::PluginHost,
+    cli: &Cli,
+    cwd: &Path,
+    remote: bool,
+) -> Result<Config> {
+    let raw_config = if remote {
+        plugin_host.load_global_init_file_or_skip(cli.no_plugins)
+    } else {
+        plugin_host.load_init_files_or_skip(cli.no_plugins, cwd)
+    }
+    .context("load init.lua files")?;
 
     let mut config = raw_config
         .unwrap_or_default()
         .into_config(cli.no_rtk)
         .context("invalid config")?;
-    config.permissions = caudra_config::load_permissions(cwd);
+    config.permissions = if remote {
+        caudra_config::load_global_permissions()
+    } else {
+        caudra_config::load_permissions(cwd)
+    };
 
     if cli.yolo || config.always_yolo {
         config.permissions.yolo = true;
+    }
+    if let Some(max) = cli.max_turns {
+        config.agent.max_turns = Some(max);
     }
     if !cli.allowed_tools.is_empty() {
         config.agent.allowed_tools = cli
@@ -113,8 +110,8 @@ fn configure_native_tools(agent: &caudra_config::AgentConfig) {
     caudra_agent::tools::native::task::set_max_concurrent(agent.task_max_concurrent);
 }
 
-pub fn dispatch(cli: Cli) -> Result<ExitCode> {
-    match cli.command {
+pub fn dispatch(mut cli: Cli) -> Result<ExitCode> {
+    match cli.command.take() {
         Some(Command::Auth { action }) => {
             let storage = StateDir::resolve().context("resolve data directory")?;
             match action {
@@ -123,18 +120,41 @@ pub fn dispatch(cli: Cli) -> Result<ExitCode> {
                 }
                 AuthAction::Logout { provider } => subcmd::auth_logout(&provider, &storage)?,
                 AuthAction::Status => subcmd::auth_status(&storage)?,
+                AuthAction::Workcell { action } => match action {
+                    WorkcellAuthAction::Set { name, stdin } => {
+                        subcmd::workcell_credential_set(&name, stdin, &storage)?
+                    }
+                    WorkcellAuthAction::List => subcmd::workcell_credential_list(&storage)?,
+                    WorkcellAuthAction::Delete { name } => {
+                        subcmd::workcell_credential_delete(&name, &storage)?
+                    }
+                },
             }
         }
         Some(Command::Index { path }) => {
-            subcmd::index(&path, cli.no_plugins, cli.no_jit)?;
+            subcmd::index(&cli, &path)?;
         }
-        Some(Command::Models { jobs }) => {
-            subcmd::models(jobs, cli.model.as_deref(), cli.no_plugins, cli.no_jit)?
-        }
+        Some(Command::Remote { args }) => subcmd::remote_control(&cli, &args)?,
+        Some(Command::Models { jobs }) => subcmd::models(&cli, jobs)?,
         Some(Command::Mcp { action }) => {
             let storage = StateDir::resolve().context("resolve data directory")?;
+            let runtime = if cli.workcell.is_set() {
+                let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+                Some(workcell_runtime::WorkcellRuntime::initialize(
+                    &cli.workcell,
+                    &cwd,
+                    &storage,
+                    caudra_agent::tools::ToolRegistry::global(),
+                )?)
+            } else {
+                None
+            };
             match action {
-                McpAction::Auth { server } => subcmd::mcp_auth(&server, &storage)?,
+                McpAction::Auth { server } => subcmd::mcp_auth(
+                    &server,
+                    &storage,
+                    runtime.as_ref().is_some_and(|r| r.is_remote()),
+                )?,
                 McpAction::Logout { server } => subcmd::mcp_logout(&server, &storage)?,
             }
         }
@@ -146,12 +166,13 @@ pub fn dispatch(cli: Cli) -> Result<ExitCode> {
         }
         Some(Command::Acp { model, yolo }) => {
             acp::run(
-                model,
+                model.as_deref(),
                 yolo,
                 cli.ephemeral,
                 cli.no_plugins,
                 cli.no_jit,
-                cli.system_prompt_profile,
+                cli.system_prompt_profile.as_deref(),
+                &cli.workcell,
             )?;
         }
         Some(Command::Tools {
@@ -179,6 +200,21 @@ pub fn dispatch(cli: Cli) -> Result<ExitCode> {
             logs::run(follow, level, lines, json)?;
         }
         Some(Command::Storage { action }) => {
+            if cli.workcell.is_set() {
+                let storage = StateDir::resolve().context("resolve data directory")?;
+                let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+                let runtime = workcell_runtime::WorkcellRuntime::initialize(
+                    &cli.workcell,
+                    &cwd,
+                    &storage,
+                    caudra_agent::tools::ToolRegistry::global(),
+                )?;
+                if runtime.is_remote() {
+                    return Err(color_eyre::eyre::eyre!(
+                        "storage and snapshot commands are disabled for remote Workcell sessions"
+                    ));
+                }
+            }
             storage::run(action, cli.no_plugins, cli.no_jit)?;
         }
         Some(Command::Prompt {
@@ -197,6 +233,7 @@ pub fn dispatch(cli: Cli) -> Result<ExitCode> {
                 cli.no_rtk,
                 cli.model.as_deref(),
                 cli.system_prompt_profile.as_deref(),
+                &cli.workcell,
             )?;
         }
         None => return tui::run(cli),

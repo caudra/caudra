@@ -1,5 +1,4 @@
 use std::borrow::Cow;
-use std::env;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -565,6 +564,7 @@ pub struct StatusBar {
     cwd_branch: String,
     pub flash_duration: Duration,
     branch_update_rx: Option<flume::Receiver<()>>,
+    cwd: Option<String>,
     marquee: Marquee,
 }
 
@@ -637,13 +637,18 @@ impl Marquee {
 }
 
 impl StatusBar {
-    pub fn new(flash_duration: Duration) -> Self {
+    pub fn new(flash_duration: Duration, cwd: &str, remote: bool) -> Self {
         Self {
             flash: None,
             started_at: Instant::now(),
-            cwd_branch: cwd_branch_label(),
+            cwd_branch: if remote {
+                cwd.to_owned()
+            } else {
+                cwd_branch_label(cwd)
+            },
             flash_duration,
-            branch_update_rx: spawn_branch_watcher(),
+            branch_update_rx: (!remote).then(|| spawn_branch_watcher(cwd)).flatten(),
+            cwd: (!remote).then(|| cwd.to_owned()),
             marquee: Marquee::default(),
         }
     }
@@ -657,8 +662,16 @@ impl StatusBar {
         self.flash.as_ref().map(|(s, _)| s.as_str())
     }
 
-    pub fn refresh_cwd(&mut self) {
-        self.cwd_branch = cwd_branch_label();
+    pub fn refresh_cwd(&mut self, cwd: &str) {
+        self.cwd_branch = cwd_branch_label(cwd);
+        self.branch_update_rx = spawn_branch_watcher(cwd);
+        self.cwd = Some(cwd.to_owned());
+    }
+
+    pub fn set_remote_cwd(&mut self, cwd: String) {
+        self.cwd_branch = cwd;
+        self.branch_update_rx = None;
+        self.cwd = None;
     }
 
     pub fn poll_branch_update(&mut self) -> Dirty {
@@ -668,7 +681,10 @@ impl StatusBar {
         if rx.try_iter().next().is_none() {
             return Dirty::NO;
         }
-        let branch = cwd_branch_label();
+        let Some(cwd) = &self.cwd else {
+            return Dirty::NO;
+        };
+        let branch = cwd_branch_label(cwd);
         let changed = branch != self.cwd_branch;
         self.cwd_branch = branch;
         Dirty::from(changed)
@@ -1440,12 +1456,9 @@ fn collapse_home_with(path: &str, home: &str) -> String {
         .unwrap_or_else(|| path.to_string())
 }
 
-fn cwd_branch_label() -> String {
-    let cwd = env::current_dir()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| ".".into());
-    let label = collapse_home(&cwd);
-    match detect_branch(&cwd) {
+fn cwd_branch_label(cwd: &str) -> String {
+    let label = collapse_home(cwd);
+    match detect_branch(cwd) {
         Some(branch) => format!("{label}:{branch}"),
         None => label,
     }
@@ -1470,11 +1483,10 @@ fn find_git_dir(cwd: &Path) -> Option<std::path::PathBuf> {
     }
 }
 
-fn spawn_branch_watcher() -> Option<flume::Receiver<()>> {
+fn spawn_branch_watcher(cwd: &str) -> Option<flume::Receiver<()>> {
     use notify::{RecursiveMode, Watcher};
 
-    let cwd = env::current_dir().ok()?;
-    let git_dir = find_git_dir(&cwd)?;
+    let git_dir = find_git_dir(Path::new(cwd))?;
     let (tx, rx) = flume::bounded(1);
 
     std::thread::spawn(move || {
@@ -1674,7 +1686,7 @@ mod tests {
             pending_model,
             chat_name,
         } = fixture;
-        let mut bar = StatusBar::new(FLASH_TTL);
+        let mut bar = StatusBar::new(FLASH_TTL, ".", false);
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 1)).unwrap();
         let ctx = StatusBarContext {
@@ -2152,7 +2164,7 @@ mod tests {
 
     #[test]
     fn an_active_marquee_claims_only_its_step_cadence() {
-        let mut bar = StatusBar::new(FLASH_TTL);
+        let mut bar = StatusBar::new(FLASH_TTL, ".", false);
         bar.marquee.active = Some(MarqueeState {
             target: StatusBarHitTarget::ChatName,
             source: "a long chat name".into(),
@@ -2581,7 +2593,7 @@ mod tests {
     #[test_case(true,  FLASH_TTL      => Dirty::NO  ; "flash_still_visible")]
     #[test_case(true,  Duration::ZERO => Dirty::YES ; "flash_expired")]
     fn clear_expired_hint_owes_the_frame_only_once(flashing: bool, ttl: Duration) -> Dirty {
-        let mut bar = StatusBar::new(ttl);
+        let mut bar = StatusBar::new(ttl, ".", false);
         if flashing {
             bar.flash(FLASH_MSG.into());
         }
@@ -2599,14 +2611,16 @@ mod tests {
     #[test_case(false => Dirty::NO  ; "unchanged_branch")]
     #[test_case(true  => Dirty::YES ; "switched_branch")]
     fn poll_branch_update_reports_only_real_changes(stale: bool) -> Dirty {
-        let label = cwd_branch_label();
+        let cwd = std::env::current_dir().unwrap();
+        let label = cwd_branch_label(&cwd.to_string_lossy());
         let (tx, rx) = flume::bounded(1);
-        let mut bar = StatusBar::new(FLASH_TTL);
+        let mut bar = StatusBar::new(FLASH_TTL, ".", false);
         bar.cwd_branch = if stale {
             STALE_BRANCH.into()
         } else {
             label.clone()
         };
+        bar.cwd = Some(cwd.to_string_lossy().into_owned());
         bar.branch_update_rx = Some(rx);
         tx.send(()).unwrap();
 
@@ -2621,7 +2635,7 @@ mod tests {
 
     #[test]
     fn clear_flash_removes_flash() {
-        let mut bar = StatusBar::new(Duration::from_secs(999));
+        let mut bar = StatusBar::new(Duration::from_secs(999), ".", false);
         bar.flash("Copied".into());
         bar.clear_flash();
         assert!(bar.flash.is_none());

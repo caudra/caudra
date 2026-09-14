@@ -11,6 +11,7 @@
 use std::ops::{Range, RangeInclusive};
 use std::path::{Path, PathBuf};
 
+use caudra_workspace::WorkspacePath;
 use serde::{Deserialize, Serialize};
 
 const SIGIL: char = '@';
@@ -33,9 +34,16 @@ pub struct Mention {
     /// The mention exactly as it appears in the composer, sigil included. Kept
     /// verbatim so a restored draft renders the text the user actually typed.
     pub raw: String,
-    pub path: PathBuf,
+    pub target: MentionTarget,
     /// Inclusive and 1-based, matching how the workbench and editors count.
     pub lines: Option<RangeInclusive<usize>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "path", rename_all = "snake_case")]
+pub enum MentionTarget {
+    Local(PathBuf),
+    Remote(WorkspacePath),
 }
 
 impl Mention {
@@ -45,8 +53,38 @@ impl Mention {
         let path = path.into();
         Self {
             raw: format(&path, lines.as_ref()),
-            path,
+            target: MentionTarget::Local(path),
             lines,
+        }
+    }
+
+    pub fn remote(path: WorkspacePath, lines: Option<RangeInclusive<usize>>) -> Self {
+        let raw = format_remote(&path, lines.as_ref());
+        Self {
+            raw,
+            target: MentionTarget::Remote(path),
+            lines,
+        }
+    }
+
+    pub fn local_path(&self) -> Option<&Path> {
+        match &self.target {
+            MentionTarget::Local(path) => Some(path),
+            MentionTarget::Remote(_) => None,
+        }
+    }
+
+    pub fn remote_path(&self) -> Option<&WorkspacePath> {
+        match &self.target {
+            MentionTarget::Remote(path) => Some(path),
+            MentionTarget::Local(_) => None,
+        }
+    }
+
+    pub fn display_path(&self) -> &str {
+        match &self.target {
+            MentionTarget::Local(path) => path.to_str().unwrap_or("<non-UTF-8 path>"),
+            MentionTarget::Remote(path) => path.as_str(),
         }
     }
 
@@ -83,6 +121,33 @@ pub fn format(path: &Path, lines: Option<&RangeInclusive<usize>>) -> String {
     out
 }
 
+fn format_remote(path: &WorkspacePath, lines: Option<&RangeInclusive<usize>>) -> String {
+    format_text(path.as_str(), lines)
+}
+
+fn format_text(display: &str, lines: Option<&RangeInclusive<usize>>) -> String {
+    let mut out = String::with_capacity(display.len() + 2);
+    out.push(SIGIL);
+    if display.contains(char::is_whitespace) {
+        out.push(QUOTE);
+        out.push_str(display);
+        out.push(QUOTE);
+    } else {
+        out.push_str(display);
+    }
+    if let Some(lines) = lines {
+        out.push(RANGE_SEPARATOR);
+        out.push(LINE_PREFIXES[0]);
+        out.push_str(&lines.start().to_string());
+        if lines.start() != lines.end() {
+            out.push(RANGE_SPAN);
+            out.push(LINE_PREFIXES[0]);
+            out.push_str(&lines.end().to_string());
+        }
+    }
+    out
+}
+
 /// Finds every mention in `text` that names a path under `cwd`, which is what a
 /// caller holding a working directory wants instead of its own predicate.
 pub fn scan_in(text: &str, cwd: &Path) -> Vec<(Range<usize>, Mention)> {
@@ -105,7 +170,7 @@ pub fn scan(text: &str, mut exists: impl FnMut(&Path) -> bool) -> Vec<(Range<usi
         if character == SIGIL
             && boundary
             && let Some((end, mention)) = parse_from(text, byte_index)
-            && exists(&mention.path)
+            && mention.local_path().is_some_and(&mut exists)
         {
             let width = text[byte_index..end].chars().count();
             found.push((char_index..char_index + width, mention));
@@ -120,9 +185,52 @@ pub fn scan(text: &str, mut exists: impl FnMut(&Path) -> bool) -> Vec<(Range<usi
     found
 }
 
+/// Parses workspace-relative mentions without probing the client filesystem.
+pub fn scan_remote(text: &str) -> Vec<(Range<usize>, Mention)> {
+    let mut found = Vec::new();
+    let mut boundary = true;
+    let mut candidates = 0;
+    let mut cursor = text.char_indices().enumerate();
+    while let Some((char_index, (byte_index, character))) = cursor.next() {
+        if character == SIGIL && boundary && candidates < MAX_CANDIDATES {
+            candidates += 1;
+            if let Some((end, path, lines)) = parse_parts(text, byte_index)
+                && let Ok(path) = WorkspacePath::new(path.to_owned())
+            {
+                let mention = Mention {
+                    raw: text[byte_index..end].to_owned(),
+                    target: MentionTarget::Remote(path),
+                    lines,
+                };
+                let width = text[byte_index..end].chars().count();
+                found.push((char_index..char_index + width, mention));
+                for _ in 1..width {
+                    cursor.next();
+                }
+                boundary = false;
+                continue;
+            }
+        }
+        boundary = character.is_whitespace() || OPENING_DELIMITERS.contains(&character);
+    }
+    found
+}
+
 /// Parses one mention starting at `at`, a byte offset that must land on the
 /// sigil. Returns the byte offset just past the mention.
 fn parse_from(text: &str, at: usize) -> Option<(usize, Mention)> {
+    let (end, path, lines) = parse_parts(text, at)?;
+    Some((
+        end,
+        Mention {
+            raw: text[at..end].to_owned(),
+            target: MentionTarget::Local(PathBuf::from(path)),
+            lines,
+        },
+    ))
+}
+
+fn parse_parts(text: &str, at: usize) -> Option<(usize, &str, Option<RangeInclusive<usize>>)> {
     let body = text.get(at..)?.strip_prefix(SIGIL)?;
     let (path, lines, consumed) = match body.strip_prefix(QUOTE) {
         Some(quoted) => {
@@ -148,14 +256,7 @@ fn parse_from(text: &str, at: usize) -> Option<(usize, Mention)> {
     if path.is_empty() {
         return None;
     }
-    Some((
-        at + SIGIL.len_utf8() + consumed,
-        Mention {
-            raw: text[at..at + SIGIL.len_utf8() + consumed].to_owned(),
-            path: PathBuf::from(path),
-            lines,
-        },
-    ))
+    Some((at + SIGIL.len_utf8() + consumed, path, lines))
 }
 
 /// Splits a trailing `:L12-L20` off an unquoted run. The suffix counts only
@@ -228,7 +329,7 @@ mod tests {
     fn scan_reads_a_mention(text: &str, path: &str, lines: Option<RangeInclusive<usize>>) {
         let found = scan(text, anything);
         assert_eq!(found.len(), 1, "{text}");
-        assert_eq!(found[0].1.path, PathBuf::from(path));
+        assert_eq!(found[0].1.local_path(), Some(Path::new(path)));
         assert_eq!(found[0].1.lines, lines);
     }
 
@@ -290,7 +391,7 @@ mod tests {
         let rendered = format(Path::new(path), lines.as_ref());
         assert_eq!(rendered, expected);
         let found = scan(&rendered, anything);
-        assert_eq!(found[0].1.path, PathBuf::from(path));
+        assert_eq!(found[0].1.local_path(), Some(Path::new(path)));
         assert_eq!(found[0].1.lines, lines);
     }
 

@@ -4,6 +4,10 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use caudra_workspace::{
+    AuthenticatedPrincipalId, AuthorityIdentity, ProjectIdentity, SessionWorkspaceBinding,
+};
+
 use crate::id::CaudraId;
 use crate::state::{SCOPE_GLOBAL, StateKey, StateStore};
 use crate::{StateClass, StateDir, StorageError, now_epoch};
@@ -26,8 +30,32 @@ pub const COMMAND_PATTERN_MAX_BYTES: usize = 256;
 pub const COMMAND_PATTERN_MAX_TOKENS: usize = 8;
 const SHA256_HEX_LEN: usize = 64;
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemotePermissionIdentity {
+    pub authority: AuthorityIdentity,
+    pub principal: AuthenticatedPrincipalId,
+    pub project: ProjectIdentity,
+}
+
+impl RemotePermissionIdentity {
+    pub fn from_binding(binding: &SessionWorkspaceBinding) -> Self {
+        Self {
+            authority: binding.authority().clone(),
+            principal: binding.principal().clone(),
+            project: binding.project().clone(),
+        }
+    }
+
+    fn is_consistent(&self) -> bool {
+        self.authority.legacy_local_authority_id().is_none()
+            && self.principal.authority() == &self.authority
+            && self.project.authority() == &self.authority
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum PermissionSubject {
     Native {
         owner: String,
@@ -45,6 +73,16 @@ pub enum PermissionSubject {
         tool: String,
         contract: String,
     },
+    RemoteWorkcell {
+        identity: RemotePermissionIdentity,
+        tool: String,
+        contract: String,
+    },
+    RemoteNative {
+        identity: RemotePermissionIdentity,
+        owner: String,
+        contract: String,
+    },
     UnknownLegacy {
         identity: String,
     },
@@ -56,6 +94,7 @@ pub enum PermissionExecutorKind {
     Native,
     Lua,
     Mcp,
+    RemoteWorkcell,
     UnknownLegacy,
 }
 
@@ -67,7 +106,19 @@ pub enum PermissionResourceKind {
     Url,
     Command,
     Query,
-    Custom { name: String },
+    RemoteFile {
+        identity: RemotePermissionIdentity,
+    },
+    RemoteDirectory {
+        identity: RemotePermissionIdentity,
+    },
+    RemoteResource {
+        identity: RemotePermissionIdentity,
+        resource_kind: String,
+    },
+    Custom {
+        name: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -100,6 +151,14 @@ pub enum PermissionResourceSelector {
     },
     CommandPattern {
         pattern: String,
+    },
+    RemoteResource {
+        identity: RemotePermissionIdentity,
+        scope: Vec<String>,
+    },
+    RemoteSubtree {
+        identity: RemotePermissionIdentity,
+        scope: Vec<String>,
     },
     Subtree {
         root: String,
@@ -426,6 +485,7 @@ fn validate_record(
     if let Some(family) = record.rule.family {
         validate_family(family, &record.rule.subject, &record.rule.resources)?;
     }
+    validate_subject(&record.rule.subject)?;
     for resource in &record.rule.resources {
         validate_resource_selector(&resource.kind, &resource.selector)?;
         for (attribute, selector) in &resource.attributes {
@@ -441,6 +501,20 @@ fn validate_record(
         validate_review(review)?;
     }
     Ok(())
+}
+
+fn validate_subject(subject: &PermissionSubject) -> Result<(), PermissionStateError> {
+    match subject {
+        PermissionSubject::RemoteWorkcell { identity, .. }
+        | PermissionSubject::RemoteNative { identity, .. }
+            if !identity.is_consistent() =>
+        {
+            Err(PermissionStateError::Invalid(
+                "remote permission subject identity is inconsistent".into(),
+            ))
+        }
+        _ => Ok(()),
+    }
 }
 
 fn validate_review(value: &Value) -> Result<(), PermissionStateError> {
@@ -513,6 +587,31 @@ fn validate_resource_selector(
     kind: &PermissionResourceKind,
     selector: &PermissionResourceSelector,
 ) -> Result<(), PermissionStateError> {
+    if matches!(
+        kind,
+        PermissionResourceKind::RemoteFile { identity }
+            | PermissionResourceKind::RemoteDirectory { identity }
+            | PermissionResourceKind::RemoteResource { identity, .. }
+            if !identity.is_consistent()
+    ) {
+        return Err(PermissionStateError::Invalid(
+            "remote resource kind identity is inconsistent".into(),
+        ));
+    }
+    if matches!(
+        selector,
+        PermissionResourceSelector::RemoteResource { .. }
+            | PermissionResourceSelector::RemoteSubtree { .. }
+    ) && !matches!(
+        kind,
+        PermissionResourceKind::RemoteFile { .. }
+            | PermissionResourceKind::RemoteDirectory { .. }
+            | PermissionResourceKind::RemoteResource { .. }
+    ) {
+        return Err(PermissionStateError::Invalid(
+            "remote resource selector requires a remote resource kind".into(),
+        ));
+    }
     if let PermissionResourceSelector::CommandPattern { pattern } = selector {
         if !matches!(kind, PermissionResourceKind::Command) {
             return Err(PermissionStateError::Invalid(
@@ -531,6 +630,21 @@ fn validate_selector(selector: &PermissionResourceSelector) -> Result<(), Permis
         | PermissionResourceSelector::UrlSubtreeDigest { digest }
         | PermissionResourceSelector::UrlOriginDigest { digest } => validate_digest(digest),
         PermissionResourceSelector::Any => Ok(()),
+        PermissionResourceSelector::RemoteResource { identity, scope }
+        | PermissionResourceSelector::RemoteSubtree { identity, scope }
+            if identity.is_consistent()
+                && !scope.is_empty()
+                && scope
+                    .iter()
+                    .all(|value| !value.is_empty() && !value.chars().any(char::is_control))
+                && scope.iter().collect::<HashSet<_>>().len() == scope.len() =>
+        {
+            Ok(())
+        }
+        PermissionResourceSelector::RemoteResource { .. }
+        | PermissionResourceSelector::RemoteSubtree { .. } => Err(PermissionStateError::Invalid(
+            "remote resource selector identity is invalid".into(),
+        )),
         PermissionResourceSelector::CommandPattern { .. } => Err(PermissionStateError::Invalid(
             "command pattern selector is only valid as a primary command resource selector".into(),
         )),
@@ -606,20 +720,60 @@ mod tests {
 
     use test_case::test_case;
 
+    use caudra_workspace::{
+        AuthenticatedPrincipalId, AuthorityIdentity, ProjectIdentity, ProjectKey, SourceTrustAnchor,
+    };
+
     use super::{
         COMMAND_PATTERN_MAX_BYTES, FAMILY_REQUIRES_FILESYSTEM_KIND, FAMILY_REQUIRES_MCP_SUBJECT,
         FAMILY_REQUIRES_READ_ACCESS, FAMILY_REQUIRES_RESOURCES, PERMISSION_RULES,
         PermissionArgumentConstraint, PermissionCapabilityFamily, PermissionExecutorKind,
         PermissionLifetime, PermissionResourceAccess, PermissionResourceConstraint,
         PermissionResourceKind, PermissionResourceSelector, PermissionRuleRecord, PermissionState,
-        PermissionStateError, PermissionSubject, RAW_RESOURCE_VALUES_NOT_DURABLE, SHA256_HEX_LEN,
-        StructuredPermissionEffect, StructuredPermissionRule, validate_command_pattern,
-        validate_conversation_record,
+        PermissionStateError, PermissionSubject, RAW_RESOURCE_VALUES_NOT_DURABLE,
+        RemotePermissionIdentity, SHA256_HEX_LEN, StructuredPermissionEffect,
+        StructuredPermissionRule, validate_command_pattern, validate_conversation_record,
     };
     use crate::state::{self, SCOPE_GLOBAL};
     use crate::{StateDir, now_epoch};
 
     const DIGEST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    fn remote_identity() -> RemotePermissionIdentity {
+        let authority = AuthorityIdentity::new(
+            SourceTrustAnchor::new("https://authority.example").unwrap(),
+            "server",
+            "workspace",
+            "generation",
+            "namespace",
+        )
+        .unwrap();
+        RemotePermissionIdentity {
+            principal: AuthenticatedPrincipalId::new(authority.clone(), "principal").unwrap(),
+            project: ProjectIdentity::new(authority.clone(), ProjectKey::new("project").unwrap()),
+            authority,
+        }
+    }
+
+    #[test]
+    fn permission_identities_written_before_remote_workcell_still_deserialize() {
+        let subject: PermissionSubject = serde_json::from_value(json!({
+            "kind":"native",
+            "owner":"workcell",
+            "contract":"file.read.v1"
+        }))
+        .expect("legacy native subject");
+        let executor: PermissionExecutorKind =
+            serde_json::from_value(json!("native")).expect("legacy native executor");
+        assert_eq!(
+            subject,
+            PermissionSubject::Native {
+                owner: "workcell".into(),
+                contract: "file.read.v1".into(),
+            }
+        );
+        assert_eq!(executor, PermissionExecutorKind::Native);
+    }
 
     fn rule(lifetime: PermissionLifetime) -> StructuredPermissionRule {
         StructuredPermissionRule {
@@ -644,6 +798,61 @@ mod tests {
             effect: StructuredPermissionEffect::Allow,
             family: None,
         }
+    }
+
+    #[test]
+    fn remote_workcell_rule_round_trips_with_opaque_resource_authority() {
+        let identity = remote_identity();
+        let rule = StructuredPermissionRule {
+            subject: PermissionSubject::RemoteWorkcell {
+                identity: identity.clone(),
+                tool: "file_read".into(),
+                contract: "file.read.v1@v1/v1".into(),
+            },
+            executor: PermissionExecutorKind::RemoteWorkcell,
+            resources: vec![PermissionResourceConstraint {
+                kind: PermissionResourceKind::RemoteFile {
+                    identity: identity.clone(),
+                },
+                selector: PermissionResourceSelector::RemoteResource {
+                    identity,
+                    scope: vec!["root".into(), "opaque-file".into()],
+                },
+                access: Some(PermissionResourceAccess::Read),
+                protected: Some(false),
+                attributes: BTreeMap::new(),
+            }],
+            arguments: PermissionArgumentConstraint::Unconstrained,
+            lifetime: PermissionLifetime::Conversation,
+            effect: StructuredPermissionEffect::Allow,
+            family: None,
+        };
+        let encoded = serde_json::to_string(&rule).expect("remote rule serializes");
+        let decoded: StructuredPermissionRule =
+            serde_json::from_str(&encoded).expect("remote rule deserializes");
+        assert_eq!(decoded, rule);
+
+        let mut unknown = serde_json::to_value(&rule).unwrap();
+        unknown["subject"]["server_generation"] = serde_json::json!("instance");
+        assert!(serde_json::from_value::<StructuredPermissionRule>(unknown).is_err());
+
+        let legacy_remote = json!({
+            "subject": {
+                "kind": "remote_workcell",
+                "server": "server",
+                "workspace": "workspace",
+                "principal": "principal",
+                "root_project": "project",
+                "tool": "file_read",
+                "contract": "file.read.v1"
+            },
+            "executor": "remote_workcell",
+            "resources": [],
+            "arguments": {"constraint": "unconstrained"},
+            "lifetime": "conversation",
+            "effect": "allow"
+        });
+        assert!(serde_json::from_value::<StructuredPermissionRule>(legacy_remote).is_err());
     }
 
     fn command_pattern_rule(

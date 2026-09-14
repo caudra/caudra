@@ -15,7 +15,9 @@ use caudra_storage::tool_outputs::ToolOutputRef;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::permissions::{PermissionAuthorityProfile, PermissionResource, PermissionRisk};
+use crate::permissions::{
+    PermissionAuthorityProfile, PermissionResource, PermissionRisk, RemotePermissionIdentity,
+};
 use crate::template::Vars;
 use crate::{BufferSnapshot, ToolInput, ToolOutput, ToolOutputLimits};
 
@@ -76,6 +78,10 @@ pub enum ToolSource {
     Mcp {
         server: Arc<str>,
     },
+    RemoteWorkcell {
+        identity: Arc<RemotePermissionIdentity>,
+        contract: Arc<str>,
+    },
     Lua {
         plugin: Arc<str>,
         contract: Arc<str>,
@@ -88,6 +94,10 @@ impl ToolSource {
         match self {
             Self::Native { owner, .. } => Cow::Owned(format!("native:{owner}")),
             Self::Mcp { server } => Cow::Owned(format!("mcp:{server}")),
+            Self::RemoteWorkcell { identity, .. } => Cow::Owned(format!(
+                "remote-workcell:{}",
+                identity.authority.server_id()
+            )),
             Self::Lua { plugin, .. } => Cow::Owned(format!("lua:{plugin}")),
         }
     }
@@ -97,6 +107,7 @@ impl ToolSource {
             Self::Native { trusted, .. } => *trusted,
             Self::Lua { bundled, .. } => *bundled,
             Self::Mcp { .. } => false,
+            Self::RemoteWorkcell { .. } => true,
         }
     }
 }
@@ -143,6 +154,7 @@ pub struct ToolExecResult {
     pub annotation: Option<String>,
     pub written_path: Option<String>,
     pub written_paths: Vec<String>,
+    pub remote_written_paths: bool,
     pub model_suffix: Option<String>,
     pub model_output: Option<String>,
     pub output_limits: Option<ToolOutputLimits>,
@@ -159,6 +171,7 @@ impl From<Result<ToolOutput, String>> for ToolExecResult {
             annotation: None,
             written_path: None,
             written_paths: Vec::new(),
+            remote_written_paths: false,
             model_suffix: None,
             model_output: None,
             output_limits: None,
@@ -181,6 +194,11 @@ impl ToolExecResult {
             self.written_path = paths.first().cloned();
             self.written_paths = paths;
         }
+        self
+    }
+
+    pub fn with_remote_written_paths(mut self) -> Self {
+        self.remote_written_paths = true;
         self
     }
 
@@ -369,6 +387,9 @@ pub trait ToolInvocation: Send + Sync {
             .into_iter()
             .collect()
     }
+    fn local_document_target(&self) -> Option<&caudra_workspace::LocalDocumentRef> {
+        None
+    }
     /// Files this call reads whole, named before it runs. Dispatch takes a
     /// shared guard on each, so a concurrent write cannot land between the read
     /// and the mtime the tool records for it. Paths a call only discovers while
@@ -376,6 +397,11 @@ pub trait ToolInvocation: Send + Sync {
     /// overlaps `mutation_targets`, which already covers read-modify-write.
     fn read_targets(&self, _ctx: &ToolContext) -> Vec<PathBuf> {
         Vec::new()
+    }
+    /// Whether this invocation's effects are confined to the remote workspace
+    /// represented by `ctx` and must bypass client-local snapshots and locks.
+    fn remote_workspace_effect(&self, _ctx: &ToolContext) -> bool {
+        false
     }
     /// How this call may proceed while a plan is being written. Consulted after
     /// `preflight`, so an invocation that can only judge itself once its input
@@ -413,6 +439,10 @@ pub trait ToolInvocation: Send + Sync {
     /// Runs after permission enforcement and `ToolStart`. Some call paths skip
     /// it, so `execute` must never rely on it having run.
     fn start<'a>(&'a self, _ctx: &'a ToolContext) -> BoxFuture<'a, ()> {
+        Box::pin(std::future::ready(()))
+    }
+    /// Releases retained preflight state when dispatch will not call `execute`.
+    fn abandon<'a>(&'a self, _ctx: &'a ToolContext) -> BoxFuture<'a, ()> {
         Box::pin(std::future::ready(()))
     }
     fn execute<'a>(self: Box<Self>, ctx: &'a ToolContext) -> ExecFuture<'a>;
@@ -489,7 +519,9 @@ impl RegisteredTool {
     fn is_audited_host(&self) -> bool {
         matches!(
             self.source,
-            ToolSource::Native { trusted: true, .. } | ToolSource::Lua { bundled: true, .. }
+            ToolSource::Native { trusted: true, .. }
+                | ToolSource::Lua { bundled: true, .. }
+                | ToolSource::RemoteWorkcell { .. }
         )
     }
 }

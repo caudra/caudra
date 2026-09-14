@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::mem;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -6,12 +7,17 @@ use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use nucleo::pattern::{CaseMatching, Normalization};
-use nucleo::{Config, Matcher, Nucleo};
+use nucleo::{Config, Matcher, Nucleo, Utf32String};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use tracing::warn;
+
+use caudra_workbench::{
+    BackendDriver, BackendError, BackendEvent, ResourceEntry, WorkbenchBackend, WorkbenchPath,
+};
+use caudra_workspace::{ResourceKind, WorkspacePath, WorkspaceSession};
 
 use crate::animation::spinner_frame;
 use crate::components::Overlay;
@@ -72,7 +78,9 @@ struct Session {
     scrollbar: Scrollbar,
 
     cancel: Arc<AtomicBool>,
-    done_rx: flume::Receiver<Walk>,
+    done_rx: Option<flume::Receiver<Walk>>,
+    backend: Option<BackendDriver>,
+    remote_resources: HashMap<String, ResourceEntry>,
     started_at: Instant,
 
     walk: Walk,
@@ -122,12 +130,47 @@ impl FilePickerModal {
             mouse_down: None,
             scrollbar: Scrollbar::default(),
             cancel,
-            done_rx,
+            done_rx: Some(done_rx),
+            backend: None,
+            remote_resources: HashMap::new(),
             started_at: Instant::now(),
             walk: Walk::Running,
             matching: false,
             visible: false,
         });
+    }
+
+    pub fn open_workspace(&mut self, workspace: WorkspaceSession) -> Result<(), BackendError> {
+        self.close();
+        let notify = Arc::new(|| {});
+        let nucleo = Nucleo::new(Config::DEFAULT.match_paths(), notify, None, 1);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let root = WorkbenchPath::Remote(WorkspacePath::root());
+        let mut backend = BackendDriver::new(WorkbenchBackend::workspace(workspace)?, root.clone());
+        backend.list(root, true);
+        self.session = Some(Session {
+            nucleo,
+            matcher: Matcher::new(Config::DEFAULT.match_paths()),
+            matches: Vec::new(),
+            total_matches: 0,
+            search: TextBuffer::new(String::new()),
+            selected: 0,
+            scroll_offset: 0,
+            viewport_height: 0,
+            popup_area: Rect::default(),
+            row_hits: Vec::new(),
+            mouse_down: None,
+            scrollbar: Scrollbar::default(),
+            cancel,
+            done_rx: None,
+            backend: Some(backend),
+            remote_resources: HashMap::new(),
+            started_at: Instant::now(),
+            walk: Walk::Running,
+            matching: false,
+            visible: false,
+        });
+        Ok(())
     }
 
     pub fn close(&mut self) {
@@ -183,6 +226,9 @@ impl FilePickerModal {
                     return FilePickerModalAction::Consumed;
                 }
                 if let Some(m) = s.matches.get(s.selected) {
+                    if s.backend.is_some() && !s.remote_resources.contains_key(&m.path) {
+                        return FilePickerModalAction::Consumed;
+                    }
                     return FilePickerModalAction::Select(m.path.clone());
                 }
                 return FilePickerModalAction::Close;
@@ -289,13 +335,44 @@ impl FilePickerModal {
             return (Dirty::NO, None);
         };
 
+        let mut remote_error = None;
+        if let Some(backend) = &mut s.backend {
+            for event in backend.drain() {
+                if let BackendEvent::Listed { result, .. } = event {
+                    match result {
+                        Ok(result) => {
+                            let injector = s.nucleo.injector();
+                            for entry in result.entries {
+                                let mut path = entry.path.display();
+                                if entry.kind == ResourceKind::Directory {
+                                    path.push('/');
+                                }
+                                injector.push((), |_, columns| {
+                                    columns[0] = Utf32String::from(path.as_str());
+                                });
+                                s.remote_resources.insert(path, entry);
+                            }
+                            s.walk = Walk::Listed;
+                        }
+                        Err(error) => remote_error = Some(error.to_string()),
+                    }
+                }
+            }
+        }
+        if let Some(error) = remote_error {
+            self.session = None;
+            return (Dirty::YES, Some(error));
+        }
+
         let status = s.nucleo.tick(0);
         s.matching = status.running;
         // The title says "scanning…" while walking, so finishing redraws too.
         let mut dirty = Dirty::from(status.changed);
 
-        if s.walk == Walk::Running {
-            match s.done_rx.try_recv() {
+        if s.walk == Walk::Running
+            && let Some(done_rx) = &s.done_rx
+        {
+            match done_rx.try_recv() {
                 Ok(end) => {
                     s.walk = end;
                     dirty = Dirty::YES;
@@ -671,7 +748,9 @@ mod tests {
             mouse_down: None,
             scrollbar: Scrollbar::default(),
             cancel: Arc::new(AtomicBool::new(false)),
-            done_rx,
+            done_rx: Some(done_rx),
+            backend: None,
+            remote_resources: HashMap::new(),
             started_at: Instant::now(),
             walk: Walk::Running,
             matching: false,
@@ -1204,5 +1283,126 @@ mod tests {
         let session = picker.session.as_ref().unwrap();
         assert!(session.row_hits.is_empty());
         assert!(session.mouse_down.is_none());
+    }
+
+    struct RemotePickerFilesystem;
+
+    #[async_trait::async_trait]
+    impl caudra_workbench::WorkbenchFilesystem for RemotePickerFilesystem {
+        fn is_remote(&self) -> bool {
+            true
+        }
+
+        async fn list(
+            &self,
+            _parent: &WorkbenchPath,
+            _recursive: bool,
+            _continuation: Option<caudra_workspace::ContinuationToken>,
+        ) -> Result<caudra_workbench::ListResult, BackendError> {
+            Ok(caudra_workbench::ListResult {
+                entries: vec![ResourceEntry {
+                    path: WorkbenchPath::Remote(WorkspacePath::new(MAIN_PATH).unwrap()),
+                    resource_id: Some(caudra_workspace::ResourceId::new("picker-file").unwrap()),
+                    revision: Some(caudra_workbench::BackendRevision::Remote(
+                        caudra_workspace::ResourceRevision::new("picker-revision").unwrap(),
+                    )),
+                    kind: ResourceKind::File,
+                    size_bytes: Some(0),
+                }],
+                continuation: None,
+                incomplete: false,
+            })
+        }
+
+        async fn read(
+            &self,
+            _entry: &ResourceEntry,
+        ) -> Result<caudra_workbench::LoadedFile, BackendError> {
+            Err(BackendError::WrongBackend)
+        }
+
+        async fn write(
+            &self,
+            _entry: &ResourceEntry,
+            _contents: String,
+        ) -> Result<ResourceEntry, BackendError> {
+            Err(BackendError::WrongBackend)
+        }
+
+        async fn create_file(&self, _path: &WorkbenchPath) -> Result<ResourceEntry, BackendError> {
+            Err(BackendError::WrongBackend)
+        }
+
+        async fn create_dir(&self, _path: &WorkbenchPath) -> Result<ResourceEntry, BackendError> {
+            Err(BackendError::WrongBackend)
+        }
+
+        async fn rename(
+            &self,
+            _entry: &ResourceEntry,
+            _destination: &WorkbenchPath,
+        ) -> Result<ResourceEntry, BackendError> {
+            Err(BackendError::WrongBackend)
+        }
+
+        async fn delete(&self, _entry: &ResourceEntry) -> Result<(), BackendError> {
+            Err(BackendError::WrongBackend)
+        }
+
+        async fn count(&self, _parent: &WorkbenchPath) -> Result<usize, BackendError> {
+            Err(BackendError::WrongBackend)
+        }
+
+        async fn search(
+            &self,
+            _query: String,
+            _include: Option<String>,
+            _continuation: Option<caudra_workspace::ContinuationToken>,
+        ) -> Result<caudra_workbench::SearchResult, BackendError> {
+            Err(BackendError::WrongBackend)
+        }
+
+        async fn watch_open(&self) -> Result<Option<caudra_workbench::WatchHandle>, BackendError> {
+            Ok(None)
+        }
+
+        async fn watch_poll(
+            &self,
+            _handle: caudra_workbench::WatchHandle,
+        ) -> Result<caudra_workbench::WatchResult, BackendError> {
+            Err(BackendError::WrongBackend)
+        }
+
+        async fn watch_close(
+            &self,
+            _handle: caudra_workbench::WatchHandle,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn remote_picker_materializes_backend_resources_without_local_filesystem_calls() {
+        caudra_workbench::LocalFilesystem::reset_call_count();
+        let (mut picker, _done) = pending_picker();
+        let root = WorkbenchPath::Remote(WorkspacePath::root());
+        let backend = WorkbenchBackend::custom(Arc::new(RemotePickerFilesystem));
+        let mut driver = BackendDriver::new(backend, root.clone());
+        driver.list(root, true);
+        let session = picker.session.as_mut().unwrap();
+        session.done_rx = None;
+        session.backend = Some(driver);
+
+        assert!(
+            tick_until(&mut picker, |session| !session.matches.is_empty()).is_some(),
+            "{NEVER_CONVERGED}"
+        );
+        let session = picker.session.as_ref().unwrap();
+        assert!(session.remote_resources[MAIN_PATH].resource_id.is_some());
+        assert!(matches!(
+            picker.handle_key(key(KeyCode::Enter)),
+            FilePickerModalAction::Select(path) if path == MAIN_PATH
+        ));
+        assert_eq!(caudra_workbench::LocalFilesystem::call_count(), 0);
     }
 }

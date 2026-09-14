@@ -15,6 +15,7 @@ caudra-markdown = { workspace = true }
 caudra-providers = { workspace = true }
 caudra-lua = { workspace = true }
 caudra-storage = { workspace = true }
+caudra-workspace = { workspace = true }
 caudra-workbench = { workspace = true }
 caudra-workflow = { workspace = true }
 ratatui = { workspace = true }
@@ -31,6 +32,7 @@ jiff = { workspace = true }
 smol = { workspace = true }
 flume = { workspace = true }
 async-lock = { workspace = true }
+async-trait = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
 arc-swap = { workspace = true }

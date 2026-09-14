@@ -21,14 +21,21 @@ mod style;
 mod view;
 
 pub use action::WorkbenchAction;
+pub use fs::backend::{
+    BackendDriver, BackendError, BackendEvent, BackendRevision, ListResult, LoadedFile,
+    LocalFilesystem, MutationGate, RequestId, ResourceEntry, SearchMatch, SearchResult,
+    WatchHandle, WatchResult, WatchUpdate, WorkbenchBackend, WorkbenchFilesystem, WorkbenchPath,
+    WorkspaceFilesystem,
+};
 pub use style::WorkbenchStyles;
 use unicode_width::UnicodeWidthStr;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use caudra_workspace::{ScmDiffTarget, ScmMutation, ScmRevision, ScmSide, WorkspacePath};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 use serde::{Deserialize, Serialize};
@@ -42,6 +49,9 @@ use fs::watch::Watch;
 use menu::{Action as MenuAction, Menu, Target};
 use pointer::Clicks;
 use quick_open::QuickOpen;
+use scm::backend::{
+    CommitFilesResult, DiffResult as RemoteDiffResult, Driver as ScmDriver, Event as ScmEvent,
+};
 use scm::{MIN_SECTION_ROWS, Scm, Section};
 use scroll::{Scrollbar, ScrollbarMouse};
 use search::Search;
@@ -75,6 +85,7 @@ const CANCEL_LABEL: &str = "Cancel";
 const RENAME_PROMPT: &str = "Rename: ";
 const NEW_FILE_PROMPT: &str = "New file: ";
 const NEW_FOLDER_PROMPT: &str = "New folder: ";
+const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -311,7 +322,7 @@ struct Input {
     kind: InputKind,
     /// What the answer is about: the path being renamed, or the folder a new
     /// path lands in.
-    at: PathBuf,
+    at: WorkbenchPath,
     value: String,
 }
 
@@ -320,6 +331,14 @@ enum InputKind {
     Rename,
     NewFile,
     NewFolder,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenPurpose {
+    Open,
+    Preview,
+    Reload,
+    Discard,
 }
 
 impl InputKind {
@@ -414,6 +433,18 @@ pub struct Workbench {
     palette: QuickOpen,
     scm: Scm,
     search: Search,
+    remote_backend: Option<BackendDriver>,
+    remote_scm: Option<ScmDriver>,
+    remote_entries: Vec<ResourceEntry>,
+    remote_pending: HashSet<RequestId>,
+    pending_open: HashMap<RequestId, OpenPurpose>,
+    pending_save: HashMap<RequestId, WorkbenchPath>,
+    pending_create: HashMap<RequestId, InputKind>,
+    pending_count: HashMap<RequestId, WorkbenchPath>,
+    pending_lines: HashMap<WorkbenchPath, RangeInclusive<usize>>,
+    deferred_open: HashMap<WorkbenchPath, OpenPurpose>,
+    delete_target: Option<ResourceEntry>,
+    remote_invalidated: HashSet<WorkbenchPath>,
     /// Started when the workbench opens and dropped when it closes, so a tree
     /// nobody is looking at costs no kernel handles.
     watch: Option<Watch>,
@@ -452,7 +483,7 @@ pub struct Workbench {
     /// What a batch close still has to get through, last one first so the next
     /// is a pop. Paths rather than indices, because every close renumbers the
     /// tabs behind it.
-    closing: Vec<PathBuf>,
+    closing: Vec<WorkbenchPath>,
     flash: Option<String>,
 }
 
@@ -477,6 +508,18 @@ impl Workbench {
             palette: QuickOpen::default(),
             scm: Scm::default(),
             search: Search::default(),
+            remote_backend: None,
+            remote_scm: None,
+            remote_entries: Vec::new(),
+            remote_pending: HashSet::new(),
+            pending_open: HashMap::new(),
+            pending_save: HashMap::new(),
+            pending_create: HashMap::new(),
+            pending_count: HashMap::new(),
+            pending_lines: HashMap::new(),
+            deferred_open: HashMap::new(),
+            delete_target: None,
+            remote_invalidated: HashSet::new(),
             watch: None,
             touched: HashSet::new(),
             drag: Drag::None,
@@ -501,9 +544,120 @@ impl Workbench {
     pub fn close(&mut self) {
         self.open = false;
         self.watch = None;
+        if let Some(backend) = &mut self.remote_backend {
+            backend.suspend();
+        }
+        if let Some(scm) = &mut self.remote_scm {
+            scm.suspend();
+        }
+        self.remote_pending.clear();
+        self.pending_open.clear();
+        self.pending_save.clear();
+        self.pending_create.clear();
+        self.pending_count.clear();
+        self.pending_lines.clear();
+        self.deferred_open.clear();
+        self.delete_target = None;
+        self.remote_invalidated.clear();
+    }
+
+    pub fn bind_workspace(
+        &mut self,
+        session: caudra_workspace::WorkspaceSession,
+    ) -> Result<(), BackendError> {
+        self.bind_workspace_with_gate(session, MutationGate::allow())
+    }
+
+    pub fn bind_workspace_with_gate(
+        &mut self,
+        session: caudra_workspace::WorkspaceSession,
+        gate: MutationGate,
+    ) -> Result<(), BackendError> {
+        let reload = self.open;
+        let backend = WorkbenchBackend::workspace_with_gate(session.clone(), gate.clone())?;
+        let mut remote_scm = ScmDriver::new_with_gate(session, gate).ok();
+        let root = WorkbenchPath::Remote(caudra_workspace::WorkspacePath::root());
+        if let Some(driver) = &mut self.remote_backend {
+            driver.rebind(backend, root.clone());
+        } else {
+            self.remote_backend = Some(BackendDriver::new(backend, root.clone()));
+        }
+        self.watch = None;
+        self.root.clear();
+        self.tree = Tree::default();
+        self.editor = Editor::default();
+        self.palette = QuickOpen::default();
+        self.search = Search::default();
+        self.scm = Scm::default();
+        self.scm.open_workspace();
+        if let Some(driver) = &mut remote_scm {
+            driver.refresh();
+        } else {
+            self.scm
+                .fail_workspace_refresh("Remote source control is unavailable");
+        }
+        self.remote_scm = remote_scm;
+        self.touched.clear();
+        self.remote_entries.clear();
+        self.remote_pending.clear();
+        self.pending_open.clear();
+        self.pending_save.clear();
+        self.pending_create.clear();
+        self.pending_count.clear();
+        self.pending_lines.clear();
+        self.deferred_open.clear();
+        self.delete_target = None;
+        self.remote_invalidated.clear();
+        self.tree = Tree::remote(root.clone(), self.show_hidden);
+        if reload && let Some(driver) = &mut self.remote_backend {
+            driver.open_watch();
+            let request = driver.list(root, true);
+            self.remote_pending.insert(request);
+        }
+        Ok(())
+    }
+
+    pub fn toggle_workspace(
+        &mut self,
+        session: caudra_workspace::WorkspaceSession,
+    ) -> Result<(), BackendError> {
+        if self.open {
+            self.close();
+            return Ok(());
+        }
+        if self.remote_backend.is_none() {
+            self.bind_workspace(session)?;
+        }
+        self.open = true;
+        if let Some(driver) = &mut self.remote_backend {
+            driver.open_watch();
+            let request = driver.list(driver.root().clone(), true);
+            self.remote_pending.insert(request);
+        }
+        Ok(())
+    }
+
+    pub fn bind_local(&mut self) {
+        if let Some(mut backend) = self.remote_backend.take() {
+            backend.suspend();
+        }
+        if let Some(mut scm) = self.remote_scm.take() {
+            scm.suspend();
+        }
+        self.remote_entries.clear();
+        self.remote_pending.clear();
+        self.pending_open.clear();
+        self.pending_save.clear();
+        self.pending_create.clear();
+        self.pending_count.clear();
+        self.pending_lines.clear();
+        self.deferred_open.clear();
+        self.delete_target = None;
+        self.remote_invalidated.clear();
     }
 
     pub fn open(&mut self, root: &Path) {
+        self.bind_local();
         let started = Instant::now();
         let mut phase_start = started;
         let mut lap = || {
@@ -555,6 +709,13 @@ impl Workbench {
     /// click on an `@path:L12-L20` mention lands on, so it opens the workbench
     /// if it was closed rather than requiring two gestures.
     pub fn open_at(&mut self, root: &Path, path: &Path, lines: Option<RangeInclusive<usize>>) {
+        if self.remote_backend.is_some() {
+            match caudra_workspace::WorkspacePath::new(path.to_string_lossy().into_owned()) {
+                Ok(path) => self.open_remote_at(path, lines),
+                Err(error) => self.flash = Some(error.to_string()),
+            }
+            return;
+        }
         if !self.open || self.root != root {
             self.open(root);
         }
@@ -577,6 +738,24 @@ impl Workbench {
         self.follow_cursor();
     }
 
+    pub fn open_remote_at(
+        &mut self,
+        path: caudra_workspace::WorkspacePath,
+        lines: Option<RangeInclusive<usize>>,
+    ) {
+        if self.remote_backend.is_none() {
+            self.flash = Some(BackendError::WrongBackend.to_string());
+            return;
+        }
+        self.open = true;
+        let path = WorkbenchPath::Remote(path);
+        if let Some(lines) = lines {
+            self.pending_lines.insert(path.clone(), lines);
+        }
+        self.open_workbench_path(&path, OpenPurpose::Open);
+        self.show_explorer();
+    }
+
     pub fn set_styles(&mut self, styles: WorkbenchStyles) {
         self.styles = styles;
         self.theme_generation += 1;
@@ -590,16 +769,403 @@ impl Workbench {
     /// Whether a background worker owes an answer, so the host knows to look
     /// again rather than sleeping until the next key.
     pub fn is_busy(&self) -> bool {
-        self.search.is_running() || self.edge_scroll_delta() != 0
+        !self.remote_pending.is_empty()
+            || self.remote_scm.as_ref().is_some_and(ScmDriver::is_busy)
+            || self.search.is_running()
+            || self.edge_scroll_delta() != 0
     }
 
     /// Drains whatever the background workers have produced. Reports whether
     /// the screen changed, plus anything worth saying in the status bar.
     pub fn tick(&mut self) -> (bool, Option<String>) {
+        let remote = self.drain_remote_backend();
+        let remote_scm = self.drain_remote_scm();
         let watched = self.absorb_changes();
         let searched = self.search.tick();
         let scrolled = self.edge_scroll();
-        (watched || searched || scrolled, self.flash.take())
+        (
+            remote || remote_scm || watched || searched || scrolled,
+            self.flash.take(),
+        )
+    }
+
+    fn drain_remote_scm(&mut self) -> bool {
+        let Some(driver) = &mut self.remote_scm else {
+            return false;
+        };
+        let events = driver.drain();
+        let changed = !events.is_empty();
+        for event in events {
+            match event {
+                ScmEvent::Refreshed { result, .. } => match result {
+                    Ok(snapshot) => {
+                        self.scm.apply_workspace_snapshot(snapshot);
+                        self.apply_marks();
+                    }
+                    Err(error) => self.scm.fail_workspace_refresh(error),
+                },
+                ScmEvent::Diffed { result, .. } => match result {
+                    Ok(result) => self.open_remote_diff(result),
+                    Err(error) => self.flash = Some(error.to_string()),
+                },
+                ScmEvent::CommitFiles { result, .. } => match result {
+                    Ok(result) => self.apply_remote_commit_files(result),
+                    Err(error) => self.flash = Some(error.to_string()),
+                },
+                ScmEvent::Mutated {
+                    mutation, result, ..
+                } => {
+                    if let ScmMutation::Discard { paths } = &mutation {
+                        self.remote_invalidated
+                            .extend(paths.iter().cloned().map(WorkbenchPath::Remote));
+                        self.refresh_remote_tree();
+                    }
+                    if let Err(error) = result {
+                        self.flash = Some(error.to_string());
+                    }
+                    self.refresh_remote_scm();
+                }
+            }
+        }
+        changed
+    }
+
+    fn drain_remote_backend(&mut self) -> bool {
+        let Some(backend) = &mut self.remote_backend else {
+            return false;
+        };
+        let events = backend.drain();
+        let changed = !events.is_empty();
+        for event in events {
+            let scm_invalidate = matches!(
+                &event,
+                BackendEvent::Saved { .. }
+                    | BackendEvent::Created { .. }
+                    | BackendEvent::Renamed { .. }
+                    | BackendEvent::Deleted { .. }
+            );
+            match event {
+                BackendEvent::Listed {
+                    request, result, ..
+                } => {
+                    self.remote_pending.remove(&request);
+                    match result {
+                        Ok(result) => self.apply_remote_listing(result),
+                        Err(error) => self.flash = Some(error.to_string()),
+                    }
+                }
+                BackendEvent::Opened { request, result } => {
+                    self.remote_pending.remove(&request);
+                    let purpose = self.pending_open.remove(&request);
+                    match (purpose, result) {
+                        (Some(purpose), Ok(loaded)) => self.apply_remote_open(purpose, loaded),
+                        (Some(_), Err(error)) => {
+                            if matches!(error, BackendError::Indeterminate) {
+                                self.refresh_remote_tree();
+                            }
+                            self.flash = Some(error.to_string());
+                        }
+                        (None, _) => {}
+                    }
+                }
+                BackendEvent::Saved { request, result } => {
+                    self.remote_pending.remove(&request);
+                    let path = self.pending_save.remove(&request);
+                    match (path, result) {
+                        (Some(path), Ok(entry)) => {
+                            if let Some(tab) = self
+                                .editor
+                                .tabs_mut()
+                                .iter_mut()
+                                .find(|tab| tab.path == path)
+                            {
+                                tab.apply_saved(entry);
+                            }
+                            self.refresh_remote_tree();
+                        }
+                        (Some(path), Err(error)) => {
+                            if matches!(error, BackendError::Conflict | BackendError::Indeterminate)
+                                && let Some(tab) = self
+                                    .editor
+                                    .tabs_mut()
+                                    .iter_mut()
+                                    .find(|tab| tab.path == path)
+                            {
+                                tab.conflict = true;
+                            }
+                            self.flash = Some(error.to_string());
+                            self.remote_invalidated.insert(path);
+                            self.refresh_remote_tree();
+                        }
+                        (None, _) => {}
+                    }
+                }
+                BackendEvent::Created { request, result } => {
+                    self.remote_pending.remove(&request);
+                    let kind = self.pending_create.remove(&request);
+                    match (kind, result) {
+                        (Some(InputKind::NewFile), Ok(entry)) => {
+                            self.request_remote_open(entry, OpenPurpose::Open);
+                            self.refresh_remote_tree();
+                        }
+                        (Some(InputKind::NewFolder), Ok(entry)) => {
+                            self.remote_invalidated.insert(entry.path);
+                            self.refresh_remote_tree();
+                        }
+                        (Some(_), Err(error)) => {
+                            if matches!(error, BackendError::Indeterminate) {
+                                self.refresh_remote_tree();
+                            }
+                            self.flash = Some(error.to_string());
+                        }
+                        _ => {}
+                    }
+                }
+                BackendEvent::Renamed {
+                    request,
+                    source,
+                    result,
+                } => {
+                    self.remote_pending.remove(&request);
+                    match result {
+                        Ok(entry) => {
+                            self.editor.rename_resource(
+                                &source,
+                                &entry.path,
+                                Some(entry.clone()),
+                                self.theme_generation,
+                            );
+                            self.remote_invalidated.insert(entry.path);
+                            self.refresh_remote_tree();
+                        }
+                        Err(error) => {
+                            if matches!(error, BackendError::Indeterminate) {
+                                self.refresh_remote_tree();
+                            }
+                            self.flash = Some(error.to_string());
+                        }
+                    }
+                }
+                BackendEvent::Deleted {
+                    request,
+                    path,
+                    result,
+                } => {
+                    self.remote_pending.remove(&request);
+                    match result {
+                        Ok(()) => {
+                            self.close_tabs_under(&path);
+                            self.refresh_remote_tree();
+                        }
+                        Err(error) => {
+                            if matches!(error, BackendError::Indeterminate) {
+                                self.refresh_remote_tree();
+                            }
+                            self.flash = Some(error.to_string());
+                        }
+                    }
+                }
+                BackendEvent::Counted { request, result } => {
+                    self.remote_pending.remove(&request);
+                    let path = self.pending_count.remove(&request);
+                    match (path, result) {
+                        (Some(path), Ok(count)) => {
+                            self.delete_target = self
+                                .remote_entries
+                                .iter()
+                                .find(|entry| entry.path == path)
+                                .cloned();
+                            self.confirm = Some(Confirm {
+                                ask: Ask::Delete(count),
+                                choice: Choice::Cancel,
+                            });
+                        }
+                        (Some(_), Err(error)) => self.flash = Some(error.to_string()),
+                        (None, _) => {}
+                    }
+                }
+                BackendEvent::SearchPage { request, result } => {
+                    self.remote_pending.remove(&request);
+                    match result {
+                        Ok(result) => self.search.apply_remote(request, result),
+                        Err(error) => self.search.fail_remote(request, error.to_string()),
+                    }
+                }
+                BackendEvent::WatchPolled(Ok(result)) => self.apply_remote_watch(result),
+                BackendEvent::WatchOpened(Err(error)) | BackendEvent::WatchPolled(Err(error)) => {
+                    self.flash = Some(error.to_string())
+                }
+                BackendEvent::WatchOpened(Ok(_)) => {}
+            }
+            if scm_invalidate {
+                self.refresh_remote_scm();
+            }
+        }
+        changed
+    }
+
+    fn apply_remote_listing(&mut self, result: ListResult) {
+        self.remote_entries = result.entries;
+        for tab in self.editor.tabs_mut() {
+            if !tab.is_dirty()
+                && let Some(entry) = self
+                    .remote_entries
+                    .iter()
+                    .find(|entry| entry.path == tab.path)
+            {
+                tab.resource = Some(entry.clone());
+            }
+        }
+        self.tree.replace_remote(self.remote_entries.clone());
+        self.palette.replace_remote_entries(&self.remote_entries);
+        let deferred = std::mem::take(&mut self.deferred_open);
+        for (path, purpose) in deferred {
+            if let Some(entry) = self
+                .remote_entries
+                .iter()
+                .find(|entry| entry.path == path)
+                .cloned()
+            {
+                self.request_remote_open(entry, purpose);
+            } else {
+                self.pending_lines.remove(&path);
+                self.flash = Some(format!("remote file does not exist: {}", path.display()));
+            }
+        }
+        let invalidated = std::mem::take(&mut self.remote_invalidated);
+        for path in invalidated {
+            let Some(entry) = self
+                .remote_entries
+                .iter()
+                .find(|entry| entry.path == path)
+                .cloned()
+            else {
+                self.editor.close_where(&|tab| tab.path == path);
+                continue;
+            };
+            let purpose = match self
+                .editor
+                .tabs()
+                .iter()
+                .find(|tab| tab.path == path)
+                .map(Tab::is_dirty)
+            {
+                Some(true) => {
+                    if let Some(tab) = self
+                        .editor
+                        .tabs_mut()
+                        .iter_mut()
+                        .find(|tab| tab.path == path)
+                    {
+                        tab.conflict = true;
+                    }
+                    continue;
+                }
+                Some(false) => OpenPurpose::Reload,
+                None => continue,
+            };
+            self.request_remote_open(entry, purpose);
+        }
+    }
+
+    fn apply_remote_open(&mut self, purpose: OpenPurpose, loaded: LoadedFile) {
+        let path = loaded.entry.path.clone();
+        match purpose {
+            OpenPurpose::Open | OpenPurpose::Preview => {
+                let tab = Tab::from_backend(loaded, self.theme_generation);
+                self.editor
+                    .push_backend(tab, purpose == OpenPurpose::Preview);
+                self.tree.reveal_workbench_path(&path);
+                self.focus = Focus::Editor;
+                if let Some(lines) = self.pending_lines.remove(&path)
+                    && let Some(tab) = self.editor.active_mut()
+                {
+                    tab.buffer
+                        .set_cursor(Cursor::new(lines.start().saturating_sub(1), 0), false);
+                    tab.buffer
+                        .set_cursor(Cursor::new(lines.end().saturating_sub(1), 0), true);
+                    self.follow_cursor();
+                }
+            }
+            OpenPurpose::Reload | OpenPurpose::Discard => {
+                if let Some(tab) = self
+                    .editor
+                    .tabs_mut()
+                    .iter_mut()
+                    .find(|tab| tab.path == path)
+                {
+                    if purpose == OpenPurpose::Discard {
+                        tab.discard_backend(loaded);
+                    } else {
+                        tab.apply_backend_reload(loaded);
+                    }
+                }
+            }
+        }
+    }
+
+    fn apply_remote_watch(&mut self, result: WatchResult) {
+        let refresh_scm = match result.update {
+            WatchUpdate::Events(events) => {
+                let refresh = !events.is_empty();
+                for event in events {
+                    self.remote_invalidated
+                        .insert(WorkbenchPath::Remote(event.path));
+                    if let Some(previous) = event.previous_path {
+                        self.remote_invalidated
+                            .insert(WorkbenchPath::Remote(previous));
+                    }
+                }
+                refresh
+            }
+            WatchUpdate::Resync => {
+                self.remote_invalidated.extend(
+                    self.editor
+                        .tabs()
+                        .iter()
+                        .filter(|tab| tab.path.remote().is_some())
+                        .map(|tab| tab.path.clone()),
+                );
+                true
+            }
+        };
+        if refresh_scm {
+            self.refresh_remote_scm();
+        }
+    }
+
+    fn request_remote_open(&mut self, entry: ResourceEntry, purpose: OpenPurpose) {
+        let Some(backend) = &mut self.remote_backend else {
+            return;
+        };
+        let request = backend.open(entry);
+        self.remote_pending.insert(request);
+        self.pending_open.insert(request, purpose);
+    }
+
+    fn cancel_pending_opens(&mut self) {
+        let Some(backend) = &mut self.remote_backend else {
+            return;
+        };
+        for request in self.pending_open.keys().copied().collect::<Vec<_>>() {
+            backend.cancel(request);
+            self.remote_pending.remove(&request);
+        }
+        self.pending_open.clear();
+    }
+
+    fn refresh_remote_tree(&mut self) {
+        let Some(backend) = &mut self.remote_backend else {
+            return;
+        };
+        let request = backend.list(backend.root().clone(), true);
+        self.remote_pending.insert(request);
+    }
+
+    fn refresh_remote_scm(&mut self) {
+        if let Some(driver) = &mut self.remote_scm {
+            driver.refresh();
+        }
     }
 
     /// Folds what moved on disk into the panes: tabs catch up or raise a
@@ -668,7 +1234,9 @@ impl Workbench {
             if index == active_tab {
                 active = tabs.len();
             }
-            tabs.push(tab.path.clone());
+            if let Some(path) = tab.path.local() {
+                tabs.push(path.to_path_buf());
+            }
         }
         let (flat, sections) = self.scm.saved();
         Layout {
@@ -1105,22 +1673,28 @@ impl Workbench {
         }
     }
 
-    fn run_on_row(&mut self, action: MenuAction, path: PathBuf) -> WorkbenchAction {
+    fn run_on_row(&mut self, action: MenuAction, path: WorkbenchPath) -> WorkbenchAction {
         match action {
-            MenuAction::Open => self.open_path(&path),
+            MenuAction::Open => self.open_workbench_path(&path, OpenPurpose::Open),
             MenuAction::CopyPath => return self.copy(path.display().to_string()),
             MenuAction::CopyRelative => {
-                return self.copy(self.relative(&path).display().to_string());
+                return self.copy(self.relative_path(&path));
             }
             MenuAction::SendToComposer => return self.mention(&path, None),
             MenuAction::Rename => self.ask_for_name(InputKind::Rename, path),
             MenuAction::NewFile => self.ask_for_name(InputKind::NewFile, self.holder(&path)),
             MenuAction::NewFolder => self.ask_for_name(InputKind::NewFolder, self.holder(&path)),
             MenuAction::Delete => {
-                self.confirm = Some(Confirm {
-                    ask: Ask::Delete(ops::count_under(&path)),
-                    choice: Choice::Cancel,
-                });
+                if let Some(backend) = &mut self.remote_backend {
+                    let request = backend.count(path.clone());
+                    self.remote_pending.insert(request);
+                    self.pending_count.insert(request, path);
+                } else if let Some(path) = path.local() {
+                    self.confirm = Some(Confirm {
+                        ask: Ask::Delete(ops::count_under(path)),
+                        choice: Choice::Cancel,
+                    });
+                }
             }
             // Every other action belongs to the tab menu, which no row opens.
             _ => {}
@@ -1130,22 +1704,25 @@ impl Workbench {
 
     /// Where something new made from `path` lands: inside a folder, and beside
     /// a file.
-    fn holder(&self, path: &Path) -> PathBuf {
-        match path.is_dir() {
-            true => path.to_path_buf(),
-            false => path.parent().unwrap_or(&self.root).to_path_buf(),
+    fn holder(&self, path: &WorkbenchPath) -> WorkbenchPath {
+        match self.tree.resource(path).map(|entry| entry.kind) {
+            Some(caudra_workspace::ResourceKind::Directory) => path.clone(),
+            Some(_) => path.parent().unwrap_or_else(|| self.backend_root()),
+            None => match path.local() {
+                Some(local) if local.is_dir() => path.clone(),
+                Some(local) => {
+                    WorkbenchPath::Local(local.parent().unwrap_or(&self.root).to_path_buf())
+                }
+                None => self.backend_root(),
+            },
         }
     }
 
     /// Puts the question in the status row. A rename starts from the name it
     /// already has, since most renames change part of one.
-    fn ask_for_name(&mut self, kind: InputKind, at: PathBuf) {
+    fn ask_for_name(&mut self, kind: InputKind, at: WorkbenchPath) {
         let value = match kind {
-            InputKind::Rename => at
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned(),
+            InputKind::Rename => at.file_name(),
             _ => String::new(),
         };
         self.input = Some(Input { kind, at, value });
@@ -1158,12 +1735,20 @@ impl Workbench {
         let Some(input) = self.input.clone() else {
             return;
         };
+        if self.remote_backend.is_some() {
+            self.commit_remote_input(input);
+            return;
+        }
+        let Some(at) = input.at.local() else {
+            self.flash = Some(BackendError::WrongBackend.to_string());
+            return;
+        };
         let done = match input.kind {
-            InputKind::Rename => self.rename_path(&input.at, &input.value),
-            InputKind::NewFile => ops::create_file(&input.at, &input.value).map(|path| {
+            InputKind::Rename => self.rename_path(at, &input.value),
+            InputKind::NewFile => ops::create_file(at, &input.value).map(|path| {
                 self.open_path(&path);
             }),
-            InputKind::NewFolder => ops::create_dir(&input.at, &input.value).map(|path| {
+            InputKind::NewFolder => ops::create_dir(at, &input.value).map(|path| {
                 self.tree.reveal(&path);
             }),
         };
@@ -1174,6 +1759,48 @@ impl Workbench {
             }
             Err(error) => self.flash = Some(error.to_string()),
         }
+    }
+
+    fn commit_remote_input(&mut self, input: Input) {
+        let destination = match input.kind {
+            InputKind::Rename => input
+                .at
+                .parent()
+                .unwrap_or_else(|| self.backend_root())
+                .join(&input.value),
+            InputKind::NewFile | InputKind::NewFolder => input.at.join(&input.value),
+        };
+        let destination = match destination {
+            Ok(path) => path,
+            Err(error) => {
+                self.flash = Some(error.to_string());
+                return;
+            }
+        };
+        let Some(backend) = &mut self.remote_backend else {
+            return;
+        };
+        let request = match input.kind {
+            InputKind::Rename => {
+                let Some(entry) = self
+                    .remote_entries
+                    .iter()
+                    .find(|entry| entry.path == input.at)
+                    .cloned()
+                else {
+                    self.flash = Some(BackendError::MissingRevision.to_string());
+                    return;
+                };
+                backend.rename(entry, destination)
+            }
+            InputKind::NewFile => backend.create_file(destination),
+            InputKind::NewFolder => backend.create_dir(destination),
+        };
+        self.remote_pending.insert(request);
+        if input.kind != InputKind::Rename {
+            self.pending_create.insert(request, input.kind);
+        }
+        self.input = None;
     }
 
     /// Renames a path and takes the tabs with it, including every tab under a
@@ -1208,17 +1835,18 @@ impl Workbench {
                 }
             }
             MenuAction::Save => {
+                self.cancel_pending_opens();
                 self.editor.select(index);
                 self.save_active();
             }
             MenuAction::RevealInExplorer => {
                 self.show_explorer();
                 self.focus = Focus::Sidebar;
-                self.tree.reveal(&path);
+                self.tree.reveal_workbench_path(&path);
             }
             MenuAction::CopyPath => return self.copy(path.display().to_string()),
             MenuAction::CopyRelative => {
-                return self.copy(self.relative(&path).display().to_string());
+                return self.copy(self.relative_path(&path));
             }
             MenuAction::CloseOthers => self.close_many(self.tab_paths(|at| at != index)),
             MenuAction::CloseRight => self.close_many(self.tab_paths(|at| at > index)),
@@ -1237,7 +1865,7 @@ impl Workbench {
 
     /// The paths of the tabs a batch close covers, read before anything closes
     /// because closing renumbers what is left.
-    fn tab_paths(&self, covered: impl Fn(usize) -> bool) -> Vec<PathBuf> {
+    fn tab_paths(&self, covered: impl Fn(usize) -> bool) -> Vec<WorkbenchPath> {
         self.editor
             .tabs()
             .iter()
@@ -1249,7 +1877,7 @@ impl Workbench {
 
     /// Closes a list of tabs, stopping at the first that has to ask about
     /// unsaved work. The rest wait until that question is answered.
-    fn close_many(&mut self, doomed: Vec<PathBuf>) {
+    fn close_many(&mut self, doomed: Vec<WorkbenchPath>) {
         self.closing = doomed;
         self.closing.reverse();
         self.close_next();
@@ -1357,11 +1985,16 @@ impl Workbench {
             Control::Stage => self.stage_selected(),
             Control::Revert => self.revert_selected(),
             Control::Open => {
-                let Some(path) = self.scm.selected_change().map(|change| change.path.clone())
-                else {
+                let Some(change) = self.scm.selected_change().cloned() else {
                     return;
                 };
-                self.open_path(&path);
+                if self.remote_scm.is_some() {
+                    if let Ok(path) = WorkspacePath::new(change.relative) {
+                        self.open_workbench_path(&WorkbenchPath::Remote(path), OpenPurpose::Open);
+                    }
+                } else {
+                    self.open_path(&change.path);
+                }
             }
         }
     }
@@ -1443,9 +2076,16 @@ impl Workbench {
     /// takes it.
     fn open_palette_row(&mut self, offset: usize) {
         self.palette.select_index(self.palette.scroll() + offset);
-        let chosen = self.palette.selected(&self.root);
+        let remote = self.palette.selected_remote();
+        let chosen = self
+            .remote_backend
+            .is_none()
+            .then(|| self.palette.selected(&self.root))
+            .flatten();
         self.palette.close();
-        if let Some(path) = chosen {
+        if let Some(entry) = remote {
+            self.request_remote_open(entry, OpenPurpose::Open);
+        } else if let Some(path) = chosen {
             self.open_path(&path);
         }
     }
@@ -1459,6 +2099,7 @@ impl Workbench {
             // reading a menu is not a reason to leave the file on screen.
             TabPart::Menu => self.open_menu_at(at),
             TabPart::Body => {
+                self.cancel_pending_opens();
                 self.editor.select(hit.index);
                 self.reveal_active();
             }
@@ -1480,6 +2121,7 @@ impl Workbench {
     /// Closing through the same guard the keyboard uses, so an unsaved tab
     /// asks the pointer the same question it asks the keyboard.
     fn close_at(&mut self, index: usize) {
+        self.cancel_pending_opens();
         self.editor.select(index);
         match self.editor.active().is_some_and(Tab::is_dirty) {
             true => {
@@ -1674,6 +2316,14 @@ impl Workbench {
 
     fn global_key(&mut self, key: KeyEvent) -> Option<WorkbenchAction> {
         if keys::CLOSE.matches(key) {
+            if self
+                .remote_scm
+                .as_mut()
+                .is_some_and(ScmDriver::cancel_mutation)
+            {
+                self.flash = Some("Cancelling remote source control operation…".to_owned());
+                return Some(WorkbenchAction::Consumed);
+            }
             // Everything else that owns `Esc` has already been offered it, so
             // this is the last thing between the key and leaving. A live
             // selection is the editor's own transient state and goes first.
@@ -1695,14 +2345,24 @@ impl Workbench {
         }
         if keys::QUICK_OPEN.matches(key) {
             self.palette.set_priority(self.other_tabs());
-            self.palette.open(&self.root, self.show_hidden);
+            if self.remote_backend.is_some() {
+                self.palette.open_remote(self.remote_entries.clone());
+            } else {
+                self.palette.open(&self.root, self.show_hidden);
+            }
             return Some(WorkbenchAction::Consumed);
         }
         if keys::REFRESH.matches(key) {
-            self.tree.reload();
-            self.scm.refresh();
-            self.palette.invalidate();
-            self.apply_marks();
+            if self.remote_backend.is_some() {
+                self.remote_invalidated
+                    .extend(self.editor.tabs().iter().map(|tab| tab.path.clone()));
+                self.refresh_remote_tree();
+            } else {
+                self.tree.reload();
+                self.scm.refresh();
+                self.palette.invalidate();
+                self.apply_marks();
+            }
             return Some(WorkbenchAction::Consumed);
         }
         if keys::SAVE.matches(key) {
@@ -1711,6 +2371,7 @@ impl Workbench {
         }
         for (bind, delta) in [(keys::NEXT_TAB, 1), (keys::PREV_TAB, -1)] {
             if bind.matches(key) {
+                self.cancel_pending_opens();
                 self.editor.cycle(delta);
                 self.reveal_active();
                 return Some(WorkbenchAction::Consumed);
@@ -1734,6 +2395,9 @@ impl Workbench {
             (keys::VIEW_SEARCH, SidebarView::Search),
         ] {
             if bind.matches(key) {
+                if view != SidebarView::Search {
+                    self.cancel_remote_search();
+                }
                 self.sidebar = view;
                 self.sidebar_collapsed = false;
                 self.focus = Focus::Sidebar;
@@ -1872,6 +2536,22 @@ impl Workbench {
         if keys::REVERT.matches(key) {
             // The only way out of a conflict that keeps the other writer's
             // work, so it throws the buffer away rather than merging.
+            if self.remote_backend.is_some() {
+                let path = self.editor.active()?.path.clone();
+                let Some(mut entry) = self
+                    .remote_entries
+                    .iter()
+                    .find(|entry| entry.path == path)
+                    .cloned()
+                else {
+                    self.flash = Some("remote file revision is still refreshing".into());
+                    return Some(WorkbenchAction::Consumed);
+                };
+                // Discard requests the current contents, not the revision cached before a conflict.
+                entry.revision = None;
+                self.request_remote_open(entry, OpenPurpose::Discard);
+                return Some(WorkbenchAction::Consumed);
+            }
             let outcome = self.editor.active_mut()?.discard_and_reload();
             self.flash = outcome.err().map(|error| error.to_string());
             self.follow_cursor();
@@ -1930,9 +2610,18 @@ impl Workbench {
         match key.code {
             KeyCode::Esc => self.palette.close(),
             KeyCode::Enter => {
-                let chosen = self.palette.selected(&self.root);
+                let remote = self.palette.selected_remote();
+                let chosen = self
+                    .remote_backend
+                    .is_none()
+                    .then(|| self.palette.selected(&self.root))
+                    .flatten();
                 self.palette.close();
-                if let Some(path) = chosen {
+                if let Some(entry) = remote {
+                    self.request_remote_open(entry, OpenPurpose::Open);
+                } else if self.remote_backend.is_none()
+                    && let Some(path) = chosen
+                {
                     self.open_path(&path);
                 }
             }
@@ -2141,7 +2830,11 @@ impl Workbench {
             KeyCode::Home => self.scm.select_first(),
             KeyCode::End => self.scm.select_last(),
             KeyCode::Left => self.scm.fold(),
-            KeyCode::Right => drop(self.scm.unfold()),
+            KeyCode::Right => {
+                if !self.scm.unfold() {
+                    self.expand_remote_commit();
+                }
+            }
             KeyCode::Enter => self.activate_scm(),
             _ => {}
         }
@@ -2153,7 +2846,35 @@ impl Workbench {
         if self.scm.toggle_fold() {
             return;
         }
+        if self.expand_remote_commit() {
+            return;
+        }
         self.open_scm_selection();
+    }
+
+    fn expand_remote_commit(&mut self) -> bool {
+        let Some(commit) = self.scm.selected_commit().cloned() else {
+            return false;
+        };
+        let Some(parent) = commit.parents.first() else {
+            self.scm
+                .open_workspace_commit(&commit.id, scm::repo::CommitFiles::default());
+            return true;
+        };
+        let Some(repository) = self.scm.workspace_repository().cloned() else {
+            return false;
+        };
+        let Ok(commit_id) = ScmRevision::new(commit.id) else {
+            return false;
+        };
+        let Ok(parent_id) = ScmRevision::new(parent.clone()) else {
+            return false;
+        };
+        let Some(driver) = &mut self.remote_scm else {
+            return false;
+        };
+        driver.commit_files(&repository, commit_id, parent_id);
+        true
     }
 
     /// Opens whatever the cursor is on as a read-only tab: a diff for a change,
@@ -2189,7 +2910,23 @@ impl Workbench {
     /// and "open what I am looking at" once they agree.
     fn run_or_open_search(&mut self) {
         if self.search.is_stale() {
-            self.search.start(&self.root, self.show_hidden);
+            if self.remote_backend.is_some() {
+                if let Some(previous) = self.search.cancel_remote()
+                    && let Some(backend) = &mut self.remote_backend
+                {
+                    backend.cancel(previous);
+                    self.remote_pending.remove(&previous);
+                }
+                if let Some((query, include)) = self.search.prepare_remote()
+                    && let Some(backend) = &mut self.remote_backend
+                {
+                    let request = backend.search(query, include);
+                    self.remote_pending.insert(request);
+                    self.search.begin_remote(request);
+                }
+            } else {
+                self.search.start(&self.root, self.show_hidden);
+            }
             self.flash = self.search.error().map(str::to_owned);
             return;
         }
@@ -2200,14 +2937,44 @@ impl Workbench {
         let Some((path, line)) = self.search.selection() else {
             return;
         };
-        self.open_path(&path);
-        if let Some(tab) = self.editor.active_mut() {
+        if self.remote_backend.is_some() {
+            self.pending_lines.insert(path.clone(), line..=line);
+            if let Some(entry) = self.search.selected_resource() {
+                self.cancel_pending_opens();
+                self.request_remote_open(entry, OpenPurpose::Open);
+                self.follow_cursor();
+                return;
+            }
+        }
+        self.open_workbench_path(&path, OpenPurpose::Open);
+        if self.remote_backend.is_none()
+            && let Some(tab) = self.editor.active_mut()
+        {
             tab.buffer.goto_line(line);
         }
         self.follow_cursor();
     }
 
     fn stage_selected(&mut self) {
+        if self.remote_scm.is_some() {
+            let paths = match self.scm.workspace_paths() {
+                Ok(paths) => paths,
+                Err(error) => {
+                    self.flash = Some(error.to_string());
+                    return;
+                }
+            };
+            if paths.is_empty() {
+                return;
+            }
+            let mutation = match self.scm.cursor().section {
+                Section::Staged => ScmMutation::Unstage { paths },
+                Section::Unstaged => ScmMutation::Stage { paths },
+                Section::Graph => return,
+            };
+            self.run_remote_mutation(mutation);
+            return;
+        }
         if let Err(error) = self.scm.stage() {
             self.flash = Some(error.to_string());
             return;
@@ -2238,6 +3005,37 @@ impl Workbench {
     }
 
     fn discard_change(&mut self) {
+        if self.remote_scm.is_some() {
+            let relative = match self.scm.discard() {
+                Ok(scm::Discard::Nothing) => return,
+                Ok(scm::Discard::Armed(relative)) => {
+                    self.flash = Some(format!(
+                        "Discard changes to {relative}? Press {} or click {} to confirm.",
+                        keys::DISCARD.label,
+                        view::REVERT_MARK,
+                    ));
+                    return;
+                }
+                Ok(scm::Discard::Done(relative)) => relative,
+                Err(error) => {
+                    self.flash = Some(error.to_string());
+                    return;
+                }
+            };
+            let Ok(path) = WorkspacePath::new(relative) else {
+                return;
+            };
+            if self
+                .scm
+                .discardable_workspace_paths()
+                .is_ok_and(|paths| paths.contains(&path))
+            {
+                self.run_remote_mutation(ScmMutation::Discard { paths: vec![path] });
+            } else {
+                self.flash = Some("Untracked files cannot be discarded remotely".to_owned());
+            }
+            return;
+        }
         match self.scm.discard() {
             Ok(scm::Discard::Nothing) => {}
             Ok(scm::Discard::Armed(relative)) => {
@@ -2258,6 +3056,10 @@ impl Workbench {
     /// Opens the selected change as a read-only diff tab, which inherits the
     /// editor's scrolling, find and selection rather than reimplementing them.
     fn open_diff(&mut self) {
+        if self.remote_scm.is_some() {
+            self.open_remote_change_diff();
+            return;
+        }
         let diff = match self.scm.selected_diff() {
             Ok(Some(diff)) => diff,
             Ok(None) => return,
@@ -2288,6 +3090,10 @@ impl Workbench {
     /// [`Editor::push`] keeps one tab per path. The name still ends in the real
     /// one, which is what the highlighter reads the language from.
     fn open_commit_file(&mut self) {
+        if self.remote_scm.is_some() {
+            self.open_remote_commit_diff();
+            return;
+        }
         let opened = match self.scm.selected_commit_file_diff() {
             Ok(Some(opened)) => opened,
             Ok(None) => return,
@@ -2311,6 +3117,142 @@ impl Workbench {
         self.focus = Focus::Editor;
     }
 
+    fn run_remote_mutation(&mut self, mutation: ScmMutation) {
+        let Some(repository) = self.scm.workspace_repository().cloned() else {
+            return;
+        };
+        let Some(driver) = &mut self.remote_scm else {
+            return;
+        };
+        if let Err(error) = driver.mutate(&repository, mutation) {
+            self.flash = Some(error.to_string());
+        }
+    }
+
+    fn open_remote_change_diff(&mut self) {
+        let Some(change) = self.scm.selected_change().cloned() else {
+            return;
+        };
+        let Some(repository) = self.scm.workspace_repository().cloned() else {
+            return;
+        };
+        let Ok(path) = WorkspacePath::new(change.relative) else {
+            return;
+        };
+        let (target, old, new) = if change.staged {
+            (ScmDiffTarget::Staged, ScmSide::Head, ScmSide::Index)
+        } else {
+            (ScmDiffTarget::Unstaged, ScmSide::Index, ScmSide::Worktree)
+        };
+        if let Some(driver) = &mut self.remote_scm {
+            driver.diff(&repository, path, target, old, new);
+        }
+    }
+
+    fn open_remote_commit_diff(&mut self) {
+        let Some((commit, file)) = self
+            .scm
+            .selected_commit_file()
+            .map(|(commit, file)| (commit.clone(), file.clone()))
+        else {
+            return;
+        };
+        let Some(parent) = commit.parents.first() else {
+            return;
+        };
+        let Some(repository) = self.scm.workspace_repository().cloned() else {
+            return;
+        };
+        let (Ok(path), Ok(base), Ok(target)) = (
+            WorkspacePath::new(file.relative),
+            ScmRevision::new(parent.clone()),
+            ScmRevision::new(commit.id),
+        ) else {
+            return;
+        };
+        let diff_target = ScmDiffTarget::Tree {
+            base: base.clone(),
+            target: target.clone(),
+        };
+        if let Some(driver) = &mut self.remote_scm {
+            driver.diff(
+                &repository,
+                path,
+                diff_target,
+                ScmSide::Commit { revision: base },
+                ScmSide::Commit { revision: target },
+            );
+        }
+    }
+
+    fn open_remote_diff(&mut self, result: RemoteDiffResult) {
+        let RemoteDiffResult {
+            path,
+            target,
+            lines,
+            old,
+            new,
+            warnings,
+        } = result;
+        let rendered =
+            scm::diff::structured(path.as_str(), &old, &new, lines, !warnings.is_empty());
+        let (title, tab_path) = match target {
+            ScmDiffTarget::Staged => (
+                format!("{path} ↔ {STAGED}"),
+                WorkbenchPath::Remote(path.clone()),
+            ),
+            ScmDiffTarget::Unstaged => (
+                format!("{path} ↔ {WORKING}"),
+                WorkbenchPath::Remote(path.clone()),
+            ),
+            ScmDiffTarget::Tree { target, .. } => {
+                let synthetic = WorkspacePath::new(format!(
+                    ".caudra-scm/{}/{}",
+                    opaque_path_component(target.as_str()),
+                    path.as_str()
+                ))
+                .unwrap_or_else(|_| path.clone());
+                (
+                    format!("{path} ↔ {}", target.as_str()),
+                    WorkbenchPath::Remote(synthetic),
+                )
+            }
+        };
+        if let Some(warning) = warnings.last() {
+            self.flash = Some(warning.clone());
+        }
+        self.editor.push(Tab::synthetic_backend(
+            tab_path,
+            title,
+            rendered.rows,
+            self.theme_generation,
+        ));
+        self.focus = Focus::Editor;
+    }
+
+    fn apply_remote_commit_files(&mut self, result: CommitFilesResult) {
+        let mut paths = std::collections::BTreeMap::new();
+        for line in result.lines {
+            let mark = line
+                .change
+                .map(scm::workspace_change_mark)
+                .unwrap_or(fs::tree::GitMark::Modified);
+            paths.entry(line.path.to_string()).or_insert(mark);
+        }
+        let files = scm::repo::CommitFiles {
+            files: paths
+                .into_iter()
+                .map(|(relative, mark)| scm::repo::CommitPath { relative, mark })
+                .collect(),
+            truncated: result.truncated || result.incomplete,
+        };
+        self.scm
+            .open_workspace_commit(result.commit.as_str(), files);
+        if result.truncated || result.incomplete {
+            self.flash = Some("Remote commit file list is incomplete".to_owned());
+        }
+    }
+
     /// A discard rewrote a file underneath whatever was showing it, so any tab
     /// on that path has to catch up or say that it cannot.
     fn reload_tabs_for(&mut self, relative: &str) {
@@ -2324,6 +3266,7 @@ impl Workbench {
     /// one keeps what was typed and flies the conflict, because throwing away
     /// unsaved work is the user's call and not the watcher's.
     fn reload_tab(&mut self, path: &Path) {
+        let path = WorkbenchPath::Local(path.to_path_buf());
         for tab in self.editor.tabs_mut() {
             if tab.path == path && tab.is_editable() && tab.reload_from_disk().is_err() {
                 tab.conflict = true;
@@ -2332,6 +3275,13 @@ impl Workbench {
     }
 
     fn apply_marks(&mut self) {
+        if self.remote_scm.is_some() {
+            let marks = |path: &WorkspacePath| self.scm.workspace_mark(path);
+            let under = |path: &WorkspacePath| self.scm.workspace_folder_mark(path);
+            self.tree.apply_remote_git(&marks, &under);
+            self.tree.set_agent_touched(&self.touched);
+            return;
+        }
         let marks = self.scm.marks();
         let under = self.scm.folder_marks();
         self.tree.apply_git(&marks, &under);
@@ -2368,7 +3318,7 @@ impl Workbench {
         let Some(path) = self.tree.selected().map(|row| row.path.clone()) else {
             return;
         };
-        self.open_path(&path);
+        self.open_workbench_path(&path, OpenPurpose::Open);
     }
 
     /// Puts the selected file up without leaving the tree, which is what one
@@ -2378,7 +3328,15 @@ impl Workbench {
         let Some(path) = self.tree.selected().map(|row| row.path.clone()) else {
             return;
         };
-        match self.editor.preview(&path, self.theme_generation) {
+        if self.remote_backend.is_some() {
+            self.open_workbench_path(&path, OpenPurpose::Preview);
+            return;
+        }
+        let Some(path) = path.local() else {
+            self.flash = Some(BackendError::WrongBackend.to_string());
+            return;
+        };
+        match self.editor.preview(path, self.theme_generation) {
             Ok(()) => {
                 // The tree is already on this row, but source control is not.
                 self.reveal_active();
@@ -2389,6 +3347,35 @@ impl Workbench {
     }
 
     fn open_path(&mut self, path: &Path) {
+        self.open_workbench_path(&WorkbenchPath::Local(path.to_path_buf()), OpenPurpose::Open);
+    }
+
+    fn open_workbench_path(&mut self, path: &WorkbenchPath, purpose: OpenPurpose) {
+        if self.remote_backend.is_some() {
+            if matches!(purpose, OpenPurpose::Open | OpenPurpose::Preview) {
+                self.cancel_pending_opens();
+            }
+            let entry = self
+                .remote_entries
+                .iter()
+                .find(|entry| entry.path == *path)
+                .cloned();
+            match entry {
+                Some(entry) if entry.kind == caudra_workspace::ResourceKind::File => {
+                    self.request_remote_open(entry, purpose);
+                }
+                Some(_) => self.flash = Some(BackendError::NotFile.to_string()),
+                None => {
+                    self.deferred_open.insert(path.clone(), purpose);
+                    self.refresh_remote_tree();
+                }
+            }
+            return;
+        }
+        let Some(path) = path.local() else {
+            self.flash = Some(BackendError::WrongBackend.to_string());
+            return;
+        };
         let started = Instant::now();
         let mut phase_start = started;
         let mut lap = || {
@@ -2432,13 +3419,25 @@ impl Workbench {
     /// The path is the tree's own selection, which the menu landed on before
     /// it opened and the dialog has held still ever since.
     fn resolve_delete(&mut self, choice: Choice) {
+        if choice != Choice::Discard {
+            self.delete_target = None;
+            return;
+        }
+        if let Some(entry) = self.delete_target.take() {
+            if let Some(backend) = &mut self.remote_backend {
+                let request = backend.delete(entry);
+                self.remote_pending.insert(request);
+            }
+            return;
+        }
         let Some(path) = self.tree.selected().map(|row| row.path.clone()) else {
             return;
         };
-        if choice != Choice::Discard {
+        let Some(local) = path.local() else {
+            self.flash = Some(BackendError::WrongBackend.to_string());
             return;
-        }
-        match ops::delete(&path) {
+        };
+        match ops::delete(local) {
             Ok(()) => {
                 self.close_tabs_under(&path);
                 self.reread();
@@ -2450,7 +3449,7 @@ impl Workbench {
     /// A path that is gone takes its tabs with it. A tab with unsaved edits
     /// stays and flies the conflict instead, because throwing that work away
     /// is not part of what was asked.
-    fn close_tabs_under(&mut self, path: &Path) {
+    fn close_tabs_under(&mut self, path: &WorkbenchPath) {
         for tab in self.editor.tabs_mut() {
             if tab.path.starts_with(path) && tab.is_dirty() {
                 tab.conflict = true;
@@ -2486,6 +3485,18 @@ impl Workbench {
         if choice != Choice::Discard {
             return;
         }
+        if self.remote_scm.is_some() {
+            match self.scm.discardable_workspace_paths() {
+                Ok(paths) if !paths.is_empty() => {
+                    self.run_remote_mutation(ScmMutation::Discard { paths });
+                }
+                Ok(_) => {
+                    self.flash = Some("Untracked files cannot be discarded remotely".to_owned());
+                }
+                Err(error) => self.flash = Some(error.to_string()),
+            }
+            return;
+        }
         match self.scm.discard_scope() {
             Ok(paths) => {
                 for relative in &paths {
@@ -2515,14 +3526,15 @@ impl Workbench {
         let Some(path) = self.editor.active().map(|tab| tab.path.clone()) else {
             return;
         };
-        self.tree.reveal(&path);
+        self.tree.reveal_workbench_path(&path);
         // Change paths are relative to the repository, which is not the
         // workbench root when the workbench was opened below it.
-        let relative = self
-            .scm
-            .workdir()
-            .and_then(|workdir| path.strip_prefix(workdir).ok())
-            .map(|relative| relative.to_string_lossy().into_owned());
+        let relative = path.local().and_then(|path| {
+            self.scm
+                .workdir()
+                .and_then(|workdir| path.strip_prefix(workdir).ok())
+                .map(|relative| relative.to_string_lossy().into_owned())
+        });
         if let Some(relative) = relative {
             self.scm.reveal(&relative);
         }
@@ -2534,6 +3546,22 @@ impl Workbench {
         let Some(tab) = self.editor.active_mut() else {
             return false;
         };
+        if tab.path.remote().is_some() {
+            let Some(entry) = tab.resource.clone() else {
+                self.flash = Some(BackendError::MissingRevision.to_string());
+                return false;
+            };
+            let path = tab.path.clone();
+            let contents = tab.contents();
+            let Some(backend) = &mut self.remote_backend else {
+                self.flash = Some(BackendError::WrongBackend.to_string());
+                return false;
+            };
+            let request = backend.save(entry, contents);
+            self.remote_pending.insert(request);
+            self.pending_save.insert(request, path);
+            return false;
+        }
         self.flash = match tab.save() {
             Ok(()) => return true,
             Err(error) => Some(error.to_string()),
@@ -2554,9 +3582,18 @@ impl Workbench {
 
     /// How a path leaves for the composer, which is the same wherever the path
     /// came from.
-    fn mention(&self, path: &Path, lines: Option<RangeInclusive<usize>>) -> WorkbenchAction {
+    fn mention(
+        &self,
+        path: &WorkbenchPath,
+        lines: Option<RangeInclusive<usize>>,
+    ) -> WorkbenchAction {
         WorkbenchAction::SendToComposer {
-            path: self.relative(path).to_path_buf(),
+            path: match path {
+                WorkbenchPath::Local(path) => {
+                    WorkbenchPath::Local(self.relative(path).to_path_buf())
+                }
+                WorkbenchPath::Remote(path) => WorkbenchPath::Remote(path.clone()),
+            },
             lines,
         }
     }
@@ -2570,7 +3607,12 @@ impl Workbench {
                 return Some(self.mention(&path, Some(line..=line)));
             }
             let path = match self.sidebar {
-                SidebarView::SourceControl => &self.scm.selected_change()?.path,
+                SidebarView::SourceControl => {
+                    return Some(self.mention(
+                        &WorkbenchPath::Local(self.scm.selected_change()?.path.clone()),
+                        None,
+                    ));
+                }
                 _ => &self.tree.selected()?.path,
             };
             return Some(self.mention(path, None));
@@ -2597,12 +3639,33 @@ impl Workbench {
             .enumerate()
             .filter(|(index, _)| *index != active)
             .rev()
-            .map(|(_, tab)| self.relative(&tab.path).display().to_string())
+            .map(|(_, tab)| self.relative_path(&tab.path))
             .collect()
     }
 
     fn relative<'a>(&'a self, path: &'a Path) -> &'a Path {
         path.strip_prefix(&self.root).unwrap_or(path)
+    }
+
+    fn relative_path(&self, path: &WorkbenchPath) -> String {
+        path.display_relative(&self.backend_root())
+    }
+
+    fn backend_root(&self) -> WorkbenchPath {
+        self.remote_backend
+            .as_ref()
+            .map(|backend| backend.root().clone())
+            .unwrap_or_else(|| WorkbenchPath::Local(self.root.clone()))
+    }
+
+    fn cancel_remote_search(&mut self) {
+        let Some(request) = self.search.cancel_remote() else {
+            return;
+        };
+        if let Some(backend) = &mut self.remote_backend {
+            backend.cancel(request);
+        }
+        self.remote_pending.remove(&request);
     }
 
     fn follow_cursor(&mut self) {
@@ -2646,6 +3709,15 @@ impl Workbench {
     fn set_sidebar_width(&mut self, width: u16) {
         self.sidebar_width = width.clamp(MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH);
     }
+}
+
+fn opaque_path_component(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len() * 2);
+    for byte in value.bytes() {
+        encoded.push(HEX_DIGITS[(byte >> 4) as usize] as char);
+        encoded.push(HEX_DIGITS[(byte & 0x0f) as usize] as char);
+    }
+    encoded
 }
 
 fn layout(area: Rect, sidebar_width: u16, collapsed: bool) -> PaneRects {
@@ -2743,10 +3815,10 @@ fn layout_sections(
 mod tests {
     use super::{
         Ask, Choice, Confirm, Cursor, DEFAULT_SIDEBAR_WIDTH, DISCARD_LABEL, Drag,
-        EDGE_SCROLL_LINES, Focus, Layout, MAX_SIDEBAR_WIDTH, MIN_EDITOR_WIDTH, MIN_SECTION_ROWS,
-        MIN_SIDEBAR_WIDTH, MenuAction, NEW_FILE_PROMPT, SCROLL_COLUMNS, SCROLL_LINES, ScmLayout,
-        Section, SidebarView, Target, Toggle, Workbench, WorkbenchAction, WorkbenchStyles, keys,
-        layout, layout_sections, scm,
+        EDGE_SCROLL_LINES, Focus, InputKind, Layout, MAX_SIDEBAR_WIDTH, MIN_EDITOR_WIDTH,
+        MIN_SECTION_ROWS, MIN_SIDEBAR_WIDTH, MenuAction, NEW_FILE_PROMPT, SCROLL_COLUMNS,
+        SCROLL_LINES, ScmLayout, Section, SidebarView, Target, Toggle, Workbench, WorkbenchAction,
+        WorkbenchPath, WorkbenchStyles, keys, layout, layout_sections, scm,
     };
     use crate::chrome::ELLIPSIS;
     use crate::editor::{VisualRow, render};
@@ -2772,6 +3844,7 @@ mod tests {
     use std::fs;
     use std::ops::RangeInclusive;
     use std::path::{Path, PathBuf};
+    use std::time::{Duration, Instant};
     use tempfile::TempDir;
     use test_case::test_case;
     use unicode_width::UnicodeWidthStr;
@@ -2796,6 +3869,7 @@ mod tests {
     const CHANGE_MISSING: &str = "the change the test made is not under the cursor";
     const MARK_MISSING: &str = "the explorer row is missing its source control mark";
     const DIFF_EDITABLE: &str = "a diff tab must be read-only";
+    const REMOTE_SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
     const COMMIT_OPENED_WHOLE: &str = "a commit must open into its paths, not into one document";
     const COMMIT_NOT_LISTED: &str = "the graph does not list what the commit changed";
     const DIFF_DISPLACED: &str = "a commit's diff replaced the working tree's diff of that path";
@@ -2911,7 +3985,7 @@ mod tests {
 
     fn sent(path: &str, lines: Option<RangeInclusive<usize>>) -> WorkbenchAction {
         WorkbenchAction::SendToComposer {
-            path: PathBuf::from(path),
+            path: PathBuf::from(path).into(),
             lines,
         }
     }
@@ -3141,7 +4215,7 @@ mod tests {
         assert_eq!(workbench.focus, Focus::Editor, "{NOT_REVEALED}");
         assert_eq!(
             workbench.tree.selected().map(|row| row.path.clone()),
-            Some(dir.path().join(relative)),
+            Some(dir.path().join(relative).into()),
             "{NOT_REVEALED}"
         );
     }
@@ -3966,7 +5040,7 @@ mod tests {
         assert_eq!(workbench.active_title(), "b.txt", "{NO_TAB}");
         assert_eq!(
             workbench.editor.active().expect(NO_TAB).path,
-            dir.path().join("sub/b.txt")
+            WorkbenchPath::Local(dir.path().join("sub/b.txt"))
         );
         assert_eq!(
             workbench.tree.selected().map(|row| row.name.clone()),
@@ -4183,7 +5257,7 @@ mod tests {
             .tree
             .rows()
             .iter()
-            .find(|row| row.path == dir.path().join("a.txt"))
+            .find(|row| row.path == WorkbenchPath::Local(dir.path().join("a.txt")))
             .expect("the file must be in the tree");
         assert_eq!(row.git, Some(GitMark::Untracked), "{MARK_MISSING}");
     }
@@ -5219,7 +6293,11 @@ mod tests {
         workbench.handle_key(key(KeyCode::Enter));
 
         let tab = workbench.editor.active().expect("a tab");
-        assert_eq!(tab.path, dir.path().join("a.txt"), "{NO_TAB}");
+        assert_eq!(
+            tab.path,
+            WorkbenchPath::Local(dir.path().join("a.txt")),
+            "{NO_TAB}"
+        );
         assert_eq!(tab.buffer.cursor().line, 2, "{WRONG_LINE}");
     }
 
@@ -5397,7 +6475,7 @@ mod tests {
         assert_eq!(restored.layout(), saved, "{WRONG_LAYOUT}");
         assert_eq!(
             restored.editor.active().expect("a tab").path,
-            dir.path().join("a.txt"),
+            WorkbenchPath::Local(dir.path().join("a.txt")),
             "{WRONG_LAYOUT}"
         );
     }
@@ -5986,7 +7064,11 @@ mod tests {
 
         assert_eq!(workbench.search.selected_index(), 1, "{WRONG_CLICK}");
         let tab = workbench.editor.active().expect(NO_TAB);
-        assert_eq!(tab.path, dir.path().join("a.txt"), "{NO_TAB}");
+        assert_eq!(
+            tab.path,
+            WorkbenchPath::Local(dir.path().join("a.txt")),
+            "{NO_TAB}"
+        );
         assert_eq!(tab.buffer.cursor().line, 2, "{WRONG_LINE}");
     }
 
@@ -6093,7 +7175,7 @@ mod tests {
         let menu = workbench.menu.as_ref().expect(NO_MENU);
         assert_eq!(
             menu.target(),
-            &Target::Row(dir.path().join(NESTED_DIR)),
+            &Target::Row(dir.path().join(NESTED_DIR).into()),
             "{WRONG_TARGET}"
         );
     }
@@ -6124,7 +7206,7 @@ mod tests {
         let menu = workbench.menu.as_ref().expect(NO_MENU);
         assert_eq!(
             menu.target(),
-            &Target::Row(dir.path().join(NESTED_DIR)),
+            &Target::Row(dir.path().join(NESTED_DIR).into()),
             "{WRONG_TARGET}"
         );
     }
@@ -6157,7 +7239,7 @@ mod tests {
         let menu = workbench.menu.as_ref().expect(NO_MENU);
         assert_eq!(
             menu.target(),
-            &Target::Row(dir.path().join(OPENED_FILE)),
+            &Target::Row(dir.path().join(OPENED_FILE).into()),
             "{WRONG_TARGET}"
         );
     }
@@ -6211,7 +7293,11 @@ mod tests {
         assert!(dir.path().join(RENAMED_FILE).is_file(), "{NOT_RENAMED}");
         assert!(!dir.path().join(OPENED_FILE).exists(), "{NOT_RENAMED}");
         let tab = workbench.editor.active().expect(NO_TAB);
-        assert_eq!(tab.path, dir.path().join(RENAMED_FILE), "{TAB_LEFT_BEHIND}");
+        assert_eq!(
+            tab.path,
+            WorkbenchPath::Local(dir.path().join(RENAMED_FILE)),
+            "{TAB_LEFT_BEHIND}"
+        );
         assert_eq!(tab.title, RENAMED_FILE, "{TAB_LEFT_BEHIND}");
     }
 
@@ -6234,7 +7320,7 @@ mod tests {
         );
         assert_eq!(
             workbench.editor.active().map(|tab| tab.path.clone()),
-            Some(dir.path().join(RENAMED_DIR).join(NESTED_FILE)),
+            Some(dir.path().join(RENAMED_DIR).join(NESTED_FILE).into()),
             "{TAB_LEFT_BEHIND}"
         );
     }
@@ -6271,7 +7357,7 @@ mod tests {
         assert_eq!(made.is_dir(), !file, "{NOT_MADE}");
         assert_eq!(
             workbench.editor.active().map(|tab| tab.path.clone()),
-            file.then(|| made.clone()),
+            file.then(|| made.clone().into()),
             "{NOT_MADE}"
         );
     }
@@ -6404,7 +7490,7 @@ mod tests {
         assert_eq!(workbench.focus, Focus::Sidebar, "{NOT_REVEALED}");
         assert_eq!(
             workbench.tree.selected().map(|row| row.path.clone()),
-            Some(dir.path().join(OPENED_FILE)),
+            Some(dir.path().join(OPENED_FILE).into()),
             "{NOT_REVEALED}"
         );
     }
@@ -6669,5 +7755,219 @@ mod tests {
             "{QUEUE_RAN_ON}"
         );
         assert!(workbench.closing.is_empty(), "{QUEUE_RAN_ON}");
+    }
+
+    #[track_caller]
+    fn settle_remote(workbench: &mut Workbench, ready: impl Fn(&Workbench) -> bool) {
+        let deadline = Instant::now() + REMOTE_SETTLE_TIMEOUT;
+        while Instant::now() < deadline {
+            workbench.tick();
+            if ready(workbench) {
+                return;
+            }
+            smol::block_on(smol::future::yield_now());
+            std::thread::yield_now();
+        }
+        panic!(
+            "remote workbench did not settle: tabs={:?}, pending={:?}, opens={:?}, invalidated={:?}, entries={:?}, flash={:?}",
+            workbench
+                .editor
+                .tabs()
+                .iter()
+                .map(|tab| (&tab.path, tab.preview))
+                .collect::<Vec<_>>(),
+            workbench.remote_pending,
+            workbench.pending_open,
+            workbench.remote_invalidated,
+            workbench
+                .remote_entries
+                .iter()
+                .map(|entry| &entry.path)
+                .collect::<Vec<_>>(),
+            workbench.flash,
+        );
+    }
+
+    #[test]
+    fn remote_discard_reads_the_current_revision_with_a_stale_listing() {
+        const FILE: &str = "same-name.txt";
+        const REPLACEMENT: &str = "theirs";
+
+        let (session, control) = crate::fs::backend::tests::widget_fixture();
+        let mut workbench = Workbench::new(WorkbenchStyles::default());
+        workbench.toggle_workspace(session).unwrap();
+        settle_remote(&mut workbench, |workbench| !workbench.is_busy());
+        let path = WorkbenchPath::Remote(caudra_workspace::WorkspacePath::new(FILE).unwrap());
+        workbench.open_workbench_path(&path, super::OpenPurpose::Open);
+        settle_remote(&mut workbench, |workbench| {
+            workbench.editor.active().is_some()
+        });
+        workbench.editor_key(key(KeyCode::Char('X')));
+        control.replace(FILE, REPLACEMENT);
+        workbench.editor.active_mut().unwrap().conflict = true;
+
+        workbench.buffer_key(press(keys::REVERT));
+
+        settle_remote(&mut workbench, |workbench| {
+            workbench.editor.active().is_some_and(|tab| {
+                tab.buffer.line(0) == REPLACEMENT && !tab.is_dirty() && !tab.conflict
+            })
+        });
+    }
+
+    #[test]
+    fn remote_widgets_cover_tree_editor_mutations_search_watch_resync_and_rebind() {
+        const FILE: &str = "same-name.txt";
+        const SECOND: &str = "second.txt";
+        const MADE: &str = "made.txt";
+        const RENAMED: &str = "renamed.txt";
+
+        crate::LocalFilesystem::reset_call_count();
+        let (session, control) = crate::fs::backend::tests::widget_fixture();
+        control.insert(SECOND, "second\n");
+        let mut workbench = Workbench::new(WorkbenchStyles::default());
+        workbench.bind_workspace(session.clone()).unwrap();
+        workbench.toggle_workspace(session).unwrap();
+        settle_remote(&mut workbench, |workbench| workbench.tree.rows().len() == 3);
+        settle_remote(&mut workbench, |workbench| workbench.scm.is_repository());
+        workbench.scm.select(Section::Unstaged, Some(0));
+        workbench.stage_selected();
+        settle_remote(&mut workbench, |workbench| {
+            workbench
+                .remote_scm
+                .as_ref()
+                .is_some_and(|scm| !scm.is_busy())
+        });
+        assert!(control.scm_calls() >= 7);
+        assert!(workbench.tree.rows().iter().all(|row| {
+            row.path.remote().is_some()
+                && row
+                    .resource
+                    .as_ref()
+                    .and_then(|entry| entry.resource_id.as_ref())
+                    .is_some()
+        }));
+
+        let file = WorkbenchPath::Remote(caudra_workspace::WorkspacePath::new(FILE).unwrap());
+        workbench.open_workbench_path(&file, super::OpenPurpose::Open);
+        settle_remote(&mut workbench, |workbench| {
+            workbench.editor.active().is_some()
+        });
+        workbench.editor_key(key(KeyCode::Char('X')));
+        workbench.save_active();
+        settle_remote(&mut workbench, |workbench| {
+            workbench.editor.active().is_some_and(|tab| !tab.is_dirty())
+        });
+        assert!(control.contents(FILE).starts_with('X'));
+
+        workbench.editor_key(key(KeyCode::Char('Y')));
+        control.replace(FILE, "theirs\n");
+        workbench.save_active();
+        settle_remote(&mut workbench, |workbench| {
+            workbench.editor.active().is_some_and(|tab| tab.conflict)
+        });
+        workbench.buffer_key(press(keys::REVERT));
+        settle_remote(&mut workbench, |workbench| {
+            workbench
+                .editor
+                .active()
+                .is_some_and(|tab| tab.buffer.line(0) == "theirs" && !tab.is_dirty())
+        });
+
+        let scm_calls_before_watch = control.scm_calls();
+        control.replace(FILE, "watched\n");
+        control.watch_change(FILE);
+        settle_remote(&mut workbench, |workbench| {
+            workbench
+                .editor
+                .active()
+                .is_some_and(|tab| tab.buffer.line(0) == "watched")
+        });
+        settle_remote(&mut workbench, |_| {
+            control.scm_calls() > scm_calls_before_watch
+        });
+        control.replace(FILE, "resynced\n");
+        control.watch_resync();
+        settle_remote(&mut workbench, |workbench| {
+            workbench
+                .editor
+                .active()
+                .is_some_and(|tab| tab.buffer.line(0) == "resynced")
+        });
+
+        let root = WorkbenchPath::Remote(caudra_workspace::WorkspacePath::root());
+        workbench.ask_for_name(InputKind::NewFile, root.clone());
+        workbench.input.as_mut().unwrap().value = MADE.into();
+        workbench.commit_input();
+        settle_remote(&mut workbench, |workbench| {
+            workbench
+                .editor
+                .active()
+                .is_some_and(|tab| tab.path.file_name() == MADE)
+        });
+        workbench.ask_for_name(InputKind::NewFolder, root);
+        workbench.input.as_mut().unwrap().value = "folder".into();
+        workbench.commit_input();
+        settle_remote(&mut workbench, |workbench| {
+            workbench.tree.rows().iter().any(|row| row.name == "folder")
+        });
+
+        let made = WorkbenchPath::Remote(caudra_workspace::WorkspacePath::new(MADE).unwrap());
+        workbench.ask_for_name(InputKind::Rename, made);
+        workbench.input.as_mut().unwrap().value = RENAMED.into();
+        workbench.commit_input();
+        settle_remote(&mut workbench, |workbench| {
+            workbench.tree.rows().iter().any(|row| row.name == RENAMED)
+        });
+
+        workbench.sidebar = SidebarView::Search;
+        for ch in "resynced".chars() {
+            workbench.search.push_char(ch);
+        }
+        workbench.run_or_open_search();
+        settle_remote(&mut workbench, |workbench| workbench.search.has_results());
+        assert!(workbench.search.selection().is_some());
+
+        assert_eq!(open_titles(&workbench), [FILE, RENAMED]);
+        let second = WorkbenchPath::Remote(caudra_workspace::WorkspacePath::new(SECOND).unwrap());
+        workbench.open_workbench_path(&second, super::OpenPurpose::Open);
+        settle_remote(&mut workbench, |workbench| {
+            workbench.pending_open.is_empty()
+        });
+        assert_eq!(open_titles(&workbench), [FILE, RENAMED, SECOND]);
+        assert_eq!(workbench.editor.active().unwrap().path, second);
+
+        let renamed = WorkbenchPath::Remote(caudra_workspace::WorkspacePath::new(RENAMED).unwrap());
+        workbench.run_on_row(MenuAction::Delete, renamed);
+        settle_remote(&mut workbench, |workbench| workbench.confirm.is_some());
+        workbench.resolve_delete(Choice::Discard);
+        settle_remote(&mut workbench, |workbench| {
+            !workbench.tree.rows().iter().any(|row| row.name == RENAMED)
+        });
+
+        let (replacement, replacement_control) = crate::fs::backend::tests::widget_fixture();
+        replacement_control.replace(FILE, "replacement\n");
+        workbench.open_workbench_path(&file, super::OpenPurpose::Open);
+        workbench.bind_workspace(replacement.clone()).unwrap();
+        settle_remote(&mut workbench, |workbench| {
+            workbench.editor.tabs().is_empty() && !workbench.tree.rows().is_empty()
+        });
+        settle_remote(&mut workbench, |workbench| workbench.scm.is_repository());
+        workbench.sidebar = SidebarView::SourceControl;
+        workbench.scm.select(Section::Unstaged, Some(0));
+        workbench.open_diff();
+        settle_remote(&mut workbench, |workbench| {
+            workbench
+                .editor
+                .active()
+                .is_some_and(|tab| tab.diff_rows().is_some())
+        });
+        let frame = draw(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        assert!(frame.contains("scm-head"));
+        assert!(!frame.contains("test-authority"));
+        assert!(!frame.contains("test-anchor"));
+        assert!(replacement_control.scm_calls() >= 6);
+
+        assert_eq!(crate::LocalFilesystem::call_count(), 0);
     }
 }

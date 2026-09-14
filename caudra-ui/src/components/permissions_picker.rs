@@ -268,6 +268,8 @@ fn entry(record: PermissionRuleRecord) -> PermissionEntry {
         PermissionSubject::Native { contract, .. } => contract.clone(),
         PermissionSubject::Lua { plugin, tool, .. } => format!("{plugin}:{tool}"),
         PermissionSubject::Mcp { server, tool, .. } => format!("{server}.{tool}"),
+        PermissionSubject::RemoteWorkcell { tool, .. } => format!("remote.{tool}"),
+        PermissionSubject::RemoteNative { owner, .. } => format!("remote.{owner}"),
         PermissionSubject::UnknownLegacy { identity } => identity.clone(),
     };
     let command_patterns: Vec<_> = record

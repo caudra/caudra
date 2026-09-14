@@ -7,7 +7,10 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+use caudra_workspace::WorkspacePath;
 use ignore::{DirEntry, WalkBuilder};
+
+use super::backend::{ResourceEntry, WorkbenchPath};
 
 pub(crate) const GIT_DIR: &str = ".git";
 /// What joins the names of folders drawn on one row. A label rather than a
@@ -58,7 +61,8 @@ impl GitMark {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Row {
-    pub path: PathBuf,
+    pub path: WorkbenchPath,
+    pub resource: Option<ResourceEntry>,
     pub name: String,
     pub depth: usize,
     pub kind: EntryKind,
@@ -78,28 +82,42 @@ impl Row {
 
 #[derive(Debug)]
 struct Node {
-    path: PathBuf,
+    path: WorkbenchPath,
+    resource: Option<ResourceEntry>,
     name: String,
     kind: EntryKind,
     ignored: bool,
     children: Option<Vec<Node>>,
 }
 
-#[derive(Default)]
 pub struct Tree {
-    root: PathBuf,
+    root: WorkbenchPath,
     nodes: Vec<Node>,
-    expanded: HashSet<PathBuf>,
+    expanded: HashSet<WorkbenchPath>,
     show_hidden: bool,
     rows: Vec<Row>,
     selected: usize,
     scroll: usize,
 }
 
+impl Default for Tree {
+    fn default() -> Self {
+        Self {
+            root: WorkbenchPath::Local(PathBuf::new()),
+            nodes: Vec::new(),
+            expanded: HashSet::new(),
+            show_hidden: false,
+            rows: Vec::new(),
+            selected: 0,
+            scroll: 0,
+        }
+    }
+}
+
 impl Tree {
     pub fn new(root: &Path, show_hidden: bool) -> Self {
         let mut tree = Self {
-            root: root.to_path_buf(),
+            root: WorkbenchPath::Local(root.to_path_buf()),
             nodes: Vec::new(),
             expanded: HashSet::new(),
             show_hidden,
@@ -109,6 +127,28 @@ impl Tree {
         };
         tree.reload();
         tree
+    }
+
+    pub fn remote(root: WorkbenchPath, show_hidden: bool) -> Self {
+        Self {
+            root,
+            show_hidden,
+            ..Self::default()
+        }
+    }
+
+    pub fn replace_remote(&mut self, entries: Vec<ResourceEntry>) {
+        let selected = self.selected().map(|row| row.path.clone());
+        self.nodes = remote_children(&self.root, &entries);
+        self.expanded.retain(|path| {
+            entries.iter().any(|entry| {
+                entry.path == *path && entry.kind == caudra_workspace::ResourceKind::Directory
+            })
+        });
+        self.rebuild_rows();
+        if let Some(path) = selected {
+            self.select_workbench_path(&path);
+        }
     }
 
     pub fn rows(&self) -> &[Row] {
@@ -130,22 +170,27 @@ impl Tree {
     pub fn set_show_hidden(&mut self, show_hidden: bool) {
         if self.show_hidden != show_hidden {
             self.show_hidden = show_hidden;
-            self.reload();
+            if self.root.local().is_some() {
+                self.reload();
+            }
         }
     }
 
     /// Rereads every directory currently expanded, keeping the selection on the
     /// same path when it survived.
     pub fn reload(&mut self) {
+        let Some(root) = self.root.local().map(Path::to_path_buf) else {
+            return;
+        };
         let selected = self.selected().map(|row| row.path.clone());
-        self.nodes = read_dir(&self.root, self.show_hidden);
-        let expanded: Vec<PathBuf> = self.expanded.iter().cloned().collect();
+        self.nodes = read_dir(&root, self.show_hidden);
+        let expanded: Vec<WorkbenchPath> = self.expanded.iter().cloned().collect();
         for path in expanded {
             self.load_children(&path);
         }
         self.rebuild_rows();
         if let Some(path) = selected {
-            self.select_path(&path);
+            self.select_workbench_path(&path);
         }
     }
 
@@ -174,19 +219,54 @@ impl Tree {
     /// Expands every ancestor of `path` and lands the cursor on it, which is
     /// how a quick-open or a search hit reveals its file in the tree.
     pub fn reveal(&mut self, path: &Path) {
-        let Ok(relative) = path.strip_prefix(&self.root) else {
-            return;
+        self.reveal_workbench_path(&WorkbenchPath::Local(path.to_path_buf()));
+    }
+
+    pub fn reveal_workbench_path(&mut self, path: &WorkbenchPath) {
+        let components = match (path, &self.root) {
+            (WorkbenchPath::Local(path), WorkbenchPath::Local(root)) => {
+                let Ok(relative) = path.strip_prefix(root) else {
+                    return;
+                };
+                relative
+                    .components()
+                    .map(|component| component.as_os_str().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+            }
+            (WorkbenchPath::Remote(path), WorkbenchPath::Remote(root)) => {
+                let relative = if root.is_root() {
+                    path.as_str()
+                } else {
+                    let Some(relative) = path
+                        .as_str()
+                        .strip_prefix(root.as_str())
+                        .and_then(|path| path.strip_prefix('/'))
+                    else {
+                        return;
+                    };
+                    relative
+                };
+                relative.split('/').map(str::to_owned).collect()
+            }
+            _ => return,
         };
         let mut current = self.root.clone();
-        for component in relative.components() {
-            current.push(component);
-            if current != path {
+        for component in components {
+            let Ok(joined) = current.join(&component) else {
+                return;
+            };
+            current = joined;
+            if &current != path {
                 self.expanded.insert(current.clone());
                 self.load_children(&current);
             }
         }
         self.rebuild_rows();
-        self.select_path(path);
+        self.select_workbench_path(path);
+    }
+
+    pub fn resource(&self, path: &WorkbenchPath) -> Option<&ResourceEntry> {
+        find_node(&self.nodes, path)?.resource.as_ref()
     }
 
     /// Expands or collapses a directory. Reports whether anything moved, so a
@@ -206,7 +286,7 @@ impl Tree {
             self.load_children(&path);
         }
         self.rebuild_rows();
-        self.select_path(&path);
+        self.select_workbench_path(&path);
         true
     }
 
@@ -220,11 +300,13 @@ impl Tree {
         let Some(path) = selected else {
             return;
         };
-        let showing = path
-            .ancestors()
-            .find(|ancestor| self.rows.iter().any(|row| row.path == *ancestor));
-        if let Some(ancestor) = showing {
-            self.select_path(ancestor);
+        let mut showing = Some(path);
+        while let Some(candidate) = showing {
+            if self.rows.iter().any(|row| row.path == candidate) {
+                self.select_workbench_path(&candidate);
+                break;
+            }
+            showing = candidate.parent();
         }
     }
 
@@ -238,11 +320,11 @@ impl Tree {
             self.toggle_selected();
             return;
         }
-        let Some(parent) = row.path.parent().map(Path::to_path_buf) else {
+        let Some(parent) = row.path.parent() else {
             return;
         };
         if parent != self.root {
-            self.select_path(&parent);
+            self.select_workbench_path(&parent);
         }
     }
 
@@ -255,17 +337,39 @@ impl Tree {
         under: &dyn Fn(&Path) -> Option<GitMark>,
     ) {
         for row in &mut self.rows {
+            let Some(path) = row.path.local() else {
+                row.git = None;
+                continue;
+            };
             row.git = match (row.is_dir(), row.expanded) {
                 (true, true) => None,
-                (true, false) => under(&row.path),
-                (false, _) => marks(&row.path),
+                (true, false) => under(path),
+                (false, _) => marks(path),
+            };
+        }
+    }
+
+    pub fn apply_remote_git(
+        &mut self,
+        marks: &dyn Fn(&WorkspacePath) -> Option<GitMark>,
+        under: &dyn Fn(&WorkspacePath) -> Option<GitMark>,
+    ) {
+        for row in &mut self.rows {
+            let Some(path) = row.path.remote() else {
+                row.git = None;
+                continue;
+            };
+            row.git = match (row.is_dir(), row.expanded) {
+                (true, true) => None,
+                (true, false) => under(path),
+                (false, _) => marks(path),
             };
         }
     }
 
     pub fn set_agent_touched(&mut self, touched: &HashSet<PathBuf>) {
         for row in &mut self.rows {
-            row.agent_touched = touched.contains(&row.path);
+            row.agent_touched = row.path.local().is_some_and(|path| touched.contains(path));
         }
     }
 
@@ -292,19 +396,22 @@ impl Tree {
         self.scroll = top.min(self.rows.len().saturating_sub(viewport));
     }
 
-    fn select_path(&mut self, path: &Path) {
-        if let Some(index) = self.rows.iter().position(|row| row.path == path) {
+    fn select_workbench_path(&mut self, path: &WorkbenchPath) {
+        if let Some(index) = self.rows.iter().position(|row| &row.path == path) {
             self.selected = index;
         } else {
             self.selected = self.selected.min(self.rows.len().saturating_sub(1));
         }
     }
 
-    fn collapse_descendants(&mut self, path: &Path) {
+    fn collapse_descendants(&mut self, path: &WorkbenchPath) {
         self.expanded.retain(|open| !open.starts_with(path));
     }
 
-    fn load_children(&mut self, path: &Path) {
+    fn load_children(&mut self, path: &WorkbenchPath) {
+        let Some(local_path) = path.local() else {
+            return;
+        };
         let show_hidden = self.show_hidden;
         let Some(node) = find_node_mut(&mut self.nodes, path) else {
             return;
@@ -312,7 +419,7 @@ impl Tree {
         if node.kind != EntryKind::Directory || node.children.is_some() {
             return;
         }
-        node.children = Some(read_dir(path, show_hidden));
+        node.children = Some(read_dir(local_path, show_hidden));
     }
 
     fn rebuild_rows(&mut self) {
@@ -330,7 +437,7 @@ fn flatten(
     nodes: &[Node],
     depth: usize,
     ignored: bool,
-    expanded: &HashSet<PathBuf>,
+    expanded: &HashSet<WorkbenchPath>,
     out: &mut Vec<Row>,
 ) {
     for node in nodes {
@@ -338,6 +445,7 @@ fn flatten(
         let ignored = ignored || node.ignored;
         out.push(Row {
             path: node.path.clone(),
+            resource: node.resource.clone(),
             name: node.name.clone(),
             depth,
             kind: node.kind,
@@ -352,14 +460,29 @@ fn flatten(
     }
 }
 
-fn find_node_mut<'a>(nodes: &'a mut [Node], path: &Path) -> Option<&'a mut Node> {
+fn find_node_mut<'a>(nodes: &'a mut [Node], path: &WorkbenchPath) -> Option<&'a mut Node> {
     for node in nodes {
-        if node.path == path {
+        if &node.path == path {
             return Some(node);
         }
         if path.starts_with(&node.path)
             && let Some(children) = node.children.as_mut()
             && let Some(found) = find_node_mut(children, path)
+        {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn find_node<'a>(nodes: &'a [Node], path: &WorkbenchPath) -> Option<&'a Node> {
+    for node in nodes {
+        if &node.path == path {
+            return Some(node);
+        }
+        if path.starts_with(&node.path)
+            && let Some(children) = node.children.as_ref()
+            && let Some(found) = find_node(children, path)
         {
             return Some(found);
         }
@@ -388,7 +511,8 @@ fn walk(dir: &Path, show_hidden: bool, git: bool) -> impl Iterator<Item = DirEnt
 fn node_of(entry: &DirEntry, ignored: bool) -> Node {
     Node {
         ignored,
-        path: entry.path().to_path_buf(),
+        path: WorkbenchPath::Local(entry.path().to_path_buf()),
+        resource: None,
         name: entry.file_name().to_string_lossy().into_owned(),
         kind: match entry.file_type().is_some_and(|kind| kind.is_dir()) {
             true => EntryKind::Directory,
@@ -406,7 +530,10 @@ fn compact(node: Node, show_hidden: bool) -> Node {
     if node.kind != EntryKind::Directory {
         return node;
     }
-    let Some(only) = only_child(&node.path, show_hidden) else {
+    let Some(path) = node.path.local() else {
+        return node;
+    };
+    let Some(only) = only_child(path, show_hidden) else {
         return node;
     };
     if only.kind != EntryKind::Directory {
@@ -448,6 +575,36 @@ fn read_dir(dir: &Path, show_hidden: bool) -> Vec<Node> {
             )
         })
         .collect();
+    nodes.sort_by(|a, b| {
+        b.kind
+            .eq(&EntryKind::Directory)
+            .cmp(&a.kind.eq(&EntryKind::Directory))
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    nodes
+}
+
+fn remote_children(parent: &WorkbenchPath, entries: &[ResourceEntry]) -> Vec<Node> {
+    let mut nodes = entries
+        .iter()
+        .filter(|entry| entry.path.parent().as_ref() == Some(parent))
+        .map(|entry| {
+            let kind = match entry.kind {
+                caudra_workspace::ResourceKind::Directory => EntryKind::Directory,
+                _ => EntryKind::File,
+            };
+            Node {
+                path: entry.path.clone(),
+                resource: Some(entry.clone()),
+                name: entry.path.file_name(),
+                kind,
+                ignored: false,
+                children: (kind == EntryKind::Directory)
+                    .then(|| remote_children(&entry.path, entries)),
+            }
+        })
+        .collect::<Vec<_>>();
     nodes.sort_by(|a, b| {
         b.kind
             .eq(&EntryKind::Directory)
@@ -616,7 +773,7 @@ mod tests {
         tree.reveal(&deep);
 
         assert_eq!(
-            tree.selected().map(|row| row.path.as_path()),
+            tree.selected().and_then(|row| row.path.local()),
             Some(deep.as_path()),
             "{REVEALED}"
         );

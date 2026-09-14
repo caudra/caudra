@@ -4,7 +4,8 @@
 //! reaches outside its own state leaves as one of these.
 
 use std::ops::RangeInclusive;
-use std::path::PathBuf;
+
+use crate::fs::backend::WorkbenchPath;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkbenchAction {
@@ -19,7 +20,7 @@ pub enum WorkbenchAction {
     /// is relative to the project root, and the host owns the spelling so the
     /// workbench never has to keep a copy of the composer's mention syntax.
     SendToComposer {
-        path: PathBuf,
+        path: WorkbenchPath,
         lines: Option<RangeInclusive<usize>>,
     },
     /// Put text on the system clipboard.

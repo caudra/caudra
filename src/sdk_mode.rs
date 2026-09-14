@@ -10,7 +10,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{self, BufRead, Write};
 use std::mem;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -35,13 +35,17 @@ use caudra_providers::{
     TokenUsage, add_cost,
 };
 use caudra_storage::id::SessionRef;
+use caudra_storage::local_documents::LocalDocumentStore;
 use caudra_storage::permission_state::PermissionRuleRecord;
-use caudra_storage::sessions::{SessionError, SessionLease};
+use caudra_storage::sessions::{SessionError, SessionLease, StoredMode, StoredPlanTarget};
 use caudra_storage::tool_outputs::{ToolOutputRef, ToolOutputStore};
+use caudra_storage::workspace_binding::StoredWorkspaceBinding;
 use caudra_storage::{StateDir, StorageError};
 use caudra_workflow::{
     LaunchRequest, WorkflowError, WorkflowEvent, WorkflowRequest, WorkflowResponse,
 };
+use caudra_workspace::PlanRef;
+use caudra_workspace::WorkspaceSession;
 use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
 use flume::{Receiver, Sender};
@@ -570,6 +574,25 @@ impl SdkWriter {
             },
         }))
     }
+
+    fn emit_direct_command_result(
+        &self,
+        output: caudra_agent::headless::RemoteCommandOutput,
+        duration_ms: u128,
+    ) -> Result<()> {
+        self.emit(WireInner::Result(ResultPayload {
+            subtype: if output.is_error { "error" } else { "success" },
+            is_error: output.is_error,
+            duration_ms,
+            duration_api_ms: 0,
+            num_turns: 0,
+            result: output.output,
+            total_cost_usd: 0.0,
+            subscription_cost_usd: 0.0,
+            usage: TokenUsage::default(),
+            permission_denials: Vec::new(),
+        }))
+    }
 }
 
 pub struct SdkParams {
@@ -584,6 +607,12 @@ pub struct SdkParams {
     pub thinking: ThinkingConfig,
     pub model_policy: Arc<ModelPolicy>,
     pub plugin_rules: Arc<PluginRuleStore>,
+    pub workspace_binding: Option<StoredWorkspaceBinding>,
+    pub remote_environment: Option<headless::RemoteEnvironment>,
+    pub workspace_session: Option<WorkspaceSession>,
+    pub remote_project_context:
+        Option<Arc<caudra_agent::remote_project_context::RemoteProjectContext>>,
+    pub local_documents: Option<Arc<LocalDocumentStore>>,
 }
 
 struct Shared {
@@ -592,6 +621,33 @@ struct Shared {
     turn_start: Instant,
     pending: HashMap<String, String>,
     resolved_permission_requests: HashSet<String>,
+    workspace_session: Option<WorkspaceSession>,
+    local_documents: Option<Arc<LocalDocumentStore>>,
+    session_id: SessionRef,
+    remote_plan: Option<PlanRef>,
+}
+
+impl Shared {
+    fn agent_mode(&mut self, cwd: &Path) -> AgentMode {
+        if self.permission_mode != PermissionMode::Plan || self.workspace_session.is_none() {
+            return self.permission_mode.agent_mode(cwd);
+        }
+        if self.remote_plan.is_none()
+            && let (Some(workspace), Some(store)) = (&self.workspace_session, &self.local_documents)
+        {
+            self.remote_plan = store
+                .create_plan(
+                    workspace.binding().project().key(),
+                    self.session_id.as_str(),
+                )
+                .map_err(|error| warn!(%error, "remote plan could not be created"))
+                .ok();
+        }
+        self.remote_plan
+            .clone()
+            .map(AgentMode::RemotePlan)
+            .unwrap_or(AgentMode::ReadOnly)
+    }
 }
 
 pub fn run(params: SdkParams) -> Result<()> {
@@ -607,16 +663,26 @@ pub fn run(params: SdkParams) -> Result<()> {
         thinking,
         model_policy,
         plugin_rules,
+        workspace_binding,
+        remote_environment,
+        workspace_session,
+        remote_project_context,
+        local_documents,
     } = params;
     cli.warn_ignored_flags();
     if let Some(max) = cli.max_turns {
         config.max_turns = Some(max);
     }
-    let requested_permission_mode =
+    let max_output_lines = config.max_output_lines;
+    let max_output_bytes = config.max_output_bytes;
+    let mut requested_permission_mode =
         PermissionMode::resolve(cli.permission_mode.as_deref(), cli.yolo);
     let system_prompt_override = cli.system_prompt.clone().filter(|s| !s.is_empty());
 
-    let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+    let cwd = remote_environment.as_ref().map_or_else(
+        || std::env::current_dir().unwrap_or_else(|_| ".".into()),
+        |environment| environment.cwd.clone().into(),
+    );
     let working_dir = cwd.to_string_lossy().into_owned();
     let ResolvedSession {
         session_id,
@@ -626,13 +692,36 @@ pub fn run(params: SdkParams) -> Result<()> {
         structured_permission_rules,
         session_yolo,
         stored_system_prompt_profile,
+        restored_plan,
+        restored_legacy_plan,
+        restored_plan_mode,
     } = resolve_session(
         &cli,
         &working_dir,
         &prompt_profiles,
         config.system_prompt_profile.as_deref(),
         system_prompt_override.is_some(),
+        workspace_binding.as_ref(),
     )?;
+    let restored_plan = restored_plan.or_else(|| {
+        restored_legacy_plan.as_deref().and_then(|path| {
+            workspace_session
+                .as_ref()
+                .zip(local_documents.as_ref())
+                .and_then(|(workspace, store)| {
+                    store
+                        .adopt_legacy_plan(
+                            workspace.binding().project().key(),
+                            session_id.as_str(),
+                            path,
+                        )
+                        .ok()
+                })
+        })
+    });
+    if restored_plan_mode && cli.permission_mode.is_none() && !cli.yolo {
+        requested_permission_mode = PermissionMode::Plan;
+    }
     crate::setup::report_session_start(
         if initial_history.is_empty() {
             caudra_otel::emit::START_FRESH
@@ -642,7 +731,11 @@ pub fn run(params: SdkParams) -> Result<()> {
         Some(&session_id),
     );
 
-    let (mcp_handle, mcp_config_errors) = smol::block_on(mcp::start_connected(&cwd));
+    let (mcp_handle, mcp_config_errors) = if remote_environment.is_some() {
+        smol::block_on(mcp::start_global_connected(&cwd))
+    } else {
+        smol::block_on(mcp::start_connected(&cwd))
+    };
     if !mcp_config_errors.is_empty() {
         eprintln!("MCP config error: {mcp_config_errors}");
     }
@@ -700,13 +793,17 @@ pub fn run(params: SdkParams) -> Result<()> {
         turn_start: Instant::now(),
         pending: HashMap::new(),
         resolved_permission_requests: HashSet::new(),
+        workspace_session: workspace_session.clone(),
+        local_documents: local_documents.clone(),
+        session_id: session_id.clone(),
+        remote_plan: restored_plan,
     }));
     // Workflow agents start under whatever mode the client last set, which
     // may be long after the prompt that launched their run.
     let workflow_mode = Arc::new({
         let shared = Arc::clone(&shared);
         let cwd = cwd.clone();
-        move || shared.lock().unwrap().permission_mode.agent_mode(&cwd)
+        move || shared.lock().unwrap().agent_mode(&cwd)
     });
     let handle = smol::block_on(headless::spawn_interactive(InteractiveParams {
         model,
@@ -734,8 +831,16 @@ pub fn run(params: SdkParams) -> Result<()> {
         plugin_rules,
         local_tools: Default::default(),
         workflow_mode: Some(workflow_mode),
+        workspace_binding: workspace_binding.clone(),
+        remote_environment: remote_environment.clone(),
+        workspace_session,
+        remote_project_context,
+        local_documents,
     }))
     .map_err(|error| eyre!(error))?;
+    if let Some(workspace) = handle.remote_workspace_session() {
+        shared.lock().unwrap().workspace_session = Some(workspace);
+    }
     let permission_mode =
         effective_permission_mode(requested_permission_mode, handle.permissions.is_yolo());
     shared.lock().unwrap().permission_mode = permission_mode;
@@ -811,19 +916,82 @@ pub fn run(params: SdkParams) -> Result<()> {
                 let content = user.message.content;
                 let prompt = content_text(&content).unwrap_or_else(|| content.to_string());
                 let images = content_images(&content);
+                if images.is_empty()
+                    && let Some(args) = prompt
+                        .strip_prefix("/remote")
+                        .filter(|args| args.is_empty() || args.starts_with(char::is_whitespace))
+                {
+                    match smol::block_on(handle.remote_control(args)) {
+                        Ok(status) => {
+                            writer.emit_system("remote", serde_json::json!({ "status": status }))?
+                        }
+                        Err(error) => writer
+                            .emit_system("remote_error", serde_json::json!({ "error": error }))?,
+                    }
+                    continue;
+                }
+                if remote_environment.is_some()
+                    && images.is_empty()
+                    && let Some(path) = remote_cd_path(&prompt)
+                {
+                    match smol::block_on(handle.change_remote_directory(path)) {
+                        Ok(cwd) => {
+                            shared.lock().unwrap().workspace_session =
+                                handle.remote_workspace_session();
+                            writer.emit_system("cwd", serde_json::json!({ "cwd": cwd }))?
+                        }
+                        Err(error) => writer
+                            .emit_system("cwd_error", serde_json::json!({ "error": error }))?,
+                    }
+                    continue;
+                }
+                if remote_environment.is_some()
+                    && images.is_empty()
+                    && let Some(command) = headless::direct_shell_command(&prompt)
+                {
+                    let started = Instant::now();
+                    let output = match (
+                        handle.remote_workspace_session(),
+                        handle.remote_workspace_baseline(),
+                    ) {
+                        (Some(workspace), Some(baseline)) => {
+                            smol::block_on(headless::execute_remote_command(
+                                &workspace,
+                                &baseline,
+                                command,
+                                &caudra_agent::CancelToken::none(),
+                                max_output_lines,
+                                max_output_bytes,
+                                |_| {},
+                            ))
+                        }
+                        _ => headless::RemoteCommandOutput {
+                            output: "Remote command execution is unavailable".into(),
+                            is_error: true,
+                        },
+                    };
+                    writer.emit_direct_command_result(output, started.elapsed().as_millis())?;
+                    continue;
+                }
                 let mode = {
                     let mut shared = shared.lock().unwrap();
                     shared.turn_start = Instant::now();
-                    shared.permission_mode
+                    shared.agent_mode(&cwd)
                 };
-                let mentions =
+                let mentions = if remote_environment.is_some() {
+                    caudra_agent::mentions::scan_remote(&prompt)
+                        .into_iter()
+                        .map(|(_, mention)| mention)
+                        .collect()
+                } else {
                     caudra_agent::mentions::scan(&prompt, |path| cwd.join(path).exists())
                         .into_iter()
                         .map(|(_, mention)| mention)
-                        .collect();
+                        .collect()
+                };
                 let input = AgentInput {
                     message: prompt,
-                    mode: mode.agent_mode(&cwd),
+                    mode,
                     images,
                     mentions,
                     preamble: Vec::new(),
@@ -888,6 +1056,18 @@ pub fn run(params: SdkParams) -> Result<()> {
     Ok(())
 }
 
+fn remote_cd_path(prompt: &str) -> Option<&str> {
+    let prompt = prompt.trim();
+    if prompt == "/cd" {
+        return Some(".");
+    }
+    prompt
+        .strip_prefix("/cd")
+        .filter(|rest| rest.starts_with(char::is_whitespace))
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+}
+
 struct ResolvedSession {
     session_id: SessionRef,
     session_lease: Arc<SessionLease>,
@@ -896,6 +1076,16 @@ struct ResolvedSession {
     structured_permission_rules: Vec<PermissionRuleRecord>,
     session_yolo: Option<bool>,
     stored_system_prompt_profile: Option<String>,
+    restored_plan: Option<PlanRef>,
+    restored_legacy_plan: Option<PathBuf>,
+    restored_plan_mode: bool,
+}
+
+fn restored_plan(session: &StoredSession) -> Option<PlanRef> {
+    match &session.meta.plan_target {
+        Some(StoredPlanTarget::PlanRef { reference }) => Some(reference.clone()),
+        _ => None,
+    }
 }
 
 fn session_permissions(
@@ -918,6 +1108,7 @@ fn resolve_session(
     prompt_profiles: &PromptProfileCatalog,
     configured_profile: Option<&str>,
     raw_prompt_override: bool,
+    workspace_binding: Option<&StoredWorkspaceBinding>,
 ) -> Result<ResolvedSession> {
     let storage = StateDir::resolve().context("resolve state dir")?;
     let cli_session_id = cli
@@ -941,6 +1132,12 @@ fn resolve_session(
         };
         let session = crate::setup::load_session(session_ref.id(), &storage)
             .map_err(|e| eyre!("load session {id}: {e}"))?;
+        if !cli.fork_session {
+            StoredWorkspaceBinding::validate_resume_identity(
+                session.workspace_binding(),
+                workspace_binding,
+            )?;
+        }
         let history = crate::setup::active_session_history(&session)
             .map_err(|e| eyre!("load active history for session {id}: {e}"))?;
         if cli.fork_session {
@@ -1013,9 +1210,15 @@ fn resolve_session(
                 std::iter::once(history.as_slice())
                     .chain(subagent_histories.values().map(Vec::as_slice)),
             )?;
-            if let Err(error) =
-                save_sdk_fork(&storage, &session, &target, &history, subagent_histories)
-            {
+            if let Err(error) = save_sdk_fork(
+                &storage,
+                &session,
+                &target,
+                &history,
+                subagent_histories,
+                workspace_binding,
+                cwd,
+            ) {
                 let _ = ToolOutputStore::new(storage.clone()).delete_session(target.id());
                 return Err(error);
             }
@@ -1027,6 +1230,9 @@ fn resolve_session(
                 structured_permission_rules,
                 session_yolo,
                 stored_system_prompt_profile: session.meta.system_prompt_profile.clone(),
+                restored_plan: None,
+                restored_legacy_plan: None,
+                restored_plan_mode: false,
             });
         }
 
@@ -1047,15 +1253,36 @@ fn resolve_session(
             structured_permission_rules,
             session_yolo,
             stored_system_prompt_profile: session.meta.system_prompt_profile.clone(),
+            restored_plan: restored_plan(&session),
+            restored_legacy_plan: session
+                .meta
+                .plan_target
+                .as_ref()
+                .and_then(|target| match target {
+                    StoredPlanTarget::LocalPath { path } => Some(PathBuf::from(path)),
+                    StoredPlanTarget::PlanRef { .. } => None,
+                })
+                .or_else(|| session.meta.plan_path.as_deref().map(PathBuf::from)),
+            restored_plan_mode: session.meta.mode == Some(StoredMode::Plan),
         });
     }
 
+    let summaries = if let Some(binding) = workspace_binding {
+        caudra_storage::sessions::SessionDatabase::open_state(&storage)?
+            .list_for_workspace_identity(binding)?
+    } else {
+        StoredSession::list(cwd, &storage)?
+    };
     if cli.continue_session
-        && let Some(summary) = StoredSession::list(cwd, &storage)?.into_iter().next()
+        && let Some(summary) = summaries.into_iter().next()
     {
         let session_ref = SessionRef::from(summary.id);
         let session_lease = Arc::new(SessionLease::acquire(&storage, summary.id)?);
         let session = crate::setup::load_session(summary.id, &storage)?;
+        StoredWorkspaceBinding::validate_resume_identity(
+            session.workspace_binding(),
+            workspace_binding,
+        )?;
         let history = crate::setup::active_session_history(&session)?;
         let (structured_permission_rules, session_yolo) = session_permissions(&session, false);
         return Ok(ResolvedSession {
@@ -1066,6 +1293,17 @@ fn resolve_session(
             structured_permission_rules,
             session_yolo,
             stored_system_prompt_profile: session.meta.system_prompt_profile.clone(),
+            restored_plan: restored_plan(&session),
+            restored_legacy_plan: session
+                .meta
+                .plan_target
+                .as_ref()
+                .and_then(|target| match target {
+                    StoredPlanTarget::LocalPath { path } => Some(PathBuf::from(path)),
+                    StoredPlanTarget::PlanRef { .. } => None,
+                })
+                .or_else(|| session.meta.plan_path.as_deref().map(PathBuf::from)),
+            restored_plan_mode: session.meta.mode == Some(StoredMode::Plan),
         });
     }
 
@@ -1079,7 +1317,22 @@ fn resolve_session(
         structured_permission_rules: Vec::new(),
         session_yolo: None,
         stored_system_prompt_profile: None,
+        restored_plan: None,
+        restored_legacy_plan: None,
+        restored_plan_mode: false,
     })
+}
+
+#[cfg(test)]
+fn validate_workspace_binding(
+    session: &StoredSession,
+    expected: Option<&StoredWorkspaceBinding>,
+    allow_rebind: bool,
+) -> Result<()> {
+    if !allow_rebind {
+        StoredWorkspaceBinding::validate_resume(session.workspace_binding(), expected)?;
+    }
+    Ok(())
 }
 
 fn resolve_prompt_profile(
@@ -1165,8 +1418,13 @@ fn save_sdk_fork(
     target: &SessionRef,
     history: &[HistoryItem],
     subagent_histories: HashMap<String, Vec<HistoryItem>>,
+    workspace_binding: Option<&StoredWorkspaceBinding>,
+    cwd: &str,
 ) -> Result<()> {
-    let mut fork = StoredSession::new(&source.model, &source.cwd);
+    let mut fork = workspace_binding.map_or_else(
+        || StoredSession::new(&source.model, cwd),
+        |binding| StoredSession::new_with_workspace(&source.model, cwd, binding.clone()),
+    );
     fork.id = target.id();
     fork.meta.system_prompt_profile = source.meta.system_prompt_profile.clone();
     fork.replace_messages(history.to_vec());
@@ -2126,6 +2384,8 @@ mod tests {
 
     const CAUDRA_REQUEST_ID: &str = "caudra-permission-1";
     const SECOND_CAUDRA_REQUEST_ID: &str = "caudra-permission-2";
+    const WORKSPACE_REBIND_REQUIRED: &str =
+        "session workspace identity changed; fork or explicitly rebind the session";
 
     fn permission_manager() -> Arc<PermissionManager> {
         Arc::new(PermissionManager::new_nonpersistent(
@@ -2142,6 +2402,10 @@ mod tests {
             turn_start: Instant::now(),
             pending,
             resolved_permission_requests: HashSet::new(),
+            workspace_session: None,
+            local_documents: None,
+            session_id: SessionRef::generate(),
+            remote_plan: None,
         }))
     }
 
@@ -2420,6 +2684,9 @@ mod tests {
         source.meta.system_prompt_profile = Some("review".into());
         source.meta.structured_permission_rules = vec![stored_structured_rule()];
         source.meta.yolo = Some(true);
+        source.meta.plan_target = Some(StoredPlanTarget::PlanRef {
+            reference: caudra_workspace::PlanRef::new(format!("plan-{}", "a".repeat(32))).unwrap(),
+        });
         let target = SessionRef::generate();
         let history = History::new(vec![
             Message::user("main".into()),
@@ -2451,6 +2718,8 @@ mod tests {
             &target,
             &history,
             HashMap::from([("task-1".into(), subagent.clone())]),
+            None,
+            "/fork-target",
         )
         .unwrap();
 
@@ -2460,6 +2729,9 @@ mod tests {
         assert!(loaded.tool_outputs().contains_key("batch-call"));
         assert!(loaded.meta.structured_permission_rules.is_empty());
         assert_eq!(loaded.meta.yolo, None);
+        assert_eq!(loaded.cwd, "/fork-target");
+        assert!(loaded.meta.plan_target.is_none());
+        assert!(loaded.meta.pending_revert.is_none());
         assert_eq!(loaded.meta.system_prompt_profile.as_deref(), Some("review"));
         assert!(ensure_fork_target_available(&storage, &target).is_err());
         assert!(ensure_fork_target_available(&storage, &SessionRef::generate()).is_ok());
@@ -2541,6 +2813,50 @@ mod tests {
             (session.meta.structured_permission_rules.clone(), Some(true))
         );
         assert_eq!(forked, (Vec::new(), None));
+    }
+
+    #[test]
+    fn remote_session_mismatch_fails_before_permissions_can_be_reused() {
+        let mut session = StoredSession::new("provider/model", "/first");
+        session.meta.yolo = Some(true);
+        let expected = StoredWorkspaceBinding::local_from_cwd("/second");
+        let expected = serde_json::from_str::<StoredWorkspaceBinding>(
+            &serde_json::to_string(&expected)
+                .unwrap()
+                .replace("caudra:local:v1", "https://remote.example"),
+        )
+        .unwrap();
+
+        let error = validate_workspace_binding(&session, Some(&expected), false).unwrap_err();
+
+        assert_eq!(error.to_string(), WORKSPACE_REBIND_REQUIRED);
+    }
+
+    #[test]
+    fn remote_session_mismatch_can_be_explicitly_rebound_by_forking() {
+        let session = StoredSession::new("provider/model", "/first");
+        let expected = StoredWorkspaceBinding::local_from_cwd("/second");
+
+        validate_workspace_binding(&session, Some(&expected), true).unwrap();
+    }
+
+    #[test]
+    fn sdk_resume_remote_to_embedded_requires_explicit_fork() {
+        let local = StoredWorkspaceBinding::local_from_cwd("/remote");
+        let remote = serde_json::from_str::<StoredWorkspaceBinding>(
+            &serde_json::to_string(&local)
+                .unwrap()
+                .replace("caudra:local:v1", "https://remote.example"),
+        )
+        .unwrap();
+        let session = StoredSession::new_with_workspace("provider/model", "/remote", remote);
+        assert_eq!(
+            validate_workspace_binding(&session, None, false)
+                .unwrap_err()
+                .to_string(),
+            WORKSPACE_REBIND_REQUIRED
+        );
+        validate_workspace_binding(&session, None, true).unwrap();
     }
 
     #[test]
@@ -2914,6 +3230,31 @@ mod tests {
         assert_eq!(json["subtype"], "success");
         assert_eq!(json["num_turns"], 1);
         assert!(json.get("session_id").is_some());
+    }
+
+    #[test]
+    fn direct_remote_command_emits_a_zero_turn_result() {
+        let (out_tx, out_rx) = flume::unbounded();
+        let writer = SdkWriter {
+            session_id: SessionRef::generate(),
+            out_tx,
+        };
+        writer
+            .emit_direct_command_result(
+                headless::RemoteCommandOutput {
+                    output: "remote output".into(),
+                    is_error: false,
+                },
+                12,
+            )
+            .unwrap();
+        let json: Value = serde_json::from_str(&out_rx.recv().unwrap()).unwrap();
+
+        assert_eq!(json["type"], "result");
+        assert_eq!(json["subtype"], "success");
+        assert_eq!(json["num_turns"], 0);
+        assert_eq!(json["result"], "remote output");
+        assert_eq!(json["duration_ms"], 12);
     }
 
     #[test]

@@ -11,13 +11,14 @@ use caudra_config::{
     PermissionsConfig, ToolKey,
 };
 use caudra_storage::permission_config_trust::{
-    is_project_trusted as is_permission_config_trusted,
-    revoke_project_trust as revoke_project_permission_config,
-    trust_project as trust_project_permission_config,
+    is_project_trusted as is_permission_config_trusted, is_remote_asset_trusted,
+    revoke_project_trust as revoke_project_permission_config, revoke_remote_asset_trust,
+    trust_project as trust_project_permission_config, trust_remote_asset,
 };
 use caudra_storage::permission_state::{PermissionState, validate_conversation_record};
 use caudra_storage::sessions::SESSIONS_DB_FILE;
 use caudra_storage::{StateDir, now_epoch};
+use caudra_workspace::ProjectAssetTrustKey;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tracing::{info, warn};
@@ -413,6 +414,29 @@ struct ConfiguredPolicy {
     review_candidates: Vec<PermissionReviewCandidate>,
     default: DefaultEffect,
     tool_defaults: HashMap<ToolKey, DefaultEffect>,
+    remote_allow_rules: Vec<PermissionRule>,
+    remote_allow_defaults: HashMap<ToolKey, DefaultEffect>,
+    remote_default_allow: bool,
+    remote_restrictive_rules: Vec<PermissionRule>,
+    remote_restrictive_defaults: HashMap<ToolKey, DefaultEffect>,
+    remote_restrictive_default: Option<DefaultEffect>,
+    remote_policy_invalid: bool,
+    remote_permission_asset: Option<(ProjectAssetTrustKey, String)>,
+    remote_review_candidates: Vec<PermissionReviewCandidate>,
+}
+
+impl ConfiguredPolicy {
+    fn clear_remote(&mut self, fail_closed: bool) {
+        self.remote_restrictive_rules.clear();
+        self.remote_restrictive_defaults.clear();
+        self.remote_restrictive_default = fail_closed.then_some(DefaultEffect::Deny);
+        self.remote_allow_rules.clear();
+        self.remote_allow_defaults.clear();
+        self.remote_default_allow = false;
+        self.remote_review_candidates.clear();
+        self.remote_permission_asset = None;
+        self.remote_policy_invalid = fail_closed;
+    }
 }
 
 #[derive(Clone)]
@@ -668,6 +692,15 @@ fn configured_policy(
         review_candidates: config.review_candidates,
         default: config.default,
         tool_defaults: config.tool_defaults,
+        remote_allow_rules: Vec::new(),
+        remote_allow_defaults: HashMap::new(),
+        remote_default_allow: false,
+        remote_restrictive_rules: Vec::new(),
+        remote_restrictive_defaults: HashMap::new(),
+        remote_restrictive_default: None,
+        remote_policy_invalid: false,
+        remote_permission_asset: None,
+        remote_review_candidates: Vec::new(),
     }
 }
 
@@ -998,6 +1031,151 @@ impl PermissionManager {
         };
     }
 
+    pub fn replace_remote_permission_asset(
+        &self,
+        asset: Option<&crate::remote_project_context::RemotePermissionAsset>,
+    ) -> Result<(), PermissionPolicyError> {
+        self.replace_remote_permission_asset_after(asset, || Ok(()))
+            .map_err(|error| {
+                self.invalidate_remote_permission_asset();
+                PermissionPolicyError(error)
+            })
+    }
+
+    pub fn replace_remote_permission_asset_after(
+        &self,
+        asset: Option<&crate::remote_project_context::RemotePermissionAsset>,
+        before_install: impl FnOnce() -> Result<(), String>,
+    ) -> Result<(), String> {
+        let mut current = self
+            .configured
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut configured = current.clone();
+        configured.clear_remote(asset.is_some());
+        let Some(asset) = asset else {
+            before_install()?;
+            *current = configured;
+            return Ok(());
+        };
+        let trust_key = asset
+            .source
+            .trust_key()
+            .map_err(|error| error.to_string())?;
+        configured.remote_restrictive_rules = asset.declarations.restrictive_rules.clone();
+        configured.remote_restrictive_defaults = asset.declarations.restrictive_defaults.clone();
+        configured.remote_restrictive_default = asset
+            .declarations
+            .default
+            .filter(|effect| *effect != DefaultEffect::Allow);
+        configured.remote_allow_rules = asset.declarations.allow_rules.clone();
+        configured.remote_allow_defaults = asset.declarations.allow_defaults.clone();
+        configured.remote_default_allow = asset.declarations.default == Some(DefaultEffect::Allow);
+        configured.remote_review_candidates = asset
+            .declarations
+            .allow_rules
+            .iter()
+            .map(|rule| PermissionReviewCandidate {
+                source: caudra_config::PermissionSource::Project,
+                kind: caudra_config::PermissionReviewKind::Rule,
+                tool: Some(rule.tool.clone()),
+                scope: rule.scope.clone(),
+            })
+            .chain(
+                asset
+                    .declarations
+                    .allow_defaults
+                    .keys()
+                    .cloned()
+                    .map(|tool| PermissionReviewCandidate {
+                        source: caudra_config::PermissionSource::Project,
+                        kind: caudra_config::PermissionReviewKind::Default,
+                        tool: Some(tool),
+                        scope: None,
+                    }),
+            )
+            .chain(
+                configured
+                    .remote_default_allow
+                    .then_some(PermissionReviewCandidate {
+                        source: caudra_config::PermissionSource::Project,
+                        kind: caudra_config::PermissionReviewKind::Default,
+                        tool: None,
+                        scope: None,
+                    }),
+            )
+            .collect();
+        configured.remote_permission_asset = (!configured.remote_review_candidates.is_empty())
+            .then(|| (trust_key, asset.digest.clone()));
+        configured.remote_policy_invalid = false;
+        before_install()?;
+        *current = configured;
+        Ok(())
+    }
+
+    pub fn invalidate_remote_permission_asset(&self) {
+        let mut configured = self
+            .configured
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        configured.clear_remote(true);
+    }
+
+    fn remote_restrictive_default(&self, tool: &ToolKey) -> Option<DefaultEffect> {
+        let configured = self.configured();
+        configured
+            .remote_restrictive_defaults
+            .get(tool)
+            .copied()
+            .or_else(|| match tool {
+                ToolKey::McpTool { server, .. } => configured
+                    .remote_restrictive_defaults
+                    .get(&ToolKey::McpServer {
+                        server: server.clone(),
+                    })
+                    .copied(),
+                _ => None,
+            })
+            .or(configured.remote_restrictive_default)
+    }
+
+    fn remote_default_denies(&self, tool: &ToolKey, request: &PermissionRequest) -> bool {
+        if self.remote_restrictive_default(tool) != Some(DefaultEffect::Deny) {
+            return false;
+        }
+        let configured = self.configured();
+        if !self.remote_allows_active(&configured) {
+            return true;
+        }
+        let default_allows = configured
+            .remote_allow_defaults
+            .get(tool)
+            .copied()
+            .or_else(|| match tool {
+                ToolKey::McpTool { server, .. } => configured
+                    .remote_allow_defaults
+                    .get(&ToolKey::McpServer {
+                        server: server.clone(),
+                    })
+                    .copied(),
+                _ => None,
+            })
+            == Some(DefaultEffect::Allow)
+            || configured.remote_default_allow;
+        if default_allows {
+            false
+        } else {
+            !permission_rules_cover_request(
+                &configured
+                    .remote_allow_rules
+                    .iter()
+                    .filter_map(|rule| compile_configured_rule(rule, request))
+                    .collect::<Vec<_>>(),
+                request,
+            )
+        }
+    }
+
     /// Fresh manager for a new session runtime: shares config and builtin
     /// rules plus the current yolo state, but owns empty session rules so
     /// restoring one session never clobbers another's grants.
@@ -1204,8 +1382,12 @@ impl PermissionManager {
     }
 
     fn default_effect(&self, tool: &ToolKey) -> DefaultEffect {
+        if let Some(effect) = self.remote_restrictive_default(tool) {
+            return effect;
+        }
         let configured = self.configured();
-        configured
+        let remote_allows_active = self.remote_allows_active(&configured);
+        let effect = configured
             .tool_defaults
             .get(tool)
             .copied()
@@ -1221,7 +1403,30 @@ impl PermissionManager {
                     })
                     .copied()
             })
-            .unwrap_or(configured.default)
+            .unwrap_or(configured.default);
+        if effect != DefaultEffect::Prompt || !remote_allows_active {
+            return effect;
+        }
+        configured
+            .remote_allow_defaults
+            .get(tool)
+            .copied()
+            .or_else(|| match tool {
+                ToolKey::McpTool { server, .. } => configured
+                    .remote_allow_defaults
+                    .get(&ToolKey::McpServer {
+                        server: server.clone(),
+                    })
+                    .copied(),
+                _ => None,
+            })
+            .unwrap_or_else(|| {
+                if configured.remote_default_allow {
+                    DefaultEffect::Allow
+                } else {
+                    effect
+                }
+            })
     }
 
     /// The explicit toggle, so it also claims the session's intent: `/yolo` off
@@ -1333,17 +1538,38 @@ impl PermissionManager {
             })
     }
 
+    fn remote_allows_active(&self, configured: &ConfiguredPolicy) -> bool {
+        configured
+            .remote_permission_asset
+            .as_ref()
+            .zip(self.policy.as_ref())
+            .is_some_and(|((asset, digest), policy)| {
+                is_remote_asset_trusted(&policy.state_dir, asset, digest).unwrap_or_else(|error| {
+                    warn!(%error, "could not read remote permission config trust");
+                    false
+                })
+            })
+    }
+
     fn active_config_rules(&self) -> Vec<PermissionRule> {
         let project_allows_active = self.project_allows_active();
         let configured = self.configured();
+        let remote_allows_active = self.remote_allows_active(&configured);
         configured
             .rules
             .iter()
+            .chain(configured.remote_restrictive_rules.iter())
             .chain(
                 configured
                     .project_allow_rules
                     .iter()
                     .filter(move |_| project_allows_active),
+            )
+            .chain(
+                configured
+                    .remote_allow_rules
+                    .iter()
+                    .filter(move |_| remote_allows_active),
             )
             .cloned()
             .collect()
@@ -1352,23 +1578,35 @@ impl PermissionManager {
     pub fn needs_project_permission_config_trust(&self) -> bool {
         let project_allows_active = self.project_allows_active();
         let configured = self.configured();
-        configured.project_config_digest.is_some()
+        let remote_allows_active = self.remote_allows_active(&configured);
+        (configured.project_config_digest.is_some()
             && configured.project_config_root.is_some()
             && !project_allows_active
-            && self.project().canonical_project.as_ref() == configured.project_config_root.as_ref()
+            && self.project().canonical_project.as_ref() == configured.project_config_root.as_ref())
+            || (configured.remote_permission_asset.is_some() && !remote_allows_active)
     }
 
     pub fn project_permission_config_trusted(&self) -> bool {
         let project_allows_active = self.project_allows_active();
         let configured = self.configured();
-        configured.project_config_digest.is_some()
+        let remote_allows_active = self.remote_allows_active(&configured);
+        (configured.project_config_digest.is_some()
             && configured.project_config_root.is_some()
             && self.project().canonical_project.as_ref() == configured.project_config_root.as_ref()
-            && project_allows_active
+            && project_allows_active)
+            || (configured.remote_permission_asset.is_some() && remote_allows_active)
     }
 
     pub fn trust_project_permission_config(&self) -> Result<(), PermissionPolicyError> {
         let configured = self.configured();
+        if let Some((asset, digest)) = &configured.remote_permission_asset {
+            let policy = self
+                .policy
+                .as_ref()
+                .ok_or_else(|| PermissionPolicyError("persistent storage is disabled".into()))?;
+            return trust_remote_asset(&policy.state_dir, asset, digest)
+                .map_err(|error| PermissionPolicyError(error.to_string()));
+        }
         let digest = configured
             .project_config_digest
             .clone()
@@ -1393,6 +1631,14 @@ impl PermissionManager {
     }
 
     pub fn revoke_project_permission_config_trust(&self) -> Result<(), PermissionPolicyError> {
+        if let Some((asset, _)) = &self.configured().remote_permission_asset {
+            let policy = self
+                .policy
+                .as_ref()
+                .ok_or_else(|| PermissionPolicyError("persistent storage is disabled".into()))?;
+            return revoke_remote_asset_trust(&policy.state_dir, asset)
+                .map_err(|error| PermissionPolicyError(error.to_string()));
+        }
         let project_config_root = self.configured().project_config_root.clone();
         let project = self.project();
         let canonical_project = project
@@ -1413,7 +1659,11 @@ impl PermissionManager {
     pub fn review_candidates(&self) -> Vec<PermissionReviewCandidate> {
         let project_allows_active = self.project_allows_active();
         let configured = self.configured();
+        let remote_allows_active = self.remote_allows_active(&configured);
         let mut candidates = configured.review_candidates.clone();
+        if !remote_allows_active {
+            candidates.extend(configured.remote_review_candidates.iter().cloned());
+        }
         if project_allows_active {
             candidates.retain(|candidate| {
                 candidate.source != caudra_config::PermissionSource::Project
@@ -1949,6 +2199,12 @@ impl PermissionManager {
                 warn!(%error, "structured permission policy failed closed");
                 deny(DECISION_SOURCE_RULE, Some(error.to_string()))
             })?;
+        if self.configured().remote_policy_invalid {
+            return Err(deny(
+                DECISION_SOURCE_RULE,
+                Some("remote permission policy is unavailable".into()),
+            ));
+        }
         if structured_rules
             .iter()
             .any(|policy| permission_rule_intersects_request(&policy.rule, &full_request))
@@ -1956,6 +2212,9 @@ impl PermissionManager {
             return Err(deny(DECISION_SOURCE_RULE, None));
         }
         let full = self.request_coverage(&full_request, &structured_rules, include_builtin_allows);
+        if self.remote_default_denies(tool, &full_request) {
+            return Err(deny(DECISION_SOURCE_RULE, None));
+        }
         if self.is_yolo() {
             return allowed(by_rule());
         }
@@ -2205,6 +2464,12 @@ fn subject_kind_and_contract(subject: &PermissionSubject) -> (&str, &str) {
         PermissionSubject::Mcp {
             server, contract, ..
         } => (server, contract),
+        PermissionSubject::RemoteWorkcell {
+            identity, contract, ..
+        } => (identity.authority.server_id(), contract),
+        PermissionSubject::RemoteNative {
+            owner, contract, ..
+        } => (owner, contract),
         PermissionSubject::UnknownLegacy { identity } => (identity, ""),
     }
 }
@@ -2384,6 +2649,8 @@ fn is_bound_shell_request(request: &PermissionRequest) -> bool {
         }
         PermissionSubject::Lua { .. }
         | PermissionSubject::Mcp { .. }
+        | PermissionSubject::RemoteWorkcell { .. }
+        | PermissionSubject::RemoteNative { .. }
         | PermissionSubject::UnknownLegacy { .. } => false,
     }
 }
@@ -2477,7 +2744,12 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
+    use crate::tools::PermissionIntent;
     use caudra_storage::sessions::SessionDatabase;
+    use caudra_workspace::{
+        AuthenticatedPrincipalId, AuthorityIdentity, ProjectIdentity, ProjectKey, ResourceId,
+        ResourceRevision, SourceTrustAnchor, WorkspacePath,
+    };
     use test_case::test_case;
 
     const PERMISSION_RULES_STATE_KEY: &str = "permission.rules";
@@ -2504,6 +2776,40 @@ mod tests {
             tool: ToolKey::native("bash"),
             scope: Some(scope.into()),
             effect: Effect::Deny,
+        }
+    }
+
+    fn remote_permission_asset(
+        revision: &str,
+        digest: &str,
+        allow_scope: &str,
+    ) -> crate::remote_project_context::RemotePermissionAsset {
+        let authority = AuthorityIdentity::new(
+            SourceTrustAnchor::new("https://workcell.example").unwrap(),
+            "server",
+            "workspace",
+            "generation",
+            "namespace",
+        )
+        .unwrap();
+        crate::remote_project_context::RemotePermissionAsset {
+            source: crate::remote_project_context::RemoteAssetIdentity {
+                principal: AuthenticatedPrincipalId::new(authority.clone(), "principal").unwrap(),
+                project: ProjectIdentity::new(
+                    authority.clone(),
+                    ProjectKey::new("project").unwrap(),
+                ),
+                authority,
+                path: WorkspacePath::new(".caudra/permissions.toml").unwrap(),
+                resource_id: ResourceId::new("permissions").unwrap(),
+                revision: ResourceRevision::new(revision).unwrap(),
+            },
+            digest: digest.into(),
+            declarations: crate::remote_project_context::RemotePermissionDeclarations {
+                restrictive_rules: vec![deny_rule("remote-denied")],
+                allow_rules: vec![allow_rule(allow_scope)],
+                ..Default::default()
+            },
         }
     }
 
@@ -2826,6 +3132,55 @@ mod tests {
             },
         );
         mark_confined(&mut request);
+
+        let coverage = coverage_with(&manager, &request, false, &builtin_structured_rules());
+        assert_eq!(covered_flags(&coverage), vec![false]);
+    }
+
+    #[test]
+    fn a_local_confined_read_never_covers_a_remote_resource() {
+        let manager = default_mgr();
+        let asset = remote_permission_asset(
+            "revision",
+            "4444444444444444444444444444444444444444444444444444444444444444",
+            "unused",
+        );
+        let identity = RemotePermissionIdentity {
+            authority: asset.source.authority.clone(),
+            principal: asset.source.principal.clone(),
+            project: asset.source.project.clone(),
+        };
+        let intent = PermissionIntent::new(
+            crate::tools::PermissionScopes::single("remote read".into()),
+            vec![PermissionResource {
+                kind: PermissionResourceKind::RemoteFile {
+                    identity: identity.clone(),
+                },
+                value: "root\u{1f}file".into(),
+                access: Some(PermissionResourceAccess::Read),
+                protected: false,
+                requires_prompt: false,
+                attributes: BTreeMap::from([(
+                    CONFINED_READ_ATTRIBUTE.into(),
+                    CONFINED_READ_VALUE.into(),
+                )]),
+            }],
+            PermissionRisk::Low,
+        )
+        .with_authority(PermissionAuthorityProfile::RemoteResource);
+        let request = PermissionRequest::from_intent_with_identity(
+            "remote-confined".into(),
+            ToolKey::native("file_read"),
+            &intent,
+            serde_json::json!({}),
+            Path::new("/tmp"),
+            PermissionSubject::RemoteNative {
+                identity,
+                owner: "caudra".into(),
+                contract: "view-image/v1".into(),
+            },
+            PermissionExecutorKind::Native,
+        );
 
         let coverage = coverage_with(&manager, &request, false, &builtin_structured_rules());
         assert_eq!(covered_flags(&coverage), vec![false]);
@@ -4813,6 +5168,136 @@ mod tests {
             assert!(denied_by_rule(&mgr, &denied));
             assert!(
                 enforce_shell_without_prompt(&mgr, &["rm -rf /"], false)
+                    .await
+                    .is_err()
+            );
+        });
+    }
+
+    #[test]
+    fn remote_policy_replacement_removes_authority_and_fails_closed() {
+        smol::block_on(async {
+            const FIRST_DIGEST: &str =
+                "1111111111111111111111111111111111111111111111111111111111111111";
+            const SECOND_DIGEST: &str =
+                "2222222222222222222222222222222222222222222222222222222222222222";
+            let temp = tempfile::tempdir().unwrap();
+            let manager = PermissionManager::new_persistent_in(
+                PermissionsConfig {
+                    yolo: true,
+                    ..Default::default()
+                },
+                temp.path().to_path_buf(),
+                Arc::default(),
+                StateDir::from_path(temp.path().join("state")),
+            );
+            let first = remote_permission_asset("revision-1", FIRST_DIGEST, "trusted-first");
+            manager
+                .replace_remote_permission_asset(Some(&first))
+                .unwrap();
+            manager.trust_project_permission_config().unwrap();
+            assert!(manager.active_policy().iter().any(|entry| {
+                entry.rule.scope.as_deref() == Some("trusted-first")
+                    && entry.rule.effect == Effect::Allow
+            }));
+
+            let second = remote_permission_asset("revision-2", SECOND_DIGEST, "untrusted-second");
+            const PERSISTENCE_FAILED: &str = "injected persistence failure";
+            assert_eq!(
+                manager
+                    .replace_remote_permission_asset_after(Some(&second), || Err(
+                        PERSISTENCE_FAILED.to_owned()
+                    ))
+                    .unwrap_err(),
+                PERSISTENCE_FAILED
+            );
+            assert!(
+                manager
+                    .active_policy()
+                    .iter()
+                    .any(|entry| entry.rule.scope.as_deref() == Some("trusted-first")
+                        && entry.rule.effect == Effect::Allow)
+            );
+            manager
+                .replace_remote_permission_asset(Some(&second))
+                .unwrap();
+            assert!(!manager.active_policy().iter().any(|entry| {
+                matches!(
+                    entry.rule.scope.as_deref(),
+                    Some("trusted-first" | "untrusted-second")
+                ) && entry.rule.effect == Effect::Allow
+            }));
+            assert!(manager.needs_project_permission_config_trust());
+
+            manager.replace_remote_permission_asset(None).unwrap();
+            assert!(!manager.needs_project_permission_config_trust());
+            assert!(!manager.active_policy().iter().any(|entry| {
+                matches!(
+                    entry.rule.scope.as_deref(),
+                    Some("remote-denied" | "trusted-first" | "untrusted-second")
+                )
+            }));
+
+            manager
+                .replace_remote_permission_asset(Some(&first))
+                .unwrap();
+            let mut invalid = second;
+            let other_authority = AuthorityIdentity::new(
+                SourceTrustAnchor::new("https://other.example").unwrap(),
+                "server",
+                "workspace",
+                "generation",
+                "namespace",
+            )
+            .unwrap();
+            invalid.source.project =
+                ProjectIdentity::new(other_authority, ProjectKey::new("project").unwrap());
+            assert!(
+                manager
+                    .replace_remote_permission_asset(Some(&invalid))
+                    .is_err()
+            );
+            assert!(!manager.active_policy().iter().any(|entry| {
+                matches!(
+                    entry.rule.scope.as_deref(),
+                    Some("remote-denied" | "trusted-first")
+                )
+            }));
+            assert!(
+                enforce_shell_without_prompt(&manager, &["echo still denied"], false)
+                    .await
+                    .is_err()
+            );
+        });
+    }
+
+    #[test]
+    fn remote_default_denial_is_final_under_yolo() {
+        smol::block_on(async {
+            let temp = tempfile::tempdir().unwrap();
+            let manager = PermissionManager::new_persistent_in(
+                PermissionsConfig {
+                    yolo: true,
+                    ..Default::default()
+                },
+                temp.path().to_path_buf(),
+                Arc::default(),
+                StateDir::from_path(temp.path().join("state")),
+            );
+            let mut asset = remote_permission_asset(
+                "revision",
+                "3333333333333333333333333333333333333333333333333333333333333333",
+                "unused",
+            );
+            asset.declarations.restrictive_rules.clear();
+            asset.declarations.allow_rules.clear();
+            asset.declarations.default = Some(DefaultEffect::Deny);
+            manager
+                .replace_remote_permission_asset(Some(&asset))
+                .unwrap();
+
+            assert!(
+                enforce_shell_without_prompt(&manager, &["echo denied by server"], false)
                     .await
                     .is_err()
             );

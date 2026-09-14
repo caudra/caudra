@@ -132,7 +132,7 @@ impl QueueItem {
     fn model_lane(&self) -> Option<ModelLane> {
         match self {
             Self::Message { input, .. } => Some(match input.mode {
-                AgentMode::Plan(_) => ModelLane::Plan,
+                AgentMode::Plan(_) | AgentMode::RemotePlan(_) => ModelLane::Plan,
                 AgentMode::Build | AgentMode::ReadOnly => ModelLane::Chat,
             }),
             Self::Compact { .. } => None,

@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, OnceLock};
 
+use crate::remote_project_context::RemoteSkill;
 use arc_swap::ArcSwap;
 use serde_json::Value;
 
@@ -167,6 +168,7 @@ struct SkillCatalog {
 
 pub struct SkillTool {
     dirs: Vec<SkillDirCandidate>,
+    remote_skills: Option<Arc<[RemoteSkill]>>,
     /// Built on first use, not at registration: tools register before the
     /// config that decides whether the builtin skill exists. Memoized so the
     /// list the model was given cannot change under it mid-session.
@@ -177,15 +179,35 @@ impl Default for SkillTool {
     fn default() -> Self {
         Self {
             dirs: skill_dirs(),
+            remote_skills: None,
             catalog: OnceLock::new(),
         }
     }
 }
 
 impl SkillTool {
+    pub fn remote(skills: &[RemoteSkill]) -> Self {
+        Self {
+            dirs: global_skill_dirs(),
+            remote_skills: Some(skills.into()),
+            catalog: OnceLock::new(),
+        }
+    }
+
     fn catalog(&self) -> &SkillCatalog {
         self.catalog.get_or_init(|| {
-            let found = discover(&self.dirs, &installed_builtins());
+            let mut found = discover(&self.dirs, &installed_builtins());
+            for skill in self.remote_skills.iter().flat_map(|skills| skills.iter()) {
+                found.insert(
+                    skill.name.clone(),
+                    Skill {
+                        name: skill.name.clone(),
+                        description: skill.description.clone(),
+                        location: skill.source.source_label(),
+                        scope: SkillScope::Project,
+                    },
+                );
+            }
             SkillCatalog {
                 description: format!("{DESCRIPTION}{}", skill_list(&found)),
                 entries: found
@@ -234,12 +256,18 @@ pub fn directories(registry: &ToolRegistry) -> Vec<SkillDirCandidate> {
 /// The body exactly as the model receives it, for `caudra skills <name>`.
 pub fn load(registry: &ToolRegistry, name: &str) -> Result<String, String> {
     let registered = registry.get(SKILL_TOOL_NAME);
-    let dirs = registered
+    if let Some(tool) = registered
         .as_ref()
         .and_then(RegisteredTool::downcast_ref::<SkillTool>)
-        .map(|tool| tool.dirs.as_slice())
-        .unwrap_or_default();
-    load_from(name, dirs, &installed_builtins())
+    {
+        return SkillCall {
+            name: name.into(),
+            dirs: tool.dirs.clone(),
+            remote_skills: tool.remote_skills.clone(),
+        }
+        .load();
+    }
+    load_from(name, &[], &installed_builtins())
 }
 
 impl Tool for SkillTool {
@@ -268,6 +296,7 @@ impl Tool for SkillTool {
         Ok(Box::new(SkillCall {
             name: name.to_owned(),
             dirs: self.dirs.clone(),
+            remote_skills: self.remote_skills.clone(),
         }))
     }
 }
@@ -275,6 +304,7 @@ impl Tool for SkillTool {
 struct SkillCall {
     name: String,
     dirs: Vec<SkillDirCandidate>,
+    remote_skills: Option<Arc<[RemoteSkill]>>,
 }
 
 impl ToolInvocation for SkillCall {
@@ -282,8 +312,16 @@ impl ToolInvocation for SkillCall {
         HeaderFuture::Ready(HeaderResult::plain(self.name.clone()))
     }
 
-    fn execute<'a>(self: Box<Self>, _ctx: &'a ToolContext) -> ExecFuture<'a> {
+    fn execute<'a>(mut self: Box<Self>, ctx: &'a ToolContext) -> ExecFuture<'a> {
         Box::pin(async move {
+            if ctx.workspace_session.is_some() || ctx.remote_project_context.is_some() {
+                self.dirs.retain(|dir| dir.scope == SkillScope::User);
+                self.remote_skills = Some(
+                    ctx.remote_project_context
+                        .as_ref()
+                        .map_or_else(|| Arc::from([]), |context| Arc::from(context.skills())),
+                );
+            }
             match smol::unblock(move || self.load()).await {
                 Ok(text) => ToolExecResult::from(Ok(ToolOutput::Markdown(text.into()))),
                 Err(message) => ToolExecResult::from(Err(message)),
@@ -294,6 +332,18 @@ impl ToolInvocation for SkillCall {
 
 impl SkillCall {
     fn load(&self) -> Result<String, String> {
+        if let Some(skill) = self
+            .remote_skills
+            .iter()
+            .flat_map(|skills| skills.iter())
+            .find(|skill| skill.name == self.name)
+        {
+            return Ok(format!(
+                "{}\n{}",
+                skill.source.source_label(),
+                numbered(&skill.content)
+            ));
+        }
         load_from(&self.name, &self.dirs, &installed_builtins())
     }
 }
@@ -462,6 +512,15 @@ fn resolve_group(
 /// group; each project ancestor is a group of its own, so levels still merge
 /// and a repo-root skill still shadows a nested one.
 fn skill_dirs() -> Vec<SkillDirCandidate> {
+    let mut dirs = global_skill_dirs();
+    for ancestor in project_ancestors() {
+        let level = PROJECT_SKILL_DIRS.iter().map(|rel| ancestor.join(rel));
+        resolve_group(level, SkillScope::Project, &mut dirs);
+    }
+    dirs
+}
+
+fn global_skill_dirs() -> Vec<SkillDirCandidate> {
     let mut dirs = Vec::new();
     let config = caudra_storage::paths::config_dir().ok();
     let home = caudra_storage::paths::home();
@@ -473,10 +532,6 @@ fn skill_dirs() -> Vec<SkillDirCandidate> {
         );
     resolve_group(global, SkillScope::User, &mut dirs);
 
-    for ancestor in project_ancestors() {
-        let level = PROJECT_SKILL_DIRS.iter().map(|rel| ancestor.join(rel));
-        resolve_group(level, SkillScope::Project, &mut dirs);
-    }
     dirs
 }
 
@@ -502,11 +557,102 @@ fn project_ancestors() -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::remote_project_context::RemoteAssetIdentity;
+    use caudra_workspace::{
+        AuthenticatedPrincipalId, AuthorityIdentity, ProjectIdentity, ProjectKey, ResourceId,
+        ResourceRevision, SourceTrustAnchor, WorkspacePath,
+    };
     use test_case::test_case;
 
     const BUILTIN_NAME: &str = "caudra-plugin-dev";
     const BUILTIN_BODY: &str = "how to write plugins";
     const BUILTIN_DESC: &str = "author plugins";
+    const SHARED_SKILL: &str = "isolation-shared";
+    const LOCAL_ONLY_SKILL: &str = "isolation-local-only";
+    const LOCAL_BODY: &str = "local project canary";
+    const GLOBAL_BODY: &str = "global skill body";
+    const REMOTE_BODY: &str = "remote skill body";
+
+    fn remote_skill() -> RemoteSkill {
+        let authority = AuthorityIdentity::new(
+            SourceTrustAnchor::new("test-source").unwrap(),
+            "test-authority",
+            "test-workspace",
+            "test-generation",
+            "test-namespace",
+        )
+        .unwrap();
+        RemoteSkill {
+            source: RemoteAssetIdentity {
+                principal: AuthenticatedPrincipalId::new(authority.clone(), "test-user").unwrap(),
+                project: ProjectIdentity::new(
+                    authority.clone(),
+                    ProjectKey::new("test-project").unwrap(),
+                ),
+                authority,
+                path: WorkspacePath::new(".caudra/skills/isolation-shared/SKILL.md").unwrap(),
+                resource_id: ResourceId::new("skill-resource").unwrap(),
+                revision: ResourceRevision::new("skill-revision").unwrap(),
+            },
+            name: SHARED_SKILL.into(),
+            description: REMOTE_BODY.into(),
+            content: REMOTE_BODY.into(),
+        }
+    }
+
+    #[test_case(false; "global_without_remote_override")]
+    #[test_case(true; "remote_overrides_global")]
+    fn remote_catalog_never_falls_back_to_local_project(include_remote: bool) {
+        let project = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        let project_dir = skill_dir(&project, SHARED_SKILL, LOCAL_BODY);
+        skill_dir(&project, LOCAL_ONLY_SKILL, LOCAL_BODY);
+        let mut global_dir = skill_dir(&global, SHARED_SKILL, GLOBAL_BODY);
+        global_dir.scope = SkillScope::User;
+        let embedded = SkillTool {
+            dirs: vec![global_dir.clone(), project_dir],
+            remote_skills: None,
+            catalog: OnceLock::new(),
+        };
+        let skills = if include_remote {
+            vec![remote_skill()]
+        } else {
+            vec![]
+        };
+        let mut remote = SkillTool::remote(&skills);
+        assert!(remote.dirs.iter().all(|dir| dir.scope == SkillScope::User));
+        remote.dirs = vec![global_dir];
+        let call = |tool: &SkillTool, name: &str| {
+            SkillCall {
+                name: name.into(),
+                dirs: tool.dirs.clone(),
+                remote_skills: tool.remote_skills.clone(),
+            }
+            .load()
+        };
+        assert!(call(&embedded, SHARED_SKILL).unwrap().contains(LOCAL_BODY));
+        assert!(
+            call(&embedded, LOCAL_ONLY_SKILL)
+                .unwrap()
+                .contains(LOCAL_BODY)
+        );
+        let expected = if include_remote {
+            REMOTE_BODY
+        } else {
+            GLOBAL_BODY
+        };
+        let loaded = call(&remote, SHARED_SKILL).unwrap();
+        assert!(loaded.contains(expected));
+        assert!(!loaded.contains(LOCAL_BODY));
+        let error = call(&remote, LOCAL_ONLY_SKILL).unwrap_err();
+        assert!(error.starts_with(NOT_FOUND));
+        assert!(!error.contains(LOCAL_BODY));
+        assert!(!remote.catalog().description.contains(LOCAL_ONLY_SKILL));
+        assert!(!remote.catalog().description.contains(LOCAL_BODY));
+        if include_remote {
+            assert!(remote.catalog().description.contains(REMOTE_BODY));
+        }
+    }
 
     fn selected(path: PathBuf) -> SkillDirCandidate {
         SkillDirCandidate {
@@ -618,6 +764,7 @@ mod tests {
         );
         let tool = SkillTool {
             dirs: vec![root],
+            remote_skills: None,
             catalog: OnceLock::new(),
         };
 
@@ -777,6 +924,7 @@ mod tests {
         root.scope = SkillScope::User;
         let tool = SkillTool {
             dirs: vec![root],
+            remote_skills: None,
             catalog: OnceLock::new(),
         };
 

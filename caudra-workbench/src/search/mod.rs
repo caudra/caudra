@@ -7,8 +7,9 @@
 
 pub mod engine;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
+use crate::fs::backend::{RequestId, ResourceEntry, SearchResult, WorkbenchPath};
 use engine::{Event, Hit, Query, Run};
 
 /// Which of the pane's two fields the caret is in.
@@ -31,7 +32,7 @@ pub enum Row {
 pub struct Search {
     query: Query,
     field: Field,
-    files: Vec<PathBuf>,
+    files: Vec<WorkbenchPath>,
     hits: Vec<Hit>,
     rows: Vec<Row>,
     selected: usize,
@@ -42,6 +43,7 @@ pub struct Search {
     /// The query the listed results came from. Enter runs the search while this
     /// disagrees with the fields, and opens the selection once it agrees.
     ran: Option<Query>,
+    remote_request: Option<RequestId>,
 }
 
 impl Search {
@@ -57,8 +59,8 @@ impl Search {
         &self.rows
     }
 
-    pub fn file(&self, index: usize) -> Option<&Path> {
-        self.files.get(index).map(PathBuf::as_path)
+    pub fn file(&self, index: usize) -> Option<&WorkbenchPath> {
+        self.files.get(index)
     }
 
     pub fn hit(&self, index: usize) -> Option<&Hit> {
@@ -82,7 +84,7 @@ impl Search {
     }
 
     pub fn is_running(&self) -> bool {
-        self.run.is_some()
+        self.run.is_some() || self.remote_request.is_some()
     }
 
     /// Whether the fields have moved on from the results below them.
@@ -135,6 +137,48 @@ impl Search {
             Ok(run) => self.run = Some(run),
             Err(error) => self.error = Some(error.to_string()),
         }
+    }
+
+    pub fn prepare_remote(&mut self) -> Option<(String, Option<String>)> {
+        self.clear();
+        self.ran = Some(self.query.clone());
+        if self.query.text.is_empty() {
+            return None;
+        }
+        let include = (!self.query.include.trim().is_empty()).then(|| self.query.include.clone());
+        Some((self.query.text.clone(), include))
+    }
+
+    pub fn begin_remote(&mut self, request: RequestId) {
+        self.remote_request = Some(request);
+    }
+
+    pub fn apply_remote(&mut self, request: RequestId, result: SearchResult) {
+        if self.remote_request != Some(request) {
+            return;
+        }
+        self.remote_request = None;
+        self.truncated = result.truncated || result.incomplete;
+        for hit in result.hits {
+            self.push(Hit {
+                path: hit.entry.path.clone(),
+                resource: Some(hit.entry),
+                line: u64::from(hit.line),
+                text: hit.text,
+                range: (0, 0),
+            });
+        }
+    }
+
+    pub fn fail_remote(&mut self, request: RequestId, error: String) {
+        if self.remote_request == Some(request) {
+            self.remote_request = None;
+            self.error = Some(error);
+        }
+    }
+
+    pub fn cancel_remote(&mut self) -> Option<RequestId> {
+        self.remote_request.take()
     }
 
     /// Takes whatever the worker produced. Reports whether the pane changed, so
@@ -204,7 +248,7 @@ impl Search {
     }
 
     /// Where the selected row points: a file, and the line to land on.
-    pub fn selection(&self) -> Option<(PathBuf, usize)> {
+    pub fn selection(&self) -> Option<(WorkbenchPath, usize)> {
         match self.rows.get(self.selected)? {
             Row::File(index) => Some((self.files.get(*index)?.clone(), 1)),
             Row::Hit(index) => {
@@ -212,6 +256,17 @@ impl Search {
                 Some((hit.path.clone(), usize::try_from(hit.line).unwrap_or(1)))
             }
         }
+    }
+
+    pub fn selected_resource(&self) -> Option<ResourceEntry> {
+        let path = match self.rows.get(self.selected)? {
+            Row::File(index) => self.files.get(*index)?,
+            Row::Hit(index) => return self.hits.get(*index)?.resource.clone(),
+        };
+        self.hits
+            .iter()
+            .find(|hit| &hit.path == path)
+            .and_then(|hit| hit.resource.clone())
     }
 
     pub fn counts(&self) -> (usize, usize) {
@@ -227,6 +282,7 @@ impl Search {
 
     fn clear(&mut self) {
         self.run = None;
+        self.remote_request = None;
         self.files.clear();
         self.hits.clear();
         self.rows.clear();
@@ -261,7 +317,8 @@ mod tests {
 
     fn hit(path: &str, line: u64) -> Hit {
         Hit {
-            path: PathBuf::from(path),
+            path: PathBuf::from(path).into(),
+            resource: None,
             line,
             text: format!("line {line}"),
             range: (0, 4),
@@ -298,7 +355,7 @@ mod tests {
         search.select_first();
         assert_eq!(
             search.selection(),
-            Some((PathBuf::from("/a.rs"), 1)),
+            Some((PathBuf::from("/a.rs").into(), 1)),
             "{SELECTION_WRONG}"
         );
     }
@@ -309,7 +366,7 @@ mod tests {
         search.move_selection(1);
         assert_eq!(
             search.selection(),
-            Some((PathBuf::from("/a.rs"), 7)),
+            Some((PathBuf::from("/a.rs").into(), 7)),
             "{SELECTION_WRONG}"
         );
     }

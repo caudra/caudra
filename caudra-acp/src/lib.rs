@@ -14,6 +14,9 @@ use caudra_agent::{AgentConfig, PermissionsConfig};
 use caudra_config::ModelPolicy;
 use caudra_providers::model::Model;
 use caudra_providers::{ThinkingConfig, Timeouts};
+use caudra_storage::local_documents::LocalDocumentStore;
+use caudra_storage::workspace_binding::StoredWorkspaceBinding;
+use caudra_workspace::WorkspaceSession;
 
 pub struct AcpParams {
     pub model: Model,
@@ -28,6 +31,12 @@ pub struct AcpParams {
     pub yolo: bool,
     pub model_policy: Arc<ModelPolicy>,
     pub plugin_rules: Arc<PluginRuleStore>,
+    pub workspace_binding: Option<StoredWorkspaceBinding>,
+    pub remote_environment: Option<caudra_agent::headless::RemoteEnvironment>,
+    pub workspace_session: Option<WorkspaceSession>,
+    pub remote_project_context:
+        Option<Arc<caudra_agent::remote_project_context::RemoteProjectContext>>,
+    pub local_documents: Option<Arc<LocalDocumentStore>>,
 }
 
 pub fn run(params: AcpParams) -> color_eyre::Result<()> {

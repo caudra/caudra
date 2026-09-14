@@ -5,6 +5,7 @@
 pub mod auth;
 pub mod id;
 pub mod input_history;
+pub mod local_documents;
 pub mod log;
 pub mod mcp_trust;
 pub mod model;
@@ -14,6 +15,8 @@ pub mod permission_state;
 pub mod plans;
 pub mod projects;
 pub mod prompt_stash;
+pub mod remote_operation_journal;
+pub mod remote_snapshots;
 pub mod retention;
 pub mod sessions;
 pub mod state;
@@ -29,6 +32,7 @@ pub mod workflow;
 pub mod workflow_scratch;
 pub mod workflow_source;
 pub mod workflow_trust;
+pub mod workspace_binding;
 
 use std::env;
 use std::fs::{self, File, OpenOptions};
@@ -199,6 +203,8 @@ pub enum StorageError {
     Json(#[from] serde_json::Error),
     #[error("invalid provider authentication: {0}")]
     InvalidProviderAuth(String),
+    #[error("invalid Workcell credential: {0}")]
+    InvalidWorkcellCredential(String),
     #[error("not found: {0}")]
     NotFound(String),
     #[error("slug collision after max attempts")]

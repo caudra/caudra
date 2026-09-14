@@ -536,6 +536,7 @@ impl ToolInvocation for LuaToolInvocation {
                         annotation: reply.annotation,
                         written_path: reply.written_path,
                         written_paths: Vec::new(),
+                        remote_written_paths: false,
                         model_suffix,
                         model_output: None,
                         output_limits,

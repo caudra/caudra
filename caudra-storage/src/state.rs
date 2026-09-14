@@ -7,6 +7,7 @@ use std::path::Path;
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::id::CaudraId;
 use crate::sessions::SessionDatabase;
@@ -14,6 +15,7 @@ use crate::{StateClass, StateDir, StorageError};
 
 pub const SCOPE_GLOBAL: &str = "global";
 const PROJECT_SCOPE_PREFIX: &str = "project:";
+const REMOTE_ASSET_SCOPE_PREFIX: &str = "remote-asset:";
 const WORKSPACE_TABS_KEY: StateKey = StateKey {
     name: "workspace.tabs",
     class: StateClass::Persistent,
@@ -135,6 +137,34 @@ where
 pub fn project_scope(cwd: &Path) -> String {
     let canonical = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
     format!("{PROJECT_SCOPE_PREFIX}{}", canonical.display())
+}
+
+pub(crate) fn remote_asset_scope(key: &caudra_workspace::ProjectAssetTrustKey) -> String {
+    let mut hasher = Sha256::new();
+    for field in [
+        key.authority().trust_anchor().as_str(),
+        key.authority().server_id(),
+        key.authority().workspace_id(),
+        key.authority().workspace_generation(),
+        key.authority().resource_namespace_version(),
+        key.principal().subject(),
+        key.project().key().as_str(),
+        key.path().as_str(),
+        key.resource_id().as_str(),
+        key.revision().as_str(),
+    ] {
+        hasher.update((field.len() as u64).to_be_bytes());
+        hasher.update(field.as_bytes());
+    }
+    let digest = hasher
+        .finalize()
+        .iter()
+        .fold(String::with_capacity(64), |mut output, byte| {
+            use std::fmt::Write;
+            let _ = write!(output, "{byte:02x}");
+            output
+        });
+    format!("{REMOTE_ASSET_SCOPE_PREFIX}{digest}")
 }
 
 /// The sessions a workspace had open, so `--continue` restores the layout.

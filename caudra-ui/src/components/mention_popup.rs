@@ -6,6 +6,7 @@
 //! whole buffer to complete, this must edit a range: the composer may hold
 //! paste tokens that a whole-buffer replacement would silently drop.
 
+use std::collections::HashMap;
 use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -13,12 +14,17 @@ use std::sync::atomic::AtomicBool;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use nucleo::pattern::{CaseMatching, Normalization};
-use nucleo::{Config, Nucleo};
+use nucleo::{Config, Nucleo, Utf32String};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph, Widget};
+
+use caudra_workbench::{
+    BackendDriver, BackendEvent, ResourceEntry, WorkbenchBackend, WorkbenchPath,
+};
+use caudra_workspace::{ResourceKind, WorkspacePath, WorkspaceSession};
 
 use crate::components::file_walk::{self, Walk};
 use crate::repaint::Dirty;
@@ -54,7 +60,9 @@ struct Session {
     selected: usize,
     scroll_offset: usize,
     cancel: Arc<AtomicBool>,
-    done_rx: flume::Receiver<Walk>,
+    done_rx: Option<flume::Receiver<Walk>>,
+    backend: Option<BackendDriver>,
+    remote_resources: HashMap<String, ResourceEntry>,
     walk: Walk,
     query: String,
     /// Where the rows were last drawn, so the pointer can find them. Cleared
@@ -113,7 +121,13 @@ impl MentionPopup {
 
     /// Re-reads the composer after an edit. Opens when the cursor is inside an
     /// `@query`, re-queries while it grows, and closes as soon as it is not.
-    pub fn sync(&mut self, text: &str, cursor: usize, cwd: &str) {
+    pub fn sync_workspace(
+        &mut self,
+        text: &str,
+        cursor: usize,
+        cwd: &str,
+        workspace: Option<WorkspaceSession>,
+    ) {
         let Some((range, query)) = trigger_at(text, cursor) else {
             self.close();
             return;
@@ -125,7 +139,10 @@ impl MentionPopup {
                 session.query = query;
                 reparse(session);
             }
-            None => self.start(cwd, query),
+            None => match workspace {
+                Some(workspace) => self.start_workspace(workspace, query),
+                None => self.start(cwd, query),
+            },
         }
     }
 
@@ -143,7 +160,36 @@ impl MentionPopup {
             selected: 0,
             scroll_offset: 0,
             cancel,
-            done_rx,
+            done_rx: Some(done_rx),
+            backend: None,
+            remote_resources: HashMap::new(),
+            walk: Walk::Running,
+            query,
+            area: Rect::default(),
+            pressed: None,
+        };
+        reparse(&mut session);
+        self.session = Some(session);
+    }
+
+    fn start_workspace(&mut self, workspace: WorkspaceSession, query: String) {
+        let nucleo = Nucleo::new(Config::DEFAULT.match_paths(), Arc::new(|| {}), None, 1);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let root = WorkbenchPath::Remote(WorkspacePath::root());
+        let Ok(backend) = WorkbenchBackend::workspace(workspace) else {
+            return;
+        };
+        let mut backend = BackendDriver::new(backend, root.clone());
+        backend.list(root, true);
+        let mut session = Session {
+            nucleo,
+            matches: Vec::new(),
+            selected: 0,
+            scroll_offset: 0,
+            cancel,
+            done_rx: None,
+            backend: Some(backend),
+            remote_resources: HashMap::new(),
             walk: Walk::Running,
             query,
             area: Rect::default(),
@@ -159,8 +205,31 @@ impl MentionPopup {
         let Some(session) = &mut self.session else {
             return Dirty::NO;
         };
-        if let Ok(walk) = session.done_rx.try_recv() {
+        if let Some(done_rx) = &session.done_rx
+            && let Ok(walk) = done_rx.try_recv()
+        {
             session.walk = walk;
+        }
+        if let Some(backend) = &mut session.backend {
+            for event in backend.drain() {
+                if let BackendEvent::Listed {
+                    result: Ok(result), ..
+                } = event
+                {
+                    let injector = session.nucleo.injector();
+                    for entry in result.entries {
+                        let mut path = entry.path.display();
+                        if entry.kind == ResourceKind::Directory {
+                            path.push('/');
+                        }
+                        injector.push((), |_, columns| {
+                            columns[0] = Utf32String::from(path.as_str());
+                        });
+                        session.remote_resources.insert(path, entry);
+                    }
+                    session.walk = Walk::Listed;
+                }
+            }
         }
         let before = session.matches.len();
         session.nucleo.tick(0);
@@ -178,7 +247,9 @@ impl MentionPopup {
         let Some(session) = &mut self.session else {
             return;
         };
-        if let Ok(walk) = session.done_rx.recv() {
+        if let Some(done_rx) = &session.done_rx
+            && let Ok(walk) = done_rx.recv()
+        {
             session.walk = walk;
         }
         while session.nucleo.tick(POLL_MS).running {}
@@ -268,6 +339,9 @@ impl MentionPopup {
         let Some(chosen) = session.matches.get(session.selected).cloned() else {
             return MentionAction::Passthrough;
         };
+        if session.backend.is_some() && !session.remote_resources.contains_key(&chosen) {
+            return MentionAction::Consumed;
+        }
         let path = format!("{SIGIL}{chosen}");
         match drill && chosen.ends_with(SEPARATOR) {
             true => {
@@ -428,7 +502,9 @@ mod tests {
                 selected: 0,
                 scroll_offset: 0,
                 cancel: Arc::new(AtomicBool::new(false)),
-                done_rx,
+                done_rx: Some(done_rx),
+                backend: None,
+                remote_resources: HashMap::new(),
                 walk: Walk::Listed,
                 query: String::new(),
                 area,

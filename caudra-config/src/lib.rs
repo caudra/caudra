@@ -40,6 +40,7 @@ const PROCESS_ONLY_ENV_VARS: &[&str] = &[
 ];
 
 pub mod providers;
+pub mod workcell;
 
 pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 50 * 1024;
 pub const DEFAULT_MAX_OUTPUT_LINES: usize = 2000;
@@ -160,6 +161,9 @@ pub const ACTIVE_DEFAULT_LUA_PLUGINS: &[&str] = &[];
 pub const CAUDRA_NATIVE_TOOL_NAMES: &[&str] = &[
     "batch",
     "image_generate",
+    "local_document_apply_patch",
+    "local_document_read",
+    "local_document_write",
     "memory",
     "question",
     "skill",
@@ -1026,7 +1030,14 @@ pub struct SnapshotsFileConfig {
 
 impl SnapshotsFileConfig {
     fn merge(&mut self, overlay: SnapshotsFileConfig) {
-        merge_option!(self, overlay, enabled, max_bytes_mb, max_files, max_file_bytes_mb);
+        merge_option!(
+            self,
+            overlay,
+            enabled,
+            max_bytes_mb,
+            max_files,
+            max_file_bytes_mb
+        );
     }
 }
 
@@ -1613,7 +1624,7 @@ impl ToolOutputLines {
             ],
         ),
         ("grep", &["file_grep", "file_glob"]),
-        ("read", &["file_read"]),
+        ("read", &["file_read", "local_document_read"]),
         (
             "write",
             &[
@@ -1621,6 +1632,8 @@ impl ToolOutputLines {
                 "file_edit",
                 "file_apply_patch",
                 "image_generate",
+                "local_document_apply_patch",
+                "local_document_write",
                 "memory",
             ],
         ),
@@ -1690,8 +1703,8 @@ impl ToolOutputLines {
             "index" | "file_index" | "code_map" | "code_context" | "code_refs" | "code_impact"
             | "code_expand" => self.index,
             "file_grep" | "file_glob" | "grep" | "glob" => self.grep,
-            "file_read" | "read" => self.read,
-            "memory" => self.write,
+            "file_read" | "local_document_read" | "read" => self.read,
+            "local_document_apply_patch" | "local_document_write" | "memory" => self.write,
             name if FILE_WRITE_TOOLS.contains(&name) => self.write,
             "webfetch" | "websearch" => self.web,
             _ => self.other,
@@ -2853,11 +2866,17 @@ fn env_file_var_is_allowed(key: &str) -> bool {
 }
 
 fn load_env_files_with_global(cwd: &Path, global: Option<&Path>) {
+    load_env_files_scoped(cwd, global, true);
+}
+
+fn load_env_files_scoped(cwd: &Path, global: Option<&Path>, include_project: bool) {
     let mut vars = HashMap::new();
     if let Some(path) = global {
         collect_env_vars(&path.join(".env"), &mut vars);
     }
-    collect_env_vars(&cwd.join(PROJECT_DIR).join(".env"), &mut vars);
+    if include_project {
+        collect_env_vars(&cwd.join(PROJECT_DIR).join(".env"), &mut vars);
+    }
 
     for (key, value) in vars {
         if env_file_var_is_allowed(&key) && std::env::var_os(&key).is_none() {
@@ -2865,6 +2884,10 @@ fn load_env_files_with_global(cwd: &Path, global: Option<&Path>) {
             unsafe { std::env::set_var(&key, &value) };
         }
     }
+}
+
+pub fn load_global_env_file() {
+    load_env_files_scoped(Path::new("."), global_dir().as_deref(), false);
 }
 
 fn collect_env_vars(path: &Path, vars: &mut HashMap<String, String>) {
@@ -2884,7 +2907,19 @@ pub fn load_permissions(cwd: &Path) -> PermissionsConfig {
     load_permissions_inner(cwd, global_dir().as_deref())
 }
 
+pub fn load_global_permissions() -> PermissionsConfig {
+    load_permissions_scoped(Path::new("."), global_dir().as_deref(), false)
+}
+
 fn load_permissions_inner(cwd: &Path, global_dir: Option<&Path>) -> PermissionsConfig {
+    load_permissions_scoped(cwd, global_dir, true)
+}
+
+fn load_permissions_scoped(
+    cwd: &Path,
+    global_dir: Option<&Path>,
+    include_project: bool,
+) -> PermissionsConfig {
     let mut global_perms = PermissionsFileConfig::default();
     if let Some(dir) = global_dir {
         let path = dir.join(PERMISSIONS_FILE);
@@ -2898,6 +2933,9 @@ fn load_permissions_inner(cwd: &Path, global_dir: Option<&Path>) -> PermissionsC
         }
     }
 
+    if !include_project {
+        return build_permissions(global_perms, PermissionsFileConfig::default());
+    }
     let project_path = cwd.join(PROJECT_DIR).join(PERMISSIONS_FILE);
     let project_perms = match read_permissions_file(&project_path) {
         Ok(Some(permissions)) => permissions,
@@ -3983,6 +4021,20 @@ mod tests {
     }
 
     #[test]
+    fn global_permissions_loader_ignores_project_rules() {
+        let dir = TempDir::new().unwrap();
+        let global = global_config_dir(dir.path());
+        write_global_permissions(dir.path(), "default = \"allow\"\n");
+        let caudra_dir = dir.path().join(".caudra");
+        fs::create_dir_all(&caudra_dir).unwrap();
+        fs::write(caudra_dir.join("permissions.toml"), "default = \"deny\"\n").unwrap();
+
+        let permissions = load_permissions_scoped(dir.path(), Some(&global), false);
+
+        assert_eq!(permissions.default, DefaultEffect::Prompt);
+    }
+
+    #[test]
     fn env_file_precedence() {
         const GLOBAL_ONLY: &str = "TEST_CAUDRA_GLOBAL_ONLY";
         const PROJECT_SHADOWS: &str = "TEST_CAUDRA_PROJECT_SHADOWS";
@@ -4021,6 +4073,37 @@ mod tests {
             std::env::remove_var(GLOBAL_ONLY);
             std::env::remove_var(PROJECT_SHADOWS);
             std::env::remove_var(PROCESS_WINS);
+        }
+    }
+
+    #[test]
+    fn global_env_loader_does_not_read_project_file() {
+        const GLOBAL: &str = "TEST_CAUDRA_REMOTE_GLOBAL";
+        const PROJECT_CANARY: &str = "TEST_CAUDRA_REMOTE_PROJECT_CANARY";
+
+        let dir = TempDir::new().unwrap();
+        let global = global_config_dir(dir.path());
+        fs::create_dir_all(&global).unwrap();
+        fs::write(global.join(".env"), format!("{GLOBAL}=loaded")).unwrap();
+        let caudra_dir = dir.path().join(".caudra");
+        fs::create_dir_all(&caudra_dir).unwrap();
+        fs::write(
+            caudra_dir.join(".env"),
+            format!("{PROJECT_CANARY}=executed"),
+        )
+        .unwrap();
+        unsafe {
+            std::env::remove_var(GLOBAL);
+            std::env::remove_var(PROJECT_CANARY);
+        }
+
+        load_env_files_scoped(dir.path(), Some(&global), false);
+
+        assert_eq!(std::env::var(GLOBAL).unwrap(), "loaded");
+        assert!(std::env::var_os(PROJECT_CANARY).is_none());
+        unsafe {
+            std::env::remove_var(GLOBAL);
+            std::env::remove_var(PROJECT_CANARY);
         }
     }
 

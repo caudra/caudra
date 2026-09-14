@@ -38,10 +38,10 @@ use serde_json::{Value, json};
 use tracing::{info, warn};
 
 use self::config::{
-    McpConfig, McpConfigErrors, McpConfigSource, McpReviewSummary, McpServerInfo, McpServerStatus,
-    OauthClientConfig, RawServerConfig, RawTransport, ServerConfig, Transport, load_config,
-    parse_server, requires_project_trust, resolve_http_addresses, review_summary, risky_ip,
-    security_digest, transport_kind,
+    LocalExecutionPolicy, McpConfig, McpConfigErrors, McpConfigSource, McpReviewSummary,
+    McpServerInfo, McpServerStatus, OauthClientConfig, RawServerConfig, RawTransport, ServerConfig,
+    Transport, load_config, load_global_config, parse_server, requires_project_trust,
+    resolve_http_addresses, review_summary, risky_ip, security_digest, transport_kind,
 };
 use self::error::McpError;
 use self::http::HttpTransport;
@@ -756,6 +756,22 @@ pub async fn start_connected(cwd: &Path) -> (Option<McpHandle>, McpConfigErrors)
     (handle, config_errors)
 }
 
+pub async fn start_global_connected(cwd: &Path) -> (Option<McpHandle>, McpConfigErrors) {
+    let cwd = cwd.to_owned();
+    let (config, config_errors) = smol::unblock(move || load_global_config(&cwd)).await;
+    let handle = start_with_config(config);
+    if let Some(handle) = &handle {
+        handle.ready().await;
+    }
+    (handle, config_errors)
+}
+
+pub async fn start_global(cwd: &Path) -> (Option<McpHandle>, McpConfigErrors) {
+    let cwd = cwd.to_owned();
+    let (config, config_errors) = smol::unblock(move || load_global_config(&cwd)).await;
+    (start_with_config(config), config_errors)
+}
+
 /// `start` plus servers declared at runtime. `mcp.toml` wins on name, so a
 /// runtime server can never swap out the credentials the user configured or
 /// revive one they disabled.
@@ -1173,7 +1189,11 @@ async fn refresh_server(inner: &mut McpManagerInner, server_name: &str) -> Resul
         entry.clear_connection().await;
     }
 
-    let result = start_server(&config).await;
+    let result = start_server(
+        &config,
+        entry_has_startup_trust(&inner.entries[idx], inner.state_dir.as_ref()),
+    )
+    .await;
     apply_start_result(&mut inner.entries[idx], result, "refresh")?;
     info!(
         server = server_name,
@@ -1231,7 +1251,7 @@ struct StartResult {
     prompt_infos: Vec<protocol::PromptInfo>,
 }
 
-async fn start_server(config: &ServerConfig) -> Result<StartResult, McpError> {
+async fn start_server(config: &ServerConfig, trusted: bool) -> Result<StartResult, McpError> {
     let transport: Arc<dyn McpTransport> = match &config.transport {
         Transport::Stdio {
             program,
@@ -1243,6 +1263,8 @@ async fn start_server(config: &ServerConfig) -> Result<StartResult, McpError> {
             args,
             environment,
             config.timeout,
+            config.local_execution,
+            trusted,
         )?),
         Transport::Http {
             url,
@@ -1290,6 +1312,7 @@ async fn start_server(config: &ServerConfig) -> Result<StartResult, McpError> {
 }
 
 fn parse_entries(config: McpConfig, state_dir: Option<StateDir>) -> McpManagerInner {
+    let local_execution = config.local_execution;
     let origins = config.origins;
     let sources = config.sources;
     let project_root = config.project_root;
@@ -1314,14 +1337,25 @@ fn parse_entries(config: McpConfig, state_dir: Option<StateDir>) -> McpManagerIn
         let resolved_risk = resolved
             .as_ref()
             .map_or(true, |addresses| addresses.iter().copied().any(risky_ip));
-        let trust = (source == McpConfigSource::Project
-            && (requires_project_trust(&raw.transport) || resolved_risk))
+        let remote_stdio = local_execution == LocalExecutionPolicy::RemoteLocal
+            && matches!(raw.transport, RawTransport::Stdio(_));
+        let trust = (remote_stdio
+            || (source == McpConfigSource::Project
+                && (requires_project_trust(&raw.transport) || resolved_risk)))
             .then(|| ProjectTrust {
-                project: project_root.clone(),
+                project: if remote_stdio {
+                    None
+                } else {
+                    project_root.clone()
+                },
                 config_digest,
             });
         let disabled = !raw.enabled;
-        let (config, status) = match parse_server(name.clone(), raw) {
+        let parsed = parse_server(name.clone(), raw).map(|mut server| {
+            server.local_execution = local_execution;
+            server
+        });
+        let (config, status) = match parsed {
             Ok(mut sc) if disabled => {
                 if let Transport::Http {
                     resolved: pinned, ..
@@ -1401,11 +1435,12 @@ fn spawn_connects(
         .iter()
         .enumerate()
         .filter(|(_, e)| e.status == McpServerStatus::Connecting)
+        .filter(|(_, e)| entry_has_startup_trust(e, inner.state_dir.as_ref()))
         .filter_map(|(i, e)| e.config.clone().map(|c| (i, c)))
         .map(|(i, config)| {
             let tx = tx.clone();
             smol::spawn(async move {
-                let _ = tx.send_async((i, start_server(&config).await)).await;
+                let _ = tx.send_async((i, start_server(&config, true).await)).await;
             })
         })
         .collect()
@@ -1908,6 +1943,7 @@ mod tests {
 
     fn bad_stdio_config(name: &str) -> ServerConfig {
         ServerConfig {
+            local_execution: LocalExecutionPolicy::Embedded,
             name: name.into(),
             timeout: Duration::from_secs(1),
             always_load: false,
@@ -2136,6 +2172,37 @@ mod tests {
 
         assert_eq!(inner.entries[0].status, McpServerStatus::AwaitingTrust);
         assert!(spawn_connects(&inner, tx).is_empty());
+    }
+
+    #[test_case(McpConfigSource::Global; "global")]
+    #[test_case(McpConfigSource::Runtime; "runtime")]
+    fn remote_local_stdio_is_parked_until_explicit_trust(source: McpConfigSource) {
+        smol::block_on(async {
+            let mut config = make_config(vec![("remote-local", stdio_raw(&[MISSING_PROGRAM]))]);
+            config.local_execution = LocalExecutionPolicy::RemoteLocal;
+            config.sources.insert("remote-local".into(), source);
+            assert_eq!(
+                config.preliminary_infos(&[])[0].status,
+                McpServerStatus::AwaitingTrust
+            );
+            let mut inner = parse_entries(config, None);
+            let entry = &inner.entries[0];
+            assert_eq!(
+                entry.config.as_ref().unwrap().local_execution,
+                LocalExecutionPolicy::RemoteLocal
+            );
+            assert_eq!(entry.status, McpServerStatus::AwaitingTrust);
+            let (tx, _rx) = flume::unbounded();
+            assert!(spawn_connects(&inner, tx).is_empty());
+            refresh_server(&mut inner, "remote-local").await.unwrap();
+            assert_eq!(inner.entries[0].status, McpServerStatus::AwaitingTrust);
+            handle_trust(&mut inner, "remote-local", false).await;
+            assert!(entry_has_startup_trust(&inner.entries[0], None));
+            assert!(matches!(
+                inner.entries[0].status,
+                McpServerStatus::Failed(_)
+            ));
+        });
     }
 
     #[test]

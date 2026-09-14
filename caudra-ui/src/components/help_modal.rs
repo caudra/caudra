@@ -1,10 +1,10 @@
 use crate::components::Overlay;
-use crate::components::{ModalScroll, bar_area};
 use crate::components::keybindings::{
     ALT_SEP, KEYBINDS, KeyLabel, KeybindContext, all_contexts, key,
 };
 use crate::components::modal::Modal;
 use crate::components::scrollbar::{Scrollbar, ScrollbarMouse};
+use crate::components::{ModalScroll, bar_area};
 use crate::theme;
 
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent};

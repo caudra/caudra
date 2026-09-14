@@ -9,17 +9,22 @@ mod notes;
 pub mod paths;
 
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::fs;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 
-use caudra_providers::token_label;
+use caudra_providers::{estimate_tokens, token_label};
+use caudra_storage::local_documents::{LocalDocument, LocalDocumentStore};
+use caudra_workspace::{LocalDocumentRef, MemoryRef};
 use serde_json::Value;
 
+use crate::permissions::{PermissionResource, PermissionResourceKind, PermissionRisk};
+use crate::tools::native::local_document::scoped_store;
 use crate::tools::registry::{
-    ExecFuture, HeaderFuture, HeaderResult, ParseError, PermissionScopes, Tool, ToolEffect,
-    ToolExecResult, ToolInvocation,
+    ExecFuture, HeaderFuture, HeaderResult, ParseError, PermissionIntent, PermissionScopes, Tool,
+    ToolEffect, ToolExecResult, ToolInvocation,
 };
 use crate::tools::schema::{ParamKind, ParamSchema, Property, to_json_schema, validate};
 use crate::tools::{DescriptionContext, ToolContext};
@@ -30,7 +35,7 @@ pub const DESCRIPTION: &str = "Persistent, project-scoped scratchpad for learnin
 - Notes are retrieved by tag; reuse the tags from your system prompt when they fit.
 - Save important context before compaction or to build up project knowledge.
 - Keep entries concise and current. Delete outdated information.
-- The memory `list` and `read` commands report the notes dir; use `file_edit` on `<dir>/<name>` for targeted changes.";
+- Embedded `list` and `read` report the notes dir for `file_edit`. Remote sessions return opaque memory references for `local_document_read`, `local_document_write`, or `local_document_apply_patch`; no client host path is exposed.";
 
 pub const TOOL_USAGE: &str =
     "- Proactively save non-obvious project gotchas and architecture decisions to **memory**.";
@@ -272,6 +277,48 @@ fn browse_dir(dir: &Path, cache: &Mutex<notes::TagCache>) -> (Vec<BrowseEntry>, 
     (entries, warnings.len())
 }
 
+pub fn browse_store(store: &LocalDocumentStore) -> Result<Vec<(MemoryRef, BrowseEntry)>, String> {
+    let documents = store
+        .list_memories(store.project_key())
+        .map_err(|error| error.to_string())?;
+    let mut groups = BTreeMap::<String, Vec<(MemoryRef, String, u32)>>::new();
+    for document in documents {
+        let LocalDocumentRef::Memory(reference) = &document.reference else {
+            continue;
+        };
+        let name = document.name.as_deref().unwrap_or_default();
+        let label = format!("{name} [{}]", reference.as_str());
+        let mut tags = document_tags(&document);
+        if tags.is_empty() {
+            tags.push(name.to_owned());
+        }
+        for tag in tags {
+            groups.entry(tag).or_default().push((
+                reference.clone(),
+                label.clone(),
+                estimate_tokens(&document.content),
+            ));
+        }
+    }
+    Ok(groups
+        .into_iter()
+        .flat_map(|(tag, files)| {
+            let tag_count = files.len();
+            files.into_iter().map(move |(reference, name, tokens)| {
+                (
+                    reference,
+                    BrowseEntry {
+                        name,
+                        tokens,
+                        tag: tag.clone(),
+                        tag_count,
+                    },
+                )
+            })
+        })
+        .collect())
+}
+
 /// Shared by the prompt's tag line and the tool's own scans. The prompt is
 /// rebuilt every turn and would otherwise re-read every note each time; the
 /// cache keys on size and mtime, so a note the tool just wrote is never stale.
@@ -281,6 +328,28 @@ static TAG_CACHE: LazyLock<Mutex<notes::TagCache>> = LazyLock::new(Mutex::defaul
 /// value the rest of the tools layer resolves paths against.
 pub fn prompt_tag_line_for_cwd() -> Option<String> {
     prompt_tag_line(&std::env::current_dir().ok()?, &TAG_CACHE)
+}
+
+pub fn prompt_tag_line_for_store(store: &LocalDocumentStore) -> Option<String> {
+    let documents = store.list_memories(store.project_key()).ok()?;
+    let mut tags = documents
+        .iter()
+        .flat_map(|document| {
+            let (frontmatter, _) = notes::parse_frontmatter(&document.content);
+            frontmatter
+                .as_ref()
+                .and_then(|value| value.get("tags"))
+                .and_then(serde_yaml::Value::as_sequence)
+                .into_iter()
+                .flatten()
+                .filter_map(serde_yaml::Value::as_str)
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    tags.sort();
+    tags.dedup();
+    (!tags.is_empty()).then(|| format!("{PROMPT_TAG_PREFIX}{}\n", tags.join(", ")))
 }
 
 /// The tag index shown in the system prompt. Absent when there is nothing to
@@ -543,6 +612,19 @@ impl ToolInvocation for MemoryCall {
         })
     }
 
+    fn preflight<'a>(
+        &'a self,
+        ctx: &'a ToolContext,
+    ) -> crate::tools::registry::BoxFuture<'a, Result<Option<PermissionIntent>, String>> {
+        Box::pin(async move {
+            if ctx.workspace_session.is_none() {
+                return Ok(None);
+            }
+            scoped_store(ctx)?;
+            Ok(Some(self.remote_permission_intent()))
+        })
+    }
+
     /// Browsing a scratchpad is a read; only the two commands that touch a
     /// note carry the registered mutating effect.
     fn call_effect(&self, registered: ToolEffect) -> ToolEffect {
@@ -552,7 +634,10 @@ impl ToolInvocation for MemoryCall {
         }
     }
 
-    fn mutation_targets(&self, _ctx: &ToolContext) -> Vec<PathBuf> {
+    fn mutation_targets(&self, ctx: &ToolContext) -> Vec<PathBuf> {
+        if ctx.workspace_session.is_some() {
+            return Vec::new();
+        }
         match (self.command, &self.dir, self.path.as_deref()) {
             (Command::Write | Command::Delete, Some(dir), Some(path)) => {
                 paths::safe_resolve(dir, path).into_iter().collect()
@@ -563,7 +648,7 @@ impl ToolInvocation for MemoryCall {
 
     fn execute<'a>(self: Box<Self>, _ctx: &'a ToolContext) -> ExecFuture<'a> {
         Box::pin(async move {
-            let text = match self.run_all(&TAG_CACHE) {
+            let text = match self.run_for_context(_ctx) {
                 Ok(text) => text,
                 Err(error) => return ToolExecResult::from(Err(format!("error: {error}"))),
             };
@@ -582,11 +667,179 @@ impl ToolInvocation for MemoryCall {
     }
 }
 
+impl MemoryCall {
+    fn remote_permission_intent(&self) -> PermissionIntent {
+        let detail = self
+            .path
+            .as_deref()
+            .map(str::to_owned)
+            .unwrap_or_else(|| self.tags.join(","));
+        let scope = format!("local-memory:{}:{detail}", self.command.as_str());
+        PermissionIntent::new(
+            PermissionScopes::single(scope.clone()),
+            vec![PermissionResource {
+                kind: PermissionResourceKind::Custom {
+                    name: "local_memory".to_owned(),
+                },
+                value: scope,
+                access: None,
+                protected: false,
+                requires_prompt: false,
+                attributes: BTreeMap::new(),
+            }],
+            PermissionRisk::Low,
+        )
+    }
+
+    fn run_for_context(&self, ctx: &ToolContext) -> Result<String, String> {
+        if ctx.workspace_session.is_none() {
+            return self.run_all(&TAG_CACHE);
+        }
+        self.validate()?;
+        let store = scoped_store(ctx)?;
+        let project = store.project_key();
+        let documents = store
+            .list_memories(project)
+            .map_err(|error| error.to_string())?;
+        match self.command {
+            Command::List => Ok(self.remote_list(&documents)),
+            Command::Read if !self.tags.is_empty() => self.remote_read_by_tag(&documents),
+            Command::Read => self.remote_read_by_path(&documents),
+            Command::Write => self.remote_write(store, project),
+            Command::Delete => self.remote_delete(store, project),
+        }
+    }
+
+    fn remote_list(&self, documents: &[LocalDocument]) -> String {
+        let wanted = notes::tags_for_filter(&self.tags)
+            .ok()
+            .map(|(tags, _)| tags);
+        let mut entries = Vec::new();
+        for document in documents {
+            let Some(name) = document.name.as_deref() else {
+                continue;
+            };
+            let tags = document_tags(document);
+            if wanted
+                .as_ref()
+                .is_some_and(|wanted| !tags.iter().any(|tag| wanted.contains(tag)))
+            {
+                continue;
+            }
+            entries.push(format!(
+                "- {name} ({}) [memory_ref: {}] tags: {}",
+                token_label(estimate_tokens(&document.content)),
+                reference_id(&document.reference),
+                tags.join(", ")
+            ));
+        }
+        if entries.is_empty() {
+            notes::NO_MEMORIES.to_owned()
+        } else {
+            notes::cap(entries.join("\n"), notes::CAP_HINT_FILTER)
+        }
+    }
+
+    fn remote_read_by_tag(&self, documents: &[LocalDocument]) -> Result<String, String> {
+        let (wanted, warning) = notes::tags_for_filter(&self.tags)?;
+        let entries = documents
+            .iter()
+            .filter(|document| {
+                document_tags(document)
+                    .iter()
+                    .any(|tag| wanted.contains(tag))
+            })
+            .map(format_remote_document)
+            .collect::<Vec<_>>();
+        let body = if entries.is_empty() {
+            notes::NO_MATCH.to_owned()
+        } else {
+            notes::cap(entries.join("\n\n"), notes::CAP_HINT_NARROW)
+        };
+        Ok(notes::join_parts("\n", &[warning, Some(body)]))
+    }
+
+    fn remote_read_by_path(&self, documents: &[LocalDocument]) -> Result<String, String> {
+        let name = self.path.as_deref().unwrap_or_default();
+        let document = documents
+            .iter()
+            .find(|document| document.name.as_deref() == Some(name))
+            .ok_or_else(|| format!("'{name}' does not exist"))?;
+        Ok(notes::cap(
+            format_remote_document(document),
+            notes::CAP_HINT_REWRITE,
+        ))
+    }
+
+    fn remote_write(
+        &self,
+        store: &LocalDocumentStore,
+        project: &caudra_workspace::ProjectKey,
+    ) -> Result<String, String> {
+        let content = self.content.as_deref().unwrap_or_default();
+        if let Some(error) = notes::write_size_error(content) {
+            return Err(error);
+        }
+        let (tags, note) = notes::tags_for_write(&self.tags)?;
+        let body = format!("{}{content}", notes::encode_frontmatter(&tags));
+        let reference = store
+            .write_memory(project, self.path.as_deref().unwrap_or_default(), &body)
+            .map_err(|error| error.to_string())?;
+        let suffix = note.map_or(String::new(), |note| format!("; {note}"));
+        Ok(format!("wrote memory_ref {}{suffix}", reference.as_str()))
+    }
+
+    fn remote_delete(
+        &self,
+        store: &LocalDocumentStore,
+        project: &caudra_workspace::ProjectKey,
+    ) -> Result<String, String> {
+        let reference = store
+            .delete_memory(project, self.path.as_deref().unwrap_or_default())
+            .map_err(|error| error.to_string())?;
+        Ok(format!("deleted memory_ref {}", reference.as_str()))
+    }
+}
+
+fn document_tags(document: &LocalDocument) -> Vec<String> {
+    let (frontmatter, _) = notes::parse_frontmatter(&document.content);
+    frontmatter
+        .as_ref()
+        .and_then(|value| value.get("tags"))
+        .and_then(serde_yaml::Value::as_sequence)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_yaml::Value::as_str)
+        .map(str::to_owned)
+        .collect()
+}
+
+fn format_remote_document(document: &LocalDocument) -> String {
+    let name = document.name.as_deref().unwrap_or("memory");
+    format!(
+        "## {name}\nmemory_ref: {}\nrevision: {}\n\n{}",
+        reference_id(&document.reference),
+        document.revision.as_str(),
+        document.content
+    )
+}
+
+fn reference_id(reference: &LocalDocumentRef) -> &str {
+    match reference {
+        LocalDocumentRef::Memory(reference) => reference.as_str(),
+        LocalDocumentRef::Plan(reference) => reference.as_str(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::slice;
+
     use super::*;
     use crate::AgentMode;
     use crate::tools::test_support::stub_ctx;
+    use caudra_storage::local_documents::DocumentRevision;
+    use caudra_workspace::MemoryRef;
     use serde_json::json;
     use test_case::test_case;
 
@@ -1068,5 +1321,51 @@ mod tests {
     fn a_project_without_notes_contributes_no_prompt_line() {
         let temp = tempfile::tempdir().unwrap();
         assert!(prompt_tag_line(temp.path(), &Mutex::new(notes::TagCache::default())).is_none());
+    }
+
+    #[test]
+    fn remote_memory_browsing_returns_refs_without_a_directory() {
+        let reference = MemoryRef::new(format!("memory-{}", "a".repeat(64))).expect("memory ref");
+        let document = LocalDocument {
+            reference: LocalDocumentRef::Memory(reference.clone()),
+            name: Some("architecture.md".into()),
+            content: "---\ntags: [rust]\n---\nkeep this".into(),
+            revision: DocumentRevision::new("b".repeat(64)).expect("revision"),
+        };
+        let call = call_in(
+            json!({"command": "list"}),
+            Path::new("/secret/client/state"),
+        );
+
+        let listed = call.remote_list(slice::from_ref(&document));
+        let read = format_remote_document(&document);
+
+        assert!(listed.contains(reference.as_str()));
+        assert!(read.contains(reference.as_str()));
+        assert!(!listed.contains("/secret/client/state"));
+        assert!(!read.contains("/secret/client/state"));
+    }
+
+    #[test]
+    fn remote_memory_permission_intent_uses_an_opaque_resource() {
+        let call = call_in(
+            json!({"command": "write", "path": "architecture.md", "content": "note"}),
+            Path::new("/secret/client/state"),
+        );
+
+        let intent = call.remote_permission_intent();
+
+        assert_eq!(intent.resources.len(), 1);
+        assert_eq!(
+            intent.resources[0].kind,
+            PermissionResourceKind::Custom {
+                name: "local_memory".to_owned()
+            }
+        );
+        assert_eq!(
+            intent.resources[0].value,
+            "local-memory:write:architecture.md"
+        );
+        assert!(!intent.resources[0].value.contains("/secret/client/state"));
     }
 }

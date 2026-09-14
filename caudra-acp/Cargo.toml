@@ -11,6 +11,7 @@ caudra-config = { workspace = true }
 caudra-otel = { workspace = true }
 caudra-providers = { workspace = true }
 caudra-storage = { workspace = true }
+caudra-workspace = { workspace = true }
 agent-client-protocol-schema = { workspace = true }
 smol = { workspace = true }
 flume = { workspace = true }
@@ -20,5 +21,6 @@ tracing = { workspace = true }
 color-eyre = { workspace = true }
 
 [dev-dependencies]
+caudra-agent = { workspace = true, features = ["test-support"] }
 test-case = { workspace = true }
 tempfile = { workspace = true }

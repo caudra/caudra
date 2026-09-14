@@ -1223,12 +1223,19 @@ impl App {
                     .iter()
                     .any(|chat| chat.task_id().is_some_and(|id| **id == task_id))
             });
-        let cwd = PathBuf::from(&self.state.session.cwd);
-        self.chats[self.active_chat].update_hover(row, col, area, known_task_target, &cwd);
+        if self.workspace_session.is_some() {
+            self.chats[self.active_chat].update_hover_remote(row, col, area, known_task_target);
+        } else {
+            let cwd = PathBuf::from(&self.state.session.cwd);
+            self.chats[self.active_chat].update_hover(row, col, area, known_task_target, &cwd);
+        }
     }
 
     /// The mention under the pointer in the transcript.
     fn transcript_mention_at(&self, row: u16, col: u16) -> Option<Mention> {
+        if self.workspace_session.is_some() {
+            return self.chats[self.active_chat].mention_at_remote(row, col, self.msg_area());
+        }
         let cwd = PathBuf::from(&self.state.session.cwd);
         self.chats[self.active_chat].mention_at(row, col, self.msg_area(), &cwd)
     }

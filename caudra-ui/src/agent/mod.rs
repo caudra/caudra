@@ -17,14 +17,16 @@ use caudra_agent::prompt::profile::{BUILTIN_PROFILE_NAME, SystemPromptProfile};
 use caudra_agent::workflow::WorkflowHandle;
 use caudra_agent::{
     AgentConfig, AgentMode, BaselineGate, CancelMap, CancelToken, Envelope, HistorySnapshot,
-    McpCommand, McpConfigErrors, McpHandle, McpSnapshotReader, Nudge, SessionMailbox, SharedHistory,
-    SubagentHistoryStore, ToolOutputLines, WorkspaceBaseline,
+    McpCommand, McpConfigErrors, McpHandle, McpSnapshotReader, Nudge, SessionMailbox,
+    SharedHistory, SubagentHistoryStore, ToolOutputLines, WorkspaceBaseline,
 };
 use caudra_config::ModelPolicy;
 use caudra_lua::EventHandle;
 use caudra_storage::StateDir;
 use caudra_storage::id::SessionRef;
+use caudra_storage::local_documents::LocalDocumentStore;
 use caudra_storage::sessions::SessionLease;
+use caudra_workspace::WorkspaceSession;
 
 use self::cancel_map::new_run_cancel_map;
 use caudra_providers::provider::Provider;
@@ -96,6 +98,9 @@ pub(crate) struct AgentHandles {
     /// Session-lifetime: `respawn` carries it over untouched and only a change
     /// of session id replaces it.
     workflow: Option<WorkflowSession>,
+    workspace_session: Option<WorkspaceSession>,
+    remote_project_context: Option<Arc<caudra_agent::remote_project_context::RemoteProjectContext>>,
+    local_documents: Option<Arc<LocalDocumentStore>>,
     task: smol::Task<()>,
 }
 
@@ -124,6 +129,11 @@ impl AgentHandles {
         prompt_profiles: Arc<PromptProfileCatalog>,
         state_dir: Option<StateDir>,
         baseline: Arc<WorkspaceBaseline>,
+        workspace_session: Option<WorkspaceSession>,
+        remote_project_context: Option<
+            Arc<caudra_agent::remote_project_context::RemoteProjectContext>,
+        >,
+        local_documents: Option<Arc<LocalDocumentStore>>,
     ) -> Self {
         spawn_agent_internal(
             flume::unbounded(),
@@ -145,6 +155,9 @@ impl AgentHandles {
             Arc::clone(&prompt_profiles),
             WorkflowSlot::Fresh(state_dir),
             baseline,
+            workspace_session,
+            remote_project_context,
+            local_documents,
         )
     }
 
@@ -200,6 +213,18 @@ impl AgentHandles {
 
     pub(crate) fn cancel(self) {
         let _ = self.cmd_tx.try_send(AgentCommand::CancelAll);
+    }
+
+    pub(crate) fn rebind_workspace(
+        &mut self,
+        workspace: WorkspaceSession,
+        context: Arc<caudra_agent::remote_project_context::RemoteProjectContext>,
+    ) {
+        self.workspace_session = Some(workspace);
+        self.remote_project_context = Some(context);
+        if let Some(workflow) = self.workflow.take() {
+            workflow.shutdown();
+        }
     }
 
     pub(crate) fn send_mcp(&self, cmd: McpCommand) {
@@ -283,6 +308,9 @@ impl AgentHandles {
             Arc::clone(&self.prompt_profiles),
             workflow,
             Arc::clone(&app.workspace_baseline),
+            self.workspace_session.clone(),
+            self.remote_project_context.clone(),
+            self.local_documents.clone(),
         );
         let old = mem::replace(self, new);
         // Repoint the app at the new queue before dropping `old`, otherwise the app keeps
@@ -361,6 +389,9 @@ fn spawn_agent_internal(
     prompt_profiles: Arc<PromptProfileCatalog>,
     workflow: WorkflowSlot,
     baseline: Arc<WorkspaceBaseline>,
+    workspace_session: Option<WorkspaceSession>,
+    remote_project_context: Option<Arc<caudra_agent::remote_project_context::RemoteProjectContext>>,
+    local_documents: Option<Arc<LocalDocumentStore>>,
 ) -> AgentHandles {
     let (cmd_tx, cmd_rx) = flume::unbounded::<AgentCommand>();
     let (answer_tx, answer_rx) = match &workflow {
@@ -427,6 +458,9 @@ fn spawn_agent_internal(
                         answer: (answer_tx.clone(), Arc::clone(&answer_rx)),
                         events: agent_tx.clone(),
                         baseline: Some(BaselineGate::new(Arc::clone(&baseline), None)),
+                        workspace_session: workspace_session.clone(),
+                        remote_project_context: remote_project_context.clone(),
+                        local_documents: local_documents.clone(),
                     })
                 })
         }
@@ -473,6 +507,9 @@ fn spawn_agent_internal(
         workflow.as_ref().map(WorkflowSession::handle),
         mode,
         baseline,
+        workspace_session.clone(),
+        remote_project_context.clone(),
+        local_documents.clone(),
     );
 
     let task = smol::spawn(async move {
@@ -499,6 +536,9 @@ fn spawn_agent_internal(
         prompt_profiles,
         mailbox,
         workflow,
+        workspace_session,
+        remote_project_context,
+        local_documents,
         task,
     }
 }
@@ -722,6 +762,9 @@ mod tests {
                 PathBuf::from("/tmp"),
                 true,
             ),
+            None,
+            None,
+            None,
         );
         (handles, model_slot, permissions)
     }

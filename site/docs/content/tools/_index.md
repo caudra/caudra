@@ -7,9 +7,11 @@ group = "Reference"
 
 # Tools
 
-Caudra ships with 27 built-in tools in this reference (27 on by default, 0 opt-in via plugin options). Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
+Caudra ships with 30 built-in tools in this reference (30 requiring no plugin opt-in, 0 opt-in via plugin options). Availability depends on the selected workspace backend. Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
 
 First-party file, web, shell, index, Python, and environment tools run through protocol-neutral Workcell contracts. Workcell owns schemas, validation, execution bounds, atomic file changes, network policy, subprocess cleanup, cancellation, and the bundled worker lifecycle. Caudra owns registration, authorization, retained session output, and model or UI presentation. Release builds pin an exact Workcell revision.
+
+Remote Workcell selection replaces the first-party execution backend. Startup requires the complete compatible catalog and workspace capabilities, even when a tool is disabled for the model. A missing or incompatible remote tool never falls back to local execution. The Local Documents section below describes remote-only tools for client-owned plans and memory by opaque reference. They are absent from embedded sessions. This development feature requires a matching Workcell build beyond the current release pin. See [Remote Workspaces](/docs/remote-workspaces/).
 
 ## Disabling tools
 
@@ -189,6 +191,38 @@ Return one symbol's source together with its immediate callers and callees.
 |-----------|------|----------|-------------|
 | `symbol` | string | yes | A symbol name, optionally qualified as `path::name` to disambiguate. |
 | `path` | string | no | Root-relative subdirectory to scope the map to. Absent means the whole configured root, and an empty string is the same as absent. |
+
+## Local Documents
+
+### `local_document_read` {#local_document_read}
+
+Read a client-owned plan or memory document by opaque reference. Available only for remote workspace sessions; it never accepts or reveals a host path.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `kind` | string | yes | Document kind associated with the reference. |
+| `reference` | string | yes | Opaque reference supplied by Caudra or a previous tool result. |
+
+### `local_document_write` {#local_document_write}
+
+Replace a client-owned plan or memory document by opaque reference. Available only for remote workspace sessions; it never accepts an arbitrary path.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `kind` | string | yes | Document kind associated with the reference. |
+| `reference` | string | yes | Opaque reference supplied by Caudra or a previous tool result. |
+| `content` | string | yes | Complete replacement content for the document. |
+
+### `local_document_apply_patch` {#local_document_apply_patch}
+
+Apply exact text replacements to a client-owned plan or memory document by opaque reference. Requires the revision returned by the latest read and rejects stale edits.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `kind` | string | yes | Document kind associated with the reference. |
+| `reference` | string | yes | Opaque reference supplied by Caudra or a previous tool result. |
+| `revision` | string | yes | Revision returned by the latest read. |
+| `edits` | array | yes | Exact text replacements applied in order. |
 
 ## Execution & Control
 

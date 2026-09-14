@@ -48,7 +48,9 @@ use crate::{
 };
 use caudra_config::{ModelPolicy, ToolOutputLines};
 use caudra_storage::id::SessionRef;
+use caudra_storage::local_documents::LocalDocumentStore;
 use caudra_storage::usage_ledger::LedgerPurpose;
+use caudra_workspace::WorkspaceSession;
 
 const MAX_REAUTH_ATTEMPTS: u32 = 2;
 const AUTH_RELOAD_POLL_MIN_MS: u64 = 250;
@@ -99,6 +101,8 @@ const RESUME_PROMPT: &str =
     "Continue the task from where you left off, and end your turn with a text response.";
 /// Reported in place of a spec when nothing is bound to the goal evaluator.
 const UNBOUND_EVALUATOR: &str = "default";
+const LOCAL_PLAN_WRITE_TOOLS: &str = "`file_write`, `file_edit`, or `file_apply_patch`";
+const REMOTE_PLAN_WRITE_TOOLS: &str = "`local_document_write` or `local_document_apply_patch`";
 
 /// Resolves an explicit or global binding against the selected Chat model.
 /// With no binding, the caller's effective model is the automatic fallback.
@@ -241,6 +245,10 @@ pub struct AgentParams {
     pub tool_output_lines: ToolOutputLines,
     pub permissions: Arc<PermissionManager>,
     pub session_id: Option<SessionRef>,
+    pub workspace_session: Option<WorkspaceSession>,
+    pub remote_project_context: Option<Arc<crate::remote_project_context::RemoteProjectContext>>,
+    pub local_documents: Option<Arc<LocalDocumentStore>>,
+    pub task_environment: Vars,
     pub root_tool_use_id: Option<String>,
     pub mailbox: Option<SessionMailbox>,
     pub context_publisher: Option<ContextPublisher>,
@@ -311,6 +319,10 @@ pub struct Agent<'h> {
     permissions: Arc<PermissionManager>,
     opts: RequestOptions,
     session_id: Option<SessionRef>,
+    workspace_session: Option<WorkspaceSession>,
+    remote_project_context: Option<Arc<crate::remote_project_context::RemoteProjectContext>>,
+    local_documents: Option<Arc<LocalDocumentStore>>,
+    task_environment: Vars,
     /// Numbers each turn so every log line inside one can be correlated.
     turn_id: u64,
     root_tool_use_id: Option<String>,
@@ -396,6 +408,10 @@ impl<'h> Agent<'h> {
             reauth_attempts: 0,
             opts: RequestOptions::default(),
             session_id: params.session_id,
+            workspace_session: params.workspace_session,
+            remote_project_context: params.remote_project_context,
+            local_documents: params.local_documents,
+            task_environment: params.task_environment,
             turn_id: 0,
             root_tool_use_id: params.root_tool_use_id,
             mailbox: params.mailbox,
@@ -739,6 +755,7 @@ impl<'h> Agent<'h> {
                 whole_file: &self.tool_context(),
                 slice: &slice,
                 vision: self.model.supports_vision(),
+                remote_context: self.remote_project_context.as_ref(),
             },
         )
         .await
@@ -1435,6 +1452,10 @@ impl<'h> Agent<'h> {
             event_tx: self.event_tx.clone(),
             mode: self.mode.clone(),
             session_id: self.session_id.clone(),
+            workspace_session: self.workspace_session.clone(),
+            remote_project_context: self.remote_project_context.clone(),
+            local_documents: self.local_documents.clone(),
+            task_environment: self.task_environment.clone(),
             context_publisher: self.context_publisher.clone(),
             tool_output_store: crate::tool_output::default_store(),
             tool_use_id: None,
@@ -1585,7 +1606,7 @@ impl AnnouncedMode {
     /// and its system prompt restates it every turn, so it announces nothing.
     fn of(mode: &AgentMode) -> Option<Self> {
         match mode {
-            AgentMode::Plan(_) => Some(Self::Plan),
+            AgentMode::Plan(_) | AgentMode::RemotePlan(_) => Some(Self::Plan),
             AgentMode::Build => Some(Self::Build),
             AgentMode::ReadOnly => None,
         }
@@ -1650,12 +1671,21 @@ fn mode_switch_notice(history: &[Message], next: &AgentMode) -> Option<Message> 
     if announced == last_announced_mode(history) {
         return None;
     }
-    let text = match next.plan_path() {
-        Some(plan_path) => Vars::new()
+    let text = match next {
+        AgentMode::Plan(plan_path) => Vars::new()
             .set("{plan_path}", plan_path.display().to_string())
+            .set("{plan_write_tools}", LOCAL_PLAN_WRITE_TOOLS)
             .apply(crate::prompt::PLAN_PROMPT)
             .into_owned(),
-        None => crate::prompt::BUILD_PROMPT.to_owned(),
+        AgentMode::RemotePlan(reference) => Vars::new()
+            .set(
+                "{plan_path}",
+                format!("opaque plan reference {}", reference.as_str()),
+            )
+            .set("{plan_write_tools}", REMOTE_PLAN_WRITE_TOOLS)
+            .apply(crate::prompt::PLAN_PROMPT)
+            .into_owned(),
+        AgentMode::Build | AgentMode::ReadOnly => crate::prompt::BUILD_PROMPT.to_owned(),
     };
     Some(Message::observation(text))
 }
@@ -1780,6 +1810,7 @@ mod tests {
         ContentBlock, Message, Model, ProviderEvent, RequestOptions, Role, StopReason,
         StreamResponse, TokenUsage,
     };
+    use caudra_workspace::PlanRef;
     use serde_json::Value;
     use test_case::test_case;
 
@@ -2304,6 +2335,10 @@ mod tests {
                     Arc::default(),
                 )),
                 session_id: None,
+                workspace_session: None,
+                remote_project_context: None,
+                local_documents: None,
+                task_environment: crate::template::env_vars(),
                 root_tool_use_id: None,
                 mailbox: None,
                 context_publisher: None,
@@ -3114,6 +3149,28 @@ mod tests {
                 .user_text()
                 .is_some_and(|text| text.contains(crate::prompt::PLAN_MODE_MARKER))
         );
+    }
+
+    #[test_case(false; "embedded_plan_uses_only_file_tools")]
+    #[test_case(true; "remote_plan_uses_only_local_document_tools")]
+    fn plan_notice_names_only_the_active_workspace_plan_tools(remote: bool) {
+        let mode = if remote {
+            AgentMode::RemotePlan(PlanRef::new("plan-test").expect("valid plan reference"))
+        } else {
+            plan_mode()
+        };
+        let notice = mode_switch_notice(&[], &mode).expect(EXPECTED_PLAN_NOTICE);
+        let text = notice.user_text().expect(EXPECTED_PLAN_NOTICE);
+        for tool in ["local_document_write", "local_document_apply_patch"] {
+            assert_eq!(text.contains(tool), remote, "{tool}: {text}");
+        }
+        for tool in ["`file_write`", "`file_edit`", "`file_apply_patch`"] {
+            assert_eq!(text.contains(tool), !remote, "{tool}: {text}");
+        }
+        if !remote {
+            assert!(!text.contains("local_"));
+        }
+        assert!(!text.contains("{plan_write_tools}"));
     }
 
     #[test]

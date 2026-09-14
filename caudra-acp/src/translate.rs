@@ -669,6 +669,7 @@ mod tests {
             annotation: None,
             written_path: written.map(str::to_owned),
             written_paths: Vec::new(),
+            remote_written_paths: false,
             output_ref: None,
             output_limits: None,
             model_suffix: None,

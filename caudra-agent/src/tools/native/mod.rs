@@ -11,6 +11,7 @@
 
 pub mod batch;
 pub mod image_generate;
+mod local_document;
 pub mod memory;
 pub mod question;
 pub mod skill;
@@ -27,6 +28,7 @@ use serde_json::json;
 use super::registry::{RegistryError, Tool, ToolEffect, ToolRegistry, ToolSource};
 use super::{DescriptionContext, ToolAudience, ToolFilter};
 use crate::permissions::canonical_json_sha256;
+use crate::remote_project_context::RemoteSkill;
 
 pub const OWNER: &str = "caudra";
 
@@ -35,6 +37,17 @@ pub fn register(registry: &ToolRegistry) -> Result<(), RegistryError> {
 }
 
 fn entries() -> Vec<(Arc<dyn Tool>, ToolSource, ToolEffect)> {
+    entries_with_skill(skill::SkillTool::default())
+}
+
+pub fn register_remote(
+    registry: &ToolRegistry,
+    skills: &[RemoteSkill],
+) -> Result<(), RegistryError> {
+    registry.register_many_audited(entries_with_skill(skill::SkillTool::remote(skills)))
+}
+
+fn entries_with_skill(skill: skill::SkillTool) -> Vec<(Arc<dyn Tool>, ToolSource, ToolEffect)> {
     vec![
         entry(
             tool_output::ToolOutputTool,
@@ -52,6 +65,21 @@ fn entries() -> Vec<(Arc<dyn Tool>, ToolSource, ToolEffect)> {
             image_generate::DESCRIPTION,
         ),
         entry(
+            local_document::LocalDocumentRead,
+            ToolEffect::ReadOnly,
+            local_document::READ_DESCRIPTION,
+        ),
+        entry(
+            local_document::LocalDocumentWrite,
+            ToolEffect::Mutating,
+            local_document::WRITE_DESCRIPTION,
+        ),
+        entry(
+            local_document::LocalDocumentApplyPatch,
+            ToolEffect::Mutating,
+            local_document::PATCH_DESCRIPTION,
+        ),
+        entry(
             memory::MemoryTool,
             ToolEffect::Mutating,
             memory::DESCRIPTION,
@@ -61,11 +89,7 @@ fn entries() -> Vec<(Arc<dyn Tool>, ToolSource, ToolEffect)> {
             ToolEffect::Isolated,
             question::DESCRIPTION,
         ),
-        entry(
-            skill::SkillTool::default(),
-            ToolEffect::ReadOnly,
-            skill::DESCRIPTION,
-        ),
+        entry(skill, ToolEffect::ReadOnly, skill::DESCRIPTION),
         entry(task::TaskTool, ToolEffect::Orchestrator, task::DESCRIPTION),
         entry(
             todo_write::TodoWrite,

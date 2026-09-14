@@ -5,12 +5,15 @@
 //! capped and the match is a scan of short strings. Anything larger than the
 //! cap is a repository the tree is the better way through anyway.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use ignore::WalkBuilder;
 use nucleo::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo::{Config, Matcher, Utf32Str};
+
+use crate::fs::backend::ResourceEntry;
 
 const MAX_FILES: usize = 20_000;
 const MAX_MATCHES: usize = 200;
@@ -28,6 +31,7 @@ pub struct QuickOpen {
     scroll: usize,
     matcher: Matcher,
     scratch: Vec<char>,
+    remote: HashMap<String, ResourceEntry>,
 }
 
 impl Default for QuickOpen {
@@ -42,6 +46,7 @@ impl Default for QuickOpen {
             scroll: 0,
             matcher: Matcher::new(Config::DEFAULT.match_paths()),
             scratch: Vec::new(),
+            remote: HashMap::new(),
         }
     }
 }
@@ -55,6 +60,7 @@ impl QuickOpen {
     /// palette costs a match rather than a full crawl of the tree. What makes
     /// the list stale is [`QuickOpen::invalidate`].
     pub fn open(&mut self, root: &Path, show_hidden: bool) {
+        self.remote.clear();
         let started = Instant::now();
         let walked = self.files.is_empty();
         if walked {
@@ -72,6 +78,23 @@ impl QuickOpen {
             files = self.files.len(),
             "workbench palette opened"
         );
+    }
+
+    pub fn open_remote(&mut self, entries: Vec<ResourceEntry>) {
+        self.open = true;
+        self.query.clear();
+        self.files.clear();
+        self.remote.clear();
+        for entry in entries {
+            if entry.kind != caudra_workspace::ResourceKind::File {
+                continue;
+            }
+            let path = entry.path.display();
+            self.files.push(path.clone());
+            self.remote.insert(path, entry);
+        }
+        self.files.sort();
+        self.rescan();
     }
 
     pub fn close(&mut self) {
@@ -112,6 +135,23 @@ impl QuickOpen {
     pub fn selected(&self, root: &Path) -> Option<PathBuf> {
         let index = *self.matches.get(self.selected)?;
         Some(root.join(&self.files[index]))
+    }
+
+    pub fn selected_remote(&self) -> Option<ResourceEntry> {
+        let index = *self.matches.get(self.selected)?;
+        self.remote.get(&self.files[index]).cloned()
+    }
+
+    pub fn replace_remote_entries(&mut self, entries: &[ResourceEntry]) {
+        if self.remote.is_empty() && !self.open {
+            return;
+        }
+        let query = self.query.clone();
+        let open = self.open;
+        self.open_remote(entries.to_vec());
+        self.open = open;
+        self.query = query;
+        self.rescan();
     }
 
     pub fn set_query(&mut self, query: String) {

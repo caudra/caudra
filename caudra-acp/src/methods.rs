@@ -9,8 +9,8 @@ use agent_client_protocol_schema::v1::{
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-const MODE_BUILD: &str = "build";
-const MODE_PLAN: &str = "plan";
+pub const MODE_BUILD: &str = "build";
+pub const MODE_PLAN: &str = "plan";
 
 pub const MODEL_CONFIG_ID: &str = "model";
 
@@ -68,5 +68,21 @@ pub fn mode_id_to_agent_mode(mode_id: &str, cwd: &Path) -> Option<caudra_agent::
             Some(caudra_agent::AgentMode::Plan(plan_path))
         }
         _ => None,
+    }
+}
+
+pub fn mode_id_to_agent_mode_for_session(
+    mode_id: &str,
+    cwd: &Path,
+    workspace: Option<&caudra_workspace::WorkspaceSession>,
+    documents: Option<&caudra_storage::local_documents::LocalDocumentStore>,
+    session_id: &str,
+) -> Option<caudra_agent::AgentMode> {
+    match (mode_id, workspace, documents) {
+        (MODE_PLAN, Some(workspace), Some(documents)) => documents
+            .create_plan(workspace.binding().project().key(), session_id)
+            .ok()
+            .map(caudra_agent::AgentMode::RemotePlan),
+        _ => mode_id_to_agent_mode(mode_id, cwd),
     }
 }
