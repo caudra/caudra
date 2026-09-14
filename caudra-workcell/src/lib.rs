@@ -5994,6 +5994,9 @@ mod tests {
             total,
             scan_complete,
             truncated: total > count || !scan_complete,
+            ignored: 0,
+            ignore_complete: true,
+            pruned_repositories: Vec::new(),
         }
     }
 
