@@ -25,9 +25,12 @@ pub use permission::{
 };
 // These limits are public because hosts may need to describe the same contract outside MCP.
 pub use progress::ShellProgressSink;
+#[cfg(feature = "mcp")]
+pub use progress::mcp_progress_sink;
 pub use types::{
     DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS, PreparedShell, ShellCommandAnalysis, ShellCommandScope,
-    ShellExecution, ShellFilterInfo, ShellInput, ShellOutput, ShellProgressChunk, ShellStream,
-    ShellWord,
+    ShellExecution, ShellFilterInfo, ShellInput, ShellOutput, ShellPolicyDecision,
+    ShellProgressChunk, ShellStream, ShellWord,
 };
 pub use workcell_tool_contract::{ToolAnnotations, ToolSpec};
+pub use workdir::STALE_WORKDIR_ERROR;

@@ -4,12 +4,16 @@
 //! host and an MCP client are answering to the same contract by construction.
 
 #[cfg(feature = "mcp")]
-use rmcp::model::{JsonObject, MetaObject, Tool, ToolAnnotations};
+use rmcp::model::{MetaObject, Tool, ToolAnnotations};
+use schemars::{JsonSchema, SchemaGenerator, generate::SchemaSettings};
 use serde_json::{Map, Value, json};
-use workcell_tool_contract::{ToolAnnotations as NeutralAnnotations, ToolSpec};
+use workcell_tool_contract::{ToolAnnotations as NeutralAnnotations, ToolContract, ToolSpec};
 
-#[cfg(feature = "mcp")]
-const PRESENTATION_KEY: &str = "ai.workcell/presentation";
+use crate::types::{
+    CodeContextOutput, CodeExpandOutput, CodeImpactOutput, CodeMapOutput, CodeRefsOutput,
+    SelectorRefusal,
+};
+
 const DRAFT_07: &str = "http://json-schema.org/draft-07/schema#";
 
 const MAP_DESCRIPTION: &str = r#"Rank every symbol in a source tree by importance and return the top ones. Start here when you do not know a codebase.
@@ -121,8 +125,16 @@ fn spec(
         input_schema,
         read_annotations(),
         presentation,
-        contract_id,
+        ToolContract::new(contract_id, "v1", "v1"),
     )
+    .with_output_schema(match name {
+        "code_map" => output_schema::<CodeMapOutput>(),
+        "code_context" => output_schema::<CodeContextOutput>(),
+        "code_refs" => output_union::<CodeRefsOutput, SelectorRefusal>(),
+        "code_impact" => output_union::<CodeImpactOutput, SelectorRefusal>(),
+        "code_expand" => output_union::<CodeExpandOutput, SelectorRefusal>(),
+        _ => unreachable!("canonical code-graph spec"),
+    })
 }
 
 /// Every tool here reads. None mutates, none is destructive, and none reaches the network.
@@ -137,15 +149,6 @@ fn read_annotations() -> NeutralAnnotations {
 
 #[cfg(feature = "mcp")]
 fn to_mcp_tool(spec: &ToolSpec) -> Tool {
-    let mut meta = JsonObject::new();
-    meta.insert(
-        PRESENTATION_KEY.to_owned(),
-        Value::String(spec.presentation.to_owned()),
-    );
-    meta.insert(
-        "ai.workcell/contract".to_owned(),
-        Value::String(spec.contract_id.to_owned()),
-    );
     let tool = Tool::new(
         spec.name,
         spec.description.clone(),
@@ -155,12 +158,11 @@ fn to_mcp_tool(spec: &ToolSpec) -> Tool {
         Some(title) => tool.with_title(title),
         None => tool,
     };
-    let tool = match &spec.output_schema {
-        Some(output_schema) => {
-            tool.with_raw_output_schema(std::sync::Arc::new(output_schema.clone()))
-        }
-        None => tool,
-    };
+    let tool = tool.with_raw_output_schema(std::sync::Arc::new(
+        spec.output_schema
+            .clone()
+            .expect("code-graph output schema"),
+    ));
     tool.with_annotations(ToolAnnotations::from_raw(
         None,
         spec.annotations.read_only_hint,
@@ -168,7 +170,33 @@ fn to_mcp_tool(spec: &ToolSpec) -> Tool {
         spec.annotations.idempotent_hint,
         spec.annotations.open_world_hint,
     ))
-    .with_meta(MetaObject(meta))
+    .with_meta(MetaObject(spec.extension_metadata()))
+}
+
+fn output_schema<T: JsonSchema>() -> Map<String, Value> {
+    Value::from(SchemaGenerator::new(SchemaSettings::draft07()).into_root_schema_for::<T>())
+        .as_object()
+        .expect("output schema is an object")
+        .clone()
+}
+
+fn output_union<A: JsonSchema, B: JsonSchema>() -> Map<String, Value> {
+    let mut variants = [output_schema::<A>(), output_schema::<B>()];
+    let mut definitions = Map::new();
+    for variant in &mut variants {
+        variant.remove("$schema");
+        if let Some(Value::Object(nested)) = variant.remove("definitions") {
+            definitions.extend(nested);
+        }
+    }
+    let mut output = schema(json!({
+        "$schema": DRAFT_07,
+        "oneOf": variants,
+    }));
+    if !definitions.is_empty() {
+        output.insert("definitions".to_owned(), Value::Object(definitions));
+    }
+    output
 }
 
 fn path_property() -> Value {

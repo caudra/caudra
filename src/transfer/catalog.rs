@@ -1,10 +1,9 @@
 use std::sync::Arc;
 
-use rmcp::model::{JsonObject, MetaObject, Tool, ToolAnnotations};
+use rmcp::model::{MetaObject, Tool, ToolAnnotations};
 use serde_json::{Map, Value, json};
-use workcell_tool_contract::{ToolAnnotations as NeutralAnnotations, ToolSpec};
+use workcell_tool_contract::{ToolAnnotations as NeutralAnnotations, ToolContract, ToolSpec};
 
-const PRESENTATION_KEY: &str = "ai.workcell/presentation-profile";
 const DRAFT_07: &str = "http://json-schema.org/draft-07/schema#";
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
@@ -49,7 +48,7 @@ pub fn specs(allow_write: bool) -> Vec<ToolSpec> {
                 open_world_hint: Some(false),
             },
             "transfer.download.v1",
-            "transfer.download.v1",
+            ToolContract::new("transfer.download.v1", "v1", "v1"),
         )
         .with_output_schema(download_output_schema()),
     ];
@@ -67,7 +66,7 @@ pub fn specs(allow_write: bool) -> Vec<ToolSpec> {
                     open_world_hint: Some(false),
                 },
                 "transfer.upload.v1",
-                "transfer.upload.v1",
+                ToolContract::new("transfer.upload.v1", "v1", "v1"),
             )
             .with_output_schema(upload_output_schema()),
         );
@@ -79,11 +78,6 @@ pub fn specs(allow_write: bool) -> Vec<ToolSpec> {
 // itself. This mirrors the projection in `crates/mcp-files/src/catalog.rs`; the duplication is the
 // cost of keeping `ToolSpec` protocol-free.
 fn to_mcp_tool(spec: &ToolSpec) -> Tool {
-    let mut meta = JsonObject::new();
-    meta.insert(
-        PRESENTATION_KEY.to_owned(),
-        Value::String(spec.presentation.to_owned()),
-    );
     let tool = Tool::new(
         spec.name,
         spec.description.clone(),
@@ -104,7 +98,7 @@ fn to_mcp_tool(spec: &ToolSpec) -> Tool {
         spec.annotations.idempotent_hint,
         spec.annotations.open_world_hint,
     ))
-    .with_meta(MetaObject(meta))
+    .with_meta(MetaObject(spec.extension_metadata()))
 }
 
 fn download_schema() -> Map<String, Value> {

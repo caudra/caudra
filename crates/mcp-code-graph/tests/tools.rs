@@ -6,6 +6,7 @@ use workcell_mcp_code_graph::{
     CodeContextInput, CodeExpandInput, CodeGraphToolGroup, CodeImpactInput, CodeMapInput,
     CodeRefsInput, Direction, GraphPhase, GraphProgress, GraphProgressSink, ModelText,
 };
+use workcell_mcp_files::{FileResource, FileResourceAccess};
 
 /// A tree with a clear importance gradient: `normalize` is called from three places, `orphan` from
 /// none, and a test reaches the middle of the chain.
@@ -75,6 +76,146 @@ async fn code_map_ranks_the_most_referenced_symbol_first() {
     let leader = &output.symbols[0];
     assert_eq!(leader.callers, 3, "three distinct callers");
     assert_eq!(leader.path, "src/normalize.rs");
+}
+
+#[tokio::test]
+async fn preparation_binds_validated_options_without_crawling() {
+    let (_directory, group) = group().await;
+    let scope = group.inspect_scope(None).await.expect("scope");
+    let impact = group
+        .prepare_code_impact(
+            CodeImpactInput {
+                symbol: "normalize_sku".to_owned(),
+                depth: Some(usize::MAX),
+                path: None,
+                limit: Some(usize::MAX),
+            },
+            scope,
+        )
+        .expect("prepare impact");
+    assert_eq!(impact.symbol(), "normalize_sku");
+    assert_eq!(impact.depth(), 8);
+    assert_eq!(impact.limit(), group.limits().max_result_limit);
+    assert_eq!(impact.path(), ".");
+    assert!(impact.retained_bytes() >= impact.symbol().len() + impact.path().len());
+
+    let context = group
+        .prepare_code_context(
+            CodeContextInput {
+                task: "find normalization".to_owned(),
+                path: None,
+                limit: Some(7),
+            },
+            group.inspect_scope(None).await.expect("scope"),
+        )
+        .expect("prepare context");
+    assert_eq!(context.task(), "find normalization");
+    assert_eq!(context.limit(), 7);
+    assert!(context.retained_bytes() >= context.task().len() + context.path().len());
+
+    let refs = group
+        .prepare_code_refs(
+            CodeRefsInput {
+                symbol: "normalize_sku".to_owned(),
+                direction: Direction::Callees,
+                path: None,
+                limit: Some(9),
+            },
+            group.inspect_scope(None).await.expect("scope"),
+        )
+        .expect("prepare refs");
+    assert_eq!(refs.symbol(), "normalize_sku");
+    assert_eq!(refs.direction(), Direction::Callees);
+    assert_eq!(refs.limit(), 9);
+    assert!(refs.retained_bytes() >= refs.symbol().len() + refs.path().len());
+
+    let expand = group
+        .prepare_code_expand(
+            CodeExpandInput {
+                symbol: "normalize_sku".to_owned(),
+                path: None,
+            },
+            group.inspect_scope(None).await.expect("scope"),
+        )
+        .expect("prepare expand");
+    assert_eq!(expand.symbol(), "normalize_sku");
+    assert!(expand.retained_bytes() >= expand.symbol().len() + expand.path().len());
+
+    let scope = group.inspect_scope(None).await.expect("scope");
+    assert!(
+        group
+            .prepare_code_context(
+                CodeContextInput {
+                    task: "   ".to_owned(),
+                    path: None,
+                    limit: None,
+                },
+                scope,
+            )
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn prepared_execution_uses_the_host_supplied_scope_not_the_raw_selector() {
+    let (directory, group) = group().await;
+    let prepared = group
+        .prepare_code_map(
+            CodeMapInput {
+                path: Some("tests".to_owned()),
+                limit: None,
+            },
+            FileResource {
+                requested_path: "host-authorized-src".to_owned(),
+                path: directory.path().join("src"),
+                root_relative_path: "src".to_owned(),
+                access: FileResourceAccess::Traverse,
+            },
+        )
+        .expect("prepare map");
+    assert_eq!(prepared.path(), "tests");
+    assert!(prepared.retained_bytes() >= prepared.path().len());
+
+    let output = group
+        .execute_prepared_code_map(prepared, None, &token())
+        .await
+        .expect("execute prepared map");
+    assert!(
+        output
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "normalize_sku")
+    );
+    assert!(
+        output
+            .symbols
+            .iter()
+            .all(|symbol| !symbol.path.starts_with("tests/"))
+    );
+}
+
+#[tokio::test]
+async fn prepared_execution_fails_when_the_authorized_scope_is_stale() {
+    let (directory, group) = group().await;
+    let scope = group.inspect_scope(Some("src")).await.expect("scope");
+    let prepared = group
+        .prepare_code_map(
+            CodeMapInput {
+                path: Some("src".to_owned()),
+                limit: None,
+            },
+            scope,
+        )
+        .expect("prepare map");
+    std::fs::rename(directory.path().join("src"), directory.path().join("moved"))
+        .expect("move scope");
+
+    assert!(
+        group
+            .execute_prepared_code_map(prepared, None, &token())
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]

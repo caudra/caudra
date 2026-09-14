@@ -23,7 +23,9 @@
         "inputSchema": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["query"],
+          "required": [
+            "query"
+          ],
           "properties": {
             "query": {
               "type": "string",
@@ -44,12 +46,126 @@
             }
           }
         },
+        "outputSchema": {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string"
+            },
+            "backend": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/WebsearchBackend"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "query": {
+              "type": "string"
+            },
+            "resultsFound": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "results": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/WebsearchResult"
+              }
+            },
+            "formattedResults": {
+              "type": "string",
+              "description": "Model-facing projection used for the MCP content block, not duplicated in structured output.",
+              "writeOnly": true
+            },
+            "error": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "errorMessage": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "kind",
+            "query",
+            "resultsFound",
+            "results",
+            "formattedResults"
+          ],
+          "title": "WebsearchOutput",
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "definitions": {
+            "WebsearchBackend": {
+              "type": "string",
+              "enum": [
+                "searxng",
+                "exa",
+                "exa-mcp",
+                "brave",
+                "kagi",
+                "serpapi"
+              ],
+              "description": "Search provider represented in normalized output."
+            },
+            "WebsearchResult": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "string"
+                },
+                "url": {
+                  "type": "string"
+                },
+                "snippet": {
+                  "type": "string"
+                },
+                "engine": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "iconUrl": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "iconDataUrl": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "title",
+                "url",
+                "snippet"
+              ]
+            }
+          }
+        },
         "annotations": {
           "readOnlyHint": true,
           "openWorldHint": true
         },
         "_meta": {
-          "ai.workcell/presentation-profile": "web.search.v1"
+          "ai.workcell/presentation-profile": "web.search.v1",
+          "ai.workcell/contract": {
+            "id": "web.search.v1",
+            "version": "v1",
+            "resultVersion": "v1"
+          }
         }
       },
       {
@@ -58,7 +174,9 @@
         "inputSchema": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["url"],
+          "required": [
+            "url"
+          ],
           "properties": {
             "url": {
               "type": "string",
@@ -66,12 +184,19 @@
             },
             "format": {
               "type": "string",
-              "enum": ["markdown", "text", "html"],
+              "enum": [
+                "markdown",
+                "text",
+                "html"
+              ],
               "description": "Output format."
             },
             "pdfMode": {
               "type": "string",
-              "enum": ["extract", "attachment"],
+              "enum": [
+                "extract",
+                "attachment"
+              ],
               "description": "PDF handling mode. Defaults to extract."
             },
             "timeout": {
@@ -82,12 +207,169 @@
             }
           }
         },
+        "outputSchema": {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string"
+            },
+            "url": {
+              "type": "string"
+            },
+            "finalUrl": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "contentType": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "format": {
+              "$ref": "#/definitions/WebfetchFormat"
+            },
+            "pdfMode": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/WebfetchPdfMode"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "status": {
+              "type": "integer",
+              "format": "uint16",
+              "minimum": 0,
+              "maximum": 65535
+            },
+            "title": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "output": {
+              "type": "string"
+            },
+            "summaryInput": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "truncated": {
+              "type": "boolean"
+            },
+            "pdfAttachment": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/WebfetchPdfAttachment"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "extractionMethod": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "extractionLowSignal": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "iconUrl": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "iconDataUrl": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "kind",
+            "url",
+            "format",
+            "status",
+            "output",
+            "truncated"
+          ],
+          "title": "WebfetchOutput",
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "definitions": {
+            "WebfetchFormat": {
+              "type": "string",
+              "enum": [
+                "markdown",
+                "text",
+                "html"
+              ]
+            },
+            "WebfetchPdfMode": {
+              "type": "string",
+              "enum": [
+                "extract",
+                "attachment"
+              ]
+            },
+            "WebfetchPdfAttachment": {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string"
+                },
+                "mime": {
+                  "type": "string"
+                },
+                "url": {
+                  "type": "string"
+                },
+                "filename": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "sizeBytes": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0
+                }
+              },
+              "required": [
+                "type",
+                "mime",
+                "url",
+                "sizeBytes"
+              ]
+            }
+          }
+        },
         "annotations": {
           "readOnlyHint": true,
           "openWorldHint": true
         },
         "_meta": {
-          "ai.workcell/presentation-profile": "web.source.v1"
+          "ai.workcell/presentation-profile": "web.source.v1",
+          "ai.workcell/contract": {
+            "id": "web.fetch.v1",
+            "version": "v1",
+            "resultVersion": "v1"
+          }
         }
       }
     ]

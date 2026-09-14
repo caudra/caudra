@@ -2,7 +2,12 @@
 
 //! Protocol-neutral typed APIs for embedding Workcell tools.
 
-pub use workcell_tool_contract::{ToolAnnotations, ToolSpec};
+pub use workcell_tool_contract::{
+    CatalogRevision, OwnedToolSpec, ToolAnnotations, ToolContract, ToolManifest, ToolSpec,
+};
+
+#[cfg(feature = "host-contract")]
+pub use workcell_host_contract as host_contract;
 
 #[cfg(feature = "environment")]
 pub use workcell_environment as environment;
@@ -49,3 +54,13 @@ pub use workcell_mcp_web::{PreparedWebfetch, PreparedWebsearch, WebToolGroup};
 // stream rather than replaying it has to render one itself.
 #[cfg(feature = "shell")]
 pub use workcell_output_filter as output_filter;
+
+#[cfg(feature = "scm")]
+pub use workcell_workspace_scm as scm;
+#[cfg(feature = "scm")]
+pub use workcell_workspace_scm::ScmGroup;
+
+#[cfg(feature = "snapshots")]
+pub use workcell_workspace_snapshot as snapshots;
+#[cfg(feature = "snapshots")]
+pub use workcell_workspace_snapshot::SnapshotManager;

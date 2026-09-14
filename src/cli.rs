@@ -6,6 +6,7 @@ use clap::{Parser, ValueEnum};
 use workcell_mcp_web::ProxyConfiguration;
 
 use crate::environment::StartupEnvironment;
+use crate::remote_host::RemoteHostConfiguration;
 
 pub const DEFAULT_PORT: u16 = 3001;
 const CODE_WORKER_CACHE_ENV: &str = "WORKCELL_MCP_CODE_WORKER_CACHE";
@@ -177,6 +178,30 @@ pub struct RawOptions {
     /// Maximum bytes accepted or served by a single `/files` transfer.
     #[arg(long)]
     pub max_transfer_bytes: Option<usize>,
+
+    /// Stable operator identifier for this remote Workcell server.
+    #[arg(long)]
+    pub remote_server_id: Option<String>,
+
+    /// Stable operator identifier for the workspace containing the configured project.
+    #[arg(long)]
+    pub remote_workspace_id: Option<String>,
+
+    /// Stable operator-configured generation of the remote workspace.
+    #[arg(long)]
+    pub remote_workspace_generation: Option<String>,
+
+    /// Stable operator identifier for the one project represented by root.
+    #[arg(long)]
+    pub remote_root_project_id: Option<String>,
+
+    /// Principal represented by this authenticated HTTP server process.
+    #[arg(long)]
+    pub remote_principal_id: Option<String>,
+
+    /// Existing private directory used for server-side workspace snapshots.
+    #[arg(long)]
+    pub snapshot_root: Option<PathBuf>,
 }
 
 pub struct CliOptions {
@@ -201,6 +226,8 @@ pub struct CliOptions {
     pub expose_execution_environment: bool,
     pub modern_only: bool,
     pub max_transfer_bytes: usize,
+    pub remote_host: Option<RemoteHostConfiguration>,
+    pub snapshot_root: Option<PathBuf>,
 }
 
 impl fmt::Debug for CliOptions {
@@ -249,6 +276,11 @@ impl fmt::Debug for CliOptions {
             )
             .field("modern_only", &self.modern_only)
             .field("max_transfer_bytes", &self.max_transfer_bytes)
+            .field("remote_host_configured", &self.remote_host.is_some())
+            .field(
+                "snapshot_root",
+                &self.snapshot_root.as_ref().map(|_| "[CONFIGURED]"),
+            )
             .finish()
     }
 }
@@ -271,6 +303,13 @@ pub enum CliError {
     TransferRequiresHttp,
     TransferOptionRequiresTransfer,
     InvalidMaxTransferBytes,
+    InvalidRemoteHost,
+    IncompleteRemoteHost,
+    RemoteHostRequiresHttp,
+    RemoteHostRequiresRoot,
+    SnapshotRequiresRemoteHost,
+    SnapshotRequiresWrite,
+    SnapshotRequiresFiles,
 }
 
 impl fmt::Display for CliError {
@@ -313,6 +352,21 @@ impl fmt::Display for CliError {
             }
             Self::InvalidMaxTransferBytes => {
                 "--max-transfer-bytes must be between 1 and 17179869184"
+            }
+            Self::InvalidRemoteHost => "remote-host identifiers are invalid",
+            Self::IncompleteRemoteHost => {
+                "remote-host discovery requires server, workspace, workspace-generation, root-project, and principal identifiers"
+            }
+            Self::RemoteHostRequiresHttp => {
+                "remote-host discovery requires --transport http"
+            }
+            Self::RemoteHostRequiresRoot => "remote-host discovery requires a configured root",
+            Self::SnapshotRequiresRemoteHost => {
+                "--snapshot-root requires authenticated remote-host discovery"
+            }
+            Self::SnapshotRequiresWrite => "--snapshot-root requires --allow-write",
+            Self::SnapshotRequiresFiles => {
+                "--snapshot-root requires the files tool group"
             }
         })
     }
@@ -477,13 +531,69 @@ impl RawOptions {
                 Some(_) => return Err(CliError::InvalidEnvironment),
             }
         };
+        let remote_server_id = self.remote_server_id.or(environment_value(
+            environment,
+            "WORKCELL_MCP_REMOTE_SERVER_ID",
+        )?);
+        let remote_workspace_id = self.remote_workspace_id.or(environment_value(
+            environment,
+            "WORKCELL_MCP_REMOTE_WORKSPACE_ID",
+        )?);
+        let remote_workspace_generation = self.remote_workspace_generation.or(environment_value(
+            environment,
+            "WORKCELL_MCP_REMOTE_WORKSPACE_GENERATION",
+        )?);
+        let remote_root_project_id = self.remote_root_project_id.or(environment_value(
+            environment,
+            "WORKCELL_MCP_REMOTE_ROOT_PROJECT_ID",
+        )?);
+        let remote_principal_id = self.remote_principal_id.or(environment_value(
+            environment,
+            "WORKCELL_MCP_REMOTE_PRINCIPAL_ID",
+        )?);
+        let remote_host = match (
+            remote_server_id,
+            remote_workspace_id,
+            remote_workspace_generation,
+            remote_root_project_id,
+            remote_principal_id,
+        ) {
+            (None, None, None, None, None) => None,
+            (Some(server), Some(workspace), Some(generation), Some(project), Some(principal)) => {
+                Some(
+                    RemoteHostConfiguration::new(server, workspace, generation, project, principal)
+                        .map_err(|_| CliError::InvalidRemoteHost)?,
+                )
+            }
+            _ => return Err(CliError::IncompleteRemoteHost),
+        };
+        if remote_host.is_some() && transport != Transport::Http {
+            return Err(CliError::RemoteHostRequiresHttp);
+        }
+        if remote_host.is_some() && self.root.is_none() {
+            return Err(CliError::RemoteHostRequiresRoot);
+        }
+        let snapshot_root =
+            self.snapshot_root.or(
+                environment_value(environment, "WORKCELL_MCP_SNAPSHOT_ROOT")?.map(PathBuf::from),
+            );
+        if snapshot_root.is_some() && remote_host.is_none() {
+            return Err(CliError::SnapshotRequiresRemoteHost);
+        }
+        if snapshot_root.is_some() && !self.allow_write {
+            return Err(CliError::SnapshotRequiresWrite);
+        }
+        if snapshot_root.is_some() && !groups.contains(&ToolGroup::Files) {
+            return Err(CliError::SnapshotRequiresFiles);
+        }
 
         // Transfer and code_graph both resolve every path through a confined `FileToolGroup`, so
         // they need a root for the same reason the files tools do.
         let has_local = groups.contains(&ToolGroup::Files)
             || groups.contains(&ToolGroup::Shell)
             || groups.contains(&ToolGroup::CodeGraph)
-            || groups.contains(&ToolGroup::Transfer);
+            || groups.contains(&ToolGroup::Transfer)
+            || remote_host.is_some();
         if has_local && self.root.is_none() {
             return Err(CliError::RootRequired);
         }
@@ -557,6 +667,8 @@ impl RawOptions {
             expose_execution_environment,
             modern_only,
             max_transfer_bytes,
+            remote_host,
+            snapshot_root,
         })
     }
 }
@@ -728,6 +840,161 @@ mod tests {
         for host in ["", "https://example.com", "user@example.com", "bad host"] {
             assert!(!valid_host(host));
         }
+    }
+
+    #[test]
+    fn remote_host_configuration_is_complete_http_only_and_rooted() {
+        let raw = RawOptions::try_parse_from([
+            "workcell-mcp",
+            "--transport",
+            "http",
+            "--tool-group",
+            "files",
+            "--remote-server-id",
+            "server",
+            "--remote-workspace-id",
+            "workspace",
+            "--remote-workspace-generation",
+            "generation",
+            "--remote-root-project-id",
+            "project",
+            "--remote-principal-id",
+            "principal",
+            ".",
+        ])
+        .unwrap();
+        let environment = StartupEnvironment::load(None).unwrap();
+        let options = raw.resolve(&environment).unwrap();
+        assert_eq!(
+            options.remote_host.unwrap().workspace_generation.as_str(),
+            "generation"
+        );
+
+        let partial = RawOptions::try_parse_from([
+            "workcell-mcp",
+            "--transport",
+            "http",
+            "--remote-server-id",
+            "server",
+            ".",
+        ])
+        .unwrap();
+        assert_eq!(
+            partial.resolve(&environment).unwrap_err(),
+            CliError::IncompleteRemoteHost
+        );
+
+        let missing_generation = RawOptions::try_parse_from([
+            "workcell-mcp",
+            "--transport",
+            "http",
+            "--remote-server-id",
+            "server",
+            "--remote-workspace-id",
+            "workspace",
+            "--remote-root-project-id",
+            "project",
+            "--remote-principal-id",
+            "principal",
+            ".",
+        ])
+        .unwrap();
+        assert_eq!(
+            missing_generation.resolve(&environment).unwrap_err(),
+            CliError::IncompleteRemoteHost
+        );
+
+        let stdio = RawOptions::try_parse_from([
+            "workcell-mcp",
+            "--remote-server-id",
+            "server",
+            "--remote-workspace-id",
+            "workspace",
+            "--remote-workspace-generation",
+            "generation",
+            "--remote-root-project-id",
+            "project",
+            "--remote-principal-id",
+            "principal",
+            ".",
+        ])
+        .unwrap();
+        assert_eq!(
+            stdio.resolve(&environment).unwrap_err(),
+            CliError::RemoteHostRequiresHttp
+        );
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("remote.env");
+        std::fs::write(
+            &path,
+            "WORKCELL_MCP_TRANSPORT=http\nWORKCELL_MCP_REMOTE_SERVER_ID=server-env\nWORKCELL_MCP_REMOTE_WORKSPACE_ID=workspace-env\nWORKCELL_MCP_REMOTE_WORKSPACE_GENERATION=generation-env\nWORKCELL_MCP_REMOTE_ROOT_PROJECT_ID=project-env\nWORKCELL_MCP_REMOTE_PRINCIPAL_ID=principal-env\n",
+        )
+        .unwrap();
+        let environment = StartupEnvironment::load(Some(&path)).unwrap();
+        let configured = RawOptions::try_parse_from(["workcell-mcp", "."])
+            .unwrap()
+            .resolve(&environment)
+            .unwrap();
+        assert_eq!(
+            configured
+                .remote_host
+                .unwrap()
+                .workspace_generation
+                .as_str(),
+            "generation-env"
+        );
+    }
+
+    #[test]
+    fn snapshot_storage_is_explicit_remote_write_configuration() {
+        let environment = StartupEnvironment::load(None).unwrap();
+        let without_remote = RawOptions::try_parse_from([
+            "workcell-mcp",
+            "--transport",
+            "http",
+            "--tool-group",
+            "files",
+            "--allow-write",
+            "--snapshot-root",
+            "/private/snapshots",
+            ".",
+        ])
+        .unwrap();
+        assert_eq!(
+            without_remote.resolve(&environment).unwrap_err(),
+            CliError::SnapshotRequiresRemoteHost
+        );
+
+        let configured = RawOptions::try_parse_from([
+            "workcell-mcp",
+            "--transport",
+            "http",
+            "--tool-group",
+            "files",
+            "--allow-write",
+            "--remote-server-id",
+            "server",
+            "--remote-workspace-id",
+            "workspace",
+            "--remote-workspace-generation",
+            "generation",
+            "--remote-root-project-id",
+            "project",
+            "--remote-principal-id",
+            "principal",
+            "--snapshot-root",
+            "/private/snapshots",
+            ".",
+        ])
+        .unwrap()
+        .resolve(&environment)
+        .unwrap();
+        assert_eq!(
+            configured.snapshot_root.as_deref(),
+            Some(std::path::Path::new("/private/snapshots"))
+        );
+        assert!(!format!("{configured:?}").contains("/private/snapshots"));
     }
 
     /// Transfer mints URLs for an HTTP route this process would never serve over stdio, so the

@@ -2,8 +2,14 @@
   "fixtureVersion": 1,
   "caseID": "catalog.execution-environment.sdk-emitted.v1",
   "catalogKind": "sdk-emitted",
-  "server": { "name": "workcell-mcp", "version": "0.1.0" },
-  "provenance": ["src/execution_environment.rs", "src/server.rs"],
+  "server": {
+    "name": "workcell-mcp",
+    "version": "0.1.0"
+  },
+  "provenance": [
+    "src/execution_environment.rs",
+    "src/server.rs"
+  ],
   "expected": {
     "tools": [
       {
@@ -33,12 +39,16 @@
             "commands"
           ],
           "properties": {
-            "version": { "const": "v1" },
+            "version": {
+              "const": "v1"
+            },
             "snapshotRevision": {
               "type": "string",
               "pattern": "^sha256:[0-9a-f]{64}$"
             },
-            "scope": { "const": "server-process" },
+            "scope": {
+              "const": "server-process"
+            },
             "os": {
               "type": "object",
               "additionalProperties": false,
@@ -52,24 +62,53 @@
                 "systemPackageManager"
               ],
               "properties": {
-                "family": { "enum": ["linux", "macos", "windows", "other"] },
-                "architecture": {
-                  "enum": ["x86_64", "aarch64", "x86", "arm", "other"]
+                "family": {
+                  "enum": [
+                    "linux",
+                    "macos",
+                    "windows",
+                    "other"
+                  ]
                 },
-                "pathStyle": { "enum": ["windows", "posix"] },
+                "architecture": {
+                  "enum": [
+                    "x86_64",
+                    "aarch64",
+                    "x86",
+                    "arm",
+                    "other"
+                  ]
+                },
+                "pathStyle": {
+                  "enum": [
+                    "windows",
+                    "posix"
+                  ]
+                },
                 "kernelRelease": {
-                  "type": ["string", "null"],
+                  "type": [
+                    "string",
+                    "null"
+                  ],
                   "maxLength": 128
                 },
                 "distribution": {
-                  "type": ["string", "null"],
+                  "type": [
+                    "string",
+                    "null"
+                  ],
                   "maxLength": 128
                 },
-                "wsl": { "type": "boolean" },
+                "wsl": {
+                  "type": "boolean"
+                },
                 "systemPackageManager": {
                   "type": "object",
                   "additionalProperties": false,
-                  "required": ["name", "available"],
+                  "required": [
+                    "name",
+                    "available"
+                  ],
                   "properties": {
                     "name": {
                       "enum": [
@@ -88,7 +127,9 @@
                         "unknown"
                       ]
                     },
-                    "available": { "type": "boolean" },
+                    "available": {
+                      "type": "boolean"
+                    },
                     "executable": {
                       "enum": [
                         "apt-get",
@@ -117,10 +158,17 @@
             "runtime": {
               "type": "object",
               "additionalProperties": false,
-              "required": ["name", "version"],
+              "required": [
+                "name",
+                "version"
+              ],
               "properties": {
-                "name": { "const": "workcell-mcp" },
-                "version": { "type": "string" }
+                "name": {
+                  "const": "workcell-mcp"
+                },
+                "version": {
+                  "type": "string"
+                }
               }
             },
             "execution": {
@@ -134,20 +182,47 @@
                 "privilege"
               ],
               "properties": {
-                "shell": { "enum": ["bash", "cmd", "other", "none"] },
-                "sandbox": {
-                  "enum": ["container", "virtual-machine", "unknown"]
+                "shell": {
+                  "enum": [
+                    "bash",
+                    "cmd",
+                    "other",
+                    "none"
+                  ]
                 },
-                "networkAccess": { "enum": ["host-policy", "proxied"] },
+                "sandbox": {
+                  "enum": [
+                    "container",
+                    "virtual-machine",
+                    "unknown"
+                  ]
+                },
+                "networkAccess": {
+                  "enum": [
+                    "host-policy",
+                    "proxied"
+                  ]
+                },
                 "environmentInheritance": {
-                  "enum": ["allowlisted", "not-applicable"]
+                  "enum": [
+                    "allowlisted",
+                    "not-applicable"
+                  ]
                 },
                 "privilege": {
                   "type": "object",
                   "additionalProperties": false,
-                  "required": ["effectiveRoot", "nonInteractiveSudo"],
+                  "required": [
+                    "effectiveRoot",
+                    "nonInteractiveSudo"
+                  ],
                   "properties": {
-                    "effectiveRoot": { "type": ["boolean", "null"] },
+                    "effectiveRoot": {
+                      "type": [
+                        "boolean",
+                        "null"
+                      ]
+                    },
                     "nonInteractiveSudo": {
                       "enum": [
                         "available",
@@ -165,7 +240,10 @@
             "container": {
               "type": "object",
               "additionalProperties": false,
-              "required": ["kind", "evidence"],
+              "required": [
+                "kind",
+                "evidence"
+              ],
               "properties": {
                 "kind": {
                   "enum": [
@@ -204,26 +282,44 @@
             "workspace": {
               "type": "object",
               "additionalProperties": false,
-              "required": ["git", "packageManager"],
+              "required": [
+                "git",
+                "packageManager"
+              ],
               "properties": {
                 "git": {
                   "type": "object",
                   "additionalProperties": false,
-                  "required": ["available", "repository"],
+                  "required": [
+                    "available",
+                    "repository"
+                  ],
                   "properties": {
-                    "available": { "type": "boolean" },
-                    "repository": { "enum": ["yes", "no", "unknown"] }
+                    "available": {
+                      "type": "boolean"
+                    },
+                    "repository": {
+                      "enum": [
+                        "yes",
+                        "no",
+                        "unknown"
+                      ]
+                    }
                   }
                 },
                 "packageManager": {
                   "type": "object",
                   "additionalProperties": false,
-                  "required": ["lockfiles"],
+                  "required": [
+                    "lockfiles"
+                  ],
                   "properties": {
                     "declared": {
                       "type": "object",
                       "additionalProperties": false,
-                      "required": ["name"],
+                      "required": [
+                        "name"
+                      ],
                       "properties": {
                         "name": {
                           "type": "string",
@@ -263,13 +359,29 @@
             "toolGroups": {
               "type": "object",
               "additionalProperties": false,
-              "required": ["files", "web", "shell", "code", "codeGraph"],
+              "required": [
+                "files",
+                "web",
+                "shell",
+                "code",
+                "codeGraph"
+              ],
               "properties": {
-                "files": { "type": "boolean" },
-                "web": { "type": "boolean" },
-                "shell": { "type": "boolean" },
-                "code": { "type": "boolean" },
-                "codeGraph": { "type": "boolean" }
+                "files": {
+                  "type": "boolean"
+                },
+                "web": {
+                  "type": "boolean"
+                },
+                "shell": {
+                  "type": "boolean"
+                },
+                "code": {
+                  "type": "boolean"
+                },
+                "codeGraph": {
+                  "type": "boolean"
+                }
               }
             },
             "commands": {
@@ -279,7 +391,10 @@
               "items": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["id", "available"],
+                "required": [
+                  "id",
+                  "available"
+                ],
                 "properties": {
                   "id": {
                     "enum": [
@@ -309,7 +424,9 @@
                       "devcontainer"
                     ]
                   },
-                  "available": { "type": "boolean" },
+                  "available": {
+                    "type": "boolean"
+                  },
                   "version": {
                     "type": "string",
                     "minLength": 1,
@@ -327,7 +444,12 @@
           "openWorldHint": true
         },
         "_meta": {
-          "ai.workcell/presentation-profile": "execution-environment.snapshot.v1"
+          "ai.workcell/presentation-profile": "execution-environment.snapshot.v1",
+          "ai.workcell/contract": {
+            "id": "execution-environment.snapshot.v1",
+            "version": "v1",
+            "resultVersion": "v1"
+          }
         }
       }
     ]

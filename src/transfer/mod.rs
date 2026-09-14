@@ -11,7 +11,7 @@
 pub mod catalog;
 pub mod endpoints;
 
-use std::path::Path;
+use std::{mem::size_of, path::Path, sync::Arc, time::SystemTime};
 
 use rmcp::{
     ErrorData,
@@ -31,11 +31,106 @@ const OCTET_STREAM: &str = "application/octet-stream";
 pub struct TransferToolGroup {
     files: FileToolGroup,
     max_transfer_bytes: usize,
+    authority: Arc<()>,
 }
 
 #[derive(Debug, Deserialize)]
 struct TransferInput {
     path: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransferDirection {
+    Download,
+    Upload,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct TransferRevision {
+    bytes: u64,
+    modified: Option<SystemTime>,
+    regular_file: bool,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    change_seconds: i64,
+    #[cfg(unix)]
+    change_nanoseconds: i64,
+}
+
+impl TransferRevision {
+    #[must_use]
+    pub const fn bytes(&self) -> u64 {
+        self.bytes
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum TransferPrecondition {
+    Missing,
+    Existing(TransferRevision),
+}
+
+#[derive(Debug)]
+pub struct PreparedTransfer {
+    authority: Arc<()>,
+    resource: workcell_mcp_files::FileResource,
+    direction: TransferDirection,
+    relative_path: String,
+    name: String,
+    max_bytes: usize,
+    precondition: TransferPrecondition,
+}
+
+impl PreparedTransfer {
+    /// Conservative retained bytes; the group's shared authority allocation is excluded.
+    #[must_use]
+    pub fn retained_bytes(&self) -> usize {
+        size_of::<Self>()
+            .saturating_add(self.resource.retained_bytes())
+            .saturating_add(self.relative_path.capacity())
+            .saturating_add(self.name.capacity())
+    }
+
+    #[must_use]
+    pub const fn direction(&self) -> TransferDirection {
+        self.direction
+    }
+
+    #[must_use]
+    pub const fn resource(&self) -> &workcell_mcp_files::FileResource {
+        &self.resource
+    }
+
+    #[must_use]
+    pub fn path(&self) -> &str {
+        &self.relative_path
+    }
+
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    #[must_use]
+    pub const fn max_bytes(&self) -> usize {
+        self.max_bytes
+    }
+
+    #[must_use]
+    pub const fn revision(&self) -> Option<&TransferRevision> {
+        match &self.precondition {
+            TransferPrecondition::Missing => None,
+            TransferPrecondition::Existing(revision) => Some(revision),
+        }
+    }
+
+    #[must_use]
+    pub const fn requires_absent_destination(&self) -> bool {
+        matches!(self.precondition, TransferPrecondition::Missing)
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -68,6 +163,7 @@ impl TransferToolGroup {
         Ok(Self {
             files: FileToolGroup::new(root, allow_write, None).await?,
             max_transfer_bytes,
+            authority: Arc::new(()),
         })
     }
 
@@ -86,6 +182,23 @@ impl TransferToolGroup {
         self.max_transfer_bytes
     }
 
+    pub async fn inspect(
+        &self,
+        name: &str,
+        arguments: Value,
+    ) -> Result<workcell_mcp_files::FileResource, String> {
+        let input = parse(arguments)?;
+        let access = match name {
+            "file_download" => FileResourceAccess::Read,
+            "file_upload" if self.files.allow_write() => FileResourceAccess::Write,
+            _ => return Err("unknown transfer tool".to_owned()),
+        };
+        self.files
+            .inspect_path(&input.path, access)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
     /// Returns `None` only when this group does not own the tool name, so a server can compose it
     /// alongside the other groups without a second routing table.
     pub async fn dispatch(
@@ -94,99 +207,114 @@ impl TransferToolGroup {
         arguments: Value,
     ) -> Option<Result<CallToolResult, ErrorData>> {
         match name {
-            "file_download" => Some(self.download(arguments).await),
-            "file_upload" if self.files.allow_write() => Some(self.upload(arguments).await),
+            "file_download" | "file_upload" if name == "file_download" || self.allow_write() => {
+                let prepared = match self.prepare(name, arguments).await {
+                    Ok(prepared) => prepared,
+                    Err(message) => return Some(tool_error(message)),
+                };
+                Some(self.execute_prepared(prepared).await)
+            }
             _ => None,
         }
     }
 
-    async fn download(&self, arguments: Value) -> Result<CallToolResult, ErrorData> {
-        let input = match parse(arguments) {
-            Ok(input) => input,
-            Err(message) => return tool_error(message),
-        };
-        let resource = match self
-            .files
-            .inspect_path(&input.path, FileResourceAccess::Read)
-            .await
-        {
-            Ok(resource) => resource,
-            Err(error) => return tool_error(error.to_string()),
-        };
-        let metadata = match tokio::fs::metadata(&resource.path).await {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return tool_error(format!("Path does not exist: {}", input.path));
+    /// Parses, resolves, and snapshots one transfer without minting a URL or moving bytes.
+    pub async fn prepare(&self, name: &str, arguments: Value) -> Result<PreparedTransfer, String> {
+        let input = parse(arguments)?;
+        let (direction, access) = match name {
+            "file_download" => (TransferDirection::Download, FileResourceAccess::Read),
+            "file_upload" if self.files.allow_write() => {
+                (TransferDirection::Upload, FileResourceAccess::Write)
             }
-            Err(_) => return tool_error(format!("Cannot read path: {}", input.path)),
+            _ => return Err("unknown transfer tool".to_owned()),
         };
-        if metadata.is_dir() {
-            return tool_error(format!(
-                "Path is a directory: {}. Transfer moves a single file; use file_read to list a directory.",
-                input.path
-            ));
-        }
-        if !metadata.is_file() {
-            return tool_error(format!("Path is not a regular file: {}", input.path));
-        }
-        let bytes = metadata.len();
-        if bytes > self.max_transfer_bytes as u64 {
-            return tool_error(format!(
-                "File is {bytes} bytes, larger than the {} byte transfer limit.",
-                self.max_transfer_bytes
-            ));
-        }
+        let resource = self
+            .files
+            .inspect_path(&input.path, access)
+            .await
+            .map_err(|error| error.to_string())?;
+        let precondition = match tokio::fs::metadata(&resource.path).await {
+            Ok(metadata) => {
+                if metadata.is_dir() {
+                    let message = if direction == TransferDirection::Download {
+                        format!(
+                            "Path is a directory: {}. Transfer moves a single file; use file_read to list a directory.",
+                            input.path
+                        )
+                    } else {
+                        format!("Path is a directory: {}", input.path)
+                    };
+                    return Err(message);
+                }
+                if direction == TransferDirection::Download && !metadata.is_file() {
+                    return Err(format!("Path is not a regular file: {}", input.path));
+                }
+                let revision = transfer_revision(&metadata);
+                if direction == TransferDirection::Download
+                    && revision.bytes > self.max_transfer_bytes as u64
+                {
+                    return Err(format!(
+                        "File is {} bytes, larger than the {} byte transfer limit.",
+                        revision.bytes, self.max_transfer_bytes
+                    ));
+                }
+                TransferPrecondition::Existing(revision)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if direction == TransferDirection::Download {
+                    return Err(format!("Path does not exist: {}", input.path));
+                }
+                TransferPrecondition::Missing
+            }
+            Err(_) => return Err(format!("Cannot inspect path: {}", input.path)),
+        };
         let relative = self.relative(&resource.path);
         let name = file_name(&resource.path);
-        let output = DownloadOutput {
-            method: "GET",
-            url: transfer_url(&relative),
-            path: relative,
+        Ok(PreparedTransfer {
+            authority: self.authority.clone(),
+            resource,
+            direction,
+            relative_path: relative,
             name,
-            bytes,
-        };
-        let text = format!(
-            "Prepared a download for `{}` ({} bytes). No bytes were transferred by this call.\n\nThe harness must now issue `GET {}` against the same origin as its MCP endpoint, reusing the credentials it already sends, and write the response body to the destination the user asked for.",
-            output.name, output.bytes, output.url
-        );
-        success(&output, text)
+            max_bytes: self.max_transfer_bytes,
+            precondition,
+        })
     }
 
-    async fn upload(&self, arguments: Value) -> Result<CallToolResult, ErrorData> {
-        let input = match parse(arguments) {
-            Ok(input) => input,
-            Err(message) => return tool_error(message),
+    /// Reauthorizes and consumes a prepared transfer before minting its bearer-authenticated route.
+    pub async fn execute_prepared(
+        &self,
+        prepared: PreparedTransfer,
+    ) -> Result<CallToolResult, ErrorData> {
+        if !Arc::ptr_eq(&self.authority, &prepared.authority) {
+            return tool_error("Prepared transfer belongs to a different transfer tool group");
+        }
+        if prepared.direction == TransferDirection::Upload && !self.files.allow_write() {
+            return tool_error("This server was started without --allow-write");
+        }
+        let access = match prepared.direction {
+            TransferDirection::Download => FileResourceAccess::Read,
+            TransferDirection::Upload => FileResourceAccess::Write,
         };
-        let resource = match self
+        let current = match self
             .files
-            .inspect_path(&input.path, FileResourceAccess::Write)
+            .inspect_path(&prepared.resource.requested_path, access)
             .await
         {
             Ok(resource) => resource,
             Err(error) => return tool_error(error.to_string()),
         };
-        // Refuse a destination the endpoint would reject anyway, so the harness does not discover it
-        // only after streaming a body.
-        if let Ok(metadata) = tokio::fs::metadata(&resource.path).await
-            && metadata.is_dir()
-        {
-            return tool_error(format!("Path is a directory: {}", input.path));
+        if current.path != prepared.resource.path {
+            return tool_error("Transfer resource changed after preparation");
         }
-        let relative = self.relative(&resource.path);
-        let name = file_name(&resource.path);
-        let output = UploadOutput {
-            method: "POST",
-            url: transfer_url(&relative),
-            path: relative,
-            name,
-            content_type: OCTET_STREAM,
-            max_bytes: self.max_transfer_bytes,
-        };
-        let text = format!(
-            "Prepared an upload for `{}`. No bytes were transferred by this call.\n\nThe harness must now issue `POST {}` against the same origin as its MCP endpoint, with `Content-Type: {}`, the raw bytes as the request body, and the credentials it already sends. Bodies over {} bytes are rejected.",
-            output.name, output.url, OCTET_STREAM, output.max_bytes
-        );
-        success(&output, text)
+        if let Err(message) = verify_precondition(&prepared).await {
+            return tool_error(message);
+        }
+
+        match prepared.direction {
+            TransferDirection::Download => complete_download(prepared),
+            TransferDirection::Upload => complete_upload(prepared),
+        }
     }
 
     /// Falls back to the absolute path when the resolved path is not beneath the root. Confined
@@ -198,6 +326,76 @@ impl TransferToolGroup {
             .to_string_lossy()
             .into_owned()
     }
+}
+
+fn transfer_revision(metadata: &std::fs::Metadata) -> TransferRevision {
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
+
+    TransferRevision {
+        bytes: metadata.len(),
+        modified: metadata.modified().ok(),
+        regular_file: metadata.is_file(),
+        #[cfg(unix)]
+        device: metadata.dev(),
+        #[cfg(unix)]
+        inode: metadata.ino(),
+        #[cfg(unix)]
+        change_seconds: metadata.ctime(),
+        #[cfg(unix)]
+        change_nanoseconds: metadata.ctime_nsec(),
+    }
+}
+
+async fn verify_precondition(prepared: &PreparedTransfer) -> Result<(), &'static str> {
+    let current = tokio::fs::metadata(&prepared.resource.path).await;
+    match (&prepared.precondition, current) {
+        (TransferPrecondition::Missing, Err(error))
+            if error.kind() == std::io::ErrorKind::NotFound =>
+        {
+            Ok(())
+        }
+        (TransferPrecondition::Existing(expected), Ok(metadata))
+            if !metadata.is_dir() && transfer_revision(&metadata) == *expected =>
+        {
+            Ok(())
+        }
+        _ => Err("Transfer resource changed after preparation"),
+    }
+}
+
+fn complete_download(prepared: PreparedTransfer) -> Result<CallToolResult, ErrorData> {
+    let TransferPrecondition::Existing(revision) = prepared.precondition else {
+        return tool_error("Transfer resource changed after preparation");
+    };
+    let output = DownloadOutput {
+        method: "GET",
+        url: transfer_url(&prepared.relative_path),
+        path: prepared.relative_path,
+        name: prepared.name,
+        bytes: revision.bytes,
+    };
+    let text = format!(
+        "Prepared a download for `{}` ({} bytes). No bytes were transferred by this call.\n\nThe harness must now issue `GET {}` against the same origin as its MCP endpoint, reusing the credentials it already sends, and write the response body to the destination the user asked for.",
+        output.name, output.bytes, output.url
+    );
+    success(&output, text)
+}
+
+fn complete_upload(prepared: PreparedTransfer) -> Result<CallToolResult, ErrorData> {
+    let output = UploadOutput {
+        method: "POST",
+        url: transfer_url(&prepared.relative_path),
+        path: prepared.relative_path,
+        name: prepared.name,
+        content_type: OCTET_STREAM,
+        max_bytes: prepared.max_bytes,
+    };
+    let text = format!(
+        "Prepared an upload for `{}`. No bytes were transferred by this call.\n\nThe harness must now issue `POST {}` against the same origin as its MCP endpoint, with `Content-Type: {}`, the raw bytes as the request body, and the credentials it already sends. Bodies over {} bytes are rejected.",
+        output.name, output.url, OCTET_STREAM, output.max_bytes
+    );
+    success(&output, text)
 }
 
 fn file_name(path: &Path) -> String {

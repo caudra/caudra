@@ -10,6 +10,7 @@
 //!
 //! Zero means "none found". It never means "none exists".
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// Ranked symbols for a tree.
@@ -109,7 +110,7 @@ pub struct CodeExpandInput {
 ///
 /// Present on every result. A ranking produced from a truncated crawl and one produced from a
 /// complete crawl are different claims, and nothing downstream can tell them apart without this.
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, JsonSchema, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GraphSummary {
     pub files_indexed: usize,
@@ -137,7 +138,7 @@ pub struct GraphSummary {
 }
 
 /// One ranked symbol.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, JsonSchema, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RankedSymbol {
     pub name: String,
@@ -157,7 +158,7 @@ pub struct RankedSymbol {
 }
 
 /// A symbol named without a rank, used where ordering comes from something else.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, JsonSchema, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SymbolRef {
     pub name: String,
@@ -168,7 +169,7 @@ pub struct SymbolRef {
 }
 
 /// A symbol reached by walking the graph, with how far away it is.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, JsonSchema, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReachedSymbol {
     #[serde(flatten)]
@@ -179,7 +180,7 @@ pub struct ReachedSymbol {
     pub test_scope: bool,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, JsonSchema, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodeMapOutput {
     /// The subtree that was mapped, root-relative. `.` is the whole root.
@@ -195,7 +196,7 @@ pub struct CodeMapOutput {
     pub graph: GraphSummary,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, JsonSchema, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodeContextOutput {
     pub task: String,
@@ -218,7 +219,7 @@ pub struct CodeContextOutput {
     pub graph: GraphSummary,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, JsonSchema, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodeRefsOutput {
     pub symbol: String,
@@ -236,7 +237,7 @@ pub struct CodeRefsOutput {
     pub graph: GraphSummary,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, JsonSchema, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodeImpactOutput {
     pub symbol: String,
@@ -254,7 +255,7 @@ pub struct CodeImpactOutput {
     pub graph: GraphSummary,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, JsonSchema, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodeExpandOutput {
     pub symbol: String,
@@ -284,7 +285,7 @@ pub struct CodeExpandOutput {
 /// Distinct from an empty result on purpose. `code_refs` on a symbol with no callers is the answer
 /// `0`; `code_refs` on a misspelled symbol is not an answer at all, and returning `0` for it would
 /// let a caller conclude something false about code that exists.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, JsonSchema, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SelectorRefusal {
     /// Always true, so a consumer can branch without inspecting the shape.

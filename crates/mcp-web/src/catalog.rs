@@ -2,14 +2,12 @@
 use std::sync::Arc;
 
 #[cfg(feature = "mcp")]
-use rmcp::model::{JsonObject, MetaObject, Tool, ToolAnnotations};
+use rmcp::model::{MetaObject, Tool, ToolAnnotations};
+use schemars::{JsonSchema, SchemaGenerator, generate::SchemaSettings};
 use serde_json::{Map, Value, json};
 
-use crate::WebsearchExecutionConfiguration;
-use workcell_tool_contract::{ToolAnnotations as NeutralAnnotations, ToolSpec};
-
-#[cfg(feature = "mcp")]
-const PRESENTATION_KEY: &str = "ai.workcell/presentation-profile";
+use crate::{WebfetchOutput, WebsearchExecutionConfiguration, WebsearchOutput};
+use workcell_tool_contract::{ToolAnnotations as NeutralAnnotations, ToolContract, ToolSpec};
 
 const WEBFETCH_DESCRIPTION: &str = r#"Fetch content from a URL and return model-facing text.
 
@@ -53,6 +51,7 @@ pub fn specs(current_year: i32, configuration: &WebsearchExecutionConfiguration)
             })),
             "web.source.v1",
             "web.fetch.v1",
+            output_schema::<WebfetchOutput>(),
         ),
     ]
 }
@@ -89,6 +88,7 @@ fn websearch_spec(current_year: i32, configuration: &WebsearchExecutionConfigura
         })),
         "web.search.v1",
         "web.search.v1",
+        output_schema::<WebsearchOutput>(),
     )
 }
 
@@ -99,6 +99,7 @@ fn spec(
     input_schema: Map<String, Value>,
     profile: &'static str,
     contract_id: &'static str,
+    output_schema: Map<String, Value>,
 ) -> ToolSpec {
     ToolSpec::new(
         name,
@@ -112,22 +113,25 @@ fn spec(
             open_world_hint: Some(true),
         },
         profile,
-        contract_id,
+        ToolContract::new(contract_id, "v1", "v1"),
     )
+    .with_output_schema(output_schema)
 }
 
 #[cfg(feature = "mcp")]
 fn to_mcp_tool(spec: &ToolSpec) -> Tool {
-    let mut meta = JsonObject::new();
-    meta.insert(
-        PRESENTATION_KEY.to_owned(),
-        Value::String(spec.presentation.to_owned()),
-    );
-    Tool::new(
+    let tool = Tool::new(
         spec.name,
         spec.description.clone(),
         Arc::new(spec.input_schema.clone()),
-    )
+    );
+    let tool = match spec.title {
+        Some(title) => tool.with_title(title),
+        None => tool,
+    };
+    tool.with_raw_output_schema(Arc::new(
+        spec.output_schema.clone().expect("web output schema"),
+    ))
     .with_annotations(ToolAnnotations::from_raw(
         None,
         spec.annotations.read_only_hint,
@@ -135,7 +139,14 @@ fn to_mcp_tool(spec: &ToolSpec) -> Tool {
         spec.annotations.idempotent_hint,
         spec.annotations.open_world_hint,
     ))
-    .with_meta(MetaObject(meta))
+    .with_meta(MetaObject(spec.extension_metadata()))
+}
+
+fn output_schema<T: JsonSchema>() -> Map<String, Value> {
+    Value::from(SchemaGenerator::new(SchemaSettings::draft07()).into_root_schema_for::<T>())
+        .as_object()
+        .expect("output schema is an object")
+        .clone()
 }
 
 fn schema(value: Value) -> Map<String, Value> {

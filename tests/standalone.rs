@@ -1,4 +1,9 @@
-use std::time::Duration;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+use std::{
+    process::{Command, Stdio},
+    time::Duration,
+};
 
 use reqwest::{Client, Response, StatusCode, header};
 use rmcp::ServiceExt;
@@ -7,6 +12,7 @@ use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use workcell_mcp::{
     cli::{HttpBindMode, ToolGroup},
+    remote_host::RemoteHostConfiguration,
     server::{ServerBehavior, ToolConfiguration, WorkcellServer},
     transports::http::{HttpAuthentication, HttpConfiguration, HttpServer, ShutdownOutcome},
 };
@@ -69,6 +75,8 @@ async fn fixture_server_with_options(
                 type_check: true,
             },
             max_transfer_bytes: workcell_mcp::cli::DEFAULT_MAX_TRANSFER_BYTES,
+            snapshot_root: None,
+            snapshot_exclusions: &[],
         },
     )
     .await
@@ -108,6 +116,27 @@ async fn stdio_supports_legacy_initialization_and_shell_progress() {
         &json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
     )
     .await;
+    write_json(
+        &mut write,
+        &legacy_request(20, "ai.workcell/status", json!({})),
+    )
+    .await;
+    let remote_refusal = read_json(&mut read).await;
+    assert_eq!(remote_refusal["error"]["code"], -32601);
+    write_json(
+        &mut write,
+        &legacy_request(21, "ai.workcell/scm-status", json!({})),
+    )
+    .await;
+    let scm_refusal = read_json(&mut read).await;
+    assert_eq!(scm_refusal["error"]["code"], -32601);
+    write_json(
+        &mut write,
+        &legacy_request(22, "ai.workcell/snapshot-capture", json!({})),
+    )
+    .await;
+    let snapshot_refusal = read_json(&mut read).await;
+    assert_eq!(snapshot_refusal["error"]["code"], -32601);
     write_json(
         &mut write,
         &legacy_request(
@@ -204,6 +233,45 @@ async fn stdio_rejects_modern_version_on_legacy_initialize_lifecycle() {
     assert!(server_task.await.unwrap().is_err());
 }
 
+#[tokio::test]
+async fn stdio_discovery_rejects_missing_and_legacy_request_context() {
+    let (_root, server) = fixture_server().await;
+    let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+    let server_task = tokio::spawn(async move {
+        server
+            .serve(server_transport)
+            .await
+            .expect("start MCP service")
+            .waiting()
+            .await
+            .expect("MCP service")
+    });
+    let (read, mut write) = tokio::io::split(client_transport);
+    let mut read = BufReader::new(read);
+
+    write_json(&mut write, &discover_request(1, json!({}))).await;
+    assert!(read_json(&mut read).await["result"].is_object());
+    write_json(
+        &mut write,
+        &json!({"jsonrpc":"2.0","id":2,"method":"server/discover","params":{}}),
+    )
+    .await;
+    assert_eq!(read_json(&mut read).await["error"]["code"], -32_602);
+
+    let mut legacy = discover_request(3, json!({}));
+    legacy["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"] =
+        json!(LEGACY_PROTOCOL_VERSION);
+    write_json(&mut write, &legacy).await;
+    assert_eq!(read_json(&mut read).await["error"]["code"], -32_022);
+
+    drop(write);
+    drop(read);
+    tokio::time::timeout(Duration::from_secs(2), server_task)
+        .await
+        .expect("server stopped")
+        .expect("server task");
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn stdio_streams_standard_shell_progress_before_the_result() {
@@ -276,7 +344,8 @@ async fn stdio_discovers_lists_and_calls_all_standalone_tools() {
             1,
             json!({
                 "extensions": {
-                    "ai.workcell/execution-environment": {"versions": ["v1"]}
+                    "ai.workcell/execution-environment": {"versions": ["v1"]},
+                    "ai.workcell/remote-host": {"versions": ["v1"]}
                 }
             }),
         ),
@@ -298,6 +367,36 @@ async fn stdio_discovers_lists_and_calls_all_standalone_tools() {
     assert_environment_descriptor(
         &discovered["result"]["capabilities"]["extensions"]["ai.workcell/execution-environment"],
     );
+    assert!(
+        discovered["result"]["capabilities"]["extensions"]["ai.workcell/remote-host"].is_null()
+    );
+
+    write_json(
+        &mut write,
+        &remote_request(
+            20,
+            "ai.workcell/watch-open",
+            json!({
+                "version":"v1",
+                "host":{
+                    "serverId":"server",
+                    "instanceId":"instance",
+                    "workspaceId":"workspace",
+                    "rootProjectId":"project",
+                    "principalId":"principal",
+                    "cwdHandle":"cwd",
+                    "catalogRevision":"catalog",
+                    "policyRevision":"policy"
+                },
+                "cwdHandle":"cwd",
+                "path":".",
+                "recursive":true
+            }),
+        ),
+    )
+    .await;
+    let refused = read_json(&mut read).await;
+    assert_eq!(refused["error"]["code"], -32601);
 
     write_json(&mut write, &mcp_request(2, "tools/list", json!({}))).await;
     let listed = read_json(&mut read).await;
@@ -440,6 +539,7 @@ async fn authenticated_http_has_one_stateless_mcp_route() {
             bind_mode: HttpBindMode::Loopback,
             allowed_hosts: vec!["127.0.0.1".into()],
             authentication: Some(HttpAuthentication::new(TOKEN).unwrap()),
+            remote_host: None,
         },
     )
     .await
@@ -521,6 +621,1629 @@ async fn authenticated_http_has_one_stateless_mcp_route() {
     assert_eq!(http.shutdown().await, ShutdownOutcome::AlreadyStopped);
 }
 
+#[tokio::test]
+async fn authenticated_http_discovers_one_opt_in_remote_environment() {
+    let (_root, server) = fixture_server().await;
+    let catalog_revision = server.catalog_revision().as_str().to_owned();
+    let http = HttpServer::start(
+        server,
+        0,
+        HttpConfiguration {
+            bind_mode: HttpBindMode::Loopback,
+            allowed_hosts: vec!["127.0.0.1".into()],
+            authentication: Some(HttpAuthentication::new(TOKEN).unwrap()),
+            remote_host: Some(
+                RemoteHostConfiguration::new(
+                    "server-a".into(),
+                    "workspace-a".into(),
+                    "generation-a".into(),
+                    "project-a".into(),
+                    "principal-a".into(),
+                )
+                .unwrap(),
+            ),
+        },
+    )
+    .await
+    .expect("HTTP server");
+    let endpoint = format!("http://{}/mcp", http.address());
+    let client = Client::new();
+    let requested = json!({
+        "extensions": {
+            "ai.workcell/remote-host": {"versions": ["v1"]}
+        }
+    });
+
+    let unauthenticated = post_rpc(
+        &client,
+        &endpoint,
+        None,
+        discover_request(1, requested.clone()),
+    )
+    .await;
+    assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+    let unrequested = post_rpc(
+        &client,
+        &endpoint,
+        Some(TOKEN),
+        discover_request(2, json!({})),
+    )
+    .await;
+    let unrequested = final_sse_json(unrequested).await;
+    assert!(
+        unrequested["result"]["capabilities"]["extensions"]["ai.workcell/remote-host"].is_null()
+    );
+
+    let first = post_rpc(
+        &client,
+        &endpoint,
+        Some(TOKEN),
+        discover_request(3, requested.clone()),
+    )
+    .await;
+    let first = final_sse_json(first).await;
+    let descriptor = &first["result"]["capabilities"]["extensions"]["ai.workcell/remote-host"];
+    assert_eq!(descriptor["version"], "v1");
+    assert_eq!(descriptor["serverId"], "server-a");
+    assert_eq!(descriptor["workspaceId"], "workspace-a");
+    assert_eq!(descriptor["workspaceGeneration"], "generation-a");
+    assert_eq!(descriptor["rootProjectId"], "project-a");
+    assert_eq!(descriptor["principalId"], "principal-a");
+    assert_eq!(descriptor["resourceNamespaceVersion"], "v1");
+    assert_eq!(descriptor["pathStyle"], "root-relative-posix");
+    assert!(
+        descriptor["cwd"]["handle"]
+            .as_str()
+            .unwrap()
+            .starts_with("cwd_")
+    );
+    assert_eq!(descriptor["cwd"]["displayPath"], ".");
+    assert_eq!(descriptor["revisions"]["catalog"], catalog_revision);
+    for revision in [
+        &descriptor["revisions"]["executionEnvironment"],
+        &descriptor["revisions"]["catalog"],
+        &descriptor["revisions"]["policy"],
+    ] {
+        assert!(revision.as_str().unwrap().starts_with("sha256:"));
+    }
+    assert_eq!(
+        descriptor["capabilities"]["operations"]["methods"]["prepare"],
+        true
+    );
+    assert_eq!(
+        descriptor["capabilities"]["operations"]["exactPreparation"],
+        true
+    );
+    assert_eq!(descriptor["capabilities"]["controlPlane"], false);
+    assert_eq!(
+        descriptor["capabilities"]["controlPlaneMissing"],
+        json!(["workspaceMutation", "snapshots"])
+    );
+    assert!(descriptor["capabilities"]["snapshots"].is_null());
+    assert_eq!(descriptor["capabilities"]["scm"]["version"], "v1");
+    assert_eq!(
+        descriptor["capabilities"]["scm"]["limits"]["maxConcurrentOperations"],
+        workcell_workspace_scm::MAX_CONCURRENT_SCM_OPERATIONS
+    );
+    assert_eq!(
+        descriptor["capabilities"]["scm"]["limits"]["maxConfigBytes"],
+        workcell_host_contract::MAX_SCM_CONFIG_BYTES
+    );
+    assert_eq!(
+        descriptor["capabilities"]["scm"]["limits"]["maxPaths"],
+        workcell_host_contract::MAX_SCM_PATHS
+    );
+    assert_eq!(
+        descriptor["capabilities"]["scm"]["limits"]["maxCommitBytes"],
+        workcell_host_contract::MAX_SCM_COMMIT_BYTES
+    );
+    assert_eq!(
+        descriptor["capabilities"]["scm"]["limits"]["maxLogScanBytes"],
+        workcell_host_contract::MAX_SCM_LOG_SCAN_BYTES
+    );
+    assert_eq!(descriptor["capabilities"]["scm"]["methods"]["status"], true);
+    assert_eq!(descriptor["capabilities"]["scm"]["methods"]["stage"], false);
+    assert_eq!(descriptor["capabilities"]["scm"]["discardUntracked"], false);
+    assert_eq!(descriptor["capabilities"]["workspace"]["version"], "v1");
+    assert_eq!(
+        descriptor["capabilities"]["workspace"]["methods"]["resolveDirectory"],
+        true
+    );
+    assert!(descriptor["capabilities"]["workspaceMutation"].is_null());
+    assert_eq!(descriptor["capabilities"]["watch"]["methods"]["poll"], true);
+    assert_eq!(
+        descriptor["capabilities"]["watch"]["exactRenamePairing"],
+        false
+    );
+    assert_eq!(
+        descriptor["capabilities"]["projectAssets"]["manifestVersion"],
+        "project-assets.v1"
+    );
+    assert_eq!(
+        descriptor["capabilities"]["projectAssets"]["limits"],
+        json!({
+            "maxAssets": workcell_host_contract::MAX_PROJECT_ASSETS,
+            "maxReadBytes": workcell_host_contract::MAX_PROJECT_ASSET_READ_BYTES,
+            "maxPathBytes": workcell_host_contract::MAX_WORKSPACE_PATH_BYTES,
+            "maxDiscoveryEntries": workcell_host_contract::MAX_WORKSPACE_LIST_ENTRIES,
+            "maxDiscoveryRetainedBytes": workcell_host_contract::MAX_WORKSPACE_LIST_RETAINED_BYTES,
+            "maxDiscoveryHashBytes": workcell_host_contract::MAX_WORKSPACE_LIST_HASH_BYTES,
+        })
+    );
+    assert_eq!(descriptor["capabilities"]["directExec"]["prepared"], true);
+    assert_eq!(
+        descriptor["capabilities"]["toolExecution"]["limits"]["maxRequestBytes"],
+        workcell_mcp::http_policy::MAX_JSON_BODY_BYTES
+    );
+    assert!(descriptor["capabilities"]["fileTransfer"].is_null());
+
+    let second = post_rpc(
+        &client,
+        &endpoint,
+        Some(TOKEN),
+        discover_request(4, requested),
+    )
+    .await;
+    let second = final_sse_json(second).await;
+    assert_eq!(
+        descriptor["instanceId"],
+        second["result"]["capabilities"]["extensions"]["ai.workcell/remote-host"]["instanceId"]
+    );
+    assert_eq!(http.shutdown().await, ShutdownOutcome::Completed);
+}
+
+#[tokio::test]
+async fn authenticated_snapshot_restore_is_negotiated_and_uses_the_common_ledger() {
+    let root = tempfile::tempdir().expect("temporary root");
+    let snapshot_root = tempfile::tempdir().expect("snapshot root");
+    #[cfg(unix)]
+    std::fs::set_permissions(snapshot_root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    tokio::fs::write(root.path().join("state.txt"), "before")
+        .await
+        .unwrap();
+    let server = WorkcellServer::configured(
+        Some(root.path()),
+        &[ToolGroup::Files, ToolGroup::Shell],
+        ServerBehavior {
+            expose_execution_environment: false,
+            modern_only: true,
+        },
+        ToolConfiguration {
+            allow_write: true,
+            web: WebsearchExecutionConfiguration::unconfigured(),
+            web_icons: false,
+            proxy: ProxyConfiguration::direct(),
+            shell_policy: ShellPermissionPolicy::restricted(),
+            shell_output_filter: true,
+            code: CodeConfiguration {
+                worker: WorkerSource::Discover {
+                    bundled_cache_root: None,
+                },
+                type_check: true,
+            },
+            max_transfer_bytes: workcell_mcp::cli::DEFAULT_MAX_TRANSFER_BYTES,
+            snapshot_root: Some(snapshot_root.path()),
+            snapshot_exclusions: &[],
+        },
+    )
+    .await
+    .unwrap();
+    let http = HttpServer::start(
+        server,
+        0,
+        HttpConfiguration {
+            bind_mode: HttpBindMode::Loopback,
+            allowed_hosts: vec!["127.0.0.1".into()],
+            authentication: Some(HttpAuthentication::new(TOKEN).unwrap()),
+            remote_host: Some(
+                RemoteHostConfiguration::new(
+                    "server-snapshot".into(),
+                    "workspace-snapshot".into(),
+                    "generation-snapshot".into(),
+                    "project-snapshot".into(),
+                    "principal-snapshot".into(),
+                )
+                .unwrap(),
+            ),
+        },
+    )
+    .await
+    .unwrap();
+    let endpoint = format!("http://{}/mcp", http.address());
+    let client = Client::new();
+    let discovery = final_sse_json(
+        post_rpc(
+            &client,
+            &endpoint,
+            Some(TOKEN),
+            discover_request(
+                1,
+                json!({"extensions":{"ai.workcell/remote-host":{"versions":["v1"]}}}),
+            ),
+        )
+        .await,
+    )
+    .await;
+    let descriptor = &discovery["result"]["capabilities"]["extensions"]["ai.workcell/remote-host"];
+    assert_eq!(descriptor["capabilities"]["controlPlane"], true);
+    assert_eq!(descriptor["capabilities"]["controlPlaneMissing"], json!([]));
+    assert_eq!(descriptor["capabilities"]["snapshots"]["version"], "v1");
+    assert_eq!(
+        descriptor["capabilities"]["snapshots"]["atomicAcrossFiles"],
+        false
+    );
+    assert_eq!(
+        descriptor["capabilities"]["snapshots"]["limits"]["maxCaptureEntries"],
+        workcell_host_contract::MAX_SNAPSHOT_CAPTURE_ENTRIES
+    );
+    assert_eq!(
+        descriptor["capabilities"]["snapshots"]["limits"]["maxCapturePathBytes"],
+        workcell_host_contract::MAX_SNAPSHOT_CAPTURE_PATH_BYTES
+    );
+    assert_eq!(descriptor["capabilities"]["watch"]["methods"]["poll"], true);
+    assert_eq!(descriptor["capabilities"]["scm"]["methods"]["status"], true);
+
+    let capture_params = json!({
+        "version":"v1",
+        "host":remote_host_binding(descriptor),
+        "cwdHandle":descriptor["cwd"]["handle"],
+        "checkpointId":"checkpoint-http"
+    });
+    let unauthenticated = post_rpc(
+        &client,
+        &endpoint,
+        None,
+        remote_request(2, "ai.workcell/snapshot-capture", capture_params.clone()),
+    )
+    .await;
+    assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+    let unnegotiated = final_sse_json(
+        post_rpc(
+            &client,
+            &endpoint,
+            Some(TOKEN),
+            mcp_request(3, "ai.workcell/snapshot-capture", capture_params.clone()),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(unnegotiated["error"]["code"], -32601);
+    let capture = final_sse_json(
+        post_rpc(
+            &client,
+            &endpoint,
+            Some(TOKEN),
+            remote_request(4, "ai.workcell/snapshot-capture", capture_params),
+        )
+        .await,
+    )
+    .await;
+    let snapshot_id = capture["result"]["snapshot"]["snapshotId"].clone();
+    assert_eq!(capture["result"]["snapshot"]["state"], "complete");
+
+    tokio::fs::write(root.path().join("state.txt"), "after")
+        .await
+        .unwrap();
+    let prepare = final_sse_json(
+        post_rpc(
+            &client,
+            &endpoint,
+            Some(TOKEN),
+            remote_request(
+                5,
+                "ai.workcell/snapshot-prepare-restore",
+                json!({
+                    "version":"v1",
+                    "host":remote_host_binding(descriptor),
+                    "cwdHandle":descriptor["cwd"]["handle"],
+                    "snapshotId":snapshot_id
+                }),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        prepare["result"]["preview"]["changes"][0]["kind"],
+        "replace"
+    );
+    assert_eq!(
+        prepare["result"]["preview"]["createdDirectories"],
+        json!([])
+    );
+    let restore_id = prepare["result"]["preview"]["restoreId"].clone();
+    assert!(restore_id.as_str().unwrap().starts_with("restore_"));
+    assert_eq!(
+        prepare["result"]["operation"]["intent"]["resources"]
+            .as_array()
+            .unwrap()
+            .len(),
+        4
+    );
+    assert!(
+        prepare["result"]["operation"]["intent"]["resources"][1]["display"]
+            .as_str()
+            .unwrap()
+            .starts_with("snapshot-store:pre-restore:snap_")
+    );
+    let execute = remote_request(
+        6,
+        "ai.workcell/execute",
+        json!({
+            "version":"v1",
+            "preparationId":prepare["result"]["operation"]["preparationId"],
+            "invocationId":"snapshot-restore-http",
+            "host":remote_host_binding(descriptor)
+        }),
+    );
+    let completed =
+        final_sse_json(post_rpc(&client, &endpoint, Some(TOKEN), execute.clone()).await).await;
+    assert_eq!(completed["result"]["state"], "completed", "{completed}");
+    assert_eq!(
+        completed["result"]["outcome"]["result"]["structuredContent"]["state"],
+        "completed"
+    );
+    assert_eq!(
+        completed["result"]["outcome"]["result"]["structuredContent"]["restoreId"],
+        restore_id
+    );
+    assert_eq!(
+        tokio::fs::read_to_string(root.path().join("state.txt"))
+            .await
+            .unwrap(),
+        "before"
+    );
+    let duplicate = final_sse_json(post_rpc(&client, &endpoint, Some(TOKEN), execute).await).await;
+    assert_eq!(duplicate["result"], completed["result"]);
+    assert_eq!(http.shutdown().await, ShutdownOutcome::Completed);
+
+    let reopened = WorkcellServer::configured(
+        Some(root.path()),
+        &[ToolGroup::Files, ToolGroup::Shell],
+        ServerBehavior {
+            expose_execution_environment: false,
+            modern_only: true,
+        },
+        ToolConfiguration {
+            allow_write: true,
+            web: WebsearchExecutionConfiguration::unconfigured(),
+            web_icons: false,
+            proxy: ProxyConfiguration::direct(),
+            shell_policy: ShellPermissionPolicy::restricted(),
+            shell_output_filter: true,
+            code: CodeConfiguration {
+                worker: WorkerSource::Discover {
+                    bundled_cache_root: None,
+                },
+                type_check: true,
+            },
+            max_transfer_bytes: workcell_mcp::cli::DEFAULT_MAX_TRANSFER_BYTES,
+            snapshot_root: Some(snapshot_root.path()),
+            snapshot_exclusions: &[],
+        },
+    )
+    .await
+    .unwrap();
+    let reopened_http = HttpServer::start(
+        reopened,
+        0,
+        HttpConfiguration {
+            bind_mode: HttpBindMode::Loopback,
+            allowed_hosts: vec!["127.0.0.1".into()],
+            authentication: Some(HttpAuthentication::new(TOKEN).unwrap()),
+            remote_host: Some(
+                RemoteHostConfiguration::new(
+                    "server-snapshot".into(),
+                    "workspace-snapshot".into(),
+                    "generation-snapshot".into(),
+                    "project-snapshot".into(),
+                    "principal-snapshot".into(),
+                )
+                .unwrap(),
+            ),
+        },
+    )
+    .await
+    .unwrap();
+    let reopened_endpoint = format!("http://{}/mcp", reopened_http.address());
+    let reopened_discovery = final_sse_json(
+        post_rpc(
+            &client,
+            &reopened_endpoint,
+            Some(TOKEN),
+            discover_request(
+                7,
+                json!({"extensions":{"ai.workcell/remote-host":{"versions":["v1"]}}}),
+            ),
+        )
+        .await,
+    )
+    .await;
+    let reopened_descriptor =
+        &reopened_discovery["result"]["capabilities"]["extensions"]["ai.workcell/remote-host"];
+    let restored_status = final_sse_json(
+        post_rpc(
+            &client,
+            &reopened_endpoint,
+            Some(TOKEN),
+            remote_request(
+                8,
+                "ai.workcell/snapshot-status",
+                json!({
+                    "version":"v1",
+                    "host":remote_host_binding(reopened_descriptor),
+                    "cwdHandle":reopened_descriptor["cwd"]["handle"],
+                    "restoreId":restore_id
+                }),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(restored_status["result"]["restore"]["state"], "completed");
+    assert_eq!(
+        restored_status["result"]["restore"]["restoreId"],
+        restore_id
+    );
+    assert_eq!(reopened_http.shutdown().await, ShutdownOutcome::Completed);
+}
+
+#[tokio::test]
+async fn authenticated_remote_mutation_is_prepared_once_replayed_and_released() {
+    let root = tempfile::tempdir().expect("temporary root");
+    let server = WorkcellServer::configured(
+        Some(root.path()),
+        &[ToolGroup::Files],
+        ServerBehavior {
+            expose_execution_environment: false,
+            modern_only: true,
+        },
+        ToolConfiguration {
+            allow_write: true,
+            web: WebsearchExecutionConfiguration::unconfigured(),
+            web_icons: false,
+            proxy: ProxyConfiguration::direct(),
+            shell_policy: ShellPermissionPolicy::restricted(),
+            shell_output_filter: true,
+            code: CodeConfiguration {
+                worker: WorkerSource::Discover {
+                    bundled_cache_root: None,
+                },
+                type_check: true,
+            },
+            max_transfer_bytes: workcell_mcp::cli::DEFAULT_MAX_TRANSFER_BYTES,
+            snapshot_root: None,
+            snapshot_exclusions: &[],
+        },
+    )
+    .await
+    .expect("server");
+    let http = HttpServer::start(
+        server,
+        0,
+        HttpConfiguration {
+            bind_mode: HttpBindMode::Loopback,
+            allowed_hosts: vec!["127.0.0.1".into()],
+            authentication: Some(HttpAuthentication::new(TOKEN).unwrap()),
+            remote_host: Some(
+                RemoteHostConfiguration::new(
+                    "server-a".into(),
+                    "workspace-a".into(),
+                    "generation-a".into(),
+                    "project-a".into(),
+                    "principal-a".into(),
+                )
+                .unwrap(),
+            ),
+        },
+    )
+    .await
+    .expect("HTTP server");
+    let endpoint = format!("http://{}/mcp", http.address());
+    let client = Client::new();
+    let discovery = final_sse_json(
+        post_rpc(
+            &client,
+            &endpoint,
+            Some(TOKEN),
+            discover_request(
+                1,
+                json!({"extensions":{"ai.workcell/remote-host":{"versions":["v1"]}}}),
+            ),
+        )
+        .await,
+    )
+    .await;
+    let descriptor = &discovery["result"]["capabilities"]["extensions"]["ai.workcell/remote-host"];
+    let host = remote_host_binding(descriptor);
+    let target = root.path().join("once.txt");
+    let prepare = remote_request(
+        2,
+        "ai.workcell/prepare",
+        json!({
+            "version":"v1",
+            "host":host,
+            "tool":"file_write",
+            "contract":{"id":"file.write.v1","version":"v1","resultVersion":"v1"},
+            "arguments":{"filePath":"once.txt","content":"first"}
+        }),
+    );
+    let unauthenticated = post_rpc(&client, &endpoint, None, prepare.clone()).await;
+    assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+    let mut unrequested_params = prepare["params"].clone();
+    unrequested_params.as_object_mut().unwrap().remove("_meta");
+    let unrequested = final_sse_json(
+        post_rpc(
+            &client,
+            &endpoint,
+            Some(TOKEN),
+            mcp_request(20, "ai.workcell/prepare", unrequested_params),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(unrequested["error"]["code"], -32601);
+    let prepared = final_sse_json(post_rpc(&client, &endpoint, Some(TOKEN), prepare).await).await;
+    assert!(prepared["error"].is_null(), "{prepared}");
+    assert!(!target.exists(), "prepare must not write");
+    assert_eq!(prepared["result"]["intent"]["mutating"], true);
+    let preparation_id = prepared["result"]["preparationId"].clone();
+    let replay_attempt = remote_request(
+        3,
+        "ai.workcell/execute",
+        json!({
+            "version":"v1",
+            "preparationId":preparation_id,
+            "invocationId":"invocation-a",
+            "host":remote_host_binding(descriptor),
+            "arguments":{"filePath":"replayed.txt","content":"replacement"}
+        }),
+    );
+    let replay_refused =
+        final_sse_json(post_rpc(&client, &endpoint, Some(TOKEN), replay_attempt).await).await;
+    assert_eq!(replay_refused["error"]["data"]["code"], "invalid_request");
+    let execute = remote_request(
+        21,
+        "ai.workcell/execute",
+        json!({
+            "version":"v1",
+            "preparationId":preparation_id,
+            "invocationId":"invocation-a",
+            "host":remote_host_binding(descriptor)
+        }),
+    );
+    let completed =
+        final_sse_json(post_rpc(&client, &endpoint, Some(TOKEN), execute.clone()).await).await;
+    assert_eq!(completed["result"]["state"], "completed", "{completed}");
+    let tool_result = &completed["result"]["outcome"]["result"];
+    assert_eq!(tool_result["version"], "v1");
+    assert_eq!(tool_result["isError"], false);
+    assert_eq!(tool_result["content"][0]["type"], "text");
+    assert!(tool_result["structuredContent"].is_object());
+    assert!(tool_result["resultType"].is_null());
+    assert_eq!(tokio::fs::read_to_string(&target).await.unwrap(), "first");
+    assert!(!root.path().join("replayed.txt").exists());
+    tokio::fs::write(&target, "changed-after-response")
+        .await
+        .unwrap();
+    let replayed = final_sse_json(post_rpc(&client, &endpoint, Some(TOKEN), execute).await).await;
+    assert_eq!(replayed["result"], completed["result"]);
+    assert_eq!(
+        tokio::fs::read_to_string(&target).await.unwrap(),
+        "changed-after-response"
+    );
+
+    let mut wrong_host = remote_host_binding(descriptor);
+    wrong_host["instanceId"] = json!("other-instance");
+    wrong_host["workspaceGeneration"] = json!("other-generation");
+    let mismatch = final_sse_json(
+        post_rpc(
+            &client,
+            &endpoint,
+            Some(TOKEN),
+            remote_request(
+                4,
+                "ai.workcell/status",
+                json!({
+                    "version":"v1",
+                    "preparationId":preparation_id,
+                    "invocationId":"invocation-a",
+                    "host":wrong_host
+                }),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(mismatch["error"]["data"]["code"], "binding_mismatch");
+
+    let released = final_sse_json(
+        post_rpc(
+            &client,
+            &endpoint,
+            Some(TOKEN),
+            remote_request(
+                5,
+                "ai.workcell/release",
+                json!({
+                    "version":"v1",
+                    "preparationId":preparation_id,
+                    "invocationId":"invocation-a",
+                    "host":remote_host_binding(descriptor)
+                }),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(released["result"]["released"], true);
+    let forgotten = final_sse_json(
+        post_rpc(
+            &client,
+            &endpoint,
+            Some(TOKEN),
+            remote_request(
+                6,
+                "ai.workcell/status",
+                json!({
+                    "version":"v1",
+                    "preparationId":preparation_id,
+                    "invocationId":"invocation-a",
+                    "host":remote_host_binding(descriptor)
+                }),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(forgotten["result"]["state"], "forgotten");
+    assert_eq!(http.shutdown().await, ShutdownOutcome::Completed);
+}
+
+#[tokio::test]
+async fn authenticated_scm_is_negotiated_structured_and_uses_the_common_ledger() {
+    let root = tempfile::tempdir().expect("temporary root");
+    git(root.path(), &["init", "--quiet", "--initial-branch=main"]);
+    git(root.path(), &["config", "user.name", "Workcell Test"]);
+    git(
+        root.path(),
+        &["config", "user.email", "workcell@example.invalid"],
+    );
+    tokio::fs::write(root.path().join("tracked.txt"), "before\n")
+        .await
+        .unwrap();
+    git(root.path(), &["add", "--", "tracked.txt"]);
+    git(root.path(), &["commit", "-m", "initial"]);
+    let server = WorkcellServer::configured(
+        Some(root.path()),
+        &[ToolGroup::Files],
+        ServerBehavior {
+            expose_execution_environment: false,
+            modern_only: true,
+        },
+        ToolConfiguration {
+            allow_write: true,
+            web: WebsearchExecutionConfiguration::unconfigured(),
+            web_icons: false,
+            proxy: ProxyConfiguration::direct(),
+            shell_policy: ShellPermissionPolicy::restricted(),
+            shell_output_filter: true,
+            code: CodeConfiguration {
+                worker: WorkerSource::Discover {
+                    bundled_cache_root: None,
+                },
+                type_check: true,
+            },
+            max_transfer_bytes: workcell_mcp::cli::DEFAULT_MAX_TRANSFER_BYTES,
+            snapshot_root: None,
+            snapshot_exclusions: &[],
+        },
+    )
+    .await
+    .unwrap();
+    let http = HttpServer::start(
+        server,
+        0,
+        HttpConfiguration {
+            bind_mode: HttpBindMode::Loopback,
+            allowed_hosts: vec!["127.0.0.1".into()],
+            authentication: Some(HttpAuthentication::new(TOKEN).unwrap()),
+            remote_host: Some(
+                RemoteHostConfiguration::new(
+                    "server-a".into(),
+                    "workspace-a".into(),
+                    "generation-a".into(),
+                    "project-a".into(),
+                    "principal-a".into(),
+                )
+                .unwrap(),
+            ),
+        },
+    )
+    .await
+    .unwrap();
+    let endpoint = format!("http://{}/mcp", http.address());
+    let client = Client::new();
+    let discovery = final_sse_json(
+        post_rpc(
+            &client,
+            &endpoint,
+            Some(TOKEN),
+            discover_request(
+                1,
+                json!({"extensions":{"ai.workcell/remote-host":{"versions":["v1"]}}}),
+            ),
+        )
+        .await,
+    )
+    .await;
+    let descriptor = &discovery["result"]["capabilities"]["extensions"]["ai.workcell/remote-host"];
+    assert_eq!(descriptor["capabilities"]["scm"]["methods"]["stage"], true);
+    assert_eq!(descriptor["capabilities"]["controlPlane"], false);
+    let params = json!({
+        "version":"v1",
+        "host":remote_host_binding(descriptor),
+        "cwdHandle":descriptor["cwd"]["handle"],
+        "path":"."
+    });
+    let unauthenticated = post_rpc(
+        &client,
+        &endpoint,
+        None,
+        remote_request(2, "ai.workcell/scm-discover", params.clone()),
+    )
+    .await;
+    assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+    let unnegotiated = final_sse_json(
+        post_rpc(
+            &client,
+            &endpoint,
+            Some(TOKEN),
+            mcp_request(3, "ai.workcell/scm-discover", params.clone()),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(unnegotiated["error"]["code"], -32601);
+    let repository = final_sse_json(
+        post_rpc(
+            &client,
+            &endpoint,
+            Some(TOKEN),
+            remote_request(4, "ai.workcell/scm-discover", params),
+        )
+        .await,
+    )
+    .await;
+    let repository_handle = repository["result"]["repository"]["handle"].clone();
+    let repository_resource_id = repository["result"]["repository"]["resourceId"].clone();
+    assert_eq!(repository["result"]["repository"]["root"], ".");
+
+    tokio::fs::write(root.path().join("tracked.txt"), "prepared\n")
+        .await
+        .unwrap();
+    let prepare = final_sse_json(
+        post_rpc(
+            &client,
+            &endpoint,
+            Some(TOKEN),
+            remote_request(
+                5,
+                "ai.workcell/scm-prepare-mutation",
+                json!({
+                    "version":"v1",
+                    "host":remote_host_binding(descriptor),
+                    "cwdHandle":descriptor["cwd"]["handle"],
+                    "repositoryHandle":repository_handle,
+                    "mutation":{"kind":"stage","paths":["tracked.txt"]}
+                }),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        prepare["result"]["preview"]["entries"][0]["unstaged"],
+        "modified"
+    );
+    assert_eq!(
+        prepare["result"]["operation"]["intent"]["resources"][0]["resourceId"],
+        repository_resource_id
+    );
+    assert_ne!(
+        prepare["result"]["operation"]["intent"]["resources"][0]["resourceId"],
+        repository_handle
+    );
+    let execute = remote_request(
+        6,
+        "ai.workcell/execute",
+        json!({
+            "version":"v1",
+            "preparationId":prepare["result"]["operation"]["preparationId"],
+            "invocationId":"scm-stage",
+            "host":remote_host_binding(descriptor)
+        }),
+    );
+    let completed =
+        final_sse_json(post_rpc(&client, &endpoint, Some(TOKEN), execute.clone()).await).await;
+    assert_eq!(completed["result"]["state"], "completed", "{completed}");
+    assert_eq!(
+        completed["result"]["outcome"]["result"]["structuredContent"]["mutation"]["kind"],
+        "stage"
+    );
+    tokio::fs::write(root.path().join("tracked.txt"), "after duplicate\n")
+        .await
+        .unwrap();
+    let duplicate = final_sse_json(post_rpc(&client, &endpoint, Some(TOKEN), execute).await).await;
+    assert_eq!(duplicate["result"], completed["result"]);
+    assert_eq!(git_text(root.path(), &["show", ":tracked.txt"]), "prepared");
+
+    let ordinary = final_sse_json(
+        post_rpc(
+            &client,
+            &endpoint,
+            Some(TOKEN),
+            mcp_request(
+                7,
+                "tools/call",
+                json!({"name":"file_read","arguments":{"filePath":"tracked.txt"}}),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_ne!(ordinary["result"]["isError"], true);
+    assert_eq!(http.shutdown().await, ShutdownOutcome::Completed);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn authenticated_workspace_operations_bind_cursors_mutations_and_direct_exec() {
+    let root = tempfile::tempdir().expect("temporary root");
+    tokio::fs::write(root.path().join("a.txt"), "needle before\n")
+        .await
+        .unwrap();
+    tokio::fs::write(root.path().join("b.txt"), "needle b\n")
+        .await
+        .unwrap();
+    tokio::fs::create_dir(root.path().join("sub"))
+        .await
+        .unwrap();
+    let policy = ShellPermissionPolicy::from_toml(
+        "version = 1\ndefault = \"deny\"\nallow = [\"printf *\", \"sleep *\"]\n",
+        false,
+    )
+    .unwrap();
+    let server = WorkcellServer::configured(
+        Some(root.path()),
+        &[ToolGroup::Files, ToolGroup::Shell],
+        ServerBehavior {
+            expose_execution_environment: false,
+            modern_only: true,
+        },
+        ToolConfiguration {
+            allow_write: true,
+            web: WebsearchExecutionConfiguration::unconfigured(),
+            web_icons: false,
+            proxy: ProxyConfiguration::direct(),
+            shell_policy: policy,
+            shell_output_filter: false,
+            code: CodeConfiguration {
+                worker: WorkerSource::Discover {
+                    bundled_cache_root: None,
+                },
+                type_check: true,
+            },
+            max_transfer_bytes: workcell_mcp::cli::DEFAULT_MAX_TRANSFER_BYTES,
+            snapshot_root: None,
+            snapshot_exclusions: &[],
+        },
+    )
+    .await
+    .unwrap();
+    let http = HttpServer::start(
+        server,
+        0,
+        HttpConfiguration {
+            bind_mode: HttpBindMode::Loopback,
+            allowed_hosts: vec!["127.0.0.1".into()],
+            authentication: Some(HttpAuthentication::new(TOKEN).unwrap()),
+            remote_host: Some(
+                RemoteHostConfiguration::new(
+                    "server-a".into(),
+                    "workspace-a".into(),
+                    "generation-a".into(),
+                    "project-a".into(),
+                    "principal-a".into(),
+                )
+                .unwrap(),
+            ),
+        },
+    )
+    .await
+    .unwrap();
+    let endpoint = format!("http://{}/mcp", http.address());
+    let client = Client::new();
+    let discovery = final_sse_json(
+        post_rpc(
+            &client,
+            &endpoint,
+            Some(TOKEN),
+            discover_request(
+                1,
+                json!({"extensions":{"ai.workcell/remote-host":{"versions":["v1"]}}}),
+            ),
+        )
+        .await,
+    )
+    .await;
+    let descriptor = &discovery["result"]["capabilities"]["extensions"]["ai.workcell/remote-host"];
+    assert_eq!(
+        descriptor["capabilities"]["workspaceMutation"]["atomicAcrossFiles"],
+        false
+    );
+    assert_eq!(
+        descriptor["capabilities"]["workspaceMutation"]["rollbackOnFailure"],
+        true
+    );
+    let host = remote_host_binding(descriptor);
+    let cwd = descriptor["cwd"]["handle"].clone();
+    let list_params = json!({
+        "version":"v1",
+        "host":host,
+        "cwdHandle":cwd,
+        "path":".",
+        "recursive":false,
+        "pageSize":1,
+        "cursor":null
+    });
+    let unauthenticated = post_rpc(
+        &client,
+        &endpoint,
+        None,
+        remote_request(2, "ai.workcell/list", list_params.clone()),
+    )
+    .await;
+    assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+    let unrequested = final_sse_json(
+        post_rpc(
+            &client,
+            &endpoint,
+            Some(TOKEN),
+            mcp_request(3, "ai.workcell/list", list_params.clone()),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(unrequested["error"]["code"], -32601);
+    let listed = final_sse_json(
+        post_rpc(
+            &client,
+            &endpoint,
+            Some(TOKEN),
+            remote_request(4, "ai.workcell/list", list_params),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(listed["result"]["entries"][0]["path"], "a.txt");
+    assert!(listed["result"]["nextCursor"].is_string());
+
+    let read = final_sse_json(
+        post_rpc(
+            &client,
+            &endpoint,
+            Some(TOKEN),
+            remote_request(
+                5,
+                "ai.workcell/read-text",
+                json!({
+                    "version":"v1",
+                    "host":remote_host_binding(descriptor),
+                    "cwdHandle":cwd,
+                    "path":"a.txt",
+                    "range":null,
+                    "maxBytes":1024
+                }),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(read["result"]["text"], "needle before\n");
+    assert_eq!(read["result"]["startByte"], 0);
+    assert_eq!(
+        read["result"]["endByte"],
+        read["result"]["text"].as_str().unwrap().len()
+    );
+    assert!(read["result"]["nextByteOffset"].is_null());
+    assert_eq!(read["result"]["truncated"], false);
+    let revision = read["result"]["revision"].clone();
+    let prepared = final_sse_json(
+        post_rpc(
+            &client,
+            &endpoint,
+            Some(TOKEN),
+            remote_request(
+                6,
+                "ai.workcell/prepare-mutation",
+                json!({
+                    "version":"v1",
+                    "host":remote_host_binding(descriptor),
+                    "cwdHandle":cwd,
+                    "mutations":[
+                        {"kind":"write","path":"a.txt","content":"after","expectedRevision":revision},
+                        {"kind":"create","path":"created.txt","content":"created"}
+                    ]
+                }),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        prepared["result"]["intent"]["resources"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        tokio::fs::read_to_string(root.path().join("a.txt"))
+            .await
+            .unwrap(),
+        "needle before\n"
+    );
+    let mutation_execute = remote_request(
+        7,
+        "ai.workcell/execute",
+        json!({
+            "version":"v1",
+            "preparationId":prepared["result"]["preparationId"],
+            "invocationId":"workspace-mutation",
+            "host":remote_host_binding(descriptor)
+        }),
+    );
+    let completed =
+        final_sse_json(post_rpc(&client, &endpoint, Some(TOKEN), mutation_execute.clone()).await)
+            .await;
+    assert_eq!(completed["result"]["state"], "completed", "{completed}");
+    assert_eq!(
+        completed["result"]["outcome"]["result"]["structuredContent"]["atomicAcrossFiles"],
+        false
+    );
+    tokio::fs::write(root.path().join("a.txt"), "later")
+        .await
+        .unwrap();
+    let duplicate =
+        final_sse_json(post_rpc(&client, &endpoint, Some(TOKEN), mutation_execute).await).await;
+    assert_eq!(duplicate["result"], completed["result"]);
+    assert_eq!(
+        tokio::fs::read_to_string(root.path().join("a.txt"))
+            .await
+            .unwrap(),
+        "later"
+    );
+
+    let denied = final_sse_json(
+        post_rpc(
+            &client,
+            &endpoint,
+            Some(TOKEN),
+            remote_request(
+                8,
+                "ai.workcell/prepare-exec",
+                json!({
+                    "version":"v1",
+                    "host":remote_host_binding(descriptor),
+                    "cwdHandle":cwd,
+                    "options":{"command":"rm denied","timeoutMs":1000}
+                }),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(denied["error"]["data"]["code"], "invalid_request");
+
+    let exec = final_sse_json(
+        post_rpc(
+            &client,
+            &endpoint,
+            Some(TOKEN),
+            remote_request(
+                9,
+                "ai.workcell/prepare-exec",
+                json!({
+                    "version":"v1",
+                    "host":remote_host_binding(descriptor),
+                    "cwdHandle":cwd,
+                    "options":{"command":"printf started; sleep 30","timeoutMs":60000}
+                }),
+            ),
+        )
+        .await,
+    )
+    .await;
+    let preparation_id = exec["result"]["preparationId"].clone();
+    let endpoint_for_execute = endpoint.clone();
+    let client_for_execute = client.clone();
+    let descriptor_for_execute = descriptor.clone();
+    let preparation_for_execute = preparation_id.clone();
+    let execution = tokio::spawn(async move {
+        final_sse_json(
+            post_rpc(
+                &client_for_execute,
+                &endpoint_for_execute,
+                Some(TOKEN),
+                remote_request(
+                    10,
+                    "ai.workcell/execute",
+                    json!({
+                        "version":"v1",
+                        "preparationId":preparation_for_execute,
+                        "invocationId":"direct-exec",
+                        "host":remote_host_binding(&descriptor_for_execute)
+                    }),
+                ),
+            )
+            .await,
+        )
+        .await
+    });
+    let cancellation = async {
+        loop {
+            let status = final_sse_json(
+                post_rpc(
+                    &client,
+                    &endpoint,
+                    Some(TOKEN),
+                    remote_request(
+                        11,
+                        "ai.workcell/status",
+                        json!({
+                            "version":"v1",
+                            "preparationId":preparation_id,
+                            "invocationId":"direct-exec",
+                            "host":remote_host_binding(descriptor)
+                        }),
+                    ),
+                )
+                .await,
+            )
+            .await;
+            if status["result"]["state"] == "running"
+                && !status["result"]["progress"].as_array().unwrap().is_empty()
+            {
+                assert_eq!(status["result"]["progress"][0]["chunk"], "started");
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        final_sse_json(
+            post_rpc(
+                &client,
+                &endpoint,
+                Some(TOKEN),
+                remote_request(
+                    12,
+                    "ai.workcell/cancel",
+                    json!({
+                        "version":"v1",
+                        "preparationId":preparation_id,
+                        "invocationId":"direct-exec",
+                        "host":remote_host_binding(descriptor)
+                    }),
+                ),
+            )
+            .await,
+        )
+        .await
+    };
+    let cancelled = tokio::time::timeout(Duration::from_secs(5), cancellation)
+        .await
+        .expect("direct execution reached progress");
+    assert_eq!(cancelled["result"]["cancellationRequested"], true);
+    let terminal = execution.await.unwrap();
+    assert_eq!(terminal["result"]["state"], "indeterminate", "{terminal}");
+    let next = terminal["result"]["progressMetadata"]["nextSequence"]
+        .as_u64()
+        .unwrap();
+    for after in [0, next - 1, next] {
+        let replay = final_sse_json(
+            post_rpc(
+                &client,
+                &endpoint,
+                Some(TOKEN),
+                remote_request(
+                    13,
+                    "ai.workcell/status",
+                    json!({
+                        "version": "v1",
+                        "preparationId": preparation_id,
+                        "invocationId": "direct-exec",
+                        "host": remote_host_binding(descriptor),
+                        "afterSequence": after
+                    }),
+                ),
+            )
+            .await,
+        )
+        .await;
+        if after == next {
+            assert!(replay.get("error").is_some(), "{replay}");
+        } else {
+            assert_eq!(
+                replay["result"]["progressMetadata"],
+                terminal["result"]["progressMetadata"]
+            );
+            let expected: Vec<_> = terminal["result"]["progress"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|event| event["sequence"].as_u64().unwrap() > after)
+                .cloned()
+                .collect();
+            assert_eq!(replay["result"]["progress"], json!(expected));
+        }
+    }
+    assert_eq!(
+        terminal["result"]["outcome"]["sideEffectsPossible"], true,
+        "{terminal}"
+    );
+    assert_eq!(http.shutdown().await, ShutdownOutcome::Completed);
+}
+
+#[tokio::test]
+async fn authenticated_watch_replays_changes_and_assets_remain_allowlisted_bytes() {
+    let root = tempfile::tempdir().expect("temporary root");
+    tokio::fs::create_dir_all(root.path().join(".caudra/workflows"))
+        .await
+        .unwrap();
+    for directory in [
+        ".caudra/commands/nested",
+        ".claude/commands",
+        ".opencode/commands",
+        ".agents/commands",
+        ".config/opencode/commands",
+    ] {
+        tokio::fs::create_dir_all(root.path().join(directory))
+            .await
+            .unwrap();
+    }
+    tokio::fs::write(root.path().join("AGENTS.md"), "project instructions")
+        .await
+        .unwrap();
+    tokio::fs::write(
+        root.path().join(".caudra/workflows/review.rhai"),
+        "untrusted workflow",
+    )
+    .await
+    .unwrap();
+    for (path, content) in [
+        (".caudra/commands/review.md", "project command"),
+        (".claude/commands/compat.md", "claude command"),
+        (".opencode/commands/build.md", "opencode command"),
+        (
+            ".caudra/permissions.toml",
+            "[shell]\ndeny = [\"rm *\"]\nallow = [\"cargo test\"]\n",
+        ),
+    ] {
+        tokio::fs::write(root.path().join(path), content)
+            .await
+            .unwrap();
+    }
+    for excluded in [
+        ".caudra/init.lua",
+        ".caudra/mcp.toml",
+        ".caudra/plugins.toml",
+        ".caudra/config.toml",
+        ".caudra/commands/run.sh",
+        ".caudra/commands/nested/deep.md",
+        ".caudra/workflows/unsafe.sh",
+        ".agents/commands/not-project-compatible.md",
+        ".config/opencode/commands/global-only.md",
+        ".env",
+    ] {
+        tokio::fs::write(root.path().join(excluded), "excluded")
+            .await
+            .unwrap();
+    }
+    let server = WorkcellServer::configured(
+        Some(root.path()),
+        &[ToolGroup::Files],
+        ServerBehavior {
+            expose_execution_environment: false,
+            modern_only: true,
+        },
+        ToolConfiguration {
+            allow_write: true,
+            web: WebsearchExecutionConfiguration::unconfigured(),
+            web_icons: false,
+            proxy: ProxyConfiguration::direct(),
+            shell_policy: ShellPermissionPolicy::restricted(),
+            shell_output_filter: true,
+            code: CodeConfiguration {
+                worker: WorkerSource::Discover {
+                    bundled_cache_root: None,
+                },
+                type_check: true,
+            },
+            max_transfer_bytes: workcell_mcp::cli::DEFAULT_MAX_TRANSFER_BYTES,
+            snapshot_root: None,
+            snapshot_exclusions: &[],
+        },
+    )
+    .await
+    .unwrap();
+    let http = HttpServer::start(
+        server,
+        0,
+        HttpConfiguration {
+            bind_mode: HttpBindMode::Loopback,
+            allowed_hosts: vec!["127.0.0.1".into()],
+            authentication: Some(HttpAuthentication::new(TOKEN).unwrap()),
+            remote_host: Some(
+                RemoteHostConfiguration::new(
+                    "server-a".into(),
+                    "workspace-a".into(),
+                    "generation-a".into(),
+                    "project-a".into(),
+                    "principal-a".into(),
+                )
+                .unwrap(),
+            ),
+        },
+    )
+    .await
+    .unwrap();
+    let endpoint = format!("http://{}/mcp", http.address());
+    let client = Client::new();
+    let discovery = final_sse_json(
+        post_rpc(
+            &client,
+            &endpoint,
+            Some(TOKEN),
+            discover_request(
+                1,
+                json!({"extensions":{"ai.workcell/remote-host":{"versions":["v1"]}}}),
+            ),
+        )
+        .await,
+    )
+    .await;
+    let descriptor = &discovery["result"]["capabilities"]["extensions"]["ai.workcell/remote-host"];
+    let binding = json!({
+        "version":"v1",
+        "host":remote_host_binding(descriptor),
+        "cwdHandle":descriptor["cwd"]["handle"]
+    });
+    let mut open_params = binding.clone();
+    open_params["path"] = json!(".");
+    open_params["recursive"] = json!(true);
+    let unauthenticated = post_rpc(
+        &client,
+        &endpoint,
+        None,
+        remote_request(2, "ai.workcell/watch-open", open_params.clone()),
+    )
+    .await;
+    assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+    let unnegotiated = final_sse_json(
+        post_rpc(
+            &client,
+            &endpoint,
+            Some(TOKEN),
+            mcp_request(3, "ai.workcell/watch-open", open_params.clone()),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(unnegotiated["error"]["code"], -32601);
+
+    let unauthenticated_assets = post_rpc(
+        &client,
+        &endpoint,
+        None,
+        remote_request(4, "ai.workcell/discover-project-assets", binding.clone()),
+    )
+    .await;
+    assert_eq!(unauthenticated_assets.status(), StatusCode::UNAUTHORIZED);
+    let assets = final_sse_json(
+        post_rpc(
+            &client,
+            &endpoint,
+            Some(TOKEN),
+            remote_request(5, "ai.workcell/discover-project-assets", binding.clone()),
+        )
+        .await,
+    )
+    .await;
+    let asset_entries = assets["result"]["manifest"]["assets"].as_array().unwrap();
+    assert_eq!(asset_entries.len(), 6);
+    assert!(asset_entries.iter().all(|asset| {
+        !matches!(
+            asset["path"].as_str(),
+            Some(
+                ".env"
+                    | ".caudra/init.lua"
+                    | ".caudra/mcp.toml"
+                    | ".caudra/plugins.toml"
+                    | ".caudra/config.toml"
+                    | ".caudra/commands/run.sh"
+                    | ".caudra/commands/nested/deep.md"
+                    | ".caudra/workflows/unsafe.sh"
+                    | ".agents/commands/not-project-compatible.md"
+                    | ".config/opencode/commands/global-only.md"
+            )
+        )
+    }));
+    assert_eq!(
+        asset_entries
+            .iter()
+            .filter(|asset| asset["kind"] == "command" && asset["trust"] == "declarative")
+            .count(),
+        3
+    );
+    let workflow = asset_entries
+        .iter()
+        .find(|asset| asset["kind"] == "workflow")
+        .unwrap();
+    assert_eq!(workflow["trust"], "clientApprovalRequired");
+    let permissions = asset_entries
+        .iter()
+        .find(|asset| asset["kind"] == "permissions")
+        .unwrap();
+    assert_eq!(permissions["trust"], "mixedReviewRequired");
+    let mut read_params = binding.clone();
+    read_params["path"] = permissions["path"].clone();
+    read_params["expectedRevision"] = permissions["revision"].clone();
+    read_params["maxBytes"] = json!(65_536);
+    let unauthenticated_read = post_rpc(
+        &client,
+        &endpoint,
+        None,
+        remote_request(6, "ai.workcell/read-project-asset", read_params.clone()),
+    )
+    .await;
+    assert_eq!(unauthenticated_read.status(), StatusCode::UNAUTHORIZED);
+    let read = final_sse_json(
+        post_rpc(
+            &client,
+            &endpoint,
+            Some(TOKEN),
+            remote_request(7, "ai.workcell/read-project-asset", read_params),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        read["result"]["content"],
+        "[shell]\ndeny = [\"rm *\"]\nallow = [\"cargo test\"]\n"
+    );
+    assert_eq!(read["result"]["encoding"], "utf8");
+
+    let opened = final_sse_json(
+        post_rpc(
+            &client,
+            &endpoint,
+            Some(TOKEN),
+            remote_request(8, "ai.workcell/watch-open", open_params),
+        )
+        .await,
+    )
+    .await;
+    let subscription_id = opened["result"]["subscriptionId"].clone();
+    let cursor = opened["result"]["cursor"].clone();
+    tokio::fs::write(root.path().join("external.txt"), "one")
+        .await
+        .unwrap();
+    tokio::fs::write(root.path().join("external.txt"), "two")
+        .await
+        .unwrap();
+    tokio::fs::rename(
+        root.path().join("external.txt"),
+        root.path().join("renamed.txt"),
+    )
+    .await
+    .unwrap();
+    tokio::fs::remove_file(root.path().join("renamed.txt"))
+        .await
+        .unwrap();
+    let ordinary = final_sse_json(
+        post_rpc(
+            &client,
+            &endpoint,
+            Some(TOKEN),
+            mcp_request(
+                9,
+                "tools/call",
+                json!({"name":"file_write","arguments":{"filePath":"mediated.txt","content":"server"}}),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_ne!(ordinary["result"]["isError"], true);
+
+    let observed = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let mut poll = binding.clone();
+            poll["subscriptionId"] = subscription_id.clone();
+            poll["cursor"] = cursor.clone();
+            poll["maxEvents"] = json!(128);
+            poll["maxBytes"] = json!(262_144);
+            poll["waitMs"] = json!(500);
+            let response = final_sse_json(
+                post_rpc(
+                    &client,
+                    &endpoint,
+                    Some(TOKEN),
+                    remote_request(10, "ai.workcell/watch-poll", poll),
+                )
+                .await,
+            )
+            .await;
+            let events = response["result"]["events"].as_array().unwrap();
+            let saw_external = events.iter().any(|event| {
+                matches!(event["path"].as_str(), Some("external.txt" | "renamed.txt"))
+            });
+            let saw_remove = events.iter().any(|event| event["kind"] == "remove");
+            let saw_mediated = events.iter().any(|event| event["path"] == "mediated.txt");
+            if saw_external && saw_remove && saw_mediated {
+                break response;
+            }
+        }
+    })
+    .await
+    .expect("bounded HTTP watch wait");
+    let events = observed["result"]["events"].as_array().unwrap();
+    assert!(events.windows(2).all(|pair| {
+        pair[0]["sequence"].as_u64().unwrap() < pair[1]["sequence"].as_u64().unwrap()
+    }));
+    assert!(events.iter().all(|event| {
+        !event["path"]
+            .as_str()
+            .is_some_and(|path| path.starts_with('/'))
+    }));
+
+    let mut replay_params = binding.clone();
+    replay_params["subscriptionId"] = subscription_id.clone();
+    replay_params["cursor"] = cursor;
+    replay_params["maxEvents"] = json!(128);
+    replay_params["maxBytes"] = json!(262_144);
+    replay_params["waitMs"] = json!(0);
+    let replay = final_sse_json(
+        post_rpc(
+            &client,
+            &endpoint,
+            Some(TOKEN),
+            remote_request(11, "ai.workcell/watch-poll", replay_params),
+        )
+        .await,
+    )
+    .await;
+    let replayed = replay["result"]["events"].as_array().unwrap();
+    assert!(replayed.len() >= events.len());
+    assert_eq!(&replayed[..events.len()], events);
+
+    let mut close_params = binding;
+    close_params["subscriptionId"] = subscription_id;
+    let closed = final_sse_json(
+        post_rpc(
+            &client,
+            &endpoint,
+            Some(TOKEN),
+            remote_request(12, "ai.workcell/watch-close", close_params),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(closed["result"]["closed"], true);
+    assert_eq!(http.shutdown().await, ShutdownOutcome::Completed);
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn http_streams_standard_shell_progress_before_the_result() {
@@ -532,6 +2255,7 @@ async fn http_streams_standard_shell_progress_before_the_result() {
             bind_mode: HttpBindMode::Loopback,
             allowed_hosts: vec!["127.0.0.1".into()],
             authentication: Some(HttpAuthentication::new(TOKEN).unwrap()),
+            remote_host: None,
         },
     )
     .await
@@ -585,6 +2309,7 @@ async fn http_supports_stateless_legacy_calls_and_progress() {
             bind_mode: HttpBindMode::Loopback,
             allowed_hosts: vec!["127.0.0.1".into()],
             authentication: Some(HttpAuthentication::new(TOKEN).unwrap()),
+            remote_host: None,
         },
     )
     .await
@@ -672,6 +2397,7 @@ async fn http_modern_only_rejects_legacy_and_advertises_only_modern() {
             bind_mode: HttpBindMode::Loopback,
             allowed_hosts: vec!["127.0.0.1".into()],
             authentication: Some(HttpAuthentication::new(TOKEN).unwrap()),
+            remote_host: None,
         },
     )
     .await
@@ -754,6 +2480,7 @@ async fn http_legacy_fallback_rejects_older_unknown_and_era_mismatched_versions(
             bind_mode: HttpBindMode::Loopback,
             allowed_hosts: vec!["127.0.0.1".into()],
             authentication: Some(HttpAuthentication::new(TOKEN).unwrap()),
+            remote_host: None,
         },
     )
     .await
@@ -802,6 +2529,59 @@ async fn http_legacy_fallback_rejects_older_unknown_and_era_mismatched_versions(
     assert_eq!(rejected_call.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
         rejected_call.json::<Value>().await.unwrap()["error"]["code"],
+        -32_022
+    );
+
+    assert_eq!(http.shutdown().await, ShutdownOutcome::Completed);
+}
+
+#[tokio::test]
+async fn http_discovery_rejects_missing_and_legacy_request_context() {
+    let (_root, server) = fixture_server().await;
+    let http = HttpServer::start(
+        server,
+        0,
+        HttpConfiguration {
+            bind_mode: HttpBindMode::Loopback,
+            allowed_hosts: vec!["127.0.0.1".into()],
+            authentication: Some(HttpAuthentication::new(TOKEN).unwrap()),
+            remote_host: None,
+        },
+    )
+    .await
+    .expect("HTTP server");
+    let endpoint = format!("http://{}/mcp", http.address());
+    let client = Client::new();
+
+    let missing = post_raw_rpc(
+        &client,
+        &endpoint,
+        1,
+        "server/discover",
+        json!({}),
+        Some(PROTOCOL_VERSION),
+    )
+    .await;
+    assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        missing.json::<Value>().await.unwrap()["error"]["code"],
+        -32_602
+    );
+
+    let mut meta = request_meta(json!({}));
+    meta["io.modelcontextprotocol/protocolVersion"] = json!(LEGACY_PROTOCOL_VERSION);
+    let legacy = post_raw_rpc(
+        &client,
+        &endpoint,
+        2,
+        "server/discover",
+        json!({"_meta":meta}),
+        Some(LEGACY_PROTOCOL_VERSION),
+    )
+    .await;
+    assert_eq!(legacy.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        legacy.json::<Value>().await.unwrap()["error"]["code"],
         -32_022
     );
 
@@ -878,6 +2658,32 @@ async fn final_sse_json(response: Response) -> Value {
         .filter_map(|data| serde_json::from_str(data).ok())
         .last()
         .expect("SSE JSON-RPC response")
+}
+
+fn git(path: &std::path::Path, arguments: &[&str]) {
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(arguments)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success(), "git command failed: {arguments:?}");
+}
+
+fn git_text(path: &std::path::Path, arguments: &[&str]) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(arguments)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "git command failed: {arguments:?}");
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
 }
 
 async fn next_sse_json(response: &mut Response, buffer: &mut Vec<u8>) -> Value {
@@ -1010,6 +2816,28 @@ fn mcp_request(id: u64, method: &str, mut params: Value) -> Value {
     json!({"jsonrpc":"2.0","id":id,"method":method,"params":params})
 }
 
+fn remote_request(id: u64, method: &str, params: Value) -> Value {
+    let mut request = mcp_request(id, method, params);
+    request["params"]["_meta"]["ai.workcell/remote-host"] = json!({"versions":["v1"]});
+    request["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"]["extensions"]["ai.workcell/remote-host"] =
+        json!({"versions":["v1"]});
+    request
+}
+
+fn remote_host_binding(descriptor: &Value) -> Value {
+    json!({
+        "serverId":descriptor["serverId"],
+        "instanceId":descriptor["instanceId"],
+        "workspaceId":descriptor["workspaceId"],
+        "workspaceGeneration":descriptor["workspaceGeneration"],
+        "rootProjectId":descriptor["rootProjectId"],
+        "principalId":descriptor["principalId"],
+        "cwdHandle":descriptor["cwd"]["handle"],
+        "catalogRevision":descriptor["revisions"]["catalog"],
+        "policyRevision":descriptor["revisions"]["policy"]
+    })
+}
+
 async fn write_json<W>(writer: &mut W, value: &Value)
 where
     W: tokio::io::AsyncWrite + Unpin,
@@ -1086,6 +2914,8 @@ async fn stdio_serves_the_full_catalog_including_python_execution() {
                 type_check: true,
             },
             max_transfer_bytes: workcell_mcp::cli::DEFAULT_MAX_TRANSFER_BYTES,
+            snapshot_root: None,
+            snapshot_exclusions: &[],
         },
     )
     .await
@@ -1190,6 +3020,8 @@ async fn write_authority_decides_whether_mutation_tools_exist_at_all() {
                     type_check: true,
                 },
                 max_transfer_bytes: workcell_mcp::cli::DEFAULT_MAX_TRANSFER_BYTES,
+                snapshot_root: None,
+                snapshot_exclusions: &[],
             },
         )
         .await
@@ -1253,6 +3085,8 @@ async fn transfer_tools_mint_urls_that_the_files_route_serves_under_the_same_cre
                 type_check: true,
             },
             max_transfer_bytes: 4096,
+            snapshot_root: None,
+            snapshot_exclusions: &[],
         },
     )
     .await
@@ -1264,6 +3098,7 @@ async fn transfer_tools_mint_urls_that_the_files_route_serves_under_the_same_cre
             bind_mode: HttpBindMode::Loopback,
             allowed_hosts: vec!["127.0.0.1".into()],
             authentication: Some(HttpAuthentication::new(TOKEN).unwrap()),
+            remote_host: None,
         },
     )
     .await
@@ -1364,6 +3199,7 @@ async fn the_files_route_is_absent_when_the_transfer_group_is_not_enabled() {
             bind_mode: HttpBindMode::Loopback,
             allowed_hosts: vec!["127.0.0.1".into()],
             authentication: Some(HttpAuthentication::new(TOKEN).unwrap()),
+            remote_host: None,
         },
     )
     .await

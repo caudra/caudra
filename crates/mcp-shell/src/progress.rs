@@ -29,6 +29,14 @@ const STANDARD_MESSAGE_BYTES: usize = 16 * 1024;
 pub trait ShellProgressSink: Send + Sync {
     async fn publish(&self, chunk: ShellProgressChunk) -> Result<(), String>;
 }
+
+#[cfg(feature = "mcp")]
+pub fn mcp_progress_sink(
+    peer: Peer<RoleServer>,
+    token: ProgressToken,
+) -> Arc<dyn ShellProgressSink> {
+    Arc::new(McpProgressSink { peer, token })
+}
 #[cfg(feature = "mcp")]
 pub(crate) struct McpProgressSink {
     pub(crate) peer: Peer<RoleServer>,

@@ -36,15 +36,22 @@ pub use dependencies::{
     WebHttpTransport, WebToolDependencies,
 };
 pub use fetch::WebfetchError;
-pub use group::{PreparedWebfetch, PreparedWebsearch};
-pub use group::{WebToolGroup, WebsearchConfigurationSnapshot, WebsearchConfigurationSource};
+pub use group::{
+    PreparedWebOperation, PreparedWebfetch, PreparedWebfetchOperation, PreparedWebsearch,
+    PreparedWebsearchOperation, STALE_WEBSEARCH_CONFIGURATION_ERROR, WebOperationError,
+    WebOperationExecution, WebToolGroup, WebsearchConfigurationSnapshot,
+    WebsearchConfigurationSource,
+};
 pub use pdf::{NativePdfExtractor, PdfExtraction, PdfExtractionError, PdfExtractor};
 pub use types::{
     TimeRange, WebExecution, WebfetchFormat, WebfetchInput, WebfetchOutput, WebfetchPdfAttachment,
     WebfetchPdfMode, WebsearchInput, WebsearchOutput, WebsearchResult,
 };
 // Re-exported so a host configuring outbound egress needs only this crate.
-pub use workcell_net::{ProxyConfiguration, ProxyConfigurationError, ProxyEndpoint, ProxyRoute};
+pub use workcell_net::{
+    OperatorConfiguredPolicy, ProxyConfiguration, ProxyConfigurationError, ProxyEndpoint,
+    ProxyRoute, UrlPolicy,
+};
 pub use workcell_tool_contract::{ToolAnnotations, ToolSpec};
 
 /// Stable crate marker retained for consumers that used the scaffold.

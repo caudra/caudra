@@ -1,7 +1,9 @@
+use http::{HeaderMap, Method};
 use url::Url;
 use workcell_net::{UrlPolicy, UrlPolicyError};
 
-use super::WebfetchError;
+use super::{MAX_PDF_RESPONSE_BYTES, MAX_REDIRECTS, WebfetchError, content};
+use crate::WebHttpRequestKind;
 use crate::types::{WebfetchFormat, WebfetchInput, WebfetchPdfMode};
 
 const DEFAULT_TIMEOUT_SECONDS: u64 = 30;
@@ -12,6 +14,12 @@ pub(crate) struct NormalizedWebfetchInput {
     pub format: WebfetchFormat,
     pub pdf_mode: WebfetchPdfMode,
     pub timeout_seconds: u64,
+    pub policy: UrlPolicy,
+    pub request_kind: WebHttpRequestKind,
+    pub method: Method,
+    pub headers: HeaderMap,
+    pub max_redirects: usize,
+    pub max_body_bytes: usize,
 }
 
 pub(crate) fn normalize_input(
@@ -52,6 +60,12 @@ pub(crate) fn normalize_input(
         format: input.format,
         pdf_mode: input.pdf_mode,
         timeout_seconds,
+        policy,
+        request_kind: WebHttpRequestKind::PublicGet,
+        method: Method::GET,
+        headers: content::headers(input.format),
+        max_redirects: MAX_REDIRECTS,
+        max_body_bytes: MAX_PDF_RESPONSE_BYTES,
     })
 }
 

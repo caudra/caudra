@@ -28,7 +28,8 @@ use crate::{
     suspend::{Answer, answer},
     types::{
         CodeException, CodeExecution, CodeInput, CodeOutput, DEFAULT_TIMEOUT_MS, MAX_CODE_BYTES,
-        MAX_MEMORY_BYTES, MAX_SUSPENSIONS, MAX_TIMEOUT_MS, Outcome, STREAM_CAPTURE_BYTES,
+        MAX_MEMORY_BYTES, MAX_SUSPENSIONS, MAX_TIMEOUT_MS, Outcome, PreparedCode,
+        STREAM_CAPTURE_BYTES,
     },
     worker::{CodeBuildError, WorkerSource, build_pool},
 };
@@ -114,12 +115,8 @@ impl CodeToolGroup {
         }))
     }
 
-    /// Execute one validated, isolated snippet without involving MCP.
-    pub async fn execute(
-        &self,
-        input: CodeInput,
-        cancellation: CancellationToken,
-    ) -> Result<Option<CodeExecution>, String> {
+    /// Validates and binds one snippet without checking out a worker or running user code.
+    pub fn prepare(&self, input: CodeInput) -> Result<PreparedCode, String> {
         if input.code.trim().is_empty() {
             return Err("Invalid arguments: code must not be empty".into());
         }
@@ -137,9 +134,27 @@ impl CodeToolGroup {
             Some(value) => value,
             None => DEFAULT_TIMEOUT_MS,
         };
+        Ok(PreparedCode {
+            code: input.code,
+            timeout_ms,
+            type_check: self.type_check,
+        })
+    }
+
+    /// Executes a prepared snippet exactly once without revalidating its source or limits.
+    pub async fn execute_prepared(
+        &self,
+        prepared: PreparedCode,
+        cancellation: CancellationToken,
+    ) -> Result<Option<CodeExecution>, String> {
+        let PreparedCode {
+            code,
+            timeout_ms,
+            type_check,
+        } = prepared;
 
         let started = Instant::now();
-        let repl = self.repl_config(timeout_ms);
+        let repl = Self::repl_config(type_check, timeout_ms);
         let session = tokio::select! {
             biased;
             () = cancellation.cancelled() => return Ok(None),
@@ -149,7 +164,7 @@ impl CodeToolGroup {
             Ok(session) => session,
             Err(e) => {
                 return Ok(Some(execution(Self::failure(
-                    self.type_check,
+                    type_check,
                     &e,
                     timeout_ms,
                     started.elapsed(),
@@ -165,7 +180,7 @@ impl CodeToolGroup {
                 drop(session);
                 return Ok(None);
             }
-            outcome = self.drive(&mut session, &input.code) => outcome,
+            outcome = self.drive(&mut session, &code) => outcome,
         };
         let duration = started.elapsed();
 
@@ -173,28 +188,20 @@ impl CodeToolGroup {
             Ok(completion) => {
                 // Only a clean completion returns the worker; anything else discards it.
                 let _ = session.finish().await;
-                Ok(Some(execution(
-                    self.complete(completion, timeout_ms, duration),
-                )))
+                Ok(Some(execution(Self::complete(
+                    type_check, completion, timeout_ms, duration,
+                ))))
             }
             Err(DriveError::Pool(e)) => {
                 drop(session);
                 Ok(Some(execution(Self::failure(
-                    self.type_check,
-                    &e,
-                    timeout_ms,
-                    duration,
+                    type_check, &e, timeout_ms, duration,
                 ))))
             }
             Err(DriveError::SuspensionLimit(captured)) => {
                 drop(session);
-                let mut output = Self::envelope(
-                    self.type_check,
-                    Outcome::Limited,
-                    timeout_ms,
-                    duration,
-                    captured,
-                );
+                let mut output =
+                    Self::envelope(type_check, Outcome::Limited, timeout_ms, duration, captured);
                 output.suspension_limit_exceeded = true;
                 output.diagnostic = Some(
                     "The snippet made too many unresolved external lookups and was stopped. This usually means a typo or an undefined name inside a loop.".into(),
@@ -204,14 +211,24 @@ impl CodeToolGroup {
         }
     }
 
-    fn repl_config(&self, timeout_ms: u64) -> ReplConfig {
+    /// Execute one validated, isolated snippet without involving MCP.
+    pub async fn execute(
+        &self,
+        input: CodeInput,
+        cancellation: CancellationToken,
+    ) -> Result<Option<CodeExecution>, String> {
+        self.execute_prepared(self.prepare(input)?, cancellation)
+            .await
+    }
+
+    fn repl_config(type_check: bool, timeout_ms: u64) -> ReplConfig {
         let limits = ResourceLimits::default()
             .max_duration(Duration::from_millis(timeout_ms))
             .max_memory(MAX_MEMORY_BYTES);
         ReplConfig {
             script_name: SCRIPT_NAME.to_owned(),
             limits: Some(limits),
-            type_check: self.type_check,
+            type_check,
             type_check_stubs: None,
             // Concise diagnostics stay readable in a tool result; the full form renders a source
             // snippet with carets for a terminal, and colour would be ANSI noise in JSON.
@@ -256,9 +273,14 @@ impl CodeToolGroup {
         Err(DriveError::SuspensionLimit(captured.take()))
     }
 
-    fn complete(&self, completion: Completion, timeout_ms: u64, duration: Duration) -> CodeOutput {
+    fn complete(
+        type_check: bool,
+        completion: Completion,
+        timeout_ms: u64,
+        duration: Duration,
+    ) -> CodeOutput {
         let mut output = Self::envelope(
-            self.type_check,
+            type_check,
             Outcome::Completed,
             timeout_ms,
             duration,

@@ -13,10 +13,11 @@ use http::StatusCode;
 use serde_json::{Map, Value, json};
 use tokio_util::sync::CancellationToken;
 use workcell_mcp_web::{
-    NativePdfExtractor, PdfExtraction, PdfExtractionError, PdfExtractor, SerpApiEngine,
-    WebHttpError, WebHttpRequestKind, WebToolGroup, WebfetchFormat, WebfetchInput, WebfetchPdfMode,
-    WebsearchBackend, WebsearchConfigurationIssue, WebsearchExecutionConfiguration, WebsearchInput,
-    catalog, specs,
+    NativePdfExtractor, OperatorConfiguredPolicy, PdfExtraction, PdfExtractionError, PdfExtractor,
+    PreparedWebOperation, STALE_WEBSEARCH_CONFIGURATION_ERROR, SerpApiEngine, UrlPolicy,
+    WebHttpError, WebHttpRequestKind, WebOperationError, WebOperationExecution, WebToolGroup,
+    WebfetchFormat, WebfetchInput, WebfetchPdfMode, WebsearchBackend, WebsearchConfigurationIssue,
+    WebsearchConfigurationSource, WebsearchExecutionConfiguration, WebsearchInput, catalog, specs,
 };
 
 use support::*;
@@ -217,6 +218,154 @@ async fn native_preparation_normalizes_permissions_without_network_io() {
     assert_eq!(search.permission_query, "native query");
     assert_eq!(fetch.permission_url, "https://example.test/page");
     assert_eq!(fetch.timeout_seconds, 60);
+    assert!(search.retained_bytes() >= search.permission_query.len());
+    assert!(fetch.retained_bytes() >= fetch.permission_url.len());
+    assert!(http.requests().is_empty());
+}
+
+#[tokio::test]
+async fn exact_webfetch_preparation_binds_url_options_and_request_policy() {
+    const EXPECTED_MAX_BODY_BYTES: usize = 6 * 1024 * 1024;
+    const EXPECTED_MAX_REDIRECTS: usize = 5;
+    const EXPECTED_TIMEOUT_SECONDS: u64 = 60;
+
+    let http = Arc::new(FakeHttp::with_responses(vec![Ok(response(
+        "https://example.test/exact?value=1",
+        StatusCode::OK,
+        Some("text/plain"),
+        Bytes::from_static(b"exact"),
+    ))]));
+    let group = WebToolGroup::with_dependencies(
+        WebsearchExecutionConfiguration::unconfigured(),
+        dependencies(http.clone(), Arc::new(FakeIcons::default()), default_pdf()),
+    );
+    let prepared = group
+        .prepare_webfetch_operation(WebfetchInput {
+            url: " http://example.test/exact?value=1 ".into(),
+            format: WebfetchFormat::Text,
+            pdf_mode: WebfetchPdfMode::Attachment,
+            timeout: Some(120),
+        })
+        .unwrap();
+    let PreparedWebOperation::Webfetch(operation) = &prepared else {
+        panic!("expected prepared webfetch")
+    };
+    assert!(prepared.retained_bytes() >= operation.url().as_str().len());
+    assert_eq!(
+        operation.url().as_str(),
+        "https://example.test/exact?value=1"
+    );
+    assert_eq!(operation.format(), WebfetchFormat::Text);
+    assert_eq!(operation.pdf_mode(), WebfetchPdfMode::Attachment);
+    assert_eq!(operation.timeout_seconds(), EXPECTED_TIMEOUT_SECONDS);
+    assert_eq!(
+        operation.url_policy(),
+        UrlPolicy::OperatorConfigured(OperatorConfiguredPolicy {
+            allow_non_public_ips: false,
+            allow_special_use_names: true,
+            allow_url_credentials: false,
+        })
+    );
+    assert_eq!(operation.request_kind(), WebHttpRequestKind::PublicGet);
+    assert_eq!(operation.method(), http::Method::GET);
+    assert_eq!(operation.max_redirects(), EXPECTED_MAX_REDIRECTS);
+    assert_eq!(operation.max_body_bytes(), EXPECTED_MAX_BODY_BYTES);
+    assert!(http.requests().is_empty());
+
+    let execution = group
+        .execute_prepared(prepared, CancellationToken::new())
+        .await
+        .unwrap();
+    let WebOperationExecution::Webfetch(execution) = execution else {
+        panic!("expected webfetch execution")
+    };
+    assert_eq!(execution.output.url, "https://example.test/exact?value=1");
+    assert_eq!(execution.output.output, "exact");
+    let requests = http.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].url.as_str(),
+        "https://example.test/exact?value=1"
+    );
+    assert_eq!(
+        requests[0].timeout,
+        Duration::from_secs(EXPECTED_TIMEOUT_SECONDS)
+    );
+    assert_eq!(requests[0].max_redirects, EXPECTED_MAX_REDIRECTS);
+    assert_eq!(requests[0].max_body_bytes, EXPECTED_MAX_BODY_BYTES);
+}
+
+#[tokio::test]
+async fn prepared_websearch_rejects_configuration_revision_drift_without_network_io() {
+    let http = Arc::new(FakeHttp::default());
+    let group = WebToolGroup::with_dependencies(
+        WebsearchExecutionConfiguration::searxng("https://search.example.test/search"),
+        dependencies(http.clone(), Arc::new(FakeIcons::default()), default_pdf()),
+    );
+    let prepared = group
+        .prepare_websearch_operation(WebsearchInput {
+            query: "  exact query  ".into(),
+            country: None,
+            categories: None,
+            language: None,
+            pageno: None,
+            time_range: None,
+            safesearch: None,
+            limit: None,
+            timeout_sec: None,
+        })
+        .unwrap();
+    let PreparedWebOperation::Websearch(operation) = &prepared else {
+        panic!("expected prepared websearch")
+    };
+    assert_eq!(operation.query(), "exact query");
+    assert_eq!(operation.input().query, "exact query");
+    assert_eq!(operation.backend(), Some(WebsearchBackend::Searxng));
+    assert_eq!(
+        operation.configuration_source(),
+        WebsearchConfigurationSource::Environment
+    );
+    assert_eq!(operation.configuration_revision(), 0);
+    assert!(http.requests().is_empty());
+    group.replace_configuration(WebsearchExecutionConfiguration::exa("replacement-key"));
+
+    let error = group
+        .execute_prepared(prepared, CancellationToken::new())
+        .await
+        .unwrap_err();
+
+    assert!(matches!(&error, WebOperationError::Websearch(_)));
+    assert_eq!(error.to_string(), STALE_WEBSEARCH_CONFIGURATION_ERROR);
+    assert!(http.requests().is_empty());
+}
+
+#[tokio::test]
+async fn exact_prepared_webfetch_preserves_cancellation_without_network_io() {
+    let http = Arc::new(FakeHttp::default());
+    let group = WebToolGroup::with_dependencies(
+        WebsearchExecutionConfiguration::unconfigured(),
+        dependencies(http.clone(), Arc::new(FakeIcons::default()), default_pdf()),
+    );
+    let prepared = group
+        .prepare_webfetch_operation(WebfetchInput {
+            url: "https://example.test/cancel".into(),
+            format: WebfetchFormat::Markdown,
+            pdf_mode: WebfetchPdfMode::Extract,
+            timeout: None,
+        })
+        .unwrap();
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+
+    let error = group
+        .execute_prepared(prepared, cancellation)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        WebOperationError::Webfetch(workcell_mcp_web::WebfetchError::Aborted)
+    ));
     assert!(http.requests().is_empty());
 }
 

@@ -3,10 +3,11 @@ use std::{fmt, path::Path};
 #[cfg(unix)]
 use std::{fs::File, io::Read};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tree_sitter::{Node, Parser};
+use workcell_tool_contract::CatalogRevision;
 
-use crate::types::{ShellCommandAnalysis, ShellCommandScope, ShellWord};
+use crate::types::{ShellCommandAnalysis, ShellCommandScope, ShellPolicyDecision, ShellWord};
 
 const POLICY_VERSION: u8 = 1;
 pub(crate) const MAX_COMMAND_BYTES: usize = 64 * 1024;
@@ -16,7 +17,7 @@ const MAX_PATTERN_BYTES: usize = 512;
 const MAX_AST_NODES: usize = 4_096;
 const MAX_AST_DEPTH: usize = 64;
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 enum DefaultDecision {
     Allow,
@@ -36,7 +37,7 @@ struct PolicyDocument {
     deny: Vec<String>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize)]
 pub struct ShellPermissionPolicy {
     default: DefaultDecision,
     allow: Vec<String>,
@@ -97,9 +98,7 @@ impl std::error::Error for ShellPermissionPolicyError {}
 
 #[derive(Debug)]
 enum AuthorizationError {
-    #[cfg(feature = "mcp")]
     Denied(String),
-    #[cfg(feature = "mcp")]
     Required(String),
     Opaque,
 }
@@ -107,12 +106,10 @@ enum AuthorizationError {
 impl fmt::Display for AuthorizationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            #[cfg(feature = "mcp")]
             Self::Denied(scope) => write!(
                 formatter,
                 "Shell execution denied by an immutable Workcell policy rule for scope `{scope}`. Ask the Workcell operator to remove or narrow the matching deny rule if this command is required; tool arguments cannot override it"
             ),
-            #[cfg(feature = "mcp")]
             Self::Required(scope) => write!(
                 formatter,
                 "Shell execution requires an allow rule for scope `{scope}`. Ask the Workcell operator to update the immutable shell policy; tool arguments cannot approve execution"
@@ -125,6 +122,10 @@ impl fmt::Display for AuthorizationError {
 }
 
 impl ShellPermissionPolicy {
+    pub fn revision(&self) -> Result<CatalogRevision, serde_json::Error> {
+        CatalogRevision::for_serializable(self)
+    }
+
     #[must_use]
     pub fn summary(&self) -> ShellPermissionPolicySummary {
         ShellPermissionPolicySummary {
@@ -213,19 +214,46 @@ impl ShellPermissionPolicy {
         }
     }
 
-    #[cfg(feature = "mcp")]
-    pub(crate) fn authorize(&self, command: &str) -> Result<(), String> {
-        self.authorize_inner(command)
-            .map_err(|error| error.to_string())
+    pub(crate) fn prepare(&self, command: &str) -> (ShellCommandAnalysis, ShellPolicyDecision) {
+        match analyze(command) {
+            Ok(analysis) => {
+                let decision = self.authorize_analysis(&analysis).map_or_else(
+                    |error| ShellPolicyDecision::deny(error.to_string()),
+                    |()| ShellPolicyDecision::allow(),
+                );
+                (analysis, decision)
+            }
+            Err(error) => {
+                let decision = if self.yolo && self.deny.is_empty() {
+                    ShellPolicyDecision::allow()
+                } else {
+                    ShellPolicyDecision::deny(error.to_string())
+                };
+                (
+                    ShellCommandAnalysis {
+                        scopes: Vec::new(),
+                        opaque: true,
+                    },
+                    decision,
+                )
+            }
+        }
     }
 
-    #[cfg(feature = "mcp")]
+    #[cfg(all(test, feature = "mcp"))]
     fn authorize_inner(&self, command: &str) -> Result<(), AuthorizationError> {
         let analysis = match analyze(command) {
             Ok(analysis) => analysis,
             Err(_) if self.yolo && self.deny.is_empty() => return Ok(()),
             Err(error) => return Err(error),
         };
+        self.authorize_analysis(&analysis)
+    }
+
+    fn authorize_analysis(
+        &self,
+        analysis: &ShellCommandAnalysis,
+    ) -> Result<(), AuthorizationError> {
         for scope in &analysis.scopes {
             if self
                 .deny
@@ -260,6 +288,7 @@ impl ShellPermissionPolicy {
     }
 }
 
+#[cfg(all(test, feature = "mcp"))]
 pub(crate) fn inspect(command: &str) -> ShellCommandAnalysis {
     analyze(command).unwrap_or_else(|_| ShellCommandAnalysis {
         scopes: Vec::new(),
@@ -534,12 +563,10 @@ fn valid_pattern(pattern: &str) -> bool {
         && (!pattern.contains('*') || pattern.ends_with('*'))
 }
 
-#[cfg(feature = "mcp")]
 fn scope_matches(pattern: &str, scope: &ShellCommandScope) -> bool {
     matches_text(pattern, &scope.source) || matches_text(pattern, &scope.normalized)
 }
 
-#[cfg(feature = "mcp")]
 fn matches_text(pattern: &str, scope: &str) -> bool {
     if matches!(pattern, "*" | "**") {
         return true;

@@ -1,4 +1,5 @@
-use tokio::fs;
+use std::path::PathBuf;
+
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -6,7 +7,7 @@ use crate::{
     glob::{GlobMatcher, MatchOutcome, MatchScratch},
     operations::FilesystemCore,
     text::check_cancelled,
-    types::{FileGlobInput, FileGlobOutput, FileListing},
+    types::{FileGlobOutput, FileListing},
 };
 
 use super::{
@@ -14,33 +15,14 @@ use super::{
 };
 
 impl FilesystemCore {
-    pub(crate) async fn file_glob(
+    pub(crate) async fn file_glob_prepared(
         &self,
-        input: FileGlobInput,
+        search: PathBuf,
+        relative_root: String,
+        pattern: String,
+        matcher: GlobMatcher,
         token: &CancellationToken,
     ) -> Result<FileGlobOutput, FilesystemError> {
-        if input.pattern.is_empty() {
-            return Err(FilesystemError::message("pattern is required"));
-        }
-        let requested = input
-            .path
-            .as_deref()
-            .filter(|path| !path.is_empty())
-            .unwrap_or(".");
-        let search = self.policy.resolve(requested).await?;
-        let metadata = fs::metadata(&search).await.map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                FilesystemError::message(format!("Path not found: {requested}"))
-            } else {
-                FilesystemError::io_path("Cannot inspect", &search, error)
-            }
-        })?;
-        if !metadata.is_dir() {
-            return Err(FilesystemError::message(format!(
-                "glob path must be a directory: {requested}"
-            )));
-        }
-        let matcher = GlobMatcher::new(&input.pattern, &self.limits)?;
         let listed = list_files(self, &search, token).await?;
         let mut files = Vec::new();
         let mut truncated = listed.truncated;
@@ -86,8 +68,8 @@ impl FilesystemCore {
         }
         Ok(FileGlobOutput {
             cwd: path_string(&search),
-            relative_path: self.policy.relative(&search)?,
-            pattern: input.pattern,
+            relative_path: relative_root,
+            pattern,
             count: files.len(),
             total,
             scan_complete,

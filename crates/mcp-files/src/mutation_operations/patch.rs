@@ -4,43 +4,30 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     FilesystemError,
-    diff::{file_diff, file_diff_hunks, shorten_patch},
+    diff::{file_diff, file_diff_hunks, line_index_retained_bytes, shorten_patch},
     group::{MCP_RAW_RESULT_CEILING_BYTES, mcp_response_size},
     operations::FilesystemCore,
     patch::{PatchHunk, apply_update_chunks, parse_patch},
     text::{check_cancelled, enforce_bytes, exists, read_text_snapshot_required},
-    types::{FileApplyPatchInput, FileApplyPatchOutput, FileMutation, FilePatchKind},
+    types::{FileApplyPatchOutput, FileMutation, FilePatchKind},
 };
 
 use super::{PlannedChange, PlannedChangeType, patch_publication::publish_patch, path_string};
 
 impl FilesystemCore {
-    pub(crate) async fn file_apply_patch(
-        &self,
-        input: FileApplyPatchInput,
-        token: &CancellationToken,
-    ) -> Result<FileApplyPatchOutput, FilesystemError> {
-        let _guard = self.mutation.lock().await;
-        check_cancelled(token)?;
-        enforce_bytes("patchText", &input.patch_text, self.limits.max_patch_bytes)?;
-        let changes = self.plan_patch(&input.patch_text, token).await?;
-        self.require_write()?;
-        // The exact text + structured MCP response shape, including a
-        // conservative envelope, fits the MCP raw result ceiling
-        // before the first file is published.
-        let output = self.fit_patch_output(self.patch_output(&changes, true)?)?;
-        publish_patch(self, &changes, token).await?;
-        Ok(output)
-    }
-
-    pub(crate) async fn prepare_patch(
+    pub(crate) async fn prepare_patch_bounded(
         &self,
         patch_text: &str,
+        maximum_retained_bytes: usize,
         token: &CancellationToken,
     ) -> Result<(Vec<PlannedChange>, FileApplyPatchOutput), FilesystemError> {
         check_cancelled(token)?;
         enforce_bytes("patchText", patch_text, self.limits.max_patch_bytes)?;
-        let changes = self.plan_patch(patch_text, token).await?;
+        let maximum_retained_bytes = maximum_retained_bytes.min(self.limits.max_patch_plan_bytes);
+        let changes = self
+            .plan_patch(patch_text, maximum_retained_bytes, token)
+            .await?;
+        enforce_patch_bytes(patch_preview_peak(&changes), maximum_retained_bytes)?;
         let output = self.fit_patch_output(self.patch_output(&changes, false)?)?;
         Ok((changes, output))
     }
@@ -95,6 +82,7 @@ impl FilesystemCore {
     async fn plan_patch(
         &self,
         patch_text: &str,
+        maximum_retained_bytes: usize,
         token: &CancellationToken,
     ) -> Result<Vec<PlannedChange>, FilesystemError> {
         let hunks = parse_patch(patch_text)?;
@@ -106,7 +94,7 @@ impl FilesystemCore {
         }
         let mut used = HashSet::new();
         let mut changes = Vec::new();
-        let mut budget = PatchPlanBudget::new(self.limits.max_patch_plan_bytes);
+        let mut budget = PatchPlanBudget::new(maximum_retained_bytes, patch_text.len());
         for hunk in hunks {
             check_cancelled(token)?;
             let hunk_path = hunk.path().to_owned();
@@ -136,22 +124,33 @@ impl FilesystemCore {
                     budget.push(
                         &mut changes,
                         PlannedChange {
+                            requested_path: hunk_path,
                             diff,
                             file_path,
                             new_content: contents,
                             change_type: PlannedChangeType::Add,
                             move_path: None,
+                            requested_move_path: None,
                             expected_source: None,
                         },
                         0,
                     )?;
                 }
                 PatchHunk::Delete { .. } => {
+                    budget.ensure_peak(
+                        self.limits.max_file_bytes,
+                        0,
+                        self.limits.max_diff_bytes,
+                    )?;
                     let snapshot =
                         read_text_snapshot_required(&file_path, self.limits.max_file_bytes, token)
                             .await?;
                     let old_bytes = snapshot.content.len();
-                    budget.ensure_peak(old_bytes, 0, 0)?;
+                    budget.ensure_peak(
+                        old_bytes,
+                        0,
+                        line_index_retained_bytes(&[&snapshot.content]),
+                    )?;
                     let diff = file_diff(
                         &self.policy,
                         &file_path,
@@ -163,11 +162,13 @@ impl FilesystemCore {
                     budget.push(
                         &mut changes,
                         PlannedChange {
+                            requested_path: hunk_path,
                             diff,
                             file_path,
                             new_content: String::new(),
                             change_type: PlannedChangeType::Delete,
                             move_path: None,
+                            requested_move_path: None,
                             expected_source: Some(snapshot.version),
                         },
                         old_bytes,
@@ -176,6 +177,11 @@ impl FilesystemCore {
                 PatchHunk::Update {
                     move_path, chunks, ..
                 } => {
+                    budget.ensure_peak(
+                        self.limits.max_file_bytes,
+                        self.limits.max_write_bytes,
+                        self.limits.max_diff_bytes,
+                    )?;
                     let snapshot =
                         read_text_snapshot_required(&file_path, self.limits.max_file_bytes, token)
                             .await?;
@@ -184,7 +190,11 @@ impl FilesystemCore {
                     let (new_content, spans) =
                         apply_update_chunks(&hunk_path, &chunks, &snapshot.content)?;
                     enforce_bytes("patched file", &new_content, self.limits.max_write_bytes)?;
-                    budget.ensure_peak(old_bytes, new_content.len(), 0)?;
+                    budget.ensure_peak(
+                        old_bytes,
+                        new_content.len(),
+                        line_index_retained_bytes(&[&snapshot.content, &new_content]),
+                    )?;
                     let move_path = match move_path {
                         Some(path) => Some((path.clone(), self.policy.resolve(&path).await?)),
                         None => None,
@@ -216,6 +226,7 @@ impl FilesystemCore {
                     budget.push(
                         &mut changes,
                         PlannedChange {
+                            requested_path: hunk_path,
                             diff,
                             file_path,
                             new_content,
@@ -224,6 +235,9 @@ impl FilesystemCore {
                             } else {
                                 PlannedChangeType::Update
                             },
+                            requested_move_path: move_path
+                                .as_ref()
+                                .map(|(requested, _)| requested.clone()),
                             move_path: move_path.map(|(_, target)| target),
                             expected_source: Some(snapshot.version),
                         },
@@ -321,9 +335,11 @@ struct PatchPlanBudget {
 }
 
 impl PatchPlanBudget {
-    fn new(maximum_bytes: usize) -> Self {
+    fn new(maximum_bytes: usize, patch_bytes: usize) -> Self {
         Self {
-            retained_bytes: 0,
+            // Parsing owns hunk paths, chunks, and inserted text while the request
+            // still owns the source patch. Twice the source bytes bounds both.
+            retained_bytes: patch_bytes.saturating_mul(2),
             maximum_bytes,
         }
     }
@@ -355,17 +371,51 @@ impl PatchPlanBudget {
         change: PlannedChange,
         old_content_bytes: usize,
     ) -> Result<(), FilesystemError> {
-        let new_content_bytes = change.new_content.len();
-        let diff_bytes = change.diff.patch.len();
+        let new_content_bytes = change.new_content.capacity();
+        let diff_bytes = change.diff.patch.capacity();
         self.ensure_peak(old_content_bytes, new_content_bytes, diff_bytes)?;
         self.retained_bytes = self
             .retained_bytes
-            .checked_add(new_content_bytes)
-            .and_then(|value| value.checked_add(diff_bytes))
+            .checked_add(change.retained_bytes())
             .ok_or_else(|| FilesystemError::message("Patch plan content budget overflow"))?;
         changes.push(change);
         Ok(())
     }
+}
+
+fn patch_preview_peak(changes: &[PlannedChange]) -> usize {
+    changes
+        .iter()
+        .map(PlannedChange::retained_bytes)
+        .fold(0, usize::saturating_add)
+        .saturating_add(
+            changes
+                .iter()
+                .map(|change| {
+                    change
+                        .requested_path
+                        .capacity()
+                        .saturating_add(change.file_path.capacity())
+                        .saturating_add(change.diff.patch.capacity().saturating_mul(2))
+                        .saturating_add(
+                            change
+                                .move_path
+                                .as_ref()
+                                .map_or(0, std::path::PathBuf::capacity),
+                        )
+                        .saturating_add(std::mem::size_of::<FileMutation>())
+                })
+                .fold(0, usize::saturating_add),
+        )
+}
+
+fn enforce_patch_bytes(bytes: usize, maximum: usize) -> Result<(), FilesystemError> {
+    if bytes > maximum {
+        return Err(FilesystemError::message(format!(
+            "Patch plan exceeds maximum retained size of {maximum} bytes"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

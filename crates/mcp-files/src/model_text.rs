@@ -175,6 +175,7 @@ mod tests {
             files_scanned: 3,
             files_listed: 40,
             truncated: true,
+            revisions: Default::default(),
         };
         assert_eq!(
             output.model_text(),

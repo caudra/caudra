@@ -6,6 +6,7 @@ pub mod environment;
 pub use workcell_environment as execution_environment;
 pub mod http_policy;
 pub mod logging;
+pub mod remote_host;
 pub mod root;
 pub mod server;
 pub mod transfer;
@@ -13,6 +14,7 @@ pub mod transports;
 
 use cli::{CliOptions, Transport};
 use server::{ServerBehavior, ToolConfiguration, WorkcellServer};
+use std::path::{Path, PathBuf};
 use transports::{TransportError, TransportOutcome, http::HttpAuthentication};
 use workcell_mcp_code::{CodeConfiguration, WorkerSource};
 use workcell_mcp_shell::ShellPermissionPolicy;
@@ -26,6 +28,8 @@ pub async fn run(
 ) -> Result<TransportOutcome, Box<dyn std::error::Error>> {
     let root =
         root::resolve_effective_root(options.root.as_deref(), &options.root_relative_subdirectory)?;
+    let snapshot_exclusions =
+        cache_snapshot_exclusion(root.as_deref(), options.code_worker_cache.as_deref())?;
     let server = WorkcellServer::configured(
         root.as_deref(),
         &options.groups,
@@ -50,6 +54,8 @@ pub async fn run(
                 type_check: options.code_type_check,
             },
             max_transfer_bytes: options.max_transfer_bytes,
+            snapshot_root: options.snapshot_root.as_deref(),
+            snapshot_exclusions: snapshot_exclusions.as_slice(),
         },
     )
     .await?;
@@ -64,6 +70,7 @@ pub async fn run(
                 bind_mode: options.http_bind,
                 allowed_hosts: options.allowed_hosts,
                 authentication,
+                remote_host: options.remote_host,
             },
         )
         .await
@@ -73,6 +80,21 @@ pub async fn run(
     // safe but leaves a SIGKILL in the operator's logs for an ordinary shutdown.
     server.shutdown().await;
     outcome
+}
+
+fn cache_snapshot_exclusion(
+    root: Option<&Path>,
+    cache: Option<&Path>,
+) -> std::io::Result<Option<PathBuf>> {
+    let (Some(root), Some(cache)) = (root, cache) else {
+        return Ok(None);
+    };
+    let cache = if cache.is_absolute() {
+        cache.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(cache)
+    };
+    Ok(cache.starts_with(root).then_some(cache))
 }
 
 pub fn resolve_shell_policy(
@@ -111,4 +133,24 @@ pub fn validate_http_authentication(
         environment_token
     };
     token.as_deref().map(HttpAuthentication::new).transpose()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cache_snapshot_exclusion;
+    use std::path::Path;
+
+    #[test]
+    fn worker_cache_outside_workspace_is_not_a_snapshot_exclusion() {
+        let root = Path::new("/workspace");
+        assert_eq!(
+            cache_snapshot_exclusion(Some(root), Some(Path::new("/home/cache"))).unwrap(),
+            None
+        );
+        assert_eq!(
+            cache_snapshot_exclusion(Some(root), Some(Path::new("/workspace/cache"))).unwrap(),
+            Some(root.join("cache"))
+        );
+        assert_eq!(cache_snapshot_exclusion(Some(root), None).unwrap(), None);
+    }
 }

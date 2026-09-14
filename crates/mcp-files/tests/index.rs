@@ -1129,6 +1129,47 @@ async fn authorized_index_rejects_a_path_type_swap() {
 }
 
 #[tokio::test]
+async fn prepared_index_keeps_the_exact_path_and_configuration() {
+    let root = tempdir().expect("root");
+    fs::write(root.path().join("source.rs"), "fn source() {}\n").expect("source");
+    fs::write(root.path().join("other.rs"), "fn other() {}\n").expect("other");
+    let group = FileToolGroup::new(root.path(), false, None)
+        .await
+        .expect("group");
+    let mut input = IndexInput {
+        path: "source.rs".into(),
+    };
+    let mut configuration = IndexExecutionConfiguration::default();
+    configuration.limits.max_model_output_bytes = 1_024;
+    configuration.limits.max_output_line_bytes = 512;
+    let prepared = group
+        .prepare_index_with_configuration(input.clone(), configuration, &CancellationToken::new())
+        .await
+        .expect("prepared index");
+    assert_eq!(prepared.relative_path(), "source.rs");
+    assert!(prepared.retained_bytes() >= prepared.resource().requested_path.len());
+    input.path = "other.rs".into();
+    configuration.limits.max_model_output_bytes = 1;
+    assert_eq!(configuration.limits.max_model_output_bytes, 1);
+
+    let output = group
+        .execute_prepared_index(prepared, &CancellationToken::new())
+        .await
+        .expect("index");
+    let IndexOutput::File {
+        relative_path,
+        skeleton,
+        ..
+    } = output
+    else {
+        panic!("expected file");
+    };
+    assert_eq!(relative_path, "source.rs");
+    assert!(skeleton.contains("source"));
+    assert!(!skeleton.contains("other"));
+}
+
+#[tokio::test]
 async fn complex_native_cases_have_exact_output_ranges_and_metadata() {
     let cases: &[(&str, &str, &[MetadataSpec<'_>])] = &[
         (

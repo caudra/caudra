@@ -83,6 +83,185 @@ names are restricted to printable ASCII with quoting and path characters removed
 name cannot inject header structure or a traversal into a client's save path. Requests are logged
 without paths, queries, or file names.
 
+The optional `ai.workcell/remote-host` discovery extension is served only through authenticated
+`POST /mcp` after the operator configures one server, workspace, workspace-generation, root-project,
+and principal identifier. The stable generation identifies replacement or reset of the configured
+workspace and is independent of the random process instance identifier. The identifiers are disclosure
+labels, not users or tenant records, and the single bearer
+still carries all process authority. Its current-directory handle is resolved once through the
+filesystem confinement policy; the descriptor also exposes the resulting root-relative display path
+and stable catalog and policy revisions. The environment revision reflects either the disclosed
+startup snapshot or nondisclosure. Its custom prepare, execute, release, status, and
+cancel methods remain on authenticated `POST /mcp` and require modern per-request extension
+negotiation. Every preparation is bound to the process instance, principal, workspace, configured
+generation, root project, immutable current-directory handle, catalog and policy revisions, tool
+contract, and argument digest. Generation mismatches are rejected before an instance mismatch can be
+treated as volatile state loss. Durable workspace, session, project-resource, and snapshot-store
+identity consists of server ID, workspace ID, generation, resource namespace version, root-project ID,
+and principal ID; instance ID is used only for volatile operation and watch loss detection.
+Preparation resolves resource intents without executing the tool. A bounded volatile ledger gives
+mutating execution one transition and retains its structured result for same-invocation retries;
+expiry, release, count limits, and byte limits bound abandoned state. Cancellation uses the active
+tool cancellation token, and bounded ordered shell progress is retained without replacing live MCP
+progress delivery. A cancellation before dispatch has `sideEffectsPossible: false`; cancellation after
+a file mutation, direct child, or Git mutation may have started has `sideEffectsPossible: true` and an `indeterminate`
+status because process termination cannot retract or prove the absence of prior effects. Restart is an
+explicit indeterminate boundary. The extension adds no endpoint,
+control plane, tenant, lease broker, transfer ticket, or signing authority, and is never exposed over
+stdio or an unauthenticated HTTP listener.
+
+Remote websearch intent keeps provider connection authority separate from the exact normalized query.
+The query is represented by a query-derived opaque resource ID and bounded display text matching the
+embedded permission query, so authorization does not collapse query disclosure into generic egress.
+
+The extension also serves resolve-directory, stat, deterministic paginated list/traversal, bounded
+revision-bearing text reads, and deterministic paginated text search through that same authenticated
+MCP route. Every relative request repeats the immutable host and root-project binding and names an
+opaque cwd handle. Handles are server-held directory bindings rather than path-bearing tickets;
+resolving a directory creates a fresh one, and rebinding, removal, root escape, or an escaping symlink
+is rejected. Pagination cursors are bounded server-held records bound to both request digest and
+observed revision, so tampering is invalid and changed results are explicitly stale. Search preserves
+bounded traversal coverage and truncation metadata even when no page cursor remains. Text reads expose
+byte continuation within a selected line range, the line containing the first byte, and the last line
+completed by the chunk, so oversized lines and beyond-EOF ranges cannot silently skip or fabricate
+content.
+
+Workspace watch state is volatile, bounded, and owned by the authenticated remote-host instance. A
+subscription is bound to the same host, workspace generation, principal, root project, and immutable
+cwd handle as its open
+request. Native watcher paths pass through filesystem confinement and are converted to root-relative
+POSIX paths before entering the retained event ring; protected paths and absolute host paths are not
+disclosed. Raw callback queues, subscription count, retained event count and bytes, total events,
+poll size and wait, lifetime, and tombstones are bounded. Close, expiry, process drop, and terminal
+resync remove the native watcher. Restart, cursor tampering, kernel or process queue overflow, backend
+failure, and retention loss return an explicit `fullResync` response rather than an incomplete stream.
+Every subscription owns one abortable expiry task; close, terminal resync, replacement, expiry, and
+host drop abort it instead of retaining a detached sleeper.
+The backend's order is retained, but rename pairing is not portable: known ends become remove/create,
+and ambiguity becomes `rescan`.
+
+Project-asset discovery is a fixed, versioned server allowlist. It covers recognized project
+instruction files, one-level skill `SKILL.md` sources in the documented compatibility directories,
+`.caudra/workflows/*.rhai`, immediate Markdown files in exactly `.caudra/commands`,
+`.claude/commands`, and `.opencode/commands`, and the exact `.caudra/permissions.toml` source; it has no
+project-controlled extension mechanism. Discovery and reads reuse confined traversal, stat, symlink
+rejection, protected-path policy, text bounds, and content revisions. Discovery admits at most 256
+assets while scanning at most 50,000 entries, 16 MiB of retained path state, and 64 MiB of hashed
+content; paths are at most 4,096 bytes and reads at most 64 KiB. A bounded partial scan is rejected.
+`.env`, `init.lua`, MCP configuration, plugin configuration or source, general or remote configuration,
+and arbitrary scripts are excluded. The server does not parse, load, execute, or grant trust to any
+discovered source. Instructions, skills, and commands are labeled `declarative`; workflow bytes are
+labeled `clientApprovalRequired`. Permissions are labeled `mixedReviewRequired`, allowing a client to
+apply denies immediately while requiring review of allows against the returned revision.
+
+Prepared workspace create, revision-matched write, mkdir, revision-matched rename, and
+revision-matched delete batches use the existing operation ledger and its idempotent invocation
+response. Workcell cannot make arbitrary multi-file publication atomic. It validates the complete
+batch before publishing, uses atomic same-filesystem replacement or rename for each action, and keeps
+an in-memory reverse rollback journal for failures and cancellation. A rollback failure is reported as
+partial failure. Process termination, kernel failure, or host loss between publications or during
+rollback is a crash boundary that can leave a partial batch; no durable recovery journal is claimed.
+Rename and delete bind regular files by byte digest and file identity, including binary files. Text
+writes and edits retain the UTF-8 and binary-content gates.
+Direct non-interactive exec is likewise prepared into the common ledger, exact-cwd and option bound,
+and admitted only through the immutable shell policy before process creation. Its output progress and
+cancellation are the same bounded mechanisms used by the ordinary shell tool. Discovery advertises
+these implemented subcapabilities as `v1`.
+
+SCM discovery and every repository-relative path start from the same confined immutable cwd/resource
+handles as workspace reads. A repository is accepted only when its ordinary worktree and `.git`
+directory canonicalize inside the configured root. `.git` files, symlinked or external git
+directories, linked worktrees, submodules, bare repositories, and common-directory indirection are
+rejected. Repository handles are process-local bindings rather than path tickets. Status, history,
+diff, and side responses are revision-bearing and bounded; paginated responses use opaque cursors
+bound to the request and observed repository revision. Untracked and conflicted paths remain explicit
+states rather than being folded into a generic dirty bit.
+
+Repository discovery, identity, object decoding, and history traversal use `gix`. Commit object headers
+are checked against the advertised 1 MiB per-object and 16 MiB aggregate `maxLogScanBytes` limits before
+each traversed body is loaded or decoded; commits skipped to reach a cursor consume the same aggregate
+budget. An aggregate stop is returned as a truncated response without a continuation cursor. Shallow
+boundaries are read only from the regular, non-symlink `.git/shallow` file; shallow-path configuration
+overrides are rejected. The reader accepts at most 1 MiB and 10,000 strict object IDs before traversal.
+Before `gix` parses repository configuration, Workcell reads `.git/config` through a confined,
+non-symlink descriptor under the advertised 1 MiB `maxConfigBytes` limit. It retains content and file
+identity and revalidates them immediately before and after `gix` reopens the file; a race is stale.
+Status uses Git's documented porcelain-v2 NUL format, changed-path discovery uses NUL-delimited
+name-status, and textual patches are parsed into typed line records under hard source bounds. Raw stdout
+and stderr are never
+returned. The fixed Git child templates disable hooks and filesystem monitors, suppress prompts,
+ignore global/system configuration, remove helper-affecting environment variables, and reject
+repositories with external filter or diff-driver configuration. Every diff pass disables external
+diff, textconv, and color independently of repository attributes. Remote-host construction first
+bounds and validates `git --version`; an unavailable or invalid Git executable removes the SCM
+capability and is reported through `controlPlaneMissing`.
+There is no client-selected command, option, environment, executable, or generic Git route.
+
+Stage, unstage, and discard are exact prepared operations in the existing ledger. A mutation accepts at
+most 127 paths so its repository intent plus all path intents fit the 128-intent ledger bound.
+Preparation records
+the repository identity, HEAD, index, content-sensitive worktree revision, normalized path set, and
+status preview. Execution serializes against filesystem mutations, checks the index lock and every
+captured revision again, and reports stale, locked, cleanly cancelled, indeterminate post-start
+cancellation, or failed outcomes structurally.
+Retries with the same invocation ID reuse the retained outcome. Discard invokes only tracked-worktree
+restore for the prepared paths; it does not remove untracked content and no clean/reset operation is
+available. A process crash during a Git index update remains a repository recovery boundary.
+
+Snapshot support is an explicit authenticated-HTTP, writable-files opt-in. `--snapshot-root` or
+`WORKCELL_MCP_SNAPSHOT_ROOT` must name an existing absolute directory outside the configured workspace.
+Startup rejects a symlink component, ownership by another identity, group/other access on Unix, a path
+that contains the workspace or is contained by it, an unsupported private entry, an oversized journal,
+or more journals than the recovery bound. Workcell never falls back to a shared temporary path. The
+private root is operator state: do not mount it into the exposed workspace or serve it independently.
+
+Capture traverses only canonical entries admitted by filesystem confinement and the protected-path
+policy. Git metadata, `.workcell`, credential-bearing paths, the private snapshot root, and a configured
+in-workspace code-worker cache are excluded. Each scan bounds aggregate directory-entry count and
+retained path bytes before collecting entries, including wide directories and empty directory trees. A
+configured exclusion is resolved through its nearest
+existing ancestor, so a later-created suffix remains excluded; escaping and malformed suffixes fail
+startup. Every included entry must remain a regular file; symlinks, sockets, devices, and pipes fail
+capture. Per-file, file-count, total-byte, concurrent-capture, retained snapshot, journal, metadata, and
+total-storage limits are fixed and advertised. Blob, manifest, checkpoint, and journal bytes are
+serialized and charged prospectively, including replacement size, under one publication lock. Failed
+or inconsistent captures run bounded reachability collection. A complete second scan must match the
+first before an immutable manifest is published. Blob names are content digests and both blobs and
+manifests are verified when read. Private files use owner-only modes and same-directory
+create/sync/rename or create/link/sync publication.
+
+Restore authorization happens against stable restore and deterministic pre-restore snapshot IDs and
+the complete prepared create/replace/delete/conflict and missing-ancestor list in the existing operation
+ledger. The workspace
+revision is compared again before the first effect and each file is compared immediately before its
+effect. An aggregate private-store write intent covers the prepared pre-restore manifest and blobs. A
+mismatch refuses publication; it never chooses the snapshot over a later edit. The
+pre-restore state is captured before a durable journal under that same restore ID enters `publishing`.
+Execution creates only prepared ancestors and journals directory progress before file progress. Each
+file replacement is atomic, but the complete restore is not. Termination can happen after a directory
+creation or file rename and before its journal update. Startup therefore compares bounded journal
+entries with pre-state and target digest/mode, marks safely completed work complete, and otherwise
+reports `partial` or `indeterminate` with reconciliation required. It does not replay an incomplete
+restore.
+
+Unrevert targets the exact private pre-restore snapshot and uses the same prepared execution and status
+path. Until a completed restore is acknowledged, overlapping restores are rejected. Partial and
+indeterminate journals cannot be acknowledged and continue to gate overlap until an operator
+reconciles private state. Journal count and byte limits are enforced before restore and unrevert; only
+acknowledged terminal journals are reclaimable under pressure. Prepared cleanup also uses the common
+ledger. It retains the exact checkpoint, acknowledged-journal, manifest, and unreachable-blob deletion
+set and binds one server-state resource intent to that plan. Execution revalidates equality, removes
+references before referents, and never widens the prepared set. Startup bounded GC makes every cleanup
+crash boundary openable and permits GC-only recovery when no manifest ID remains. Pending preparations
+and every non-reclaimable journal remain reachability roots, so cleanup cannot remove state needed for
+restore, recovery, or unrevert.
+
+Discovery reports snapshots only after private-store validation and startup recovery succeed. It sets
+`controlPlane: true` only when operations, workspace reads, watch, project assets, writable prepared
+mutation, direct exec, SCM, and snapshots are all enabled; otherwise `controlPlaneMissing` identifies
+the absent slice. This is a capability summary, not a deployment controller. Snapshot methods add no
+route, user, tenant, signed ticket, bearer, or authority beyond authenticated `POST /mcp`.
+
 Shell requests are parsed into command scopes before execution. Without `--shell-policy` or `--yolo`,
 all shell requests are denied. An explicit deny rejects the entire request before any command starts;
 `--yolo` permits unmatched classified scopes but does not override a deny. If deny rules exist, opaque

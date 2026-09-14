@@ -2,7 +2,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     FilesystemError,
-    diff::{DiffHunk, file_diff, file_diff_hunks},
+    diff::{DiffHunk, file_diff, file_diff_hunks, line_index_retained_bytes},
     operations::FilesystemCore,
     text::{check_cancelled, enforce_bytes, read_text_snapshot_required},
     types::{FileEditInput, FileEditKind, FileEditOutput},
@@ -16,24 +16,22 @@ use super::path_string;
 const MAX_EDIT_SPANS: usize = 1024;
 
 impl FilesystemCore {
-    pub(crate) async fn file_edit(
+    pub(crate) async fn prepare_edit_bounded(
         &self,
+        file_path: &std::path::Path,
+        relative_path: String,
         input: FileEditInput,
+        maximum_retained_bytes: usize,
         token: &CancellationToken,
-    ) -> Result<FileEditOutput, FilesystemError> {
-        let _guard = self.mutation.lock().await;
+    ) -> Result<(String, crate::text::FileVersion, FileEditOutput), FilesystemError> {
         check_cancelled(token)?;
-        if input.old_string.is_empty() {
-            return Err(FilesystemError::message("oldString cannot be empty"));
-        }
         if input.old_string == input.new_string {
             return Err(FilesystemError::message(
                 "No changes to apply: strings are identical",
             ));
         }
-        let file_path = self.policy.resolve(&input.file_path).await?;
         let snapshot =
-            read_text_snapshot_required(&file_path, self.limits.max_file_bytes, token).await?;
+            read_text_snapshot_required(file_path, self.limits.max_file_bytes, token).await?;
         let old_content = &snapshot.content;
         let ending = if old_content.contains("\r\n") {
             "\r\n"
@@ -45,10 +43,20 @@ impl FilesystemCore {
         let replace_all = input.replace_all.unwrap_or(false);
         let new_content = replace_exact(old_content, &old_string, &new_string, replace_all)?;
         enforce_bytes("edited content", &new_content, self.limits.max_write_bytes)?;
+        let preparation_peak = snapshot
+            .content
+            .capacity()
+            .saturating_add(new_content.capacity())
+            .saturating_add(line_index_retained_bytes(&[old_content, &new_content]));
+        if preparation_peak > maximum_retained_bytes {
+            return Err(FilesystemError::message(format!(
+                "File edit preparation exceeds maximum retained size of {maximum_retained_bytes} bytes"
+            )));
+        }
         let diff = match edit_spans(old_content, &old_string, &new_string, replace_all) {
             Some(spans) => file_diff_hunks(
                 &self.policy,
-                &file_path,
+                file_path,
                 old_content,
                 &new_content,
                 &spans,
@@ -57,29 +65,21 @@ impl FilesystemCore {
             )?,
             None => file_diff(
                 &self.policy,
-                &file_path,
+                file_path,
                 old_content,
                 &new_content,
                 None,
                 self.limits.max_diff_bytes,
             )?,
         };
-        self.require_write()?;
-        self.commit_write(
-            &file_path,
-            &new_content,
-            token,
-            false,
-            Some(&snapshot.version),
-        )
-        .await?;
-        Ok(FileEditOutput {
+        let output = FileEditOutput {
             kind: FileEditKind::Edit,
-            path: path_string(&file_path),
-            relative_path: self.policy.relative(&file_path)?,
-            applied: true,
+            path: path_string(file_path),
+            relative_path,
+            applied: false,
             diff,
-        })
+        };
+        Ok((new_content, snapshot.version, output))
     }
 }
 

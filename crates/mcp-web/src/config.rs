@@ -10,7 +10,7 @@ use crate::search::{
 };
 
 /// Search provider represented in normalized output.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, schemars::JsonSchema, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum WebsearchBackend {
     Searxng,

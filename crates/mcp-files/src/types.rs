@@ -1,6 +1,10 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::mem::size_of;
 use std::path::PathBuf;
+
+use crate::text::FileVersion;
 
 /// Resource bounds are deliberately independent so deployments can tighten one
 /// attack surface without unexpectedly changing another operation.
@@ -253,6 +257,9 @@ pub struct FileGrepOutput {
     /// Candidate files the traversal listed. A lower bound when `truncated`.
     pub files_listed: usize,
     pub truncated: bool,
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub(crate) revisions: HashMap<String, FileVersion>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -265,6 +272,15 @@ pub struct FileDiff {
     pub deletions: usize,
     #[serde(default, skip_serializing_if = "is_false")]
     pub truncated: bool,
+}
+
+impl FileDiff {
+    pub(crate) fn retained_bytes(&self) -> usize {
+        size_of::<Self>()
+            .saturating_add(self.file.capacity())
+            .saturating_add(self.relative_path.capacity())
+            .saturating_add(self.patch.capacity())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -294,6 +310,16 @@ pub struct FileMutation {
     pub move_path: Option<String>,
 }
 
+impl FileMutation {
+    pub(crate) fn retained_bytes(&self) -> usize {
+        size_of::<Self>()
+            .saturating_add(self.file_path.capacity())
+            .saturating_add(self.relative_path.capacity())
+            .saturating_add(self.patch.capacity())
+            .saturating_add(self.move_path.as_ref().map_or(0, String::capacity))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct FileWriteOutput {
@@ -303,6 +329,15 @@ pub struct FileWriteOutput {
     pub existed: bool,
     pub applied: bool,
     pub diff: FileDiff,
+}
+
+impl FileWriteOutput {
+    pub(crate) fn retained_bytes(&self) -> usize {
+        size_of::<Self>()
+            .saturating_add(self.path.capacity())
+            .saturating_add(self.relative_path.capacity())
+            .saturating_add(self.diff.retained_bytes())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -319,6 +354,15 @@ pub struct FileEditOutput {
     pub relative_path: String,
     pub applied: bool,
     pub diff: FileDiff,
+}
+
+impl FileEditOutput {
+    pub(crate) fn retained_bytes(&self) -> usize {
+        size_of::<Self>()
+            .saturating_add(self.path.capacity())
+            .saturating_add(self.relative_path.capacity())
+            .saturating_add(self.diff.retained_bytes())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -341,6 +385,24 @@ pub struct FileApplyPatchOutput {
     pub truncated: bool,
 }
 
+impl FileApplyPatchOutput {
+    pub(crate) fn retained_bytes(&self) -> usize {
+        size_of::<Self>()
+            .saturating_add(self.diff.capacity())
+            .saturating_add(
+                self.files
+                    .capacity()
+                    .saturating_mul(size_of::<FileMutation>()),
+            )
+            .saturating_add(
+                self.files
+                    .iter()
+                    .map(FileMutation::retained_bytes)
+                    .fold(0, usize::saturating_add),
+            )
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum FilePatchKind {
@@ -360,7 +422,34 @@ pub enum FileResourceAccess {
 pub struct FileResource {
     pub requested_path: String,
     pub path: PathBuf,
+    pub root_relative_path: String,
     pub access: FileResourceAccess,
+}
+
+impl FileResource {
+    pub fn resource_scope(
+        &self,
+    ) -> Result<Vec<workcell_host_contract::ResourceId>, crate::WorkspaceError> {
+        crate::root_relative_resource_scope(crate::RootResourceKind::Path, &self.root_relative_path)
+    }
+    pub fn resource_id(&self) -> Result<workcell_host_contract::ResourceId, crate::WorkspaceError> {
+        crate::root_relative_resource_id(crate::RootResourceKind::Path, &self.root_relative_path)
+    }
+
+    /// Conservative bytes exclusively retained by this resource binding.
+    #[must_use]
+    pub fn retained_bytes(&self) -> usize {
+        size_of::<Self>()
+            .saturating_add(self.requested_path.capacity())
+            .saturating_add(self.path.capacity())
+            .saturating_add(self.root_relative_path.capacity())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedDirectory {
+    pub path: PathBuf,
+    pub relative_path: String,
 }
 
 fn is_false(value: &bool) -> bool {

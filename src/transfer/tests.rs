@@ -87,6 +87,86 @@ async fn download_mints_a_relative_url_and_moves_no_bytes() {
 }
 
 #[tokio::test]
+async fn preparation_captures_exact_transfer_state_without_minting_or_moving_bytes() {
+    let (root, group) = group(true).await;
+    let path = root.path().join("report.bin");
+    std::fs::write(&path, b"payload").expect("file");
+    let prepared = group
+        .prepare("file_download", json!({"path": "report.bin"}))
+        .await
+        .expect("prepare");
+
+    assert_eq!(prepared.direction(), TransferDirection::Download);
+    assert_eq!(prepared.path(), "report.bin");
+    assert_eq!(prepared.name(), "report.bin");
+    assert_eq!(prepared.max_bytes(), 1024);
+    assert_eq!(prepared.revision().map(TransferRevision::bytes), Some(7));
+    assert!(prepared.retained_bytes() >= prepared.path().len() + prepared.name().len());
+    assert_eq!(std::fs::read(&path).expect("read"), b"payload");
+    assert_eq!(std::fs::read_dir(root.path()).expect("listing").count(), 1);
+
+    let result = group.execute_prepared(prepared).await.expect("execute");
+    let structured = result.structured_content.expect("structured");
+    assert_eq!(structured["url"], "/files?path=report.bin");
+    assert!(structured["url"].as_str().is_some_and(|url| {
+        !url.contains("ticket") && !url.contains("signature") && !url.contains("expires")
+    }));
+}
+
+#[tokio::test]
+async fn prepared_download_fails_after_the_captured_file_is_replaced() {
+    let (root, group) = group(false).await;
+    std::fs::write(root.path().join("report.bin"), b"before").expect("file");
+    let prepared = group
+        .prepare("file_download", json!({"path": "report.bin"}))
+        .await
+        .expect("prepare");
+    std::fs::write(root.path().join("replacement.bin"), b"after!").expect("replacement");
+    std::fs::rename(
+        root.path().join("replacement.bin"),
+        root.path().join("report.bin"),
+    )
+    .expect("replace");
+
+    let result = group.execute_prepared(prepared).await.expect("tool result");
+    assert_eq!(result.is_error, Some(true));
+    assert!(text(&result).contains("changed after preparation"));
+}
+
+#[tokio::test]
+async fn prepared_upload_fails_when_an_absent_destination_appears() {
+    let (root, group) = group(true).await;
+    let prepared = group
+        .prepare("file_upload", json!({"path": "new.bin"}))
+        .await
+        .expect("prepare");
+    assert!(prepared.requires_absent_destination());
+    std::fs::write(root.path().join("new.bin"), b"raced").expect("racing file");
+
+    let result = group.execute_prepared(prepared).await.expect("tool result");
+    assert_eq!(result.is_error, Some(true));
+    assert!(text(&result).contains("changed after preparation"));
+}
+
+#[tokio::test]
+async fn prepared_transfer_is_bound_to_the_preparing_process_authority() {
+    let (root, preparing_group) = group(false).await;
+    std::fs::write(root.path().join("report.bin"), b"payload").expect("file");
+    let prepared = preparing_group
+        .prepare("file_download", json!({"path": "report.bin"}))
+        .await
+        .expect("prepare");
+    let (_other_root, other_group) = group(false).await;
+
+    let result = other_group
+        .execute_prepared(prepared)
+        .await
+        .expect("tool result");
+    assert_eq!(result.is_error, Some(true));
+    assert!(text(&result).contains("different transfer tool group"));
+}
+
+#[tokio::test]
 async fn download_rejects_a_directory_and_an_oversized_file() {
     let (root, group) = group(false).await;
     std::fs::create_dir(root.path().join("nested")).expect("dir");

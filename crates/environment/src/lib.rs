@@ -12,19 +12,17 @@ use std::{
 };
 
 #[cfg(feature = "mcp")]
-use rmcp::model::{CallToolResult, ContentBlock, JsonObject, MetaObject, Tool, ToolAnnotations};
+use rmcp::model::{CallToolResult, ContentBlock, MetaObject, Tool, ToolAnnotations};
 use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::{io::AsyncReadExt, process::Command, sync::Semaphore, task::JoinSet};
 use tokio_util::sync::CancellationToken;
-use workcell_tool_contract::{ToolAnnotations as NeutralAnnotations, ToolSpec};
+use workcell_tool_contract::{ToolAnnotations as NeutralAnnotations, ToolContract, ToolSpec};
 
 pub const EXTENSION_ID: &str = "ai.workcell/execution-environment";
 pub const TOOL_NAME: &str = "execution_environment";
 
-#[cfg(feature = "mcp")]
-const PRESENTATION_KEY: &str = "ai.workcell/presentation-profile";
 const TOOL_DESCRIPTION: &str = r#"Inspect the execution host's current sanitized environment.
 
 Use this tool when command availability, installed versions, privilege access, Git repository status, package-manager metadata, or recognized lockfiles may have changed since server discovery. Each call collects a fresh snapshot using bounded local checks; avoid repeated calls when an earlier result is still sufficient.
@@ -105,6 +103,23 @@ pub struct ExecutionEnvironmentOutput {
 pub struct ExecutionEnvironmentResult {
     pub output: ExecutionEnvironmentOutput,
     pub model_text: String,
+}
+
+#[derive(Debug)]
+pub struct PreparedExecutionEnvironment {
+    groups: ToolGroupDisclosure,
+}
+
+impl PreparedExecutionEnvironment {
+    #[must_use]
+    pub const fn tool_groups(&self) -> ToolGroupDisclosure {
+        self.groups
+    }
+
+    #[must_use]
+    pub const fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -398,6 +413,21 @@ impl ExecutionEnvironmentDisclosure {
         groups: ToolGroupDisclosure,
         cancellation: CancellationToken,
     ) -> Result<ExecutionEnvironmentResult, ExecutionEnvironmentError> {
+        self.execute_prepared(self.prepare(groups), cancellation)
+            .await
+    }
+
+    /// Binds the configured disclosure for a no-argument inspection without starting any probes.
+    #[must_use]
+    pub const fn prepare(&self, groups: ToolGroupDisclosure) -> PreparedExecutionEnvironment {
+        PreparedExecutionEnvironment { groups }
+    }
+
+    pub async fn execute_prepared(
+        &self,
+        prepared: PreparedExecutionEnvironment,
+        cancellation: CancellationToken,
+    ) -> Result<ExecutionEnvironmentResult, ExecutionEnvironmentError> {
         let gate = self.refresh_gate.clone();
         let permit = tokio::select! {
             permit = gate.acquire_owned() => permit.map_err(|_| ExecutionEnvironmentError::Unavailable)?,
@@ -418,7 +448,7 @@ impl ExecutionEnvironmentDisclosure {
             }
         };
         drop(permit);
-        let output = snapshot.output(groups);
+        let output = snapshot.output(prepared.groups);
         let model_text = serde_json::to_string_pretty(&output)
             .expect("execution-environment descriptor is serializable");
         Ok(ExecutionEnvironmentResult { output, model_text })
@@ -467,7 +497,7 @@ pub fn spec() -> ToolSpec {
             open_world_hint: Some(true),
         },
         "execution-environment.snapshot.v1",
-        "execution-environment.snapshot.v1",
+        ToolContract::new("execution-environment.snapshot.v1", "v1", "v1"),
     )
     .with_output_schema(output_schema())
 }
@@ -475,11 +505,6 @@ pub fn spec() -> ToolSpec {
 #[cfg(feature = "mcp")]
 pub fn tool() -> Tool {
     let spec = spec();
-    let mut meta = JsonObject::new();
-    meta.insert(
-        PRESENTATION_KEY.to_owned(),
-        Value::String(spec.presentation.to_owned()),
-    );
     let tool = Tool::new(
         spec.name,
         spec.description.clone(),
@@ -501,7 +526,7 @@ pub fn tool() -> Tool {
         spec.annotations.idempotent_hint,
         spec.annotations.open_world_hint,
     ))
-    .with_meta(MetaObject(meta))
+    .with_meta(MetaObject(spec.extension_metadata()))
 }
 
 fn output_schema() -> serde_json::Map<String, Value> {
@@ -1979,6 +2004,34 @@ mod tests {
             result.model_text,
             serde_json::to_string_pretty(&result.output).unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn prepared_inspection_has_no_probe_effects_and_consumes_bound_disclosure() {
+        let disclosure = ExecutionEnvironmentDisclosure::new(None).await;
+        let groups = ToolGroupDisclosure {
+            files: true,
+            web: false,
+            shell: false,
+            code: true,
+            code_graph: true,
+        };
+        let permits = disclosure.refresh_gate.available_permits();
+        let prepared = disclosure.prepare(groups);
+        assert_eq!(disclosure.refresh_gate.available_permits(), permits);
+        assert!(prepared.tool_groups().files);
+        assert!(prepared.tool_groups().code);
+        assert!(prepared.retained_bytes() >= std::mem::size_of::<ToolGroupDisclosure>());
+
+        let result = disclosure
+            .execute_prepared(prepared, CancellationToken::new())
+            .await
+            .expect("prepared inspection");
+        assert!(result.output.tool_groups.files);
+        assert!(result.output.tool_groups.code);
+        assert!(result.output.tool_groups.code_graph);
+        assert!(!result.output.tool_groups.web);
+        assert!(!result.output.tool_groups.shell);
     }
 
     #[tokio::test]

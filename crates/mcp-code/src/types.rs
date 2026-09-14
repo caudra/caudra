@@ -4,6 +4,9 @@
 //! numbers therefore change deliberately: consumers can branch on `version` rather than infer a
 //! schema from optional fields or presentation text.
 
+use std::mem::size_of;
+
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// Small scripts are the advertised use case, so the default budget is short enough that a runaway
@@ -29,8 +32,38 @@ pub struct CodeInput {
     pub timeout: Option<u64>,
 }
 
+#[derive(Debug)]
+pub struct PreparedCode {
+    pub(crate) code: String,
+    pub(crate) timeout_ms: u64,
+    pub(crate) type_check: bool,
+}
+
+impl PreparedCode {
+    /// Conservative retained bytes for the source captured by this execution plan.
+    #[must_use]
+    pub fn retained_bytes(&self) -> usize {
+        size_of::<Self>().saturating_add(self.code.capacity())
+    }
+
+    #[must_use]
+    pub fn code(&self) -> &str {
+        &self.code
+    }
+
+    #[must_use]
+    pub const fn timeout_ms(&self) -> u64 {
+        self.timeout_ms
+    }
+
+    #[must_use]
+    pub const fn type_check(&self) -> bool {
+        self.type_check
+    }
+}
+
 /// How a call ended. This is the field an agent should branch on before reading anything else.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Outcome {
     /// The snippet ran to completion and produced a value.
@@ -45,7 +78,7 @@ pub enum Outcome {
     Unavailable,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, JsonSchema, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodeException {
     /// Python exception class name, for example `ValueError`.
@@ -53,7 +86,7 @@ pub struct CodeException {
     pub message: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, JsonSchema, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodeOutput {
     /// Version of the structured result shape, independent of the MCP protocol version.
@@ -117,5 +150,23 @@ impl CodeOutput {
             memory_exceeded: false,
             suspension_limit_exceeded: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PreparedCode;
+
+    #[test]
+    fn prepared_code_estimate_covers_the_owned_source_capacity() {
+        let mut code = String::with_capacity(64 * 1_024);
+        code.push_str("print('ok')");
+        let prepared = PreparedCode {
+            code,
+            timeout_ms: 1,
+            type_check: true,
+        };
+
+        assert!(prepared.retained_bytes() >= 64 * 1_024);
     }
 }

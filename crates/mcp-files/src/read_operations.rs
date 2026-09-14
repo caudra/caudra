@@ -1,9 +1,9 @@
 mod glob;
-mod grep;
+pub(crate) mod grep;
 mod listing_metadata;
 mod traversal;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use tokio::fs;
 use tokio_util::sync::CancellationToken;
@@ -12,30 +12,28 @@ use crate::{
     FilesystemError,
     operations::FilesystemCore,
     text::{check_cancelled, decode_text, read_bounded, split_text_lines, truncate_line},
-    types::{DirectoryEntryDetail, FileEntryKind, FileReadInput, FileReadOutput},
+    types::{DirectoryEntryDetail, FileEntryKind, FileReadOutput},
 };
 
 use self::listing_metadata::file_listing_metadata;
 
 impl FilesystemCore {
-    pub(crate) async fn file_read(
+    pub(crate) async fn file_read_prepared(
         &self,
-        input: FileReadInput,
+        file_path: PathBuf,
+        requested_path: String,
+        relative_path: String,
+        offset: usize,
+        limit: usize,
         token: &CancellationToken,
     ) -> Result<FileReadOutput, FilesystemError> {
         check_cancelled(token)?;
-        let requested = if input.file_path.is_empty() {
-            "."
-        } else {
-            &input.file_path
-        };
-        let file_path = self.policy.resolve(requested).await?;
         let metadata = match fs::metadata(&file_path).await {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Err(FilesystemError::message(format!(
                     "File not found: {}",
-                    input.file_path
+                    requested_path
                 )));
             }
             Err(error) => {
@@ -47,26 +45,12 @@ impl FilesystemCore {
             }
         };
         if metadata.is_dir() {
-            return self.read_directory(&file_path, token).await;
+            return self.read_directory(&file_path, relative_path, token).await;
         }
         if !metadata.is_file() {
             return Err(FilesystemError::message(format!(
                 "Path is not a regular file: {}",
-                input.file_path
-            )));
-        }
-
-        let offset = input.offset.unwrap_or(1);
-        let limit = input.limit.unwrap_or(self.limits.max_read_lines);
-        if offset < 1 {
-            return Err(FilesystemError::message(
-                "offset must be an integer of 1 or greater",
-            ));
-        }
-        if limit > self.limits.max_read_lines {
-            return Err(FilesystemError::message(format!(
-                "limit must be an integer between 0 and {}",
-                self.limits.max_read_lines
+                requested_path
             )));
         }
         let bytes = read_bounded(&file_path, self.limits.max_file_bytes, token).await?;
@@ -94,7 +78,7 @@ impl FilesystemCore {
         }
         Ok(FileReadOutput::File {
             path: path_string(&file_path),
-            relative_path: self.policy.relative(&file_path)?,
+            relative_path,
             text: selected.join("\n"),
             numbered_text: numbered.join("\n"),
             line_start: offset,
@@ -107,6 +91,7 @@ impl FilesystemCore {
     async fn read_directory(
         &self,
         path: &Path,
+        relative_path: String,
         token: &CancellationToken,
     ) -> Result<FileReadOutput, FilesystemError> {
         let mut reader = fs::read_dir(path)
@@ -167,7 +152,7 @@ impl FilesystemCore {
         }
         Ok(FileReadOutput::Directory {
             path: path_string(path),
-            relative_path: self.policy.relative(path)?,
+            relative_path,
             entries,
             entry_details,
             truncated,

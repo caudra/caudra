@@ -6,20 +6,20 @@ mod pdf_response;
 
 use std::time::Duration;
 
-use http::Method;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use workcell_source_icons::SourceIconError;
 
 use crate::WebToolDependencies;
-use crate::dependencies::{WebHttpError, WebHttpRequest, WebHttpRequestKind};
+use crate::dependencies::{WebHttpError, WebHttpRequest};
 use crate::types::WebfetchOutput;
 
 pub(crate) use input::{NormalizedWebfetchInput, normalize_input};
 pub(crate) use output::utf8_prefix;
 
 const MAX_RESPONSE_BYTES: usize = 5 * 1024 * 1024;
-const MAX_PDF_RESPONSE_BYTES: usize = 6 * 1024 * 1024;
+pub(super) const MAX_PDF_RESPONSE_BYTES: usize = 6 * 1024 * 1024;
+pub(super) const MAX_REDIRECTS: usize = 5;
 
 #[derive(Debug, thiserror::Error)]
 pub enum WebfetchError {
@@ -45,25 +45,29 @@ pub(crate) async fn execute(
     // Webfetch timeout is one total deadline for network transfer and primary
     // HTML/PDF parsing. Optional icon decoration is skipped at that deadline.
     let deadline = Instant::now() + timeout;
+    input
+        .policy
+        .validate_url(&input.url)
+        .map_err(|error| WebfetchError::Operation(input::policy_message(error)))?;
     let response = dependencies
         .http
         .execute(WebHttpRequest {
-            kind: WebHttpRequestKind::PublicGet,
-            method: Method::GET,
+            kind: input.request_kind,
+            method: input.method.clone(),
             url: input.url.clone(),
-            headers: content::headers(input.format),
+            headers: input.headers.clone(),
             body: None,
             timeout,
-            max_redirects: 5,
+            max_redirects: input.max_redirects,
             // Octet-stream responses need the PDF allowance before their
             // signature can be inspected.
-            max_body_bytes: MAX_PDF_RESPONSE_BYTES,
+            max_body_bytes: input.max_body_bytes,
             cancellation: cancellation.clone(),
         })
         .await
         .map_err(|error| map_http_error(error, input.timeout_seconds))?;
-    dependencies
-        .webfetch_policy
+    input
+        .policy
         .validate_url(&response.final_url)
         .map_err(|error| WebfetchError::Operation(input::policy_message(error)))?;
     if !response.status.is_success() {

@@ -10,11 +10,12 @@ use crate::{
     text::{FileVersion, check_cancelled, validate_snapshot},
 };
 
-use super::path_string;
+use super::publication_stale;
 
 impl FilesystemCore {
-    pub(super) async fn commit_write(
+    pub(crate) async fn commit_write(
         &self,
+        requested_path: &str,
         file_path: &Path,
         content: &str,
         token: &CancellationToken,
@@ -28,16 +29,9 @@ impl FilesystemCore {
         fs::create_dir_all(parent)
             .await
             .map_err(|error| FilesystemError::io_path("Cannot create directory", parent, error))?;
-        let checked = self.policy.resolve(&path_string(file_path)).await?;
-        if checked != file_path {
-            return Err(FilesystemError::message(format!(
-                "Path changed before write: {}",
-                file_path.to_string_lossy()
-            )));
-        }
         check_cancelled(token)?;
-        let existing = fs::metadata(&checked).await.ok();
-        let basename = checked.file_name().unwrap_or_default().to_string_lossy();
+        let existing = fs::metadata(file_path).await.ok();
+        let basename = file_path.file_name().unwrap_or_default().to_string_lossy();
         let temporary = parent.join(format!(
             ".{basename}.{}.{}.tmp",
             std::process::id(),
@@ -61,22 +55,33 @@ impl FilesystemCore {
             set_compatible_permissions(&temporary, existing.as_ref()).await?;
             drop(file);
             check_cancelled(token)?;
+            self.validate_prepared_path(requested_path, file_path)
+                .await
+                .map_err(|_| publication_stale(requested_path))?;
             if let Some(expected) = expected {
-                validate_snapshot(&checked, expected, self.limits.max_file_bytes, token).await?;
+                validate_snapshot(file_path, expected, self.limits.max_file_bytes, token).await?;
+            } else if fs::symlink_metadata(file_path).await.is_ok() {
+                return Err(publication_stale(requested_path));
             }
             if exclusive {
                 // A same-filesystem hard link is the portable create-if-absent
                 // primitive used by the TypeScript implementation. It closes
                 // the race between patch planning and publication.
-                fs::hard_link(&temporary, &checked).await.map_err(|error| {
-                    FilesystemError::io_path("Cannot publish new file", &checked, error)
-                })?;
+                fs::hard_link(&temporary, file_path)
+                    .await
+                    .map_err(|error| {
+                        if error.kind() == std::io::ErrorKind::AlreadyExists {
+                            publication_stale(requested_path)
+                        } else {
+                            FilesystemError::io_path("Cannot publish new file", file_path, error)
+                        }
+                    })?;
                 fs::remove_file(&temporary).await.map_err(|error| {
                     FilesystemError::io_path("Cannot remove temporary file", &temporary, error)
                 })?;
             } else {
-                fs::rename(&temporary, &checked).await.map_err(|error| {
-                    FilesystemError::io_path("Cannot replace file", &checked, error)
+                fs::rename(&temporary, file_path).await.map_err(|error| {
+                    FilesystemError::io_path("Cannot replace file", file_path, error)
                 })?;
             }
             Ok(())
@@ -135,6 +140,7 @@ mod tests {
 
         let error = core
             .commit_write(
+                "value.txt",
                 &path,
                 "our change\n",
                 &token,

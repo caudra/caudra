@@ -115,6 +115,42 @@ async fn returns_the_value_of_the_final_expression() {
     group.shutdown().await;
 }
 
+#[tokio::test]
+async fn preparation_validates_and_binds_without_running_the_snippet() {
+    let group = group_or_skip!(true);
+    let prepared = group
+        .prepare(CodeInput {
+            code: "print('prepared once')\n7".to_owned(),
+            timeout: None,
+        })
+        .expect("prepare");
+    assert_eq!(prepared.code(), "print('prepared once')\n7");
+    assert_eq!(prepared.timeout_ms(), workcell_mcp_code::DEFAULT_TIMEOUT_MS);
+    assert!(prepared.type_check());
+
+    let execution = group
+        .execute_prepared(prepared, CancellationToken::new())
+        .await
+        .expect("execute")
+        .expect("not cancelled");
+    assert_eq!(execution.output.result, json!(7));
+    assert_eq!(execution.output.stdout, "prepared once\n");
+    group.shutdown().await;
+}
+
+#[tokio::test]
+async fn preparation_rejects_invalid_limits_before_worker_execution() {
+    let group = group_or_skip!();
+    let error = group
+        .prepare(CodeInput {
+            code: "1".to_owned(),
+            timeout: Some(workcell_mcp_code::MAX_TIMEOUT_MS + 1),
+        })
+        .expect_err("invalid timeout");
+    assert!(error.contains("timeout must be between"));
+    group.shutdown().await;
+}
+
 #[cfg(feature = "bundled-worker")]
 #[tokio::test]
 async fn bundled_worker_executes_without_an_external_path() {

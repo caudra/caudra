@@ -4,19 +4,14 @@
 //! An MCP client may use annotations and presentation metadata for UX, but the server never trusts
 //! clients to enforce either the unsafe-execution warning or argument constraints.
 
-use crate::types::{DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS};
+use crate::types::{DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS, ShellOutput};
 #[cfg(feature = "mcp")]
-use rmcp::model::{JsonObject, MetaObject, Tool, ToolAnnotations};
-#[cfg(feature = "mcp")]
-use serde_json::Value;
-use serde_json::json;
+use rmcp::model::{MetaObject, Tool, ToolAnnotations};
+use schemars::{JsonSchema, SchemaGenerator, generate::SchemaSettings};
+use serde_json::{Map, Value, json};
 #[cfg(feature = "mcp")]
 use std::sync::Arc;
-use workcell_tool_contract::{ToolAnnotations as NeutralAnnotations, ToolSpec};
-
-/// Stable extension key consumed by Workcell renderers. Preserve this namespace across versions.
-#[cfg(feature = "mcp")]
-pub(crate) const PRESENTATION_KEY: &str = "ai.workcell/presentation-profile";
+use workcell_tool_contract::{ToolAnnotations as NeutralAnnotations, ToolContract, ToolSpec};
 
 const DESCRIPTION: &str = r#"Execute a Bash command on the MCP server host.
 
@@ -47,29 +42,27 @@ pub fn specs() -> Vec<ToolSpec> {
     let schema = json!({"type":"object","additionalProperties":false,"properties":{"command":{"type":"string","minLength":1,"description":"Bash command to execute on the MCP server host."},"timeout":{"type":"integer","minimum":1,"maximum":MAX_TIMEOUT_MS,"default":DEFAULT_TIMEOUT_MS,"description":"Optional timeout in milliseconds. Defaults to 120000 and is capped at 600000."},"workdir":{"type":"string","minLength":1,"description":"Optional configured-root-relative or absolute initial working directory inside the configured root."}},"required":["command"],"$schema":"http://json-schema.org/draft-07/schema#"});
     // Destructive/idempotent annotations are presentation hints only. The explicit description is
     // the durable warning that arbitrary commands inherit files, network, and environment access.
-    vec![ToolSpec::new(
-        "shell",
-        Some("Execute shell command"),
-        DESCRIPTION,
-        schema.as_object().expect("schema object").clone(),
-        NeutralAnnotations {
-            read_only_hint: Some(false),
-            destructive_hint: Some(true),
-            idempotent_hint: Some(false),
-            open_world_hint: Some(true),
-        },
-        "shell.result.v1",
-        "shell.execution.v1",
-    )]
+    vec![
+        ToolSpec::new(
+            "shell",
+            Some("Execute shell command"),
+            DESCRIPTION,
+            schema.as_object().expect("schema object").clone(),
+            NeutralAnnotations {
+                read_only_hint: Some(false),
+                destructive_hint: Some(true),
+                idempotent_hint: Some(false),
+                open_world_hint: Some(true),
+            },
+            "shell.result.v1",
+            ToolContract::new("shell.execution.v1", "v1", "v1"),
+        )
+        .with_output_schema(output_schema::<ShellOutput>()),
+    ]
 }
 
 #[cfg(feature = "mcp")]
 fn to_mcp_tool(spec: &ToolSpec) -> Tool {
-    let mut meta = JsonObject::new();
-    meta.insert(
-        PRESENTATION_KEY.into(),
-        Value::String(spec.presentation.to_owned()),
-    );
     let tool = Tool::new(
         spec.name,
         spec.description.clone(),
@@ -79,6 +72,9 @@ fn to_mcp_tool(spec: &ToolSpec) -> Tool {
         Some(title) => tool.with_title(title),
         None => tool,
     };
+    let tool = tool.with_raw_output_schema(Arc::new(
+        spec.output_schema.clone().expect("shell output schema"),
+    ));
     tool.with_annotations(ToolAnnotations::from_raw(
         None,
         spec.annotations.read_only_hint,
@@ -86,7 +82,14 @@ fn to_mcp_tool(spec: &ToolSpec) -> Tool {
         spec.annotations.idempotent_hint,
         spec.annotations.open_world_hint,
     ))
-    .with_meta(MetaObject(meta))
+    .with_meta(MetaObject(spec.extension_metadata()))
+}
+
+fn output_schema<T: JsonSchema>() -> Map<String, Value> {
+    Value::from(SchemaGenerator::new(SchemaSettings::draft07()).into_root_schema_for::<T>())
+        .as_object()
+        .expect("output schema is an object")
+        .clone()
 }
 
 #[cfg(all(test, feature = "mcp"))]
@@ -119,7 +122,7 @@ mod tests {
             "Optional timeout in milliseconds. Defaults to 120000 and is capped at 600000."
         );
         assert_eq!(
-            tools[0].meta.as_ref().unwrap().0[PRESENTATION_KEY],
+            tools[0].meta.as_ref().unwrap().0[workcell_tool_contract::PRESENTATION_METADATA_KEY],
             "shell.result.v1"
         );
         assert_eq!(specs[0].name, tools[0].name);

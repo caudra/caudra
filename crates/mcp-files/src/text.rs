@@ -1,11 +1,23 @@
 use std::path::Path;
 
+#[cfg(test)]
+use std::{
+    path::PathBuf,
+    sync::{Mutex, OnceLock},
+};
+
 use file_format::FileFormat;
 use sha2::{Digest, Sha256};
 use tokio::{fs, io::AsyncReadExt};
 use tokio_util::sync::CancellationToken;
 
 use crate::FilesystemError;
+
+#[cfg(test)]
+type SnapshotReadHook = Box<dyn FnOnce() + Send>;
+
+#[cfg(test)]
+static SNAPSHOT_READ_HOOK: OnceLock<Mutex<Option<(PathBuf, SnapshotReadHook)>>> = OnceLock::new();
 
 #[derive(Clone)]
 pub(crate) struct FileSnapshot {
@@ -25,6 +37,17 @@ struct FileIdentity {
 pub(crate) struct FileVersion {
     identity: FileIdentity,
     digest: [u8; 32],
+}
+
+impl FileVersion {
+    pub(crate) fn revision(&self) -> String {
+        let mut revision = String::from("sha256:");
+        for byte in self.digest {
+            use std::fmt::Write as _;
+            let _ = write!(revision, "{byte:02x}");
+        }
+        revision
+    }
 }
 
 pub(crate) fn check_cancelled(token: &CancellationToken) -> Result<(), FilesystemError> {
@@ -183,32 +206,41 @@ pub(crate) fn enforce_bytes(
     Ok(())
 }
 
-pub(crate) async fn read_text_if_exists(
-    path: &Path,
-    maximum: usize,
-    token: &CancellationToken,
-) -> Result<Option<String>, FilesystemError> {
-    match read_bounded(path, maximum, token).await {
-        Ok(bytes) => {
-            reject_binary(path, &bytes)?;
-            Ok(Some(decode_text(&bytes)))
-        }
-        Err(error) if error.is_not_found() => Ok(None),
-        Err(error) => Err(error),
-    }
-}
-
 pub(crate) async fn read_text_snapshot_required(
     path: &Path,
     maximum: usize,
     token: &CancellationToken,
 ) -> Result<FileSnapshot, FilesystemError> {
+    let (bytes, version) = read_file_snapshot_required(path, maximum, token).await?;
+    reject_binary(path, &bytes)?;
+    Ok(FileSnapshot {
+        content: decode_text(&bytes),
+        version,
+    })
+}
+
+pub(crate) async fn read_file_version_required(
+    path: &Path,
+    maximum: usize,
+    token: &CancellationToken,
+) -> Result<FileVersion, FilesystemError> {
+    read_file_snapshot_required(path, maximum, token)
+        .await
+        .map(|(_, version)| version)
+}
+
+async fn read_file_snapshot_required(
+    path: &Path,
+    maximum: usize,
+    token: &CancellationToken,
+) -> Result<(Vec<u8>, FileVersion), FilesystemError> {
     check_cancelled(token)?;
     let before = fs::metadata(path)
         .await
         .map_err(|error| FilesystemError::io_path("Cannot inspect", path, error))?;
     let bytes = read_bounded(path, maximum, token).await?;
-    reject_binary(path, &bytes)?;
+    #[cfg(test)]
+    run_snapshot_read_hook(path);
     let after = fs::metadata(path)
         .await
         .map_err(|error| FilesystemError::io_path("Cannot inspect", path, error))?;
@@ -218,13 +250,37 @@ pub(crate) async fn read_text_snapshot_required(
             path.to_string_lossy()
         )));
     }
-    Ok(FileSnapshot {
-        content: decode_text(&bytes),
-        version: FileVersion {
-            identity: file_identity(&after),
-            digest: Sha256::digest(&bytes).into(),
-        },
-    })
+    let version = FileVersion {
+        identity: file_identity(&after),
+        digest: Sha256::digest(&bytes).into(),
+    };
+    Ok((bytes, version))
+}
+
+#[cfg(test)]
+pub(crate) fn install_snapshot_read_hook(path: PathBuf, hook: impl FnOnce() + Send + 'static) {
+    *SNAPSHOT_READ_HOOK
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((path, Box::new(hook)));
+}
+
+#[cfg(test)]
+fn run_snapshot_read_hook(path: &Path) {
+    let hook = {
+        let mut hook = SNAPSHOT_READ_HOOK
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if hook.as_ref().is_some_and(|(target, _)| target == path) {
+            hook.take().map(|(_, hook)| hook)
+        } else {
+            None
+        }
+    };
+    if let Some(hook) = hook {
+        hook();
+    }
 }
 
 pub(crate) async fn validate_snapshot(
@@ -233,8 +289,17 @@ pub(crate) async fn validate_snapshot(
     maximum: usize,
     token: &CancellationToken,
 ) -> Result<(), FilesystemError> {
-    let current = read_text_snapshot_required(path, maximum, token).await?;
-    if current.version != *expected {
+    let current = match read_file_version_required(path, maximum, token).await {
+        Ok(current) => current,
+        Err(FilesystemError::Aborted) => return Err(FilesystemError::Aborted),
+        Err(_) => {
+            return Err(FilesystemError::message(format!(
+                "File changed before publication: {}",
+                path.to_string_lossy()
+            )));
+        }
+    };
+    if current != *expected {
         return Err(FilesystemError::message(format!(
             "File changed before publication: {}",
             path.to_string_lossy()

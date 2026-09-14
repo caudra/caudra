@@ -7,19 +7,14 @@
 //! The JSON schema is an admission contract, not a security boundary; dispatch validates again.
 
 use crate::subset::{available_modules, untyped_builtins, withheld_builtins};
-use crate::types::{DEFAULT_TIMEOUT_MS, MAX_CODE_BYTES, MAX_TIMEOUT_MS};
+use crate::types::{CodeOutput, DEFAULT_TIMEOUT_MS, MAX_CODE_BYTES, MAX_TIMEOUT_MS};
 #[cfg(feature = "mcp")]
-use rmcp::model::{JsonObject, MetaObject, Tool, ToolAnnotations};
-#[cfg(feature = "mcp")]
-use serde_json::Value;
-use serde_json::json;
+use rmcp::model::{MetaObject, Tool, ToolAnnotations};
+use schemars::{JsonSchema, SchemaGenerator, generate::SchemaSettings};
+use serde_json::{Map, Value, json};
 #[cfg(feature = "mcp")]
 use std::sync::Arc;
-use workcell_tool_contract::{ToolAnnotations as NeutralAnnotations, ToolSpec};
-
-/// Stable extension key consumed by Workcell renderers. Preserve this namespace across versions.
-#[cfg(feature = "mcp")]
-pub(crate) const PRESENTATION_KEY: &str = "ai.workcell/presentation-profile";
+use workcell_tool_contract::{ToolAnnotations as NeutralAnnotations, ToolContract, ToolSpec};
 
 /// Spliced from `subset` rather than written inline: the module and builtin lists have to be the
 /// same ones the diagnostics quote, or a failed call steers the caller back into the same failure.
@@ -82,29 +77,27 @@ pub fn specs() -> Vec<ToolSpec> {
     // The read-only and closed-world annotations are the inverse of the shell tool's and are
     // accurate: without mounts or host functions the interpreter reaches no file, socket, or
     // environment value. They are still presentation hints; the isolation is enforced by the worker.
-    vec![ToolSpec::new(
-        "python_execution",
-        Some("Execute Python code"),
-        DESCRIPTION,
-        schema.as_object().expect("schema object").clone(),
-        NeutralAnnotations {
-            read_only_hint: Some(true),
-            destructive_hint: Some(false),
-            idempotent_hint: Some(false),
-            open_world_hint: Some(false),
-        },
-        "python.result.v1",
-        "python.execution.v1",
-    )]
+    vec![
+        ToolSpec::new(
+            "python_execution",
+            Some("Execute Python code"),
+            DESCRIPTION,
+            schema.as_object().expect("schema object").clone(),
+            NeutralAnnotations {
+                read_only_hint: Some(true),
+                destructive_hint: Some(false),
+                idempotent_hint: Some(false),
+                open_world_hint: Some(false),
+            },
+            "python.result.v1",
+            ToolContract::new("python.execution.v1", "v1", "v1"),
+        )
+        .with_output_schema(output_schema::<CodeOutput>()),
+    ]
 }
 
 #[cfg(feature = "mcp")]
 fn to_mcp_tool(spec: &ToolSpec) -> Tool {
-    let mut meta = JsonObject::new();
-    meta.insert(
-        PRESENTATION_KEY.into(),
-        Value::String(spec.presentation.to_owned()),
-    );
     let tool = Tool::new(
         spec.name,
         spec.description.clone(),
@@ -114,6 +107,9 @@ fn to_mcp_tool(spec: &ToolSpec) -> Tool {
         Some(title) => tool.with_title(title),
         None => tool,
     };
+    let tool = tool.with_raw_output_schema(Arc::new(
+        spec.output_schema.clone().expect("code output schema"),
+    ));
     tool.with_annotations(ToolAnnotations::from_raw(
         None,
         spec.annotations.read_only_hint,
@@ -121,7 +117,14 @@ fn to_mcp_tool(spec: &ToolSpec) -> Tool {
         spec.annotations.idempotent_hint,
         spec.annotations.open_world_hint,
     ))
-    .with_meta(MetaObject(meta))
+    .with_meta(MetaObject(spec.extension_metadata()))
+}
+
+fn output_schema<T: JsonSchema>() -> Map<String, Value> {
+    Value::from(SchemaGenerator::new(SchemaSettings::draft07()).into_root_schema_for::<T>())
+        .as_object()
+        .expect("output schema is an object")
+        .clone()
 }
 
 #[cfg(all(test, feature = "mcp"))]
@@ -142,7 +145,7 @@ mod tests {
             "Optional timeout in milliseconds. Defaults to 5000 and is capped at 30000."
         );
         assert_eq!(
-            tools[0].meta.as_ref().unwrap().0[PRESENTATION_KEY],
+            tools[0].meta.as_ref().unwrap().0[workcell_tool_contract::PRESENTATION_METADATA_KEY],
             "python.result.v1"
         );
         assert_eq!(specs[0].name, tools[0].name);

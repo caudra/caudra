@@ -1,3 +1,5 @@
+use std::mem::size_of;
+
 use crate::{FilesystemError, FilesystemLimits};
 
 #[derive(Clone, Copy, Debug)]
@@ -61,6 +63,22 @@ impl GlobMatcher {
             fast_path,
             subsumes_basename,
         })
+    }
+
+    pub(crate) fn retained_bytes(&self) -> usize {
+        size_of::<Self>()
+            .saturating_add(
+                self.alternatives
+                    .capacity()
+                    .saturating_mul(size_of::<Vec<Token>>()),
+            )
+            .saturating_add(
+                self.alternatives
+                    .iter()
+                    .map(|tokens| tokens.capacity().saturating_mul(size_of::<Token>()))
+                    .fold(0, usize::saturating_add),
+            )
+            .saturating_add(self.fast_path.as_ref().map_or(0, FastPath::retained_bytes))
     }
 
     /// Matches a traversal candidate, retrying against `basename` only when the
@@ -146,6 +164,12 @@ pub(crate) struct MatchScratch {
 }
 
 impl FastPath {
+    fn retained_bytes(&self) -> usize {
+        size_of::<Self>().saturating_add(match self {
+            Self::Literal(value) | Self::RecursiveLiteralSuffix(value) => value.capacity(),
+        })
+    }
+
     fn new(pattern: &str) -> Option<Self> {
         if let Some(suffix) = pattern.strip_prefix("**/")
             && !suffix.is_empty()

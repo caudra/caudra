@@ -1,16 +1,17 @@
 use regex::Regex;
+use std::collections::HashMap;
+
 use tokio::fs;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    FilesystemError,
-    glob::{GlobMatcher, MatchOutcome, MatchScratch},
+    FilesystemError, PreparedFileGrep,
+    glob::{MatchOutcome, MatchScratch},
     operations::FilesystemCore,
     text::{
-        check_cancelled, decode_text, is_binary_content, js_length, read_bounded, split_text_lines,
-        truncate_line,
+        check_cancelled, js_length, read_text_snapshot_required, split_text_lines, truncate_line,
     },
-    types::{FileGrepInput, FileGrepOutput, FileGrepRow},
+    types::{FileGrepOutput, FileGrepRow},
 };
 
 use super::{
@@ -19,29 +20,25 @@ use super::{
 };
 
 impl FilesystemCore {
-    pub(crate) async fn file_grep(
+    pub(crate) async fn file_grep_prepared(
         &self,
-        input: FileGrepInput,
+        prepared: PreparedFileGrep,
         token: &CancellationToken,
     ) -> Result<FileGrepOutput, FilesystemError> {
+        let PreparedFileGrep {
+            resources: [resource],
+            relative_paths: [relative_root],
+            pattern,
+            include,
+            regex,
+            include_matcher,
+            ..
+        } = prepared;
+        let requested = resource.path;
         check_cancelled(token)?;
-        if input.pattern.is_empty() {
-            return Err(FilesystemError::message("pattern is required"));
-        }
-        let regex = compile_linear_regex(&input.pattern, self.limits.max_regex_length)?;
-        let include = input.include.as_deref().filter(|value| !value.is_empty());
-        let include_matcher = include
-            .map(|pattern| GlobMatcher::new(pattern, &self.limits))
-            .transpose()?;
-        let requested_name = input
-            .path
-            .as_deref()
-            .filter(|path| !path.is_empty())
-            .unwrap_or(".");
-        let requested = self.policy.resolve(requested_name).await?;
         let metadata = fs::metadata(&requested).await.map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
-                FilesystemError::message(format!("Path not found: {requested_name}"))
+                FilesystemError::message("Prepared grep path is no longer available")
             } else {
                 FilesystemError::io_path("Cannot inspect", &requested, error)
             }
@@ -65,6 +62,7 @@ impl FilesystemCore {
         let mut scratch = MatchScratch::default();
         let files_listed = listed.paths.len();
         let mut files_scanned = 0usize;
+        let mut revisions = HashMap::new();
         'files: for file in listed.paths {
             check_cancelled(token)?;
             let relative_path = relative_to(&cwd, &file);
@@ -87,15 +85,14 @@ impl FilesystemCore {
                 }
             }
             files_scanned += 1;
-            let bytes = match read_bounded(&file, self.limits.max_file_bytes, token).await {
-                Ok(bytes) => bytes,
-                Err(FilesystemError::Aborted) => return Err(FilesystemError::Aborted),
-                Err(_) => continue,
-            };
-            if is_binary_content(&bytes) {
-                continue;
-            }
-            for (index, source) in split_text_lines(&decode_text(&bytes)).iter().enumerate() {
+            let snapshot =
+                match read_text_snapshot_required(&file, self.limits.max_file_bytes, token).await {
+                    Ok(snapshot) => snapshot,
+                    Err(FilesystemError::Aborted) => return Err(FilesystemError::Aborted),
+                    Err(_) => continue,
+                };
+            let first_row = rows.len();
+            for (index, source) in split_text_lines(&snapshot.content).iter().enumerate() {
                 check_cancelled(token)?;
                 let line = truncate_line(source, self.limits.max_line_length);
                 if regex.find(&line).is_none() {
@@ -104,6 +101,9 @@ impl FilesystemCore {
                 if rows.len() == self.limits.max_search_results {
                     truncated = true;
                     break 'files;
+                }
+                if rows.len() == first_row {
+                    revisions.insert(path_string(&file), snapshot.version);
                 }
                 rows.push(FileGrepRow {
                     path: path_string(&file),
@@ -119,19 +119,23 @@ impl FilesystemCore {
         }
         Ok(FileGrepOutput {
             cwd: path_string(&cwd),
-            relative_path: self.policy.relative(&requested)?,
-            pattern: input.pattern,
-            include: input.include,
+            relative_path: relative_root,
+            pattern,
+            include,
             matches: rows.len(),
             files_scanned,
             files_listed,
             rows,
             truncated,
+            revisions,
         })
     }
 }
 
-fn compile_linear_regex(pattern: &str, maximum: usize) -> Result<Regex, FilesystemError> {
+pub(crate) fn compile_linear_regex(
+    pattern: &str,
+    maximum: usize,
+) -> Result<Regex, FilesystemError> {
     if js_length(pattern) > maximum {
         return Err(FilesystemError::message(format!(
             "grep regex exceeds maximum length of {maximum}"

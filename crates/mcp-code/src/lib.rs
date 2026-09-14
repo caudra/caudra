@@ -29,7 +29,7 @@ pub use worker::{CodeBuildError, WORKER_FILE_NAME, WorkerSource, bundled_worker_
 // These limits are public because hosts may need to describe the same contract outside MCP.
 pub use types::{
     CodeException, CodeExecution, CodeInput, CodeOutput, DEFAULT_TIMEOUT_MS, MAX_CODE_BYTES,
-    MAX_TIMEOUT_MS, Outcome,
+    MAX_TIMEOUT_MS, Outcome, PreparedCode,
 };
 pub use workcell_tool_contract::{ToolAnnotations, ToolSpec};
 // The subset the description advertises, exported so neither a host restating the contract nor the

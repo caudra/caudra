@@ -1,0 +1,26 @@
+[package]
+name = "workcell-workspace-snapshot"
+description = "Protocol-neutral bounded workspace snapshots and journaled restore for Workcell hosts"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+rustix.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+uuid.workspace = true
+workcell-host-contract.workspace = true
+workcell-mcp-files.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

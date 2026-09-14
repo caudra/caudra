@@ -1,12 +1,15 @@
 //! The code-graph tool group.
 
-use std::sync::{Arc, Mutex};
+use std::{
+    mem::size_of,
+    sync::{Arc, Mutex},
+};
 
 use tokio::sync::mpsc;
 
 use tokio_util::sync::CancellationToken;
 use workcell_code_graph::FactsCache;
-use workcell_mcp_files::{FileResourceAccess, FileToolGroup};
+use workcell_mcp_files::{FileResource, FileResourceAccess, FileToolGroup};
 
 use crate::{
     crawl::{crawl, crawl_filesystem_limits},
@@ -29,6 +32,170 @@ use crate::{
 /// given enough hops, and the answer is true, useless, and expensive.
 const MAX_IMPACT_DEPTH: usize = 8;
 const DEFAULT_IMPACT_DEPTH: usize = 3;
+
+#[derive(Debug)]
+struct PreparedScope {
+    resource: FileResource,
+    display_path: String,
+}
+
+impl PreparedScope {
+    fn retained_bytes(&self) -> usize {
+        size_of::<Self>()
+            .saturating_add(self.resource.retained_bytes())
+            .saturating_add(self.display_path.capacity())
+    }
+}
+
+#[derive(Debug)]
+pub struct PreparedCodeMap {
+    scope: PreparedScope,
+    limit: usize,
+}
+
+#[derive(Debug)]
+pub struct PreparedCodeContext {
+    scope: PreparedScope,
+    task: String,
+    limit: usize,
+}
+
+#[derive(Debug)]
+pub struct PreparedCodeRefs {
+    scope: PreparedScope,
+    symbol: String,
+    direction: crate::types::Direction,
+    limit: usize,
+}
+
+#[derive(Debug)]
+pub struct PreparedCodeImpact {
+    scope: PreparedScope,
+    symbol: String,
+    depth: usize,
+    limit: usize,
+}
+
+#[derive(Debug)]
+pub struct PreparedCodeExpand {
+    scope: PreparedScope,
+    symbol: String,
+}
+
+macro_rules! scope_accessors {
+    ($prepared:ty) => {
+        impl $prepared {
+            #[must_use]
+            pub fn scope(&self) -> &FileResource {
+                &self.scope.resource
+            }
+
+            #[must_use]
+            pub fn path(&self) -> &str {
+                &self.scope.display_path
+            }
+        }
+    };
+}
+
+scope_accessors!(PreparedCodeMap);
+scope_accessors!(PreparedCodeContext);
+scope_accessors!(PreparedCodeRefs);
+scope_accessors!(PreparedCodeImpact);
+scope_accessors!(PreparedCodeExpand);
+
+impl PreparedCodeMap {
+    #[must_use]
+    pub fn retained_bytes(&self) -> usize {
+        size_of::<Self>().saturating_add(self.scope.retained_bytes())
+    }
+
+    #[must_use]
+    pub const fn limit(&self) -> usize {
+        self.limit
+    }
+}
+
+impl PreparedCodeContext {
+    #[must_use]
+    pub fn retained_bytes(&self) -> usize {
+        size_of::<Self>()
+            .saturating_add(self.scope.retained_bytes())
+            .saturating_add(self.task.capacity())
+    }
+
+    #[must_use]
+    pub fn task(&self) -> &str {
+        &self.task
+    }
+
+    #[must_use]
+    pub const fn limit(&self) -> usize {
+        self.limit
+    }
+}
+
+impl PreparedCodeRefs {
+    #[must_use]
+    pub fn retained_bytes(&self) -> usize {
+        size_of::<Self>()
+            .saturating_add(self.scope.retained_bytes())
+            .saturating_add(self.symbol.capacity())
+    }
+
+    #[must_use]
+    pub fn symbol(&self) -> &str {
+        &self.symbol
+    }
+
+    #[must_use]
+    pub const fn direction(&self) -> crate::types::Direction {
+        self.direction
+    }
+
+    #[must_use]
+    pub const fn limit(&self) -> usize {
+        self.limit
+    }
+}
+
+impl PreparedCodeImpact {
+    #[must_use]
+    pub fn retained_bytes(&self) -> usize {
+        size_of::<Self>()
+            .saturating_add(self.scope.retained_bytes())
+            .saturating_add(self.symbol.capacity())
+    }
+
+    #[must_use]
+    pub fn symbol(&self) -> &str {
+        &self.symbol
+    }
+
+    #[must_use]
+    pub const fn depth(&self) -> usize {
+        self.depth
+    }
+
+    #[must_use]
+    pub const fn limit(&self) -> usize {
+        self.limit
+    }
+}
+
+impl PreparedCodeExpand {
+    #[must_use]
+    pub fn retained_bytes(&self) -> usize {
+        size_of::<Self>()
+            .saturating_add(self.scope.retained_bytes())
+            .saturating_add(self.symbol.capacity())
+    }
+
+    #[must_use]
+    pub fn symbol(&self) -> &str {
+        &self.symbol
+    }
+}
 
 /// Repository-scale symbol map, retrieval, and impact tools over one confined root.
 ///
@@ -104,15 +271,118 @@ impl CodeGraphToolGroup {
         self.files.root()
     }
 
+    pub async fn inspect_scope(
+        &self,
+        path: Option<&str>,
+    ) -> Result<workcell_mcp_files::FileResource, CodeGraphError> {
+        self.files
+            .inspect_path(scope(path).unwrap_or("."), FileResourceAccess::Traverse)
+            .await
+            .map_err(CodeGraphError::from)
+    }
+
+    pub fn prepare_code_map(
+        &self,
+        input: CodeMapInput,
+        scope: FileResource,
+    ) -> Result<PreparedCodeMap, CodeGraphError> {
+        Ok(PreparedCodeMap {
+            scope: prepare_scope(scope, input.path.as_deref())?,
+            limit: self.limits.resolve_limit(input.limit),
+        })
+    }
+
+    pub fn prepare_code_context(
+        &self,
+        input: CodeContextInput,
+        scope: FileResource,
+    ) -> Result<PreparedCodeContext, CodeGraphError> {
+        if input.task.trim().is_empty() {
+            return Err(CodeGraphError::invalid("task must not be empty"));
+        }
+        Ok(PreparedCodeContext {
+            scope: prepare_scope(scope, input.path.as_deref())?,
+            task: input.task,
+            limit: self.limits.resolve_limit(input.limit),
+        })
+    }
+
+    pub fn prepare_code_refs(
+        &self,
+        input: CodeRefsInput,
+        scope: FileResource,
+    ) -> Result<PreparedCodeRefs, CodeGraphError> {
+        if input.symbol.trim().is_empty() {
+            return Err(CodeGraphError::invalid("symbol must not be empty"));
+        }
+        Ok(PreparedCodeRefs {
+            scope: prepare_scope(scope, input.path.as_deref())?,
+            symbol: input.symbol,
+            direction: input.direction,
+            limit: self.limits.resolve_limit(input.limit),
+        })
+    }
+
+    pub fn prepare_code_impact(
+        &self,
+        input: CodeImpactInput,
+        scope: FileResource,
+    ) -> Result<PreparedCodeImpact, CodeGraphError> {
+        if input.symbol.trim().is_empty() {
+            return Err(CodeGraphError::invalid("symbol must not be empty"));
+        }
+        Ok(PreparedCodeImpact {
+            scope: prepare_scope(scope, input.path.as_deref())?,
+            symbol: input.symbol,
+            depth: input
+                .depth
+                .unwrap_or(DEFAULT_IMPACT_DEPTH)
+                .clamp(1, MAX_IMPACT_DEPTH),
+            limit: self.limits.resolve_limit(input.limit),
+        })
+    }
+
+    pub fn prepare_code_expand(
+        &self,
+        input: CodeExpandInput,
+        scope: FileResource,
+    ) -> Result<PreparedCodeExpand, CodeGraphError> {
+        if input.symbol.trim().is_empty() {
+            return Err(CodeGraphError::invalid("symbol must not be empty"));
+        }
+        Ok(PreparedCodeExpand {
+            scope: prepare_scope(scope, input.path.as_deref())?,
+            symbol: input.symbol,
+        })
+    }
+
     /// Crawls and builds a graph for one request.
     async fn graph_for(
         &self,
-        path: Option<&str>,
+        scope: &PreparedScope,
         progress: Option<&dyn GraphProgressSink>,
         token: &CancellationToken,
     ) -> Result<CodeGraph, CodeGraphError> {
+        let authoritative_path = scope.resource.path.to_string_lossy();
+        let current = self
+            .files
+            .inspect_path(&authoritative_path, FileResourceAccess::Traverse)
+            .await
+            .map_err(CodeGraphError::from)?;
+        if current.path != scope.resource.path {
+            return Err(CodeGraphError::invalid(
+                "code-graph scope changed after authorization",
+            ));
+        }
         report(progress, GraphPhase::Crawl, 0).await;
-        let crawled = crawl(&self.files, path, &self.limits, progress, token).await?;
+        let crawled = crawl(
+            &self.files,
+            Some(&authoritative_path),
+            &self.limits,
+            progress,
+            token,
+        )
+        .await?;
         let cache = Arc::clone(&self.cache);
         let limits = self.limits;
         // The build cannot await, so its phase changes arrive over a channel that this function
@@ -155,21 +425,30 @@ impl CodeGraphToolGroup {
         progress: Option<&dyn GraphProgressSink>,
         token: &CancellationToken,
     ) -> Result<CodeMapOutput, CodeGraphError> {
-        let limit = self.limits.resolve_limit(input.limit);
-        let graph = self
-            .graph_for(scope(input.path.as_deref()), progress, token)
-            .await?;
+        let scope = self.inspect_scope(input.path.as_deref()).await?;
+        let prepared = self.prepare_code_map(input, scope)?;
+        self.execute_prepared_code_map(prepared, progress, token)
+            .await
+    }
+
+    pub async fn execute_prepared_code_map(
+        &self,
+        prepared: PreparedCodeMap,
+        progress: Option<&dyn GraphProgressSink>,
+        token: &CancellationToken,
+    ) -> Result<CodeMapOutput, CodeGraphError> {
+        let graph = self.graph_for(&prepared.scope, progress, token).await?;
 
         let ordered = graph.ordered();
         let total = ordered.len();
         let symbols: Vec<RankedSymbol> = ordered
             .into_iter()
-            .take(limit)
+            .take(prepared.limit)
             .filter_map(|node| graph.ranked(node))
             .collect();
 
         let mut output = CodeMapOutput {
-            path: scope(input.path.as_deref()).unwrap_or(".").to_owned(),
+            path: prepared.scope.display_path,
             shown: symbols.len(),
             truncated: total > symbols.len(),
             symbols,
@@ -189,15 +468,21 @@ impl CodeGraphToolGroup {
         progress: Option<&dyn GraphProgressSink>,
         token: &CancellationToken,
     ) -> Result<CodeContextOutput, CodeGraphError> {
-        if input.task.trim().is_empty() {
-            return Err(CodeGraphError::invalid("task must not be empty"));
-        }
-        let limit = self.limits.resolve_limit(input.limit);
-        let graph = self
-            .graph_for(scope(input.path.as_deref()), progress, token)
-            .await?;
+        let scope = self.inspect_scope(input.path.as_deref()).await?;
+        let prepared = self.prepare_code_context(input, scope)?;
+        self.execute_prepared_code_context(prepared, progress, token)
+            .await
+    }
 
-        let retrieval = graph.retrieve(&input.task, limit);
+    pub async fn execute_prepared_code_context(
+        &self,
+        prepared: PreparedCodeContext,
+        progress: Option<&dyn GraphProgressSink>,
+        token: &CancellationToken,
+    ) -> Result<CodeContextOutput, CodeGraphError> {
+        let graph = self.graph_for(&prepared.scope, progress, token).await?;
+
+        let retrieval = graph.retrieve(&prepared.task, prepared.limit);
         let results: Vec<RankedSymbol> = retrieval
             .results
             .iter()
@@ -205,8 +490,8 @@ impl CodeGraphToolGroup {
             .collect();
 
         let mut output = CodeContextOutput {
-            task: input.task,
-            path: scope(input.path.as_deref()).unwrap_or(".").to_owned(),
+            task: prepared.task,
+            path: prepared.scope.display_path,
             shape: retrieval.shape.name().to_owned(),
             shape_reason: retrieval.shape.reason().to_owned(),
             confidence: retrieval.confidence.name().to_owned(),
@@ -230,24 +515,33 @@ impl CodeGraphToolGroup {
         progress: Option<&dyn GraphProgressSink>,
         token: &CancellationToken,
     ) -> Result<Result<CodeRefsOutput, SelectorRefusal>, CodeGraphError> {
-        let limit = self.limits.resolve_limit(input.limit);
-        let graph = self
-            .graph_for(scope(input.path.as_deref()), progress, token)
-            .await?;
+        let scope = self.inspect_scope(input.path.as_deref()).await?;
+        let prepared = self.prepare_code_refs(input, scope)?;
+        self.execute_prepared_code_refs(prepared, progress, token)
+            .await
+    }
 
-        let seeds = match graph.select(&input.symbol, &self.limits) {
+    pub async fn execute_prepared_code_refs(
+        &self,
+        prepared: PreparedCodeRefs,
+        progress: Option<&dyn GraphProgressSink>,
+        token: &CancellationToken,
+    ) -> Result<Result<CodeRefsOutput, SelectorRefusal>, CodeGraphError> {
+        let graph = self.graph_for(&prepared.scope, progress, token).await?;
+
+        let seeds = match graph.select(&prepared.symbol, &self.limits) {
             Ok(seeds) => seeds,
             Err(refusal) => return Ok(Err(refusal)),
         };
 
-        let mut references = graph.references(&seeds, input.direction);
+        let mut references = graph.references(&seeds, prepared.direction);
         let total = references.len();
-        references.truncate(limit);
+        references.truncate(prepared.limit);
 
         let mut output = CodeRefsOutput {
-            symbol: input.symbol,
-            direction: input.direction.name(),
-            unit: input.direction.unit(),
+            symbol: prepared.symbol,
+            direction: prepared.direction.name(),
+            unit: prepared.direction.unit(),
             matched: seeds.iter().filter_map(|&n| graph.symbol_ref(n)).collect(),
             shown: references.len(),
             truncated: total > references.len(),
@@ -268,25 +562,30 @@ impl CodeGraphToolGroup {
         progress: Option<&dyn GraphProgressSink>,
         token: &CancellationToken,
     ) -> Result<Result<CodeImpactOutput, SelectorRefusal>, CodeGraphError> {
-        let limit = self.limits.resolve_limit(input.limit);
-        let depth = input
-            .depth
-            .unwrap_or(DEFAULT_IMPACT_DEPTH)
-            .clamp(1, MAX_IMPACT_DEPTH);
-        let graph = self
-            .graph_for(scope(input.path.as_deref()), progress, token)
-            .await?;
+        let scope = self.inspect_scope(input.path.as_deref()).await?;
+        let prepared = self.prepare_code_impact(input, scope)?;
+        self.execute_prepared_code_impact(prepared, progress, token)
+            .await
+    }
 
-        let seeds = match graph.select(&input.symbol, &self.limits) {
+    pub async fn execute_prepared_code_impact(
+        &self,
+        prepared: PreparedCodeImpact,
+        progress: Option<&dyn GraphProgressSink>,
+        token: &CancellationToken,
+    ) -> Result<Result<CodeImpactOutput, SelectorRefusal>, CodeGraphError> {
+        let graph = self.graph_for(&prepared.scope, progress, token).await?;
+
+        let seeds = match graph.select(&prepared.symbol, &self.limits) {
             Ok(seeds) => seeds,
             Err(refusal) => return Ok(Err(refusal)),
         };
 
         // One past the limit, so the truncation flag reflects whether more exist rather than
         // whether the walk happened to stop exactly at the boundary.
-        let mut reached = graph.impact(&seeds, depth, limit.saturating_add(1));
+        let mut reached = graph.impact(&seeds, prepared.depth, prepared.limit.saturating_add(1));
         let total = reached.len();
-        reached.truncate(limit);
+        reached.truncate(prepared.limit);
         let tests_reaching = reached
             .iter()
             .filter(|row| row.test_scope)
@@ -294,8 +593,8 @@ impl CodeGraphToolGroup {
             .collect();
 
         let mut output = CodeImpactOutput {
-            symbol: input.symbol,
-            depth,
+            symbol: prepared.symbol,
+            depth: prepared.depth,
             matched: seeds.iter().filter_map(|&n| graph.symbol_ref(n)).collect(),
             shown: reached.len(),
             truncated: total > reached.len(),
@@ -317,10 +616,20 @@ impl CodeGraphToolGroup {
         progress: Option<&dyn GraphProgressSink>,
         token: &CancellationToken,
     ) -> Result<Result<CodeExpandOutput, SelectorRefusal>, CodeGraphError> {
-        let graph = self
-            .graph_for(scope(input.path.as_deref()), progress, token)
-            .await?;
-        let seeds = match graph.select(&input.symbol, &self.limits) {
+        let scope = self.inspect_scope(input.path.as_deref()).await?;
+        let prepared = self.prepare_code_expand(input, scope)?;
+        self.execute_prepared_code_expand(prepared, progress, token)
+            .await
+    }
+
+    pub async fn execute_prepared_code_expand(
+        &self,
+        prepared: PreparedCodeExpand,
+        progress: Option<&dyn GraphProgressSink>,
+        token: &CancellationToken,
+    ) -> Result<Result<CodeExpandOutput, SelectorRefusal>, CodeGraphError> {
+        let graph = self.graph_for(&prepared.scope, progress, token).await?;
+        let seeds = match graph.select(&prepared.symbol, &self.limits) {
             Ok(seeds) => seeds,
             Err(refusal) => return Ok(Err(refusal)),
         };
@@ -400,7 +709,7 @@ impl CodeGraphToolGroup {
             .collect();
 
         let mut output = CodeExpandOutput {
-            symbol: input.symbol,
+            symbol: prepared.symbol,
             path,
             kind: definition.kind.name().to_owned(),
             line_start: definition.lines.start,
@@ -417,6 +726,21 @@ impl CodeGraphToolGroup {
         output.estimated_tokens = estimate_tokens(output.model_text().len());
         Ok(Ok(output))
     }
+}
+
+fn prepare_scope(
+    resource: FileResource,
+    requested_path: Option<&str>,
+) -> Result<PreparedScope, CodeGraphError> {
+    if resource.access != FileResourceAccess::Traverse {
+        return Err(CodeGraphError::invalid(
+            "code-graph scope must authorize traversal",
+        ));
+    }
+    Ok(PreparedScope {
+        resource,
+        display_path: scope(requested_path).unwrap_or(".").to_owned(),
+    })
 }
 
 /// Folds an empty `path` onto absent.

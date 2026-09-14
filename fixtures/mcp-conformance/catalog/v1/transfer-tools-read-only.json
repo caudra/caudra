@@ -74,7 +74,12 @@
           "openWorldHint": false
         },
         "_meta": {
-          "ai.workcell/presentation-profile": "transfer.download.v1"
+          "ai.workcell/presentation-profile": "transfer.download.v1",
+          "ai.workcell/contract": {
+            "id": "transfer.download.v1",
+            "version": "v1",
+            "resultVersion": "v1"
+          }
         }
       }
     ]

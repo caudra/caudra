@@ -4,7 +4,53 @@
 //! resolution accepts paths outside its base cwd. Neither mode confines the command after launch:
 //! this is validation, not a command sandbox.
 
-use std::path::{Component, Path, PathBuf};
+use std::{
+    mem::size_of,
+    path::{Component, Path, PathBuf},
+};
+
+pub const STALE_WORKDIR_ERROR: &str =
+    "Prepared shell workdir is stale because its path or directory identity changed";
+
+#[derive(Debug)]
+pub(crate) struct WorkdirBinding {
+    canonical: PathBuf,
+    requested: PathBuf,
+    root: PathBuf,
+    relative: String,
+    identity: WorkdirIdentity,
+    confined: bool,
+}
+
+impl WorkdirBinding {
+    pub(crate) fn canonical(&self) -> &Path {
+        &self.canonical
+    }
+
+    pub(crate) fn relative(&self) -> &str {
+        &self.relative
+    }
+
+    pub(crate) fn retained_bytes(&self) -> usize {
+        size_of::<Self>()
+            .saturating_add(self.canonical.capacity())
+            .saturating_add(self.requested.capacity())
+            .saturating_add(self.root.capacity())
+            .saturating_add(self.relative.capacity())
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct WorkdirIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(windows)]
+    volume: Option<u32>,
+    #[cfg(windows)]
+    file_index: Option<u64>,
+}
 
 pub(crate) async fn canonicalize(path: &Path) -> std::io::Result<PathBuf> {
     // Canonicalization may block on filesystem traversal, so keep it off Tokio worker threads.
@@ -14,7 +60,7 @@ pub(crate) async fn canonicalize(path: &Path) -> std::io::Result<PathBuf> {
         .map_err(std::io::Error::other)?
 }
 
-pub(crate) async fn resolve(root: &Path, requested: &str) -> Result<(PathBuf, String), String> {
+pub(crate) async fn resolve(root: &Path, requested: &str) -> Result<WorkdirBinding, String> {
     let requested = if requested.is_empty() { "." } else { requested };
     let path = Path::new(requested);
     let lexical = normalize(if path.is_absolute() {
@@ -48,13 +94,21 @@ pub(crate) async fn resolve(root: &Path, requested: &str) -> Result<(PathBuf, St
     } else {
         relative.to_string_lossy().replace('\\', "/")
     };
-    Ok((canonical, relative))
+    let identity = identity(&canonical).await?;
+    Ok(WorkdirBinding {
+        canonical,
+        requested: lexical,
+        root: root.to_owned(),
+        relative,
+        identity,
+        confined: true,
+    })
 }
 
 pub(crate) async fn resolve_unconfined(
     base_cwd: &Path,
     requested: &str,
-) -> Result<(PathBuf, String), String> {
+) -> Result<WorkdirBinding, String> {
     let requested = if requested.is_empty() { "." } else { requested };
     let path = Path::new(requested);
     let lexical = normalize(if path.is_absolute() {
@@ -82,7 +136,61 @@ pub(crate) async fn resolve_unconfined(
             }
         },
     );
-    Ok((canonical, relative))
+    let identity = identity(&canonical).await?;
+    Ok(WorkdirBinding {
+        canonical,
+        requested: lexical,
+        root: base_cwd.to_owned(),
+        relative,
+        identity,
+        confined: false,
+    })
+}
+
+pub(crate) async fn revalidate(binding: &WorkdirBinding) -> Result<(), String> {
+    if binding.confined && !inside(&binding.requested, &binding.root) {
+        return Err(STALE_WORKDIR_ERROR.to_owned());
+    }
+    let canonical = canonicalize(&binding.requested)
+        .await
+        .map_err(|_| STALE_WORKDIR_ERROR.to_owned())?;
+    if canonical != binding.canonical
+        || (binding.confined && !inside(&canonical, &binding.root))
+        || identity(&canonical).await? != binding.identity
+    {
+        return Err(STALE_WORKDIR_ERROR.to_owned());
+    }
+    Ok(())
+}
+
+async fn identity(path: &Path) -> Result<WorkdirIdentity, String> {
+    let metadata = tokio::fs::metadata(path)
+        .await
+        .map_err(|_| STALE_WORKDIR_ERROR.to_owned())?;
+    if !metadata.is_dir() {
+        return Err(STALE_WORKDIR_ERROR.to_owned());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(WorkdirIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        Ok(WorkdirIdentity {
+            volume: metadata.volume_serial_number(),
+            file_index: metadata.file_index(),
+        })
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = metadata;
+        Ok(WorkdirIdentity {})
+    }
 }
 
 fn normalize(path: PathBuf) -> PathBuf {

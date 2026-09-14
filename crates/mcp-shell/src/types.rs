@@ -4,8 +4,11 @@
 //! numbers therefore change deliberately: consumers can branch on `version` rather than infer a
 //! schema from optional fields or presentation text.
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::{mem::size_of, path::Path};
+
+use crate::workdir::WorkdirBinding;
 
 pub const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 pub const MAX_TIMEOUT_MS: u64 = 600_000;
@@ -19,7 +22,7 @@ pub struct ShellInput {
     pub workdir: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, JsonSchema, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ShellOutput {
     /// Version of the structured result shape, independent of the MCP protocol version.
@@ -106,13 +109,48 @@ pub struct ShellCommandAnalysis {
     pub opaque: bool,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+pub struct ShellPolicyDecision {
+    denial: Option<String>,
+}
+
+impl ShellPolicyDecision {
+    pub(crate) const fn allow() -> Self {
+        Self { denial: None }
+    }
+
+    pub(crate) fn deny(reason: String) -> Self {
+        Self {
+            denial: Some(reason),
+        }
+    }
+
+    #[must_use]
+    pub const fn is_allowed(&self) -> bool {
+        self.denial.is_none()
+    }
+
+    #[must_use]
+    pub fn denial_reason(&self) -> Option<&str> {
+        self.denial.as_deref()
+    }
+
+    pub(crate) fn result(&self) -> Result<(), String> {
+        match &self.denial {
+            Some(reason) => Err(reason.clone()),
+            None => Ok(()),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct PreparedShell {
     command: String,
     timeout_ms: u64,
-    relative_workdir: String,
     analysis: ShellCommandAnalysis,
-    workdir: PathBuf,
+    policy_decision: ShellPolicyDecision,
+    workdir: WorkdirBinding,
+    output_filter: bool,
 }
 
 impl PreparedShell {
@@ -128,7 +166,7 @@ impl PreparedShell {
 
     #[must_use]
     pub fn relative_workdir(&self) -> &str {
-        &self.relative_workdir
+        self.workdir.relative()
     }
 
     #[must_use]
@@ -137,23 +175,50 @@ impl PreparedShell {
     }
 
     #[must_use]
+    pub const fn policy_decision(&self) -> &ShellPolicyDecision {
+        &self.policy_decision
+    }
+
+    #[must_use]
+    pub const fn output_filter_enabled(&self) -> bool {
+        self.output_filter
+    }
+
+    #[must_use]
     pub fn workdir(&self) -> &Path {
-        &self.workdir
+        self.workdir.canonical()
+    }
+
+    /// Conservative retained bytes, excluding immutable group policy shared by the caller.
+    #[must_use]
+    pub fn retained_bytes(&self) -> usize {
+        size_of::<Self>()
+            .saturating_add(self.command.capacity())
+            .saturating_add(self.analysis.retained_bytes())
+            .saturating_add(
+                self.policy_decision
+                    .denial
+                    .as_ref()
+                    .map_or(0, String::capacity),
+            )
+            .saturating_add(self.workdir.retained_bytes())
     }
 
     pub(crate) fn new(
         command: String,
         timeout_ms: u64,
-        workdir: PathBuf,
-        relative_workdir: String,
         analysis: ShellCommandAnalysis,
+        policy_decision: ShellPolicyDecision,
+        workdir: WorkdirBinding,
+        output_filter: bool,
     ) -> Self {
         Self {
             command,
             timeout_ms,
-            relative_workdir,
             analysis,
+            policy_decision,
             workdir,
+            output_filter,
         }
     }
 
@@ -165,14 +230,55 @@ impl PreparedShell {
     /// already resolves.
     pub(crate) fn into_execution_parts(
         self,
-    ) -> (String, u64, PathBuf, String, ShellCommandAnalysis) {
+    ) -> (String, u64, WorkdirBinding, ShellCommandAnalysis, bool) {
         (
             self.command,
             self.timeout_ms,
             self.workdir,
-            self.relative_workdir,
             self.analysis,
+            self.output_filter,
         )
+    }
+}
+
+impl ShellCommandAnalysis {
+    fn retained_bytes(&self) -> usize {
+        size_of::<Self>()
+            .saturating_add(
+                self.scopes
+                    .capacity()
+                    .saturating_mul(size_of::<ShellCommandScope>()),
+            )
+            .saturating_add(
+                self.scopes
+                    .iter()
+                    .map(ShellCommandScope::retained_bytes)
+                    .fold(0, usize::saturating_add),
+            )
+    }
+}
+
+impl ShellCommandScope {
+    fn retained_bytes(&self) -> usize {
+        size_of::<Self>()
+            .saturating_add(self.source.capacity())
+            .saturating_add(self.normalized.capacity())
+            .saturating_add(self.permission.capacity())
+            .saturating_add(self.executable.capacity())
+            .saturating_add(self.arguments.as_ref().map_or(0, |arguments| {
+                arguments
+                    .capacity()
+                    .saturating_mul(size_of::<ShellWord>())
+                    .saturating_add(
+                        arguments
+                            .iter()
+                            .map(|argument| match argument {
+                                ShellWord::Literal(value) => value.capacity(),
+                                ShellWord::Undecodable => 0,
+                            })
+                            .fold(0, usize::saturating_add),
+                    )
+            }))
     }
 }
 

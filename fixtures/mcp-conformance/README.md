@@ -111,8 +111,8 @@ fragments, and the absence of unsafe content.
 
 ## Reviewed Boundaries
 
-- The web runtime does not currently define MCP titles or annotations. `catalog/v1/web-tools.json`
-  omits them rather than inventing values.
+- Every canonical catalog fixture includes the structured output schema and uniform Workcell contract
+  metadata emitted by its neutral `ToolSpec` projection.
 - PDF dispatch uses a fixed injected extractor result; native extraction is intentionally not
   byte-snapshotted.
 - Redirect ports, request IDs, clocks, cache-counter snapshots, mutation failures, truncation limits,

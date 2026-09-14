@@ -5,6 +5,25 @@ use crate::{FilesystemError, path_policy::RootPathPolicy, types::FileDiff};
 const TRUNCATION_MARKER: &str = "... (diff truncated)";
 const CONTEXT_LINES: usize = 3;
 
+pub(crate) fn line_index_retained_bytes(contents: &[&str]) -> usize {
+    contents
+        .iter()
+        .map(|content| {
+            if content.is_empty() {
+                return 0;
+            }
+            content
+                .bytes()
+                .filter(|byte| *byte == b'\n')
+                .count()
+                .saturating_add(1)
+                .checked_next_power_of_two()
+                .unwrap_or(usize::MAX)
+                .saturating_mul(std::mem::size_of::<&str>())
+        })
+        .fold(0, usize::saturating_add)
+}
+
 /// One changed region as line spans into the old and new content. Supplied by a
 /// caller that already knows where it changed the file, so the preview costs the
 /// change rather than the distance between the first and last change.

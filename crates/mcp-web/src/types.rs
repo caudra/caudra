@@ -1,8 +1,9 @@
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::WebsearchBackend;
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum WebfetchFormat {
     #[default]
@@ -11,7 +12,7 @@ pub enum WebfetchFormat {
     Html,
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum WebfetchPdfMode {
     #[default]
@@ -53,7 +54,7 @@ pub struct WebfetchInput {
     pub timeout: Option<u64>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, JsonSchema, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WebsearchResult {
     pub title: String,
@@ -67,7 +68,7 @@ pub struct WebsearchResult {
     pub icon_data_url: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, JsonSchema, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WebsearchOutput {
     pub kind: &'static str,
@@ -84,7 +85,7 @@ pub struct WebsearchOutput {
     pub error_message: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, JsonSchema, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WebfetchPdfAttachment {
     #[serde(rename = "type")]
@@ -96,7 +97,7 @@ pub struct WebfetchPdfAttachment {
     pub size_bytes: usize,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, JsonSchema, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WebfetchOutput {
     pub kind: &'static str,

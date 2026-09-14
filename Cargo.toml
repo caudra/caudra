@@ -24,6 +24,9 @@ members = [
   "crates/source-icons",
   "crates/source-languages",
   "crates/tool-contract",
+  "crates/workcell-host-contract",
+  "crates/workspace-scm",
+  "crates/workspace-snapshot",
   "crates/workcell",
 ]
 # Eval generators are third-party progress libraries built only to capture what
@@ -64,6 +67,7 @@ lru = "0.18.1"
 # workspace, linking the interpreter into the server binary for every `--workspace` build.
 monty-pool = "=0.0.21"
 monty-types = "=0.0.21"
+notify = { version = "8.2.0", default-features = false, features = ["macos_kqueue"] }
 gix = { version = "0.87.1", default-features = false, features = ["sha1", "max-performance-safe"] }
 proptest = "1.11.0"
 regex = "1.13.1"
@@ -120,6 +124,9 @@ url = { version = "2.5.8", features = ["serde"] }
 uuid = { version = "1.24.0", features = ["v4"] }
 wiremock = "0.6.5"
 workcell-tool-contract = { path = "crates/tool-contract" }
+workcell-host-contract = { path = "crates/workcell-host-contract" }
+workcell-workspace-scm = { path = "crates/workspace-scm" }
+workcell-workspace-snapshot = { path = "crates/workspace-snapshot" }
 workcell-environment = { path = "crates/environment", default-features = false }
 workcell-mcp-code = { path = "crates/mcp-code", default-features = false }
 workcell-mcp-files = { path = "crates/mcp-files", default-features = false }
@@ -139,6 +146,7 @@ todo = "deny"
 unimplemented = "deny"
 
 [dependencies]
+async-trait.workspace = true
 axum.workspace = true
 clap.workspace = true
 dotenvy.workspace = true
@@ -156,6 +164,9 @@ tracing-subscriber.workspace = true
 url.workspace = true
 uuid.workspace = true
 workcell-tool-contract.workspace = true
+workcell-host-contract.workspace = true
+workcell-workspace-scm.workspace = true
+workcell-workspace-snapshot.workspace = true
 workcell-environment = { workspace = true, features = ["mcp"] }
 workcell-mcp-code = { workspace = true, features = ["bundled-worker", "mcp"] }
 workcell-mcp-code-graph = { workspace = true, features = ["git", "mcp"] }

@@ -1,5 +1,9 @@
-use std::sync::{Arc, RwLock};
+use std::{
+    mem::size_of,
+    sync::{Arc, RwLock},
+};
 
+use http::{HeaderMap, Method};
 #[cfg(feature = "mcp")]
 use rmcp::model::{CallToolResult, ContentBlock, Tool};
 #[cfg(feature = "mcp")]
@@ -7,6 +11,8 @@ use serde::{Serialize, de::DeserializeOwned};
 #[cfg(feature = "mcp")]
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
+use url::Url;
+use workcell_net::UrlPolicy;
 
 #[cfg(feature = "mcp")]
 use crate::catalog;
@@ -25,6 +31,8 @@ pub struct PreparedWebsearch {
     pub backend: Option<WebsearchBackend>,
     input: WebsearchInput,
     configuration: WebsearchExecutionConfiguration,
+    configuration_source: WebsearchConfigurationSource,
+    configuration_revision: u64,
 }
 
 pub struct PreparedWebfetch {
@@ -34,6 +42,189 @@ pub struct PreparedWebfetch {
     pub timeout_seconds: u64,
     input: fetch::NormalizedWebfetchInput,
 }
+
+impl PreparedWebsearch {
+    #[must_use]
+    pub fn retained_bytes(&self) -> usize {
+        size_of::<Self>()
+            .saturating_add(self.permission_query.capacity())
+            .saturating_add(self.input.query.capacity())
+            .saturating_add(self.input.country.as_ref().map_or(0, String::capacity))
+            .saturating_add(self.input.categories.as_ref().map_or(0, String::capacity))
+            .saturating_add(self.input.language.as_ref().map_or(0, String::capacity))
+    }
+}
+
+impl PreparedWebfetch {
+    #[must_use]
+    pub fn retained_bytes(&self) -> usize {
+        const HEADER_ENTRY_OVERHEAD: usize = 128;
+
+        size_of::<Self>()
+            .saturating_add(self.permission_url.capacity())
+            .saturating_add(self.input.url.as_str().len().saturating_mul(2))
+            .saturating_add(
+                self.input
+                    .headers
+                    .iter()
+                    .map(|(name, value)| {
+                        name.as_str()
+                            .len()
+                            .saturating_add(value.as_bytes().len())
+                            .saturating_add(HEADER_ENTRY_OVERHEAD)
+                    })
+                    .fold(0, usize::saturating_add),
+            )
+    }
+}
+
+pub struct PreparedWebsearchOperation {
+    prepared: PreparedWebsearch,
+    configuration: Arc<RwLock<WebsearchConfigurationState>>,
+}
+
+impl PreparedWebsearchOperation {
+    /// Conservative retained bytes; shared process configuration is excluded.
+    #[must_use]
+    pub fn retained_bytes(&self) -> usize {
+        size_of::<Self>().saturating_add(self.prepared.retained_bytes())
+    }
+
+    #[must_use]
+    pub fn query(&self) -> &str {
+        &self.prepared.input.query
+    }
+
+    #[must_use]
+    pub fn permission_query(&self) -> &str {
+        &self.prepared.permission_query
+    }
+
+    #[must_use]
+    pub const fn input(&self) -> &WebsearchInput {
+        &self.prepared.input
+    }
+
+    #[must_use]
+    pub const fn backend(&self) -> Option<WebsearchBackend> {
+        self.prepared.backend
+    }
+
+    #[must_use]
+    pub const fn configuration_source(&self) -> WebsearchConfigurationSource {
+        self.prepared.configuration_source
+    }
+
+    #[must_use]
+    pub const fn configuration_revision(&self) -> u64 {
+        self.prepared.configuration_revision
+    }
+}
+
+pub struct PreparedWebfetchOperation {
+    prepared: PreparedWebfetch,
+    configuration: Arc<RwLock<WebsearchConfigurationState>>,
+}
+
+impl PreparedWebfetchOperation {
+    /// Conservative retained bytes; shared process configuration is excluded.
+    #[must_use]
+    pub fn retained_bytes(&self) -> usize {
+        size_of::<Self>().saturating_add(self.prepared.retained_bytes())
+    }
+
+    #[must_use]
+    pub fn url(&self) -> &Url {
+        &self.prepared.input.url
+    }
+
+    #[must_use]
+    pub const fn format(&self) -> WebfetchFormat {
+        self.prepared.input.format
+    }
+
+    #[must_use]
+    pub const fn pdf_mode(&self) -> WebfetchPdfMode {
+        self.prepared.input.pdf_mode
+    }
+
+    #[must_use]
+    pub const fn timeout_seconds(&self) -> u64 {
+        self.prepared.input.timeout_seconds
+    }
+
+    #[must_use]
+    pub const fn url_policy(&self) -> UrlPolicy {
+        self.prepared.input.policy
+    }
+
+    #[must_use]
+    pub const fn request_kind(&self) -> crate::WebHttpRequestKind {
+        self.prepared.input.request_kind
+    }
+
+    #[must_use]
+    pub fn method(&self) -> &Method {
+        &self.prepared.input.method
+    }
+
+    #[must_use]
+    pub fn headers(&self) -> &HeaderMap {
+        &self.prepared.input.headers
+    }
+
+    #[must_use]
+    pub const fn max_redirects(&self) -> usize {
+        self.prepared.input.max_redirects
+    }
+
+    #[must_use]
+    pub const fn max_body_bytes(&self) -> usize {
+        self.prepared.input.max_body_bytes
+    }
+}
+
+/// An exact prepared operation that cannot be duplicated before consuming execution.
+///
+/// ```compile_fail
+/// use workcell_mcp_web::PreparedWebOperation;
+///
+/// fn requires_clone<T: Clone>() {}
+/// requires_clone::<PreparedWebOperation>();
+/// ```
+pub enum PreparedWebOperation {
+    Websearch(PreparedWebsearchOperation),
+    Webfetch(PreparedWebfetchOperation),
+}
+
+impl PreparedWebOperation {
+    #[must_use]
+    pub fn retained_bytes(&self) -> usize {
+        match self {
+            Self::Websearch(prepared) => prepared.retained_bytes(),
+            Self::Webfetch(prepared) => prepared.retained_bytes(),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum WebOperationExecution {
+    Websearch(WebExecution<WebsearchOutput>),
+    Webfetch(WebExecution<WebfetchOutput>),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum WebOperationError {
+    #[error("Prepared web operation belongs to a different web tool group")]
+    GroupMismatch,
+    #[error("{0}")]
+    Websearch(String),
+    #[error(transparent)]
+    Webfetch(#[from] WebfetchError),
+}
+
+pub const STALE_WEBSEARCH_CONFIGURATION_ERROR: &str =
+    "Prepared websearch is stale because the search configuration revision changed";
 
 /// Cloneable composition unit for the MCP server. Clones share immutable
 /// configuration and dependency handles but no mutable invocation state.
@@ -169,14 +360,28 @@ impl WebToolGroup {
 
     /// Validate and normalize a search request without performing network I/O.
     pub fn prepare_websearch(&self, input: WebsearchInput) -> Result<PreparedWebsearch, String> {
-        let configuration = self.snapshot().configuration;
-        let mut input = validate_websearch(input, &configuration)?;
+        let snapshot = self.snapshot();
+        let mut input = validate_websearch(input, &snapshot.configuration)?;
         input.query = input.query.trim().to_owned();
         Ok(PreparedWebsearch {
             permission_query: input.query.clone(),
-            backend: configuration.backend(),
+            backend: snapshot.configuration.backend(),
             input,
-            configuration,
+            configuration: snapshot.configuration,
+            configuration_source: snapshot.source,
+            configuration_revision: snapshot.revision,
+        })
+    }
+
+    pub fn prepare_websearch_operation(
+        &self,
+        input: WebsearchInput,
+    ) -> Result<PreparedWebOperation, String> {
+        self.prepare_websearch(input).map(|prepared| {
+            PreparedWebOperation::Websearch(PreparedWebsearchOperation {
+                prepared,
+                configuration: self.configuration.clone(),
+            })
         })
     }
 
@@ -185,6 +390,9 @@ impl WebToolGroup {
         prepared: PreparedWebsearch,
         cancellation: CancellationToken,
     ) -> Result<WebExecution<WebsearchOutput>, String> {
+        if self.snapshot().revision != prepared.configuration_revision {
+            return Err(STALE_WEBSEARCH_CONFIGURATION_ERROR.to_owned());
+        }
         let output = search::execute(
             prepared.input,
             &prepared.configuration,
@@ -223,6 +431,18 @@ impl WebToolGroup {
         })
     }
 
+    pub fn prepare_webfetch_operation(
+        &self,
+        input: WebfetchInput,
+    ) -> Result<PreparedWebOperation, WebfetchError> {
+        self.prepare_webfetch(input).map(|prepared| {
+            PreparedWebOperation::Webfetch(PreparedWebfetchOperation {
+                prepared,
+                configuration: self.configuration.clone(),
+            })
+        })
+    }
+
     pub async fn execute_webfetch(
         &self,
         prepared: PreparedWebfetch,
@@ -242,6 +462,44 @@ impl WebToolGroup {
     ) -> Result<WebExecution<WebfetchOutput>, WebfetchError> {
         self.execute_webfetch(self.prepare_webfetch(input)?, cancellation)
             .await
+    }
+
+    /// Execute one exact typed operation. The prepared value is deliberately consumed.
+    ///
+    /// ```compile_fail
+    /// use tokio_util::sync::CancellationToken;
+    /// use workcell_mcp_web::{PreparedWebOperation, WebToolGroup};
+    ///
+    /// async fn execute_twice(group: &WebToolGroup, prepared: PreparedWebOperation) {
+    ///     let _ = group.execute_prepared(prepared, CancellationToken::new()).await;
+    ///     let _ = group.execute_prepared(prepared, CancellationToken::new()).await;
+    /// }
+    /// ```
+    pub async fn execute_prepared(
+        &self,
+        prepared: PreparedWebOperation,
+        cancellation: CancellationToken,
+    ) -> Result<WebOperationExecution, WebOperationError> {
+        match prepared {
+            PreparedWebOperation::Websearch(operation) => {
+                if !Arc::ptr_eq(&operation.configuration, &self.configuration) {
+                    return Err(WebOperationError::GroupMismatch);
+                }
+                self.execute_websearch(operation.prepared, cancellation)
+                    .await
+                    .map(WebOperationExecution::Websearch)
+                    .map_err(WebOperationError::Websearch)
+            }
+            PreparedWebOperation::Webfetch(operation) => {
+                if !Arc::ptr_eq(&operation.configuration, &self.configuration) {
+                    return Err(WebOperationError::GroupMismatch);
+                }
+                self.execute_webfetch(operation.prepared, cancellation)
+                    .await
+                    .map(WebOperationExecution::Webfetch)
+                    .map_err(WebOperationError::Webfetch)
+            }
+        }
     }
 
     /// Returns `None` only for names outside this group. Invalid arguments and

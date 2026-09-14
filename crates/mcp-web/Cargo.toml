@@ -28,6 +28,7 @@ pdf_oxide = { version = "0.3.74", default-features = false }
 regex = "1.13.1"
 reqwest.workspace = true
 rmcp = { workspace = true, optional = true }
+schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

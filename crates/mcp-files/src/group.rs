@@ -11,12 +11,15 @@ use tokio_util::sync::CancellationToken;
 #[cfg(feature = "mcp")]
 use crate::catalog::catalog;
 use crate::model_text::ModelText;
-use crate::mutation_operations::{PlannedChange, PlannedChangeType};
+use crate::mutation_operations::PlannedChangeType;
 use crate::{
-    FilesystemError, FilesystemLimits,
+    FilesystemError, FilesystemLimits, PreparedFileEdit, PreparedFileGlob, PreparedFileGrep,
+    PreparedFilePatch, PreparedFileRead, PreparedFileWrite,
+    glob::GlobMatcher,
     operations::FilesystemCore,
     patch::{PatchHunk, parse_patch},
-    text::enforce_bytes,
+    read_operations::grep::compile_linear_regex,
+    text::{check_cancelled, enforce_bytes},
     types::{
         FileApplyPatchInput, FileApplyPatchOutput, FileEditInput, FileEditOutput, FileGlobInput,
         FileGlobOutput, FileGrepInput, FileGrepOutput, FileReadInput, FileReadOutput, FileResource,
@@ -24,7 +27,9 @@ use crate::{
     },
 };
 #[cfg(feature = "index")]
-use crate::{INDEX_MAX_PATH_BYTES, IndexExecutionConfiguration, IndexInput, IndexOutput};
+use crate::{
+    INDEX_MAX_PATH_BYTES, IndexExecutionConfiguration, IndexInput, IndexOutput, PreparedFileIndex,
+};
 
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 // This is a protocol compatibility bound, not a deployment tuning default.
@@ -58,26 +63,8 @@ struct SerializedTextContent<'a> {
 /// Cloneable filesystem executor. Clones share the same mutation lock and path policy.
 #[derive(Clone, Debug)]
 pub struct FileToolGroup {
-    core: Arc<FilesystemCore>,
-}
-
-pub struct PreparedFilePatch {
-    core: Arc<FilesystemCore>,
-    changes: Vec<PlannedChange>,
-    preview: FileApplyPatchOutput,
-    resources: Vec<FileResource>,
-}
-
-impl PreparedFilePatch {
-    #[must_use]
-    pub fn preview(&self) -> &FileApplyPatchOutput {
-        &self.preview
-    }
-
-    #[must_use]
-    pub fn resources(&self) -> &[FileResource] {
-        &self.resources
-    }
+    pub(crate) core: Arc<FilesystemCore>,
+    pub(crate) workspace: Arc<crate::workspace::WorkspaceState>,
 }
 
 impl FileToolGroup {
@@ -88,6 +75,7 @@ impl FileToolGroup {
     ) -> Result<Self, FilesystemError> {
         Ok(Self {
             core: Arc::new(FilesystemCore::create(root.as_ref(), allow_write, limits).await?),
+            workspace: Arc::new(crate::workspace::WorkspaceState::default()),
         })
     }
 
@@ -111,6 +99,7 @@ impl FileToolGroup {
             core: Arc::new(
                 FilesystemCore::create_unconfined(base_cwd.as_ref(), allow_write, limits).await?,
             ),
+            workspace: Arc::new(crate::workspace::WorkspaceState::default()),
         })
     }
 
@@ -126,6 +115,17 @@ impl FileToolGroup {
         &self.core.limits
     }
 
+    pub async fn resolve_directory(
+        &self,
+        requested: &str,
+    ) -> Result<crate::ResolvedDirectory, FilesystemError> {
+        let (path, relative_path) = self.core.resolve_directory(requested).await?;
+        Ok(crate::ResolvedDirectory {
+            path,
+            relative_path,
+        })
+    }
+
     #[cfg(feature = "mcp")]
     pub fn catalog(&self) -> Vec<Tool> {
         catalog(self.core.allow_write)
@@ -136,7 +136,77 @@ impl FileToolGroup {
         input: FileReadInput,
         token: &CancellationToken,
     ) -> Result<FileReadOutput, FilesystemError> {
-        self.core.file_read(validate_read(input)?, token).await
+        self.execute_prepared_read(self.prepare_read(input, token).await?, token)
+            .await
+    }
+
+    pub async fn prepare_read(
+        &self,
+        input: FileReadInput,
+        token: &CancellationToken,
+    ) -> Result<PreparedFileRead, FilesystemError> {
+        check_cancelled(token)?;
+        let input = validate_read(input)?;
+        let offset = input.offset.unwrap_or(1);
+        let limit = input.limit.unwrap_or(self.core.limits.max_read_lines);
+        if limit > self.core.limits.max_read_lines {
+            return Err(FilesystemError::message(format!(
+                "limit must be an integer between 0 and {}",
+                self.core.limits.max_read_lines
+            )));
+        }
+        let path = self.core.policy.resolve(&input.file_path).await?;
+        let metadata = inspect_existing(&path, &input.file_path).await?;
+        let access = if metadata.is_dir() {
+            FileResourceAccess::Traverse
+        } else if metadata.is_file() {
+            FileResourceAccess::Read
+        } else {
+            return Err(FilesystemError::message(format!(
+                "Path is not a regular file: {}",
+                input.file_path
+            )));
+        };
+        let relative_path = self.core.policy.relative(&path)?;
+        Ok(PreparedFileRead {
+            core: self.core.clone(),
+            resources: [FileResource {
+                requested_path: input.file_path,
+                path,
+                root_relative_path: relative_path.clone(),
+                access,
+            }],
+            relative_paths: [relative_path],
+            offset,
+            limit,
+        })
+    }
+
+    pub async fn execute_prepared_read(
+        &self,
+        prepared: PreparedFileRead,
+        token: &CancellationToken,
+    ) -> Result<FileReadOutput, FilesystemError> {
+        ensure_prepared_core(&self.core, &prepared.core)?;
+        check_cancelled(token)?;
+        let PreparedFileRead {
+            resources: [resource],
+            relative_paths: [relative_path],
+            offset,
+            limit,
+            ..
+        } = prepared;
+        self.core.revalidate_resource(&resource).await?;
+        self.core
+            .file_read_prepared(
+                resource.path,
+                resource.requested_path,
+                relative_path,
+                offset,
+                limit,
+                token,
+            )
+            .await
     }
 
     pub async fn file_glob(
@@ -144,7 +214,59 @@ impl FileToolGroup {
         input: FileGlobInput,
         token: &CancellationToken,
     ) -> Result<FileGlobOutput, FilesystemError> {
-        self.core.file_glob(validate_glob(input)?, token).await
+        self.execute_prepared_glob(self.prepare_glob(input, token).await?, token)
+            .await
+    }
+
+    pub async fn prepare_glob(
+        &self,
+        input: FileGlobInput,
+        token: &CancellationToken,
+    ) -> Result<PreparedFileGlob, FilesystemError> {
+        check_cancelled(token)?;
+        let input = validate_glob(input)?;
+        let matcher = GlobMatcher::new(&input.pattern, &self.core.limits)?;
+        let requested_path = input.path.as_deref().unwrap_or(".");
+        let path = self.core.policy.resolve(requested_path).await?;
+        let metadata = inspect_existing(&path, requested_path).await?;
+        if !metadata.is_dir() {
+            return Err(FilesystemError::message(format!(
+                "glob path must be a directory: {requested_path}"
+            )));
+        }
+        let relative_path = self.core.policy.relative(&path)?;
+        Ok(PreparedFileGlob {
+            core: self.core.clone(),
+            resources: [FileResource {
+                requested_path: requested_path.to_owned(),
+                path,
+                root_relative_path: relative_path.clone(),
+                access: FileResourceAccess::Traverse,
+            }],
+            relative_paths: [relative_path],
+            pattern: input.pattern,
+            matcher,
+        })
+    }
+
+    pub async fn execute_prepared_glob(
+        &self,
+        prepared: PreparedFileGlob,
+        token: &CancellationToken,
+    ) -> Result<FileGlobOutput, FilesystemError> {
+        ensure_prepared_core(&self.core, &prepared.core)?;
+        check_cancelled(token)?;
+        let PreparedFileGlob {
+            resources: [resource],
+            relative_paths: [relative_path],
+            pattern,
+            matcher,
+            ..
+        } = prepared;
+        self.core.revalidate_resource(&resource).await?;
+        self.core
+            .file_glob_prepared(resource.path, relative_path, pattern, matcher, token)
+            .await
     }
 
     pub async fn file_grep(
@@ -152,7 +274,61 @@ impl FileToolGroup {
         input: FileGrepInput,
         token: &CancellationToken,
     ) -> Result<FileGrepOutput, FilesystemError> {
-        self.core.file_grep(validate_grep(input)?, token).await
+        self.execute_prepared_grep(self.prepare_grep(input, token).await?, token)
+            .await
+    }
+
+    pub async fn prepare_grep(
+        &self,
+        input: FileGrepInput,
+        token: &CancellationToken,
+    ) -> Result<PreparedFileGrep, FilesystemError> {
+        check_cancelled(token)?;
+        let input = validate_grep(input)?;
+        let regex = compile_linear_regex(&input.pattern, self.core.limits.max_regex_length)?;
+        let include_matcher = input
+            .include
+            .as_deref()
+            .map(|pattern| GlobMatcher::new(pattern, &self.core.limits))
+            .transpose()?;
+        let requested_path = input.path.as_deref().unwrap_or(".");
+        let path = self.core.policy.resolve(requested_path).await?;
+        let metadata = inspect_existing(&path, requested_path).await?;
+        let access = if metadata.is_file() {
+            FileResourceAccess::Read
+        } else if metadata.is_dir() {
+            FileResourceAccess::Traverse
+        } else {
+            return Err(FilesystemError::message(format!(
+                "Path is not a regular file or directory: {requested_path}"
+            )));
+        };
+        let relative_path = self.core.policy.relative(&path)?;
+        Ok(PreparedFileGrep {
+            core: self.core.clone(),
+            resources: [FileResource {
+                requested_path: requested_path.to_owned(),
+                path,
+                root_relative_path: relative_path.clone(),
+                access,
+            }],
+            relative_paths: [relative_path],
+            pattern: input.pattern,
+            include: input.include,
+            regex,
+            include_matcher,
+        })
+    }
+
+    pub async fn execute_prepared_grep(
+        &self,
+        prepared: PreparedFileGrep,
+        token: &CancellationToken,
+    ) -> Result<FileGrepOutput, FilesystemError> {
+        ensure_prepared_core(&self.core, &prepared.core)?;
+        check_cancelled(token)?;
+        self.core.revalidate_resource(prepared.resource()).await?;
+        self.core.file_grep_prepared(prepared, token).await
     }
 
     pub async fn file_write(
@@ -160,7 +336,87 @@ impl FileToolGroup {
         input: FileWriteInput,
         token: &CancellationToken,
     ) -> Result<FileWriteOutput, FilesystemError> {
-        self.core.file_write(validate_write(input)?, token).await
+        self.execute_prepared_write(self.prepare_write(input, token).await?, token)
+            .await
+    }
+
+    pub async fn prepare_write(
+        &self,
+        input: FileWriteInput,
+        token: &CancellationToken,
+    ) -> Result<PreparedFileWrite, FilesystemError> {
+        self.prepare_write_bounded(input, usize::MAX, token).await
+    }
+
+    pub async fn prepare_write_bounded(
+        &self,
+        input: FileWriteInput,
+        maximum_retained_bytes: usize,
+        token: &CancellationToken,
+    ) -> Result<PreparedFileWrite, FilesystemError> {
+        let input = validate_write(input)?;
+        let _guard = self.core.mutation.lock().await;
+        let path = self.core.policy.resolve(&input.file_path).await?;
+        let relative_path = self.core.policy.relative(&path)?;
+        let requested_path = input.file_path.clone();
+        let (content, expected, preview) = self
+            .core
+            .prepare_write_bounded(
+                &path,
+                relative_path.clone(),
+                input,
+                maximum_retained_bytes,
+                token,
+            )
+            .await?;
+        let access = if expected.is_some() {
+            FileResourceAccess::ReadWrite
+        } else {
+            FileResourceAccess::Write
+        };
+        Ok(PreparedFileWrite {
+            core: self.core.clone(),
+            resources: [FileResource {
+                requested_path,
+                path,
+                root_relative_path: relative_path.clone(),
+                access,
+            }],
+            relative_paths: [relative_path],
+            content,
+            expected,
+            preview,
+        })
+    }
+
+    pub async fn execute_prepared_write(
+        &self,
+        prepared: PreparedFileWrite,
+        token: &CancellationToken,
+    ) -> Result<FileWriteOutput, FilesystemError> {
+        ensure_prepared_core(&self.core, &prepared.core)?;
+        check_cancelled(token)?;
+        let PreparedFileWrite {
+            resources: [resource],
+            content,
+            expected,
+            mut preview,
+            ..
+        } = prepared;
+        let _guard = self.core.mutation.lock().await;
+        self.core.require_write()?;
+        self.core
+            .commit_write(
+                &resource.requested_path,
+                &resource.path,
+                &content,
+                token,
+                expected.is_none(),
+                expected.as_ref(),
+            )
+            .await?;
+        preview.applied = true;
+        Ok(preview)
     }
 
     pub async fn file_edit(
@@ -168,7 +424,82 @@ impl FileToolGroup {
         input: FileEditInput,
         token: &CancellationToken,
     ) -> Result<FileEditOutput, FilesystemError> {
-        self.core.file_edit(validate_edit(input)?, token).await
+        self.execute_prepared_edit(self.prepare_edit(input, token).await?, token)
+            .await
+    }
+
+    pub async fn prepare_edit(
+        &self,
+        input: FileEditInput,
+        token: &CancellationToken,
+    ) -> Result<PreparedFileEdit, FilesystemError> {
+        self.prepare_edit_bounded(input, usize::MAX, token).await
+    }
+
+    pub async fn prepare_edit_bounded(
+        &self,
+        input: FileEditInput,
+        maximum_retained_bytes: usize,
+        token: &CancellationToken,
+    ) -> Result<PreparedFileEdit, FilesystemError> {
+        let input = validate_edit(input)?;
+        let _guard = self.core.mutation.lock().await;
+        let path = self.core.policy.resolve(&input.file_path).await?;
+        let relative_path = self.core.policy.relative(&path)?;
+        let requested_path = input.file_path.clone();
+        let (content, expected, preview) = self
+            .core
+            .prepare_edit_bounded(
+                &path,
+                relative_path.clone(),
+                input,
+                maximum_retained_bytes,
+                token,
+            )
+            .await?;
+        Ok(PreparedFileEdit {
+            core: self.core.clone(),
+            resources: [FileResource {
+                requested_path,
+                path,
+                root_relative_path: relative_path.clone(),
+                access: FileResourceAccess::ReadWrite,
+            }],
+            relative_paths: [relative_path],
+            content,
+            expected,
+            preview,
+        })
+    }
+
+    pub async fn execute_prepared_edit(
+        &self,
+        prepared: PreparedFileEdit,
+        token: &CancellationToken,
+    ) -> Result<FileEditOutput, FilesystemError> {
+        ensure_prepared_core(&self.core, &prepared.core)?;
+        check_cancelled(token)?;
+        let PreparedFileEdit {
+            resources: [resource],
+            content,
+            expected,
+            mut preview,
+            ..
+        } = prepared;
+        let _guard = self.core.mutation.lock().await;
+        self.core.require_write()?;
+        self.core
+            .commit_write(
+                &resource.requested_path,
+                &resource.path,
+                &content,
+                token,
+                false,
+                Some(&expected),
+            )
+            .await?;
+        preview.applied = true;
+        Ok(preview)
     }
 
     pub async fn file_apply_patch(
@@ -176,8 +507,7 @@ impl FileToolGroup {
         input: FileApplyPatchInput,
         token: &CancellationToken,
     ) -> Result<FileApplyPatchOutput, FilesystemError> {
-        self.core
-            .file_apply_patch(validate_patch(input)?, token)
+        self.execute_prepared_patch(self.prepare_apply_patch(input, token).await?, token)
             .await
     }
 
@@ -187,7 +517,7 @@ impl FileToolGroup {
         input: IndexInput,
         token: &CancellationToken,
     ) -> Result<IndexOutput, FilesystemError> {
-        self.index_with_configuration(input, IndexExecutionConfiguration::default(), token)
+        self.execute_prepared_index(self.prepare_index(input, token).await?, token)
             .await
     }
 
@@ -198,8 +528,75 @@ impl FileToolGroup {
         configuration: IndexExecutionConfiguration,
         token: &CancellationToken,
     ) -> Result<IndexOutput, FilesystemError> {
+        self.execute_prepared_index(
+            self.prepare_index_with_configuration(input, configuration, token)
+                .await?,
+            token,
+        )
+        .await
+    }
+
+    #[cfg(feature = "index")]
+    pub async fn prepare_index(
+        &self,
+        input: IndexInput,
+        token: &CancellationToken,
+    ) -> Result<PreparedFileIndex, FilesystemError> {
+        self.prepare_index_with_configuration(input, IndexExecutionConfiguration::default(), token)
+            .await
+    }
+
+    #[cfg(feature = "index")]
+    pub async fn prepare_index_with_configuration(
+        &self,
+        input: IndexInput,
+        configuration: IndexExecutionConfiguration,
+        token: &CancellationToken,
+    ) -> Result<PreparedFileIndex, FilesystemError> {
+        check_cancelled(token)?;
+        let input = validate_index(input)?;
+        let limits = configuration.limits.validate()?;
+        let path = self.core.policy.resolve(&input.path).await?;
+        let metadata = inspect_existing(&path, &input.path).await?;
+        let access = if metadata.is_dir() {
+            FileResourceAccess::Traverse
+        } else if metadata.is_file() {
+            FileResourceAccess::Read
+        } else {
+            return Err(FilesystemError::message(format!(
+                "Path is not a regular file or directory: {}",
+                input.path
+            )));
+        };
+        let relative_path = self.core.policy.relative(&path)?;
+        Ok(PreparedFileIndex {
+            core: self.core.clone(),
+            resources: [FileResource {
+                requested_path: input.path,
+                path,
+                root_relative_path: relative_path.clone(),
+                access,
+            }],
+            relative_paths: [relative_path],
+            limits,
+        })
+    }
+
+    #[cfg(feature = "index")]
+    pub async fn execute_prepared_index(
+        &self,
+        prepared: PreparedFileIndex,
+        token: &CancellationToken,
+    ) -> Result<IndexOutput, FilesystemError> {
+        ensure_prepared_core(&self.core, &prepared.core)?;
+        check_cancelled(token)?;
+        let PreparedFileIndex {
+            resources: [resource],
+            limits,
+            ..
+        } = prepared;
         self.core
-            .index(validate_index(input)?, configuration, token)
+            .index_authorized_with_limits(resource, limits, token)
             .await
     }
 
@@ -341,9 +738,11 @@ impl FileToolGroup {
                 input.path
             )));
         };
+        let root_relative_path = self.core.policy.relative(&path)?;
         Ok(FileResource {
             requested_path: input.path.clone(),
             path,
+            root_relative_path,
             access,
         })
     }
@@ -356,37 +755,64 @@ impl FileToolGroup {
         input: FileApplyPatchInput,
         token: &CancellationToken,
     ) -> Result<PreparedFilePatch, FilesystemError> {
+        self.prepare_apply_patch_bounded(input, self.core.limits.max_patch_plan_bytes, token)
+            .await
+    }
+
+    pub async fn prepare_apply_patch_bounded(
+        &self,
+        input: FileApplyPatchInput,
+        maximum_retained_bytes: usize,
+        token: &CancellationToken,
+    ) -> Result<PreparedFilePatch, FilesystemError> {
         let input = validate_patch(input)?;
         let _guard = self.core.mutation.lock().await;
-        let (changes, preview) = self.core.prepare_patch(&input.patch_text, token).await?;
-        let resources = changes
-            .iter()
-            .flat_map(|change| {
-                let source = FileResource {
-                    requested_path: change.file_path.to_string_lossy().into_owned(),
-                    path: change.file_path.clone(),
-                    access: match change.change_type {
-                        PlannedChangeType::Add => FileResourceAccess::Write,
-                        PlannedChangeType::Update => FileResourceAccess::ReadWrite,
-                        PlannedChangeType::Delete | PlannedChangeType::Move => {
-                            FileResourceAccess::Delete
-                        }
-                    },
-                };
-                let destination = change.move_path.as_ref().map(|path| FileResource {
-                    requested_path: path.to_string_lossy().into_owned(),
+        let (changes, preview) = self
+            .core
+            .prepare_patch_bounded(&input.patch_text, maximum_retained_bytes, token)
+            .await?;
+        let mut resources = Vec::with_capacity(changes.len());
+        let mut relative_paths = Vec::with_capacity(changes.len());
+        for change in &changes {
+            resources.push(FileResource {
+                requested_path: change.requested_path.clone(),
+                path: change.file_path.clone(),
+                root_relative_path: self.core.policy.relative(&change.file_path)?,
+                access: match change.change_type {
+                    PlannedChangeType::Add => FileResourceAccess::Write,
+                    PlannedChangeType::Update => FileResourceAccess::ReadWrite,
+                    PlannedChangeType::Delete | PlannedChangeType::Move => {
+                        FileResourceAccess::Delete
+                    }
+                },
+            });
+            relative_paths.push(self.core.policy.relative(&change.file_path)?);
+            if let Some(path) = &change.move_path {
+                resources.push(FileResource {
+                    requested_path: change
+                        .requested_move_path
+                        .clone()
+                        .expect("move has requested target"),
                     path: path.clone(),
+                    root_relative_path: self.core.policy.relative(path)?,
                     access: FileResourceAccess::Write,
                 });
-                std::iter::once(source).chain(destination)
-            })
-            .collect();
-        Ok(PreparedFilePatch {
+                relative_paths.push(self.core.policy.relative(path)?);
+            }
+        }
+        let prepared = PreparedFilePatch {
             core: self.core.clone(),
             changes,
             preview,
             resources,
-        })
+            relative_paths,
+        };
+        if prepared.retained_bytes() > maximum_retained_bytes {
+            return Err(FilesystemError::message(format!(
+                "Patch plan exceeds maximum retained size of {maximum_retained_bytes} bytes"
+            )));
+        }
+        Ok(prepared)
     }
 
     /// Publish an authorized prepared patch exactly once, without replanning.
@@ -395,11 +821,8 @@ impl FileToolGroup {
         prepared: PreparedFilePatch,
         token: &CancellationToken,
     ) -> Result<FileApplyPatchOutput, FilesystemError> {
-        if !Arc::ptr_eq(&self.core, &prepared.core) {
-            return Err(FilesystemError::message(
-                "Prepared patch belongs to a different file tool group",
-            ));
-        }
+        ensure_prepared_core(&self.core, &prepared.core)?;
+        check_cancelled(token)?;
         let _guard = self.core.mutation.lock().await;
         self.core
             .publish_prepared_patch(&prepared.changes, token)
@@ -418,9 +841,12 @@ impl FileToolGroup {
         requested_path: &str,
         access: FileResourceAccess,
     ) -> Result<FileResource, FilesystemError> {
+        let path = self.core.policy.resolve(requested_path).await?;
+        let root_relative_path = self.core.policy.relative(&path)?;
         Ok(FileResource {
             requested_path: requested_path.to_owned(),
-            path: self.core.policy.resolve(requested_path).await?,
+            path,
+            root_relative_path,
             access,
         })
     }
@@ -476,6 +902,32 @@ impl FileToolGroup {
         };
         Some(result)
     }
+}
+
+fn ensure_prepared_core(
+    expected: &Arc<FilesystemCore>,
+    prepared: &Arc<FilesystemCore>,
+) -> Result<(), FilesystemError> {
+    if Arc::ptr_eq(expected, prepared) {
+        Ok(())
+    } else {
+        Err(FilesystemError::message(
+            "Prepared operation belongs to a different file tool group",
+        ))
+    }
+}
+
+async fn inspect_existing(
+    path: &Path,
+    requested_path: &str,
+) -> Result<std::fs::Metadata, FilesystemError> {
+    tokio::fs::metadata(path).await.map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            FilesystemError::message(format!("Path not found: {requested_path}"))
+        } else {
+            FilesystemError::io_path("Cannot inspect", path, error)
+        }
+    })
 }
 
 #[cfg(feature = "mcp")]
@@ -575,6 +1027,16 @@ fn fit_search_result<T: BoundedSearchResult>(output: T) -> Result<T, serde_json:
 }
 
 #[cfg(feature = "mcp")]
+pub fn fit_glob_output(output: FileGlobOutput) -> Result<FileGlobOutput, serde_json::Error> {
+    fit_search_result(output)
+}
+
+#[cfg(feature = "mcp")]
+pub fn fit_grep_output(output: FileGrepOutput) -> Result<FileGrepOutput, serde_json::Error> {
+    fit_search_result(output)
+}
+
+#[cfg(feature = "mcp")]
 fn success(output: impl Serialize + ModelText) -> Result<CallToolResult, rmcp::ErrorData> {
     build_success_result(&output).map_err(|error| {
         rmcp::ErrorData::internal_error(
@@ -606,7 +1068,7 @@ fn run_index(
 }
 
 #[cfg(all(feature = "index", feature = "mcp"))]
-fn fit_index_output(output: IndexOutput) -> Result<IndexOutput, serde_json::Error> {
+pub fn fit_index_output(output: IndexOutput) -> Result<IndexOutput, serde_json::Error> {
     if index_response_size(&output)? <= MCP_RAW_RESULT_CEILING_BYTES {
         return Ok(output);
     }
@@ -864,12 +1326,14 @@ fn validate_index(input: IndexInput) -> Result<IndexInput, FilesystemError> {
 
 #[cfg(all(test, feature = "mcp"))]
 mod tests {
-    use super::{
-        ContentBlock, MCP_RAW_RESULT_CEILING_BYTES, ModelText, SerializedTextContent,
-        SerializedToolResult, build_success_result, fit_search_result, mcp_response_size,
-    };
     #[cfg(feature = "index")]
-    use super::{INDEX_TRUNCATED, mcp_response_size_from_parts, run_index, validate_index};
+    use super::{
+        ContentBlock, INDEX_TRUNCATED, mcp_response_size_from_parts, run_index, validate_index,
+    };
+    use super::{
+        MCP_RAW_RESULT_CEILING_BYTES, ModelText, SerializedTextContent, SerializedToolResult,
+        build_success_result, fit_search_result, mcp_response_size,
+    };
     use crate::types::{FileGrepOutput, FileGrepRow};
     #[cfg(feature = "index")]
     use crate::{IndexDirectoryEntry, IndexDirectoryEntryKind};
@@ -900,6 +1364,7 @@ mod tests {
             files_listed: 1,
             rows,
             truncated: false,
+            revisions: Default::default(),
         };
         assert!(
             mcp_response_size(&output).expect("size") > MCP_RAW_RESULT_CEILING_BYTES,
@@ -930,6 +1395,7 @@ mod tests {
             files_scanned: 1,
             files_listed: 1,
             truncated: false,
+            revisions: Default::default(),
         };
         let structured = serde_json::to_value(&output).expect("structured output");
         let structured_size = serde_json::to_vec(&structured)

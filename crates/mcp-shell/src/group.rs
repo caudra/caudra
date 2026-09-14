@@ -5,7 +5,7 @@
 //! child exits, so conflating these conditions can hang forever or discard trailing output.
 
 #[cfg(feature = "mcp")]
-use crate::{catalog, progress::McpProgressSink};
+use crate::{catalog, progress::mcp_progress_sink};
 use crate::{
     output::{
         COMBINED_OUTPUT_BYTES, FALLBACK_PREVIEW_BYTES, OUTPUT_CHANNEL_CAPACITY, Tail, read_stream,
@@ -36,6 +36,7 @@ use std::{
 };
 use tokio::sync::{Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
+use workcell_host_contract::DirectExecOptions;
 use workcell_output_filter::{Rule as FilterRule, collapse_progress_lines, strip_escape_sequences};
 
 /// Name reported for the command-independent escape reduction.
@@ -144,6 +145,10 @@ impl ShellToolGroup {
         self.policy.summary()
     }
 
+    pub fn authorize_prepared(&self, prepared: &PreparedShell) -> Result<(), String> {
+        prepared.policy_decision().result()
+    }
+
     #[must_use]
     #[cfg(feature = "mcp")]
     pub fn catalog(&self) -> Vec<Tool> {
@@ -161,6 +166,22 @@ impl ShellToolGroup {
             // Returning `None` lets an application compose this group with other MCP tool groups.
             return None;
         }
+        let progress = progress.map(|(peer, token)| mcp_progress_sink(peer, token));
+        self.dispatch_with_progress(name, arguments, cancellation, progress)
+            .await
+    }
+
+    #[cfg(feature = "mcp")]
+    pub async fn dispatch_with_progress(
+        &self,
+        name: &str,
+        arguments: Value,
+        cancellation: CancellationToken,
+        progress: Option<Arc<dyn ShellProgressSink>>,
+    ) -> Option<Result<CallToolResult, rmcp::ErrorData>> {
+        if name != "shell" {
+            return None;
+        }
         let input = match serde_json::from_value::<ShellInput>(arguments) {
             Ok(input) => input,
             Err(e) => {
@@ -173,12 +194,9 @@ impl ShellToolGroup {
             Ok(prepared) => prepared,
             Err(error) => return Some(Ok(tool_error(error))),
         };
-        if let Err(error) = self.policy.authorize(prepared.command()) {
+        if let Err(error) = self.authorize_prepared(&prepared) {
             return Some(Ok(tool_error(error)));
         }
-        let progress = progress.map(|(peer, token)| {
-            Arc::new(McpProgressSink { peer, token }) as Arc<dyn ShellProgressSink>
-        });
         Some(Ok(
             match self
                 .execute_prepared(prepared, cancellation, progress)
@@ -191,7 +209,7 @@ impl ShellToolGroup {
         ))
     }
 
-    /// Validate and inspect a command without applying policy or starting a process.
+    /// Validate, inspect, and apply immutable policy without starting a process.
     pub async fn prepare(&self, input: ShellInput) -> Result<PreparedShell, String> {
         if input.command.trim().is_empty() {
             return Err("Invalid arguments: command must not be empty".into());
@@ -209,30 +227,60 @@ impl ShellToolGroup {
             ));
         }
         let requested_workdir = input.workdir.as_deref().unwrap_or(".");
-        let (workdir, relative_workdir) = if self.confined {
+        let workdir = if self.confined {
             workdir::resolve(&self.root, requested_workdir).await?
         } else {
             workdir::resolve_unconfined(&self.root, requested_workdir).await?
         };
-        let analysis = crate::permission::inspect(&input.command);
+        let (analysis, policy_decision) = self.policy.prepare(&input.command);
         Ok(PreparedShell::new(
             input.command,
             timeout_ms,
-            workdir,
-            relative_workdir,
             analysis,
+            policy_decision,
+            workdir,
+            self.output_filter,
         ))
     }
 
+    /// Prepares a non-interactive host operation through the same immutable shell policy as the
+    /// ordinary model-facing shell tool.
+    pub async fn prepare_direct(
+        &self,
+        options: DirectExecOptions,
+        relative_workdir: String,
+    ) -> Result<PreparedShell, String> {
+        let prepared = self
+            .prepare(ShellInput {
+                command: options.command.as_str().to_owned(),
+                timeout: options.timeout_ms,
+                workdir: Some(relative_workdir),
+            })
+            .await?;
+        self.authorize_prepared(&prepared)?;
+        Ok(prepared)
+    }
+
     /// Execute after a native host has authorized the prepared scopes.
+    ///
+    /// ```compile_fail
+    /// use tokio_util::sync::CancellationToken;
+    /// use workcell_mcp_shell::{PreparedShell, ShellToolGroup};
+    ///
+    /// async fn execute_twice(group: &ShellToolGroup, prepared: PreparedShell) {
+    ///     let _ = group.execute_prepared(prepared, CancellationToken::new(), None).await;
+    ///     let _ = group.execute_prepared(prepared, CancellationToken::new(), None).await;
+    /// }
+    /// ```
     pub async fn execute_prepared(
         &self,
         prepared: PreparedShell,
         cancellation: CancellationToken,
         progress: Option<Arc<dyn ShellProgressSink>>,
     ) -> Result<Option<ShellExecution>, String> {
-        let (command_text, timeout_ms, workdir, relative_workdir, analysis) =
+        let (command_text, timeout_ms, workdir, analysis, output_filter) =
             prepared.into_execution_parts();
+        let relative_workdir = workdir.relative().to_owned();
         let mut progress = progress.map(ProgressPump::start);
         // Queue admission remains cancellable; holding the permit through final progress drain keeps
         // all per-execution resources inside the global concurrency budget.
@@ -240,11 +288,19 @@ impl ShellToolGroup {
         let started = Instant::now();
         let mut command = platform_command(&command_text);
         command
-            .current_dir(workdir)
+            .current_dir(workdir.canonical())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        tokio::select! {
+            biased;
+            () = cancellation.cancelled() => return Ok(None),
+            result = workdir::revalidate(&workdir) => result?,
+        }
+        if cancellation.is_cancelled() {
+            return Ok(None);
+        }
         let mut child = command
             .spawn()
             .map_err(|e| format!("Failed to start shell: {e}"))?;
@@ -354,8 +410,13 @@ impl ShellToolGroup {
             stdout_redraws_collapsed: stdout_tail.redraws(),
             stderr_redraws_collapsed: stderr_tail.redraws(),
         };
-        let (model_text, filter) =
-            self.render_with_filter(&output, &analysis, &stdout_tail, &stderr_tail);
+        let (model_text, filter) = self.render_with_filter(
+            &output,
+            &analysis,
+            &stdout_tail,
+            &stderr_tail,
+            output_filter,
+        );
         Ok(Some(ShellExecution {
             output,
             model_text,
@@ -369,7 +430,7 @@ impl ShellToolGroup {
     /// previews already placed in the structured result. Reducing first means
     /// the same preview budget carries what survived filtering instead of the
     /// raw end of the stream.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "mcp"))]
     fn render(
         &self,
         output: &ShellOutput,
@@ -377,8 +438,14 @@ impl ShellToolGroup {
         stdout_tail: &Tail,
         stderr_tail: &Tail,
     ) -> String {
-        self.render_with_filter(output, analysis, stdout_tail, stderr_tail)
-            .0
+        self.render_with_filter(
+            output,
+            analysis,
+            stdout_tail,
+            stderr_tail,
+            self.output_filter,
+        )
+        .0
     }
 
     /// Builds the model-facing rendering from the retained tails.
@@ -395,9 +462,10 @@ impl ShellToolGroup {
         analysis: &ShellCommandAnalysis,
         stdout_tail: &Tail,
         stderr_tail: &Tail,
+        output_filter: bool,
     ) -> (String, Option<ShellFilterInfo>) {
         let unfiltered = model_text(output);
-        if !self.output_filter {
+        if !output_filter {
             return (unfiltered, None);
         }
         let mut stages: Vec<String> = Vec::new();
@@ -420,7 +488,7 @@ impl ShellToolGroup {
 
         let mut consumed_stderr = false;
         let mut body = stdout;
-        if let Some(rule) = self.matching_rule(analysis) {
+        if let Some(rule) = Self::matching_rule(analysis, output_filter) {
             let filtered = rule.apply(&body, &stderr, output.exit_code);
             // A rule that matched but removed nothing is not announced.
             // Announcing a filter that did not filter would tell a reader to go
@@ -483,8 +551,11 @@ impl ShellToolGroup {
     /// the last stage rather than the program a rule names, and in a chain it
     /// belongs to several programs at once, so applying a single rule would
     /// describe output it did not produce.
-    fn matching_rule(&self, analysis: &ShellCommandAnalysis) -> Option<&'static FilterRule> {
-        if !self.output_filter || analysis.opaque {
+    fn matching_rule(
+        analysis: &ShellCommandAnalysis,
+        output_filter: bool,
+    ) -> Option<&'static FilterRule> {
+        if !output_filter || analysis.opaque {
             return None;
         }
         let [scope] = analysis.scopes.as_slice() else {
@@ -499,7 +570,9 @@ impl ShellToolGroup {
         cancellation: CancellationToken,
         progress: Option<Arc<dyn ShellProgressSink>>,
     ) -> Result<Option<ShellExecution>, String> {
-        self.execute_prepared(self.prepare(input).await?, cancellation, progress)
+        let prepared = self.prepare(input).await?;
+        self.authorize_prepared(&prepared)?;
+        self.execute_prepared(prepared, cancellation, progress)
             .await
     }
 }
@@ -569,6 +642,20 @@ fn tool_error(error: impl Into<String>) -> CallToolResult {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct RecordingProgress {
+        chunks: Mutex<Vec<crate::ShellProgressChunk>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ShellProgressSink for RecordingProgress {
+        async fn publish(&self, chunk: crate::ShellProgressChunk) -> Result<(), String> {
+            self.chunks.lock().unwrap().push(chunk);
+            Ok(())
+        }
+    }
 
     /// Builds a completed result carrying the given previews. Callers pass the
     /// same text they push into the corresponding tail, because in execution the
@@ -609,6 +696,7 @@ mod tests {
         "make[1]: Entering directory '/x'\ngcc -O2 foo.c\nmake[1]: Leaving directory '/x'\n";
     const CARGO_TEST_STDOUT: &str = "running 2 tests\ntest sdk_mode::tests::wire_init ... ok\ntest sdk_mode::tests::wire_result ... ok\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n";
     const CARGO_TEST_STDERR: &str = "warning: future incompatibility\n";
+    const PREPARED_TIMEOUT_MS: u64 = 321;
 
     async fn group_for_render(output_filter: bool) -> (tempfile::TempDir, ShellToolGroup) {
         let root = tempfile::tempdir().unwrap();
@@ -872,8 +960,144 @@ mod tests {
 
         assert_eq!(prepared.workdir(), root.path().canonicalize().unwrap());
         assert_eq!(prepared.relative_workdir(), ".");
+        assert_eq!(prepared.timeout_ms(), DEFAULT_TIMEOUT_MS);
+        assert!(prepared.output_filter_enabled());
         assert_eq!(prepared.analysis().scopes.len(), 1);
         assert_eq!(prepared.analysis().scopes[0].permission, "printf *");
+        assert!(!prepared.policy_decision().is_allowed());
+        assert!(prepared.policy_decision().denial_reason().is_some());
+        assert!(prepared.retained_bytes() >= prepared.command().len());
+        assert!(!marker.exists());
+    }
+
+    #[tokio::test]
+    async fn prepared_execution_binds_timeout_workdir_policy_and_progress() {
+        let root = tempfile::tempdir().unwrap();
+        let workdir = root.path().join("bound");
+        std::fs::create_dir(&workdir).unwrap();
+        let group = ShellToolGroup::with_policy(root.path(), ShellPermissionPolicy::yolo())
+            .await
+            .unwrap();
+        let prepared = group
+            .prepare(ShellInput {
+                command: "printf bound".into(),
+                timeout: Some(PREPARED_TIMEOUT_MS),
+                workdir: Some("bound".into()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(prepared.timeout_ms(), PREPARED_TIMEOUT_MS);
+        assert_eq!(prepared.workdir(), workdir.canonicalize().unwrap());
+        assert_eq!(prepared.relative_workdir(), "bound");
+        assert!(prepared.policy_decision().is_allowed());
+        let progress = Arc::new(RecordingProgress::default());
+
+        let execution = group
+            .execute_prepared(prepared, CancellationToken::new(), Some(progress.clone()))
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(execution.output.timeout_ms, PREPARED_TIMEOUT_MS);
+        assert_eq!(execution.output.relative_workdir, "bound");
+        assert_eq!(execution.output.stdout, "bound");
+        let chunks = progress.chunks.lock().unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].text, "bound");
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_prepared_spawn_has_no_side_effect() {
+        let root = tempfile::tempdir().unwrap();
+        let marker = root.path().join("cancelled");
+        let group = ShellToolGroup::with_policy(root.path(), ShellPermissionPolicy::yolo())
+            .await
+            .unwrap();
+        let prepared = group
+            .prepare(ShellInput {
+                command: format!("printf ran > '{}'", marker.display()),
+                timeout: None,
+                workdir: None,
+            })
+            .await
+            .unwrap();
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        assert!(
+            group
+                .execute_prepared(prepared, cancellation, None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(!marker.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn prepared_workdir_rejects_symlink_retarget_before_spawn() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        let link = root.path().join("work");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&second).unwrap();
+        symlink(&first, &link).unwrap();
+        let marker = root.path().join("must-not-run");
+        let group = ShellToolGroup::with_policy(root.path(), ShellPermissionPolicy::yolo())
+            .await
+            .unwrap();
+        let prepared = group
+            .prepare(ShellInput {
+                command: format!("printf ran > '{}'", marker.display()),
+                timeout: None,
+                workdir: Some("work".into()),
+            })
+            .await
+            .unwrap();
+        std::fs::remove_file(&link).unwrap();
+        symlink(&second, &link).unwrap();
+
+        let error = group
+            .execute_prepared(prepared, CancellationToken::new(), None)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error, workdir::STALE_WORKDIR_ERROR);
+        assert!(!marker.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn prepared_workdir_rejects_same_path_directory_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let selected = root.path().join("selected");
+        let original = root.path().join("original");
+        std::fs::create_dir(&selected).unwrap();
+        let marker = root.path().join("must-not-run");
+        let group = ShellToolGroup::with_policy(root.path(), ShellPermissionPolicy::yolo())
+            .await
+            .unwrap();
+        let prepared = group
+            .prepare(ShellInput {
+                command: format!("printf ran > '{}'", marker.display()),
+                timeout: None,
+                workdir: Some("selected".into()),
+            })
+            .await
+            .unwrap();
+        std::fs::rename(&selected, &original).unwrap();
+        std::fs::create_dir(&selected).unwrap();
+
+        let error = group
+            .execute_prepared(prepared, CancellationToken::new(), None)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error, workdir::STALE_WORKDIR_ERROR);
         assert!(!marker.exists());
     }
     #[tokio::test]

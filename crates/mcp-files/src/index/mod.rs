@@ -139,6 +139,7 @@ fn detect(path: &Path) -> Result<Language, FilesystemError> {
 }
 
 impl FilesystemCore {
+    #[cfg(test)]
     pub(crate) async fn index(
         &self,
         input: IndexInput,
@@ -164,8 +165,18 @@ impl FilesystemCore {
         configuration: IndexExecutionConfiguration,
         token: &CancellationToken,
     ) -> Result<IndexOutput, FilesystemError> {
-        check_cancelled(token)?;
         let limits = configuration.limits.validate()?;
+        self.index_authorized_with_limits(resource, limits, token)
+            .await
+    }
+
+    pub(crate) async fn index_authorized_with_limits(
+        &self,
+        resource: FileResource,
+        limits: IndexLimits,
+        token: &CancellationToken,
+    ) -> Result<IndexOutput, FilesystemError> {
+        check_cancelled(token)?;
         let path = self.policy.revalidate(&resource.path).await?;
         if path != resource.path {
             return Err(FilesystemError::message(format!(

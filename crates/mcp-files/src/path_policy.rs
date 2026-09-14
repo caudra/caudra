@@ -111,7 +111,6 @@ impl RootPathPolicy {
         }
     }
 
-    #[cfg(feature = "index")]
     pub(crate) async fn revalidate(&self, authorized: &Path) -> Result<PathBuf, FilesystemError> {
         let requested = authorized.to_string_lossy();
         let canonical = canonicalize(authorized).await.map_err(|error| {
@@ -120,6 +119,19 @@ impl RootPathPolicy {
         if self.confined {
             self.assert_inside(&canonical, &requested)?;
             self.assert_not_protected(&canonical, &requested)?;
+        }
+        Ok(canonical)
+    }
+
+    pub(crate) async fn resolve_internal_existing(
+        &self,
+        candidate: &Path,
+    ) -> Result<PathBuf, FilesystemError> {
+        let canonical = canonicalize(candidate).await.map_err(|error| {
+            FilesystemError::io_path("Cannot resolve internal workspace path", candidate, error)
+        })?;
+        if self.confined {
+            self.assert_inside(&canonical, &candidate.to_string_lossy())?;
         }
         Ok(canonical)
     }

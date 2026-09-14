@@ -29,6 +29,7 @@ use super::{TransportError, TransportOutcome, shutdown_signal};
 use crate::{
     cli::HttpBindMode,
     http_policy::{self, HttpPolicy},
+    remote_host::RemoteHostConfiguration,
     server::WorkcellServer,
     transfer,
 };
@@ -65,12 +66,16 @@ pub struct HttpConfiguration {
     pub bind_mode: HttpBindMode,
     pub allowed_hosts: Vec<String>,
     pub authentication: Option<HttpAuthentication>,
+    pub remote_host: Option<RemoteHostConfiguration>,
 }
 
 impl HttpConfiguration {
     pub fn validate(&self) -> Result<(), TransportError> {
         if self.bind_mode == HttpBindMode::Container && self.authentication.is_none() {
             return Err(TransportError::HttpAuthenticationRequired);
+        }
+        if self.remote_host.is_some() && self.authentication.is_none() {
+            return Err(TransportError::RemoteHostAuthenticationRequired);
         }
         Ok(())
     }
@@ -108,11 +113,20 @@ pub struct HttpServer {
 
 impl HttpServer {
     pub async fn start(
-        server: WorkcellServer,
+        mut server: WorkcellServer,
         port: u16,
         configuration: HttpConfiguration,
     ) -> Result<Self, TransportError> {
         configuration.validate()?;
+        if let Some(remote_host) = configuration.remote_host.clone() {
+            server = server
+                .with_remote_host(remote_host)
+                .await
+                .map_err(|error| {
+                    tracing::error!(operation = "remote_host.configure", %error, "remote host configuration failed");
+                    TransportError::HttpConfiguration
+                })?;
+        }
         let modern_only = server.modern_only();
         let transfer = server.transfer().cloned();
         let transfer_enabled = transfer.is_some();
@@ -367,6 +381,8 @@ async fn wait_for_shutdown(service: HttpServer) -> Result<TransportOutcome, Tran
 
 #[cfg(test)]
 mod tests {
+    use crate::remote_host::RemoteHostConfiguration;
+
     use super::*;
 
     #[test]
@@ -383,10 +399,34 @@ mod tests {
             bind_mode: HttpBindMode::Container,
             allowed_hosts: vec!["127.0.0.1".into()],
             authentication: None,
+            remote_host: None,
         };
         assert_eq!(
             configuration.validate().unwrap_err(),
             TransportError::HttpAuthenticationRequired
+        );
+    }
+
+    #[test]
+    fn remote_host_discovery_requires_authentication() {
+        let configuration = HttpConfiguration {
+            bind_mode: HttpBindMode::Loopback,
+            allowed_hosts: vec!["127.0.0.1".into()],
+            authentication: None,
+            remote_host: Some(
+                RemoteHostConfiguration::new(
+                    "server".into(),
+                    "workspace".into(),
+                    "generation".into(),
+                    "project".into(),
+                    "principal".into(),
+                )
+                .unwrap(),
+            ),
+        };
+        assert_eq!(
+            configuration.validate().unwrap_err(),
+            TransportError::RemoteHostAuthenticationRequired
         );
     }
 }

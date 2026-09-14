@@ -2,12 +2,16 @@
 use std::sync::Arc;
 
 #[cfg(feature = "mcp")]
-use rmcp::model::{JsonObject, MetaObject, Tool, ToolAnnotations};
+use rmcp::model::{MetaObject, Tool, ToolAnnotations};
+use schemars::{JsonSchema, SchemaGenerator, generate::SchemaSettings};
 use serde_json::{Map, Value, json};
-use workcell_tool_contract::{ToolAnnotations as NeutralAnnotations, ToolSpec};
+use workcell_tool_contract::{ToolAnnotations as NeutralAnnotations, ToolContract, ToolSpec};
 
-#[cfg(feature = "mcp")]
-const PRESENTATION_KEY: &str = "ai.workcell/presentation-profile";
+use crate::types::{
+    FileApplyPatchOutput, FileEditOutput, FileGlobOutput, FileGrepOutput, FileReadOutput,
+    FileWriteOutput,
+};
+
 const DRAFT_07: &str = "http://json-schema.org/draft-07/schema#";
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
@@ -220,24 +224,28 @@ fn spec(
     presentation: &'static str,
     contract_id: &'static str,
 ) -> ToolSpec {
-    ToolSpec::new(
+    let spec = ToolSpec::new(
         name,
         Some(title),
         description,
         input_schema,
         annotations,
         presentation,
-        contract_id,
-    )
+        ToolContract::new(contract_id, "v1", "v1"),
+    );
+    match name {
+        "file_read" => spec.with_output_schema(output_schema::<FileReadOutput>()),
+        "file_glob" => spec.with_output_schema(output_schema::<FileGlobOutput>()),
+        "file_grep" => spec.with_output_schema(output_schema::<FileGrepOutput>()),
+        "file_write" => spec.with_output_schema(output_schema::<FileWriteOutput>()),
+        "file_edit" => spec.with_output_schema(output_schema::<FileEditOutput>()),
+        "file_apply_patch" => spec.with_output_schema(output_schema::<FileApplyPatchOutput>()),
+        _ => spec,
+    }
 }
 
 #[cfg(feature = "mcp")]
 fn to_mcp_tool(spec: &ToolSpec) -> Tool {
-    let mut meta = JsonObject::new();
-    meta.insert(
-        PRESENTATION_KEY.to_owned(),
-        Value::String(spec.presentation.to_owned()),
-    );
     let tool = Tool::new(
         spec.name,
         spec.description.clone(),
@@ -247,10 +255,11 @@ fn to_mcp_tool(spec: &ToolSpec) -> Tool {
         Some(title) => tool.with_title(title),
         None => tool,
     };
-    let tool = match &spec.output_schema {
-        Some(output_schema) => tool.with_raw_output_schema(Arc::new(output_schema.clone())),
-        None => tool,
-    };
+    let tool = tool.with_raw_output_schema(Arc::new(
+        spec.output_schema
+            .clone()
+            .expect("filesystem output schema"),
+    ));
     tool.with_annotations(ToolAnnotations::from_raw(
         None,
         spec.annotations.read_only_hint,
@@ -258,7 +267,14 @@ fn to_mcp_tool(spec: &ToolSpec) -> Tool {
         spec.annotations.idempotent_hint,
         spec.annotations.open_world_hint,
     ))
-    .with_meta(MetaObject(meta))
+    .with_meta(MetaObject(spec.extension_metadata()))
+}
+
+fn output_schema<T: JsonSchema>() -> Map<String, Value> {
+    Value::from(SchemaGenerator::new(SchemaSettings::draft07()).into_root_schema_for::<T>())
+        .as_object()
+        .expect("output schema is an object")
+        .clone()
 }
 
 fn read_annotations() -> NeutralAnnotations {
@@ -524,7 +540,7 @@ fn schema(value: Value) -> Map<String, Value> {
 mod tests {
     use serde_json::json;
 
-    use super::{PRESENTATION_KEY, catalog, specs};
+    use super::{catalog, specs};
 
     #[test]
     fn catalog_has_compatible_order_annotations_and_metadata() {
@@ -558,7 +574,7 @@ mod tests {
             Some(true)
         );
         assert_eq!(
-            tools[0].meta.as_ref().unwrap().0[PRESENTATION_KEY],
+            tools[0].meta.as_ref().unwrap().0[workcell_tool_contract::PRESENTATION_METADATA_KEY],
             json!("file.read.v1")
         );
         assert_eq!(tools[0].input_schema["$schema"], json!(super::DRAFT_07));
@@ -569,7 +585,7 @@ mod tests {
             assert_eq!(&spec.input_schema, tool.input_schema.as_ref());
             assert_eq!(
                 spec.presentation,
-                tool.meta.as_ref().unwrap().0[PRESENTATION_KEY]
+                tool.meta.as_ref().unwrap().0[workcell_tool_contract::PRESENTATION_METADATA_KEY]
             );
         }
         #[cfg(feature = "index")]

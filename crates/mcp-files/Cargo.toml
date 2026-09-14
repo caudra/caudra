@@ -19,6 +19,7 @@ mcp = ["dep:rmcp"]
 [dependencies]
 dunce.workspace = true
 file-format.workspace = true
+notify.workspace = true
 regex.workspace = true
 rmcp = { workspace = true, optional = true }
 schemars.workspace = true
@@ -32,6 +33,7 @@ tree-sitter = { workspace = true, optional = true }
 uuid.workspace = true
 workcell-source-languages = { workspace = true, optional = true }
 workcell-tool-contract.workspace = true
+workcell-host-contract.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

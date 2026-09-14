@@ -38,6 +38,7 @@ pub enum TransportError {
     HttpConfiguration,
     HttpAuthentication,
     HttpAuthenticationRequired,
+    RemoteHostAuthenticationRequired,
 }
 
 impl fmt::Display for TransportError {
@@ -51,6 +52,9 @@ impl fmt::Display for TransportError {
             Self::HttpConfiguration => "HTTP MCP composition is inconsistent",
             Self::HttpAuthentication => "the HTTP bearer token is invalid",
             Self::HttpAuthenticationRequired => "container HTTP bind requires a bearer token",
+            Self::RemoteHostAuthenticationRequired => {
+                "remote-host discovery requires authenticated HTTP"
+            }
         })
     }
 }

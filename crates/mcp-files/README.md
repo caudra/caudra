@@ -21,7 +21,10 @@ assert_eq!(catalog.len(), 6);
 
 `FileToolGroup::new` accepts a root, an `allow_write` flag, and optional `FilesystemLimits`. The group
 is cloneable; clones share immutable root policy and a per-service mutation lock. Typed operation
-methods are available alongside JSON MCP dispatch.
+methods are available alongside JSON MCP dispatch. Every canonical file tool also has a typed
+`prepare_*` and consuming `execute_prepared_*` pair. Prepared values expose canonical resources and
+captured root-relative display paths, retain validated options and mutation preconditions, and are
+intentionally non-cloneable.
 
 ## Tools
 
@@ -75,7 +78,11 @@ backtracking controlled by model input.
   absent from the catalog, `dispatch` does not own their names, and direct native calls are denied.
 - Mutation inputs reject unknown fields, so a stale or misspelled argument cannot be dropped into an
   unintended write.
-- `prepare_apply_patch` plans without write access; only `execute_prepared_patch` requires it.
+- Preparation performs validation, canonical resolution, matcher compilation, and mutation planning
+  without publication. Write access is checked only by consuming execution.
+- Prepared reads and searches stay bound to their captured path, scope, and options while observing
+  content at execution time. Prepared mutations additionally reject retargeted paths and stale source
+  revisions immediately before atomic publication.
 - Existing mode bits are preserved and new files use mode `0600` on supported platforms.
 - Missing parent directories are created for every mutation publication, after the write-authority
   check and inside the resolved root. Created directories take the process umask.

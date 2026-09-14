@@ -18,9 +18,13 @@ code-bundled = ["code", "workcell-mcp-code/bundled-worker"]
 code-graph = ["dep:workcell-mcp-code-graph"]
 code-graph-git = ["code-graph", "workcell-mcp-code-graph/git"]
 environment = ["dep:workcell-environment"]
+host-contract = ["dep:workcell-host-contract"]
+scm = ["files", "dep:workcell-workspace-scm"]
+snapshots = ["files", "dep:workcell-workspace-snapshot"]
 
 [dependencies]
 workcell-environment = { workspace = true, optional = true }
+workcell-host-contract = { workspace = true, optional = true }
 workcell-mcp-code = { workspace = true, optional = true }
 workcell-mcp-code-graph = { workspace = true, optional = true }
 workcell-mcp-files = { workspace = true, optional = true }
@@ -28,6 +32,8 @@ workcell-mcp-shell = { workspace = true, optional = true }
 workcell-mcp-web = { workspace = true, optional = true }
 workcell-output-filter = { path = "../output-filter", optional = true }
 workcell-tool-contract.workspace = true
+workcell-workspace-scm = { workspace = true, optional = true }
+workcell-workspace-snapshot = { workspace = true, optional = true }
 
 [lints]
 workspace = true

@@ -13,6 +13,9 @@ use workcell_mcp_files::{
     FileReadOutput, FileToolGroup, FileWriteInput, FilesystemError, FilesystemLimits,
 };
 
+const STALE_PUBLICATION: &str = "changed before publication";
+const FOREIGN_FILE_GROUP: &str = "different file tool group";
+
 struct Fixture {
     _temporary: TempDir,
     root: PathBuf,
@@ -1399,6 +1402,280 @@ async fn prepared_native_patch_exposes_every_resource_and_mutates_only_on_execut
     assert!(output.applied);
     assert!(!source.exists());
     assert_eq!(fs::read_to_string(destination).unwrap(), "new\n");
+}
+
+#[tokio::test]
+async fn expansion_heavy_patch_is_rejected_by_the_preparation_peak_bound() {
+    const OLD_LINES: usize = 2 * 1_024 * 1_024;
+    const INSERTED_BYTES: usize = 900 * 1_024;
+    const PREPARATION_BYTES: usize = 30 * 1_024 * 1_024;
+
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("large.txt"), "a\n".repeat(OLD_LINES)).unwrap();
+    let group = FileToolGroup::new(temp.path(), true, None).await.unwrap();
+    let patch_text = format!(
+        "*** Begin Patch\n*** Update File: large.txt\n@@\n-a\n+{}\n*** End Patch",
+        "b".repeat(INSERTED_BYTES)
+    );
+
+    let result = group
+        .prepare_apply_patch_bounded(
+            FileApplyPatchInput { patch_text },
+            PREPARATION_BYTES,
+            &token(),
+        )
+        .await;
+    let Err(error) = result else {
+        panic!("expansion-heavy preparation unexpectedly succeeded");
+    };
+
+    assert!(error.to_string().contains("content budget"));
+}
+
+#[tokio::test]
+async fn preparation_is_effect_free_and_exposes_canonical_and_relative_resources() {
+    let fixture = fixture();
+    let files = FileToolGroup::new(&fixture.root, true, None)
+        .await
+        .expect("tool group");
+
+    let write = files
+        .prepare_write(
+            FileWriteInput {
+                file_path: "nested/new.txt".into(),
+                content: "new\n".into(),
+            },
+            &token(),
+        )
+        .await
+        .expect("prepared write");
+    assert!(!write.preview().applied);
+    assert!(write.retained_bytes() >= serde_json::to_vec(write.preview()).unwrap().len());
+    assert_eq!(write.relative_path(), "nested/new.txt");
+    assert_eq!(write.resource().path, fixture.root.join("nested/new.txt"));
+    assert!(!fixture.root.join("nested").exists());
+
+    let edit = files
+        .prepare_edit(
+            FileEditInput {
+                file_path: "notes.txt".into(),
+                old_string: "alpha\nbeta".into(),
+                new_string: "alpha\nchanged".into(),
+                replace_all: None,
+            },
+            &token(),
+        )
+        .await
+        .expect("prepared edit");
+    assert!(!edit.preview().applied);
+    assert!(edit.retained_bytes() >= serde_json::to_vec(edit.preview()).unwrap().len());
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("notes.txt")).expect("notes"),
+        "alpha\nbeta\nalpha beta\n"
+    );
+
+    let patch = files
+        .prepare_apply_patch(
+            FileApplyPatchInput {
+                patch_text: "*** Begin Patch\n*** Add File: patch.txt\n+patch\n*** End Patch"
+                    .into(),
+            },
+            &token(),
+        )
+        .await
+        .expect("prepared patch");
+    assert!(!patch.preview().applied);
+    assert!(patch.retained_bytes() >= serde_json::to_vec(patch.preview()).unwrap().len());
+    assert_eq!(patch.relative_paths(), ["patch.txt"]);
+    assert!(!fixture.root.join("patch.txt").exists());
+}
+
+#[tokio::test]
+async fn prepared_reads_and_searches_keep_the_exact_options_and_scope() {
+    let fixture = fixture();
+    fs::write(fixture.root.join("other.rs"), "alpha\n").expect("other");
+    let files = FileToolGroup::new(&fixture.root, false, None)
+        .await
+        .expect("tool group");
+
+    let mut read_input = FileReadInput {
+        file_path: "notes.txt".into(),
+        offset: Some(2),
+        limit: Some(1),
+    };
+    let read = files
+        .prepare_read(read_input.clone(), &token())
+        .await
+        .expect("prepared read");
+    assert!(read.retained_bytes() >= read.resource().requested_path.len());
+    read_input.offset = Some(1);
+    let FileReadOutput::File { text, .. } = files
+        .execute_prepared_read(read, &token())
+        .await
+        .expect("read")
+    else {
+        panic!("expected file");
+    };
+    assert_eq!(text, "beta");
+
+    let mut glob_input = FileGlobInput {
+        pattern: "*.txt".into(),
+        path: None,
+    };
+    let glob = files
+        .prepare_glob(glob_input.clone(), &token())
+        .await
+        .expect("prepared glob");
+    assert!(glob.retained_bytes() >= glob.resource().requested_path.len());
+    glob_input.pattern = "*.rs".into();
+    let glob = files
+        .execute_prepared_glob(glob, &token())
+        .await
+        .expect("glob");
+    assert_eq!(glob.pattern, "*.txt");
+    assert_eq!(glob.files.len(), 1);
+    assert_eq!(glob.files[0].relative_path, "notes.txt");
+
+    let mut grep_input = FileGrepInput {
+        pattern: "beta".into(),
+        path: Some("notes.txt".into()),
+        include: None,
+    };
+    let grep = files
+        .prepare_grep(grep_input.clone(), &token())
+        .await
+        .expect("prepared grep");
+    assert!(grep.retained_bytes() >= grep.resource().requested_path.len());
+    grep_input.pattern = "missing".into();
+    grep_input.path = Some("other.rs".into());
+    let grep = files
+        .execute_prepared_grep(grep, &token())
+        .await
+        .expect("grep");
+    assert_eq!(grep.pattern, "beta");
+    assert_eq!(grep.relative_path, "notes.txt");
+    assert_eq!(grep.matches, 2);
+}
+
+#[tokio::test]
+async fn prepared_mutations_reject_stale_write_edit_and_patch_plans() {
+    let fixture = fixture();
+    let files = FileToolGroup::new(&fixture.root, true, None)
+        .await
+        .expect("tool group");
+
+    let write = files
+        .prepare_write(
+            FileWriteInput {
+                file_path: "notes.txt".into(),
+                content: "prepared write\n".into(),
+            },
+            &token(),
+        )
+        .await
+        .expect("prepared write");
+    fs::write(fixture.root.join("notes.txt"), "external write\n").expect("external write");
+    let error = files
+        .execute_prepared_write(write, &token())
+        .await
+        .expect_err("stale write");
+    assert!(error.to_string().contains(STALE_PUBLICATION));
+
+    fs::write(fixture.root.join("notes.txt"), "edit me\n").expect("edit source");
+    let edit = files
+        .prepare_edit(
+            FileEditInput {
+                file_path: "notes.txt".into(),
+                old_string: "edit".into(),
+                new_string: "edited".into(),
+                replace_all: None,
+            },
+            &token(),
+        )
+        .await
+        .expect("prepared edit");
+    fs::write(fixture.root.join("notes.txt"), "external edit\n").expect("external edit");
+    let error = files
+        .execute_prepared_edit(edit, &token())
+        .await
+        .expect_err("stale edit");
+    assert!(error.to_string().contains(STALE_PUBLICATION));
+
+    fs::write(fixture.root.join("notes.txt"), "patch me\n").expect("patch source");
+    let patch = files
+        .prepare_apply_patch(
+            FileApplyPatchInput {
+                patch_text: "*** Begin Patch\n*** Update File: notes.txt\n@@\n-patch me\n+patched\n*** End Patch"
+                    .into(),
+            },
+            &token(),
+        )
+        .await
+        .expect("prepared patch");
+    fs::write(fixture.root.join("notes.txt"), "external patch\n").expect("external patch");
+    let error = files
+        .execute_prepared_patch(patch, &token())
+        .await
+        .expect_err("stale patch");
+    assert!(error.to_string().contains(STALE_PUBLICATION));
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("notes.txt")).expect("notes"),
+        "external patch\n"
+    );
+}
+
+#[tokio::test]
+async fn prepared_mutation_rejects_a_retargeted_symlink_and_a_foreign_group() {
+    let fixture = fixture();
+    let first = fixture.root.join("first.txt");
+    let second = fixture.root.join("second.txt");
+    let link = fixture.root.join("current.txt");
+    fs::write(&first, "first\n").expect("first");
+    fs::write(&second, "second\n").expect("second");
+    symlink(&first, &link).expect("link");
+    let files = FileToolGroup::new(&fixture.root, true, None)
+        .await
+        .expect("tool group");
+    let prepared = files
+        .prepare_write(
+            FileWriteInput {
+                file_path: "current.txt".into(),
+                content: "replacement\n".into(),
+            },
+            &token(),
+        )
+        .await
+        .expect("prepared write");
+    fs::remove_file(&link).expect("remove link");
+    symlink(&second, &link).expect("retarget link");
+
+    let error = files
+        .execute_prepared_write(prepared, &token())
+        .await
+        .expect_err("retargeted resource");
+    assert!(error.to_string().contains(STALE_PUBLICATION));
+    assert_eq!(fs::read_to_string(first).expect("first"), "first\n");
+    assert_eq!(fs::read_to_string(second).expect("second"), "second\n");
+
+    let prepared = files
+        .prepare_read(
+            FileReadInput {
+                file_path: "notes.txt".into(),
+                offset: None,
+                limit: None,
+            },
+            &token(),
+        )
+        .await
+        .expect("prepared read");
+    let other = FileToolGroup::new(&fixture.root, true, None)
+        .await
+        .expect("other group");
+    let error = other
+        .execute_prepared_read(prepared, &token())
+        .await
+        .expect_err("foreign group");
+    assert!(error.to_string().contains(FOREIGN_FILE_GROUP));
 }
 
 #[tokio::test]

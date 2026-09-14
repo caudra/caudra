@@ -40,7 +40,10 @@ pub use catalog::specs;
 pub use crawl::{CrawlSkip, CrawlTruncation, Crawled, crawl, crawl_filesystem_limits};
 pub use engine::{CodeGraph, estimate_tokens};
 pub use error::CodeGraphError;
-pub use group::CodeGraphToolGroup;
+pub use group::{
+    CodeGraphToolGroup, PreparedCodeContext, PreparedCodeExpand, PreparedCodeImpact,
+    PreparedCodeMap, PreparedCodeRefs,
+};
 pub use limits::CodeGraphLimits;
 pub use model_text::ModelText;
 pub use progress::{

@@ -4,8 +4,9 @@ Workcell MCP is a portable, harness-independent execution server for filesystem,
 tools. Run it directly over stdio or deploy it inside a container, VM, sandbox, or dedicated host and
 connect any compatible MCP client.
 
-Workcell has no users, teams, workspaces, deployment records, or tenant routing. One server process
-represents one execution environment.
+Workcell owns no users, teams, workspaces, deployment records, or tenant routing. One server process
+represents one execution environment; optional remote-host identifiers are opaque operator labels,
+not records managed by Workcell.
 
 > [!WARNING]
 > Workcell does not create a sandbox. Its tools inherit the filesystem, process, network, and resource
@@ -283,6 +284,217 @@ flowchart TB
 Token files and `WORKCELL_MCP_HTTP_TOKEN` are mutually exclusive. Prefer a mounted secret file where
 the deployment platform supports one.
 
+### Remote-host discovery
+
+Authenticated HTTP deployments may opt into `ai.workcell/remote-host` discovery by configuring all
+five identifiers: `--remote-server-id`, `--remote-workspace-id`,
+`--remote-workspace-generation`, `--remote-root-project-id`, and `--remote-principal-id`, or their
+`WORKCELL_MCP_REMOTE_*` environment equivalents. The generation is a stable operator value that must
+change when the workspace is replaced or reset; it is distinct from the random per-process instance
+identifier. The client must request version `v1` in `server/discover`. Workcell then reports those
+opaque identifiers, the process instance identifier, the frozen catalog and policy revisions, the disclosed startup
+execution-environment revision (or a stable nondisclosure revision), exact enabled protocol
+capabilities and limits, and an opaque current-directory handle with a root-relative display path.
+
+This extension uses the existing `POST /mcp` JSON-RPC path. It is absent over stdio, from
+unauthenticated HTTP servers, when not configured, and when the client does not request it. One
+configured root is one project and one bearer-authenticated server process represents one principal.
+Durable workspace, client-session, and resource identity is the tuple of server ID, workspace ID,
+workspace generation, resource namespace version, root-project ID, and principal ID. Resource IDs
+must not be interpreted outside that tuple. The process instance ID is not part of durable identity;
+it detects loss of volatile operation-ledger and watch state after restart. Every binding comparison
+rejects a workspace-generation mismatch.
+Negotiated clients may call `ai.workcell/prepare`, `ai.workcell/execute`, `ai.workcell/release`,
+`ai.workcell/status`, and `ai.workcell/cancel` on that same path. Preparation validates the frozen
+tool contract and host binding, resolves bounded resource intents without running the tool, and
+returns an expiring preparation ID. Execution accepts only that ID plus one invocation ID. The first
+request performs the operation; retries with the same invocation ID return the retained structured
+result instead of repeating an effect. A different invocation ID is rejected. The operations
+descriptor reports `exactPreparation: true`: execution consumes the typed prepared value and rejects
+resource, working-directory, content, configuration, catalog, or policy changes that invalidate it.
+Websearch preparation reports the provider connection separately from a search resource whose opaque
+ID and bounded display text bind the exact normalized query used by embedded permission checks.
+
+The same negotiated extension exposes versioned workspace methods for directory resolution, stat,
+deterministically ordered list and traversal, bounded text ranges, and deterministic text search:
+`ai.workcell/resolve-directory`, `ai.workcell/stat`, `ai.workcell/list`,
+`ai.workcell/read-text`, and `ai.workcell/search-text`. Every relative request carries both the exact
+host binding and an immutable cwd handle. Directory resolution returns a fresh handle plus a
+root-relative POSIX display path; traversal or symlinks cannot leave the one configured root-project.
+List and search pagination use bounded opaque server-side cursors bound to the request digest and
+observed resource revision. Unknown or modified cursors are rejected, and a resource change returns
+an explicit stale-cursor error. List traversal retains at most 50,000 entries and 16 MiB of entry and
+path state and hashes at most 64 MiB of file content, independently of the requested page size;
+`truncated` is explicit when one of those aggregate limits stops the traversal. Search responses
+preserve the underlying scan's `filesScanned`,
+`filesListed`, and `truncated` values, so a null cursor does not claim completeness when the bounded
+scan stopped early. Match text and its resource revision come from one metadata-verified file
+snapshot; a concurrent replacement is omitted rather than pairing old text with a newer revision.
+Text reads return the resource revision used by prepared writes. `byteOffset`
+continues within the selected line range; `startByte`, exclusive `endByte`, and `nextByteOffset`
+identify the exact returned bytes. `startLine` identifies the line containing the first returned byte,
+while `endLine` identifies the last line completed by that chunk and is zero when none was completed.
+Empty and beyond-EOF reads report no completed line instead of inventing one.
+
+`ai.workcell/watch-open`, `ai.workcell/watch-poll`, and `ai.workcell/watch-close` provide bounded
+process-local change replay without adding an HTTP route or a stateful transport session. A watch is
+bound to the authenticated host, principal, root project, and immutable cwd handle. Open returns an
+opaque replay cursor; poll returns monotonically sequenced `create`, `modify`, `remove`, or `rescan`
+events and a cursor for the last delivered event. Cursors can be replayed while their events remain in
+the advertised retention window. A modified cursor, process-instance change, backend queue overflow,
+watcher error, expired subscription, or lost retention returns `fullResync` with a reason and no
+continuation cursor. It never claims a complete incremental history across one of those boundaries.
+Subscriptions, raw backend queues, retained events and bytes, poll batches, waits, total event count,
+and lifetime are all bounded; close, overflow, backend failure, expiry, replacement, and server drop
+release the native watcher and abort its expiry task.
+
+Native filesystems do not provide one portable exact rename contract. Workcell therefore advertises
+`exactRenamePairing: false` and normalizes what the backend can establish into remove/create events.
+An ambiguous rename is a `rescan` event rather than a fabricated pair. Event paths use the same
+root-relative POSIX form and protected-path exclusions as workspace traversal; absolute host paths are
+never returned. Both external filesystem changes and mutations performed through Workcell enter this
+same stream.
+
+`ai.workcell/discover-project-assets` and `ai.workcell/read-project-asset` expose the fixed
+`project-assets.v1` manifest. Its allowlist is deliberately source-shaped rather than configuration-
+shaped: recognized instruction basenames (`AGENTS.md`, `AGENTS.local.md`, `CLAUDE.md`, `COPILOT.md`,
+`.cursorrules`, `.windsurfrules`, `.clinerules`, `CONVENTIONS.md`, `GEMINI.md`, and
+`CODING_AGENT.md`), `.github/copilot-instructions.md`, `.caudra/instructions`, one-level `SKILL.md`
+sources below `.caudra/skills`, `.claude/skills`, `.opencode/skills`, or `.agents/skills`, and
+`.caudra/workflows/*.rhai`. It also includes immediate Markdown files under exactly
+`.caudra/commands`, `.claude/commands`, and `.opencode/commands`, plus the exact declarative permission
+source `.caudra/permissions.toml`. Command, skill, and instruction sources are marked `declarative`.
+Workflow scripts are marked `clientApprovalRequired`. Permissions are marked `mixedReviewRequired`:
+a client may apply denies immediately, but must review allows and bind that decision to the returned
+revision. Workcell does not parse or apply any of these sources.
+
+Discovery retains at most 256 assets, visits at most 50,000 entries, retains at most 16 MiB of path
+state, and hashes at most 64 MiB of content; it rejects a partial traversal. Asset paths are at most
+4,096 bytes and each UTF-8 read is at most 64 KiB. Reads reuse confined stat, require the discovered
+content revision, and return source bytes without parsing or executing them.
+
+The manifest does not include `.env`, `init.lua`, MCP configuration, plugin configuration or source,
+general `.caudra` configuration, arbitrary scripts, or arbitrary remote configuration. It follows no
+symlinks and has no fallback glob or project-provided manifest that can widen this list.
+
+`ai.workcell/prepare-mutation` prepares a bounded batch of explicit create, revision-matched write,
+mkdir, revision-matched rename, and revision-matched delete actions. It discloses every source and
+destination before execution and enters the same operation ledger as ordinary exact tool preparation;
+there is no second ledger. Each publication uses the narrowest atomic filesystem primitive available.
+Rename and delete revisions are computed from regular-file bytes and therefore support binary files;
+UTF-8 and binary-content checks remain required for text writes and edits.
+There is no portable atomic transaction across arbitrary files, so discovery reports
+`atomicAcrossFiles: false`: all resources are revalidated before the first publication, and an
+in-process failure or cancellation rolls completed actions back in reverse order. A failed rollback is
+reported as `partial_failure`. A process or host crash between publications or during rollback can
+leave a partial batch; recovery is an operator filesystem concern rather than a claim of atomicity.
+
+`ai.workcell/prepare-exec` prepares direct non-interactive execution against an immutable cwd and
+bounded command/timeout options. It passes through the same startup-frozen shell parser and policy as
+the ordinary `shell` tool, then uses the common execute/status/progress/cancel lifecycle. It is absent
+when shell is disabled and has no input field that can approve or bypass policy. Cancellation before
+dispatch is a clean `cancelled` outcome with `sideEffectsPossible: false`. Once a direct child,
+file, workspace, or SCM mutation, snapshot restore or unrevert, or snapshot cleanup may have started, a
+failed or cancelled operation reports `sideEffectsPossible: true` and status is `indeterminate`
+unless a pre-effect rejection or successful atomic rollback proves otherwise. Killing a process
+cannot prove that its earlier effects were absent. Prepared-operation bytes remain charged to the
+global ledger while execution is running, including time queued on a mutation lock.
+
+The versioned SCM slice uses `ai.workcell/scm-discover`, `ai.workcell/scm-status`,
+`ai.workcell/scm-log`, `ai.workcell/scm-diff`, and `ai.workcell/scm-read-side`. Discovery starts from a
+confined immutable cwd/resource handle and returns an opaque repository handle only for an ordinary
+worktree and `.git` directory that both remain inside the configured root. Linked worktrees,
+submodules, symlinked or external git directories, bare repositories, and configured external filter
+or diff/textconv programs are rejected. Git availability and its bounded version response are probed
+when the remote host is constructed; failed probes omit SCM and add `scm` to `controlPlaneMissing`.
+At most four SCM operations run concurrently across all groups in one process; queued requests remain
+cancellable. The effective bound is advertised as `maxConcurrentOperations`.
+The regular, non-symlink `.git/config` is limited to the advertised 1 MiB `maxConfigBytes`; bounded
+descriptor reads and identity revalidation bracket each in-process repository open.
+Status distinguishes staged, unstaged, untracked, and conflicted paths. Log,
+status, and diff ordering is deterministic; pagination cursors are request- and revision-bound. Log
+walks at most 10,000 prior commits and 16 MiB of aggregate commit objects, advertised as
+`maxLogScanBytes`, charging object-header sizes before loading each body and including commits skipped
+to reach a cursor. It rejects any commit object over 1 MiB before loading or decoding it and retains
+only the current page plus one lookahead commit. Diff
+scans at most 16 MiB and parses at most 20,000 aggregate lines across at most 500 files before
+materializing a bounded prefix. Log and diff responses report `truncated` when an aggregate limit
+withholds the tail; diff and side reads also enforce their advertised response line and byte limits.
+
+`ai.workcell/scm-prepare-mutation` prepares an exact `stage`, `unstage`, or `discard` set of at most
+127 paths, leaving one of the operation ledger's 128 resource intents for the repository itself, and
+returns its status preview plus repository identity and HEAD, index, and worktree revisions. Execution
+uses the common operation ledger, acquires the filesystem mutation lock, revalidates every captured
+revision, and returns a structured stale or lock error instead of guessing through concurrent index
+changes. Same-invocation retries return the retained result. Discard accepts tracked worktree changes
+only and never removes an untracked path; no clean/reset or generic Git execution method is exposed.
+Repository and history decoding use `gix`. The few Git CLI operations use fixed argument templates,
+bounded documented porcelain/name-status or parsed patch data, discard stderr, and never return raw
+terminal output. Every diff pass disables external diff, text conversion, and color. Helper-affecting
+environment variables are removed; repository filters and diff-driver configuration are rejected;
+hooks and filesystem monitors are disabled for those calls.
+
+Workspace snapshots are disabled unless an authenticated remote host, writable files group, and an
+existing operator-owned private directory are configured together with `--snapshot-root` or
+`WORKCELL_MCP_SNAPSHOT_ROOT`. The directory must be absolute, owned by the process identity, inaccessible
+to group and other users on Unix, free of symlink components, and disjoint from the exposed workspace.
+It has no shared temporary-directory default. Snapshot blobs, manifests, checkpoint mappings, and
+restore journals remain beneath a directory keyed by the complete durable workspace identity under
+that private root. They never cross workspace generations and are never returned as byte payloads or
+exposed by an HTTP route.
+
+`ai.workcell/snapshot-capture` uses a client checkpoint ID for durable idempotency. It captures at most
+128 confined regular files, 64 MiB per file, and 256 MiB total while holding the filesystem mutation
+lock. Each scan admits at most 50,000 directory entries and 16 MiB of aggregate retained path bytes,
+including directories that contain no files, before repeating the scan and publishing the manifest. A
+concurrent change fails capture instead of publishing a mixed manifest. Symlinks and special files are
+rejected rather than followed. The
+filesystem policy's protected paths, including Git metadata, credentials, and `.workcell`, are excluded;
+an in-workspace code-worker cache is also recorded as an exclusion even when its final path does not
+exist yet. Immutable blobs are SHA-256 addressed and deduplicated. Every blob, manifest, checkpoint,
+and journal publication checks the prospective replacement-aware total while holding the publication
+lock. A failed capture runs bounded orphan collection. Manifests record root-relative path, resource
+identity, revision, digest, mode, and size. `snapshot-inspect` pages that bounded manifest and verifies
+both manifest identity and every referenced blob before returning metadata.
+
+`snapshot-prepare-restore` allocates the stable restore ID and deterministic pre-restore snapshot ID,
+and returns the complete create, replace, delete, conflict, and missing-ancestor preview before storing
+the prepared value in the common operation ledger. Authorization includes one aggregate private-store
+manifest-and-blob write intent in addition to workspace and journal effects. Execution revalidates the
+captured workspace revision before any effect and again
+compares each file immediately before publication. Later edits are never overwritten, and execution
+creates only ancestor directories disclosed by preparation. Each replacement is atomic for one file,
+but a portable atomic transaction across files does not exist: discovery reports
+`atomicAcrossFiles: false`. Before publication, Workcell captures the exact current file state as a
+private snapshot and durably writes a restore journal under the prepared restore ID. Directory and file
+progress are journaled separately. A cancellation or ordinary failure reports partial or indeterminate
+state; after restart, bounded journal recovery compares the workspace with pre- and post-state, resolves
+an already completed restore, and otherwise requires reconciliation without replaying writes.
+
+`snapshot-status` reads the durable restore journal. `snapshot-prepare-unrevert` restores the private
+pre-restore snapshot through the same preview, common-ledger execution, compare-before-write, and status
+path. A completed, partial, or indeterminate restore protects its paths and referenced snapshots until
+the completed state is acknowledged with `snapshot-acknowledge`; another overlapping restore is refused.
+Journal count and byte quotas are checked before restore and unrevert, and pressure may reclaim only
+acknowledged terminal journals. `snapshot-prepare-cleanup` is likewise a common-ledger mutation.
+Preparation retains one exact plan covering checkpoint mappings, acknowledged journals, manifests, and
+unreachable blobs and binds authorization to its digest. Execution revalidates that plan, removes
+references before referents, and deletes no resource discovered after preparation. An empty snapshot ID
+list is a GC-only request. Startup completes bounded orphan collection, including an over-quota orphan
+store with no manifests, without replaying workspace writes.
+
+Preparations, terminal outcomes, and ordered shell progress are held in a bounded in-process ledger.
+Status therefore reports an instance mismatch as `indeterminate`, and a released, expired, or evicted
+record as `forgotten` while its bounded tombstone remains. Restarting the process intentionally loses
+the generic ledger; snapshot restore journals retain only reconciliation status and publication
+progress. Every retained outcome carries `sideEffectsPossible`; an uncertain post-start cancellation
+is retained as `indeterminate`, not as a clean cancellation. There are no user, tenant, ticket, signing,
+lease-broker, controller, or administrative APIs.
+Discovery sets `controlPlane: true` only when workspace reads, watch, project assets, writable prepared
+mutation, direct exec, SCM, operations, and healthy configured snapshots are all present. Otherwise it
+stays false and `controlPlaneMissing` names the absent subcapabilities. The optional `/files` byte route
+is unchanged: every request still presents the process bearer and is re-resolved and reauthorized.
+
 ## Web Configuration
 
 `websearch` uses Exa's credential-free hosted search by default; no API key is required. Search queries
@@ -367,6 +579,10 @@ dual-era posture is:
 - Stdio uses the SDK newline-delimited transport.
 - Modern tool, discovery, and list responses use complete-result envelopes. The SDK omits modern-only
   result and caching fields for legacy peers.
+- JSON-RPC failures with a stable symbolic identifier expose it as `error.data.code`.
+- Every tool publishes its structured output schema and `ai.workcell/contract` metadata with explicit
+  contract and result versions. The catalog is built once per server and has a deterministic content
+  revision.
 - Cancellation is cooperative; shell calls publish ordered progress when requested. Each progress
   notification includes a bounded, single-line standard `message` field with control and
   bidirectional formatting characters escaped, plus an `ai.workcell/tool-output-chunk` metadata

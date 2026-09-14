@@ -40,8 +40,133 @@
               "maximum": 9007199254740991
             }
           },
-          "required": ["filePath"],
+          "required": [
+            "filePath"
+          ],
           "$schema": "http://json-schema.org/draft-07/schema#"
+        },
+        "outputSchema": {
+          "oneOf": [
+            {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "relativePath": {
+                  "type": "string"
+                },
+                "entryDetails": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/definitions/DirectoryEntryDetail"
+                  }
+                },
+                "truncated": {
+                  "type": "boolean"
+                },
+                "kind": {
+                  "type": "string",
+                  "const": "directory"
+                }
+              },
+              "required": [
+                "kind",
+                "path",
+                "relativePath",
+                "entryDetails",
+                "truncated"
+              ]
+            },
+            {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "relativePath": {
+                  "type": "string"
+                },
+                "text": {
+                  "type": "string"
+                },
+                "lineStart": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0
+                },
+                "lineEnd": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0
+                },
+                "totalLines": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0
+                },
+                "truncated": {
+                  "type": "boolean"
+                },
+                "kind": {
+                  "type": "string",
+                  "const": "file"
+                }
+              },
+              "required": [
+                "kind",
+                "path",
+                "relativePath",
+                "text",
+                "lineStart",
+                "lineEnd",
+                "totalLines",
+                "truncated"
+              ]
+            }
+          ],
+          "title": "FileReadOutput",
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "definitions": {
+            "DirectoryEntryDetail": {
+              "type": "object",
+              "properties": {
+                "relativePath": {
+                  "type": "string"
+                },
+                "kind": {
+                  "$ref": "#/definitions/FileEntryKind"
+                },
+                "sizeBytes": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "format": "uint64",
+                  "minimum": 0
+                },
+                "lineCount": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "format": "uint",
+                  "minimum": 0
+                }
+              },
+              "required": [
+                "relativePath",
+                "kind"
+              ]
+            },
+            "FileEntryKind": {
+              "type": "string",
+              "enum": [
+                "file",
+                "directory"
+              ]
+            }
+          }
         },
         "annotations": {
           "readOnlyHint": true,
@@ -50,7 +175,12 @@
           "openWorldHint": false
         },
         "_meta": {
-          "ai.workcell/presentation-profile": "file.read.v1"
+          "ai.workcell/presentation-profile": "file.read.v1",
+          "ai.workcell/contract": {
+            "id": "file.read.v1",
+            "version": "v1",
+            "resultVersion": "v1"
+          }
         }
       },
       {
@@ -71,8 +201,93 @@
               "minLength": 1
             }
           },
-          "required": ["pattern"],
+          "required": [
+            "pattern"
+          ],
           "$schema": "http://json-schema.org/draft-07/schema#"
+        },
+        "outputSchema": {
+          "type": "object",
+          "properties": {
+            "cwd": {
+              "type": "string"
+            },
+            "relativePath": {
+              "type": "string"
+            },
+            "pattern": {
+              "type": "string"
+            },
+            "files": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/FileListing"
+              }
+            },
+            "count": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "total": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0,
+              "description": "Files matching the pattern. Counting continues past the returned window,\nso this exceeds `count` when results were withheld. Exact when\n`scanComplete` is true, otherwise a lower bound."
+            },
+            "scanComplete": {
+              "type": "boolean",
+              "description": "Whether every candidate the traversal produced was examined. False when\nthe traversal or the match work budget stopped the scan early."
+            },
+            "truncated": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "cwd",
+            "relativePath",
+            "pattern",
+            "files",
+            "count",
+            "total",
+            "scanComplete",
+            "truncated"
+          ],
+          "title": "FileGlobOutput",
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "definitions": {
+            "FileListing": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "relativePath": {
+                  "type": "string"
+                },
+                "sizeBytes": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "format": "uint64",
+                  "minimum": 0
+                },
+                "lineCount": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "format": "uint",
+                  "minimum": 0
+                }
+              },
+              "required": [
+                "path",
+                "relativePath"
+              ]
+            }
+          }
         },
         "annotations": {
           "readOnlyHint": true,
@@ -81,7 +296,12 @@
           "openWorldHint": false
         },
         "_meta": {
-          "ai.workcell/presentation-profile": "file.list.v1"
+          "ai.workcell/presentation-profile": "file.list.v1",
+          "ai.workcell/contract": {
+            "id": "file.glob.v1",
+            "version": "v1",
+            "resultVersion": "v1"
+          }
         }
       },
       {
@@ -107,8 +327,95 @@
               "minLength": 1
             }
           },
-          "required": ["pattern"],
+          "required": [
+            "pattern"
+          ],
           "$schema": "http://json-schema.org/draft-07/schema#"
+        },
+        "outputSchema": {
+          "type": "object",
+          "properties": {
+            "cwd": {
+              "type": "string"
+            },
+            "relativePath": {
+              "type": "string"
+            },
+            "pattern": {
+              "type": "string"
+            },
+            "include": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "rows": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/FileGrepRow"
+              }
+            },
+            "matches": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "filesScanned": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0,
+              "description": "Candidate files actually searched. An exact match total is not reported\nbecause producing one would require reading every remaining file."
+            },
+            "filesListed": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0,
+              "description": "Candidate files the traversal listed. A lower bound when `truncated`."
+            },
+            "truncated": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "cwd",
+            "relativePath",
+            "pattern",
+            "rows",
+            "matches",
+            "filesScanned",
+            "filesListed",
+            "truncated"
+          ],
+          "title": "FileGrepOutput",
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "definitions": {
+            "FileGrepRow": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "relativePath": {
+                  "type": "string"
+                },
+                "line": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0
+                },
+                "text": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "path",
+                "relativePath",
+                "line",
+                "text"
+              ]
+            }
+          }
         },
         "annotations": {
           "readOnlyHint": true,
@@ -117,7 +424,12 @@
           "openWorldHint": false
         },
         "_meta": {
-          "ai.workcell/presentation-profile": "file.search.v1"
+          "ai.workcell/presentation-profile": "file.search.v1",
+          "ai.workcell/contract": {
+            "id": "file.grep.v1",
+            "version": "v1",
+            "resultVersion": "v1"
+          }
         }
       },
       {
@@ -133,7 +445,9 @@
               "description": "Root-relative or absolute source file or directory path, limited to 4096 UTF-8 bytes."
             }
           },
-          "required": ["path"],
+          "required": [
+            "path"
+          ],
           "additionalProperties": false,
           "$schema": "http://json-schema.org/draft-07/schema#"
         },
@@ -155,39 +469,79 @@
                 "truncated"
               ],
               "properties": {
-                "kind": { "const": "file" },
-                "path": { "type": "string" },
-                "relativePath": { "type": "string" },
-                "language": { "type": "string" },
+                "kind": {
+                  "const": "file"
+                },
+                "path": {
+                  "type": "string"
+                },
+                "relativePath": {
+                  "type": "string"
+                },
+                "language": {
+                  "type": "string"
+                },
                 "lines": {
                   "type": "array",
                   "items": {
                     "type": "object",
                     "additionalProperties": false,
-                    "required": ["outputLine", "text", "semantic"],
+                    "required": [
+                      "outputLine",
+                      "text",
+                      "semantic"
+                    ],
                     "properties": {
-                      "outputLine": { "type": "integer", "minimum": 1 },
-                      "text": { "type": "string" },
+                      "outputLine": {
+                        "type": "integer",
+                        "minimum": 1
+                      },
+                      "text": {
+                        "type": "string"
+                      },
                       "semantic": {
                         "type": "string",
-                        "enum": ["section", "item", "dimmed", "plain"]
+                        "enum": [
+                          "section",
+                          "item",
+                          "dimmed",
+                          "plain"
+                        ]
                       },
-                      "body": { "type": "string" },
+                      "body": {
+                        "type": "string"
+                      },
                       "sourceRange": {
                         "type": "object",
                         "additionalProperties": false,
-                        "required": ["startLine", "endLine"],
+                        "required": [
+                          "startLine",
+                          "endLine"
+                        ],
                         "properties": {
-                          "startLine": { "type": "integer", "minimum": 1 },
-                          "endLine": { "type": "integer", "minimum": 1 }
+                          "startLine": {
+                            "type": "integer",
+                            "minimum": 1
+                          },
+                          "endLine": {
+                            "type": "integer",
+                            "minimum": 1
+                          }
                         }
                       }
                     }
                   }
                 },
-                "sourceLineCount": { "type": "integer", "minimum": 1 },
-                "parseError": { "type": "boolean" },
-                "truncated": { "type": "boolean" }
+                "sourceLineCount": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "parseError": {
+                  "type": "boolean"
+                },
+                "truncated": {
+                  "type": "boolean"
+                }
               }
             },
             {
@@ -202,20 +556,34 @@
                 "truncated"
               ],
               "properties": {
-                "kind": { "const": "directory" },
-                "path": { "type": "string" },
-                "relativePath": { "type": "string" },
+                "kind": {
+                  "const": "directory"
+                },
+                "path": {
+                  "type": "string"
+                },
+                "relativePath": {
+                  "type": "string"
+                },
                 "entries": {
                   "type": "array",
                   "items": {
                     "type": "object",
                     "additionalProperties": false,
-                    "required": ["name", "kind"],
+                    "required": [
+                      "name",
+                      "kind"
+                    ],
                     "properties": {
-                      "name": { "type": "string" },
+                      "name": {
+                        "type": "string"
+                      },
                       "kind": {
                         "type": "string",
-                        "enum": ["directory", "file"]
+                        "enum": [
+                          "directory",
+                          "file"
+                        ]
                       }
                     }
                   }
@@ -225,7 +593,9 @@
                   "minimum": 0,
                   "description": "Exact when truncated is false; otherwise a lower bound on visible entries processed before scanning stopped."
                 },
-                "truncated": { "type": "boolean" }
+                "truncated": {
+                  "type": "boolean"
+                }
               }
             }
           ]
@@ -237,9 +607,14 @@
           "openWorldHint": false
         },
         "_meta": {
-          "ai.workcell/presentation-profile": "file.index.v1"
+          "ai.workcell/presentation-profile": "file.index.v1",
+          "ai.workcell/contract": {
+            "id": "file.index.v1",
+            "version": "v1",
+            "resultVersion": "v1"
+          }
         }
       }
-      ]
+    ]
   }
 }
