@@ -736,6 +736,9 @@ mod tests {
     const CUSTOM_CORRECTION: &str = "Return the requested report using its schema.";
     const MISSING_REPORT_RULE: &str = "missing_task_report";
     const EMPTY_RESPONSE_RULE: &str = "empty_response";
+    const TRUNCATION_RULE: &str = "truncation";
+    const DEFAULT_TRUNCATION_ATTEMPTS: u32 = 3;
+    const ORDINARY_TOOL_ROUNDS: u32 = 4;
     const SCRIPT_EXHAUSTED: &str = "script exhausted";
     const COMPACTED_SUMMARY: &str = "Earlier investigation was compacted.";
     const COMPACTION_HISTORY_MESSAGES: usize = 32;
@@ -1298,6 +1301,14 @@ mod tests {
         )
     }
 
+    fn truncated_response(text: &str, usage: TokenUsage) -> StreamResponse {
+        response(
+            vec![ContentBlock::Text { text: text.into() }],
+            StopReason::MaxTokens,
+            usage,
+        )
+    }
+
     fn structured_output_call(value: Value) -> StreamResponse {
         response(
             vec![ContentBlock::tool_use("t1", STRUCTURED_OUTPUT_TOOL, value)],
@@ -1338,17 +1349,22 @@ mod tests {
         );
     }
 
-    #[test_case(SUMMARY; "prose_tail")]
-    #[test_case(""; "empty_tail")]
-    #[test_case(" \n "; "whitespace_tail")]
-    fn a_structured_result_is_validated_and_returned_as_json(tail: &str) {
+    #[test_case(SUMMARY, StopReason::EndTurn; "prose_tail")]
+    #[test_case("", StopReason::EndTurn; "empty_tail")]
+    #[test_case(" \n ", StopReason::EndTurn; "whitespace_tail")]
+    #[test_case("", StopReason::MaxTokens; "truncated_empty_tail")]
+    fn a_structured_result_is_validated_and_returned_as_json(tail: &str, stop: StopReason) {
         smol::block_on(async {
             let expected = json!({ REQUIRED_FIELD: SUMMARY });
             let ctx = ctx_with(
                 AgentMode::Build,
                 ScriptedProvider::new(vec![
                     structured_output_call(expected.clone()),
-                    text_response(tail, SECOND_TURN),
+                    response(
+                        vec![ContentBlock::Text { text: tail.into() }],
+                        stop,
+                        SECOND_TURN,
+                    ),
                 ]),
             );
 
@@ -1448,25 +1464,237 @@ mod tests {
         });
     }
 
-    #[test]
-    fn a_truncated_task_summary_keeps_both_fragments() {
+    #[test_case(1; "first_retry")]
+    #[test_case(DEFAULT_TRUNCATION_ATTEMPTS; "last_default_retry")]
+    fn a_truncated_task_summary_keeps_all_fragments(attempts: u32) {
         smol::block_on(async {
-            let ctx = ctx_with(
-                AgentMode::Build,
-                ScriptedProvider::new(vec![
-                    response(
-                        vec![ContentBlock::Text {
-                            text: PARTIAL.into(),
-                        }],
-                        StopReason::MaxTokens,
-                        FIRST_TURN,
-                    ),
-                    text_response(SUMMARY, SECOND_TURN),
-                ]),
-            );
+            let mut responses: Vec<_> = (0..attempts)
+                .map(|_| truncated_response(PARTIAL, FIRST_TURN))
+                .collect();
+            responses.push(text_response(SUMMARY, SECOND_TURN));
+            let provider = ScriptedProvider::new(responses);
+            let observed = Arc::clone(&provider.requests);
+            let ctx = ctx_with(AgentMode::Build, provider);
             let outcome = run_task(&ctx, request(TaskIdentity::Derive, None)).await;
             assert_eq!(outcome.error, None);
-            assert_eq!(outcome.output, json!(format!("{PARTIAL}{SUMMARY}")));
+            assert_eq!(
+                outcome.output,
+                json!(format!("{}{SUMMARY}", PARTIAL.repeat(attempts as usize)))
+            );
+            assert_eq!(observed.lock().unwrap().len(), attempts as usize + 1);
+            assert_eq!(
+                outcome.tokens_used,
+                u64::from(
+                    attempts * (FIRST_TURN.total_input() + FIRST_TURN.output)
+                        + SECOND_TURN.total_input()
+                        + SECOND_TURN.output
+                )
+            );
+            assert_retired(&ctx, CALL_ID);
+        });
+    }
+
+    #[test_case(true, false, PARTIAL; "master_disabled_prose")]
+    #[test_case(false, false, PARTIAL; "rule_disabled_prose")]
+    #[test_case(true, true, PARTIAL; "master_disabled_missing_report")]
+    #[test_case(false, true, PARTIAL; "rule_disabled_missing_report")]
+    #[test_case(true, true, ""; "master_disabled_empty")]
+    #[test_case(false, true, ""; "rule_disabled_empty")]
+    fn disabled_truncation_is_not_a_report_or_a_report_retry(
+        master: bool,
+        validating: bool,
+        text: &str,
+    ) {
+        smol::block_on(async {
+            let provider = ScriptedProvider::new(vec![truncated_response(text, FIRST_TURN)]);
+            let observed = Arc::clone(&provider.requests);
+            let mut ctx = ctx_with(AgentMode::Build, provider);
+            let steering = Arc::make_mut(&mut ctx.config.steering);
+            if master {
+                steering.enabled = Some(false);
+            } else {
+                steering.rules.truncation.enabled = Some(false);
+            }
+            let outcome = run_task(
+                &ctx,
+                TaskRequest {
+                    output_schema: validating.then(answer_schema),
+                    ..request(TaskIdentity::Derive, None)
+                },
+            )
+            .await;
+            assert!(!outcome.success && !outcome.cancelled);
+            assert_eq!(outcome.output, Value::Null);
+            assert_eq!(
+                outcome.error,
+                Some(failure_message(subagent::PromptFailure {
+                    error: subagent::TRUNCATED.into(),
+                    partial: (!text.is_empty()).then(|| text.into()),
+                }))
+            );
+            assert_eq!(observed.lock().unwrap().len(), 1);
+            assert_eq!(
+                outcome.tokens_used,
+                u64::from(FIRST_TURN.total_input() + FIRST_TURN.output)
+            );
+            assert_retired(&ctx, CALL_ID);
+        });
+    }
+
+    #[test_case(1, None, false; "rule_limit")]
+    #[test_case(DEFAULT_TRUNCATION_ATTEMPTS, None, true; "default_limit_missing_report")]
+    #[test_case(DEFAULT_TRUNCATION_ATTEMPTS, Some(1), true; "combined_limit")]
+    #[test_case(DEFAULT_TRUNCATION_ATTEMPTS, Some(0), true; "zero_budget")]
+    fn exhausted_truncation_retains_fragments_and_usage(
+        attempts: u32,
+        budget: Option<u32>,
+        validating: bool,
+    ) {
+        smol::block_on(async {
+            let responses = attempts.min(budget.unwrap_or(attempts)) + 1;
+            let provider = ScriptedProvider::new(
+                (0..responses)
+                    .map(|_| truncated_response(PARTIAL, FIRST_TURN))
+                    .collect(),
+            );
+            let observed = Arc::clone(&provider.requests);
+            let mut ctx = ctx_with(AgentMode::Build, provider);
+            let steering = Arc::make_mut(&mut ctx.config.steering);
+            steering.rules.truncation.max_attempts = Some(attempts);
+            steering.max_recoveries = budget;
+            let outcome = run_task(
+                &ctx,
+                TaskRequest {
+                    output_schema: validating.then(answer_schema),
+                    ..request(TaskIdentity::Derive, None)
+                },
+            )
+            .await;
+            assert!(!outcome.success && !outcome.cancelled);
+            assert_eq!(outcome.output, Value::Null);
+            assert_eq!(
+                outcome.error,
+                Some(failure_message(subagent::PromptFailure {
+                    error: AgentError::SteeringExhausted {
+                        rule: TRUNCATION_RULE.into()
+                    }
+                    .to_string(),
+                    partial: Some(PARTIAL.repeat(responses as usize)),
+                }))
+            );
+            assert_eq!(observed.lock().unwrap().len(), responses as usize);
+            assert_eq!(
+                outcome.tokens_used,
+                u64::from(responses * (FIRST_TURN.total_input() + FIRST_TURN.output))
+            );
+            assert_retired(&ctx, CALL_ID);
+        });
+    }
+
+    #[test]
+    fn ordinary_tool_responses_do_not_spend_task_truncation_attempts() {
+        smol::block_on(async {
+            let mut responses: Vec<_> = (0..ORDINARY_TOOL_ROUNDS)
+                .map(|round| {
+                    response(
+                        vec![ContentBlock::tool_use(
+                            format!("report-{round}"),
+                            STRUCTURED_OUTPUT_TOOL,
+                            json!({ REQUIRED_FIELD: round.to_string() }),
+                        )],
+                        StopReason::ToolUse,
+                        FIRST_TURN,
+                    )
+                })
+                .collect();
+            responses.extend(
+                (0..DEFAULT_TRUNCATION_ATTEMPTS).map(|_| truncated_response(PARTIAL, FIRST_TURN)),
+            );
+            responses.push(text_response(SUMMARY, SECOND_TURN));
+            let provider = ScriptedProvider::new(responses);
+            let observed = Arc::clone(&provider.requests);
+            let ctx = ctx_with(AgentMode::Build, provider);
+            let outcome = run_task(
+                &ctx,
+                TaskRequest {
+                    output_schema: Some(answer_schema()),
+                    ..request(TaskIdentity::Derive, None)
+                },
+            )
+            .await;
+            assert_eq!(outcome.error, None);
+            assert_eq!(
+                outcome.output,
+                json!({ REQUIRED_FIELD: (ORDINARY_TOOL_ROUNDS - 1).to_string() })
+            );
+            let initial_responses = ORDINARY_TOOL_ROUNDS + DEFAULT_TRUNCATION_ATTEMPTS;
+            assert_eq!(
+                observed.lock().unwrap().len(),
+                initial_responses as usize + 1
+            );
+            assert_eq!(
+                outcome.tokens_used,
+                u64::from(
+                    initial_responses * (FIRST_TURN.total_input() + FIRST_TURN.output)
+                        + SECOND_TURN.total_input()
+                        + SECOND_TURN.output
+                )
+            );
+        });
+    }
+
+    #[test_case(1, None, TRUNCATION_RULE; "truncation_allowance")]
+    #[test_case(DEFAULT_TRUNCATION_ATTEMPTS, Some(2), TRUNCATION_RULE; "combined_allowance")]
+    #[test_case(DEFAULT_TRUNCATION_ATTEMPTS, Some(1), MISSING_REPORT_RULE; "truncation_spends_combined_allowance")]
+    fn report_corrections_do_not_refill_truncation(
+        attempts: u32,
+        budget: Option<u32>,
+        exhausted_rule: &str,
+    ) {
+        smol::block_on(async {
+            let mut responses = vec![
+                truncated_response(PARTIAL, FIRST_TURN),
+                text_response(SUMMARY, SECOND_TURN),
+            ];
+            if exhausted_rule == TRUNCATION_RULE {
+                responses.push(truncated_response(PROMPT, FIRST_TURN));
+            }
+            let requests = responses.len();
+            let provider = ScriptedProvider::new(responses);
+            let observed = Arc::clone(&provider.requests);
+            let mut ctx = ctx_with(AgentMode::Build, provider);
+            let steering = Arc::make_mut(&mut ctx.config.steering);
+            steering.rules.truncation.max_attempts = Some(attempts);
+            steering.max_recoveries = budget;
+            let outcome = run_task(
+                &ctx,
+                TaskRequest {
+                    output_schema: Some(answer_schema()),
+                    ..request(TaskIdentity::Derive, None)
+                },
+            )
+            .await;
+            assert!(!outcome.success);
+            let error = outcome.error.as_deref().unwrap();
+            assert!(
+                error.contains(
+                    &AgentError::SteeringExhausted {
+                        rule: exhausted_rule.into()
+                    }
+                    .to_string()
+                )
+            );
+            assert!(error.contains(if exhausted_rule == TRUNCATION_RULE {
+                PROMPT
+            } else {
+                PARTIAL
+            }));
+            assert_eq!(observed.lock().unwrap().len(), requests);
+            assert_eq!(
+                outcome.tokens_used,
+                (requests as u64 - 1) * u64::from(FIRST_TURN.total_input() + FIRST_TURN.output)
+                    + u64::from(SECOND_TURN.total_input() + SECOND_TURN.output)
+            );
         });
     }
 
@@ -1687,21 +1915,33 @@ mod tests {
         });
     }
 
-    #[test_case(None; "explicit_resume")]
-    #[test_case(Some(PROMPT); "external_prompt")]
-    fn an_external_invocation_refreshes_the_empty_episode(message: Option<&str>) {
+    #[test_case(None, StopReason::EndTurn; "empty_explicit_resume")]
+    #[test_case(Some(PROMPT), StopReason::EndTurn; "empty_external_prompt")]
+    #[test_case(None, StopReason::MaxTokens; "truncation_explicit_resume")]
+    #[test_case(Some(PROMPT), StopReason::MaxTokens; "truncation_external_prompt")]
+    fn an_external_invocation_refreshes_the_recovery_allowance(
+        message: Option<&str>,
+        stop: StopReason,
+    ) {
         smol::block_on(async {
+            let text = if stop == StopReason::MaxTokens {
+                PARTIAL
+            } else {
+                ""
+            };
+            let incomplete =
+                |usage| response(vec![ContentBlock::Text { text: text.into() }], stop, usage);
             let provider = ScriptedProvider::new(vec![
-                text_response("", FIRST_TURN),
-                text_response("", FIRST_TURN),
-                text_response("", SECOND_TURN),
+                incomplete(FIRST_TURN),
+                incomplete(FIRST_TURN),
+                incomplete(SECOND_TURN),
                 text_response(SUMMARY, SECOND_TURN),
             ]);
+            let observed = Arc::clone(&provider.requests);
             let mut ctx = ctx_with(AgentMode::Build, provider);
-            Arc::make_mut(&mut ctx.config.steering)
-                .rules
-                .empty_response
-                .max_idle = Some(1);
+            let steering = Arc::make_mut(&mut ctx.config.steering);
+            steering.rules.empty_response.max_idle = Some(1);
+            steering.rules.truncation.max_attempts = Some(1);
             let mut session = OpenSession(
                 subagent::open_task(
                     &ctx,
@@ -1721,7 +1961,12 @@ mod tests {
             assert_eq!(
                 failure.error,
                 AgentError::SteeringExhausted {
-                    rule: EMPTY_RESPONSE_RULE.into()
+                    rule: if stop == StopReason::MaxTokens {
+                        TRUNCATION_RULE
+                    } else {
+                        EMPTY_RESPONSE_RULE
+                    }
+                    .into()
                 }
                 .to_string()
             );
@@ -1731,25 +1976,34 @@ mod tests {
                 .await
                 .map_err(failure_message)
                 .unwrap();
-            assert_eq!(reply.text, SUMMARY);
+            assert_eq!(reply.text, format!("{text}{SUMMARY}"));
             let mut expected_usage = FIRST_TURN;
             expected_usage += FIRST_TURN;
             expected_usage += SECOND_TURN;
             expected_usage += SECOND_TURN;
             assert_eq!(session.0.usage(), expected_usage);
+            assert_eq!(reply.input_tokens, expected_usage.total_input());
+            assert_eq!(reply.output_tokens, expected_usage.output);
+            assert_eq!(observed.lock().unwrap().len(), 4);
         });
     }
 
     #[test_case(StopReason::EndTurn, false; "new_answer")]
     #[test_case(StopReason::MaxTokens, false; "truncation_chain")]
     #[test_case(StopReason::EndTurn, true; "usage_on_failure")]
+    #[test_case(StopReason::MaxTokens, true; "truncation_budget_and_fragments_on_failure")]
     fn subagent_output_and_usage_survive_compaction(stop: StopReason, fail: bool) {
         smol::block_on(async {
             let initial_usage = TokenUsage {
                 input: COMPACTION_INPUT_TOKENS,
                 ..FIRST_TURN
             };
-            let provider = ScriptedProvider::new(vec![
+            let exhausted_truncation = fail && stop == StopReason::MaxTokens;
+            let mut responses = Vec::new();
+            if exhausted_truncation {
+                responses.push(truncated_response(PROMPT, FIRST_TURN));
+            }
+            responses.extend([
                 response(
                     vec![ContentBlock::Text {
                         text: PARTIAL.into(),
@@ -1758,11 +2012,21 @@ mod tests {
                     initial_usage,
                 ),
                 text_response(COMPACTED_SUMMARY, SECOND_TURN),
-                text_response(if fail { "" } else { SUMMARY }, SECOND_TURN),
+                if exhausted_truncation {
+                    truncated_response(SUMMARY, SECOND_TURN)
+                } else {
+                    text_response(if fail { "" } else { SUMMARY }, SECOND_TURN)
+                },
             ]);
+            let provider = ScriptedProvider::new(responses);
             let observed = Arc::clone(&provider.requests);
             let mut ctx = ctx_with(AgentMode::Build, provider);
-            if fail {
+            if exhausted_truncation {
+                Arc::make_mut(&mut ctx.config.steering)
+                    .rules
+                    .truncation
+                    .max_attempts = Some(2);
+            } else if fail {
                 Arc::make_mut(&mut ctx.config.steering).max_recoveries = Some(0);
             }
             let mut model = Model::clone(&ctx.model);
@@ -1794,13 +2058,22 @@ mod tests {
             );
             let reply = session.0.prompt(None).await;
             if fail {
+                let failure = reply.err().unwrap();
                 assert_eq!(
-                    reply.err().unwrap().error,
+                    failure.error,
                     AgentError::SteeringExhausted {
-                        rule: EMPTY_RESPONSE_RULE.into()
+                        rule: if exhausted_truncation {
+                            TRUNCATION_RULE
+                        } else {
+                            EMPTY_RESPONSE_RULE
+                        }
+                        .into()
                     }
                     .to_string()
                 );
+                if exhausted_truncation {
+                    assert_eq!(failure.partial, Some(format!("{PROMPT}{PARTIAL}{SUMMARY}")));
+                }
             } else {
                 let expected = if stop == StopReason::MaxTokens {
                     format!("{PARTIAL}{SUMMARY}")
@@ -1810,17 +2083,160 @@ mod tests {
                 assert_eq!(reply.map_err(failure_message).unwrap().text, expected);
             }
             let mut expected_usage = initial_usage;
+            if exhausted_truncation {
+                expected_usage += FIRST_TURN;
+            }
             expected_usage += SECOND_TURN;
             expected_usage += SECOND_TURN;
             assert_eq!(session.0.usage(), expected_usage);
             let observed = observed.lock().unwrap();
-            assert_eq!(observed.len(), 3);
-            assert!(observed[2].len() < COMPACTION_HISTORY_MESSAGES);
+            assert_eq!(observed.len(), if exhausted_truncation { 4 } else { 3 });
+            let final_request = observed.last().unwrap();
+            assert!(final_request.len() < COMPACTION_HISTORY_MESSAGES);
             assert!(
-                observed[2]
+                final_request
                     .iter()
                     .any(|message| message.is_compaction_summary)
             );
+        });
+    }
+
+    #[test]
+    fn resumed_cancellation_retains_only_the_truncation_chain_across_compaction() {
+        smol::block_on(async {
+            let (trigger, cancel) = CancelToken::new();
+            let initial_usage = TokenUsage {
+                input: COMPACTION_INPUT_TOKENS,
+                ..FIRST_TURN
+            };
+            let mut commentary = structured_output_call(json!({ REQUIRED_FIELD: PROMPT }));
+            commentary.message.content.insert(
+                0,
+                ContentBlock::Text {
+                    text: PROMPT.into(),
+                },
+            );
+            let provider = ScriptedProvider {
+                cancel_when_exhausted: Mutex::new(Some(trigger)),
+                cancel_partial: Some(SUMMARY),
+                ..ScriptedProvider::new(vec![
+                    commentary,
+                    truncated_response(PARTIAL, initial_usage),
+                    text_response(COMPACTED_SUMMARY, SECOND_TURN),
+                ])
+            };
+            let observed = Arc::clone(&provider.requests);
+            let mut ctx = ctx_with(AgentMode::Build, provider);
+            ctx.cancel = cancel;
+            Arc::make_mut(&mut ctx.model).context_window = COMPACTION_CONTEXT_WINDOW;
+            let mut history: Vec<_> = (0..COMPACTION_HISTORY_MESSAGES)
+                .map(|_| Message::user(PROMPT.repeat(COMPACTION_HISTORY_REPEATS)))
+                .collect();
+            history.push(text_response(BOOM, FIRST_TURN).message);
+            ctx.subagent_history
+                .reserve(FRESH_ID)
+                .unwrap()
+                .complete(history);
+            let (definition, tools) = tool_for(&answer_schema()).unwrap();
+            let mut session = OpenSession(
+                subagent::open_generic(
+                    &ctx,
+                    subagent::GenericOptions {
+                        name: LABEL.into(),
+                        task_id: Some(FRESH_ID.into()),
+                        model_spec: None,
+                        system: PROMPT.into(),
+                        tools: json!([definition]),
+                        audience: None,
+                        thinking: None,
+                        fast: None,
+                        mcp: Some(false),
+                        local_tools: tools,
+                    },
+                )
+                .await
+                .unwrap(),
+            );
+            let failure = session.0.prompt(None).await.err().unwrap();
+            assert_eq!(failure.error, subagent::CANCELLED);
+            let partial = failure.partial.unwrap();
+            assert!(
+                partial.starts_with(&format!("{PARTIAL}{SUMMARY}")),
+                "{partial}"
+            );
+            for fragment in [PARTIAL, SUMMARY] {
+                assert_eq!(partial.matches(fragment).count(), 1);
+            }
+            for excluded in [PROMPT, BOOM, COMPACTED_SUMMARY] {
+                assert!(!partial.contains(excluded), "{partial}");
+            }
+            let observed = observed.lock().unwrap();
+            assert_eq!(observed.len(), 4);
+            let final_request = observed.last().unwrap();
+            assert!(final_request.len() < COMPACTION_HISTORY_MESSAGES);
+            assert!(
+                final_request
+                    .iter()
+                    .any(|message| message.is_compaction_summary)
+            );
+        });
+    }
+
+    #[test_case(false, false; "empty_summary")]
+    #[test_case(true, false; "reasoning_only_summary")]
+    #[test_case(false, true; "transport_failure")]
+    fn failed_compaction_bills_only_completed_requests(reasoning: bool, transport: bool) {
+        smol::block_on(async {
+            let initial_usage = TokenUsage {
+                input: COMPACTION_INPUT_TOKENS,
+                ..FIRST_TURN
+            };
+            let mut responses = vec![truncated_response(PARTIAL, initial_usage)];
+            if !transport {
+                let content = if reasoning {
+                    vec![ContentBlock::Thinking {
+                        thinking: COMPACTED_SUMMARY.into(),
+                        signature: None,
+                        duration_ms: None,
+                        interrupted: false,
+                        responses: None,
+                    }]
+                } else {
+                    Vec::new()
+                };
+                responses.push(response(content, StopReason::EndTurn, SECOND_TURN));
+            }
+            let provider = ScriptedProvider::new(responses);
+            let observed = Arc::clone(&provider.requests);
+            let mut ctx = ctx_with(AgentMode::Build, provider);
+            Arc::make_mut(&mut ctx.model).context_window = COMPACTION_CONTEXT_WINDOW;
+            let outcome = run_task(&ctx, request(TaskIdentity::Derive, None)).await;
+            assert!(!outcome.success && !outcome.cancelled);
+            assert_eq!(outcome.output, Value::Null);
+            let error = if transport {
+                AgentError::Config {
+                    message: SCRIPT_EXHAUSTED.into(),
+                }
+            } else {
+                AgentError::EmptySummary
+            };
+            assert_eq!(
+                outcome.error,
+                Some(failure_message(subagent::PromptFailure {
+                    error: error.to_string(),
+                    partial: Some(PARTIAL.into()),
+                }))
+            );
+            let mut expected_usage = initial_usage;
+            if !transport {
+                expected_usage += SECOND_TURN;
+            }
+            assert_eq!(
+                outcome.tokens_used,
+                u64::from(expected_usage.total_input() + expected_usage.output)
+            );
+            assert_eq!(observed.lock().unwrap().len(), 2);
+            assert_retired(&ctx, CALL_ID);
         });
     }
 
@@ -1966,16 +2382,19 @@ mod tests {
         });
     }
 
-    #[test]
-    fn a_valid_report_does_not_swallow_cancellation_or_its_partial_text() {
+    #[test_case(false; "valid_report")]
+    #[test_case(true; "truncated_response")]
+    fn cancellation_keeps_its_streamed_tail_after_a_completed_response(truncated: bool) {
         smol::block_on(async {
             let (trigger, cancel) = CancelToken::new();
             let provider = ScriptedProvider {
                 cancel_when_exhausted: Mutex::new(Some(trigger)),
                 cancel_partial: Some(PARTIAL),
-                ..ScriptedProvider::new(vec![structured_output_call(
-                    json!({ REQUIRED_FIELD: SUMMARY }),
-                )])
+                ..ScriptedProvider::new(vec![if truncated {
+                    truncated_response(SUMMARY, FIRST_TURN)
+                } else {
+                    structured_output_call(json!({ REQUIRED_FIELD: SUMMARY }))
+                }])
             };
             let observed = Arc::clone(&provider.requests);
             let mut ctx = ctx_with(AgentMode::Build, provider);
@@ -1991,6 +2410,9 @@ mod tests {
             assert!(outcome.cancelled && !outcome.success);
             assert_eq!(outcome.output, Value::Null);
             assert!(outcome.error.as_deref().unwrap().contains(PARTIAL));
+            if truncated {
+                assert!(outcome.error.as_deref().unwrap().contains(SUMMARY));
+            }
             assert_eq!(observed.lock().unwrap().len(), 2);
             assert_eq!(
                 outcome.tokens_used,

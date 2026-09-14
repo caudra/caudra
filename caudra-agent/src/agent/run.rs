@@ -301,8 +301,6 @@ pub struct Agent<'h> {
     retry_now: Nudge,
     total_usage: TokenUsage,
     measured: Option<MeasuredContext>,
-    // Legacy truncation eligibility uses this Agent's response count. Invocation
-    // hard limits instead use Steering, which survives automatic report corrections.
     num_turns: u32,
     recent_calls: RecentCalls,
     /// What the last response called its tools, kept because the next one
@@ -475,6 +473,18 @@ impl<'h> Agent<'h> {
 
     pub fn response_text(&self) -> Option<&str> {
         self.response_text.as_deref()
+    }
+
+    fn record_response_text(&mut self, text: Option<String>) {
+        // Only truncation joins requests into one answer. This also preserves an
+        // interrupted continuation across compaction without replaying commentary.
+        if self.continuing_response {
+            if let Some(text) = text {
+                self.response_text.get_or_insert_default().push_str(&text);
+            }
+        } else {
+            self.response_text = text;
+        }
     }
 
     pub(crate) fn usage(&self) -> TokenUsage {
@@ -1058,9 +1068,9 @@ impl<'h> Agent<'h> {
                         })
                         .collect();
                 if !streamed.is_empty() {
-                    content.push(ContentBlock::Text {
-                        text: format!("{streamed}\n\n{CANCELLED_TEXT_NOTE}"),
-                    });
+                    let text = format!("{streamed}\n\n{CANCELLED_TEXT_NOTE}");
+                    self.record_response_text(Some(text.clone()));
+                    content.push(ContentBlock::Text { text });
                 }
                 if !content.is_empty() {
                     self.history.push(Message {
@@ -1137,17 +1147,7 @@ impl<'h> Agent<'h> {
             self.response_text = None;
             self.process_tool_calls(response).await?
         } else {
-            // Keep only a single answer, joining requests solely when truncation
-            // scheduled the continuation. This run-local buffer survives compaction
-            // without pulling in tool commentary or an earlier invocation's report.
-            let text = steering::visible_text(&response.message);
-            if self.continuing_response {
-                if let Some(text) = text {
-                    self.response_text.get_or_insert_default().push_str(&text);
-                }
-            } else {
-                self.response_text = text;
-            }
+            self.record_response_text(steering::visible_text(&response.message));
             if empty {
                 response
                     .message
@@ -1212,10 +1212,7 @@ impl<'h> Agent<'h> {
             Some(Recovery::Protocol)
         } else if usable_report {
             None
-        } else if !has_tools
-            && stop_reason == Some(StopReason::MaxTokens)
-            && self.num_turns <= self.config.max_continuation_turns
-        {
+        } else if !has_tools && stop_reason == Some(StopReason::MaxTokens) {
             Some(Recovery::Truncated)
         } else if empty {
             Some(Recovery::Empty {
@@ -1244,7 +1241,9 @@ impl<'h> Agent<'h> {
         if usable_report {
             return Ok(TurnOutcome::Done(DoneReason::EndTurn));
         }
-        let outcome = if has_tools || compacted {
+        // Context maintenance alone cannot reopen a disabled truncation recovery.
+        // Explicit user input and goal evaluation retain their own continuation policy.
+        let outcome = if has_tools || (compacted && stop_reason != Some(StopReason::MaxTokens)) {
             TurnOutcome::Continue
         } else {
             self.goal_completion(stop_reason.into()).await?
@@ -1726,7 +1725,7 @@ impl<'h> Agent<'h> {
             self.timeouts,
             &self.model_policy,
         )?;
-        let usage = compaction::compact_history(
+        let compacted = compaction::compact_history(
             &*compact_provider,
             &compact_model,
             self.history,
@@ -1736,9 +1735,11 @@ impl<'h> Agent<'h> {
             &self.config,
         )
         .await?;
+        let usage = compacted.usage;
         let cost = compact_model.billed_cost(&usage, false);
         self.total_usage += usage;
         self.goal.record_usage(usage, cost, compact_model.billing);
+        compacted.result?;
         self.rollback_len = self.history.len();
         steering::lock(&self.steering).reset_patterns();
         self.recent_calls =
@@ -2010,11 +2011,11 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
-    use caudra_config::steering::{SteeringConfig, SteeringPreset};
+    use caudra_config::steering::SteeringConfig;
     use caudra_providers::provider::{BoxFuture, Provider};
     use caudra_providers::{
-        ContentBlock, Message, Model, ProviderEvent, RequestOptions, Role, StopReason,
-        StreamResponse, TokenUsage,
+        ContentBlock, Message, Model, ProviderEvent, RequestOptions, Role, SteeringKind,
+        StopReason, StreamResponse, TokenUsage,
     };
     use caudra_workspace::PlanRef;
     use serde_json::Value;
@@ -2033,6 +2034,13 @@ mod tests {
     const STEERING_EMPTY: &str = "empty_response";
     const STEERING_PROTOCOL: &str = "protocol_mismatch";
     const STEERING_TOOL_REPAIR: &str = "tool_repair";
+    const STEERING_TRUNCATION: &str = "truncation";
+    const TRUNCATION_ATTEMPTS: u32 = 3;
+    const RECOVERY_BUDGET: u32 = 32;
+    const TOOL_ROUNDS: u32 = 5;
+    const OUTPUT_TOKENS: u32 = 7;
+    const TEST_TOOL: &str = "test_tool";
+    const TEST_TOOL_RESULT: &str = "completed";
     const VISIBLE_RESPONSE: &str = "response";
     const STEERING_CUSTOM: &str = "Custom runtime guidance.";
     const INVALID_TOOL: &str = "invalid_tool";
@@ -4080,7 +4088,7 @@ mod tests {
     /// budgets runs out: the continuation limit or the caller's `max_turns`.
     #[test_case(&[StopReason::EndTurn], None, 1, DoneReason::EndTurn ; "end_turn_completes")]
     #[test_case(&[StopReason::MaxTokens, StopReason::EndTurn], None, 2, DoneReason::EndTurn ; "max_tokens_continues")]
-    #[test_case(&[StopReason::MaxTokens; 4], None, 4, DoneReason::MaxTokens ; "max_tokens_gives_up_after_limit")]
+    #[test_case(&[StopReason::MaxTokens, StopReason::MaxTokens, StopReason::MaxTokens, StopReason::EndTurn], None, 4, DoneReason::EndTurn ; "last_retry_can_complete")]
     #[test_case(&[StopReason::MaxTokens, StopReason::EndTurn], Some(1), 1, DoneReason::MaxTurns ; "turn_budget_exhausted")]
     fn turn_counting(
         stops: &[StopReason],
@@ -4099,7 +4107,7 @@ mod tests {
 
     #[test_case(true; "steering_enabled")]
     #[test_case(false; "steering_disabled")]
-    fn rebuilt_agents_share_hard_limits_without_changing_truncation_counting(enabled: bool) {
+    fn rebuilt_agents_share_hard_limits(enabled: bool) {
         smol::block_on(async {
             let mut history = History::default();
             let (mut first, _events) = make_agent(
@@ -4122,6 +4130,196 @@ mod tests {
             );
             assert_eq!(agent.num_turns, 1);
             assert_eq!(steering::lock(&agent.steering).responses(), 2);
+        });
+    }
+
+    #[test_case(None, None, true, false; "default_last_retry_succeeds_after_tools")]
+    #[test_case(None, None, false, false; "default_rule_exhaustion_after_tools")]
+    #[test_case(Some(1), None, false, false; "combined_exhaustion")]
+    #[test_case(Some(0), None, false, true; "zero_budget_empty_max_tokens")]
+    #[test_case(None, Some(1), false, false; "custom_rule_limit")]
+    fn truncation_retries_count_corrections_not_tool_rounds(
+        budget: Option<u32>,
+        limit: Option<u32>,
+        succeeds: bool,
+        empty: bool,
+    ) {
+        smol::block_on(async {
+            let attempts = budget
+                .unwrap_or(RECOVERY_BUDGET)
+                .min(limit.unwrap_or(TRUNCATION_ATTEMPTS));
+            let mut responses: Vec<_> = (0..TOOL_ROUNDS)
+                .map(|round| tool_use_response(TEST_TOOL, serde_json::json!({"round": round})))
+                .collect();
+            for index in 0..=attempts {
+                let mut response = if empty {
+                    empty_response()
+                } else {
+                    text_response(StopReason::MaxTokens)
+                };
+                response.stop_reason = Some(if succeeds && index == attempts {
+                    StopReason::EndTurn
+                } else {
+                    StopReason::MaxTokens
+                });
+                responses.push(response);
+            }
+            for response in &mut responses {
+                response.usage.output = OUTPUT_TOKENS;
+            }
+            let calls = Arc::new(AtomicUsize::new(0));
+            let executed = Arc::clone(&calls);
+            let local_tools = Arc::new(HashMap::from([(
+                TEST_TOOL.to_owned(),
+                crate::tools::local_tool(move |_, _| {
+                    executed.fetch_add(1, Ordering::SeqCst);
+                    Box::pin(async { Ok(TEST_TOOL_RESULT.into()) })
+                }),
+            )]));
+            let mut history = History::default();
+            let (agent, events) = make_agent(MockProvider::new(responses), &mut history);
+            let mut agent = agent.with_local_tools(local_tools);
+            let config = Arc::make_mut(&mut agent.config.steering);
+            config.max_recoveries = budget;
+            config.rules.truncation.max_attempts = limit;
+            let result = agent.run(default_input()).await;
+            if succeeds {
+                assert_eq!(result.unwrap(), DoneReason::EndTurn);
+            } else {
+                assert!(
+                    matches!(result, Err(AgentError::SteeringExhausted { rule }) if rule == STEERING_TRUNCATION)
+                );
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), TOOL_ROUNDS as usize);
+            assert_eq!(agent.num_turns, TOOL_ROUNDS + attempts + 1);
+            assert_eq!(agent.usage().output, agent.num_turns * OUTPUT_TOKENS);
+            assert_eq!(
+                agent.response_text(),
+                (!empty)
+                    .then(|| VISIBLE_RESPONSE.repeat((attempts + 1) as usize))
+                    .as_deref()
+            );
+            let origins: Vec<_> = agent
+                .history
+                .as_slice()
+                .iter()
+                .filter_map(|message| message.steering.as_ref())
+                .collect();
+            assert_eq!(origins.len(), attempts as usize);
+            assert!(
+                origins
+                    .iter()
+                    .all(|origin| origin.rule == STEERING_TRUNCATION
+                        && origin.kind == SteeringKind::Recovery)
+            );
+            assert!(
+                !events
+                    .try_iter()
+                    .any(|event| matches!(event.event, AgentEvent::Nudge))
+            );
+        });
+    }
+
+    #[test_case(true, false, false; "master_disabled_text")]
+    #[test_case(false, false, false; "rule_disabled_text")]
+    #[test_case(true, true, false; "master_disabled_empty")]
+    #[test_case(false, true, false; "rule_disabled_empty")]
+    #[test_case(true, false, true; "master_disabled_text_compacts")]
+    #[test_case(false, false, true; "rule_disabled_text_compacts")]
+    #[test_case(true, true, true; "master_disabled_empty_compacts")]
+    #[test_case(false, true, true; "rule_disabled_empty_compacts")]
+    fn disabled_truncation_preserves_max_tokens(master: bool, empty: bool, compact: bool) {
+        smol::block_on(async {
+            let mut response = if empty {
+                empty_response()
+            } else {
+                text_response(StopReason::MaxTokens)
+            };
+            response.stop_reason = Some(StopReason::MaxTokens);
+            response.usage.output = OUTPUT_TOKENS;
+            let mut responses = Vec::new();
+            if compact {
+                response.usage.input = LARGE_CONTEXT;
+            }
+            responses.push(response);
+            if compact {
+                responses.push(text_response(StopReason::EndTurn));
+            }
+            let provider = MockProvider::new(responses);
+            let requests = Arc::clone(&provider.captured_models);
+            let mut history = History::new(vec![Message::user(GO.into()); 10]);
+            let (mut agent, events) = make_agent(provider, &mut history);
+            agent.auto_compact = compact;
+            agent.model = Arc::new(small_context_model(200_000, 8_192));
+            let config = Arc::make_mut(&mut agent.config.steering);
+            config.max_recoveries = Some(0);
+            if master {
+                config.enabled = Some(false);
+            } else {
+                config.rules.truncation.enabled = Some(false);
+            }
+            assert_eq!(
+                agent.run(default_input()).await.unwrap(),
+                DoneReason::MaxTokens
+            );
+            assert_eq!(agent.num_turns, 1);
+            assert_eq!(requests.lock().unwrap().len(), 1 + usize::from(compact));
+            assert_eq!(agent.usage().output, OUTPUT_TOKENS);
+            assert_eq!(agent.response_text(), (!empty).then_some(VISIBLE_RESPONSE));
+            assert!(
+                !agent
+                    .history
+                    .as_slice()
+                    .iter()
+                    .any(|message| message.steering.is_some())
+            );
+            let events = drain_events(&events);
+            assert_eq!(
+                has_event(&events, |event| matches!(event, AgentEvent::CompactionDone)),
+                compact
+            );
+            assert!(!has_event(&events, |event| matches!(
+                event,
+                AgentEvent::Nudge
+            )));
+        });
+    }
+
+    #[test_case(false; "master_disabled")]
+    #[test_case(true; "rule_disabled")]
+    fn disabled_truncation_leaves_goal_continuation_independent(rule_only: bool) {
+        smol::block_on(async {
+            let goal = GoalHandle::default();
+            goal.set(GO).unwrap();
+            let mut history = History::default();
+            let (agent, _events) = make_agent(
+                MockProvider::new(vec![
+                    text_response(StopReason::MaxTokens),
+                    goal_response(false, false, GO),
+                    text_response(StopReason::EndTurn),
+                    goal_response(true, false, GO),
+                ]),
+                &mut history,
+            );
+            let mut agent = agent.with_goal(goal);
+            let config = Arc::make_mut(&mut agent.config.steering);
+            if rule_only {
+                config.rules.truncation.enabled = Some(false);
+            } else {
+                config.enabled = Some(false);
+            }
+            assert_eq!(
+                agent.run(default_input()).await.unwrap(),
+                DoneReason::EndTurn
+            );
+            assert_eq!(agent.num_turns, 2);
+            assert!(
+                !agent
+                    .history
+                    .as_slice()
+                    .iter()
+                    .any(|message| message.steering.is_some())
+            );
         });
     }
 
@@ -4948,7 +5146,7 @@ mod tests {
     #[test_case("A normal final answer."; "prose")]
     #[test_case(r#"{"name":"shell","arguments":{"command":"pwd"}}"#; "tool_json")]
     #[test_case("```json\n{\"tool\":\"shell\"}\n```"; "fenced_example")]
-    fn enhanced_steering_never_reopens_final_text(text: &str) {
+    fn default_steering_never_reopens_final_text(text: &str) {
         smol::block_on(async {
             let mut history = History::default();
             let (mut agent, _events) = make_agent(
@@ -4957,7 +5155,6 @@ mod tests {
                 }])]),
                 &mut history,
             );
-            Arc::make_mut(&mut agent.config.steering).preset = Some(SteeringPreset::Enhanced);
             Arc::make_mut(&mut agent.config.steering)
                 .rules
                 .no_tool_use
@@ -4998,7 +5195,6 @@ mod tests {
                     MockProvider::new(vec![text_response(StopReason::EndTurn)]),
                     &mut history,
                 );
-                Arc::make_mut(&mut agent.config.steering).preset = Some(SteeringPreset::Enhanced);
                 if has_tools {
                     agent.tools = serde_json::json!([{"name":"shell"}]);
                 }
@@ -5031,7 +5227,6 @@ mod tests {
                 &mut history,
             );
             let mut agent = agent.with_report_ready(Arc::new(AtomicBool::new(ready)));
-            Arc::make_mut(&mut agent.config.steering).preset = Some(SteeringPreset::Enhanced);
             Arc::make_mut(&mut agent.config.steering).max_recoveries = Some(0);
             assert!(
                 matches!(agent.run(default_input()).await, Err(AgentError::SteeringExhausted { rule }) if rule == STEERING_PROTOCOL)
@@ -5058,7 +5253,6 @@ mod tests {
                 })
                 .collect();
             let (mut agent, _events) = make_agent(MockProvider::new(responses), &mut history);
-            Arc::make_mut(&mut agent.config.steering).preset = Some(SteeringPreset::Enhanced);
             assert!(
                 matches!(agent.run(default_input()).await, Err(AgentError::SteeringExhausted { rule }) if rule == STEERING_PROTOCOL)
             );
@@ -5114,6 +5308,7 @@ mod tests {
     #[test_case(None, StopReason::EndTurn, true; "valid_report_missing_prose")]
     #[test_case(None, StopReason::MaxTokens, true; "valid_report_truncated_empty_tail")]
     #[test_case(Some(1), StopReason::EndTurn, false; "turn_limit_wins")]
+    #[test_case(Some(1), StopReason::MaxTokens, false; "turn_limit_preempts_truncation_and_report")]
     fn ready_report_only_relaxes_the_prose_contract(
         max_turns: Option<u32>,
         stop: StopReason,
@@ -5181,14 +5376,17 @@ mod tests {
         }
     }
 
-    #[test_case(false; "empty_contract")]
-    #[test_case(true; "ready_report")]
-    fn cancellation_at_response_boundary_preempts_contracts(ready: bool) {
+    #[test_case(false, StopReason::EndTurn; "empty_contract")]
+    #[test_case(true, StopReason::EndTurn; "ready_report")]
+    #[test_case(false, StopReason::MaxTokens; "truncation")]
+    #[test_case(true, StopReason::MaxTokens; "truncated_ready_report")]
+    fn cancellation_at_response_boundary_preempts_contracts(ready: bool, stop: StopReason) {
         smol::block_on(async {
             let (trigger, cancel) = CancelToken::new();
             let mut history = History::default();
-            let (agent, _events) =
-                make_agent(MockProvider::new(vec![empty_response()]), &mut history);
+            let mut response = empty_response();
+            response.stop_reason = Some(stop);
+            let (agent, _events) = make_agent(MockProvider::new(vec![response]), &mut history);
             let mut agent = agent
                 .with_cancel(cancel)
                 .with_report_ready(Arc::new(AtomicBool::new(ready)))
@@ -5284,10 +5482,186 @@ mod tests {
             agent.do_compact().await.unwrap();
             assert_eq!(agent.response_text(), Some(VISIBLE_RESPONSE));
             if empty_latest {
-                Arc::make_mut(&mut agent.config.steering).enabled = Some(false);
+                Arc::make_mut(&mut agent.config.steering)
+                    .rules
+                    .empty_response
+                    .enabled = Some(false);
                 agent.run(default_input()).await.unwrap();
                 assert_eq!(agent.response_text(), None);
             }
+        });
+    }
+
+    #[test_case(0, false, false; "zero_combined_budget")]
+    #[test_case(1, false, false; "combined_exhaustion")]
+    #[test_case(32, false, false; "truncation_exhaustion")]
+    #[test_case(32, true, false; "last_retry_succeeds")]
+    #[test_case(1, false, true; "spent_combined_allowance_survives_compaction")]
+    #[test_case(32, false, true; "spent_truncation_allowance_survives_compaction")]
+    #[test_case(32, true, true; "fragments_survive_mid_chain_compaction")]
+    fn truncation_compaction_retains_fragments_and_budgets(
+        budget: u32,
+        succeeds: bool,
+        after_first: bool,
+    ) {
+        smol::block_on(async {
+            let attempts = budget.min(TRUNCATION_ATTEMPTS);
+            let mut responses = Vec::new();
+            for attempt in 0..=attempts {
+                let mut response = text_response(if succeeds && attempt == attempts {
+                    StopReason::EndTurn
+                } else {
+                    StopReason::MaxTokens
+                });
+                response.usage.output = OUTPUT_TOKENS;
+                let compact = attempt == u32::from(after_first);
+                if compact {
+                    response.usage.input = LARGE_CONTEXT;
+                }
+                responses.push(response);
+                if compact {
+                    responses.push(text_response(StopReason::EndTurn));
+                }
+            }
+            let mut history = History::new(vec![Message::user(GO.into()); 10]);
+            let (mut agent, events) = make_agent(MockProvider::new(responses), &mut history);
+            agent.auto_compact = true;
+            agent.model = Arc::new(small_context_model(200_000, 8_192));
+            agent.tools = serde_json::json!([{"name": TEST_TOOL}]);
+            let config = Arc::make_mut(&mut agent.config.steering);
+            config.max_recoveries = Some(budget);
+            config.rules.truncation.prompt = Some(STEERING_CUSTOM.into());
+            config.rules.no_tool_use.after_responses = Some(1);
+            let result = agent.run(default_input()).await;
+            if succeeds {
+                assert_eq!(result.unwrap(), DoneReason::EndTurn);
+            } else {
+                assert!(
+                    matches!(result, Err(AgentError::SteeringExhausted { rule }) if rule == STEERING_TRUNCATION)
+                );
+            }
+            assert_eq!(agent.num_turns, attempts + 1);
+            assert_eq!(agent.usage().output, (attempts + 1) * OUTPUT_TOKENS);
+            assert_eq!(
+                agent.response_text(),
+                Some(VISIBLE_RESPONSE.repeat((attempts + 1) as usize).as_str())
+            );
+            let messages: Vec<_> = agent
+                .history
+                .as_slice()
+                .iter()
+                .filter(|message| message.steering.is_some())
+                .collect();
+            assert_eq!(messages.len(), attempts as usize);
+            for message in messages {
+                let origin = message.steering.as_ref().unwrap();
+                assert_eq!(origin.rule, STEERING_TRUNCATION);
+                assert_eq!(origin.kind, SteeringKind::Recovery);
+                assert!(
+                    message
+                        .first_text_content()
+                        .unwrap()
+                        .ends_with(STEERING_CUSTOM)
+                );
+            }
+            assert!(has_event(&drain_events(&events), |event| matches!(
+                event,
+                AgentEvent::CompactionDone
+            )));
+        });
+    }
+
+    #[test_case(false, false; "automatic_report_correction")]
+    #[test_case(true, false; "external_prompt")]
+    #[test_case(true, true; "external_resume")]
+    fn truncation_allowance_survives_report_corrections_but_not_external_invocations(
+        external: bool,
+        resume: bool,
+    ) {
+        smol::block_on(async {
+            let mut history = History::default();
+            let mut responses: Vec<_> = (0..TRUNCATION_ATTEMPTS)
+                .map(|_| text_response(StopReason::MaxTokens))
+                .collect();
+            responses.push(text_response(StopReason::EndTurn));
+            let (mut first, _events) = make_agent(MockProvider::new(responses), &mut history);
+            assert_eq!(
+                first.run(default_input()).await.unwrap(),
+                DoneReason::EndTurn
+            );
+            let shared = Arc::clone(&first.steering);
+            drop(first);
+            let correction = steering::lock(&shared)
+                .report_correction(false)
+                .unwrap()
+                .unwrap();
+            let mut responses = vec![text_response(StopReason::MaxTokens)];
+            if external {
+                responses.push(text_response(StopReason::EndTurn));
+            }
+            let (agent, _events) = make_agent(MockProvider::new(responses), &mut history);
+            let mut agent = if external {
+                agent
+            } else {
+                agent.with_steering(shared)
+            };
+            let input = if resume {
+                resume_input()
+            } else if external {
+                default_input()
+            } else {
+                AgentInput {
+                    message: String::new(),
+                    preamble: vec![correction],
+                    ..default_input()
+                }
+            };
+            let result = agent.run(input).await;
+            if external {
+                assert_eq!(result.unwrap(), DoneReason::EndTurn);
+                assert_eq!(agent.num_turns, 2);
+            } else {
+                assert!(
+                    matches!(result, Err(AgentError::SteeringExhausted { rule }) if rule == STEERING_TRUNCATION)
+                );
+                assert_eq!(agent.num_turns, 1);
+                assert_eq!(agent.response_text(), Some(VISIBLE_RESPONSE));
+            }
+        });
+    }
+
+    #[test_case(false; "new_prompt")]
+    #[test_case(true; "resume")]
+    fn reused_agent_refills_truncation_on_external_run(resume: bool) {
+        smol::block_on(async {
+            let mut responses: Vec<_> = (0..=TRUNCATION_ATTEMPTS)
+                .map(|_| text_response(StopReason::MaxTokens))
+                .collect();
+            responses.extend([
+                text_response(StopReason::MaxTokens),
+                text_response(StopReason::EndTurn),
+            ]);
+            let mut history = History::default();
+            let (mut agent, _events) = make_agent(MockProvider::new(responses), &mut history);
+            assert!(
+                matches!(agent.run(default_input()).await, Err(AgentError::SteeringExhausted { rule }) if rule == STEERING_TRUNCATION)
+            );
+            assert_eq!(
+                agent
+                    .run(if resume {
+                        resume_input()
+                    } else {
+                        default_input()
+                    })
+                    .await
+                    .unwrap(),
+                DoneReason::EndTurn
+            );
+            assert_eq!(
+                agent.response_text(),
+                Some(VISIBLE_RESPONSE.repeat(2).as_str())
+            );
+            assert_eq!(steering::lock(&agent.steering).responses(), 2);
         });
     }
 

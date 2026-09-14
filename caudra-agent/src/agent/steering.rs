@@ -12,6 +12,8 @@ const EMPTY_AFTER_TOOLS: &str = "You just executed tool calls but returned an em
 const EMPTY_IDLE: &str = "You ended your turn without a response. Continue the task, and always end your turn with a text response summarizing what you did.";
 const PROTOCOL_FACT: &str = "The provider indicated tool use, but supplied no tool calls. No tool was executed for this response.";
 const PROTOCOL_PROMPT: &str = "Use the native tool-call interface with valid arguments if a tool is needed; otherwise provide a text answer.";
+const TRUNCATION_FACT: &str = "The previous response was cut off.";
+const TRUNCATION_PROMPT: &str = "Continue from where it stopped without repeating text already returned. Do not replay completed tool calls.";
 const REPORT_STRUCTURED: &str = "The required structured report has not been captured.";
 const REPORT_SUMMARY: &str = "The task ended without a visible summary.";
 const REPORT_PROMPT: &str = "Provide the required task report now, using the reporting tool when structured output is required, or a concise text summary otherwise.";
@@ -33,7 +35,7 @@ const NO_TOOL_RULE: &str = "no_tool_use";
 
 pub(crate) type SharedSteering = Arc<Mutex<Steering>>;
 
-// Shared only across automatic report corrections in one invocation. Pattern
+// Shared across automatic report corrections in one invocation. Pattern
 // resets discard evidence, never allowances; a new external invocation owns a
 // new instance instead of reviving an exhausted one.
 pub(crate) struct Steering {
@@ -42,6 +44,7 @@ pub(crate) struct Steering {
     advisories: u32,
     reports: u32,
     protocols: u32,
+    truncations: u32,
     responses: u64,
     calls: VecDeque<(u64, ToolObservation)>,
     model: Option<String>,
@@ -71,6 +74,7 @@ impl Steering {
             advisories: 0,
             reports: 0,
             protocols: 0,
+            truncations: 0,
             responses: 0,
             calls: VecDeque::new(),
             model: None,
@@ -207,11 +211,7 @@ impl Steering {
 
     pub(super) fn recover(&mut self, recovery: Recovery) -> Result<RecoveryAction, AgentError> {
         if !self.policy.enabled {
-            return Ok(if matches!(recovery, Recovery::Truncated) {
-                RecoveryAction::Continue(None)
-            } else {
-                RecoveryAction::Disabled
-            });
+            return Ok(RecoveryAction::Disabled);
         }
         let (rule, episode, limit, prompt) = match recovery {
             Recovery::Empty {
@@ -249,12 +249,28 @@ impl Steering {
                     )),
                 )
             }
-            Recovery::Truncated => (TRUNCATION_RULE, 0, u32::MAX, None),
+            Recovery::Truncated => {
+                let policy = &self.policy.rules.truncation;
+                if !policy.enabled {
+                    return Ok(RecoveryAction::Disabled);
+                }
+                (
+                    TRUNCATION_RULE,
+                    self.truncations,
+                    policy.max_attempts,
+                    Some(format!(
+                        "{TRUNCATION_FACT}\n\n{}",
+                        policy.prompt.as_deref().unwrap_or(TRUNCATION_PROMPT)
+                    )),
+                )
+            }
             Recovery::ToolRepair => (TOOL_REPAIR_RULE, 0, u32::MAX, None),
         };
         self.charge(rule, episode, limit)?;
         if rule == PROTOCOL_RULE {
             self.protocols += 1;
+        } else if rule == TRUNCATION_RULE {
+            self.truncations += 1;
         }
         Ok(RecoveryAction::Continue(prompt.map(|text| {
             Box::new(Message::steering(text, rule, SteeringKind::Recovery))
@@ -493,14 +509,15 @@ fn cooldown_ready(history: &[&Message], rule: &str, cooldown: u32) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use caudra_config::steering::{SteeringConfig, SteeringPreset};
+    use caudra_config::steering::SteeringConfig;
     use caudra_providers::{ContentBlock, Message, Model, ReasoningSource, Role, SteeringKind};
     use test_case::test_case;
 
     use super::{
         EMPTY_IDLE, EMPTY_RULE, NO_TOOL_RULE, PLANNING_RULE, PROTOCOL_FACT, PROTOCOL_RULE,
         REPETITION_RULE, REPORT_RULE, REPORT_STRUCTURED, REPORT_SUMMARY, Recovery, RecoveryAction,
-        Steering, TEXT_BYTES_LIMIT, eligible_response, normalized_message,
+        Steering, TEXT_BYTES_LIMIT, TRUNCATION_FACT, TRUNCATION_PROMPT, TRUNCATION_RULE,
+        eligible_response, normalized_message,
     };
     use crate::AgentError;
     use crate::agent::tool_dispatch::{ToolObservation, ToolOutcome};
@@ -510,15 +527,10 @@ mod tests {
     const CUSTOM: &str = "Custom guidance, not a rule identity.";
     const TOOL: &str = "file_read";
     const OTHER_MODEL: &str = "other-model";
+    const TRUNCATION_ATTEMPTS: u32 = 3;
 
-    fn enhanced() -> Steering {
-        Steering::new(
-            SteeringConfig {
-                preset: Some(SteeringPreset::Enhanced),
-                ..Default::default()
-            }
-            .resolve(MODEL),
-        )
+    fn default_state() -> Steering {
+        Steering::new(SteeringConfig::default().resolve(MODEL))
     }
 
     fn assistant(text: &str) -> Message {
@@ -540,7 +552,7 @@ mod tests {
     #[test_case(false, 2; "idle")]
     #[test_case(true, 20; "after_tools")]
     fn empty_episode_limits(after_tools: bool, limit: u32) {
-        let mut state = enhanced();
+        let mut state = default_state();
         for nudges in 0..limit {
             assert!(matches!(
                 state.recover(Recovery::Empty {
@@ -559,7 +571,7 @@ mod tests {
     #[test_case(false; "tool_feedback")]
     #[test_case(true; "reset_empty_episodes")]
     fn default_combined_limit_bounds_all_recoverable_transitions(empty: bool) {
-        let mut state = enhanced();
+        let mut state = default_state();
         for _ in 0..32 {
             let recovery = if empty {
                 Recovery::Empty {
@@ -582,7 +594,7 @@ mod tests {
     #[test_case(false; "summary")]
     #[test_case(true; "structured")]
     fn report_corrections_share_combined_allowance(validating: bool) {
-        let mut state = enhanced();
+        let mut state = default_state();
         state.policy.max_recoveries = 2;
         assert!(matches!(
             state.recover(Recovery::ToolRepair),
@@ -609,7 +621,7 @@ mod tests {
     #[test_case(false; "summary")]
     #[test_case(true; "structured")]
     fn report_episode_limit_survives_pattern_reset(validating: bool) {
-        let mut state = enhanced();
+        let mut state = default_state();
         for _ in 0..2 {
             assert!(state.report_correction(validating).unwrap().is_some());
             state.reset_patterns();
@@ -621,8 +633,8 @@ mod tests {
 
     #[test_case(true; "master_disabled")]
     #[test_case(false; "rules_disabled")]
-    fn disabling_does_not_disable_truncation(master: bool) {
-        let mut state = enhanced();
+    fn disabling_suppresses_recovery_without_charging(master: bool) {
+        let mut state = default_state();
         if master {
             state.policy.enabled = false;
         } else {
@@ -630,6 +642,7 @@ mod tests {
             state.policy.rules.protocol_mismatch.enabled = false;
             state.policy.rules.missing_task_report.enabled = false;
             state.policy.rules.repeated_tool_call.enabled = false;
+            state.policy.rules.truncation.enabled = false;
         }
         assert!(matches!(
             state.recover(Recovery::Empty {
@@ -646,15 +659,74 @@ mod tests {
         assert_eq!(state.repeat_threshold(), 0);
         assert!(matches!(
             state.recover(Recovery::Truncated),
-            Ok(RecoveryAction::Continue(None))
+            Ok(RecoveryAction::Disabled)
         ));
-        assert_eq!(state.recoveries, u32::from(!master));
+        assert_eq!(state.recoveries, 0);
+        assert_eq!(state.truncations, 0);
+    }
+
+    #[test_case(false; "default")]
+    #[test_case(true; "custom")]
+    fn truncation_allowance_survives_responses_and_pattern_resets(custom: bool) {
+        let mut state = default_state();
+        if custom {
+            state.policy.rules.truncation.prompt = Some(CUSTOM.into());
+        }
+        for attempt in 0..TRUNCATION_ATTEMPTS {
+            state.observe(vec![call(u64::from(attempt), ToolOutcome::Success)], false);
+            state.observe(Vec::new(), false);
+            state.reset_patterns();
+            let RecoveryAction::Continue(Some(message)) =
+                state.recover(Recovery::Truncated).unwrap()
+            else {
+                panic!()
+            };
+            let guidance = if custom { CUSTOM } else { TRUNCATION_PROMPT };
+            assert_eq!(
+                message.first_text_content(),
+                Some(format!("{TRUNCATION_FACT}\n\n{guidance}").as_str())
+            );
+            assert!(message.is_observation());
+            let origin = message.steering.unwrap();
+            assert_eq!(origin.rule, TRUNCATION_RULE);
+            assert_eq!(origin.kind, SteeringKind::Recovery);
+        }
+        assert!(matches!(
+            state.recover(Recovery::Truncated),
+            Err(AgentError::SteeringExhausted { rule }) if rule == TRUNCATION_RULE
+        ));
+        assert_eq!(state.truncations, TRUNCATION_ATTEMPTS);
+        assert_eq!(state.recoveries, TRUNCATION_ATTEMPTS);
+        assert_eq!(state.advisories, 0);
+    }
+
+    #[test_case(0; "no_combined_allowance")]
+    #[test_case(1; "one_combined_recovery")]
+    #[test_case(32; "rule_limit")]
+    fn truncation_charges_both_allowances_only_on_success(budget: u32) {
+        let mut state = default_state();
+        state.policy.max_recoveries = budget;
+        let attempts = budget.min(TRUNCATION_ATTEMPTS);
+        for _ in 0..attempts {
+            assert!(matches!(
+                state.recover(Recovery::Truncated),
+                Ok(RecoveryAction::Continue(Some(_)))
+            ));
+        }
+        for _ in 0..2 {
+            assert!(matches!(
+                state.recover(Recovery::Truncated),
+                Err(AgentError::SteeringExhausted { rule }) if rule == TRUNCATION_RULE
+            ));
+        }
+        assert_eq!(state.truncations, attempts);
+        assert_eq!(state.recoveries, attempts);
     }
 
     #[test_case(false; "default")]
     #[test_case(true; "custom")]
     fn protocol_limit_and_facts(custom: bool) {
-        let mut state = enhanced();
+        let mut state = default_state();
         if custom {
             state.policy.rules.protocol_mismatch.prompt = Some(CUSTOM.into());
         }
@@ -687,7 +759,7 @@ mod tests {
     #[test_case(3; "period_three")]
     #[test_case(4; "period_four")]
     fn exact_cycles_use_ordered_leaf_facts(period: u64) {
-        let mut state = enhanced();
+        let mut state = default_state();
         let model = Model::from_spec(MODEL).unwrap();
         for index in 0..period * 3 - 1 {
             state.observe(vec![call(index % period, ToolOutcome::Success)], false);
@@ -705,7 +777,7 @@ mod tests {
     #[test_case(true, false, true; "repeated_calls")]
     #[test_case(false, true, true; "repeated_errors")]
     fn planning_requires_evidence_across_responses(repeat: bool, errors: bool, expected: bool) {
-        let mut state = enhanced();
+        let mut state = default_state();
         state.policy.rules.repetition.enabled = false;
         let model = Model::from_spec(MODEL).unwrap();
         for response in 0..3 {
@@ -740,7 +812,7 @@ mod tests {
     #[test_case(2, false; "before_boundary")]
     #[test_case(3, true; "exact_boundary")]
     fn advisory_cooldown_restores_from_metadata(responses: usize, expected: bool) {
-        let mut state = enhanced();
+        let mut state = default_state();
         state.policy.rules.no_tool_use.prompt = Some(CUSTOM.into());
         state.policy.rules.repetition.enabled = false;
         let model = Model::from_spec(MODEL).unwrap();
@@ -757,7 +829,7 @@ mod tests {
     #[test_case(false; "no_inventory")]
     #[test_case(true; "inventory")]
     fn no_tool_advisory_has_a_separate_allowance(has_tools: bool) {
-        let mut state = enhanced();
+        let mut state = default_state();
         state.policy.rules.repetition.enabled = false;
         let model = Model::from_spec(MODEL).unwrap();
         let history = vec![assistant(TEXT); 3];
@@ -790,7 +862,7 @@ mod tests {
     #[test_case(assistant(" \n\t "); "whitespace")]
     fn no_tool_history_excludes_host_and_invisible_messages(message: Message) {
         assert!(!eligible_response(&message));
-        let mut state = enhanced();
+        let mut state = default_state();
         assert!(
             state
                 .advisory(&vec![message; 3], &Model::from_spec(MODEL).unwrap(), true)
@@ -815,13 +887,13 @@ mod tests {
         let mut history = vec![assistant(TEXT); 3];
         history.push(boundary);
         history.push(assistant(TEXT));
-        assert!(enhanced().advisory(&history, &model, true).is_none());
+        assert!(default_state().advisory(&history, &model, true).is_none());
     }
 
     #[test_case(0, false; "retained_tail_not_new_evidence")]
     #[test_case(3, true; "new_responses_after_compaction")]
     fn compacted_tail_cannot_reconstruct_discarded_patterns(new_responses: usize, expected: bool) {
-        let mut state = enhanced();
+        let mut state = default_state();
         let mut history = vec![assistant(TEXT); 3];
         state.report_correction(false).unwrap();
         state.reset_patterns();
@@ -841,7 +913,6 @@ mod tests {
     fn model_changes_discard_patterns_without_refilling(exhausted: bool) {
         let config = SteeringConfig {
             max_recoveries: Some(1),
-            preset: Some(SteeringPreset::Enhanced),
             ..Default::default()
         };
         let mut state = Steering::new(config.resolve(MODEL));
@@ -867,7 +938,7 @@ mod tests {
                 normalized_message(&message),
                 normalized_message(&assistant(&TEXT.replace(' ', "  \n")))
             );
-            let mut state = enhanced();
+            let mut state = default_state();
             let advisory = state
                 .advisory(&vec![message; 3], &Model::from_spec(MODEL).unwrap(), true)
                 .unwrap();

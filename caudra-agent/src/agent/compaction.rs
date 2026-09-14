@@ -33,6 +33,13 @@ const PRESERVE_RECENT_MAX_TOKENS: u32 = 15_000;
 /// The share of the usable window the preserved tail may claim.
 const PRESERVE_RECENT_FRACTION: u32 = 4;
 
+// A completed request is billable even when its summary cannot replace history.
+#[derive(Debug)]
+pub(super) struct CompactionOutcome {
+    pub usage: TokenUsage,
+    pub result: Result<(), AgentError>,
+}
+
 fn normalize(text: &Option<String>) -> Option<&str> {
     text.as_deref().map(str::trim).filter(|t| !t.is_empty())
 }
@@ -52,7 +59,7 @@ pub(super) async fn compact_history(
     cancel: &CancelToken,
     retry_now: &Nudge,
     config: &AgentConfig,
-) -> Result<TokenUsage, AgentError> {
+) -> Result<CompactionOutcome, AgentError> {
     let compact_start = std::time::Instant::now();
     let head_end = head_end(
         history.as_slice(),
@@ -92,7 +99,10 @@ pub(super) async fn compact_history(
                         "compaction succeeded after truncating oldest rounds"
                     );
                 }
-                return finish_compact(response, history, head_end, event_tx, compact_start, model);
+                let usage = response.usage;
+                let result =
+                    finish_compact(response, history, head_end, event_tx, compact_start, model);
+                return Ok(CompactionOutcome { usage, result });
             }
             Err(StreamError::Other(e)) if e.is_context_overflow() && attempt < max_attempts - 1 => {
                 last_error = Some(e);
@@ -156,7 +166,7 @@ fn finish_compact(
     event_tx: &EventSender,
     compact_start: std::time::Instant,
     model: &Model,
-) -> Result<TokenUsage, AgentError> {
+) -> Result<(), AgentError> {
     let _ = event_tx.send(AgentEvent::TurnComplete(Box::new(TurnCompleteEvent {
         message: response.message.clone(),
         usage: response.usage,
@@ -202,7 +212,7 @@ fn finish_compact(
         "compaction completed"
     );
 
-    Ok(response.usage)
+    Ok(())
 }
 
 fn retained_output_refs(messages: &[Message]) -> Vec<caudra_storage::tool_outputs::ToolOutputRef> {
@@ -251,7 +261,7 @@ pub async fn compact(
 ) -> Result<TokenUsage, AgentError> {
     event_tx.send(AgentEvent::Compacting)?;
     let cancel = CancelToken::none();
-    let usage = compact_history(
+    let compacted = compact_history(
         provider,
         model,
         history,
@@ -261,6 +271,8 @@ pub async fn compact(
         config,
     )
     .await?;
+    compacted.result?;
+    let usage = compacted.usage;
     if let Some(post) = normalize(&config.post_compaction_instructions) {
         history.push(Message::synthetic(post.to_string()));
         event_tx.send(AgentEvent::Injected {
@@ -874,6 +886,8 @@ mod tests {
                 &AgentConfig::default(),
             )
             .await
+            .unwrap()
+            .result
             .unwrap();
 
             let requests = provider.requests.lock().unwrap();
@@ -1295,6 +1309,8 @@ mod tests {
                 &AgentConfig::default(),
             )
             .await
+            .unwrap()
+            .result
             .unwrap();
 
             let requests = provider.requests.lock().unwrap();
@@ -1338,6 +1354,8 @@ mod tests {
                 &AgentConfig::default(),
             )
             .await
+            .unwrap()
+            .result
             .unwrap();
 
             let requests = provider.requests.lock().unwrap();

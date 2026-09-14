@@ -18,7 +18,7 @@ use caudra_providers::model::{Model, ModelPurpose};
 use caudra_providers::model_registry::Binding;
 use caudra_providers::provider;
 use caudra_providers::{
-    ContentBlock, HistoryItem, Message, Role, ThinkingConfig, TokenUsage, add_cost, expand_message,
+    HistoryItem, Message, ThinkingConfig, TokenUsage, add_cost, expand_message,
 };
 use caudra_storage::id::CaudraId;
 
@@ -31,11 +31,11 @@ use crate::tools::{
     ToolContext, ToolFilter, ToolLive, deferral,
 };
 use crate::{
-    Agent, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, DoneReason,
-    EMPTY_RESPONSE_MARKER, Envelope, EventSender, History, InterruptSource, McpSession,
-    SteeringQueue, SteeringQueueReceiver, SubagentActivity, SubagentHistoryError,
-    SubagentHistoryLease, SubagentInfo, SubagentProgress, SubagentTaskMode, SubagentTaskSpec,
-    SubagentTaskSpecCandidate, reasoning_summary, steering_queue,
+    Agent, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, DoneReason, Envelope,
+    EventSender, History, InterruptSource, McpSession, SteeringQueue, SteeringQueueReceiver,
+    SubagentActivity, SubagentHistoryError, SubagentHistoryLease, SubagentInfo, SubagentProgress,
+    SubagentTaskMode, SubagentTaskSpec, SubagentTaskSpecCandidate, reasoning_summary,
+    steering_queue,
 };
 
 pub const STRUCTURED_OUTPUT_TOOL: &str = "structured_output";
@@ -43,6 +43,7 @@ pub const BUILTIN_TASK_PROFILE_DESCRIPTION: &str = "Caudra\'s built-in task prom
 pub const SESSION_CLOSED: &str = "session closed";
 pub const CANCELLED: &str = "cancelled";
 pub(super) const TURN_LIMIT: &str = "subagent reached its maximum turn limit";
+pub(super) const TRUNCATED: &str = "subagent response was cut off at its output token limit";
 const DEFAULT_SESSION_AUDIENCE: ToolAudience = ToolAudience::GENERAL_SUB;
 /// A thought\'s title is its first bold line. Past this the block is into
 /// prose and will never resolve one, so it stops being accumulated and a
@@ -390,7 +391,6 @@ impl Subagent {
             });
         }
 
-        let history_len = self.history.len();
         let interrupt_source: Arc<dyn InterruptSource> = self.interrupt_source.clone();
         let mut agent = Agent::new(
             self.params.clone(),
@@ -446,23 +446,19 @@ impl Subagent {
                 ),
             }
         }
-        // A subagent can be cancelled on its own, and its caller should hear
-        // about that instead of taking a half-finished answer for a real one,
-        // so cancel reads like an error here even though the run ended
-        // normally.
+        // A normal runtime exit can still leave the task unfinished. Only a
+        // completed response may enter task-report validation or correction.
         let cut_short = match &result {
             Err(error) => Some(error.to_string()),
             Ok(DoneReason::Cancelled) => Some(CANCELLED.to_owned()),
             Ok(DoneReason::MaxTurns) => Some(TURN_LIMIT.to_owned()),
+            Ok(DoneReason::MaxTokens) => Some(TRUNCATED.to_owned()),
             Ok(_) => None,
         };
         if let Some(error) = cut_short {
-            let turn = &self.history.as_slice()[history_len.min(self.history.len())..];
-            let partial = assistant_text(turn).join("\n");
-            let partial = if partial.is_empty() { text } else { partial };
             return Err(PromptFailure {
                 error,
-                partial: (!partial.is_empty()).then_some(partial),
+                partial: (!text.is_empty()).then_some(text),
             });
         }
         Ok(PromptResult {
@@ -472,17 +468,6 @@ impl Subagent {
             output_tokens: self.usage.output,
         })
     }
-}
-
-fn assistant_text(turn: &[Message]) -> Vec<&str> {
-    turn.iter()
-        .filter(|message| matches!(message.role, Role::Assistant))
-        .flat_map(|message| message.content.iter())
-        .filter_map(|block| match block {
-            ContentBlock::Text { text } if text != EMPTY_RESPONSE_MARKER => Some(text.as_str()),
-            _ => None,
-        })
-        .collect()
 }
 
 /// Everything both openers must decide before a [`Subagent`] can exist.
@@ -1000,7 +985,7 @@ mod tests {
         ContextInventory, ContextKey, ContextReadiness, ContextSnapshot, ContextStore,
         ContextUsage, ContextWindow,
     };
-    use caudra_providers::{Billing, Message};
+    use caudra_providers::{Billing, ContentBlock, Message, Role};
     use caudra_storage::usage_ledger::LedgerPurpose;
     use test_case::test_case;
 

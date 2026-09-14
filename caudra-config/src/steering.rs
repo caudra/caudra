@@ -1,5 +1,5 @@
-//! Optional fields preserve inheritance across config layers until the model's preset is
-//! selected. Resolving defaults earlier would turn omitted fields into explicit overrides.
+//! Optional fields preserve inheritance across config layers until the model is resolved.
+//! Resolving defaults earlier would turn omitted fields into explicit overrides.
 
 use std::collections::BTreeMap;
 
@@ -15,14 +15,6 @@ const MAX_WINDOW: usize = 4096;
 const MAX_PROMPT_BYTES: usize = 16 * 1024;
 const MAX_MODELS: usize = 256;
 const MAX_MODEL_ID_BYTES: usize = 512;
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SteeringPreset {
-    #[default]
-    Conservative,
-    Enhanced,
-}
 
 macro_rules! override_fields {
     ($target:ident, $source:ident, $($field:ident),+ $(,)?) => {
@@ -41,7 +33,7 @@ macro_rules! merge_fields {
 }
 
 macro_rules! rule {
-    ($config:ident, $policy:ident, $conservative:literal, {
+    ($config:ident, $policy:ident, {
         $($field:ident: $ty:ty = $default:literal, $min:literal..=$max:ident);+ $(;)?
     }) => {
         #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,15 +64,17 @@ macro_rules! rule {
             $(pub $field: $ty,)+
         }
 
-        impl $policy {
-            fn preset(preset: &SteeringPreset) -> Self {
+        impl Default for $policy {
+            fn default() -> Self {
                 Self {
-                    enabled: $conservative || *preset == SteeringPreset::Enhanced,
+                    enabled: true,
                     prompt: None,
                     $($field: $default,)+
                 }
             }
+        }
 
+        impl $policy {
             fn validate(&self, path: &str) -> Result<(), ConfigError> {
                 if let Some(prompt) = &self.prompt
                     && (prompt.trim().is_empty() || prompt.len() > MAX_PROMPT_BYTES)
@@ -102,21 +96,24 @@ macro_rules! rule {
     };
 }
 
-rule!(EmptyResponseConfig, EmptyResponsePolicy, true, {
+rule!(TruncationConfig, TruncationPolicy, {
+    max_attempts: u32 = 3, 1..=MAX_COUNT;
+});
+rule!(EmptyResponseConfig, EmptyResponsePolicy, {
     max_after_tools: u32 = 20, 1..=MAX_COUNT;
     max_idle: u32 = 2, 1..=MAX_COUNT;
     recent_tool_window: usize = 5, 1..=MAX_WINDOW;
 });
-rule!(RepeatedToolCallConfig, RepeatedToolCallPolicy, true, {
+rule!(RepeatedToolCallConfig, RepeatedToolCallPolicy, {
     threshold: usize = 3, 2..=MAX_COUNT;
 });
-rule!(ProtocolMismatchConfig, ProtocolMismatchPolicy, false, {
+rule!(ProtocolMismatchConfig, ProtocolMismatchPolicy, {
     max_attempts: u32 = 2, 1..=MAX_COUNT;
 });
-rule!(MissingTaskReportConfig, MissingTaskReportPolicy, true, {
+rule!(MissingTaskReportConfig, MissingTaskReportPolicy, {
     max_attempts: u32 = 2, 1..=MAX_COUNT;
 });
-rule!(RepetitionConfig, RepetitionPolicy, false, {
+rule!(RepetitionConfig, RepetitionPolicy, {
     window: usize = 24, 1..=MAX_WINDOW;
     cycle_repeats: usize = 3, 2..=MAX_COUNT;
     max_cycle: usize = 4, 2..=MAX_COUNT;
@@ -124,12 +121,12 @@ rule!(RepetitionConfig, RepetitionPolicy, false, {
     text_repeats: usize = 3, 2..=MAX_COUNT;
     cooldown: u32 = 3, 1..=MAX_COUNT;
 });
-rule!(ToolPlanningConfig, ToolPlanningPolicy, false, {
+rule!(ToolPlanningConfig, ToolPlanningPolicy, {
     after_calls: usize = 6, 1..=MAX_COUNT;
     after_responses: usize = 3, 1..=MAX_COUNT;
     cooldown: u32 = 3, 1..=MAX_COUNT;
 });
-rule!(NoToolUseConfig, NoToolUsePolicy, false, {
+rule!(NoToolUseConfig, NoToolUsePolicy, {
     after_responses: usize = 3, 1..=MAX_COUNT;
     window: usize = 8, 1..=MAX_WINDOW;
     cooldown: u32 = 3, 1..=MAX_COUNT;
@@ -153,16 +150,12 @@ macro_rules! rules {
             }
         }
 
-        #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+        #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
         pub struct SteeringRules {
             $(pub $field: $policy,)+
         }
 
         impl SteeringRules {
-            fn preset(preset: &SteeringPreset) -> Self {
-                Self { $($field: $policy::preset(preset),)+ }
-            }
-
             fn validate(&self, path: &str) -> Result<(), ConfigError> {
                 $(self.$field.validate(&format!("{path}.{}", stringify!($field)))?;)+
                 // Observation windows must fit their trigger; planning cannot require fewer
@@ -197,6 +190,7 @@ macro_rules! rules {
 }
 
 rules! {
+    truncation: TruncationConfig => TruncationPolicy,
     empty_response: EmptyResponseConfig => EmptyResponsePolicy,
     repeated_tool_call: RepeatedToolCallConfig => RepeatedToolCallPolicy,
     protocol_mismatch: ProtocolMismatchConfig => ProtocolMismatchPolicy,
@@ -210,7 +204,6 @@ rules! {
 #[serde(default, deny_unknown_fields)]
 pub struct SteeringConfig {
     pub enabled: Option<bool>,
-    pub preset: Option<SteeringPreset>,
     pub max_recoveries: Option<u32>,
     pub max_advisories: Option<u32>,
     pub rules: SteeringRulesConfig,
@@ -221,7 +214,6 @@ pub struct SteeringConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct SteeringModelConfig {
     pub enabled: Option<bool>,
-    pub preset: Option<SteeringPreset>,
     pub max_recoveries: Option<u32>,
     pub max_advisories: Option<u32>,
     pub rules: SteeringRulesConfig,
@@ -237,14 +229,7 @@ pub struct SteeringPolicy {
 
 impl SteeringModelConfig {
     pub fn merge(&mut self, overlay: Self) {
-        merge_fields!(
-            self,
-            overlay,
-            enabled,
-            preset,
-            max_recoveries,
-            max_advisories
-        );
+        merge_fields!(self, overlay, enabled, max_recoveries, max_advisories);
         self.rules.merge(overlay.rules);
     }
 }
@@ -253,37 +238,25 @@ impl SteeringConfig {
     /// Later layers replace explicit fields, while rules and exact model entries merge
     /// field by field so omitted settings continue to inherit.
     pub fn merge(&mut self, overlay: Self) {
-        merge_fields!(
-            self,
-            overlay,
-            enabled,
-            preset,
-            max_recoveries,
-            max_advisories
-        );
+        merge_fields!(self, overlay, enabled, max_recoveries, max_advisories);
         self.rules.merge(overlay.rules);
         for (model, policy) in overlay.models {
             self.models.entry(model).or_default().merge(policy);
         }
     }
 
-    /// The exact model's preset wins over the global preset. Explicit global settings
-    /// override that preset, then explicit model settings take final precedence.
+    /// Explicit global settings override built-in defaults, then exact model settings
+    /// take final precedence.
     pub fn resolve(&self, model: &str) -> SteeringPolicy {
         self.resolve_override(self.models.get(model))
     }
 
     fn resolve_override(&self, model: Option<&SteeringModelConfig>) -> SteeringPolicy {
-        let preset = model
-            .and_then(|model| model.preset.as_ref())
-            .or(self.preset.as_ref())
-            .cloned()
-            .unwrap_or_default();
         let mut policy = SteeringPolicy {
             enabled: true,
             max_recoveries: DEFAULT_MAX_RECOVERIES,
             max_advisories: DEFAULT_MAX_ADVISORIES,
-            rules: SteeringRules::preset(&preset),
+            rules: SteeringRules::default(),
         };
         override_fields!(policy, self, enabled, max_recoveries, max_advisories);
         self.rules.apply(&mut policy.rules);
@@ -365,7 +338,7 @@ mod tests {
     use test_case::test_case;
 
     use super::{MAX_COUNT, MAX_MODEL_ID_BYTES, MAX_MODELS, MAX_PROMPT_BYTES, MAX_WINDOW};
-    use super::{SteeringConfig, SteeringModelConfig, SteeringPreset};
+    use super::{SteeringConfig, SteeringModelConfig};
     use crate::{AgentConfig, ConfigError, RawConfig};
 
     const MODEL: &str = "provider/model";
@@ -374,41 +347,49 @@ mod tests {
     const GLOBAL_PROMPT: &str = "Global guidance";
     const INVALID_FIELD: &str = "rules.no_tool_use.window";
     const INVALID_MESSAGE: &str = "must be between 3 and 4096, got 2";
+    const UNKNOWN_FIELD: &str = "unknown field";
+    const RULES: [&str; 8] = [
+        "truncation",
+        "empty_response",
+        "repeated_tool_call",
+        "protocol_mismatch",
+        "missing_task_report",
+        "repetition",
+        "tool_planning",
+        "no_tool_use",
+    ];
 
     fn config(value: Value) -> SteeringConfig {
         serde_json::from_value(value).unwrap()
     }
 
-    #[test_case(SteeringPreset::Conservative, false; "conservative")]
-    #[test_case(SteeringPreset::Enhanced, true; "enhanced")]
-    fn preset_defaults(preset: SteeringPreset, enhanced: bool) {
-        let config = SteeringConfig {
-            preset: Some(preset),
-            ..SteeringConfig::default()
-        };
+    #[test]
+    fn policy_defaults() {
+        let config = SteeringConfig::default();
         config.validate().unwrap();
         assert_eq!(
             serde_json::to_value(config.resolve(MODEL)).unwrap(),
             json!({
                 "enabled": true, "max_recoveries": 32, "max_advisories": 4,
                 "rules": {
+                    "truncation": {"enabled": true, "prompt": null, "max_attempts": 3},
                     "empty_response": {
                         "enabled": true, "prompt": null, "max_after_tools": 20,
                         "max_idle": 2, "recent_tool_window": 5
                     },
                     "repeated_tool_call": {"enabled": true, "prompt": null, "threshold": 3},
-                    "protocol_mismatch": {"enabled": enhanced, "prompt": null, "max_attempts": 2},
+                    "protocol_mismatch": {"enabled": true, "prompt": null, "max_attempts": 2},
                     "missing_task_report": {"enabled": true, "prompt": null, "max_attempts": 2},
                     "repetition": {
-                        "enabled": enhanced, "prompt": null, "window": 24, "cycle_repeats": 3,
+                        "enabled": true, "prompt": null, "window": 24, "cycle_repeats": 3,
                         "max_cycle": 4, "text_window": 8, "text_repeats": 3, "cooldown": 3
                     },
                     "tool_planning": {
-                        "enabled": enhanced, "prompt": null, "after_calls": 6,
+                        "enabled": true, "prompt": null, "after_calls": 6,
                         "after_responses": 3, "cooldown": 3
                     },
                     "no_tool_use": {
-                        "enabled": enhanced, "prompt": null, "after_responses": 3,
+                        "enabled": true, "prompt": null, "after_responses": 3,
                         "window": 8, "cooldown": 3
                     }
                 }
@@ -416,24 +397,24 @@ mod tests {
         );
     }
 
-    #[test_case("conservative", "enhanced", true; "model_enhanced")]
-    #[test_case("enhanced", "conservative", false; "model_conservative")]
-    #[test_case("enhanced", "enhanced", true; "global_enhanced")]
-    fn resolution_precedence(global: &str, model: &str, enhanced: bool) {
+    #[test_case(false, true; "model_enables")]
+    #[test_case(true, false; "model_disables")]
+    #[test_case(true, true; "both_enabled")]
+    fn resolution_precedence(global: bool, model: bool) {
         let config = config(json!({
-            "preset": global,
             "enabled": false,
             "max_recoveries": 7,
             "max_advisories": 0,
             "rules": {
+                "repetition": {"enabled": global},
                 "no_tool_use": {"enabled": false, "after_responses": 4},
                 "empty_response": {"max_idle": 5, "prompt": GLOBAL_PROMPT}
             },
             "models": {(MODEL): {
-                "preset": model,
                 "enabled": true,
                 "max_recoveries": 0,
                 "rules": {
+                    "repetition": {"enabled": model},
                     "no_tool_use": {"after_responses": 6},
                     "empty_response": {"prompt": PROMPT}
                 }
@@ -444,12 +425,13 @@ mod tests {
         assert!(policy.enabled);
         assert_eq!(policy.max_recoveries, 0);
         assert_eq!(policy.max_advisories, 0);
-        assert_eq!(policy.rules.repetition.enabled, enhanced);
+        assert_eq!(policy.rules.repetition.enabled, model);
         assert!(!policy.rules.no_tool_use.enabled);
         assert_eq!(policy.rules.no_tool_use.after_responses, 6);
         assert_eq!(policy.rules.empty_response.max_idle, 5);
         assert_eq!(policy.rules.empty_response.prompt.as_deref(), Some(PROMPT));
         let unmatched = config.resolve(OTHER_MODEL);
+        assert_eq!(unmatched.rules.repetition.enabled, global);
         assert!(!unmatched.enabled);
         assert_eq!(unmatched.max_recoveries, 7);
         assert_eq!(unmatched.rules.no_tool_use.after_responses, 4);
@@ -459,12 +441,14 @@ mod tests {
         );
     }
 
-    #[test_case(MODEL, true; "exact")]
-    #[test_case("provider/model/suffix", false; "not_prefix")]
-    #[test_case("Provider/model", false; "case_sensitive")]
-    #[test_case("other/model", false; "not_suffix")]
+    #[test_case(MODEL, false; "exact")]
+    #[test_case("provider/model/suffix", true; "not_prefix")]
+    #[test_case("Provider/model", true; "case_sensitive")]
+    #[test_case("other/model", true; "not_suffix")]
     fn model_matching_is_exact(model: &str, enabled: bool) {
-        let config = config(json!({"models": {(MODEL): {"preset": "enhanced"}}}));
+        let config = config(json!({"models": {(MODEL): {"rules": {
+            "no_tool_use": {"enabled": false}
+        }}}}));
         assert_eq!(config.resolve(model).rules.no_tool_use.enabled, enabled);
     }
 
@@ -472,10 +456,15 @@ mod tests {
     #[test_case(false; "explicit_false")]
     fn raw_merge_preserves_inheritance_and_explicit_values(omitted: bool) {
         let mut base: RawConfig = serde_json::from_value(json!({"agent": {"steering": {
-            "preset": "enhanced",
-            "rules": {"no_tool_use": {"after_responses": 4, "prompt": GLOBAL_PROMPT}},
+            "rules": {
+                "no_tool_use": {"after_responses": 4, "prompt": GLOBAL_PROMPT},
+                "truncation": {"max_attempts": 5, "prompt": GLOBAL_PROMPT}
+            },
             "models": {
-                (MODEL): {"rules": {"empty_response": {"max_idle": 5, "prompt": PROMPT}}},
+                (MODEL): {"rules": {
+                    "empty_response": {"max_idle": 5, "prompt": PROMPT},
+                    "truncation": {"max_attempts": 7}
+                }},
                 (OTHER_MODEL): {"max_advisories": 1}
             }
         }}}))
@@ -485,8 +474,17 @@ mod tests {
         } else {
             json!({"agent": {"steering": {
                 "enabled": false, "max_recoveries": 0, "max_advisories": 0,
-                "rules": {"no_tool_use": {"enabled": false}},
-                "models": {(MODEL): {"rules": {"empty_response": {"enabled": false}}}}
+                "rules": {
+                    "no_tool_use": {"enabled": false},
+                    "truncation": {"enabled": false}
+                },
+                "models": {(MODEL): {
+                    "enabled": false, "max_recoveries": 0, "max_advisories": 0,
+                    "rules": {
+                        "empty_response": {"enabled": false},
+                        "truncation": {"prompt": PROMPT}
+                    }
+                }}
             }}})
         };
         base.merge(serde_json::from_value(overlay).unwrap());
@@ -495,12 +493,22 @@ mod tests {
         let steering = &config.agent.steering;
         assert_eq!(steering.models.len(), 2);
         assert_eq!(steering.rules.empty_response.max_idle, None);
-        assert_eq!(steering.models[MODEL].preset, None);
+        assert_eq!(steering.models[MODEL].rules.truncation.enabled, None);
         assert_eq!(
             steering.models[MODEL].rules.empty_response.max_idle,
             Some(5)
         );
         let policy = steering.resolve(MODEL);
+        assert_eq!(policy.rules.truncation.enabled, omitted);
+        assert_eq!(policy.rules.truncation.max_attempts, 7);
+        assert_eq!(
+            policy.rules.truncation.prompt.as_deref(),
+            Some(if omitted { GLOBAL_PROMPT } else { PROMPT })
+        );
+        assert_eq!(
+            steering.resolve(OTHER_MODEL).rules.truncation.max_attempts,
+            5
+        );
         assert_eq!(policy.enabled, omitted);
         assert_eq!(policy.rules.empty_response.enabled, omitted);
         assert_eq!(policy.rules.no_tool_use.enabled, omitted);
@@ -532,15 +540,11 @@ mod tests {
             .unwrap();
         assert_eq!(*config.agent.steering, SteeringConfig::default());
         assert_eq!(AgentConfig::default().steering, config.agent.steering);
-        assert!(
-            !config
-                .agent
-                .steering
-                .resolve(MODEL)
-                .rules
-                .no_tool_use
-                .enabled
-        );
+        let rules = serde_json::to_value(config.agent.steering.resolve(MODEL).rules).unwrap();
+        assert_eq!(rules.as_object().unwrap().len(), RULES.len());
+        for rule in RULES {
+            assert_eq!(rules[rule]["enabled"], true);
+        }
     }
 
     #[test_case(r#"{"unknown":true}"#; "global")]
@@ -549,9 +553,12 @@ mod tests {
     #[test_case(r#"{"models":{"provider/model":{"unknown":true}}}"#; "model")]
     #[test_case(r#"{"models":{"provider/model":{"models":{}}}}"#; "recursive_models")]
     #[test_case(r#"{"models":{"provider/model":{"rules":{"no_tool_use":{"unknown":3}}}}}"#; "model_rule")]
-    #[test_case(r#"{"preset":"automatic"}"#; "preset")]
     #[test_case(r#"{"max_recoveries":-1}"#; "negative_budget")]
     #[test_case(r#"{"rules":{"repetition":{"window":1.5}}}"#; "fractional_count")]
+    #[test_case(r#"{"rules":{"truncation":{"max_attempts":-1}}}"#; "negative_attempts")]
+    #[test_case(r#"{"rules":{"truncation":{"max_attempts":1.5}}}"#; "fractional_attempts")]
+    #[test_case(r#"{"rules":{"truncation":{"max_attempts":4294967296}}}"#; "overflow_attempts")]
+    #[test_case(r#"{"rules":{"truncation":{"max_idle":3}}}"#; "wrong_truncation_parameter")]
     fn rejects_invalid_schema(raw: &str) {
         assert!(serde_json::from_str::<SteeringConfig>(raw).is_err());
         assert!(
@@ -560,11 +567,50 @@ mod tests {
         );
     }
 
+    #[test_case(json!({"steering": {"preset": "conservative"}}), "preset"; "global_conservative")]
+    #[test_case(json!({"steering": {"preset": "enhanced"}}), "preset"; "global_enhanced")]
+    #[test_case(json!({"steering": {"models": {(MODEL): {"preset": "conservative"}}}}), "preset"; "model_conservative")]
+    #[test_case(json!({"steering": {"models": {(MODEL): {"preset": "enhanced"}}}}), "preset"; "model_enhanced")]
+    #[test_case(json!({"max_continuation_turns": 3}), "max_continuation_turns"; "old_truncation_setting")]
+    fn raw_config_rejects_removed_keys(agent: Value, key: &str) {
+        let error = serde_json::from_value::<RawConfig>(json!({"agent": agent})).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("{UNKNOWN_FIELD} `{key}`"))
+        );
+    }
+
+    #[test_case(false; "global")]
+    #[test_case(true; "model")]
+    fn each_rule_can_be_disabled(model_override: bool) {
+        for rule in RULES {
+            let settings = json!({"rules": {(rule): {"enabled": false}}});
+            let config = config(if model_override {
+                json!({"models": {(MODEL): settings}})
+            } else {
+                settings
+            });
+            config.validate().unwrap();
+            for model in [MODEL, OTHER_MODEL] {
+                let rules = serde_json::to_value(config.resolve(model).rules).unwrap();
+                for other in RULES {
+                    assert_eq!(
+                        rules[other]["enabled"],
+                        other != rule || (model_override && model != MODEL)
+                    );
+                }
+            }
+        }
+    }
+
     #[test_case("empty_response", "max_after_tools", 0; "empty_after_tools_zero")]
     #[test_case("empty_response", "max_idle", 0; "empty_idle_zero")]
     #[test_case("empty_response", "recent_tool_window", 0; "empty_window_zero")]
     #[test_case("repeated_tool_call", "threshold", 1; "repeat_threshold_one")]
     #[test_case("protocol_mismatch", "max_attempts", 0; "protocol_zero")]
+    #[test_case("truncation", "max_attempts", 0; "truncation_zero")]
+    #[test_case("truncation", "max_attempts", MAX_COUNT + 1; "truncation_too_large")]
     #[test_case("missing_task_report", "max_attempts", 0; "report_zero")]
     #[test_case("repetition", "window", MAX_WINDOW + 1; "oversized_window")]
     #[test_case("repetition", "max_cycle", 1; "single_cycle")]
@@ -621,7 +667,7 @@ mod tests {
                     json!({(field): value})
                 };
                 let mut raw: RawConfig = serde_json::from_value(json!({"agent": {"steering": {
-                    "models": {(MODEL): {"preset": "enhanced"}}
+                    "models": {(MODEL): {"rules": {"no_tool_use": {"enabled": false}}}}
                 }}}))
                 .unwrap();
                 raw.merge(
@@ -641,6 +687,40 @@ mod tests {
                         matches!(result, Err(ConfigError::InvalidSteering { field, .. }) if field == expected)
                     );
                 }
+            }
+        }
+    }
+
+    #[test_case(0, false; "zero")]
+    #[test_case(1, true; "minimum")]
+    #[test_case(MAX_COUNT, true; "maximum")]
+    #[test_case(MAX_COUNT + 1, false; "too_large")]
+    fn raw_conversion_validates_truncation_bounds(value: usize, valid: bool) {
+        for model_override in [false, true] {
+            let settings = json!({"rules": {"truncation": {
+                "enabled": false, "max_attempts": value
+            }}});
+            let steering = if model_override {
+                json!({"models": {(MODEL): settings}})
+            } else {
+                settings
+            };
+            let raw: RawConfig =
+                serde_json::from_value(json!({"agent": {"steering": steering}})).unwrap();
+            let result = raw.into_config(false);
+            if valid {
+                let policy = result.unwrap().agent.steering.resolve(MODEL);
+                assert_eq!(policy.rules.truncation.max_attempts as usize, value);
+                assert!(!policy.rules.truncation.enabled);
+            } else {
+                let expected = if model_override {
+                    format!("models[{MODEL:?}].rules.truncation.max_attempts")
+                } else {
+                    "rules.truncation.max_attempts".to_owned()
+                };
+                assert!(
+                    matches!(result, Err(ConfigError::InvalidSteering { field, .. }) if field == expected)
+                );
             }
         }
     }
@@ -737,24 +817,44 @@ mod tests {
     #[test_case(" \n\t", false; "blank")]
     #[test_case(PROMPT, true; "literal_text")]
     fn validates_prompt(prompt: &str, valid: bool) {
-        assert_eq!(
-            config(json!({"rules": {"tool_planning": {"prompt": prompt}}}))
-                .validate()
-                .is_ok(),
-            valid
-        );
+        check_prompts(prompt, valid);
     }
 
     #[test_case(MAX_PROMPT_BYTES, true; "maximum")]
     #[test_case(MAX_PROMPT_BYTES + 1, false; "too_large")]
     fn validates_prompt_bytes(bytes: usize, valid: bool) {
-        let prompt = "x".repeat(bytes);
-        assert_eq!(
-            config(json!({"rules": {"no_tool_use": {"prompt": prompt}}}))
-                .validate()
-                .is_ok(),
-            valid
-        );
+        check_prompts(&"x".repeat(bytes), valid);
+    }
+
+    fn check_prompts(prompt: &str, valid: bool) {
+        for rule in RULES {
+            for model_override in [false, true] {
+                let settings = json!({"rules": {(rule): {"enabled": false, "prompt": prompt}}});
+                let steering = if model_override {
+                    json!({"models": {(MODEL): settings}})
+                } else {
+                    settings
+                };
+                let raw: RawConfig =
+                    serde_json::from_value(json!({"agent": {"steering": steering}})).unwrap();
+                let result = raw.into_config(false);
+                if valid {
+                    let rules =
+                        serde_json::to_value(result.unwrap().agent.steering.resolve(MODEL).rules)
+                            .unwrap();
+                    assert_eq!(rules[rule]["prompt"], prompt);
+                } else {
+                    let expected = if model_override {
+                        format!("models[{MODEL:?}].rules.{rule}.prompt")
+                    } else {
+                        format!("rules.{rule}.prompt")
+                    };
+                    assert!(
+                        matches!(result, Err(ConfigError::InvalidSteering { field, .. }) if field == expected)
+                    );
+                }
+            }
+        }
     }
 
     #[test_case(false; "global")]

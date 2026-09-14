@@ -59,7 +59,6 @@ pub const MIN_MAX_INPUT_LINES: u32 = 1;
 
 pub const MAX_SERVER_NAME_LEN: usize = 64;
 
-pub const DEFAULT_MAX_CONTINUATION_TURNS: u32 = 3;
 pub const DEFAULT_COMPACTION_BUFFER: CompactionBuffer = CompactionBuffer::Percent(20);
 /// Windows that already exclude output need less held back, since the reserve
 /// only has to absorb estimation drift rather than a whole response.
@@ -85,7 +84,6 @@ pub const MIN_OUTPUT_BYTES: usize = 1024;
 pub const MIN_OUTPUT_LINES: usize = 10;
 pub const MIN_PER_TOOL_OUTPUT_BYTES: usize = 256;
 pub const MIN_PER_TOOL_OUTPUT_LINES: usize = 4;
-pub const MIN_MAX_CONTINUATION_TURNS: u32 = 1;
 pub const MIN_COMPACTION_BUFFER: u32 = 1_000;
 const MAX_COMPACTION_PERCENT: u8 = 99;
 const COMPACTION_BUFFER_EXPECTED: &str =
@@ -933,7 +931,6 @@ pub struct AgentFileConfig {
     pub system_prompt_profile: Option<String>,
     pub max_output_bytes: Option<usize>,
     pub max_output_lines: Option<usize>,
-    pub max_continuation_turns: Option<u32>,
     pub compaction_buffer: Option<CompactionBuffer>,
     pub compaction_instructions: Option<String>,
     pub post_compaction_instructions: Option<String>,
@@ -956,7 +953,6 @@ impl AgentFileConfig {
             system_prompt_profile,
             max_output_bytes,
             max_output_lines,
-            max_continuation_turns,
             compaction_buffer,
             compaction_instructions,
             post_compaction_instructions,
@@ -1752,9 +1748,6 @@ pub struct AgentConfig {
     #[config(default = DEFAULT_MAX_OUTPUT_LINES, min = MIN_OUTPUT_LINES, desc = "Host-enforced default max tool-result lines")]
     pub max_output_lines: usize,
 
-    #[config(default = DEFAULT_MAX_CONTINUATION_TURNS, min = MIN_MAX_CONTINUATION_TURNS, desc = "Max automatic continuation turns")]
-    pub max_continuation_turns: u32,
-
     #[config(
         default = "None",
         ty = "u32 | string",
@@ -1857,9 +1850,6 @@ impl AgentConfig {
                 .filter(|profile| profile != "builtin"),
             max_output_bytes: file.max_output_bytes.unwrap_or(DEFAULT_MAX_OUTPUT_BYTES),
             max_output_lines: file.max_output_lines.unwrap_or(DEFAULT_MAX_OUTPUT_LINES),
-            max_continuation_turns: file
-                .max_continuation_turns
-                .unwrap_or(DEFAULT_MAX_CONTINUATION_TURNS),
             compaction_buffer: file.compaction_buffer,
             compaction_instructions: file.compaction_instructions,
             post_compaction_instructions: file.post_compaction_instructions,
