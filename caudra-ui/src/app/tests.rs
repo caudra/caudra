@@ -14929,14 +14929,18 @@ fn shift_arrows_pan_a_wide_diagram() {
 }
 
 #[test]
-fn shift_arrows_still_move_the_cursor_when_no_diagram_is_visible() {
+fn shift_arrows_still_reach_the_composer_when_no_diagram_is_visible() {
     let mut app = test_app();
     for character in CURSOR_PROBE.chars() {
         app.update(Msg::Key(key(KeyCode::Char(character))));
     }
     app.update(Msg::Key(kb::PAN_LEFT.to_key_event()));
     app.update(Msg::Key(key(KeyCode::Char('X'))));
-    assert_eq!(app.input_box.buffer.value(), "abXc");
+    assert_eq!(
+        app.input_box.buffer.value(),
+        "abX",
+        "shift+left selects the last character, which typing then replaces"
+    );
 }
 
 #[test]

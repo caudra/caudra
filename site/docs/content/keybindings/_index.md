@@ -82,6 +82,9 @@ Holding `Alt` while turning the wheel scrolls four times as far. A middle-click 
 | Key | Action |
 |-----|--------|
 | `Enter` | Insert newline |
+| `Ctrl+A` | Select the whole text |
+| `Ctrl+C` / `Shift+Delete` / `Ctrl+V` | Copy, cut or paste the selection |
+| `Ctrl+Z` / `Ctrl+Y` | Undo or redo an edit |
 | `Ctrl+S` | Save pasted text |
 | `Esc` | Cancel editing |
 
@@ -89,9 +92,11 @@ Holding `Alt` while turning the wheel scrolls four times as far. A middle-click 
 
 | Key | Action |
 |-----|--------|
-| `j` / `k` / `g` / `G` | Move the row cursor |
-| `v` | Extend the passage |
-| `Enter` | Write a note on the passage |
+| `↑` / `↓` | Move the caret through the passage |
+| `Shift+↑` / `Shift+↓` / `Shift+←` / `Shift+→` | Select part of the passage |
+| `Ctrl+A` | Select the whole passage |
+| `Ctrl+C` | Copy the selection |
+| `Enter` | Write a note on the selection |
 | `e` / `d` | Edit or delete the note under the cursor |
 | `n` / `p` | Jump between notes |
 | `Ctrl+S` | Send notes to the prompt |

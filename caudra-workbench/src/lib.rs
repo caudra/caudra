@@ -21,12 +21,14 @@ mod style;
 mod view;
 
 pub use action::WorkbenchAction;
+pub use editor::{buffer, history, render};
 pub use fs::backend::{
     BackendDriver, BackendError, BackendEvent, BackendRevision, ListResult, LoadedFile,
     LocalFilesystem, MutationGate, RequestId, ResourceEntry, SearchMatch, SearchResult,
     WatchHandle, WatchResult, WatchUpdate, WorkbenchBackend, WorkbenchFilesystem, WorkbenchPath,
     WorkspaceFilesystem,
 };
+pub use pointer::Clicks;
 pub use style::WorkbenchStyles;
 use unicode_width::UnicodeWidthStr;
 
@@ -47,7 +49,6 @@ use fs::ops;
 use fs::tree::Tree;
 use fs::watch::Watch;
 use menu::{Action as MenuAction, Menu, Target};
-use pointer::Clicks;
 use quick_open::QuickOpen;
 use scm::backend::{
     CommitFilesResult, DiffResult as RemoteDiffResult, Driver as ScmDriver, Event as ScmEvent,

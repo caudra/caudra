@@ -1,9 +1,11 @@
 use std::ops::Range;
 
+use caudra_workbench::buffer::{Buffer, Cursor, Edit};
+use caudra_workbench::history::History;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::highlight::TAB_SPACES;
-use crate::text_buffer::{EditResult, TextBuffer};
+use crate::text_buffer::EditResult;
 
 pub(crate) const PASTE_TOKEN_MIN_CHARACTERS: usize = 150;
 pub(crate) const PASTE_TOKEN_MIN_LINES: usize = 3;
@@ -31,9 +33,11 @@ struct PasteSpan {
     text: String,
 }
 
-#[derive(Debug, Clone)]
 pub(crate) struct InputDocument {
-    display: TextBuffer,
+    display: Buffer,
+    /// Undo for the composer, coalesced into gestures by the same rules the
+    /// workbench's editor uses.
+    history: History,
     pastes: Vec<PasteSpan>,
     next_paste_id: u64,
 }
@@ -45,7 +49,8 @@ impl InputDocument {
 
     pub fn from_plain(text: String) -> Self {
         Self {
-            display: TextBuffer::new(text),
+            display: buffer_of(&text),
+            history: History::default(),
             pastes: Vec::new(),
             next_paste_id: 1,
         }
@@ -81,14 +86,15 @@ impl InputDocument {
 
         display.push_str(&draft.text[source_byte..]);
         Self {
-            display: TextBuffer::new(display),
+            display: buffer_of(&display),
+            history: History::default(),
             next_paste_id: pastes.len() as u64 + 1,
             pastes,
         }
     }
 
     pub fn draft(&self) -> InputDraft {
-        let display = self.display.value();
+        let display = self.display_text();
         let mut text = String::with_capacity(display.len());
         let mut paste_ranges = Vec::with_capacity(self.pastes.len());
         let mut display_char = 0;
@@ -106,7 +112,7 @@ impl InputDocument {
     }
 
     pub fn display_text(&self) -> String {
-        self.display.value()
+        self.display.lines().join("\n")
     }
 
     pub fn expanded_text(&self) -> String {
@@ -119,7 +125,7 @@ impl InputDocument {
 
     pub fn palette_text(&self) -> String {
         let mut text = self.project(|_| PALETTE_TOKEN);
-        let display = self.display.value();
+        let display = self.display_text();
         if self.pastes.last().is_some_and(|paste| {
             char_slice(&display, paste.range.end..display.chars().count()) == " "
         }) {
@@ -133,11 +139,11 @@ impl InputDocument {
     }
 
     pub fn x(&self) -> usize {
-        self.display.x()
+        self.display.cursor().col
     }
 
     pub fn y(&self) -> usize {
-        self.display.y()
+        self.display.cursor().line
     }
 
     pub fn line_count(&self) -> usize {
@@ -145,21 +151,67 @@ impl InputDocument {
     }
 
     pub fn cursor_offset(&self) -> usize {
-        self.display.cursor_offset()
+        self.offset_of(self.display.cursor())
+    }
+
+    /// The selection in char offsets over [`Self::display_text`], which is the
+    /// space paste spans are recorded in.
+    pub fn selection(&self) -> Option<Range<usize>> {
+        let (start, end) = self.display.selection()?;
+        Some(self.offset_of(start)..self.offset_of(end))
+    }
+
+    pub fn selected_text(&self) -> Option<String> {
+        self.display.selected_text()
+    }
+
+    pub fn select_all(&mut self) {
+        self.display.select_all();
     }
 
     pub fn set_cursor(&mut self, y: usize, x: usize) {
-        self.display.set_cursor(y, x);
+        self.set_caret(Cursor::new(y, x), false);
+    }
+
+    /// Drops the caret, extending the selection when asked, and keeps it out of
+    /// the middle of a paste chip either way.
+    pub fn set_caret(&mut self, cursor: Cursor, extend: bool) {
+        self.display.set_cursor(cursor, extend);
         self.normalize_cursor(CursorDirection::Nearest);
     }
 
     pub fn move_to_end(&mut self) {
-        self.display.move_to_end();
+        self.display.move_document_end(false);
     }
 
     pub fn clear(&mut self) {
-        self.display.clear();
+        self.display = Buffer::new(Vec::new());
+        self.history = History::default();
         self.pastes.clear();
+    }
+
+    /// Steps back through the undo history, reporting whether anything moved.
+    pub fn undo(&mut self) -> bool {
+        self.replay(History::undo)
+    }
+
+    pub fn redo(&mut self) -> bool {
+        self.replay(History::redo)
+    }
+
+    /// A replayed edit moves every offset after it, and a chip the edit covered
+    /// is gone for good: undo restores the text, not the summary it stood
+    /// behind, which is the same trade expanding a paste already makes.
+    fn replay(&mut self, step: impl Fn(&mut History) -> Option<Edit>) -> bool {
+        let Some(edit) = step(&mut self.history) else {
+            return false;
+        };
+        let at = self.offset_of(edit.at);
+        let removed = edit.removed.chars().count();
+        let inserted = edit.inserted.chars().count();
+        self.display.replay(&edit);
+        self.apply_change(at..at + removed, inserted);
+        true
     }
 
     pub fn has_pastes(&self) -> bool {
@@ -185,8 +237,7 @@ impl InputDocument {
 
     pub fn insert_text(&mut self, text: &str) {
         let text = sanitize_paste(text);
-        let cursor = self.cursor_offset();
-        self.replace(cursor..cursor, &text);
+        self.replace(self.edit_range(), &text);
     }
 
     #[cfg(test)]
@@ -219,38 +270,39 @@ impl InputDocument {
     }
 
     pub fn add_line(&mut self) {
-        let cursor = self.cursor_offset();
-        self.replace(cursor..cursor, "\n");
+        self.replace(self.edit_range(), "\n");
     }
 
     pub fn remove_char(&mut self) {
-        let cursor = self.cursor_offset();
-        if cursor > 0 {
-            self.replace(cursor - 1..cursor, "");
+        let range = self.edit_range();
+        if !range.is_empty() {
+            self.replace(range, "");
+        } else if range.start > 0 {
+            self.replace(range.start - 1..range.start, "");
         }
     }
 
     #[cfg(test)]
     pub fn move_left(&mut self) {
-        self.display.move_left();
+        self.display.move_left(false);
         self.normalize_cursor(CursorDirection::Left);
     }
 
     #[cfg(test)]
     pub fn move_right(&mut self) {
-        self.display.move_right();
+        self.display.move_right(false);
         self.normalize_cursor(CursorDirection::Right);
     }
 
     #[cfg(test)]
     pub fn move_up(&mut self) {
-        self.display.move_up();
+        self.display.move_vertical(-1, false);
         self.normalize_cursor(CursorDirection::Nearest);
     }
 
     #[cfg(test)]
     pub fn move_home(&mut self) {
-        self.display.move_home();
+        self.display.move_home(false);
         self.normalize_cursor(CursorDirection::Nearest);
     }
 
@@ -282,9 +334,16 @@ impl InputDocument {
                     self.delete_to_line_end();
                     EditResult::Changed
                 }
-                KeyCode::Left | KeyCode::Right | KeyCode::Char('a') | KeyCode::Char('e') => {
-                    self.move_with_key(key)
+                // Select-all displaces emacs' line-start, which `Home` still
+                // reaches. Nothing else in the composer can take a whole draft
+                // in one keystroke.
+                KeyCode::Char('a') => {
+                    self.select_all();
+                    EditResult::Moved
                 }
+                KeyCode::Char('z') => self.stepped(Self::undo),
+                KeyCode::Char('y') => self.stepped(Self::redo),
+                KeyCode::Left | KeyCode::Right | KeyCode::Char('e') => self.move_with_key(key),
                 _ => EditResult::Ignored,
             };
         }
@@ -310,9 +369,11 @@ impl InputDocument {
                 EditResult::Changed
             }
             KeyCode::Delete => {
-                let cursor = self.cursor_offset();
-                if cursor < self.display.value().chars().count() {
-                    self.replace(cursor..cursor + 1, "");
+                let range = self.edit_range();
+                if !range.is_empty() {
+                    self.replace(range, "");
+                } else if range.end < self.display_text().chars().count() {
+                    self.replace(range.start..range.start + 1, "");
                 }
                 EditResult::Changed
             }
@@ -326,13 +387,37 @@ impl InputDocument {
         }
     }
 
-    fn move_with_key(&mut self, key: KeyEvent) -> EditResult {
-        let direction = CursorDirection::from_key(key);
-        let result = self.display.handle_key(key);
-        if result == EditResult::Moved {
-            self.normalize_cursor(direction);
+    fn stepped(&mut self, step: impl Fn(&mut Self) -> bool) -> EditResult {
+        match step(self) {
+            true => EditResult::Changed,
+            false => EditResult::Ignored,
         }
-        result
+    }
+
+    /// Caret motions. Shift keeps the anchor so the motion grows a selection,
+    /// which is what every other editor in the app does.
+    fn move_with_key(&mut self, key: KeyEvent) -> EditResult {
+        let extend = key.modifiers.contains(KeyModifiers::SHIFT);
+        let control = key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::ALT);
+        let super_key = key.modifiers.contains(KeyModifiers::SUPER);
+        match key.code {
+            KeyCode::Left if control => self.display.move_word_left(extend),
+            KeyCode::Left if super_key => self.display.move_home(extend),
+            KeyCode::Left => self.display.move_left(extend),
+            KeyCode::Right if control => self.display.move_word_right(extend),
+            KeyCode::Right if super_key => self.display.move_end(extend),
+            KeyCode::Right => self.display.move_right(extend),
+            KeyCode::Char('e') => self.display.move_end(extend),
+            KeyCode::Up => self.display.move_vertical(-1, extend),
+            KeyCode::Down => self.display.move_vertical(1, extend),
+            KeyCode::Home => self.display.move_home(extend),
+            KeyCode::End => self.display.move_end(extend),
+            _ => return EditResult::Ignored,
+        }
+        self.history.break_group();
+        self.normalize_cursor(CursorDirection::from_key(key));
+        EditResult::Moved
     }
 
     pub fn focused_paste(&self) -> Option<PasteId> {
@@ -362,7 +447,8 @@ impl InputDocument {
         let Some(paste) = self.pastes.iter().find(|paste| paste.id == id) else {
             return false;
         };
-        self.display.set_cursor_offset(paste.range.start);
+        let cursor = self.cursor_of(paste.range.start);
+        self.display.set_cursor(cursor, false);
         true
     }
 
@@ -376,9 +462,15 @@ impl InputDocument {
         let old_len = old_range.len();
         let new_len = label.chars().count();
         let cursor = self.cursor_offset();
-        let display = replace_char_range(&self.display.value(), old_range.clone(), &label);
 
-        self.display = TextBuffer::new(display);
+        let start = self.cursor_of(old_range.start);
+        let end = self.cursor_of(old_range.end);
+        self.display.set_cursor(start, false);
+        self.display.set_cursor(end, true);
+        if let Some(edit) = self.display.insert(&label) {
+            self.history.record(edit);
+        }
+
         self.pastes[index].range = old_range.start..old_range.start + new_len;
         self.pastes[index].text = text;
         shift_spans(&mut self.pastes[index + 1..], old_len, new_len);
@@ -390,7 +482,8 @@ impl InputDocument {
         } else {
             old_range.start
         };
-        self.display.set_cursor_offset(cursor);
+        let cursor = self.cursor_of(cursor);
+        self.display.set_cursor(cursor, false);
         true
     }
 
@@ -411,15 +504,26 @@ impl InputDocument {
             .collect()
     }
 
+    /// The selection clipped to line `y`, in line-local char offsets, so the
+    /// painter can ask every line and paint the ones that come back.
+    pub fn selection_on_line(&self, y: usize) -> Option<Range<usize>> {
+        let selection = self.selection()?;
+        let start = line_start(self.lines(), y)?;
+        let end = start + self.lines()[y].chars().count();
+        let lo = selection.start.max(start);
+        let hi = selection.end.min(end);
+        (lo < hi).then(|| lo - start..hi - start)
+    }
+
     pub fn expand_pastes(&mut self) {
-        let text = self.expanded_text();
-        self.display = TextBuffer::new(text);
-        self.display.move_to_end();
+        self.display = buffer_of(&self.expanded_text());
+        self.display.move_document_end(false);
+        self.history = History::default();
         self.pastes.clear();
     }
 
     fn project<'a>(&'a self, replacement: impl Fn(&'a PasteSpan) -> &'a str) -> String {
-        let display = self.display.value();
+        let display = self.display_text();
         let mut projected = String::with_capacity(display.len());
         let mut cursor = 0;
         for paste in &self.pastes {
@@ -431,6 +535,9 @@ impl InputDocument {
         projected
     }
 
+    /// Splices `inserted` over a char range. A range that reaches into a paste
+    /// chip swallows the whole chip: half a summary stands for nothing, and a
+    /// selection that straddles one is the ordinary way to reach that state.
     fn replace(&mut self, mut removed: Range<usize>, inserted: &str) {
         loop {
             let mut expanded = removed.clone();
@@ -446,11 +553,47 @@ impl InputDocument {
             removed = expanded;
         }
 
-        let cursor = removed.start + inserted.chars().count();
-        let display = replace_char_range(&self.display.value(), removed.clone(), inserted);
+        let start = self.cursor_of(removed.start);
+        let end = self.cursor_of(removed.end);
+        self.display.set_cursor(start, false);
+        self.display.set_cursor(end, true);
+        if let Some(edit) = self.display.insert(inserted) {
+            self.history.record(edit);
+        }
         self.apply_change(removed, inserted.chars().count());
-        self.display = TextBuffer::new(display);
-        self.display.set_cursor_offset(cursor);
+    }
+
+    /// The range an edit acts on: the selection when there is one, otherwise
+    /// the caret.
+    fn edit_range(&self) -> Range<usize> {
+        self.selection().unwrap_or_else(|| {
+            let cursor = self.cursor_offset();
+            cursor..cursor
+        })
+    }
+
+    /// Char offset of `cursor` in [`Self::display_text`].
+    fn offset_of(&self, cursor: Cursor) -> usize {
+        self.display
+            .lines()
+            .iter()
+            .take(cursor.line)
+            .map(|line| line.chars().count() + 1)
+            .sum::<usize>()
+            + cursor.col
+    }
+
+    /// Inverse of [`Self::offset_of`], clamped to the end of the text.
+    fn cursor_of(&self, mut offset: usize) -> Cursor {
+        for (line, text) in self.display.lines().iter().enumerate() {
+            let len = text.chars().count();
+            if offset <= len {
+                return Cursor::new(line, offset);
+            }
+            offset -= len + 1;
+        }
+        let last = self.display.line_count().saturating_sub(1);
+        Cursor::new(last, self.display.line(last).chars().count())
     }
 
     fn apply_change(&mut self, removed: Range<usize>, inserted_len: usize) {
@@ -485,7 +628,8 @@ impl InputDocument {
                 }
             }
         };
-        self.display.set_cursor_offset(offset);
+        let cursor = self.cursor_of(offset);
+        self.display.set_cursor(cursor, false);
     }
 
     fn delete_word_before(&mut self) {
@@ -599,6 +743,10 @@ fn valid_ranges(text: &str, ranges: &[Range<usize>]) -> bool {
     })
 }
 
+fn buffer_of(text: &str) -> Buffer {
+    Buffer::new(text.split('\n').map(str::to_owned).collect())
+}
+
 fn line_start(lines: &[String], y: usize) -> Option<usize> {
     (y < lines.len()).then(|| {
         lines
@@ -609,20 +757,16 @@ fn line_start(lines: &[String], y: usize) -> Option<usize> {
     })
 }
 
-fn char_slice(text: &str, range: Range<usize>) -> &str {
-    let start = TextBuffer::char_to_byte(text, range.start);
-    let end = TextBuffer::char_to_byte(text, range.end);
-    &text[start..end]
+fn char_to_byte(text: &str, chars: usize) -> usize {
+    text.char_indices()
+        .nth(chars)
+        .map_or(text.len(), |(offset, _)| offset)
 }
 
-fn replace_char_range(text: &str, range: Range<usize>, replacement: &str) -> String {
-    let start = TextBuffer::char_to_byte(text, range.start);
-    let end = TextBuffer::char_to_byte(text, range.end);
-    let mut result = String::with_capacity(text.len() - (end - start) + replacement.len());
-    result.push_str(&text[..start]);
-    result.push_str(replacement);
-    result.push_str(&text[end..]);
-    result
+fn char_slice(text: &str, range: Range<usize>) -> &str {
+    let start = char_to_byte(text, range.start);
+    let end = char_to_byte(text, range.end);
+    &text[start..end]
 }
 
 fn ranges_intersect(left: &Range<usize>, right: &Range<usize>) -> bool {

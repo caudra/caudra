@@ -14,7 +14,7 @@ const MULTI_CLICK_WINDOW: Duration = Duration::from_millis(400);
 const LONGEST_RUN: u8 = 3;
 
 #[derive(Debug, Default)]
-pub(crate) struct Clicks {
+pub struct Clicks {
     last: Option<(Instant, (u16, u16))>,
     count: u8,
 }
@@ -22,7 +22,7 @@ pub(crate) struct Clicks {
 impl Clicks {
     /// How many presses in a row have landed on this cell, counting this one.
     /// A press elsewhere, or one that arrives too late, starts a fresh run.
-    pub(crate) fn press(&mut self, at: (u16, u16), now: Instant) -> u8 {
+    pub fn press(&mut self, at: (u16, u16), now: Instant) -> u8 {
         let continues = self.last.is_some_and(|(when, where_)| {
             where_ == at && now.duration_since(when) < MULTI_CLICK_WINDOW
         });

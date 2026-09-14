@@ -18,6 +18,7 @@ use std::fmt::Write as _;
 use std::ops::Range;
 
 use caudra_markdown::render::SpanSource;
+use caudra_workbench::Clicks;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
@@ -25,15 +26,16 @@ use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget, Wrap};
+use unicode_width::UnicodeWidthChar;
 
 use super::messages::{ASSISTANT_LABEL, ReviewTarget};
 use super::modal::Modal;
 use super::scrollbar::{Scrollbar, ScrollbarMouse};
+use super::text_editor::{EditorKey, EditorMouse, TextEditor};
 use super::{DisplaySource, Overlay, hint_line};
 use crate::markdown;
 use crate::provenance::{LineProvenance, Provenance};
 use crate::selection::{self, LineBreaks, ScreenSelection, line_chars, wrap_breaks};
-use crate::text_buffer::TextBuffer;
 use crate::theme;
 
 const PASSAGE_TITLE: &str = " Review reply ";
@@ -76,10 +78,22 @@ struct Target {
     provenance: Option<Provenance>,
 }
 
+/// A cell of the passage: a display row, and a column inside the content width.
+/// Ordering is reading order, which is what makes a span of two of them a
+/// selection.
+#[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+struct Cell {
+    row: u16,
+    col: u16,
+}
+
 enum Mode {
     Passage {
-        cursor: u16,
-        anchor: Option<u16>,
+        cursor: Cell,
+        /// Where a selection started. `None`, or an anchor the cursor never
+        /// left, means the whole row is taken rather than one character: a
+        /// click and a bare caret both mean "this line".
+        anchor: Option<Cell>,
     },
     Note {
         rows: (u16, u16),
@@ -92,6 +106,8 @@ pub(crate) enum ReviewAction {
     Consumed,
     Passthrough,
     Submit(String),
+    /// Text the host should put on the system clipboard.
+    Copy(String),
     Close,
 }
 
@@ -99,7 +115,8 @@ pub(crate) struct ReviewModal {
     target: Option<Target>,
     notes: Vec<ReviewNote>,
     mode: Mode,
-    buffer: TextBuffer,
+    note: TextEditor,
+    clicks: Clicks,
     scroll: u16,
     scrollbar: Scrollbar,
     rows_total: u16,
@@ -114,10 +131,11 @@ impl ReviewModal {
             target: None,
             notes: Vec::new(),
             mode: Mode::Passage {
-                cursor: 0,
+                cursor: Cell::default(),
                 anchor: None,
             },
-            buffer: TextBuffer::new(String::new()),
+            note: TextEditor::new(),
+            clicks: Clicks::default(),
             scroll: 0,
             scrollbar: Scrollbar::default(),
             rows_total: 0,
@@ -135,7 +153,7 @@ impl ReviewModal {
             provenance: target.provenance,
         });
         self.mode = Mode::Passage {
-            cursor: 0,
+            cursor: Cell::default(),
             anchor: None,
         };
         self.scroll = 0;
@@ -166,7 +184,7 @@ impl ReviewModal {
         if !matches!(self.mode, Mode::Note { .. }) {
             return false;
         }
-        self.buffer.insert_text(text);
+        self.note.handle_paste(text);
         true
     }
 
@@ -184,6 +202,15 @@ impl ReviewModal {
         if self.target.is_none() {
             return ReviewAction::Passthrough;
         }
+        // The note editor owns the whole pointer while it is up, bar and wheel
+        // included: the passage behind it is not what the pointer is on.
+        let Mode::Passage { .. } = self.mode else {
+            return match self.note.handle_mouse(&event) {
+                EditorMouse::Consumed => ReviewAction::Consumed,
+                EditorMouse::Copy(text) => ReviewAction::Copy(text),
+                EditorMouse::Passthrough => ReviewAction::Passthrough,
+            };
+        };
         match self.scrollbar.handle(&event) {
             ScrollbarMouse::Ignored => {}
             ScrollbarMouse::Consumed => return ReviewAction::Consumed,
@@ -201,34 +228,53 @@ impl ReviewModal {
             self.scroll(delta);
             return ReviewAction::Consumed;
         }
-        let Mode::Passage { .. } = self.mode else {
-            return ReviewAction::Passthrough;
-        };
         let inside = self
             .content
             .contains(Position::new(event.column, event.row));
         match event.kind {
             MouseEventKind::Down(MouseButton::Left) if inside => {
-                let row = self.row_at(event.row);
-                self.mode = Mode::Passage {
-                    cursor: row,
-                    anchor: Some(row),
-                };
+                self.press(event.column, event.row);
                 ReviewAction::Consumed
             }
-            MouseEventKind::Drag(MouseButton::Left) if inside => {
-                let row = self.row_at(event.row);
-                if let Mode::Passage { cursor, .. } = &mut self.mode {
-                    *cursor = row;
+            MouseEventKind::Drag(MouseButton::Left) => {
+                let at = self.cell_at(event.column, event.row);
+                if let Mode::Passage { cursor, anchor } = &mut self.mode {
+                    anchor.get_or_insert(*cursor);
+                    *cursor = at;
                 }
                 ReviewAction::Consumed
             }
-            MouseEventKind::Up(MouseButton::Left) if inside => ReviewAction::Consumed,
+            MouseEventKind::Up(MouseButton::Left) if inside => match self.selected_text() {
+                Some(text) => ReviewAction::Copy(text),
+                None => ReviewAction::Consumed,
+            },
             _ => ReviewAction::Passthrough,
         }
     }
 
-    fn passage_key(&mut self, key: KeyEvent, cursor: u16, anchor: Option<u16>) -> ReviewAction {
+    /// One press drops the caret and takes the row, two take the word under it,
+    /// three take the row again, which is what a triple click means everywhere
+    /// else and what the passage was already doing before it could select a
+    /// word at all.
+    fn press(&mut self, column: u16, row: u16) {
+        let at = self.cell_at(column, row);
+        let anchor = match self.clicks.press((column, row), std::time::Instant::now()) {
+            2 => self.word_at(at),
+            _ => None,
+        };
+        self.mode = match anchor {
+            Some((start, end)) => Mode::Passage {
+                cursor: end,
+                anchor: Some(start),
+            },
+            None => Mode::Passage {
+                cursor: at,
+                anchor: Some(at),
+            },
+        };
+    }
+
+    fn passage_key(&mut self, key: KeyEvent, cursor: Cell, anchor: Option<Cell>) -> ReviewAction {
         let page = (self.content.height / 2).max(1);
         match key.code {
             KeyCode::Esc => {
@@ -250,13 +296,28 @@ impl ReviewModal {
                 self.close();
                 return ReviewAction::Submit(compiled);
             }
+            // Without a selection there is nothing to copy, and the chord is
+            // the way out of the session before it is a copy.
+            KeyCode::Char('c') if key.modifiers == KeyModifiers::CONTROL => {
+                return match self.selected_text() {
+                    Some(text) => ReviewAction::Copy(text),
+                    None => ReviewAction::Passthrough,
+                };
+            }
+            KeyCode::Char('a') if key.modifiers == KeyModifiers::CONTROL => {
+                self.mode = Mode::Passage {
+                    cursor: self.last_cell(),
+                    anchor: Some(Cell::default()),
+                };
+                return ReviewAction::Consumed;
+            }
             KeyCode::Enter => {
-                let rows = ordered(cursor, anchor);
-                let quote = self.quote(rows);
+                let rows = self.selected_rows();
+                let quote = self.quote(self.selection());
                 if quote.trim().is_empty() {
                     return ReviewAction::Consumed;
                 }
-                self.buffer = TextBuffer::new(String::new());
+                self.note.set_text(String::new());
                 self.mode = Mode::Note {
                     rows,
                     quote,
@@ -264,37 +325,100 @@ impl ReviewModal {
                 };
                 return ReviewAction::Consumed;
             }
-            KeyCode::Char('v') => {
-                self.mode = Mode::Passage {
-                    cursor,
-                    anchor: anchor.xor(Some(cursor)),
-                };
-                return ReviewAction::Consumed;
-            }
             KeyCode::Char('d') => {
-                self.delete_note_at(cursor);
+                self.delete_note_at(cursor.row);
                 return ReviewAction::Consumed;
             }
             KeyCode::Char('e') => {
-                self.edit_note_at(cursor);
+                self.edit_note_at(cursor.row);
                 return ReviewAction::Consumed;
             }
-            KeyCode::Char('n') => return self.jump_note(cursor, true),
-            KeyCode::Char('p') => return self.jump_note(cursor, false),
+            KeyCode::Char('n') => return self.jump_note(cursor.row, true),
+            KeyCode::Char('p') => return self.jump_note(cursor.row, false),
             _ => {}
         }
 
         let last = self.rows_total.saturating_sub(1);
-        let moved = match key.code {
-            KeyCode::Char('j') | KeyCode::Down => cursor.saturating_add(1),
-            KeyCode::Char('k') | KeyCode::Up => cursor.saturating_sub(1),
-            KeyCode::Char('g') | KeyCode::Home => 0,
-            KeyCode::Char('G') | KeyCode::End => last,
-            KeyCode::PageDown => cursor.saturating_add(page),
-            KeyCode::PageUp => cursor.saturating_sub(page),
+        let right = self.width.saturating_sub(1);
+        let by_word = key.modifiers.contains(KeyModifiers::CONTROL);
+        let extend = key.modifiers.contains(KeyModifiers::SHIFT);
+        // A vertical extension takes whole rows: a reader picking out prose
+        // means lines, and carrying the column down would clip the row it just
+        // took. `seed` is where the anchor lands when the extension starts, so
+        // the row the caret was on is taken whole too.
+        let vertical = |rows: u16, down: bool| {
+            let moved = Cell {
+                row: match down {
+                    true => cursor.row.saturating_add(rows),
+                    false => cursor.row.saturating_sub(rows),
+                },
+                col: match (extend, down) {
+                    (true, true) => right,
+                    (true, false) => 0,
+                    (false, _) => cursor.col,
+                },
+            };
+            let seed = Cell {
+                col: if down { 0 } else { right },
+                ..cursor
+            };
+            (moved, seed)
+        };
+        let (moved, seed) = match key.code {
+            KeyCode::Down => vertical(1, true),
+            KeyCode::Up => vertical(1, false),
+            KeyCode::PageDown => vertical(page, true),
+            KeyCode::PageUp => vertical(page, false),
+            // Stepping off either end of a row carries on to the next, the way
+            // a caret crosses a line break in any editor.
+            KeyCode::Right if cursor.col >= right => (
+                Cell {
+                    row: cursor.row.saturating_add(1),
+                    col: 0,
+                },
+                cursor,
+            ),
+            KeyCode::Right => (
+                Cell {
+                    col: cursor.col + 1,
+                    ..cursor
+                },
+                cursor,
+            ),
+            KeyCode::Left if cursor.col == 0 => (
+                Cell {
+                    row: cursor.row.saturating_sub(1),
+                    col: if cursor.row == 0 { 0 } else { right },
+                },
+                cursor,
+            ),
+            KeyCode::Left => (
+                Cell {
+                    col: cursor.col - 1,
+                    ..cursor
+                },
+                cursor,
+            ),
+            KeyCode::Home if by_word => (Cell::default(), cursor),
+            KeyCode::Home => (Cell { col: 0, ..cursor }, cursor),
+            KeyCode::End if by_word => (self.last_cell(), cursor),
+            KeyCode::End => (
+                Cell {
+                    col: right,
+                    ..cursor
+                },
+                cursor,
+            ),
             _ => return ReviewAction::Consumed,
         };
-        self.set_cursor(moved.min(last), anchor);
+        let moved = Cell {
+            row: moved.row.min(last),
+            col: moved.col.min(right),
+        };
+        // Shift keeps the anchor and grows the span; a bare motion drops it, so
+        // the caret goes back to meaning one row.
+        let anchor = extend.then(|| anchor.unwrap_or(seed));
+        self.set_cursor(moved, anchor);
         ReviewAction::Consumed
     }
 
@@ -307,12 +431,11 @@ impl ReviewModal {
             self.save_note();
             return ReviewAction::Consumed;
         }
-        if key.code == KeyCode::Enter {
-            self.buffer.add_line();
-        } else {
-            self.buffer.handle_key(key);
+        match self.note.handle_key(key) {
+            EditorKey::Consumed => ReviewAction::Consumed,
+            EditorKey::Copy(text) => ReviewAction::Copy(text),
+            EditorKey::Passthrough => ReviewAction::Passthrough,
         }
-        ReviewAction::Consumed
     }
 
     fn save_note(&mut self) {
@@ -324,7 +447,7 @@ impl ReviewModal {
         else {
             return;
         };
-        let comment = self.buffer.value();
+        let comment = self.note.text();
         if comment.trim().is_empty() {
             return;
         }
@@ -345,11 +468,8 @@ impl ReviewModal {
     }
 
     fn back_to_passage(&mut self) {
-        let cursor = match self.mode {
-            Mode::Note { rows, .. } => rows.0,
-            Mode::Passage { cursor, .. } => cursor,
-        };
-        self.buffer.clear();
+        let cursor = self.caret();
+        self.note.set_text(String::new());
         self.mode = Mode::Passage {
             cursor,
             anchor: None,
@@ -361,8 +481,8 @@ impl ReviewModal {
             return;
         };
         let note = &self.notes[index];
-        self.buffer = TextBuffer::new(note.comment.clone());
-        self.buffer.move_to_end();
+        self.note.set_text(note.comment.clone());
+        self.note.move_to_end();
         self.mode = Mode::Note {
             rows: note.rows,
             quote: note.quote.clone(),
@@ -385,7 +505,7 @@ impl ReviewModal {
             rows.iter().rev().find(|&&row| row < cursor).copied()
         };
         if let Some(row) = next.or_else(|| rows.first().copied()) {
-            self.set_cursor(row, None);
+            self.set_cursor(Cell { row, col: 0 }, None);
         }
         ReviewAction::Consumed
     }
@@ -408,9 +528,9 @@ impl ReviewModal {
             .filter(move |note| Some(note.source) == source && note.width == width)
     }
 
-    fn set_cursor(&mut self, cursor: u16, anchor: Option<u16>) {
+    fn set_cursor(&mut self, cursor: Cell, anchor: Option<Cell>) {
         self.mode = Mode::Passage { cursor, anchor };
-        self.follow_cursor(cursor);
+        self.follow_cursor(cursor.row);
     }
 
     fn follow_cursor(&mut self, cursor: u16) {
@@ -428,14 +548,147 @@ impl ReviewModal {
         self.scroll = self.scroll.min(max);
     }
 
-    fn row_at(&self, screen_row: u16) -> u16 {
-        let offset = screen_row.saturating_sub(self.content.y);
-        (self.scroll + offset).min(self.rows_total.saturating_sub(1))
+    /// The cell under a screen position, which a drag may have carried outside
+    /// the content rect entirely.
+    fn cell_at(&self, screen_col: u16, screen_row: u16) -> Cell {
+        let row = self.scroll + screen_row.saturating_sub(self.content.y);
+        Cell {
+            row: row.min(self.rows_total.saturating_sub(1)),
+            col: screen_col
+                .saturating_sub(self.content.x)
+                .min(self.width.saturating_sub(1)),
+        }
     }
 
-    /// Markdown behind display rows `rows.0..=rows.1`, preferring the source
-    /// text provenance recorded when the segment was painted.
-    fn quote(&self, rows: (u16, u16)) -> String {
+    fn last_cell(&self) -> Cell {
+        Cell {
+            row: self.rows_total.saturating_sub(1),
+            col: self.width.saturating_sub(1),
+        }
+    }
+
+    /// The span the passage will quote and highlight, in display rows and
+    /// content columns. A caret that never left its anchor takes the whole row,
+    /// which is what makes a click and a bare motion mean "this line".
+    fn selection(&self) -> ScreenSelection {
+        let Mode::Passage { cursor, anchor } = self.mode else {
+            let (start, end) = self.selected_rows();
+            return self.whole_rows(start, end);
+        };
+        let (start, end) = match anchor {
+            Some(anchor) if anchor < cursor => (anchor, cursor),
+            Some(anchor) => (cursor, anchor),
+            None => (cursor, cursor),
+        };
+        if start == end {
+            return self.whole_rows(start.row, end.row);
+        }
+        ScreenSelection {
+            start_row: start.row,
+            start_col: start.col,
+            end_row: end.row,
+            end_col: end.col,
+        }
+    }
+
+    fn whole_rows(&self, start: u16, end: u16) -> ScreenSelection {
+        ScreenSelection {
+            start_row: start,
+            start_col: 0,
+            end_row: end,
+            end_col: self.width.saturating_sub(1),
+        }
+    }
+
+    /// The display rows the selection touches. Notes are keyed on rows, so this
+    /// is what a note records however narrow the span inside them was.
+    fn selected_rows(&self) -> (u16, u16) {
+        let selection = self.selection();
+        (selection.start_row, selection.end_row)
+    }
+
+    /// The selected text, or `None` when the caret never left its anchor. A
+    /// bare caret selects a row for the purpose of quoting it, but copying it
+    /// would be a copy the reader never asked for.
+    fn selected_text(&self) -> Option<String> {
+        let Mode::Passage { cursor, anchor } = self.mode else {
+            return None;
+        };
+        if anchor.is_none_or(|anchor| anchor == cursor) {
+            return None;
+        }
+        let text = self.quote(self.selection());
+        (!text.trim().is_empty()).then_some(text)
+    }
+
+    /// The word around `at`, as an inclusive cell span. `None` where the row
+    /// has no text under the pointer, which leaves a double click behaving like
+    /// a single one.
+    fn word_at(&self, at: Cell) -> Option<(Cell, Cell)> {
+        let (chars, range) = self.row_chars(at.row)?;
+        let row = &chars[range];
+        let mut columns = Vec::with_capacity(row.len());
+        let mut column = 0usize;
+        for ch in row {
+            columns.push(column);
+            column += ch.width().unwrap_or(0).max(1);
+        }
+        let index = columns.partition_point(|&start| start <= usize::from(at.col));
+        let index = index.checked_sub(1)?;
+        let wanted = is_word(row[index]);
+        let start = row[..index]
+            .iter()
+            .rposition(|ch| is_word(*ch) != wanted)
+            .map_or(0, |found| found + 1);
+        let end = row[index..]
+            .iter()
+            .position(|ch| is_word(*ch) != wanted)
+            .map_or(row.len(), |offset| index + offset);
+        let last = end.checked_sub(1)?;
+        Some((
+            Cell {
+                row: at.row,
+                col: u16::try_from(columns[start]).unwrap_or(u16::MAX),
+            },
+            Cell {
+                row: at.row,
+                col: u16::try_from(columns[last]).unwrap_or(u16::MAX),
+            },
+        ))
+    }
+
+    /// The chars of the logical line display row `row` belongs to, and the
+    /// range of them that row shows. Replays the same wrap the frame was
+    /// painted with, so a press cannot land on a different half of a line than
+    /// it points at.
+    fn row_chars(&self, row: u16) -> Option<(Vec<char>, Range<usize>)> {
+        if self.width == 0 {
+            return None;
+        }
+        let mut seen = 0u16;
+        for line in self.target_lines() {
+            let chars = line_chars(line);
+            let mut starts = vec![0usize];
+            starts.extend(wrap_breaks(&chars, self.width).into_iter().map(|b| b.start));
+            let index = row
+                .checked_sub(seen)
+                .map(usize::from)
+                .filter(|index| *index < starts.len());
+            if let Some(index) = index {
+                let start = starts[index];
+                let end = starts.get(index + 1).copied().unwrap_or(chars.len());
+                return Some((chars, start..end));
+            }
+            seen = seen.saturating_add(u16::try_from(starts.len()).unwrap_or(u16::MAX));
+        }
+        None
+    }
+
+    /// Markdown behind `sel`, preferring the source text provenance recorded
+    /// when the segment was painted. Partial first and last rows are carried
+    /// through: provenance narrows a covered row to the chars the selection
+    /// touched, so a span inside a line quotes that span.
+    fn quote(&self, sel: ScreenSelection) -> String {
         let Some(target) = &self.target else {
             return String::new();
         };
@@ -443,13 +696,11 @@ impl ReviewModal {
         if width == 0 || self.rows_total == 0 {
             return String::new();
         }
-        let (start, end) = rows;
-        let end = end.min(self.rows_total.saturating_sub(1));
+        let start = sel.start_row;
+        let end = sel.end_row.min(self.rows_total.saturating_sub(1));
         let sel = ScreenSelection {
-            start_row: start,
-            start_col: 0,
             end_row: end,
-            end_col: width.saturating_sub(1),
+            ..sel
         };
         if let Some(text) = target
             .provenance
@@ -502,18 +753,18 @@ impl ReviewModal {
         self.content = text;
         self.width = text.width;
         self.rows_total = total_rows(self.target_lines(), text.width);
-        let cursor = self.cursor();
-        self.follow_cursor(cursor.min(self.rows_total.saturating_sub(1)));
+        let cursor = self.caret();
+        self.follow_cursor(cursor.row.min(self.rows_total.saturating_sub(1)));
 
         self.render_meta(frame, meta_area);
         self.render_gutter(frame, gutter);
         self.render_passage(frame, text);
         frame.render_widget(
             Paragraph::new(hint_line(&[
-                ("j/k", "move"),
-                ("v", "select"),
+                ("Shift+↑↓", "select"),
                 ("Enter", "note"),
                 ("e/d", "edit/delete"),
+                ("n/p", "jump"),
                 ("Ctrl+S", "send"),
                 ("Esc", "close"),
             ])),
@@ -525,7 +776,7 @@ impl ReviewModal {
     fn render_meta(&self, frame: &mut Frame, area: Rect) {
         let theme = theme::current();
         let notes = self.notes.len();
-        let (start, end) = ordered(self.cursor(), self.anchor());
+        let (start, end) = self.selected_rows();
         let rows = if start == end {
             format!("row {}", start + 1)
         } else {
@@ -544,7 +795,7 @@ impl ReviewModal {
 
     fn render_gutter(&self, frame: &mut Frame, area: Rect) {
         let theme = theme::current();
-        let (start, end) = ordered(self.cursor(), self.anchor());
+        let (start, end) = self.selected_rows();
         let noted: Vec<(u16, u16)> = self.visible_notes().map(|note| note.rows).collect();
         let lines = (0..area.height)
             .map(|offset| {
@@ -573,15 +824,22 @@ impl ReviewModal {
             area,
         );
 
-        let (start, end) = ordered(self.cursor(), self.anchor());
+        // The selection is kept in display rows and content columns; the
+        // highlight wants screen cells, so it is offset by the window here and
+        // nowhere else.
+        let selection = self.selection();
+        let (start, end) = (selection.start_row, selection.end_row);
         if start < self.scroll + area.height && end >= self.scroll {
             let top = area.y + start.saturating_sub(self.scroll);
             let bottom = area.y + (end - self.scroll).min(area.height.saturating_sub(1));
             let sel = ScreenSelection {
                 start_row: top.max(area.y),
-                start_col: area.x,
+                start_col: area.x.saturating_add(selection.start_col),
                 end_row: bottom,
-                end_col: area.right().saturating_sub(1),
+                end_col: area
+                    .x
+                    .saturating_add(selection.end_col)
+                    .min(area.right().saturating_sub(1)),
             };
             selection::apply_highlight(frame.buffer_mut(), area, &sel);
         }
@@ -617,14 +875,14 @@ impl ReviewModal {
                 .style(theme.item_desc),
             quote_area,
         );
+        self.note.view(frame, editor_area);
         frame.render_widget(
-            Paragraph::new(editor_lines(&self.buffer))
-                .wrap(Wrap { trim: false })
-                .style(Style::new().fg(theme.foreground)),
-            editor_area,
-        );
-        frame.render_widget(
-            Paragraph::new(hint_line(&[("Ctrl+S", "save"), ("Esc", "back")])),
+            Paragraph::new(hint_line(&[
+                ("Ctrl+S", "save"),
+                ("Ctrl+A", "select all"),
+                ("Ctrl+Z", "undo"),
+                ("Esc", "back"),
+            ])),
             hint_area,
         );
         popup
@@ -634,17 +892,15 @@ impl ReviewModal {
         self.target.as_ref().map_or(&[], |t| t.lines.as_slice())
     }
 
-    fn cursor(&self) -> u16 {
+    /// Where the caret sits. A note being written puts it back on the first row
+    /// of the passage it is about, which is where the reader left it.
+    fn caret(&self) -> Cell {
         match self.mode {
             Mode::Passage { cursor, .. } => cursor,
-            Mode::Note { rows, .. } => rows.0,
-        }
-    }
-
-    fn anchor(&self) -> Option<u16> {
-        match self.mode {
-            Mode::Passage { anchor, .. } => anchor,
-            Mode::Note { rows, .. } => Some(rows.1),
+            Mode::Note { rows, .. } => Cell {
+                row: rows.0,
+                col: 0,
+            },
         }
     }
 }
@@ -658,9 +914,9 @@ impl Overlay for ReviewModal {
     /// message, and cancelling a run must not throw the batch away.
     fn close(&mut self) {
         self.target = None;
-        self.buffer.clear();
+        self.note.set_text(String::new());
         self.mode = Mode::Passage {
-            cursor: 0,
+            cursor: Cell::default(),
             anchor: None,
         };
         self.scroll = 0;
@@ -901,12 +1157,10 @@ fn modal_body_rows(area: Rect, minimum: u16) -> u16 {
         .max(minimum + META_ROWS + HINT_ROWS)
 }
 
-fn ordered(cursor: u16, anchor: Option<u16>) -> (u16, u16) {
-    match anchor {
-        Some(anchor) if anchor < cursor => (anchor, cursor),
-        Some(anchor) => (cursor, anchor),
-        None => (cursor, cursor),
-    }
+/// Word characters for the passage's double click, matching the workbench's
+/// own rule so a word means the same thing in both.
+fn is_word(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '_'
 }
 
 fn plural(count: usize) -> &'static str {
@@ -923,29 +1177,6 @@ fn total_rows(lines: &[Line<'_>], width: u16) -> u16 {
             .saturating_add(1);
         total.saturating_add(u16::try_from(rows).unwrap_or(u16::MAX))
     })
-}
-
-fn editor_lines(buffer: &TextBuffer) -> Vec<Line<'static>> {
-    let theme = theme::current();
-    buffer
-        .lines()
-        .iter()
-        .enumerate()
-        .map(|(y, line)| {
-            if y != buffer.y() {
-                return Line::raw(line.clone());
-            }
-            let byte = TextBuffer::char_to_byte(line, buffer.x());
-            let (before, after) = line.split_at(byte);
-            let mut chars = after.chars();
-            let cursor = chars.next().unwrap_or(' ');
-            Line::from(vec![
-                Span::raw(before.to_owned()),
-                Span::styled(cursor.to_string(), theme.cursor),
-                Span::raw(chars.collect::<String>()),
-            ])
-        })
-        .collect()
 }
 
 #[cfg(test)]
@@ -1001,13 +1232,6 @@ mod tests {
         assert_eq!(compiled.matches(NOTE_CLOSE).count(), 2);
     }
 
-    #[test_case(3, None, (3, 3) ; "collapsed_range_is_the_cursor_row")]
-    #[test_case(3, Some(7), (3, 7) ; "anchor_below_cursor")]
-    #[test_case(7, Some(3), (3, 7) ; "anchor_above_cursor")]
-    fn orders_the_row_range(cursor: u16, anchor: Option<u16>, expected: (u16, u16)) {
-        assert_eq!(ordered(cursor, anchor), expected);
-    }
-
     fn modal_with_rows(rows: u16) -> ReviewModal {
         let mut modal = ReviewModal::new();
         modal.open(
@@ -1028,32 +1252,124 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
-    #[test]
-    fn cursor_stops_at_both_ends() {
-        let mut modal = modal_with_rows(3);
-        modal.handle_key(press(KeyCode::Char('k')));
-        assert_eq!(modal.cursor(), 0);
-        for _ in 0..5 {
-            modal.handle_key(press(KeyCode::Char('j')));
+    fn shift(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::SHIFT)
+    }
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
         }
-        assert_eq!(modal.cursor(), 2);
+    }
+
+    fn click(modal: &mut ReviewModal, column: u16, row: u16) {
+        modal.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), column, row));
+    }
+
+    #[test]
+    fn the_caret_stops_at_both_ends() {
+        let mut modal = modal_with_rows(3);
+        modal.handle_key(press(KeyCode::Up));
+        assert_eq!(modal.caret().row, 0);
+        for _ in 0..5 {
+            modal.handle_key(press(KeyCode::Down));
+        }
+        assert_eq!(modal.caret().row, 2);
+    }
+
+    #[test]
+    fn a_bare_caret_takes_the_whole_row() {
+        let mut modal = modal_with_rows(3);
+        modal.handle_key(press(KeyCode::Right));
+        assert_eq!(modal.selected_rows(), (0, 0));
+        assert_eq!(modal.selection().start_col, 0);
+        assert_eq!(modal.selection().end_col, modal.width - 1);
+    }
+
+    #[test]
+    fn shift_extends_the_selection_and_a_bare_motion_drops_it() {
+        let mut modal = modal_with_rows(3);
+        modal.handle_key(shift(KeyCode::Down));
+        assert_eq!(modal.selected_rows(), (0, 1));
+
+        modal.handle_key(press(KeyCode::Down));
+        assert_eq!(modal.selected_rows(), (2, 2));
+    }
+
+    #[test]
+    fn shift_right_selects_inside_one_row() {
+        let mut modal = modal_with_rows(3);
+        for _ in 0..4 {
+            modal.handle_key(shift(KeyCode::Right));
+        }
+        let selection = modal.selection();
+        assert_eq!((selection.start_row, selection.end_row), (0, 0));
+        assert_eq!((selection.start_col, selection.end_col), (0, 4));
+        assert_eq!(modal.quote(selection), "line");
     }
 
     #[test]
     fn escape_clears_the_range_before_closing() {
         let mut modal = modal_with_rows(3);
-        modal.handle_key(press(KeyCode::Char('v')));
-        modal.handle_key(press(KeyCode::Char('j')));
-        assert_eq!(ordered(modal.cursor(), modal.anchor()), (0, 1));
+        modal.handle_key(shift(KeyCode::Down));
+        assert_eq!(modal.selected_rows(), (0, 1));
 
         assert!(matches!(
             modal.handle_key(press(KeyCode::Esc)),
             ReviewAction::Consumed
         ));
-        assert_eq!(modal.anchor(), None);
+        assert_eq!(modal.selected_rows(), (1, 1));
         assert!(matches!(
             modal.handle_key(press(KeyCode::Esc)),
             ReviewAction::Close
+        ));
+    }
+
+    #[test]
+    fn a_drag_selects_across_rows_and_copies_on_release() {
+        let mut modal = modal_with_rows(3);
+        click(&mut modal, 0, 0);
+        modal.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 5, 1));
+        let action = modal.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 5, 1));
+        assert!(matches!(action, ReviewAction::Copy(text) if text == "line 0\nline 1"));
+    }
+
+    #[test]
+    fn a_click_that_selected_nothing_copies_nothing() {
+        let mut modal = modal_with_rows(3);
+        click(&mut modal, 2, 0);
+        let action = modal.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 2, 0));
+        assert!(matches!(action, ReviewAction::Consumed));
+    }
+
+    #[test]
+    fn a_second_click_on_the_same_cell_takes_the_word() {
+        let mut modal = modal_with_rows(3);
+        click(&mut modal, 2, 0);
+        click(&mut modal, 2, 0);
+        assert_eq!(modal.quote(modal.selection()), "line");
+    }
+
+    #[test]
+    fn copy_without_a_selection_is_left_to_the_app() {
+        let mut modal = modal_with_rows(3);
+        assert!(matches!(
+            modal.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            ReviewAction::Passthrough
+        ));
+    }
+
+    #[test]
+    fn select_all_takes_the_whole_passage() {
+        let mut modal = modal_with_rows(3);
+        modal.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        assert_eq!(modal.selected_rows(), (0, 2));
+        assert!(matches!(
+            modal.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            ReviewAction::Copy(text) if text == "line 0\nline 1\nline 2"
         ));
     }
 
@@ -1131,7 +1447,7 @@ mod tests {
         modal.handle_key(press(KeyCode::Char('d')));
         assert_eq!(modal.notes_pending(), 1);
 
-        modal.handle_key(press(KeyCode::Char('j')));
+        modal.handle_key(press(KeyCode::Down));
         modal.handle_key(press(KeyCode::Char('d')));
         assert_eq!(modal.notes_pending(), 0);
     }
@@ -1139,9 +1455,8 @@ mod tests {
     #[test]
     fn quote_falls_back_to_scraping_without_provenance() {
         let mut modal = modal_with_rows(3);
-        assert_eq!(modal.quote((0, 1)), "line 0\nline 1");
-        modal.handle_key(press(KeyCode::Char('v')));
-        modal.handle_key(press(KeyCode::Char('j')));
+        assert_eq!(modal.quote(modal.whole_rows(0, 1)), "line 0\nline 1");
+        modal.handle_key(shift(KeyCode::Down));
         modal.handle_key(press(KeyCode::Enter));
         assert!(matches!(modal.mode, Mode::Note { ref quote, .. } if quote == "line 0\nline 1"));
     }

@@ -1515,6 +1515,10 @@ impl App {
         if self.paste_editor.is_open() {
             match self.paste_editor.handle_key(key) {
                 PasteEditorAction::Consumed => {}
+                // Nothing in the editor wanted it, so the key keeps whatever it
+                // means to the app: `Ctrl+C` with no selection still quits.
+                PasteEditorAction::Passthrough => return None,
+                PasteEditorAction::Copy(text) => self.copy_to_clipboard(&text),
                 PasteEditorAction::Cancel => self.paste_editor.close(),
                 PasteEditorAction::Save { target, id, text } => {
                     if self.active_input_target() == Some(target)
@@ -1694,6 +1698,11 @@ impl App {
 
         if self.review.is_open() {
             let action = self.review.handle_key(key);
+            // The note editor hands back only the chord it must not swallow, so
+            // `Ctrl+C` with nothing selected still reaches the app.
+            if matches!(action, ReviewAction::Passthrough) {
+                return None;
+            }
             return Some(self.handle_review_action(action));
         }
 
@@ -1854,19 +1863,24 @@ impl App {
         Vec::new()
     }
 
+    /// The one way a surface that holds the mouse hands text to the system
+    /// clipboard, so the workbench, the paste editor and the review modal all
+    /// report a copy the same way.
+    pub(super) fn copy_to_clipboard(&mut self, text: &str) {
+        let message = match self.clipboard.copy_text(text) {
+            Ok(CopyResult::Noop) => "Nothing to copy".to_owned(),
+            Ok(CopyResult::Copied) => "Copied".to_owned(),
+            Err(e) => format!("Copy failed: {e}"),
+        };
+        self.status_bar.flash(message);
+    }
+
     fn handle_workbench_action(&mut self, action: WorkbenchAction) -> Vec<Action> {
         match action {
             WorkbenchAction::Consumed | WorkbenchAction::Passthrough => {}
             WorkbenchAction::Close => self.workbench.close(),
             WorkbenchAction::Flash(message) => self.status_bar.flash(message),
-            WorkbenchAction::Copy(text) => {
-                let message = match self.clipboard.copy_text(&text) {
-                    Ok(CopyResult::Noop) => "Nothing to copy".to_owned(),
-                    Ok(CopyResult::Copied) => "Copied".to_owned(),
-                    Err(e) => format!("Copy failed: {e}"),
-                };
-                self.status_bar.flash(message);
-            }
+            WorkbenchAction::Copy(text) => self.copy_to_clipboard(&text),
             WorkbenchAction::SendToComposer { path, lines } => {
                 self.workbench.close();
                 let text = match path {
@@ -1973,6 +1987,7 @@ impl App {
     fn handle_review_action(&mut self, action: ReviewAction) -> Vec<Action> {
         match action {
             ReviewAction::Consumed | ReviewAction::Passthrough => {}
+            ReviewAction::Copy(text) => self.copy_to_clipboard(&text),
             ReviewAction::Submit(text) => {
                 self.input_box.handle_paste(&text);
                 self.flash(REVIEW_READY_MSG.into());

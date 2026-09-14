@@ -50,10 +50,6 @@ impl TextBuffer {
         self.cursor_y
     }
 
-    pub fn line_count(&self) -> usize {
-        self.lines.len()
-    }
-
     pub fn cursor_offset(&self) -> usize {
         self.lines
             .iter()

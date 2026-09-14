@@ -327,6 +327,7 @@ fn get_bit(bits: &[u64], row: u16) -> bool {
 }
 
 impl LineBreaks {
+    #[cfg(test)]
     pub fn from_heights(heights: impl Iterator<Item = u16>) -> Self {
         let mut line_starts = Vec::new();
         let mut row: u16 = 0;

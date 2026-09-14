@@ -12,7 +12,8 @@ use crate::theme;
 use caudra_agent::PromptAdmission;
 use caudra_agent::mentions::{self, Mention};
 use caudra_storage::input_history::InputHistory;
-use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
+use caudra_workbench::buffer::Cursor;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use std::mem;
 use std::ops::Range;
 use std::path::PathBuf;
@@ -26,12 +27,13 @@ use ratatui::widgets::{Block, Paragraph};
 
 use super::scrollbar::{Scrollbar, ScrollbarMouse};
 use super::{apply_scroll_delta, hover_style};
-use crate::selection::LineBreaks;
 
+#[cfg(test)]
 const CHEVRON: &str = super::CHEVRON;
 const NEWLINE_PAD: &str = "  ";
 const PREFIX_WIDTH: u16 = 2;
 const SPACE: char = ' ';
+const SELECTION: Style = Style::new().add_modifier(Modifier::REVERSED);
 const COMPOSER_RAIL_WIDTH: u16 = 1;
 const COMPOSER_VERTICAL_PADDING: u16 = 1;
 const ADMISSION_SEPARATOR: &str = "  ";
@@ -184,12 +186,16 @@ impl InputBox {
     fn handle_key_inner(&mut self, key: KeyEvent, record_history: bool) -> InputAction {
         self.follow_cursor = true;
 
+        // Shift means the caret is growing a selection, so the edge lines stay
+        // edges instead of handing the draft over to history recall.
+        let extending = key.modifiers.contains(KeyModifiers::SHIFT);
+
         match key.code {
-            KeyCode::Up if self.is_at_first_line() => {
+            KeyCode::Up if !extending && self.is_at_first_line() => {
                 self.history_up();
                 return InputAction::None;
             }
-            KeyCode::Down if self.is_at_last_line() => {
+            KeyCode::Down if !extending && self.is_at_last_line() => {
                 self.history_down();
                 return InputAction::None;
             }
@@ -317,27 +323,8 @@ impl InputBox {
         }
     }
 
-    pub fn copy_text(&self) -> String {
-        self.buffer
-            .lines()
-            .iter()
-            .enumerate()
-            .map(|(i, l)| {
-                let prefix = if i == 0 { CHEVRON } else { NEWLINE_PAD };
-                format!("{prefix}{l}")
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
-    pub fn line_breaks(&self, content_width: u16) -> LineBreaks {
-        let ew = effective_width(content_width as usize);
-        LineBreaks::from_heights(
-            self.buffer
-                .lines()
-                .iter()
-                .map(|line| wrap_row_count(line, ew, false) as u16),
-        )
+    pub fn selected_text(&self) -> Option<String> {
+        self.buffer.selected_text()
     }
 
     pub fn height(&self, width: u16) -> u16 {
@@ -608,10 +595,14 @@ impl InputBox {
                     } else {
                         None
                     };
-                    let styled_spans = match tokens.is_empty() {
+                    let mut styled_spans = match tokens.is_empty() {
                         true => shell_spans,
                         false => Some(token_spans(line, &tokens)),
                     };
+                    if let Some(range) = self.buffer.selection_on_line(i) {
+                        let spans = styled_spans.unwrap_or_else(|| vec![Span::raw(line.clone())]);
+                        styled_spans = Some(apply_selection(spans, &range));
+                    }
                     wrap_line(
                         line,
                         ew,
@@ -727,6 +718,16 @@ impl InputBox {
                 hit
             }
         }
+    }
+
+    /// Extends the selection to the pointer. The press already dropped the
+    /// anchor, so a sweep only ever moves the far end.
+    pub fn handle_drag(&mut self, area: Rect, row: u16, col: u16, focused: bool) {
+        let Some((y, x, _)) = self.click_position_with_hit(area, row, col, focused) else {
+            return;
+        };
+        self.buffer.set_caret(Cursor::new(y, x), true);
+        self.follow_cursor = true;
     }
 
     /// A mention keeps the text cursor where it was clicked, unlike a paste
@@ -1068,6 +1069,38 @@ fn slice_styled_spans(
             result.push(Span::styled(slice, span.style));
         }
         pos = span_end;
+    }
+    result
+}
+
+/// Repaints `range` as selected, splitting spans at its edges. Selection is a
+/// modifier on top of whatever colour a span already carries, so a selected
+/// paste chip or shell keyword still reads as one.
+fn apply_selection(spans: Vec<Span<'static>>, range: &Range<usize>) -> Vec<Span<'static>> {
+    let mut result = Vec::with_capacity(spans.len() + 2);
+    let mut pos = 0;
+    for span in spans {
+        let len = span.content.chars().count();
+        let end = pos + len;
+        if end <= range.start || pos >= range.end {
+            result.push(span);
+            pos = end;
+            continue;
+        }
+        let lo = range.start.saturating_sub(pos).min(len);
+        let hi = (range.end - pos).min(len);
+        for (from, to, selected) in [(0, lo, false), (lo, hi, true), (hi, len, false)] {
+            if from >= to {
+                continue;
+            }
+            let text: String = span.content.chars().skip(from).take(to - from).collect();
+            let style = match selected {
+                true => span.style.patch(SELECTION),
+                false => span.style,
+            };
+            result.push(Span::styled(text, style));
+        }
+        pos = end;
     }
     result
 }
@@ -1717,18 +1750,6 @@ mod tests {
             row1.starts_with("x"),
             "wrapped row should start with content: {row1:?}"
         );
-    }
-
-    #[test]
-    fn copy_text_includes_prefix() {
-        let input = InputBox::new(InputHistory::default(), 20);
-        assert_eq!(input.copy_text(), CHEVRON);
-
-        let mut input = InputBox::new(InputHistory::default(), 20);
-        type_text(&mut input, "line1");
-        input.buffer.add_line();
-        type_text(&mut input, "line2");
-        assert_eq!(input.copy_text(), "❯ line1\n  line2");
     }
 
     #[test_case(Placeholder::Blank, "" ; "blank_shows_only_the_chevron")]

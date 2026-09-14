@@ -727,9 +727,13 @@ impl App {
         };
 
         let sel = state.sel();
-        let scroll = self.scroll_offset(sel.zone);
-        if let Some(screen_sel) = sel.to_screen(scroll) {
-            selection::apply_highlight(frame.buffer_mut(), sel.highlight_area(), &screen_sel);
+        // The composer selects logical text and paints it itself, so a second
+        // screen-cell highlight over the same cells would only disagree with it.
+        if sel.zone != SelectionZone::Input {
+            let scroll = self.scroll_offset(sel.zone);
+            if let Some(screen_sel) = sel.to_screen(scroll) {
+                selection::apply_highlight(frame.buffer_mut(), sel.highlight_area(), &screen_sel);
+            }
         }
         if state.is_pending_copy() {
             let sel = *sel;

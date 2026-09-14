@@ -44,6 +44,7 @@ pub mod status_bar;
 pub(crate) mod storage_modal;
 pub(crate) mod streaming_content;
 pub(crate) mod task_picker;
+pub(crate) mod text_editor;
 pub(crate) mod theme_picker;
 pub(crate) mod thinking_picker;
 pub(crate) mod todo_panel;

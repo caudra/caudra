@@ -5,6 +5,7 @@ use crate::clipboard::CopyResult;
 use crate::components::Overlay;
 use crate::components::command::ChatScope;
 use crate::components::input::InputHit;
+use crate::components::paste_editor::PasteEditorAction;
 use crate::components::permission_prompt::PromptMouse;
 use crate::components::queue_panel::{QueueAction, QueueHit, QueueHitTarget};
 use crate::components::status_bar::{StatusBarHit, StatusBarHitTarget};
@@ -104,11 +105,8 @@ impl App {
         }
         if self.paste_editor.is_open() {
             self.clear_control_hovers();
-            // Ahead of the click, or a drag down the bar would drag the caret.
-            if !self.paste_editor.handle_mouse(&event)
-                && event.kind == MouseEventKind::Down(MouseButton::Left)
-            {
-                self.paste_editor.handle_click(event.row, event.column);
+            if let PasteEditorAction::Copy(text) = self.paste_editor.handle_mouse(&event) {
+                self.copy_to_clipboard(&text);
             }
             return Vec::new();
         }
@@ -807,6 +805,11 @@ impl App {
                 sel.update(row, col, scroll);
             }
         }
+        if zone == SelectionZone::Input {
+            let focused = self.composer_holds_keys();
+            self.active_input_box_mut()
+                .handle_drag(area, row, col, focused);
+        }
     }
 
     fn update_selection_to_edge(&mut self, zone: SelectionZone, col: u16) {
@@ -893,23 +896,9 @@ impl App {
                 let msg_area = self.msg_area();
                 self.chats[render_chat].extract_selection_text(sel, msg_area)
             }
-            SelectionZone::Input => {
-                let scroll = self.scroll_offset(sel.zone);
-                let Some(screen_sel) = sel.to_screen(scroll) else {
-                    self.selection_state = None;
-                    return;
-                };
-                let input_box = self.active_input_box();
-                let copy_text = input_box.copy_text();
-                let input_area = sel.area;
-                let line_breaks = input_box.line_breaks(input_area.width);
-                let regions = [ContentRegion {
-                    area: input_area,
-                    raw_text: &copy_text,
-                    line_breaks,
-                }];
-                selection::extract_selected_text(buf, &screen_sel, &regions)
-            }
+            // The sweep tracked screen cells only to drive edge scrolling; what
+            // it selected is the document's own range.
+            SelectionZone::Input => self.active_input_box().selected_text().unwrap_or_default(),
             SelectionZone::Overlay => {
                 let scroll = self.scroll_offset(sel.zone);
                 let Some(screen_sel) = sel.to_screen(scroll) else {
