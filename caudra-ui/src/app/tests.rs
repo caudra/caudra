@@ -8709,6 +8709,34 @@ fn rewind_to_first_turn_selects_empty_root_without_deleting_state() {
     assert!(matches!(&actions[0], Action::LoadSession(_)));
 }
 
+/// The reminders a turn is given trail it, so cutting the turn cuts them too.
+/// Leaving them behind opened the transcript on two orphaned blocks, put the
+/// next message underneath them, and let the stale announcements suppress the
+/// fresh ones the new turn was owed.
+#[test]
+fn reverting_the_first_turn_takes_its_reminders_with_it() {
+    const ORPHANED_MSG: &str = "a reverted turn must leave no reminder behind";
+    let mut app = test_app();
+    let items = crate::history_items(&[
+        Message::user("first prompt".into()),
+        Message::observation(caudra_agent::prompt::ENVIRONMENT_MARKER.into()),
+        Message::observation(caudra_agent::prompt::PLAN_MODE_MARKER.into()),
+        assistant_message("response"),
+    ]);
+    let first_user = items[0].id;
+    app.state.session_mut().replace_messages(items);
+
+    app.revert_to(first_user, RestoreMode::Conversation);
+
+    assert!(
+        crate::active_session_history(&app.state.session)
+            .unwrap()
+            .is_empty(),
+        "{ORPHANED_MSG}"
+    );
+    assert_eq!(app.input_box.buffer.value(), "first prompt");
+}
+
 #[test]
 fn unrevert_restores_exact_original_head_and_clears_the_rewound_draft() {
     let mut app = build_rewind_app();

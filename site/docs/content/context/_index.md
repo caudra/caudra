@@ -129,6 +129,8 @@ Part of what the model reads was written by Caudra rather than typed by you. The
 
 None of this lives in the system prompt. Anything that changes during a session would invalidate the cached prefix on every change, so it reaches the model as a message instead, and it is sent only when it differs from the last time Caudra said it.
 
+Each one is appended after the message it steers, so the transcript reads in the order it happened and rewinding a turn takes that turn's reminders with it.
+
 Each one appears in the transcript as a dim row folded to its heading. Click the row to read the exact text the model was sent, and click again to fold it back. Mentioned file contents are the exception: the model gets them, and the transcript shows the `@path` you typed rather than the body behind it.
 
 Set `ui.show_reminders = false` to keep the transcript to the conversation alone. The messages still reach the model.

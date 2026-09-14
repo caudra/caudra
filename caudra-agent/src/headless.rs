@@ -3301,7 +3301,9 @@ complete(#{ report: first.output });
     }
 
     impl ScriptedProvider {
-        /// The text of the last user message of every request, in order.
+        /// The text of the last prompt the caller sent in every request, in
+        /// order. Caudra's own injections trail that prompt and carry the same
+        /// role, so they have to be skipped rather than mistaken for it.
         fn user_prompts(&self) -> Vec<String> {
             self.requests
                 .lock()
@@ -3311,7 +3313,12 @@ complete(#{ report: first.output });
                     messages
                         .iter()
                         .rev()
-                        .find(|message| matches!(message.role, Role::User))
+                        .find(|message| {
+                            matches!(message.role, Role::User)
+                                && !message.is_observation()
+                                && !message.is_mention()
+                                && message.display_text.as_deref() != Some("")
+                        })
                         .and_then(Message::first_text_content)
                         .unwrap_or_default()
                         .to_owned()

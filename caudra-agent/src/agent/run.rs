@@ -689,6 +689,12 @@ impl<'h> Agent<'h> {
         }
     }
 
+    /// The preamble trails the message it steers. The user typed that message
+    /// first and watched it land first, so a transcript that hoisted the
+    /// reminders above it would rewrite what they remember happening, and a
+    /// revert that cut the message would strand them there. Trailing also puts
+    /// the standing block closest to the point the model generates from, which
+    /// is what makes the most recent block of a kind the one in force.
     async fn push_user_inputs(&mut self, mut inputs: Vec<AgentInput>, queued: bool) -> String {
         let Some(latest) = inputs.last() else {
             return String::new();
@@ -715,7 +721,6 @@ impl<'h> Agent<'h> {
             preamble.append(&mut input.preamble);
             preamble.append(&mut self.mention_preamble(&input.mentions).await);
         }
-        self.push_input_context(preamble);
 
         let mut telemetry = Vec::with_capacity(inputs.len());
         for input in inputs {
@@ -732,6 +737,7 @@ impl<'h> Agent<'h> {
             };
             self.history.push(message);
         }
+        self.push_input_context(preamble);
         telemetry.join("\n\n")
     }
 
@@ -1663,9 +1669,10 @@ fn last_announced_mode(history: &[Message]) -> AnnouncedMode {
 ///
 /// Carries the mode's full instructions rather than a bare notice, because this
 /// is the only place they appear: the system prompt is deliberately identical in
-/// both modes so that toggling does not re-cache the conversation. Compaction
-/// dropping the announcement is self-healing, since the next turn then finds no
-/// match and announces again.
+/// both modes so that toggling does not re-cache the conversation. An
+/// announcement trails the turn it governs, so the cut that preserves that turn
+/// preserves it too; losing one anyway is self-healing, since the next turn then
+/// finds no match and announces again.
 fn mode_switch_notice(history: &[Message], next: &AgentMode) -> Option<Message> {
     let announced = AnnouncedMode::of(next)?;
     if announced == last_announced_mode(history) {
@@ -1856,6 +1863,7 @@ mod tests {
     const ENVIRONMENT_NEXT_DAY: &str =
         "<system-reminder>\n# Environment\n\n- Date: 2026-09-10\n</system-reminder>";
     const EXPECTED_ENVIRONMENT_NOTICE: &str = "a changed environment must be announced";
+    const EXPECTED_USER_TURN: &str = "the fixture opens on the message the user typed";
     const INSTRUCTIONS_CHANGED: &str =
         "<system-reminder>\n# Instructions changed\n\n+ be brief\n</system-reminder>";
     const MENTION_BODY: &str = "<file path=\"a.rs\">fn main() {}</file>";
@@ -3093,7 +3101,7 @@ mod tests {
     }
 
     #[test]
-    fn run_ingests_preamble_then_mailbox_then_user_message() {
+    fn run_ingests_the_user_message_then_preamble_then_mailbox() {
         smol::block_on(async {
             let id = caudra_storage::id::CaudraId::generate();
             let mailbox = SessionMailbox::register(id);
@@ -3110,9 +3118,9 @@ mod tests {
             agent.run(input).await.unwrap();
             drop(agent);
 
-            assert_eq!(history.as_slice()[0].user_text(), Some("preamble"));
-            assert_eq!(history.as_slice()[1].user_text(), Some("mailbox"));
-            assert_eq!(history.as_slice()[2].user_text(), Some("hello"));
+            assert_eq!(history.as_slice()[0].user_text(), Some("hello"));
+            assert_eq!(history.as_slice()[1].user_text(), Some("preamble"));
+            assert_eq!(history.as_slice()[2].user_text(), Some("mailbox"));
         });
     }
 
@@ -3200,13 +3208,42 @@ mod tests {
         assert!(mode_switch_notice(&history, &plan_mode()).is_none());
     }
 
+    /// A revert cuts the turn and the announcements that trail it, so the next
+    /// turn starts from a transcript that says nothing about either. Both have
+    /// to speak up again rather than leave the model on a block that was
+    /// rewound away.
+    #[test]
+    fn a_turn_reverted_away_takes_its_announcements_with_it() {
+        let turn = [
+            Message::user("draft the plan".into()),
+            standing_notice(&[], crate::prompt::ENVIRONMENT_MARKER, Some(ENVIRONMENT))
+                .expect(EXPECTED_ENVIRONMENT_NOTICE),
+            plan_announcement(),
+        ];
+        let position = turn
+            .iter()
+            .position(|message| !message.is_observation())
+            .expect(EXPECTED_USER_TURN);
+        let reverted = &turn[..position];
+
+        assert!(
+            standing_notice(
+                reverted,
+                crate::prompt::ENVIRONMENT_MARKER,
+                Some(ENVIRONMENT)
+            )
+            .is_some()
+        );
+        assert!(mode_switch_notice(reverted, &plan_mode()).is_some());
+    }
+
     /// The case an in-memory previous mode cannot catch: `Agent` is rebuilt per
     /// run, so only the transcript still knows the session was planning.
     #[test]
     fn a_restored_plan_transcript_switched_to_build_announces_build() {
         let history = [
-            plan_announcement(),
             Message::user("draft the plan".into()),
+            plan_announcement(),
             Message::observation("a mention preamble".into()),
         ];
         let notice = mode_switch_notice(&history, &AgentMode::Build).expect(EXPECTED_BUILD_NOTICE);
@@ -3325,13 +3362,13 @@ mod tests {
             agent.run(input).await.unwrap();
             drop(agent);
 
-            assert_eq!(history.as_slice()[0].user_text(), Some(ENVIRONMENT));
+            assert_eq!(history.as_slice()[0].user_text(), Some("hello"));
+            assert_eq!(history.as_slice()[1].user_text(), Some(ENVIRONMENT));
             assert!(
-                history.as_slice()[1]
+                history.as_slice()[2]
                     .user_text()
                     .is_some_and(|text| text.contains(crate::prompt::PLAN_MODE_MARKER))
             );
-            assert_eq!(history.as_slice()[2].user_text(), Some("hello"));
         });
     }
 
@@ -3375,8 +3412,8 @@ mod tests {
         });
     }
 
-    /// Instruction drift patches the system prompt, so it has to land before
-    /// anything the model might act on under the stale text.
+    /// Instruction drift patches the system prompt, so it has to land ahead of
+    /// the mode rules the model reads under the stale text.
     #[test]
     fn run_announces_changed_instructions_between_the_environment_and_the_mode() {
         smol::block_on(async {
@@ -3398,10 +3435,10 @@ mod tests {
                 .iter()
                 .filter_map(Message::user_text)
                 .collect();
-            assert_eq!(texts[0], ENVIRONMENT);
-            assert_eq!(texts[1], INSTRUCTIONS_CHANGED);
-            assert!(texts[2].contains(crate::prompt::PLAN_MODE_MARKER));
-            assert_eq!(texts[3], "hello");
+            assert_eq!(texts[0], "hello");
+            assert_eq!(texts[1], ENVIRONMENT);
+            assert_eq!(texts[2], INSTRUCTIONS_CHANGED);
+            assert!(texts[3].contains(crate::prompt::PLAN_MODE_MARKER));
         });
     }
 
@@ -3419,7 +3456,7 @@ mod tests {
     }
 
     #[test]
-    fn run_announces_plan_mode_ahead_of_the_user_message() {
+    fn run_announces_plan_mode_below_the_user_message() {
         smol::block_on(async {
             let mut history = History::new(Vec::new());
             let (mut agent, _event_rx) = make_agent(
@@ -3432,12 +3469,12 @@ mod tests {
             agent.run(input).await.unwrap();
             drop(agent);
 
+            assert_eq!(history.as_slice()[0].user_text(), Some("hello"));
             assert!(
-                history.as_slice()[0]
+                history.as_slice()[1]
                     .user_text()
                     .is_some_and(|text| text.contains(crate::prompt::PLAN_MODE_MARKER))
             );
-            assert_eq!(history.as_slice()[1].user_text(), Some("hello"));
         });
     }
 
@@ -3467,9 +3504,9 @@ mod tests {
                 .iter()
                 .map(Message::user_text)
                 .collect::<Vec<_>>();
-            assert_eq!(text, [Some("preamble"), Some("mailbox"), Some("hello")]);
-            assert!(history.as_slice()[0].is_observation());
+            assert_eq!(text, [Some("hello"), Some("preamble"), Some("mailbox")]);
             assert!(history.as_slice()[1].is_observation());
+            assert!(history.as_slice()[2].is_observation());
         });
     }
 
