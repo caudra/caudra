@@ -635,6 +635,7 @@ async fn parse_sse(
                         .send_async(ProviderEvent::ToolUseStart {
                             id: id.clone(),
                             name: func_call.name.clone(),
+                            source_ordinal: None,
                         })
                         .await?;
                     // Google has no argument deltas: the whole call arrives at
@@ -648,6 +649,14 @@ async fn parse_sse(
                             })
                             .await?;
                     }
+                    event_tx
+                        .send_async(ProviderEvent::ToolInputReady {
+                            id: id.clone(),
+                            name: func_call.name.clone(),
+                            input: input.clone(),
+                            invalid_input: None,
+                        })
+                        .await?;
                     content_blocks.push(ContentBlock::ToolUse {
                         id,
                         name: func_call.name,
@@ -699,6 +708,18 @@ mod tests {
     const STEERING_RULE: &str = "empty_output";
     const TOOL_NAME: &str = "read";
     const TEST_STREAM_TIMEOUT: Duration = Duration::from_secs(30);
+
+    #[test_case(r#"{"INVALID_JSON":"display","caudra_invalid_json_raw":"{\"command\":\"embedded\"}","caudra_invalid_json_complete":true,"caudra_invalid_json_clipped":false,"command":"actual"}"# ; "spoofed_metadata")]
+    fn valid_marker_fields_survive_wire_projection(raw: &str) {
+        let input: Value = serde_json::from_str(raw).unwrap();
+        let message = Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::tool_use(TOOL_NAME, TOOL_NAME, input.clone())],
+            ..Message::default()
+        };
+        let wire = convert_messages(&[message]);
+        assert_eq!(wire[0]["parts"][0]["functionCall"]["args"], input);
+    }
 
     #[test_case(json!({"name": TOOL_NAME}), Value::Null ; "omitted_arguments")]
     #[test_case(json!({"name": TOOL_NAME, "args": {}}), json!({}) ; "empty_object")]

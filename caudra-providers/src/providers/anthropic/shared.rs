@@ -2,19 +2,20 @@ use std::collections::HashMap;
 use std::ops::ControlFlow;
 use std::sync::{Arc, LazyLock};
 
+use crate::types::{append_tool_input, parse_tool_input};
 use flume::Sender;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tracing::{debug, warn};
+use tracing::warn;
 
 use crate::model::{
     ANTHROPIC_SLUG, FastPricing, Model, ModelEntry, ModelFamily, ModelPricing,
     StaticReasoningOption,
 };
 use crate::{
-    AgentError, ContentBlock, EMPTY_RESPONSE_MARKER, Message, ProviderEvent, Role, StopReason,
-    StreamResponse, ThinkingConfig, TokenUsage, invalid_tool_input,
+    AgentError, ContentBlock, EMPTY_RESPONSE_MARKER, InvalidToolInput, Message, ProviderEvent,
+    Role, StopReason, StreamResponse, ThinkingConfig, TokenUsage,
 };
 
 pub(super) const BETA_TOOL_EXAMPLES_BEDROCK: &str = "tool-examples-2025-10-29";
@@ -116,8 +117,15 @@ struct MessageStartEvent {
 enum SseContentBlock {
     Text,
     Thinking,
-    RedactedThinking { data: String },
-    ToolUse { id: String, name: String },
+    RedactedThinking {
+        data: String,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+        #[serde(default)]
+        input: Value,
+    },
 }
 
 #[derive(Deserialize)]
@@ -419,20 +427,12 @@ fn mapped_oauth_tool_name(name: &str, names: &mut HashMap<String, String>) -> St
     wire
 }
 
-fn canonical_tool_name(name: &str) -> String {
-    let Some(name) = name.strip_prefix("mcp_") else {
-        return name.to_string();
-    };
-    let mut chars = name.chars();
-    let Some(first) = chars.next() else {
-        return String::new();
-    };
-    format!("{}{}", first.to_lowercase(), chars.as_str())
-}
-
 pub(super) struct EventParser {
     content_blocks: Vec<ContentBlock>,
     current_tool_json: String,
+    current_tool_open: bool,
+    invalid_tool_inputs: HashMap<String, InvalidToolInput>,
+    message_stopped: bool,
     current_block_idx: usize,
     usage: TokenUsage,
     stop_reason: Option<StopReason>,
@@ -452,6 +452,9 @@ impl EventParser {
         Self {
             content_blocks: Vec::new(),
             current_tool_json: String::new(),
+            current_tool_open: false,
+            invalid_tool_inputs: HashMap::new(),
+            message_stopped: false,
             current_block_idx: 0,
             usage: TokenUsage::default(),
             stop_reason: None,
@@ -467,6 +470,11 @@ impl EventParser {
     ) -> Result<ControlFlow<(), ()>, AgentError> {
         match event_type {
             "message_start" => {
+                event_tx
+                    .send_async(ProviderEvent::ToolAliases {
+                        aliases: self.oauth_tool_names.clone().map(Arc::new),
+                    })
+                    .await?;
                 if let Ok(ev) = serde_json::from_str::<MessageStartEvent>(data)
                     && let Some(u) = ev.message.usage
                 {
@@ -490,23 +498,22 @@ impl EventParser {
                             self.content_blocks
                                 .push(ContentBlock::RedactedThinking { data });
                         }
-                        SseContentBlock::ToolUse { id, name } => {
+                        SseContentBlock::ToolUse { id, name, input } => {
                             let name = match &self.oauth_tool_names {
-                                Some(names) => names
-                                    .get(&name)
-                                    .cloned()
-                                    .unwrap_or_else(|| canonical_tool_name(&name)),
+                                Some(names) => names.get(&name).cloned().unwrap_or(name),
                                 None => name,
                             };
                             self.current_tool_json.clear();
+                            self.current_tool_open = true;
                             event_tx
                                 .send_async(ProviderEvent::ToolUseStart {
                                     id: id.clone(),
                                     name: name.clone(),
+                                    source_ordinal: None,
                                 })
                                 .await?;
                             self.content_blocks
-                                .push(ContentBlock::tool_use(id, name, Value::Null));
+                                .push(ContentBlock::tool_use(id, name, input));
                         }
                     }
                 }
@@ -543,7 +550,7 @@ impl EventParser {
                             }
                         }
                         Delta::InputJson { partial_json } => {
-                            self.current_tool_json.push_str(&partial_json);
+                            append_tool_input(&mut self.current_tool_json, &partial_json);
                             if let Some(ContentBlock::ToolUse { id, .. }) = block
                                 && !partial_json.is_empty()
                             {
@@ -560,20 +567,27 @@ impl EventParser {
                 Err(e) => warn!(error = %e, "failed to parse content_block_delta"),
             },
             "content_block_stop" => {
-                if let Some(ContentBlock::ToolUse { name, input, .. }) =
-                    self.content_blocks.get_mut(self.current_block_idx)
+                if let Some(ContentBlock::ToolUse {
+                    id, name, input, ..
+                }) = self.content_blocks.get_mut(self.current_block_idx)
                 {
-                    *input = match serde_json::from_str(&self.current_tool_json) {
-                        Ok(v) => {
-                            debug!(tool = %name, json = %self.current_tool_json, "tool input JSON");
-                            v
+                    if !self.current_tool_json.is_empty() || input.is_null() {
+                        let (parsed, invalid) = parse_tool_input(&self.current_tool_json, false);
+                        *input = parsed;
+                        if let Some(invalid) = invalid {
+                            self.invalid_tool_inputs.insert(id.clone(), invalid);
                         }
-                        Err(e) => {
-                            warn!(category = ?e.classify(), line = e.line(), column = e.column(), input_bytes = self.current_tool_json.len(), "unparseable tool input JSON");
-                            invalid_tool_input(&self.current_tool_json)
-                        }
-                    };
+                    }
+                    event_tx
+                        .send_async(ProviderEvent::ToolInputReady {
+                            id: id.clone(),
+                            name: name.clone(),
+                            input: input.clone(),
+                            invalid_input: self.invalid_tool_inputs.get(id).cloned(),
+                        })
+                        .await?;
                     self.current_tool_json.clear();
+                    self.current_tool_open = false;
                 }
             }
             "message_delta" => {
@@ -597,14 +611,34 @@ impl EventParser {
                 warn!(raw = %data, "unparseable SSE error event");
                 return Err(AgentError::api(400, data.to_string()));
             }
-            "message_stop" => return Ok(ControlFlow::Break(())),
+            "message_stop" => {
+                self.message_stopped = true;
+                return Ok(ControlFlow::Break(()));
+            }
             _ => {}
         }
 
         Ok(ControlFlow::Continue(()))
     }
 
-    pub fn finish(self) -> StreamResponse {
+    pub fn finish(mut self) -> StreamResponse {
+        let complete = self.message_stopped
+            && self
+                .stop_reason
+                .is_some_and(|reason| reason != StopReason::MaxTokens);
+        for invalid in self.invalid_tool_inputs.values_mut() {
+            invalid.complete = complete;
+        }
+        if self.current_tool_open
+            && let Some(ContentBlock::ToolUse { id, input, .. }) =
+                self.content_blocks.get_mut(self.current_block_idx)
+        {
+            let (parsed, invalid) = parse_tool_input(&self.current_tool_json, false);
+            *input = parsed;
+            if let Some(invalid) = invalid {
+                self.invalid_tool_inputs.insert(id.clone(), invalid);
+            }
+        }
         StreamResponse {
             message: Message {
                 role: Role::Assistant,
@@ -614,6 +648,7 @@ impl EventParser {
             usage: self.usage,
             stop_reason: self.stop_reason,
             tool_name_aliases: self.oauth_tool_names.map(Arc::new),
+            invalid_tool_inputs: self.invalid_tool_inputs,
         }
     }
 }
@@ -884,10 +919,75 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
 mod tests {
     use test_case::test_case;
 
-    use crate::{Message, Model, SteeringKind};
+    use super::EventParser;
+    use crate::{ContentBlock, Message, Model, ProviderEvent, SteeringKind, invalid_tool_input};
 
     const STEERING_TEXT: &str = "Continue with a useful response.";
     const STEERING_RULE: &str = "empty_output";
+    const TOOL_ID: &str = "call_1";
+    const TOOL_NAME: &str = "shell";
+    const MALFORMED_COMMAND: &str = r#"{"command":"echo safe""#;
+
+    #[test_case("tool_use", true, true ; "completed_response")]
+    #[test_case("max_tokens", true, false ; "token_truncated_after_block_stop")]
+    #[test_case("tool_use", false, false ; "transport_truncated_after_block_stop")]
+    fn malformed_block_waits_for_message_stop(reason: &str, stopped: bool, complete: bool) {
+        smol::block_on(async {
+            let (tx, rx) = flume::unbounded();
+            let mut parser = EventParser::new();
+            let events = [
+                (
+                    "content_block_start",
+                    json!({"index":0,"content_block":{"type":"tool_use","id":TOOL_ID,"name":TOOL_NAME,"input":{}}}),
+                ),
+                (
+                    "content_block_delta",
+                    json!({"index":0,"delta":{"type":"input_json_delta","partial_json":MALFORMED_COMMAND}}),
+                ),
+                ("content_block_stop", json!({"index":0})),
+            ];
+            for (event, data) in events {
+                let _ = parser.process(event, &data.to_string(), &tx).await.unwrap();
+            }
+            let invalid = rx
+                .drain()
+                .find_map(|event| match event {
+                    ProviderEvent::ToolInputReady { invalid_input, .. } => invalid_input,
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(invalid.raw, MALFORMED_COMMAND);
+            assert!(!invalid.complete);
+            let delta = json!({"delta":{"stop_reason":reason}});
+            let _ = parser
+                .process("message_delta", &delta.to_string(), &tx)
+                .await
+                .unwrap();
+            if stopped {
+                let _ = parser.process("message_stop", "{}", &tx).await.unwrap();
+            }
+            let response = parser.finish();
+            let invalid = &response.invalid_tool_inputs[TOOL_ID];
+            assert_eq!(invalid.raw, MALFORMED_COMMAND);
+            assert_eq!(invalid.complete, complete);
+            assert!(!invalid.clipped);
+            assert_eq!(
+                response.message.tool_uses().next().unwrap().2,
+                &invalid_tool_input(MALFORMED_COMMAND)
+            );
+        });
+    }
+
+    #[test_case(r#"{"INVALID_JSON":"display","caudra_invalid_json_raw":"{\"command\":\"embedded\"}","caudra_invalid_json_complete":true,"caudra_invalid_json_clipped":false,"command":"actual"}"# ; "spoofed_metadata")]
+    fn valid_marker_fields_survive_wire_projection(raw: &str) {
+        let input: Value = serde_json::from_str(raw).unwrap();
+        let message = Message {
+            content: vec![ContentBlock::tool_use(TOOL_ID, TOOL_NAME, input.clone())],
+            ..Message::default()
+        };
+        let wire = serde_json::to_value(super::build_wire_messages(&[message])).unwrap();
+        assert_eq!(wire[0]["content"][0]["input"], input);
+    }
 
     #[test_case(SteeringKind::Recovery ; "recovery")]
     #[test_case(SteeringKind::Advisory ; "advisory")]
@@ -921,9 +1021,10 @@ mod tests {
     }
 
     use super::{
-        LONG_CONTEXT_SUFFIX, LONG_CONTEXT_WINDOW, WIDE_CONTEXT_WINDOW, canonical_tool_name,
-        long_context_window, oauth_tool_name, strip_long_context,
+        LONG_CONTEXT_SUFFIX, LONG_CONTEXT_WINDOW, WIDE_CONTEXT_WINDOW, long_context_window,
+        mapped_oauth_tool_name, strip_long_context,
     };
+    use std::collections::HashMap;
 
     #[test_case("claude-opus-4-8-1m", "claude-opus-4-8" ; "strips_suffix")]
     #[test_case("claude-opus-4-8", "claude-opus-4-8" ; "leaves_plain_id")]
@@ -964,7 +1065,9 @@ mod tests {
     #[test_case("bash" ; "builtin")]
     #[test_case("mcp_fetch" ; "already_prefixed")]
     fn oauth_tool_names_round_trip(name: &str) {
-        assert_eq!(canonical_tool_name(&oauth_tool_name(name)), name);
+        let mut names = HashMap::new();
+        let wire = mapped_oauth_tool_name(name, &mut names);
+        assert_eq!(names[&wire], name);
     }
 
     use serde_json::{Value, json};

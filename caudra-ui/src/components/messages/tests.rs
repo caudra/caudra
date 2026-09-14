@@ -56,6 +56,10 @@ const INJECTED_BODY: &str =
 const INJECTED_HEADING: &str = "Environment";
 const INJECTED_DETAIL: &str = "2026-09-10";
 const REASONING_BODY: &str = "weighing the options";
+const EAGER_SUMMARY: &str = "executed arguments";
+const EAGER_BODY: &str = "execution output";
+const EAGER_ANNOTATION: &str = "ranking 12 files";
+const EAGER_CHILD_ID: &str = "t1:0";
 
 fn snap_line(text: &str) -> SnapshotLine {
     SnapshotLine {
@@ -7026,6 +7030,239 @@ fn a_roster_for_an_unknown_call_is_ignored() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     panel.tool_input_roster("t1", Some(vec![pending_child("file_read")]));
     assert!(panel.messages.is_empty());
+}
+
+fn eager_entry(status: BatchToolStatus) -> BatchToolEntry {
+    BatchToolEntry {
+        tool: SHELL_TOOL_NAME.into(),
+        effect: ToolEffect::Mutating,
+        summary: EAGER_SUMMARY.into(),
+        status,
+        input: Some(ToolInput::Script {
+            language: "bash".into(),
+            code: EAGER_SUMMARY.into(),
+        }),
+        raw_input: Some(serde_json::json!({ "command": EAGER_SUMMARY })),
+        output: Some(ToolOutput::Plain(EAGER_BODY.into())),
+        annotation: Some(EAGER_ANNOTATION.into()),
+    }
+}
+
+fn roster(panel: &MessagesPanel) -> &[BatchToolEntry] {
+    let Some(ToolOutput::Batch { entries, .. }) = panel.messages[0].tool_output.as_deref() else {
+        panic!("{STALE_ROSTER_MSG}");
+    };
+    entries
+}
+
+#[test_case(BatchToolStatus::Running, ViewMode::Compact ; "running_compact")]
+#[test_case(BatchToolStatus::Success, ViewMode::Compact ; "success_compact")]
+#[test_case(BatchToolStatus::Error, ViewMode::Compact ; "error_compact")]
+#[test_case(BatchToolStatus::Running, ViewMode::Expanded ; "running_expanded")]
+#[test_case(BatchToolStatus::Success, ViewMode::Expanded ; "success_expanded")]
+#[test_case(BatchToolStatus::Error, ViewMode::Expanded ; "error_expanded")]
+fn streamed_rosters_and_parent_start_preserve_execution(status: BatchToolStatus, view: ViewMode) {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.set_view(view);
+    panel.tool_pending(TOOL_ID.into(), BATCH_TOOL);
+    panel.tool_input_roster(TOOL_ID, Some(vec![pending_child("alias")]));
+    panel.batch_progress(TOOL_ID, 0, eager_entry(BatchToolStatus::Running));
+    panel.set_batch_child_output(TOOL_ID, 0, EAGER_BODY);
+    panel.set_batch_child_progress(TOOL_ID, 0, child_report());
+    panel.batch_progress(TOOL_ID, 0, eager_entry(status));
+    panel.close_tool_card(TOOL_ID);
+    panel.toggle_batch_child(TOOL_ID, 0);
+
+    panel.tool_input_roster(
+        TOOL_ID,
+        Some(vec![
+            pending_child("alias"),
+            pending_child(FILE_READ_TOOL_NAME),
+        ]),
+    );
+    panel.tool_input_roster(TOOL_ID, Some(vec![pending_child("alias")]));
+    for snapshot_status in [BatchToolStatus::Pending, BatchToolStatus::Running] {
+        let mut stale = pending_child("alias");
+        stale.status = snapshot_status;
+        let mut event = start(TOOL_ID, BATCH_TOOL);
+        event.output = Some(ToolOutput::Batch {
+            entries: vec![stale, pending_child(FILE_READ_TOOL_NAME)],
+            text: String::new(),
+        });
+        panel.tool_start(event);
+        panel.batch_progress(TOOL_ID, 0, pending_child("alias"));
+        render(&mut panel, 100, 40);
+
+        assert_eq!(roster(&panel).len(), 2);
+        assert_eq!(
+            serde_json::to_value(&roster(&panel)[0]).unwrap(),
+            serde_json::to_value(eager_entry(status)).unwrap(),
+            "{STALE_ROSTER_MSG}"
+        );
+        assert_eq!(roster(&panel)[1].status, BatchToolStatus::Pending);
+        assert_eq!(
+            panel.batch_child_stream(TOOL_ID, 0),
+            (!status.is_terminal()).then_some(EAGER_BODY)
+        );
+        assert_eq!(
+            panel.batch_child_progress[TOOL_ID][&0].is_live(),
+            !status.is_terminal()
+        );
+        assert!(panel.card_closed(TOOL_ID));
+        assert!(!panel.batch_views.is_empty());
+    }
+}
+
+#[test_case(None ; "running")]
+#[test_case(Some(false) ; "success")]
+#[test_case(Some(true) ; "error")]
+fn late_top_level_previews_do_not_replace_execution(terminal: Option<bool>) {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.tool_pending(TOOL_ID.into(), SHELL_TOOL_NAME);
+    panel.tool_input_body(TOOL_ID, Some(EAGER_SUMMARY.into()));
+    let entry = eager_entry(BatchToolStatus::Running);
+    let mut event = start(TOOL_ID, SHELL_TOOL_NAME);
+    event.summary = entry.summary;
+    event.input = entry.input;
+    event.raw_input = entry.raw_input;
+    event.output = entry.output;
+    event.annotation = entry.annotation;
+    panel.tool_start(event);
+    panel.tool_output(TOOL_ID, EAGER_BODY);
+    if let Some(is_error) = terminal {
+        panel.tool_done(ToolDoneEvent {
+            is_error,
+            ..shell_done(TOOL_ID, false)
+        });
+    }
+    let before = panel.messages[0].clone();
+    panel.tool_input_preview(
+        TOOL_ID,
+        Some(REASONING_BODY.into()),
+        Some(REASONING_BODY.into()),
+    );
+    panel.tool_input_body(TOOL_ID, Some(REASONING_BODY.into()));
+    panel.tool_input_roster(TOOL_ID, Some(vec![pending_child("alias")]));
+    panel.tool_pending(TOOL_ID.into(), "alias");
+    if terminal.is_some() {
+        panel.tool_start(start(TOOL_ID, "alias"));
+        panel.tool_output(TOOL_ID, REASONING_BODY);
+        panel.tool_annotation(TOOL_ID, REASONING_BODY.into());
+        panel.set_tool_progress(TOOL_ID, child_report());
+    }
+    let after = &panel.messages[0];
+    assert_eq!(panel.messages.len(), 1);
+    assert_eq!(after.role, before.role);
+    assert_eq!(after.text, before.text);
+    assert_eq!(after.annotation, before.annotation);
+    assert_eq!(after.tool_input, before.tool_input);
+    assert_eq!(after.tool_raw_input, before.tool_raw_input);
+    assert_eq!(after.live_output, before.live_output);
+    assert_eq!(
+        serde_json::to_value(&after.tool_output).unwrap(),
+        serde_json::to_value(&before.tool_output).unwrap()
+    );
+    assert!(after.live_body.is_none());
+    assert!(after.progress.is_none());
+    assert!(panel.live_body_dirty.is_empty());
+}
+
+#[test_case(false ; "child_completion")]
+#[test_case(true ; "parent_cancellation")]
+fn child_live_buffers_and_annotations_do_not_resurrect(cancel: bool) {
+    let mut panel = panel_with_running_shell();
+    let body = Arc::new(SharedBuf::new());
+    body.set_lines(vec![snap_line(EAGER_BODY)]);
+    panel.register_live_buf(EAGER_CHILD_ID.into(), Arc::clone(&body));
+    panel.tool_annotation(EAGER_CHILD_ID, EAGER_ANNOTATION.into());
+    panel.set_batch_child_progress(TOOL_ID, 0, child_report());
+    let _ = panel.poll_live_bufs();
+    assert_eq!(panel.batch_child_stream(TOOL_ID, 0), Some(EAGER_BODY));
+    assert_eq!(
+        roster(&panel)[0].annotation.as_deref(),
+        Some(EAGER_ANNOTATION)
+    );
+    if cancel {
+        panel.cancel_in_progress();
+    } else {
+        panel.batch_progress(TOOL_ID, 0, eager_entry(BatchToolStatus::Success));
+    }
+    panel.register_live_buf(EAGER_CHILD_ID.into(), Arc::clone(&body));
+    body.set_lines(vec![snap_line(REASONING_BODY)]);
+    panel.tool_annotation(EAGER_CHILD_ID, REASONING_BODY.into());
+    panel.tool_snapshot(
+        EAGER_CHILD_ID,
+        BufferSnapshot::plain_text(REASONING_BODY.into()),
+        None,
+    );
+    panel.set_batch_child_output(TOOL_ID, 0, REASONING_BODY);
+    panel.set_batch_child_progress(TOOL_ID, 0, child_report());
+    panel.batch_progress(TOOL_ID, 0, running_child(SHELL_TOOL_NAME));
+    let _ = panel.poll_live_bufs();
+    assert!(!panel.live_bufs.contains_key(EAGER_CHILD_ID));
+    assert!(panel.batch_child_stream(TOOL_ID, 0).is_none());
+    assert!(!panel.batch_child_progress[TOOL_ID][&0].is_live());
+    assert_eq!(
+        roster(&panel)[0].annotation.as_deref(),
+        Some(EAGER_ANNOTATION)
+    );
+    assert_eq!(
+        roster(&panel)[0].status,
+        if cancel {
+            BatchToolStatus::Error
+        } else {
+            BatchToolStatus::Success
+        }
+    );
+}
+
+#[test_case(false ; "pending_parent_snapshot")]
+#[test_case(true ; "running_parent_snapshot")]
+fn parent_snapshot_completion_retires_child_live_buffers(started: bool) {
+    let mut panel = panel_with_running_shell();
+    let body = Arc::new(SharedBuf::new());
+    panel.register_live_buf(EAGER_CHILD_ID.into(), Arc::clone(&body));
+    panel.set_batch_child_progress(TOOL_ID, 0, child_report());
+    let mut event = start(TOOL_ID, BATCH_TOOL);
+    event.output = Some(ToolOutput::Batch {
+        entries: vec![eager_entry(BatchToolStatus::Success)],
+        text: String::new(),
+    });
+    panel.tool_start(event);
+    let stale = if started {
+        running_child(SHELL_TOOL_NAME)
+    } else {
+        pending_child(SHELL_TOOL_NAME)
+    };
+    panel.batch_progress(TOOL_ID, 0, stale);
+    assert_eq!(roster(&panel)[0].status, BatchToolStatus::Success);
+    assert!(!panel.live_bufs.contains_key(EAGER_CHILD_ID));
+    assert!(!panel.batch_child_progress[TOOL_ID][&0].is_live());
+}
+
+#[test_case(false ; "success")]
+#[test_case(true ; "error")]
+fn native_shell_completion_retires_live_buffers(is_error: bool) {
+    let mut panel = panel_with_tools(&[(TOOL_ID, SHELL_TOOL_NAME)]);
+    let body = Arc::new(SharedBuf::new());
+    body.set_lines(vec![snap_line(EAGER_BODY)]);
+    panel.register_live_buf(TOOL_ID.into(), Arc::clone(&body));
+    panel.tool_done(ToolDoneEvent {
+        is_error,
+        ..shell_done(TOOL_ID, false)
+    });
+    panel.register_live_buf(TOOL_ID.into(), Arc::clone(&body));
+    body.set_lines(vec![snap_line(REASONING_BODY)]);
+    panel.tool_snapshot(
+        TOOL_ID,
+        BufferSnapshot::plain_text(REASONING_BODY.into()),
+        None,
+    );
+    let _ = panel.poll_live_bufs();
+    assert!(panel.live_bufs.is_empty());
+    assert!(panel.watched_bufs.is_empty());
+    assert_eq!(panel.messages[0].live_output.as_deref(), Some(EAGER_BODY));
+    assert!(panel.messages[0].render_snapshot.is_none());
 }
 
 const FOLD_MARK: &str = "\u{2026}";

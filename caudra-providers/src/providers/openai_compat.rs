@@ -1,5 +1,7 @@
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+use crate::types::{append_tool_input, parse_tool_input};
 use flume::Sender;
 use futures_lite::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
 use isahc::{AsyncReadResponseExt, HttpClient, Request};
@@ -10,7 +12,6 @@ use tracing::{debug, warn};
 use super::ResolvedAuth;
 use crate::{
     AgentError, ContentBlock, Message, ProviderEvent, Role, StopReason, StreamResponse, TokenUsage,
-    invalid_tool_input,
 };
 
 const STREAM_DONE: &str = "[DONE]";
@@ -502,6 +503,30 @@ struct ToolAccumulator {
     id: String,
     name: String,
     arguments: String,
+    announced: bool,
+    sent_bytes: usize,
+}
+
+async fn publish_completed_inputs(
+    calls: &[ToolAccumulator],
+    event_tx: &Sender<ProviderEvent>,
+    complete: bool,
+) -> Result<(), AgentError> {
+    for call in calls {
+        if call.id.is_empty() || call.name.is_empty() {
+            continue;
+        }
+        let (input, invalid_input) = parse_tool_input(&call.arguments, complete);
+        event_tx
+            .send_async(ProviderEvent::ToolInputReady {
+                id: call.id.clone(),
+                name: call.name.clone(),
+                input,
+                invalid_input,
+            })
+            .await?;
+    }
+    Ok(())
 }
 
 pub async fn parse_sse(
@@ -566,6 +591,14 @@ pub async fn parse_sse(
         }
 
         let Some(delta) = choice.delta.or(choice.message) else {
+            if let Some(reason) = stop_reason {
+                publish_completed_inputs(
+                    &tool_accumulators,
+                    event_tx,
+                    reason != StopReason::MaxTokens,
+                )
+                .await?;
+            }
             continue;
         };
 
@@ -650,15 +683,17 @@ pub async fn parse_sse(
                         id: String::new(),
                         name: String::new(),
                         arguments: String::new(),
+                        announced: false,
+                        sent_bytes: 0,
                     });
                 }
                 let acc = &mut tool_accumulators[tc.index];
-                let was_unnamed = acc.name.is_empty();
-                if let Some(id) = tc.id {
+                if let Some(id) = tc.id
+                    && !acc.announced
+                {
                     acc.id = id;
                 }
                 // GLM-5.2 via Mistral sends "" names in subsequent chunks; skip to keep the accumulated name.
-                let mut input_delta = None;
                 if let Some(func) = tc.function {
                     if let Some(name) = func.name
                         && !name.is_empty()
@@ -668,21 +703,29 @@ pub async fn parse_sse(
                     if let Some(args) = func.arguments
                         && !args.is_empty()
                     {
-                        acc.arguments.push_str(&args);
-                        input_delta = Some(args);
+                        append_tool_input(&mut acc.arguments, &args);
                     }
                 }
-                if was_unnamed && !acc.name.is_empty() {
+            }
+            for (ordinal, acc) in tool_accumulators.iter_mut().enumerate() {
+                if acc.name.is_empty() || acc.id.is_empty() {
+                    continue;
+                }
+                if !acc.announced {
+                    acc.announced = true;
                     event_tx
                         .send_async(ProviderEvent::ToolUseStart {
                             id: acc.id.clone(),
                             name: acc.name.clone(),
+                            source_ordinal: Some(ordinal),
                         })
                         .await?;
                 }
                 // After the start, since one chunk can carry both and the
                 // consumer keys deltas off the id the start announced.
-                if let Some(delta) = input_delta {
+                if acc.sent_bytes < acc.arguments.len() {
+                    let delta = acc.arguments[acc.sent_bytes..].to_owned();
+                    acc.sent_bytes = acc.arguments.len();
                     event_tx
                         .send_async(ProviderEvent::ToolInputDelta {
                             id: acc.id.clone(),
@@ -691,6 +734,14 @@ pub async fn parse_sse(
                         .await?;
                 }
             }
+        }
+        if let Some(reason) = stop_reason {
+            publish_completed_inputs(
+                &tool_accumulators,
+                event_tx,
+                reason != StopReason::MaxTokens,
+            )
+            .await?;
         }
     }
 
@@ -704,17 +755,12 @@ pub async fn parse_sse(
         content_blocks.push(ContentBlock::Text { text });
     }
 
+    let mut invalid_tool_inputs = HashMap::new();
     for (idx, acc) in tool_accumulators.into_iter().enumerate() {
-        let input: Value = match serde_json::from_str(&acc.arguments) {
-            Ok(v) => {
-                debug!(tool = %acc.name, json = %acc.arguments, "tool input JSON");
-                v
-            }
-            Err(e) => {
-                warn!(category = ?e.classify(), line = e.line(), column = e.column(), input_bytes = acc.arguments.len(), "malformed tool JSON");
-                invalid_tool_input(&acc.arguments)
-            }
-        };
+        let (input, invalid_input) = parse_tool_input(
+            &acc.arguments,
+            stop_reason.is_some_and(|reason| reason != StopReason::MaxTokens),
+        );
         let id = if acc.id.is_empty() {
             warn!(
                 input_bytes = acc.arguments.len(),
@@ -730,6 +776,26 @@ pub async fn parse_sse(
         } else {
             acc.name
         };
+        if !acc.announced {
+            event_tx
+                .send_async(ProviderEvent::ToolUseStart {
+                    id: id.clone(),
+                    name: name.clone(),
+                    source_ordinal: Some(idx),
+                })
+                .await?;
+        }
+        event_tx
+            .send_async(ProviderEvent::ToolInputReady {
+                id: id.clone(),
+                name: name.clone(),
+                input: input.clone(),
+                invalid_input: invalid_input.clone(),
+            })
+            .await?;
+        if let Some(invalid) = invalid_input {
+            invalid_tool_inputs.insert(id.clone(), invalid);
+        }
         content_blocks.push(ContentBlock::tool_use(id, name, input));
     }
 
@@ -741,6 +807,7 @@ pub async fn parse_sse(
         },
         usage,
         stop_reason,
+        invalid_tool_inputs,
         ..Default::default()
     })
 }
@@ -749,6 +816,7 @@ pub async fn parse_sse(
 mod tests {
     use super::*;
     use crate::SteeringKind;
+    use crate::invalid_tool_input;
     use futures_lite::io::Cursor;
     use test_case::test_case;
 
@@ -758,6 +826,170 @@ mod tests {
     const INVALID_CALL_ID: &str = "original-invalid-call";
     const VALID_CALL_ID: &str = "original-valid-call";
     const TOOL_NAME: &str = "read";
+    const PRIVATE_TAIL: &str = "private repair source tail";
+    const MALFORMED_COMMAND: &str = r#"{"command":"echo safe""#;
+    const STREAM_TAIL: &str = "tail after independently executable call";
+    const EARLY_ARGUMENTS: &str = r#"{"path":"early"}"#;
+    const EARLY_ARGUMENT_PREFIX: &str = r#"{"path":"#;
+    const LATE_ARGUMENTS: &str = r#"{"path":"late"}"#;
+
+    #[test_case(Some("tool_calls"), true ; "completed_response")]
+    #[test_case(Some("length"), false ; "token_truncated")]
+    #[test_case(None, false ; "transport_truncated")]
+    fn malformed_arguments_require_final_status(reason: Option<&str>, complete: bool) {
+        smol::block_on(async {
+            let call = json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":INVALID_CALL_ID,"function":{"name":TOOL_NAME,"arguments":MALFORMED_COMMAND}}]}}]});
+            let mut sse = format!("data: {call}\n\n");
+            if let Some(reason) = reason {
+                let finish = json!({"choices":[{"finish_reason":reason}]});
+                sse.push_str(&format!("data: {finish}\n\n"));
+            }
+            let (tx, _rx) = flume::unbounded();
+            let response = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+                .await
+                .unwrap();
+            let invalid = &response.invalid_tool_inputs[INVALID_CALL_ID];
+            assert_eq!(invalid.raw, MALFORMED_COMMAND);
+            assert_eq!(invalid.complete, complete);
+            assert!(!invalid.clipped);
+        });
+    }
+
+    #[test_case(r#"{"INVALID_JSON":"display","caudra_invalid_json_raw":"{\"command\":\"embedded\"}","caudra_invalid_json_complete":true,"caudra_invalid_json_clipped":false,"command":"actual"}"# ; "spoofed_metadata")]
+    fn valid_marker_fields_survive_wire_projection(raw: &str) {
+        let input: Value = serde_json::from_str(raw).unwrap();
+        let message = Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::tool_use(
+                VALID_CALL_ID,
+                TOOL_NAME,
+                input.clone(),
+            )],
+            ..Message::default()
+        };
+        let wire = convert_messages(&[message], "");
+        assert_eq!(
+            serde_json::from_str::<Value>(
+                wire[1]["tool_calls"][0]["function"]["arguments"]
+                    .as_str()
+                    .unwrap()
+            )
+            .unwrap(),
+            input
+        );
+    }
+
+    #[test_case(true, false ; "missing_name")]
+    #[test_case(false, true ; "missing_id")]
+    #[test_case(false, false ; "missing_both")]
+    fn late_identity_does_not_block_independent_starts(has_id: bool, has_name: bool) {
+        smol::block_on(async {
+            let mut early = json!({"index":0,"function":{"arguments": EARLY_ARGUMENT_PREFIX}});
+            if has_id {
+                early["id"] = json!(INVALID_CALL_ID);
+            }
+            if has_name {
+                early["function"]["name"] = json!(TOOL_NAME);
+            }
+            let chunks = [
+                json!({"choices":[{"delta":{"tool_calls":[early,{"index":1,"id":VALID_CALL_ID,"function":{"name":TOOL_NAME,"arguments":LATE_ARGUMENTS}}]}}]}),
+                json!({"choices":[{"delta":{"content":STREAM_TAIL}}]}),
+                json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":INVALID_CALL_ID,"function":{"name":TOOL_NAME,"arguments": &EARLY_ARGUMENTS[EARLY_ARGUMENT_PREFIX.len()..]}}]}}]}),
+                json!({"choices":[{"finish_reason":"tool_calls"}]}),
+            ];
+            let sse = chunks
+                .iter()
+                .map(|chunk| format!("data: {chunk}\n\n"))
+                .collect::<String>();
+            let (tx, rx) = flume::unbounded();
+            let response = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+                .await
+                .unwrap();
+            let events: Vec<_> = rx.drain().collect();
+            assert!(
+                matches!(&events[0], ProviderEvent::ToolUseStart { id, source_ordinal: Some(1), .. } if id == VALID_CALL_ID)
+            );
+            assert!(
+                matches!(&events[1], ProviderEvent::ToolInputDelta { id, delta } if id == VALID_CALL_ID && delta == LATE_ARGUMENTS)
+            );
+            assert!(matches!(&events[2], ProviderEvent::TextDelta { text } if text == STREAM_TAIL));
+            let starts: Vec<_> = events
+                .iter()
+                .filter_map(|event| match event {
+                    ProviderEvent::ToolUseStart {
+                        id, source_ordinal, ..
+                    } => Some((id.as_str(), *source_ordinal)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                starts,
+                [(VALID_CALL_ID, Some(1)), (INVALID_CALL_ID, Some(0))]
+            );
+            let deltas: Vec<_> = events
+                .iter()
+                .filter_map(|event| match event {
+                    ProviderEvent::ToolInputDelta { id, delta } => {
+                        Some((id.as_str(), delta.as_str()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                deltas,
+                [
+                    (VALID_CALL_ID, LATE_ARGUMENTS),
+                    (INVALID_CALL_ID, EARLY_ARGUMENTS)
+                ]
+            );
+            assert_eq!(
+                response.message.tool_uses().collect::<Vec<_>>(),
+                [
+                    (
+                        INVALID_CALL_ID,
+                        TOOL_NAME,
+                        &serde_json::from_str::<Value>(EARLY_ARGUMENTS).unwrap()
+                    ),
+                    (
+                        VALID_CALL_ID,
+                        TOOL_NAME,
+                        &serde_json::from_str::<Value>(LATE_ARGUMENTS).unwrap()
+                    ),
+                ]
+            );
+        });
+    }
+
+    #[test]
+    fn malformed_repair_source_is_not_reprojected_to_the_model() {
+        let raw = format!(
+            "{}{}",
+            "x".repeat(crate::MAX_TOOL_INPUT_BYTES / 2),
+            PRIVATE_TAIL
+        );
+        let message = Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::tool_use(
+                INVALID_CALL_ID,
+                TOOL_NAME,
+                invalid_tool_input(&raw),
+            )],
+            ..Message::default()
+        };
+        let wire = convert_messages(std::slice::from_ref(&message), "");
+        assert!(!serde_json::to_string(&wire).unwrap().contains(PRIVATE_TAIL));
+        assert_eq!(
+            message
+                .tool_uses()
+                .next()
+                .unwrap()
+                .2
+                .as_object()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
 
     #[test_case(SteeringKind::Recovery ; "recovery")]
     #[test_case(SteeringKind::Advisory ; "advisory")]
@@ -928,6 +1160,7 @@ data: [DONE]\n";
                     ProviderEvent::ToolInputDelta { .. } => {}
                     ProviderEvent::PromptProgress { .. } => {}
                     ProviderEvent::ThinkingBoundary => {}
+                    ProviderEvent::ToolAliases { .. } | ProviderEvent::ToolInputReady { .. } => {}
                 }
             }
             assert_eq!(thinking, vec!["Let me think", "..."]);
@@ -1073,7 +1306,7 @@ data: [DONE]\n";
             let starts: Vec<_> = rx
                 .drain()
                 .filter_map(|e| match e {
-                    ProviderEvent::ToolUseStart { id, name } => Some((id, name)),
+                    ProviderEvent::ToolUseStart { id, name, .. } => Some((id, name)),
                     _ => None,
                 })
                 .collect();

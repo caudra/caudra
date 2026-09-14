@@ -12,7 +12,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 use serde_json::{Map, Value};
 
-use crate::agent::speculative::Peeked;
+use crate::agent::speculative::{Peeked, with_live};
 use crate::agent::tool_dispatch::{self, Emit};
 use crate::tools::registry::{
     ExecFuture, HeaderFuture, HeaderResult, ParseError, Tool, ToolExecResult, ToolInvocation,
@@ -20,7 +20,7 @@ use crate::tools::registry::{
 use crate::tools::schema::{ParamSchema, Property, to_json_schema, validate};
 use crate::tools::{DescriptionContext, ToolAudience, ToolContext, ToolEffect};
 use crate::types::{
-    BatchProgressEvent, BatchToolEntry, BatchToolStatus, ToolOutput, ToolStartEvent,
+    BatchProgressEvent, BatchToolEntry, BatchToolStatus, ToolDoneEvent, ToolOutput, ToolStartEvent,
 };
 use crate::{AgentEvent, task_set::TaskSet};
 
@@ -206,7 +206,7 @@ impl ToolInvocation for BatchCall {
                 .children
                 .iter()
                 .map(|child| (child.tool.as_str(), &child.params));
-            let peeked = runs.peek_all(calls);
+            let peeked = runs.peek_all(ctx.tool_use_id.as_deref().unwrap_or_default(), calls);
             for ((entry, child), peeked) in entries.iter_mut().zip(&self.children).zip(peeked) {
                 if let Some(started) = peeked
                     .as_ref()
@@ -277,7 +277,13 @@ impl BatchCall {
             .enumerate()
             .filter_map(|(index, child)| {
                 let mut child_ctx = child_context(ctx, index);
-                tool_dispatch::observe_context(&mut child_ctx, &child.tool, &child.params);
+                if let Some(observations) = ctx.speculative.as_ref().and_then(|runs| {
+                    runs.observation_for(child_ctx.tool_use_id.as_deref().unwrap_or_default())
+                }) {
+                    child_ctx.steering_observations = Some(observations);
+                } else {
+                    tool_dispatch::observe_context(&mut child_ctx, &child.tool, &child.params);
+                }
                 if child.rejection.is_some() {
                     child_ctx.mark_tool_result_repairable();
                     if !ctx.cancel.is_cancelled()
@@ -300,11 +306,13 @@ impl BatchCall {
             // A child the stream already started is taken over rather than
             // started again: the work is the same work, and running it twice
             // is exactly what the early start was for.
-            if let Some(adopted) = ctx
-                .speculative
-                .as_ref()
-                .and_then(|runs| runs.claim(&child.tool, &child.params))
-            {
+            if let Some(adopted) = ctx.speculative.as_ref().and_then(|runs| {
+                runs.claim(
+                    ctx.tool_use_id.as_deref().unwrap_or_default(),
+                    &child.tool,
+                    &child.params,
+                )
+            }) {
                 set.spawn(async move {
                     if let Some(start) = adopted.start() {
                         publish(&entries, index, &ctx, |entry| {
@@ -324,32 +332,54 @@ impl BatchCall {
                 });
                 continue;
             }
+            if let Some(message) = ctx
+                .speculative
+                .as_ref()
+                .and_then(|runs| runs.admit(&ctx, &child.tool, &child.params))
+            {
+                if !ctx.cancel.is_cancelled()
+                    && let Some(observations) = &ctx.steering_observations
+                {
+                    observations.finish(true);
+                }
+                let done =
+                    ToolDoneEvent::error(ctx.tool_use_id.clone().unwrap_or_default(), message);
+                publish(&entries, index, &ctx, |entry| settle_entry(entry, &done));
+                continue;
+            }
             set.spawn(async move {
-                let done = tool_dispatch::run(
-                    &registry,
-                    mcp.as_ref(),
-                    ctx.tool_use_id.clone().unwrap_or_default(),
-                    &child.tool,
-                    &child.params,
-                    &ctx,
-                    // The roster shows a child the way a standalone card
-                    // would, which is the header the call introduced itself
-                    // with rather than a bare tool name. Taken as the child
-                    // starts, or the row carries no title for as long as it
-                    // runs, which on a batch is the whole time worth watching.
-                    //
-                    // The name comes from the same event for the same reason:
-                    // start is the first point where an alias has been
-                    // resolved. Under Anthropic OAuth the model calls a tool by
-                    // its wire name, so the roster is holding `mcp_Shell` until
-                    // this replaces it with `shell`, and every reader of the
-                    // name past here is looking at the tool the registry knows.
-                    Emit::Capture(&mut |start: &ToolStartEvent| {
-                        publish(&entries, index, &ctx, |entry| {
-                            *entry = started_entry(start);
-                        });
-                    }),
-                )
+                let done = with_live(&ctx, |live_ctx| {
+                    let entries = &entries;
+                    async move {
+                        let ctx = &live_ctx;
+                        tool_dispatch::run(
+                            &registry,
+                            mcp.as_ref(),
+                            ctx.tool_use_id.clone().unwrap_or_default(),
+                            &child.tool,
+                            &child.params,
+                            ctx,
+                            // The roster shows a child the way a standalone card
+                            // would, which is the header the call introduced itself
+                            // with rather than a bare tool name. Taken as the child
+                            // starts, or the row carries no title for as long as it
+                            // runs, which on a batch is the whole time worth watching.
+                            //
+                            // The name comes from the same event for the same reason:
+                            // start is the first point where an alias has been
+                            // resolved. Under Anthropic OAuth the model calls a tool by
+                            // its wire name, so the roster is holding `mcp_Shell` until
+                            // this replaces it with `shell`, and every reader of the
+                            // name past here is looking at the tool the registry knows.
+                            Emit::Capture(&mut |start: &ToolStartEvent| {
+                                publish(entries, index, ctx, |entry| {
+                                    *entry = started_entry(start);
+                                });
+                            }),
+                        )
+                        .await
+                    }
+                })
                 .await;
                 publish(&entries, index, &ctx, |entry| settle_entry(entry, &done));
             });
@@ -428,6 +458,12 @@ pub(crate) fn settle_entry(entry: &mut BatchToolEntry, done: &crate::ToolDoneEve
         BatchToolStatus::Success
     };
     entry.annotation = done.annotation.clone();
+    if let Some(suffix) = &done.model_suffix {
+        entry.annotation = Some(match entry.annotation.take() {
+            Some(annotation) => format!("{annotation}\n{suffix}"),
+            None => suffix.clone(),
+        });
+    }
     entry.output = Some(done.output.clone());
 }
 
@@ -520,6 +556,10 @@ fn render_llm(entries: &[BatchToolEntry]) -> String {
             out.push_str(ERROR_PREFIX);
             out.push_str(&text);
         }
+        if let Some(annotation) = &entry.annotation {
+            out.push('\n');
+            out.push_str(annotation);
+        }
         out.push_str("\n\n");
     }
     let total = entries.len();
@@ -538,7 +578,7 @@ fn render_llm(entries: &[BatchToolEntry]) -> String {
 mod tests {
     use super::*;
     use crate::AgentMode;
-    use crate::agent::speculative::SpeculativeRuns;
+    use crate::agent::speculative::{REVISED_INPUT, SpeculativeRuns};
     use crate::agent::tool_dispatch::{ResponseObservations, ToolOutcome};
     use crate::tools::STALE_READ_MSG;
     use crate::tools::registry::{ToolRegistry, ToolSource};
@@ -774,6 +814,7 @@ mod tests {
         smol::block_on(async {
             let (mut ctx, ran) = counting_batch_ctx();
             let runs = Arc::new(SpeculativeRuns::new(&ctx, None));
+            runs.register(BATCH_ID, crate::tools::BATCH_TOOL_NAME);
             runs.start(BATCH_ID, 0, &child(PATTERN).to_string());
             runs.settled().await;
             assert_eq!(ran.load(Ordering::SeqCst), 1, "{NEVER_STARTED}");
@@ -791,28 +832,21 @@ mod tests {
         });
     }
 
-    /// A child whose arguments changed is a different call, so the answer has
-    /// to come from running it, not from the run it no longer matches.
     #[test]
-    fn a_child_the_model_rewrote_is_run_for_what_it_now_says() {
+    fn a_child_the_model_rewrote_reports_its_original_execution() {
         smol::block_on(async {
             let (mut ctx, ran) = counting_batch_ctx();
             let runs = Arc::new(SpeculativeRuns::new(&ctx, None));
+            runs.register(BATCH_ID, crate::tools::BATCH_TOOL_NAME);
             runs.start(BATCH_ID, 0, &child("stale.rs").to_string());
             runs.settled().await;
             assert_eq!(ran.load(Ordering::SeqCst), 1, "{NEVER_STARTED}");
             ctx.speculative = Some(Arc::clone(&runs));
             let text = run_batch(&ctx, json!([child(PATTERN)])).await;
-            assert!(text.contains(&nth_body(2)), "the stale run is not reused");
-            assert_eq!(ran.load(Ordering::SeqCst), 2);
-            let report = runs.drain_report().expect("the stale run is reported");
-            assert!(
-                report
-                    .first_text_content()
-                    .unwrap_or_default()
-                    .contains("stale.rs"),
-                "the model is told what already ran"
-            );
+            assert!(text.contains(&nth_body(1)));
+            assert!(text.contains(REVISED_INPUT));
+            assert_eq!(ran.load(Ordering::SeqCst), 1);
+            assert!(runs.drain_report().is_none());
         });
     }
 
@@ -824,6 +858,7 @@ mod tests {
         smol::block_on(async {
             let (mut ctx, ran) = counting_batch_ctx();
             let runs = Arc::new(SpeculativeRuns::new(&ctx, None));
+            runs.register(BATCH_ID, crate::tools::BATCH_TOOL_NAME);
             runs.start(BATCH_ID, 0, &child(PATTERN).to_string());
             runs.settled().await;
             assert_eq!(ran.load(Ordering::SeqCst), 1, "{NEVER_STARTED}");

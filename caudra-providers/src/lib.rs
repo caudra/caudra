@@ -46,9 +46,9 @@ pub use tokens::{
 };
 pub use types::{
     ContentBlock, EFFORT_LEVELS, EMPTY_RESPONSE_MARKER, IMAGE_OMITTED_NOTE, INVALID_TOOL_JSON_KEY,
-    ImageMediaType, ImageSource, MIN_THINKING_BUDGET, Message, MessageKind, ProviderEvent,
-    ProviderUsage, ReasoningOption, ReasoningOptions, ReasoningSource, ReasoningTransport,
-    RequestOptions, ResolvedThinking, ResponsesReasoning, Role, SteeringKind, SteeringOrigin,
-    StopReason, StreamResponse, THINKING_USAGE, ThinkingConfig, ToolNameAliases, UsageLimit,
-    adapt_images_for_model, invalid_tool_input,
+    ImageMediaType, ImageSource, InvalidToolInput, MAX_TOOL_INPUT_BYTES, MIN_THINKING_BUDGET,
+    Message, MessageKind, ProviderEvent, ProviderUsage, ReasoningOption, ReasoningOptions,
+    ReasoningSource, ReasoningTransport, RequestOptions, ResolvedThinking, ResponsesReasoning,
+    Role, SteeringKind, SteeringOrigin, StopReason, StreamResponse, THINKING_USAGE, ThinkingConfig,
+    ToolNameAliases, UsageLimit, adapt_images_for_model, invalid_tool_input,
 };

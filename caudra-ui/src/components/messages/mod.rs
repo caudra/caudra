@@ -25,6 +25,7 @@ use super::{
     workflow_card::CardHit,
 };
 use crate::animation::spinner_str;
+use crate::chat::batch_child_id;
 use crate::components::keybindings::key;
 use crate::markdown::{
     DiagramSpan, LinkMap, TerminalLink, hr_line, plain_lines, text_to_painted, truncate_output,
@@ -52,9 +53,9 @@ use crossterm::event::MouseEvent;
 use super::scrollbar::{ScrollHint, Scrollbar, ScrollbarMouse};
 use super::streaming_content::StreamingContent;
 use caudra_agent::mentions::{self, Mention};
-use caudra_agent::tools::{BATCH_TOOL_NAME, ToolEffect};
+use caudra_agent::tools::{BATCH_TOOL_NAME, SHELL_TOOL_NAME, ToolEffect};
 use caudra_agent::{
-    BatchToolEntry, BufferSnapshot, EventSender, InstructionBlock, NO_FILES_FOUND,
+    BatchToolEntry, BatchToolStatus, BufferSnapshot, EventSender, InstructionBlock, NO_FILES_FOUND,
     ReasoningSummary, SharedBuf, SubagentProgress, ToolDoneEvent, ToolOutput, ToolStartEvent,
     format_live_duration, reasoning_summary, streaming_reasoning_summary,
 };
@@ -1427,6 +1428,7 @@ impl MessagesPanel {
         self.armed_card = None;
         self.lua_clicks.clear();
         self.live_bufs.clear();
+        self.live_body_dirty.clear();
         self.watched_bufs.clear();
         self.retained_shell_outputs.clear();
         self.rebake_requested.clear();
@@ -1498,6 +1500,9 @@ impl MessagesPanel {
     }
 
     pub fn tool_pending(&mut self, id: String, name: &str) {
+        if self.tool_card(&id).is_some() {
+            return;
+        }
         self.flush();
         let role = DisplayRole::Tool(Box::new(ToolRole {
             id,
@@ -1506,6 +1511,7 @@ impl MessagesPanel {
             effect: ToolEffect::default(),
         }));
         let mut msg = DisplayMessage::new(role, String::new());
+        msg.tool_preview_pending = true;
         msg.timestamp = Some(format_timestamp_now(self.clock_format));
         self.messages.push(msg);
     }
@@ -1526,6 +1532,9 @@ impl MessagesPanel {
         let Some(msg) = self.find_tool_msg_mut(tool_id) else {
             return;
         };
+        if !msg.tool_preview_pending || !Self::is_running(msg) {
+            return;
+        }
         if let Some(header) = header {
             msg.text = header;
         }
@@ -1535,10 +1544,6 @@ impl MessagesPanel {
         self.rebuild_tool_segment(tool_id);
     }
 
-    /// The children a still-streaming `batch` has named. Drawn through the
-    /// same roster the running call publishes, so a child reads the same
-    /// before it is dispatched as it does after. `ToolStart` replaces it with
-    /// the roster the batch actually dispatched.
     pub fn tool_input_roster(&mut self, tool_id: &str, entries: Option<Vec<BatchToolEntry>>) {
         let Some(entries) = entries else {
             return;
@@ -1546,10 +1551,10 @@ impl MessagesPanel {
         let Some(msg) = self.find_tool_msg_mut(tool_id) else {
             return;
         };
-        msg.tool_output = Some(Arc::new(ToolOutput::Batch {
-            entries,
-            text: String::new(),
-        }));
+        if !msg.tool_preview_pending || !Self::is_running(msg) {
+            return;
+        }
+        merge_batch_snapshot(msg, entries, String::new());
         self.rebuild_tool_segment(tool_id);
     }
 
@@ -1566,6 +1571,9 @@ impl MessagesPanel {
         let Some(msg) = self.find_tool_msg_mut(tool_id) else {
             return;
         };
+        if !msg.tool_preview_pending || !Self::is_running(msg) {
+            return;
+        }
         msg.live_body.get_or_insert_default().push_str(&body);
         self.live_body_dirty.insert(tool_id.to_owned());
     }
@@ -1580,10 +1588,12 @@ impl MessagesPanel {
     }
 
     pub fn tool_start(&mut self, event: ToolStartEvent) {
-        // The call's real output lands here, so whatever the arguments drew
-        // has nothing left to say.
         self.live_body_dirty.remove(&event.id);
         if let Some(msg) = self.find_tool_msg_mut(&event.id) {
+            if !Self::is_running(msg) {
+                return;
+            }
+            msg.tool_preview_pending = false;
             if let DisplayRole::Tool(t) = &mut msg.role {
                 t.name = Arc::clone(&event.tool);
                 t.effect = event.effect;
@@ -1591,10 +1601,17 @@ impl MessagesPanel {
             msg.text = event.summary;
             msg.tool_input = event.input.map(Arc::new);
             msg.tool_raw_input = event.raw_input.map(Arc::new);
-            msg.tool_output = event.output.map(Arc::new);
+            match event.output {
+                Some(ToolOutput::Batch { entries, text }) => {
+                    merge_batch_snapshot(msg, entries, text)
+                }
+                Some(output) => msg.tool_output = Some(Arc::new(output)),
+                None => {}
+            }
             msg.live_body = None;
             msg.annotation = event.annotation;
             msg.render_header = event.render_header;
+            self.settle_batch_snapshot(&event.id);
             self.rebuild_tool_segment(&event.id);
             return;
         }
@@ -1617,9 +1634,6 @@ impl MessagesPanel {
         self.messages.push(msg);
     }
 
-    /// Patches one child of a running batch. The roster arrived with the
-    /// batch's `ToolStart`, so an event that names an index the message does
-    /// not have is from a batch that is already gone.
     pub fn batch_progress(&mut self, tool_id: &str, index: usize, entry: BatchToolEntry) {
         let Some(msg) = self
             .messages
@@ -1628,10 +1642,17 @@ impl MessagesPanel {
         else {
             return;
         };
+        if !Self::is_running(msg) {
+            return;
+        }
         let Some(ToolOutput::Batch { entries, .. }) = msg.tool_output.as_deref() else {
             return;
         };
-        if index >= entries.len() {
+        if index >= entries.len()
+            || entries[index].status.is_terminal()
+            || (entries[index].status == BatchToolStatus::Running
+                && entry.status == BatchToolStatus::Pending)
+        {
             return;
         }
         let terminal = entry.status.is_terminal();
@@ -1717,7 +1738,7 @@ impl MessagesPanel {
         index: usize,
         report: SubagentProgress,
     ) -> bool {
-        if !self.batch_child_exists(tool_id, index) {
+        if !self.batch_child_running(tool_id, index) {
             return false;
         }
         Arc::make_mut(
@@ -1738,7 +1759,7 @@ impl MessagesPanel {
     /// child is drawn in decides how much of it shows, and the sink upstream
     /// already bounds what a command that prints forever can send.
     pub fn set_batch_child_output(&mut self, tool_id: &str, index: usize, content: &str) -> bool {
-        if !self.batch_child_exists(tool_id, index) {
+        if !self.batch_child_running(tool_id, index) {
             return false;
         }
         Arc::make_mut(
@@ -1760,6 +1781,7 @@ impl MessagesPanel {
     /// What a child streamed is superseded by what it returned, so the tail is
     /// dropped the moment its own result can be drawn.
     fn forget_child_output(&mut self, tool_id: &str, index: usize) {
+        self.live_bufs.remove(&format!("{tool_id}:{index}"));
         if let Some(children) = self.batch_child_output.get_mut(tool_id)
             && Arc::make_mut(children).remove(&index).is_some()
             && children.is_empty()
@@ -1768,15 +1790,16 @@ impl MessagesPanel {
         }
     }
 
-    fn batch_child_exists(&self, tool_id: &str, index: usize) -> bool {
+    fn batch_child_running(&self, tool_id: &str, index: usize) -> bool {
         self.messages
             .iter()
             .rfind(|m| matches!(&m.role, DisplayRole::Tool(t) if t.id == tool_id))
+            .filter(|msg| Self::is_running(msg))
             .and_then(|msg| match msg.tool_output.as_deref() {
-                Some(ToolOutput::Batch { entries, .. }) => Some(entries.len()),
+                Some(ToolOutput::Batch { entries, .. }) => entries.get(index),
                 _ => None,
             })
-            .is_some_and(|len| index < len)
+            .is_some_and(|entry| !entry.status.is_terminal())
     }
 
     fn settle_child_progress(&mut self, tool_id: &str, index: usize) {
@@ -1787,7 +1810,28 @@ impl MessagesPanel {
         }
     }
 
+    fn settle_batch_snapshot(&mut self, tool_id: &str) {
+        let Some(msg) = self.find_tool_msg_mut(tool_id) else {
+            return;
+        };
+        let Some(ToolOutput::Batch { entries, .. }) = msg.tool_output.as_deref() else {
+            return;
+        };
+        let terminal: Vec<_> = entries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| entry.status.is_terminal().then_some(index))
+            .collect();
+        for index in terminal {
+            self.settle_child_progress(tool_id, index);
+            self.forget_child_output(tool_id, index);
+        }
+    }
+
     pub fn tool_output(&mut self, tool_id: &str, content: &str) {
+        if !self.tool_in_progress(tool_id) {
+            return;
+        }
         let Some(msg) = self
             .messages
             .iter_mut()
@@ -1815,8 +1859,13 @@ impl MessagesPanel {
     }
 
     pub fn tool_done(&mut self, event: ToolDoneEvent) {
+        self.live_body_dirty.remove(&event.id);
+        self.remove_child_live_bufs(&event.id);
         let retain_live_output = matches!(&event.output, ToolOutput::Shell(_));
         let had_live_buf = self.retire_live_buf(&event.id);
+        if retain_live_output {
+            self.stop_watching(&event.id);
+        }
         // A child whose own terminal event never arrived stops here with the
         // batch, so no row is left counting against a clock that has stopped.
         if let Some(children) = self.batch_child_progress.get_mut(&event.id) {
@@ -1843,6 +1892,10 @@ impl MessagesPanel {
             progress.settle();
         }
         msg.live_body = None;
+        msg.tool_preview_pending = false;
+        if retain_live_output {
+            msg.render_snapshot = None;
+        }
         truncate_to_header(&mut msg.text);
         let done_annotation = event
             .annotation
@@ -1911,6 +1964,9 @@ impl MessagesPanel {
     }
 
     pub fn set_tool_progress(&mut self, tool_id: &str, report: SubagentProgress) {
+        if !self.tool_in_progress(tool_id) {
+            return;
+        }
         self.update_tool(tool_id, |msg| {
             msg.progress = Some(ToolProgress::live(report));
         });
@@ -1923,6 +1979,20 @@ impl MessagesPanel {
         theme_gen: Option<u64>,
     ) {
         self.store_snapshot(tool_id, snapshot, false, theme_gen);
+    }
+
+    pub fn tool_annotation(&mut self, tool_id: &str, annotation: String) {
+        if self.tool_in_progress(tool_id) {
+            self.update_tool(tool_id, |msg| msg.annotation = Some(annotation));
+        } else if let Some((parent, index)) = batch_child_id(tool_id)
+            && self.batch_child_running(parent, index)
+            && let Some(msg) = self.find_tool_msg_mut(parent)
+            && let Some(output) = &mut msg.tool_output
+            && let ToolOutput::Batch { entries, .. } = Arc::make_mut(output)
+        {
+            entries[index].annotation = Some(annotation);
+            self.rebuild_tool_segment(parent);
+        }
     }
 
     pub fn tool_header_snapshot(
@@ -2065,6 +2135,30 @@ impl MessagesPanel {
             // so retire their live bufs here: keeps them clickable via
             // the warm path and stops them being polled forever.
             self.retire_live_buf(id);
+            self.remove_child_live_bufs(id);
+            self.batch_child_output.remove(id);
+            self.live_body_dirty.remove(id);
+            if let Some(children) = self.batch_child_progress.get_mut(id) {
+                Arc::make_mut(children)
+                    .values_mut()
+                    .for_each(ToolProgress::settle);
+            }
+            if let Some(msg) = self.find_tool_msg_mut(id) {
+                msg.tool_preview_pending = false;
+                msg.live_body = None;
+                if let Some(output) = &mut msg.tool_output
+                    && let ToolOutput::Batch { entries, .. } = Arc::make_mut(output)
+                {
+                    for entry in entries {
+                        if entry.status == BatchToolStatus::Running {
+                            entry.status = BatchToolStatus::Error;
+                        }
+                    }
+                }
+                if let Some(progress) = &mut msg.progress {
+                    progress.settle();
+                }
+            }
             self.rebuild_tool_segment(id);
         }
     }
@@ -3921,6 +4015,27 @@ impl MessagesPanel {
         is_header: bool,
         theme_gen: Option<u64>,
     ) {
+        if self.tool_card(tool_id).is_none()
+            && let Some((parent, index)) = batch_child_id(tool_id)
+        {
+            if !is_header {
+                self.set_batch_child_output(parent, index, &snapshot.text());
+            }
+            return;
+        }
+        if theme_gen.is_none()
+            && let Some((index, tool)) = self.tool_card(tool_id)
+        {
+            let msg = &self.messages[index];
+            if tool.status != ToolStatus::InProgress
+                && matches!(msg.tool_output.as_deref(), Some(ToolOutput::Shell(_)))
+            {
+                return;
+            }
+            if !is_header && tool.name.as_ref() == SHELL_TOOL_NAME {
+                self.tool_output(tool_id, &snapshot.text());
+            }
+        }
         if theme_gen.is_some() {
             // A generation only comes with restore replies. The restore
             // superseded the old live view (and evicted the runtime's
@@ -4006,7 +4121,21 @@ impl MessagesPanel {
     }
 
     pub fn register_live_buf(&mut self, id: String, body: Arc<SharedBuf>) {
+        if let Some((_, tool)) = self.tool_card(&id) {
+            if tool.status != ToolStatus::InProgress {
+                return;
+            }
+        } else if let Some((parent, index)) = batch_child_id(&id)
+            && !self.batch_child_running(parent, index)
+        {
+            return;
+        }
         self.live_bufs.insert(id, body);
+    }
+
+    fn remove_child_live_bufs(&mut self, parent: &str) {
+        self.live_bufs
+            .retain(|id, _| !batch_child_id(id).is_some_and(|(candidate, _)| candidate == parent));
     }
 
     /// Snapshots are baked at the last width `view` saw, and a resize
@@ -4493,6 +4622,34 @@ impl MessagesPanel {
             })
             .collect()
     }
+}
+
+fn merge_batch_snapshot(msg: &mut DisplayMessage, mut incoming: Vec<BatchToolEntry>, text: String) {
+    if let Some(ToolOutput::Batch { entries, .. }) = msg.tool_output.as_deref() {
+        for (index, entry) in entries.iter().enumerate() {
+            if let Some(next) = incoming.get_mut(index) {
+                if entry.status.is_terminal()
+                    || (entry.status == BatchToolStatus::Running && !next.status.is_terminal())
+                {
+                    let mut preserved = entry.clone();
+                    if !entry.status.is_terminal() && next.status == BatchToolStatus::Running {
+                        preserved.input = preserved.input.or_else(|| next.input.take());
+                        preserved.raw_input = preserved.raw_input.or_else(|| next.raw_input.take());
+                        preserved.output = preserved.output.or_else(|| next.output.take());
+                        preserved.annotation =
+                            preserved.annotation.or_else(|| next.annotation.take());
+                    }
+                    *next = preserved;
+                }
+            } else {
+                incoming.push(entry.clone());
+            }
+        }
+    }
+    msg.tool_output = Some(Arc::new(ToolOutput::Batch {
+        entries: incoming,
+        text,
+    }));
 }
 
 fn same_display_item(left: &DisplayMessage, right: &DisplayMessage) -> bool {

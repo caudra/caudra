@@ -296,6 +296,7 @@ pub fn run(
             | AgentEvent::ToolInputDelta { .. }
             | AgentEvent::ToolStart(_)
             | AgentEvent::ToolOutput { .. }
+            | AgentEvent::ToolAnnotation { .. }
             | AgentEvent::ToolDone(_)
             | AgentEvent::BatchProgress(_)
             | AgentEvent::Question(_)
@@ -408,6 +409,28 @@ pub fn run(
                         session_id: &session_id,
                         parent_tool_use_id,
                     })?;
+                }
+            }
+            AgentEvent::ModelUsage {
+                usage: repair_usage,
+                cost: repair_cost,
+                billing,
+                ..
+            } => {
+                add_spend(&mut cost, &mut subscription_cost, *repair_cost, *billing);
+                if parent_tool_use_id.is_some() {
+                    goal.record_external_usage(*repair_usage, *repair_cost, *billing);
+                } else {
+                    usage += *repair_usage;
+                }
+                if let Some(out) = &mut verbose_out {
+                    out.emit(&serde_json::json!({
+                        "type": "system",
+                        "subtype": "model_usage",
+                        "accounting": event,
+                        "session_id": session_id,
+                        "parent_tool_use_id": parent_tool_use_id,
+                    }))?;
                 }
             }
             AgentEvent::ToolResultsSubmitted { message } => {

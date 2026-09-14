@@ -383,7 +383,7 @@ impl OpenAi {
         let forward = async move {
             let mut forwarded = 0usize;
             while let Ok(event) = relay_rx.recv_async().await {
-                forwarded += 1;
+                forwarded += usize::from(event.is_content());
                 if event_tx.send_async(event).await.is_err() {
                     break;
                 }

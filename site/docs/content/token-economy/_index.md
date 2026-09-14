@@ -60,6 +60,18 @@ Every round-trip re-sends the context, so round-trips are the other half of the 
 
 **batch** runs independent tool calls in one turn: one request, N results.
 
+With `agent.eager_tool_dispatch = true` (the default), tools and batch children start as soon as their complete JSON arguments arrive. They still pass through permission checks, mode restrictions, and file locks. Later argument fragments cannot reset a running or completed child to queued. The old `agent.eager_batch_dispatch` setting remains a fallback when the new setting is absent.
+
+An early call can apply effects before the provider finishes its response. A later argument revision cannot undo those effects. If the stream fails after calls were admitted, Caudra collects their outcomes and tells the model what happened instead of automatically replaying them. Explicit cancellation still stops running work.
+
+**JSON syntax repair.** `agent.tool_json_repair = true` enables syntax repair independently of eager execution. Caudra first tries local repairs that preserve argument values. When local repair needs confirmation, one isolated request to the calling model receives only the affected tool schema, malformed arguments, and parser error. It receives no conversation history or execution tools.
+
+Repairs retain the original call ID or batch-child slot. Valid siblings are not regenerated or executed again. Results record repaired arguments without rewriting the original assistant message. A schema error or execution failure, including a shell timeout, remains an ordinary tool error for the main model.
+
+Repair accepts at most 64 KiB of complete argument text and refuses truncated values or ambiguous child boundaries. Model repair has a 20-second deadline, a 4,096-token output ceiling, at most two concurrent requests, and at most eight requests per response. Unsuccessful repairs return errors rather than guessed commands or file content.
+
+Model repair adds usage charged under `tool_json_repair`. Its separate request leaves the main conversation prefix and tool catalog unchanged, avoiding an unnecessary prompt-cache invalidation. Cache hits still depend on the provider.
+
 **python_execution** runs pure computation in an isolated Python subset. It can reshape JSON, aggregate values, process text, and perform calculations without host filesystem or network access.
 
 ```
@@ -124,6 +136,7 @@ Every row records why the model was called, so you can separate the conversation
 | `compaction` | Summarizing a session that filled its window |
 | `title` | Naming a session |
 | `btw` | `/btw` questions asked beside the conversation |
+| `tool_json_repair` | Isolated syntax repair for malformed tool arguments |
 
 The model cannot answer that question on its own, because goals, compaction, and titles often run on the model already in use.
 

@@ -936,7 +936,9 @@ pub struct AgentFileConfig {
     pub post_compaction_instructions: Option<String>,
     pub generate_titles: Option<bool>,
     pub stale_read_check: Option<bool>,
+    pub tool_json_repair: Option<bool>,
     pub eager_batch_dispatch: Option<bool>,
+    pub eager_tool_dispatch: Option<bool>,
     pub shell_output_filter: Option<bool>,
     pub defer_builtin_tools: Option<DeferBuiltinTools>,
     pub disabled_tools: Option<Vec<String>>,
@@ -958,7 +960,9 @@ impl AgentFileConfig {
             post_compaction_instructions,
             generate_titles,
             stale_read_check,
+            tool_json_repair,
             eager_batch_dispatch,
+            eager_tool_dispatch,
             shell_output_filter,
             defer_builtin_tools
         );
@@ -1784,9 +1788,15 @@ pub struct AgentConfig {
 
     #[config(
         default = true,
-        desc = "Start each `batch` child as soon as its arguments finish streaming, instead of waiting for the whole message"
+        desc = "Repair malformed tool JSON syntax locally, with one bounded isolated model fallback; independent of eager dispatch"
     )]
-    pub eager_batch_dispatch: bool,
+    pub tool_json_repair: bool,
+
+    #[config(
+        default = true,
+        desc = "Start tools and batch children as soon as their complete arguments arrive, instead of waiting for the whole message"
+    )]
+    pub eager_tool_dispatch: bool,
 
     #[config(
         default = true,
@@ -1855,7 +1865,11 @@ impl AgentConfig {
             post_compaction_instructions: file.post_compaction_instructions,
             generate_titles: file.generate_titles.unwrap_or(true),
             stale_read_check: file.stale_read_check.unwrap_or(true),
-            eager_batch_dispatch: file.eager_batch_dispatch.unwrap_or(true),
+            tool_json_repair: file.tool_json_repair.unwrap_or(true),
+            eager_tool_dispatch: file
+                .eager_tool_dispatch
+                .or(file.eager_batch_dispatch)
+                .unwrap_or(true),
             shell_output_filter: !no_rtk && file.shell_output_filter.unwrap_or(true),
             defer_builtin_tools: file.defer_builtin_tools.unwrap_or_default(),
             max_turns: None,
@@ -3126,6 +3140,24 @@ mod tests {
         assert_eq!(config.agent.max_output_bytes, DEFAULT_MAX_OUTPUT_BYTES);
     }
 
+    #[test_case(None, true; "default_enabled")]
+    #[test_case(Some(false), false; "explicit_disabled")]
+    #[test_case(Some(true), true; "explicit_enabled")]
+    fn tool_json_repair_config_merges_independently(setting: Option<bool>, expected: bool) {
+        let mut raw = RawConfig::default();
+        raw.agent.eager_tool_dispatch = Some(false);
+        raw.merge(RawConfig {
+            agent: AgentFileConfig {
+                tool_json_repair: setting,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let config = raw.into_config(false).unwrap();
+        assert_eq!(config.agent.tool_json_repair, expected);
+        assert!(!config.agent.eager_tool_dispatch);
+    }
+
     #[test]
     fn builtin_system_prompt_profile_clears_global_selection() {
         let mut global = RawConfig {
@@ -3149,6 +3181,26 @@ mod tests {
                 .agent
                 .system_prompt_profile,
             None
+        );
+    }
+
+    #[test_case(None, None, true ; "default")]
+    #[test_case(None, Some(false), false ; "legacy_fallback")]
+    #[test_case(Some(true), Some(false), true ; "new_enabled_precedence")]
+    #[test_case(Some(false), Some(true), false ; "new_disabled_precedence")]
+    fn eager_tool_dispatch_config_precedence(new: Option<bool>, old: Option<bool>, expected: bool) {
+        let mut raw = RawConfig::default();
+        raw.merge(RawConfig {
+            agent: AgentFileConfig {
+                eager_tool_dispatch: new,
+                eager_batch_dispatch: old,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        assert_eq!(
+            raw.into_config(false).unwrap().agent.eager_tool_dispatch,
+            expected
         );
     }
 

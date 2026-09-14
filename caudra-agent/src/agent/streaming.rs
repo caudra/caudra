@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 use caudra_providers::provider::Provider;
 use caudra_providers::retry::{MAX_RETRIES, RetryDecision, RetryState};
 use caudra_providers::{
-    Billing, ContentBlock, Message, Model, ProviderEvent, ReasoningSource, RequestOptions,
-    StreamResponse,
+    Billing, ContentBlock, MAX_TOOL_INPUT_BYTES, Message, Model, ProviderEvent, ReasoningSource,
+    RequestOptions, StopReason, StreamResponse,
 };
 use caudra_storage::id::SessionRef;
 use caudra_storage::log::target;
@@ -78,6 +78,7 @@ struct Changed {
 /// The argument JSON of one tool call as it arrives, kept only until the
 /// preview it feeds can no longer change.
 struct PendingInput {
+    execution: InputFrame,
     name: String,
     json: String,
     preview: Option<String>,
@@ -101,6 +102,7 @@ struct PendingInput {
 impl PendingInput {
     fn new(id: String, name: String, dispatching: bool) -> Self {
         Self {
+            execution: InputFrame::default(),
             body: BodyStream::new(&name),
             roster: RosterStream::new(&name, dispatching),
             delegation: DelegationStream::new(&name),
@@ -207,6 +209,62 @@ impl PendingInput {
     }
 }
 
+#[derive(Default)]
+struct InputFrame {
+    raw: String,
+    depth: usize,
+    quoted: bool,
+    escaped: bool,
+    container: bool,
+    stopped: bool,
+}
+
+impl InputFrame {
+    fn absorb(&mut self, delta: &str) -> Option<Value> {
+        if self.stopped {
+            return None;
+        }
+        if self.raw.len().saturating_add(delta.len()) > MAX_TOOL_INPUT_BYTES {
+            self.stopped = true;
+            self.raw.clear();
+            return None;
+        }
+        let mut boundary = false;
+        for c in delta.chars() {
+            if self.quoted {
+                if self.escaped {
+                    self.escaped = false;
+                } else if c == '\\' {
+                    self.escaped = true;
+                } else if c == '"' {
+                    self.quoted = false;
+                }
+            } else {
+                match c {
+                    '"' => self.quoted = true,
+                    '{' | '[' => {
+                        self.container = true;
+                        self.depth += 1;
+                    }
+                    '}' | ']' => {
+                        self.depth = self.depth.saturating_sub(1);
+                        boundary |= self.depth == 0;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        self.raw.push_str(delta);
+        if !boundary || !self.container {
+            return None;
+        }
+        let input = serde_json::from_str(&self.raw).ok()?;
+        self.stopped = true;
+        self.raw.clear();
+        Some(input)
+    }
+}
+
 /// Names a decoded brief with the id the subagent it opens will publish under.
 fn delegation(parent_tool_use_id: String, delegated: Delegated) -> Delegation {
     Delegation {
@@ -239,7 +297,15 @@ async fn forward_provider_events(
     let mut reasoning_text = String::new();
     let mut run_started: Option<Instant> = None;
     let mut pending_inputs: HashMap<String, PendingInput> = HashMap::new();
+    let mut aliases = None;
     while let Ok(pe) = prx.recv_async().await {
+        if let ProviderEvent::ToolAliases { aliases: current } = pe {
+            if let Some(runs) = &speculative {
+                runs.set_aliases(current.clone());
+            }
+            aliases = current;
+            continue;
+        }
         if let ProviderEvent::ThinkingDelta { text } = &pe {
             run_started.get_or_insert_with(Instant::now);
             reasoning_text.push_str(text);
@@ -258,15 +324,89 @@ async fn forward_provider_events(
         // The call whose children this fragment finished, and the children
         // themselves. Dispatched below, once the row they report on exists.
         let mut ready = (String::new(), Vec::new());
+        let mut top_ready = None;
         let ae = match pe {
+            ProviderEvent::ToolAliases { .. } => continue,
+            ProviderEvent::ToolInputReady {
+                id,
+                name,
+                input,
+                invalid_input,
+            } => {
+                let name = canonical_tool_name(&name);
+                let name = aliases
+                    .as_ref()
+                    .and_then(|aliases| aliases.get(name))
+                    .map(String::as_str)
+                    .unwrap_or(name)
+                    .to_owned();
+                if !pending_inputs.contains_key(&id) {
+                    if forward && let Some(tx) = event_tx {
+                        if tx
+                            .send(AgentEvent::ToolPending {
+                                id: id.clone(),
+                                name: name.clone(),
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                        forwarded = true;
+                    }
+                    let mut pending = PendingInput::new(id.clone(), name.clone(), false);
+                    let delta = input.to_string();
+                    let changed = pending.absorb(&delta);
+                    if forward
+                        && let Some(tx) = event_tx
+                        && tx
+                            .send(AgentEvent::ToolInputDelta {
+                                id: id.clone(),
+                                name: name.clone(),
+                                delta,
+                                preview: changed.preview,
+                                size: changed.size,
+                                body: changed.body,
+                                roster: changed.roster,
+                                delegations: changed.delegations,
+                            })
+                            .is_err()
+                    {
+                        break;
+                    }
+                    pending_inputs.insert(id.clone(), pending);
+                }
+                if let Some(runs) = &speculative {
+                    runs.register(&id, &name);
+                    if invalid_input.is_none() {
+                        runs.ready(&id, &name, input);
+                    }
+                }
+                continue;
+            }
             ProviderEvent::TextDelta { text } => {
                 streamed.push_str(&text);
                 AgentEvent::TextDelta { text }
             }
             ProviderEvent::ThinkingDelta { text } => AgentEvent::ThinkingDelta { text },
             ProviderEvent::ThinkingBoundary => AgentEvent::ThinkingBoundary,
-            ProviderEvent::ToolUseStart { id, name } => {
-                let name = canonical_tool_name(&name).to_owned();
+            ProviderEvent::ToolUseStart {
+                id,
+                name,
+                source_ordinal,
+            } => {
+                let name = canonical_tool_name(&name);
+                let name = aliases
+                    .as_ref()
+                    .and_then(|aliases| aliases.get(name))
+                    .map(String::as_str)
+                    .unwrap_or(name)
+                    .to_owned();
+                if pending_inputs.contains_key(&id) {
+                    continue;
+                }
+                if let Some(runs) = &speculative {
+                    runs.register_source(&id, &name, source_ordinal);
+                }
                 pending_inputs.insert(
                     id.clone(),
                     PendingInput::new(id.clone(), name.clone(), speculative.is_some()),
@@ -281,6 +421,9 @@ async fn forward_provider_events(
                     continue;
                 };
                 let changed = pending.absorb(&delta);
+                if let Some(input) = pending.execution.absorb(&delta) {
+                    top_ready = Some((id.clone(), pending.name.clone(), input));
+                }
                 ready = (id.clone(), changed.ready);
                 AgentEvent::ToolInputDelta {
                     id,
@@ -317,6 +460,9 @@ async fn forward_provider_events(
         if let Some(runs) = speculative.as_ref() {
             for (index, element) in children {
                 runs.start(&batch_id, index, &element);
+            }
+            if let Some((id, name, input)) = top_ready {
+                runs.ready(&id, &name, input);
             }
         }
     }
@@ -359,6 +505,10 @@ fn attach_reasoning_durations(message: &mut Message, durations: &[Duration]) {
 /// attempt's text (`stream_reset`), and history must agree with the view.
 #[derive(Debug)]
 pub(crate) enum StreamError {
+    Partial {
+        response: Box<StreamResponse>,
+        error: AgentError,
+    },
     Cancelled {
         streamed: String,
         reasoning: Vec<ForwardedReasoning>,
@@ -381,6 +531,7 @@ impl From<StreamError> for AgentError {
         match e {
             StreamError::Cancelled { .. } => Self::Cancelled,
             StreamError::Auth { error, .. } => error,
+            StreamError::Partial { error, .. } => error,
             StreamError::Other(e) => e,
         }
     }
@@ -469,6 +620,9 @@ async fn stream_with_retry_inner(
     // its own clock.
     let first_attempt_at = Instant::now();
     loop {
+        if let Some(runs) = speculative {
+            runs.begin_attempt();
+        }
         let started = Instant::now();
         let (ptx, prx) = flume::unbounded();
         let forwarder = smol::spawn({
@@ -503,6 +657,10 @@ async fn stream_with_retry_inner(
         match result {
             Ok(mut r) => {
                 canonicalize_tool_names(&mut r.message);
+                if let Some(runs) = speculative {
+                    runs.reconcile(&mut r.message);
+                    runs.finalize(&mut r);
+                }
                 let durations: Vec<_> = reasoning.iter().map(|run| run.duration).collect();
                 attach_reasoning_durations(&mut r.message, &durations);
                 r.message.reasoning_source = Some(ReasoningSource::new(
@@ -523,6 +681,47 @@ async fn stream_with_retry_inner(
                     );
                 }
                 return Ok(r);
+            }
+            Err(e) if speculative.is_some_and(|runs| runs.has_admitted()) => {
+                if !matches!(e, AgentError::Cancelled) {
+                    emit_api_error(model, &e, retry.attempts() + 1, started.elapsed());
+                }
+                let Some(runs) = speculative else {
+                    return Err(e.into());
+                };
+                let mut message = runs.recover_partial();
+                let mut content: Vec<_> =
+                    reasoning
+                        .into_iter()
+                        .filter(|run| !run.text.is_empty())
+                        .map(|run| ContentBlock::Thinking {
+                            thinking: run.text,
+                            signature: None,
+                            duration_ms: Some(
+                                run.duration.as_millis().min(u128::from(u64::MAX)) as u64
+                            ),
+                            interrupted: true,
+                            responses: None,
+                        })
+                        .collect();
+                if !streamed.is_empty() {
+                    content.push(ContentBlock::Text { text: streamed });
+                }
+                content.append(&mut message.content);
+                message.content = content;
+                message.reasoning_source = Some(ReasoningSource::new(
+                    model,
+                    provider.reasoning_transport(model),
+                ));
+                return Err(StreamError::Partial {
+                    response: Box::new(StreamResponse {
+                        message,
+                        stop_reason: Some(StopReason::ToolUse),
+                        tool_name_aliases: runs.aliases(),
+                        ..StreamResponse::default()
+                    }),
+                    error: e,
+                });
             }
             Err(AgentError::Cancelled) => {
                 info!(
@@ -713,14 +912,552 @@ fn error_description(error: &AgentError) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::agent::tool_dispatch::{ResponseObservations, ToolOutcome};
+    use crate::tools::{ToolLive, ToolSource};
     use caudra_providers::Role;
+    use caudra_providers::provider::BoxFuture;
+    use caudra_providers::{InvalidToolInput, ModelInfo, invalid_tool_input};
     use serde_json::json;
+    use std::future::pending;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use test_case::test_case;
 
     use super::*;
 
     const SECRET_BODY: &str = "messages.0.content: \"my private prompt\", key sk-abc";
     const TOOL_ID: &str = "toolu_1";
+    const INCOMPLETE_ID: &str = "toolu_incomplete";
+    const WIRE_READ: &str = "wire_read";
+    const LIVE_ANNOTATION: &str = "building graph";
+    const TRANSPORT_FAILURE: &str = "stream interrupted";
+    const MALFORMED_COMMAND: &str = r#"{"command":"echo safe""#;
+    const COMMAND: &str = "echo safe";
+    const PARTIAL_REASONING: &str = "Inspect the file first.";
+    const PARTIAL_TEXT: &str = "Reading the file.";
+    const EARLY_INPUT: &str = r#"{"path":"early"}"#;
+    const LATE_INPUT: &str = r#"{"path":"late"}"#;
+    const EARLY_FAILURE: &str = "earlier call failed";
+
+    #[test_case(1 ; "bounded_source_prefix")]
+    #[test_case(2 ; "distinct_source_slots")]
+    fn independent_start_executes_before_tail_without_reordering_observations(limit: usize) {
+        smol::block_on(async {
+            let mut ctx = crate::tools::test_support::stub_ctx(&crate::AgentMode::Build);
+            let observations = ResponseObservations::new(limit);
+            ctx.steering_observations = Some(observations.clone());
+            let (executed, effects) = flume::unbounded();
+            ctx.local_tools = Arc::new(HashMap::from([(
+                READ.into(),
+                crate::tools::local_tool(move |input, ctx| {
+                    let executed = executed.clone();
+                    Box::pin(async move {
+                        let earlier = ctx.tool_use_id.as_deref() == Some(INCOMPLETE_ID);
+                        executed.send((ctx.steering_order, input)).unwrap();
+                        if earlier {
+                            Err(EARLY_FAILURE.into())
+                        } else {
+                            Ok(String::new())
+                        }
+                    })
+                }),
+            )]));
+            let runs = Arc::new(SpeculativeRuns::new(&ctx, None));
+            let (tx, rx) = flume::unbounded();
+            let forwarding = smol::spawn({
+                let runs = Arc::clone(&runs);
+                async move { forward_provider_events(rx, None, false, Some(runs)).await }
+            });
+            tx.send(ProviderEvent::ToolUseStart {
+                id: TOOL_ID.into(),
+                name: READ.into(),
+                source_ordinal: Some(1),
+            })
+            .unwrap();
+            tx.send(ProviderEvent::ToolInputDelta {
+                id: TOOL_ID.into(),
+                delta: LATE_INPUT.into(),
+            })
+            .unwrap();
+            let later: Value = serde_json::from_str(LATE_INPUT).unwrap();
+            assert_eq!(
+                effects.recv_async().await.unwrap(),
+                (vec![1], later.clone())
+            );
+            tx.send(ProviderEvent::TextDelta {
+                text: PARTIAL_TEXT.into(),
+            })
+            .unwrap();
+            tx.send(ProviderEvent::ToolUseStart {
+                id: INCOMPLETE_ID.into(),
+                name: READ.into(),
+                source_ordinal: Some(0),
+            })
+            .unwrap();
+            for fragment in ["{", &EARLY_INPUT[1..]] {
+                tx.send(ProviderEvent::ToolInputDelta {
+                    id: INCOMPLETE_ID.into(),
+                    delta: fragment.into(),
+                })
+                .unwrap();
+            }
+            let earlier: Value = serde_json::from_str(EARLY_INPUT).unwrap();
+            assert_eq!(
+                effects.recv_async().await.unwrap(),
+                (vec![0], earlier.clone())
+            );
+            for (id, input) in [(INCOMPLETE_ID, &earlier), (TOOL_ID, &later)] {
+                tx.send(ProviderEvent::ToolInputReady {
+                    id: id.into(),
+                    name: READ.into(),
+                    input: input.clone(),
+                    invalid_input: None,
+                })
+                .unwrap();
+            }
+            drop(tx);
+            forwarding.await;
+            let mut response = StreamResponse {
+                message: Message {
+                    content: vec![
+                        ContentBlock::tool_use(INCOMPLETE_ID, READ, earlier.clone()),
+                        ContentBlock::tool_use(TOOL_ID, READ, later.clone()),
+                    ],
+                    ..Message::default()
+                },
+                ..StreamResponse::default()
+            };
+            runs.finalize(&mut response);
+            runs.settled().await;
+            assert!(effects.is_empty());
+            assert_eq!(
+                runs.partial_message()
+                    .tool_uses()
+                    .map(|(id, _, _)| id)
+                    .collect::<Vec<_>>(),
+                [INCOMPLETE_ID, TOOL_ID]
+            );
+            let first = runs
+                .claim(INCOMPLETE_ID, READ, &earlier)
+                .unwrap()
+                .finish()
+                .await;
+            assert!(first.is_error);
+            assert_eq!(first.output.as_text(), EARLY_FAILURE);
+            assert!(
+                !runs
+                    .claim(TOOL_ID, READ, &later)
+                    .unwrap()
+                    .finish()
+                    .await
+                    .is_error
+            );
+            let (facts, _) = observations.take();
+            assert_eq!(facts.len(), limit);
+            assert_eq!(facts[0].outcome, ToolOutcome::Failure);
+            if limit > 1 {
+                assert_eq!(facts[1].outcome, ToolOutcome::Success);
+                assert_ne!(facts[0].fingerprint, facts[1].fingerprint);
+            }
+        });
+    }
+
+    #[test_case(false, false ; "max_tokens")]
+    #[test_case(true, false ; "completed_response")]
+    #[test_case(true, true ; "final_revision")]
+    fn malformed_top_level_waits_for_final_response(complete: bool, revised: bool) {
+        smol::block_on(async {
+            let mut ctx = crate::tools::test_support::stub_ctx(&crate::AgentMode::Build);
+            let (executed, effects) = flume::unbounded();
+            ctx.local_tools = Arc::new(HashMap::from([(
+                READ.into(),
+                crate::tools::local_tool(move |input, _| {
+                    let executed = executed.clone();
+                    Box::pin(async move {
+                        executed.send(input).unwrap();
+                        Ok(String::new())
+                    })
+                }),
+            )]));
+            ctx.json_repair.register_definitions(&json!([{"name":READ,"input_schema":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}]));
+            let runs = Arc::new(SpeculativeRuns::new(&ctx, None));
+            let (tx, rx) = flume::unbounded();
+            let marker = invalid_tool_input(MALFORMED_COMMAND);
+            for event in [
+                ProviderEvent::ToolUseStart {
+                    id: TOOL_ID.into(),
+                    name: READ.into(),
+                    source_ordinal: None,
+                },
+                ProviderEvent::ToolInputDelta {
+                    id: TOOL_ID.into(),
+                    delta: MALFORMED_COMMAND.into(),
+                },
+                ProviderEvent::ToolInputReady {
+                    id: TOOL_ID.into(),
+                    name: READ.into(),
+                    input: marker.clone(),
+                    invalid_input: Some(InvalidToolInput {
+                        raw: MALFORMED_COMMAND.into(),
+                        complete: true,
+                        clipped: false,
+                    }),
+                },
+            ] {
+                tx.send(event).unwrap();
+            }
+            drop(tx);
+            forward_provider_events(rx, None, false, Some(Arc::clone(&runs))).await;
+            assert!(!runs.has_admitted());
+            assert!(effects.is_empty());
+            assert!(ctx.json_repair.invalid_input(TOOL_ID).is_none());
+            let input = if revised {
+                json!({"command":COMMAND})
+            } else {
+                marker
+            };
+            let mut response = StreamResponse {
+                message: Message {
+                    content: vec![ContentBlock::tool_use(TOOL_ID, READ, input.clone())],
+                    ..Message::default()
+                },
+                stop_reason: Some(if complete {
+                    StopReason::ToolUse
+                } else {
+                    StopReason::MaxTokens
+                }),
+                ..StreamResponse::default()
+            };
+            if !revised {
+                response.invalid_tool_inputs.insert(
+                    TOOL_ID.into(),
+                    InvalidToolInput {
+                        raw: MALFORMED_COMMAND.into(),
+                        complete,
+                        clipped: false,
+                    },
+                );
+            }
+            runs.finalize(&mut response);
+            runs.settled().await;
+            let done = runs.claim(TOOL_ID, READ, &input).unwrap().finish().await;
+            assert_eq!(done.is_error, !complete);
+            if complete {
+                assert_eq!(effects.try_recv().unwrap(), json!({"command":COMMAND}));
+            }
+            runs.finalize(&mut response);
+            runs.settled().await;
+            assert!(effects.is_empty());
+        });
+    }
+
+    struct AdmissionFailureProvider {
+        calls: AtomicUsize,
+        batch: bool,
+        status: u16,
+        wait_for_cancel: bool,
+    }
+
+    impl Provider for AdmissionFailureProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            _: &'a [Message],
+            _: &'a str,
+            _: &'a Value,
+            events: &'a flume::Sender<ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&'a SessionRef>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(async move {
+                if self.calls.fetch_add(1, Ordering::SeqCst) > 0 {
+                    return Ok(StreamResponse::default());
+                }
+                events
+                    .send(ProviderEvent::ThinkingDelta {
+                        text: PARTIAL_REASONING.into(),
+                    })
+                    .unwrap();
+                events
+                    .send(ProviderEvent::TextDelta {
+                        text: PARTIAL_TEXT.into(),
+                    })
+                    .unwrap();
+                events
+                    .send(ProviderEvent::ToolUseStart {
+                        id: TOOL_ID.into(),
+                        name: if self.batch { BATCH } else { READ }.into(),
+                        source_ordinal: None,
+                    })
+                    .unwrap();
+                let delta = if self.batch {
+                    format!("{{\"tool_calls\":[{{\"tool\":\"{READ}\",\"parameters\":{{}}}},")
+                } else {
+                    "{}".into()
+                };
+                events
+                    .send(ProviderEvent::ToolInputDelta {
+                        id: TOOL_ID.into(),
+                        delta,
+                    })
+                    .unwrap();
+                if self.wait_for_cancel {
+                    return pending().await;
+                }
+                Err(AgentError::api(self.status, TRANSPORT_FAILURE))
+            })
+        }
+
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    #[test_case(false, 503, false ; "top_level_transport")]
+    #[test_case(true, 503, false ; "unfinished_batch_transport")]
+    #[test_case(false, 401, false ; "admitted_auth_failure")]
+    #[test_case(false, 503, true ; "top_level_user_cancellation")]
+    #[test_case(true, 503, true ; "unfinished_batch_user_cancellation")]
+    fn admitted_calls_settle_without_transport_replay(batch: bool, status: u16, cancelled: bool) {
+        smol::block_on(async {
+            let (events, _rx) = flume::unbounded();
+            let sender = EventSender::new(events, 0);
+            let mut ctx = crate::tools::test_support::stub_ctx_with(
+                &crate::AgentMode::Build,
+                Some(&sender),
+                None,
+            );
+            ctx.registry
+                .register(
+                    Arc::new(batch::BatchTool),
+                    ToolSource::Native {
+                        owner: crate::tools::native::OWNER.into(),
+                        contract: BATCH.into(),
+                        trusted: true,
+                    },
+                )
+                .unwrap();
+            let executed = Arc::new(AtomicUsize::new(0));
+            let count = Arc::clone(&executed);
+            let (effect, effects) = flume::unbounded();
+            let (cancel, token) = CancelToken::new();
+            let mut cancel = Some(cancel);
+            ctx.cancel = token;
+            ctx.local_tools = Arc::new(HashMap::from([(
+                READ.into(),
+                crate::tools::local_tool(move |_, _| {
+                    let count = Arc::clone(&count);
+                    let effect = effect.clone();
+                    Box::pin(async move {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        effect.send(()).unwrap();
+                        if cancelled {
+                            return pending().await;
+                        }
+                        Ok(String::new())
+                    })
+                }),
+            )]));
+            let runs = Arc::new(SpeculativeRuns::new(&ctx, None));
+            let provider = AdmissionFailureProvider {
+                calls: AtomicUsize::new(0),
+                batch,
+                status,
+                wait_for_cancel: cancelled,
+            };
+            let tools = json!([]);
+            let nudge = Nudge::default();
+            let request = stream_with_retry(
+                &provider,
+                &ctx.model,
+                &[],
+                "",
+                &tools,
+                &sender,
+                &ctx.cancel,
+                &nudge,
+                RequestOptions::default(),
+                None,
+                Some(&runs),
+            );
+            let result = futures_lite::future::race(request, async {
+                if cancelled {
+                    effects.recv_async().await.unwrap();
+                    cancel.take().unwrap().cancel();
+                }
+                pending().await
+            })
+            .await;
+            let Err(StreamError::Partial {
+                mut response,
+                error,
+            }) = result
+            else {
+                panic!("expected an admitted partial response");
+            };
+            runs.settled().await;
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(executed.load(Ordering::SeqCst), 1);
+            assert_eq!(matches!(error, AgentError::Cancelled), cancelled);
+            assert!(
+                matches!(&response.message.content[0], ContentBlock::Thinking {
+                thinking,
+                interrupted: true,
+                ..
+            } if thinking == PARTIAL_REASONING)
+            );
+            assert_eq!(response.message.first_text_content(), Some(PARTIAL_TEXT));
+            assert!(response.message.reasoning_source.is_some());
+            let uses: Vec<_> = response.message.tool_uses().collect();
+            assert_eq!(uses.len(), 1);
+            let (id, name, input) = uses[0];
+            let done = runs.claim(id, name, input).unwrap().finish().await;
+            assert_eq!(done.is_error, cancelled);
+            assert_eq!(done.id, TOOL_ID);
+            runs.finalize(&mut response);
+            runs.settled().await;
+            assert_eq!(executed.load(Ordering::SeqCst), 1);
+        });
+    }
+
+    #[test_case(false ; "streamed_json")]
+    #[test_case(true ; "done_only")]
+    fn top_level_call_executes_while_response_channel_remains_open(done_only: bool) {
+        smol::block_on(async {
+            let (etx, erx) = flume::unbounded();
+            let sender = EventSender::new(etx, 0);
+            let mut ctx = crate::tools::test_support::stub_ctx_with(
+                &crate::AgentMode::Build,
+                Some(&sender),
+                None,
+            );
+            let (executed, effects) = flume::unbounded();
+            ctx.local_tools = Arc::new(HashMap::from([(
+                READ.into(),
+                crate::tools::local_tool(move |_, ctx| {
+                    let executed = executed.clone();
+                    Box::pin(async move {
+                        ctx.live_sink
+                            .as_ref()
+                            .unwrap()
+                            .send(ToolLive::Annotation(LIVE_ANNOTATION.into()))
+                            .unwrap();
+                        executed.send(()).unwrap();
+                        Ok(String::new())
+                    })
+                }),
+            )]));
+            let runs = Arc::new(SpeculativeRuns::new(&ctx, None));
+            let (ptx, prx) = flume::unbounded();
+            let forwarding = smol::spawn({
+                let runs = Arc::clone(&runs);
+                let sender = sender.clone();
+                async move { forward_provider_events(prx, Some(&sender), false, Some(runs)).await }
+            });
+            ptx.send(ProviderEvent::ToolAliases {
+                aliases: Some(Arc::new(HashMap::from([(WIRE_READ.into(), READ.into())]))),
+            })
+            .unwrap();
+            let input = json!({"path": "a.rs"});
+            ptx.send(ProviderEvent::ToolUseStart {
+                id: INCOMPLETE_ID.into(),
+                name: WIRE_READ.into(),
+                source_ordinal: None,
+            })
+            .unwrap();
+            ptx.send(ProviderEvent::ToolInputDelta {
+                id: INCOMPLETE_ID.into(),
+                delta: "{".into(),
+            })
+            .unwrap();
+            if done_only {
+                ptx.send(ProviderEvent::ToolInputReady {
+                    id: TOOL_ID.into(),
+                    name: WIRE_READ.into(),
+                    input: input.clone(),
+                    invalid_input: None,
+                })
+                .unwrap();
+            } else {
+                ptx.send(ProviderEvent::ToolUseStart {
+                    id: TOOL_ID.into(),
+                    name: WIRE_READ.into(),
+                    source_ordinal: None,
+                })
+                .unwrap();
+                ptx.send(ProviderEvent::ToolInputDelta {
+                    id: TOOL_ID.into(),
+                    delta: input.to_string(),
+                })
+                .unwrap();
+            }
+            effects.recv_async().await.unwrap();
+            ptx.send(ProviderEvent::ToolInputReady {
+                id: TOOL_ID.into(),
+                name: WIRE_READ.into(),
+                input: input.clone(),
+                invalid_input: None,
+            })
+            .unwrap();
+            ptx.send(ProviderEvent::TextDelta {
+                text: String::new(),
+            })
+            .unwrap();
+            drop(ptx);
+            forwarding.await;
+            runs.settled().await;
+            assert!(effects.is_empty());
+            assert!(
+                !runs
+                    .claim(TOOL_ID, READ, &input)
+                    .unwrap()
+                    .finish()
+                    .await
+                    .is_error
+            );
+            let events: Vec<_> = erx.drain().map(|event| event.event).collect();
+            let preview = events
+                .iter()
+                .position(|event| matches!(event, AgentEvent::ToolInputDelta { .. }))
+                .unwrap();
+            let start = events
+                .iter()
+                .position(|event| matches!(event, AgentEvent::ToolStart(_)))
+                .unwrap();
+            assert!(preview < start);
+            let live = events.iter().position(|event| matches!(event, AgentEvent::ToolAnnotation { id, annotation } if id == TOOL_ID && annotation == LIVE_ANNOTATION)).unwrap();
+            let done = events
+                .iter()
+                .position(|event| matches!(event, AgentEvent::ToolDone(_)))
+                .unwrap();
+            assert!(start < live && live < done);
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, AgentEvent::ToolDone(_)))
+                    .count(),
+                1
+            );
+        });
+    }
+
+    #[test_case(r#"{"value":"é \\\" } ]", "nested":[{}]}"# ; "escapes_unicode_nesting")]
+    #[test_case(r#"[{}, {"x": true}]"# ; "array")]
+    fn completed_input_is_detected_at_every_fragment_boundary(raw: &str) {
+        let expected: Value = serde_json::from_str(raw).unwrap();
+        for split in raw.char_indices().map(|(index, _)| index) {
+            let mut frame = InputFrame::default();
+            assert!(frame.absorb(&raw[..split]).is_none());
+            assert_eq!(frame.absorb(&raw[split..]), Some(expected.clone()));
+            assert!(frame.absorb(raw).is_none());
+        }
+    }
+
+    #[test_case("42" ; "scalar_waits")]
+    #[test_case("{\"value\":\"unterminated" ; "unfinished_string")]
+    #[test_case("{}{}" ; "multiple_values")]
+    fn incomplete_or_ambiguous_input_never_admits(raw: &str) {
+        assert!(InputFrame::default().absorb(raw).is_none());
+    }
 
     const WRITE: &str = "file_write";
     const EDIT: &str = "file_edit";
@@ -745,6 +1482,7 @@ mod tests {
         ptx.send(ProviderEvent::ToolUseStart {
             id: TOOL_ID.into(),
             name: tool.into(),
+            source_ordinal: None,
         })
         .unwrap();
         for fragment in fragments {
@@ -778,6 +1516,16 @@ mod tests {
             Some(&sender),
             None,
         );
+        ctx.registry
+            .register(
+                Arc::new(batch::BatchTool),
+                ToolSource::Native {
+                    owner: crate::tools::native::OWNER.into(),
+                    contract: crate::tools::BATCH_TOOL_NAME.into(),
+                    trusted: true,
+                },
+            )
+            .unwrap();
         let ran = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let count = std::sync::Arc::clone(&ran);
         ctx.local_tools = std::sync::Arc::new(std::collections::HashMap::from([(
@@ -796,6 +1544,7 @@ mod tests {
         ptx.send(ProviderEvent::ToolUseStart {
             id: TOOL_ID.into(),
             name: BATCH.into(),
+            source_ordinal: None,
         })
         .unwrap();
         ptx.send(ProviderEvent::ToolInputDelta {

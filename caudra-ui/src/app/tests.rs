@@ -7623,6 +7623,85 @@ fn compaction_is_billed_to_its_own_provider_and_purpose() {
     assert_eq!(rows[0].purpose, LedgerPurpose::Compaction.storage_name());
 }
 
+#[test_case(false, false; "main")]
+#[test_case(true, false; "subagent")]
+#[test_case(false, true; "cancelled_run")]
+fn repair_accounting_persists_once_without_changing_context(subagent: bool, stale: bool) {
+    let (_tmp, dir, writer, mut app) = tempdir_app();
+    app.status = Status::Streaming;
+    app.run_id = if stale { 2 } else { 1 };
+    app.state.goal.set(GOAL_CONDITION).unwrap();
+    let usage = TokenUsage {
+        input: GOAL_INPUT,
+        output: GOAL_OUTPUT,
+        ..Default::default()
+    };
+    let chat_idx = if subagent {
+        app.resolve_or_create_chat(&subagent_info(TASK_ID, RESEARCH_NAME))
+    } else {
+        app.state
+            .goal
+            .record_external_usage(usage, Some(GOAL_COST), Billing::Api);
+        0
+    };
+    app.state.context_size = TITLE_CONTEXT_SIZE;
+    app.chats[chat_idx].context_size = TITLE_CONTEXT_SIZE;
+    app.chats[chat_idx].context_window = CHAT_CONTEXT_WINDOW;
+    let messages = app.chats[chat_idx].message_count();
+    let event = AgentEvent::ModelUsage {
+        usage,
+        cost: Some(GOAL_COST),
+        billing: Billing::Api,
+        provider: OTHER_PROVIDER.into(),
+        model: LEDGER_MODEL.into(),
+        purpose: LedgerPurpose::ToolJsonRepair,
+    };
+    let message = if subagent {
+        subagent_msg(event, TASK_ID, Some(RESEARCH_NAME))
+    } else {
+        agent_msg(event)
+    };
+    app.update(message);
+    assert_eq!(app.state.token_usage, usage);
+    assert_eq!(app.state.goal.snapshot().unwrap().usage, usage);
+    assert_eq!(app.state.cost, Some(GOAL_COST));
+    assert_eq!(app.chats[chat_idx].cost, Some(GOAL_COST));
+    assert_eq!(app.state.context_size, TITLE_CONTEXT_SIZE);
+    assert_eq!(app.chats[chat_idx].context_size, TITLE_CONTEXT_SIZE);
+    assert_eq!(app.chats[chat_idx].context_window, CHAT_CONTEXT_WINDOW);
+    assert_eq!(app.chats[chat_idx].message_count(), messages);
+    assert_eq!(
+        app.state
+            .session
+            .usage_by_model()
+            .values()
+            .filter_map(|usage| usage.cost)
+            .sum::<f64>(),
+        GOAL_COST
+    );
+    app.update(agent_msg_with_run_id(
+        AgentEvent::Done {
+            usage,
+            num_turns: 0,
+            reason: DoneReason::Cancelled,
+        },
+        app.run_id,
+    ));
+    assert_eq!(app.state.token_usage, usage);
+    assert_eq!(app.state.cost, Some(GOAL_COST));
+    drain_writer(app, writer);
+    let rows = UsageLedger::open(&dir).unwrap().buckets(None).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].purpose,
+        LedgerPurpose::ToolJsonRepair.storage_name()
+    );
+    assert_eq!(rows[0].provider, OTHER_PROVIDER);
+    assert_eq!(rows[0].model, LEDGER_MODEL);
+    assert_eq!(rows[0].input, u64::from(GOAL_INPUT));
+    assert_eq!(rows[0].cost, GOAL_COST);
+}
+
 /// The title request never enters the conversation, so its spend is recorded
 /// while the context size it would otherwise report is ignored.
 #[test]

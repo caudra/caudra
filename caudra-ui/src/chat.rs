@@ -227,7 +227,7 @@ impl Chat {
                         .push(DisplayMessage::plan(content, pp.display().to_string()));
                 }
             }
-            AgentEvent::TurnComplete(_) => {}
+            AgentEvent::TurnComplete(_) | AgentEvent::ModelUsage { .. } => {}
             AgentEvent::GoalEvaluating { .. }
             | AgentEvent::GoalEvaluation { .. }
             | AgentEvent::GoalFinished { .. }
@@ -332,6 +332,9 @@ impl Chat {
             AgentEvent::SubagentHistory { .. } | AgentEvent::Workflow(_) => {}
             AgentEvent::LiveToolBuf { id, body } => {
                 self.messages_panel.register_live_buf(id, body);
+            }
+            AgentEvent::ToolAnnotation { id, annotation } => {
+                self.messages_panel.tool_annotation(&id, annotation);
             }
             AgentEvent::PromptProgress {
                 processed,
@@ -798,7 +801,7 @@ impl Chat {
 /// child's. Only a shape: the caller confirms the child exists before dropping
 /// the suffix, so a tool whose own id merely contains a colon still reaches
 /// its own header.
-fn batch_child_id(tool_id: &str) -> Option<(&str, usize)> {
+pub(crate) fn batch_child_id(tool_id: &str) -> Option<(&str, usize)> {
     let (parent, index) = tool_id.rsplit_once(BATCH_CHILD_ID_SEPARATOR)?;
     Some((parent, index.parse().ok()?))
 }
@@ -953,6 +956,7 @@ pub fn history_to_display(
                         .map(Arc::new),
                     tool_raw_input: Some(Arc::new(input.clone())),
                     tool_output,
+                    tool_preview_pending: false,
                     live_output: None,
                     live_body: None,
                     annotation,
@@ -1129,7 +1133,7 @@ mod tests {
     use caudra_agent::tools::{BATCH_TOOL_NAME, SHELL_TOOL_NAME};
     use caudra_agent::{
         AgentEvent, BatchToolEntry, BatchToolStatus, IndexLine, IndexLineSemantic, IndexOutput,
-        IndexSourceRange, ToolDoneEvent, ToolOutput, ToolStartEvent,
+        IndexSourceRange, SharedBuf, ToolDoneEvent, ToolOutput, ToolStartEvent,
     };
     use caudra_config::UiConfig;
     use caudra_providers::{ContentBlock, Message, Role};
@@ -1266,6 +1270,9 @@ mod tests {
         "a batch child's streamed output belongs to the roster row, not to a header";
     const HEADER_STREAM_MSG: &str = "an id that merely ends in a number still names its own card";
     const CHILD_TAIL: &str = "building";
+    const LIVE_PHASE: &str = "ranking 12 files";
+    const LIVE_PARENT_ID: &str = "batch:source";
+    const LIVE_CHILD_ID: &str = "batch:source:0";
 
     fn batch_start(id: &str, children: usize) -> AgentEvent {
         let AgentEvent::ToolStart(mut ev) = tool_start(id, BATCH_TOOL_NAME) else {
@@ -1325,6 +1332,64 @@ mod tests {
             None,
             "{HEADER_STREAM_MSG}"
         );
+    }
+
+    #[test_case(false, false ; "local_top_level")]
+    #[test_case(false, true ; "remote_top_level")]
+    #[test_case(true, false ; "local_batch_child")]
+    #[test_case(true, true ; "remote_batch_child")]
+    fn generic_live_events_reach_their_execution_slot(child: bool, remote: bool) {
+        let mut chat = chat();
+        let id = if child { LIVE_CHILD_ID } else { LIVE_PARENT_ID };
+        chat.handle_event(
+            if child {
+                batch_start(LIVE_PARENT_ID, 1)
+            } else {
+                tool_start(id, SHELL_TOOL_NAME)
+            },
+            None,
+        );
+        if remote {
+            let body = Arc::new(SharedBuf::new());
+            body.set_lines(
+                BufferSnapshot::plain_text(CHILD_TAIL.into())
+                    .lines
+                    .as_ref()
+                    .clone(),
+            );
+            chat.handle_event(
+                AgentEvent::LiveToolBuf {
+                    id: id.into(),
+                    body,
+                },
+                None,
+            );
+            let _ = chat.tick();
+        } else {
+            chat.handle_event(streamed(id, CHILD_TAIL), None);
+        }
+        chat.handle_event(
+            AgentEvent::ToolAnnotation {
+                id: id.into(),
+                annotation: LIVE_PHASE.into(),
+            },
+            None,
+        );
+        let msg = chat.messages_panel.message_at(0).unwrap();
+        if child {
+            assert_eq!(
+                chat.messages_panel.batch_child_stream(LIVE_PARENT_ID, 0),
+                Some(CHILD_TAIL)
+            );
+            let Some(ToolOutput::Batch { entries, .. }) = msg.tool_output.as_deref() else {
+                panic!("{CHILD_STREAM_MSG}");
+            };
+            assert_eq!(entries[0].annotation.as_deref(), Some(LIVE_PHASE));
+            assert!(msg.annotation.is_none());
+        } else {
+            assert_eq!(msg.live_output.as_deref(), Some(CHILD_TAIL));
+            assert_eq!(msg.annotation.as_deref(), Some(LIVE_PHASE));
+        }
     }
 
     /// The plan card renders the same file the write card does, so exactly one

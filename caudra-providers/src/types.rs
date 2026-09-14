@@ -26,6 +26,7 @@ use crate::model::Model;
 
 const LOCAL_BUDGET_FIELD: &str = "thinking_budget_tokens";
 const INVALID_TOOL_JSON_EXCERPT: usize = 2_000;
+pub const MAX_TOOL_INPUT_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImageMediaType {
@@ -481,10 +482,52 @@ impl Message {
 
 pub fn invalid_tool_input(raw: &str) -> Value {
     let excerpt: String = raw.chars().take(INVALID_TOOL_JSON_EXCERPT).collect();
-    Value::Object(Map::from_iter([(
-        INVALID_TOOL_JSON_KEY.to_string(),
-        Value::String(excerpt),
-    )]))
+    json!({ INVALID_TOOL_JSON_KEY: excerpt })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct InvalidToolInput {
+    pub raw: String,
+    pub complete: bool,
+    pub clipped: bool,
+}
+
+pub(crate) fn append_tool_input(raw: &mut String, delta: &str) {
+    if raw.len() > MAX_TOOL_INPUT_BYTES {
+        return;
+    }
+    let available = MAX_TOOL_INPUT_BYTES - raw.len();
+    if delta.len() <= available {
+        raw.push_str(delta);
+    } else {
+        let mut end = available;
+        while !delta.is_char_boundary(end) {
+            end -= 1;
+        }
+        raw.push_str(&delta[..end]);
+        while raw.len() <= MAX_TOOL_INPUT_BYTES {
+            raw.push('\0');
+        }
+    }
+}
+
+pub(crate) fn parse_tool_input(raw: &str, complete: bool) -> (Value, Option<InvalidToolInput>) {
+    let clipped = raw.len() > MAX_TOOL_INPUT_BYTES;
+    if !clipped && let Ok(input) = serde_json::from_str(raw) {
+        return (input, None);
+    }
+    (
+        invalid_tool_input(raw),
+        Some(InvalidToolInput {
+            raw: if clipped {
+                String::new()
+            } else {
+                raw.to_owned()
+            },
+            complete,
+            clipped,
+        }),
+    )
 }
 
 impl TitleSource for Message {
@@ -498,6 +541,16 @@ impl TitleSource for Message {
 
 #[derive(Debug, Clone, Serialize)]
 pub enum ProviderEvent {
+    ToolAliases {
+        aliases: Option<ToolNameAliases>,
+    },
+    ToolInputReady {
+        id: String,
+        name: String,
+        input: Value,
+        #[serde(skip)]
+        invalid_input: Option<InvalidToolInput>,
+    },
     TextDelta {
         text: String,
     },
@@ -508,6 +561,8 @@ pub enum ProviderEvent {
     ToolUseStart {
         id: String,
         name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        source_ordinal: Option<usize>,
     },
     /// One fragment of a tool call's argument JSON, in arrival order. Always
     /// preceded by the `ToolUseStart` naming the same `id`. Providers that
@@ -521,6 +576,12 @@ pub enum ProviderEvent {
         total: u32,
         cache: u32,
     },
+}
+
+impl ProviderEvent {
+    pub fn is_content(&self) -> bool {
+        !matches!(self, Self::ToolAliases { .. } | Self::PromptProgress { .. })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Display, IntoStaticStr)]
@@ -1007,6 +1068,7 @@ pub struct StreamResponse {
     pub usage: TokenUsage,
     pub stop_reason: Option<StopReason>,
     pub tool_name_aliases: Option<ToolNameAliases>,
+    pub invalid_tool_inputs: HashMap<String, InvalidToolInput>,
 }
 
 /// Provider-reported usage quota, independent of local token accounting. Not every
@@ -1047,6 +1109,13 @@ mod tests {
     const STEERING_RULE: &str = "empty_output";
     const STEERING_TEXT: &str = "Continue with a useful response.";
 
+    #[test_case(ProviderEvent::ToolAliases { aliases: None }, false ; "aliases_are_metadata")]
+    #[test_case(ProviderEvent::PromptProgress { processed: 1, total: 2, cache: 0 }, false ; "prefill_is_metadata")]
+    #[test_case(ProviderEvent::ToolInputReady { id: "call".into(), name: "read".into(), input: json!({}), invalid_input: None }, true ; "completed_tool_is_content")]
+    fn oauth_retry_content_classification(event: ProviderEvent, expected: bool) {
+        assert_eq!(event.is_content(), expected);
+    }
+
     #[test_case("", 0 ; "empty")]
     #[test_case("{broken", 1 ; "short")]
     #[test_case("é", INVALID_TOOL_JSON_EXCERPT ; "at_limit")]
@@ -1061,6 +1130,52 @@ mod tests {
         );
         assert!(raw.starts_with(excerpt));
         assert_eq!(wrapped.as_object().unwrap().len(), 1);
+    }
+
+    #[test_case(true, MAX_TOOL_INPUT_BYTES, true ; "complete_at_limit")]
+    #[test_case(true, MAX_TOOL_INPUT_BYTES + 1, false ; "clipped")]
+    #[test_case(false, 10, false ; "incomplete")]
+    fn repair_source_requires_complete_unclipped_input(
+        complete: bool,
+        bytes: usize,
+        repairable: bool,
+    ) {
+        let raw = "x".repeat(bytes);
+        let (_, invalid) = parse_tool_input(&raw, complete);
+        let invalid = invalid.unwrap();
+        assert_eq!(invalid.complete && !invalid.clipped, repairable);
+        assert_eq!(invalid.clipped, bytes > MAX_TOOL_INPUT_BYTES);
+        assert_eq!(
+            invalid.raw,
+            if invalid.clipped { String::new() } else { raw }
+        );
+    }
+
+    #[test_case("é" ; "two_byte")]
+    #[test_case("𝄞" ; "four_byte")]
+    fn argument_buffer_never_repairs_a_clipped_prefix(unit: &str) {
+        let mut raw = String::new();
+        append_tool_input(&mut raw, &unit.repeat(MAX_TOOL_INPUT_BYTES));
+        assert_eq!(raw.len(), MAX_TOOL_INPUT_BYTES + 1);
+        let (_, invalid) = parse_tool_input(&raw, true);
+        let invalid = invalid.unwrap();
+        assert!(invalid.clipped);
+        assert!(invalid.raw.is_empty());
+    }
+
+    #[test_case(true ; "complete")]
+    #[test_case(false ; "incomplete")]
+    fn valid_marker_keys_are_not_repair_metadata(complete: bool) {
+        let input = json!({
+            "INVALID_JSON": "display",
+            "caudra_invalid_json_raw": "{\"command\":\"embedded\"}",
+            "caudra_invalid_json_complete": true,
+            "caudra_invalid_json_clipped": false,
+            "command": "actual"
+        });
+        let (parsed, invalid) = parse_tool_input(&input.to_string(), complete);
+        assert_eq!(parsed, input);
+        assert!(invalid.is_none());
     }
 
     #[test_case(SteeringKind::Recovery, "recovery" ; "recovery")]

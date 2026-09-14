@@ -976,7 +976,7 @@ impl Provider for Anthropic {
             let forward = async move {
                 let mut forwarded = 0usize;
                 while let Ok(event) = relay_rx.recv_async().await {
-                    forwarded += 1;
+                    forwarded += usize::from(event.is_content());
                     if event_tx.send_async(event).await.is_err() {
                         break;
                     }
@@ -1596,7 +1596,9 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
             let starts: Vec<_> = events
                 .iter()
                 .filter_map(|e| match e {
-                    ProviderEvent::ToolUseStart { id, name } => Some((id.clone(), name.clone())),
+                    ProviderEvent::ToolUseStart { id, name, .. } => {
+                        Some((id.clone(), name.clone()))
+                    }
                     _ => None,
                 })
                 .collect();

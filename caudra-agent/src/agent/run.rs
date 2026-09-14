@@ -7,6 +7,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
+use crate::tools::json_repair::RepairState;
 use serde_json::Value;
 use tracing::{Instrument, debug, error, info, info_span, warn};
 
@@ -645,6 +646,10 @@ impl<'h> Agent<'h> {
         // that failed was still busy.
         let busy_since = Instant::now();
         let result = self.run_loop().await;
+        if let Some(runs) = self.speculative.clone() {
+            runs.abandon_unfinished();
+            self.drain_repair_usage(&runs.repair_state());
+        }
         if top_level {
             caudra_otel::emit::active_time(busy_since.elapsed());
         }
@@ -1015,12 +1020,23 @@ impl<'h> Agent<'h> {
         // must learn what already ran before it decides what to run next.
         self.report_speculative();
         let sent_at_history_len = self.history.len();
-        self.speculative = self
-            .config
-            .eager_batch_dispatch
-            .then(|| Arc::new(SpeculativeRuns::new(&self.tool_context(), self.mcp.clone())));
+        self.tool_name_aliases = None;
+        let repair_state = Arc::new(RepairState::default());
+        self.speculative = self.config.eager_tool_dispatch.then(|| {
+            let ctx = ToolContext {
+                json_repair: Arc::clone(&repair_state),
+                steering_observations: Some(ResponseObservations::new(
+                    steering::lock(&self.steering).observation_window(),
+                )),
+                ..self.tool_context()
+            };
+            Arc::new(
+                SpeculativeRuns::new(&ctx, self.mcp.clone()).with_recent(self.recent_calls.clone()),
+            )
+        });
         let stream_result = {
             let (tools, mcp) = self.request_tools();
+            repair_state.register_definitions(tools.as_ref());
             let provider_history = self.projected_history(tools.as_ref());
             self.publish_context(
                 ContextReadiness::CapturedCurrentRequest,
@@ -1043,7 +1059,13 @@ impl<'h> Agent<'h> {
             )
             .await
         };
+        self.drain_repair_usage(&repair_state);
+        let mut interrupted = None;
         let mut response = match stream_result {
+            Err(StreamError::Partial { response, error }) => {
+                interrupted = Some(error);
+                *response
+            }
             Ok(r) => {
                 self.reauth_attempts = 0;
                 r
@@ -1109,10 +1131,12 @@ impl<'h> Agent<'h> {
             "API response received"
         );
 
-        self.measured = Some(MeasuredContext {
-            reported: response.usage.total_input(),
-            history_len: sent_at_history_len,
-        });
+        if interrupted.is_none() {
+            self.measured = Some(MeasuredContext {
+                reported: response.usage.total_input(),
+                history_len: sent_at_history_len,
+            });
+        }
         let usage = response.usage;
         self.total_usage += usage;
         self.emit_turn_complete(&response)?;
@@ -1145,7 +1169,7 @@ impl<'h> Agent<'h> {
         let empty = !has_tools && steering::visible_text(&response.message).is_none();
         let (observations, all_repairable) = if has_tools {
             self.response_text = None;
-            self.process_tool_calls(response).await?
+            self.process_tool_calls(response, repair_state).await?
         } else {
             self.record_response_text(steering::visible_text(&response.message));
             if empty {
@@ -1161,6 +1185,9 @@ impl<'h> Agent<'h> {
             (Vec::new(), false)
         };
         self.continuing_response = false;
+        if let Some(error) = &interrupted {
+            self.push_injected(Message::observation(format!("The provider stream stopped after tool admission ({}). Admitted calls were settled and their actual outcomes are recorded above. Calls not admitted were not executed. Do not replay successful calls; consider possible effects of failed calls before continuing.", error.kind())));
+        }
         steering::lock(&self.steering).observe(observations, protocol);
         if self.cancel.is_cancelled() {
             return Err(AgentError::Cancelled);
@@ -1206,7 +1233,9 @@ impl<'h> Agent<'h> {
             let state = steering::lock(&self.steering);
             state.policy().enabled && state.policy().rules.protocol_mismatch.enabled
         };
-        let recovery = if all_repairable {
+        let recovery = if interrupted.is_some() {
+            Some(Recovery::Truncated)
+        } else if all_repairable {
             Some(Recovery::ToolRepair)
         } else if protocol && protocol_enabled {
             Some(Recovery::Protocol)
@@ -1226,8 +1255,13 @@ impl<'h> Agent<'h> {
             let is_empty = matches!(recovery, Recovery::Empty { .. });
             let is_truncated = matches!(recovery, Recovery::Truncated);
             let action = steering::lock(&self.steering).recover(recovery)?;
+            if matches!(action, RecoveryAction::Disabled)
+                && let Some(error) = interrupted.take()
+            {
+                return Err(error);
+            }
             if let RecoveryAction::Continue(message) = action {
-                self.continuing_response = is_truncated;
+                self.continuing_response = is_truncated && interrupted.is_none();
                 if let Some(message) = message {
                     if is_empty {
                         self.event_tx.send(AgentEvent::Nudge)?;
@@ -1599,21 +1633,31 @@ impl<'h> Agent<'h> {
     async fn process_tool_calls(
         &mut self,
         response: StreamResponse,
+        repair_state: Arc<RepairState>,
     ) -> Result<(Vec<ToolObservation>, bool), AgentError> {
         let tool_uses = response
             .message
             .tool_uses()
             .map(|(id, name, input)| (id.to_owned(), name.to_owned(), input.clone()))
             .collect();
-        let observations =
-            ResponseObservations::new(steering::lock(&self.steering).observation_window());
+        let observations = self
+            .speculative
+            .as_ref()
+            .and_then(|runs| runs.observations())
+            .unwrap_or_else(|| {
+                ResponseObservations::new(steering::lock(&self.steering).observation_window())
+            });
         self.tool_name_aliases = response.tool_name_aliases.clone();
         let ctx = ToolContext {
             steering_observations: Some(observations.clone()),
+            json_repair: repair_state,
             tool_name_aliases: response.tool_name_aliases.clone(),
             speculative: self.speculative.clone(),
             ..self.tool_context()
         };
+        for (id, invalid) in response.invalid_tool_inputs {
+            ctx.json_repair.register_invalid(&id, invalid);
+        }
         self.push_assistant_message(response.message);
         let result = tool_dispatch::process_tool_calls(
             tool_uses,
@@ -1624,6 +1668,7 @@ impl<'h> Agent<'h> {
             &ctx,
         )
         .await;
+        self.drain_repair_usage(&ctx.json_repair);
         if result.is_ok() {
             self.publish_prepared_context();
         }
@@ -1631,13 +1676,32 @@ impl<'h> Agent<'h> {
         Ok(observations.take())
     }
 
+    fn drain_repair_usage(&mut self, state: &RepairState) {
+        for repair in state.take_usage() {
+            self.total_usage += repair.usage;
+            self.goal
+                .record_usage(repair.usage, repair.cost, repair.billing);
+            self.event_tx.try_send(AgentEvent::ModelUsage {
+                usage: repair.usage,
+                cost: repair.cost,
+                billing: repair.billing,
+                provider: repair.provider,
+                model: repair.model,
+                purpose: repair.purpose,
+            });
+        }
+    }
+
     /// Hands the model whatever the last response started early and never
     /// asked for, so it does not do that work a second time.
     fn report_speculative(&mut self) {
-        let Some(message) = self.speculative.take().and_then(|runs| runs.drain_report()) else {
+        let Some(runs) = self.speculative.take() else {
             return;
         };
-        self.history.push(message);
+        if let Some(message) = runs.drain_report() {
+            self.history.push(message);
+        }
+        self.drain_repair_usage(&runs.repair_state());
     }
 
     fn tool_context(&self) -> ToolContext {
@@ -1683,6 +1747,7 @@ impl<'h> Agent<'h> {
             tool_name_aliases: self.tool_name_aliases.clone(),
             steering_observations: None,
             steering_order: Vec::new(),
+            json_repair: Arc::new(RepairState::default()),
             live_sink: None,
             model_policy: Arc::clone(&self.model_policy),
             workflow: self.workflow.clone(),
@@ -2014,8 +2079,8 @@ mod tests {
     use caudra_config::steering::SteeringConfig;
     use caudra_providers::provider::{BoxFuture, Provider};
     use caudra_providers::{
-        ContentBlock, Message, Model, ProviderEvent, RequestOptions, Role, SteeringKind,
-        StopReason, StreamResponse, TokenUsage,
+        ContentBlock, InvalidToolInput, Message, Model, ProviderEvent, RequestOptions, Role,
+        SteeringKind, StopReason, StreamResponse, TokenUsage, invalid_tool_input,
     };
     use caudra_workspace::PlanRef;
     use serde_json::Value;
@@ -2044,6 +2109,21 @@ mod tests {
     const VISIBLE_RESPONSE: &str = "response";
     const STEERING_CUSTOM: &str = "Custom runtime guidance.";
     const INVALID_TOOL: &str = "invalid_tool";
+    const REPAIR_RAW: &str = "{\"a\" 1}";
+    const REPAIR_ACCEPTED: &str = "{\"a\":1}";
+    const REPAIR_REJECTED: &str = "{\"a\":2}";
+    const REPAIR_USAGE: TokenUsage = TokenUsage {
+        input: 19,
+        output: 7,
+        cache_creation: 3,
+        cache_read: 5,
+    };
+    const MAIN_REQUEST_USAGE: TokenUsage = TokenUsage {
+        input: 73,
+        output: 11,
+        cache_creation: 0,
+        cache_read: 0,
+    };
     const LARGE_CONTEXT: u32 = 170_000;
     const AUTH_ERROR_MESSAGE: &str = "expired";
     const EXPECTED_AUTH_ERROR: &str = "expected terminal authentication error";
@@ -2618,6 +2698,197 @@ mod tests {
         }
     }
 
+    fn repair_schema() -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {"a": {"type": "integer"}},
+            "required": ["a"],
+            "additionalProperties": false,
+        })
+    }
+
+    fn repair_reply(reply: &str) -> StreamResponse {
+        let mut response = assistant_response(vec![ContentBlock::Text { text: reply.into() }]);
+        response.usage = REPAIR_USAGE;
+        response
+    }
+
+    fn repair_input() -> InvalidToolInput {
+        InvalidToolInput {
+            raw: REPAIR_RAW.into(),
+            complete: true,
+            clipped: false,
+        }
+    }
+
+    #[test_case(REPAIR_ACCEPTED, true, false; "accepted_non_eager")]
+    #[test_case(REPAIR_REJECTED, false, false; "rejected_non_eager")]
+    #[test_case(REPAIR_ACCEPTED, true, true; "accepted_eager")]
+    #[test_case(REPAIR_REJECTED, false, true; "rejected_eager")]
+    fn request_local_schema_and_repair_usage_are_shared(reply: &str, accepted: bool, eager: bool) {
+        smol::block_on(async {
+            let mut response = tool_use_response(TEST_TOOL, invalid_tool_input(REPAIR_RAW));
+            response.usage = MAIN_REQUEST_USAGE;
+            response
+                .invalid_tool_inputs
+                .insert(RESUME_TOOL_ID.into(), repair_input());
+            let provider = MockProvider::new(vec![response, repair_reply(reply)]);
+            let captured_tools = provider.captured_tools.clone();
+            let mut history = History::new(vec![Message::user(GO.into())]);
+            let (mut agent, event_rx) = make_agent(provider, &mut history);
+            agent.config.eager_tool_dispatch = eager;
+            agent.config.tool_json_repair = true;
+            agent.tools = serde_json::json!([{
+                "name": TEST_TOOL,
+                "input_schema": repair_schema(),
+            }]);
+            let executions = Arc::new(AtomicUsize::new(0));
+            let calls = executions.clone();
+            agent.local_tools = Arc::new(HashMap::from([(
+                TEST_TOOL.into(),
+                crate::tools::local_tool(move |input, ctx| {
+                    let calls = calls.clone();
+                    Box::pin(async move {
+                        assert_eq!(ctx.json_repair.schema(TEST_TOOL), Some(repair_schema()));
+                        assert_eq!(
+                            input,
+                            serde_json::from_str::<Value>(REPAIR_ACCEPTED).unwrap()
+                        );
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Ok(TEST_TOOL_RESULT.into())
+                    })
+                }),
+            )]));
+            agent.goal.set(GO).unwrap();
+
+            assert!(matches!(agent.turn().await.unwrap(), TurnOutcome::Continue));
+            agent.report_speculative();
+            assert_eq!(executions.load(Ordering::SeqCst), usize::from(accepted));
+            let mut expected_usage = MAIN_REQUEST_USAGE;
+            expected_usage += REPAIR_USAGE;
+            assert_eq!(agent.usage(), expected_usage);
+            assert_eq!(agent.goal.snapshot().unwrap().usage, expected_usage);
+            assert_eq!(
+                agent.measured.unwrap().reported,
+                MAIN_REQUEST_USAGE.total_input()
+            );
+            assert_eq!(agent.num_turns, 1);
+            assert_eq!(agent.history.len(), 3);
+            let requests = captured_tools.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            assert_eq!(requests[0], agent.tools);
+            assert_eq!(requests[1], serde_json::json!([]));
+            let events: Vec<_> = event_rx.try_iter().map(|envelope| envelope.event).collect();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, AgentEvent::TurnComplete(_)))
+                    .count(),
+                1
+            );
+            let accounting: Vec<_> = events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::ModelUsage { .. }))
+                .collect();
+            assert_eq!(accounting.len(), 1);
+            let AgentEvent::ModelUsage {
+                usage,
+                purpose,
+                provider,
+                model,
+                cost,
+                billing,
+            } = accounting[0]
+            else {
+                unreachable!()
+            };
+            assert_eq!(*usage, REPAIR_USAGE);
+            assert_eq!(*purpose, LedgerPurpose::ToolJsonRepair);
+            assert_eq!(*provider, agent.model.provider.to_string());
+            assert_eq!(*model, agent.model.id);
+            assert_eq!(*cost, agent.model.billed_cost(&REPAIR_USAGE, false));
+            assert_eq!(*billing, agent.model.billing);
+        });
+    }
+
+    #[test_case(REPAIR_ACCEPTED, true; "accepted")]
+    #[test_case(REPAIR_REJECTED, false; "rejected")]
+    fn repair_accounting_does_not_change_context_or_history(reply: &str, accepted: bool) {
+        smol::block_on(async {
+            let mut history = History::new(vec![Message::user(GO.into())]);
+            let (mut agent, event_rx) =
+                make_agent(MockProvider::new(vec![repair_reply(reply)]), &mut history);
+            agent.measured = Some(MeasuredContext {
+                reported: MAIN_REQUEST_USAGE.total_input(),
+                history_len: agent.history.len(),
+            });
+            agent.goal.set(GO).unwrap();
+            let context = agent.context_size();
+            let history = serde_json::to_value(agent.history.as_slice()).unwrap();
+            let ctx = agent.tool_context();
+            ctx.json_repair
+                .register_invalid(RESUME_TOOL_ID, repair_input());
+            assert_eq!(
+                ctx.json_repair
+                    .repair(RESUME_TOOL_ID, TEST_TOOL, &repair_schema(), &ctx)
+                    .await
+                    .is_ok(),
+                accepted
+            );
+            agent.drain_repair_usage(&ctx.json_repair);
+            agent.drain_repair_usage(&ctx.json_repair);
+            assert_eq!(agent.usage(), REPAIR_USAGE);
+            assert_eq!(agent.goal.snapshot().unwrap().usage, REPAIR_USAGE);
+            assert_eq!(agent.context_size(), context);
+            assert_eq!(
+                serde_json::to_value(agent.history.as_slice()).unwrap(),
+                history
+            );
+            assert_eq!(agent.num_turns, 0);
+            let events: Vec<_> = event_rx.try_iter().collect();
+            assert!(matches!(
+                &events[..],
+                [Envelope {
+                    event: AgentEvent::ModelUsage { .. },
+                    ..
+                }]
+            ));
+        });
+    }
+
+    #[test_case(true; "cancelled")]
+    #[test_case(false; "event_channel_closed")]
+    fn finished_repair_usage_survives_dispatch_termination(cancelled: bool) {
+        smol::block_on(async {
+            let mut history = History::new(vec![Message::user(GO.into())]);
+            let (mut agent, event_rx) = make_agent(
+                MockProvider::new(vec![repair_reply(REPAIR_ACCEPTED)]),
+                &mut history,
+            );
+            let ctx = agent.tool_context();
+            ctx.json_repair
+                .register_invalid(RESUME_TOOL_ID, repair_input());
+            ctx.json_repair
+                .repair(RESUME_TOOL_ID, TEST_TOOL, &repair_schema(), &ctx)
+                .await
+                .unwrap();
+            let (trigger, token) = CancelToken::new();
+            agent.cancel = token;
+            if cancelled {
+                trigger.cancel();
+            } else {
+                drop(event_rx);
+            }
+            let result = agent
+                .process_tool_calls(empty_response(), ctx.json_repair.clone())
+                .await;
+            assert_eq!(result.is_ok(), cancelled);
+            agent.drain_repair_usage(&ctx.json_repair);
+            assert_eq!(agent.usage(), REPAIR_USAGE);
+            assert!(ctx.json_repair.take_usage().is_empty());
+        });
+    }
+
     fn resume_input() -> AgentInput {
         AgentInput {
             message: String::new(),
@@ -2706,10 +2977,10 @@ mod tests {
                 snapshot
             };
             let (result, pending) = futures_lite::future::zip(
-                agent.process_tool_calls(tool_use_response(
-                    BLOCKING_TOOL_NAME,
-                    serde_json::json!({}),
-                )),
+                agent.process_tool_calls(
+                    tool_use_response(BLOCKING_TOOL_NAME, serde_json::json!({})),
+                    Arc::new(RepairState::default()),
+                ),
                 inspect_pending_context,
             )
             .await;
@@ -5274,9 +5545,25 @@ mod tests {
     fn tool_feedback_charges_one_transition_without_supplemental_prompt(repeated: bool) {
         smol::block_on(async {
             let mut history = History::default();
-            let responses = (0..3).map(|index| tool_use_response(INVALID_TOOL,
-                if repeated { serde_json::json!({}) } else { serde_json::json!({caudra_providers::INVALID_TOOL_JSON_KEY: format!("{{{index}")}) }
-            )).collect();
+            let responses = (0..3)
+                .map(|index| {
+                    if repeated {
+                        return tool_use_response(INVALID_TOOL, serde_json::json!({}));
+                    }
+                    let raw = format!("{{{index}");
+                    let mut response = tool_use_response(INVALID_TOOL, invalid_tool_input(&raw));
+                    let id = response.message.tool_uses().next().unwrap().0.to_owned();
+                    response.invalid_tool_inputs.insert(
+                        id,
+                        InvalidToolInput {
+                            raw,
+                            complete: true,
+                            clipped: false,
+                        },
+                    );
+                    response
+                })
+                .collect();
             let (mut agent, _events) = make_agent(MockProvider::new(responses), &mut history);
             Arc::make_mut(&mut agent.config.steering).max_recoveries =
                 Some(if repeated { 0 } else { 2 });

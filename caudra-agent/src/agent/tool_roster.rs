@@ -28,6 +28,7 @@ use super::tool_preview::{
 use crate::tools::native::batch::MAX_BATCH_SIZE;
 use crate::tools::{BATCH_TOOL_NAME, ToolEffect};
 use crate::types::{BatchToolEntry, BatchToolStatus};
+use caudra_providers::MAX_TOOL_INPUT_BYTES;
 
 /// The argument holding the calls to run.
 const TOOL_CALLS_KEY: &str = "tool_calls";
@@ -77,6 +78,7 @@ enum State {
     Value,
     /// Between elements of `tool_calls`.
     Array,
+    ArraySeparator,
     /// Inside one element, counting the containers still open within it.
     Element(usize),
     /// Inside a string within the element, where a brace is not structure.
@@ -126,7 +128,11 @@ impl Child {
             self.text.push(c);
         }
         if let Some(raw) = self.raw.as_mut() {
-            raw.push(c);
+            if raw.len().saturating_add(c.len_utf8()) <= MAX_TOOL_INPUT_BYTES {
+                raw.push(c);
+            } else {
+                self.raw = None;
+            }
         }
         if let Some(stream) = self.delegation.as_mut() {
             stream.push(c, &mut self.revealed);
@@ -323,7 +329,8 @@ impl RosterStream {
             State::Done => State::Done,
             State::Open => match c {
                 '{' => State::Member,
-                _ => State::Open,
+                c if c.is_whitespace() => State::Open,
+                _ => State::Done,
             },
             State::Member => match c {
                 '"' => {
@@ -361,7 +368,13 @@ impl RosterStream {
                     State::Element(0)
                 }
                 ']' => State::Done,
-                _ => State::Array,
+                c if c.is_whitespace() => State::Array,
+                _ => State::Done,
+            },
+            State::ArraySeparator => match c {
+                ',' => State::Array,
+                c if c.is_whitespace() => State::ArraySeparator,
+                _ => State::Done,
             },
             State::Element(depth) => {
                 self.accumulate(c);
@@ -374,7 +387,7 @@ impl RosterStream {
                     '}' | ']' if depth > 0 => State::Element(depth - 1),
                     '}' => {
                         self.close();
-                        State::Array
+                        State::ArraySeparator
                     }
                     _ => State::Element(depth),
                 }
@@ -749,6 +762,51 @@ mod tests {
             ],
             "an element is handed over in the fragment that closed it, and never again"
         );
+    }
+
+    #[test_case("[", "]"; "nested_array")]
+    #[test_case("[[", "]]"; "deeply_nested_array")]
+    #[test_case("\"", "\""; "string_containing_json")]
+    #[test_case("null,", ""; "null_before_object")]
+    #[test_case("true,", ""; "boolean_before_object")]
+    #[test_case("42,", ""; "number_before_object")]
+    fn invalid_direct_elements_stop_admission_without_renumbering(prefix: &str, suffix: &str) {
+        let child = r#"{"tool":"shell","parameters":{"command":"ls"}}"#;
+        let inner = if prefix == "\"" {
+            child.replace('"', "\\\"")
+        } else {
+            child.to_owned()
+        };
+        for valid_prefix in [false, true] {
+            let mut stream = RosterStream::new(BATCH, true).unwrap();
+            let first = if valid_prefix {
+                format!("{child},")
+            } else {
+                String::new()
+            };
+            let input = format!(r#"{{"tool_calls":[{first}{prefix}{inner}{suffix},{child}]}}"#);
+            let mut admitted = Vec::new();
+            for c in input.chars() {
+                admitted.extend(stream.absorb(&c.to_string()).ready);
+            }
+            assert_eq!(
+                admitted,
+                if valid_prefix {
+                    vec![(0, child.to_owned())]
+                } else {
+                    vec![]
+                }
+            );
+        }
+    }
+
+    #[test_case("[", "]"; "array_parent")]
+    #[test_case("null,", ""; "primitive_parent")]
+    fn non_object_parents_do_not_promote_inner_batches(prefix: &str, suffix: &str) {
+        let input = format!(
+            r#"{prefix}{{"tool_calls":[{{"tool":"shell","parameters":{{"command":"ls"}}}}]}}{suffix}"#
+        );
+        assert!(ready(&[&input]).concat().is_empty());
     }
 
     /// The buffer is the one thing a dispatching reader cannot economise on,

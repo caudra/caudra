@@ -1456,6 +1456,14 @@ pub enum AgentEvent {
         message: String,
     },
     TurnComplete(Box<TurnCompleteEvent>),
+    ModelUsage {
+        usage: TokenUsage,
+        cost: Option<f64>,
+        billing: Billing,
+        provider: String,
+        model: String,
+        purpose: LedgerPurpose,
+    },
     ToolResultsSubmitted {
         message: Box<Message>,
     },
@@ -1552,6 +1560,10 @@ pub enum AgentEvent {
     LiveToolBuf {
         id: String,
         body: Arc<SharedBuf>,
+    },
+    ToolAnnotation {
+        id: String,
+        annotation: String,
     },
     PromptProgress {
         processed: u32,

@@ -16,6 +16,7 @@ use std::collections::BTreeMap;
 
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
+use serde::Serialize;
 
 use crate::sessions::{
     LedgerEntry, SessionDatabase, SessionError, StoredTokenUsage, UsageBucket, cache_hit_rate,
@@ -29,13 +30,15 @@ const MONTH_FORMAT: &str = "%Y-%m";
 /// Caudra spends on the user's behalf without being asked, which is exactly the
 /// spend a bill is queried about. The model alone cannot answer that: a goal
 /// evaluated by the chat model is indistinguishable from the chat.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum LedgerPurpose {
     Chat,
     Goal,
     Compaction,
     Title,
     Btw,
+    ToolJsonRepair,
 }
 
 impl LedgerPurpose {
@@ -46,6 +49,7 @@ impl LedgerPurpose {
             Self::Compaction => "compaction",
             Self::Title => "title",
             Self::Btw => "btw",
+            Self::ToolJsonRepair => "tool_json_repair",
         }
     }
 
@@ -56,6 +60,7 @@ impl LedgerPurpose {
             "compaction" => Some(Self::Compaction),
             "title" => Some(Self::Title),
             "btw" => Some(Self::Btw),
+            "tool_json_repair" => Some(Self::ToolJsonRepair),
             _ => None,
         }
     }
@@ -443,6 +448,7 @@ mod tests {
     #[test_case(LedgerPurpose::Compaction ; "compaction")]
     #[test_case(LedgerPurpose::Title ; "title")]
     #[test_case(LedgerPurpose::Btw ; "btw")]
+    #[test_case(LedgerPurpose::ToolJsonRepair ; "tool_json_repair")]
     fn a_purpose_round_trips_through_the_ledger(purpose: LedgerPurpose) {
         let (_temp, dir) = state_dir();
         ledger(&dir)

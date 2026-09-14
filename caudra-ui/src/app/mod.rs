@@ -3218,7 +3218,9 @@ impl App {
             }
             return vec![];
         }
-        if envelope.run_id != self.run_id {
+        if envelope.run_id != self.run_id
+            && !matches!(envelope.event, AgentEvent::ModelUsage { .. })
+        {
             let cancelled_terminal = envelope.subagent.is_none()
                 && self.cancelling_run == Some(envelope.run_id)
                 && matches!(
@@ -3415,6 +3417,23 @@ impl App {
         }
 
         let event = match envelope.event {
+            AgentEvent::ModelUsage {
+                usage,
+                cost,
+                billing,
+                provider,
+                model,
+                purpose,
+            } => {
+                self.state.token_usage += usage;
+                self.add_session_spend(cost, billing);
+                add_chat_spend(&mut self.chats[chat_idx], cost, billing);
+                if subagent_id.is_some() {
+                    self.state.goal.record_external_usage(usage, cost, billing);
+                }
+                self.record_model_usage(&provider, &model, purpose, usage, cost, billing);
+                return vec![];
+            }
             AgentEvent::GoalEvaluating { evaluation } => {
                 self.flash(format!("Evaluating goal (#{evaluation})..."));
                 return vec![];

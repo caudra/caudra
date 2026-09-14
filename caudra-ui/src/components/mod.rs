@@ -858,6 +858,7 @@ pub struct DisplayMessage {
     pub tool_input: Option<Arc<ToolInput>>,
     pub tool_raw_input: Option<Arc<serde_json::Value>>,
     pub tool_output: Option<Arc<ToolOutput>>,
+    pub tool_preview_pending: bool,
     pub live_output: Option<String>,
     /// The file a write is still spelling out, as far as its arguments have
     /// arrived. Transient by construction: only ever set while the call's
@@ -893,6 +894,7 @@ impl DisplayMessage {
             tool_input: None,
             tool_raw_input: None,
             tool_output: None,
+            tool_preview_pending: false,
             live_output: None,
             live_body: None,
             annotation: None,
@@ -917,6 +919,7 @@ impl DisplayMessage {
             tool_input: None,
             tool_raw_input: None,
             tool_output: None,
+            tool_preview_pending: false,
             live_output: None,
             live_body: None,
             annotation: None,

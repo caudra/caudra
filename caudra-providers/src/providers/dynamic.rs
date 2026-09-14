@@ -761,7 +761,7 @@ impl Provider for DynamicProvider {
             let forward = async move {
                 let mut forwarded = 0usize;
                 while let Ok(ev) = rx.recv_async().await {
-                    forwarded += 1;
+                    forwarded += usize::from(ev.is_content());
                     if event_tx.send_async(ev).await.is_err() {
                         break;
                     }

@@ -630,6 +630,7 @@ impl WorkflowHostContext {
             local_tools: LocalTools::default(),
             tool_name_aliases: self.tool_name_aliases.clone(),
             live_sink: None,
+            json_repair: Arc::default(),
             model_policy: Arc::clone(&self.model_policy),
             workflow: None,
             steering_observations: None,

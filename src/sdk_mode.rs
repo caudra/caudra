@@ -890,6 +890,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         result_text: String::new(),
         cost: None,
         subscription_cost: None,
+        auxiliary_usage: TokenUsage::default(),
         request_counter: 0,
     }
     .spawn(handle.event_rx.clone());
@@ -2034,6 +2035,7 @@ struct EventPump {
     /// the rate it paid.
     cost: Option<f64>,
     subscription_cost: Option<f64>,
+    auxiliary_usage: TokenUsage,
     request_counter: u64,
 }
 
@@ -2074,6 +2076,7 @@ impl EventPump {
         self.result_text.clear();
         self.cost = None;
         self.subscription_cost = None;
+        self.auxiliary_usage = TokenUsage::default();
         let pending = mem::take(&mut self.shared.lock().unwrap().pending);
         for request_id in pending.into_values() {
             self.permissions.answer(&request_id, PermissionAnswer::Deny);
@@ -2169,6 +2172,7 @@ impl EventPump {
                 }
             }
             AgentEvent::ToolOutput { .. }
+            | AgentEvent::ToolAnnotation { .. }
             | AgentEvent::ToolDone(_)
             | AgentEvent::BatchProgress(_)
             | AgentEvent::Question(_)
@@ -2256,6 +2260,25 @@ impl EventPump {
                     workflow: envelope.workflow.clone(),
                 }))?;
             }
+            AgentEvent::ModelUsage {
+                usage,
+                cost,
+                billing,
+                ..
+            } => {
+                self.add_spend(*cost, *billing);
+                if parent_tool_use_id.is_none() {
+                    self.auxiliary_usage += *usage;
+                }
+                self.writer.emit_system(
+                    "model_usage",
+                    serde_json::json!({
+                        "accounting": envelope.event,
+                        "parent_tool_use_id": parent_tool_use_id,
+                        "workflow": envelope.workflow,
+                    }),
+                )?;
+            }
             AgentEvent::ToolResultsSubmitted { message } => {
                 self.writer.emit(WireInner::User(UserPayload {
                     message: UserMessage {
@@ -2341,7 +2364,7 @@ impl EventPump {
                 self.emit_turn_result(is_error, result, *num_turns, *usage)?;
             }
             AgentEvent::Error { message } => {
-                self.emit_turn_result(true, message.clone(), 0, TokenUsage::default())?;
+                self.emit_turn_result(true, message.clone(), 0, self.auxiliary_usage)?;
             }
         }
         Ok(())
@@ -2378,12 +2401,17 @@ mod tests {
     use caudra_agent::tools::PermissionScopes;
     use caudra_agent::types::WORKFLOW_EVENT_RUN_ID;
     use caudra_providers::{ContentBlock, Message, Role};
+    use caudra_storage::usage_ledger::LedgerPurpose;
     use caudra_workflow::{RunSnapshot, RunStatus, RunUsage, SourceKind};
     use tempfile::TempDir;
     use test_case::test_case;
 
     const CAUDRA_REQUEST_ID: &str = "caudra-permission-1";
     const SECOND_CAUDRA_REQUEST_ID: &str = "caudra-permission-2";
+    const REPAIR_COST: f64 = 0.25;
+    const REPAIR_INPUT: u32 = 17;
+    const REPAIR_PARENT: &str = "repair-parent";
+    const REPAIR_FAILURE: &str = "transport failed";
     const WORKSPACE_REBIND_REQUIRED: &str =
         "session workspace identity changed; fork or explicitly rebind the session";
 
@@ -2475,6 +2503,7 @@ mod tests {
             result_text: String::new(),
             cost: None,
             subscription_cost: None,
+            auxiliary_usage: TokenUsage::default(),
             request_counter: 0,
         };
         (pump, out_rx, shared)
@@ -2482,6 +2511,86 @@ mod tests {
 
     fn history_messages(items: Vec<HistoryItem>) -> Vec<Message> {
         History::restored(items).unwrap().into_vec()
+    }
+
+    #[test_case(false; "done")]
+    #[test_case(true; "error")]
+    fn repair_accounting_preserves_stream_and_subagent_totals(failed: bool) {
+        let (mut pump, out, _) =
+            permission_event_pump(permission_manager(), PermissionMode::Default);
+        let usage = TokenUsage {
+            input: REPAIR_INPUT,
+            ..Default::default()
+        };
+        pump.result_text = REPAIR_PARENT.into();
+        let model = pump.model_id();
+        pump.synth.text_delta(&model, REPAIR_PARENT);
+        for subagent in [
+            None,
+            Some(SubagentInfo {
+                parent_tool_use_id: REPAIR_PARENT.into(),
+                task_id: REPAIR_PARENT.into(),
+                name: REPAIR_PARENT.into(),
+                prompt: None,
+                model: None,
+                answer_tx: None,
+                steer_tx: None,
+            }),
+        ] {
+            pump.handle(Envelope {
+                event: AgentEvent::ModelUsage {
+                    usage,
+                    cost: Some(REPAIR_COST),
+                    billing: Billing::Api,
+                    provider: REPAIR_PARENT.into(),
+                    model: model.clone(),
+                    purpose: LedgerPurpose::ToolJsonRepair,
+                },
+                subagent,
+                run_id: 1,
+                workflow: None,
+            })
+            .unwrap();
+        }
+        assert!(pump.synth.started);
+        assert_eq!(pump.result_text, REPAIR_PARENT);
+        let accounting: Vec<Value> = out
+            .try_iter()
+            .map(|line| serde_json::from_str(&line).unwrap())
+            .collect();
+        assert_eq!(accounting.len(), 2);
+        for event in &accounting {
+            assert_eq!(event["type"], "system");
+            assert_eq!(event["subtype"], "model_usage");
+            assert_eq!(
+                event["accounting"]["purpose"],
+                LedgerPurpose::ToolJsonRepair.storage_name()
+            );
+        }
+        assert_eq!(accounting[1]["parent_tool_use_id"], REPAIR_PARENT);
+        let event = if failed {
+            AgentEvent::Error {
+                message: REPAIR_FAILURE.into(),
+            }
+        } else {
+            AgentEvent::Done {
+                usage,
+                num_turns: 1,
+                reason: DoneReason::EndTurn,
+            }
+        };
+        pump.handle(Envelope {
+            event,
+            subagent: None,
+            run_id: 1,
+            workflow: None,
+        })
+        .unwrap();
+        let result: Value = serde_json::from_str(&out.recv().unwrap()).unwrap();
+        assert_eq!(result["type"], "result");
+        assert_eq!(result["usage"]["input_tokens"], REPAIR_INPUT);
+        assert_eq!(result["total_cost_usd"], REPAIR_COST * 2.0);
+        assert_eq!(pump.auxiliary_usage, TokenUsage::default());
     }
 
     fn sample_messages() -> Vec<Message> {

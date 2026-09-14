@@ -10,6 +10,7 @@ mod file_tracker;
 pub mod grep;
 pub(crate) mod image_bytes;
 pub mod interpreter_bridge;
+pub mod json_repair;
 pub mod native;
 mod path_locks;
 pub mod registry;
@@ -512,6 +513,7 @@ pub struct ToolContext {
     pub tool_filter: ToolFilter,
     pub local_tools: LocalTools,
     pub tool_name_aliases: Option<caudra_providers::ToolNameAliases>,
+    pub json_repair: Arc<json_repair::RepairState>,
     /// Streams a dispatched child's live bufs and annotations back to the
     /// caller (`caudra.agent.call_tool` with `on_live_buf`/`on_annotation`).
     /// Never inherited: `to_tool_context` clears it, and each caller sets
@@ -779,6 +781,7 @@ pub fn interpreter_ctx(
         tool_filter: ToolFilter::All,
         local_tools: LocalTools::default(),
         tool_name_aliases: None,
+        json_repair: Arc::new(json_repair::RepairState::default()),
         live_sink: None,
         model_policy: Arc::new(ModelPolicy::default()),
         workflow: None,

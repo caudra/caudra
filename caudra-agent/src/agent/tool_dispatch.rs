@@ -11,6 +11,7 @@ use tracing::{Instrument, debug, error, info_span, warn};
 use crate::mcp::{McpSession, UNKNOWN_MCP};
 use crate::permissions::canonical_json;
 use crate::task_set::TaskSet;
+use crate::tools::json_repair::RepairError;
 use crate::tools::registry::{PlanModeAccess, ToolInvocation, ToolRegistry};
 use crate::tools::{
     DOOM_LOOP_GUIDANCE, LocalToolEntry, READ_ONLY_TOOL_RESTRICTED, TOOL_SEARCH_TOOL_NAME,
@@ -19,7 +20,6 @@ use crate::tools::{
 use crate::workspace_baseline::BaselineOutcome;
 use crate::{AgentError, AgentEvent, LuaToolProvenance, ToolDoneEvent, ToolOutput, ToolStartEvent};
 use caudra_config::ToolKey;
-use caudra_providers::INVALID_TOOL_JSON_KEY;
 
 /// Where a tool's start presentation goes: the transcript, the caller that
 /// asked for it, or nowhere.
@@ -56,6 +56,7 @@ const UNKNOWN_TOOL_PREFIX: &str = "unknown tool";
 const TOOL_DISABLED_SUFFIX: &str = "is disabled for the current agent";
 const INVALID_INPUT_MESSAGE: &str = "arguments were not valid JSON, so the tool did not run. Call it again with complete \
      arguments; if the input is large, split it across several calls. Raw text received:";
+const MAX_INVALID_INPUT_CHARS: usize = 2_000;
 const SOURCE_NATIVE: &str = "native";
 const SOURCE_LOCAL: &str = "local";
 const SOURCE_UNKNOWN: &str = "unknown";
@@ -181,6 +182,18 @@ impl ResponseObservations {
         }
     }
 
+    pub(super) fn expanded_context(&self, order: Vec<usize>) -> Self {
+        Self {
+            shared: Arc::clone(&self.shared),
+            attempt: Some(Arc::new(Mutex::new(ObservationAttempt {
+                order,
+                outcome: ToolOutcome::Failure,
+                repairable: false,
+                expanded: true,
+            }))),
+        }
+    }
+
     /// Response-wide totals include attempts evicted from the bounded pattern
     /// window; one ordinary failure or success anywhere prevents all-repairable.
     pub(crate) fn finish(&self, is_error: bool) {
@@ -247,8 +260,9 @@ pub(crate) fn observe_context(ctx: &mut ToolContext, name: &str, input: &Value) 
     }
 }
 
+#[derive(Clone)]
 pub(super) struct RecentCalls {
-    calls: VecDeque<(String, u64)>,
+    calls: VecDeque<(String, String)>,
     threshold: usize,
 }
 
@@ -269,31 +283,36 @@ impl RecentCalls {
         self.threshold
     }
 
-    fn hash_input(input: &Value) -> u64 {
-        let mut h = DefaultHasher::new();
-        input.to_string().hash(&mut h);
-        h.finish()
-    }
-
-    fn is_doom_loop(&self, name: &str, input: &Value) -> bool {
+    pub(super) fn is_doom_loop(&self, name: &str, input: &Value) -> bool {
         if self.threshold == 0 {
             return false;
         }
-        let hash = Self::hash_input(input);
+        let canonical = canonical_json(input);
         self.calls.len() >= self.threshold - 1
             && self
                 .calls
                 .iter()
                 .rev()
                 .take(self.threshold - 1)
-                .all(|(n, h)| n == name && *h == hash)
+                .all(|(n, value)| n == name && *value == canonical)
     }
 
-    fn record(&mut self, name: String, input: &Value) {
+    pub(super) fn may_repeat_name(&self, name: &str) -> bool {
+        self.threshold > 0
+            && self.calls.len() >= self.threshold - 1
+            && self
+                .calls
+                .iter()
+                .rev()
+                .take(self.threshold - 1)
+                .all(|(previous, _)| previous == name)
+    }
+
+    pub(super) fn record(&mut self, name: String, input: &Value) {
         if self.threshold == 0 {
             return;
         }
-        self.calls.push_back((name, Self::hash_input(input)));
+        self.calls.push_back((name, canonical_json(input)));
         if self.calls.len() > self.threshold {
             self.calls.pop_front();
         }
@@ -329,17 +348,134 @@ pub async fn run(
     let source = tool_source(registry, ctx, canonical);
     let span = info_span!("tool", tool = canonical, tool_use_id = %id);
     let started = Instant::now();
-    let mut done = run_inner(registry, mcp, id, name, input, ctx, &mut emit)
-        .instrument(span)
-        .await;
+    let entry = registry.get(canonical);
+    let local = ctx.local_tools.get(canonical);
+    let mcp_name = crate::mcp::internal_tool_name(canonical);
+    let eligible = ctx.config.tool_json_repair
+        && ctx.tool_filter.matches(canonical)
+        && (entry
+            .as_ref()
+            .is_some_and(|entry| entry.tool.audience().contains(ctx.audience))
+            || local.is_some()
+            || (canonical == TOOL_SEARCH_TOOL_NAME && searchable(mcp, ctx))
+            || mcp.is_some_and(|mcp| mcp.has_tool(&mcp_name) && !mcp.is_disabled(&mcp_name)))
+        && (!ctx.policy().is_read_only()
+            || entry.is_some()
+            || local.is_some_and(|local| local.effect.is_safe_in_read_only()));
+    let invalid = ctx.json_repair.invalid_input(&id);
+    let repair = if eligible && invalid.is_some() {
+        let schema = repair_schema(registry, mcp, canonical, ctx);
+        Some(match schema {
+            Some(schema) => ctx.json_repair.repair(&id, canonical, &schema, ctx).await,
+            None => Err(RepairError::Schema),
+        })
+    } else {
+        None
+    };
+    let refusal = if canonical == crate::tools::BATCH_TOOL_NAME
+        && local.is_none()
+        && invalid.is_some()
+        && let Some(runs) = &ctx.speculative
+        && !runs.has_admitted()
+        && !repair.as_ref().is_some_and(|repair| {
+            repair.as_ref().is_ok_and(|repair| {
+                entry
+                    .as_ref()
+                    .is_some_and(|entry| entry.tool.parse(&repair.effective).is_ok())
+            })
+        }) {
+        runs.admit(ctx, name, input)
+    } else {
+        None
+    };
+    let mut done = match refusal {
+        Some(message) => ToolDoneEvent::error(id, message),
+        None if invalid.is_some() && !matches!(repair, Some(Ok(_))) => {
+            ctx.mark_tool_result_repairable();
+            let mut message = format!("{canonical} {INVALID_INPUT_MESSAGE}");
+            if let Some(invalid) = &invalid {
+                message.push(' ');
+                message.extend(invalid.raw.chars().take(MAX_INVALID_INPUT_CHARS));
+            }
+            if let Some(Err(error)) = &repair {
+                message.push_str(&format!("\n{error}"));
+            }
+            let mut done = ToolDoneEvent::error(id, message);
+            done.tool = Arc::from(canonical);
+            done
+        }
+        _ => {
+            let effective = repair
+                .as_ref()
+                .and_then(|repair| repair.as_ref().ok())
+                .map_or(input, |repair| &repair.effective);
+            run_inner(registry, mcp, id, name, effective, ctx, &mut emit)
+                .instrument(span)
+                .await
+        }
+    };
+    if let Some(Ok(repair)) = repair
+        && repair.method != "unchanged"
+    {
+        let provenance = repair.provenance();
+        done.model_suffix = Some(match done.model_suffix.take() {
+            Some(suffix) => format!("{suffix}\n\n{provenance}"),
+            None => provenance,
+        });
+        done.annotation = Some(match done.annotation.take() {
+            Some(annotation) => format!("{annotation}; JSON repaired"),
+            None => "JSON repaired".into(),
+        });
+    }
     crate::tool_output::limit(&mut done, ctx).await;
     if !ctx.cancel.is_cancelled()
         && let Some(observations) = &ctx.steering_observations
     {
         observations.finish(done.is_error);
     }
-    report(&done, canonical, &source, input, started.elapsed());
+    let logged_input = if invalid.is_some() {
+        &Value::Null
+    } else {
+        input
+    };
+    report(&done, canonical, &source, logged_input, started.elapsed());
     done
+}
+
+pub(crate) fn repair_schema(
+    registry: &ToolRegistry,
+    mcp: Option<&McpSession>,
+    name: &str,
+    ctx: &ToolContext,
+) -> Option<Value> {
+    if ctx.local_tools.contains_key(name) {
+        return ctx.json_repair.schema(name);
+    }
+    if let Some(entry) = registry.get(name) {
+        return Some(entry.tool.schema());
+    }
+    if let Some(schema) = ctx.json_repair.schema(name) {
+        return Some(schema);
+    }
+    let mut definitions = Value::Array(Vec::new());
+    if name == TOOL_SEARCH_TOOL_NAME {
+        if let Some(mcp) = mcp {
+            mcp.request_snapshot().extend_tools(&mut definitions);
+        }
+        if let Some(deferral) = &ctx.deferral {
+            deferral.request_snapshot().extend_tools(&mut definitions);
+        }
+    } else if let Some(mcp) = mcp {
+        let lookup = mcp.fresh();
+        lookup.mark_loaded(&crate::mcp::internal_tool_name(name));
+        lookup.request_snapshot().extend_tools(&mut definitions);
+    }
+    let wire_name = crate::mcp::wire_tool_name(name);
+    definitions.as_array()?.iter().find_map(|definition| {
+        (definition["name"] == name || definition["name"] == wire_name)
+            .then(|| definition.get("input_schema").cloned())
+            .flatten()
+    })
 }
 
 /// Parse errors and unknown tools skip the start event so the UI never
@@ -397,13 +533,6 @@ async fn run_inner(
             model_output_from_ref: false,
         }
     };
-
-    // Before every gate and lookup: arguments that never parsed cannot be
-    // judged, so there is nothing to permit and nothing to run.
-    if let Some(raw) = input.get(INVALID_TOOL_JSON_KEY).and_then(Value::as_str) {
-        ctx.mark_tool_result_repairable();
-        return done_error(format!("{name} {INVALID_INPUT_MESSAGE} {raw}"));
-    }
 
     // Before the read-only gate: a tool the config turned off should say so
     // even when the mode would have refused it for another reason.
@@ -671,15 +800,6 @@ async fn run_inner(
 fn canonical_tool_name<'a>(name: &'a str, ctx: &'a ToolContext) -> &'a str {
     let name = super::streaming::canonical_tool_name(name);
     ctx.resolve_tool_name_alias(name)
-}
-
-/// Whether this context already knows how to run `name` itself. Speculative
-/// dispatch asks before it starts anything: a name it cannot resolve now is a
-/// name whose meaning depends on the alias map the response has yet to carry,
-/// and running the wrong tool early is worse than running the right one late.
-pub(crate) fn resolves_natively(ctx: &ToolContext, name: &str) -> bool {
-    let name = canonical_tool_name(name, ctx);
-    ctx.registry.get(name).is_some() || ctx.local_tools.contains_key(name)
 }
 
 fn set_lua_provenance(
@@ -1103,6 +1223,29 @@ pub(super) async fn process_tool_calls(
     event_tx: &crate::EventSender,
     ctx: &ToolContext,
 ) -> Result<(), AgentError> {
+    if let Some(runs) = &ctx.speculative {
+        runs.set_aliases(ctx.tool_name_aliases.clone());
+        for (id, name, input) in &tool_uses {
+            runs.ready(id, name, input.clone());
+        }
+        let mut results = Vec::with_capacity(tool_uses.len());
+        for (id, name, input) in tool_uses {
+            let Some(adopted) = runs.claim(&id, &name, &input) else {
+                return Err(AgentError::Tool {
+                    tool: name,
+                    message: "eager tool slot was not available for adoption".into(),
+                });
+            };
+            results.push(adopted.finish().await);
+        }
+        *recent_calls = runs.recent();
+        let tool_msg = crate::types::tool_results(results);
+        history.push(tool_msg.clone());
+        event_tx.send(AgentEvent::ToolResultsSubmitted {
+            message: Box::new(tool_msg),
+        })?;
+        return Ok(());
+    }
     let mut immediate_errors: Vec<ToolDoneEvent> = Vec::new();
     let mut runnable = Vec::new();
     let mut repeat_message = None;
@@ -1161,15 +1304,18 @@ pub(super) async fn process_tool_calls(
         let event_tx_clone = ctx.event_tx.clone();
         let mcp_owned = mcp.cloned();
         set.spawn(async move {
-            let done = run(
-                &tool_ctx.registry,
-                mcp_owned.as_ref(),
-                id,
-                &name,
-                &input,
-                &tool_ctx,
-                Emit::Notify,
-            )
+            let done = super::speculative::with_live(&tool_ctx, |live_ctx| async move {
+                run(
+                    &live_ctx.registry,
+                    mcp_owned.as_ref(),
+                    id,
+                    &name,
+                    &input,
+                    &live_ctx,
+                    Emit::Notify,
+                )
+                .await
+            })
             .await;
             event_tx_clone.try_send(AgentEvent::ToolDone(Box::new(done.clone())));
             done
@@ -1310,19 +1456,25 @@ mod tests {
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use caudra_config::{DefaultEffect, Effect, PermissionRule, PermissionsConfig, ToolKey};
+    use caudra_providers::{INVALID_TOOL_JSON_KEY, InvalidToolInput};
     use caudra_storage::StateDir;
     use caudra_storage::id::SessionRef;
     use caudra_storage::tool_outputs::ToolOutputStore;
+    use serde_json::json;
     use tempfile::TempDir;
     use test_case::test_case;
 
     use super::*;
     use crate::agent::history::History;
+    use crate::agent::speculative::SpeculativeRuns;
     use crate::cancel::CancelToken;
     use crate::permissions::{PERMISSION_DENIED_PREFIX, PermissionManager};
     use crate::snapshots::{SnapshotLimits, SnapshotStore};
+    use crate::tools::BATCH_TOOL_NAME;
+    use crate::tools::native::batch::BatchTool;
     use crate::tools::registry::ToolSource;
     use crate::tools::test_support::{GUARDED_TOOL_NAME, GuardedMock};
     use crate::{AgentMode, EventSender};
@@ -1334,6 +1486,81 @@ mod tests {
     const MODEL_REPEAT_GUIDANCE: &str = "Use a different query for this model.";
     const REPEAT_TWO_PREFIX: &str =
         "You have called this tool with identical input 2 times in a row. ";
+    const OBSERVED_BATCH_ID: &str = "observed-batch";
+    const OBSERVED_CHILDREN: usize = 2;
+
+    #[test_case(false; "valid_children")]
+    #[test_case(true; "repaired_fallback_children")]
+    fn eager_dispatch_retains_final_child_history_and_single_reservations(malformed: bool) {
+        smol::block_on(async {
+            let count = Arc::new(AtomicUsize::new(0));
+            let executions = Arc::clone(&count);
+            let mut ctx = local_ctx(OBSERVED_TOOL, move |_| {
+                executions.fetch_add(1, Ordering::SeqCst);
+                Ok(String::new())
+            });
+            Arc::make_mut(&mut ctx.local_tools)
+                .get_mut(OBSERVED_TOOL)
+                .unwrap()
+                .effect = ToolEffect::Mutating;
+            ctx.registry
+                .register(
+                    Arc::new(BatchTool),
+                    ToolSource::Native {
+                        owner: crate::tools::native::OWNER.into(),
+                        contract: BATCH_TOOL_NAME.into(),
+                        trusted: true,
+                    },
+                )
+                .unwrap();
+            let (tx, _rx) = flume::unbounded();
+            ctx.event_tx = EventSender::new(tx, 0);
+            ctx.config.tool_json_repair = true;
+            let observations = ResponseObservations::new(OBSERVED_CHILDREN);
+            ctx.steering_observations = Some(observations.clone());
+            let mut recent = RecentCalls::with_threshold(OBSERVED_CHILDREN);
+            ctx.speculative = Some(Arc::new(
+                SpeculativeRuns::new(&ctx, None).with_recent(recent.clone()),
+            ));
+            let params = json!({});
+            let input = json!({"tool_calls": vec![json!({"tool": OBSERVED_TOOL, "parameters": params}); OBSERVED_CHILDREN]});
+            if malformed {
+                ctx.json_repair.register_invalid(
+                    OBSERVED_BATCH_ID,
+                    InvalidToolInput {
+                        raw: input
+                            .to_string()
+                            .replacen("\"tool_calls\"", "tool_calls", 1),
+                        complete: true,
+                        clipped: false,
+                    },
+                );
+            }
+            let mut history = History::new(Vec::new());
+            process_tool_calls(
+                vec![(
+                    OBSERVED_BATCH_ID.into(),
+                    BATCH_TOOL_NAME.into(),
+                    if malformed { json!({}) } else { input },
+                )],
+                &mut recent,
+                None,
+                &mut history,
+                &ctx.event_tx,
+                &ctx,
+            )
+            .await
+            .unwrap();
+            assert_eq!(count.load(Ordering::SeqCst), 1);
+            assert!(recent.is_doom_loop(OBSERVED_TOOL, &params));
+            assert_eq!(observations.lock().attempts, OBSERVED_CHILDREN);
+            let (facts, all_repairable) = observations.take();
+            assert_eq!(facts.len(), OBSERVED_CHILDREN);
+            assert_eq!(facts[0].outcome, ToolOutcome::Success);
+            assert_eq!(facts[1].outcome, ToolOutcome::Repairable);
+            assert!(!all_repairable);
+        });
+    }
 
     #[test_case(&[0, 1, 2, 3]; "input_order")]
     #[test_case(&[3, 1, 0, 2]; "shuffled_completion")]
@@ -1728,6 +1955,14 @@ mod tests {
 
         smol::block_on(async {
             let mut ctx = local_ctx("batch", |_| panic!("{RAN_ANYWAY}"));
+            ctx.json_repair.register_invalid(
+                "t1",
+                InvalidToolInput {
+                    raw: TRUNCATED.into(),
+                    complete: false,
+                    clipped: false,
+                },
+            );
             let observations = ResponseObservations::new(1);
             ctx.steering_observations = Some(observations.clone());
             let done = run(
@@ -2320,8 +2555,6 @@ mod tests {
     }
 
     const START_PROBE_NAME: &str = "start_probe";
-
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use crate::ToolInput;
     use crate::tools::{
