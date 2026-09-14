@@ -269,7 +269,7 @@ fn test_writer(dir: StateDir) -> StorageWriter {
 }
 
 thread_local! {
-    /// Retiring or checkpointing a session writes to `sessions.sqlite3` under
+    /// Retiring or checkpointing a session writes to `caudra.sqlite` under
     /// the state dir, so pointing every app at `env::temp_dir()` put the whole
     /// suite on one database. Under load the write lock timed out and
     /// `retire_current_session` failed, taking `/new` and session loading down

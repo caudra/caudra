@@ -1093,7 +1093,7 @@ mod tests {
             PermissionState::open(&persistent).unwrap().records().len(),
             1
         );
-        assert!(!state_dir.path().join("sessions.sqlite3").exists());
+        assert!(!state_dir.path().join("caudra.sqlite").exists());
     }
 
     #[test]

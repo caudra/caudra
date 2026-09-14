@@ -65,7 +65,7 @@ if os.name == "nt":
     STATE_HOME = Path(os.environ.get("APPDATA", Path.home() / "AppData/Roaming"))
 else:
     STATE_HOME = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
-DEFAULT_DB = STATE_HOME / "caudra" / "sessions.sqlite3"
+DEFAULT_DB = STATE_HOME / "caudra" / "caudra.sqlite"
 
 DEFAULT_MODELS = ["claude-opus-5", "claude-fable-5-1", "gpt-5.6-sol"]
 # Excludes title/compaction/goal traffic: short utility work, often on a cheaper model,

@@ -20,7 +20,7 @@ use crate::retention::{self, Decision, GroupBy, KeepPolicy, SessionFacts};
 use crate::tool_outputs::ToolOutputStore;
 use crate::{StateDir, StorageError, lock_session_artifacts, try_exclusive_state_lock};
 
-const SWEEP_LOCK_FILE: &str = "sessions.sqlite3.sweep.lock";
+const SWEEP_LOCK_FILE: &str = "caudra.sqlite.sweep.lock";
 const LAST_SWEEP_KEY: &str = "retention.last_sweep_at";
 const OWNER_FILE_MODE: u32 = 0o600;
 /// Orphaned artifact directories younger than this may belong to a session

@@ -62,8 +62,8 @@ use crate::{
     StateDir, StorageError, lock_session_artifacts, shared_existing_state_lock, shared_state_lock,
 };
 
-pub const SESSIONS_DB_FILE: &str = "sessions.sqlite3";
-pub const SESSIONS_DB_LOCK_FILE: &str = "sessions.sqlite3.lock";
+pub const SESSIONS_DB_FILE: &str = "caudra.sqlite";
+pub const SESSIONS_DB_LOCK_FILE: &str = "caudra.sqlite.lock";
 
 const SCHEMA_VERSION: i64 = 7;
 const APPLICATION_ID: i64 = i32::from_be_bytes(*b"CAUD") as i64;

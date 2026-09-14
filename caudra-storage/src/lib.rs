@@ -55,7 +55,7 @@ use paths::state_dir;
 const RENAME_ATTEMPTS: usize = 20;
 const XDG_RUNTIME_DIR_ENV: &str = "XDG_RUNTIME_DIR";
 const EPHEMERAL_DIR_PREFIX: &str = "caudra";
-const SESSION_ARTIFACT_LOCK_FILE: &str = "sessions.sqlite3.artifacts.lock";
+const SESSION_ARTIFACT_LOCK_FILE: &str = "caudra.sqlite.artifacts.lock";
 /// How long a bounded artifact-lock wait sleeps between attempts. `flock`
 /// grants no queue and no fairness, so a waiter polls rather than blocks.
 const ARTIFACT_LOCK_POLL: Duration = Duration::from_millis(20);
