@@ -14,6 +14,7 @@ use std::mem;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use caudra_storage::id::CaudraId;
@@ -39,6 +40,9 @@ const STORAGE_WARNING_BYTES: u64 = 1024 * 1024 * 1024;
 const WAL_WARNING_BYTES: u64 = 2 * WAL_RETENTION_LIMIT_BYTES;
 const CHECKPOINT_COMMIT_INTERVAL: u32 = 128;
 const CHECKPOINT_STALL_WARNING_COUNT: u32 = 2;
+const WRITER_UNAVAILABLE: &str = "storage writer unavailable";
+const WRITER_TIMEOUT: &str = "storage writer operation timed out";
+const WRITER_DRAIN_FAILED: &str = "storage writer stopped with unsaved session operations";
 
 type Pending = Arc<Mutex<HashMap<CaudraId, Entry>>>;
 type PendingWorkspaceTabs = Arc<Mutex<Option<WorkspaceTabsRequest>>>;
@@ -69,7 +73,8 @@ pub struct StorageWriter {
     wake: flume::Sender<()>,
     workspace_tabs: PendingWorkspaceTabs,
     usage: PendingUsage,
-    done_rx: flume::Receiver<()>,
+    done_rx: flume::Receiver<Result<(), SessionError>>,
+    thread: JoinHandle<()>,
     generation: Arc<AtomicU64>,
 }
 
@@ -82,11 +87,11 @@ impl StorageWriter {
         let usage: PendingUsage = Arc::default();
         let writer_usage = Arc::clone(&usage);
         let (wake, wake_rx) = flume::bounded::<()>(1);
-        let (done_tx, done_rx) = flume::bounded::<()>(1);
+        let (done_tx, done_rx) = flume::bounded(1);
         let generation: Arc<AtomicU64> = Arc::default();
         let writer_generation = Arc::clone(&generation);
 
-        std::thread::Builder::new()
+        let thread = std::thread::Builder::new()
             .name("storage-writer".into())
             .spawn(move || {
                 let mut writer = Writer {
@@ -97,6 +102,7 @@ impl StorageWriter {
                     cursors: HashMap::new(),
                     deleted_sessions: HashMap::new(),
                     failing: HashSet::new(),
+                    workspace_tabs_errors: HashMap::new(),
                     size_warning_level: 0,
                     wal_warning_active: false,
                     commits_since_checkpoint: 0,
@@ -106,13 +112,9 @@ impl StorageWriter {
                 while wake_rx.recv().is_ok() {
                     writer.drain(&writer_pending, &writer_workspace_tabs, &writer_usage);
                 }
-                writer.drain(&writer_pending, &writer_workspace_tabs, &writer_usage);
-                if let Some(database) = &writer.database
-                    && let Err(error) = database.checkpoint(false)
-                {
-                    warn!(%error, "session database checkpoint failed during shutdown");
-                }
-                let _ = done_tx.send(());
+                let result = writer.finish(&writer_pending, &writer_workspace_tabs, &writer_usage);
+                drop(writer);
+                let _ = done_tx.send(result);
             })
             .expect("failed to spawn storage writer thread");
 
@@ -122,6 +124,7 @@ impl StorageWriter {
             workspace_tabs,
             usage,
             done_rx,
+            thread,
             generation,
         }
     }
@@ -158,6 +161,16 @@ impl StorageWriter {
         let (done_tx, done_rx) = flume::bounded(1);
         self.enqueue(id, Entry::SaveSync(session, done_tx));
         done_rx.recv().unwrap_or_else(|_| Err(writer_gone()))
+    }
+
+    pub fn save_sync_timeout(
+        &self,
+        session: Arc<AppSession>,
+        timeout: Duration,
+    ) -> Result<(), SessionError> {
+        let (done_tx, done_rx) = flume::bounded(1);
+        self.enqueue(session.id, Entry::SaveSync(session, done_tx));
+        done_rx.recv_timeout(timeout).map_err(writer_wait_error)?
     }
 
     /// Queue deletion on the writer thread; `done` fires after the canonical
@@ -216,6 +229,16 @@ impl StorageWriter {
             warn!("storage writer did not drain within {timeout:?}");
         }
     }
+
+    pub fn shutdown_checked(self, timeout: Duration) -> Result<(), SessionError> {
+        drop(self.wake);
+        let result = self
+            .done_rx
+            .recv_timeout(timeout)
+            .map_err(writer_wait_error)?;
+        self.thread.join().map_err(|_| writer_gone())?;
+        result
+    }
 }
 
 fn lock(pending: &Pending) -> std::sync::MutexGuard<'_, HashMap<CaudraId, Entry>> {
@@ -223,7 +246,16 @@ fn lock(pending: &Pending) -> std::sync::MutexGuard<'_, HashMap<CaudraId, Entry>
 }
 
 fn writer_gone() -> SessionError {
-    StorageError::Io(io::Error::other("storage writer unavailable")).into()
+    StorageError::Io(io::Error::other(WRITER_UNAVAILABLE)).into()
+}
+
+fn writer_wait_error(error: flume::RecvTimeoutError) -> SessionError {
+    match error {
+        flume::RecvTimeoutError::Timeout => {
+            StorageError::Io(io::Error::new(io::ErrorKind::TimedOut, WRITER_TIMEOUT)).into()
+        }
+        flume::RecvTimeoutError::Disconnected => writer_gone(),
+    }
 }
 
 fn superseded_error(id: CaudraId) -> SessionError {
@@ -257,6 +289,7 @@ struct Writer {
     /// Sessions whose last write failed, so a sick disk warns once instead of
     /// once per frame.
     failing: HashSet<CaudraId>,
+    workspace_tabs_errors: HashMap<PathBuf, SessionError>,
     size_warning_level: u32,
     wal_warning_active: bool,
     commits_since_checkpoint: u32,
@@ -311,6 +344,8 @@ impl Writer {
                             self.deleted_sessions.insert(id, recreation);
                         }
                         self.checkpoint(true);
+                    } else {
+                        self.failing.insert(id);
                     }
                     self.mark_changed(&session_result);
                     done(session_result);
@@ -356,6 +391,29 @@ impl Writer {
         self.flush_usage(usage);
     }
 
+    fn finish(
+        &mut self,
+        pending: &Pending,
+        tabs: &PendingWorkspaceTabs,
+        usage: &PendingUsage,
+    ) -> Result<(), SessionError> {
+        self.drain(pending, tabs, usage);
+        let checkpoint = self
+            .database
+            .as_ref()
+            .map_or(Ok(()), |database| database.checkpoint(false).map(|_| ()));
+        if let Err(error) = &checkpoint {
+            warn!(%error, "session database checkpoint failed during shutdown");
+        }
+        if !self.failing.is_empty() || !lock(pending).is_empty() {
+            return Err(StorageError::Io(io::Error::other(WRITER_DRAIN_FAILED)).into());
+        }
+        if let Some((_, error)) = self.workspace_tabs_errors.drain().next() {
+            return Err(error);
+        }
+        checkpoint
+    }
+
     fn flush_workspace_tabs(&mut self, request: WorkspaceTabsRequest) {
         let cwd = request.cwd.clone();
         if let Err(error) = self.write_workspace_tabs(request) {
@@ -363,6 +421,9 @@ impl Writer {
             let _ = self
                 .warn_tx
                 .send(format!("{WORKSPACE_TABS_SAVE_FAILED_PREFIX}: {error}"));
+            self.workspace_tabs_errors.insert(cwd, error);
+        } else {
+            self.workspace_tabs_errors.remove(&cwd);
         }
     }
 
@@ -376,21 +437,18 @@ impl Writer {
         if self.database.is_none() {
             self.database = Some(SessionDatabase::open(&self.dir)?);
         }
-        let cwd = request.cwd.canonicalize().map_err(StorageError::from)?;
-        let existing = self
+        let cwd = workspace_tabs_path(&request.cwd)?;
+        let mut existing = HashSet::new();
+        for facts in self
             .database
             .as_ref()
             .expect("database initialized")
             .session_facts(None)?
-            .into_iter()
-            .filter_map(|facts| {
-                Path::new(&facts.cwd)
-                    .canonicalize()
-                    .ok()
-                    .filter(|stored_cwd| stored_cwd == &cwd)
-                    .map(|_| facts.id)
-            })
-            .collect::<HashSet<_>>();
+        {
+            if workspace_tabs_path(Path::new(&facts.cwd))? == cwd {
+                existing.insert(facts.id);
+            }
+        }
         let mut seen = HashSet::new();
         request
             .tabs
@@ -551,6 +609,14 @@ impl Writer {
     }
 }
 
+fn workspace_tabs_path(path: &Path) -> Result<PathBuf, StorageError> {
+    match path.canonicalize() {
+        Ok(path) => Ok(path),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(path.to_path_buf()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn mib(bytes: u64) -> u64 {
     bytes / (1024 * 1024)
 }
@@ -575,6 +641,7 @@ mod tests {
     use super::*;
     use caudra_storage::usage_ledger::LedgerPurpose;
     use tempfile::TempDir;
+    use test_case::test_case;
 
     const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
     const MODEL: &str = "test-model";
@@ -597,6 +664,9 @@ mod tests {
     const WAL_GROWTH_SILENT: &str = "a WAL past the alarm must be announced";
     const WAL_WARNED_TWICE: &str = "one burst must warn once, not once per commit";
     const WAL_LATCH_STUCK: &str = "falling back to the retention limit must re-arm the warning";
+    const WORKSPACE: &str = "workspace";
+    const OTHER_WORKSPACE: &str = "other-workspace";
+    const BLOCKED_PARENT: &str = "blocked-parent";
 
     fn state_dir() -> (TempDir, StateDir) {
         let tmp = TempDir::new().unwrap();
@@ -615,6 +685,7 @@ mod tests {
             cursors: HashMap::new(),
             deleted_sessions: HashMap::new(),
             failing: HashSet::new(),
+            workspace_tabs_errors: HashMap::new(),
             size_warning_level: 0,
             wal_warning_active: false,
             commits_since_checkpoint: 0,
@@ -646,6 +717,245 @@ mod tests {
 
     fn block_session_database(dir: &StateDir) {
         std::fs::create_dir(dir.path().join(SESSIONS_DB_FILE)).unwrap();
+    }
+
+    fn pause_writer(writer: &StorageWriter) -> flume::Sender<()> {
+        let (entered_tx, entered_rx) = flume::bounded(1);
+        let (release_tx, release_rx) = flume::bounded(1);
+        writer.delete(CaudraId::generate(), move |result| {
+            result.unwrap();
+            entered_tx.send(()).unwrap();
+            release_rx.recv_timeout(DRAIN_TIMEOUT).unwrap();
+        });
+        entered_rx.recv_timeout(DRAIN_TIMEOUT).unwrap();
+        release_tx
+    }
+
+    fn assert_writer_error(error: SessionError, kind: io::ErrorKind, message: &str) {
+        let SessionError::Storage(StorageError::Io(error)) = error else {
+            panic!("unexpected writer error: {error}");
+        };
+        assert_eq!(error.kind(), kind);
+        assert_eq!(error.to_string(), message);
+    }
+
+    #[test]
+    fn save_sync_timeout_does_not_cancel_the_write() {
+        let (_tmp, dir) = state_dir();
+        let (writer, _warn_rx) = writer(&dir);
+        let release = pause_writer(&writer);
+        let session = Arc::new(AppSession::new(MODEL, CWD));
+        let id = session.id;
+
+        let error = writer
+            .save_sync_timeout(session, Duration::ZERO)
+            .unwrap_err();
+
+        assert_writer_error(error, io::ErrorKind::TimedOut, WRITER_TIMEOUT);
+        assert!(matches!(
+            lock(&writer.pending).get(&id),
+            Some(Entry::SaveSync(..))
+        ));
+        release.send(()).unwrap();
+        writer.shutdown_checked(DRAIN_TIMEOUT).unwrap();
+        assert!(AppSession::load(id, &dir).is_ok());
+    }
+
+    #[test_case(false; "legacy_save")]
+    #[test_case(true; "timed_save")]
+    fn disconnected_save_resolves_its_callback(timed: bool) {
+        let (_tmp, dir) = state_dir();
+        let (mut writer, _warn_rx) = writer(&dir);
+        let release = pause_writer(&writer);
+        let (wake, wake_rx) = flume::bounded(1);
+        drop(wake_rx);
+        writer.wake = wake;
+        let session = Arc::new(AppSession::new(MODEL, CWD));
+
+        let error = if timed {
+            writer.save_sync_timeout(session, DRAIN_TIMEOUT)
+        } else {
+            writer.save_sync(session)
+        }
+        .unwrap_err();
+
+        assert_writer_error(error, io::ErrorKind::Other, WRITER_UNAVAILABLE);
+        assert!(lock(&writer.pending).is_empty());
+        release.send(()).unwrap();
+        writer.shutdown_checked(DRAIN_TIMEOUT).unwrap();
+    }
+
+    #[test]
+    fn checked_shutdown_times_out_without_claiming_the_writer_stopped() {
+        let (_tmp, dir) = state_dir();
+        let (writer, _warn_rx) = writer(&dir);
+        let release = pause_writer(&writer);
+        let done_rx = writer.done_rx.clone();
+
+        let error = writer.shutdown_checked(Duration::ZERO).unwrap_err();
+
+        assert_writer_error(error, io::ErrorKind::TimedOut, WRITER_TIMEOUT);
+        release.send(()).unwrap();
+        done_rx.recv_timeout(DRAIN_TIMEOUT).unwrap().unwrap();
+    }
+
+    #[test]
+    fn checked_shutdown_rejects_a_disconnected_completion_channel() {
+        let (_tmp, dir) = state_dir();
+        let (mut writer, _warn_rx) = writer(&dir);
+        let done_rx = writer.done_rx.clone();
+        let (done_tx, disconnected_rx) = flume::bounded(1);
+        drop(done_tx);
+        writer.done_rx = disconnected_rx;
+
+        let error = writer.shutdown_checked(DRAIN_TIMEOUT).unwrap_err();
+
+        assert_writer_error(error, io::ErrorKind::Other, WRITER_UNAVAILABLE);
+        done_rx.recv_timeout(DRAIN_TIMEOUT).unwrap().unwrap();
+    }
+
+    #[test_case(false; "pending_retryable_save")]
+    #[test_case(true; "failed_save_without_pending_retry")]
+    fn checked_shutdown_reports_session_persistence_failure(synchronous: bool) {
+        let (_tmp, dir) = state_dir();
+        block_session_database(&dir);
+        let (writer, _warn_rx) = writer(&dir);
+        let session = Arc::new(AppSession::new(MODEL, CWD));
+        let pending = Arc::clone(&writer.pending);
+        let (done_tx, done_rx) = flume::bounded(1);
+        let entry = if synchronous {
+            Entry::SaveSync(Arc::clone(&session), done_tx)
+        } else {
+            Entry::Save(Arc::clone(&session))
+        };
+        lock(&pending).insert(session.id, entry);
+
+        let error = writer.shutdown_checked(DRAIN_TIMEOUT).unwrap_err();
+
+        assert_writer_error(error, io::ErrorKind::Other, WRITER_DRAIN_FAILED);
+        assert_eq!(lock(&pending).is_empty(), synchronous);
+        if synchronous {
+            assert!(done_rx.recv_timeout(DRAIN_TIMEOUT).unwrap().is_err());
+        }
+        assert_eq!(Arc::strong_count(&pending), 1);
+    }
+
+    #[test]
+    fn checked_shutdown_resolves_failed_delete_callbacks() {
+        let (_tmp, dir) = state_dir();
+        block_session_database(&dir);
+        let (writer, _warn_rx) = writer(&dir);
+        let (done_tx, done_rx) = flume::bounded(1);
+        lock(&writer.pending).insert(
+            CaudraId::generate(),
+            Entry::Delete(Box::new(move |result| done_tx.send(result).unwrap())),
+        );
+
+        let error = writer.shutdown_checked(DRAIN_TIMEOUT).unwrap_err();
+
+        assert_writer_error(error, io::ErrorKind::Other, WRITER_DRAIN_FAILED);
+        assert!(done_rx.recv_timeout(DRAIN_TIMEOUT).unwrap().is_err());
+        assert!(done_rx.try_recv().is_err());
+    }
+
+    #[test_case(false; "final_tab_write")]
+    #[test_case(true; "earlier_tab_failure")]
+    fn checked_shutdown_reports_workspace_tabs_failure(before_shutdown: bool) {
+        let (tmp, dir) = state_dir();
+        let (writer, warn_rx) = writer(&dir);
+        let parent = tmp.path().join(BLOCKED_PARENT);
+        fs::write(&parent, []).unwrap();
+        let cwd = parent.join(WORKSPACE);
+        if before_shutdown {
+            writer.persist_workspace_tabs(cwd, WorkspaceTabs::default());
+            let warning = warn_rx.recv_timeout(DRAIN_TIMEOUT).unwrap();
+            assert!(warning.starts_with(WORKSPACE_TABS_SAVE_FAILED_PREFIX));
+        } else {
+            *writer.workspace_tabs.lock().unwrap() = Some(WorkspaceTabsRequest {
+                cwd,
+                tabs: WorkspaceTabs::default(),
+            });
+        }
+
+        let error = writer.shutdown_checked(DRAIN_TIMEOUT).unwrap_err();
+
+        assert!(matches!(
+            error,
+            SessionError::Storage(StorageError::Io(error)) if error.kind() == io::ErrorKind::NotADirectory
+        ));
+    }
+
+    #[test_case(false; "same_workspace_recovers")]
+    #[test_case(true; "other_workspace_does_not_clear_failure")]
+    fn workspace_tabs_failure_clears_only_after_that_workspace_is_saved(other_workspace: bool) {
+        let (tmp, dir) = state_dir();
+        let (warn_tx, _warn_rx) = flume::unbounded();
+        let mut writer = bare_writer(&dir, warn_tx);
+        let parent = tmp.path().join(BLOCKED_PARENT);
+        fs::write(&parent, []).unwrap();
+        let cwd = parent.join(WORKSPACE);
+        writer.flush_workspace_tabs(WorkspaceTabsRequest {
+            cwd: cwd.clone(),
+            tabs: WorkspaceTabs::default(),
+        });
+        let saved_cwd = if other_workspace {
+            tmp.path().join(OTHER_WORKSPACE)
+        } else {
+            cwd
+        };
+        fs::remove_file(&parent).unwrap();
+        fs::create_dir_all(&saved_cwd).unwrap();
+        writer.flush_workspace_tabs(WorkspaceTabsRequest {
+            cwd: saved_cwd,
+            tabs: WorkspaceTabs::default(),
+        });
+
+        let result = writer.finish(&Arc::default(), &Arc::default(), &Arc::default());
+
+        assert_eq!(result.is_err(), other_workspace);
+    }
+
+    #[test]
+    fn checked_shutdown_drains_callbacks_and_tabs_and_joins_the_writer() {
+        let (tmp, dir) = state_dir();
+        let cwd = tmp.path().join(WORKSPACE);
+        fs::create_dir(&cwd).unwrap();
+        let (writer, _warn_rx) = writer(&dir);
+        let release = pause_writer(&writer);
+        let pending = Arc::clone(&writer.pending);
+        let tabs = Arc::clone(&writer.workspace_tabs);
+        let session = Arc::new(AppSession::new(MODEL, &cwd.to_string_lossy()));
+        let id = session.id;
+        let (save_tx, save_rx) = flume::bounded(1);
+        let (delete_tx, delete_rx) = flume::bounded(1);
+        lock(&pending).insert(id, Entry::SaveSync(session, save_tx));
+        lock(&pending).insert(
+            CaudraId::generate(),
+            Entry::Delete(Box::new(move |result| delete_tx.send(result).unwrap())),
+        );
+        let expected_tabs = WorkspaceTabs {
+            open: vec![id],
+            focused: Some(id),
+        };
+        *tabs.lock().unwrap() = Some(WorkspaceTabsRequest {
+            cwd: cwd.clone(),
+            tabs: expected_tabs.clone(),
+        });
+        release.send(()).unwrap();
+
+        writer.shutdown_checked(DRAIN_TIMEOUT).unwrap();
+
+        save_rx.recv_timeout(DRAIN_TIMEOUT).unwrap().unwrap();
+        delete_rx.recv_timeout(DRAIN_TIMEOUT).unwrap().unwrap();
+        assert!(AppSession::load(id, &dir).is_ok());
+        assert_eq!(
+            caudra_storage::state::read_workspace_tabs(&dir, &cwd).unwrap(),
+            Some(expected_tabs)
+        );
+        assert!(lock(&pending).is_empty());
+        assert!(tabs.lock().unwrap().is_none());
+        assert_eq!(Arc::strong_count(&pending), 1);
+        assert_eq!(Arc::strong_count(&tabs), 1);
     }
 
     /// A caller that waited for its own delete then read the generation used
@@ -758,6 +1068,87 @@ mod tests {
         );
     }
 
+    #[test_case(false; "missing_workspace")]
+    #[test_case(true; "renamed_workspace")]
+    fn checked_shutdown_saves_missing_workspace_tabs_with_exact_path_matching(renamed: bool) {
+        let (tmp, dir) = state_dir();
+        let cwd = tmp.path().join(WORKSPACE);
+        let destination = tmp.path().join(OTHER_WORKSPACE);
+        if renamed {
+            fs::create_dir(&cwd).unwrap();
+        }
+        let (writer, warn_rx) = writer(&dir);
+        let kept = Arc::new(AppSession::new(MODEL, &cwd.to_string_lossy()));
+        let kept_id = kept.id;
+        writer.save_sync(kept).unwrap();
+        let mut open = vec![kept_id];
+        for path in [cwd.join(OTHER_WORKSPACE), destination.clone()] {
+            let session = Arc::new(AppSession::new(MODEL, &path.to_string_lossy()));
+            open.push(session.id);
+            writer.save_sync(session).unwrap();
+        }
+        open.extend([kept_id, CaudraId::generate()]);
+        if renamed {
+            fs::rename(&cwd, &destination).unwrap();
+        }
+        writer.persist_workspace_tabs(
+            cwd.clone(),
+            WorkspaceTabs {
+                open,
+                focused: Some(kept_id),
+            },
+        );
+
+        writer.shutdown_checked(DRAIN_TIMEOUT).unwrap();
+
+        assert_eq!(
+            caudra_storage::state::read_workspace_tabs(&dir, &cwd).unwrap(),
+            Some(WorkspaceTabs {
+                open: vec![kept_id],
+                focused: Some(kept_id),
+            })
+        );
+        assert_eq!(
+            caudra_storage::state::read_workspace_tabs(&dir, &destination).unwrap(),
+            None
+        );
+        assert!(warn_rx.is_empty());
+    }
+
+    #[test_case(false; "existing_workspace")]
+    #[test_case(true; "missing_workspace")]
+    fn checked_shutdown_reports_stored_workspace_path_errors(missing: bool) {
+        let (tmp, dir) = state_dir();
+        let cwd = tmp.path().join(WORKSPACE);
+        if !missing {
+            fs::create_dir(&cwd).unwrap();
+        }
+        let parent = tmp.path().join(BLOCKED_PARENT);
+        fs::write(&parent, []).unwrap();
+        let stored_cwd = parent.join(OTHER_WORKSPACE);
+        let (writer, warn_rx) = writer(&dir);
+        let session = Arc::new(AppSession::new(MODEL, &stored_cwd.to_string_lossy()));
+        writer.save_sync(session).unwrap();
+        writer.persist_workspace_tabs(cwd.clone(), WorkspaceTabs::default());
+
+        let error = writer.shutdown_checked(DRAIN_TIMEOUT).unwrap_err();
+
+        assert!(matches!(
+            error,
+            SessionError::Storage(StorageError::Io(error)) if error.kind() == io::ErrorKind::NotADirectory
+        ));
+        assert!(
+            warn_rx
+                .recv_timeout(DRAIN_TIMEOUT)
+                .unwrap()
+                .starts_with(WORKSPACE_TABS_SAVE_FAILED_PREFIX)
+        );
+        assert_eq!(
+            caudra_storage::state::read_workspace_tabs(&dir, &cwd).unwrap(),
+            None
+        );
+    }
+
     fn spend(model: &str, cost: Option<f64>) -> TurnUsage {
         TurnUsage {
             provider: PROVIDER.into(),
@@ -811,15 +1202,21 @@ mod tests {
         assert_eq!(rows[0].cost, 10.0, "{SPEND_OUTLIVES}");
     }
 
-    #[test]
-    fn synchronous_save_is_visible_before_it_returns() {
+    #[test_case(false; "legacy_save")]
+    #[test_case(true; "timed_save")]
+    fn synchronous_save_is_visible_before_it_returns(timed: bool) {
         let (_tmp, dir) = state_dir();
         let (writer, _warn_rx) = writer(&dir);
         let mut session = AppSession::new(MODEL, CWD);
         crate::push_history_message(&mut session, user_message(0));
         let id = session.id;
 
-        writer.save_sync(Arc::new(session)).unwrap();
+        if timed {
+            writer.save_sync_timeout(Arc::new(session), DRAIN_TIMEOUT)
+        } else {
+            writer.save_sync(Arc::new(session))
+        }
+        .unwrap();
 
         assert!(AppSession::load(id, &dir).is_ok());
         writer.shutdown(DRAIN_TIMEOUT);
@@ -1027,8 +1424,9 @@ mod tests {
     /// A failed write stays queued: `checkpoint` never resends an unchanged
     /// revision, so the writer owns the retry, and the shutdown flush is the
     /// last one.
-    #[test]
-    fn failed_write_is_retried_by_a_later_flush() {
+    #[test_case(false; "legacy_shutdown")]
+    #[test_case(true; "checked_shutdown")]
+    fn failed_write_is_retried_by_a_later_flush(checked: bool) {
         let (_tmp, dir) = state_dir();
         block_session_database(&dir);
         let (writer, warn_rx) = writer(&dir);
@@ -1040,7 +1438,11 @@ mod tests {
         assert!(warning.starts_with(SAVE_FAILED_PREFIX), "{warning}");
 
         std::fs::remove_dir(dir.path().join(SESSIONS_DB_FILE)).unwrap();
-        writer.shutdown(DRAIN_TIMEOUT);
+        if checked {
+            writer.shutdown_checked(DRAIN_TIMEOUT).unwrap();
+        } else {
+            writer.shutdown(DRAIN_TIMEOUT);
+        }
 
         assert!(AppSession::load(id, &dir).is_ok());
         assert_eq!(warn_rx.recv_timeout(DRAIN_TIMEOUT).unwrap(), SAVE_RECOVERED);

@@ -67,6 +67,7 @@ use crate::components::rewind_picker::{RewindPicker, RewindPickerAction};
 use crate::components::scrollbar;
 use crate::components::search_modal::{SearchAction, SearchModal};
 use crate::components::session_picker::{SessionPicker, SessionRow};
+use crate::components::session_relocation::SessionRelocationPicker;
 use crate::components::skills_modal::SkillsModal;
 use crate::components::stash_picker::StashPicker;
 use crate::components::status_bar::{StatusBar, StatusBarHit, StatusBarHitTarget};
@@ -337,6 +338,7 @@ pub struct App {
     pub(crate) workflow: workflow::WorkflowUi,
     pub(super) question_form: QuestionForm,
     pub(super) session_picker: SessionPicker,
+    pub(super) session_relocation_picker: SessionRelocationPicker,
     /// Published by the event loop, which is the only thing that can see
     /// sibling sessions. Polled while the picker is open.
     pub(crate) live_sessions: Arc<ArcSwap<Vec<SessionRow>>>,
@@ -548,6 +550,7 @@ impl App {
             workflow: workflow::WorkflowUi::new(),
             question_form: QuestionForm::new(),
             session_picker: SessionPicker::new(),
+            session_relocation_picker: SessionRelocationPicker::new(),
             live_sessions: Arc::default(),
             live_session_watch: Watch::default(),
             stored_session_generation: 0,
@@ -1142,6 +1145,10 @@ impl App {
             Msg::Paste(text) => {
                 self.sync_subagent_input_target();
                 let text = text.replace("\r\n", "\n").replace('\r', "\n");
+                if self.session_relocation_picker.is_open() {
+                    self.route_text_paste(&text);
+                    return vec![];
+                }
                 if self.workbench.is_open() && self.workbench.paste(&text) {
                     return vec![];
                 }
@@ -1341,6 +1348,7 @@ impl App {
             return None;
         }
         try_picker!(self.session_picker);
+        try_picker!(self.session_relocation_picker);
         // Not modal: the palette floats over the transcript, so it claims the
         // wheel only where it actually drew.
         if self.command_palette.is_active() && self.command_palette.contains(pos) {
@@ -1746,6 +1754,10 @@ impl App {
         if self.session_picker.is_open() {
             let action = self.session_picker.handle_key(key);
             return Some(self.handle_session_picker_action(action));
+        }
+        if self.session_relocation_picker.is_open() {
+            let action = self.session_relocation_picker.handle_key(key);
+            return Some(self.handle_session_relocation_action(action));
         }
         if self.task_picker.is_open() {
             let action = self.task_picker.handle_key(key);
@@ -3856,6 +3868,13 @@ impl App {
             "/workflow" => self.execute_workflow(&cmd.args),
             "/deep-research" => self.execute_deep_research(&cmd.args),
             "/sessions" => self.sessions_browse(),
+            "/move-session" | "/migrate-sessions" => {
+                let destination = cmd.args.trim();
+                vec![Action::OpenSessionRelocation {
+                    bulk: cmd.name == "/migrate-sessions",
+                    destination: (!destination.is_empty()).then(|| destination.to_owned()),
+                }]
+            }
             "/rename" => self.rename_session(&cmd.args),
             "/model" => {
                 self.model_picker
@@ -4220,7 +4239,7 @@ impl App {
         self.subagent_input_box.set_cwd(cwd);
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 34] {
+    fn overlays(&self) -> [&dyn Overlay; 35] {
         [
             &self.workbench,
             &self.logs_modal,
@@ -4255,11 +4274,12 @@ impl App {
             &self.workflow_catalog_picker,
             &self.question_form,
             &self.session_picker,
+            &self.session_relocation_picker,
             &self.permission_prompt,
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 34] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 35] {
         [
             &mut self.workbench,
             &mut self.logs_modal,
@@ -4294,6 +4314,7 @@ impl App {
             &mut self.workflow_catalog_picker,
             &mut self.question_form,
             &mut self.session_picker,
+            &mut self.session_relocation_picker,
             &mut self.permission_prompt,
         ]
     }
@@ -4744,6 +4765,7 @@ impl App {
         }
         try_picker!(self.workflow_catalog_picker);
         try_picker!(self.session_picker);
+        try_picker!(self.session_relocation_picker);
         try_picker!(self.question_form);
         try_picker!(self.login_picker);
         if !self.is_main_chat() && !(self.active_subagent_can_steer() || self.queue_editor_active())

@@ -1,0 +1,1059 @@
+use std::collections::BTreeMap;
+use std::fs;
+use std::mem;
+use std::path::Path;
+
+use caudra_storage::id::CaudraId;
+use caudra_storage::paths;
+use caudra_storage::sessions::{SessionLocation, SessionRelocation};
+use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
+use ratatui::Frame;
+use ratatui::layout::{Position, Rect};
+use ratatui::text::Line;
+
+use super::Overlay;
+use crate::components::hint_line;
+use crate::components::keybindings::key;
+use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
+use crate::repaint::Cadence;
+use crate::text_buffer::TextBuffer;
+
+const MAX_VISIBLE: u16 = 12;
+const WIDTH_PERCENT: u16 = 95;
+const SOURCE_TITLE: &str = " Migrate directory sessions: source ";
+const DESTINATION_TITLE: &str = " Session relocation: destination ";
+const CUSTOM_TITLE: &str = " Session relocation: custom directory ";
+const CONFIRM_TITLE: &str = " Confirm session relocation ";
+const CUSTOM_DIRECTORY: &str = "Custom directory";
+const CONFIRM: &str = "Confirm relocation";
+const UNTITLED: &str = "(untitled)";
+const EMPTY_SELECTION: &str = "No sessions match this source. Refresh the session inventory.";
+const SAME_DIRECTORY: &str = "Already in that directory. Choose a different destination.";
+const EMPTY_DESTINATION: &str = "Enter an existing destination directory.";
+const MISSING_HOME: &str = "Cannot resolve ~: home directory is unavailable.";
+const UNSUPPORTED_TILDE: &str = "Use ~ or ~/path; named-user expansion is not supported.";
+const NON_UTF8_DESTINATION: &str = "Destination directory is not valid UTF-8.";
+const NOT_DIRECTORY: &str = "Not a directory";
+const CANNOT_OPEN: &str = "Cannot open";
+const CUSTOM_HINT: &str = "Enter an existing directory. Relative paths use the invoking session's cwd; ~ uses your home. No shell expansion.";
+const SOURCE_HINT: &str =
+    "Choose one exact stored cwd, including missing directories. Descendants are not included.";
+const DESTINATION_HINT: &str =
+    "A destination session supplies its directory only; its conversation is not merged or changed.";
+const FILES_UNCHANGED: &str =
+    "No files or old workspace snapshots are moved. Destination sessions stay intact.";
+const CLOSING_LABEL: &str = "Other open tabs to save and close";
+const AFFECTED_LABEL: &str = "Affected sessions";
+const DESTINATIONS_LABEL: &str = "destinations";
+
+#[derive(Debug)]
+pub enum SessionRelocationAction {
+    Consumed,
+    Closed,
+    Confirm(SessionRelocation, Option<(CaudraId, String)>),
+}
+
+enum EntryKind {
+    Source(String),
+    Destination(CaudraId, String),
+    Custom,
+    Confirm,
+}
+
+struct Entry {
+    label: String,
+    kind: EntryKind,
+}
+
+impl PickerItem for Entry {
+    fn label(&self) -> &str {
+        &self.label
+    }
+}
+
+struct Target {
+    directory: String,
+    donor: Option<(CaudraId, String)>,
+}
+
+enum Stage {
+    Source(Option<Target>),
+    Destination,
+    Custom(TextBuffer),
+    Confirm(SessionRelocation, Option<(CaudraId, String)>),
+}
+
+struct Flow {
+    current_id: CaudraId,
+    current_cwd: String,
+    locations: Vec<SessionLocation>,
+    source_cwd: Option<String>,
+    other_open_count: usize,
+    stage: Stage,
+}
+
+pub struct SessionRelocationPicker {
+    picker: ListPicker<Entry>,
+    flow: Option<Flow>,
+}
+
+impl SessionRelocationPicker {
+    pub fn new() -> Self {
+        Self {
+            picker: ListPicker::new()
+                .with_max_visible(MAX_VISIBLE)
+                .with_width_percent(WIDTH_PERCENT),
+            flow: None,
+        }
+    }
+
+    pub fn open(
+        &mut self,
+        current_id: CaudraId,
+        current_cwd: String,
+        locations: Vec<SessionLocation>,
+        bulk: bool,
+        initial_destination: Option<String>,
+        other_open_count: usize,
+    ) {
+        self.close();
+        self.flow = Some(Flow {
+            current_id,
+            source_cwd: bulk.then(|| current_cwd.clone()),
+            current_cwd,
+            locations,
+            other_open_count,
+            stage: Stage::Destination,
+        });
+        if bulk {
+            self.show_sources(initial_destination.map(|directory| Target {
+                directory,
+                donor: None,
+            }));
+        } else if let Some(destination) = initial_destination {
+            self.preview(destination, None);
+        } else {
+            self.show_destinations();
+        }
+    }
+
+    pub fn is_open(&self) -> bool {
+        self.flow.is_some()
+    }
+
+    pub fn close(&mut self) {
+        self.flow = None;
+        self.picker.close();
+    }
+
+    pub fn contains(&self, pos: Position) -> bool {
+        self.picker.contains(pos)
+    }
+
+    pub fn scroll(&mut self, delta: i32) {
+        self.picker.scroll(delta);
+        self.sync_selection();
+    }
+
+    pub fn cadence(&self) -> Cadence {
+        self.picker.cadence()
+    }
+
+    pub fn handle_key(&mut self, event: KeyEvent) -> SessionRelocationAction {
+        let Some(flow) = &mut self.flow else {
+            return SessionRelocationAction::Consumed;
+        };
+        if event.code == KeyCode::Esc || key::QUIT.matches(event) {
+            self.close();
+            return SessionRelocationAction::Closed;
+        }
+        if event.code == KeyCode::Tab && matches!(flow.stage, Stage::Custom(_) | Stage::Confirm(..))
+        {
+            self.show_destinations();
+            return SessionRelocationAction::Consumed;
+        }
+        match &mut flow.stage {
+            Stage::Custom(buffer) => {
+                if key::RENAME_SESSION.matches(event) {
+                    let directory = buffer.value();
+                    if flow.source_cwd.is_some() {
+                        self.show_sources(Some(Target {
+                            directory,
+                            donor: None,
+                        }));
+                    } else {
+                        self.show_destinations();
+                    }
+                } else if event.code == KeyCode::Enter {
+                    let destination = buffer.value();
+                    self.preview(destination, None);
+                } else {
+                    buffer.handle_key(event);
+                    self.sync_custom();
+                }
+                return SessionRelocationAction::Consumed;
+            }
+            Stage::Confirm(request, donor) => {
+                if key::RENAME_SESSION.matches(event) {
+                    let target = Target {
+                        directory: request.destination.clone(),
+                        donor: donor.clone(),
+                    };
+                    if flow.source_cwd.is_some() {
+                        self.show_sources(Some(target));
+                    } else {
+                        self.show_destinations();
+                    }
+                    return SessionRelocationAction::Consumed;
+                }
+                if key::RELOCATION_CUSTOM.matches(event) {
+                    let destination = request.destination.clone();
+                    self.show_custom(destination);
+                    return SessionRelocationAction::Consumed;
+                }
+                if event.code == KeyCode::Enter {
+                    return self.confirm();
+                }
+                return SessionRelocationAction::Consumed;
+            }
+            Stage::Destination if key::RELOCATION_CUSTOM.matches(event) => {
+                self.show_custom(String::new());
+                return SessionRelocationAction::Consumed;
+            }
+            _ => {}
+        }
+        let action = self.picker.handle_key(event);
+        let result = self.map_action(action);
+        self.sync_selection();
+        result
+    }
+
+    pub fn handle_paste(&mut self, text: &str) -> bool {
+        match self.flow.as_mut().map(|flow| &mut flow.stage) {
+            Some(Stage::Custom(buffer)) => {
+                buffer.insert_text(text);
+                self.sync_custom();
+                true
+            }
+            Some(Stage::Confirm(..)) => true,
+            Some(_) => {
+                let handled = self.picker.handle_paste(text);
+                self.sync_selection();
+                handled
+            }
+            None => false,
+        }
+    }
+
+    pub fn handle_mouse(&mut self, event: MouseEvent) -> SessionRelocationAction {
+        if matches!(
+            self.flow.as_ref().map(|flow| &flow.stage),
+            Some(Stage::Custom(_))
+        ) {
+            return SessionRelocationAction::Consumed;
+        }
+        let action = self.picker.handle_mouse(event);
+        let result = self.map_action(action);
+        self.sync_selection();
+        result
+    }
+
+    pub fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
+        self.picker.view(frame, area)
+    }
+
+    fn show_sources(&mut self, destination: Option<Target>) {
+        let Some(flow) = &mut self.flow else {
+            return;
+        };
+        let mut groups = BTreeMap::new();
+        groups.insert(flow.current_cwd.clone(), 0usize);
+        for location in &flow.locations {
+            *groups.entry(location.cwd.clone()).or_default() += 1;
+        }
+        let items = groups
+            .into_iter()
+            .map(|(cwd, count)| {
+                let missing = if Path::new(&cwd).is_dir() {
+                    ""
+                } else {
+                    " · missing"
+                };
+                Entry {
+                    label: format!("{cwd} · {count} sessions{missing}"),
+                    kind: EntryKind::Source(cwd),
+                }
+            })
+            .collect();
+        flow.stage = Stage::Source(destination);
+        self.picker.set_error_text(None);
+        self.picker.set_info_text(Some(SOURCE_HINT.into()));
+        self.picker.set_footer_builder(source_footer);
+        self.picker.open(items, SOURCE_TITLE);
+        self.picker.select_item_by(|entry| {
+            matches!(&entry.kind, EntryKind::Source(cwd) if Some(cwd) == flow.source_cwd.as_ref())
+        });
+        self.sync_selection();
+    }
+
+    fn show_destinations(&mut self) {
+        let Some(flow) = &mut self.flow else {
+            return;
+        };
+        flow.stage = Stage::Destination;
+        let mut locations: Vec<_> = flow.locations.iter().collect();
+        locations.sort_by(|a, b| {
+            b.updated_at
+                .cmp(&a.updated_at)
+                .then_with(|| a.id.as_bytes().cmp(b.id.as_bytes()))
+        });
+        let mut items = vec![Entry {
+            label: CUSTOM_DIRECTORY.into(),
+            kind: EntryKind::Custom,
+        }];
+        items.extend(locations.into_iter().map(|location| {
+            let title = if location.title.is_empty() {
+                UNTITLED
+            } else {
+                &location.title
+            };
+            Entry {
+                label: format!("{title} · {} · {}", location.id, location.cwd),
+                kind: EntryKind::Destination(location.id, location.cwd.clone()),
+            }
+        }));
+        self.picker.set_error_text(None);
+        self.picker.set_info_text(Some(DESTINATION_HINT.into()));
+        self.picker.set_footer_builder(destination_footer);
+        self.picker.open(items, DESTINATION_TITLE);
+        self.sync_selection();
+    }
+
+    fn sync_selection(&mut self) {
+        let hint = match self.flow.as_ref().map(|flow| &flow.stage) {
+            Some(Stage::Source(_)) => SOURCE_HINT,
+            Some(Stage::Destination) => DESTINATION_HINT,
+            _ => return,
+        };
+        self.picker
+            .set_info_text(Some(self.picker.selected_item().map_or_else(
+                || hint.to_owned(),
+                |entry| format!("{hint}\n{}", entry.label),
+            )));
+    }
+
+    fn show_custom(&mut self, destination: String) {
+        let Some(flow) = &mut self.flow else {
+            return;
+        };
+        let mut buffer = TextBuffer::new(destination);
+        buffer.move_to_end();
+        flow.stage = Stage::Custom(buffer);
+        self.picker.set_error_text(None);
+        self.picker.set_info_text(Some(CUSTOM_HINT.into()));
+        self.picker.set_empty_text(EMPTY_DESTINATION);
+        self.picker.set_footer_builder(custom_footer);
+        self.picker.open(Vec::new(), CUSTOM_TITLE);
+        self.sync_custom();
+    }
+
+    fn sync_custom(&mut self) {
+        if let Some(Flow {
+            stage: Stage::Custom(buffer),
+            ..
+        }) = &self.flow
+        {
+            self.picker.set_search_text(&buffer.value());
+            self.picker.set_search_cursor(buffer.cursor_offset());
+        }
+    }
+
+    fn preview(&mut self, input: String, donor: Option<(CaudraId, String)>) {
+        let Some(flow) = &self.flow else {
+            return;
+        };
+        let result = resolve_destination(
+            &input,
+            Path::new(&flow.current_cwd),
+            paths::home().as_deref(),
+        )
+        .and_then(|destination| {
+            let sessions: Vec<_> = flow
+                .locations
+                .iter()
+                .filter(|location| {
+                    flow.source_cwd
+                        .as_ref()
+                        .map_or(location.id == flow.current_id, |source| {
+                            location.cwd == *source
+                        })
+                })
+                .cloned()
+                .collect();
+            if sessions.is_empty() {
+                return Err(EMPTY_SELECTION.into());
+            }
+            if sessions
+                .iter()
+                .any(|session| same_directory(&session.cwd, &destination))
+            {
+                return Err(SAME_DIRECTORY.into());
+            }
+            Ok(SessionRelocation {
+                sessions,
+                source_cwd: flow.source_cwd.clone(),
+                destination,
+            })
+        });
+        let request = match result {
+            Ok(request) => request,
+            Err(error) => {
+                self.show_custom(input);
+                self.picker.set_error_text(Some(error));
+                return;
+            }
+        };
+        let source = request
+            .source_cwd
+            .as_deref()
+            .unwrap_or(&request.sessions[0].cwd);
+        let closing = if request.source_cwd.is_some() {
+            0
+        } else {
+            flow.other_open_count
+        };
+        let info = format!(
+            "Source: {source}\nDestination: {}\n{AFFECTED_LABEL}: {}\n{CLOSING_LABEL}: {closing}\n{FILES_UNCHANGED}",
+            request.destination,
+            request.sessions.len(),
+        );
+        if let Some(flow) = &mut self.flow {
+            flow.stage = Stage::Confirm(request, donor);
+        }
+        self.picker.set_error_text(None);
+        self.picker.set_info_text(Some(info));
+        self.picker.set_footer_builder(confirm_footer);
+        self.picker.open(
+            vec![Entry {
+                label: CONFIRM.into(),
+                kind: EntryKind::Confirm,
+            }],
+            CONFIRM_TITLE,
+        );
+    }
+
+    fn confirm(&mut self) -> SessionRelocationAction {
+        if !matches!(
+            self.flow.as_ref().map(|flow| &flow.stage),
+            Some(Stage::Confirm(..))
+        ) {
+            return SessionRelocationAction::Consumed;
+        }
+        self.picker.close();
+        match self.flow.take().map(|flow| flow.stage) {
+            Some(Stage::Confirm(request, donor)) => {
+                SessionRelocationAction::Confirm(request, donor)
+            }
+            _ => SessionRelocationAction::Consumed,
+        }
+    }
+
+    fn map_action(&mut self, action: PickerAction<Entry>) -> SessionRelocationAction {
+        match action {
+            PickerAction::Close => {
+                self.close();
+                return SessionRelocationAction::Closed;
+            }
+            PickerAction::Select(entry) => match entry.kind {
+                EntryKind::Source(source) => {
+                    let Some(flow) = &mut self.flow else {
+                        return SessionRelocationAction::Consumed;
+                    };
+                    flow.source_cwd = Some(source);
+                    let previous = mem::replace(&mut flow.stage, Stage::Destination);
+                    if let Stage::Source(Some(target)) = previous {
+                        self.preview(target.directory, target.donor);
+                    } else {
+                        self.show_destinations();
+                    }
+                }
+                EntryKind::Destination(id, cwd) => self.preview(cwd.clone(), Some((id, cwd))),
+                EntryKind::Custom => self.show_custom(String::new()),
+                EntryKind::Confirm => return self.confirm(),
+            },
+            PickerAction::Consumed | PickerAction::Toggle(..) => {}
+        }
+        SessionRelocationAction::Consumed
+    }
+}
+
+impl Overlay for SessionRelocationPicker {
+    fn is_open(&self) -> bool {
+        self.is_open()
+    }
+
+    fn close(&mut self) {
+        self.close();
+    }
+
+    fn cadence(&self) -> Cadence {
+        self.cadence()
+    }
+}
+
+fn resolve_destination(
+    input: &str,
+    current_cwd: &Path,
+    home: Option<&Path>,
+) -> Result<String, String> {
+    if input.is_empty() {
+        return Err(EMPTY_DESTINATION.into());
+    }
+    let path = if input == "~" {
+        home.ok_or(MISSING_HOME)?.to_path_buf()
+    } else if let Some(rest) = input.strip_prefix("~/") {
+        home.ok_or(MISSING_HOME)?.join(rest.trim_start_matches('/'))
+    } else if input.starts_with('~') {
+        return Err(UNSUPPORTED_TILDE.into());
+    } else {
+        current_cwd.join(input)
+    };
+    let canonical = fs::canonicalize(&path)
+        .map_err(|error| format!("{CANNOT_OPEN} {}: {error}", path.display()))?;
+    if !canonical.is_dir() {
+        return Err(format!("{NOT_DIRECTORY}: {}", canonical.display()));
+    }
+    fs::read_dir(&canonical)
+        .map_err(|error| format!("Cannot access {}: {error}", canonical.display()))?;
+    canonical
+        .into_os_string()
+        .into_string()
+        .map_err(|_| NON_UTF8_DESTINATION.into())
+}
+
+fn same_directory(source: &str, destination: &str) -> bool {
+    source == destination
+        || fs::canonicalize(source).ok().as_deref() == Some(Path::new(destination))
+}
+
+fn source_footer() -> Line<'static> {
+    hint_line(&[("Enter", "choose source"), ("Esc", "cancel")])
+}
+
+fn destination_footer() -> Line<'static> {
+    hint_line(&[
+        ("Enter", "choose"),
+        (key::RELOCATION_CUSTOM.label, "Custom directory"),
+        ("Esc", "cancel"),
+    ])
+}
+
+fn custom_footer() -> Line<'static> {
+    hint_line(&[
+        ("Enter", "preview"),
+        (key::RENAME_SESSION.label, "change selection"),
+        ("Tab", DESTINATIONS_LABEL),
+        ("Esc", "cancel"),
+    ])
+}
+
+fn confirm_footer() -> Line<'static> {
+    hint_line(&[
+        ("Enter", "confirm"),
+        (key::RENAME_SESSION.label, "change selection"),
+        ("Tab", DESTINATIONS_LABEL),
+        (key::RELOCATION_CUSTOM.label, "directory"),
+        ("Esc", "cancel"),
+    ])
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::Path;
+
+    use caudra_storage::id::CaudraId;
+    use caudra_storage::sessions::SessionLocation;
+    use crossterm::event::{
+        KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::layout::{Position, Rect};
+    use tempfile::{TempDir, tempdir};
+    use test_case::test_case;
+
+    use super::{
+        AFFECTED_LABEL, CANNOT_OPEN, CLOSING_LABEL, CONFIRM, CUSTOM_DIRECTORY, DESTINATIONS_LABEL,
+        EMPTY_DESTINATION, EMPTY_SELECTION, EntryKind, FILES_UNCHANGED, MISSING_HOME,
+        NOT_DIRECTORY, SAME_DIRECTORY, SessionRelocationAction, SessionRelocationPicker, Stage,
+        UNSUPPORTED_TILDE, resolve_destination,
+    };
+    use crate::components::keybindings::key;
+
+    const SOURCE: &str = "source";
+    const TARGET: &str = "target with spaces";
+    const HOME: &str = "home";
+    const OLD: &str = "deleted source";
+    const TITLE: &str = "same title";
+    const WRITE_VERSION: i64 = 7;
+    const UPDATED_AT: u64 = 42;
+    const CURRENT: u8 = 1;
+    const SIBLING: u8 = 2;
+    const DONOR: u8 = 3;
+    const CHILD: u8 = 4;
+    const OTHER_OPEN_COUNT: usize = 2;
+    const SCREEN_WIDTH: u16 = 120;
+    const SCREEN_HEIGHT: u16 = 40;
+
+    fn workspace() -> TempDir {
+        let root = tempdir().unwrap();
+        for directory in [SOURCE, TARGET, HOME] {
+            fs::create_dir(root.path().join(directory)).unwrap();
+        }
+        fs::create_dir(root.path().join(HOME).join(TARGET)).unwrap();
+        root
+    }
+
+    fn path_string(path: &Path) -> String {
+        path.to_str().unwrap().to_owned()
+    }
+
+    fn location(tag: u8, cwd: &Path) -> SessionLocation {
+        SessionLocation {
+            id: CaudraId::from_bytes([tag; 16]),
+            title: TITLE.into(),
+            cwd: path_string(cwd),
+            updated_at: UPDATED_AT,
+            write_version: WRITE_VERSION,
+        }
+    }
+
+    fn press(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn opened(root: &Path, bulk: bool, destination: Option<String>) -> SessionRelocationPicker {
+        let source = root.join(SOURCE);
+        let current = location(CURRENT, &source);
+        let mut picker = SessionRelocationPicker::new();
+        picker.open(
+            current.id,
+            current.cwd.clone(),
+            vec![
+                current,
+                location(SIBLING, &source),
+                location(DONOR, &root.join(TARGET)),
+            ],
+            bulk,
+            destination,
+            OTHER_OPEN_COUNT,
+        );
+        picker
+    }
+
+    fn render(picker: &mut SessionRelocationPicker) -> (String, Position) {
+        let mut terminal = Terminal::new(TestBackend::new(SCREEN_WIDTH, SCREEN_HEIGHT)).unwrap();
+        terminal
+            .draw(|frame| {
+                picker.view(frame, Rect::new(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT));
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let mut text = String::new();
+        let mut confirm = Position::default();
+        for y in 0..SCREEN_HEIGHT {
+            let line: String = (0..SCREEN_WIDTH)
+                .map(|x| buffer.cell((x, y)).unwrap().symbol())
+                .collect();
+            if let Some(x) = line.find(CONFIRM) {
+                confirm = Position::new(line[..x].chars().count() as u16, y);
+            }
+            text.push_str(line.trim_end());
+            text.push('\n');
+        }
+        (text, confirm)
+    }
+
+    #[test_case("target with spaces", "target with spaces"; "relative_spaces")]
+    #[test_case("./target with spaces/..", ""; "canonical_parent")]
+    #[test_case("~", "home"; "home_directory")]
+    #[test_case("~/target with spaces", "home/target with spaces"; "home_child")]
+    fn destination_resolution(input: &str, expected: &str) {
+        let root = workspace();
+        let resolved =
+            resolve_destination(input, root.path(), Some(&root.path().join(HOME))).unwrap();
+        assert_eq!(
+            resolved,
+            path_string(&fs::canonicalize(root.path().join(expected)).unwrap())
+        );
+    }
+
+    #[test_case("", EMPTY_DESTINATION; "empty")]
+    #[test_case("~", MISSING_HOME; "missing_home")]
+    #[test_case("~another", UNSUPPORTED_TILDE; "named_user")]
+    fn destination_resolution_errors(input: &str, expected: &str) {
+        let root = workspace();
+        assert_eq!(
+            resolve_destination(input, root.path(), None).unwrap_err(),
+            expected
+        );
+    }
+
+    #[test_case(false; "missing")]
+    #[test_case(true; "file")]
+    fn invalid_destination_stays_editable(file_exists: bool) {
+        let root = workspace();
+        let invalid = root.path().join(OLD);
+        if file_exists {
+            fs::write(&invalid, TITLE).unwrap();
+        }
+        let picker = opened(root.path(), false, Some(path_string(&invalid)));
+        assert!(matches!(
+            picker.flow.as_ref().unwrap().stage,
+            Stage::Custom(_)
+        ));
+        let prefix = if file_exists {
+            NOT_DIRECTORY
+        } else {
+            CANNOT_OPEN
+        };
+        assert!(picker.picker.error_text().unwrap().starts_with(prefix));
+    }
+
+    #[test_case(false; "exact")]
+    #[test_case(true; "canonical_alias")]
+    fn same_directory_is_an_explicit_noop(alias: bool) {
+        let root = workspace();
+        let source = root.path().join(SOURCE);
+        let destination = if alias { source.join(".") } else { source };
+        let mut picker = opened(root.path(), false, Some(path_string(&destination)));
+        assert_eq!(picker.picker.error_text(), Some(SAME_DIRECTORY));
+        assert!(matches!(
+            picker.handle_key(press(KeyCode::Enter)),
+            SessionRelocationAction::Consumed
+        ));
+        assert!(picker.is_open());
+    }
+
+    #[test_case(false; "current_not_checkpointed")]
+    #[test_case(true; "empty_source")]
+    fn empty_inventory_never_confirms(bulk: bool) {
+        let root = workspace();
+        let current = location(CURRENT, &root.path().join(SOURCE));
+        let mut picker = SessionRelocationPicker::new();
+        picker.open(
+            current.id,
+            current.cwd,
+            Vec::new(),
+            bulk,
+            Some(path_string(&root.path().join(TARGET))),
+            0,
+        );
+        if bulk {
+            picker.handle_key(press(KeyCode::Enter));
+        }
+        assert_eq!(picker.picker.error_text(), Some(EMPTY_SELECTION));
+        assert!(matches!(
+            picker.handle_key(press(KeyCode::Enter)),
+            SessionRelocationAction::Consumed
+        ));
+    }
+
+    #[test_case(false; "keyboard")]
+    #[test_case(true; "mouse")]
+    fn current_move_preview_and_confirmation(mouse: bool) {
+        let root = workspace();
+        let destination = path_string(&root.path().join(TARGET));
+        let mut picker = opened(root.path(), false, Some(destination.clone()));
+        let (text, confirm) = render(&mut picker);
+        assert!(text.contains(FILES_UNCHANGED));
+        assert!(text.contains(&format!("{CLOSING_LABEL}: {OTHER_OPEN_COUNT}")));
+        assert!(text.contains(&format!("{AFFECTED_LABEL}: 1")));
+        assert!(picker.contains(confirm));
+        let action = if mouse {
+            let event = MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: confirm.x,
+                row: confirm.y,
+                modifiers: KeyModifiers::NONE,
+            };
+            assert!(matches!(
+                picker.handle_mouse(event),
+                SessionRelocationAction::Consumed
+            ));
+            picker.handle_mouse(MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                ..event
+            })
+        } else {
+            picker.handle_key(press(KeyCode::Enter))
+        };
+        let SessionRelocationAction::Confirm(request, donor) = action else {
+            panic!("{action:?}")
+        };
+        assert_eq!(
+            request.sessions,
+            vec![location(CURRENT, &root.path().join(SOURCE))]
+        );
+        assert_eq!(request.source_cwd, None);
+        assert_eq!(request.destination, destination);
+        assert_eq!(donor, None);
+        assert!(!picker.is_open());
+        assert!(root.path().join(SOURCE).is_dir());
+    }
+
+    #[test_case(1; "up")]
+    #[test_case(-1; "down")]
+    fn scrolling_cancels_a_pressed_confirmation(delta: i32) {
+        let root = workspace();
+        let mut picker = opened(
+            root.path(),
+            false,
+            Some(path_string(&root.path().join(TARGET))),
+        );
+        let (_, confirm) = render(&mut picker);
+        let event = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: confirm.x,
+            row: confirm.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        picker.handle_mouse(event);
+        picker.scroll(delta);
+        assert!(matches!(
+            picker.handle_mouse(MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                ..event
+            }),
+            SessionRelocationAction::Consumed
+        ));
+        assert!(picker.is_open());
+        assert!(matches!(
+            picker.handle_key(press(KeyCode::Enter)),
+            SessionRelocationAction::Confirm(..)
+        ));
+    }
+
+    #[test_case(false; "without_prefill")]
+    #[test_case(true; "with_prefill")]
+    fn bulk_source_is_exact_and_editable(prefill: bool) {
+        let root = workspace();
+        let source = root.path().join(SOURCE);
+        let old = root.path().join(OLD);
+        let destination = path_string(&root.path().join(TARGET));
+        let current = location(CURRENT, &source);
+        let expected = location(SIBLING, &old);
+        let mut picker = SessionRelocationPicker::new();
+        picker.open(
+            current.id,
+            current.cwd.clone(),
+            vec![
+                current,
+                expected.clone(),
+                location(CHILD, &old.join(SOURCE)),
+            ],
+            true,
+            prefill.then(|| destination.clone()),
+            OTHER_OPEN_COUNT,
+        );
+        assert!(
+            matches!(&picker.picker.selected_item().unwrap().kind, EntryKind::Source(cwd) if cwd == &path_string(&source))
+        );
+        picker.picker.select_item_by(
+            |entry| matches!(&entry.kind, EntryKind::Source(cwd) if cwd == &path_string(&old)),
+        );
+        picker.handle_key(press(KeyCode::Enter));
+        if !prefill {
+            picker.handle_key(key::RELOCATION_CUSTOM.to_key_event());
+            picker.handle_paste(&destination);
+            picker.handle_key(press(KeyCode::Enter));
+        }
+        let SessionRelocationAction::Confirm(request, _) = picker.handle_key(press(KeyCode::Enter))
+        else {
+            panic!()
+        };
+        assert_eq!(request.sessions, vec![expected]);
+        assert_eq!(request.source_cwd.as_deref(), old.to_str());
+        assert!(!old.exists());
+    }
+
+    #[test_case(false; "current")]
+    #[test_case(true; "bulk_change_source")]
+    fn destination_identity_survives_confirmation(bulk: bool) {
+        let root = workspace();
+        let mut picker = opened(root.path(), bulk, None);
+        if bulk {
+            picker.handle_key(press(KeyCode::Enter));
+        }
+        let donor = location(DONOR, &root.path().join(TARGET));
+        let labels: Vec<_> = (0..)
+            .map_while(|index| picker.picker.item(index))
+            .map(|entry| entry.label.clone())
+            .collect();
+        assert_eq!(labels[0], CUSTOM_DIRECTORY);
+        assert!(
+            labels
+                .iter()
+                .any(|label| label.contains(&donor.id.to_string()) && label.contains(&donor.cwd))
+        );
+        picker.picker.select_item_by(
+            |entry| matches!(&entry.kind, EntryKind::Destination(id, _) if *id == donor.id),
+        );
+        picker.handle_key(press(KeyCode::Enter));
+        if bulk {
+            picker.handle_key(key::RENAME_SESSION.to_key_event());
+            picker.handle_key(press(KeyCode::Enter));
+        }
+        let SessionRelocationAction::Confirm(request, selected) =
+            picker.handle_key(press(KeyCode::Enter))
+        else {
+            panic!()
+        };
+        assert_eq!(selected, Some((donor.id, donor.cwd)));
+        assert_eq!(request.sessions.len(), if bulk { 2 } else { 1 });
+    }
+
+    #[test_case(false, false; "custom")]
+    #[test_case(true, false; "prefilled_confirmation")]
+    #[test_case(true, true; "session_confirmation")]
+    fn bulk_can_return_to_destination_sessions(confirm: bool, from_session: bool) {
+        let root = workspace();
+        let destination = path_string(&root.path().join(TARGET));
+        let mut picker = opened(root.path(), true, (!from_session).then_some(destination));
+        let previous = location(DONOR, &root.path().join(TARGET));
+        let replacement = location(CHILD, &root.path().join(HOME));
+        picker
+            .flow
+            .as_mut()
+            .unwrap()
+            .locations
+            .push(replacement.clone());
+        picker.handle_key(press(KeyCode::Enter));
+        if from_session {
+            picker.picker.select_item_by(
+                |entry| matches!(&entry.kind, EntryKind::Destination(id, _) if *id == previous.id),
+            );
+            picker.handle_key(press(KeyCode::Enter));
+        }
+        if !confirm {
+            picker.handle_key(key::RELOCATION_CUSTOM.to_key_event());
+        }
+        assert!(render(&mut picker).0.contains(DESTINATIONS_LABEL));
+        picker.handle_key(press(KeyCode::Tab));
+        assert!(matches!(
+            picker.flow.as_ref().unwrap().stage,
+            Stage::Destination
+        ));
+        assert_eq!(picker.picker.error_text(), None);
+        picker.picker.select_item_by(
+            |entry| matches!(&entry.kind, EntryKind::Destination(id, _) if *id == replacement.id),
+        );
+        picker.handle_key(press(KeyCode::Enter));
+        let SessionRelocationAction::Confirm(request, donor) =
+            picker.handle_key(press(KeyCode::Enter))
+        else {
+            panic!()
+        };
+        assert_eq!(
+            request.source_cwd,
+            Some(path_string(&root.path().join(SOURCE)))
+        );
+        assert_eq!(request.sessions.len(), 2);
+        assert_eq!(request.destination, replacement.cwd);
+        assert_eq!(donor, Some((replacement.id, replacement.cwd)));
+    }
+
+    #[test_case(false; "valid_prefill")]
+    #[test_case(true; "invalid_prefill")]
+    fn bulk_custom_can_change_source_with_prefill(invalid: bool) {
+        let root = workspace();
+        let destination = path_string(&root.path().join(if invalid { OLD } else { TARGET }));
+        let mut picker = opened(root.path(), true, Some(destination.clone()));
+        let replacement = location(CHILD, &root.path().join(HOME));
+        picker
+            .flow
+            .as_mut()
+            .unwrap()
+            .locations
+            .push(replacement.clone());
+        picker.handle_key(press(KeyCode::Enter));
+        if !invalid {
+            picker.handle_key(key::RELOCATION_CUSTOM.to_key_event());
+        }
+        picker.handle_key(key::RENAME_SESSION.to_key_event());
+        assert!(matches!(
+            &picker.flow.as_ref().unwrap().stage,
+            Stage::Source(Some(target)) if target.directory == destination && target.donor.is_none()
+        ));
+        picker.picker.select_item_by(
+            |entry| matches!(&entry.kind, EntryKind::Source(cwd) if *cwd == replacement.cwd),
+        );
+        picker.handle_key(press(KeyCode::Enter));
+        assert_eq!(
+            picker.flow.as_ref().unwrap().source_cwd.as_ref(),
+            Some(&replacement.cwd)
+        );
+        if invalid {
+            assert_eq!(picker.picker.search_text(), destination);
+            assert!(picker.picker.error_text().unwrap().starts_with(CANNOT_OPEN));
+        } else {
+            let SessionRelocationAction::Confirm(request, None) =
+                picker.handle_key(press(KeyCode::Enter))
+            else {
+                panic!()
+            };
+            assert_eq!(request.sessions, vec![replacement]);
+            assert_eq!(request.destination, destination);
+        }
+    }
+
+    #[test_case(0; "source")]
+    #[test_case(1; "destination")]
+    #[test_case(2; "custom")]
+    #[test_case(3; "confirmation")]
+    fn escape_cancels_every_stage(stage: usize) {
+        let root = workspace();
+        let mut picker = opened(
+            root.path(),
+            stage == 0,
+            (stage == 3).then(|| path_string(&root.path().join(TARGET))),
+        );
+        if stage == 2 {
+            picker.handle_key(key::RELOCATION_CUSTOM.to_key_event());
+        }
+        assert!(matches!(
+            picker.handle_key(press(KeyCode::Esc)),
+            SessionRelocationAction::Closed
+        ));
+        assert!(!picker.is_open());
+        assert!(matches!(
+            picker.handle_key(press(KeyCode::Enter)),
+            SessionRelocationAction::Consumed
+        ));
+        assert!(!picker.handle_paste(TITLE));
+    }
+
+    #[test_case(false; "custom_entry")]
+    #[test_case(true; "custom_shortcut_after_filter")]
+    fn custom_input_echoes_paste_and_resolves_against_invoking_cwd(shortcut: bool) {
+        let root = workspace();
+        let mut picker = opened(root.path(), false, None);
+        if shortcut {
+            picker.handle_paste(TITLE);
+            picker.handle_key(key::RELOCATION_CUSTOM.to_key_event());
+        } else {
+            picker.handle_key(press(KeyCode::Enter));
+        }
+        let input = format!("../{TARGET}");
+        assert!(picker.handle_paste(&input));
+        assert_eq!(picker.picker.search_text(), input);
+        picker.handle_key(press(KeyCode::Enter));
+        let SessionRelocationAction::Confirm(request, None) =
+            picker.handle_key(press(KeyCode::Enter))
+        else {
+            panic!()
+        };
+        assert_eq!(request.destination, path_string(&root.path().join(TARGET)));
+    }
+}

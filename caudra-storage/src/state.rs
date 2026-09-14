@@ -3,14 +3,16 @@
 //! open tabs of a workspace. Each is one JSON row in the `state` table of the
 //! session database, so they share its lock, durability, and migration path.
 
+use std::collections::HashSet;
 use std::path::Path;
 
+use rusqlite::{OptionalExtension, Transaction, params};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::id::CaudraId;
-use crate::sessions::SessionDatabase;
+use crate::sessions::{SessionDatabase, SessionError};
 use crate::{StateClass, StateDir, StorageError};
 
 pub const SCOPE_GLOBAL: &str = "global";
@@ -193,6 +195,64 @@ pub fn write_workspace_tabs(
         return Ok(());
     }
     set(dir, &project_scope(cwd), WORKSPACE_TABS_KEY, tabs)
+}
+
+pub(crate) fn write_relocated_workspace_tabs(
+    transaction: &Transaction<'_>,
+    cwd: &str,
+    tabs: &WorkspaceTabs,
+) -> Result<(), SessionError> {
+    let value = serde_json::to_string(tabs).map_err(StorageError::from)?;
+    transaction.execute(
+        "INSERT INTO state (scope, key, value, updated_at) \
+         VALUES (?1, ?2, ?3, unixepoch()) \
+         ON CONFLICT(scope, key) DO UPDATE SET \
+             value = excluded.value, updated_at = excluded.updated_at",
+        params![
+            project_scope(Path::new(cwd)),
+            WORKSPACE_TABS_KEY.name,
+            value
+        ],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn remove_relocated_workspace_tabs(
+    transaction: &Transaction<'_>,
+    cwd: &str,
+    moved: &HashSet<CaudraId>,
+) -> Result<(), SessionError> {
+    let scopes = HashSet::from([
+        format!("{PROJECT_SCOPE_PREFIX}{cwd}"),
+        project_scope(Path::new(cwd)),
+    ]);
+    for scope in scopes {
+        let stored: Option<String> = transaction
+            .query_row(
+                "SELECT value FROM state WHERE scope = ?1 AND key = ?2",
+                params![scope, WORKSPACE_TABS_KEY.name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(stored) = stored else {
+            continue;
+        };
+        let mut tabs: WorkspaceTabs = serde_json::from_str(&stored).map_err(StorageError::from)?;
+        let original = tabs.clone();
+        tabs.open.retain(|id| !moved.contains(id));
+        if tabs.focused.is_some_and(|id| !tabs.open.contains(&id)) {
+            tabs.focused = tabs.open.first().copied();
+        }
+        if tabs == original {
+            continue;
+        }
+        let value = serde_json::to_string(&tabs).map_err(StorageError::from)?;
+        transaction.execute(
+            "UPDATE state SET value = ?1, updated_at = unixepoch() WHERE scope = ?2 AND key = ?3",
+            params![value, scope, WORKSPACE_TABS_KEY.name],
+        )?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

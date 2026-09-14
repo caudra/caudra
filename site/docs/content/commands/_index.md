@@ -45,6 +45,8 @@ Commands marked Main only act on the main session's turn or history. They stay l
 | `/permissions` | Inspect active conversation permission rules |  |
 | `/login` | Authenticate with an LLM provider |  |
 | `/cd` | Change working directory |  |
+| `/move-session` | Move the current session to an existing directory (optional directory) | Main only |
+| `/migrate-sessions` | Migrate sessions with one exact stored cwd (optional destination directory) | Main only |
 | `/btw` | Ask a quick question (no tools, no history pollution) | Main only |
 | `/goal` | Work until a completion condition is met | Main only |
 | `/goal-clear` | Stop the active completion goal | Main only |

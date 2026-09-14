@@ -820,7 +820,7 @@ fn trim_run_children(
     Ok(counted)
 }
 
-fn interrupt_runs(
+pub(super) fn interrupt_runs(
     connection: &Connection,
     session_id: CaudraId,
     statuses: &[WorkflowRunStatus],

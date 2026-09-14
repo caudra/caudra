@@ -465,6 +465,7 @@ impl App {
         render_if_open!(self.workflow_inspector);
         render_if_open!(self.workflow_catalog_picker);
         render_if_open!(self.session_picker);
+        render_if_open!(self.session_relocation_picker);
 
         overlay_rect
     }

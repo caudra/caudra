@@ -36,6 +36,7 @@ pub(crate) mod rewind_picker;
 pub(crate) mod scrollbar;
 pub(crate) mod search_modal;
 pub(crate) mod session_picker;
+pub(crate) mod session_relocation;
 pub(crate) mod skills_modal;
 pub(crate) mod split_layout;
 pub(crate) mod stash_picker;
@@ -66,6 +67,7 @@ use caudra_agent::tools::{SHELL_TOOL_NAME, ToolEffect};
 use caudra_agent::{BufferSnapshot, ImageSource, SubagentProgress, ToolInput, ToolOutput};
 use caudra_providers::model_registry::Binding;
 use caudra_providers::{CaudraId, HistoryItem, ModelPurpose};
+use caudra_storage::sessions::SessionRelocation;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
 use ratatui::style::Style;
@@ -681,6 +683,14 @@ pub enum Action {
     RewindSession(rewind_picker::RewindEntry),
     UnrevertSession,
     ChangeWorkingDirectory(PathBuf),
+    OpenSessionRelocation {
+        bulk: bool,
+        destination: Option<String>,
+    },
+    RelocateSessions {
+        request: SessionRelocation,
+        donor: Option<(CaudraId, String)>,
+    },
     ChangeRemoteWorkingDirectory(caudra_workspace::DirectoryNavigation),
     RemoteControl(String),
     ChangeModel(String),

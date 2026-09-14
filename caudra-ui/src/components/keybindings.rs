@@ -219,6 +219,17 @@ pub mod key {
     pub const NEW_SESSION: Bind = ctrl_bind!('n');
     pub const RENAME_SESSION: Bind = ctrl_bind!('r');
     pub const GENERATE_TITLE: Bind = ctrl_bind!('g');
+    pub const MOVE_SESSION: Bind = Bind {
+        code: KeyCode::F(2),
+        modifiers: KeyModifiers::NONE,
+        label: "F2",
+    };
+    pub const MIGRATE_SESSIONS: Bind = Bind {
+        code: KeyCode::F(3),
+        modifiers: KeyModifiers::NONE,
+        label: "F3",
+    };
+    pub const RELOCATION_CUSTOM: Bind = ctrl_bind!('o');
     pub const REFRESH: Bind = ctrl_bind!('r');
     pub const SUSPEND: Bind = ctrl_bind!('z');
     pub const DELETE: Bind = ctrl_bind!('d');
@@ -296,6 +307,7 @@ pub enum KeybindContext {
     FilePicker,
     StashPicker,
     SessionPicker,
+    SessionRelocation,
     WorkflowInspector,
     WorkflowCatalogPicker,
     Workbench,
@@ -325,6 +337,7 @@ impl KeybindContext {
             Self::FilePicker => "File Picker",
             Self::StashPicker => "Stash Picker",
             Self::SessionPicker => "Session Picker",
+            Self::SessionRelocation => "Session Relocation",
             Self::WorkflowInspector => "Workflow Inspector",
             Self::WorkflowCatalogPicker => "Workflow Catalog",
             Self::Workbench => "Workbench",
@@ -346,6 +359,7 @@ impl KeybindContext {
             | Self::FilePicker
             | Self::StashPicker
             | Self::SessionPicker
+            | Self::SessionRelocation
             | Self::WorkflowInspector
             | Self::WorkflowCatalogPicker => Some(Self::Picker),
             Self::WorkbenchExplorer
@@ -989,6 +1003,30 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::All,
     },
     Keybind {
+        label: KeyLabel::Single(key::MOVE_SESSION.label),
+        description: "Move current session",
+        context: KeybindContext::SessionPicker,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(key::MIGRATE_SESSIONS.label),
+        description: "Migrate directory sessions",
+        context: KeybindContext::SessionPicker,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(key::RELOCATION_CUSTOM.label),
+        description: "Enter a custom destination directory",
+        context: KeybindContext::SessionRelocation,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(key::RENAME_SESSION.label),
+        description: "Change relocation source or destination selection",
+        context: KeybindContext::SessionRelocation,
+        platform: Platform::All,
+    },
+    Keybind {
         label: KeyLabel::Single(key::RENAME_SESSION.label),
         description: "Rename session",
         context: KeybindContext::SessionPicker,
@@ -1359,6 +1397,22 @@ mod tests {
         "this chord is the same byte as Backspace, Tab or Enter and would steal it";
     const CHORD_COLLISION: &str = "two leader chords in one context answer the same second key";
     const LEADER_DRIFT: &str = "the workbench and the host must spend the same key on the prefix";
+
+    #[test_case(key::MOVE_SESSION; "move_current")]
+    #[test_case(key::MIGRATE_SESSIONS; "migrate")]
+    fn relocation_bindings_do_not_collide_with_picker_actions(binding: Bind) {
+        for other in [
+            key::NEW_SESSION,
+            key::RENAME_SESSION,
+            key::GENERATE_TITLE,
+            key::DELETE,
+            key::QUIT,
+            key::HELP,
+        ] {
+            assert!(!other.matches(binding.to_key_event()));
+        }
+        assert_ne!(key::MOVE_SESSION.code, key::MIGRATE_SESSIONS.code);
+    }
 
     #[test_case(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL), "ctrl+d")]
     #[test_case(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT), "alt+x")]

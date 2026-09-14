@@ -51,8 +51,8 @@ use caudra_storage::id::CaudraId;
 use caudra_storage::prompt_stash::{PromptStash, StashEntry};
 use caudra_storage::sessions::{
     PendingConversationRevert, PendingRestoreKind, PendingRestoreOperation, PendingRestorePhase,
-    StoredActiveGoal, StoredGoalVerdict, StoredImage, StoredMode, StoredPasteRange,
-    StoredPromptAdmission, StoredQueuedDraft, StoredQueuedPrompt, StoredSubagent,
+    SessionLocation, StoredActiveGoal, StoredGoalVerdict, StoredImage, StoredMode,
+    StoredPasteRange, StoredPromptAdmission, StoredQueuedDraft, StoredQueuedPrompt, StoredSubagent,
     StoredSubagentOutcome, StoredTokenUsage,
 };
 use caudra_storage::thinking::StoredThinking;
@@ -74,6 +74,12 @@ use tempfile::TempDir;
 use test_case::test_case;
 
 const WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+const RELOCATION_DESTINATION: &str = "destination with spaces";
+const RELOCATION_DRAFT: &str = "keep this draft";
+const RELOCATION_WRITE_VERSION: i64 = 7;
+const RELOCATION_OTHER_OPEN_COUNT: usize = 2;
+const RELOCATION_CONFIRM_TITLE: &str = "Confirm session relocation";
+const RELOCATION_CONFIRM: &str = "Confirm relocation";
 /// What [`test_model`] answers as, so a turn recorded in a test lands under
 /// the session's own provider the way a real one does.
 const TEST_PROVIDER: &str = "anthropic";
@@ -10007,6 +10013,174 @@ fn fork_fails_when_referenced_managed_output_is_missing() {
     assert!(error.contains(&source_session_id.to_string()));
 }
 
+#[test_case("/move-session", false, None; "move_picker")]
+#[test_case("/migrate-sessions", true, None; "migrate_picker")]
+#[test_case("/move-session destination with spaces", false, Some(RELOCATION_DESTINATION); "move_destination")]
+#[test_case("/migrate-sessions destination with spaces", true, Some(RELOCATION_DESTINATION); "migrate_destination")]
+#[test_case("  /MOVE-SESSION destination with spaces  ", false, Some(RELOCATION_DESTINATION); "normalized_command")]
+fn relocation_commands_request_runtime_preflight(
+    command: &str,
+    bulk: bool,
+    destination: Option<&str>,
+) {
+    let mut app = test_app();
+    let actions = app.run_cmdline(command, 0).unwrap();
+    assert!(matches!(
+        &actions[..],
+        [Action::OpenSessionRelocation { bulk: actual_bulk, destination: actual_destination }]
+            if *actual_bulk == bulk && actual_destination.as_deref() == destination
+    ));
+    assert!(!app.session_relocation_picker.is_open());
+}
+
+#[test_case(kb::MOVE_SESSION, false; "move_current")]
+#[test_case(kb::MIGRATE_SESSIONS, true; "migrate_directory")]
+fn session_picker_relocation_keys_request_runtime_preflight(bind: Bind, bulk: bool) {
+    let mut app = test_app();
+    app.sessions_browse();
+    let actions = app.update(Msg::Key(bind.to_key_event()));
+    assert!(matches!(
+        &actions[..],
+        [Action::OpenSessionRelocation { bulk: actual_bulk, destination: None }]
+            if *actual_bulk == bulk
+    ));
+    assert!(!app.session_picker.is_open());
+    assert!(!app.session_relocation_picker.is_open());
+}
+
+fn open_relocation_picker(app: &mut App) {
+    app.open_session_relocation(Vec::new(), false, None, 0);
+}
+
+#[test_case(false; "escape")]
+#[test_case(true; "close_all")]
+fn relocation_cancellation_preserves_the_draft(close_all: bool) {
+    let mut app = test_app();
+    app.update(Msg::Paste(RELOCATION_DRAFT.into()));
+    open_relocation_picker(&mut app);
+    assert!(app.has_modal_overlay());
+    if close_all {
+        app.close_all_overlays();
+    } else {
+        assert!(app.update(Msg::Key(key(KeyCode::Esc))).is_empty());
+    }
+    assert!(!app.any_overlay_open());
+    assert_eq!(app.input_box.buffer.value(), RELOCATION_DRAFT);
+}
+
+#[test_case(false, false; "composer_keyboard")]
+#[test_case(true, false; "workbench_keyboard")]
+#[test_case(false, true; "composer_mouse")]
+#[test_case(true, true; "workbench_mouse")]
+fn relocation_custom_destination_paste_reaches_confirmation(workbench: bool, mouse: bool) {
+    let (_temp, storage, writer, mut app) = tempdir_app();
+    let destination = TempDir::new().unwrap();
+    let destination = destination.path().canonicalize().unwrap();
+    let destination_text = destination.to_str().unwrap();
+    let location = SessionLocation {
+        id: app.state.session.id,
+        title: String::new(),
+        cwd: app.state.session.cwd.clone(),
+        updated_at: 0,
+        write_version: RELOCATION_WRITE_VERSION,
+    };
+    let generation = writer.generation();
+    app.update(Msg::Paste(RELOCATION_DRAFT.into()));
+    if workbench {
+        app.run_builtin(BuiltinAction::Workbench);
+    }
+    app.open_session_relocation(
+        vec![location.clone()],
+        false,
+        None,
+        RELOCATION_OTHER_OPEN_COUNT,
+    );
+    assert!(
+        app.update(Msg::Key(kb::RELOCATION_CUSTOM.to_key_event()))
+            .is_empty()
+    );
+    assert!(app.update(Msg::Paste(destination_text.into())).is_empty());
+    assert_eq!(app.input_box.buffer.value(), RELOCATION_DRAFT);
+    assert!(app.update(Msg::Key(key(KeyCode::Enter))).is_empty());
+    assert!(rendered(&mut app).contains(RELOCATION_CONFIRM_TITLE));
+    assert!(app.update(Msg::Paste(RELOCATION_DRAFT.into())).is_empty());
+    let actions = if mouse {
+        let (row, column) = screen_hit(&mut app, RELOCATION_CONFIRM);
+        assert!(
+            app.update(mouse_event(
+                MouseEventKind::Down(MouseButton::Left),
+                column,
+                row
+            ))
+            .is_empty()
+        );
+        assert!(app.selection_state.is_none());
+        app.update(Msg::Scroll {
+            column,
+            row,
+            delta: 1,
+        });
+        assert!(
+            app.update(mouse_event(
+                MouseEventKind::Up(MouseButton::Left),
+                column,
+                row
+            ))
+            .is_empty()
+        );
+        assert!(app.session_relocation_picker.is_open());
+        let (row, column) = screen_hit(&mut app, RELOCATION_CONFIRM);
+        app.update(mouse_event(
+            MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+        ));
+        app.update(mouse_event(
+            MouseEventKind::Up(MouseButton::Left),
+            column,
+            row,
+        ))
+    } else {
+        app.update(Msg::Key(key(KeyCode::Enter)))
+    };
+    assert!(matches!(
+        &actions[..],
+        [Action::RelocateSessions { request, donor: None }]
+            if request.sessions == [location]
+                && request.source_cwd.is_none()
+                && request.destination == destination_text
+    ));
+    assert!(!app.session_relocation_picker.is_open());
+    assert_eq!(app.input_box.buffer.value(), RELOCATION_DRAFT);
+    assert_eq!(writer.generation(), generation);
+    assert!(AppSession::load(app.state.session.id, &storage).is_err());
+}
+
+#[test_case(false; "composer_background")]
+#[test_case(true; "workbench_background")]
+fn relocation_outside_press_dismisses_without_reaching_the_background(workbench: bool) {
+    let mut app = test_app();
+    app.update(Msg::Paste(RELOCATION_DRAFT.into()));
+    if workbench {
+        app.run_builtin(BuiltinAction::Workbench);
+    }
+    open_relocation_picker(&mut app);
+    rendered(&mut app);
+    let (column, row) = OUTSIDE_MODAL;
+    assert!(
+        app.update(mouse_event(
+            MouseEventKind::Down(MouseButton::Left),
+            column,
+            row
+        ))
+        .is_empty()
+    );
+    assert!(!app.session_relocation_picker.is_open());
+    assert_eq!(app.workbench.is_open(), workbench);
+    assert!(app.selection_state.is_none());
+    assert_eq!(app.input_box.buffer.value(), RELOCATION_DRAFT);
+}
+
 /// The picker's live half never moves for a session this process does not
 /// have open, so a delete that only the writer thread can finish left the row
 /// on screen for as long as the picker stayed up.
@@ -11235,6 +11409,7 @@ fn open_argument_prompt(app: &mut App) {
 #[test_case(open_goal_modal    ; "goal_modal")]
 #[test_case(open_model_picker  ; "model_picker")]
 #[test_case(open_command_modal ; "command_modal")]
+#[test_case(open_relocation_picker ; "relocation_picker")]
 fn a_press_outside_a_modal_dismisses_it(open: fn(&mut App)) {
     let mut app = test_app();
     open(&mut app);

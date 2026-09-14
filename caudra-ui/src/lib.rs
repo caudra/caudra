@@ -49,6 +49,7 @@ use caudra_providers::{
 };
 use caudra_storage::StateDir;
 use caudra_storage::id::CaudraId;
+use caudra_storage::sessions::{SessionLease, SessionRelocation};
 use color_eyre::Result;
 use color_eyre::eyre::Context;
 
@@ -112,6 +113,12 @@ pub struct SessionTab {
     pub lease: Arc<caudra_storage::sessions::SessionLease>,
 }
 
+pub struct SessionRelocationHandoff {
+    pub request: SessionRelocation,
+    pub donor: Option<(CaudraId, String)>,
+    pub leases: Vec<Arc<SessionLease>>,
+}
+
 /// How a UI generation ended. On `Reload`, each tab carries its in-memory
 /// session so the caller reopens everything without re-reading from disk.
 pub enum RunOutcome {
@@ -122,6 +129,11 @@ pub enum RunOutcome {
     Reload {
         tabs: Vec<SessionTab>,
         focused: usize,
+    },
+    Relocate {
+        tabs: Vec<SessionTab>,
+        focused: usize,
+        relocation: SessionRelocationHandoff,
     },
 }
 
@@ -150,6 +162,13 @@ pub fn run(params: EventLoopParams, initial_prompt: Option<String>) -> Result<Ru
         );
         el.run(initial_prompt)?
     };
+    if let Some(relocation) = report.relocation {
+        return Ok(RunOutcome::Relocate {
+            tabs: report.tabs,
+            focused: report.focused,
+            relocation,
+        });
+    }
     Ok(match report.exit {
         components::ExitRequest::Reload => RunOutcome::Reload {
             tabs: report.tabs,

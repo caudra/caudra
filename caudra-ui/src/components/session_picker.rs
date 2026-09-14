@@ -22,6 +22,7 @@ use crate::text_buffer::TextBuffer;
 
 const TITLE: &str = " Sessions ";
 const MAX_VISIBLE: u16 = 15;
+const WIDTH_PERCENT: u16 = 95;
 const EMPTY_TEXT: &str = "No sessions yet. Press Ctrl+N to start one.";
 const CURRENT_LABEL: &str = "current";
 const DELETE_FOCUSED_HINT: &str = "Cannot delete the current session";
@@ -63,6 +64,8 @@ pub enum SessionPickerAction {
     Rename { id: CaudraId, title: String },
     Generate(CaudraId),
     New,
+    MoveCurrent,
+    MigrateDirectory,
     Closed,
 }
 
@@ -111,6 +114,7 @@ impl SessionPicker {
     pub fn new() -> Self {
         let mut picker = ListPicker::new()
             .with_max_visible(MAX_VISIBLE)
+            .with_width_percent(WIDTH_PERCENT)
             .with_footer_builder(footer);
         picker.set_empty_text(EMPTY_TEXT);
         Self {
@@ -129,7 +133,7 @@ impl SessionPicker {
         self.rename = None;
         self.pending_delete = None;
         self.now = now;
-        self.picker.set_info_text(None);
+        self.picker.set_info_text(Some(editing_hints()));
         let items = self.rank_and_build(rows);
         self.picker.open(items, TITLE);
     }
@@ -220,6 +224,14 @@ impl SessionPicker {
             return self.press_delete();
         }
         self.clear_pending();
+        if key::MOVE_SESSION.matches(key) {
+            self.close();
+            return SessionPickerAction::MoveCurrent;
+        }
+        if key::MIGRATE_SESSIONS.matches(key) {
+            self.close();
+            return SessionPickerAction::MigrateDirectory;
+        }
         if key::NEW_SESSION.matches(key) {
             self.close();
             return SessionPickerAction::New;
@@ -351,7 +363,7 @@ impl SessionPicker {
     /// cannot drop a session the user is no longer looking at.
     fn clear_pending(&mut self) {
         if self.pending_delete.take().is_some() {
-            self.picker.set_info_text(None);
+            self.picker.set_info_text(Some(editing_hints()));
         }
     }
 
@@ -387,11 +399,19 @@ impl Overlay for SessionPicker {
 fn footer() -> Line<'static> {
     hint_line(&[
         ("Enter", "open"),
-        (key::NEW_SESSION.label, "new"),
-        (key::RENAME_SESSION.label, "rename"),
-        (key::GENERATE_TITLE.label, "name it"),
-        (key::DELETE.label, "delete"),
+        (key::MOVE_SESSION.label, "Move current session"),
+        (key::MIGRATE_SESSIONS.label, "Migrate directory sessions"),
     ])
+}
+
+fn editing_hints() -> String {
+    format!(
+        "{} new · {} rename · {} name it · {} delete",
+        key::NEW_SESSION.label,
+        key::RENAME_SESSION.label,
+        key::GENERATE_TITLE.label,
+        key::DELETE.label,
+    )
 }
 
 fn rename_footer() -> Line<'static> {
@@ -460,6 +480,24 @@ mod tests {
         let mut picker = SessionPicker::new();
         picker.open(rows, NOW);
         picker
+    }
+
+    #[test_case(false; "move_current")]
+    #[test_case(true; "migrate_directory")]
+    fn relocation_actions_do_not_target_the_selected_session(bulk: bool) {
+        let mut picker = opened(vec![row(FIRST, TITLE_A, 0, None)]);
+        let binding = if bulk {
+            key::MIGRATE_SESSIONS
+        } else {
+            key::MOVE_SESSION
+        };
+        let action = picker.handle_key(binding.to_key_event());
+        assert!(matches!(
+            (bulk, action),
+            (false, SessionPickerAction::MoveCurrent)
+                | (true, SessionPickerAction::MigrateDirectory)
+        ));
+        assert!(!picker.is_open());
     }
 
     #[test]

@@ -334,7 +334,7 @@ impl AgentHandles {
 }
 
 /// Wait for every agent task under one shared timeout, not one per task.
-pub(crate) fn join_all(tasks: Vec<smol::Task<()>>, timeout: Duration) {
+pub(crate) fn join_all(tasks: Vec<smol::Task<()>>, timeout: Duration) -> bool {
     info!(
         count = tasks.len(),
         "waiting for agents to finish (timeout {timeout:?})"
@@ -356,7 +356,8 @@ pub(crate) fn join_all(tasks: Vec<smol::Task<()>>, timeout: Duration) {
         if !finished {
             warn!("agents did not finish within {timeout:?}, forcing shutdown");
         }
-    });
+        finished
+    })
 }
 
 /// Where a new agent generation gets its workflow runtime from.
@@ -928,23 +929,23 @@ mod tests {
 
     #[test]
     fn join_all_returns_when_all_tasks_complete() {
-        join_all(Vec::new(), LONG_TIMEOUT);
-        join_all(
+        assert!(join_all(Vec::new(), LONG_TIMEOUT));
+        assert!(join_all(
             (0..3).map(|_| smol::spawn(async {})).collect(),
             LONG_TIMEOUT,
-        );
+        ));
     }
 
     #[test]
     fn join_all_stuck_task_returns_after_shared_timeout() {
         let start = Instant::now();
-        join_all(
+        assert!(!join_all(
             vec![
                 smol::spawn(async {}),
                 smol::spawn(futures_lite::future::pending::<()>()),
             ],
             SHORT_TIMEOUT,
-        );
+        ));
         assert!(start.elapsed() >= SHORT_TIMEOUT);
     }
 }

@@ -43,14 +43,19 @@ use tracing::warn;
 
 use super::lease::SessionLease;
 use super::{
-    SESSION_VERSION, Session, SessionError, SessionSummary, StoredSubagent, StoredSubagentOutcome,
-    StoredSubagentTaskSpec, StoredTokenUsage, next_epoch,
+    SESSION_VERSION, Session, SessionError, SessionLocation, SessionRelocation, SessionSummary,
+    StoredSubagent, StoredSubagentOutcome, StoredSubagentTaskSpec, StoredTokenUsage, next_epoch,
 };
 use crate::id::CaudraId;
 use crate::retention::SessionFacts;
+use crate::state::{
+    WorkspaceTabs, remove_relocated_workspace_tabs, write_relocated_workspace_tabs,
+};
 use crate::tool_outputs::{TOOL_OUTPUT_DIR, delete_session_outputs};
 use crate::usage_ledger::LedgerPurpose;
-use crate::workflow::{SESSION_WORKFLOW_BYTES, trim_workflow_runs, workflow_totals};
+use crate::workflow::{
+    SESSION_WORKFLOW_BYTES, WorkflowRunStatus, interrupt_runs, trim_workflow_runs, workflow_totals,
+};
 use crate::workflow_scratch::{remove_session as remove_scratch_session, session_scratch_bytes};
 use crate::workspace_binding::StoredWorkspaceBinding;
 use crate::{
@@ -96,6 +101,17 @@ const STATE_SCOPE_GLOBAL: &str = "global";
 const TRIM_KEEP_OUTPUT_BYTES: i64 = 4096;
 const SESSION_OPEN_ELSEWHERE: &str = "session is open in another Caudra instance";
 const UNKNOWN_CLEANUP_KIND: &str = "unknown cleanup job kind";
+const RELOCATION_REMOTE: &str = "remote sessions cannot be relocated";
+const RELOCATION_PENDING_REVERT: &str = "the source workspace has a pending revert or restore";
+const RELOCATION_WORKFLOW: &str = "stop active or resumable workflows before relocating";
+const RELOCATION_METADATA_FIELDS: [&str; 6] = [
+    "plan_path",
+    "plan_target",
+    "plan_written",
+    "structured_permission_rules",
+    "yolo",
+    "snapshots_unavailable",
+];
 
 /// Lifetime spend, aggregated into hourly buckets. Deliberately carries no
 /// `session_id` and no foreign key: forgetting a session must not erase what it
@@ -1446,6 +1462,157 @@ impl SessionDatabase {
         Ok(summaries)
     }
 
+    pub fn local_session_locations(&self) -> Result<Vec<SessionLocation>, SessionError> {
+        local_session_locations_on(&self.connection, None)
+    }
+
+    pub fn relocate_sessions(
+        &mut self,
+        request: &SessionRelocation,
+    ) -> Result<usize, SessionError> {
+        self.relocate_sessions_with_tabs(request, &None)
+    }
+
+    pub fn relocate_sessions_with_tabs(
+        &mut self,
+        request: &SessionRelocation,
+        destination_tabs: &Option<WorkspaceTabs>,
+    ) -> Result<usize, SessionError> {
+        if self.state_dir.is_ephemeral() {
+            return Err(SessionError::RelocationUnavailable);
+        }
+        validate_len("destination cwd", request.destination.len(), MAX_PATH_BYTES)?;
+        if !Path::new(&request.destination).is_absolute() || request.destination.contains('\0') {
+            return Err(SessionError::InvalidRelocationDestination);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let ids: HashSet<_> = request.sessions.iter().map(|session| session.id).collect();
+        if ids.len() != request.sessions.len() {
+            return Err(SessionError::RelocationSelectionChanged);
+        }
+        if let Some(source) = &request.source_cwd {
+            let members = local_session_locations_on(&transaction, Some(source))?;
+            if members.len() != ids.len()
+                || members.iter().any(|session| !ids.contains(&session.id))
+            {
+                return Err(SessionError::RelocationSelectionChanged);
+            }
+        }
+        let local = StoredWorkspaceBinding::local_from_cwd("");
+        let mut sources: HashMap<&str, HashSet<CaudraId>> = HashMap::new();
+        for expected in &request.sessions {
+            ensure_write_version(&transaction, expected.id, expected.write_version)?;
+            let root = root_on(&transaction, expected.id)?;
+            if root.format_version != SESSION_VERSION {
+                return Err(SessionError::VersionMismatch {
+                    found: root.format_version,
+                    expected: SESSION_VERSION,
+                });
+            }
+            if root.cwd != expected.cwd
+                || request
+                    .source_cwd
+                    .as_ref()
+                    .is_some_and(|source| source != &root.cwd)
+            {
+                return Err(SessionError::RelocationSelectionChanged);
+            }
+            if (!root.workspace_source.is_empty()
+                && root.workspace_source != local.trust_anchor().as_str())
+                || (root.workspace_binding != "{}"
+                    && !deserialize_json::<StoredWorkspaceBinding>(
+                        &root.workspace_binding,
+                        "sessions.workspace_binding",
+                    )?
+                    .is_local())
+            {
+                return Err(SessionError::RelocationBlocked {
+                    id: expected.id,
+                    reason: RELOCATION_REMOTE,
+                });
+            }
+            if root.cwd == request.destination {
+                continue;
+            }
+            if !sources.contains_key(expected.cwd.as_str()) {
+                let pending = transaction
+                    .query_row(
+                        "SELECT id FROM sessions WHERE cwd = ?1 AND workspace_source IN ('', ?2) \
+                     AND json_extract(metadata, '$.pending_revert') IS NOT NULL LIMIT 1",
+                        params![expected.cwd, local.trust_anchor().as_str()],
+                        |row| row.get::<_, Vec<u8>>(0),
+                    )
+                    .optional()?;
+                if let Some(id) = pending {
+                    return Err(SessionError::RelocationBlocked {
+                        id: id_from_bytes(&id, "sessions.id")?,
+                        reason: RELOCATION_PENDING_REVERT,
+                    });
+                }
+            }
+            let workflow_pending: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM workflow_runs WHERE session_id = ?1 \
+                 AND status IN ('active', 'paused', 'budget_limited'))",
+                params![expected.id.as_bytes().as_slice()],
+                |row| row.get(0),
+            )?;
+            if workflow_pending {
+                return Err(SessionError::RelocationBlocked {
+                    id: expected.id,
+                    reason: RELOCATION_WORKFLOW,
+                });
+            }
+            let mut metadata: Value = deserialize_json(&root.metadata, "session metadata")?;
+            let object =
+                metadata
+                    .as_object_mut()
+                    .ok_or_else(|| SessionError::CorruptDatabaseValue {
+                        field: "session metadata",
+                        reason: "expected an object".into(),
+                    })?;
+            for field in RELOCATION_METADATA_FIELDS {
+                object.remove(field);
+            }
+            let metadata = serialize_json(&metadata, "session metadata", MAX_METADATA_BYTES)?;
+            let changed = transaction.execute(
+                "UPDATE sessions SET cwd = ?1, write_version = write_version + 1, \
+                 metadata = ?2, logical_bytes = logical_bytes - length(CAST(metadata AS BLOB)) \
+                 + length(CAST(?2 AS BLOB)) WHERE id = ?3 AND write_version = ?4",
+                params![
+                    request.destination,
+                    metadata,
+                    expected.id.as_bytes().as_slice(),
+                    expected.write_version
+                ],
+            )?;
+            if changed != 1 {
+                return Err(SessionError::RelocationSelectionChanged);
+            }
+            interrupt_runs(
+                &transaction,
+                expected.id,
+                &[WorkflowRunStatus::Failed, WorkflowRunStatus::Cancelled],
+            )?;
+            sources
+                .entry(&expected.cwd)
+                .or_default()
+                .insert(expected.id);
+        }
+        for (source, moved) in &sources {
+            remove_relocated_workspace_tabs(&transaction, source, moved)?;
+        }
+        let moved = sources.values().map(HashSet::len).sum();
+        if moved > 0
+            && let Some(tabs) = destination_tabs
+        {
+            write_relocated_workspace_tabs(&transaction, &request.destination, tabs)?;
+        }
+        transaction.commit()?;
+        Ok(moved)
+    }
+
     pub fn latest_id(&self, cwd: &str) -> Result<Option<CaudraId>, SessionError> {
         self.connection
             .query_row(
@@ -2182,6 +2349,30 @@ impl Drop for PreparedArchive {
             crate::sync_parent_dir(&self.pending_path);
         }
     }
+}
+
+fn local_session_locations_on(
+    connection: &Connection,
+    cwd: Option<&str>,
+) -> Result<Vec<SessionLocation>, SessionError> {
+    let local = StoredWorkspaceBinding::local_from_cwd("");
+    let mut statement = connection.prepare(
+        "SELECT id, title, cwd, updated_at, write_version FROM sessions \
+         WHERE workspace_source IN ('', ?1) AND (?2 IS NULL OR cwd = ?2) \
+         ORDER BY updated_at DESC, id DESC",
+    )?;
+    let mut rows = statement.query(params![local.trust_anchor().as_str(), cwd])?;
+    let mut locations = Vec::new();
+    while let Some(row) = rows.next()? {
+        locations.push(SessionLocation {
+            id: id_from_row(row, 0)?,
+            title: row.get(1)?,
+            cwd: row.get(2)?,
+            updated_at: from_i64(row.get(3)?, "sessions.updated_at")?,
+            write_version: row.get(4)?,
+        });
+    }
+    Ok(locations)
 }
 
 fn load_on<M, U, T>(
@@ -3729,6 +3920,8 @@ mod tests {
 
     use super::*;
     use crate::sessions::{Session, StoredSubagentOutcome, TitleSource};
+    use crate::state::{WorkspaceTabs, project_scope, read_workspace_tabs, write_workspace_tabs};
+    use crate::workflow::{WorkflowEventKind, WorkflowRunPatch, WorkflowRunRow, WorkflowUpdate};
     use crate::workflow_scratch::WORKFLOW_SCRATCH_DIR;
     use caudra_workspace::{
         AuthenticatedPrincipalId, AuthorityIdentity, CwdHandle, ProjectIdentity, ProjectKey,
@@ -3769,6 +3962,12 @@ mod tests {
     const TRIM_DROPS_LARGE: &str = "trim must drop rich outputs above the threshold";
     const ARTIFACTS_REMOVED: &str = "trim must remove every artifact directory";
     const VERSION_UNCHANGED: &str = "mark_opened must not bump write_version";
+    const RELOCATION_DESTINATION: &str = "/destination with spaces";
+    const RELOCATION_NESTED: &str = "/project/nested";
+    const RELOCATION_DRAFT: &str = "draft with /project/reference";
+    const RELOCATION_PLAN: &str = "/project/plan.md";
+    const RELOCATION_FAILURE: &str = "injected relocation failure";
+    const RELOCATION_RUN: &str = "relocation-run";
     const SESSIONS_BEFORE_WORKSPACE_BINDING: &str = r#"
 DROP INDEX sessions_workspace_updated;
 ALTER TABLE sessions DROP COLUMN workspace_cursor_label;
@@ -3836,6 +4035,552 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
             Some(cursor.into()),
         )
         .unwrap()
+    }
+
+    fn relocation_request(database: &SessionDatabase, cwd: &str, bulk: bool) -> SessionRelocation {
+        SessionRelocation {
+            sessions: database
+                .local_session_locations()
+                .unwrap()
+                .into_iter()
+                .filter(|session| session.cwd == cwd)
+                .collect(),
+            source_cwd: bulk.then(|| cwd.to_owned()),
+            destination: RELOCATION_DESTINATION.into(),
+        }
+    }
+
+    fn relocation_workflow(
+        database: &SessionDatabase,
+        session_id: CaudraId,
+        status: WorkflowRunStatus,
+    ) -> WorkflowRunRow {
+        database.connection.execute(
+            "INSERT INTO workflow_runs (run_id, session_id, display_name, workflow_name, source_kind, \
+             source_digest, language_version, abi_version, source, args, launch_mode, status, \
+             agent_budget, usage, roster, result, error, created_at, updated_at) \
+             VALUES (?1, ?2, ?1, ?1, 'project', ?1, 1, 1, ?4, '{}', 'build', ?3, 1, '{}', '[]', '{}', ?5, 0, 0)",
+            params![RELOCATION_RUN, session_id.as_bytes().as_slice(), status.as_str(), RELOCATION_PLAN, RELOCATION_FAILURE],
+        ).unwrap();
+        database.connection.execute(
+            "INSERT INTO workflow_calls (run_id, call_key, kind, request_hash, request, state, result, started_at) \
+             VALUES (?1, 1, 'agent', ?1, '{}', 'completed', '{}', 0)",
+            params![RELOCATION_RUN],
+        ).unwrap();
+        database
+            .append_workflow_event(RELOCATION_RUN, WorkflowEventKind::Log, RELOCATION_DRAFT)
+            .unwrap();
+        database.load_workflow_run(RELOCATION_RUN).unwrap().unwrap()
+    }
+
+    #[test]
+    fn relocation_preserves_payloads_activity_and_binding_and_detaches_source_policy() {
+        let (_temp, state_dir) = state_dir();
+        let mut database = SessionDatabase::open(&state_dir).unwrap();
+        let mut session = TestSession::new(MODEL, MISSING_LEGACY_CWD);
+        session.push_message(TestMessage(RELOCATION_DRAFT.into()));
+        session.insert_tool_output(SMALL_OUTPUT_ID.into(), json!({"path": RELOCATION_PLAN}));
+        session.set_subagent_messages(
+            SMALL_OUTPUT_ID.into(),
+            vec![TestMessage(RELOCATION_DRAFT.into())],
+        );
+        session.set_subagents(vec![stored_subagent(
+            SMALL_OUTPUT_ID,
+            StoredSubagentOutcome::Done,
+        )]);
+        session.token_usage = json!({"input": 25});
+        session.meta.input_draft = Some(RELOCATION_DRAFT.into());
+        session.meta.plan_path = Some(RELOCATION_PLAN.into());
+        session.meta.plan_written = true;
+        session.meta.yolo = Some(true);
+        database.save(&session, None).unwrap();
+        database
+            .connection
+            .execute(
+                "UPDATE sessions SET metadata = json_set(metadata, '$.future_field', ?1, \
+             '$.structured_permission_rules', json('[{\"future_rule\":true}]')) WHERE id = ?2",
+                params![RELOCATION_DRAFT, session.id.as_bytes().as_slice()],
+            )
+            .unwrap();
+        let before = root_on(&database.connection, session.id).unwrap();
+        let request = relocation_request(&database, MISSING_LEGACY_CWD, false);
+
+        assert_eq!(database.relocate_sessions(&request).unwrap(), 1);
+
+        let after = root_on(&database.connection, session.id).unwrap();
+        assert_eq!(after.cwd, RELOCATION_DESTINATION);
+        assert_eq!(after.updated_at, before.updated_at);
+        assert_eq!(after.created_at, before.created_at);
+        assert_eq!(after.write_version, before.write_version + 1);
+        assert_eq!(after.token_usage, before.token_usage);
+        assert_eq!(after.workspace_binding, before.workspace_binding);
+        let metadata: Value = serde_json::from_str(&after.metadata).unwrap();
+        assert_eq!(metadata["future_field"], RELOCATION_DRAFT);
+        for field in RELOCATION_METADATA_FIELDS {
+            assert!(metadata.get(field).is_none());
+        }
+        let loaded: TestSession = database.load(session.id).unwrap();
+        assert_eq!(loaded.messages(), session.messages());
+        assert_eq!(loaded.tool_outputs(), session.tool_outputs());
+        assert_eq!(loaded.subagent_messages(), session.subagent_messages());
+        assert_eq!(loaded.subagents(), session.subagents());
+        assert_eq!(loaded.meta.input_draft, session.meta.input_draft);
+        assert_eq!(
+            after.logical_bytes + before.metadata.len(),
+            before.logical_bytes + after.metadata.len()
+        );
+    }
+
+    #[test_case(false; "explicit_current_only")]
+    #[test_case(true; "exact_bulk_includes_closed")]
+    fn relocation_reconciles_source_tabs_without_replacing_destination(bulk: bool) {
+        let (_temp, state_dir) = state_dir();
+        let mut database = SessionDatabase::open(&state_dir).unwrap();
+        let current = TestSession::new(MODEL, CWD);
+        let closed = TestSession::new(MODEL, CWD);
+        let donor = TestSession::new(MODEL, RELOCATION_DESTINATION);
+        let nested = TestSession::new(MODEL, RELOCATION_NESTED);
+        for session in [&current, &closed, &donor, &nested] {
+            database.save(session, None).unwrap();
+        }
+        let before = database.local_session_locations().unwrap();
+        let source_tabs = WorkspaceTabs {
+            open: vec![current.id, closed.id],
+            focused: Some(current.id),
+        };
+        let destination_tabs = WorkspaceTabs {
+            open: vec![donor.id],
+            focused: Some(donor.id),
+        };
+        write_workspace_tabs(&state_dir, Path::new(CWD), &source_tabs).unwrap();
+        write_workspace_tabs(
+            &state_dir,
+            Path::new(RELOCATION_DESTINATION),
+            &destination_tabs,
+        )
+        .unwrap();
+        let mut request = relocation_request(&database, CWD, bulk);
+        if !bulk {
+            request.sessions.retain(|session| session.id == current.id);
+        }
+
+        assert_eq!(
+            database.relocate_sessions(&request).unwrap(),
+            request.sessions.len()
+        );
+
+        let after = database.local_session_locations().unwrap();
+        assert_eq!(
+            before.iter().map(|row| row.id).collect::<Vec<_>>(),
+            after.iter().map(|row| row.id).collect::<Vec<_>>()
+        );
+        for original in before {
+            let actual = after.iter().find(|row| row.id == original.id).unwrap();
+            if request.sessions.iter().any(|row| row.id == original.id) {
+                assert_eq!(actual.cwd, RELOCATION_DESTINATION);
+                assert_eq!(actual.updated_at, original.updated_at);
+                assert_eq!(actual.write_version, original.write_version + 1);
+            } else {
+                assert_eq!(actual, &original);
+            }
+        }
+        let remaining = if bulk { Vec::new() } else { vec![closed.id] };
+        assert_eq!(
+            read_workspace_tabs(&state_dir, Path::new(CWD)).unwrap(),
+            Some(WorkspaceTabs {
+                focused: remaining.first().copied(),
+                open: remaining,
+            })
+        );
+        assert_eq!(
+            read_workspace_tabs(&state_dir, Path::new(RELOCATION_DESTINATION)).unwrap(),
+            Some(destination_tabs)
+        );
+    }
+
+    #[test]
+    fn relocation_inventory_and_bulk_exclude_remote_and_include_legacy_unbound() {
+        let (_temp, state_dir) = state_dir();
+        let mut database = SessionDatabase::open(&state_dir).unwrap();
+        let local = TestSession::new(MODEL, REMOTE_CWD);
+        let remote = TestSession::new_with_workspace(
+            MODEL,
+            REMOTE_CWD,
+            remote_binding("origin", "principal", "project", "cursor"),
+        );
+        for session in [&local, &remote] {
+            database.save(session, None).unwrap();
+        }
+        database
+            .connection
+            .execute(
+                "UPDATE sessions SET workspace_binding = '{}', workspace_source = '' WHERE id = ?1",
+                params![local.id.as_bytes().as_slice()],
+            )
+            .unwrap();
+        let request = relocation_request(&database, REMOTE_CWD, true);
+        assert_eq!(request.sessions.len(), 1);
+        assert_eq!(request.sessions[0].id, local.id);
+        assert_eq!(database.relocate_sessions(&request).unwrap(), 1);
+        let root = root_on(&database.connection, remote.id).unwrap();
+        assert_eq!(root.cwd, REMOTE_CWD);
+        let remote_request = SessionRelocation {
+            sessions: vec![SessionLocation {
+                id: remote.id,
+                title: root.title,
+                cwd: root.cwd,
+                updated_at: root.updated_at,
+                write_version: root.write_version,
+            }],
+            source_cwd: None,
+            destination: RELOCATION_DESTINATION.into(),
+        };
+        assert!(matches!(
+            database.relocate_sessions(&remote_request),
+            Err(SessionError::RelocationBlocked {
+                reason: RELOCATION_REMOTE,
+                ..
+            })
+        ));
+        assert_eq!(
+            root_on(&database.connection, local.id)
+                .unwrap()
+                .workspace_binding,
+            "{}"
+        );
+    }
+
+    #[test_case(false, true; "new_member")]
+    #[test_case(true, false; "deleted_member")]
+    #[test_case(true, true; "same_count_different_members")]
+    fn relocation_bulk_revalidates_membership_from_another_connection(delete: bool, insert: bool) {
+        let (_temp, state_dir) = state_dir();
+        let mut database = SessionDatabase::open(&state_dir).unwrap();
+        let first = TestSession::new(MODEL, CWD);
+        let second = TestSession::new(MODEL, CWD);
+        database.save(&first, None).unwrap();
+        database.save(&second, None).unwrap();
+        let request = relocation_request(&database, CWD, true);
+        let mut other = SessionDatabase::open(&state_dir).unwrap();
+        if delete {
+            other.delete(second.id, None).unwrap();
+        }
+        if insert {
+            other.save(&TestSession::new(MODEL, CWD), None).unwrap();
+        }
+        let before = database.local_session_locations().unwrap();
+        assert!(matches!(
+            database.relocate_sessions(&request),
+            Err(SessionError::RelocationSelectionChanged)
+        ));
+        assert_eq!(database.local_session_locations().unwrap(), before);
+    }
+
+    #[test_case(false; "version_conflict_after_first_update")]
+    #[test_case(true; "missing_id_after_first_update")]
+    fn relocation_explicit_failure_rolls_back_prior_rows(missing: bool) {
+        let (_temp, state_dir) = state_dir();
+        let mut database = SessionDatabase::open(&state_dir).unwrap();
+        database.save(&TestSession::new(MODEL, CWD), None).unwrap();
+        database.save(&TestSession::new(MODEL, CWD), None).unwrap();
+        let mut request = relocation_request(&database, CWD, false);
+        if missing {
+            request.sessions[1].id = CaudraId::generate();
+        } else {
+            let mut other = SessionDatabase::open(&state_dir).unwrap();
+            let mut changed: TestSession = other.load(request.sessions[1].id).unwrap();
+            changed.set_title(RELOCATION_DRAFT.into());
+            other.save(&changed, None).unwrap();
+        }
+        let before = database.local_session_locations().unwrap();
+        let error = database.relocate_sessions(&request).unwrap_err();
+        if missing {
+            assert!(matches!(
+                error,
+                SessionError::Storage(StorageError::NotFound(_))
+            ));
+        } else {
+            assert!(matches!(
+                error,
+                SessionError::ConcurrentSessionWriter { .. }
+            ));
+        }
+        assert_eq!(database.local_session_locations().unwrap(), before);
+    }
+
+    #[test_case(None, WorkflowRunStatus::Failed; "session_failure_failed_run")]
+    #[test_case(None, WorkflowRunStatus::Cancelled; "session_failure_cancelled_run")]
+    #[test_case(Some(CWD), WorkflowRunStatus::Failed; "source_layout_failure_failed_run")]
+    #[test_case(Some(CWD), WorkflowRunStatus::Cancelled; "source_layout_failure_cancelled_run")]
+    #[test_case(Some(RELOCATION_DESTINATION), WorkflowRunStatus::Failed; "destination_layout_failure_failed_run")]
+    #[test_case(Some(RELOCATION_DESTINATION), WorkflowRunStatus::Cancelled; "destination_layout_failure_cancelled_run")]
+    fn relocation_database_failure_rolls_back_sessions_and_tabs(
+        failure_scope: Option<&str>,
+        status: WorkflowRunStatus,
+    ) {
+        let (_temp, state_dir) = state_dir();
+        let mut database = SessionDatabase::open(&state_dir).unwrap();
+        database.save(&TestSession::new(MODEL, CWD), None).unwrap();
+        database.save(&TestSession::new(MODEL, CWD), None).unwrap();
+        let request = relocation_request(&database, CWD, true);
+        let workflow = relocation_workflow(&database, request.sessions[0].id, status);
+        let tabs = WorkspaceTabs {
+            open: request.sessions.iter().map(|session| session.id).collect(),
+            focused: Some(request.sessions[0].id),
+        };
+        write_workspace_tabs(&state_dir, Path::new(CWD), &tabs).unwrap();
+        let donor = TestSession::new(MODEL, RELOCATION_DESTINATION);
+        database.save(&donor, None).unwrap();
+        let destination_tabs = WorkspaceTabs {
+            open: vec![donor.id],
+            focused: Some(donor.id),
+        };
+        write_workspace_tabs(
+            &state_dir,
+            Path::new(RELOCATION_DESTINATION),
+            &destination_tabs,
+        )
+        .unwrap();
+        let trigger = if let Some(scope) = failure_scope {
+            format!(
+                "CREATE TRIGGER relocation_failure BEFORE UPDATE ON state WHEN OLD.scope = '{}' BEGIN SELECT RAISE(ABORT, '{RELOCATION_FAILURE}'); END",
+                project_scope(Path::new(scope))
+            )
+        } else {
+            format!(
+                "CREATE TRIGGER relocation_failure BEFORE UPDATE ON sessions WHEN OLD.id = X'{}' BEGIN SELECT RAISE(ABORT, '{RELOCATION_FAILURE}'); END",
+                request.sessions[1]
+                    .id
+                    .as_bytes()
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            )
+        };
+        database.connection.execute_batch(&trigger).unwrap();
+        let before = database.local_session_locations().unwrap();
+        assert!(
+            database
+                .relocate_sessions_with_tabs(&request, &Some(tabs.clone()))
+                .unwrap_err()
+                .to_string()
+                .contains(RELOCATION_FAILURE)
+        );
+        assert_eq!(database.local_session_locations().unwrap(), before);
+        assert_eq!(
+            database.load_workflow_run(RELOCATION_RUN).unwrap().unwrap(),
+            workflow
+        );
+        assert_eq!(
+            read_workspace_tabs(&state_dir, Path::new(CWD)).unwrap(),
+            Some(tabs)
+        );
+        assert_eq!(
+            read_workspace_tabs(&state_dir, Path::new(RELOCATION_DESTINATION)).unwrap(),
+            Some(destination_tabs)
+        );
+    }
+
+    #[test_case(false, false; "delta_snapshot")]
+    #[test_case(true, false; "full_snapshot")]
+    #[test_case(true, true; "cursorless_snapshot")]
+    fn relocation_rejects_old_lineage_saves_and_allows_reloaded_lineage(
+        full: bool,
+        cursorless: bool,
+    ) {
+        let (_temp, state_dir) = state_dir();
+        let mut database = SessionDatabase::open(&state_dir).unwrap();
+        let session = TestSession::new(MODEL, CWD);
+        database.save(&session, None).unwrap();
+        let (mut stale, cursor): (TestSession, _) = database.load_with_cursor(session.id).unwrap();
+        let request = relocation_request(&database, CWD, false);
+        database.relocate_sessions(&request).unwrap();
+        if full {
+            stale.replace_messages(vec![TestMessage(RELOCATION_DRAFT.into())]);
+        } else {
+            stale.push_message(TestMessage(RELOCATION_DRAFT.into()));
+        }
+        assert!(matches!(
+            database.save(&stale, (!cursorless).then_some(&cursor)),
+            Err(SessionError::ConcurrentSessionWriter { .. })
+        ));
+        assert!(matches!(
+            database.relocate_sessions(&request),
+            Err(SessionError::ConcurrentSessionWriter { .. })
+        ));
+        let (mut reloaded, new_cursor): (TestSession, _) =
+            database.load_with_cursor(session.id).unwrap();
+        assert!(!cursor.shares_lineage(&reloaded));
+        reloaded.push_message(TestMessage(RELOCATION_DRAFT.into()));
+        database.save(&reloaded, Some(&new_cursor)).unwrap();
+        assert_eq!(
+            root_on(&database.connection, session.id).unwrap().cwd,
+            RELOCATION_DESTINATION
+        );
+    }
+
+    #[test_case(false; "affected_session_revert")]
+    #[test_case(true; "source_sibling_restore")]
+    fn relocation_rejects_pending_source_revert_metadata(sibling: bool) {
+        let (_temp, state_dir) = state_dir();
+        let mut database = SessionDatabase::open(&state_dir).unwrap();
+        let session = TestSession::new(MODEL, CWD);
+        database.save(&session, None).unwrap();
+        let request = relocation_request(&database, CWD, false);
+        let blocker = if sibling {
+            TestSession::new(MODEL, CWD)
+        } else {
+            session
+        };
+        if sibling {
+            database.save(&blocker, None).unwrap();
+        }
+        database.connection.execute("UPDATE sessions SET metadata = json_set(metadata, '$.pending_revert', json(?1)) WHERE id = ?2", params![if sibling { r#"{"restore_operation":{}}"# } else { "{}" }, blocker.id.as_bytes().as_slice()]).unwrap();
+        let before = database.local_session_locations().unwrap();
+        assert!(
+            matches!(database.relocate_sessions(&request), Err(SessionError::RelocationBlocked { id, reason: RELOCATION_PENDING_REVERT }) if id == blocker.id)
+        );
+        assert_eq!(database.local_session_locations().unwrap(), before);
+    }
+
+    #[test_case(WorkflowRunStatus::Active, true, false; "active")]
+    #[test_case(WorkflowRunStatus::Paused, true, false; "paused")]
+    #[test_case(WorkflowRunStatus::BudgetLimited, true, false; "budget_limited")]
+    #[test_case(WorkflowRunStatus::Completed, false, false; "completed")]
+    #[test_case(WorkflowRunStatus::Cancelled, false, false; "cancelled")]
+    #[test_case(WorkflowRunStatus::Failed, false, false; "failed")]
+    #[test_case(WorkflowRunStatus::Interrupted, false, false; "interrupted")]
+    #[test_case(WorkflowRunStatus::Cancelled, false, true; "cancelled_noop")]
+    #[test_case(WorkflowRunStatus::Failed, false, true; "failed_noop")]
+    fn relocation_invalidates_only_moved_resumable_terminal_runs(
+        status: WorkflowRunStatus,
+        blocked: bool,
+        noop: bool,
+    ) {
+        let (_temp, state_dir) = state_dir();
+        let mut database = SessionDatabase::open(&state_dir).unwrap();
+        let session = TestSession::new(MODEL, CWD);
+        database.save(&session, None).unwrap();
+        let mut workflow = relocation_workflow(&database, session.id, status);
+        let calls = database.load_workflow_calls(RELOCATION_RUN).unwrap();
+        let events = database.load_workflow_events(RELOCATION_RUN).unwrap();
+        let mut request = relocation_request(&database, CWD, false);
+        if noop {
+            request.destination = CWD.into();
+        }
+        let result = database.relocate_sessions(&request);
+        if blocked {
+            assert!(matches!(
+                result,
+                Err(SessionError::RelocationBlocked {
+                    reason: RELOCATION_WORKFLOW,
+                    ..
+                })
+            ));
+            assert_eq!(
+                database.local_session_locations().unwrap(),
+                request.sessions
+            );
+        } else {
+            assert_eq!(result.unwrap(), usize::from(!noop));
+        }
+        let moved = database.load_workflow_run(RELOCATION_RUN).unwrap().unwrap();
+        if !noop
+            && matches!(
+                status,
+                WorkflowRunStatus::Failed | WorkflowRunStatus::Cancelled
+            )
+        {
+            assert_eq!(
+                database
+                    .update_workflow_run(
+                        RELOCATION_RUN,
+                        workflow.revision,
+                        workflow.execution_epoch,
+                        &WorkflowRunPatch {
+                            status: Some(WorkflowRunStatus::Active),
+                            ..WorkflowRunPatch::default()
+                        },
+                    )
+                    .unwrap(),
+                WorkflowUpdate::Stale
+            );
+            workflow.status = WorkflowRunStatus::Interrupted;
+            workflow.revision += 1;
+            workflow.execution_epoch += 1;
+            workflow.outbox_pending = true;
+            workflow.updated_at = moved.updated_at;
+        }
+        assert_eq!(moved, workflow);
+        assert_eq!(database.load_workflow_calls(RELOCATION_RUN).unwrap(), calls);
+        assert_eq!(
+            database.load_workflow_events(RELOCATION_RUN).unwrap(),
+            events
+        );
+    }
+
+    #[test_case(WorkflowRunStatus::Failed; "failed")]
+    #[test_case(WorkflowRunStatus::Cancelled; "cancelled")]
+    fn relocation_preserves_unselected_workflows(status: WorkflowRunStatus) {
+        let (_temp, state_dir) = state_dir();
+        let mut database = SessionDatabase::open(&state_dir).unwrap();
+        database.save(&TestSession::new(MODEL, CWD), None).unwrap();
+        let request = relocation_request(&database, CWD, false);
+        let sibling = TestSession::new(MODEL, CWD);
+        database.save(&sibling, None).unwrap();
+        let workflow = relocation_workflow(&database, sibling.id, status);
+        assert_eq!(database.relocate_sessions(&request).unwrap(), 1);
+        assert_eq!(
+            database.load_workflow_run(RELOCATION_RUN).unwrap().unwrap(),
+            workflow
+        );
+    }
+
+    #[test]
+    fn relocation_noops_and_duplicate_or_changed_cwd_requests_are_safe() {
+        let (_temp, state_dir) = state_dir();
+        let mut database = SessionDatabase::open(&state_dir).unwrap();
+        database.save(&TestSession::new(MODEL, CWD), None).unwrap();
+        let before = database.local_session_locations().unwrap();
+        let mut request = relocation_request(&database, CWD, true);
+        request.destination = CWD.into();
+        let tabs = WorkspaceTabs {
+            open: vec![request.sessions[0].id],
+            focused: Some(request.sessions[0].id),
+        };
+        write_workspace_tabs(&state_dir, Path::new(CWD), &tabs).unwrap();
+        assert_eq!(
+            database
+                .relocate_sessions_with_tabs(&request, &Some(WorkspaceTabs::default()))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            read_workspace_tabs(&state_dir, Path::new(CWD)).unwrap(),
+            Some(tabs)
+        );
+        assert_eq!(database.local_session_locations().unwrap(), before);
+        request.sessions.push(request.sessions[0].clone());
+        assert!(matches!(
+            database.relocate_sessions(&request),
+            Err(SessionError::RelocationSelectionChanged)
+        ));
+        request.sessions.pop();
+        request.sessions[0].cwd = MISSING_LEGACY_CWD.into();
+        assert!(matches!(
+            database.relocate_sessions(&request),
+            Err(SessionError::RelocationSelectionChanged)
+        ));
+        request.sessions.clear();
+        assert!(matches!(
+            database.relocate_sessions(&request),
+            Err(SessionError::RelocationSelectionChanged)
+        ));
+        request.source_cwd = Some(MISSING_LEGACY_CWD.into());
+        assert_eq!(database.relocate_sessions(&request).unwrap(), 0);
+        request.source_cwd = None;
+        assert_eq!(database.relocate_sessions(&request).unwrap(), 0);
+        assert_eq!(database.local_session_locations().unwrap(), before);
     }
 
     #[test]

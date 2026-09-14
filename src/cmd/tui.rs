@@ -1,7 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::env;
+use std::fs;
 use std::io::{self, IsTerminal, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
@@ -9,7 +10,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use color_eyre::Result;
-use color_eyre::eyre::Context;
+use color_eyre::eyre::{Context, bail, eyre};
 
 use caudra_agent::command::{self, CustomCommand};
 use caudra_agent::prompt::profile::{PromptProfileCatalog, SystemPromptProfile};
@@ -20,10 +21,14 @@ use caudra_providers::model::Model;
 use caudra_storage::StateDir;
 use caudra_storage::id::CaudraId;
 use caudra_storage::sessions::sweep::{SweepPolicy, sweep_if_due};
-use caudra_storage::sessions::{SessionDatabase, SessionLease, StoredMode};
+use caudra_storage::sessions::{
+    SessionDatabase, SessionLease, SessionLocation, SessionRelocation, StoredMode,
+};
 use caudra_storage::state::{WorkspaceTabs, read_workspace_tabs};
 use caudra_storage::workspace_binding::StoredWorkspaceBinding;
-use caudra_ui::{AppSession, ExitSummary, HerdrReporter, RunOutcome, SessionTab};
+use caudra_ui::{
+    AppSession, ExitSummary, HerdrReporter, RunOutcome, SessionRelocationHandoff, SessionTab,
+};
 
 use crate::cli::Cli;
 use crate::cmd::load_config;
@@ -37,6 +42,18 @@ const SWEEP_STARTUP_DELAY: Duration = Duration::from_secs(60);
 /// How often the sweep thread re-checks whether the interval has elapsed.
 const SWEEP_POLL_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const SECONDS_PER_HOUR: u64 = 60 * 60;
+const RELOCATION_ABORTED: &str = "Session relocation was not committed";
+const RELOCATION_DONOR_CHANGED: &str =
+    "Destination session disappeared or changed directory; refresh the relocation preview";
+const RELOCATION_VERSION_CHANGED: &str =
+    "Session changed outside the stopped live writer; refresh the relocation preview";
+const RELOCATION_DESTINATION_CHANGED: &str =
+    "Destination directory changed; refresh the relocation preview";
+const RELOCATION_ROLLBACK_FAILED: &str =
+    "Could not restore the original working directory; the UI was not restarted";
+const PROJECT_ENV_PATH: &str = ".caudra/.env";
+const RELOCATION_ENV_RESTART: &str =
+    "Run caudra --continue from the destination to load its environment safely";
 
 /// Runs the retention sweep on its own thread while the TUI is open. Dropping
 /// the sender wakes and stops the thread. Every step the sweep takes is
@@ -290,6 +307,215 @@ struct ResolvedSessions {
     tabs: Vec<SessionTab>,
     focused: usize,
     warnings: Vec<String>,
+}
+
+fn local_runtime_cwd(
+    tabs: &[SessionTab],
+    focused: usize,
+    current: io::Result<PathBuf>,
+) -> Result<PathBuf> {
+    match tabs.get(focused).or_else(|| tabs.first()) {
+        Some(tab) => Ok(PathBuf::from(&tab.session.cwd)),
+        None => current.context("resolve current working directory for reload"),
+    }
+}
+
+fn project_env_present(cwd: &Path) -> bool {
+    match fs::symlink_metadata(cwd.join(PROJECT_ENV_PATH)) {
+        Ok(_) => true,
+        Err(error) => error.kind() != io::ErrorKind::NotFound,
+    }
+}
+
+fn relocation_moves_live_tabs(tabs: &[SessionTab], request: &SessionRelocation) -> bool {
+    tabs.iter().any(|tab| {
+        request
+            .sessions
+            .iter()
+            .any(|expected| expected.id == tab.session.id && expected.cwd != request.destination)
+    })
+}
+
+fn relocation_requires_env_restart(
+    tabs: &[SessionTab],
+    request: &SessionRelocation,
+    startup_cwd: &Path,
+    startup_project_env: bool,
+) -> bool {
+    relocation_moves_live_tabs(tabs, request)
+        && (startup_project_env
+            || project_env_present(startup_cwd)
+            || project_env_present(Path::new(&request.destination))
+            || request
+                .sessions
+                .iter()
+                .any(|source| project_env_present(Path::new(&source.cwd))))
+}
+
+fn rebase_relocation_versions(
+    request: &mut SessionRelocation,
+    tabs: &[SessionTab],
+    inventory: &[SessionLocation],
+) -> Result<()> {
+    for expected in &mut request.sessions {
+        let Some(tab) = tabs.iter().find(|tab| tab.session.id == expected.id) else {
+            continue;
+        };
+        let committed = tab.session.clone().persisted_write_version();
+        let stored = inventory.iter().find(|stored| stored.id == expected.id);
+        if tab.lease.id() != expected.id
+            || tab.session.cwd != expected.cwd
+            || !stored.is_some_and(|stored| {
+                stored.cwd == expected.cwd
+                    && Some(stored.write_version) == committed
+                    && stored.write_version >= expected.write_version
+            })
+        {
+            bail!("{RELOCATION_VERSION_CHANGED}: {}", expected.id);
+        }
+        expected.write_version = committed.ok_or_else(|| eyre!(RELOCATION_VERSION_CHANGED))?;
+    }
+    Ok(())
+}
+
+fn relocate_stopped_sessions(
+    tabs: Vec<SessionTab>,
+    focused: usize,
+    mut relocation: SessionRelocationHandoff,
+    storage: &StateDir,
+    original_cwd: &Path,
+    mut change_cwd: impl FnMut(&Path) -> io::Result<()>,
+) -> Result<(ResolvedSessions, Option<String>)> {
+    let focused_id = tabs.get(focused).map(|tab| tab.session.id);
+    let open: Vec<_> = tabs
+        .iter()
+        .filter(|tab| {
+            relocation.request.sessions.iter().any(|expected| {
+                expected.id == tab.session.id && expected.cwd != relocation.request.destination
+            })
+        })
+        .map(|tab| tab.session.id)
+        .collect();
+    let destination_tabs = (!open.is_empty()).then(|| WorkspaceTabs {
+        focused: focused_id
+            .filter(|id| open.contains(id))
+            .or_else(|| open.first().copied()),
+        open,
+    });
+    let mut installed_cwd = false;
+    let result = (|| -> Result<usize> {
+        if storage.is_ephemeral()
+            || tabs.iter().any(|tab| {
+                tab.session
+                    .workspace_binding()
+                    .is_some_and(|binding| !binding.is_local())
+            })
+        {
+            bail!("Relocation requires persistent local sessions");
+        }
+        let leased: HashSet<_> = tabs
+            .iter()
+            .filter(|tab| tab.session.id == tab.lease.id())
+            .map(|tab| tab.lease.id())
+            .chain(relocation.leases.iter().map(|lease| lease.id()))
+            .collect();
+        for expected in &relocation.request.sessions {
+            if !leased.contains(&expected.id) {
+                bail!("Session relocation lease is missing: {}", expected.id);
+            }
+        }
+        let mut database = SessionDatabase::open_state(storage)?;
+        let inventory = database.local_session_locations()?;
+        rebase_relocation_versions(&mut relocation.request, &tabs, &inventory)?;
+        let destination = Path::new(&relocation.request.destination);
+        if fs::canonicalize(destination).context("revalidate destination directory")? != destination
+        {
+            bail!(RELOCATION_DESTINATION_CHANGED);
+        }
+        fs::read_dir(destination).context("access destination directory")?;
+        if destination_tabs.is_some() {
+            change_cwd(destination).context("install destination working directory")?;
+            installed_cwd = true;
+        }
+        if let Some((id, cwd)) = &relocation.donor
+            && !database
+                .local_session_locations()?
+                .iter()
+                .any(|entry| entry.id == *id && entry.cwd == *cwd)
+        {
+            bail!(RELOCATION_DONOR_CHANGED);
+        }
+        database
+            .relocate_sessions_with_tabs(&relocation.request, &destination_tabs)
+            .context("commit session relocation")
+    })();
+    let count = match result {
+        Ok(count) => count,
+        Err(error) => {
+            if installed_cwd {
+                change_cwd(original_cwd).wrap_err_with(|| {
+                    format!(
+                        "{RELOCATION_ABORTED}: {error:#}. {RELOCATION_ROLLBACK_FAILED}: {}",
+                        original_cwd.display()
+                    )
+                })?;
+            }
+            return Ok((
+                ResolvedSessions {
+                    tabs,
+                    focused,
+                    warnings: vec![format!("{RELOCATION_ABORTED}: {error:#}")],
+                },
+                None,
+            ));
+        }
+    };
+    if count == 0 {
+        return Ok((
+            ResolvedSessions {
+                tabs,
+                focused,
+                warnings: vec![
+                    "No sessions moved; the selection is empty or already at the destination"
+                        .into(),
+                ],
+            },
+            None,
+        ));
+    }
+    let committed = format!(
+        "Relocation committed: moved {count} session(s) to {}. Active source plans and approvals were detached. Files and old workspace snapshots were not moved",
+        relocation.request.destination
+    );
+    let mut retained = Vec::new();
+    for tab in tabs {
+        let affected = destination_tabs
+            .as_ref()
+            .is_some_and(|tabs| tabs.open.contains(&tab.session.id));
+        if affected {
+            let session = setup::load_session(tab.session.id, storage).wrap_err_with(|| {
+                format!("{committed}. Could not reopen {}; reopen the committed session at the destination", tab.session.id)
+            })?;
+            retained.push(SessionTab {
+                session,
+                lease: tab.lease,
+            });
+        } else if !installed_cwd {
+            retained.push(tab);
+        }
+    }
+    let focused = retained
+        .iter()
+        .position(|tab| Some(tab.session.id) == focused_id)
+        .unwrap_or(0);
+    Ok((
+        ResolvedSessions {
+            tabs: retained,
+            focused,
+            warnings: vec![committed.clone()],
+        },
+        Some(committed),
+    ))
 }
 
 fn restore_warning(warnings: &mut Vec<String>, message: String) {
@@ -546,6 +772,7 @@ pub fn run(mut cli: Cli) -> Result<ExitCode> {
     let model_registry_ms = lap();
 
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
+    let startup_project_env = project_env_present(&cwd);
 
     let workcell_runtime = super::workcell_runtime::WorkcellRuntime::initialize(
         &cli.workcell,
@@ -657,7 +884,6 @@ pub fn run(mut cli: Cli) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    let cwd_str = cwd.to_string_lossy().into_owned();
     let session_cwd = workcell_runtime
         .is_remote()
         .then_some(workcell_runtime.display().cwd.as_str());
@@ -688,8 +914,14 @@ pub fn run(mut cli: Cli) -> Result<ExitCode> {
     let mut teardown = Teardown::default();
     let mut herdr_reporter = HerdrReporter::from_env();
     let mut sweeper = RetentionSweeper::spawn(storage.clone(), stack.config.storage.retention);
+    let mut committed_relocation: Option<String> = None;
 
     loop {
+        let runtime_cwd = if workcell_runtime.is_remote() {
+            cwd.clone()
+        } else {
+            local_runtime_cwd(&tabs, focused, env::current_dir())?
+        };
         for tab in &mut tabs {
             let session = &mut tab.session;
             if setup::session_history_head(session).is_none() {
@@ -715,7 +947,7 @@ pub fn run(mut cli: Cli) -> Result<ExitCode> {
         let permissions = Arc::new(
             caudra_agent::permissions::PermissionManager::new_persistent(
                 stack.config.permissions.clone(),
-                cwd.clone(),
+                runtime_cwd.clone(),
                 stack.plugin_host.plugin_rules(),
             ),
         );
@@ -739,6 +971,7 @@ pub fn run(mut cli: Cli) -> Result<ExitCode> {
                 config: stack.config.agent.clone(),
                 ui_config: stack.config.ui.clone(),
                 snapshots: stack.config.storage.snapshots,
+                allow_workspace_recovery: committed_relocation.is_none(),
                 input_history_size: stack.config.storage.input_history_size,
                 max_log_files: stack.config.storage.max_log_files,
                 permissions,
@@ -760,9 +993,14 @@ pub fn run(mut cli: Cli) -> Result<ExitCode> {
             },
             initial_prompt.take(),
         )
-        .context("run UI")?;
+        .wrap_err_with(|| match &committed_relocation {
+            Some(committed) => format!(
+                "{committed}. UI startup failed; reopen the committed sessions at the destination"
+            ),
+            None => "run UI".into(),
+        })?;
 
-        match outcome {
+        let (reloaded, f, relocation) = match outcome {
             RunOutcome::Exit { summary, code } => {
                 if let Some(summary) = summary {
                     let rich = io::stderr().is_terminal() && !cli.exit_on_done;
@@ -789,44 +1027,118 @@ pub fn run(mut cli: Cli) -> Result<ExitCode> {
             RunOutcome::Reload {
                 tabs: reloaded,
                 focused: f,
-            } => {
-                let started = Instant::now();
-                let last_good = (
-                    stack.config.clone(),
-                    stack.model.clone(),
-                    Arc::clone(&stack.prompt_profiles),
-                    stack.default_prompt_profile.clone(),
-                );
-                // Shut the old host down first so nothing can repopulate
-                // the registry after the clear: its senders disconnect, the
-                // watchdog aborts in-flight callbacks, and only this thread
-                // issues loads. The old VM then shares nothing with the new
-                // stack, so its slow join (up to 2s) can run on a
-                // background thread.
-                stack.plugin_host.begin_shutdown();
-                ToolRegistry::global().clear_lua();
-                teardown.defer(move || drop(stack));
-                let (new_stack, new_warnings) =
-                    build_stack(&cli, &cwd, &storage, Some(last_good), false)?;
-                tabs = reloaded;
-                if tabs.is_empty() {
-                    let session = AppSession::new(&new_stack.model.spec(), &cwd_str);
-                    let lease = Arc::new(SessionLease::acquire(&storage, session.id)?);
-                    setup::report_session_start(caudra_otel::emit::START_FRESH, Some(session.id));
-                    tabs.push(SessionTab { session, lease });
-                }
-                sweeper =
-                    RetentionSweeper::spawn(storage.clone(), new_stack.config.storage.retention);
-                stack = new_stack;
-                warnings = new_warnings;
-                focused = f.min(tabs.len() - 1);
-                tracing::info!(
-                    elapsed_ms = started.elapsed().as_millis() as u64,
-                    tabs = tabs.len(),
-                    "reload: rebuilt plugins and config"
-                );
+            } => (reloaded, f, None),
+            RunOutcome::Relocate {
+                tabs: reloaded,
+                focused: f,
+                relocation,
+            } => (reloaded, f, Some(relocation)),
+        };
+        let started = Instant::now();
+        let restart_for_env = relocation.as_ref().is_some_and(|relocation| {
+            relocation_requires_env_restart(
+                &reloaded,
+                &relocation.request,
+                &cwd,
+                startup_project_env,
+            )
+        });
+        let relocation = match relocation {
+            Some(relocation) if !relocation_moves_live_tabs(&reloaded, &relocation.request) => {
+                let original_cwd = env::current_dir().unwrap_or_else(|_| runtime_cwd.clone());
+                let (resolved, _) = relocate_stopped_sessions(
+                    reloaded,
+                    f,
+                    relocation,
+                    &storage,
+                    &original_cwd,
+                    |path| env::set_current_dir(path),
+                )?;
+                tabs = resolved.tabs;
+                focused = resolved.focused;
+                warnings = resolved.warnings;
+                stack.commands = discover_commands(cli.no_commands || workcell_runtime.is_remote());
+                committed_relocation = None;
+                continue;
             }
+            relocation => relocation,
+        };
+        let last_good = (
+            stack.config.clone(),
+            stack.model.clone(),
+            Arc::clone(&stack.prompt_profiles),
+            stack.default_prompt_profile.clone(),
+        );
+        stack.plugin_host.begin_shutdown();
+        ToolRegistry::global().clear_lua();
+        committed_relocation = None;
+        if let Some(relocation) = relocation {
+            stack.plugin_host.shutdown_checked().context(
+                "Session relocation aborted before changing directories: source plugins did not stop",
+            )?;
+            teardown.join();
+            drop(stack);
+            let original_cwd = env::current_dir().unwrap_or_else(|_| runtime_cwd.clone());
+            let (resolved, committed) = relocate_stopped_sessions(
+                reloaded,
+                f,
+                relocation,
+                &storage,
+                &original_cwd,
+                |path| env::set_current_dir(path),
+            )?;
+            tabs = resolved.tabs;
+            focused = resolved.focused;
+            warnings = resolved.warnings;
+            committed_relocation = committed;
+            if restart_for_env && let Some(committed) = &committed_relocation {
+                drop(sweeper);
+                teardown.join();
+                if let Some(reporter) = herdr_reporter.take() {
+                    reporter.shutdown();
+                }
+                eprintln!("{committed}. {RELOCATION_ENV_RESTART}.");
+                return Ok(ExitCode::SUCCESS);
+            }
+        } else {
+            teardown.defer(move || drop(stack));
+            tabs = reloaded;
+            focused = f;
         }
+        let reload_cwd = if workcell_runtime.is_remote() {
+            cwd.clone()
+        } else {
+            local_runtime_cwd(&tabs, focused, env::current_dir())?
+        };
+        let fallback =
+            (committed_relocation.is_none() && reload_cwd == runtime_cwd).then_some(last_good);
+        let (new_stack, new_warnings) = build_stack(
+            &cli,
+            &reload_cwd,
+            &storage,
+            fallback,
+            workcell_runtime.is_remote(),
+        )
+        .wrap_err_with(|| match &committed_relocation {
+            Some(committed) => format!("{committed}. Runtime initialization failed; reopen the committed sessions at the destination"),
+            None => "rebuild runtime".into(),
+        })?;
+        if tabs.is_empty() {
+            let session = AppSession::new(&new_stack.model.spec(), &reload_cwd.to_string_lossy());
+            let lease = Arc::new(SessionLease::acquire(&storage, session.id)?);
+            setup::report_session_start(caudra_otel::emit::START_FRESH, Some(session.id));
+            tabs.push(SessionTab { session, lease });
+        }
+        sweeper = RetentionSweeper::spawn(storage.clone(), new_stack.config.storage.retention);
+        stack = new_stack;
+        warnings.extend(new_warnings);
+        focused = focused.min(tabs.len() - 1);
+        tracing::info!(
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            tabs = tabs.len(),
+            relocated = committed_relocation.is_some(),
+            "rebuilt plugins and config"
+        );
     }
 }
 
@@ -844,9 +1156,13 @@ fn exit_report(summary: &ExitSummary, rich: bool) -> String {
 mod tests {
     use super::*;
     use caudra_config::RawConfig;
+    use caudra_storage::state::write_workspace_tabs;
     use color_eyre::eyre::eyre;
     use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
     use std::path::PathBuf;
+    use std::slice;
     use std::sync::atomic::{AtomicBool, Ordering};
     use test_case::test_case;
 
@@ -858,6 +1174,588 @@ mod tests {
     const DUPLICATE_TAB_WARNING: &str = "is duplicated";
     const MISSING_TAB_WARNING: &str = "no longer exists";
     const WRONG_CWD_WARNING: &str = "belongs to";
+    const INJECTED_CWD_FAILURE: &str = "injected working directory failure";
+    const INJECTED_CONFIG_FAILURE: &str = "injected destination config failure";
+    const RELOCATION_COMMITTED: &str = "Relocation committed";
+
+    fn relocation_test_tab(storage: &StateDir, cwd: &Path) -> SessionTab {
+        let mut session = AppSession::new(TEST_MODEL, &cwd.to_string_lossy());
+        session.save(storage).unwrap();
+        let lease = Arc::new(SessionLease::acquire(storage, session.id).unwrap());
+        SessionTab { session, lease }
+    }
+
+    fn relocation_handoff(
+        storage: &StateDir,
+        tabs: &[SessionTab],
+        source: &Path,
+        destination: &Path,
+        bulk: bool,
+    ) -> SessionRelocationHandoff {
+        let sessions: Vec<_> = SessionDatabase::open_state(storage)
+            .unwrap()
+            .local_session_locations()
+            .unwrap()
+            .into_iter()
+            .filter(|entry| entry.cwd == source.to_string_lossy())
+            .filter(|entry| bulk || entry.id == tabs[0].session.id)
+            .collect();
+        let leases = sessions
+            .iter()
+            .filter(|entry| !tabs.iter().any(|tab| tab.session.id == entry.id))
+            .map(|entry| Arc::new(SessionLease::acquire(storage, entry.id).unwrap()))
+            .collect();
+        SessionRelocationHandoff {
+            request: SessionRelocation {
+                sessions,
+                source_cwd: bulk.then(|| source.to_string_lossy().into_owned()),
+                destination: destination.to_string_lossy().into_owned(),
+            },
+            donor: None,
+            leases,
+        }
+    }
+
+    #[test_case(PROJECT_ENV_PATH, true; "project_env")]
+    #[test_case(".env", false; "root_env_is_not_project_env")]
+    #[test_case(".caudra/config.lua", false; "other_project_file")]
+    fn project_env_detection_is_scoped_to_project_env(relative: &str, expected: bool) {
+        let temp = tempfile::tempdir().unwrap();
+        assert!(!project_env_present(temp.path()));
+        let path = temp.path().join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "").unwrap();
+        assert_eq!(project_env_present(temp.path()), expected);
+        fs::remove_file(path).unwrap();
+        assert!(!project_env_present(temp.path()));
+    }
+
+    #[cfg(unix)]
+    #[test_case(false; "existing_target")]
+    #[test_case(true; "dangling_target")]
+    fn project_env_detection_is_conservative_for_symlinks(dangling: bool) {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target");
+        if !dangling {
+            fs::write(&target, "").unwrap();
+        }
+        let path = temp.path().join(PROJECT_ENV_PATH);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        symlink(target, path).unwrap();
+        assert!(project_env_present(temp.path()));
+    }
+
+    #[test_case(None, true, false; "no_project_env")]
+    #[test_case(Some("source"), true, true; "source_project_env")]
+    #[test_case(Some("destination"), true, true; "destination_project_env")]
+    #[test_case(Some("startup"), true, true; "startup_project_env_appeared")]
+    #[test_case(None, false, false; "missing_source_without_env")]
+    #[test_case(Some("destination"), false, true; "missing_source_destination_env")]
+    #[test_case(Some("startup"), false, true; "missing_source_startup_env")]
+    fn live_relocation_checks_project_environments(
+        env_directory: Option<&str>,
+        source_exists: bool,
+        expected: bool,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = StateDir::from_path(temp.path().join("state"));
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        let startup = temp.path().join("startup");
+        for directory in [&destination, &startup] {
+            fs::create_dir(directory).unwrap();
+        }
+        if source_exists {
+            fs::create_dir(&source).unwrap();
+        }
+        let startup_project_env = project_env_present(&startup);
+        if let Some(directory) = env_directory {
+            let path = temp.path().join(directory).join(PROJECT_ENV_PATH);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "").unwrap();
+        }
+        let tabs = vec![relocation_test_tab(&storage, &source)];
+        let handoff = relocation_handoff(&storage, &tabs, &source, &destination, false);
+        assert!(relocation_moves_live_tabs(&tabs, &handoff.request));
+        assert_eq!(
+            relocation_requires_env_restart(&tabs, &handoff.request, &startup, startup_project_env),
+            expected
+        );
+    }
+
+    #[test_case(false; "startup_env_removed")]
+    #[test_case(true; "startup_directory_removed")]
+    fn live_relocation_remembers_captured_startup_environment(remove_directory: bool) {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = StateDir::from_path(temp.path().join("state"));
+        let source = temp.path().join("missing source");
+        let destination = temp.path().join("destination");
+        fs::create_dir(&destination).unwrap();
+        let startup = temp.path().join("startup");
+        let path = startup.join(PROJECT_ENV_PATH);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "").unwrap();
+        let startup_project_env = project_env_present(&startup);
+        if remove_directory {
+            fs::remove_dir_all(&startup).unwrap();
+        } else {
+            fs::remove_file(path).unwrap();
+        }
+        let tabs = vec![relocation_test_tab(&storage, &source)];
+        let handoff = relocation_handoff(&storage, &tabs, &source, &destination, false);
+        assert!(!relocation_requires_env_restart(
+            &tabs,
+            &handoff.request,
+            &startup,
+            false,
+        ));
+        assert!(relocation_requires_env_restart(
+            &tabs,
+            &handoff.request,
+            &startup,
+            startup_project_env,
+        ));
+    }
+
+    #[test_case(false, false; "current_only_new_layout")]
+    #[test_case(false, true; "current_only_existing_layout")]
+    #[test_case(true, false; "active_bulk_new_layout")]
+    #[test_case(true, true; "active_bulk_existing_layout")]
+    fn relocation_retains_live_tabs_after_destination_config_failure(
+        bulk: bool,
+        existing_layout: bool,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = StateDir::from_path(temp.path().join("state"));
+        let source = temp.path().join("missing source");
+        let destination = fs::canonicalize(temp.path()).unwrap();
+        let tabs = vec![
+            relocation_test_tab(&storage, &source),
+            relocation_test_tab(&storage, &source),
+        ];
+        let ids: Vec<_> = tabs.iter().map(|tab| tab.session.id).collect();
+        let closed = save_test_session(&storage, &source);
+        let donor = save_test_session(&storage, &destination);
+        write_workspace_tabs(
+            &storage,
+            &source,
+            &WorkspaceTabs {
+                open: ids.clone(),
+                focused: Some(ids[1]),
+            },
+        )
+        .unwrap();
+        if existing_layout {
+            write_workspace_tabs(
+                &storage,
+                &destination,
+                &WorkspaceTabs {
+                    open: vec![donor],
+                    focused: Some(donor),
+                },
+            )
+            .unwrap();
+        }
+        let mut handoff = relocation_handoff(&storage, &tabs, &source, &destination, bulk);
+        handoff.donor = Some((donor, destination.to_string_lossy().into_owned()));
+        let mut old_lineage = tabs[0].session.clone();
+        old_lineage.save(&storage).unwrap();
+        let mut installed = Vec::new();
+        let (mut resolved, committed) =
+            relocate_stopped_sessions(tabs, 1, handoff, &storage, &source, |path| {
+                installed.push(path.to_path_buf());
+                Ok(())
+            })
+            .unwrap();
+        assert!(committed.unwrap().contains(RELOCATION_COMMITTED));
+        assert_eq!(installed, slice::from_ref(&destination));
+        assert_eq!(resolved.focused, usize::from(bulk));
+        let expected_tabs = WorkspaceTabs {
+            open: if bulk { ids.clone() } else { vec![ids[0]] },
+            focused: Some(ids[usize::from(bulk)]),
+        };
+        assert_eq!(
+            read_workspace_tabs(&storage, &destination).unwrap(),
+            Some(expected_tabs.clone())
+        );
+        assert_eq!(
+            resolved
+                .tabs
+                .iter()
+                .map(|tab| tab.session.id)
+                .collect::<Vec<_>>(),
+            if bulk { ids.clone() } else { vec![ids[0]] }
+        );
+        assert!(old_lineage.save(&storage).is_err());
+        resolved.tabs[0].session.save(&storage).unwrap();
+        for id in [ids[0], ids[1], closed, donor] {
+            let stored = setup::load_session(id, &storage).unwrap();
+            let moved = id == ids[0] || (bulk && id != donor);
+            assert_eq!(
+                stored.cwd,
+                if moved || id == donor {
+                    &destination
+                } else {
+                    &source
+                }
+                .to_string_lossy()
+            );
+        }
+        assert_eq!(
+            local_runtime_cwd(&resolved.tabs, resolved.focused, Ok(source)).unwrap(),
+            destination
+        );
+        let error =
+            config_or_fallback::<()>(Err(eyre!(INJECTED_CONFIG_FAILURE)), None, &mut Vec::new())
+                .unwrap_err();
+        assert_eq!(error.to_string(), INJECTED_CONFIG_FAILURE);
+        drop(resolved);
+        let restored =
+            resolve_sessions(true, None, TEST_MODEL, &destination, &storage, None).unwrap();
+        assert_eq!(
+            restored
+                .tabs
+                .iter()
+                .map(|tab| tab.session.id)
+                .collect::<Vec<_>>(),
+            expected_tabs.open
+        );
+        assert_eq!(
+            Some(restored.tabs[restored.focused].session.id),
+            expected_tabs.focused
+        );
+    }
+
+    #[test_case(false, false; "closed_source")]
+    #[test_case(true, false; "empty_source")]
+    #[test_case(false, true; "closed_source_with_project_env")]
+    #[test_case(true, true; "empty_source_with_project_env")]
+    fn relocation_of_other_source_keeps_invoking_tabs_and_cwd(empty: bool, with_env: bool) {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = StateDir::from_path(temp.path().join("state"));
+        let source = temp.path().join("deleted source");
+        let destination = fs::canonicalize(temp.path()).unwrap();
+        let invoking = temp.path().join("invoking");
+        let tabs = vec![
+            relocation_test_tab(&storage, &invoking),
+            relocation_test_tab(&storage, &invoking),
+        ];
+        let ids: Vec<_> = tabs.iter().map(|tab| tab.session.id).collect();
+        let closed = (!empty).then(|| save_test_session(&storage, &source));
+        let donor = save_test_session(&storage, &destination);
+        let destination_tabs = WorkspaceTabs {
+            open: vec![donor],
+            focused: Some(donor),
+        };
+        write_workspace_tabs(&storage, &destination, &destination_tabs).unwrap();
+        let handoff = relocation_handoff(&storage, &tabs, &source, &destination, true);
+        if with_env {
+            for directory in [&source, &destination, &invoking] {
+                let path = directory.join(PROJECT_ENV_PATH);
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(path, "").unwrap();
+            }
+        }
+        assert!(!relocation_moves_live_tabs(&tabs, &handoff.request));
+        assert!(!relocation_requires_env_restart(
+            &tabs,
+            &handoff.request,
+            &invoking,
+            project_env_present(&invoking),
+        ));
+        let (resolved, committed) =
+            relocate_stopped_sessions(tabs, 1, handoff, &storage, &invoking, |_| {
+                panic!("closed-source migration must not change process cwd")
+            })
+            .unwrap();
+        assert_eq!(committed.is_some(), !empty);
+        assert_eq!(
+            read_workspace_tabs(&storage, &destination).unwrap(),
+            Some(destination_tabs)
+        );
+        assert_eq!(resolved.focused, 1);
+        assert_eq!(
+            resolved
+                .tabs
+                .iter()
+                .map(|tab| tab.session.id)
+                .collect::<Vec<_>>(),
+            ids
+        );
+        assert!(
+            resolved
+                .tabs
+                .iter()
+                .all(|tab| tab.session.cwd == invoking.to_string_lossy())
+        );
+        if let Some(id) = closed {
+            assert_eq!(
+                setup::load_session(id, &storage).unwrap().cwd,
+                destination.to_string_lossy()
+            );
+        }
+    }
+
+    #[test]
+    fn relocation_same_directory_keeps_siblings_and_versions() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = StateDir::from_path(temp.path().join("state"));
+        let cwd = fs::canonicalize(temp.path()).unwrap();
+        let tabs = vec![
+            relocation_test_tab(&storage, &cwd),
+            relocation_test_tab(&storage, &cwd),
+        ];
+        let handoff = relocation_handoff(&storage, &tabs, &cwd, &cwd, false);
+        let path = cwd.join(PROJECT_ENV_PATH);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, "").unwrap();
+        assert!(!relocation_moves_live_tabs(&tabs, &handoff.request));
+        assert!(!relocation_requires_env_restart(
+            &tabs,
+            &handoff.request,
+            &cwd,
+            project_env_present(&cwd),
+        ));
+        let layout = WorkspaceTabs {
+            open: tabs.iter().map(|tab| tab.session.id).collect(),
+            focused: Some(tabs[1].session.id),
+        };
+        write_workspace_tabs(&storage, &cwd, &layout).unwrap();
+        let before = SessionDatabase::open_state(&storage)
+            .unwrap()
+            .local_session_locations()
+            .unwrap();
+        let (resolved, committed) =
+            relocate_stopped_sessions(tabs, 1, handoff, &storage, &cwd, |_| {
+                panic!("same-directory relocation must not change process cwd")
+            })
+            .unwrap();
+        assert!(committed.is_none());
+        assert_eq!(resolved.tabs.len(), 2);
+        assert_eq!(resolved.focused, 1);
+        assert_eq!(read_workspace_tabs(&storage, &cwd).unwrap(), Some(layout));
+        assert_eq!(
+            SessionDatabase::open_state(&storage)
+                .unwrap()
+                .local_session_locations()
+                .unwrap(),
+            before
+        );
+    }
+
+    #[test_case(false; "donor_changed")]
+    #[test_case(true; "donor_deleted")]
+    fn relocation_rejects_stale_donor(deleted: bool) {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = StateDir::from_path(temp.path().join("state"));
+        let source = temp.path().join("source");
+        let destination = fs::canonicalize(temp.path()).unwrap();
+        let tabs = vec![relocation_test_tab(&storage, &source)];
+        let donor = save_test_session(&storage, &destination);
+        let mut handoff = relocation_handoff(&storage, &tabs, &source, &destination, false);
+        handoff.donor = Some((donor, destination.to_string_lossy().into_owned()));
+        if deleted {
+            AppSession::delete(donor, &storage).unwrap();
+        } else {
+            let mut session = setup::load_session(donor, &storage).unwrap();
+            session.set_cwd(source.to_string_lossy().into_owned());
+            session.save(&storage).unwrap();
+        }
+        let mut attempted = Vec::new();
+        let (resolved, committed) =
+            relocate_stopped_sessions(tabs, 0, handoff, &storage, &source, |path| {
+                attempted.push(path.to_path_buf());
+                Ok(())
+            })
+            .unwrap();
+        assert!(committed.is_none());
+        assert_eq!(attempted, [destination, source.clone()]);
+        assert!(resolved.warnings[0].contains(RELOCATION_DONOR_CHANGED));
+        assert_eq!(resolved.tabs[0].session.cwd, source.to_string_lossy());
+    }
+
+    #[test_case(false; "live_external_write")]
+    #[test_case(true; "closed_external_write")]
+    fn relocation_never_rebases_external_writes(closed: bool) {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = StateDir::from_path(temp.path().join("state"));
+        let source = temp.path().join("source");
+        let destination = fs::canonicalize(temp.path()).unwrap();
+        let tabs = vec![relocation_test_tab(&storage, &source)];
+        let id = if closed {
+            save_test_session(&storage, &source)
+        } else {
+            tabs[0].session.id
+        };
+        let handoff = relocation_handoff(&storage, &tabs, &source, &destination, true);
+        let mut external = setup::load_session(id, &storage).unwrap();
+        external.save(&storage).unwrap();
+        let before = SessionDatabase::open_state(&storage)
+            .unwrap()
+            .local_session_locations()
+            .unwrap();
+        let (resolved, committed) =
+            relocate_stopped_sessions(tabs, 0, handoff, &storage, &source, |_| Ok(())).unwrap();
+        assert!(committed.is_none());
+        assert!(resolved.warnings[0].contains(RELOCATION_ABORTED));
+        if !closed {
+            assert!(resolved.warnings[0].contains(RELOCATION_VERSION_CHANGED));
+        }
+        assert_eq!(
+            SessionDatabase::open_state(&storage)
+                .unwrap()
+                .local_session_locations()
+                .unwrap(),
+            before
+        );
+    }
+
+    #[test_case(false; "cwd_install_failure")]
+    #[test_case(true; "destination_removed")]
+    fn relocation_filesystem_failure_reopens_original_tabs(missing: bool) {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = StateDir::from_path(temp.path().join("state"));
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        fs::create_dir(&destination).unwrap();
+        let tabs = vec![
+            relocation_test_tab(&storage, &source),
+            relocation_test_tab(&storage, &source),
+        ];
+        let handoff = relocation_handoff(&storage, &tabs, &source, &destination, false);
+        if missing {
+            fs::remove_dir(&destination).unwrap();
+        }
+        let mut attempted = Vec::new();
+        let (resolved, committed) =
+            relocate_stopped_sessions(tabs, 1, handoff, &storage, &source, |path| {
+                attempted.push(path.to_path_buf());
+                Err(io::Error::other(INJECTED_CWD_FAILURE))
+            })
+            .unwrap();
+        assert!(committed.is_none());
+        assert_eq!(resolved.tabs.len(), 2);
+        assert_eq!(resolved.focused, 1);
+        assert!(resolved.warnings[0].contains(RELOCATION_ABORTED));
+        assert_eq!(attempted.len(), usize::from(!missing));
+        if !missing {
+            assert!(resolved.warnings[0].contains(INJECTED_CWD_FAILURE));
+        }
+        for tab in resolved.tabs {
+            assert_eq!(
+                setup::load_session(tab.session.id, &storage).unwrap().cwd,
+                source.to_string_lossy()
+            );
+        }
+    }
+
+    #[test]
+    fn relocation_database_open_failure_reopens_original_tabs() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = StateDir::from_path(temp.path().join("state"));
+        let source = temp.path().join("source");
+        let destination = fs::canonicalize(temp.path()).unwrap();
+        let tabs = vec![relocation_test_tab(&storage, &source)];
+        let id = tabs[0].session.id;
+        let handoff = relocation_handoff(&storage, &tabs, &source, &destination, false);
+        let database_path = SessionDatabase::open_state(&storage).unwrap().path();
+        let backup = temp.path().join("database-backup");
+        fs::rename(&database_path, &backup).unwrap();
+        fs::create_dir(&database_path).unwrap();
+        let (resolved, committed) =
+            relocate_stopped_sessions(tabs, 0, handoff, &storage, &source, |_| {
+                panic!("database open failure must abort before changing cwd")
+            })
+            .unwrap();
+        fs::remove_dir(&database_path).unwrap();
+        fs::rename(backup, database_path).unwrap();
+        assert!(committed.is_none());
+        assert_eq!(resolved.tabs[0].session.id, id);
+        assert!(resolved.warnings[0].contains(RELOCATION_ABORTED));
+        assert_eq!(
+            setup::load_session(id, &storage).unwrap().cwd,
+            source.to_string_lossy()
+        );
+    }
+
+    #[test_case(false; "transaction_failure_restores_cwd")]
+    #[test_case(true; "rollback_cwd_failure_stops_restart")]
+    fn relocation_transaction_failure_rolls_back_before_restart(rollback_fails: bool) {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = StateDir::from_path(temp.path().join("state"));
+        let source = temp.path().join("missing source");
+        let destination = fs::canonicalize(temp.path()).unwrap();
+        let tabs = vec![relocation_test_tab(&storage, &source)];
+        let id = tabs[0].session.id;
+        let handoff = relocation_handoff(&storage, &tabs, &source, &destination, true);
+        let mut attempted = Vec::new();
+        let source_tabs = WorkspaceTabs {
+            open: vec![id],
+            focused: Some(id),
+        };
+        let donor = save_test_session(&storage, &destination);
+        let destination_tabs = WorkspaceTabs {
+            open: vec![donor],
+            focused: Some(donor),
+        };
+        write_workspace_tabs(&storage, &source, &source_tabs).unwrap();
+        write_workspace_tabs(&storage, &destination, &destination_tabs).unwrap();
+        let result = relocate_stopped_sessions(tabs, 0, handoff, &storage, &source, |path| {
+            attempted.push(path.to_path_buf());
+            if path == destination {
+                save_test_session(&storage, &source);
+            } else if rollback_fails {
+                return Err(io::Error::other(INJECTED_CWD_FAILURE));
+            }
+            Ok(())
+        });
+        assert_eq!(attempted, [destination.clone(), source.clone()]);
+        if rollback_fails {
+            let error = result.err().unwrap().to_string();
+            assert!(error.contains(RELOCATION_ROLLBACK_FAILED));
+            assert!(error.contains(RELOCATION_ABORTED));
+        } else {
+            let (resolved, committed) = result.unwrap();
+            assert!(committed.is_none());
+            assert!(resolved.warnings[0].contains(RELOCATION_ABORTED));
+            assert_eq!(resolved.tabs[0].session.id, id);
+        }
+        assert_eq!(
+            setup::load_session(id, &storage).unwrap().cwd,
+            source.to_string_lossy()
+        );
+        assert_eq!(
+            read_workspace_tabs(&storage, &source).unwrap(),
+            Some(source_tabs)
+        );
+        assert_eq!(
+            read_workspace_tabs(&storage, &destination).unwrap(),
+            Some(destination_tabs)
+        );
+    }
+
+    #[test_case(0; "first_focused")]
+    #[test_case(1; "second_focused")]
+    fn reload_cwd_comes_from_focused_session_not_startup(focused: usize) {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = StateDir::from_path(temp.path().join("state"));
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        let tabs = vec![
+            relocation_test_tab(&storage, &first),
+            relocation_test_tab(&storage, &second),
+        ];
+        let current = temp.path().to_path_buf();
+        assert_eq!(
+            local_runtime_cwd(&tabs, focused, Ok(current.clone())).unwrap(),
+            if focused == 0 { first } else { second }
+        );
+        assert_eq!(
+            local_runtime_cwd(&[], 0, Ok(current.clone())).unwrap(),
+            current
+        );
+        assert!(local_runtime_cwd(&[], 0, Err(io::Error::other(INJECTED_CWD_FAILURE))).is_err());
+    }
 
     #[test_case(Some("fix it"), None, Some("fix it"); "flag_only")]
     #[test_case(None, Some("piped\n"), Some("piped\n"); "stdin_kept_verbatim")]

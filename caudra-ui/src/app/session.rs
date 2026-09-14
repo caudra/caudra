@@ -8,6 +8,7 @@ use crate::app::tasks::TaskOutcome;
 use crate::chat::{CANCELLED_TEXT, Chat, DONE_TEXT, ERROR_TEXT, history_to_display};
 use crate::components::rewind_picker::RewindEntry;
 use crate::components::session_picker::{SessionPickerAction, SessionRow};
+use crate::components::session_relocation::SessionRelocationAction;
 use crate::components::{Action, DisplaySource, ForkDraft, ForkedSession, LoadedSession};
 use crate::input_document::InputDraft;
 use crate::repaint::{Dirty, Watch};
@@ -25,9 +26,9 @@ use caudra_providers::{
 use caudra_storage::id::CaudraId;
 use caudra_storage::sessions::{
     PendingConversationRevert, PendingRestoreKind, PendingRestoreOperation, PendingRestorePhase,
-    SessionDatabase, SessionLease, SessionMeta, StoredActiveGoal, StoredGoalResult, StoredImage,
-    StoredPasteRange, StoredPlanTarget, StoredPromptAdmission, StoredQueuedDraft,
-    StoredQueuedPrompt, StoredSubagent, StoredSubagentOutcome,
+    SessionDatabase, SessionLease, SessionLocation, SessionMeta, StoredActiveGoal,
+    StoredGoalResult, StoredImage, StoredPasteRange, StoredPlanTarget, StoredPromptAdmission,
+    StoredQueuedDraft, StoredQueuedPrompt, StoredSubagent, StoredSubagentOutcome,
 };
 use caudra_storage::tool_outputs::{ToolOutputId, ToolOutputRef, ToolOutputStore};
 use ratatui::layout::Rect;
@@ -2764,6 +2765,43 @@ impl App {
             }
             SessionPickerAction::Generate(id) => vec![Action::GenerateSessionTitle(id)],
             SessionPickerAction::New => vec![Action::RequestNewSession],
+            SessionPickerAction::MoveCurrent => vec![Action::OpenSessionRelocation {
+                bulk: false,
+                destination: None,
+            }],
+            SessionPickerAction::MigrateDirectory => vec![Action::OpenSessionRelocation {
+                bulk: true,
+                destination: None,
+            }],
+        }
+    }
+
+    pub(crate) fn open_session_relocation(
+        &mut self,
+        locations: Vec<SessionLocation>,
+        bulk: bool,
+        destination: Option<String>,
+        other_open_count: usize,
+    ) {
+        self.session_relocation_picker.open(
+            self.state.session.id,
+            self.state.session.cwd.clone(),
+            locations,
+            bulk,
+            destination,
+            other_open_count,
+        );
+    }
+
+    pub(super) fn handle_session_relocation_action(
+        &mut self,
+        action: SessionRelocationAction,
+    ) -> Vec<Action> {
+        match action {
+            SessionRelocationAction::Consumed | SessionRelocationAction::Closed => Vec::new(),
+            SessionRelocationAction::Confirm(request, donor) => {
+                vec![Action::RelocateSessions { request, donor }]
+            }
         }
     }
 

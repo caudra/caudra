@@ -63,6 +63,19 @@ fn autoscroll_rows(distance: i32) -> i32 {
 impl App {
     pub(super) fn handle_mouse(&mut self, event: MouseEvent) -> Vec<crate::components::Action> {
         let at = Position::new(event.column, event.row);
+        if self.session_relocation_picker.is_open() {
+            self.clear_control_hovers();
+            self.autoscroll = None;
+            self.selection_state = None;
+            if event.kind == MouseEventKind::Down(MouseButton::Left)
+                && !self.session_relocation_picker.contains(at)
+            {
+                self.session_relocation_picker.close();
+                return Vec::new();
+            }
+            let action = self.session_relocation_picker.handle_mouse(event);
+            return self.handle_session_relocation_action(action);
+        }
         match event.kind {
             MouseEventKind::Down(MouseButton::Middle) => {
                 self.toggle_autoscroll(at);
@@ -700,6 +713,10 @@ impl App {
     }
 
     pub(super) fn handle_scroll(&mut self, column: u16, row: u16, delta: i32) {
+        if self.session_relocation_picker.is_open() {
+            self.session_relocation_picker.scroll(delta);
+            return;
+        }
         // The wheel is aggregated into `Msg::Scroll` before `handle_mouse` ever
         // runs, so the workbench has to be offered it here as well or its panes
         // never see a wheel at all. Its rows count downwards.

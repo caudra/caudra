@@ -20,8 +20,8 @@ use caudra_workflow::{
     CallKey, CallKind, CallState, DEFAULT_AGENT_BUDGET, Journal, JournalEntry, LaunchRequest,
     MAX_ACTIVE_RUNS, MAX_AGENT_BUDGET, RunCall, RunCallBody, RunDetail, RunHistoryEntry,
     RunSnapshot, RunStatus, RunUsage, SmokeResult, WORKFLOW_ABI_VERSION, WORKFLOW_LANGUAGE_VERSION,
-    WorkflowError, WorkflowOutcome, WorkflowRequest, WorkflowResponse, WorkflowState, call_body,
-    call_preview, hash_request, validate,
+    WorkflowError, WorkflowEvent, WorkflowOutcome, WorkflowRequest, WorkflowResponse,
+    WorkflowState, call_body, call_preview, hash_request, validate,
 };
 use flume::Receiver;
 use serde_json::Value;
@@ -38,7 +38,7 @@ use super::store::WorkflowStore;
 use crate::AgentMode;
 use crate::agent::task_runner::{ModeResolver, TaskRunner};
 use crate::cancel::{CancelMap, CancelToken, CancelTrigger};
-use crate::types::Envelope;
+use crate::types::{AgentEvent, Envelope, EventSender, WORKFLOW_EVENT_RUN_ID, WorkflowProvenance};
 
 const OBJECTIVE_ARG: &str = "objective";
 const QUERY_ARG: &str = "query";
@@ -429,6 +429,51 @@ impl Manager {
         status: RunStatus,
     ) -> Result<WorkflowResponse, WorkflowError> {
         let current = self.find(run_id)?;
+        if status == RunStatus::Cancelled
+            && matches!(current.status, RunStatus::Paused | RunStatus::BudgetLimited)
+        {
+            if let Some(ended) = self.active.remove(run_id) {
+                ended.task.await;
+            }
+            let update = self
+                .env
+                .store
+                .update_run(
+                    run_id.to_owned(),
+                    current.revision,
+                    current.execution_epoch,
+                    WorkflowRunPatch {
+                        status: Some(WorkflowRunStatus::Cancelled),
+                        execution_epoch: Some(current.execution_epoch + 1),
+                        outbox_pending: Some(true),
+                        ..WorkflowRunPatch::default()
+                    },
+                )
+                .await?;
+            let mut snapshot = snapshot_from_row(&self.load_row(run_id).await?);
+            restore_timeline(
+                &mut snapshot,
+                &self.env.store.load_events(run_id.to_owned()).await?,
+            );
+            publish(&self.env.published, &snapshot);
+            if update == WorkflowUpdate::Stale {
+                return Err(WorkflowError::InvalidTransition {
+                    run_id: run_id.to_owned(),
+                    status: snapshot.status,
+                });
+            }
+            EventSender::new(self.env.events.clone(), WORKFLOW_EVENT_RUN_ID)
+                .with_workflow(WorkflowProvenance {
+                    run_id: run_id.to_owned(),
+                    epoch: snapshot.execution_epoch,
+                    call_key: 0,
+                    phase: snapshot.phase.clone(),
+                })
+                .try_send(AgentEvent::Workflow(Box::new(WorkflowEvent::Snapshot(
+                    Box::new(snapshot.clone()),
+                ))));
+            return Ok(WorkflowResponse::Run(Box::new(snapshot)));
+        }
         if current.status != RunStatus::Active {
             return Err(WorkflowError::InvalidTransition {
                 run_id: run_id.to_owned(),
@@ -782,8 +827,9 @@ mod tests {
     use std::path::Path;
     use std::sync::Mutex;
 
+    use caudra_storage::sessions::{SessionDatabase, SessionRelocation};
     use caudra_storage::workflow::{WorkflowCallState, WorkflowEventKind, WorkflowSourceKind};
-    use caudra_workflow::{RosterState, WorkflowEvent};
+    use caudra_workflow::RosterState;
     use serde_json::json;
     use tempfile::TempDir;
     use test_case::test_case;
@@ -791,7 +837,6 @@ mod tests {
     use super::*;
     use crate::StoredSession;
     use crate::agent::task_runner::{TaskFuture, TaskOutcome, TaskRequest};
-    use crate::types::{AgentEvent, EventSender, WORKFLOW_EVENT_RUN_ID, WorkflowProvenance};
 
     const MODEL: &str = "test/model";
     const DESCRIPTION: &str = "A test workflow";
@@ -810,6 +855,7 @@ mod tests {
     const PAUSE_KIND: &str = "verification";
     const PAUSE_MESSAGE: &str = "check the first result";
     const UNKNOWN_RUN: &str = "no-such-run";
+    const RELOCATED_PROJECT: &str = "relocated";
     /// The engine numbers a run's calls from one.
     const FIRST_KEY: u64 = 1;
     const SECOND_KEY: u64 = 2;
@@ -842,6 +888,12 @@ complete([first.output.echo, second.output.echo]);
     const PAIR_BODY: &str = r#"
 let first = agent("one", #{ label: "worker-1" });
 let second = agent("two", #{ label: "worker-2" });
+complete([first.output.echo, second.output.echo]);
+"#;
+    const FAILING: &str = "failing";
+    const FAILING_BODY: &str = r#"
+let first = agent("one", #{ label: "worker-1" });
+let second = agent("two", #{ label: "fail-2" });
 complete([first.output.echo, second.output.echo]);
 "#;
     const FANOUT: &str = "fanout";
@@ -1032,6 +1084,19 @@ complete(first.output.echo);
 
         async fn spawn(&self) -> WorkflowRuntime {
             self.spawn_as(self.session_id).await
+        }
+
+        fn relocate(&mut self) {
+            let destination = self._temp.path().join(RELOCATED_PROJECT);
+            fs::create_dir(&destination).unwrap();
+            let mut database = SessionDatabase::open(&self.state_dir).unwrap();
+            let request = SessionRelocation {
+                sessions: database.local_session_locations().unwrap(),
+                source_cwd: Some(self.project.to_string_lossy().into_owned()),
+                destination: destination.to_string_lossy().into_owned(),
+            };
+            assert_eq!(database.relocate_sessions(&request).unwrap(), 1);
+            self.project = destination;
         }
 
         /// A second session in the same state directory, as another
@@ -1474,6 +1539,199 @@ complete(first.output.echo);
             assert_eq!(paused_again.execution_epoch, 1, "{RESUME_BUMPS_EPOCH}");
             assert_eq!(fixture.runner.labels(), ["worker-1"], "{JOURNAL_REPLAYS}");
             runtime.shutdown().await;
+        });
+    }
+
+    #[test_case(PAUSING, PAUSING_BODY, RunStatus::Paused, false; "paused")]
+    #[test_case(PAIR, PAIR_BODY, RunStatus::BudgetLimited, false; "budget_limited")]
+    #[test_case(PAUSING, PAUSING_BODY, RunStatus::Paused, true; "restarted_paused")]
+    #[test_case(PAIR, PAIR_BODY, RunStatus::BudgetLimited, true; "restarted_budget_limited")]
+    fn stop_settled_run_without_executing_or_raising_budget(
+        name: &str,
+        body: &str,
+        status: RunStatus,
+        restart: bool,
+    ) {
+        smol::block_on(async {
+            let mut fixture = Fixture::new();
+            fixture.user_workflow(name, body);
+            let runtime = fixture.spawn().await;
+            let started = start(&runtime.handle(), name, Some(1)).await;
+            let settled = fixture.wait_for(&started.run_id, status).await;
+            let runtime = if restart {
+                runtime.shutdown().await;
+                fixture.spawn().await
+            } else {
+                runtime
+            };
+            let handle = runtime.handle();
+            assert_eq!(
+                handle
+                    .request(WorkflowRequest::Pause {
+                        run_id: started.run_id.clone()
+                    })
+                    .await,
+                Err(WorkflowError::InvalidTransition {
+                    run_id: started.run_id.clone(),
+                    status
+                })
+            );
+            let stopped = run(
+                &handle,
+                WorkflowRequest::Stop {
+                    run_id: started.run_id.clone(),
+                },
+            )
+            .await;
+            assert_eq!(stopped.status, RunStatus::Cancelled);
+            assert_eq!(stopped.revision, settled.revision + 1);
+            assert_eq!(stopped.execution_epoch, settled.execution_epoch + 1);
+            assert_eq!(stopped.agent_budget, settled.agent_budget);
+            assert_eq!(stopped.usage, settled.usage);
+            assert_eq!(stopped.roster, settled.roster);
+            assert!(stopped.outbox_pending);
+            assert_eq!(
+                fixture
+                    .wait_for(&started.run_id, RunStatus::Cancelled)
+                    .await,
+                stopped
+            );
+            assert_eq!(fixture.runner.labels(), ["worker-1"]);
+            runtime.shutdown().await;
+            fixture.relocate();
+            let runtime = fixture.spawn().await;
+            assert_eq!(
+                resume(&runtime.handle(), &started.run_id, None).await,
+                Err(WorkflowError::InvalidTransition {
+                    run_id: started.run_id,
+                    status: RunStatus::Interrupted
+                })
+            );
+            runtime.shutdown().await;
+            assert_eq!(fixture.runner.labels(), ["worker-1"]);
+        });
+    }
+
+    #[test_case(false; "revision_changed")]
+    #[test_case(true; "epoch_changed")]
+    fn stop_settled_run_rejects_stale_snapshot(advance_epoch: bool) {
+        smol::block_on(async {
+            let fixture = Fixture::new();
+            fixture.user_workflow(PAUSING, PAUSING_BODY);
+            let runtime = fixture.spawn().await;
+            let started = start(&runtime.handle(), PAUSING, None).await;
+            let paused = fixture.wait_for(&started.run_id, RunStatus::Paused).await;
+            let database = SessionDatabase::open(&fixture.state_dir).unwrap();
+            assert_eq!(
+                database
+                    .update_workflow_run(
+                        &started.run_id,
+                        paused.revision,
+                        paused.execution_epoch,
+                        &WorkflowRunPatch {
+                            execution_epoch: advance_epoch.then_some(paused.execution_epoch + 1),
+                            ..WorkflowRunPatch::default()
+                        },
+                    )
+                    .unwrap(),
+                WorkflowUpdate::Applied {
+                    revision: paused.revision + 1
+                }
+            );
+            let before = database.load_workflow_run(&started.run_id).unwrap();
+            assert_eq!(
+                runtime
+                    .handle()
+                    .request(WorkflowRequest::Stop {
+                        run_id: started.run_id.clone()
+                    })
+                    .await,
+                Err(WorkflowError::InvalidTransition {
+                    run_id: started.run_id.clone(),
+                    status: RunStatus::Paused
+                })
+            );
+            assert_eq!(database.load_workflow_run(&started.run_id).unwrap(), before);
+            runtime.shutdown().await;
+            assert_eq!(fixture.runner.labels(), ["worker-1"]);
+        });
+    }
+
+    #[test_case(false, false; "failed_same_workspace")]
+    #[test_case(true, false; "cancelled_same_workspace")]
+    #[test_case(false, true; "failed_relocated")]
+    #[test_case(true, true; "cancelled_relocated")]
+    fn fresh_runtime_resumes_terminal_runs_only_in_original_workspace(
+        cancelled: bool,
+        moved: bool,
+    ) {
+        smol::block_on(async {
+            let mut fixture = Fixture::new();
+            let (name, body) = if cancelled {
+                (SLOW, SLOW_BODY)
+            } else {
+                (FAILING, FAILING_BODY)
+            };
+            fixture.user_workflow(name, body);
+            let runtime = fixture.spawn().await;
+            let handle = runtime.handle();
+            let started = start(&handle, name, None).await;
+            let settled = if cancelled {
+                fixture.started().await;
+                fixture.started().await;
+                run(
+                    &handle,
+                    WorkflowRequest::Stop {
+                        run_id: started.run_id.clone(),
+                    },
+                )
+                .await
+            } else {
+                fixture.wait_for(&started.run_id, RunStatus::Failed).await
+            };
+            runtime.shutdown().await;
+            let labels = fixture.runner.labels();
+            if moved {
+                fixture.relocate();
+            }
+            let runtime = fixture.spawn().await;
+            let handle = runtime.handle();
+            if moved {
+                for budget in [None, Some(MAX_AGENT_BUDGET)] {
+                    assert_eq!(
+                        resume(&handle, &started.run_id, budget).await,
+                        Err(WorkflowError::InvalidTransition {
+                            run_id: started.run_id.clone(),
+                            status: RunStatus::Interrupted
+                        })
+                    );
+                }
+                runtime.shutdown().await;
+                assert_eq!(fixture.runner.labels(), labels);
+            } else {
+                fixture.release.send(()).unwrap();
+                let resumed = resume(&handle, &started.run_id, None).await.unwrap();
+                let WorkflowResponse::Run(resumed) = resumed else {
+                    panic!("{resumed:?}")
+                };
+                assert_eq!(resumed.status, RunStatus::Active);
+                assert_eq!(resumed.execution_epoch, settled.execution_epoch + 1);
+                fixture
+                    .wait_for(
+                        &started.run_id,
+                        if cancelled {
+                            RunStatus::Completed
+                        } else {
+                            RunStatus::Failed
+                        },
+                    )
+                    .await;
+                runtime.shutdown().await;
+                assert_eq!(
+                    fixture.runner.labels(),
+                    [labels[0].clone(), labels[1].clone(), labels[1].clone()]
+                );
+            }
         });
     }
 

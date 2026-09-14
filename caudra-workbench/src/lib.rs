@@ -545,6 +545,14 @@ impl Workbench {
         self.open = false;
         self.watch = None;
         if let Some(backend) = &mut self.remote_backend {
+            backend.close_watch();
+        }
+        if !self.remote_pending.is_empty()
+            || self.remote_scm.as_ref().is_some_and(ScmDriver::is_busy)
+        {
+            return;
+        }
+        if let Some(backend) = &mut self.remote_backend {
             backend.suspend();
         }
         if let Some(scm) = &mut self.remote_scm {
@@ -773,6 +781,10 @@ impl Workbench {
             || self.remote_scm.as_ref().is_some_and(ScmDriver::is_busy)
             || self.search.is_running()
             || self.edge_scroll_delta() != 0
+    }
+
+    pub fn blocks_workspace_change(&self) -> bool {
+        self.editor.tabs().iter().any(Tab::is_dirty) || self.is_busy()
     }
 
     /// Drains whatever the background workers have produced. Reports whether
@@ -3815,7 +3827,7 @@ fn layout_sections(
 mod tests {
     use super::{
         Ask, Choice, Confirm, Cursor, DEFAULT_SIDEBAR_WIDTH, DISCARD_LABEL, Drag,
-        EDGE_SCROLL_LINES, Focus, InputKind, Layout, MAX_SIDEBAR_WIDTH, MIN_EDITOR_WIDTH,
+        EDGE_SCROLL_LINES, Focus, Input, InputKind, Layout, MAX_SIDEBAR_WIDTH, MIN_EDITOR_WIDTH,
         MIN_SECTION_ROWS, MIN_SIDEBAR_WIDTH, MenuAction, NEW_FILE_PROMPT, SCROLL_COLUMNS,
         SCROLL_LINES, ScmLayout, Section, SidebarView, Target, Toggle, Workbench, WorkbenchAction,
         WorkbenchPath, WorkbenchStyles, keys, layout, layout_sections, scm,
@@ -3850,6 +3862,9 @@ mod tests {
     use unicode_width::UnicodeWidthStr;
 
     const CLOSED_START: &str = "a fresh workbench must not be on screen";
+    const WORKSPACE_CHANGE_BLOCKED: &str = "an idle clean workbench must allow workspace changes";
+    const WORKSPACE_CHANGE_UNGUARDED: &str =
+        "unsaved buffers and outstanding operations must block workspace changes";
     const NARROW_DROPS_SIDEBAR: &str =
         "a terminal too narrow for both panes must keep the editor, not split into unusable strips";
     const STATUS_RESERVED: &str = "the status row must always be carved";
@@ -4167,6 +4182,83 @@ mod tests {
         let mut workbench = Workbench::new(WorkbenchStyles::default());
         workbench.open(dir.path());
         (dir, workbench)
+    }
+
+    #[test_case(false ; "open")]
+    #[test_case(true ; "closed")]
+    fn clean_idle_workbench_allows_workspace_change(closed: bool) {
+        let (dir, mut workbench) = project();
+        open_file(&dir, &mut workbench);
+        if closed {
+            workbench.close();
+        }
+
+        assert!(
+            !workbench.blocks_workspace_change(),
+            "{WORKSPACE_CHANGE_BLOCKED}"
+        );
+    }
+
+    #[test_case(false ; "active_tab")]
+    #[test_case(true ; "inactive_tab")]
+    fn dirty_buffers_block_workspace_change_even_when_closed(inactive: bool) {
+        let (dir, mut workbench) = project();
+        open_file(&dir, &mut workbench);
+        workbench.handle_key(key(KeyCode::Char(EDIT)));
+        if inactive {
+            workbench.open_path(&dir.path().join(NESTED_DIR).join(NESTED_FILE));
+        }
+
+        assert!(
+            workbench.blocks_workspace_change(),
+            "{WORKSPACE_CHANGE_UNGUARDED}"
+        );
+        workbench.close();
+        assert!(!workbench.is_open(), "{CLOSED_START}");
+        assert!(
+            workbench.blocks_workspace_change(),
+            "{WORKSPACE_CHANGE_UNGUARDED}"
+        );
+    }
+
+    #[test_case(false ; "filesystem_write")]
+    #[test_case(true ; "scm_mutation")]
+    fn pending_operations_block_workspace_change_even_when_closed(scm: bool) {
+        let (session, _control) = crate::fs::backend::tests::widget_fixture();
+        let mut workbench = Workbench::new(WorkbenchStyles::default());
+        workbench.toggle_workspace(session).unwrap();
+        settle_remote(&mut workbench, |workbench| !workbench.is_busy());
+        assert!(
+            !workbench.blocks_workspace_change(),
+            "{WORKSPACE_CHANGE_BLOCKED}"
+        );
+
+        if scm {
+            workbench.scm.select(Section::Unstaged, Some(0));
+            workbench.stage_selected();
+        } else {
+            workbench.commit_remote_input(Input {
+                kind: InputKind::NewFile,
+                at: workbench.backend_root(),
+                value: MADE_NAME.to_owned(),
+            });
+        }
+
+        assert!(
+            workbench.blocks_workspace_change(),
+            "{WORKSPACE_CHANGE_UNGUARDED}"
+        );
+        workbench.close();
+        assert!(!workbench.is_open(), "{CLOSED_START}");
+        assert!(
+            workbench.blocks_workspace_change(),
+            "{WORKSPACE_CHANGE_UNGUARDED}"
+        );
+        settle_remote(&mut workbench, |workbench| !workbench.is_busy());
+        assert!(
+            !workbench.blocks_workspace_change(),
+            "{WORKSPACE_CHANGE_BLOCKED}"
+        );
     }
 
     #[test_case(None, (0, 0), None ; "whole_file_lands_on_the_first_line")]

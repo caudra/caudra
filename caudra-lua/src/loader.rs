@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
+use std::thread;
 use std::time::Duration;
 
 use caudra_agent::permissions::{PluginRuleStore, canonical_json_sha256};
@@ -221,6 +222,26 @@ impl PluginHost {
         let _ = self.inner.prio_tx.send(Request::Shutdown);
         self.inner.tx = flume::unbounded().0;
         self.inner.prio_tx = flume::unbounded().0;
+    }
+
+    pub fn shutdown_checked(&mut self) -> Result<(), PluginError> {
+        self.shutdown_checked_with_timeout(SHUTDOWN_TIMEOUT)
+    }
+
+    fn shutdown_checked_with_timeout(&mut self, timeout: Duration) -> Result<(), PluginError> {
+        self.begin_shutdown();
+        let handle = self.inner.join.take().ok_or(PluginError::HostDead)?;
+        let (done_tx, done_rx) = flume::bounded(1);
+        thread::spawn(move || {
+            let _ = done_tx.send(handle.join().is_err());
+        });
+        match done_rx.recv_timeout(timeout) {
+            Ok(false) => Ok(()),
+            Ok(true) | Err(flume::RecvTimeoutError::Disconnected) => {
+                Err(PluginError::ShutdownPanicked)
+            }
+            Err(flume::RecvTimeoutError::Timeout) => Err(PluginError::ShutdownTimeout),
+        }
     }
 
     /// Boots the runtime and loads every default bundled plugin into `registry`.
@@ -828,6 +849,76 @@ mod tests {
         assert!(host.load_source("late", "return {}").is_err());
         host.begin_shutdown();
         assert!(host.load_source("later", "return {}").is_err());
+    }
+
+    #[test]
+    fn shutdown_checked_stops_vm_and_rejects_later_loads() {
+        let mut host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let events = host.event_handle();
+        host.shutdown_checked().unwrap();
+        assert!(host.inner.shutdown.load(Ordering::Acquire));
+        assert!(host.inner.join.is_none());
+        assert!(events.is_disconnected());
+        assert!(matches!(
+            host.load_source("late", "return {}"),
+            Err(PluginError::HostDead)
+        ));
+        assert!(matches!(
+            host.shutdown_checked(),
+            Err(PluginError::HostDead)
+        ));
+    }
+
+    #[test_case(false; "stopped")]
+    #[test_case(true; "panicked")]
+    fn shutdown_checked_reports_join_result(panics: bool) {
+        const PANIC_MESSAGE: &str = "gated vm panic";
+        let mut host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.shutdown_checked().unwrap();
+        let (release_tx, release_rx) = flume::bounded(1);
+        let stopped = Arc::new(AtomicBool::new(false));
+        let thread_stopped = Arc::clone(&stopped);
+        host.inner.join = Some(thread::spawn(move || {
+            release_rx.recv().unwrap();
+            assert!(!panics, "{PANIC_MESSAGE}");
+            thread_stopped.store(true, Ordering::Release);
+        }));
+        release_tx.send(()).unwrap();
+
+        let result = host.shutdown_checked();
+        if panics {
+            assert!(matches!(result, Err(PluginError::ShutdownPanicked)));
+        } else {
+            result.unwrap();
+            assert!(stopped.load(Ordering::Acquire));
+        }
+        assert!(matches!(
+            host.shutdown_checked(),
+            Err(PluginError::HostDead)
+        ));
+    }
+
+    #[test]
+    fn shutdown_checked_timeout_never_reports_detached_vm_as_stopped() {
+        let mut host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.shutdown_checked().unwrap();
+        let (release_tx, release_rx) = flume::bounded(1);
+        let (stopped_tx, stopped_rx) = flume::bounded(1);
+        host.inner.join = Some(thread::spawn(move || {
+            if release_rx.recv().is_ok() {
+                let _ = stopped_tx.send(());
+            }
+        }));
+
+        let result = host.shutdown_checked_with_timeout(Duration::ZERO);
+        assert!(matches!(result, Err(PluginError::ShutdownTimeout)));
+        assert!(matches!(
+            host.shutdown_checked(),
+            Err(PluginError::HostDead)
+        ));
+        assert!(stopped_rx.try_recv().is_err());
+        release_tx.send(()).unwrap();
+        stopped_rx.recv_timeout(SHUTDOWN_TIMEOUT).unwrap();
     }
 
     /// Regression for the exit drain in `runtime::spawn`. An `EventHandle`

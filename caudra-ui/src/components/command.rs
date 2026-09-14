@@ -257,6 +257,18 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         scope: ChatScope::Any,
     },
     BuiltinCommand {
+        name: "/move-session",
+        description: "Move the current session to an existing directory (optional directory)",
+        max_args: 1,
+        scope: ChatScope::MainOnly,
+    },
+    BuiltinCommand {
+        name: "/migrate-sessions",
+        description: "Migrate sessions with one exact stored cwd (optional destination directory)",
+        max_args: 1,
+        scope: ChatScope::MainOnly,
+    },
+    BuiltinCommand {
         name: "/btw",
         description: "Ask a quick question (no tools, no history pollution)",
         max_args: usize::MAX,
@@ -1023,6 +1035,25 @@ mod tests {
         let mut p = CommandPalette::new(Arc::from([]), empty_snapshot(), LuaCommandReader::empty());
         p.sync(input, false);
         p
+    }
+
+    #[test_case("/move-session"; "current")]
+    #[test_case("/migrate-sessions"; "bulk")]
+    fn relocation_commands_are_main_only_and_preserve_directory_spaces(name: &str) {
+        const DIRECTORY: &str = "../project with spaces";
+        let input = format!("{name} {DIRECTORY}");
+        let mut palette = synced(name);
+        let command = palette.confirm(&input).unwrap();
+        assert_eq!(command.name, name);
+        assert_eq!(command.args, DIRECTORY);
+        assert!(palette.is_main_only(name));
+        let row = palette
+            .rows(true)
+            .into_iter()
+            .find(|row| row.name == name)
+            .unwrap();
+        assert!(row.disabled);
+        assert!(row.takes_args());
     }
 
     fn mouse(kind: MouseEventKind, area: Rect) -> MouseEvent {

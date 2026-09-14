@@ -158,6 +158,10 @@ Some pickers add extra bindings on top of the defaults:
 | Commands | `Tab` | Complete command |
 | Model Picker | `R` | Clear job binding |
 | Session Picker | `Ctrl+N` | New session |
+| Session Picker | `F2` | Move current session |
+| Session Picker | `F3` | Migrate directory sessions |
+| Session Relocation | `Ctrl+O` | Enter a custom destination directory |
+| Session Relocation | `Ctrl+R` | Change relocation source or destination selection |
 | Session Picker | `Ctrl+R` | Rename session |
 | Session Picker | `Ctrl+G` | Generate session title |
 | Session Picker | `Ctrl+D` | Delete session (press twice) |
@@ -204,7 +208,7 @@ Some pickers add extra bindings on top of the defaults:
 
 Child contexts inherit their parent's bindings and add their own.
 
-- **Pickers** is the base for: Rewind Picker, Theme Picker, Model Picker, Queue, Commands, Search, File Picker, Stash Picker, Session Picker, Workflow Inspector, Workflow Catalog
+- **Pickers** is the base for: Rewind Picker, Theme Picker, Model Picker, Queue, Commands, Search, File Picker, Stash Picker, Session Picker, Session Relocation, Workflow Inspector, Workflow Catalog
 - **Workbench** is the base for: Workbench Explorer, Workbench Editor, Workbench Source Control, Workbench Search
 
 ## Overriding Keybindings

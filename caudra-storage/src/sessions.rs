@@ -118,6 +118,14 @@ pub enum SessionError {
     WorkspaceRebindRequired,
     #[error("remote session cwd must be a bounded logical workspace path")]
     InvalidRemoteCwd,
+    #[error("session relocation selection changed; refresh the confirmation")]
+    RelocationSelectionChanged,
+    #[error("cannot relocate session {id}: {reason}")]
+    RelocationBlocked { id: CaudraId, reason: &'static str },
+    #[error("session relocation requires an absolute local destination directory")]
+    InvalidRelocationDestination,
+    #[error("session relocation requires persistent storage")]
+    RelocationUnavailable,
 }
 
 /// Per-model token breakdown entry. Mirrors the four usage counters tracked by
@@ -517,6 +525,22 @@ pub struct SessionSummary {
     pub id: CaudraId,
     pub title: String,
     pub updated_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionLocation {
+    pub id: CaudraId,
+    pub title: String,
+    pub cwd: String,
+    pub updated_at: u64,
+    pub write_version: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRelocation {
+    pub sessions: Vec<SessionLocation>,
+    pub source_cwd: Option<String>,
+    pub destination: String,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
