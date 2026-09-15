@@ -70,7 +70,8 @@ pub use editable_queue::{
     SteeringQueue, SteeringQueueEntry, SteeringQueueReceiver, editable_queue, steering_queue,
 };
 pub use types::{
-    AgentEvent, BatchProgressEvent, BatchToolEntry, BatchToolStatus, BufferSnapshot, CodeGraphRow,
+    ActivityChild, AgentEvent, BatchProgressEvent, BatchToolEntry, BatchToolStatus, BufferSnapshot,
+    CodeGraphRow,
     CodeGraphSource, Delegation, DoneReason, ENVIRONMENT_COMMANDS_LABEL, ENVIRONMENT_MISSING_LABEL,
     ENVIRONMENT_NO_VERSION, Envelope, EnvironmentCommand, EnvironmentFact, EventSender,
     GrepFileEntry, GrepLine, GrepMatchGroup, INDEX_TRUNCATED, IndexDirectoryEntry,

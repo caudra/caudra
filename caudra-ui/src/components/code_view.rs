@@ -8,7 +8,8 @@ use crate::provenance::LineProvenance;
 use crate::theme;
 
 use super::tool_display::{
-    ScrollTail, activity_detail, activity_label, batch_sigil_style, compact_args_for,
+    ScrollTail, TREE_BRANCH, TREE_GAP, TREE_LAST, TREE_TRUNK, activity_child_spans,
+    activity_detail, activity_label, activity_sigil, batch_sigil_style, compact_args_for,
     compact_sigil_label, header_spans, names_tool, scroll_footer_text,
 };
 use super::{ToolProgress, environment_card, is_collapsible, workflow_card};
@@ -31,14 +32,15 @@ use syntect::util::LinesWithEndings;
 use unicode_width::UnicodeWidthStr;
 
 pub(crate) const MAX_INSTRUCTION_LINES: usize = 15;
-const BATCH_CHILD_INDENT: &str = "  ";
-const BATCH_CHILD_INDENT_WIDTH: u16 = BATCH_CHILD_INDENT.len() as u16;
+/// What a child's body clears past the trunk it hangs from, so its text lands
+/// under the label the connector and sigil pushed across.
+const BATCH_BODY_PAD: &str = "  ";
+const BATCH_CHILD_INDENT_WIDTH: u16 = (TREE_GAP.len() + BATCH_BODY_PAD.len()) as u16;
 const ANSWER_MARK: &str = "  \u{2713} ";
 const ANSWER_INDENT: &str = "    ";
 const NO_ANSWER: &str = "(no answer)";
 /// Indented past the child's own sigil, so the activity reads as belonging to
 /// the row above it rather than as another entry in the roster.
-const CHILD_ACTIVITY_PREFIX: &str = "  ├ ";
 const CHILD_ACTIVITY_SEPARATOR: &str = " · ";
 /// Says a child is folded, so a row with nothing under it is not mistaken for
 /// one whose body was hidden.
@@ -874,11 +876,22 @@ fn render_batch(
         // change what is drawn: this is also how a dispatched child's rows are
         // traced back to the subagent they belong to.
         let target = Some(RowTarget(index));
+        // The separator sits above a child that exists, so the trunk always has
+        // somewhere left to go: drawn blank it would cut the tree in two at
+        // every body.
         if !lines.is_empty() && (previous_has_body || has_body) {
-            lines.push(Line::default());
+            lines.push(Line::from(Span::styled(TREE_TRUNK.trim_end(), t.tool_dim)));
             rows.push(None);
         }
         previous_has_body = has_body;
+        // A child is a node of the card's tree: the connector says whether any
+        // sibling follows, and the trunk below it says the same thing for every
+        // row this child owns.
+        let last = index + 1 == entries.len();
+        let (connector, continuation) = match last {
+            true => (TREE_LAST, TREE_GAP),
+            false => (TREE_BRANCH, TREE_TRUNK),
+        };
         let (sigil, label) = compact_sigil_label(&entry.tool, entry.status.into());
         // Once the body carries the script, the row keeps only what the body
         // does not say. The same trade a card's header makes, and for the same
@@ -889,6 +902,7 @@ fn render_batch(
         };
         let gap = if summary.is_empty() { "" } else { " " };
         let mut spans = vec![
+            Span::styled(connector, t.tool_dim),
             Span::styled(
                 format!("{sigil} "),
                 batch_sigil_style(entry.status, entry.output.as_ref()),
@@ -914,23 +928,31 @@ fn render_batch(
         if let Some(annotation) = child_annotation(entry) {
             spans.push(Span::styled(format!(" ({annotation})"), t.tool_annotation));
         }
+        if let Some(tally) = limits.progress.get(&index).and_then(settled_tally) {
+            spans.push(Span::styled(
+                format!("{CHILD_ACTIVITY_SEPARATOR}{tally}"),
+                t.tool_dim,
+            ));
+        }
         if body.is_none() && holds_a_body(entry) {
             spans.push(Span::styled(BATCH_FOLDED_MARK, t.tool_dim));
         }
         lines.push(Line::from(spans));
         rows.push(target);
-        // Between the header and the body, so a click below it still resolves
-        // to the child it looks like it is on.
-        if let Some(progress) = limits.progress.get(&index) {
-            lines.push(Line::from(child_progress_spans(progress)));
-            rows.push(target);
-        }
+        // A child's own output is content and clears the trunk; what the child
+        // dispatched hangs off it as nodes. Content first, so reading down a
+        // child never steps back out to a shallower level than the row above.
         if let Some((body, _, span)) = body {
             if let Some(span) = span {
                 spans_out.push(span.shifted(lines.len(), Some(index)));
             }
             rows.resize(rows.len() + body.len(), target);
-            lines.extend(indent_all(body));
+            lines.extend(indent_all(body, continuation));
+        }
+        if let Some(progress) = limits.progress.get(&index).filter(|p| p.is_live()) {
+            let progress_lines = child_progress_lines(progress, continuation);
+            rows.resize(rows.len() + progress_lines.len(), target);
+            lines.extend(progress_lines);
         }
     }
     (lines, rows, spans_out)
@@ -968,27 +990,64 @@ fn child_annotation(entry: &BatchToolEntry) -> Option<String> {
     }
 }
 
-/// How a dispatched child is getting on. A settled child is described by its
-/// output, so what it was doing gives way to what it did, and only the tally
-/// survives as the record of work its output does not show.
-fn child_progress_spans(progress: &ToolProgress) -> Vec<Span<'static>> {
+/// What a settled child's dispatch is still worth saying. Its output already
+/// carries the result, so only the tally survives, and it rides the child's
+/// own row: hung off it as a node it would be a branch of the tree holding
+/// nothing but a clock, with the child's body drawn to the left of it.
+fn settled_tally(progress: &ToolProgress) -> Option<String> {
+    match progress.is_live() {
+        true => None,
+        false => Some(SubagentProgress::tally(
+            progress.report.tools,
+            progress.elapsed(),
+        )),
+    }
+}
+
+/// How a dispatched child is getting on, and the roster it is working through
+/// when the tool it is running is itself a batch.
+///
+/// `continuation` is the trunk carried down from the child that owns this
+/// progress: `│   ` while that child has siblings below it, spaces once it is
+/// the last one.
+fn child_progress_lines(progress: &ToolProgress, continuation: &str) -> Vec<Line<'static>> {
     let theme = theme::current();
-    let mut spans = vec![Span::styled(CHILD_ACTIVITY_PREFIX, theme.tool_dim)];
-    if progress.is_live() {
-        spans.push(Span::styled(
-            activity_label(&progress.report.activity),
-            theme.tool_prefix,
-        ));
-        if let Some(detail) = activity_detail(&progress.report.activity) {
-            spans.push(Span::styled(format!(" {detail}"), theme.tool_dim));
-        }
-        spans.push(Span::styled(CHILD_ACTIVITY_SEPARATOR, theme.tool_dim));
+    let mut spans = vec![Span::styled(
+        format!("{continuation}{TREE_LAST}"),
+        theme.tool_dim,
+    )];
+    if let Some(sigil) = activity_sigil(&progress.report.activity) {
+        spans.push(Span::styled(format!("{sigil} "), theme.tool_prefix));
     }
     spans.push(Span::styled(
-        SubagentProgress::tally(progress.report.tools, progress.elapsed()),
+        activity_label(&progress.report.activity),
+        theme.tool_prefix,
+    ));
+    if let Some(detail) = activity_detail(&progress.report.activity) {
+        spans.push(Span::styled(format!(" {detail}"), theme.tool_dim));
+    }
+    spans.push(Span::styled(
+        format!(
+            "{CHILD_ACTIVITY_SEPARATOR}{}",
+            SubagentProgress::tally(progress.report.tools, progress.elapsed())
+        ),
         theme.tool_dim,
     ));
-    spans
+    let mut lines = vec![Line::from(spans)];
+    // The activity row is the last node under its child, so everything below
+    // it clears the trunk rather than continuing one.
+    let children = progress.report.activity.children();
+    for (index, child) in children.iter().enumerate() {
+        let connector = match index + 1 == children.len() {
+            true => TREE_LAST,
+            false => TREE_BRANCH,
+        };
+        lines.push(Line::from(activity_child_spans(
+            child,
+            format!("{continuation}{TREE_GAP}{connector}"),
+        )));
+    }
+    lines
 }
 
 /// A child's own rendering, structured where the tool produced structure and
@@ -1173,11 +1232,16 @@ fn text_lines(text: String) -> Vec<Line<'static>> {
         .collect()
 }
 
-fn indent_all(lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
+/// Indents a child's body to sit under its label, carrying the trunk down the
+/// left of every row so the body reads as hanging off the connector above it
+/// rather than floating between two siblings.
+fn indent_all(lines: Vec<Line<'static>>, continuation: &str) -> Vec<Line<'static>> {
+    let indent = format!("{continuation}{BATCH_BODY_PAD}");
+    let style = theme::current().tool_dim;
     lines
         .into_iter()
         .map(|mut line| {
-            line.spans.insert(0, Span::raw(BATCH_CHILD_INDENT));
+            line.spans.insert(0, Span::styled(indent.clone(), style));
             line
         })
         .collect()
@@ -2286,8 +2350,9 @@ fn merge_syntax_with_diff(
 mod tests {
     use super::*;
     use crate::markdown::{EXPAND_AFFORDANCE, TRUNCATION_PREFIX};
-    use caudra_agent::GrepMatchGroup;
-    use caudra_agent::tools::ToolEffect;
+    use caudra_agent::tools::{BATCH_TOOL_NAME, FILE_GREP_TOOL_NAME, ToolEffect};
+    use caudra_agent::{ActivityChild, GrepMatchGroup, SubagentActivity};
+    use std::time::Duration;
     use test_case::test_case;
 
     fn plain(text: &str) -> DiffSpan {
@@ -3204,10 +3269,11 @@ mod tests {
             body.len() > unbroken_rows(&fence),
             "the long value has to have been broken: {body:?}"
         );
-        let limit = usize::from(NARROW_BODY_WIDTH) + BATCH_CHILD_INDENT.len();
+        let indent = format!("{TREE_GAP}{BATCH_BODY_PAD}");
+        let limit = usize::from(NARROW_BODY_WIDTH) + indent.len();
         for line in &body {
             assert!(
-                line.starts_with(BATCH_CHILD_INDENT),
+                line.starts_with(&indent),
                 "an unindented row reads as belonging to the batch, not the child: {line:?}"
             );
             assert!(
@@ -3413,12 +3479,22 @@ mod tests {
     const CHILD_COUNT_MSG: &str =
         "a child row reports what its result holds, the way a standalone row does";
 
+    /// A lone child is the last node of its card, so its row opens on the
+    /// closing connector.
+    const ONLY_CHILD_CONNECTOR: &str = TREE_LAST;
+
+    /// The row without the tree column, which every child carries and no
+    /// assertion here is about.
     fn child_row(entry: BatchToolEntry) -> String {
-        line_text(&render_batch(&[entry], false, &limits(BatchViews::default())).0[0])
+        let row = line_text(&render_batch(&[entry], false, &limits(BatchViews::default())).0[0]);
+        row.strip_prefix(ONLY_CHILD_CONNECTOR)
+            .expect("a child row opens on its connector")
+            .to_owned()
     }
 
+    /// The sigil sits behind the connector, which is neutral chrome.
     fn child_sigil(entry: BatchToolEntry) -> Span<'static> {
-        render_batch(&[entry], false, &limits(BatchViews::default())).0[0].spans[0].clone()
+        render_batch(&[entry], false, &limits(BatchViews::default())).0[0].spans[1].clone()
     }
 
     /// The reported bug: a finished grep named no matches. `batch` copies only
@@ -3473,10 +3549,10 @@ mod tests {
 
     const SIGIL_MSG: &str = "a child opens on its sigil, which is what carries the outcome";
 
-    /// The row used to lead with a status dot and then repeat the outcome in
-    /// the sigil that followed it, which a standalone compact row has never
-    /// done. Pending and running are still told apart from a finished call
-    /// without it, by the tense of the label beside the sigil.
+    /// Behind the tree connector the row leads with its sigil, which is what
+    /// carries the outcome; a standalone compact row has never done otherwise.
+    /// Pending and running are still told apart from a finished call by the
+    /// tense of the label beside it.
     #[test_case(BatchToolStatus::Pending, "$ Run"     ; "pending")]
     #[test_case(BatchToolStatus::Running, "$ Running" ; "running")]
     #[test_case(BatchToolStatus::Success, "$ Ran"     ; "success")]
@@ -3487,6 +3563,121 @@ mod tests {
             ..batch_entry(SHELL_CHILD, 0)
         });
         assert!(row.starts_with(expected), "{SIGIL_MSG}: {row:?}");
+    }
+
+    const TREE_MSG: &str = "a card is a tree: the last child closes it and every earlier one \
+        carries the trunk down its own rows";
+
+    /// Every child is a node, so the connector on each says whether a sibling
+    /// follows it.
+    #[test]
+    fn a_card_closes_its_tree_on_the_last_child() {
+        let entries = [
+            batch_entry(SHELL_CHILD, 0),
+            batch_entry(SHELL_CHILD, 1),
+            batch_entry(SHELL_CHILD, 2),
+        ];
+
+        let (lines, ..) = render_batch(&entries, false, &limits(BatchViews::default()));
+
+        let connectors: Vec<String> = lines
+            .iter()
+            .map(|line| line.spans[0].content.to_string())
+            .collect();
+        assert_eq!(
+            connectors,
+            [TREE_BRANCH, TREE_BRANCH, TREE_LAST],
+            "{TREE_MSG}"
+        );
+    }
+
+    const SETTLED_MSG: &str = "a settled child owns its row and its body and nothing else: a \
+        tally hung off it as a node leaves the body drawn to the left of that node";
+
+    /// The reported bug: a finished `task` child drew `└── 2.9s` as a node of
+    /// the tree and then its answer beneath at a shallower indent, so reading
+    /// down one child stepped back out a level.
+    #[test]
+    fn a_settled_child_carries_its_tally_on_its_own_row() {
+        let entries = [batch_entry(SHELL_CHILD, 1), batch_entry(SHELL_CHILD, 1)];
+        let mut limits = limits(BatchViews::new([0]));
+        let mut progress = batching_report(Vec::new());
+        progress.settle();
+        limits.progress = Arc::new(HashMap::from([(0, progress)]));
+
+        let (lines, rows, _) = render_batch(&entries, false, &limits);
+
+        let owned: Vec<String> = lines
+            .iter()
+            .zip(rows.iter())
+            .filter(|(_, row)| **row == Some(RowTarget(0)))
+            .map(|(line, _)| line_text(line))
+            .collect();
+        let tally = SubagentProgress::tally(BATCHING_TOOLS, Duration::ZERO);
+        assert!(owned[0].ends_with(&tally), "{SETTLED_MSG}: {owned:?}");
+        let body_indent = format!("{TREE_TRUNK}{BATCH_BODY_PAD}");
+        assert!(
+            owned[1..].iter().all(|row| row.starts_with(&body_indent)),
+            "{SETTLED_MSG}: {owned:?}"
+        );
+    }
+
+    const BATCHING_TOOLS: u32 = 2;
+    const BATCHING_SUMMARY: &str = "2 tools";
+
+    fn batching_report(children: Vec<ActivityChild>) -> ToolProgress {
+        ToolProgress::live(SubagentProgress {
+            activity: SubagentActivity::batch(Arc::from(BATCH_TOOL_NAME), BATCHING_SUMMARY, children),
+            tools: BATCHING_TOOLS,
+            elapsed: Duration::ZERO,
+        })
+    }
+
+    fn activity_child(tool: &str, summary: &str, status: BatchToolStatus) -> ActivityChild {
+        ActivityChild {
+            tool: Arc::from(tool),
+            summary: summary.to_owned(),
+            status,
+        }
+    }
+
+    /// The reported bug: a dispatched subagent running its own batch said only
+    /// `Batching 2 tools`, and what it was batching was invisible. It is a
+    /// third level of the same tree, carrying the trunk of the child it
+    /// belongs to.
+    #[test]
+    fn a_batching_child_draws_its_roster_as_a_third_level() {
+        let entries = [
+            batch_entry(TASK_TOOL_NAME, 0),
+            batch_entry(TASK_TOOL_NAME, 1),
+        ];
+        let roster = vec![
+            activity_child(SHELL_CHILD, "cargo check", BatchToolStatus::Running),
+            activity_child(FILE_GREP_TOOL_NAME, "fn main", BatchToolStatus::Success),
+        ];
+        let mut limits = limits(BatchViews::default());
+        limits.progress = Arc::new(HashMap::from([(0, batching_report(roster))]));
+
+        let (lines, rows, _) = render_batch(&entries, false, &limits);
+
+        let drawn: Vec<String> = lines.iter().take(4).map(line_text).collect();
+        assert_eq!(
+            drawn,
+            [
+                format!("{TREE_BRANCH}\u{2756} Delegated {TASK_TOOL_NAME} summary"),
+                format!(
+                    "{TREE_TRUNK}{TREE_LAST}\u{21f6} Batching {BATCHING_SUMMARY}{CHILD_ACTIVITY_SEPARATOR}{}",
+                    SubagentProgress::tally(BATCHING_TOOLS, Duration::ZERO)
+                ),
+                format!("{TREE_TRUNK}{TREE_GAP}{TREE_BRANCH}$ Running cargo check"),
+                format!("{TREE_TRUNK}{TREE_GAP}{TREE_LAST}⌕ Grepped fn main"),
+            ],
+            "{TREE_MSG}"
+        );
+        assert!(
+            rows[..4].iter().all(|row| *row == Some(RowTarget(0))),
+            "every row of a child answers for the child that owns it"
+        );
     }
 
     fn shell_child(status: BatchToolStatus) -> BatchToolEntry {
@@ -3569,11 +3760,16 @@ mod tests {
     const BATCH_TIGHT_MSG: &str = "a roster of folded calls must stack like the list it is";
     const BATCH_BODY_AIR_MSG: &str = "a child carrying a body must be set off from its neighbours";
 
-    fn blank_rows(lines: &[Line<'static>]) -> Vec<usize> {
+    /// A separator draws nothing but the trunk it has to keep going, so it
+    /// reads as air between two children while the tree stays joined.
+    fn separator_rows(lines: &[Line<'static>]) -> Vec<usize> {
         lines
             .iter()
             .enumerate()
-            .filter(|(_, line)| line_text(line).is_empty())
+            .filter(|(_, line)| {
+                let text = line_text(line);
+                text.is_empty() || text.trim_end() == TREE_TRUNK.trim_end()
+            })
             .map(|(row, _)| row)
             .collect()
     }
@@ -3586,7 +3782,7 @@ mod tests {
     fn folded_children_stack_the_way_the_transcript_stacks_them() {
         let (lines, rows) = batch(BatchViews::default());
 
-        assert!(blank_rows(&lines).is_empty(), "{BATCH_TIGHT_MSG}");
+        assert!(separator_rows(&lines).is_empty(), "{BATCH_TIGHT_MSG}");
         assert_eq!(lines.len(), rows.len(), "the rows stay parallel");
     }
 
@@ -3602,7 +3798,7 @@ mod tests {
         ];
         let (lines, rows, _) = render_batch(&entries, false, &limits(BatchViews::new([1])));
 
-        assert_eq!(blank_rows(&lines), vec![1, 5], "{BATCH_BODY_AIR_MSG}");
+        assert_eq!(separator_rows(&lines), vec![1, 5], "{BATCH_BODY_AIR_MSG}");
         assert_eq!(lines.len(), rows.len(), "the rows stay parallel");
     }
 

@@ -26,16 +26,17 @@ use super::steering::{SharedSteering, Steering};
 use super::{ModelRoute, resolve_model_for_purpose};
 use crate::cancel::{CancelMap, CancelSlot};
 use crate::prompt::PromptId;
+use crate::tools::native::batch::MAX_BATCH_SIZE;
 use crate::tools::{
     BuiltinDeferral, DeferredTool, DescriptionContext, FileReadTracker, LocalTools, ToolAudience,
     ToolContext, ToolFilter, ToolLive, deferral,
 };
 use crate::{
-    Agent, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, DoneReason, Envelope,
-    EventSender, History, InterruptSource, McpSession, SteeringQueue, SteeringQueueReceiver,
-    SubagentActivity, SubagentHistoryError, SubagentHistoryLease, SubagentInfo, SubagentProgress,
-    SubagentTaskMode, SubagentTaskSpec, SubagentTaskSpecCandidate, reasoning_summary,
-    steering_queue,
+    ActivityChild, Agent, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams,
+    DoneReason, Envelope, EventSender, History, InterruptSource, McpSession, SteeringQueue,
+    SteeringQueueReceiver, SubagentActivity, SubagentHistoryError, SubagentHistoryLease,
+    SubagentInfo, SubagentProgress, SubagentTaskMode, SubagentTaskSpec, SubagentTaskSpecCandidate,
+    ToolOutput, reasoning_summary, steering_queue,
 };
 
 pub const STRUCTURED_OUTPUT_TOOL: &str = "structured_output";
@@ -88,6 +89,13 @@ async fn relay_session_events(
     }
 }
 
+/// The batch a subagent is working through, so each child's state change can
+/// patch one row instead of resending the roster the `ToolStart` already gave.
+struct BatchWatch {
+    id: String,
+    children: Vec<ActivityChild>,
+}
+
 /// Keeps the running digest one subagent reports to its parent.
 struct ProgressRelay {
     started: Instant,
@@ -95,6 +103,9 @@ struct ProgressRelay {
     thought: String,
     thought_title: Option<String>,
     last: Option<SubagentActivity>,
+    /// One slot, because `batch` refuses a nested `batch` child and a subagent
+    /// runs one call at a time.
+    batch: Option<BatchWatch>,
 }
 
 impl ProgressRelay {
@@ -105,6 +116,36 @@ impl ProgressRelay {
             thought: String::new(),
             thought_title: None,
             last: None,
+            batch: None,
+        }
+    }
+
+    /// What one event adds to the tally. A batch dispatches its children with
+    /// `Emit::Capture`, so they never reach this stream as starts of their
+    /// own: counting the batch as one call would report a fan-out of twenty
+    /// as a single tool.
+    fn counted(event: &AgentEvent) -> u32 {
+        match event {
+            AgentEvent::ToolStart(start) => match &start.output {
+                Some(ToolOutput::Batch { entries, .. }) => entries.len() as u32,
+                _ => 1,
+            },
+            _ => 0,
+        }
+    }
+
+    /// The roster row this activity should carry, rebuilt from whatever the
+    /// watched batch knows. `None` when nothing is being watched, or when the
+    /// last activity was not the batch's own row.
+    fn watched_batch(&self) -> Option<SubagentActivity> {
+        let watch = self.batch.as_ref()?;
+        match &self.last {
+            Some(SubagentActivity::Tool { name, summary, .. }) => Some(SubagentActivity::batch(
+                Arc::clone(name),
+                summary,
+                watch.children.clone(),
+            )),
+            _ => None,
         }
     }
 
@@ -125,14 +166,61 @@ impl ProgressRelay {
                 })
             }
             // The header a plugin paints mid-run is the one its transcript
-            // shows, and it arrives without a tool name to match on.
+            // shows, and it arrives without a tool name to match on. The
+            // roster survives the retitle: it describes the same call.
             AgentEvent::ToolHeaderSnapshot { snapshot, .. } => match &self.last {
-                Some(SubagentActivity::Tool { name, .. }) => Some(SubagentActivity::tool(
-                    Arc::clone(name),
-                    &snapshot.first_line_text(),
-                )),
+                Some(SubagentActivity::Tool { name, children, .. }) => {
+                    Some(SubagentActivity::batch(
+                        Arc::clone(name),
+                        &snapshot.first_line_text(),
+                        children.clone(),
+                    ))
+                }
                 _ => None,
             },
+            // A batch hands its whole roster over in its start event, which is
+            // the only place the parent ever sees it: the children run under
+            // captured starts that never reach this stream.
+            AgentEvent::ToolStart(start) => {
+                self.thought.clear();
+                self.thought_title = None;
+                self.batch = match &start.output {
+                    Some(ToolOutput::Batch { entries, .. }) => Some(BatchWatch {
+                        id: start.id.clone(),
+                        children: entries
+                            .iter()
+                            .take(MAX_BATCH_SIZE)
+                            .map(ActivityChild::from)
+                            .collect(),
+                    }),
+                    _ => None,
+                };
+                let summary = start.summary.clone();
+                Some(match &self.batch {
+                    Some(watch) => SubagentActivity::batch(
+                        Arc::clone(&start.tool),
+                        &summary,
+                        watch.children.clone(),
+                    ),
+                    None => SubagentActivity::tool(Arc::clone(&start.tool), &summary),
+                })
+            }
+            // One child moved. The row it names is patched in place, and the
+            // digest republished so the parent's tree redraws that row alone.
+            AgentEvent::BatchProgress(event) => {
+                let watch = self.batch.as_mut().filter(|w| w.id == event.id)?;
+                let child = watch.children.get_mut(event.index)?;
+                *child = ActivityChild::from(&event.entry);
+                self.watched_batch()
+            }
+            // Whatever the roster ends on is what the last `BatchProgress`
+            // published, so the batch is only forgotten here.
+            AgentEvent::ToolDone(done) => {
+                if self.batch.as_ref().is_some_and(|w| w.id == done.id) {
+                    self.batch = None;
+                }
+                None
+            }
             _ => {
                 let activity = SubagentActivity::from_event(event);
                 // A turn ends the thought even with nothing after it, and the
@@ -166,14 +254,14 @@ impl ProgressRelay {
         }
         // `ToolPending` announces the same call, so counting that instead
         // would double every tool the subagent runs.
-        let counted = matches!(envelope.event, AgentEvent::ToolStart(_));
-        self.tools += u32::from(counted);
+        let counted = Self::counted(&envelope.event);
+        self.tools += counted;
         let Some(activity) = self.activity(&envelope.event) else {
             return;
         };
         // Two identical calls in a row leave the activity untouched, and the
         // count is the only thing that moved.
-        if !counted && self.last.as_ref() == Some(&activity) {
+        if counted == 0 && self.last.as_ref() == Some(&activity) {
             return;
         }
         self.last = Some(activity.clone());
@@ -980,7 +1068,8 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::TurnCompleteEvent;
+    use crate::tools::BATCH_TOOL_NAME;
+    use crate::{BatchToolStatus, ToolDoneEvent, TurnCompleteEvent};
     use crate::context::{
         ContextInventory, ContextKey, ContextReadiness, ContextSnapshot, ContextStore,
         ContextUsage, ContextWindow,
@@ -1431,6 +1520,161 @@ mod tests {
             raw_input: None,
             output: None,
         }))
+    }
+
+    const CHILD_TOOL: &str = "shell";
+    const ROSTER_MISCOUNT_MSG: &str =
+        "a batch is worth its roster, not one call: its children never reach this stream";
+
+    fn roster_entry(index: usize, status: BatchToolStatus) -> crate::BatchToolEntry {
+        crate::BatchToolEntry {
+            tool: CHILD_TOOL.to_owned(),
+            effect: crate::tools::ToolEffect::Unknown,
+            summary: format!("c{index}"),
+            status,
+            input: None,
+            raw_input: None,
+            output: None,
+            annotation: None,
+        }
+    }
+
+    /// A batch's start event, carrying the roster it is about to run.
+    fn batch_start(children: usize) -> AgentEvent {
+        let entries = (0..children)
+            .map(|index| roster_entry(index, BatchToolStatus::Pending))
+            .collect();
+        let AgentEvent::ToolStart(mut start) = tool_start(BATCH_TOOL_NAME) else {
+            unreachable!("tool_start builds a start event")
+        };
+        start.output = Some(ToolOutput::Batch {
+            entries,
+            text: String::new(),
+        });
+        AgentEvent::ToolStart(start)
+    }
+
+    fn batch_progress(id: &str, index: usize, status: BatchToolStatus) -> AgentEvent {
+        AgentEvent::BatchProgress(Box::new(crate::BatchProgressEvent {
+            id: id.to_owned(),
+            index,
+            entry: roster_entry(index, status),
+        }))
+    }
+
+    /// Every roster the fragments published, as tool names and statuses.
+    fn rosters(events: Vec<AgentEvent>) -> Vec<Vec<(String, BatchToolStatus)>> {
+        let mut relay = ProgressRelay::new();
+        events
+            .into_iter()
+            .filter_map(|event| {
+                let activity = relay.activity(&event)?;
+                relay.last = Some(activity.clone());
+                Some(
+                    activity
+                        .children()
+                        .iter()
+                        .map(|child| (child.tool.to_string(), child.status))
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
+    /// The reported bug: a batch of twenty reported as one tool call, because
+    /// its children are dispatched with `Emit::Capture` and never arrive here
+    /// as starts of their own.
+    #[test]
+    fn a_batch_counts_every_call_it_dispatches() {
+        let mut relay = ProgressRelay::new();
+        relay.tools += ProgressRelay::counted(&batch_start(3));
+        relay.tools += ProgressRelay::counted(&tool_start(CHILD_TOOL));
+        relay.tools += ProgressRelay::counted(&batch_progress(TOOL_ID, 0, BatchToolStatus::Running));
+
+        assert_eq!(relay.tools, 4, "{ROSTER_MISCOUNT_MSG}");
+    }
+
+    /// A model can ask for more children than `batch` will run. Every one of
+    /// them is a call it made, so every one is counted, while the rows stop at
+    /// the cap: past it each says the same discard message.
+    #[test]
+    fn an_oversized_roster_counts_whole_and_draws_to_the_cap() {
+        let over = MAX_BATCH_SIZE + 5;
+        let start = batch_start(over);
+        let mut relay = ProgressRelay::new();
+
+        let activity = relay.activity(&start).expect("a start names its tool");
+
+        assert_eq!(ProgressRelay::counted(&start), over as u32);
+        assert_eq!(activity.children().len(), MAX_BATCH_SIZE);
+    }
+
+    #[test]
+    fn a_child_moving_republishes_the_roster_that_holds_it() {
+        let published = rosters(vec![
+            batch_start(2),
+            batch_progress(TOOL_ID, 1, BatchToolStatus::Running),
+            batch_progress(TOOL_ID, 1, BatchToolStatus::Success),
+        ]);
+
+        let row = |status| (CHILD_TOOL.to_owned(), status);
+        assert_eq!(
+            published,
+            [
+                vec![row(BatchToolStatus::Pending), row(BatchToolStatus::Pending)],
+                vec![row(BatchToolStatus::Pending), row(BatchToolStatus::Running)],
+                vec![row(BatchToolStatus::Pending), row(BatchToolStatus::Success)],
+            ]
+        );
+    }
+
+    /// A report for a batch this session is not watching describes someone
+    /// else's call, and patching a row from it would draw the wrong roster.
+    #[test_case("other-batch", 0 ; "another_batch")]
+    #[test_case(TOOL_ID, 9      ; "a_row_the_roster_does_not_have")]
+    fn an_unrecognised_child_report_publishes_nothing(id: &str, index: usize) {
+        let mut relay = ProgressRelay::new();
+        relay.last = relay.activity(&batch_start(2));
+
+        assert!(
+            relay
+                .activity(&batch_progress(id, index, BatchToolStatus::Running))
+                .is_none()
+        );
+    }
+
+    /// The roster describes the call the header names, so a plugin renaming
+    /// that header mid-run must not drop it.
+    #[test]
+    fn a_retitled_batch_keeps_its_roster() {
+        let mut relay = ProgressRelay::new();
+        relay.last = relay.activity(&batch_start(2));
+
+        let retitled = relay
+            .activity(&header_snapshot("2 tools"))
+            .expect("a snapshot retitles the call it belongs to");
+
+        assert_eq!(retitled.detail(), Some("2 tools"));
+        assert_eq!(retitled.children().len(), 2);
+    }
+
+    /// The batch is over, so a later report cannot patch a roster that no
+    /// longer describes anything.
+    #[test]
+    fn a_finished_batch_stops_being_watched() {
+        let mut relay = ProgressRelay::new();
+        relay.last = relay.activity(&batch_start(1));
+        let done = AgentEvent::ToolDone(Box::new(ToolDoneEvent::error(
+            TOOL_ID.to_owned(),
+            SESSION_CLOSED,
+        )));
+        assert!(relay.activity(&done).is_none());
+
+        assert!(
+            relay
+                .activity(&batch_progress(TOOL_ID, 0, BatchToolStatus::Success))
+                .is_none()
+        );
     }
 
     /// Drives the relay's stateful half directly: the published sequence is

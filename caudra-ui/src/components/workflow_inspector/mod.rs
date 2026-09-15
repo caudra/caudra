@@ -29,7 +29,9 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::animation::{animation_elapsed_ms, spinner_str};
 use crate::components::modal::{FooterHits, FooterLine, Modal};
 use crate::components::scrollbar::{ScrollHint, Scrollbar, ScrollbarMouse};
-use crate::components::tool_display::{activity_detail, activity_label};
+use crate::components::tool_display::{
+    TREE_BRANCH, TREE_LAST, activity_child_spans, activity_detail, activity_label, activity_sigil,
+};
 use crate::components::workflow_card::{phase_strip_line, status_span};
 use crate::components::workflow_inspector::timeline::{TimelineRow, span_bar, timeline};
 use crate::components::{
@@ -1815,11 +1817,28 @@ impl WorkflowInspector {
                     t.tool_dim,
                 )),
             }
-            if let Some(progress) = self.activity(run, agent) {
+            let progress = self.activity(run, agent);
+            if let Some(progress) = progress {
                 spans.extend(activity_spans(progress, agent.state));
             }
             starts.push(lines.len());
             lines.push(Line::from(spans));
+            // The batch the agent is working through, hung under the row that
+            // names it and indented past the mark and glyph columns so the
+            // connectors sit under the agent's label.
+            if let Some(progress) = progress.filter(|_| agent.state == RosterState::Running) {
+                let children = progress.report.activity.children();
+                for (index, child) in children.iter().enumerate() {
+                    let connector = match index + 1 == children.len() {
+                        true => TREE_LAST,
+                        false => TREE_BRANCH,
+                    };
+                    lines.push(Line::from(activity_child_spans(
+                        child,
+                        format!("{}{GLYPH_PAD}{connector}", " ".repeat(MARK_COLS)),
+                    )));
+                }
+            }
             if let Some(call) = self.agent_call(agent.call_key)
                 && self.expanded_call == Some(agent.call_key)
             {
@@ -2002,10 +2021,14 @@ fn activity_spans(progress: &ToolProgress, state: RosterState) -> Vec<Span<'stat
         true => t.tool_prefix,
         false => t.tool_dim,
     };
-    let mut spans = vec![
-        Span::raw(SEPARATOR),
-        Span::styled(activity_label(&progress.report.activity), label),
-    ];
+    let mut spans = vec![Span::raw(SEPARATOR)];
+    if let Some(sigil) = activity_sigil(&progress.report.activity) {
+        spans.push(Span::styled(format!("{sigil} "), label));
+    }
+    spans.push(Span::styled(
+        activity_label(&progress.report.activity),
+        label,
+    ));
     if let Some(detail) = activity_detail(&progress.report.activity) {
         spans.push(Span::styled(format!(" {detail}"), t.tool_dim));
     }

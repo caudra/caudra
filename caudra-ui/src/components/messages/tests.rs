@@ -5228,7 +5228,7 @@ fn a_compact_row_names_its_tool_with_a_sigil_and_label() {
     finished(&mut panel, &["t1"]);
     rebuild(&mut panel);
 
-    assert_eq!(first_line_text(&panel, 0), "✱ Grepped t1 (1 lines)");
+    assert_eq!(first_line_text(&panel, 0), "⌕ Grepped t1 (1 lines)");
 }
 
 /// The past tense asserts the call happened, so a failure has to fall back to
@@ -5253,6 +5253,8 @@ fn a_compact_label_is_inflected_by_what_the_call_is_doing(outcome: Option<bool>,
 
 const EXPANDED_HEADER_LABEL_MSG: &str =
     "an expanded card says what the call is doing, not what its tool is registered as";
+/// How `shell` heads a row, whichever density drew it.
+const SHELL_SIGIL: &str = "$";
 
 /// The expanded header wrote the bare tool name and an arrow, so the same
 /// shell call read `shell>` on a card and `Ran` on a row one view mode away.
@@ -5271,12 +5273,18 @@ fn an_expanded_card_header_is_inflected_like_its_row(outcome: Option<bool>, expe
     }
     rebuild(&mut panel);
 
-    // The leading glyph is a spinner while the call runs, so the label is
-    // read as the token after it rather than from the front of the row.
+    // A running card carries the spinner ahead of its sigil and a finished one
+    // holds that slot blank, so the label is found behind the sigil rather than
+    // at a fixed offset from the front of the row.
     let header = first_line_text(&panel, 0);
+    let tokens: Vec<&str> = header.split_whitespace().collect();
+    let sigil = tokens
+        .iter()
+        .position(|token| *token == SHELL_SIGIL)
+        .expect("the header opens on its tool's sigil");
     assert_eq!(
-        header.split_whitespace().nth(1),
-        Some(expected),
+        tokens.get(sigil + 1),
+        Some(&expected),
         "{EXPANDED_HEADER_LABEL_MSG}: {header:?}"
     );
 }
@@ -5649,8 +5657,10 @@ fn live_thinking_duration_always_keeps_tenths(duration: Duration, expected: &str
 }
 
 #[test]
-fn expanded_density_keeps_the_status_dot_and_the_card() {
-    const CARD_HEADER: &str = "● Mapped ";
+fn expanded_density_keeps_the_sigil_and_the_card() {
+    // The spinner's slot is held blank once the call lands, so the sigil sits
+    // in the column it occupied while the call ran.
+    const CARD_HEADER: &str = "  ◇ Mapped ";
 
     let mut panel = panel_with_tools(&[("t1", CODE_MAP_TOOL_NAME)]);
     panel.set_view(ViewMode::Expanded);

@@ -1917,6 +1917,26 @@ fn breaks_a_title(character: char) -> bool {
     matches!(character, '*' | '\n' | '\r')
 }
 
+/// One child of a batch a subagent is running, as its parent's progress row
+/// draws it. Deliberately not [`BatchToolEntry`], which carries the input and
+/// the whole output: this is republished every time any child changes state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ActivityChild {
+    pub tool: Arc<str>,
+    pub summary: String,
+    pub status: BatchToolStatus,
+}
+
+impl From<&BatchToolEntry> for ActivityChild {
+    fn from(entry: &BatchToolEntry) -> Self {
+        Self {
+            tool: Arc::from(entry.tool.as_str()),
+            summary: entry.summary.split_whitespace().collect::<Vec<_>>().join(" "),
+            status: entry.status,
+        }
+    }
+}
+
 /// What a subagent is doing right now, so a parent watching only the task
 /// header can tell a stalled run from a busy one. Derived from the child's own
 /// event stream; the parent never inspects the child transcript for it.
@@ -1931,6 +1951,10 @@ pub enum SubagentActivity {
     Tool {
         name: Arc<str>,
         summary: String,
+        /// The roster, when the tool is a `batch`. Empty for every other call,
+        /// which is what keeps the common activity a two-field struct.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        children: Vec<ActivityChild>,
     },
     Compacting,
     Retrying,
@@ -1945,6 +1969,27 @@ impl SubagentActivity {
         Self::Tool {
             name,
             summary: summary.split_whitespace().collect::<Vec<_>>().join(" "),
+            children: Vec::new(),
+        }
+    }
+
+    /// The same row, with the roster the batch behind it is working through.
+    pub fn batch(name: Arc<str>, summary: &str, children: Vec<ActivityChild>) -> Self {
+        match Self::tool(name, summary) {
+            Self::Tool { name, summary, .. } => Self::Tool {
+                name,
+                summary,
+                children,
+            },
+            other => other,
+        }
+    }
+
+    /// The batch roster behind this activity, empty for everything else.
+    pub fn children(&self) -> &[ActivityChild] {
+        match self {
+            Self::Tool { children, .. } => children,
+            _ => &[],
         }
     }
 

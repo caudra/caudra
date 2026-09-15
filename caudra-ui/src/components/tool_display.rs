@@ -28,7 +28,7 @@ use crate::markdown::{
 };
 use caudra_agent::{
     BatchToolStatus, BufferSnapshot, InstructionBlock, NO_FILES_FOUND, ShellOutput, SnapshotSpan,
-    SpanStyle, SubagentActivity, SubagentProgress, ToolInput, ToolOutput,
+    ActivityChild, SpanStyle, SubagentActivity, SubagentProgress, ToolInput, ToolOutput,
     tools::{
         FILE_READ_TOOL_NAME, FILE_WRITE_TOOL_NAME, PYTHON_EXECUTION_TOOL_NAME, SHELL_TOOL_NAME,
         humanize_duration,
@@ -115,16 +115,28 @@ impl RenderCtx<'_> {
     }
 }
 
-pub const TOOL_INDICATOR: &str = "● ";
 pub const TOOL_BODY_INDENT: &str = "  ";
+/// Stands where the spinner does once a call has landed, so the sigil beside
+/// it never changes column. Must match the width of one spinner frame plus its
+/// trailing space.
+const INDICATOR_PAD: &str = "  ";
 const TOOL_BODY_INDENT_WIDTH: u16 = TOOL_BODY_INDENT.len() as u16;
 pub(crate) const NOTICE_PREFIX: &str = "· ";
 pub(crate) const SPINNER_STYLE_NAME: &str = "spinner";
 pub(crate) const SPINNER_STYLE_PREFIX: &str = "spinner:";
 
 const CODE_OUTPUT_DIVIDER: &str = "  ────────────";
-const ACTIVITY_PREFIX: &str = "  ├ ";
+/// The progress row is the only node under a card header, and `tree` draws a
+/// lone child with the closing connector.
+const ACTIVITY_PREFIX: &str = "  └── ";
 const ACTIVITY_SEPARATOR: &str = " · ";
+/// One tree level, all four columns wide so a connector and the gap below it
+/// occupy the same span. Shared with `code_view` and the workflow inspector,
+/// which draw the same tree: a second copy is how two surfaces drift apart.
+pub(super) const TREE_BRANCH: &str = "├── ";
+pub(super) const TREE_LAST: &str = "└── ";
+pub(super) const TREE_TRUNK: &str = "│   ";
+pub(super) const TREE_GAP: &str = "    ";
 /// A window still chasing the tail, and one the reader pinned by scrolling
 /// up. Named the way the log viewer names the same two states.
 pub(crate) const FOLLOWING: &str = "following";
@@ -268,31 +280,36 @@ const SESSIONS: Inflection = ("Sessions", "Sessions", "Sessions");
 /// Header keys are matched ignoring case and underscores, so one spelling
 /// covers Workcell's camelCase wire names and the snake_case the legacy tools
 /// still carry in restored sessions.
+/// A sigil names its tool, because the label beside it already names the
+/// operation: family-coding both spends the only per-tool identifier on what
+/// the row repeats two columns right. Families survive only where the tools
+/// really are one tool with several verbs — the code graph, the two stores,
+/// and the cold members of read and write.
 const COMPACT_TOOLS: &[(&str, CompactTool)] = &[
     tool_row("file_read", '→', READ, &["file_path"]),
     tool_row("file_glob", '✱', FIND, &["pattern", "path"]),
-    tool_row("file_grep", '✱', GREP, &["pattern", "path"]),
+    tool_row("file_grep", '⌕', GREP, &["pattern", "path"]),
     tool_row("file_write", '←', WRITE, &["file_path", "content"]),
-    tool_row("file_edit", '←', EDIT, EDIT_KEYS),
-    tool_row("file_apply_patch", '%', PATCH, &["patch_text"]),
-    tool_row("file_index", '→', INDEX, &["path"]),
+    tool_row("file_edit", '✎', EDIT, EDIT_KEYS),
+    tool_row("file_apply_patch", '±', PATCH, &["patch_text"]),
+    tool_row("file_index", '≡', INDEX, &["path"]),
     tool_row("websearch", '◈', SEARCH, &["query"]),
-    tool_row("webfetch", '%', FETCH, &["url"]),
+    tool_row("webfetch", '↓', FETCH, &["url"]),
     tool_row("shell", '$', RUN, &["command"]),
-    tool_row("python_execution", '$', COMPUTE, &["code"]),
+    tool_row("python_execution", 'λ', COMPUTE, &["code"]),
     tool_row("code_map", '◇', MAP, &["path"]),
     tool_row("code_context", '◇', LOCATE, &["task", "path"]),
     tool_row("code_refs", '◇', TRACE, &["symbol", "path"]),
     tool_row("code_impact", '◇', IMPACT, &["symbol", "path"]),
     tool_row("code_expand", '◇', EXPAND, &["symbol", "path"]),
-    tool_row("execution_environment", '⚙', INSPECT, &[]),
-    tool_row("task", '#', DELEGATE, &["prompt", "description"]),
-    tool_row("batch", '#', BATCH, &["invocations"]),
-    tool_row("todo_write", '⚙', UPDATE, &["todos"]),
+    tool_row("execution_environment", '⌂', INSPECT, &[]),
+    tool_row("task", '❖', DELEGATE, &["prompt", "description"]),
+    tool_row("batch", '⇶', BATCH, &["invocations"]),
+    tool_row("todo_write", '✓', UPDATE, &["todos"]),
     tool_row("skill", '→', LOAD, &["name"]),
-    tool_row("question", '→', ASK, &["questions"]),
-    tool_row("memory", '⚙', MEMORY, &["content"]),
-    tool_row("sessions", '⚙', SESSIONS, &[]),
+    tool_row("question", '?', ASK, &["questions"]),
+    tool_row("memory", '▤', MEMORY, &["content"]),
+    tool_row("sessions", '▤', SESSIONS, &[]),
     tool_row("view_image", '→', VIEW, &["path"]),
     tool_row("image_generate", '←', DRAW, &["out", "prompt"]),
 ];
@@ -421,6 +438,36 @@ pub(super) fn activity_label(activity: &SubagentActivity) -> String {
 /// summary is built from tool input, which the agent does not author.
 pub(super) fn activity_detail(activity: &SubagentActivity) -> Option<String> {
     activity.detail().map(escape_terminal_controls)
+}
+
+/// The sigil an activity row opens on, so it reads like the row above it and
+/// the rows below it. A phase that is not a call has no tool to name, and
+/// falling back to the unknown-tool sigil would assert one that never ran.
+pub(super) fn activity_sigil(activity: &SubagentActivity) -> Option<char> {
+    match activity {
+        SubagentActivity::Tool { name, .. } => Some(compact_sigil_label(name, Tense::Present).0),
+        _ => None,
+    }
+}
+
+/// One child of a batch a subagent is running, drawn the way the batch card
+/// draws the same call: the connector, then the sigil in its outcome colour,
+/// then the tense the child's status puts the verb in.
+pub(super) fn activity_child_spans(child: &ActivityChild, prefix: String) -> Vec<Span<'static>> {
+    let theme = theme::current();
+    let (sigil, label) = compact_sigil_label(&child.tool, child.status.into());
+    let mut spans = vec![
+        Span::styled(prefix, theme.tool_dim),
+        Span::styled(format!("{sigil} "), batch_sigil_style(child.status, None)),
+        Span::styled(label.to_owned(), theme.tool_prefix),
+    ];
+    if !child.summary.is_empty() {
+        spans.push(Span::styled(
+            format!(" {}", escape_terminal_controls(&child.summary)),
+            theme.tool_dim,
+        ));
+    }
+    spans
 }
 
 /// A phase label is authored lowercase to read mid-sentence, but on this row it
@@ -1010,11 +1057,16 @@ struct ToolLineBuilder {
     limits: RenderLimits,
     markdown: bool,
     indicator: Indicator,
+    /// The card's tool, resolved once at header time so the head, a plugin's
+    /// baked spinner slot, and a compact row cannot disagree about what this
+    /// call is.
+    sigil: char,
 }
 
 impl ToolLineBuilder {
     fn new(width: u16, indicator: Indicator, limits: RenderLimits) -> Self {
         Self {
+            sigil: COMPACT_FALLBACK_SIGIL,
             lines: Vec::new(),
             link_rows: Vec::new(),
             search_text: String::new(),
@@ -1050,7 +1102,8 @@ impl ToolLineBuilder {
         output: Option<&ToolOutput>,
         raw_input: Option<&serde_json::Value>,
     ) {
-        let label = compact_sigil_label(tool_name, self.indicator.into()).1;
+        let (sigil, label) = compact_sigil_label(tool_name, self.indicator.into());
+        self.sigil = sigil;
         // An omitted header leaves the label against the annotation, so the
         // separator goes with the text it separates.
         let gap = if header.is_empty() { "" } else { " " };
@@ -1067,6 +1120,7 @@ impl ToolLineBuilder {
                     &mut spans,
                     spinner_str(0),
                     self.indicator,
+                    sigil,
                     |span_idx| {
                         spinners.push((line_idx, span_idx));
                     },
@@ -1104,6 +1158,7 @@ impl ToolLineBuilder {
     ) {
         let row = compact_row(tool_name);
         let label = row.map_or(tool_name, |(_, entry)| entry.label(self.indicator.into()));
+        self.sigil = row.map_or(COMPACT_FALLBACK_SIGIL, |(_, entry)| entry.sigil);
 
         let mut copy = format!("{label} {header}");
         let mut spans = vec![Span::styled(
@@ -1137,9 +1192,10 @@ impl ToolLineBuilder {
         self.search_text = copy;
     }
 
-    /// Compact rows carry the sigil where an expanded row carries `● `, so a
-    /// finished call still reports success or failure by color.
-    fn prepend_compact_sigil(&mut self, tool_name: &str, started_at: Instant) {
+    /// The leading glyph is the tool, coloured by outcome. A compact row has
+    /// no room for a spinner beside it, so while the call runs the frame takes
+    /// the slot outright.
+    fn prepend_compact_sigil(&mut self, started_at: Instant) {
         if self.lines.is_empty() {
             return;
         }
@@ -1148,11 +1204,7 @@ impl ToolLineBuilder {
                 format!("{} ", spinner_frame(started_at.elapsed().as_millis())),
                 theme::current().spinner,
             ),
-            finished => {
-                let sigil =
-                    compact_tool(tool_name).map_or(COMPACT_FALLBACK_SIGIL, |entry| entry.sigil);
-                (format!("{sigil} "), finished_style(finished))
-            }
+            finished => (format!("{} ", self.sigil), finished_style(finished)),
         };
         if matches!(self.indicator, Indicator::InProgress) {
             self.spinner_lines.push((0, 0));
@@ -1167,26 +1219,45 @@ impl ToolLineBuilder {
         self.search_text.push_str(text);
     }
 
+    /// The leading glyph is the tool, so a glance at the head says what the
+    /// card is doing rather than only how it ended. The sigil holds one column
+    /// in both states: the spinner takes the slot in front of it while the
+    /// call runs and leaves it blank once it lands, so a finished card does
+    /// not drag its header two columns left.
     fn prepend_indicator(&mut self, started_at: Instant) {
         if self.lines.is_empty() {
             return;
         }
-        let (text, style) = match self.indicator {
-            Indicator::InProgress => {
-                let ch = spinner_frame(started_at.elapsed().as_millis());
-                (format!("{ch} "), theme::current().spinner)
-            }
-            finished => (TOOL_INDICATOR.into(), finished_style(finished)),
+        let theme = theme::current();
+        let running = matches!(self.indicator, Indicator::InProgress);
+        let (head, sigil_style) = match running {
+            true => (
+                Span::styled(
+                    format!("{} ", spinner_frame(started_at.elapsed().as_millis())),
+                    theme.spinner,
+                ),
+                theme.tool_prefix,
+            ),
+            false => (
+                Span::raw(INDICATOR_PAD),
+                finished_style(self.indicator),
+            ),
         };
         for (line, span) in &mut self.spinner_lines {
             if *line == 0 {
-                *span += 1;
+                *span += 2;
             }
         }
-        if matches!(self.indicator, Indicator::InProgress) {
+        if running {
             self.spinner_lines.push((0, 0));
         }
-        self.lines[0].spans.insert(0, Span::styled(text, style));
+        self.lines[0].spans.splice(
+            0..0,
+            [
+                head,
+                Span::styled(format!("{} ", self.sigil), sigil_style),
+            ],
+        );
     }
 
     fn is_in_progress(&self) -> bool {
@@ -1198,6 +1269,9 @@ impl ToolLineBuilder {
     fn progress_spans(&self, progress: &ToolProgress, out: &mut Vec<Span<'static>>) {
         let theme = theme::current();
         if self.is_in_progress() {
+            if let Some(sigil) = activity_sigil(&progress.report.activity) {
+                out.push(Span::styled(format!("{sigil} "), theme.tool_prefix));
+            }
             out.push(Span::styled(
                 activity_label(&progress.report.activity),
                 theme.tool_prefix,
@@ -1219,6 +1293,22 @@ impl ToolLineBuilder {
         let mut spans = vec![Span::styled(ACTIVITY_PREFIX, theme::current().tool_dim)];
         self.progress_spans(progress, &mut spans);
         self.lines.push(Line::from(spans));
+        // The roster hangs off the activity row, which is itself the last node
+        // under the header, so every level below it is gap rather than trunk.
+        if !self.is_in_progress() {
+            return;
+        }
+        let children = progress.report.activity.children();
+        for (index, child) in children.iter().enumerate() {
+            let connector = match index + 1 == children.len() {
+                true => TREE_LAST,
+                false => TREE_BRANCH,
+            };
+            self.lines.push(Line::from(activity_child_spans(
+                child,
+                format!("{TOOL_BODY_INDENT}{TREE_GAP}{connector}"),
+            )));
+        }
     }
 
     /// A compact row is one line by contract, so progress joins the header
@@ -1501,6 +1591,7 @@ impl ToolLineBuilder {
             start..end,
             frame,
             self.indicator,
+            self.sigil,
         );
         self.lines.extend(lines);
         self.spinner_lines
@@ -1563,13 +1654,15 @@ fn push_text_lines(lines: &mut Vec<Line<'static>>, text: &str, indent: &'static 
 /// Bakes snapshot spans onto `out`. `"spinner"`-styled spans bake to the
 /// current frame while a tool is in progress, and `on_spinner` gets their
 /// span index in the same pass, so animation offsets can never drift from
-/// the baked spans. Finished tools bake a static dot instead and record no
-/// spinner position, so a stale `"spinner"` span can never keep animating.
+/// the baked spans. Finished tools bake the card's own sigil instead and
+/// record no spinner position, so a stale `"spinner"` span can never keep
+/// animating.
 fn bake_spans(
     src: &[SnapshotSpan],
     out: &mut Vec<Span<'static>>,
     spinner_frame: &'static str,
     indicator: Indicator,
+    sigil: char,
     mut on_spinner: impl FnMut(usize),
 ) {
     for span in src {
@@ -1579,7 +1672,9 @@ fn bake_spans(
                     on_spinner(out.len());
                     out.push(Span::styled(spinner_frame, theme::current().spinner));
                 }
-                finished => out.push(Span::styled(TOOL_INDICATOR, finished_style(finished))),
+                finished => {
+                    out.push(Span::styled(format!("{sigil} "), finished_style(finished)))
+                }
             }
         } else {
             out.push(Span::styled(
@@ -1605,6 +1700,7 @@ fn snapshot_to_lines_range(
     range: std::ops::Range<usize>,
     spinner_frame: &'static str,
     indicator: Indicator,
+    sigil: char,
 ) -> (Vec<Line<'static>>, Vec<(usize, usize)>) {
     let mut spinners = Vec::new();
     let lines = snapshot.lines[range]
@@ -1617,6 +1713,7 @@ fn snapshot_to_lines_range(
                 &mut spans,
                 spinner_frame,
                 indicator,
+                sigil,
                 |span_idx| {
                     spinners.push((i, span_idx));
                 },
@@ -1722,7 +1819,7 @@ pub fn build_tool_lines(
             msg.tool_raw_input.as_deref(),
             msg.tool_output.as_deref(),
         );
-        b.prepend_compact_sigil(tool_name, rctx.started_at);
+        b.prepend_compact_sigil(rctx.started_at);
     } else {
         // The command still belongs on a row that has no body to defer to.
         // An open card has one either way: the settled script, or as much of
@@ -1934,7 +2031,10 @@ mod tests {
     const TOL: ToolOutputLines = ToolOutputLines::DEFAULT;
     use crate::components::{DisplayRole, ToolRole};
     use crate::markdown::TRUNCATION_PREFIX;
-    use caudra_agent::tools::{FILE_READ_TOOL_NAME, SHELL_TOOL_NAME, TASK_TOOL_NAME, ToolEffect};
+    use caudra_agent::tools::{
+        BATCH_TOOL_NAME, FILE_GREP_TOOL_NAME, FILE_READ_TOOL_NAME, SHELL_TOOL_NAME, TASK_TOOL_NAME,
+        ToolEffect,
+    };
     use caudra_agent::{
         GrepFileEntry, GrepMatchGroup, ShellFilterInfo, SnapshotLine, SnapshotSpan,
         SubagentActivity, TextOutput, ToolInput, ToolOutput,
@@ -2138,6 +2238,13 @@ mod tests {
             .map(|s| s.content.as_ref())
             .collect::<Vec<_>>()
             .join("")
+    }
+
+    fn line_text(line: &Line<'static>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
     }
 
     const MARKDOWN_PATH: &str = "notes.md";
@@ -2771,6 +2878,9 @@ mod tests {
         );
     }
 
+    /// What `snapshot_msg`'s tool heads its rows with, sigil and trailing gap.
+    const INDEX_SIGIL: &str = "≡ ";
+
     fn snapshot_msg(snapshot: BufferSnapshot) -> DisplayMessage {
         DisplayMessage {
             role: DisplayRole::Tool(Box::new(ToolRole {
@@ -2899,8 +3009,9 @@ mod tests {
             &test_rctx(80),
             Some(Disclosure::default()),
         );
-        // indicator + `tool> ` prefix + "3 tools " sit before the header spinner.
-        assert_eq!(tl.spinner_lines, vec![(0, 3), (0, 0)]);
+        // Head spinner, sigil, label prefix and "3 tools " all sit before the
+        // spinner the plugin painted into its own header.
+        assert_eq!(tl.spinner_lines, vec![(0, 4), (0, 0)]);
     }
 
     const DENIAL_MSG: &str = "Permission denied: user rejected";
@@ -3430,8 +3541,85 @@ mod tests {
             .collect();
         assert_eq!(
             progress_line,
-            "  ├ Running cargo nextest run · 3 tools · 1m 3.4s"
+            "  └── $ Running cargo nextest run · 3 tools · 1m 3.4s"
         );
+    }
+
+    const NESTED_ROSTER_MSG: &str =
+        "a subagent batching draws the roster it is working through, one node in";
+
+    fn batch_child(tool: &str, summary: &str, status: BatchToolStatus) -> ActivityChild {
+        ActivityChild {
+            tool: Arc::from(tool),
+            summary: summary.to_owned(),
+            status,
+        }
+    }
+
+    /// The reported bug: a subagent running a batch reported only `Batching 3
+    /// tools`, so the three calls it was actually making were invisible from
+    /// the parent. They hang off the activity row as its own tree level.
+    #[test]
+    fn a_batching_subagent_draws_its_roster_under_the_activity() {
+        let activity = SubagentActivity::batch(
+            Arc::from(BATCH_TOOL_NAME),
+            "3 tools",
+            vec![
+                batch_child(FILE_READ_TOOL_NAME, "a.rs", BatchToolStatus::Success),
+                batch_child(SHELL_TOOL_NAME, "cargo check", BatchToolStatus::Running),
+                batch_child(FILE_GREP_TOOL_NAME, "fn main", BatchToolStatus::Pending),
+            ],
+        );
+        let msg = subagent_msg(ToolStatus::InProgress, Some(report(activity, 3)));
+
+        let tl = build_tool_lines(&msg, ToolStatus::InProgress, &test_rctx(80), None);
+
+        let rows: Vec<String> = tl.lines.iter().skip(1).map(line_text).collect();
+        assert_eq!(
+            rows,
+            [
+                "  └── ⇶ Batching 3 tools · 3 tools · 1m 3.4s",
+                "      ├── → Read a.rs",
+                "      ├── $ Running cargo check",
+                "      └── ⌕ Grep fn main",
+            ],
+            "{NESTED_ROSTER_MSG}"
+        );
+    }
+
+    /// The roster describes what the call is doing, so it goes when the call
+    /// stops, exactly as the activity beside it does.
+    #[test]
+    fn a_settled_subagent_drops_the_roster_with_its_activity() {
+        let activity = SubagentActivity::batch(
+            Arc::from(BATCH_TOOL_NAME),
+            "1 tool",
+            vec![batch_child(
+                FILE_READ_TOOL_NAME,
+                "a.rs",
+                BatchToolStatus::Success,
+            )],
+        );
+        let msg = subagent_msg(ToolStatus::Success, Some(report(activity, 1)));
+
+        let tl = build_tool_lines(&msg, ToolStatus::Success, &test_rctx(80), None);
+
+        let text = lines_text(&tl);
+        assert!(!text.contains("a.rs"), "{text}");
+    }
+
+    /// A phase is not a call, so nothing names a tool on that row and the
+    /// unknown-tool sigil must not stand in for one.
+    #[test]
+    fn a_phase_activity_draws_no_sigil() {
+        let msg = subagent_msg(
+            ToolStatus::InProgress,
+            Some(report(SubagentActivity::Responding, 2)),
+        );
+
+        let tl = build_tool_lines(&msg, ToolStatus::InProgress, &test_rctx(80), None);
+
+        assert_eq!(line_text(&tl.lines[1]), "  └── Responding · 2 tools · 1m 3.4s");
     }
 
     /// What it was doing is stale the moment it stops; what it did is not.
@@ -3443,7 +3631,7 @@ mod tests {
         let tl = build_tool_lines(&msg, status, &test_rctx(80), Some(Disclosure::default()));
 
         let text = lines_text(&tl);
-        assert!(text.contains("├ 7 tools · 1m 3.4s"), "{text}");
+        assert!(text.contains("└── 7 tools · 1m 3.4s"), "{text}");
         assert!(!text.contains("cargo nextest run"), "{text}");
     }
 
@@ -3464,7 +3652,7 @@ mod tests {
         );
 
         assert!(
-            lines_text(&tl).contains(&format!("├ {expected}")),
+            lines_text(&tl).contains(&format!("└── {expected}")),
             "{}",
             lines_text(&tl)
         );
@@ -3495,9 +3683,49 @@ mod tests {
         assert_eq!(tl.lines.len(), 1);
         let text = lines_text(&tl);
         assert!(
-            text.contains(" · Running cargo nextest run · 3 tools · 1m 3.4s"),
+            text.contains(" · $ Running cargo nextest run · 3 tools · 1m 3.4s"),
             "{text}"
         );
+    }
+
+    const SIGIL_WIDTH_MSG: &str =
+        "a sigil holds one cell, or every label behind it sits a column out";
+    const SIGIL_CLASH_MSG: &str = "two tools sharing a sigil is a family, and a family is declared";
+    /// The sigils a family deliberately shares: the code graph is one tool with
+    /// five verbs, the stores are one store with two, and read and write each
+    /// keep the cold members whose operation really is the same.
+    const SHARED_SIGILS: &[char] = &['◇', '▤', '→', '←'];
+
+    #[test]
+    fn every_sigil_occupies_one_cell() {
+        for (tool, entry) in COMPACT_TOOLS {
+            let width = UnicodeWidthStr::width(entry.sigil.to_string().as_str());
+            assert_eq!(width, 1, "{SIGIL_WIDTH_MSG}: {tool} uses {:?}", entry.sigil);
+        }
+        let fallback = UnicodeWidthStr::width(COMPACT_FALLBACK_SIGIL.to_string().as_str());
+        assert_eq!(fallback, 1, "{SIGIL_WIDTH_MSG}: the unknown-tool sigil");
+    }
+
+    /// The table used to hand `task` and `batch` one glyph and `shell` and
+    /// `python_execution` another, so the two busiest pairs in a transcript
+    /// were the two a reader could not tell apart.
+    #[test]
+    fn no_two_tools_share_a_sigil_outside_a_declared_family() {
+        for (index, (tool, entry)) in COMPACT_TOOLS.iter().enumerate() {
+            if SHARED_SIGILS.contains(&entry.sigil) {
+                continue;
+            }
+            for (other, other_entry) in &COMPACT_TOOLS[index + 1..] {
+                assert_ne!(
+                    entry.sigil, other_entry.sigil,
+                    "{SIGIL_CLASH_MSG}: {tool} and {other}"
+                );
+            }
+            assert_ne!(
+                entry.sigil, COMPACT_FALLBACK_SIGIL,
+                "{SIGIL_CLASH_MSG}: {tool} reads as a tool the table has never heard of"
+            );
+        }
     }
 
     const ACTIVITY_VERB_MSG: &str = "an activity row names a tool by the verb its card header uses";
@@ -3740,8 +3968,14 @@ mod tests {
             text: "content".into(),
             style: SpanStyle::Default,
         }]]);
-        let (lines, _) =
-            snapshot_to_lines_range(&snapshot, ">>", 0..1, "⠋ ", Indicator::InProgress);
+        let (lines, _) = snapshot_to_lines_range(
+            &snapshot,
+            ">>",
+            0..1,
+            "⠋ ",
+            Indicator::InProgress,
+            COMPACT_FALLBACK_SIGIL,
+        );
         assert_eq!(lines.len(), 1);
         let first_span = &lines[0].spans[0];
         assert_eq!(first_span.content.as_ref(), ">>");
@@ -3763,7 +3997,14 @@ mod tests {
                 style: SpanStyle::Default,
             },
         ]]);
-        let (lines, _) = snapshot_to_lines_range(&snapshot, "", 0..1, "⠋ ", Indicator::InProgress);
+        let (lines, _) = snapshot_to_lines_range(
+            &snapshot,
+            "",
+            0..1,
+            "⠋ ",
+            Indicator::InProgress,
+            COMPACT_FALLBACK_SIGIL,
+        );
         let texts: Vec<&str> = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(texts, vec!["", "aaa", "bbb", "ccc"]);
     }
@@ -3786,15 +4027,21 @@ mod tests {
                 },
             ],
         ]);
-        let (lines, spinners) =
-            snapshot_to_lines_range(&snapshot, "", 0..2, "⠹ ", Indicator::InProgress);
+        let (lines, spinners) = snapshot_to_lines_range(
+            &snapshot,
+            "",
+            0..2,
+            "⠹ ",
+            Indicator::InProgress,
+            COMPACT_FALLBACK_SIGIL,
+        );
         assert_eq!(spinners, vec![(1, 2)]);
         assert_eq!(lines[1].spans[2].content.as_ref(), "⠹ ");
     }
 
-    #[test_case(ToolStatus::Success ; "success_bakes_dot")]
-    #[test_case(ToolStatus::Error ; "error_bakes_dot")]
-    fn done_snapshot_with_spinner_span_bakes_dot_and_records_no_spinner(status: ToolStatus) {
+    #[test_case(ToolStatus::Success ; "success_bakes_sigil")]
+    #[test_case(ToolStatus::Error ; "error_bakes_sigil")]
+    fn done_snapshot_with_spinner_span_bakes_sigil_and_records_no_spinner(status: ToolStatus) {
         let snapshot = make_snapshot(vec![vec![
             SnapshotSpan {
                 text: "child ".into(),
@@ -3813,12 +4060,12 @@ mod tests {
         );
         assert_eq!(tl.spinner_lines, vec![]);
         let body = tl.lines.get(1).expect("snapshot body line");
-        let dot = body.spans.last().expect("baked dot span");
-        assert_eq!(dot.content.as_ref(), TOOL_INDICATOR);
+        let baked = body.spans.last().expect("baked sigil span");
+        assert_eq!(baked.content.as_ref(), INDEX_SIGIL);
     }
 
     #[test]
-    fn done_header_with_spinner_span_bakes_dot_and_records_no_spinner() {
+    fn done_header_with_spinner_span_bakes_sigil_and_records_no_spinner() {
         let header = make_snapshot(vec![vec![
             SnapshotSpan {
                 text: "3 tools ".into(),
@@ -3842,8 +4089,8 @@ mod tests {
         );
         assert_eq!(tl.spinner_lines, vec![]);
         let header_line = tl.lines.first().expect("header line");
-        let dot = header_line.spans.last().expect("baked dot span");
-        assert_eq!(dot.content.as_ref(), TOOL_INDICATOR);
+        let baked = header_line.spans.last().expect("baked sigil span");
+        assert_eq!(baked.content.as_ref(), INDEX_SIGIL);
     }
 
     const GREP_TOOL: &str = "file_grep";
