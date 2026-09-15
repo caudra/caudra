@@ -167,6 +167,7 @@ impl Peeked {
             batch::started_entry(start)
         } else {
             BatchToolEntry {
+                model_suffix: None,
                 tool: self.done.as_ref()?.tool.to_string(),
                 effect: ToolEffect::Unknown,
                 summary: String::new(),

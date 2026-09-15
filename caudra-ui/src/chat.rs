@@ -1281,6 +1281,7 @@ mod tests {
         ev.output = Some(ToolOutput::Batch {
             entries: (0..children)
                 .map(|_| BatchToolEntry {
+                    model_suffix: None,
                     tool: SHELL_TOOL_NAME.into(),
                     effect: ToolEffect::Unknown,
                     summary: String::new(),

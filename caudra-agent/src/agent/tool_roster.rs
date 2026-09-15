@@ -176,6 +176,7 @@ impl Child {
     /// it under.
     fn entry(&self) -> Option<BatchToolEntry> {
         Some(BatchToolEntry {
+            model_suffix: None,
             tool: self.tool.clone()?,
             effect: ToolEffect::Unknown,
             summary: self.summary.clone(),

@@ -254,6 +254,7 @@ impl Child {
             None => (BatchToolStatus::Pending, None),
         };
         BatchToolEntry {
+            model_suffix: None,
             tool: self.tool.clone(),
             effect: ToolEffect::Unknown,
             summary: self.pending_header(ctx),
@@ -454,6 +455,7 @@ pub(crate) fn dispatchable(entry: &Value, ctx: &ToolContext) -> Option<(String, 
 /// the one the registry knows rather than the wire alias the model used.
 pub(crate) fn started_entry(start: &ToolStartEvent) -> BatchToolEntry {
     BatchToolEntry {
+        model_suffix: None,
         tool: start.tool.to_string(),
         effect: start.effect,
         summary: start.summary.clone(),
@@ -487,12 +489,7 @@ pub(crate) fn settle_entry(entry: &mut BatchToolEntry, done: &crate::ToolDoneEve
         BatchToolStatus::Success
     };
     entry.annotation = done.annotation.clone();
-    if let Some(suffix) = &done.model_suffix {
-        entry.annotation = Some(match entry.annotation.take() {
-            Some(annotation) => format!("{annotation}\n{suffix}"),
-            None => suffix.clone(),
-        });
-    }
+    entry.model_suffix = done.model_suffix.clone();
     entry.output = Some(done.output.clone());
 }
 
@@ -585,9 +582,9 @@ fn render_llm(entries: &[BatchToolEntry]) -> String {
             out.push_str(ERROR_PREFIX);
             out.push_str(&text);
         }
-        if let Some(annotation) = &entry.annotation {
+        for note in [&entry.annotation, &entry.model_suffix].into_iter().flatten() {
             out.push('\n');
-            out.push_str(annotation);
+            out.push_str(note);
         }
         out.push_str("\n\n");
     }
@@ -928,6 +925,7 @@ mod tests {
 
     fn entry(tool: &str, status: BatchToolStatus, text: &str) -> BatchToolEntry {
         BatchToolEntry {
+            model_suffix: None,
             tool: tool.into(),
             effect: ToolEffect::Unknown,
             summary: String::new(),
@@ -1313,6 +1311,34 @@ mod tests {
             row.raw_input,
             Some(json!({ "path": HEADER_PATH })),
             "{EXPECT_PENDING_SUMMARY}"
+        );
+    }
+
+    const MODEL_SUFFIX: &str = "<task_metadata>\ntask_id: task-1\n</task_metadata>";
+    const EXPECT_MODEL_ONLY: &str =
+        "guidance a child addressed to the model belongs in the answer the model reads, never in \
+         the annotation the card draws beside the child's header";
+
+    /// `task` hands back a `<task_metadata>` block so the model can resume the
+    /// subagent. Folded into the annotation it reached the model and the
+    /// child's row alike, and the card drew the raw block after the header.
+    #[test]
+    fn model_only_guidance_stays_out_of_the_row() {
+        let mut row = entry(READ, BatchToolStatus::Pending, BODY);
+        let done = ToolDoneEvent::error(READ.to_owned(), BODY)
+            .with_model_suffix(Some(MODEL_SUFFIX.to_owned()));
+
+        settle_entry(&mut row, &done);
+
+        assert_eq!(row.annotation, None, "{EXPECT_MODEL_ONLY}");
+        assert_eq!(
+            row.model_suffix.as_deref(),
+            Some(MODEL_SUFFIX),
+            "{EXPECT_MODEL_ONLY}"
+        );
+        assert!(
+            render_llm(&[row]).contains(MODEL_SUFFIX),
+            "{EXPECT_MODEL_ONLY}"
         );
     }
 

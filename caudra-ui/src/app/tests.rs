@@ -2394,6 +2394,7 @@ fn batch_roster(id: &str, children: usize) -> AgentEvent {
     start.output = Some(ToolOutput::Batch {
         entries: (0..children)
             .map(|_| caudra_agent::BatchToolEntry {
+                model_suffix: None,
                 tool: "task".into(),
                 effect: ToolEffect::Orchestrator,
                 summary: "research".into(),

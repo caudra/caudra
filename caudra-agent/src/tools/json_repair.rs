@@ -1247,7 +1247,7 @@ mod tests {
             assert_eq!(entries[1].status == BatchToolStatus::Success, accepted);
             if accepted {
                 assert_eq!(entries[1].raw_input, Some(json!({"a": 1})));
-                assert!(entries[1].annotation.as_deref().unwrap().contains(REPLY));
+                assert!(entries[1].model_suffix.as_deref().unwrap().contains(REPLY));
                 assert!(text.contains(EFFECTIVE_ARGUMENTS));
             }
             assert_eq!(requests.load(Ordering::SeqCst), 1);
@@ -1273,7 +1273,7 @@ mod tests {
             };
             assert_eq!(entries[0].status, BatchToolStatus::Success);
             assert_eq!(entries[0].raw_input, Some(json!({"a": 1})));
-            assert!(entries[0].annotation.as_deref().unwrap().contains(REPLY));
+            assert!(entries[0].model_suffix.as_deref().unwrap().contains(REPLY));
             assert_eq!(requests.load(Ordering::SeqCst), model_requests);
         });
     }

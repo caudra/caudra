@@ -220,6 +220,13 @@ pub struct BatchToolEntry {
     pub output: Option<ToolOutput>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub annotation: Option<String>,
+    /// Guidance the child addressed to the model alone, such as the task id a
+    /// `task` child hands back to be resumed with. Kept apart from the
+    /// annotation because that one is read by both sides, and folding the two
+    /// together drew a metadata block on the card. Lives only until the batch
+    /// assembles its answer, which is the text that is persisted.
+    #[serde(skip)]
+    pub model_suffix: Option<String>,
 }
 
 /// One child of a running batch changing state. Only the child that moved is

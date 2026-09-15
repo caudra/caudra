@@ -3185,6 +3185,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         BatchToolEntry {
+            model_suffix: None,
             tool: tool.into(),
             effect: ToolEffect::ReadOnly,
             summary: format!("{tool} summary"),
@@ -3229,6 +3230,7 @@ mod tests {
 
     fn markdown_entry(text: &str) -> BatchToolEntry {
         BatchToolEntry {
+            model_suffix: None,
             tool: MARKDOWN_CHILD_TOOL.into(),
             effect: ToolEffect::ReadOnly,
             summary: format!("{MARKDOWN_CHILD_TOOL} summary"),

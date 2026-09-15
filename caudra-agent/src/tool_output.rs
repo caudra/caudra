@@ -837,6 +837,7 @@ mod tests {
         let mut done = done(String::new(), false);
         done.output = ToolOutput::Batch {
             entries: vec![BatchToolEntry {
+                model_suffix: None,
                 tool: "file_read".into(),
                 effect: ToolEffect::ReadOnly,
                 summary: "README.md".into(),

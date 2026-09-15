@@ -5936,6 +5936,7 @@ const EXPECT_SUMMARIES_KEPT: &str = "a folded batch still lists what it ran";
 
 fn batch_child(tool: &str, marker: &str) -> caudra_agent::BatchToolEntry {
     caudra_agent::BatchToolEntry {
+        model_suffix: None,
         tool: tool.into(),
         effect: effect_of(tool),
         summary: format!("{tool} ran"),
@@ -6977,6 +6978,7 @@ fn settle_highlights(panel: &mut MessagesPanel) {
 
 fn pending_child(tool: &str) -> caudra_agent::BatchToolEntry {
     caudra_agent::BatchToolEntry {
+        model_suffix: None,
         tool: tool.into(),
         effect: effect_of(tool),
         summary: String::new(),
@@ -7065,6 +7067,7 @@ fn a_roster_for_an_unknown_call_is_ignored() {
 
 fn eager_entry(status: BatchToolStatus) -> BatchToolEntry {
     BatchToolEntry {
+        model_suffix: None,
         tool: SHELL_TOOL_NAME.into(),
         effect: ToolEffect::Mutating,
         summary: EAGER_SUMMARY.into(),

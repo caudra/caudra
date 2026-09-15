@@ -1528,6 +1528,7 @@ mod tests {
 
     fn roster_entry(index: usize, status: BatchToolStatus) -> crate::BatchToolEntry {
         crate::BatchToolEntry {
+            model_suffix: None,
             tool: CHILD_TOOL.to_owned(),
             effect: crate::tools::ToolEffect::Unknown,
             summary: format!("c{index}"),
