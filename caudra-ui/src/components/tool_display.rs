@@ -97,9 +97,13 @@ impl RenderCtx<'_> {
     /// A created file is the only body that *is* its result rather than a
     /// report of one. Seven lines of it say nothing its header did not, and the
     /// notice offering the rest is on every write, so abridging it buys a click
-    /// and costs the thing the card is for. Everything else a write settles
-    /// into is already only the part that changed, and keeps the budget it
-    /// shares with an edit and a patch.
+    /// and costs the thing the card is for.
+    ///
+    /// Everything else a write settles into is a diff, which keeps the budget
+    /// it shares with an edit and a patch. That budget is a floor there rather
+    /// than a bound: a diff is already only the part that changed, so
+    /// `render_tool_content` draws one whole up to its own ceiling and this
+    /// number matters only when it is raised past it.
     ///
     /// A batch child is deliberately not asked: it rests at its own tool's
     /// budget so that a batch reads as the list of what it ran, and several
@@ -2317,7 +2321,8 @@ mod tests {
 
     const UNBOUNDED_MSG: &str =
         "a created file is its own result, so the card that holds it is not abridged";
-    const BOUNDED_MSG: &str = "a diff is already only the part that changed, so it keeps a budget";
+    const BOUNDED_MSG: &str =
+        "a diff keeps the budget its bucket sets, which is the floor it is drawn against";
 
     /// The exemption belongs to the body that *is* a result, not to the tool
     /// that produced it: the same tool now also settles into a diff and a

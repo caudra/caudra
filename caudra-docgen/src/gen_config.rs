@@ -471,9 +471,12 @@ fn write_tool_output_section(out: &mut String) {
          All values are `usize` with a minimum of {MIN_TOOL_OUTPUT_LINES}.\n\n\
          The `bash`, `python_execution`, and `task` entries apply only when \
          `ui.scroll_card_lines` is `0`. Above that, those tools draw a fixed window of \
-         that many lines instead, and the budget here goes unused. `write` never reaches \
-         `file_write`, whose body is the file it wrote and is always drawn whole, but it \
-         does govern the other tools in its row.\n"
+         that many lines instead, and the budget here goes unused. `write` does not reach \
+         a `file_write` that created a file, whose body is that file and is always drawn \
+         whole. It is also a floor rather than a bound for anything drawn as a diff, since \
+         a diff is already only the part that changed: an edit, a patch, and an overwrite \
+         are drawn whole until they run long, and raising `write` past that point is what \
+         makes this number matter to them.\n"
     )
     .unwrap();
     writeln!(out, "| Field | Default | Tools |").unwrap();

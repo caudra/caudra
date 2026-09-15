@@ -52,6 +52,12 @@ const GREP_COUNT_SEP: &str = " \u{b7} ";
 /// Workcell cuts a receipt at a byte bound and reports no line count for what
 /// it dropped, so this says that the patch is short without inventing a number.
 const PATCH_TRUNCATED: &str = "\u{2026} patch shortened";
+/// A diff is already only the part that changed, so abridging one costs the
+/// thing the card is for. This is the point past which a change stops being
+/// something to read and starts being a file, and the card is held to it. Used
+/// as a floor under the budget rather than in place of it, so a reader who
+/// raises `ui.tool_output_lines.write` past it still gets what they asked for.
+const DIFF_CARD_LINES: usize = 60;
 const GREP_SUMMARY_INDENT: &str = "  ";
 /// Past this many lines in one hunk, diffing its two sides again costs more
 /// than the grouping it buys, so the wire's own order is drawn instead. A card
@@ -2201,11 +2207,12 @@ pub fn render_tool_content(
                 after,
                 limits.width,
             ),
-            limits.budget,
+            limits.budget.max(DIFF_CARD_LINES),
         ),
-        Some(ToolOutput::Patch { files }) => {
-            capped(render_patch(files, limits.width), limits.budget)
-        }
+        Some(ToolOutput::Patch { files }) => capped(
+            render_patch(files, limits.width),
+            limits.budget.max(DIFF_CARD_LINES),
+        ),
         Some(ToolOutput::GrepResult { entries, capped }) => {
             render_grep_results(entries, capped.as_ref(), limits.budget, highlight)
         }
@@ -2463,9 +2470,14 @@ mod tests {
         );
     }
 
+    /// Smaller than any real edit renders to, so a card that honoured it would
+    /// be hiding the change it exists to show.
     const BUDGET_ROWS: usize = 2;
-    const BUDGET_MSG: &str =
-        "a card holds its diff to the rows it was given, and says the body goes on";
+    const OVER_CEILING: usize = DIFF_CARD_LINES + 10;
+    const WHOLE_MSG: &str = "a diff is already only the part that changed, so a card draws one \
+                             whole however small the budget it was handed";
+    const CEILING_MSG: &str =
+        "past the ceiling a change has become a file, and the card holds it there and says so";
     const OPENED_MSG: &str = "an opened card draws the whole body it was withholding";
 
     fn tool_content(output: &ToolOutput, budget: usize) -> ToolContent {
@@ -2477,23 +2489,69 @@ mod tests {
         )
     }
 
-    /// Both cards reported `false` for truncation no matter how long they ran,
-    /// which is also what withheld the affordance that would have opened them.
-    #[test_case(ToolOutput::Diff {
-        path: FIRST_PATH.into(),
-        before: "a\nb\nc\nd\ne\n".into(),
-        after: "A\nB\nC\nD\nE\n".into(),
-        summary: String::new(),
-    } ; "a_diff")]
-    #[test_case(ToolOutput::Patch { files: two_files(PATCH) } ; "a_patch")]
-    fn an_edit_card_keeps_the_budget_it_was_given(output: ToolOutput) {
-        let held = tool_content(&output, BUDGET_ROWS);
-        assert!(held.truncation, "{BUDGET_MSG}");
-        assert_eq!(held.lines.len(), BUDGET_ROWS + 1, "{BUDGET_MSG}");
+    fn short_diff() -> ToolOutput {
+        ToolOutput::Diff {
+            path: FIRST_PATH.into(),
+            before: "a\nb\nc\nd\ne\n".into(),
+            after: "A\nB\nC\nD\nE\n".into(),
+            summary: String::new(),
+        }
+    }
 
-        let whole = tool_content(&output, usize::MAX);
+    fn long_diff() -> ToolOutput {
+        let side = |tag: &str| (0..OVER_CEILING).map(|i| format!("{tag} {i}\n")).collect();
+        ToolOutput::Diff {
+            path: FIRST_PATH.into(),
+            before: side("before"),
+            after: side("after"),
+            summary: String::new(),
+        }
+    }
+
+    fn short_patch() -> ToolOutput {
+        ToolOutput::Patch {
+            files: two_files(PATCH),
+        }
+    }
+
+    fn long_patch() -> ToolOutput {
+        let mut patch =
+            format!("--- a/{FIRST_PATH}\n+++ b/{FIRST_PATH}\n@@ -1 +1,{OVER_CEILING} @@\n");
+        for i in 0..OVER_CEILING {
+            patch.push_str(&format!("+added {i}\n"));
+        }
+        ToolOutput::Patch {
+            files: one_file(&patch),
+        }
+    }
+
+    /// The budget an edit shares with a write is seven rows, which is less than
+    /// an edit of three lines draws, so holding a diff to it hid the change and
+    /// charged a click for it. The ceiling is what a change stops being worth
+    /// reading past, and it is a floor under the budget rather than a second
+    /// bound: a card opened by hand still draws everything.
+    #[test_case(short_diff, long_diff ; "a_diff")]
+    #[test_case(short_patch, long_patch ; "a_patch")]
+    fn an_edit_card_is_drawn_whole_up_to_its_ceiling(
+        short: fn() -> ToolOutput,
+        long: fn() -> ToolOutput,
+    ) {
+        let held = tool_content(&short(), BUDGET_ROWS);
+        assert!(!held.truncation, "{WHOLE_MSG}");
+        assert!(held.lines.len() > BUDGET_ROWS + 1, "{WHOLE_MSG}");
+
+        let long = long();
+        let cut = tool_content(&long, BUDGET_ROWS);
+        assert!(cut.truncation, "{CEILING_MSG}");
+        assert_eq!(cut.lines.len(), DIFF_CARD_LINES + 1, "{CEILING_MSG}");
+        assert!(
+            line_text(cut.lines.last().unwrap()).contains(EXPAND_AFFORDANCE),
+            "{CEILING_MSG}"
+        );
+
+        let whole = tool_content(&long, usize::MAX);
         assert!(!whole.truncation, "{OPENED_MSG}");
-        assert!(whole.lines.len() > BUDGET_ROWS + 1, "{OPENED_MSG}");
+        assert!(whole.lines.len() > DIFF_CARD_LINES + 1, "{OPENED_MSG}");
     }
 
     /// A shortened patch describes less than its counts claim, and a reader
