@@ -884,6 +884,10 @@ pub struct DisplayMessage {
     /// Wall time the model spent on a `Thinking` block. Absent for sessions
     /// written before reasoning was timed.
     pub thinking_duration: Option<Duration>,
+    /// When the tool actually began running, which is after the permission
+    /// verdict: the clock measures the command, not the prompt in front of it.
+    /// Absent on a restored card, which has no live phase to time.
+    pub tool_started: Option<Instant>,
 }
 
 impl DisplayMessage {
@@ -909,6 +913,7 @@ impl DisplayMessage {
             snapshot_theme_gen: 0,
             body_open: None,
             thinking_duration: None,
+            tool_started: None,
         }
     }
 
@@ -934,6 +939,7 @@ impl DisplayMessage {
             snapshot_theme_gen: 0,
             body_open: None,
             thinking_duration: None,
+            tool_started: None,
         }
     }
 

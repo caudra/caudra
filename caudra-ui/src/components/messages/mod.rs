@@ -12,7 +12,8 @@ use layout::{SegmentChrome, SegmentKind};
 use super::tool_display::{
     RenderCtx, ToolLines, append_annotation, append_right_info, assistant_style,
     build_instructions_lines, build_tool_lines, done_style, draws_live_script, error_style,
-    format_timestamp_now, names_tool, notice_style, thinking_style, truncate_to_header, user_style,
+    format_timestamp_now, names_tool, notice_style, shell_elapsed, thinking_style,
+    truncate_to_header, user_style,
 };
 use super::{
     DisplayMessage, DisplayRole, DisplaySource, ToolProgress, ToolRole, ToolStatus,
@@ -57,7 +58,7 @@ use caudra_agent::tools::{BATCH_TOOL_NAME, SHELL_TOOL_NAME, ToolEffect};
 use caudra_agent::{
     BatchToolEntry, BatchToolStatus, BufferSnapshot, EventSender, InstructionBlock, NO_FILES_FOUND,
     ReasoningSummary, SharedBuf, SubagentProgress, ToolDoneEvent, ToolOutput, ToolStartEvent,
-    format_live_duration, reasoning_summary, streaming_reasoning_summary,
+    format_live_duration, format_settled_duration, reasoning_summary, streaming_reasoning_summary,
 };
 use caudra_lua::{EventHandle, WARM_TOOL_CAP, WinView};
 use caudra_storage::view::ViewMode;
@@ -78,8 +79,6 @@ const THINKING_SEARCH_PREFIX: &str = "thinking> ";
 /// character a tool id carries, so a child's key can never collide with a
 /// card's.
 const CHILD_SCROLL_INFIX: &str = "#";
-const MILLIS_PER_SECOND: u128 = 1_000;
-const SECONDS_PER_MINUTE: u64 = 60;
 const REFLOW_MARGIN_VIEWPORTS: u32 = 1;
 const SHELL_LIVE_OUTPUT_LINES: usize = 12;
 const PROMPT_PROGRESS_LABEL: &str = " Processing ";
@@ -1594,6 +1593,9 @@ impl MessagesPanel {
                 return;
             }
             msg.tool_preview_pending = false;
+            // Not reset: a speculative call resends its start on adoption, and
+            // the clock belongs to the run rather than to the announcement.
+            msg.tool_started.get_or_insert_with(Instant::now);
             if let DisplayRole::Tool(t) = &mut msg.role {
                 t.name = Arc::clone(&event.tool);
                 t.effect = event.effect;
@@ -1631,6 +1633,7 @@ impl MessagesPanel {
         msg.annotation = event.annotation;
         msg.render_header = event.render_header;
         msg.timestamp = Some(format_timestamp_now(self.clock_format));
+        msg.tool_started = Some(Instant::now());
         self.messages.push(msg);
     }
 
@@ -3763,7 +3766,7 @@ impl MessagesPanel {
                         |title| format!("Thinking: {}", markdown_inline(title)),
                     );
                     let duration = match message {
-                        Some(message) => message.thinking_duration.map(format_thought_duration),
+                        Some(message) => message.thinking_duration.map(format_settled_duration),
                         None => self
                             .thinking_started
                             .map(|started| format_live_duration(started.elapsed())),
@@ -4339,9 +4342,10 @@ impl MessagesPanel {
         }
     }
 
-    /// The one row whose text is a function of the wall clock. Only a running
-    /// subagent has it, and its segment is a header plus that row until the
-    /// call returns, so rebuilding at the spinner cadence stays cheap.
+    /// The cards whose text is a function of the wall clock: a running
+    /// subagent's activity row, and a running shell call's header clock. A
+    /// chatty command already rebuilds far more often than this through
+    /// `tool_output`, and the rebuild reuses its highlight results.
     fn refresh_live_progress(&mut self) {
         let progress = &self.batch_child_progress;
         let live: Vec<String> = self
@@ -4356,7 +4360,10 @@ impl MessagesPanel {
                 }
                 // A batch keeps a clock per child, since the reports belong to
                 // rows the card has no header for and it carries none itself.
-                let ticking = msg.progress.as_ref().is_some_and(ToolProgress::is_live)
+                // The header clock asks the renderer's own question, so the set
+                // refreshed here cannot drift from the set that draws one.
+                let ticking = shell_elapsed(msg, tool.status).is_some()
+                    || msg.progress.as_ref().is_some_and(ToolProgress::is_live)
                     || progress
                         .get(&tool.id)
                         .is_some_and(|children| children.values().any(ToolProgress::is_live));
@@ -4716,7 +4723,7 @@ fn thought_line(title: Option<&str>, duration: Option<Duration>, done: bool) -> 
             format!(
                 " · {}",
                 if done {
-                    format_thought_duration(duration)
+                    format_settled_duration(duration)
                 } else {
                     format_live_duration(duration)
                 }
@@ -4725,22 +4732,6 @@ fn thought_line(title: Option<&str>, duration: Option<Duration>, done: bool) -> 
         ));
     }
     vec![Line::from(spans)]
-}
-
-fn format_thought_duration(duration: Duration) -> String {
-    let millis = duration.as_millis();
-    if millis < MILLIS_PER_SECOND {
-        return format!("{millis}ms");
-    }
-    let seconds = duration.as_secs_f64();
-    if duration.as_secs() < SECONDS_PER_MINUTE {
-        return format!("{seconds:.1}s");
-    }
-    format!(
-        "{}m {}s",
-        duration.as_secs() / SECONDS_PER_MINUTE,
-        duration.as_secs() % SECONDS_PER_MINUTE
-    )
 }
 
 fn segment_kind(role: &DisplayRole) -> SegmentKind {

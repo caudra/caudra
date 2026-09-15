@@ -5649,6 +5649,39 @@ fn thought_durations_are_formatted_by_magnitude(duration: Duration, expected: &s
     assert_eq!(text, expected);
 }
 
+/// Back-dated far enough that the tenths are stable however slow the host is.
+const SHELL_RAN_FOR: Duration = Duration::from_millis(1_201);
+const SHELL_LIVE_CLOCK: &str = "· 1.2s";
+/// What `shell_done` reports as the command's own time.
+const SHELL_MEASURED_CLOCK: &str = "· 10ms";
+
+/// The card is cached after the first render, so the clock only advances if
+/// the clock-driven refresh knows to rebuild it.
+#[test]
+fn a_running_shell_card_ticks_after_its_segment_is_cached() {
+    let mut panel = panel_with_tools(&[("t1", SHELL_TOOL_NAME)]);
+    assert!(panel.messages[0].tool_started.is_some());
+    render(&mut panel, 80, 20);
+
+    panel.messages[0].tool_started = Some(Instant::now() - SHELL_RAN_FOR);
+    let text = buffer_text(&render(&mut panel, 80, 20));
+
+    assert!(text.contains(SHELL_LIVE_CLOCK), "{text}");
+}
+
+#[test]
+fn a_settled_shell_card_swaps_the_live_clock_for_the_measured_one() {
+    let mut panel = panel_with_tools(&[("t1", SHELL_TOOL_NAME)]);
+    panel.messages[0].tool_started = Some(Instant::now() - SHELL_RAN_FOR);
+    render(&mut panel, 80, 20);
+
+    panel.tool_done(shell_done("t1", false));
+    let text = buffer_text(&render(&mut panel, 80, 20));
+
+    assert!(text.contains(SHELL_MEASURED_CLOCK), "{text}");
+    assert!(!text.contains(SHELL_LIVE_CLOCK), "{text}");
+}
+
 #[test_case(Duration::from_millis(420), "0.4s" ; "sub_second")]
 #[test_case(Duration::from_millis(9_700), "9.7s" ; "under_a_minute")]
 #[test_case(Duration::from_millis(125_340), "2m 5.3s" ; "over_a_minute")]

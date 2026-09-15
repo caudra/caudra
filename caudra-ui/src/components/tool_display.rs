@@ -29,6 +29,7 @@ use crate::markdown::{
 use caudra_agent::{
     ActivityChild, BatchToolStatus, BufferSnapshot, InstructionBlock, NO_FILES_FOUND, ShellOutput,
     SnapshotSpan, SpanStyle, SubagentActivity, SubagentProgress, ToolInput, ToolOutput,
+    format_live_duration, format_settled_duration,
     tools::{
         FILE_READ_TOOL_NAME, FILE_WRITE_TOOL_NAME, PYTHON_EXECUTION_TOOL_NAME, SHELL_TOOL_NAME,
         humanize_duration,
@@ -176,6 +177,7 @@ const QUERY_KEYS: &[(&str, &str)] = &[
 /// renders it and never through the window their output is drawn in.
 const LIVE_SCRIPT_TOOLS: &[&str] = &[SHELL_TOOL_NAME, PYTHON_EXECUTION_TOOL_NAME];
 const MILLIS_PER_SECOND: u64 = 1_000;
+const DURATION_SEPARATOR: &str = " · ";
 
 /// Duration inputs and the millis one of their units is worth, so a bracket
 /// reads `10m` instead of `600000`. `timeout` is milliseconds to a subprocess
@@ -1216,6 +1218,24 @@ impl ToolLineBuilder {
         self.lines[0].spans.insert(0, Span::styled(text, style));
     }
 
+    /// Row 0 only, and appended rather than inserted: `prepend_indicator` and
+    /// `prepend_compact_sigil` own the front of that row and shift the spinner
+    /// spans sitting on it. Deliberately not in `search_text`, because a number
+    /// that changes every frame is nothing a reader can search for.
+    fn append_duration(&mut self, elapsed: Duration) {
+        let Some(line) = self.lines.first_mut() else {
+            return;
+        };
+        let clock = match self.indicator {
+            Indicator::InProgress => format_live_duration(elapsed),
+            _ => format_settled_duration(elapsed),
+        };
+        line.spans.push(Span::styled(
+            format!("{DURATION_SEPARATOR}{clock}"),
+            theme::current().tool_dim,
+        ));
+    }
+
     fn push_search_text(&mut self, text: &str) {
         if !self.search_text.is_empty() {
             self.search_text.push('\n');
@@ -1787,6 +1807,27 @@ pub(super) fn draws_live_script(tool_name: &str) -> bool {
         .any(|known| names_tool(known, tool_name))
 }
 
+/// A shell call's clock: wall time while it runs, and the command's own
+/// measured time once it lands, which leaves out the dispatch either side of
+/// it and so can step down slightly on settle.
+///
+/// Only `shell` reports a duration of its own, and that one is persisted with
+/// the output, so it is the one tool whose card reads the same restored as it
+/// did live. The running branch has to ask the tool's name; the settled one
+/// does not, because nothing else produces a [`ToolOutput::Shell`].
+pub(super) fn shell_elapsed(msg: &DisplayMessage, status: ToolStatus) -> Option<Duration> {
+    if status == ToolStatus::InProgress {
+        return msg
+            .tool_started
+            .filter(|_| names_tool(SHELL_TOOL_NAME, msg.role.tool_name().unwrap_or_default()))
+            .map(|started| started.elapsed());
+    }
+    match msg.tool_output.as_deref() {
+        Some(ToolOutput::Shell(output)) => Some(Duration::from_millis(output.duration_ms)),
+        _ => None,
+    }
+}
+
 /// `expansion` is `None` on a compact row the reader has not opened, which is
 /// the only state that draws a header with no body.
 pub fn build_tool_lines(
@@ -1847,6 +1888,9 @@ pub fn build_tool_lines(
             msg.tool_raw_input.as_deref(),
         );
         b.prepend_indicator(rctx.started_at);
+    }
+    if let Some(elapsed) = shell_elapsed(msg, status) {
+        b.append_duration(elapsed);
     }
     if let Some(progress) = msg.progress.as_ref() {
         if rctx.compact {
@@ -2208,6 +2252,7 @@ mod tests {
             snapshot_theme_gen: 0,
             body_open: None,
             thinking_duration: None,
+            tool_started: None,
         }
     }
 
@@ -2293,6 +2338,7 @@ mod tests {
             snapshot_theme_gen: 0,
             body_open: None,
             thinking_duration: None,
+            tool_started: None,
         }
     }
 
@@ -2718,6 +2764,7 @@ mod tests {
             snapshot_theme_gen: 0,
             body_open: None,
             thinking_duration: None,
+            tool_started: None,
         }
     }
 
@@ -2819,6 +2866,7 @@ mod tests {
             snapshot_theme_gen: 0,
             body_open: None,
             thinking_duration: None,
+            tool_started: None,
         }
     }
 
@@ -2917,6 +2965,7 @@ mod tests {
             snapshot_theme_gen: 0,
             body_open: None,
             thinking_duration: None,
+            tool_started: None,
         }
     }
 
@@ -3238,6 +3287,7 @@ mod tests {
             snapshot_theme_gen: 0,
             body_open: None,
             thinking_duration: None,
+            tool_started: None,
         }
     }
 
@@ -3425,6 +3475,7 @@ mod tests {
             snapshot_theme_gen: 0,
             body_open: None,
             thinking_duration: None,
+            tool_started: None,
         }
     }
 
@@ -3500,6 +3551,72 @@ mod tests {
 
         assert_eq!(tl.lines.len(), 1);
         assert!(!tl.truncation);
+    }
+
+    /// Back-dated far enough that the tenths are stable however slow the test
+    /// host is, and a magnitude the settled formatter spells differently.
+    const SHELL_RAN_FOR: Duration = Duration::from_millis(1_201);
+    const LIVE_CLOCK: &str = " · 1.2s";
+    /// What `shell_output()` reports as the command's own time.
+    const MEASURED_CLOCK: &str = " · 10ms";
+
+    fn running_shell(started: Option<Duration>) -> DisplayMessage {
+        let mut msg = bash_msg("cargo test", ToolStatus::InProgress, None, None);
+        msg.tool_started = started.map(|ago| Instant::now() - ago);
+        msg
+    }
+
+    #[test_case(test_rctx(80)    ; "expanded")]
+    #[test_case(compact_rctx(80) ; "compact")]
+    fn a_running_shell_header_carries_a_live_clock(rctx: RenderCtx<'static>) {
+        let msg = running_shell(Some(SHELL_RAN_FOR));
+        let tl = build_tool_lines(&msg, ToolStatus::InProgress, &rctx, None);
+
+        assert!(
+            line_text(&tl.lines[0]).ends_with(LIVE_CLOCK),
+            "header should end with the live clock: {}",
+            line_text(&tl.lines[0])
+        );
+    }
+
+    #[test]
+    fn a_settled_shell_header_reports_the_commands_own_time() {
+        let mut msg = bash_msg(
+            "cargo test",
+            ToolStatus::Success,
+            None,
+            Some(shell_output(false)),
+        );
+        msg.tool_started = Some(Instant::now() - SHELL_RAN_FOR);
+        let tl = build_tool_lines(&msg, ToolStatus::Success, &test_rctx(80), None);
+
+        let header = line_text(&tl.lines[0]);
+        assert!(header.ends_with(MEASURED_CLOCK), "got {header}");
+        assert!(
+            !header.contains(LIVE_CLOCK),
+            "the subprocess's own time supersedes the wall clock: {header}"
+        );
+    }
+
+    #[test]
+    fn an_unstarted_shell_card_draws_no_clock() {
+        let msg = running_shell(None);
+        let tl = build_tool_lines(&msg, ToolStatus::InProgress, &test_rctx(80), None);
+
+        assert!(!line_text(&tl.lines[0]).contains(DURATION_SEPARATOR));
+    }
+
+    /// Same card, same start time: only `shell` reports a duration of its own,
+    /// so only `shell` gets a clock.
+    #[test]
+    fn a_non_shell_tool_draws_no_clock() {
+        let mut msg = running_shell(Some(SHELL_RAN_FOR));
+        if let DisplayRole::Tool(tool) = &mut msg.role {
+            tool.name = FILE_READ_TOOL_NAME.into();
+        }
+        let tl = build_tool_lines(&msg, ToolStatus::InProgress, &test_rctx(80), None);
+
+        assert!(!line_text(&tl.lines[0]).contains(DURATION_SEPARATOR));
     }
 
     const SUBAGENT_ELAPSED: Duration = Duration::from_millis(63_400);
@@ -3882,6 +3999,7 @@ mod tests {
             snapshot_theme_gen: 0,
             body_open: None,
             thinking_duration: None,
+            tool_started: None,
         };
         let tl = build_tool_lines(
             &msg,
@@ -3927,6 +4045,7 @@ mod tests {
             snapshot_theme_gen: 0,
             body_open: None,
             thinking_duration: None,
+            tool_started: None,
         };
         let tl = build_tool_lines(
             &msg,

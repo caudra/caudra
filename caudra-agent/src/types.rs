@@ -45,6 +45,7 @@ pub const ENVIRONMENT_MISSING_LABEL: &str = "missing";
 pub const ENVIRONMENT_NO_VERSION: &str = "(no version)";
 const ENVIRONMENT_LIST_SEPARATOR: &str = ", ";
 
+const MILLIS_PER_SECOND: u128 = 1_000;
 const SECONDS_PER_MINUTE: u64 = 60;
 const TALLY_SEPARATOR: &str = " · ";
 const THOUGHT_TITLE_FENCE: &str = "**";
@@ -2096,6 +2097,24 @@ pub fn format_live_duration(duration: Duration) -> String {
             tenths % 10
         )
     }
+}
+
+/// The same clock once it has stopped, which can afford a millisecond tail
+/// because nothing redraws it.
+pub fn format_settled_duration(duration: Duration) -> String {
+    let millis = duration.as_millis();
+    if millis < MILLIS_PER_SECOND {
+        return format!("{millis}ms");
+    }
+    let seconds = duration.as_secs_f64();
+    if duration.as_secs() < SECONDS_PER_MINUTE {
+        return format!("{seconds:.1}s");
+    }
+    format!(
+        "{}m {}s",
+        duration.as_secs() / SECONDS_PER_MINUTE,
+        duration.as_secs() % SECONDS_PER_MINUTE
+    )
 }
 
 /// What a delegating call has revealed about the subagent it is about to

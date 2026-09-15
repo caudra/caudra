@@ -81,7 +81,8 @@ pub use types::{
     ToolDoneEvent, ToolInput, ToolOutput, ToolOutputLimits, ToolStartEvent, TurnCompleteEvent,
 };
 pub use types::{
-    ReasoningSummary, format_live_duration, reasoning_summary, streaming_reasoning_summary,
+    ReasoningSummary, format_live_duration, format_settled_duration, reasoning_summary,
+    streaming_reasoning_summary,
 };
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]

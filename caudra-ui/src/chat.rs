@@ -970,6 +970,7 @@ pub fn history_to_display(
                     snapshot_theme_gen: 0,
                     body_open: None,
                     thinking_duration: None,
+                    tool_started: None,
                 });
             }
             HistoryItemKind::AssistantText { .. }
