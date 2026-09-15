@@ -7,6 +7,7 @@ use caudra_config::{ClockFormat, ToolOutputLines};
 use code_view::{
     BatchLiveMap, BatchProgressMap, BatchStartedMap, BatchViewMap, BatchViews, BodySource,
     CardPolicy, Disclosure, RenderLimits, RowTarget, ScrollSpan, ScrollWindow, SourceTrace,
+    WrappedRows,
 };
 
 use std::borrow::Cow;
@@ -1645,32 +1646,57 @@ impl ToolLineBuilder {
         output: Option<Arc<ToolOutput>>,
         content_indent: &'static str,
     ) -> ToolLines {
-        let highlight = HighlightRequest::new(self.content_range, input, output, self.limits);
-        let mut rows = self.rows;
-        rows.resize(self.lines.len(), None);
-        let mut links = LinkMap::none_for(&self.lines);
-        for (line, row) in self.link_rows {
-            links.rows[line] = row;
-        }
         let source = self
             .source
             .finish(&self.lines)
             .filter(BodySource::names_source);
+        let mut rows = self.rows;
+        rows.resize(self.lines.len(), None);
+        // The card is laid out in logical lines and broken here, once, so
+        // everything it indexed by line moves onto the rows that break made
+        // rather than being recorded against rows that no longer exist.
+        let wrapped = WrappedRows::new(self.lines, self.width);
+        let lines = wrapped.lines();
+        let mut links = LinkMap::none_for(&lines);
+        for (line, row) in self.link_rows {
+            let first = wrapped.row_of(line);
+            for (offset, spans) in wrapped.spans_of(line, &row).into_iter().enumerate() {
+                links.rows[first + offset] = spans;
+            }
+        }
+        let (start, end) = self.content_range;
+        let content = wrapped.range(start..end);
         ToolLines {
-            lines: self.lines,
+            lines,
             links,
             search_text: self.search_text,
-            highlight,
-            spinner_lines: self.spinner_lines,
-            snapshot_base: self.snapshot_base,
+            highlight: HighlightRequest::new(
+                (content.start, content.end),
+                input,
+                output,
+                self.limits,
+            ),
+            spinner_lines: self
+                .spinner_lines
+                .into_iter()
+                .map(|(line, span)| wrapped.span_at(line, span))
+                .collect(),
+            snapshot_base: self.snapshot_base.map(|line| wrapped.row_of(line)),
             snapshot_skip: self.snapshot_skip,
-            shell_toggle_line: self.shell_toggle_line,
-            scroll_footer_line: self.scroll_footer_line,
-            scroll_spans: self.scroll_spans,
+            shell_toggle_line: self.shell_toggle_line.map(|line| wrapped.row_of(line)),
+            scroll_footer_line: self.scroll_footer_line.map(|line| wrapped.row_of(line)),
+            scroll_spans: self
+                .scroll_spans
+                .into_iter()
+                .map(|span| ScrollSpan {
+                    first: wrapped.row_of(span.first),
+                    ..span
+                })
+                .collect(),
             content_indent,
             truncation: self.truncation,
-            rows,
-            source,
+            rows: wrapped.expand(rows),
+            source: source.map(|source| wrapped.body(source)),
         }
     }
 }
@@ -2107,6 +2133,10 @@ mod tests {
     static NO_LIVE: std::sync::LazyLock<BatchLiveMap> = std::sync::LazyLock::new(BatchLiveMap::new);
     static NO_STARTED: std::sync::LazyLock<BatchStartedMap> =
         std::sync::LazyLock::new(BatchStartedMap::new);
+
+    /// Wide enough that no card drawn in these tests has to break a row, for
+    /// the tests whose subject is what a row says rather than how it breaks.
+    const UNBROKEN: u16 = 400;
 
     fn test_rctx(width: u16) -> RenderCtx<'static> {
         RenderCtx {
@@ -2625,7 +2655,7 @@ mod tests {
         let lines = build_tool_lines(
             &msg,
             ToolStatus::Success,
-            &test_rctx(80),
+            &test_rctx(UNBROKEN),
             Some(Disclosure::default()),
         );
         let text = lines_text(&lines);
@@ -3657,7 +3687,12 @@ mod tests {
             batch_started: started,
             ..test_rctx(80)
         };
-        build_tool_lines(&msg, ToolStatus::InProgress, &rctx, Some(Disclosure::default()))
+        build_tool_lines(
+            &msg,
+            ToolStatus::InProgress,
+            &rctx,
+            Some(Disclosure::default()),
+        )
     }
 
     /// A clock is a moving row. The worker's cache key cannot see it, so a
@@ -3881,12 +3916,14 @@ mod tests {
     }
 
     /// A compact row is one line by contract, so progress has to ride the
-    /// header rather than claim a second row.
+    /// header rather than claim a second row. Drawn wide enough to hold the
+    /// row, because a row the card has to break is a question about widths and
+    /// this one is about where the progress goes.
     #[test]
     fn a_compact_row_keeps_the_progress_on_the_header() {
         let msg = subagent_msg(ToolStatus::InProgress, Some(running_tool_report(3)));
 
-        let tl = build_tool_lines(&msg, ToolStatus::InProgress, &compact_rctx(80), None);
+        let tl = build_tool_lines(&msg, ToolStatus::InProgress, &compact_rctx(UNBROKEN), None);
 
         assert_eq!(tl.lines.len(), 1);
         let text = lines_text(&tl);

@@ -74,6 +74,11 @@ const MIN_CODE_COLUMNS: usize = 60;
 /// Below this a row has no room left to say anything, and breaking it would
 /// cost more rows than the overflow it was meant to spare.
 const MIN_WRAP_COLUMNS: usize = 8;
+/// The characters a row's gutter is built from: the card's own indent, the four
+/// tree glyphs, and the check a settled row opens with.
+const GUTTER_CHARS: &str = " \u{2502}\u{251c}\u{2514}\u{2500}\u{2713}";
+const MARKER_OPEN: char = '[';
+const MARKER_CLOSE: char = ']';
 const MARK_UNCHANGED: char = ' ';
 const MARK_REMOVED: char = '-';
 const MARK_ADDED: char = '+';
@@ -800,10 +805,12 @@ fn render_todos(items: &[TodoItem]) -> Vec<Line<'static>> {
                 TodoStatus::Pending => t.todo_pending,
                 TodoStatus::Cancelled => t.todo_cancelled,
             };
-            Line::from(Span::styled(
-                format!("{} {}", item.status.marker(), item.content),
-                style,
-            ))
+            // The marker is its own span so a break hangs the text under
+            // itself rather than restarting it against the card's edge.
+            Line::from(Vec::from([
+                Span::styled(format!("{} ", item.status.marker()), style),
+                Span::styled(item.content.clone(), style),
+            ]))
         })
         .collect()
 }
@@ -822,16 +829,19 @@ fn render_answers(answers: &[Answer]) -> Vec<Line<'static>> {
         };
         lines.push(Line::styled(label, t.tool_prefix));
         if answer.labels.is_empty() {
-            lines.push(Line::styled(
-                format!("{ANSWER_INDENT}{NO_ANSWER}"),
-                t.tool_dim,
-            ));
+            lines.push(Line::from(Vec::from([
+                Span::styled(ANSWER_INDENT, t.tool_dim),
+                Span::styled(NO_ANSWER, t.tool_dim),
+            ])));
             continue;
         }
         for picked in &answer.labels {
             for (row, piece) in picked.lines().enumerate() {
                 let prefix = if row == 0 { ANSWER_MARK } else { ANSWER_INDENT };
-                lines.push(Line::styled(format!("{prefix}{piece}"), t.todo_completed));
+                lines.push(Line::from(Vec::from([
+                    Span::styled(prefix, t.todo_completed),
+                    Span::styled(piece.to_owned(), t.todo_completed),
+                ])));
             }
         }
     }
@@ -849,12 +859,13 @@ fn render_answers(answers: &[Answer]) -> Vec<Line<'static>> {
 /// itself is a list entry and stacks flush against its neighbours, while one
 /// with a body has stopped being an entry and takes a blank row on both sides.
 ///
-/// The transcript separates a row that merely wraps, which this cannot: these
-/// are logical lines and the wrapping happens downstream, at a width no one
-/// here knows. It reads as the list anyway, because every child opens on its
-/// sigil and a continuation line does not, which is the distinction the blank
-/// row was buying. Threading a width in would also put the gaps back exactly
-/// where they are worst, since a long search header is what wraps.
+/// The transcript separates a row that merely wraps, which this does not: a
+/// break is applied to the whole card at the end, once, and a child that takes
+/// two rows is still one entry in this list. It reads as the list anyway,
+/// because every child opens on its sigil and a continuation row opens on the
+/// gutter it hangs under, which is the distinction the blank row was buying.
+/// Spacing them here by what they might break into would put the gaps back
+/// exactly where they are worst, since a long search header is what wraps.
 fn render_batch(entries: &[BatchToolEntry], highlight: bool, limits: &RenderLimits) -> BatchCard {
     let t = theme::current();
     let mut lines = Vec::new();
@@ -1473,6 +1484,7 @@ pub(super) fn plain_body(text: &str, width: u16) -> (Vec<Line<'static>>, BodySou
 ///
 /// `origin` names the span it was cut from, or `None` for the gutter a
 /// continuation was given, which stands for nothing the row said.
+#[derive(Clone)]
 struct SpanPiece {
     origin: Option<usize>,
     offset: usize,
@@ -1589,6 +1601,172 @@ fn wrapped_lines(rows: Vec<Vec<SpanPiece>>) -> Vec<Line<'static>> {
     rows.into_iter()
         .map(|row| Line::from(row.into_iter().map(|piece| piece.span).collect::<Vec<_>>()))
         .collect()
+}
+
+/// Whether a span standing at the head of a row is chrome rather than content.
+///
+/// The question is only ever asked of a whole span, and the span boundary was
+/// drawn by the renderer: a line number, a tree connector, a todo marker and
+/// the card's own indent are each already spans of their own. That is what
+/// makes this a reading of the row's structure rather than a guess about its
+/// text.
+fn is_gutter(text: &str) -> bool {
+    if text.is_empty() {
+        return false;
+    }
+    let bare = text.trim_end_matches(' ');
+    bare.starts_with(MARKER_OPEN) && bare.ends_with(MARKER_CLOSE)
+        || text
+            .chars()
+            .all(|c| GUTTER_CHARS.contains(c) || c.is_ascii_digit())
+}
+
+/// The leading spans of a row that are its gutter.
+///
+/// Never the whole row: a row that is nothing but chrome has no text to hang,
+/// and claiming all of it would leave the break no room to put anything in.
+fn gutter_spans(spans: &[Span<'static>]) -> usize {
+    spans
+        .iter()
+        .take_while(|span| is_gutter(span.content.as_ref()))
+        .count()
+        .min(spans.len().saturating_sub(1))
+}
+
+/// One row broken to `width`, hung under whatever gutter it opens with.
+fn wrap_row(spans: Vec<Span<'static>>, width: u16) -> Vec<Vec<SpanPiece>> {
+    let gutter = gutter_spans(&spans);
+    let pad = " ".repeat(
+        spans
+            .iter()
+            .take(gutter)
+            .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+            .sum(),
+    );
+    wrap_styled(spans, gutter, &pad, width)
+}
+
+/// A card's lines broken to a width, holding on to which rows each line became
+/// so that everything the card indexed by line can be moved onto them.
+///
+/// Wrapping is the last thing that happens to a card, and it happens to every
+/// card in one place. A renderer that draws a gutter therefore does not have to
+/// know the width it will be drawn at, which is the assumption the rest of this
+/// module is written under.
+pub(crate) struct WrappedRows {
+    per_line: Vec<Vec<Vec<SpanPiece>>>,
+}
+
+impl WrappedRows {
+    pub(crate) fn new(lines: Vec<Line<'static>>, width: u16) -> Self {
+        Self {
+            per_line: lines
+                .into_iter()
+                .map(|line| wrap_row(line.spans, width))
+                .collect(),
+        }
+    }
+
+    /// The first display row of each source line, with the total appended so a
+    /// range over lines maps to a range over rows by its endpoints alone.
+    fn starts(&self) -> Vec<usize> {
+        let mut at = 0;
+        let mut starts = Vec::with_capacity(self.per_line.len() + 1);
+        for rows in &self.per_line {
+            starts.push(at);
+            at += rows.len();
+        }
+        starts.push(at);
+        starts
+    }
+
+    pub(crate) fn row_of(&self, line: usize) -> usize {
+        self.starts()[line.min(self.per_line.len())]
+    }
+
+    pub(crate) fn lines(&self) -> Vec<Line<'static>> {
+        self.per_line
+            .iter()
+            .flat_map(|rows| wrapped_lines(rows.to_vec()))
+            .collect()
+    }
+
+    /// A value held per line, moved onto every row that line became.
+    pub(crate) fn expand<T: Clone>(&self, per_line: Vec<T>) -> Vec<T> {
+        per_line
+            .into_iter()
+            .zip(&self.per_line)
+            .flat_map(|(value, rows)| std::iter::repeat_n(value, rows.len()))
+            .collect()
+    }
+
+    /// Provenance for every row, narrowed to the bytes each one drew.
+    pub(crate) fn provenance(&self, rows: Vec<LineProvenance>) -> Vec<LineProvenance> {
+        rows.into_iter()
+            .zip(&self.per_line)
+            .flat_map(|(source, rows)| wrapped_provenance(rows, &source))
+            .collect()
+    }
+
+    /// A range of lines as the range of rows they became.
+    pub(crate) fn range(&self, range: Range<usize>) -> Range<usize> {
+        self.row_of(range.start)..self.row_of(range.end)
+    }
+
+    /// A card's source, moved onto the rows the break produced. The text is
+    /// what was written, so it never moves.
+    pub(crate) fn body(&self, source: BodySource) -> BodySource {
+        BodySource {
+            rows: self.provenance(source.rows),
+            code: source
+                .code
+                .into_iter()
+                .map(|block| CodeBlock {
+                    rows: self.range(block.rows),
+                    ..block
+                })
+                .collect(),
+            text: source.text,
+        }
+    }
+
+    /// Where a span of a line ended up, as the row holding it and its index in
+    /// that row. A span the break dropped entirely keeps the line's first row.
+    pub(crate) fn span_at(&self, line: usize, span: usize) -> (usize, usize) {
+        let first = self.row_of(line);
+        let Some(rows) = self.per_line.get(line) else {
+            return (first, span);
+        };
+        for (offset, row) in rows.iter().enumerate() {
+            if let Some(at) = row.iter().position(|piece| piece.origin == Some(span)) {
+                return (first + offset, at);
+            }
+        }
+        (first, span)
+    }
+
+    /// A per-span value held for one line, rebuilt for each row that line
+    /// became, so a row answers for exactly the spans it drew.
+    pub(crate) fn spans_of<T: Clone + Default>(&self, line: usize, values: &[T]) -> Vec<Vec<T>> {
+        self.per_line
+            .get(line)
+            .map(|rows| {
+                rows.iter()
+                    .map(|row| {
+                        row.iter()
+                            .map(|piece| {
+                                piece
+                                    .origin
+                                    .and_then(|origin| values.get(origin))
+                                    .cloned()
+                                    .unwrap_or_default()
+                            })
+                            .collect()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
 }
 
 /// The provenance of every row a break produced, from the row's own.
@@ -2760,15 +2938,42 @@ pub fn render_tool_content(
     }
     lines.extend(output_lines);
     let source = trace.finish(&lines);
+    let scroll_spans = output_spans
+        .into_iter()
+        .map(|span| span.shifted(body_start, span.child))
+        .collect();
+    wrapped_content(
+        ToolContent {
+            lines,
+            rows,
+            truncation,
+            scroll_spans,
+            source,
+        },
+        limits.width,
+    )
+}
+
+/// The card, broken to the width it will be drawn at.
+///
+/// Everything above this point lays the card out in logical lines and leaves
+/// the width to the end, so there is exactly one place where a gutter can be
+/// lost to a break, and it is this one.
+fn wrapped_content(content: ToolContent, width: u16) -> ToolContent {
+    let wrapped = WrappedRows::new(content.lines, width);
     ToolContent {
-        lines,
-        rows,
-        truncation,
-        scroll_spans: output_spans
+        lines: wrapped.lines(),
+        rows: wrapped.expand(content.rows),
+        truncation: content.truncation,
+        scroll_spans: content
+            .scroll_spans
             .into_iter()
-            .map(|span| span.shifted(body_start, span.child))
+            .map(|span| ScrollSpan {
+                first: wrapped.row_of(span.first),
+                ..span
+            })
             .collect(),
-        source,
+        source: content.source.map(|source| wrapped.body(source)),
     }
 }
 
@@ -2822,7 +3027,10 @@ mod tests {
     use super::*;
     use crate::markdown::{EXPAND_AFFORDANCE, TRUNCATION_PREFIX};
     use caudra_agent::tools::{BATCH_TOOL_NAME, FILE_GREP_TOOL_NAME, ToolEffect};
-    use caudra_agent::{ActivityChild, GrepMatchGroup, ShellOutput, SubagentActivity};
+    use caudra_agent::{
+        ActivityChild, EnvironmentFact, GrepLine, GrepMatchGroup, ShellOutput, SubagentActivity,
+        TextOutput,
+    };
     use std::time::Duration;
     use test_case::test_case;
 
@@ -4544,7 +4752,10 @@ mod tests {
         let card = render_batch(&[entry], false, &started(0, CHILD_RAN_FOR));
         let row = line_text(&card.lines[0]);
 
-        assert!(row.ends_with(CHILD_MEASURED_CLOCK), "{CHILD_CLOCK_MSG}: {row}");
+        assert!(
+            row.ends_with(CHILD_MEASURED_CLOCK),
+            "{CHILD_CLOCK_MSG}: {row}"
+        );
         assert!(!row.contains(CHILD_LIVE_CLOCK), "{CHILD_CLOCK_MSG}: {row}");
     }
 
@@ -4976,5 +5187,162 @@ mod tests {
             "a whole-file substitution has to say why"
         );
         assert!(texts.iter().any(|t| t.contains("fn alpha")));
+    }
+
+    const ROW_FITS: &str = "every row a card draws has to fit the width it was given; one that \
+        does not is broken by the terminal instead, which starts the next row at column zero and \
+        drops the gutter the card was drawing";
+    const INVARIANT_WIDTH: u16 = 28;
+    /// Long enough that no gutter leaves room for it, with spaces to break on
+    /// so a failure is the layout's and not an unbreakable token's.
+    const LONG: &str =
+        "a sentence long enough that no card of this width can draw it on one row at all";
+
+    fn text_output(text: &str) -> TextOutput {
+        TextOutput {
+            text: text.to_owned(),
+            instructions: None,
+            state: None,
+            lua_provenance: None,
+        }
+    }
+
+    /// Every row of the card, as the terminal would measure it.
+    fn overflowing_rows(output: &ToolOutput) -> Vec<String> {
+        let mut limits = limits(BatchViews::default());
+        limits.width = INVARIANT_WIDTH;
+        render_tool_content(None, Some(output), false, limits)
+            .lines
+            .iter()
+            .map(line_text)
+            .filter(|text| UnicodeWidthStr::width(text.as_str()) > usize::from(INVARIANT_WIDTH))
+            .collect()
+    }
+
+    fn todo_output() -> ToolOutput {
+        ToolOutput::TodoList(Vec::from([TodoItem {
+            content: LONG.to_owned(),
+            status: TodoStatus::InProgress,
+            priority: Default::default(),
+        }]))
+    }
+
+    fn answers_output() -> ToolOutput {
+        ToolOutput::Answers(Vec::from([Answer {
+            header: LONG.to_owned(),
+            labels: Vec::from([LONG.to_owned()]),
+        }]))
+    }
+
+    fn grep_output() -> ToolOutput {
+        ToolOutput::GrepResult {
+            entries: Vec::from([GrepFileEntry {
+                path: format!("src/{LONG}.rs"),
+                groups: Vec::from([GrepMatchGroup {
+                    lines: Vec::from([GrepLine {
+                        line_nr: 12,
+                        text: LONG.to_owned(),
+                        is_match: true,
+                    }]),
+                }]),
+            }]),
+            capped: None,
+        }
+    }
+
+    fn environment_output() -> ToolOutput {
+        ToolOutput::Environment {
+            headline: LONG.to_owned(),
+            summary: LONG.to_owned(),
+            facts: Vec::from([EnvironmentFact {
+                label: "platform".to_owned(),
+                value: LONG.to_owned(),
+            }]),
+            commands: Vec::new(),
+        }
+    }
+
+    fn read_code_output() -> ToolOutput {
+        ToolOutput::ReadCode {
+            path: "src/main.rs".to_owned(),
+            start_line: 1,
+            lines: Vec::from([LONG.to_owned()]),
+            total_lines: 1,
+            instructions: None,
+        }
+    }
+
+    fn code_graph_output() -> ToolOutput {
+        ToolOutput::CodeGraph {
+            headline: LONG.to_owned(),
+            rows: Vec::new(),
+            source: None,
+            footer: LONG.to_owned(),
+            state: None,
+        }
+    }
+
+    /// The whole point of the invariant: one case per output a card can draw,
+    /// so a renderer added later has to join the list rather than quietly
+    /// reintroducing the bug this fixes.
+    #[test_case(todo_output() ; "todo_list")]
+    #[test_case(answers_output() ; "answers")]
+    #[test_case(grep_output() ; "grep_result")]
+    #[test_case(environment_output() ; "environment")]
+    #[test_case(read_code_output() ; "read_code")]
+    #[test_case(code_graph_output() ; "code_graph")]
+    #[test_case(ToolOutput::Plain(text_output(LONG)) ; "plain")]
+    #[test_case(ToolOutput::Markdown(text_output(LONG)) ; "markdown")]
+    fn no_row_outgrows_the_card_it_is_drawn_in(output: ToolOutput) {
+        let over = overflowing_rows(&output);
+        assert!(over.is_empty(), "{ROW_FITS}: {over:#?}");
+    }
+
+    const HANGS_UNDER_MARKER: &str = "a todo too long for its card carries on under its own text, \
+        not against the card's edge where the marker can no longer be told from the wrap";
+
+    /// The reported bug: a todo list inside a batch lost both the tree and its
+    /// marker the moment an item was too long to fit.
+    #[test]
+    fn a_todo_that_outgrows_its_card_hangs_under_its_marker() {
+        let mut limits = limits(BatchViews::default());
+        limits.width = INVARIANT_WIDTH;
+
+        let content = render_tool_content(None, Some(&todo_output()), false, limits);
+        let rows: Vec<String> = content.lines.iter().map(line_text).collect();
+
+        assert!(rows.len() > 1, "{HANGS_UNDER_MARKER}: {rows:#?}");
+        let marker = UnicodeWidthStr::width(TodoStatus::InProgress.marker()) + 1;
+        for row in rows.iter().skip(1) {
+            assert!(
+                row.starts_with(&" ".repeat(marker)),
+                "{HANGS_UNDER_MARKER}: {row:?}"
+            );
+        }
+    }
+
+    const SOURCE_IS_PARALLEL: &str = "a card's source has to name one row per painted row at every \
+        width, or extraction gives up on the card and copy scrapes the gutter off the screen";
+    const COPY_IS_WIDTH_BLIND: &str = "what a card copies is what was written, so it cannot depend \
+        on how wide the terminal happened to be";
+
+    /// Breaking a row is a picture, not a fact about the text behind it.
+    #[test_case(INVARIANT_WIDTH ; "narrow")]
+    #[test_case(60 ; "medium")]
+    #[test_case(UNCONSTRAINED_WIDTH ; "unconstrained")]
+    fn a_card_copies_the_same_text_however_it_is_broken(width: u16) {
+        let code = read_code_output();
+        let mut limits = limits(BatchViews::default());
+        limits.width = width;
+
+        let content = render_tool_content(None, Some(&code), false, limits);
+        let source = content.source.expect(SOURCE_IS_PARALLEL);
+
+        assert_eq!(
+            source.rows.len(),
+            content.lines.len(),
+            "{SOURCE_IS_PARALLEL}"
+        );
+        assert!(source.text.contains(LONG), "{COPY_IS_WIDTH_BLIND}");
     }
 }
