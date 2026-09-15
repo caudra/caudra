@@ -162,6 +162,8 @@ const FAST_UNSUPPORTED_MSG: &str = "Fast mode requires an Anthropic Opus 4.6+ mo
 const THINKING_UNSUPPORTED_MSG: &str = "Thinking requires a model that supports it";
 const FAST_ON_MSG: &str = "Fast mode: on";
 const FAST_OFF_MSG: &str = "Fast mode: off";
+const YOLO_ON_MSG: &str = "YOLO mode enabled";
+const YOLO_OFF_MSG: &str = "YOLO mode disabled";
 const AUTO_VIEW_MSG: &str = "View: auto (the newest card stays open)";
 const COMPACT_VIEW_MSG: &str = "View: compact";
 const EXPANDED_VIEW_MSG: &str = "View: expanded";
@@ -3946,11 +3948,10 @@ impl App {
                 vec![Action::RemoteControl(cmd.args)]
             }
             "/yolo" => {
-                let enabled = self.permissions.toggle_yolo();
-                let msg = if enabled {
-                    "YOLO mode enabled"
+                let msg = if self.permissions.toggle_yolo() {
+                    YOLO_ON_MSG
                 } else {
-                    "YOLO mode disabled"
+                    YOLO_OFF_MSG
                 };
                 self.flash(msg.into());
                 vec![]

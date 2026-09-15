@@ -4998,6 +4998,58 @@ fn releasing_off_the_resume_control_leaves_the_transcript_paused() {
     assert!(!app.chats[0].auto_scroll());
 }
 
+fn bypassing_app() -> App {
+    let app = test_app();
+    app.permissions.set_session_yolo(Some(true));
+    app
+}
+
+/// The chip warns that prompts are being skipped, so clicking it is the way
+/// back to them and the warning goes with the state it described.
+#[test]
+fn clicking_the_yolo_chip_turns_it_off() {
+    let mut app = bypassing_app();
+    let hit = status_hit(&mut app, StatusBarHitTarget::Yolo);
+    app.update(mouse_event(MouseEventKind::Moved, hit.area.x, hit.area.y));
+    assert_eq!(app.status_hover, Some(StatusBarHitTarget::Yolo));
+
+    assert!(click_status(&mut app, StatusBarHitTarget::Yolo).is_empty());
+
+    assert!(!app.permissions.is_yolo());
+    assert_eq!(app.status_hover, None);
+    assert_eq!(app.status_bar.flash_text(), Some(YOLO_OFF_MSG));
+    let _ = rendered(&mut app);
+    assert!(
+        app.status_hits
+            .iter()
+            .all(|hit| hit.target != StatusBarHitTarget::Yolo)
+    );
+}
+
+/// The click is the same explicit choice `/yolo` makes, so a resume must not
+/// hand the session its bypass back.
+#[test]
+fn turning_yolo_off_from_the_footer_is_remembered() {
+    let mut app = bypassing_app();
+
+    click_status(&mut app, StatusBarHitTarget::Yolo);
+    app.checkpoint();
+
+    assert_eq!(app.state.session.meta.yolo, Some(false));
+}
+
+/// Permissions are the session's, so a task footer switches off the bypass the
+/// whole session was running under.
+#[test]
+fn a_subagent_footer_turns_yolo_off() {
+    let mut app = read_only_task_app();
+    app.permissions.set_session_yolo(Some(true));
+
+    click_status(&mut app, StatusBarHitTarget::Yolo);
+
+    assert!(!app.permissions.is_yolo());
+}
+
 /// The footer draws no price until a turn has been billed, and no price means
 /// no control to click.
 fn priced_app() -> App {

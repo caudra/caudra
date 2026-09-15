@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use crate::repaint::Dirty;
 
 use super::tasks::MAIN_TASK_ID;
-use super::{App, KeyFocus};
+use super::{App, KeyFocus, YOLO_OFF_MSG};
 
 pub(super) const EDGE_SCROLL_LINES: i32 = 1;
 pub(super) const EDGE_SCROLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -1003,6 +1003,15 @@ impl App {
             StatusBarHitTarget::ResumeAutoScroll => {
                 self.clear_control_hovers();
                 self.active_chat().enable_auto_scroll();
+                Vec::new()
+            }
+            // A click means off, so a hit rect left over from an earlier frame
+            // can never switch it back on. The chip goes with the state it
+            // warned about, taking the hover it was drawn under with it.
+            StatusBarHitTarget::Yolo => {
+                self.clear_control_hovers();
+                self.permissions.set_session_yolo(Some(false));
+                self.flash(YOLO_OFF_MSG.into());
                 Vec::new()
             }
             // The countdown is cleared here rather than left to the next event:

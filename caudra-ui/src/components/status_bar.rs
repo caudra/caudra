@@ -145,6 +145,7 @@ pub enum StatusBarHitTarget {
     ChatName,
     Cwd,
     ResumeAutoScroll,
+    Yolo,
 }
 
 impl StatusBarHitTarget {
@@ -163,7 +164,8 @@ impl StatusBarHitTarget {
             | Self::Retry
             | Self::ChatName
             | Self::Cwd
-            | Self::ResumeAutoScroll => ChatScope::Any,
+            | Self::ResumeAutoScroll
+            | Self::Yolo => ChatScope::Any,
             Self::Mode | Self::Model | Self::Thinking | Self::Goal | Self::Workflows => {
                 ChatScope::MainOnly
             }
@@ -1099,7 +1101,12 @@ fn right_side_animated<'a>(
         );
     }
     if let Some(label) = fit.yolo_label(ctx) {
-        chips.push(Span::styled(label, theme::current().error));
+        control(
+            &mut chips,
+            StatusBarHitTarget::Yolo,
+            label,
+            theme::current().error,
+        );
     }
     let counters = Style::new().fg(theme::current().foreground);
     if let Some(text) = fit.context_text(&spend) {
@@ -1609,8 +1616,11 @@ mod tests {
     const MISSING_RETRY_HIT_MSG: &str = "a visible retry countdown must be clickable";
     const MISSING_RESUME_HIT_MSG: &str = "a paused transcript must be resumable from the footer";
     const UNCLICKABLE_LABEL_MSG: &str = "the bar drew the resume label without a hit to click it";
+    const MISSING_YOLO_HIT_MSG: &str = "a bypassed session must be switchable back from the footer";
+    const UNCLICKABLE_YOLO_MSG: &str = "the bar drew the yolo chip without a hit to click it";
 
-    fn resume_glyphs(text: &str, hit: &StatusBarHit) -> String {
+    /// The glyphs a hit claims, read back out of the bar it was measured on.
+    fn bar_glyphs(text: &str, hit: &StatusBarHit) -> String {
         text.chars()
             .skip(usize::from(hit.area.x))
             .take(usize::from(hit.area.width))
@@ -1848,8 +1858,13 @@ mod tests {
 
     /// The glyphs a hit claims, read back out of the spans it was measured on.
     fn hit_glyphs(side: &RightSide<'_>, target: StatusBarHitTarget) -> String {
-        let (offset, width) = side_hit(side, target).expect(MISSING_HIT_MSG);
-        side_text(side).chars().skip(offset).take(width).collect()
+        drawn_glyphs(side, target).expect(MISSING_HIT_MSG)
+    }
+
+    /// The same, for a control the bar is free to have dropped entirely.
+    fn drawn_glyphs(side: &RightSide<'_>, target: StatusBarHitTarget) -> Option<String> {
+        let (offset, width) = side_hit(side, target)?;
+        Some(side_text(side).chars().skip(offset).take(width).collect())
     }
 
     /// Reads the drawn glyphs rather than the [`Fit`], so a tier that measures
@@ -2551,7 +2566,7 @@ mod tests {
             .find(|hit| hit.target == StatusBarHitTarget::ResumeAutoScroll)
             .expect(MISSING_RESUME_HIT_MSG);
 
-        assert_eq!(resume_glyphs(&text, hit), AUTO_SCROLL_PAUSED_LABEL);
+        assert_eq!(bar_glyphs(&text, hit), AUTO_SCROLL_PAUSED_LABEL);
         assert_eq!(text.chars().nth(usize::from(hit.area.x) - 1), Some(' '));
         assert!(hit.target.accepts_click());
     }
@@ -2588,7 +2603,7 @@ mod tests {
             .iter()
             .find(|hit| hit.target == StatusBarHitTarget::ResumeAutoScroll)
         {
-            Some(hit) => assert_eq!(resume_glyphs(&text, hit), AUTO_SCROLL_PAUSED_LABEL),
+            Some(hit) => assert_eq!(bar_glyphs(&text, hit), AUTO_SCROLL_PAUSED_LABEL),
             None => assert!(
                 !text.contains(AUTO_SCROLL_PAUSED_LABEL),
                 "{UNCLICKABLE_LABEL_MSG}"
@@ -2633,6 +2648,101 @@ mod tests {
             hits.iter()
                 .any(|hit| hit.target == StatusBarHitTarget::ResumeAutoScroll)
         );
+    }
+
+    /// The chip is the whole control: the space ahead of it separates it from
+    /// whatever the bar drew last and must not answer the pointer.
+    #[test]
+    fn a_bypassed_session_offers_a_yolo_control() {
+        let (text, hits, _) = render_at(Fixture {
+            yolo: true,
+            ..Default::default()
+        });
+        let hit = hits
+            .iter()
+            .find(|hit| hit.target == StatusBarHitTarget::Yolo)
+            .expect(MISSING_YOLO_HIT_MSG);
+
+        assert_eq!(bar_glyphs(&text, hit), YOLO_LABEL.trim());
+        assert_eq!(text.chars().nth(usize::from(hit.area.x) - 1), Some(' '));
+        assert!(hit.target.accepts_click());
+    }
+
+    #[test]
+    fn a_prompting_session_has_no_yolo_control() {
+        let (text, hits, _) = render_at(Fixture::default());
+
+        assert!(!text.contains(YOLO_LABEL.trim()));
+        assert!(
+            hits.iter()
+                .all(|hit| hit.target != StatusBarHitTarget::Yolo)
+        );
+    }
+
+    /// The chip keeps its warning colour, so the hover has only the reversal to
+    /// say the pointer is on a control.
+    #[test]
+    fn hovering_the_yolo_control_highlights_its_chip_alone() {
+        let (_, hits, styles) = render_at(Fixture {
+            yolo: true,
+            hovered: Some(StatusBarHitTarget::Yolo),
+            ..Default::default()
+        });
+        let hit = hits
+            .iter()
+            .find(|hit| hit.target == StatusBarHitTarget::Yolo)
+            .expect(MISSING_YOLO_HIT_MSG);
+        let start = usize::from(hit.area.x);
+        let end = usize::from(hit.area.right());
+
+        assert!(!styles[start - 1].add_modifier.contains(Modifier::REVERSED));
+        assert!(
+            styles[start..end]
+                .iter()
+                .all(|style| style.add_modifier.contains(Modifier::REVERSED))
+        );
+    }
+
+    /// The bypass belongs to the session rather than to one transcript, so a
+    /// task footer switches off the same one the main chat would.
+    #[test]
+    fn a_subagent_footer_offers_the_yolo_control() {
+        let (_, hits, _) = render_at(Fixture {
+            yolo: true,
+            main_chat: false,
+            ..Default::default()
+        });
+
+        assert_eq!(StatusBarHitTarget::Yolo.scope(), ChatScope::Any);
+        assert!(
+            hits.iter()
+                .any(|hit| hit.target == StatusBarHitTarget::Yolo)
+        );
+    }
+
+    /// A squeezed bar spells the chip `[!]` before it drops it, so the hit has
+    /// to cover whichever spelling was drawn and go when neither is.
+    #[test_case(3           ; "model_floor_only")]
+    #[test_case(8           ; "very_narrow")]
+    #[test_case(16          ; "narrow")]
+    #[test_case(24          ; "cramped")]
+    #[test_case(40          ; "medium")]
+    #[test_case(60          ; "roomy")]
+    #[test_case(WIDE_BUDGET ; "everything_fits")]
+    fn a_yolo_hit_tracks_the_tier_it_was_drawn_on(budget: usize) {
+        with_ladder_ctx(|ctx| {
+            let side = right_side(ctx, LADDER_CWD, budget);
+            match drawn_glyphs(&side, StatusBarHitTarget::Yolo) {
+                Some(glyphs) => assert!(
+                    [YOLO_LABEL.trim(), YOLO_SHORT_LABEL.trim()].contains(&glyphs.as_str()),
+                    "{STALE_HIT_MSG}: {glyphs:?}"
+                ),
+                None => assert!(
+                    !visible_chips(&side).contains(&Chip::Yolo),
+                    "{UNCLICKABLE_YOLO_MSG}"
+                ),
+            }
+        });
     }
 
     #[test]

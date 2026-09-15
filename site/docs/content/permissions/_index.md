@@ -244,6 +244,6 @@ Lua plugin API capabilities remain separate. `plugin.toml` controls whether plug
 
 ## YOLO mode
 
-`/yolo` and `--yolo` skip prompts after deny rules and hard restrictions have run. The status bar shows `[yolo]` while enabled, or `[!]` when the terminal is too narrow to spell it. The warning is the last thing the bar drops, so it stays visible after the token counts and the reasoning level are gone.
+`/yolo` and `--yolo` skip prompts after deny rules and hard restrictions have run. The status bar shows `[yolo]` while enabled, or `[!]` when the terminal is too narrow to spell it. The warning is the last thing the bar drops, so it stays visible after the token counts and the reasoning level are gone. Clicking it turns YOLO off and brings prompts back, from a task footer as well as the main one.
 
 An explicit `/yolo` choice is stored with the root conversation. A user-created fork and `/new` start without that explicit state. `--yolo` supplies the initial default for a fresh root.
