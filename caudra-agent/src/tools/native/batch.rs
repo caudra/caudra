@@ -8,6 +8,7 @@
 //! each child's state as it changes.
 
 use std::borrow::Cow;
+use std::mem;
 use std::sync::{Arc, LazyLock, Mutex};
 
 use serde_json::{Map, Value};
@@ -199,8 +200,11 @@ impl ToolInvocation for BatchCall {
     /// this output replaces whatever the roster drew, so a pending row here
     /// would take a running child back to the start and leave it there.
     fn start_output(&self, ctx: &ToolContext) -> Option<ToolOutput> {
-        let mut entries: Vec<BatchToolEntry> =
-            self.children.iter().map(Child::pending_entry).collect();
+        let mut entries: Vec<BatchToolEntry> = self
+            .children
+            .iter()
+            .map(|child| child.pending_entry(ctx))
+            .collect();
         if let Some(runs) = &ctx.speculative {
             let calls = self
                 .children
@@ -213,7 +217,7 @@ impl ToolInvocation for BatchCall {
                     .filter(|_| child.rejection.is_none())
                     .and_then(Peeked::entry)
                 {
-                    *entry = started;
+                    adopt_row(entry, started);
                 }
             }
         }
@@ -229,28 +233,35 @@ impl ToolInvocation for BatchCall {
 }
 
 impl Child {
-    fn pending_entry(&self) -> BatchToolEntry {
-        match self.rejection {
-            Some(reason) => BatchToolEntry {
-                tool: self.tool.clone(),
-                effect: ToolEffect::Unknown,
-                summary: String::new(),
-                status: BatchToolStatus::Error,
-                input: None,
-                raw_input: None,
-                output: Some(ToolOutput::Plain(reason.into())),
-                annotation: None,
-            },
-            None => BatchToolEntry {
-                tool: self.tool.clone(),
-                effect: ToolEffect::Unknown,
-                summary: String::new(),
-                status: BatchToolStatus::Pending,
-                input: None,
-                raw_input: None,
-                output: None,
-                annotation: None,
-            },
+    /// The row a child draws before it has introduced itself. Resolved from
+    /// the call the model wrote rather than left blank: a child can be settled
+    /// without ever publishing a start — adopted from a speculative run still
+    /// in permission gating, refused at the boundary, swept by a cancelled
+    /// turn — and this row is then its only description. A bare `Ran` names
+    /// nothing the reader can act on.
+    fn pending_header(&self, ctx: &ToolContext) -> String {
+        let name = ctx.resolve_tool_name_alias(&self.tool);
+        let header = ctx.registry.resolve_header(name, &self.params);
+        match header == name {
+            true => String::new(),
+            false => header,
+        }
+    }
+
+    fn pending_entry(&self, ctx: &ToolContext) -> BatchToolEntry {
+        let (status, output) = match self.rejection {
+            Some(reason) => (BatchToolStatus::Error, Some(ToolOutput::Plain(reason.into()))),
+            None => (BatchToolStatus::Pending, None),
+        };
+        BatchToolEntry {
+            tool: self.tool.clone(),
+            effect: ToolEffect::Unknown,
+            summary: self.pending_header(ctx),
+            status,
+            input: None,
+            raw_input: Some(self.params.clone()),
+            output,
+            annotation: None,
         }
     }
 }
@@ -264,7 +275,11 @@ impl BatchCall {
                 child.rejection = Some(NESTED_ERROR);
             }
         }
-        let entries: Vec<BatchToolEntry> = self.children.iter().map(Child::pending_entry).collect();
+        let entries: Vec<BatchToolEntry> = self
+            .children
+            .iter()
+            .map(|child| child.pending_entry(ctx))
+            .collect();
         let entries = Arc::new(Mutex::new(entries));
         // Reserve the complete child roster before any child executes, so
         // concurrent completion cannot choose the collector's bounded prefix.
@@ -316,7 +331,7 @@ impl BatchCall {
                 set.spawn(async move {
                     if let Some(start) = adopted.start() {
                         publish(&entries, index, &ctx, |entry| {
-                            *entry = started_entry(start);
+                            adopt_row(entry, started_entry(start));
                         });
                     }
                     let done = adopted.finish().await;
@@ -448,6 +463,20 @@ pub(crate) fn started_entry(start: &ToolStartEvent) -> BatchToolEntry {
         output: None,
         annotation: None,
     }
+}
+
+/// Replaces a roster row with one a running child published, keeping what the
+/// new row does not carry. A speculative child claimed while it is still in
+/// permission gating has no header yet, and taking its row verbatim would
+/// erase the description the batch resolved from the call itself.
+pub(crate) fn adopt_row(entry: &mut BatchToolEntry, mut row: BatchToolEntry) {
+    if row.summary.is_empty() {
+        row.summary = mem::take(&mut entry.summary);
+    }
+    if row.raw_input.is_none() {
+        row.raw_input = entry.raw_input.take();
+    }
+    *entry = row;
 }
 
 /// The same row once the child has answered.
@@ -972,7 +1001,12 @@ mod tests {
         let child =
             normalized(json!({ "tool": crate::tools::BATCH_TOOL_NAME, "tool_calls": [] })).unwrap();
         assert_eq!(child.rejection, Some(NESTED_ERROR));
-        assert_eq!(child.pending_entry().status, BatchToolStatus::Error);
+        let ctx = stub_ctx(&AgentMode::Build);
+        assert_eq!(
+            child.pending_entry(&ctx).status,
+            BatchToolStatus::Error,
+            "{NESTED_ERROR}"
+        );
     }
 
     #[test]
@@ -1223,6 +1257,63 @@ mod tests {
             panic!("expected a batch result");
         };
         assert_eq!(entries[0].summary, HEADER_PATH, "{EXPECT_SUMMARY}");
+    }
+
+    const EXPECT_PENDING_SUMMARY: &str =
+        "a child settled without ever starting keeps the header the batch resolved from the call, \
+         so the roster never draws a bare tense with nothing after it";
+
+    /// A child is adopted from a speculative run still in permission gating,
+    /// refused at the boundary, or swept by a cancelled turn, and then settles
+    /// without ever publishing a start. Its row is whatever the batch built up
+    /// front, which was empty, so a finished `shell` read as `Ran` and named
+    /// no command at all.
+    #[test]
+    fn a_child_names_its_call_before_it_starts() {
+        let registry = Arc::new(ToolRegistry::new());
+        registry
+            .register(
+                Arc::new(HeaderTool),
+                crate::tools::ToolSource::Native {
+                    owner: super::super::OWNER.into(),
+                    contract: HEADER_TOOL.into(),
+                    trusted: true,
+                },
+            )
+            .expect("registering a stub child");
+        let mut ctx = stub_ctx(&AgentMode::Build);
+        ctx.registry = registry;
+        let child = normalized(json!({ "tool": HEADER_TOOL, "path": HEADER_PATH })).unwrap();
+
+        let entry = child.pending_entry(&ctx);
+
+        assert_eq!(entry.summary, HEADER_PATH, "{EXPECT_PENDING_SUMMARY}");
+        assert_eq!(
+            entry.raw_input,
+            Some(json!({ "path": HEADER_PATH })),
+            "{EXPECT_PENDING_SUMMARY}"
+        );
+    }
+
+    /// The other half: a start that arrived without a header must not erase
+    /// the one the call itself gave.
+    #[test]
+    fn an_adopted_row_keeps_the_header_it_already_had() {
+        let mut row = BatchToolEntry {
+            summary: HEADER_PATH.to_owned(),
+            raw_input: Some(json!({ "path": HEADER_PATH })),
+            ..entry(HEADER_TOOL, BatchToolStatus::Pending, BODY)
+        };
+
+        adopt_row(&mut row, entry(HEADER_TOOL, BatchToolStatus::Running, BODY));
+
+        assert_eq!(row.status, BatchToolStatus::Running, "{EXPECT_SUMMARY}");
+        assert_eq!(row.summary, HEADER_PATH, "{EXPECT_PENDING_SUMMARY}");
+        assert_eq!(
+            row.raw_input,
+            Some(json!({ "path": HEADER_PATH })),
+            "{EXPECT_PENDING_SUMMARY}"
+        );
     }
 
     const HEADER_TOOL_WIRE: &str = "mcp_Header_tool";
