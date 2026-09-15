@@ -62,12 +62,20 @@ enum Body {
 /// wait: it arrives first, so counting only the new side leaves the header
 /// empty until the last stretch of the stream, and empty for good on every
 /// edit whose replacement is shorter than the floor `size_label` applies.
+///
+/// A note and a local document belong here for the reason a whole file does:
+/// each is a document the call carries entire, legible half-written, and drawn
+/// by its settled card as the document it is. A tool whose body is only one of
+/// several commands still earns a row, because the reader that finds no such
+/// argument decodes nothing and costs nothing.
 const BODY_ARGS: &[(&str, &[&str], Body)] = &[
     ("file_write", &["content"], Body::Drawn),
     ("file_edit", &["oldString", "newString"], Body::Counted),
     ("file_apply_patch", &["patchText"], Body::Named),
     ("shell", &["command"], Body::Drawn),
     ("python_execution", &["code"], Body::Drawn),
+    ("memory", &["content"], Body::Drawn),
+    ("local_document_write", &["content"], Body::Drawn),
 ];
 
 /// The arguments `tool` writes and what becomes of them, `None` for a tool
@@ -373,6 +381,7 @@ mod tests {
     const EDIT: &str = "file_edit";
     const PATCH: &str = "file_apply_patch";
     const SHELL: &str = "shell";
+    const MEMORY: &str = "memory";
     const CONTENT_KEYS: &[&str] = &["content"];
     const EDIT_KEYS: &[&str] = &["oldString", "newString"];
     const PATCH_TEXT_KEYS: &[&str] = &["patchText"];
@@ -422,6 +431,8 @@ mod tests {
     #[test_case(PATCH, Some((PATCH_TEXT_KEYS, Body::Named)) ; "a_patch_reads_its_envelope")]
     #[test_case(SHELL, Some((COMMAND_KEYS, Body::Drawn)) ; "a_command_is_drawn")]
     #[test_case("python_execution", Some((CODE_KEYS, Body::Drawn)) ; "a_script_is_drawn")]
+    #[test_case(MEMORY, Some((CONTENT_KEYS, Body::Drawn)) ; "a_note_is_drawn")]
+    #[test_case("local_document_write", Some((CONTENT_KEYS, Body::Drawn)) ; "a_local_document_is_drawn")]
     #[test_case("file_read", None ; "a_tool_with_no_body")]
     fn a_tools_body_arguments(tool: &str, expected: Option<(&[&str], Body)>) {
         assert_eq!(body_arg(tool), expected);
@@ -435,6 +446,27 @@ mod tests {
             &[r#"{"filePath": "a.rs", "content": "fn "#, r#"x() {}"}"#],
         );
         assert_eq!(decoded, "fn x() {}");
+    }
+
+    #[test]
+    fn a_note_is_decoded_past_the_arguments_that_precede_it() {
+        let decoded = published(
+            MEMORY,
+            &[
+                r##"{"command": "write", "path": "a.md", "tags": ["x"], "content": "# T"##,
+                r#"itle\nbody"}"#,
+            ],
+        );
+        assert_eq!(decoded, "# Title\nbody");
+    }
+
+    /// The reader is built for every command of a tool that has one body
+    /// argument, and the commands without it decode nothing.
+    #[test]
+    fn a_command_with_no_body_publishes_nothing() {
+        let mut stream = BodyStream::new(MEMORY).unwrap();
+        assert_eq!(stream.absorb(r#"{"command": "list", "tags": ["x"]}"#), None);
+        assert_eq!(stream.lines(), 1);
     }
 
     /// A heredoc is the case the header could never show: the newlines it is

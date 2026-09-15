@@ -20,6 +20,9 @@ pub const READ_DESCRIPTION: &str = "Read a client-owned plan or memory document 
 pub const WRITE_DESCRIPTION: &str = "Replace a client-owned plan or memory document by opaque reference. Available only for remote workspace sessions; it never accepts an arbitrary path.";
 pub const PATCH_DESCRIPTION: &str = "Apply exact text replacements to a client-owned plan or memory document by opaque reference. Requires the revision returned by the latest read and rejects stale edits.";
 
+const WRITE_RECEIPT: &str = "local document written";
+const PATCH_RECEIPT: &str = "local document patched";
+
 pub struct LocalDocumentRead;
 pub struct LocalDocumentWrite;
 pub struct LocalDocumentApplyPatch;
@@ -157,16 +160,12 @@ struct LocalDocumentCall {
 }
 
 impl ToolInvocation for LocalDocumentCall {
+    /// The document, not what is being done to it: each operation is its own
+    /// tool, so the row's own label already carries the verb and inflects it.
+    /// Naming only the document is also what the arguments can say mid-stream,
+    /// which is what keeps the streaming row and the settled one the same row.
     fn start_header(&self) -> HeaderFuture {
-        let operation = match self.operation {
-            Operation::Read => "read",
-            Operation::Write { .. } => "write",
-            Operation::Patch { .. } => "apply patch",
-        };
-        HeaderFuture::Ready(HeaderResult::plain(format!(
-            "{operation} {}",
-            reference_label(&self.reference)
-        )))
+        HeaderFuture::Ready(HeaderResult::plain(reference_label(&self.reference)))
     }
 
     fn local_document_target(&self) -> Option<&LocalDocumentRef> {
@@ -220,7 +219,20 @@ impl ToolInvocation for LocalDocumentCall {
             let result = execute(&self, ctx);
             match result {
                 Ok((output, revision)) => {
-                    let mut result = ToolExecResult::from(Ok(ToolOutput::Plain(output.into())));
+                    // A write's reply is a receipt. The document is what the
+                    // reader came for, and the model already has it, so the
+                    // card keeps the document and only the receipt goes back.
+                    let written = match &self.operation {
+                        Operation::Write { content } if !content.trim().is_empty() => Some(content),
+                        _ => None,
+                    };
+                    let mut result = match written {
+                        Some(content) => {
+                            ToolExecResult::from(Ok(ToolOutput::Markdown(content.as_str().into())))
+                                .with_model_output(Some(output))
+                        }
+                        None => ToolExecResult::from(Ok(ToolOutput::Plain(output.into()))),
+                    };
                     result.annotation = Some(if matches!(self.operation, Operation::Read) {
                         format!("revision {}", revision.as_str())
                     } else {
@@ -281,13 +293,13 @@ fn execute(
             let revision = store
                 .write(project, session_id, &call.reference, content)
                 .map_err(|error| error.to_string())?;
-            Ok(("local document written".to_owned(), revision))
+            Ok((WRITE_RECEIPT.to_owned(), revision))
         }
         Operation::Patch { revision, edits } => {
             let revision = store
                 .apply_patch(project, session_id, &call.reference, revision, edits)
                 .map_err(|error| error.to_string())?;
-            Ok(("local document patched".to_owned(), revision))
+            Ok((PATCH_RECEIPT.to_owned(), revision))
         }
     }
 }
@@ -398,6 +410,7 @@ mod tests {
     const PROJECT: &str = "project-a";
     const PLAN: &str = "finished plan";
     const WRONG_OWNER: &str = "local document does not belong to this project or session";
+    const RENDERED: &str = "the reader sees the document, the model sees the receipt";
 
     fn workspace() -> WorkspaceSession {
         workspace_for_principal("principal")
@@ -440,26 +453,53 @@ mod tests {
         WorkspaceSession::new(handle, binding, cursor).expect("workspace session")
     }
 
+    /// A remote session with an empty plan in it, which every document call
+    /// needs before it can say anything at all.
+    struct Remote {
+        root: tempfile::TempDir,
+        registry: Arc<ToolRegistry>,
+        ctx: crate::tools::ToolContext,
+        store: Arc<LocalDocumentStore>,
+        plan: PlanRef,
+    }
+
+    fn remote() -> Remote {
+        let root = tempfile::tempdir().expect("tempdir");
+        let workspace = workspace();
+        let session_id = SessionRef::generate();
+        let store = Arc::new(LocalDocumentStore::remote(
+            StateDir::from_path(root.path().join("state")),
+            workspace.binding(),
+        ));
+        let plan = store
+            .create_plan(workspace.binding().project().key(), session_id.as_str())
+            .expect("create plan");
+        let registry = Arc::new(ToolRegistry::new());
+        crate::tools::native::register(&registry).expect("register native tools");
+        let mut ctx = stub_ctx(&AgentMode::RemotePlan(plan.clone()));
+        ctx.registry = Arc::clone(&registry);
+        ctx.session_id = Some(session_id);
+        ctx.workspace_session = Some(workspace);
+        ctx.local_documents = Some(Arc::clone(&store));
+        Remote {
+            root,
+            registry,
+            ctx,
+            store,
+            plan,
+        }
+    }
+
     #[test]
     fn remote_plan_write_is_typed_and_completable_without_a_host_path() {
         smol::block_on(async {
-            let root = tempfile::tempdir().expect("tempdir");
-            let workspace = workspace();
-            let session_id = SessionRef::generate();
-            let store = Arc::new(LocalDocumentStore::remote(
-                StateDir::from_path(root.path().join("state")),
-                workspace.binding(),
-            ));
-            let plan = store
-                .create_plan(workspace.binding().project().key(), session_id.as_str())
-                .expect("create plan");
-            let registry = Arc::new(ToolRegistry::new());
-            crate::tools::native::register(&registry).expect("register native tools");
-            let mut ctx = stub_ctx(&AgentMode::RemotePlan(plan.clone()));
-            ctx.registry = Arc::clone(&registry);
-            ctx.session_id = Some(session_id);
-            ctx.workspace_session = Some(workspace);
-            ctx.local_documents = Some(Arc::clone(&store));
+            let Remote {
+                root,
+                registry,
+                ctx,
+                store,
+                plan,
+            } = remote();
 
             let done = run(
                 &registry,
@@ -544,6 +584,50 @@ mod tests {
                 "approved plan"
             );
         });
+    }
+
+    /// A write's reply is a receipt, so rendering it renders nothing. The
+    /// document is what the reader came for, and the model wrote it and does
+    /// not need it back.
+    #[test]
+    fn a_document_write_renders_the_document_and_replies_with_the_receipt() {
+        smol::block_on(async {
+            // Held whole: the struct owns the temporary directory every call
+            // in it reads from.
+            let remote = remote();
+            let plan = remote.plan.clone();
+            let done = run(
+                &remote.registry,
+                None,
+                "call".into(),
+                LOCAL_DOCUMENT_WRITE_TOOL_NAME,
+                &json!({"kind": "plan", "reference": plan.as_str(), "content": PLAN}),
+                &remote.ctx,
+                Emit::Silent,
+            )
+            .await;
+            assert!(!done.is_error, "{}", done.output.as_text());
+            assert!(matches!(done.output, ToolOutput::Markdown(_)), "{RENDERED}");
+            assert_eq!(done.output.as_text(), PLAN, "{RENDERED}");
+            assert_eq!(done.model_output.as_deref(), Some(WRITE_RECEIPT), "{RENDERED}");
+            // The marker the transcript recognises a plan write by has to
+            // survive the change of output type.
+            assert!(done.wrote_document(&LocalDocumentRef::Plan(plan)));
+        });
+    }
+
+    /// Each operation is its own tool, so the row's label carries the verb and
+    /// the header carries only what the verb is being applied to.
+    #[test]
+    fn a_document_header_names_the_document_and_not_the_operation() {
+        let plan = PlanRef::new("abc".to_owned()).expect("plan reference");
+        let header = LocalDocumentWrite
+            .parse(&json!({"kind": "plan", "reference": plan.as_str(), "content": PLAN}))
+            .expect("a well-formed write")
+            .start_header()
+            .into_ready()
+            .text();
+        assert_eq!(header, format!("plan {}", plan.as_str()));
     }
 
     #[test_case(LOCAL_DOCUMENT_READ_TOOL_NAME; "document_read")]

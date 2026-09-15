@@ -1569,6 +1569,25 @@ fn a_streamed_write_to_a_markdown_file_draws_the_document() {
     assert!(!shown.contains(HEADING.trim_end()), "{shown}");
 }
 
+/// A note arrives under a header that names a sub-command rather than a path,
+/// so what draws it as a document is the tool, and what puts its verb in the
+/// present tense is the row.
+#[test]
+fn a_streamed_note_draws_the_document_under_a_conjugated_header() {
+    const HEADER: &str = "write render-loop-perf.md";
+    const CONJUGATED: &str = "writing render-loop-perf.md";
+    const HEADING: &str = "# Title\n";
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.tool_pending(TOOL_ID.into(), MEMORY_TOOL_NAME);
+    panel.tool_input_preview(TOOL_ID, Some(HEADER.into()), None);
+    panel.tool_input_body(TOOL_ID, Some(HEADING.into()));
+
+    let shown = buffer_text(&render(&mut panel, 80, 24));
+    assert!(shown.contains(CONJUGATED), "{shown}");
+    assert!(shown.contains("Title"), "{shown}");
+    assert!(!shown.contains(HEADING.trim_end()), "{shown}");
+}
+
 #[test]
 fn a_streamed_write_grows_in_the_card() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());

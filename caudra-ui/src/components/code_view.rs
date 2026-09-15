@@ -13,7 +13,7 @@ use crate::theme;
 use super::tool_display::{
     ScrollTail, TREE_BRANCH, TREE_GAP, TREE_LAST, TREE_TRUNK, activity_child_spans,
     activity_detail, activity_label, activity_sigil, batch_sigil_style, compact_args_for,
-    compact_sigil_label, header_spans, names_tool, scroll_footer_text,
+    compact_sigil_label, header_spans, inflected_header, names_tool, scroll_footer_text,
 };
 use super::{ToolProgress, environment_card, is_collapsible, workflow_card};
 use caudra_agent::tools::{PYTHON_EXECUTION_TOOL_NAME, SHELL_TOOL_NAME, TASK_TOOL_NAME};
@@ -899,13 +899,15 @@ fn render_batch(entries: &[BatchToolEntry], highlight: bool, limits: &RenderLimi
             true => (TREE_LAST, TREE_GAP),
             false => (TREE_BRANCH, TREE_TRUNK),
         };
-        let (sigil, label) = compact_sigil_label(&entry.tool, entry.status.into());
+        let tense = entry.status.into();
+        let (sigil, label) = compact_sigil_label(&entry.tool, tense);
+        let inflected = inflected_header(&entry.tool, &entry.summary, tense);
         // Once the body carries the script, the row keeps only what the body
         // does not say. The same trade a card's header makes, and for the same
         // reason: the body's copy is the numbered, highlighted one.
         let summary = match has_body && body_repeats_summary(entry) {
             true => "",
-            false => entry.summary.as_str(),
+            false => &inflected,
         };
         let gap = if summary.is_empty() { "" } else { " " };
         let mut spans = vec![

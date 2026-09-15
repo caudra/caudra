@@ -192,7 +192,10 @@ impl PendingInput {
             self.settled = tool_preview::past_scan_cap(self.json.len());
             return None;
         };
-        self.settled = preview.complete;
+        // A preview built from several arguments need never complete: the last
+        // of them can trail a body long enough to outrun the scan. Giving up at
+        // the cap is what keeps the buffer from following the body.
+        self.settled = preview.complete || tool_preview::past_scan_cap(self.json.len());
         if self.settled {
             self.json = String::new();
         }
@@ -1465,6 +1468,7 @@ mod tests {
     const BATCH: &str = "batch";
     const READ: &str = "file_read";
     const SHELL: &str = "shell";
+    const MEMORY: &str = "memory";
     /// A body long enough to cross the first step and reach the second.
     const STEPPED_LINES: usize = 9;
     const THRESHOLD_LINES: usize = 4;
@@ -1849,6 +1853,32 @@ mod tests {
     #[test]
     fn a_tool_with_no_body_publishes_none() {
         assert!(published_body(READ, &[r#"{"filePath": "a.rs"}"#]).is_empty());
+    }
+
+    /// A note is drawn while it arrives, and the row it is drawn under is the
+    /// row the call settles on rather than a prefix of it.
+    #[test]
+    fn a_note_is_published_under_the_header_it_will_settle_on() {
+        let fragments = [
+            r#"{"command": "write", "path": "notes.md", "content": "one"#,
+            r#"\ntwo"}"#,
+        ];
+        assert_eq!(published_body(MEMORY, &fragments), "one\ntwo");
+        assert_eq!(
+            previews(MEMORY, &fragments).last().map(String::as_str),
+            Some("write notes.md")
+        );
+    }
+
+    /// A preview built from several arguments need never complete, so the
+    /// buffer feeding it is given up on the way one that never appears is.
+    #[test]
+    fn a_composite_preview_stops_buffering_past_the_scan_cap() {
+        let mut pending = PendingInput::new(TOOL_ID.into(), MEMORY.into(), false);
+        pending.absorb(r#"{"command": "write", "content": ""#);
+        pending.absorb(&"x".repeat(tool_preview::PREVIEW_SCAN_CAP));
+        assert!(pending.settled);
+        assert!(pending.json.is_empty());
     }
 
     /// The header is one space-joined line, so the body is the only thing that

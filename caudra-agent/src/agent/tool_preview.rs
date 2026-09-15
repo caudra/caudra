@@ -14,34 +14,42 @@ const PREVIEW_MAX_CHARS: usize = 160;
 /// A key that has not appeared by here is not going to be the headline, and
 /// rescanning a growing file body on every delta is what this bound exists to
 /// prevent.
-const PREVIEW_SCAN_CAP: usize = 8 * 1024;
+pub(super) const PREVIEW_SCAN_CAP: usize = 8 * 1024;
 /// What separates a server or namespace from the tool it qualifies.
 const QUALIFIER: [char; 3] = ['_', '.', '-'];
 const ELLIPSIS: char = '…';
 
-/// The argument each tool leads with. Matched ignoring case and underscores,
-/// so one spelling covers Workcell's camelCase wire names and the snake_case
-/// the native tools use.
-const PREVIEW_KEYS: &[(&str, &str)] = &[
-    ("file_read", "filePath"),
-    ("file_write", "filePath"),
-    ("file_edit", "filePath"),
-    ("file_index", "path"),
-    ("view_image", "path"),
-    ("file_glob", "pattern"),
-    ("file_grep", "pattern"),
-    ("shell", "command"),
-    ("memory", "command"),
-    ("websearch", "query"),
-    ("webfetch", "url"),
-    ("task", "description"),
-    ("skill", "name"),
-    ("workflow", "action"),
-    ("code_map", "path"),
-    ("code_context", "task"),
-    ("code_refs", "symbol"),
-    ("code_impact", "symbol"),
-    ("code_expand", "symbol"),
+/// The arguments each tool leads with, in the order its finished header spells
+/// them. Matched ignoring case and underscores, so one spelling covers
+/// Workcell's camelCase wire names and the snake_case the native tools use.
+///
+/// Most tools lead with one argument. A tool reached by sub-command leads with
+/// two, because its verb is an argument and the thing it acts on is another;
+/// naming both is what lets the row it draws mid-stream be the row it settles
+/// on rather than a prefix of it.
+const PREVIEW_KEYS: &[(&str, &[&str])] = &[
+    ("file_read", &["filePath"]),
+    ("file_write", &["filePath"]),
+    ("file_edit", &["filePath"]),
+    ("file_index", &["path"]),
+    ("view_image", &["path"]),
+    ("file_glob", &["pattern"]),
+    ("file_grep", &["pattern"]),
+    ("shell", &["command"]),
+    ("memory", &["command", "path"]),
+    ("local_document_read", &["kind", "reference"]),
+    ("local_document_write", &["kind", "reference"]),
+    ("local_document_apply_patch", &["kind", "reference"]),
+    ("websearch", &["query"]),
+    ("webfetch", &["url"]),
+    ("task", &["description"]),
+    ("skill", &["name"]),
+    ("workflow", &["action"]),
+    ("code_map", &["path"]),
+    ("code_context", &["task"]),
+    ("code_refs", &["symbol"]),
+    ("code_impact", &["symbol"]),
+    ("code_expand", &["symbol"]),
 ];
 
 /// Tools that lead with a blob or an aggregate. There is nothing short to show
@@ -86,16 +94,24 @@ const SIZE_STEP_LINES: usize = 5;
 const SIZE_SUFFIX: &str = "+ lines";
 
 enum Rule {
-    Key(&'static str),
+    Keys(&'static [&'static str]),
     Suppressed,
     Generic,
 }
 
 pub(crate) struct Preview {
     pub(crate) text: String,
-    /// The value's closing quote arrived, so it will not grow again and the
-    /// caller can stop scanning.
+    /// Every argument the preview is built from has arrived whole, so it will
+    /// not grow again and the caller can stop scanning.
     pub(crate) complete: bool,
+}
+
+/// One member a scan asked for, as far as it has arrived.
+struct Found {
+    key: String,
+    value: String,
+    /// The value's closing quote arrived.
+    complete: bool,
 }
 
 /// Compares tool and argument names the way the wire spells them: `filePath`,
@@ -123,8 +139,8 @@ pub(super) fn candidates(tool: &str) -> impl Iterator<Item = &str> {
 
 fn rule(tool: &str) -> Rule {
     for rest in candidates(tool) {
-        if let Some((_, key)) = PREVIEW_KEYS.iter().find(|(name, _)| same_key(name, rest)) {
-            return Rule::Key(key);
+        if let Some((_, keys)) = PREVIEW_KEYS.iter().find(|(name, _)| same_key(name, rest)) {
+            return Rule::Keys(keys);
         }
         if NO_PREVIEW.iter().any(|name| same_key(name, rest)) {
             return Rule::Suppressed;
@@ -140,29 +156,48 @@ pub(crate) fn size_label(lines: usize) -> Option<String> {
 }
 
 /// The preview for `tool` given everything of its argument JSON that has
-/// arrived. `None` while the headline key is still unwritten, and for every
-/// tool that has no headline to show.
+/// arrived, its headline arguments joined in the order the table names them.
+/// `None` while every one of them is still unwritten, and for every tool that
+/// has no headline to show.
+///
+/// A member the object never declares is not a member still being written, so
+/// the closing brace is what lets a call that omits one of its headline
+/// arguments settle rather than be rescanned to the cap.
 pub(crate) fn preview_for(tool: &str, json: &str) -> Option<Preview> {
-    let wanted = match rule(tool) {
+    // An unknown tool is previewed by the first argument that is not a
+    // payload: one slot, filled by predicate rather than by name.
+    let keys: &[&str] = match rule(tool) {
         Rule::Suppressed => return None,
-        Rule::Key(key) => Some(key),
-        Rule::Generic => None,
+        Rule::Keys(keys) => keys,
+        Rule::Generic => &[],
     };
-    let matches = |found: &str| match wanted {
-        Some(key) => same_key(found, key),
-        None => !BLOB_KEYS.iter().any(|blob| same_key(blob, found)),
+    let slot = |found: &str| match keys.is_empty() {
+        true => (!BLOB_KEYS.iter().any(|blob| same_key(blob, found))).then_some(0),
+        false => keys.iter().position(|key| same_key(key, found)),
     };
+    let (found, closed) = Scanner::new(capped(json)).find_strings(keys.len().max(1), slot)?;
 
-    let (key, value, complete) = Scanner::new(capped(json)).find_string(matches)?;
-    // Shortened even while it is still being typed: `strip_prefix` matches
-    // whole components, so a half-written path either shortens correctly or
-    // stays as it came.
-    let value = match PATH_KEYS.iter().any(|path| same_key(path, &key)) {
-        true => relative_path(&value),
-        false => value,
-    };
-    let text = tidy(&value);
-    (!text.is_empty()).then_some(Preview { text, complete })
+    let mut text = String::new();
+    let mut every = true;
+    for slot in found.iter().flatten() {
+        if !text.is_empty() {
+            text.push(' ');
+        }
+        // Shortened even while it is still being typed: `strip_prefix` matches
+        // whole components, so a half-written path either shortens correctly or
+        // stays as it came.
+        match PATH_KEYS.iter().any(|path| same_key(path, &slot.key)) {
+            true => text.push_str(&relative_path(&slot.value)),
+            false => text.push_str(&slot.value),
+        }
+        every &= slot.complete;
+    }
+    every &= found.iter().all(Option::is_some);
+    let text = tidy(&text);
+    (!text.is_empty()).then_some(Preview {
+        text,
+        complete: closed || every,
+    })
 }
 
 /// Whether the caller can stop feeding a buffer that has produced no preview.
@@ -174,8 +209,9 @@ pub(crate) fn past_scan_cap(len: usize) -> bool {
 /// closing quote arrived. `None` while the member is unwritten, or once an
 /// earlier value stops the scan short of it.
 pub(super) fn string_member(json: &str, key: &str) -> Option<(String, bool)> {
-    let (_, value, complete) = Scanner::new(json).find_string(|found| same_key(found, key))?;
-    Some((value, complete))
+    let (found, _) = Scanner::new(json).find_strings(1, |name| same_key(name, key).then_some(0))?;
+    let found = found.into_iter().flatten().next()?;
+    Some((found.value, found.complete))
 }
 
 /// Everything that has arrived of the object value of the first top-level
@@ -284,31 +320,44 @@ impl<'a> Scanner<'a> {
         }
     }
 
-    /// The first top-level `"key": "value"` whose key satisfies `matches`,
-    /// with whether the value's closing quote arrived. Scanning stops at the
-    /// first string value that is both unwanted and unfinished, because
-    /// nothing can follow it yet.
-    fn find_string(&mut self, matches: impl Fn(&str) -> bool) -> Option<(String, String, bool)> {
+    /// The top-level string members `slot` places, each in the position it was
+    /// given, with whether the object's closing brace arrived. Scanning stops
+    /// once every slot holds a finished value, and at the first string value
+    /// that is both unplaced and unfinished, because nothing can follow it yet.
+    /// `None` only when the prefix holds no object at all.
+    fn find_strings(
+        &mut self,
+        slots: usize,
+        slot: impl Fn(&str) -> Option<usize>,
+    ) -> Option<(Vec<Option<Found>>, bool)> {
         self.skip_ws();
         if !self.eat('{') {
             return None;
         }
+        let mut found: Vec<Option<Found>> = (0..slots).map(|_| None).collect();
         while let Some(key) = self.next_key() {
-            if self.peek()? == '"' {
-                self.bump();
-                let mut value = String::new();
-                let complete = self.read_string(&mut value);
-                if matches(&key) {
-                    return Some((key, value, complete));
-                }
-                if !complete {
-                    return None;
-                }
-            } else {
+            let Some(c) = self.peek() else {
+                return Some((found, false));
+            };
+            if c != '"' {
                 self.skip_value();
+                continue;
+            }
+            self.bump();
+            let mut value = String::new();
+            let complete = self.read_string(&mut value);
+            if let Some(index) = slot(&key) {
+                found[index] = Some(Found {
+                    key,
+                    value,
+                    complete,
+                });
+            }
+            if !complete || found.iter().all(Option::is_some) {
+                return Some((found, false));
             }
         }
-        None
+        Some((found, self.peek() == Some('}')))
     }
 
     /// Where the object value of the first member satisfying `matches` opens.
@@ -406,6 +455,7 @@ mod tests {
 
     const EDIT: &str = "file_edit";
     const SHELL: &str = "shell";
+    const MEMORY: &str = "memory";
 
     fn text_of(tool: &str, json: &str) -> Option<String> {
         preview_for(tool, json).map(|p| p.text)
@@ -430,8 +480,23 @@ mod tests {
     #[test_case("some_plugin_tool", r#"{"target": "thing""#, Some("thing") ; "unknown_tool_fallback")]
     #[test_case("some_plugin_tool", r#"{"content": "a whole file""#, None ; "unknown_tool_skips_blob_key")]
     #[test_case("file_glob", r#"{"pattern": "**/*.rs""#, Some("**/*.rs") ; "glob_pattern")]
+    #[test_case(MEMORY, r#"{"command": "write", "path": "a.md""#, Some("write a.md") ; "both_headline_arguments")]
+    #[test_case(MEMORY, r#"{"path": "a.md", "command": "write""#, Some("write a.md") ; "joined_in_table_order_not_arrival_order")]
+    #[test_case(MEMORY, r#"{"command": "list""#, Some("list") ; "one_of_two_arguments")]
+    #[test_case("local_document_write", r#"{"kind": "plan", "reference": "abc""#, Some("plan abc") ; "a_document_is_named_by_kind_and_reference")]
     fn preview_text(tool: &str, json: &str, expected: Option<&str>) {
         assert_eq!(text_of(tool, json).as_deref(), expected);
+    }
+
+    /// A member the object never declares is not one still being written, so a
+    /// call that omits a headline argument settles at the closing brace
+    /// instead of being rescanned to the cap.
+    #[test_case(r#"{"command": "list""#, false ; "still_open")]
+    #[test_case(r#"{"command": "list"}"#, true ; "closed_without_the_second")]
+    #[test_case(r#"{"command": "write", "path": "a.md""#, true ; "both_arrived_whole")]
+    #[test_case(r#"{"command": "write", "path": "a.m"#, false ; "second_still_arriving")]
+    fn a_composite_preview_settles_when_it_cannot_grow(json: &str, expected: bool) {
+        assert_eq!(preview_for(MEMORY, json).unwrap().complete, expected);
     }
 
     #[test]

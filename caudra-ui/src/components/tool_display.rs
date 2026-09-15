@@ -32,8 +32,8 @@ use caudra_agent::{
     SnapshotSpan, SpanStyle, SubagentActivity, SubagentProgress, ToolInput, ToolOutput,
     format_live_duration, format_settled_duration,
     tools::{
-        FILE_READ_TOOL_NAME, FILE_WRITE_TOOL_NAME, PYTHON_EXECUTION_TOOL_NAME, SHELL_TOOL_NAME,
-        humanize_duration,
+        FILE_READ_TOOL_NAME, FILE_WRITE_TOOL_NAME, LOCAL_DOCUMENT_WRITE_TOOL_NAME,
+        MEMORY_TOOL_NAME, PYTHON_EXECUTION_TOOL_NAME, SHELL_TOOL_NAME, humanize_duration,
     },
 };
 use ratatui::style::{Color, Modifier, Style};
@@ -165,6 +165,11 @@ const COMPACT_ARG_LIMIT: usize = 3;
 const COMPACT_ARG_MAX_CHARS: usize = 40;
 const ELLIPSIS: char = '…';
 const EDIT_KEYS: &[&str] = &["file_path", "old_string", "new_string"];
+/// A local document is addressed by kind and opaque reference, which together
+/// are its header.
+const DOCUMENT_KEYS: &[&str] = &["kind", "reference"];
+/// The same, plus the document itself, which the card's body carries.
+const DOCUMENT_WRITE_KEYS: &[&str] = &["kind", "reference", "content"];
 const READ_RESULT_KEYS: &[&str] = &["offset", "limit"];
 /// Extensions whose file is worth more rendered than quoted.
 const MARKDOWN_EXTENSIONS: &[&str] = &["md", "markdown", "mdx"];
@@ -183,6 +188,11 @@ const QUERY_KEYS: &[(&str, &str)] = &[
 /// it as numbered lines whole, so it is rendered here the way the settled card
 /// renders it and never through the window their output is drawn in.
 const LIVE_SCRIPT_TOOLS: &[&str] = &[SHELL_TOOL_NAME, PYTHON_EXECUTION_TOOL_NAME];
+/// The tools whose streaming body is a document however it is named. Both
+/// settle to rendered markdown, and one of them is named by an opaque
+/// reference with no extension to read, so the tool is what says so rather
+/// than the header.
+const LIVE_MARKDOWN_TOOLS: &[&str] = &[MEMORY_TOOL_NAME, LOCAL_DOCUMENT_WRITE_TOOL_NAME];
 const MILLIS_PER_SECOND: u64 = 1_000;
 const DURATION_SEPARATOR: &str = " · ";
 
@@ -290,6 +300,17 @@ const EXPAND: Inflection = ("Expand", "Expanding", "Expanded");
 const MEMORY: Inflection = ("Memory", "Memory", "Memory");
 const SESSIONS: Inflection = ("Sessions", "Sessions", "Sessions");
 
+/// The verbs a store's header opens with. A tool reached by sub-command is the
+/// one case where the label cannot carry the tense, because the verb is an
+/// argument and varies per call; the header carries it instead, and the tool
+/// emits the plain form once for the row to conjugate.
+const MEMORY_COMMANDS: &[(&str, Inflection)] = &[
+    ("list", ("list", "listing", "listed")),
+    ("read", ("read", "reading", "read")),
+    ("write", ("write", "writing", "wrote")),
+    ("delete", ("delete", "deleting", "deleted")),
+];
+
 /// Header keys are matched ignoring case and underscores, so one spelling
 /// covers Workcell's camelCase wire names and the snake_case the legacy tools
 /// still carry in restored sessions.
@@ -321,8 +342,13 @@ const COMPACT_TOOLS: &[(&str, CompactTool)] = &[
     tool_row("todo_write", '✓', UPDATE, &["todos"]),
     tool_row("skill", '→', LOAD, &["name"]),
     tool_row("question", '?', ASK, &["questions"]),
-    tool_row("memory", '▤', MEMORY, &["content"]),
+    // `command` is folded by name rather than left to the containment check,
+    // because the header spells the verb in a tense the argument never had.
+    tool_row("memory", '▤', MEMORY, &["content", "command", "path"]),
     tool_row("sessions", '▤', SESSIONS, &[]),
+    tool_row("local_document_read", '→', READ, DOCUMENT_KEYS),
+    tool_row("local_document_write", '←', WRITE, DOCUMENT_WRITE_KEYS),
+    tool_row("local_document_apply_patch", '±', PATCH, DOCUMENT_KEYS),
     tool_row("view_image", '→', VIEW, &["path"]),
     tool_row("image_generate", '←', DRAW, &["out", "prompt"]),
 ];
@@ -468,15 +494,17 @@ pub(super) fn activity_sigil(activity: &SubagentActivity) -> Option<char> {
 /// then the tense the child's status puts the verb in.
 pub(super) fn activity_child_spans(child: &ActivityChild, prefix: String) -> Vec<Span<'static>> {
     let theme = theme::current();
-    let (sigil, label) = compact_sigil_label(&child.tool, child.status.into());
+    let tense = Tense::from(child.status);
+    let (sigil, label) = compact_sigil_label(&child.tool, tense);
     let mut spans = vec![
         Span::styled(prefix, theme.tool_dim),
         Span::styled(format!("{sigil} "), batch_sigil_style(child.status, None)),
         Span::styled(label.to_owned(), theme.tool_prefix),
     ];
     if !child.summary.is_empty() {
+        let summary = inflected_header(&child.tool, &child.summary, tense);
         spans.push(Span::styled(
-            format!(" {}", escape_terminal_controls(&child.summary)),
+            format!(" {}", escape_terminal_controls(&summary)),
             theme.tool_dim,
         ));
     }
@@ -490,6 +518,28 @@ fn capitalized(label: &str) -> String {
     rest.next().map_or_else(String::new, |first| {
         first.to_uppercase().chain(rest).collect()
     })
+}
+
+/// The header with its leading verb put in `tense`, borrowed unchanged for
+/// every tool that does not open with one. Only a whole leading word is
+/// replaced, so a note called `write-ups.md` keeps its name.
+pub(super) fn inflected_header<'a>(tool: &str, header: &'a str, tense: Tense) -> Cow<'a, str> {
+    if !names_tool(MEMORY_TOOL_NAME, tool) {
+        return Cow::Borrowed(header);
+    }
+    let (verb, rest) = header.split_once(' ').unwrap_or((header, ""));
+    let Some((_, inflection)) = MEMORY_COMMANDS.iter().find(|(name, _)| *name == verb) else {
+        return Cow::Borrowed(header);
+    };
+    let conjugated = match tense {
+        Tense::Plain => inflection.0,
+        Tense::Present => inflection.1,
+        Tense::Past => inflection.2,
+    };
+    match rest.is_empty() {
+        true => Cow::Borrowed(conjugated),
+        false => Cow::Owned(format!("{conjugated} {rest}")),
+    }
 }
 
 /// How a tool introduces itself on a one-line row. A name the table has never
@@ -1115,7 +1165,9 @@ impl ToolLineBuilder {
         output: Option<&ToolOutput>,
         raw_input: Option<&serde_json::Value>,
     ) {
-        let (sigil, label) = compact_sigil_label(tool_name, self.indicator.into());
+        let tense = Tense::from(self.indicator);
+        let (sigil, label) = compact_sigil_label(tool_name, tense);
+        let header = &*inflected_header(tool_name, header, tense);
         self.sigil = sigil;
         // An omitted header leaves the label against the annotation, so the
         // separator goes with the text it separates.
@@ -1169,8 +1221,10 @@ impl ToolLineBuilder {
         raw_input: Option<&serde_json::Value>,
         output: Option<&ToolOutput>,
     ) {
+        let tense = Tense::from(self.indicator);
         let row = compact_row(tool_name);
-        let label = row.map_or(tool_name, |(_, entry)| entry.label(self.indicator.into()));
+        let label = row.map_or(tool_name, |(_, entry)| entry.label(tense));
+        let header = &*inflected_header(tool_name, header, tense);
         self.sigil = row.map_or(COMPACT_FALLBACK_SIGIL, |(_, entry)| entry.sigil);
 
         let mut copy = format!("{label} {header}");
@@ -1412,13 +1466,17 @@ impl ToolLineBuilder {
     /// belongs to has no output yet and its arguments are the only record of
     /// what it is about to do.
     ///
-    /// `path` is what the header has said so far, which is all a still-arriving
-    /// write has said about itself, and it cannot say whether that path already
-    /// exists. So a document is drawn the way a *created* file settles, and an
-    /// overwrite changes at settle time into the diff of what it replaced.
-    /// What does not change is the card's window: a write 800 lines long does
-    /// not push the transcript down 800 rows on its way past.
-    fn push_live_body(&mut self, body: &str, path: &str) {
+    /// All a still-arriving write has said about itself is its header, and a
+    /// header cannot say whether the path it names already exists. So a
+    /// document is drawn the way a *created* file settles, and an overwrite
+    /// changes at settle time into the diff of what it replaced. What does not
+    /// change is the card's window: a write 800 lines long does not push the
+    /// transcript down 800 rows on its way past.
+    ///
+    /// `markdown` is [`draws_live_markdown`], decided by the caller because a
+    /// body is drawn the way its settled card will draw it and only the caller
+    /// knows which tool is writing.
+    fn push_live_body(&mut self, body: &str, markdown: bool) {
         self.source.abandon();
         let start = self.lines.len();
         let (windowed, scrolled) = match self.limits.scroll {
@@ -1428,7 +1486,7 @@ impl ToolLineBuilder {
             }
             None => (Cow::Borrowed(body), None),
         };
-        if renders_as_markdown(path) {
+        if markdown {
             self.push_markdown_body(&windowed);
         } else {
             for mut line in code_view::render_live_body(&windowed, self.body_width()) {
@@ -1839,6 +1897,17 @@ pub(super) fn draws_live_script(tool_name: &str) -> bool {
         .any(|known| names_tool(known, tool_name))
 }
 
+/// Whether a still-arriving body is drawn as the document it is rather than as
+/// its source. A tool that settles to rendered markdown says so by name, since
+/// its header is a sub-command or an opaque reference and has no extension to
+/// read; everything else is judged by the path the header has spelled so far.
+fn draws_live_markdown(tool_name: &str, header: &str) -> bool {
+    LIVE_MARKDOWN_TOOLS
+        .iter()
+        .any(|known| names_tool(known, tool_name))
+        || renders_as_markdown(header)
+}
+
 /// A shell call's clock: wall time while it runs, and the command's own
 /// measured time once it lands, which leaves out the dispatch either side of
 /// it and so can step down slightly on settle.
@@ -1947,7 +2016,7 @@ pub fn build_tool_lines(
     }
     match live {
         Some(live) if draws_live_script(tool_name) => b.push_live_script(live),
-        Some(live) => b.push_live_body(live, header),
+        Some(live) => b.push_live_body(live, draws_live_markdown(tool_name, header)),
         None => b.push_code_content(
             msg.tool_input.as_deref(),
             match msg.render_snapshot.is_some() {
@@ -2414,6 +2483,82 @@ mod tests {
         let text = lines_text(&tl);
         assert!(text.contains(HEADING_TEXT), "{text}");
         assert_eq!(text.contains(HEADING_SOURCE), keeps_markers, "{text}");
+    }
+
+    const MEMORY_NOTE: &str = "render-loop-perf.md";
+    /// A note whose name the extension rule cannot judge, which is the case
+    /// the tool has to answer for.
+    const UNEXTENDED_NOTE: &str = "draft";
+
+    fn memory_msg(header: &str, live_body: Option<&str>, status: ToolStatus) -> DisplayMessage {
+        DisplayMessage {
+            role: DisplayRole::Tool(Box::new(ToolRole {
+                id: "t1".into(),
+                effect: ToolEffect::Unknown,
+                status,
+                name: MEMORY_TOOL_NAME.into(),
+            })),
+            text: header.into(),
+            ..write_msg(header, live_body, None)
+        }
+    }
+
+    fn open_card(msg: &DisplayMessage, status: ToolStatus) -> String {
+        lines_text(&build_tool_lines(
+            msg,
+            status,
+            &test_rctx(80),
+            Some(Disclosure::default()),
+        ))
+    }
+
+    /// A note settles into a rendered document, so the body drawn while it
+    /// arrives has to be that document too. Its header is a sub-command and
+    /// an opaque name, so the tool answers for it rather than the extension.
+    #[test_case(MEMORY_NOTE ; "a_name_the_extension_rule_would_pass")]
+    #[test_case(UNEXTENDED_NOTE ; "a_name_the_extension_rule_would_fail")]
+    fn a_streaming_note_is_drawn_as_a_document(note: &str) {
+        let msg = memory_msg(
+            &format!("write {note}"),
+            Some(HEADING_SOURCE),
+            ToolStatus::InProgress,
+        );
+        let text = open_card(&msg, ToolStatus::InProgress);
+        assert!(text.contains(HEADING_TEXT), "{text}");
+        assert!(!text.contains(HEADING_SOURCE), "{text}");
+    }
+
+    /// A store's verb is an argument, so the label cannot carry the tense and
+    /// the header does. The past tense asserts the call happened, which is why
+    /// a failed write claims only the plain verb.
+    #[test_case(ToolStatus::InProgress, "writing" ; "in_flight")]
+    #[test_case(ToolStatus::Success,    "wrote"   ; "landed")]
+    #[test_case(ToolStatus::Error,      "write"   ; "failed_claims_nothing")]
+    fn a_store_header_conjugates_its_own_verb(status: ToolStatus, expected: &str) {
+        let msg = memory_msg(&format!("write {MEMORY_NOTE}"), None, status);
+        let text = open_card(&msg, status);
+        assert!(text.contains(&format!("{expected} {MEMORY_NOTE}")), "{text}");
+    }
+
+    /// The conjugated header no longer contains the raw `command` value, so
+    /// the containment check cannot fold it and the row would repeat the verb
+    /// it just finished inflecting.
+    #[test]
+    fn a_conjugated_header_does_not_repeat_its_command_in_brackets() {
+        let raw = serde_json::json!({
+            "command": "write",
+            "path": MEMORY_NOTE,
+            "content": HEADING_SOURCE,
+        });
+        assert_eq!(
+            compact_args_for(
+                MEMORY_TOOL_NAME,
+                &format!("wrote {MEMORY_NOTE}"),
+                Some(&raw),
+                None
+            ),
+            None
+        );
     }
 
     const UNBOUNDED_MSG: &str =
@@ -3937,9 +4082,10 @@ mod tests {
         "a sigil holds one cell, or every label behind it sits a column out";
     const SIGIL_CLASH_MSG: &str = "two tools sharing a sigil is a family, and a family is declared";
     /// The sigils a family deliberately shares: the code graph is one tool with
-    /// five verbs, the stores are one store with two, and read and write each
-    /// keep the cold members whose operation really is the same.
-    const SHARED_SIGILS: &[char] = &['◇', '▤', '→', '←'];
+    /// five verbs, the stores are one store with two, and read, write and patch
+    /// each keep the cold members whose operation really is the same. Patching
+    /// a document is patching a file that happens to live in a remote store.
+    const SHARED_SIGILS: &[char] = &['◇', '▤', '→', '←', '±'];
 
     #[test]
     fn every_sigil_occupies_one_cell() {
