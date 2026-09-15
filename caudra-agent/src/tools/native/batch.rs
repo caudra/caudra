@@ -250,7 +250,10 @@ impl Child {
 
     fn pending_entry(&self, ctx: &ToolContext) -> BatchToolEntry {
         let (status, output) = match self.rejection {
-            Some(reason) => (BatchToolStatus::Error, Some(ToolOutput::Plain(reason.into()))),
+            Some(reason) => (
+                BatchToolStatus::Error,
+                Some(ToolOutput::Plain(reason.into())),
+            ),
             None => (BatchToolStatus::Pending, None),
         };
         BatchToolEntry {
@@ -582,7 +585,10 @@ fn render_llm(entries: &[BatchToolEntry]) -> String {
             out.push_str(ERROR_PREFIX);
             out.push_str(&text);
         }
-        for note in [&entry.annotation, &entry.model_suffix].into_iter().flatten() {
+        for note in [&entry.annotation, &entry.model_suffix]
+            .into_iter()
+            .flatten()
+        {
             out.push('\n');
             out.push_str(note);
         }
@@ -1257,8 +1263,7 @@ mod tests {
         assert_eq!(entries[0].summary, HEADER_PATH, "{EXPECT_SUMMARY}");
     }
 
-    const EXPECT_PENDING_SUMMARY: &str =
-        "a child settled without ever starting keeps the header the batch resolved from the call, \
+    const EXPECT_PENDING_SUMMARY: &str = "a child settled without ever starting keeps the header the batch resolved from the call, \
          so the roster never draws a bare tense with nothing after it";
 
     /// A child is adopted from a speculative run still in permission gating,
@@ -1315,8 +1320,7 @@ mod tests {
     }
 
     const MODEL_SUFFIX: &str = "<task_metadata>\ntask_id: task-1\n</task_metadata>";
-    const EXPECT_MODEL_ONLY: &str =
-        "guidance a child addressed to the model belongs in the answer the model reads, never in \
+    const EXPECT_MODEL_ONLY: &str = "guidance a child addressed to the model belongs in the answer the model reads, never in \
          the annotation the card draws beside the child's header";
 
     /// `task` hands back a `<task_metadata>` block so the model can resume the

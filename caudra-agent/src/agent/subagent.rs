@@ -1068,12 +1068,12 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::tools::BATCH_TOOL_NAME;
-    use crate::{BatchToolStatus, ToolDoneEvent, TurnCompleteEvent};
     use crate::context::{
         ContextInventory, ContextKey, ContextReadiness, ContextSnapshot, ContextStore,
         ContextUsage, ContextWindow,
     };
+    use crate::tools::BATCH_TOOL_NAME;
+    use crate::{BatchToolStatus, ToolDoneEvent, TurnCompleteEvent};
     use caudra_providers::{Billing, ContentBlock, Message, Role};
     use caudra_storage::usage_ledger::LedgerPurpose;
     use test_case::test_case;
@@ -1590,7 +1590,8 @@ mod tests {
         let mut relay = ProgressRelay::new();
         relay.tools += ProgressRelay::counted(&batch_start(3));
         relay.tools += ProgressRelay::counted(&tool_start(CHILD_TOOL));
-        relay.tools += ProgressRelay::counted(&batch_progress(TOOL_ID, 0, BatchToolStatus::Running));
+        relay.tools +=
+            ProgressRelay::counted(&batch_progress(TOOL_ID, 0, BatchToolStatus::Running));
 
         assert_eq!(relay.tools, 4, "{ROSTER_MISCOUNT_MSG}");
     }

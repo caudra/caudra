@@ -1938,7 +1938,11 @@ impl From<&BatchToolEntry> for ActivityChild {
     fn from(entry: &BatchToolEntry) -> Self {
         Self {
             tool: Arc::from(entry.tool.as_str()),
-            summary: entry.summary.split_whitespace().collect::<Vec<_>>().join(" "),
+            summary: entry
+                .summary
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" "),
             status: entry.status,
         }
     }

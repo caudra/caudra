@@ -3651,7 +3651,11 @@ mod tests {
 
     fn batching_report(children: Vec<ActivityChild>) -> ToolProgress {
         ToolProgress::live(SubagentProgress {
-            activity: SubagentActivity::batch(Arc::from(BATCH_TOOL_NAME), BATCHING_SUMMARY, children),
+            activity: SubagentActivity::batch(
+                Arc::from(BATCH_TOOL_NAME),
+                BATCHING_SUMMARY,
+                children,
+            ),
             tools: BATCHING_TOOLS,
             elapsed: Duration::ZERO,
         })

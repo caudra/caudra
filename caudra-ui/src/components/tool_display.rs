@@ -27,8 +27,8 @@ use crate::markdown::{
     truncation_notice,
 };
 use caudra_agent::{
-    BatchToolStatus, BufferSnapshot, InstructionBlock, NO_FILES_FOUND, ShellOutput, SnapshotSpan,
-    ActivityChild, SpanStyle, SubagentActivity, SubagentProgress, ToolInput, ToolOutput,
+    ActivityChild, BatchToolStatus, BufferSnapshot, InstructionBlock, NO_FILES_FOUND, ShellOutput,
+    SnapshotSpan, SpanStyle, SubagentActivity, SubagentProgress, ToolInput, ToolOutput,
     tools::{
         FILE_READ_TOOL_NAME, FILE_WRITE_TOOL_NAME, PYTHON_EXECUTION_TOOL_NAME, SHELL_TOOL_NAME,
         humanize_duration,
@@ -1238,10 +1238,7 @@ impl ToolLineBuilder {
                 ),
                 theme.tool_prefix,
             ),
-            false => (
-                Span::raw(INDICATOR_PAD),
-                finished_style(self.indicator),
-            ),
+            false => (Span::raw(INDICATOR_PAD), finished_style(self.indicator)),
         };
         for (line, span) in &mut self.spinner_lines {
             if *line == 0 {
@@ -1253,10 +1250,7 @@ impl ToolLineBuilder {
         }
         self.lines[0].spans.splice(
             0..0,
-            [
-                head,
-                Span::styled(format!("{} ", self.sigil), sigil_style),
-            ],
+            [head, Span::styled(format!("{} ", self.sigil), sigil_style)],
         );
     }
 
@@ -1672,9 +1666,7 @@ fn bake_spans(
                     on_spinner(out.len());
                     out.push(Span::styled(spinner_frame, theme::current().spinner));
                 }
-                finished => {
-                    out.push(Span::styled(format!("{sigil} "), finished_style(finished)))
-                }
+                finished => out.push(Span::styled(format!("{sigil} "), finished_style(finished))),
             }
         } else {
             out.push(Span::styled(
@@ -3619,7 +3611,10 @@ mod tests {
 
         let tl = build_tool_lines(&msg, ToolStatus::InProgress, &test_rctx(80), None);
 
-        assert_eq!(line_text(&tl.lines[1]), "  └── Responding · 2 tools · 1m 3.4s");
+        assert_eq!(
+            line_text(&tl.lines[1]),
+            "  └── Responding · 2 tools · 1m 3.4s"
+        );
     }
 
     /// What it was doing is stale the moment it stops; what it did is not.
