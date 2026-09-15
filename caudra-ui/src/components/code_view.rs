@@ -69,6 +69,9 @@ const MAX_REDIFF_LINES: usize = 4096;
 /// The columns a diff body needs before a second gutter of line numbers is
 /// worth what it takes away from the code.
 const MIN_CODE_COLUMNS: usize = 60;
+/// Below this a row has no room left to say anything, and breaking it would
+/// cost more rows than the overflow it was meant to spare.
+const MIN_WRAP_COLUMNS: usize = 8;
 const MARK_UNCHANGED: char = ' ';
 const MARK_REMOVED: char = '-';
 const MARK_ADDED: char = '+';
@@ -242,30 +245,6 @@ impl SourceTrace {
     }
 }
 
-/// Text drawn one raw line per row behind `chrome_spans` of padding, which is
-/// how a card prints output no renderer claimed.
-pub fn text_body(text: &str, chrome_spans: usize) -> BodySource {
-    let mut at = 0u32;
-    let rows = text
-        .lines()
-        .map(|line| {
-            let range = at..at + line.len() as u32;
-            at = range.end + 1;
-            let mut spans = vec![SpanSource::Chrome; chrome_spans];
-            spans.push(SpanSource::Range(Source::verbatim(range.clone())));
-            LineProvenance {
-                line: Some(range),
-                spans,
-            }
-        })
-        .collect();
-    BodySource {
-        text: text.to_owned(),
-        rows,
-        code: Vec::new(),
-    }
-}
-
 /// Moves a row's ranges onto text that now sits `by` bytes further in.
 fn rebase_row(row: &mut LineProvenance, by: u32) {
     if let Some(range) = row.line.as_mut() {
@@ -317,6 +296,7 @@ fn render_code(
     code_lines: &[String],
     total_count: usize,
     max_lines: usize,
+    width: u16,
 ) -> CodeRender {
     let capped = code_lines.len().min(max_lines);
     let hidden = total_count.saturating_sub(capped);
@@ -333,6 +313,9 @@ fn render_code(
     };
     let mut at = 0u32;
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(shown.len());
+    // A number names a line of the file, so a line too long for the card keeps
+    // one number and hangs the rest of itself under the code it belongs to.
+    let hang = " ".repeat(w + 1);
     for (i, text) in shown.iter().enumerate() {
         let nr = start_line + i;
         let mut spans = vec![gutter(&format!("{nr:>w$}"))];
@@ -340,9 +323,11 @@ fn render_code(
             Some(h) => spans.extend(highlight_spans(h, text)),
             None => spans.push(fallback_span(text)),
         }
-        source.rows.push(code_row(&spans, text, at));
+        let row = code_row(&spans, text, at);
         at += text.len() as u32 + 1;
-        lines.push(Line::from(spans));
+        let broken = wrap_styled(spans, 1, &hang, width);
+        source.rows.extend(wrapped_provenance(&broken, &row));
+        lines.extend(wrapped_lines(broken));
     }
     source.code.push(CodeBlock {
         rows: 0..lines.len(),
@@ -868,11 +853,7 @@ fn render_answers(answers: &[Answer]) -> Vec<Line<'static>> {
 /// sigil and a continuation line does not, which is the distinction the blank
 /// row was buying. Threading a width in would also put the gaps back exactly
 /// where they are worst, since a long search header is what wraps.
-fn render_batch(
-    entries: &[BatchToolEntry],
-    highlight: bool,
-    limits: &RenderLimits,
-) -> BatchCard {
+fn render_batch(entries: &[BatchToolEntry], highlight: bool, limits: &RenderLimits) -> BatchCard {
     let t = theme::current();
     let mut lines = Vec::new();
     let mut rows = Vec::new();
@@ -953,9 +934,18 @@ fn render_batch(
         // A child is a section of the card, not another run of its output, so
         // its summary row copies as the heading that says whose output follows.
         // Without it ten calls reach the clipboard as one undivided block.
-        trace.record(lines.len(), child_heading(index, entry, spans.len()));
-        lines.push(Line::from(spans));
-        rows.push(target);
+        // A title too long for the card hangs under its own label, so the
+        // connector and the sigil are said once and the tree stays legible.
+        let broken = wrap_styled(
+            spans,
+            2,
+            &format!("{continuation}{BATCH_BODY_PAD}"),
+            limits.width,
+        );
+        let heading = child_heading(index, entry);
+        trace.record(lines.len(), heading_rows(&broken, heading));
+        rows.resize(rows.len() + broken.len(), target);
+        lines.extend(wrapped_lines(broken));
         // A child's own output is content and clears the trunk; what the child
         // dispatched hangs off it as nodes. Content first, so reading down a
         // child never steps back out to a shallower level than the row above.
@@ -990,7 +980,7 @@ fn render_batch(
 /// The row's own spans name nothing: the connector, the sigil and the tense are
 /// the card's way of saying what the heading says in words, and copying the
 /// glyphs would put box-drawing characters in the middle of a document.
-fn child_heading(index: usize, entry: &BatchToolEntry, span_count: usize) -> BodySource {
+fn child_heading(index: usize, entry: &BatchToolEntry) -> BodySource {
     let summary = entry.summary.trim();
     let gap = if summary.is_empty() { "" } else { " " };
     let text = format!(
@@ -1001,10 +991,29 @@ fn child_heading(index: usize, entry: &BatchToolEntry, span_count: usize) -> Bod
     BodySource {
         rows: Vec::from([LineProvenance {
             line: Some(0..text.len() as u32),
-            spans: vec![SpanSource::Chrome; span_count],
+            spans: Vec::new(),
         }]),
         text,
         code: Vec::new(),
+    }
+}
+
+/// The heading's rows, one per display row the title took. Only the first
+/// names the heading text: the rest are the same title still being said, and a
+/// selection that reaches them copies it once.
+fn heading_rows(broken: &[Vec<SpanPiece>], heading: BodySource) -> BodySource {
+    let mut rows = heading.rows;
+    let first = rows.pop().unwrap_or_else(|| LineProvenance::chrome(0));
+    for row in broken {
+        rows.push(LineProvenance {
+            line: first.line.clone(),
+            spans: vec![SpanSource::Chrome; row.len()],
+        });
+    }
+    BodySource {
+        rows,
+        text: heading.text,
+        code: heading.code,
     }
 }
 
@@ -1390,7 +1399,7 @@ fn markdown_body(text: &str, width: u16) -> (Vec<Line<'static>>, BodySource) {
 /// The whole body is one block, because it is text a tool printed rather than
 /// prose: fenced where it lands, its line breaks survive a copy into markdown
 /// instead of reflowing into a paragraph.
-fn plain_body(text: &str, width: u16) -> (Vec<Line<'static>>, BodySource) {
+pub(super) fn plain_body(text: &str, width: u16) -> (Vec<Line<'static>>, BodySource) {
     let mut lines = Vec::new();
     let mut rows = Vec::new();
     let mut at = 0u32;
@@ -1427,6 +1436,171 @@ fn plain_body(text: &str, width: u16) -> (Vec<Line<'static>>, BodySource) {
             code,
         },
     )
+}
+
+/// One piece of a styled row, on the display row the break put it on.
+///
+/// `origin` names the span it was cut from, or `None` for the gutter a
+/// continuation was given, which stands for nothing the row said.
+struct SpanPiece {
+    origin: Option<usize>,
+    offset: usize,
+    /// The bytes of the origin span this row stands for, which is not always
+    /// what it draws: a break swallows the spaces it broke on, and drawing
+    /// them would push the row back past the width it was broken to.
+    len: usize,
+    span: Span<'static>,
+}
+
+/// Breaks a styled row to `width`, keeping its gutter in the left column of
+/// every display row it takes.
+///
+/// `gutter` counts the leading spans that are chrome — a connector, a line
+/// number, a sigil. They stay on the first row; the rows after it get
+/// `continuation` in their place, which must be the same width or the text
+/// under it stops lining up. Left to ratatui, those rows would start at column
+/// zero and the card's own structure would end at the first line too long for
+/// it.
+fn wrap_styled(
+    spans: Vec<Span<'static>>,
+    gutter: usize,
+    continuation: &str,
+    width: u16,
+) -> Vec<Vec<SpanPiece>> {
+    let gutter_width: usize = spans
+        .iter()
+        .take(gutter)
+        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+        .sum();
+    let room = usize::from(width).saturating_sub(gutter_width);
+    let content: String = spans
+        .iter()
+        .skip(gutter)
+        .map(|span| span.content.as_ref())
+        .collect();
+    let unbroken = width == UNCONSTRAINED_WIDTH
+        || room < MIN_WRAP_COLUMNS
+        || UnicodeWidthStr::width(content.as_str()) <= room;
+    let head: Vec<SpanPiece> = spans
+        .iter()
+        .take(gutter)
+        .enumerate()
+        .map(|(origin, span)| SpanPiece {
+            origin: Some(origin),
+            offset: 0,
+            len: span.content.len(),
+            span: span.clone(),
+        })
+        .collect();
+    if unbroken {
+        let tail = spans
+            .into_iter()
+            .enumerate()
+            .skip(gutter)
+            .map(|(origin, span)| SpanPiece {
+                origin: Some(origin),
+                offset: 0,
+                len: span.content.len(),
+                span,
+            });
+        return Vec::from([head.into_iter().chain(tail).collect()]);
+    }
+    let mut rows = Vec::new();
+    let mut row = head;
+    let mut cut = wrapped_ranges(&content, room as u16).into_iter().skip(1);
+    let mut next = cut.next().map(|range| range.start);
+    let mut at = 0usize;
+    for (origin, span) in spans.into_iter().enumerate().skip(gutter) {
+        let text = span.content.as_ref();
+        let mut taken = 0usize;
+        while let Some(boundary) = next.filter(|boundary| *boundary < at + text.len()) {
+            let end = boundary - at;
+            let whole = &text[taken..end];
+            row.push(piece(
+                origin,
+                taken,
+                whole,
+                whole.trim_end_matches(' '),
+                &span,
+            ));
+            rows.push(std::mem::take(&mut row));
+            row.push(SpanPiece {
+                origin: None,
+                offset: 0,
+                len: 0,
+                span: Span::styled(continuation.to_owned(), theme::current().tool_dim),
+            });
+            taken = end;
+            next = cut.next().map(|range| range.start);
+        }
+        let rest = &text[taken..];
+        row.push(piece(origin, taken, rest, rest, &span));
+        at += text.len();
+    }
+    rows.push(row);
+    rows
+}
+
+/// A span narrowed to the part of it one display row stands for. `drawn` is
+/// what reaches the screen, which drops the spaces a break swallowed; the
+/// piece still answers for them so a copy reads back the line as written.
+fn piece(origin: usize, offset: usize, text: &str, drawn: &str, span: &Span<'static>) -> SpanPiece {
+    SpanPiece {
+        origin: Some(origin),
+        offset,
+        len: text.len(),
+        span: Span::styled(drawn.to_owned(), span.style),
+    }
+}
+
+/// The rows `wrap_styled` produced, as lines.
+fn wrapped_lines(rows: Vec<Vec<SpanPiece>>) -> Vec<Line<'static>> {
+    rows.into_iter()
+        .map(|row| Line::from(row.into_iter().map(|piece| piece.span).collect::<Vec<_>>()))
+        .collect()
+}
+
+/// The provenance of every row a break produced, from the row's own.
+///
+/// Each row names the whole source line, so a selection reaching across a
+/// break copies it once and unbroken. A span the break cut is narrowed to the
+/// bytes that landed on each row, and one drawn from text that does not
+/// survive the trip to the screen stays atomic, because its offsets no longer
+/// count its bytes.
+fn wrapped_provenance(rows: &[Vec<SpanPiece>], source: &LineProvenance) -> Vec<LineProvenance> {
+    rows.iter()
+        .map(|row| LineProvenance {
+            line: source.line.clone(),
+            spans: row
+                .iter()
+                .map(
+                    |piece| match piece.origin.and_then(|origin| source.spans.get(origin)) {
+                        Some(SpanSource::Range(range)) => {
+                            SpanSource::Range(narrowed(range, piece.offset, piece.len))
+                        }
+                        // The gutter a continuation was given stands for nothing
+                        // the row said; every other span keeps what it had.
+                        Some(other) => other.clone(),
+                        None => SpanSource::Chrome,
+                    },
+                )
+                .collect(),
+        })
+        .collect()
+}
+
+/// The part of a span's source one row drew. A verbatim range counts bytes, so
+/// it can be cut; anything else stands for the whole span however much of it
+/// is on screen.
+fn narrowed(source: &Source, offset: usize, len: usize) -> Source {
+    let span = (source.range.end - source.range.start) as usize;
+    match source.verbatim && offset + len <= span {
+        true => {
+            let start = source.range.start + offset as u32;
+            Source::verbatim(start..start + len as u32)
+        }
+        false => source.clone(),
+    }
 }
 
 /// The bytes of each display row `line` occupies at `width`.
@@ -1518,9 +1692,9 @@ fn render_patch(files: &[PatchedFile], width: u16) -> Vec<Line<'static>> {
 /// Nothing here is highlighted. A file cut off mid-token leaves the parser in
 /// a state the rest of the file has not justified yet, which is the same
 /// reason a patch hunk is never highlighted either.
-pub(crate) fn render_live_body(body: &str) -> Vec<Line<'static>> {
+pub(crate) fn render_live_body(body: &str, width: u16) -> Vec<Line<'static>> {
     let shown: Vec<String> = body.lines().map(String::from).collect();
-    render_code(None, 1, &shown, shown.len(), usize::MAX).lines
+    render_code(None, 1, &shown, shown.len(), usize::MAX, width).lines
 }
 
 /// How many rows the full rendering would take. Counted rather than rendered,
@@ -1779,6 +1953,9 @@ fn render_index_file(
 /// crawl that stopped early both order the same way a complete one does, so the
 /// footer is the only place a reader learns the difference.
 const GRAPH_CAVEATS: &[&str] = &["NOT converged", "truncated by", "stopped early"];
+/// What a graph row's continuations clear, so they hang under the name rather
+/// than under the sigil that opened the row.
+const GRAPH_HANG: &str = "  ";
 const GRAPH_ROW_SIGIL: &str = "\u{25c7} ";
 
 /// One symbol per line, with the name leading and everything measured about it
@@ -1793,6 +1970,7 @@ fn render_code_graph(
     footer: &str,
     max_lines: usize,
     highlight: bool,
+    width: u16,
 ) -> (Vec<Line<'static>>, bool) {
     let theme = theme::current();
     // The headline and footer are the two lines that make the rest
@@ -1802,10 +1980,12 @@ fn render_code_graph(
     let (shown, hidden) = within(body_height, room);
     let truncated = hidden > 0;
 
-    let mut lines = vec![Line::from(Span::styled(
-        headline.to_owned(),
-        theme.tool_dim,
-    ))];
+    let mut lines = wrapped_lines(wrap_styled(
+        Vec::from([Span::styled(headline.to_owned(), theme.tool_dim)]),
+        0,
+        GRAPH_HANG,
+        width,
+    ));
 
     let row_count = rows.len().min(shown);
     let name_width = rows
@@ -1821,7 +2001,12 @@ fn render_code_graph(
         .max()
         .map(|hops| hops.to_string().len());
     for row in rows.iter().take(row_count) {
-        lines.push(code_graph_row(row, name_width, hop_width));
+        lines.extend(wrapped_lines(wrap_styled(
+            code_graph_row(row, name_width, hop_width).spans,
+            1,
+            GRAPH_HANG,
+            width,
+        )));
     }
 
     if let Some(source) = source {
@@ -1840,6 +2025,7 @@ fn render_code_graph(
                 &source.lines,
                 source.lines.len(),
                 body_room.saturating_sub(1),
+                width,
             );
             lines.extend(body.lines);
         }
@@ -1849,13 +2035,15 @@ fn render_code_graph(
         lines.push(truncation_line(hidden));
     }
     let caveated = GRAPH_CAVEATS.iter().any(|caveat| footer.contains(caveat));
-    lines.push(Line::from(Span::styled(
-        footer.to_owned(),
-        if caveated {
-            theme.error
-        } else {
-            theme.tool_dim
-        },
+    let footer_style = match caveated {
+        true => theme.error,
+        false => theme.tool_dim,
+    };
+    lines.extend(wrapped_lines(wrap_styled(
+        Vec::from([Span::styled(footer.to_owned(), footer_style)]),
+        0,
+        GRAPH_HANG,
+        width,
     )));
     (lines, truncated)
 }
@@ -1949,6 +2137,7 @@ pub(crate) fn render_instructions(
     lines: &mut Vec<Line<'static>>,
     max_lines: usize,
     highlight: bool,
+    width: u16,
 ) -> bool {
     let dim = theme::current().tool_dim;
     let mut used = 0;
@@ -1978,7 +2167,7 @@ pub(crate) fn render_instructions(
         let total = code_lines.len();
         let remaining = max_lines.saturating_sub(used);
         let hl = highlight.then(|| caudra_highlight::Highlighter::for_path(&block.path));
-        let rendered = render_code(hl, 1, &code_lines, total, remaining);
+        let rendered = render_code(hl, 1, &code_lines, total, remaining, width);
         used += rendered.lines.len();
         truncated |= rendered.truncated;
         lines.extend(rendered.lines);
@@ -2378,7 +2567,7 @@ pub fn render_tool_content(
         // script is the record of what ran, it cannot be reconstructed from
         // the output, and it is bounded by what the model wrote. The budget
         // belongs to the output, which the tool can make arbitrarily long.
-        let script = render_code(hl, 1, &code_lines, total, total);
+        let script = render_code(hl, 1, &code_lines, total, total, limits.width);
         trace.record(lines.len(), script.source.named(language));
         lines.extend(script.lines);
     }
@@ -2395,6 +2584,7 @@ pub fn render_tool_content(
                 code_lines,
                 code_lines.len(),
                 limits.budget,
+                limits.width,
             );
             output_source = Some(code.source.named_for_path(path));
             (code.lines, code.truncated)
@@ -2410,6 +2600,7 @@ pub fn render_tool_content(
                 code_lines,
                 code_lines.len(),
                 limits.budget,
+                limits.width,
             );
             output_source = Some(code.source.named_for_path(path));
             (code.lines, code.truncated)
@@ -2451,14 +2642,20 @@ pub fn render_tool_content(
             footer,
             limits.budget,
             highlight,
+            limits.width,
         ),
         Some(ToolOutput::Index(output @ IndexOutput::Directory { .. })) => {
             render_index_directory(output, limits.budget)
         }
         Some(ToolOutput::Instructions { blocks }) => {
             let mut instruction_lines = Vec::new();
-            let trunc =
-                render_instructions(blocks, &mut instruction_lines, limits.budget, highlight);
+            let trunc = render_instructions(
+                blocks,
+                &mut instruction_lines,
+                limits.budget,
+                highlight,
+                limits.width,
+            );
             (instruction_lines, trunc)
         }
         Some(ToolOutput::Environment {
@@ -2601,6 +2798,7 @@ mod tests {
             &code_lines,
             total,
             READ_MAX_LINES,
+            UNCONSTRAINED_WIDTH,
         );
         assert_eq!(result.lines.len(), expected);
         assert_eq!(result.source.rows.len(), expected, "{ROWS_PER_LINE}");
@@ -2618,7 +2816,7 @@ mod tests {
         let code_lines = vec![CODE.to_owned()];
         let hl = highlight.then(|| caudra_highlight::Highlighter::for_path("test.rs"));
 
-        let rendered = render_code(hl, 1, &code_lines, 1, usize::MAX);
+        let rendered = render_code(hl, 1, &code_lines, 1, usize::MAX, UNCONSTRAINED_WIDTH);
 
         assert_eq!(rendered.source.text, CODE);
         let row = &rendered.source.rows[0];
@@ -2633,6 +2831,80 @@ mod tests {
 
     const SPANS_PER_ROW: &str = "a row's sources must stay parallel to its painted spans";
     const GUTTER_IS_CHROME: &str = "the line-number gutter must name no source";
+
+    const NUMBERED_ONCE: &str = "a source line is numbered once however many rows it takes, and \
+        its continuations hang under the code rather than restarting at column zero";
+    const CODE_CARD_WIDTH: u16 = 30;
+
+    /// The reported bug: a long command in a numbered listing ran past the card
+    /// and the terminal broke it, so the tail landed under the line numbers
+    /// instead of under the code.
+    #[test_case(1, 9 ; "one_digit")]
+    #[test_case(97, 99 ; "two_digits")]
+    #[test_case(998, 999 ; "three_digits")]
+    fn a_numbered_line_is_numbered_once_however_many_rows_it_takes(start: usize, last: usize) {
+        const LONG: &str = "git status --short; git diff --stat; git diff --cached --stat";
+        let code_lines = Vec::from([LONG.to_owned(), "echo done".to_owned()]);
+        let width = nr_width(last) + 1;
+
+        let rendered = render_code(None, start, &code_lines, 2, usize::MAX, CODE_CARD_WIDTH);
+
+        let drawn: Vec<String> = rendered
+            .lines
+            .iter()
+            .map(|line| spans_text(&line.spans))
+            .collect();
+        assert!(drawn.len() > code_lines.len(), "{NUMBERED_ONCE}: {drawn:?}");
+        let numbered: Vec<&String> = drawn
+            .iter()
+            .filter(|row| !row.starts_with(&" ".repeat(width)))
+            .collect();
+        assert_eq!(
+            numbered.len(),
+            code_lines.len(),
+            "{NUMBERED_ONCE}: {drawn:?}"
+        );
+        assert!(
+            drawn
+                .iter()
+                .all(|row| row.chars().count() <= usize::from(CODE_CARD_WIDTH)),
+            "{NUMBERED_ONCE}: {drawn:?}"
+        );
+        assert_eq!(
+            rendered.source.rows.len(),
+            rendered.lines.len(),
+            "{ROWS_PER_LINE}"
+        );
+    }
+
+    /// A break must not put the clipboard out of step with the screen: the
+    /// pieces of a cut span name the bytes each row drew, and together they are
+    /// the line that was written.
+    #[test]
+    fn the_rows_a_numbered_line_broke_into_name_it_between_them() {
+        const LONG: &str = "cargo nextest run --workspace --locked --no-fail-fast";
+        let code_lines = Vec::from([LONG.to_owned()]);
+
+        let rendered = render_code(None, 1, &code_lines, 1, usize::MAX, CODE_CARD_WIDTH);
+
+        let copied: String = rendered
+            .source
+            .rows
+            .iter()
+            .flat_map(|row| &row.spans)
+            .filter_map(|span| match span {
+                SpanSource::Range(source) => Some(
+                    &rendered.source.text[source.range.start as usize..source.range.end as usize],
+                ),
+                SpanSource::Chrome | SpanSource::Unknown => None,
+            })
+            .collect();
+        assert_eq!(copied, LONG, "{NUMBERED_ONCE}");
+        for (row, line) in rendered.source.rows.iter().zip(&rendered.lines) {
+            assert_eq!(row.spans.len(), line.spans.len(), "{SPANS_PER_ROW}");
+            assert_eq!(row.line, Some(0..LONG.len() as u32), "{NUMBERED_ONCE}");
+        }
+    }
 
     const PATCH: &str = "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -8,3 +8,4 @@\n context\n-gone\n+added\n+also added\n";
     const NUMBERED_MSG: &str = "context and removed lines carry their real file line number";
@@ -3270,7 +3542,8 @@ mod tests {
             content: long_content,
         }];
         let mut lines = Vec::new();
-        let truncated = render_instructions(&blocks, &mut lines, max_lines, false);
+        let truncated =
+            render_instructions(&blocks, &mut lines, max_lines, false, UNCONSTRAINED_WIDTH);
         assert_eq!(truncated, expect_truncated);
         let has_notice = lines
             .iter()
@@ -3285,7 +3558,13 @@ mod tests {
             content: String::new(),
         }];
         let mut lines = Vec::new();
-        let truncated = render_instructions(&blocks, &mut lines, MAX_INSTRUCTION_LINES, false);
+        let truncated = render_instructions(
+            &blocks,
+            &mut lines,
+            MAX_INSTRUCTION_LINES,
+            false,
+            UNCONSTRAINED_WIDTH,
+        );
         assert!(!truncated);
         assert_eq!(lines.len(), 0);
     }
@@ -3612,23 +3891,24 @@ mod tests {
         "a batch card that names no source hands every child back to the scraping fallback";
     const ROWS_PER_CARD_LINE: &str =
         "a batch card needs one source row per painted line or extraction gives up on it";
-    const ONE_SOURCE_LINE: &str =
-        "the rows a paragraph broke into have to name the line it was written as, or a \
+    const ONE_SOURCE_LINE: &str = "the rows a paragraph broke into have to name the line it was written as, or a \
          selection across them copies the break";
     const CHILD_INDENT_MSG: &str =
         "a row that does not open on the trunk reads as belonging to the batch, not the child";
 
     /// A lone child's body rows, each paired with the source it names, which is
-    /// what a selection over that row resolves against. Everything but the
-    /// summary row above them belongs to the body.
+    /// what a selection over that row resolves against. The summary row above
+    /// them is dropped along with any row it broke into, which all name the
+    /// same heading it does.
     fn lone_child_body(card: &BatchCard) -> Vec<(String, LineProvenance)> {
         let source = card.source.clone().expect(CARD_RECORDS_SOURCE);
         assert_eq!(card.lines.len(), source.rows.len(), "{ROWS_PER_CARD_LINE}");
+        let heading = source.rows.first().and_then(|row| row.line.clone());
         card.lines
             .iter()
             .map(|line| spans_text(&line.spans))
             .zip(source.rows)
-            .skip(1)
+            .skip_while(|(_, row)| row.line == heading)
             .collect()
     }
 
@@ -3645,6 +3925,53 @@ mod tests {
         let source = card.source.as_ref().expect(CARD_RECORDS_SOURCE);
         assert_eq!(source.rows.len(), card.lines.len(), "{ROWS_PER_CARD_LINE}");
         assert!(source.names_source(), "{CARD_RECORDS_SOURCE}");
+    }
+
+    const TITLE_HANGS: &str = "a title wider than the card hangs under its own label: the \
+        connector and the sigil are said once, and the trunk runs down every row it took";
+
+    /// The reported bug: a `task` child's title with its arguments and its
+    /// annotation ran past the card, and the terminal broke it at column zero,
+    /// so the tree ended at the first child long enough to overflow.
+    #[test]
+    fn a_child_title_too_wide_for_the_card_hangs_under_its_label() {
+        let long = BatchToolEntry {
+            summary: "Located permission prompt command scope options repeated tool calls \
+                      shell classifier reusable patterns"
+                .to_owned(),
+            ..batch_entry(SHELL_CHILD, 0)
+        };
+        let limits =
+            limits(BatchViews::default()).with_width(NARROW_BODY_WIDTH + BATCH_CHILD_INDENT_WIDTH);
+
+        let card = render_batch(&[long, batch_entry(SHELL_CHILD, 0)], false, &limits);
+
+        let drawn: Vec<String> = card
+            .lines
+            .iter()
+            .map(|line| spans_text(&line.spans))
+            .collect();
+        let title = &drawn[..drawn.len() - 1];
+        assert!(title.len() > 1, "{TITLE_HANGS}: {drawn:?}");
+        assert!(
+            title[0].starts_with(TREE_BRANCH),
+            "{TITLE_HANGS}: {title:?}"
+        );
+        let hang = format!("{TREE_TRUNK}{BATCH_BODY_PAD}");
+        assert!(
+            title.iter().skip(1).all(|row| row.starts_with(&hang)),
+            "{TITLE_HANGS}: {title:?}"
+        );
+        assert_eq!(
+            card.rows[..title.len()],
+            vec![Some(RowTarget(0)); title.len()],
+            "{TITLE_HANGS}"
+        );
+        assert_eq!(
+            card.source.as_ref().map(|source| source.rows.len()),
+            Some(card.lines.len()),
+            "{ROWS_PER_CARD_LINE}"
+        );
     }
 
     /// The two halves of the fix meeting: the card breaks the paragraph so each
@@ -3691,7 +4018,10 @@ mod tests {
             "{ONE_SOURCE_LINE}: {body:?}"
         );
         for (text, row) in &body {
-            assert!(text.chars().count() <= limit, "{CHILD_INDENT_MSG}: {text:?}");
+            assert!(
+                text.chars().count() <= limit,
+                "{CHILD_INDENT_MSG}: {text:?}"
+            );
             assert_eq!(row.line.as_ref(), Some(&written), "{ONE_SOURCE_LINE}");
         }
     }
@@ -3891,7 +4221,8 @@ mod tests {
     /// The row without the tree column, which every child carries and no
     /// assertion here is about.
     fn child_row(entry: BatchToolEntry) -> String {
-        let row = line_text(&render_batch(&[entry], false, &limits(BatchViews::default())).lines[0]);
+        let row =
+            line_text(&render_batch(&[entry], false, &limits(BatchViews::default())).lines[0]);
         row.strip_prefix(ONLY_CHILD_CONNECTOR)
             .expect("a child row opens on its connector")
             .to_owned()
@@ -3985,7 +4316,8 @@ mod tests {
 
         let card = render_batch(&entries, false, &limits(BatchViews::default()));
 
-        let connectors: Vec<String> = card.lines
+        let connectors: Vec<String> = card
+            .lines
             .iter()
             .map(|line| line.spans[0].content.to_string())
             .collect();
@@ -4208,7 +4540,11 @@ mod tests {
         ];
         let card = render_batch(&entries, false, &limits(BatchViews::new([1])));
 
-        assert_eq!(separator_rows(&card.lines), vec![1, 5], "{BATCH_BODY_AIR_MSG}");
+        assert_eq!(
+            separator_rows(&card.lines),
+            vec![1, 5],
+            "{BATCH_BODY_AIR_MSG}"
+        );
         assert_eq!(card.lines.len(), card.rows.len(), "the rows stay parallel");
     }
 
@@ -4331,13 +4667,64 @@ mod tests {
         }
     }
 
+    const GRAPH_HANGS: &str = "a graph row wider than the card hangs under its own name, so the \
+        fields it ends on stay inside the card instead of restarting at column zero";
+    const GRAPH_CARD_WIDTH: u16 = 44;
+
+    /// The reported bug: a row ending in `[test]` ran past the card and the
+    /// terminal broke it, dropping the tail to the left margin.
+    #[test]
+    fn a_graph_row_too_wide_for_the_card_hangs_under_its_name() {
+        let row = CodeGraphRow {
+            test_scope: true,
+            ..ranked_row(
+                "shell_pattern_option_is_absent_without_a_reusable_prefix",
+                4,
+            )
+        };
+
+        let (lines, _) = render_code_graph(
+            "located in .",
+            &[row],
+            None,
+            "[21 files]",
+            20,
+            false,
+            GRAPH_CARD_WIDTH,
+        );
+
+        let drawn: Vec<String> = lines.iter().map(|line| spans_text(&line.spans)).collect();
+        assert!(drawn.len() > 3, "{GRAPH_HANGS}: {drawn:?}");
+        assert!(
+            drawn
+                .iter()
+                .all(|row| row.chars().count() <= usize::from(GRAPH_CARD_WIDTH)),
+            "{GRAPH_HANGS}: {drawn:?}"
+        );
+        let body = &drawn[1..drawn.len() - 1];
+        assert!(
+            body.iter()
+                .skip(1)
+                .all(|row| row.starts_with(GRAPH_HANG) && !row.starts_with(GRAPH_ROW_SIGIL)),
+            "{GRAPH_HANGS}: {body:?}"
+        );
+    }
+
     #[test]
     fn a_code_graph_card_keeps_its_headline_and_footer() {
         const HEADLINE: &str = "ranked symbols in .";
         const FOOTER: &str = "[3 files, 9 symbols, 4 edges]";
 
         let rows = vec![ranked_row("alpha", 3), ranked_row("beta", 1)];
-        let (lines, truncated) = render_code_graph(HEADLINE, &rows, None, FOOTER, 20, false);
+        let (lines, truncated) = render_code_graph(
+            HEADLINE,
+            &rows,
+            None,
+            FOOTER,
+            20,
+            false,
+            UNCONSTRAINED_WIDTH,
+        );
 
         let texts: Vec<String> = lines.iter().map(line_text).collect();
         assert!(!truncated);
@@ -4358,7 +4745,8 @@ mod tests {
         const FOOTER: &str = "[100 files]";
 
         let rows: Vec<CodeGraphRow> = (0..40).map(|i| ranked_row(&format!("sym{i}"), i)).collect();
-        let (lines, truncated) = render_code_graph(HEADLINE, &rows, None, FOOTER, 8, false);
+        let (lines, truncated) =
+            render_code_graph(HEADLINE, &rows, None, FOOTER, 8, false, UNCONSTRAINED_WIDTH);
 
         let texts: Vec<String> = lines.iter().map(line_text).collect();
         assert!(truncated);
@@ -4372,7 +4760,16 @@ mod tests {
     #[test]
     fn a_footer_naming_a_caveat_is_not_dimmed_like_an_ordinary_one() {
         let rows = vec![ranked_row("alpha", 1)];
-        let plain = render_code_graph("h", &rows, None, "[3 files]", 20, false).0;
+        let plain = render_code_graph(
+            "h",
+            &rows,
+            None,
+            "[3 files]",
+            20,
+            false,
+            UNCONSTRAINED_WIDTH,
+        )
+        .0;
         let caveated = render_code_graph(
             "h",
             &rows,
@@ -4380,6 +4777,7 @@ mod tests {
             "[3 files; rank NOT converged after 50 iterations]",
             20,
             false,
+            UNCONSTRAINED_WIDTH,
         )
         .0;
 
@@ -4399,7 +4797,15 @@ mod tests {
         far.name = "far".to_owned();
         far.hops = Some(12);
 
-        let (lines, _) = render_code_graph("h", &[near, far], None, "[f]", 20, false);
+        let (lines, _) = render_code_graph(
+            "h",
+            &[near, far],
+            None,
+            "[f]",
+            20,
+            false,
+            UNCONSTRAINED_WIDTH,
+        );
         let texts: Vec<String> = lines.iter().map(line_text).collect();
 
         let hop_column = |needle: &str| -> String {
@@ -4423,7 +4829,15 @@ mod tests {
             lines: vec!["fn alpha() {".to_owned(), "}".to_owned()],
             whole_file_reason: Some("the bundle would cost more than the file".to_owned()),
         };
-        let (lines, _) = render_code_graph("h", &[], Some(&source), "[f]", 20, false);
+        let (lines, _) = render_code_graph(
+            "h",
+            &[],
+            Some(&source),
+            "[f]",
+            20,
+            false,
+            UNCONSTRAINED_WIDTH,
+        );
 
         let texts: Vec<String> = lines.iter().map(line_text).collect();
         assert!(

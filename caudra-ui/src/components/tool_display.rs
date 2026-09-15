@@ -6,7 +6,7 @@ use crate::theme;
 use caudra_config::{ClockFormat, ToolOutputLines};
 use code_view::{
     BatchLiveMap, BatchProgressMap, BatchViewMap, BatchViews, BodySource, CardPolicy, Disclosure,
-    RenderLimits, RowTarget, ScrollSpan, ScrollWindow, SourceTrace, text_body,
+    RenderLimits, RowTarget, ScrollSpan, ScrollWindow, SourceTrace,
 };
 
 use std::borrow::Cow;
@@ -1258,6 +1258,12 @@ impl ToolLineBuilder {
         );
     }
 
+    /// The columns a body has once the card's own indent is taken off, which
+    /// is what anything drawn under the header has to break itself to.
+    fn body_width(&self) -> u16 {
+        self.width.saturating_sub(TOOL_BODY_INDENT_WIDTH)
+    }
+
     fn is_in_progress(&self) -> bool {
         matches!(self.indicator, Indicator::InProgress)
     }
@@ -1398,7 +1404,7 @@ impl ToolLineBuilder {
         if renders_as_markdown(path) {
             self.push_markdown_body(&windowed);
         } else {
-            for mut line in code_view::render_live_body(&windowed) {
+            for mut line in code_view::render_live_body(&windowed, self.body_width()) {
                 line.spans.insert(0, Span::raw(TOOL_BODY_INDENT));
                 self.lines.push(line);
             }
@@ -1421,7 +1427,7 @@ impl ToolLineBuilder {
     fn push_live_script(&mut self, code: &str) {
         self.source.abandon();
         let start = self.lines.len();
-        for mut line in code_view::render_live_body(code) {
+        for mut line in code_view::render_live_body(code, self.body_width()) {
             line.spans.insert(0, Span::raw(TOOL_BODY_INDENT));
             self.lines.push(line);
         }
@@ -1446,10 +1452,14 @@ impl ToolLineBuilder {
             if self.markdown {
                 self.push_markdown_body(text);
             } else {
-                push_text_lines(&mut self.lines, text, TOOL_BODY_INDENT);
+                // Broken to the body's own width, so a row too long for the
+                // card keeps the indent that says whose body it is instead of
+                // restarting at column zero when the terminal breaks it.
+                let (body, source) = code_view::plain_body(text, self.body_width());
+                self.lines.extend(indented(body, TOOL_BODY_INDENT));
                 // The window has already taken its slice, so the ranges index
                 // what was drawn rather than the line numbers it came from.
-                self.source.record(body_start, text_body(text, 1));
+                self.source.record(body_start, source.indented());
             }
             if let Some(full) = &resolved.full_text {
                 self.push_search_text(full);
@@ -1639,14 +1649,15 @@ impl ToolLineBuilder {
     }
 }
 
-fn push_text_lines(lines: &mut Vec<Line<'static>>, text: &str, indent: &'static str) {
+fn indented(lines: Vec<Line<'static>>, indent: &'static str) -> Vec<Line<'static>> {
     let style = theme::current().tool;
-    for line in text.lines() {
-        lines.push(Line::from(vec![
-            Span::styled(indent, style),
-            Span::styled(line.to_owned(), style),
-        ]));
-    }
+    lines
+        .into_iter()
+        .map(|mut line| {
+            line.spans.insert(0, Span::styled(indent, style));
+            line
+        })
+        .collect()
 }
 
 /// Bakes snapshot spans onto `out`. `"spinner"`-styled spans bake to the
@@ -1966,7 +1977,8 @@ pub fn build_instructions_lines(
     b.prepend_indicator(Instant::now());
 
     let start = b.lines.len();
-    b.truncation |= code_view::render_instructions(blocks, &mut b.lines, b.limits.budget, false);
+    b.truncation |=
+        code_view::render_instructions(blocks, &mut b.lines, b.limits.budget, false, width);
     b.source.abandon();
     for line in &mut b.lines[start..] {
         line.spans.insert(0, Span::raw(TOOL_BODY_INDENT));
