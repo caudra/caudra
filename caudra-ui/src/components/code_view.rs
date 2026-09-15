@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::iter;
 use std::ops::Range;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::highlight::{fallback_span, highlight_line};
 use crate::markdown::{expand_notice, should_truncate, text_to_wrapped, truncation_notice};
@@ -22,6 +23,7 @@ use caudra_agent::{
     BatchToolEntry, BatchToolStatus, CodeGraphRow, CodeGraphSource, GrepFileEntry, INDEX_TRUNCATED,
     IndexDirectoryEntryKind, IndexLine, IndexLineSemantic, IndexOutput, IndexSourceRange,
     InstructionBlock, PatchedFile, SearchCap, SubagentProgress, ToolInput, ToolOutput,
+    format_live_duration, format_settled_duration,
 };
 use caudra_config::ToolOutputLines;
 use caudra_diff::{DiffHunk, DiffLine, DiffSpan, compute_hunks};
@@ -922,6 +924,16 @@ fn render_batch(entries: &[BatchToolEntry], highlight: bool, limits: &RenderLimi
         if let Some(annotation) = child_annotation(entry) {
             spans.push(Span::styled(format!(" ({annotation})"), t.tool_annotation));
         }
+        if let Some(elapsed) = child_elapsed(entry, limits.started.get(&index)) {
+            let clock = match entry.status {
+                BatchToolStatus::Running => format_live_duration(elapsed),
+                _ => format_settled_duration(elapsed),
+            };
+            spans.push(Span::styled(
+                format!("{CHILD_ACTIVITY_SEPARATOR}{clock}"),
+                t.tool_dim,
+            ));
+        }
         if let Some(tally) = limits.progress.get(&index).and_then(settled_tally) {
             spans.push(Span::styled(
                 format!("{CHILD_ACTIVITY_SEPARATOR}{tally}"),
@@ -1056,6 +1068,25 @@ fn child_annotation(entry: &BatchToolEntry) -> Option<String> {
         BatchToolStatus::Pending => Some(QUEUED_ANNOTATION.to_owned()),
         BatchToolStatus::Success => entry.output.as_ref().and_then(ToolOutput::annotation),
         BatchToolStatus::Running | BatchToolStatus::Error => None,
+    }
+}
+
+/// A child's clock, on the same terms a standalone card keeps one: wall time
+/// while it runs, and the command's own measured time once it lands.
+///
+/// `shell` alone, because `shell` alone reports a duration, and that one is
+/// persisted with the output, so a restored roster reads as the run did. A
+/// child that started before the roster was being timed has no clock rather
+/// than a wrong one.
+fn child_elapsed(entry: &BatchToolEntry, started: Option<&Instant>) -> Option<Duration> {
+    if entry.status == BatchToolStatus::Running {
+        return started
+            .filter(|_| names_tool(SHELL_TOOL_NAME, &entry.tool))
+            .map(|started| started.elapsed());
+    }
+    match entry.output.as_ref() {
+        Some(ToolOutput::Shell(output)) => Some(Duration::from_millis(output.duration_ms)),
+        _ => None,
     }
 }
 
@@ -2228,6 +2259,11 @@ pub type ChildProgress = Arc<HashMap<usize, ToolProgress>>;
 /// index in the roster.
 pub type ChildLive = Arc<HashMap<usize, String>>;
 
+/// When each still-running child of one batch started, by index in the roster.
+/// Only the children that report a duration of their own are in it, because
+/// only those draw a clock worth counting up.
+pub type ChildStarted = Arc<HashMap<usize, Instant>>;
+
 /// A fixed-height window onto a body that may be longer than it. `follow`
 /// pins the window to the tail, so a body still arriving keeps its newest
 /// lines on screen; scrolling up drops the pin and `offset` takes over.
@@ -2321,6 +2357,7 @@ pub struct RenderLimits {
     /// The tail each child that has not answered yet is streaming, by index
     /// in the roster.
     pub live: ChildLive,
+    pub started: ChildStarted,
     /// Every tool's budget rather than only this card's, because a batch child
     /// rests at the one its own tool would be drawn with.
     pub tool_lines: ToolOutputLines,
@@ -2340,6 +2377,7 @@ impl RenderLimits {
             views,
             progress: ChildProgress::default(),
             live: ChildLive::default(),
+            started: ChildStarted::default(),
             tool_lines,
             width: UNCONSTRAINED_WIDTH,
         }
@@ -2361,10 +2399,16 @@ impl RenderLimits {
         }
     }
 
-    pub fn with_progress(self, progress: ChildProgress, live: ChildLive) -> Self {
+    pub fn with_progress(
+        self,
+        progress: ChildProgress,
+        live: ChildLive,
+        started: ChildStarted,
+    ) -> Self {
         Self {
             progress,
             live,
+            started,
             ..self
         }
     }
@@ -2373,17 +2417,19 @@ impl RenderLimits {
         Self { width, ..self }
     }
 
-    /// Whether any child is still moving. A report is redrawn every tick from
-    /// a clock the highlight worker does not have, and a stream arrives as
-    /// often as the command prints, so a batch holding either renders here
-    /// instead of being sent out and spliced back stale.
+    /// Whether any child is still moving: a report redrawn every tick, a
+    /// stream arriving as often as the command prints, or a clock counting up.
+    /// A batch holding any of them renders here instead of being sent out and
+    /// spliced back stale.
     ///
-    /// Neither is in the worker's cache key, and neither usefully could be:
-    /// both move on every frame. Without this a streaming child shows the
+    /// None of them is in the worker's cache key, and none usefully could be:
+    /// they all move on every frame. Without this a streaming child shows the
     /// first window that reached the worker and then freezes there until the
-    /// call settles.
+    /// call settles, and a running child's clock freezes with it.
     pub fn has_live_rows(&self) -> bool {
-        !self.live.is_empty() || self.progress.values().any(ToolProgress::is_live)
+        !self.live.is_empty()
+            || !self.started.is_empty()
+            || self.progress.values().any(ToolProgress::is_live)
     }
 
     pub fn is_expanded(&self) -> bool {
@@ -2463,6 +2509,7 @@ impl RenderLimits {
             views: BatchViews::default(),
             progress: ChildProgress::default(),
             live: ChildLive::default(),
+            started: ChildStarted::default(),
             tool_lines: self.tool_lines,
             width: self.width.saturating_sub(BATCH_CHILD_INDENT_WIDTH),
         })
@@ -2478,6 +2525,10 @@ pub type BatchProgressMap = HashMap<String, ChildProgress>;
 /// The live output of every batch that has a child still streaming, by parent
 /// tool id.
 pub type BatchLiveMap = HashMap<String, ChildLive>;
+
+/// The start times of every batch that has a child still running a clock, by
+/// parent tool id.
+pub type BatchStartedMap = HashMap<String, ChildStarted>;
 
 /// What a body line belongs to, so a click can name a row after the async
 /// highlight has replaced the spans under it: a batch child by its roster
@@ -2771,7 +2822,7 @@ mod tests {
     use super::*;
     use crate::markdown::{EXPAND_AFFORDANCE, TRUNCATION_PREFIX};
     use caudra_agent::tools::{BATCH_TOOL_NAME, FILE_GREP_TOOL_NAME, ToolEffect};
-    use caudra_agent::{ActivityChild, GrepMatchGroup, SubagentActivity};
+    use caudra_agent::{ActivityChild, GrepMatchGroup, ShellOutput, SubagentActivity};
     use std::time::Duration;
     use test_case::test_case;
 
@@ -4427,6 +4478,86 @@ mod tests {
             status,
             ..batch_entry(SHELL_CHILD, 0)
         }
+    }
+
+    /// Back-dated far enough that the tenths are stable however slow the host
+    /// is, and a magnitude the settled formatter spells differently.
+    const CHILD_RAN_FOR: Duration = Duration::from_millis(1_201);
+    const CHILD_LIVE_CLOCK: &str = " · 1.2s";
+    const CHILD_MEASURED_MS: u64 = 10;
+    const CHILD_MEASURED_CLOCK: &str = " · 10ms";
+    const CHILD_TIMEOUT_MS: u64 = 120_000;
+    const CHILD_CLOCK_MSG: &str = "a child row keeps the clock its standalone card would";
+
+    fn started(index: usize, ago: Duration) -> RenderLimits {
+        RenderLimits {
+            started: Arc::new(HashMap::from([(index, Instant::now() - ago)])),
+            ..limits(BatchViews::default())
+        }
+    }
+
+    fn shell_child_output(duration_ms: u64) -> ToolOutput {
+        ToolOutput::Shell(ShellOutput {
+            model_text: String::new(),
+            relative_workdir: ".".into(),
+            timeout_ms: CHILD_TIMEOUT_MS,
+            duration_ms,
+            exit_code: Some(0),
+            signal: None,
+            timed_out: false,
+            output_limit_exceeded: false,
+            final_sequence: 0,
+            stdout_utf8_bytes: 0,
+            stderr_utf8_bytes: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+            stdout_capture_truncated: false,
+            stderr_capture_truncated: false,
+            stdout_preview_truncated: false,
+            stderr_preview_truncated: false,
+            stdout_redraws_collapsed: 0,
+            stderr_redraws_collapsed: 0,
+            filter: None,
+        })
+    }
+
+    #[test]
+    fn a_running_shell_child_counts_up() {
+        let card = render_batch(
+            &[shell_child(BatchToolStatus::Running)],
+            false,
+            &started(0, CHILD_RAN_FOR),
+        );
+        let row = line_text(&card.lines[0]);
+
+        assert!(row.ends_with(CHILD_LIVE_CLOCK), "{CHILD_CLOCK_MSG}: {row}");
+    }
+
+    /// The subprocess's own time supersedes the wall clock the row was drawn
+    /// with, exactly as a standalone card's header does.
+    #[test]
+    fn a_settled_shell_child_reports_the_commands_own_time() {
+        let entry = BatchToolEntry {
+            output: Some(shell_child_output(CHILD_MEASURED_MS)),
+            ..shell_child(BatchToolStatus::Success)
+        };
+        let card = render_batch(&[entry], false, &started(0, CHILD_RAN_FOR));
+        let row = line_text(&card.lines[0]);
+
+        assert!(row.ends_with(CHILD_MEASURED_CLOCK), "{CHILD_CLOCK_MSG}: {row}");
+        assert!(!row.contains(CHILD_LIVE_CLOCK), "{CHILD_CLOCK_MSG}: {row}");
+    }
+
+    /// Same row, same start time: only a child that measures itself gets one.
+    #[test]
+    fn a_non_shell_child_draws_no_clock() {
+        let entry = BatchToolEntry {
+            status: BatchToolStatus::Running,
+            ..batch_entry(GREP_CHILD, 0)
+        };
+        let card = render_batch(&[entry], false, &started(0, CHILD_RAN_FOR));
+
+        assert!(!line_text(&card.lines[0]).contains(CHILD_ACTIVITY_SEPARATOR));
     }
 
     /// Colour is the only thing left saying how a child went, so every state

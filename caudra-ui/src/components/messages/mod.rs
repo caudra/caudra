@@ -19,8 +19,8 @@ use super::{
     DisplayMessage, DisplayRole, DisplaySource, ToolProgress, ToolRole, ToolStatus,
     apply_scroll_rows,
     code_view::{
-        BatchLiveMap, BatchProgressMap, BatchViewMap, CardPolicy, Disclosure, RowTarget,
-        ScrollWindow,
+        BatchLiveMap, BatchProgressMap, BatchStartedMap, BatchViewMap, CardPolicy, Disclosure,
+        RowTarget, ScrollWindow,
     },
     review, workflow_card,
     workflow_card::CardHit,
@@ -891,6 +891,10 @@ pub struct MessagesPanel {
     /// output arrives addressed to an id no header has and is kept here until
     /// the child's own result supersedes it.
     batch_child_output: BatchLiveMap,
+    /// When each running batch child started, by parent tool id and child
+    /// index. Live chrome like the two above, and emptied as each child lands,
+    /// so a non-empty entry is exactly a card with a clock still counting.
+    batch_child_started: BatchStartedMap,
     /// One bar per window on screen, keyed exactly as `card_scroll` is, since
     /// a bar holds the anchor of a drag in progress and several windows can be
     /// visible at once. Entries for windows that are no longer drawn are swept
@@ -998,6 +1002,7 @@ impl MessagesPanel {
             batch_views: BatchViewMap::new(),
             batch_child_progress: BatchProgressMap::new(),
             batch_child_output: BatchLiveMap::new(),
+            batch_child_started: BatchStartedMap::new(),
             card_bars: HashMap::new(),
             card_windows: Vec::new(),
             armed_card: None,
@@ -1422,6 +1427,7 @@ impl MessagesPanel {
         self.batch_views.clear();
         self.batch_child_progress.clear();
         self.batch_child_output.clear();
+        self.batch_child_started.clear();
         self.card_bars.clear();
         self.card_windows.clear();
         self.armed_card = None;
@@ -1614,10 +1620,12 @@ impl MessagesPanel {
             msg.annotation = event.annotation;
             msg.render_header = event.render_header;
             self.settle_batch_snapshot(&event.id);
+            self.sync_child_clocks(&event.id);
             self.rebuild_tool_segment(&event.id);
             return;
         }
         self.flush();
+        let id = event.id.clone();
         let mut msg = DisplayMessage::new(
             DisplayRole::Tool(Box::new(ToolRole {
                 id: event.id,
@@ -1635,6 +1643,7 @@ impl MessagesPanel {
         msg.timestamp = Some(format_timestamp_now(self.clock_format));
         msg.tool_started = Some(Instant::now());
         self.messages.push(msg);
+        self.sync_child_clocks(&id);
     }
 
     pub fn batch_progress(&mut self, tool_id: &str, index: usize, entry: BatchToolEntry) {
@@ -1665,6 +1674,7 @@ impl MessagesPanel {
             entries,
             text: String::new(),
         }));
+        self.sync_child_clocks(tool_id);
         // What it was doing is stale the moment it stops, but what it did is
         // the only record of work its output does not show.
         if terminal {
@@ -1793,6 +1803,46 @@ impl MessagesPanel {
         }
     }
 
+    /// Puts a clock on every shell child that is running without one, and
+    /// takes it off every child that is not.
+    ///
+    /// Reconciled against the roster rather than stamped on the transition,
+    /// because a roster can arrive with a child already running — a start
+    /// re-delivered for a batch mid-flight does exactly that — and a clock
+    /// that is never started never counts. Leaving the map exactly the set of
+    /// running shell children is also what lets `refresh_live_progress` ask
+    /// whether it is empty instead of re-deriving the condition.
+    fn sync_child_clocks(&mut self, tool_id: &str) {
+        let ticking: Vec<usize> = match self
+            .tool_card(tool_id)
+            .and_then(|(index, _)| self.messages[index].tool_output.as_deref())
+        {
+            Some(ToolOutput::Batch { entries, .. }) => entries
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| {
+                    entry.status == BatchToolStatus::Running
+                        && names_tool(SHELL_TOOL_NAME, &entry.tool)
+                })
+                .map(|(index, _)| index)
+                .collect(),
+            _ => return,
+        };
+        if ticking.is_empty() {
+            self.batch_child_started.remove(tool_id);
+            return;
+        }
+        let children = Arc::make_mut(
+            self.batch_child_started
+                .entry(tool_id.to_owned())
+                .or_default(),
+        );
+        children.retain(|index, _| ticking.contains(index));
+        for index in ticking {
+            children.entry(index).or_insert_with(Instant::now);
+        }
+    }
+
     fn batch_child_running(&self, tool_id: &str, index: usize) -> bool {
         self.messages
             .iter()
@@ -1877,6 +1927,7 @@ impl MessagesPanel {
                 .for_each(ToolProgress::settle);
         }
         self.batch_child_output.remove(&event.id);
+        self.batch_child_started.remove(&event.id);
         let Some(msg) = self
             .messages
             .iter_mut()
@@ -2140,6 +2191,7 @@ impl MessagesPanel {
             self.retire_live_buf(id);
             self.remove_child_live_bufs(id);
             self.batch_child_output.remove(id);
+            self.batch_child_started.remove(id);
             self.live_body_dirty.remove(id);
             if let Some(children) = self.batch_child_progress.get_mut(id) {
                 Arc::make_mut(children)
@@ -4099,6 +4151,7 @@ impl MessagesPanel {
             batch_views: &self.batch_views,
             batch_progress: &self.batch_child_progress,
             batch_live: &self.batch_child_output,
+            batch_started: &self.batch_child_started,
         }
     }
 
@@ -4348,6 +4401,7 @@ impl MessagesPanel {
     /// `tool_output`, and the rebuild reuses its highlight results.
     fn refresh_live_progress(&mut self) {
         let progress = &self.batch_child_progress;
+        let started = &self.batch_child_started;
         let live: Vec<String> = self
             .messages
             .iter()
@@ -4366,7 +4420,10 @@ impl MessagesPanel {
                     || msg.progress.as_ref().is_some_and(ToolProgress::is_live)
                     || progress
                         .get(&tool.id)
-                        .is_some_and(|children| children.values().any(ToolProgress::is_live));
+                        .is_some_and(|children| children.values().any(ToolProgress::is_live))
+                    // Emptied as each child lands, so an entry that survives is
+                    // a roster row still counting up.
+                    || started.get(&tool.id).is_some_and(|children| !children.is_empty());
                 ticking.then(|| tool.id.clone())
             })
             .collect();

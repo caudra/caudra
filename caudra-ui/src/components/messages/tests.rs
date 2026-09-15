@@ -5655,6 +5655,57 @@ const SHELL_LIVE_CLOCK: &str = "· 1.2s";
 /// What `shell_done` reports as the command's own time.
 const SHELL_MEASURED_CLOCK: &str = "· 10ms";
 
+/// The card is cached after the first render, so a child's clock reaches the
+/// screen only if the clock-driven refresh rebuilds the batch. Driven through
+/// `tool_start` and `batch_progress` rather than by poking the map, so the
+/// roster, the clock and the refresh are all exercised the way the agent
+/// drives them.
+///
+/// Being withheld from the highlight worker is the other half of this, and is
+/// covered where the request is built: the worker does not deliver in a test,
+/// so a panel test cannot tell the two apart.
+#[test]
+fn a_running_shell_child_ticks_inside_a_batch() {
+    let mut panel = panel_with_tools(&[(TOOL_ID, BATCH_TOOL)]);
+    let mut event = start(TOOL_ID, BATCH_TOOL);
+    event.output = Some(ToolOutput::Batch {
+        entries: vec![pending_child(SHELL_TOOL_NAME)],
+        text: String::new(),
+    });
+    panel.tool_start(event);
+    panel.batch_progress(TOOL_ID, 0, running_child(SHELL_TOOL_NAME));
+    render(&mut panel, 80, 20);
+
+    let started = panel.batch_child_started[TOOL_ID][&0];
+    Arc::make_mut(panel.batch_child_started.get_mut(TOOL_ID).unwrap())
+        .insert(0, started - SHELL_RAN_FOR);
+    let text = buffer_text(&render(&mut panel, 80, 20));
+
+    assert!(text.contains(SHELL_LIVE_CLOCK), "{text}");
+}
+
+/// A roster can arrive with a child already running, so a clock stamped only
+/// on the transition would never start for it.
+#[test]
+fn a_batch_whose_roster_arrives_running_still_gets_a_clock() {
+    let panel = panel_with_running_shell();
+
+    assert!(panel.batch_child_started.contains_key("t1"));
+}
+
+#[test]
+fn a_settled_shell_child_drops_its_wall_clock() {
+    let mut panel = panel_with_running_shell();
+    assert!(panel.batch_child_started.contains_key("t1"));
+
+    panel.batch_progress("t1", 0, batch_child(SHELL_TOOL_NAME, "a"));
+
+    assert!(
+        !panel.batch_child_started.contains_key("t1"),
+        "a card with nothing counting must not ask to be repainted"
+    );
+}
+
 /// The card is cached after the first render, so the clock only advances if
 /// the clock-driven refresh knows to rebuild it.
 #[test]

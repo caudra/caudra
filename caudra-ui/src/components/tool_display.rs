@@ -5,8 +5,8 @@ use crate::animation::{spinner_frame, spinner_str};
 use crate::theme;
 use caudra_config::{ClockFormat, ToolOutputLines};
 use code_view::{
-    BatchLiveMap, BatchProgressMap, BatchViewMap, BatchViews, BodySource, CardPolicy, Disclosure,
-    RenderLimits, RowTarget, ScrollSpan, ScrollWindow, SourceTrace,
+    BatchLiveMap, BatchProgressMap, BatchStartedMap, BatchViewMap, BatchViews, BodySource,
+    CardPolicy, Disclosure, RenderLimits, RowTarget, ScrollSpan, ScrollWindow, SourceTrace,
 };
 
 use std::borrow::Cow;
@@ -62,6 +62,8 @@ pub struct RenderCtx<'a> {
     /// id. A child's own header does not exist, so its output is drawn from
     /// here or not at all.
     pub batch_live: &'a BatchLiveMap,
+    /// When each batch's still-running children started, by parent tool id.
+    pub batch_started: &'a BatchStartedMap,
 }
 
 impl RenderCtx<'_> {
@@ -78,10 +80,14 @@ impl RenderCtx<'_> {
             .and_then(|id| self.batch_live.get(id))
             .cloned()
             .unwrap_or_default();
+        let started = tool_id
+            .and_then(|id| self.batch_started.get(id))
+            .cloned()
+            .unwrap_or_default();
         RenderLimits::new(full, budget, views, *self.tool_output_lines)
             .with_scroll(self.card_scroll)
             .with_policy(self.policy.clone(), self.child_scroll.clone())
-            .with_progress(progress, live)
+            .with_progress(progress, live, started)
             .with_width(self.width.saturating_sub(TOOL_BODY_INDENT_WIDTH))
     }
 
@@ -2088,8 +2094,8 @@ mod tests {
         ToolEffect,
     };
     use caudra_agent::{
-        GrepFileEntry, GrepMatchGroup, ShellFilterInfo, SnapshotLine, SnapshotSpan,
-        SubagentActivity, TextOutput, ToolInput, ToolOutput,
+        BatchToolEntry, BatchToolStatus, GrepFileEntry, GrepMatchGroup, ShellFilterInfo,
+        SnapshotLine, SnapshotSpan, SubagentActivity, TextOutput, ToolInput, ToolOutput,
     };
     use std::time::Duration;
     use test_case::test_case;
@@ -2099,6 +2105,8 @@ mod tests {
     static NO_PROGRESS: std::sync::LazyLock<BatchProgressMap> =
         std::sync::LazyLock::new(BatchProgressMap::new);
     static NO_LIVE: std::sync::LazyLock<BatchLiveMap> = std::sync::LazyLock::new(BatchLiveMap::new);
+    static NO_STARTED: std::sync::LazyLock<BatchStartedMap> =
+        std::sync::LazyLock::new(BatchStartedMap::new);
 
     fn test_rctx(width: u16) -> RenderCtx<'static> {
         RenderCtx {
@@ -2114,6 +2122,7 @@ mod tests {
             batch_views: &NO_VIEWS,
             batch_progress: &NO_PROGRESS,
             batch_live: &NO_LIVE,
+            batch_started: &NO_STARTED,
         }
     }
 
@@ -3604,6 +3613,76 @@ mod tests {
         let tl = build_tool_lines(&msg, ToolStatus::InProgress, &test_rctx(80), None);
 
         assert!(!line_text(&tl.lines[0]).contains(DURATION_SEPARATOR));
+    }
+
+    fn code_child() -> BatchToolEntry {
+        BatchToolEntry {
+            tool: FILE_READ_TOOL_NAME.into(),
+            effect: ToolEffect::Unknown,
+            summary: SOURCE_PATH.into(),
+            status: BatchToolStatus::Success,
+            input: None,
+            raw_input: None,
+            output: Some(ToolOutput::ReadCode {
+                path: SOURCE_PATH.into(),
+                start_line: 1,
+                lines: vec!["fn main() {}".into()],
+                total_lines: 1,
+                instructions: None,
+            }),
+            annotation: None,
+            model_suffix: None,
+        }
+    }
+
+    fn running_shell_child() -> BatchToolEntry {
+        BatchToolEntry {
+            tool: SHELL_TOOL_NAME.into(),
+            status: BatchToolStatus::Running,
+            output: None,
+            ..code_child()
+        }
+    }
+
+    fn batch_of(entries: Vec<BatchToolEntry>, started: &BatchStartedMap) -> ToolLines {
+        let mut msg = bash_msg("batch", ToolStatus::InProgress, None, None);
+        if let DisplayRole::Tool(tool) = &mut msg.role {
+            tool.name = BATCH_TOOL_NAME.into();
+        }
+        msg.tool_output = Some(Arc::new(ToolOutput::Batch {
+            entries,
+            text: String::new(),
+        }));
+        let rctx = RenderCtx {
+            batch_started: started,
+            ..test_rctx(80)
+        };
+        build_tool_lines(&msg, ToolStatus::InProgress, &rctx, Some(Disclosure::default()))
+    }
+
+    /// A clock is a moving row. The worker's cache key cannot see it, so a
+    /// batch holding one has to be withheld: the answer spliced back over
+    /// those rows freezes the number the reader is watching, which is what
+    /// `reuse_highlight` then keeps doing every frame.
+    #[test]
+    fn a_batch_with_a_ticking_child_is_withheld_from_the_worker() {
+        let clocked = BatchStartedMap::from([(
+            "t1".to_owned(),
+            Arc::new(HashMap::from([(1_usize, Instant::now())])),
+        )]);
+
+        assert!(
+            batch_of(vec![code_child()], &BatchStartedMap::new())
+                .highlight
+                .is_some(),
+            "a settled batch is the worker's whole purpose"
+        );
+        assert!(
+            batch_of(vec![code_child(), running_shell_child()], &clocked)
+                .highlight
+                .is_none(),
+            "a batch with a clock counting up must render locally every frame"
+        );
     }
 
     /// Same card, same start time: only `shell` reports a duration of its own,
