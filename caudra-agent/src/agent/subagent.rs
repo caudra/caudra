@@ -967,6 +967,10 @@ fn build(
     fast: bool,
     name: String,
 ) -> Result<Subagent, String> {
+    // A deferred definition starts outside the request, so it is absent from
+    // `tools`. Leaving it out of the filter too would let the child load a tool
+    // with `tool_search` that dispatch then refuses. It goes in ahead of the
+    // config intersect, which is what keeps a disabled tool disabled.
     let tool_filter = ToolFilter::Only(
         resolved
             .tools
@@ -976,6 +980,7 @@ fn build(
             .filter_map(|definition| definition.get("name")?.as_str().map(str::to_owned))
             .collect(),
     )
+    .including(resolved.deferred.iter().map(|tool| tool.name.to_string()))
     .intersect(&ToolFilter::from_config(&ctx.config, &resolved.model, &[]))
     .including(local_tools.keys().cloned())
     .for_mode(&resolved.mode);
@@ -1112,6 +1117,8 @@ mod tests {
         ContextUsage, ContextWindow,
     };
     use crate::tools::BATCH_TOOL_NAME;
+    use crate::tools::registry::Tool;
+    use crate::tools::test_support::NamedMock;
     use crate::{BatchToolStatus, ToolDoneEvent, TurnCompleteEvent};
     use caudra_providers::{Billing, ContentBlock, Message, Role};
     use caudra_storage::usage_ledger::LedgerPurpose;
@@ -1130,6 +1137,9 @@ mod tests {
     const REMOTE_PLATFORM: &str = "remote-os";
     const PLAN_PATH: &str = "plan.md";
     const ENVIRONMENT_MISSING: &str = "a task must be told its environment";
+    /// A real entry of `DEFERRED_BUILTIN_TOOLS`, so the split under test happens.
+    const DEFERRED_TOOL: &str = "python_execution";
+    const MAIN_ONLY_TOOL: &str = "main_only_mock";
     const PUBLISHER_MISSING: &str = "subagent must inherit a task-scoped context publisher";
     const IGNORED_ERROR: &str = "handled by the session caller";
     const DONE_USAGE: TokenUsage = tokens(150, 30);
@@ -1292,6 +1302,41 @@ mod tests {
 
             assert!(subagent.environment.is_none());
             assert!(subagent.mode_notice.is_none());
+            subagent.close();
+        });
+    }
+
+    /// `tool_search` can load a deferred builtin into the child's next request,
+    /// so the filter dispatch judges it by has to know the name too. What the
+    /// child's audience never offered stays out.
+    #[test_case(DEFERRED_TOOL, true ; "a_loadable_builtin_stays_callable")]
+    #[test_case(MAIN_ONLY_TOOL, false ; "a_tool_outside_the_audience_does_not")]
+    fn a_task_may_call_what_it_was_allowed_to_load(tool: &str, callable: bool) {
+        smol::block_on(async {
+            let mut ctx = crate::tools::test_support::stub_ctx(&AgentMode::Build);
+            // Pinned rather than left to the model's class, so the split under
+            // test happens wherever this runs.
+            ctx.config.defer_builtin_tools = caudra_config::DeferBuiltinTools::Always;
+            ctx.registry
+                .register_many([
+                    (
+                        Arc::new(NamedMock::new(DEFERRED_TOOL, ToolAudience::all()))
+                            as Arc<dyn Tool>,
+                        NamedMock::source(),
+                    ),
+                    (
+                        Arc::new(NamedMock::new(MAIN_ONLY_TOOL, ToolAudience::MAIN))
+                            as Arc<dyn Tool>,
+                        NamedMock::source(),
+                    ),
+                ])
+                .unwrap();
+
+            let mut subagent = open_task(&ctx, task_options(Some(SubagentTaskMode::Build)))
+                .await
+                .unwrap();
+
+            assert_eq!(subagent.params.tool_filter.matches(tool), callable);
             subagent.close();
         });
     }

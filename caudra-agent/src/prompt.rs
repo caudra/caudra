@@ -631,7 +631,12 @@ pub fn assemble_task_with_filter(
     instructions: &str,
     profile: Option<&SystemPromptProfile>,
 ) -> String {
-    assemble_task(mode, &slots.with_native_hints(filter), instructions, profile)
+    assemble_task(
+        mode,
+        &slots.with_native_hints(filter),
+        instructions,
+        profile,
+    )
 }
 
 /// Fill each host template marker once. Inserted content is opaque and is not

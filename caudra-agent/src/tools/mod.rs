@@ -859,6 +859,62 @@ pub mod test_support {
         }
     }
 
+    pub const MOCK_TOOL_OUTPUT: &str = "mock";
+
+    /// A tool whose name and audience the caller chooses, so a test can pin one
+    /// to a real deferred builtin name and watch what the split does with it.
+    pub struct NamedMock(&'static str, ToolAudience);
+
+    struct NamedInvocation;
+
+    impl registry::ToolInvocation for NamedInvocation {
+        fn start_header(&self) -> registry::HeaderFuture {
+            registry::HeaderFuture::Ready(registry::HeaderResult::plain(MOCK_TOOL_OUTPUT.into()))
+        }
+        fn execute<'a>(self: Box<Self>, _ctx: &'a ToolContext) -> registry::ExecFuture<'a> {
+            Box::pin(async {
+                registry::ToolExecResult::from(Ok::<_, String>(ToolOutput::Plain(
+                    MOCK_TOOL_OUTPUT.into(),
+                )))
+            })
+        }
+    }
+
+    impl registry::Tool for NamedMock {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn description(&self, _ctx: &DescriptionContext) -> Cow<'_, str> {
+            MOCK_TOOL_OUTPUT.into()
+        }
+        fn schema(&self) -> Value {
+            serde_json::json!({"type": "object", "properties": {}, "additionalProperties": false})
+        }
+        fn audience(&self) -> ToolAudience {
+            self.1
+        }
+        fn parse(
+            &self,
+            _input: &Value,
+        ) -> Result<Box<dyn registry::ToolInvocation>, registry::ParseError> {
+            Ok(Box::new(NamedInvocation))
+        }
+    }
+
+    impl NamedMock {
+        pub fn new(name: &'static str, audience: ToolAudience) -> Self {
+            Self(name, audience)
+        }
+
+        pub fn source() -> registry::ToolSource {
+            registry::ToolSource::Native {
+                owner: Arc::from(MOCK_TOOL_OUTPUT),
+                contract: Arc::from(MOCK_TOOL_OUTPUT),
+                trusted: true,
+            }
+        }
+    }
+
     static TEST_PERMISSIONS: LazyLock<Arc<PermissionManager>> = LazyLock::new(|| {
         Arc::new(PermissionManager::new_nonpersistent(
             caudra_config::PermissionsConfig {

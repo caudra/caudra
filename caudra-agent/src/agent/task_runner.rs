@@ -727,11 +727,12 @@ mod tests {
     use super::*;
     use crate::cancel::CancelTrigger;
     use crate::tools::DescriptionContext;
+    use crate::tools::TOOL_SEARCH_TOOL_NAME;
     use crate::tools::registry::BoxFuture;
     use crate::tools::registry::{
         ExecFuture, HeaderFuture, HeaderResult, ParseError, Tool, ToolInvocation, ToolSource,
     };
-    use crate::tools::test_support::stub_ctx_with;
+    use crate::tools::test_support::{MOCK_TOOL_OUTPUT, NamedMock, stub_ctx_with};
     use crate::workflow::{RuntimeDeps, WorkflowRuntime, WorkspaceRebind};
     use caudra_storage::{StateDir, id::CaudraId};
     use caudra_workflow::{
@@ -740,6 +741,9 @@ mod tests {
     use caudra_workspace::WorkspacePath;
 
     const CALL_ID: &str = "toolu_01";
+    const SEARCH_CALL_ID: &str = "toolu_search";
+    const LOADED_CALL_ID: &str = "toolu_loaded";
+    const DEFERRED_TOOL: &str = "python_execution";
     const FRESH_ID: &str = "wf-run-1-call-7";
     const LABEL: &str = "find auth";
     const PROMPT: &str = "search the codebase";
@@ -1161,6 +1165,55 @@ mod tests {
             partial: None,
         });
         assert_eq!(message, format!("{ERROR_PREFIX}{BOOM}"));
+    }
+
+    /// The whole round trip, because each half passes its own test while the
+    /// pair disagrees: `tool_search` puts a deferred definition in the next
+    /// request, and dispatch judges the call against a filter built when the
+    /// session opened. A child that loads a tool must be able to call it.
+    #[test]
+    fn a_task_can_call_a_builtin_it_loaded_with_tool_search() {
+        smol::block_on(async {
+            let provider = ScriptedProvider::new(vec![
+                response(
+                    vec![ContentBlock::tool_use(
+                        SEARCH_CALL_ID,
+                        TOOL_SEARCH_TOOL_NAME,
+                        json!({ "query": DEFERRED_TOOL }),
+                    )],
+                    StopReason::ToolUse,
+                    FIRST_TURN,
+                ),
+                response(
+                    vec![ContentBlock::tool_use(
+                        LOADED_CALL_ID,
+                        DEFERRED_TOOL,
+                        json!({}),
+                    )],
+                    StopReason::ToolUse,
+                    FIRST_TURN,
+                ),
+                text_response(SUMMARY, SECOND_TURN),
+            ]);
+            let observed = Arc::clone(&provider.requests);
+            let mut ctx = ctx_with(AgentMode::Build, provider);
+            ctx.config.defer_builtin_tools = caudra_config::DeferBuiltinTools::Always;
+            ctx.registry
+                .register(
+                    Arc::new(NamedMock::new(DEFERRED_TOOL, ToolAudience::all())),
+                    NamedMock::source(),
+                )
+                .unwrap();
+
+            let outcome = run_task(&ctx, request(TaskIdentity::Derive, None)).await;
+
+            assert!(outcome.success, "{:?}", outcome.error);
+            let transcript = format!("{:?}", observed.lock().unwrap().last().unwrap());
+            assert!(
+                transcript.contains(MOCK_TOOL_OUTPUT),
+                "the loaded tool must have run: {transcript}"
+            );
+        });
     }
 
     /// A caller that asked for a command runner and was handed a read-only
