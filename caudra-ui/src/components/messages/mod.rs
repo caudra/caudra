@@ -12,7 +12,7 @@ use layout::{SegmentChrome, SegmentKind};
 use super::tool_display::{
     RenderCtx, ToolLines, append_annotation, append_right_info, assistant_style,
     build_instructions_lines, build_tool_lines, done_style, draws_live_script, error_style,
-    format_timestamp_now, notice_style, thinking_style, truncate_to_header, user_style,
+    format_timestamp_now, names_tool, notice_style, thinking_style, truncate_to_header, user_style,
 };
 use super::{
     DisplayMessage, DisplayRole, DisplaySource, ToolProgress, ToolRole, ToolStatus,
@@ -3817,12 +3817,19 @@ impl MessagesPanel {
                         metadata.push_str(" | Annotation: ");
                         metadata.push_str(&markdown_inline(annotation));
                     }
+                    // A batch copies as its children's sections, each already
+                    // fenced where it needed to be, so fencing the card too
+                    // would flatten the hierarchy back into one block. A
+                    // selection that stayed inside one child's code still names
+                    // a language, and that still gets a fence of its own.
+                    let fenced =
+                        fragment.language.is_some() || !names_tool(BATCH_TOOL_NAME, tool_name);
                     self.append_selection_section(
                         &mut document,
                         &heading,
                         Some(&metadata),
                         fragment.text.as_str(),
-                        true,
+                        fenced,
                         fragment.language.as_deref(),
                     );
                     continue;

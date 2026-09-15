@@ -8419,7 +8419,7 @@ fn code_block_and_card_rows(
     let mut start = 0u32;
     for segment in panel.cache.segments() {
         let height = u32::from(segment.height(width));
-        if let Some((rows, _)) = segment.code_block_rows(width) {
+        if let Some((rows, _)) = segment.code_blocks(width).into_iter().next() {
             let first = start + u32::from(segment.chrome(width).content_start());
             return (
                 first + u32::from(rows.start)..first + u32::from(rows.end),
@@ -8611,8 +8611,64 @@ fn copying_a_windowed_output_takes_the_rows_that_were_drawn() {
     assert_eq!(copied, drawn, "{WINDOWED_MSG}");
 }
 
+/// The reported defect: ten calls inside a batch copied as one undivided
+/// block, with nothing left saying which output belonged to which call. Each
+/// child is a section of the card, and its body is fenced where it sits so a
+/// tool's printed lines do not reflow into the prose around them.
+#[test]
+fn copying_a_batch_keeps_a_section_per_child() {
+    const SECTION_MSG: &str =
+        "a batch copies as one section per child, or its calls run together into one block";
+    const FENCE: &str = "```";
+    const CHILDREN: [&str; 2] = [FILE_WRITE_TOOL_NAME, FILE_EDIT_TOOL_NAME];
+
+    let mut panel = panel_with_tools(&[(TOOL_ID, BATCH_TOOL)]);
+    panel.tool_done(ToolDoneEvent {
+        tool: BATCH_TOOL.into(),
+        output: ToolOutput::Batch {
+            entries: CHILDREN
+                .iter()
+                .enumerate()
+                .map(|(index, tool)| batch_child(tool, &index.to_string()))
+                .collect(),
+            text: String::new(),
+        },
+        ..done(TOOL_ID)
+    });
+    // A lone fragment copies raw, so the card needs a neighbour before the
+    // selection becomes the markdown document this is about.
+    panel.push(DisplayMessage::new(
+        DisplayRole::Assistant,
+        "Finished".into(),
+    ));
+
+    let copied = extract_entire_document(&mut panel);
+    let card = copied
+        .split("## Tool:")
+        .nth(1)
+        .unwrap_or_else(|| panic!("{SECTION_MSG}: {copied}"));
+    let first = card
+        .find("### 1.")
+        .unwrap_or_else(|| panic!("{SECTION_MSG}: {copied}"));
+
+    // A heading inside a fence is literal text, so the card must not open one.
+    assert!(!card[..first].contains(FENCE), "{SECTION_MSG}: {copied}");
+    for (index, tool) in CHILDREN.iter().enumerate() {
+        assert!(
+            card.contains(&format!("### {}. `{tool}`", index + 1)),
+            "{SECTION_MSG}: {copied}"
+        );
+        assert!(
+            card.contains(&format!("{BATCH_CHILD_BODY}_{index}")),
+            "{SECTION_MSG}: {copied}"
+        );
+    }
+    assert!(card.contains(FENCE), "{SECTION_MSG}: {copied}");
+}
+
 /// A renderer that names no source has to keep copying by scraping the screen,
-/// which is all a diff, a grep or a batch card can do.
+/// which is all a diff or a grep can do. A batch card names one as far as its
+/// children do, and falls back to scraping the moment any of them cannot.
 #[test]
 fn a_card_that_records_no_source_still_copies_by_scraping() {
     const SCRAPE_MSG: &str = "a card whose body records no source still copies what it drew";

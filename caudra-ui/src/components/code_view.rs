@@ -1,10 +1,12 @@
 use std::collections::HashMap;
+use std::iter;
 use std::ops::Range;
 use std::sync::Arc;
 
 use crate::highlight::{fallback_span, highlight_line};
 use crate::markdown::{expand_notice, should_truncate, text_to_wrapped, truncation_notice};
 use crate::provenance::LineProvenance;
+use crate::selection::wrap_breaks;
 use crate::theme;
 
 use super::tool_display::{
@@ -76,6 +78,9 @@ const MARK_REINDENTED: char = '~';
 /// Parts a card's source blocks by the blank row drawn between them, so a
 /// selection spanning both copies the gap it saw rather than closing it.
 const BLOCK_GAP: &str = "\n\n";
+/// One level under the heading a copied tool card opens with, so a batch's
+/// children read as its sections rather than as cards of their own.
+const CHILD_HEADING_LEVEL: &str = "###";
 
 pub(crate) fn instruction_limit(expanded: bool) -> usize {
     if expanded {
@@ -122,9 +127,10 @@ fn highlight_spans(hl: &mut caudra_highlight::Highlighter, text: &str) -> Vec<Sp
 pub struct BodySource {
     pub text: String,
     pub rows: Vec<LineProvenance>,
-    /// The rows holding source code, and what to call it, so a copy that ran
-    /// past the block can fence it rather than drop code into prose.
-    pub code: Option<CodeBlock>,
+    /// The runs of rows holding source code, and what to call each, so a copy
+    /// that ran past one can fence it rather than drop code into prose. A batch
+    /// card holds one per child, which is why this is not a single block.
+    pub code: Vec<CodeBlock>,
 }
 
 /// Where a card's code sits among its painted rows, and the language a fence
@@ -151,9 +157,9 @@ impl BodySource {
         self.rows.iter().any(|row| row.line.is_some())
     }
 
-    /// Names the code block after the language a tool declared for it.
+    /// Names the code blocks after the language a tool declared for them.
     fn named(mut self, language: &str) -> Self {
-        if let Some(code) = self.code.as_mut() {
+        for code in &mut self.code {
             code.language = Some(language.to_owned());
         }
         self
@@ -186,7 +192,7 @@ impl BodySource {
 pub struct SourceTrace {
     text: String,
     rows: Vec<Option<LineProvenance>>,
-    code: Option<CodeBlock>,
+    code: Vec<CodeBlock>,
     abandoned: bool,
 }
 
@@ -202,11 +208,11 @@ impl SourceTrace {
         for row in &mut body.rows {
             rebase_row(row, base);
         }
-        if let Some(mut code) = body.code {
+        self.code.extend(body.code.into_iter().map(|mut code| {
             code.rows.start += start;
             code.rows.end += start;
-            self.code.get_or_insert(code);
-        }
+            code
+        }));
         self.rows.resize(start, None);
         self.rows.extend(body.rows.into_iter().map(Some));
     }
@@ -256,7 +262,7 @@ pub fn text_body(text: &str, chrome_spans: usize) -> BodySource {
     BodySource {
         text: text.to_owned(),
         rows,
-        code: None,
+        code: Vec::new(),
     }
 }
 
@@ -323,7 +329,7 @@ fn render_code(
     let mut source = BodySource {
         text: shown.join("\n"),
         rows: Vec::with_capacity(shown.len()),
-        code: None,
+        code: Vec::new(),
     };
     let mut at = 0u32;
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(shown.len());
@@ -338,7 +344,7 @@ fn render_code(
         at += text.len() as u32 + 1;
         lines.push(Line::from(spans));
     }
-    source.code = Some(CodeBlock {
+    source.code.push(CodeBlock {
         rows: 0..lines.len(),
         language: None,
     });
@@ -866,18 +872,19 @@ fn render_batch(
     entries: &[BatchToolEntry],
     highlight: bool,
     limits: &RenderLimits,
-) -> (Vec<Line<'static>>, Vec<Option<RowTarget>>, Vec<ScrollSpan>) {
+) -> BatchCard {
     let t = theme::current();
     let mut lines = Vec::new();
     let mut rows = Vec::new();
     let mut spans_out = Vec::new();
+    let mut trace = SourceTrace::default();
     let mut previous_has_body = false;
     for (index, entry) in entries.iter().enumerate() {
         let view = limits.child(index, entry);
         // Resolved before the summary row so the separator below knows whether
         // this child is a list entry or a block.
         let body = view.map(|child| child_body(entry, highlight, &child, limits.live.get(&index)));
-        let has_body = body.as_ref().is_some_and(|(lines, ..)| !lines.is_empty());
+        let has_body = body.as_ref().is_some_and(|body| !body.lines.is_empty());
         // Every row of a child answers for it, whether or not a click would
         // change what is drawn: this is also how a dispatched child's rows are
         // traced back to the subagent they belong to.
@@ -943,17 +950,25 @@ fn render_batch(
         if body.is_none() && holds_a_body(entry) {
             spans.push(Span::styled(BATCH_FOLDED_MARK, t.tool_dim));
         }
+        // A child is a section of the card, not another run of its output, so
+        // its summary row copies as the heading that says whose output follows.
+        // Without it ten calls reach the clipboard as one undivided block.
+        trace.record(lines.len(), child_heading(index, entry, spans.len()));
         lines.push(Line::from(spans));
         rows.push(target);
         // A child's own output is content and clears the trunk; what the child
         // dispatched hangs off it as nodes. Content first, so reading down a
         // child never steps back out to a shallower level than the row above.
-        if let Some((body, _, span)) = body {
-            if let Some(span) = span {
+        if let Some(body) = body {
+            if let Some(span) = body.span {
                 spans_out.push(span.shifted(lines.len(), Some(index)));
             }
-            rows.resize(rows.len() + body.len(), target);
-            lines.extend(indent_all(body, continuation));
+            rows.resize(rows.len() + body.lines.len(), target);
+            match body.source {
+                Some(source) => trace.record(lines.len(), source.indented()),
+                None => trace.abandon(),
+            }
+            lines.extend(indent_all(body.lines, continuation));
         }
         if let Some(progress) = limits.progress.get(&index).filter(|p| p.is_live()) {
             let progress_lines = child_progress_lines(progress, continuation);
@@ -961,7 +976,46 @@ fn render_batch(
             lines.extend(progress_lines);
         }
     }
-    (lines, rows, spans_out)
+    BatchCard {
+        source: trace.finish(&lines),
+        lines,
+        rows,
+        spans: spans_out,
+    }
+}
+
+/// The heading a child's summary row copies as, numbered so a reader can match
+/// a section against the roster they were looking at.
+///
+/// The row's own spans name nothing: the connector, the sigil and the tense are
+/// the card's way of saying what the heading says in words, and copying the
+/// glyphs would put box-drawing characters in the middle of a document.
+fn child_heading(index: usize, entry: &BatchToolEntry, span_count: usize) -> BodySource {
+    let summary = entry.summary.trim();
+    let gap = if summary.is_empty() { "" } else { " " };
+    let text = format!(
+        "{CHILD_HEADING_LEVEL} {}. `{}`{gap}{summary}",
+        index + 1,
+        entry.tool
+    );
+    BodySource {
+        rows: Vec::from([LineProvenance {
+            line: Some(0..text.len() as u32),
+            spans: vec![SpanSource::Chrome; span_count],
+        }]),
+        text,
+        code: Vec::new(),
+    }
+}
+
+/// What a batch card draws, with the rows and the source every line of it has
+/// to be readable through: a click resolves a row to the child that owns it,
+/// and a selection resolves it to the text that child answered with.
+struct BatchCard {
+    lines: Vec<Line<'static>>,
+    rows: Vec<Option<RowTarget>>,
+    spans: Vec<ScrollSpan>,
+    source: Option<BodySource>,
 }
 
 /// Whether opening this child would show anything, which is what the folded
@@ -1069,43 +1123,118 @@ fn child_body(
     highlight: bool,
     limits: &RenderLimits,
     live: Option<&String>,
-) -> (Vec<Line<'static>>, bool, Option<ScrollSpan>) {
+) -> ChildBody {
     let output = entry.output.as_ref();
     // Every answer that is text goes through one place, so no arm can be the
     // one that forgets the script. `render_tool_content` draws the script
     // itself, which is why structured output is the exception here rather than
     // a case alongside the others.
     let text = if entry.status == BatchToolStatus::Error {
-        Some(text_lines(
-            output.map_or(String::new(), ToolOutput::as_text),
+        Some(plain_body(
+            &output.map_or(String::new(), ToolOutput::as_text),
+            limits.width,
         ))
     } else if let Some(tail) = live.filter(|text| output.is_none() && !text.is_empty()) {
-        Some(text_lines(tail.clone()))
+        Some(plain_body(tail, limits.width))
     } else {
         match output {
-            Some(ToolOutput::Markdown(text)) => Some(markdown_lines(&text.text, limits.width)),
+            Some(ToolOutput::Markdown(text)) => Some(markdown_body(&text.text, limits.width)),
             Some(ToolOutput::Plain(text) | ToolOutput::ReadDir(text)) => {
-                Some(text_lines(text.text.clone()))
+                Some(plain_body(&text.text, limits.width))
             }
-            Some(ToolOutput::Shell(shell)) => Some(text_lines(shell.raw_text())),
+            Some(ToolOutput::Shell(shell)) => Some(plain_body(&shell.raw_text(), limits.width)),
             _ => None,
         }
     };
     match text {
-        Some(lines) => {
+        Some((lines, source)) => {
             // A child that has answered has no tail left to chase, so its
             // footer is told to report where the window sits and nothing more.
             let tail = match entry.output.is_none() {
                 true => ScrollTail::Live,
                 false => ScrollTail::Settled,
             };
-            with_script(entry, highlight, limits, child_view(lines, limits, tail))
+            let body = child_view(ChildBody::traced(lines, source), limits, tail);
+            with_script(entry, highlight, limits, body)
         }
         None => {
             let content =
                 render_tool_content(entry.input.as_ref(), output, highlight, limits.clone());
-            (content.lines, content.truncation, None)
+            ChildBody {
+                lines: content.lines,
+                source: content.source,
+                truncation: content.truncation,
+                span: None,
+            }
         }
+    }
+}
+
+/// A child's body with everything that has to stay parallel to its lines.
+///
+/// The rows travel with the lines because a window, a budget and a script each
+/// change the line count between here and the card: a row one of them left
+/// behind points a copy at text that was never drawn.
+struct ChildBody {
+    lines: Vec<Line<'static>>,
+    /// `None` where a renderer in the body named no source at all, which hands
+    /// the card it lands in back to the scraping fallback.
+    source: Option<BodySource>,
+    truncation: bool,
+    span: Option<ScrollSpan>,
+}
+
+impl ChildBody {
+    fn traced(lines: Vec<Line<'static>>, source: BodySource) -> Self {
+        Self {
+            lines,
+            source: Some(source),
+            truncation: false,
+            span: None,
+        }
+    }
+
+    /// Keeps the rows behind the lines a window or a budget kept, giving the
+    /// body up when they can no longer be told to line up. The blocks move with
+    /// them, or a fence would land around rows the window never drew.
+    fn keep_rows(&mut self, kept: Range<usize>) {
+        self.source = self.source.take().and_then(|mut source| {
+            source.rows = source.rows.get(kept.clone())?.to_vec();
+            source.code = source
+                .code
+                .into_iter()
+                .filter_map(|block| {
+                    let start = block.rows.start.max(kept.start);
+                    let end = block.rows.end.min(kept.end);
+                    (start < end).then(|| CodeBlock {
+                        rows: start - kept.start..end - kept.start,
+                        ..block
+                    })
+                })
+                .collect();
+            Some(source)
+        });
+    }
+
+    /// Marks a line the body was closed with, which is chrome wherever it came
+    /// from: a scroll footer or a truncation notice.
+    fn push_chrome(&mut self) {
+        if let Some(source) = self.source.as_mut() {
+            source.push_chrome(1);
+        }
+    }
+
+    /// Holds the body to the budget its own card would hold it to, and says how
+    /// much that hid.
+    fn capped(mut self, budget: usize) -> Self {
+        let (lines, truncated) = capped(std::mem::take(&mut self.lines), budget);
+        self.lines = lines;
+        if truncated {
+            self.keep_rows(0..budget);
+            self.push_chrome();
+        }
+        self.truncation |= truncated;
+        self
     }
 }
 
@@ -1140,20 +1269,33 @@ fn with_script(
     entry: &BatchToolEntry,
     highlight: bool,
     limits: &RenderLimits,
-    body: (Vec<Line<'static>>, bool, Option<ScrollSpan>),
-) -> (Vec<Line<'static>>, bool, Option<ScrollSpan>) {
-    let (output, truncation, span) = body;
+    body: ChildBody,
+) -> ChildBody {
     if entry.input.is_none() {
-        return (output, truncation, span);
+        return body;
     }
-    let mut lines =
-        render_tool_content(entry.input.as_ref(), None, highlight, limits.clone()).lines;
-    if !lines.is_empty() && !output.is_empty() {
+    let script = render_tool_content(entry.input.as_ref(), None, highlight, limits.clone());
+    let mut lines = script.lines;
+    if !lines.is_empty() && !body.lines.is_empty() {
         lines.push(Line::default());
     }
     let shift = lines.len();
-    lines.extend(output);
-    (lines, truncation, span.map(|span| span.shift_lines(shift)))
+    lines.extend(body.lines);
+    // The two halves were painted from different texts, so their ranges are
+    // rebased onto the one the card ends up holding rather than spliced.
+    let mut trace = SourceTrace::default();
+    for (start, source) in [(0, script.source), (shift, body.source)] {
+        match source {
+            Some(source) => trace.record(start, source),
+            None => trace.abandon(),
+        }
+    }
+    ChildBody {
+        source: trace.finish(&lines),
+        lines,
+        truncation: body.truncation,
+        span: body.span.map(|span| span.shift_lines(shift)),
+    }
 }
 
 /// Holds a child to its window when it scrolls and to its budget otherwise.
@@ -1162,30 +1304,30 @@ fn with_script(
 /// what is not being shown; a window says it as two edges and which one the
 /// reader is pinned to, because that is what tells them whether output is
 /// still arriving under what they are reading.
-fn child_view(
-    lines: Vec<Line<'static>>,
-    limits: &RenderLimits,
-    tail: ScrollTail,
-) -> (Vec<Line<'static>>, bool, Option<ScrollSpan>) {
+fn child_view(mut body: ChildBody, limits: &RenderLimits, tail: ScrollTail) -> ChildBody {
     let Some(window) = limits.scroll else {
-        let (lines, truncation) = capped(lines, limits.budget);
-        return (lines, truncation, None);
+        return body.capped(limits.budget);
     };
-    let total = lines.len();
+    let total = body.lines.len();
     let (start, end) = window.range(total);
-    let mut shown = lines[start..end].to_vec();
+    body.lines = body.lines[start..end].to_vec();
+    body.keep_rows(start..end);
     let span = ScrollSpan {
         child: None,
         first: 0,
-        lines: shown.len(),
+        lines: body.lines.len(),
         total,
         offset: start,
     };
     let Some(footer) = scroll_footer_text(start, total - end, tail) else {
-        return (shown, false, None);
+        return body;
     };
-    shown.push(Line::from(Span::styled(footer, theme::current().tool_dim)));
-    (shown, true, Some(span))
+    body.lines
+        .push(Line::from(Span::styled(footer, theme::current().tool_dim)));
+    body.push_chrome();
+    body.truncation = true;
+    body.span = Some(span);
+    body
 }
 
 /// Holds a text body to the budget its own card would hold it to, and says how
@@ -1210,27 +1352,104 @@ fn capped(mut lines: Vec<Line<'static>>, budget: usize) -> (Vec<Line<'static>>, 
 /// terminal wraps them, and `Wrap` restarts a continuation at column zero, so
 /// the indent saying which child the row belongs to is lost. A subagent
 /// reporting a structured result is a fenced block, so this is the case that
-/// matters. Paragraphs are still ratatui's to wrap, here as everywhere else:
-/// pre-breaking them would turn soft wraps into hard newlines in a copy.
+/// matters.
 ///
 /// The width rides on the limits, which is what reaches the highlight worker,
 /// and `HighlightKey` carries it so a resize re-renders instead of splicing
 /// back an answer broken for the width the terminal used to be. Zero is the
 /// renderer's own word for not wrapping, and stays what a caller with no width
 /// to give gets.
-fn markdown_lines(text: &str, width: u16) -> Vec<Line<'static>> {
-    text_to_wrapped(
+///
+/// Breaking a paragraph here does not put a newline on the clipboard: the rows
+/// of one source line all name that line, so copy reads it back as it was
+/// written rather than as it was drawn.
+fn markdown_body(text: &str, width: u16) -> (Vec<Line<'static>>, BodySource) {
+    let (painted, parsed) = text_to_wrapped(
         text,
         theme::current().assistant,
         width,
         caudra_markdown::render::TOOL_OUTPUT_MAX_LINE_BYTES,
+    );
+    (
+        painted.lines,
+        BodySource {
+            text: parsed.to_string(),
+            rows: painted.provenance,
+            code: Vec::new(),
+        },
     )
-    .lines
 }
 
-fn text_lines(text: String) -> Vec<Line<'static>> {
-    text.lines()
-        .map(|line| Line::from(line.to_owned()))
+/// Text with no markdown behind it, broken where ratatui would break it for
+/// the same reason a markdown body is: a row the terminal wraps for us
+/// restarts at column zero and leaves the tree behind.
+///
+/// Every row of one source line names that whole line, so a selection reaching
+/// across a break copies the line unbroken.
+///
+/// The whole body is one block, because it is text a tool printed rather than
+/// prose: fenced where it lands, its line breaks survive a copy into markdown
+/// instead of reflowing into a paragraph.
+fn plain_body(text: &str, width: u16) -> (Vec<Line<'static>>, BodySource) {
+    let mut lines = Vec::new();
+    let mut rows = Vec::new();
+    let mut at = 0u32;
+    for source in text.lines() {
+        let line = at..at + source.len() as u32;
+        at = line.end + 1;
+        let ranges = wrapped_ranges(source, width);
+        let last = ranges.len() - 1;
+        for (index, range) in ranges.into_iter().enumerate() {
+            // The break swallowed the spaces the row ends on, and drawing them
+            // would push it back past the width it was broken to.
+            let drawn = match index == last {
+                true => &source[range.clone()],
+                false => source[range.clone()].trim_end_matches(' '),
+            };
+            lines.push(Line::from(drawn.to_owned()));
+            rows.push(LineProvenance {
+                line: Some(line.clone()),
+                spans: vec![SpanSource::Range(Source::verbatim(
+                    line.start + range.start as u32..line.start + range.end as u32,
+                ))],
+            });
+        }
+    }
+    let code = Vec::from([CodeBlock {
+        rows: 0..rows.len(),
+        language: None,
+    }]);
+    (
+        lines,
+        BodySource {
+            text: text.to_owned(),
+            rows,
+            code,
+        },
+    )
+}
+
+/// The bytes of each display row `line` occupies at `width`.
+///
+/// The ranges tile the line: `wrap_breaks` reports where a row starts, having
+/// skipped the spaces it broke on, so the row before a break absorbs them and
+/// the ranges still read back as the line that was written.
+fn wrapped_ranges(line: &str, width: u16) -> Vec<Range<usize>> {
+    if width == UNCONSTRAINED_WIDTH || UnicodeWidthStr::width(line) <= usize::from(width) {
+        return iter::once(0..line.len()).collect();
+    }
+    let chars: Vec<char> = line.chars().collect();
+    let mut offsets: Vec<usize> = line.char_indices().map(|(at, _)| at).collect();
+    offsets.push(line.len());
+    let mut starts = vec![0usize];
+    starts.extend(wrap_breaks(&chars, width).into_iter().map(|b| b.start));
+    starts
+        .iter()
+        .enumerate()
+        .map(|(index, &start)| {
+            let end = starts.get(index + 1).copied().unwrap_or(chars.len());
+            offsets[start]..offsets[end]
+        })
         .collect()
 }
 
@@ -2265,10 +2484,11 @@ pub fn render_tool_content(
         // Each child owns how much of itself it shows, so the card reports no
         // truncation of its own: there is no one thing for it to open.
         Some(ToolOutput::Batch { entries, .. }) if !entries.is_empty() => {
-            let (batch_lines, rows, spans) = render_batch(entries, highlight, &limits);
-            output_rows = rows;
-            output_spans = spans;
-            (batch_lines, false)
+            let card = render_batch(entries, highlight, &limits);
+            output_rows = card.rows;
+            output_spans = card.spans;
+            output_source = card.source;
+            (card.lines, false)
         }
         Some(ToolOutput::ReadDir(_)) => (Vec::new(), false),
         _ => (Vec::new(), false),
@@ -3261,6 +3481,7 @@ mod tests {
     }
 
     const MARKDOWN_CHILD_TOOL: &str = "task";
+    const PLAIN_CHILD: &str = "read";
     const FENCE_MARK: &str = "```";
     const FENCE_KEY: &str = "answer";
     /// One value long enough that a narrow card has to break the line, which
@@ -3301,13 +3522,27 @@ mod tests {
         }
     }
 
+    /// A child answering with text no renderer claimed, which is the arm that
+    /// has to break its own lines rather than leave them to ratatui.
+    fn plain_entry(text: &str) -> BatchToolEntry {
+        BatchToolEntry {
+            output: Some(ToolOutput::Plain(caudra_agent::TextOutput {
+                text: text.to_owned(),
+                instructions: None,
+                state: None,
+                lua_provenance: None,
+            })),
+            ..batch_entry(PLAIN_CHILD, 0)
+        }
+    }
+
     /// The child's body rows, which follow its one summary row. The card is
     /// given the child's width plus the indent it prefixes, so `width` is what
     /// the body itself ends up with.
     fn markdown_child_body(text: &str, width: u16) -> Vec<String> {
         let limits = limits(BatchViews::new([0])).with_width(width + BATCH_CHILD_INDENT_WIDTH);
-        let (lines, ..) = render_batch(&[markdown_entry(text)], false, &limits);
-        lines
+        let card = render_batch(&[markdown_entry(text)], false, &limits);
+        card.lines
             .iter()
             .skip(1)
             .map(|line| spans_text(&line.spans))
@@ -3373,6 +3608,94 @@ mod tests {
         assert_eq!(body.len(), unbroken_rows(&fence), "{body:?}");
     }
 
+    const CARD_RECORDS_SOURCE: &str =
+        "a batch card that names no source hands every child back to the scraping fallback";
+    const ROWS_PER_CARD_LINE: &str =
+        "a batch card needs one source row per painted line or extraction gives up on it";
+    const ONE_SOURCE_LINE: &str =
+        "the rows a paragraph broke into have to name the line it was written as, or a \
+         selection across them copies the break";
+    const CHILD_INDENT_MSG: &str =
+        "a row that does not open on the trunk reads as belonging to the batch, not the child";
+
+    /// A lone child's body rows, each paired with the source it names, which is
+    /// what a selection over that row resolves against. Everything but the
+    /// summary row above them belongs to the body.
+    fn lone_child_body(card: &BatchCard) -> Vec<(String, LineProvenance)> {
+        let source = card.source.clone().expect(CARD_RECORDS_SOURCE);
+        assert_eq!(card.lines.len(), source.rows.len(), "{ROWS_PER_CARD_LINE}");
+        card.lines
+            .iter()
+            .map(|line| spans_text(&line.spans))
+            .zip(source.rows)
+            .skip(1)
+            .collect()
+    }
+
+    fn all_indented(body: &[(String, LineProvenance)]) -> bool {
+        let indent = format!("{TREE_GAP}{BATCH_BODY_PAD}");
+        body.iter().all(|(text, _)| text.starts_with(&indent))
+    }
+
+    #[test]
+    fn a_batch_card_names_a_source_for_every_line_it_draws() {
+        let entries = [batch_entry("read", 2), batch_entry("grep", 3)];
+        let card = render_batch(&entries, false, &limits(BatchViews::new([0, 1])));
+
+        let source = card.source.as_ref().expect(CARD_RECORDS_SOURCE);
+        assert_eq!(source.rows.len(), card.lines.len(), "{ROWS_PER_CARD_LINE}");
+        assert!(source.names_source(), "{CARD_RECORDS_SOURCE}");
+    }
+
+    /// The two halves of the fix meeting: the card breaks the paragraph so each
+    /// drawn row keeps the trunk, and every one of those rows still points at
+    /// the whole line, so copying across the break gives back what was written.
+    #[test]
+    fn the_rows_a_broken_paragraph_drew_name_one_source_line() {
+        let limits =
+            limits(BatchViews::new([0])).with_width(NARROW_BODY_WIDTH + BATCH_CHILD_INDENT_WIDTH);
+        let card = render_batch(&[markdown_entry(LONG_PARAGRAPH)], false, &limits);
+
+        let body = lone_child_body(&card);
+        let drawn: Vec<Option<Range<u32>>> = body
+            .iter()
+            .filter(|(_, row)| row.line.is_some())
+            .map(|(_, row)| row.line.clone())
+            .collect();
+
+        assert!(all_indented(&body), "{CHILD_INDENT_MSG}: {body:?}");
+        assert!(drawn.len() > 1, "{ONE_SOURCE_LINE}: {body:?}");
+        assert!(
+            drawn.iter().all(|line| *line == drawn[0]),
+            "{ONE_SOURCE_LINE}: {body:?}"
+        );
+    }
+
+    /// Text no renderer claimed breaks the same way, for the same reason: a row
+    /// the terminal wraps for us restarts at column zero and drops the trunk.
+    #[test]
+    fn a_plain_child_breaks_an_over_wide_body_to_its_own_width() {
+        let limits =
+            limits(BatchViews::new([0])).with_width(NARROW_BODY_WIDTH + BATCH_CHILD_INDENT_WIDTH);
+        let card = render_batch(&[plain_entry(LONG_PARAGRAPH)], false, &limits);
+
+        let body = lone_child_body(&card);
+        let written = body[0].1.line.clone().expect(ONE_SOURCE_LINE);
+        let limit = usize::from(NARROW_BODY_WIDTH) + TREE_GAP.len() + BATCH_BODY_PAD.len();
+
+        assert!(body.len() > 1, "{ONE_SOURCE_LINE}: {body:?}");
+        assert!(all_indented(&body), "{CHILD_INDENT_MSG}: {body:?}");
+        assert_eq!(
+            (written.end - written.start) as usize,
+            LONG_PARAGRAPH.len(),
+            "{ONE_SOURCE_LINE}: {body:?}"
+        );
+        for (text, row) in &body {
+            assert!(text.chars().count() <= limit, "{CHILD_INDENT_MSG}: {text:?}");
+            assert_eq!(row.line.as_ref(), Some(&written), "{ONE_SOURCE_LINE}");
+        }
+    }
+
     /// The budget cuts the text before the renderer sees it, so the closing
     /// fence is routinely missing. It still has to read as a block rather than
     /// put its own syntax on screen.
@@ -3398,8 +3721,8 @@ mod tests {
         views: BatchViews,
     ) -> (Vec<Line<'static>>, Vec<Option<RowTarget>>) {
         let entries = [batch_entry("read", sizes[0]), batch_entry("grep", sizes[1])];
-        let (lines, rows, _) = render_batch(&entries, false, &limits(views));
-        (lines, rows)
+        let card = render_batch(&entries, false, &limits(views));
+        (card.lines, card.rows)
     }
 
     fn batch(views: BatchViews) -> (Vec<Line<'static>>, Vec<Option<RowTarget>>) {
@@ -3568,7 +3891,7 @@ mod tests {
     /// The row without the tree column, which every child carries and no
     /// assertion here is about.
     fn child_row(entry: BatchToolEntry) -> String {
-        let row = line_text(&render_batch(&[entry], false, &limits(BatchViews::default())).0[0]);
+        let row = line_text(&render_batch(&[entry], false, &limits(BatchViews::default())).lines[0]);
         row.strip_prefix(ONLY_CHILD_CONNECTOR)
             .expect("a child row opens on its connector")
             .to_owned()
@@ -3576,7 +3899,7 @@ mod tests {
 
     /// The sigil sits behind the connector, which is neutral chrome.
     fn child_sigil(entry: BatchToolEntry) -> Span<'static> {
-        render_batch(&[entry], false, &limits(BatchViews::default())).0[0].spans[1].clone()
+        render_batch(&[entry], false, &limits(BatchViews::default())).lines[0].spans[1].clone()
     }
 
     /// The reported bug: a finished grep named no matches. `batch` copies only
@@ -3660,9 +3983,9 @@ mod tests {
             batch_entry(SHELL_CHILD, 2),
         ];
 
-        let (lines, ..) = render_batch(&entries, false, &limits(BatchViews::default()));
+        let card = render_batch(&entries, false, &limits(BatchViews::default()));
 
-        let connectors: Vec<String> = lines
+        let connectors: Vec<String> = card.lines
             .iter()
             .map(|line| line.spans[0].content.to_string())
             .collect();
@@ -3687,11 +4010,12 @@ mod tests {
         progress.settle();
         limits.progress = Arc::new(HashMap::from([(0, progress)]));
 
-        let (lines, rows, _) = render_batch(&entries, false, &limits);
+        let card = render_batch(&entries, false, &limits);
 
-        let owned: Vec<String> = lines
+        let owned: Vec<String> = card
+            .lines
             .iter()
-            .zip(rows.iter())
+            .zip(card.rows.iter())
             .filter(|(_, row)| **row == Some(RowTarget(0)))
             .map(|(line, _)| line_text(line))
             .collect();
@@ -3744,9 +4068,9 @@ mod tests {
         let mut limits = limits(BatchViews::default());
         limits.progress = Arc::new(HashMap::from([(0, batching_report(roster))]));
 
-        let (lines, rows, _) = render_batch(&entries, false, &limits);
+        let card = render_batch(&entries, false, &limits);
 
-        let drawn: Vec<String> = lines.iter().take(4).map(line_text).collect();
+        let drawn: Vec<String> = card.lines.iter().take(4).map(line_text).collect();
         assert_eq!(
             drawn,
             [
@@ -3761,7 +4085,7 @@ mod tests {
             "{TREE_MSG}"
         );
         assert!(
-            rows[..4].iter().all(|row| *row == Some(RowTarget(0))),
+            card.rows[..4].iter().all(|row| *row == Some(RowTarget(0))),
             "every row of a child answers for the child that owns it"
         );
     }
@@ -3882,10 +4206,10 @@ mod tests {
             batch_entry("read", 2),
             batch_entry("read", 1),
         ];
-        let (lines, rows, _) = render_batch(&entries, false, &limits(BatchViews::new([1])));
+        let card = render_batch(&entries, false, &limits(BatchViews::new([1])));
 
-        assert_eq!(separator_rows(&lines), vec![1, 5], "{BATCH_BODY_AIR_MSG}");
-        assert_eq!(lines.len(), rows.len(), "the rows stay parallel");
+        assert_eq!(separator_rows(&card.lines), vec![1, 5], "{BATCH_BODY_AIR_MSG}");
+        assert_eq!(card.lines.len(), card.rows.len(), "the rows stay parallel");
     }
 
     /// The card's own body is the list of what it ran, so opening it says
@@ -3896,8 +4220,8 @@ mod tests {
         let whole = 6;
         let opened = RenderLimits::new(true, PARENT_BUDGET, BatchViews::default(), TOOL_LINES);
         let entries = [batch_entry("read", whole), batch_entry("grep", whole)];
-        let (lines, ..) = render_batch(&entries, false, &opened);
-        assert_eq!(body_count(&lines), 0);
+        let card = render_batch(&entries, false, &opened);
+        assert_eq!(body_count(&card.lines), 0);
     }
 
     const WRITE_CHILD: &str = "file_write";
@@ -3919,8 +4243,8 @@ mod tests {
         body_lines: usize,
         views: BatchViews,
     ) -> (Vec<Line<'static>>, Vec<Option<RowTarget>>) {
-        let (lines, rows, _) = render_batch(&[write_entry(body_lines)], false, &limits(views));
-        (lines, rows)
+        let card = render_batch(&[write_entry(body_lines)], false, &limits(views));
+        (card.lines, card.rows)
     }
 
     /// The reported bug: a batch of edits drew a roster of headers and no
@@ -3948,9 +4272,9 @@ mod tests {
             ..batch_entry(SHELL_CHILD, 2)
         };
 
-        let (lines, ..) = render_batch(&[entry], false, &limits(BatchViews::default()));
+        let card = render_batch(&[entry], false, &limits(BatchViews::default()));
 
-        assert_eq!(body_count(&lines), 0, "{CHANGED_MSG}");
+        assert_eq!(body_count(&card.lines), 0, "{CHANGED_MSG}");
     }
 
     /// Otherwise a batch of five writes is five whole files, which is the

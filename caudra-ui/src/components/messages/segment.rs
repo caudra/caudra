@@ -110,10 +110,11 @@ pub(super) struct Segment {
     /// line. Selection uses it to copy that source; without it copy falls back
     /// to scraping cells, which reads a code row's gutter back as text.
     provenance: Option<Provenance>,
-    /// The painted lines holding a card's code, so a copy that ran past the
-    /// block can fence it rather than drop code into prose. Cleared and
-    /// restored alongside `provenance`, whose rows it indexes.
-    code_block: Option<CodeBlock>,
+    /// The painted lines holding a card's code, so a copy that ran past a
+    /// block can fence it rather than drop code into prose. A batch card holds
+    /// one per child. Cleared and restored alongside `provenance`, whose rows
+    /// they index.
+    code_blocks: Vec<CodeBlock>,
     /// Drawn diagrams in `lines`, so a hover or a pan can find one by row.
     /// Like `provenance`, cleared by `set_lines` and restored after it.
     diagrams: Vec<DiagramSpan>,
@@ -252,21 +253,27 @@ impl Segment {
     fn set_source(&mut self, source: Option<BodySource>) {
         let Some(source) = source.filter(|source| source.rows.len() == self.lines.len()) else {
             self.provenance = None;
-            self.code_block = None;
+            self.code_blocks.clear();
             return;
         };
-        self.code_block = source.code;
+        self.code_blocks = source.code;
         self.provenance = Some(Provenance::new(Arc::from(source.text), source.rows));
     }
 
-    /// The content rows a card's code occupies at `width`, and what to call the
-    /// language, so copy can tell a selection that stayed inside the block from
-    /// one that ran past it.
-    pub fn code_block_rows(&self, width: u16) -> Option<(Range<u16>, Option<&str>)> {
-        let block = self.code_block.as_ref()?;
-        let (first, count) = self.rows_for_lines(block.rows.start, block.rows.len(), width);
-        let start = first.saturating_sub(self.chrome(width).content_start());
-        Some((start..start + count, block.language.as_deref()))
+    /// The content rows each of a card's code blocks occupies at `width`, and
+    /// what to call its language, so copy can tell a selection that stayed
+    /// inside one block from one that ran past it. In row order, which is what
+    /// lets a caller fence them as it walks down the selection.
+    pub fn code_blocks(&self, width: u16) -> Vec<(Range<u16>, Option<&str>)> {
+        let content_start = self.chrome(width).content_start();
+        self.code_blocks
+            .iter()
+            .map(|block| {
+                let (first, count) = self.rows_for_lines(block.rows.start, block.rows.len(), width);
+                let start = first.saturating_sub(content_start);
+                (start..start + count, block.language.as_deref())
+            })
+            .collect()
     }
 
     pub fn diagrams(&self) -> &[DiagramSpan] {
@@ -324,7 +331,7 @@ impl Segment {
         // Line indices moved, so any provenance or row recorded for the old
         // vector no longer lines up.
         self.provenance = None;
-        self.code_block = None;
+        self.code_blocks.clear();
         self.rows.clear();
         self.stale = false;
         self.invalidate_height();
@@ -614,7 +621,7 @@ impl Segment {
         };
         if !spliced {
             self.provenance = None;
-            self.code_block = None;
+            self.code_blocks.clear();
         }
     }
 
@@ -663,7 +670,7 @@ impl Segment {
         for span in &mut self.scroll_spans {
             shift(&mut span.first);
         }
-        if let Some(block) = &mut self.code_block {
+        for block in &mut self.code_blocks {
             shift(&mut block.rows.start);
             shift(&mut block.rows.end);
         }
