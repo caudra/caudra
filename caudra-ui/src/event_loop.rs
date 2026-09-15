@@ -71,7 +71,7 @@ use crate::components::usage_modal::UsageFetchState;
 use crate::components::{Action, ExitRequest, ForkDraft, ForkedSession, Status};
 use crate::herdr::{HerdrObservation, HerdrReporterHandle, aggregate_observations};
 use crate::input::InputReader;
-use crate::repaint::{Dirty, IDLE_POLL};
+use crate::repaint::{Dirty, FrameLimiter, IDLE_POLL};
 use crate::theme;
 use crate::{AppSession, SessionRelocationHandoff, SessionTab};
 use crate::{load_app_session, open_app_session};
@@ -1591,6 +1591,12 @@ impl<'t> EventLoop<'t> {
         // The first frame always paints. After that only a poller, an event or
         // an animation tick owes another.
         let mut dirty = Dirty::YES;
+        // The limiter owes nothing until it has painted once, so the first
+        // frame needs no exemption. Cleared only by a paint, never per pass: a
+        // keystroke arriving while a frame is held back keeps its exemption
+        // until that frame is the one on screen.
+        let mut limiter = FrameLimiter::default();
+        let mut urgent = false;
         let result = loop {
             if self.relocation.is_some() {
                 break Ok(());
@@ -1613,7 +1619,16 @@ impl<'t> EventLoop<'t> {
             }
             self.checkpoint_all();
             self.persist_workspace_tabs_if_changed();
-            if dirty.take() {
+            // An exit leaves the loop right below, so its frame can never be
+            // the one the cap holds back.
+            urgent |= self
+                .sessions
+                .iter()
+                .any(|rt| rt.app.exit_request != ExitRequest::None);
+            let owed = dirty.take();
+            let painted = owed && limiter.admit(Instant::now(), urgent);
+            if painted {
+                urgent = false;
                 let app = &mut self.sessions[self.focused].app;
                 if let Err(e) = self.terminal.draw(|f| {
                     app.view(f);
@@ -1622,6 +1637,10 @@ impl<'t> EventLoop<'t> {
                 }) {
                     break Err(e.into());
                 }
+            }
+            let held = owed && !painted;
+            if held {
+                dirty = Dirty::YES;
             }
 
             if let Some(i) = self.sessions.iter().position(|rt| {
@@ -1637,11 +1656,16 @@ impl<'t> EventLoop<'t> {
             // Sleeping a whole frame instead of a fraction of one is what
             // makes a spinner cost 12 paints a second instead of 62.
             let cadence = self.sessions[self.focused].app.cadence();
-            match self.next_wake(cadence.frame().unwrap_or(IDLE_POLL)) {
+            let mut timeout = cadence.frame().unwrap_or(IDLE_POLL);
+            if held {
+                timeout = limiter.hold(Instant::now(), timeout);
+            }
+            match self.next_wake(timeout) {
                 // Any event can change the screen, so paint after handling it
                 // rather than asking every handler to prove it did.
                 Some(wake) => {
                     dirty = Dirty::YES;
+                    urgent |= matches!(wake, Wake::Input(_));
                     if let Err(e) = self.handle_wake(wake) {
                         break Err(e);
                     }

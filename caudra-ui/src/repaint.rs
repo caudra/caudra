@@ -28,7 +28,7 @@
 
 use std::ops::{BitOr, BitOrAssign};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::animation::SPINNER_FRAME;
 
@@ -228,16 +228,75 @@ impl Cadence {
     }
 }
 
+/// How often an owed frame may actually be painted.
+///
+/// [`Cadence`] says how long the loop may sleep, never how often it may paint,
+/// and the two part company the moment events arrive faster than the cadence:
+/// the loop owes a frame per event, so a provider streaming two hundred deltas
+/// a second draws the same pixels three times over against a 62fps ceiling.
+///
+/// Input is exempt. A keystroke held back for the cap is a keystroke the
+/// terminal echoes late, and that is the one latency a reader notices.
+pub struct FrameLimiter {
+    min_frame: Duration,
+    last_paint: Option<Instant>,
+}
+
+impl Default for FrameLimiter {
+    fn default() -> Self {
+        Self::new(SMOOTH_FRAME)
+    }
+}
+
+impl FrameLimiter {
+    pub fn new(min_frame: Duration) -> Self {
+        Self {
+            min_frame,
+            last_paint: None,
+        }
+    }
+
+    /// Whether an owed frame paints now, recording it when it does. A caller
+    /// refused here still owes the frame.
+    pub fn admit(&mut self, now: Instant, urgent: bool) -> bool {
+        if !urgent
+            && self
+                .last_paint
+                .is_some_and(|at| now.duration_since(at) < self.min_frame)
+        {
+            return false;
+        }
+        self.last_paint = Some(now);
+        true
+    }
+
+    /// Shortens a sleep so a frame this held back is not left off the screen
+    /// for a whole idle poll. Only a caller still owing one needs it.
+    pub fn hold(&self, now: Instant, timeout: Duration) -> Duration {
+        match self.last_paint {
+            Some(at) => timeout.min(self.min_frame.saturating_sub(now.duration_since(at))),
+            None => timeout,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::expect::{OWED, QUIET};
-    use super::{Cadence, Dirty, Watch};
+    use super::{Cadence, Dirty, FrameLimiter, IDLE_POLL, Watch};
     use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
     const EXPECT_SETTLED: &str = "nothing to combine must leave the loop asleep";
     const EXPECT_SOONEST: &str = "the soonest source must win over the whole list";
     const EXPECT_MOTION_KEPT: &str = "a pending poll must not swallow another source's motion";
     const EXPECT_UNSEEN: &str = "an unpolled watch has nothing to render";
+    const EXPECT_FIRST: &str = "the first frame has nothing to be too soon after";
+    const EXPECT_CAPPED: &str = "a background change inside the cap must wait for it";
+    const EXPECT_URGENT: &str = "input must never wait for the cap";
+    const EXPECT_RELEASED: &str = "a held frame must paint once the cap has passed";
+    const EXPECT_HELD_SLEEP: &str = "a held frame must not sleep past the cap";
+    const MIN_FRAME: Duration = Duration::from_millis(16);
 
     #[test]
     fn any_runs_every_poller() {
@@ -290,5 +349,61 @@ mod tests {
         assert_eq!(watch.poll(Arc::new(7)), Dirty::YES, "{OWED}");
         assert_eq!(watch.poll(None), Dirty::YES, "{OWED}");
         assert_eq!(watch.get(), None, "{EXPECT_UNSEEN}");
+    }
+
+    #[test]
+    fn the_cap_spaces_background_frames_and_lets_input_through() {
+        let mut limiter = FrameLimiter::new(MIN_FRAME);
+        let start = Instant::now();
+
+        assert!(limiter.admit(start, false), "{EXPECT_FIRST}");
+        assert!(
+            !limiter.admit(start + MIN_FRAME / 2, false),
+            "{EXPECT_CAPPED}"
+        );
+        assert!(limiter.admit(start + MIN_FRAME, false), "{EXPECT_RELEASED}");
+    }
+
+    #[test]
+    fn input_paints_inside_the_cap_and_restarts_it() {
+        let mut limiter = FrameLimiter::new(MIN_FRAME);
+        let start = Instant::now();
+
+        assert!(limiter.admit(start, false), "{EXPECT_FIRST}");
+        let typed = start + MIN_FRAME / 4;
+        assert!(limiter.admit(typed, true), "{EXPECT_URGENT}");
+        // The keystroke's own frame is what the next cap is measured from, so
+        // a background change right behind it still waits a whole one.
+        assert!(!limiter.admit(typed + MIN_FRAME / 2, false), "{EXPECT_CAPPED}");
+    }
+
+    /// Without this a frame held back while the cadence is `IDLE` sits off the
+    /// screen for the full poll.
+    #[test]
+    fn a_held_frame_shortens_the_sleep_to_what_is_left_of_the_cap() {
+        let mut limiter = FrameLimiter::new(MIN_FRAME);
+        let start = Instant::now();
+        assert_eq!(
+            limiter.hold(start, IDLE_POLL),
+            IDLE_POLL,
+            "nothing painted yet, so nothing to wait for"
+        );
+
+        assert!(limiter.admit(start, false), "{EXPECT_FIRST}");
+        assert_eq!(
+            limiter.hold(start + MIN_FRAME / 4, IDLE_POLL),
+            MIN_FRAME * 3 / 4,
+            "{EXPECT_HELD_SLEEP}"
+        );
+        assert_eq!(
+            limiter.hold(start + MIN_FRAME * 2, IDLE_POLL),
+            Duration::ZERO,
+            "{EXPECT_HELD_SLEEP}"
+        );
+        assert_eq!(
+            limiter.hold(start, Duration::from_millis(1)),
+            Duration::from_millis(1),
+            "a sooner cadence must still win"
+        );
     }
 }
