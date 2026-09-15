@@ -832,7 +832,25 @@ pub(super) fn wrapped_line_count(lines: &[Line<'_>], width: u16) -> u16 {
     if width == 0 {
         return lines.len() as u16;
     }
-    Paragraph::new(lines.to_vec())
+    lines
+        .iter()
+        .fold(0, |rows, line| rows.saturating_add(wrapped_rows(line, width)))
+}
+
+/// A line no wider than the box takes exactly one row, and once the renderer
+/// has broken code blocks and tables to width that is most of them. Asking
+/// ratatui costs a clone and a full re-wrap, so only an overflowing row pays
+/// for one: measuring a screenful used to cost more than rendering it.
+///
+/// `Line::width` and the wrapper both sum `unicode_width` per character, so a
+/// line this accepts cannot be one the wrapper would split. A grapheme whose
+/// parts measure wider than the cluster only overstates the width, which falls
+/// through to the wrapper and is merely slower.
+fn wrapped_rows(line: &Line<'_>, width: u16) -> u16 {
+    if line.width() <= width as usize {
+        return 1;
+    }
+    Paragraph::new(line.clone())
         .wrap(Wrap { trim: false })
         .line_count(width) as u16
 }
@@ -848,6 +866,62 @@ mod tests {
     const INLINE_CONTENT_WIDTH: usize = 37;
     const EXPECT_DENSE_AGREES: &str =
         "the wrap-free dense test must answer exactly what re-wrapping would";
+    const EXPECT_ORACLE_AGREES: &str =
+        "skipping the wrapper must answer exactly what the wrapper would";
+    const MEASURE_WIDTHS: [u16; 6] = [1, 2, 7, 20, 40, 100];
+
+    /// What [`wrapped_line_count`] replaced: every line handed to ratatui,
+    /// whatever its width. Kept here so the fast path is checked against the
+    /// wrapper itself rather than against hand-counted numbers.
+    fn reference_rows(lines: &[Line<'_>], width: u16) -> u16 {
+        Paragraph::new(lines.to_vec())
+            .wrap(Wrap { trim: false })
+            .line_count(width) as u16
+    }
+
+    /// Shapes that between them cover every branch the wrapper takes: nothing
+    /// to wrap, the exact boundary either side, whitespace the `trim: false`
+    /// wrapper has to keep, a word longer than the box, and characters whose
+    /// display width is not their byte count.
+    fn measure_corpus(width: u16) -> Vec<Vec<Line<'static>>> {
+        let w = width as usize;
+        let shapes: Vec<Line<'static>> = vec![
+            Line::from(""),
+            Line::from(" "),
+            Line::from("short"),
+            Line::from("x".repeat(w)),
+            Line::from("x".repeat(w + 1)),
+            Line::from(format!("{} ", "x".repeat(w.saturating_sub(1)))),
+            Line::from(format!("{}  ", "x".repeat(w))),
+            Line::from("word ".repeat(w)),
+            Line::from("   leading and then a long run of ordinary words ".repeat(3)),
+            Line::from("日本語のテキスト".repeat(4)),
+            Line::from("👨‍👩‍👦 family and more text after it".to_owned()),
+            Line::from(vec![
+                Span::raw("a ".repeat(w / 2)),
+                Span::raw("b ".repeat(w / 2)),
+            ]),
+        ];
+        let mut cases: Vec<Vec<Line<'static>>> = shapes.iter().cloned().map(|l| vec![l]).collect();
+        cases.push(shapes);
+        cases
+    }
+
+    #[test_case(MEASURE_WIDTHS[0] ; "width_1")]
+    #[test_case(MEASURE_WIDTHS[1] ; "width_2")]
+    #[test_case(MEASURE_WIDTHS[2] ; "width_7")]
+    #[test_case(MEASURE_WIDTHS[3] ; "width_20")]
+    #[test_case(MEASURE_WIDTHS[4] ; "width_40")]
+    #[test_case(MEASURE_WIDTHS[5] ; "width_100")]
+    fn wrapped_line_count_matches_the_wrapper(width: u16) {
+        for case in measure_corpus(width) {
+            assert_eq!(
+                wrapped_line_count(&case, width),
+                reference_rows(&case, width),
+                "{EXPECT_ORACLE_AGREES}: {case:?} at width {width}"
+            );
+        }
+    }
 
     fn seg_with_base(line_count: usize, base: Option<usize>) -> Segment {
         Segment {
