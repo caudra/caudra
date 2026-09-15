@@ -96,7 +96,10 @@ impl StreamingCache {
         }
         let text =
             caudra_markdown::render::truncate_long_lines_at(visible, STREAMING_MAX_LINE_BYTES);
-        let source: Arc<str> = text.as_ref().into();
+        // Normalizing before the render, not the key, keeps the cheap path
+        // cheap: an unchanged buffer never reaches this at all. The renderer
+        // and the provenance ranges then index the same normalized string.
+        let source: Arc<str> = caudra_markdown::close_open_tail(&text).as_ref().into();
         let semantic = renderer.render(&source, width, theme_gen);
         let mut painted = paint_semantic(&semantic, prefix, styles.0, styles.1);
         if !interactive_links {
@@ -432,6 +435,58 @@ mod tests {
 
         assert!(!docs.style.add_modifier.contains(Modifier::UNDERLINED));
         assert_eq!(content.link_at(80, 0, 0), None);
+    }
+
+    const SYNTAX: [char; 3] = ['*', '[', ']'];
+
+    fn drawn(content: &mut StreamingContent, width: u16) -> String {
+        content
+            .render_lines(width)
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The whole point of normalizing the open tail: a delimiter is never
+    /// drawn only to be taken away, so the content it wraps lands in its
+    /// final column the first time it appears and stays there.
+    #[test_case("a **bold** c", "bold"                           ; "bold")]
+    #[test_case("a *ital* c", "ital"                             ; "italic")]
+    #[test_case("see [docs](https://example.com) now", "docs"    ; "link")]
+    #[test_case("## a **bold** heading", "bold"                  ; "heading")]
+    fn a_streamed_delimiter_is_never_drawn_and_its_content_never_moves(text: &str, word: &str) {
+        let style = Style::default();
+        let width = 80;
+        let mut content = StreamingContent::new("", style, style, 0);
+        let mut column = None;
+
+        for end in 1..=text.len() {
+            if !text.is_char_boundary(end) {
+                continue;
+            }
+            content.set_buffer(&text[..end]);
+            let shown = drawn(&mut content, width);
+            assert!(
+                !shown.contains(SYNTAX),
+                "prefix {:?} drew markdown syntax: {shown:?}",
+                &text[..end]
+            );
+            if let Some(at) = shown.find(word) {
+                assert_eq!(
+                    *column.get_or_insert(at),
+                    at,
+                    "{word} moved at prefix {:?}",
+                    &text[..end]
+                );
+            }
+        }
+        assert!(column.is_some(), "{word} never appeared");
     }
 
     #[test]

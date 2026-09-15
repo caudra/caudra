@@ -13,6 +13,7 @@ pub mod latex;
 pub mod mermaid;
 pub mod render;
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ops::{Not, Range};
 use std::sync::Arc;
@@ -738,6 +739,224 @@ pub fn parse_inline_at(text: &str, offset: u32) -> Vec<InlineSpan> {
     parse_inline_impl(text, offset, Emphasis::default(), ParseMode::WithCode, true)
 }
 
+/// Rewrites a still-streaming markdown prefix so its open tail renders the
+/// way it will once the rest arrives.
+///
+/// A delimiter resolves only when its closer is in the text, so a growing
+/// `**bold` draws its asterisks and then loses them the moment the run
+/// closes: two columns vanish and the paragraph rewraps under the reader.
+/// This closes what the tail leaves open, and drops a trailing fragment too
+/// short to classify, so content is styled as it arrives and never moves
+/// afterwards.
+///
+/// Complete markdown comes back borrowed and untouched, so this is a no-op
+/// on anything already settled. Only the outermost open delimiter is closed:
+/// a nested one stays literal for the few frames until its own closer lands.
+pub fn close_open_tail(text: &str) -> Cow<'_, str> {
+    let Some(inline_start) = tail_inline_start(text) else {
+        return Cow::Borrowed(text);
+    };
+    let mut end = text.len();
+    loop {
+        match scan_open_tail(&text[inline_start..end]) {
+            OpenTail::Settled => break,
+            OpenTail::Close(closer) => return Cow::Owned(format!("{}{closer}", &text[..end])),
+            OpenTail::Truncate(at) => {
+                let cut = inline_start + at;
+                if cut >= end {
+                    break;
+                }
+                end = cut;
+            }
+        }
+    }
+    Cow::Borrowed(&text[..end])
+}
+
+/// Where the last line's inline content starts, or `None` when the tail is
+/// inside a fenced block: those already stream whole, and a horizontal rule
+/// has no inline content to close.
+fn tail_inline_start(text: &str) -> Option<usize> {
+    let mut rest = text;
+    let mut base = 0;
+    while let Some(found) = find_fenced_block(rest) {
+        let block_end = match &found {
+            Fenced::Code(fence) => fence.block_end,
+            Fenced::Math(fence) => fence.block_end,
+        };
+        if block_end >= rest.len() {
+            return None;
+        }
+        rest = &rest[block_end..];
+        base += block_end;
+    }
+    let line_start = base + rest.rfind('\n').map_or(0, |nl| nl + 1);
+    let line = classify_line(&text[line_start..], line_start);
+    matches!(line.kind, BlockKind::HorizontalRule)
+        .not()
+        .then_some(line.inline_start as usize)
+}
+
+enum OpenTail {
+    Settled,
+    /// Hold back from this offset: the fragment there cannot be classified
+    /// until more of it arrives.
+    Truncate(usize),
+    /// Append this to resolve what the tail left open.
+    Close(Cow<'static, str>),
+}
+
+/// Walks the tail the way [`parse_inline_impl`] does, skipping whatever
+/// already resolved, and reports the first construct still open.
+fn scan_open_tail(text: &str) -> OpenTail {
+    let bytes = text.as_bytes();
+    let label_ends = bytes.contains(&b'[').then(|| scan_link_label_ends(text));
+    let mut pos = 0;
+
+    while pos < bytes.len() {
+        if let Some(math) = try_inline_math(text, pos) {
+            pos = math.end;
+            continue;
+        }
+
+        if bytes[pos] == b'[' || (bytes[pos] == b'!' && bytes.get(pos + 1) == Some(&b'[')) {
+            let open = pos + usize::from(bytes[pos] == b'!');
+            let resolved = label_ends
+                .as_ref()
+                .and_then(|ends| ends.get(&open))
+                .copied()
+                .and_then(|label_end| try_explicit_link(text, open, label_end));
+            match resolved {
+                Some(link) => pos = link.end,
+                None => return open_link(text, pos, open, label_ends.as_ref()),
+            }
+            continue;
+        }
+
+        if let Some(link) = try_autolink(text, pos) {
+            pos = link.end;
+            continue;
+        }
+
+        if bytes[pos] == b'<' && starts_http_scheme_at(text, pos + 1) {
+            return OpenTail::Close(Cow::Borrowed(">"));
+        }
+
+        if let Some(end) = bare_url_end(text, pos) {
+            pos = end;
+            continue;
+        }
+
+        // A delimiter run reaching the end cannot be classified yet: the
+        // parser needs the byte after it to tell an opener from literal text,
+        // and a single `~` is not even a candidate until its pair arrives.
+        if matches!(bytes[pos], b'*' | b'_' | b'~' | b'`')
+            && pos + count_run(bytes, pos, bytes[pos]) >= bytes.len()
+        {
+            return OpenTail::Truncate(pos);
+        }
+
+        if bytes[pos] == b'`' {
+            let run = count_backtick_run(bytes, pos);
+            if let Some((cs, ce, close_end)) = find_code_span_close(bytes, pos, run)
+                && ce > cs
+            {
+                pos = close_end;
+                continue;
+            }
+            return hold_partial_closer(bytes, pos, Cow::Owned("`".repeat(run)));
+        }
+
+        let outcome = match bytes[pos] {
+            b'*' => try_star_emphasis(bytes, pos),
+            b'~' => try_strike_emphasis(bytes, pos),
+            b'_' => try_underscore_emphasis(bytes, pos),
+            _ => InlineMatch::None,
+        };
+        match outcome {
+            InlineMatch::Found {
+                close, delim_len, ..
+            } => {
+                // A run that resolved against fewer characters than it opened
+                // with, right at the end, is its own closer still arriving:
+                // `***both**` is not bold `*both`, it is bold-italic `both`
+                // one star short.
+                if close + delim_len >= bytes.len()
+                    && count_run(bytes, pos, bytes[pos]) > delim_len
+                {
+                    return OpenTail::Truncate(close);
+                }
+                pos = close + delim_len;
+            }
+            InlineMatch::Skip(n) => match open_emphasis(bytes, pos) {
+                Some(delim) => return hold_partial_closer(bytes, pos, Cow::Borrowed(delim)),
+                None => pos += n,
+            },
+            InlineMatch::None => pos += 1,
+        }
+    }
+    OpenTail::Settled
+}
+
+/// A short run of the opener's own character at the very end is its closer
+/// arriving one byte at a time. Held back rather than treated as content, so
+/// `**bold*` does not get a third asterisk appended and draw the stray.
+fn hold_partial_closer(bytes: &[u8], pos: usize, delim: Cow<'static, str>) -> OpenTail {
+    let ch = delim.as_bytes()[0];
+    let content_start = pos + delim.len();
+    let mut start = bytes.len();
+    while start > content_start && bytes[start - 1] == ch {
+        start -= 1;
+    }
+    match start < bytes.len() && bytes.len() - start < delim.len() {
+        true => OpenTail::Truncate(start),
+        false => OpenTail::Close(delim),
+    }
+}
+
+/// What would close the delimiter run at `pos`, for a run the parser could
+/// not resolve. `None` leaves it as the literal text it already is.
+fn open_emphasis(bytes: &[u8], pos: usize) -> Option<&'static str> {
+    let ch = bytes[pos];
+    let run = count_run(bytes, pos, ch);
+    let delim = match (ch, run) {
+        (b'*', 3..) => "***",
+        (b'*', 2) => "**",
+        (b'~', 2) => "~~",
+        (b'*', 1) => "*",
+        (b'_', 1) => "_",
+        _ => return None,
+    };
+    let opens = match run {
+        1 => is_valid_italic_open(bytes, pos),
+        _ => opens_run(bytes, pos + run),
+    };
+    opens.then_some(delim)
+}
+
+/// A link the tail has not finished. Its label is held back until the
+/// destination starts, and drawn from then on: closing the parenthesis lets
+/// the label settle into place once instead of appearing as raw syntax and
+/// collapsing when the real `)` lands.
+fn open_link(
+    text: &str,
+    start: usize,
+    open: usize,
+    label_ends: Option<&HashMap<usize, usize>>,
+) -> OpenTail {
+    let held = OpenTail::Truncate(start);
+    let Some(label_end) = label_ends.and_then(|ends| ends.get(&open)).copied() else {
+        return held;
+    };
+    // Cheaper to ask the real parser whether one parenthesis is all that is
+    // missing than to re-derive its destination and title rules here.
+    let closed = format!("{text})");
+    match try_explicit_link(&closed, open, label_end) {
+        Some(link) if link.end == closed.len() => OpenTail::Close(Cow::Borrowed(")")),
+        _ => held,
+    }
+}
+
 /// `EmphasisOnly` is for rescanning a region the outer pass already split on
 /// code, so we don't re-recognize backticks we've already consumed.
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -1391,9 +1610,17 @@ fn find_strike_close(bytes: &[u8], start: usize) -> Option<usize> {
     None
 }
 
+/// A multi-character delimiter run opens only when content follows the whole
+/// run with nothing between: `a ** b ** c` is four asterisks, not bold, and
+/// `*** x ***` must not fall back to reading its own third star as content.
+fn opens_run(bytes: &[u8], after: usize) -> bool {
+    bytes.get(after).is_some_and(|b| !b.is_ascii_whitespace())
+}
+
 fn try_star_emphasis(bytes: &[u8], pos: usize) -> InlineMatch {
     let run = count_run(bytes, pos, b'*');
     if run >= 3
+        && opens_run(bytes, pos + run)
         && let Some(close) = find_emphasis_close(bytes, pos + 3, b"***")
         && close > pos + 3
     {
@@ -1405,7 +1632,8 @@ fn try_star_emphasis(bytes: &[u8], pos: usize) -> InlineMatch {
         };
     }
     if run >= 2 {
-        if let Some(close) = find_emphasis_close(bytes, pos + 2, b"**")
+        if opens_run(bytes, pos + run)
+            && let Some(close) = find_emphasis_close(bytes, pos + 2, b"**")
             && close > pos + 2
         {
             return InlineMatch::Found {
@@ -2014,5 +2242,124 @@ mod tests {
         let strip =
             |s: &str| -> String { s.chars().filter(|c| !STRIP_DELIMS.contains(c)).collect() };
         assert_eq!(strip(&visible), strip(input));
+    }
+
+    #[test_case("a ** b ** c"       ; "spaced_double")]
+    #[test_case("2 ** 3 ** 4"       ; "exponent")]
+    #[test_case("*** x ***"         ; "spaced_triple")]
+    fn a_star_run_needs_content_to_open(input: &str) {
+        let spans = parse_inline(input);
+        assert!(
+            spans.iter().all(|s| s.emphasis.is_empty()),
+            "{input} must stay literal, got {spans:?}"
+        );
+    }
+
+    const SETTLED: &[&str] = &[
+        "plain words",
+        "a **b** c",
+        "*i* and _j_ and ~~k~~",
+        "a `code()` span",
+        "see [docs](https://example.com) now",
+        "# heading with **bold**",
+        "- item one\n- item two",
+        "5 * 3 and a_b_c and 50% ** off",
+        "```rust\nfn x() {}\n```\ndone",
+        "| a | b |\n| --- | --- |\n| 1 | 2 |",
+    ];
+
+    #[test]
+    fn close_open_tail_leaves_settled_markdown_untouched() {
+        for text in SETTLED {
+            let out = close_open_tail(text);
+            assert!(
+                matches!(out, Cow::Borrowed(_)),
+                "{text:?} must not be rewritten, got {out:?}"
+            );
+            assert_eq!(out, *text);
+        }
+    }
+
+    #[test_case("**bold",            "**bold**"              ; "double_star")]
+    #[test_case("***both",           "***both***"            ; "triple_star")]
+    #[test_case("a *ital",           "a *ital*"              ; "single_star")]
+    #[test_case("a _ital",           "a _ital_"              ; "underscore")]
+    #[test_case("~~gone",            "~~gone~~"              ; "strike")]
+    #[test_case("a `code",           "a `code`"              ; "code_span")]
+    #[test_case("a ``co`de",         "a ``co`de``"           ; "code_span_double_run")]
+    #[test_case("## **bo",           "## **bo**"             ; "inside_heading")]
+    #[test_case("- **bo",            "- **bo**"              ; "inside_list_item")]
+    #[test_case("| a | **bo",        "| a | **bo**"          ; "inside_table_row")]
+    #[test_case("done\n\n**bo",      "done\n\n**bo**"        ; "after_a_blank_line")]
+    #[test_case("```\nx\n```\n**bo", "```\nx\n```\n**bo**"   ; "after_a_closed_fence")]
+    #[test_case("see [d](h",         "see [d](h)"            ; "link_destination")]
+    #[test_case("a <https://ex",     "a <https://ex>"        ; "autolink")]
+    fn close_open_tail_closes_what_the_tail_left_open(input: &str, expected: &str) {
+        assert_eq!(close_open_tail(input), expected);
+    }
+
+    #[test_case("a *",        "a "    ; "lone_star")]
+    #[test_case("a **",       "a "    ; "lone_double_star")]
+    #[test_case("a ***",      "a "    ; "lone_triple_star")]
+    #[test_case("a ~~",       "a "    ; "lone_strike")]
+    #[test_case("a `",        "a "    ; "lone_backtick")]
+    #[test_case("a **bold*",  "a **bold**" ; "half_arrived_closer")]
+    #[test_case("see [",      "see "  ; "link_open_bracket")]
+    #[test_case("see [do",    "see "  ; "link_partial_label")]
+    #[test_case("see [docs]", "see "  ; "link_label_only")]
+    #[test_case("see [docs](", "see " ; "link_empty_destination")]
+    #[test_case("an ![alt](",  "an "  ; "image_empty_destination")]
+    fn close_open_tail_holds_back_what_it_cannot_classify_yet(input: &str, expected: &str) {
+        assert_eq!(close_open_tail(input), expected);
+    }
+
+    #[test_case("```rust\nfn x() {"     ; "open_code_fence")]
+    #[test_case("$$\nx = *y"            ; "open_math_fence")]
+    #[test_case("---"                   ; "horizontal_rule")]
+    #[test_case("5 * 3"                 ; "arithmetic")]
+    #[test_case("a ** b"                ; "spaced_double_star")]
+    #[test_case("snake_case_ident"      ; "intra_word_underscore")]
+    #[test_case("if a < b"              ; "less_than")]
+    #[test_case("* item"                ; "bullet_marker")]
+    #[test_case("`**kwargs`"            ; "markers_inside_code")]
+    fn close_open_tail_leaves_a_settled_tail_alone(input: &str) {
+        assert_eq!(close_open_tail(input), input);
+    }
+
+    /// The point of the whole exercise: a reader never sees a delimiter that
+    /// is about to be taken away, and content never shifts once it is drawn.
+    #[test_case("a **bold** c"                    ; "bold")]
+    #[test_case("a *ital* c"                      ; "italic")]
+    #[test_case("a _ital_ c"                      ; "underscore_italic")]
+    #[test_case("a ***both*** c"                  ; "bold_italic")]
+    #[test_case("a ~~gone~~ c"                    ; "strike")]
+    #[test_case("a `code()` c"                    ; "code_span")]
+    #[test_case("see [docs](https://example.com)" ; "link")]
+    #[test_case("## a **bold** heading"           ; "heading")]
+    fn no_streaming_prefix_draws_a_delimiter_it_will_take_back(text: &str) {
+        let settled: String = span_text(&parse_inline(
+            &close_open_tail(text)[classify_line(text, 0).inline_start as usize..],
+        ));
+        let mut drawn = String::new();
+        for end in 1..=text.len() {
+            if !text.is_char_boundary(end) {
+                continue;
+            }
+            let normalized = close_open_tail(&text[..end]);
+            let inline_start = classify_line(&normalized, 0).inline_start as usize;
+            let visible = span_text(&parse_inline(&normalized[inline_start..]));
+            assert!(
+                !visible.contains(STRIP_DELIMS),
+                "prefix {:?} drew a delimiter: {visible:?}",
+                &text[..end]
+            );
+            assert!(
+                visible.starts_with(&drawn),
+                "prefix {:?} rewrote {drawn:?} as {visible:?}",
+                &text[..end]
+            );
+            drawn = visible;
+        }
+        assert_eq!(drawn, settled);
     }
 }
