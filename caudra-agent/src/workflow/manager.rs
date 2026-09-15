@@ -988,6 +988,7 @@ complete(first.output.echo);
                 {
                     return TaskOutcome {
                         task_id,
+                        mode: None,
                         success: false,
                         cancelled: true,
                         output: Value::Null,
@@ -999,6 +1000,7 @@ complete(first.output.echo);
                 if label.starts_with(FAIL_PREFIX) {
                     return TaskOutcome {
                         task_id: None,
+                        mode: None,
                         success: false,
                         cancelled: false,
                         output: Value::Null,
@@ -1009,6 +1011,7 @@ complete(first.output.echo);
                 }
                 TaskOutcome {
                     task_id,
+                    mode: None,
                     success: true,
                     cancelled: false,
                     output: json!({ "echo": request.prompt }),

@@ -276,6 +276,9 @@ pub struct AgentRunParams<'h> {
     /// since changed on disk. `None` when they match, and for a subagent, which
     /// reads them fresh at spawn.
     pub instructions: Option<String>,
+    /// The mode a task was granted. `None` for the interactive modes, which the
+    /// user toggles and which are therefore derived from the transcript.
+    pub mode_notice: Option<String>,
     pub event_tx: EventSender,
     pub tools: Value,
     /// Definitions the request holds back until `tool_search` loads them.
@@ -292,6 +295,7 @@ pub struct Agent<'h> {
     system: String,
     environment: Option<String>,
     instructions: Option<String>,
+    mode_notice: Option<String>,
     event_tx: EventSender,
     tools: Value,
     deferral: DeferralSession,
@@ -398,6 +402,7 @@ impl<'h> Agent<'h> {
             system: run.system,
             environment: run.environment,
             instructions: run.instructions,
+            mode_notice: run.mode_notice,
             event_tx: run.event_tx,
             tools: run.tools,
             deferral,
@@ -786,6 +791,11 @@ impl<'h> Agent<'h> {
             self.history.as_slice(),
             crate::prompt::INSTRUCTIONS_CHANGED_MARKER,
             self.instructions.as_deref(),
+        ));
+        standing.extend(standing_notice(
+            self.history.as_slice(),
+            crate::prompt::TASK_MODE_MARKER,
+            self.mode_notice.as_deref(),
         ));
         standing.extend(mode_switch_notice(self.history.as_slice(), &latest.mode));
         self.mode = latest.mode.clone();
@@ -2168,6 +2178,9 @@ mod tests {
     const INSTRUCTIONS_CHANGED: &str =
         "<system-reminder>\n# Instructions changed\n\n+ be brief\n</system-reminder>";
     const MENTION_BODY: &str = "<file path=\"a.rs\">fn main() {}</file>";
+    /// Standing, not per turn: the block stays in the transcript and the
+    /// contract says the most recent one is the one in force.
+    const EXPECTED_MODE_ANNOUNCEMENTS: usize = 1;
     const OVERRIDE_MODEL_SPEC: &str = "openai/gpt-5.4";
     const PLAN_MODEL_SPEC: &str = "openai/gpt-5.4";
     const PROFILE_MODEL_SPEC: &str = "anthropic/claude-opus-4-6";
@@ -2676,6 +2689,7 @@ mod tests {
                 system: "system".into(),
                 environment: None,
                 instructions: None,
+                mode_notice: None,
                 event_tx: EventSender::new(raw_tx, 0),
                 tools: serde_json::json!([]),
                 deferred: Vec::new(),
@@ -3945,6 +3959,38 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    /// A task is granted its mode by the host that opened it, so it is told
+    /// once and then only again if the transcript loses the block.
+    #[test]
+    fn run_announces_a_granted_task_mode_once() {
+        smol::block_on(async {
+            let mut history = History::new(Vec::new());
+            let (mut agent, _event_rx) = make_agent(
+                MockProvider::new(vec![
+                    text_response(StopReason::EndTurn),
+                    text_response(StopReason::EndTurn),
+                ]),
+                &mut history,
+            );
+            agent.mode_notice = Some(crate::prompt::TASK_PLAN_CONTRACT.to_owned());
+
+            agent.run(default_input()).await.unwrap();
+            agent.run(default_input()).await.unwrap();
+            drop(agent);
+
+            let announced = history
+                .as_slice()
+                .iter()
+                .filter(|message| {
+                    message
+                        .user_text()
+                        .is_some_and(|text| text.contains(crate::prompt::TASK_MODE_MARKER))
+                })
+                .count();
+            assert_eq!(announced, EXPECTED_MODE_ANNOUNCEMENTS);
+        });
     }
 
     #[test]

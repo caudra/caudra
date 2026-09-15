@@ -288,6 +288,8 @@ pub struct Subagent {
     tools: JsonValue,
     deferred: Vec<DeferredTool>,
     mode: AgentMode,
+    environment: Option<String>,
+    mode_notice: Option<String>,
     thinking: ThinkingConfig,
     fast: bool,
     /// Fresh per session so `tool_search` loads never leak between a
@@ -372,6 +374,16 @@ pub struct PromptFailure {
 impl Subagent {
     pub fn id(&self) -> &str {
         &self.task_id
+    }
+
+    /// The mode this session actually runs under, which is not always what the
+    /// caller asked for: an omitted mode is inherited and an over-reaching one
+    /// is clamped.
+    pub fn task_mode(&self) -> SubagentTaskMode {
+        match self.mode {
+            AgentMode::ReadOnly => SubagentTaskMode::Plan,
+            _ => SubagentTaskMode::Build,
+        }
     }
 
     pub fn is_closed(&self) -> bool {
@@ -483,8 +495,9 @@ impl Subagent {
         let mut agent = Agent::new(
             self.params.clone(),
             AgentRunParams {
-                environment: None,
+                environment: self.environment.clone(),
                 instructions: None,
+                mode_notice: self.mode_notice.clone(),
                 history: &mut self.history,
                 system: self.system.clone(),
                 event_tx: self.sub_event_tx.clone(),
@@ -569,6 +582,12 @@ struct Resolved {
     /// the child needs.
     deferred: Vec<DeferredTool>,
     mode: AgentMode,
+    /// Announced to the child rather than assembled into `system`, so its
+    /// prompt carries nothing that varies between runs. Both are `None` for a
+    /// generic session, whose caller-authored prompt never agreed to the
+    /// reminder contract.
+    environment: Option<String>,
+    mode_notice: Option<String>,
     audience: ToolAudience,
     thinking: ThinkingConfig,
     mcp_enabled: bool,
@@ -640,7 +659,7 @@ pub async fn open_task(ctx: &ToolContext, opts: TaskOptions) -> Result<Subagent,
     let ids = Identity::derive(ctx, opts.task_id.requested());
     let default_spec = SubagentTaskSpec {
         profile_name: ctx.default_task_prompt_profile_name.to_string(),
-        mode: SubagentTaskMode::Plan,
+        mode: inherited_mode(&ctx.mode),
         ..SubagentTaskSpec::default()
     };
     let (task_id, history_lease) = match opts.task_id {
@@ -660,7 +679,7 @@ pub async fn open_task(ctx: &ToolContext, opts: TaskOptions) -> Result<Subagent,
         TaskIdentity::Derive | TaskIdentity::Fresh(_) => {
             let spec = SubagentTaskSpec {
                 profile_name: opts.profile.unwrap_or(default_spec.profile_name),
-                mode: opts.mode.unwrap_or(SubagentTaskMode::Plan),
+                mode: opts.mode.unwrap_or(default_spec.mode),
                 ..SubagentTaskSpec::default()
             };
             reserve_fresh(ctx, ids.task_id.clone(), Some(spec))?
@@ -710,7 +729,7 @@ pub async fn open_task(ctx: &ToolContext, opts: TaskOptions) -> Result<Subagent,
         ));
     }
 
-    let (mode, prompt_id, contract, audience) = match spec.mode {
+    let (mode, prompt_id, mode_notice, audience) = match spec.mode {
         SubagentTaskMode::Plan => (
             AgentMode::ReadOnly,
             PromptId::Research,
@@ -742,7 +761,6 @@ pub async fn open_task(ctx: &ToolContext, opts: TaskOptions) -> Result<Subagent,
         &base_filter,
         &instructions,
         profile.as_deref(),
-        contract,
     );
     let mut definitions = ctx.registry.definitions_split(
         &vars,
@@ -763,6 +781,9 @@ pub async fn open_task(ctx: &ToolContext, opts: TaskOptions) -> Result<Subagent,
         .expect("definitions return an array")
         .extend(opts.local_definitions);
     let profile_name: Arc<str> = Arc::from(spec.profile_name.as_str());
+    // The child's own model, which a profile's `subagent_model` can move away
+    // from the parent's.
+    let environment = crate::agent::environment_block(&vars, &model);
 
     build(
         ctx,
@@ -774,6 +795,8 @@ pub async fn open_task(ctx: &ToolContext, opts: TaskOptions) -> Result<Subagent,
             tools: definitions.declared,
             deferred: definitions.deferred,
             mode,
+            environment: Some(environment),
+            mode_notice: Some(mode_notice.to_owned()),
             audience,
             thinking,
             mcp_enabled: spec.mode == SubagentTaskMode::Build,
@@ -815,6 +838,8 @@ pub async fn open_generic(ctx: &ToolContext, opts: GenericOptions) -> Result<Sub
             tools: opts.tools,
             deferred: Vec::new(),
             mode: AgentMode::Build,
+            environment: None,
+            mode_notice: None,
             audience: opts.audience.unwrap_or(DEFAULT_SESSION_AUDIENCE),
             thinking: opts.thinking.unwrap_or_else(|| ctx.opts.thinking.clone()),
             mcp_enabled: opts.mcp.unwrap_or(true),
@@ -827,6 +852,18 @@ pub async fn open_generic(ctx: &ToolContext, opts: GenericOptions) -> Result<Sub
         opts.fast.unwrap_or(ctx.opts.fast),
         opts.name,
     )
+}
+
+/// What a task runs as when its caller did not say. A parent hands down the
+/// authority it holds and no more, so delegating from build mode delegates the
+/// ability to build; everything read-only stays read-only.
+pub fn inherited_mode(mode: &AgentMode) -> SubagentTaskMode {
+    match mode {
+        AgentMode::Build => SubagentTaskMode::Build,
+        AgentMode::ReadOnly | AgentMode::Plan(_) | AgentMode::RemotePlan(_) => {
+            SubagentTaskMode::Plan
+        }
+    }
 }
 
 pub const BUILD_FROM_READ_ONLY: &str =
@@ -1024,6 +1061,8 @@ fn build(
         tools: resolved.tools,
         deferred: resolved.deferred,
         mode: resolved.mode,
+        environment: resolved.environment,
+        mode_notice: resolved.mode_notice,
         thinking: resolved.thinking,
         fast,
         mcp: ctx
@@ -1089,6 +1128,8 @@ mod tests {
     const SUBAGENT_SYSTEM: &str = "system";
     const REMOTE_CWD: &str = "remote/project";
     const REMOTE_PLATFORM: &str = "remote-os";
+    const PLAN_PATH: &str = "plan.md";
+    const ENVIRONMENT_MISSING: &str = "a task must be told its environment";
     const PUBLISHER_MISSING: &str = "subagent must inherit a task-scoped context publisher";
     const IGNORED_ERROR: &str = "handled by the session caller";
     const DONE_USAGE: TokenUsage = tokens(150, 30);
@@ -1115,6 +1156,17 @@ mod tests {
             usage: ContextUsage::default(),
             measured: None,
             inventory: ContextInventory::default(),
+        }
+    }
+
+    fn task_options(mode: Option<SubagentTaskMode>) -> TaskOptions {
+        TaskOptions {
+            name: COLLIDING_SUBAGENT_NAME.into(),
+            task_id: TaskIdentity::Derive,
+            profile: Some(crate::prompt::profile::BUILTIN_PROFILE_NAME.into()),
+            mode,
+            local_definitions: Vec::new(),
+            local_tools: LocalTools::default(),
         }
     }
 
@@ -1193,29 +1245,68 @@ mod tests {
         });
     }
 
+    /// Announced rather than assembled, so the prompt a subagent caches never
+    /// carries a working directory, a date, or a model.
     #[test]
-    fn task_subagent_inherits_the_remote_environment() {
+    fn task_subagent_is_told_the_remote_environment() {
         smol::block_on(async {
             let mut ctx = crate::tools::test_support::stub_ctx(&AgentMode::Build);
             ctx.task_environment = crate::template::Vars::new()
                 .set("{cwd}", REMOTE_CWD)
                 .set("{platform}", REMOTE_PLATFORM);
-            let mut subagent = open_task(
-                &ctx,
-                TaskOptions {
-                    name: COLLIDING_SUBAGENT_NAME.into(),
-                    task_id: TaskIdentity::Derive,
-                    profile: Some(crate::prompt::profile::BUILTIN_PROFILE_NAME.into()),
-                    mode: Some(SubagentTaskMode::Build),
-                    local_definitions: Vec::new(),
-                    local_tools: LocalTools::default(),
-                },
-            )
-            .await
-            .unwrap();
+            let mut subagent = open_task(&ctx, task_options(Some(SubagentTaskMode::Build)))
+                .await
+                .unwrap();
 
-            assert!(subagent.system.contains(REMOTE_CWD));
-            assert!(subagent.system.contains(REMOTE_PLATFORM));
+            let environment = subagent.environment.as_deref().expect(ENVIRONMENT_MISSING);
+            assert!(environment.contains(REMOTE_CWD));
+            assert!(environment.contains(REMOTE_PLATFORM));
+            assert!(environment.contains(&subagent.params.model.spec()));
+            assert!(!subagent.system.contains(REMOTE_CWD));
+            subagent.close();
+        });
+    }
+
+    /// The mode is the one thing a subagent must not be able to talk itself out
+    /// of, so it arrives the same way the main agent's does.
+    #[test_case(SubagentTaskMode::Plan, crate::prompt::TASK_PLAN_CONTRACT ; "plan")]
+    #[test_case(SubagentTaskMode::Build, crate::prompt::TASK_BUILD_CONTRACT ; "build")]
+    fn a_task_is_told_the_mode_it_was_granted(mode: SubagentTaskMode, expected: &str) {
+        smol::block_on(async {
+            let ctx = crate::tools::test_support::stub_ctx(&AgentMode::Build);
+            let mut subagent = open_task(&ctx, task_options(Some(mode))).await.unwrap();
+
+            assert_eq!(subagent.mode_notice.as_deref(), Some(expected));
+            assert!(!subagent.system.contains(crate::prompt::TASK_MODE_MARKER));
+            subagent.close();
+        });
+    }
+
+    /// A generic session's prompt is written by its caller and never agreed to
+    /// the reminder contract, so it is told nothing it cannot read.
+    #[test]
+    fn a_generic_session_is_announced_nothing() {
+        smol::block_on(async {
+            let ctx = crate::tools::test_support::stub_ctx(&AgentMode::Build);
+            let mut subagent = open_generic(&ctx, generic_options()).await.unwrap();
+
+            assert!(subagent.environment.is_none());
+            assert!(subagent.mode_notice.is_none());
+            subagent.close();
+        });
+    }
+
+    /// A caller hands down the authority it holds, so delegation from build
+    /// mode delegates the ability to build instead of silently downgrading.
+    #[test_case(AgentMode::Build, SubagentTaskMode::Build ; "build_delegates_build")]
+    #[test_case(AgentMode::ReadOnly, SubagentTaskMode::Plan ; "read_only_delegates_plan")]
+    #[test_case(AgentMode::Plan(PLAN_PATH.into()), SubagentTaskMode::Plan ; "plan_delegates_plan")]
+    fn an_omitted_task_mode_is_inherited(caller: AgentMode, expected: SubagentTaskMode) {
+        smol::block_on(async {
+            let ctx = crate::tools::test_support::stub_ctx(&caller);
+            let mut subagent = open_task(&ctx, task_options(None)).await.unwrap();
+
+            assert_eq!(subagent.task_mode(), expected);
             subagent.close();
         });
     }

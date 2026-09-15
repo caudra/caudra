@@ -65,11 +65,15 @@ pub const COMPACTION_USER: &str = include_str!("prompts/compaction_user.md");
 pub const COMPACTION_MERGE: &str = include_str!("prompts/compaction_merge.md");
 pub const GOAL_EVALUATOR: &str = include_str!("prompts/goal_evaluator.md");
 pub const TITLE_SYSTEM: &str = include_str!("prompts/title.md");
-pub const TASK_PLAN_CONTRACT: &str = "\n\n# Host mode contract\nYou are in plan mode. Inspect, reason, and report, but do not modify files, persistent state, or external systems. If implementation is needed, describe the exact changes without applying them.";
-pub const TASK_BUILD_CONTRACT: &str = "\n\n# Host mode contract\nYou are in build mode. You may modify the workspace using the available tools. Complete the requested work, verify it, and report the result concisely.";
+/// Announced in the subagent's conversation for the same reason the interactive
+/// modes are: the rule then sits closest to the point the model generates from.
+/// Both modes share the heading, and so the kind, because a task's mode is
+/// fixed when it opens and a continuation cannot change it.
+pub const TASK_MODE_MARKER: &str = "# Host mode contract";
+pub const TASK_PLAN_CONTRACT: &str = "<system-reminder>\n# Host mode contract\n\nYou are in plan mode. Inspect, reason, and report, but do not modify files, persistent state, or external systems. If implementation is needed, describe the exact changes without applying them.\n</system-reminder>";
+pub const TASK_BUILD_CONTRACT: &str = "<system-reminder>\n# Host mode contract\n\nYou are in build mode. You may modify the workspace using the available tools. Complete the requested work, verify it, and report the result concisely.\n</system-reminder>";
 
 const INSTRUCTIONS_MARKER: &str = "{{instructions}}";
-const TASK_ENVIRONMENT_HEADING: &str = "Environment:\n";
 const TASK_STYLE_HEADING: &str = "# Output discipline\n";
 const TASK_TOOLS_HEADING: &str = "# Tool usage\n";
 const RESEARCH_CONVENTIONS_HEADING: &str = "# Guidelines\n";
@@ -548,7 +552,6 @@ pub fn assemble_system(
 
 fn task_parts(slots: &ResolvedSlots, mode: PromptId, instructions: &str) -> Option<SystemParts> {
     let template = mode.template();
-    let environment_start = template.find(TASK_ENVIRONMENT_HEADING)?;
     let style_start = template.find(TASK_STYLE_HEADING)?;
     let tools_start = template.find(TASK_TOOLS_HEADING)?;
     let conventions_heading = match mode {
@@ -564,7 +567,6 @@ fn task_parts(slots: &ResolvedSlots, mode: PromptId, instructions: &str) -> Opti
         PromptId::System => return None,
     };
     if ![
-        environment_start,
         style_start,
         tools_start,
         conventions_start,
@@ -579,30 +581,27 @@ fn task_parts(slots: &ResolvedSlots, mode: PromptId, instructions: &str) -> Opti
     let render = |fragment: &str| {
         render_prompt_template(fragment.trim_matches(['\r', '\n']), slots, mode, "")
     };
-    let mut context = render(&template[environment_start..style_start]);
-    if !instructions.is_empty() {
-        context.push('\n');
-        context.push_str(instructions);
-    }
     Some(SystemParts {
-        identity: render(&template[..environment_start]),
+        identity: render(&template[..style_start]),
         style: render(&template[style_start..tools_start]),
         tools: render(&template[tools_start..conventions_start]),
         conventions: render(&template[conventions_start..completion_start]),
         completion: render(&template[completion_start..instructions_start]),
-        context,
+        context: instructions.to_owned(),
         plan: String::new(),
     })
 }
 
 /// Assemble a research or general task prompt under a system prompt profile.
-/// The mode contract is opaque to templates and is appended exactly once, last.
+/// The reminder contract is opaque to templates and is appended exactly once,
+/// last, so a profile cannot leave a subagent unable to read its own
+/// announcements. What varies between runs is announced instead of assembled:
+/// the environment, and the mode the host granted this task.
 pub fn assemble_task(
     mode: PromptId,
     slots: &ResolvedSlots,
     instructions: &str,
     profile: Option<&SystemPromptProfile>,
-    mode_contract: &str,
 ) -> String {
     let mut default = render_prompt_template(mode.template(), slots, mode, instructions);
     let mut output = match profile {
@@ -621,7 +620,7 @@ pub fn assemble_task(
             None => default,
         },
     };
-    output.push_str(mode_contract);
+    output.push_str(REMINDERS_PROMPT);
     output
 }
 
@@ -631,15 +630,8 @@ pub fn assemble_task_with_filter(
     filter: &crate::tools::ToolFilter,
     instructions: &str,
     profile: Option<&SystemPromptProfile>,
-    mode_contract: &str,
 ) -> String {
-    assemble_task(
-        mode,
-        &slots.with_native_hints(filter),
-        instructions,
-        profile,
-        mode_contract,
-    )
+    assemble_task(mode, &slots.with_native_hints(filter), instructions, profile)
 }
 
 /// Fill each host template marker once. Inserted content is opaque and is not
@@ -962,18 +954,39 @@ mod tests {
 
     #[test_case(PromptId::Research, "You are a research agent" ; "research")]
     #[test_case(PromptId::General, "You are a general-purpose coding agent" ; "general")]
-    fn builtin_task_uses_existing_default_and_appends_contract_last(
+    fn builtin_task_uses_existing_default_and_appends_the_reminder_contract_last(
         mode: PromptId,
         identity: &str,
     ) {
-        const CONTRACT: &str = "\n<mode-contract>{{caudra.default}}</mode-contract>";
         let slots = ResolvedSlots::default();
         let default = assemble(mode, &slots, "TASK_CONTEXT");
 
-        let output = assemble_task(mode, &slots, "TASK_CONTEXT", None, CONTRACT);
-        assert_eq!(output, format!("{default}{CONTRACT}"));
+        let output = assemble_task(mode, &slots, "TASK_CONTEXT", None);
+        assert_eq!(output, format!("{default}{REMINDERS_PROMPT}"));
         assert!(output.starts_with(identity));
-        assert!(output.ends_with(CONTRACT));
-        assert_eq!(output.matches(CONTRACT).count(), 1);
+        assert!(output.ends_with(REMINDERS_PROMPT));
+    }
+
+    /// The task prompt precedes every message a subagent sends, so anything
+    /// here that varies re-caches its whole session when it moves. The mode and
+    /// the environment are announced in the conversation instead.
+    #[test_case(ENVIRONMENT_MARKER ; "environment_stays_out")]
+    #[test_case("Working directory" ; "cwd_stays_out")]
+    #[test_case(TASK_MODE_MARKER ; "mode_contract_stays_out")]
+    #[test_case(MODEL_SLOT ; "model_stays_out")]
+    fn a_task_prompt_carries_nothing_that_varies(absent: &str) {
+        for mode in [PromptId::Research, PromptId::General] {
+            let output = assemble_task(mode, &ResolvedSlots::default(), "", None);
+            assert!(!output.contains(absent), "{mode} carries {absent}");
+        }
+    }
+
+    /// Announcements arrive as user-role observations, so without this the tag
+    /// is the only thing telling a subagent they are not its caller talking.
+    #[test_case(PromptId::Research ; "research")]
+    #[test_case(PromptId::General ; "general")]
+    fn a_task_prompt_explains_the_reminder_contract(mode: PromptId) {
+        let output = assemble_task(mode, &ResolvedSlots::default(), "", None);
+        assert!(output.contains(REMINDERS_PROMPT.trim_end()));
     }
 }

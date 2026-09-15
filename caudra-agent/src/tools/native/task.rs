@@ -22,9 +22,11 @@ use crate::types::ToolOutput;
 
 pub const DESCRIPTION: &str = "Launch an autonomous subagent to perform tasks independently. Best combined with batch.
 
-Modes:
-- `plan` (default): Strictly read-only. For exploration, review, and implementation planning.
-- `build`: Can modify files and run commands. For implementation work.
+Modes, which default to your own and can never exceed it:
+- `plan`: Strictly read-only. No `shell` and no file writes, so anything that must run a command needs `build`. For exploration, review, and implementation planning.
+- `build`: Can modify files and run commands. For implementation work. Requested from a plan-mode caller, it runs as `plan` instead.
+
+Pass `mode: \"plan\"` explicitly when delegating read-only work from build mode. Every result reports the mode it actually ran as.
 
 Available system prompt profiles:
 {task_system_prompt_profiles}
@@ -37,8 +39,10 @@ Notes:
 5. Tell it to return concise summaries with file:line refs, not full file contents.
 ";
 
-const TASK_METADATA_FORMAT: &str = "<task_metadata>\ntask_id: {task_id}\n</task_metadata>";
+const TASK_METADATA_FORMAT: &str = "<task_metadata>\ntask_id: {task_id}\n{mode}</task_metadata>";
 const TASK_ID_PLACEHOLDER: &str = "{task_id}";
+const MODE_PLACEHOLDER: &str = "{mode}";
+const MODE_METADATA_LINE: &str = "mode: ";
 const JSON_FENCE_OPEN: &str = "```json\n";
 const JSON_FENCE_CLOSE: &str = "\n```";
 const DESCRIPTION_REQUIRED_ERROR: &str = "description is required";
@@ -60,7 +64,7 @@ static TASK_ID_PARAM: ParamSchema = ParamSchema::Primitive {
 };
 static MODE_PARAM: ParamSchema = ParamSchema::Enum {
     variants: MODES,
-    description: "Subagent mode. Defaults to \"plan\" for a new task; omitted continuations retain their stored mode.",
+    description: "Subagent mode. A new task defaults to the caller's own mode and is capped by it; omitted continuations retain their stored mode.",
 };
 static PROFILE_PARAM: ParamSchema = ParamSchema::Primitive {
     kind: ParamKind::String,
@@ -173,7 +177,10 @@ impl ToolInvocation for TaskCall {
 }
 
 /// The task ID is what makes a continuation possible, so it rides along with
-/// failures too: an interrupted subagent is still resumable.
+/// failures too: an interrupted subagent is still resumable. The mode rides
+/// with it because the caller's request is defaulted and capped on the way in,
+/// and a caller that wanted a command run has no other way to learn it was
+/// handed a read-only agent.
 fn render(outcome: TaskOutcome) -> ToolExecResult {
     let result = match (outcome.error, outcome.output) {
         (Some(message), _) => error(message),
@@ -181,13 +188,22 @@ fn render(outcome: TaskOutcome) -> ToolExecResult {
         (None, structured) => structured_json(structured),
     };
     match outcome.task_id {
-        Some(task_id) => with_task_id(&task_id, result),
+        Some(task_id) => with_metadata(&task_id, outcome.mode, result),
         None => result,
     }
 }
 
-fn with_task_id(task_id: &str, mut result: ToolExecResult) -> ToolExecResult {
-    result.model_suffix = Some(TASK_METADATA_FORMAT.replace(TASK_ID_PLACEHOLDER, task_id));
+fn with_metadata(
+    task_id: &str,
+    mode: Option<SubagentTaskMode>,
+    mut result: ToolExecResult,
+) -> ToolExecResult {
+    let mode = mode.map_or_else(String::new, |mode| format!("{MODE_METADATA_LINE}{mode}\n"));
+    result.model_suffix = Some(
+        TASK_METADATA_FORMAT
+            .replace(TASK_ID_PLACEHOLDER, task_id)
+            .replace(MODE_PLACEHOLDER, &mode),
+    );
     result
 }
 
@@ -220,6 +236,7 @@ mod tests {
     use test_case::test_case;
 
     const TASK_ID: &str = "toolu_01";
+    const PLAN_MODE: &str = "plan";
     const SUMMARY: &str = "found the middleware in src/auth.rs:12";
     const REQUIRED_FIELD: &str = "answer";
     const BOOM: &str = "boom";
@@ -242,6 +259,7 @@ mod tests {
     fn outcome(task_id: Option<&str>, verdict: Result<Value, &str>) -> TaskOutcome {
         TaskOutcome {
             task_id: task_id.map(str::to_owned),
+            mode: task_id.map(|_| SubagentTaskMode::Plan),
             success: verdict.is_ok(),
             cancelled: false,
             output: verdict.clone().unwrap_or(Value::Null),
@@ -252,7 +270,7 @@ mod tests {
     }
 
     fn metadata(task_id: &str) -> String {
-        format!("<task_metadata>\ntask_id: {task_id}\n</task_metadata>")
+        format!("<task_metadata>\ntask_id: {task_id}\nmode: {PLAN_MODE}\n</task_metadata>")
     }
 
     #[test]

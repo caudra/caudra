@@ -105,6 +105,9 @@ pub struct TaskRequest {
 pub struct TaskOutcome {
     /// `None` when no subagent was opened, so there is nothing to resume.
     pub task_id: Option<String>,
+    /// What the task ran as once the caller's request was defaulted and capped.
+    /// `None` when no session opened.
+    pub mode: Option<SubagentTaskMode>,
     pub success: bool,
     pub cancelled: bool,
     /// The validated structured value under an `output_schema`, else the
@@ -200,11 +203,11 @@ pub async fn run_task(ctx: &ToolContext, request: TaskRequest) -> TaskOutcome {
         None => (Vec::new(), LocalTools::default()),
         Some(schema) => match structured_output_tool(schema, &captured, &report_ready) {
             Ok((definition, tools)) => (vec![definition], tools),
-            Err(message) => return finish(started, None, 0, Err(message.into())),
+            Err(message) => return finish(started, None, None, 0, Err(message.into())),
         },
     };
     let Ok(_permit) = ctx.cancel.race(PERMITS.load().acquire_arc()).await else {
-        return finish(started, None, 0, Err(cancelled_failure().into()));
+        return finish(started, None, None, 0, Err(cancelled_failure().into()));
     };
     let mode = clamp_mode(&request.task, request.mode, &ctx.mode);
     let mut session = match subagent::open_task(
@@ -221,19 +224,27 @@ pub async fn run_task(ctx: &ToolContext, request: TaskRequest) -> TaskOutcome {
     .await
     {
         Ok(session) => OpenSession(session.with_report_ready(report_ready)),
-        Err(message) => return finish(started, None, 0, Err(message.into())),
+        Err(message) => return finish(started, None, None, 0, Err(message.into())),
     };
     let task_id = session.0.id().to_owned();
+    let effective_mode = session.0.task_mode();
     let verdict = converse(&mut session.0, request.prompt, validating, &captured).await;
     let usage = session.0.usage();
     let tokens_used = u64::from(usage.total_input()) + u64::from(usage.output);
     drop(session);
-    finish(started, Some(task_id), tokens_used, verdict)
+    finish(
+        started,
+        Some(task_id),
+        Some(effective_mode),
+        tokens_used,
+        verdict,
+    )
 }
 
 fn finish(
     started: Instant,
     task_id: Option<String>,
+    mode: Option<SubagentTaskMode>,
     tokens_used: u64,
     verdict: Result<Value, Failure>,
 ) -> TaskOutcome {
@@ -241,6 +252,7 @@ fn finish(
     match verdict {
         Ok(output) => TaskOutcome {
             task_id,
+            mode,
             success: true,
             cancelled: false,
             output,
@@ -250,6 +262,7 @@ fn finish(
         },
         Err(failure) => TaskOutcome {
             task_id,
+            mode,
             success: false,
             cancelled: failure.cancelled,
             output: Value::Null,
@@ -691,7 +704,7 @@ impl TaskRunner for SubagentTaskRunner {
                 .await
             {
                 Ok(ctx) => ctx,
-                Err(message) => return finish(started, None, 0, Err(message.into())),
+                Err(message) => return finish(started, None, None, 0, Err(message.into())),
             };
             run_task(&ctx, request).await
         })
@@ -1148,6 +1161,26 @@ mod tests {
             partial: None,
         });
         assert_eq!(message, format!("{ERROR_PREFIX}{BOOM}"));
+    }
+
+    /// A caller that asked for a command runner and was handed a read-only
+    /// agent has no other way to find out, so the outcome reports what the
+    /// task actually ran as rather than what was requested.
+    #[test_case(AgentMode::Build, None, SubagentTaskMode::Build; "an_omitted_mode_is_inherited")]
+    #[test_case(AgentMode::ReadOnly, Some(SubagentTaskMode::Build), SubagentTaskMode::Plan; "a_clamped_mode_is_reported")]
+    fn an_outcome_reports_the_mode_the_task_ran_as(
+        caller: AgentMode,
+        requested: Option<SubagentTaskMode>,
+        expected: SubagentTaskMode,
+    ) {
+        smol::block_on(async {
+            let provider = ScriptedProvider::new(vec![text_response(SUMMARY, FIRST_TURN)]);
+            let ctx = ctx_with(caller, provider);
+
+            let outcome = run_task(&ctx, request(TaskIdentity::Derive, requested)).await;
+
+            assert_eq!(outcome.mode, Some(expected));
+        });
     }
 
     #[test_case(TaskIdentity::Derive, Some(SubagentTaskMode::Build), AgentMode::ReadOnly, Some(SubagentTaskMode::Plan); "build_under_read_only_becomes_plan")]

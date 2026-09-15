@@ -471,8 +471,10 @@ async fn open_lua_task(
             .as_deref(),
     )?;
     // Plan-mode tasks are read-only, so the one tool they may install is the
-    // structured-output sink: anything else would be an effect in disguise.
-    let plan_mode = mode.unwrap_or(SubagentTaskMode::Plan) == SubagentTaskMode::Plan;
+    // structured-output sink: anything else would be an effect in disguise. An
+    // omitted mode is inherited from the caller, exactly as `open_task` does.
+    let plan_mode =
+        mode.unwrap_or_else(|| subagent::inherited_mode(&agent_ctx.mode)) == SubagentTaskMode::Plan;
     let (local_definitions, local_tools) = build_local_tools(
         lua,
         local_tools_tbl,

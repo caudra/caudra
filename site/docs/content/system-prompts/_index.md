@@ -35,7 +35,7 @@ Do not edit files unless the user explicitly asks.
 
 `layout: overlay` is the default, so the frontmatter is optional. Caudra inserts the profile after runtime context and before the mode section.
 
-The system prompt is identical in plan and build mode, and carries no working directory, date, or model. All of those are announced in the conversation instead, and re-announced only when they change, so switching mode, crossing midnight, or changing model does not invalidate the prompt cache. Editing an instruction file mid-session is announced the same way, as a diff against the copy the prompt already carries.
+The system prompt is identical in plan and build mode, and carries no working directory, date, or model. All of those are announced in the conversation instead, and re-announced only when they change, so switching mode, crossing midnight, or changing model does not invalidate the prompt cache. Editing an instruction file mid-session is announced the same way, as a diff against the copy the prompt already carries. Task prompts follow the same rule: a subagent is told its environment and the mode it was granted in the conversation.
 
 Those announcements arrive wrapped in `<system-reminder>`. They are appended to the conversation and never edited, so a kind is restated only when its content changes and earlier blocks of the same kind remain as history. The most recent block of a kind is the only one in force; the system prompt tells the model this, and that a reminder is not the user talking.
 
@@ -70,7 +70,7 @@ Act as a security-focused reviewer. Report findings before summaries.
 | `{{caudra.tools}}` | Tool rules, plugin hints, and efficient tools |
 | `{{caudra.conventions}}` | Git, security, and plugin conventions |
 | `{{caudra.completion}}` | Completion requirements |
-| `{{caudra.context}}` | Instruction files and plugin runtime context |
+| `{{caudra.context}}` | Instruction files and plugin runtime context. In a task prompt, the instruction files alone |
 | `{{caudra.plan}}` | The system-reminder contract, and how plan and build mode work. Identical in both modes |
 
 A directive expands only when it occupies a complete line. Prefix it with `\` to keep it literal, for example `\{{caudra.tools}}`.
@@ -100,9 +100,11 @@ Prioritize exploitable findings and concrete fixes.
 
 Caudra validates each profile against the effective subagent model. An explicit thinking setting must be supported exactly. Caudra does not snap effort levels, clamp budgets, or translate between effort and budget modes for a profile. An incompatible profile remains available to the main agent, but Caudra warns and removes it from the task profile list.
 
-The `task` tool accepts `profile` and `mode`. A new task inherits the parent profile when `profile` is omitted. Set `profile` to `builtin` to use Caudra's built-in task prompt. `mode` defaults to `plan`, which has a host-enforced read-only tool set. `build` enables implementation tools.
+The `task` tool accepts `profile` and `mode`. A new task inherits the parent profile when `profile` is omitted. Set `profile` to `builtin` to use Caudra's built-in task prompt.
 
-Task profiles support overlay and custom layouts. For a custom task prompt, directives resolve to the matching research or general task component. `{{caudra.default}}` expands to the complete built-in task prompt. Caudra appends the plan or build contract after the rendered profile, so custom layouts cannot remove it.
+`mode` defaults to the caller's own mode and can never exceed it, so a task launched from build mode can build, and one launched from plan mode stays read-only. `plan` has a host-enforced read-only tool set with no `shell` and no file writes, so a task that must run a command needs `build`. A `build` request from a plan-mode caller runs as `plan` instead. Every result reports the mode the task ran as.
+
+Task profiles support overlay and custom layouts. For a custom task prompt, directives resolve to the matching research or general task component. `{{caudra.default}}` expands to the complete built-in task prompt. Caudra appends the system-reminder contract after the rendered profile, so custom layouts cannot remove it.
 
 The effective profile and mode are stored with task history. A continuation uses the stored values when they are omitted and rejects conflicting values. Legacy task histories bind both values on their first successful continuation.
 

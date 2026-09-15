@@ -1469,30 +1469,50 @@ pub fn prompt(
                 system
             }
         }
-        PromptVariant::Research => vars
-            .apply(&assemble_task_with_filter(
+        PromptVariant::Research => with_announcements(
+            &assemble_task_with_filter(
                 PromptId::Research,
                 &slots,
                 &filter,
                 &instructions,
                 system_prompt_profile.as_deref(),
-                TASK_PLAN_CONTRACT,
-            ))
-            .into_owned(),
-        PromptVariant::General => vars
-            .apply(&assemble_task_with_filter(
+            ),
+            &vars,
+            &model,
+            TASK_PLAN_CONTRACT,
+        ),
+        PromptVariant::General => with_announcements(
+            &assemble_task_with_filter(
                 PromptId::General,
                 &slots,
                 &filter,
                 &instructions,
                 system_prompt_profile.as_deref(),
-                TASK_BUILD_CONTRACT,
-            ))
-            .into_owned(),
+            ),
+            &vars,
+            &model,
+            TASK_BUILD_CONTRACT,
+        ),
     };
 
     print!("{output}");
     Ok(())
+}
+
+/// A task prompt carries neither its environment nor its mode: both are
+/// announced to the subagent, so printing one without them would misrepresent
+/// what the subagent is told.
+fn with_announcements(
+    prompt: &str,
+    vars: &caudra_agent::template::Vars,
+    model: &caudra_providers::Model,
+    contract: &str,
+) -> String {
+    format!(
+        "{}\n\n{}\n\n{contract}",
+        vars.apply(prompt),
+        caudra_agent::agent::environment_block(vars, model)
+    )
 }
 
 #[cfg(test)]

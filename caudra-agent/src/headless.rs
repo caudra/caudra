@@ -1384,6 +1384,7 @@ pub fn spawn(mut params: HeadlessParams) -> HeadlessHandle {
                     system,
                     environment: Some(agent::environment_block(&vars, &params.model)),
                     instructions: None,
+                    mode_notice: None,
                     event_tx,
                     tools,
                     deferred,
@@ -2402,6 +2403,7 @@ pub async fn spawn_prepared_interactive(
                         system,
                         environment: Some(agent::environment_block(&vars, &turn_model)),
                         instructions,
+                        mode_notice: None,
                         event_tx,
                         tools: definitions.declared,
                         deferred: definitions.deferred,
@@ -3675,8 +3677,10 @@ complete(#{ report: first.output });
             );
             let run = trust_and_start(&workflow).await;
             wait_for_run(&handle.event_rx, &run.run_id, RunStatus::Completed).await;
-            let prompts = format!("{:?}", session.provider.systems.lock().unwrap());
-            assert!(prompts.contains("nested"), "{prompts}");
+            // The directory reaches an agent as an announcement now, not as
+            // part of the prompt it caches.
+            let announced = format!("{:?}", session.provider.requests.lock().unwrap());
+            assert!(announced.contains("nested"), "{announced}");
             let loaded = crate::load_stored_session(session_id(), &session.state_dir).unwrap();
             assert_eq!(loaded.cwd, "nested");
             assert_eq!(
@@ -3694,12 +3698,14 @@ complete(#{ report: first.output });
             assert!(
                 session
                     .provider
-                    .systems
+                    .requests
                     .lock()
                     .unwrap()
                     .last()
                     .unwrap()
-                    .contains("nested")
+                    .iter()
+                    .filter_map(Message::first_text_content)
+                    .any(|text| text.contains("nested"))
             );
             let InteractiveHandle { input_tx, task, .. } = handle;
             drop(input_tx);

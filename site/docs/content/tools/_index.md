@@ -289,7 +289,7 @@ Launch an autonomous subagent to perform tasks independently. Best combined with
 | `description` | string | yes | Short (3-5 words) description of the task |
 | `prompt` | string | no | Detailed task prompt for the agent. Required for a new task; omit it to resume a task_id with no new work. |
 | `task_id` | string | no | Set this only to resume. Continues the subagent from an earlier task_id with its existing history instead of starting fresh. |
-| `mode` | string | no | Subagent mode. Defaults to "plan" for a new task; omitted continuations retain their stored mode. |
+| `mode` | string | no | Subagent mode. A new task defaults to the caller's own mode and is capped by it; omitted continuations retain their stored mode. |
 | `profile` | string | no | System prompt profile. Defaults to the parent profile for a new task; use "builtin" explicitly for Caudra's built-in prompt. Omitted continuations retain their stored profile. |
 | `output_schema` | string | no | JSON Schema (object) the subagent's final result must match. When set, the result is returned as a validated JSON string. |
 

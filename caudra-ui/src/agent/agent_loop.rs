@@ -588,6 +588,7 @@ impl AgentLoop {
                 system,
                 environment: Some(agent::environment_block(&self.vars, &effective_slot.model)),
                 instructions,
+                mode_notice: None,
                 event_tx,
                 tools: self.tools.clone(),
                 deferred: self.deferred.clone(),

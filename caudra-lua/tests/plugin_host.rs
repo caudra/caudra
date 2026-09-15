@@ -5470,10 +5470,12 @@ fn session_task_id_reopens_completed_history() {
     assert!(out.starts_with("session-"), "got: {out}");
 }
 
-const MODE_MISMATCH_ERR: &str = "uses `plan` mode, not requested `build` mode";
+const MODE_MISMATCH_ERR: &str = "uses `build` mode, not requested `plan` mode";
 
+/// An omitted mode is the caller's own, so a task opened from build mode can
+/// build. The stored spec is what a continuation is then held to.
 #[test]
-fn task_session_defaults_to_plan_and_locks_continuation_identity() {
+fn task_session_inherits_the_caller_mode_and_locks_continuation_identity() {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let src = format!(
@@ -5490,7 +5492,7 @@ fn task_session_defaults_to_plan_and_locks_continuation_identity() {
                 local continued, continued_err = caudra.agent.session(ctx, {{
                     task = true,
                     task_id = task_id,
-                    mode = "build",
+                    mode = "plan",
                 }})
                 if continued then return "unexpected continuation" end
                 return task_id .. "\n" .. continued_err
@@ -5511,7 +5513,7 @@ fn task_session_defaults_to_plan_and_locks_continuation_identity() {
     let snapshot = history.snapshot();
     let spec = snapshot.records()[task_id].spec().unwrap();
     assert_eq!(spec.profile_name, "builtin");
-    assert_eq!(spec.mode, caudra_agent::SubagentTaskMode::Plan);
+    assert_eq!(spec.mode, caudra_agent::SubagentTaskMode::Build);
     assert!(!history.is_active(task_id));
 }
 

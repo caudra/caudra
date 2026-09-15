@@ -602,6 +602,10 @@ mod tests {
 
     use super::*;
 
+    /// The reminder contract is appended once, after the profile, so a profile
+    /// cannot leave a subagent unable to read its own announcements.
+    const EXPECTED_REMINDER_CONTRACTS: usize = 1;
+
     fn discover(dir: &Path) -> PromptProfileCatalog {
         PromptProfileCatalog::discover_with(Some(dir))
     }
@@ -1002,8 +1006,7 @@ mod tests {
     }
 
     #[test]
-    fn task_overlay_lands_after_default_and_before_mode_contract() {
-        const CONTRACT: &str = "\n<mode-contract>RESEARCH</mode-contract>";
+    fn task_overlay_lands_after_default_and_before_reminder_contract() {
         let dir = TempDir::new().unwrap();
         let profiles = profile_dir(&dir);
         fs::write(profiles.join("review.md"), "PROFILE_OVERLAY").unwrap();
@@ -1014,17 +1017,18 @@ mod tests {
             &crate::prompt::ResolvedSlots::default(),
             "TASK_CONTEXT",
             Some(&profile),
-            CONTRACT,
         );
         assert!(output.starts_with("You are a research agent"));
         assert!(output.find("TASK_CONTEXT") < output.find("PROFILE_OVERLAY"));
-        assert!(output.ends_with(CONTRACT));
-        assert_eq!(output.matches(CONTRACT).count(), 1);
+        assert!(output.ends_with(crate::prompt::REMINDERS_PROMPT));
+        assert_eq!(
+            output.matches(crate::prompt::REMINDERS_PROMPT).count(),
+            EXPECTED_REMINDER_CONTRACTS
+        );
     }
 
     #[test]
     fn task_custom_default_is_the_full_task_default() {
-        const CONTRACT: &str = "MODE_CONTRACT";
         let dir = TempDir::new().unwrap();
         let profiles = profile_dir(&dir);
         fs::write(
@@ -1042,14 +1046,15 @@ mod tests {
             &slots,
             "TASK_CONTEXT",
             Some(&profile),
-            CONTRACT,
         );
-        assert_eq!(output, format!("{default}{CONTRACT}"));
+        assert_eq!(
+            output,
+            format!("{default}{}", crate::prompt::REMINDERS_PROMPT)
+        );
     }
 
     #[test]
     fn task_custom_directives_use_mode_specific_components() {
-        const CONTRACT: &str = "\nMODE_CONTRACT";
         let dir = TempDir::new().unwrap();
         let profiles = profile_dir(&dir);
         fs::write(
@@ -1074,31 +1079,27 @@ mod tests {
             &slots,
             "TASK_CONTEXT",
             Some(&profile),
-            CONTRACT,
         );
         assert!(research.contains("You are a research agent"));
         assert!(research.contains("Do NOT modify files"));
         assert!(research.contains("# Output discipline"));
         assert!(research.contains("# Tool usage"));
         assert!(research.contains("# Guidelines"));
-        assert!(research.contains("Environment:"));
         assert!(research.contains("TASK_CONTEXT"));
-        assert!(research.contains("{platform}\nTASK_CONTEXT"));
         assert!(!research.contains("# When done"));
         assert!(research.contains("PLAN_START\nPLAN_END"));
-        assert!(research.ends_with(CONTRACT));
+        assert!(research.ends_with(crate::prompt::REMINDERS_PROMPT));
 
         let general = crate::prompt::assemble_task(
             crate::prompt::PromptId::General,
             &slots,
             "TASK_CONTEXT",
             Some(&profile),
-            CONTRACT,
         );
         assert!(general.contains("You are a general-purpose coding agent"));
         assert!(general.contains("# Conventions"));
         assert!(general.contains("# When done"));
         assert!(!general.contains("# Guidelines"));
-        assert!(general.ends_with(CONTRACT));
+        assert!(general.ends_with(crate::prompt::REMINDERS_PROMPT));
     }
 }
