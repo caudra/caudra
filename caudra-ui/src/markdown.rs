@@ -575,6 +575,24 @@ pub(crate) fn text_to_painted(
     )
 }
 
+/// Renders markdown with its paragraphs broken to `width` instead of left for
+/// ratatui to re-break when it paints. A body drawn inside a tree carries a
+/// prefix on every row, and ratatui's own wrap restarts a continuation at
+/// column zero: the paragraph keeps going, but the tree it hangs from stops.
+///
+/// `width` of zero still means unbroken, which is what a caller with no width
+/// to give asks for.
+pub(crate) fn text_to_wrapped(
+    text: &str,
+    style: Style,
+    width: u16,
+    max_line_bytes: usize,
+) -> Painted {
+    let parsed = render::truncate_long_lines_at(text, max_line_bytes);
+    let semantic = render::Renderer::new().render(parsed.as_ref(), width, 0);
+    paint_semantic(&semantic, "", style, style)
+}
+
 /// Paints a fragment whose provenance has to point into a larger document.
 /// Every recorded range is shifted by `base`, the offset of `text` inside that
 /// document, so a copy reaches the original bytes.

@@ -3,7 +3,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use crate::highlight::{fallback_span, highlight_line};
-use crate::markdown::{expand_notice, should_truncate, text_to_painted, truncation_notice};
+use crate::markdown::{expand_notice, should_truncate, text_to_wrapped, truncation_notice};
 use crate::provenance::LineProvenance;
 use crate::theme;
 
@@ -1213,17 +1213,13 @@ fn capped(mut lines: Vec<Line<'static>>, budget: usize) -> (Vec<Line<'static>>, 
 /// renderer's own word for not wrapping, and stays what a caller with no width
 /// to give gets.
 fn markdown_lines(text: &str, width: u16) -> Vec<Line<'static>> {
-    let style = theme::current().assistant;
-    let (painted, _) = text_to_painted(
+    text_to_wrapped(
         text,
-        "",
-        style,
-        style,
+        theme::current().assistant,
         width,
-        Some(caudra_markdown::render::TOOL_OUTPUT_MAX_LINE_BYTES),
-        Vec::new(),
-    );
-    painted.lines
+        caudra_markdown::render::TOOL_OUTPUT_MAX_LINE_BYTES,
+    )
+    .lines
 }
 
 fn text_lines(text: String) -> Vec<Line<'static>> {
@@ -3258,6 +3254,32 @@ mod tests {
             .skip(1)
             .map(|line| spans_text(&line.spans))
             .collect()
+    }
+
+    /// One paragraph longer than the card is wide. The renderer leaves
+    /// paragraphs for ratatui to break at paint time, which is fine for a body
+    /// that owns its column and wrong for one hanging off a tree: every
+    /// continuation restarts at column zero and the trunk stops with it.
+    const LONG_PARAGRAPH: &str = "A librarian walks into a library and whispers that they are \
+        looking for a book on paranoia, and the librarian whispers back that the books are right \
+        behind them, which is the sort of answer that only raises further questions.";
+
+    #[test]
+    fn a_markdown_child_breaks_a_paragraph_to_its_own_width() {
+        let body = markdown_child_body(LONG_PARAGRAPH, NARROW_BODY_WIDTH);
+
+        assert!(
+            body.len() > 1,
+            "an unbroken paragraph is one the terminal breaks for us, losing the trunk: {body:?}"
+        );
+        let indent = format!("{TREE_GAP}{BATCH_BODY_PAD}");
+        let limit = usize::from(NARROW_BODY_WIDTH) + indent.len();
+        for line in &body {
+            assert!(
+                line.starts_with(&indent) && line.chars().count() <= limit,
+                "a row past the width is one the terminal wraps for us: {line:?}"
+            );
+        }
     }
 
     /// A line the card does not break is one the terminal breaks, and `Wrap`
