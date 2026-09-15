@@ -21,6 +21,10 @@ use crate::runtime::{self, ClickFallback, LuaThread, Request, RestoreItem};
 use caudra_agent::prompt::ResolvedSlots;
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+/// How often a blocked caller looks up to check the runtime still exists.
+/// Only a caller whose request died with the host ever waits a whole one: a
+/// live runtime's reply wakes the receive the moment it is sent.
+const HOST_LIVENESS_POLL: Duration = Duration::from_millis(50);
 /// Bundled plugins that load regardless of the user's `plugins` config.
 /// Empty since `tool_output` became a native tool; kept because the mechanism
 /// is how any future non-negotiable builtin would arrive.
@@ -650,13 +654,54 @@ impl EventHandle {
         });
     }
 
+    /// Waits for a reply, and settles for the default if the runtime dies
+    /// with the request still queued.
+    ///
+    /// A dying runtime drains what it holds and then spends the teardown of a
+    /// whole Lua VM still owning its receivers, so a request sent in that
+    /// window is accepted by a channel nobody will read again. Dropping the
+    /// receivers does not free it: flume keeps a queued message alive while
+    /// any sender exists, and this handle is one. The reply sender inside it
+    /// therefore never drops, and a plain `recv` would park here for good.
+    /// The receivers going is what says the host is gone, and only a waiter
+    /// can see it happen, so the waiter is where it has to be checked.
+    fn await_reply<T: Default>(&self, rx: &flume::Receiver<T>) -> T {
+        loop {
+            match rx.recv_timeout(HOST_LIVENESS_POLL) {
+                Ok(reply) => return reply,
+                Err(flume::RecvTimeoutError::Disconnected) => return T::default(),
+                Err(flume::RecvTimeoutError::Timeout) if self.tx.is_disconnected() => {
+                    return T::default();
+                }
+                Err(flume::RecvTimeoutError::Timeout) => {}
+            }
+        }
+    }
+
+    /// [`Self::await_reply`] for a caller that must not block its executor.
+    async fn await_reply_async<T: Default>(&self, rx: &flume::Receiver<T>) -> T {
+        loop {
+            let reply = async { Some(rx.recv_async().await) };
+            let lull = async {
+                smol::Timer::after(HOST_LIVENESS_POLL).await;
+                None
+            };
+            match smol::future::or(reply, lull).await {
+                Some(Ok(reply)) => return reply,
+                Some(Err(_)) => return T::default(),
+                None if self.tx.is_disconnected() => return T::default(),
+                None => {}
+            }
+        }
+    }
+
     pub fn collect_prompt_slots(&self, config: &AgentConfig) -> ResolvedSlots {
         let (tx, rx) = flume::bounded(1);
         let _ = self.tx.send(Request::CollectPromptSlots {
             config: config.clone(),
             reply: tx,
         });
-        rx.recv().unwrap_or_default()
+        self.await_reply(&rx)
     }
 
     pub async fn collect_prompt_slots_async(&self, config: &AgentConfig) -> ResolvedSlots {
@@ -665,7 +710,7 @@ impl EventHandle {
             config: config.clone(),
             reply: tx,
         });
-        rx.recv_async().await.unwrap_or_default()
+        self.await_reply_async(&rx).await
     }
 
     pub fn request_restore(&self, item: RestoreItem, event_tx: caudra_agent::EventSender) {
@@ -921,14 +966,7 @@ mod tests {
         stopped_rx.recv_timeout(SHUTDOWN_TIMEOUT).unwrap();
     }
 
-    /// Regression for the exit drain in `runtime::spawn`. An `EventHandle`
-    /// clone keeps queued requests alive after the Lua thread exits, and
-    /// dispatch prefers the priority lane, so a bulk request queued behind
-    /// `Shutdown` is never served. Without the drain its reply sender lives
-    /// forever and `collect_prompt_slots` blocks; with it, the call falls
-    /// back to defaults right away.
-    #[test]
-    fn live_event_handle_does_not_hang_after_begin_shutdown() {
+    fn hinted_host() -> (PluginHost, EventHandle) {
         let mut host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
         host.load_source(
             "hinted",
@@ -937,6 +975,17 @@ mod tests {
         .unwrap();
         let handle = host.event_handle();
         host.begin_shutdown();
+        (host, handle)
+    }
+
+    /// An `EventHandle` clone keeps a sender alive, which keeps queued
+    /// requests alive, so a request that lands after the exiting runtime's
+    /// drain is never freed and its reply sender never drops. The two calls
+    /// straddle the window deliberately: the first races the teardown, the
+    /// second is long past it.
+    #[test]
+    fn live_event_handle_does_not_hang_after_begin_shutdown() {
+        let (host, handle) = hinted_host();
 
         let slots = handle.collect_prompt_slots(&AgentConfig::default());
         assert!(
@@ -946,6 +995,20 @@ mod tests {
 
         drop(host);
         let slots = handle.collect_prompt_slots(&AgentConfig::default());
+        assert!(contents(&slots, PromptId::System, Slot::ToolUsage).is_empty());
+    }
+
+    /// The agent loop assembles its prompt through the async twin, so it has
+    /// the same hazard and needs the same answer.
+    #[test]
+    fn live_event_handle_does_not_hang_asynchronously_either() {
+        let (host, handle) = hinted_host();
+
+        let slots = smol::block_on(handle.collect_prompt_slots_async(&AgentConfig::default()));
+        assert!(contents(&slots, PromptId::System, Slot::ToolUsage).is_empty());
+
+        drop(host);
+        let slots = smol::block_on(handle.collect_prompt_slots_async(&AgentConfig::default()));
         assert!(contents(&slots, PromptId::System, Slot::ToolUsage).is_empty());
     }
 

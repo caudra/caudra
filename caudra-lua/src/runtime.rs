@@ -3155,7 +3155,12 @@ pub fn spawn(
             // Clones of the host (`EventHandle`, `LuaTool`) can still hold
             // a live sender, so dropping the receivers alone does not free
             // queued requests. Drain them so their reply channels drop and
-            // no caller blocks on a dead host.
+            // waiting callers are answered now rather than when they next
+            // look up. This is a courtesy, not the guarantee: the receivers
+            // outlive it for as long as the teardown below takes, and a
+            // request arriving in that window is queued where nothing will
+            // ever read it. `EventHandle::await_reply` is what keeps such a
+            // caller from waiting forever.
             for _ in rx.drain() {}
             for _ in prio_rx.drain() {}
         })
