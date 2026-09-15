@@ -584,6 +584,15 @@ fn with_text(app: &mut App) {
     app.update(Msg::Key(key(KeyCode::Char('i'))));
 }
 
+/// The composer's select-all lives in the workbench keymap: the app never
+/// matches it, the document does, so there is no `key::` const to reach for.
+fn select_all_key() -> KeyEvent {
+    KeyEvent::new(
+        caudra_workbench::keys::SELECT_ALL.code,
+        caudra_workbench::keys::SELECT_ALL.modifiers,
+    )
+}
+
 fn with_image(app: &mut App) {
     let img = ImageSource::new(ImageMediaType::Png, Arc::from("dGVzdA=="));
     app.input_box.attach_image(img);
@@ -607,6 +616,32 @@ fn ctrl_c_quits_when_input_empty() {
     let actions = app.update(Msg::Key(kb::QUIT.to_key_event()));
     assert_eq!(app.exit_request, ExitRequest::Success);
     assert!(matches!(actions.as_slice(), [Action::ManualExit]));
+}
+
+/// Select-all puts the whole draft under the next keystroke, so copy has to
+/// reach the clipboard rather than the discard path behind it.
+#[test]
+fn ctrl_c_copies_a_selection_instead_of_clearing_the_draft() {
+    let mut app = test_app();
+    with_text(&mut app);
+    app.update(Msg::Key(select_all_key()));
+
+    let actions = app.update(Msg::Key(kb::QUIT.to_key_event()));
+
+    assert!(actions.is_empty());
+    assert_eq!(app.exit_request, ExitRequest::None);
+    assert_eq!(app.input_box.buffer.value(), "hi");
+}
+
+#[test]
+fn shift_delete_cuts_the_selection_out_of_the_draft() {
+    let mut app = test_app();
+    with_text(&mut app);
+    app.update(Msg::Key(select_all_key()));
+
+    app.update(Msg::Key(kb::CUT.to_key_event()));
+
+    assert!(app.input_box.buffer.value().is_empty());
 }
 
 #[test]

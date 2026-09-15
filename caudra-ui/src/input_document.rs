@@ -161,8 +161,12 @@ impl InputDocument {
         Some(self.offset_of(start)..self.offset_of(end))
     }
 
+    /// The selection with every paste chip it covers restored to the content the
+    /// chip stands for. The display buffer holds labels, so reading the
+    /// selection straight off it hands out `[Pasted 12 lines]` rather than the
+    /// twelve lines, which is not what submitting the same draft would send.
     pub fn selected_text(&self) -> Option<String> {
-        self.display.selected_text()
+        Some(self.project_range(self.selection()?, |paste| &paste.text))
     }
 
     pub fn select_all(&mut self) {
@@ -523,15 +527,29 @@ impl InputDocument {
     }
 
     fn project<'a>(&'a self, replacement: impl Fn(&'a PasteSpan) -> &'a str) -> String {
+        self.project_range(0..self.display_text().chars().count(), replacement)
+    }
+
+    /// `range` of the display text with every chip it touches swapped for
+    /// `replacement`. A chip the range only partly covers comes back whole, the
+    /// rule [`Self::replace`] already applies to an edit that straddles one.
+    fn project_range<'a>(
+        &'a self,
+        range: Range<usize>,
+        replacement: impl Fn(&'a PasteSpan) -> &'a str,
+    ) -> String {
         let display = self.display_text();
-        let mut projected = String::with_capacity(display.len());
-        let mut cursor = 0;
+        let mut projected = String::with_capacity(range.len());
+        let mut cursor = range.start;
         for paste in &self.pastes {
-            projected.push_str(char_slice(&display, cursor..paste.range.start));
+            if !ranges_intersect(&range, &paste.range) {
+                continue;
+            }
+            projected.push_str(char_slice(&display, cursor..paste.range.start.max(cursor)));
             projected.push_str(replacement(paste));
             cursor = paste.range.end;
         }
-        projected.push_str(char_slice(&display, cursor..display.chars().count()));
+        projected.push_str(char_slice(&display, cursor.min(range.end)..range.end));
         projected
     }
 
@@ -628,8 +646,12 @@ impl InputDocument {
                 }
             }
         };
+        // Nudging the caret off a chip must not disturb the anchor: dropping it
+        // here left a sweep that crossed a chip with nothing before the chip
+        // selected, starting again at the edge it came out of.
+        let extend = self.display.has_selection();
         let cursor = self.cursor_of(offset);
-        self.display.set_cursor(cursor, false);
+        self.display.set_cursor(cursor, extend);
     }
 
     fn delete_word_before(&mut self) {
@@ -791,9 +813,13 @@ fn shift_spans(spans: &mut [PasteSpan], removed_len: usize, inserted_len: usize)
 #[cfg(test)]
 mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::ops::Range;
     use test_case::test_case;
 
     use super::{InputDocument, InputDraft, paste_summary_label, should_summarize_paste};
+
+    const PASTE_BODY: &str = "a\nb\nc";
+    const PASTE_LABEL: &str = "[Pasted 3 lines]";
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, modifiers)
@@ -938,5 +964,116 @@ mod tests {
         });
         assert_eq!(document.display_text(), "é");
         assert!(!document.has_pastes());
+    }
+
+    fn select(document: &mut InputDocument, range: Range<usize>) {
+        let start = document.cursor_of(range.start);
+        let end = document.cursor_of(range.end);
+        document.set_caret(start, false);
+        document.set_caret(end, true);
+    }
+
+    fn with_one_paste() -> InputDocument {
+        let mut document = InputDocument::from_plain("Review ".into());
+        document.move_to_end();
+        document.insert_paste(PASTE_BODY);
+        document
+    }
+
+    #[test]
+    fn selection_across_a_chip_copies_the_pasted_text() {
+        let mut document = with_one_paste();
+        let whole = document.display_text().chars().count();
+        select(&mut document, 0..whole);
+
+        assert_eq!(document.selected_text().as_deref(), Some("Review a\nb\nc "));
+    }
+
+    #[test]
+    fn selection_of_only_the_chip_copies_its_text() {
+        let mut document = with_one_paste();
+        let start = "Review ".chars().count();
+        select(&mut document, start..start + PASTE_LABEL.chars().count());
+
+        assert_eq!(document.selected_text().as_deref(), Some(PASTE_BODY));
+    }
+
+    #[test]
+    fn selection_clear_of_every_chip_is_left_alone() {
+        let mut document = InputDocument::from_plain("plain words".into());
+        select(&mut document, 0..5);
+
+        assert_eq!(document.selected_text().as_deref(), Some("plain"));
+    }
+
+    #[test]
+    fn selection_expands_each_chip_in_order() {
+        let mut document = InputDocument::from_plain("Review ".into());
+        document.move_to_end();
+        document.insert_paste(PASTE_BODY);
+        document.insert_text("then ");
+        document.insert_paste("x\ny\nz");
+        let whole = document.display_text().chars().count();
+        select(&mut document, 0..whole);
+
+        assert_eq!(
+            document.selected_text().as_deref(),
+            Some("Review a\nb\nc then x\ny\nz ")
+        );
+    }
+
+    #[test]
+    fn selecting_everything_copies_what_submitting_would_send() {
+        let mut document = with_one_paste();
+        document.select_all();
+
+        assert_eq!(document.selected_text(), Some(document.value()));
+    }
+
+    /// Nudging the caret off a chip must not disturb the anchor. It used to,
+    /// so a sweep that crossed a chip lost everything selected before it and
+    /// started again at the chip's far edge.
+    #[test]
+    fn extending_across_a_chip_keeps_what_came_before_it() {
+        let mut document = with_one_paste();
+        let before_chip = "Rev".chars().count();
+        let after_chip = document.display_text().chars().count();
+        document.set_caret(document.cursor_of(before_chip), false);
+
+        for offset in before_chip + 1..=after_chip {
+            let step = document.cursor_of(offset);
+            document.set_caret(step, true);
+        }
+
+        assert_eq!(document.selected_text().as_deref(), Some("iew a\nb\nc "));
+    }
+
+    /// The same crossing by keyboard, which reaches `normalize_cursor` through
+    /// `move_with_key` rather than through a drag.
+    #[test]
+    fn shift_right_across_a_chip_keeps_what_came_before_it() {
+        let mut document = with_one_paste();
+        document.set_caret(document.cursor_of(0), false);
+        let steps = document.display_text().chars().count();
+
+        for _ in 0..steps {
+            document.handle_key(key(KeyCode::Right, KeyModifiers::SHIFT));
+        }
+
+        assert_eq!(document.selected_text().as_deref(), Some("Review a\nb\nc "));
+    }
+
+    /// The caret is kept off the middle of a chip, so this range is not one the
+    /// composer can produce. The clamp still has to hold: half a summary stands
+    /// for nothing, which is the rule `replace` applies to the same overlap.
+    #[test]
+    fn partly_covered_chip_comes_back_whole() {
+        let document = with_one_paste();
+        let inside = "Review ".chars().count() + 2;
+
+        assert_eq!(
+            document.project_range(0..inside, |paste| &paste.text),
+            "Review a\nb\nc"
+        );
     }
 }

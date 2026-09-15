@@ -1379,6 +1379,15 @@ impl App {
 
     fn handle_global_key(&mut self, key: KeyEvent) -> Option<Vec<Action>> {
         if key::QUIT.matches(key) {
+            // A selection is a copy target before it is anything else: select
+            // all then copy must not be the gesture that throws the draft away.
+            // The selection survives, so discarding means clearing it first.
+            if self.composer_holds_keys()
+                && let Some(text) = self.active_input_box().selected_text()
+            {
+                self.copy_to_clipboard(&text);
+                return Some(vec![]);
+            }
             self.command_palette.close();
             if !self.is_main_chat()
                 && self.active_subagent_can_steer()
@@ -2402,6 +2411,16 @@ impl App {
         if key::THINKING.matches(key) || is_shift_tab(key) {
             self.cycle_reasoning_effort();
             return vec![];
+        }
+
+        // Cut is a copy plus the delete the composer already performs, so it
+        // only has to take the copy on the way past. Ahead of the main/task
+        // split so both composers cut the same way.
+        if key::CUT.matches(key)
+            && self.composer_holds_keys()
+            && let Some(text) = self.active_input_box().selected_text()
+        {
+            self.copy_to_clipboard(&text);
         }
 
         // Ahead of the main/task split so the editing chords answer the same

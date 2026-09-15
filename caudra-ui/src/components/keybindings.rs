@@ -149,7 +149,7 @@ impl Bind {
 }
 
 pub mod key {
-    use super::Bind;
+    use super::{Bind, wb};
     use crossterm::event::{KeyCode, KeyModifiers};
 
     /// Prefix of every two-key chord. `Ctrl+X` carries no control code of its
@@ -239,8 +239,14 @@ pub mod key {
     pub const SUSPEND: Bind = ctrl_bind!('z');
     pub const DELETE: Bind = ctrl_bind!('d');
     pub const KILL_LINE: Bind = ctrl_bind!('k');
-    pub const LINE_START: Bind = ctrl_bind!('a');
     pub const LINE_END: Bind = ctrl_bind!('e');
+    /// The composer cuts on the workbench's chord, restated in this module's
+    /// own `Bind` so the app can match it with the `key::` it already imports.
+    pub const CUT: Bind = Bind {
+        code: wb::CUT.code,
+        modifiers: wb::CUT.modifiers,
+        label: wb::CUT.label,
+    };
 }
 
 /// Second keys of the `Ctrl+X` chords. They are a namespace of their own:
@@ -481,7 +487,7 @@ pub struct Keybind {
 pub const KEYBINDS: &[Keybind] = &[
     Keybind {
         label: KeyLabel::Single(key::QUIT.label),
-        description: "Quit / clear input",
+        description: "Quit / clear input (copies instead when text is selected)",
         context: KeybindContext::General,
         platform: Platform::All,
     },
@@ -660,8 +666,26 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::All,
     },
     Keybind {
-        label: KeyLabel::Single(key::LINE_START.label),
-        description: "Jump to start of line",
+        label: KeyLabel::Single(wb::SELECT_ALL.label),
+        description: "Select the whole draft",
+        context: KeybindContext::Editing,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(wb::COPY.label),
+        description: "Copy selection (clears the draft when nothing is selected)",
+        context: KeybindContext::Editing,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(wb::CUT.label),
+        description: "Cut selection",
+        context: KeybindContext::Editing,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Alt(wb::UNDO.label, wb::REDO.label),
+        description: "Undo / redo the draft",
         context: KeybindContext::Editing,
         platform: Platform::All,
     },

@@ -29,7 +29,7 @@ Holding `Alt` while turning the wheel scrolls four times as far. A middle-click 
 
 | Key | Action |
 |-----|--------|
-| `Ctrl+C` | Quit / clear input |
+| `Ctrl+C` | Quit / clear input (copies instead when text is selected) |
 | `Ctrl+D Ctrl+D` | Exit |
 | `Ctrl+P` | Command palette |
 | `Ctrl+X` | Leader: lists the chords below, then runs the one you press |
@@ -65,7 +65,10 @@ Holding `Alt` while turning the wheel scrolls four times as far. A middle-click 
 | `Ctrl+←` / `Ctrl+→` | Move word left / right |
 | `Ctrl+Del` | Delete word forward |
 | `Ctrl+K` | Delete to end of line |
-| `Ctrl+A` | Jump to start of line |
+| `Ctrl+A` | Select the whole draft |
+| `Ctrl+C` | Copy selection (clears the draft when nothing is selected) |
+| `Shift+Delete` | Cut selection |
+| `Ctrl+Z` / `Ctrl+Y` | Undo / redo the draft |
 | `Home` / `End` | Start / end of line or transcript |
 | `PageUp` / `PageDown` | Page the draft or the transcript |
 | `Ctrl+U` | Scroll half page up |
