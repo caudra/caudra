@@ -1135,6 +1135,11 @@ struct ToolLineBuilder {
     /// baked spinner slot, and a compact row cannot disagree about what this
     /// call is.
     sigil: char,
+    /// Leading spans of row 0 that are the card's head rather than what the
+    /// header says. Declared by whichever function put them there, because a
+    /// spinner frame and a tool's sigil are ordinary text to look at and a
+    /// wrapped header would otherwise restart underneath them.
+    head: usize,
 }
 
 impl ToolLineBuilder {
@@ -1158,6 +1163,7 @@ impl ToolLineBuilder {
             limits,
             markdown: false,
             indicator,
+            head: 0,
         }
     }
 
@@ -1288,6 +1294,7 @@ impl ToolLineBuilder {
             self.spinner_lines.push((0, 0));
         }
         self.lines[0].spans.insert(0, Span::styled(text, style));
+        self.head += 1;
     }
 
     /// Row 0 only, and appended rather than inserted: `prepend_indicator` and
@@ -1348,6 +1355,7 @@ impl ToolLineBuilder {
             0..0,
             [head, Span::styled(format!("{} ", self.sigil), sigil_style)],
         );
+        self.head += 2;
     }
 
     /// The columns a body has once the card's own indent is taken off, which
@@ -1724,7 +1732,7 @@ impl ToolLineBuilder {
         // The card is laid out in logical lines and broken here, once, so
         // everything it indexed by line moves onto the rows that break made
         // rather than being recorded against rows that no longer exist.
-        let wrapped = WrappedRows::new(self.lines, self.width);
+        let wrapped = WrappedRows::new(self.lines, self.head, self.width);
         let lines = wrapped.lines();
         let mut links = LinkMap::none_for(&lines);
         for (line, row) in self.link_rows {
@@ -2548,7 +2556,10 @@ mod tests {
     fn a_store_header_conjugates_its_own_verb(status: ToolStatus, expected: &str) {
         let msg = memory_msg(&format!("write {MEMORY_NOTE}"), None, status);
         let text = open_card(&msg, status);
-        assert!(text.contains(&format!("{expected} {MEMORY_NOTE}")), "{text}");
+        assert!(
+            text.contains(&format!("{expected} {MEMORY_NOTE}")),
+            "{text}"
+        );
     }
 
     /// The conjugated header no longer contains the raw `command` value, so
@@ -3943,6 +3954,12 @@ mod tests {
 
     const NESTED_ROSTER_MSG: &str =
         "a subagent batching draws the roster it is working through, one node in";
+    const ROSTER_TRUNK: &str = "a roster row with a sibling below it carries the trunk past its \
+        own break, or the tree comes apart at the first row too long for the card";
+    /// Long enough that a narrow card has to break the roster row drawing it.
+    const LONG_SUMMARY: &str =
+        "cargo nextest run --workspace --locked --no-fail-fast --status-level all";
+    const ROSTER_WIDTH: u16 = 40;
 
     fn batch_child(tool: &str, summary: &str, status: BatchToolStatus) -> ActivityChild {
         ActivityChild {
@@ -3981,6 +3998,97 @@ mod tests {
             ],
             "{NESTED_ROSTER_MSG}"
         );
+    }
+
+    /// The reported bug: the break put spaces where the trunk was, so a roster
+    /// row too long for the card cut the tree in half.
+    #[test]
+    fn a_wrapped_roster_row_carries_the_trunk_past_the_break() {
+        let activity = SubagentActivity::batch(
+            Arc::from(BATCH_TOOL_NAME),
+            "2 tools",
+            vec![
+                batch_child(SHELL_TOOL_NAME, LONG_SUMMARY, BatchToolStatus::Running),
+                batch_child(FILE_GREP_TOOL_NAME, "fn main", BatchToolStatus::Pending),
+            ],
+        );
+        let msg = subagent_msg(ToolStatus::InProgress, Some(report(activity, 2)));
+
+        let tl = build_tool_lines(&msg, ToolStatus::InProgress, &test_rctx(ROSTER_WIDTH), None);
+
+        let rows: Vec<String> = tl.lines.iter().map(line_text).collect();
+        let level = format!("{TOOL_BODY_INDENT}{TREE_GAP}");
+        let opened = rows
+            .iter()
+            .position(|row| row.starts_with(&format!("{level}{TREE_BRANCH}")))
+            .expect(ROSTER_TRUNK);
+        let last = rows
+            .iter()
+            .position(|row| row.starts_with(&format!("{level}{TREE_LAST}")))
+            .expect(ROSTER_TRUNK);
+        let trunk = format!("{level}{}", TREE_TRUNK.trim_end());
+
+        assert!(last > opened + 1, "{ROSTER_TRUNK}: {rows:#?}");
+        for row in rows.iter().take(last).skip(opened + 1) {
+            assert!(row.starts_with(&trunk), "{ROSTER_TRUNK}: {row:?}");
+        }
+    }
+
+    const HEADER_HANG: &str = "a header too long for its card carries on under its label, not \
+        under the spinner or the sigil that opened the row";
+    /// The indicator and the sigil, which a card puts in front of its label.
+    const HEAD_WIDTH: usize = 4;
+
+    /// Nothing about a spinner frame or a tool's sigil says it is chrome, so
+    /// the row that puts them there is the only thing that can say so.
+    #[test_case(ToolStatus::InProgress ; "running")]
+    #[test_case(ToolStatus::Success ; "finished")]
+    fn a_wrapped_header_hangs_under_its_label(status: ToolStatus) {
+        let msg = bash_msg(LONG_SUMMARY, status, None, None);
+
+        let lines = build_tool_lines(&msg, status, &test_rctx(ROSTER_WIDTH), None);
+
+        let rows: Vec<String> = lines.lines.iter().map(line_text).collect();
+        assert!(rows.len() > 1, "{HEADER_HANG}: {rows:#?}");
+        let hang = &rows[1];
+        assert!(
+            hang.starts_with(&" ".repeat(HEAD_WIDTH)),
+            "{HEADER_HANG}: {hang:?}"
+        );
+        assert!(
+            !hang.starts_with(&" ".repeat(HEAD_WIDTH + 1)),
+            "{HEADER_HANG}: {hang:?}"
+        );
+    }
+
+    const NOTHING_OVERFLOWS: &str = "a gutter too deep to break into clips what it draws rather \
+        than running past the card, where the terminal would break it at column zero and take the \
+        tree with it";
+    /// Narrow enough that the roster's own gutter leaves less than the columns
+    /// a break needs to be worth making.
+    const CRAMPED: u16 = 14;
+
+    #[test]
+    fn a_row_with_no_room_left_to_break_is_clipped_to_the_card() {
+        let activity = SubagentActivity::batch(
+            Arc::from(BATCH_TOOL_NAME),
+            "2 tools",
+            vec![
+                batch_child(SHELL_TOOL_NAME, LONG_SUMMARY, BatchToolStatus::Running),
+                batch_child(FILE_GREP_TOOL_NAME, LONG_SUMMARY, BatchToolStatus::Pending),
+            ],
+        );
+        let msg = subagent_msg(ToolStatus::InProgress, Some(report(activity, 2)));
+
+        let lines = build_tool_lines(&msg, ToolStatus::InProgress, &test_rctx(CRAMPED), None);
+
+        for row in lines.lines.iter().map(line_text) {
+            let drawn = UnicodeWidthStr::width(row.as_str());
+            assert!(
+                drawn <= usize::from(CRAMPED),
+                "{NOTHING_OVERFLOWS}: {row:?}"
+            );
+        }
     }
 
     /// The roster describes what the call is doing, so it goes when the call

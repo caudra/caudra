@@ -33,7 +33,7 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use syntect::parsing::SyntaxReference;
 use syntect::util::LinesWithEndings;
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 pub(crate) const MAX_INSTRUCTION_LINES: usize = 15;
 /// What a child's body clears past the trunk it hangs from, so its text lands
@@ -77,6 +77,8 @@ const MIN_WRAP_COLUMNS: usize = 8;
 /// The characters a row's gutter is built from: the card's own indent, the four
 /// tree glyphs, and the check a settled row opens with.
 const GUTTER_CHARS: &str = " \u{2502}\u{251c}\u{2514}\u{2500}\u{2713}";
+const TRUNK_GLYPH: char = '\u{2502}';
+const BRANCH_GLYPH: char = '\u{251c}';
 const MARKER_OPEN: char = '[';
 const MARKER_CLOSE: char = ']';
 const MARK_UNCHANGED: char = ' ';
@@ -1559,17 +1561,27 @@ fn wrap_styled(
         })
         .collect();
     if unbroken {
-        let tail = spans
-            .into_iter()
-            .enumerate()
-            .skip(gutter)
-            .map(|(origin, span)| SpanPiece {
+        // A gutter deep enough to leave no room to break into still may not run
+        // past the card: the terminal would break it instead, at column zero,
+        // taking the gutter with it and cutting the tree the gutter was drawing.
+        // The pieces go on answering for every byte, so a copy reads the row
+        // whole however little of it reached the screen.
+        let mut left = match width != UNCONSTRAINED_WIDTH && room < MIN_WRAP_COLUMNS {
+            true => room,
+            false => usize::MAX,
+        };
+        let mut row = head;
+        for (origin, span) in spans.into_iter().enumerate().skip(gutter) {
+            let text = span.content.as_ref();
+            let drawn = clipped(text, &mut left);
+            row.push(SpanPiece {
                 origin: Some(origin),
                 offset: 0,
-                len: span.content.len(),
-                span,
+                len: text.len(),
+                span: Span::styled(drawn, span.style),
             });
-        return Vec::from([head.into_iter().chain(tail).collect()]);
+        }
+        return Vec::from([row]);
     }
     let mut rows = Vec::new();
     let mut row = head;
@@ -1605,6 +1617,26 @@ fn wrap_styled(
     }
     rows.push(row);
     rows
+}
+
+/// As much of `text` as `room` has left, in whole characters, drawing down what
+/// it took. `usize::MAX` is a row under no pressure, which is every row wide
+/// enough to have been broken instead.
+fn clipped(text: &str, room: &mut usize) -> String {
+    if *room == usize::MAX {
+        return text.to_owned();
+    }
+    let mut out = String::new();
+    for glyph in text.chars() {
+        let width = UnicodeWidthChar::width(glyph).unwrap_or_default();
+        if width > *room {
+            *room = 0;
+            break;
+        }
+        *room -= width;
+        out.push(glyph);
+    }
+    out
 }
 
 /// A span narrowed to the part of it one display row stands for. `drawn` is
@@ -1656,17 +1688,37 @@ fn gutter_spans(spans: &[Span<'static>]) -> usize {
         .min(spans.len().saturating_sub(1))
 }
 
+/// The left column a wrapped row carries on under.
+///
+/// A break must not decide the shape of the tree. A row with a sibling below it
+/// keeps its trunk, and one that closed its branch keeps the blank the connector
+/// already promised, so a child reads as owning its wrapped rows exactly as it
+/// owns its first. Everything else a gutter draws — a line number, a marker, a
+/// sigil — is said once, on the row it was drawn for.
+///
+/// Each character is replaced by one of the same display width, so the text
+/// under the hang stays in the column the unbroken row put it in.
+fn hang_under(gutter: &str) -> String {
+    gutter
+        .chars()
+        .map(|glyph| match glyph {
+            TRUNK_GLYPH | BRANCH_GLYPH => String::from(TRUNK_GLYPH),
+            other => " ".repeat(UnicodeWidthChar::width(other).unwrap_or_default()),
+        })
+        .collect()
+}
+
 /// One row broken to `width`, hung under whatever gutter it opens with.
-fn wrap_row(spans: Vec<Span<'static>>, width: u16) -> Vec<Vec<SpanPiece>> {
-    let gutter = gutter_spans(&spans);
-    let pad = " ".repeat(
-        spans
-            .iter()
-            .take(gutter)
-            .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
-            .sum(),
-    );
-    wrap_styled(spans, gutter, &pad, width)
+fn wrap_row(spans: Vec<Span<'static>>, gutter: usize, width: u16) -> Vec<Vec<SpanPiece>> {
+    let gutter = gutter
+        .max(gutter_spans(&spans))
+        .min(spans.len().saturating_sub(1));
+    let hang: String = spans
+        .iter()
+        .take(gutter)
+        .map(|span| hang_under(span.content.as_ref()))
+        .collect();
+    wrap_styled(spans, gutter, &hang, width)
 }
 
 /// A card's lines broken to a width, holding on to which rows each line became
@@ -1681,11 +1733,18 @@ pub(crate) struct WrappedRows {
 }
 
 impl WrappedRows {
-    pub(crate) fn new(lines: Vec<Line<'static>>, width: u16) -> Self {
+    /// `head` is how many leading spans of row 0 are the card's own head: the
+    /// indicator and the sigil, which the row that carries them declares
+    /// because nothing about their text says so.
+    pub(crate) fn new(lines: Vec<Line<'static>>, head: usize, width: u16) -> Self {
         Self {
             per_line: lines
                 .into_iter()
-                .map(|line| wrap_row(line.spans, width))
+                .enumerate()
+                .map(|(index, line)| {
+                    let declared = if index == 0 { head } else { 0 };
+                    wrap_row(line.spans, declared, width)
+                })
                 .collect(),
         }
     }
@@ -2986,7 +3045,7 @@ pub fn render_tool_content(
 /// the width to the end, so there is exactly one place where a gutter can be
 /// lost to a break, and it is this one.
 fn wrapped_content(content: ToolContent, width: u16) -> ToolContent {
-    let wrapped = WrappedRows::new(content.lines, width);
+    let wrapped = WrappedRows::new(content.lines, 0, width);
     ToolContent {
         lines: wrapped.lines(),
         rows: wrapped.expand(content.rows),
@@ -5369,9 +5428,29 @@ mod tests {
         }
     }
 
+    /// A child whose body is structured rather than prose. Prose is broken to
+    /// the child's own width before it is indented, so it is the structured
+    /// renderers that reach the card's break still carrying a full-width row.
+    fn todo_entry() -> BatchToolEntry {
+        BatchToolEntry {
+            output: Some(todo_output()),
+            ..batch_entry(caudra_agent::tools::TODOWRITE_TOOL_NAME, 0)
+        }
+    }
+
+    /// Two children, so one is followed by a sibling and one is not, with
+    /// bodies too long for the card. The deepest gutters a card ever draws.
+    fn batch_output() -> ToolOutput {
+        ToolOutput::Batch {
+            entries: Vec::from([todo_entry(), todo_entry()]),
+            text: LONG.to_owned(),
+        }
+    }
+
     /// The whole point of the invariant: one case per output a card can draw,
     /// so a renderer added later has to join the list rather than quietly
     /// reintroducing the bug this fixes.
+    #[test_case(batch_output() ; "batch")]
     #[test_case(todo_output() ; "todo_list")]
     #[test_case(answers_output() ; "answers")]
     #[test_case(grep_output() ; "grep_result")]
@@ -5404,6 +5483,38 @@ mod tests {
             assert!(
                 row.starts_with(&" ".repeat(marker)),
                 "{HANGS_UNDER_MARKER}: {row:?}"
+            );
+        }
+    }
+
+    const TRUNK_UNBROKEN: &str = "a child with a sibling below it carries the trunk down every row \
+        it owns, wrapped rows included, or the tree is cut in two at the first row too long for \
+        the card";
+    const TRUNK_ENDS: &str = "nothing follows the last child, so its rows carry no trunk";
+
+    /// The reported bug: a break put spaces where the trunk was, so the tree
+    /// came apart at exactly the rows that needed it most.
+    #[test]
+    fn a_wrapped_row_carries_the_trunk_down_the_side_of_its_child() {
+        let mut limits = limits(BatchViews::new([0, 1]));
+        limits.width = INVARIANT_WIDTH;
+
+        let content = render_tool_content(None, Some(&batch_output()), false, limits);
+        let rows: Vec<String> = content.lines.iter().map(line_text).collect();
+        let last = rows
+            .iter()
+            .position(|row| row.starts_with(TREE_LAST))
+            .expect(TRUNK_ENDS);
+
+        assert!(last > 1, "{TRUNK_UNBROKEN}: {rows:#?}");
+        for row in rows.iter().take(last).filter(|row| !row.trim().is_empty()) {
+            let opens = row.starts_with(TREE_BRANCH) || row.starts_with(TREE_TRUNK.trim_end());
+            assert!(opens, "{TRUNK_UNBROKEN}: {row:?}");
+        }
+        for row in rows.iter().skip(last + 1) {
+            assert!(
+                !row.starts_with(TREE_TRUNK.trim_end()),
+                "{TRUNK_ENDS}: {row:?}"
             );
         }
     }
