@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use caudra_config::ImageModel;
 use caudra_storage::StateDir;
 use caudra_storage::auth::try_load_tokens;
 use futures_lite::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
@@ -32,8 +33,9 @@ use crate::types::ImageSource;
 
 const RESPONSES_PATH: &str = "/responses";
 /// The subscription backend routes image generation through the chat model
-/// rather than exposing an image endpoint of its own.
-const IMAGE_MODEL: &str = "gpt-5.5";
+/// rather than exposing an image endpoint of its own. This is the mainline
+/// model that drives the turn; the image model rides on the hosted tool.
+const MAINLINE_MODEL: &str = "gpt-5.5";
 const OUTPUT_FORMAT: &str = "png";
 const OUTPUT_ITEM_DONE: &str = "response.output_item.done";
 const IMAGE_CALL_ITEM: &str = "image_generation_call";
@@ -53,18 +55,29 @@ pub enum ImageQuality {
     Low,
     Medium,
     High,
+    XHigh,
+    Max,
     #[default]
     Auto,
 }
 
 impl ImageQuality {
-    pub const ALL: [Self; 4] = [Self::Low, Self::Medium, Self::High, Self::Auto];
+    pub const ALL: [Self; 6] = [
+        Self::Low,
+        Self::Medium,
+        Self::High,
+        Self::XHigh,
+        Self::Max,
+        Self::Auto,
+    ];
 
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Low => "low",
             Self::Medium => "medium",
             Self::High => "high",
+            Self::XHigh => "xhigh",
+            Self::Max => "max",
             Self::Auto => "auto",
         }
     }
@@ -76,6 +89,7 @@ impl ImageQuality {
 
 pub struct ImageRequest<'a> {
     pub prompt: &'a str,
+    pub model: ImageModel,
     pub quality: ImageQuality,
     pub size: Option<&'a str>,
     pub references: &'a [ImageSource],
@@ -102,7 +116,8 @@ pub async fn generate(dir: &StateDir, req: &ImageRequest<'_>) -> Result<Vec<u8>,
         .body(body)?;
 
     debug!(
-        model = IMAGE_MODEL,
+        model = MAINLINE_MODEL,
+        image_model = req.model.model_id(),
         references = req.references.len(),
         quality = req.quality.as_str(),
         size = req.size.unwrap_or("auto"),
@@ -140,6 +155,7 @@ fn build_body(req: &ImageRequest<'_>) -> Value {
 
     let mut tool = json!({
         "type": "image_generation",
+        "model": req.model.model_id(),
         "output_format": OUTPUT_FORMAT,
         "quality": req.quality.as_str(),
     });
@@ -148,7 +164,7 @@ fn build_body(req: &ImageRequest<'_>) -> Value {
     }
 
     json!({
-        "model": IMAGE_MODEL,
+        "model": MAINLINE_MODEL,
         "instructions": INSTRUCTIONS,
         "input": [{"role": "user", "content": content}],
         "tools": [tool],
@@ -227,6 +243,7 @@ mod tests {
     fn request<'a>(references: &'a [ImageSource], size: Option<&'a str>) -> ImageRequest<'a> {
         ImageRequest {
             prompt: PROMPT,
+            model: ImageModel::Sunburst,
             quality: ImageQuality::High,
             size,
             references,
@@ -313,9 +330,10 @@ mod tests {
     fn body_forces_the_hosted_image_tool_and_carries_no_history() {
         let body = build_body(&request(&[], None));
 
-        assert_eq!(body["model"], IMAGE_MODEL);
+        assert_eq!(body["model"], MAINLINE_MODEL);
         assert_eq!(body["tool_choice"], json!({"type": "image_generation"}));
         assert_eq!(body["tools"][0]["type"], "image_generation");
+        assert_eq!(body["tools"][0]["model"], ImageModel::Sunburst.model_id());
         assert_eq!(body["tools"][0]["output_format"], OUTPUT_FORMAT);
         assert_eq!(body["tools"][0]["quality"], "high");
         assert_eq!(body["stream"], true);
@@ -323,6 +341,19 @@ mod tests {
         assert_eq!(body["input"].as_array().unwrap().len(), 1);
         assert_eq!(body["input"][0]["content"].as_array().unwrap().len(), 1);
         assert_eq!(body["input"][0]["content"][0]["text"], PROMPT);
+    }
+
+    /// The image model rides on the hosted tool, not the top level: the
+    /// mainline model must stay put whichever image model is configured.
+    #[test_case(ImageModel::Sunburst ; "sunburst")]
+    #[test_case(ImageModel::Flare ; "flare")]
+    fn the_configured_image_model_reaches_the_tool_and_leaves_the_mainline_alone(model: ImageModel) {
+        let mut req = request(&[], None);
+        req.model = model;
+        let body = build_body(&req);
+
+        assert_eq!(body["tools"][0]["model"], model.model_id());
+        assert_eq!(body["model"], MAINLINE_MODEL);
     }
 
     #[test]
@@ -355,6 +386,8 @@ mod tests {
     #[test_case(ImageQuality::Low, "low")]
     #[test_case(ImageQuality::Medium, "medium")]
     #[test_case(ImageQuality::High, "high")]
+    #[test_case(ImageQuality::XHigh, "xhigh")]
+    #[test_case(ImageQuality::Max, "max")]
     #[test_case(ImageQuality::Auto, "auto")]
     fn quality_round_trips_through_its_wire_string(quality: ImageQuality, wire: &str) {
         assert_eq!(quality.as_str(), wire);

@@ -62,7 +62,7 @@ static OUT_PARAM: ParamSchema = ParamSchema::Primitive {
     description: "Output file path, relative to the project directory unless absolute. Written as a PNG.",
 };
 static QUALITY_PARAM: ParamSchema = ParamSchema::Enum {
-    variants: &["low", "medium", "high", "auto"],
+    variants: &["low", "medium", "high", "xhigh", "max", "auto"],
     description: "Generation quality. Defaults to auto.",
 };
 static SIZE_PARAM: ParamSchema = ParamSchema::Primitive {
@@ -290,6 +290,7 @@ impl ImageGenerateCall {
             &state_dir,
             &ImageRequest {
                 prompt: &self.prompt,
+                model: ctx.config.image_model,
                 quality: self.quality,
                 size: self.size.as_deref(),
                 references: &references,

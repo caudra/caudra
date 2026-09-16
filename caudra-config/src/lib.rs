@@ -824,6 +824,30 @@ pub enum DeferBuiltinTools {
     Never,
 }
 
+/// Which GPT Image 2.5 model the hosted `image_generation` tool runs.
+///
+/// `Sunburst` is the more capable of the two and is built for editing
+/// precision, which is what `image_generate` does whenever it is handed
+/// reference images. `Flare` trades that for lower latency at the same price.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ImageModel {
+    #[default]
+    Sunburst,
+    Flare,
+}
+
+impl ImageModel {
+    /// Distinct from an `as_str` because the configured name and the wire id
+    /// differ: users write `sunburst`, the backend wants the full model id.
+    pub const fn model_id(self) -> &'static str {
+        match self {
+            Self::Sunburst => "gpt-image-2.5-sunburst",
+            Self::Flare => "gpt-image-2.5-flare",
+        }
+    }
+}
+
 #[derive(Deserialize, Default, Debug)]
 #[serde(default, deny_unknown_fields)]
 pub struct ToolOutputLinesFile {
@@ -941,6 +965,7 @@ pub struct AgentFileConfig {
     pub eager_tool_dispatch: Option<bool>,
     pub shell_output_filter: Option<bool>,
     pub defer_builtin_tools: Option<DeferBuiltinTools>,
+    pub image_model: Option<ImageModel>,
     pub disabled_tools: Option<Vec<String>>,
 }
 
@@ -964,7 +989,8 @@ impl AgentFileConfig {
             eager_batch_dispatch,
             eager_tool_dispatch,
             shell_output_filter,
-            defer_builtin_tools
+            defer_builtin_tools,
+            image_model
         );
         // Restriction only, unlike every other list here: a project must not be
         // able to hand itself back a tool the global config took away.
@@ -1812,6 +1838,14 @@ pub struct AgentConfig {
     )]
     pub defer_builtin_tools: DeferBuiltinTools,
 
+    #[config(
+        default = ImageModel::Sunburst,
+        ty = "string",
+        default_doc = "sunburst",
+        desc = "GPT Image 2.5 model behind `image_generate`: `sunburst` is the most capable and the better editor, `flare` is faster at the same price"
+    )]
+    pub image_model: ImageModel,
+
     #[config(skip, default = false)]
     pub no_rtk: bool,
 
@@ -1872,6 +1906,7 @@ impl AgentConfig {
                 .unwrap_or(true),
             shell_output_filter: !no_rtk && file.shell_output_filter.unwrap_or(true),
             defer_builtin_tools: file.defer_builtin_tools.unwrap_or_default(),
+            image_model: file.image_model.unwrap_or_default(),
             max_turns: None,
             allowed_tools: Vec::new(),
             disabled_tools,
@@ -3095,6 +3130,23 @@ mod tests {
     fn notifications_reject_unknown_value() {
         let result: Result<RawConfig, _> = toml::from_str("[ui]\nnotifications = \"desktop\"\n");
         assert!(result.is_err());
+    }
+
+    #[test_case("sunburst", ImageModel::Sunburst ; "sunburst")]
+    #[test_case("flare", ImageModel::Flare ; "flare")]
+    fn image_model_deserialize(value: &str, expected: ImageModel) {
+        let raw: RawConfig =
+            toml::from_str(&format!("[agent]\nimage_model = \"{value}\"\n")).unwrap();
+        assert_eq!(raw.into_config(false).unwrap().agent.image_model, expected);
+    }
+
+    #[test]
+    fn image_model_defaults_to_sunburst() {
+        let raw: RawConfig = toml::from_str("").unwrap();
+        assert_eq!(
+            raw.into_config(false).unwrap().agent.image_model,
+            ImageModel::Sunburst
+        );
     }
 
     #[test_case("auto", DeferBuiltinTools::Auto ; "auto")]
