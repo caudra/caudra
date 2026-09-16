@@ -752,10 +752,15 @@ fn patch_hunks(patch: &str) -> Vec<PatchHunk<'_>> {
 /// region it produced, which prints every line they share twice. Diffing the
 /// two sides again is what puts each change beside the line it replaces.
 ///
-/// Syntax highlighting is left out on purpose, because a hunk carries only its
-/// own context and a highlighter fed that much guesses wrong more than it
-/// helps.
-fn render_unified_patch(patch: &str, width: u16) -> Vec<Line<'static>> {
+/// Each hunk restarts the highlighter at its own first line, because there is
+/// no file above it to parse. That is the same approximation an edit's before
+/// and after fragments already get, and it costs a hunk opening inside a block
+/// comment or a long string the colour it would have had in place.
+fn render_unified_patch(
+    patch: &str,
+    syntax: Option<&'static SyntaxReference>,
+    width: u16,
+) -> Vec<Line<'static>> {
     let hunks = patch_hunks(patch);
     let (before_max, after_max) = hunks.iter().map(PatchHunk::ends).fold(
         (1, 1),
@@ -766,6 +771,11 @@ fn render_unified_patch(patch: &str, width: u16) -> Vec<Line<'static>> {
     let gutter = DiffGutter::new(before_max, after_max, width);
     let mut lines = Vec::new();
     for hunk in &hunks {
+        // The wire order and the re-diffed order walk the same body, drop the
+        // same no-newline markers, and so consume these two sides line for
+        // line either way.
+        let (before, after) = hunk.sides();
+        let mut walkers = syntax.map(|s| (FileWalker::new(&before, s), FileWalker::new(&after, s)));
         let groups = if hunk.body.len() > MAX_REDIFF_LINES {
             vec![DiffHunk {
                 before_start: 1,
@@ -773,19 +783,30 @@ fn render_unified_patch(patch: &str, width: u16) -> Vec<Line<'static>> {
                 lines: hunk.wire_lines(),
             }]
         } else {
-            let (before, after) = hunk.sides();
             compute_hunks(&before, &after)
         };
         for group in groups {
             if !lines.is_empty() {
                 lines.push(gap_ellipsis());
             }
+            // A group starts where the hunk's own sides say it does, which is
+            // not where the gutter starts counting.
+            if let Some((before, after)) = walkers.as_mut() {
+                before.skip_to(group.before_start);
+                after.skip_to(group.after_start);
+            }
             let mut cursor = (
                 hunk.before_start + group.before_start - 1,
                 hunk.after_start + group.after_start - 1,
             );
             for dl in &group.lines {
-                lines.push(render_hunk_line(dl, None, &mut cursor, gutter, width));
+                lines.push(render_hunk_line(
+                    dl,
+                    walkers.as_mut(),
+                    &mut cursor,
+                    gutter,
+                    width,
+                ));
             }
         }
     }
@@ -1859,7 +1880,7 @@ fn indent_all(lines: Vec<Line<'static>>, continuation: &str) -> Vec<Line<'static
 /// A patch that touches one is the exception. There is no boundary to mark,
 /// and the card header already names that file and carries the same counts, so
 /// the heading would be the row above it spelled a second time.
-fn render_patch(files: &[PatchedFile], width: u16) -> Vec<Line<'static>> {
+fn render_patch(files: &[PatchedFile], highlight: bool, width: u16) -> Vec<Line<'static>> {
     let theme = theme::current();
     let needs_headings = files.len() > 1;
     let mut lines = Vec::new();
@@ -1876,7 +1897,11 @@ fn render_patch(files: &[PatchedFile], width: u16) -> Vec<Line<'static>> {
                 ),
             ]));
         }
-        lines.extend(render_unified_patch(&file.patch, width));
+        lines.extend(render_unified_patch(
+            &file.patch,
+            highlight.then(|| caudra_highlight::syntax_for_path(&file.path)),
+            width,
+        ));
         if file.truncated {
             lines.push(Line::from(Span::styled(
                 PATCH_TRUNCATED.to_owned(),
@@ -1901,8 +1926,7 @@ fn render_patch(files: &[PatchedFile], width: u16) -> Vec<Line<'static>> {
 /// there is nothing a click could reveal.
 ///
 /// Nothing here is highlighted. A file cut off mid-token leaves the parser in
-/// a state the rest of the file has not justified yet, which is the same
-/// reason a patch hunk is never highlighted either.
+/// a state the rest of the file has not justified yet.
 pub(crate) fn render_live_body(body: &str, width: u16) -> Vec<Line<'static>> {
     let shown: Vec<String> = body.lines().map(String::from).collect();
     render_code(None, 1, &shown, shown.len(), usize::MAX, width).lines
@@ -2851,7 +2875,7 @@ pub fn render_tool_content(
             limits.budget.max(DIFF_CARD_LINES),
         ),
         Some(ToolOutput::Patch { files }) => capped(
-            render_patch(files, limits.width),
+            render_patch(files, highlight, limits.width),
             limits.budget.max(DIFF_CARD_LINES),
         ),
         Some(ToolOutput::GrepResult { entries, capped }) => {
@@ -3180,7 +3204,7 @@ mod tests {
     const SHORTENED_MSG: &str = "a patch cut short must say so, and one that is whole must not";
 
     fn patch_text(files: &[PatchedFile]) -> Vec<String> {
-        render_patch(files, UNCONSTRAINED_WIDTH)
+        render_patch(files, false, UNCONSTRAINED_WIDTH)
             .iter()
             .map(line_text)
             .collect()
@@ -3584,6 +3608,67 @@ mod tests {
 
         let expected = fg_in_context("test.rs", "/*\ndoc\n", "fn x() {}", "fn");
         assert_eq!(diff_fg(&lines, "fn x() {}"), expected);
+    }
+
+    const RUST_PATCH: &str = "@@ -1,2 +1,2 @@\n fn f() {}\n-let old = 1;\n+let new = 2;\n";
+    const CONTEXT: &str = "fn f() {}";
+    const HIGHLIGHTED_MSG: &str =
+        "a patch hunk is highlighted the way the fragment an edit carries is";
+    const FLAG_MSG: &str = "the sync path asks for no highlighting and must not be parsed anyway";
+    const BAND_MSG: &str =
+        "a changed row wears its diff band under the syntax colour, not instead of it";
+
+    fn highlighted_patch() -> Vec<Line<'static>> {
+        render_patch(&one_file(RUST_PATCH), true, UNCONSTRAINED_WIDTH)
+    }
+
+    /// An edit's card highlights the fragment it was handed, and a hunk is the
+    /// same kind of fragment.
+    #[test]
+    fn a_patch_hunk_is_highlighted_like_an_edit() {
+        assert_eq!(
+            diff_fg(&highlighted_patch(), "fn"),
+            fg_in_context(FIRST_PATH, "", CONTEXT, "fn"),
+            "{HIGHLIGHTED_MSG}"
+        );
+    }
+
+    /// The card drawn on the UI thread declines the parse to stay cheap, so a
+    /// flag quietly ignored would charge every patch for one twice over.
+    #[test]
+    fn a_patch_honours_the_highlight_flag() {
+        let plain = render_patch(&one_file(RUST_PATCH), false, UNCONSTRAINED_WIDTH);
+        assert_ne!(
+            diff_fg(&plain, "fn"),
+            diff_fg(&highlighted_patch(), "fn"),
+            "{FLAG_MSG}"
+        );
+    }
+
+    /// The band is a background the syntax colour sits on. Dropping either half
+    /// of that merge still looks plausible on its own, so both are pinned here:
+    /// an added row keeps its tint, and its code keeps the colour it would have
+    /// had after the context line above it.
+    #[test]
+    fn a_highlighted_change_keeps_its_diff_band() {
+        let lines = highlighted_patch();
+        let added = lines
+            .iter()
+            .find(|line| line.spans[0].content.contains(MARK_ADDED))
+            .unwrap_or_else(|| panic!("{BAND_MSG}: {lines:?}"));
+        let code = &added.spans[1..];
+
+        assert!(
+            code.iter().all(|span| span.style.bg.is_some()),
+            "{BAND_MSG}: {added:?}"
+        );
+        assert_eq!(
+            code.iter()
+                .find(|span| span.content.contains("let"))
+                .and_then(|span| span.style.fg),
+            Some(fg_in_context(FIRST_PATH, CONTEXT, "let new = 2;", "let")),
+            "{BAND_MSG}: {added:?}"
+        );
     }
 
     #[test]
