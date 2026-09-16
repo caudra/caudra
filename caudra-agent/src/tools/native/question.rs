@@ -112,13 +112,7 @@ impl Tool for QuestionTool {
 
     fn parse(&self, input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
         let input = validate(&SCHEMA, input.clone())?;
-        let questions: Vec<AskedQuestion> = input
-            .get("questions")
-            .and_then(Value::as_array)
-            .ok_or_else(|| ParseError::custom(NO_QUESTIONS))?
-            .iter()
-            .map(parse_question)
-            .collect::<Result<_, _>>()?;
+        let questions = asked_questions(&input);
         if questions.is_empty() {
             return Err(ParseError::custom(NO_QUESTIONS));
         }
@@ -126,9 +120,22 @@ impl Tool for QuestionTool {
     }
 }
 
-fn parse_question(raw: &Value) -> Result<AskedQuestion, ParseError> {
+/// The questions a call put to the user, read back out of its own input.
+///
+/// A front end restoring a finished call has the input and not the invocation,
+/// and the shape of a question is this tool's to say, so it says it here rather
+/// than leaving each reader to rediscover the field names.
+pub fn asked_questions(input: &Value) -> Vec<AskedQuestion> {
+    input
+        .get("questions")
+        .and_then(Value::as_array)
+        .map(|questions| questions.iter().map(parse_question).collect())
+        .unwrap_or_default()
+}
+
+fn parse_question(raw: &Value) -> AskedQuestion {
     let field = |name: &str| raw.get(name).and_then(Value::as_str).unwrap_or_default();
-    Ok(AskedQuestion {
+    AskedQuestion {
         question: field("question").to_owned(),
         header: field("header").to_owned(),
         options: raw
@@ -140,7 +147,7 @@ fn parse_question(raw: &Value) -> Result<AskedQuestion, ParseError> {
             .get(MULTI_SELECT_FIELD)
             .and_then(Value::as_bool)
             .unwrap_or(false),
-    })
+    }
 }
 
 fn parse_option(raw: &Value) -> QuestionOption {
@@ -218,6 +225,8 @@ fn parse_answers(questions: &[AskedQuestion], raw: &str) -> Option<Vec<Answer>> 
             .map(|(index, question)| Answer {
                 header: question.header.clone(),
                 labels: picked.get(index).cloned().unwrap_or_default(),
+                question: question.question.clone(),
+                options: question.options.clone(),
             })
             .collect(),
     )
@@ -313,7 +322,7 @@ mod tests {
             "options": [{ "label": YES, "description": "affirmative" }],
             MULTI_SELECT_FIELD: true,
         });
-        let parsed = parse_question(&raw).unwrap();
+        let parsed = parse_question(&raw);
         assert_eq!(parsed.question, PICK);
         assert_eq!(parsed.header, HEADER);
         assert_eq!(parsed.options[0].label, YES);
@@ -322,7 +331,7 @@ mod tests {
 
     #[test]
     fn multi_select_defaults_to_a_single_answer() {
-        assert!(!parse_question(&one_question()[0]).unwrap().multiple);
+        assert!(!parse_question(&one_question()[0]).multiple);
     }
 
     #[test]
@@ -428,5 +437,47 @@ mod tests {
             panic!("the transcript keeps the structured answers");
         };
         assert_eq!(answers[0].labels, [YES]);
+    }
+
+    /// The card redraws the form, so the answer has to carry what the pick was
+    /// made against and not just the pick.
+    #[test]
+    fn an_answer_carries_the_question_it_answers() {
+        let questions = vec![question(HEADER, false)];
+        let answers = parse_answers(&questions, &json!([[YES]]).to_string()).unwrap();
+        assert_eq!(answers[0].question, PICK);
+        assert_eq!(answers[0].options, questions[0].options);
+    }
+
+    /// The questions sit in the input right above the result and inputs outlive
+    /// outputs through compaction, so widening what the reader sees must not
+    /// widen what the model is sent.
+    #[test]
+    fn the_model_is_still_sent_the_picks_alone() {
+        let questions = vec![question(HEADER, false)];
+        let answers = parse_answers(&questions, &json!([[YES]]).to_string()).unwrap();
+        let text = format_answers(&questions, &answers);
+        assert_eq!(text, format!("{HEADER}: {YES}"));
+        assert!(
+            !text.contains(PICK),
+            "the question text stays out of the text"
+        );
+        assert!(
+            !text.contains(NO),
+            "a declined option stays out of the text"
+        );
+    }
+
+    #[test]
+    fn questions_are_read_back_out_of_a_stored_input() {
+        let restored = asked_questions(&input(one_question()));
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].question, PICK);
+        assert_eq!(restored[0].options[0].label, YES);
+    }
+
+    #[test]
+    fn an_input_without_questions_reads_back_as_none() {
+        assert!(asked_questions(&json!({})).is_empty());
     }
 }

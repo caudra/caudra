@@ -19,10 +19,11 @@ use crate::markdown::truncate_output;
 
 use crate::selection::Selection;
 use caudra_agent::permissions::PermissionRequest;
+use caudra_agent::tools::native::question::asked_questions;
 use caudra_agent::tools::{
     FILE_WRITE_TOOL_NAME, ToolEffect, ToolInvocation, ToolRegistry, WORKFLOW_TOOL_NAME,
 };
-use caudra_agent::types::{QuestionEvent, WorkflowRunCard};
+use caudra_agent::types::{Answer, QuestionEvent, WorkflowRunCard};
 use caudra_agent::{
     AgentEvent, BatchToolEntry, BufferSnapshot, COMPACTION_ANCHOR, Mention, SubagentProgress,
     ToolDoneEvent, ToolOutput, ToolStartEvent,
@@ -923,7 +924,8 @@ pub fn history_to_display(
                 let reconstructed = tool_outputs
                     .get(call_id.as_str())
                     .cloned()
-                    .map(|output| stamped_batch_effects(output, reg));
+                    .map(|output| stamped_batch_effects(output, reg))
+                    .map(|output| restored_answers(output, input));
                 let (text, truncated_lines, tool_output, mut annotation) = build_loaded_tool(
                     static_name,
                     &summary,
@@ -1087,6 +1089,41 @@ fn stamped_batch_effects(output: Arc<ToolOutput>, reg: &ToolRegistry) -> Arc<Too
         entries,
         text: text.clone(),
     })
+}
+
+/// Fills a restored answer back in from the questions it was given, the way the
+/// call above fills a restored batch child in from the registry.
+///
+/// An answer is persisted as the picks alone, because the tool call's input
+/// holds the form already and storing it twice would only let the two disagree.
+/// The card draws the form, so it is put back together here, where the input
+/// and the output are both in hand. A session written before the card drew
+/// anything but the picks restores through this same path, which is what makes
+/// it look like one written after.
+fn restored_answers(output: Arc<ToolOutput>, input: &serde_json::Value) -> Arc<ToolOutput> {
+    let ToolOutput::Answers(answers) = output.as_ref() else {
+        return output;
+    };
+    if answers.iter().all(|answer| !answer.question.is_empty()) {
+        return output;
+    }
+    let questions = asked_questions(input);
+    // An input that no longer lines up with its answers is one the card cannot
+    // redraw; the picks it does have are worth more than a form built from the
+    // wrong questions.
+    if questions.len() != answers.len() {
+        return output;
+    }
+    let answers = answers
+        .iter()
+        .zip(questions)
+        .map(|(answer, asked)| Answer {
+            question: asked.question,
+            options: asked.options,
+            ..answer.clone()
+        })
+        .collect();
+    Arc::new(ToolOutput::Answers(answers))
 }
 
 /// Mirrors the live `tool_done` path so restored sessions
@@ -2148,6 +2185,76 @@ mod tests {
 
         let (_, items) = display_messages(&msgs, &empty_outputs());
         assert_eq!(items.len(), 1, "text-only history still restores via Lua");
+    }
+
+    const ANSWER_HEADER: &str = "Transfer channel";
+    const ANSWER_QUESTION: &str = "How should bytes move?";
+    const ANSWER_PICKED: &str = "Signed URLs";
+    const ANSWER_DECLINED: &str = "Base64 in JSON-RPC";
+    const ANSWER_DESCRIPTION: &str = "Mint short-lived URLs instead of returning bytes";
+    const FORM_RESTORED: &str = "the form is filled back in from the tool call input";
+
+    fn question_input() -> serde_json::Value {
+        serde_json::json!({ "questions": [{
+            "question": ANSWER_QUESTION,
+            "header": ANSWER_HEADER,
+            "options": [
+                { "label": ANSWER_PICKED, "description": ANSWER_DESCRIPTION },
+                { "label": ANSWER_DECLINED, "description": "" },
+            ],
+        }]})
+    }
+
+    fn bare_answers(count: usize) -> HashMap<String, Arc<ToolOutput>> {
+        let answers = (0..count)
+            .map(|_| Answer {
+                header: ANSWER_HEADER.into(),
+                labels: vec![ANSWER_PICKED.into()],
+                question: String::new(),
+                options: Vec::new(),
+            })
+            .collect();
+        HashMap::from([("t1".to_owned(), Arc::new(ToolOutput::Answers(answers)))])
+    }
+
+    fn restored_answer(
+        input: serde_json::Value,
+        outputs: &HashMap<String, Arc<ToolOutput>>,
+    ) -> Answer {
+        let msgs = tool_use_pair("question", input, "Transfer channel: Signed URLs", false);
+        let (display, _) = display_messages(&msgs, outputs);
+        let Some(ToolOutput::Answers(answers)) = display[0].tool_output.as_deref().cloned() else {
+            panic!("a restored question keeps its structured answers");
+        };
+        answers[0].clone()
+    }
+
+    /// An answer is persisted as the picks alone, so the card's form comes back
+    /// from the questions the call was made with.
+    #[test]
+    fn a_restored_answer_is_filled_in_from_the_questions_it_answered() {
+        let answer = restored_answer(question_input(), &bare_answers(1));
+        assert_eq!(answer.question, ANSWER_QUESTION, "{FORM_RESTORED}");
+        assert_eq!(answer.options.len(), 2, "{FORM_RESTORED}");
+        assert_eq!(answer.options[1].label, ANSWER_DECLINED, "{FORM_RESTORED}");
+        assert_eq!(answer.labels, [ANSWER_PICKED]);
+    }
+
+    /// An input that no longer lines up with its answers cannot be redrawn as a
+    /// form, and the picks are worth more than the wrong questions.
+    #[test]
+    fn an_input_that_does_not_match_its_answers_leaves_the_picks_alone() {
+        let answer = restored_answer(question_input(), &bare_answers(2));
+        assert!(answer.question.is_empty());
+        assert!(answer.options.is_empty());
+        assert_eq!(answer.labels, [ANSWER_PICKED]);
+    }
+
+    #[test]
+    fn an_answer_restored_without_an_input_keeps_its_picks() {
+        let answer = restored_answer(serde_json::json!({}), &bare_answers(1));
+        assert!(answer.question.is_empty());
+        assert_eq!(answer.labels, [ANSWER_PICKED]);
     }
 
     #[test]

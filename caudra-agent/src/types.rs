@@ -181,10 +181,21 @@ pub struct QuestionOption {
 
 /// What the user picked for one question. `labels` is empty when the question
 /// was skipped, and may hold text the user typed rather than an offered label.
+///
+/// `question` and `options` are what the pick was made against, so a card can
+/// redraw the form rather than the picks alone. Both are skipped by serde
+/// rather than stored: the tool call's input holds the form already, a second
+/// copy under the result could only disagree with it, and a restored answer is
+/// filled back in from the input. That is also what lets a session written
+/// before the card drew a form render the same as one written after.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Answer {
     pub header: String,
     pub labels: Vec<String>,
+    #[serde(skip)]
+    pub question: String,
+    #[serde(skip)]
+    pub options: Vec<QuestionOption>,
 }
 
 /// The run has parked on a question. The front end that shows the form answers

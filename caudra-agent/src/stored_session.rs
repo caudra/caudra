@@ -209,6 +209,7 @@ pub(crate) mod tests {
     use test_case::test_case;
 
     use super::*;
+    use crate::types::{Answer, QuestionOption};
     use crate::{
         IndexDirectoryEntry, IndexDirectoryEntryKind, IndexLine, IndexLineSemantic, IndexOutput,
         IndexSourceRange, ShellFilterInfo, ShellOutput,
@@ -219,6 +220,14 @@ pub(crate) mod tests {
     const MODEL: &str = "anthropic/test";
     const LOAD_IS_NOT_ACTIVITY: &str = "a recovery scan or retitle must not count as opening";
     const OPEN_IS_ACTIVITY: &str = "opening a session must record last_opened_at";
+    const ANSWER_CALL: &str = "question-call";
+    const ANSWER_HEADER: &str = "Transfer channel";
+    const ANSWER_QUESTION: &str = "How should bytes move?";
+    const ANSWER_LABEL: &str = "Signed URLs";
+    const ANSWER_DESCRIPTION: &str = "Mint short-lived URLs instead of returning bytes";
+    const ANSWERS_EXPECTED: &str = "the transcript keeps the structured answers";
+    const FORM_NOT_PERSISTED: &str = "the form lives in the tool call input, not the result";
+    const FORM_COMES_FROM_INPUT: &str = "a bare answer is filled in from the input on restore";
 
     pub(crate) struct ResumeService {
         pub revision: AtomicUsize,
@@ -722,5 +731,72 @@ pub(crate) mod tests {
 
         assert_eq!(serde_json::to_value(actual.as_ref()).unwrap(), expected);
         assert_eq!(actual.as_text(), "filtered\n\n[shell status: exit code 0]");
+    }
+
+    fn answered_call(storage: &StateDir, output: ToolOutput) -> Arc<ToolOutput> {
+        let mut session = StoredSession::new(MODEL, CWD);
+        let id = session.id;
+        session.insert_tool_output(ANSWER_CALL.into(), output);
+        session.save(storage).unwrap();
+        load_stored_session(id, storage)
+            .unwrap()
+            .tool_outputs()
+            .get(ANSWER_CALL)
+            .unwrap()
+            .clone()
+    }
+
+    /// The form is the tool call's input, and an answer is restored against it.
+    /// Persisting it a second time under the result would only let the two
+    /// disagree, so the stored payload stays the picks alone.
+    #[test]
+    fn a_stored_answer_keeps_the_picks_and_not_the_form() {
+        let temp = TempDir::new().unwrap();
+        let storage = StateDir::from_path(temp.path().to_path_buf());
+        let output = ToolOutput::Answers(vec![Answer {
+            header: ANSWER_HEADER.into(),
+            labels: vec![ANSWER_LABEL.into()],
+            question: ANSWER_QUESTION.into(),
+            options: vec![QuestionOption {
+                label: ANSWER_LABEL.into(),
+                description: ANSWER_DESCRIPTION.into(),
+            }],
+        }]);
+
+        let actual = answered_call(&storage, output);
+
+        let ToolOutput::Answers(answers) = actual.as_ref() else {
+            panic!("{ANSWERS_EXPECTED}");
+        };
+        assert_eq!(answers[0].header, ANSWER_HEADER);
+        assert_eq!(answers[0].labels, [ANSWER_LABEL]);
+        assert!(answers[0].question.is_empty(), "{FORM_NOT_PERSISTED}");
+        assert!(answers[0].options.is_empty(), "{FORM_NOT_PERSISTED}");
+        assert_eq!(
+            serde_json::to_value(actual.as_ref()).unwrap(),
+            serde_json::json!({ "Answers": [{ "header": ANSWER_HEADER, "labels": [ANSWER_LABEL] }] }),
+            "{FORM_NOT_PERSISTED}"
+        );
+    }
+
+    /// Every answer written before the card drew the form is stored this way,
+    /// so the bare shape has to keep loading.
+    #[test]
+    fn an_answer_stored_without_its_form_still_loads() {
+        let temp = TempDir::new().unwrap();
+        let storage = StateDir::from_path(temp.path().to_path_buf());
+        let bare: ToolOutput = serde_json::from_value(
+            serde_json::json!({ "Answers": [{ "header": ANSWER_HEADER, "labels": [ANSWER_LABEL] }] }),
+        )
+        .unwrap();
+
+        let actual = answered_call(&storage, bare);
+
+        let ToolOutput::Answers(answers) = actual.as_ref() else {
+            panic!("{ANSWERS_EXPECTED}");
+        };
+        assert_eq!(answers[0].labels, [ANSWER_LABEL]);
+        assert!(answers[0].question.is_empty(), "{FORM_COMES_FROM_INPUT}");
+        assert!(answers[0].options.is_empty(), "{FORM_COMES_FROM_INPUT}");
     }
 }
