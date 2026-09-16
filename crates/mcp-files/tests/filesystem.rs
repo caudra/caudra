@@ -10,11 +10,14 @@ use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 use workcell_mcp_files::{
     FileApplyPatchInput, FileEditInput, FileGlobInput, FileGrepInput, FileReadInput,
-    FileReadOutput, FileToolGroup, FileWriteInput, FilesystemError, FilesystemLimits,
+    FileReadOutput, FileResourceAccess, FileToolGroup, FileWriteInput, FilesystemError,
+    FilesystemLimits,
 };
 
 const STALE_PUBLICATION: &str = "changed before publication";
 const FOREIGN_FILE_GROUP: &str = "different file tool group";
+const DIRECTORY_REPLACEMENT_CONTENT: &str = "directory grants must not expose this content";
+const DIRECTORY_LISTING_LIMIT: usize = 1;
 
 struct Fixture {
     _temporary: TempDir,
@@ -1637,6 +1640,199 @@ async fn prepared_reads_and_searches_keep_the_exact_options_and_scope() {
     assert_eq!(grep.pattern, "beta");
     assert_eq!(grep.relative_path, "notes.txt");
     assert_eq!(grep.matches, 2);
+}
+
+#[tokio::test]
+async fn directory_only_execution_refuses_prepared_files_foreign_groups_and_cancelled_calls() {
+    let fixture = fixture();
+    let files = FileToolGroup::new(&fixture.root, false, None)
+        .await
+        .unwrap();
+    let file = files
+        .prepare_read(
+            FileReadInput {
+                file_path: "notes.txt".into(),
+                offset: None,
+                limit: None,
+            },
+            &token(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        files
+            .execute_prepared_directory_read(file, &token())
+            .await
+            .is_err()
+    );
+
+    let input = FileReadInput {
+        file_path: ".".into(),
+        offset: None,
+        limit: None,
+    };
+    let directory = files.prepare_read(input.clone(), &token()).await.unwrap();
+    let foreign = FileToolGroup::new(&fixture.root, false, None)
+        .await
+        .unwrap();
+    let error = foreign
+        .execute_prepared_directory_read(directory, &token())
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains(FOREIGN_FILE_GROUP));
+
+    let directory = files.prepare_read(input, &token()).await.unwrap();
+    let cancelled = token();
+    cancelled.cancel();
+    assert!(matches!(
+        files
+            .execute_prepared_directory_read(directory, &cancelled)
+            .await,
+        Err(FilesystemError::Aborted)
+    ));
+}
+
+#[tokio::test]
+async fn prepared_directory_read_never_follows_a_replaced_resource() {
+    for unconfined in [false, true] {
+        for replacement in [
+            "file",
+            "inside_file",
+            "outside_file",
+            "inside_directory",
+            "outside_directory",
+            "protected_directory",
+        ] {
+            let fixture = fixture();
+            let path = fixture.root.join("listed");
+            fs::create_dir(&path).unwrap();
+            fs::create_dir(fixture.root.join("other")).unwrap();
+            fs::create_dir(fixture.root.join(".ssh")).unwrap();
+            let files = if unconfined {
+                FileToolGroup::new_unconfined(&fixture.root, false, None).await
+            } else {
+                FileToolGroup::new(&fixture.root, false, None).await
+            }
+            .unwrap();
+            let prepared = files
+                .prepare_read(
+                    FileReadInput {
+                        file_path: "listed".into(),
+                        offset: None,
+                        limit: None,
+                    },
+                    &token(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(prepared.resource().access, FileResourceAccess::Traverse);
+            fs::remove_dir(&path).unwrap();
+            match replacement {
+                "file" => fs::write(&path, DIRECTORY_REPLACEMENT_CONTENT).unwrap(),
+                "inside_file" => symlink(fixture.root.join("notes.txt"), &path).unwrap(),
+                "outside_file" => symlink(fixture.outside.join("secret.txt"), &path).unwrap(),
+                "inside_directory" => symlink(fixture.root.join("other"), &path).unwrap(),
+                "outside_directory" => symlink(&fixture.outside, &path).unwrap(),
+                _ => symlink(fixture.root.join(".ssh"), &path).unwrap(),
+            }
+            let result = files
+                .execute_prepared_directory_read(prepared, &token())
+                .await;
+            assert!(result.is_err(), "{replacement} was followed: {result:?}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn prepared_directory_read_does_not_follow_a_retargeted_input_symlink() {
+    let fixture = fixture();
+    let directory = fixture.root.join("listed");
+    let link = fixture.root.join("alias");
+    fs::create_dir(&directory).unwrap();
+    fs::write(directory.join("visible.txt"), DIRECTORY_REPLACEMENT_CONTENT).unwrap();
+    symlink(&directory, &link).unwrap();
+    let files = FileToolGroup::new(&fixture.root, false, None)
+        .await
+        .unwrap();
+    let prepared = files
+        .prepare_read(
+            FileReadInput {
+                file_path: "alias".into(),
+                offset: None,
+                limit: None,
+            },
+            &token(),
+        )
+        .await
+        .unwrap();
+    fs::remove_file(&link).unwrap();
+    symlink(fixture.outside.join("secret.txt"), &link).unwrap();
+    let FileReadOutput::Directory { path, entries, .. } = files
+        .execute_prepared_directory_read(prepared, &token())
+        .await
+        .unwrap()
+    else {
+        panic!("directory-only execution returned file contents");
+    };
+    assert_eq!(PathBuf::from(path), fs::canonicalize(directory).unwrap());
+    assert_eq!(entries, ["visible.txt"]);
+}
+
+#[tokio::test]
+async fn prepared_directory_read_preserves_listing_bounds_and_path_policy() {
+    let fixture = fixture();
+    fs::create_dir(fixture.root.join("public")).unwrap();
+    fs::create_dir(fixture.root.join(".ssh")).unwrap();
+    fs::write(fixture.root.join(".env"), DIRECTORY_REPLACEMENT_CONTENT).unwrap();
+    fs::write(
+        fixture.root.join("public/nested.txt"),
+        DIRECTORY_REPLACEMENT_CONTENT,
+    )
+    .unwrap();
+    symlink(&fixture.outside, fixture.root.join("outside_link")).unwrap();
+    symlink(
+        fixture.root.join(".ssh"),
+        fixture.root.join("protected_link"),
+    )
+    .unwrap();
+    for limited in [false, true] {
+        let limits = limited.then(|| FilesystemLimits {
+            max_search_results: DIRECTORY_LISTING_LIMIT,
+            ..FilesystemLimits::default()
+        });
+        let files = FileToolGroup::new(&fixture.root, false, limits)
+            .await
+            .unwrap();
+        let prepared = files
+            .prepare_read(
+                FileReadInput {
+                    file_path: ".".into(),
+                    offset: None,
+                    limit: None,
+                },
+                &token(),
+            )
+            .await
+            .unwrap();
+        let FileReadOutput::Directory {
+            entries, truncated, ..
+        } = files
+            .execute_prepared_directory_read(prepared, &token())
+            .await
+            .unwrap()
+        else {
+            panic!("directory-only execution returned file contents");
+        };
+        assert_eq!(truncated, limited);
+        assert_eq!(
+            entries,
+            if limited {
+                vec!["notes.txt"]
+            } else {
+                vec!["notes.txt", "public/"]
+            }
+        );
+    }
 }
 
 #[tokio::test]

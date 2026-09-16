@@ -11,7 +11,10 @@ use crate::{
         COMBINED_OUTPUT_BYTES, FALLBACK_PREVIEW_BYTES, OUTPUT_CHANNEL_CAPACITY, Tail, read_stream,
     },
     permission::{MAX_COMMAND_BYTES, ShellPermissionPolicy},
-    process::{exit_signal, platform_command, terminate_and_reap, terminate_residual_group},
+    process::{
+        SharedShellLauncher, ShellLauncher, exit_signal, platform_command, terminate_and_reap,
+        terminate_residual_group,
+    },
     progress::{ProgressPump, ShellProgressSink, receive_failure},
     types::{
         DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS, PreparedShell, ShellCommandAnalysis, ShellExecution,
@@ -61,6 +64,7 @@ pub struct ShellToolGroup {
     policy: ShellPermissionPolicy,
     confined: bool,
     output_filter: bool,
+    launcher: SharedShellLauncher,
 }
 #[derive(Debug)]
 pub struct ShellBuildError;
@@ -125,6 +129,7 @@ impl ShellToolGroup {
             policy,
             confined,
             output_filter: true,
+            launcher: Arc::new(ShellLauncher::from_host().await),
         })
     }
 
@@ -232,14 +237,15 @@ impl ShellToolGroup {
         } else {
             workdir::resolve_unconfined(&self.root, requested_workdir).await?
         };
-        let (analysis, policy_decision) = self.policy.prepare(&input.command);
+        let (analysis, bash_program, policy_decision) = self.policy.prepare(&input.command);
         Ok(PreparedShell::new(
             input.command,
             timeout_ms,
-            analysis,
+            (analysis, bash_program),
             policy_decision,
             workdir,
             self.output_filter,
+            Arc::clone(&self.launcher),
         ))
     }
 
@@ -278,15 +284,16 @@ impl ShellToolGroup {
         cancellation: CancellationToken,
         progress: Option<Arc<dyn ShellProgressSink>>,
     ) -> Result<Option<ShellExecution>, String> {
-        let (command_text, timeout_ms, workdir, analysis, output_filter) =
+        let (command_text, timeout_ms, workdir, analysis, output_filter, launcher) =
             prepared.into_execution_parts();
+        let launcher = launcher.as_ref().as_ref().map_err(ToString::to_string)?;
         let relative_workdir = workdir.relative().to_owned();
         let mut progress = progress.map(ProgressPump::start);
         // Queue admission remains cancellable; holding the permit through final progress drain keeps
         // all per-execution resources inside the global concurrency budget.
         let _permit = tokio::select! {permit=concurrency().clone().acquire_owned()=>permit.map_err(|_|"Shell concurrency gate is unavailable".to_owned())?,()=cancellation.cancelled()=>return Ok(None)};
         let started = Instant::now();
-        let mut command = platform_command(&command_text);
+        let mut command = platform_command(launcher, &command_text);
         command
             .current_dir(workdir.canonical())
             .stdin(Stdio::null())
@@ -296,7 +303,10 @@ impl ShellToolGroup {
         tokio::select! {
             biased;
             () = cancellation.cancelled() => return Ok(None),
-            result = workdir::revalidate(&workdir) => result?,
+            result = async {
+                workdir::revalidate(&workdir).await?;
+                launcher.revalidate().await.map_err(|error| error.to_string())
+            } => result?,
         }
         if cancellation.is_cancelled() {
             return Ok(None);

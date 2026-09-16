@@ -8,7 +8,11 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::{mem::size_of, path::Path};
 
-use crate::workdir::WorkdirBinding;
+use crate::{
+    bash::{BashCommandContexts, BashContextError, BashParseError, BashProgram},
+    process::{SharedShellLauncher, ShellLauncher, retained_launcher_bytes},
+    workdir::WorkdirBinding,
+};
 
 pub const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 pub const MAX_TIMEOUT_MS: u64 = 600_000;
@@ -148,9 +152,11 @@ pub struct PreparedShell {
     command: String,
     timeout_ms: u64,
     analysis: ShellCommandAnalysis,
+    bash_program: Result<BashProgram, BashParseError>,
     policy_decision: ShellPolicyDecision,
     workdir: WorkdirBinding,
     output_filter: bool,
+    launcher: SharedShellLauncher,
 }
 
 impl PreparedShell {
@@ -172,6 +178,33 @@ impl PreparedShell {
     #[must_use]
     pub const fn analysis(&self) -> &ShellCommandAnalysis {
         &self.analysis
+    }
+
+    pub fn bash_program(&self) -> Result<&BashProgram, &BashParseError> {
+        self.bash_program.as_ref()
+    }
+
+    pub fn bash_command_contexts(&self) -> Result<BashCommandContexts, BashContextError> {
+        let assumptions = self
+            .launcher
+            .as_ref()
+            .as_ref()
+            .ok()
+            .and_then(ShellLauncher::bash_startup_assumptions)
+            .ok_or(BashContextError::UnsupportedLauncher)?;
+        let program = self
+            .bash_program()
+            .map_err(|error| BashContextError::Parse(error.clone()))?;
+        Ok(program.command_contexts_with_assumptions(self.workdir(), assumptions))
+    }
+
+    #[must_use]
+    pub fn bash_executable(&self) -> Option<&Path> {
+        self.launcher
+            .as_ref()
+            .as_ref()
+            .ok()
+            .and_then(ShellLauncher::bash_executable)
     }
 
     #[must_use]
@@ -196,29 +229,39 @@ impl PreparedShell {
             .saturating_add(self.command.capacity())
             .saturating_add(self.analysis.retained_bytes())
             .saturating_add(
+                self.bash_program
+                    .as_ref()
+                    .map_or(0, BashProgram::retained_bytes),
+            )
+            .saturating_add(
                 self.policy_decision
                     .denial
                     .as_ref()
                     .map_or(0, String::capacity),
             )
             .saturating_add(self.workdir.retained_bytes())
+            .saturating_add(retained_launcher_bytes(&self.launcher))
     }
 
     pub(crate) fn new(
         command: String,
         timeout_ms: u64,
-        analysis: ShellCommandAnalysis,
+        analysis: (ShellCommandAnalysis, Result<BashProgram, BashParseError>),
         policy_decision: ShellPolicyDecision,
         workdir: WorkdirBinding,
         output_filter: bool,
+        launcher: SharedShellLauncher,
     ) -> Self {
+        let (analysis, bash_program) = analysis;
         Self {
             command,
             timeout_ms,
             analysis,
+            bash_program,
             policy_decision,
             workdir,
             output_filter,
+            launcher,
         }
     }
 
@@ -230,13 +273,21 @@ impl PreparedShell {
     /// already resolves.
     pub(crate) fn into_execution_parts(
         self,
-    ) -> (String, u64, WorkdirBinding, ShellCommandAnalysis, bool) {
+    ) -> (
+        String,
+        u64,
+        WorkdirBinding,
+        ShellCommandAnalysis,
+        bool,
+        SharedShellLauncher,
+    ) {
         (
             self.command,
             self.timeout_ms,
             self.workdir,
             self.analysis,
             self.output_filter,
+            self.launcher,
         )
     }
 }
@@ -297,4 +348,111 @@ pub struct ShellExecution {
     pub output: ShellOutput,
     pub model_text: String,
     pub filter: Option<ShellFilterInfo>,
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(unix)]
+    use crate::bash::{BashCwdSet, MAX_BASH_CST_NODES};
+    use crate::{ShellInput, ShellPermissionPolicy, ShellToolGroup, bash::BashContextError};
+    use tempfile::TempDir;
+
+    use super::PreparedShell;
+
+    const WORKDIR: &str = "work";
+
+    async fn prepare(source: &str) -> (TempDir, PreparedShell) {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join(WORKDIR)).unwrap();
+        let group = ShellToolGroup::with_policy(directory.path(), ShellPermissionPolicy::yolo())
+            .await
+            .unwrap();
+        let prepared = group
+            .prepare(ShellInput {
+                command: source.to_owned(),
+                timeout: None,
+                workdir: Some(WORKDIR.into()),
+            })
+            .await
+            .unwrap();
+        (directory, prepared)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn prepared_contexts_use_launcher_guarantees_and_the_bound_workdir_not_history_assumptions()
+     {
+        let (_directory, prepared) = prepare("cd left || cd right; cat note.txt").await;
+        let contexts = prepared.bash_command_contexts().unwrap();
+        assert!(contexts.complete, "{:?}", contexts.diagnostics);
+        assert_eq!(
+            contexts.commands[0].incoming,
+            BashCwdSet::Known(vec![prepared.workdir().to_owned()])
+        );
+        let mut possible = vec![
+            prepared.workdir().to_owned(),
+            prepared.workdir().join("left"),
+            prepared.workdir().join("right"),
+        ];
+        possible.sort();
+        assert_eq!(
+            contexts.commands.last().unwrap().incoming,
+            BashCwdSet::Known(possible)
+        );
+        assert!(
+            !prepared
+                .bash_program()
+                .unwrap()
+                .command_contexts(prepared.workdir())
+                .complete
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn trusted_startup_does_not_launder_stateful_scripts_into_known_contexts() {
+        for source in [
+            "source setup; cat note",
+            ". setup; cat note",
+            "eval 'cd left'; cat note",
+            "trap 'cd left' DEBUG; cat note",
+            "shopt -s lastpipe; cat note",
+            "set -P; cat note",
+            "export CDPATH=/outside; cat note",
+            "f() { cd left; }; f; cat note",
+            "command cd left; cat note",
+            "builtin cd left; cat note",
+            "cd $target; cat note",
+            "cat $(cd left); cat note",
+        ] {
+            let (_directory, prepared) = prepare(source).await;
+            let contexts = prepared.bash_command_contexts().unwrap();
+            assert!(!contexts.complete, "{source:?}");
+            let last = contexts.commands.last().unwrap();
+            assert!(!last.complete, "{source:?}");
+            assert_eq!(last.incoming, BashCwdSet::Unknown, "{source:?}");
+            assert!(!contexts.diagnostics.is_empty(), "{source:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_bash_analysis_cannot_produce_trusted_contexts() {
+        let (_directory, prepared) = prepare(&"echo x;".repeat(MAX_BASH_CST_NODES)).await;
+        let error = prepared.bash_program().unwrap_err().clone();
+        assert_eq!(
+            prepared.bash_command_contexts(),
+            Err(BashContextError::Parse(error))
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn the_windows_cmd_launcher_never_claims_bash_context_trust() {
+        let (_directory, prepared) = prepare("echo value").await;
+        assert_eq!(
+            prepared.bash_command_contexts(),
+            Err(BashContextError::UnsupportedLauncher)
+        );
+    }
 }

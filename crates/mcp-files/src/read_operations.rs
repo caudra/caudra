@@ -3,7 +3,7 @@ pub(crate) mod grep;
 mod listing_metadata;
 mod traversal;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use tokio::fs;
 use tokio_util::sync::CancellationToken;
@@ -12,7 +12,9 @@ use crate::{
     FilesystemError,
     operations::FilesystemCore,
     text::{check_cancelled, decode_text, read_bounded, split_text_lines, truncate_line},
-    types::{DirectoryEntryDetail, FileEntryKind, FileReadOutput},
+    types::{
+        DirectoryEntryDetail, FileEntryKind, FileReadOutput, FileResource, FileResourceAccess,
+    },
 };
 
 use self::listing_metadata::file_listing_metadata;
@@ -20,14 +22,22 @@ use self::listing_metadata::file_listing_metadata;
 impl FilesystemCore {
     pub(crate) async fn file_read_prepared(
         &self,
-        file_path: PathBuf,
-        requested_path: String,
+        resource: FileResource,
         relative_path: String,
         offset: usize,
         limit: usize,
         token: &CancellationToken,
     ) -> Result<FileReadOutput, FilesystemError> {
         check_cancelled(token)?;
+        let FileResource {
+            path: file_path,
+            requested_path,
+            access,
+            ..
+        } = resource;
+        if access == FileResourceAccess::Traverse {
+            return self.read_directory(&file_path, relative_path, token).await;
+        }
         let metadata = match fs::metadata(&file_path).await {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -44,9 +54,6 @@ impl FilesystemCore {
                 ));
             }
         };
-        if metadata.is_dir() {
-            return self.read_directory(&file_path, relative_path, token).await;
-        }
         if !metadata.is_file() {
             return Err(FilesystemError::message(format!(
                 "Path is not a regular file: {}",
@@ -171,4 +178,60 @@ fn relative_to(root: &Path, path: &Path) -> String {
         .map(|component| component.as_os_str().to_string_lossy())
         .collect::<Vec<_>>()
         .join("/")
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{FileReadInput, FileToolGroup};
+    use std::fs;
+    use tokio_util::sync::CancellationToken;
+
+    const READ_START: usize = 1;
+    const CONTENT: &str = "not authorized by a directory listing";
+
+    #[tokio::test]
+    async fn prepared_reads_never_switch_kind_after_resource_revalidation() {
+        for directory in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("target");
+            if directory {
+                fs::create_dir(&path).unwrap();
+            } else {
+                fs::write(&path, CONTENT).unwrap();
+            }
+            let files = FileToolGroup::new(root.path(), false, None).await.unwrap();
+            let token = CancellationToken::new();
+            let prepared = files
+                .prepare_read(
+                    FileReadInput {
+                        file_path: "target".into(),
+                        offset: None,
+                        limit: None,
+                    },
+                    &token,
+                )
+                .await
+                .unwrap();
+            let resource = prepared.resource().clone();
+            files.core.revalidate_resource(&resource).await.unwrap();
+            if directory {
+                fs::remove_dir(&path).unwrap();
+                fs::write(&path, CONTENT).unwrap();
+            } else {
+                fs::remove_file(&path).unwrap();
+                fs::create_dir(&path).unwrap();
+            }
+            let result = files
+                .core
+                .file_read_prepared(
+                    resource,
+                    prepared.relative_path().into(),
+                    READ_START,
+                    files.limits().max_read_lines,
+                    &token,
+                )
+                .await;
+            assert!(result.is_err(), "prepared kind changed: {result:?}");
+        }
+    }
 }

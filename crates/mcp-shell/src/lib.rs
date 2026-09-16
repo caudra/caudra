@@ -6,6 +6,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod bash;
 // Process and output internals stay private so all callers retain lifecycle cleanup and bounds.
 mod catalog;
 mod group;

@@ -1,21 +1,25 @@
-use std::{fmt, path::Path};
+use std::{collections::BTreeMap, fmt, path::Path};
 
 #[cfg(unix)]
 use std::{fs::File, io::Read};
 
 use serde::{Deserialize, Serialize};
-use tree_sitter::{Node, Parser};
+use tree_sitter::Node;
 use workcell_tool_contract::CatalogRevision;
 
-use crate::types::{ShellCommandAnalysis, ShellCommandScope, ShellPolicyDecision, ShellWord};
+use crate::{
+    bash::{
+        BashLimits, BashParseError, BashProgram, MAX_BASH_SOURCE_BYTES, decode_static_word,
+        lower_tree, parse_tree,
+    },
+    types::{ShellCommandAnalysis, ShellCommandScope, ShellPolicyDecision, ShellWord},
+};
 
 const POLICY_VERSION: u8 = 1;
-pub(crate) const MAX_COMMAND_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_COMMAND_BYTES: usize = MAX_BASH_SOURCE_BYTES;
 const MAX_POLICY_BYTES: usize = 64 * 1024;
 const MAX_PATTERNS: usize = 256;
 const MAX_PATTERN_BYTES: usize = 512;
-const MAX_AST_NODES: usize = 4_096;
-const MAX_AST_DEPTH: usize = 64;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -214,26 +218,34 @@ impl ShellPermissionPolicy {
         }
     }
 
-    pub(crate) fn prepare(&self, command: &str) -> (ShellCommandAnalysis, ShellPolicyDecision) {
-        match analyze(command) {
-            Ok(analysis) => {
+    pub(crate) fn prepare(
+        &self,
+        command: &str,
+    ) -> (
+        ShellCommandAnalysis,
+        Result<BashProgram, BashParseError>,
+        ShellPolicyDecision,
+    ) {
+        match analyze_with_program(command) {
+            Ok((analysis, program)) => {
                 let decision = self.authorize_analysis(&analysis).map_or_else(
                     |error| ShellPolicyDecision::deny(error.to_string()),
                     |()| ShellPolicyDecision::allow(),
                 );
-                (analysis, decision)
+                (analysis, Ok(program), decision)
             }
             Err(error) => {
                 let decision = if self.yolo && self.deny.is_empty() {
                     ShellPolicyDecision::allow()
                 } else {
-                    ShellPolicyDecision::deny(error.to_string())
+                    ShellPolicyDecision::deny(AuthorizationError::Opaque.to_string())
                 };
                 (
                     ShellCommandAnalysis {
                         scopes: Vec::new(),
                         opaque: true,
                     },
+                    Err(error),
                     decision,
                 )
             }
@@ -296,72 +308,76 @@ pub(crate) fn inspect(command: &str) -> ShellCommandAnalysis {
     })
 }
 
+#[cfg(all(test, feature = "mcp"))]
 fn analyze(command: &str) -> Result<ShellCommandAnalysis, AuthorizationError> {
-    if command.len() > MAX_COMMAND_BYTES {
-        return Err(AuthorizationError::Opaque);
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = command;
-        return Err(AuthorizationError::Opaque);
-    }
-    #[cfg(unix)]
-    {
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_bash::LANGUAGE.into())
-            .map_err(|_| AuthorizationError::Opaque)?;
-        let tree = parser
-            .parse(command.as_bytes(), None)
-            .ok_or(AuthorizationError::Opaque)?;
-        let root = tree.root_node();
-        let mut analysis = ShellCommandAnalysis {
-            scopes: Vec::new(),
-            opaque: root.has_error(),
-        };
-        let mut stack = vec![(root, 0_usize)];
-        let mut visited = 0_usize;
-        while let Some((node, depth)) = stack.pop() {
-            visited = visited.saturating_add(1);
-            if visited > MAX_AST_NODES || depth > MAX_AST_DEPTH {
-                return Err(AuthorizationError::Opaque);
-            }
-            if is_opaque_construct(node.kind()) {
-                analysis.opaque = true;
-            }
-            if is_scope_node(node.kind()) {
-                match command_scope(node, command.as_bytes()) {
-                    Some((scope, opaque)) => {
-                        analysis.scopes.push(scope);
-                        analysis.opaque |= opaque;
-                    }
-                    None => analysis.opaque = true,
-                }
-            }
-            push_named_children(node, depth, &mut stack);
-        }
-        analysis.scopes.sort_by_key(|scope| scope.start_byte);
-        analysis
-            .scopes
-            .dedup_by(|left, right| left.start_byte == right.start_byte);
-        if analysis.scopes.is_empty() {
-            analysis.opaque = true;
-        }
-        Ok(analysis)
-    }
+    analyze_with_program(command)
+        .map(|(analysis, _)| analysis)
+        .map_err(|_| AuthorizationError::Opaque)
 }
 
-fn push_named_children<'tree>(
-    node: Node<'tree>,
-    depth: usize,
-    stack: &mut Vec<(Node<'tree>, usize)>,
-) {
+fn analyze_with_program(
+    command: &str,
+) -> Result<(ShellCommandAnalysis, BashProgram), BashParseError> {
+    let tree = parse_tree(command, &BashLimits::default())?;
+    let program = lower_tree(command, &tree);
+    let commands: BTreeMap<_, _> = program
+        .commands()
+        .filter_map(|(_, command)| command.words.first().map(|word| (word.span.start, command)))
+        .collect();
+    let root = tree.root_node();
+    let mut analysis = ShellCommandAnalysis {
+        scopes: Vec::new(),
+        opaque: root.has_error() || !cfg!(unix) || !program.is_complete(),
+    };
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if is_opaque_construct(node.kind()) {
+            analysis.opaque = true;
+        }
+        if is_scope_node(node.kind()) {
+            match command_scope(node, command.as_bytes()) {
+                Some((scope, opaque)) => {
+                    let mut scope = scope;
+                    scope.arguments = commands
+                        .get(&scope.start_byte)
+                        .filter(|command| command.complete)
+                        .map(|command| {
+                            command
+                                .words
+                                .iter()
+                                .skip(1)
+                                .map(|word| {
+                                    word.literal
+                                        .clone()
+                                        .map_or(ShellWord::Undecodable, ShellWord::Literal)
+                                })
+                                .collect()
+                        });
+                    analysis.scopes.push(scope);
+                    analysis.opaque |= opaque;
+                }
+                None => analysis.opaque = true,
+            }
+        }
+        push_named_children(node, &mut stack);
+    }
+    analysis.scopes.sort_by_key(|scope| scope.start_byte);
+    analysis
+        .scopes
+        .dedup_by(|left, right| left.start_byte == right.start_byte);
+    if analysis.scopes.is_empty() {
+        analysis.opaque = true;
+    }
+    Ok((analysis, program))
+}
+
+fn push_named_children<'tree>(node: Node<'tree>, stack: &mut Vec<Node<'tree>>) {
     for index in (0..node.named_child_count()).rev() {
         let Ok(index) = u32::try_from(index) else {
             continue;
         };
         if let Some(child) = node.named_child(index) {
-            stack.push((child, depth.saturating_add(1)));
+            stack.push(child);
         }
     }
 }
@@ -423,70 +439,10 @@ fn command_scope(node: Node<'_>, command: &[u8]) -> Option<(ShellCommandScope, b
             normalized,
             permission: format!("{basename} *"),
             executable: basename.to_owned(),
-            arguments: command_arguments(node, command),
+            arguments: None,
         },
         is_opaque_wrapper(basename),
     ))
-}
-
-/// Decodes the words a plain command passes, in order.
-///
-/// The grammar keeps redirect destinations in their own field, so reading the
-/// `argument` field leaves them out for the same reason the scope source does.
-/// Nodes that are not commands have no such field and are reported as never
-/// enumerated rather than as taking no arguments.
-fn command_arguments(node: Node<'_>, command: &[u8]) -> Option<Vec<ShellWord>> {
-    if node.kind() != "command" {
-        return None;
-    }
-    let mut cursor = node.walk();
-    Some(
-        node.children_by_field_name("argument", &mut cursor)
-            .map(|argument| {
-                argument
-                    .utf8_text(command)
-                    .ok()
-                    .and_then(decode_static_word)
-                    .map_or(ShellWord::Undecodable, ShellWord::Literal)
-            })
-            .collect(),
-    )
-}
-
-fn decode_static_word(word: &str) -> Option<String> {
-    let mut decoded = String::new();
-    let mut characters = word.chars();
-    let mut quote = None;
-    while let Some(character) = characters.next() {
-        match (quote, character) {
-            (None, '\'') => quote = Some('\''),
-            (None, '"') => quote = Some('"'),
-            (Some('\''), '\'') | (Some('"'), '"') => quote = None,
-            (Some('\''), value) => decoded.push(value),
-            (Some('"'), '$' | '`') => return None,
-            (Some('"'), '\\') => {
-                let escaped = characters.next()?;
-                if matches!(escaped, '$' | '`' | '"' | '\\') {
-                    decoded.push(escaped);
-                } else if escaped != '\n' {
-                    decoded.push('\\');
-                    decoded.push(escaped);
-                }
-            }
-            (Some('"'), value) => decoded.push(value),
-            (None, '\\') => {
-                let escaped = characters.next()?;
-                if escaped != '\n' {
-                    decoded.push(escaped);
-                }
-            }
-            (None, '$' | '`' | '*' | '?' | '[' | '{') => return None,
-            (None, value) if value.is_whitespace() || value.is_control() => return None,
-            (None, value) => decoded.push(value),
-            _ => return None,
-        }
-    }
-    (quote.is_none() && !decoded.is_empty()).then_some(decoded)
 }
 
 fn normalize_shell_whitespace(source: &str) -> String {
@@ -791,7 +747,6 @@ mod tests {
         for command in [
             "cat $HOME",
             "cat \"$HOME\"",
-            "cat `cat pointer`",
             "cat *",
             "cat ?ecret",
             "cat [a-z]ecret",
@@ -813,6 +768,7 @@ mod tests {
     fn a_command_with_no_arguments_differs_from_one_never_enumerated() {
         assert_eq!(first_scope("pwd").arguments, Some(Vec::new()));
         assert_eq!(first_scope("unset EDITOR").arguments, None);
+        assert_eq!(first_scope("cat `cat pointer`").arguments, None);
     }
 
     /// Redirect destinations sit in their own field, so they are not arguments,

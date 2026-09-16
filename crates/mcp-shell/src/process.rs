@@ -7,26 +7,212 @@
 
 use std::{
     ffi::OsString,
+    fmt,
+    path::{Path, PathBuf},
     process::ExitStatus,
+    sync::Arc,
     time::{Duration, Instant},
+};
+#[cfg(unix)]
+use std::{
+    fs::Metadata,
+    os::unix::{fs::MetadataExt, process::CommandExt},
 };
 use tokio::process::{Child, Command};
 
+use crate::bash::BashContextAssumptions;
+
 const TERMINATION_GRACE: Duration = Duration::from_secs(3);
+#[cfg(unix)]
+const BASH_ARGUMENTS: [&str; 3] = ["--noprofile", "--norc", "-c"];
+#[cfg(unix)]
+const BASH_EXECUTABLE_ENV: &str = "WORKCELL_BASH_EXECUTABLE";
+#[cfg(unix)]
+const DEFAULT_BASH_EXECUTABLES: &[&str] = &["/bin/bash", "/usr/bin/bash"];
+const MAX_LAUNCHER_PATH_BYTES: usize = 4096;
+const ARC_COUNTER_BYTES: usize = 2 * size_of::<usize>();
+#[cfg(unix)]
+const EXECUTABLE_MODE: u32 = 0o111;
+
+pub(crate) type SharedShellLauncher = Arc<Result<ShellLauncher, ShellLauncherError>>;
+
+#[derive(Debug)]
+pub(crate) struct ShellLauncher {
+    executable: PathBuf,
+    #[cfg(unix)]
+    identity: BashExecutableIdentity,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum ShellLauncherError {
+    InvalidPath,
+    #[cfg(unix)]
+    Unavailable,
+    #[cfg(unix)]
+    NotExecutable,
+    #[cfg(unix)]
+    Changed,
+}
+
+impl fmt::Display for ShellLauncherError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidPath => "The host shell executable must have a nonempty bounded path; WORKCELL_BASH_EXECUTABLE must be absolute",
+            #[cfg(unix)]
+            Self::Unavailable => "No trusted Bash executable is available; set host WORKCELL_BASH_EXECUTABLE to an absolute Bash path",
+            #[cfg(unix)]
+            Self::NotExecutable => "The host Bash executable must be an executable regular file",
+            #[cfg(unix)]
+            Self::Changed => "The bound Bash executable changed or disappeared; rebuild the shell tool group and prepare again",
+        })
+    }
+}
 
 #[cfg(unix)]
-pub(crate) fn platform_command(script: &str) -> Command {
-    use std::os::unix::process::CommandExt;
-    let mut command = Command::new("bash");
-    command.arg("-lc").arg(script);
+#[derive(Debug, Eq, PartialEq)]
+struct BashExecutableIdentity {
+    device: u64,
+    inode: u64,
+    length: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
+}
+
+#[cfg(unix)]
+impl BashExecutableIdentity {
+    fn from_metadata(metadata: &Metadata) -> Result<Self, ShellLauncherError> {
+        if !metadata.is_file() || metadata.mode() & EXECUTABLE_MODE == 0 {
+            return Err(ShellLauncherError::NotExecutable);
+        }
+        Ok(Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            length: metadata.len(),
+            modified: (metadata.mtime(), metadata.mtime_nsec()),
+            changed: (metadata.ctime(), metadata.ctime_nsec()),
+        })
+    }
+}
+
+impl ShellLauncher {
+    pub(crate) async fn from_host() -> Result<Self, ShellLauncherError> {
+        #[cfg(unix)]
+        {
+            let configured = std::env::var_os(BASH_EXECUTABLE_ENV)
+                .or_else(|| option_env!("WORKCELL_BASH_EXECUTABLE").map(OsString::from))
+                .map(PathBuf::from);
+            Self::select_bash(configured.as_deref()).await
+        }
+        #[cfg(windows)]
+        {
+            let executable =
+                PathBuf::from(std::env::var_os("ComSpec").unwrap_or_else(|| "cmd.exe".into()));
+            if executable.as_os_str().is_empty()
+                || executable.as_os_str().len() > MAX_LAUNCHER_PATH_BYTES
+            {
+                return Err(ShellLauncherError::InvalidPath);
+            }
+            Ok(Self { executable })
+        }
+    }
+
+    #[cfg(unix)]
+    async fn select_bash(configured: Option<&Path>) -> Result<Self, ShellLauncherError> {
+        if let Some(path) = configured {
+            return Self::bind_bash(path).await;
+        }
+        for path in DEFAULT_BASH_EXECUTABLES {
+            match Self::bind_bash(Path::new(path)).await {
+                Ok(launcher) => return Ok(launcher),
+                Err(ShellLauncherError::Unavailable) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Err(ShellLauncherError::Unavailable)
+    }
+
+    #[cfg(unix)]
+    async fn bind_bash(path: &Path) -> Result<Self, ShellLauncherError> {
+        if !path.is_absolute() || path.as_os_str().len() > MAX_LAUNCHER_PATH_BYTES {
+            return Err(ShellLauncherError::InvalidPath);
+        }
+        let executable = tokio::fs::canonicalize(path)
+            .await
+            .map_err(|_| ShellLauncherError::Unavailable)?;
+        if executable.as_os_str().len() > MAX_LAUNCHER_PATH_BYTES {
+            return Err(ShellLauncherError::InvalidPath);
+        }
+        let metadata = tokio::fs::metadata(&executable)
+            .await
+            .map_err(|_| ShellLauncherError::Unavailable)?;
+        Ok(Self {
+            executable,
+            identity: BashExecutableIdentity::from_metadata(&metadata)?,
+        })
+    }
+
+    pub(crate) fn bash_executable(&self) -> Option<&Path> {
+        #[cfg(unix)]
+        {
+            Some(&self.executable)
+        }
+        #[cfg(windows)]
+        {
+            None
+        }
+    }
+
+    pub(crate) async fn revalidate(&self) -> Result<(), ShellLauncherError> {
+        #[cfg(unix)]
+        {
+            let metadata = tokio::fs::metadata(&self.executable)
+                .await
+                .map_err(|_| ShellLauncherError::Changed)?;
+            if BashExecutableIdentity::from_metadata(&metadata).as_ref() != Ok(&self.identity) {
+                return Err(ShellLauncherError::Changed);
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn bash_startup_assumptions(&self) -> Option<BashContextAssumptions> {
+        self.bash_executable().map(|_| BashContextAssumptions {
+            startup_preserves_cwd: true,
+            no_aliases_functions_or_command_not_found_hook: true,
+            no_traps: true,
+            default_shell_options: true,
+            standard_builtins: true,
+            directory_variables_are_standard: true,
+            cdpath_empty: true,
+            lastpipe_disabled: true,
+            logical_pwd_matches_initial: true,
+        })
+    }
+}
+
+pub(crate) fn retained_launcher_bytes(launcher: &SharedShellLauncher) -> usize {
+    size_of::<Result<ShellLauncher, ShellLauncherError>>()
+        .saturating_add(ARC_COUNTER_BYTES)
+        .saturating_add(
+            launcher
+                .as_ref()
+                .as_ref()
+                .map_or(0, |launcher| launcher.executable.capacity()),
+        )
+}
+
+#[cfg(unix)]
+pub(crate) fn platform_command(launcher: &ShellLauncher, script: &str) -> Command {
+    let mut command = Command::new(&launcher.executable);
+    command.args(BASH_ARGUMENTS).arg(script);
     clean_environment(&mut command);
     // A dedicated group lets cancellation target descendants that inherited the shell's group.
     command.as_std_mut().process_group(0);
     command
 }
 #[cfg(windows)]
-pub(crate) fn platform_command(script: &str) -> Command {
-    let mut command = Command::new(std::env::var_os("ComSpec").unwrap_or_else(|| "cmd.exe".into()));
+pub(crate) fn platform_command(launcher: &ShellLauncher, script: &str) -> Command {
+    let mut command = Command::new(&launcher.executable);
     command.arg("/D").arg("/S").arg("/C").arg(script);
     clean_environment(&mut command);
     command
@@ -176,7 +362,80 @@ pub(crate) fn exit_signal(_status: &ExitStatus) -> Option<i32> {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsStr;
+
     use super::*;
+
+    const LAUNCH_CANARY: &str = "echo launcher-canary";
+    const STARTUP_ENVIRONMENT: &[(&str, &str)] = &[
+        ("WORKCELL_BASH_EXECUTABLE", "/host/bash"),
+        ("BASH_ENV", "startup-canary"),
+        ("ENV", "startup-canary"),
+        ("SHELLOPTS", "errexit:functrace:noclobber:posix:xtrace"),
+        ("BASHOPTS", "expand_aliases:extdebug:lastpipe"),
+        ("BASH_COMPAT", "42"),
+        ("BASH_FUNC_cd%%", "() { builtin cd /; }"),
+        (
+            "BASH_FUNC_command_not_found_handle%%",
+            "() { builtin cd /; }",
+        ),
+        ("CDPATH", "/outside"),
+        ("PWD", "/outside"),
+        ("OLDPWD", "/outside"),
+        ("PROMPT_COMMAND", "cd /"),
+        ("PS4", "$(cd /)"),
+    ];
+
+    #[tokio::test]
+    async fn startup_trust_matches_the_actual_platform_launcher() {
+        let launcher = ShellLauncher::from_host().await.unwrap();
+        let command = platform_command(&launcher, LAUNCH_CANARY);
+        let arguments: Vec<_> = command.as_std().get_args().collect();
+        assert_eq!(launcher.bash_startup_assumptions().is_some(), cfg!(unix));
+        assert_eq!(
+            command.as_std().get_program(),
+            launcher.executable.as_os_str()
+        );
+        #[cfg(unix)]
+        {
+            assert!(launcher.bash_executable().unwrap().is_absolute());
+            assert_eq!(
+                arguments,
+                ["--noprofile", "--norc", "-c", LAUNCH_CANARY].map(OsStr::new)
+            );
+        }
+        #[cfg(windows)]
+        assert_eq!(arguments, ["/D", "/S", "/C", LAUNCH_CANARY].map(OsStr::new));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn explicit_host_bash_selection_is_absolute_executable_and_authoritative() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("missing-bash");
+        let file = directory.path().join("not-executable");
+        tokio::fs::write(&file, b"not executable").await.unwrap();
+        for (path, expected) in [
+            (Path::new("bash"), ShellLauncherError::InvalidPath),
+            (Path::new(""), ShellLauncherError::InvalidPath),
+            (missing.as_path(), ShellLauncherError::Unavailable),
+            (file.as_path(), ShellLauncherError::NotExecutable),
+            (directory.path(), ShellLauncherError::NotExecutable),
+        ] {
+            assert_eq!(
+                ShellLauncher::select_bash(Some(path)).await.err(),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn startup_files_options_functions_and_directory_variables_are_not_inherited() {
+        let inherited = child_environment(STARTUP_ENVIRONMENT);
+        for (forbidden, _) in STARTUP_ENVIRONMENT {
+            assert!(inherited.iter().all(|(name, _)| name != forbidden));
+        }
+    }
 
     /// Resolve the child environment from a fixture instead of the real process environment, which
     /// cannot be mutated from a test without `unsafe` under edition 2024.

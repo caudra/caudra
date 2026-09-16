@@ -32,6 +32,7 @@ use crate::{
 };
 
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+const PREPARED_DIRECTORY_REQUIRED: &str = "Directory listing requires a prepared directory read";
 // This is a protocol compatibility bound, not a deployment tuning default.
 pub(crate) const MCP_RAW_RESULT_CEILING_BYTES: usize = 64_000;
 const TRANSPORT_FRAME_DELIMITER_BYTES: usize = 1;
@@ -198,15 +199,19 @@ impl FileToolGroup {
         } = prepared;
         self.core.revalidate_resource(&resource).await?;
         self.core
-            .file_read_prepared(
-                resource.path,
-                resource.requested_path,
-                relative_path,
-                offset,
-                limit,
-                token,
-            )
+            .file_read_prepared(resource, relative_path, offset, limit, token)
             .await
+    }
+
+    pub async fn execute_prepared_directory_read(
+        &self,
+        prepared: PreparedFileRead,
+        token: &CancellationToken,
+    ) -> Result<FileReadOutput, FilesystemError> {
+        if prepared.resource().access != FileResourceAccess::Traverse {
+            return Err(FilesystemError::message(PREPARED_DIRECTORY_REQUIRED));
+        }
+        self.execute_prepared_read(prepared, token).await
     }
 
     pub async fn file_glob(
