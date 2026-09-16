@@ -27,7 +27,9 @@ use caudra_agent::{
 };
 use caudra_config::ModelPolicy;
 use caudra_lua::EventHandle;
-use caudra_providers::{AgentError, HistoryItem, Message, Model, ModelPurpose, RequestOptions};
+use caudra_providers::{
+    AgentError, CacheKey, HistoryItem, Message, Model, ModelPurpose, RequestOptions,
+};
 use caudra_storage::id::SessionRef;
 use caudra_storage::local_documents::LocalDocumentStore;
 use caudra_workspace::WorkspaceSession;
@@ -555,6 +557,7 @@ impl AgentLoop {
                 tool_output_lines: self.tool_output_lines,
                 permissions: Arc::clone(&self.permissions),
                 session_id: self.session_id.clone(),
+                cache_key: self.session_id.as_ref().map(CacheKey::session),
                 workspace_session: self.workspace_session.clone(),
                 remote_project_context: self.remote_project_context.clone(),
                 local_documents: self.local_documents.clone(),

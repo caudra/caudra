@@ -12,12 +12,21 @@ use tracing::{debug, warn};
 use crate::model::Model;
 use crate::providers::ResolvedAuth;
 use crate::{
-    AgentError, ContentBlock, Message, ProviderEvent, ResponsesReasoning, Role, StopReason,
-    StreamResponse, ThinkingConfig, TokenUsage,
+    AgentError, CacheKey, ContentBlock, Message, ProviderEvent, ResponsesReasoning, Role,
+    StopReason, StreamResponse, ThinkingConfig, TokenUsage,
 };
 
 const RESPONSES_PATH: &str = "/responses";
 pub(crate) const ENCRYPTED_REASONING: &str = "reasoning.encrypted_content";
+pub(crate) const PROMPT_CACHE_KEY_FIELD: &str = "prompt_cache_key";
+
+/// Routes the request to the cache holding this conversation. The field is
+/// part of OpenAI's Responses and Chat Completions APIs alike.
+pub(crate) fn apply_prompt_cache_key(body: &mut Value, cache_key: Option<&CacheKey>) {
+    if let Some(cache_key) = cache_key {
+        body[PROMPT_CACHE_KEY_FIELD] = json!(cache_key.as_str());
+    }
+}
 
 pub(crate) fn build_body(
     model: &Model,
@@ -798,6 +807,7 @@ mod tests {
         "a provider outage reported over SSE must stay retryable end to end";
     const STEERING_TEXT: &str = "Continue with a useful response.";
     const STEERING_RULE: &str = "empty_output";
+    const CACHE_KEY: &str = "session/task";
     const INVALID_CALL_ID: &str = "original-invalid-call";
     const VALID_CALL_ID: &str = "original-valid-call";
     const TOOL_NAME: &str = "read";
@@ -1140,6 +1150,19 @@ data: {\"response\":{\"status\":\"incomplete\",\"usage\":{\"input_tokens\":10,\"
                 matches!(&resp.message.content[0], ContentBlock::Text { text } if text == "partial")
             );
         })
+    }
+
+    #[test]
+    fn prompt_cache_key_is_written_only_when_the_request_has_one() {
+        let key = CacheKey::task(None, CACHE_KEY);
+        let mut keyed = json!({});
+        let mut unkeyed = json!({});
+
+        apply_prompt_cache_key(&mut keyed, Some(&key));
+        apply_prompt_cache_key(&mut unkeyed, None);
+
+        assert_eq!(keyed[PROMPT_CACHE_KEY_FIELD], CACHE_KEY);
+        assert!(unkeyed.get(PROMPT_CACHE_KEY_FIELD).is_none());
     }
 
     #[test]

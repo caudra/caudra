@@ -1,6 +1,5 @@
 use std::sync::{Arc, Mutex};
 
-use caudra_storage::id::SessionRef;
 use flume::Sender;
 use futures::future::join_all;
 use serde::Deserialize;
@@ -11,7 +10,7 @@ use caudra_config::providers::Protocol;
 
 use crate::model::Model;
 use crate::provider::{BoxFuture, Provider};
-use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
+use crate::{AgentError, CacheKey, Message, ProviderEvent, RequestOptions, StreamResponse};
 
 use super::openai::responses;
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
@@ -135,7 +134,7 @@ impl Provider for LocalEndpoint {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        _session_id: Option<&'a SessionRef>,
+        _cache_key: Option<&'a CacheKey>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let auth = self.auth.lock().unwrap().clone();

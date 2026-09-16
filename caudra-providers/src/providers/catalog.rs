@@ -24,7 +24,6 @@ use tracing::{debug, warn};
 
 use caudra_storage::StateDir;
 use caudra_storage::auth::load_provider_credentials;
-use caudra_storage::id::SessionRef;
 
 use caudra_storage::thinking::ReasoningOptions;
 
@@ -33,7 +32,7 @@ use crate::provider::{BoxFuture, Provider};
 use crate::providers::anthropic::shared;
 use crate::providers::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 use crate::providers::{ResolvedAuth, Timeouts, http_client};
-use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
+use crate::{AgentError, CacheKey, Message, ProviderEvent, RequestOptions, StreamResponse};
 
 const MESSAGES_PATH: &str = "/messages";
 
@@ -755,7 +754,7 @@ impl Provider for CatalogProvider {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        _session_id: Option<&'a SessionRef>,
+        _cache_key: Option<&'a CacheKey>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let auth = match &self.auth {
@@ -913,12 +912,12 @@ impl Provider for LazyCatalogProvider {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        session_id: Option<&'a SessionRef>,
+        cache_key: Option<&'a CacheKey>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             self.resolve()
                 .await?
-                .stream_message(model, messages, system, tools, event_tx, opts, session_id)
+                .stream_message(model, messages, system, tools, event_tx, opts, cache_key)
                 .await
         })
     }

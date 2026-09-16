@@ -10,7 +10,6 @@ use caudra_providers::{
     AgentError, Billing, ContentBlock, Message, Model, ModelPurpose, RequestOptions, Timeouts,
     TokenUsage,
 };
-use caudra_storage::id::SessionRef;
 use caudra_storage::sessions::{StoredActiveGoal, StoredGoalVerdict};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -481,7 +480,6 @@ pub(crate) struct Evaluator<'a> {
     pub evaluation: u32,
     pub event_tx: &'a EventSender,
     pub cancel: &'a CancelToken,
-    pub session_id: Option<&'a SessionRef>,
 }
 
 impl Evaluator<'_> {
@@ -511,7 +509,6 @@ impl Evaluator<'_> {
                 crate::prompt::GOAL_EVALUATOR,
                 self.event_tx,
                 self.cancel,
-                self.session_id,
             )
             .await
             {
@@ -579,7 +576,6 @@ async fn evaluator_request(
     system: &str,
     event_tx: &EventSender,
     cancel: &CancelToken,
-    session_id: Option<&SessionRef>,
 ) -> Result<caudra_providers::StreamResponse, AgentError> {
     let tools = json!([]);
     let request = stream_silent_with_retry(
@@ -591,7 +587,7 @@ async fn evaluator_request(
         Some(event_tx),
         cancel,
         RequestOptions::default(),
-        session_id,
+        None,
     );
     let result = request.await.map_err(Into::into);
     event_tx.send(AgentEvent::PromptProgress {
@@ -835,7 +831,7 @@ mod tests {
     use super::*;
     use caudra_providers::provider::BoxFuture;
     use caudra_providers::{
-        ImageMediaType, ImageSource, ModelInfo, ProviderEvent, Role, StreamResponse,
+        CacheKey, ImageMediaType, ImageSource, ModelInfo, ProviderEvent, Role, StreamResponse,
     };
     use serde_json::Value;
     use test_case::test_case;
@@ -866,7 +862,7 @@ mod tests {
             _: &'a Value,
             _: &'a flume::Sender<ProviderEvent>,
             _: RequestOptions,
-            _: Option<&'a SessionRef>,
+            _: Option<&'a CacheKey>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async { unimplemented!() })
         }
@@ -885,7 +881,7 @@ mod tests {
             _: &'a Value,
             event_tx: &'a flume::Sender<ProviderEvent>,
             _: RequestOptions,
-            _: Option<&'a SessionRef>,
+            _: Option<&'a CacheKey>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async {
                 event_tx.send(ProviderEvent::PromptProgress {
@@ -942,7 +938,6 @@ mod tests {
                 "system",
                 &event_tx,
                 &CancelToken::none(),
-                None,
             )
             .await
             .unwrap();

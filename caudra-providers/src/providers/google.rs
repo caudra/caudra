@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use caudra_storage::id::{CaudraId, SessionRef};
+use caudra_storage::id::CaudraId;
 use flume::Sender;
 use futures_lite::io::{AsyncBufReadExt, BufReader};
 use isahc::{AsyncReadResponseExt, HttpClient, Request};
@@ -12,7 +12,7 @@ use tracing::warn;
 use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, StaticReasoningOption};
 use crate::provider::{BoxFuture, Provider};
 use crate::{
-    AgentError, ContentBlock, Message, ProviderEvent, RequestOptions, Role, StopReason,
+    AgentError, CacheKey, ContentBlock, Message, ProviderEvent, RequestOptions, Role, StopReason,
     StreamResponse, ThinkingConfig, TokenUsage,
 };
 
@@ -256,7 +256,7 @@ impl Provider for Google {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        _session_id: Option<&'a SessionRef>,
+        _cache_key: Option<&'a CacheKey>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(self.do_stream(model, messages, system, tools, event_tx, opts.thinking))
     }

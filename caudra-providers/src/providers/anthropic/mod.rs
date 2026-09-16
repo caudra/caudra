@@ -11,7 +11,6 @@ use std::time::{Duration, Instant};
 
 use caudra_storage::StateDir;
 use caudra_storage::auth::OAuthTokens;
-use caudra_storage::id::SessionRef;
 use caudra_storage::log::{outcome, target};
 use flume::Sender;
 use futures_lite::io::{AsyncBufReadExt, BufReader};
@@ -24,7 +23,8 @@ use tracing::{debug, info, warn};
 use crate::model::{Billing, Model};
 use crate::provider::{BoxFuture, Provider};
 use crate::{
-    AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse, UsageLimit,
+    AgentError, CacheKey, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse,
+    UsageLimit,
 };
 
 use super::KeyPool;
@@ -722,7 +722,7 @@ impl Anthropic {
         body: &Value,
         event_tx: &Sender<ProviderEvent>,
         fast: bool,
-        session_id: Option<&SessionRef>,
+        cache_key: Option<&CacheKey>,
         oauth_tool_names: Option<&HashMap<String, String>>,
     ) -> Result<StreamResponse, AgentError> {
         let json_body = serde_json::to_vec(body)?;
@@ -738,7 +738,7 @@ impl Anthropic {
                 oauth,
                 "POST",
                 path,
-                session_id.map(SessionRef::as_str),
+                cache_key.map(CacheKey::as_str),
             )
             .header("content-type", "application/json");
         let mut betas = Vec::new();
@@ -899,7 +899,7 @@ impl Provider for Anthropic {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        session_id: Option<&'a SessionRef>,
+        cache_key: Option<&'a CacheKey>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let auth_snapshot = self.auth_for_request().await?;
@@ -949,7 +949,7 @@ impl Provider for Anthropic {
             if !oauth {
                 let attempted_credential = auth_credential(&auth_snapshot.resolved);
                 let result = self
-                    .do_stream_request(&auth_snapshot, &body, event_tx, fast, session_id, None)
+                    .do_stream_request(&auth_snapshot, &body, event_tx, fast, cache_key, None)
                     .await;
                 if matches!(&result, Err(error) if error.is_auth_error()) {
                     self.mark_auth_rejected(attempted_credential);
@@ -966,7 +966,7 @@ impl Provider for Anthropic {
                         &body,
                         &relay_tx,
                         fast,
-                        session_id,
+                        cache_key,
                         oauth_tool_names.as_ref(),
                     )
                     .await;
@@ -999,7 +999,7 @@ impl Provider for Anthropic {
                         &body,
                         event_tx,
                         fast,
-                        session_id,
+                        cache_key,
                         oauth_tool_names.as_ref(),
                     )
                     .await;

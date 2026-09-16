@@ -11,8 +11,7 @@ use crate::manifest::{ManifestRegistry, ProviderManifest};
 use crate::model::{Model, ModelEntry, ModelInfo, ModelPricing, ThinkingSupport, lookup_entry};
 use crate::provider::{BoxFuture, Provider, ProviderKind};
 use crate::providers::anthropic::shared::declares_input_budget;
-use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
-use caudra_storage::id::SessionRef;
+use crate::{AgentError, CacheKey, Message, ProviderEvent, RequestOptions, StreamResponse};
 
 use super::anthropic::Anthropic;
 use super::deepseek::DeepSeek;
@@ -423,7 +422,7 @@ impl Provider for Aperture {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        session_id: Option<&'a SessionRef>,
+        cache_key: Option<&'a CacheKey>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let (provider_id, model_id) = model.id.split_once('/').unwrap_or(("", &model.id));
@@ -442,7 +441,7 @@ impl Provider for Aperture {
                         tools,
                         event_tx,
                         opts,
-                        session_id,
+                        cache_key,
                     )
                     .await;
             }

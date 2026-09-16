@@ -609,7 +609,11 @@ mod tests {
             assert!(!done.is_error, "{}", done.output.as_text());
             assert!(matches!(done.output, ToolOutput::Markdown(_)), "{RENDERED}");
             assert_eq!(done.output.as_text(), PLAN, "{RENDERED}");
-            assert_eq!(done.model_output.as_deref(), Some(WRITE_RECEIPT), "{RENDERED}");
+            assert_eq!(
+                done.model_output.as_deref(),
+                Some(WRITE_RECEIPT),
+                "{RENDERED}"
+            );
             // The marker the transcript recognises a plan write by has to
             // survive the change of output type.
             assert!(done.wrote_document(&LocalDocumentRef::Plan(plan)));

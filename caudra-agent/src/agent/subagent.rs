@@ -18,7 +18,7 @@ use caudra_providers::model::{Model, ModelPurpose};
 use caudra_providers::model_registry::Binding;
 use caudra_providers::provider;
 use caudra_providers::{
-    HistoryItem, Message, ThinkingConfig, TokenUsage, add_cost, expand_message,
+    CacheKey, HistoryItem, Message, ThinkingConfig, TokenUsage, add_cost, expand_message,
 };
 use caudra_storage::id::CaudraId;
 
@@ -1049,6 +1049,7 @@ fn build(
             tool_output_lines: caudra_config::ToolOutputLines::default(),
             permissions: Arc::clone(&ctx.permissions),
             session_id: ctx.session_id.clone(),
+            cache_key: Some(CacheKey::task(ctx.session_id.as_ref(), &resolved.task_id)),
             workspace_session: ctx.workspace_session.clone(),
             remote_project_context: ctx.remote_project_context.clone(),
             local_documents: ctx.local_documents.clone(),
@@ -1133,6 +1134,7 @@ mod tests {
     use crate::tools::test_support::NamedMock;
     use crate::{BatchToolStatus, ToolDoneEvent, TurnCompleteEvent};
     use caudra_providers::{Billing, ContentBlock, Message, Role};
+    use caudra_storage::id::SessionRef;
     use caudra_storage::usage_ledger::LedgerPurpose;
     use test_case::test_case;
 
@@ -1391,6 +1393,33 @@ mod tests {
             assert!(store.latest(&ContextKey::task(PARENT_ID)).is_none());
             assert!(store.latest(&ContextKey::Main).is_none());
             subagent.close();
+        });
+    }
+
+    /// Siblings must not fight over the parent's cache slot, so each is keyed
+    /// by the task it actually reserved.
+    #[test]
+    fn each_subagent_is_cache_keyed_by_its_own_task_within_the_session() {
+        smol::block_on(async {
+            let mut ctx =
+                crate::tools::test_support::stub_ctx_with(&AgentMode::Build, None, Some(PARENT_ID));
+            let session = SessionRef::generate();
+            ctx.session_id = Some(session.clone());
+            let mut first = open_generic(&ctx, generic_options()).await.unwrap();
+            let mut second = open_generic(&ctx, generic_options()).await.unwrap();
+
+            let keys = [&first, &second].map(|subagent| {
+                assert_eq!(
+                    subagent.params.cache_key,
+                    Some(CacheKey::task(Some(&session), subagent.id()))
+                );
+                subagent.params.cache_key.clone().unwrap()
+            });
+
+            assert_ne!(keys[0], keys[1]);
+            assert!(keys.iter().all(|key| *key != CacheKey::session(&session)));
+            first.close();
+            second.close();
         });
     }
 

@@ -881,8 +881,7 @@ fn scan_open_tail(text: &str) -> OpenTail {
                 // with, right at the end, is its own closer still arriving:
                 // `***both**` is not bold `*both`, it is bold-italic `both`
                 // one star short.
-                if close + delim_len >= bytes.len()
-                    && count_run(bytes, pos, bytes[pos]) > delim_len
+                if close + delim_len >= bytes.len() && count_run(bytes, pos, bytes[pos]) > delim_len
                 {
                     return OpenTail::Truncate(close);
                 }

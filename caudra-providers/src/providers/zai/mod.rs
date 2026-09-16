@@ -1,7 +1,6 @@
 use std::sync::{Arc, Mutex};
 
 use caudra_config::providers::{BuiltInProvider, Protocol, ProviderPlan};
-use caudra_storage::id::SessionRef;
 use flume::Sender;
 use serde::Deserialize;
 use serde_json::Value;
@@ -11,7 +10,8 @@ use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ThinkingSupport
 use crate::provider::{BoxFuture, Provider};
 use crate::providers::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 use crate::{
-    AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse, UsageLimit,
+    AgentError, CacheKey, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse,
+    UsageLimit,
 };
 
 use super::{KeyPool, ResolvedAuth};
@@ -308,7 +308,7 @@ impl Provider for Zai {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        _session_id: Option<&'a SessionRef>,
+        _cache_key: Option<&'a CacheKey>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let auth = self.auth.lock().unwrap().clone();

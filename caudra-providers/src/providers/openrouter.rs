@@ -1,6 +1,5 @@
 use std::sync::{Arc, Mutex};
 
-use caudra_storage::id::SessionRef;
 use caudra_storage::thinking::EFFORT_NONE;
 use flume::Sender;
 use serde_json::{Value, json};
@@ -8,8 +7,8 @@ use serde_json::{Value, json};
 use crate::model::{Model, ModelEntry, ModelInfo, ModelPricing};
 use crate::provider::{BoxFuture, Provider};
 use crate::{
-    AgentError, Message, ProviderEvent, ReasoningOption, ReasoningOptions, RequestOptions,
-    StreamResponse,
+    AgentError, CacheKey, Message, ProviderEvent, ReasoningOption, ReasoningOptions,
+    RequestOptions, StreamResponse,
 };
 
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
@@ -176,7 +175,7 @@ impl Provider for OpenRouter {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        session_id: Option<&'a SessionRef>,
+        cache_key: Option<&'a CacheKey>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let auth = self.auth.lock().unwrap().clone();
@@ -192,8 +191,8 @@ impl Provider for OpenRouter {
                 body["reasoning"] = json!({"effort": effort});
             }
 
-            if let Some(sid) = session_id {
-                body["session_id"] = json!(sid.to_string());
+            if let Some(cache_key) = cache_key {
+                body["session_id"] = json!(cache_key.as_str());
             }
 
             let extra_headers = [("HTTP-Referer", REFERER), ("X-OpenRouter-Title", APP_TITLE)];

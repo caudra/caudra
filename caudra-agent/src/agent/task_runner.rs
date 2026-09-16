@@ -718,8 +718,8 @@ mod tests {
 
     use caudra_config::steering::SteeringModelConfig;
     use caudra_providers::{
-        AgentError, ContentBlock, Message, ProviderEvent, Role, StopReason, StreamResponse,
-        TokenUsage,
+        AgentError, CacheKey, ContentBlock, Message, ProviderEvent, Role, StopReason,
+        StreamResponse, TokenUsage,
     };
     use serde_json::json;
     use test_case::test_case;
@@ -1331,7 +1331,7 @@ mod tests {
             _: &'a Value,
             events: &'a flume::Sender<ProviderEvent>,
             _: RequestOptions,
-            _: Option<&'a SessionRef>,
+            _: Option<&'a CacheKey>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async move {
                 self.requests.lock().unwrap().push(messages.to_vec());

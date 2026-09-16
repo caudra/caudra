@@ -443,10 +443,10 @@ mod tests {
 
     use caudra_providers::provider::{BoxFuture, Provider};
     use caudra_providers::{
-        ContentBlock, Message, Model, ProviderEvent, RequestOptions, Role, StopReason,
+        CacheKey, ContentBlock, Message, Model, ProviderEvent, RequestOptions, Role, StopReason,
         StreamResponse, TokenUsage,
     };
-    use caudra_storage::id::{CaudraId, SessionRef};
+    use caudra_storage::id::CaudraId;
     use caudra_storage::tool_outputs::ToolOutputRef;
     use serde_json::Value;
     use test_case::test_case;
@@ -477,7 +477,7 @@ mod tests {
             _: &'a Value,
             _: &'a flume::Sender<ProviderEvent>,
             _: RequestOptions,
-            _: Option<&'a SessionRef>,
+            _: Option<&'a CacheKey>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async {
                 self.requests.lock().unwrap().push(messages.to_vec());

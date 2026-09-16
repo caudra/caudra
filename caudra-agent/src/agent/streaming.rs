@@ -5,10 +5,9 @@ use std::time::{Duration, Instant};
 use caudra_providers::provider::Provider;
 use caudra_providers::retry::{MAX_RETRIES, RetryDecision, RetryState};
 use caudra_providers::{
-    Billing, ContentBlock, MAX_TOOL_INPUT_BYTES, Message, Model, ProviderEvent, ReasoningSource,
-    RequestOptions, StopReason, StreamResponse,
+    Billing, CacheKey, ContentBlock, MAX_TOOL_INPUT_BYTES, Message, Model, ProviderEvent,
+    ReasoningSource, RequestOptions, StopReason, StreamResponse,
 };
-use caudra_storage::id::SessionRef;
 use caudra_storage::log::target;
 use serde_json::Value;
 use tracing::{info, warn};
@@ -551,7 +550,7 @@ pub(crate) async fn stream_with_retry(
     cancel: &CancelToken,
     retry_now: &Nudge,
     opts: RequestOptions,
-    session_id: Option<&SessionRef>,
+    cache_key: Option<&CacheKey>,
     speculative: Option<&Arc<SpeculativeRuns>>,
 ) -> Result<StreamResponse, StreamError> {
     stream_with_retry_inner(
@@ -565,7 +564,7 @@ pub(crate) async fn stream_with_retry(
         cancel,
         retry_now,
         opts,
-        session_id,
+        cache_key,
         speculative,
     )
     .await
@@ -581,7 +580,7 @@ pub(crate) async fn stream_silent_with_retry(
     progress_tx: Option<&EventSender>,
     cancel: &CancelToken,
     opts: RequestOptions,
-    session_id: Option<&SessionRef>,
+    cache_key: Option<&CacheKey>,
 ) -> Result<StreamResponse, StreamError> {
     stream_with_retry_inner(
         provider,
@@ -594,7 +593,7 @@ pub(crate) async fn stream_silent_with_retry(
         cancel,
         &Nudge::default(),
         opts,
-        session_id,
+        cache_key,
         None,
     )
     .await
@@ -612,7 +611,7 @@ async fn stream_with_retry_inner(
     cancel: &CancelToken,
     retry_now: &Nudge,
     opts: RequestOptions,
-    session_id: Option<&SessionRef>,
+    cache_key: Option<&CacheKey>,
     speculative: Option<&Arc<SpeculativeRuns>>,
 ) -> Result<StreamResponse, StreamError> {
     let opts = opts.clamped(model);
@@ -643,7 +642,7 @@ async fn stream_with_retry_inner(
                 tools,
                 &ptx,
                 opts.clone(),
-                session_id,
+                cache_key,
             ),
             async {
                 cancel.cancelled().await;
@@ -1169,7 +1168,7 @@ mod tests {
             _: &'a Value,
             events: &'a flume::Sender<ProviderEvent>,
             _: RequestOptions,
-            _: Option<&'a SessionRef>,
+            _: Option<&'a CacheKey>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async move {
                 if self.calls.fetch_add(1, Ordering::SeqCst) > 0 {

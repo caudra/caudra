@@ -8,7 +8,6 @@ use caudra_config::providers::{
     ModelPurpose, Protocol, ProviderDef, ProvidersConfig, resolve_api_key_env, resolve_base_url,
     resolve_protocol,
 };
-use caudra_storage::id::SessionRef;
 
 use super::ResolvedAuth;
 use super::openai::responses;
@@ -19,7 +18,9 @@ use crate::model::{
 };
 use crate::provider::{BoxFuture, Provider, ProviderKind};
 use crate::providers::Timeouts;
-use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig};
+use crate::{
+    AgentError, CacheKey, Message, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig,
+};
 
 static CUSTOM_OPENAI_CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
     // Custom providers resolve their own base URL (including any override) from
@@ -255,12 +256,29 @@ fn build_responses_body(
     system: &str,
     tools: &Value,
     thinking: &ThinkingConfig,
+    cache_key: Option<&CacheKey>,
 ) -> Value {
     let mut body = responses::build_body(model, messages, system, tools);
     responses::apply_responses_reasoning(&mut body, thinking, model);
     if let Some(max_output_tokens) = model.max_output_tokens {
         body["max_output_tokens"] = Value::from(max_output_tokens);
     }
+    responses::apply_prompt_cache_key(&mut body, cache_key);
+    body
+}
+
+fn build_chat_body(
+    compat: &OpenAiCompatProvider,
+    model: &Model,
+    messages: &[Message],
+    system: &str,
+    tools: &Value,
+    thinking: &ThinkingConfig,
+    cache_key: Option<&CacheKey>,
+) -> Value {
+    let mut body = compat.build_body(model, messages, system, tools);
+    apply_declared_effort(thinking, &mut body, model);
+    responses::apply_prompt_cache_key(&mut body, cache_key);
     body
 }
 
@@ -341,13 +359,14 @@ impl Provider for CustomOpenAiProvider {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        _session_id: Option<&'a SessionRef>,
+        cache_key: Option<&'a CacheKey>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let auth = self.auth.lock().unwrap().clone();
 
             if self.protocol == Protocol::OpenaiResponses {
-                let body = build_responses_body(model, messages, system, tools, &opts.thinking);
+                let body =
+                    build_responses_body(model, messages, system, tools, &opts.thinking, cache_key);
                 return responses::do_stream(
                     self.compat.client(),
                     model,
@@ -359,8 +378,15 @@ impl Provider for CustomOpenAiProvider {
                 .await;
             }
 
-            let mut body = self.compat.build_body(model, messages, system, tools);
-            apply_declared_effort(&opts.thinking, &mut body, model);
+            let body = build_chat_body(
+                &self.compat,
+                model,
+                messages,
+                system,
+                tools,
+                &opts.thinking,
+                cache_key,
+            );
             self.compat
                 .do_stream(model, &[], &body, event_tx, &auth)
                 .await
@@ -389,6 +415,7 @@ mod tests {
 
     const ANTHROPIC_KEY_LEAKED: &str =
         "an OpenAI-compatible body must never carry Anthropic's `thinking` key";
+    const CACHE_KEY: &str = "session/task";
 
     fn openai_def(model_id: &str) -> ProviderDef {
         serde_json::from_str(&format!(
@@ -605,6 +632,7 @@ mod tests {
             "system",
             &Value::Null,
             &ThinkingConfig::Effort("xhigh".into()),
+            None,
         );
 
         assert_eq!(body["store"], false);
@@ -613,5 +641,32 @@ mod tests {
         assert_eq!(body["input"][0]["type"], "message");
         assert_eq!(body["input"][0]["content"][0]["text"], "hello");
         assert!(body.get("previous_response_id").is_none());
+    }
+
+    /// A custom endpoint is OpenAI-compatible by declaration, so both wire
+    /// shapes carry the conversation key an OpenAI server routes caches by.
+    #[test_case::test_case(true ; "responses")]
+    #[test_case::test_case(false ; "chat_completions")]
+    fn custom_bodies_carry_the_conversation_cache_key(responses: bool) {
+        let model = model_from_def(
+            &openai_def("m"),
+            ProviderKind::OpenAi,
+            "cache-key-test",
+            "m",
+        );
+        let compat = OpenAiCompatProvider::new(&CUSTOM_OPENAI_CONFIG, Timeouts::default());
+        let key = CacheKey::task(None, CACHE_KEY);
+        let thinking = ThinkingConfig::Off;
+
+        let [keyed, unkeyed] = [Some(&key), None].map(|cache_key| {
+            if responses {
+                build_responses_body(&model, &[], "", &Value::Null, &thinking, cache_key)
+            } else {
+                build_chat_body(&compat, &model, &[], "", &Value::Null, &thinking, cache_key)
+            }
+        });
+
+        assert_eq!(keyed[responses::PROMPT_CACHE_KEY_FIELD], CACHE_KEY);
+        assert!(unkeyed.get(responses::PROMPT_CACHE_KEY_FIELD).is_none());
     }
 }

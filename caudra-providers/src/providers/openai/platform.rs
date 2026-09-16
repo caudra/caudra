@@ -3,7 +3,6 @@ use std::sync::{Arc, Mutex};
 
 use caudra_storage::StateDir;
 use caudra_storage::auth::OAuthTokens;
-use caudra_storage::id::SessionRef;
 use caudra_storage::log::{outcome, target};
 use flume::Sender;
 use serde::Deserialize;
@@ -13,10 +12,12 @@ use tracing::{debug, info, warn};
 use crate::model::{Billing, Model, ModelInfo};
 use crate::provider::{BoxFuture, Provider};
 use crate::{
-    AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse, UsageLimit,
+    AgentError, CacheKey, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse,
+    UsageLimit,
 };
 
 use super::auth;
+use super::responses::apply_prompt_cache_key;
 use crate::providers::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 use crate::providers::{ResolvedAuth, catalog};
 
@@ -49,6 +50,9 @@ const CODEX_PLAN_CONTEXT_WINDOW: u32 = 272_000;
 /// window, so this only ever narrows what the static table already declared.
 const WIDE_PLAN_CONTEXT_WINDOW: u32 = 372_000;
 const USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
+/// The header the Codex backend derives cache affinity from; Codex CLI sends
+/// its thread id here alongside the body's `prompt_cache_key`.
+const CODEX_SESSION_HEADER: &str = "session-id";
 const EMPTY_USAGE_ERROR: &str =
     "OpenAI usage response contained no plan or rate limits; the endpoint schema likely changed";
 const MILLIS_PER_SECOND: u64 = 1_000;
@@ -413,6 +417,18 @@ impl OpenAi {
     }
 }
 
+/// Only the Codex backend reads the affinity header; an API-key request to
+/// the platform carries the body field alone.
+fn with_codex_affinity(mut auth: ResolvedAuth, cache_key: Option<&CacheKey>) -> ResolvedAuth {
+    if auth.base_url.as_deref() == Some(auth::CODING_PLAN_BASE_URL)
+        && let Some(key) = cache_key
+    {
+        auth.headers
+            .push((CODEX_SESSION_HEADER.into(), key.as_str().into()));
+    }
+    auth
+}
+
 fn bearer_token(auth: &ResolvedAuth) -> Option<String> {
     auth.headers.iter().find_map(|(key, value)| {
         key.eq_ignore_ascii_case("authorization")
@@ -500,7 +516,7 @@ impl Provider for OpenAi {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        _session_id: Option<&'a SessionRef>,
+        cache_key: Option<&'a CacheKey>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let mut buf = String::new();
@@ -509,10 +525,12 @@ impl Provider for OpenAi {
             if is_codex_model(&model.id) {
                 let mut body = super::responses::build_body(model, messages, system, tools);
                 super::responses::apply_responses_reasoning(&mut body, &opts.thinking, model);
+                apply_prompt_cache_key(&mut body, cache_key);
                 let stream_timeout = self.compat.stream_timeout();
                 return self
                     .with_oauth_stream_retry(true, event_tx, |codex_auth, attempt_tx| {
                         let body = body.clone();
+                        let codex_auth = with_codex_affinity(codex_auth, cache_key);
                         async move {
                             super::responses::do_stream(
                                 self.compat.client(),
@@ -530,6 +548,7 @@ impl Provider for OpenAi {
 
             let mut body = self.compat.build_body(model, messages, system, tools);
             opts.thinking.apply_reasoning_effort(&mut body, model);
+            apply_prompt_cache_key(&mut body, cache_key);
             self.with_oauth_stream_retry(false, event_tx, |auth, attempt_tx| {
                 let body = body.clone();
                 async move {
@@ -658,6 +677,7 @@ mod tests {
     const TEST_REFRESH: &str = "test-refresh";
     const TEST_AUTH_STATUS: u16 = 401;
     const TEST_AUTH_ERROR: &str = "expired";
+    const CACHE_KEY: &str = "session/task";
     const MISSING_PLAN_MODEL: &str =
         "a model named in PLAN_MODELS must reach the coding-plan listing";
     const UNENTITLED_PLAN_MODEL: &str =
@@ -667,6 +687,42 @@ mod tests {
 
     fn effort(level: &str) -> ThinkingConfig {
         ThinkingConfig::Effort(level.into())
+    }
+
+    fn oauth_tokens() -> OAuthTokens {
+        OAuthTokens {
+            access: TEST_ACCESS.into(),
+            refresh: TEST_REFRESH.into(),
+            expires: u64::MAX,
+            account_id: None,
+        }
+    }
+
+    fn session_header(auth: &ResolvedAuth) -> Option<&str> {
+        auth.headers
+            .iter()
+            .find(|(name, _)| name == CODEX_SESSION_HEADER)
+            .map(|(_, value)| value.as_str())
+    }
+
+    #[test_case(true, true, Some(CACHE_KEY) ; "codex_backend_routes_by_the_key")]
+    #[test_case(true, false, None ; "codex_backend_without_a_key")]
+    #[test_case(false, true, None ; "api_key_platform_never_gets_the_header")]
+    fn codex_affinity_header_follows_the_cache_key(
+        coding_plan: bool,
+        keyed: bool,
+        expected: Option<&str>,
+    ) {
+        let auth = if coding_plan {
+            auth::build_coding_plan_resolved(&oauth_tokens())
+        } else {
+            ResolvedAuth::bearer(TEST_ACCESS)
+        };
+        let key = keyed.then(|| CacheKey::task(None, CACHE_KEY));
+
+        let auth = with_codex_affinity(auth, key.as_ref());
+
+        assert_eq!(session_header(&auth), expected);
     }
 
     #[test_case("gpt-6-astra")]

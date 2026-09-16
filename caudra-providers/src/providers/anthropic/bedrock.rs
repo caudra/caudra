@@ -5,7 +5,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
-use caudra_storage::id::SessionRef;
 use flume::Sender;
 use hmac::{Hmac, KeyInit, Mac};
 use isahc::config::{Configurable, VersionNegotiation};
@@ -16,7 +15,7 @@ use tracing::{debug, warn};
 
 use crate::model::Model;
 use crate::provider::{BoxFuture, Provider};
-use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
+use crate::{AgentError, CacheKey, Message, ProviderEvent, RequestOptions, StreamResponse};
 
 use super::shared;
 use super::shared::hex_encode;
@@ -519,7 +518,7 @@ impl Provider for Bedrock {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        _session_id: Option<&'a SessionRef>,
+        _cache_key: Option<&'a CacheKey>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             if self.needs_refresh() {

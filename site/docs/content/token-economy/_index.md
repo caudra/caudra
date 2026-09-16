@@ -100,6 +100,8 @@ A rate of `—` means the provider reported no prompt tokens for that row, which
 
 Both scopes of `/usage` score each model and, once two providers served the work, each provider. `caudra storage usage` prints the same column, and `--json` carries it as `cache_hit_rate`.
 
+Some providers keep a cache per machine and route a request by a key the client supplies. Caudra sends one per conversation: the session id for the main agent, and `session/task` for a subagent, so siblings never compete for the parent's cache. Title, goal evaluator, and tool-repair requests have their own system prompt and send no key. The key reaches OpenAI (as `prompt_cache_key`, plus the `session-id` header on a ChatGPT login), custom OpenAI-compatible endpoints, xAI, OpenRouter, Mistral, and a Claude login. It is a routing hint only, so a stale key costs a cache miss and never changes output.
+
 ## Spend on a subscription
 
 A Claude, ChatGPT, or Copilot login pays a flat monthly fee, so its turns never reach an invoice. Caudra still prices them at the provider's published API rates and files the figure separately, labelled `subscription (not billed)`. That is what the same work would have cost through the API.

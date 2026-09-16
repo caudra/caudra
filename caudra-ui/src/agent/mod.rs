@@ -671,7 +671,9 @@ mod tests {
     use caudra_agent::AgentEvent;
     use caudra_config::PermissionsConfig;
     use caudra_providers::provider::BoxFuture;
-    use caudra_providers::{AgentError, ModelInfo, ProviderEvent, RequestOptions, StreamResponse};
+    use caudra_providers::{
+        AgentError, CacheKey, ModelInfo, ProviderEvent, RequestOptions, StreamResponse,
+    };
 
     use super::*;
 
@@ -692,7 +694,7 @@ mod tests {
             _tools: &'a serde_json::Value,
             _event_tx: &'a flume::Sender<ProviderEvent>,
             _opts: RequestOptions,
-            _session_id: Option<&'a SessionRef>,
+            _cache_key: Option<&'a CacheKey>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(std::future::pending())
         }

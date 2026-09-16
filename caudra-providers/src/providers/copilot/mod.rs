@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use caudra_storage::id::SessionRef;
 use flume::Sender;
 use futures_lite::io::BufReader;
 use isahc::{AsyncReadResponseExt, HttpClient, Request};
@@ -19,8 +18,8 @@ use crate::model::{
 };
 use crate::provider::{BoxFuture, Provider};
 use crate::{
-    AgentError, Message, ProviderEvent, ReasoningOption, ReasoningOptions, RequestOptions,
-    StreamResponse, ThinkingConfig,
+    AgentError, CacheKey, Message, ProviderEvent, ReasoningOption, ReasoningOptions,
+    RequestOptions, StreamResponse, ThinkingConfig,
 };
 
 pub mod auth;
@@ -1111,7 +1110,7 @@ impl Provider for Copilot {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        _session_id: Option<&'a SessionRef>,
+        _cache_key: Option<&'a CacheKey>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let mut prefixed_system = String::new();

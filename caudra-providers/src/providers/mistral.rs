@@ -1,12 +1,11 @@
 use std::sync::{Arc, Mutex};
 
-use caudra_storage::id::SessionRef;
 use flume::Sender;
 use serde_json::{Value, json};
 
 use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ThinkingSupport};
 use crate::provider::{BoxFuture, Provider};
-use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
+use crate::{AgentError, CacheKey, Message, ProviderEvent, RequestOptions, StreamResponse};
 
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 use super::{KeyPool, ResolvedAuth};
@@ -218,7 +217,7 @@ impl Provider for Mistral {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        session_id: Option<&'a SessionRef>,
+        cache_key: Option<&'a CacheKey>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let auth = self.auth.lock().unwrap().clone();
@@ -230,8 +229,8 @@ impl Provider for Mistral {
             convert_assistant_messages_in_place(body.get_mut("messages").unwrap());
 
             let mut extra_headers = vec![];
-            if let Some(session_id) = session_id {
-                extra_headers.push(("x-affinity", session_id.as_str()));
+            if let Some(cache_key) = cache_key {
+                extra_headers.push(("x-affinity", cache_key.as_str()));
             }
             self.compat
                 .do_stream(model, &extra_headers, &body, event_tx, &auth)

@@ -9,7 +9,6 @@ use strum::{Display, EnumIter, EnumString};
 use tracing::{debug, warn};
 
 use caudra_config::ModelPolicy;
-use caudra_storage::id::SessionRef;
 
 use crate::model::{Model, ModelFamily, ModelInfo};
 use crate::providers::Timeouts;
@@ -33,8 +32,8 @@ use crate::providers::tensorx::TensorX;
 use crate::providers::xai::Xai;
 use crate::providers::zai::Zai;
 use crate::{
-    AgentError, Message, ProviderEvent, ProviderUsage, ReasoningTransport, RequestOptions,
-    StreamResponse,
+    AgentError, CacheKey, Message, ProviderEvent, ProviderUsage, ReasoningTransport,
+    RequestOptions, StreamResponse,
 };
 
 const STATIC_FALLBACK_NOTE: &str = "using static fallback";
@@ -267,7 +266,7 @@ pub trait Provider: Send + Sync {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        session_id: Option<&'a SessionRef>,
+        cache_key: Option<&'a CacheKey>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>>;
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>>;
@@ -380,7 +379,7 @@ impl Provider for UnconfiguredProvider {
         _tools: &'a Value,
         _event_tx: &'a Sender<ProviderEvent>,
         _opts: RequestOptions,
-        _session_id: Option<&'a SessionRef>,
+        _cache_key: Option<&'a CacheKey>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async {
             Err(AgentError::Config {

@@ -700,7 +700,7 @@ pub fn truncate_output(text: String, max_lines: usize, max_bytes: usize) -> Stri
     result
 }
 
-use caudra_providers::{Message, ProviderEvent, StreamResponse};
+use caudra_providers::{CacheKey, Message, ProviderEvent, StreamResponse};
 
 struct NullProvider;
 
@@ -713,7 +713,7 @@ impl Provider for NullProvider {
         _: &'a Value,
         _: &'a flume::Sender<ProviderEvent>,
         _: RequestOptions,
-        _: Option<&'a SessionRef>,
+        _: Option<&'a CacheKey>,
     ) -> BoxFuture<'a, Result<StreamResponse, crate::AgentError>> {
         Box::pin(async { unimplemented!() })
     }

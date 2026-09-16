@@ -7,7 +7,6 @@ use caudra_providers::{
     AgentError, ContentBlock, MIN_THINKING_BUDGET, Message, Model, ModelError, ModelPurpose,
     RequestOptions, Timeouts, TokenUsage,
 };
-use caudra_storage::id::SessionRef;
 use caudra_storage::sessions::{normalize_title, truncate_title};
 use serde_json::json;
 use tracing::{debug, warn};
@@ -45,17 +44,9 @@ pub async fn for_prompt(
     model_policy: &ModelPolicy,
     prompt: &str,
     cancel: &CancelToken,
-    session_id: Option<&SessionRef>,
 ) -> Result<(ResolvedTitleModel, TitleOutcome), AgentError> {
     let resolved = resolve(provider, model, timeouts, model_policy).await;
-    let outcome = generate(
-        &*resolved.provider,
-        &resolved.model,
-        prompt,
-        cancel,
-        session_id,
-    )
-    .await?;
+    let outcome = generate(&*resolved.provider, &resolved.model, prompt, cancel).await?;
     Ok((resolved, outcome))
 }
 
@@ -129,12 +120,14 @@ pub struct TitleOutcome {
 
 /// Errors only when the request itself failed or stalled, which is the one
 /// case with no spend to attribute.
+///
+/// No cache key: the title has its own system prompt, so it shares no prefix
+/// with the session and must not claim the session's cache slot.
 async fn generate(
     provider: &dyn Provider,
     model: &Model,
     prompt: &str,
     cancel: &CancelToken,
-    session_id: Option<&SessionRef>,
 ) -> Result<TitleOutcome, AgentError> {
     let messages = [Message::user(format!(
         "{PROMPT_PREFIX}{}",
@@ -150,7 +143,7 @@ async fn generate(
         None,
         cancel,
         RequestOptions::default(),
-        session_id,
+        None,
     );
     let response = futures_lite::future::race(request, async {
         smol::Timer::after(TITLE_TIMEOUT).await;

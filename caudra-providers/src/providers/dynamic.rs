@@ -7,7 +7,6 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, UNIX_EPOCH};
 
 use caudra_config::providers::ProvidersConfig;
-use caudra_storage::id::SessionRef;
 use caudra_storage::state::{self, SCOPE_GLOBAL, StateKey};
 use caudra_storage::{StateClass, StateDir};
 use flume::Sender;
@@ -20,7 +19,9 @@ use crate::manifest::ManifestRegistry;
 use crate::model::{Billing, Model, ModelPricing, ThinkingSupport};
 use crate::provider::{BoxFuture, Provider, ProviderKind};
 use crate::types::{ReasoningOptions, ThinkingFields};
-use crate::{AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse};
+use crate::{
+    AgentError, CacheKey, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse,
+};
 
 use super::ResolvedAuth;
 use super::anthropic::Anthropic;
@@ -734,7 +735,7 @@ impl Provider for DynamicProvider {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        session_id: Option<&'a SessionRef>,
+        cache_key: Option<&'a CacheKey>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             // First attempt streams through a counting relay: a 401 is only
@@ -745,15 +746,7 @@ impl Provider for DynamicProvider {
             let attempt = async {
                 let result = self
                     .inner
-                    .stream_message(
-                        model,
-                        messages,
-                        system,
-                        tools,
-                        &tx,
-                        opts.clone(),
-                        session_id,
-                    )
+                    .stream_message(model, messages, system, tools, &tx, opts.clone(), cache_key)
                     .await;
                 drop(tx);
                 result
@@ -782,7 +775,7 @@ impl Provider for DynamicProvider {
                         Ok(()) => {
                             self.inner
                                 .stream_message(
-                                    model, messages, system, tools, event_tx, opts, session_id,
+                                    model, messages, system, tools, event_tx, opts, cache_key,
                                 )
                                 .await
                         }

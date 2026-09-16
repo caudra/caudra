@@ -2,7 +2,9 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use caudra_agent::CancelToken;
-use caudra_providers::{AgentError, Message, ProviderEvent, StopReason, project_messages};
+use caudra_providers::{
+    AgentError, CacheKey, Message, ProviderEvent, StopReason, project_messages,
+};
 use caudra_storage::id::SessionRef;
 use flume::Sender;
 use futures_lite::future;
@@ -73,8 +75,9 @@ impl App {
         let (trigger, cancel) = CancelToken::new();
         self.btw_modal.open(&question, rx, trigger);
 
-        let session_id = SessionRef::from(self.state.session.id);
-        smol::spawn(run_btw(prompt, messages, tx, Some(session_id), cancel)).detach();
+        // A btw forks the main conversation, so it shares its cache key on purpose.
+        let cache_key = CacheKey::session(&SessionRef::from(self.state.session.id));
+        smol::spawn(run_btw(prompt, messages, tx, Some(cache_key), cancel)).detach();
     }
 }
 
@@ -82,7 +85,7 @@ async fn run_btw(
     prompt: Arc<BtwPrompt>,
     messages: Vec<Message>,
     btw_tx: Sender<BtwEvent>,
-    session_id: Option<SessionRef>,
+    cache_key: Option<CacheKey>,
     cancel: CancelToken,
 ) {
     let provider = Arc::clone(&prompt.provider);
@@ -118,7 +121,7 @@ async fn run_btw(
             &prompt.tools,
             &event_tx,
             opts.clone(),
-            session_id.as_ref(),
+            cache_key.as_ref(),
         ),
         async {
             cancel.cancelled().await;
@@ -175,7 +178,7 @@ mod tests {
             _: &'a serde_json::Value,
             _: &'a flume::Sender<ProviderEvent>,
             _: RequestOptions,
-            _: Option<&'a SessionRef>,
+            _: Option<&'a CacheKey>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async move {
                 self.0.send(model.spec()).unwrap();

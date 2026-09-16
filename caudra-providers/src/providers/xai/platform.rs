@@ -1,7 +1,6 @@
 use std::sync::{Arc, Mutex};
 
 use caudra_storage::StateDir;
-use caudra_storage::id::SessionRef;
 use caudra_storage::log::{outcome, target};
 use flume::Sender;
 use serde_json::{Value, json};
@@ -12,7 +11,9 @@ use crate::provider::{BoxFuture, Provider};
 use crate::providers::ResolvedAuth;
 use crate::providers::openai::responses;
 use crate::providers::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
-use crate::{AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse};
+use crate::{
+    AgentError, CacheKey, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse,
+};
 
 use super::{auth, catalog};
 
@@ -139,10 +140,8 @@ fn apply_grok_reasoning(body: &mut Value, opts: &RequestOptions, model: &Model) 
     }
 }
 
-fn proxy_request_headers(model: &Model, session_id: Option<&SessionRef>) -> Vec<(String, String)> {
-    let session = session_id
-        .map(ToString::to_string)
-        .unwrap_or_else(random_id);
+fn proxy_request_headers(model: &Model, cache_key: Option<&CacheKey>) -> Vec<(String, String)> {
+    let session = cache_key.map(ToString::to_string).unwrap_or_else(random_id);
     vec![
         ("accept".into(), "text/event-stream".into()),
         ("x-grok-conv-id".into(), session.clone()),
@@ -168,7 +167,7 @@ impl Provider for Xai {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        session_id: Option<&'a SessionRef>,
+        cache_key: Option<&'a CacheKey>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let mut buf = String::new();
@@ -177,15 +176,12 @@ impl Provider for Xai {
             if self.is_oauth() {
                 let mut body = responses::build_body(model, messages, system, tools);
                 apply_grok_reasoning(&mut body, &opts, model);
-                if let Some(session) = session_id {
-                    body["prompt_cache_key"] = json!(session.as_str());
-                }
+                responses::apply_prompt_cache_key(&mut body, cache_key);
                 let stream_timeout = self.compat.stream_timeout();
                 return self
                     .with_oauth_retry(|| async {
                         let mut auth = self.current_auth();
-                        auth.headers
-                            .extend(proxy_request_headers(model, session_id));
+                        auth.headers.extend(proxy_request_headers(model, cache_key));
                         responses::do_stream(
                             self.compat.client(),
                             model,
@@ -307,6 +303,8 @@ mod tests {
     use crate::types::ThinkingConfig;
     use crate::{ModelFamily, ModelPricing};
 
+    const CACHE_KEY: &str = "session/task";
+
     fn test_model(thinking: bool) -> Model {
         Model {
             id: "grok-4.6".into(),
@@ -366,6 +364,17 @@ mod tests {
         apply_grok_reasoning(&mut body, &RequestOptions::default(), &model);
         assert!(body.get("reasoning").is_none());
         assert!(body.get("include").is_none());
+    }
+
+    #[test]
+    fn proxy_conversation_headers_carry_the_cache_key() {
+        let key = CacheKey::task(None, CACHE_KEY);
+        let headers = proxy_request_headers(&test_model(true), Some(&key));
+
+        for name in ["x-grok-conv-id", "x-grok-session-id"] {
+            let value = headers.iter().find(|(header, _)| header == name);
+            assert_eq!(value.map(|(_, value)| value.as_str()), Some(CACHE_KEY));
+        }
     }
 
     #[test]

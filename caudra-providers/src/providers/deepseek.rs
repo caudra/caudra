@@ -1,6 +1,5 @@
 use std::sync::{Arc, Mutex};
 
-use caudra_storage::id::SessionRef;
 use flume::Sender;
 use serde::Deserialize;
 use serde_json::Value;
@@ -10,7 +9,9 @@ use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing};
 use crate::pricing::{PricingSchedule, PricingWindow};
 use crate::provider::{BoxFuture, Provider};
 use crate::types::{ProviderUsage, UsageLimit};
-use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig};
+use crate::{
+    AgentError, CacheKey, Message, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig,
+};
 
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 use super::{KeyPool, ResolvedAuth};
@@ -176,7 +177,7 @@ impl Provider for DeepSeek {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        _session_id: Option<&'a SessionRef>,
+        _cache_key: Option<&'a CacheKey>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let auth = self.auth.lock().unwrap().clone();

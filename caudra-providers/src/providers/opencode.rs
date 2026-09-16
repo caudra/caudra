@@ -1,7 +1,6 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use caudra_storage::id::SessionRef;
 use flume::Sender;
 use isahc::{HttpClient, Request};
 use serde_json::{Value, json};
@@ -15,7 +14,7 @@ use crate::providers::catalog::{
 };
 use crate::providers::http_client;
 use crate::providers::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
-use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
+use crate::{AgentError, CacheKey, Message, ProviderEvent, RequestOptions, StreamResponse};
 
 use super::{ResolvedAuth, user_agent, with_prefix};
 
@@ -176,7 +175,7 @@ impl Provider for Opencode {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        _session_id: Option<&'a SessionRef>,
+        _cache_key: Option<&'a CacheKey>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let model_for_stream = model.clone();

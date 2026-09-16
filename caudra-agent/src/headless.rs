@@ -12,12 +12,12 @@ use caudra_config::ToolKey;
 use caudra_providers::Timeouts;
 use caudra_providers::model::{Model, ModelPurpose};
 use caudra_providers::provider::{self, Provider};
-#[cfg(test)]
-use caudra_providers::{ContentBlock, Message, Role};
 use caudra_providers::{
-    HistoryItem, HistoryItemKind, TokenUsage, active_history_items, merge_history_items,
+    CacheKey, HistoryItem, HistoryItemKind, TokenUsage, active_history_items, merge_history_items,
     resolve_history_head,
 };
+#[cfg(test)]
+use caudra_providers::{ContentBlock, Message, Role};
 use caudra_storage::StateDir;
 use caudra_storage::id::{CaudraId, SessionRef};
 use caudra_storage::local_documents::LocalDocumentStore;
@@ -1356,6 +1356,7 @@ pub fn spawn(mut params: HeadlessParams) -> HeadlessHandle {
                     tool_output_lines: ToolOutputLines::default(),
                     permissions,
                     session_id: Some(session_ref_clone.clone()),
+                    cache_key: Some(CacheKey::session(&session_ref_clone)),
                     workspace_session: params.workspace_session.clone(),
                     remote_project_context: params.remote_project_context.clone(),
                     local_documents: params.local_documents.clone(),
@@ -1910,6 +1911,7 @@ pub async fn spawn_prepared_interactive(
         tool_output_lines: ToolOutputLines::default(),
         permissions: Arc::clone(&permissions),
         session_id: Some(session_ref.clone()),
+        cache_key: Some(CacheKey::session(&session_ref)),
         workspace_session: params.workspace_session.clone(),
         remote_project_context: params.remote_project_context.clone(),
         local_documents: params.local_documents.clone(),
@@ -3342,7 +3344,7 @@ complete(#{ report: first.output });
             _: &'a Value,
             _: &'a flume::Sender<ProviderEvent>,
             _: RequestOptions,
-            _: Option<&'a SessionRef>,
+            _: Option<&'a CacheKey>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async move {
                 self.requests.lock().unwrap().push(messages.to_vec());

@@ -254,7 +254,7 @@ impl RepairState {
                         &tools,
                         &tx,
                         options,
-                        ctx.session_id.as_ref(),
+                        None,
                     );
                     let response = race(
                         async { request.await.map_err(|_| RepairError::Model) },
@@ -608,11 +608,11 @@ mod tests {
         },
     };
     use caudra_providers::{
-        AgentError, ContentBlock, INVALID_TOOL_JSON_KEY, InvalidToolInput, Message, Model,
-        ModelInfo, ProviderEvent, RequestOptions, StreamResponse, TokenUsage, invalid_tool_input,
-        provider::Provider,
+        AgentError, CacheKey, ContentBlock, INVALID_TOOL_JSON_KEY, InvalidToolInput, Message,
+        Model, ModelInfo, ProviderEvent, RequestOptions, StreamResponse, TokenUsage,
+        invalid_tool_input, provider::Provider,
     };
-    use caudra_storage::{id::SessionRef, usage_ledger::LedgerPurpose};
+    use caudra_storage::usage_ledger::LedgerPurpose;
     use futures_lite::future::poll_once;
     use serde_json::{Value, json};
     use std::{
@@ -1115,7 +1115,7 @@ mod tests {
             tools: &'a Value,
             _: &'a flume::Sender<ProviderEvent>,
             _: RequestOptions,
-            _: Option<&'a SessionRef>,
+            _: Option<&'a CacheKey>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async move {
                 self.requests.fetch_add(1, Ordering::SeqCst);

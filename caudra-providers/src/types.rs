@@ -8,8 +8,10 @@
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
+use std::fmt;
 use std::sync::Arc;
 
+use caudra_storage::id::SessionRef;
 use caudra_storage::sessions::TitleSource;
 pub use caudra_storage::thinking::{
     EFFORT_LEVELS, MIN_THINKING_BUDGET, ReasoningOption, ReasoningOptions,
@@ -27,6 +29,7 @@ use crate::model::Model;
 const LOCAL_BUDGET_FIELD: &str = "thinking_budget_tokens";
 const INVALID_TOOL_JSON_EXCERPT: usize = 2_000;
 pub const MAX_TOOL_INPUT_BYTES: usize = 1024 * 1024;
+const HEADER_SAFE_REPLACEMENT: char = '-';
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImageMediaType {
@@ -1060,6 +1063,54 @@ impl RequestOptions {
     }
 }
 
+/// The conversation a request belongs to, sent to providers that route or
+/// restore prompt caches by client key. Same key iff same prefix lineage: a
+/// subagent never shares its parent's key, and a request with its own system
+/// prompt (title, evaluator, repair) sends none. A wrong key is a cache miss,
+/// never wrong output.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct CacheKey(String);
+
+impl CacheKey {
+    /// The main conversation of a session.
+    pub fn session(session: &SessionRef) -> Self {
+        Self(header_safe(session.as_str()))
+    }
+
+    /// One subagent conversation. `task_id` is what a continuation names, so
+    /// the key survives a resume and differs between siblings.
+    pub fn task(session: Option<&SessionRef>, task_id: &str) -> Self {
+        Self(header_safe(&match session {
+            Some(session) => format!("{}/{task_id}", session.as_str()),
+            None => task_id.to_owned(),
+        }))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for CacheKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// The key travels as an HTTP header value on several providers, and an
+/// invalid byte there fails the whole request at build time.
+fn header_safe(raw: &str) -> String {
+    raw.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '/' | '-') {
+                c
+            } else {
+                HEADER_SAFE_REPLACEMENT
+            }
+        })
+        .collect()
+}
+
 pub type ToolNameAliases = Arc<HashMap<String, String>>;
 
 #[derive(Debug, Default)]
@@ -1108,6 +1159,31 @@ mod tests {
 
     const STEERING_RULE: &str = "empty_output";
     const STEERING_TEXT: &str = "Continue with a useful response.";
+    const SESSION_ID: &str = "CNK1hV6GWoysH3KQMm5wu";
+    const TASK_ID: &str = "toolu_01ABC";
+
+    fn session() -> SessionRef {
+        SESSION_ID.parse().unwrap()
+    }
+
+    #[test]
+    fn cache_key_for_the_main_conversation_is_the_session() {
+        assert_eq!(CacheKey::session(&session()).as_str(), SESSION_ID);
+    }
+
+    #[test_case(Some(TASK_ID), "CNK1hV6GWoysH3KQMm5wu/toolu_01ABC" ; "within_a_session")]
+    #[test_case(None, "toolu_01ABC" ; "without_a_session")]
+    fn cache_key_for_a_task_is_scoped_by_its_session(session_id: Option<&str>, expected: &str) {
+        let session = session_id.map(|_| session());
+        assert_eq!(CacheKey::task(session.as_ref(), TASK_ID).as_str(), expected);
+    }
+
+    #[test_case("session-2f1a", "session-2f1a" ; "generated_ids_pass")]
+    #[test_case("call_x.y:z", "call_x.y:z" ; "punctuation_passes")]
+    #[test_case("run 1/é\n", "run-1/--" ; "unsafe_bytes_become_dashes")]
+    fn cache_key_is_always_a_valid_header_value(task_id: &str, expected: &str) {
+        assert_eq!(CacheKey::task(None, task_id).as_str(), expected);
+    }
 
     #[test_case(ProviderEvent::ToolAliases { aliases: None }, false ; "aliases_are_metadata")]
     #[test_case(ProviderEvent::PromptProgress { processed: 1, total: 2, cache: 0 }, false ; "prefill_is_metadata")]

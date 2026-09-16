@@ -14,9 +14,9 @@ use tracing::{Instrument, debug, error, info, info_span, warn};
 use caudra_providers::model_registry::{self, Binding};
 use caudra_providers::provider::{self, Provider};
 use caudra_providers::{
-    Billing, ContentBlock, EMPTY_RESPONSE_MARKER, Message, Model, ModelError, ModelPurpose,
-    ReasoningSource, RequestOptions, Role, StopReason, StreamResponse, Timeouts, TokenUsage,
-    estimate_tokens_cached,
+    Billing, CacheKey, ContentBlock, EMPTY_RESPONSE_MARKER, Message, Model, ModelError,
+    ModelPurpose, ReasoningSource, RequestOptions, Role, StopReason, StreamResponse, Timeouts,
+    TokenUsage, estimate_tokens_cached,
 };
 
 use super::compaction;
@@ -240,6 +240,9 @@ pub struct AgentParams {
     pub tool_output_lines: ToolOutputLines,
     pub permissions: Arc<PermissionManager>,
     pub session_id: Option<SessionRef>,
+    /// What the provider routes this conversation's prompt cache by. The
+    /// session for the main agent, session-plus-task for a subagent.
+    pub cache_key: Option<CacheKey>,
     pub workspace_session: Option<WorkspaceSession>,
     pub remote_project_context: Option<Arc<crate::remote_project_context::RemoteProjectContext>>,
     pub local_documents: Option<Arc<LocalDocumentStore>>,
@@ -330,6 +333,7 @@ pub struct Agent<'h> {
     permissions: Arc<PermissionManager>,
     opts: RequestOptions,
     session_id: Option<SessionRef>,
+    cache_key: Option<CacheKey>,
     workspace_session: Option<WorkspaceSession>,
     remote_project_context: Option<Arc<crate::remote_project_context::RemoteProjectContext>>,
     local_documents: Option<Arc<LocalDocumentStore>>,
@@ -429,6 +433,7 @@ impl<'h> Agent<'h> {
             reauth_attempts: 0,
             opts: RequestOptions::default(),
             session_id: params.session_id,
+            cache_key: params.cache_key,
             workspace_session: params.workspace_session,
             remote_project_context: params.remote_project_context,
             local_documents: params.local_documents,
@@ -720,19 +725,11 @@ impl<'h> Agent<'h> {
         let timeouts = self.timeouts;
         let model_policy = Arc::clone(&self.model_policy);
         let cancel = CancelToken::none();
-        let session_id = self.session_id.clone();
         let event_tx = self.event_tx.clone();
         smol::spawn(async move {
-            if let Ok((resolved, outcome)) = title::for_prompt(
-                &provider,
-                &model,
-                timeouts,
-                &model_policy,
-                &prompt,
-                &cancel,
-                session_id.as_ref(),
-            )
-            .await
+            if let Ok((resolved, outcome)) =
+                title::for_prompt(&provider, &model, timeouts, &model_policy, &prompt, &cancel)
+                    .await
             {
                 event_tx.try_send(AgentEvent::SessionTitle {
                     title: outcome.title,
@@ -1064,7 +1061,7 @@ impl<'h> Agent<'h> {
                 &self.cancel,
                 &self.retry_now,
                 self.opts.clone(),
-                self.session_id.as_ref(),
+                self.cache_key.as_ref(),
                 self.speculative.as_ref(),
             )
             .await
@@ -1386,7 +1383,6 @@ impl<'h> Agent<'h> {
             evaluation,
             event_tx: &self.event_tx,
             cancel: &self.cancel,
-            session_id: self.session_id.as_ref(),
         }
         .run()
         .await;
@@ -1423,7 +1419,6 @@ impl<'h> Agent<'h> {
                     evaluation,
                     event_tx: &self.event_tx,
                     cancel: &self.cancel,
-                    session_id: self.session_id.as_ref(),
                 }
                 .run()
                 .await
@@ -2233,7 +2228,7 @@ mod tests {
             tools: &'a Value,
             _: &'a flume::Sender<ProviderEvent>,
             _: RequestOptions,
-            _: Option<&'a SessionRef>,
+            _: Option<&'a CacheKey>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async {
                 self.captured_tools.lock().unwrap().push(tools.clone());
@@ -2266,7 +2261,7 @@ mod tests {
             _: &'a Value,
             _: &'a flume::Sender<ProviderEvent>,
             _: RequestOptions,
-            _: Option<&'a SessionRef>,
+            _: Option<&'a CacheKey>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async {
                 let mut captured = self.captured.lock().unwrap();
@@ -2297,7 +2292,7 @@ mod tests {
             _: &'a Value,
             _: &'a flume::Sender<ProviderEvent>,
             _: RequestOptions,
-            _: Option<&'a SessionRef>,
+            _: Option<&'a CacheKey>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async {
                 *self.captured.lock().unwrap() = self.store.latest(&ContextKey::Main);
@@ -2343,7 +2338,7 @@ mod tests {
             _: &'a Value,
             event_tx: &'a flume::Sender<ProviderEvent>,
             _: RequestOptions,
-            _: Option<&'a SessionRef>,
+            _: Option<&'a CacheKey>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async {
                 if self.state.stream_calls.fetch_add(1, Ordering::SeqCst) == 0 {
@@ -2393,7 +2388,7 @@ mod tests {
             _: &'a Value,
             _: &'a flume::Sender<ProviderEvent>,
             _: RequestOptions,
-            _: Option<&'a SessionRef>,
+            _: Option<&'a CacheKey>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async move {
                 if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
@@ -2435,7 +2430,7 @@ mod tests {
             _: &'a Value,
             ptx: &'a flume::Sender<ProviderEvent>,
             _: RequestOptions,
-            _: Option<&'a SessionRef>,
+            _: Option<&'a CacheKey>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async move {
                 if let Some(text) = self.delta {
@@ -2657,6 +2652,7 @@ mod tests {
                     Arc::default(),
                 )),
                 session_id: None,
+                cache_key: None,
                 workspace_session: None,
                 remote_project_context: None,
                 local_documents: None,
@@ -4783,7 +4779,7 @@ mod tests {
             _: &'a Value,
             _: &'a flume::Sender<ProviderEvent>,
             _: RequestOptions,
-            _: Option<&'a SessionRef>,
+            _: Option<&'a CacheKey>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async {
                 futures_lite::future::yield_now().await;

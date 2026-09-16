@@ -23,7 +23,7 @@ use caudra_agent::{
 };
 use caudra_config::ModelPolicy;
 use caudra_lua::EventHandle;
-use caudra_providers::Timeouts;
+use caudra_providers::{CacheKey, Timeouts};
 use caudra_storage::StateDir;
 use caudra_storage::id::{CaudraId, SessionRef};
 use caudra_storage::local_documents::LocalDocumentStore;
@@ -113,6 +113,7 @@ impl WorkflowSession {
         let slot = spawn.model_slot.load();
         let tool_filter = ToolFilter::from_config(spawn.config, &slot.model, &[])
             .for_remote_workspace(spawn.workspace_session.is_some());
+        let session_ref = SessionRef::from(spawn.session_id);
         let base = AgentParams {
             provider: Arc::clone(&slot.provider),
             model: slot.model.clone(),
@@ -121,7 +122,8 @@ impl WorkflowSession {
             config: spawn.config.clone(),
             tool_output_lines: spawn.tool_output_lines,
             permissions: Arc::clone(spawn.permissions),
-            session_id: Some(SessionRef::from(spawn.session_id)),
+            session_id: Some(session_ref.clone()),
+            cache_key: Some(CacheKey::session(&session_ref)),
             workspace_session: spawn.workspace_session,
             remote_project_context: spawn.remote_project_context.clone(),
             local_documents: spawn.local_documents,

@@ -2437,7 +2437,6 @@ impl<'t> EventLoop<'t> {
                 &model_policy,
                 &prompt,
                 &cancel,
-                None,
             )
             .await
             .map_err(|error| error.user_message())
