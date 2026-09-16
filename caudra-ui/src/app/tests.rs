@@ -9,6 +9,7 @@ use crate::components::context_modal::{
 };
 use crate::components::file_walk::UNREADABLE_DIR_MSG;
 use crate::components::keybindings::{Bind, KeybindContext, key as kb, leader as chord};
+use crate::components::messages::{ASSISTANT_LABEL, ReviewTarget};
 use crate::components::queue_actions::QueueActionKind;
 use crate::components::queue_panel::{QueueAction, QueueHit, QueueHitTarget};
 use crate::components::rewind_picker::RewindEntry;
@@ -20,13 +21,19 @@ use crate::components::usage_modal::SCOPE_KEY;
 use crate::components::{DisplaySource, ExitRequest, ToolProgress, buffer_text, key, test_model};
 use crate::repaint::expect::{OWED, QUIET};
 use crate::selection::{SelectableZone, SelectionState, SelectionZone};
+use crate::test_pattern_discovery_report;
 use arc_swap::ArcSwap;
 use caudra_agent::command::CustomCommand;
 use caudra_agent::context::{
     ContextInventory, ContextModel, ContextReadiness, ContextReserve, ContextUsage, ContextWindow,
 };
 use caudra_agent::mcp::config::{McpConfigSource, McpReviewSummary};
-use caudra_agent::permissions::{PermissionManager, PermissionRequest};
+use caudra_agent::permissions::pattern_recognition::{
+    CandidateEvidence, InvocationOutcome, ObservationProvenance, PatternCandidate, SupportCount,
+};
+use caudra_agent::permissions::{
+    PermissionManager, PermissionRequest, PermissionResourceSelector, PermissionRuleRecord,
+};
 use caudra_agent::snapshots::{RestoreFailureKind, RestoreStatus};
 use caudra_agent::tools::ToolEffect;
 use caudra_agent::workspace_baseline::BaselineOutcome;
@@ -48,6 +55,10 @@ use caudra_providers::{
     expand_message, project_messages,
 };
 use caudra_storage::id::CaudraId;
+use caudra_storage::permission_patterns::{
+    ArgumentRole, PATTERN_SCHEMA_VERSION, PatternContext, PatternDefinition, PatternToken,
+    SlotCombinations,
+};
 use caudra_storage::prompt_stash::{PromptStash, StashEntry};
 use caudra_storage::sessions::{
     PendingConversationRevert, PendingRestoreKind, PendingRestoreOperation, PendingRestorePhase,
@@ -60,20 +71,43 @@ use caudra_storage::tool_outputs::{ToolOutputError, ToolOutputStore};
 use caudra_storage::usage_ledger::{LedgerPurpose, TurnUsage, UsageLedger};
 use caudra_storage::view::ViewMode;
 use caudra_storage::workspace_binding::StoredWorkspaceBinding;
+use caudra_workbench::keys as workbench_keys;
 use caudra_workspace::{
     CollectionRevision, OperationId, ProjectAsset, ProjectAssetContent, ProjectAssetManifest,
     SessionWorkspaceBinding, WorkspaceAssetService, WorkspaceCapabilities, WorkspaceCursor,
     WorkspaceError, WorkspaceHandle, WorkspaceServices, WorkspaceSession,
 };
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+};
+use ratatui::Terminal;
+use ratatui::backend::TestBackend;
 use ratatui::buffer::CellDiffOption;
 use ratatui::layout::{Position, Rect};
+use ratatui::text::Line;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tempfile::TempDir;
 use test_case::test_case;
 
 const WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+const PERMISSION_TEST_TIMEOUT: Duration = Duration::from_secs(10);
+const PATTERN_TEST_ANALYSIS: &str = "test-analysis/v1";
+const PATTERN_TEST_SOURCE: &str = "history-test";
+const PATTERN_TEST_COMMAND: &str = "fixture-command";
+const PATTERN_TEST_OTHER_COMMAND: &str = "fixture-second";
+const PERMISSIONS_MODE_RULE_COUNT: usize = 240;
+const PROJECT_PERMISSION_TEST_SCOPE: &str = "cargo check -p caudra-ui";
+const REPORTED_PERMISSION_FIRST: &str = "physical-first";
+const REPORTED_PERMISSION_SECOND: &str = "physical-second";
+const REPORTED_PERMISSION_COMMAND: &str = "cargo check";
+const PERMISSION_TITLE: &str = "Permission required";
+const PERMISSION_ALLOW_HINT: &str = "[y Once]";
+const PERMISSION_EDITOR_DRAFT: &str = "unsaved editor text";
+const REPEAT_FIELD_TEXT: &str = "repeat field";
+const REPEAT_FIELD_EDITED: &str = "repeat fiel";
+const REPEAT_EDITOR_FILE: &str = "repeat-input.txt";
 const RELOCATION_DESTINATION: &str = "destination with spaces";
 const RELOCATION_DRAFT: &str = "keep this draft";
 const RELOCATION_WRITE_VERSION: i64 = 7;
@@ -10494,8 +10528,9 @@ fn deleting_a_stored_session_drops_it_from_the_open_picker() {
 /// Home and End used to reach the picker's filter line, because the transcript
 /// binds hand every key to the open overlay and the overlay passed on what its
 /// list did not name. This walks the whole chain, not just the list.
-#[test]
-fn the_navigation_keys_reach_an_open_picker_list() {
+#[test_case(KeyEventKind::Press; "press")]
+#[test_case(KeyEventKind::Repeat; "repeat")]
+fn the_navigation_keys_reach_an_open_picker_list(kind: KeyEventKind) {
     let (_temp, storage, _writer, mut app) = tempdir_app();
     for _ in 0..PICKER_ROWS {
         let mut stored = AppSession::new(&app.state.session.model, &app.state.session.cwd);
@@ -10505,10 +10540,10 @@ fn the_navigation_keys_reach_an_open_picker_list() {
     let last = app.session_picker.ids().len() - 1;
     assert!(last > 0, "{PICKER_NEEDS_ROWS}");
 
-    app.update(Msg::Key(key(KeyCode::End)));
+    dispatch_reported_key(&mut app, key(KeyCode::End), kind);
     assert_eq!(app.session_picker.selected_index(), Some(last));
 
-    app.update(Msg::Key(key(KeyCode::Home)));
+    dispatch_reported_key(&mut app, key(KeyCode::Home), kind);
     assert_eq!(app.session_picker.selected_index(), Some(0));
 }
 
@@ -11141,7 +11176,7 @@ fn app_awaiting_permission_config_trust() -> App {
     let project = PathBuf::from(&app.state.session.cwd);
     let rule = PermissionRule {
         tool: ToolKey::native("bash"),
-        scope: Some("cargo check -p caudra-ui".into()),
+        scope: Some(PROJECT_PERMISSION_TEST_SCOPE.into()),
         effect: Effect::Allow,
     };
     app.permissions = Arc::new(PermissionManager::new_persistent_in(
@@ -11310,6 +11345,418 @@ fn permission_request_suspends_and_then_restores_project_trust() {
     assert!(app.permissions_picker.is_open());
 }
 
+fn pattern_suggestion_candidate(project: &Path) -> PatternCandidate {
+    PatternCandidate {
+        definition: PatternDefinition {
+            version: PATTERN_SCHEMA_VERSION,
+            name: PATTERN_TEST_COMMAND.into(),
+            context: PatternContext {
+                tool_identity: "workcell/shell".into(),
+                executable_identity: PATTERN_TEST_COMMAND.into(),
+                effective_workdir: project.to_string_lossy().into_owned(),
+                path_binding: project.to_string_lossy().into_owned(),
+                analysis_version: PATTERN_TEST_ANALYSIS.into(),
+            },
+            argv: vec![PatternToken::Exact {
+                value: PATTERN_TEST_COMMAND.into(),
+                role: ArgumentRole::Executable,
+            }],
+            slots: Vec::new(),
+            combinations: SlotCombinations::Independent,
+        },
+        evidence: CandidateEvidence {
+            support: SupportCount {
+                observations: 2,
+                independent_sessions: 2,
+            },
+            provenance: ObservationProvenance::Imported,
+            sources: [PATTERN_TEST_SOURCE.into()].into(),
+            outcomes: [(InvocationOutcome::Unknown, 2)].into(),
+            first_seen_ms: 1,
+            last_seen_ms: 1,
+            distributions: Default::default(),
+            tuples: Vec::new(),
+        },
+    }
+}
+
+fn pattern_suggestion_reply(project: &Path) -> Arc<PatternDiscoveryOutcome> {
+    Arc::new(PatternDiscoveryOutcome::Ready(
+        test_pattern_discovery_report(vec![pattern_suggestion_candidate(project)]),
+    ))
+}
+
+#[test_case("discover", true; "discover_opens_proposals_directly")]
+#[test_case("suggested", true; "suggested_alias_opens_proposals_directly")]
+#[test_case("", false; "plain_permissions_opens_rules")]
+fn permissions_command_selects_the_requested_mode_with_large_rule_inventory(
+    argument: &str,
+    discover: bool,
+) {
+    let mut app = test_app();
+    let rules = (0..PERMISSIONS_MODE_RULE_COUNT)
+        .map(|index| {
+            let mut rule = conversation_permission_record().rule;
+            rule.resources[0].selector = PermissionResourceSelector::CommandPattern {
+                pattern: format!("opsctl inspect task-{index:03}"),
+            };
+            PermissionRuleRecord::conversation(rule).unwrap()
+        })
+        .collect::<Vec<_>>();
+    app.permissions
+        .load_structured_conversation_rules(rules.clone());
+    app.set_pattern_suggestion_loader(Some(Arc::new(move |project, _| {
+        let first = pattern_suggestion_candidate(&project);
+        let mut second = first.clone();
+        second.definition.name = PATTERN_TEST_OTHER_COMMAND.into();
+        second.definition.context.executable_identity = PATTERN_TEST_OTHER_COMMAND.into();
+        second.definition.argv[0] = PatternToken::Exact {
+            value: PATTERN_TEST_OTHER_COMMAND.into(),
+            role: ArgumentRole::Executable,
+        };
+        let (reply, receiver) = flume::bounded(1);
+        reply
+            .send(Arc::new(PatternDiscoveryOutcome::Ready(
+                test_pattern_discovery_report(vec![first, second]),
+            )))
+            .unwrap();
+        receiver
+    })));
+    assert_eq!(app.poll_pattern_suggestions(), Dirty::YES);
+    app.run_cmdline(&format!("/permissions {argument}"), 0)
+        .unwrap();
+    assert_eq!(app.permissions_picker.discovery_mode(), discover);
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal
+        .draw(|frame| {
+            app.permissions_picker.view(frame, frame.area());
+        })
+        .unwrap();
+    let screen = buffer_text(terminal.backend().buffer());
+    for command in [PATTERN_TEST_COMMAND, PATTERN_TEST_OTHER_COMMAND] {
+        assert_eq!(screen.contains(command), discover, "{screen}");
+    }
+    assert_eq!(screen.contains("Active structured permissions"), !discover);
+    assert_eq!(
+        app.permissions.structured_rule_inventory().unwrap().len(),
+        rules.len()
+    );
+}
+
+#[test_case(false; "current_root_reply_applied_by_tick_not_render")]
+#[test_case(true; "foreign_candidate_context_rejected")]
+fn pattern_suggestions_are_polled_outside_rendering(foreign: bool) {
+    let mut app = test_app();
+    let project = app.permissions.project_cwd();
+    let (request, requested) = flume::unbounded();
+    let candidate = pattern_suggestion_candidate(if foreign {
+        Path::new("/another/project")
+    } else {
+        &project
+    });
+    app.set_pattern_suggestion_loader(Some(Arc::new(move |project, _| {
+        let (reply, receiver) = flume::bounded(1);
+        reply
+            .send(Arc::new(PatternDiscoveryOutcome::Ready(
+                test_pattern_discovery_report(vec![candidate.clone()]),
+            )))
+            .unwrap();
+        request.send(project).unwrap();
+        receiver
+    })));
+    assert_eq!(requested.try_recv().unwrap(), project);
+    let backend = ratatui::backend::TestBackend::new(TEST_AREA.width, TEST_AREA.height);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal.draw(|frame| app.view(frame)).unwrap();
+    assert!(app.pending_pattern_suggestions.is_some());
+    assert!(requested.is_empty());
+    assert_eq!(app.poll_pattern_suggestions(), Dirty::YES);
+    assert!(app.pending_pattern_suggestions.is_none());
+    assert_eq!(
+        app.permissions.pattern_proposal_inventory().2.len(),
+        usize::from(!foreign)
+    );
+    if foreign {
+        let DiscoveryState::Complete(outcome) = app.permissions_picker.discovery_state() else {
+            panic!("missing discovery failure")
+        };
+        assert!(matches!(
+            outcome.as_ref(),
+            PatternDiscoveryOutcome::Unavailable(PATTERN_INVALID_CONTEXT)
+        ));
+    }
+    assert_eq!(app.poll_pattern_suggestions(), Dirty::NO);
+}
+
+#[test_case(false; "refresh_cancelled_before_completion")]
+#[test_case(true; "ready_reply_cancelled_before_poll")]
+fn permissions_discovery_refresh_and_cancel_are_explicit_single_requests(
+    ready_before_cancel: bool,
+) {
+    let mut app = test_app();
+    let (request, requested) = flume::unbounded();
+    app.set_pattern_suggestion_loader(Some(Arc::new(move |project, mode| {
+        let (reply, receiver) = flume::bounded(1);
+        request.send((project, mode, reply)).unwrap();
+        receiver
+    })));
+    let (project, mode, first) = requested.try_recv().unwrap();
+    assert_eq!(mode, PatternDiscoveryMode::Cached);
+    first.send(pattern_suggestion_reply(&project)).unwrap();
+    assert_eq!(app.poll_pattern_suggestions(), Dirty::YES);
+    let before = app.permissions.structured_rule_inventory().unwrap();
+    app.run_cmdline("/permissions discover", 0).unwrap();
+    for _ in 0..3 {
+        app.update(Msg::Key(KeyEvent::new(
+            KeyCode::Char('r'),
+            KeyModifiers::CONTROL,
+        )));
+    }
+    let (project, mode, cancelled) = requested.try_recv().unwrap();
+    assert_eq!(mode, PatternDiscoveryMode::Refresh);
+    assert!(requested.is_empty());
+    assert!(matches!(
+        app.permissions_picker.discovery_state(),
+        DiscoveryState::Loading
+    ));
+    if ready_before_cancel {
+        cancelled.send(pattern_suggestion_reply(&project)).unwrap();
+    }
+    app.update(Msg::Key(KeyEvent::new(
+        KeyCode::Char('x'),
+        KeyModifiers::CONTROL,
+    )));
+    assert!(cancelled.is_disconnected());
+    assert!(app.permissions_picker.discovery_cancelled());
+    assert_eq!(app.poll_pattern_suggestions(), Dirty::NO);
+    app.request_pattern_suggestions();
+    assert!(requested.is_empty());
+    app.update(Msg::Key(KeyEvent::new(
+        KeyCode::Char('r'),
+        KeyModifiers::CONTROL,
+    )));
+    let (project, mode, reply) = requested.try_recv().unwrap();
+    assert_eq!(mode, PatternDiscoveryMode::Refresh);
+    reply.send(pattern_suggestion_reply(&project)).unwrap();
+    assert_eq!(app.poll_pattern_suggestions(), Dirty::YES);
+    for code in ['g', 'r', 'x'] {
+        app.update(Msg::Key(KeyEvent::new_with_kind(
+            KeyCode::Char(code),
+            KeyModifiers::CONTROL,
+            KeyEventKind::Repeat,
+        )));
+    }
+    assert!(requested.is_empty());
+    assert!(app.pending_pattern_suggestions.is_none());
+    assert_eq!(app.permissions.structured_rule_inventory().unwrap(), before);
+}
+
+#[test_case(false; "worker_reports_failure")]
+#[test_case(true; "worker_channel_disconnects")]
+fn permissions_discovery_failures_remain_visible_and_retryable(disconnected: bool) {
+    let mut app = test_app();
+    let (request, requested) = flume::unbounded();
+    app.set_pattern_suggestion_loader(Some(Arc::new(move |_, _| {
+        request.send(()).unwrap();
+        let (reply, receiver) = flume::bounded(1);
+        if !disconnected {
+            reply
+                .send(Arc::new(PatternDiscoveryOutcome::Unavailable(
+                    PATTERN_WORKER_UNAVAILABLE,
+                )))
+                .unwrap();
+        }
+        receiver
+    })));
+    requested.try_recv().unwrap();
+    assert_eq!(app.poll_pattern_suggestions(), Dirty::YES);
+    let DiscoveryState::Complete(outcome) = app.permissions_picker.discovery_state() else {
+        panic!("missing discovery failure")
+    };
+    let expected = if disconnected {
+        PATTERN_WORKER_DISCONNECTED
+    } else {
+        PATTERN_WORKER_UNAVAILABLE
+    };
+    assert!(
+        matches!(outcome.as_ref(), PatternDiscoveryOutcome::Unavailable(reason) if *reason == expected)
+    );
+    app.run_cmdline("/permissions discover", 0).unwrap();
+    app.update(Msg::Key(KeyEvent::new(
+        KeyCode::Char('r'),
+        KeyModifiers::CONTROL,
+    )));
+    requested.try_recv().unwrap();
+    assert_eq!(app.poll_pattern_suggestions(), Dirty::YES);
+    assert!(
+        app.permissions
+            .structured_rule_inventory()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test_case(false; "project_revision_changed")]
+#[test_case(true; "manager_replaced_at_same_project")]
+fn completed_discovery_status_is_not_reused_across_permission_contexts(replace: bool) {
+    let mut app = test_app();
+    app.set_pattern_suggestion_loader(Some(Arc::new(move |project, _| {
+        let (reply, receiver) = flume::bounded(1);
+        reply.send(pattern_suggestion_reply(&project)).unwrap();
+        receiver
+    })));
+    assert_eq!(app.poll_pattern_suggestions(), Dirty::YES);
+    app.open_permissions_picker().unwrap();
+    let project = app.permissions.project_cwd();
+    if replace {
+        app.permissions = Arc::new(PermissionManager::new_nonpersistent(
+            PermissionsConfig::default(),
+            project,
+            Arc::default(),
+        ));
+    } else {
+        app.permissions.set_project(&project);
+    }
+    assert_eq!(app.poll_pattern_suggestions(), Dirty::YES);
+    assert!(!app.permissions_picker.is_open());
+    assert!(matches!(
+        app.permissions_picker.discovery_state(),
+        DiscoveryState::Idle
+    ));
+    assert!(app.pending_pattern_suggestions.is_none());
+}
+
+#[test_case("switch"; "directory_lifecycle_replaces_request_and_cancels_old_receiver")]
+fn pattern_suggestion_context_switch_cancels_stale_work(_case: &str) {
+    let mut app = test_app();
+    let (request, requested) = flume::unbounded();
+    app.set_pattern_suggestion_loader(Some(Arc::new(move |project, _| {
+        let (reply, receiver) = flume::bounded(1);
+        request.send((project, reply)).unwrap();
+        receiver
+    })));
+    let (original, old_reply) = requested.try_recv().unwrap();
+    app.request_pattern_suggestions();
+    assert!(requested.is_empty());
+
+    let temp = TempDir::new().unwrap();
+    let project = std::fs::canonicalize(temp.path()).unwrap();
+    let store = App::snapshot_store_for(
+        &app.storage,
+        app.state.session.id,
+        &project,
+        SnapshotLimits::default(),
+    )
+    .unwrap();
+    app.install_working_directory(&project, store, PermissionsConfig::default());
+    assert!(old_reply.is_disconnected());
+    let (active, reply) = requested.try_recv().unwrap();
+    assert_ne!(active, original);
+    assert_eq!(active, project);
+    reply.send(pattern_suggestion_reply(&active)).unwrap();
+    assert_eq!(app.poll_pattern_suggestions(), Dirty::YES);
+    assert!(app.pending_pattern_suggestions.is_none());
+}
+
+#[test_case(false; "manager_root_changed_outside_loader")]
+#[test_case(true; "shutdown_cancels_pending_reply")]
+fn pattern_suggestion_late_replies_cannot_cross_lifecycle(shutdown: bool) {
+    let mut app = test_app();
+    let (request, requested) = flume::unbounded();
+    app.set_pattern_suggestion_loader(Some(Arc::new(move |project, _| {
+        let (reply, receiver) = flume::bounded(1);
+        request.send((project, reply)).unwrap();
+        receiver
+    })));
+    let (project, reply) = requested.try_recv().unwrap();
+    reply.send(pattern_suggestion_reply(&project)).unwrap();
+    let temp = TempDir::new().unwrap();
+    if shutdown {
+        app.prepare_shutdown();
+    } else {
+        app.permissions.set_project(temp.path());
+    }
+    assert_eq!(app.poll_pattern_suggestions(), Dirty::NO);
+    assert!(app.pending_pattern_suggestions.is_none());
+    assert!(reply.is_disconnected());
+}
+
+#[test_case(false, false; "same_path_new_revision_rejects_ready_reply")]
+#[test_case(true, false; "replacement_manager_same_path_and_revision_rejects_ready_reply")]
+#[test_case(false, true; "same_path_new_revision_resubmits_and_cancels_old_work")]
+#[test_case(true, true; "replacement_manager_resubmits_and_cancels_old_work")]
+fn pattern_suggestion_reply_is_bound_to_the_captured_manager_context(
+    replace: bool,
+    resubmit: bool,
+) {
+    let mut app = test_app();
+    let (request, requested) = flume::unbounded();
+    app.set_pattern_suggestion_loader(Some(Arc::new(move |project, _| {
+        let (reply, receiver) = flume::bounded(1);
+        request.send((project, reply)).unwrap();
+        receiver
+    })));
+    let (project, old_reply) = requested.try_recv().unwrap();
+    let old_manager = Arc::clone(&app.permissions);
+    let old_context = old_manager.pattern_candidate_context();
+    assert_eq!(
+        app.pending_pattern_suggestions.as_ref().unwrap().revision,
+        old_context.1
+    );
+    if replace {
+        app.permissions = Arc::new(PermissionManager::new_nonpersistent(
+            PermissionsConfig::default(),
+            project.clone(),
+            Arc::default(),
+        ));
+        assert_eq!(app.permissions.pattern_candidate_context(), old_context);
+    } else {
+        app.permissions.set_project(&project);
+        assert_ne!(app.permissions.pattern_candidate_context().1, old_context.1);
+    }
+    old_reply.send(pattern_suggestion_reply(&project)).unwrap();
+    if resubmit {
+        app.request_pattern_suggestions();
+        assert!(old_reply.is_disconnected());
+        let (active, reply) = requested.try_recv().unwrap();
+        let pending = app.pending_pattern_suggestions.as_ref().unwrap();
+        assert!(pending.owner.ptr_eq(&Arc::downgrade(&app.permissions)));
+        assert_eq!(
+            pending.revision,
+            app.permissions.pattern_candidate_context().1
+        );
+        reply.send(pattern_suggestion_reply(&active)).unwrap();
+        assert_eq!(app.poll_pattern_suggestions(), Dirty::YES);
+    } else {
+        assert_eq!(app.poll_pattern_suggestions(), Dirty::NO);
+        assert!(old_reply.is_disconnected());
+    }
+    assert!(app.pending_pattern_suggestions.is_none());
+}
+
+#[test_case(false; "remote_sessions_do_not_request_local_history")]
+#[test_case(true; "ephemeral_sessions_do_not_request_persistent_history")]
+fn pattern_suggestion_lifecycle_respects_privacy(ephemeral: bool) {
+    let mut app = test_app();
+    if ephemeral {
+        app.storage = StateDir::split(
+            app.storage.path().join("volatile"),
+            app.storage.path().into(),
+        );
+    } else {
+        app.workspace_session = Some(remote_workspace_session());
+    }
+    let (request, requested) = flume::unbounded();
+    app.set_pattern_suggestion_loader(Some(Arc::new(move |project, _| {
+        request.send(project).unwrap();
+        flume::bounded(1).1
+    })));
+    app.request_pattern_suggestions();
+    assert_eq!(app.poll_pattern_suggestions(), Dirty::NO);
+    assert!(requested.is_empty());
+    assert!(app.pending_pattern_suggestions.is_none());
+}
+
 #[test]
 fn changing_projects_closes_stale_permission_config_actions() {
     let mut app = app_awaiting_permission_config_trust();
@@ -11360,6 +11807,13 @@ fn trusting_project_permission_config_refreshes_picker() {
 
     assert!(!app.permissions.needs_project_permission_config_trust());
     assert!(app.permissions_picker.is_open());
+    assert!(!app.permissions_picker.discovery_mode());
+    assert!(app.permissions.active_policy().iter().any(|policy| {
+        policy.source == "configuration"
+            && policy.rule.tool == ToolKey::native("bash")
+            && policy.rule.effect == Effect::Allow
+            && policy.rule.scope.as_deref() == Some(PROJECT_PERMISSION_TEST_SCOPE)
+    }));
     assert_eq!(app.lifecycle_blocker(), None);
     assert_eq!(
         app.status_bar.flash_text(),
@@ -11377,7 +11831,22 @@ fn trusting_project_permission_config_refreshes_picker() {
     assert!(screen.contains("shell allow patterns are active"));
     assert!(screen.contains("Trust or revoke"));
     assert!(!screen.contains("needs review"));
-    assert!(screen.contains("bash"));
+
+    assert!(app.update(Msg::Key(key(KeyCode::Down))).is_empty());
+    terminal
+        .draw(|frame| {
+            app.permissions_picker.view(frame, frame.area());
+        })
+        .unwrap();
+    let screen = buffer_text(terminal.backend().buffer());
+    for visible in ["bash", "[policy] allow", "configuration", "read-only"] {
+        assert!(screen.contains(visible), "{visible}: {screen}");
+    }
+    for word in PROJECT_PERMISSION_TEST_SCOPE.split_whitespace() {
+        assert!(screen.contains(word), "{word}: {screen}");
+    }
+    assert!(app.permissions.project_permission_config_trusted());
+    assert!(app.update(Msg::Key(key(KeyCode::Home))).is_empty());
 
     assert!(app.update(Msg::Key(key(KeyCode::Enter))).is_empty());
     assert!(app.update(Msg::Key(key(KeyCode::Enter))).is_empty());
@@ -13660,6 +14129,572 @@ fn agent_error_creates_synthetic_tool_done_with_message() {
     );
 }
 
+fn dispatch_reported_key(app: &mut App, mut key: KeyEvent, kind: KeyEventKind) -> Vec<Action> {
+    key.kind = kind;
+    app.update(Msg::Key(key))
+}
+
+fn open_permission_test_editor(app: &mut App) {
+    let id = app.input_box.buffer.insert_paste(PERMISSION_EDITOR_DRAFT);
+    app.open_paste_editor(id);
+}
+
+fn open_permission_test_leader(app: &mut App) {
+    app.which_key = crate::components::which_key::WhichKey::new(Duration::ZERO);
+    app.which_key.arm();
+}
+
+#[test_case(open_help_modal; "help")]
+#[test_case(open_usage_modal; "usage")]
+#[test_case(open_logs_modal; "logs")]
+#[test_case(open_context_modal; "context")]
+#[test_case(open_tools_modal; "tools")]
+#[test_case(open_skills_modal; "skills")]
+#[test_case(open_storage_modal; "storage")]
+#[test_case(open_goal_modal; "goal")]
+#[test_case(open_model_picker; "model_picker")]
+#[test_case(open_command_modal; "command_modal")]
+#[test_case(open_relocation_picker; "relocation_picker")]
+#[test_case(open_permission_test_editor; "paste_editor")]
+#[test_case(open_permission_test_leader; "leader")]
+#[test_case(|app| app.mcp_picker.open(); "mcp_picker")]
+#[test_case(|app| { app.execute_command(cmd("/permissions"), 0); }; "permissions_picker")]
+fn permission_ownership_survives_overlays_before_and_after_arrival(open: fn(&mut App)) {
+    for workbench in [false, true] {
+        for overlay_first in [false, true] {
+            let mut app = if workbench {
+                open_workbench()
+            } else {
+                test_app()
+            };
+            if overlay_first {
+                open(&mut app);
+                rendered(&mut app);
+            }
+            app.status = Status::Streaming;
+            app.run_id = 1;
+            app.update(agent_msg(permission_event(
+                REPORTED_PERMISSION_FIRST,
+                REPORTED_PERMISSION_COMMAND,
+            )));
+            if !overlay_first {
+                open(&mut app);
+            }
+            assert!(app.update(Msg::Key(key(KeyCode::Char('y')))).is_empty());
+            assert_eq!(
+                app.permission_prompt.request_id(),
+                Some(REPORTED_PERMISSION_FIRST)
+            );
+            let screen = rendered(&mut app);
+            for visible in [
+                PERMISSION_TITLE,
+                REPORTED_PERMISSION_COMMAND,
+                PERMISSION_ALLOW_HINT,
+            ] {
+                assert!(screen.contains(visible), "{visible}: {screen}");
+            }
+            app.update(Msg::Key(key(KeyCode::Tab)));
+            rendered(&mut app);
+            assert!(app.update(Msg::Key(key(KeyCode::Char('y')))).is_empty());
+            assert!(!app.permission_prompt.is_open());
+            assert_eq!(app.exit_request, ExitRequest::None);
+        }
+    }
+}
+
+#[test_case(open_help_modal; "help")]
+#[test_case(open_logs_modal; "logs")]
+#[test_case(open_permission_test_editor; "paste_editor")]
+#[test_case(|app| { app.run_builtin(BuiltinAction::Workbench); }; "workbench")]
+fn visible_permission_buttons_own_the_pointer_over_other_overlays(open: fn(&mut App)) {
+    let mut app = test_app();
+    open(&mut app);
+    app.permission_prompt.open(
+        REPORTED_PERMISSION_FIRST.into(),
+        ToolKey::native("bash"),
+        vec![REPORTED_PERMISSION_COMMAND.into()],
+        None,
+    );
+    let (row, column) = screen_hit(&mut app, PERMISSION_ALLOW_HINT);
+    for kind in [
+        MouseEventKind::Down(MouseButton::Left),
+        MouseEventKind::Up(MouseButton::Left),
+    ] {
+        assert!(app.update(mouse_event(kind, column, row)).is_empty());
+    }
+    assert!(!app.permission_prompt.is_open());
+}
+
+#[test_case(false; "paste_editor")]
+#[test_case(true; "workbench")]
+fn permission_guidance_owns_paste_instead_of_the_hidden_editor(workbench: bool) {
+    let mut app = test_app();
+    open_permission_test_editor(&mut app);
+    if workbench {
+        app.run_builtin(BuiltinAction::Workbench);
+    }
+    app.permission_prompt.open(
+        REPORTED_PERMISSION_FIRST.into(),
+        ToolKey::native("bash"),
+        vec![REPORTED_PERMISSION_COMMAND.into()],
+        None,
+    );
+    app.update(Msg::Key(key(KeyCode::Char('g'))));
+    app.update(Msg::Paste(REPORTED_PERMISSION_COMMAND.into()));
+    assert!(rendered(&mut app).contains(&format!("Guidance: {REPORTED_PERMISSION_COMMAND}")));
+    assert_eq!(
+        app.input_box.expanded_text(),
+        format!("{PERMISSION_EDITOR_DRAFT} ")
+    );
+    assert!(app.paste_editor.is_open());
+}
+
+#[test_case(KeyCode::Char('y'); "queued_approval_requires_release_and_fresh_press")]
+fn reported_permission_keys_preserve_physical_release(approval: KeyCode) {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    for id in [REPORTED_PERMISSION_FIRST, REPORTED_PERMISSION_SECOND] {
+        app.update(agent_msg(permission_event(id, REPORTED_PERMISSION_COMMAND)));
+    }
+    rendered(&mut app);
+    assert!(dispatch_reported_key(&mut app, key(approval), KeyEventKind::Press).is_empty());
+    assert_eq!(
+        app.permission_prompt.request_id(),
+        Some(REPORTED_PERMISSION_SECOND)
+    );
+    rendered(&mut app);
+    assert!(dispatch_reported_key(&mut app, key(approval), KeyEventKind::Repeat).is_empty());
+    assert_eq!(
+        app.permission_prompt.request_id(),
+        Some(REPORTED_PERMISSION_SECOND)
+    );
+    assert!(dispatch_reported_key(&mut app, key(approval), KeyEventKind::Release).is_empty());
+    assert_eq!(
+        app.permission_prompt.request_id(),
+        Some(REPORTED_PERMISSION_SECOND)
+    );
+    assert!(dispatch_reported_key(&mut app, key(approval), KeyEventKind::Press).is_empty());
+    assert!(!app.permission_prompt.is_open());
+}
+
+#[test_case('y', KeyEventKind::Press; "legacy_once")]
+#[test_case('a', KeyEventKind::Press; "legacy_project")]
+#[test_case('y', KeyEventKind::Repeat; "reported_once")]
+#[test_case('a', KeyEventKind::Repeat; "reported_project")]
+fn a_key_held_before_the_first_permission_needs_rearming(shortcut: char, kind: KeyEventKind) {
+    for release in [false, true] {
+        let mut app = streaming_app();
+        app.run_id = 1;
+        let held = key(KeyCode::Char(shortcut));
+        assert!(dispatch_reported_key(&mut app, held, kind).is_empty());
+        assert_eq!(app.input_box.buffer.value(), shortcut.to_string());
+        let mut request = Box::new(PermissionRequest::from_legacy(
+            REPORTED_PERMISSION_FIRST.into(),
+            ToolKey::native("bash"),
+            vec![REPORTED_PERMISSION_COMMAND.into()],
+            serde_json::json!({"command": REPORTED_PERMISSION_COMMAND}),
+            Path::new("/project"),
+            false,
+        ));
+        request.presentation.project = Some("/project".into());
+        app.update(agent_msg(AgentEvent::PermissionRequest(request)));
+        assert!(rendered(&mut app).contains(PERMISSION_TITLE));
+        assert!(dispatch_reported_key(&mut app, held, KeyEventKind::Press).is_empty());
+        assert_eq!(
+            app.permission_prompt.request_id(),
+            Some(REPORTED_PERMISSION_FIRST)
+        );
+        if release {
+            dispatch_reported_key(&mut app, held, KeyEventKind::Release);
+        } else {
+            app.update(Msg::Key(key(KeyCode::Tab)));
+        }
+        rendered(&mut app);
+        assert!(dispatch_reported_key(&mut app, held, KeyEventKind::Press).is_empty());
+        assert!(!app.permission_prompt.is_open());
+        assert_eq!(app.input_box.buffer.value(), shortcut.to_string());
+    }
+}
+
+#[test_case(KeyCode::Char('y'); "approval")]
+#[test_case(KeyCode::Esc; "denial")]
+fn physical_release_between_requests_rearms_the_next_prompt(code: KeyCode) {
+    let mut app = test_app();
+    app.permission_prompt.open(
+        REPORTED_PERMISSION_FIRST.into(),
+        ToolKey::native("bash"),
+        vec![REPORTED_PERMISSION_COMMAND.into()],
+        None,
+    );
+    rendered(&mut app);
+    dispatch_reported_key(&mut app, key(code), KeyEventKind::Press);
+    assert!(!app.permission_prompt.is_open());
+    dispatch_reported_key(&mut app, key(code), KeyEventKind::Release);
+    app.permission_prompt.open(
+        REPORTED_PERMISSION_SECOND.into(),
+        ToolKey::native("bash"),
+        vec![REPORTED_PERMISSION_COMMAND.into()],
+        None,
+    );
+    rendered(&mut app);
+    dispatch_reported_key(&mut app, key(code), KeyEventKind::Press);
+    assert!(!app.permission_prompt.is_open());
+}
+
+#[test_case(KeyEventKind::Repeat; "repeat_cannot_suspend_or_run_a_leader_action")]
+#[test_case(KeyEventKind::Release; "release_cannot_suspend_or_run_a_leader_action")]
+fn reported_permission_key_kinds_never_activate_global_shortcuts(kind: KeyEventKind) {
+    let mut app = test_app();
+    app.permission_prompt.open(
+        REPORTED_PERMISSION_FIRST.into(),
+        ToolKey::native("bash"),
+        vec![REPORTED_PERMISSION_COMMAND.into()],
+        None,
+    );
+    app.which_key.arm();
+    for key in [
+        kb::SUSPEND.to_key_event(),
+        kb::QUIT.to_key_event(),
+        chord::HELP.to_key_event(),
+    ] {
+        assert!(dispatch_reported_key(&mut app, key, kind).is_empty());
+        assert!(app.permission_prompt.is_open());
+        assert!(app.which_key.is_armed());
+        assert_eq!(app.exit_request, ExitRequest::None);
+    }
+}
+
+#[test_case(KeyEventKind::Press; "legacy_editing_and_navigation")]
+#[test_case(KeyEventKind::Repeat; "reported_autorepeat_editing_and_navigation")]
+fn reported_key_routing_preserves_composer_editing(kind: KeyEventKind) {
+    let mut app = test_app();
+    app.update(Msg::Paste("ab".into()));
+    dispatch_reported_key(&mut app, key(KeyCode::Left), kind);
+    dispatch_reported_key(&mut app, key(KeyCode::Char('X')), kind);
+    assert_eq!(app.input_box.buffer.value(), "aXb");
+    dispatch_reported_key(&mut app, key(KeyCode::Backspace), kind);
+    assert_eq!(app.input_box.buffer.value(), "ab");
+    dispatch_reported_key(&mut app, key(KeyCode::Backspace), KeyEventKind::Release);
+    assert_eq!(app.input_box.buffer.value(), "ab");
+}
+
+#[test_case(KeyEventKind::Press; "press")]
+#[test_case(KeyEventKind::Repeat; "repeat")]
+fn reported_key_routing_preserves_paste_editor_editing(kind: KeyEventKind) {
+    let mut app = test_app();
+    open_permission_test_editor(&mut app);
+    dispatch_reported_key(&mut app, key(KeyCode::End), kind);
+    dispatch_reported_key(&mut app, key(KeyCode::Char('X')), kind);
+    assert!(rendered(&mut app).contains(&format!("{PERMISSION_EDITOR_DRAFT}X")));
+    dispatch_reported_key(&mut app, key(KeyCode::Backspace), kind);
+    assert!(rendered(&mut app).contains(PERMISSION_EDITOR_DRAFT));
+    assert!(app.paste_editor.is_open());
+}
+
+fn open_repeat_test_session_picker(app: &mut App) {
+    app.session_picker.open(
+        vec![SessionRow {
+            id: app.state.session.id,
+            title: REPEAT_FIELD_TEXT.into(),
+            updated_at: 0,
+            activity: None,
+            focused: true,
+        }],
+        0,
+    );
+}
+
+#[test_case(KeyEventKind::Repeat; "repeat")]
+#[test_case(KeyEventKind::Release; "release")]
+fn session_title_generation_requires_a_fresh_press(kind: KeyEventKind) {
+    let mut app = test_app();
+    open_repeat_test_session_picker(&mut app);
+    assert!(dispatch_reported_key(&mut app, kb::GENERATE_TITLE.to_key_event(), kind).is_empty());
+    assert!(app.session_picker.is_open());
+    assert!(dispatch_reported_key(&mut app, kb::GENERATE_TITLE.to_key_event(), KeyEventKind::Press)
+        .iter()
+        .any(|action| matches!(action, Action::GenerateSessionTitle(id) if *id == app.state.session.id)));
+}
+
+#[test_case(KeyEventKind::Press; "press")]
+#[test_case(KeyEventKind::Repeat; "repeat")]
+fn search_field_preserves_text_and_backspace_repeats(kind: KeyEventKind) {
+    let mut app = test_app();
+    open_search(&mut app);
+    app.update(Msg::Paste(REPEAT_FIELD_TEXT.into()));
+    dispatch_reported_key(&mut app, key(KeyCode::Char('X')), kind);
+    let extended = format!("{REPEAT_FIELD_TEXT}X");
+    assert!(rendered(&mut app).contains(&extended));
+    dispatch_reported_key(&mut app, key(KeyCode::Backspace), kind);
+    let screen = rendered(&mut app);
+    assert!(screen.contains(REPEAT_FIELD_TEXT));
+    assert!(!screen.contains(&extended));
+    assert!(dispatch_reported_key(&mut app, key(KeyCode::Enter), KeyEventKind::Repeat).is_empty());
+    assert!(app.search_modal.is_open());
+    assert!(app.input_box.is_empty());
+}
+
+#[test_case(KeyEventKind::Press; "press")]
+#[test_case(KeyEventKind::Repeat; "repeat")]
+fn logs_filter_preserves_edit_repeats_without_repeating_log_actions(kind: KeyEventKind) {
+    let mut app = test_app();
+    app.logs_modal.open();
+    assert!(
+        dispatch_reported_key(&mut app, key(KeyCode::Char('/')), KeyEventKind::Repeat).is_empty()
+    );
+    assert!(!app.logs_modal.text_input_active());
+    app.update(Msg::Key(key(KeyCode::Char('/'))));
+    assert!(app.logs_modal.text_input_active());
+    app.update(Msg::Paste(REPEAT_FIELD_TEXT.into()));
+    dispatch_reported_key(&mut app, key(KeyCode::Char('q')), kind);
+    let extended = format!("{REPEAT_FIELD_TEXT}q");
+    assert!(rendered(&mut app).contains(&extended));
+    dispatch_reported_key(&mut app, key(KeyCode::Backspace), kind);
+    let screen = rendered(&mut app);
+    assert!(screen.contains(REPEAT_FIELD_TEXT));
+    assert!(!screen.contains(&extended));
+    for event in [
+        key(KeyCode::Enter),
+        key(KeyCode::Esc),
+        kb::QUIT.to_key_event(),
+    ] {
+        assert!(dispatch_reported_key(&mut app, event, KeyEventKind::Repeat).is_empty());
+        assert!(app.logs_modal.text_input_active());
+    }
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert!(!app.logs_modal.text_input_active());
+    for code in [KeyCode::Char('q'), KeyCode::Char('/')] {
+        assert!(dispatch_reported_key(&mut app, key(code), KeyEventKind::Repeat).is_empty());
+        assert!(app.logs_modal.is_open());
+        assert!(!app.logs_modal.text_input_active());
+    }
+    app.update(Msg::Key(key(KeyCode::Char('q'))));
+    assert!(!app.logs_modal.is_open());
+    assert!(app.input_box.is_empty());
+}
+
+#[test_case(KeyEventKind::Press; "press")]
+#[test_case(KeyEventKind::Repeat; "repeat")]
+fn custom_question_answer_preserves_edit_repeats_without_repeating_decisions(kind: KeyEventKind) {
+    let mut app = streaming_app();
+    let (answer_tx, answers) = flume::unbounded();
+    app.answer_tx = Some(answer_tx);
+    open_question(&mut app);
+    app.update(Msg::Key(key(KeyCode::Down)));
+    assert!(dispatch_reported_key(&mut app, key(KeyCode::Enter), KeyEventKind::Repeat).is_empty());
+    assert!(!app.question_form.text_input_active());
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert!(app.question_form.text_input_active());
+    app.update(Msg::Paste(REPEAT_FIELD_TEXT.into()));
+    dispatch_reported_key(&mut app, key(KeyCode::Char('X')), kind);
+    assert!(rendered(&mut app).contains(&format!("{REPEAT_FIELD_TEXT}X")));
+    for _ in 0..2 {
+        dispatch_reported_key(&mut app, key(KeyCode::Backspace), kind);
+    }
+    for event in [
+        key(KeyCode::Enter),
+        key(KeyCode::Esc),
+        kb::QUIT.to_key_event(),
+    ] {
+        assert!(dispatch_reported_key(&mut app, event, KeyEventKind::Repeat).is_empty());
+        assert!(app.question_form.text_input_active());
+        assert_eq!(answers.try_recv(), Err(TryRecvError::Empty));
+        assert_eq!(app.status, Status::Streaming);
+    }
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert!(!app.question_form.is_open());
+    assert!(!app.question_form.text_input_active());
+    let submitted: Vec<Vec<String>> = serde_json::from_str(&answers.try_recv().unwrap()).unwrap();
+    assert_eq!(submitted, vec![vec![REPEAT_FIELD_EDITED.to_owned()]]);
+    assert!(app.input_box.is_empty());
+}
+
+#[test_case(KeyEventKind::Press; "press")]
+#[test_case(KeyEventKind::Repeat; "repeat")]
+fn session_rename_preserves_text_and_backspace_repeats(kind: KeyEventKind) {
+    let mut app = test_app();
+    open_repeat_test_session_picker(&mut app);
+    app.update(Msg::Key(kb::RENAME_SESSION.to_key_event()));
+    dispatch_reported_key(&mut app, key(KeyCode::Char('X')), kind);
+    assert!(rendered(&mut app).contains(&format!("{REPEAT_FIELD_TEXT}X")));
+    for _ in 0..2 {
+        dispatch_reported_key(&mut app, key(KeyCode::Backspace), kind);
+    }
+    assert!(dispatch_reported_key(&mut app, key(KeyCode::Enter), KeyEventKind::Repeat).is_empty());
+    let actions = app.update(Msg::Key(key(KeyCode::Enter)));
+    assert!(actions.iter().any(|action| matches!(action,
+        Action::SetSessionTitle { id, title } if *id == app.state.session.id && title == REPEAT_FIELD_EDITED)));
+    assert!(app.input_box.is_empty());
+}
+
+fn workbench_repeat_editor() -> (TempDir, PathBuf, App) {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join(REPEAT_EDITOR_FILE);
+    fs::write(&path, REPEAT_FIELD_TEXT).unwrap();
+    let mut app = test_app();
+    app.workbench.open_at(dir.path(), &path, None);
+    rendered(&mut app);
+    (dir, path, app)
+}
+
+#[test_case(KeyEventKind::Press; "press")]
+#[test_case(KeyEventKind::Repeat; "repeat")]
+fn workbench_text_and_backspace_repeats_edit_without_repeating_save(kind: KeyEventKind) {
+    let (_dir, path, mut app) = workbench_repeat_editor();
+    assert!(app.workbench.text_input_active());
+    dispatch_reported_key(&mut app, key(KeyCode::End), kind);
+    dispatch_reported_key(&mut app, key(KeyCode::Char('X')), kind);
+    assert!(rendered(&mut app).contains(&format!("{REPEAT_FIELD_TEXT}X")));
+    for _ in 0..2 {
+        dispatch_reported_key(&mut app, key(KeyCode::Backspace), kind);
+    }
+    let save = KeyEvent::new(workbench_keys::SAVE.code, workbench_keys::SAVE.modifiers);
+    assert!(dispatch_reported_key(&mut app, save, KeyEventKind::Repeat).is_empty());
+    assert_eq!(fs::read_to_string(&path).unwrap(), REPEAT_FIELD_TEXT);
+    assert!(dispatch_reported_key(&mut app, save, KeyEventKind::Press).is_empty());
+    assert_eq!(fs::read_to_string(&path).unwrap(), REPEAT_FIELD_EDITED);
+    assert!(app.input_box.is_empty());
+}
+
+#[test_case(KeyCode::Char('d'); "discard")]
+#[test_case(KeyCode::Char('s'); "save")]
+#[test_case(KeyCode::Char('c'); "cancel")]
+#[test_case(KeyCode::Enter; "selected_answer")]
+fn workbench_confirmation_never_inherits_text_repeat_ownership(code: KeyCode) {
+    let (_dir, path, mut app) = workbench_repeat_editor();
+    app.update(Msg::Key(key(KeyCode::End)));
+    app.update(Msg::Key(key(KeyCode::Char('X'))));
+    app.update(Msg::Key(kb::LEADER.to_key_event()));
+    app.update(Msg::Key(KeyEvent::new(
+        workbench_keys::CLOSE_TAB.code,
+        workbench_keys::CLOSE_TAB.modifiers,
+    )));
+    assert!(!app.workbench.text_input_active());
+    assert!(dispatch_reported_key(&mut app, key(code), KeyEventKind::Repeat).is_empty());
+    assert!(!app.workbench.text_input_active());
+    assert_eq!(app.workbench.layout().tabs, vec![path.clone()]);
+    assert_eq!(fs::read_to_string(&path).unwrap(), REPEAT_FIELD_TEXT);
+    app.update(Msg::Key(key(KeyCode::Char('c'))));
+    assert!(app.workbench.text_input_active());
+}
+
+#[test_case(KeyEventKind::Press; "press")]
+#[test_case(KeyEventKind::Repeat; "repeat")]
+fn review_note_preserves_edit_repeats_without_repeating_note_actions(kind: KeyEventKind) {
+    let mut app = test_app();
+    app.review.open(
+        DisplaySource::AssistantText(CaudraId::generate()),
+        ReviewTarget {
+            lines: vec![Line::raw(REPEAT_FIELD_TEXT)],
+            provenance: None,
+            label: ASSISTANT_LABEL,
+        },
+    );
+    rendered(&mut app);
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert!(app.review.text_input_active());
+    app.update(Msg::Paste(REPEAT_FIELD_TEXT.into()));
+    dispatch_reported_key(&mut app, key(KeyCode::Char('X')), kind);
+    assert!(rendered(&mut app).contains(&format!("{REPEAT_FIELD_TEXT}X")));
+    for _ in 0..2 {
+        dispatch_reported_key(&mut app, key(KeyCode::Backspace), kind);
+    }
+    let save = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
+    assert!(dispatch_reported_key(&mut app, save, KeyEventKind::Repeat).is_empty());
+    assert!(app.review.text_input_active());
+    app.update(Msg::Key(save));
+    assert!(!app.review.text_input_active());
+    assert_eq!(app.review.notes_pending(), 1);
+    assert!(
+        dispatch_reported_key(&mut app, key(KeyCode::Char('d')), KeyEventKind::Repeat).is_empty()
+    );
+    assert_eq!(app.review.notes_pending(), 1);
+    assert!(dispatch_reported_key(&mut app, save, KeyEventKind::Repeat).is_empty());
+    assert!(app.review.is_open());
+    app.update(Msg::Key(save));
+    assert!(!app.review.is_open());
+    assert!(
+        app.input_box
+            .expanded_text()
+            .contains(&format!("\n{REPEAT_FIELD_EDITED}\n</note>"))
+    );
+}
+
+#[test_case(KeyEventKind::Release; "denial_release_does_not_become_a_global_quit")]
+#[test_case(KeyEventKind::Repeat; "held_denial_does_not_become_a_global_quit")]
+fn reported_ctrl_c_cannot_exit_after_denying_a_prompt(kind: KeyEventKind) {
+    let mut app = test_app();
+    app.permission_prompt.open(
+        REPORTED_PERMISSION_FIRST.into(),
+        ToolKey::native("bash"),
+        vec![REPORTED_PERMISSION_COMMAND.into()],
+        None,
+    );
+    assert!(
+        dispatch_reported_key(&mut app, kb::QUIT.to_key_event(), KeyEventKind::Press).is_empty()
+    );
+    assert!(!app.permission_prompt.is_open());
+    assert!(dispatch_reported_key(&mut app, kb::QUIT.to_key_event(), kind).is_empty());
+    assert_eq!(app.exit_request, ExitRequest::None);
+    assert!(
+        dispatch_reported_key(&mut app, kb::QUIT.to_key_event(), KeyEventKind::Press)
+            .iter()
+            .any(|action| matches!(action, Action::ManualExit))
+    );
+}
+
+#[test_case(KeyEventKind::Repeat; "repeat")]
+#[test_case(KeyEventKind::Release; "release")]
+fn reported_ctrl_c_cannot_cancel_a_run_after_denying_its_last_prompt(kind: KeyEventKind) {
+    let mut app = streaming_app();
+    app.permission_prompt.open(
+        REPORTED_PERMISSION_FIRST.into(),
+        ToolKey::native("bash"),
+        vec![REPORTED_PERMISSION_COMMAND.into()],
+        None,
+    );
+    assert!(
+        dispatch_reported_key(&mut app, kb::QUIT.to_key_event(), KeyEventKind::Press).is_empty()
+    );
+    assert!(!app.permission_prompt.is_open());
+    assert!(dispatch_reported_key(&mut app, kb::QUIT.to_key_event(), kind).is_empty());
+    assert_eq!(app.status, Status::Streaming);
+    assert!(app.cancelling_run.is_none());
+    assert_eq!(app.exit_request, ExitRequest::None);
+}
+
+#[test_case(kb::SUSPEND.to_key_event(); "suspend")]
+#[test_case(kb::LEADER.to_key_event(); "leader")]
+#[test_case(kb::EXIT.to_key_event(); "exit")]
+#[test_case(kb::QUIT.to_key_event(); "quit")]
+#[test_case(key(KeyCode::Enter); "submit")]
+#[test_case(key(KeyCode::Esc); "escape")]
+fn reported_repeats_do_not_activate_global_actions(key: KeyEvent) {
+    let mut app = test_app();
+    app.update(Msg::Paste(REPORTED_PERMISSION_COMMAND.into()));
+    for _ in 0..2 {
+        assert!(dispatch_reported_key(&mut app, key, KeyEventKind::Repeat).is_empty());
+    }
+    assert_eq!(app.input_box.buffer.value(), REPORTED_PERMISSION_COMMAND);
+    assert!(!app.which_key.is_armed());
+    assert_eq!(app.exit_request, ExitRequest::None);
+    assert!(app.last_exit.is_none());
+    assert!(app.last_esc.is_none());
+}
+
+#[test_case(KeyCode::Enter; "enter")]
+#[test_case(KeyCode::Char('y'); "yes")]
+fn reported_repeats_cannot_accept_project_trust_confirmation(code: KeyCode) {
+    let mut app = app_awaiting_permission_config_trust();
+    app.open_awaiting_permission_config_trust(false);
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    rendered(&mut app);
+    assert!(dispatch_reported_key(&mut app, key(code), KeyEventKind::Repeat).is_empty());
+    assert!(app.permissions.needs_project_permission_config_trust());
+    assert!(app.permissions_picker.is_open());
+}
+
 #[test]
 fn ctrl_c_denies_permission_prompt() {
     let mut app = test_app();
@@ -13745,16 +14780,56 @@ fn permission_decision_answers_manager_request_id_directly() {
             )
             .await
     });
-    let envelope = smol::block_on(event_rx.recv_async()).unwrap();
+    let envelope = event_rx.recv_timeout(PERMISSION_TEST_TIMEOUT).unwrap();
     assert_eq!(app.permissions.pending_count(), 1);
     app.update(Msg::Agent(Box::new(envelope)));
+    rendered(&mut app);
 
     app.update(Msg::Key(key(KeyCode::Char('y'))));
 
-    assert!(smol::block_on(task).is_ok());
+    assert!(smol::block_on(futures_lite::future::or(
+        async { task.await.is_ok() },
+        async {
+            smol::Timer::after(PERMISSION_TEST_TIMEOUT).await;
+            false
+        },
+    )));
     assert_eq!(app.permissions.pending_count(), 0);
     assert!(app.permission_prompt.request_id().is_none());
     drop(legacy_tx);
+}
+
+#[test_case(false; "current_request")]
+#[test_case(true; "queued_request")]
+fn permission_updates_refresh_existing_requests_without_enqueuing(queued: bool) {
+    const REQUEST_ID: &str = "updated-request";
+    const ORIGINAL: &str = "cargo test";
+    const UPDATED: &str = "cargo check";
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    if queued {
+        app.update(agent_msg(permission_event("first", "cargo build")));
+    }
+    app.update(agent_msg(permission_event(REQUEST_ID, ORIGINAL)));
+    rendered(&mut app);
+    let AgentEvent::PermissionRequest(request) = permission_event(REQUEST_ID, UPDATED) else {
+        unreachable!()
+    };
+    app.update(agent_msg(AgentEvent::PermissionRequestUpdated(request)));
+    assert_eq!(
+        app.permission_prompt.pending_count(),
+        1 + usize::from(queued)
+    );
+    if queued {
+        app.update(Msg::Key(key(KeyCode::Esc)));
+    }
+    assert_eq!(app.permission_prompt.request_id(), Some(REQUEST_ID));
+    app.update(Msg::Key(key(KeyCode::Char('y'))));
+    assert_eq!(app.permission_prompt.request_id(), Some(REQUEST_ID));
+    let text = rendered(&mut app);
+    assert!(text.contains(UPDATED));
+    assert!(!text.contains(ORIGINAL));
 }
 
 const TEST_AREA: Rect = Rect {

@@ -1,8 +1,16 @@
 #![forbid(unsafe_code)]
 
+mod pattern_analysis;
 mod read_only_shell;
 mod remote;
 
+pub use pattern_analysis::{
+    BashContextAssumptions, BashContextIssue, BashOperatorKind, BashSpan,
+    COMMAND_OBSERVATION_ATTRIBUTE, MAX_PATTERN_DIAGNOSTIC_DETAILS, PatternCallAnalysis,
+    PatternCallDiagnostics, PatternCommandOmission, PatternObligationCount, PatternObligationKind,
+    PatternOmissionReason, PatternSourceObligation, PatternSourceObligations,
+    analyze_pattern_calls,
+};
 pub use remote::{
     NamedBearerCredential, PendingRemoteOperation, RemoteConnectionStatus, RemoteEvent,
     RemotePreparedToolCall, RemoteToolResultEnvelope, RemoteWorkcellClient, RemoteWorkcellError,
@@ -18,10 +26,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use caudra_agent::patch;
+use caudra_agent::permissions::pattern_recognition::ObservationProvenance;
 use caudra_agent::permissions::{
-    CONFINED_READ_ATTRIBUTE, CONFINED_READ_VALUE, PermissionAuthorityProfile, PermissionResource,
-    PermissionResourceAccess, PermissionResourceKind, PermissionRisk, RemotePermissionIdentity,
-    filesystem_permission_resource, shell_permission_scope,
+    COMMAND_OBSERVATION_BINDING_ATTRIBUTE, CONFINED_READ_ATTRIBUTE, CONFINED_READ_VALUE,
+    PermissionAuthorityProfile, PermissionResource, PermissionResourceAccess,
+    PermissionResourceKind, PermissionRisk, RemotePermissionIdentity,
+    filesystem_permission_resource, prepared_command_binding, shell_permission_scope,
 };
 use caudra_agent::tools::{
     BoxFuture, DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError,
@@ -37,6 +47,9 @@ use caudra_agent::{
     IndexSourceRange as AgentIndexSourceRange, PatchedFile, SearchCap, SharedBuf,
     ShellFilterInfo as AgentShellFilterInfo, ShellOutput as AgentShellOutput, SnapshotLine,
     TextOutput, ToolInput, ToolOutput,
+};
+use caudra_storage::permission_state::{
+    BROWSE_DIRECT, BROWSE_RECURSION_ATTRIBUTE, BROWSE_RECURSIVE,
 };
 use caudra_workspace::{
     OperationProgressKind, OperationState, OperationStatus, PreparedToolCall, ToolPrepareRequest,
@@ -65,6 +78,7 @@ use workcell::files::{
     FileResource, FileResourceAccess, FileToolGroup, FileWriteInput, FileWriteOutput,
     IndexDirectoryEntryKind, IndexExecutionConfiguration, IndexInput, IndexLimits,
     IndexLineSemantic, IndexOutput as WorkcellIndexOutput, ModelText, PreparedFilePatch,
+    PreparedFileRead,
 };
 use workcell::output_filter::RowRenderer;
 use workcell::shell::{
@@ -119,9 +133,6 @@ const REMOTE_POLL_MAX: Duration = Duration::from_secs(2);
 const REMOTE_EXECUTION_TIMEOUT: Duration = Duration::from_secs(600);
 const REMOTE_RECONCILE_TIMEOUT: Duration = Duration::from_secs(10);
 const REMOTE_RECONCILE_MAX_POLLS: usize = 4;
-/// The one redirect destination that reaches nothing: writes to it are
-/// discarded and reads from it yield end of file.
-const NULL_DEVICE: &str = "/dev/null";
 /// Caudra owns authorization, so Workcell always hands over the mutation
 /// tools and every write still passes through the permission layer first.
 /// Withholding them here would hide tools the user is allowed to approve.
@@ -781,10 +792,12 @@ impl Tool for WorkcellTool {
 
     fn parse(&self, input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
         reject_unknown_fields(&self.spec, input).map_err(ParseError::custom)?;
+        let raw_input = (self.kind == ToolKind::Shell).then(|| input.clone());
         let input = Input::parse(self.kind, input.clone()).map_err(ParseError::custom)?;
         Ok(Box::new(WorkcellInvocation {
             host: Arc::clone(&self.host),
             input,
+            raw_input,
             prepared: Mutex::new(None),
         }))
     }
@@ -898,6 +911,8 @@ fn parse_input<T: DeserializeOwned>(name: &str, input: Value) -> Result<T, Strin
 
 enum PreparedExecution {
     File(FileToolGroup, Input),
+    FileRead(FileToolGroup, PreparedFileRead),
+    DirectoryRead(FileToolGroup, PreparedFileRead),
     Index(FileToolGroup, FileResource),
     FilePatch(FileToolGroup, PreparedFilePatch),
     Websearch(PreparedWebsearch),
@@ -918,6 +933,7 @@ struct PreparedInvocation {
 struct WorkcellInvocation {
     host: Arc<HostInner>,
     input: Input,
+    raw_input: Option<Value>,
     prepared: Mutex<Option<PreparedInvocation>>,
 }
 
@@ -937,27 +953,39 @@ impl WorkcellInvocation {
                 let host = Arc::clone(&self.host);
                 let cwd = project.clone();
                 let inspection_input = input.clone();
-                let (group, resource) = self
+                let (group, read) = self
                     .host
-                    .run(ctx, move |_| async move {
+                    .run(ctx, move |token| async move {
                         let groups = host.project_groups(cwd).await?;
-                        let resource = groups
+                        let read = groups
                             .files
-                            .inspect_read(&inspection_input)
+                            .prepare_read(inspection_input.clone(), &token)
                             .await
                             .map_err(|e| e.to_string())?;
-                        Ok::<_, String>((groups.files, resource))
+                        if read.resource().access != FileResourceAccess::Traverse {
+                            return Ok::<_, String>((groups.files, read));
+                        }
+                        let group = FileToolGroup::new(
+                            &read.resource().path,
+                            false,
+                            Some(*groups.files.limits()),
+                        )
+                        .await
+                        .map_err(|error| error.to_string())?;
+                        let read = group
+                            .prepare_read(
+                                FileReadInput {
+                                    file_path: read.resource().path.to_string_lossy().into_owned(),
+                                    ..inspection_input
+                                },
+                                &token,
+                            )
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        Ok((group, read))
                     })
                     .await??;
-                let mut authorized = input.clone();
-                authorized.file_path = resource.path.to_string_lossy().into_owned();
-                file_prepared(
-                    vec![resource],
-                    &project,
-                    group,
-                    Input::FileRead(authorized),
-                    &[],
-                )
+                file_read_prepared(&project, group, read)
             }
             Input::FileGlob(input) => {
                 let host = Arc::clone(&self.host);
@@ -1179,7 +1207,7 @@ impl WorkcellInvocation {
                         Ok::<_, String>((group, prepared))
                     })
                     .await??;
-                shell_prepared(group, shell, &project)
+                shell_prepared(group, shell, &project, self.raw_input.as_ref())
             }
             Input::Code(_) => exact_custom_prepared(
                 "isolated_compute",
@@ -2263,9 +2291,17 @@ impl ToolInvocation for WorkcellInvocation {
             .map(|prepared| &prepared.execution)
         {
             Some(PreparedExecution::Shell(_, shell)) => {
-                let opaque =
-                    shell.analysis().opaque || shell_command_hides_operands(shell.command());
-                if read_only_shell::is_read_only(shell.analysis(), opaque) {
+                let read_only = shell.bash_program().ok().is_some_and(|program| {
+                    shell.bash_command_contexts().ok().is_some_and(|contexts| {
+                        let facts = pattern_analysis::shell_facts(program, &contexts);
+                        !facts.opaque
+                            && facts
+                                .commands
+                                .iter()
+                                .all(|command| read_only_shell::scope_is_read_only(&command.scope))
+                    })
+                });
+                if read_only {
                     PlanModeAccess::ReadOnly
                 } else {
                     PlanModeAccess::Prompted
@@ -2280,6 +2316,10 @@ impl ToolInvocation for WorkcellInvocation {
         ctx: &'a ToolContext,
     ) -> BoxFuture<'a, Result<Option<PermissionIntent>, String>> {
         Box::pin(async move { self.prepare(ctx).await.map(Some) })
+    }
+
+    fn permission_input(&self) -> Option<&Value> {
+        self.raw_input.as_ref()
     }
 
     fn execute<'a>(self: Box<Self>, ctx: &'a ToolContext) -> ExecFuture<'a> {
@@ -2300,11 +2340,24 @@ impl WorkcellInvocation {
         prepared: PreparedInvocation,
     ) -> ToolExecResult {
         match (&self.input, prepared.execution) {
-            (Input::FileRead(_), PreparedExecution::File(group, Input::FileRead(input))) => {
+            (Input::FileRead(_), PreparedExecution::DirectoryRead(group, read)) => {
                 match self
                     .host
                     .run(ctx, move |token| async move {
-                        group.file_read(input, &token).await
+                        group.execute_prepared_directory_read(read, &token).await
+                    })
+                    .await
+                {
+                    Ok(Ok(output)) => file_read_result(output),
+                    Ok(Err(error)) => Err(error.to_string()).into(),
+                    Err(error) => Err(error).into(),
+                }
+            }
+            (Input::FileRead(_), PreparedExecution::FileRead(group, read)) => {
+                match self
+                    .host
+                    .run(ctx, move |token| async move {
+                        group.execute_prepared_read(read, &token).await
                     })
                     .await
                 {
@@ -2766,7 +2819,11 @@ fn missing_read_target(intent: &PermissionIntent) -> Option<&str> {
     intent.resources.iter().find_map(|resource| {
         let reads = matches!(
             resource.access,
-            Some(PermissionResourceAccess::Read) | Some(PermissionResourceAccess::Search)
+            Some(
+                PermissionResourceAccess::Read
+                    | PermissionResourceAccess::Search
+                    | PermissionResourceAccess::List
+            )
         );
         let filesystem = matches!(
             resource.kind,
@@ -2777,6 +2834,55 @@ fn missing_read_target(intent: &PermissionIntent) -> Option<&str> {
     })
 }
 
+fn file_read_prepared(
+    project: &Path,
+    group: FileToolGroup,
+    read: PreparedFileRead,
+) -> PreparedInvocation {
+    let directory = read.resource().access == FileResourceAccess::Traverse;
+    let mut resource = filesystem_permission_resource(
+        if directory {
+            PermissionResourceKind::Directory
+        } else {
+            PermissionResourceKind::File
+        },
+        &read.resource().path,
+        if directory {
+            PermissionResourceAccess::List
+        } else {
+            PermissionResourceAccess::Read
+        },
+        project,
+    );
+    if directory {
+        resource
+            .attributes
+            .insert(BROWSE_RECURSION_ATTRIBUTE.into(), BROWSE_DIRECT.into());
+    }
+    let read_targets = if directory {
+        Vec::new()
+    } else {
+        vec![read.resource().path.clone()]
+    };
+    PreparedInvocation {
+        intent: PermissionIntent::new(
+            PermissionScopes::single(resource.value.clone()),
+            vec![resource],
+            PermissionRisk::Low,
+        )
+        .with_authority(PermissionAuthorityProfile::Filesystem {
+            input_pointers: Vec::new(),
+        }),
+        execution: if directory {
+            PreparedExecution::DirectoryRead(group, read)
+        } else {
+            PreparedExecution::FileRead(group, read)
+        },
+        mutation_targets: Vec::new(),
+        read_targets,
+    }
+}
+
 fn file_prepared(
     resources: Vec<FileResource>,
     project: &Path,
@@ -2784,7 +2890,15 @@ fn file_prepared(
     input: Input,
     input_pointers: &[&str],
 ) -> PreparedInvocation {
-    let permissions = file_permissions(&resources, project);
+    let mut permissions = file_permissions(&resources, project);
+    if matches!(input, Input::FileGlob(_)) {
+        for resource in &mut permissions.resources {
+            resource.access = Some(PermissionResourceAccess::List);
+            resource
+                .attributes
+                .insert(BROWSE_RECURSION_ATTRIBUTE.into(), BROWSE_RECURSIVE.into());
+        }
+    }
     let mutation = !permissions.mutation_targets.is_empty();
     PreparedInvocation {
         intent: PermissionIntent::new(
@@ -2991,66 +3105,85 @@ fn shell_prepared(
     group: ShellToolGroup,
     shell: PreparedShell,
     project: &Path,
+    raw_input: Option<&Value>,
 ) -> PreparedInvocation {
-    let opaque = shell.analysis().opaque || shell_command_hides_operands(shell.command());
-    let workdir = shell.workdir().to_string_lossy().into_owned();
-    let scopes = if opaque || shell.analysis().scopes.is_empty() {
-        vec![shell_permission_scope(shell.command(), shell.workdir())]
-    } else {
-        shell
-            .analysis()
-            .scopes
-            .iter()
-            .map(|scope| shell_permission_scope(&scope.source, shell.workdir()))
-            .collect()
-    };
-    // An opaque line describes less than it does, so it stays one resource
-    // holding the whole text, and nothing about it is confined.
-    let commands: Vec<(String, Option<String>, bool)> =
-        if opaque || shell.analysis().scopes.is_empty() {
-            vec![(shell.command().into(), None, false)]
-        } else {
-            shell
-                .analysis()
-                .scopes
-                .iter()
-                .zip(read_only_shell::confined_reads(
-                    shell.analysis(),
-                    shell.workdir(),
-                    project,
-                ))
-                .map(|(scope, confined_read)| {
-                    (
-                        scope.source.clone(),
-                        Some(scope.normalized.clone()),
-                        confined_read,
+    let raw_input = raw_input
+        .filter(|input| input.get("command").and_then(Value::as_str) == Some(shell.command()));
+    let mut opaque = true;
+    let mut resources = Vec::new();
+    let mut scopes = Vec::new();
+    if let Ok(program) = shell.bash_program() {
+        let contexts = shell
+            .bash_command_contexts()
+            .unwrap_or_else(|_| program.command_contexts(shell.workdir()));
+        let facts = pattern_analysis::shell_facts(program, &contexts);
+        opaque = facts.opaque;
+        for command in &facts.commands {
+            let workdir = pattern_analysis::singleton_workdir(command);
+            let mut attributes = BTreeMap::new();
+            if let Some(workdir) = workdir {
+                attributes.insert("workdir".into(), workdir.to_string_lossy().into_owned());
+            }
+            if let Some(context) = command.context
+                && let Ok(incoming) = serde_json::to_string(&context.incoming)
+            {
+                attributes.insert("possible_workdirs".into(), incoming);
+            }
+            attributes.insert(
+                NORMALIZED_COMMAND_ATTRIBUTE.into(),
+                command.scope.normalized.clone(),
+            );
+            if !opaque {
+                if command.context.is_some_and(|context| {
+                    read_only_shell::confined_read(&command.scope, &context.incoming, project)
+                }) {
+                    attributes.insert(CONFINED_READ_ATTRIBUTE.into(), CONFINED_READ_VALUE.into());
+                }
+                if let Some(raw_input) = raw_input
+                    && let Some(mut observation) = pattern_analysis::command_observation(
+                        program,
+                        command,
+                        shell.workdir(),
+                        project,
+                        ObservationProvenance::Native,
                     )
-                })
-                .collect()
-        };
-    let resources = commands
-        .into_iter()
-        .map(|(command, normalized, confined_read)| {
-            let mut attributes = BTreeMap::from([("workdir".into(), workdir.clone())]);
-            if let Some(normalized) = normalized {
-                attributes.insert(NORMALIZED_COMMAND_ATTRIBUTE.into(), normalized);
+                {
+                    let binding = prepared_command_binding(&command.scope.source, raw_input);
+                    observation.source.input_hash = binding.clone();
+                    if let Ok(observation) = serde_json::to_string(&observation) {
+                        attributes.insert(COMMAND_OBSERVATION_ATTRIBUTE.into(), observation);
+                        attributes.insert(COMMAND_OBSERVATION_BINDING_ATTRIBUTE.into(), binding);
+                    }
+                }
             }
-            if confined_read {
-                attributes.insert(
-                    CONFINED_READ_ATTRIBUTE.into(),
-                    CONFINED_READ_VALUE.to_owned(),
-                );
-            }
-            PermissionResource {
+            scopes.push(shell_permission_scope(
+                &command.scope.source,
+                workdir.unwrap_or(shell.workdir()),
+            ));
+            resources.push(PermissionResource {
                 kind: PermissionResourceKind::Command,
-                value: command,
+                value: command.scope.source.clone(),
                 access: Some(PermissionResourceAccess::Execute),
-                protected: opaque,
-                requires_prompt: opaque,
+                protected: false,
+                requires_prompt: false,
                 attributes,
-            }
-        })
-        .collect();
+            });
+        }
+    }
+    if opaque {
+        scopes.push(shell_permission_scope(shell.command(), shell.workdir()));
+        resources.push(PermissionResource {
+            kind: PermissionResourceKind::Command,
+            value: shell.command().into(),
+            access: Some(PermissionResourceAccess::Execute),
+            protected: true,
+            requires_prompt: true,
+            attributes: BTreeMap::from([(
+                "workdir".into(),
+                shell.workdir().to_string_lossy().into_owned(),
+            )]),
+        });
+    }
     PreparedInvocation {
         intent: PermissionIntent::new(
             // Opaque commands carry `requires_prompt` instead of forcing a prompt on
@@ -3076,129 +3209,6 @@ fn shell_prepared(
         mutation_targets: Vec::new(),
         read_targets: Vec::new(),
     }
-}
-
-/// Reports whether a command carries operands that the analyzed scopes drop.
-///
-/// Shell analysis strips redirection nodes from each scope's source, so a file
-/// redirect, heredoc, or here-string would leave the reviewed text describing
-/// less than the command actually does. File descriptor duplication such as
-/// `2>&1` names no operand and stays reviewable, and so does a redirect to
-/// `/dev/null`, which names one that reaches nothing.
-fn shell_command_hides_operands(command: &str) -> bool {
-    let bytes = command.as_bytes();
-    let mut index = 0;
-    let mut comment_eligible = true;
-    while let Some(&byte) = bytes.get(index) {
-        match byte {
-            b'\\' => {
-                index += 2;
-                comment_eligible = false;
-            }
-            b'$' if bytes.get(index + 1) == Some(&b'\'') => {
-                index = skip_quoted(bytes, index + 2, b'\'', true);
-                comment_eligible = false;
-            }
-            b'\'' => {
-                index = skip_quoted(bytes, index + 1, b'\'', false);
-                comment_eligible = false;
-            }
-            b'"' => {
-                index = skip_quoted(bytes, index + 1, b'"', true);
-                comment_eligible = false;
-            }
-            b'#' if comment_eligible => {
-                index = bytes[index..]
-                    .iter()
-                    .position(|byte| *byte == b'\n')
-                    .map_or(bytes.len(), |offset| index + offset);
-            }
-            b'<' | b'>' => {
-                if duplicates_descriptor(bytes, index) {
-                    index += 2;
-                } else if let Some(end) = discards_output(bytes, index) {
-                    index = end;
-                } else {
-                    return true;
-                }
-                comment_eligible = false;
-            }
-            b';' | b'|' | b'&' | b'(' | b')' => {
-                index += 1;
-                comment_eligible = true;
-            }
-            _ => {
-                comment_eligible = byte.is_ascii_whitespace();
-                index += 1;
-            }
-        }
-    }
-    false
-}
-
-/// Advances past a quoted span, optionally honoring backslash escapes.
-fn skip_quoted(bytes: &[u8], mut index: usize, terminator: u8, escapes: bool) -> usize {
-    while let Some(&byte) = bytes.get(index) {
-        match byte {
-            b'\\' if escapes => index += 2,
-            byte if byte == terminator => return index + 1,
-            _ => index += 1,
-        }
-    }
-    index
-}
-
-/// Reports whether the redirect at `index` targets a descriptor rather than a file.
-///
-/// `>&` and `<&` duplicate or close a descriptor when followed by a digit run or
-/// `-`; any other word is a file target that redirects both streams.
-fn duplicates_descriptor(bytes: &[u8], index: usize) -> bool {
-    if bytes.get(index + 1) != Some(&b'&') {
-        return false;
-    }
-    let mut cursor = index + 2;
-    while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
-        cursor += 1;
-    }
-    let digits = cursor;
-    while bytes.get(cursor).is_some_and(u8::is_ascii_digit) {
-        cursor += 1;
-    }
-    if cursor == digits && bytes.get(cursor) != Some(&b'-') {
-        return false;
-    }
-    if bytes.get(cursor) == Some(&b'-') {
-        cursor += 1;
-    }
-    ends_redirect(bytes, cursor)
-}
-
-/// Where a redirect to the null device ends, or `None` when it names something
-/// else.
-///
-/// Writes to `/dev/null` are discarded and reads from it yield end of file, so
-/// naming it drops no operand the review needed to see. A path that merely
-/// begins with it names a different file and stays hidden.
-fn discards_output(bytes: &[u8], index: usize) -> Option<usize> {
-    let mut cursor = index;
-    while bytes
-        .get(cursor)
-        .is_some_and(|byte| matches!(byte, b'<' | b'>'))
-    {
-        cursor += 1;
-    }
-    while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
-        cursor += 1;
-    }
-    let end = cursor + NULL_DEVICE.len();
-    (bytes.get(cursor..end) == Some(NULL_DEVICE.as_bytes()) && ends_redirect(bytes, end))
-        .then_some(end)
-}
-
-fn ends_redirect(bytes: &[u8], cursor: usize) -> bool {
-    bytes.get(cursor).is_none_or(|byte| {
-        byte.is_ascii_whitespace() || matches!(byte, b';' | b'|' | b'&' | b'(' | b')' | b'<' | b'>')
-    })
 }
 
 fn exact_custom_prepared(
@@ -4090,14 +4100,28 @@ mod tests {
     use super::*;
     use caudra_agent::agent::mention_preamble;
     use caudra_agent::cancel::CancelToken;
+    use caudra_agent::permissions::pattern_recognition::{CommandObservation, ShellEffectStatus};
     use caudra_agent::permissions::{
-        PermissionManager, PermissionResourceAccess, PermissionResourceKind,
+        COMMAND_EXACT_PREFIX, COMMAND_TEMPLATE_PREFIX, PermissionAnswer,
+        PermissionCapabilityFamily, PermissionError, PermissionExecutorKind, PermissionLifetime,
+        PermissionManager, PermissionRequest, PermissionResourceAccess, PermissionResourceKind,
+        PermissionResourceSelector, PermissionRowGrant, PermissionSubject,
+        permission_rule_covers_request, permission_rule_covers_resource,
+        review::{COMMAND_TEMPLATE_EXECUTION_NOTICE, review_for_rule},
     };
     use caudra_agent::tools::{FileReadTracker, STALE_READ_MSG, interpreter_ctx};
     use caudra_agent::{AgentMode, ContentBlock, Envelope, EventSender, Mention, Message};
     use caudra_config::{DefaultEffect, Effect, PermissionRule, PermissionsConfig, ToolKey};
+    use caudra_storage::{
+        StateDir,
+        permission_patterns::{
+            ArgumentDomain, ArgumentRole, OptionLikePolicy, PatternToken, SlotCombinations,
+        },
+        permission_state::PermissionState,
+    };
     use caudra_workspace::{OperationHandle, OperationId, OperationProgress, SequenceMetadata};
     use serde_json::json;
+    use smol::lock::Mutex as AsyncMutex;
     use std::any::TypeId;
     use std::ops::RangeInclusive;
     use std::sync::Arc;
@@ -4120,6 +4144,13 @@ mod tests {
     const FILTERABLE_MAKEFILE: &str = "all:\n\t@echo \"make[1]: Entering directory '/x'\"\n\t@echo \"real build line\"\n\t@echo \"make[1]: Leaving directory '/x'\"\n";
     const SHELL_CANCELLED: &str = "Shell execution cancelled";
     const LOCKFILE: &str = "package-lock.json";
+    const BROWSE_CONTENT_SENTINEL: &str = "content_not_authorized_by_a_names_only_grant";
+    const PATTERN_PACKAGES: [&str; 3] = ["alpha", "beta", "gamma"];
+    const PATTERN_COMMAND: &str = "cargo check -p alpha --tests";
+    const PATTERN_TIMEOUT_MS: u64 = 1_000;
+    const GENERIC_NAME_REGEX: &str = "(?:alpha|beta|gamma|delta-[0-9]+)";
+    const POSSIBLE_WORKDIRS_ATTRIBUTE: &str = "possible_workdirs";
+    const POSSIBLE_WORKDIRS_LABEL: &str = "Possible working directories:";
     /// The descriptor pretty-prints to about 170 lines on a populated host; a
     /// rendering that ever approached that would have stopped being one.
     const ENVIRONMENT_MAX_MODEL_LINES: usize = 40;
@@ -4669,17 +4700,22 @@ mod tests {
     #[test_case("cat < /dev/null", false; "read_from_the_device")]
     #[test_case("cargo check >&2", false; "stdout_to_stderr")]
     #[test_case("cargo check 1>&2", false; "explicit_stdout_to_stderr")]
-    #[test_case("exec 3<&0", false; "input_descriptor_duplicate")]
+    #[test_case("exec 3<&0", true; "input_descriptor_state_change")]
     #[test_case("cargo check >& 2", false; "spaced_descriptor_duplicate")]
     #[test_case("cargo check 2>&-", false; "descriptor_close")]
-    #[test_case("printf ok # > ignored", false; "redirect_inside_comment")]
-    #[test_case("printf '%s > %s' left right", false; "single_quoted_literal")]
-    #[test_case(r#"printf ">""#, false; "double_quoted_literal")]
-    #[test_case(r"printf \>", false; "escaped_literal")]
-    #[test_case(r"printf $'a\'b'", false; "ansi_c_quoted_literal")]
-    #[test_case(r"printf $'>'", false; "ansi_c_quoted_redirect_literal")]
+    #[test_case("echo ok # > ignored", false; "redirect_inside_comment")]
+    #[test_case("echo '%s > %s' left right", false; "single_quoted_literal")]
+    #[test_case(r#"echo ">""#, false; "double_quoted_literal")]
+    #[test_case(r"echo \>", false; "escaped_literal")]
+    #[test_case(r"echo $'a\'b'", true; "undecoded_ansi_c_quoted_literal")]
+    #[test_case(r"echo $'>'", true; "undecoded_ansi_c_quoted_redirect_literal")]
     fn shell_commands_hiding_operands_require_exact_authority(command: &str, expected: bool) {
-        assert_eq!(shell_command_hides_operands(command), expected);
+        let root = TempDir::new().expect("tempdir");
+        let intent = shell_preflight_intent(root.path(), command);
+        assert_eq!(
+            intent.resources.iter().any(|resource| resource.protected),
+            expected
+        );
     }
 
     #[test_case("/usr/bin/git status"; "absolute_executable")]
@@ -4730,10 +4766,15 @@ mod tests {
 
         assert!(!intent.scopes.force_prompt);
         assert_eq!(intent.authority, PermissionAuthorityProfile::Shell);
-        assert_eq!(intent.resources.len(), 1);
-        assert_eq!(intent.resources[0].value, command);
-        assert!(intent.resources[0].protected);
-        assert!(intent.resources[0].requires_prompt);
+        let whole_source = intent.resources.last().expect("whole source resource");
+        assert_eq!(whole_source.value, command);
+        assert!(whole_source.protected);
+        assert!(whole_source.requires_prompt);
+        assert!(
+            !whole_source
+                .attributes
+                .contains_key(NORMALIZED_COMMAND_ATTRIBUTE)
+        );
     }
 
     /// The classifier's answer has to reach the permission layer or it only ever
@@ -4768,6 +4809,71 @@ mod tests {
     // disqualify the line rather than wait for the confinement check.
     #[test_case("find . $FLAG" => false ; "find could be hiding -delete")]
     #[test_case("rg $PRE pattern" => false ; "ripgrep could be hiding --pre")]
+    #[test_case("git branch -D topic" => false ; "branch_force_delete")]
+    #[test_case("git branch --delete topic" => false ; "branch_delete")]
+    #[test_case("git branch --del topic" => false ; "branch_abbreviated_delete")]
+    #[test_case("git branch -m old new" => false ; "branch_rename")]
+    #[test_case("git branch -c old new" => false ; "branch_copy")]
+    #[test_case("git branch topic" => false ; "branch_create")]
+    #[test_case("git branch --list -D topic" => false ; "branch_list_does_not_hide_mutation")]
+    #[test_case("git tag release" => false ; "tag_create")]
+    #[test_case("git tag -a release -m message" => false ; "tag_annotated_create")]
+    #[test_case("git tag --list -d release" => false ; "tag_list_does_not_hide_delete")]
+    #[test_case("git reflog expire --expire=now --all" => false ; "reflog_expire")]
+    #[test_case("git reflog delete HEAD@{0}" => false ; "reflog_delete")]
+    #[test_case("git reflog drop --all" => false ; "reflog_drop")]
+    #[test_case("git branch --list 'topic*'" => true ; "branch_explicit_list")]
+    #[test_case("git branch -avv" => false ; "unreviewed_branch_cluster")]
+    #[test_case("git branch -a -vv" => true ; "branch_verbose_list")]
+    #[test_case("git branch --show-current" => true ; "branch_current")]
+    #[test_case("git tag" => true ; "tag_implicit_list")]
+    #[test_case("git tag --list 'v*'" => true ; "tag_explicit_list")]
+    #[test_case("git reflog show --oneline -3" => true ; "reflog_show")]
+    #[test_case("git diff --out=output" => false ; "git_abbreviated_output")]
+    #[test_case("git ls-files --open-files-in-pager=sh" => false ; "git_pager_helper")]
+    #[test_case("git show --textconv HEAD" => false ; "git_textconv_helper")]
+    #[test_case("git --paginate log" => false ; "git_explicit_pager")]
+    #[test_case("./cat Cargo.toml" => false ; "relative_executable_spoof")]
+    #[test_case("/usr/bin/cat Cargo.toml" => false ; "absolute_executable_unproven")]
+    #[test_case("'./cat' Cargo.toml" => false ; "quoted_executable_spoof")]
+    #[test_case("./git status" => false ; "git_executable_spoof")]
+    #[test_case("./cd . && cat Cargo.toml" => false ; "cd_executable_spoof")]
+    #[test_case("'cat' Cargo.toml" => false ; "quoted_executable_unproven")]
+    #[test_case("c\\at Cargo.toml" => false ; "escaped_executable_unproven")]
+    #[test_case("cat .env" => false ; "protected_dotenv")]
+    #[test_case("cat .env.local" => false ; "protected_dotenv_variant")]
+    #[test_case("cat .git/config" => false ; "protected_git_config")]
+    #[test_case("cat .git/hooks/pre-commit" => false ; "protected_git_hook")]
+    #[test_case("cat .ssh/id_rsa" => false ; "protected_ssh")]
+    #[test_case("cat .aws/credentials" => false ; "protected_aws")]
+    #[test_case("cat vendor/dep/.git/HEAD" => false ; "protected_nested_git")]
+    #[test_case("cat .git/HEAD" => true ; "inert_project_git_head")]
+    #[test_case("cat .git/refs/heads/main" => true ; "inert_project_git_ref")]
+    #[test_case("rg --file=.env needle src" => false ; "protected_attached_long_operand")]
+    #[test_case("grep -f.env Cargo.toml" => false ; "protected_attached_short_operand")]
+    #[test_case("rg -f.env Cargo.toml" => false ; "protected_ripgrep_attached_operand")]
+    #[test_case("git show HEAD:.env" => false ; "protected_revision_operand")]
+    #[test_case("cd .git && cat config" => false ; "protected_directory_change")]
+    #[test_case("cd -P && cat x" => false ; "implicit_home_after_cd_option")]
+    #[test_case("date -s now" => false ; "date_set")]
+    #[test_case("date --se=now" => false ; "date_abbreviated_set")]
+    #[test_case("date 010100002026" => false ; "date_positional_set")]
+    #[test_case("date -u +%F" => true ; "date_display")]
+    #[test_case("tree -o output" => false ; "tree_output")]
+    #[test_case("tree -a src" => true ; "tree_listing")]
+    #[test_case("file -C -m magic" => false ; "file_compile")]
+    #[test_case("file -z archive.gz" => false ; "file_decompress_helper")]
+    #[test_case("file --mime-type Cargo.toml" => true ; "file_identify")]
+    #[test_case("jq --run-tests tests.jq" => false ; "jq_unreviewed_mode")]
+    #[test_case("printf -v PATH value" => false ; "printf_variable_assignment")]
+    #[test_case("find . -fprint0 output" => false ; "find_null_output")]
+    #[test_case("find -L . -name '*.rs'" => false ; "find_follow_links")]
+    #[test_case("rg --follow needle ." => false ; "ripgrep_follow_links")]
+    #[test_case("sort --out=output Cargo.toml" => false ; "sort_abbreviated_output")]
+    #[test_case("sort -nu Cargo.toml" => true ; "sort_numeric_unique")]
+    #[test_case("grep --dereference-r needle ." => false ; "grep_abbreviated_follow")]
+    #[test_case("wc --files0-from=paths" => false ; "wc_indirect_file_operands")]
+    #[test_case("du --files0-f=paths" => false ; "du_abbreviated_indirect_operands")]
     fn shell_preflight_marks_only_a_confined_read(command: &str) -> bool {
         let root = TempDir::new().expect("tempdir");
         confined_read_preflight_marks(root.path(), command)
@@ -4791,6 +4897,55 @@ mod tests {
         confined_read_preflight_marks(root.path(), command)
     }
 
+    #[test_case(".env", false; "dotenv_alias")]
+    #[test_case(".git/config", false; "git_config_alias")]
+    #[test_case(".git/HEAD", true; "inert_git_alias")]
+    #[test_case("notes.md", true; "ordinary_alias")]
+    fn shell_preflight_protects_resolved_operands(target: &str, expected: bool) {
+        let root = TempDir::new().expect("tempdir");
+        let path = root.path().join(target);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("parent directory");
+        std::fs::write(&path, "fixture").expect("target");
+        std::os::unix::fs::symlink(&path, root.path().join("alias")).expect("alias");
+
+        assert_eq!(
+            confined_read_preflight_marks(root.path(), "cat alias"),
+            expected
+        );
+    }
+
+    #[test_case("execution_environment")]
+    fn environment_preflight_keeps_explicit_authority(tool: &str) {
+        let root = TempDir::new().expect("tempdir");
+        let (_host, registry) = host_and_registry(root.path());
+        let ctx = context(root.path(), Arc::clone(&registry), CancelToken::none());
+        let invocation = registry
+            .get(tool)
+            .expect("registered tool")
+            .tool
+            .parse(&json!({}))
+            .expect("valid input");
+        let intent = smol::block_on(invocation.preflight(&ctx))
+            .expect("preflight")
+            .expect("permission intent");
+
+        assert_eq!(intent.resources.len(), 1);
+        assert!(matches!(
+            intent.resources[0].kind,
+            PermissionResourceKind::Custom { .. }
+        ));
+        assert_eq!(intent.resources[0].value, tool);
+        assert!(
+            !intent.resources[0]
+                .attributes
+                .contains_key(CONFINED_READ_ATTRIBUTE)
+        );
+        assert!(!matches!(
+            invocation.plan_mode_access(),
+            PlanModeAccess::ReadOnly
+        ));
+    }
+
     /// Plan mode gates on `is_read_only` alone, with no confinement check, so
     /// the classifier has to be self-sufficient there. A denied flag cannot be
     /// recognized inside a word the parse could not read, which is why an
@@ -4803,6 +4958,37 @@ mod tests {
     #[test_case("rg $PRE pattern" => false ; "ripgrep could be hiding --pre")]
     #[test_case("git -c core.pager=sh log" => false ; "a flag it can read is refused on its merits")]
     #[test_case("rm -rf build" => false ; "not a read at all")]
+    #[test_case("git branch -D topic" => false ; "branch_force_delete")]
+    #[test_case("git branch --del topic" => false ; "branch_abbreviated_delete")]
+    #[test_case("git branch topic" => false ; "branch_create")]
+    #[test_case("git tag release" => false ; "tag_create")]
+    #[test_case("git tag --list -d release" => false ; "tag_list_with_delete")]
+    #[test_case("git reflog expire --expire=now --all" => false ; "reflog_expire")]
+    #[test_case("git reflog delete HEAD@{0}" => false ; "reflog_delete")]
+    #[test_case("git reflog drop --all" => false ; "reflog_drop")]
+    #[test_case("git branch -a -vv" => true ; "branch_listing")]
+    #[test_case("git tag --list 'v*'" => true ; "tag_listing")]
+    #[test_case("git reflog show --oneline -3" => true ; "reflog_show")]
+    #[test_case("git diff --out=output" => false ; "git_abbreviated_output")]
+    #[test_case("git ls-files --open-files-in-pager=sh" => false ; "git_pager_helper")]
+    #[test_case("git show --textconv HEAD" => false ; "git_textconv_helper")]
+    #[test_case("./cat Cargo.toml" => false ; "relative_executable_spoof")]
+    #[test_case("/usr/bin/cat Cargo.toml" => false ; "absolute_executable_unproven")]
+    #[test_case("'./cat' Cargo.toml" => false ; "quoted_executable_spoof")]
+    #[test_case("./cd ." => false ; "cd_executable_spoof")]
+    #[test_case("cat .env" => true ; "protected_read_still_requires_permission")]
+    #[test_case("cat .git/config" => true ; "protected_git_read_still_requires_permission")]
+    #[test_case("date -s now" => false ; "date_set")]
+    #[test_case("date --se=now" => false ; "date_abbreviated_set")]
+    #[test_case("date 010100002026" => false ; "date_positional_set")]
+    #[test_case("date -u +%F" => true ; "date_display")]
+    #[test_case("tree -o output" => false ; "tree_output")]
+    #[test_case("file -C -m magic" => false ; "file_compile")]
+    #[test_case("file -z archive.gz" => false ; "file_decompress_helper")]
+    #[test_case("jq --run-tests tests.jq" => false ; "jq_unreviewed_mode")]
+    #[test_case("printf -v PATH value" => false ; "printf_variable_assignment")]
+    #[test_case("find . -fprint0 output" => false ; "find_null_output")]
+    #[test_case("sort --out=output Cargo.toml" => false ; "sort_abbreviated_output")]
     fn plan_mode_admits_only_a_line_it_could_read(command: &str) -> bool {
         let root = TempDir::new().expect("tempdir");
         let (_host, registry) = host_and_registry(root.path());
@@ -4819,7 +5005,7 @@ mod tests {
         matches!(invocation.plan_mode_access(), PlanModeAccess::ReadOnly)
     }
 
-    fn confined_read_preflight_rows(root: &Path, command: &str) -> Vec<bool> {
+    fn shell_preflight_intent(root: &Path, command: &str) -> PermissionIntent {
         let (_host, registry) = host_and_registry(root);
         let ctx = context(root, Arc::clone(&registry), CancelToken::none());
         let invocation = registry
@@ -4829,11 +5015,13 @@ mod tests {
             .parse(&json!({"command": command}))
             .expect("valid shell input");
 
-        let intent = smol::block_on(invocation.preflight(&ctx))
+        smol::block_on(invocation.preflight(&ctx))
             .expect("shell preflight")
-            .expect("shell permission intent");
+            .expect("shell permission intent")
+    }
 
-        intent
+    fn confined_read_preflight_rows(root: &Path, command: &str) -> Vec<bool> {
+        shell_preflight_intent(root, command)
             .resources
             .iter()
             .map(|resource| {
@@ -4861,7 +5049,7 @@ mod tests {
         let root = TempDir::new().expect("tempdir");
 
         assert_eq!(
-            confined_read_preflight_rows(root.path(), "cd . && cargo check && rg needle src"),
+            confined_read_preflight_rows(root.path(), "cd src && cargo check && rg needle src"),
             vec![true, false, true]
         );
     }
@@ -4886,6 +5074,836 @@ mod tests {
         assert_eq!(intent.resources[0].value, "cargo check --all-targets");
         assert!(!intent.resources[0].protected);
         assert!(!intent.resources[0].requires_prompt);
+        assert!(
+            !intent.resources[0]
+                .attributes
+                .contains_key(COMMAND_OBSERVATION_ATTRIBUTE)
+        );
+    }
+
+    #[test_case("left/note"; "left_success")]
+    #[test_case("right/note"; "right_success_is_not_left_slash_right")]
+    #[test_case("note"; "both_changes_fail")]
+    fn shell_preflight_checks_every_possible_cd_branch(link: &str) {
+        let root = TempDir::new().expect("tempdir");
+        let outside = TempDir::new().expect("outside");
+        std::fs::create_dir_all(root.path().join("left/right")).expect("left directory");
+        std::fs::create_dir(root.path().join("right")).expect("right directory");
+        std::fs::write(outside.path().join("note"), "outside").expect("outside file");
+        std::os::unix::fs::symlink(outside.path().join("note"), root.path().join(link))
+            .expect("escape link");
+
+        assert_eq!(
+            confined_read_preflight_rows(root.path(), "cd left || cd right; cat note"),
+            vec![true, true, false]
+        );
+    }
+
+    #[test_case("notes.txt", true; "all_branches_inside")]
+    #[test_case(".env", false; "one_branch_resolves_to_protected_file")]
+    fn shell_preflight_applies_protection_to_every_incoming_directory(
+        target: &str,
+        expected: bool,
+    ) {
+        let root = TempDir::new().expect("tempdir");
+        std::fs::create_dir_all(root.path().join("left/right")).expect("left directory");
+        std::fs::create_dir(root.path().join("right")).expect("right directory");
+        std::fs::write(root.path().join(target), "fixture").expect("target");
+        std::os::unix::fs::symlink(root.path().join(target), root.path().join("right/note"))
+            .expect("link");
+        assert_eq!(
+            confined_read_preflight_rows(root.path(), "cd left || cd right; cat note"),
+            vec![true, true, expected]
+        );
+    }
+
+    #[test]
+    fn shell_preflight_keeps_the_initial_directory_after_a_failed_cd() {
+        let root = TempDir::new().expect("tempdir");
+        let outside = TempDir::new().expect("outside");
+        std::fs::write(outside.path().join("note"), "outside").expect("outside file");
+        std::os::unix::fs::symlink(outside.path().join("note"), root.path().join("note"))
+            .expect("escape link");
+        assert_eq!(
+            confined_read_preflight_rows(root.path(), "cd missing; cat note"),
+            vec![true, false]
+        );
+    }
+
+    #[test_case("cd left | cat note; cat note", vec![true, true, true]; "pipeline_isolation")]
+    #[test_case("cd left && cat note", vec![true, false]; "and_success")]
+    #[test_case("(cd left && cat note); cat note", vec![true, false, true]; "subshell_isolation")]
+    fn shell_preflight_tracks_control_flow_not_source_order(command: &str, expected: Vec<bool>) {
+        let root = TempDir::new().expect("tempdir");
+        let outside = TempDir::new().expect("outside");
+        std::fs::create_dir(root.path().join("left")).expect("left directory");
+        std::fs::write(outside.path().join("note"), "outside").expect("outside file");
+        std::os::unix::fs::symlink(outside.path().join("note"), root.path().join("left/note"))
+            .expect("escape link");
+        assert_eq!(confined_read_preflight_rows(root.path(), command), expected);
+    }
+
+    #[test_case("cargo check &&"; "incomplete_syntax")]
+    #[test_case("cargo check <<-EOF\n\t$(touch hidden)\n\tEOF\n"; "heredoc_dash_byte_gap")]
+    #[test_case("MODE=$(echo hidden) cargo check"; "environment_substitution")]
+    #[test_case("cargo check >$(echo hidden)"; "redirect_substitution")]
+    #[test_case("if true; then cargo check; fi"; "unsupported_conditional")]
+    #[test_case("f() { cargo check; }; f"; "function_body")]
+    #[test_case("bash -c 'cargo check'"; "interpreter_wrapper")]
+    #[test_case("cd . && cargo check"; "unknown_cwd_effect")]
+    #[test_case("hash -p ./cargo cargo; cargo check"; "builtin_command_resolution_state")]
+    #[test_case("pwd -P; cargo check"; "builtin_flags_need_positive_classification")]
+    #[test_case("umask 000; cargo check"; "builtin_process_state")]
+    fn shell_preflight_requires_exact_source_for_unaccounted_effects(command: &str) {
+        let root = TempDir::new().expect("tempdir");
+        let intent = shell_preflight_intent(root.path(), command);
+        let fallback = intent.resources.last().expect("fallback resource");
+        assert_eq!(fallback.value, command);
+        assert!(fallback.protected && fallback.requires_prompt);
+        assert!(intent.resources.iter().all(|resource| {
+            !resource
+                .attributes
+                .contains_key(COMMAND_OBSERVATION_ATTRIBUTE)
+                && !resource.attributes.contains_key(CONFINED_READ_ATTRIBUTE)
+        }));
+    }
+
+    #[test_case("cargo check -p core", "."; "direct_command")]
+    #[test_case("cd crate && cargo check -p core", "crate"; "successful_cd")]
+    fn shell_preflight_observes_the_effective_command_workdir(command: &str, directory: &str) {
+        let root = TempDir::new().expect("tempdir");
+        let intent = shell_preflight_intent(root.path(), command);
+        let resource = intent.resources.last().expect("cargo resource");
+        let observation = CommandObservation::from_json(
+            resource
+                .attributes
+                .get(COMMAND_OBSERVATION_ATTRIBUTE)
+                .expect("observation"),
+        )
+        .expect("valid observation");
+        assert_eq!(observation.argv, ["cargo", "check", "-p", "core"]);
+        assert_eq!(observation.source.provenance, ObservationProvenance::Native);
+        assert_eq!(
+            observation.verification.shell_effects,
+            ShellEffectStatus::Absent
+        );
+        assert_eq!(
+            Path::new(&observation.context.effective_workdir),
+            root.path()
+                .canonicalize()
+                .expect("canonical root")
+                .join(directory)
+        );
+        assert_eq!(
+            resource.attributes.get("workdir"),
+            Some(&observation.context.effective_workdir)
+        );
+        assert!(intent.resources.iter().all(|resource| !resource.protected));
+    }
+
+    #[test]
+    fn shell_preflight_binds_identical_commands_to_their_source_spans() {
+        let root = TempDir::new().expect("tempdir");
+        let intent = shell_preflight_intent(
+            root.path(),
+            "(cd left && cargo check -p core); (cd right && cargo check -p core)",
+        );
+        let observations = intent
+            .resources
+            .iter()
+            .filter_map(|resource| {
+                resource
+                    .attributes
+                    .get(COMMAND_OBSERVATION_ATTRIBUTE)
+                    .map(|json| CommandObservation::from_json(json).expect("observation"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(observations.len(), 2);
+        assert!(observations[0].context.effective_workdir.ends_with("/left"));
+        assert!(
+            observations[1]
+                .context
+                .effective_workdir
+                .ends_with("/right")
+        );
+        assert_ne!(
+            observations[0].source.observation_id,
+            observations[1].source.observation_id
+        );
+    }
+
+    #[test_case("cargo check -p core 2>&1"; "descriptor")]
+    #[test_case("cargo check -p core --password redacted"; "sensitive")]
+    #[test_case("python3 -c 'print(1)'"; "payload")]
+    #[test_case("./cargo check -p core"; "executable_script")]
+    #[test_case("cd left; cargo check -p core"; "ambiguous_context")]
+    #[test_case("novelctl inspect -c body"; "generic_code_flag")]
+    #[test_case("novelctl inspect -e body"; "generic_expression_flag")]
+    #[test_case("novelctl inspect -f code"; "generic_script_file")]
+    #[test_case("novelctl inspect --eval body"; "generic_eval_flag")]
+    #[test_case("novelctl inspect --script code"; "generic_script_flag")]
+    #[test_case("novelctl inspect --command body"; "generic_command_flag")]
+    #[test_case("novelctl inspect --config settings"; "generic_config_flag")]
+    #[test_case("novelctl inspect @arguments.rsp"; "generic_response_file")]
+    #[test_case("python3.13 --version"; "versioned_interpreter")]
+    #[test_case("node --version"; "javascript_interpreter")]
+    #[test_case("perl -v"; "perl_interpreter")]
+    #[test_case("awk 'BEGIN { print 1 }'"; "awk_program")]
+    #[test_case("sed -n '1p' file"; "sed_program")]
+    #[test_case("ssh host true"; "remote_shell_payload")]
+    #[test_case("sudo novelctl inspect --name alpha"; "privilege_wrapper")]
+    #[test_case("env novelctl inspect --name alpha"; "environment_wrapper")]
+    fn shell_preflight_does_not_attach_ineligible_observations(command: &str) {
+        let root = TempDir::new().expect("tempdir");
+        let intent = shell_preflight_intent(root.path(), command);
+        assert!(intent.resources.iter().all(|resource| {
+            !resource
+                .attributes
+                .contains_key(COMMAND_OBSERVATION_ATTRIBUTE)
+        }));
+    }
+
+    async fn prepared_shell_request(
+        root: &Path,
+        registry: &Arc<ToolRegistry>,
+        input: Value,
+        id: &str,
+    ) -> PermissionRequest {
+        let ctx = context(root, Arc::clone(registry), CancelToken::none());
+        let registered = registry.get("shell").expect("shell tool");
+        let invocation = registered.tool.parse(&input).expect("shell input");
+        assert_eq!(invocation.permission_input(), Some(&input));
+        let intent = invocation
+            .preflight(&ctx)
+            .await
+            .expect("preflight")
+            .expect("intent");
+        let ToolSource::Native {
+            owner, contract, ..
+        } = &registered.source
+        else {
+            panic!("native shell source")
+        };
+        PermissionRequest::from_intent_with_identity(
+            id.into(),
+            ToolKey::native("shell"),
+            &intent,
+            input,
+            root,
+            PermissionSubject::Native {
+                owner: owner.to_string(),
+                contract: contract.to_string(),
+            },
+            PermissionExecutorKind::Native,
+        )
+    }
+
+    async fn enforce_shell_request(
+        manager: &PermissionManager,
+        request: &PermissionRequest,
+        events: &EventSender,
+    ) -> Result<(), PermissionError> {
+        let (_sender, receiver) = flume::unbounded();
+        let responses = AsyncMutex::new(receiver);
+        let intent = PermissionIntent::new(
+            PermissionScopes {
+                scopes: request.scopes.clone(),
+                force_prompt: false,
+                plan_scoped: false,
+            },
+            request.resources.clone(),
+            request.risk.clone(),
+        )
+        .with_authority(PermissionAuthorityProfile::Shell);
+        manager
+            .enforce_with_intent(
+                &request.tool,
+                &intent,
+                &request.input,
+                events,
+                Some(&responses),
+                &request.id,
+                &CancelToken::none(),
+                None,
+                Some((request.subject.clone(), request.executor.clone())),
+                true,
+            )
+            .await
+    }
+
+    #[test_case(json!({"command": PATTERN_COMMAND}); "omitted_defaults")]
+    #[test_case(json!({"command": PATTERN_COMMAND, "workdir": "."}); "explicit_workdir")]
+    #[test_case(json!({"command": PATTERN_COMMAND, "timeout": PATTERN_TIMEOUT_MS}); "explicit_timeout")]
+    #[test_case(json!({"command": PATTERN_COMMAND, "workdir": null, "timeout": null}); "explicit_nulls")]
+    #[test_case(json!({"command": "cd crate && cargo check -p alpha --tests", "workdir": "."}); "primitive_in_compound_source")]
+    fn shell_preflight_binds_original_json_not_typed_defaults(input: Value) {
+        smol::block_on(async {
+            let root = TempDir::new().expect("project");
+            let (_host, registry) = host_and_registry(root.path());
+            let request =
+                prepared_shell_request(root.path(), &registry, input.clone(), "binding").await;
+            assert_eq!(request.input, input);
+            let resource = request.resources.last().expect("cargo resource");
+            let fact =
+                CommandObservation::from_json(&resource.attributes[COMMAND_OBSERVATION_ATTRIBUTE])
+                    .expect("native observation");
+            let binding = prepared_command_binding(&resource.value, &input);
+            assert_eq!(
+                resource.attributes[COMMAND_OBSERVATION_BINDING_ATTRIBUTE],
+                binding
+            );
+            assert_eq!(fact.source.input_hash, binding);
+            let wire = serde_json::to_value(&request).expect("wire request");
+            let restored: PermissionRequest =
+                serde_json::from_value(wire.clone()).expect("restored request");
+            for resource in wire["resources"].as_array().expect("wire resources") {
+                assert!(
+                    resource["attributes"]
+                        .get(COMMAND_OBSERVATION_ATTRIBUTE)
+                        .is_none()
+                );
+                assert!(
+                    resource["attributes"]
+                        .get(COMMAND_OBSERVATION_BINDING_ATTRIBUTE)
+                        .is_none()
+                );
+            }
+            assert!(restored.resources.iter().all(|resource| {
+                !resource
+                    .attributes
+                    .contains_key(COMMAND_OBSERVATION_ATTRIBUTE)
+                    && !resource
+                        .attributes
+                        .contains_key(COMMAND_OBSERVATION_BINDING_ATTRIBUTE)
+            }));
+        });
+    }
+
+    #[test_case(None; "missing_original_json")]
+    #[test_case(Some(json!({})); "missing_original_command")]
+    #[test_case(Some(json!({"command": "cargo clean"})); "mismatched_original_command")]
+    fn shell_preflight_drops_facts_without_an_input_binding(raw_input: Option<Value>) {
+        let root = TempDir::new().expect("project");
+        let (host, registry) = host_and_registry(root.path());
+        let ctx = context(root.path(), registry, CancelToken::none());
+        let invocation = WorkcellInvocation {
+            host: Arc::clone(&host.inner),
+            input: Input::parse(ToolKind::Shell, json!({"command": PATTERN_COMMAND}))
+                .expect("shell input"),
+            raw_input,
+            prepared: Mutex::new(None),
+        };
+        let intent = smol::block_on(invocation.prepare(&ctx)).expect("preflight");
+        assert!(intent.resources.iter().all(|resource| {
+            !resource
+                .attributes
+                .contains_key(COMMAND_OBSERVATION_ATTRIBUTE)
+                && !resource
+                    .attributes
+                    .contains_key(COMMAND_OBSERVATION_BINDING_ATTRIBUTE)
+        }));
+    }
+
+    #[test_case(false; "direct_command")]
+    #[test_case(true; "successful_cd_composition")]
+    fn shell_preflight_live_templates_compose_persist_reload_and_match(compound: bool) {
+        smol::block_on(async {
+            let root = TempDir::new().expect("project");
+            std::fs::create_dir(root.path().join("crate")).expect("crate workdir");
+            let state_root = TempDir::new().expect("permission state");
+            let state = StateDir::from_path(state_root.path().to_path_buf());
+            let manager = PermissionManager::new_persistent_in(
+                PermissionsConfig::default(),
+                root.path().to_path_buf(),
+                Arc::default(),
+                state.clone(),
+            );
+            let (_host, registry) = host_and_registry(root.path());
+            let input_for = |package: &str| {
+                json!({
+                    "command": format!("{}cargo check -p {package} --tests", if compound { "cd crate && " } else { "" }),
+                })
+            };
+            let cargo_index = usize::from(compound);
+            for (index, package) in PATTERN_PACKAGES.iter().enumerate() {
+                let request =
+                    prepared_shell_request(root.path(), &registry, input_for(package), package)
+                        .await;
+                assert!(
+                    request.resources[cargo_index]
+                        .attributes
+                        .contains_key(POSSIBLE_WORKDIRS_ATTRIBUTE)
+                );
+                let (events, received) = flume::unbounded();
+                let events = EventSender::new(events, 0);
+                let mut enforcement = Box::pin(enforce_shell_request(&manager, &request, &events));
+                assert!(future::poll_once(&mut enforcement).await.is_none());
+                let AgentEvent::PermissionRequest(offered) =
+                    received.try_recv().expect("prompt").event
+                else {
+                    panic!("permission request")
+                };
+                assert_eq!(offered.input, request.input);
+                assert!(
+                    offered.resources[cargo_index]
+                        .attributes
+                        .contains_key(COMMAND_OBSERVATION_BINDING_ATTRIBUTE)
+                );
+                let exact = offered
+                    .options
+                    .iter()
+                    .find(|option| option.id == format!("{COMMAND_EXACT_PREFIX}{cargo_index}"))
+                    .expect("exact command option");
+                let review = review_for_rule(&offered, &exact.rule);
+                assert!(
+                    review.resources[0]
+                        .value
+                        .as_ref()
+                        .expect("command label")
+                        .contains("cargo check")
+                );
+                assert!(
+                    review.resources[0].attributes[POSSIBLE_WORKDIRS_ATTRIBUTE]
+                        .starts_with(POSSIBLE_WORKDIRS_LABEL)
+                );
+                let template = offered
+                    .options
+                    .iter()
+                    .find(|option| option.id.starts_with(COMMAND_TEMPLATE_PREFIX));
+                let answer = if index + 1 == PATTERN_PACKAGES.len() {
+                    let template = template.expect("candidate from three real preflights");
+                    let PermissionResourceSelector::CommandTemplate { definition } =
+                        &template.rule.resources[0].selector
+                    else {
+                        panic!("learned template selector")
+                    };
+                    assert_eq!(definition.slots.len(), 1);
+                    assert_eq!(
+                        definition.slots[0].domain,
+                        ArgumentDomain::ObservedSet {
+                            values: PATTERN_PACKAGES
+                                .iter()
+                                .map(|package| (*package).into())
+                                .collect(),
+                        }
+                    );
+                    assert!(template.label.contains("cargo"));
+                    assert!(template.label.contains("<pattern1>"));
+                    assert!(
+                        template
+                            .description
+                            .contains(&format!("{} observations", PATTERN_PACKAGES.len()))
+                    );
+                    assert_eq!(
+                        template.group.as_ref().and_then(|group| group.resource),
+                        Some(cargo_index)
+                    );
+                    assert!(!template.is_default);
+                    assert!(
+                        template.rule.resources[0]
+                            .attributes
+                            .keys()
+                            .all(|name| name == "workdir")
+                    );
+                    let mut rows = vec![None; offered.resources.len()];
+                    rows[cargo_index] = Some(PermissionRowGrant::Offered(template.id.clone()));
+                    assert_eq!(
+                        offered
+                            .composed_rules(&rows, &PermissionLifetime::Project)
+                            .expect("composed template")
+                            .len(),
+                        1
+                    );
+                    PermissionAnswer::AllowComposed {
+                        rows,
+                        lifetime: PermissionLifetime::Project,
+                    }
+                } else {
+                    assert!(template.is_none());
+                    PermissionAnswer::AllowOnce
+                };
+                assert!(manager.answer(&request.id, answer));
+                enforcement.await.expect("approved call");
+            }
+            let saved = manager
+                .structured_rule_inventory()
+                .expect("saved inventory");
+            assert_eq!(saved.len(), 1);
+            assert_eq!(
+                PermissionState::open(&state)
+                    .expect("persisted state")
+                    .records(),
+                saved
+            );
+            let persisted = serde_json::to_string(&saved).expect("serialized inventory");
+            assert!(!persisted.contains(COMMAND_OBSERVATION_ATTRIBUTE));
+            assert!(
+                saved[0].review.as_ref().expect("review").resources[0]
+                    .value
+                    .as_ref()
+                    .expect("template label")
+                    .contains("Command template")
+            );
+            drop(manager);
+            let reloaded = PermissionManager::new_persistent_in(
+                PermissionsConfig::default(),
+                root.path().to_path_buf(),
+                Arc::default(),
+                state,
+            );
+            assert_eq!(
+                reloaded
+                    .structured_rule_inventory()
+                    .expect("reloaded inventory"),
+                saved
+            );
+            let mut input = input_for(PATTERN_PACKAGES[1]);
+            input["timeout"] = json!(PATTERN_TIMEOUT_MS);
+            input["workdir"] = json!(".");
+            let approved = prepared_shell_request(root.path(), &registry, input, "reload").await;
+            let rule = &saved[0].rule;
+            assert!(permission_rule_covers_resource(
+                rule,
+                &approved,
+                &approved.resources[cargo_index]
+            ));
+            let (events, received) = flume::unbounded();
+            let events = EventSender::new(events, 0);
+            let mut enforcement = Box::pin(enforce_shell_request(&reloaded, &approved, &events));
+            assert!(
+                future::poll_once(&mut enforcement)
+                    .await
+                    .expect("automatic decision")
+                    .is_ok()
+            );
+            assert!(received.try_recv().is_err());
+            let mut different_workdir = input_for(PATTERN_PACKAGES[1]);
+            different_workdir["workdir"] = json!("crate");
+            let different_workdir = prepared_shell_request(
+                root.path(),
+                &registry,
+                different_workdir,
+                "different-workdir",
+            )
+            .await;
+            assert!(!permission_rule_covers_resource(
+                rule,
+                &different_workdir,
+                &different_workdir.resources[cargo_index]
+            ));
+            let other = prepared_shell_request(
+                root.path(),
+                &registry,
+                input_for(PATTERN_PACKAGES[0]),
+                "other",
+            )
+            .await;
+            for change in [
+                "source",
+                "input",
+                "input_workdir",
+                "timeout",
+                "missing_binding",
+                "fact_hash",
+                "fact_context",
+                "swapped_fact",
+                "swapped_pair",
+                "workdir",
+                "possible_workdirs",
+                "wire",
+            ] {
+                let mut changed = approved.clone();
+                match change {
+                    "source" => changed.resources[cargo_index].value.push_str(" --fix"),
+                    "input" => changed.input["command"] = json!("cargo clean"),
+                    "input_workdir" => changed.input["workdir"] = json!("crate"),
+                    "timeout" => changed.input["timeout"] = Value::Null,
+                    "missing_binding" => {
+                        changed.resources[cargo_index]
+                            .attributes
+                            .remove(COMMAND_OBSERVATION_BINDING_ATTRIBUTE);
+                    }
+                    "fact_hash" | "fact_context" => {
+                        let mut fact = CommandObservation::from_json(
+                            &changed.resources[cargo_index].attributes
+                                [COMMAND_OBSERVATION_ATTRIBUTE],
+                        )
+                        .expect("native fact");
+                        if change == "fact_hash" {
+                            fact.source.input_hash = other.resources[cargo_index].attributes
+                                [COMMAND_OBSERVATION_BINDING_ATTRIBUTE]
+                                .clone();
+                        } else {
+                            fact.context.effective_workdir = "/elsewhere".into();
+                        }
+                        changed.resources[cargo_index].attributes.insert(
+                            COMMAND_OBSERVATION_ATTRIBUTE.into(),
+                            serde_json::to_string(&fact).expect("changed fact"),
+                        );
+                    }
+                    "swapped_fact" | "swapped_pair" => {
+                        changed.resources[cargo_index].attributes.insert(
+                            COMMAND_OBSERVATION_ATTRIBUTE.into(),
+                            other.resources[cargo_index].attributes[COMMAND_OBSERVATION_ATTRIBUTE]
+                                .clone(),
+                        );
+                        if change == "swapped_pair" {
+                            changed.resources[cargo_index].attributes.insert(
+                                COMMAND_OBSERVATION_BINDING_ATTRIBUTE.into(),
+                                other.resources[cargo_index].attributes
+                                    [COMMAND_OBSERVATION_BINDING_ATTRIBUTE]
+                                    .clone(),
+                            );
+                        }
+                    }
+                    "workdir" => {
+                        changed.resources[cargo_index]
+                            .attributes
+                            .insert("workdir".into(), "/elsewhere".into());
+                    }
+                    "possible_workdirs" => {
+                        changed.resources[cargo_index].attributes.insert(
+                            POSSIBLE_WORKDIRS_ATTRIBUTE.into(),
+                            json!({"kind":"known", "symbolic_paths":["/elsewhere"]}).to_string(),
+                        );
+                    }
+                    "wire" => {
+                        changed = serde_json::from_value(
+                            serde_json::to_value(&changed).expect("wire request"),
+                        )
+                        .expect("restored request");
+                    }
+                    _ => unreachable!(),
+                }
+                assert!(
+                    !permission_rule_covers_resource(
+                        rule,
+                        &changed,
+                        &changed.resources[cargo_index]
+                    ),
+                    "{change}"
+                );
+            }
+            let unobserved =
+                prepared_shell_request(root.path(), &registry, input_for("delta"), "unobserved")
+                    .await;
+            assert!(!permission_rule_covers_resource(
+                rule,
+                &unobserved,
+                &unobserved.resources[cargo_index]
+            ));
+        });
+    }
+
+    async fn prompted_shell_request(
+        manager: &PermissionManager,
+        request: &PermissionRequest,
+        answer: impl FnOnce(&PermissionRequest) -> PermissionAnswer,
+    ) -> PermissionRequest {
+        let (events, received) = flume::unbounded();
+        let events = EventSender::new(events, 0);
+        let mut enforcement = Box::pin(enforce_shell_request(manager, request, &events));
+        assert!(future::poll_once(&mut enforcement).await.is_none());
+        let AgentEvent::PermissionRequest(offered) = received.try_recv().expect("prompt").event
+        else {
+            panic!("permission request")
+        };
+        assert!(manager.answer(&request.id, answer(&offered)));
+        enforcement.await.expect("explicitly approved call");
+        *offered
+    }
+
+    #[test]
+    fn generic_shell_templates_require_consent_and_respect_explicit_regex_domains() {
+        smol::block_on(async {
+            let root = TempDir::new().expect("project");
+            let (_host, registry) = host_and_registry(root.path());
+            let manager = PermissionManager::new_nonpersistent(
+                PermissionsConfig::default(),
+                root.path().to_path_buf(),
+                Arc::default(),
+            );
+            let input_for =
+                |name: &str| json!({"command": format!("novelctl inspect --name {name}")});
+            for (index, name) in PATTERN_PACKAGES.iter().enumerate() {
+                let request =
+                    prepared_shell_request(root.path(), &registry, input_for(name), name).await;
+                let resource = &request.resources[0];
+                assert!(!resource.attributes.contains_key(CONFINED_READ_ATTRIBUTE));
+                let fact = CommandObservation::from_json(
+                    &resource.attributes[COMMAND_OBSERVATION_ATTRIBUTE],
+                )
+                .expect("generic execution observation");
+                assert_eq!(
+                    fact.roles,
+                    [
+                        ArgumentRole::Executable,
+                        ArgumentRole::Operation,
+                        ArgumentRole::Flag,
+                        ArgumentRole::Unknown
+                    ]
+                );
+                let offered =
+                    prompted_shell_request(&manager, &request, |_| PermissionAnswer::AllowOnce)
+                        .await;
+                let template = offered
+                    .options
+                    .iter()
+                    .find(|option| option.id.starts_with(COMMAND_TEMPLATE_PREFIX));
+                assert_eq!(template.is_some(), index + 1 == PATTERN_PACKAGES.len());
+                if let Some(template) = template {
+                    assert!(!template.is_default);
+                    assert!(template.label.contains(COMMAND_TEMPLATE_EXECUTION_NOTICE));
+                    assert!(
+                        template
+                            .description
+                            .contains(COMMAND_TEMPLATE_EXECUTION_NOTICE)
+                    );
+                    let PermissionResourceSelector::CommandTemplate { definition } =
+                        &template.rule.resources[0].selector
+                    else {
+                        panic!("command template")
+                    };
+                    assert!(matches!(
+                        &definition.argv[3],
+                        PatternToken::Slot {
+                            role: ArgumentRole::Unknown,
+                            ..
+                        }
+                    ));
+                    assert!(
+                        matches!(&definition.combinations, SlotCombinations::ObservedTuples { tuples } if tuples.len() == PATTERN_PACKAGES.len())
+                    );
+                    assert_eq!(definition.slots[0].option_like, OptionLikePolicy::Reject);
+                    assert!(
+                        matches!(&definition.slots[0].domain, ArgumentDomain::ObservedSet { values }
+                        if values.iter().map(String::as_str).collect::<Vec<_>>() == PATTERN_PACKAGES)
+                    );
+                    let review = review_for_rule(&offered, &template.rule);
+                    assert!(
+                        review.resources[0]
+                            .value
+                            .as_ref()
+                            .expect("execution review")
+                            .contains(COMMAND_TEMPLATE_EXECUTION_NOTICE)
+                    );
+                }
+                assert!(
+                    manager
+                        .structured_rule_inventory()
+                        .expect("inventory")
+                        .is_empty()
+                );
+            }
+            let unseen = prepared_shell_request(
+                root.path(),
+                &registry,
+                input_for("delta-42"),
+                "regex-value",
+            )
+            .await;
+            let request = prepared_shell_request(
+                root.path(),
+                &registry,
+                input_for(PATTERN_PACKAGES[0]),
+                "consent",
+            )
+            .await;
+            prompted_shell_request(&manager, &request, |offered| {
+                let template = offered
+                    .options
+                    .iter()
+                    .find(|option| option.id.starts_with(COMMAND_TEMPLATE_PREFIX))
+                    .expect("still requires template consent");
+                assert!(!permission_rule_covers_request(&template.rule, &unseen));
+                let PermissionResourceSelector::CommandTemplate { definition } =
+                    &template.rule.resources[0].selector
+                else {
+                    panic!("command template")
+                };
+                let mut edited = definition.clone();
+                edited.slots[0].domain = ArgumentDomain::Regex {
+                    pattern: GENERIC_NAME_REGEX.into(),
+                };
+                let tuple_rows = [Some(PermissionRowGrant::Pattern {
+                    option_id: template.id.clone(),
+                    definition: edited.clone(),
+                })];
+                let tuple_rules = offered
+                    .composed_rules(&tuple_rows, &PermissionLifetime::Conversation)
+                    .expect("tuple-bound regex");
+                assert!(!permission_rule_covers_request(&tuple_rules[0], &unseen));
+                edited.combinations = SlotCombinations::Independent;
+                let rows = vec![Some(PermissionRowGrant::Pattern {
+                    option_id: template.id.clone(),
+                    definition: edited,
+                })];
+                let rules = offered
+                    .composed_rules(&rows, &PermissionLifetime::Conversation)
+                    .expect("explicit regex domain");
+                assert!(permission_rule_covers_request(&rules[0], &unseen));
+                let review = review_for_rule(offered, &rules[0]);
+                let label = review.resources[0]
+                    .value
+                    .as_ref()
+                    .expect("edited template review");
+                assert!(label.contains(COMMAND_TEMPLATE_EXECUTION_NOTICE));
+                assert!(label.contains(GENERIC_NAME_REGEX));
+                PermissionAnswer::AllowComposed {
+                    rows,
+                    lifetime: PermissionLifetime::Conversation,
+                }
+            })
+            .await;
+            let saved = manager.structured_rule_inventory().expect("explicit grant");
+            assert_eq!(saved.len(), 1);
+            assert!(permission_rule_covers_request(&saved[0].rule, &unseen));
+            let (events, received) = flume::unbounded();
+            let events = EventSender::new(events, 0);
+            let mut enforcement = Box::pin(enforce_shell_request(&manager, &unseen, &events));
+            assert!(
+                future::poll_once(&mut enforcement)
+                    .await
+                    .expect("configured regex match")
+                    .is_ok()
+            );
+            assert!(received.try_recv().is_err());
+            for (index, command) in [
+                "novelctl inspect --name delta-nope",
+                "novelctl inspect --name delta-42 --force",
+                "novelctl remove --name delta-42",
+                "novelctl inspect nested --name delta-42",
+                "novelctl inspect --other delta-42",
+                "differentctl inspect --name delta-42",
+            ]
+            .iter()
+            .enumerate()
+            {
+                let changed = prepared_shell_request(
+                    root.path(),
+                    &registry,
+                    json!({"command": command}),
+                    &format!("mismatch-{index}"),
+                )
+                .await;
+                assert!(
+                    changed.resources[0]
+                        .attributes
+                        .contains_key(COMMAND_OBSERVATION_ATTRIBUTE)
+                );
+                assert!(
+                    !permission_rule_covers_request(&saved[0].rule, &changed),
+                    "{command}"
+                );
+                prompted_shell_request(&manager, &changed, |_| PermissionAnswer::AllowOnce).await;
+                assert_eq!(
+                    manager
+                        .structured_rule_inventory()
+                        .expect("unchanged grant"),
+                    saved
+                );
+            }
+        });
     }
 
     fn shell_output(exit_code: i32) -> WorkcellShellOutput {
@@ -6526,6 +7544,339 @@ mod tests {
         assert_eq!(lines, ["authorized"]);
     }
 
+    #[test_case("*.rs"; "basename_glob_is_recursive")]
+    #[test_case("**/*.rs"; "explicit_recursive_glob")]
+    #[test_case("{visible,nested/item}.rs"; "brace_glob_is_recursive")]
+    fn browsing_glob_preflight_is_names_only_and_explicitly_recursive(pattern: &str) {
+        let root = TempDir::new().unwrap();
+        std::fs::create_dir(root.path().join("nested")).unwrap();
+        std::fs::write(root.path().join("visible.rs"), BROWSE_CONTENT_SENTINEL).unwrap();
+        std::fs::write(root.path().join("nested/item.rs"), BROWSE_CONTENT_SENTINEL).unwrap();
+        let (_host, registry) = host_and_registry(root.path());
+        let ctx = context(root.path(), Arc::clone(&registry), CancelToken::none());
+        let input = json!({"pattern": pattern});
+        let invocation = registry
+            .get("file_glob")
+            .unwrap()
+            .tool
+            .parse(&input)
+            .unwrap();
+        let intent = smol::block_on(invocation.preflight(&ctx)).unwrap().unwrap();
+        assert_eq!(intent.resources[0].kind, PermissionResourceKind::Directory);
+        assert_eq!(
+            intent.resources[0].access,
+            Some(PermissionResourceAccess::List)
+        );
+        assert_eq!(
+            intent.resources[0].attributes[BROWSE_RECURSION_ATTRIBUTE],
+            BROWSE_RECURSIVE
+        );
+        assert_eq!(
+            Path::new(&intent.resources[0].value),
+            root.path().canonicalize().unwrap()
+        );
+        let request = PermissionRequest::from_intent_with_identity(
+            "browsing".into(),
+            ToolKey::native("file_glob"),
+            &intent,
+            input,
+            root.path(),
+            PermissionSubject::Native {
+                owner: OWNER.into(),
+                contract: "file.glob.v1".into(),
+            },
+            PermissionExecutorKind::Native,
+        );
+        assert!(
+            request
+                .options
+                .iter()
+                .any(|option| option.rule.family
+                    == Some(PermissionCapabilityFamily::FilesystemBrowse))
+        );
+        assert!(
+            request.options.iter().all(
+                |option| option.rule.family != Some(PermissionCapabilityFamily::FilesystemRead)
+            )
+        );
+        let result = smol::block_on(invocation.execute(&ctx));
+        let text = result.output.unwrap().as_text();
+        assert!(text.contains("nested/item.rs"));
+        assert!(!text.contains(BROWSE_CONTENT_SENTINEL));
+    }
+
+    #[test]
+    fn browsing_directory_grants_are_direct_unless_recursion_is_explicitly_selected() {
+        let root = TempDir::new().unwrap();
+        let directory = root.path().join("browse");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::create_dir(directory.join("nested")).unwrap();
+        std::fs::write(directory.join("visible.rs"), BROWSE_CONTENT_SENTINEL).unwrap();
+        let (_host, registry) = host_and_registry(root.path());
+        let ctx = context(root.path(), Arc::clone(&registry), CancelToken::none());
+        let request = |tool: &str, contract: &str, input: Value| {
+            let invocation = registry.get(tool).unwrap().tool.parse(&input).unwrap();
+            let intent = smol::block_on(invocation.preflight(&ctx)).unwrap().unwrap();
+            PermissionRequest::from_intent_with_identity(
+                "browsing".into(),
+                ToolKey::native(tool),
+                &intent,
+                input,
+                root.path(),
+                PermissionSubject::Native {
+                    owner: OWNER.into(),
+                    contract: contract.into(),
+                },
+                PermissionExecutorKind::Native,
+            )
+        };
+        let listing = request("file_read", "file.read.v1", json!({"filePath": "browse"}));
+        assert_eq!(listing.resources[0].kind, PermissionResourceKind::Directory);
+        assert_eq!(
+            listing.resources[0].access,
+            Some(PermissionResourceAccess::List)
+        );
+        assert_eq!(
+            listing.resources[0].attributes[BROWSE_RECURSION_ATTRIBUTE],
+            BROWSE_DIRECT
+        );
+        assert_eq!(
+            Path::new(&listing.resources[0].value),
+            directory.canonicalize().unwrap()
+        );
+        assert!(
+            listing.options.iter().all(
+                |option| option.rule.family != Some(PermissionCapabilityFamily::FilesystemRead)
+            )
+        );
+        let direct_option = listing
+            .options
+            .iter()
+            .find(|option| {
+                option.rule.family == Some(PermissionCapabilityFamily::FilesystemBrowse)
+                    && matches!(
+                        option.rule.resources[0].selector,
+                        PermissionResourceSelector::Digest { .. }
+                    )
+            })
+            .unwrap();
+        let direct = listing
+            .option_rule(&direct_option.id, PermissionLifetime::Conversation)
+            .unwrap();
+        assert!(permission_rule_covers_request(&direct, &listing));
+        let glob = request(
+            "file_glob",
+            "file.glob.v1",
+            json!({"path": "browse", "pattern": "*.rs"}),
+        );
+        let nested = request(
+            "file_read",
+            "file.read.v1",
+            json!({"filePath": "browse/nested"}),
+        );
+        let content = request(
+            "file_read",
+            "file.read.v1",
+            json!({"filePath": "browse/visible.rs"}),
+        );
+        for outside_direct_scope in [&glob, &nested, &content] {
+            assert!(!permission_rule_covers_request(
+                &direct,
+                outside_direct_scope
+            ));
+        }
+        let recursive_option = listing
+            .options
+            .iter()
+            .find(|option| {
+                option.rule.family == Some(PermissionCapabilityFamily::FilesystemBrowse)
+                    && matches!(
+                        option.rule.resources[0].selector,
+                        PermissionResourceSelector::FilesystemSubtreeDigest { .. }
+                    )
+            })
+            .unwrap();
+        let recursive = listing
+            .option_rule(&recursive_option.id, PermissionLifetime::Conversation)
+            .unwrap();
+        assert!(permission_rule_covers_request(&recursive, &glob));
+        assert!(permission_rule_covers_request(&recursive, &nested));
+        assert!(!permission_rule_covers_request(&recursive, &content));
+    }
+
+    #[test_case(true; "directory_replaced_by_file")]
+    #[test_case(false; "file_replaced_by_directory")]
+    fn browsing_read_execution_refuses_a_kind_change_after_preflight(directory: bool) {
+        let root = TempDir::new().unwrap();
+        let target = root.path().join("target");
+        if directory {
+            std::fs::create_dir(&target).unwrap();
+        } else {
+            std::fs::write(&target, BROWSE_CONTENT_SENTINEL).unwrap();
+        }
+        let (_host, registry) = host_and_registry(root.path());
+        let ctx = context(root.path(), Arc::clone(&registry), CancelToken::none());
+        let input = json!({"filePath": "target"});
+        let invocation = registry
+            .get("file_read")
+            .unwrap()
+            .tool
+            .parse(&input)
+            .unwrap();
+        let intent = smol::block_on(invocation.preflight(&ctx)).unwrap().unwrap();
+        assert_eq!(
+            intent.resources[0].access,
+            Some(if directory {
+                PermissionResourceAccess::List
+            } else {
+                PermissionResourceAccess::Read
+            })
+        );
+        if directory {
+            std::fs::remove_dir(&target).unwrap();
+            std::fs::write(&target, BROWSE_CONTENT_SENTINEL).unwrap();
+        } else {
+            std::fs::remove_file(&target).unwrap();
+            std::fs::create_dir(&target).unwrap();
+        }
+        assert!(smol::block_on(invocation.execute(&ctx)).output.is_err());
+        let fresh = registry
+            .get("file_read")
+            .unwrap()
+            .tool
+            .parse(&input)
+            .unwrap();
+        let intent = smol::block_on(fresh.preflight(&ctx)).unwrap().unwrap();
+        assert_eq!(
+            intent.resources[0].access,
+            Some(if directory {
+                PermissionResourceAccess::Read
+            } else {
+                PermissionResourceAccess::List
+            })
+        );
+    }
+
+    #[cfg(unix)]
+    #[test_case(false; "retargeted_to_file")]
+    #[test_case(true; "retargeted_to_directory")]
+    fn browsing_directory_execution_keeps_the_canonical_preflight_target(directory: bool) {
+        use std::os::unix::fs::symlink;
+
+        let root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let authorized = root.path().join("authorized");
+        let link = root.path().join("alias");
+        std::fs::create_dir(&authorized).unwrap();
+        std::fs::write(authorized.join("visible.rs"), BROWSE_CONTENT_SENTINEL).unwrap();
+        let secret = outside.path().join("secret.txt");
+        std::fs::write(&secret, BROWSE_CONTENT_SENTINEL).unwrap();
+        symlink(&authorized, &link).unwrap();
+        let (_host, registry) = host_and_registry(root.path());
+        let ctx = context(root.path(), Arc::clone(&registry), CancelToken::none());
+        let invocation = registry
+            .get("file_read")
+            .unwrap()
+            .tool
+            .parse(&json!({"filePath": "alias"}))
+            .unwrap();
+        let intent = smol::block_on(invocation.preflight(&ctx)).unwrap().unwrap();
+        assert_eq!(
+            intent.resources[0].access,
+            Some(PermissionResourceAccess::List)
+        );
+        assert!(invocation.read_targets(&ctx).is_empty());
+        std::fs::remove_file(&link).unwrap();
+        symlink(
+            if directory {
+                outside.path()
+            } else {
+                secret.as_path()
+            },
+            &link,
+        )
+        .unwrap();
+        let output = smol::block_on(invocation.execute(&ctx))
+            .output
+            .unwrap()
+            .as_text();
+        assert!(output.contains("visible.rs"));
+        assert!(!output.contains("secret.txt"));
+        assert!(!output.contains(BROWSE_CONTENT_SENTINEL));
+    }
+
+    #[test_case("file_read", json!({"filePath": "source.rs"}), PermissionResourceKind::File, PermissionResourceAccess::Read; "file_read")]
+    #[test_case("file_grep", json!({"path": ".", "pattern": "fn"}), PermissionResourceKind::Directory, PermissionResourceAccess::Search; "grep")]
+    #[test_case("file_index", json!({"path": "."}), PermissionResourceKind::Directory, PermissionResourceAccess::Search; "directory_index")]
+    #[test_case("file_index", json!({"path": "source.rs"}), PermissionResourceKind::File, PermissionResourceAccess::Read; "source_index")]
+    fn browsing_classification_does_not_relabel_other_read_contracts(
+        tool: &str,
+        input: Value,
+        kind: PermissionResourceKind,
+        access: PermissionResourceAccess,
+    ) {
+        let root = TempDir::new().unwrap();
+        std::fs::write(root.path().join("source.rs"), "fn main() {}\n").unwrap();
+        let (_host, registry) = host_and_registry(root.path());
+        let ctx = context(root.path(), Arc::clone(&registry), CancelToken::none());
+        let invocation = registry.get(tool).unwrap().tool.parse(&input).unwrap();
+        let intent = smol::block_on(invocation.preflight(&ctx)).unwrap().unwrap();
+        assert_eq!(intent.resources[0].kind, kind);
+        assert_eq!(intent.resources[0].access, Some(access));
+        assert!(
+            !intent.resources[0]
+                .attributes
+                .contains_key(BROWSE_RECURSION_ATTRIBUTE)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test_case("file_glob", false; "glob_excludes_symlinks_and_protected_descendants")]
+    #[test_case("file_glob", true; "glob_refuses_a_substituted_root")]
+    #[test_case("file_read", false; "listing_excludes_symlinks_and_protected_descendants")]
+    #[test_case("file_read", true; "listing_refuses_a_substituted_root")]
+    fn browsing_stays_inside_its_policy_root(tool: &str, substitute_root: bool) {
+        use std::os::unix::fs::symlink;
+
+        let root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let directory = root.path().join("browse");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(directory.join("visible.rs"), BROWSE_CONTENT_SENTINEL).unwrap();
+        std::fs::write(directory.join(".env"), BROWSE_CONTENT_SENTINEL).unwrap();
+        std::fs::create_dir(directory.join(".ssh")).unwrap();
+        std::fs::write(directory.join(".ssh/secret.rs"), BROWSE_CONTENT_SENTINEL).unwrap();
+        std::fs::write(
+            outside.path().join("outside_secret.rs"),
+            BROWSE_CONTENT_SENTINEL,
+        )
+        .unwrap();
+        symlink(outside.path(), directory.join("link")).unwrap();
+        let (_host, registry) = host_and_registry(root.path());
+        let ctx = context(root.path(), Arc::clone(&registry), CancelToken::none());
+        let input = if tool == "file_read" {
+            json!({"filePath": "browse"})
+        } else {
+            json!({"path": "browse", "pattern": "**/*"})
+        };
+        let invocation = registry.get(tool).unwrap().tool.parse(&input).unwrap();
+        smol::block_on(invocation.preflight(&ctx)).unwrap();
+        if substitute_root {
+            std::fs::rename(&directory, root.path().join("original")).unwrap();
+            symlink(outside.path(), &directory).unwrap();
+        }
+        let result = smol::block_on(invocation.execute(&ctx));
+        if substitute_root {
+            assert!(result.output.is_err());
+        } else {
+            let text = result.output.unwrap().as_text();
+            assert!(text.contains("visible.rs"));
+            assert!(!text.contains("secret.rs"));
+            assert!(!text.contains(".env"));
+            assert!(!text.contains(BROWSE_CONTENT_SENTINEL));
+        }
+    }
+
     #[test]
     fn broad_grep_excludes_protected_files() {
         let root = TempDir::new().expect("tempdir");
@@ -7101,8 +8452,12 @@ mod tests {
     fn the_missing_read_refusal_comes_from_this_crate() {
         let root = TempDir::new().expect("tempdir");
 
-        let error = preflight_error(root.path(), "file_read", json!({"filePath": MISSING_NAME}))
-            .expect_err("preflight must refuse");
+        let error = preflight_error(
+            root.path(),
+            "file_glob",
+            json!({"path": MISSING_NAME, "pattern": "*"}),
+        )
+        .expect_err("preflight must refuse");
 
         assert!(
             error.contains(MISSING_READ_TARGET),

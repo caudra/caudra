@@ -198,6 +198,10 @@ impl ReviewModal {
         }
     }
 
+    pub(crate) fn text_input_active(&self) -> bool {
+        self.target.is_some() && matches!(self.mode, Mode::Note { .. })
+    }
+
     pub fn handle_mouse(&mut self, event: MouseEvent) -> ReviewAction {
         if self.target.is_none() {
             return ReviewAction::Passthrough;

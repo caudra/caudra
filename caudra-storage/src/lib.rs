@@ -11,6 +11,7 @@ pub mod mcp_trust;
 pub mod model;
 pub mod paths;
 pub mod permission_config_trust;
+pub mod permission_patterns;
 pub mod permission_state;
 pub mod plans;
 pub mod projects;
@@ -113,6 +114,13 @@ impl StateDir {
             return Ok(dir.clone());
         }
         Ok(Self::from_path(state_dir()?))
+    }
+
+    pub fn resolve_without_create() -> Result<Self, StorageError> {
+        if let Some(dir) = PROCESS_OVERRIDE.get() {
+            return Ok(dir.clone());
+        }
+        Ok(Self::from_path(paths::state_dir_path()?))
     }
 
     pub fn from_path(path: PathBuf) -> Self {
@@ -331,14 +339,27 @@ pub(crate) fn shared_state_lock(path: &Path, mode: u32) -> Result<File, StorageE
 }
 
 pub(crate) fn shared_existing_state_lock(path: &Path) -> Result<File, StorageError> {
+    let file = existing_state_lock(path)?;
+    file.lock_shared()?;
+    Ok(file)
+}
+
+pub(crate) fn try_exclusive_existing_state_lock(path: &Path) -> Result<Option<File>, StorageError> {
+    let file = existing_state_lock(path)?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(fs::TryLockError::WouldBlock) => Ok(None),
+        Err(fs::TryLockError::Error(error)) => Err(error.into()),
+    }
+}
+
+fn existing_state_lock(path: &Path) -> Result<File, StorageError> {
     validate_lock_path(path)?;
     let mut options = OpenOptions::new();
     options.read(true).write(true);
     #[cfg(unix)]
     options.custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32);
-    let file = options.open(path)?;
-    file.lock_shared()?;
-    Ok(file)
+    Ok(options.open(path)?)
 }
 
 fn validate_lock_path(path: &Path) -> Result<(), StorageError> {
@@ -662,7 +683,9 @@ mod tests {
         let volatile = tmp.path().join("volatile");
         fs::create_dir(&persistent).unwrap();
         let persistent_dir = StateDir::from_path(persistent.clone());
-        drop(sessions::SessionDatabase::open_state(&persistent_dir).unwrap());
+        let database = sessions::SessionDatabase::open_state(&persistent_dir).unwrap();
+        assert!(database.session_facts(None).unwrap().is_empty());
+        drop(database);
         let before = tree_entries(&persistent);
         let state_dir = StateDir::split(volatile.clone(), persistent.clone());
 

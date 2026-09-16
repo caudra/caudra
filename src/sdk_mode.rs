@@ -2323,6 +2323,7 @@ impl EventPump {
                     return Err(error);
                 }
             }
+            AgentEvent::PermissionRequestUpdated(_) => {}
             AgentEvent::PermissionRequestResolved { request_id, .. } => {
                 let sdk_request_ids = {
                     let mut shared = self.shared.lock().unwrap();
@@ -3547,6 +3548,37 @@ mod tests {
         assert_eq!(message["request"]["input"], input);
         assert_eq!(message["request"]["tool_use_id"], CAUDRA_REQUEST_ID);
         assert_eq!(shared.lock().unwrap().pending["req_1"], CAUDRA_REQUEST_ID);
+    }
+
+    #[test]
+    fn sdk_permission_coverage_update_preserves_the_outstanding_request() {
+        let manager = permission_manager();
+        let (mut pump, out_rx, shared) = permission_event_pump(manager, PermissionMode::Default);
+        let request = PermissionRequest::from_legacy(
+            CAUDRA_REQUEST_ID.into(),
+            caudra_config::ToolKey::native("bash"),
+            vec!["cargo test".into()],
+            serde_json::json!({"command": "cargo test"}),
+            Path::new("/project"),
+            false,
+        );
+        for event in [
+            AgentEvent::PermissionRequest(Box::new(request.clone())),
+            AgentEvent::PermissionRequestUpdated(Box::new(request)),
+        ] {
+            pump.handle(Envelope {
+                event,
+                subagent: None,
+                run_id: 0,
+                workflow: None,
+            })
+            .unwrap();
+        }
+        assert_eq!(out_rx.len(), 1);
+        let shared = shared.lock().unwrap();
+        assert_eq!(shared.pending.len(), 1);
+        assert_eq!(shared.pending["req_1"], CAUDRA_REQUEST_ID);
+        assert!(shared.resolved_permission_requests.is_empty());
     }
 
     #[test]

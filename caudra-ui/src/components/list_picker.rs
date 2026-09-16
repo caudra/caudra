@@ -660,7 +660,6 @@ impl<T: PickerItem> ListPicker<T> {
         s.selected_item_index().map(|i| &s.items[i])
     }
 
-    #[cfg(test)]
     pub fn selected_index(&self) -> Option<usize> {
         self.state.as_ref().and_then(|s| s.selected_item_index())
     }

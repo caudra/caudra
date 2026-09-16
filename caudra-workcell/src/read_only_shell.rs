@@ -9,46 +9,93 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use caudra_agent::permissions::{physical_boundary_check, sed_only_prints};
-use workcell::shell::{ShellCommandAnalysis, ShellCommandScope, ShellWord};
+use caudra_agent::permissions::{
+    PermissionResourceAccess, PermissionResourceKind, filesystem_permission_resource,
+    physical_boundary_check, sed_only_prints,
+};
+#[cfg(test)]
+use workcell::shell::ShellCommandAnalysis;
+use workcell::shell::{ShellCommandScope, ShellWord, bash::BashCwdSet};
 
 const GIT: &str = "git";
 const GIT_READ_SUBCOMMANDS: &[&str] = &[
     "blame",
-    "branch",
     "describe",
     "diff",
     "log",
     "ls-files",
     "ls-tree",
-    "reflog",
     "rev-list",
     "rev-parse",
     "shortlog",
     "show",
     "status",
-    "tag",
 ];
-/// Every one of these redirects git at another repository, another program, or
-/// another output file, which takes the call outside what its subcommand says.
-const GIT_DENIED_FLAGS: &[&str] = &[
-    "--config-env",
-    "--exec-path",
-    "--ext-diff",
-    "--git-dir",
-    "--output",
-    "--upload-pack",
-    "--work-tree",
-    "-C",
-    "-c",
+const GIT_READ_FLAGS: &[&str] = &[
+    "--oneline",
+    "--short",
+    "--stat",
+    "--numstat",
+    "--name-only",
+    "--name-status",
+    "--summary",
+    "--check",
+    "--cached",
+    "--staged",
+    "--no-ext-diff",
+    "--no-textconv",
+    "--no-color",
+    "--color=never",
+    "--no-renames",
+    "--no-index",
+    "--raw",
+    "--patch",
+    "--quiet",
+    "--exit-code",
+    "--all",
+    "--count",
+    "--abbrev-ref",
+    "--show-toplevel",
+    "--show-prefix",
+    "--verify",
+    "--porcelain",
+    "--porcelain=v1",
+    "--porcelain=v2",
+    "--graph",
+    "--decorate",
+    "--no-decorate",
+    "--reverse",
+    "--first-parent",
+    "--no-merges",
+    "--merges",
+    "--left-right",
+    "--cherry-pick",
+    "--boundary",
+    "--tags",
+    "--heads",
+    "--remotes",
+    "--full-name",
+    "--full-tree",
+    "--long",
+    "-p",
+    "-s",
+    "-u",
+    "-uno",
+    "-z",
+    "-r",
+    "-t",
+    "-v",
 ];
+const GIT_LIST_FLAGS: &[&str] = &["--list", "-l", "--no-color", "--color=never"];
+const GIT_BRANCH_FLAGS: &[&str] = &["--all", "-a", "--remotes", "-r", "--verbose", "-v", "-vv"];
 const RG: &str = "rg";
-/// Each of these makes ripgrep run another program or unpack an archive.
 const RG_DENIED_FLAGS: &[&str] = &[
     "--hostname-bin",
     "--pre",
     "--pre-glob",
     "--search-zip",
+    "--follow",
+    "-L",
     "-z",
 ];
 const GREP: &str = "grep";
@@ -57,32 +104,68 @@ const GREP: &str = "grep";
 /// only the ones named on the command line, which no textual check can see.
 const GREP_DENIED_FLAGS: &[&str] = &["--dereference-recursive", "-R"];
 const FIND: &str = "find";
-/// Each of these makes find execute, delete, or write.
 const FIND_DENIED_FLAGS: &[&str] = &[
-    "-delete", "-exec", "-execdir", "-fls", "-fprint", "-fprintf", "-ok", "-okdir",
+    "-delete",
+    "-exec",
+    "-execdir",
+    "-fls",
+    "-fprint",
+    "-fprint0",
+    "-fprintf",
+    "-ok",
+    "-okdir",
+    "-L",
+    "-H",
+    "-files0-from",
 ];
 const SORT: &str = "sort";
-/// Two of these write the result somewhere other than stdout, one writes its
-/// temporary files into a directory of the caller's choosing, and one runs a
-/// program of its own.
-const SORT_DENIED_FLAGS: &[&str] = &[
-    "--compress-program",
-    "--output",
-    "--temporary-directory",
-    "-T",
-    "-o",
+const SORT_READ_FLAGS: &[&str] = &[
+    "--unique",
+    "--reverse",
+    "--numeric-sort",
+    "--human-numeric-sort",
+    "--general-numeric-sort",
+    "--ignore-case",
+    "--ignore-leading-blanks",
+    "--dictionary-order",
+    "--ignore-nonprinting",
+    "--month-sort",
+    "--stable",
+    "--version-sort",
+    "--check",
+    "--zero-terminated",
 ];
+const SORT_READ_SHORT_FLAGS: &str = "urnhgfbdiMsVcCz";
 const SED: &str = "sed";
 const CD: &str = "cd";
-/// `cd -` is `$OLDPWD`, which the command does not say the location of.
-const PREVIOUS_DIRECTORY: &str = "-";
 /// `awk` is absent on purpose rather than deny-listed: `system()` and `print >`
 /// are reached from inside the script, so no flag list can exclude them. The
 /// same is true of `sed`, which is why `sed` is recognized by its script rather
 /// than by its flags and is not in the list below.
 const READ_ONLY_COMMANDS: &[&str] = &[
-    "basename", "cat", "cd", "date", "df", "dirname", "du", "echo", "file", "head", "jq", "ls",
-    "printf", "ps", "pwd", "readlink", "realpath", "stat", "tail", "tree", "uname", "wc", "which",
+    "basename", "cat", "cd", "df", "dirname", "echo", "head", "ls", "ps", "pwd", "readlink",
+    "realpath", "stat", "tail", "uname", "which",
+];
+const INDIRECT_FILE_FLAGS: &[&str] = &["--files0-from"];
+const FILE_READ_FLAGS: &[&str] = &[
+    "-b",
+    "--brief",
+    "-i",
+    "--mime",
+    "--mime-type",
+    "--mime-encoding",
+    "-h",
+    "--no-dereference",
+];
+const TREE_READ_FLAGS: &[&str] = &[
+    "-a",
+    "-d",
+    "-f",
+    "-i",
+    "-p",
+    "-s",
+    "--dirsfirst",
+    "--noreport",
 ];
 
 /// Reports whether every command in an analyzed line only observes.
@@ -90,11 +173,15 @@ const READ_ONLY_COMMANDS: &[&str] = &[
 /// `opaque` means the analysis could not account for part of the line, so the
 /// reviewed text describes less than the command does and nothing about it can
 /// be trusted.
-pub(crate) fn is_read_only(analysis: &ShellCommandAnalysis, opaque: bool) -> bool {
+#[cfg(test)]
+fn is_read_only(analysis: &ShellCommandAnalysis, opaque: bool) -> bool {
     !opaque && !analysis.scopes.is_empty() && analysis.scopes.iter().all(scope_is_read_only)
 }
 
-fn scope_is_read_only(scope: &ShellCommandScope) -> bool {
+pub(crate) fn scope_is_read_only(scope: &ShellCommandScope) -> bool {
+    if scope.source != scope.normalized {
+        return false;
+    }
     // Reading every flag is the whole basis for calling `git`, `rg`, and `find`
     // observers, and a word that does not mean its own text could be any of the
     // denied ones. Plan mode gates on this answer alone, so it cannot defer the
@@ -103,87 +190,142 @@ fn scope_is_read_only(scope: &ShellCommandScope) -> bool {
         return false;
     };
     match scope.executable.as_str() {
-        GIT => {
-            !denies(&arguments, GIT_DENIED_FLAGS)
-                && arguments
-                    .iter()
-                    .find(|argument| !argument.starts_with('-'))
-                    .is_some_and(|subcommand| GIT_READ_SUBCOMMANDS.contains(subcommand))
-        }
-        RG => !denies(&arguments, RG_DENIED_FLAGS),
-        GREP => !denies(&arguments, GREP_DENIED_FLAGS),
+        GIT => git_is_read_only(&arguments),
+        RG => !denies(&arguments, RG_DENIED_FLAGS) && no_attached_pattern_file(&arguments),
+        GREP => !denies(&arguments, GREP_DENIED_FLAGS) && no_attached_pattern_file(&arguments),
         FIND => !denies(&arguments, FIND_DENIED_FLAGS),
-        SORT => !denies(&arguments, SORT_DENIED_FLAGS),
+        SORT => arguments.iter().all(|argument| {
+            !argument.starts_with('-')
+                || SORT_READ_FLAGS.contains(argument)
+                || argument.strip_prefix('-').is_some_and(|flags| {
+                    !flags.is_empty()
+                        && flags
+                            .chars()
+                            .all(|flag| SORT_READ_SHORT_FLAGS.contains(flag))
+                })
+        }),
         SED => sed_only_prints(&arguments),
+        "date" => arguments.iter().all(|argument| {
+            matches!(*argument, "-u" | "--utc" | "--universal") || argument.starts_with('+')
+        }),
+        "file" => only_flags_and_operands(&arguments, FILE_READ_FLAGS),
+        "tree" => only_flags_and_operands(&arguments, TREE_READ_FLAGS),
+        "du" | "wc" => !denies(&arguments, INDIRECT_FILE_FLAGS),
+        "printf" => arguments
+            .first()
+            .is_some_and(|format| !format.starts_with('-') || *format == "--"),
         executable => READ_ONLY_COMMANDS.contains(&executable),
     }
 }
 
-/// Reports, for each command on a line in source order, whether it only
-/// observes and can only reach inside the project.
-///
-/// A read-only command still reads, and the project's own read tools are bound
-/// to the project, so granting one without the same bound would make `cat` reach
-/// what `file_read` has to ask about. The workdir is checked too, because Caudra
-/// runs the shell unconfined and a relative operand is only inside when its base
-/// is.
-///
-/// Each command is answered on its own because each is authorized on its own: a
-/// line that runs `cargo` still has to ask about the `cargo`, and the prompt
-/// lists every command, so the reader beside it grants nothing the user did not
-/// already see. Answering for the line as a whole meant one command that writes
-/// cost a prompt for every observer sharing the line, which is what made `cd`
-/// into the directory the shell already sat in ask 1,479 times in this
-/// machine's history.
-///
-/// A `cd` moves the directory every later operand resolves against, so the
-/// directory is carried across the scopes rather than each being judged against
-/// the workdir. Workcell sorts them by `start_byte`, and marks a subshell, an
-/// expansion, and a substitution opaque, so a `cd` that applied to only part of
-/// the line never reaches here. One inside a loop or a conditional is followed
-/// as though it ran, which costs a prompt rather than an allowance.
-pub(crate) fn confined_reads(
-    analysis: &ShellCommandAnalysis,
-    workdir: &Path,
-    project: &Path,
-) -> Vec<bool> {
-    if !workdir.starts_with(project) {
-        return vec![false; analysis.scopes.len()];
+fn git_is_read_only(mut arguments: &[&str]) -> bool {
+    while let [
+        "--no-pager" | "--literal-pathspecs" | "--no-optional-locks",
+        rest @ ..,
+    ] = arguments
+    {
+        arguments = rest;
     }
-    let mut current = Some(workdir.to_path_buf());
-    let mut confined = Vec::with_capacity(analysis.scopes.len());
-    for scope in &analysis.scopes {
-        // A `cd` nothing can place leaves every later operand resolving against
-        // an unknown directory, so it disqualifies the rest of the line rather
-        // than only itself.
-        let Some(directory) = current.take() else {
-            confined.push(false);
-            continue;
-        };
-        if scope.executable == CD {
-            current = cd_target(scope, &directory, project);
-            confined.push(current.is_some());
-            continue;
+    let Some((&subcommand, arguments)) = arguments.split_first() else {
+        return false;
+    };
+    match subcommand {
+        "branch" if arguments == ["--show-current"] => true,
+        "branch" | "tag" => {
+            let mut listing = false;
+            arguments.iter().all(|argument| {
+                if matches!(*argument, "--list" | "-l") {
+                    listing = true;
+                }
+                GIT_LIST_FLAGS.contains(argument)
+                    || (subcommand == "branch" && GIT_BRANCH_FLAGS.contains(argument))
+                    || (listing && !argument.starts_with('-'))
+            })
         }
-        confined
-            .push(scope_is_read_only(scope) && scope_stays_in_project(scope, &directory, project));
-        current = Some(directory);
+        "reflog" => match arguments {
+            [] => true,
+            ["show", rest @ ..] => git_read_arguments(rest),
+            _ => false,
+        },
+        subcommand => GIT_READ_SUBCOMMANDS.contains(&subcommand) && git_read_arguments(arguments),
     }
-    confined
+}
+
+fn git_read_arguments(arguments: &[&str]) -> bool {
+    let mut arguments = arguments.iter().copied();
+    while let Some(argument) = arguments.next() {
+        if argument == "--" {
+            return true;
+        }
+        if matches!(argument, "-n" | "--max-count") {
+            if !arguments.next().is_some_and(decimal) {
+                return false;
+            }
+        } else if argument.starts_with('-')
+            && !GIT_READ_FLAGS.contains(&argument)
+            && !argument.strip_prefix('-').is_some_and(decimal)
+            && !argument.strip_prefix("--max-count=").is_some_and(decimal)
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn decimal(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn only_flags_and_operands(arguments: &[&str], flags: &[&str]) -> bool {
+    arguments
+        .iter()
+        .all(|argument| !argument.starts_with('-') || flags.contains(argument))
+}
+
+fn no_attached_pattern_file(arguments: &[&str]) -> bool {
+    arguments
+        .iter()
+        .all(|argument| *argument == "-f" || !hides_in_cluster(argument, "-f"))
+}
+
+pub(crate) fn confined_read(
+    scope: &ShellCommandScope,
+    incoming: &BashCwdSet,
+    project: &Path,
+) -> bool {
+    let BashCwdSet::Known(directories) = incoming else {
+        return false;
+    };
+    !directories.is_empty()
+        && scope_is_read_only(scope)
+        && directories.iter().all(|directory| {
+            directory.starts_with(project)
+                && resolves_inside("", directory, project)
+                && if scope.executable == CD {
+                    cd_target(scope, directory, project).is_some()
+                } else {
+                    scope_stays_in_project(scope, directory, project)
+                }
+        })
 }
 
 /// Where a `cd` leaves the shell, or `None` when the command does not say, or
 /// says somewhere outside the project.
 fn cd_target(scope: &ShellCommandScope, current: &Path, project: &Path) -> Option<PathBuf> {
-    // No operand is `$HOME`, and two is the substitution form `cd old new`.
-    let [target] = literal_arguments(scope)?[..] else {
+    if !scope_is_read_only(scope) {
         return None;
+    }
+    // No operand is `$HOME`, and two is the substitution form `cd old new`.
+    let arguments = literal_arguments(scope)?;
+    let target = match arguments.as_slice() {
+        [target] | ["--", target] => *target,
+        _ => return None,
     };
-    if target == PREVIOUS_DIRECTORY || !stays_inside(target) {
+    if target.starts_with('-') || !stays_inside(target) {
         return None;
     }
     let moved = current.join(target);
-    (physical_boundary_check(project, &moved) == Some(true)).then_some(moved)
+    resolves_inside(target, current, project).then_some(moved)
 }
 
 fn scope_stays_in_project(scope: &ShellCommandScope, workdir: &Path, project: &Path) -> bool {
@@ -198,7 +340,7 @@ fn argument_stays_in_project(argument: &str, workdir: &Path, project: &Path) -> 
     // A flag carrying an attached value hides a second operand, and
     // `--file=/etc/passwd` reads it just as surely as a bare path would.
     argument
-        .split('=')
+        .split(['=', ':'])
         .all(|part| stays_inside(part) && resolves_inside(part, workdir, project))
 }
 
@@ -228,7 +370,15 @@ fn literal_arguments(scope: &ShellCommandScope) -> Option<Vec<&str>> {
 /// joins the workdir and canonicalizes to its own lexical form, which is inside.
 /// Only a link can leave, and only resolving finds it.
 fn resolves_inside(operand: &str, workdir: &Path, project: &Path) -> bool {
-    physical_boundary_check(project, &workdir.join(operand)) == Some(true)
+    let path = workdir.join(operand);
+    physical_boundary_check(project, &path) == Some(true)
+        && !filesystem_permission_resource(
+            PermissionResourceKind::File,
+            &path,
+            PermissionResourceAccess::Read,
+            project,
+        )
+        .requires_prompt
 }
 
 /// The two forms resolution cannot be trusted to judge.
@@ -255,6 +405,9 @@ fn denies(arguments: &[&str], denied: &[&str]) -> bool {
                 || argument
                     .strip_prefix(flag)
                     .is_some_and(|rest| rest.starts_with('='))
+                || (argument.starts_with("--")
+                    && argument.len() > 2
+                    && flag.starts_with(argument.split('=').next().unwrap_or(argument)))
                 || hides_in_cluster(argument, flag)
         })
     })
@@ -279,11 +432,54 @@ fn hides_in_cluster(argument: &str, flag: &str) -> bool {
 mod tests {
     use std::path::Path;
 
-    use super::{FIND, GIT, RG, SED, confined_reads, is_read_only};
+    use super::{FIND, GIT, RG, SED, confined_read, is_read_only};
     use test_case::test_case;
+    use workcell::shell::bash::{BashContextAssumptions, parse_bash};
     use workcell::shell::{ShellCommandAnalysis, ShellCommandScope, ShellWord};
 
     const PROJECT: &str = "/home/dev/project";
+    const COMMAND_SEPARATOR: &str = " && ";
+
+    fn confined_reads(
+        analysis: &ShellCommandAnalysis,
+        workdir: &Path,
+        project: &Path,
+    ) -> Vec<bool> {
+        let source = analysis
+            .scopes
+            .iter()
+            .map(|scope| scope.source.as_str())
+            .collect::<Vec<_>>()
+            .join(COMMAND_SEPARATOR);
+        let program = parse_bash(&source).expect("program");
+        let contexts = program.command_contexts_with_assumptions(
+            workdir,
+            BashContextAssumptions {
+                startup_preserves_cwd: true,
+                no_aliases_functions_or_command_not_found_hook: true,
+                no_traps: true,
+                default_shell_options: true,
+                standard_builtins: true,
+                directory_variables_are_standard: true,
+                cdpath_empty: true,
+                lastpipe_disabled: true,
+                logical_pwd_matches_initial: true,
+            },
+        );
+        analysis
+            .scopes
+            .iter()
+            .map(|scope| {
+                contexts
+                    .commands
+                    .iter()
+                    .find(|context| {
+                        program.nodes()[context.command.0].span.start == scope.start_byte
+                    })
+                    .is_some_and(|context| confined_read(scope, &context.incoming, project))
+            })
+            .collect()
+    }
 
     /// Whether a whole line is confined, for the cases about how one command's
     /// operands resolve rather than about which command the answer lands on.
@@ -296,16 +492,22 @@ mod tests {
     /// expansion are deliberately absent, because decoding them is Workcell's
     /// job now; the cases that need them are built from `ShellWord` directly.
     fn analysis(commands: &[&str]) -> ShellCommandAnalysis {
+        let mut offset = 0;
         ShellCommandAnalysis {
             scopes: commands
                 .iter()
                 .map(|command| {
                     let mut words = command.split_whitespace();
                     let executable = words.next().unwrap_or_default();
-                    scope(
+                    let mut scope = scope(
                         executable,
                         Some(words.map(|word| ShellWord::Literal(word.into())).collect()),
-                    )
+                    );
+                    scope.source = (*command).into();
+                    scope.normalized = (*command).into();
+                    scope.start_byte = offset;
+                    offset += command.len() + COMMAND_SEPARATOR.len();
+                    scope
                 })
                 .collect(),
             opaque: false,
@@ -367,8 +569,43 @@ mod tests {
     #[test_case("awk -f script.awk" => false ; "awk_is_excluded_entirely")]
     #[test_case("rm -rf build" => false ; "rm")]
     #[test_case("cargo build" => false ; "cargo_is_not_allowlisted")]
+    #[test_case("git branch -D topic" => false ; "branch_force_delete")]
+    #[test_case("git branch --list -D topic" => false ; "branch_list_with_delete")]
+    #[test_case("git branch topic" => false ; "branch_create")]
+    #[test_case("git tag release" => false ; "tag_create")]
+    #[test_case("git reflog expire --all" => false ; "reflog_expire")]
+    #[test_case("git reflog delete HEAD" => false ; "reflog_delete")]
+    #[test_case("git branch -a -vv" => true ; "branch_list")]
+    #[test_case("git tag --list v1" => true ; "tag_list")]
+    #[test_case("git reflog show -3" => true ; "reflog_show")]
+    #[test_case("git diff --out=output" => false ; "git_abbreviated_output")]
+    #[test_case("git show --textconv HEAD" => false ; "git_textconv_helper")]
+    #[test_case("date --se=now" => false ; "date_abbreviated_set")]
+    #[test_case("file -C -m magic" => false ; "file_compile")]
+    #[test_case("tree -o output" => false ; "tree_output")]
+    #[test_case("printf -v PATH value" => false ; "printf_assignment")]
+    #[test_case("sort --out=output input" => false ; "sort_abbreviated_output")]
+    #[test_case("grep --dereference-r needle ." => false ; "grep_abbreviated_follow")]
+    #[test_case("find . -fprint0 output" => false ; "find_null_output")]
     fn single_commands_are_classified(command: &str) -> bool {
         is_read_only(&analysis(&[command]), false)
+    }
+
+    #[test_case("./cat", "cat"; "relative_reader")]
+    #[test_case("/usr/bin/cat", "cat"; "absolute_reader")]
+    #[test_case("'cat'", "cat"; "quoted_reader")]
+    #[test_case("./cd", "cd"; "relative_directory_change")]
+    fn normalized_executables_do_not_prove_read_authority(source: &str, executable: &str) {
+        let mut command = scope(executable, Some(vec![ShellWord::Literal(".".into())]));
+        command.source = format!("{source} .");
+        command.normalized = format!("{executable} .");
+        let analysis = one(command);
+
+        assert!(!is_read_only(&analysis, false));
+        assert_eq!(
+            confined_reads(&analysis, Path::new(PROJECT), Path::new(PROJECT)),
+            vec![false]
+        );
     }
 
     /// A line is only as safe as its worst command, and an unaccounted-for
@@ -419,6 +656,11 @@ mod tests {
     #[test_case("git diff --no-index /etc/passwd x" => false ; "no_index_needs_no_special_case")]
     #[test_case("find . -name *.rs" => true ; "a_decoded_glob_is_an_ordinary_argument")]
     #[test_case("rg a.*b src" => true ; "a_decoded_regex_is_not_a_path")]
+    #[test_case("cat .env" => false ; "protected_dotenv")]
+    #[test_case("cat .git/config" => false ; "protected_git_config")]
+    #[test_case("cat .git/HEAD" => true ; "inert_git_metadata")]
+    #[test_case("git show HEAD:.env" => false ; "protected_revision_path")]
+    #[test_case("rg --file=.env needle" => false ; "protected_attached_operand")]
     fn operands_are_confined_to_the_project(command: &str) -> bool {
         line_is_confined(
             &analysis(&[command]),
@@ -443,6 +685,8 @@ mod tests {
     #[test_case(&["cd ..", "cat x"] => false ; "a_parent_segment_leaves_the_project")]
     #[test_case(&["cd a b", "cat x"] => false ; "two_operands_are_the_substitution_form")]
     #[test_case(&["rg needle src", "cd /tmp"] => false ; "a_trailing_move_counts_too")]
+    #[test_case(&["cd --", "cat x"] => false ; "an_option_is_not_a_directory")]
+    #[test_case(&["cd .git", "cat config"] => false ; "protected_working_directory")]
     fn a_directory_change_is_followed(commands: &[&str]) -> bool {
         line_is_confined(&analysis(commands), Path::new(PROJECT), Path::new(PROJECT))
     }

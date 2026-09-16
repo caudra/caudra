@@ -1,5 +1,6 @@
 mod acp;
 mod logs;
+mod permissions;
 mod storage;
 mod subcmd;
 mod tui;
@@ -112,6 +113,14 @@ fn configure_native_tools(agent: &caudra_config::AgentConfig) {
 
 pub fn dispatch(mut cli: Cli) -> Result<ExitCode> {
     match cli.command.take() {
+        Some(Command::Permissions { action, database }) => {
+            if cli.workcell.is_set() || cli.ephemeral {
+                return Err(color_eyre::eyre::eyre!(
+                    "permission administration requires local persistent storage"
+                ));
+            }
+            permissions::run(action, database)?;
+        }
         Some(Command::Auth { action }) => {
             let storage = StateDir::resolve().context("resolve data directory")?;
             match action {

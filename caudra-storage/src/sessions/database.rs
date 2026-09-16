@@ -17,23 +17,27 @@
 //! the structured delete because SQLite cannot atomically remove those files.
 
 use std::collections::{HashMap, HashSet};
-use std::ffi::OsStr;
-#[cfg(unix)]
-use std::fs::OpenOptions;
-use std::fs::{self, File};
+use std::ffi::{OsStr, c_int};
+use std::fs::{self, File, Metadata, OpenOptions};
 use std::io;
+use std::ops::ControlFlow;
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::path::{Path, PathBuf, absolute};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
+use crate::permission_state::{
+    PermissionHistoryScan, RawPermissionSession, RawPermissionSnapshot, validate_review_only_change,
+};
 use caudra_workspace::WorkspacePath;
 use rusqlite::backup::Backup;
+use rusqlite::ffi::{self, Error as SqliteErrorCode};
 use rusqlite::limits::Limit;
 use rusqlite::{
-    Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
+    Connection, Error as SqliteError, MAIN_DB, OpenFlags, OptionalExtension, Transaction,
+    TransactionBehavior, params,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -60,7 +64,8 @@ use crate::workflow::{
 use crate::workflow_scratch::{remove_session as remove_scratch_session, session_scratch_bytes};
 use crate::workspace_binding::StoredWorkspaceBinding;
 use crate::{
-    StateDir, StorageError, lock_session_artifacts, shared_existing_state_lock, shared_state_lock,
+    StateDir, StorageError, existing_state_lock, lock_session_artifacts,
+    shared_existing_state_lock, shared_state_lock, try_exclusive_existing_state_lock,
 };
 
 pub const SESSIONS_DB_FILE: &str = "caudra.sqlite";
@@ -71,7 +76,7 @@ const APPLICATION_ID: i64 = i32::from_be_bytes(*b"CAUD") as i64;
 /// Pages copied per step of the pre-migration backup. The whole file is copied
 /// under the initialization lock, so this only bounds how long the backup holds
 /// SQLite's read lock between steps.
-const BACKUP_PAGES_PER_STEP: std::ffi::c_int = 1024;
+const BACKUP_PAGES_PER_STEP: c_int = 1024;
 const INCREMENTAL_AUTO_VACUUM: i64 = 2;
 const PAGE_SIZE: i64 = 4096;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -91,17 +96,37 @@ const MAX_DECODED_IMAGE_BYTES: usize = 24 * 1024 * 1024;
 const MAX_SQLITE_VALUE_BYTES: i32 = 40 * 1024 * 1024;
 const MAX_EAGER_LOAD_BYTES: usize = 512 * 1024 * 1024;
 const OWNER_FILE_MODE: u32 = 0o600;
+const OTHER_USER_PERMISSIONS: u32 = 0o077;
+const DATABASE_SIDECAR_SUFFIXES: [&str; 3] = ["-wal", "-shm", "-journal"];
 pub(super) const SESSION_SNAPSHOT_DIR: &str = "session-snapshots";
 const CLEANUP_RETRY_DELAY_MS: i64 = 60_000;
 const PENDING_ARCHIVE_ORPHAN_GRACE: Duration = Duration::from_secs(60 * 60);
 const ARTIFACT_CLEANUP_KINDS: [&str; 4] =
     ["tool_output", "archive", "snapshot", "workflow_scratch"];
 const STATE_SCOPE_GLOBAL: &str = "global";
+const PERMISSION_RULES_KEY: &str = "permission.rules";
+const PERMISSION_METADATA_KEY: &str = "structured_permission_rules";
+const PERMISSION_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
+const PERMISSION_SNAPSHOT_SESSIONS: usize = 10_000;
+const INVALID_PERMISSION_REPAIR: &str =
+    "invalid or stale permission review repair; refresh the preview";
+const MAX_BASE58_UUID_BYTES: usize = 22;
+const UUID_VERSION_BYTE: usize = 6;
+const UUID_VARIANT_BYTE: usize = 8;
+const UUID_VERSION_SHIFT: u32 = 4;
+const UUID_VARIANT_SHIFT: u32 = 6;
+const UUID_V7: u8 = 7;
+const UUID_RFC4122_VARIANT: u8 = 2;
 /// Rich tool output rows at or below this size survive a trim so old
 /// transcripts keep their todo panels and other small structured records.
 const TRIM_KEEP_OUTPUT_BYTES: i64 = 4096;
 const SESSION_OPEN_ELSEWHERE: &str = "session is open in another Caudra instance";
 const UNKNOWN_CLEANUP_KIND: &str = "unknown cleanup job kind";
+const READ_ONLY_DATABASE_UNAVAILABLE: &str = "read-only inspection requires both WAL and SHM sidecars or exclusive access to an offline database without sidecars; retry after other connections close";
+const WAL_PERSISTENCE_CONFIGURATION_FAILED: &str = "failed to configure SQLite WAL persistence";
+const URI_HEX_DIGITS: &[u8; 16] = b"0123456789ABCDEF";
+#[cfg(not(unix))]
+const INVALID_SQLITE_URI_PATH: &str = "SQLite URI paths must be valid UTF-8 on this platform";
 const RELOCATION_REMOTE: &str = "remote sessions cannot be relocated";
 const RELOCATION_PENDING_REVERT: &str = "the source workspace has a pending revert or restore";
 const RELOCATION_WORKFLOW: &str = "stop active or resumable workflows before relocating";
@@ -523,6 +548,49 @@ pub struct LedgerEntry<'a> {
     pub cost: Option<f64>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct HistoryReadLimits {
+    pub max_sessions: usize,
+    pub max_rows: usize,
+    pub max_bytes: usize,
+    pub max_row_bytes: usize,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct HistoryReadReport {
+    pub sessions: usize,
+    pub rows: usize,
+    pub bytes: usize,
+    pub oversized_rows: usize,
+    pub invalid_records: usize,
+    pub nonlocal_sessions: usize,
+    pub max_rows_per_session: Option<usize>,
+    pub session_row_cutoffs: usize,
+    pub per_session: Vec<HistorySessionReadReport>,
+    pub truncated: bool,
+    pub stopped: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct HistorySessionReadReport {
+    pub session_id: CaudraId,
+    pub rows: usize,
+    pub bytes: usize,
+    pub row_cutoff: bool,
+}
+
+/// Borrowed, bounded JSON with source identity. The timestamp is the history
+/// UUIDv7 creation time, not an execution time; cwd is the session's current value.
+pub struct HistoryRecord<'a> {
+    pub session_id: CaudraId,
+    pub current_cwd: &'a str,
+    pub subagent_id: Option<&'a str>,
+    pub ordinal: u64,
+    pub history_id: CaudraId,
+    pub timestamp_ms: u64,
+    pub payload: &'a Value,
+}
+
 /// One accumulated hour of spend. Counters are `u64` because a lifetime total
 /// outgrows the `u32` a single session's counters use.
 #[derive(Debug, Clone, PartialEq)]
@@ -730,8 +798,63 @@ impl SessionDatabase {
         self.state_dir.path().join(SESSIONS_DB_FILE)
     }
 
-    pub fn open_read_only(state_dir: &StateDir) -> Result<Self, SessionError> {
+    pub(crate) fn open_permission_admin(state_dir: &StateDir) -> Result<Self, SessionError> {
+        let migration_lock =
+            try_exclusive_existing_state_lock(&state_dir.path().join(SESSIONS_DB_LOCK_FILE))?
+                .ok_or_else(|| {
+                    StorageError::Io(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "stop all sessions and close storage readers before rebinding permissions",
+                    ))
+                })?;
         let path = state_dir.path().join(SESSIONS_DB_FILE);
+        let file = open_owner_only_existing(&path)?;
+        validate_existing_database_sidecars(&path)?;
+        let connection = Connection::open_with_flags(
+            &path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?;
+        configure_wal_retention(&connection, true)?;
+        let current = open_owner_only_existing(&path)?;
+        validate_existing_database_sidecars(&path)?;
+        #[cfg(unix)]
+        if file.metadata().map_err(StorageError::from)?.ino()
+            != current.metadata().map_err(StorageError::from)?.ino()
+            || file.metadata().map_err(StorageError::from)?.dev()
+                != current.metadata().map_err(StorageError::from)?.dev()
+        {
+            return Err(StorageError::Io(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "permission database identity changed while opening",
+            ))
+            .into());
+        }
+        #[cfg(not(unix))]
+        let _ = (&file, &current);
+        connection.busy_timeout(BUSY_TIMEOUT)?;
+        connection.set_limit(Limit::SQLITE_LIMIT_LENGTH, MAX_SQLITE_VALUE_BYTES)?;
+        verify_current_schema(&connection)?;
+        connection.execute_batch("PRAGMA trusted_schema = OFF;")?;
+        Ok(Self {
+            connection,
+            state_dir: state_dir.clone(),
+            _migration_lock: migration_lock,
+        })
+    }
+
+    pub fn open_read_only(state_dir: &StateDir) -> Result<Self, SessionError> {
+        Self::open_read_only_inner(state_dir, false)
+    }
+
+    /// Background inspection must not wait on a migration or SQLite writer.
+    pub fn open_read_only_nonblocking(state_dir: &StateDir) -> Result<Self, SessionError> {
+        Self::open_read_only_inner(state_dir, true)
+    }
+
+    fn open_read_only_inner(state_dir: &StateDir, nonblocking: bool) -> Result<Self, SessionError> {
+        let path = absolute(state_dir.path().join(SESSIONS_DB_FILE)).map_err(StorageError::from)?;
         match fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
                 return Err(StorageError::Io(io::Error::new(
@@ -749,36 +872,358 @@ impl SessionDatabase {
             }
             Err(error) => return Err(StorageError::from(error).into()),
         }
-        let wal = database_sidecar(&path, "-wal");
-        let shm = database_sidecar(&path, "-shm");
-        if wal.exists() && !shm.exists() {
-            // SQLite must create shared memory to inspect this WAL. Refusing is
-            // the only way a diagnostic open can remain genuinely read-only.
-            return Err(StorageError::Io(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "read-only inspection requires an existing SQLite SHM sidecar",
-            ))
-            .into());
-        }
         // Inspection must not create files, change journal mode, or initialize
         // a schema. Normal writable initialization creates this lock file.
-        let migration_lock =
-            shared_existing_state_lock(&state_dir.path().join(SESSIONS_DB_LOCK_FILE))?;
-        let connection = Connection::open_with_flags(
-            &path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY
-                | OpenFlags::SQLITE_OPEN_NO_MUTEX
-                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-        )?;
-        connection.busy_timeout(BUSY_TIMEOUT)?;
+        let unavailable = || {
+            StorageError::Io(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                READ_ONLY_DATABASE_UNAVAILABLE,
+            ))
+        };
+        let offline = match database_sidecars_exist(&path)? {
+            [true, true, _] => false,
+            [false, false, false] => true,
+            _ => return Err(unavailable().into()),
+        };
+        let lock_path = path.with_file_name(SESSIONS_DB_LOCK_FILE);
+        let migration_lock = if offline {
+            try_exclusive_existing_state_lock(&lock_path)?.ok_or_else(unavailable)?
+        } else if nonblocking {
+            let file = existing_state_lock(&lock_path)?;
+            file.try_lock_shared()
+                .map_err(io::Error::from)
+                .map_err(StorageError::from)?;
+            file
+        } else {
+            shared_existing_state_lock(&lock_path)?
+        };
+        match database_sidecars_exist(&path)? {
+            [true, true, _] if !offline => {}
+            [false, false, false] if offline => {}
+            _ => return Err(unavailable().into()),
+        }
+        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+        let connection = if offline {
+            Connection::open_with_flags(
+                immutable_database_uri(&path)?,
+                flags | OpenFlags::SQLITE_OPEN_URI,
+            )?
+        } else {
+            Connection::open_with_flags(&path, flags)?
+        };
+        connection.busy_timeout(if nonblocking {
+            Duration::ZERO
+        } else {
+            BUSY_TIMEOUT
+        })?;
         connection.set_limit(Limit::SQLITE_LIMIT_LENGTH, MAX_SQLITE_VALUE_BYTES)?;
-        verify_current_schema(&connection)?;
         connection.execute_batch("PRAGMA query_only = ON; PRAGMA trusted_schema = OFF;")?;
+        verify_current_schema(&connection)?;
         Ok(Self {
             connection,
             state_dir: state_dir.clone(),
             _migration_lock: migration_lock,
         })
+    }
+
+    pub fn raw_permission_snapshot(&self) -> Result<RawPermissionSnapshot, SessionError> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let snapshot = raw_permission_snapshot_on(&transaction)?;
+        transaction.commit()?;
+        Ok(snapshot)
+    }
+
+    pub fn visit_permission_history(
+        &self,
+        max_rows: usize,
+        max_bytes: usize,
+        max_row_bytes: usize,
+        mut visit: impl FnMut(&str, &str),
+    ) -> Result<PermissionHistoryScan, SessionError> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let mut report = PermissionHistoryScan::default();
+        for table in ["main_history_items", "subagent_history_items"] {
+            let mut statement = transaction.prepare(&format!(
+                "SELECT s.cwd, length(CAST(h.payload AS BLOB)), CASE WHEN length(CAST(h.payload AS BLOB)) <= ?1 THEN h.payload END FROM {table} h JOIN sessions s ON s.id = h.session_id ORDER BY h.session_id, {}h.ordinal",
+                if table == "subagent_history_items" { "h.subagent_id, " } else { "" }
+            ))?;
+            let mut rows = statement.query([to_i64(max_row_bytes, "history row limit")?])?;
+            while let Some(row) = rows.next()? {
+                let bytes = from_i64_usize(row.get(1)?, "history payload bytes")?;
+                if report.rows >= max_rows || bytes > max_bytes.saturating_sub(report.bytes) {
+                    report.truncated = true;
+                    break;
+                }
+                report.rows += 1;
+                report.bytes += bytes;
+                if bytes > max_row_bytes {
+                    report.oversized_rows += 1;
+                    continue;
+                }
+                let cwd: String = row.get(0)?;
+                let payload: String = row.get(2)?;
+                visit(&cwd, &payload);
+            }
+            if report.truncated {
+                break;
+            }
+        }
+        transaction.commit()?;
+        Ok(report)
+    }
+
+    /// Samples current local project history without loading sessions or outputs.
+    /// Indexed session/stream scans keep empty sessions, duplicate rows and skipped
+    /// payloads inside the same budgets. `report` survives a partial read failure.
+    pub fn visit_history_records(
+        &self,
+        project: &str,
+        limits: &HistoryReadLimits,
+        report: &mut HistoryReadReport,
+        should_stop: impl Fn() -> bool,
+        visit: impl FnMut(HistoryRecord<'_>) -> ControlFlow<()>,
+    ) -> Result<(), SessionError> {
+        self.visit_history_records_with_session_limit(
+            project,
+            limits,
+            None,
+            report,
+            should_stop,
+            visit,
+        )
+    }
+
+    pub fn visit_history_records_with_session_limit(
+        &self,
+        project: &str,
+        limits: &HistoryReadLimits,
+        max_rows_per_session: Option<usize>,
+        report: &mut HistoryReadReport,
+        should_stop: impl Fn() -> bool,
+        mut visit: impl FnMut(HistoryRecord<'_>) -> ControlFlow<()>,
+    ) -> Result<(), SessionError> {
+        report.max_rows_per_session = max_rows_per_session;
+        let max_rows_per_session = max_rows_per_session.unwrap_or(usize::MAX);
+        let transaction = self.connection.unchecked_transaction()?;
+        let local = StoredWorkspaceBinding::local_from_cwd(project);
+        let mut sessions = transaction.prepare(
+            "SELECT id, CASE WHEN length(CAST(workspace_source AS BLOB)) <= ?3 THEN workspace_source END \
+             FROM sessions INDEXED BY sessions_cwd_updated \
+             WHERE cwd = ?1 ORDER BY updated_at DESC, id DESC LIMIT ?2",
+        )?;
+        let mut session_rows = sessions.query(params![
+            project,
+            to_i64(
+                limits.max_sessions.saturating_add(1),
+                "history session limit"
+            )?,
+            to_i64(MAX_IDENTIFIER_BYTES, "workspace source limit")?,
+        ])?;
+        'sessions: loop {
+            if should_stop() {
+                report.stopped = true;
+                break;
+            }
+            let Some(session) = session_rows.next()? else {
+                break;
+            };
+            if report.sessions >= limits.max_sessions {
+                report.truncated = true;
+                break;
+            }
+            report.sessions += 1;
+            let Some(source) = session.get::<_, Option<String>>(1)? else {
+                report.invalid_records += 1;
+                continue;
+            };
+            if !source.is_empty() && source != local.trust_anchor().as_str() {
+                report.nonlocal_sessions += 1;
+                continue;
+            }
+            let session_id = id_from_row(session, 0)?;
+            if history_uuid_timestamp(session_id).is_none() {
+                report.invalid_records += 1;
+                continue;
+            }
+            let session_index = report.per_session.len();
+            report.per_session.push(HistorySessionReadReport {
+                session_id,
+                rows: 0,
+                bytes: 0,
+                row_cutoff: false,
+            });
+            let session_report = &mut report.per_session[session_index];
+            for (table, stream, order) in [
+                ("main_history_items", "NULL", "ordinal DESC"),
+                (
+                    "subagent_history_items",
+                    "subagent_id",
+                    "subagent_id DESC, ordinal DESC",
+                ),
+            ] {
+                if should_stop() {
+                    report.stopped = true;
+                    break 'sessions;
+                }
+                let mut statement = transaction.prepare(&format!(
+                    "SELECT CASE WHEN length(CAST({stream} AS BLOB)) <= {MAX_IDENTIFIER_BYTES} THEN {stream} END, \
+                     ordinal, length(CAST(payload AS BLOB)), \
+                     CASE WHEN length(CAST(payload AS BLOB)) <= ?2 THEN payload END \
+                     FROM {table} WHERE session_id = ?1 ORDER BY {order} LIMIT ?3"
+                ))?;
+                let mut rows = statement.query(params![
+                    session_id.as_bytes().as_slice(),
+                    to_i64(
+                        limits.max_row_bytes.min(limits.max_bytes),
+                        "history row limit"
+                    )?,
+                    to_i64(
+                        limits
+                            .max_rows
+                            .saturating_sub(report.rows)
+                            .min(max_rows_per_session.saturating_sub(session_report.rows))
+                            .saturating_add(1),
+                        "history row count"
+                    )?,
+                ])?;
+                loop {
+                    if should_stop() {
+                        report.stopped = true;
+                        break 'sessions;
+                    }
+                    let Some(row) = rows.next()? else { break };
+                    if session_report.rows >= max_rows_per_session {
+                        session_report.row_cutoff = true;
+                        report.session_row_cutoffs += 1;
+                        report.truncated = true;
+                        continue 'sessions;
+                    }
+                    let bytes = from_i64_usize(row.get(2)?, "history payload bytes")?;
+                    if report.rows >= limits.max_rows
+                        || bytes > limits.max_bytes.saturating_sub(report.bytes)
+                    {
+                        report.truncated = true;
+                        break 'sessions;
+                    }
+                    report.rows += 1;
+                    report.bytes += bytes;
+                    session_report.rows += 1;
+                    session_report.bytes += bytes;
+                    if bytes > limits.max_row_bytes {
+                        report.oversized_rows += 1;
+                        continue;
+                    }
+                    let text: String = row.get(3)?;
+                    let Ok(payload) = serde_json::from_str::<Value>(&text) else {
+                        report.invalid_records += 1;
+                        continue;
+                    };
+                    let Some((history_id, timestamp_ms)) = history_record_identity(&payload) else {
+                        report.invalid_records += 1;
+                        continue;
+                    };
+                    let subagent_id: Option<String> = row.get(0)?;
+                    if table == "subagent_history_items" && subagent_id.is_none() {
+                        report.invalid_records += 1;
+                        continue;
+                    }
+                    let ordinal = from_i64(row.get(1)?, "history ordinal")?;
+                    if visit(HistoryRecord {
+                        session_id,
+                        current_cwd: project,
+                        subagent_id: subagent_id.as_deref(),
+                        ordinal,
+                        history_id,
+                        timestamp_ms,
+                        payload: &payload,
+                    })
+                    .is_break()
+                    {
+                        report.stopped = true;
+                        break 'sessions;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn repair_permission_reviews(
+        state_dir: &StateDir,
+        expected: &RawPermissionSnapshot,
+        replacement: &RawPermissionSnapshot,
+    ) -> Result<PathBuf, SessionError> {
+        validate_permission_replacement(expected, replacement)?;
+        let mut database = Self::open_permission_admin(state_dir)?;
+        if database.raw_permission_snapshot()? != *expected {
+            return Err(invalid_permission_repair());
+        }
+        let backup_path = state_dir.path().join(format!(
+            "{SESSIONS_DB_FILE}.permission-review-{}.bak",
+            CaudraId::generate()
+        ));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options
+            .mode(OWNER_FILE_MODE)
+            .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32);
+        let backup_file = options.open(&backup_path).map_err(StorageError::from)?;
+        let mut destination = Connection::open_with_flags(
+            &backup_path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?;
+        Backup::new(&database.connection, &mut destination)?.run_to_completion(
+            BACKUP_PAGES_PER_STEP,
+            Duration::ZERO,
+            None,
+        )?;
+        quick_check_on(&destination)?;
+        destination.close().map_err(|(_, error)| error)?;
+        backup_file.sync_all().map_err(StorageError::from)?;
+        #[cfg(unix)]
+        File::open(state_dir.path())
+            .map_err(StorageError::from)?
+            .sync_all()
+            .map_err(StorageError::from)?;
+        let transaction = database
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if raw_permission_snapshot_on(&transaction)? != *expected {
+            return Err(invalid_permission_repair());
+        }
+        if expected.persistent != replacement.persistent {
+            let changed = transaction.execute(
+                "UPDATE state SET value = ?1 WHERE scope = ?2 AND key = ?3 AND value = ?4",
+                params![
+                    replacement.persistent,
+                    STATE_SCOPE_GLOBAL,
+                    PERMISSION_RULES_KEY,
+                    expected.persistent
+                ],
+            )?;
+            if changed != 1 {
+                return Err(invalid_permission_repair());
+            }
+        }
+        for (before, after) in expected.sessions.iter().zip(&replacement.sessions) {
+            if before.metadata == after.metadata {
+                continue;
+            }
+            let delta = to_i64(after.metadata.len(), "metadata bytes")?
+                - to_i64(before.metadata.len(), "metadata bytes")?;
+            let changed = transaction.execute(
+                "UPDATE sessions SET metadata = ?1, logical_bytes = logical_bytes + ?2, write_version = write_version + 1 WHERE id = ?3 AND write_version = ?4 AND metadata = ?5 AND logical_bytes + ?2 >= 0",
+                params![after.metadata, delta, before.id.as_bytes().as_slice(), before.write_version, before.metadata],
+            )?;
+            if changed != 1 {
+                return Err(invalid_permission_repair());
+            }
+        }
+        transaction.commit()?;
+        Ok(backup_path)
     }
 
     pub fn stats(&self) -> Result<SessionStorageStats, SessionError> {
@@ -1205,6 +1650,19 @@ impl SessionDatabase {
     where
         T: DeserializeOwned + Serialize + Default,
     {
+        self.state_try_update_checked(scope, key, update, || Ok(()))
+    }
+
+    pub(crate) fn state_try_update_checked<T, R, E>(
+        &mut self,
+        scope: &str,
+        key: &str,
+        update: impl FnOnce(&mut T) -> Result<R, E>,
+        before_commit: impl FnOnce() -> Result<(), E>,
+    ) -> Result<Result<R, E>, SessionError>
+    where
+        T: DeserializeOwned + Serialize + Default,
+    {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1230,6 +1688,9 @@ impl SessionDatabase {
                  value = excluded.value, updated_at = excluded.updated_at",
             params![scope, key, value],
         )?;
+        if let Err(error) = before_commit() {
+            return Ok(Err(error));
+        }
         transaction.commit()?;
         Ok(Ok(result))
     }
@@ -2382,6 +2843,137 @@ impl Drop for PreparedArchive {
     }
 }
 
+fn history_record_identity(payload: &Value) -> Option<(CaudraId, u64)> {
+    let text = payload.get("id")?.as_str()?;
+    if text.len() > MAX_BASE58_UUID_BYTES {
+        return None;
+    }
+    let id = text.parse::<CaudraId>().ok()?;
+    if id.to_string() != text {
+        return None;
+    }
+    Some((id, history_uuid_timestamp(id)?))
+}
+
+fn history_uuid_timestamp(id: CaudraId) -> Option<u64> {
+    let bytes = id.as_bytes();
+    if bytes[UUID_VERSION_BYTE] >> UUID_VERSION_SHIFT != UUID_V7
+        || bytes[UUID_VARIANT_BYTE] >> UUID_VARIANT_SHIFT != UUID_RFC4122_VARIANT
+    {
+        return None;
+    }
+    let timestamp = u64::from_be_bytes([
+        0, 0, bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5],
+    ]);
+    (timestamp != 0).then_some(timestamp)
+}
+
+fn invalid_permission_repair() -> SessionError {
+    SessionError::CorruptDatabaseValue {
+        field: "permission reviews",
+        reason: INVALID_PERMISSION_REPAIR.into(),
+    }
+}
+
+fn raw_permission_snapshot_on(
+    connection: &Connection,
+) -> Result<RawPermissionSnapshot, SessionError> {
+    let persistent: Option<String> = connection
+        .query_row(
+            "SELECT value FROM state WHERE scope = ?1 AND key = ?2",
+            params![STATE_SCOPE_GLOBAL, PERMISSION_RULES_KEY],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let mut bytes = persistent.as_ref().map_or(0, String::len);
+    validate_len(
+        "permission snapshot bytes",
+        bytes,
+        PERMISSION_SNAPSHOT_BYTES,
+    )?;
+    let mut sessions = Vec::new();
+    let mut statement =
+        connection.prepare("SELECT id, write_version, cwd, metadata FROM sessions ORDER BY id")?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        validate_len(
+            "permission snapshot sessions",
+            sessions.len() + 1,
+            PERMISSION_SNAPSHOT_SESSIONS,
+        )?;
+        let metadata: String = row.get(3)?;
+        let cwd: String = row.get(2)?;
+        bytes = bytes
+            .saturating_add(metadata.len())
+            .saturating_add(cwd.len());
+        validate_len(
+            "permission snapshot bytes",
+            bytes,
+            PERMISSION_SNAPSHOT_BYTES,
+        )?;
+        sessions.push(RawPermissionSession {
+            id: id_from_row(row, 0)?,
+            write_version: row.get(1)?,
+            cwd,
+            metadata,
+        });
+    }
+    Ok(RawPermissionSnapshot {
+        persistent,
+        sessions,
+    })
+}
+
+fn validate_permission_replacement(
+    expected: &RawPermissionSnapshot,
+    replacement: &RawPermissionSnapshot,
+) -> Result<(), SessionError> {
+    let parse = |text: &str| -> Result<Value, SessionError> {
+        serde_json::from_str(text).map_err(|_| invalid_permission_repair())
+    };
+    match (&expected.persistent, &replacement.persistent) {
+        (Some(before), Some(after)) => {
+            validate_len("permission rules", after.len(), MAX_PAYLOAD_BYTES)?;
+            validate_review_only_change(&parse(before)?, &parse(after)?, true)
+                .map_err(|_| invalid_permission_repair())?;
+        }
+        (None, None) => {}
+        _ => return Err(invalid_permission_repair()),
+    }
+    if expected.sessions.len() != replacement.sessions.len() {
+        return Err(invalid_permission_repair());
+    }
+    for (before, after) in expected.sessions.iter().zip(&replacement.sessions) {
+        if before.id != after.id
+            || before.cwd != after.cwd
+            || before.write_version != after.write_version
+        {
+            return Err(invalid_permission_repair());
+        }
+        validate_len("metadata", after.metadata.len(), MAX_METADATA_BYTES)?;
+        let mut before = parse(&before.metadata)?;
+        let mut after = parse(&after.metadata)?;
+        let before_rules = before
+            .as_object_mut()
+            .ok_or_else(invalid_permission_repair)?
+            .remove(PERMISSION_METADATA_KEY);
+        let after_rules = after
+            .as_object_mut()
+            .ok_or_else(invalid_permission_repair)?
+            .remove(PERMISSION_METADATA_KEY);
+        if before != after {
+            return Err(invalid_permission_repair());
+        }
+        match (before_rules, after_rules) {
+            (Some(before), Some(after)) => validate_review_only_change(&before, &after, false)
+                .map_err(|_| invalid_permission_repair())?,
+            (None, None) => {}
+            _ => return Err(invalid_permission_repair()),
+        }
+    }
+    Ok(())
+}
+
 fn validate_relocation_paths(source: Option<&str>, destination: &str) -> Result<(), SessionError> {
     validate_len("destination cwd", destination.len(), MAX_PATH_BYTES)?;
     if !Path::new(destination).is_absolute() || destination.contains('\0') {
@@ -2826,32 +3418,7 @@ impl SerializedSession {
 
 fn create_owner_only(path: &Path) -> Result<(), SessionError> {
     match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
-            return Err(StorageError::Io(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!(
-                    "session database path {} is not a regular file",
-                    path.display()
-                ),
-            ))
-            .into());
-        }
-        Ok(metadata) => {
-            #[cfg(unix)]
-            if metadata.uid() != rustix::process::geteuid().as_raw()
-                || metadata.permissions().mode() & 0o077 != 0
-            {
-                return Err(StorageError::Io(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    format!(
-                        "session database {} must be owned by the current user and inaccessible to other users",
-                        path.display()
-                    ),
-                ))
-                .into());
-            }
-            return Ok(());
-        }
+        Ok(metadata) => return validate_owner_only_metadata(path, &metadata),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(StorageError::from(error).into()),
     }
@@ -2880,6 +3447,58 @@ fn create_owner_only(path: &Path) -> Result<(), SessionError> {
     Ok(())
 }
 
+fn validate_owner_only_metadata(path: &Path, metadata: &Metadata) -> Result<(), SessionError> {
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(StorageError::Io(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "session database path {} is not a regular file",
+                path.display()
+            ),
+        ))
+        .into());
+    }
+    #[cfg(unix)]
+    if metadata.uid() != rustix::process::geteuid().as_raw()
+        || metadata.permissions().mode() & OTHER_USER_PERMISSIONS != 0
+    {
+        return Err(StorageError::Io(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("session database {} must be owned by the current user and inaccessible to other users", path.display()),
+        )).into());
+    }
+    Ok(())
+}
+
+fn open_owner_only_existing(path: &Path) -> Result<File, SessionError> {
+    validate_owner_only_metadata(
+        path,
+        &fs::symlink_metadata(path).map_err(StorageError::from)?,
+    )?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options
+        .custom_flags((rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32);
+    let file = options.open(path).map_err(StorageError::from)?;
+    validate_owner_only_metadata(path, &file.metadata().map_err(StorageError::from)?)?;
+    Ok(file)
+}
+
+fn validate_existing_database_sidecars(path: &Path) -> Result<(), SessionError> {
+    for suffix in DATABASE_SIDECAR_SUFFIXES {
+        let path = database_sidecar(path, suffix);
+        match fs::symlink_metadata(&path) {
+            Ok(_) => {
+                open_owner_only_existing(&path)?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(StorageError::from(error).into()),
+        }
+    }
+    Ok(())
+}
+
 fn open_writable_connection(state_dir: &StateDir) -> Result<Connection, SessionError> {
     fs::create_dir_all(state_dir.path()).map_err(StorageError::from)?;
     ensure_real_directory(state_dir.path(), false).map_err(StorageError::from)?;
@@ -2892,11 +3511,33 @@ fn open_writable_connection(state_dir: &StateDir) -> Result<Connection, SessionE
             | OpenFlags::SQLITE_OPEN_NO_MUTEX
             | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )?;
+    configure_wal_retention(&connection, true)?;
     connection.busy_timeout(BUSY_TIMEOUT)?;
     connection.set_limit(Limit::SQLITE_LIMIT_LENGTH, MAX_SQLITE_VALUE_BYTES)?;
     initialize(&mut connection, state_dir)?;
     configure(&connection)?;
     Ok(connection)
+}
+
+fn configure_wal_retention(connection: &Connection, persistent: bool) -> Result<(), SessionError> {
+    let mut enabled = c_int::from(persistent);
+    let result = unsafe {
+        ffi::sqlite3_file_control(
+            connection.handle(),
+            MAIN_DB.as_ptr(),
+            ffi::SQLITE_FCNTL_PERSIST_WAL,
+            (&raw mut enabled).cast(),
+        )
+    };
+    if result != ffi::SQLITE_OK {
+        return Err(SqliteError::SqliteFailure(
+            SqliteErrorCode::new(result),
+            Some(WAL_PERSISTENCE_CONFIGURATION_FAILED.into()),
+        )
+        .into());
+    }
+    connection.pragma_update(None, "journal_size_limit", WAL_RETENTION_LIMIT_BYTES as i64)?;
+    Ok(())
 }
 
 fn verify_current_schema(connection: &Connection) -> Result<(), SessionError> {
@@ -3083,7 +3724,6 @@ fn configure(connection: &Connection) -> Result<(), SessionError> {
         "PRAGMA foreign_keys = ON;\
          PRAGMA synchronous = FULL;\
          PRAGMA wal_autocheckpoint = {WAL_AUTO_CHECKPOINT_PAGES};\
-         PRAGMA journal_size_limit = {WAL_RETENTION_LIMIT_BYTES};\
          PRAGMA trusted_schema = OFF;"
     ))?;
     Ok(())
@@ -3981,6 +4621,47 @@ fn database_sidecar(path: &Path, suffix: &str) -> PathBuf {
     sidecar.into()
 }
 
+fn database_sidecars_exist(
+    path: &Path,
+) -> Result<[bool; DATABASE_SIDECAR_SUFFIXES.len()], SessionError> {
+    let mut exists = [false; DATABASE_SIDECAR_SUFFIXES.len()];
+    for (exists, suffix) in exists.iter_mut().zip(DATABASE_SIDECAR_SUFFIXES) {
+        *exists = match fs::symlink_metadata(database_sidecar(path, suffix)) {
+            Ok(_) => true,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+            Err(error) => return Err(StorageError::from(error).into()),
+        };
+    }
+    Ok(exists)
+}
+
+fn immutable_database_uri(path: &Path) -> Result<String, SessionError> {
+    #[cfg(unix)]
+    let bytes = path.as_os_str().as_encoded_bytes();
+    #[cfg(not(unix))]
+    let bytes = path
+        .to_str()
+        .ok_or_else(|| {
+            StorageError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                INVALID_SQLITE_URI_PATH,
+            ))
+        })?
+        .as_bytes();
+    let mut uri = String::from("file:");
+    for &byte in bytes {
+        uri.push('%');
+        uri.push(char::from(
+            URI_HEX_DIGITS[usize::from(byte) / URI_HEX_DIGITS.len()],
+        ));
+        uri.push(char::from(
+            URI_HEX_DIGITS[usize::from(byte) % URI_HEX_DIGITS.len()],
+        ));
+    }
+    uri.push_str("?mode=ro&immutable=1");
+    Ok(uri)
+}
+
 fn is_pending_archive(name: &OsStr) -> bool {
     name.to_str()
         .is_some_and(|name| name.starts_with(".pending-") && name.ends_with(".jsonl"))
@@ -4000,7 +4681,12 @@ fn pragma_u64(connection: &Connection, name: &str) -> Result<u64, SessionError> 
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::cell::Cell;
+    #[cfg(unix)]
+    use std::ffi::OsString;
+    use std::fs::{self, TryLockError};
+    #[cfg(unix)]
+    use std::os::unix::ffi::OsStringExt;
     use std::sync::Barrier;
 
     use super::*;
@@ -4057,6 +4743,18 @@ mod tests {
     const LEDGER_PROVIDER: &str = "test/provider";
     const OTHER_LEDGER_PROVIDER: &str = "other/provider";
     const OTHER_LEDGER_MODEL: &str = "other/model";
+    const REPAIR_FAILURE: &str = "injected permission repair failure";
+    const OLD_REVIEW: &str = "old untyped review";
+    const HISTORY_TIME_MS: u64 = 1_767_225_600_000;
+    const HISTORY_UUID: u128 = 0x019b_76da_a800_7000_8000_0000_0000_0001;
+    const HISTORY_SESSION_CAP: usize = 4;
+    const HISTORY_LARGE_SESSION_ROWS: usize = HISTORY_SESSION_CAP * 8;
+    const HISTORY_STREAM: &str = "history-stream";
+    const UNRECOVERED_JOURNAL: &[u8] = b"pending rollback recovery";
+    #[cfg(unix)]
+    const URI_PATH_COMPONENT: &str = "file: space #%2F?mode=rw&immutable=0-é";
+    #[cfg(unix)]
+    const NON_UTF8_PATH_BYTE: u8 = 0xff;
     const SESSIONS_BEFORE_WORKSPACE_BINDING: &str = r#"
 DROP INDEX sessions_workspace_updated;
 ALTER TABLE sessions DROP COLUMN workspace_cursor_label;
@@ -4083,6 +4781,547 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         let temp = TempDir::new().unwrap();
         let state_dir = StateDir::from_path(temp.path().to_path_buf());
         (temp, state_dir)
+    }
+
+    fn permission_repair_fixture(
+        database: &mut SessionDatabase,
+    ) -> (RawPermissionSnapshot, RawPermissionSnapshot) {
+        let record = |lifetime: &str| {
+            json!({
+                "id": CaudraId::generate().to_string(), "created_at": 1,
+                "review": {"input_summary": OLD_REVIEW}, "unknown_record_field": [1, 2],
+                "rule": {"subject": {"kind": "native", "owner": "workcell", "contract": "file.read.v1"},
+                    "executor": "native", "resources": [], "arguments": {"constraint": "unconstrained"},
+                    "lifetime": lifetime, "effect": "deny"}
+            })
+        };
+        database
+            .global_state_set(PERMISSION_RULES_KEY, &json!([record("global")]))
+            .unwrap();
+        let mut session = TestSession::new(MODEL, CWD);
+        session.push_message(TestMessage(OLD_REVIEW.into()));
+        database.save(&session, None).unwrap();
+        let metadata: String = database
+            .connection
+            .query_row("SELECT metadata FROM sessions", [], |row| row.get(0))
+            .unwrap();
+        let mut metadata: Value = serde_json::from_str(&metadata).unwrap();
+        metadata[PERMISSION_METADATA_KEY] = json!([record("conversation")]);
+        metadata["unknown_session_field"] = json!({"preserve": OLD_REVIEW});
+        let metadata = serde_json::to_string(&metadata).unwrap();
+        database.connection.execute("UPDATE sessions SET logical_bytes = logical_bytes + length(CAST(?1 AS BLOB)) - length(CAST(metadata AS BLOB)), metadata = ?1", [&metadata]).unwrap();
+        let before = database.raw_permission_snapshot().unwrap();
+        let mut after = before.clone();
+        let review = json!({"tool": "file_read", "authority": "Bound tool; input unconstrained; resources unconstrained", "resources": [], "source": "unavailable"});
+        let mut persistent: Value =
+            serde_json::from_str(after.persistent.as_ref().unwrap()).unwrap();
+        persistent[0]["review"] = review.clone();
+        after.persistent = Some(serde_json::to_string(&persistent).unwrap());
+        let mut metadata: Value = serde_json::from_str(&after.sessions[0].metadata).unwrap();
+        metadata[PERMISSION_METADATA_KEY][0]["review"] = review;
+        after.sessions[0].metadata = serde_json::to_string(&metadata).unwrap();
+        (before, after)
+    }
+
+    #[test_case(false; "backup_and_accounting")]
+    #[test_case(true; "rollback_after_persistent_update")]
+    fn permission_review_repair_is_atomic_and_backed_up(fail: bool) {
+        let (_temp, state) = state_dir();
+        let mut database = SessionDatabase::open(&state).unwrap();
+        let (before, after) = permission_repair_fixture(&mut database);
+        let stats = database.stats().unwrap();
+        let protected = |connection: &Connection| -> (String, String, i64, i64) {
+            connection.query_row("SELECT token_usage, (SELECT payload FROM main_history_items LIMIT 1), updated_at, history_item_count FROM sessions", [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))).unwrap()
+        };
+        let original = protected(&database.connection);
+        if fail {
+            database.connection.execute_batch(&format!("CREATE TRIGGER fail_permission_repair BEFORE UPDATE OF metadata ON sessions BEGIN SELECT RAISE(ABORT, '{REPAIR_FAILURE}'); END;")).unwrap();
+        }
+        drop(database);
+        let result = SessionDatabase::repair_permission_reviews(&state, &before, &after);
+        let database = SessionDatabase::open_read_only(&state).unwrap();
+        assert_eq!(protected(&database.connection), original);
+        if fail {
+            assert!(result.unwrap_err().to_string().contains(REPAIR_FAILURE));
+            assert_eq!(database.raw_permission_snapshot().unwrap(), before);
+            assert_eq!(database.stats().unwrap().logical_bytes, stats.logical_bytes);
+        } else {
+            let backup = Connection::open(result.unwrap()).unwrap();
+            assert_eq!(raw_permission_snapshot_on(&backup).unwrap(), before);
+            assert_eq!(protected(&backup), original);
+            let current = database.raw_permission_snapshot().unwrap();
+            assert_eq!(current.persistent, after.persistent);
+            assert_eq!(current.sessions[0].metadata, after.sessions[0].metadata);
+            assert_eq!(
+                current.sessions[0].write_version,
+                before.sessions[0].write_version + 1
+            );
+            let delta =
+                after.sessions[0].metadata.len() as i64 - before.sessions[0].metadata.len() as i64;
+            assert_eq!(
+                database.stats().unwrap().logical_bytes as i64,
+                stats.logical_bytes as i64 + delta
+            );
+        }
+    }
+
+    #[test_case("state"; "stale_inventory")]
+    #[test_case("session"; "stale_session")]
+    #[test_case("authority"; "authority_change")]
+    #[test_case("unknown"; "unknown_metadata_change")]
+    #[test_case("locked"; "active_reader")]
+    #[test_case("invalid"; "invalid_old_record")]
+    fn permission_review_repair_refuses_unsafe_apply(case: &str) {
+        let (_temp, state) = state_dir();
+        let mut database = SessionDatabase::open(&state).unwrap();
+        let (mut before, mut after) = permission_repair_fixture(&mut database);
+        match case {
+            "state" => database
+                .global_state_set(PERMISSION_RULES_KEY, &json!([]))
+                .unwrap(),
+            "session" => {
+                database
+                    .connection
+                    .execute("UPDATE sessions SET write_version = write_version + 1", [])
+                    .unwrap();
+            }
+            "authority" => {
+                let mut value: Value =
+                    serde_json::from_str(after.persistent.as_ref().unwrap()).unwrap();
+                value[0]["rule"]["effect"] = json!("allow");
+                after.persistent = Some(value.to_string());
+            }
+            "unknown" => {
+                let mut value: Value = serde_json::from_str(&after.sessions[0].metadata).unwrap();
+                value["unknown_session_field"] = json!(false);
+                after.sessions[0].metadata = value.to_string();
+            }
+            "invalid" => {
+                let mut value: Value =
+                    serde_json::from_str(before.persistent.as_ref().unwrap()).unwrap();
+                value[0]["id"] = json!(OLD_REVIEW);
+                before.persistent = Some(value.to_string());
+            }
+            _ => {}
+        }
+        let unchanged = database.raw_permission_snapshot().unwrap();
+        if case == "locked" {
+            assert!(SessionDatabase::repair_permission_reviews(&state, &before, &after).is_err());
+            assert_eq!(database.raw_permission_snapshot().unwrap(), unchanged);
+        } else {
+            drop(database);
+            assert!(SessionDatabase::repair_permission_reviews(&state, &before, &after).is_err());
+            let database = SessionDatabase::open_read_only(&state).unwrap();
+            assert_eq!(database.raw_permission_snapshot().unwrap(), unchanged);
+        }
+    }
+
+    #[test_case(0, usize::MAX, usize::MAX; "row_limit")]
+    #[test_case(usize::MAX, 0, usize::MAX; "byte_limit")]
+    #[test_case(usize::MAX, usize::MAX, 0; "oversized_row")]
+    fn permission_history_scan_reports_bounds(rows: usize, bytes: usize, row_bytes: usize) {
+        let (_temp, state) = state_dir();
+        let mut database = SessionDatabase::open(&state).unwrap();
+        permission_repair_fixture(&mut database);
+        let report = database
+            .visit_permission_history(
+                rows.min(i64::MAX as usize),
+                bytes,
+                row_bytes.min(i64::MAX as usize),
+                |_, _| panic!("out-of-budget payload visited"),
+            )
+            .unwrap();
+        assert!(report.truncated || report.oversized_rows > 0);
+    }
+
+    #[test_case("valid", true; "canonical_base58_uuidv7")]
+    #[test_case("version", false; "wrong_uuid_version")]
+    #[test_case("variant", false; "wrong_uuid_variant")]
+    #[test_case("zero_time", false; "zero_creation_timestamp")]
+    #[test_case("oversized", false; "bounded_id_parser")]
+    fn history_record_identity_requires_uuidv7(case: &str, valid: bool) {
+        let mut bytes = HISTORY_UUID.to_be_bytes();
+        match case {
+            "version" => bytes[UUID_VERSION_BYTE] = 0,
+            "variant" => bytes[UUID_VARIANT_BYTE] = 0,
+            "zero_time" => bytes[..UUID_VERSION_BYTE].fill(0),
+            _ => {}
+        }
+        let id = CaudraId::from_bytes(bytes);
+        let text = if case == "oversized" {
+            "x".repeat(MAX_BASE58_UUID_BYTES + 1)
+        } else {
+            id.to_string()
+        };
+        let identity = history_record_identity(&json!({"id": text}));
+        assert_eq!(identity.is_some(), valid);
+        if valid {
+            assert_eq!(identity, Some((id, HISTORY_TIME_MS)));
+        }
+    }
+
+    #[test_case("migration"; "does_not_wait_for_exclusive_migration_lock")]
+    fn history_read_only_open_is_nonblocking(_case: &str) {
+        let (_temp, state) = state_dir();
+        drop(SessionDatabase::open(&state).unwrap());
+        let lock = existing_state_lock(&state.path().join(SESSIONS_DB_LOCK_FILE)).unwrap();
+        lock.lock().unwrap();
+        let result = SessionDatabase::open_read_only_nonblocking(&state);
+        assert!(
+            matches!(result, Err(SessionError::Storage(StorageError::Io(error))) if error.kind() == io::ErrorKind::WouldBlock)
+        );
+    }
+
+    #[test_case(false; "source_records_have_validated_id_and_timestamp")]
+    #[test_case(true; "partial_read_failure_retains_scan_counts")]
+    fn history_record_visitor_preserves_source_and_partial_reports(corrupt: bool) {
+        let (_temp, state) = state_dir();
+        let mut database = SessionDatabase::open(&state).unwrap();
+        let mut session = TestSession::new(MODEL, CWD);
+        session.push_message(TestMessage(ARTIFACT_NAME.into()));
+        session.push_message(TestMessage(ARTIFACT_NAME.into()));
+        database.save(&session, None).unwrap();
+        let id = CaudraId::from_bytes(HISTORY_UUID.to_be_bytes());
+        let payload = json!({"id": id, "type": "tool_call"}).to_string();
+        database
+            .connection
+            .execute(
+                "UPDATE main_history_items SET payload = ?1, byte_count = length(CAST(?1 AS BLOB))",
+                [&payload],
+            )
+            .unwrap();
+        if corrupt {
+            database
+                .connection
+                .execute(
+                    "UPDATE main_history_items SET ordinal = -1 WHERE ordinal = 0",
+                    [],
+                )
+                .unwrap();
+        }
+        let read_only = SessionDatabase::open_read_only_nonblocking(&state).unwrap();
+        let limits = HistoryReadLimits {
+            max_sessions: 2,
+            max_rows: 4,
+            max_bytes: MAX_PAYLOAD_BYTES,
+            max_row_bytes: MAX_PAYLOAD_BYTES,
+        };
+        let mut report = HistoryReadReport::default();
+        let mut visited = 0;
+        let result = read_only.visit_history_records(
+            CWD,
+            &limits,
+            &mut report,
+            || false,
+            |record| {
+                assert_eq!(record.session_id, session.id);
+                assert_eq!(record.history_id, id);
+                assert_eq!(record.timestamp_ms, HISTORY_TIME_MS);
+                assert_eq!(record.current_cwd, CWD);
+                assert_eq!(record.subagent_id, None);
+                visited += 1;
+                ControlFlow::Continue(())
+            },
+        );
+        assert_eq!(result.is_err(), corrupt);
+        assert_eq!(report.rows, 2);
+        assert_eq!(report.bytes, payload.len() * 2);
+        assert_eq!(visited, if corrupt { 1 } else { 2 });
+    }
+
+    fn history_session(
+        database: &mut SessionDatabase,
+        serial: u64,
+        main_rows: usize,
+        subagent_rows: usize,
+    ) -> CaudraId {
+        let mut session = TestSession::new(MODEL, CWD);
+        session.id = CaudraId::from_bytes((HISTORY_UUID + u128::from(serial)).to_be_bytes());
+        session.replace_messages(vec![TestMessage(ARTIFACT_NAME.into()); main_rows]);
+        if subagent_rows > 0 {
+            session.set_subagent_messages(
+                HISTORY_STREAM.into(),
+                vec![TestMessage(ARTIFACT_NAME.into()); subagent_rows],
+            );
+        }
+        session.updated_at = serial;
+        database.save(&session, None).unwrap();
+        let payload = json!({"id": session.id, "type": "tool_call"}).to_string();
+        for table in ["main_history_items", "subagent_history_items"] {
+            database.connection.execute(
+                &format!("UPDATE {table} SET payload = ?1, byte_count = length(CAST(?1 AS BLOB)) WHERE session_id = ?2"),
+                params![payload, session.id.as_bytes().as_slice()],
+            ).unwrap();
+        }
+        session.id
+    }
+
+    #[test_case(None; "generic_history_keeps_existing_session_order")]
+    #[test_case(Some(HISTORY_SESSION_CAP); "fair_history_reaches_older_parent")]
+    fn session_row_limit_is_opt_in(cap: Option<usize>) {
+        let (_temp, state) = state_dir();
+        let mut database = SessionDatabase::open(&state).unwrap();
+        let older = history_session(&mut database, 1, 2, 0);
+        let newer = history_session(&mut database, 2, HISTORY_LARGE_SESSION_ROWS, 0);
+        let limits = HistoryReadLimits {
+            max_sessions: 2,
+            max_rows: HISTORY_SESSION_CAP + 2,
+            max_bytes: MAX_PAYLOAD_BYTES,
+            max_row_bytes: MAX_PAYLOAD_BYTES,
+        };
+        let read_only = SessionDatabase::open_read_only_nonblocking(&state).unwrap();
+        let mut report = HistoryReadReport::default();
+        let mut visited = Vec::new();
+        let visit = |row: HistoryRecord<'_>| {
+            visited.push(row.session_id);
+            ControlFlow::Continue(())
+        };
+        if cap.is_some() {
+            read_only
+                .visit_history_records_with_session_limit(
+                    CWD,
+                    &limits,
+                    cap,
+                    &mut report,
+                    || false,
+                    visit,
+                )
+                .unwrap();
+        } else {
+            read_only
+                .visit_history_records(CWD, &limits, &mut report, || false, visit)
+                .unwrap();
+        }
+        assert_eq!(report.max_rows_per_session, cap);
+        assert_eq!(report.rows, limits.max_rows);
+        assert_eq!(report.sessions, if cap.is_some() { 2 } else { 1 });
+        assert_eq!(report.session_row_cutoffs, usize::from(cap.is_some()));
+        assert!(report.truncated);
+        assert!(!report.stopped);
+        let newest_rows = cap.unwrap_or(limits.max_rows);
+        assert_eq!(&visited[..newest_rows], vec![newer; newest_rows]);
+        if cap.is_some() {
+            assert_eq!(&visited[newest_rows..], [older, older]);
+        }
+        assert_eq!(report.per_session[0].session_id, newer);
+        assert_eq!(report.per_session[0].rows, newest_rows);
+        assert_eq!(report.per_session[0].row_cutoff, cap.is_some());
+        assert_eq!(
+            report.per_session.iter().map(|row| row.rows).sum::<usize>(),
+            report.rows
+        );
+        assert_eq!(
+            report
+                .per_session
+                .iter()
+                .map(|row| row.bytes)
+                .sum::<usize>(),
+            report.bytes
+        );
+        assert_eq!(read_only.connection.total_changes(), 0);
+    }
+
+    #[test_case(0, 0, false; "empty_session_is_complete")]
+    #[test_case(HISTORY_SESSION_CAP, 0, false; "exact_main_limit_is_complete")]
+    #[test_case(2, 2, false; "exact_combined_limit_is_complete")]
+    #[test_case(0, HISTORY_SESSION_CAP, false; "exact_subagent_limit_is_complete")]
+    #[test_case(HISTORY_SESSION_CAP, 1, true; "subagent_probe_proves_cutoff")]
+    #[test_case(1, HISTORY_SESSION_CAP, true; "main_and_subagents_share_one_cap")]
+    #[test_case(0, HISTORY_SESSION_CAP + 1, true; "subagents_are_bounded")]
+    fn session_cutoff_requires_an_unread_row(main: usize, subagent: usize, cutoff: bool) {
+        let (_temp, state) = state_dir();
+        let mut database = SessionDatabase::open(&state).unwrap();
+        history_session(&mut database, 1, 1, 0);
+        let newest = history_session(&mut database, 2, main, subagent);
+        let limits = HistoryReadLimits {
+            max_sessions: 2,
+            max_rows: HISTORY_LARGE_SESSION_ROWS,
+            max_bytes: MAX_PAYLOAD_BYTES,
+            max_row_bytes: MAX_PAYLOAD_BYTES,
+        };
+        let mut report = HistoryReadReport::default();
+        database
+            .visit_history_records_with_session_limit(
+                CWD,
+                &limits,
+                Some(HISTORY_SESSION_CAP),
+                &mut report,
+                || false,
+                |_| ControlFlow::Continue(()),
+            )
+            .unwrap();
+        assert_eq!(report.sessions, 2);
+        assert_eq!(report.per_session[0].session_id, newest);
+        assert_eq!(
+            report.per_session[0].rows,
+            HISTORY_SESSION_CAP.min(main + subagent)
+        );
+        assert_eq!(report.per_session[0].row_cutoff, cutoff);
+        assert_eq!(report.per_session[1].rows, 1);
+        assert_eq!(report.truncated, cutoff);
+        assert_eq!(report.session_row_cutoffs, usize::from(cutoff));
+    }
+
+    #[test_case("invalid"; "invalid_rows_consume_session_budget")]
+    #[test_case("oversized"; "oversized_rows_consume_session_budget")]
+    #[test_case("duplicate"; "duplicate_rows_consume_session_budget")]
+    fn skipped_rows_cannot_starve_other_sessions(kind: &str) {
+        let (_temp, state) = state_dir();
+        let mut database = SessionDatabase::open(&state).unwrap();
+        let older = history_session(&mut database, 1, 1, 0);
+        let newest = history_session(&mut database, 2, HISTORY_LARGE_SESSION_ROWS, 0);
+        let mut limits = HistoryReadLimits {
+            max_sessions: 2,
+            max_rows: HISTORY_LARGE_SESSION_ROWS,
+            max_bytes: MAX_PAYLOAD_BYTES,
+            max_row_bytes: MAX_PAYLOAD_BYTES,
+        };
+        let payload = match kind {
+            "invalid" => Some(json!({"type": "tool_call"}).to_string()),
+            "oversized" => {
+                limits.max_row_bytes = MAX_IDENTIFIER_BYTES;
+                Some(
+                    json!({
+                        "id": newest,
+                        "type": "tool_call",
+                        "content": "x".repeat(MAX_IDENTIFIER_BYTES + 1),
+                    })
+                    .to_string(),
+                )
+            }
+            _ => None,
+        };
+        if let Some(payload) = payload {
+            database.connection.execute(
+                "UPDATE main_history_items SET payload = ?1, byte_count = length(CAST(?1 AS BLOB)) WHERE session_id = ?2",
+                params![payload, newest.as_bytes().as_slice()],
+            ).unwrap();
+        }
+        let mut report = HistoryReadReport::default();
+        let mut visited = Vec::new();
+        database
+            .visit_history_records_with_session_limit(
+                CWD,
+                &limits,
+                Some(HISTORY_SESSION_CAP),
+                &mut report,
+                || false,
+                |row| {
+                    visited.push(row.session_id);
+                    ControlFlow::Continue(())
+                },
+            )
+            .unwrap();
+        assert_eq!(report.rows, HISTORY_SESSION_CAP + 1);
+        assert_eq!(report.session_row_cutoffs, 1);
+        assert_eq!(
+            report.invalid_records,
+            if kind == "invalid" {
+                HISTORY_SESSION_CAP
+            } else {
+                0
+            }
+        );
+        assert_eq!(
+            report.oversized_rows,
+            if kind == "oversized" {
+                HISTORY_SESSION_CAP
+            } else {
+                0
+            }
+        );
+        assert_eq!(visited.last(), Some(&older));
+        assert_eq!(
+            visited.len(),
+            if kind == "duplicate" {
+                HISTORY_SESSION_CAP + 1
+            } else {
+                1
+            }
+        );
+    }
+
+    #[test_case(false; "stop_hook_at_session_boundary")]
+    #[test_case(true; "visitor_stop_at_session_boundary")]
+    fn fair_history_honors_stop_before_probing_or_advancing(visitor_stop: bool) {
+        let (_temp, state) = state_dir();
+        let mut database = SessionDatabase::open(&state).unwrap();
+        history_session(&mut database, 1, 1, 0);
+        history_session(&mut database, 2, HISTORY_LARGE_SESSION_ROWS, 0);
+        let limits = HistoryReadLimits {
+            max_sessions: 2,
+            max_rows: HISTORY_LARGE_SESSION_ROWS,
+            max_bytes: MAX_PAYLOAD_BYTES,
+            max_row_bytes: MAX_PAYLOAD_BYTES,
+        };
+        let visited = Cell::new(0);
+        let mut report = HistoryReadReport::default();
+        database
+            .visit_history_records_with_session_limit(
+                CWD,
+                &limits,
+                Some(HISTORY_SESSION_CAP),
+                &mut report,
+                || !visitor_stop && visited.get() == HISTORY_SESSION_CAP,
+                |_| {
+                    visited.set(visited.get() + 1);
+                    if visitor_stop && visited.get() == HISTORY_SESSION_CAP {
+                        ControlFlow::Break(())
+                    } else {
+                        ControlFlow::Continue(())
+                    }
+                },
+            )
+            .unwrap();
+        assert!(report.stopped);
+        assert!(!report.truncated);
+        assert_eq!(report.rows, HISTORY_SESSION_CAP);
+        assert_eq!(report.sessions, 1);
+        assert_eq!(report.session_row_cutoffs, 0);
+    }
+
+    #[test_case(HISTORY_SESSION_CAP; "one_snapshot_across_parent_sessions")]
+    fn fair_history_keeps_the_read_only_snapshot(cap: usize) {
+        let (_temp, state) = state_dir();
+        let mut database = SessionDatabase::open(&state).unwrap();
+        let older = history_session(&mut database, 1, 1, 0);
+        let newest = history_session(&mut database, 2, 1, 0);
+        let read_only = SessionDatabase::open_read_only_nonblocking(&state).unwrap();
+        let limits = HistoryReadLimits {
+            max_sessions: 2,
+            max_rows: HISTORY_LARGE_SESSION_ROWS,
+            max_bytes: MAX_PAYLOAD_BYTES,
+            max_row_bytes: MAX_PAYLOAD_BYTES,
+        };
+        let mut report = HistoryReadReport::default();
+        read_only.visit_history_records_with_session_limit(
+            CWD, &limits, Some(cap), &mut report, || false,
+            |row| {
+                if row.session_id == newest {
+                    let payload = json!({"id": older, "type": "tool_call"}).to_string();
+                    database.connection.execute(
+                        "INSERT INTO main_history_items (session_id, ordinal, payload, byte_count) VALUES (?1, 1, ?2, length(CAST(?2 AS BLOB)))",
+                        params![older.as_bytes().as_slice(), payload],
+                    ).unwrap();
+                }
+                ControlFlow::Continue(())
+            },
+        ).unwrap();
+        assert_eq!(report.rows, 2);
+        assert!(!report.truncated);
+        assert_eq!(read_only.connection.total_changes(), 0);
+        let mut after = HistoryReadReport::default();
+        read_only
+            .visit_history_records_with_session_limit(
+                CWD,
+                &limits,
+                Some(cap),
+                &mut after,
+                || false,
+                |_| ControlFlow::Continue(()),
+            )
+            .unwrap();
+        assert_eq!(after.rows, report.rows + 1);
     }
 
     fn stored_subagent(id: &str, outcome: StoredSubagentOutcome) -> StoredSubagent {
@@ -5816,19 +7055,265 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         assert!(SessionDatabase::open(&state_dir).is_err());
     }
 
-    #[test]
-    fn read_only_open_never_creates_missing_wal_shared_memory() {
+    fn database_file_snapshot(state_dir: &StateDir) -> HashMap<PathBuf, Vec<u8>> {
+        fs::read_dir(state_dir.path())
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                let bytes = fs::read(&path).unwrap();
+                (path, bytes)
+            })
+            .collect()
+    }
+
+    fn assert_read_only_unavailable(result: Result<SessionDatabase, SessionError>) {
+        assert!(
+            matches!(result, Err(SessionError::Storage(StorageError::Io(error)))
+            if error.kind() == io::ErrorKind::WouldBlock
+                && error.to_string() == READ_ONLY_DATABASE_UNAVAILABLE)
+        );
+    }
+
+    #[test_case(true; "enable")]
+    #[test_case(false; "disable")]
+    fn wal_retention_refuses_unsupported_file_control(persistent: bool) {
+        let connection = Connection::open_in_memory().unwrap();
+        assert!(matches!(configure_wal_retention(&connection, persistent),
+            Err(SessionError::Sqlite(SqliteError::SqliteFailure(error, Some(message))))
+                if error.extended_code == ffi::SQLITE_NOTFOUND
+                    && message == WAL_PERSISTENCE_CONFIGURATION_FAILED));
+    }
+
+    #[cfg(unix)]
+    #[test_case(SessionDatabase::open, true; "normal_writer")]
+    #[test_case(SessionDatabase::open_state, true; "state_writer")]
+    #[test_case(SessionDatabase::open_permission_admin, false; "permission_admin")]
+    fn last_writer_close_preserves_sidecars_for_late_read_only_open(
+        open: fn(&StateDir) -> Result<SessionDatabase, SessionError>,
+        shared_reader_lock: bool,
+    ) {
+        let (_temp, state_dir) = state_dir();
+        if !shared_reader_lock {
+            drop(SessionDatabase::open_state(&state_dir).unwrap());
+        }
+        let mut database = open(&state_dir).unwrap();
+        assert_eq!(
+            pragma_u64(&database.connection, "journal_size_limit").unwrap(),
+            WAL_RETENTION_LIMIT_BYTES
+        );
+        database.checkpoint(true).unwrap();
+        let path = database.path();
+        let checkpointed = fs::read(&path).unwrap();
+        let session = TestSession::new(MODEL, CWD);
+        database.save(&session, None).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), checkpointed);
+        let wal = database_sidecar(&path, "-wal");
+        let shm = database_sidecar(&path, "-shm");
+        assert!(fs::metadata(&wal).unwrap().len() > 0);
+        let reader_lock = shared_reader_lock.then(|| {
+            shared_existing_state_lock(&state_dir.path().join(SESSIONS_DB_LOCK_FILE)).unwrap()
+        });
+        assert_eq!(database_sidecars_exist(&path).unwrap(), [true, true, false]);
+        let identities = || {
+            [&path, &wal, &shm].map(|path| {
+                let metadata = fs::metadata(path).unwrap();
+                (metadata.dev(), metadata.ino())
+            })
+        };
+        let checked_identities = identities();
+
+        drop(database);
+        assert_eq!(identities(), checked_identities);
+        assert_eq!(fs::metadata(&wal).unwrap().len(), 0);
+        let before = database_file_snapshot(&state_dir);
+        let read_only = SessionDatabase::open_read_only_nonblocking(&state_dir).unwrap();
+        assert_eq!(read_only.latest_id(CWD).unwrap(), Some(session.id));
+        drop(read_only);
+
+        let after = database_file_snapshot(&state_dir);
+        assert_eq!(
+            after.keys().collect::<HashSet<_>>(),
+            before.keys().collect::<HashSet<_>>()
+        );
+        assert_eq!(identities(), checked_identities);
+        for path in [&path, &wal] {
+            assert_eq!(after[path], before[path]);
+        }
+        drop(reader_lock);
+    }
+
+    #[test_case("-wal", false; "blocking_missing_wal")]
+    #[test_case("-shm", false; "blocking_missing_shm")]
+    #[test_case("-wal", true; "nonblocking_missing_wal")]
+    #[test_case("-shm", true; "nonblocking_missing_shm")]
+    fn read_only_open_never_creates_missing_wal_sidecars(suffix: &str, nonblocking: bool) {
         let (_temp, state_dir) = state_dir();
         let mut database = SessionDatabase::open(&state_dir).unwrap();
         database.save(&TestSession::new(MODEL, CWD), None).unwrap();
         let path = database.path();
-        let wal = database_sidecar(&path, "-wal");
-        let shm = database_sidecar(&path, "-shm");
-        assert!(wal.exists());
-        fs::remove_file(&shm).unwrap();
+        fs::remove_file(database_sidecar(&path, suffix)).unwrap();
+        let before = database_file_snapshot(&state_dir);
 
-        assert!(SessionDatabase::open_read_only(&state_dir).is_err());
-        assert!(!shm.exists());
+        let result = SessionDatabase::open_read_only_inner(&state_dir, nonblocking);
+        assert_eq!(database_file_snapshot(&state_dir), before);
+        assert_read_only_unavailable(result);
+    }
+
+    #[test_case("WAL", false; "blocking_clean_wal")]
+    #[test_case("WAL", true; "nonblocking_clean_wal")]
+    #[test_case("DELETE", false; "blocking_clean_rollback")]
+    #[test_case("DELETE", true; "nonblocking_clean_rollback")]
+    fn read_only_open_never_creates_files_for_closed_databases(mode: &str, nonblocking: bool) {
+        let (_temp, state_dir) = state_dir();
+        let mut database = SessionDatabase::open(&state_dir).unwrap();
+        configure_wal_retention(&database.connection, false).unwrap();
+        let session = TestSession::new(MODEL, CWD);
+        database.save(&session, None).unwrap();
+        database
+            .connection
+            .pragma_update(None, "journal_mode", mode)
+            .unwrap();
+        let path = database.path();
+        drop(database);
+        for suffix in DATABASE_SIDECAR_SUFFIXES {
+            assert!(!database_sidecar(&path, suffix).exists());
+        }
+        let before = database_file_snapshot(&state_dir);
+
+        let read_only = SessionDatabase::open_read_only_inner(&state_dir, nonblocking).unwrap();
+        assert_eq!(read_only.latest_id(CWD).unwrap(), Some(session.id));
+        assert_eq!(database_file_snapshot(&state_dir), before);
+        drop(read_only);
+        assert_eq!(database_file_snapshot(&state_dir), before);
+    }
+
+    #[test_case(false; "blocking")]
+    #[test_case(true; "nonblocking")]
+    fn read_only_open_preserves_uncheckpointed_wal_reads(nonblocking: bool) {
+        let (_temp, state_dir) = state_dir();
+        let mut database = SessionDatabase::open(&state_dir).unwrap();
+        database.checkpoint(true).unwrap();
+        let path = database.path();
+        let checkpointed = fs::read(&path).unwrap();
+        let session = TestSession::new(MODEL, CWD);
+        database.save(&session, None).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), checkpointed);
+        let before = database_file_snapshot(&state_dir);
+
+        let read_only = SessionDatabase::open_read_only_inner(&state_dir, nonblocking).unwrap();
+        assert_eq!(read_only.latest_id(CWD).unwrap(), Some(session.id));
+        drop(read_only);
+
+        let after = database_file_snapshot(&state_dir);
+        assert_eq!(
+            after.keys().collect::<HashSet<_>>(),
+            before.keys().collect::<HashSet<_>>()
+        );
+        for path in [&path, &database_sidecar(&path, "-wal")] {
+            assert_eq!(after[path], before[path]);
+        }
+    }
+
+    #[test_case(false; "blocking")]
+    #[test_case(true; "nonblocking")]
+    fn read_only_offline_open_refuses_live_writer_without_sidecars(nonblocking: bool) {
+        let (_temp, state_dir) = state_dir();
+        let database = SessionDatabase::open(&state_dir).unwrap();
+        configure_wal_retention(&database.connection, false).unwrap();
+        database
+            .connection
+            .pragma_update(None, "journal_mode", "DELETE")
+            .unwrap();
+        assert_eq!(
+            database_sidecars_exist(&database.path()).unwrap(),
+            [false, false, false]
+        );
+        let before = database_file_snapshot(&state_dir);
+
+        assert_read_only_unavailable(SessionDatabase::open_read_only_inner(
+            &state_dir,
+            nonblocking,
+        ));
+        assert_eq!(database_file_snapshot(&state_dir), before);
+    }
+
+    #[test_case(false; "blocking")]
+    #[test_case(true; "nonblocking")]
+    fn read_only_offline_open_holds_exclusive_lock_until_connection_closes(nonblocking: bool) {
+        let (_temp, state_dir) = state_dir();
+        let database = SessionDatabase::open(&state_dir).unwrap();
+        configure_wal_retention(&database.connection, false).unwrap();
+        drop(database);
+        let before = database_file_snapshot(&state_dir);
+        let read_only = SessionDatabase::open_read_only_inner(&state_dir, nonblocking).unwrap();
+        let contender = existing_state_lock(&state_dir.path().join(SESSIONS_DB_LOCK_FILE)).unwrap();
+
+        assert!(matches!(
+            contender.try_lock_shared(),
+            Err(TryLockError::WouldBlock)
+        ));
+        assert!(matches!(
+            contender.try_lock(),
+            Err(TryLockError::WouldBlock)
+        ));
+        assert_read_only_unavailable(SessionDatabase::open_read_only_inner(
+            &state_dir,
+            nonblocking,
+        ));
+        assert!(matches!(SessionDatabase::open_permission_admin(&state_dir),
+            Err(SessionError::Storage(StorageError::Io(error)))
+                if error.kind() == io::ErrorKind::WouldBlock));
+        assert_eq!(database_file_snapshot(&state_dir), before);
+
+        drop(read_only);
+        contender.try_lock_shared().unwrap();
+        drop(contender);
+        let mut writable = SessionDatabase::open_state(&state_dir).unwrap();
+        writable.save(&TestSession::new(MODEL, CWD), None).unwrap();
+    }
+
+    #[test_case(false; "blocking")]
+    #[test_case(true; "nonblocking")]
+    fn read_only_offline_open_never_ignores_rollback_journal(nonblocking: bool) {
+        let (_temp, state_dir) = state_dir();
+        let database = SessionDatabase::open(&state_dir).unwrap();
+        configure_wal_retention(&database.connection, false).unwrap();
+        let path = database.path();
+        drop(database);
+        fs::write(database_sidecar(&path, "-journal"), UNRECOVERED_JOURNAL).unwrap();
+        let before = database_file_snapshot(&state_dir);
+
+        assert_read_only_unavailable(SessionDatabase::open_read_only_inner(
+            &state_dir,
+            nonblocking,
+        ));
+        assert_eq!(database_file_snapshot(&state_dir), before);
+    }
+
+    #[cfg(unix)]
+    #[test_case(false, false; "blocking_uri_metacharacters")]
+    #[test_case(false, true; "blocking_non_utf8")]
+    #[test_case(true, false; "nonblocking_uri_metacharacters")]
+    #[test_case(true, true; "nonblocking_non_utf8")]
+    fn read_only_offline_uri_preserves_path_bytes(nonblocking: bool, non_utf8: bool) {
+        let temp = TempDir::new().unwrap();
+        let mut name = URI_PATH_COMPONENT.as_bytes().to_vec();
+        if non_utf8 {
+            name.push(NON_UTF8_PATH_BYTE);
+        }
+        let state_dir = StateDir::from_path(temp.path().join(OsString::from_vec(name)));
+        let mut database = SessionDatabase::open(&state_dir).unwrap();
+        configure_wal_retention(&database.connection, false).unwrap();
+        let session = TestSession::new(MODEL, CWD);
+        database.save(&session, None).unwrap();
+        drop(database);
+        let before = database_file_snapshot(&state_dir);
+
+        let read_only = SessionDatabase::open_read_only_inner(&state_dir, nonblocking).unwrap();
+        assert_eq!(read_only.latest_id(CWD).unwrap(), Some(session.id));
+        assert_eq!(database_file_snapshot(&state_dir), before);
+        drop(read_only);
+        assert_eq!(database_file_snapshot(&state_dir), before);
     }
 
     fn artifact_paths(state_dir: &StateDir, id: CaudraId) -> [PathBuf; 4] {

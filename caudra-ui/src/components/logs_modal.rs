@@ -214,6 +214,10 @@ impl LogsModal {
         self.open
     }
 
+    pub(crate) fn text_input_active(&self) -> bool {
+        self.open && self.query_focused
+    }
+
     pub fn contains(&self, pos: Position) -> bool {
         self.open && self.popup.contains(pos)
     }

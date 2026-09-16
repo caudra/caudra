@@ -110,7 +110,150 @@ If both `--yolo` and `--permission-mode` are set, the explicit mode wins. Unknow
 
 Several other Claude Code flags are accepted and ignored so existing scripts keep parsing. Caudra prints a warning when you pass one of them.
 
+### Shell host configuration
+
+On Unix, Workcell uses a host-bound absolute Bash executable with `--noprofile --norc -c`. It does not search `PATH` for the shell or implicitly source login files, `.bashrc`, `BASH_ENV`, or `ENV`. Commands still receive the existing environment allowlist, including `PATH`, basic home/user/locale/temp variables, and uppercase and lowercase proxy variables. Arbitrary host variables and startup hooks are not forwarded.
+
+`WORKCELL_BASH_EXECUTABLE` selects an absolute Bash path in the execution host's environment. Runtime selection takes precedence over the same build-time variable. With neither set, Workcell tries `/bin/bash`, then `/usr/bin/bash`. An explicit empty, relative, missing, or invalid override fails instead of falling back. The selected executable is bound and revalidated before execution. A changed executable requires restarting the shell host.
+
+```bash
+WORKCELL_BASH_EXECUTABLE=/usr/bin/bash caudra
+```
+
+Set this on the Workcell host for remote execution. It is host configuration, not a model tool argument or a Caudra CLI flag. Nix builds can supply an absolute store path through the build-time variable. See [Shell parsing](/docs/permissions/#shell-parsing) for authorization limits. A predictable shell startup is not a sandbox.
+
 ## Subcommands
+
+### `caudra permissions`
+
+Audit permission events, discover review-only command patterns, inspect stored rules, repair review descriptions, or review an explicit permission transfer without starting an agent. `audit` and `rebind` emit JSON. `discover`, `inventory`, and `repair-review` default to human-readable output and accept `--json`.
+
+`discover`, `inventory`, `repair-review`, and `rebind` accept `--database <ABSOLUTE_CAUDRA_SQLITE>` before or after the subcommand. The path must name an existing canonical absolute `caudra.sqlite` file. Symlink and hard-link aliases are rejected. Selecting a database creates no database or directories. Inventory, repair, and rebind reports identify the selected database path. Discovery reports a hashed source identity.
+
+Without `--database`, commands use this build's data namespace. Development builds default to `caudra-debug`, not the production `caudra` namespace. To preview repair of the standard Linux production database with a development binary, select it explicitly:
+
+```bash
+./target/debug/caudra permissions repair-review \
+  --database "$HOME/.local/state/caudra/caudra.sqlite" --json
+```
+
+Use the actual production path if your state directory differs. Keep the same `--database` selection when moving from inspection to apply.
+
+```bash
+caudra permissions audit
+caudra permissions audit --log permission-sample.jsonl \
+  --since 2026-09-14T00:00:00Z --max-bytes 8388608
+```
+
+`audit` reads the current canonical log unless `--log` selects another existing regular file. It rejects `--database`. It does not create directories, open the permission database, or scan rotated logs or session history.
+
+| Flag | Effect |
+|---|---|
+| `--log <JSON_LOG>` | Read this file instead of the current canonical log |
+| `--since <RFC3339>` | Include prompt and decision events independently at or after this timestamp |
+| `--max-bytes <BYTES>` | Tail-read budget, including the boundary probe. Defaults to 8 MiB and clamps to 1 byte through 32 MiB |
+
+The sample covers one file's bounded tail. It processes at most 50,000 complete lines forward within that tail, skipping lines larger than 64 KiB. Output reports skipped partial or oversized lines and complete bytes left unprocessed. Concurrent appends, rotation, or truncation can leave the sample incomplete.
+
+Counts are log events, not deduplicated requests. There is no total-invocation denominator, so they cannot establish a prompt rate. Output separates explicit decisions, rule settlements, policy denials, and abandoned waits. Wait summaries pair `manager_id` and `request_id`, falling back to request ID alone when the manager ID is absent. Duplicate or colliding keys are excluded from waits. Time and sample boundaries can leave pairs incomplete. Waits include unattended time and can overlap, so they do not measure active human time. Commands, resources, identifiers, and arbitrary log strings are not emitted.
+
+```bash
+caudra permissions inventory
+caudra permissions inventory --json
+caudra permissions inventory --project /work/new --known-root /work/old
+caudra permissions rebind --old-root /work/old --new-root /work/new
+caudra permissions rebind --old-root /work/old --new-root /work/new \
+  --candidates candidates.json --select FULL_RULE_ID
+```
+
+`inventory` includes persistent rules across projects and conversation rules from stored sessions, including revoked rules. Human output shows full IDs, creation and revocation times, binding status, authority, and sanitized review descriptions. Missing inputs and scopes are marked unavailable. Supplied `--known-root` paths can supply hash-verified scope labels. `--json` includes the structured constraints and digests. The project defaults to the current directory. Binding eligibility is not a full policy evaluation: it does not decide whether a particular call is allowed. Inspection does not change logical database state, though SQLite may update existing WAL coordination sidecars.
+
+#### Discovering patterns from history
+
+```bash
+caudra permissions discover
+caudra permissions discover --project /work/app --limit 10 \
+  --since 2026-09-14T00:00:00Z --json
+caudra permissions --database "$HOME/.local/state/caudra/caudra.sqlite" \
+  discover --project /work/app --limit 5
+```
+
+`discover` reads a bounded sample of local stored tool calls and proposes command patterns for review. It never executes history, installs rules, or changes authorization. There is no apply mode. Use the [matching approval prompt](/docs/permissions/#argument-pattern-inspector) to review and grant a scope.
+
+| Flag | Effect |
+|---|---|
+| `--project <ABSOLUTE_PATH>` | Match sessions whose current stored project cwd equals this path. Defaults to the current directory |
+| `--limit <COUNT>` | Maximum proposals, default 10 and clamped to 1 through 64 |
+| `--since <RFC3339>` | Include history records created at or after this timestamp, based on their UUIDv7 IDs |
+| `--json` | Emit pattern definitions, retained literal values, evidence, per-session counts, analysis diagnostics, assumptions, exclusions, and limits |
+| `--database <ABSOLUTE_CAUDRA_SQLITE>` | Read an explicitly selected database instead of this build's data namespace |
+
+The project path must be bounded absolute UTF-8 without parent components or control characters. Historical paths are interpreted lexically, without resolving them through today's filesystem. A session's current stored cwd only approximates its historical project. Timestamps describe history creation, not execution time. Invalid, missing, or future dates are excluded.
+
+Reports label all history-derived proposals as imported, with unknown outcomes and unverified historical execution context. Analysis assumes standard Bash startup, no aliases, functions, traps, or command-not-found hook, standard builtins and directory variables, empty `CDPATH`, disabled `lastpipe`, and a logical `PWD` matching the initial cwd. `context_verified` means analysis succeeded under those declared assumptions. It does not prove the old command ran in that environment.
+
+Proposals keep the executable, fixed arguments, argument count, and workdir bound. Variable slots start with observed literal values and their observed joint combinations, without wildcards. An unknown-role argument after a fixed flag can select a program operation. Its position does not prove it is data. See the [argument pattern inspector](/docs/permissions/#argument-pattern-inspector) before widening a slot.
+
+The scan samples recent sessions first, with limits of 256 sessions, 10,000 history rows, 16 MiB of history, 4,096 calls, and 4 MiB of command analysis. Each parent session has a shared cap of 128 rows across main and subagent history. Reaching that cap skips the parent's remaining rows and advances to the next session. Duplicates, invalid records, and skipped rows count toward the cap. A row is limited to 256 KiB and a command to 8 KiB.
+
+The per-parent cap prevents one large session from consuming the entire row allowance. Global byte, call, and time budgets can still end the scan earlier. Reports include visited parent-session row and byte counts, per-session cutoff flags, and the number of parents cut short. This is a bounded prefix sample, not representative coverage or a count of all omitted rows.
+
+The two-second budget reserves half for sampling, one quarter for admitting observations, and the final quarter for suggestions and evidence. Checks run between bounded operations, so one in-flight operation can finish after its deadline. Phase cutoffs retain partial results, while cancellation discards all proposals. `--limit` changes the proposal cap, not these scan limits. Check the reported phase limits, timeout, storage availability, and exclusions before drawing conclusions.
+
+Imported proposals require at least two observations across two independent parent sessions. Recognizer admission is first-come and capacity-bounded, so input order can change retained evidence and proposals. Capacity exclusions are reported.
+
+Only structurally stored native shell calls and shell calls inside native batches are eligible. Tool names alone do not authenticate historical identity. Text, tool outputs, MCP calls, unsupported expressions, sensitive-looking values, and interpreted payloads are excluded. Archives and deleted history are not scanned. Repeated history IDs count once, conflicting copies are excluded, and subagents do not count as independent parent sessions. Support counts describe sampled records, not authoritative execution or success statistics.
+
+Analysis reports aggregate omitted-command reasons and source/effect obligations, plus counts of calls with incomplete source or context. These totals precede history quarantine and recognizer admission, so observed-command counts are not retained proposal support. A matching pattern does not establish full-call authorization. Source/operator obligations and unassessed program effects can remain outside that match. Counts and matches cannot establish a safe-approval percentage.
+
+Read-only SQLite access can update existing WAL coordination sidecars without changing logical database state. Caudra retains these sidecars after its last writer closes and truncates the WAL after a successful close checkpoint. An older offline database without sidecars is inspected only while Caudra holds exclusive storage access. Incomplete sidecars or conflicting access make the scan unavailable rather than ignoring WAL data.
+
+Retained literals can still contain private information, so inspect JSON before sharing it. The TUI's [background discovery and Suggested list](/docs/permissions/#suggested-patterns) use imported proposals too and never grant them automatically.
+
+#### Repairing review descriptions
+
+```bash
+caudra permissions repair-review
+caudra permissions repair-review --json
+caudra permissions repair-review --retry-unavailable --json
+caudra permissions repair-review --apply
+```
+
+The default is a read-only dry run. This explicit, one-off repair reads old review metadata across all persistent rules and stored conversation rules. It scans bounded local session history for tool inputs and resource candidates, then verifies them against existing constraints before storing sanitized descriptions. It never executes recovered commands, resolves historical paths through the current filesystem, or changes authorization. IDs, lifetimes, effects, revocations, and project bindings remain unchanged. Already typed reviews are skipped by default.
+
+`--retry-unavailable` also retries typed unavailable reviews and incomplete recovered reviews. Approved reviews remain untouched. Existing verified labels are retained when the new scan still cannot recover those fields. Review the retry dry run, then retain `--retry-unavailable` and the same `--database` selection when adding `--apply`.
+
+Output reports the database path, retried, repaired, recovered, and unavailable reviews, missing scope labels and inputs, scan limits, truncation, and invalid history rows. JSON includes the path in `database`. A recovered review can still have unavailable fields. Check those counts before applying. History limits, redaction, and missing history can prevent full recovery. The command does not invert hashes or invent missing values.
+
+Before applying, stop every Caudra session and close all storage readers using this database, including old Caudra versions and sessions in other projects. Run `caudra storage path` with the production binary to locate its database, and check the repair report's database path. Apply requires exclusive administrative access and rechecks the stored metadata before committing the replacements atomically.
+
+When there are reviews to repair, apply automatically creates an owner-only, checked SQLite backup beside the database, named `caudra.sqlite.permission-review-<ID>.bak`. Human output prints its exact path after `SQLite backup:`. JSON output reports it in `backup`. A no-op apply creates no backup. Keep the backup private because it contains the full database, including the old metadata and session history.
+
+After a successful apply, restart Caudra with the updated version and inspect `/permissions` or `caudra permissions inventory` against the same database. A failed access check requires closing the remaining readers and rerunning the dry run before applying again. No permission re-approval is needed for a metadata-only repair.
+
+#### Rebinding stored rules
+
+`rebind` defaults to a read-only preview and selects nothing automatically. Use a normalized historical absolute `--old-root` and an existing canonical destination directory for `--new-root`. The old root's current symlink is irrelevant. Repeat `--select` with full rule IDs, including affected global rules and restrictive rules you intend to transfer.
+
+The optional candidate file is bounded to 1 MiB and uses this shape:
+
+```json
+{"paths":["/work/old","/work/old/src"],"values":["git status --short"]}
+```
+
+`paths` supplies historical absolute filesystem or workdir spellings. `values` supplies exact non-path resource text, such as a reviewed command. Candidates must match the stored hashes. They are never executed or persisted as recovered display metadata. Root paths alone cannot identify arbitrary descendant hashes. There is no automatic history recovery, hash inversion, or rewriting of paths inside command text. Exact-input and selected-input constraints require fresh grants.
+
+Preview rows are classified as verifiable, needs candidate, unaffected, unsupported, or restrictive-policy blocker. Review the old and new authority, reasons, `partial_policy_transfer`, and `can_apply`. Unresolved or unselected affected deny/ask rules block related allows. A selected restrictive rule is copied while its original remains active at the source. Only replaced allow originals are retired. A subset transfer is not equivalent to moving the whole policy.
+
+To apply, close every session and storage reader using this database, including sessions in other projects. Repeat the reviewed command with the same roots, candidates, and selections, adding:
+
+```bash
+--apply --confirm PREVIEW_FINGERPRINT
+```
+
+Use the top-level `confirmation` value from that selected preview, not the inventory fingerprint. Apply rechecks the preview fingerprint, destination identity, resource aliases, and database access guards. It inserts replacements and retires selected allow originals atomically, retaining source-record provenance. Changed inventory or destination identity requires a fresh preview. Rules remain path-bound after commit, not inode-bound.
+
+This is fresh destination authorization. It never transfers project-config trust or YOLO, and it never automatically rebinds stored grants through symlinks. See [Permissions](/docs/permissions/) for runtime matching and prompt behavior.
 
 ### `caudra remote`
 

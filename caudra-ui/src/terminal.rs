@@ -33,7 +33,8 @@ const STRING_TERMINATOR: &str = "\u{1b}\\";
 /// must not be able to hang startup with Ctrl-C disabled.
 const TMUX_QUERY_TIMEOUT: Duration = Duration::from_millis(500);
 const KEYBOARD_ENHANCEMENTS: KeyboardEnhancementFlags =
-    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES;
+    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        .union(KeyboardEnhancementFlags::REPORT_EVENT_TYPES);
 /// Termux exports this from v0.107, but not on every install or upgrade path,
 /// so it confirms Termux and never rules it out.
 const TERMUX_VERSION: &str = "TERMUX_VERSION";
@@ -511,6 +512,7 @@ mod tests {
 
     const WRONG_TERMUX: &str = "the environment was read as the wrong terminal";
     const TERMUX_PREFIX: &str = "/data/data/com.termux/files/usr";
+    const EXPECTED_KEYBOARD_ENHANCEMENTS: &str = "\u{1b}[>3u";
 
     #[test_case(false, Some(TERMUX_PREFIX), true ; "the prefix alone identifies an older termux")]
     #[test_case(true, None, true ; "the version alone identifies one that exports it")]
@@ -526,11 +528,12 @@ mod tests {
     }
 
     #[test]
-    fn keyboard_enhancements_preserve_text_input() {
-        assert_eq!(
-            KEYBOARD_ENHANCEMENTS,
-            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-        );
+    fn keyboard_enhancements_report_event_types_without_forcing_all_keys() {
+        let mut sequence = String::new();
+        PushKeyboardEnhancementFlags(KEYBOARD_ENHANCEMENTS)
+            .write_ansi(&mut sequence)
+            .unwrap();
+        assert_eq!(sequence, EXPECTED_KEYBOARD_ENHANCEMENTS);
     }
 
     #[test]

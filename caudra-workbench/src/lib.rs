@@ -1299,6 +1299,27 @@ impl Workbench {
         self.focus
     }
 
+    pub fn text_input_active(&self) -> bool {
+        if !self.open {
+            return false;
+        }
+        if self.input.is_some() {
+            return true;
+        }
+        if self.confirm.is_some() || self.menu.is_some() {
+            return false;
+        }
+        self.palette.is_open()
+            || self.goto.is_some()
+            || match self.focus {
+                Focus::Editor => self
+                    .editor
+                    .active()
+                    .is_some_and(|tab| tab.find.is_open() || tab.is_editable()),
+                Focus::Sidebar => self.sidebar == SidebarView::Search,
+            }
+    }
+
     /// Inserts text the host pulled out of a bracketed paste. Reports whether
     /// anything took it, so the host can fall back to its own composer.
     pub fn paste(&mut self, text: &str) -> bool {

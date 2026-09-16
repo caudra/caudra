@@ -418,6 +418,130 @@ pub enum Command {
         #[command(subcommand)]
         action: StorageAction,
     },
+    #[command(
+        about = "Inspect permissions and discover review-only patterns without starting an agent"
+    )]
+    Permissions {
+        #[arg(
+            long,
+            global = true,
+            value_name = "ABSOLUTE_CAUDRA_SQLITE",
+            help = "Select an existing canonical caudra.sqlite path; default uses this build's data namespace. Not accepted by audit"
+        )]
+        database: Option<PathBuf>,
+        #[command(subcommand)]
+        action: PermissionAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum PermissionAction {
+    #[command(
+        about = "Propose command patterns from bounded history under declared standard-Bash assumptions; never installs rules"
+    )]
+    Discover {
+        #[arg(
+            long,
+            value_name = "ABSOLUTE_PATH",
+            help = "Match the stored current project cwd exactly (approximate historical context); defaults to the current directory, without resolving historical paths"
+        )]
+        project: Option<PathBuf>,
+        #[arg(
+            long,
+            value_name = "COUNT",
+            help = "Maximum proposals; default 10, clamped to 1–64"
+        )]
+        limit: Option<usize>,
+        #[arg(
+            long,
+            value_name = "RFC3339",
+            help = "Include history UUIDv7 creation times at or after this cutoff; not proof of execution time"
+        )]
+        since: Option<String>,
+        #[arg(
+            long,
+            help = "Emit safe observed literal values, pattern definitions and evidence as JSON; omitted inputs are never printed"
+        )]
+        json: bool,
+    },
+    #[command(
+        about = "Summarize a bounded read-only sample of permission log events without exposing log values"
+    )]
+    Audit {
+        #[arg(
+            long,
+            value_name = "JSON_LOG",
+            help = "Read this file instead of the current canonical log; rotated files are not scanned"
+        )]
+        log: Option<PathBuf>,
+        #[arg(
+            long,
+            value_name = "RFC3339",
+            help = "Include events at or after this timestamp within the bounded tail sample"
+        )]
+        since: Option<String>,
+        #[arg(
+            long,
+            value_name = "BYTES",
+            help = "Tail read budget, including boundary probe; default 8 MiB, clamped to 1 byte–32 MiB"
+        )]
+        max_bytes: Option<u64>,
+    },
+    #[command(
+        about = "Review all persistent and conversation permission rules without changing storage"
+    )]
+    Inventory {
+        #[arg(long)]
+        project: Option<PathBuf>,
+        #[arg(long, value_name = "ABSOLUTE_PATH")]
+        known_root: Vec<String>,
+        #[arg(
+            long,
+            help = "Export raw structured records as JSON instead of a human-readable review"
+        )]
+        json: bool,
+    },
+    #[command(
+        about = "Recover typed permission reviews from hash-verified history candidates; dry-run by default"
+    )]
+    RepairReview {
+        #[arg(
+            long,
+            help = "Retry unavailable or incomplete recovered reviews; never replace approved reviews"
+        )]
+        retry_unavailable: bool,
+        #[arg(
+            long,
+            help = "Back up and apply metadata-only repairs; stop all sessions and storage readers first"
+        )]
+        apply: bool,
+        #[arg(
+            long,
+            help = "Print aggregate counts only as JSON, never history or candidate values"
+        )]
+        json: bool,
+    },
+    #[command(
+        about = "Preview an explicit old-to-new permission transfer; never follows the old root's current symlink"
+    )]
+    Rebind {
+        #[arg(long, value_name = "HISTORICAL_ABSOLUTE_PATH")]
+        old_root: PathBuf,
+        #[arg(long, value_name = "CANONICAL_DIRECTORY")]
+        new_root: PathBuf,
+        #[arg(
+            long,
+            value_name = "JSON_FILE",
+            help = "Explicit hash candidates: {\"paths\":[\"/old/path\"],\"values\":[\"command text\"]}; never executed or persisted"
+        )]
+        candidates: Option<PathBuf>,
+        #[arg(long, value_name = "FULL_RULE_ID")]
+        select: Vec<String>,
+        #[arg(long, requires_all = ["confirm", "select"], help = "Apply selected replacements with all sessions using this database stopped")]
+        apply: bool,
+        #[arg(long, requires = "apply", value_name = "PREVIEW_FINGERPRINT")]
+        confirm: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -736,6 +860,169 @@ mod tests {
     const MODELS_NOT_PARSED: &str = "expected the models subcommand";
     const TRIM_NOT_PARSED: &str = "expected the storage trim subcommand";
     const MODEL_SPEC: &str = "openai/gpt-5";
+    const PERMISSIONS_NOT_PARSED: &str = "expected permission rebind subcommand";
+    const PERMISSION_DATABASE: &str = "/explicit-copy/caudra.sqlite";
+
+    #[test_case(false; "human_proposals")]
+    #[test_case(true; "json_proposals")]
+    fn permission_discover_parses_read_only_project_and_sample_options(json: bool) {
+        let mut args = vec![
+            "caudra",
+            "permissions",
+            "discover",
+            "--project",
+            "/historical/project",
+            "--limit",
+            "3",
+            "--since",
+            "2026-01-01T00:00:00Z",
+            "--database",
+            PERMISSION_DATABASE,
+        ];
+        if json {
+            args.push("--json");
+        }
+        let cli = Cli::try_parse_from(args).unwrap();
+        assert!(matches!(cli.command, Some(Command::Permissions {
+            database: Some(path), action: PermissionAction::Discover { project: Some(_), limit: Some(3), since: Some(_), json: actual }
+        }) if actual == json && path.to_str() == Some(PERMISSION_DATABASE)));
+    }
+
+    #[test_case("--apply"; "no_apply_mode")]
+    #[test_case("--install"; "no_automatic_installation")]
+    fn permission_discovery_cannot_install_rules(flag: &str) {
+        assert!(Cli::try_parse_from(["caudra", "permissions", "discover", flag]).is_err());
+    }
+
+    #[test_case(false; "before_subcommand")]
+    #[test_case(true; "after_subcommand")]
+    fn permission_database_selection_is_global_to_permission_subcommands(after: bool) {
+        let args = if after {
+            vec![
+                "caudra",
+                "permissions",
+                "repair-review",
+                "--retry-unavailable",
+                "--database",
+                PERMISSION_DATABASE,
+            ]
+        } else {
+            vec![
+                "caudra",
+                "permissions",
+                "--database",
+                PERMISSION_DATABASE,
+                "repair-review",
+                "--retry-unavailable",
+            ]
+        };
+        let cli = Cli::try_parse_from(args).unwrap();
+        assert!(matches!(cli.command, Some(Command::Permissions {
+            database: Some(path), action: PermissionAction::RepairReview { retry_unavailable: true, apply: false, .. }
+        }) if path.to_str() == Some(PERMISSION_DATABASE)));
+    }
+
+    #[test_case(false; "human_by_default")]
+    #[test_case(true; "json_export")]
+    fn permission_inventory_output_mode(json: bool) {
+        let mut args = vec!["caudra", "permissions", "inventory"];
+        if json {
+            args.push("--json");
+        }
+        let cli = Cli::try_parse_from(args).unwrap();
+        assert!(
+            matches!(cli.command, Some(Command::Permissions { action: PermissionAction::Inventory { json: actual, .. }, .. }) if actual == json)
+        );
+    }
+
+    #[test_case(false; "dry_run_by_default")]
+    #[test_case(true; "explicit_apply")]
+    fn permission_review_repair_requires_explicit_apply(apply: bool) {
+        let mut args = vec!["caudra", "permissions", "repair-review", "--json"];
+        if apply {
+            args.push("--apply");
+        }
+        let cli = Cli::try_parse_from(args).unwrap();
+        assert!(
+            matches!(cli.command, Some(Command::Permissions { action: PermissionAction::RepairReview { apply: actual, json: true, retry_unavailable: false }, .. }) if actual == apply)
+        );
+    }
+
+    #[test]
+    fn permission_audit_parses_bounded_read_only_options() {
+        let cli = Cli::try_parse_from([
+            "caudra",
+            "permissions",
+            "audit",
+            "--log",
+            "sample.log",
+            "--since",
+            "2026-01-01T00:00:00Z",
+            "--max-bytes",
+            "1024",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Permissions {
+                action: PermissionAction::Audit {
+                    log: Some(_),
+                    since: Some(_),
+                    max_bytes: Some(1024)
+                },
+                ..
+            })
+        ));
+        assert!(Cli::try_parse_from(["caudra", "permissions", "audit", "--apply"]).is_err());
+    }
+
+    #[test]
+    fn permission_rebind_defaults_to_preview() {
+        let cli = Cli::try_parse_from([
+            "caudra",
+            "permissions",
+            "rebind",
+            "--old-root",
+            "/old",
+            "--new-root",
+            "/new",
+        ])
+        .unwrap();
+        let Some(Command::Permissions {
+            action:
+                PermissionAction::Rebind {
+                    apply,
+                    confirm,
+                    select,
+                    ..
+                },
+            ..
+        }) = cli.command
+        else {
+            panic!("{PERMISSIONS_NOT_PARSED}");
+        };
+        assert!(!apply);
+        assert!(confirm.is_none());
+        assert!(select.is_empty());
+    }
+
+    #[test_case(vec!["--apply"]; "apply_without_selection_and_confirmation")]
+    #[test_case(vec!["--apply", "--select", "rule"]; "apply_without_confirmation")]
+    #[test_case(vec!["--apply", "--confirm", "fingerprint"]; "apply_without_selection")]
+    #[test_case(vec!["--confirm", "fingerprint"]; "confirmation_without_apply")]
+    fn permission_rebind_apply_requires_explicit_review(extra: Vec<&str>) {
+        let mut args = vec![
+            "caudra",
+            "permissions",
+            "rebind",
+            "--old-root",
+            "/old",
+            "--new-root",
+            "/new",
+        ];
+        args.extend(extra);
+        assert!(Cli::try_parse_from(args).is_err());
+    }
 
     #[test_case("FileRead", "file_read")]
     #[test_case("Shell", "shell")]

@@ -32,6 +32,30 @@ use crate::remote_project_context::RemoteSkill;
 
 pub const OWNER: &str = "caudra";
 
+pub fn review_contracts() -> Vec<(String, String)> {
+    [
+        entry(
+            tool_output::ToolOutputTool,
+            ToolEffect::ReadOnly,
+            tool_output::DESCRIPTION,
+        ),
+        entry(
+            view_image::ViewImage,
+            ToolEffect::ReadOnly,
+            view_image::DESCRIPTION,
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(tool, source, _)| {
+        if let ToolSource::Native { contract, .. } = source {
+            Some((contract.to_string(), tool.name().to_owned()))
+        } else {
+            None
+        }
+    })
+    .collect()
+}
+
 pub fn register(registry: &ToolRegistry) -> Result<(), RegistryError> {
     registry.register_many_audited(entries())
 }

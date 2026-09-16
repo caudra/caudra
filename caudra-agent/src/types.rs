@@ -1523,6 +1523,7 @@ pub enum AgentEvent {
         message: String,
     },
     PermissionRequest(Box<PermissionRequest>),
+    PermissionRequestUpdated(Box<PermissionRequest>),
     PermissionRequestResolved {
         request_id: String,
         source_request_id: String,

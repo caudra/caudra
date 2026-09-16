@@ -224,8 +224,16 @@ pub fn state_dir() -> Result<PathBuf, std::io::Error> {
     active_path(|paths| &paths.state)
 }
 
+pub fn state_dir_path() -> Result<PathBuf, std::io::Error> {
+    Ok(resolve().ok_or_else(err)?.state.clone())
+}
+
 pub fn logs_dir() -> Result<PathBuf, std::io::Error> {
     active_path(|paths| &paths.logs)
+}
+
+pub fn logs_dir_path() -> Result<PathBuf, std::io::Error> {
+    Ok(resolve().ok_or_else(err)?.logs.clone())
 }
 
 pub fn cache_dir() -> Result<PathBuf, std::io::Error> {

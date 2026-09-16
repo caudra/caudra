@@ -310,6 +310,7 @@ pub fn run(
             | AgentEvent::AuthRequired
             | AgentEvent::AuthRestored
             | AgentEvent::PermissionRequest(_)
+            | AgentEvent::PermissionRequestUpdated(_)
             | AgentEvent::PermissionRequestResolved { .. }
             | AgentEvent::SubagentProgress { .. }
             | AgentEvent::SubagentHistory { .. }

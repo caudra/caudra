@@ -2098,6 +2098,7 @@ impl App {
         self.reset_ui_chrome();
         self.restore_display();
 
+        self.request_pattern_suggestions();
         Ok(self.install_local_history())
     }
 

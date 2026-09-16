@@ -24,13 +24,12 @@ pub(crate) mod workflow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use caudra_workbench::{Layout as WorkbenchLayout, MutationGate, Workbench, WorkbenchAction};
 
-use crate::AppSession;
 use crate::agent::ModelSlot;
 use crate::app::tasks::TaskOutcome;
 use crate::chat::Chat;
@@ -55,8 +54,10 @@ use crate::components::message_actions::{MessageActionKind, MessageActions, Mess
 use crate::components::messages::MessageActionTarget;
 use crate::components::model_picker::{ModelPicker, ModelPickerAction};
 use crate::components::paste_editor::{PasteEditor, PasteEditorAction, PasteEditorTarget};
-use crate::components::permission_prompt::{PermissionDecision, PermissionPrompt};
-use crate::components::permissions_picker::{PermissionsPicker, PermissionsPickerAction};
+use crate::components::permission_prompt::{PermissionDecision, PermissionPrompt, PromptMouse};
+use crate::components::permissions_picker::{
+    DiscoveryState, PermissionsPicker, PermissionsPickerAction,
+};
 use crate::components::plan_form::{PlanForm, PlanFormAction};
 use crate::components::prompt_profile_picker::{PromptProfilePicker, PromptProfilePickerAction};
 use crate::components::question_form::{QuestionForm, QuestionFormAction};
@@ -90,6 +91,7 @@ use crate::image;
 use crate::input_document::InputDraft;
 use crate::repaint::{Cadence, Dirty, Watch};
 use crate::selection::{SelectionState, SelectionZone, ZoneRegistry};
+use crate::{AppSession, PatternDiscoveryMode, PatternDiscoveryOutcome, PatternSuggestionLoader};
 use arc_swap::{ArcSwap, ArcSwapOption};
 use caudra_agent::context::{ContextKey, ContextSnapshot, ContextStore};
 use caudra_agent::mentions;
@@ -120,7 +122,8 @@ use caudra_storage::input_history::InputHistory;
 use caudra_storage::model::persist_model;
 use caudra_storage::usage_ledger::{LedgerPurpose, LifetimeUsage, TurnUsage, UsageLedger};
 use caudra_storage::view::ViewMode;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent};
+use flume::{Receiver, TryRecvError};
 
 use crate::storage_writer::StorageWriter;
 use ratatui::layout::{Position, Rect};
@@ -182,6 +185,14 @@ const QUESTION_DISMISSED: &str = "dismissed";
 const LOGIN_BLOCKER: &str = "Provider login required";
 const MCP_TRUST_BLOCKER: &str = "MCP trust required";
 const PROJECT_PERMISSION_CONFIG_TRUST_BLOCKER: &str = "Project permission config trust required";
+const PATTERN_DISCOVERY_DISABLED: &str =
+    "Local history discovery is disabled for remote or ephemeral sessions.";
+const PATTERN_WORKER_UNAVAILABLE: &str =
+    "History discovery worker is unavailable. Restart Caudra to retry.";
+const PATTERN_INVALID_CONTEXT: &str =
+    "Discovery returned proposals for an invalid context. Refresh to retry.";
+const PATTERN_WORKER_DISCONNECTED: &str =
+    "Discovery worker stopped or its queue is full. Refresh to retry.";
 
 const MISSING_TOOL_COMPLETION: &str = "Tool did not report completion before the turn ended";
 const NOTIFICATION_PREVIEW_CHARS: usize = 200;
@@ -431,6 +442,9 @@ pub struct App {
     pub(crate) shell: shell::ShellState,
     pub(crate) ui_config: UiConfig,
     pub(crate) permissions: Arc<PermissionManager>,
+    pattern_suggestion_loader: Option<PatternSuggestionLoader>,
+    pending_pattern_suggestions: Option<PendingPatternSuggestions>,
+    pattern_discovery_context: Option<(PathBuf, u64, Weak<PermissionManager>)>,
     pub(crate) model_policy: Arc<ModelPolicy>,
     pub(crate) lua_event_handle: EventHandle,
     pub(super) keymap_reader: KeymapReader,
@@ -457,6 +471,13 @@ struct PendingSteer {
     id: QueueItemId,
     text: String,
     draft: InputDraft,
+}
+
+struct PendingPatternSuggestions {
+    project: PathBuf,
+    revision: u64,
+    owner: Weak<PermissionManager>,
+    reply: Receiver<Arc<PatternDiscoveryOutcome>>,
 }
 
 impl App {
@@ -625,6 +646,9 @@ impl App {
             shell: shell::ShellState::default(),
             ui_config,
             permissions,
+            pattern_suggestion_loader: None,
+            pending_pattern_suggestions: None,
+            pattern_discovery_context: None,
             model_policy: Arc::clone(&model_policy),
             lua_event_handle,
             hints: Watch::seeded(hint_reader.load_full()),
@@ -658,6 +682,149 @@ impl App {
             tracing::warn!(%error, "remote workbench backend initialization failed");
         }
         app
+    }
+
+    pub(crate) fn set_pattern_suggestion_loader(
+        &mut self,
+        loader: Option<PatternSuggestionLoader>,
+    ) {
+        self.pending_pattern_suggestions = None;
+        self.pattern_suggestion_loader = loader;
+        self.request_pattern_suggestions();
+    }
+
+    fn can_load_pattern_suggestions(&self) -> bool {
+        !self.storage.is_ephemeral()
+            && self.workspace_session.is_none()
+            && self.remote_project_context.is_none()
+            && self
+                .state
+                .session
+                .workspace_binding()
+                .is_none_or(|binding| binding.is_local())
+    }
+
+    pub(crate) fn request_pattern_suggestions(&mut self) {
+        self.load_pattern_suggestions(PatternDiscoveryMode::Cached);
+    }
+
+    fn sync_pattern_discovery_context(&mut self) -> bool {
+        let (project, revision) = self.permissions.pattern_candidate_context();
+        let owner = Arc::downgrade(&self.permissions);
+        if self
+            .pattern_discovery_context
+            .as_ref()
+            .is_some_and(|(previous, version, manager)| {
+                previous == &project && *version == revision && manager.ptr_eq(&owner)
+            })
+        {
+            return false;
+        }
+        self.pending_pattern_suggestions = None;
+        if self.pattern_discovery_context.is_some() {
+            self.permissions_picker.close();
+        }
+        self.pattern_discovery_context = Some((project, revision, owner));
+        self.permissions_picker.set_discovery(DiscoveryState::Idle);
+        self.refresh_permission_suggestions();
+        true
+    }
+
+    fn discovery_unavailable(&mut self, reason: &'static str) {
+        self.permissions_picker
+            .set_discovery(DiscoveryState::Complete(Arc::new(
+                PatternDiscoveryOutcome::Unavailable(reason),
+            )));
+    }
+
+    fn load_pattern_suggestions(&mut self, mode: PatternDiscoveryMode) {
+        self.sync_pattern_discovery_context();
+        if mode == PatternDiscoveryMode::Cached && self.permissions_picker.discovery_cancelled() {
+            return;
+        }
+        if !self.can_load_pattern_suggestions() {
+            self.pending_pattern_suggestions = None;
+            self.discovery_unavailable(PATTERN_DISCOVERY_DISABLED);
+            return;
+        }
+        let Some(loader) = &self.pattern_suggestion_loader else {
+            self.discovery_unavailable(PATTERN_WORKER_UNAVAILABLE);
+            return;
+        };
+        let (project, revision) = self.permissions.pattern_candidate_context();
+        let owner = Arc::downgrade(&self.permissions);
+        if self
+            .pending_pattern_suggestions
+            .as_ref()
+            .is_some_and(|pending| {
+                pending.project == project
+                    && pending.revision == revision
+                    && pending.owner.ptr_eq(&owner)
+            })
+        {
+            return;
+        }
+        self.pending_pattern_suggestions = Some(PendingPatternSuggestions {
+            reply: loader(project.clone(), mode),
+            project,
+            revision,
+            owner,
+        });
+        self.permissions_picker
+            .set_discovery(DiscoveryState::Loading);
+    }
+
+    fn poll_pattern_suggestions(&mut self) -> Dirty {
+        let was_open = self.permissions_picker.is_open();
+        let changed = self.sync_pattern_discovery_context();
+        let Some(pending) = &self.pending_pattern_suggestions else {
+            return Dirty::from(changed && was_open);
+        };
+        if !self.can_load_pattern_suggestions()
+            || !pending.owner.ptr_eq(&Arc::downgrade(&self.permissions))
+        {
+            self.pending_pattern_suggestions = None;
+            self.discovery_unavailable(PATTERN_DISCOVERY_DISABLED);
+            return Dirty::from(self.permissions_picker.is_open());
+        }
+        let (project, revision) = self.permissions.pattern_candidate_context();
+        if project != pending.project || revision != pending.revision {
+            self.pending_pattern_suggestions = None;
+            return Dirty::NO;
+        }
+        match pending.reply.try_recv() {
+            Ok(outcome) => {
+                let installed = match outcome.as_ref() {
+                    PatternDiscoveryOutcome::Ready(report) => {
+                        self.permissions.set_pattern_candidates_for_project(
+                            &pending.project,
+                            pending.revision,
+                            report.candidates.to_vec(),
+                        )
+                    }
+                    PatternDiscoveryOutcome::Unavailable(_) => Ok(()),
+                };
+                self.pending_pattern_suggestions = None;
+                if installed.is_err() {
+                    tracing::debug!(
+                        "discarded history pattern suggestions for stale or invalid context"
+                    );
+                    self.discovery_unavailable(PATTERN_INVALID_CONTEXT);
+                    return Dirty::YES;
+                }
+                self.permissions_picker
+                    .set_discovery(DiscoveryState::Complete(outcome));
+                self.refresh_permission_suggestions();
+                return Dirty::YES;
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.pending_pattern_suggestions = None;
+                self.discovery_unavailable(PATTERN_WORKER_DISCONNECTED);
+                return Dirty::YES;
+            }
+            Err(TryRecvError::Empty) => {}
+        }
+        Dirty::NO
     }
 
     pub(crate) fn snapshot_store_for(
@@ -1147,6 +1314,10 @@ impl App {
             Msg::Paste(text) => {
                 self.sync_subagent_input_target();
                 let text = text.replace("\r\n", "\n").replace('\r', "\n");
+                if self.permission_prompt.is_open() {
+                    self.permission_prompt.handle_paste(&text);
+                    return vec![];
+                }
                 if self.session_relocation_picker.is_open() {
                     self.route_text_paste(&text);
                     return vec![];
@@ -1177,10 +1348,25 @@ impl App {
                 }
                 vec![]
             }
+            Msg::Mouse(event) if self.permission_prompt.is_open() => {
+                self.autoscroll = None;
+                if let PromptMouse::Decided(decision) = self.permission_prompt.handle_mouse(event) {
+                    self.apply_permission_decision(decision);
+                }
+                vec![]
+            }
             Msg::Mouse(event) => self.handle_mouse(event),
             Msg::Scroll { column, row, delta } => {
                 self.autoscroll = None;
-                self.handle_scroll(column, row, delta);
+                if self.permission_prompt.is_open() {
+                    if self.permission_prompt.contains(Position::new(column, row)) {
+                        self.permission_prompt.scroll(delta);
+                    } else {
+                        self.active_chat().scroll(delta);
+                    }
+                } else {
+                    self.handle_scroll(column, row, delta);
+                }
                 vec![]
             }
             Msg::Agent(envelope) => self.handle_agent_event(*envelope),
@@ -1329,7 +1515,12 @@ impl App {
         try_picker!(self.prompt_profile_picker);
         try_picker!(self.thinking_picker);
         try_picker!(self.file_picker);
-        try_picker!(self.permissions_picker);
+        if self.permissions_picker.is_open() {
+            if self.permissions_picker.contains(pos) {
+                self.permissions_picker.scroll_at(pos, delta);
+            }
+            return None;
+        }
         try_picker!(self.stash_picker);
         try_picker!(self.memory_picker);
         // Not `try_picker!`: the wheel walks the run list or scrolls the
@@ -1523,7 +1714,15 @@ impl App {
     }
 
     fn dispatch_overlay(&mut self, key: KeyEvent) -> Option<Vec<Action>> {
+        macro_rules! guard_repeat {
+            ($editing:expr) => {
+                if key.kind == KeyEventKind::Repeat && !Self::repeat_key_allowed(key, $editing) {
+                    return Some(vec![]);
+                }
+            };
+        }
         if self.paste_editor.is_open() {
+            guard_repeat!(true);
             match self.paste_editor.handle_key(key) {
                 PasteEditorAction::Consumed => {}
                 // Nothing in the editor wanted it, so the key keeps whatever it
@@ -1543,15 +1742,9 @@ impl App {
             return Some(vec![]);
         }
 
-        if self.permission_prompt.is_open() {
-            if let Some(decision) = self.permission_prompt.handle_key(key) {
-                self.apply_permission_decision(decision);
-            }
-            return Some(vec![]);
-        }
-
         // plan_form is non-modal: Passthrough falls through to the rest of dispatch
         if self.plan_form_active() {
+            guard_repeat!(false);
             let action = self.plan_form.handle_key(key);
             if action != PlanFormAction::Passthrough {
                 return Some(self.handle_plan_form_action(action));
@@ -1559,11 +1752,13 @@ impl App {
         }
 
         if self.help_modal.is_open() {
+            guard_repeat!(false);
             self.help_modal.handle_key(key);
             return Some(vec![]);
         }
 
         if self.usage_modal.is_open() {
+            guard_repeat!(false);
             if key::REFRESH.matches(key) {
                 self.lifetime_usage = None;
                 self.load_lifetime_usage();
@@ -1575,32 +1770,38 @@ impl App {
         }
 
         if self.logs_modal.is_open() {
+            guard_repeat!(self.logs_modal.text_input_active());
             let action = self.logs_modal.handle_key(key);
             self.handle_logs_action(action);
             return Some(vec![]);
         }
 
         if self.context_modal.is_open() {
+            guard_repeat!(false);
             self.context_modal.handle_key(key);
             return Some(vec![]);
         }
 
         if self.tools_modal.is_open() {
+            guard_repeat!(false);
             self.tools_modal.handle_key(key);
             return Some(vec![]);
         }
 
         if self.skills_modal.is_open() {
+            guard_repeat!(false);
             self.skills_modal.handle_key(key);
             return Some(vec![]);
         }
 
         if self.storage_modal.is_open() {
+            guard_repeat!(false);
             self.storage_modal.handle_key(key);
             return Some(vec![]);
         }
 
         if self.goal_modal.is_open() {
+            guard_repeat!(false);
             if let Some(limit) = self
                 .goal_modal
                 .handle_key(key, self.state.goal.continuation_limit())
@@ -1611,36 +1812,45 @@ impl App {
         }
 
         if self.btw_modal.is_open() {
+            guard_repeat!(false);
             self.btw_modal.handle_key(key);
             return Some(vec![]);
         }
 
+        if Overlay::is_open(&self.float_mgr) {
+            guard_repeat!(false);
+        }
         if self.float_mgr.handle_key(key) {
             return Some(vec![]);
         }
 
         if self.search_modal.is_open() {
+            guard_repeat!(true);
             let action = self.search_modal.handle_key(key);
             return Some(self.handle_search_action(action));
         }
 
         if self.file_picker.is_open() {
+            guard_repeat!(true);
             let action = self.file_picker.handle_key(key);
             return Some(self.handle_file_picker_action(action));
         }
 
         if self.queue_editor_active() {
+            guard_repeat!(true);
             return Some(self.handle_queue_editor_key(key));
         }
 
         // Ahead of the focused queue itself: the menu is drawn over the panel
         // it acts on, so it answers first.
         if self.queue_actions.is_open() {
+            guard_repeat!(false);
             let action = self.queue_actions.handle_key(key);
             return Some(self.handle_queue_actions_action(action));
         }
 
         if self.active_queue_is_focused() {
+            guard_repeat!(false);
             match key.code {
                 KeyCode::Up if key.modifiers == KeyModifiers::SHIFT => {
                     self.move_focused_queue_item(true);
@@ -1698,16 +1908,19 @@ impl App {
         }
 
         if self.rewind_picker.is_open() {
+            guard_repeat!(false);
             let action = self.rewind_picker.handle_key(key);
             return Some(self.handle_rewind_picker_action(action));
         }
 
         if self.message_actions.is_open() {
+            guard_repeat!(false);
             let action = self.message_actions.handle_key(key);
             return Some(self.handle_message_actions_action(action));
         }
 
         if self.review.is_open() {
+            guard_repeat!(self.review.text_input_active());
             let action = self.review.handle_key(key);
             // The note editor hands back only the chord it must not swallow, so
             // `Ctrl+C` with nothing selected still reaches the app.
@@ -1718,51 +1931,61 @@ impl App {
         }
 
         if self.command_modal.is_open() {
+            guard_repeat!(true);
             let action = self.command_modal.handle_key(key);
             return Some(self.handle_command_modal_action(action));
         }
 
         if self.theme_picker.is_open() {
+            guard_repeat!(false);
             let action = self.theme_picker.handle_key(key);
             return Some(self.handle_theme_picker_action(action));
         }
 
         if self.prompt_profile_picker.is_open() {
+            guard_repeat!(false);
             let action = self.prompt_profile_picker.handle_key(key);
             return Some(self.handle_prompt_profile_picker_action(action));
         }
 
         if self.thinking_picker.is_open() {
+            guard_repeat!(false);
             let action = self.thinking_picker.handle_key(key);
             return Some(self.handle_thinking_picker_action(action));
         }
 
         if self.model_picker.is_open() {
+            guard_repeat!(false);
             let action = self.model_picker.handle_key(key);
             return Some(self.handle_model_picker_action(action));
         }
 
         if self.login_picker.is_open() {
+            guard_repeat!(false);
             let action = self.login_picker.handle_key(key);
             return Some(self.handle_login_picker_action(action));
         }
 
         if self.mcp_picker.is_open() {
+            guard_repeat!(false);
             let action = self.mcp_picker.handle_key(key);
             return Some(self.handle_mcp_picker_action(action));
         }
 
         if self.permissions_picker.is_open() {
+            guard_repeat!(false);
             let action = self.permissions_picker.handle_key(key);
             return Some(self.handle_permissions_picker_action(action));
         }
 
         if self.stash_picker.is_open() {
+            guard_repeat!(false);
             let action = self.stash_picker.handle_key(key);
             return Some(self.handle_stash_picker_action(action));
         }
 
         if self.question_form.is_open() {
+            guard_repeat!(self.question_form.text_input_active());
             // The form is docked, not modal: keys that only move the
             // transcript keep working while it waits for an answer.
             if self.scroll_transcript(key) {
@@ -1772,26 +1995,32 @@ impl App {
             return Some(self.handle_question_form_action(action));
         }
         if self.session_picker.is_open() {
+            guard_repeat!(true);
             let action = self.session_picker.handle_key(key);
             return Some(self.handle_session_picker_action(action));
         }
         if self.session_relocation_picker.is_open() {
+            guard_repeat!(false);
             let action = self.session_relocation_picker.handle_key(key);
             return Some(self.handle_session_relocation_action(action));
         }
         if self.task_picker.is_open() {
+            guard_repeat!(false);
             let action = self.task_picker.handle_key(key);
             return Some(self.handle_task_picker_action(action));
         }
         if self.memory_picker.is_open() {
+            guard_repeat!(false);
             let action = self.memory_picker.handle_key(key);
             return Some(self.handle_memory_picker_action(action));
         }
         if self.workflow_inspector.is_open() {
+            guard_repeat!(false);
             let action = self.workflow_inspector.handle_key(key);
             return Some(self.handle_workflow_inspector_action(action));
         }
         if self.workflow_catalog_picker.is_open() {
+            guard_repeat!(false);
             let action = self.workflow_catalog_picker.handle_key(key);
             return Some(self.handle_workflow_catalog_action(action));
         }
@@ -1801,6 +2030,7 @@ impl App {
         // the keyboard from behind an opaque screen and a permission prompt
         // becomes unanswerable.
         if self.workbench.is_open() {
+            guard_repeat!(self.workbench.text_input_active());
             match self.workbench.handle_key(key) {
                 WorkbenchAction::Passthrough => {}
                 action => return Some(self.handle_workbench_action(action)),
@@ -2116,6 +2346,7 @@ impl App {
     }
 
     fn open_permissions_picker(&mut self) -> Result<(), PermissionPolicyError> {
+        self.sync_pattern_discovery_context();
         let rules = self.permissions.structured_rule_inventory()?;
         let candidates = self.permissions.review_candidates();
         let policy = self.permissions.active_policy();
@@ -2128,13 +2359,62 @@ impl App {
             needs_project_config_trust,
             project_config_trusted,
         );
+        self.refresh_permission_suggestions();
         Ok(())
+    }
+
+    fn refresh_permission_suggestions(&mut self) {
+        let (project, revision, candidates) = self.permissions.pattern_proposal_inventory();
+        self.permissions_picker
+            .set_suggestions(&project, revision, &candidates);
+    }
+
+    fn finish_permission_suggestion_action(
+        &mut self,
+        result: Result<(), PermissionPolicyError>,
+        success: &str,
+    ) {
+        self.refresh_permission_suggestions();
+        self.flash(match result {
+            Ok(()) => success.into(),
+            Err(error) => format!("Could not hide suggested pattern: {error}"),
+        });
     }
 
     fn handle_permissions_picker_action(&mut self, action: PermissionsPickerAction) -> Vec<Action> {
         match action {
-            PermissionsPickerAction::Consumed => {}
+            PermissionsPickerAction::Consumed => self.refresh_permission_suggestions(),
             PermissionsPickerAction::Close => self.permissions_picker.close(),
+            PermissionsPickerAction::RefreshDiscovery => {
+                self.load_pattern_suggestions(PatternDiscoveryMode::Refresh)
+            }
+            PermissionsPickerAction::CancelDiscovery => {
+                self.pending_pattern_suggestions = None;
+                self.permissions_picker
+                    .set_discovery(DiscoveryState::Cancelled);
+            }
+            PermissionsPickerAction::DismissSuggestion(target) => {
+                let result = self.permissions.dismiss_pattern_proposal(
+                    &target.project,
+                    target.revision,
+                    &target.definition_id,
+                );
+                self.finish_permission_suggestion_action(
+                    result,
+                    "Suggested pattern dismissed for this project",
+                );
+            }
+            PermissionsPickerAction::SnoozeSuggestion(target) => {
+                let result = self.permissions.snooze_pattern_proposal(
+                    &target.project,
+                    target.revision,
+                    &target.definition_id,
+                );
+                self.finish_permission_suggestion_action(
+                    result,
+                    "Suggested pattern snoozed for 24 hours in this project",
+                );
+            }
             PermissionsPickerAction::TrustProjectConfig => {
                 match self.permissions.trust_project_permission_config() {
                     Ok(()) => match self.open_permissions_picker() {
@@ -2360,6 +2640,18 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Vec<Action> {
+        if self.permission_prompt.is_open() {
+            if let Some(decision) = self.permission_prompt.handle_key(key) {
+                self.apply_permission_decision(decision);
+            }
+            return vec![];
+        }
+        self.permission_prompt.handle_key(key);
+        match key.kind {
+            KeyEventKind::Release => return vec![],
+            KeyEventKind::Repeat => return self.handle_key_repeat(key),
+            KeyEventKind::Press => {}
+        }
         self.clear_selection_unless_pending_copy();
         self.sync_subagent_input_target();
 
@@ -2455,6 +2747,47 @@ impl App {
         }
 
         self.handle_main_chat_key(key)
+    }
+
+    fn handle_key_repeat(&mut self, key: KeyEvent) -> Vec<Action> {
+        if self.which_key.is_armed() {
+            return vec![];
+        }
+        self.clear_selection_unless_pending_copy();
+        self.sync_subagent_input_target();
+        if let Some(actions) = self.dispatch_overlay(key) {
+            return actions;
+        }
+        if self.scroll_transcript(key)
+            || !self.composer_is_interactive()
+            || !Self::repeat_key_allowed(key, true)
+        {
+            return vec![];
+        }
+        self.key_focus = KeyFocus::Composer;
+        if self.is_main_chat() {
+            self.handle_main_chat_key(key)
+        } else {
+            self.handle_subagent_chat_key(key)
+        }
+    }
+
+    fn repeat_key_allowed(key: KeyEvent, editing: bool) -> bool {
+        if !(key.modifiers - KeyModifiers::SHIFT).is_empty() {
+            return false;
+        }
+        match key.code {
+            KeyCode::Up
+            | KeyCode::Down
+            | KeyCode::Left
+            | KeyCode::Right
+            | KeyCode::Home
+            | KeyCode::End
+            | KeyCode::PageUp
+            | KeyCode::PageDown => editing || key.modifiers.is_empty(),
+            KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Delete => editing,
+            _ => false,
+        }
     }
 
     /// The key the leader was waiting for. `Esc` and `Ctrl+C` back out
@@ -3640,6 +3973,11 @@ impl App {
             return vec![];
         }
 
+        if let ChatEventResult::PermissionRequestUpdated(request) = result {
+            self.permission_prompt.update(request);
+            return vec![];
+        }
+
         if let ChatEventResult::PermissionRequestResolved { request_id } = result {
             self.permission_prompt.resolve_pending(&request_id);
             return vec![];
@@ -3734,6 +4072,7 @@ impl App {
                 | ChatEventResult::AuthRestored
                 | ChatEventResult::Question(_)
                 | ChatEventResult::PermissionRequest(_)
+                | ChatEventResult::PermissionRequestUpdated(_)
                 | ChatEventResult::PermissionRequestResolved { .. }
                 | ChatEventResult::QueueItemConsumed { .. }
                 | ChatEventResult::QueueBatchConsumed { .. } => unreachable!(),
@@ -3953,7 +4292,11 @@ impl App {
             }
             "/permissions" => {
                 match self.open_permissions_picker() {
-                    Ok(()) => {}
+                    Ok(()) => {
+                        if matches!(cmd.args.trim(), "discover" | "suggested") {
+                            self.permissions_picker.show_discovery();
+                        }
+                    }
                     Err(error) => self.flash(error.to_string()),
                 }
                 vec![]
@@ -4223,6 +4566,8 @@ impl App {
         self.rebind_workspace_baseline(snapshot_store, cwd.to_path_buf());
         self.status_bar.refresh_cwd(&cwd.to_string_lossy());
         self.sync_composer_cwd();
+        self.pending_pattern_suggestions = None;
+        self.request_pattern_suggestions();
     }
 
     pub(crate) fn install_remote_working_directory(
@@ -4276,6 +4621,7 @@ impl App {
             tracing::warn!(%error, "remote workbench backend rebind failed");
         }
         self.remote_project_context = Some(change.context);
+        self.pending_pattern_suggestions = None;
         self.status_bar.set_remote_cwd(change.display_path);
         Ok(())
     }
@@ -4437,6 +4783,8 @@ impl App {
     }
 
     pub(crate) fn prepare_shutdown(&mut self) {
+        self.pending_pattern_suggestions = None;
+        self.pattern_suggestion_loader = None;
         self.release_remote_restore_confirmation();
         if self.recoverable_queue.is_empty() {
             self.recoverable_queue = self.queue.pending_prompts();
@@ -4508,6 +4856,7 @@ impl App {
             | self.mcp_picker.refresh()
             | self.tick_permission_config_trust()
             | self.poll_snapshot_refusal()
+            | self.poll_pattern_suggestions()
             | self.model_picker.refresh()
             | self.usage_modal.poll(&self.usage_slot)
             | self.storage_modal.poll(&self.storage_slot)

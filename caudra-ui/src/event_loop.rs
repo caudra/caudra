@@ -47,8 +47,10 @@ use caudra_storage::sessions::{
 use caudra_storage::state::WorkspaceTabs;
 use caudra_storage::workflow::WorkflowRunStatus;
 use caudra_storage::workspace_binding::StoredWorkspaceBinding;
+#[cfg(not(windows))]
+use crossterm::event::KeyEventKind;
 use crossterm::event::{
-    Event, KeyEventKind, KeyModifiers, MouseButton, MouseEvent as CtMouseEvent, MouseEventKind,
+    Event, KeyModifiers, MouseButton, MouseEvent as CtMouseEvent, MouseEventKind,
 };
 use serde_json::json;
 use tracing::{info, warn};
@@ -73,7 +75,7 @@ use crate::herdr::{HerdrObservation, HerdrReporterHandle, aggregate_observations
 use crate::input::InputReader;
 use crate::repaint::{Dirty, FrameLimiter, IDLE_POLL};
 use crate::theme;
-use crate::{AppSession, SessionRelocationHandoff, SessionTab};
+use crate::{AppSession, PatternSuggestionLoader, SessionRelocationHandoff, SessionTab};
 use crate::{load_app_session, open_app_session};
 
 use crate::storage_writer::StorageWriter;
@@ -150,6 +152,7 @@ pub struct EventLoopParams {
     pub input_history_size: usize,
     pub max_log_files: u32,
     pub permissions: Arc<PermissionManager>,
+    pub pattern_suggestion_loader: Option<PatternSuggestionLoader>,
     pub timeouts: Timeouts,
     pub exit_on_done: bool,
     pub lua_command_reader: LuaCommandReader,
@@ -914,6 +917,7 @@ struct SpawnCtx {
     /// Prototype only: every runtime forks its own manager so session
     /// rules stay per-session.
     permissions: Arc<PermissionManager>,
+    pattern_suggestion_loader: Option<PatternSuggestionLoader>,
     timeouts: Timeouts,
     custom_commands: Arc<[CustomCommand]>,
     no_commands: bool,
@@ -1169,6 +1173,7 @@ impl SpawnCtx {
         if restore_session {
             app.restore_resumed_session();
         }
+        app.set_pattern_suggestion_loader(self.pattern_suggestion_loader.clone());
         info!(
             session_id = %session_id,
             prepare_ms,
@@ -1413,6 +1418,7 @@ impl<'t> EventLoop<'t> {
             input_history_size,
             max_log_files,
             permissions,
+            pattern_suggestion_loader,
             timeouts,
             exit_on_done,
             lua_command_reader,
@@ -1492,6 +1498,7 @@ impl<'t> EventLoop<'t> {
             input_history_size,
             max_log_files,
             permissions,
+            pattern_suggestion_loader,
             timeouts,
             custom_commands: Arc::from(commands),
             no_commands,
@@ -2172,6 +2179,7 @@ impl<'t> EventLoop<'t> {
         // The picker only ever lists the focused session, so a session switch
         // closes it rather than leaving ids from elsewhere on screen.
         self.focused_app().task_picker.close();
+        self.focused_app().request_pattern_suggestions();
         let mut data = json!({ "session_id": id });
         if let Some(previous) = self.last_focused {
             data["previous_session_id"] = json!(previous.to_string());
@@ -2615,8 +2623,7 @@ impl<'t> EventLoop<'t> {
             self.terminal_focused = true;
         }
         match raw {
-            Event::Key(key) if key.kind == KeyEventKind::Press => (Some(Msg::Key(key)), None),
-            Event::Key(_) => (None, None),
+            Event::Key(key) => (Some(Msg::Key(key)), None),
             Event::Paste(text) => (Some(Msg::Paste(text)), None),
             Event::Mouse(mouse) => self.translate_mouse(mouse),
             // Reattaching a multiplexer to another terminal resizes the

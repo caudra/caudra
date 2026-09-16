@@ -185,6 +185,10 @@ impl QuestionForm {
         !self.questions.is_empty()
     }
 
+    pub(crate) fn text_input_active(&self) -> bool {
+        self.is_open() && self.mode == Mode::EditingCustom
+    }
+
     pub fn close(&mut self) {
         self.questions.clear();
         self.answers.clear();

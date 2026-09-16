@@ -423,6 +423,9 @@ impl App {
     }
 
     fn render_picker_overlays(&mut self, frame: &mut Frame, msg_area: Rect) -> Rect {
+        if self.permission_prompt.is_open() {
+            return Rect::default();
+        }
         let mut overlay_rect = Rect::default();
         let full = frame.area();
 
@@ -471,6 +474,9 @@ impl App {
     }
 
     fn render_top_modals(&mut self, frame: &mut Frame, mut overlay_rect: Rect) -> Rect {
+        if self.permission_prompt.is_open() {
+            return overlay_rect;
+        }
         let full = frame.area();
         let r = self.btw_modal.view(frame, full);
         if r.width > 0 {

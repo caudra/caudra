@@ -39,21 +39,88 @@ mod event_loop;
 mod input;
 mod terminal;
 
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Instant;
 
+use caudra_agent::permissions::pattern_recognition::{
+    PatternCandidate, RecognitionStats, RecognizerLimits,
+};
 use caudra_providers::{
     HistoryItem, HistoryProjectionError, Message, active_history_items, expand_message,
     resolve_history_head, transcript_history_items,
 };
 use caudra_storage::StateDir;
 use caudra_storage::id::CaudraId;
-use caudra_storage::sessions::{SessionLease, SessionRelocation};
+use caudra_storage::sessions::{
+    HistoryReadLimits, HistoryReadReport, SessionLease, SessionRelocation,
+};
 use color_eyre::Result;
 use color_eyre::eyre::Context;
+use flume::Receiver;
+
+#[cfg(test)]
+const PATTERN_TEST_SAMPLE_LIMIT: usize = 64;
 
 pub type AppSession = caudra_agent::StoredSession;
+
+/// Enqueues bounded discovery, never performs it on the UI thread. Dropping the
+/// reply receiver cancels interest; replies are proposals, not permission rules.
+pub type PatternSuggestionLoader = Arc<
+    dyn Fn(PathBuf, PatternDiscoveryMode) -> Receiver<Arc<PatternDiscoveryOutcome>> + Send + Sync,
+>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PatternDiscoveryMode {
+    Cached,
+    Refresh,
+}
+
+#[derive(Debug)]
+pub enum PatternDiscoveryOutcome {
+    Ready(Box<PatternDiscoveryReport>),
+    Unavailable(&'static str),
+}
+
+#[derive(Debug)]
+pub struct PatternDiscoveryReport {
+    pub candidates: Arc<[PatternCandidate]>,
+    pub sample: HistoryReadReport,
+    pub history_limits: HistoryReadLimits,
+    pub recognition: RecognitionStats,
+    pub recognizer_limits: RecognizerLimits,
+    pub calls: usize,
+    pub max_calls: usize,
+    pub analysis_bytes: usize,
+    pub max_analysis_bytes: usize,
+    pub max_elapsed_ms: u64,
+    pub partial_reasons: Vec<String>,
+}
+
+#[cfg(test)]
+pub(crate) fn test_pattern_discovery_report(
+    candidates: Vec<PatternCandidate>,
+) -> Box<PatternDiscoveryReport> {
+    Box::new(PatternDiscoveryReport {
+        candidates: candidates.into(),
+        sample: HistoryReadReport::default(),
+        history_limits: HistoryReadLimits {
+            max_sessions: PATTERN_TEST_SAMPLE_LIMIT,
+            max_rows: PATTERN_TEST_SAMPLE_LIMIT,
+            max_bytes: PATTERN_TEST_SAMPLE_LIMIT,
+            max_row_bytes: PATTERN_TEST_SAMPLE_LIMIT,
+        },
+        recognition: RecognitionStats::default(),
+        recognizer_limits: RecognizerLimits::default(),
+        calls: 0,
+        max_calls: PATTERN_TEST_SAMPLE_LIMIT,
+        analysis_bytes: 0,
+        max_analysis_bytes: PATTERN_TEST_SAMPLE_LIMIT,
+        max_elapsed_ms: PATTERN_TEST_SAMPLE_LIMIT as u64,
+        partial_reasons: Vec::new(),
+    })
+}
 
 pub(crate) fn load_app_session(id: CaudraId, storage: &StateDir) -> Result<AppSession> {
     caudra_agent::load_stored_session(id, storage).context("load persisted session")

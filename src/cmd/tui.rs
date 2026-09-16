@@ -1,24 +1,26 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs;
 use std::io::{self, IsTerminal, Read};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver as ShutdownReceiver, RecvTimeoutError, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use color_eyre::Result;
 use color_eyre::eyre::{Context, bail, eyre};
+use flume::{RecvTimeoutError as PatternRecvError, Sender as ChannelSender};
 
 use caudra_agent::command::{self, CustomCommand};
+use caudra_agent::permissions::pattern_recognition::{PatternCandidate, RecognitionExclusion};
 use caudra_agent::prompt::profile::{PromptProfileCatalog, SystemPromptProfile};
 use caudra_agent::tools::ToolRegistry;
 use caudra_config::{Config, RetentionConfig};
 use caudra_lua::PluginHost;
 use caudra_providers::model::Model;
-use caudra_storage::StateDir;
 use caudra_storage::id::CaudraId;
 use caudra_storage::sessions::sweep::{SweepPolicy, sweep_if_due};
 use caudra_storage::sessions::{
@@ -27,12 +29,20 @@ use caudra_storage::sessions::{
 };
 use caudra_storage::state::{WorkspaceTabs, read_workspace_tabs};
 use caudra_storage::workspace_binding::StoredWorkspaceBinding;
+use caudra_storage::{StateClass, StateDir};
 use caudra_ui::{
-    AppSession, ExitSummary, HerdrReporter, RunOutcome, SessionRelocationHandoff, SessionTab,
+    AppSession, ExitSummary, HerdrReporter, PatternDiscoveryMode, PatternDiscoveryOutcome,
+    PatternDiscoveryReport, PatternSuggestionLoader, RunOutcome, SessionRelocationHandoff,
+    SessionTab,
 };
+use caudra_workcell::PatternObligationKind;
 
 use crate::cli::Cli;
 use crate::cmd::load_config;
+use crate::cmd::permissions::discover::{
+    DiscoveryLimits, DiscoveryReport, RECOGNIZER_CAPACITY, RECOGNIZER_ORDER_BIAS,
+    discover_for_project_cancellable,
+};
 use crate::setup;
 
 const FALLBACK_MODEL_SPEC: &str = "anthropic/claude-sonnet-4-20250514";
@@ -58,6 +68,390 @@ const RELOCATION_ENV_RESTART: &str =
 const RELOCATION_USAGE_UNCHANGED: &str = "Historical project usage attribution was left unchanged";
 const RELOCATION_USAGE_EMPTY: &str =
     "No historical project usage was recorded for the source directory";
+const PATTERN_LOAD_QUEUE: usize = 32;
+const PATTERN_CACHE_PROJECTS: usize = 8;
+const PATTERN_CACHE_BYTES_PER_PROJECT: usize = 256 * 1024;
+const PATTERN_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+const PATTERN_RETRY_DELAY: Duration = Duration::from_secs(30);
+const PATTERN_LOAD_POLL: Duration = Duration::from_millis(25);
+const PATTERN_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+const PATTERN_HISTORY_SESSIONS: usize = 64;
+const PATTERN_HISTORY_ROWS: usize = 2048;
+const PATTERN_HISTORY_BYTES: usize = 4 * 1024 * 1024;
+const PATTERN_HISTORY_ROW_BYTES: usize = 128 * 1024;
+const PATTERN_HISTORY_CALLS: usize = 512;
+const PATTERN_ANALYSIS_BYTES: usize = 512 * 1024;
+const PATTERN_SCAN_UNAVAILABLE: &str = "History could not be read or analyzed. Refresh to retry.";
+const PATTERN_PROJECT_UNAVAILABLE: &str = "Discovery requires a canonical local project directory.";
+const PATTERN_CACHE_LIMIT: &str = "Proposal display/cache limit reached";
+const PATTERN_SESSION_LIMIT: &str = "Per-parent history row limit";
+const PATTERN_OMITTED_SCOPES: &str = "Omitted command scopes";
+const PATTERN_SOURCE_OBLIGATIONS: &str = "Source/effect obligations";
+
+struct PatternLoadRequest {
+    project: PathBuf,
+    mode: PatternDiscoveryMode,
+    requested_at: Instant,
+    reply: ChannelSender<Arc<PatternDiscoveryOutcome>>,
+}
+
+struct CachedPatternSuggestions {
+    project: PathBuf,
+    loaded_at: Instant,
+    outcome: Arc<PatternDiscoveryOutcome>,
+}
+
+impl CachedPatternSuggestions {
+    fn fresh_at(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.loaded_at)
+            < if matches!(self.outcome.as_ref(), PatternDiscoveryOutcome::Ready(_)) {
+                PATTERN_CACHE_TTL
+            } else {
+                PATTERN_RETRY_DELAY
+            }
+    }
+}
+
+struct PatternSuggestionWorker {
+    loader: PatternSuggestionLoader,
+    requests: Option<ChannelSender<PatternLoadRequest>>,
+    stop: Arc<AtomicBool>,
+    finished: ShutdownReceiver<()>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl PatternSuggestionWorker {
+    fn spawn(storage: &StateDir, remote: bool) -> Option<Self> {
+        if remote || storage.is_ephemeral() {
+            return None;
+        }
+        Self::spawn_with(
+            storage.for_class(StateClass::Persistent),
+            load_history_patterns,
+        )
+    }
+
+    fn spawn_with(
+        storage: StateDir,
+        scan: impl Fn(&StateDir, &Path, &dyn Fn() -> bool) -> PatternDiscoveryOutcome + Send + 'static,
+    ) -> Option<Self> {
+        let (requests, incoming) = flume::bounded::<PatternLoadRequest>(PATTERN_LOAD_QUEUE);
+        let stop = Arc::new(AtomicBool::new(false));
+        let (done, finished) = mpsc::channel();
+        let stopping = Arc::clone(&stop);
+        let thread = match thread::Builder::new()
+            .name("pattern-suggestions".into())
+            .spawn(move || {
+                let mut cache = VecDeque::<CachedPatternSuggestions>::new();
+                while !stopping.load(Ordering::Acquire) {
+                    let request = match incoming.recv_timeout(PATTERN_LOAD_POLL) {
+                        Ok(request) => request,
+                        Err(PatternRecvError::Timeout) => continue,
+                        Err(PatternRecvError::Disconnected) => break,
+                    };
+                    let cancelled =
+                        || stopping.load(Ordering::Acquire) || request.reply.is_disconnected();
+                    if cancelled() {
+                        continue;
+                    }
+                    if !request.project.is_absolute()
+                        || !fs::canonicalize(&request.project)
+                            .is_ok_and(|path| path == request.project && path.is_dir())
+                    {
+                        let _ =
+                            request
+                                .reply
+                                .try_send(Arc::new(PatternDiscoveryOutcome::Unavailable(
+                                    PATTERN_PROJECT_UNAVAILABLE,
+                                )));
+                        continue;
+                    }
+                    let now = Instant::now();
+                    cache.retain(|entry| entry.fresh_at(now));
+                    if let Some(entry) = cache.iter().find(|entry| {
+                        entry.project == request.project
+                            && (request.mode == PatternDiscoveryMode::Cached
+                                || entry.loaded_at >= request.requested_at)
+                    }) {
+                        let _ = request.reply.try_send(Arc::clone(&entry.outcome));
+                        continue;
+                    }
+                    let mut outcome = scan(&storage, &request.project, &cancelled);
+                    if cancelled() {
+                        continue;
+                    }
+                    if let PatternDiscoveryOutcome::Ready(report) = &mut outcome {
+                        let count = report.candidates.len();
+                        report.candidates = cacheable_pattern_candidates(
+                            &request.project,
+                            report.candidates.to_vec(),
+                        );
+                        if report.candidates.len() < count {
+                            report.partial_reasons.push(PATTERN_CACHE_LIMIT.into());
+                        }
+                    }
+                    if cancelled() {
+                        continue;
+                    }
+                    let outcome = Arc::new(outcome);
+                    cache.retain(|entry| entry.project != request.project);
+                    if cache.len() == PATTERN_CACHE_PROJECTS {
+                        cache.pop_front();
+                    }
+                    cache.push_back(CachedPatternSuggestions {
+                        project: request.project,
+                        loaded_at: Instant::now(),
+                        outcome: Arc::clone(&outcome),
+                    });
+                    let _ = request.reply.try_send(outcome);
+                }
+                drop(cache);
+                let _ = done.send(());
+            }) {
+            Ok(thread) => thread,
+            Err(error) => {
+                tracing::warn!(kind = ?error.kind(), "history pattern suggestion worker unavailable");
+                return None;
+            }
+        };
+        let stopping = Arc::clone(&stop);
+        let weak_requests = requests.downgrade();
+        let loader = Arc::new(move |project, mode| {
+            let (reply, receiver) = flume::bounded(1);
+            if !stopping.load(Ordering::Acquire)
+                && let Some(requests) = weak_requests.upgrade()
+            {
+                let _ = requests.try_send(PatternLoadRequest {
+                    project,
+                    mode,
+                    requested_at: Instant::now(),
+                    reply,
+                });
+            }
+            receiver
+        });
+        Some(Self {
+            loader,
+            requests: Some(requests),
+            stop,
+            finished,
+            thread: Some(thread),
+        })
+    }
+
+    fn shutdown(&mut self, budget: Duration) -> bool {
+        self.stop.store(true, Ordering::Release);
+        self.requests = None;
+        let Some(thread) = self.thread.take() else {
+            return true;
+        };
+        if matches!(
+            self.finished.recv_timeout(budget),
+            Err(RecvTimeoutError::Timeout)
+        ) {
+            // Rust cannot preempt a thread stuck in kernel I/O. The worker has
+            // no manager handles; the UI has already dropped its reply receivers.
+            tracing::warn!(
+                budget_ms = budget.as_millis(),
+                "pattern discovery did not stop within shutdown budget"
+            );
+            return false;
+        }
+        if thread.join().is_err() {
+            tracing::warn!("history pattern suggestion worker panicked");
+        }
+        true
+    }
+}
+
+impl Drop for PatternSuggestionWorker {
+    fn drop(&mut self) {
+        self.shutdown(PATTERN_SHUTDOWN_TIMEOUT);
+    }
+}
+
+fn cacheable_pattern_candidates(
+    project: &Path,
+    candidates: Vec<PatternCandidate>,
+) -> Arc<[PatternCandidate]> {
+    let mut fingerprints = HashSet::new();
+    let mut bytes = 0;
+    let mut retained = Vec::new();
+    for candidate in candidates
+        .into_iter()
+        .take(DiscoveryLimits::default().max_suggestions)
+    {
+        if Path::new(&candidate.definition.context.path_binding) != project {
+            continue;
+        }
+        let Ok(fingerprint) = candidate.definition.fingerprint() else {
+            continue;
+        };
+        let Ok(encoded) = serde_json::to_vec(&candidate) else {
+            continue;
+        };
+        if encoded.len() > PATTERN_CACHE_BYTES_PER_PROJECT.saturating_sub(bytes)
+            || !fingerprints.insert(fingerprint)
+        {
+            continue;
+        }
+        bytes += encoded.len();
+        retained.push(candidate);
+    }
+    Arc::from(retained)
+}
+
+fn load_history_patterns(
+    storage: &StateDir,
+    project: &Path,
+    cancelled: &dyn Fn() -> bool,
+) -> PatternDiscoveryOutcome {
+    let mut limits = DiscoveryLimits {
+        max_calls: PATTERN_HISTORY_CALLS,
+        max_analysis_bytes: PATTERN_ANALYSIS_BYTES,
+        ..DiscoveryLimits::default()
+    };
+    limits.history.max_sessions = PATTERN_HISTORY_SESSIONS;
+    limits.history.max_rows = PATTERN_HISTORY_ROWS;
+    limits.history.max_bytes = PATTERN_HISTORY_BYTES;
+    limits.history.max_row_bytes = PATTERN_HISTORY_ROW_BYTES;
+    let report = match discover_for_project_cancellable(storage, project, limits, cancelled) {
+        Ok(report) => report,
+        Err(_) => {
+            tracing::debug!("history pattern discovery unavailable");
+            return PatternDiscoveryOutcome::Unavailable(PATTERN_SCAN_UNAVAILABLE);
+        }
+    };
+    tracing::debug!(
+        rows = report.sample.rows,
+        calls = report.processing.calls,
+        candidates = report.candidates.len(),
+        unavailable = report.processing.storage_unavailable,
+        cancelled = report.processing.cancelled,
+        timed_out = report.processing.timed_out,
+        "history pattern discovery completed"
+    );
+    discovery_outcome(report)
+}
+
+fn discovery_outcome(report: DiscoveryReport) -> PatternDiscoveryOutcome {
+    if report.processing.storage_unavailable || report.processing.recognition_failed {
+        return PatternDiscoveryOutcome::Unavailable(PATTERN_SCAN_UNAVAILABLE);
+    }
+    let mut partial_reasons: Vec<String> = [
+        (report.sample.truncated, "History sample incomplete"),
+        (report.sample.stopped, "History sampling stopped early"),
+        (report.processing.call_limit, "Tool-call limit reached"),
+        (
+            report.processing.analysis_byte_limit,
+            "Analysis byte limit reached",
+        ),
+        (
+            report.processing.observation_limit,
+            "Observation limit reached",
+        ),
+        (report.processing.timed_out, "Time budget reached"),
+        (
+            report.processing.sampling_time_limit,
+            "Sampling time budget reached",
+        ),
+        (
+            report.processing.recognition_time_limit,
+            "Recognition time budget reached",
+        ),
+        (report.processing.cancelled, "Scan cancelled"),
+    ]
+    .into_iter()
+    .filter(|(active, _)| *active)
+    .map(|(_, reason)| reason.to_string())
+    .collect();
+    if report.sample.session_row_cutoffs > 0 {
+        partial_reasons.push(format!(
+            "{PATTERN_SESSION_LIMIT}: {} sessions cut short at {} rows (main + subagents)",
+            report.sample.session_row_cutoffs, report.limits.max_rows_per_session
+        ));
+    }
+    for (label, count) in [
+        (
+            "Oversized history rows skipped",
+            report.sample.oversized_rows,
+        ),
+        (
+            "Invalid history records skipped",
+            report.sample.invalid_records,
+        ),
+        ("Nonlocal sessions skipped", report.sample.nonlocal_sessions),
+        (
+            "Repeated history rows skipped",
+            report.processing.duplicate_records,
+        ),
+        (
+            "Conflicting history identities quarantined",
+            report.processing.colliding_records,
+        ),
+        (
+            "Previously quarantined rows skipped",
+            report.processing.quarantined_records,
+        ),
+        (
+            "Shell analysis failures",
+            report.processing.analysis_failures,
+        ),
+    ] {
+        if count > 0 {
+            partial_reasons.push(format!("{label}: {count}"));
+        }
+    }
+    let stats = &report.processing;
+    if stats.calls_with_omitted_commands > 0
+        || stats.calls_with_incomplete_source > 0
+        || stats.calls_with_incomplete_context > 0
+    {
+        partial_reasons.push(format!(
+            "Observed {}/{} represented command scopes; {} calls omit commands; {} incomplete source, {} incomplete context (not full-call authorization)",
+            stats.observed_commands,
+            stats.represented_commands,
+            stats.calls_with_omitted_commands,
+            stats.calls_with_incomplete_source,
+            stats.calls_with_incomplete_context
+        ));
+    }
+    for (reason, count) in &stats.exclusions {
+        partial_reasons.push(format!("Excluded records/calls ({reason:?}): {count}"));
+    }
+    for (reason, count) in &stats.omission_counts {
+        partial_reasons.push(format!("{PATTERN_OMITTED_SCOPES} ({reason:?}): {count}"));
+    }
+    for obligation in &stats.obligation_counts {
+        if obligation.kind != PatternObligationKind::ProgramEffectsNotAssessed {
+            partial_reasons.push(format!(
+                "{PATTERN_SOURCE_OBLIGATIONS} ({:?}): {} (not full-call authorization)",
+                obligation.kind, obligation.count
+            ));
+        }
+    }
+    for (reason, count) in &report.recognition.exclusions {
+        partial_reasons.push(match reason {
+            RecognitionExclusion::Capacity => {
+                format!("{RECOGNIZER_CAPACITY}: {count}. {RECOGNIZER_ORDER_BIAS}")
+            }
+            _ => format!("Recognizer exclusions ({reason:?}): {count}"),
+        });
+    }
+    PatternDiscoveryOutcome::Ready(Box::new(PatternDiscoveryReport {
+        candidates: Arc::from(report.candidates),
+        sample: report.sample,
+        history_limits: report.limits.history,
+        recognition: report.recognition,
+        recognizer_limits: report.recognizer_limits,
+        calls: report.processing.calls,
+        max_calls: report.limits.max_calls,
+        analysis_bytes: report.processing.analysis_bytes,
+        max_analysis_bytes: report.limits.max_analysis_bytes,
+        max_elapsed_ms: report.limits.max_elapsed_ms,
+        partial_reasons,
+    }))
+}
 
 /// Runs the retention sweep on its own thread while the TUI is open. Dropping
 /// the sender wakes and stops the thread. Every step the sweep takes is
@@ -969,6 +1363,11 @@ pub fn run(mut cli: Cli) -> Result<ExitCode> {
                     .and_then(|context| context.permissions()),
             )
             .context("install initial remote permission policy")?;
+        let pattern_suggestions = if stack.config.storage.ephemeral {
+            None
+        } else {
+            PatternSuggestionWorker::spawn(&storage, workcell_runtime.is_remote())
+        };
         let outcome = caudra_ui::run(
             caudra_ui::EventLoopParams {
                 model,
@@ -986,6 +1385,9 @@ pub fn run(mut cli: Cli) -> Result<ExitCode> {
                 input_history_size: stack.config.storage.input_history_size,
                 max_log_files: stack.config.storage.max_log_files,
                 permissions,
+                pattern_suggestion_loader: pattern_suggestions
+                    .as_ref()
+                    .map(|worker| Arc::clone(&worker.loader)),
                 timeouts: stack.timeouts(),
                 exit_on_done: cli.exit_on_done,
                 lua_command_reader: stack.plugin_host.command_reader(),
@@ -1003,8 +1405,9 @@ pub fn run(mut cli: Cli) -> Result<ExitCode> {
                 local_documents: workcell_runtime.local_documents().cloned(),
             },
             initial_prompt.take(),
-        )
-        .wrap_err_with(|| match &committed_relocation {
+        );
+        drop(pattern_suggestions);
+        let outcome = outcome.wrap_err_with(|| match &committed_relocation {
             Some(committed) => format!(
                 "{committed}. UI startup failed; reopen the committed sessions at the destination"
             ),
@@ -1166,21 +1569,36 @@ fn exit_report(summary: &ExitSummary, rich: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use caudra_agent::permissions::pattern_recognition::{
+        CandidateEvidence, InvocationOutcome, ObservationProvenance, SupportCount,
+    };
     use caudra_config::RawConfig;
+    use caudra_providers::{HistoryItem, HistoryItemKind};
+    use caudra_storage::permission_patterns::{
+        ArgumentRole, PATTERN_SCHEMA_VERSION, PatternContext, PatternDefinition, PatternToken,
+        SlotCombinations,
+    };
     use caudra_storage::sessions::{LedgerEntry, StoredTokenUsage};
     use caudra_storage::state::write_workspace_tabs;
     use caudra_storage::usage_ledger::{BUCKET_SECONDS, LedgerPurpose};
+    use caudra_workcell::{PatternObligationCount, PatternOmissionReason};
     use color_eyre::eyre::eyre;
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
     use std::path::PathBuf;
     use std::slice;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use test_case::test_case;
 
     const TEST_MODEL: &str = "test/model";
     const TEST_CWD: &str = "/tmp";
+    const PATTERN_TEST_WAIT: Duration = Duration::from_secs(10);
+    const PATTERN_TEST_SOURCE: &str = "history-test";
+    const PATTERN_TEST_ANALYSIS: &str = "test-analysis/v1";
+    const PATTERN_TEST_COMMAND: &str = "fixture-command";
+    const PATTERN_FIRST_COMMAND: &str = "cargo check -p alpha";
+    const PATTERN_SECOND_COMMAND: &str = "cargo check -p beta";
     const EXIT_RUN_TIME: Duration = Duration::from_secs(90);
     const SCRIPTABLE: &str = "a redirected stderr gets one line a script can act on";
     const BLOCK: &str = "a terminal gets the full block, not the fallback line";
@@ -1199,6 +1617,545 @@ mod tests {
         cost: Some(0.25),
         subscription_cost: None,
     };
+
+    fn suggestion_candidate(project: &Path) -> PatternCandidate {
+        PatternCandidate {
+            definition: PatternDefinition {
+                version: PATTERN_SCHEMA_VERSION,
+                name: PATTERN_TEST_COMMAND.into(),
+                context: PatternContext {
+                    tool_identity: "workcell/shell".into(),
+                    executable_identity: PATTERN_TEST_COMMAND.into(),
+                    effective_workdir: project.to_string_lossy().into_owned(),
+                    path_binding: project.to_string_lossy().into_owned(),
+                    analysis_version: PATTERN_TEST_ANALYSIS.into(),
+                },
+                argv: vec![PatternToken::Exact {
+                    value: PATTERN_TEST_COMMAND.into(),
+                    role: ArgumentRole::Executable,
+                }],
+                slots: Vec::new(),
+                combinations: SlotCombinations::Independent,
+            },
+            evidence: CandidateEvidence {
+                support: SupportCount {
+                    observations: 2,
+                    independent_sessions: 2,
+                },
+                provenance: ObservationProvenance::Imported,
+                sources: [PATTERN_TEST_SOURCE.into()].into(),
+                outcomes: [(InvocationOutcome::Unknown, 2)].into(),
+                first_seen_ms: 1,
+                last_seen_ms: 1,
+                distributions: Default::default(),
+                tuples: Vec::new(),
+            },
+        }
+    }
+
+    fn scan_outcome(candidates: Vec<PatternCandidate>) -> PatternDiscoveryOutcome {
+        let limits = DiscoveryLimits::default();
+        PatternDiscoveryOutcome::Ready(Box::new(PatternDiscoveryReport {
+            candidates: candidates.into(),
+            sample: Default::default(),
+            history_limits: limits.history,
+            recognition: Default::default(),
+            recognizer_limits: Default::default(),
+            calls: 0,
+            max_calls: limits.max_calls,
+            analysis_bytes: 0,
+            max_analysis_bytes: limits.max_analysis_bytes,
+            max_elapsed_ms: limits.max_elapsed_ms,
+            partial_reasons: Vec::new(),
+        }))
+    }
+
+    fn scan_candidates(outcome: &PatternDiscoveryOutcome) -> &[PatternCandidate] {
+        let PatternDiscoveryOutcome::Ready(report) = outcome else {
+            panic!("expected a successful scan");
+        };
+        &report.candidates
+    }
+
+    #[test_case(false; "ready_cache")]
+    #[test_case(true; "unavailable_cache")]
+    fn explicit_pattern_refresh_bypasses_cache_without_changing_normal_reuse(fail: bool) {
+        let temp = tempfile::tempdir().unwrap();
+        let project = fs::canonicalize(temp.path()).unwrap();
+        let scans = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&scans);
+        let mut worker = PatternSuggestionWorker::spawn_with(
+            StateDir::from_path(project.clone()),
+            move |_, _, _| {
+                count.fetch_add(1, Ordering::Relaxed);
+                if fail {
+                    PatternDiscoveryOutcome::Unavailable(PATTERN_SCAN_UNAVAILABLE)
+                } else {
+                    scan_outcome(Vec::new())
+                }
+            },
+        )
+        .unwrap();
+        for (mode, expected) in [
+            (PatternDiscoveryMode::Cached, 1),
+            (PatternDiscoveryMode::Cached, 1),
+            (PatternDiscoveryMode::Refresh, 2),
+            (PatternDiscoveryMode::Cached, 2),
+        ] {
+            (worker.loader)(project.clone(), mode)
+                .recv_timeout(PATTERN_TEST_WAIT)
+                .unwrap();
+            assert_eq!(scans.load(Ordering::Relaxed), expected);
+        }
+        assert!(worker.shutdown(PATTERN_TEST_WAIT));
+    }
+
+    #[test_case(PatternDiscoveryMode::Refresh; "overlapping_refreshes_share_one_scan")]
+    fn pattern_refreshes_coalesce_while_the_scan_is_running(mode: PatternDiscoveryMode) {
+        let temp = tempfile::tempdir().unwrap();
+        let project = fs::canonicalize(temp.path()).unwrap();
+        let scans = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&scans);
+        let (entered, ready) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let mut worker = PatternSuggestionWorker::spawn_with(
+            StateDir::from_path(project.clone()),
+            move |_, _, _| {
+                if count.fetch_add(1, Ordering::Relaxed) > 0 {
+                    entered.send(()).unwrap();
+                    released.recv_timeout(PATTERN_TEST_WAIT).unwrap();
+                }
+                scan_outcome(Vec::new())
+            },
+        )
+        .unwrap();
+        (worker.loader)(project.clone(), PatternDiscoveryMode::Cached)
+            .recv_timeout(PATTERN_TEST_WAIT)
+            .unwrap();
+        let first = (worker.loader)(project.clone(), mode.clone());
+        ready.recv_timeout(PATTERN_TEST_WAIT).unwrap();
+        let second = (worker.loader)(project, mode);
+        release.send(()).unwrap();
+        let first = first.recv_timeout(PATTERN_TEST_WAIT).unwrap();
+        let second = second.recv_timeout(PATTERN_TEST_WAIT).unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(scans.load(Ordering::Relaxed), 2);
+        assert!(worker.shutdown(PATTERN_TEST_WAIT));
+    }
+
+    #[test_case(PatternDiscoveryMode::Cached; "cancelled_results_never_populate_cache")]
+    fn cancelled_pattern_scan_is_not_reused_by_the_next_request(mode: PatternDiscoveryMode) {
+        let temp = tempfile::tempdir().unwrap();
+        let project = fs::canonicalize(temp.path()).unwrap();
+        let scans = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&scans);
+        let (entered, ready) = mpsc::channel();
+        let mut worker = PatternSuggestionWorker::spawn_with(
+            StateDir::from_path(project.clone()),
+            move |_, _, stop| {
+                if count.fetch_add(1, Ordering::Relaxed) == 0 {
+                    entered.send(()).unwrap();
+                    while !stop() {
+                        thread::yield_now();
+                    }
+                }
+                scan_outcome(Vec::new())
+            },
+        )
+        .unwrap();
+        let first = (worker.loader)(project.clone(), mode.clone());
+        ready.recv_timeout(PATTERN_TEST_WAIT).unwrap();
+        drop(first);
+        (worker.loader)(project, mode)
+            .recv_timeout(PATTERN_TEST_WAIT)
+            .unwrap();
+        assert_eq!(scans.load(Ordering::Relaxed), 2);
+        assert!(worker.shutdown(PATTERN_TEST_WAIT));
+    }
+
+    #[test_case("rows"; "bounded_sample")]
+    #[test_case("calls"; "call_limit")]
+    #[test_case("time"; "elapsed_budget")]
+    #[test_case("sampling"; "sampling_budget")]
+    #[test_case("recognition"; "recognition_budget")]
+    #[test_case("session_rows"; "per_session_partial_sample")]
+    #[test_case("omissions"; "sanitized_scope_omission_counts")]
+    #[test_case("obligations"; "unresolved_source_obligation_counts")]
+    #[test_case("capacity"; "capacity_exclusions_and_admission_order_bias")]
+    #[test_case("storage"; "unavailable_storage")]
+    #[test_case("failure"; "recognition_failure")]
+    fn discovery_report_preserves_partial_counts_and_distinguishes_failure(reason: &str) {
+        let mut report = DiscoveryReport {
+            version: 0,
+            read_only: true,
+            historical_context_verified: false,
+            project: TEST_CWD.into(),
+            source_identity: PATTERN_TEST_SOURCE.into(),
+            limits: DiscoveryLimits::default(),
+            recognizer_limits: Default::default(),
+            max_command_bytes: PATTERN_HISTORY_ROW_BYTES,
+            as_of_ms: 0,
+            sample: Default::default(),
+            processing: Default::default(),
+            recognition: Default::default(),
+            candidates: vec![suggestion_candidate(Path::new(TEST_CWD))],
+            provenance: Default::default(),
+            assumptions: &[],
+            limitations: &[],
+        };
+        report.sample.sessions = 2;
+        report.recognition.retained_observations = 2;
+        match reason {
+            "rows" => report.sample.truncated = true,
+            "calls" => report.processing.call_limit = true,
+            "time" => report.processing.timed_out = true,
+            "sampling" => report.processing.sampling_time_limit = true,
+            "recognition" => report.processing.recognition_time_limit = true,
+            "session_rows" => report.sample.session_row_cutoffs = 2,
+            "omissions" => {
+                report.processing.represented_commands = 4;
+                report.processing.observed_commands = 2;
+                report.processing.calls_with_omitted_commands = 2;
+                report
+                    .processing
+                    .omission_counts
+                    .insert(PatternOmissionReason::InterpretedExecutable, 2);
+            }
+            "obligations" => report
+                .processing
+                .obligation_counts
+                .push(PatternObligationCount {
+                    kind: PatternObligationKind::Redirect,
+                    count: 2,
+                }),
+            "capacity" => {
+                report
+                    .recognition
+                    .exclusions
+                    .insert(RecognitionExclusion::Capacity, 2);
+            }
+            "storage" => report.processing.storage_unavailable = true,
+            "failure" => report.processing.recognition_failed = true,
+            _ => unreachable!(),
+        }
+        let unavailable =
+            report.processing.storage_unavailable || report.processing.recognition_failed;
+        match discovery_outcome(report) {
+            PatternDiscoveryOutcome::Unavailable(message) => {
+                assert!(unavailable);
+                assert_eq!(message, PATTERN_SCAN_UNAVAILABLE);
+            }
+            PatternDiscoveryOutcome::Ready(report) => {
+                assert!(!unavailable);
+                assert!(!report.partial_reasons.is_empty());
+                assert_eq!(report.sample.sessions, 2);
+                assert_eq!(report.recognition.retained_observations, 2);
+                assert_eq!(report.candidates.len(), 1);
+                match reason {
+                    "session_rows" => assert!(report.partial_reasons.contains(&format!(
+                        "{PATTERN_SESSION_LIMIT}: 2 sessions cut short at {} rows (main + subagents)",
+                        DiscoveryLimits::default().max_rows_per_session
+                    ))),
+                    "omissions" => assert!(report.partial_reasons.contains(&format!(
+                        "{PATTERN_OMITTED_SCOPES} ({:?}): 2", PatternOmissionReason::InterpretedExecutable
+                    ))),
+                    "obligations" => assert!(report.partial_reasons.contains(&format!(
+                        "{PATTERN_SOURCE_OBLIGATIONS} ({:?}): 2 (not full-call authorization)", PatternObligationKind::Redirect
+                    ))),
+                    "capacity" => assert!(report.partial_reasons.contains(&format!(
+                        "{RECOGNIZER_CAPACITY}: 2. {RECOGNIZER_ORDER_BIAS}"
+                    ))),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    #[test_case(false; "coalesces_successful_loads_across_tabs")]
+    #[test_case(true; "failed_loads_have_a_bounded_retry_delay")]
+    fn pattern_suggestion_worker_caches_one_load_per_project(fail: bool) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let scans = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&scans);
+        let mut worker = PatternSuggestionWorker::spawn_with(
+            StateDir::from_path(root.clone()),
+            move |_, project, _| {
+                count.fetch_add(1, Ordering::Relaxed);
+                if fail {
+                    PatternDiscoveryOutcome::Unavailable(PATTERN_SCAN_UNAVAILABLE)
+                } else {
+                    scan_outcome(vec![suggestion_candidate(project)])
+                }
+            },
+        )
+        .unwrap();
+        let mut prior = None;
+        for _ in 0..3 {
+            let reply = (worker.loader)(root.clone(), PatternDiscoveryMode::Cached)
+                .recv_timeout(PATTERN_TEST_WAIT)
+                .unwrap();
+            if fail {
+                assert!(matches!(
+                    reply.as_ref(),
+                    PatternDiscoveryOutcome::Unavailable(PATTERN_SCAN_UNAVAILABLE)
+                ));
+            } else {
+                let candidates = reply;
+                assert_eq!(scan_candidates(&candidates).len(), 1);
+                if let Some(prior) = &prior {
+                    assert!(Arc::ptr_eq(prior, &candidates));
+                }
+                prior = Some(candidates);
+            }
+        }
+        assert_eq!(scans.load(Ordering::Relaxed), 1);
+        assert!(worker.shutdown(PATTERN_TEST_WAIT));
+        assert!(worker.thread.is_none());
+        assert!((worker.loader)(root, PatternDiscoveryMode::Cached).is_disconnected());
+    }
+
+    #[test_case(false, PATTERN_CACHE_TTL; "successful_cache_timestamp")]
+    #[test_case(true, PATTERN_RETRY_DELAY; "failed_cache_timestamp")]
+    fn pattern_cache_expiration_is_explicit(fail: bool, ttl: Duration) {
+        let loaded_at = Instant::now();
+        let entry = CachedPatternSuggestions {
+            project: TEST_CWD.into(),
+            loaded_at,
+            outcome: Arc::new(if fail {
+                PatternDiscoveryOutcome::Unavailable(PATTERN_SCAN_UNAVAILABLE)
+            } else {
+                scan_outcome(Vec::new())
+            }),
+        };
+        assert!(entry.fresh_at(loaded_at));
+        assert!(!entry.fresh_at(loaded_at + ttl));
+    }
+
+    #[test_case(PATTERN_CACHE_PROJECTS + 1; "bounded_project_cache")]
+    fn pattern_suggestion_worker_evicts_old_projects(projects: usize) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let scans = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&scans);
+        let mut worker = PatternSuggestionWorker::spawn_with(
+            StateDir::from_path(root.clone()),
+            move |_, project, _| {
+                count.fetch_add(1, Ordering::Relaxed);
+                scan_outcome(vec![suggestion_candidate(project)])
+            },
+        )
+        .unwrap();
+        for index in 0..projects {
+            let project = root.join(index.to_string());
+            fs::create_dir(&project).unwrap();
+            let outcome = (worker.loader)(project.clone(), PatternDiscoveryMode::Cached)
+                .recv_timeout(PATTERN_TEST_WAIT)
+                .unwrap();
+            let candidates = scan_candidates(&outcome);
+            assert_eq!(
+                Path::new(&candidates[0].definition.context.path_binding),
+                project
+            );
+        }
+        let _ = (worker.loader)(root.join("0"), PatternDiscoveryMode::Cached)
+            .recv_timeout(PATTERN_TEST_WAIT)
+            .unwrap();
+        assert_eq!(scans.load(Ordering::Relaxed), projects + 1);
+        assert!(worker.shutdown(PATTERN_TEST_WAIT));
+    }
+
+    #[test_case(false; "receiver_drop_cancels_stale_context")]
+    #[test_case(true; "shutdown_cancels_and_joins_active_scan")]
+    fn pattern_suggestion_worker_cancellation_is_owned(shutdown: bool) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let (entered, ready) = mpsc::channel();
+        let (observed_cancel, cancelled) = mpsc::channel();
+        let mut worker = PatternSuggestionWorker::spawn_with(
+            StateDir::from_path(root.clone()),
+            move |_, _, stop| {
+                entered.send(()).unwrap();
+                while !stop() {
+                    thread::yield_now();
+                }
+                observed_cancel.send(()).unwrap();
+                scan_outcome(Vec::new())
+            },
+        )
+        .unwrap();
+        let reply = (worker.loader)(root, PatternDiscoveryMode::Cached);
+        ready.recv_timeout(PATTERN_TEST_WAIT).unwrap();
+        if shutdown {
+            assert!(worker.shutdown(PATTERN_TEST_WAIT));
+            assert!(reply.is_disconnected());
+        } else {
+            drop(reply);
+            cancelled.recv_timeout(PATTERN_TEST_WAIT).unwrap();
+            assert!(worker.shutdown(PATTERN_TEST_WAIT));
+        }
+    }
+
+    #[test_case(PATTERN_LOAD_QUEUE; "full_queue_never_blocks_startup")]
+    fn pattern_suggestion_requests_are_bounded(capacity: usize) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let (entered, ready) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let mut worker = PatternSuggestionWorker::spawn_with(
+            StateDir::from_path(root.clone()),
+            move |_, _, _| {
+                entered.send(()).unwrap();
+                released.recv_timeout(PATTERN_TEST_WAIT).unwrap();
+                scan_outcome(Vec::new())
+            },
+        )
+        .unwrap();
+        let first = (worker.loader)(root.clone(), PatternDiscoveryMode::Cached);
+        ready.recv_timeout(PATTERN_TEST_WAIT).unwrap();
+        let pending = (0..capacity)
+            .map(|_| (worker.loader)(root.clone(), PatternDiscoveryMode::Cached))
+            .collect::<Vec<_>>();
+        assert!((worker.loader)(root, PatternDiscoveryMode::Cached).is_disconnected());
+        worker.stop.store(true, Ordering::Release);
+        release.send(()).unwrap();
+        assert!(worker.shutdown(PATTERN_TEST_WAIT));
+        assert!(first.is_disconnected());
+        assert!(pending.iter().all(flume::Receiver::is_disconnected));
+    }
+
+    #[test_case(Duration::ZERO; "blocked_io_cannot_hang_ui_shutdown")]
+    fn pattern_suggestion_shutdown_has_a_hard_wait_budget(budget: Duration) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let (entered, ready) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let mut worker = PatternSuggestionWorker::spawn_with(
+            StateDir::from_path(root.clone()),
+            move |_, _, _| {
+                entered.send(()).unwrap();
+                released.recv_timeout(PATTERN_TEST_WAIT).unwrap();
+                scan_outcome(Vec::new())
+            },
+        )
+        .unwrap();
+        let reply = (worker.loader)(root.clone(), PatternDiscoveryMode::Cached);
+        ready.recv_timeout(PATTERN_TEST_WAIT).unwrap();
+        assert!(!worker.shutdown(budget));
+        assert!((worker.loader)(root, PatternDiscoveryMode::Cached).is_disconnected());
+        release.send(()).unwrap();
+        worker.finished.recv_timeout(PATTERN_TEST_WAIT).unwrap();
+        assert!(reply.recv_timeout(PATTERN_TEST_WAIT).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test_case("alias"; "startup_requires_a_canonical_local_project")]
+    fn pattern_suggestion_worker_refuses_project_aliases(name: &str) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let alias = root.join(name);
+        symlink(&root, &alias).unwrap();
+        let scans = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&scans);
+        let mut worker =
+            PatternSuggestionWorker::spawn_with(StateDir::from_path(root), move |_, _, _| {
+                count.fetch_add(1, Ordering::Relaxed);
+                scan_outcome(Vec::new())
+            })
+            .unwrap();
+        assert!(matches!(
+            (worker.loader)(alias, PatternDiscoveryMode::Cached)
+                .recv_timeout(PATTERN_TEST_WAIT)
+                .unwrap()
+                .as_ref(),
+            PatternDiscoveryOutcome::Unavailable(PATTERN_PROJECT_UNAVAILABLE)
+        ));
+        assert_eq!(scans.load(Ordering::Relaxed), 0);
+        assert!(worker.shutdown(PATTERN_TEST_WAIT));
+    }
+
+    #[test_case(true, false; "remote_runtime")]
+    #[test_case(false, true; "ephemeral_storage")]
+    fn pattern_suggestion_worker_respects_privacy(remote: bool, ephemeral: bool) {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = if ephemeral {
+            StateDir::split(temp.path().join("volatile"), temp.path().join("persistent"))
+        } else {
+            StateDir::from_path(temp.path().into())
+        };
+        assert!(PatternSuggestionWorker::spawn(&storage, remote).is_none());
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 0);
+    }
+
+    #[test_case("duplicate"; "deduplicates_definition_fingerprints")]
+    #[test_case("foreign"; "rejects_another_project")]
+    #[test_case("oversized"; "bounds_cached_candidate_bytes")]
+    fn pattern_suggestion_cache_rejects_unsafe_or_redundant_entries(case: &str) {
+        let root = Path::new(TEST_CWD);
+        let candidate = suggestion_candidate(root);
+        let mut other = candidate.clone();
+        match case {
+            "foreign" => other.definition.context.path_binding = "/other/project".into(),
+            "oversized" => {
+                other
+                    .evidence
+                    .sources
+                    .insert("x".repeat(PATTERN_CACHE_BYTES_PER_PROJECT));
+            }
+            _ => other.definition.name = "renamed".into(),
+        }
+        let retained = cacheable_pattern_candidates(root, vec![candidate.clone(), other]);
+        assert_eq!(retained.as_ref(), [candidate]);
+    }
+
+    #[test_case("history"; "real_read_only_startup_loader_uses_synthetic_database")]
+    fn pattern_suggestion_startup_reads_imported_proposals_without_policy_writes(_case: &str) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let storage = StateDir::from_path(root.join("storage"));
+        fs::create_dir(storage.path()).unwrap();
+        for command in [PATTERN_FIRST_COMMAND, PATTERN_SECOND_COMMAND] {
+            let mut session = AppSession::new(TEST_MODEL, root.to_str().unwrap());
+            let id = CaudraId::generate();
+            session.push_message(HistoryItem {
+                id,
+                parent_id: None,
+                supersedes: None,
+                group_id: id,
+                kind: HistoryItemKind::ToolCall {
+                    call_id: id.to_string(),
+                    name: "shell".into(),
+                    input: serde_json::json!({"command": command}),
+                    thought_signature: None,
+                    source: None,
+                },
+            });
+            session.save(&storage).unwrap();
+        }
+        let before = SessionDatabase::open_read_only(&storage)
+            .unwrap()
+            .raw_permission_snapshot()
+            .unwrap();
+        let mut worker = PatternSuggestionWorker::spawn(&storage, false).unwrap();
+        let outcome = (worker.loader)(root, PatternDiscoveryMode::Cached)
+            .recv_timeout(PATTERN_TEST_WAIT)
+            .unwrap();
+        let candidates = scan_candidates(&outcome);
+        assert!(worker.shutdown(PATTERN_TEST_WAIT));
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates[0].evidence.provenance,
+            ObservationProvenance::Imported
+        );
+        assert_eq!(candidates[0].evidence.support.independent_sessions, 2);
+        assert_eq!(
+            before,
+            SessionDatabase::open_read_only(&storage)
+                .unwrap()
+                .raw_permission_snapshot()
+                .unwrap()
+        );
+    }
 
     fn relocation_test_tab(storage: &StateDir, cwd: &Path) -> SessionTab {
         let mut session = AppSession::new(TEST_MODEL, &cwd.to_string_lossy());

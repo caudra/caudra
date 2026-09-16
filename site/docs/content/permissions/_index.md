@@ -19,7 +19,7 @@ Caudra resolves a tool call in this order:
 
 1. Plan-mode and executor restrictions reject prohibited operations.
 2. A matching deny blocks the call.
-3. A matching configured ask requires confirmation.
+3. A winning configured ask requires confirmation, using the shell specificity rules below.
 4. Stored and configured allows cover resources independently. Every unresolved resource needs coverage.
 5. Builtin command-family asks apply when no stored or configured allow covers the command.
 6. Builtin and trusted-plugin policy can allow known operations.
@@ -32,7 +32,7 @@ Allows can combine across resources. A shell chain can use separate grants for `
 
 Authority controls what a rule covers. Lifetime controls how long the rule remains active. The prompt selects them independently.
 
-Exact call is the default authority. Trusted tool profiles can also offer a URL prefix, filesystem subtree, shell command pattern, shell workdir, search provider, or whole MCP tool. Caudra does not infer these choices from names in an external tool schema.
+The default authority is narrow: an exact call, exact paths for eligible reads, or an exact shell command in its reviewed working directory. Trusted tool profiles can also offer names-only browsing, a filesystem subtree, URL prefix, command pattern, shell workdir, search provider, or whole MCP tool. Caudra does not infer these choices from names in an external tool schema.
 
 Prompt decisions use four lifetimes:
 
@@ -43,64 +43,105 @@ Prompt decisions use four lifetimes:
 | Project | Applies in the same canonical project directory |
 | Global | Applies in every project |
 
-Project and global rules still bind to the exact native tool contract or MCP server authority and tool contract. Replacing a tool, changing an MCP endpoint, or changing an MCP schema invalidates the old authority.
+Project and global rules bind to the native tool contract or MCP server authority and tool contract. Explicit filesystem family grants cover the trusted native tools described under [Typed resources](#typed-resources). Replacing a tool, changing an MCP endpoint, or changing an MCP schema does not silently transfer authority.
 
 A user-created fork starts with no conversation grants and no inherited explicit YOLO state. Subtasks share the root conversation's grants. `/new` also starts clean.
 
 ## Permission prompts
 
-The prompt shows the action, risk, selected authority, and typed resources before its controls. Resources already covered by another rule appear after unresolved resources, marked with the scope that covers them and the authority that carries it, such as `already allowed · project · rg *`. The scope tells you whether the coverage outlives the session and the authority tells you how far it already reaches, which is what decides whether granting again changes anything. The body expands when the terminal has room and scrolls on smaller terminals while the controls remain visible.
+The prompt separates the action, future scope, lifetime, context, and warnings into review cards. Context identifies why approval is needed and the requester when present. `y` allows this call once. `s` remembers the displayed scope for the conversation, and `a` remembers it for the project. Routine narrow approvals act directly, without a separate Remember screen or preliminary confirmation.
 
-The action line carries the arguments its own summary does not already name, in the compact form the transcript uses. Likely secret values and URL query values are masked there.
+Local exact-shell calls with fully matched input and prepared context use a compact review. It shows the command, working directory, lifetime, and any warnings, with `Exact call only` and `Same reviewed preparation` describing the retained scope.
+
+Already covered resources are collapsed behind a count. Expand them with `c` to see the covering scope and authority, such as `already allowed · project · rg *`.
+
+Shell reviews use the supplied command text when available. Likely secret values and URL query values are masked, and terminal controls are escaped.
 
 | Key | Action |
 |---|---|
-| `y` | Allow this exact call once |
-| `Up` / `Down` | Select a host-generated reusable authority or a reviewed command |
-| `Left` / `Right` | Walk the selected row along its range, where it has one |
-| `<` / `>` | Narrow or widen every command row at once |
-| `Enter` | Write your own command pattern for the selected command |
-| `s` | Allow the selected authority for the conversation, after confirmation |
-| `a` | Allow the selected authority for the project, after confirmation |
-| `A` | Allow the selected authority globally, after confirmation |
-| `n` | Add guidance and deny once |
-| `d` | Deny this exact call for the project, after confirmation |
-| `D` | Deny this exact call globally, after confirmation |
+| `y` | On the main prompt, allow this exact call once |
+| `s` | Allow the displayed future scope for the conversation |
+| `a` | Allow the displayed future scope for the project, when available |
+| `r` / `?` | Open the optional scope editor without approving |
+| `v` / `F2` | Open or close Details |
+| `c` | Expand or collapse already covered resources |
+| `Tab` / `Shift-Tab` | Move focus between controls |
+| `Enter` | Activate the focused control |
+| `Up` / `Down` | With a scope control focused, select an authority or command row |
+| `Left` / `Right` | With a scope control focused, narrow or widen that row |
+| `p` | In the scope editor, use the scope and return to the main prompt without approving |
+| `i` | In the scope editor, inspect an available argument pattern |
+| `e` | In the scope editor, write a command prefix pattern |
+| `A` | In the scope editor, review a global approval when available |
+| `g` / `n` | Add guidance and deny once |
+| `d` / `D` | In the scope editor or Details, review a project / global exact-call deny |
 | `PageUp` / `PageDown` | Scroll the body when it does not fit |
-| `Esc` or `Ctrl-C` | Deny once |
+| `Esc` | Return from a panel or editor. From the main prompt, deny once |
+| `Ctrl-C` | Deny once |
 
-The footer names widening only when the selected authority has somewhere to go, and the page keys only when the body is taller than the space it has. It names the command-row keys only on a wide terminal, because a narrow footer gives its rows to the decision keys.
+Controls also support mouse input. Opening the scope editor or inspecting a suggestion grants nothing. On the main prompt, `y` allows this exact call once, regardless of the selected future scope.
 
-Reusable approvals are exact by default. A parsed shell command is scoped one command at a time, described below, ahead of the unrestricted workdir and global shell choices. Broad authorities require explicit selection. Unrestricted URL, search, shell, and MCP authorities also require a typed phrase. Each authority advertises its valid lifetimes. Whole-tool MCP authority is conversation-only.
+Higher-impact reusable scopes and global decisions require an extra confirmation. It shows a frozen human-readable summary of the authority, lifetime, project binding, and any required phrases. It does not require interpreting a JSON rule. In this confirmation, `Enter` or `y` confirms the displayed decision, including reusable authority, when no phrase is required. Unrestricted URL, search, shell, and MCP authorities require a typed phrase followed by `Enter`. Incomplete or truncated authority summaries disable approval until they can be reviewed.
+
+Advanced reviews keep distinct resource alternatives separate. All guards within an alternative apply, and unrestricted guards are labelled. Remote reviews show the trust anchor, server, workspace and generation, resource namespace, principal, remote project, scope and target keys, and authority digest. Binding IDs are percent-escaped. Display paths are labelled as display information rather than authority.
+
+For eligible reads, the prompt starts on `This exact path` or `These exact paths`. This remembers the resource rather than the full input, so reading the same file with another `offset` or `limit` does not need a new grant. Exact-path search grants still constrain the search expression. The exact-call authority continues to require the complete original input. Protected paths, remote requests, plan restrictions, and unavailable persistence can limit the offered scopes and lifetimes.
+
+Details presents supplied input and technical authority as scrollable, bounded named fields, with secret redaction and escaped terminal controls. Supplied edits and patches are shown as supplied, with a warning when no before-state is available. Opening Details does not run a tool or read files to construct a diff. Truncation is labelled.
 
 A filesystem authority arrives as a ladder. Its narrowest rung covers the directories the request touched, and each step up covers the directory above, as far as the filesystem root. The rungs share one row, and `Left` and `Right` walk it, so widening changes the reach the row names rather than adding choices to scroll through. A rung reaching outside the repository is marked `outside repo`. A rung that takes in your home directory is marked `outside home` and needs the `ALLOW OUTSIDE HOME` phrase. Moving to another authority and back returns the ladder to its narrowest rung.
 
 A URL authority is a ladder too. `Left` and `Right` walk it the same way, one path segment at a time, so a page can be scoped to the section it sits in. A request for `https://example.com/path/to/sub/page` starts at `https://example.com/path/to/sub/page/**` and widens through `https://example.com/path/to/**` and `https://example.com/path/**` to `https://example.com/**`, where the row reads `Any page on this origin`. A path deeper than eight segments offers its eight deepest prefixes and the origin. A URL with no path offers the origin alone. Reaching other origins is a separate authority that needs the `ALLOW ANY URL` phrase.
 
-Multiple requests are queued by request ID. The prompt identifies the requesting subtask. A subtask request cannot replace a prompt from the main agent or another subtask. Confirming a reusable authority also approves every pending request it already covers. Conversation, project, and global lifetimes limit which pending conversations or projects can share that approval. Allow once and deny decisions resolve only the selected request.
+Multiple requests are queued by request ID. A subtask request cannot replace a prompt from the main agent or another subtask. Allow once resolves only the selected request. Terminals reporting key releases rearm on release. Older terminals may show `Tab, then retry` when the same key would cross into another decision.
+
+When policy changes, each pending request rechecks its own current policy and refreshes partial coverage. Separate grants for A and B can cumulatively settle a request needing both. Automatic settlement requires complete coverage under the current deny, ask, lifetime, and workspace restrictions. Policy is checked again before execution, so stale displayed coverage cannot authorize a call. Conversation, project, and global lifetimes limit which waiting requests can share approval.
 
 ## Per-command scopes
 
-A shell call often runs several commands at once. Each reviewed command gets its own row in the prompt, above a separate `Or grant broadly instead` section holding the blanket authorities. A row starts on `this command`, which remembers that exact command in that workdir, and widens to a token-bound pattern such as `git status *`. Narrowing past the start reaches `this call only`, which remembers nothing for that command. Rows already covered start there, so answering without moving remembers only what was undecided.
+A shell call can contain several commands. The scope editor gives each reviewed command its own row. A row starts on `this command`, which remembers that exact command in its reviewed workdir. Wider choices can include a suggested argument pattern or a token prefix such as `git status *`. Narrowing past the start reaches `this call only`, which remembers nothing for that command. Already covered rows start there and remain collapsed until expanded with `c`.
 
-The `Commands` heading counts the rows still waiting, such as `2 of 5 need approval`. The call is atomic, so those rows are the whole decision.
+The main prompt counts unresolved rows, such as `Needs approval: 2 of 5 commands`. Every command needs authorization before the whole call is submitted. Shell effects are not transactional and are not rolled back if a later command fails.
 
-A pattern is offered whenever it would match the command, including commands whose operands the shell expands. `ls src/ src/*/` offers `ls *` and `wc -l a.rs b/*.rs` offers `wc *`, because the pattern only pins leading literals. Commands using command substitution get no pattern, because the reviewed text is not what would run.
+With the scope control focused, `Left` and `Right` walk the selected row. Both ends clamp rather than wrap. Unsupported shell expressions remain subject to [exact-call review](#shell-parsing).
 
-`Left` and `Right` walk the selected row. `<` and `>` walk every row one step at a time, so the usual answer stays two keystrokes however many commands were batched. Both ends of a row clamp rather than wrap.
+The scope you pick controls what Caudra remembers, never which commands are submitted. `this call only` means run now without remembering, not skip the command. Shell operators still determine execution order and conditional execution. Confirming reusable scopes stores separate rules, so `/permissions` lists commands separately and revoking one leaves the others in place. The lifetimes offered are the ones every granted row allows.
 
-The scope you pick controls what Caudra remembers, never what runs. A shell call is atomic, so answering the prompt runs every command in it. Rows left on `this call only` are kept out of the stored rules. Confirming with `s`, `a`, or `A` writes one rule per row that chose a reusable scope, so `/permissions` lists each command separately and revoking one leaves the others in place. The lifetimes offered are the ones every granted row allows.
+When one selected row covers another, the prompt identifies the covering row and scope without adding a duplicate rule. Narrowing the covering row restores the other row's choice. Displayed coverage from existing policy does not discard an explicitly selected grant. It is presentation information, not authorization.
 
-A row that adds nothing files nothing:
+Composed grants are validated together and stored atomically. A failed write leaves no partial grant set. Conversation grants are also added together after validation.
 
-- When one row already covers another, the covered row reads `covered by \`rg *\`` and contributes no rule. A pipeline running `rg` twice writes one `rg *` rather than two. Narrowing the covering row hands the other row its own choice straight back. The covered row stays selectable, because `Enter` can still reach a wider pattern than the one covering it.
-- A row whose existing coverage is at least as durable as the scope you are granting files nothing. Answering `a` on a row only a conversation rule covers still files, or the authority would disappear with the session. The builtin allowlist never counts as coverage here, because it is a default that a configured ask or deny overrides. Widening a covered row still files, since a wider pattern reaches commands this prompt is not about.
+### Argument pattern inspector
 
-Rows replace the whole-request `This command in this workdir` and command-pattern choices, because a row on its narrowest reusable rung reproduces the first and a row at its widest reproduces the second.
+When a row has a suggested pattern, press `i` in the scope editor. The inspector shows fixed command words, variable argument positions, working directory, evidence, and a current-call match preview. Patterns match parsed static arguments. They never interpolate captured values into command text.
+
+Use `Tab` to focus controls, then arrows to select a slot or mode. The mode shortcuts are:
+
+| Key | Mode | Coverage |
+|---|---|---|
+| `1` | Values | Selected observed literal values |
+| `2` | Exact | One exact literal value |
+| `3` | Glob | One entire argument matched by a glob |
+| `4` | Regex | One entire argument matched by a regular expression |
+| `5` | Any | Any one literal argument, subject to the fixed option guard |
+
+`e` edits a constraint, `o` shows observed values, and `c` switches between observed tuples and independent combinations when available. `N` edits the pattern name and `n` edits a slot label. Names are display labels and do not change matching or rule identity. The executable, fixed arguments, argument count, and slot positions stay fixed.
+
+For example, `cargo check -p <pattern1>` can restrict its variable argument to the observed values `caudra-agent` and `caudra-ui`. It does not cover another executable, another subcommand, or extra arguments. Option-looking values remain rejected unless the host has proved the position is data. Choosing Any does not remove that guard.
+
+Slots with an unknown role can include arguments after fixed flags. That position does not prove the argument is data or establish the flag's arity. These values can select program operations, so the inspector and approval review caution against widening them.
+
+Suggestions start with observed literal values and observed tuples, without wildcards. Tuples preserve combinations. If two slots were seen as `(alpha, json)` and `(beta, text)`, they allow only those pairs. Independent combinations also allow `(alpha, text)` and `(beta, json)`. Widening one slot to Glob, Regex, or Any still leaves the tuple restriction in force until you explicitly choose independence.
+
+Glob matching is case-sensitive over UTF-8 bytes. `?` matches one byte, `*` excludes a literal `/`, and `**` can cross `/` in globset's recursive forms. Backslash escapes metacharacters, and braces and character classes use globset syntax. For example, `src/*.rs` matches `src/main.rs` but not `src/nested/mod.rs`, while `src/**/*.rs` can match both. These patterns match one complete argument without shell or filesystem expansion. The inspector displays these semantics beside the preview.
+
+Regex uses Rust's finite-automata regular-expression engine, with whole-argument matching. Regular constructs such as alternation, groups, and repetition work. PCRE look-around and backreferences do not. Expressions, nesting, compiled size, input, and retained evidence are bounded. Invalid or oversized expressions show a compile error and cannot be used.
+
+`p` uses a valid scope and returns to the main prompt without granting it. A known current-call mismatch must be fixed or approved once instead. Policy rechecks the complete call on approval. Glob, Regex, Any, and independent multi-slot combinations require extra review. A remembered pattern is explicit execution authority, even for an unfamiliar CLI. It never makes that command read-only or sandboxed.
 
 ### Writing your own pattern
 
-`Enter` opens an editor on the selected command row. A pattern must end in `*`, hold at least one literal token before it, use at most eight tokens, and match the command on that row. Caudra refuses anything else and names the reason.
+For a token prefix instead of an argument pattern, press `e` on a command row in the scope editor. A prefix must end in `*`, hold at least one literal token before it, use at most eight tokens, and match the command on that row. Caudra refuses anything else and names the reason. This editor validates text without running it.
 
 Two patterns are accepted with a caution:
 
@@ -109,21 +150,64 @@ Two patterns are accepted with a caution:
 
 Grading is structural. It checks the shape of the pattern and that it matches the command, and it cannot know what a program does with its arguments. `sed -n *` grades clean, yet GNU `sed` can run shell commands through the `e` escape. Write patterns for programs whose arguments you understand.
 
+## Suggested patterns
+
+Caudra learns permission suggestions from tool use. Suggestions are never automatic grants or the default future scope. Live recognition needs at least three eligible command observations and can propose a pattern within one session. A compound request can supply several observations. Counts do not establish successful execution.
+
+Suggestions come only from eligible live observations or imported session history. A command without enough evidence has no suggested argument template. The executable, workdir, and argument structure stay bound, and every template requires explicit approval.
+
+Recognition compares individual commands with fixed argument structure and observed literal values. It can handle unfamiliar CLI names without a read-only executable allowlist. Payload and sensitivity guards still exclude interpreted code, unsafe expressions, and suspicious literals. It does not learn whole command sequences or generate scripts. Basic chains and pipelines are analyzed per command only where control flow and working-directory context can be established.
+
+The local TUI loads bounded historical proposals in the background at startup, for the current tab, and after `/cd`. Loading is cached per canonical project and cancellable, and stale results are discarded. Remote and ephemeral sessions do not run history discovery. Approval and Suggested inspectors label imported history as unverified, with unknown outcomes and historical execution context. Analysis assumes standard Bash startup and uses the session's current stored cwd as an approximation. Loading these proposals does not make them verified live evidence.
+
+Open `/permissions discover` for the Discover tab. The Rules tab contains stored grants and policy; Discover lists only proposals, which are not active permissions. Click either tab or press `Ctrl-G` to switch. Opening Discover does not force a new scan.
+
+| Key | Discovery action |
+|---|---|
+| `Ctrl-G` | Switch between Rules and Discover |
+| `Ctrl-O` | Show the discovery overview and scan diagnostics |
+| `Ctrl-R` | Scan or refresh, bypassing an older cached result. An active scan is not restarted |
+| `Ctrl-X` | Cancel the current scan request |
+
+The overview reports `Not scanned`, `Loading`, `Ready`, `Partial`, `Unavailable`, or `Cancelled`. Completed scans show sample counts and limits. `Partial` lists cutoffs and exclusions, including per-parent row limits, omitted command scopes, and source obligations. `Unavailable` gives the reason discovery cannot run. Cancellation discards late results for that request and leaves active permissions unchanged. Press `Ctrl-R` to retry.
+
+Imported proposals need at least two observations from two independent parent sessions. Repeated commands in one session are insufficient. An empty list can also reflect unsupported or sensitive commands, sample limits, or dismissed and snoozed definitions.
+
+In Discover, select a proposal to read its command shape, constraints, evidence, and examples in the detail pane. With the list focused, `Enter` opens a read-only inspector. Its details wrap to the available width. Use `Up` / `Down`, `PageUp` / `PageDown`, or the mouse wheel to scroll the inspector. A suggestion can be approved only from a matching live permission prompt.
+
+`Ctrl-D` dismisses the selected definition for the project, and `Ctrl-S` snoozes it for 24 hours. These preferences persist as bounded project and definition digests and leave active rules unchanged. Renaming a display label does not change the definition's identity.
+
+Use [`caudra permissions discover`](/docs/cli/#discovering-patterns-from-history) for an explicit read-only scan and its limits. Neither background discovery nor the CLI executes historical commands.
+
 ## Plan mode
 
 While plan mode is active, Caudra withholds the authority that would outlive the plan. Remembered project and global rules do not apply, allows from `permissions.toml` do not apply, and the prompt offers only the once and conversation lifetimes. Deny and ask rules still apply, because they only restrict access.
 
-A conversation grant made while planning does apply for the rest of the plan. Approving broad shell authority once therefore lets the agent keep exploring with scripts and searches instead of asking about each command. The grant stays with the conversation after you leave plan mode.
+A conversation grant made while planning does apply for the rest of the plan. Approving broad shell authority for the conversation lets the agent keep exploring with scripts and searches instead of asking about each command. The grant stays with the conversation after you leave plan mode. Allow once covers only the current call.
 
 ## Stored rules
 
-Use `/permissions` to inspect and revoke active conversation, project, and global rules. The picker distinguishes exact, selected-input, filesystem subtree, URL subtree, URL origin, and unrestricted authority. It also shows active legacy denies and builtin, configured, or trusted-plugin policy. Read-only policy must be changed at its source.
+Use `/permissions` to inspect and revoke active conversation, project, and global rules. The picker shows human-readable review descriptions for the selected rule, with named inputs, resource scopes, and authority constraints. It distinguishes exact, selected-input, filesystem subtree, URL subtree, URL origin, and unrestricted authority without displaying hashes by default. Missing descriptions are marked unavailable. It also shows active legacy denies and builtin, configured, or trusted-plugin policy. Read-only policy must be changed at its source.
 
-Project and global prompt decisions are stored in the `permission.rules` row of Caudra's owner-only SQLite state database. Exact input and resource values are stored as SHA-256 digests. Host-derived command patterns are stored as clear-text policy, such as `git diff *`. Review metadata keeps only anonymous field positions and value types. Selected-input authorities store their JSON pointers and a digest, but never the selected values.
+The list and selected detail occupy separate panes, so long descriptions do not resize the list. Wide terminals show them side by side, narrow terminals stack them, and small terminals show the focused pane. `Tab` / `Shift-Tab` switches focus. `Up` / `Down` and `PageUp` / `PageDown` act on the focused pane. The mouse wheel scrolls the pane under the pointer.
+
+Project and global prompt decisions are stored in the `permission.rules` row of Caudra's owner-only SQLite state database. Authorization uses SHA-256 digests for exact input and resource constraints. Selected-input authorities use JSON pointers and a digest. Host-derived command patterns are clear-text policy, such as `git diff *`.
+
+Argument patterns and names-only browse grants use new durable selector or capability tags. Older binaries cannot open permission state containing those grants. There is no backward-compatibility layer. Update every Caudra process sharing the database before using these scopes, including sessions in other projects.
+
+Separate typed review metadata stores meaningful sanitized paths, command patterns, and recognized first-party input names and values. Likely secrets are redacted, bulk content and unrecognized fields are omitted, and descriptions are bounded. These descriptions can contain private project information even after sanitization. The database is owner-only, not encrypted. Review provenance is approved, recovered, or unavailable. Review metadata never grants authority or relaxes a stored constraint. Displayed omitted fields remain constrained for exact-input rules.
 
 Conversation rules are stored with the session. A persistent write must finish before Caudra executes the approved call. If storage fails, the durable approval fails and the prompt remains open in the TUI.
 
+Older review metadata requires the explicit [`caudra permissions repair-review`](/docs/cli/#repairing-review-descriptions) command. Its default is a dry run. Applying it repairs descriptions across persistent rules and stored conversations, takes a SQLite backup, and leaves authorization unchanged. Unverified historical values stay unavailable. Use `--retry-unavailable` to retry unavailable or incomplete recovered reviews while preserving approved reviews and existing verified labels.
+
+Use `--database` to select an existing canonical absolute `caudra.sqlite` path, and check the database path in the report before applying. Development binaries default to the separate `caudra-debug` namespace. The [CLI reference](/docs/cli/#caudra-permissions) shows how to target the production database explicitly.
+
 Ephemeral runs still read and write project and global permission decisions in the persistent state database. Conversation rules stay with the temporary session and disappear with it.
+
+For rules bound to another project or a renamed directory, use the read-only [CLI inventory and reviewed rebind](/docs/cli/#caudra-permissions). Authorization never follows an old stored project's current symlink to transfer authority. Rebinding is fresh authorization for the destination. Unknown hashes need verified candidates, and unsupported input constraints need fresh grants. Related deny or ask rules can block a transfer and remain active at the source when copied. Project-config trust and YOLO are never transferred.
+
+Use [`caudra permissions audit`](/docs/cli/#caudra-permissions) for a bounded, read-only summary of logged prompts, decisions, and paired waits. Counts measure events, not unique requests or a prompt rate. Wait summaries exclude duplicate or colliding pairing keys. The CLI reference lists sampling limits and timestamp filtering.
 
 ## TOML policy
 
@@ -169,7 +253,7 @@ deny = ["admin_delete"]
 
 Shell allow and ask patterns use literal tokens followed by an optional bare `*` token. The wildcard matches zero or more complete arguments. It must be separated by a space, so `git status *` is valid and `git status*` is rejected. `allow = true` is the all-command `*` pattern for native shell tools. Patterns contain at most eight tokens and 256 bytes. Literal tokens may contain ASCII letters, digits, `.`, `_`, `/`, `@`, `:`, `=`, `+`, and `-`.
 
-Command patterns never authorize a redirect that names a file. Writing to a file, reading from a file, and heredocs all produce a protected request carrying the complete original command. File descriptor duplication such as `2>&1` names no file and stays an ordinary reviewable command. Path-qualified executables remain path-qualified, so `git status *` does not authorize `/tmp/git status`.
+Token prefix patterns do not authorize redirects to ordinary files or heredocs. These produce a protected request carrying the complete original command. Literal `/dev/null` redirects and file descriptor duplication such as `2>&1` can remain reviewable when their effects are understood. Argument patterns exclude all redirects. Path-qualified executables remain path-qualified, so `git status *` does not authorize `/tmp/git status`.
 
 No configured allow reaches a protected command, whatever its pattern. A protected command that no deny names is left uncovered and prompts, so the reviewed text reaches you rather than a rule written against a shape it does not have.
 
@@ -191,7 +275,9 @@ A configured scope matches glob-like, whatever its effect:
 | `dir/**` | The directory and descendants, using path components |
 | Other | Exact text |
 
-New remembered decisions use structured matching. Shell command authorities use the strict token pattern grammar above.
+New remembered decisions use structured matching. Prefix authorities use the strict token grammar above. Argument patterns use the separate inspector constraints and are not TOML shell patterns.
+
+Configured filesystem exact and subtree scopes expand only a leading `~` or `~/` on the rule side. Relative paths resolve against the explicit permission project base, then normalize with existing symlinks. Embedded `~` and `~user` stay literal. Generic raw-prefix scopes such as `prefix*` keep their text-prefix semantics. Tool arguments and shell text are unchanged. If a required home directory or path cannot be resolved, policy fails closed.
 
 ## Typed resources
 
@@ -208,6 +294,23 @@ File-write tools remain pre-allowed inside the project working directory. Read-o
 
 Every registered model tool reaches the permission manager. A tool without declared scopes receives its canonical validated input as an exact fallback scope. The `batch` container routes inner calls through the same manager. Native `python_execution` is isolated and has no inner tool calls.
 
+### Directory browsing and content reads
+
+Names-only browsing has its own `FilesystemBrowse` authority:
+
+| Tool request | Access |
+|---|---|
+| `file_read` on a directory | `List`, direct entries in that directory |
+| `file_glob` | Recursive filename enumeration under its root |
+| `file_read` on a file | File content read, outside the browse family |
+| `file_grep`, `file_index`, code-graph tools | Content search or analysis, outside the browse family |
+
+`List names in this directory` covers only the exact directory's direct entries. `Browse names below this directory` explicitly permits recursive filename enumeration, including `file_glob` with other filename patterns. It also covers directory listings below the approved root. Neither choice permits reading file contents, content search, writes, or shell execution. Protected paths and symlink boundaries remain checked.
+
+Directory `file_read` requests bind the canonical target and directory kind during preparation. Execution uses the prepared directory-listing operation and refuses a later file/directory kind change. A listing approval cannot become a content read through that race.
+
+The broader `These directories and descendants` option uses `FilesystemRead`, covering reading, listing, and searching across the trusted native read family. It requires explicit selection and excludes writes and shell execution. Choosing Project binds it to the current project even if the directory lies outside it. A sibling checkout does not receive a directory grant by default.
+
 ## MCP tool calls
 
 Generic MCP tools use the complete canonical JSON input as their exact authority.
@@ -220,21 +323,27 @@ The TUI can select broad whole-tool MCP authority for the current conversation. 
 
 ## Shell parsing
 
-Bash scopes include the normalized initial working directory. Tree-sitter walks control flow, loops, and functions so each command in `&&`, `||`, `;`, and pipeline expressions is authorized independently. Analysis drops redirect operands from the reviewed text, so a command that redirects to or from a file keeps the complete original command as its protected authority.
+Bash analysis starts from the normalized initial working directory and tracks the possible directory at each command. Basic `&&`, `||`, `;`, and pipeline expressions can receive per-command scopes when control flow and context are proven. Reusable argument patterns require one known effective workdir. Unknown or ambiguous context falls back to manual exact-call review instead of assuming a directory or learning a sequence template.
 
 The parser preserves executable directory prefixes for allow matching. `/usr/bin/git status --short` therefore does not inherit `git status *` authority. Deny and ask rules also check the normalized executable name, so `rm *` still restricts `/bin/rm`. Quotes keep argument boundaries, and a wildcard consumes complete arguments rather than arbitrary text.
 
-A shell prompt offers a reusable pattern derived from the reviewed command. A curated table names the families whose first operand is data rather than a subcommand, so `rg needle src/` offers `rg *` and keeps the search term out of the rule. The table also names the families whose subcommand sits behind a namespace token, so `npm run build` offers `npm run build *`. Outside the table the leading lowercase words become the prefix, so `git commit -m "message"` offers `git commit *`.
+A shell prompt can offer a token prefix derived from the reviewed command. A curated table names the families whose first operand is data rather than a subcommand, so `rg needle src/` offers `rg *` and keeps the search term out of the rule. The table also names the families whose subcommand sits behind a namespace token, so `npm run build` offers `npm run build *`. Outside the table the leading lowercase words become the prefix, so `git commit -m "message"` offers `git commit *`. This prefix heuristic is separate from generic argument-pattern recognition.
 
-A prefix never reaches past a flag, so `docker -H tcp://host run nginx` offers no pattern. A prefix taken from outside the table must name more than the executable and must leave at least one operand behind, which is why `git status` offers no pattern. Caudra also offers no pattern that shares a prefix with a default ask family, because storing `git checkout main *` would silence the `git checkout *` ask.
+A derived prefix never reaches past a flag, so `docker -H tcp://host run nginx` offers no prefix. A prefix taken from outside the table must name more than the executable and must leave at least one operand behind, which is why `git status` offers no prefix. Caudra also avoids deriving prefixes that overlap a default ask family, because storing `git checkout main *` would silence the `git checkout *` ask.
 
-Command substitution, process substitution, subshells, arithmetic expansion, wrappers such as `eval` and `sudo`, file redirects, heredocs, and parse failures all mark the command protected. A protected command is reviewed as one whole command line.
+Dynamic arguments, command or process substitution, unsupported control flow, wrappers such as `eval` and `sudo`, ordinary file redirects, heredocs, and parse failures require protected whole-call review. Interpreted payloads and sensitivity guards also prevent argument-pattern suggestions. Successful parsing alone does not establish reusable authority.
 
 Configured allows, scope allows, and command patterns never cover a protected command. The two unrestricted shell authorities do, because they already authorize any command the user can write, including `tee` and an interpreter reading a script from standard input. Selecting one requires the `ALLOW BROAD SHELL ACCESS` phrase. Deny rules still apply. Builtin command-family asks do not reach protected commands, so a broad grant also silences those asks for them.
 
 Caudra executes the reviewed command text unchanged. Workcell may reduce completed shell output before the model receives it. The TUI shows raw output while the command runs, then switches to a labelled filtered view that the user can toggle back to raw.
 
+On Unix, Workcell launches a host-bound absolute Bash executable with `--noprofile --norc -c`. It does not implicitly load login files or shell startup hooks. The existing environment allowlist still forwards `PATH`, proxy settings, and selected basic variables. This startup contract does not isolate the commands or their own configuration. See [Shell host configuration](/docs/cli/#shell-host-configuration) for executable selection.
+
 The initial working directory is context, not confinement. An approved shell command can still access files, the network, and inherited environment variables.
+
+The builtin read-only classifier is conservative about mutation flags, executable paths, expansions, and named file operands. For example, `git branch -D`, tag creation, and reflog expiration do not receive read-only authority. A path-qualified executable such as `./cat` does not inherit the builtin reader allowance, and an explicitly named protected operand such as `.env` requires review. These checks do not guarantee containment of recursive reads, program configuration, or repository code. Build and test commands are not read-only exemptions.
+
+`execution_environment` still requires explicit approval under normal prompting policy. Its fixed probes can invoke sudo policy hooks or refresh credentials. A remembered exact grant can avoid repeated prompts without treating the tool as a pure read.
 
 ## Plugin rules
 

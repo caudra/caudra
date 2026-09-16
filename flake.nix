@@ -91,8 +91,8 @@
           "sha256-P4PgqfYykkZrWGg5G3WQo070lORLEhmXQUQPx3+Yslo=";
         "git+https://github.com/crossterm-rs/crossterm?rev=3ca54292d2b1f1c58e200a06122ddaf5dd6b5c77#3ca54292d2b1f1c58e200a06122ddaf5dd6b5c77" =
           "sha256-A5lgiEEi7mktf7m2GljdAxst7Fdl7Uqko29Xq6o90Ow=";
-        "git+https://github.com/tensorninja/workcell-mcp?rev=7e9d2a6fcb9ee46fd5e4c967068e336eeff060b0#7e9d2a6fcb9ee46fd5e4c967068e336eeff060b0" =
-          "sha256-/bZNeHv3ofDMNMbxNlQhVIWv3SECBuPFeURI2mSGYtE=";
+        "git+https://github.com/tensorninja/workcell-mcp?rev=f40392adf109c7ca12de1d7143a5df8f85bbb28e#f40392adf109c7ca12de1d7143a5df8f85bbb28e" =
+          "sha256-g+7gGm75cBv79A8mg29S7pFQ3KSRpBDx6K2b0IeVpxg=";
       };
 
       missingGitDepHashes = builtins.filter (s: !(builtins.hasAttr s gitDepHashes)) gitDepSources;
@@ -171,6 +171,7 @@
               stdenv.cc.cc.lib
             ];
             inherit cargoVendorDir;
+            WORKCELL_BASH_EXECUTABLE = "${pkgs.bash}/bin/bash";
             WORKCELL_BUNDLED_MONTY_WORKER = "${montyWorker}/bin/monty";
           };
 
