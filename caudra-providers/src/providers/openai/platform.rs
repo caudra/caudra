@@ -13,7 +13,7 @@ use crate::model::{Billing, Model, ModelInfo};
 use crate::provider::{BoxFuture, Provider};
 use crate::{
     AgentError, CacheKey, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse,
-    UsageLimit,
+    ThinkingConfig, UsageLimit,
 };
 
 use super::auth;
@@ -44,6 +44,9 @@ pub(crate) const PLAN_MODELS: &[&str] = &[
     "gpt-5.2",
 ];
 
+/// Families that accept an explicit `prompt_cache_breakpoint`; earlier models
+/// are implicit-only and reject the field.
+const EXPLICIT_CACHE_FAMILIES: &[&str] = &["gpt-5.6-", "gpt-6-"];
 const CODEX_PLAN_CONTEXT_WINDOW: u32 = 272_000;
 /// Plan window for the long-context families, gpt-5.6 and gpt-astra. Neither is
 /// published; `adjust_model` clamps to the smaller of this and the model's own
@@ -73,6 +76,12 @@ struct AuthState {
 
 fn is_codex_model(model_id: &str) -> bool {
     coding_plan_context_window(model_id).is_some()
+}
+
+fn supports_explicit_cache(model_id: &str) -> bool {
+    EXPLICIT_CACHE_FAMILIES
+        .iter()
+        .any(|family| model_id.starts_with(family))
 }
 
 // Codex models match by substring so future releases route without a registry
@@ -417,6 +426,29 @@ impl OpenAi {
     }
 }
 
+impl OpenAi {
+    /// The Codex backend a login talks to answers `prompt_cache_breakpoint`
+    /// with `not supported on this model` for every 5.6 model, so only the
+    /// metered API gets the breakpoint.
+    fn responses_body(
+        &self,
+        model: &Model,
+        messages: &[Message],
+        system: &str,
+        tools: &Value,
+        thinking: &ThinkingConfig,
+        cache_key: Option<&CacheKey>,
+    ) -> Value {
+        let mut body = super::responses::build_body(model, messages, system, tools);
+        if supports_explicit_cache(&model.id) && !self.is_oauth() {
+            super::responses::apply_system_breakpoint(&mut body);
+        }
+        super::responses::apply_responses_reasoning(&mut body, thinking, model);
+        apply_prompt_cache_key(&mut body, cache_key);
+        body
+    }
+}
+
 /// Only the Codex backend reads the affinity header; an API-key request to
 /// the platform carries the body field alone.
 fn with_codex_affinity(mut auth: ResolvedAuth, cache_key: Option<&CacheKey>) -> ResolvedAuth {
@@ -523,9 +555,8 @@ impl Provider for OpenAi {
             let system = super::super::with_prefix(&self.system_prefix, system, &mut buf);
 
             if is_codex_model(&model.id) {
-                let mut body = super::responses::build_body(model, messages, system, tools);
-                super::responses::apply_responses_reasoning(&mut body, &opts.thinking, model);
-                apply_prompt_cache_key(&mut body, cache_key);
+                let body =
+                    self.responses_body(model, messages, system, tools, &opts.thinking, cache_key);
                 let stream_timeout = self.compat.stream_timeout();
                 return self
                     .with_oauth_stream_retry(true, event_tx, |codex_auth, attempt_tx| {
@@ -671,13 +702,13 @@ mod tests {
 
     use super::super::responses;
     use super::*;
-    use crate::ThinkingConfig;
 
     const TEST_ACCESS: &str = "test-access";
     const TEST_REFRESH: &str = "test-refresh";
     const TEST_AUTH_STATUS: u16 = 401;
     const TEST_AUTH_ERROR: &str = "expired";
     const CACHE_KEY: &str = "session/task";
+    const SYSTEM_PROMPT: &str = "You are a careful engineer.";
     const MISSING_PLAN_MODEL: &str =
         "a model named in PLAN_MODELS must reach the coding-plan listing";
     const UNENTITLED_PLAN_MODEL: &str =
@@ -731,6 +762,52 @@ mod tests {
     #[test_case("gpt-5.6-sol")]
     fn named_plan_models_use_coding_plan(model_id: &str) {
         assert!(is_codex_model(model_id));
+    }
+
+    #[test_case("gpt-6-astra", true)]
+    #[test_case("gpt-5.6-luna", true)]
+    #[test_case("gpt-5.6-sol", true)]
+    #[test_case("gpt-5.5", false ; "gpt_5_5_is_implicit_only")]
+    #[test_case("gpt-5.3-codex", false ; "codex_before_5_6_is_implicit_only")]
+    #[test_case("gpt-5.4-nano", false)]
+    fn explicit_cache_breakpoints_are_sent_to_gpt_5_6_and_later(model_id: &str, expected: bool) {
+        assert_eq!(supports_explicit_cache(model_id), expected);
+    }
+
+    /// Verified live: the Codex backend 400s on the field for every 5.6 model,
+    /// so a login keeps `instructions` while an API key gets the marked
+    /// developer message.
+    #[test_case("openai/gpt-5.6-sol", false, true ; "api_key_marks_a_5_6_model")]
+    #[test_case("openai/gpt-5.6-sol", true, false ; "login_keeps_instructions_on_a_5_6_model")]
+    #[test_case("openai/gpt-5.5", false, false ; "api_key_keeps_instructions_before_5_6")]
+    fn responses_body_marks_the_system_prompt_only_for_the_metered_api(
+        spec: &str,
+        oauth: bool,
+        marked: bool,
+    ) {
+        let provider = OpenAi::with_auth(
+            Arc::new(Mutex::new(ResolvedAuth::bearer(TEST_ACCESS))),
+            crate::providers::Timeouts::default(),
+        );
+        if oauth {
+            provider.auth_state.lock().unwrap().oauth_tokens = Some(oauth_tokens());
+        }
+        let model = Model::from_spec(spec).unwrap();
+
+        let body = provider.responses_body(
+            &model,
+            &[],
+            SYSTEM_PROMPT,
+            &Value::Null,
+            &ThinkingConfig::Off,
+            None,
+        );
+
+        assert_eq!(body.get(responses::INSTRUCTIONS_FIELD).is_none(), marked);
+        assert_eq!(
+            body["input"][0]["content"][0][responses::CACHE_BREAKPOINT_FIELD].is_object(),
+            marked
+        );
     }
 
     #[test_case("gpt-6-astra", Some(372_000))]

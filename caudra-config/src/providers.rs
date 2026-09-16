@@ -242,6 +242,10 @@ pub struct ModelFields {
     pub requires_thinking: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_vision: Option<bool>,
+    /// The endpoint honours OpenAI's explicit `prompt_cache_breakpoint` on a
+    /// Responses input block, so the system prompt closes with one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_cache_breakpoints: Option<bool>,
     /// Reasoning controls this model accepts, in the models.dev shape. Declared
     /// here for a model no catalog describes, so a level it never advertised is
     /// snapped into this list instead of being sent.
@@ -284,6 +288,9 @@ impl ModelFields {
             supports_thinking: self.supports_thinking.or(base.supports_thinking),
             requires_thinking: self.requires_thinking.or(base.requires_thinking),
             supports_vision: self.supports_vision.or(base.supports_vision),
+            supports_cache_breakpoints: self
+                .supports_cache_breakpoints
+                .or(base.supports_cache_breakpoints),
             reasoning_options: self
                 .reasoning_options
                 .or_else(|| base.reasoning_options.clone()),
@@ -693,6 +700,7 @@ best = "qwen3.8-27b-lora"
 [local.model_defaults]
 context_window = 229376
 max_output_tokens = 32768
+supports_cache_breakpoints = true
 reasoning_options = []
 
 [[local.models]]
@@ -712,6 +720,7 @@ context_window = 8192
 
         assert_eq!(settings.context_window, window, "{ABSENT_MEANS_INHERIT}");
         assert_eq!(settings.max_output_tokens, Some(32_768));
+        assert_eq!(settings.supports_cache_breakpoints, Some(true));
     }
 
     #[test_case(ModelPurpose::Fast, "small" ; "list_prefers_its_first_entry")]

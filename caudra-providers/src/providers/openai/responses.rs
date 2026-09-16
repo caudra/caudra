@@ -19,12 +19,46 @@ use crate::{
 const RESPONSES_PATH: &str = "/responses";
 pub(crate) const ENCRYPTED_REASONING: &str = "reasoning.encrypted_content";
 pub(crate) const PROMPT_CACHE_KEY_FIELD: &str = "prompt_cache_key";
+pub(crate) const CACHE_BREAKPOINT_FIELD: &str = "prompt_cache_breakpoint";
+pub(crate) const INSTRUCTIONS_FIELD: &str = "instructions";
+pub(crate) const DEVELOPER_ROLE: &str = "developer";
+const EXPLICIT_BREAKPOINT_MODE: &str = "explicit";
 
 /// Routes the request to the cache holding this conversation. The field is
 /// part of OpenAI's Responses and Chat Completions APIs alike.
 pub(crate) fn apply_prompt_cache_key(body: &mut Value, cache_key: Option<&CacheKey>) {
     if let Some(cache_key) = cache_key {
         body[PROMPT_CACHE_KEY_FIELD] = json!(cache_key.as_str());
+    }
+}
+
+/// Closes the system prompt with an explicit cache breakpoint. Implicit caching
+/// writes through the latest message, so a conversation that shares system and
+/// tools but opens with a different user turn (a new session, a subagent)
+/// would miss the whole prefix. Top-level `instructions` cannot carry the mark,
+/// so the prompt moves into a developer message. GPT-5.6 and later only:
+/// earlier models reject the field.
+pub(crate) fn apply_system_breakpoint(body: &mut Value) {
+    if body[INSTRUCTIONS_FIELD].as_str().is_none_or(str::is_empty) {
+        return;
+    }
+    let Some(system) = body
+        .as_object_mut()
+        .and_then(|body| body.remove(INSTRUCTIONS_FIELD))
+    else {
+        return;
+    };
+    let developer = json!({
+        "type": "message",
+        "role": DEVELOPER_ROLE,
+        "content": [{
+            "type": "input_text",
+            "text": system,
+            CACHE_BREAKPOINT_FIELD: { "mode": EXPLICIT_BREAKPOINT_MODE },
+        }],
+    });
+    if let Some(input) = body["input"].as_array_mut() {
+        input.insert(0, developer);
     }
 }
 
@@ -39,7 +73,7 @@ pub(crate) fn build_body(
 
     let mut body = json!({
         "model": model.id,
-        "instructions": system,
+        INSTRUCTIONS_FIELD: system,
         "input": input,
         "include": [ENCRYPTED_REASONING],
         "stream": true,
@@ -781,15 +815,15 @@ fn parse_usage(u: &Value) -> TokenUsage {
     let input_tokens = u["input_tokens"].as_u64().unwrap_or(0) as u32;
     let output_tokens = u["output_tokens"].as_u64().unwrap_or(0) as u32;
 
-    let cached = u["input_tokens_details"]["cached_tokens"]
-        .as_u64()
-        .unwrap_or(0) as u32;
+    let details = &u["input_tokens_details"];
+    let cached = details["cached_tokens"].as_u64().unwrap_or(0) as u32;
+    let written = details["cache_write_tokens"].as_u64().unwrap_or(0) as u32;
 
     TokenUsage {
-        input: input_tokens.saturating_sub(cached),
+        input: input_tokens.saturating_sub(cached).saturating_sub(written),
         output: output_tokens,
         cache_read: cached,
-        cache_creation: 0,
+        cache_creation: written,
     }
 }
 
@@ -808,6 +842,8 @@ mod tests {
     const STEERING_TEXT: &str = "Continue with a useful response.";
     const STEERING_RULE: &str = "empty_output";
     const CACHE_KEY: &str = "session/task";
+    const OPENAI_RESPONSES_SPEC: &str = "openai/gpt-5.6-sol";
+    const SYSTEM_PROMPT: &str = "You are a careful engineer.";
     const INVALID_CALL_ID: &str = "original-invalid-call";
     const VALID_CALL_ID: &str = "original-valid-call";
     const TOOL_NAME: &str = "read";
@@ -1163,6 +1199,64 @@ data: {\"response\":{\"status\":\"incomplete\",\"usage\":{\"input_tokens\":10,\"
 
         assert_eq!(keyed[PROMPT_CACHE_KEY_FIELD], CACHE_KEY);
         assert!(unkeyed.get(PROMPT_CACHE_KEY_FIELD).is_none());
+    }
+
+    /// `instructions` cannot carry a breakpoint, so the system prompt becomes
+    /// the first input item and closes with one; the conversation follows.
+    #[test]
+    fn system_breakpoint_moves_instructions_into_a_marked_developer_message() {
+        let model = Model::from_spec(OPENAI_RESPONSES_SPEC).unwrap();
+        let messages = [Message::user("hello".into())];
+        let mut body = build_body(&model, &messages, SYSTEM_PROMPT, &Value::Null);
+
+        apply_system_breakpoint(&mut body);
+
+        assert!(body.get(INSTRUCTIONS_FIELD).is_none());
+        let developer = &body["input"][0];
+        assert_eq!(developer["type"], "message");
+        assert_eq!(developer["role"], DEVELOPER_ROLE);
+        assert_eq!(developer["content"][0]["type"], "input_text");
+        assert_eq!(developer["content"][0]["text"], SYSTEM_PROMPT);
+        assert_eq!(
+            developer["content"][0][CACHE_BREAKPOINT_FIELD],
+            json!({ "mode": EXPLICIT_BREAKPOINT_MODE })
+        );
+        assert_eq!(body["input"][1]["role"], "user");
+        assert_eq!(body["input"].as_array().unwrap().len(), 2);
+    }
+
+    /// Nothing to mark: an empty prompt keeps the body as built rather than
+    /// sending a developer message with no text.
+    #[test]
+    fn system_breakpoint_leaves_an_empty_prompt_alone() {
+        let model = Model::from_spec(OPENAI_RESPONSES_SPEC).unwrap();
+        let mut body = build_body(&model, &[], "", &Value::Null);
+        let unmarked = body.clone();
+
+        apply_system_breakpoint(&mut body);
+
+        assert_eq!(body, unmarked);
+    }
+
+    #[test_case(json!({"cached_tokens": 40}), 60, 40, 0 ; "reads_only")]
+    #[test_case(json!({"cached_tokens": 40, "cache_write_tokens": 25}), 35, 40, 25 ; "reads_and_writes")]
+    #[test_case(json!({}), 100, 0, 0 ; "no_details")]
+    fn usage_splits_cache_reads_and_writes_out_of_input(
+        details: Value,
+        input: u32,
+        cache_read: u32,
+        cache_creation: u32,
+    ) {
+        let usage = parse_usage(&json!({
+            "input_tokens": 100,
+            "output_tokens": 10,
+            "input_tokens_details": details,
+        }));
+
+        assert_eq!(usage.input, input);
+        assert_eq!(usage.output, 10);
+        assert_eq!(usage.cache_read, cache_read);
+        assert_eq!(usage.cache_creation, cache_creation);
     }
 
     #[test]

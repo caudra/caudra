@@ -1054,6 +1054,7 @@ pub(crate) fn test_model() -> caudra_providers::Model {
         supports_tool_examples_override: None,
         thinking_override: None,
         supports_vision_override: Some(true),
+        supports_cache_breakpoints_override: None,
         pricing: test_pricing(),
         discovered_free: false,
         max_output_tokens: Some(8192),

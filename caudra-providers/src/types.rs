@@ -1805,6 +1805,7 @@ mod tests {
             supports_tool_examples_override: None,
             thinking_override: None,
             supports_vision_override: Some(provider.family().supports_vision()),
+            supports_cache_breakpoints_override: None,
             pricing: crate::model::ModelPricing::default(),
             discovered_free: false,
             max_output_tokens: Some(8192),

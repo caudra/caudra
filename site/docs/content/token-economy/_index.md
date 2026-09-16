@@ -102,6 +102,12 @@ Both scopes of `/usage` score each model and, once two providers served the work
 
 Some providers keep a cache per machine and route a request by a key the client supplies. Caudra sends one per conversation: the session id for the main agent, and `session/task` for a subagent, so siblings never compete for the parent's cache. Title, goal evaluator, and tool-repair requests have their own system prompt and send no key. The key reaches OpenAI (as `prompt_cache_key`, plus the `session-id` header on a ChatGPT login), custom OpenAI-compatible endpoints, xAI, OpenRouter, Mistral, and a Claude login. It is a routing hint only, so a stale key costs a cache miss and never changes output.
 
+Routing finds the right machine. Whether that machine holds a usable prefix is a separate matter. OpenAI writes a cache entry through the latest message of each request, so a conversation that shares the system prompt and tool definitions but opens with a different user turn, which is every new session and every subagent, finds no entry ending where its shared prefix ends. On GPT-5.6 and later Caudra places an explicit cache breakpoint after the system prompt, so that prefix is written once and read by every later conversation in the project. The mark is a field on an input block, and top-level `instructions` cannot carry it, so for these models the system prompt travels as the first developer message instead. A ChatGPT login does not take part: the Codex backend rejects the field, so a login keeps implicit caching, as do earlier models on either path.
+
+Custom endpoints that speak the Responses protocol get the breakpoint when a model declares `supports_cache_breakpoints = true` in `providers.toml`. Leave it unset unless the server documents support, since a strict endpoint rejects the unknown field.
+
+Cache writes on GPT-5.6 and later cost more than plain input, and `/usage` books them as cache creation so the hit column and the cost stay honest.
+
 ## Spend on a subscription
 
 A Claude, ChatGPT, or Copilot login pays a flat monthly fee, so its turns never reach an invoice. Caudra still prices them at the provider's published API rates and files the figure separately, labelled `subscription (not billed)`. That is what the same work would have cost through the API.

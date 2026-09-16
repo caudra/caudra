@@ -360,6 +360,9 @@ pub struct Model {
     /// back to discovery, then the provider manifest.
     pub thinking_override: Option<ThinkingSupport>,
     pub supports_vision_override: Option<bool>,
+    /// Declared by a custom endpoint that honours OpenAI's explicit
+    /// `prompt_cache_breakpoint`; the builtin OpenAI provider decides by family.
+    pub supports_cache_breakpoints_override: Option<bool>,
     pub pricing: ModelPricing,
     /// Discovery reported an explicit all-zero price. Distinct from a zero
     /// `pricing`, which also covers "no price is known".
@@ -485,6 +488,7 @@ impl Model {
             supports_tool_examples_override: None,
             thinking_override: None,
             supports_vision_override: None,
+            supports_cache_breakpoints_override: None,
             pricing,
             discovered_free: discovered_pricing.is_some_and(ModelPricing::is_zero),
             max_output_tokens,
@@ -513,6 +517,7 @@ impl Model {
             supports_tool_examples_override: None,
             thinking_override: ThinkingSupport::from_flags(Some(meta.supports_thinking), false),
             supports_vision_override: Some(meta.supports_vision),
+            supports_cache_breakpoints_override: None,
             pricing: ModelPricing {
                 input: meta.input_price,
                 output: meta.output_price,
@@ -583,6 +588,10 @@ impl Model {
     pub fn supports_tool_examples(&self) -> bool {
         self.supports_tool_examples_override
             .unwrap_or_else(|| self.family.supports_tool_examples())
+    }
+
+    pub fn supports_cache_breakpoints(&self) -> bool {
+        self.supports_cache_breakpoints_override.unwrap_or(false)
     }
 
     /// Which of the two editing contracts this model was trained on, so it is

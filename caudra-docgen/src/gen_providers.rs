@@ -266,6 +266,7 @@ supports_vision = false
 | `supports_thinking` | bool | protocol default | |
 | `requires_thinking` | bool | false | For APIs that reject requests with thinking disabled. Implies `supports_thinking` and raises thinking to minimal effort when off (including compaction) |
 | `supports_vision` | bool | false | Off unless declared. When false, image input and `view_image` are off |
+| `supports_cache_breakpoints` | bool | false | `openai-responses` only. The endpoint honours OpenAI's explicit `prompt_cache_breakpoint`, so the system prompt moves into a developer message that closes with one (see [token economy](/docs/token-economy/)) |
 | `pricing_input` / `pricing_output` | f64 | 0 | USD per 1M tokens |
 | `pricing_cache_write` / `pricing_cache_read` | f64 | 0 | USD per 1M tokens |
 | `pricing_fast_input` / `pricing_fast_output` | f64 | unset | Fast-mode pricing when the provider supports it |

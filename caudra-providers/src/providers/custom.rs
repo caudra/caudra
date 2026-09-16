@@ -198,6 +198,7 @@ fn model_from_def(def: &ProviderDef, kind: ProviderKind, slug: &str, model_id: &
         declared.requires_thinking.unwrap_or(false),
     );
     let supports_vision_override = declared.supports_vision;
+    let supports_cache_breakpoints_override = declared.supports_cache_breakpoints;
     let pricing = Some(&declared)
         .filter(|m| m.has_pricing())
         .map(|m| ModelPricing {
@@ -225,6 +226,7 @@ fn model_from_def(def: &ProviderDef, kind: ProviderKind, slug: &str, model_id: &
         supports_tool_examples_override,
         thinking_override,
         supports_vision_override,
+        supports_cache_breakpoints_override,
         pricing,
         discovered_free: false,
         max_output_tokens,
@@ -259,6 +261,9 @@ fn build_responses_body(
     cache_key: Option<&CacheKey>,
 ) -> Value {
     let mut body = responses::build_body(model, messages, system, tools);
+    if model.supports_cache_breakpoints() {
+        responses::apply_system_breakpoint(&mut body);
+    }
     responses::apply_responses_reasoning(&mut body, thinking, model);
     if let Some(max_output_tokens) = model.max_output_tokens {
         body["max_output_tokens"] = Value::from(max_output_tokens);
@@ -416,6 +421,7 @@ mod tests {
     const ANTHROPIC_KEY_LEAKED: &str =
         "an OpenAI-compatible body must never carry Anthropic's `thinking` key";
     const CACHE_KEY: &str = "session/task";
+    const SYSTEM_PROMPT: &str = "You are a careful engineer.";
 
     fn openai_def(model_id: &str) -> ProviderDef {
         serde_json::from_str(&format!(
@@ -668,5 +674,35 @@ mod tests {
 
         assert_eq!(keyed[responses::PROMPT_CACHE_KEY_FIELD], CACHE_KEY);
         assert!(unkeyed.get(responses::PROMPT_CACHE_KEY_FIELD).is_none());
+    }
+
+    /// The breakpoint is a Responses content-block field the protocol says
+    /// nothing about, so only an endpoint that declares it gets the developer
+    /// message; every other body keeps `instructions`.
+    #[test_case::test_case(r#"{"protocol":"openai-responses","models":[{"id":"m","supports_cache_breakpoints":true}]}"#, true ; "declared_on_the_model")]
+    #[test_case::test_case(r#"{"protocol":"openai-responses","model_defaults":{"supports_cache_breakpoints":true},"models":[{"id":"m"}]}"#, true ; "declared_in_model_defaults")]
+    #[test_case::test_case(r#"{"protocol":"openai-responses","models":[{"id":"m","supports_cache_breakpoints":false}]}"#, false ; "declared_off")]
+    #[test_case::test_case(r#"{"protocol":"openai-responses","models":[{"id":"m"}]}"#, false ; "undeclared_stays_off")]
+    fn custom_responses_body_marks_the_system_prompt_only_when_declared(def: &str, marked: bool) {
+        let def: ProviderDef = serde_json::from_str(def).unwrap();
+        let model = model_from_def(&def, ProviderKind::OpenAi, "cache-breakpoint-test", "m");
+
+        let body = build_responses_body(
+            &model,
+            &[],
+            SYSTEM_PROMPT,
+            &Value::Null,
+            &ThinkingConfig::Off,
+            None,
+        );
+
+        assert_eq!(model.supports_cache_breakpoints(), marked);
+        assert_eq!(body.get(responses::INSTRUCTIONS_FIELD).is_none(), marked);
+        let developer = &body["input"][0];
+        assert_eq!(developer["role"] == responses::DEVELOPER_ROLE, marked);
+        assert_eq!(
+            developer["content"][0][responses::CACHE_BREAKPOINT_FIELD].is_object(),
+            marked
+        );
     }
 }

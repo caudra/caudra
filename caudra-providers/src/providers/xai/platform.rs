@@ -317,6 +317,7 @@ mod tests {
                 crate::model::ThinkingSupport::No
             }),
             supports_vision_override: Some(true),
+            supports_cache_breakpoints_override: None,
             pricing: ModelPricing::ZERO,
             discovered_free: false,
             max_output_tokens: Some(131_072),
