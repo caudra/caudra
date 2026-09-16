@@ -112,6 +112,7 @@ fn configure_native_tools(agent: &caudra_config::AgentConfig) {
 }
 
 pub fn dispatch(mut cli: Cli) -> Result<ExitCode> {
+    caudra_storage::paths::check_namespace_override()?;
     match cli.command.take() {
         Some(Command::Permissions { action, database }) => {
             if cli.workcell.is_set() || cli.ephemeral {

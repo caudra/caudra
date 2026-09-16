@@ -11,6 +11,7 @@ fn utf8(p: PathBuf) -> Option<String> {
 
 /// Return the directory where caudra stores runtime state (sessions, auth tokens, etc.).
 /// Typically `~/.local/state/caudra`, or `~/.local/state/caudra-debug` in debug builds.
+/// `CAUDRA_NAMESPACE` overrides the directory name.
 ///
 /// @return (string?) State directory path, or nil if it cannot be determined.
 /// @example
@@ -22,6 +23,7 @@ fn state_dir(_lua: &Lua) -> mlua::Result<Option<String>> {
 
 /// Return the directory where caudra looks for user configuration files.
 /// Typically `~/.config/caudra`, or `~/.config/caudra-debug` in debug builds.
+/// `CAUDRA_NAMESPACE` overrides the directory name.
 ///
 /// @return (string?) Config directory path, or nil if it cannot be determined.
 /// @example
@@ -33,6 +35,7 @@ fn config_dir(_lua: &Lua) -> mlua::Result<Option<String>> {
 
 /// Return the directory where caudra writes its log files (`caudra.log`).
 /// Typically `~/.local/logs/caudra`, or `~/.local/logs/caudra-debug` in debug builds.
+/// `CAUDRA_NAMESPACE` overrides the directory name.
 ///
 /// @return (string?) Logs directory path, or nil if it cannot be determined.
 /// @example

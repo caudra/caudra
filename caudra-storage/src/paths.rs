@@ -1,8 +1,12 @@
+use std::env;
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
 
 use etcetera::base_strategy::BaseStrategy;
+
+const NAMESPACE_ENV: &str = "CAUDRA_NAMESPACE";
 
 /// Debug builds get their own directory so a development run never shares
 /// config, sessions, auth, logs, or caches with an installed release.
@@ -16,7 +20,26 @@ const fn app_dir_name(debug_assertions: bool) -> &'static str {
 
 const APP_DIR_NAME: &str = app_dir_name(cfg!(debug_assertions));
 
-static STRATEGY: OnceLock<Option<Paths>> = OnceLock::new();
+/// Rejection of an explicit namespace. The override is authoritative: an
+/// unusable value refuses to start rather than quietly falling back to the
+/// build-profile default and writing to a directory nobody asked for.
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum NamespaceError {
+    #[error("{NAMESPACE_ENV} is not valid UTF-8")]
+    NotUtf8,
+    #[error("{NAMESPACE_ENV} must be a single directory name, got `{0}`")]
+    NotASegment(String),
+}
+
+#[derive(Debug, Clone, thiserror::Error)]
+enum PathsError {
+    #[error("cannot determine base directories")]
+    BaseDirs,
+    #[error(transparent)]
+    Namespace(#[from] NamespaceError),
+}
+
+static STRATEGY: OnceLock<Result<Paths, PathsError>> = OnceLock::new();
 
 struct Paths {
     config: PathBuf,
@@ -24,6 +47,25 @@ struct Paths {
     state: PathBuf,
     logs: PathBuf,
     cache: PathBuf,
+}
+
+/// Parse an explicit namespace override. Pure: the caller supplies the raw
+/// value, so nothing here reads process environment.
+fn namespace_from(raw: Option<&OsStr>) -> Result<Option<&str>, NamespaceError> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let value = raw.to_str().ok_or(NamespaceError::NotUtf8)?.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let mut components = Path::new(value).components();
+    match (components.next(), components.next()) {
+        (Some(Component::Normal(segment)), None) if segment.to_str() == Some(value) => {
+            Ok(Some(value))
+        }
+        _ => Err(NamespaceError::NotASegment(value.to_owned())),
+    }
 }
 
 /// Lexical path normalization that never hits the filesystem.
@@ -187,20 +229,32 @@ fn paths_for(strategy: &impl BaseStrategy, app_dir_name: &str) -> Paths {
     }
 }
 
-fn resolve() -> Option<&'static Paths> {
+fn resolve() -> Result<&'static Paths, &'static PathsError> {
     STRATEGY
         .get_or_init(|| {
-            let strategy = etcetera::choose_base_strategy().ok()?;
-            Some(paths_for(&strategy, APP_DIR_NAME))
+            let raw = env::var_os(NAMESPACE_ENV);
+            let namespace = namespace_from(raw.as_deref())?;
+            let strategy = etcetera::choose_base_strategy().map_err(|_| PathsError::BaseDirs)?;
+            Ok(paths_for(&strategy, namespace.unwrap_or(APP_DIR_NAME)))
         })
         .as_ref()
 }
 
-fn err() -> std::io::Error {
-    std::io::Error::new(
-        std::io::ErrorKind::NotFound,
-        "cannot determine base directories",
-    )
+fn err(error: &PathsError) -> std::io::Error {
+    let kind = match error {
+        PathsError::BaseDirs => std::io::ErrorKind::NotFound,
+        PathsError::Namespace(_) => std::io::ErrorKind::InvalidInput,
+    };
+    std::io::Error::new(kind, error.to_string())
+}
+
+/// Validate an explicit namespace once, before anything touches a platform
+/// directory, so a rejected value is reported where the user can act on it.
+pub fn check_namespace_override() -> Result<(), NamespaceError> {
+    match resolve() {
+        Err(PathsError::Namespace(error)) => Err(error.clone()),
+        _ => Ok(()),
+    }
 }
 
 fn ensure(path: &Path) -> Result<PathBuf, std::io::Error> {
@@ -209,7 +263,7 @@ fn ensure(path: &Path) -> Result<PathBuf, std::io::Error> {
 }
 
 fn active_path(field: fn(&Paths) -> &Path) -> Result<PathBuf, std::io::Error> {
-    ensure(field(resolve().ok_or_else(err)?))
+    ensure(field(resolve().map_err(err)?))
 }
 
 pub fn config_dir() -> Result<PathBuf, std::io::Error> {
@@ -225,7 +279,7 @@ pub fn state_dir() -> Result<PathBuf, std::io::Error> {
 }
 
 pub fn state_dir_path() -> Result<PathBuf, std::io::Error> {
-    Ok(resolve().ok_or_else(err)?.state.clone())
+    Ok(resolve().map_err(err)?.state.clone())
 }
 
 pub fn logs_dir() -> Result<PathBuf, std::io::Error> {
@@ -233,7 +287,7 @@ pub fn logs_dir() -> Result<PathBuf, std::io::Error> {
 }
 
 pub fn logs_dir_path() -> Result<PathBuf, std::io::Error> {
-    Ok(resolve().ok_or_else(err)?.logs.clone())
+    Ok(resolve().map_err(err)?.logs.clone())
 }
 
 pub fn cache_dir() -> Result<PathBuf, std::io::Error> {
@@ -254,6 +308,8 @@ pub fn user_config_dir(config: Option<&Path>, subdir: &str) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use test_case::test_case;
+
     use super::*;
 
     struct TestStrategy {
@@ -308,18 +364,55 @@ mod tests {
         assert_eq!(app_dir_name(true), "caudra-debug");
     }
 
-    #[test]
-    fn paths_use_selected_app_directory_name() {
+    #[test_case("caudra-debug" ; "build profile name")]
+    #[test_case("caudra-scratch" ; "overridden name")]
+    fn paths_use_selected_app_directory_name(name: &str) {
         let root = tempfile::tempdir().unwrap();
         let strategy = TestStrategy::new(root.path(), true);
 
-        let paths = paths_for(&strategy, "caudra-debug");
+        let paths = paths_for(&strategy, name);
 
-        assert_eq!(paths.config, root.path().join("config/caudra-debug"));
-        assert_eq!(paths.data, root.path().join("data/caudra-debug"));
-        assert_eq!(paths.state, root.path().join("state/caudra-debug"));
-        assert_eq!(paths.logs, root.path().join("logs/caudra-debug"));
-        assert_eq!(paths.cache, root.path().join("cache/caudra-debug"));
+        assert_eq!(paths.config, root.path().join("config").join(name));
+        assert_eq!(paths.data, root.path().join("data").join(name));
+        assert_eq!(paths.state, root.path().join("state").join(name));
+        assert_eq!(paths.logs, root.path().join("logs").join(name));
+        assert_eq!(paths.cache, root.path().join("cache").join(name));
+    }
+
+    #[test_case(None, None ; "unset")]
+    #[test_case(Some(""), None ; "empty")]
+    #[test_case(Some("   "), None ; "whitespace only")]
+    #[test_case(Some("caudra"), Some("caudra") ; "release name")]
+    #[test_case(Some("caudra-scratch"), Some("caudra-scratch") ; "custom name")]
+    #[test_case(Some(" caudra-scratch "), Some("caudra-scratch") ; "surrounding whitespace")]
+    #[test_case(Some("work.space"), Some("work.space") ; "interior dot")]
+    fn namespace_override_accepts_a_single_segment(raw: Option<&str>, expected: Option<&str>) {
+        assert_eq!(namespace_from(raw.map(OsStr::new)).unwrap(), expected);
+    }
+
+    #[test_case("." ; "current directory")]
+    #[test_case(".." ; "parent directory")]
+    #[test_case("a/b" ; "nested")]
+    #[test_case("a/" ; "trailing separator")]
+    #[test_case("/abs" ; "absolute")]
+    #[test_case("../escape" ; "traversal")]
+    #[cfg_attr(windows, test_case(r"C:\x" ; "windows drive"))]
+    fn namespace_override_rejects_anything_that_is_not_a_segment(raw: &str) {
+        assert!(matches!(
+            namespace_from(Some(OsStr::new(raw))),
+            Err(NamespaceError::NotASegment(_))
+        ));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn namespace_override_rejects_non_utf8() {
+        use std::os::unix::ffi::OsStrExt;
+
+        assert!(matches!(
+            namespace_from(Some(OsStr::from_bytes(&[0xff]))),
+            Err(NamespaceError::NotUtf8)
+        ));
     }
 
     #[test]

@@ -186,7 +186,7 @@ caudra permissions --database "$HOME/.local/state/caudra/caudra.sqlite" \
 | `--limit <COUNT>` | Maximum proposals, default 10 and clamped to 1 through 64 |
 | `--since <RFC3339>` | Include history records created at or after this timestamp, based on their UUIDv7 IDs |
 | `--json` | Emit pattern definitions, retained literal values, evidence, per-session counts, analysis diagnostics, assumptions, exclusions, and limits |
-| `--database <ABSOLUTE_CAUDRA_SQLITE>` | Read an explicitly selected database instead of this build's data namespace |
+| `--database <ABSOLUTE_CAUDRA_SQLITE>` | Read an explicitly selected database instead of the active data namespace |
 
 The project path must be bounded absolute UTF-8 without parent components or control characters. Historical paths are interpreted lexically, without resolving them through today's filesystem. A session's current stored cwd only approximates its historical project. Timestamps describe history creation, not execution time. Invalid, missing, or future dates are excluded.
 

@@ -78,7 +78,8 @@ Plugins live in one of two config directories with the same layout:
 - `<project>/.caudra/` - this project only
 
 Release builds normally return `~/.config/caudra/`. Debug builds return
-`~/.config/caudra-debug/`. An active legacy directory takes precedence.
+`~/.config/caudra-debug/`. Setting `CAUDRA_NAMESPACE` replaces the directory
+name with your own. An active legacy directory takes precedence.
 
 ```
 init.lua        the only file caudra runs; require()s plugins, calls caudra.setup()

@@ -1428,6 +1428,7 @@ caudra.env.state_dir()
 
 Return the directory where caudra stores runtime state (sessions, auth tokens, etc.).
 Typically `~/.local/state/caudra`, or `~/.local/state/caudra-debug` in debug builds.
+`CAUDRA_NAMESPACE` overrides the directory name.
 
 Requires the `env` [plugin permission](#plugin-permissions).
 
@@ -1449,6 +1450,7 @@ caudra.env.config_dir()
 
 Return the directory where caudra looks for user configuration files.
 Typically `~/.config/caudra`, or `~/.config/caudra-debug` in debug builds.
+`CAUDRA_NAMESPACE` overrides the directory name.
 
 Requires the `env` [plugin permission](#plugin-permissions).
 
@@ -1470,6 +1472,7 @@ caudra.env.logs_dir()
 
 Return the directory where caudra writes its log files (`caudra.log`).
 Typically `~/.local/logs/caudra`, or `~/.local/logs/caudra-debug` in debug builds.
+`CAUDRA_NAMESPACE` overrides the directory name.
 
 Requires the `env` [plugin permission](#plugin-permissions).
 
