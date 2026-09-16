@@ -942,7 +942,10 @@ fn bash_live_output_with_code_input() {
     bash_code_start(&mut panel, "t1", "echo hello");
     rebuild(&mut panel);
 
+    // Live output is drawn by the frame, so the card is read after one. The
+    // settled output below needs no frame: a terminal event draws its own card.
     panel.tool_output("t1", "streaming");
+    rebuild(&mut panel);
     assert!(seg_text(&panel, "t1").contains("streaming"));
 
     panel.tool_done(ToolDoneEvent {
@@ -7273,6 +7276,7 @@ fn late_top_level_previews_do_not_replace_execution(terminal: Option<bool>) {
         });
     }
     let before = panel.messages[0].clone();
+    let owed = panel.dirty_cards.clone();
     panel.tool_input_preview(
         TOOL_ID,
         Some(REASONING_BODY.into()),
@@ -7301,8 +7305,11 @@ fn late_top_level_previews_do_not_replace_execution(terminal: Option<bool>) {
     );
     assert!(after.live_body.is_none());
     assert!(after.progress.is_none());
-    assert!(panel.live_body_dirty.is_empty());
+    assert_eq!(panel.dirty_cards, owed, "{NO_LATE_REDRAW_MSG}");
 }
+
+const NO_LATE_REDRAW_MSG: &str = "a preview for a call that has moved on owes its card nothing, \
+    so it cannot be redrawn from state the execution replaced";
 
 #[test_case(false ; "child_completion")]
 #[test_case(true ; "parent_cancellation")]
@@ -8410,6 +8417,379 @@ fn a_streaming_write_redraws_once_a_frame_not_once_a_fragment() {
 
     render(&mut panel, 80, WRITTEN_FILE_LINES as u16 + 8);
     assert!(rows(&panel) > settled, "{LIVE_BODY_DRAWN_MSG}");
+}
+
+const EAGER_STATE_MSG: &str = "ingestion is eager, so the message carries every event before \
+    anything is drawn";
+const BACKGROUND_QUIET_MSG: &str =
+    "a chat nobody is drawing must not rebuild its card once per event";
+const BACKGROUND_DRAWN_MSG: &str = "the frame that draws the chat shows what every event left";
+const NOTHING_OWED_MSG: &str = "a drawn frame leaves no card owed a redraw";
+const OWED_MSG: &str = "a live event owes its card a redraw";
+const TERMINAL_EAGER_MSG: &str = "a terminal event owns the card that restore, search and export \
+    read, so it draws itself and takes the owed redraw with it";
+const PREVIEW_GONE_MSG: &str = "what the call turned out to be replaces what it was spelling out";
+const RESET_DROPS_MSG: &str = "a reset that drops the cache drops what the cache was owed";
+const RESET_KEEPS_MSG: &str = "dropping the owed redraw must not drop the state behind it";
+const OFF_SCREEN_MSG: &str = "the card has to be off screen for the flush to be the only thing \
+    that can redraw it";
+const OFF_SCREEN_FLUSHED_MSG: &str = "a theme change reflows only around the viewport, so an \
+    off-screen card is redrawn by the flush or not at all";
+const RESTORE_CLAMP_MSG: &str = "the flush runs before the scroll resolves, so a restored offset \
+    clamps against the height this frame draws";
+
+/// How many live events a backgrounded chat takes before anyone draws it. Long
+/// enough that a rebuild per event would be the card's length squared.
+const BACKGROUND_EVENTS: usize = 24;
+/// Tall enough for a card of `BACKGROUND_EVENTS` rows and its chrome.
+const DRAWN_HEIGHT: u16 = BACKGROUND_EVENTS as u16 + 8;
+/// Shorter than the documents below, so what is on screen is a choice of
+/// scroll offset rather than everything there is.
+const CLIPPED_HEIGHT: u16 = 12;
+
+/// A subagent's chat that the reader opened once and then left: its cache is
+/// warm, so `rebuild_tool_lines` no longer misses and every forwarded event
+/// would otherwise pay for the whole card.
+fn backgrounded_write() -> MessagesPanel {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.tool_pending(TOOL_ID.into(), FILE_WRITE_TOOL_NAME);
+    render(&mut panel, 80, 24);
+    panel
+}
+
+/// The forwarded stream a background chat is about to start seeing. The cost
+/// of drawing it is the whole point, so the deferral is what is tested, not
+/// the lines it eventually produces.
+#[test]
+fn a_backgrounded_chat_defers_a_streamed_write_until_it_is_drawn() {
+    let mut panel = backgrounded_write();
+    let opened = seg_text(&panel, TOOL_ID);
+
+    for line in 0..BACKGROUND_EVENTS {
+        panel.tool_input_preview(
+            TOOL_ID,
+            Some(WRITTEN_FILE_PATH.into()),
+            Some(format!("{line} lines")),
+        );
+        panel.tool_input_body(TOOL_ID, Some(format!("line {line}\n")));
+    }
+    let tail = format!("line {}", BACKGROUND_EVENTS - 1);
+
+    assert_eq!(
+        panel.messages[0].text, WRITTEN_FILE_PATH,
+        "{EAGER_STATE_MSG}"
+    );
+    assert!(
+        panel.messages[0]
+            .live_body
+            .as_deref()
+            .is_some_and(|body| body.contains(&tail)),
+        "{EAGER_STATE_MSG}"
+    );
+    assert_eq!(seg_text(&panel, TOOL_ID), opened, "{BACKGROUND_QUIET_MSG}");
+    assert!(panel.dirty_cards.contains(TOOL_ID), "{OWED_MSG}");
+
+    let shown = buffer_text(&render(&mut panel, 80, DRAWN_HEIGHT));
+    for line in ["line 0", tail.as_str()] {
+        assert!(shown.contains(line), "{BACKGROUND_DRAWN_MSG}: {shown}");
+    }
+    assert!(panel.dirty_cards.is_empty(), "{NOTHING_OWED_MSG}");
+}
+
+#[test]
+fn a_backgrounded_chat_defers_live_output_and_annotations_until_it_is_drawn() {
+    let mut panel = panel_with_tools(&[(TOOL_ID, SHELL_TOOL_NAME)]);
+    render(&mut panel, 80, 24);
+    let opened = seg_text(&panel, TOOL_ID);
+
+    for event in 1..=BACKGROUND_EVENTS {
+        panel.tool_output(TOOL_ID, &numbered_body(event));
+        panel.tool_annotation(TOOL_ID, format!("{event} lines"));
+    }
+    let tail = format!("line {}", BACKGROUND_EVENTS - 1);
+    let annotation = format!("{BACKGROUND_EVENTS} lines");
+
+    assert!(panel.messages[0].text.contains(&tail), "{EAGER_STATE_MSG}");
+    assert_eq!(
+        panel.messages[0].annotation.as_deref(),
+        Some(annotation.as_str()),
+        "{EAGER_STATE_MSG}"
+    );
+    assert_eq!(seg_text(&panel, TOOL_ID), opened, "{BACKGROUND_QUIET_MSG}");
+
+    render(&mut panel, 80, DRAWN_HEIGHT);
+
+    let drawn = seg_text(&panel, TOOL_ID);
+    assert!(drawn.contains(&tail), "{BACKGROUND_DRAWN_MSG}: {drawn:?}");
+    assert!(
+        drawn.contains(&annotation),
+        "{BACKGROUND_DRAWN_MSG}: {drawn:?}"
+    );
+    assert!(panel.dirty_cards.is_empty(), "{NOTHING_OWED_MSG}");
+}
+
+/// A settled card is what restore, search and export read, so it is rebuilt as
+/// the event lands. The owed redraw goes with it: the card it was owed for has
+/// been replaced by the one the call turned out to be.
+#[test]
+fn tool_done_draws_its_own_card_and_evicts_the_owed_redraw() {
+    let mut panel = panel_with_tools(&[(TOOL_ID, SHELL_TOOL_NAME)]);
+    render(&mut panel, 80, 24);
+    panel.tool_output(TOOL_ID, &numbered_body(BACKGROUND_EVENTS));
+    assert!(panel.dirty_cards.contains(TOOL_ID), "{OWED_MSG}");
+    assert!(
+        seg_text(&panel, TOOL_ID).contains(SHELL_RUNNING_LABEL),
+        "{BACKGROUND_QUIET_MSG}"
+    );
+
+    panel.tool_done(shell_done(TOOL_ID, false));
+
+    assert!(panel.dirty_cards.is_empty(), "{TERMINAL_EAGER_MSG}");
+    let settled = seg_text(&panel, TOOL_ID);
+    assert!(
+        settled.contains(SHELL_SETTLED_LABEL) && !settled.contains(SHELL_RUNNING_LABEL),
+        "{TERMINAL_EAGER_MSG}: {settled:?}"
+    );
+}
+
+/// The last thing the call was spelling out is not what it ran, so a start
+/// both redraws the card and drops what the previews were owed.
+#[test]
+fn tool_start_draws_its_own_card_and_evicts_the_owed_redraw() {
+    let mut panel = backgrounded_write();
+    panel.tool_input_preview(TOOL_ID, Some(PREVIEW_PATH.into()), None);
+    panel.tool_input_body(TOOL_ID, Some(PREVIEW_BODY.into()));
+    assert!(panel.dirty_cards.contains(TOOL_ID), "{OWED_MSG}");
+
+    let mut event = start(TOOL_ID, FILE_WRITE_TOOL_NAME);
+    event.summary = WRITTEN_FILE_PATH.into();
+    panel.tool_start(event);
+
+    assert!(panel.dirty_cards.is_empty(), "{TERMINAL_EAGER_MSG}");
+    let started = seg_text(&panel, TOOL_ID);
+    assert!(started.contains(WRITTEN_FILE_PATH), "{TERMINAL_EAGER_MSG}");
+    for stale in [PREVIEW_PATH, PREVIEW_BODY] {
+        assert!(!started.contains(stale), "{PREVIEW_GONE_MSG}: {started:?}");
+    }
+}
+
+const PREVIEW_PATH: &str = "src/spelled_out.rs";
+const PREVIEW_BODY: &str = "fn spelled_out() {}";
+/// How a shell card heads itself while it runs, and once it has landed. Which
+/// of the two it draws says which state its lines were built from.
+const SHELL_RUNNING_LABEL: &str = "Running";
+const SHELL_SETTLED_LABEL: &str = "Ran";
+
+enum Reset {
+    View,
+    Load,
+    Cancel,
+}
+
+/// Each of these ends or replaces the card an owed redraw named, so a surviving
+/// entry would rebuild a card that had moved on.
+#[test_case(Reset::View ; "set_view")]
+#[test_case(Reset::Load ; "load_messages")]
+#[test_case(Reset::Cancel ; "cancel_in_progress")]
+fn a_reset_drops_every_owed_redraw(reset: Reset) {
+    let mut panel = panel_with_tools(&[(TOOL_ID, SHELL_TOOL_NAME)]);
+    render(&mut panel, 80, 24);
+    panel.tool_output(TOOL_ID, &numbered_body(BACKGROUND_EVENTS));
+    assert!(panel.dirty_cards.contains(TOOL_ID), "{OWED_MSG}");
+
+    let keeps_card = !matches!(reset, Reset::Load);
+    match reset {
+        Reset::View => panel.set_view(ViewMode::Expanded),
+        Reset::Load => panel.load_messages(Vec::new()),
+        Reset::Cancel => panel.cancel_in_progress(),
+    }
+    assert!(panel.dirty_cards.is_empty(), "{RESET_DROPS_MSG}");
+
+    render(&mut panel, 80, DRAWN_HEIGHT);
+    assert_eq!(has_seg(&panel, TOOL_ID), keeps_card, "{RESET_KEEPS_MSG}");
+    if keeps_card {
+        let tail = format!("line {}", BACKGROUND_EVENTS - 1);
+        let text = seg_text(&panel, TOOL_ID);
+        assert!(text.contains(&tail), "{RESET_KEEPS_MSG}: {text:?}");
+    }
+    assert!(panel.dirty_cards.is_empty(), "{NOTHING_OWED_MSG}");
+}
+
+/// Rows of prose after the card, enough to push it clear of the viewport.
+const OFF_SCREEN_FILLER: usize = 40;
+const OFF_SCREEN_SUMMARY: &str = "ranked while nobody was looking";
+
+/// The reason the flush cannot ask whether a rebuild is worth it: a theme
+/// change marks every segment stale but only reflows the ones the viewport
+/// reaches, so an off-screen card is left holding its old lines.
+#[test]
+fn a_theme_change_still_flushes_an_off_screen_card() {
+    theme::set(theme::load_by_name("dracula").unwrap());
+    let mut panel = panel_with_tools(&[(TOOL_ID, CODE_MAP_TOOL_NAME)]);
+    for row in 0..OFF_SCREEN_FILLER {
+        panel.push(DisplayMessage::new(
+            DisplayRole::Assistant,
+            format!("filler {row}"),
+        ));
+    }
+    render(&mut panel, 80, CLIPPED_HEIGHT);
+
+    panel.update_tool_summary(TOOL_ID, OFF_SCREEN_SUMMARY);
+    theme::set(theme::load_by_name("tokyonight").unwrap());
+    let shown = buffer_text(&render(&mut panel, 80, CLIPPED_HEIGHT));
+
+    assert!(!shown.contains(OFF_SCREEN_SUMMARY), "{OFF_SCREEN_MSG}");
+    let text = seg_text(&panel, TOOL_ID);
+    assert!(
+        text.contains(OFF_SCREEN_SUMMARY),
+        "{OFF_SCREEN_FLUSHED_MSG}: {text:?}"
+    );
+}
+
+/// A restored offset is clamped to the document, and the document is only the
+/// right height once the owed redraws have been paid. Flushing after the
+/// scroll resolved would pin a grown card to the height of its header.
+#[test]
+fn a_restored_scroll_clamps_against_the_flushed_height() {
+    let mut panel = backgrounded_write();
+    panel.tool_input_body(TOOL_ID, Some(numbered_body(WRITTEN_FILE_LINES)));
+    panel.restore_scroll(u32::MAX, false);
+
+    let shown = buffer_text(&render(&mut panel, 80, CLIPPED_HEIGHT));
+
+    let tail = format!("line {}", WRITTEN_FILE_LINES - 1);
+    assert!(shown.contains(&tail), "{RESTORE_CLAMP_MSG}: {shown}");
+    assert_eq!(
+        panel.scroll_top(),
+        panel.max_scroll(),
+        "{RESTORE_CLAMP_MSG}"
+    );
+}
+
+const HOVER_KEPT_MSG: &str = "a redraw the frame owes a card cannot cancel the pointer the reader \
+    is holding, or nothing under a streaming chat could ever be pointed at";
+const HOVER_PAINTED_MSG: &str =
+    "a pointer that survives the flush has to reach the paint of the same frame";
+
+const HOVER_SETUP_MSG: &str = "a document that changed height cancels the pointer on its own, so \
+    the card has to restate its output at the height it already settled at";
+/// Lines of live output the card settles at before the pointer lands on it.
+const STEADY_LINES: usize = 5;
+
+/// The flush runs before the frame reads hover, so clearing it there lands
+/// after the mouse handler that set it and the mark never paints.
+#[test]
+fn flushing_a_dirty_card_leaves_the_pointer_where_the_reader_put_it() {
+    let mut panel = panel_with_tools(&[(TOOL_ID, SHELL_TOOL_NAME)]);
+    let area = Rect::new(0, 0, 80, DRAWN_HEIGHT);
+    panel.tool_output(TOOL_ID, &numbered_body(STEADY_LINES));
+    render(&mut panel, area.width, area.height);
+    let settled = panel.segment_heights();
+
+    panel.update_hover(area.y, area.x, area, false, Path::new(NO_PROJECT));
+    let Some(HoverTarget::Tool { feedback, .. }) = &panel.hover else {
+        panic!("the test must hover the card it dirties: {:?}", panel.hover);
+    };
+    let held = HoverTarget::Tool {
+        id: TOOL_ID.into(),
+        feedback: *feedback,
+    };
+
+    let restated: String = (0..STEADY_LINES)
+        .map(|line| format!("tick {line}\n"))
+        .collect();
+    panel.tool_output(TOOL_ID, &restated);
+    let marked = render(&mut panel, area.width, area.height);
+
+    assert_eq!(panel.segment_heights(), settled, "{HOVER_SETUP_MSG}");
+    assert_eq!(panel.hover, Some(held), "{HOVER_KEPT_MSG}");
+    let marked = style_of(&marked, TOOL_ID);
+    panel.clear_hover();
+    let plain = style_of(&render(&mut panel, area.width, area.height), TOOL_ID);
+    assert_ne!(marked, plain, "{HOVER_PAINTED_MSG}");
+}
+
+/// How a roster row names the step it is on, so the card says which of them it
+/// was built from.
+const ROSTER_MARK: &str = "step_";
+
+enum ChildEvent {
+    Output,
+    Progress,
+    Roster,
+}
+
+/// Drives one step of a streaming child and hands back the text its card draws
+/// once the frame that owes it lands.
+fn stream_child(panel: &mut MessagesPanel, event: &ChildEvent, step: usize) -> String {
+    match event {
+        ChildEvent::Output => {
+            panel.set_batch_child_output(TOOL_ID, 0, &numbered_body(step));
+            format!("line {}", step - 1)
+        }
+        ChildEvent::Progress => {
+            panel.set_batch_child_progress(TOOL_ID, 0, child_report());
+            RUNNING_LABEL.to_owned()
+        }
+        ChildEvent::Roster => {
+            let entry = BatchToolEntry {
+                summary: format!("{ROSTER_MARK}{step}"),
+                ..running_child(SHELL_TOOL_NAME)
+            };
+            panel.batch_progress(TOOL_ID, 0, entry);
+            format!("{ROSTER_MARK}{step}")
+        }
+    }
+}
+
+/// The volume the deferral was built for: a batch runs its children under ids
+/// of its own, so every one of them redraws the single card the batch owns.
+#[test_case(ChildEvent::Output ; "streamed_output")]
+#[test_case(ChildEvent::Progress ; "activity_report")]
+#[test_case(ChildEvent::Roster ; "roster_entry")]
+fn a_backgrounded_batch_defers_its_children_until_it_is_drawn(event: ChildEvent) {
+    let mut panel = panel_with_running_shell();
+    let opened = seg_text(&panel, TOOL_ID);
+
+    let mut mark = String::new();
+    for step in 1..=BACKGROUND_EVENTS {
+        mark = stream_child(&mut panel, &event, step);
+    }
+
+    assert!(!opened.contains(&mark), "the test must assert on a change");
+    assert_eq!(seg_text(&panel, TOOL_ID), opened, "{BACKGROUND_QUIET_MSG}");
+    assert!(panel.dirty_cards.contains(TOOL_ID), "{OWED_MSG}");
+
+    render(&mut panel, 80, DRAWN_HEIGHT);
+
+    let drawn = seg_text(&panel, TOOL_ID);
+    assert!(drawn.contains(&mark), "{BACKGROUND_DRAWN_MSG}: {drawn:?}");
+    assert!(panel.dirty_cards.is_empty(), "{NOTHING_OWED_MSG}");
+}
+
+const SNAPSHOT_EAGER_MSG: &str = "a rendered chunk draws its own card, which is what the runtime \
+    handed a snapshot back for";
+const SNAPSHOT_OWED_MSG: &str = "a card the chunk just drew owes the next frame nothing, or every \
+    chunk buys a second rebuild of what is already on screen";
+
+/// A live shell chunk reaches the card twice: once as the text `tool_output`
+/// marks dirty, once as the snapshot that draws it. The second has to take the
+/// mark with it.
+#[test]
+fn a_live_shell_chunk_leaves_no_redundant_redraw_owed() {
+    let mut panel = panel_with_tools(&[(TOOL_ID, SHELL_TOOL_NAME)]);
+    render(&mut panel, 80, DRAWN_HEIGHT);
+
+    panel.tool_snapshot(
+        TOOL_ID,
+        BufferSnapshot::plain_text(numbered_body(BACKGROUND_EVENTS)),
+        None,
+    );
+
+    let tail = format!("line {}", BACKGROUND_EVENTS - 1);
+    let drawn = seg_text(&panel, TOOL_ID);
+    assert!(drawn.contains(&tail), "{SNAPSHOT_EAGER_MSG}: {drawn:?}");
+    assert!(panel.dirty_cards.is_empty(), "{SNAPSHOT_OWED_MSG}");
 }
 
 const RATE_UNSET_MSG: &str = "one sample measures no interval, so there is no rate to show";

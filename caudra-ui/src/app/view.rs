@@ -643,7 +643,7 @@ impl App {
             auto_scroll: chat.auto_scroll(),
             chat_name,
             main_chat,
-            retry_info: self.retry_info.as_ref(),
+            retry_info: chat.retry(),
             thinking,
             fast: self.state.fast,
             workflows: workflow_chip(self.workflow.runs()),

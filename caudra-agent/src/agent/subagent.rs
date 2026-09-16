@@ -78,10 +78,22 @@ async fn relay_session_events(
                 let _ = usage_tx.send(*usage);
                 continue;
             }
-            AgentEvent::Error { .. }
-            | AgentEvent::ToolOutput { .. }
+            // A failed subagent reaches the user as its task tool result, and
+            // the parent's own session must not take a child's verdict as its
+            // own: in the UI an error ends the session it arrives on.
+            AgentEvent::Error { .. } => continue,
+            // Already stamped, so this is a grandchild's live tool work and
+            // this session sits blocked on the nested task that ran it.
+            // Restamping would open a card in this session's transcript for a
+            // call it never made, and a `ToolOutput` flush carries the whole
+            // accumulated buffer, recloned at every hop it crosses.
+            AgentEvent::ToolPending { .. }
             | AgentEvent::ToolInputDelta { .. }
-            | AgentEvent::ToolPending { .. } => continue,
+            | AgentEvent::ToolOutput { .. }
+                if envelope.subagent.is_some() =>
+            {
+                continue;
+            }
             _ => {}
         }
         envelope.subagent = subagent_info.get().cloned();
@@ -1439,10 +1451,14 @@ mod tests {
     }
 
     fn parent_info() -> Arc<OnceLock<SubagentInfo>> {
+        session_info(PARENT_ID)
+    }
+
+    fn session_info(id: &str) -> Arc<OnceLock<SubagentInfo>> {
         let info = Arc::new(OnceLock::new());
         info.set(SubagentInfo {
-            parent_tool_use_id: PARENT_ID.into(),
-            task_id: PARENT_ID.into(),
+            parent_tool_use_id: id.into(),
+            task_id: id.into(),
             name: "research".into(),
             prompt: None,
             model: None,
@@ -1815,27 +1831,37 @@ mod tests {
         );
     }
 
-    /// Drives the relay's stateful half directly: the published sequence is
-    /// what a parent header would show, in order.
-    fn activities(events: Vec<AgentEvent>) -> Vec<(String, Option<String>)> {
+    /// One relay hop, stamping with `info`: every envelope it handed on.
+    fn relay_hop(info: Arc<OnceLock<SubagentInfo>>, envelopes: Vec<Envelope>) -> Vec<Envelope> {
         let (sub_tx, sub_rx) = flume::unbounded();
         let (parent_raw_tx, parent_rx) = flume::unbounded();
         let (usage_tx, _usage_rx) = flume::unbounded();
-        for event in events {
-            sub_tx.send(envelope(event)).unwrap();
+        for envelope in envelopes {
+            sub_tx.send(envelope).unwrap();
         }
         drop(sub_tx);
 
         smol::block_on(relay_session_events(
             sub_rx,
             EventSender::new(parent_raw_tx, RUN_ID),
-            parent_info(),
+            info,
             usage_tx,
             None,
         ));
 
-        parent_rx
-            .drain()
+        parent_rx.drain().collect()
+    }
+
+    /// Everything one session's events made the relay hand the parent.
+    fn relayed(events: Vec<AgentEvent>) -> Vec<Envelope> {
+        relay_hop(parent_info(), events.into_iter().map(envelope).collect())
+    }
+
+    /// Drives the relay's stateful half directly: the published sequence is
+    /// what a parent header would show, in order.
+    fn activities(events: Vec<AgentEvent>) -> Vec<(String, Option<String>)> {
+        relayed(events)
+            .into_iter()
             .filter_map(|envelope| match envelope.event {
                 AgentEvent::SubagentProgress { progress } => Some((
                     progress.activity.label().to_owned(),
@@ -1984,6 +2010,183 @@ mod tests {
             .map(|(_, tools, _)| tools)
             .collect();
         assert_eq!(counts, [0, 1, 2]);
+    }
+
+    const PENDING_TOOL: &str = "shell";
+    const INPUT_PREVIEW: &str = "ls -la";
+    const TOOL_CHUNK: &str = "total 0\n";
+    const TRANSCRIPT_DROPPED: &str =
+        "a live tool event must reach the subagent's own transcript, not just the parent header";
+    const TRANSCRIPT_LEAKED: &str = "a session-level verdict belongs to the caller, not the relay";
+
+    fn tool_pending() -> AgentEvent {
+        AgentEvent::ToolPending {
+            id: TOOL_ID.into(),
+            name: PENDING_TOOL.into(),
+        }
+    }
+
+    fn tool_input_delta() -> AgentEvent {
+        AgentEvent::ToolInputDelta {
+            id: TOOL_ID.into(),
+            name: PENDING_TOOL.into(),
+            delta: r#"{"command":"#.into(),
+            preview: Some(INPUT_PREVIEW.into()),
+            size: None,
+            body: None,
+            roster: None,
+            delegations: Vec::new(),
+        }
+    }
+
+    fn tool_output() -> AgentEvent {
+        AgentEvent::ToolOutput {
+            id: TOOL_ID.into(),
+            content: TOOL_CHUNK.into(),
+        }
+    }
+
+    fn error_event() -> AgentEvent {
+        AgentEvent::Error {
+            message: IGNORED_ERROR.into(),
+        }
+    }
+
+    fn done_event() -> AgentEvent {
+        AgentEvent::Done {
+            usage: DONE_USAGE,
+            num_turns: 1,
+            reason: DoneReason::EndTurn,
+        }
+    }
+
+    fn without_digests(envelopes: Vec<Envelope>) -> Vec<Envelope> {
+        envelopes
+            .into_iter()
+            .filter(|envelope| !matches!(envelope.event, AgentEvent::SubagentProgress { .. }))
+            .collect()
+    }
+
+    /// What the relay forwarded that was not a digest it synthesized itself.
+    fn forwarded(events: Vec<AgentEvent>) -> Vec<Envelope> {
+        without_digests(relayed(events))
+    }
+
+    /// The reported bug: a subagent's own transcript only showed a call once
+    /// it had finished, because the events that open one were dropped here
+    /// after the parent header had already been built from them.
+    #[test_case(tool_pending()     ; "pending")]
+    #[test_case(tool_input_delta() ; "input_delta")]
+    #[test_case(tool_output()      ; "output")]
+    fn a_live_tool_event_reaches_the_subagents_transcript(event: AgentEvent) {
+        let expected = serde_json::to_value(&event).unwrap();
+
+        let envelopes = forwarded(vec![event]);
+
+        let [envelope] = envelopes.as_slice() else {
+            panic!("{TRANSCRIPT_DROPPED}");
+        };
+        assert_eq!(serde_json::to_value(&envelope.event).unwrap(), expected);
+        assert_eq!(
+            envelope
+                .subagent
+                .as_ref()
+                .map(|info| info.parent_tool_use_id.as_str()),
+            Some(PARENT_ID),
+            "{TRANSCRIPT_DROPPED}"
+        );
+    }
+
+    /// `Error` ends the session it arrives on, and `Done` is the barrier
+    /// `prompt` drains off `usage_tx`. Neither describes the parent's run.
+    #[test_case(error_event() ; "error")]
+    #[test_case(done_event()  ; "done")]
+    fn a_session_level_event_is_withheld_from_the_parent(event: AgentEvent) {
+        assert!(forwarded(vec![event]).is_empty(), "{TRANSCRIPT_LEAKED}");
+    }
+
+    /// The header is built from the same events the transcript now also sees,
+    /// so widening the relay must leave the digests it publishes untouched.
+    #[test]
+    fn forwarding_live_tool_events_leaves_the_digests_alone() {
+        let published = activities(vec![
+            tool_pending(),
+            tool_input_delta(),
+            tool_start(PENDING_TOOL),
+            tool_output(),
+            text_delta(),
+        ]);
+
+        assert_eq!(
+            published,
+            [
+                (PENDING_TOOL.to_owned(), None),
+                (PENDING_TOOL.to_owned(), Some(INPUT_PREVIEW.to_owned())),
+                (PENDING_TOOL.to_owned(), None),
+                (RESPONDING_LABEL.to_owned(), None),
+            ]
+        );
+    }
+
+    const GRANDCHILD_ID: &str = "task-2";
+    const GRANDCHILD_LEAKED: &str =
+        "a grandchild's live tool work must not be restamped into this session's transcript";
+    const GRANDCHILD_REROUTED: &str =
+        "a grandchild's finished call keeps the routing it had before the live kinds were added";
+
+    fn tool_done() -> AgentEvent {
+        AgentEvent::ToolDone(Box::new(ToolDoneEvent::error(
+            TOOL_ID.to_owned(),
+            SESSION_CLOSED,
+        )))
+    }
+
+    /// A grandchild's events as the parent finally sees them: stamped by the
+    /// relay of the session that ran them, then handled by the relay this
+    /// session runs while it is blocked on that nested task.
+    fn through_two_relays(events: Vec<AgentEvent>) -> Vec<Envelope> {
+        let from_grandchild = relay_hop(
+            session_info(GRANDCHILD_ID),
+            events.into_iter().map(envelope).collect(),
+        );
+        without_digests(relay_hop(parent_info(), from_grandchild))
+    }
+
+    /// Restamped, these would open a card in this session's transcript for a
+    /// call it never made, and `ToolOutput` would re-send its whole buffer
+    /// once per hop. The digest refuses the same nesting.
+    #[test_case(tool_pending()     ; "pending")]
+    #[test_case(tool_input_delta() ; "input_delta")]
+    #[test_case(tool_output()      ; "output")]
+    fn a_grandchilds_live_tool_event_stops_at_the_session_that_ran_it(event: AgentEvent) {
+        assert!(
+            through_two_relays(vec![event]).is_empty(),
+            "{GRANDCHILD_LEAKED}"
+        );
+    }
+
+    /// The kinds this relay already forwarded are left alone: the guard is on
+    /// the newly forwarded ones, so a grandchild's call still arrives wearing
+    /// this session's identity, exactly as it always has.
+    #[test_case(tool_start(PENDING_TOOL) ; "start")]
+    #[test_case(tool_done()              ; "done")]
+    fn a_grandchilds_finished_call_is_relayed_as_before(event: AgentEvent) {
+        let expected = serde_json::to_value(&event).unwrap();
+
+        let envelopes = through_two_relays(vec![event]);
+
+        let [envelope] = envelopes.as_slice() else {
+            panic!("{GRANDCHILD_REROUTED}");
+        };
+        assert_eq!(serde_json::to_value(&envelope.event).unwrap(), expected);
+        assert_eq!(
+            envelope
+                .subagent
+                .as_ref()
+                .map(|info| info.parent_tool_use_id.as_str()),
+            Some(PARENT_ID),
+            "{GRANDCHILD_REROUTED}"
+        );
     }
 
     #[test]

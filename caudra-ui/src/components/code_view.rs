@@ -1918,7 +1918,7 @@ fn render_patch(files: &[PatchedFile], highlight: bool, width: u16) -> Vec<Line<
 /// the live view would only make the card jump when the tool starts, and a
 /// write's card is the file. What makes that affordable is that this runs
 /// once per frame rather than once per fragment — see
-/// `MessagesPanel::flush_live_bodies`. Rendering it per token cost the file's
+/// `MessagesPanel::flush_dirty_cards`. Rendering it per token cost the file's
 /// length squared, which is what a long write used to feel like as lag.
 ///
 /// `render_code` is told the window is the whole of what it is drawing, so it

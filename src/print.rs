@@ -137,6 +137,8 @@ struct RetryEvent<'a> {
     retry_delay_ms: u64,
     error: &'a str,
     session_id: &'a SessionRef,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent_tool_use_id: Option<&'a str>,
 }
 
 enum VerboseOutput {
@@ -389,6 +391,7 @@ pub fn run(
                         retry_delay_ms: *delay_ms,
                         error: message,
                         session_id: &session_id,
+                        parent_tool_use_id,
                     })?;
                 }
             }
@@ -535,6 +538,11 @@ fn print_goal(prompt: String) -> Result<(String, GoalHandle)> {
 mod tests {
     use super::*;
     use caudra_providers::TokenUsage;
+    use test_case::test_case;
+
+    const RETRY_PARENT_ID: &str = "toolu_task_1";
+    const RETRY_ERROR: &str = "overloaded";
+    const PARENT_KEY: &str = "parent_tool_use_id";
 
     const PRINT_RESULT_FIELDS: &[&str] = &[
         "type",
@@ -617,10 +625,32 @@ mod tests {
             retry_delay_ms: 3000,
             error: "rate_limit",
             session_id: &sid,
+            parent_tool_use_id: None,
         };
         let json: Value = serde_json::to_value(&retry).unwrap();
         for field in RETRY_EVENT_FIELDS {
             assert!(json.get(field).is_some(), "RetryEvent missing: {field}");
         }
+    }
+
+    /// A consumer cannot otherwise tell a task's backoff from the main
+    /// conversation's, and the key stays absent for the main one so older
+    /// readers see the shape they always did.
+    #[test_case(None => None ; "main_retry_omits_the_key")]
+    #[test_case(Some(RETRY_PARENT_ID) => Some(RETRY_PARENT_ID.to_owned()) ; "subagent_retry_names_its_parent")]
+    fn retry_event_attributes_the_stream_that_backed_off(parent: Option<&str>) -> Option<String> {
+        let session_id = SessionRef::generate();
+        let json: Value = serde_json::to_value(RetryEvent {
+            event_type: "system",
+            subtype: "api_retry",
+            attempt: 1,
+            retry_delay_ms: 1_000,
+            error: RETRY_ERROR,
+            session_id: &session_id,
+            parent_tool_use_id: parent,
+        })
+        .unwrap();
+        json.get(PARENT_KEY)
+            .map(|id| id.as_str().expect("serialized as a string").to_owned())
     }
 }

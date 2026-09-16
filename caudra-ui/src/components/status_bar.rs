@@ -156,19 +156,26 @@ impl StatusBarHitTarget {
     /// the command edits a session setting, while the chip renders and cycles
     /// the effective level of the session model, which is not the model a task
     /// runs.
+    ///
+    /// [`Self::Retry`] is main-only although every chat draws its own countdown:
+    /// asking for an immediate retry reaches the top-level agent alone, so on a
+    /// task the chip is a label and a click there would shorten the main
+    /// conversation's backoff instead of the one on screen.
     pub fn scope(self) -> ChatScope {
         match self {
             Self::BackToMain
             | Self::Context
             | Self::Usage
-            | Self::Retry
             | Self::ChatName
             | Self::Cwd
             | Self::ResumeAutoScroll
             | Self::Yolo => ChatScope::Any,
-            Self::Mode | Self::Model | Self::Thinking | Self::Goal | Self::Workflows => {
-                ChatScope::MainOnly
-            }
+            Self::Mode
+            | Self::Model
+            | Self::Thinking
+            | Self::Goal
+            | Self::Workflows
+            | Self::Retry => ChatScope::MainOnly,
         }
     }
 
@@ -712,21 +719,13 @@ impl StatusBar {
         Dirty::YES
     }
 
-    /// The bar spins for a whole turn, again while a restore is in flight, and
-    /// it counts a retry down by the second. It sits next to [`Self::view`] so
-    /// a new moving span cannot forget to claim its frames.
-    pub fn cadence(
-        &self,
-        status: &Status,
-        restoring: bool,
-        retrying: bool,
-        goal_active: bool,
-    ) -> Cadence {
+    /// The bar spins for a whole turn and again while a restore is in flight.
+    /// It sits next to [`Self::view`] so a new moving span cannot forget to
+    /// claim its frames; the retry countdown is the exception, claimed by the
+    /// chat that owns it because the bar only borrows it to draw.
+    pub fn cadence(&self, status: &Status, restoring: bool, goal_active: bool) -> Cadence {
         Cadence::any([
-            Cadence::when(
-                *status == Status::Streaming || restoring || retrying,
-                Cadence::SPINNER,
-            ),
+            Cadence::when(*status == Status::Streaming || restoring, Cadence::SPINNER),
             Cadence::when(goal_active, Cadence::CLOCK),
             Cadence::when(self.marquee.active(), Cadence::due(MARQUEE_STEP)),
         ])
@@ -2221,7 +2220,7 @@ mod tests {
         });
 
         assert_eq!(
-            bar.cadence(&Status::Idle, false, false, false),
+            bar.cadence(&Status::Idle, false, false),
             Cadence::due(MARQUEE_STEP)
         );
     }
@@ -2985,21 +2984,22 @@ mod tests {
         StatusBarHitTarget::Workflows,
         StatusBarHitTarget::Retry,
     ];
-    const TASK_CONTROLS: [StatusBarHitTarget; 4] = [
+    const TASK_CONTROLS: [StatusBarHitTarget; 3] = [
         StatusBarHitTarget::BackToMain,
         StatusBarHitTarget::Context,
         StatusBarHitTarget::Usage,
-        StatusBarHitTarget::Retry,
     ];
     const TASK_HIT_MSG: &str = "a task's bar offers exactly the controls a task owns";
+    const INERT_RETRY_MSG: &str = "a task's countdown is drawn even though it cannot be clicked";
     /// Wide enough that every chip survives the ladder, so a control missing
     /// from the hits is one the scope refused rather than one the width dropped.
     const TASK_BAR_WIDTH: u16 = 200;
 
     /// A task's bar still draws the session's model, reasoning level, workflow
-    /// count and goal, because they describe the run the task belongs to. Only
-    /// the controls that read the transcript in front of you, or leave it,
-    /// answer the pointer.
+    /// count and goal, because they describe the run the task belongs to, and
+    /// its own backoff, because that is the task the user is watching. Only the
+    /// controls that read the transcript in front of you, or leave it, answer
+    /// the pointer.
     #[test]
     fn a_task_bar_offers_only_the_controls_a_task_owns() {
         let goal = active_goal();
@@ -3008,7 +3008,7 @@ mod tests {
             message: RETRY_MESSAGE.into(),
             deadline: Instant::now() + RETRY_REMAINING,
         };
-        let (_, hits, _) = render_at(Fixture {
+        let (text, hits, _) = render_at(Fixture {
             width: TASK_BAR_WIDTH,
             main_chat: false,
             goal: Some(&goal),
@@ -3017,6 +3017,7 @@ mod tests {
             ..Default::default()
         });
 
+        assert!(text.contains(RETRY_COUNTDOWN_PREFIX), "{INERT_RETRY_MSG}");
         for target in ALL_CONTROLS {
             assert_eq!(
                 hits.iter().any(|hit| hit.target == target),

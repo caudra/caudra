@@ -177,7 +177,20 @@ const HINT_PLUGIN: &str = "statusline";
 const HINT_TEXT: &str = "2/4 staged";
 const HINT_STYLE: &str = "fg";
 const RETRY_MESSAGE: &str = "overloaded";
-const RETRY_DELAY: Duration = Duration::from_secs(5);
+const RETRY_ATTEMPT: u32 = 2;
+const RETRY_DELAY_MS: u64 = 5_000;
+const RETRY_DELAY: Duration = Duration::from_millis(RETRY_DELAY_MS);
+const MAIN_RETRY_WIPED: &str = "a subagent's event must not clear the main chat's backoff";
+const MAIN_RETRY_STUCK: &str = "the main chat's own next event ends its backoff";
+const SUBAGENT_RETRY_MISSING: &str = "a task's own chat must show the backoff it is waiting out";
+const SUBAGENT_RETRY_LEAKED: &str = "a task's backoff is not the main conversation's";
+const BACKOFF_SLEPT: &str = "a backgrounded task's countdown has to keep the loop awake";
+/// Asserted without the seconds, which tick down between the event and the
+/// render.
+const RETRY_COUNTDOWN_PREFIX: &str = "retrying in";
+const COUNTDOWN_DRAWN_FOR_THE_WRONG_CHAT: &str = "the bar draws the backoff of the chat on screen";
+const BAR_CLAIMS_THE_COUNTDOWN: &str = "the bar borrows a countdown to draw, it does not own it";
+const RETRY_CONTROL_MISPLACED: &str = "only the main chat's countdown can be clicked";
 const MISSING_DIR: &str = "gone";
 const RESUMED_PROMPT: &str = "carry me over";
 const CONVERSATION_PERMISSION_PATTERN: &str = "just *";
@@ -5467,29 +5480,48 @@ fn waiting_tool_animates_at_the_spinner_rate() {
     assert_eq!(app.cadence(), Cadence::SPINNER);
 }
 
-/// The bar spins for a whole streaming turn, again while a restore is in
-/// flight, and once more for a retry countdown. The old `is_animating` only
-/// knew about the restore, so the other two froze mid turn.
-#[test_case(Status::Streaming, false, false => Cadence::SPINNER ; "streaming_turn")]
-#[test_case(Status::Idle, true, false => Cadence::SPINNER ; "restoring_session")]
-#[test_case(Status::Idle, false, true => Cadence::SPINNER ; "retry_countdown")]
-#[test_case(Status::Idle, false, false => Cadence::IDLE ; "nothing_in_flight")]
-fn status_bar_motion_reaches_app_cadence(
-    status: Status,
-    restoring: bool,
-    retrying: bool,
-) -> Cadence {
+/// The bar spins for a whole streaming turn and again while a restore is in
+/// flight. The old `is_animating` only knew about the restore, so a streaming
+/// turn froze mid flight. The countdown used to be a third case here and is
+/// now the chat's, which
+/// [`a_retry_countdown_reaches_app_cadence_through_the_chat_that_owns_it`]
+/// covers.
+#[test_case(Status::Streaming, false => Cadence::SPINNER ; "streaming_turn")]
+#[test_case(Status::Idle, true => Cadence::SPINNER ; "restoring_session")]
+#[test_case(Status::Idle, false => Cadence::IDLE ; "nothing_in_flight")]
+fn status_bar_motion_reaches_app_cadence(status: Status, restoring: bool) -> Cadence {
     let mut app = app_without_splash();
     app.status = status;
     app.restoring.store(restoring, Ordering::Relaxed);
-    if retrying {
-        app.retry_info = Some(RetryInfo {
-            attempt: 1,
-            message: RETRY_MESSAGE.into(),
-            deadline: Instant::now() + RETRY_DELAY,
-        });
-    }
     app.cadence()
+}
+
+fn retry_info() -> RetryInfo {
+    RetryInfo {
+        attempt: RETRY_ATTEMPT,
+        message: RETRY_MESSAGE.into(),
+        deadline: Instant::now() + RETRY_DELAY,
+    }
+}
+
+/// A countdown belongs to the chat sitting it out, not to the bar that borrows
+/// it to draw. The bar is only ever handed the chat on screen, so a
+/// backgrounded task's frames would be dropped if the bar still claimed them.
+#[test]
+fn a_retry_countdown_reaches_app_cadence_through_the_chat_that_owns_it() {
+    let mut app = app_without_splash();
+    assert_eq!(app.cadence(), Cadence::IDLE);
+
+    app.chats[0].set_retry(retry_info());
+
+    assert_eq!(app.chats[0].cadence(), Cadence::SPINNER);
+    assert_eq!(
+        app.status_bar
+            .cadence(&app.status, false, app.state.goal.snapshot().is_some()),
+        Cadence::IDLE,
+        "{BAR_CLAIMS_THE_COUNTDOWN}"
+    );
+    assert_eq!(app.cadence(), Cadence::SPINNER);
 }
 
 /// `App::cadence` asks `overlays()` as a group, so a moving overlay only
@@ -10797,7 +10829,7 @@ fn retry_clears_in_progress_tools() {
         delay_ms: 1000,
     }));
     assert_eq!(app.chats[0].in_progress_count(), 0);
-    assert!(app.retry_info.is_some());
+    assert!(app.chats[0].retry().is_some());
 }
 
 /// The countdown is a control, not just a label: clicking it asks the agent to
@@ -10818,7 +10850,7 @@ fn clicking_the_retry_countdown_asks_for_an_immediate_retry() {
 
     assert!(click_status(&mut app, StatusBarHitTarget::Retry).is_empty());
 
-    assert!(app.retry_info.is_none());
+    assert!(app.chats[0].retry().is_none());
     assert!(matches!(
         cmd_rx.try_recv(),
         Ok(crate::agent::AgentCommand::RetryNow)
@@ -10880,7 +10912,109 @@ fn retry_clears_subagent_in_progress_tools() {
         Some("research"),
     ));
     assert_eq!(app.chats[1].in_progress_count(), 0);
-    assert!(app.retry_info.is_none());
+    assert!(app.chats[1].retry().is_some(), "{SUBAGENT_RETRY_MISSING}");
+    assert!(app.chats[0].retry().is_none(), "{SUBAGENT_RETRY_LEAKED}");
+}
+
+fn retry_event() -> AgentEvent {
+    AgentEvent::Retry {
+        attempt: RETRY_ATTEMPT,
+        message: RETRY_MESSAGE.into(),
+        delay_ms: RETRY_DELAY_MS,
+    }
+}
+
+fn app_with_retrying_subagent() -> App {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    app.update(subagent_msg(retry_event(), TASK_ID, Some(RESEARCH_NAME)));
+    app
+}
+
+/// The parent's task header already says a retry happened; the transcript the
+/// user opens to watch that task showed nothing at all.
+#[test]
+fn a_subagent_retry_is_recorded_on_the_chat_it_belongs_to() {
+    let app = app_with_retrying_subagent();
+
+    let retry = app.chats[1].retry().expect(SUBAGENT_RETRY_MISSING);
+    assert_eq!(retry.message, RETRY_MESSAGE);
+    assert_eq!(retry.attempt, RETRY_ATTEMPT);
+    assert!(app.chats[0].retry().is_none(), "{SUBAGENT_RETRY_LEAKED}");
+}
+
+/// A running task publishes a digest on every activity change, so a single
+/// clear that ignored which chat an event addressed wiped the main chat's
+/// countdown almost as soon as it appeared.
+#[test_case(progress_event(SubagentActivity::Responding, 1) ; "progress_digest")]
+#[test_case(AgentEvent::StreamReset ; "stream_reset")]
+#[test_case(AgentEvent::ToolPending { id: SUB_TOOL_ID.into(), name: "bash".into() } ; "tool_event")]
+fn a_subagents_event_leaves_the_main_retry_standing(event: AgentEvent) {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    app.update(agent_msg(retry_event()));
+
+    app.update(subagent_msg(event, TASK_ID, Some(RESEARCH_NAME)));
+    assert!(app.chats[0].retry().is_some(), "{MAIN_RETRY_WIPED}");
+
+    app.update(agent_msg(AgentEvent::ToolPending {
+        id: "t1".into(),
+        name: "bash".into(),
+    }));
+    assert!(app.chats[0].retry().is_none(), "{MAIN_RETRY_STUCK}");
+}
+
+/// Nothing else is in flight while a task sleeps off its backoff, so the loop
+/// has only the countdown to stay awake for.
+#[test]
+fn a_backgrounded_tasks_backoff_keeps_the_loop_awake() {
+    let mut app = app_with_retrying_subagent();
+    app.status = Status::Idle;
+    assert_eq!(app.active_chat, 0);
+
+    assert!(app.has_lifecycle_work(), "{BACKOFF_SLEPT}");
+
+    app.chats[1].clear_retry();
+    assert!(!app.has_lifecycle_work());
+}
+
+/// The bar is drawn for whichever chat is on screen, so it must read that
+/// chat's backoff and no other's. Only the main chat's countdown answers the
+/// pointer: an immediate retry reaches the top-level agent alone, so clicking a
+/// task's chip would cut the main conversation's backoff short and leave the
+/// task on screen waiting out the one the user asked to skip.
+#[test_case(0, 0, true, true   ; "the_main_chat_is_waiting_it_out")]
+#[test_case(1, 0, false, false ; "the_main_chat_is_not_the_one_retrying")]
+#[test_case(1, 1, true, false  ; "the_retrying_task_is_on_screen")]
+fn the_focused_chats_countdown_is_drawn_but_only_the_main_chats_is_clickable(
+    retrying: usize,
+    focused: usize,
+    expect_chip: bool,
+    expect_control: bool,
+) {
+    let mut app = app_with_retrying_subagent();
+    if retrying == 0 {
+        app.chats[1].clear_retry();
+        app.chats[0].set_retry(retry_info());
+    }
+    app.active_chat = focused;
+
+    let bar = rendered_wide(&mut app, SIGMA_BAR_WIDTH);
+
+    assert_eq!(
+        bar.contains(RETRY_COUNTDOWN_PREFIX),
+        expect_chip,
+        "{COUNTDOWN_DRAWN_FOR_THE_WRONG_CHAT}"
+    );
+    assert_eq!(
+        app.status_hits
+            .iter()
+            .any(|hit| hit.target == StatusBarHitTarget::Retry),
+        expect_control,
+        "{RETRY_CONTROL_MISPLACED}"
+    );
 }
 
 #[test]
@@ -10896,7 +11030,7 @@ fn auth_stream_reset_clears_partial_tools_without_retry_status() {
     app.update(agent_msg(AgentEvent::StreamReset));
 
     assert_eq!(app.chats[0].in_progress_count(), 0);
-    assert!(app.retry_info.is_none());
+    assert!(app.chats[0].retry().is_none());
 }
 
 fn auth_retry_enter(app: &mut App) -> Vec<Action> {

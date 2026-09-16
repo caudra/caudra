@@ -956,11 +956,15 @@ pub struct MessagesPanel {
     hover: Option<HoverTarget>,
     message_action_hits: Vec<MessageActionHit>,
     terminal_links: Vec<TerminalLink>,
-    /// Cards whose still-arriving file body has grown since the last frame.
-    /// The body is drawn whole, so redrawing it once per fragment costs the
-    /// file's length squared; the frame is the natural rate for something
-    /// nobody can read faster than.
-    live_body_dirty: HashSet<String>,
+    /// Cards whose message changed since the last frame and whose segment is
+    /// therefore owed a rebuild. A card's lines are derived, so paying for
+    /// them per event costs the card's length per event; the frame is the
+    /// natural rate for something nobody can read faster than, and a chat
+    /// nobody is looking at pays nothing at all.
+    ///
+    /// Keyed by tool id rather than segment index, so the cache moving under
+    /// it cannot turn an entry into a rebuild of the wrong card.
+    dirty_cards: HashSet<String>,
 }
 
 impl MessagesPanel {
@@ -1035,7 +1039,7 @@ impl MessagesPanel {
             hover: None,
             message_action_hits: Vec::new(),
             terminal_links: Vec::new(),
-            live_body_dirty: HashSet::new(),
+            dirty_cards: HashSet::new(),
         }
     }
 
@@ -1063,6 +1067,9 @@ impl MessagesPanel {
         // heights, so a raw line offset would land anywhere.
         let anchor = self.cache.anchor_at(self.scroll_top, self.viewport_width);
         self.cache.clear();
+        // The next frame builds every segment from scratch, so an owed redraw
+        // is already paid for and would only shift the anchor index below.
+        self.dirty_cards.clear();
         if let Some((seg_idx, _)) = anchor.filter(|_| !self.auto_scroll) {
             self.pending_scroll_segment = Some(seg_idx);
         }
@@ -1433,7 +1440,7 @@ impl MessagesPanel {
         self.armed_card = None;
         self.lua_clicks.clear();
         self.live_bufs.clear();
-        self.live_body_dirty.clear();
+        self.dirty_cards.clear();
         self.watched_bufs.clear();
         self.retained_shell_outputs.clear();
         self.rebake_requested.clear();
@@ -1546,7 +1553,7 @@ impl MessagesPanel {
         if let Some(size) = size {
             msg.annotation = Some(size);
         }
-        self.rebuild_tool_segment(tool_id);
+        self.mark_card_dirty(tool_id);
     }
 
     pub fn tool_input_roster(&mut self, tool_id: &str, entries: Option<Vec<BatchToolEntry>>) {
@@ -1560,14 +1567,14 @@ impl MessagesPanel {
             return;
         }
         merge_batch_snapshot(msg, entries, String::new());
-        self.rebuild_tool_segment(tool_id);
+        self.mark_card_dirty(tool_id);
     }
 
     /// The file a still-streaming write is spelling out. `ToolStart` drops it
     /// for the call's real output, so it only ever fills the wait.
     ///
     /// Only the text is kept here. The card is drawn from it once per frame
-    /// by [`Self::flush_live_bodies`], because the body is drawn whole and a
+    /// by [`Self::flush_dirty_cards`], because the body is drawn whole and a
     /// fragment arrives per token.
     pub fn tool_input_body(&mut self, tool_id: &str, body: Option<String>) {
         let Some(body) = body else {
@@ -1580,20 +1587,35 @@ impl MessagesPanel {
             return;
         }
         msg.live_body.get_or_insert_default().push_str(&body);
-        self.live_body_dirty.insert(tool_id.to_owned());
+        self.mark_card_dirty(tool_id);
     }
 
-    /// Redraws the cards whose file grew since the last frame. Called from
-    /// `view`, so a write costs its length once a frame however fast the
-    /// fragments arrive.
-    fn flush_live_bodies(&mut self) {
-        for tool_id in mem::take(&mut self.live_body_dirty) {
-            self.rebuild_tool_segment(&tool_id);
+    /// Owes `tool_id` a redraw at the next frame. The message itself is always
+    /// written as the event lands; only the lines derived from it wait, so
+    /// everything that reads the transcript still sees the latest state.
+    fn mark_card_dirty(&mut self, tool_id: &str) {
+        self.dirty_cards.insert(tool_id.to_owned());
+    }
+
+    /// Redraws every card that changed since the last frame. Called from
+    /// `view`, so a burst of live events costs each card its length once for
+    /// the frame that shows it and nothing at all while nobody is looking.
+    ///
+    /// Deliberately unconditional: the reflow pass only reaches the segments
+    /// around the viewport, so anything cleverer would leave an off-screen
+    /// card holding lines that no later frame goes back for.
+    ///
+    /// Hover-preserving, like the other per-frame refreshes: this runs before
+    /// the frame reads hover, so clearing it here would cancel the reader's
+    /// pointer for as long as anything in the chat is still streaming.
+    fn flush_dirty_cards(&mut self) {
+        for tool_id in mem::take(&mut self.dirty_cards) {
+            self.rebuild_tool_lines(&tool_id);
         }
     }
 
     pub fn tool_start(&mut self, event: ToolStartEvent) {
-        self.live_body_dirty.remove(&event.id);
+        self.dirty_cards.remove(&event.id);
         if let Some(msg) = self.find_tool_msg_mut(&event.id) {
             if !Self::is_running(msg) {
                 return;
@@ -1681,7 +1703,7 @@ impl MessagesPanel {
             self.settle_child_progress(tool_id, index);
             self.forget_child_output(tool_id, index);
         }
-        self.rebuild_tool_segment(tool_id);
+        self.mark_card_dirty(tool_id);
     }
 
     /// Brings the card of `run` up to its latest state, whether a slash
@@ -1760,7 +1782,7 @@ impl MessagesPanel {
                 .or_default(),
         )
         .insert(index, ToolProgress::live(report));
-        self.rebuild_tool_segment(tool_id);
+        self.mark_card_dirty(tool_id);
         true
     }
 
@@ -1781,7 +1803,7 @@ impl MessagesPanel {
                 .or_default(),
         )
         .insert(index, content.to_owned());
-        self.rebuild_tool_segment(tool_id);
+        self.mark_card_dirty(tool_id);
         true
     }
 
@@ -1908,11 +1930,11 @@ impl MessagesPanel {
         msg.text.push('\n');
         msg.text.push_str(&truncated.kept);
         msg.live_output = Some(content.to_owned());
-        self.rebuild_tool_segment(tool_id);
+        self.mark_card_dirty(tool_id);
     }
 
     pub fn tool_done(&mut self, event: ToolDoneEvent) {
-        self.live_body_dirty.remove(&event.id);
+        self.dirty_cards.remove(&event.id);
         self.remove_child_live_bufs(&event.id);
         let retain_live_output = matches!(&event.output, ToolOutput::Shell(_));
         let had_live_buf = self.retire_live_buf(&event.id);
@@ -2045,7 +2067,7 @@ impl MessagesPanel {
             && let ToolOutput::Batch { entries, .. } = Arc::make_mut(output)
         {
             entries[index].annotation = Some(annotation);
-            self.rebuild_tool_segment(parent);
+            self.mark_card_dirty(parent);
         }
     }
 
@@ -2114,7 +2136,7 @@ impl MessagesPanel {
             return;
         };
         update_msg(msg);
-        self.rebuild_tool_segment(tool_id);
+        self.mark_card_dirty(tool_id);
     }
 
     pub fn stream_reset(&mut self) {
@@ -2192,7 +2214,7 @@ impl MessagesPanel {
             self.remove_child_live_bufs(id);
             self.batch_child_output.remove(id);
             self.batch_child_started.remove(id);
-            self.live_body_dirty.remove(id);
+            self.dirty_cards.remove(id);
             if let Some(children) = self.batch_child_progress.get_mut(id) {
                 Arc::make_mut(children)
                     .values_mut()
@@ -3242,7 +3264,7 @@ impl MessagesPanel {
         }
         self.follow_latest();
         self.rebuild_line_cache();
-        self.flush_live_bodies();
+        self.flush_dirty_cards();
         if let Some(seg_idx) = self.pending_scroll_segment.take() {
             self.scroll_to_segment(seg_idx.min(self.cache.len().saturating_sub(1)));
         }
@@ -4115,6 +4137,9 @@ impl MessagesPanel {
                 msg.render_snapshot = Some(snapshot);
             }
             msg.snapshot_theme_gen = applied_gen;
+            // A live shell chunk reaches `tool_output` above on its way here,
+            // so the card it owes a redraw is the one this draws right now.
+            self.dirty_cards.remove(tool_id);
             self.rebuild_tool_segment(tool_id);
         } else {
             self.dropped_snapshots.record(tool_id);

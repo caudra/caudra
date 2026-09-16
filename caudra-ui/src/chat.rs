@@ -13,7 +13,7 @@ use crate::components::messages::{MessagesPanel, PromptProgress};
 use crate::components::tool_display::append_annotation;
 use crate::components::workflow_card::CardHit;
 use crate::components::{
-    DisplayMessage, DisplayRole, DisplaySource, ToolRole, ToolStatus, workflow_card,
+    DisplayMessage, DisplayRole, DisplaySource, RetryInfo, ToolRole, ToolStatus, workflow_card,
 };
 use crate::markdown::truncate_output;
 
@@ -89,6 +89,10 @@ pub struct Chat {
     /// is the handle `caudra.task` addresses a task by, see `app::tasks`.
     task_id: Option<Arc<str>>,
     parent_tool_use_id: Option<Arc<str>>,
+    /// The provider backoff this chat's own stream is waiting out. It is per
+    /// chat because a subagent retrying says nothing about the main chat, and
+    /// the status bar draws whichever chat is on screen.
+    retry: Option<RetryInfo>,
     /// Whether harness-injected messages get a row at all. They always start
     /// folded, so this is the switch for readers who want the transcript to
     /// hold nothing but the conversation.
@@ -114,6 +118,7 @@ impl Chat {
             finish: None,
             task_id: None,
             parent_tool_use_id: None,
+            retry: None,
         }
     }
 
@@ -449,7 +454,10 @@ impl Chat {
     }
 
     pub fn cadence(&self) -> Cadence {
-        self.messages_panel.cadence()
+        Cadence::any([
+            self.messages_panel.cadence(),
+            Cadence::when(self.retry.is_some(), Cadence::SPINNER),
+        ])
     }
 
     pub fn view(
@@ -598,7 +606,20 @@ impl Chat {
             .tool_header_snapshot(tool_id, snapshot, theme_gen);
     }
 
+    pub(crate) fn set_retry(&mut self, retry: RetryInfo) {
+        self.retry = Some(retry);
+    }
+
+    pub(crate) fn retry(&self) -> Option<&RetryInfo> {
+        self.retry.as_ref()
+    }
+
+    pub(crate) fn clear_retry(&mut self) {
+        self.retry = None;
+    }
+
     pub fn stream_reset(&mut self) {
+        self.retry = None;
         self.messages_panel.stream_reset();
     }
 
@@ -627,6 +648,7 @@ impl Chat {
     /// only ever grows one ending, but a caller who knows more than the one who
     /// got here first rewrites it in place. See [`TaskOutcome::refines`].
     pub(crate) fn mark_finished(&mut self, outcome: TaskOutcome, text: &str) {
+        self.retry = None;
         if let Some((previous, bubble)) = self.finish {
             if outcome.refines(previous) {
                 self.finish = Some((outcome, bubble));

@@ -403,7 +403,6 @@ pub struct App {
     pub(crate) run_id: u64,
     pub(crate) cancelling_run: Option<u64>,
     replacement_item: Option<QueueItemId>,
-    pub(super) retry_info: Option<RetryInfo>,
     goal_deferred: bool,
     pub(super) zones: ZoneRegistry,
     pub(super) selection_state: Option<SelectionState>,
@@ -617,7 +616,6 @@ impl App {
             run_id: 0,
             cancelling_run: None,
             replacement_item: None,
-            retry_info: None,
             goal_deferred: false,
             zones: ZoneRegistry::new(),
             selection_state: None,
@@ -3331,7 +3329,6 @@ impl App {
         let cancelled_run = self.run_id;
         self.run_id += 1;
         self.cancelling_run = await_terminal.then_some(cancelled_run);
-        self.retry_info = None;
         self.close_all_overlays();
         self.pending_input = PendingInput::None;
         self.finish_subagents(TaskOutcome::Killed, CANCELLED_TEXT);
@@ -3344,6 +3341,7 @@ impl App {
         for chat in &mut self.chats {
             chat.flush();
             chat.cancel_in_progress();
+            chat.clear_retry();
         }
         self.main_chat()
             .push(DisplayMessage::new(DisplayRole::Error, CANCEL_MSG.into()));
@@ -3719,7 +3717,6 @@ impl App {
         if matches!(envelope.event, AgentEvent::StreamReset) {
             self.chats[chat_idx].stream_reset();
             self.discard_stream_delegations(chat_idx);
-            self.retry_info = None;
             return vec![];
         }
 
@@ -3731,17 +3728,18 @@ impl App {
         {
             self.chats[chat_idx].stream_reset();
             self.discard_stream_delegations(chat_idx);
-            if chat_idx == 0 {
-                self.retry_info = Some(RetryInfo {
-                    attempt,
-                    message,
-                    deadline: Instant::now() + Duration::from_millis(delay_ms),
-                });
-            }
+            self.chats[chat_idx].set_retry(RetryInfo {
+                attempt,
+                message,
+                deadline: Instant::now() + Duration::from_millis(delay_ms),
+            });
             return vec![];
         }
 
-        self.retry_info = None;
+        // The wait is over for the stream that produced this, and only for it:
+        // a subagent's traffic says nothing about a backoff the main chat or a
+        // sibling task is still sitting in.
+        self.chats[chat_idx].clear_retry();
 
         if let AgentEvent::TurnComplete(ref tc) = envelope.event {
             self.state.token_usage += tc.usage;
@@ -4764,7 +4762,7 @@ impl App {
 
     pub(crate) fn has_lifecycle_work(&self) -> bool {
         self.status == Status::Streaming
-            || self.retry_info.is_some()
+            || self.chats.iter().any(|chat| chat.retry().is_some())
             || self.restoring.load(Ordering::Relaxed)
             || self.btw_modal.is_streaming()
             || self
@@ -5067,7 +5065,6 @@ impl App {
             self.status_bar.cadence(
                 &self.status,
                 self.restoring.load(Ordering::Relaxed),
-                self.retry_info.is_some(),
                 self.state.goal.snapshot().is_some(),
             ),
             self.selection_state

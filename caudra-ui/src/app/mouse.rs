@@ -1019,7 +1019,7 @@ impl App {
             // "retrying in 0s" reads like the click missed.
             StatusBarHitTarget::Retry => {
                 self.clear_control_hovers();
-                self.retry_info = None;
+                self.active_chat().clear_retry();
                 if let Some(cmd_tx) = &self.cmd_tx {
                     let _ = cmd_tx.try_send(AgentCommand::RetryNow);
                 }

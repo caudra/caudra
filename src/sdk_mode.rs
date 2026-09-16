@@ -219,6 +219,18 @@ struct UserPayload {
     workflow: Option<WorkflowProvenance>,
 }
 
+/// The `system` / `api_retry` body. `parent_tool_use_id` names the subagent
+/// whose stream is backing off, so a client can tell a task's retry from the
+/// main conversation's.
+#[derive(Serialize)]
+struct RetryPayload<'a> {
+    attempt: u32,
+    retry_delay_ms: u64,
+    error: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent_tool_use_id: Option<&'a str>,
+}
+
 /// The `system` / `workflow` body: the run's event plus the envelope's
 /// `workflow_*` provenance keys, so a client can key it by run.
 #[derive(Serialize)]
@@ -2229,11 +2241,12 @@ impl EventPump {
                 }
                 self.writer.emit_system(
                     "api_retry",
-                    serde_json::json!({
-                        "attempt": attempt,
-                        "retry_delay_ms": delay_ms,
-                        "error": message,
-                    }),
+                    serde_json::to_value(RetryPayload {
+                        attempt: *attempt,
+                        retry_delay_ms: *delay_ms,
+                        error: message,
+                        parent_tool_use_id: parent_tool_use_id.as_deref(),
+                    })?,
                 )?;
             }
             AgentEvent::TurnComplete(tc) => {
@@ -2413,6 +2426,10 @@ mod tests {
     const REPAIR_INPUT: u32 = 17;
     const REPAIR_PARENT: &str = "repair-parent";
     const REPAIR_FAILURE: &str = "transport failed";
+    const RETRY_PARENT: &str = "toolu_task_1";
+    const RETRY_ERROR: &str = "overloaded";
+    const RETRY_DELAY_MS: u64 = 1_000;
+    const PARENT_KEY: &str = "parent_tool_use_id";
     const WORKSPACE_REBIND_REQUIRED: &str =
         "session workspace identity changed; fork or explicitly rebind the session";
 
@@ -3945,6 +3962,43 @@ mod tests {
         assert_eq!(message["parent_tool_use_id"], "wf-call");
         assert_eq!(message["workflow_run_id"], RUN_ID);
         assert_eq!(message["workflow_epoch"], EPOCH);
+    }
+
+    /// A consumer cannot otherwise tell a task's backoff from the main
+    /// conversation's, and the key stays absent for the main one so older
+    /// readers see the shape they always did.
+    #[test_case(None => None ; "main_retry_omits_the_key")]
+    #[test_case(Some(RETRY_PARENT) => Some(RETRY_PARENT.to_owned()) ; "subagent_retry_names_its_parent")]
+    fn api_retry_attributes_the_stream_that_backed_off(parent: Option<&str>) -> Option<String> {
+        let (mut pump, out_rx, _) =
+            permission_event_pump(permission_manager(), PermissionMode::Default);
+
+        pump.handle(Envelope {
+            event: AgentEvent::Retry {
+                attempt: 1,
+                message: RETRY_ERROR.into(),
+                delay_ms: RETRY_DELAY_MS,
+            },
+            subagent: parent.map(|id| SubagentInfo {
+                parent_tool_use_id: id.into(),
+                task_id: id.into(),
+                name: id.into(),
+                prompt: None,
+                model: None,
+                answer_tx: None,
+                steer_tx: None,
+            }),
+            run_id: 1,
+            workflow: None,
+        })
+        .unwrap();
+
+        let message = next_message(&out_rx);
+        assert_eq!(message["subtype"], "api_retry");
+        assert_eq!(message["error"], RETRY_ERROR);
+        message
+            .get(PARENT_KEY)
+            .map(|id| id.as_str().expect("serialized as a string").to_owned())
     }
 
     #[test_case(WORKFLOW_LIST, serde_json::json!({}) => WorkflowRequest::List; "list")]
