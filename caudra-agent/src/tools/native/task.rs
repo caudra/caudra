@@ -34,7 +34,7 @@ Available system prompt profiles:
 Notes:
 1. Launch multiple tasks concurrently when possible.
 2. The agent's result is not visible to the user. Summarize it in your response.
-3. A fresh call gives the subagent no context beyond your prompt, so make the prompt self-contained and state exactly what to report back.
+3. A fresh call gives the subagent no context beyond your prompt, so make the prompt self-contained and state exactly what to report back. Write it as prose: compress by omitting, never by running words together.
 4. Every result, success or failure, carries a task_id. Pass it back to continue that subagent with its previous messages and tool outputs, sending only the new work. Omit mode and profile when continuing; they stay locked to the original run. Omit prompt too to resume an interrupted subagent that needs no new instruction.
 5. Tell it to return concise summaries with file:line refs, not full file contents.
 ";

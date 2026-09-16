@@ -35,6 +35,7 @@ pub const DESCRIPTION: &str = "Persistent, project-scoped scratchpad for learnin
 - Notes are retrieved by tag; reuse the tags from your system prompt when they fit.
 - Save important context before compaction or to build up project knowledge.
 - Keep entries concise and current. Delete outdated information.
+- Concision comes from dropping facts, never from dropping spaces or running words together. A note that cannot be read costs more than the tokens it saved.
 - Embedded `list` and `read` report the notes dir for `file_edit`. Remote sessions return opaque memory references for `local_document_read`, `local_document_write`, or `local_document_apply_patch`; no client host path is exposed.";
 
 pub const TOOL_USAGE: &str =
