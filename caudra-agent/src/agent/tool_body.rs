@@ -76,6 +76,7 @@ const BODY_ARGS: &[(&str, &[&str], Body)] = &[
     ("python_execution", &["code"], Body::Drawn),
     ("memory", &["content"], Body::Drawn),
     ("local_document_write", &["content"], Body::Drawn),
+    ("task", &["prompt"], Body::Drawn),
 ];
 
 /// The arguments `tool` writes and what becomes of them, `None` for a tool
@@ -382,7 +383,9 @@ mod tests {
     const PATCH: &str = "file_apply_patch";
     const SHELL: &str = "shell";
     const MEMORY: &str = "memory";
+    const TASK: &str = "task";
     const CONTENT_KEYS: &[&str] = &["content"];
+    const PROMPT_KEYS: &[&str] = &["prompt"];
     const EDIT_KEYS: &[&str] = &["oldString", "newString"];
     const PATCH_TEXT_KEYS: &[&str] = &["patchText"];
     const COMMAND_KEYS: &[&str] = &["command"];
@@ -390,6 +393,7 @@ mod tests {
     /// What a header reads once it stops naming files one by one.
     const COUNTED_FILES: &str = " files";
     const EXPECT_NAMED: &str = "a patch that declares files earns a header";
+    const EXPECT_PROMPT: &str = "a delegation draws the brief it sends, whole";
 
     /// Everything the fragments published, in arrival order.
     fn published(tool: &str, fragments: &[&str]) -> String {
@@ -433,10 +437,33 @@ mod tests {
     #[test_case("python_execution", Some((CODE_KEYS, Body::Drawn)) ; "a_script_is_drawn")]
     #[test_case(MEMORY, Some((CONTENT_KEYS, Body::Drawn)) ; "a_note_is_drawn")]
     #[test_case("local_document_write", Some((CONTENT_KEYS, Body::Drawn)) ; "a_local_document_is_drawn")]
+    #[test_case(TASK, Some((PROMPT_KEYS, Body::Drawn)) ; "a_delegation_draws_its_prompt")]
     #[test_case("file_read", None ; "a_tool_with_no_body")]
     fn a_tools_body_arguments(tool: &str, expected: Option<(&[&str], Body)>) {
         assert_eq!(body_arg(tool), expected);
         assert_eq!(BodyStream::new(tool).is_some(), expected.is_some());
+    }
+
+    /// The description names the call; the prompt is the call. A card that drew
+    /// the first would be summarising a summary, and the row already carries it.
+    #[test]
+    fn a_delegation_draws_the_prompt_and_not_the_description() {
+        let decoded = published(
+            TASK,
+            &[
+                r#"{"description": "Find auth", "prompt": "Search for "#,
+                r#"the middleware."}"#,
+            ],
+        );
+        assert_eq!(decoded, "Search for the middleware.", "{EXPECT_PROMPT}");
+    }
+
+    /// A prompt is the one body whose escapes routinely land on a token
+    /// boundary, because the model writes it as prose with newlines in it.
+    #[test]
+    fn a_prompt_escape_split_across_fragments_still_decodes() {
+        let decoded = published(TASK, &[r#"{"prompt": "first\"#, r#"nsecond"}"#]);
+        assert_eq!(decoded, "first\nsecond", "{EXPECT_PROMPT}");
     }
 
     #[test]

@@ -33,7 +33,8 @@ use caudra_agent::{
     format_live_duration, format_settled_duration,
     tools::{
         FILE_READ_TOOL_NAME, FILE_WRITE_TOOL_NAME, LOCAL_DOCUMENT_WRITE_TOOL_NAME,
-        MEMORY_TOOL_NAME, PYTHON_EXECUTION_TOOL_NAME, SHELL_TOOL_NAME, humanize_duration,
+        MEMORY_TOOL_NAME, PYTHON_EXECUTION_TOOL_NAME, SHELL_TOOL_NAME, TASK_TOOL_NAME,
+        humanize_duration,
     },
 };
 use ratatui::style::{Color, Modifier, Style};
@@ -189,10 +190,20 @@ const QUERY_KEYS: &[(&str, &str)] = &[
 /// renders it and never through the window their output is drawn in.
 const LIVE_SCRIPT_TOOLS: &[&str] = &[SHELL_TOOL_NAME, PYTHON_EXECUTION_TOOL_NAME];
 /// The tools whose streaming body is a document however it is named. Both
-/// settle to rendered markdown, and one of them is named by an opaque
+/// stores settle to rendered markdown, and one of them is named by an opaque
 /// reference with no extension to read, so the tool is what says so rather
 /// than the header.
-const LIVE_MARKDOWN_TOOLS: &[&str] = &[MEMORY_TOOL_NAME, LOCAL_DOCUMENT_WRITE_TOOL_NAME];
+///
+/// A delegation is the one member whose live body is not what its settled card
+/// draws: the prompt arrives while the subagent works, and the answer replaces
+/// it on `ToolDone`. The two are different documents rather than one drawn
+/// twice, so the swap is the card reporting progress, not the flicker the rule
+/// against a mismatched live draw exists to prevent. Leave it.
+const LIVE_MARKDOWN_TOOLS: &[&str] = &[
+    MEMORY_TOOL_NAME,
+    LOCAL_DOCUMENT_WRITE_TOOL_NAME,
+    TASK_TOOL_NAME,
+];
 const MILLIS_PER_SECOND: u64 = 1_000;
 const DURATION_SEPARATOR: &str = " · ";
 
@@ -4117,6 +4128,23 @@ mod tests {
                 "{SIGIL_CLASH_MSG}: {tool} reads as a tool the table has never heard of"
             );
         }
+    }
+
+    const LIVE_DOCUMENT_MSG: &str =
+        "a body that settles to rendered markdown is drawn as a document while it arrives";
+    /// A delegation's header is its description, which is prose and has no
+    /// extension to read, so the name is the only thing that can say the body
+    /// arriving under it is a document.
+    const HEADERLESS_EXTENSION: &str = "Find the auth middleware";
+
+    #[test_case(TASK_TOOL_NAME ; "a_delegation")]
+    #[test_case(MEMORY_TOOL_NAME ; "a_note")]
+    #[test_case(LOCAL_DOCUMENT_WRITE_TOOL_NAME ; "a_local_document")]
+    fn a_document_body_is_drawn_as_one_before_it_settles(tool: &str) {
+        assert!(
+            draws_live_markdown(tool, HEADERLESS_EXTENSION),
+            "{LIVE_DOCUMENT_MSG}: {tool}"
+        );
     }
 
     const ACTIVITY_VERB_MSG: &str = "an activity row names a tool by the verb its card header uses";
