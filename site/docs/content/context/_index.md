@@ -109,9 +109,9 @@ Each file arrives in the system prompt wrapped in a tag naming where it came fro
 
 `scope` is `project`, `local`, or `global`.
 
-Editing one of these files mid-session takes effect on your next message. The system prompt keeps the text it was built with, because rewriting it would invalidate the whole cached prefix on every save; the change reaches the model as a diff against that text instead. Compaction and `/undo` replace the conversation and have already given up that cache, so they quietly rebuild the system prompt from disk.
+Editing one of these files mid-session takes effect on your next message. The system prompt keeps the text it was built with, because rewriting it would invalidate the whole cached prefix on every save; the change reaches the model as a diff against that text instead. A session that started with no instruction files has nothing in its prompt for a diff to patch, so the first file to appear arrives whole. Compaction and `/undo` replace the conversation and have already given up that cache, so they quietly rebuild the system prompt from disk.
 
-Putting a file back the way it was withdraws the diff rather than leaving it standing, as does a compaction that rebuilds the system prompt while a diff is outstanding. Either way the model is told to go back to following the system prompt as written.
+Putting a file back the way it was withdraws the announcement rather than leaving it standing. Deleting a file that appeared does the same, and so does a compaction that rebuilds the system prompt while an announcement is outstanding. In each case the model is told to go back to following the system prompt as written.
 
 Put coding conventions, repo quirks, and off-limits directories in these files. Keep them short, for the reason the next section gives.
 
@@ -123,13 +123,13 @@ Part of what the model reads was written by Caudra rather than typed by you. The
 |----------|------|
 | Environment | At session start, and again whenever the date, working directory, or model changes |
 | Mode announcement | On the first message after you switch between plan and build |
-| Instruction diff | On the first message after you edit an instruction file, and again to withdraw the diff when you put the file back |
+| Instruction change | On the first message after you edit or create an instruction file, and again to withdraw that when you put the file back |
 | Goal check-in | While a goal is running, to report progress against it |
 | Continuation | After a nudge or a compaction, to say what the model should pick up |
 
 None of this lives in the system prompt. Anything that changes during a session would invalidate the cached prefix on every change, so it reaches the model as a message instead, and it is sent only when it differs from the last time Caudra said it.
 
-Where one lands depends on whether anything else still holds a copy. A standing reminder — the environment, a mode announcement, an instruction diff — is appended after the message it steers, and rewinding that message takes the reminder with it, because Caudra re-sends it on the next turn anyway. A one-shot notice — a finished background task, a settled workflow, the output of a `/!` command, an MCP prompt's canned exchange — is appended before the message, because it happened first and the transcript is the only place it still exists, so a rewind has to spare it.
+Where one lands depends on whether anything else still holds a copy. A standing reminder — the environment, a mode announcement, an instruction change — is appended after the message it steers, and rewinding that message takes the reminder with it, because Caudra re-sends it on the next turn anyway. A one-shot notice — a finished background task, a settled workflow, the output of a `/!` command, an MCP prompt's canned exchange — is appended before the message, because it happened first and the transcript is the only place it still exists, so a rewind has to spare it.
 
 Each one appears in the transcript as a dim row folded to its heading. Click the row to read the exact text the model was sent, and click again to fold it back. Mentioned file contents are the exception: the model gets them, and the transcript shows the `@path` you typed rather than the body behind it.
 

@@ -46,11 +46,16 @@ pub const ENVIRONMENT_MARKER: &str = "# Environment";
 /// Instruction files are snapshotted into the system prompt, so a later edit
 /// arrives as a diff against that snapshot rather than by rebuilding it.
 pub const INSTRUCTIONS_CHANGED_PROMPT: &str = include_str!("prompts/instructions_changed.md");
-/// Withdraws an announced diff once the files match the system prompt again.
-/// Shares the heading, and so the kind, with the diff it supersedes.
+/// Carries the files whole rather than as a diff, for the session that started
+/// with none: a patch against an empty snapshot is the text with every line
+/// marked added, and the prompt it claims to patch says nothing at all.
+pub const INSTRUCTIONS_APPEARED_PROMPT: &str = include_str!("prompts/instructions_appeared.md");
+/// Withdraws an announced change once the files match the system prompt again.
+/// Shares the heading, and so the kind, with the announcement it supersedes.
 pub const INSTRUCTIONS_RESTORED_PROMPT: &str = include_str!("prompts/instructions_restored.md");
 pub const INSTRUCTIONS_CHANGED_MARKER: &str = "# Instructions changed";
 pub const DIFF_SLOT: &str = "{diff}";
+pub const INSTRUCTIONS_SLOT: &str = "{instructions}";
 /// Not a [`Vars`](crate::template::Vars) entry: the model is per-run rather
 /// than a process-wide environment value, and is already threaded as `&Model`.
 pub const MODEL_SLOT: &str = "{model}";

@@ -152,24 +152,15 @@ impl InstructionBaseline {
     }
 
     /// `epoch` is the history epoch, which changes only when the conversation
-    /// was replaced. Returns the reminder to announce: a diff while the files
-    /// differ from the baseline, a withdrawal on the turn they stop differing,
-    /// and `None` once the transcript and disk agree.
+    /// was replaced. Returns the reminder to announce: the current instructions
+    /// while they differ from the baseline, a withdrawal on the turn they stop
+    /// differing, and `None` once the transcript and disk agree.
     pub fn drift(&mut self, current: Instructions, epoch: u64) -> Option<String> {
         let swapped = epoch != std::mem::replace(&mut self.epoch, epoch);
         if current.text != self.instructions.text {
             if !swapped {
                 self.drifted = true;
-                let diff = crate::diff::unified_text(
-                    &self.instructions.text,
-                    &current.text,
-                    &crate::diff::stat(&self.instructions.text, &current.text),
-                    INSTRUCTIONS_DISPLAY_PATH,
-                );
-                return Some(
-                    crate::prompt::INSTRUCTIONS_CHANGED_PROMPT
-                        .replace(crate::prompt::DIFF_SLOT, &diff),
-                );
+                return Some(announcement(&self.instructions.text, &current.text));
             }
             self.instructions = current;
         }
@@ -179,6 +170,26 @@ impl InstructionBaseline {
         std::mem::take(&mut self.drifted)
             .then(|| crate::prompt::INSTRUCTIONS_RESTORED_PROMPT.to_owned())
     }
+}
+
+/// How a change to the files reaches a system prompt that cannot be rebuilt.
+///
+/// A diff is the cheap form and the honest one while the prompt quotes
+/// something to patch. A session that started with no instruction files quotes
+/// nothing, so the same diff would be the whole text with every line marked
+/// added, patching a section that does not exist; those files arrive whole.
+fn announcement(baseline: &str, current: &str) -> String {
+    if baseline.is_empty() {
+        return crate::prompt::INSTRUCTIONS_APPEARED_PROMPT
+            .replace(crate::prompt::INSTRUCTIONS_SLOT, current.trim());
+    }
+    let diff = crate::diff::unified_text(
+        baseline,
+        current,
+        &crate::diff::stat(baseline, current),
+        INSTRUCTIONS_DISPLAY_PATH,
+    );
+    crate::prompt::INSTRUCTIONS_CHANGED_PROMPT.replace(crate::prompt::DIFF_SLOT, &diff)
 }
 
 fn read_instruction(path: &Path, loaded: &LoadedInstructions) -> Option<(PathBuf, String)> {
@@ -407,7 +418,10 @@ mod tests {
     const BASELINE_TEXT: &str = "# Code guidelines\n";
     const EDITED_TEXT: &str = "# Code guidelines\nbe brief\n";
     const OTHER_TEXT: &str = "# Code guidelines\nbe thorough\n";
+    const NO_INSTRUCTIONS: &str = "";
+    const DIFF_ADDED_LINE: &str = "+ be brief";
     const EXPECTED_DRIFT_NOTICE: &str = "an edited instruction file should be announced";
+    const EXPECTED_APPEARANCE_NOTICE: &str = "a created instruction file should be announced";
     const EPOCH: u64 = 7;
 
     fn system_prompt() -> String {
@@ -564,7 +578,7 @@ mod tests {
             .expect(EXPECTED_DRIFT_NOTICE);
 
         assert!(notice.contains(crate::prompt::INSTRUCTIONS_CHANGED_MARKER));
-        assert!(notice.contains("+ be brief"));
+        assert!(notice.contains(DIFF_ADDED_LINE));
         assert!(!notice.contains(crate::prompt::DIFF_SLOT));
         assert_eq!(
             baseline.text(),
@@ -664,6 +678,65 @@ mod tests {
             "{EXPECTED_DRIFT_NOTICE}"
         );
         assert_eq!(baseline.text(), BASELINE_TEXT);
+    }
+
+    /// A session that began with no instruction files has nothing in its system
+    /// prompt for a diff to patch, so the file that appears has to arrive as
+    /// itself rather than as the same text with every line marked added.
+    #[test]
+    fn a_created_instruction_file_arrives_whole() {
+        let mut baseline = baseline_of(NO_INSTRUCTIONS);
+        let notice = baseline
+            .drift(instructions_of(EDITED_TEXT), EPOCH)
+            .expect(EXPECTED_APPEARANCE_NOTICE);
+
+        assert!(notice.contains(crate::prompt::INSTRUCTIONS_CHANGED_MARKER));
+        assert!(notice.contains(EDITED_TEXT.trim()));
+        assert!(!notice.contains(crate::prompt::INSTRUCTIONS_SLOT));
+        assert!(!notice.contains(DIFF_ADDED_LINE));
+        assert!(!notice.contains(&format!("--- {INSTRUCTIONS_DISPLAY_PATH}")));
+        assert_eq!(
+            baseline.text(),
+            NO_INSTRUCTIONS,
+            "adopting the text would splice a section into the cached system prompt"
+        );
+    }
+
+    /// The baseline stays empty after an appearance, so there is still nothing
+    /// to diff against and every later edit is another whole copy.
+    #[test]
+    fn an_edit_after_an_appearance_resends_the_whole_text() {
+        let mut baseline = baseline_of(NO_INSTRUCTIONS);
+        baseline
+            .drift(instructions_of(BASELINE_TEXT), EPOCH)
+            .expect(EXPECTED_APPEARANCE_NOTICE);
+        let notice = baseline
+            .drift(instructions_of(EDITED_TEXT), EPOCH)
+            .expect(EXPECTED_APPEARANCE_NOTICE);
+
+        assert!(notice.contains(EDITED_TEXT.trim()));
+        assert!(!notice.contains(DIFF_ADDED_LINE));
+    }
+
+    /// Deleting the file again leaves the announcement standing over rules that
+    /// no longer exist, the same gap a reverted edit leaves.
+    #[test]
+    fn a_deleted_instruction_file_withdraws_the_announcement() {
+        let mut baseline = baseline_of(NO_INSTRUCTIONS);
+        baseline
+            .drift(instructions_of(EDITED_TEXT), EPOCH)
+            .expect(EXPECTED_APPEARANCE_NOTICE);
+
+        assert_eq!(
+            baseline.drift(instructions_of(NO_INSTRUCTIONS), EPOCH),
+            Some(crate::prompt::INSTRUCTIONS_RESTORED_PROMPT.to_owned())
+        );
+        assert!(
+            baseline
+                .drift(instructions_of(NO_INSTRUCTIONS), EPOCH)
+                .is_none(),
+            "the withdrawal is announced once, not on every quiet turn"
+        );
     }
 
     #[test]
