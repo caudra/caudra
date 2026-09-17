@@ -4258,7 +4258,15 @@ impl App {
             "/tasks" => self.tasks_browse(),
             "/workflows" => self.workflows_browse(),
             "/workflow" => self.execute_workflow(&cmd.args),
-            "/deep-research" => self.execute_deep_research(&cmd.args),
+            "/deep-research" => {
+                self.execute_builtin_workflow(workflow::DEEP_RESEARCH_WORKFLOW, &cmd.args)
+            }
+            "/review-changes" => {
+                self.execute_builtin_workflow(workflow::REVIEW_CHANGES_WORKFLOW, &cmd.args)
+            }
+            "/root-cause" => {
+                self.execute_builtin_workflow(workflow::ROOT_CAUSE_WORKFLOW, &cmd.args)
+            }
             "/sessions" => self.sessions_browse(),
             "/move-session" | "/migrate-sessions" => {
                 let destination = cmd.args.trim();

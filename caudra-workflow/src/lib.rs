@@ -20,6 +20,10 @@ pub mod validate;
 
 pub const DEEP_RESEARCH_NAME: &str = "deep-research";
 pub const DEEP_RESEARCH_SOURCE: &str = include_str!("../builtins/deep-research.rhai");
+pub const REVIEW_CHANGES_NAME: &str = "review-changes";
+pub const REVIEW_CHANGES_SOURCE: &str = include_str!("../builtins/review-changes.rhai");
+pub const ROOT_CAUSE_NAME: &str = "root-cause";
+pub const ROOT_CAUSE_SOURCE: &str = include_str!("../builtins/root-cause.rhai");
 /// The authoring guide the `skill` tool offers as `caudra-workflow-dev`, with
 /// its frontmatter. It lives beside the engine so its examples are tested
 /// against the ABI they describe.
@@ -29,7 +33,8 @@ pub use catalog::{CatalogEntry, InvalidEntry, LaunchRequest, WorkflowCatalog};
 #[cfg(feature = "rhai")]
 pub use engine::{EngineError, RhaiEngine, RunParams, WorkflowEngine};
 pub use host::{
-    AgentRequest, AgentResult, CapabilityMode, HostError, UnknownCapabilityMode, WorkflowHost,
+    AgentRequest, AgentResult, CapabilityMode, HostError, ModelJob, UnknownCapabilityMode,
+    UnknownModelJob, WorkflowHost,
 };
 pub use journal::{
     CallKey, CallKind, CallSignature, Journal, JournalEntry, JournalError, RequestHash,

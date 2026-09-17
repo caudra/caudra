@@ -28,6 +28,43 @@ pub enum CapabilityMode {
 )]
 pub struct UnknownCapabilityMode(pub String);
 
+/// Which of Caudra's model jobs runs an agent. A script names a job and never a
+/// `provider/model-id`, so a workflow shared between machines asks for cheap
+/// breadth or strong judgement without pinning a model nobody else has.
+pub const MODEL_JOB_NAMES: [(&str, ModelJob); 5] = [
+    ("chat", ModelJob::Chat),
+    ("plan", ModelJob::Plan),
+    ("subagent", ModelJob::Subagent),
+    ("fast", ModelJob::Fast),
+    ("best", ModelJob::Best),
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ModelJob {
+    Chat,
+    Plan,
+    Subagent,
+    Fast,
+    Best,
+}
+
+impl FromStr for ModelJob {
+    type Err = UnknownModelJob;
+
+    fn from_str(name: &str) -> Result<Self, Self::Err> {
+        MODEL_JOB_NAMES
+            .iter()
+            .find(|(candidate, _)| *candidate == name)
+            .map(|(_, job)| *job)
+            .ok_or_else(|| UnknownModelJob(name.to_owned()))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("unknown model_job {0:?}; expected one of chat, plan, subagent, fast, best")]
+pub struct UnknownModelJob(pub String);
+
 impl FromStr for CapabilityMode {
     type Err = UnknownCapabilityMode;
 
@@ -55,6 +92,10 @@ pub struct AgentRequest {
     pub phase: Option<String>,
     #[serde(default)]
     pub profile: Option<String>,
+    /// Skipped when unset so a journal written before this field existed hashes
+    /// to the same request and its run still resumes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_job: Option<ModelJob>,
 }
 
 impl AgentRequest {
@@ -66,6 +107,7 @@ impl AgentRequest {
             output_schema: None,
             phase: None,
             profile: None,
+            model_job: None,
         }
     }
 }
@@ -127,6 +169,9 @@ mod tests {
 
     use super::*;
 
+    const UNSET_JOB_IS_ABSENT: &str =
+        "an unset model_job must not appear in the request JSON at all";
+
     #[test_case("read-only" => Ok(CapabilityMode::ReadOnly); "read_only")]
     #[test_case("read-write" => Ok(CapabilityMode::Build); "read_write")]
     #[test_case("execute" => Ok(CapabilityMode::Build); "execute")]
@@ -135,6 +180,24 @@ mod tests {
     #[test_case("readonly" => Err(UnknownCapabilityMode("readonly".into())); "unknown")]
     fn capability_mode_parsing(name: &str) -> Result<CapabilityMode, UnknownCapabilityMode> {
         name.parse()
+    }
+
+    #[test_case("fast" => Ok(ModelJob::Fast); "fast")]
+    #[test_case("best" => Ok(ModelJob::Best); "best")]
+    #[test_case("subagent" => Ok(ModelJob::Subagent); "subagent")]
+    #[test_case("opus" => Err(UnknownModelJob("opus".into())); "a model is not a job")]
+    fn model_job_parsing(name: &str) -> Result<ModelJob, UnknownModelJob> {
+        name.parse()
+    }
+
+    /// The journal hashes this JSON, so a field that serialized as `null` when
+    /// unset would change every request written before it existed and no run
+    /// started by an older build could resume.
+    #[test]
+    fn an_unset_model_job_leaves_the_request_json_untouched() {
+        let json = serde_json::to_value(AgentRequest::new("hi")).expect("serializable");
+
+        assert_eq!(json.get("model_job"), None, "{UNSET_JOB_IS_ABSENT}");
     }
 
     #[test]

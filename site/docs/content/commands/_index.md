@@ -34,6 +34,8 @@ Commands marked Main only act on the main session's turn or history. They stay l
 | `/workflows` | Browse, trust, and launch workflows | Main only |
 | `/workflow` | Start a workflow, or list, pause, resume, and stop runs | Main only |
 | `/deep-research` | Research a question with the deep-research workflow | Main only |
+| `/review-changes` | Review a change from independent angles with the review-changes workflow | Main only |
+| `/root-cause` | Diagnose a failure with the root-cause workflow | Main only |
 | `/sessions` | Browse and switch sessions |  |
 | `/rename` | Rename the current session |  |
 | `/model` | Switch chat model or assign job models | Main only |

@@ -191,6 +191,18 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         scope: ChatScope::MainOnly,
     },
     BuiltinCommand {
+        name: "/review-changes",
+        description: "Review a change from independent angles with the review-changes workflow",
+        max_args: usize::MAX,
+        scope: ChatScope::MainOnly,
+    },
+    BuiltinCommand {
+        name: "/root-cause",
+        description: "Diagnose a failure with the root-cause workflow",
+        max_args: usize::MAX,
+        scope: ChatScope::MainOnly,
+    },
+    BuiltinCommand {
         name: "/sessions",
         description: "Browse and switch sessions",
         max_args: 0,

@@ -14,9 +14,9 @@ use caudra_storage::workflow_source::read_bounded_regular_file;
 use caudra_storage::workflow_trust::{is_workflow_trusted, trust_workflow, workflow_source_digest};
 use caudra_workflow::meta::MAX_SOURCE_BYTES;
 use caudra_workflow::{
-    CatalogEntry, DEEP_RESEARCH_NAME, DEEP_RESEARCH_SOURCE, InvalidEntry, SourceKind,
-    WORKFLOW_ABI_VERSION, WORKFLOW_LANGUAGE_VERSION, WorkflowCatalog, WorkflowError, WorkflowMeta,
-    parse_meta,
+    CatalogEntry, DEEP_RESEARCH_NAME, DEEP_RESEARCH_SOURCE, InvalidEntry, REVIEW_CHANGES_NAME,
+    REVIEW_CHANGES_SOURCE, ROOT_CAUSE_NAME, ROOT_CAUSE_SOURCE, SourceKind, WORKFLOW_ABI_VERSION,
+    WORKFLOW_LANGUAGE_VERSION, WorkflowCatalog, WorkflowError, WorkflowMeta, parse_meta,
 };
 use tracing::{debug, warn};
 
@@ -25,7 +25,11 @@ use crate::remote_project_context::{RemoteAssetIdentity, RemoteProjectContext};
 const PROJECT_DIR: &str = ".caudra";
 const WORKFLOWS_SUBDIR: &str = "workflows";
 const SCRIPT_EXTENSION: &str = "rhai";
-const BUILTINS: [(&str, &str); 1] = [(DEEP_RESEARCH_NAME, DEEP_RESEARCH_SOURCE)];
+const BUILTINS: [(&str, &str); 3] = [
+    (DEEP_RESEARCH_NAME, DEEP_RESEARCH_SOURCE),
+    (REVIEW_CHANGES_NAME, REVIEW_CHANGES_SOURCE),
+    (ROOT_CAUSE_NAME, ROOT_CAUSE_SOURCE),
+];
 const BUILTIN_PATH_PREFIX: &str = "<builtin>";
 const NOT_UTF8: &str = "source is not valid UTF-8";
 const NOT_A_DIRECTORY: &str = "is not a real directory";
@@ -560,6 +564,26 @@ mod tests {
         format!("{name}.{SCRIPT_EXTENSION}")
     }
 
+    fn builtin_names() -> Vec<&'static str> {
+        BUILTINS.iter().map(|(name, _)| *name).collect()
+    }
+
+    /// The built-in roster in listing order, followed by whatever the scan found
+    /// on disk, so a test about discovery does not restate which built-ins exist.
+    fn builtins_then(discovered: &[&'static str]) -> Vec<&'static str> {
+        let mut expected = builtin_names();
+        expected.extend_from_slice(discovered);
+        expected
+    }
+
+    fn entry<'a>(catalog: &'a WorkflowCatalog, name: &str) -> &'a CatalogEntry {
+        catalog
+            .entries
+            .iter()
+            .find(|entry| entry.name == name)
+            .expect("listed")
+    }
+
     fn names(catalog: &WorkflowCatalog) -> Vec<&str> {
         catalog
             .entries
@@ -589,7 +613,7 @@ mod tests {
         let resolved = catalog.resolve(DEEP_RESEARCH_NAME).unwrap();
 
         let listed = catalog.to_catalog();
-        assert_eq!(names(&listed), [DEEP_RESEARCH_NAME]);
+        assert_eq!(names(&listed), builtin_names());
         assert!(listed.invalid.is_empty(), "{NOTHING_INVALID}");
         assert_eq!(resolved.source_kind, SourceKind::Builtin);
         assert_eq!(resolved.path, None);
@@ -667,7 +691,7 @@ mod tests {
 
         let catalog = fixture.scan().to_catalog();
 
-        assert_eq!(names(&catalog), [DEEP_RESEARCH_NAME]);
+        assert_eq!(names(&catalog), builtin_names());
         assert_eq!(catalog.invalid.len(), 1);
         assert_eq!(catalog.invalid[0].path, link.display().to_string());
         assert_eq!(catalog.invalid[0].source_kind, SourceKind::Project);
@@ -684,7 +708,7 @@ mod tests {
 
         let catalog = fixture.scan().to_catalog();
 
-        assert_eq!(names(&catalog), [DEEP_RESEARCH_NAME]);
+        assert_eq!(names(&catalog), builtin_names());
         assert_eq!(catalog.invalid.len(), 1);
         assert_eq!(catalog.invalid[0].path, path.display().to_string());
         assert_eq!(catalog.invalid[0].source_kind, SourceKind::User);
@@ -716,7 +740,7 @@ mod tests {
         catalog.admit(SourceKind::User, vec![candidate("review.rhai")]);
 
         let listed = catalog.to_catalog();
-        assert_eq!(names(&listed), [DEEP_RESEARCH_NAME]);
+        assert_eq!(names(&listed), builtin_names());
         assert_eq!(listed.invalid.len(), 3, "{BOTH_REJECTED}");
         assert_eq!(
             catalog.resolve(REVIEW),
@@ -750,12 +774,12 @@ mod tests {
         let catalog = fixture.scan();
 
         let listed = catalog.to_catalog();
-        assert_eq!(names(&listed), [DEEP_RESEARCH_NAME, REVIEW, "audit"]);
+        assert_eq!(names(&listed), builtins_then(&[REVIEW, "audit"]));
         assert!(listed.invalid.is_empty());
-        let review = &listed.entries[1];
+        let review = entry(&listed, REVIEW);
         assert_eq!(review.source_kind, SourceKind::Project, "{PROJECT_WINS}");
         assert_eq!(review.shadowed, [SourceKind::User]);
-        assert_eq!(listed.entries[2].shadowed, []);
+        assert_eq!(entry(&listed, "audit").shadowed, []);
         assert_eq!(
             catalog.resolve(REVIEW).unwrap().source,
             project_source,
@@ -782,7 +806,7 @@ mod tests {
         let catalog = fixture.scan();
 
         let listed = catalog.to_catalog();
-        assert_eq!(names(&listed), [DEEP_RESEARCH_NAME]);
+        assert_eq!(names(&listed), builtin_names());
         assert_eq!(listed.entries[0].shadowed, []);
         assert_eq!(
             listed.invalid,
@@ -814,7 +838,7 @@ mod tests {
             without_config.to_catalog(),
             without_cwd.to_catalog(),
         ] {
-            assert_eq!(names(&catalog), [DEEP_RESEARCH_NAME]);
+            assert_eq!(names(&catalog), builtin_names());
             assert!(catalog.invalid.is_empty(), "{NOTHING_INVALID}");
         }
     }
@@ -830,7 +854,7 @@ mod tests {
 
         let catalog = fixture.scan().to_catalog();
 
-        assert_eq!(names(&catalog), [DEEP_RESEARCH_NAME]);
+        assert_eq!(names(&catalog), builtin_names());
         assert_eq!(
             catalog.invalid,
             [InvalidEntry {

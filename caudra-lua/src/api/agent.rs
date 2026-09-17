@@ -487,6 +487,7 @@ async fn open_lua_task(
             task_id: subagent::TaskIdentity::continue_or_derive(task_id),
             profile: opts.get("profile").map_err(lua_err)?,
             mode,
+            model_job: None,
             local_definitions,
             local_tools,
         },

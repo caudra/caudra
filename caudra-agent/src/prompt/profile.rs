@@ -15,7 +15,7 @@ use crate::agent::resolve_purpose_model;
 
 pub const BUILTIN_PROFILE_NAME: &str = "builtin";
 
-const PROFILE_DIR: &str = "system-prompts";
+pub(crate) const PROFILE_DIR: &str = "system-prompts";
 const MAX_PROFILE_BYTES: usize = 64 * 1024;
 const MAX_PROFILE_NAME_BYTES: usize = 64;
 const MAX_TASK_SUMMARY_ENTRIES: usize = 20;
@@ -159,7 +159,7 @@ impl PromptProfileCatalog {
         Self::discover_with(caudra_storage::paths::config_dir().ok().as_deref())
     }
 
-    fn discover_with(config_dir: Option<&Path>) -> Self {
+    pub(crate) fn discover_with(config_dir: Option<&Path>) -> Self {
         let mut catalog = Self::default();
         if let Some(dir) = caudra_storage::paths::user_config_dir(config_dir, PROFILE_DIR) {
             catalog.load_dir(&dir);

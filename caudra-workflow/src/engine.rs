@@ -9,7 +9,7 @@ use rhai::{Array, Dynamic, Engine, EvalAltResult, Map, Position, Scope};
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::host::{AgentRequest, HostError, UnknownCapabilityMode, WorkflowHost};
+use crate::host::{AgentRequest, HostError, UnknownCapabilityMode, UnknownModelJob, WorkflowHost};
 use crate::journal::{
     CallKey, CallKind, Journal, agent_request_value, hash_request, scratch_request_value,
 };
@@ -28,14 +28,20 @@ const OPT_CAPABILITY_MODE: &str = "capability_mode";
 const OPT_OUTPUT_SCHEMA: &str = "output_schema";
 const OPT_PHASE: &str = "phase";
 const OPT_PROFILE: &str = "profile";
-const AGENT_OPTIONS: [&str; 6] = [
+const OPT_MODEL_JOB: &str = "model_job";
+const AGENT_OPTIONS: [&str; 7] = [
     OPT_PROMPT,
     OPT_LABEL,
     OPT_CAPABILITY_MODE,
     OPT_OUTPUT_SCHEMA,
     OPT_PHASE,
     OPT_PROFILE,
+    OPT_MODEL_JOB,
 ];
+
+const BUDGET_ISSUED: &str = "issued";
+const BUDGET_LIMIT: &str = "limit";
+const BUDGET_REMAINING: &str = "remaining";
 
 const HOST_GONE: &str = "workflow host stopped servicing calls";
 const FOREIGN_TERMINATION: &str = "workflow was terminated by an unknown token";
@@ -52,6 +58,7 @@ pub struct RunParams<'a> {
     pub journal: &'a Journal,
     pub host: &'a dyn WorkflowHost,
     pub limits: &'a EngineLimits,
+    pub agent_budget: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -91,6 +98,7 @@ impl WorkflowEngine for RhaiEngine {
             journal,
             host,
             limits,
+            agent_budget,
         } = params;
         let (jobs_tx, jobs_rx) = mpsc::channel();
         thread::scope(|scope| {
@@ -98,7 +106,14 @@ impl WorkflowEngine for RhaiEngine {
                 .name(INTERPRETER_THREAD_NAME.into())
                 .stack_size(INTERPRETER_STACK_BYTES)
                 .spawn_scoped(scope, move || {
-                    evaluate(source, args, journal, limits, HostBridge(jobs_tx))
+                    evaluate(
+                        source,
+                        args,
+                        journal,
+                        limits,
+                        agent_budget,
+                        HostBridge(jobs_tx),
+                    )
                 });
             let interpreter = match interpreter {
                 Ok(handle) => handle,
@@ -199,12 +214,14 @@ struct RunState {
     next_key: CallKey,
     log_entries: u64,
     log_bytes: usize,
+    agents_issued: u64,
 }
 
 struct Session {
     host: HostBridge,
     journal: Journal,
     limits: EngineLimits,
+    agent_budget: u32,
     state: RefCell<RunState>,
 }
 
@@ -264,8 +281,26 @@ impl Session {
         Ok(self.host.call(job)?)
     }
 
+    /// What the script has spent and what it has left, as a map the script reads
+    /// to decide how wide to fan out or whether it can still afford to verify.
+    /// Counted from what the script asked for rather than from what the host
+    /// admitted, because a replay re-issues every call without dispatching one.
+    fn budget(&self) -> Map {
+        let issued = self.state.borrow().agents_issued;
+        let limit = u64::from(self.agent_budget);
+        let mut map = Map::new();
+        map.insert(BUDGET_ISSUED.into(), Dynamic::from(issued as i64));
+        map.insert(BUDGET_LIMIT.into(), Dynamic::from(limit as i64));
+        map.insert(
+            BUDGET_REMAINING.into(),
+            Dynamic::from(limit.saturating_sub(issued) as i64),
+        );
+        map
+    }
+
     fn agent(&self, request: AgentRequest) -> ScriptResult<Dynamic> {
         let key = self.reserve_keys(1)?;
+        self.state.borrow_mut().agents_issued += 1;
         let result = match self.replayed(key, CallKind::Agent, &agent_request_value(&request))? {
             Some(result) => result,
             None => json_value(&host_result(
@@ -279,6 +314,7 @@ impl Session {
     /// run that died mid-`parallel` only re-issues the items that never got committed.
     fn parallel(&self, requests: Vec<AgentRequest>) -> ScriptResult<Array> {
         let first = self.reserve_keys(requests.len())?;
+        self.state.borrow_mut().agents_issued += requests.len() as u64;
         let mut results = Vec::with_capacity(requests.len());
         for (index, request) in requests.iter().enumerate() {
             let key = key_at(first, index)?;
@@ -401,6 +437,13 @@ fn agent_request(positional_prompt: Option<&str>, options: Map) -> ScriptResult<
             }
             OPT_PHASE => request.phase = Some(string_option(&key, value)?),
             OPT_PROFILE => request.profile = Some(string_option(&key, value)?),
+            OPT_MODEL_JOB => {
+                request.model_job = Some(
+                    string_option(&key, value)?
+                        .parse()
+                        .map_err(|error: UnknownModelJob| runtime_error(error.to_string()))?,
+                );
+            }
             other => {
                 return Err(runtime_error(format!(
                     "unknown agent option `{other}`; expected one of {}",
@@ -510,6 +553,8 @@ fn register_host_api(engine: &mut Engine, session: &Rc<Session>) {
         }
         .into())
     });
+    let s = Rc::clone(session);
+    engine.register_fn("budget", move || -> Map { s.budget() });
     engine.register_fn("json_encode", |value: Dynamic| -> ScriptResult<String> {
         serde_json::to_string(&dynamic_to_json(&value)?)
             .map_err(|error| runtime_error(format!("json_encode failed: {error}")))
@@ -521,6 +566,7 @@ fn evaluate(
     args: &Value,
     journal: &Journal,
     limits: &EngineLimits,
+    agent_budget: u32,
     host: HostBridge,
 ) -> WorkflowOutcome {
     if let Err(error) = check_source_size(source, limits.max_source_bytes) {
@@ -541,10 +587,12 @@ fn evaluate(
         host,
         journal: journal.clone(),
         limits: limits.clone(),
+        agent_budget,
         state: RefCell::new(RunState {
             next_key: CallKey::FIRST,
             log_entries: 0,
             log_bytes: 0,
+            agents_issued: 0,
         }),
     });
     let mut engine = restricted_engine(limits);
@@ -609,14 +657,61 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
-    use crate::DEEP_RESEARCH_SOURCE;
-    use crate::host::{AgentResult, CapabilityMode};
+    use crate::host::{AgentResult, CapabilityMode, ModelJob};
     use crate::journal::JournalEntry;
+    use crate::{DEEP_RESEARCH_SOURCE, REVIEW_CHANGES_SOURCE, ROOT_CAUSE_SOURCE};
 
     const META: &str = r#"let meta = #{ name: "t", description: "d" };"#;
     const SCRATCH_ROOT: &str = "/scratch";
     const PHASE_PREFIX: &str = "phase:";
     const LOG_PREFIX: &str = "log:";
+    const TEST_AGENT_BUDGET: u32 = 16;
+    const MUST_NOT_CALL: &str = "must not be called";
+    const BUDGET_COUNTS_ISSUED: &str =
+        "budget() counts every agent the script asked for, one per parallel item";
+    const BUDGET_SURVIVES_REPLAY: &str =
+        "a branch on budget() must read the same on a replay, which re-issues without dispatching";
+    const BUDGET_BODY: &str = r#"
+        agent("one");
+        parallel([#{ prompt: "a" }, #{ prompt: "b" }]);
+        let b = budget();
+        complete([b.issued, b.limit, b.remaining]);"#;
+    const BUDGET_BRANCH_BODY: &str = r#"
+        parallel([#{ prompt: "a" }, #{ prompt: "b" }]);
+        let wide = budget().remaining > 15;
+        agent(if wide { "wide" } else { "narrow" });
+        complete(wide);"#;
+    const SURVEYOR: &str = "change-surveyor";
+    const REVIEWER_PREFIX: &str = "reviewer-";
+    const REFUTER_PREFIX: &str = "refuter-";
+    const REVIEW_WRITER: &str = "review-writer";
+    const SECURITY_DIMENSION: &str = "security";
+    const BLOCKER_SEVERITY: &str = "blocker";
+    const DIMENSION_COUNT: usize = 5;
+    const FINDINGS_OPEN: &str = "<findings-json>\n";
+    const FINDINGS_CLOSE: &str = "\n</findings-json>";
+    const CHANGE_SUMMARY: &str = "It rewrote the parser.";
+    const REVIEW_BODY: &str = "### blocker: src/security.rs:1\n\nThe parser trusts its input.";
+    const UNCHALLENGED_NOTE: &str = "unchallenged claim";
+    const RANKED_BY_SEVERITY: &str = "surviving findings are ordered blocker first";
+    const REFUTED_ARE_DROPPED: &str = "a finding a refuter ruled refuted never reaches the report";
+    const UNCHALLENGED_ARE_KEPT: &str =
+        "a budget too small to refute keeps every finding and says they went unchallenged";
+    const EVIDENCE_PREFIX: &str = "evidence-";
+    const HYPOTHESIS_PREFIX: &str = "hypothesis-";
+    const DIAGNOSIS_WRITER: &str = "diagnosis-writer";
+    const REFUTED_STANCE: &str = "the-boundary";
+    const STRAND_COUNT: usize = 4;
+    const STANCE_COUNT: usize = 3;
+    const CAUSES_OPEN: &str = "<causes-json>\n";
+    const CAUSES_CLOSE: &str = "\n</causes-json>";
+    const DIAGNOSIS_BODY: &str = "The config loader reads the key before the file is parsed.";
+    const UNREFUTED_NOTE: &str = "not whether it survives scrutiny";
+    const RANKED_BY_CONVERGENCE: &str = "the cause the most refuters upheld is ranked first";
+    const REFUTED_STANCE_IS_DROPPED: &str =
+        "a cause every refuter ruled out never reaches the report";
+    const UNREFUTED_ARE_KEPT: &str =
+        "a budget too small to refute keeps every cause and says none was challenged";
     const PLANNER: &str = "research-planner";
     const RESEARCHER_PREFIX: &str = "researcher-";
     const VERIFIER_PREFIX: &str = "evidence-verifier-";
@@ -792,6 +887,7 @@ mod tests {
             journal,
             host,
             limits,
+            agent_budget: TEST_AGENT_BUDGET,
         })
     }
 
@@ -947,7 +1043,7 @@ mod tests {
         let outcome = run(
             r#"let r = agent("do it", #{
                 label: "worker", capability_mode: "execute", phase: "P", profile: "fast",
-                output_schema: #{ "type": "object" },
+                model_job: "best", output_schema: #{ "type": "object" },
             });
             complete(r.output);"#,
             &host,
@@ -965,6 +1061,7 @@ mod tests {
                 output_schema: Some(json!({ "type": "object" })),
                 phase: Some("P".into()),
                 profile: Some("fast".into()),
+                model_job: Some(ModelJob::Best),
             }
         );
     }
@@ -1044,7 +1141,7 @@ mod tests {
         );
         assert_eq!(first.emissions(), ["phase:A", "log:x"]);
 
-        let replay = FakeHost::failing(HostError::Failed("must not be called".into()));
+        let replay = FakeHost::failing(HostError::Failed(MUST_NOT_CALL.into()));
         let outcome = run_with(
             JOURNALED_BODY,
             &json!({ "objective": "test" }),
@@ -1056,6 +1153,41 @@ mod tests {
         assert!(replay.requests().is_empty());
         assert!(replay.scratch().is_empty());
         assert!(replay.emissions().is_empty());
+    }
+
+    #[test]
+    fn budget_counts_every_agent_the_script_asked_for() {
+        let host = FakeHost::echo();
+
+        let outcome = run(BUDGET_BODY, &host);
+
+        assert_eq!(
+            outcome,
+            WorkflowOutcome::Completed(json!([3, TEST_AGENT_BUDGET, TEST_AGENT_BUDGET - 3])),
+            "{BUDGET_COUNTS_ISSUED}"
+        );
+    }
+
+    /// The threshold sits between what the script has really spent and what a
+    /// replay that counted only freshly dispatched agents would report, so the
+    /// second pass would take the other branch and diverge at the call after it.
+    #[test]
+    fn a_budget_branch_takes_the_same_path_on_a_replay() {
+        let first = FakeHost::echo();
+        let expected = WorkflowOutcome::Completed(json!(false));
+        assert_eq!(run(BUDGET_BRANCH_BODY, &first), expected);
+
+        let replay = FakeHost::failing(HostError::Failed(MUST_NOT_CALL.into()));
+        let outcome = run_with(
+            BUDGET_BRANCH_BODY,
+            &json!({ "objective": "test" }),
+            &first.journal(),
+            &replay,
+            &EngineLimits::default(),
+        );
+
+        assert_eq!(outcome, expected, "{BUDGET_SURVIVES_REPLAY}");
+        assert!(replay.requests().is_empty(), "{BUDGET_SURVIVES_REPLAY}");
     }
 
     #[test]
@@ -1152,6 +1284,263 @@ mod tests {
         assert!(replay.requests().is_empty());
     }
 
+    fn finding(label: &str, index: usize, severity: &str) -> Value {
+        json!({
+            "path": format!("src/{label}.rs"),
+            "line": index.to_string(),
+            "claim": format!("{label} defect {index}"),
+            "evidence": format!("{label} evidence {index}"),
+            "consequence": format!("{label} breaks {index}"),
+            "severity": severity,
+        })
+    }
+
+    /// Refuters answer from the packet they were handed, so the bijection check
+    /// passes and the script reaches the ranking and report it guards.
+    fn review_changes_host(refute_everything: bool) -> FakeHost {
+        FakeHost::new(Box::new(move |key, request| {
+            let label = request.label.clone().unwrap_or_default();
+            let output = if label == SURVEYOR {
+                json!({
+                    "summary": CHANGE_SUMMARY,
+                    "files": [{ "path": "src/a.rs", "change": "rewrote it", "risk": "high" }],
+                })
+            } else if label.starts_with(REVIEWER_PREFIX) {
+                let dimension = label.trim_start_matches(REVIEWER_PREFIX);
+                let severity = if dimension == SECURITY_DIMENSION {
+                    BLOCKER_SEVERITY
+                } else {
+                    "minor"
+                };
+                json!({ "findings": [finding(dimension, 1, severity)] })
+            } else if label.starts_with(REFUTER_PREFIX) {
+                let start =
+                    request.prompt.find(FINDINGS_OPEN).expect("packet open") + FINDINGS_OPEN.len();
+                let end = request.prompt.find(FINDINGS_CLOSE).expect("packet close");
+                let shard: Vec<Value> =
+                    serde_json::from_str(&request.prompt[start..end]).expect("packet json");
+                let verdicts: Vec<Value> = shard
+                    .iter()
+                    .map(|found| {
+                        let refuted = refute_everything || found["dimension"] == "performance";
+                        json!({
+                            "finding_id": found["id"],
+                            "verdict": if refuted { "refuted" } else { "upheld" },
+                            "reason": "read the code",
+                        })
+                    })
+                    .collect();
+                json!({ "verdicts": verdicts })
+            } else if label == REVIEW_WRITER {
+                Value::String(REVIEW_BODY.into())
+            } else {
+                return Err(HostError::Failed(format!("unexpected label {label}")));
+            };
+            Ok(agent_result(format!("agent-{key}"), true, output))
+        }))
+    }
+
+    fn run_review_changes(host: &FakeHost, agent_budget: u32) -> Value {
+        let outcome = RhaiEngine.run(RunParams {
+            source: REVIEW_CHANGES_SOURCE,
+            args: &json!({ "scope": "the working tree" }),
+            journal: &Journal::new(),
+            host,
+            limits: &EngineLimits::default(),
+            agent_budget,
+        });
+        match outcome {
+            WorkflowOutcome::Completed(value) => value,
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn review_changes_drops_refuted_findings_and_ranks_the_rest() {
+        let host = review_changes_host(false);
+
+        let result = run_review_changes(&host, TEST_AGENT_BUDGET);
+
+        assert_eq!(result["status"], "reviewed", "{result}");
+        let findings = result["findings"].as_array().expect("findings");
+        assert_eq!(findings.len(), DIMENSION_COUNT - 1, "{result}");
+        assert_eq!(
+            findings[0]["severity"], BLOCKER_SEVERITY,
+            "{RANKED_BY_SEVERITY}"
+        );
+        assert!(
+            findings
+                .iter()
+                .all(|found| found["dimension"] != "performance"),
+            "{REFUTED_ARE_DROPPED}"
+        );
+        assert_eq!(
+            host.phases(),
+            ["Survey", "Review", "Refute", "Report"],
+            "{result}"
+        );
+        assert!(
+            result["report"]
+                .as_str()
+                .expect("report")
+                .contains(REVIEW_BODY)
+        );
+    }
+
+    #[test]
+    fn review_changes_reports_nothing_when_every_finding_is_refuted() {
+        let host = review_changes_host(true);
+
+        let result = run_review_changes(&host, TEST_AGENT_BUDGET);
+
+        assert_eq!(result["findings"], json!([]), "{result}");
+        assert_eq!(host.phases(), ["Survey", "Review", "Refute", "Report"]);
+        assert_eq!(host.scratch().len(), 1);
+    }
+
+    /// A run with no room left for refuters must still deliver a review, and
+    /// must say the findings in it went unchallenged.
+    #[test]
+    fn review_changes_skips_refutation_when_the_budget_is_nearly_spent() {
+        let host = review_changes_host(false);
+
+        let result = run_review_changes(&host, DIMENSION_COUNT as u32 + 2);
+
+        assert_eq!(result["status"], "partial", "{result}");
+        assert_eq!(
+            result["findings"].as_array().map(Vec::len),
+            Some(DIMENSION_COUNT),
+            "{UNCHALLENGED_ARE_KEPT}"
+        );
+        assert_eq!(host.phases(), ["Survey", "Review", "Refute", "Report"]);
+        assert!(
+            result["report"]
+                .as_str()
+                .expect("report")
+                .contains(UNCHALLENGED_NOTE),
+            "{UNCHALLENGED_ARE_KEPT}"
+        );
+    }
+
+    /// Every refuter rules the `the-boundary` cause out and every other cause
+    /// in, so the survivors separate on how many refuters upheld them.
+    fn root_cause_host() -> FakeHost {
+        FakeHost::new(Box::new(move |key, request| {
+            let label = request.label.clone().unwrap_or_default();
+            let output = if label.starts_with(EVIDENCE_PREFIX) {
+                let strand = label.trim_start_matches(EVIDENCE_PREFIX);
+                json!({
+                    "observations": [{
+                        "fact": format!("{strand} fact"),
+                        "locator": format!("src/{strand}.rs:1"),
+                        "relevance": "direct",
+                    }],
+                    "gaps": [],
+                })
+            } else if label.starts_with(HYPOTHESIS_PREFIX) {
+                let stance = label.trim_start_matches(HYPOTHESIS_PREFIX);
+                json!({
+                    "hypotheses": [{
+                        "cause": format!("{stance} cause"),
+                        "mechanism": format!("{stance} mechanism"),
+                        "supporting_ids": ["observation-0"],
+                        "disconfirming": format!("check {stance}"),
+                    }],
+                })
+            } else if label.starts_with(REFUTER_PREFIX) {
+                let start =
+                    request.prompt.find(CAUSES_OPEN).expect("packet open") + CAUSES_OPEN.len();
+                let end = request.prompt.find(CAUSES_CLOSE).expect("packet close");
+                let causes: Vec<Value> =
+                    serde_json::from_str(&request.prompt[start..end]).expect("packet json");
+                let verdicts: Vec<Value> = causes
+                    .iter()
+                    .map(|cause| {
+                        let refuted = cause["stance"] == REFUTED_STANCE;
+                        json!({
+                            "cause_id": cause["id"],
+                            "verdict": if refuted { "refuted" } else { "survives" },
+                            "reason": "read the code",
+                        })
+                    })
+                    .collect();
+                json!({ "verdicts": verdicts })
+            } else if label == DIAGNOSIS_WRITER {
+                Value::String(DIAGNOSIS_BODY.into())
+            } else {
+                return Err(HostError::Failed(format!("unexpected label {label}")));
+            };
+            Ok(agent_result(format!("agent-{key}"), true, output))
+        }))
+    }
+
+    fn run_root_cause(host: &FakeHost, agent_budget: u32) -> Value {
+        let outcome = RhaiEngine.run(RunParams {
+            source: ROOT_CAUSE_SOURCE,
+            args: &json!({ "failure": "it panics on startup" }),
+            journal: &Journal::new(),
+            host,
+            limits: &EngineLimits::default(),
+            agent_budget,
+        });
+        match outcome {
+            WorkflowOutcome::Completed(value) => value,
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn root_cause_rules_out_the_refuted_stance_and_ranks_by_convergence() {
+        let host = root_cause_host();
+
+        let result = run_root_cause(&host, TEST_AGENT_BUDGET);
+
+        assert_eq!(result["status"], "diagnosed", "{result}");
+        let causes = result["causes"].as_array().expect("causes");
+        assert_eq!(causes.len(), STANCE_COUNT - 1, "{result}");
+        assert!(
+            causes.iter().all(|cause| cause["stance"] != REFUTED_STANCE),
+            "{REFUTED_STANCE_IS_DROPPED}"
+        );
+        assert_eq!(
+            causes[0]["upheld_by"], STANCE_COUNT,
+            "{RANKED_BY_CONVERGENCE}"
+        );
+        assert_eq!(
+            host.phases(),
+            ["Evidence", "Hypothesize", "Refute", "Report"]
+        );
+        assert!(
+            result["report"]
+                .as_str()
+                .expect("report")
+                .contains(DIAGNOSIS_BODY)
+        );
+    }
+
+    /// With room for the writer but not for a refuter, the causes still reach a
+    /// report and the report says nothing challenged them.
+    #[test]
+    fn root_cause_reports_unchallenged_causes_when_the_budget_runs_out() {
+        let host = root_cause_host();
+
+        let result = run_root_cause(&host, (STRAND_COUNT + STANCE_COUNT) as u32 + 1);
+
+        assert_eq!(result["status"], "partial", "{result}");
+        assert_eq!(
+            result["causes"].as_array().map(Vec::len),
+            Some(STANCE_COUNT),
+            "{UNREFUTED_ARE_KEPT}"
+        );
+        assert!(
+            result["report"]
+                .as_str()
+                .expect("report")
+                .contains(UNREFUTED_NOTE),
+            "{UNREFUTED_ARE_KEPT}"
+        );
+    }
+
     fn claim(label: &str, index: usize) -> Value {
         json!({
             "claim": format!("{label} claim {index}"),
@@ -1209,6 +1598,7 @@ mod tests {
             journal: &Journal::new(),
             host,
             limits: &EngineLimits::default(),
+            agent_budget: TEST_AGENT_BUDGET,
         });
         match outcome {
             WorkflowOutcome::Completed(value) => value,

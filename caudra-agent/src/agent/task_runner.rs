@@ -91,6 +91,10 @@ pub struct TaskRequest {
     /// `None` is the parent's default profile for a new task and the stored
     /// profile for a continuation.
     pub profile: Option<String>,
+    /// Which model job runs this task. Reachable from a workflow script, which
+    /// names a job rather than a model, and never from the `task` tool, whose
+    /// API deliberately no longer takes a model.
+    pub model_job: Option<ModelPurpose>,
     /// JSON Schema (object) the result must match. When set, `output` is the
     /// validated value the subagent reported through `structured_output`.
     pub output_schema: Option<Value>,
@@ -217,6 +221,7 @@ pub async fn run_task(ctx: &ToolContext, request: TaskRequest) -> TaskOutcome {
             task_id: request.task,
             profile: request.profile,
             mode,
+            model_job: request.model_job,
             local_definitions,
             local_tools,
         },
@@ -1417,6 +1422,7 @@ mod tests {
             task,
             mode,
             profile: None,
+            model_job: None,
             output_schema: None,
             call_id: CALL_ID.into(),
             provenance: None,
@@ -2037,6 +2043,7 @@ mod tests {
                         task_id: TaskIdentity::Derive,
                         profile: None,
                         mode: None,
+                        model_job: None,
                         local_definitions: Vec::new(),
                         local_tools: LocalTools::default(),
                     },
@@ -2385,6 +2392,7 @@ mod tests {
                         task_id: TaskIdentity::Derive,
                         profile: None,
                         mode: None,
+                        model_job: None,
                         local_definitions: Vec::new(),
                         local_tools: LocalTools::default(),
                     },
@@ -2444,6 +2452,7 @@ mod tests {
                         task_id: TaskIdentity::Derive,
                         profile: None,
                         mode: None,
+                        model_job: None,
                         local_definitions: Vec::new(),
                         local_tools: LocalTools::default(),
                     },

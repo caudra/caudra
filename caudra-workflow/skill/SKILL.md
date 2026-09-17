@@ -30,7 +30,7 @@ Three scopes are searched, in this order. The first scope that defines a name wi
 
 | Scope | Location | Trust | Use it for |
 |-------|----------|-------|------------|
-| Built-in | compiled into Caudra | always | `deep-research` ships here. Cannot be shadowed. |
+| Built-in | compiled into Caudra | always | `deep-research`, `review-changes`, and `root-cause` ship here. Cannot be shadowed. |
 | Project | `<project root>/.caudra/workflows/<name>.rhai` | the user must approve the exact bytes in `/workflows` | plans specific to this repository |
 | User | `<config dir>/workflows/<name>.rhai` | trusted as written | personal routines the user wants everywhere |
 
@@ -139,6 +139,13 @@ Options, all optional:
 | `output_schema` | a map holding a JSON Schema with `type: "object"` at the root. The agent must answer through `structured_output` and the result is validated before the script sees it. On success `output` is the object. |
 | `phase` | tags the agent with a phase title for the roster. |
 | `profile` | a Caudra system prompt profile name for the task. Omit it unless the user has profiles. |
+| `model_job` | which model job runs this call: `"chat"`, `"plan"`, `"subagent"`, `"fast"`, or `"best"`. Omit it and the call uses the session's subagent model. |
+
+`model_job` names a job and never a model. `model_job: "anthropic/claude-haiku-4-5"` is an error, because a script pinned to one model breaks on a machine that does not have it. The job resolves against whatever the user bound to it.
+
+Use `"fast"` for bulk work over a fixed packet, such as one shard of items to rule on. Use `"best"` for the single call whose output the user reads, usually the report writer. Leave it off everywhere else.
+
+A `subagent_model` pinned on the profile the call names wins over `model_job`, because the user configured that deliberately.
 
 An unknown option is an error. `prompt` inside the options map conflicts with the positional prompt and is an error. A blank prompt is an error.
 
@@ -185,6 +192,25 @@ Writes an artifact and returns its absolute path as a string. `name` is a single
 Serializes a value to compact JSON text. `()` becomes `null`. Use it to embed structured data in a prompt, so the agent sees one unambiguous block rather than Rhai's debug formatting.
 
 There is no `json_decode`. Structured data comes back from agents through `output_schema`, already parsed.
+
+### `budget()`
+
+Returns `#{ issued, limit, remaining }` as integers. `issued` counts every agent the script has asked for so far, one per `agent` call and one per item of a `parallel`. `limit` is the budget the run was launched with. `remaining` is the difference.
+
+Use it to decide whether a later pass is still affordable, and say in the result when you skipped one:
+
+```rhai
+let spend = budget();
+if spend.remaining > shard_count {
+    let verdicts = parallel(refute_jobs);
+    // drop what the refuters ruled out
+} else {
+    degraded = true;
+    notes.push("Only " + spend.remaining.to_string() + " agent(s) remained, so nothing was refuted.");
+}
+```
+
+The count is what the script asked for rather than what the host admitted, so a branch on `budget()` takes the same path on a resume. Reading it costs no host call and writes nothing to the journal.
 
 ### `pause(kind, message)`
 
@@ -538,7 +564,8 @@ The build agents edit one file each, which keeps a replay after a pause from rep
 | `Function not found: f (i64)` for a closure | closures are invoked with `.call()` | `f.call(2)` |
 | `Function not found: join` | arrays have no `join` | build the string with `reduce` |
 | `Variable not found: x` inside `fn` | functions cannot see outer variables | pass it as an argument |
-| `unknown agent option` | a typo or an option that does not exist | `prompt`, `label`, `capability_mode`, `output_schema`, `phase`, `profile` |
+| `unknown agent option` | a typo or an option that does not exist | `prompt`, `label`, `capability_mode`, `output_schema`, `phase`, `profile`, `model_job` |
+| `unknown model_job "opus"` | a model id where a job belongs | one of `chat`, `plan`, `subagent`, `fast`, `best` |
 | `agent option output_schema must be a map` | schema given as a string | write it as a map literal |
 | `subagent finished without calling structured_output` in the log | the agent ignored the schema | shorten the prompt, name the deliverable, keep the schema small |
 | run ends `budget_limited` at a `parallel` | the batch did not fit the remaining budget | raise `agent_budget`, cap the batch, or resume with a higher budget |
@@ -553,6 +580,8 @@ The build agents edit one file each, which keeps a replay after a pause from rep
 - Anything branched on comes back through `output_schema`. Everything else is treated as text.
 - Every `success` is checked before `output` is used.
 - Loops over agent output are capped by a constant.
+- A pass that can be skipped checks `budget()` first and records that it skipped it.
+- `model_job` is a job name, set only where the work is clearly cheap or clearly the deliverable.
 - The result uses `report` and, for long output, `path`.
 - `validate` passed, and the scope directory came from `list`.
 - For project scope, the user knows to approve it in `/workflows`.

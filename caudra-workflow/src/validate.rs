@@ -17,6 +17,9 @@ const SMOKE_AGENT_ID: &str = "smoke";
 const SMOKE_SCRATCH_DIR: &str = "smoke-scratch";
 const SMOKE_MAX_OPERATIONS: u64 = 5_000_000;
 const SMOKE_MAX_HOST_CALLS: u64 = 64;
+/// Enough that a budget-aware script takes its full path during validation
+/// rather than the degraded one it keeps for a nearly spent run.
+const SMOKE_AGENT_BUDGET: u32 = 128;
 const SMOKE_WALL_TIME: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, PartialEq)]
@@ -122,6 +125,7 @@ pub fn validate(source: &str) -> Result<ValidationReport, ValidationError> {
         journal: &Journal::new(),
         host: &host,
         limits: &limits,
+        agent_budget: SMOKE_AGENT_BUDGET,
     });
     if let WorkflowOutcome::Failed(error) = outcome {
         return Err(ValidationError::Smoke(error));
@@ -142,7 +146,10 @@ pub fn validate(source: &str) -> Result<ValidationReport, ValidationError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{DEEP_RESEARCH_NAME, DEEP_RESEARCH_SOURCE};
+    use crate::{
+        DEEP_RESEARCH_NAME, DEEP_RESEARCH_SOURCE, REVIEW_CHANGES_NAME, REVIEW_CHANGES_SOURCE,
+        ROOT_CAUSE_NAME, ROOT_CAUSE_SOURCE,
+    };
 
     const META: &str = r#"let meta = #{ name: "t", description: "d" };"#;
 
@@ -152,6 +159,32 @@ mod tests {
         assert_eq!(report.meta.name, DEEP_RESEARCH_NAME);
         assert_eq!(report.smoke.phases_seen, ["Plan", "Research"]);
         assert!(report.smoke.host_calls > 0);
+        assert!(matches!(
+            report.smoke.outcome,
+            WorkflowOutcome::Completed(_)
+        ));
+    }
+
+    /// Agents answer `{}` on the smoke path, so this pins the degraded route:
+    /// an empty survey and no findings still reach a written artifact.
+    #[test]
+    fn review_changes_validates_on_the_inert_path() {
+        let report = validate(REVIEW_CHANGES_SOURCE).expect("review-changes validates");
+        assert_eq!(report.meta.name, REVIEW_CHANGES_NAME);
+        assert_eq!(report.smoke.phases_seen, ["Survey", "Review"]);
+        assert!(matches!(
+            report.smoke.outcome,
+            WorkflowOutcome::Completed(_)
+        ));
+    }
+
+    /// An inert host yields no observations, so this pins the earliest exit:
+    /// a run that saw nothing still writes an artifact rather than failing.
+    #[test]
+    fn root_cause_validates_on_the_inert_path() {
+        let report = validate(ROOT_CAUSE_SOURCE).expect("root-cause validates");
+        assert_eq!(report.meta.name, ROOT_CAUSE_NAME);
+        assert_eq!(report.smoke.phases_seen, ["Evidence"]);
         assert!(matches!(
             report.smoke.outcome,
             WorkflowOutcome::Completed(_)

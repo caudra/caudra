@@ -7,15 +7,17 @@
 
 use std::sync::Arc;
 
+use caudra_providers::ModelPurpose;
 use caudra_storage::workflow::{
     WorkflowCallFinish, WorkflowCallKind, WorkflowCallStart, WorkflowEventKind, WorkflowRunPatch,
     WorkflowUpdate,
 };
 use caudra_workflow::{
     AgentRequest, AgentResult, AgentRosterEntry, CallKey, CallKind, CapabilityMode, EngineLimits,
-    HostError, Journal, LogLine, MAX_PHASE_HISTORY, MAX_RUN_LOG_ENTRIES, PhaseRecord, RhaiEngine,
-    RosterState, RunParams, RunSnapshot, RunStatus, WorkflowEngine, WorkflowError, WorkflowEvent,
-    WorkflowHost, WorkflowOutcome, agent_request_value, hash_request, scratch_request_value,
+    HostError, Journal, LogLine, MAX_PHASE_HISTORY, MAX_RUN_LOG_ENTRIES, ModelJob, PhaseRecord,
+    RhaiEngine, RosterState, RunParams, RunSnapshot, RunStatus, WorkflowEngine, WorkflowError,
+    WorkflowEvent, WorkflowHost, WorkflowOutcome, agent_request_value, hash_request,
+    scratch_request_value,
 };
 use flume::{Receiver, Sender};
 use futures_lite::future;
@@ -215,6 +217,7 @@ pub(super) fn launch(
         commands,
         cancel: cancel.clone(),
     };
+    let agent_budget = snapshot.agent_budget;
     let engine = smol::unblock(move || {
         let outcome = RhaiEngine.run(RunParams {
             source: &spec.source,
@@ -222,6 +225,7 @@ pub(super) fn launch(
             journal: &spec.journal,
             host: &host,
             limits: &EngineLimits::default(),
+            agent_budget,
         });
         let _ = host.commands.send(HostCommand::Finished(outcome));
     });
@@ -446,6 +450,7 @@ impl Driver {
                 CapabilityMode::Build => SubagentTaskMode::Build,
             }),
             profile: request.profile.clone(),
+            model_job: request.model_job.and_then(model_purpose),
             output_schema: request.output_schema.clone(),
             call_id: format!("{}{CALL_ID_SEPARATOR}{}", self.snapshot.run_id, key.0),
             provenance: Some(provenance.clone()),
@@ -863,6 +868,19 @@ async fn recv_or_pending<T>(rx: Option<&Receiver<T>>) -> Result<T, flume::RecvEr
     }
 }
 
+/// The job a script asked for, as a routing purpose. `subagent` is how a script
+/// says "however subagents are configured here", which is the absence of an
+/// override rather than a binding that would resolve to itself.
+fn model_purpose(job: ModelJob) -> Option<ModelPurpose> {
+    match job {
+        ModelJob::Chat => Some(ModelPurpose::Chat),
+        ModelJob::Plan => Some(ModelPurpose::Plan),
+        ModelJob::Fast => Some(ModelPurpose::Fast),
+        ModelJob::Best => Some(ModelPurpose::Best),
+        ModelJob::Subagent => None,
+    }
+}
+
 fn label_of(key: CallKey, request: &AgentRequest) -> String {
     request
         .label
@@ -905,4 +923,22 @@ fn host_failure(error: WorkflowError) -> HostError {
 
 fn scratch_failure(error: WorkflowError) -> HostError {
     HostError::Scratch(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use test_case::test_case;
+
+    use super::{ModelJob, ModelPurpose, model_purpose};
+
+    /// The `subagent` case is the one worth pinning: it must resolve to no
+    /// override, not to a purpose that would route a subagent to itself.
+    #[test_case(ModelJob::Chat => Some(ModelPurpose::Chat); "chat")]
+    #[test_case(ModelJob::Plan => Some(ModelPurpose::Plan); "plan")]
+    #[test_case(ModelJob::Fast => Some(ModelPurpose::Fast); "fast")]
+    #[test_case(ModelJob::Best => Some(ModelPurpose::Best); "best")]
+    #[test_case(ModelJob::Subagent => None; "subagent")]
+    fn a_model_job_maps_to_its_routing_purpose(job: ModelJob) -> Option<ModelPurpose> {
+        model_purpose(job)
+    }
 }

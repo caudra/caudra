@@ -32,9 +32,15 @@ const UNKNOWN_RUN: &str = "Unknown workflow run: ";
 const AMBIGUOUS: &str = "Several runs match";
 const BUDGET_RANGE: &str = "An agent budget must be between 1 and";
 const MAX_CANDIDATES: usize = 5;
-pub(crate) const DEEP_RESEARCH_USAGE: &str = "Usage: /deep-research <query>";
 pub(crate) const TRUST_HINT: &str = "run /workflows to review and trust it";
 pub(crate) const DEEP_RESEARCH_WORKFLOW: &str = "deep-research";
+pub(crate) const REVIEW_CHANGES_WORKFLOW: &str = "review-changes";
+pub(crate) const ROOT_CAUSE_WORKFLOW: &str = "root-cause";
+/// What a built-in workflow wants after its own slash command, as the word the
+/// usage line asks for.
+const DEEP_RESEARCH_SUBJECT: &str = "query";
+const REVIEW_CHANGES_SUBJECT: &str = "scope";
+const ROOT_CAUSE_SUBJECT: &str = "failure";
 const RUNS_SUBCOMMAND: &str = "runs";
 const RETURN_HINT: &str = "/workflow returns to this run";
 const HISTORY_LIMIT: Option<usize> = None;
@@ -309,13 +315,15 @@ impl App {
         Vec::new()
     }
 
-    pub(super) fn execute_deep_research(&mut self, query: &str) -> Vec<Action> {
-        let query = query.trim();
-        if query.is_empty() {
-            self.flash(DEEP_RESEARCH_USAGE.into());
+    /// A built-in workflow's own slash command takes free text and nothing else,
+    /// so it forwards to `/workflow <name> <text>` once the text is non-empty.
+    pub(super) fn execute_builtin_workflow(&mut self, name: &str, text: &str) -> Vec<Action> {
+        let text = text.trim();
+        if text.is_empty() {
+            self.flash(builtin_workflow_usage(name));
             return Vec::new();
         }
-        self.execute_workflow(&format!("{DEEP_RESEARCH_WORKFLOW} {query}"))
+        self.execute_workflow(&format!("{name} {text}"))
     }
 
     fn control_workflow_by_name(&mut self, control: RunControl, target: &str) {
@@ -627,6 +635,15 @@ fn split_word(text: &str) -> (&str, &str) {
     text.split_once(char::is_whitespace).unwrap_or((text, ""))
 }
 
+pub(crate) fn builtin_workflow_usage(name: &str) -> String {
+    let subject = match name {
+        REVIEW_CHANGES_WORKFLOW => REVIEW_CHANGES_SUBJECT,
+        ROOT_CAUSE_WORKFLOW => ROOT_CAUSE_SUBJECT,
+        _ => DEEP_RESEARCH_SUBJECT,
+    };
+    format!("Usage: /{name} <{subject}>")
+}
+
 /// `<name> [--agent-budget N] [rest]`. A JSON object after the name is the
 /// script's arguments as given; anything else is its query and objective.
 pub(crate) fn parse_launch(args: &str) -> Result<LaunchRequest, String> {
@@ -734,6 +751,9 @@ mod tests {
     const ONE_ANNOUNCEMENT: &str = "a pending completion is announced exactly once";
     const ACK_AT_READ_REVISION: &str = "the ack must name the revision the notice was read at";
     const LOG_MESSAGE: &str = "searching the docs";
+    const BUILTIN_SUBJECT: &str = "why is the sky blue";
+    const LAUNCHES_ITS_OWN: &str =
+        "a built-in slash command launches the workflow it is named after, with its free text";
     const CARD_DRAWN: &str = "a slash launch draws the run's card in the transcript";
     const CARD_FOLLOWS: &str = "the card must follow the run's snapshots";
     const LOG_MIRRORED: &str = "a log line must reach the mirror's tail";
@@ -1041,27 +1061,35 @@ mod tests {
         );
     }
 
-    #[test]
-    fn deep_research_is_the_builtin_workflow_with_the_query() {
+    #[test_case(DEEP_RESEARCH_WORKFLOW ; "deep_research")]
+    #[test_case(REVIEW_CHANGES_WORKFLOW ; "review_changes")]
+    #[test_case(ROOT_CAUSE_WORKFLOW ; "root_cause")]
+    fn a_builtin_slash_command_launches_its_own_workflow(name: &str) {
         let mut app = scripted_app();
 
-        workflow_command(&mut app, "/deep-research", "why is the sky blue");
+        workflow_command(&mut app, &format!("/{name}"), BUILTIN_SUBJECT);
 
-        assert!(matches!(
-            &app.workflow.sent[..],
-            [WorkflowRequest::Start(launch)]
-                if launch.name == DEEP_RESEARCH_WORKFLOW
-                    && launch.args[QUERY_ARG] == "why is the sky blue"
-        ));
+        assert!(
+            matches!(
+                &app.workflow.sent[..],
+                [WorkflowRequest::Start(launch)]
+                    if launch.name == name && launch.args[QUERY_ARG] == BUILTIN_SUBJECT
+            ),
+            "{LAUNCHES_ITS_OWN}"
+        );
     }
 
-    #[test]
-    fn deep_research_without_a_query_shows_usage() {
+    /// The usage line names what that workflow wants, so a user who typed the
+    /// command bare is told what to put after it rather than the word "query".
+    #[test_case(DEEP_RESEARCH_WORKFLOW, "Usage: /deep-research <query>" ; "deep_research")]
+    #[test_case(REVIEW_CHANGES_WORKFLOW, "Usage: /review-changes <scope>" ; "review_changes")]
+    #[test_case(ROOT_CAUSE_WORKFLOW, "Usage: /root-cause <failure>" ; "root_cause")]
+    fn a_builtin_slash_command_without_a_subject_shows_its_own_usage(name: &str, usage: &str) {
         let mut app = scripted_app();
 
-        workflow_command(&mut app, "/deep-research", "  ");
+        workflow_command(&mut app, &format!("/{name}"), "  ");
 
-        assert_eq!(app.status_bar.flash_text(), Some(DEEP_RESEARCH_USAGE));
+        assert_eq!(app.status_bar.flash_text(), Some(usage));
         assert!(app.workflow.sent.is_empty());
     }
 

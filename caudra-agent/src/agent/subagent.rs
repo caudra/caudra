@@ -26,6 +26,7 @@ use super::steering::{SharedSteering, Steering};
 use super::{ModelRoute, resolve_model_for_purpose};
 use crate::cancel::{CancelMap, CancelSlot};
 use crate::prompt::PromptId;
+use crate::prompt::profile::SystemPromptProfile;
 use crate::tools::native::batch::MAX_BATCH_SIZE;
 use crate::tools::{
     BuiltinDeferral, DeferredTool, DescriptionContext, FileReadTracker, LocalTools, ToolAudience,
@@ -646,6 +647,11 @@ pub struct TaskOptions {
     pub task_id: TaskIdentity,
     pub profile: Option<String>,
     pub mode: Option<SubagentTaskMode>,
+    /// Which model job runs this one task, when the caller knows what kind of
+    /// work it is. A profile that pins `subagent_model` still wins, because the
+    /// user configured that and the caller only asked for a job. Not persisted
+    /// with the task, so a continuation resolves the model the ordinary way.
+    pub model_job: Option<ModelPurpose>,
     /// Tool definitions the subagent sees on top of the registry's, paired
     /// with `local_tools` by name.
     pub local_definitions: Vec<JsonValue>,
@@ -719,9 +725,8 @@ pub async fn open_task(ctx: &ToolContext, opts: TaskOptions) -> Result<Subagent,
         .resolve(&spec.profile_name)
         .map_err(|error| error.to_string())?;
 
-    let model_binding = profile
-        .as_deref()
-        .and_then(|profile| profile.subagent_model());
+    let asked = opts.model_job.map(Binding::Same);
+    let model_binding = subagent_model_binding(profile.as_deref(), asked.as_ref());
     let (model, provider) = resolve_provider(ctx, model_binding).await?;
     announce_model(ctx, &model);
 
@@ -940,6 +945,17 @@ fn reserve_fresh(
     }
 }
 
+/// A profile pin wins over the job the caller named: the user chose the model,
+/// the caller only said what kind of work this is.
+fn subagent_model_binding<'a>(
+    profile: Option<&'a SystemPromptProfile>,
+    asked: Option<&'a Binding>,
+) -> Option<&'a Binding> {
+    profile
+        .and_then(SystemPromptProfile::subagent_model)
+        .or(asked)
+}
+
 async fn resolve_provider(
     ctx: &ToolContext,
     binding_override: Option<&Binding>,
@@ -1136,6 +1152,7 @@ mod tests {
     use caudra_providers::{Billing, ContentBlock, Message, Role};
     use caudra_storage::id::SessionRef;
     use caudra_storage::usage_ledger::LedgerPurpose;
+    use tempfile::TempDir;
     use test_case::test_case;
 
     const RUN_ID: u64 = 7;
@@ -1144,6 +1161,10 @@ mod tests {
     const PARENT_ID: &str = "task-1";
     const TOOL_ID: &str = "toolu_01";
     const PLAN_MODEL_SPEC: &str = "openai/gpt-5.4";
+    const PINNED_MODEL_SPEC: &str = "anthropic/claude-haiku-4-5";
+    const PINNING_PROFILE: &str = "pinned";
+    const PROFILE_BODY: &str = "Pinned.";
+    const PROFILE_MISSING: &str = "a written profile must load";
     const COLLIDING_SUBAGENT_NAME: &str = "collision";
     const INHERITED_PROFILE: &str = "parent-default";
     const SUBAGENT_SYSTEM: &str = "system";
@@ -1189,6 +1210,7 @@ mod tests {
             task_id: TaskIdentity::Derive,
             profile: Some(crate::prompt::profile::BUILTIN_PROFILE_NAME.into()),
             mode,
+            model_job: None,
             local_definitions: Vec::new(),
             local_tools: LocalTools::default(),
         }
@@ -1256,6 +1278,7 @@ mod tests {
                     task_id: TaskIdentity::Derive,
                     profile: Some(crate::prompt::profile::BUILTIN_PROFILE_NAME.into()),
                     mode: Some(mode),
+                    model_job: None,
                     local_definitions: Vec::new(),
                     local_tools: LocalTools::default(),
                 },
@@ -1267,6 +1290,52 @@ mod tests {
             assert!(Arc::ptr_eq(&subagent.params.provider, &ctx.provider));
             subagent.close();
         });
+    }
+
+    /// Built through the real loader, so the pin under test is the one a user
+    /// writing that frontmatter would get.
+    fn profile_pinning(model: Option<&str>) -> Arc<SystemPromptProfile> {
+        let dir = TempDir::new().unwrap();
+        let profiles = dir.path().join(crate::prompt::profile::PROFILE_DIR);
+        std::fs::create_dir(&profiles).unwrap();
+        let frontmatter = model
+            .map(|model| format!("---\nsubagent_model: {model}\n---\n"))
+            .unwrap_or_default();
+        std::fs::write(
+            profiles.join(format!("{PINNING_PROFILE}.md")),
+            format!("{frontmatter}{PROFILE_BODY}"),
+        )
+        .unwrap();
+        crate::prompt::profile::PromptProfileCatalog::discover_with(Some(dir.path()))
+            .get(PINNING_PROFILE)
+            .expect(PROFILE_MISSING)
+    }
+
+    /// The user configured the pin and the caller only said what kind of work
+    /// this is, so the pin outranks the job asked for.
+    #[test_case(None ; "no_job_asked")]
+    #[test_case(Some(ModelPurpose::Fast) ; "fast_job_asked")]
+    #[test_case(Some(ModelPurpose::Best) ; "best_job_asked")]
+    fn a_profile_pin_outranks_the_asked_for_job(model_job: Option<ModelPurpose>) {
+        let profile = profile_pinning(Some(PINNED_MODEL_SPEC));
+        let asked = model_job.map(Binding::Same);
+
+        assert_eq!(
+            subagent_model_binding(Some(&profile), asked.as_ref()),
+            Some(&Binding::Exact(PINNED_MODEL_SPEC.into()))
+        );
+    }
+
+    #[test_case(true ; "unpinned_profile")]
+    #[test_case(false ; "no_profile")]
+    fn the_asked_for_job_is_used_without_a_pin(unpinned_profile: bool) {
+        let profile = unpinned_profile.then(|| profile_pinning(None));
+        let asked = Some(Binding::Same(ModelPurpose::Fast));
+
+        assert_eq!(
+            subagent_model_binding(profile.as_deref(), asked.as_ref()),
+            Some(&Binding::Same(ModelPurpose::Fast))
+        );
     }
 
     /// Announced rather than assembled, so the prompt a subagent caches never
@@ -1451,6 +1520,7 @@ mod tests {
                     task_id: TaskIdentity::Derive,
                     profile: Some(crate::prompt::profile::BUILTIN_PROFILE_NAME.into()),
                     mode: Some(SubagentTaskMode::Plan),
+                    model_job: None,
                     local_definitions: Vec::new(),
                     local_tools: LocalTools::default(),
                 },

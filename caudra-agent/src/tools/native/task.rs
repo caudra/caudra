@@ -164,6 +164,7 @@ impl ToolInvocation for TaskCall {
                 task: TaskIdentity::continue_or_derive(self.task_id),
                 mode: self.mode,
                 profile: self.profile,
+                model_job: None,
                 output_schema: self.output_schema,
                 call_id: ctx
                     .tool_use_id

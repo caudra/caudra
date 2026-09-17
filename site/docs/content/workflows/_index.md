@@ -9,12 +9,28 @@ group = "Guides"
 
 A workflow is a script that runs a plan of subagents and keeps the results. It is the trusted part of the system: plain code that fans work out to agents, validates what comes back, drops what does not hold up, and assembles the result. The agents are untrusted workers. The script decides.
 
-Caudra ships one workflow, `deep-research`, and discovers the ones you write. Runs are durable. A run that pauses, fails, or is stopped can resume from its journal instead of starting over.
+Caudra ships three workflows and discovers the ones you write. Runs are durable. A run that pauses, fails, or is stopped can resume from its journal instead of starting over.
+
+## What ships
+
+| Workflow | Use it for | Phases |
+|----------|------------|--------|
+| `deep-research` | A question that needs sourced claims rather than an answer from memory | Plan, Research, Verify, Report |
+| `review-changes` | A diff, branch, or pull request you want read by more than one pair of eyes | Survey, Review, Refute, Report |
+| `root-cause` | A failure whose cause is not obvious from the error alone | Evidence, Hypothesize, Refute, Report |
+
+All three are read-only. They inspect the workspace and the web, and they write their report to a scratch file. None of them edits your code.
+
+They share a shape. Work fans out to agents that cannot see each other, a second wave attacks what the first wave produced, and the script throws away whatever does not survive. `deep-research` verifies claims against independent sources. `review-changes` hands each finding to a refuter that tries to show the defect is not there. `root-cause` proposes rival causes from separate stances and rules out the ones the code contradicts. What reaches the report has been through an adversary.
+
+Each one degrades rather than failing. A reviewer that returns nothing costs you that angle and a line in the coverage section. A run with too little budget left to refute says so in the report and labels its findings unchallenged.
 
 ## Run one
 
 ```
 /deep-research Compare the migration risks of PostgreSQL 17 and MySQL 9
+/workflow review-changes the auth middleware I just rewrote
+/workflow root-cause the integration suite panics on startup since Tuesday
 ```
 
 The command returns at once. The run continues in the background while you keep working in the session. Watch it in `/workflow`, and when it settles Caudra starts one model turn that carries the report into the conversation.
@@ -26,7 +42,7 @@ Other ways to launch:
 /workflow deep-research {"query": "smol blocking", "breadth": 3}
 ```
 
-Plain text after the name becomes `args.query` and `args.objective`. A JSON object passes through as `args`. `--agent-budget N` caps how many agents the run may launch.
+Plain text after the name becomes `args.query` and `args.objective`. A JSON object passes through as `args`. `--agent-budget N` caps how many agents the run may launch. `review-changes` also reads `args.scope` and `root-cause` reads `args.failure`, so a JSON launch can name the input directly.
 
 The model can launch workflows too, through the `workflow` tool, when the session has a runtime. It sees the same catalog you do and the same trust rules. See [Tools](/docs/tools/#workflow) for the tool contract.
 
@@ -115,12 +131,12 @@ Workflows are [Rhai](https://rhai.rs) scripts. The file name must be `<meta.name
 
 ```rhai
 let meta = #{
-    name: "review-changes",
-    description: "Review a diff with independent readers and merge their findings",
-    when_to_use: "Review, audit, or second-opinion a change before it lands.",
+    name: "release-notes",
+    description: "Turn the commits since a tag into notes grouped by audience",
+    when_to_use: "Write release notes or a changelog for a range of commits.",
     phases: [
-        #{ title: "Read", detail: "Independent readers summarize the diff" },
-        #{ title: "Report", detail: "Merge findings into one review" },
+        #{ title: "Read", detail: "Independent readers summarize the commits" },
+        #{ title: "Report", detail: "Merge the summaries into one set of notes" },
     ],
 };
 ```
@@ -139,9 +155,47 @@ Everything after the metadata is ordinary Rhai with these host functions:
 | `complete()`, `complete(value)` | Ends the run with `value` as its result |
 | `write_scratch_file(name, content)` | Writes an artifact and returns its path |
 | `json_encode(value)` | Serializes a value to JSON text |
+| `budget()` | Returns `#{ issued, limit, remaining }` for the run's agent budget |
 | `args` | The launch arguments, or `()` when none were given |
 
-Agent options: `prompt` (required in `parallel` items), `label` for the roster, `capability_mode` (`read-only`, or `read-write`, `execute`, `all` for a build agent), `output_schema` (a JSON Schema the agent must satisfy through `structured_output`), `phase`, and `profile` (a Caudra task profile). An unknown option is an error. A read-only agent runs as a plan task. A build agent runs as a build task, still capped by your current permission mode.
+Agent options:
+
+| Option | Meaning |
+|--------|---------|
+| `prompt` | The instruction. Required in `parallel` items, and the positional argument to `agent` |
+| `label` | The name this agent takes in the roster and the timeline |
+| `capability_mode` | `read-only` for a plan task, or `read-write`, `execute`, `all` for a build task |
+| `output_schema` | A JSON Schema the agent must satisfy through `structured_output` |
+| `phase` | The phase the call belongs to |
+| `profile` | A Caudra task profile, which brings its own system prompt and tool set |
+| `model_job` | The kind of work this call is: `chat`, `plan`, `subagent`, `fast`, or `best` |
+
+An unknown option is an error. A build agent is still capped by your current permission mode.
+
+### Choosing a model
+
+`model_job` names a job rather than a model. The job resolves against the model bindings configured on the machine the workflow runs on, so a script shared between two people picks each person's fast model rather than pinning one they may not have. Naming a model directly, as `anthropic/claude-haiku-4-5`, is rejected.
+
+Use `fast` for bulk work over a fixed packet, such as a shard of findings to rule on. Use `best` for the one call whose output the user reads. Leave it off, or pass `subagent`, for everything else, and the call runs on whatever the session uses for subagents.
+
+Precedence runs from most specific configuration to least. A `subagent_model` pin on the profile the call names wins over the call's `model_job`, because a user who pinned a model for a profile meant it. Without a pin, `model_job` applies. Without either, the session's subagent binding applies. See [System Prompt Profiles](/docs/system-prompts/#configure-subagents).
+
+### Spending the budget
+
+`budget()` reports what the run has spent. `issued` counts every agent the script asked for, including each item of a `parallel`, `limit` is the budget the run was launched with, and `remaining` is the difference.
+
+Read it to decide how much verification you can still afford:
+
+```rhai
+if budget().remaining > shard_count {
+    let verdicts = parallel(refute_jobs);
+    // drop what the refuters ruled out
+} else {
+    notes.push("The budget ran out before refutation, so these findings are unchallenged.");
+}
+```
+
+The count comes from what the script asked for rather than from what the host admitted, so a branch on `budget()` reads the same on a resume as it did on the original run. Both built-in review workflows use it to skip refutation and say so in the report rather than running out of budget in the middle of one.
 
 `output` is validated JSON when `output_schema` was given, otherwise the agent's final text. Treat both as data. The engine converts model output to inert values, so nothing an agent returns can become a host call or a permission.
 
@@ -151,13 +205,73 @@ Nothing else is reachable. There is no `import`, `eval`, clock, sleep, or file a
 
 Validate a script from the catalog or with the `workflow` tool's `validate` action. Validation compiles the script and runs it once against a canned host whose agents return empty results, so it exercises one path through the code, not every branch.
 
+## Patterns that work
+
+The three built-in workflows are worth reading as worked examples. These are the patterns they share.
+
+### Fan out, then attack
+
+One agent is a single opinion. Two agents asked the same question are two correlated opinions. The useful shape is a wide first pass followed by a second pass whose only job is to destroy what the first pass produced.
+
+Give the second pass a packet and a narrow ruling. `review-changes` asks its refuters to rule `upheld`, `refuted`, or `uncertain`, and forbids them to repair a finding or add one. A refuter allowed to improve a claim will improve it, which is how a weak finding survives.
+
+Drop what loses. Keeping a refuted item with a warning label puts the judgement back on the reader.
+
+### Make the angles disjoint
+
+Independence comes from the topology rather than from asking for it in the prompt. Agents that can see each other's work converge, so each one gets its own slice and no sight of the others.
+
+`review-changes` splits by dimension: correctness, security, performance, tests, API compatibility. `root-cause` splits its evidence pass by strand and its hypothesis pass by stance, which is the same idea applied to explanation rather than observation. Each prompt names its slice and says another agent covers the rest.
+
+### Shard the verify pass
+
+A verifier handed twenty items will skim. Shard the work so each verifier sees a handful, and check the result as a bijection: exactly one verdict per ID, every ID accounted for, no ID that was not in the packet.
+
+Fail the shard rather than the item. A verifier that returned a malformed set has told you nothing about any of its items, so discard all of them and say so in the report.
+
+### Degrade on purpose
+
+Decide in advance what a run does when it runs short, then say what it did.
+
+```rhai
+let spend = budget();
+if spend.remaining <= shard_count {
+    degraded = true;
+    notes.push("Only " + spend.remaining.to_string() + " agent(s) remained, so nothing was refuted.");
+} else {
+    // run the refuters
+}
+```
+
+A report that says which pass it skipped is worth more than one that quietly skipped it. Both review workflows carry a coverage section listing every angle that failed and every item dropped.
+
+### Frame every interpolation
+
+Everything an agent returns is untrusted. Wrap it before it reaches another prompt:
+
+```rhai
+fn untrusted(tag, value) {
+    "<" + tag + "-json>\n" + json_encode(value) + "\n</" + tag + "-json>"
+}
+```
+
+`json_encode` makes the content inert text, and the tag tells the reading agent where the data starts and stops. Say in the prompt that the block is data rather than instructions.
+
+### Withhold what you do not want invented
+
+An agent that is shown a conclusion will support it. Refuters in `root-cause` receive the causes and the observations, and nothing about which cause the script currently favours. The ranking happens after the verdicts arrive, in the script.
+
+### Two profiles, two budgets
+
+Pair a cheap wide pass with one expensive narrow one. Set `model_job: "fast"` on the sharded verifiers, where the work is mechanical and the packet is fixed, and `model_job: "best"` on the single call that writes what the user reads. A run of twenty agents where nineteen are cheap costs about what one careful agent costs.
+
 ## How resume works
 
 Every `agent`, `parallel`, and `write_scratch_file` call gets a sequence key and a hash of its request. Results are committed to the session database before the script sees them. Resuming a run evaluates the same source from the top with the same `args`, and each call whose key is in the journal returns the committed result without touching an agent. The script reaches the point where it stopped and continues from there.
 
 Divergence is an error. If the script asks a different question at the same key, the run fails rather than replaying a stale answer.
 
-Resume is not exactly-once for the outside world. An agent that edited files before a pause landed, whose result was not yet committed, runs again on resume and may repeat that work. A read-only workflow such as `deep-research` is unaffected. A build workflow should make its agents idempotent or keep them small.
+Resume is not exactly-once for the outside world. An agent that edited files before a pause landed, whose result was not yet committed, runs again on resume and may repeat that work. The three built-in workflows are read-only and unaffected. A build workflow should make its agents idempotent or keep them small.
 
 A run that was active when the process exited becomes `interrupted` and does not resume. External effects have no stable identity across processes, so replaying them would be a guess. Start a new run.
 
