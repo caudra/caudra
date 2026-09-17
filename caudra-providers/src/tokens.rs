@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::{LazyLock, Mutex};
 
-use tiktoken_rs::CoreBPE;
+use tiktoken_rs::{CoreBPE, Rank};
 
 use crate::model::{format_tokens, format_tokens_wide};
 
@@ -29,6 +29,47 @@ static CACHE: LazyLock<Mutex<HashMap<u64, u32>>> = LazyLock::new(Mutex::default)
 /// CJK, base64, and dense JSON.
 pub fn estimate_tokens(text: &str) -> u32 {
     u32::try_from(O200K.count_ordinary(text)).unwrap_or(u32::MAX)
+}
+
+/// A text cut to its first `head` and last `tail` tokens, with the count that
+/// fell out between them.
+#[derive(Debug, PartialEq, Eq)]
+pub struct MiddleCut {
+    pub head: String,
+    pub tail: String,
+    pub omitted: u32,
+}
+
+/// Cuts the middle out of `text` so its beginning and end survive: `None` when
+/// the whole text already fits in `head + tail` tokens.
+///
+/// A token boundary can fall inside a multibyte character, so each side is
+/// decoded lossily and the replacement glyph that marks the split is trimmed
+/// off rather than handed on.
+pub fn cut_middle(text: &str, head: u32, tail: u32) -> Option<MiddleCut> {
+    let tokens = O200K.encode_ordinary(text);
+    let (head, tail) = (head as usize, tail as usize);
+    if tokens.len() <= head + tail {
+        return None;
+    }
+    let decode = |slice: &[Rank]| {
+        O200K
+            .decode_bytes(slice)
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+    };
+    let head_text = decode(&tokens[..head]).ok()?;
+    let tail_text = decode(&tokens[tokens.len() - tail..]).ok()?;
+    Some(MiddleCut {
+        head: head_text
+            .trim_end_matches(char::REPLACEMENT_CHARACTER)
+            .trim_end()
+            .to_owned(),
+        tail: tail_text
+            .trim_start_matches(char::REPLACEMENT_CHARACTER)
+            .trim_start()
+            .to_owned(),
+        omitted: u32::try_from(tokens.len() - head - tail).unwrap_or(u32::MAX),
+    })
 }
 
 /// [`estimate_tokens`], memoized on a hash of `text`.
@@ -93,9 +134,12 @@ mod tests {
     use test_case::test_case;
 
     use super::{
-        CACHE_CAPACITY, NO_RATE, estimate_tokens, estimate_tokens_cached, format_hit_rate,
-        format_tokens_u64,
+        CACHE_CAPACITY, NO_RATE, cut_middle, estimate_tokens, estimate_tokens_cached,
+        format_hit_rate, format_tokens_u64,
     };
+
+    const HEAD: u32 = 8;
+    const TAIL: u32 = 12;
 
     #[test_case(None, NO_RATE ; "nothing_to_score_is_not_a_zero_hit")]
     #[test_case(Some(0.0), "0%" ; "a_real_zero_is_a_number")]
@@ -138,6 +182,38 @@ mod tests {
             estimate_tokens(text),
             "a second call must hit the cache and still agree"
         );
+    }
+
+    #[test_case("" ; "empty_text")]
+    #[test_case("short enough to keep whole" ; "under_the_cut")]
+    fn a_text_that_fits_is_not_cut(text: &str) {
+        assert_eq!(cut_middle(text, HEAD, TAIL), None);
+    }
+
+    #[test]
+    fn a_long_text_keeps_its_ends_within_the_token_limits() {
+        let text = (1..=60)
+            .map(|n| format!("sentence number {n} of the reply."))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let cut = cut_middle(&text, HEAD, TAIL).expect("sixty sentences exceed twenty tokens");
+        assert!(text.starts_with(&cut.head), "the head opens the text");
+        assert!(text.ends_with(&cut.tail), "the tail closes the text");
+        assert!(estimate_tokens(&cut.head) <= HEAD);
+        assert!(estimate_tokens(&cut.tail) <= TAIL);
+        assert_eq!(cut.omitted, estimate_tokens(&text) - HEAD - TAIL);
+    }
+
+    /// A token boundary inside a multibyte character must not leak the
+    /// replacement glyph into either side.
+    #[test]
+    fn a_split_multibyte_character_is_trimmed_not_replaced() {
+        let cjk = "\u{6f22}\u{5b57}\u{3042}".repeat(64);
+        let cut = cut_middle(&cjk, HEAD, TAIL).expect("dense text exceeds the cut");
+        assert!(!cut.head.contains(char::REPLACEMENT_CHARACTER));
+        assert!(!cut.tail.contains(char::REPLACEMENT_CHARACTER));
+        assert!(cjk.starts_with(&cut.head));
+        assert!(cjk.ends_with(&cut.tail));
     }
 
     /// The cache clears rather than evicting, so the entry that triggered the

@@ -16,7 +16,7 @@ use tracing::{info, warn};
 
 use super::history::{History, is_user_turn, remove_orphaned_tool_results, repair_tool_pairs};
 use super::requirements::{
-    self, REQUIREMENTS_MARKER, REQUIREMENTS_OUTPUT_TOKENS, RequirementsInput, requirements_section,
+    self, REQUIREMENTS_MARKER, REQUIREMENTS_OUTPUT_TOKENS, RequirementsInput,
 };
 use super::run::estimate_message_tokens;
 use super::side_model::{self, SideModel};
@@ -128,7 +128,7 @@ pub(super) async fn compact_history(
     compaction_history.push(Message::user(summary_prompt(&compaction_history, config)));
     // Read before the summary runs and across every seam: the requirements
     // are what the user said, not what the last summary kept of it.
-    let transcript = extractor.map(|_| history.transcript_items());
+    let input = extractor.map(|_| RequirementsInput::from_items(&history.transcript_items()));
 
     let summarize = async {
         let empty_tools = serde_json::json!([]);
@@ -172,12 +172,9 @@ pub(super) async fn compact_history(
     };
     let extract = async {
         let extractor = extractor?;
-        let input = RequirementsInput::from_items(transcript.as_deref()?);
-        if input.is_empty() {
-            return None;
-        }
+        let input = input.as_ref().filter(|input| !input.is_empty())?;
         Some(
-            requirements::extract(&*extractor.provider, &extractor.model, &input, None, cancel)
+            requirements::extract(&*extractor.provider, &extractor.model, input, None, cancel)
                 .await,
         )
     };
@@ -215,8 +212,9 @@ pub(super) async fn compact_history(
     // dropping them would lose what the user said for the price of one
     // request that did not come back.
     let section = requirements.map(Cow::Owned).or_else(|| {
-        extractor
-            .and_then(|_| previous_requirements(&history.as_slice()[..head_end]))
+        input
+            .as_ref()
+            .and_then(RequirementsInput::prior)
             .map(Cow::Borrowed)
     });
     if let Some(section) = section {
@@ -229,15 +227,6 @@ pub(super) async fn compact_history(
         result,
         extraction,
     })
-}
-
-/// The requirements block the previous summary carried, marker included.
-fn previous_requirements(head: &[Message]) -> Option<&str> {
-    head.iter()
-        .rev()
-        .find(|message| message.is_compaction_summary)
-        .and_then(Message::first_text_content)
-        .and_then(requirements_section)
 }
 
 /// Appends the list under [`REQUIREMENTS_MARKER`]. The marker is added when
