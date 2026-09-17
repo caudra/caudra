@@ -1053,7 +1053,7 @@ fn splash_stops_driving_cadence_once_a_message_exists() {
     assert_eq!(
         panel.cadence(),
         Cadence::SMOOTH,
-        "the starfield drifts while the splash is the only thing drawn"
+        "the splash keeps animating while it is the only thing drawn"
     );
 
     panel.tool_start(start("t1", SHELL_TOOL_NAME));
