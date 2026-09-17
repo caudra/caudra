@@ -210,8 +210,13 @@ impl Selection {
             return None;
         }
 
+        // `scroll_top` opens at `u32::MAX` to pin the first frame to the bottom
+        // and stays there while the splash is up, since nothing ever resolves
+        // it against a document. A drag on the start screen arrives here with
+        // that sentinel; saturating puts the whole viewport past every row and
+        // the selection simply has nothing to show.
         let view_top = scroll_offset;
-        let view_bottom = scroll_offset + self.area.height as u32;
+        let view_bottom = scroll_offset.saturating_add(u32::from(self.area.height));
 
         if end.row < view_top || start.row >= view_bottom {
             return None;
@@ -858,6 +863,7 @@ mod tests {
     #[test_case(doc(3,10), doc(12,50), Rect::new(0,0,80,10),  5, Some(ss(0,0,7,50))     ; "start_above_viewport")]
     #[test_case(doc(2,5),  doc(25,70), Rect::new(0,0,80,10),  5, Some(ss(0,0,9,79))     ; "both_ends_outside")]
     #[test_case(doc(0,8),  doc(5,20),  Rect::new(5,3,40,10),  0, Some(ss(3,8,8,20))     ; "nonzero_area_offset")]
+    #[test_case(doc(0,0),  doc(3,5),   Rect::new(0,0,80,20), u32::MAX, None            ; "unresolved_scroll_sentinel_on_the_splash")]
     fn to_screen_cases(
         anchor: DocPos,
         cursor: DocPos,
