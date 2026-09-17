@@ -379,10 +379,13 @@ impl AgentLoop {
             &slot.model,
             &caudra_providers::ThinkingConfig::default(),
         );
-        self.context_system = self.publish_btw_prompt(
+        let tool_filter = ToolFilter::from_config(&self.config, &slot.model, &[])
+            .for_remote_workspace(self.workspace_session.is_some());
+        self.context_system = self.build_system(
             &caudra_agent::prompt::ResolvedSlots::default(),
-            RequestOptions::default(),
+            &tool_filter,
         );
+        self.publish_btw_prompt(&slot, &self.context_system, RequestOptions::default());
         self.publish_prepared_context(&slot);
         !self.init_cancel.is_cancelled()
     }
@@ -536,28 +539,10 @@ impl AgentLoop {
             .await;
         let tool_filter = ToolFilter::from_config(&self.config, &effective_slot.model, &[])
             .for_remote_workspace(self.workspace_session.is_some());
-        let system = self.local_documents.as_ref().map_or_else(
-            || {
-                agent::build_system_prompt(
-                    self.instructions.text(),
-                    &prompt_slots,
-                    &tool_filter,
-                    self.system_prompt_profile.as_deref(),
-                )
-            },
-            |store| {
-                agent::build_system_prompt_for_remote(
-                    self.instructions.text(),
-                    &prompt_slots,
-                    &tool_filter,
-                    self.system_prompt_profile.as_deref(),
-                    store,
-                )
-            },
-        );
+        let system = self.build_system(&prompt_slots, &tool_filter);
         self.context_system.clone_from(&system);
         self.context_options = opts.clone();
-        self.publish_btw_prompt(&prompt_slots, opts.clone());
+        self.publish_btw_prompt(&effective_slot, &system, opts.clone());
         let (trigger, cancel) = CancelToken::new();
         self.set_cancel_trigger(run_id, trigger);
 
@@ -800,23 +785,17 @@ impl AgentLoop {
         tools
     }
 
-    /// Always pins the selected Chat model: btw never acts on tools, so the
-    /// active Plan model must not leak into its cache prefix.
-    fn publish_btw_prompt(
+    fn build_system(
         &self,
         prompt_slots: &caudra_agent::prompt::ResolvedSlots,
-        opts: RequestOptions,
+        tool_filter: &ToolFilter,
     ) -> String {
-        let slot = self.model_slot.load();
-        let tool_filter = ToolFilter::from_config(&self.config, &slot.model, &[])
-            .for_remote_workspace(self.workspace_session.is_some());
-        let definitions = self.build_tools(&slot.model, &slot.model, &opts.thinking);
-        let system = self.local_documents.as_ref().map_or_else(
+        self.local_documents.as_ref().map_or_else(
             || {
                 agent::build_system_prompt(
                     self.instructions.text(),
                     prompt_slots,
-                    &tool_filter,
+                    tool_filter,
                     self.system_prompt_profile.as_deref(),
                 )
             },
@@ -824,25 +803,27 @@ impl AgentLoop {
                 agent::build_system_prompt_for_remote(
                     self.instructions.text(),
                     prompt_slots,
-                    &tool_filter,
+                    tool_filter,
                     self.system_prompt_profile.as_deref(),
                     store,
                 )
             },
-        );
+        )
+    }
+
+    /// Captures the prefix of the live request as it was built, never a
+    /// rebuild of it: the route, system text, and tool array are the ones the
+    /// run bound, so a `/btw` continues the same cached prefix and agrees with
+    /// the environment reminder the transcript already carries for that model.
+    fn publish_btw_prompt(&self, slot: &ModelSlot, system: &str, opts: RequestOptions) {
         let mcp = self.mcp.as_ref().map(McpSession::request_snapshot);
         self.btw_prompt.store(Arc::new(BtwPrompt {
             provider: Arc::clone(&slot.provider),
             model: slot.model.clone(),
-            system: system.clone(),
-            tools: self.request_tools_from(
-                definitions.declared,
-                definitions.deferred,
-                mcp.as_ref(),
-            ),
+            system: system.to_owned(),
+            tools: self.request_tools(mcp.as_ref()),
             opts,
         }));
-        system
     }
 
     fn publish_prepared_context(&self, slot: &ModelSlot) {

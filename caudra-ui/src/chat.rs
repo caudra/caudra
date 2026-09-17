@@ -645,6 +645,10 @@ impl Chat {
         self.messages_panel.push(msg);
     }
 
+    pub fn remove_notice(&mut self, text: &str) {
+        self.messages_panel.remove_notice(text);
+    }
+
     /// Ends the transcript with the bubble [`TaskOutcome::role`] picks. A chat
     /// only ever grows one ending, but a caller who knows more than the one who
     /// got here first rewrites it in place. See [`TaskOutcome::refines`].

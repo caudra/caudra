@@ -3461,7 +3461,10 @@ impl<'t> EventLoop<'t> {
                 self.sessions[idx].app.start_btw(question);
             }
             Action::Extract => {
-                self.sessions[idx].app.start_extract(self.ctx.timeouts);
+                let chat = self.ctx.model_slot.load_full();
+                self.sessions[idx]
+                    .app
+                    .start_extract(self.ctx.timeouts, &chat);
             }
             Action::Suspend => {
                 let _pause = self.input.pause();

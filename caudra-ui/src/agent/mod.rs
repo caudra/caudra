@@ -46,9 +46,9 @@ pub(crate) struct ModelSlot {
     pub(crate) provider: Arc<dyn Provider>,
 }
 
-/// The complete `/btw` request prefix and the route that built it, published
-/// as one unit so a model switch cannot pair a new provider with stale tools
-/// or system text.
+/// The prefix of the last live request and the route that sent it, captured
+/// where the run builds it and published as one unit so a model switch cannot
+/// pair a new provider with stale tools or system text.
 pub(crate) struct BtwPrompt {
     pub(crate) provider: Arc<dyn Provider>,
     pub(crate) model: Model,

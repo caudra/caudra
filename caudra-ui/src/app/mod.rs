@@ -74,7 +74,7 @@ use crate::components::skills_modal::SkillsModal;
 use crate::components::stash_picker::StashPicker;
 use crate::components::status_bar::{StatusBar, StatusBarHit, StatusBarHitTarget};
 use crate::components::storage_modal::{StorageFetchState, StorageModal};
-use crate::components::stream_modal::StreamModal;
+use crate::components::stream_modal::{StreamKey, StreamModal};
 use crate::components::task_picker::TaskPicker;
 use crate::components::theme_picker::{ThemePicker, ThemePickerAction};
 use crate::components::thinking_picker::{ThinkingPicker, ThinkingPickerAction};
@@ -435,6 +435,9 @@ pub struct App {
     pub(crate) storage_slot: Arc<ArcSwapOption<StorageFetchState>>,
     pub(crate) shared_history: Option<SharedHistory>,
     pub(crate) btw_prompt: Option<crate::agent::SharedBtwPrompt>,
+    /// The `/btw` thread behind the stream modal, alive exactly as long as it
+    /// is; `/extract` shares the modal and never has one.
+    pub(super) btw_thread: Option<btw::BtwThread>,
     pub(crate) context_store: Option<ContextStore>,
     pub(crate) effective_model_slot: Option<Arc<ArcSwap<ModelSlot>>>,
     pub(crate) image_paste_rx: Vec<flume::Receiver<Result<ImageSource, String>>>,
@@ -642,6 +645,7 @@ impl App {
             storage_slot: Arc::new(ArcSwapOption::empty()),
             shared_history: None,
             btw_prompt: None,
+            btw_thread: None,
             context_store: None,
             effective_model_slot: None,
             image_paste_rx: vec![],
@@ -1807,8 +1811,10 @@ impl App {
 
         if self.stream_modal.is_open() {
             guard_repeat!(false);
-            if let Some(text) = self.stream_modal.handle_key(key) {
-                self.copy_to_clipboard(&text);
+            match self.stream_modal.handle_key(key) {
+                StreamKey::Handled => {}
+                StreamKey::Copy(text) => self.copy_to_clipboard(&text),
+                StreamKey::Submit(question) => self.continue_btw(question),
             }
             return Some(vec![]);
         }
@@ -5058,7 +5064,8 @@ impl App {
     /// never enters history.
     fn tick_stream_modal(&mut self) -> Dirty {
         let dirty = self.stream_modal.poll();
-        if let Some(spend) = self.stream_modal.take_usage() {
+        if let Some(done) = self.stream_modal.take_done() {
+            let spend = done.usage;
             self.state.token_usage += spend.usage;
             self.add_session_spend(spend.cost, spend.billing);
             add_chat_spend(self.main_chat(), spend.cost, spend.billing);
@@ -5073,6 +5080,12 @@ impl App {
             self.state
                 .goal
                 .record_external_usage(spend.usage, spend.cost, spend.billing);
+            // Only a `/btw` has a thread, so the answer is its own to keep.
+            self.settle_btw(done.answer);
+        }
+        if self.btw_thread.is_some() && !self.stream_modal.is_open() {
+            self.end_btw_thread();
+            return Dirty::YES;
         }
         dirty
     }
@@ -5144,6 +5157,9 @@ impl App {
             return;
         }
         if self.float_mgr.handle_paste(text) {
+            return;
+        }
+        if self.stream_modal.handle_paste(text) {
             return;
         }
         if self.logs_modal.is_open() {

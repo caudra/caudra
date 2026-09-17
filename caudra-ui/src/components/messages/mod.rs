@@ -1421,6 +1421,19 @@ impl MessagesPanel {
         self.auto_open = None;
     }
 
+    /// Drops the newest harness notice reading `text`. Found by content rather
+    /// than by a remembered index, so a transcript that was reloaded or grew
+    /// in between still loses the right row, or none at all.
+    pub fn remove_notice(&mut self, text: &str) {
+        if let Some(index) = self
+            .messages
+            .iter()
+            .rposition(|msg| msg.role == DisplayRole::Notice && msg.text == text)
+        {
+            self.remove(index);
+        }
+    }
+
     pub fn load_messages(&mut self, mut msgs: Vec<DisplayMessage>) {
         for msg in &mut msgs {
             msg.body_open = None;

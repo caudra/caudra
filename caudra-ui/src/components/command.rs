@@ -270,7 +270,7 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     },
     BuiltinCommand {
         name: "/btw",
-        description: "Ask a quick question (no tools, no history pollution)",
+        description: "Ask a side question, with follow-ups (no tools, nothing enters history)",
         max_args: usize::MAX,
         scope: ChatScope::MainOnly,
     },

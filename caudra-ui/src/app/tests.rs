@@ -16,7 +16,7 @@ use crate::components::status_bar::StatusBarHitTarget;
 use crate::components::storage_modal::{
     EXPANDED_TITLE as STORAGE_EXPANDED_TITLE, TITLE as STORAGE_TITLE,
 };
-use crate::components::stream_modal::{StreamEvent, StreamUsage};
+use crate::components::stream_modal::{StreamDone, StreamEvent, StreamFooter, StreamUsage};
 use crate::components::usage_modal::SCOPE_KEY;
 use crate::components::{DisplaySource, ExitRequest, ToolProgress, buffer_text, key, test_model};
 use crate::repaint::expect::{OWED, QUIET};
@@ -1600,7 +1600,7 @@ fn reset_session_clears_plan() {
     let (_tx, rx) = flume::bounded::<StreamEvent>(1);
     let (trigger, _cancel) = caudra_agent::CancelToken::new();
     app.stream_modal
-        .open(" /btw ", "q".into(), false, rx, trigger);
+        .open(" /btw ", "q".into(), StreamFooter::FollowUp, rx, trigger);
     let actions = app.reset_session();
     assert!(matches!(&actions[0], Action::NewSession(_)));
     assert_eq!(app.status, Status::Idle);
@@ -9135,6 +9135,36 @@ fn assistant_message(text: &str) -> Message {
     }
 }
 
+/// A route that never answers, for side requests a test settles by hand.
+struct PendingProvider;
+
+impl caudra_providers::provider::Provider for PendingProvider {
+    fn stream_message<'a>(
+        &'a self,
+        _: &'a caudra_providers::Model,
+        _: &'a [Message],
+        _: &'a str,
+        _: &'a serde_json::Value,
+        _: &'a flume::Sender<caudra_providers::ProviderEvent>,
+        _: caudra_providers::RequestOptions,
+        _: Option<&'a caudra_providers::CacheKey>,
+    ) -> caudra_providers::provider::BoxFuture<
+        'a,
+        Result<caudra_providers::StreamResponse, caudra_providers::AgentError>,
+    > {
+        Box::pin(std::future::pending())
+    }
+
+    fn list_models(
+        &self,
+    ) -> caudra_providers::provider::BoxFuture<
+        '_,
+        Result<Vec<caudra_providers::ModelInfo>, caudra_providers::AgentError>,
+    > {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+}
+
 fn snapshot_revert_app() -> (TempDir, App, PathBuf, CaudraId, CaudraId, CaudraId) {
     let (temp, _, _, mut app) = tempdir_app();
     let workspace = PathBuf::from(&app.state.session.cwd);
@@ -12132,20 +12162,28 @@ fn btw_usage_settles_into_the_session_ledger() {
 
     let (tx, rx) = flume::bounded(1);
     let (trigger, _cancel) = caudra_agent::CancelToken::new();
-    app.stream_modal
-        .open(" /btw ", "why sqlite?".into(), false, rx, trigger);
-    tx.send(StreamEvent::Done(StreamUsage {
-        usage: TokenUsage {
-            input: 100,
-            output: 40,
-            cache_read: 900,
-            ..Default::default()
+    app.stream_modal.open(
+        " /btw ",
+        "why sqlite?".into(),
+        StreamFooter::FollowUp,
+        rx,
+        trigger,
+    );
+    tx.send(StreamEvent::Done(StreamDone {
+        usage: StreamUsage {
+            usage: TokenUsage {
+                input: 100,
+                output: 40,
+                cache_read: 900,
+                ..Default::default()
+            },
+            cost: Some(BTW_COST),
+            billing: Billing::Api,
+            model: BTW_MODEL.into(),
+            provider: TEST_PROVIDER.into(),
+            purpose: LedgerPurpose::Btw,
         },
-        cost: Some(BTW_COST),
-        billing: Billing::Api,
-        model: BTW_MODEL.into(),
-        provider: TEST_PROVIDER.into(),
-        purpose: LedgerPurpose::Btw,
+        answer: None,
     }))
     .unwrap();
     let _ = app.tick();
@@ -12178,7 +12216,7 @@ fn btw_modal_key_routing_and_animation() {
     let (tx, rx) = flume::bounded(1);
     let (trigger, _cancel) = caudra_agent::CancelToken::new();
     app.stream_modal
-        .open(" /btw ", "test".into(), false, rx, trigger);
+        .open(" /btw ", "test".into(), StreamFooter::FollowUp, rx, trigger);
 
     // A pending stream is data, drained by `poll`. Only the typewriter
     // revealing the answer moves on its own.
@@ -12191,12 +12229,132 @@ fn btw_modal_key_routing_and_animation() {
     let actions = app.update(Msg::Key(key(KeyCode::Char('x'))));
     assert!(actions.is_empty());
     assert!(app.stream_modal.is_open());
-    assert_eq!(app.input_box.buffer.value(), "");
+    assert_eq!(
+        app.input_box.buffer.value(),
+        "",
+        "a key typed at the modal never reaches the composer"
+    );
+    assert_eq!(app.stream_modal.input_text(), "x");
 
     let actions = app.update(Msg::Key(key(KeyCode::Esc)));
     assert!(actions.is_empty());
     assert!(!app.stream_modal.is_open());
     assert_eq!(app.stream_modal.cadence(), Cadence::IDLE);
+}
+
+fn btw_ready_app() -> App {
+    let mut app = test_app();
+    app.shared_history = Some(Arc::new(ArcSwap::from_pointee(HistorySnapshot::new(
+        crate::history_items(&[
+            Message::user("pick a database".into()),
+            assistant_message("sqlite"),
+        ]),
+    ))));
+    app.btw_prompt = Some(Arc::new(ArcSwap::from_pointee(crate::agent::BtwPrompt {
+        provider: Arc::new(PendingProvider),
+        model: test_model(),
+        system: "system".into(),
+        tools: serde_json::json!([]),
+        opts: caudra_providers::RequestOptions::default(),
+    })));
+    app
+}
+
+fn notice_texts(app: &mut App) -> Vec<String> {
+    let chat = app.main_chat();
+    (0..chat.message_count())
+        .filter_map(|i| chat.message_at(i))
+        .filter(|m| m.role == DisplayRole::Notice)
+        .map(|m| m.text.clone())
+        .collect()
+}
+
+/// The marker shows where the thread's view of the conversation ends, and
+/// leaves with the thread however the modal was dismissed.
+#[test]
+fn btw_marks_the_cutoff_and_clears_it_when_the_modal_closes() {
+    let mut app = btw_ready_app();
+    let before = app.main_chat().message_count();
+
+    app.start_btw("why sqlite?".into());
+
+    assert!(app.stream_modal.is_open());
+    assert!(app.btw_thread.is_some());
+    assert_eq!(app.main_chat().message_count(), before + 1);
+    assert_eq!(
+        notice_texts(&mut app),
+        [super::btw::BTW_CUTOFF_MARKER],
+        "the marker is the newest row"
+    );
+
+    app.main_chat().push(DisplayMessage::new(
+        DisplayRole::Assistant,
+        "the agent kept talking".into(),
+    ));
+    app.update(Msg::Key(key(KeyCode::Esc)));
+    let _ = app.tick();
+
+    assert!(app.btw_thread.is_none());
+    assert!(notice_texts(&mut app).is_empty(), "the marker is gone");
+    assert_eq!(
+        app.main_chat().message_count(),
+        before + 1,
+        "only the marker left; the row appended after it stays"
+    );
+}
+
+/// A follow-up typed into the modal extends the same thread: the answered
+/// question is filed, the new one is pending, and a fresh exchange opens.
+#[test]
+fn a_btw_follow_up_extends_the_thread_over_the_same_snapshot() {
+    let mut app = btw_ready_app();
+    app.start_btw("why sqlite?".into());
+
+    // Stand in for the request the stub never answers.
+    let (tx, rx) = flume::bounded(1);
+    let (trigger, _cancel) = caudra_agent::CancelToken::new();
+    app.stream_modal.open(
+        " /btw ",
+        "Q: why sqlite?".into(),
+        StreamFooter::FollowUp,
+        rx,
+        trigger,
+    );
+    tx.send(StreamEvent::Done(StreamDone {
+        usage: StreamUsage {
+            usage: TokenUsage::default(),
+            cost: None,
+            billing: Billing::Api,
+            model: "m".into(),
+            provider: TEST_PROVIDER.into(),
+            purpose: LedgerPurpose::Btw,
+        },
+        answer: Some("it ships in the binary".into()),
+    }))
+    .unwrap();
+    let _ = app.tick();
+    assert!(
+        app.btw_thread.is_some(),
+        "a settled answer keeps the modal's thread"
+    );
+    assert_eq!(app.btw_thread.as_ref().unwrap().exchange_count(), 1);
+
+    for c in "and postgres?".chars() {
+        app.update(Msg::Key(key(KeyCode::Char(c))));
+    }
+    app.update(Msg::Key(key(KeyCode::Enter)));
+
+    let thread = app.btw_thread.as_ref().unwrap();
+    assert_eq!(thread.exchange_count(), 1);
+    assert_eq!(thread.pending(), Some("and postgres?"));
+    assert!(
+        app.stream_modal.is_streaming(),
+        "the follow-up is in flight"
+    );
+    assert_eq!(
+        app.stream_modal.headers(),
+        ["Q: why sqlite?", "Q: and postgres?"]
+    );
 }
 
 #[test]
@@ -12215,7 +12373,11 @@ fn extract_command_returns_action() {
 #[test]
 fn extract_on_a_session_without_user_turns_flashes_instead_of_opening() {
     let mut app = test_app();
-    app.start_extract(caudra_providers::Timeouts::default());
+    let chat = crate::agent::ModelSlot {
+        model: test_model(),
+        provider: Arc::new(PendingProvider),
+    };
+    app.start_extract(caudra_providers::Timeouts::default(), &chat);
     assert!(!app.stream_modal.is_open());
     assert_eq!(
         app.status_bar.flash_text().unwrap(),
@@ -12230,8 +12392,13 @@ fn extract_modal_copy_keeps_the_modal_open() {
     let mut app = test_app();
     let (tx, rx) = flume::bounded(1);
     let (trigger, _cancel) = caudra_agent::CancelToken::new();
-    app.stream_modal
-        .open(" /extract ", "Extracting…".into(), true, rx, trigger);
+    app.stream_modal.open(
+        " /extract ",
+        "Extracting…".into(),
+        StreamFooter::Copy,
+        rx,
+        trigger,
+    );
     tx.send(StreamEvent::TextDelta("- ship it".into())).unwrap();
     assert_eq!(app.stream_modal.poll(), Dirty::YES);
 
@@ -12253,19 +12420,27 @@ fn extract_usage_settles_under_the_extract_purpose() {
 
     let (tx, rx) = flume::bounded(1);
     let (trigger, _cancel) = caudra_agent::CancelToken::new();
-    app.stream_modal
-        .open(" /extract ", "Extracting…".into(), true, rx, trigger);
-    tx.send(StreamEvent::Done(StreamUsage {
-        usage: TokenUsage {
-            input: 300,
-            output: 60,
-            ..Default::default()
+    app.stream_modal.open(
+        " /extract ",
+        "Extracting…".into(),
+        StreamFooter::Copy,
+        rx,
+        trigger,
+    );
+    tx.send(StreamEvent::Done(StreamDone {
+        usage: StreamUsage {
+            usage: TokenUsage {
+                input: 300,
+                output: 60,
+                ..Default::default()
+            },
+            cost: Some(EXTRACT_COST),
+            billing: Billing::Api,
+            model: EXTRACT_MODEL.into(),
+            provider: TEST_PROVIDER.into(),
+            purpose: LedgerPurpose::Extract,
         },
-        cost: Some(EXTRACT_COST),
-        billing: Billing::Api,
-        model: EXTRACT_MODEL.into(),
-        provider: TEST_PROVIDER.into(),
-        purpose: LedgerPurpose::Extract,
+        answer: None,
     }))
     .unwrap();
     let _ = app.tick();

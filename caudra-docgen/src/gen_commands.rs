@@ -267,7 +267,7 @@ pub fn generate() -> String {
     .unwrap();
     writeln!(
         out,
-        "- **`/btw`**: one-shot side question with no tools and no history pollution."
+        "- **`/btw`**: a side question over the conversation so far, with follow-ups in the same thread. The answer streams into a modal; type under it and press `Enter` to ask the next question, `Esc` to close. No tool runs, nothing enters history, and a marker in the transcript shows where the thread's view of the conversation ends."
     )
     .unwrap();
     writeln!(

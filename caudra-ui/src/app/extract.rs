@@ -7,13 +7,13 @@ use caudra_providers::{AgentError, Model, ModelPurpose, Timeouts};
 use caudra_storage::usage_ledger::LedgerPurpose;
 use flume::Sender;
 
-use crate::components::stream_modal::{StreamEvent, StreamUsage};
+use crate::agent::ModelSlot;
+use crate::components::stream_modal::{StreamDone, StreamEvent, StreamFooter, StreamUsage};
 
 use super::App;
 
 const TITLE: &str = " /extract ";
 pub(crate) const NOTHING_TO_EXTRACT: &str = "Nothing to extract: the session has no user turns yet";
-const MODEL_NOT_READY: &str = "The model is still initializing";
 const EMPTY_LIST: &str = "_The model found no requirements in this session._";
 
 fn header(input: &RequirementsInput, model: Option<&Model>) -> String {
@@ -27,8 +27,10 @@ fn header(input: &RequirementsInput, model: Option<&Model>) -> String {
 
 impl App {
     /// Reads the whole transcript, not just what the next request carries, so
-    /// a requirement stated before a compaction still makes the list.
-    pub(crate) fn start_extract(&mut self, timeouts: Timeouts) {
+    /// a requirement stated before a compaction still makes the list. Resolves
+    /// the extractor from the Chat slot, as compaction does, so both name the
+    /// same model whatever route the live turn took.
+    pub(crate) fn start_extract(&mut self, timeouts: Timeouts, chat: &ModelSlot) {
         let items = match crate::transcript_session_history(&self.state.session) {
             Ok(items) => items,
             Err(error) => {
@@ -41,18 +43,15 @@ impl App {
             self.flash(NOTHING_TO_EXTRACT.into());
             return;
         }
-        let Some(prompt) = self.btw_prompt.as_ref().map(|p| p.load_full()) else {
-            self.flash(MODEL_NOT_READY.into());
-            return;
-        };
+        self.end_btw_thread();
 
         let (tx, rx) = flume::bounded(64);
         let (trigger, cancel) = CancelToken::new();
         self.stream_modal
-            .open(TITLE, header(&input, None), true, rx, trigger);
+            .open(TITLE, header(&input, None), StreamFooter::Copy, rx, trigger);
 
-        let provider = Arc::clone(&prompt.provider);
-        let model = prompt.model.clone();
+        let provider = Arc::clone(&chat.provider);
+        let model = chat.model.clone();
         let model_policy = Arc::clone(&self.model_policy);
         smol::spawn(async move {
             let side = side_model::resolve(
@@ -104,13 +103,16 @@ async fn run_extract(
             if outcome.text.is_none() {
                 let _ = tx.send(StreamEvent::TextDelta(EMPTY_LIST.into()));
             }
-            let _ = tx.send(StreamEvent::Done(StreamUsage {
-                cost: side.model.billed_cost(&outcome.usage, false),
-                billing: side.model.billing,
-                usage: outcome.usage,
-                model: side.model.id.clone(),
-                provider: side.model.provider.to_string(),
-                purpose: LedgerPurpose::Extract,
+            let _ = tx.send(StreamEvent::Done(StreamDone {
+                usage: StreamUsage {
+                    cost: side.model.billed_cost(&outcome.usage, false),
+                    billing: side.model.billing,
+                    usage: outcome.usage,
+                    model: side.model.id.clone(),
+                    provider: side.model.provider.to_string(),
+                    purpose: LedgerPurpose::Extract,
+                },
+                answer: outcome.text,
             }));
         }
         // The receiver is already gone, which is what cancelled the stream.
