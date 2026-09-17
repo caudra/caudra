@@ -1,15 +1,19 @@
+use std::time::{Duration, Instant};
+
+use crate::animation::spinner_str;
 use crate::components::ModalScroll;
 use crate::components::Overlay;
 use crate::components::modal::{ESC_LABEL, FooterHits, FooterLine, Modal};
+use crate::components::prompt_progress::{self, PromptProgress, PromptRate};
 use crate::components::scrollbar::{Scrollbar, ScrollbarMouse};
 use crate::components::streaming_content::StreamingContent;
 use crate::text_buffer::TextBuffer;
 use crate::theme;
 
-use caudra_agent::CancelTrigger;
+use caudra_agent::{CancelTrigger, format_live_duration, format_settled_duration};
 use caudra_providers::{Billing, TokenUsage};
 use caudra_storage::usage_ledger::LedgerPurpose;
-use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 use ratatui::text::{Line, Span};
@@ -21,15 +25,34 @@ const H_PAD: u16 = 2;
 const WIDTH_PERCENT: u16 = 65;
 const MAX_HEIGHT_PERCENT: u16 = 80;
 pub(crate) const COPY_LABEL: &str = "y";
+const CTRL_COPY_LABEL: &str = "⌃Y";
 const COPY_HINT: &str = " Copy";
 const CLOSE_HINT: &str = " Close";
 const FOOTER_GAP: &str = "   ";
 const INPUT_PREFIX: &str = "> ";
 const SEND_LABEL: &str = "Enter";
 const SEND_HINT: &str = " Send a follow-up";
-/// The input line and the hint under it, kept out of the scroll region so a
-/// long thread never scrolls the prompt away.
-const INPUT_ROWS: u16 = 2;
+/// While an answer is still streaming the key does not send: the thread is
+/// one question deep at a time, so what it takes is held until the answer is
+/// in.
+const QUEUE_HINT: &str = " Queue a follow-up";
+const WAITING_PLACEHOLDER: &str = "waiting for the answer…";
+const QUEUED_PREFIX: &str = "queued: ";
+/// A stopped answer says so in its own body, where the truncation is, rather
+/// than only in the header.
+const STOPPED_NOTE: &str = "\n\n_Stopped._";
+const ERROR_PREFIX: &str = "";
+const TOKENS_IN: &str = " in";
+const TOKENS_CACHED: &str = " cached";
+const TOKENS_OUT: &str = " out";
+const SUFFIX_SEPARATOR: &str = " · ";
+/// The spinner, the clock and the prefill bar, kept out of the scroll region
+/// so the wait is always visible.
+const STATUS_ROW: u16 = 1;
+/// The input line, kept out of the scroll region so a long thread never
+/// scrolls the prompt away.
+const INPUT_ROW: u16 = 1;
+const FOOTER_ROW: u16 = 1;
 
 const CLOSE_CONTROL: StreamControl = StreamControl {
     label: ESC_LABEL,
@@ -45,11 +68,17 @@ const COPY_FOOTER: [StreamControl; 2] = [
     },
     CLOSE_CONTROL,
 ];
-const FOLLOW_UP_FOOTER: [StreamControl; 2] = [
+/// Copy needs a chord here: a bare `y` is text the input is owed.
+const FOLLOW_UP_FOOTER: [StreamControl; 3] = [
     StreamControl {
         label: SEND_LABEL,
         hint: SEND_HINT,
         command: StreamCommand::Send,
+    },
+    StreamControl {
+        label: CTRL_COPY_LABEL,
+        hint: COPY_HINT,
+        command: StreamCommand::Copy,
     },
     CLOSE_CONTROL,
 ];
@@ -78,6 +107,10 @@ pub enum StreamEvent {
     /// Replaces the header once the request knows something it did not at
     /// open time, such as which model answered.
     Header(String),
+    /// How much of the prompt the server has prefilled. Only providers that
+    /// report it send this, so it is the bar's only source and never a
+    /// guarantee that a bar appears.
+    Progress(PromptProgress),
     TextDelta(String),
     Done(StreamDone),
     Error(String),
@@ -124,10 +157,25 @@ pub enum StreamAction {
     Submit(String),
 }
 
+/// How an exchange ended, which is what its body is painted as.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExchangeOutcome {
+    Live,
+    Done,
+    Failed,
+    Stopped,
+}
+
 /// One question and the answer streaming under it.
 struct Exchange {
     header: String,
     body: StreamingContent,
+    started_at: Instant,
+    /// How long the answer took, once it is in. `None` while it is still
+    /// coming, which is also what says the live clock belongs to this one.
+    settled: Option<Duration>,
+    usage: Option<TokenUsage>,
+    outcome: ExchangeOutcome,
 }
 
 impl Exchange {
@@ -141,7 +189,46 @@ impl Exchange {
                 theme.assistant,
                 ms_per_char,
             ),
+            started_at: Instant::now(),
+            settled: None,
+            usage: None,
+            outcome: ExchangeOutcome::Live,
         }
+    }
+
+    fn settle(&mut self, outcome: ExchangeOutcome) {
+        self.settled = Some(self.started_at.elapsed());
+        self.outcome = outcome;
+    }
+
+    /// What the exchange cost, appended to its question once the answer is in.
+    /// A reader scrolling back wants the price of the answer beside the
+    /// question that bought it.
+    fn suffix(&self) -> String {
+        let Some(settled) = self.settled else {
+            return String::new();
+        };
+        let mut suffix = format!("{SUFFIX_SEPARATOR}{}", format_settled_duration(settled));
+        let Some(usage) = self.usage else {
+            return suffix;
+        };
+        let input =
+            u64::from(usage.input) + u64::from(usage.cache_read) + u64::from(usage.cache_creation);
+        suffix.push_str(&format!(
+            "{SUFFIX_SEPARATOR}{}{TOKENS_IN}",
+            super::format_compact(input)
+        ));
+        if usage.cache_read > 0 {
+            suffix.push_str(&format!(
+                "{SUFFIX_SEPARATOR}{}{TOKENS_CACHED}",
+                super::format_compact(u64::from(usage.cache_read))
+            ));
+        }
+        suffix.push_str(&format!(
+            "{SUFFIX_SEPARATOR}{}{TOKENS_OUT}",
+            super::format_compact(u64::from(usage.output))
+        ));
+        suffix
     }
 }
 
@@ -163,6 +250,13 @@ pub struct StreamModal {
     /// already funnels through [`StreamModal::close`] cancels for free.
     cancel: Option<CancelTrigger>,
     pending_done: Option<StreamDone>,
+    /// How far the live request's prompt has been prefilled, while that is
+    /// still short of the whole prompt.
+    progress: Option<PromptProgress>,
+    rate: PromptRate,
+    /// A follow-up typed while the answer was still streaming, held until the
+    /// host can extend the thread with it.
+    queued: Option<String>,
     popup: Rect,
 }
 
@@ -181,6 +275,9 @@ impl StreamModal {
             rx: None,
             cancel: None,
             pending_done: None,
+            progress: None,
+            rate: PromptRate::default(),
+            queued: None,
             popup: Rect::default(),
         }
     }
@@ -212,6 +309,8 @@ impl StreamModal {
         self.exchanges.push(Exchange::new(header, self.ms_per_char));
         self.rx = Some(rx);
         self.cancel = Some(cancel);
+        self.progress = None;
+        self.rate.reset();
         self.scroll.scroll_to(u16::MAX);
     }
 
@@ -223,25 +322,37 @@ impl StreamModal {
         self.input.clear();
         self.scroll.reset();
         self.footer_hits.reset();
-        self.rx = None;
-        self.cancel = None;
+        self.queued = None;
+        self.finish_stream();
     }
 
     pub fn take_done(&mut self) -> Option<StreamDone> {
         self.pending_done.take()
     }
 
+    /// The follow-up typed while the last answer was still streaming. Taken
+    /// once: the host either extends the thread with it or it is gone.
+    pub fn take_queued(&mut self) -> Option<String> {
+        self.queued.take()
+    }
+
     pub fn is_streaming(&self) -> bool {
         self.rx.is_some()
     }
 
-    /// Only the typewriters move on their own, and only while on screen. A
-    /// pending stream is drained by [`Self::poll`], which reports its own
-    /// [`Dirty`].
+    /// The spinner and the clock carry the wait before the first token, which
+    /// is exactly the window the typewriter cannot: it has nothing to reveal
+    /// yet.
     pub fn cadence(&self) -> Cadence {
         Cadence::when(
-            self.open && self.exchanges.iter().any(|e| e.body.is_animating()),
-            Cadence::SMOOTH,
+            self.open,
+            Cadence::any([
+                Cadence::when(self.is_streaming(), Cadence::SPINNER),
+                Cadence::when(
+                    self.exchanges.iter().any(|e| e.body.is_animating()),
+                    Cadence::SMOOTH,
+                ),
+            ]),
         )
     }
 
@@ -272,15 +383,29 @@ impl StreamModal {
             dirty = Dirty::YES;
             match event {
                 StreamEvent::Header(header) => live.header = header,
-                StreamEvent::TextDelta(text) => live.body.push(&text),
+                StreamEvent::Progress(progress) => {
+                    self.rate.sample(progress.processed, Instant::now());
+                    self.progress = (progress.processed < progress.total).then_some(progress);
+                }
+                StreamEvent::TextDelta(text) => {
+                    // Text means the prefill is over, whatever the last count
+                    // said; a bar left part-full outlives what it measured.
+                    self.progress = None;
+                    live.body.push(&text);
+                }
                 StreamEvent::Done(done) => {
+                    live.usage = Some(done.usage.usage);
+                    live.settle(ExchangeOutcome::Done);
                     self.pending_done = Some(done);
                     finished = true;
                     break;
                 }
                 StreamEvent::Error(msg) => {
+                    let theme = theme::current();
                     live.body.clear();
+                    live.body.set_style(ERROR_PREFIX, theme.error, theme.error);
                     live.body.push(&msg);
+                    live.settle(ExchangeOutcome::Failed);
                     finished = true;
                     break;
                 }
@@ -293,10 +418,24 @@ impl StreamModal {
     }
 
     /// Retires the cancel trigger alongside the receiver so a finished stream
-    /// never leaves a live trigger behind.
+    /// never leaves a live trigger behind, and drops the prefill the trigger
+    /// was measuring.
     fn finish_stream(&mut self) {
         self.rx = None;
         self.cancel = None;
+        self.progress = None;
+        self.rate.reset();
+    }
+
+    /// Abandons the answer and keeps everything around it: the modal stays up,
+    /// the thread keeps its earlier exchanges, and the stopped one says where
+    /// it was cut. Dropping the trigger cancels the request.
+    fn stop(&mut self) {
+        if let Some(live) = self.exchanges.last_mut() {
+            live.body.push(STOPPED_NOTE);
+            live.settle(ExchangeOutcome::Stopped);
+        }
+        self.finish_stream();
     }
 
     pub fn scroll(&mut self, delta: i32) {
@@ -329,6 +468,17 @@ impl StreamModal {
     }
 
     pub fn handle_key(&mut self, key_event: KeyEvent) -> StreamAction {
+        if key_event.modifiers.contains(KeyModifiers::CONTROL) {
+            match key_event.code {
+                // The global gesture stops what is running, so here it stops
+                // the answer and leaves the thread that asked for it.
+                KeyCode::Char('c') if self.is_streaming() => self.stop(),
+                KeyCode::Char('c') => self.close(),
+                KeyCode::Char('y') => return StreamAction::Copy(self.text().to_owned()),
+                _ => return StreamAction::Consumed,
+            }
+            return StreamAction::Consumed;
+        }
         if self.footer == StreamFooter::FollowUp {
             return self.handle_follow_up_key(key_event);
         }
@@ -344,16 +494,18 @@ impl StreamModal {
         StreamAction::Consumed
     }
 
-    /// The input owns every key but the four that move the thread: `y` and
+    /// The input owns every key but the ones that move the thread: `y` and
     /// Space are text here.
     fn handle_follow_up_key(&mut self, key_event: KeyEvent) -> StreamAction {
         match key_event.code {
             KeyCode::Esc => self.close(),
-            KeyCode::Enter => match self.take_question() {
-                Some(question) => return StreamAction::Submit(question),
-                None if self.input.value().trim().is_empty() => self.close(),
-                None => {}
-            },
+            KeyCode::Enter => {
+                if self.input.value().trim().is_empty() {
+                    self.close();
+                } else if let Some(question) = self.take_question() {
+                    return StreamAction::Submit(question);
+                }
+            }
             KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown => {
                 self.scroll.handle_key(key_event);
             }
@@ -364,15 +516,19 @@ impl StreamModal {
         StreamAction::Consumed
     }
 
-    /// The typed follow-up, cleared from the input once taken. Nothing is
-    /// taken while an answer is still streaming, so a follow-up cannot cancel
-    /// the answer it is following up.
+    /// The typed follow-up, cleared from the input once taken. A question
+    /// asked while the answer is still streaming is queued instead of sent,
+    /// so it cannot cancel the answer it is following up.
     fn take_question(&mut self) -> Option<String> {
         let question = self.input.value().trim().to_owned();
-        if question.is_empty() || self.is_streaming() {
+        if question.is_empty() {
             return None;
         }
         self.input.clear();
+        if self.is_streaming() {
+            self.queued = Some(question);
+            return None;
+        }
         Some(question)
     }
 
@@ -382,6 +538,26 @@ impl StreamModal {
             StreamFooter::Copy => &COPY_FOOTER,
             StreamFooter::FollowUp => &FOLLOW_UP_FOOTER,
         }
+    }
+
+    /// Each control is one phrase, key and gloss together, so the pointer
+    /// marks and presses the whole of what it reads. The send control says
+    /// which of the two things it does, because mid-stream it queues.
+    fn footer_line(&self) -> FooterLine {
+        let theme = theme::current();
+        let mut footer = FooterLine::default();
+        for (index, control) in self.controls().iter().enumerate() {
+            if index > 0 {
+                footer.text(FOOTER_GAP, theme.tool_dim);
+            }
+            let hint = match control.command {
+                StreamCommand::Send if self.is_streaming() => QUEUE_HINT,
+                _ => control.hint,
+            };
+            footer.command(control.label, theme.keybind_key);
+            footer.describe(hint, theme.tool_dim);
+        }
+        footer
     }
 
     /// A paste lands in the input, flattened to the one line it has.
@@ -407,22 +583,15 @@ impl StreamModal {
             if index > 0 {
                 lines.push(Line::default());
             }
-            lines.push(Line::from(Span::styled(
-                exchange.header.clone(),
-                theme.tool_dim,
-            )));
+            lines.push(Line::from(vec![
+                Span::styled(exchange.header.clone(), theme.tool_dim),
+                Span::styled(exchange.suffix(), theme.tool_dim),
+            ]));
             lines.push(Line::default());
             lines.extend_from_slice(exchange.body.render_lines(padded_width));
         }
-        let footer = footer_line(self.controls());
-        let input_rows = if self.footer == StreamFooter::FollowUp {
-            INPUT_ROWS
-        } else {
-            lines.push(Line::default());
-            lines.push(footer.line(self.footer_hits.hovered()));
-            0
-        };
 
+        let chrome = self.chrome_rows();
         let total = Paragraph::new(lines.clone())
             .wrap(Wrap { trim: false })
             .line_count(padded_width) as u16;
@@ -431,22 +600,35 @@ impl StreamModal {
             width_percent: WIDTH_PERCENT,
             max_height_percent: MAX_HEIGHT_PERCENT,
         };
-        let (popup, inner) = modal.render(frame, area, total.saturating_add(input_rows));
+        let (popup, inner) = modal.render(frame, area, total.saturating_add(chrome));
         let padded = Rect {
             x: inner.x + H_PAD,
             width: inner.width.saturating_sub(H_PAD * 2),
             ..inner
         };
+        // The chrome is claimed from the bottom up, so a modal clamped to the
+        // height cap loses transcript rows rather than the rows that say what
+        // is happening.
         let viewport = Rect {
-            height: padded.height.saturating_sub(input_rows),
+            height: padded.height.saturating_sub(chrome.min(padded.height)),
             ..padded
         };
+        let mut row = viewport.bottom();
+        let mut claim = |height: u16| {
+            let taken = Rect {
+                y: row,
+                height: height.min(padded.bottom().saturating_sub(row)),
+                ..padded
+            };
+            row = taken.bottom();
+            taken
+        };
+        let status = self.is_streaming().then(|| claim(STATUS_ROW));
+        let input = (self.footer == StreamFooter::FollowUp).then(|| claim(INPUT_ROW));
+        let footer_row = claim(FOOTER_ROW);
+
         self.scroll.update_dimensions(total, viewport.height);
         let scroll = self.scroll.offset();
-        if input_rows == 0 {
-            self.footer_hits.set(footer.hits(viewport, scroll, total));
-        }
-
         let paragraph = Paragraph::new(lines)
             .wrap(Wrap { trim: false })
             .scroll((scroll, 0));
@@ -462,32 +644,63 @@ impl StreamModal {
             scroll,
         );
 
-        if input_rows > 0 {
-            let prompt_row = Rect {
-                y: viewport.y + viewport.height,
-                height: (padded.height - viewport.height).min(1),
-                ..padded
-            };
-            let hint_row = Rect {
-                y: prompt_row.bottom(),
-                height: padded.bottom().saturating_sub(prompt_row.bottom()),
-                ..padded
-            };
-            frame.render_widget(Paragraph::new(self.input_line()), prompt_row);
-            self.footer_hits.set(footer.hits(hint_row, 0, 1));
-            frame.render_widget(
-                Paragraph::new(footer.line(self.footer_hits.hovered())),
-                hint_row,
-            );
+        if let Some(status) = status {
+            self.draw_status(frame, status);
         }
+        if let Some(input) = input {
+            frame.render_widget(Paragraph::new(self.input_line()), input);
+        }
+        let footer = self.footer_line();
+        self.footer_hits.set(footer.hits(footer_row, 0, 1));
+        frame.render_widget(
+            Paragraph::new(footer.line(self.footer_hits.hovered())),
+            footer_row,
+        );
 
         self.popup = popup;
         popup
     }
 
+    fn chrome_rows(&self) -> u16 {
+        u16::from(self.is_streaming()) * STATUS_ROW
+            + u16::from(self.footer == StreamFooter::FollowUp) * INPUT_ROW
+            + FOOTER_ROW
+    }
+
+    /// The spinner and the clock on the left, the prefill bar on the right.
+    /// Only providers that report prefill draw the bar; the rest are carried
+    /// by the clock alone.
+    fn draw_status(&mut self, frame: &mut Frame, area: Rect) {
+        let theme = theme::current();
+        let Some(elapsed) = self.exchanges.last().map(|e| e.started_at.elapsed()) else {
+            return;
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(spinner_str(elapsed.as_millis()), theme.spinner),
+                Span::styled(
+                    format!(" {}", format_live_duration(elapsed)),
+                    theme.tool_dim,
+                ),
+            ])),
+            area,
+        );
+        if let Some(progress) = self.progress {
+            prompt_progress::render(frame, area, progress, &self.rate);
+        }
+    }
+
     fn input_line(&self) -> Line<'static> {
         let theme = theme::current();
         let text = self.input.value();
+        if text.is_empty()
+            && let Some(placeholder) = self.placeholder()
+        {
+            return Line::from(vec![
+                Span::styled(INPUT_PREFIX, theme.tool_dim),
+                Span::styled(placeholder, theme.tool_dim),
+            ]);
+        }
         let cursor_byte = TextBuffer::char_to_byte(&text, self.input.x());
         let (before, rest) = text.split_at(cursor_byte);
         let mut chars = rest.chars();
@@ -500,6 +713,15 @@ impl StreamModal {
             Span::styled(cursor_char.to_string(), theme.cursor),
             Span::styled(after.to_owned(), style),
         ])
+    }
+
+    /// An empty input says why it is empty: what is already queued, or that
+    /// the thread is waiting on the answer before it takes the next question.
+    fn placeholder(&self) -> Option<String> {
+        match &self.queued {
+            Some(question) => Some(format!("{QUEUED_PREFIX}{question}")),
+            None => self.is_streaming().then(|| WAITING_PLACEHOLDER.to_owned()),
+        }
     }
 
     #[cfg(test)]
@@ -523,21 +745,6 @@ impl StreamModal {
     }
 }
 
-/// Each control is one phrase, key and gloss together, so the pointer marks
-/// and presses the whole of what it reads.
-fn footer_line(controls: &[StreamControl]) -> FooterLine {
-    let theme = theme::current();
-    let mut footer = FooterLine::default();
-    for (index, control) in controls.iter().enumerate() {
-        if index > 0 {
-            footer.text(FOOTER_GAP, theme.tool_dim);
-        }
-        footer.command(control.label, theme.keybind_key);
-        footer.describe(control.hint, theme.tool_dim);
-    }
-    footer
-}
-
 impl Overlay for StreamModal {
     fn is_open(&self) -> bool {
         self.is_open()
@@ -556,6 +763,7 @@ impl Overlay for StreamModal {
 mod tests {
     use super::*;
     use crate::components::key as key_ev;
+    use crate::components::prompt_progress::PROMPT_PROGRESS_LABEL;
     use caudra_agent::CancelToken;
     use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEventKind};
     use ratatui::Terminal;
@@ -566,7 +774,13 @@ mod tests {
     const COPY: usize = 0;
     const SEND: usize = 0;
     const CLOSE: usize = 1;
+    const FOLLOW_UP_COPY: usize = 1;
+    const FOLLOW_UP_CLOSE: usize = 2;
     const HOVER_MISSED: &str = "the footer control must reverse under the pointer as one phrase";
+    const STATUS_MISSING: &str = "a waiting request has to show that it is waiting";
+    const STATUS_LINGERED: &str = "a settled request has nothing left to report";
+    const WIDTH: u16 = 80;
+    const HEIGHT: u16 = 24;
     const MODEL: &str = "test-model";
     const PROVIDER: &str = "anthropic";
     const TITLE: &str = " /btw ";
@@ -841,7 +1055,7 @@ mod tests {
     fn the_follow_up_footer_sends_and_closes_by_click() {
         let mut m = StreamModal::new(0);
         let (tx, _cancel) = open_modal(&mut m, HEADER, StreamFooter::FollowUp);
-        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT)).unwrap();
         draw(&mut m, &mut terminal);
         let send = m.footer_hit(SEND);
         assert!(send.width > 0, "the send control is drawn");
@@ -854,20 +1068,56 @@ mod tests {
             matches!(click(&mut m, send), StreamAction::Consumed),
             "a follow-up waits for the answer it follows up"
         );
-        assert_eq!(m.input_text(), "and y?", "the draft survives the wait");
+        assert_eq!(
+            m.input_text(),
+            "",
+            "what was typed is held, not left behind"
+        );
 
         tx.send(done()).unwrap();
         let _ = m.poll();
+        assert_eq!(
+            m.take_queued().as_deref(),
+            Some("and y?"),
+            "the held question is the host's to send"
+        );
+
+        draw(&mut m, &mut terminal);
+        type_text(&mut m, "and z?");
+        let send = m.footer_hit(SEND);
         assert!(matches!(
             click(&mut m, send),
-            StreamAction::Submit(question) if question == "and y?"
+            StreamAction::Submit(question) if question == "and z?"
         ));
         assert_eq!(m.input_text(), "", "a sent question leaves the input");
         assert!(m.is_open());
 
-        let close = m.footer_hit(CLOSE);
+        let close = m.footer_hit(FOLLOW_UP_CLOSE);
         assert!(matches!(click(&mut m, close), StreamAction::Consumed));
         assert!(!m.is_open());
+    }
+
+    /// A bare `y` is text the input is owed, so copying needs a chord here.
+    #[test]
+    fn the_follow_up_footer_copies_by_chord_and_by_click() {
+        let mut m = StreamModal::new(0);
+        let (tx, _cancel) = open_modal(&mut m, HEADER, StreamFooter::FollowUp);
+        tx.send(StreamEvent::TextDelta(ANSWER.into())).unwrap();
+        let _ = m.poll();
+        let mut terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT)).unwrap();
+        draw(&mut m, &mut terminal);
+
+        let copy = m.footer_hit(FOLLOW_UP_COPY);
+        assert!(matches!(
+            click(&mut m, copy),
+            StreamAction::Copy(text) if text == ANSWER
+        ));
+        assert!(matches!(
+            m.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL)),
+            StreamAction::Copy(text) if text == ANSWER
+        ));
+        assert_eq!(m.input_text(), "", "the chord copies rather than typing");
+        assert!(m.is_open(), "copying leaves the modal up");
     }
 
     #[test]
@@ -945,21 +1195,61 @@ mod tests {
     fn enter_submits_the_input_once_the_answer_has_landed() {
         let mut m = StreamModal::new(0);
         let (tx, _cancel) = open_modal(&mut m, HEADER, StreamFooter::FollowUp);
-        type_text(&mut m, "and y? ");
-        assert!(
-            matches!(m.handle_key(key_ev(KeyCode::Enter)), StreamAction::Consumed),
-            "a follow-up waits for the answer it follows up"
-        );
-        assert_eq!(m.input_text(), "and y? ", "the draft survives the wait");
-
         tx.send(done()).unwrap();
         let _ = m.poll();
+
+        type_text(&mut m, "and y? ");
         assert!(matches!(
             m.handle_key(key_ev(KeyCode::Enter)),
             StreamAction::Submit(question) if question == "and y?"
         ));
         assert_eq!(m.input_text(), "", "a sent question leaves the input");
         assert!(m.is_open());
+    }
+
+    /// The thread is one question deep at a time, so a question asked into a
+    /// streaming answer is held rather than dropped or sent over the top of it.
+    #[test]
+    fn enter_mid_stream_queues_the_question_for_the_host() {
+        let mut m = StreamModal::new(0);
+        let (tx, _cancel) = open_modal(&mut m, HEADER, StreamFooter::FollowUp);
+        type_text(&mut m, "and y? ");
+        assert!(
+            matches!(m.handle_key(key_ev(KeyCode::Enter)), StreamAction::Consumed),
+            "a follow-up waits for the answer it follows up"
+        );
+        assert_eq!(
+            m.input_text(),
+            "",
+            "what was typed is held, not left behind"
+        );
+        assert!(m.is_open(), "queueing never dismisses");
+
+        tx.send(done()).unwrap();
+        let _ = m.poll();
+        assert_eq!(m.take_queued().as_deref(), Some("and y?"));
+        assert!(m.take_queued().is_none(), "a queued question is sent once");
+    }
+
+    #[test]
+    fn a_queued_question_and_a_pending_answer_each_say_so_in_the_input() {
+        let mut m = StreamModal::new(0);
+        let (_tx, _cancel) = open_modal(&mut m, HEADER, StreamFooter::FollowUp);
+        let mut terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT)).unwrap();
+        draw(&mut m, &mut terminal);
+        assert!(
+            terminal.backend().to_string().contains(WAITING_PLACEHOLDER),
+            "an inert-looking input has to say what it is waiting for"
+        );
+
+        type_text(&mut m, "and y?");
+        m.handle_key(key_ev(KeyCode::Enter));
+        draw(&mut m, &mut terminal);
+        let screen = terminal.backend().to_string();
+        assert!(
+            screen.contains(&format!("{QUEUED_PREFIX}and y?")),
+            "a queued question stays visible after the input clears: {screen}"
+        );
     }
 
     #[test]
@@ -993,20 +1283,196 @@ mod tests {
         assert!(!plain.handle_paste("x"), "no input, nothing to paste into");
     }
 
+    /// The window before the first token is exactly the one the typewriter
+    /// cannot carry, and it is where a long prefill is spent.
+    #[test]
+    fn a_waiting_request_still_asks_to_be_repainted() {
+        let mut m = StreamModal::new(0);
+        let (tx, _cancel) = open_modal(&mut m, HEADER, StreamFooter::Close);
+        assert_eq!(m.cadence(), Cadence::SPINNER, "{STATUS_MISSING}");
+
+        tx.send(done()).unwrap();
+        let _ = m.poll();
+        assert_eq!(m.cadence(), Cadence::IDLE, "{STATUS_LINGERED}");
+    }
+
+    #[test]
+    fn the_status_row_carries_the_wait_and_leaves_when_the_answer_lands() {
+        let mut m = StreamModal::new(0);
+        let (tx, _cancel) = open_modal(&mut m, HEADER, StreamFooter::Close);
+        let mut terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT)).unwrap();
+        draw(&mut m, &mut terminal);
+        let waiting = terminal.backend().to_string();
+        assert!(waiting.contains("0.0s"), "{STATUS_MISSING}: {waiting}");
+
+        tx.send(done()).unwrap();
+        let _ = m.poll();
+        draw(&mut m, &mut terminal);
+        let settled = terminal.backend().to_string();
+        assert!(
+            !settled.contains(PROMPT_PROGRESS_LABEL.trim()),
+            "{STATUS_LINGERED}: {settled}"
+        );
+    }
+
+    /// Only some providers report prefill, so the bar is drawn from what
+    /// arrives and retired the moment the answer starts instead.
+    #[test]
+    fn prefill_progress_fills_the_bar_until_the_first_token() {
+        let mut m = StreamModal::new(0);
+        let (tx, _cancel) = open_modal(&mut m, HEADER, StreamFooter::Close);
+        tx.send(StreamEvent::Progress(PromptProgress {
+            processed: 1_000,
+            total: 4_000,
+            cache: 800,
+        }))
+        .unwrap();
+        let _ = m.poll();
+        let mut terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT)).unwrap();
+        draw(&mut m, &mut terminal);
+        let prefilling = terminal.backend().to_string();
+        assert!(
+            prefilling.contains(PROMPT_PROGRESS_LABEL.trim()),
+            "{STATUS_MISSING}: {prefilling}"
+        );
+
+        tx.send(StreamEvent::TextDelta(ANSWER.into())).unwrap();
+        let _ = m.poll();
+        draw(&mut m, &mut terminal);
+        let answering = terminal.backend().to_string();
+        assert!(
+            !answering.contains(PROMPT_PROGRESS_LABEL.trim()),
+            "text means the prefill is over: {answering}"
+        );
+    }
+
+    /// A prompt the server has entirely prefilled has nothing left to report,
+    /// and a full bar that never empties reads as a stall.
+    #[test]
+    fn a_finished_prefill_retires_its_own_bar() {
+        let mut m = StreamModal::new(0);
+        let (tx, _cancel) = open_modal(&mut m, HEADER, StreamFooter::Close);
+        tx.send(StreamEvent::Progress(PromptProgress {
+            processed: 4_000,
+            total: 4_000,
+            cache: 4_000,
+        }))
+        .unwrap();
+        let _ = m.poll();
+        assert!(m.progress.is_none());
+    }
+
+    #[test]
+    fn ctrl_c_stops_the_answer_and_keeps_the_thread() {
+        let mut m = StreamModal::new(0);
+        let (tx, _cancel) = open_modal(&mut m, HEADER, StreamFooter::FollowUp);
+        tx.send(StreamEvent::TextDelta(ANSWER.into())).unwrap();
+        tx.send(done()).unwrap();
+        let _ = m.poll();
+        let (_tx2, second) = follow_up(&mut m, FOLLOW_UP);
+
+        m.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+
+        assert!(second.is_cancelled(), "stopping cancels the live request");
+        assert!(
+            m.is_open(),
+            "stopping an answer is not dismissing the modal"
+        );
+        assert!(!m.is_streaming());
+        assert_eq!(m.headers(), [HEADER, FOLLOW_UP], "the thread survives");
+        assert!(
+            m.exchanges[0].body == ANSWER,
+            "the answered exchange keeps its answer"
+        );
+        assert!(m.text().contains(STOPPED_NOTE.trim()));
+    }
+
+    /// Without a stream to stop the chord is the global one, which dismisses.
+    #[test]
+    fn ctrl_c_closes_once_nothing_is_streaming() {
+        let mut m = StreamModal::new(0);
+        let (tx, _cancel) = open_modal(&mut m, HEADER, StreamFooter::FollowUp);
+        tx.send(done()).unwrap();
+        let _ = m.poll();
+
+        m.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(!m.is_open());
+    }
+
+    /// Scrolling back through a thread, the price of an answer belongs beside
+    /// the question that bought it.
+    #[test]
+    fn a_settled_question_carries_what_its_answer_cost() {
+        let mut m = StreamModal::new(0);
+        let (tx, _cancel) = open_modal(&mut m, HEADER, StreamFooter::Close);
+        tx.send(StreamEvent::Done(StreamDone {
+            usage: StreamUsage {
+                usage: TokenUsage {
+                    input: 200,
+                    output: 340,
+                    cache_creation: 0,
+                    cache_read: 1_900,
+                },
+                cost: None,
+                billing: Billing::Api,
+                provider: PROVIDER.into(),
+                model: MODEL.into(),
+                purpose: LedgerPurpose::Btw,
+            },
+            answer: Some(ANSWER.into()),
+        }))
+        .unwrap();
+        let _ = m.poll();
+
+        let suffix = m.exchanges[0].suffix();
+        assert!(suffix.contains(&format!("2k{TOKENS_IN}")), "{suffix}");
+        assert!(suffix.contains(&format!("1k{TOKENS_CACHED}")), "{suffix}");
+        assert!(suffix.contains(&format!("340{TOKENS_OUT}")), "{suffix}");
+    }
+
+    /// A question with no answer under it is unreadable, so a failure is
+    /// styled as one rather than replacing the exchange.
+    #[test]
+    fn an_error_is_painted_as_one_under_the_question_that_caused_it() {
+        const OOPS: &str = "the request failed";
+        let mut m = StreamModal::new(0);
+        let (tx, _cancel) = open_modal(&mut m, HEADER, StreamFooter::Close);
+        tx.send(StreamEvent::Error(OOPS.into())).unwrap();
+        let _ = m.poll();
+        let mut terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT)).unwrap();
+        draw(&mut m, &mut terminal);
+
+        let screen = terminal.backend().to_string();
+        assert!(screen.contains(HEADER), "the question stays: {screen}");
+        assert!(screen.contains(OOPS), "{screen}");
+        let buffer = terminal.backend().buffer();
+        let error = theme::current().error.fg.expect("errors carry a colour");
+        assert!(
+            buffer
+                .area
+                .positions()
+                .any(|position| buffer[(position.x, position.y)].fg == error),
+            "an error reads as an error, not as an answer"
+        );
+    }
+
+    /// The key does two different things, and the footer says which.
     #[test]
     fn the_follow_up_input_is_drawn_under_the_thread() {
         let mut m = StreamModal::new(0);
-        let (_tx, _cancel) = open_modal(&mut m, HEADER, StreamFooter::FollowUp);
+        let (tx, _cancel) = open_modal(&mut m, HEADER, StreamFooter::FollowUp);
         type_text(&mut m, "next");
-        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        terminal
-            .draw(|frame| {
-                m.view(frame, frame.area());
-            })
-            .unwrap();
-        let screen = terminal.backend().to_string();
-        assert!(screen.contains(HEADER));
-        assert!(screen.contains("> next"));
-        assert!(screen.contains(SEND_HINT.trim()));
+        let mut terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT)).unwrap();
+        draw(&mut m, &mut terminal);
+        let streaming = terminal.backend().to_string();
+        assert!(streaming.contains(HEADER));
+        assert!(streaming.contains("> next"));
+        assert!(streaming.contains(QUEUE_HINT.trim()), "{streaming}");
+
+        tx.send(done()).unwrap();
+        let _ = m.poll();
+        draw(&mut m, &mut terminal);
+        let settled = terminal.backend().to_string();
+        assert!(settled.contains(SEND_HINT.trim()), "{settled}");
     }
 }

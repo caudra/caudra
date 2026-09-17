@@ -28,6 +28,7 @@ pub(crate) mod permissions_picker;
 pub(crate) mod plan_form;
 pub(crate) mod progress_bar;
 pub(crate) mod prompt_profile_picker;
+pub(crate) mod prompt_progress;
 pub(crate) mod question_form;
 pub(crate) mod queue_actions;
 pub mod queue_panel;

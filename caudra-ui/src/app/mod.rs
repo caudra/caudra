@@ -5082,6 +5082,13 @@ impl App {
                 .record_external_usage(spend.usage, spend.cost, spend.billing);
             // Only a `/btw` has a thread, so the answer is its own to keep.
             self.settle_btw(done.answer);
+            // The answered exchange is filed first, so a question queued while
+            // it streamed extends the thread rather than replacing it.
+            if let Some(question) = self.stream_modal.take_queued()
+                && self.btw_thread.is_some()
+            {
+                self.continue_btw(question);
+            }
         }
         if self.btw_thread.is_some() && !self.stream_modal.is_open() {
             self.end_btw_thread();

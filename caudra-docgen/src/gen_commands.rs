@@ -267,7 +267,7 @@ pub fn generate() -> String {
     .unwrap();
     writeln!(
         out,
-        "- **`/btw`**: a side question over the conversation so far, with follow-ups in the same thread. The answer streams into a modal. Type under it and press `Enter` or click `Send a follow-up` to ask the next question, and press `Esc` or click `Close` to close. No tool runs, nothing enters history, and a marker in the transcript shows where the thread's view of the conversation ends."
+        "- **`/btw`**: a side question over the conversation so far, with follow-ups in the same thread. The answer streams into a modal that reports elapsed time while it waits, and how much of the prompt has been prefilled when the provider says. Type under it and press `Enter` or click `Send a follow-up` to ask the next question, which is queued if the previous answer is still streaming; `Ctrl+Y` copies the answer, `Ctrl+C` stops it without losing the thread, and `Esc` or `Close` closes. No tool runs, nothing enters history, and a marker in the transcript shows where the thread's view of the conversation ends."
     )
     .unwrap();
     writeln!(

@@ -28,6 +28,7 @@ use super::{
 use crate::animation::spinner_str;
 use crate::chat::batch_child_id;
 use crate::components::keybindings::key;
+use crate::components::prompt_progress::{self, PromptProgress, PromptRate};
 use crate::markdown::{
     DiagramSpan, LinkMap, TerminalLink, hr_line, plain_lines, text_to_painted, truncate_output,
     truncate_output_tail,
@@ -81,15 +82,6 @@ const THINKING_SEARCH_PREFIX: &str = "thinking> ";
 const CHILD_SCROLL_INFIX: &str = "#";
 const REFLOW_MARGIN_VIEWPORTS: u32 = 1;
 const SHELL_LIVE_OUTPUT_LINES: usize = 12;
-const PROMPT_PROGRESS_LABEL: &str = " Processing ";
-/// One EWMA over the reported deltas. A raw per-sample rate swings with the
-/// server's chunk boundaries and its scheduler, which at the refresh rate of a
-/// progress bar reads as a number nobody can look at.
-const PROMPT_RATE_SMOOTHING: f64 = 0.3;
-/// Under this a sample is mostly timer noise, and dividing by it invents
-/// throughput the server never delivered.
-const PROMPT_RATE_MIN_SAMPLE: Duration = Duration::from_millis(120);
-const PROMPT_RATE_KILO: f64 = 1_000.0;
 const RAW_HTML_CLOSINGS: [&str; 4] = ["</script>", "</pre>", "</style>", "</textarea>"];
 const COMMONMARK_BLOCK_TAGS: &[&str] = &[
     "address",
@@ -773,63 +765,6 @@ impl Default for CardScroll {
             follow: true,
         }
     }
-}
-
-#[derive(Clone, Copy)]
-pub struct PromptProgress {
-    pub processed: u32,
-    pub total: u32,
-    pub cache: u32,
-}
-
-/// Prefill reports token counts, never a rate, so the throughput a reader
-/// actually wants is derived from the counts as they arrive.
-#[derive(Default)]
-struct PromptRate {
-    baseline: Option<(Instant, u32)>,
-    per_second: Option<f64>,
-}
-
-impl PromptRate {
-    fn sample(&mut self, processed: u32, now: Instant) {
-        let Some((measured_at, measured)) = self.baseline else {
-            self.baseline = Some((now, processed));
-            return;
-        };
-        let elapsed = now.duration_since(measured_at);
-        let advanced = processed.saturating_sub(measured);
-        // Holding the baseline instead of moving it lets short frames
-        // accumulate into one honest window rather than each being discarded.
-        if advanced == 0 || elapsed < PROMPT_RATE_MIN_SAMPLE {
-            return;
-        }
-        self.baseline = Some((now, processed));
-        let sample = f64::from(advanced) / elapsed.as_secs_f64();
-        self.per_second = Some(match self.per_second {
-            Some(smoothed) => smoothed + (sample - smoothed) * PROMPT_RATE_SMOOTHING,
-            None => sample,
-        });
-    }
-
-    fn reset(&mut self) {
-        *self = Self::default();
-    }
-
-    /// A cached prefix arrives as one jump and finishes before a second
-    /// sample exists, so there is deliberately nothing to show for it.
-    fn label(&self) -> Option<String> {
-        let per_second = self.per_second?;
-        Some(if per_second >= PROMPT_RATE_KILO {
-            format!(" {:.1}k tok/s ·", per_second / PROMPT_RATE_KILO)
-        } else {
-            format!(" {per_second:.0} tok/s ·")
-        })
-    }
-}
-
-fn fits(rate: &str, bar_width: u16, width: u16) -> bool {
-    let needed = rate.chars().count() + PROMPT_PROGRESS_LABEL.chars().count();
-    needed + bar_width as usize <= width as usize
 }
 
 /// Restoring a session that was cancelled mid-tool-call replays snapshots for
@@ -3490,39 +3425,11 @@ impl MessagesPanel {
         }
         self.terminal_links = cursor.into_terminal_links();
 
-        if let Some(pp) = self.prompt_progress
-            && pp.total > 0
+        if let Some(progress) = self.prompt_progress
+            && let Some(bar) = prompt_progress::render(frame, area, progress, &self.prompt_rate)
         {
-            let ratio = pp.processed as f64 / pp.total as f64;
-            let bar_width = (width as f64 * 0.1).round() as u16;
-            // The rate is the first thing to go when the terminal is narrow:
-            // it is the detail, and the bar is the answer.
-            let label = match self.prompt_rate.label() {
-                Some(rate) if fits(&rate, bar_width, width) => {
-                    format!("{rate}{PROMPT_PROGRESS_LABEL}")
-                }
-                _ => PROMPT_PROGRESS_LABEL.to_owned(),
-            };
-            let label_width = label.chars().count() as u16;
-            let total_width = label_width + bar_width;
-            let bar_x = area.x + width.saturating_sub(total_width);
-            let bar_y = area.y + area.height.saturating_sub(1);
-            let bar_area = Rect::new(bar_x, bar_y, total_width, 1);
-            crate::components::progress_bar::render(
-                frame,
-                bar_area,
-                &crate::components::progress_bar::ProgressBarConfig {
-                    ratio,
-                    style: theme::current().progress_bar,
-                    cache_ratio: pp.cache as f64 / pp.total as f64,
-                    cache_style: Style::new().fg(Color::Green),
-                    label: Some(&label),
-                    label_style: Some(theme::current().tool_dim),
-                    bar_width,
-                },
-            );
             self.terminal_links
-                .retain(|link| !bar_area.contains(link.position));
+                .retain(|link| !bar.contains(link.position));
         }
 
         if let Some(index) = self

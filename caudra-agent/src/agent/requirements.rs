@@ -340,10 +340,15 @@ pub struct RequirementsOutcome {
     pub usage: TokenUsage,
 }
 
-/// Asks the model for the list. Text deltas reach `deltas` as they stream, so a
-/// front end can draw the list while it is being written. Errors only when the
+/// Asks the model for the list. Text deltas and prefill progress reach
+/// `events` as they stream, so a front end can draw the list while it is being
+/// written and say how far the prompt has got before that. Errors only when the
 /// request itself failed or stalled, which is the one case with no spend to
 /// attribute.
+///
+/// The local channel stays between the provider and `events`: a provider whose
+/// event sender is closed fails the request, so the caller's optional sender
+/// cannot take its place.
 ///
 /// No cache key: the request shares no prefix with the session and must not
 /// claim its cache slot.
@@ -351,7 +356,7 @@ pub async fn extract(
     provider: &dyn Provider,
     model: &Model,
     input: &RequirementsInput,
-    deltas: Option<&Sender<String>>,
+    events: Option<&Sender<ProviderEvent>>,
     cancel: &CancelToken,
 ) -> Result<RequirementsOutcome, AgentError> {
     let prompt = crate::prompt::REQUIREMENTS_USER
@@ -361,14 +366,17 @@ pub async fn extract(
     let opts = RequestOptions::default().clamped(model);
     let (event_tx, event_rx) = flume::unbounded();
     let forwarder = smol::spawn({
-        let deltas = deltas.cloned();
+        let events = events.cloned();
         async move {
             while let Ok(event) = event_rx.recv_async().await {
-                let ProviderEvent::TextDelta { text } = event else {
+                if !matches!(
+                    event,
+                    ProviderEvent::TextDelta { .. } | ProviderEvent::PromptProgress { .. }
+                ) {
                     continue;
-                };
-                if let Some(deltas) = &deltas
-                    && deltas.send(text).is_err()
+                }
+                if let Some(events) = &events
+                    && events.send(event).is_err()
                 {
                     return;
                 }
@@ -458,7 +466,10 @@ pub fn requirements_section(summary: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use caudra_providers::{AssistantTextState, CaudraId};
+    use caudra_providers::provider::BoxFuture;
+    use caudra_providers::{
+        AssistantTextState, CacheKey, CaudraId, ContentBlock, ModelInfo, Role, StreamResponse,
+    };
     use serde_json::json;
     use test_case::test_case;
 
@@ -474,6 +485,10 @@ mod tests {
     const ANSWER: &str = "Model: fast";
     const CALL: &str = "call-1";
     const WIDE: u32 = 200_000;
+    const LIST_DELTA: &str = "- ship the command";
+    const PREFILL_PROCESSED: u32 = 1_200;
+    const PREFILL_TOTAL: u32 = 4_000;
+    const PREFILL_CACHE: u32 = 900;
 
     fn item(kind: HistoryItemKind) -> HistoryItem {
         HistoryItem {
@@ -545,6 +560,92 @@ mod tests {
             output_ref: None,
             images: Vec::new(),
         })
+    }
+
+    /// Reports one prefill frame and one text delta, which is what a caller
+    /// watching the request has to be able to see.
+    struct StreamingProvider;
+
+    impl Provider for StreamingProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            _: &'a [Message],
+            _: &'a str,
+            _: &'a serde_json::Value,
+            event_tx: &'a Sender<ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&'a CacheKey>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(async {
+                event_tx.send(ProviderEvent::PromptProgress {
+                    processed: PREFILL_PROCESSED,
+                    total: PREFILL_TOTAL,
+                    cache: PREFILL_CACHE,
+                })?;
+                event_tx.send(ProviderEvent::TextDelta {
+                    text: LIST_DELTA.into(),
+                })?;
+                Ok(StreamResponse {
+                    message: Message {
+                        role: Role::Assistant,
+                        content: vec![ContentBlock::Text {
+                            text: LIST_DELTA.into(),
+                        }],
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                })
+            })
+        }
+
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+            Box::pin(async { unimplemented!() })
+        }
+    }
+
+    fn extracted(events: Option<&Sender<ProviderEvent>>) -> Option<String> {
+        smol::block_on(extract(
+            &StreamingProvider,
+            &model_with_window(WIDE),
+            &RequirementsInput::from_items(&[turn(FIRST)]),
+            events,
+            &CancelToken::none(),
+        ))
+        .expect("the request succeeded")
+        .text
+    }
+
+    /// The front end draws the list as it is written and says how far the
+    /// prompt has got before that, so both have to survive the relay.
+    #[test]
+    fn extraction_relays_prefill_and_text_to_a_watching_caller() {
+        let (tx, rx) = flume::unbounded();
+        assert_eq!(extracted(Some(&tx)).as_deref(), Some(LIST_DELTA));
+        drop(tx);
+
+        let seen: Vec<ProviderEvent> = rx.drain().collect();
+        assert!(
+            matches!(
+                seen.first(),
+                Some(ProviderEvent::PromptProgress { processed, total, cache })
+                    if *processed == PREFILL_PROCESSED
+                        && *total == PREFILL_TOTAL
+                        && *cache == PREFILL_CACHE
+            ),
+            "prefill leads the relay"
+        );
+        assert!(
+            matches!(seen.get(1), Some(ProviderEvent::TextDelta { text }) if text == LIST_DELTA),
+            "text follows it"
+        );
+    }
+
+    /// Compaction extracts with nobody watching, and the provider's own sender
+    /// has to stay live either way.
+    #[test]
+    fn extraction_without_a_watcher_still_produces_the_list() {
+        assert_eq!(extracted(None).as_deref(), Some(LIST_DELTA));
     }
 
     fn model_with_window(context_window: u32) -> Model {

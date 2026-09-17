@@ -12227,10 +12227,10 @@ fn btw_modal_key_routing_and_animation() {
     app.stream_modal
         .open(" /btw ", "test".into(), StreamFooter::FollowUp, rx, trigger);
 
-    // A pending stream is data, drained by `poll`. Only the typewriter
-    // revealing the answer moves on its own.
+    // The spinner carries the wait before the first token; once text flows the
+    // typewriter revealing it wins.
     assert!(app.stream_modal.is_streaming());
-    assert_eq!(app.stream_modal.cadence(), Cadence::IDLE);
+    assert_eq!(app.stream_modal.cadence(), Cadence::SPINNER);
     tx.send(StreamEvent::TextDelta("hi".into())).unwrap();
     assert_eq!(app.stream_modal.poll(), Dirty::YES);
     assert_eq!(app.stream_modal.cadence(), Cadence::SMOOTH);
@@ -12317,10 +12317,23 @@ const BTW_HEADER: &str = "Q: why sqlite?";
 const BTW_FOLLOW_UP: &str = "and postgres?";
 const BTW_FOLLOW_UP_HEADER: &str = "Q: and postgres?";
 
-/// A btw whose first answer has landed, with the follow-up typed but not yet
-/// sent. The request the stub never answers is stood in for by a channel.
-fn btw_awaiting_follow_up() -> App {
-    let mut app = btw_ready_app();
+fn btw_answer() -> StreamEvent {
+    StreamEvent::Done(StreamDone {
+        usage: StreamUsage {
+            usage: TokenUsage::default(),
+            cost: None,
+            billing: Billing::Api,
+            model: "m".into(),
+            provider: TEST_PROVIDER.into(),
+            purpose: LedgerPurpose::Btw,
+        },
+        answer: Some("it ships in the binary".into()),
+    })
+}
+
+/// A live `/btw` whose answer is stood in for by a channel the test owns: the
+/// stub provider never answers on its own.
+fn btw_streaming(app: &mut App) -> flume::Sender<StreamEvent> {
     app.start_btw(BTW_QUESTION.into());
     let (tx, rx) = flume::bounded(1);
     let (trigger, _cancel) = caudra_agent::CancelToken::new();
@@ -12331,18 +12344,14 @@ fn btw_awaiting_follow_up() -> App {
         rx,
         trigger,
     );
-    tx.send(StreamEvent::Done(StreamDone {
-        usage: StreamUsage {
-            usage: TokenUsage::default(),
-            cost: None,
-            billing: Billing::Api,
-            model: "m".into(),
-            provider: TEST_PROVIDER.into(),
-            purpose: LedgerPurpose::Btw,
-        },
-        answer: Some("it ships in the binary".into()),
-    }))
-    .unwrap();
+    tx
+}
+
+/// A btw whose first answer has landed, with the follow-up typed but not yet
+/// sent.
+fn btw_awaiting_follow_up() -> App {
+    let mut app = btw_ready_app();
+    btw_streaming(&mut app).send(btw_answer()).unwrap();
     let _ = app.tick();
     assert!(
         app.btw_thread.is_some(),
@@ -12377,6 +12386,31 @@ fn a_btw_follow_up_extends_the_thread_over_the_same_snapshot() {
     let mut app = btw_awaiting_follow_up();
 
     app.update(Msg::Key(key(KeyCode::Enter)));
+
+    assert_btw_follow_up_in_flight(&app);
+}
+
+/// Typing the next question while the answer is still coming used to be
+/// silently ignored. It is held instead, and sent once the answer it follows
+/// up has been filed, so the thread extends rather than restarting.
+#[test]
+fn a_btw_question_queued_mid_answer_is_sent_when_the_answer_lands() {
+    let mut app = btw_ready_app();
+    let tx = btw_streaming(&mut app);
+
+    for c in BTW_FOLLOW_UP.chars() {
+        app.update(Msg::Key(key(KeyCode::Char(c))));
+    }
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert_eq!(app.stream_modal.input_text(), "", "the question is held");
+    assert_eq!(
+        app.btw_thread.as_ref().unwrap().exchange_count(),
+        0,
+        "nothing is filed while the first answer is still coming"
+    );
+
+    tx.send(btw_answer()).unwrap();
+    let _ = app.tick();
 
     assert_btw_follow_up_in_flight(&app);
 }

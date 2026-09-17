@@ -3,11 +3,12 @@ use std::sync::Arc;
 use caudra_agent::CancelToken;
 use caudra_agent::agent::requirements::{self, REQUIREMENTS_OUTPUT_TOKENS, RequirementsInput};
 use caudra_agent::agent::side_model::{self, SideModel};
-use caudra_providers::{AgentError, Model, ModelPurpose, Timeouts};
+use caudra_providers::{AgentError, Model, ModelPurpose, ProviderEvent, Timeouts};
 use caudra_storage::usage_ledger::LedgerPurpose;
 use flume::Sender;
 
 use crate::agent::ModelSlot;
+use crate::components::prompt_progress::PromptProgress;
 use crate::components::stream_modal::{StreamDone, StreamEvent, StreamFooter, StreamUsage};
 
 use super::App;
@@ -76,12 +77,25 @@ async fn run_extract(
     cancel: CancelToken,
 ) {
     let _ = tx.send(StreamEvent::Header(header(&input, Some(&side.model))));
-    let (delta_tx, delta_rx) = flume::unbounded();
+    let (event_tx, event_rx) = flume::unbounded();
     let forwarder = smol::spawn({
         let tx = tx.clone();
         async move {
-            while let Ok(delta) = delta_rx.recv_async().await {
-                if tx.send(StreamEvent::TextDelta(delta)).is_err() {
+            while let Ok(event) = event_rx.recv_async().await {
+                let forwarded = match event {
+                    ProviderEvent::TextDelta { text } => StreamEvent::TextDelta(text),
+                    ProviderEvent::PromptProgress {
+                        processed,
+                        total,
+                        cache,
+                    } => StreamEvent::Progress(PromptProgress {
+                        processed,
+                        total,
+                        cache,
+                    }),
+                    _ => continue,
+                };
+                if tx.send(forwarded).is_err() {
                     return;
                 }
             }
@@ -91,11 +105,11 @@ async fn run_extract(
         side.provider.as_ref(),
         &side.model,
         &input,
-        Some(&delta_tx),
+        Some(&event_tx),
         &cancel,
     )
     .await;
-    drop(delta_tx);
+    drop(event_tx);
     forwarder.await;
 
     match result {

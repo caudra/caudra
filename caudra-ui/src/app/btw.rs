@@ -11,6 +11,7 @@ use flume::Sender;
 use futures_lite::future;
 
 use crate::agent::BtwPrompt;
+use crate::components::prompt_progress::PromptProgress;
 use crate::components::stream_modal::{StreamDone, StreamEvent, StreamFooter, StreamUsage};
 use crate::components::{DisplayMessage, DisplayRole};
 
@@ -263,13 +264,22 @@ async fn run_btw(
         let btw_tx = btw_tx.clone();
         async move {
             while let Ok(event) = event_rx.recv_async().await {
-                let delta = match event {
+                let forwarded = match event {
                     ProviderEvent::TextDelta { text } | ProviderEvent::ThinkingDelta { text } => {
-                        text
+                        StreamEvent::TextDelta(text)
                     }
+                    ProviderEvent::PromptProgress {
+                        processed,
+                        total,
+                        cache,
+                    } => StreamEvent::Progress(PromptProgress {
+                        processed,
+                        total,
+                        cache,
+                    }),
                     _ => continue,
                 };
-                if btw_tx.send(StreamEvent::TextDelta(delta)).is_err() {
+                if btw_tx.send(forwarded).is_err() {
                     return;
                 }
             }
@@ -337,6 +347,9 @@ mod tests {
     const FIRST_MODEL: &str = "anthropic/claude-sonnet-4-20250514";
     const SECOND_MODEL: &str = "openai/gpt-5.4";
     const SYSTEM: &str = "system";
+    const PREFILL_PROCESSED: u32 = 1_200;
+    const PREFILL_TOTAL: u32 = 4_000;
+    const PREFILL_CACHE: u32 = 900;
 
     struct RecordingProvider(flume::Sender<String>);
 
@@ -368,14 +381,53 @@ mod tests {
         }
     }
 
-    fn prompt(spec: &str, called: flume::Sender<String>) -> BtwPrompt {
+    /// Reports prefill before it answers, as OpenAI's Responses provider does.
+    struct PrefillingProvider;
+
+    impl Provider for PrefillingProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            _: &'a [Message],
+            _: &'a str,
+            _: &'a serde_json::Value,
+            event_tx: &'a flume::Sender<ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&'a CacheKey>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(async {
+                event_tx.send(ProviderEvent::PromptProgress {
+                    processed: PREFILL_PROCESSED,
+                    total: PREFILL_TOTAL,
+                    cache: PREFILL_CACHE,
+                })?;
+                Ok(StreamResponse {
+                    message: assistant_text(ANSWER),
+                    stop_reason: Some(StopReason::EndTurn),
+                    ..Default::default()
+                })
+            })
+        }
+
+        fn list_models(
+            &self,
+        ) -> BoxFuture<'_, Result<Vec<caudra_providers::ModelInfo>, AgentError>> {
+            Box::pin(async { unimplemented!() })
+        }
+    }
+
+    fn prompt_with(provider: Arc<dyn Provider>, spec: &str) -> BtwPrompt {
         BtwPrompt {
-            provider: Arc::new(RecordingProvider(called)),
+            provider,
             model: Model::from_spec(spec).unwrap(),
             system: SYSTEM.into(),
             tools: json!([]),
             opts: RequestOptions::default(),
         }
+    }
+
+    fn prompt(spec: &str, called: flume::Sender<String>) -> BtwPrompt {
+        prompt_with(Arc::new(RecordingProvider(called)), spec)
     }
 
     fn thread() -> BtwThread {
@@ -492,6 +544,31 @@ mod tests {
         };
         assert_eq!(answer_text(&message).as_deref(), Some(ANSWER));
         assert_eq!(answer_text(&Message::default()), None);
+    }
+
+    /// The forwarder used to keep text alone, which left the modal with
+    /// nothing to draw for the whole of a long prefill.
+    #[test]
+    fn prefill_progress_reaches_the_modal() {
+        smol::block_on(async {
+            let (event_tx, event_rx) = flume::unbounded();
+            run_btw(
+                Arc::new(prompt_with(Arc::new(PrefillingProvider), FIRST_MODEL)),
+                vec![Message::user(Q.into())],
+                event_tx,
+                None,
+                CancelToken::none(),
+            )
+            .await;
+
+            assert!(matches!(
+                event_rx.try_recv(),
+                Ok(StreamEvent::Progress(progress))
+                    if progress.processed == PREFILL_PROCESSED
+                        && progress.total == PREFILL_TOTAL
+                        && progress.cache == PREFILL_CACHE
+            ));
+        });
     }
 
     #[test]

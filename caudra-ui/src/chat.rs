@@ -9,7 +9,8 @@ use std::time::Duration;
 use crossterm::event::MouseEvent;
 
 use crate::app::tasks::{TaskOutcome, TaskStatus};
-use crate::components::messages::{MessagesPanel, PromptProgress};
+use crate::components::messages::MessagesPanel;
+use crate::components::prompt_progress::PromptProgress;
 use crate::components::tool_display::append_annotation;
 use crate::components::workflow_card::CardHit;
 use crate::components::{

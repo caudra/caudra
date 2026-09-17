@@ -995,6 +995,12 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::All,
     },
     Keybind {
+        label: KeyLabel::Single("Ctrl+C"),
+        description: "Stop the extraction and keep what has streamed",
+        context: KeybindContext::Extract,
+        platform: Platform::All,
+    },
+    Keybind {
         label: KeyLabel::Single("Esc"),
         description: "Close",
         context: KeybindContext::Extract,
@@ -1002,7 +1008,19 @@ pub const KEYBINDS: &[Keybind] = &[
     },
     Keybind {
         label: KeyLabel::Single("Enter"),
-        description: "Send what you typed as a follow-up in the same thread",
+        description: "Send what you typed as a follow-up, or queue it while the answer streams",
+        context: KeybindContext::Btw,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single("Ctrl+Y"),
+        description: "Copy the answer, even while it is still streaming",
+        context: KeybindContext::Btw,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single("Ctrl+C"),
+        description: "Stop the answer and keep the thread",
         context: KeybindContext::Btw,
         platform: Platform::All,
     },
