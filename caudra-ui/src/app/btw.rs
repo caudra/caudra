@@ -10,9 +10,12 @@ use flume::Sender;
 use futures_lite::future;
 
 use crate::agent::BtwPrompt;
-use crate::components::btw_modal::{BtwEvent, BtwUsage};
+use crate::components::stream_modal::{StreamEvent, StreamUsage};
+use caudra_storage::usage_ledger::LedgerPurpose;
 
 use super::App;
+
+const TITLE: &str = " /btw ";
 
 const BTW_REMINDER: &str = "<system-reminder>\nThis is a side question. Answer it directly in a \
 single response.\n- Do NOT call any tool. No tool result will come back, so a tool call wastes \
@@ -73,7 +76,8 @@ impl App {
 
         let (tx, rx) = flume::bounded(64);
         let (trigger, cancel) = CancelToken::new();
-        self.btw_modal.open(&question, rx, trigger);
+        self.stream_modal
+            .open(TITLE, format!("Q: {question}"), false, rx, trigger);
 
         // A btw forks the main conversation, so it shares its cache key on purpose.
         let cache_key = CacheKey::session(&SessionRef::from(self.state.session.id));
@@ -84,7 +88,7 @@ impl App {
 async fn run_btw(
     prompt: Arc<BtwPrompt>,
     messages: Vec<Message>,
-    btw_tx: Sender<BtwEvent>,
+    btw_tx: Sender<StreamEvent>,
     cache_key: Option<CacheKey>,
     cancel: CancelToken,
 ) {
@@ -106,7 +110,7 @@ async fn run_btw(
                     }
                     _ => continue,
                 };
-                if btw_tx.send(BtwEvent::TextDelta(delta)).is_err() {
+                if btw_tx.send(StreamEvent::TextDelta(delta)).is_err() {
                     return;
                 }
             }
@@ -135,20 +139,21 @@ async fn run_btw(
     match result {
         Ok(response) => {
             if response.stop_reason == Some(StopReason::ToolUse) {
-                let _ = btw_tx.send(BtwEvent::TextDelta(TOOL_CALL_STOPPED.into()));
+                let _ = btw_tx.send(StreamEvent::TextDelta(TOOL_CALL_STOPPED.into()));
             }
-            let _ = btw_tx.send(BtwEvent::Done(BtwUsage {
+            let _ = btw_tx.send(StreamEvent::Done(StreamUsage {
                 cost: model.billed_cost(&response.usage, opts.fast),
                 billing: model.billing,
                 usage: response.usage,
                 model: model.id.clone(),
                 provider: model.provider.to_string(),
+                purpose: LedgerPurpose::Btw,
             }));
         }
         // The receiver is already gone, which is what cancelled the stream.
         Err(AgentError::Cancelled) => {}
         Err(error) => {
-            let _ = btw_tx.send(BtwEvent::Error(error.to_string()));
+            let _ = btw_tx.send(StreamEvent::Error(error.to_string()));
         }
     }
 }
@@ -257,7 +262,7 @@ mod tests {
 
             assert_eq!(first_rx.try_recv().unwrap(), FIRST_MODEL);
             assert!(second_rx.try_recv().is_err());
-            assert!(matches!(event_rx.try_recv(), Ok(BtwEvent::Done(_))));
+            assert!(matches!(event_rx.try_recv(), Ok(StreamEvent::Done(_))));
         });
     }
 }

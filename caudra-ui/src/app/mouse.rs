@@ -9,6 +9,7 @@ use crate::components::paste_editor::PasteEditorAction;
 use crate::components::permission_prompt::PromptMouse;
 use crate::components::queue_panel::{QueueAction, QueueHit, QueueHitTarget};
 use crate::components::status_bar::{StatusBarHit, StatusBarHitTarget};
+use crate::components::stream_modal::StreamMouse;
 use crate::components::workflow_card::CardHit;
 use crate::selection::{self, ContentRegion, EdgeScroll, Selection, SelectionState, SelectionZone};
 use caudra_agent::Mention;
@@ -161,17 +162,25 @@ impl App {
                 }
             };
         }
-        let passive_modal_open = self.help_modal.is_open()
-            || self.usage_modal.is_open()
-            || self.btw_modal.is_open()
-            || self.float_mgr.is_open();
+        if self.stream_modal.is_open() && !self.permission_prompt.is_open() {
+            self.clear_control_hovers();
+            match self.stream_modal.handle_mouse(&event) {
+                StreamMouse::Ignored => {}
+                StreamMouse::Consumed => return Vec::new(),
+                StreamMouse::Copy(text) => {
+                    self.copy_to_clipboard(&text);
+                    return Vec::new();
+                }
+            }
+        }
+        let passive_modal_open =
+            self.help_modal.is_open() || self.usage_modal.is_open() || self.float_mgr.is_open();
         if passive_modal_open {
             self.clear_control_hovers();
             // None of these reads the pointer for anything but its bar, and at
             // most one is up, so the first taker wins and the rest no-op.
             if self.help_modal.handle_mouse(&event)
                 || self.usage_modal.handle_mouse(&event)
-                || self.btw_modal.handle_mouse(&event)
                 || self.float_mgr.handle_mouse(&event)
             {
                 return Vec::new();
@@ -1100,7 +1109,7 @@ impl App {
             return Some(Vec::new());
         }
 
-        dismiss!(self.btw_modal);
+        dismiss!(self.stream_modal);
         dismiss!(self.help_modal);
         dismiss!(self.usage_modal);
         dismiss!(self.logs_modal);

@@ -777,7 +777,7 @@ impl Model {
             | ModelPurpose::Plan
             | ModelPurpose::Subagent
             | ModelPurpose::Compact => Ok(anchor.clone()),
-            ModelPurpose::Title | ModelPurpose::Goal => {
+            ModelPurpose::Title | ModelPurpose::Goal | ModelPurpose::Extract => {
                 Self::resolve_seen(ModelPurpose::Fast, anchor, policy, seen, catalog_access)
             }
             ModelPurpose::Fast | ModelPurpose::Best => {
@@ -1295,6 +1295,7 @@ mod tests {
     #[test_case(ModelPurpose::Compact, OPENAI_CHAT_SPEC ; "compact_keeps_anchor")]
     #[test_case(ModelPurpose::Title, "openai/gpt-5.6-luna" ; "title_uses_fast")]
     #[test_case(ModelPurpose::Goal, "openai/gpt-5.6-luna" ; "goal_uses_fast")]
+    #[test_case(ModelPurpose::Extract, "openai/gpt-5.6-luna" ; "extract_uses_fast")]
     #[test_case(ModelPurpose::Fast, "openai/gpt-5.6-luna" ; "fast_uses_small_default")]
     #[test_case(ModelPurpose::Best, "openai/gpt-5.6-sol" ; "best_uses_non_small_default")]
     fn automatic_purpose_resolution_uses_the_expected_lane(purpose: ModelPurpose, expected: &str) {

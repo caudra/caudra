@@ -14,7 +14,7 @@ group = "Reference"
 
 const MODEL_JOBS_NOTE: &str = r#"## Model jobs
 
-Caudra routes work through eight jobs: **Chat**, **Plan**, **Subagent**, **Compact**, **Title**, **Goal**, **Fast**, and **Best**. A global binding can pin a job to an exact `provider/model-id` or make it follow Chat, Plan, Fast, or Best. Explicit bindings report an error when their model is unavailable or disallowed.
+Caudra routes work through nine jobs: **Chat**, **Plan**, **Subagent**, **Compact**, **Title**, **Goal**, **Extract**, **Fast**, and **Best**. A global binding can pin a job to an exact `provider/model-id` or make it follow Chat, Plan, Fast, or Best. Explicit bindings report an error when their model is unavailable or disallowed.
 
 `/model` opens a Jobs overview and the model list. Selecting a model on this page changes Chat. Selecting the Chat row jumps to its current model. Select another job to open its assignment page, press `Esc` to return to the overview, and use uppercase `R` to clear the open job's binding. `/goal-model` opens Goal directly. Jobs are opened from the overview rather than cycled with `Tab`.
 
@@ -28,12 +28,13 @@ Bindings are saved globally in the `model.purposes` row of Caudra's SQLite state
 | Compact | The model currently running the caller |
 | Title | Fast |
 | Goal | Fast |
+| Extract | Fast |
 | Fast | Provider `fast` config, curated preferred small model, cheapest priced model, fewest-parameter model, then the anchor |
 | Best | Provider `best` config, curated flagship, then the anchor |
 
 The anchor is the selected Chat model when a main turn starts. A Plan binding can select a distinct model, which Caudra uses for main turns sent in Plan mode. An explicit global Subagent binding overrides parent inheritance. A prompt profile's `subagent_model` overrides the global Subagent binding for tasks using that profile. See [System Prompt Profiles](/docs/system-prompts/#configure-subagents).
 
-See [Sessions](/docs/sessions/#titles) for Title and [Completion goals](/docs/commands/#completion-goals) for Goal.
+See [Sessions](/docs/sessions/#titles) for Title, [Completion goals](/docs/commands/#completion-goals) for Goal, and [Requirements](/docs/commands/#requirements) for Extract.
 
 ## Supply metadata
 

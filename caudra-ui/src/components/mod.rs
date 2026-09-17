@@ -1,4 +1,3 @@
-pub(crate) mod btw_modal;
 pub(crate) mod code_view;
 pub mod command;
 pub(crate) mod command_modal;
@@ -43,6 +42,7 @@ pub(crate) mod split_layout;
 pub(crate) mod stash_picker;
 pub mod status_bar;
 pub(crate) mod storage_modal;
+pub(crate) mod stream_modal;
 pub(crate) mod streaming_content;
 pub(crate) mod task_picker;
 pub(crate) mod text_editor;
@@ -725,6 +725,7 @@ pub enum Action {
     OpenUrl(String),
     EditInputInEditor,
     Btw(String),
+    Extract,
     Suspend,
 }
 

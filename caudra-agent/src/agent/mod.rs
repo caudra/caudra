@@ -4,7 +4,9 @@ mod history;
 mod instructions;
 pub mod mention_preamble;
 mod provider_projection;
+pub mod requirements;
 mod run;
+pub mod side_model;
 pub mod speculative;
 pub(crate) mod steering;
 mod streaming;
@@ -18,7 +20,9 @@ mod tool_preview;
 mod tool_roster;
 
 pub(crate) use compaction::compaction_reserve;
-pub use compaction::{COMPACTION_ANCHOR, auto_compact_enabled, compact};
+pub use compaction::{
+    COMPACTION_ANCHOR, CompactionSpend, Spend, auto_compact_enabled, compact, resolve_extractor,
+};
 pub use goal::{
     DEFAULT_GOAL_CONTINUATION_LIMIT, GoalError, GoalHandle, GoalResult, GoalSnapshot, GoalStatus,
     GoalVerdict, MAX_GOAL_CHARS, MAX_GOAL_CONTINUATION_LIMIT, goal_checkin_message,

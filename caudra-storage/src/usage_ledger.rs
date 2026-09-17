@@ -38,6 +38,7 @@ pub enum LedgerPurpose {
     Compaction,
     Title,
     Btw,
+    Extract,
     ToolJsonRepair,
 }
 
@@ -49,6 +50,7 @@ impl LedgerPurpose {
             Self::Compaction => "compaction",
             Self::Title => "title",
             Self::Btw => "btw",
+            Self::Extract => "extract",
             Self::ToolJsonRepair => "tool_json_repair",
         }
     }
@@ -60,6 +62,7 @@ impl LedgerPurpose {
             "compaction" => Some(Self::Compaction),
             "title" => Some(Self::Title),
             "btw" => Some(Self::Btw),
+            "extract" => Some(Self::Extract),
             "tool_json_repair" => Some(Self::ToolJsonRepair),
             _ => None,
         }
@@ -448,6 +451,7 @@ mod tests {
     #[test_case(LedgerPurpose::Compaction ; "compaction")]
     #[test_case(LedgerPurpose::Title ; "title")]
     #[test_case(LedgerPurpose::Btw ; "btw")]
+    #[test_case(LedgerPurpose::Extract ; "extract")]
     #[test_case(LedgerPurpose::ToolJsonRepair ; "tool_json_repair")]
     fn a_purpose_round_trips_through_the_ledger(purpose: LedgerPurpose) {
         let (_temp, dir) = state_dir();

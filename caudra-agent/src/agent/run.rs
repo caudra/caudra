@@ -1795,6 +1795,22 @@ impl<'h> Agent<'h> {
             self.timeouts,
             &self.model_policy,
         )?;
+        // A subagent's user is its caller, whose requirements are the task
+        // prompt it already holds; only the conversation with a person has a
+        // list worth keeping.
+        let extractor =
+            if self.audience.contains(ToolAudience::MAIN) && self.root_tool_use_id.is_none() {
+                compaction::resolve_extractor(
+                    &self.config,
+                    &self.provider,
+                    &self.model,
+                    self.timeouts,
+                    &self.model_policy,
+                )
+                .await
+            } else {
+                None
+            };
         let compacted = compaction::compact_history(
             &*compact_provider,
             &compact_model,
@@ -1803,12 +1819,18 @@ impl<'h> Agent<'h> {
             &self.cancel,
             &self.retry_now,
             &self.config,
+            extractor.as_ref(),
         )
         .await?;
         let usage = compacted.usage;
         let cost = compact_model.billed_cost(&usage, false);
         self.total_usage += usage;
         self.goal.record_usage(usage, cost, compact_model.billing);
+        if let Some(spend) = compacted.extraction {
+            self.total_usage += spend.usage;
+            self.goal
+                .record_usage(spend.usage, spend.cost, spend.billing);
+        }
         compacted.result?;
         self.rollback_len = self.history.len();
         steering::lock(&self.steering).reset_patterns();
@@ -2640,7 +2662,13 @@ mod tests {
                 model: model.clone(),
                 chat_provider: provider,
                 chat_model: model,
-                config: AgentConfig::default(),
+                // Scripted providers count responses, and a compaction with
+                // requirements on spends one more of them than the script
+                // expects; the extraction has its own tests.
+                config: AgentConfig {
+                    compaction_requirements: false,
+                    ..AgentConfig::default()
+                },
                 tool_output_lines: ToolOutputLines::default(),
                 permissions: Arc::new(PermissionManager::new_nonpersistent(
                     caudra_config::PermissionsConfig {

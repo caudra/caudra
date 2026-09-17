@@ -488,7 +488,7 @@ impl App {
             return overlay_rect;
         }
         let full = frame.area();
-        let r = self.btw_modal.view(frame, full);
+        let r = self.stream_modal.view(frame, full);
         if r.width > 0 {
             overlay_rect = r;
         }

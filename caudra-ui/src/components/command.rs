@@ -275,6 +275,12 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         scope: ChatScope::MainOnly,
     },
     BuiltinCommand {
+        name: "/extract",
+        description: "List the requirements the session has gathered so far (Extract model, copyable, no history pollution)",
+        max_args: 0,
+        scope: ChatScope::MainOnly,
+    },
+    BuiltinCommand {
         name: "/goal",
         description: "Work until a completion condition is met",
         max_args: usize::MAX,

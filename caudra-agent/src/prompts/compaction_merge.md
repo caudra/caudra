@@ -4,3 +4,4 @@ An earlier summary appears in the conversation above, followed by the turns that
 - The later turns are more recent. Where they conflict with the earlier summary, they win: state the corrected fact and drop the stale claim.
 - Move work that has since finished from Active to Completed. Clear resolved blockers, keeping any detail still needed to continue.
 - Update Objective, Next Move, and Todo List to the current state, not the state the earlier summary described.
+- If the earlier summary ends with a `# User requirements` section, leave it out entirely: the host maintains that section and attaches it again after you answer.

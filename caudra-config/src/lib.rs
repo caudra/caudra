@@ -959,6 +959,7 @@ pub struct AgentFileConfig {
     pub compaction_buffer: Option<CompactionBuffer>,
     pub compaction_instructions: Option<String>,
     pub post_compaction_instructions: Option<String>,
+    pub compaction_requirements: Option<bool>,
     pub generate_titles: Option<bool>,
     pub stale_read_check: Option<bool>,
     pub tool_json_repair: Option<bool>,
@@ -984,6 +985,7 @@ impl AgentFileConfig {
             compaction_buffer,
             compaction_instructions,
             post_compaction_instructions,
+            compaction_requirements,
             generate_titles,
             stale_read_check,
             tool_json_repair,
@@ -1825,6 +1827,12 @@ pub struct AgentConfig {
 
     #[config(
         default = true,
+        desc = "Append a `# User requirements` section to every compaction summary: what the user asked for, constrained, and decided, read from their own messages and answered questions across every earlier compaction, and extracted by the Extract model so the conversation model never sees the request"
+    )]
+    pub compaction_requirements: bool,
+
+    #[config(
+        default = true,
         desc = "Name a new session by summarizing its first prompt with the Title model"
     )]
     pub generate_titles: bool,
@@ -1920,6 +1928,7 @@ impl AgentConfig {
             compaction_buffer: file.compaction_buffer,
             compaction_instructions: file.compaction_instructions,
             post_compaction_instructions: file.post_compaction_instructions,
+            compaction_requirements: file.compaction_requirements.unwrap_or(true),
             generate_titles: file.generate_titles.unwrap_or(true),
             stale_read_check: file.stale_read_check.unwrap_or(true),
             tool_json_repair: file.tool_json_repair.unwrap_or(true),
@@ -3612,6 +3621,26 @@ mod tests {
 
         assert_eq!(
             raw.into_config(false).unwrap().agent.generate_titles,
+            expected
+        );
+    }
+
+    #[test_case(None,        true  ; "requirements_appended_by_default")]
+    #[test_case(Some(false), false ; "requirements_disabled_in_config")]
+    fn compaction_requirements_config(configured: Option<bool>, expected: bool) {
+        let raw = RawConfig {
+            agent: AgentFileConfig {
+                compaction_requirements: configured,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        assert_eq!(
+            raw.into_config(false)
+                .unwrap()
+                .agent
+                .compaction_requirements,
             expected
         );
     }

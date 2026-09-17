@@ -29,18 +29,20 @@ pub enum ModelPurpose {
     Compact,
     Title,
     Goal,
+    Extract,
     Fast,
     Best,
 }
 
 impl ModelPurpose {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::Chat,
         Self::Plan,
         Self::Subagent,
         Self::Compact,
         Self::Title,
         Self::Goal,
+        Self::Extract,
         Self::Fast,
         Self::Best,
     ];
@@ -61,6 +63,7 @@ impl ModelPurpose {
             Self::Compact => "Compact",
             Self::Title => "Title",
             Self::Goal => "Goal",
+            Self::Extract => "Extract",
             Self::Fast => "Fast",
             Self::Best => "Best",
         }
@@ -74,6 +77,7 @@ impl ModelPurpose {
             Self::Compact => "compact",
             Self::Title => "title",
             Self::Goal => "goal",
+            Self::Extract => "extract",
             Self::Fast => "fast",
             Self::Best => "best",
         }
@@ -99,7 +103,7 @@ impl FromStr for ModelPurpose {
 
 #[derive(Debug, thiserror::Error)]
 #[error(
-    "unknown model purpose '{0}', expected one of: chat, plan, subagent, compact, title, goal, fast, best"
+    "unknown model purpose '{0}', expected one of: chat, plan, subagent, compact, title, goal, extract, fast, best"
 )]
 pub struct UnknownPurpose(pub String);
 
@@ -960,6 +964,7 @@ best = "gpt-4.1"
     #[test_case("compact", ModelPurpose::Compact ; "compact")]
     #[test_case("title", ModelPurpose::Title ; "title")]
     #[test_case("goal", ModelPurpose::Goal ; "goal")]
+    #[test_case("extract", ModelPurpose::Extract ; "extract")]
     #[test_case("fast", ModelPurpose::Fast ; "fast")]
     #[test_case("best", ModelPurpose::Best ; "best")]
     fn purpose_parses_and_renders_the_same_name(input: &str, expected: ModelPurpose) {
@@ -978,6 +983,7 @@ best = "gpt-4.1"
                 ModelPurpose::Compact,
                 ModelPurpose::Title,
                 ModelPurpose::Goal,
+                ModelPurpose::Extract,
                 ModelPurpose::Fast,
                 ModelPurpose::Best,
             ]

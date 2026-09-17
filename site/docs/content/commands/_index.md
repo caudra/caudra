@@ -48,6 +48,7 @@ Commands marked Main only act on the main session's turn or history. They stay l
 | `/move-session` | Move the current session; retain its counters and lifetime project attribution (optional directory) | Main only |
 | `/migrate-sessions` | Migrate sessions with one exact stored cwd; historical project usage included by default (optional destination directory) | Main only |
 | `/btw` | Ask a quick question (no tools, no history pollution) | Main only |
+| `/extract` | List the requirements the session has gathered so far (Extract model, copyable, no history pollution) | Main only |
 | `/goal` | Work until a completion condition is met | Main only |
 | `/goal-clear` | Stop the active completion goal | Main only |
 | `/goal-model` | Assign the completion goal model | Main only |
@@ -97,7 +98,7 @@ An input box appears while the focused task is running. Press Enter to queue gui
 
 That input box is a full composer. Typing `/` opens the palette, `Ctrl+S` inserts a file path, `Ctrl+X e` edits the draft in your editor, and `Ctrl+V` attaches an image to the guidance. A custom `/project:` or `/user:` command expands its template and steers the focused task rather than the main session.
 
-Commands that reach the main session's turn or history have no task equivalent, so `/compact`, `/continue`, `/model`, `/system-prompt`, `/btw`, the `/goal` family, the workflow commands, and MCP prompts are drawn dimmed and report their scope when run. Return to Main to use them. `/context`, `/tools`, `/skills`, `/queue`, `/review`, and the stash commands already follow the focused transcript.
+Commands that reach the main session's turn or history have no task equivalent, so `/compact`, `/continue`, `/model`, `/system-prompt`, `/btw`, `/extract`, the `/goal` family, the workflow commands, and MCP prompts are drawn dimmed and report their scope when run. Return to Main to use them. `/context`, `/tools`, `/skills`, `/queue`, `/review`, and the stash commands already follow the focused transcript.
 
 ## Workflows
 
@@ -175,6 +176,14 @@ A line the parser cannot read, such as a panic backtrace, is shown as it was wri
 
 Prompt text and tool input are not written to the log unless you opt in. See [Telemetry](/docs/telemetry/#privacy). Run `caudra logs` for the same records outside the TUI, and see [Logging](/docs/logging/) for the file, its rotation, and the level.
 
+## Requirements
+
+`/extract` reads every message you wrote in the session, and every answer you gave to a `question` call, and asks the Extract model for the list of requirements they add up to. It reads across compactions, so a constraint stated at the start still makes the list after the summary replaced that turn. The list streams into a modal as it is written. Press `y` or click `Copy` to hand what has arrived so far to the clipboard, and `Esc` to close. The request never enters the session's history and bills under the `extract` purpose.
+
+The same extraction runs beside every automatic or manual compaction of the main session and lands in the summary as a `# User requirements` section, so the model keeps working from your terms after the turns that stated them are gone. The summary model is told to leave that section alone and the extractor writes it fresh each time, from the whole transcript. When the extraction fails or finds nothing, the section from the previous summary is carried forward. Set `agent.compaction_requirements = false` to compact without it. Subagents summarize their own transcripts without a requirements section.
+
+Extract is a [model job](/docs/providers/#model-jobs) and follows Fast unless bound in `/model`.
+
 ## Modes and toggles
 
 - **`/yolo`**: skip permission prompts for this session (deny rules still apply). The toggle survives a resume, and `--yolo` only sets the starting value. Config: `always_yolo = true`.
@@ -184,6 +193,7 @@ Prompt text and tool input are not written to the log unless you opt in. See [Te
 - **Plan / build**: not a slash command. Press `Tab` in the input to toggle plan mode (plan-file writes only). Caudra opens in plan mode, and a resumed session reopens in the mode it was left in. A toggle reaches the agent with your next message, so until you send one the status bar shows the pending switch as `[PLAN→BUILD]`. It abbreviates this to `[P→B]` when those columns preserve more useful footer detail. Each mode remembers the model it was last used with, so the toggle asks for that one too and the bar names the pair as `[claude-opus-5→claude-sonnet-5]`, keeping the provider only when the two differ there. Binding the Plan job in `/model` decides what a plan run uses on its own, and turns the swap off.
 - **`/reload`**: rebuild plugins and config without leaving the app.
 - **`/btw`**: one-shot side question with no tools and no history pollution.
+- **`/extract`**: list every requirement the session has gathered so far. See [Requirements](#requirements).
 - **`/memory`**: open the memory file picker (view / edit / delete). See the `memory` tool under [Tools](/docs/tools/).
 
 ## Custom commands

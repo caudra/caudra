@@ -1070,6 +1070,7 @@ impl SpawnCtx {
                 Vec::new()
             }
         };
+        let archived_history = crate::archived_session_history(&session);
         let restore_session = !initial_history.is_empty() || session_has_content(&session);
         let (system_prompt_profile_name, system_prompt_profile, profile_warning) =
             self.resolve_prompt_profile(&session);
@@ -1089,6 +1090,7 @@ impl SpawnCtx {
         let handles = AgentHandles::spawn(
             &self.model_slot,
             initial_history,
+            archived_history,
             self.config.clone(),
             self.ui_config.tool_output_lines,
             &permissions,
@@ -3457,6 +3459,9 @@ impl<'t> EventLoop<'t> {
             }
             Action::Btw(question) => {
                 self.sessions[idx].app.start_btw(question);
+            }
+            Action::Extract => {
+                self.sessions[idx].app.start_extract(self.ctx.timeouts);
             }
             Action::Suspend => {
                 let _pause = self.input.pause();

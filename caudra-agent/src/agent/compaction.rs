@@ -1,18 +1,25 @@
 use std::borrow::Cow;
 use std::env;
+use std::sync::Arc;
 
 use caudra_config::{
     AgentConfig, CompactionBuffer, DEFAULT_COMPACTION_BUFFER,
-    DEFAULT_INPUT_BUDGET_COMPACTION_BUFFER,
+    DEFAULT_INPUT_BUDGET_COMPACTION_BUFFER, ModelPolicy,
 };
+use caudra_providers::provider::Provider;
 use caudra_providers::{
-    ContentBlock, Message, Model, RequestOptions, Role, StreamResponse, TokenUsage,
+    Billing, ContentBlock, Message, Model, ModelPurpose, RequestOptions, Role, StreamResponse,
+    Timeouts, TokenUsage,
 };
 use caudra_storage::usage_ledger::LedgerPurpose;
-use tracing::info;
+use tracing::{info, warn};
 
 use super::history::{History, is_user_turn, remove_orphaned_tool_results, repair_tool_pairs};
+use super::requirements::{
+    self, REQUIREMENTS_MARKER, REQUIREMENTS_OUTPUT_TOKENS, RequirementsInput, requirements_section,
+};
 use super::run::estimate_message_tokens;
+use super::side_model::{self, SideModel};
 use super::streaming::{StreamError, stream_with_retry};
 use crate::cancel::CancelToken;
 use crate::nudge::Nudge;
@@ -38,10 +45,56 @@ const PRESERVE_RECENT_FRACTION: u32 = 4;
 pub(super) struct CompactionOutcome {
     pub usage: TokenUsage,
     pub result: Result<(), AgentError>,
+    /// What the requirements extraction cost, when one ran to completion. It
+    /// is billed to its own model, so it cannot fold into `usage`.
+    pub extraction: Option<Spend>,
+}
+
+/// What a side request cost, for callers that fold spend into a goal.
+#[derive(Debug, Clone, Copy)]
+pub struct Spend {
+    pub usage: TokenUsage,
+    pub cost: Option<f64>,
+    pub billing: Billing,
+}
+
+/// What a compaction cost: the summary, and the requirements extraction that
+/// ran beside it.
+#[derive(Debug, Clone, Copy)]
+pub struct CompactionSpend {
+    pub usage: TokenUsage,
+    pub extraction: Option<Spend>,
 }
 
 fn normalize(text: &Option<String>) -> Option<&str> {
     text.as_deref().map(str::trim).filter(|t| !t.is_empty())
+}
+
+/// The Extract model, when the config asks for requirements on the summary.
+/// Resolved beside the compaction model rather than inside it so both entry
+/// points share one answer to "which model", and so a compaction never waits
+/// on a catalog lookup it did not ask for.
+pub async fn resolve_extractor(
+    config: &AgentConfig,
+    provider: &Arc<dyn Provider>,
+    model: &Model,
+    timeouts: Timeouts,
+    model_policy: &ModelPolicy,
+) -> Option<SideModel> {
+    if !config.compaction_requirements {
+        return None;
+    }
+    Some(
+        side_model::resolve(
+            ModelPurpose::Extract,
+            provider,
+            model,
+            timeouts,
+            model_policy,
+            REQUIREMENTS_OUTPUT_TOKENS,
+        )
+        .await,
+    )
 }
 
 pub(super) fn continue_message(config: &AgentConfig) -> String {
@@ -51,14 +104,16 @@ pub(super) fn continue_message(config: &AgentConfig) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn compact_history(
-    provider: &dyn caudra_providers::provider::Provider,
+    provider: &dyn Provider,
     model: &Model,
     history: &mut History,
     event_tx: &EventSender,
     cancel: &CancelToken,
     retry_now: &Nudge,
     config: &AgentConfig,
+    extractor: Option<&SideModel>,
 ) -> Result<CompactionOutcome, AgentError> {
     let compact_start = std::time::Instant::now();
     let head_end = head_end(
@@ -71,48 +126,142 @@ pub(super) async fn compact_history(
     strip_thinking(&mut compaction_history);
     strip_old_tool_results(&mut compaction_history);
     compaction_history.push(Message::user(summary_prompt(&compaction_history, config)));
+    // Read before the summary runs and across every seam: the requirements
+    // are what the user said, not what the last summary kept of it.
+    let transcript = extractor.map(|_| history.transcript_items());
 
-    let empty_tools = serde_json::json!([]);
-    let max_attempts = 3;
-    let mut last_error = None;
-
-    for attempt in 0..max_attempts {
-        match stream_with_retry(
-            provider,
-            model,
-            &compaction_history,
-            crate::prompt::COMPACTION_SYSTEM,
-            &empty_tools,
-            event_tx,
-            cancel,
-            retry_now,
-            RequestOptions::default(),
-            None,
-            None,
-        )
-        .await
-        {
-            Ok(response) => {
-                if attempt > 0 {
-                    info!(
-                        attempt,
-                        "compaction succeeded after truncating oldest rounds"
-                    );
+    let summarize = async {
+        let empty_tools = serde_json::json!([]);
+        let max_attempts = 3;
+        let mut last_error = None;
+        for attempt in 0..max_attempts {
+            match stream_with_retry(
+                provider,
+                model,
+                &compaction_history,
+                crate::prompt::COMPACTION_SYSTEM,
+                &empty_tools,
+                event_tx,
+                cancel,
+                retry_now,
+                RequestOptions::default(),
+                None,
+                None,
+            )
+            .await
+            {
+                Ok(response) => {
+                    if attempt > 0 {
+                        info!(
+                            attempt,
+                            "compaction succeeded after truncating oldest rounds"
+                        );
+                    }
+                    return Ok(response);
                 }
-                let usage = response.usage;
-                let result =
-                    finish_compact(response, history, head_end, event_tx, compact_start, model);
-                return Ok(CompactionOutcome { usage, result });
+                Err(StreamError::Other(e))
+                    if e.is_context_overflow() && attempt < max_attempts - 1 =>
+                {
+                    last_error = Some(e);
+                    truncate_oldest_round(&mut compaction_history);
+                }
+                Err(e) => return Err(AgentError::from(e)),
             }
-            Err(StreamError::Other(e)) if e.is_context_overflow() && attempt < max_attempts - 1 => {
-                last_error = Some(e);
-                truncate_oldest_round(&mut compaction_history);
-            }
-            Err(e) => return Err(e.into()),
         }
-    }
+        Err(last_error.unwrap())
+    };
+    let extract = async {
+        let extractor = extractor?;
+        let input = RequirementsInput::from_items(transcript.as_deref()?);
+        if input.is_empty() {
+            return None;
+        }
+        Some(
+            requirements::extract(&*extractor.provider, &extractor.model, &input, None, cancel)
+                .await,
+        )
+    };
+    let (summary, extraction) = futures_lite::future::zip(summarize, extract).await;
 
-    Err(last_error.unwrap())
+    let extraction = extraction.and_then(|outcome| match outcome {
+        Ok(outcome) => {
+            let extractor = extractor?;
+            let spend = Spend {
+                usage: outcome.usage,
+                cost: extractor.model.billed_cost(&outcome.usage, false),
+                billing: extractor.model.billing,
+            };
+            let _ = event_tx.send(AgentEvent::ModelUsage {
+                usage: spend.usage,
+                cost: spend.cost,
+                billing: spend.billing,
+                provider: extractor.model.provider.to_string(),
+                model: extractor.model.id.clone(),
+                purpose: LedgerPurpose::Extract,
+            });
+            Some((outcome.text, spend))
+        }
+        Err(error) => {
+            warn!(%error, "requirements extraction failed; carrying the previous section forward");
+            None
+        }
+    });
+    let mut response = summary?;
+    let (requirements, extraction) = match extraction {
+        Some((text, spend)) => (text, Some(spend)),
+        None => (None, None),
+    };
+    // A summary that failed to gain fresh requirements keeps the last ones:
+    // dropping them would lose what the user said for the price of one
+    // request that did not come back.
+    let section = requirements.map(Cow::Owned).or_else(|| {
+        extractor
+            .and_then(|_| previous_requirements(&history.as_slice()[..head_end]))
+            .map(Cow::Borrowed)
+    });
+    if let Some(section) = section {
+        append_requirements(&mut response.message, &section);
+    }
+    let usage = response.usage;
+    let result = finish_compact(response, history, head_end, event_tx, compact_start, model);
+    Ok(CompactionOutcome {
+        usage,
+        result,
+        extraction,
+    })
+}
+
+/// The requirements block the previous summary carried, marker included.
+fn previous_requirements(head: &[Message]) -> Option<&str> {
+    head.iter()
+        .rev()
+        .find(|message| message.is_compaction_summary)
+        .and_then(Message::first_text_content)
+        .and_then(requirements_section)
+}
+
+/// Appends the list under [`REQUIREMENTS_MARKER`]. The marker is added when
+/// the section is a fresh extraction and already present when it is carried
+/// forward from an earlier summary.
+fn append_requirements(message: &mut Message, section: &str) {
+    let Some(ContentBlock::Text { text }) = message
+        .content
+        .iter_mut()
+        .find(|block| matches!(block, ContentBlock::Text { .. }))
+    else {
+        return;
+    };
+    let body = text.trim_end();
+    let mut appended = String::with_capacity(body.len() + section.len() + 4);
+    appended.push_str(body);
+    appended.push_str("\n\n");
+    if !section.starts_with(REQUIREMENTS_MARKER) {
+        appended.push_str(REQUIREMENTS_MARKER);
+        appended.push('\n');
+    }
+    appended.push_str(section.trim());
+    appended.push('\n');
+    *text = appended;
 }
 
 fn summary_prompt(head: &[Message], config: &AgentConfig) -> String {
@@ -253,12 +402,13 @@ fn retained_subagent_ids(messages: &[Message]) -> Vec<String> {
 }
 
 pub async fn compact(
-    provider: &dyn caudra_providers::provider::Provider,
+    provider: &dyn Provider,
     model: &Model,
     history: &mut History,
     event_tx: &EventSender,
     config: &AgentConfig,
-) -> Result<TokenUsage, AgentError> {
+    extractor: Option<&SideModel>,
+) -> Result<CompactionSpend, AgentError> {
     event_tx.send(AgentEvent::Compacting)?;
     let cancel = CancelToken::none();
     let compacted = compact_history(
@@ -269,6 +419,7 @@ pub async fn compact(
         &cancel,
         &Nudge::default(),
         config,
+        extractor,
     )
     .await?;
     compacted.result?;
@@ -286,7 +437,10 @@ pub async fn compact(
         reason: DoneReason::EndTurn,
     })?;
 
-    Ok(usage)
+    Ok(CompactionSpend {
+        usage,
+        extraction: compacted.extraction,
+    })
 }
 
 /// A window that excludes output only needs the reserve to absorb estimation
@@ -560,6 +714,7 @@ mod tests {
                 &mut history,
                 &EventSender::new(raw_tx, 0),
                 &AgentConfig::default(),
+                None,
             )
             .await
             .unwrap();
@@ -586,12 +741,146 @@ mod tests {
                 &mut history,
                 &EventSender::new(raw_tx, 0),
                 &AgentConfig::default(),
+                None,
             )
             .await
             .unwrap();
 
             assert!(matches!(rx.recv().unwrap().event, AgentEvent::Compacting));
         });
+    }
+
+    const SUMMARY_TEXT: &str = "response";
+    const EXTRACTED: &str = "## Requirements\n- build /extract";
+    const PREVIOUS_SECTION: &str = "# User requirements\n## Requirements\n- keep me";
+
+    fn extractor(responses: Vec<Result<StreamResponse, AgentError>>) -> SideModel {
+        SideModel {
+            provider: Arc::new(MockProvider::new(responses)),
+            model: default_model(),
+        }
+    }
+
+    fn text_of(response: &str) -> StreamResponse {
+        StreamResponse {
+            message: assistant_text(response),
+            usage: TokenUsage {
+                input: 3,
+                ..Default::default()
+            },
+            stop_reason: Some(StopReason::EndTurn),
+            ..Default::default()
+        }
+    }
+
+    fn summary_text(history: &History) -> &str {
+        history.as_slice()[1].first_text_content().unwrap()
+    }
+
+    /// The list rides the summary under its own marker, and the extractor is
+    /// handed what the user said rather than the transcript the summarizer
+    /// gets.
+    #[test]
+    fn compact_appends_the_extracted_requirements() {
+        smol::block_on(async {
+            let provider = MockProvider::new(vec![Ok(text_response(StopReason::EndTurn))]);
+            let extractor = extractor(vec![Ok(text_of(EXTRACTED))]);
+            let (raw_tx, rx) = flume::unbounded();
+            let mut history = History::new(vec![Message::user("work".into())]);
+
+            let spend = compact(
+                &provider,
+                &default_model(),
+                &mut history,
+                &EventSender::new(raw_tx, 0),
+                &AgentConfig::default(),
+                Some(&extractor),
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(
+                summary_text(&history),
+                format!("{SUMMARY_TEXT}\n\n{REQUIREMENTS_MARKER}\n{EXTRACTED}\n")
+            );
+            assert_eq!(spend.extraction.map(|spend| spend.usage.input), Some(3));
+            assert!(rx.drain().any(|envelope| matches!(
+                envelope.event,
+                AgentEvent::ModelUsage {
+                    purpose: LedgerPurpose::Extract,
+                    ..
+                }
+            )));
+            let requests = provider.requests.lock().unwrap();
+            assert!(
+                !requests[0]
+                    .iter()
+                    .any(|message| message.user_text().is_some_and(|t| t.contains("[user 1]")))
+            );
+        });
+    }
+
+    #[test_case(Err(AgentError::EmptySummary) ; "request_failed")]
+    #[test_case(Ok(text_of("  ")) ; "nothing_usable")]
+    fn a_failed_extraction_carries_the_previous_section_forward(
+        outcome: Result<StreamResponse, AgentError>,
+    ) {
+        smol::block_on(async {
+            let provider = MockProvider::new(vec![Ok(text_response(StopReason::EndTurn))]);
+            let extractor = extractor(vec![outcome]);
+            let (raw_tx, _rx) = flume::unbounded();
+            let mut previous = assistant_text(&format!("old summary\n\n{PREVIOUS_SECTION}\n"));
+            previous.is_compaction_summary = true;
+            let mut history = History::new(vec![
+                Message::synthetic(COMPACTION_ANCHOR.into()),
+                previous,
+                Message::user("more work".into()),
+            ]);
+
+            compact(
+                &provider,
+                &default_model(),
+                &mut history,
+                &EventSender::new(raw_tx, 0),
+                &AgentConfig::default(),
+                Some(&extractor),
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(
+                summary_text(&history),
+                format!("{SUMMARY_TEXT}\n\n{PREVIOUS_SECTION}\n")
+            );
+        });
+    }
+
+    #[test]
+    fn no_extractor_leaves_the_summary_alone() {
+        smol::block_on(async {
+            let provider = MockProvider::new(vec![Ok(text_response(StopReason::EndTurn))]);
+            let (raw_tx, _rx) = flume::unbounded();
+            let mut history = History::new(vec![Message::user("work".into())]);
+
+            let spend = compact(
+                &provider,
+                &default_model(),
+                &mut history,
+                &EventSender::new(raw_tx, 0),
+                &AgentConfig::default(),
+                None,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(summary_text(&history), SUMMARY_TEXT);
+            assert!(spend.extraction.is_none());
+        });
+    }
+
+    #[test]
+    fn the_merge_prompt_tells_the_summarizer_to_omit_the_section() {
+        assert!(crate::prompt::COMPACTION_MERGE.contains(REQUIREMENTS_MARKER));
     }
 
     #[test]
@@ -616,6 +905,7 @@ mod tests {
                 &mut history,
                 &EventSender::new(raw_tx, 0),
                 &AgentConfig::default(),
+                None,
             )
             .await
             .unwrap();
@@ -664,6 +954,7 @@ mod tests {
                 &mut history,
                 &EventSender::new(raw_tx, 0),
                 &AgentConfig::default(),
+                None,
             )
             .await
             .unwrap();
@@ -719,6 +1010,7 @@ mod tests {
                 &mut history,
                 &EventSender::new(raw_tx, 0),
                 &AgentConfig::default(),
+                None,
             )
             .await
             .unwrap();
@@ -792,6 +1084,7 @@ mod tests {
                 &mut history,
                 &EventSender::new(raw_tx, 0),
                 &AgentConfig::default(),
+                None,
             )
             .await
             .expect_err("empty summary must fail");
@@ -823,6 +1116,7 @@ mod tests {
                 &mut history,
                 &EventSender::new(raw_tx, 0),
                 &config,
+                None,
             )
             .await
             .unwrap();
@@ -884,6 +1178,7 @@ mod tests {
                 &CancelToken::none(),
                 &Nudge::default(),
                 &AgentConfig::default(),
+                None,
             )
             .await
             .unwrap()
@@ -1307,6 +1602,7 @@ mod tests {
                 &CancelToken::none(),
                 &Nudge::default(),
                 &AgentConfig::default(),
+                None,
             )
             .await
             .unwrap()
@@ -1352,6 +1648,7 @@ mod tests {
                 &CancelToken::none(),
                 &Nudge::default(),
                 &AgentConfig::default(),
+                None,
             )
             .await
             .unwrap()

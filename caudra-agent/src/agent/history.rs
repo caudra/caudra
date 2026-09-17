@@ -24,6 +24,10 @@ pub struct History {
     snapshot: HistorySnapshot,
     messages: Vec<Message>,
     mirror: Option<SharedHistory>,
+    /// What every compaction replaced, oldest first. Never part of a request:
+    /// it exists for readers that need what the user said before a seam,
+    /// which the request deliberately no longer carries.
+    archived: Vec<HistoryItem>,
 }
 
 impl History {
@@ -32,6 +36,7 @@ impl History {
             snapshot: HistorySnapshot::new(expand_messages(&messages)),
             messages,
             mirror: None,
+            archived: Vec::new(),
         }
     }
 
@@ -52,6 +57,7 @@ impl History {
             snapshot: HistorySnapshot::new(items),
             messages,
             mirror: None,
+            archived: Vec::new(),
         })
     }
 
@@ -59,6 +65,21 @@ impl History {
         self.mirror = Some(mirror);
         self.publish();
         self
+    }
+
+    /// Seeds the archive with what earlier sessions' compactions replaced, so
+    /// a resumed session reads back past its seams the same as a live one.
+    pub fn with_archived(mut self, items: Vec<HistoryItem>) -> Self {
+        self.archived = items;
+        self
+    }
+
+    /// Every item a reader scrolls: the archive, then the active chain. Not a
+    /// valid request; it crosses every compaction seam.
+    pub fn transcript_items(&self) -> Vec<HistoryItem> {
+        let mut items = self.archived.clone();
+        items.extend_from_slice(self.active_items());
+        items
     }
 
     /// Bumped by `replace` and `truncate` but not by `extend`, so a caller can
@@ -131,6 +152,12 @@ impl History {
     /// starts a chain the request reads instead of the turns behind it, and
     /// without this the transcript has no way back to them.
     pub fn replace_superseding(&mut self, messages: Vec<Message>, supersedes: Option<CaudraId>) {
+        if let Some(end) =
+            supersedes.and_then(|id| self.snapshot.messages.iter().position(|item| item.id == id))
+        {
+            self.archived
+                .extend_from_slice(&self.snapshot.messages[..=end]);
+        }
         let mut items = expand_messages(&messages);
         if let Some(root) = items.first_mut() {
             root.supersedes = supersedes;
@@ -655,6 +682,58 @@ mod tests {
         assert!(history.has_recent_tool_results(1));
         history.push(Message::user(SECOND.into()));
         assert_eq!(history.recent_nudges(), 0);
+    }
+
+    /// A compaction swaps the request's chain for a summary; the transcript
+    /// still reads back to what the user said before it, across every seam.
+    #[test]
+    fn a_superseding_replace_archives_the_replaced_items() {
+        let mut history = History::new(vec![
+            Message::user(FIRST.into()),
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: "done".into(),
+                }],
+                ..Default::default()
+            },
+            Message::user(SECOND.into()),
+        ]);
+        let seam = history.item_at_message_boundary(2);
+        history.replace_superseding(
+            vec![
+                Message::user("summary".into()),
+                Message::user(SECOND.into()),
+            ],
+            seam,
+        );
+        let second_seam = history.item_at_message_boundary(1);
+        history.replace_superseding(vec![Message::user(GO.into())], second_seam);
+
+        let transcript = history.transcript_items();
+        let texts: Vec<&str> = transcript
+            .iter()
+            .filter_map(|item| match &item.kind {
+                HistoryItemKind::User { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, [FIRST, "summary", GO]);
+        assert_eq!(history.active_items().len(), 1);
+    }
+
+    #[test]
+    fn a_seeded_archive_precedes_the_active_chain() {
+        let archived = History::new(vec![Message::user(FIRST.into())]).into_items();
+        let history = History::new(vec![Message::user(GO.into())]).with_archived(archived);
+
+        let transcript = history.transcript_items();
+
+        assert_eq!(transcript.len(), 2);
+        assert!(matches!(
+            &transcript[0].kind,
+            HistoryItemKind::User { text, .. } if text == FIRST
+        ));
     }
 
     #[track_caller]

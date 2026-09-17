@@ -69,6 +69,14 @@ A line the parser cannot read, such as a panic backtrace, is shown as it was wri
 
 Prompt text and tool input are not written to the log unless you opt in. See [Telemetry](/docs/telemetry/#privacy). Run `caudra logs` for the same records outside the TUI, and see [Logging](/docs/logging/) for the file, its rotation, and the level."#;
 
+const REQUIREMENTS: &str = r#"## Requirements
+
+`/extract` reads every message you wrote in the session, and every answer you gave to a `question` call, and asks the Extract model for the list of requirements they add up to. It reads across compactions, so a constraint stated at the start still makes the list after the summary replaced that turn. The list streams into a modal as it is written. Press `y` or click `Copy` to hand what has arrived so far to the clipboard, and `Esc` to close. The request never enters the session's history and bills under the `extract` purpose.
+
+The same extraction runs beside every automatic or manual compaction of the main session and lands in the summary as a `# User requirements` section, so the model keeps working from your terms after the turns that stated them are gone. The summary model is told to leave that section alone and the extractor writes it fresh each time, from the whole transcript. When the extraction fails or finds nothing, the section from the previous summary is carried forward. Set `agent.compaction_requirements = false` to compact without it. Subagents summarize their own transcripts without a requirements section.
+
+Extract is a [model job](/docs/providers/#model-jobs) and follows Fast unless bound in `/model`."#;
+
 const GOALS: &str = r#"## Completion goals
 
 `/goal <condition>` asks Caudra to keep working until the conversation contains evidence that the condition is met. One goal can be active per session, and a new condition replaces the current one. Conditions are limited to 4,000 characters.
@@ -125,7 +133,7 @@ An input box appears while the focused task is running. Press Enter to queue gui
 
 That input box is a full composer. Typing `/` opens the palette, `Ctrl+S` inserts a file path, `Ctrl+X e` edits the draft in your editor, and `Ctrl+V` attaches an image to the guidance. A custom `/project:` or `/user:` command expands its template and steers the focused task rather than the main session.
 
-Commands that reach the main session's turn or history have no task equivalent, so `/compact`, `/continue`, `/model`, `/system-prompt`, `/btw`, the `/goal` family, the workflow commands, and MCP prompts are drawn dimmed and report their scope when run. Return to Main to use them. `/context`, `/tools`, `/skills`, `/queue`, `/review`, and the stash commands already follow the focused transcript."#;
+Commands that reach the main session's turn or history have no task equivalent, so `/compact`, `/continue`, `/model`, `/system-prompt`, `/btw`, `/extract`, the `/goal` family, the workflow commands, and MCP prompts are drawn dimmed and report their scope when run. Return to Main to use them. `/context`, `/tools`, `/skills`, `/queue`, `/review`, and the stash commands already follow the focused transcript."#;
 
 const WORKFLOWS: &str = r#"## Workflows
 
@@ -222,6 +230,9 @@ pub fn generate() -> String {
     writeln!(out, "{LOGS}").unwrap();
     writeln!(out).unwrap();
 
+    writeln!(out, "{REQUIREMENTS}").unwrap();
+    writeln!(out).unwrap();
+
     writeln!(out, "## Modes and toggles").unwrap();
     writeln!(out).unwrap();
     writeln!(
@@ -257,6 +268,11 @@ pub fn generate() -> String {
     writeln!(
         out,
         "- **`/btw`**: one-shot side question with no tools and no history pollution."
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "- **`/extract`**: list every requirement the session has gathered so far. See [Requirements](#requirements)."
     )
     .unwrap();
     writeln!(

@@ -2,7 +2,6 @@ use super::*;
 use crate::agent::shared_queue;
 use crate::app::tasks::{MAIN_TASK_ID, TaskStatus};
 use crate::chat::{CANCELLED_TEXT, DONE_TEXT, ERROR_TEXT};
-use crate::components::btw_modal::BtwEvent;
 use crate::components::command::{BUILTIN_COMMANDS, CommandPalette, ParsedCommand};
 use crate::components::context_modal::{
     EXPANDED_TITLE as CONTEXT_EXPANDED_TITLE, TITLE as CONTEXT_TITLE,
@@ -17,6 +16,7 @@ use crate::components::status_bar::StatusBarHitTarget;
 use crate::components::storage_modal::{
     EXPANDED_TITLE as STORAGE_EXPANDED_TITLE, TITLE as STORAGE_TITLE,
 };
+use crate::components::stream_modal::{StreamEvent, StreamUsage};
 use crate::components::usage_modal::SCOPE_KEY;
 use crate::components::{DisplaySource, ExitRequest, ToolProgress, buffer_text, key, test_model};
 use crate::repaint::expect::{OWED, QUIET};
@@ -1597,9 +1597,10 @@ fn reset_session_clears_plan() {
     app.queue_and_notify(queued_msg("q"));
     app.queue.set_focus_at(0);
     app.help_modal.toggle();
-    let (_tx, rx) = flume::bounded::<crate::components::btw_modal::BtwEvent>(1);
+    let (_tx, rx) = flume::bounded::<StreamEvent>(1);
     let (trigger, _cancel) = caudra_agent::CancelToken::new();
-    app.btw_modal.open("q", rx, trigger);
+    app.stream_modal
+        .open(" /btw ", "q".into(), false, rx, trigger);
     let actions = app.reset_session();
     assert!(matches!(&actions[0], Action::NewSession(_)));
     assert_eq!(app.status, Status::Idle);
@@ -1615,7 +1616,7 @@ fn reset_session_clears_plan() {
     assert!(app.chat_index.is_empty());
     assert!(app.queue.focus().is_none());
     assert!(!app.help_modal.is_open());
-    assert!(!app.btw_modal.is_open());
+    assert!(!app.stream_modal.is_open());
 }
 
 #[test]
@@ -12131,8 +12132,9 @@ fn btw_usage_settles_into_the_session_ledger() {
 
     let (tx, rx) = flume::bounded(1);
     let (trigger, _cancel) = caudra_agent::CancelToken::new();
-    app.btw_modal.open("why sqlite?", rx, trigger);
-    tx.send(BtwEvent::Done(crate::components::btw_modal::BtwUsage {
+    app.stream_modal
+        .open(" /btw ", "why sqlite?".into(), false, rx, trigger);
+    tx.send(StreamEvent::Done(StreamUsage {
         usage: TokenUsage {
             input: 100,
             output: 40,
@@ -12143,6 +12145,7 @@ fn btw_usage_settles_into_the_session_ledger() {
         billing: Billing::Api,
         model: BTW_MODEL.into(),
         provider: TEST_PROVIDER.into(),
+        purpose: LedgerPurpose::Btw,
     }))
     .unwrap();
     let _ = app.tick();
@@ -12174,25 +12177,111 @@ fn btw_modal_key_routing_and_animation() {
     let mut app = test_app();
     let (tx, rx) = flume::bounded(1);
     let (trigger, _cancel) = caudra_agent::CancelToken::new();
-    app.btw_modal.open("test", rx, trigger);
+    app.stream_modal
+        .open(" /btw ", "test".into(), false, rx, trigger);
 
     // A pending stream is data, drained by `poll`. Only the typewriter
     // revealing the answer moves on its own.
-    assert!(app.btw_modal.is_streaming());
-    assert_eq!(app.btw_modal.cadence(), Cadence::IDLE);
-    tx.send(BtwEvent::TextDelta("hi".into())).unwrap();
-    assert_eq!(app.btw_modal.poll(), Dirty::YES);
-    assert_eq!(app.btw_modal.cadence(), Cadence::SMOOTH);
+    assert!(app.stream_modal.is_streaming());
+    assert_eq!(app.stream_modal.cadence(), Cadence::IDLE);
+    tx.send(StreamEvent::TextDelta("hi".into())).unwrap();
+    assert_eq!(app.stream_modal.poll(), Dirty::YES);
+    assert_eq!(app.stream_modal.cadence(), Cadence::SMOOTH);
 
     let actions = app.update(Msg::Key(key(KeyCode::Char('x'))));
     assert!(actions.is_empty());
-    assert!(app.btw_modal.is_open());
+    assert!(app.stream_modal.is_open());
     assert_eq!(app.input_box.buffer.value(), "");
 
     let actions = app.update(Msg::Key(key(KeyCode::Esc)));
     assert!(actions.is_empty());
-    assert!(!app.btw_modal.is_open());
-    assert_eq!(app.btw_modal.cadence(), Cadence::IDLE);
+    assert!(!app.stream_modal.is_open());
+    assert_eq!(app.stream_modal.cadence(), Cadence::IDLE);
+}
+
+#[test]
+fn extract_command_returns_action() {
+    let mut app = test_app();
+    let actions = app.execute_command(
+        ParsedCommand {
+            name: "/extract".into(),
+            args: String::new(),
+        },
+        0,
+    );
+    assert!(matches!(&actions[..], [Action::Extract]));
+}
+
+#[test]
+fn extract_on_a_session_without_user_turns_flashes_instead_of_opening() {
+    let mut app = test_app();
+    app.start_extract(caudra_providers::Timeouts::default());
+    assert!(!app.stream_modal.is_open());
+    assert_eq!(
+        app.status_bar.flash_text().unwrap(),
+        super::extract::NOTHING_TO_EXTRACT
+    );
+}
+
+/// `y` hands the list to the clipboard and leaves the modal open, so the user
+/// can keep reading or copy again once more of it has streamed.
+#[test]
+fn extract_modal_copy_keeps_the_modal_open() {
+    let mut app = test_app();
+    let (tx, rx) = flume::bounded(1);
+    let (trigger, _cancel) = caudra_agent::CancelToken::new();
+    app.stream_modal
+        .open(" /extract ", "Extracting…".into(), true, rx, trigger);
+    tx.send(StreamEvent::TextDelta("- ship it".into())).unwrap();
+    assert_eq!(app.stream_modal.poll(), Dirty::YES);
+
+    let actions = app.update(Msg::Key(key(KeyCode::Char('y'))));
+    assert!(actions.is_empty());
+    assert!(app.stream_modal.is_open());
+    assert!(
+        app.status_bar.flash_text().is_some(),
+        "the copy reports its outcome in the status bar"
+    );
+}
+
+#[test]
+fn extract_usage_settles_under_the_extract_purpose() {
+    const EXTRACT_MODEL: &str = "extract-model";
+    const EXTRACT_COST: f64 = 0.05;
+    let (_tmp, dir, writer, mut app) = tempdir_app();
+    app.chats[0].context_size = 1000;
+
+    let (tx, rx) = flume::bounded(1);
+    let (trigger, _cancel) = caudra_agent::CancelToken::new();
+    app.stream_modal
+        .open(" /extract ", "Extracting…".into(), true, rx, trigger);
+    tx.send(StreamEvent::Done(StreamUsage {
+        usage: TokenUsage {
+            input: 300,
+            output: 60,
+            ..Default::default()
+        },
+        cost: Some(EXTRACT_COST),
+        billing: Billing::Api,
+        model: EXTRACT_MODEL.into(),
+        provider: TEST_PROVIDER.into(),
+        purpose: LedgerPurpose::Extract,
+    }))
+    .unwrap();
+    let _ = app.tick();
+
+    assert_eq!(app.state.token_usage.input, 300);
+    assert_eq!(app.state.cost, Some(EXTRACT_COST));
+    assert_eq!(
+        app.chats[0].context_size, 1000,
+        "an extraction never enters history, so it must not move the context gauge"
+    );
+    drain_writer(app, writer);
+
+    let rows = UsageLedger::open(&dir).unwrap().buckets(None).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].purpose, LedgerPurpose::Extract.storage_name());
+    assert_eq!(rows[0].cost, EXTRACT_COST);
 }
 
 #[test]

@@ -2,15 +2,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use caudra_config::ModelPolicy;
-use caudra_providers::provider::{Provider, from_model_async};
+use caudra_providers::provider::Provider;
 use caudra_providers::{
-    AgentError, ContentBlock, MIN_THINKING_BUDGET, Message, Model, ModelError, ModelPurpose,
-    RequestOptions, Timeouts, TokenUsage,
+    AgentError, ContentBlock, MIN_THINKING_BUDGET, Message, Model, ModelPurpose, RequestOptions,
+    Timeouts, TokenUsage,
 };
 use caudra_storage::sessions::{normalize_title, truncate_title};
 use serde_json::json;
-use tracing::{debug, warn};
+use tracing::warn;
 
+use super::side_model::{self, SideModel};
 use super::streaming::{StreamError, stream_silent_with_retry};
 use crate::cancel::CancelToken;
 
@@ -29,11 +30,6 @@ const PROMPT_PREFIX: &str = "Generate a title for this conversation:\n";
 const THINK_OPEN: &str = "<think>";
 const THINK_CLOSE: &str = "</think>";
 
-pub struct ResolvedTitleModel {
-    pub provider: Arc<dyn Provider>,
-    pub model: Model,
-}
-
 /// Resolves the title model and asks it for a name. The one entry point:
 /// the agent names a new session with it, and the session picker renames an
 /// existing one.
@@ -44,69 +40,18 @@ pub async fn for_prompt(
     model_policy: &ModelPolicy,
     prompt: &str,
     cancel: &CancelToken,
-) -> Result<(ResolvedTitleModel, TitleOutcome), AgentError> {
-    let resolved = resolve(provider, model, timeouts, model_policy).await;
+) -> Result<(SideModel, TitleOutcome), AgentError> {
+    let resolved = side_model::resolve(
+        ModelPurpose::Title,
+        provider,
+        model,
+        timeouts,
+        model_policy,
+        TITLE_OUTPUT_TOKENS,
+    )
+    .await;
     let outcome = generate(&*resolved.provider, &resolved.model, prompt, cancel).await?;
     Ok((resolved, outcome))
-}
-
-/// Falls back to the chat model whenever the binding cannot be resolved: a
-/// title model that will not load is a reason to use what is already there, not
-/// to skip naming the session.
-async fn resolve(
-    current_provider: &Arc<dyn Provider>,
-    current_model: &Model,
-    timeouts: Timeouts,
-    model_policy: &ModelPolicy,
-) -> ResolvedTitleModel {
-    let target_model = current_model.clone();
-    let policy = model_policy.clone();
-    // Catalog lookups and `warm_catalog` block, so they stay off the executor
-    // that is currently carrying the turn this title belongs to.
-    let resolved = smol::unblock(move || title_model(&target_model, &policy)).await;
-    let mut model = match resolved {
-        Ok(model) => model,
-        Err(error) => {
-            debug!(%error, "falling back to the chat model for the session title");
-            current_model.clone()
-        }
-    };
-    model.max_output_tokens = Some(
-        model
-            .max_output_tokens
-            .unwrap_or(TITLE_OUTPUT_TOKENS)
-            .min(TITLE_OUTPUT_TOKENS),
-    );
-
-    let provider = if model.provider == current_model.provider {
-        current_provider.adjust_model(&mut model);
-        Arc::clone(current_provider)
-    } else {
-        match from_model_async(&mut model, timeouts).await {
-            Ok(provider) => Arc::from(provider),
-            Err(error) => {
-                warn!(%error, model = %model.id, "no provider for the title model, using the chat model");
-                let mut model = current_model.clone();
-                current_provider.adjust_model(&mut model);
-                return ResolvedTitleModel {
-                    provider: Arc::clone(current_provider),
-                    model,
-                };
-            }
-        }
-    };
-    ResolvedTitleModel { provider, model }
-}
-
-fn title_model(current_model: &Model, model_policy: &ModelPolicy) -> Result<Model, AgentError> {
-    Model::resolve(ModelPurpose::Title, current_model, model_policy)
-        .map_err(|error| title_model_error(ModelPurpose::Title, error))
-}
-
-fn title_model_error(purpose: ModelPurpose, error: ModelError) -> AgentError {
-    AgentError::Config {
-        message: format!("cannot resolve the {purpose} model: {error}"),
-    }
 }
 
 /// What a title attempt cost and what it produced. `title` is `None` when the

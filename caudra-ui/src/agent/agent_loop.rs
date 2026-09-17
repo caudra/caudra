@@ -99,6 +99,7 @@ impl AgentLoop {
         config: AgentConfig,
         tool_output_lines: ToolOutputLines,
         initial_history: Vec<HistoryItem>,
+        archived_history: Vec<HistoryItem>,
         shared_history: SharedHistory,
         btw_prompt: SharedBtwPrompt,
         context_publisher: ContextPublisher,
@@ -138,7 +139,12 @@ impl AgentLoop {
             McpSession::new(h, initial_messages).with_disabled_tools(&config.disabled_tools)
         });
         let (history, history_restore_error) = match restored_history {
-            Ok(history) => (history.with_mirror(shared_history), None),
+            Ok(history) => (
+                history
+                    .with_mirror(shared_history)
+                    .with_archived(archived_history),
+                None,
+            ),
             Err(error) => (History::default(), Some(error.to_string())),
         };
         Self {
@@ -389,16 +395,32 @@ impl AgentLoop {
             self.timeouts,
             &self.model_policy,
         )?;
-        let usage = agent::compact(
+        let extractor = agent::resolve_extractor(
+            &self.config,
+            &slot.provider,
+            &slot.model,
+            self.timeouts,
+            &self.model_policy,
+        )
+        .await;
+        let spend = agent::compact(
             &*provider,
             &model,
             &mut self.history,
             event_tx,
             &self.config,
+            extractor.as_ref(),
         )
         .await?;
-        self.goal
-            .record_external_usage(usage, model.billed_cost(&usage, false), model.billing);
+        self.goal.record_external_usage(
+            spend.usage,
+            model.billed_cost(&spend.usage, false),
+            model.billing,
+        );
+        if let Some(extraction) = spend.extraction {
+            self.goal
+                .record_external_usage(extraction.usage, extraction.cost, extraction.billing);
+        }
         let effective_slot = self.effective_model_slot.load();
         self.publish_prepared_context(&effective_slot);
         Ok(())

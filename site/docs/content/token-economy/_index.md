@@ -100,7 +100,7 @@ A rate of `—` means the provider reported no prompt tokens for that row, which
 
 Both scopes of `/usage` score each model and, once two providers served the work, each provider. `caudra storage usage` prints the same column, and `--json` carries it as `cache_hit_rate`.
 
-Some providers keep a cache per machine and route a request by a key the client supplies. Caudra sends one per conversation: the session id for the main agent, and `session/task` for a subagent, so siblings never compete for the parent's cache. Title, goal evaluator, and tool-repair requests have their own system prompt and send no key. The key reaches OpenAI (as `prompt_cache_key`, plus the `session-id` header on a ChatGPT login), custom OpenAI-compatible endpoints, xAI, OpenRouter, Mistral, and a Claude login. It is a routing hint only, so a stale key costs a cache miss and never changes output.
+Some providers keep a cache per machine and route a request by a key the client supplies. Caudra sends one per conversation: the session id for the main agent, and `session/task` for a subagent, so siblings never compete for the parent's cache. Title, goal evaluator, requirements extraction, and tool-repair requests have their own system prompt and send no key. The key reaches OpenAI (as `prompt_cache_key`, plus the `session-id` header on a ChatGPT login), custom OpenAI-compatible endpoints, xAI, OpenRouter, Mistral, and a Claude login. It is a routing hint only, so a stale key costs a cache miss and never changes output.
 
 Routing finds the right machine. Whether that machine holds a usable prefix is a separate matter. OpenAI writes a cache entry through the latest message of each request, so a conversation that shares the system prompt and tool definitions but opens with a different user turn, which is every new session and every subagent, finds no entry ending where its shared prefix ends. On GPT-5.6 and later Caudra places an explicit cache breakpoint after the system prompt, so that prefix is written once and read by every later conversation in the project. The mark is a field on an input block, and top-level `instructions` cannot carry it, so for these models the system prompt travels as the first developer message instead. A ChatGPT login does not take part: the Codex backend rejects the field, so a login keeps implicit caching, as do earlier models on either path.
 
@@ -144,6 +144,7 @@ Every row records why the model was called, so you can separate the conversation
 | `compaction` | Summarizing a session that filled its window |
 | `title` | Naming a session |
 | `btw` | `/btw` questions asked beside the conversation |
+| `extract` | `/extract` lists and the requirements section of a compaction summary |
 | `tool_json_repair` | Isolated syntax repair for malformed tool arguments |
 
 The model cannot answer that question on its own, because goals, compaction, and titles often run on the model already in use.

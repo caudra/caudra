@@ -65,6 +65,10 @@ pub const COMPACTION_USER: &str = include_str!("prompts/compaction_user.md");
 pub const COMPACTION_MERGE: &str = include_str!("prompts/compaction_merge.md");
 pub const GOAL_EVALUATOR: &str = include_str!("prompts/goal_evaluator.md");
 pub const TITLE_SYSTEM: &str = include_str!("prompts/title.md");
+pub const REQUIREMENTS_SYSTEM: &str = include_str!("prompts/requirements.md");
+/// Carries [`TRANSCRIPT_SLOT`], filled with the user's side of the session.
+pub const REQUIREMENTS_USER: &str = include_str!("prompts/requirements_user.md");
+pub const TRANSCRIPT_SLOT: &str = "{transcript}";
 /// Announced in the subagent's conversation for the same reason the interactive
 /// modes are: the rule then sits closest to the point the model generates from.
 /// Both modes share the heading, and so the kind, because a task's mode is

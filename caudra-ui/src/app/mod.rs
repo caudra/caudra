@@ -6,6 +6,7 @@
 
 mod btw;
 mod delegation;
+mod extract;
 mod image_paste;
 mod memory;
 pub(crate) mod mode;
@@ -36,7 +37,6 @@ use crate::app::tasks::TaskOutcome;
 use crate::chat::Chat;
 use crate::chat::{CANCELLED_TEXT, ChatEventResult, DONE_TEXT, ERROR_TEXT};
 use crate::clipboard::{ClipboardState, CopyResult};
-use crate::components::btw_modal::BtwModal;
 use crate::components::command::{CommandAction, CommandPalette, ParsedCommand};
 use crate::components::command_modal::{CommandModal, CommandModalAction};
 use crate::components::context_modal::ContextModal;
@@ -74,6 +74,7 @@ use crate::components::skills_modal::SkillsModal;
 use crate::components::stash_picker::StashPicker;
 use crate::components::status_bar::{StatusBar, StatusBarHit, StatusBarHitTarget};
 use crate::components::storage_modal::{StorageFetchState, StorageModal};
+use crate::components::stream_modal::StreamModal;
 use crate::components::task_picker::TaskPicker;
 use crate::components::theme_picker::{ThemePicker, ThemePickerAction};
 use crate::components::thinking_picker::{ThinkingPicker, ThinkingPickerAction};
@@ -332,7 +333,7 @@ pub struct App {
     /// the table outlives sessions and only grows.
     pub(super) lifetime_usage: Option<LifetimeUsage>,
     pub(super) goal_modal: GoalModal,
-    pub(super) btw_modal: BtwModal,
+    pub(super) stream_modal: StreamModal,
     pub(super) float_mgr: FloatManager,
     pub(super) search_modal: SearchModal,
     pub(super) file_picker: FilePickerModal,
@@ -559,7 +560,7 @@ impl App {
             context_snapshot: Watch::default(),
             lifetime_usage: None,
             goal_modal: GoalModal::default(),
-            btw_modal: BtwModal::new(typewriter),
+            stream_modal: StreamModal::new(typewriter),
             float_mgr: FloatManager::new(),
             search_modal: SearchModal::new(),
             file_picker: FilePickerModal::new(),
@@ -1445,8 +1446,8 @@ impl App {
             self.question_form.scroll(delta);
             return None;
         }
-        if self.btw_modal.is_open() {
-            self.btw_modal.scroll(delta);
+        if self.stream_modal.is_open() {
+            self.stream_modal.scroll(delta);
             return None;
         }
         if self.help_modal.is_open() {
@@ -1804,9 +1805,11 @@ impl App {
             return Some(vec![]);
         }
 
-        if self.btw_modal.is_open() {
+        if self.stream_modal.is_open() {
             guard_repeat!(false);
-            self.btw_modal.handle_key(key);
+            if let Some(text) = self.stream_modal.handle_key(key) {
+                self.copy_to_clipboard(&text);
+            }
             return Some(vec![]);
         }
 
@@ -4232,6 +4235,7 @@ impl App {
                     vec![Action::Btw(question)]
                 }
             }
+            "/extract" => vec![Action::Extract],
             "/goal" => self.execute_goal(&cmd.args),
             "/goal-clear" => self.clear_goal(),
             "/goal-model" => self.open_goal_model_picker(),
@@ -4647,7 +4651,7 @@ impl App {
             &self.skills_modal,
             &self.storage_modal,
             &self.goal_modal,
-            &self.btw_modal,
+            &self.stream_modal,
             &self.float_mgr,
             &self.search_modal,
             &self.file_picker,
@@ -4687,7 +4691,7 @@ impl App {
             &mut self.skills_modal,
             &mut self.storage_modal,
             &mut self.goal_modal,
-            &mut self.btw_modal,
+            &mut self.stream_modal,
             &mut self.float_mgr,
             &mut self.search_modal,
             &mut self.file_picker,
@@ -4766,7 +4770,7 @@ impl App {
         self.status == Status::Streaming
             || self.chats.iter().any(|chat| chat.retry().is_some())
             || self.restoring.load(Ordering::Relaxed)
-            || self.btw_modal.is_streaming()
+            || self.stream_modal.is_streaming()
             || self
                 .state
                 .session
@@ -4851,7 +4855,7 @@ impl App {
             | self.tick_autoscroll()
             | self.tick_error_expiry()
             | self.poll_image_paste()
-            | self.tick_btw()
+            | self.tick_stream_modal()
             | self.status_bar.poll_branch_update()
             | self.status_bar.clear_expired_hint()
             | self.mcp_picker.refresh()
@@ -5048,26 +5052,27 @@ impl App {
         }
     }
 
-    /// btw spends real tokens outside any turn, so it settles into the same
-    /// ledger as compaction and the goal evaluator. It deliberately leaves
-    /// `context_size` alone: the question never enters history.
-    fn tick_btw(&mut self) -> Dirty {
-        let dirty = self.btw_modal.poll();
-        if let Some(btw) = self.btw_modal.take_usage() {
-            self.state.token_usage += btw.usage;
-            self.add_session_spend(btw.cost, btw.billing);
-            add_chat_spend(self.main_chat(), btw.cost, btw.billing);
+    /// A side request (`/btw`, `/extract`) spends real tokens outside any
+    /// turn, so it settles into the same ledger as compaction and the goal
+    /// evaluator. It deliberately leaves `context_size` alone: the request
+    /// never enters history.
+    fn tick_stream_modal(&mut self) -> Dirty {
+        let dirty = self.stream_modal.poll();
+        if let Some(spend) = self.stream_modal.take_usage() {
+            self.state.token_usage += spend.usage;
+            self.add_session_spend(spend.cost, spend.billing);
+            add_chat_spend(self.main_chat(), spend.cost, spend.billing);
             self.record_model_usage(
-                &btw.provider,
-                &btw.model,
-                LedgerPurpose::Btw,
-                btw.usage,
-                btw.cost,
-                btw.billing,
+                &spend.provider,
+                &spend.model,
+                spend.purpose,
+                spend.usage,
+                spend.cost,
+                spend.billing,
             );
             self.state
                 .goal
-                .record_external_usage(btw.usage, btw.cost, btw.billing);
+                .record_external_usage(spend.usage, spend.cost, spend.billing);
         }
         dirty
     }

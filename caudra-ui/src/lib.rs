@@ -177,6 +177,18 @@ pub(crate) fn transcript_session_history(
     transcript_history_items(session.messages(), session_history_head(session))
 }
 
+/// The transcript's prefix that the request no longer carries: every stretch
+/// a compaction replaced. Empty when the session never compacted or cannot be
+/// read, so a broken graph costs the archive and nothing else.
+pub(crate) fn archived_session_history(session: &AppSession) -> Vec<HistoryItem> {
+    let Ok(mut transcript) = transcript_session_history(session) else {
+        return Vec::new();
+    };
+    let active = active_session_history(session).map_or(0, |items| items.len());
+    transcript.truncate(transcript.len().saturating_sub(active));
+    transcript
+}
+
 pub(crate) fn history_items(messages: &[Message]) -> Vec<HistoryItem> {
     let mut items = Vec::new();
     for message in messages {

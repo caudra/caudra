@@ -148,6 +148,7 @@ The `bash`, `python_execution`, and `task` entries apply only when `ui.scroll_ca
 | `compaction_buffer` | u32 \| string | `20%, or 10% when the model's window excludes output` | - | Context reserved for compaction: token count or percent of the context window (e.g. "20%") |
 | `compaction_instructions` | String | `none` | - | Extra instructions appended to the compaction summary prompt |
 | `post_compaction_instructions` | String | `none` | - | Extra instructions the agent receives after any compaction (e.g. re-read plan.md) |
+| `compaction_requirements` | bool | `true` | - | Append a `# User requirements` section to every compaction summary: what the user asked for, constrained, and decided, read from their own messages and answered questions across every earlier compaction, and extracted by the Extract model so the conversation model never sees the request |
 | `generate_titles` | bool | `true` | - | Name a new session by summarizing its first prompt with the Title model |
 | `stale_read_check` | bool | `true` | - | Block a write to a file that changed on disk since it was read, and point a failed edit or patch at the change |
 | `tool_json_repair` | bool | `true` | - | Repair malformed tool JSON syntax locally, with one bounded isolated model fallback; independent of eager dispatch |
