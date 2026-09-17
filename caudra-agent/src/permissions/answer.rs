@@ -5,6 +5,11 @@ use super::{
     PermissionRowGrant, PermissionRuleRecord, StructuredPermissionEffect, StructuredPermissionRule,
     permission_rule_covers_request, permission_rule_intersects_request, review::review_for_rule,
 };
+use caudra_storage::id::CaudraId;
+use caudra_storage::now_epoch;
+use caudra_storage::permission_state::mutation::{
+    PermissionMutation, PermissionOwner, prepare_mutation,
+};
 use std::path::Path;
 
 pub const DEFAULT_DENY_GUIDANCE: &str =
@@ -282,6 +287,11 @@ impl PermissionManager {
         if rules.iter().any(|rule| rule.lifetime != first.lifetime) {
             return Err(PermissionPolicyError("mixed permission lifetimes".into()));
         }
+        let _mutation = self
+            .broker
+            .mutation_gate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         if first.lifetime == PermissionLifetime::Conversation {
             let records = rules
                 .iter()
@@ -293,7 +303,28 @@ impl PermissionManager {
                     .map_err(|error| PermissionPolicyError(error.to_string()))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            self.structured_conversation_rules().extend(records);
+            if let Some(publication) = self.publication() {
+                let snapshot = publication
+                    .snapshot()
+                    .map_err(|error| PermissionPolicyError(error.to_string()))?;
+                if snapshot.records != *self.structured_conversation_rules() {
+                    return Err(PermissionPolicyError(
+                        "conversation permission state changed".into(),
+                    ));
+                }
+                let prepared = prepare_mutation(
+                    vec![snapshot.clone()],
+                    PermissionMutation::Create {
+                        destination: snapshot.revision.owner,
+                        records: records.into_boxed_slice(),
+                    },
+                )
+                .map_err(|error| PermissionPolicyError(error.to_string()))?;
+                self.commit_prepared_permission_mutation(&prepared)
+                    .map_err(|error| PermissionPolicyError(error.to_string()))?;
+            } else {
+                self.structured_conversation_rules().extend(records);
+            }
         } else {
             let project = if first.lifetime == PermissionLifetime::Project {
                 Some(approved_project.map(Path::to_path_buf).ok_or_else(|| {
@@ -302,14 +333,17 @@ impl PermissionManager {
             } else {
                 None
             };
-            let entries = rules
+            let records = rules
                 .iter()
-                .map(|rule| {
-                    (
-                        project.clone(),
-                        rule.clone(),
-                        Some(review_for_rule(request, rule)),
-                    )
+                .map(|rule| PermissionRuleRecord {
+                    id: CaudraId::generate().to_string(),
+                    project: project.clone(),
+                    rule: rule.clone(),
+                    review: Some(review_for_rule(request, rule)),
+                    label: None,
+                    replaces: None,
+                    created_at: now_epoch(),
+                    revoked_at: None,
                 })
                 .collect();
             let policy = self
@@ -320,11 +354,23 @@ impl PermissionManager {
                 .policy
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            policy
+            let snapshot = policy
                 .state()?
-                .insert_many_with_review(entries)
+                .snapshot()
+                .map_err(|error| PermissionPolicyError(error.to_string()))?;
+            drop(policy);
+            let prepared = prepare_mutation(
+                vec![snapshot],
+                PermissionMutation::Create {
+                    destination: PermissionOwner::Persistent,
+                    records,
+                },
+            )
+            .map_err(|error| PermissionPolicyError(error.to_string()))?;
+            self.commit_prepared_permission_mutation(&prepared)
                 .map_err(|error| PermissionPolicyError(error.to_string()))?;
         }
+        self.notify_policy_changed(&request.id);
         Ok(())
     }
 }

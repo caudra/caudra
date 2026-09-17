@@ -238,6 +238,13 @@ impl WorkcellRuntime {
         matches!(self.backend, WorkcellBackend::Remote(_))
     }
 
+    pub fn local_host(&self) -> Option<&WorkcellHost> {
+        match &self.backend {
+            WorkcellBackend::Embedded { _host } => Some(_host),
+            WorkcellBackend::Remote(_) => None,
+        }
+    }
+
     pub fn stored_binding(&self) -> Option<&StoredWorkspaceBinding> {
         self.stored_binding.as_ref()
     }

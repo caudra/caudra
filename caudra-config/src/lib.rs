@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
-use std::fmt;
+use std::fmt::{self, Write};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -12,6 +12,7 @@ use caudra_storage::thinking::{StoredThinking, ThinkingParseError};
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value as JsonValue};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tracing::warn;
 
@@ -1111,6 +1112,7 @@ struct PermissionsFileConfig {
     tools: HashMap<String, ToolPermissions>,
     mcp_rules: Vec<ParsedPermissionRule>,
     mcp_defaults: HashMap<ToolKey, DefaultEffect>,
+    loaded_file: Option<(PathBuf, String)>,
 }
 
 impl<'de> Deserialize<'de> for PermissionsFileConfig {
@@ -1170,6 +1172,7 @@ impl<'de> Deserialize<'de> for PermissionsFileConfig {
             tools,
             mcp_rules,
             mcp_defaults,
+            loaded_file: None,
         })
     }
 }
@@ -1400,7 +1403,27 @@ pub struct PermissionsConfig {
     /// Project denies and asks bind trust to the effective project allow boundary.
     pub project_restrictive_rules: Vec<PermissionRule>,
     pub review_candidates: Vec<PermissionReviewCandidate>,
+    pub loaded_sources: Vec<LoadedPermissionSource>,
     pub yolo: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct LoadedPermissionSource {
+    rule: PermissionRule,
+    path: PathBuf,
+    content_digest: String,
+}
+
+impl LoadedPermissionSource {
+    pub fn rule(&self) -> &PermissionRule {
+        &self.rule
+    }
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+    pub fn content_digest(&self) -> &str {
+        &self.content_digest
+    }
 }
 
 #[derive(Clone)]
@@ -2793,6 +2816,24 @@ fn build_permissions(
     let mut review_candidates = Vec::new();
     push_review_candidates(&mut review_candidates, PermissionSource::Global, &global);
     push_review_candidates(&mut review_candidates, PermissionSource::Project, &project);
+    let mut loaded_sources = Vec::new();
+    for config in [&global, &project] {
+        let Some((path, digest)) = &config.loaded_file else {
+            continue;
+        };
+        let mut loaded_rules = Vec::new();
+        for effect in [Effect::Deny, Effect::Ask, Effect::Allow] {
+            push_rules(&mut loaded_rules, &config.tools, effect);
+            if effect != Effect::Allow {
+                push_parsed_rules(&mut loaded_rules, &config.mcp_rules, effect);
+            }
+        }
+        loaded_sources.extend(loaded_rules.into_iter().map(|rule| LoadedPermissionSource {
+            rule,
+            path: path.clone(),
+            content_digest: digest.clone(),
+        }));
+    }
     PermissionsConfig {
         default,
         tool_defaults,
@@ -2800,6 +2841,7 @@ fn build_permissions(
         project_allow_rules,
         project_restrictive_rules,
         review_candidates,
+        loaded_sources,
         yolo: false,
     }
 }
@@ -3015,14 +3057,26 @@ fn load_permissions_scoped(
 }
 
 fn read_permissions_file(path: &Path) -> Result<Option<PermissionsFileConfig>, String> {
-    let content = match fs::read_to_string(path) {
-        Ok(content) => content,
+    let path = match fs::canonicalize(path) {
+        Ok(path) => path,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(format!("cannot read permissions: {error}")),
     };
-    toml::from_str(&content)
-        .map(Some)
-        .map_err(|error| format!("cannot parse permissions: {error}"))
+    let content =
+        fs::read_to_string(&path).map_err(|error| format!("cannot read permissions: {error}"))?;
+    let mut config: PermissionsFileConfig =
+        toml::from_str(&content).map_err(|error| format!("cannot parse permissions: {error}"))?;
+    config.loaded_file = Some((path, permission_source_digest(content.as_bytes())));
+    Ok(Some(config))
+}
+
+fn permission_source_digest(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut output = String::with_capacity(digest.len() * 2);
+    for byte in digest.iter() {
+        let _ = write!(output, "{byte:02x}");
+    }
+    output
 }
 
 fn fail_closed_permissions() -> PermissionsConfig {
@@ -3048,6 +3102,17 @@ mod tests {
     use tempfile::TempDir;
     use test_case::test_case;
 
+    const EMPTY_SOURCE_DIGEST: &str =
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    const ABC_SOURCE_DIGEST: &str =
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+
+    #[test_case(b"", EMPTY_SOURCE_DIGEST; "empty_source")]
+    #[test_case(b"abc", ABC_SOURCE_DIGEST; "known_source")]
+    fn permission_source_digest_uses_lowercase_bytewise_hex(bytes: &[u8], expected: &str) {
+        assert_eq!(permission_source_digest(bytes), expected);
+    }
+
     fn plugin_enabled(enabled: bool) -> PluginFileConfig {
         PluginFileConfig {
             enabled: Some(enabled),
@@ -3063,6 +3128,52 @@ mod tests {
 
     fn global_config_dir(dir: &Path) -> PathBuf {
         dir.join(".config/caudra")
+    }
+
+    #[test_case(false; "global_and_project")]
+    #[test_case(true; "global_only")]
+    fn permission_sources_use_loaded_paths_and_bytes(global_only: bool) {
+        const GLOBAL: &str = "[shell]\nallow = ['git status']\n";
+        const PROJECT: &str = "[shell]\ndeny = ['git push *']\n";
+        let temp = tempfile::tempdir().unwrap();
+        let global = temp.path().join("global");
+        let project = temp.path().join("project");
+        fs::create_dir_all(&global).unwrap();
+        fs::create_dir_all(project.join(PROJECT_DIR)).unwrap();
+        let global_file = global.join(PERMISSIONS_FILE);
+        let project_file = project.join(PROJECT_DIR).join(PERMISSIONS_FILE);
+        fs::write(&global_file, GLOBAL).unwrap();
+        fs::write(&project_file, PROJECT).unwrap();
+        let config = load_permissions_scoped(&project, Some(&global), !global_only);
+        assert_eq!(config.loaded_sources.len(), if global_only { 1 } else { 2 });
+        for source in config.loaded_sources {
+            let (path, content) = match source.rule().effect {
+                Effect::Allow => (&global_file, GLOBAL),
+                Effect::Deny => (&project_file, PROJECT),
+                Effect::Ask => panic!("Unexpected ask rule"),
+            };
+            assert_eq!(source.path(), fs::canonicalize(path).unwrap());
+            assert_eq!(
+                source.content_digest(),
+                permission_source_digest(content.as_bytes())
+            );
+        }
+    }
+
+    #[test_case("[shell]\nallow = ['git status']\n", false; "memory_config_has_no_source")]
+    #[test_case("[shell]\nallow = ['git * status']\n", true; "invalid_config_has_no_source")]
+    fn permission_source_is_not_inferred_from_parsed_rules(source: &str, from_file: bool) {
+        let config = if from_file {
+            let temp = tempfile::tempdir().unwrap();
+            fs::write(temp.path().join(PERMISSIONS_FILE), source).unwrap();
+            load_permissions_scoped(temp.path(), Some(temp.path()), false)
+        } else {
+            build_permissions(
+                toml::from_str(source).unwrap(),
+                PermissionsFileConfig::default(),
+            )
+        };
+        assert!(config.loaded_sources.is_empty());
     }
 
     #[test_case("12000", CompactionBuffer::Tokens(12_000) ; "tokens_number")]

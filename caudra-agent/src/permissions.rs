@@ -40,12 +40,13 @@ pub use structured::{
     selected_input, selected_input_digest, selected_input_pointer, update_presentation_coverage,
 };
 
+pub mod editor;
 mod manager;
-pub use manager::{PermissionManager, RevokedRuleScope};
+pub use manager::{PermissionManager, PermissionProjectFilter, RevokedRuleScope};
 mod policy;
 pub use policy::{
     ActivePolicyRule, CONFINED_READ_ATTRIBUTE, CONFINED_READ_VALUE, PERMISSION_DENIED_PREFIX,
-    PermissionPolicyError, PluginRuleStore,
+    PermissionPolicyError, PluginRuleStore, VerifiedLocalSourceLocator,
 };
 use policy::{
     ConfiguredPolicy, SharedPermissionState, builtin_rules, configured_policy, shared_policy,

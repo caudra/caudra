@@ -128,6 +128,8 @@ Set this on the Workcell host for remote execution. It is host configuration, no
 
 Audit permission events, discover review-only command patterns, inspect stored rules, repair review descriptions, or review an explicit permission transfer without starting an agent. `audit` and `rebind` emit JSON. `discover`, `inventory`, and `repair-review` default to human-readable output and accept `--json`.
 
+For interactive New, Edit, Duplicate, Copy, and Revoke controls, use the TUI's [`/permissions` manager](/docs/permissions/#stored-rules). These are not `caudra permissions` subcommands.
+
 `discover`, `inventory`, `repair-review`, and `rebind` accept `--database <ABSOLUTE_CAUDRA_SQLITE>` before or after the subcommand. The path must name an existing canonical absolute `caudra.sqlite` file. Symlink and hard-link aliases are rejected. Selecting a database creates no database or directories. Inventory, repair, and rebind reports identify the selected database path. Discovery reports a hashed source identity.
 
 Without `--database`, commands use this build's data namespace. Development builds default to `caudra-debug`, not the production `caudra` namespace. To preview repair of the standard Linux production database with a development binary, select it explicitly:
@@ -178,7 +180,7 @@ caudra permissions --database "$HOME/.local/state/caudra/caudra.sqlite" \
   discover --project /work/app --limit 5
 ```
 
-`discover` reads a bounded sample of local stored tool calls and proposes command patterns for review. It never executes history, installs rules, or changes authorization. There is no apply mode. Use the [matching approval prompt](/docs/permissions/#argument-pattern-inspector) to review and grant a scope.
+`discover` reads a bounded sample of local stored tool calls and proposes command patterns for review. It never executes history, installs rules, or changes authorization. There is no apply mode. In the TUI, use [Discover's Create permission action](/docs/permissions/#suggested-patterns) to open a draft for current-binding validation and explicit review and Save. A matching live [approval prompt](/docs/permissions/#argument-pattern-inspector) can also grant a scope.
 
 | Flag | Effect |
 |---|---|
@@ -254,6 +256,8 @@ To apply, close every session and storage reader using this database, including 
 Use the top-level `confirmation` value from that selected preview, not the inventory fingerprint. Apply rechecks the preview fingerprint, destination identity, resource aliases, and database access guards. It inserts replacements and retires selected allow originals atomically, retaining source-record provenance. Changed inventory or destination identity requires a fresh preview. Rules remain path-bound after commit, not inode-bound.
 
 This is fresh destination authorization. It never transfers project-config trust or YOLO, and it never automatically rebinds stored grants through symlinks. See [Permissions](/docs/permissions/) for runtime matching and prompt behavior.
+
+Unlike CLI `rebind`, the TUI manager's Copy action leaves all source rules active. Revoking a copied source is a separate reviewed action. The CLI's selected-allow retirement behavior is unchanged.
 
 ### `caudra remote`
 

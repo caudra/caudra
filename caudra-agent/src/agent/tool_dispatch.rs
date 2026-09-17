@@ -9,13 +9,15 @@ use serde_json::Value;
 use tracing::{Instrument, debug, error, info_span, warn};
 
 use crate::mcp::{McpSession, UNKNOWN_MCP};
-use crate::permissions::canonical_json;
+use crate::permissions::{PermissionAuthorityProfile, RemotePermissionIdentity, canonical_json};
 use crate::task_set::TaskSet;
 use crate::tools::json_repair::RepairError;
-use crate::tools::registry::{PlanModeAccess, ToolInvocation, ToolRegistry};
+use crate::tools::registry::{
+    PlanModeAccess, RegisteredTool, ToolInvocation, ToolRegistry, TrustedToolSource,
+};
 use crate::tools::{
     DOOM_LOOP_GUIDANCE, LocalToolEntry, READ_ONLY_TOOL_RESTRICTED, TOOL_SEARCH_TOOL_NAME,
-    ToolContext, ToolEffect,
+    ToolContext, ToolEffect, ToolSource,
 };
 use crate::workspace_baseline::BaselineOutcome;
 use crate::{AgentError, AgentEvent, LuaToolProvenance, ToolDoneEvent, ToolOutput, ToolStartEvent};
@@ -676,7 +678,7 @@ async fn run_inner(
             && let Err(e) = enforce_permission(
                 invocation.as_ref(),
                 prepared_intent.as_ref(),
-                &entry.source,
+                entry,
                 name,
                 input,
                 ctx,
@@ -1022,7 +1024,7 @@ async fn ensure_revert_point(ctx: &ToolContext, effect: ToolEffect) -> Result<()
 async fn enforce_permission(
     inv: &dyn ToolInvocation,
     prepared_intent: Option<&crate::tools::PermissionIntent>,
-    source: &crate::tools::ToolSource,
+    entry: &RegisteredTool,
     name: &str,
     input: &Value,
     ctx: &ToolContext,
@@ -1035,58 +1037,25 @@ async fn enforce_permission(
     }
     let input = inv.permission_input().unwrap_or(input);
     let tool_key = ToolKey::native(name);
-    let identity = match source {
-        crate::tools::ToolSource::Native {
-            owner, contract, ..
-        } => Some((
-            if prepared_intent.is_some_and(|intent| {
-                intent.authority == crate::permissions::PermissionAuthorityProfile::RemoteResource
-            }) {
-                let workspace = ctx.workspace_session.as_ref().ok_or_else(|| {
-                    "remote permission intent has no workspace identity".to_owned()
-                })?;
-                crate::permissions::PermissionSubject::RemoteNative {
-                    identity: crate::permissions::RemotePermissionIdentity::from_binding(
-                        workspace.binding(),
-                    ),
-                    owner: owner.to_string(),
-                    contract: contract.to_string(),
-                }
-            } else {
-                crate::permissions::PermissionSubject::Native {
-                    owner: owner.to_string(),
-                    contract: contract.to_string(),
-                }
-            },
-            crate::permissions::PermissionExecutorKind::Native,
-        )),
-        crate::tools::ToolSource::Lua {
-            plugin,
-            contract,
-            bundled: _,
-        } => Some((
-            crate::permissions::PermissionSubject::Lua {
-                plugin: plugin.to_string(),
-                tool: name.to_owned(),
-                contract: contract.to_string(),
-            },
-            crate::permissions::PermissionExecutorKind::Lua,
-        )),
-        crate::tools::ToolSource::RemoteWorkcell { identity, contract } => Some((
-            crate::permissions::PermissionSubject::RemoteWorkcell {
-                identity: identity.as_ref().clone(),
-                tool: name.to_owned(),
-                contract: contract.to_string(),
-            },
-            crate::permissions::PermissionExecutorKind::RemoteWorkcell,
-        )),
-        crate::tools::ToolSource::Mcp { .. } => None,
+    let remote = if matches!(entry.source, ToolSource::Native { .. })
+        && prepared_intent
+            .is_some_and(|intent| intent.authority == PermissionAuthorityProfile::RemoteResource)
+    {
+        let workspace = ctx
+            .workspace_session
+            .as_ref()
+            .ok_or_else(|| "remote permission intent has no workspace identity".to_owned())?;
+        Some(RemotePermissionIdentity::from_binding(workspace.binding()))
+    } else {
+        None
     };
-    let include_builtin_allows = matches!(
-        source,
-        crate::tools::ToolSource::Native { trusted: true, .. }
-            | crate::tools::ToolSource::Lua { bundled: true, .. }
-    );
+    let source = TrustedToolSource::from_registered(entry, remote.as_ref());
+    let identity = source
+        .as_ref()
+        .map(|source| (source.subject().clone(), source.executor().clone()));
+    let include_builtin_allows = source
+        .as_ref()
+        .is_some_and(TrustedToolSource::builtin_allows);
     let computed_intent;
     let intent = match prepared_intent {
         Some(intent) => Some(intent),

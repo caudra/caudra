@@ -44,11 +44,14 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Instant;
 
+use caudra_agent::AgentMode;
+use caudra_agent::permissions::editor::{PermissionAuthorityProvider, PermissionEditError};
 use caudra_agent::permissions::pattern_recognition::{
     PatternCandidate, RecognitionStats, RecognizerLimits,
 };
+use caudra_agent::tools::ToolFilter;
 use caudra_providers::{
-    HistoryItem, HistoryProjectionError, Message, active_history_items, expand_message,
+    HistoryItem, HistoryProjectionError, Message, Model, active_history_items, expand_message,
     resolve_history_head, transcript_history_items,
 };
 use caudra_storage::StateDir;
@@ -56,6 +59,7 @@ use caudra_storage::id::CaudraId;
 use caudra_storage::sessions::{
     HistoryReadLimits, HistoryReadReport, SessionLease, SessionRelocation,
 };
+use caudra_workspace::WorkspaceSession;
 use color_eyre::Result;
 use color_eyre::eyre::Context;
 use flume::Receiver;
@@ -64,6 +68,25 @@ use flume::Receiver;
 const PATTERN_TEST_SAMPLE_LIMIT: usize = 64;
 
 pub type AppSession = caudra_agent::StoredSession;
+
+#[derive(Clone)]
+pub struct PermissionAuthorityBinding {
+    pub provider: Arc<dyn PermissionAuthorityProvider>,
+    pub tool_filter: ToolFilter,
+    pub available: bool,
+    pub registry_revision: u64,
+}
+
+pub type PermissionAuthorityFactory = Arc<
+    dyn Fn(
+            PathBuf,
+            AgentMode,
+            Model,
+            Option<WorkspaceSession>,
+        ) -> Result<PermissionAuthorityBinding, PermissionEditError>
+        + Send
+        + Sync,
+>;
 
 /// Enqueues bounded discovery, never performs it on the UI thread. Dropping the
 /// reply receiver cancels interest; replies are proposals, not permission rules.

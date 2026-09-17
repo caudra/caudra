@@ -18,17 +18,28 @@ use caudra_storage::permission_config_trust::{
     trust_project as trust_project_permission_config, trust_remote_asset,
 };
 use caudra_storage::permission_state::PermissionState;
+use caudra_storage::permission_state::mutation::PermissionOwner;
 use caudra_storage::permission_state::validate_command_templates;
 use caudra_storage::sessions::SESSIONS_DB_FILE;
 use caudra_workspace::ProjectAssetTrustKey;
 use sha2::Digest;
 use sha2::Sha256;
 use std::collections::{BTreeMap, HashMap};
+use std::fs::{self, OpenOptions};
+use std::io::Read;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::MutexGuard;
-use std::sync::{Arc, Mutex, OnceLock, RwLockReadGuard, Weak};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, RwLockReadGuard, Weak};
 use thiserror::Error;
 use tracing::warn;
+
+const MAX_LOCAL_POLICY_BYTES: u64 = 4 * 1024 * 1024;
+const LOCAL_SOURCE_PATH_CHANGED: &str = "local policy source path differs from verified loading";
+const LOCAL_SOURCE_TOO_LARGE: &str = "local policy source exceeds its bound";
+const LOCAL_SOURCE_CHANGED: &str = "local policy source changed since verified loading";
+const LOCAL_SOURCE_NOT_FILE: &str = "local policy source is not a bounded file";
 
 /// Set by the shell tool on a command that only observes and can only reach
 /// inside the project. Nothing else may set it: the builtin rule below reads it
@@ -151,6 +162,8 @@ pub(super) fn builtin_structured_rules() -> Vec<PolicyRule> {
 pub struct PluginRuleStore {
     pub(super) rules: Mutex<HashMap<Arc<str>, Vec<PermissionRule>>>,
     pub(super) brokers: Mutex<Vec<Weak<PermissionBroker>>>,
+    pub(super) edit_revision: RwLock<u64>,
+    sources: Mutex<HashMap<Arc<str>, VerifiedLocalSourceLocator>>,
 }
 
 impl PluginRuleStore {
@@ -164,19 +177,43 @@ impl PluginRuleStore {
     /// An empty `rules` removes the entry, so a reload that registers
     /// nothing clears the stale rules.
     pub fn replace(&self, plugin: &str, rules: Vec<PermissionRule>) {
+        self.replace_with_source(plugin, rules, None);
+    }
+
+    pub fn replace_with_source(
+        &self,
+        plugin: &str,
+        rules: Vec<PermissionRule>,
+        source: Option<VerifiedLocalSourceLocator>,
+    ) {
+        let mut revision = self
+            .edit_revision
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
         let mut map = self.lock();
+        let mut sources = self
+            .sources
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         if rules.is_empty() {
             map.remove(plugin);
+            sources.remove(plugin);
         } else {
             map.insert(Arc::from(plugin), rules);
+            if let Some(source) = source {
+                sources.insert(Arc::from(plugin), source);
+            } else {
+                sources.remove(plugin);
+            }
         }
+        *revision += 1;
+        drop(sources);
         drop(map);
         self.notify_policy_changed();
     }
 
     pub fn remove(&self, plugin: &str) {
-        self.lock().remove(plugin);
-        self.notify_policy_changed();
+        self.replace(plugin, Vec::new());
     }
 
     pub(super) fn observe(&self, broker: &Arc<PermissionBroker>) {
@@ -210,10 +247,41 @@ impl PluginRuleStore {
     pub fn snapshot(&self) -> Vec<PermissionRule> {
         self.lock().values().flatten().cloned().collect()
     }
+
+    fn source_snapshot(&self) -> Vec<ActivePolicyRule> {
+        let _revision = self
+            .edit_revision
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
+        let rules = self.lock();
+        let sources = self
+            .sources
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        rules
+            .iter()
+            .flat_map(|(plugin, rules)| {
+                let source = sources.get(plugin).cloned();
+                rules.iter().cloned().map(move |rule| ActivePolicyRule {
+                    source: if source
+                        .as_ref()
+                        .is_some_and(VerifiedLocalSourceLocator::is_plugin_entrypoint)
+                    {
+                        "plugin entrypoint"
+                    } else {
+                        "trusted plugin"
+                    },
+                    rule,
+                    verified_local_source_locator: source.clone(),
+                })
+            })
+            .collect()
+    }
 }
 
 #[derive(Clone)]
 pub(super) struct ConfiguredPolicy {
+    pub(super) verified_sources: Vec<(PermissionRule, VerifiedLocalSourceLocator)>,
     pub(super) rules: Vec<PermissionRule>,
     pub(super) project_allow_rules: Vec<PermissionRule>,
     pub(super) project_config_digest: Option<String>,
@@ -264,6 +332,105 @@ pub(super) struct SharedPermissionState {
 pub struct ActivePolicyRule {
     pub source: &'static str,
     pub rule: PermissionRule,
+    pub verified_local_source_locator: Option<VerifiedLocalSourceLocator>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedLocalSourceLocator {
+    path: PathBuf,
+    content_digest: String,
+    plugin_entrypoint: bool,
+}
+
+impl VerifiedLocalSourceLocator {
+    pub fn from_loaded_file(
+        path: &Path,
+        content_digest: &str,
+    ) -> Result<Self, PermissionPolicyError> {
+        if !path.is_absolute() {
+            return Err(PermissionPolicyError(
+                "local policy source must be absolute".into(),
+            ));
+        }
+        let canonical =
+            fs::canonicalize(path).map_err(|error| PermissionPolicyError(error.to_string()))?;
+        if canonical.as_os_str() != path.as_os_str() {
+            return Err(PermissionPolicyError(LOCAL_SOURCE_PATH_CHANGED.into()));
+        }
+        let source = Self {
+            path: canonical,
+            content_digest: content_digest.into(),
+            plugin_entrypoint: false,
+        };
+        source.verify_current()?;
+        Ok(source)
+    }
+
+    pub fn from_loaded_entrypoint(
+        path: &Path,
+        bytes: &[u8],
+    ) -> Result<Self, PermissionPolicyError> {
+        if bytes.len() as u64 > MAX_LOCAL_POLICY_BYTES {
+            return Err(PermissionPolicyError(LOCAL_SOURCE_TOO_LARGE.into()));
+        }
+        let mut source = Self::from_loaded_file(path, &hex_encode(&Sha256::digest(bytes)))?;
+        source.plugin_entrypoint = true;
+        Ok(source)
+    }
+
+    pub fn is_plugin_entrypoint(&self) -> bool {
+        self.plugin_entrypoint
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+    pub fn content_digest(&self) -> &str {
+        &self.content_digest
+    }
+
+    pub fn verify_loaded_bytes(
+        &self,
+        path: &Path,
+        bytes: &[u8],
+    ) -> Result<(), PermissionPolicyError> {
+        if path.as_os_str() != self.path.as_os_str() {
+            return Err(PermissionPolicyError(LOCAL_SOURCE_PATH_CHANGED.into()));
+        }
+        if bytes.len() as u64 > MAX_LOCAL_POLICY_BYTES {
+            return Err(PermissionPolicyError(LOCAL_SOURCE_TOO_LARGE.into()));
+        }
+        if hex_encode(&Sha256::digest(bytes)) != self.content_digest {
+            return Err(PermissionPolicyError(LOCAL_SOURCE_CHANGED.into()));
+        }
+        Ok(())
+    }
+
+    pub fn verify_current(&self) -> Result<(), PermissionPolicyError> {
+        let canonical = fs::canonicalize(&self.path)
+            .map_err(|error| PermissionPolicyError(error.to_string()))?;
+        if canonical.as_os_str() != self.path.as_os_str() {
+            return Err(PermissionPolicyError(LOCAL_SOURCE_PATH_CHANGED.into()));
+        }
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        let file = options
+            .open(&self.path)
+            .map_err(|error| PermissionPolicyError(error.to_string()))?;
+        let metadata = file
+            .metadata()
+            .map_err(|error| PermissionPolicyError(error.to_string()))?;
+        if !metadata.is_file() || metadata.len() > MAX_LOCAL_POLICY_BYTES {
+            return Err(PermissionPolicyError(LOCAL_SOURCE_NOT_FILE.into()));
+        }
+        let mut bytes = Vec::new();
+        file.take(MAX_LOCAL_POLICY_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| PermissionPolicyError(error.to_string()))?;
+        self.verify_loaded_bytes(&canonical, &bytes)
+    }
 }
 
 #[derive(Debug, Error)]
@@ -383,7 +550,24 @@ pub(super) fn configured_policy(
         &config.project_allow_rules,
         &config.project_restrictive_rules,
     );
+    let verified_sources = config
+        .loaded_sources
+        .iter()
+        .filter_map(|source| {
+            match VerifiedLocalSourceLocator::from_loaded_file(
+                source.path(),
+                source.content_digest(),
+            ) {
+                Ok(locator) => Some((source.rule().clone(), locator)),
+                Err(error) => {
+                    warn!(error = %error, "loaded permission source is not currently navigable");
+                    None
+                }
+            }
+        })
+        .collect();
     ConfiguredPolicy {
+        verified_sources,
         rules: config.rules,
         project_allow_rules: config.project_allow_rules,
         project_config_digest,
@@ -946,29 +1130,71 @@ impl PermissionManager {
     /// The policy the picker shows but cannot revoke: `permissions.toml`, the
     /// builtin project allows, and rules registered by trusted plugins.
     pub fn active_policy(&self) -> Vec<ActivePolicyRule> {
+        let _context = self
+            .context_revision
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
         let builtin_rules = self.project().builtin_rules.clone();
+        let configured = self.configured().clone();
+        let sources = configured.verified_sources;
         let mut entries: Vec<_> = self
             .active_config_rules()
             .into_iter()
             .map(|rule| ActivePolicyRule {
                 source: "configuration",
+                verified_local_source_locator: sources
+                    .iter()
+                    .filter(|(loaded, _)| {
+                        loaded == &rule
+                            && !configured.remote_allow_rules.contains(&rule)
+                            && !configured.remote_restrictive_rules.contains(&rule)
+                    })
+                    .map(|(_, source)| source)
+                    .try_fold(None, |previous, source| match previous {
+                        Some(previous) if previous != source => Err(()),
+                        _ => Ok(Some(source)),
+                    })
+                    .ok()
+                    .flatten()
+                    .cloned(),
                 rule,
             })
             .collect();
         entries.extend(builtin_rules.iter().cloned().map(|rule| ActivePolicyRule {
             source: "builtin",
             rule,
+            verified_local_source_locator: None,
         }));
-        entries.extend(
-            self.plugin_rules
-                .snapshot()
-                .into_iter()
-                .map(|rule| ActivePolicyRule {
-                    source: "trusted plugin",
-                    rule,
-                }),
-        );
+        entries.extend(self.plugin_rules.source_snapshot());
         entries
+    }
+
+    pub fn set_verified_configuration_sources(
+        &self,
+        sources: Vec<(PermissionRule, VerifiedLocalSourceLocator)>,
+    ) -> Result<(), PermissionPolicyError> {
+        let mut context = self
+            .context_revision
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        for (_, source) in &sources {
+            source.verify_current()?;
+        }
+        let mut configured = self
+            .configured
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        if sources.iter().any(|(rule, _)| {
+            !configured.rules.contains(rule) && !configured.project_allow_rules.contains(rule)
+        }) {
+            return Err(PermissionPolicyError(
+                "source locator does not identify current local configuration policy".into(),
+            ));
+        }
+        configured.verified_sources = sources;
+        *context += 1;
+        self.notify_policy_changed("");
+        Ok(())
     }
 
     /// The configured, builtin, and plugin policy compiled against this
@@ -1029,22 +1255,13 @@ impl PermissionManager {
     pub(super) fn applicable_structured_rules(
         &self,
     ) -> Result<Vec<PolicyRule>, PermissionPolicyError> {
-        self.ensure_conversation_policy_valid()?;
         let mut rules = builtin_structured_rules();
         rules.extend(
-            self.structured_conversation_rules()
-                .iter()
-                .filter(|record| record.is_active())
-                .map(|record| PolicyRule {
-                    origin: RuleOrigin::Conversation,
-                    rule: record.rule.clone(),
-                }),
-        );
-        rules.extend(
-            self.persistent_records()?
+            self.stored_permission_records()?
                 .into_iter()
                 .map(|record| PolicyRule {
                     origin: match record.rule.lifetime {
+                        PermissionLifetime::Conversation => RuleOrigin::Conversation,
                         PermissionLifetime::Global => RuleOrigin::Global,
                         _ => RuleOrigin::Project,
                     },
@@ -1054,16 +1271,31 @@ impl PermissionManager {
         Ok(rules)
     }
 
-    pub(super) fn persistent_records(
+    pub(super) fn stored_permission_records(
         &self,
     ) -> Result<Vec<PermissionRuleRecord>, PermissionPolicyError> {
+        let snapshots = self
+            .durable_permission_snapshots()
+            .map_err(|error| PermissionPolicyError(error.to_string()))?;
+        let mut records = if let Some(snapshot) = snapshots
+            .iter()
+            .find(|snapshot| matches!(snapshot.revision.owner, PermissionOwner::Conversation(_)))
+        {
+            self.publish_conversation_snapshot(snapshot.clone())
+                .map_err(|error| PermissionPolicyError(error.to_string()))?;
+            snapshot.records.clone()
+        } else {
+            self.structured_conversation_rules().clone()
+        };
+        self.ensure_conversation_policy_valid()?;
+        records.retain(PermissionRuleRecord::is_active);
         let project_context = self.project();
-        let Some(policy) = &self.policy else {
+        if self.policy.is_none() {
             if let Some(error) = &project_context.policy_context_error {
                 return Err(PermissionPolicyError(error.clone()));
             }
-            return Ok(Vec::new());
-        };
+            return Ok(records);
+        }
         let project = project_context.canonical_project.clone().ok_or_else(|| {
             PermissionPolicyError(
                 project_context
@@ -1073,25 +1305,27 @@ impl PermissionManager {
             )
         })?;
         drop(project_context);
-        let mut policy = policy.policy.lock().unwrap_or_else(|error| {
-            warn!("permission policy mutex was poisoned, recovering");
-            error.into_inner()
-        });
-        policy
-            .state()?
-            .records()
-            .iter()
-            .filter(|record| {
-                record.is_active()
-                    && match record.rule.lifetime {
-                        PermissionLifetime::Global => record.project.is_none(),
-                        PermissionLifetime::Project => record.project.as_ref() == Some(&project),
-                        PermissionLifetime::Once | PermissionLifetime::Conversation => false,
-                    }
-            })
+        records.extend(
+            snapshots
+                .into_iter()
+                .filter(|snapshot| snapshot.revision.owner == PermissionOwner::Persistent)
+                .flat_map(|snapshot| snapshot.records)
+                .filter(|record| {
+                    record.is_active()
+                        && match record.rule.lifetime {
+                            PermissionLifetime::Global => record.project.is_none(),
+                            PermissionLifetime::Project => {
+                                record.project.as_ref() == Some(&project)
+                            }
+                            PermissionLifetime::Once | PermissionLifetime::Conversation => false,
+                        }
+                }),
+        );
+        records
+            .into_iter()
             .map(|record| {
                 validate_compiled_templates(&record.rule)?;
-                Ok(record.clone())
+                Ok(record)
             })
             .collect()
     }
@@ -1154,10 +1388,20 @@ pub(super) fn is_bound_shell_request(request: &PermissionRequest) -> bool {
 mod tests {
 
     use std::collections::BTreeMap;
+    use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
 
     use caudra_storage::sessions::SessionDatabase;
     use caudra_workspace::{AuthorityIdentity, ProjectIdentity, ProjectKey, SourceTrustAnchor};
+    use sha2::{Digest, Sha256};
+    use tempfile::TempDir;
     use test_case::test_case;
+
+    use super::{
+        LOCAL_SOURCE_CHANGED, LOCAL_SOURCE_NOT_FILE, LOCAL_SOURCE_PATH_CHANGED,
+        LOCAL_SOURCE_TOO_LARGE, MAX_LOCAL_POLICY_BYTES, VerifiedLocalSourceLocator,
+    };
 
     use crate::AgentEvent;
     use crate::permissions::tests::{
@@ -1174,14 +1418,158 @@ mod tests {
         PermissionAnswer, PermissionExecutorKind, PermissionLifetime, PermissionManager,
         PermissionRequest, PermissionResource, PermissionResourceAccess, PermissionResourceKind,
         PermissionRisk, PermissionRuleRecord, PermissionSubject, PluginRuleStore, RuleOrigin,
-        StructuredPermissionDecision, StructuredPermissionEffect,
+        StructuredPermissionDecision, StructuredPermissionEffect, hex_encode,
         permission_rule_intersects_request,
     };
     use caudra_config::{DefaultEffect, Effect, PermissionRule, PermissionsConfig, ToolKey};
     use caudra_storage::StateDir;
     use std::collections::HashMap;
-    use std::path::{Path, PathBuf};
+    use std::path::{MAIN_SEPARATOR_STR, Path, PathBuf};
     use std::sync::Arc;
+
+    const LOCAL_SOURCE_FILE: &str = "permissions.toml";
+    const LOCAL_SOURCE_DIR: &str = "loaded";
+    const LOCAL_SOURCE_BYTES: &[u8] = b"[shell]\ndeny = ['git push *']\n";
+    const REPLACEMENT_SOURCE_BYTES: &[u8] = b"[shell]\nallow = ['*']\n";
+
+    fn local_source() -> (TempDir, VerifiedLocalSourceLocator) {
+        let directory = TempDir::new().unwrap();
+        let parent = directory
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join(LOCAL_SOURCE_DIR);
+        fs::create_dir(&parent).unwrap();
+        let path = parent.join(LOCAL_SOURCE_FILE);
+        fs::write(&path, LOCAL_SOURCE_BYTES).unwrap();
+        let locator = VerifiedLocalSourceLocator::from_loaded_file(
+            &path,
+            &hex_encode(&Sha256::digest(LOCAL_SOURCE_BYTES)),
+        )
+        .unwrap();
+        (directory, locator)
+    }
+
+    #[test_case(b""; "empty_buffer")]
+    #[test_case(REPLACEMENT_SOURCE_BYTES; "different_policy")]
+    fn supplied_source_bytes_are_checked_even_when_disk_still_matches(bytes: &[u8]) {
+        let (_directory, locator) = local_source();
+        locator.verify_current().unwrap();
+        assert_eq!(
+            locator
+                .verify_loaded_bytes(locator.path(), bytes)
+                .unwrap_err()
+                .0,
+            LOCAL_SOURCE_CHANGED,
+        );
+    }
+
+    #[test_case(false; "disk_changed")]
+    #[test_case(true; "disk_deleted")]
+    fn supplied_source_verification_does_not_reopen_the_file(deleted: bool) {
+        let (_directory, locator) = local_source();
+        if deleted {
+            fs::remove_file(locator.path()).unwrap();
+        } else {
+            fs::write(locator.path(), REPLACEMENT_SOURCE_BYTES).unwrap();
+        }
+        locator
+            .verify_loaded_bytes(locator.path(), LOCAL_SOURCE_BYTES)
+            .unwrap();
+        assert!(locator.verify_current().is_err());
+    }
+
+    #[test_case("other.toml", true; "different_file")]
+    #[test_case("./permissions.toml", true; "dot_alias")]
+    #[test_case("nested/../permissions.toml", true; "parent_alias")]
+    #[test_case("permissions.toml", false; "relative_path")]
+    fn supplied_source_path_must_identify_the_verified_origin(suffix: &str, absolute: bool) {
+        let (_directory, locator) = local_source();
+        let path = if absolute {
+            let mut raw_path = locator.path().parent().unwrap().as_os_str().to_os_string();
+            raw_path.push(MAIN_SEPARATOR_STR);
+            raw_path.push(suffix);
+            PathBuf::from(raw_path)
+        } else {
+            PathBuf::from(suffix)
+        };
+        assert_eq!(
+            locator
+                .verify_loaded_bytes(&path, LOCAL_SOURCE_BYTES)
+                .unwrap_err()
+                .0,
+            LOCAL_SOURCE_PATH_CHANGED,
+        );
+    }
+
+    #[test_case(false; "at_bound")]
+    #[test_case(true; "over_bound_even_with_matching_digest")]
+    fn supplied_source_bound_precedes_digest_acceptance(oversized: bool) {
+        let bytes = vec![b'x'; MAX_LOCAL_POLICY_BYTES as usize + usize::from(oversized)];
+        let (_directory, mut locator) = local_source();
+        locator.content_digest = hex_encode(&Sha256::digest(&bytes));
+        let result = locator.verify_loaded_bytes(locator.path(), &bytes);
+        if oversized {
+            assert_eq!(result.unwrap_err().0, LOCAL_SOURCE_TOO_LARGE);
+        } else {
+            result.unwrap();
+        }
+    }
+
+    #[test_case(false; "directory_replacement")]
+    #[test_case(true; "oversized_replacement")]
+    fn current_source_must_remain_a_bounded_regular_file(oversized: bool) {
+        let (_directory, locator) = local_source();
+        if oversized {
+            fs::write(
+                locator.path(),
+                vec![b'x'; MAX_LOCAL_POLICY_BYTES as usize + 1],
+            )
+            .unwrap();
+        } else {
+            fs::remove_file(locator.path()).unwrap();
+            fs::create_dir(locator.path()).unwrap();
+        }
+        let error = locator.verify_current().unwrap_err();
+        if oversized {
+            assert_eq!(error.0, LOCAL_SOURCE_NOT_FILE);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test_case(false; "file_symlink")]
+    #[test_case(true; "parent_symlink")]
+    fn source_provenance_cannot_retarget_identical_bytes(parent: bool) {
+        let (directory, locator) = local_source();
+        let replacement = directory.path().canonicalize().unwrap().join("replacement");
+        fs::create_dir(&replacement).unwrap();
+        fs::write(replacement.join(LOCAL_SOURCE_FILE), LOCAL_SOURCE_BYTES).unwrap();
+        if parent {
+            fs::remove_file(locator.path()).unwrap();
+            fs::remove_dir(locator.path().parent().unwrap()).unwrap();
+            symlink(&replacement, locator.path().parent().unwrap()).unwrap();
+        } else {
+            fs::remove_file(locator.path()).unwrap();
+            symlink(replacement.join(LOCAL_SOURCE_FILE), locator.path()).unwrap();
+        }
+        assert_eq!(
+            locator.verify_current().unwrap_err().0,
+            LOCAL_SOURCE_PATH_CHANGED
+        );
+        assert_eq!(
+            VerifiedLocalSourceLocator::from_loaded_file(locator.path(), locator.content_digest())
+                .unwrap_err()
+                .0,
+            LOCAL_SOURCE_PATH_CHANGED
+        );
+        assert_eq!(
+            VerifiedLocalSourceLocator::from_loaded_entrypoint(locator.path(), LOCAL_SOURCE_BYTES)
+                .unwrap_err()
+                .0,
+            LOCAL_SOURCE_PATH_CHANGED
+        );
+    }
+
     #[test]
     fn shell_config_uses_specificity_and_ask_wins_ties() {
         let manager = mgr_with(

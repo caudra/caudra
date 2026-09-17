@@ -28,6 +28,7 @@ pub use fs::backend::{
     WatchHandle, WatchResult, WatchUpdate, WorkbenchBackend, WorkbenchFilesystem, WorkbenchPath,
     WorkspaceFilesystem,
 };
+pub use fs::read::LocalSourceError;
 pub use pointer::Clicks;
 pub use style::WorkbenchStyles;
 use unicode_width::UnicodeWidthStr;
@@ -540,6 +541,29 @@ impl Workbench {
 
     pub fn is_open(&self) -> bool {
         self.open
+    }
+
+    pub fn open_local_source<Identity: ?Sized>(
+        styles: WorkbenchStyles,
+        path: &Path,
+        lines: Option<RangeInclusive<usize>>,
+        expected: &Identity,
+        verify: impl FnOnce(&Path, &[u8], &Identity) -> Result<(), String>,
+    ) -> Result<Self, LocalSourceError> {
+        let root = path
+            .parent()
+            .ok_or_else(|| LocalSourceError::InvalidPath(path.to_path_buf()))?;
+        let (loaded, source) =
+            fs::read::load_local_source(path, |bytes| verify(path, bytes, expected))?;
+        let mut workbench = Self::new(styles);
+        workbench.editor.push(Tab::from_local_source(
+            path,
+            loaded,
+            source,
+            workbench.theme_generation,
+        ));
+        workbench.open_at(root, path, lines);
+        Ok(workbench)
     }
 
     pub fn close(&mut self) {
@@ -3849,10 +3873,10 @@ fn layout_sections(
 mod tests {
     use super::{
         Ask, Choice, Confirm, Cursor, DEFAULT_SIDEBAR_WIDTH, DISCARD_LABEL, Drag,
-        EDGE_SCROLL_LINES, Focus, Input, InputKind, Layout, MAX_SIDEBAR_WIDTH, MIN_EDITOR_WIDTH,
-        MIN_SECTION_ROWS, MIN_SIDEBAR_WIDTH, MenuAction, NEW_FILE_PROMPT, SCROLL_COLUMNS,
-        SCROLL_LINES, ScmLayout, Section, SidebarView, Target, Toggle, Workbench, WorkbenchAction,
-        WorkbenchPath, WorkbenchStyles, keys, layout, layout_sections, scm,
+        EDGE_SCROLL_LINES, Focus, Input, InputKind, Layout, LocalSourceError, MAX_SIDEBAR_WIDTH,
+        MIN_EDITOR_WIDTH, MIN_SECTION_ROWS, MIN_SIDEBAR_WIDTH, MenuAction, NEW_FILE_PROMPT,
+        SCROLL_COLUMNS, SCROLL_LINES, ScmLayout, Section, SidebarView, Target, Toggle, Workbench,
+        WorkbenchAction, WorkbenchPath, WorkbenchStyles, keys, layout, layout_sections, scm,
     };
     use crate::chrome::ELLIPSIS;
     use crate::editor::{VisualRow, render};
@@ -3865,6 +3889,8 @@ mod tests {
         OPEN_MARK, REVERT_MARK, STAGE_MARK, TabHit, TabPart, UNSTAGE_MARK, button_at, confirm_at,
         header_at, on_menu_mark, tab_at, toggle_at, visible_range,
     };
+    #[cfg(unix)]
+    use caudra_workspace::WorkspacePath;
     use crossterm::event::{
         KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     };
@@ -3877,6 +3903,8 @@ mod tests {
     use std::collections::BTreeMap;
     use std::fs;
     use std::ops::RangeInclusive;
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
     use tempfile::TempDir;
@@ -3887,6 +3915,13 @@ mod tests {
     const WORKSPACE_CHANGE_BLOCKED: &str = "an idle clean workbench must allow workspace changes";
     const WORKSPACE_CHANGE_UNGUARDED: &str =
         "unsaved buffers and outstanding operations must block workspace changes";
+    const LOCAL_SOURCE_FILE: &str = "policy @scope [1].lua";
+    const LOCAL_SOURCE_CONTENT: &str = "one\r\ntwo\r\nthree\r\n";
+    #[cfg(unix)]
+    const LOCAL_SOURCE_CHANGED: &str = "source identity or fingerprint changed";
+    #[cfg(unix)]
+    const LOCAL_SOURCE_ISOLATED: &str =
+        "opening a local source must not alter the previous workbench or its pending operations";
     const NARROW_DROPS_SIDEBAR: &str =
         "a terminal too narrow for both panes must keep the editor, not split into unusable strips";
     const STATUS_RESERVED: &str = "the status row must always be carved";
@@ -4280,6 +4315,193 @@ mod tests {
         assert!(
             !workbench.blocks_workspace_change(),
             "{WORKSPACE_CHANGE_BLOCKED}"
+        );
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn local_source_refuses_an_unanchored_platform() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().canonicalize().unwrap().join(LOCAL_SOURCE_FILE);
+        fs::write(&path, LOCAL_SOURCE_CONTENT).unwrap();
+        let result = Workbench::open_local_source(
+            WorkbenchStyles::default(),
+            &path,
+            None,
+            LOCAL_SOURCE_CONTENT,
+            |_, _, _| unreachable!(),
+        );
+        assert!(matches!(result, Err(LocalSourceError::Unsupported)));
+    }
+
+    #[cfg(unix)]
+    #[test_case(None, (0, 0), None ; "whole_source")]
+    #[test_case(Some(2..=2), (1, 0), None ; "source_line")]
+    #[test_case(Some(1..=3), (2, 0), Some((0, 0)) ; "source_range")]
+    fn local_source_keeps_the_literal_path_and_verified_bytes(
+        lines: Option<RangeInclusive<usize>>,
+        cursor: (usize, usize),
+        anchor: Option<(usize, usize)>,
+    ) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().canonicalize().unwrap().join(LOCAL_SOURCE_FILE);
+        fs::write(&path, LOCAL_SOURCE_CONTENT).unwrap();
+        let expected = (path.clone(), LOCAL_SOURCE_CONTENT);
+        let workbench = Workbench::open_local_source(
+            WorkbenchStyles::default(),
+            &path,
+            lines,
+            &expected,
+            |path, bytes, expected| {
+                assert_eq!(path, expected.0);
+                assert_eq!(bytes, expected.1.as_bytes());
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        let tab = workbench.editor.active().expect(NO_TAB);
+        assert!(workbench.is_open());
+        assert!(workbench.remote_backend.is_none());
+        assert!(workbench.remote_scm.is_none());
+        assert_eq!(tab.path, WorkbenchPath::Local(path));
+        assert_eq!(tab.contents(), LOCAL_SOURCE_CONTENT);
+        assert_eq!((tab.buffer.cursor().line, tab.buffer.cursor().col), cursor);
+        assert_eq!(
+            tab.buffer
+                .selection()
+                .map(|(from, _)| (from.line, from.col)),
+            anchor
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn changed_local_source_identity_does_not_create_a_workbench() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().canonicalize().unwrap().join(LOCAL_SOURCE_FILE);
+        fs::write(&path, LOCAL_SOURCE_CHANGED).unwrap();
+        let result = Workbench::open_local_source(
+            WorkbenchStyles::default(),
+            &path,
+            None,
+            LOCAL_SOURCE_CONTENT,
+            |_, bytes, expected| {
+                if bytes == expected.as_bytes() {
+                    Ok(())
+                } else {
+                    Err(LOCAL_SOURCE_CHANGED.to_owned())
+                }
+            },
+        );
+        assert!(
+            matches!(result, Err(LocalSourceError::Verification(message)) if message == LOCAL_SOURCE_CHANGED)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_source_changed_during_host_verification_is_refused() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().canonicalize().unwrap().join(LOCAL_SOURCE_FILE);
+        fs::write(&path, LOCAL_SOURCE_CONTENT).unwrap();
+        let result = Workbench::open_local_source(
+            WorkbenchStyles::default(),
+            &path,
+            None,
+            LOCAL_SOURCE_CONTENT,
+            |path, bytes, expected| {
+                assert_eq!(bytes, expected.as_bytes());
+                fs::write(path, LOCAL_SOURCE_CHANGED).unwrap();
+                Ok(())
+            },
+        );
+        assert!(matches!(result, Err(LocalSourceError::Changed(_))));
+    }
+
+    #[cfg(unix)]
+    #[test_case(false ; "ordinary_save")]
+    #[test_case(true ; "sibling_symlink_attack")]
+    fn separate_local_source_preserves_a_dirty_remote_tab_and_pending_operation(attack: bool) {
+        const REMOTE_FILE: &str = "same-name.txt";
+
+        let (session, control) = crate::fs::backend::tests::widget_fixture();
+        let mut remote = Workbench::new(WorkbenchStyles::default());
+        remote.toggle_workspace(session).unwrap();
+        settle_remote(&mut remote, |workbench| !workbench.is_busy());
+        remote.open_remote_at(WorkspacePath::new(REMOTE_FILE).unwrap(), None);
+        settle_remote(&mut remote, |workbench| !workbench.is_busy());
+        remote.editor_key(key(KeyCode::Char(EDIT)));
+        let tab = remote.editor.active().expect(NO_TAB);
+        let contents = tab.contents();
+        let path = tab.path.clone();
+        let resource = tab.resource.clone();
+        let cursor = tab.buffer.cursor();
+        let saved_remote = control.contents(REMOTE_FILE);
+        remote.commit_remote_input(Input {
+            kind: InputKind::NewFile,
+            at: remote.backend_root(),
+            value: MADE_NAME.to_owned(),
+        });
+        let pending = remote.remote_pending.clone();
+        let pending_create = remote.pending_create.clone();
+        assert!(!pending.is_empty());
+        assert!(!pending_create.is_empty());
+
+        let dir = TempDir::new().unwrap();
+        let local_path = dir.path().canonicalize().unwrap().join(REMOTE_FILE);
+        fs::write(&local_path, LOCAL_SOURCE_CONTENT).unwrap();
+        let sentinel = dir.path().join("sentinel.txt");
+        fs::write(&sentinel, LOCAL_SOURCE_CHANGED).unwrap();
+        if attack {
+            symlink(
+                &sentinel,
+                local_path.with_file_name(format!(".{REMOTE_FILE}.caudra-tmp")),
+            )
+            .unwrap();
+        }
+        let mut local = Workbench::open_local_source(
+            WorkbenchStyles::default(),
+            &local_path,
+            None,
+            LOCAL_SOURCE_CONTENT,
+            |_, bytes, expected| {
+                assert_eq!(bytes, expected.as_bytes());
+                Ok(())
+            },
+        )
+        .unwrap();
+        local.editor_key(key(KeyCode::Char(EDIT)));
+        let local_contents = local.editor.active().expect(NO_TAB).contents();
+        assert!(local.save_active());
+        local.close();
+
+        let tab = remote.editor.active().expect(NO_TAB);
+        assert!(remote.is_open(), "{LOCAL_SOURCE_ISOLATED}");
+        assert!(remote.remote_backend.is_some(), "{LOCAL_SOURCE_ISOLATED}");
+        assert!(tab.is_dirty(), "{LOCAL_SOURCE_ISOLATED}");
+        assert_eq!(tab.contents(), contents, "{LOCAL_SOURCE_ISOLATED}");
+        assert_eq!(tab.path, path, "{LOCAL_SOURCE_ISOLATED}");
+        assert_eq!(tab.resource, resource, "{LOCAL_SOURCE_ISOLATED}");
+        assert_eq!(tab.buffer.cursor(), cursor, "{LOCAL_SOURCE_ISOLATED}");
+        assert_eq!(remote.remote_pending, pending, "{LOCAL_SOURCE_ISOLATED}");
+        assert_eq!(
+            remote.pending_create, pending_create,
+            "{LOCAL_SOURCE_ISOLATED}"
+        );
+        assert_eq!(control.contents(REMOTE_FILE), saved_remote);
+        assert_eq!(fs::read_to_string(local_path).unwrap(), local_contents);
+        assert_eq!(fs::read_to_string(sentinel).unwrap(), LOCAL_SOURCE_CHANGED);
+        settle_remote(&mut remote, |workbench| !workbench.is_busy());
+        assert_eq!(control.contents(MADE_NAME), "");
+        assert!(
+            remote
+                .editor
+                .tabs()
+                .iter()
+                .find(|tab| tab.path == path)
+                .expect(NO_TAB)
+                .is_dirty()
         );
     }
 

@@ -279,7 +279,7 @@ fn review_words(value: &str) -> Vec<(usize, usize, bool)> {
     words
 }
 
-pub(super) fn sensitive_text(value: &str) -> bool {
+pub(crate) fn sensitive_text(value: &str) -> bool {
     let redacted = redact_text(value);
     redacted.contains(REDACTED)
         || redacted.contains(INCOMPLETE_REDACTION)
@@ -396,7 +396,7 @@ fn detail_fields(path: &str, value: &Value, lines: &mut Vec<Line<'static>>, rema
     }
 }
 
-pub(super) fn likely_secret_key(key: &str) -> bool {
+pub(crate) fn likely_secret_key(key: &str) -> bool {
     let normalized: String = key
         .chars()
         .filter(|character| character.is_ascii_alphanumeric())

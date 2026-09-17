@@ -38,6 +38,7 @@ pub use database::{
     SessionDatabase, SessionRecreation, SessionStorageStats, TrimReport, UsageBucket,
     WAL_RETENTION_LIMIT_BYTES,
 };
+pub(crate) use database::{from_i64, to_i64};
 pub use lease::SessionLease;
 
 const SESSION_VERSION: u32 = 1;
@@ -302,6 +303,8 @@ pub struct SessionMeta {
     pub plan_written: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub structured_permission_rules: Vec<PermissionRuleRecord>,
+    #[serde(skip)]
+    pub permission_generation: u64,
     #[serde(default)]
     pub context_size: u32,
     /// Completed exchanges over the session's whole life. Counted rather than

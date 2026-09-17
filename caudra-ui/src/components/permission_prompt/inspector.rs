@@ -2,31 +2,27 @@ use std::collections::BTreeSet;
 
 use caudra_agent::permissions::{
     ComposedAnswerError, PermissionRequest, PermissionResourceSelector,
-    pattern_matching::{CompiledPattern, GLOB_ARGUMENT_SEMANTICS, PatternCompileError},
+    pattern_matching::{CompiledPattern, PatternCompileError},
 };
 use caudra_storage::permission_patterns::{
     ArgumentDomain, ArgumentRole, ObservedTuple, OptionLikePolicy, PatternDefinition, PatternToken,
     PatternValidationError, SlotCombinations, SlotId,
 };
-use ratatui::style::Modifier;
 
 use super::details::review_text;
 use super::scope::{ApprovalImpact, SHELL_REACH, ScopeSummary, complete_text};
 use super::{
     FooterRow, HINT_ENTER, HINT_ESC, KEY_ALLOW_ONCE, KeyCode, KeyEvent, KeyModifiers, Line, Panel,
     PermissionAnswer, PermissionDecision, PermissionPrompt, PermissionRowGrant,
-    PermissionRuleOption, PromptBody, PromptTarget, Span, Style, TextBuffer, command_ladders,
-    hover_style,
+    PermissionRuleOption, PromptTarget, Span, TextBuffer, command_ladders,
 };
+use crate::components::permission_scope::controls::{DOMAIN_COUNT, domain_for_mode, domain_index};
+pub(super) use crate::components::permission_scope::pattern::PatternControl as InspectorControl;
+use crate::components::permission_scope::pattern::PatternPanel;
 use crate::theme::Theme;
 
 const EXCLUSIONS: &str = "Excludes extra arguments, redirects, expansions and payloads. Other commands need their own coverage.";
-const REGEX_HELP: &str = "Regex matches one entire literal argument, not a substring. It is never evaluated by the shell.";
-const ANY_HELP: &str = "Any one literal argument; not extra arguments or shell syntax. This can widen what the program does.";
-const JOINT_HELP: &str = "Only the observed tuples are allowed, even if a slot's domain is wider.";
-const INDEPENDENT_HELP: &str =
-    "New combinations are allowed; slot domains still apply independently.";
-const MATCH_UNAVAILABLE: &str = "Current-row match unavailable; policy rechecks on approval.";
+const MATCH_UNAVAILABLE: &str = "Current-row match unavailable. Change the scope or use Once.";
 const MATCHED: &str =
     "Current row matches the policy preview; the whole call is rechecked on approval.";
 const MATCH_MISMATCH: &str = "Current row does not match this scope. Change the scope or use Once.";
@@ -37,18 +33,6 @@ const UNKNOWN_ROLE_CAUTION: &str = "Unknown-role slots: values can change progra
 pub(super) struct EditedPattern {
     pub option_id: String,
     pub definition: Box<PatternDefinition>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum InspectorControl {
-    Name,
-    Slot,
-    SlotName,
-    Mode,
-    Constraint,
-    Combinations,
-    Observations,
-    ObservedValue(usize),
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -349,7 +333,7 @@ fn option_guard(policy: &OptionLikePolicy) -> &'static str {
 
 impl PatternInspector {
     fn usable(&self) -> bool {
-        self.error.is_none() && self.current_match != CurrentMatch::KnownMismatch
+        self.error.is_none() && self.current_match == CurrentMatch::Matched
     }
 
     pub(super) fn is_editing(&self) -> bool {
@@ -505,25 +489,12 @@ impl PermissionPrompt {
         let Some(slot) = inspector.draft.slots.get_mut(inspector.slot) else {
             return;
         };
-        slot.domain = match mode {
-            0 => ArgumentDomain::ObservedSet { values },
-            1 => ArgumentDomain::Exact {
-                value: inspector
-                    .current_bindings
-                    .as_ref()
-                    .and_then(|bindings| bindings.get(&slot.id))
-                    .or_else(|| values.first())
-                    .cloned()
-                    .unwrap_or_default(),
-            },
-            2 => ArgumentDomain::Glob {
-                pattern: String::new(),
-            },
-            3 => ArgumentDomain::Regex {
-                pattern: String::new(),
-            },
-            _ => ArgumentDomain::AnyLiteralArgument,
-        };
+        let exact = inspector
+            .current_bindings
+            .as_ref()
+            .and_then(|bindings| bindings.get(&slot.id))
+            .cloned();
+        slot.domain = domain_for_mode(mode, values, exact);
         inspector.show_values = false;
         self.refresh_inspector(Some(InspectorControl::Mode));
     }
@@ -553,17 +524,11 @@ impl PermissionPrompt {
         else {
             return;
         };
-        let index = match slot.domain {
-            ArgumentDomain::ObservedSet { .. } => 0,
-            ArgumentDomain::Exact { .. } => 1,
-            ArgumentDomain::Glob { .. } => 2,
-            ArgumentDomain::Regex { .. } => 3,
-            ArgumentDomain::AnyLiteralArgument => 4,
-        };
+        let index = domain_index(&slot.domain);
         self.set_domain(if forward {
-            (index + 1) % 5
+            (index + 1) % DOMAIN_COUNT
         } else {
-            (index + 4) % 5
+            (index + DOMAIN_COUNT - 1) % DOMAIN_COUNT
         });
     }
 
@@ -604,6 +569,12 @@ impl PermissionPrompt {
             return;
         }
         match control {
+            InspectorControl::SelectSlot(id) => {
+                if let Some(slot) = inspector.draft.slots.iter().position(|slot| slot.id == id) {
+                    inspector.slot = slot;
+                    inspector.show_values = false;
+                }
+            }
             InspectorControl::Slot => {
                 self.move_inspector_slot(true);
                 return;
@@ -742,6 +713,11 @@ impl PermissionPrompt {
         let Some(request) = self.current() else {
             return;
         };
+        let definition = inspector.definition(&self.buffer);
+        if pattern_preview(request, inspector.row, &inspector.option_id, &definition).is_err() {
+            self.refresh_inspector(None);
+            return;
+        }
         let ladders = command_ladders(request);
         let Some(rung) = ladders.get(inspector.row).and_then(|offered| {
             offered
@@ -753,7 +729,6 @@ impl PermissionPrompt {
         let Some(inspector) = self.inspector.take() else {
             return;
         };
-        let definition = inspector.definition(&self.buffer);
         let choice = &mut self.scopes[inspector.row];
         choice.pattern = Some(EditedPattern {
             option_id: inspector.option_id,
@@ -821,215 +796,34 @@ impl PermissionPrompt {
             None if inspector.current_match == CurrentMatch::KnownMismatch => {
                 Line::from(Span::styled(MATCH_MISMATCH, t.error))
             }
-            None => Line::from(Span::styled(
-                "Valid definition; policy rechecks the call.",
-                t.tool_dim,
-            )),
+            None if inspector.current_match == CurrentMatch::Unavailable => {
+                Line::styled(MATCH_UNAVAILABLE, t.tool_warning)
+            }
+            None => Line::from(Span::styled(MATCHED, t.tool_dim)),
         }
     }
 
-    pub(super) fn inspector_body(&self, t: &Theme) -> PromptBody {
-        let Some(inspector) = &self.inspector else {
-            return PromptBody {
-                lines: Vec::new(),
-                entries: Vec::new(),
-            };
-        };
+    pub(super) fn inspector_panel(&self) -> Option<PatternPanel> {
+        let inspector = self.inspector.as_ref()?;
         let definition = inspector.definition(&self.buffer);
-        let mut words = Vec::new();
-        for (index, (word, variable)) in template_words(&definition).into_iter().enumerate() {
-            if index > 0 {
-                words.push(Span::raw(" "));
-            }
-            words.push(Span::styled(
-                word,
-                if variable {
-                    t.status_notice.add_modifier(Modifier::UNDERLINED)
-                } else {
-                    Style::new().fg(t.foreground).add_modifier(Modifier::BOLD)
-                },
-            ));
-        }
-        let mut body = PromptBody {
-            lines: vec![
-                Line::from(Span::styled("Suggested pattern", t.panel_title)),
-                Line::from(words),
-                Line::from(Span::styled(
-                    format!(
-                        "Working directory: {}",
-                        review_text(&definition.context.effective_workdir)
-                    ),
-                    t.tool_dim,
-                )),
-            ],
-            entries: Vec::new(),
-        };
-        if let Some(caution) = unknown_role_caution(&definition) {
-            body.lines.push(Line::styled(caution, t.tool_warning));
-        }
-        if let Some(option) = self.current().and_then(|request| {
-            request
-                .options
-                .iter()
-                .find(|option| option.id == inspector.option_id)
-        }) {
-            body.lines.push(Line::from(Span::styled(
-                format!("Proposal evidence: {}", review_text(&option.description)),
-                t.tool_dim,
-            )));
-        }
-        let mut control = |target: InspectorControl, label: &str, value: String| {
-            let target = PromptTarget::Inspector(target);
-            let on = self.hover.as_ref().or(self.focus.as_ref()) == Some(&target);
-            body.entries.push((target, body.lines.len() as u16));
-            body.lines.push(Line::from(Span::styled(
-                format!("{label}: [ {value} ]"),
-                hover_style(t.status_notice, on),
-            )));
-        };
-        control(
-            InspectorControl::Name,
-            "Name (N)",
-            review_text(&definition.name),
-        );
-        if let Some(slot) = definition.slots.get(inspector.slot) {
-            control(
-                InspectorControl::Slot,
-                "Slot (Up/Down)",
-                format!(
-                    "{} of {}: {}",
-                    inspector.slot + 1,
-                    definition.slots.len(),
-                    slot_name(&definition, slot.id)
-                ),
-            );
-            control(
-                InspectorControl::SlotName,
-                "Slot name (n)",
-                review_text(&slot.label),
-            );
-            control(
-                InspectorControl::Mode,
-                "Match (Left/Right)",
-                mode_name(&slot.domain).into(),
-            );
-            control(
-                InspectorControl::Constraint,
-                "Constraint (e)",
-                domain_text(&slot.domain),
-            );
-        }
-        if matches!(
-            inspector.proposal.combinations,
-            SlotCombinations::ObservedTuples { .. }
-        ) {
-            control(
-                InspectorControl::Combinations,
-                "Combinations (c)",
-                combinations_text(&definition),
-            );
-        }
-        if !definition.slots.is_empty() {
-            control(
-                InspectorControl::Observations,
-                "Observed values (o)",
-                format!("{} supplied", inspector.observed_values().len()),
-            );
-        }
-        if let Some(slot) = definition.slots.get(inspector.slot) {
-            if inspector.show_values {
-                for (index, value) in inspector.observed_values().iter().enumerate() {
-                    if let ArgumentDomain::ObservedSet { values } = &slot.domain {
-                        control(
-                            InspectorControl::ObservedValue(index),
-                            if values.contains(value) {
-                                "Included"
-                            } else {
-                                "Excluded"
-                            },
-                            literal(value),
-                        );
-                    }
-                }
-            }
-            body.lines.push(Line::from(Span::styled(
-                option_guard(&slot.option_like),
-                t.tool_dim,
-            )));
-            if inspector.show_values && !matches!(slot.domain, ArgumentDomain::ObservedSet { .. }) {
-                body.lines.push(Line::from(Span::styled(
-                    inspector
-                        .observed_values()
-                        .iter()
-                        .map(|value| literal(value))
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    t.tool_dim,
-                )));
-            }
-            let help = match slot.domain {
-                ArgumentDomain::Glob { .. } => GLOB_ARGUMENT_SEMANTICS,
-                ArgumentDomain::Regex { .. } => REGEX_HELP,
-                ArgumentDomain::AnyLiteralArgument => ANY_HELP,
-                ArgumentDomain::Exact { .. } => "Metacharacters are literal data in Exact mode.",
-                ArgumentDomain::ObservedSet { .. } => {
-                    "Select allowed values from this immutable proposal; per-value frequencies are not supplied."
-                }
-            };
-            body.lines.push(Line::from(Span::styled(help, t.tool_dim)));
-        }
-        body.lines.push(Line::from(Span::styled(
-            if matches!(
-                definition.combinations,
-                SlotCombinations::ObservedTuples { .. }
-            ) {
-                JOINT_HELP
-            } else {
-                INDEPENDENT_HELP
-            },
-            t.tool_dim,
-        )));
-        body.lines
-            .push(Line::from(Span::styled(EXCLUSIONS, t.tool_dim)));
-        if inspector.show_values
-            && let SlotCombinations::ObservedTuples { tuples } = &inspector.proposal.combinations
-        {
-            body.lines.push(Line::from(Span::styled(
-                "Supplied joint observations:",
-                t.tool_dim,
-            )));
-            for tuple in tuples {
-                body.lines.push(Line::from(Span::styled(
-                    tuple
-                        .iter()
-                        .map(|(id, value)| {
-                            format!("{} = {}", slot_name(&definition, *id), literal(value))
-                        })
-                        .collect::<Vec<_>>()
-                        .join("; "),
-                    t.tool_dim,
-                )));
-            }
-        }
-        body.lines.push(Line::from(Span::styled(
-            "Names are display-only. This editor does not approve execution.",
-            t.tool_dim,
-        )));
-        body.lines.push(Line::from(Span::styled(
-            match inspector.current_match {
-                CurrentMatch::Matched => MATCHED,
-                CurrentMatch::KnownMismatch => MATCH_MISMATCH,
-                CurrentMatch::Unavailable => MATCH_UNAVAILABLE,
-            },
-            t.tool_dim,
-        )));
-        if let Some(error) = &inspector.error {
-            body.lines.push(Line::from(Span::styled(
-                format!("Invalid: {error}"),
-                t.error,
-            )));
-        }
-        body
+        let caution = unknown_role_caution(&definition).map(str::to_owned);
+        let evidence = self
+            .current()
+            .and_then(|request| {
+                request
+                    .options
+                    .iter()
+                    .find(|option| option.id == inspector.option_id)
+            })
+            .map_or_else(String::new, |option| review_text(&option.description));
+        Some(PatternPanel {
+            definition,
+            slot: inspector.slot,
+            supplied: inspector.observed_values(),
+            show_values: inspector.show_values,
+            caution,
+            evidence,
+        })
     }
 }
 
@@ -1078,6 +872,7 @@ pub(super) mod tests {
     const SECOND_SLOT: SlotId = SlotId(17);
     const TEMPLATE_PHRASE: &str = "REVIEW TEMPLATE";
     const EXPECTED_TEMPLATE: &str = "cargo check -p <pattern1> --tests";
+    const EXPECTED_TUPLE: &str = "\"caudra-agent\" │ \"arm\"";
     const INVALID_EXPRESSION: &str = "[";
     const EDITED_NAME: &str = "Reviewed checks";
     const DISCARDED_NAME: &str = "Discard this edit";
@@ -1405,15 +1200,8 @@ pub(super) mod tests {
         if !constraint.is_empty() {
             edit(&mut prompt, 'e', constraint);
         }
-        let t = theme::current();
-        let body = prompt.inspector_body(&t);
-        let cautions = body
-            .lines
-            .iter()
-            .filter(|line| line.to_string() == UNKNOWN_ROLE_CAUTION)
-            .collect::<Vec<_>>();
-        assert_eq!(cautions.len(), 1);
-        assert_eq!(cautions[0].style, t.tool_warning);
+        let panel = prompt.inspector_panel().unwrap();
+        assert_eq!(panel.caution.as_deref(), Some(UNKNOWN_ROLE_CAUTION));
         prompt.scroll.scroll_to(0);
         assert!(render(&mut prompt, WIDE, TALL).contains(UNKNOWN_ROLE_CAUTION));
         let selected = take_scope(&mut prompt);
@@ -1589,7 +1377,7 @@ pub(super) mod tests {
         inspect(&mut prompt);
         prompt.handle_key(key(KeyCode::Char('o')));
         let screen = render(&mut prompt, WIDE, TALL);
-        assert!(screen.contains("<pattern1> = caudra-agent; <pattern2> = arm"));
+        assert!(screen.contains(EXPECTED_TUPLE));
         prompt.activate_inspector(InspectorControl::ObservedValue(0));
         let edited = prompt
             .inspector
@@ -1602,7 +1390,7 @@ pub(super) mod tests {
         prompt.activate_inspector(InspectorControl::ObservedValue(0));
         prompt.handle_key(key(KeyCode::Char('c')));
         let screen = render(&mut prompt, WIDE, TALL);
-        assert!(screen.contains("Independent; up to 4 combinations"));
+        assert!(screen.contains("INDEPENDENT"));
         assert_eq!(
             prompt.inspector.as_ref().unwrap().draft.combinations,
             SlotCombinations::Independent
@@ -1651,10 +1439,29 @@ pub(super) mod tests {
                 value: AGENT_VALUE.into()
             }
         );
-        take_scope(&mut prompt);
         render(&mut prompt, WIDE, TALL);
-        assert!(prompt.handle_key(key(KeyCode::Char('s'))).is_none());
-        assert!(!prompt.confirmation.as_ref().unwrap().complete);
+        assert!(prompt.handle_key(key(KeyCode::Char('p'))).is_none());
+        assert!(prompt.inspector.is_some());
+        assert!(prompt.scopes[0].pattern.is_none());
+    }
+
+    #[test_case(false; "observation_no_longer_available")]
+    #[test_case(true; "scope_no_longer_offered")]
+    fn use_scope_rechecks_current_request_instead_of_cached_admission(remove_option: bool) {
+        let mut prompt = suggested_prompt();
+        inspect(&mut prompt);
+        assert!(prompt.inspector.as_ref().unwrap().usable());
+        let request = &mut prompt.requests.front_mut().unwrap().request;
+        if remove_option {
+            request.options.retain(|option| option.id != OPTION_ID);
+        } else {
+            request.resources[0]
+                .attributes
+                .remove(COMMAND_OBSERVATION_ATTRIBUTE);
+        }
+        assert!(prompt.handle_key(key(KeyCode::Char('p'))).is_none());
+        assert!(!prompt.inspector.as_ref().unwrap().usable());
+        assert!(prompt.scopes[0].pattern.is_none());
     }
 
     #[test_case(false; "joint_values")]
@@ -2000,9 +1807,10 @@ pub(super) mod tests {
         let mut prompt = PermissionPrompt::new();
         prompt.enqueue(request, None);
         inspect(&mut prompt);
-        let body = prompt.inspector_body(&theme::current());
-        let displayed = body
-            .lines
+        prompt.activate_inspector(InspectorControl::Observations);
+        let panel = prompt.inspector_panel().unwrap();
+        let displayed = panel
+            .details(&theme::current())
             .iter()
             .map(|line| line.to_string())
             .find(|line| line.starts_with(EVIDENCE_LABEL))
@@ -2017,8 +1825,9 @@ pub(super) mod tests {
         let mut prompt = suggested_prompt();
         inspect(&mut prompt);
         let body = prompt
-            .inspector_body(&theme::current())
-            .lines
+            .inspector_panel()
+            .unwrap()
+            .details(&theme::current())
             .into_iter()
             .map(|line| line.to_string())
             .collect::<Vec<_>>()

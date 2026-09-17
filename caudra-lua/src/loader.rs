@@ -6,7 +6,9 @@ use std::sync::{Arc, LazyLock};
 use std::thread;
 use std::time::Duration;
 
-use caudra_agent::permissions::{PluginRuleStore, canonical_json_sha256};
+use caudra_agent::permissions::{
+    PluginRuleStore, VerifiedLocalSourceLocator, canonical_json_sha256,
+};
 use caudra_agent::tools::ToolRegistry;
 use caudra_config::{AgentConfig, PluginsConfig, RawConfig};
 use include_dir::{Dir, include_dir};
@@ -321,14 +323,23 @@ impl PluginHost {
         if !path.is_file() {
             return Ok(());
         }
-        let source = fs::read_to_string(path).map_err(|e| PluginError::Io {
+        let source_path = fs::canonicalize(path).map_err(|e| PluginError::Io {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
+        let source = fs::read_to_string(&source_path).map_err(|e| PluginError::Io {
             path: path.to_path_buf(),
             source: e,
         })?;
         let plugin_dir = path.parent().map(Path::to_path_buf);
-        if let Some(raw) =
-            self.send_run_init_lua_with_policy(source, label.to_owned(), plugin_dir, rule_policy)?
-        {
+        let local_source = loaded_entrypoint(&source_path, &source);
+        if let Some(raw) = self.send_run_init_lua_with_policy(
+            source,
+            label.to_owned(),
+            plugin_dir,
+            rule_policy,
+            local_source,
+        )? {
             match merged {
                 Some(existing) => existing.merge(raw),
                 None => *merged = Some(raw),
@@ -425,6 +436,7 @@ impl PluginHost {
                 PluginPermissions::trusted(),
                 PermissionRulePolicy::Trusted,
                 opts,
+                None,
             )?;
         }
         Ok(())
@@ -440,6 +452,7 @@ impl PluginHost {
         permissions: PluginPermissions,
         rule_policy: PermissionRulePolicy,
         opts: PluginOpts,
+        local_source: Option<VerifiedLocalSourceLocator>,
     ) -> Result<(), PluginError> {
         let (reply_tx, reply_rx) = flume::bounded(1);
         self.inner
@@ -452,6 +465,7 @@ impl PluginHost {
                 permissions,
                 rule_policy,
                 opts,
+                local_source,
                 reply: reply_tx,
             })
             .map_err(|_| PluginError::HostDead)?;
@@ -480,6 +494,7 @@ impl PluginHost {
             source_name,
             plugin_dir,
             PermissionRulePolicy::DenyOnly,
+            None,
         )
     }
 
@@ -489,6 +504,7 @@ impl PluginHost {
         source_name: String,
         plugin_dir: Option<PathBuf>,
         rule_policy: PermissionRulePolicy,
+        local_source: Option<VerifiedLocalSourceLocator>,
     ) -> Result<Option<RawConfig>, PluginError> {
         let (reply_tx, reply_rx) = flume::bounded(1);
         self.inner
@@ -498,6 +514,7 @@ impl PluginHost {
                 source_name,
                 plugin_dir,
                 rule_policy,
+                local_source,
                 reply: reply_tx,
             })
             .map_err(|_| PluginError::HostDead)?;
@@ -535,6 +552,7 @@ impl PluginHost {
             PluginPermissions::trusted(),
             PermissionRulePolicy::Trusted,
             Arc::new(opts),
+            None,
         )
     }
 
@@ -552,16 +570,22 @@ impl PluginHost {
             permissions,
             PermissionRulePolicy::Trusted,
             PluginOpts::default(),
+            None,
         )
     }
 
     pub fn load_plugin_file(&self, path: &Path) -> Result<(), PluginError> {
-        let source = fs::read_to_string(path).map_err(|e| PluginError::Io {
+        let source_path = fs::canonicalize(path).map_err(|e| PluginError::Io {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
+        let source = fs::read_to_string(&source_path).map_err(|e| PluginError::Io {
             path: path.to_path_buf(),
             source: e,
         })?;
         let plugin_dir = path.parent().map(Path::to_path_buf);
         let (permissions, trusted) = load_plugin_permissions_with_trust(plugin_dir.as_deref());
+        let local_source = loaded_entrypoint(&source_path, &source);
         // Test-only path today. Once user plugin dirs exist: derive a real
         // plugin name, since the hardcoded "user" would collide across files,
         // pass the `plugins.<name>` opts through, and teach the
@@ -578,6 +602,7 @@ impl PluginHost {
                 PermissionRulePolicy::DenyOnly
             },
             PluginOpts::default(),
+            local_source,
         )
     }
 
@@ -602,6 +627,16 @@ impl PluginHost {
 
     pub fn ui_action_rx(&self) -> flume::Receiver<UiAction> {
         self.inner.ui_action_rx.clone()
+    }
+}
+
+fn loaded_entrypoint(path: &Path, source: &str) -> Option<VerifiedLocalSourceLocator> {
+    match VerifiedLocalSourceLocator::from_loaded_entrypoint(path, source.as_bytes()) {
+        Ok(locator) => Some(locator),
+        Err(error) => {
+            tracing::warn!(error = %error, "loaded plugin entrypoint is not currently navigable");
+            None
+        }
     }
 }
 
@@ -785,10 +820,55 @@ impl EventHandle {
 mod tests {
     use super::*;
     use crate::api::util::command::{LuaCommandInfo, LuaCommandWriter};
+    use caudra_agent::permissions::PermissionManager;
     use caudra_agent::prompt::{PromptId, ResolvedSlots, Slot};
     use caudra_agent::tools::ToolRegistry;
+    use caudra_config::{PermissionsConfig, ToolKey};
     use std::time::Instant;
     use test_case::test_case;
+
+    #[test_case(false; "plugin_file")]
+    #[test_case(true; "init_file")]
+    fn permission_provenance_tracks_loaded_entrypoint_not_its_label(init: bool) {
+        const RULE: &str = r#"caudra.api.register_permission_rule({ tool = "provenance_tool", scope = "*", effect = "deny" })"#;
+        const LABEL: &str = "not-a-filesystem-path";
+        const TOOL: &str = "provenance_tool";
+        const CHANGED: &str = "invalid lua content";
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("init.lua");
+        fs::write(&path, RULE).unwrap();
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let manager = PermissionManager::new_nonpersistent(
+            PermissionsConfig::default(),
+            temp.path().to_path_buf(),
+            host.plugin_rules(),
+        );
+        if init {
+            host.run_init_file(&path, LABEL, PermissionRulePolicy::DenyOnly, &mut None)
+                .unwrap();
+        } else {
+            host.load_plugin_file(&path).unwrap();
+        }
+        let entry = manager
+            .active_policy()
+            .into_iter()
+            .find(|entry| entry.rule.tool == ToolKey::native(TOOL))
+            .unwrap();
+        let locator = entry.verified_local_source_locator.unwrap();
+        assert_eq!(locator.path(), path.canonicalize().unwrap());
+        assert!(locator.is_plugin_entrypoint());
+        locator.verify_current().unwrap();
+        fs::write(&path, CHANGED).unwrap();
+        assert!(locator.verify_current().is_err());
+        host.load_source(if init { LABEL } else { "user" }, RULE)
+            .unwrap();
+        let entry = manager
+            .active_policy()
+            .into_iter()
+            .find(|entry| entry.rule.tool == ToolKey::native(TOOL))
+            .unwrap();
+        assert!(entry.verified_local_source_locator.is_none());
+    }
 
     /// jit=true is exercised by the whole integration suite
     /// (`tests/plugin_host.rs` boots hosts via `new`); only the O1
@@ -879,6 +959,7 @@ mod tests {
             "global/init.lua".into(),
             Some(directory.path().to_path_buf()),
             PermissionRulePolicy::Trusted,
+            None,
         );
 
         assert!(result.is_err());

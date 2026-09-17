@@ -14,7 +14,13 @@ use serde_json::{Map, Value, json};
 use std::path::{Component, Path, PathBuf};
 use url::Url;
 
+use crate::permissions::editor::SelectorValue;
+
 use super::arguments::decode_json_pointer;
+use super::matching::{
+    filesystem_subtree_digest, normalized_filesystem_path, resource_value_digest, url_origin_digest,
+};
+use super::resources::remote_resource_identity;
 use super::{
     COMMAND_OBSERVATION_ATTRIBUTE, CONFINED_READ_ATTRIBUTE, NORMALIZED_COMMAND_ATTRIBUTE,
     PermissionArgumentConstraint, PermissionCapabilityFamily, PermissionRequest,
@@ -156,6 +162,111 @@ const BULK_FIELDS: &[&str] = &[
     "new_text",
     "edits",
 ];
+
+pub(in crate::permissions) fn editor_attribute_kind(name: &str) -> PermissionResourceKind {
+    attribute_kind(name)
+}
+
+pub(in crate::permissions) fn normalize_editor_selector_value(
+    kind: &PermissionResourceKind,
+    value: &SelectorValue,
+) -> Result<SelectorValue, String> {
+    let invalid = || "Selector is incompatible with this resource kind or value".to_owned();
+    Ok(match value {
+        SelectorValue::Exact(value)
+            if matches!(
+                kind,
+                PermissionResourceKind::File | PermissionResourceKind::Directory
+            ) =>
+        {
+            SelectorValue::Exact(
+                normalized_filesystem_path(value)
+                    .ok_or_else(invalid)?
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+        }
+        SelectorValue::Exact(value) if *kind == PermissionResourceKind::Url => {
+            SelectorValue::Exact(strict_http_url(value).ok_or_else(invalid)?.key)
+        }
+        SelectorValue::FilesystemSubtree(root) => SelectorValue::FilesystemSubtree(
+            normalized_filesystem_path(root)
+                .ok_or_else(invalid)?
+                .to_string_lossy()
+                .into_owned(),
+        ),
+        SelectorValue::UrlOrigin(origin) => SelectorValue::UrlOrigin(
+            strict_http_url(origin)
+                .ok_or_else(invalid)?
+                .url
+                .origin()
+                .ascii_serialization(),
+        ),
+        SelectorValue::UrlSubtree(root) => SelectorValue::UrlSubtree(
+            url_subtree_roots(&strict_http_url(root).ok_or_else(invalid)?)
+                .and_then(|roots| roots.into_iter().next())
+                .ok_or_else(invalid)?,
+        ),
+        _ => value.clone(),
+    })
+}
+
+pub(in crate::permissions) fn compile_editor_selector(
+    kind: &PermissionResourceKind,
+    value: &SelectorValue,
+) -> Result<PermissionResourceSelector, String> {
+    let invalid = || "Selector is incompatible with this resource kind or value".to_owned();
+    Ok(match value {
+        SelectorValue::Exact(value) => PermissionResourceSelector::Digest {
+            digest: resource_value_digest(value, kind).ok_or_else(invalid)?,
+        },
+        SelectorValue::FilesystemSubtree(root)
+            if matches!(
+                kind,
+                PermissionResourceKind::File | PermissionResourceKind::Directory
+            ) =>
+        {
+            PermissionResourceSelector::FilesystemSubtreeDigest {
+                digest: filesystem_subtree_digest(root).ok_or_else(invalid)?,
+            }
+        }
+        SelectorValue::UrlOrigin(origin) if *kind == PermissionResourceKind::Url => {
+            PermissionResourceSelector::UrlOriginDigest {
+                digest: url_origin_digest(origin).ok_or_else(invalid)?,
+            }
+        }
+        SelectorValue::UrlSubtree(root) if *kind == PermissionResourceKind::Url => {
+            let strict = strict_http_url(root).ok_or_else(invalid)?;
+            let roots = url_subtree_roots(&strict).ok_or_else(invalid)?;
+            let root = roots.first().ok_or_else(invalid)?;
+            PermissionResourceSelector::UrlSubtreeDigest {
+                digest: url_subtree_digest(root),
+            }
+        }
+        SelectorValue::CommandPattern(pattern) if *kind == PermissionResourceKind::Command => {
+            PermissionResourceSelector::CommandPattern {
+                pattern: pattern.clone(),
+            }
+        }
+        SelectorValue::CommandTemplate { definition, .. }
+            if *kind == PermissionResourceKind::Command =>
+        {
+            PermissionResourceSelector::CommandTemplate {
+                definition: definition.clone(),
+            }
+        }
+        SelectorValue::RemoteExact(scope) => PermissionResourceSelector::RemoteResource {
+            identity: remote_resource_identity(kind).ok_or_else(invalid)?.clone(),
+            scope: scope.clone(),
+        },
+        SelectorValue::RemoteSubtree(scope) => PermissionResourceSelector::RemoteSubtree {
+            identity: remote_resource_identity(kind).ok_or_else(invalid)?.clone(),
+            scope: scope.clone(),
+        },
+        SelectorValue::Any => PermissionResourceSelector::Any,
+        _ => return Err(invalid()),
+    })
+}
 
 pub fn review_for_rule(
     request: &PermissionRequest,

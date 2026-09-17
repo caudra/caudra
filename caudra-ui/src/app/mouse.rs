@@ -64,6 +64,14 @@ fn autoscroll_rows(distance: i32) -> i32 {
 impl App {
     pub(super) fn handle_mouse(&mut self, event: MouseEvent) -> Vec<crate::components::Action> {
         let at = Position::new(event.column, event.row);
+        if self.permissions_picker.is_open() && self.permissions_picker.editor_mut().is_some() {
+            self.clear_control_hovers();
+            if self.permission_mutation_pending() {
+                return Vec::new();
+            }
+            let action = self.permissions_picker.handle_mouse(event);
+            return self.handle_permissions_picker_action(action);
+        }
         if self.session_relocation_picker.is_open() {
             self.clear_control_hovers();
             self.autoscroll = None;
@@ -711,6 +719,11 @@ impl App {
     }
 
     pub(super) fn handle_scroll(&mut self, column: u16, row: u16, delta: i32) {
+        if self.permissions_picker.is_open() {
+            self.permissions_picker
+                .scroll_at(Position::new(column, row), delta);
+            return;
+        }
         if self.session_relocation_picker.is_open() {
             self.session_relocation_picker.scroll(delta);
             return;

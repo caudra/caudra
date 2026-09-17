@@ -23,6 +23,7 @@ use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Widget};
 
+use super::permission_editor::LOCAL_SOURCE_NOTICE;
 use super::{App, Mode, Status};
 
 const MAIN_GUTTER_WIDE: u16 = 2;
@@ -89,11 +90,20 @@ impl App {
     /// owning the keyboard, which hangs the session outright.
     fn render_workbench(&mut self, frame: &mut Frame) {
         let render_chat = self.active_chat;
-        let [body, status] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)])
+        let [mut body, status] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)])
             .areas(main_content_area(frame.area()));
         self.zones = ZoneRegistry::new();
         self.zones.push_overlay(frame.area());
         self.render_background(frame);
+        if self.parked_workbench.is_some() && body.height > 1 {
+            let [notice, remaining] =
+                Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(body);
+            frame.render_widget(
+                Line::from(LOCAL_SOURCE_NOTICE).style(theme::current().accent),
+                notice,
+            );
+            body = remaining;
+        }
         self.workbench.view(frame, body);
         self.render_status_bar(frame, status, render_chat);
 

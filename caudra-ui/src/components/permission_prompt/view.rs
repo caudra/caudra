@@ -18,6 +18,11 @@ use super::{
     PromptHit, PromptState, PromptTarget, Rect, ResourceCoverage, Span, Style, Wrap,
     command_ladders, grade_command_pattern, hint_key, hover_style, theme, visual_rows,
 };
+use crate::components::permission_scope::pattern::PatternPanel;
+use crate::components::permission_scope::{
+    model::ScopeModel,
+    view::{Disclosure, ScopeView},
+};
 use crate::theme::Theme;
 
 const CONTROL_GAP: &str = "  ";
@@ -29,6 +34,7 @@ const FIELD_COLUMNS_WIDTH: u16 = 52;
 const LABEL_WIDTH: u16 = 18;
 const CARD_INSET: u16 = 2;
 const CARD_GAP: u16 = 1;
+const CANONICAL_SCOPE_DETAILS: &str = "Canonical scope details";
 pub(super) const REARM_MESSAGE: &str = "Tab, then retry the blocked key.";
 
 pub(super) fn coverage_chip(coverage: &ResourceCoverage) -> String {
@@ -42,6 +48,8 @@ pub(super) fn coverage_chip(coverage: &ResourceCoverage) -> String {
 enum CardContent {
     Text(PromptBody),
     Fields(Vec<ReviewField>),
+    Scope(usize, ScopeModel, Box<ScopeView>, Vec<ReviewField>),
+    Pattern(PatternPanel),
 }
 
 enum CardTone {
@@ -83,17 +91,18 @@ impl ReviewCard {
     fn height(&self, width: u16) -> u16 {
         let width = width.saturating_sub(CARD_INSET * 2).max(1);
         let height = match &self.content {
+            CardContent::Pattern(panel) => panel.height(width, &theme::current()),
+            CardContent::Scope(_, model, _, fields) => fields_height(fields, width)
+                .saturating_add(ScopeView::summary_height(model, width))
+                .saturating_add(1),
             CardContent::Text(body) => visual_rows(&body.lines, width).total,
-            CardContent::Fields(fields) => fields
-                .iter()
-                .map(|field| field_height(field, width))
-                .fold(0u16, u16::saturating_add),
+            CardContent::Fields(fields) => fields_height(fields, width),
         };
         height.max(1).saturating_add(BORDER_ROWS)
     }
 
     fn render(
-        &self,
+        &mut self,
         area: Rect,
         buffer: &mut Buffer,
         t: &Theme,
@@ -130,7 +139,60 @@ impl ReviewCard {
                 target: target.clone(),
             });
         }
-        match &self.content {
+        match &mut self.content {
+            CardContent::Pattern(panel) => {
+                let control = if let Some(PromptTarget::Inspector(control)) = focused {
+                    Some(control)
+                } else {
+                    None
+                };
+                hits.extend(panel.render(inner, buffer, t, control).into_iter().map(
+                    |(area, control)| PromptHit {
+                        area,
+                        target: PromptTarget::Inspector(control),
+                    },
+                ));
+            }
+            CardContent::Scope(authority, model, state, fields) => {
+                let [summary, label, details] = Layout::vertical([
+                    Constraint::Length(ScopeView::summary_height(model, inner.width)),
+                    Constraint::Length(1),
+                    Constraint::Min(0),
+                ])
+                .areas(inner);
+                let properties = matches!(
+                    state.disclosure,
+                    Some(Disclosure::Identity | Disclosure::Evidence)
+                )
+                .then(|| {
+                    fields
+                        .iter()
+                        .flat_map(|field| {
+                            [
+                                Line::styled(field.label.clone(), t.item_desc),
+                                Line::from(field.value.clone()),
+                            ]
+                        })
+                        .collect()
+                });
+                state.render_with_properties(model, summary, buffer, t, properties);
+                if self.target.is_some() {
+                    for hit in &state.hits {
+                        let target = PromptTarget::VisualScope(*authority, hit.control.clone());
+                        if focused == Some(&target) {
+                            buffer.set_style(hit.area, hover_style(Style::default(), true));
+                        }
+                        hits.push(PromptHit {
+                            area: hit.area,
+                            target,
+                        });
+                    }
+                }
+                Paragraph::new(CANONICAL_SCOPE_DETAILS)
+                    .style(t.panel_title)
+                    .render(label, buffer);
+                render_fields(fields, details, buffer, t);
+            }
             CardContent::Text(body) => {
                 let rows = visual_rows(&body.lines, inner.width);
                 Paragraph::new(body.lines.clone())
@@ -147,49 +209,56 @@ impl ReviewCard {
                     });
                 }
             }
-            CardContent::Fields(fields) => {
-                let mut y = inner.y;
-                for field in fields {
-                    let height = field_height(field, inner.width);
-                    let row = Rect { y, height, ..inner };
-                    if field.label.is_empty() {
-                        Paragraph::new(field.value.as_str())
-                            .wrap(Wrap { trim: false })
-                            .render(row, buffer);
-                    } else if inner.width < FIELD_COLUMNS_WIDTH {
-                        Paragraph::new(field.label.as_str())
-                            .style(t.tool_dim)
-                            .wrap(Wrap { trim: false })
-                            .render(Rect { height: 1, ..row }, buffer);
-                        Paragraph::new(field.value.as_str())
-                            .wrap(Wrap { trim: false })
-                            .render(
-                                Rect {
-                                    y: y + 1,
-                                    height: height.saturating_sub(1),
-                                    ..row
-                                },
-                                buffer,
-                            );
-                    } else {
-                        let [label, value] = Layout::horizontal([
-                            Constraint::Length(LABEL_WIDTH),
-                            Constraint::Min(1),
-                        ])
-                        .areas(row);
-                        Paragraph::new(field.label.as_str())
-                            .style(t.tool_dim)
-                            .wrap(Wrap { trim: false })
-                            .render(label, buffer);
-                        Paragraph::new(field.value.as_str())
-                            .wrap(Wrap { trim: false })
-                            .render(value, buffer);
-                    }
-                    y += height;
-                }
-            }
+            CardContent::Fields(fields) => render_fields(fields, inner, buffer, t),
         }
         hits
+    }
+}
+
+fn fields_height(fields: &[ReviewField], width: u16) -> u16 {
+    fields
+        .iter()
+        .map(|field| field_height(field, width))
+        .fold(0u16, u16::saturating_add)
+}
+
+fn render_fields(fields: &[ReviewField], inner: Rect, buffer: &mut Buffer, theme: &Theme) {
+    let mut y = inner.y;
+    for field in fields {
+        let height = field_height(field, inner.width);
+        let row = Rect { y, height, ..inner };
+        if field.label.is_empty() {
+            Paragraph::new(field.value.as_str())
+                .wrap(Wrap { trim: false })
+                .render(row, buffer);
+        } else if inner.width < FIELD_COLUMNS_WIDTH {
+            Paragraph::new(field.label.as_str())
+                .style(theme.tool_dim)
+                .wrap(Wrap { trim: false })
+                .render(Rect { height: 1, ..row }, buffer);
+            Paragraph::new(field.value.as_str())
+                .wrap(Wrap { trim: false })
+                .render(
+                    Rect {
+                        y: y + 1,
+                        height: height.saturating_sub(1),
+                        ..row
+                    },
+                    buffer,
+                );
+        } else {
+            let [label, value] =
+                Layout::horizontal([Constraint::Length(LABEL_WIDTH), Constraint::Min(1)])
+                    .areas(row);
+            Paragraph::new(field.label.as_str())
+                .style(theme.tool_dim)
+                .wrap(Wrap { trim: false })
+                .render(label, buffer);
+            Paragraph::new(field.value.as_str())
+                .wrap(Wrap { trim: false })
+                .render(value, buffer);
+        }
+        y += height;
     }
 }
 
@@ -310,18 +379,24 @@ impl PermissionPrompt {
         frame.render_widget(block, area);
         let [body_area, footer_area] =
             Layout::vertical([Constraint::Min(1), Constraint::Length(footer_height)]).areas(inner);
-        let layout = self.review_layout(body_area.width.saturating_sub(1).max(1), t);
+        let mut layout = self.review_layout(body_area.width.saturating_sub(1).max(1), t);
         self.scroll
             .update_dimensions(layout.total(), body_area.height);
         let mut buffer = Buffer::empty(Rect::new(0, 0, layout.width, layout.total()));
         let mut hits = Vec::new();
-        for (rect, card) in &layout.cards {
+        for (rect, card) in &mut layout.cards {
             hits.extend(card.render(
                 *rect,
                 &mut buffer,
                 t,
                 self.hover.as_ref().or(self.focus.as_ref()),
             ));
+            if self.confirmation.is_none()
+                && let CardContent::Scope(authority, _, state, _) = &card.content
+                && *authority == self.scope_authority
+            {
+                self.scope_view = state.as_ref().clone();
+            }
         }
         if let Some(target) = self.pending_reveal.take()
             && let Some(hit) = hits.iter().find(|hit| hit.target == target)
@@ -464,24 +539,34 @@ impl PermissionPrompt {
         let Some(request) = self.current() else {
             return layout;
         };
-        if self.panel == Panel::Details || self.inspector.is_some() {
-            let body = if self.panel == Panel::Details {
-                details_body(request)
-            } else {
-                self.inspector_body(t)
-            };
+        if self.panel == Panel::Details {
             layout.push(ReviewCard {
-                title: if self.panel == Panel::Details {
-                    "Technical review · secrets redacted"
-                } else {
-                    "Pattern · edit without approving"
-                }
-                .into(),
-                content: CardContent::Text(body),
+                title: "Technical review · secrets redacted".into(),
+                content: CardContent::Text(details_body(request)),
                 tone: CardTone::Context,
                 target: None,
             });
             return layout;
+        }
+        if let Some(panel) = self.inspector_panel() {
+            layout.push(ReviewCard {
+                title: "Pattern · edit without approving".into(),
+                content: CardContent::Pattern(panel),
+                tone: CardTone::Scope,
+                target: None,
+            });
+            return layout;
+        }
+        if self.state == PromptState::PatternEditing {
+            let mut lines = vec![self.input_line(t)];
+            if let Some(row) = self.command_row() {
+                lines.push(Line::styled(self.pattern_feedback(row), t.tool_warning));
+            }
+            layout.push(ReviewCard::text(
+                "Custom command prefix",
+                lines,
+                CardTone::Scope,
+            ));
         }
         let mut current;
         let document = if let Some(confirmation) = &self.confirmation {
@@ -543,13 +628,23 @@ impl PermissionPrompt {
             "Choose Once, Conversation or Project below."
         };
         let mut lifetime_lines = vec![Line::styled(lifetime, t.status_notice)];
+        if let Some(requester) = self
+            .requests
+            .front()
+            .and_then(|queued| queued.requester.as_deref())
+        {
+            lifetime_lines.push(Line::styled(
+                format!("Requester: subtask {}", review_text(requester)),
+                t.tool_dim,
+            ));
+        }
         if document.exact_call_workdir.is_some() {
             lifetime_lines.extend(
                 document
                     .context
                     .iter()
                     .filter(|field| {
-                        matches!(field.label.as_str(), "Project" | "Requester")
+                        field.label == "Project"
                             || (field.label == "Needs approval" && field.value != NO_POLICY_REASON)
                     })
                     .map(|field| {
@@ -572,7 +667,14 @@ impl PermissionPrompt {
             lifetime_lines,
             CardTone::Context,
         ));
-        if let Some(workdir) = &document.exact_call_workdir {
+        let compact_exact = document.exact_call_workdir.is_some()
+            && self.panel != Panel::Scopes
+            && (document.lifetime == PermissionLifetime::Once || self.confirmation.is_some());
+        if let Some(workdir) = document
+            .exact_call_workdir
+            .as_ref()
+            .filter(|_| compact_exact)
+        {
             let mut card = ReviewCard::fields(
                 "Future scope",
                 vec![
@@ -617,10 +719,10 @@ impl PermissionPrompt {
                 CardTone::Warning,
             ));
         }
-        if document.exact_call_workdir.is_none() {
+        if !compact_exact {
             let ladders = command_ladders(request);
             let subsumed = request.subsumed_rows(&self.row_grants(request));
-            for authority in &document.authorities {
+            for (index, authority) in document.authorities.iter().enumerate() {
                 if self.panel == Panel::Scopes
                     && self.command_row().is_some()
                     && authority.row != self.command_row()
@@ -656,15 +758,32 @@ impl PermissionPrompt {
                         format!("Row {}: {}", other + 1, self.row_summary(other).label),
                     ));
                 }
-                let mut card = ReviewCard::fields(
-                    if let Some(row) = authority.row.filter(|_| document.authorities.len() > 1) {
+                let content = if let Some(scope) = &authority.scope {
+                    CardContent::Scope(
+                        index,
+                        scope.clone(),
+                        Box::new(if self.scope_authority == index {
+                            self.scope_view.clone()
+                        } else {
+                            ScopeView::default()
+                        }),
+                        fields,
+                    )
+                } else {
+                    CardContent::Fields(fields)
+                };
+                let mut card = ReviewCard {
+                    title: if let Some(row) =
+                        authority.row.filter(|_| document.authorities.len() > 1)
+                    {
                         format!("Command {} · future scope", row + 1)
                     } else {
                         "Future scope".into()
                     },
-                    fields,
-                    CardTone::Scope,
-                );
+                    content,
+                    tone: CardTone::Scope,
+                    target: None,
+                };
                 if self.confirmation.is_none() {
                     card.target = authority
                         .row
@@ -700,6 +819,7 @@ impl PermissionPrompt {
                 document
                     .context
                     .iter()
+                    .filter(|field| field.label != "Requester")
                     .map(|field| ReviewField::new(&field.label, &field.value))
                     .collect(),
                 CardTone::Context,
@@ -713,17 +833,6 @@ impl PermissionPrompt {
                     t.status_notice.add_modifier(Modifier::BOLD),
                 )],
                 CardTone::Warning,
-            ));
-        }
-        if self.state == PromptState::PatternEditing {
-            let mut lines = vec![self.input_line(t)];
-            if let Some(row) = self.command_row() {
-                lines.push(Line::styled(self.pattern_feedback(row), t.tool_warning));
-            }
-            layout.push(ReviewCard::text(
-                "Custom command prefix",
-                lines,
-                CardTone::Scope,
             ));
         }
         layout
@@ -955,7 +1064,9 @@ pub(super) mod tests {
     use caudra_workspace::{
         AuthenticatedPrincipalId, AuthorityIdentity, ProjectIdentity, ProjectKey, SourceTrustAnchor,
     };
-    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+    use crossterm::event::{
+        KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
     use ratatui::{
         Terminal,
         backend::TestBackend,
@@ -972,10 +1083,12 @@ pub(super) mod tests {
 
     use super::super::decision::tests::native_shell_request;
     use super::super::details::{INCOMPLETE_REDACTION, review_text};
+    use super::super::inspector::InspectorControl;
     use super::super::inspector::tests::suggested_prompt;
-    use super::super::{Panel, PromptTarget};
-    use super::{CardContent, CardTone, PermissionPrompt, ReviewField};
+    use super::super::{Panel, PromptMouse, PromptTarget};
+    use super::{CANONICAL_SCOPE_DETAILS, CardContent, CardTone, PermissionPrompt, ReviewField};
     use crate::components::buffer_text;
+    use crate::components::permission_scope::view::{Disclosure, ScopeControl, ScopeView};
     use crate::theme::{self, Theme};
 
     pub(crate) const ROOMY_WIDTH: u16 = 140;
@@ -1005,6 +1118,15 @@ pub(super) mod tests {
     const REMOTE_DISPLAY_PATH: &str = "/display-only/file";
     const REMOTE_ESCAPED_TARGET_KEY: &str = "/root/folder%2Ffile";
     const REMOTE_SPLIT_TARGET_KEY: &str = "/root/folder/file";
+    const LIVE_SCOPE_HEIGHT: u16 = 24;
+    const ALTERNATIVE_DIRECTORY: &str = "/work/alternative";
+    const ATTRIBUTE_NAME: &str = "zone";
+    const ATTRIBUTE_VALUE: &str = "reviewed-zone";
+    const FIRST_COMMAND: &str = "git status";
+    const TARGETS_LABEL: &str = "Targets · ANY OF (2)";
+    const SECOND_CONDITIONS: &str = "ALL OF · target 2";
+    const UNRESTRICTED_ATTRIBUTE: &str = "zoneAnyUNRESTRICTED";
+    const MAX_PROPERTY_PAGES: usize = 32;
     const SCOPE_FIELDS: &[(&str, &str)] = &[
         ("Scope", COMPACT_SCOPE),
         ("Run from", EXACT_WORKDIR),
@@ -1163,6 +1285,141 @@ pub(super) mod tests {
         terminal.backend().buffer().clone()
     }
 
+    fn typed_alternatives_prompt() -> PermissionPrompt {
+        let mut request = native_shell_request(FIRST_COMMAND);
+        request.resources[0]
+            .attributes
+            .insert(ATTRIBUTE_NAME.into(), ATTRIBUTE_VALUE.into());
+        let option = request
+            .options
+            .iter_mut()
+            .find(|option| option.id == "allow_exact")
+            .unwrap();
+        option.rule.arguments = PermissionArgumentConstraint::Unconstrained;
+        let first = &mut option.rule.resources[0];
+        first.selector = PermissionResourceSelector::Any;
+        first.protected = Some(false);
+        first.attributes.retain(|name, _| name == "workdir");
+        first.attributes.insert(
+            ATTRIBUTE_NAME.into(),
+            PermissionResourceSelector::Exact {
+                value: ATTRIBUTE_VALUE.into(),
+            },
+        );
+        let mut second = first.clone();
+        second.protected = Some(true);
+        second.attributes.insert(
+            "workdir".into(),
+            PermissionResourceSelector::Exact {
+                value: ALTERNATIVE_DIRECTORY.into(),
+            },
+        );
+        second
+            .attributes
+            .insert(ATTRIBUTE_NAME.into(), PermissionResourceSelector::Any);
+        option.rule.resources.push(second);
+        exact_prompt(request)
+    }
+
+    fn typed_pattern_prompt() -> PermissionPrompt {
+        let mut prompt = suggested_prompt();
+        let id = prompt
+            .current()
+            .unwrap()
+            .options
+            .iter()
+            .find(|option| {
+                option.rule.resources.iter().any(|resource| {
+                    matches!(
+                        resource.selector,
+                        PermissionResourceSelector::CommandTemplate { .. }
+                    )
+                })
+            })
+            .unwrap()
+            .id
+            .clone();
+        prompt.select_authority(id);
+        prompt
+    }
+
+    fn scope_card(prompt: &PermissionPrompt, t: &Theme) -> Rect {
+        prompt
+            .review_layout(prompt.area.width.saturating_sub(3), t)
+            .cards
+            .into_iter()
+            .find(|(_, card)| matches!(card.content, CardContent::Scope(..)))
+            .unwrap()
+            .0
+    }
+
+    fn reveal_scope(prompt: &mut PermissionPrompt, width: u16, t: &Theme) -> Buffer {
+        themed_buffer(prompt, width, LIVE_SCOPE_HEIGHT, t);
+        prompt.scroll.scroll_to(scope_card(prompt, t).y);
+        themed_buffer(prompt, width, LIVE_SCOPE_HEIGHT, t)
+    }
+
+    fn click_scope_control(
+        prompt: &mut PermissionPrompt,
+        width: u16,
+        t: &Theme,
+        control: ScopeControl,
+    ) -> Buffer {
+        themed_buffer(prompt, width, LIVE_SCOPE_HEIGHT, t);
+        let y = prompt
+            .scope_view
+            .hits
+            .iter()
+            .find(|hit| hit.control == control)
+            .unwrap()
+            .area
+            .y;
+        if matches!(control, ScopeControl::Scroll(_)) {
+            let properties = prompt
+                .scope_view
+                .hits
+                .iter()
+                .find(|hit| hit.control == ScopeControl::Disclosure(Disclosure::Conditions))
+                .unwrap()
+                .area
+                .y;
+            prompt.scroll.scroll_to(properties);
+            prompt.scroll.reveal(y, 1);
+        } else {
+            prompt.scroll.scroll_to(y.saturating_sub(1));
+        }
+        themed_buffer(prompt, width, LIVE_SCOPE_HEIGHT, t);
+        let target = PromptTarget::VisualScope(0, control);
+        let area = prompt
+            .row_hits
+            .iter()
+            .find(|hit| hit.target == target)
+            .unwrap()
+            .area;
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            assert!(matches!(
+                prompt.handle_mouse(MouseEvent {
+                    kind,
+                    column: area.x,
+                    row: area.y,
+                    modifiers: KeyModifiers::NONE
+                }),
+                PromptMouse::Consumed
+            ));
+        }
+        themed_buffer(prompt, width, LIVE_SCOPE_HEIGHT, t)
+    }
+
+    fn compact_cells(buffer: &Buffer) -> String {
+        buffer_rows(buffer)
+            .chars()
+            .filter(|character| !character.is_whitespace() && *character != '│')
+            .collect()
+    }
+
     fn displayed_scope_fields(prompt: &PermissionPrompt) -> Vec<ReviewField> {
         prompt
             .review_layout(
@@ -1172,7 +1429,10 @@ pub(super) mod tests {
             .cards
             .into_iter()
             .flat_map(|(_, card)| match (card.tone, card.content) {
-                (CardTone::Scope, CardContent::Fields(fields)) => fields,
+                (
+                    CardTone::Scope,
+                    CardContent::Fields(fields) | CardContent::Scope(_, _, _, fields),
+                ) => fields,
                 _ => Vec::new(),
             })
             .collect()
@@ -1783,9 +2043,12 @@ pub(super) mod tests {
             themed_buffer(&mut prompt, width, 64, &t);
             prompt.handle_key(key(KeyCode::Char('s')));
             let frozen = prompt.confirmation.as_ref().unwrap().answer.clone();
-            let before = themed_buffer(&mut prompt, width, 64, &t);
+            let before = themed_buffer(&mut prompt, width, FULL_REVIEW_HEIGHT, &t);
             prompt.selected_option = "allow_exact_resources".into();
-            assert_eq!(themed_buffer(&mut prompt, width, 64, &t), before);
+            assert_eq!(
+                themed_buffer(&mut prompt, width, FULL_REVIEW_HEIGHT, &t),
+                before
+            );
             let phrase = if protected {
                 PROTECTED_PHRASE
             } else {
@@ -1850,6 +2113,319 @@ pub(super) mod tests {
         text
     }
 
+    #[test_case(40; "narrow")]
+    #[test_case(80; "normal")]
+    #[test_case(140; "wide")]
+    fn live_future_scope_renders_shared_targets_and_selected_conditions(width: u16) {
+        for name in ["ayu_dark", "ayu_light"] {
+            let t = theme::load_by_name(name).unwrap();
+            let mut prompt = typed_alternatives_prompt();
+            let answer = prompt.allow_answer(PermissionLifetime::Conversation);
+            let first = reveal_scope(&mut prompt, width, &t);
+            assert!(buffer_text(&first).contains(TARGETS_LABEL));
+            assert!(
+                prompt
+                    .scope_view
+                    .hits
+                    .iter()
+                    .any(|hit| hit.control == ScopeControl::Disclosure(Disclosure::Conditions))
+            );
+            let height = prompt.height(width);
+            click_scope_control(&mut prompt, width, &t, ScopeControl::Target(1));
+            let conditions = click_scope_control(
+                &mut prompt,
+                width,
+                &t,
+                ScopeControl::Disclosure(Disclosure::Conditions),
+            );
+            assert_eq!(prompt.scope_view.target, 1);
+            assert!(buffer_text(&conditions).contains(SECOND_CONDITIONS));
+            assert!(compact_cells(&conditions).contains("Protectionprotectedonly"));
+            let target =
+                PromptTarget::VisualScope(0, ScopeControl::Disclosure(Disclosure::Conditions));
+            let area = prompt
+                .row_hits
+                .iter()
+                .find(|hit| hit.target == target)
+                .unwrap()
+                .area;
+            prompt.focus = Some(target);
+            let mut focused = conditions.clone();
+            focused.set_style(area, Style::default().add_modifier(Modifier::REVERSED));
+            assert_eq!(
+                themed_buffer(&mut prompt, width, LIVE_SCOPE_HEIGHT, &t),
+                focused
+            );
+            assert!(prompt.handle_key(key(KeyCode::Enter)).is_none());
+            assert_eq!(prompt.scope_view.disclosure, None);
+            let mut properties = compact_cells(&conditions);
+            for _ in 0..MAX_PROPERTY_PAGES {
+                let down = prompt
+                    .scope_view
+                    .hits
+                    .iter()
+                    .find_map(|hit| match hit.control {
+                        ScopeControl::Scroll(delta) if delta > 0 => Some(hit.control.clone()),
+                        _ => None,
+                    })
+                    .unwrap();
+                properties.push_str(&compact_cells(&click_scope_control(
+                    &mut prompt,
+                    width,
+                    &t,
+                    down,
+                )));
+            }
+            assert!(properties.contains(UNRESTRICTED_ATTRIBUTE));
+            let clamped = prompt.scope_view.offset;
+            let up = prompt
+                .scope_view
+                .hits
+                .iter()
+                .find_map(|hit| match hit.control {
+                    ScopeControl::Scroll(delta) if delta < 0 => Some(hit.control.clone()),
+                    _ => None,
+                })
+                .unwrap();
+            click_scope_control(&mut prompt, width, &t, up);
+            assert!(prompt.scope_view.offset < clamped);
+            assert_eq!(prompt.height(width), height);
+            assert_eq!(
+                prompt.allow_answer(PermissionLifetime::Conversation),
+                answer
+            );
+            assert!(prompt.confirmation.is_none());
+        }
+    }
+
+    #[test_case(40, false; "narrow_alternatives")]
+    #[test_case(80, false; "normal_alternatives")]
+    #[test_case(140, false; "wide_alternatives")]
+    #[test_case(40, true; "narrow_remote")]
+    #[test_case(80, true; "normal_remote")]
+    #[test_case(140, true; "wide_remote")]
+    fn canonical_scope_details_keep_every_cell_reachable(width: u16, remote: bool) {
+        for name in ["ayu_dark", "ayu_light"] {
+            let t = theme::load_by_name(name).unwrap();
+            let mut prompt = if remote {
+                exact_prompt(remote_request(REMOTE_IDS, &["root", "folder/file"], true))
+            } else {
+                typed_alternatives_prompt()
+            };
+            let height = prompt.height(width) + 2;
+            let full = themed_buffer(&mut prompt, width, height, &t);
+            let (card, content) = prompt
+                .review_layout(prompt.area.width - 3, &t)
+                .cards
+                .into_iter()
+                .find(|(_, card)| matches!(card.content, CardContent::Scope(..)))
+                .unwrap();
+            let CardContent::Scope(_, model, _, fields) = content.content else {
+                unreachable!()
+            };
+            if remote {
+                for (label, value) in [
+                    "Trust anchor",
+                    "Server",
+                    "Workspace",
+                    "Generation",
+                    "Namespace",
+                    "Principal",
+                    "Remote project",
+                ]
+                .into_iter()
+                .zip(REMOTE_IDS)
+                {
+                    assert!(
+                        fields
+                            .iter()
+                            .any(|field| field.label == label && field.value == value)
+                    );
+                }
+                assert!(
+                    fields.iter().any(|field| field.label == "Target key"
+                        && field.value == REMOTE_ESCAPED_TARGET_KEY)
+                );
+            } else {
+                for label in [
+                    "1 · Protection",
+                    "2 · Protection",
+                    "1 · Starting directory",
+                    "2 · Starting directory",
+                    "1 · zone",
+                    "2 · zone",
+                ] {
+                    assert!(fields.iter().any(|field| field.label == label));
+                }
+                assert!(
+                    fields
+                        .iter()
+                        .any(|field| field.value.contains(ALTERNATIVE_DIRECTORY))
+                );
+            }
+            let summary_height = ScopeView::summary_height(&model, card.width - 4);
+            let start = card.y + summary_height + 2;
+            let x = prompt.area.x + card.x + 3;
+            let y = prompt.area.y + start + 1;
+            let mut expected = Buffer::empty(Rect::new(0, 0, card.width, card.height));
+            let pairs: Vec<_> = fields
+                .iter()
+                .map(|field| (field.label.as_str(), field.value.as_str()))
+                .collect();
+            let rows = golden_fields(
+                &mut expected,
+                Rect::new(0, 0, card.width, 0),
+                CANONICAL_SCOPE_DETAILS,
+                &pairs,
+                t.tool_bg.fg(t.foreground),
+                &t,
+            ) - 2;
+            assert!(buffer_rows(&full).contains(CANONICAL_SCOPE_DETAILS));
+            for row in 0..rows {
+                for column in 0..card.width - 4 {
+                    assert_eq!(full[(x + column, y + row)], expected[(column + 2, row + 1)]);
+                }
+            }
+            themed_buffer(&mut prompt, width, LIVE_SCOPE_HEIGHT, &t);
+            for row in 0..rows {
+                prompt.scroll.scroll_to(start + row);
+                let page = themed_buffer(&mut prompt, width, LIVE_SCOPE_HEIGHT, &t);
+                let visible_y = prompt.area.y + 1 + start + row - prompt.scroll.offset();
+                for column in 0..card.width - 4 {
+                    assert_eq!(page[(x + column, visible_y)], full[(x + column, y + row)]);
+                }
+            }
+            assert!(prompt.confirmation.is_none());
+        }
+    }
+
+    #[test_case(40; "narrow")]
+    #[test_case(80; "normal")]
+    #[test_case(140; "wide")]
+    fn live_slot_and_all_of_controls_inspect_without_changing_authority(width: u16) {
+        for name in ["ayu_dark", "ayu_light"] {
+            let t = theme::load_by_name(name).unwrap();
+            let mut prompt = typed_pattern_prompt();
+            reveal_scope(&mut prompt, width, &t);
+            let answer = prompt.allow_answer(PermissionLifetime::Conversation);
+            let id = prompt
+                .scope_view
+                .hits
+                .iter()
+                .find_map(|hit| match hit.control {
+                    ScopeControl::Slot(id) => Some(id),
+                    _ => None,
+                })
+                .unwrap();
+            let slot = click_scope_control(&mut prompt, width, &t, ScopeControl::Slot(id));
+            assert!(compact_cells(&slot).contains("SameID=equalvalues"));
+            let conditions = click_scope_control(
+                &mut prompt,
+                width,
+                &t,
+                ScopeControl::Disclosure(Disclosure::Conditions),
+            );
+            assert!(buffer_text(&conditions).contains("ALL OF · target 1"));
+            click_scope_control(&mut prompt, width, &t, ScopeControl::Slot(id));
+            assert_eq!(prompt.scope_view.slot, Some(id));
+            assert_eq!(prompt.scope_view.disclosure, None);
+            assert_eq!(
+                prompt.allow_answer(PermissionLifetime::Conversation),
+                answer
+            );
+            assert!(prompt.confirmation.is_none());
+        }
+    }
+
+    #[test_case(40; "narrow")]
+    #[test_case(80; "normal")]
+    #[test_case(140; "wide")]
+    fn frozen_scope_controls_and_held_enter_cannot_change_or_confirm(width: u16) {
+        for name in ["ayu_dark", "ayu_light"] {
+            let t = theme::load_by_name(name).unwrap();
+            let mut prompt = exact_prompt(remote_request(REMOTE_IDS, &["root", "file"], true));
+            themed_buffer(&mut prompt, width, LIVE_SCOPE_HEIGHT, &t);
+            prompt.focus = Some(PromptTarget::Hint(key(KeyCode::Char('s'))));
+            assert!(prompt.handle_key(key(KeyCode::Enter)).is_none());
+            let frozen = prompt.confirmation.as_ref().unwrap().answer.clone();
+            let scope = reveal_scope(&mut prompt, width, &t);
+            assert!(buffer_text(&scope).contains("[ALL OF]"));
+            assert!(
+                prompt
+                    .row_hits
+                    .iter()
+                    .all(|hit| !matches!(hit.target, PromptTarget::VisualScope(..)))
+            );
+            let state = prompt.scope_view.clone();
+            for control in [
+                ScopeControl::Scroll(4),
+                ScopeControl::Target(1),
+                ScopeControl::Disclosure(Disclosure::Identity),
+            ] {
+                assert!(
+                    prompt
+                        .activate(PromptTarget::VisualScope(0, control))
+                        .is_none()
+                );
+            }
+            assert_eq!(prompt.scope_view.offset, state.offset);
+            assert_eq!(prompt.scope_view.target, state.target);
+            assert_eq!(prompt.scope_view.disclosure, state.disclosure);
+            assert!(
+                prompt
+                    .handle_key(KeyEvent::new_with_kind(
+                        KeyCode::Enter,
+                        KeyModifiers::NONE,
+                        KeyEventKind::Repeat
+                    ))
+                    .is_none()
+            );
+            assert!(prompt.handle_key(key(KeyCode::Enter)).is_none());
+            assert_eq!(prompt.confirmation.as_ref().unwrap().answer, frozen);
+            assert!(
+                prompt
+                    .handle_key(KeyEvent::new_with_kind(
+                        KeyCode::Enter,
+                        KeyModifiers::NONE,
+                        KeyEventKind::Release
+                    ))
+                    .is_none()
+            );
+            themed_buffer(&mut prompt, width, LIVE_SCOPE_HEIGHT, &t);
+            assert_eq!(
+                prompt.handle_key(key(KeyCode::Enter)).unwrap().answer,
+                frozen
+            );
+        }
+    }
+
+    #[test_case(40; "narrow")]
+    #[test_case(80; "normal")]
+    #[test_case(140; "wide")]
+    fn exact_once_scope_chooser_exposes_the_typed_rule(width: u16) {
+        let t = theme::load_by_name("ayu_dark").unwrap();
+        let mut prompt = protected_prompt(COMMAND);
+        assert_eq!(prompt.lifetime, PermissionLifetime::Once);
+        themed_buffer(&mut prompt, width, LIVE_SCOPE_HEIGHT, &t);
+        assert!(prompt.handle_key(key(KeyCode::Char('r'))).is_none());
+        assert!(prompt.panel == Panel::Scopes);
+        let scope = reveal_scope(&mut prompt, width, &t);
+        assert!(buffer_text(&scope).contains(TARGETS_LABEL));
+        assert!(
+            prompt
+                .scope_view
+                .hits
+                .iter()
+                .any(|hit| hit.control == ScopeControl::Disclosure(Disclosure::Conditions))
+        );
+        assert!(prompt.confirmation.is_none());
+        assert_ne!(prompt.lifetime, PermissionLifetime::Once);
+        assert!(prompt.handle_key(key(KeyCode::Char('p'))).is_none());
+        assert!(prompt.panel == Panel::Main);
+        assert!(buffer_text(&reveal_scope(&mut prompt, width, &t)).contains(TARGETS_LABEL));
+        assert!(prompt.confirmation.is_none());
+    }
+
     #[test]
     #[ignore = "writes private visual review buffers under /tmp"]
     fn export_permission_review_buffers() {
@@ -1861,10 +2437,35 @@ pub(super) mod tests {
         fs::set_permissions(directory.path(), Permissions::from_mode(0o700)).unwrap();
         for name in ["ayu_dark", "ayu_light"] {
             let t = theme::load_by_name(name).unwrap();
-            for (width, height) in [(40, 48), (80, 24), (80, 32), (140, 32)] {
-                for panel in ["main", "confirm", "broad", "remote-main", "remote-confirm"] {
+            for (width, height) in [(40, 24), (40, 48), (80, 24), (80, 32), (140, 32)] {
+                for panel in [
+                    "main",
+                    "confirm",
+                    "broad",
+                    "remote-main",
+                    "remote-confirm",
+                    "pattern-read",
+                    "pattern-edit",
+                    "pattern-tuples",
+                    "typed-alternatives",
+                    "typed-alternatives-selected",
+                    "typed-canonical-details",
+                    "typed-remote-scope",
+                    "typed-remote-identities",
+                    "typed-pattern-scope",
+                    "typed-pattern-slot",
+                    "typed-once-scope-chooser",
+                ] {
                     let mut prompt = match panel {
+                        "typed-alternatives"
+                        | "typed-alternatives-selected"
+                        | "typed-canonical-details" => typed_alternatives_prompt(),
+                        "typed-remote-scope" | "typed-remote-identities" => {
+                            exact_prompt(remote_request(REMOTE_IDS, &["root", "folder/file"], true))
+                        }
+                        "typed-pattern-scope" | "typed-pattern-slot" => typed_pattern_prompt(),
                         "broad" => open_prompt(),
+                        "pattern-read" | "pattern-edit" | "pattern-tuples" => suggested_prompt(),
                         "remote-main" | "remote-confirm" => exact_prompt(remote_request(
                             REMOTE_IDS,
                             &["root", "folder/file"],
@@ -1875,12 +2476,83 @@ pub(super) mod tests {
                     if panel == "broad" {
                         prompt.select_authority("allow_any_command".into());
                     }
+                    if panel.starts_with("pattern-") {
+                        prompt.open_scope_editor();
+                        prompt.open_inspector();
+                        match panel {
+                            "pattern-edit" => prompt.activate_inspector(InspectorControl::Name),
+                            "pattern-tuples" => {
+                                prompt.activate_inspector(InspectorControl::Observations)
+                            }
+                            _ => {}
+                        }
+                    }
                     themed_buffer(&mut prompt, width, height, &t);
                     if matches!(panel, "confirm" | "broad" | "remote-confirm") {
                         assert!(prompt.handle_key(key(KeyCode::Char('s'))).is_none());
                         assert!(prompt.confirmation.is_some());
                     }
                     let buffer = themed_buffer(&mut prompt, width, height, &t);
+                    let buffer = if panel.starts_with("typed-") {
+                        if panel == "typed-once-scope-chooser" {
+                            prompt.open_scope_editor();
+                        }
+                        reveal_scope(&mut prompt, width, &t);
+                        match panel {
+                            "typed-alternatives-selected" => {
+                                click_scope_control(
+                                    &mut prompt,
+                                    width,
+                                    &t,
+                                    ScopeControl::Target(1),
+                                );
+                            }
+                            "typed-remote-identities" => {
+                                click_scope_control(
+                                    &mut prompt,
+                                    width,
+                                    &t,
+                                    ScopeControl::Disclosure(Disclosure::Identity),
+                                );
+                            }
+                            "typed-pattern-slot" => {
+                                let slot = prompt
+                                    .scope_view
+                                    .hits
+                                    .iter()
+                                    .find_map(|hit| match hit.control {
+                                        ScopeControl::Slot(id) => Some(id),
+                                        _ => None,
+                                    })
+                                    .unwrap();
+                                click_scope_control(
+                                    &mut prompt,
+                                    width,
+                                    &t,
+                                    ScopeControl::Slot(slot),
+                                );
+                            }
+                            "typed-canonical-details" => {
+                                let card = scope_card(&prompt, &t);
+                                let rule = prompt
+                                    .review_layout(prompt.area.width - 3, &t)
+                                    .cards
+                                    .into_iter()
+                                    .find_map(|(_, card)| match card.content {
+                                        CardContent::Scope(_, model, _, _) => Some(model),
+                                        _ => None,
+                                    })
+                                    .unwrap();
+                                prompt.scroll.scroll_to(
+                                    card.y + 1 + ScopeView::summary_height(&rule, card.width - 4),
+                                );
+                            }
+                            _ => {}
+                        }
+                        themed_buffer(&mut prompt, width, height, &t)
+                    } else {
+                        buffer
+                    };
                     let stem = format!("{panel}-{name}-{width}x{height}");
                     for (extension, contents) in [
                         ("txt", buffer_rows(&buffer)),
@@ -2000,6 +2672,21 @@ pub(super) mod tests {
             let mut original = confirm_request(remote_request(REMOTE_IDS, &parts, true));
             assert!(original.confirmation.as_ref().unwrap().complete);
             let before = themed_buffer(&mut original, width, 80, &t);
+            assert!(
+                original
+                    .row_hits
+                    .iter()
+                    .all(|hit| !matches!(hit.target, PromptTarget::VisualScope(_, _)))
+            );
+            let rendered = displayed_scope_fields(&original);
+            for authority in &original.confirmation.as_ref().unwrap().review.authorities {
+                assert!(
+                    authority
+                        .fields
+                        .iter()
+                        .all(|field| rendered.contains(field))
+                );
+            }
             let authority_row = buffer_rows(&before)
                 .lines()
                 .position(|line| line.contains("Authority SHA-256"))
@@ -2365,7 +3052,12 @@ pub(super) mod tests {
                     }))
             );
         }
-        let screen = render(&mut prompt, width, 64);
+        let screen = buffer_text(&assert_scrollable_body(
+            &mut prompt,
+            width,
+            LIVE_SCOPE_HEIGHT,
+            &theme::current(),
+        ));
         for text in [
             FIRST_DIRECTORY,
             SECOND_DIRECTORY,
@@ -2539,12 +3231,12 @@ pub(super) mod tests {
         prompt.enqueue(Box::new(request), None);
         let grants = prompt.row_grants(prompt.current().unwrap());
         assert!(grants[0].is_none());
-        let collapsed = render(&mut prompt, ROOMY_WIDTH, ROOMY_HEIGHT);
+        let collapsed = render(&mut prompt, ROOMY_WIDTH, FULL_REVIEW_HEIGHT);
         assert!(collapsed.contains("Needs approval: 1 of 2 commands"));
         assert!(collapsed.contains(super::WHOLE_CALL));
         assert!(!collapsed.contains(COVERING));
         prompt.handle_key(key(KeyCode::Char('c')));
-        let expanded = render(&mut prompt, ROOMY_WIDTH, ROOMY_HEIGHT);
+        let expanded = render(&mut prompt, ROOMY_WIDTH, FULL_REVIEW_HEIGHT);
         assert!(expanded.contains(COVERING));
         assert_eq!(prompt.row_grants(prompt.current().unwrap()), grants);
         assert_eq!(prompt.current().unwrap().input, input);

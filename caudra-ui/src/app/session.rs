@@ -36,6 +36,7 @@ use ratatui::layout::Rect;
 use crate::AppSession;
 use crate::storage_writer::StorageWriter;
 
+use super::permission_editor::{PERMISSION_WORKER_BUSY, attach_session_permissions};
 use super::session_state::SessionState;
 use super::{App, Mode, PendingInput, PlanState, RestoreMode, Status};
 
@@ -259,6 +260,9 @@ impl App {
             .set_current_head(self.history_head());
 
         if !self.has_content() {
+            if self.permission_snapshot.is_some() {
+                return;
+            }
             // A draft typed and then deleted is already on disk, and a file with
             // nothing in it is a session the picker still offers to resume. Idle
             // only: submitting empties the draft a frame before the agent mirrors
@@ -328,7 +332,7 @@ impl App {
         } else {
             self.recoverable_queue.clone()
         };
-        SessionMeta {
+        let mut meta = SessionMeta {
             system_prompt_profile: if state.system_prompt_profile_override {
                 state.session.meta.system_prompt_profile.clone()
             } else {
@@ -340,7 +344,8 @@ impl App {
             plan_path: state.plan.path().map(|p| p.to_string_lossy().into_owned()),
             plan_target: plan_target(&state.plan),
             plan_written: state.plan.is_ready(),
-            structured_permission_rules: self.permissions.structured_conversation_rules_snapshot(),
+            structured_permission_rules: state.session.meta.structured_permission_rules.clone(),
+            permission_generation: state.session.meta.permission_generation,
             context_size: state.context_size,
             turns: state.turns,
             input_draft: (!draft.is_empty()).then_some(draft.text),
@@ -446,7 +451,17 @@ impl App {
             goal_continuation_limit: Some(state.goal.continuation_limit()),
             yolo: self.permissions.persisted_yolo(),
             snapshots_unavailable: self.snapshots_unavailable.clone(),
+        };
+        if let Some(snapshot) = &self.permission_snapshot {
+            let snapshot = snapshot.load();
+            if let Err(error) = snapshot.apply_to_meta(state.session.id, &mut meta) {
+                tracing::error!(%error, session_id = %state.session.id, "permission snapshot owner mismatch");
+            }
+        } else {
+            meta.structured_permission_rules =
+                self.permissions.structured_conversation_rules_snapshot();
         }
+        meta
     }
 
     pub(super) fn sync_subagents(&mut self) {
@@ -814,9 +829,11 @@ impl App {
     /// history, so no respawn follows and the restored queue must be
     /// flushed here.
     pub(crate) fn restore_resumed_session(&mut self) {
-        self.permissions.load_structured_conversation_rules(
-            self.state.session.meta.structured_permission_rules.clone(),
-        );
+        if self.permission_snapshot.is_none() {
+            self.permissions.load_structured_conversation_rules(
+                self.state.session.meta.structured_permission_rules.clone(),
+            );
+        }
         self.apply_stored_yolo(&self.state.session.meta);
         self.restore_display();
         self.flush_restored_queue();
@@ -847,11 +864,15 @@ impl App {
     }
 
     pub(crate) fn reset_session(&mut self) -> Vec<Action> {
+        if self.permission_mutation_pending() {
+            self.flash(PERMISSION_WORKER_BUSY.into());
+            return Vec::new();
+        }
         if self.cancelling_run.is_some() {
             self.status_bar.flash(REVERT_BUSY_MSG.into());
             return Vec::new();
         }
-        let replacement = self.state.session.workspace_binding().map_or_else(
+        let mut replacement = self.state.session.workspace_binding().map_or_else(
             || AppSession::new(&self.state.session.model, &self.state.session.cwd),
             |binding| {
                 AppSession::new_with_workspace(
@@ -891,11 +912,33 @@ impl App {
                 }
             }
         };
+        let permissions = Arc::new(self.permissions.fork());
+        let permission_snapshot = if self.permission_snapshot.is_some() {
+            match attach_session_permissions(
+                &self.storage,
+                &self.storage_writer,
+                &mut replacement,
+                &permissions,
+            ) {
+                Ok(snapshot) => Some(snapshot),
+                Err(error) => {
+                    self.flash(format!(
+                        "Failed to initialize conversation permissions: {error}"
+                    ));
+                    return Vec::new();
+                }
+            }
+        } else {
+            None
+        };
         if let Err(error) = self.retire_current_session() {
             self.status_bar
                 .flash(format!("Failed to retire current session: {error}"));
             return Vec::new();
         }
+        self.suspend_permission_editor();
+        self.permissions = permissions;
+        self.permission_snapshot = permission_snapshot;
         self.reset_ui_chrome();
         self.state.token_usage = TokenUsage::default();
         self.state.cost = None;
@@ -903,8 +946,6 @@ impl App {
         self.state.goal = GoalHandle::default();
         self.goal_deferred = false;
         self.state.plan = PlanState::None;
-        self.permissions
-            .load_structured_conversation_rules(Vec::new());
         self.permissions.set_session_yolo(None);
         if self.state.mode == Mode::Plan {
             self.enter_plan();
@@ -2006,6 +2047,9 @@ impl App {
         mut session: AppSession,
         fallback_model: &Model,
     ) -> Result<LoadedSession, String> {
+        if self.permission_mutation_pending() {
+            return Err(PERMISSION_WORKER_BUSY.into());
+        }
         if self.workspace_session.is_none() {
             caudra_storage::workspace_binding::StoredWorkspaceBinding::validate_resume(
                 session.workspace_binding(),
@@ -2073,10 +2117,25 @@ impl App {
             recover_pending_workspace_restore(&mut session, &store, &self.storage_writer)?;
             store
         };
+        let permissions = Arc::new(self.permissions.fork());
+        let permission_snapshot = if self.permission_snapshot.is_some() {
+            Some(attach_session_permissions(
+                &self.storage,
+                &self.storage_writer,
+                &mut session,
+                &permissions,
+            )?)
+        } else {
+            permissions.load_structured_conversation_rules(
+                session.meta.structured_permission_rules.clone(),
+            );
+            None
+        };
         self.retire_current_session()
             .map_err(|error| format!("Failed to retire current session: {error}"))?;
-        self.permissions
-            .load_structured_conversation_rules(session.meta.structured_permission_rules.clone());
+        self.suspend_permission_editor();
+        self.permissions = permissions;
+        self.permission_snapshot = permission_snapshot;
         self.apply_stored_yolo(&session.meta);
         self.state =
             SessionState::from_session(session, fallback_model, &self.storage, &self.model_policy);

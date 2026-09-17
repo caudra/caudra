@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
+use crate::components::permission_scope::model::{ScopeActivity, ScopeModel, ScopeSource};
 use caudra_agent::permissions::{
     COMMAND_OBSERVATION_ATTRIBUTE, COMMAND_OBSERVATION_BINDING_ATTRIBUTE, PermissionAnswer,
     PermissionArgumentConstraint, PermissionCapabilityFamily, PermissionExecutorKind,
@@ -61,6 +62,7 @@ pub(super) struct AuthorityReview {
     pub title: String,
     pub fields: Vec<ReviewField>,
     pub row: Option<usize>,
+    pub scope: Option<ScopeModel>,
 }
 
 pub(super) struct ReviewDocument {
@@ -112,6 +114,13 @@ impl ReviewDocument {
                         Some(PermissionRowGrant::Pattern { definition, .. }) => {
                             let summary = pattern_summary(definition);
                             document.authorities.push(AuthorityReview {
+                                scope: Some(ScopeModel {
+                                    source: ScopeSource::Pattern {
+                                        definition: definition.clone(),
+                                        lifetime: lifetime.clone(),
+                                    },
+                                    activity: ScopeActivity::Live,
+                                }),
                                 title: summary.label,
                                 fields: summary
                                     .lines
@@ -135,6 +144,7 @@ impl ReviewDocument {
                                 fields.push(ReviewField::new("Starting directory", directory));
                             }
                             document.authorities.push(AuthorityReview {
+                                scope: None,
                                 title: format!("Command {} · prefix", index + 1),
                                 fields,
                                 row: Some(index),
@@ -142,6 +152,7 @@ impl ReviewDocument {
                             document.warn(SHELL_REACH);
                         }
                         None => document.authorities.push(AuthorityReview {
+                            scope: None,
                             title: format!("Command {} · once", index + 1),
                             fields: vec![ReviewField::new(
                                 "Retained",
@@ -159,6 +170,7 @@ impl ReviewDocument {
                     PermissionLifetime::Global
                 };
                 document.authorities.push(AuthorityReview {
+                    scope: None,
                     title: "Deny this exact call".into(),
                     fields: vec![ReviewField::new(
                         "Effect",
@@ -215,9 +227,20 @@ impl ReviewDocument {
             return;
         };
         let rule = &option.rule;
+        let mut shown_rule = rule.clone();
+        shown_rule.lifetime = self.lifetime.clone();
+        let scope = Some(ScopeModel {
+            source: ScopeSource::Live {
+                rule: Box::new(shown_rule),
+                review: review_for_rule(request, rule),
+                project: request.presentation.project.clone(),
+            },
+            activity: ScopeActivity::Live,
+        });
         if let Some(definition) = offered_pattern(option) {
             let summary = pattern_summary(definition);
             self.authorities.push(AuthorityReview {
+                scope,
                 title: summary.label,
                 fields: summary
                     .lines
@@ -246,9 +269,12 @@ impl ReviewDocument {
                 0,
                 ReviewField::new("Authority SHA-256", canonical_json_sha256(&json!(rule))),
             );
+            fields.extend(identity_fields(&rule.subject, &rule.executor));
         }
         if rule.subject != request.subject || rule.executor != request.executor {
-            fields.extend(identity_fields(&rule.subject, &rule.executor));
+            if subject_remote_identity(&rule.subject).is_none() {
+                fields.extend(identity_fields(&rule.subject, &rule.executor));
+            }
             if let PermissionSubject::Native { owner, contract } = &rule.subject {
                 fields.push(ReviewField::new("Authority owner", owner));
                 fields.push(ReviewField::new("Authority contract", contract));
@@ -530,8 +556,12 @@ impl ReviewDocument {
         } else {
             authority_label(option)
         };
-        self.authorities
-            .push(AuthorityReview { title, fields, row });
+        self.authorities.push(AuthorityReview {
+            title,
+            fields,
+            row,
+            scope,
+        });
     }
 
     pub fn bound(&mut self) -> bool {

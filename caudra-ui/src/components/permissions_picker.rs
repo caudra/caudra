@@ -1,10 +1,12 @@
 use caudra_agent::permissions::{
     ActivePolicyRule, PermissionArgumentConstraint, PermissionLifetime, PermissionResourceKind,
     PermissionResourceSelector, PermissionReviewSource, PermissionRuleRecord, PermissionSubject,
-    StructuredPermissionEffect,
+    StructuredPermissionEffect, VerifiedLocalSourceLocator,
     pattern_recognition::{MAX_RECOGNIZER_SUGGESTIONS, PatternCandidate, RecognizerLimits},
 };
-use caudra_config::{Effect, PermissionReviewCandidate, PermissionReviewKind, PermissionSource};
+use caudra_config::{
+    Effect, PermissionReviewCandidate, PermissionReviewKind, PermissionRule, PermissionSource,
+};
 use caudra_storage::permission_patterns::{
     ArgumentDomain, ObservedTuple, OptionLikePolicy, PatternDefinition, PatternToken,
     SlotCombinations, SlotId,
@@ -17,11 +19,17 @@ use ratatui::widgets::{Block, Paragraph, Wrap};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use unicode_width::UnicodeWidthStr;
 
 use crate::PatternDiscoveryOutcome;
 use crate::components::keybindings::key;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
 use crate::components::modal::{CHROME_LINES, FooterHits, FooterLine, Modal};
+use crate::components::permission_scope::editor::{EditorEvent, EditorLaunch, ScopeEditor};
+use crate::components::permission_scope::{
+    model::{ScopeActivity, ScopeModel, rule_kind},
+    view::ScopeView,
+};
 use crate::components::scrollbar::{Scrollbar, ScrollbarMouse};
 use crate::components::{ModalScroll, Overlay, escape_terminal_controls, hint_line};
 use crate::theme;
@@ -38,9 +46,8 @@ const MAX_INPUT_DEPTH: usize = 4;
 const UNAVAILABLE: &str = "unavailable";
 const OMITTED: &str = "[omitted: display limit]";
 const SUGGESTED_SECTION: &str = "Suggested · not active";
-const SUGGESTED_TITLE: &str = " Suggested Pattern · Read-only ";
-const SUGGESTED_GUIDANCE: &str =
-    "Choose from next matching approval. No permission is granted here.";
+const SUGGESTED_TITLE: &str = " Proposal evidence · not active ";
+const SUGGESTED_GUIDANCE: &str = "Create permission opens a draft for current-identity validation. Evidence alone grants nothing.";
 const SUGGESTED_DISMISSAL_HELP: &str =
     "Dismiss: this definition in this project. Snooze: hide it in this project for 24 hours.";
 const MAX_SUGGESTION_EXAMPLES: usize = 3;
@@ -50,9 +57,8 @@ const INSPECTOR_HEIGHT_PERCENT: u16 = 80;
 const SCROLLBAR_WIDTH: u16 = 1;
 const MANAGER_SIZE_PERCENT: u16 = 95;
 const SIDE_BY_SIDE_WIDTH: u16 = 110;
-const LIST_WIDTH_PERCENT: u16 = 45;
-const STACKED_LIST_PERCENT: u16 = 55;
-const MIN_SPLIT_HEIGHT: u16 = 14;
+const LIST_WIDTH: u16 = 56;
+const PANE_GAP: u16 = 1;
 const MIN_CHROME_HEIGHT: u16 = 16;
 const DISCOVERY_WARNING: &str = "Imported history is unverified. Standard Bash startup and tool identity are assumed; current stored cwd approximates historical context. Execution success is not proven.";
 const DISCOVERY_EMPTY: &str = "No visible proposals. Unsupported or sensitive commands are excluded; dismissed and snoozed definitions stay hidden. A bounded sample can miss otherwise eligible patterns.";
@@ -60,8 +66,7 @@ const DISCOVERY_IDLE: &str = "Scan local saved history for suggested command pat
 const DISCOVERY_LOADING: &str = "Reading and analyzing a bounded history sample in the background. Cancel stops this request; active permissions are unchanged.";
 const DISCOVERY_CANCELLED: &str =
     "Scan cancelled. No late result from this request will be installed. Refresh to scan again.";
-const READ_ONLY_POLICY: &str =
-    "This policy is read-only here. Edit its configuration or plugin source to change it.";
+const READ_ONLY_POLICY: &str = "Read-only: no verified local source locator or supported editing API. No saved override is created.";
 const INACTIVE_ALLOW: &str = "This legacy allow is inactive. Re-approve the next exact request or remove the old config entry.";
 const CONFIRM_REVOKE_MESSAGE: &str =
     "Revoke this permission? Press Enter/y to confirm or Esc to cancel.";
@@ -76,6 +81,8 @@ pub(crate) enum PermissionsPickerAction {
     SnoozeSuggestion(SuggestedPatternTarget),
     RefreshDiscovery,
     CancelDiscovery,
+    Editor(EditorEvent),
+    EditSource(VerifiedLocalSourceLocator),
 }
 
 pub(crate) enum DiscoveryState {
@@ -89,6 +96,26 @@ pub(crate) enum DiscoveryState {
 enum PermissionsMode {
     Rules,
     Discover,
+}
+
+#[derive(Default)]
+enum ProjectFilter {
+    #[default]
+    All,
+    Here,
+    Other,
+    History,
+}
+
+impl ProjectFilter {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::All => "[All ^F]",
+            Self::Here => "[Here ^F]",
+            Self::Other => "[Other ^F]",
+            Self::History => "[History ^F]",
+        }
+    }
 }
 
 impl PermissionsMode {
@@ -130,8 +157,22 @@ enum ProjectConfigAction {
     RevokeTrust,
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq)]
+enum PickerEntry {
+    Stored(Arc<PermissionRuleRecord>),
+    Discovered(Arc<PatternCandidate>),
+    Policy {
+        source: &'static str,
+        rule: PermissionRule,
+        locator: Option<VerifiedLocalSourceLocator>,
+    },
+    Review(PermissionReviewCandidate),
+    ProjectConfig,
+}
+
+#[derive(Clone, PartialEq)]
 struct PermissionEntry {
+    source: PickerEntry,
     id: Option<String>,
     tool: String,
     detail: String,
@@ -139,6 +180,16 @@ struct PermissionEntry {
     read_only_policy: bool,
     project_config_action: Option<ProjectConfigAction>,
     suggestion: Option<SuggestedPatternTarget>,
+}
+
+impl PermissionEntry {
+    fn scope(&self) -> Option<ScopeModel> {
+        match &self.source {
+            PickerEntry::Stored(record) => Some(ScopeModel::record(record.clone())),
+            PickerEntry::Discovered(candidate) => Some(ScopeModel::candidate(candidate.clone())),
+            _ => None,
+        }
+    }
 }
 
 impl PickerItem for PermissionEntry {
@@ -152,7 +203,7 @@ impl PickerItem for PermissionEntry {
         } else if self.project_config_action.is_some() {
             "Project configuration"
         } else if self.id.is_some() {
-            "Active structured permissions"
+            "Stored permissions"
         } else if self.read_only_policy {
             "Active policy · read-only"
         } else {
@@ -177,6 +228,10 @@ pub(crate) struct PermissionsPicker {
     popup: Rect,
     toolbar_hits: FooterHits,
     tabs_hits: FooterHits,
+    scope_view: ScopeView,
+    editor: Option<ScopeEditor>,
+    current_project: Option<PathBuf>,
+    project_filter: ProjectFilter,
 }
 
 struct SuggestionInspector {
@@ -271,6 +326,10 @@ impl PermissionsPicker {
             popup: Rect::default(),
             toolbar_hits: FooterHits::default(),
             tabs_hits: FooterHits::default(),
+            scope_view: ScopeView::default(),
+            editor: None,
+            current_project: None,
+            project_filter: ProjectFilter::All,
         }
     }
 
@@ -341,6 +400,27 @@ impl PermissionsPicker {
         self.entries
             .iter()
             .filter(|entry| entry.suggestion.is_some() == (self.mode == PermissionsMode::Discover))
+            .filter(|entry| match (&self.project_filter, &entry.source) {
+                (ProjectFilter::All, _) => true,
+                (ProjectFilter::History, PickerEntry::Stored(record)) => {
+                    record.revoked_at.is_some()
+                }
+                (ProjectFilter::Here, PickerEntry::Stored(record)) => {
+                    record.revoked_at.is_none()
+                        && self.current_project.as_ref().is_some_and(|project| {
+                            record
+                                .project
+                                .as_ref()
+                                .is_none_or(|binding| binding == project)
+                        })
+                }
+                (ProjectFilter::Other, PickerEntry::Stored(record)) => record
+                    .project
+                    .as_ref()
+                    .is_some_and(|binding| Some(binding) != self.current_project.as_ref()),
+                (_, PickerEntry::Discovered(_)) => true,
+                _ => false,
+            })
             .cloned()
             .collect()
     }
@@ -432,6 +512,15 @@ impl PermissionsPicker {
     }
 
     pub(crate) fn handle_key(&mut self, key: KeyEvent) -> PermissionsPickerAction {
+        if let Some(editor) = &mut self.editor {
+            return editor.handle_key(key).map_or(
+                PermissionsPickerAction::Consumed,
+                PermissionsPickerAction::Editor,
+            );
+        }
+        if key.kind != crossterm::event::KeyEventKind::Press {
+            return PermissionsPickerAction::Consumed;
+        }
         if !self.has_pending_confirmation()
             && !self.discovery_view
             && key.modifiers == KeyModifiers::CONTROL
@@ -489,6 +578,29 @@ impl PermissionsPicker {
         }
         if key.modifiers == KeyModifiers::CONTROL {
             match key.code {
+                KeyCode::Char('n') => return self.manage(EditorLaunch::New),
+                KeyCode::Char('e') => return self.edit_selected(false),
+                KeyCode::Char('u') => return self.edit_selected(true),
+                KeyCode::Char('b') => return self.copy_selected(),
+                KeyCode::Char('f') => {
+                    self.cycle_project_filter();
+                    return PermissionsPickerAction::Consumed;
+                }
+                KeyCode::Char('i') => {
+                    self.inspect_suggestion();
+                    return PermissionsPickerAction::Consumed;
+                }
+                KeyCode::Char('k') => {
+                    if let Some(id) = self
+                        .picker
+                        .selected_item()
+                        .and_then(|entry| entry.id.clone())
+                    {
+                        self.confirm_revoke(id);
+                        self.detail_focused = true;
+                    }
+                    return PermissionsPickerAction::Consumed;
+                }
                 KeyCode::Char('r') => return self.discovery_action(false),
                 KeyCode::Char('x') => return self.discovery_action(true),
                 KeyCode::Char('g') => {
@@ -521,24 +633,30 @@ impl PermissionsPicker {
                 && self.mode == PermissionsMode::Discover
                 && !self.discovery_view
             {
-                self.inspect_suggestion();
+                self.scope_view.handle_key(key);
             } else if key::QUIT.matches(key) {
                 return PermissionsPickerAction::Close;
             } else {
-                self.detail.scroll.handle_key(key);
+                if self
+                    .picker
+                    .selected_item()
+                    .and_then(PermissionEntry::scope)
+                    .is_some()
+                {
+                    self.scope_view.handle_key(key);
+                } else {
+                    self.detail.scroll.handle_key(key);
+                }
             }
             return PermissionsPickerAction::Consumed;
         }
         if key.code == KeyCode::Enter {
             if let Some(entry) = self.picker.selected_item() {
-                if entry.suggestion.is_some() {
-                    self.inspect_suggestion();
-                } else if let Some(action) = entry.project_config_action {
+                if let Some(action) = entry.project_config_action {
                     self.confirm_project_config_action(action);
-                } else if let Some(id) = entry.id.clone() {
-                    self.confirm_revoke(id);
                 } else {
-                    self.show_read_only(entry.read_only_policy);
+                    self.detail_focused = true;
+                    self.discovery_view = false;
                 }
             }
             return PermissionsPickerAction::Consumed;
@@ -564,6 +682,12 @@ impl PermissionsPicker {
     }
 
     pub(crate) fn handle_mouse(&mut self, event: MouseEvent) -> PermissionsPickerAction {
+        if let Some(editor) = &mut self.editor {
+            return editor.handle_mouse(event).map_or(
+                PermissionsPickerAction::Consumed,
+                PermissionsPickerAction::Editor,
+            );
+        }
         if let Some(inspector) = &mut self.suggestion_inspector {
             inspector.handle_mouse(event);
             return PermissionsPickerAction::Consumed;
@@ -571,10 +695,32 @@ impl PermissionsPicker {
         if self.has_pending_confirmation() {
             return PermissionsPickerAction::Consumed;
         }
+        if self.notice.is_none()
+            && !self.discovery_view
+            && self
+                .detail
+                .popup
+                .contains(Position::new(event.column, event.row))
+            && self
+                .picker
+                .selected_item()
+                .and_then(PermissionEntry::scope)
+                .is_some()
+            && self.scope_view.handle_mouse(event)
+        {
+            if event.kind == MouseEventKind::Down(MouseButton::Left) {
+                self.detail_focused = true;
+            }
+            return PermissionsPickerAction::Consumed;
+        }
         if self.detail.handle_mouse(event) {
             return PermissionsPickerAction::Consumed;
         }
         if let Some(tab) = self.tabs_hits.handle_mouse(event) {
+            if tab == 2 {
+                self.cycle_project_filter();
+                return PermissionsPickerAction::Consumed;
+            }
             self.set_mode(if tab == 0 {
                 PermissionsMode::Rules
             } else {
@@ -583,16 +729,38 @@ impl PermissionsPicker {
             return PermissionsPickerAction::Consumed;
         }
         if let Some(control) = self.toolbar_hits.handle_mouse(event) {
+            if self.mode == PermissionsMode::Rules {
+                return match control {
+                    0 => self.manage(EditorLaunch::New),
+                    1 => self.edit_selected(false),
+                    2 => self.edit_selected(true),
+                    4 => self.copy_selected(),
+                    3 => {
+                        if let Some(id) = self
+                            .picker
+                            .selected_item()
+                            .and_then(|entry| entry.id.clone())
+                        {
+                            self.confirm_revoke(id);
+                            self.detail_focused = true;
+                        }
+                        PermissionsPickerAction::Consumed
+                    }
+                    _ => PermissionsPickerAction::Consumed,
+                };
+            }
             match control {
                 0 => return self.discovery_action(false),
                 1 => return self.discovery_action(true),
                 2 => self.show_discovery_overview(),
+                3 => return self.edit_selected(false),
                 _ => {}
             }
             return PermissionsPickerAction::Consumed;
         }
         let position = Position::new(event.column, event.row);
         if self.detail.popup.contains(position) {
+            self.scope_view.handle_mouse(event);
             if event.kind == MouseEventKind::Down(MouseButton::Left) {
                 self.detail_focused = true;
             }
@@ -608,6 +776,10 @@ impl PermissionsPicker {
     }
 
     pub(crate) fn handle_paste(&mut self, text: &str) -> bool {
+        if let Some(editor) = &mut self.editor {
+            editor.handle_paste(text);
+            return true;
+        }
         if self.suggestion_inspector.is_some() || self.detail_focused {
             return true;
         }
@@ -621,6 +793,10 @@ impl PermissionsPicker {
     }
 
     pub(crate) fn scroll(&mut self, delta: i32) {
+        if let Some(editor) = &mut self.editor {
+            editor.scroll(delta);
+            return;
+        }
         if let Some(inspector) = &mut self.suggestion_inspector {
             inspector.scroll.scroll(delta);
             return;
@@ -629,6 +805,7 @@ impl PermissionsPicker {
             return;
         }
         if self.detail_focused {
+            self.scope_view.scroll(delta);
             self.detail.scroll.scroll(delta);
         } else {
             let selected = self.picker.selected_index();
@@ -638,9 +815,14 @@ impl PermissionsPicker {
     }
 
     pub(crate) fn scroll_at(&mut self, position: Position, delta: i32) {
+        if let Some(editor) = &mut self.editor {
+            editor.scroll_at(position, delta);
+            return;
+        }
         if self.suggestion_inspector.is_some() || self.has_pending_confirmation() {
             self.scroll(delta);
         } else if self.detail.popup.contains(position) {
+            self.scope_view.scroll(delta);
             self.detail.scroll.scroll(delta);
         } else if self.picker.contains(position) {
             let selected = self.picker.selected_index();
@@ -687,11 +869,59 @@ impl PermissionsPicker {
             max_height_percent: MANAGER_SIZE_PERCENT,
         }
         .render(frame, area, area.height.saturating_sub(CHROME_LINES));
+        if self.popup != popup {
+            self.toolbar_hits.clear();
+            self.tabs_hits.clear();
+        }
         self.popup = popup;
+        let actions: &[&str] = if self.editor.is_some() {
+            &[]
+        } else if self.mode == PermissionsMode::Rules {
+            if self.picker.selected_item().is_some_and(|entry| {
+                matches!(
+                    &entry.source,
+                    PickerEntry::Policy {
+                        locator: Some(_),
+                        ..
+                    }
+                )
+            }) {
+                &[
+                    "[New ^N]",
+                    "[Edit source ^E]",
+                    "[Duplicate ^U]",
+                    "[Revoke ^K]",
+                    "[Copy ^B]",
+                ]
+            } else {
+                &[
+                    "[New ^N]",
+                    "[Edit ^E]",
+                    "[Duplicate ^U]",
+                    "[Revoke ^K]",
+                    "[Copy ^B]",
+                ]
+            }
+        } else {
+            &[
+                "[Refresh ^R]",
+                "[Cancel ^X]",
+                "[Overview ^O]",
+                "[Create permission ^E]",
+            ]
+        };
+        let (_, toolbar_rows) = actions.iter().fold((0, 1), |(mut x, mut rows), action| {
+            let width = (action.width() as u16).min(inner.width);
+            if x + width > inner.width {
+                x = 0;
+                rows += 1;
+            }
+            (x + width + 1, rows)
+        });
         let chrome = u16::from(area.height >= MIN_CHROME_HEIGHT);
         let [tabs, toolbar, status, body, footer] = Layout::vertical([
             Constraint::Length(1),
-            Constraint::Length(1),
+            Constraint::Length(toolbar_rows),
             Constraint::Length(chrome),
             Constraint::Min(0),
             Constraint::Length(chrome),
@@ -718,7 +948,10 @@ impl PermissionsPicker {
                 },
             );
         }
-        navigation.text("  Ctrl+G switch", theme.item_desc);
+        if self.mode == PermissionsMode::Rules {
+            navigation.text(" ", theme.item);
+            navigation.command(self.project_filter.label(), theme.item);
+        }
         frame.render_widget(
             Paragraph::new(navigation.line(self.tabs_hits.hovered())),
             tabs,
@@ -752,43 +985,56 @@ impl PermissionsPicker {
             ));
         }
         frame.render_widget(Paragraph::new(Line::from(status_line)), status);
-        let mut controls = FooterLine::default();
-        controls.command("[Refresh ^R]", theme.item);
-        controls.text(" ", theme.item);
-        controls.command("[Cancel ^X]", theme.item);
-        controls.text(" ", theme.item);
-        controls.command("[Overview ^O]", theme.item);
-        frame.render_widget(
-            Paragraph::new(controls.line(self.toolbar_hits.hovered())),
-            toolbar,
-        );
-        self.toolbar_hits.set(controls.hits(toolbar, 0, 1));
-        let [list, detail] = if body.height < MIN_SPLIT_HEIGHT && inner.width < SIDE_BY_SIDE_WIDTH {
-            if self.detail_focused || self.has_pending_confirmation() {
+        if self.editor.is_some() {
+            frame.render_widget(
+                Paragraph::new("Draft open · Save or Cancel below; inventory unchanged")
+                    .style(theme.item_desc),
+                toolbar,
+            );
+        }
+        let (mut x, mut y) = (toolbar.x, toolbar.y);
+        let mut action_hits = Vec::new();
+        for action in actions {
+            let width = (action.width() as u16).min(toolbar.width);
+            if x + width > toolbar.right() {
+                x = toolbar.x;
+                y += 1;
+            }
+            if y >= toolbar.bottom() {
+                break;
+            }
+            let cell = Rect::new(x, y, width.min(toolbar.width), 1);
+            frame.render_widget(Paragraph::new(*action).style(theme.keybind_key), cell);
+            action_hits.push(cell);
+            x += width + 1;
+        }
+        self.toolbar_hits.set(action_hits);
+        let [list, detail] = if body.width < SIDE_BY_SIDE_WIDTH {
+            if self.detail_focused || self.has_pending_confirmation() || self.editor.is_some() {
                 [Rect::default(), body]
             } else {
                 [body, Rect::default()]
             }
-        } else if inner.width >= SIDE_BY_SIDE_WIDTH {
-            Layout::horizontal([
-                Constraint::Percentage(LIST_WIDTH_PERCENT),
-                Constraint::Min(0),
-            ])
-            .areas(body)
         } else {
-            Layout::vertical([
-                Constraint::Percentage(STACKED_LIST_PERCENT),
+            let [list, _, detail] = Layout::horizontal([
+                Constraint::Length(LIST_WIDTH),
+                Constraint::Length(PANE_GAP),
                 Constraint::Min(0),
             ])
-            .areas(body)
+            .areas(body);
+            [list, detail]
         };
         if list.height > 0 {
             self.picker.view(frame, list);
         }
-        self.view_detail(frame, detail);
+        if let Some(editor) = &mut self.editor {
+            editor.view(frame, detail);
+        } else {
+            self.view_detail(frame, detail);
+        }
         frame.render_widget(
             Paragraph::new(hint_line(&[
-                ("Tab", "Pane"),
+                ("Tab", "List/Detail"),
                 ("PgUp/Dn", "Scroll"),
                 ("Esc", "Back"),
             ])),
@@ -798,6 +1044,29 @@ impl PermissionsPicker {
     }
 
     fn view_detail(&mut self, frame: &mut Frame, area: Rect) {
+        self.detail.popup = area;
+        if area.is_empty() {
+            return;
+        }
+        if self.notice.is_none()
+            && !self.discovery_view
+            && let Some(mut model) = self.picker.selected_item().and_then(PermissionEntry::scope)
+        {
+            if let Some(current) = &self.current_project
+                && let Some(PickerEntry::Stored(record)) =
+                    self.picker.selected_item().map(|entry| &entry.source)
+                && record
+                    .project
+                    .as_ref()
+                    .is_some_and(|project| project != current)
+                && record.revoked_at.is_none()
+            {
+                model.activity = ScopeActivity::OtherProject;
+            }
+            self.scope_view
+                .render(&model, area, frame.buffer_mut(), &theme::current());
+            return;
+        }
         let theme = theme::current();
         let block = Block::bordered()
             .title(if self.mode == PermissionsMode::Discover {
@@ -966,6 +1235,8 @@ impl PermissionsPicker {
 
     fn selection_changed(&mut self, previous: Option<usize>) {
         if previous != self.picker.selected_index() {
+            self.toolbar_hits.clear();
+            self.scope_view = ScopeView::default();
             self.detail.scroll.reset();
             self.discovery_view = false;
             self.notice = None;
@@ -976,20 +1247,14 @@ impl PermissionsPicker {
         match action {
             PickerAction::Consumed | PickerAction::Toggle(..) => PermissionsPickerAction::Consumed,
             PickerAction::Select(entry) => {
-                self.detail_focused = false;
+                self.detail_focused = true;
                 self.discovery_view = false;
                 let search = self.picker.search_text();
                 self.picker.open(self.visible_entries(), self.mode.title());
                 self.picker.set_search_text(&search);
                 self.picker.select_item_by(|candidate| candidate == &entry);
-                if entry.suggestion.is_some() {
-                    self.inspect_suggestion();
-                } else if let Some(action) = entry.project_config_action {
+                if let Some(action) = entry.project_config_action {
                     self.confirm_project_config_action(action);
-                } else if let Some(id) = entry.id {
-                    self.confirm_revoke(id);
-                } else {
-                    self.show_read_only(entry.read_only_policy);
                 }
                 PermissionsPickerAction::Consumed
             }
@@ -1023,7 +1288,9 @@ impl PermissionsPicker {
 
     fn confirm_revoke(&mut self, id: String) {
         self.pending_revoke = Some(id);
-        self.notice = Some(CONFIRM_REVOKE_MESSAGE.into());
+        self.notice = Some(format!(
+            "{CONFIRM_REVOKE_MESSAGE}\nOpaque constraints remain unknown; removing Deny/Ask can increase authority. Already-running calls cannot be undone."
+        ));
         self.detail.scroll.reset();
     }
 
@@ -1039,6 +1306,90 @@ impl PermissionsPicker {
 
     fn has_pending_confirmation(&self) -> bool {
         self.pending_revoke.is_some() || self.pending_project_config_action.is_some()
+    }
+
+    fn manage(&mut self, launch: EditorLaunch) -> PermissionsPickerAction {
+        PermissionsPickerAction::Editor(EditorEvent::Begin(launch))
+    }
+
+    pub(crate) fn set_current_project(&mut self, project: Option<PathBuf>) {
+        if self.current_project != project {
+            self.current_project = project;
+            self.scope_view = ScopeView::default();
+            self.toolbar_hits.clear();
+            if let Some(editor) = &mut self.editor {
+                editor.suspend();
+            }
+        }
+    }
+
+    fn cycle_project_filter(&mut self) {
+        if self.mode != PermissionsMode::Rules || self.has_pending_confirmation() {
+            return;
+        }
+        self.project_filter = match self.project_filter {
+            ProjectFilter::All => ProjectFilter::Here,
+            ProjectFilter::Here => ProjectFilter::Other,
+            ProjectFilter::Other => ProjectFilter::History,
+            ProjectFilter::History => ProjectFilter::All,
+        };
+        self.picker.replace_items(self.visible_entries());
+        self.scope_view = ScopeView::default();
+        self.tabs_hits.clear();
+        self.toolbar_hits.clear();
+    }
+
+    fn edit_selected(&mut self, duplicate: bool) -> PermissionsPickerAction {
+        match self
+            .picker
+            .selected_item()
+            .map(|entry| entry.source.clone())
+        {
+            Some(PickerEntry::Stored(record)) => self.manage(if duplicate {
+                EditorLaunch::Duplicate(record)
+            } else {
+                EditorLaunch::Edit(record)
+            }),
+            Some(PickerEntry::Discovered(candidate)) => {
+                self.manage(EditorLaunch::Discover(candidate))
+            }
+            Some(PickerEntry::Policy {
+                locator: Some(locator),
+                ..
+            }) if !duplicate => PermissionsPickerAction::EditSource(locator),
+            Some(_) => {
+                self.show_read_only(true);
+                self.detail_focused = true;
+                PermissionsPickerAction::Consumed
+            }
+            None => PermissionsPickerAction::Consumed,
+        }
+    }
+
+    pub(crate) fn set_editor(&mut self, editor: ScopeEditor) {
+        self.editor = Some(editor);
+    }
+
+    fn copy_selected(&mut self) -> PermissionsPickerAction {
+        if let Some(PickerEntry::Stored(source)) =
+            self.picker.selected_item().map(|entry| &entry.source)
+        {
+            self.manage(EditorLaunch::Copy {
+                source: source.clone(),
+                draft: None,
+            })
+        } else {
+            self.show_read_only(true);
+            PermissionsPickerAction::Consumed
+        }
+    }
+
+    pub(crate) fn editor_mut(&mut self) -> Option<&mut ScopeEditor> {
+        self.editor.as_mut()
+    }
+
+    pub(crate) fn close_editor(&mut self) {
+        self.editor = None;
     }
 }
 
@@ -1060,6 +1411,7 @@ impl Overlay for PermissionsPicker {
 fn project_config_entry(action: ProjectConfigAction) -> PermissionEntry {
     let trusted = action == ProjectConfigAction::RevokeTrust;
     PermissionEntry {
+        source: PickerEntry::ProjectConfig,
         id: None,
         tool: "Project permissions.toml".into(),
         detail: if trusted {
@@ -1163,6 +1515,7 @@ fn suggestion_entry(
         lines.push(OMITTED.into());
     }
     Some(PermissionEntry {
+        source: PickerEntry::Discovered(Arc::new(candidate.clone())),
         id: None,
         tool: template,
         detail,
@@ -1251,7 +1604,10 @@ fn entry(record: PermissionRuleRecord) -> PermissionEntry {
     };
     let review = record.review.as_ref();
     let tool = display_text(
-        review.map_or(&fallback_tool, |review| &review.tool),
+        record
+            .label
+            .as_ref()
+            .unwrap_or_else(|| review.map_or(&fallback_tool, |review| &review.tool)),
         MAX_FIELD_CHARS,
     );
     let mut description = vec![tool.clone()];
@@ -1358,7 +1714,8 @@ fn entry(record: PermissionRuleRecord) -> PermissionEntry {
         scopes.join(" · ")
     };
     PermissionEntry {
-        id: Some(record.id),
+        id: Some(record.id.clone()),
+        source: PickerEntry::Stored(Arc::new(record)),
         tool: display_text(&format!("{tool} · {label}"), MAX_DISPLAY_CHARS),
         detail,
         description: Some(bounded_text(&description.join("\n"), MAX_DISPLAY_CHARS)),
@@ -1444,6 +1801,7 @@ fn review_entry(candidate: &PermissionReviewCandidate) -> PermissionEntry {
         .unwrap_or_else(|| "*".into());
     let scope = candidate.scope.as_deref().unwrap_or("<all>");
     PermissionEntry {
+        source: PickerEntry::Review(candidate.clone()),
         id: None,
         tool: display_text(&tool, MAX_FIELD_CHARS),
         detail: format!(
@@ -1460,6 +1818,11 @@ fn review_entry(candidate: &PermissionReviewCandidate) -> PermissionEntry {
 fn policy_entry(entry: &ActivePolicyRule) -> PermissionEntry {
     let scope = entry.rule.scope.as_deref().unwrap_or("<all>");
     PermissionEntry {
+        source: PickerEntry::Policy {
+            source: entry.source,
+            rule: entry.rule.clone(),
+            locator: entry.verified_local_source_locator.clone(),
+        },
         id: None,
         tool: display_text(&entry.rule.tool.to_string(), MAX_FIELD_CHARS),
         detail: format!(
@@ -1480,6 +1843,20 @@ fn policy_entry(entry: &ActivePolicyRule) -> PermissionEntry {
 }
 
 fn authority_badge(record: &PermissionRuleRecord) -> String {
+    if record.rule.family.is_some()
+        || record.rule.resources.iter().any(|resource| {
+            matches!(
+                resource.selector,
+                PermissionResourceSelector::CommandTemplate { .. }
+                    | PermissionResourceSelector::RemoteResource { .. }
+                    | PermissionResourceSelector::RemoteSubtree { .. }
+                    | PermissionResourceSelector::Prefix { .. }
+                    | PermissionResourceSelector::Subtree { .. }
+            )
+        })
+    {
+        return rule_kind(&record.rule);
+    }
     let argument = match record.rule.arguments {
         PermissionArgumentConstraint::Exact { .. } => "exact",
         PermissionArgumentConstraint::Selected { .. }
@@ -1553,7 +1930,11 @@ fn lifetime_name(lifetime: &PermissionLifetime) -> &'static str {
 }
 
 fn footer() -> Line<'static> {
-    hint_line(&[("Enter", "Review"), ("Tab", "Details"), ("Esc", "Close")])
+    hint_line(&[
+        ("Enter", "Inspect"),
+        ("Tab", "List/Detail"),
+        ("Esc", "Close"),
+    ])
 }
 
 fn trust_footer() -> Line<'static> {
@@ -1623,6 +2004,7 @@ mod tests {
     use test_case::test_case;
     use unicode_width::UnicodeWidthStr;
 
+    use crate::components::permission_scope::view::Disclosure;
     use crate::components::{buffer_text, list_picker::PickerItem};
     use crate::{PatternDiscoveryOutcome, test_pattern_discovery_report, theme};
 
@@ -1677,6 +2059,10 @@ mod tests {
     const EXPORT_UNICODE_PATH: &str =
         "/project/docs/設計/rollout notes/production/recovery checklist.md";
     const EXPORT_ANCHORS: [&str; 2] = ["shell · Exact: git status", "shell · Exact: opsctl"];
+    const EXPORT_LONG_ANCHORS: [&str; 2] = [
+        "shell · Exact: opsctl task inspect --id task-000",
+        "shell · Exact: opsctl task inspect --id task-001",
+    ];
     const MODE_TEST_RULE_INDEX: usize = 17;
     const PROPOSAL_ANCHORS: [&str; 2] = ["opsctl release inspect", "artifactctl artifact describe"];
 
@@ -1769,6 +2155,9 @@ mod tests {
     }
 
     fn read_suggestion(picker: &mut PermissionsPicker, width: u16, height: u16) -> String {
+        if picker.suggestion_inspector.is_none() {
+            picker.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::CONTROL));
+        }
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         let mut rows = BTreeMap::new();
         loop {
@@ -1811,6 +2200,37 @@ mod tests {
         picker.detail_focused = true;
         picker.detail.scroll.reset();
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        if picker
+            .picker
+            .selected_item()
+            .and_then(super::PermissionEntry::scope)
+            .is_some()
+            && !picker.discovery_view
+            && picker.notice.is_none()
+        {
+            let mut text = String::new();
+            for disclosure in [None, Some(Disclosure::Evidence)] {
+                picker.scope_view.disclosure = disclosure;
+                picker.scope_view.offset = 0;
+                let mut previous = None;
+                for _ in 0..MAX_DISPLAY_CHARS {
+                    terminal
+                        .draw(|frame| {
+                            picker.view(frame, frame.area());
+                        })
+                        .unwrap();
+                    if previous == Some(picker.scope_view.offset) {
+                        break;
+                    }
+                    previous = Some(picker.scope_view.offset);
+                    text.push_str(&buffer_text(terminal.backend().buffer()));
+                    picker.scope_view.scroll(1);
+                }
+            }
+            picker.scope_view = super::ScopeView::default();
+            picker.detail_focused = false;
+            return compact(&text);
+        }
         let mut rows = BTreeMap::new();
         loop {
             terminal
@@ -1986,9 +2406,14 @@ mod tests {
         text
     }
 
-    fn export_list_anchors(picker: &PermissionsPicker, text: &str) -> Vec<Position> {
-        EXPORT_ANCHORS
-            .into_iter()
+    fn export_list_anchors(
+        picker: &PermissionsPicker,
+        text: &str,
+        labels: &[&str],
+    ) -> Vec<Position> {
+        labels
+            .iter()
+            .copied()
             .map(|label| {
                 text.lines()
                     .enumerate()
@@ -2078,9 +2503,13 @@ mod tests {
                     let buffer = export_buffer(&mut picker, width, height);
                     let stem = format!("{panel}-{name}-{width}x{height}");
                     if panel == "active-short" {
-                        anchors = export_list_anchors(&picker, &export_rows(&buffer));
+                        anchors =
+                            export_list_anchors(&picker, &export_rows(&buffer), &EXPORT_ANCHORS);
                     } else if panel == "active-long" {
-                        assert_eq!(export_list_anchors(&picker, &export_rows(&buffer)), anchors);
+                        assert_eq!(
+                            export_list_anchors(&picker, &export_rows(&buffer), &EXPORT_ANCHORS),
+                            anchors
+                        );
                         println!("{stem}: stable list anchors {anchors:?}");
                     }
                     write_export_buffer(directory.path(), &stem, &buffer);
@@ -2152,14 +2581,16 @@ mod tests {
         for key in [KeyCode::Down, KeyCode::Tab, KeyCode::Tab, KeyCode::Up] {
             picker.handle_key(KeyEvent::from(key));
             let buffer = export_buffer(&mut picker, width, height);
-            assert_eq!(proposal_anchors(&picker, &export_rows(&buffer)), anchors);
-            assert_eq!((picker.popup, picker.detail.popup), panes);
+            if !picker.detail_focused || width >= super::SIDE_BY_SIDE_WIDTH {
+                assert_eq!(proposal_anchors(&picker, &export_rows(&buffer)), anchors);
+                assert_eq!((picker.popup, picker.detail.popup), panes);
+            }
             assert_eq!((picker.tabs_hits.hit(0), picker.tabs_hits.hit(1)), tabs);
             assert!(picker.discovery_mode());
         }
         assert!(picker.picker.selected_item().unwrap().suggestion == first);
         picker.handle_key(KeyEvent::from(KeyCode::Enter));
-        assert!(picker.suggestion_inspector.is_some());
+        assert!(picker.detail_focused);
         assert!(!picker.has_pending_confirmation());
     }
 
@@ -2226,7 +2657,7 @@ mod tests {
         picker.picker.select(MODE_TEST_RULE_INDEX);
         let selected = picker.picker.selected_item().unwrap().clone();
         if pending {
-            picker.handle_key(KeyEvent::from(KeyCode::Enter));
+            picker.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
         } else {
             picker.handle_key(KeyEvent::from(KeyCode::Tab));
         }
@@ -2345,7 +2776,14 @@ mod tests {
                 row: position.y,
                 modifiers: KeyModifiers::NONE,
             });
-            assert_eq!(picker.pending_revoke.as_deref(), Some(NAV_LABELS[index]));
+            assert!(picker.pending_revoke.is_none());
+            assert_eq!(
+                picker
+                    .picker
+                    .selected_item()
+                    .and_then(|entry| entry.id.as_deref()),
+                Some(NAV_LABELS[index])
+            );
             picker.handle_key(KeyEvent::from(KeyCode::Esc));
             terminal
                 .draw(|frame| {
@@ -2369,8 +2807,13 @@ mod tests {
             .unwrap();
         let rows = nav_positions(&picker, &terminal);
         picker.handle_key(KeyEvent::from(KeyCode::Tab));
+        terminal
+            .draw(|frame| {
+                picker.view(frame, frame.area());
+            })
+            .unwrap();
         picker.handle_key(KeyEvent::from(KeyCode::PageDown));
-        assert!(picker.detail.scroll.offset() > 0);
+        assert!(picker.scope_view.offset > 0);
         let selected = picker.picker.selected_index();
         picker.handle_paste(COMMAND);
         assert!(picker.picker.search_text().is_empty());
@@ -2382,7 +2825,11 @@ mod tests {
                 picker.view(frame, frame.area());
             })
             .unwrap();
-        assert_eq!(nav_positions(&picker, &terminal), rows);
+        if width >= super::SIDE_BY_SIDE_WIDTH {
+            assert_eq!(nav_positions(&picker, &terminal), rows);
+        } else {
+            assert!(!picker.detail.popup.is_empty());
+        }
         picker.handle_key(KeyEvent::from(KeyCode::BackTab));
         picker.handle_key(KeyEvent::from(KeyCode::Down));
         assert_ne!(picker.picker.selected_index(), selected);
@@ -2577,7 +3024,7 @@ mod tests {
     #[test_case(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL); "control_c_returns_to_list")]
     fn suggested_inspection_pages_and_mouse_scroll_without_editing_or_approving(close: KeyEvent) {
         let mut picker = suggested_picker();
-        picker.handle_key(KeyEvent::from(KeyCode::Enter));
+        picker.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::CONTROL));
         let mut terminal = Terminal::new(TestBackend::new(NARROW_WIDTH, SHORT_HEIGHT)).unwrap();
         terminal
             .draw(|frame| {
@@ -2614,7 +3061,7 @@ mod tests {
         assert!(picker.suggestion_inspector.is_some());
         assert!(!picker.has_pending_confirmation());
         picker.handle_key(close);
-        picker.handle_key(KeyEvent::from(KeyCode::Enter));
+        picker.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::CONTROL));
         assert_eq!(
             picker
                 .suggestion_inspector
@@ -2636,7 +3083,7 @@ mod tests {
             })
             .unwrap();
         let screen = compact(&buffer_text(terminal.backend().buffer()))
-            + read_details(&mut picker, 150, 36).as_str();
+            + read_suggestion(&mut picker, 150, 36).as_str();
         for text in [
             SUGGESTED_SECTION,
             SUGGESTED_COMMAND,
@@ -2672,7 +3119,7 @@ mod tests {
             picker.handle_key(KeyEvent::from(KeyCode::Enter)),
             PermissionsPickerAction::Consumed
         ));
-        assert!(picker.suggestion_inspector.is_some());
+        assert!(picker.detail_focused || picker.suggestion_inspector.is_some());
         assert!(matches!(
             picker.handle_key(KeyEvent::from(KeyCode::Esc)),
             PermissionsPickerAction::Consumed
@@ -2731,7 +3178,7 @@ mod tests {
             picker.map_action(PickerAction::Select(rendered)),
             PermissionsPickerAction::Consumed
         ));
-        assert!(picker.suggestion_inspector.is_some());
+        assert!(picker.detail_focused);
         for key in [KeyCode::Enter, KeyCode::Char('y'), KeyCode::Enter] {
             assert!(matches!(
                 picker.handle_key(KeyEvent::from(key)),
@@ -2779,7 +3226,7 @@ mod tests {
         let record = record();
         let id = record.id.clone();
         picker.open(vec![record], &[], &[], false, false);
-        picker.handle_key(KeyEvent::from(KeyCode::Enter));
+        picker.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
         picker.set_suggestions(Path::new(ROOT), SUGGESTION_REVISION, &[suggestion()]);
         assert!(matches!(
             picker.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL)),
@@ -2831,16 +3278,16 @@ mod tests {
         let screen = compact(&buffer_text(terminal.backend().buffer()))
             + read_details(&mut picker, 100, 24).as_str();
         assert!(screen.contains("bash"));
-        assert!(screen.contains(&compact("[exact:exact-resource] deny")));
-        assert!(screen.contains("conversation"));
+        assert!(screen.contains("[DENY]"));
+        assert!(screen.contains("[CONVERSATION]"));
         assert!(screen.contains(&compact(COMMAND)));
-        assert!(screen.contains("command:"));
-        assert!(!screen.contains(&digest[..10]));
+        assert!(screen.contains("\"command\":"));
+        assert!(screen.contains(&digest[..10]));
         assert!(!screen.contains(&id[..10]));
 
         let enter = KeyEvent::from(KeyCode::Enter);
         assert!(matches!(
-            picker.handle_key(enter),
+            picker.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL)),
             PermissionsPickerAction::Consumed
         ));
         terminal
@@ -2982,7 +3429,7 @@ mod tests {
         let screen = compact(&buffer_text(terminal.backend().buffer()))
             + read_details(&mut picker, 70, 16).as_str();
         assert!(screen.contains(&compact(COMMAND_PATTERN)));
-        assert!(screen.contains("command-pattern"));
+        assert!(screen.contains("TOKENPREFIX"));
     }
 
     #[test]
@@ -3016,7 +3463,7 @@ mod tests {
         let screen = read_details(&mut picker, 120, 32);
         assert!(screen.contains(&compact(expected)), "{screen}");
         for key in input.as_object().unwrap().keys() {
-            assert!(screen.contains(&format!("{key}:")), "{screen}");
+            assert!(screen.contains(&format!("\"{key}\":")), "{screen}");
         }
     }
 
@@ -3127,7 +3574,7 @@ mod tests {
         let mut picker = PermissionsPicker::new();
         picker.open(vec![record], &[], &[], false, false);
         assert!(matches!(
-            picker.handle_key(KeyEvent::from(KeyCode::Enter)),
+            picker.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL)),
             PermissionsPickerAction::Consumed
         ));
         assert!(matches!(
@@ -3136,7 +3583,7 @@ mod tests {
         ));
         assert!(picker.pending_revoke.is_none());
         assert!(matches!(
-            picker.handle_key(KeyEvent::from(KeyCode::Enter)),
+            picker.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL)),
             PermissionsPickerAction::Consumed
         ));
         assert!(
@@ -3165,7 +3612,176 @@ mod tests {
         );
         assert!(matches!(
             picker.handle_key(KeyEvent::from(KeyCode::Enter)),
-            PermissionsPickerAction::Revoke(id) if id == selected_id
+            PermissionsPickerAction::Consumed
         ));
+        assert!(picker.pending_revoke.is_none());
+    }
+
+    #[test_case('n'; "new")]
+    #[test_case('e'; "edit")]
+    #[test_case('u'; "duplicate")]
+    #[test_case('b'; "copy")]
+    fn management_shortcuts_return_typed_requests_without_mutation(shortcut: char) {
+        let record = record();
+        let expected = record.clone();
+        let mut picker = PermissionsPicker::new();
+        picker.open(vec![record], &[], &[], false, false);
+        let action = picker.handle_key(KeyEvent::new(
+            KeyCode::Char(shortcut),
+            KeyModifiers::CONTROL,
+        ));
+        match action {
+            PermissionsPickerAction::Editor(super::EditorEvent::Begin(
+                super::EditorLaunch::New,
+            )) => assert_eq!(shortcut, 'n'),
+            PermissionsPickerAction::Editor(super::EditorEvent::Begin(
+                super::EditorLaunch::Edit(record),
+            )) => {
+                assert_eq!(shortcut, 'e');
+                assert_eq!(*record, expected);
+            }
+            PermissionsPickerAction::Editor(super::EditorEvent::Begin(
+                super::EditorLaunch::Duplicate(record),
+            )) => {
+                assert_eq!(shortcut, 'u');
+                assert_eq!(*record, expected);
+            }
+            PermissionsPickerAction::Editor(super::EditorEvent::Begin(
+                super::EditorLaunch::Copy { source, draft },
+            )) => {
+                assert_eq!(shortcut, 'b');
+                assert_eq!(*source, expected);
+                assert!(draft.is_none());
+            }
+            _ => panic!("expected a typed editor launch"),
+        }
+        assert!(picker.pending_revoke.is_none());
+        assert!(picker.editor.is_none());
+    }
+
+    #[test_case(false; "proposal_keyboard")]
+    #[test_case(true; "proposal_mouse")]
+    fn discover_create_passes_candidate_evidence_to_editor(mouse: bool) {
+        let mut picker = suggested_picker();
+        export_buffer(&mut picker, 80, 24);
+        let action = if mouse {
+            let hit = picker.toolbar_hits.hit(3);
+            assert!(!hit.is_empty());
+            picker.handle_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: hit.x,
+                row: hit.y,
+                modifiers: KeyModifiers::NONE,
+            });
+            picker.handle_mouse(MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column: hit.x,
+                row: hit.y,
+                modifiers: KeyModifiers::NONE,
+            })
+        } else {
+            picker.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL))
+        };
+        let PermissionsPickerAction::Editor(super::EditorEvent::Begin(
+            super::EditorLaunch::Discover(candidate),
+        )) = action
+        else {
+            panic!("expected discovery draft");
+        };
+        assert_eq!(*candidate, suggestion());
+        assert!(picker.pending_revoke.is_none());
+    }
+
+    #[test_case(false; "conditions")]
+    #[test_case(true; "identity")]
+    fn two_hundred_forty_rules_keep_whole_inventory_cells_when_scope_changes(identity: bool) {
+        let mut picker = export_picker("discovery-long-list");
+        picker.set_mode(PermissionsMode::Rules);
+        assert_eq!(picker.visible_entries().len(), EXPORT_LONG_GRANTS);
+        let before = export_buffer(&mut picker, 140, 32);
+        let anchors = export_list_anchors(&picker, &export_rows(&before), &EXPORT_LONG_ANCHORS);
+        picker.scope_view.disclosure = Some(if identity {
+            Disclosure::Identity
+        } else {
+            Disclosure::Conditions
+        });
+        picker.scope_view.scroll(4);
+        let after = export_buffer(&mut picker, 140, 32);
+        assert_eq!(
+            export_list_anchors(&picker, &export_rows(&after), &EXPORT_LONG_ANCHORS),
+            anchors
+        );
+        for y in before.area.y..before.area.bottom() {
+            for x in before.area.x..before.area.right() {
+                if picker.picker.contains(Position::new(x, y)) {
+                    assert_eq!(before[(x, y)], after[(x, y)]);
+                }
+            }
+        }
+    }
+
+    #[test_case(40, false; "narrow_copy")]
+    #[test_case(80, false; "normal_copy")]
+    #[test_case(140, false; "wide_copy")]
+    #[test_case(40, true; "narrow_create")]
+    #[test_case(80, true; "normal_create")]
+    #[test_case(140, true; "wide_create")]
+    fn last_toolbar_action_is_mouse_reachable(width: u16, discover: bool) {
+        let mut picker = if discover {
+            suggested_picker()
+        } else {
+            let mut picker = PermissionsPicker::new();
+            picker.open(vec![record()], &[], &[], false, false);
+            picker
+        };
+        export_buffer(&mut picker, width, MANAGER_TEST_HEIGHT);
+        let hit = picker.toolbar_hits.hit(if discover { 3 } else { 4 });
+        assert!(!hit.is_empty());
+        let event = |kind| MouseEvent {
+            kind,
+            column: hit.x,
+            row: hit.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        picker.handle_mouse(event(MouseEventKind::Down(MouseButton::Left)));
+        let action = picker.handle_mouse(event(MouseEventKind::Up(MouseButton::Left)));
+        if discover {
+            assert!(matches!(
+                action,
+                PermissionsPickerAction::Editor(super::EditorEvent::Begin(
+                    super::EditorLaunch::Discover(_)
+                ))
+            ));
+        } else {
+            assert!(matches!(
+                action,
+                PermissionsPickerAction::Editor(super::EditorEvent::Begin(
+                    super::EditorLaunch::Copy { .. }
+                ))
+            ));
+        }
+        assert!(picker.pending_revoke.is_none());
+    }
+
+    #[test_case(40; "narrow")]
+    #[test_case(80; "normal")]
+    #[test_case(140; "wide")]
+    fn wheel_scrolls_typed_scope_instead_of_legacy_detail(width: u16) {
+        let mut record = record();
+        record.review.as_mut().unwrap().resources[0].value =
+            Some(COMMAND.repeat(EXPORT_LONG_GRANTS));
+        let mut picker = PermissionsPicker::new();
+        picker.open(vec![record], &[], &[], false, false);
+        picker.handle_key(KeyEvent::from(KeyCode::Enter));
+        picker.scope_view.disclosure = Some(Disclosure::Evidence);
+        export_buffer(&mut picker, width, MANAGER_TEST_HEIGHT);
+        picker.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: picker.detail.popup.x,
+            row: picker.detail.popup.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(picker.scope_view.offset, 1);
+        assert_eq!(picker.detail.scroll.offset(), 0);
     }
 }

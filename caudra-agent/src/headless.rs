@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::collections::HashSet;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
@@ -18,15 +19,18 @@ use caudra_providers::{
 };
 #[cfg(test)]
 use caudra_providers::{ContentBlock, Message, Role};
-use caudra_storage::StateDir;
 use caudra_storage::id::{CaudraId, SessionRef};
 use caudra_storage::local_documents::LocalDocumentStore;
 use caudra_storage::permission_state::PermissionRuleRecord;
+use caudra_storage::permission_state::mutation::{
+    PermissionCommitReceipt, PermissionOwner, PermissionSnapshot, PreparedPermissionMutation,
+};
 use caudra_storage::sessions::{
-    SessionCursor, SessionDatabase, SessionLease, StoredMode, StoredPlanTarget, StoredSubagent,
-    StoredSubagentOutcome,
+    SessionCursor, SessionDatabase, SessionError, SessionLease, StoredMode, StoredPlanTarget,
+    StoredSubagent, StoredSubagentOutcome,
 };
 use caudra_storage::workspace_binding::StoredWorkspaceBinding;
+use caudra_storage::{StateDir, StorageError};
 use caudra_workflow::{RunSnapshot, WorkflowRequest, WorkflowResponse};
 use caudra_workspace::{
     CommandText, DirectoryNavigation, ExecRequest, LocalDocumentRef, OperationProgressKind,
@@ -43,6 +47,7 @@ use crate::agent::task_runner::{
 use crate::agent::{self, History};
 use crate::cancel::{CancelMap, CancelToken};
 use crate::mentions;
+use crate::permissions::editor::{PermissionEditError, PermissionPublication};
 use crate::permissions::{PermissionManager, PluginRuleStore};
 use crate::prompt::ResolvedSlots;
 use crate::prompt::profile::{BUILTIN_PROFILE_NAME, PromptProfileCatalog};
@@ -71,11 +76,54 @@ const REMOTE_COMMAND_FAILED: &str = "Remote command failed";
 const REMOTE_COMMAND_INDETERMINATE: &str =
     "Remote command outcome is indeterminate; it will not be retried";
 const REMOTE_COMMAND_TRUNCATED: &str = "[truncated]";
+const SESSION_DATABASE_UNAVAILABLE: &str = "session database unavailable";
+
+struct SessionPermissionPublication {
+    database: Arc<StdMutex<SessionDatabase>>,
+    lease: Arc<SessionLease>,
+}
+
+impl PermissionPublication for SessionPermissionPublication {
+    fn snapshot(&self) -> Result<PermissionSnapshot, PermissionEditError> {
+        Ok(self
+            .database
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .permission_snapshot(PermissionOwner::Conversation(self.lease.id()))?)
+    }
+
+    fn commit(
+        &self,
+        prepared: &PreparedPermissionMutation,
+    ) -> Result<PermissionCommitReceipt, PermissionEditError> {
+        if prepared.expected().iter().any(|snapshot| {
+            matches!(snapshot.revision.owner, PermissionOwner::Conversation(id) if id != self.lease.id())
+        }) {
+            return Err(PermissionEditError::Conflict);
+        }
+        Ok(self
+            .database
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .commit_permission_mutation(prepared)?)
+    }
+
+    fn receipt(
+        &self,
+        operation_id: CaudraId,
+    ) -> Result<Option<PermissionCommitReceipt>, PermissionEditError> {
+        Ok(self
+            .database
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .permission_receipt(operation_id)?)
+    }
+}
 
 struct SessionStore {
     dir: StateDir,
-    _lease: Arc<SessionLease>,
-    database: Option<SessionDatabase>,
+    lease: Arc<SessionLease>,
+    database: Option<Arc<StdMutex<SessionDatabase>>>,
     cursor: Option<SessionCursor>,
     session: StoredSession,
     created: bool,
@@ -237,8 +285,8 @@ impl SessionStore {
         let persisted_subagent_history = subagent_history.snapshot();
         Self {
             dir,
-            _lease: lease,
-            database,
+            lease,
+            database: database.map(|database| Arc::new(StdMutex::new(database))),
             cursor,
             session,
             created,
@@ -247,19 +295,27 @@ impl SessionStore {
         }
     }
 
-    fn save(&mut self) -> Result<(), caudra_storage::sessions::SessionError> {
+    fn save(&mut self) -> Result<(), SessionError> {
         self.session.updated_at = caudra_storage::now_epoch();
         if self.database.is_none() {
             self.database = SessionDatabase::open(&self.dir)
                 .map_err(|error| warn!(%error, "session database unavailable"))
-                .ok();
+                .ok()
+                .map(|database| Arc::new(StdMutex::new(database)));
         }
-        let Some(database) = self.database.as_mut() else {
-            return Err(caudra_storage::StorageError::Io(std::io::Error::other(
-                "session database unavailable",
-            ))
-            .into());
+        let Some(database) = &self.database else {
+            return Err(StorageError::Io(io::Error::other(SESSION_DATABASE_UNAVAILABLE)).into());
         };
+        let mut database = database.lock().unwrap_or_else(|error| error.into_inner());
+        database
+            .permission_snapshot(PermissionOwner::Conversation(self.session.id))
+            .and_then(|snapshot| {
+                if snapshot.revision.row_present {
+                    snapshot.apply_to_meta(self.session.id, &mut self.session.meta)?;
+                }
+                Ok(())
+            })
+            .map_err(|error| StorageError::Io(io::Error::other(error)))?;
         match database.save(&self.session, self.cursor.as_ref()) {
             Ok(cursor) => {
                 self.cursor = Some(cursor);
@@ -269,9 +325,25 @@ impl SessionStore {
         }
     }
 
+    fn permission_publication(
+        &mut self,
+    ) -> Result<Arc<SessionPermissionPublication>, PermissionEditError> {
+        self.lease
+            .validate(&self.dir, self.session.id)
+            .map_err(|error| PermissionEditError::Storage(error.to_string()))?;
+        self.save()
+            .map_err(|error| PermissionEditError::Storage(error.to_string()))?;
+        let database = self
+            .database
+            .as_ref()
+            .ok_or_else(|| PermissionEditError::Storage(SESSION_DATABASE_UNAVAILABLE.into()))?;
+        Ok(Arc::new(SessionPermissionPublication {
+            database: Arc::clone(database),
+            lease: Arc::clone(&self.lease),
+        }))
+    }
+
     fn sync_permissions(&mut self, permissions: &PermissionManager) {
-        self.session.meta.structured_permission_rules =
-            permissions.structured_conversation_rules_snapshot();
         self.session.meta.yolo = permissions.persisted_yolo();
     }
 
@@ -1807,7 +1879,7 @@ pub async fn spawn_prepared_interactive(
         mut history,
         mut model,
         mut provider,
-        store,
+        mut store,
         workspace_baseline,
     } = prepared;
     let workflows_available = params.workflow_mode.is_some();
@@ -1849,7 +1921,6 @@ pub async fn spawn_prepared_interactive(
     let subagent_history = store.subagent_history.clone();
     let state_dir = store.dir.clone();
     let initial_history_head = store.history_head();
-    let store = Arc::new(Mutex::new(Some(store)));
 
     let (raw_tx, event_rx) = flume::unbounded::<Envelope>();
     let (agent_tx, agent_rx) = flume::unbounded::<Envelope>();
@@ -1892,6 +1963,18 @@ pub async fn spawn_prepared_interactive(
         &mut params.structured_permission_rules,
     ));
     permissions.set_session_yolo(params.session_yolo);
+    permissions
+        .attach_permission_publication(store.permission_publication().map_err(|error| {
+            InteractiveStartError(format!(
+                "Conversation permission storage unavailable: {error}"
+            ))
+        })?)
+        .map_err(|error| {
+            InteractiveStartError(format!(
+                "Failed to attach conversation permissions: {error}"
+            ))
+        })?;
+    let store = Arc::new(Mutex::new(Some(store)));
 
     let answer_rx = Arc::new(Mutex::new(answer_rx));
     let active_prompt_profile_name: Arc<str> = Arc::from(
@@ -2578,6 +2661,9 @@ fn extract_tool_names(tools: &Value) -> Vec<String> {
 mod tests {
     use caudra_providers::{AgentError, ProviderEvent, RequestOptions, StopReason, StreamResponse};
     use caudra_storage::permission_state::PermissionRuleRecord;
+    use caudra_storage::permission_state::mutation::{
+        PermissionMutation, PermissionRecordIdentity, prepare_mutation,
+    };
     use caudra_storage::sessions::generate_title;
     use caudra_storage::tool_outputs::ToolOutputStore;
     use caudra_storage::workflow::WorkflowRunStatus;
@@ -2586,12 +2672,21 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
+    use crate::permissions::{
+        PermissionAnswer, PermissionError, PermissionLifetime, PermissionRequest, RevokedRuleScope,
+    };
+    use crate::tools::PermissionScopes;
     use crate::tools::registry::BoxFuture;
     use crate::workflow::store::WorkflowStore;
 
     const SESSION_ID: &str = "CNK1hV6GWoysH3KQMm5wu";
     const CWD: &str = "/project";
     const MODEL_SPEC: &str = "anthropic/claude-test";
+    const PERMISSION_REQUEST_ID: &str = "headless-permission";
+    const PERMISSION_COMMAND: &str = "headless-permission-command";
+    const PERMISSION_TOOL: &str = "bash";
+    const PERMISSION_OPTION: &str = "allow_exact";
+    const LOST_PERMISSION_ACK: &str = "permission committed but acknowledgment lost";
 
     #[test_case("!pwd", Some("pwd"); "visible_command")]
     #[test_case("!! pwd", Some("pwd"); "hidden_command")]
@@ -2694,6 +2789,238 @@ mod tests {
             PathBuf::from(CWD),
             Arc::default(),
         )
+    }
+
+    fn conversation_permission() -> PermissionRuleRecord {
+        let request = PermissionRequest::from_legacy(
+            PERMISSION_REQUEST_ID.into(),
+            ToolKey::native(PERMISSION_TOOL),
+            vec![PERMISSION_COMMAND.into()],
+            serde_json::json!({"command": PERMISSION_COMMAND}),
+            Path::new(CWD),
+            false,
+        );
+        PermissionRuleRecord::conversation(
+            request
+                .option_rule(PERMISSION_OPTION, PermissionLifetime::Conversation)
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    async fn enforce_test_permission(
+        permissions: &PermissionManager,
+        response: Option<&Mutex<Receiver<String>>>,
+        events: &EventSender,
+    ) -> Result<(), PermissionError> {
+        permissions
+            .enforce_with_identity(
+                &ToolKey::native(PERMISSION_TOOL),
+                &PermissionScopes {
+                    scopes: vec![PERMISSION_COMMAND.into()],
+                    force_prompt: false,
+                    plan_scoped: false,
+                },
+                &serde_json::json!({"command": PERMISSION_COMMAND}),
+                events,
+                response,
+                PERMISSION_REQUEST_ID,
+                &CancelToken::none(),
+                None,
+                None,
+                false,
+            )
+            .await
+    }
+
+    async fn pending_permission(
+        permissions: &Arc<PermissionManager>,
+    ) -> smol::Task<Result<(), PermissionError>> {
+        let (event_tx, event_rx) = flume::unbounded();
+        let permissions = Arc::clone(permissions);
+        let task = smol::spawn(async move {
+            let (_answer_tx, answer_rx) = flume::unbounded();
+            enforce_test_permission(
+                &permissions,
+                Some(&Mutex::new(answer_rx)),
+                &EventSender::new(event_tx, 0),
+            )
+            .await
+        });
+        assert!(matches!(
+            event_rx.recv_async().await.unwrap().event,
+            AgentEvent::PermissionRequest(request) if request.id == PERMISSION_REQUEST_ID
+        ));
+        task
+    }
+
+    struct LostAckPublication(Arc<SessionPermissionPublication>);
+
+    impl PermissionPublication for LostAckPublication {
+        fn snapshot(&self) -> Result<PermissionSnapshot, PermissionEditError> {
+            self.0.snapshot()
+        }
+
+        fn commit(
+            &self,
+            prepared: &PreparedPermissionMutation,
+        ) -> Result<PermissionCommitReceipt, PermissionEditError> {
+            self.0.commit(prepared)?;
+            Err(PermissionEditError::Storage(LOST_PERMISSION_ACK.into()))
+        }
+
+        fn receipt(
+            &self,
+            operation_id: CaudraId,
+        ) -> Result<Option<PermissionCommitReceipt>, PermissionEditError> {
+            self.0.receipt(operation_id)
+        }
+    }
+
+    #[test_case(false; "revoked")]
+    #[test_case(true; "deleted")]
+    fn publication_receipts_never_replay_retired_authority(deleted: bool) {
+        let tmp = TempDir::new().unwrap();
+        let dir = StateDir::from_path(tmp.path().to_path_buf());
+        let lease = Arc::new(SessionLease::acquire(&dir, session_id()).unwrap());
+        let mut session = StoredSession::new(MODEL_SPEC, CWD);
+        session.id = session_id();
+        let mut store = SessionStore::from_session(dir, session, true, lease);
+        let publication = store.permission_publication().unwrap();
+        let initial = publication.snapshot().unwrap();
+        assert!(initial.revision.row_present);
+        assert_eq!(load(&tmp).id, session_id());
+        let record = conversation_permission();
+        let owner = PermissionOwner::Conversation(session_id());
+        let approval = prepare_mutation(
+            vec![initial],
+            PermissionMutation::Create {
+                destination: owner.clone(),
+                records: Box::new([record.clone()]),
+            },
+        )
+        .unwrap();
+        let receipt = publication.commit(&approval).unwrap();
+        let approved = publication.snapshot().unwrap();
+        if deleted {
+            publication
+                .database
+                .lock()
+                .unwrap()
+                .delete(session_id(), None)
+                .unwrap();
+        } else {
+            let revoke = prepare_mutation(
+                vec![approved.clone()],
+                PermissionMutation::Revoke {
+                    source: PermissionRecordIdentity {
+                        owner,
+                        record_id: record.id,
+                    },
+                },
+            )
+            .unwrap();
+            publication.commit(&revoke).unwrap();
+        }
+        let retired = publication.snapshot().unwrap();
+        assert_eq!(
+            publication.receipt(approval.operation_id()).unwrap(),
+            Some(receipt.clone())
+        );
+        assert_eq!(publication.commit(&approval).unwrap(), receipt);
+        assert_eq!(publication.snapshot().unwrap(), retired);
+        assert!(!retired.records.iter().any(PermissionRuleRecord::is_active));
+        approved
+            .apply_to_meta(session_id(), &mut store.session.meta)
+            .unwrap();
+        if deleted {
+            assert!(store.save().is_err());
+            assert!(!publication.snapshot().unwrap().revision.row_present);
+        } else {
+            store.save().unwrap();
+            assert_eq!(
+                store.session.meta.structured_permission_rules,
+                retired.records
+            );
+            assert_eq!(
+                store.session.meta.permission_generation,
+                retired.revision.generation
+            );
+            assert_eq!(load(&tmp).meta.structured_permission_rules, retired.records);
+        }
+    }
+
+    #[test_case(false; "other_conversation")]
+    #[test_case(true; "other_database")]
+    fn publication_rejects_foreign_permission_owners(other_database: bool) {
+        let tmp = TempDir::new().unwrap();
+        let mut store = store_in(&tmp);
+        let publication = store.permission_publication().unwrap();
+        let other_tmp = TempDir::new().unwrap();
+        let mut other = SessionStore::open_in(
+            if other_database {
+                StateDir::from_path(other_tmp.path().to_path_buf())
+            } else {
+                store.dir.clone()
+            },
+            if other_database {
+                session_id()
+            } else {
+                CaudraId::generate()
+            },
+            CWD,
+            MODEL_SPEC,
+        )
+        .unwrap();
+        let other_publication = other.permission_publication().unwrap();
+        let before = publication.snapshot().unwrap();
+        let other_before = other_publication.snapshot().unwrap();
+        let mutation = prepare_mutation(
+            vec![other_before.clone()],
+            PermissionMutation::Create {
+                destination: other_before.revision.owner.clone(),
+                records: Box::new([conversation_permission()]),
+            },
+        )
+        .unwrap();
+        assert!(publication.commit(&mutation).is_err());
+        assert_eq!(publication.snapshot().unwrap(), before);
+        assert_eq!(other_publication.snapshot().unwrap(), other_before);
+        assert!(
+            publication
+                .receipt(mutation.operation_id())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test_case(false; "publisher")]
+    #[test_case(true; "attached_manager")]
+    fn publication_retains_the_session_lease(attached: bool) {
+        let tmp = TempDir::new().unwrap();
+        let mut store = store_in(&tmp);
+        let publication = store.permission_publication().unwrap();
+        let permissions = permission_manager();
+        if attached {
+            permissions
+                .attach_permission_publication(publication.clone())
+                .unwrap();
+        }
+        drop(store);
+        let dir = StateDir::from_path(tmp.path().to_path_buf());
+        assert!(matches!(
+            SessionLease::acquire(&dir, session_id()),
+            Err(SessionError::SessionInUse { .. })
+        ));
+        drop(publication);
+        if attached {
+            assert!(matches!(
+                SessionLease::acquire(&dir, session_id()),
+                Err(SessionError::SessionInUse { .. })
+            ));
+        }
+        drop(permissions);
+        assert!(SessionLease::acquire(&dir, session_id()).is_ok());
     }
 
     #[test]
@@ -3169,51 +3496,61 @@ mod tests {
         assert!(loaded.subagent_messages().contains_key("continuation-call"));
     }
 
-    #[test]
-    fn record_turn_checkpoints_restorable_permissions() {
-        let tmp = TempDir::new().unwrap();
-        let mut store = store_in(&tmp);
-        let permissions = permission_manager();
-        let request = crate::permissions::PermissionRequest::from_legacy(
-            "request".into(),
-            ToolKey::native("bash"),
-            vec!["cargo test".into()],
-            serde_json::json!({"command": "cargo test"}),
-            PathBuf::from(CWD).as_path(),
-            false,
-        );
-        let structured = PermissionRuleRecord::conversation(
-            request
-                .option_rule(
-                    "allow_exact",
-                    crate::permissions::PermissionLifetime::Conversation,
-                )
-                .unwrap(),
-        )
-        .unwrap();
-        permissions.load_structured_conversation_rules(vec![structured.clone()]);
-        permissions.set_session_yolo(Some(true));
-
-        store
-            .record_turn(&History::default(), MODEL_SPEC.into(), &permissions)
-            .unwrap();
-
-        let loaded = load(&tmp);
-        assert_eq!(
-            loaded.meta.structured_permission_rules,
-            vec![structured.clone()]
-        );
-        assert_eq!(loaded.meta.yolo, Some(true));
-        let restored = permission_manager();
-        restored
-            .load_structured_conversation_rules(loaded.meta.structured_permission_rules.clone());
-        restored.set_session_yolo(loaded.meta.yolo);
-        assert_eq!(
-            restored.structured_conversation_rules_snapshot(),
-            vec![structured]
-        );
-        assert!(restored.is_yolo());
-        assert_eq!(restored.persisted_yolo(), Some(true));
+    #[test_case(false; "acknowledged")]
+    #[test_case(true; "lost_acknowledgment")]
+    fn record_turn_checkpoints_restorable_permissions(lost_ack: bool) {
+        smol::block_on(async {
+            let tmp = TempDir::new().unwrap();
+            let mut store = store_in(&tmp);
+            let permissions = Arc::new(permission_manager());
+            let publication = store.permission_publication().unwrap();
+            let publisher: Arc<dyn PermissionPublication> = if lost_ack {
+                Arc::new(LostAckPublication(Arc::clone(&publication)))
+            } else {
+                publication.clone()
+            };
+            permissions
+                .attach_permission_publication(publisher)
+                .unwrap();
+            let pending = pending_permission(&permissions).await;
+            assert!(permissions.answer(
+                PERMISSION_REQUEST_ID,
+                PermissionAnswer::AllowOption {
+                    option_id: PERMISSION_OPTION.into(),
+                    lifetime: PermissionLifetime::Conversation,
+                },
+            ));
+            pending.await.unwrap();
+            let approved = publication.snapshot().unwrap();
+            assert_eq!(approved.records.len(), 1);
+            assert_eq!(
+                load(&tmp).meta.structured_permission_rules,
+                approved.records
+            );
+            permissions.set_session_yolo(Some(true));
+            store
+                .record_turn(&History::default(), MODEL_SPEC.into(), &permissions)
+                .unwrap();
+            let loaded = load(&tmp);
+            assert_eq!(loaded.meta.structured_permission_rules, approved.records);
+            assert_eq!(
+                store.session.meta.permission_generation,
+                approved.revision.generation
+            );
+            assert_eq!(
+                loaded.meta.permission_generation,
+                approved.revision.generation
+            );
+            assert_eq!(loaded.meta.yolo, Some(true));
+            let restored = permission_manager();
+            restored
+                .attach_permission_publication(publication.clone())
+                .unwrap();
+            restored.set_session_yolo(loaded.meta.yolo);
+            assert_eq!(restored.conversation_permission_snapshot(), Some(approved));
+            assert!(restored.is_yolo());
+            assert_eq!(restored.persisted_yolo(), Some(true));
+        });
     }
 
     #[test]
@@ -3473,8 +3810,8 @@ complete(#{ report: first.output });
                 expected_write_version: None,
                 initial_history: Vec::new(),
                 yolo: true,
-                structured_permission_rules: Vec::new(),
-                session_yolo: None,
+                structured_permission_rules: store.session.meta.structured_permission_rules.clone(),
+                session_yolo: store.session.meta.yolo,
                 system_prompt_override: None,
                 append_system_prompt: None,
                 model_policy: Arc::new(ModelPolicy::default()),
@@ -3501,6 +3838,121 @@ complete(#{ report: first.output });
             .await
             .unwrap()
         }
+    }
+
+    async fn shutdown_interactive(handle: InteractiveHandle) {
+        let InteractiveHandle { input_tx, task, .. } = handle;
+        drop(input_tx);
+        task.await;
+    }
+
+    #[test_case(false, PermissionLifetime::Once; "acp_once")]
+    #[test_case(false, PermissionLifetime::Conversation; "acp_conversation")]
+    #[test_case(true, PermissionLifetime::Conversation; "headless_conversation")]
+    fn interactive_permission_approval_and_revocation_survive_restart(
+        workflows: bool,
+        lifetime: PermissionLifetime,
+    ) {
+        smol::block_on(async {
+            let session = WorkflowSession::new(false);
+            let handle = session.spawn(workflows).await;
+            handle.permissions.set_session_yolo(Some(false));
+            let initial = handle
+                .permissions
+                .conversation_permission_snapshot()
+                .unwrap();
+            assert!(initial.revision.row_present);
+            let database = SessionDatabase::open_read_only(&session.state_dir).unwrap();
+            let version = database.write_version(session_id()).unwrap();
+            let pending = pending_permission(&handle.permissions).await;
+            let reusable = lifetime == PermissionLifetime::Conversation;
+            assert!(handle.permissions.answer(
+                PERMISSION_REQUEST_ID,
+                if reusable {
+                    PermissionAnswer::AllowSession
+                } else {
+                    PermissionAnswer::AllowOnce
+                },
+            ));
+            pending.await.unwrap();
+            let approved = handle
+                .permissions
+                .conversation_permission_snapshot()
+                .unwrap();
+            assert_eq!(approved.records.len(), usize::from(reusable));
+            assert_eq!(database.write_version(session_id()).unwrap(), version);
+            assert_eq!(
+                database
+                    .permission_snapshot(initial.revision.owner)
+                    .unwrap(),
+                approved,
+            );
+            let (events, _rx) = flume::unbounded();
+            let events = EventSender::new(events, 0);
+            assert_eq!(
+                enforce_test_permission(&handle.permissions, None, &events)
+                    .await
+                    .is_ok(),
+                reusable,
+            );
+            shutdown_interactive(handle).await;
+            let stored: StoredSession = database.load(session_id()).unwrap();
+            assert_eq!(stored.meta.structured_permission_rules, approved.records);
+            assert_eq!(
+                stored.meta.permission_generation,
+                approved.revision.generation
+            );
+
+            let handle = session.spawn(workflows).await;
+            assert!(!handle.permissions.is_yolo());
+            assert_eq!(
+                handle.permissions.conversation_permission_snapshot(),
+                Some(approved.clone())
+            );
+            assert_eq!(
+                enforce_test_permission(&handle.permissions, None, &events)
+                    .await
+                    .is_ok(),
+                reusable,
+            );
+            if let Some(record) = approved.records.first() {
+                assert_eq!(
+                    handle
+                        .permissions
+                        .revoke_structured_rule(&record.id)
+                        .unwrap(),
+                    Some(RevokedRuleScope::Conversation),
+                );
+            }
+            let revoked = handle
+                .permissions
+                .conversation_permission_snapshot()
+                .unwrap();
+            assert!(!revoked.records.iter().any(PermissionRuleRecord::is_active));
+            let stored: StoredSession = database.load(session_id()).unwrap();
+            assert_eq!(stored.meta.structured_permission_rules, revoked.records);
+            handle.input_tx.send_async(prompt(PROMPT)).await.unwrap();
+            wait_for_turn(&handle.event_rx).await;
+            shutdown_interactive(handle).await;
+            let stored: StoredSession = database.load(session_id()).unwrap();
+            assert_eq!(stored.meta.structured_permission_rules, revoked.records);
+            assert_eq!(
+                stored.meta.permission_generation,
+                revoked.revision.generation
+            );
+
+            let handle = session.spawn(workflows).await;
+            assert_eq!(
+                handle.permissions.conversation_permission_snapshot(),
+                Some(revoked)
+            );
+            assert!(
+                enforce_test_permission(&handle.permissions, None, &events)
+                    .await
+                    .is_err()
+            );
+            shutdown_interactive(handle).await;
+        });
     }
 
     /// Trusts the project script by the digest the catalog reports, as an SDK

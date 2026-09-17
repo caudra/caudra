@@ -24,6 +24,7 @@ pub(crate) mod modal;
 pub(crate) mod model_picker;
 pub(crate) mod paste_editor;
 pub(crate) mod permission_prompt;
+pub(crate) mod permission_scope;
 pub(crate) mod permissions_picker;
 pub(crate) mod plan_form;
 pub(crate) mod progress_bar;

@@ -10,6 +10,7 @@ use tracing::warn;
 
 #[derive(Default)]
 pub(super) struct PermissionBroker {
+    pub(super) mutation_gate: Mutex<()>,
     // Claim/register under this lock; evaluate policy, commit storage, and send only after release.
     pub(super) pending: Mutex<HashMap<u64, HashMap<String, PendingPermission>>>,
     pub(super) revision: AtomicU64,
@@ -68,6 +69,7 @@ impl Drop for PendingRegistration<'_> {
 
 pub(super) struct PendingPermission {
     pub(super) request: PermissionRequest,
+    pub(super) evaluation: Option<super::enforce::EvaluationContext>,
     pub(super) project: Option<PathBuf>,
     pub(super) context_revision: u64,
     pub(super) answering: bool,
@@ -1185,6 +1187,7 @@ mod tests {
             CONTROLLED_REQUEST.into(),
             super::PendingPermission {
                 request: request.clone(),
+                evaluation: None,
                 project: None,
                 context_revision: *manager.context_revision.read().unwrap(),
                 answering: true,

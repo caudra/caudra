@@ -1,5 +1,6 @@
 use super::diagnostics::prompt_reason_message;
 use super::diagnostics::{answer_scope_kind, bounded_log_value};
+use super::manager::PERMISSION_POLL_INTERVAL;
 use super::{
     DECISION_SOURCE_RULE, DECISION_SOURCE_USER_ABORT, DECISION_SOURCE_YOLO, DEFAULT_DENY_GUIDANCE,
     NORMALIZED_COMMAND_ATTRIBUTE, PERMISSION_DENIED_PREFIX, PERMISSION_LOG_TARGET,
@@ -21,6 +22,9 @@ use std::sync::atomic::Ordering;
 use std::time::Instant;
 use thiserror::Error;
 use tracing::{info, warn};
+
+pub(super) const CURRENT_POLICY_DENIES_REQUEST: &str =
+    "current permission policy denies this request";
 
 #[derive(Debug, Error)]
 pub struct PermissionError {
@@ -68,6 +72,7 @@ pub(super) struct RequestCoverage {
     pub(super) resolved: bool,
 }
 
+#[derive(Clone)]
 pub(super) struct EvaluationContext {
     pub(super) revision: u64,
     pub(super) plan_scoped: bool,
@@ -211,8 +216,22 @@ impl PermissionManager {
                 "reviewed permission context changed".into(),
             ));
         }
+        let _mutation = self
+            .broker
+            .mutation_gate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let rules =
             self.applicable_rules_within(request, context.plan_scoped, context.builtin_allows)?;
+        self.evaluate_policy_rules(request, context, &rules)
+    }
+
+    pub(super) fn evaluate_policy_rules(
+        &self,
+        request: &PermissionRequest,
+        context: &EvaluationContext,
+        rules: &[PolicyRule],
+    ) -> Result<CurrentPolicy, PermissionPolicyError> {
         if self.configured().remote_policy_invalid {
             return Err(PermissionPolicyError(
                 "remote permission policy is unavailable".into(),
@@ -223,11 +242,9 @@ impl PermissionManager {
                 .iter()
                 .any(|policy| permission_rule_intersects_request(&policy.rule, request))
         {
-            return Err(PermissionPolicyError(
-                "current permission policy denies this request".into(),
-            ));
+            return Err(PermissionPolicyError(CURRENT_POLICY_DENIES_REQUEST.into()));
         }
-        let coverage = self.request_coverage(request, &rules, context.builtin_allows);
+        let coverage = self.request_coverage(request, rules, context.builtin_allows);
         let covered = coverage.covered.iter().all(Option::is_some);
         let default = self.default_effect(&request.tool);
         if !self.is_yolo()
@@ -540,6 +557,7 @@ impl PermissionManager {
                 request_id.to_owned(),
                 PendingPermission {
                     request: request.clone(),
+                    evaluation: Some(context.clone()),
                     project: canonical_project,
                     context_revision: reviewed_revision,
                     answering: false,
@@ -630,16 +648,26 @@ impl PermissionManager {
                     )));
                 }
                 let wake = futures_lite::future::race(
-                    async { answer_rx.recv_async().await.map(Some) },
                     async {
-                        changed_rx.recv_async().await.map(|source| {
-                            source_request_id = source;
-                            None
-                        })
+                        futures_lite::future::race(
+                            async { answer_rx.recv_async().await.map(Some) },
+                            async {
+                                changed_rx.recv_async().await.map(|source| {
+                                    source_request_id = source;
+                                    None
+                                })
+                            },
+                        )
+                        .await
+                        .map_err(|_| PermissionPolicyError("permission channel closed".into()))
+                    },
+                    async {
+                        smol::Timer::after(PERMISSION_POLL_INTERVAL).await;
+                        self.poll_permission_changes()?;
+                        Ok(None)
                     },
                 )
-                .await
-                .map_err(|_| PermissionPolicyError("permission channel closed".into()))?;
+                .await?;
                 if let Some(decision) = wake {
                     return Ok(decision);
                 }
@@ -2353,6 +2381,7 @@ mod tests {
             CONTROLLED_REQUEST.into(),
             PendingPermission {
                 request: request.clone(),
+                evaluation: None,
                 project: None,
                 context_revision,
                 answering: false,
@@ -2402,6 +2431,7 @@ mod tests {
             CONTROLLED_REQUEST.into(),
             PendingPermission {
                 request: replacement.clone(),
+                evaluation: None,
                 project: None,
                 context_revision,
                 answering: false,

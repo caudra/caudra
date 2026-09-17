@@ -17,7 +17,7 @@ use flume::{RecvTimeoutError as PatternRecvError, Sender as ChannelSender};
 use caudra_agent::command::{self, CustomCommand};
 use caudra_agent::permissions::pattern_recognition::{PatternCandidate, RecognitionExclusion};
 use caudra_agent::prompt::profile::{PromptProfileCatalog, SystemPromptProfile};
-use caudra_agent::tools::ToolRegistry;
+use caudra_agent::tools::{ToolAudience, ToolFilter, ToolRegistry};
 use caudra_config::{Config, RetentionConfig};
 use caudra_lua::PluginHost;
 use caudra_providers::model::Model;
@@ -32,10 +32,13 @@ use caudra_storage::workspace_binding::StoredWorkspaceBinding;
 use caudra_storage::{StateClass, StateDir};
 use caudra_ui::{
     AppSession, ExitSummary, HerdrReporter, PatternDiscoveryMode, PatternDiscoveryOutcome,
-    PatternDiscoveryReport, PatternSuggestionLoader, RunOutcome, SessionRelocationHandoff,
-    SessionTab,
+    PatternDiscoveryReport, PatternSuggestionLoader, PermissionAuthorityBinding, RunOutcome,
+    SessionRelocationHandoff, SessionTab,
 };
-use caudra_workcell::PatternObligationKind;
+use caudra_workcell::editor_adapter::{
+    PermissionEditorContext, PermissionEditorRuntime, permission_authority_provider,
+};
+use caudra_workcell::{PatternObligationKind, RemoteConnectionStatus};
 
 use crate::cli::Cli;
 use crate::cmd::load_config;
@@ -1179,12 +1182,12 @@ pub fn run(mut cli: Cli) -> Result<ExitCode> {
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
     let startup_project_env = project_env_present(&cwd);
 
-    let workcell_runtime = super::workcell_runtime::WorkcellRuntime::initialize(
+    let workcell_runtime = Arc::new(super::workcell_runtime::WorkcellRuntime::initialize(
         &cli.workcell,
         &cwd,
         &persistent_storage,
         ToolRegistry::global(),
-    )?;
+    )?);
     let workcell_runtime_ms = lap();
 
     let (mut stack, _) = build_stack(
@@ -1368,6 +1371,34 @@ pub fn run(mut cli: Cli) -> Result<ExitCode> {
         } else {
             PatternSuggestionWorker::spawn(&storage, workcell_runtime.is_remote())
         };
+        let permission_authority_factory: caudra_ui::PermissionAuthorityFactory = {
+            let runtime = Arc::clone(&workcell_runtime);
+            let config = stack.config.agent.clone();
+            Arc::new(move |project, mode, model, workspace| {
+                let tool_filter = ToolFilter::from_config(&config, &model, &[])
+                    .for_remote_workspace(workspace.is_some())
+                    .for_mode(&mode);
+                let context = Arc::new(PermissionEditorContext::new(PermissionEditorRuntime {
+                    project,
+                    tool_filter: tool_filter.clone(),
+                    mode,
+                    audience: ToolAudience::MAIN,
+                    workspace,
+                })?);
+                Ok(PermissionAuthorityBinding {
+                    provider: permission_authority_provider(
+                        Arc::clone(ToolRegistry::global_arc()),
+                        context,
+                        runtime.local_host(),
+                    ),
+                    tool_filter,
+                    available: runtime
+                        .connection_status()
+                        .is_none_or(|status| status == RemoteConnectionStatus::Connected),
+                    registry_revision: ToolRegistry::global().authority_snapshot().revision(),
+                })
+            })
+        };
         let outcome = caudra_ui::run(
             caudra_ui::EventLoopParams {
                 model,
@@ -1388,6 +1419,7 @@ pub fn run(mut cli: Cli) -> Result<ExitCode> {
                 pattern_suggestion_loader: pattern_suggestions
                     .as_ref()
                     .map(|worker| Arc::clone(&worker.loader)),
+                permission_authority_factory: Some(permission_authority_factory),
                 timeouts: stack.timeouts(),
                 exit_on_done: cli.exit_on_done,
                 lua_command_reader: stack.plugin_host.command_reader(),

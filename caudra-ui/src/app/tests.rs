@@ -8204,7 +8204,7 @@ fn cd_command_behavior() {
     assert!(flash.starts_with("cd: "), "error flash={flash:?}");
 }
 
-fn remote_workspace_session() -> caudra_workspace::WorkspaceSession {
+pub(super) fn remote_workspace_session() -> caudra_workspace::WorkspaceSession {
     let authority = caudra_workspace::AuthorityIdentity::new(
         caudra_workspace::SourceTrustAnchor::new("test-source").unwrap(),
         "authority",
@@ -11301,6 +11301,7 @@ fn permissions_command_lists_current_conversation_rules() {
         .load_structured_conversation_rules(vec![conversation_permission_record()]);
 
     app.execute_command(cmd("/permissions"), 0);
+    app.finish_permission_jobs();
 
     assert!(app.permissions_picker.is_open());
 }
@@ -11401,6 +11402,7 @@ fn awaiting_permission_config_trust_startup_behavior(
     }
 
     app.open_awaiting_permission_config_trust(needs_login);
+    app.finish_permission_jobs();
 
     assert_eq!(app.permissions_picker.is_open(), opens);
 }
@@ -11418,6 +11420,7 @@ fn deferred_permission_config_trust_opens_after_mcp_trust_settles() {
         McpConfigErrors::new(PathBuf::new()),
     );
     let _ = app.tick();
+    app.finish_permission_jobs();
 
     assert!(app.permissions_picker.is_open());
 }
@@ -11438,8 +11441,17 @@ fn deferred_permission_config_trust_does_not_close_a_manual_mcp_picker() {
 
     assert!(app.mcp_picker.is_open());
     assert!(!app.permissions_picker.is_open());
+    assert!(app.permission_job_pending());
     app.update(Msg::Key(key(KeyCode::Esc)));
     assert!(!app.mcp_picker.is_open());
+    assert!(!app.permissions_picker.is_open());
+    assert!(app.permission_config_trust_deferred);
+    assert_eq!(app.tick_permission_config_trust(), Dirty::NO);
+    app.finish_permission_jobs();
+    assert!(app.permission_config_trust_deferred);
+    assert_eq!(app.tick_permission_config_trust(), Dirty::YES);
+    app.finish_permission_jobs();
+    assert!(!app.permission_config_trust_deferred);
     assert!(app.permissions_picker.is_open());
 }
 
@@ -11458,6 +11470,7 @@ fn closing_login_advances_mcp_then_project_trust() {
     assert!(app.mcp_picker.is_open());
     assert!(!app.permissions_picker.is_open());
     app.update(Msg::Key(key(KeyCode::Esc)));
+    app.finish_permission_jobs();
     assert!(app.permissions_picker.is_open());
 }
 
@@ -11465,6 +11478,7 @@ fn closing_login_advances_mcp_then_project_trust() {
 fn permission_request_suspends_and_then_restores_project_trust() {
     let mut app = app_awaiting_permission_config_trust();
     app.open_awaiting_permission_config_trust(false);
+    app.finish_permission_jobs();
     app.status = Status::Streaming;
     app.run_id = 1;
     assert!(app.permissions_picker.is_open());
@@ -11475,11 +11489,12 @@ fn permission_request_suspends_and_then_restores_project_trust() {
     assert!(app.permission_prompt.is_open());
     app.update(Msg::Key(key(KeyCode::Esc)));
     let _ = app.tick();
+    app.finish_permission_jobs();
     assert!(!app.permission_prompt.is_open());
     assert!(app.permissions_picker.is_open());
 }
 
-fn pattern_suggestion_candidate(project: &Path) -> PatternCandidate {
+pub(super) fn pattern_suggestion_candidate(project: &Path) -> PatternCandidate {
     PatternCandidate {
         definition: PatternDefinition {
             version: PATTERN_SCHEMA_VERSION,
@@ -11559,6 +11574,8 @@ fn permissions_command_selects_the_requested_mode_with_large_rule_inventory(
     assert_eq!(app.poll_pattern_suggestions(), Dirty::YES);
     app.run_cmdline(&format!("/permissions {argument}"), 0)
         .unwrap();
+    app.finish_permission_jobs();
+    assert!(app.permissions_picker.is_open());
     assert_eq!(app.permissions_picker.discovery_mode(), discover);
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
     terminal
@@ -11570,7 +11587,7 @@ fn permissions_command_selects_the_requested_mode_with_large_rule_inventory(
     for command in [PATTERN_TEST_COMMAND, PATTERN_TEST_OTHER_COMMAND] {
         assert_eq!(screen.contains(command), discover, "{screen}");
     }
-    assert_eq!(screen.contains("Active structured permissions"), !discover);
+    assert_eq!(screen.contains("Grants & policies"), !discover, "{screen}");
     assert_eq!(
         app.permissions.structured_rule_inventory().unwrap().len(),
         rules.len()
@@ -11640,6 +11657,7 @@ fn permissions_discovery_refresh_and_cancel_are_explicit_single_requests(
     assert_eq!(app.poll_pattern_suggestions(), Dirty::YES);
     let before = app.permissions.structured_rule_inventory().unwrap();
     app.run_cmdline("/permissions discover", 0).unwrap();
+    app.finish_permission_jobs();
     for _ in 0..3 {
         app.update(Msg::Key(KeyEvent::new(
             KeyCode::Char('r'),
@@ -11716,6 +11734,7 @@ fn permissions_discovery_failures_remain_visible_and_retryable(disconnected: boo
         matches!(outcome.as_ref(), PatternDiscoveryOutcome::Unavailable(reason) if *reason == expected)
     );
     app.run_cmdline("/permissions discover", 0).unwrap();
+    app.finish_permission_jobs();
     app.update(Msg::Key(KeyEvent::new(
         KeyCode::Char('r'),
         KeyModifiers::CONTROL,
@@ -11741,6 +11760,7 @@ fn completed_discovery_status_is_not_reused_across_permission_contexts(replace: 
     })));
     assert_eq!(app.poll_pattern_suggestions(), Dirty::YES);
     app.open_permissions_picker().unwrap();
+    app.finish_permission_jobs();
     let project = app.permissions.project_cwd();
     if replace {
         app.permissions = Arc::new(PermissionManager::new_nonpersistent(
@@ -11895,6 +11915,7 @@ fn pattern_suggestion_lifecycle_respects_privacy(ephemeral: bool) {
 fn changing_projects_closes_stale_permission_config_actions() {
     let mut app = app_awaiting_permission_config_trust();
     app.open_awaiting_permission_config_trust(false);
+    app.finish_permission_jobs();
     let temp = TempDir::new().unwrap();
     let project = temp.path().join("destination");
     std::fs::create_dir(&project).unwrap();
@@ -11921,6 +11942,7 @@ fn closing_mcp_trust_opens_deferred_permission_config_trust() {
     app.open_awaiting_permission_config_trust(false);
 
     let actions = app.update(Msg::Key(key(KeyCode::Esc)));
+    app.finish_permission_jobs();
 
     assert!(actions.is_empty());
     assert!(!app.mcp_picker.is_open());
@@ -11931,6 +11953,7 @@ fn closing_mcp_trust_opens_deferred_permission_config_trust() {
 fn trusting_project_permission_config_refreshes_picker() {
     let mut app = app_awaiting_permission_config_trust();
     app.execute_command(cmd("/permissions"), 0);
+    app.finish_permission_jobs();
     assert_eq!(
         app.lifecycle_blocker(),
         Some(PROJECT_PERMISSION_CONFIG_TRUST_BLOCKER)
@@ -11938,6 +11961,7 @@ fn trusting_project_permission_config_refreshes_picker() {
 
     assert!(app.update(Msg::Key(key(KeyCode::Enter))).is_empty());
     assert!(app.update(Msg::Key(key(KeyCode::Enter))).is_empty());
+    app.finish_permission_jobs();
 
     assert!(!app.permissions.needs_project_permission_config_trust());
     assert!(app.permissions_picker.is_open());
@@ -11984,6 +12008,7 @@ fn trusting_project_permission_config_refreshes_picker() {
 
     assert!(app.update(Msg::Key(key(KeyCode::Enter))).is_empty());
     assert!(app.update(Msg::Key(key(KeyCode::Enter))).is_empty());
+    app.finish_permission_jobs();
     assert!(app.permissions.needs_project_permission_config_trust());
     assert_eq!(
         app.status_bar.flash_text(),
@@ -11997,6 +12022,7 @@ fn project_permission_config_trust_blocks_only_while_picker_is_open() {
     assert_eq!(app.lifecycle_blocker(), None);
 
     app.execute_command(cmd("/permissions"), 0);
+    app.finish_permission_jobs();
     assert_eq!(
         app.lifecycle_blocker(),
         Some(PROJECT_PERMISSION_CONFIG_TRUST_BLOCKER)
@@ -14292,7 +14318,7 @@ fn open_permission_test_leader(app: &mut App) {
 #[test_case(open_permission_test_editor; "paste_editor")]
 #[test_case(open_permission_test_leader; "leader")]
 #[test_case(|app| app.mcp_picker.open(); "mcp_picker")]
-#[test_case(|app| { app.execute_command(cmd("/permissions"), 0); }; "permissions_picker")]
+#[test_case(|app| { app.execute_command(cmd("/permissions"), 0); app.finish_permission_jobs(); }; "permissions_picker")]
 fn permission_ownership_survives_overlays_before_and_after_arrival(open: fn(&mut App)) {
     for workbench in [false, true] {
         for overlay_first in [false, true] {
@@ -14822,6 +14848,7 @@ fn reported_repeats_do_not_activate_global_actions(key: KeyEvent) {
 fn reported_repeats_cannot_accept_project_trust_confirmation(code: KeyCode) {
     let mut app = app_awaiting_permission_config_trust();
     app.open_awaiting_permission_config_trust(false);
+    app.finish_permission_jobs();
     app.update(Msg::Key(key(KeyCode::Enter)));
     rendered(&mut app);
     assert!(dispatch_reported_key(&mut app, key(code), KeyEventKind::Repeat).is_empty());
@@ -14920,6 +14947,7 @@ fn permission_decision_answers_manager_request_id_directly() {
     rendered(&mut app);
 
     app.update(Msg::Key(key(KeyCode::Char('y'))));
+    app.finish_permission_jobs();
 
     assert!(smol::block_on(futures_lite::future::or(
         async { task.await.is_ok() },

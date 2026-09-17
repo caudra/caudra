@@ -966,6 +966,7 @@ impl WorkbenchFilesystem for LocalFilesystem {
         };
         read::save(path, &contents, expected).map_err(|error| match error {
             read::SaveError::Stale(_) => BackendError::Conflict,
+            read::SaveError::Unconfirmed { .. } => BackendError::Indeterminate,
             error => BackendError::Local(error.to_string()),
         })?;
         self.entry(path.to_path_buf())

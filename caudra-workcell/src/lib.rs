@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod editor_adapter;
 mod pattern_analysis;
 mod read_only_shell;
 mod remote;
@@ -211,6 +212,26 @@ struct HostInner {
 }
 
 impl HostInner {
+    fn specs(&self, include_unavailable_code: bool) -> Vec<ToolSpec> {
+        let mut specs = workcell::files::specs(ALLOW_WRITE);
+        let year = jiff::Timestamp::now()
+            .strftime("%Y")
+            .to_string()
+            .parse()
+            .unwrap_or(2026);
+        specs.extend(workcell::web::specs(
+            year,
+            &self.web.snapshot().configuration,
+        ));
+        specs.extend(workcell::shell::specs());
+        specs.extend(workcell::code_graph::specs());
+        if self.code.is_some() || include_unavailable_code {
+            specs.extend(workcell::code::specs());
+        }
+        specs.push(workcell::environment::spec());
+        specs
+    }
+
     async fn project_groups(&self, cwd: PathBuf) -> Result<ProjectGroups, String> {
         let cwd = std::fs::canonicalize(&cwd).unwrap_or(cwd);
         let mut projects = self.projects.lock().await;
@@ -423,23 +444,8 @@ impl WorkcellHost {
         &self,
         include_unavailable_code: bool,
     ) -> Vec<(Arc<dyn Tool>, ToolSource, ToolEffect)> {
-        let mut specs = workcell::files::specs(ALLOW_WRITE);
-        let year = jiff::Timestamp::now()
-            .strftime("%Y")
-            .to_string()
-            .parse()
-            .unwrap_or(2026);
-        specs.extend(workcell::web::specs(
-            year,
-            &self.inner.web.snapshot().configuration,
-        ));
-        specs.extend(workcell::shell::specs());
-        specs.extend(workcell::code_graph::specs());
-        if self.inner.code.is_some() || self.reserve_code || include_unavailable_code {
-            specs.extend(workcell::code::specs());
-        }
-        specs.push(workcell::environment::spec());
-        specs
+        self.inner
+            .specs(self.reserve_code || include_unavailable_code)
             .into_iter()
             .filter_map(|spec| {
                 let kind = ToolKind::from_name(spec.name)?;
@@ -1147,19 +1153,10 @@ impl WorkcellInvocation {
             }
             Input::Websearch(input) => {
                 let prepared = self.host.web.prepare_websearch(input.clone())?;
-                let intent = PermissionIntent::new(
-                    PermissionScopes::single(prepared.permission_query.clone()),
-                    vec![PermissionResource {
-                        kind: PermissionResourceKind::Query,
-                        value: prepared.permission_query.clone(),
-                        access: Some(PermissionResourceAccess::Search),
-                        protected: false,
-                        requires_prompt: false,
-                        attributes: BTreeMap::new(),
-                    }],
-                    PermissionRisk::Low,
-                )
-                .with_authority(PermissionAuthorityProfile::Query);
+                let intent = editor_adapter::web_intent(
+                    PermissionResourceKind::Query,
+                    prepared.permission_query.clone(),
+                );
                 PreparedInvocation {
                     intent,
                     execution: PreparedExecution::Websearch(prepared),
@@ -1173,19 +1170,10 @@ impl WorkcellInvocation {
                     .web
                     .prepare_webfetch(input.clone())
                     .map_err(|error| error.to_string())?;
-                let intent = PermissionIntent::new(
-                    PermissionScopes::single(prepared.permission_url.clone()),
-                    vec![PermissionResource {
-                        kind: PermissionResourceKind::Url,
-                        value: prepared.permission_url.clone(),
-                        access: Some(PermissionResourceAccess::Read),
-                        protected: false,
-                        requires_prompt: false,
-                        attributes: BTreeMap::new(),
-                    }],
-                    PermissionRisk::Medium,
-                )
-                .with_authority(PermissionAuthorityProfile::Url);
+                let intent = editor_adapter::web_intent(
+                    PermissionResourceKind::Url,
+                    prepared.permission_url.clone(),
+                );
                 PreparedInvocation {
                     intent,
                     execution: PreparedExecution::Webfetch(prepared),
@@ -2290,23 +2278,7 @@ impl ToolInvocation for WorkcellInvocation {
             .as_ref()
             .map(|prepared| &prepared.execution)
         {
-            Some(PreparedExecution::Shell(_, shell)) => {
-                let read_only = shell.bash_program().ok().is_some_and(|program| {
-                    shell.bash_command_contexts().ok().is_some_and(|contexts| {
-                        let facts = pattern_analysis::shell_facts(program, &contexts);
-                        !facts.opaque
-                            && facts
-                                .commands
-                                .iter()
-                                .all(|command| read_only_shell::scope_is_read_only(&command.scope))
-                    })
-                });
-                if read_only {
-                    PlanModeAccess::ReadOnly
-                } else {
-                    PlanModeAccess::Prompted
-                }
-            }
+            Some(PreparedExecution::Shell(_, shell)) => editor_adapter::shell_plan_access(shell),
             _ => PlanModeAccess::Refused,
         }
     }

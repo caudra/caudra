@@ -47,6 +47,7 @@ use caudra_storage::sessions::{
 use caudra_storage::state::WorkspaceTabs;
 use caudra_storage::workflow::WorkflowRunStatus;
 use caudra_storage::workspace_binding::StoredWorkspaceBinding;
+use caudra_workspace::WorkspaceControlCommand;
 #[cfg(not(windows))]
 use crossterm::event::KeyEventKind;
 use crossterm::event::{
@@ -56,6 +57,7 @@ use serde_json::json;
 use tracing::{info, warn};
 
 use crate::agent::{AgentCommand, AgentHandles, ModelSlot, shared_queue::QueueItem};
+use crate::app::permission_editor::attach_session_permissions;
 use crate::app::shell::{
     RemoteShellTarget, ShellEvent, spawn_remote_cd, spawn_remote_control, spawn_remote_shell,
     spawn_shell,
@@ -75,7 +77,10 @@ use crate::herdr::{HerdrObservation, HerdrReporterHandle, aggregate_observations
 use crate::input::InputReader;
 use crate::repaint::{Dirty, FrameLimiter, IDLE_POLL};
 use crate::theme;
-use crate::{AppSession, PatternSuggestionLoader, SessionRelocationHandoff, SessionTab};
+use crate::{
+    AppSession, PatternSuggestionLoader, PermissionAuthorityFactory, SessionRelocationHandoff,
+    SessionTab,
+};
 use crate::{load_app_session, open_app_session};
 
 use crate::storage_writer::StorageWriter;
@@ -153,6 +158,7 @@ pub struct EventLoopParams {
     pub max_log_files: u32,
     pub permissions: Arc<PermissionManager>,
     pub pattern_suggestion_loader: Option<PatternSuggestionLoader>,
+    pub permission_authority_factory: Option<PermissionAuthorityFactory>,
     pub timeouts: Timeouts,
     pub exit_on_done: bool,
     pub lua_command_reader: LuaCommandReader,
@@ -918,6 +924,7 @@ struct SpawnCtx {
     /// rules stay per-session.
     permissions: Arc<PermissionManager>,
     pattern_suggestion_loader: Option<PatternSuggestionLoader>,
+    permission_authority_factory: Option<PermissionAuthorityFactory>,
     timeouts: Timeouts,
     custom_commands: Arc<[CustomCommand]>,
     no_commands: bool,
@@ -1067,6 +1074,12 @@ impl SpawnCtx {
         let (system_prompt_profile_name, system_prompt_profile, profile_warning) =
             self.resolve_prompt_profile(&session);
         let permissions = Arc::new(self.permissions.fork());
+        let permission_snapshot = attach_session_permissions(
+            &self.storage,
+            &self.storage_writer,
+            &mut session,
+            &permissions,
+        )?;
         permissions.set_session_yolo(session.meta.yolo);
         let goal = caudra_agent::GoalHandle::restored(session.meta.active_goal.as_deref());
         if let Some(limit) = session.meta.goal_continuation_limit {
@@ -1127,6 +1140,10 @@ impl SpawnCtx {
             workspace_session.clone(),
         );
         app.local_documents = self.local_documents.clone();
+        app.permission_snapshot = Some(permission_snapshot);
+        app.permission_authority_factory = self.permission_authority_factory.clone();
+        app.sync_permission_authority()
+            .map_err(|error| error.to_string())?;
         app.no_commands = self.no_commands;
         app.remote_project_context = remote_project_context;
         if app.workspace_session.is_some()
@@ -1419,6 +1436,7 @@ impl<'t> EventLoop<'t> {
             max_log_files,
             permissions,
             pattern_suggestion_loader,
+            permission_authority_factory,
             timeouts,
             exit_on_done,
             lua_command_reader,
@@ -1499,6 +1517,7 @@ impl<'t> EventLoop<'t> {
             max_log_files,
             permissions,
             pattern_suggestion_loader,
+            permission_authority_factory,
             timeouts,
             custom_commands: Arc::from(commands),
             no_commands,
@@ -2856,7 +2875,7 @@ impl<'t> EventLoop<'t> {
         if self
             .sessions
             .iter()
-            .any(|runtime| runtime.app.workbench.blocks_workspace_change())
+            .any(|runtime| runtime.app.workbench_blocks_workspace_change())
         {
             return Err(RELOCATION_WORKBENCH_ERR.into());
         }
@@ -3217,6 +3236,26 @@ impl<'t> EventLoop<'t> {
                 }
             }
             Action::RemoteControl(args) => {
+                if matches!(
+                    WorkspaceControlCommand::parse(&args),
+                    Ok(WorkspaceControlCommand::Reconnect)
+                ) && let Some(authority) = self.sessions[idx]
+                    .app
+                    .workspace_session
+                    .as_ref()
+                    .map(|workspace| workspace.binding().authority().clone())
+                {
+                    for runtime in &mut self.sessions {
+                        if runtime
+                            .app
+                            .workspace_session
+                            .as_ref()
+                            .is_some_and(|workspace| workspace.binding().authority() == &authority)
+                        {
+                            runtime.app.invalidate_permission_authority();
+                        }
+                    }
+                }
                 let runtime = &self.sessions[idx];
                 spawn_remote_control(
                     runtime.app.workspace_session.clone(),

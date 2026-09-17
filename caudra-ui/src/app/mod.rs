@@ -10,6 +10,7 @@ mod image_paste;
 mod memory;
 pub(crate) mod mode;
 mod mouse;
+pub(crate) mod permission_editor;
 mod queue;
 mod session;
 pub(crate) mod session_state;
@@ -95,9 +96,7 @@ use crate::{AppSession, PatternDiscoveryMode, PatternDiscoveryOutcome, PatternSu
 use arc_swap::{ArcSwap, ArcSwapOption};
 use caudra_agent::context::{ContextKey, ContextSnapshot, ContextStore};
 use caudra_agent::mentions;
-use caudra_agent::permissions::{
-    PermissionAnswer, PermissionManager, PermissionPolicyError, RevokedRuleScope,
-};
+use caudra_agent::permissions::{PermissionManager, PermissionPolicyError};
 use caudra_agent::prompt::profile::PromptProfileCatalog;
 use caudra_agent::snapshots::{
     SESSION_SNAPSHOTS_DIR, SnapshotError, SnapshotLimits, SnapshotStore, workspace_key,
@@ -120,6 +119,7 @@ use caudra_storage::StateDir;
 use caudra_storage::id::CaudraId;
 use caudra_storage::input_history::InputHistory;
 use caudra_storage::model::persist_model;
+use caudra_storage::permission_state::mutation::PermissionSnapshot;
 use caudra_storage::usage_ledger::{LedgerPurpose, LifetimeUsage, TurnUsage, UsageLedger};
 use caudra_storage::view::ViewMode;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent};
@@ -340,6 +340,8 @@ pub struct App {
     pub(super) paste_editor: PasteEditor,
     pub(super) permission_prompt: PermissionPrompt,
     pub(super) permissions_picker: PermissionsPicker,
+    permission_ui: permission_editor::PermissionUi,
+    parked_workbench: Option<Workbench>,
     permission_config_trust_deferred: bool,
     pub(super) memory_picker: MemoryPicker,
     pub(super) task_picker: TaskPicker,
@@ -441,6 +443,8 @@ pub struct App {
     pub(crate) shell: shell::ShellState,
     pub(crate) ui_config: UiConfig,
     pub(crate) permissions: Arc<PermissionManager>,
+    pub(crate) permission_snapshot: Option<Arc<ArcSwap<PermissionSnapshot>>>,
+    pub(crate) permission_authority_factory: Option<crate::PermissionAuthorityFactory>,
     pattern_suggestion_loader: Option<PatternSuggestionLoader>,
     pending_pattern_suggestions: Option<PendingPatternSuggestions>,
     pattern_discovery_context: Option<(PathBuf, u64, Weak<PermissionManager>)>,
@@ -563,6 +567,8 @@ impl App {
             paste_editor: PasteEditor::new(),
             permission_prompt: PermissionPrompt::new(),
             permissions_picker: PermissionsPicker::new(),
+            permission_ui: permission_editor::PermissionUi::default(),
+            parked_workbench: None,
             permission_config_trust_deferred: false,
             memory_picker: MemoryPicker::new(),
             task_picker: TaskPicker::new(),
@@ -644,6 +650,8 @@ impl App {
             shell: shell::ShellState::default(),
             ui_config,
             permissions,
+            permission_snapshot: None,
+            permission_authority_factory: None,
             pattern_suggestion_loader: None,
             pending_pattern_suggestions: None,
             pattern_discovery_context: None,
@@ -720,7 +728,7 @@ impl App {
         }
         self.pending_pattern_suggestions = None;
         if self.pattern_discovery_context.is_some() {
-            self.permissions_picker.close();
+            self.suspend_permission_editor();
         }
         self.pattern_discovery_context = Some((project, revision, owner));
         self.permissions_picker.set_discovery(DiscoveryState::Idle);
@@ -1316,6 +1324,12 @@ impl App {
                     self.permission_prompt.handle_paste(&text);
                     return vec![];
                 }
+                if self.permissions_picker.is_open() {
+                    if !self.permission_mutation_pending() {
+                        self.permissions_picker.handle_paste(&text);
+                    }
+                    return vec![];
+                }
                 if self.session_relocation_picker.is_open() {
                     self.route_text_paste(&text);
                     return vec![];
@@ -1416,26 +1430,7 @@ impl App {
     /// answers have nothing to record, and a request that is no longer pending
     /// was answered elsewhere, so both clear it too.
     pub(crate) fn apply_permission_decision(&mut self, decision: PermissionDecision) {
-        let transient = matches!(
-            decision.answer,
-            PermissionAnswer::AllowOnce
-                | PermissionAnswer::Deny
-                | PermissionAnswer::DenyWithGuidance(_)
-        );
-        if self
-            .permissions
-            .answer(&decision.request_id, decision.answer)
-            || transient
-            || self
-                .permissions
-                .pending_request(&decision.request_id)
-                .is_none()
-        {
-            self.permission_prompt.resolve(&decision.request_id);
-        } else {
-            self.status_bar
-                .flash("Could not save permission decision".into());
-        }
+        self.request_permission_answer(decision);
     }
 
     fn scroll_at(&mut self, column: u16, row: u16, delta: i32) -> Option<SelectionZone> {
@@ -1971,7 +1966,11 @@ impl App {
         }
 
         if self.permissions_picker.is_open() {
-            guard_repeat!(false);
+            guard_repeat!(
+                self.permissions_picker
+                    .editor_mut()
+                    .is_some_and(|editor| editor.is_editing())
+            );
             let action = self.permissions_picker.handle_key(key);
             return Some(self.handle_permissions_picker_action(action));
         }
@@ -2117,11 +2116,11 @@ impl App {
     fn handle_workbench_action(&mut self, action: WorkbenchAction) -> Vec<Action> {
         match action {
             WorkbenchAction::Consumed | WorkbenchAction::Passthrough => {}
-            WorkbenchAction::Close => self.workbench.close(),
+            WorkbenchAction::Close => self.close_permission_source(),
             WorkbenchAction::Flash(message) => self.status_bar.flash(message),
             WorkbenchAction::Copy(text) => self.copy_to_clipboard(&text),
             WorkbenchAction::SendToComposer { path, lines } => {
-                self.workbench.close();
+                self.close_permission_source();
                 let text = match path {
                     caudra_workbench::WorkbenchPath::Local(path) => {
                         mentions::format(&path, lines.as_ref())
@@ -2333,7 +2332,11 @@ impl App {
 
     pub(crate) fn open_awaiting_permission_config_trust(&mut self, needs_login: bool) {
         let needs_trust = self.permissions.needs_project_permission_config_trust();
-        if needs_login || self.mcp_picker.is_open() || self.permission_prompt.is_open() {
+        if needs_login
+            || self.mcp_picker.is_open()
+            || self.permission_prompt.is_open()
+            || self.permission_job_pending()
+        {
             self.permission_config_trust_deferred = needs_trust;
             return;
         }
@@ -2344,20 +2347,7 @@ impl App {
     }
 
     fn open_permissions_picker(&mut self) -> Result<(), PermissionPolicyError> {
-        self.sync_pattern_discovery_context();
-        let rules = self.permissions.structured_rule_inventory()?;
-        let candidates = self.permissions.review_candidates();
-        let policy = self.permissions.active_policy();
-        let needs_project_config_trust = self.permissions.needs_project_permission_config_trust();
-        let project_config_trusted = self.permissions.project_permission_config_trusted();
-        self.permissions_picker.open(
-            rules,
-            &candidates,
-            &policy,
-            needs_project_config_trust,
-            project_config_trusted,
-        );
-        self.refresh_permission_suggestions();
+        self.request_permission_inventory();
         Ok(())
     }
 
@@ -2382,7 +2372,7 @@ impl App {
     fn handle_permissions_picker_action(&mut self, action: PermissionsPickerAction) -> Vec<Action> {
         match action {
             PermissionsPickerAction::Consumed => self.refresh_permission_suggestions(),
-            PermissionsPickerAction::Close => self.permissions_picker.close(),
+            PermissionsPickerAction::Close => self.suspend_permission_editor(),
             PermissionsPickerAction::RefreshDiscovery => {
                 self.load_pattern_suggestions(PatternDiscoveryMode::Refresh)
             }
@@ -2452,24 +2442,10 @@ impl App {
                 }
             }
             PermissionsPickerAction::Revoke(id) => {
-                match self.permissions.revoke_structured_rule(&id) {
-                    Ok(Some(scope)) => {
-                        if scope == RevokedRuleScope::Conversation {
-                            self.checkpoint_now();
-                        }
-                        match self.open_permissions_picker() {
-                            Ok(()) => {}
-                            Err(error) => {
-                                self.permissions_picker.close();
-                                self.flash(error.to_string());
-                            }
-                        }
-                        self.flash("Permission revoked".into());
-                    }
-                    Ok(None) => self.flash("Permission is no longer active".into()),
-                    Err(error) => self.flash(format!("Failed to revoke permission: {error}")),
-                }
+                self.request_permission_revoke(id);
             }
+            PermissionsPickerAction::Editor(event) => self.handle_permission_editor(event),
+            PermissionsPickerAction::EditSource(locator) => self.open_permission_source(locator),
         }
         Vec::new()
     }
@@ -2579,6 +2555,10 @@ impl App {
     /// The stored layout is read once per run: a reader who closed every tab
     /// and came back does not want them all opened again.
     fn toggle_workbench(&mut self) {
+        if self.parked_workbench.is_some() {
+            self.close_permission_source();
+            return;
+        }
         let cwd = PathBuf::from(&self.state.session.cwd);
         let opening = !self.workbench.is_open();
         if let Some(workspace) = self.workspace_session.clone() {
@@ -2634,6 +2614,9 @@ impl App {
         if self.workbench_theme_gen != generation {
             self.workbench_theme_gen = generation;
             self.workbench.set_styles(workbench_styles());
+            if let Some(parked) = &mut self.parked_workbench {
+                parked.set_styles(workbench_styles());
+            }
         }
     }
 
@@ -2645,6 +2628,13 @@ impl App {
             return vec![];
         }
         self.permission_prompt.handle_key(key);
+        if self.permissions_picker.is_open() && self.permissions_picker.editor_mut().is_some() {
+            if self.permission_mutation_pending() {
+                return vec![];
+            }
+            let action = self.permissions_picker.handle_key(key);
+            return self.handle_permissions_picker_action(action);
+        }
         match key.kind {
             KeyEventKind::Release => return vec![],
             KeyEventKind::Repeat => return self.handle_key_repeat(key),
@@ -3963,7 +3953,7 @@ impl App {
             self.skills_modal.close();
             self.storage_modal.close();
             if self.permissions_picker.is_open() {
-                self.permissions_picker.close();
+                self.suspend_permission_editor();
                 self.permission_config_trust_deferred =
                     self.permissions.needs_project_permission_config_trust();
             }
@@ -4292,6 +4282,7 @@ impl App {
                 match self.open_permissions_picker() {
                     Ok(()) => {
                         if matches!(cmd.args.trim(), "discover" | "suggested") {
+                            self.permission_ui.show_discovery = true;
                             self.permissions_picker.show_discovery();
                         }
                     }
@@ -4554,8 +4545,11 @@ impl App {
         self.release_remote_restore_confirmation();
         self.file_picker.close();
         self.mention_popup.close();
-        self.workbench.bind_local();
-        self.permissions_picker.close();
+        self.parked_workbench
+            .as_mut()
+            .unwrap_or(&mut self.workbench)
+            .bind_local();
+        self.suspend_permission_editor();
         self.permission_config_trust_deferred = false;
         self.permissions.set_project_with_config(cwd, permissions);
         self.state
@@ -4610,11 +4604,16 @@ impl App {
         self.workspace_baseline
             .set_current_head(self.history_head());
         self.workspace_session = Some(change.workspace);
+        self.invalidate_permission_authority();
         if let Some(workspace) = self.workspace_session.clone()
-            && let Err(error) = self.workbench.bind_workspace_with_gate(
-                workspace,
-                remote_workbench_gate(Arc::clone(&self.workspace_baseline)),
-            )
+            && let Err(error) = self
+                .parked_workbench
+                .as_mut()
+                .unwrap_or(&mut self.workbench)
+                .bind_workspace_with_gate(
+                    workspace,
+                    remote_workbench_gate(Arc::clone(&self.workspace_baseline)),
+                )
         {
             tracing::warn!(%error, "remote workbench backend rebind failed");
         }
@@ -4731,6 +4730,9 @@ impl App {
     }
 
     pub(crate) fn lifecycle_blocker(&self) -> Option<&'static str> {
+        if self.permission_mutation_pending() {
+            return Some("Waiting for durable permission acknowledgment");
+        }
         [
             (self.permission_prompt.is_open(), PERMISSION_BLOCKER),
             (
@@ -4836,6 +4838,7 @@ impl App {
     }
 
     pub fn close_all_overlays(&mut self) {
+        self.suspend_permission_editor();
         self.overlays_mut().iter_mut().for_each(|o| o.close());
     }
 
@@ -4855,6 +4858,7 @@ impl App {
             | self.tick_permission_config_trust()
             | self.poll_snapshot_refusal()
             | self.poll_pattern_suggestions()
+            | self.poll_permission_editor()
             | self.model_picker.refresh()
             | self.usage_modal.poll(&self.usage_slot)
             | self.storage_modal.poll(&self.storage_slot)
@@ -4883,8 +4887,16 @@ impl App {
     }
 
     fn tick_workbench(&mut self) -> Dirty {
+        let mut parked_dirty = Dirty::NO;
+        if let Some(parked) = &mut self.parked_workbench {
+            let (changed, flash) = parked.tick();
+            parked_dirty = Dirty::from(changed);
+            if let Some(flash) = flash {
+                self.status_bar.flash(flash);
+            }
+        }
         if !self.workbench.is_open() {
-            return Dirty::NO;
+            return parked_dirty;
         }
         self.sync_workbench_theme();
         // The workbench paints its own bars, so the setting reaches it here
@@ -4895,13 +4907,16 @@ impl App {
             self.status_bar.flash(flash);
         }
         self.persist_workbench_layout();
-        Dirty::from(dirty)
+        parked_dirty | Dirty::from(dirty)
     }
 
     /// A layout moves when a tab opens or a pane resizes, which is rare enough
     /// to write on the change itself rather than on a timer or on each of the
     /// several ways an overlay can leave the screen.
     fn persist_workbench_layout(&mut self) {
+        if self.parked_workbench.is_some() {
+            return;
+        }
         let layout = self.workbench.layout();
         if self.workbench_layout.as_ref() == Some(&layout) {
             return;
@@ -4939,6 +4954,7 @@ impl App {
             || self.login_picker.is_open()
             || self.mcp_picker.is_open()
             || self.permission_prompt.is_open()
+            || self.permission_job_pending()
         {
             return Dirty::NO;
         }

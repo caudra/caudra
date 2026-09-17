@@ -6,7 +6,8 @@ use std::borrow::Cow;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::{Arc, LazyLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, RwLock, RwLockReadGuard};
 use std::task::{Context, Poll};
 
 use arc_swap::ArcSwap;
@@ -16,7 +17,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::permissions::{
-    PermissionAuthorityProfile, PermissionResource, PermissionRisk, RemotePermissionIdentity,
+    PermissionAuthorityProfile, PermissionExecutorKind, PermissionResource, PermissionRisk,
+    PermissionSubject, RemotePermissionIdentity,
 };
 use crate::template::Vars;
 use crate::{BufferSnapshot, ToolInput, ToolOutput, ToolOutputLimits};
@@ -90,6 +92,50 @@ pub enum ToolSource {
 }
 
 impl ToolSource {
+    pub fn permission_identity(
+        &self,
+        name: &str,
+        remote: Option<&RemotePermissionIdentity>,
+    ) -> Option<(PermissionSubject, PermissionExecutorKind)> {
+        Some(match self {
+            Self::Native {
+                owner, contract, ..
+            } => (
+                match remote {
+                    Some(identity) => PermissionSubject::RemoteNative {
+                        identity: identity.clone(),
+                        owner: owner.to_string(),
+                        contract: contract.to_string(),
+                    },
+                    None => PermissionSubject::Native {
+                        owner: owner.to_string(),
+                        contract: contract.to_string(),
+                    },
+                },
+                PermissionExecutorKind::Native,
+            ),
+            Self::Lua {
+                plugin, contract, ..
+            } => (
+                PermissionSubject::Lua {
+                    plugin: plugin.to_string(),
+                    tool: name.to_owned(),
+                    contract: contract.to_string(),
+                },
+                PermissionExecutorKind::Lua,
+            ),
+            Self::RemoteWorkcell { identity, contract } => (
+                PermissionSubject::RemoteWorkcell {
+                    identity: identity.as_ref().clone(),
+                    tool: name.to_owned(),
+                    contract: contract.to_string(),
+                },
+                PermissionExecutorKind::RemoteWorkcell,
+            ),
+            Self::Mcp { .. } => return None,
+        })
+    }
+
     pub fn as_log_field(&self) -> Cow<'static, str> {
         match self {
             Self::Native { owner, .. } => Cow::Owned(format!("native:{owner}")),
@@ -537,6 +583,75 @@ impl RegisteredTool {
 /// Lock-free reads via `ArcSwap`, writes swap in a new snapshot atomically.
 pub struct ToolRegistry {
     tools: ArcSwap<Vec<RegisteredTool>>,
+    authority_gate: RwLock<()>,
+    authority_revision: AtomicU64,
+}
+
+pub struct RegistryAuthoritySnapshot<'a> {
+    _guard: RwLockReadGuard<'a, ()>,
+    tools: Arc<Vec<RegisteredTool>>,
+    revision: u64,
+}
+
+impl RegistryAuthoritySnapshot<'_> {
+    pub fn tools(&self) -> &[RegisteredTool] {
+        &self.tools
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrustedToolSource {
+    subject: PermissionSubject,
+    executor: PermissionExecutorKind,
+    effect: ToolEffect,
+    builtin_allows: bool,
+}
+
+impl TrustedToolSource {
+    pub fn from_registered(
+        tool: &RegisteredTool,
+        remote: Option<&RemotePermissionIdentity>,
+    ) -> Option<Self> {
+        let (subject, executor) = tool.source.permission_identity(tool.name(), remote)?;
+        Some(Self {
+            subject,
+            executor,
+            effect: tool.effect,
+            builtin_allows: matches!(
+                tool.source,
+                ToolSource::Native { trusted: true, .. } | ToolSource::Lua { bundled: true, .. }
+            ),
+        })
+    }
+
+    pub fn from_mcp_binding(subject: PermissionSubject) -> Option<Self> {
+        matches!(subject, PermissionSubject::Mcp { .. }).then_some(Self {
+            subject,
+            executor: PermissionExecutorKind::Mcp,
+            effect: ToolEffect::Unknown,
+            builtin_allows: false,
+        })
+    }
+
+    pub fn subject(&self) -> &PermissionSubject {
+        &self.subject
+    }
+
+    pub fn executor(&self) -> &PermissionExecutorKind {
+        &self.executor
+    }
+
+    pub fn effect(&self) -> ToolEffect {
+        self.effect
+    }
+
+    pub fn builtin_allows(&self) -> bool {
+        self.builtin_allows
+    }
 }
 
 impl Default for ToolRegistry {
@@ -555,6 +670,20 @@ impl ToolRegistry {
     pub fn new() -> Self {
         Self {
             tools: ArcSwap::from_pointee(Vec::new()),
+            authority_gate: RwLock::new(()),
+            authority_revision: AtomicU64::new(0),
+        }
+    }
+
+    pub fn authority_snapshot(&self) -> RegistryAuthoritySnapshot<'_> {
+        let guard = self
+            .authority_gate
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
+        RegistryAuthoritySnapshot {
+            _guard: guard,
+            tools: self.tools.load_full(),
+            revision: self.authority_revision.load(Ordering::Acquire),
         }
     }
 
@@ -587,6 +716,10 @@ impl ToolRegistry {
         source: ToolSource,
         effect: ToolEffect,
     ) -> Result<(), RegistryError> {
+        let _authority = self
+            .authority_gate
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
         let name = tool.name().to_owned();
         let mut conflict = None;
         self.tools.rcu(|current| {
@@ -607,6 +740,7 @@ impl ToolRegistry {
         if let Some(existing) = conflict {
             return Err(RegistryError::NameConflict { name, existing });
         }
+        self.authority_revision.fetch_add(1, Ordering::Release);
         Ok(())
     }
 
@@ -627,6 +761,10 @@ impl ToolRegistry {
         &self,
         entries: impl IntoIterator<Item = (Arc<dyn Tool>, ToolSource, ToolEffect)>,
     ) -> Result<(), RegistryError> {
+        let _authority = self
+            .authority_gate
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
         let entries: Vec<_> = entries.into_iter().collect();
         let mut conflict = None;
         self.tools.rcu(|current| {
@@ -652,10 +790,15 @@ impl ToolRegistry {
         if let Some(e) = conflict {
             return Err(e);
         }
+        self.authority_revision.fetch_add(1, Ordering::Release);
         Ok(())
     }
 
     pub fn clear_mcp_server(&self, server: &str) {
+        let _authority = self
+            .authority_gate
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
         self.tools.rcu(|current| {
             current
                 .iter()
@@ -665,6 +808,7 @@ impl ToolRegistry {
                 .cloned()
                 .collect::<Vec<_>>()
         });
+        self.authority_revision.fetch_add(1, Ordering::Release);
     }
 
     pub fn replace_plugin(
@@ -686,6 +830,10 @@ impl ToolRegistry {
         plugin: &str,
         new_entries: Vec<(Arc<dyn Tool>, ToolSource, ToolEffect)>,
     ) -> Result<(), RegistryError> {
+        let _authority = self
+            .authority_gate
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
         let mut conflict = None;
         self.tools.rcu(|current| {
             conflict = None;
@@ -716,10 +864,15 @@ impl ToolRegistry {
         if let Some(e) = conflict {
             return Err(e);
         }
+        self.authority_revision.fetch_add(1, Ordering::Release);
         Ok(())
     }
 
     pub fn clear_lua(&self) {
+        let _authority = self
+            .authority_gate
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
         self.tools.rcu(|current| {
             current
                 .iter()
@@ -727,9 +880,14 @@ impl ToolRegistry {
                 .cloned()
                 .collect::<Vec<_>>()
         });
+        self.authority_revision.fetch_add(1, Ordering::Release);
     }
 
     pub fn clear_plugin(&self, plugin: &str) {
+        let _authority = self
+            .authority_gate
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
         self.tools.rcu(|current| {
             current
                 .iter()
@@ -739,6 +897,7 @@ impl ToolRegistry {
                 .cloned()
                 .collect::<Vec<_>>()
         });
+        self.authority_revision.fetch_add(1, Ordering::Release);
     }
 
     /// Human-friendly summary of an invocation; the raw tool name when
@@ -879,10 +1038,46 @@ fn format_examples_as_text(examples: &Value) -> Option<String> {
 mod tests {
     use super::*;
     use crate::template::Vars;
+    use std::sync::Barrier;
+    use std::thread;
     use test_case::test_case;
 
     const EXAMPLES_DROPPED: &str = "an example body must survive into the text form";
     const SNIPPET: &str = "batch { file_read }";
+    const EDITOR_TOOL: &str = "permission-editor-tool";
+    const EDITOR_PLUGIN: &str = "permission-editor-plugin";
+
+    #[test]
+    fn authority_lease_fences_registry_reloads() {
+        let registry = ToolRegistry::new();
+        registry
+            .register(mock(EDITOR_TOOL), lua_source(EDITOR_PLUGIN))
+            .unwrap();
+        let lease = registry.authority_snapshot();
+        let revision = lease.revision();
+        let entered = Barrier::new(2);
+        thread::scope(|scope| {
+            let writer = scope.spawn(|| {
+                entered.wait();
+                registry.clear_plugin(EDITOR_PLUGIN);
+            });
+            entered.wait();
+            assert!(registry.authority_gate.try_write().is_err());
+            let registered = &lease.tools()[0];
+            let descriptor = TrustedToolSource::from_registered(registered, None).unwrap();
+            assert_eq!(
+                registered
+                    .source
+                    .permission_identity(registered.name(), None),
+                Some((descriptor.subject().clone(), descriptor.executor().clone()))
+            );
+            drop(lease);
+            writer.join().unwrap();
+        });
+        let current = registry.authority_snapshot();
+        assert!(current.tools().is_empty());
+        assert!(current.revision() > revision);
+    }
 
     struct MockTool {
         name: String,

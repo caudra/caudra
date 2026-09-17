@@ -12,8 +12,15 @@ use caudra_workspace::{
 use crate::id::CaudraId;
 use crate::permission_patterns::PatternDefinition;
 use crate::sessions::SessionDatabase;
-use crate::state::{SCOPE_GLOBAL, StateKey, StateStore};
+use crate::state::{SCOPE_GLOBAL, StateKey};
 use crate::{StateClass, StateDir, StorageError, now_epoch};
+use mutation::{
+    PermissionCommitReceipt, PermissionGeneration, PermissionMutation, PermissionMutationError,
+    PermissionOwner, PermissionRecordIdentity, PermissionSnapshot, PreparedPermissionMutation,
+    prepare_mutation,
+};
+
+pub mod mutation;
 
 const PERMISSION_RULES: StateKey = StateKey {
     name: "permission.rules",
@@ -61,6 +68,8 @@ const WORKDIR_ATTRIBUTE: &str = "workdir";
 const CONFINED_READ_ATTRIBUTE: &str = "confined_read";
 const COMMAND_OBSERVATION_ATTRIBUTE: &str = "command_observation";
 const COMMAND_OBSERVATION_BINDING_ATTRIBUTE: &str = "command_observation_binding";
+pub const PERMISSION_LABEL_MAX_BYTES: usize = 256;
+const INVALID_LABEL: &str = "permission label must be nonempty, bounded, and free of controls";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -338,6 +347,10 @@ pub struct PermissionRuleRecord {
     pub rule: StructuredPermissionRule,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review: Option<PermissionReview>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replaces: Option<PermissionRecordIdentity>,
     pub created_at: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revoked_at: Option<u64>,
@@ -434,6 +447,8 @@ impl PermissionRuleRecord {
             project: None,
             rule,
             review,
+            label: None,
+            replaces: None,
             created_at: now_epoch(),
             revoked_at: None,
         };
@@ -455,20 +470,23 @@ pub enum PermissionStateError {
 }
 
 pub struct PermissionState {
-    store: StateStore,
+    database: SessionDatabase,
     existed: bool,
     records: Vec<PermissionRuleRecord>,
 }
 
 impl PermissionState {
     pub fn open(state_dir: &StateDir) -> Result<Self, PermissionStateError> {
-        let store = StateStore::open(state_dir, PERMISSION_RULES.class)?;
-        let records = store.get::<Vec<PermissionRuleRecord>>(SCOPE_GLOBAL, PERMISSION_RULES)?;
+        let database = SessionDatabase::open_state(&state_dir.for_class(PERMISSION_RULES.class))
+            .map_err(StorageError::from)?;
+        let records = database
+            .state_get::<Vec<PermissionRuleRecord>>(SCOPE_GLOBAL, PERMISSION_RULES.name)
+            .map_err(StorageError::from)?;
         let existed = records.is_some();
         let records = records.unwrap_or_default();
         validate_records(&records)?;
         Ok(Self {
-            store,
+            database,
             existed,
             records,
         })
@@ -476,8 +494,9 @@ impl PermissionState {
 
     pub fn refresh(&mut self) -> Result<(), PermissionStateError> {
         match self
-            .store
-            .get::<Vec<PermissionRuleRecord>>(SCOPE_GLOBAL, PERMISSION_RULES)?
+            .database
+            .state_get::<Vec<PermissionRuleRecord>>(SCOPE_GLOBAL, PERMISSION_RULES.name)
+            .map_err(StorageError::from)?
         {
             Some(records) => {
                 validate_records(&records)?;
@@ -494,6 +513,41 @@ impl PermissionState {
 
     pub fn records(&self) -> &[PermissionRuleRecord] {
         &self.records
+    }
+
+    pub fn snapshot(&self) -> Result<PermissionSnapshot, PermissionMutationError> {
+        let snapshot = self
+            .database
+            .permission_snapshot(PermissionOwner::Persistent)?;
+        if self.existed && !snapshot.revision.row_present {
+            return Err(PermissionMutationError::Conflict {
+                owner: PermissionOwner::Persistent,
+            });
+        }
+        Ok(snapshot)
+    }
+
+    pub fn generation(&self) -> Result<PermissionGeneration, PermissionMutationError> {
+        self.database.permission_generation()
+    }
+
+    pub fn commit_mutation(
+        &mut self,
+        prepared: &PreparedPermissionMutation,
+    ) -> Result<PermissionCommitReceipt, PermissionMutationError> {
+        if !prepared.persistent_only() {
+            return Err(PermissionMutationError::InvalidOperation);
+        }
+        let receipt = self.database.commit_permission_mutation(prepared)?;
+        self.refresh()?;
+        Ok(receipt)
+    }
+
+    pub fn mutation_receipt(
+        &self,
+        operation_id: CaudraId,
+    ) -> Result<Option<PermissionCommitReceipt>, PermissionMutationError> {
+        self.database.permission_receipt(operation_id)
     }
 
     pub fn insert(
@@ -530,39 +584,51 @@ impl PermissionState {
         if inserted.is_empty() {
             return Ok(inserted);
         }
-        self.records = self.store.try_update(
-            SCOPE_GLOBAL,
-            PERMISSION_RULES,
-            |records: &mut Vec<PermissionRuleRecord>| -> Result<_, PermissionStateError> {
-                validate_records(records)?;
-                records.extend(inserted.iter().cloned());
-                validate_records(records)?;
-                Ok(records.clone())
+        let prepared = prepare_mutation(
+            vec![self.snapshot().map_err(mutation_state_error)?],
+            PermissionMutation::Create {
+                destination: PermissionOwner::Persistent,
+                records: inserted.clone().into_boxed_slice(),
             },
-        )??;
-        self.existed = true;
+        )
+        .map_err(mutation_state_error)?;
+        self.commit_mutation(&prepared)
+            .map_err(mutation_state_error)?;
         Ok(inserted)
     }
 
     pub fn revoke(&mut self, id: &str) -> Result<bool, PermissionStateError> {
-        let (revoked, records) = self.store.try_update(
-            SCOPE_GLOBAL,
-            PERMISSION_RULES,
-            |records: &mut Vec<PermissionRuleRecord>| -> Result<_, PermissionStateError> {
-                validate_records(records)?;
-                let Some(record) = records
-                    .iter_mut()
-                    .find(|record| record.id == id && record.is_active())
-                else {
-                    return Ok((false, records.clone()));
-                };
-                record.revoked_at = Some(now_epoch());
-                Ok((true, records.clone()))
+        let snapshot = self.snapshot().map_err(mutation_state_error)?;
+        if !snapshot
+            .records
+            .iter()
+            .any(|record| record.id == id && record.is_active())
+        {
+            self.existed |= snapshot.revision.row_present;
+            self.records = snapshot.records;
+            return Ok(false);
+        }
+        let prepared = prepare_mutation(
+            vec![snapshot],
+            PermissionMutation::Revoke {
+                source: PermissionRecordIdentity {
+                    owner: PermissionOwner::Persistent,
+                    record_id: id.into(),
+                },
             },
-        )??;
-        self.records = records;
-        self.existed = true;
-        Ok(revoked)
+        )
+        .map_err(mutation_state_error)?;
+        self.commit_mutation(&prepared)
+            .map_err(mutation_state_error)?;
+        Ok(true)
+    }
+}
+
+fn mutation_state_error(error: PermissionMutationError) -> PermissionStateError {
+    match error {
+        PermissionMutationError::Session(error) => StorageError::from(error).into(),
+        PermissionMutationError::State(error) => error,
+        error => PermissionStateError::Invalid(error.to_string()),
     }
 }
 
@@ -584,10 +650,14 @@ pub fn inventory_fingerprint(
 ) -> Result<String, PermissionStateError> {
     validate_records(records)?;
     let encoded = serde_json::to_vec(records).map_err(StorageError::from)?;
-    Ok(Sha256::digest(encoded)
+    Ok(sha256_hex(&encoded))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
         .iter()
         .map(|byte| format!("{byte:02x}"))
-        .collect())
+        .collect()
 }
 
 pub fn replace_reviewed(
@@ -665,6 +735,8 @@ fn new_record(
         project,
         rule,
         review,
+        label: None,
+        replaces: None,
         created_at: now_epoch(),
         revoked_at: None,
     };
@@ -700,6 +772,26 @@ fn validate_record(
         .id
         .parse::<CaudraId>()
         .map_err(|error| PermissionStateError::Invalid(format!("invalid record ID: {error}")))?;
+    if record.label.as_ref().is_some_and(|label| {
+        label.trim().is_empty()
+            || label.len() > PERMISSION_LABEL_MAX_BYTES
+            || label.chars().any(|character| {
+                character.is_control()
+                    || matches!(character, '\u{200b}'..='\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2060}'..='\u{206f}' | '\u{feff}')
+            })
+    }) {
+        return Err(PermissionStateError::Invalid(INVALID_LABEL.into()));
+    }
+    if let Some(source) = &record.replaces {
+        source.record_id.parse::<CaudraId>().map_err(|error| {
+            PermissionStateError::Invalid(format!("invalid replacement source ID: {error}"))
+        })?;
+        if source.record_id == record.id {
+            return Err(PermissionStateError::Invalid(
+                "a rule cannot replace itself".into(),
+            ));
+        }
+    }
     if record
         .revoked_at
         .is_some_and(|revoked_at| revoked_at < record.created_at)
@@ -1768,6 +1860,8 @@ mod tests {
             project: None,
             rule: rule(PermissionLifetime::Project),
             review: None,
+            label: None,
+            replaces: None,
             created_at: now_epoch(),
             revoked_at: None,
         };

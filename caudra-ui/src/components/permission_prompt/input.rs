@@ -1,4 +1,3 @@
-use crate::theme;
 use crossterm::event::KeyEventKind;
 
 use super::details::sensitive_text;
@@ -458,12 +457,14 @@ impl PermissionPrompt {
 
     pub(super) fn move_focus(&mut self, reverse: bool) {
         let mut controls = Vec::new();
-        if self.inspector.is_some() && self.panel != Panel::Details {
+        if self.panel != Panel::Details
+            && let Some(panel) = self.inspector_panel()
+        {
             controls.extend(
-                self.inspector_body(&theme::current())
-                    .entries
+                panel
+                    .fields()
                     .into_iter()
-                    .map(|(target, _)| target),
+                    .map(|field| PromptTarget::Inspector(field.control)),
             );
         }
         for hit in &self.row_hits {
@@ -492,6 +493,18 @@ impl PermissionPrompt {
 
     pub(super) fn activate(&mut self, target: PromptTarget) -> Option<PermissionDecision> {
         match target {
+            PromptTarget::VisualScope(authority, control) => {
+                if self.confirmation.is_some() {
+                    return None;
+                }
+                if self.scope_authority != authority {
+                    self.scope_authority = authority;
+                    self.scope_view = Default::default();
+                }
+                self.scope_view.activate(control);
+                self.invalidate_controls();
+                None
+            }
             PromptTarget::Inspector(control) => {
                 self.activate_inspector(control);
                 None

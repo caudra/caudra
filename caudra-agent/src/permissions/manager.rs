@@ -1,3 +1,4 @@
+use super::editor::{PermissionAuthorityProvider, PermissionPublication};
 use super::{
     BOUNDARY_UNVERIFIABLE_PREFIX, ConfiguredPolicy, PermissionBroker, PermissionLifetime,
     PermissionPolicyError, PermissionRuleRecord, PluginRuleStore, SharedPermissionState,
@@ -15,6 +16,10 @@ use super::{
 };
 use caudra_config::{Effect, PermissionRule, PermissionsConfig, ToolKey};
 use caudra_storage::permission_patterns::PatternDefinition;
+use caudra_storage::permission_state::mutation::{
+    PermissionGeneration, PermissionMutation, PermissionOwner, PermissionRecordIdentity,
+    PermissionSnapshot, prepare_mutation,
+};
 use caudra_storage::permission_state::validate_conversation_record;
 use caudra_storage::sessions::SessionDatabase;
 use caudra_storage::state::{SCOPE_GLOBAL, StateKey, StateStore};
@@ -26,10 +31,11 @@ use std::path::{Path, PathBuf};
 use std::sync::MutexGuard;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::warn;
 
 pub(super) static NEXT_PERMISSION_MANAGER_ID: AtomicU64 = AtomicU64::new(1);
+pub(super) const PERMISSION_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const RUNTIME_PATTERN_MIN_SUPPORT: usize = 3;
 const MAX_PATTERN_CANDIDATE_BYTES: usize = MAX_RECOGNIZER_BYTES / 8;
 const MAX_PATTERN_PROJECTS: usize = 4;
@@ -176,6 +182,11 @@ pub struct PermissionManager {
     pub(super) context_revision: RwLock<u64>,
     pub(super) structured_conversation_rules: Mutex<Vec<PermissionRuleRecord>>,
     pub(super) conversation_policy_error: Mutex<Option<String>>,
+    pub(super) conversation_snapshot: Mutex<Option<PermissionSnapshot>>,
+    pub(super) publication: RwLock<Option<Arc<dyn PermissionPublication>>>,
+    pub(super) editor_provider: RwLock<Option<Arc<dyn PermissionAuthorityProvider>>>,
+    last_permission_poll: Mutex<Option<Instant>>,
+    external_generation: Mutex<Option<PermissionGeneration>>,
     pub(super) broker: Arc<PermissionBroker>,
     pub(super) configured: RwLock<ConfiguredPolicy>,
     pub(super) yolo: AtomicBool,
@@ -205,6 +216,13 @@ pub enum RevokedRuleScope {
     Conversation,
     Project,
     Global,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PermissionProjectFilter {
+    Current,
+    All,
+    Project(PathBuf),
 }
 
 impl PermissionManager {
@@ -319,6 +337,11 @@ impl PermissionManager {
             context_revision: RwLock::new(0),
             structured_conversation_rules: Mutex::new(Vec::new()),
             conversation_policy_error: Mutex::new(None),
+            conversation_snapshot: Mutex::new(None),
+            publication: RwLock::new(None),
+            editor_provider: RwLock::new(None),
+            last_permission_poll: Mutex::new(None),
+            external_generation: Mutex::new(None),
             broker,
             configured: RwLock::new(configured),
             yolo: AtomicBool::new(seed_yolo),
@@ -427,6 +450,16 @@ impl PermissionManager {
             context_revision: RwLock::new(0),
             structured_conversation_rules: Mutex::new(Vec::new()),
             conversation_policy_error: Mutex::new(None),
+            conversation_snapshot: Mutex::new(None),
+            publication: RwLock::new(None),
+            editor_provider: RwLock::new(
+                self.editor_provider
+                    .read()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .clone(),
+            ),
+            last_permission_poll: Mutex::new(None),
+            external_generation: Mutex::new(None),
             broker: Arc::clone(&self.broker),
             configured: RwLock::new(configured),
             yolo: AtomicBool::new(self.is_yolo()),
@@ -454,6 +487,11 @@ impl PermissionManager {
     /// The explicit toggle, so it also claims the session's intent: `/yolo` off
     /// under `--yolo` genuinely turns the session off and is remembered.
     pub fn toggle_yolo(&self) -> bool {
+        let _mutation = self
+            .broker
+            .mutation_gate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let enabled = !self.yolo.fetch_xor(true, Ordering::Relaxed);
         self.yolo_explicit.store(true, Ordering::Relaxed);
         self.notify_policy_changed("");
@@ -464,6 +502,11 @@ impl PermissionManager {
     /// stored intent, `None` means they never expressed one and the seed
     /// applies again.
     pub fn set_session_yolo(&self, stored: Option<bool>) {
+        let _mutation = self
+            .broker
+            .mutation_gate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         self.yolo
             .store(stored.unwrap_or(self.seed_yolo), Ordering::Relaxed);
         self.yolo_explicit
@@ -498,10 +541,48 @@ impl PermissionManager {
     }
 
     pub fn structured_conversation_rules_snapshot(&self) -> Vec<PermissionRuleRecord> {
+        let _mutation = self
+            .broker
+            .mutation_gate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         self.structured_conversation_rules().clone()
     }
 
+    pub fn conversation_permission_snapshot(&self) -> Option<PermissionSnapshot> {
+        let _mutation = self
+            .broker
+            .mutation_gate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        self.conversation_snapshot
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
     pub fn load_structured_conversation_rules(&self, rules: Vec<PermissionRuleRecord>) {
+        let _mutation = self
+            .broker
+            .mutation_gate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(publication) = self.publication() {
+            let result = publication.snapshot().and_then(|snapshot| {
+                if snapshot.records != rules {
+                    return Err(super::editor::PermissionEditError::Conflict);
+                }
+                self.publish_conversation_snapshot(snapshot)
+            });
+            if let Err(error) = result {
+                *self
+                    .conversation_policy_error
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()) = Some(error.to_string());
+            }
+            self.notify_policy_changed("");
+            return;
+        }
         let error = rules.iter().find_map(|rule| {
             validate_conversation_record(rule)
                 .map_err(|error| PermissionPolicyError(error.to_string()))
@@ -810,38 +891,195 @@ impl PermissionManager {
     pub fn structured_rule_inventory(
         &self,
     ) -> Result<Vec<PermissionRuleRecord>, PermissionPolicyError> {
+        self.structured_rule_inventory_filtered(&PermissionProjectFilter::Current, false)
+    }
+
+    pub fn structured_rule_inventory_filtered(
+        &self,
+        filter: &PermissionProjectFilter,
+        include_revoked: bool,
+    ) -> Result<Vec<PermissionRuleRecord>, PermissionPolicyError> {
+        self.poll_permission_changes()?;
+        let _mutation = self
+            .broker
+            .mutation_gate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         self.ensure_conversation_policy_valid()?;
         let mut inventory: Vec<_> = self
             .structured_conversation_rules()
             .iter()
-            .filter(|record| record.is_active())
+            .filter(|record| include_revoked || record.is_active())
             .cloned()
             .collect();
-        inventory.extend(self.persistent_records()?);
+        let project = match filter {
+            PermissionProjectFilter::Current => Some(self.project_cwd()),
+            PermissionProjectFilter::All => None,
+            PermissionProjectFilter::Project(path) => Some(path.clone()),
+        };
+        if let Some(policy) = &self.policy {
+            let mut state = policy
+                .policy
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            inventory.extend(
+                state
+                    .state()?
+                    .records()
+                    .iter()
+                    .filter(|record| {
+                        (include_revoked || record.is_active())
+                            && (project.is_none()
+                                || record.project.is_none()
+                                || record.project == project)
+                    })
+                    .cloned(),
+            );
+        }
+        for record in &inventory {
+            validate_compiled_templates(&record.rule)?;
+        }
         inventory.sort_by_key(|record| record.created_at);
         Ok(inventory)
+    }
+
+    pub fn poll_permission_changes(&self) -> Result<bool, PermissionPolicyError> {
+        let mut last = self
+            .last_permission_poll
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if last.is_some_and(|last| last.elapsed() < PERMISSION_POLL_INTERVAL) {
+            return Ok(false);
+        }
+        *last = Some(Instant::now());
+        drop(last);
+        self.refresh_permission_state()
+    }
+
+    pub fn refresh_permission_state(&self) -> Result<bool, PermissionPolicyError> {
+        let _mutation = self
+            .broker
+            .mutation_gate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut changed = false;
+        if let Some(policy) = &self.policy {
+            let mut state = policy
+                .policy
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let generation = state
+                .state()?
+                .generation()
+                .map_err(|error| PermissionPolicyError(error.to_string()))?;
+            let mut observed = self
+                .external_generation
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            changed = observed.as_ref() != Some(&generation);
+            *observed = Some(generation);
+        }
+        if let Some(publication) = self.publication() {
+            let snapshot = publication
+                .snapshot()
+                .map_err(|error| PermissionPolicyError(error.to_string()))?;
+            let current = self
+                .conversation_snapshot
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone();
+            if current.as_ref() != Some(&snapshot) {
+                if let Err(error) = self.publish_conversation_snapshot(snapshot) {
+                    *self
+                        .conversation_policy_error
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner()) = Some(error.to_string());
+                    self.notify_policy_changed("");
+                    return Err(PermissionPolicyError(error.to_string()));
+                }
+                changed = true;
+            }
+        }
+        if changed {
+            self.notify_policy_changed("");
+        }
+        Ok(changed)
     }
 
     pub fn revoke_structured_rule(
         &self,
         id: &str,
     ) -> Result<Option<RevokedRuleScope>, PermissionPolicyError> {
+        let _mutation = self
+            .broker
+            .mutation_gate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         self.ensure_conversation_policy_valid()?;
+        if let Some(publication) = self.publication() {
+            let snapshot = publication
+                .snapshot()
+                .map_err(|error| PermissionPolicyError(error.to_string()))?;
+            if snapshot
+                .records
+                .iter()
+                .any(|record| record.id == id && record.is_active())
+            {
+                if snapshot.records != *self.structured_conversation_rules() {
+                    return Err(PermissionPolicyError(
+                        "conversation permission state changed".into(),
+                    ));
+                }
+                let prepared = prepare_mutation(
+                    vec![snapshot.clone()],
+                    PermissionMutation::Revoke {
+                        source: PermissionRecordIdentity {
+                            owner: snapshot.revision.owner,
+                            record_id: id.into(),
+                        },
+                    },
+                )
+                .map_err(|error| PermissionPolicyError(error.to_string()))?;
+                self.commit_prepared_permission_mutation(&prepared)
+                    .map_err(|error| PermissionPolicyError(error.to_string()))?;
+                self.notify_policy_changed("");
+                return Ok(Some(RevokedRuleScope::Conversation));
+            }
+        }
         {
             let mut conversation = self.structured_conversation_rules();
             if let Some(record) = conversation
                 .iter_mut()
                 .find(|record| record.id == id && record.is_active())
             {
-                record.revoked_at = Some(now_epoch());
+                if self.publication().is_some() {
+                    return Err(PermissionPolicyError(
+                        "conversation permission state changed".into(),
+                    ));
+                }
+                record.revoked_at = Some(now_epoch().max(record.created_at));
                 drop(conversation);
                 self.notify_policy_changed("");
                 return Ok(Some(RevokedRuleScope::Conversation));
             }
         }
 
-        let applicable = self.persistent_records()?;
-        let Some(record) = applicable.iter().find(|record| record.id == id) else {
+        let Some(policy) = &self.policy else {
+            return Ok(None);
+        };
+        let mut policy = policy.policy.lock().unwrap_or_else(|error| {
+            warn!("permission policy mutex was poisoned, recovering");
+            error.into_inner()
+        });
+        let state = policy.state()?;
+        let snapshot = state
+            .snapshot()
+            .map_err(|error| PermissionPolicyError(error.to_string()))?;
+        let Some(record) = snapshot
+            .records
+            .iter()
+            .find(|record| record.id == id && record.is_active())
+        else {
             return Ok(None);
         };
         let scope = match record.rule.lifetime {
@@ -849,27 +1087,21 @@ impl PermissionManager {
             PermissionLifetime::Global => RevokedRuleScope::Global,
             PermissionLifetime::Once | PermissionLifetime::Conversation => return Ok(None),
         };
-        let policy = self
-            .policy
-            .as_ref()
-            .ok_or_else(|| PermissionPolicyError("persistent storage is disabled".into()))?;
-        let mut policy = policy.policy.lock().unwrap_or_else(|error| {
-            warn!("permission policy mutex was poisoned, recovering");
-            error.into_inner()
-        });
-        let state = policy.state()?;
-        if state
-            .revoke(id)
-            .map_err(|error| PermissionPolicyError(error.to_string()))?
-        {
-            drop(policy);
-            self.notify_policy_changed("");
-            Ok(Some(scope))
-        } else {
-            Err(PermissionPolicyError(
-                "rule changed before revocation".into(),
-            ))
-        }
+        let prepared = prepare_mutation(
+            vec![snapshot],
+            PermissionMutation::Revoke {
+                source: PermissionRecordIdentity {
+                    owner: PermissionOwner::Persistent,
+                    record_id: id.into(),
+                },
+            },
+        )
+        .map_err(|error| PermissionPolicyError(error.to_string()))?;
+        drop(policy);
+        self.commit_prepared_permission_mutation(&prepared)
+            .map_err(|error| PermissionPolicyError(error.to_string()))?;
+        self.notify_policy_changed("");
+        Ok(Some(scope))
     }
 }
 
@@ -1690,23 +1922,49 @@ mod pattern_runtime_tests {
         definition.combinations = SlotCombinations::Independent;
         assert!(
             manager
-                .store_reusable_rules(&offered, vec![valid, invalid.clone()], Some(temp.path()))
+                .store_reusable_rules(
+                    &offered,
+                    vec![valid.clone(), invalid.clone()],
+                    Some(temp.path()),
+                )
                 .is_err()
         );
         assert!(manager.structured_rule_inventory().unwrap().is_empty());
-        if lifetime == PermissionLifetime::Conversation {
+        manager
+            .store_reusable_rules(&offered, vec![valid.clone()], Some(temp.path()))
+            .unwrap();
+        let approved = manager.structured_rule_inventory().unwrap();
+        assert_eq!(approved.len(), 1);
+        assert_eq!(approved[0].rule, valid);
+        let reloaded = if lifetime == PermissionLifetime::Conversation {
             manager.load_structured_conversation_rules(vec![
                 PermissionRuleRecord::conversation(invalid).unwrap(),
             ]);
-            assert!(manager.structured_rule_inventory().is_err());
+            manager
         } else {
+            assert_eq!(
+                PermissionState::open(&state).unwrap().records(),
+                approved.as_slice()
+            );
             PermissionState::open(&state)
                 .unwrap()
                 .insert(Some(temp.path().to_path_buf()), invalid)
                 .unwrap();
-            let reloaded = persistent_manager(state, temp.path());
-            assert!(reloaded.structured_rule_inventory().is_err());
-        }
+            assert!(manager.structured_rule_inventory().is_err());
+            assert!(
+                manager
+                    .applicable_rules_within(&offered, false, true)
+                    .is_err()
+            );
+            drop(manager);
+            persistent_manager(state, temp.path())
+        };
+        assert!(reloaded.structured_rule_inventory().is_err());
+        assert!(
+            reloaded
+                .applicable_rules_within(&offered, false, true)
+                .is_err()
+        );
     }
 
     #[test]

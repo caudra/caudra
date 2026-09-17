@@ -13,11 +13,15 @@ use std::io;
 use std::mem;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use caudra_storage::id::CaudraId;
+use caudra_storage::permission_state::mutation::{
+    PermissionCommitReceipt, PermissionMutationError, PermissionOwner, PreparedPermissionMutation,
+    permission_databases_shared,
+};
 #[cfg(test)]
 use caudra_storage::sessions::SESSIONS_DB_FILE;
 use caudra_storage::sessions::{
@@ -25,7 +29,7 @@ use caudra_storage::sessions::{
 };
 use caudra_storage::state::{WorkspaceTabs, write_workspace_tabs};
 use caudra_storage::usage_ledger::{TurnUsage, UsageLedger};
-use caudra_storage::{StateDir, StorageError, now_epoch};
+use caudra_storage::{StateClass, StateDir, StorageError, now_epoch};
 use tracing::warn;
 
 use crate::AppSession;
@@ -44,6 +48,8 @@ const WRITER_UNAVAILABLE: &str = "storage writer unavailable";
 const WRITER_TIMEOUT: &str = "storage writer operation timed out";
 const WRITER_DRAIN_FAILED: &str = "storage writer stopped with unsaved session operations";
 const USAGE_DRAIN_FAILED: &str = "storage writer stopped with unsaved usage contributions";
+const PERMISSION_QUEUE_CAPACITY: usize = 16;
+const PERMISSION_QUEUE_FULL: &str = "permission mutation queue is full; nothing was enqueued";
 
 type Pending = Arc<Mutex<HashMap<CaudraId, Entry>>>;
 type PendingWorkspaceTabs = Arc<Mutex<Option<WorkspaceTabsRequest>>>;
@@ -53,6 +59,44 @@ type PendingUsage = Arc<Mutex<Vec<QueuedUsage>>>;
 
 type DeleteCallback = Box<dyn FnOnce(Result<(), SessionError>) + Send>;
 type SaveCallback = flume::Sender<Result<(), SessionError>>;
+pub type PermissionMutationAcknowledgment =
+    flume::Receiver<Result<PermissionCommitReceipt, PermissionMutationError>>;
+
+struct PermissionWrite {
+    prepared: PreparedPermissionMutation,
+    done: flume::Sender<Result<PermissionCommitReceipt, PermissionMutationError>>,
+}
+
+#[derive(Clone)]
+pub struct PermissionMutationWriter {
+    pending: flume::Sender<PermissionWrite>,
+    wake: Weak<flume::Sender<()>>,
+}
+
+impl PermissionMutationWriter {
+    pub fn submit(
+        &self,
+        prepared: PreparedPermissionMutation,
+    ) -> Result<PermissionMutationAcknowledgment, PermissionMutationError> {
+        let wake = self.wake.upgrade().ok_or_else(writer_gone)?;
+        let (done, receiver) = flume::bounded(1);
+        match self.pending.try_send(PermissionWrite { prepared, done }) {
+            Ok(()) => {}
+            Err(flume::TrySendError::Full(_)) => {
+                let error = StorageError::Io(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    PERMISSION_QUEUE_FULL,
+                ));
+                return Err(SessionError::from(error).into());
+            }
+            Err(flume::TrySendError::Disconnected(_)) => return Err(writer_gone().into()),
+        }
+        match wake.try_send(()) {
+            Ok(()) | Err(flume::TrySendError::Full(())) => Ok(receiver),
+            Err(flume::TrySendError::Disconnected(())) => Err(writer_gone().into()),
+        }
+    }
+}
 
 /// One slot per session, holding whatever the app asked for last. Deletes
 /// used to ride a side channel, where a flush queued before a delete could
@@ -77,12 +121,13 @@ struct QueuedUsage {
 
 pub struct StorageWriter {
     pending: Pending,
-    wake: flume::Sender<()>,
+    wake: Arc<flume::Sender<()>>,
     workspace_tabs: PendingWorkspaceTabs,
     usage: PendingUsage,
     done_rx: flume::Receiver<Result<(), SessionError>>,
     thread: JoinHandle<()>,
     generation: Arc<AtomicU64>,
+    permission_mutations: flume::Sender<PermissionWrite>,
 }
 
 impl StorageWriter {
@@ -94,9 +139,12 @@ impl StorageWriter {
         let usage: PendingUsage = Arc::default();
         let writer_usage = Arc::clone(&usage);
         let (wake, wake_rx) = flume::bounded::<()>(1);
+        let wake = Arc::new(wake);
         let (done_tx, done_rx) = flume::bounded(1);
         let generation: Arc<AtomicU64> = Arc::default();
         let writer_generation = Arc::clone(&generation);
+        let (permission_mutations, permission_mutations_rx) =
+            flume::bounded(PERMISSION_QUEUE_CAPACITY);
 
         let thread = std::thread::Builder::new()
             .name("storage-writer".into())
@@ -115,6 +163,7 @@ impl StorageWriter {
                     commits_since_checkpoint: 0,
                     checkpoint_stalls: 0,
                     generation: writer_generation,
+                    permission_mutations: permission_mutations_rx,
                 };
                 while wake_rx.recv().is_ok() {
                     writer.drain(&writer_pending, &writer_workspace_tabs, &writer_usage);
@@ -133,6 +182,7 @@ impl StorageWriter {
             done_rx,
             thread,
             generation,
+            permission_mutations,
         }
     }
 
@@ -182,6 +232,20 @@ impl StorageWriter {
         let (done_tx, done_rx) = flume::bounded(1);
         self.enqueue(session.id, Entry::SaveSync(session, done_tx));
         done_rx.recv_timeout(timeout).map_err(writer_wait_error)?
+    }
+
+    pub fn submit_permission_mutation(
+        &self,
+        prepared: PreparedPermissionMutation,
+    ) -> Result<PermissionMutationAcknowledgment, PermissionMutationError> {
+        self.permission_mutation_writer().submit(prepared)
+    }
+
+    pub fn permission_mutation_writer(&self) -> PermissionMutationWriter {
+        PermissionMutationWriter {
+            pending: self.permission_mutations.clone(),
+            wake: Arc::downgrade(&self.wake),
+        }
     }
 
     /// Queue deletion on the writer thread; `done` fires after the canonical
@@ -306,9 +370,49 @@ struct Writer {
     commits_since_checkpoint: u32,
     checkpoint_stalls: u32,
     generation: Arc<AtomicU64>,
+    permission_mutations: flume::Receiver<PermissionWrite>,
 }
 
 impl Writer {
+    fn flush_permissions(&mut self) {
+        for _ in 0..PERMISSION_QUEUE_CAPACITY {
+            let Ok(PermissionWrite { prepared, done }) = self.permission_mutations.try_recv()
+            else {
+                break;
+            };
+            let result = self.commit_permission_mutation(&prepared);
+            if result.is_ok() {
+                self.generation.fetch_add(1, Ordering::Release);
+            }
+            let _ = done.send(result);
+        }
+    }
+
+    fn commit_permission_mutation(
+        &mut self,
+        prepared: &PreparedPermissionMutation,
+    ) -> Result<PermissionCommitReceipt, PermissionMutationError> {
+        if prepared.persistent_only() {
+            return SessionDatabase::open_state(&self.dir.for_class(StateClass::Persistent))?
+                .commit_permission_mutation(prepared);
+        }
+        if prepared
+            .expected()
+            .iter()
+            .any(|snapshot| snapshot.revision.owner == PermissionOwner::Persistent)
+            && !permission_databases_shared(&self.dir)?
+        {
+            return Err(PermissionMutationError::DifferentDatabase);
+        }
+        if self.database.is_none() {
+            self.database = Some(SessionDatabase::open(&self.dir)?);
+        }
+        self.database
+            .as_ref()
+            .ok_or_else(writer_gone)?
+            .commit_permission_mutation(prepared)
+    }
+
     fn forget(&mut self, id: CaudraId) {
         self.cursors.remove(&id);
         self.failing.remove(&id);
@@ -408,6 +512,7 @@ impl Writer {
     fn drain(&mut self, pending: &Pending, tabs: &PendingWorkspaceTabs, usage: &PendingUsage) {
         let request = tabs.lock().unwrap_or_else(|e| e.into_inner()).take();
         self.flush(pending);
+        self.flush_permissions();
         if let Some(request) = request {
             self.flush_workspace_tabs(request);
         }
@@ -665,6 +770,14 @@ fn retryable(error: &SessionError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use caudra_storage::permission_state::mutation::{
+        PermissionMutation, PermissionRecordIdentity, prepare_mutation,
+    };
+    use caudra_storage::permission_state::{
+        PermissionArgumentConstraint, PermissionExecutorKind, PermissionLifetime,
+        PermissionRuleRecord, PermissionSubject, StructuredPermissionEffect,
+        StructuredPermissionRule,
+    };
     use caudra_storage::sessions::SessionRelocation;
     use caudra_storage::usage_ledger::{BUCKET_SECONDS, LedgerPurpose, bucket_for};
     use jiff::civil::DateTime;
@@ -701,6 +814,313 @@ mod tests {
     const PREVIOUS_MONTH: &str = "2020-01";
     const NEXT_MONTH: &str = "2020-02";
 
+    fn conversation_permission() -> PermissionRuleRecord {
+        PermissionRuleRecord::conversation(StructuredPermissionRule {
+            subject: PermissionSubject::Native {
+                owner: "workcell".into(),
+                contract: "file.read.v1".into(),
+            },
+            executor: PermissionExecutorKind::Native,
+            resources: Vec::new(),
+            arguments: PermissionArgumentConstraint::Unconstrained,
+            lifetime: PermissionLifetime::Conversation,
+            effect: StructuredPermissionEffect::Allow,
+            family: None,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn permission_lane_survives_snapshot_coalescing_and_acknowledges_durability() {
+        let (_temp, dir) = state_dir();
+        let (writer, _warnings) = writer(&dir);
+        let mut session = AppSession::new(MODEL, CWD);
+        crate::push_history_message(&mut session, user_message(0));
+        writer.save_sync(Arc::new(session.clone())).unwrap();
+        let database = SessionDatabase::open_state(&dir).unwrap();
+        let owner = PermissionOwner::Conversation(session.id);
+        let expected = database.permission_snapshot(owner.clone()).unwrap();
+        let original = conversation_permission();
+        let first = prepare_mutation(
+            vec![expected.clone()],
+            PermissionMutation::Create {
+                destination: owner.clone(),
+                records: Box::new([original.clone()]),
+            },
+        )
+        .unwrap();
+        let second = prepare_mutation(
+            vec![expected],
+            PermissionMutation::Create {
+                destination: owner.clone(),
+                records: Box::new([conversation_permission()]),
+            },
+        )
+        .unwrap();
+        let release = pause_writer(&writer);
+        let first_result = writer.submit_permission_mutation(first.clone()).unwrap();
+        let second_result = writer.submit_permission_mutation(second).unwrap();
+        crate::push_history_message(&mut session, user_message(1));
+        writer.send(Arc::new(session.clone()));
+        crate::push_history_message(&mut session, user_message(2));
+        writer.send(Arc::new(session.clone()));
+        release.send(()).unwrap();
+        let receipt = first_result.recv_timeout(DRAIN_TIMEOUT).unwrap().unwrap();
+        assert!(matches!(
+            second_result.recv_timeout(DRAIN_TIMEOUT).unwrap(),
+            Err(PermissionMutationError::Conflict { .. })
+        ));
+        assert_eq!(
+            database.permission_receipt(first.operation_id()).unwrap(),
+            Some(receipt)
+        );
+        writer.save_sync(Arc::new(session.clone())).unwrap();
+        let loaded: AppSession = database.load(session.id).unwrap();
+        assert_eq!(message_texts(&loaded), message_texts(&session));
+        assert_eq!(loaded.meta.structured_permission_rules, vec![original]);
+        crate::push_history_message(&mut session, user_message(3));
+        writer.save_sync(Arc::new(session.clone())).unwrap();
+        let loaded: AppSession = database.load(session.id).unwrap();
+        assert_eq!(loaded.meta.structured_permission_rules.len(), 1);
+        assert_eq!(message_texts(&loaded), message_texts(&session));
+        writer.shutdown_checked(DRAIN_TIMEOUT).unwrap();
+    }
+
+    #[test]
+    fn permission_lane_is_bounded_and_lost_ack_is_queryable() {
+        let (_temp, dir) = state_dir();
+        let (writer, _warnings) = writer(&dir);
+        let session = Arc::new(AppSession::new(MODEL, CWD));
+        writer.save_sync(Arc::clone(&session)).unwrap();
+        let database = SessionDatabase::open_state(&dir).unwrap();
+        let owner = PermissionOwner::Conversation(session.id);
+        let prepared = prepare_mutation(
+            vec![database.permission_snapshot(owner.clone()).unwrap()],
+            PermissionMutation::Create {
+                destination: owner.clone(),
+                records: Box::new([conversation_permission()]),
+            },
+        )
+        .unwrap();
+        let release = pause_writer(&writer);
+        let mut results = Vec::new();
+        for _ in 0..PERMISSION_QUEUE_CAPACITY {
+            results.push(writer.submit_permission_mutation(prepared.clone()).unwrap());
+        }
+        let full = writer
+            .submit_permission_mutation(prepared.clone())
+            .unwrap_err();
+        let PermissionMutationError::Session(error) = full else {
+            panic!("{full}")
+        };
+        assert_writer_error(error, io::ErrorKind::WouldBlock, PERMISSION_QUEUE_FULL);
+        drop(results.remove(0));
+        release.send(()).unwrap();
+        for result in results {
+            result.recv_timeout(DRAIN_TIMEOUT).unwrap().unwrap();
+        }
+        assert!(
+            database
+                .permission_receipt(prepared.operation_id())
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            database.permission_snapshot(owner).unwrap().records.len(),
+            1
+        );
+        writer.shutdown_checked(DRAIN_TIMEOUT).unwrap();
+    }
+
+    #[test]
+    fn permission_coordinator_does_not_keep_a_shutdown_writer_alive() {
+        let (_temp, dir) = state_dir();
+        let (writer, _warnings) = writer(&dir);
+        let session = Arc::new(AppSession::new(MODEL, CWD));
+        writer.save_sync(Arc::clone(&session)).unwrap();
+        let coordinator = writer.permission_mutation_writer();
+        let database = SessionDatabase::open_state(&dir).unwrap();
+        let owner = PermissionOwner::Conversation(session.id);
+        let prepared = prepare_mutation(
+            vec![database.permission_snapshot(owner.clone()).unwrap()],
+            PermissionMutation::Create {
+                destination: owner,
+                records: Box::new([conversation_permission()]),
+            },
+        )
+        .unwrap();
+        writer.shutdown_checked(DRAIN_TIMEOUT).unwrap();
+        let error = coordinator.submit(prepared.clone()).unwrap_err();
+        let PermissionMutationError::Session(error) = error else {
+            panic!("{error}")
+        };
+        assert_writer_error(error, io::ErrorKind::Other, WRITER_UNAVAILABLE);
+        assert!(
+            database
+                .permission_receipt(prepared.operation_id())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn queued_permission_mutation_reports_conflict_when_its_session_is_deleted() {
+        let (_temp, dir) = state_dir();
+        let (warnings, _warnings) = flume::unbounded();
+        let mut writer = bare_writer(&dir, warnings);
+        let session = AppSession::new(MODEL, CWD);
+        writer.write(&session).unwrap();
+        let database = SessionDatabase::open_state(&dir).unwrap();
+        let owner = PermissionOwner::Conversation(session.id);
+        let prepared = prepare_mutation(
+            vec![database.permission_snapshot(owner.clone()).unwrap()],
+            PermissionMutation::Create {
+                destination: owner.clone(),
+                records: Box::new([conversation_permission()]),
+            },
+        )
+        .unwrap();
+        let (mutations, commands) = flume::bounded(PERMISSION_QUEUE_CAPACITY);
+        writer.permission_mutations = commands;
+        let (done, acknowledgment) = flume::bounded(1);
+        assert!(
+            mutations
+                .send(PermissionWrite {
+                    prepared: prepared.clone(),
+                    done,
+                })
+                .is_ok()
+        );
+        let (deleted, deletion) = flume::bounded(1);
+        let pending: Pending = Arc::default();
+        lock(&pending).insert(
+            session.id,
+            Entry::Delete(Box::new(move |result| {
+                deleted.send(result).unwrap();
+            })),
+        );
+        writer.drain(&pending, &Arc::default(), &Arc::default());
+        deletion.recv_timeout(DRAIN_TIMEOUT).unwrap().unwrap();
+        assert!(matches!(
+            acknowledgment.recv_timeout(DRAIN_TIMEOUT).unwrap(),
+            Err(PermissionMutationError::Conflict { .. })
+        ));
+        assert!(
+            !database
+                .permission_snapshot(owner)
+                .unwrap()
+                .revision
+                .row_present
+        );
+        assert!(
+            database
+                .permission_receipt(prepared.operation_id())
+                .unwrap()
+                .is_none()
+        );
+        writer
+            .finish(&pending, &Arc::default(), &Arc::default())
+            .unwrap();
+    }
+
+    #[test]
+    fn historical_permission_acknowledgment_does_not_recreate_a_deleted_session() {
+        let (_temp, dir) = state_dir();
+        let (writer, _warnings) = writer(&dir);
+        let session = Arc::new(AppSession::new(MODEL, CWD));
+        writer.save_sync(Arc::clone(&session)).unwrap();
+        let database = SessionDatabase::open_state(&dir).unwrap();
+        let owner = PermissionOwner::Conversation(session.id);
+        let prepared = prepare_mutation(
+            vec![database.permission_snapshot(owner.clone()).unwrap()],
+            PermissionMutation::Create {
+                destination: owner.clone(),
+                records: Box::new([conversation_permission()]),
+            },
+        )
+        .unwrap();
+        let receipt = writer
+            .submit_permission_mutation(prepared.clone())
+            .unwrap()
+            .recv_timeout(DRAIN_TIMEOUT)
+            .unwrap()
+            .unwrap();
+        writer.delete_sync(session.id).unwrap();
+        let before = database.permission_snapshot(owner.clone()).unwrap();
+        let generation = database.permission_generation().unwrap();
+        assert_eq!(
+            writer
+                .submit_permission_mutation(prepared)
+                .unwrap()
+                .recv_timeout(DRAIN_TIMEOUT)
+                .unwrap()
+                .unwrap(),
+            receipt
+        );
+        assert_eq!(database.permission_generation().unwrap(), generation);
+        assert_eq!(database.permission_snapshot(owner).unwrap(), before);
+        assert!(!before.revision.row_present);
+        writer.shutdown_checked(DRAIN_TIMEOUT).unwrap();
+    }
+
+    #[test]
+    fn permission_revocation_survives_writer_delete_and_stale_recreation() {
+        let (_temp, dir) = state_dir();
+        let (writer, _warnings) = writer(&dir);
+        let mut session = AppSession::new(MODEL, CWD);
+        crate::push_history_message(&mut session, user_message(0));
+        writer.save_sync(Arc::new(session.clone())).unwrap();
+        let database = SessionDatabase::open_state(&dir).unwrap();
+        let owner = PermissionOwner::Conversation(session.id);
+        let original = conversation_permission();
+        let approval = prepare_mutation(
+            vec![database.permission_snapshot(owner.clone()).unwrap()],
+            PermissionMutation::Create {
+                destination: owner.clone(),
+                records: Box::new([original.clone()]),
+            },
+        )
+        .unwrap();
+        writer
+            .submit_permission_mutation(approval)
+            .unwrap()
+            .recv_timeout(DRAIN_TIMEOUT)
+            .unwrap()
+            .unwrap();
+        let approved = database.permission_snapshot(owner.clone()).unwrap();
+        approved
+            .apply_to_meta(session.id, &mut session.meta)
+            .unwrap();
+        let revoke = prepare_mutation(
+            vec![approved],
+            PermissionMutation::Revoke {
+                source: PermissionRecordIdentity {
+                    owner: owner.clone(),
+                    record_id: original.id,
+                },
+            },
+        )
+        .unwrap();
+        writer
+            .submit_permission_mutation(revoke)
+            .unwrap()
+            .recv_timeout(DRAIN_TIMEOUT)
+            .unwrap()
+            .unwrap();
+        let revoked = database.permission_snapshot(owner.clone()).unwrap();
+        writer.delete_sync(session.id).unwrap();
+        crate::push_history_message(&mut session, user_message(1));
+        writer.save_sync(Arc::new(session.clone())).unwrap();
+        let current = database.permission_snapshot(owner).unwrap();
+        assert_eq!(current.records, revoked.records);
+        assert!(current.records.iter().all(|record| !record.is_active()));
+        assert_ne!(current.revision.lineage, revoked.revision.lineage);
+        assert!(current.revision.generation > revoked.revision.generation);
+        let loaded: AppSession = database.load(session.id).unwrap();
+        assert_eq!(message_texts(&loaded), message_texts(&session));
+        writer.shutdown_checked(DRAIN_TIMEOUT).unwrap();
+    }
+
     fn state_dir() -> (TempDir, StateDir) {
         let tmp = TempDir::new().unwrap();
         let dir = StateDir::from_path(tmp.path().to_path_buf());
@@ -724,6 +1144,7 @@ mod tests {
             commits_since_checkpoint: 0,
             checkpoint_stalls: 0,
             generation: Arc::default(),
+            permission_mutations: flume::bounded(PERMISSION_QUEUE_CAPACITY).1,
         }
     }
 
@@ -802,7 +1223,7 @@ mod tests {
         let release = pause_writer(&writer);
         let (wake, wake_rx) = flume::bounded(1);
         drop(wake_rx);
-        writer.wake = wake;
+        writer.wake = Arc::new(wake);
         let session = Arc::new(AppSession::new(MODEL, CWD));
 
         let error = if timed {

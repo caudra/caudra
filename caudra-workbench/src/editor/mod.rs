@@ -19,7 +19,7 @@ use highlight::ViewportHighlighter;
 use history::History;
 
 use crate::fs::backend::{LoadedFile, ResourceEntry, WorkbenchPath};
-use crate::fs::read::{self, LineEnding, LoadError, ReadOnly, SaveError};
+use crate::fs::read::{self, LineEnding, LoadError, ReadOnly, SaveError, Source};
 use crate::scm::diff::DiffRow;
 
 /// What a line is, in a diff tab. A source tab has none of these and is
@@ -53,6 +53,7 @@ pub struct Tab {
     notice: Option<ReadOnly>,
     diff_rows: Option<Vec<DiffRow>>,
     modified: Option<SystemTime>,
+    source: Option<Source>,
     /// The file changed underneath an edited buffer. Neither copy can be thrown
     /// away without being asked, so the tab says so and waits.
     pub conflict: bool,
@@ -93,6 +94,7 @@ impl Tab {
             notice: loaded.read_only,
             diff_rows: None,
             modified: loaded.modified,
+            source: None,
             conflict: false,
             preview: false,
             revision: 0,
@@ -100,6 +102,17 @@ impl Tab {
             scroll_row: 0,
             h_scroll: 0,
         }
+    }
+
+    pub(crate) fn from_local_source(
+        path: &Path,
+        loaded: read::Loaded,
+        source: Source,
+        theme_generation: u64,
+    ) -> Self {
+        let mut tab = Self::from_load(path, loaded, theme_generation);
+        tab.source = Some(source);
+        tab
     }
 
     /// The one place a file is read into a tab, and so the one place the cost
@@ -132,6 +145,7 @@ impl Tab {
             notice: None,
             diff_rows: None,
             modified: None,
+            source: None,
             conflict: false,
             preview: false,
             revision: 0,
@@ -177,6 +191,7 @@ impl Tab {
             notice: None,
             diff_rows: Some(rows),
             modified: None,
+            source: None,
             conflict: false,
             preview: false,
             revision: 0,
@@ -367,7 +382,17 @@ impl Tab {
             return Err(SaveError::ReadOnly(path.to_path_buf()));
         }
         let contents = read::encode(self.buffer.lines(), self.line_ending, self.trailing_newline);
-        self.modified = read::save(path, &contents, self.modified)?;
+        let saved = match &mut self.source {
+            Some(source) => read::save_local_source(source, path, &contents),
+            None => read::save(path, &contents, self.modified),
+        };
+        if matches!(
+            &saved,
+            Err(SaveError::Stale(_) | SaveError::Unconfirmed { .. })
+        ) {
+            self.conflict = true;
+        }
+        self.modified = saved?;
         self.history.mark_saved();
         self.conflict = false;
         Ok(())
@@ -378,14 +403,28 @@ impl Tab {
     /// cursor; a dirty one only raises the conflict, because discarding unsaved
     /// work is the user's call.
     pub fn reload_from_disk(&mut self) -> Result<bool, LoadError> {
-        if self.is_dirty() {
+        self.reload(false)
+    }
+
+    fn reload(&mut self, discard: bool) -> Result<bool, LoadError> {
+        if self.is_dirty() && !discard {
             self.conflict = true;
             return Ok(false);
         }
         let Some(path) = self.path.local() else {
             return Ok(false);
         };
-        let loaded = read::load(path)?;
+        let loaded = match &self.source {
+            Some(source) => read::reload_local_source(source, path),
+            None => read::load(path),
+        };
+        let loaded = match loaded {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                self.conflict = true;
+                return Err(error);
+            }
+        };
         let cursor = self.buffer.cursor();
         let scroll = self.scroll;
         self.line_ending = loaded.line_ending;
@@ -405,8 +444,7 @@ impl Tab {
     /// Throws the buffer away and takes what is on disk, which is the only way
     /// out of a conflict that keeps the other writer's work.
     pub fn discard_and_reload(&mut self) -> Result<(), LoadError> {
-        self.history = History::default();
-        self.reload_from_disk().map(|_| ())
+        self.reload(true).map(|_| ())
     }
 
     pub fn contents(&self) -> String {
@@ -783,6 +821,170 @@ mod tests {
     const NO_ACTIVE: &str = "the tab just pushed must be the active one";
     const DIFF_READ_ONLY: &str = "a diff is not a file and must never be written back";
     const BUFFER_IS_THE_LINE: &str = "a diff row's buffer text is the line, not the patch line";
+
+    #[cfg(unix)]
+    mod local_source {
+        use std::fs::{self, File};
+        use std::os::unix::fs::symlink;
+        use std::path::PathBuf;
+
+        use tempfile::TempDir;
+        use test_case::test_case;
+
+        use super::Tab;
+        use crate::fs::read::{LoadError, SaveError, load_local_source};
+
+        const FILE: &str = "policy.lua";
+        const ORIGINAL: &str = "allow = false\n";
+        const EXTERNAL: &str = "allow = true \n";
+        const EDIT: &str = "local ";
+        const SENTINEL: &str = "unrelated file\n";
+        const PARENT: &str = "config";
+        const OUTSIDE: &str = "outside";
+        const MOVED: &str = "moved";
+        const DIRTY: &str =
+            "a failed source save or reload must preserve the dirty draft and undo history";
+
+        enum Swap {
+            SourceSymlink,
+            SourceReplacement,
+            AncestorSymlink,
+            AncestorAlias,
+            AncestorReplacement,
+        }
+
+        fn fixture() -> (TempDir, PathBuf, Tab) {
+            let dir = TempDir::new().unwrap();
+            let parent = dir.path().canonicalize().unwrap().join(PARENT);
+            fs::create_dir(&parent).unwrap();
+            let path = parent.join(FILE);
+            fs::write(&path, ORIGINAL).unwrap();
+            let (loaded, source) = load_local_source(&path, |bytes| {
+                assert_eq!(bytes, ORIGINAL.as_bytes());
+                Ok(())
+            })
+            .unwrap();
+            let tab = Tab::from_local_source(&path, loaded, source, 0);
+            (dir, path, tab)
+        }
+
+        fn edit(tab: &mut Tab) -> String {
+            let change = tab.buffer.insert(EDIT);
+            assert!(tab.record(change));
+            tab.contents()
+        }
+
+        #[test_case(false ; "ordinary_source")]
+        #[test_case(true ; "sibling_symlink")]
+        fn saves_use_exclusive_temporaries_and_advance_the_source_guard(attack: bool) {
+            let (dir, path, mut tab) = fixture();
+            let sentinel = dir.path().join(OUTSIDE);
+            fs::write(&sentinel, SENTINEL).unwrap();
+            let old_temporary = path.with_file_name(format!(".{FILE}.caudra-tmp"));
+            if attack {
+                symlink(&sentinel, &old_temporary).unwrap();
+            }
+            for _ in 0..2 {
+                let edited = edit(&mut tab);
+                tab.save().unwrap();
+                assert!(!tab.is_dirty());
+                assert_eq!(fs::read_to_string(&path).unwrap(), edited);
+                assert!(
+                    !fs::symlink_metadata(&path)
+                        .unwrap()
+                        .file_type()
+                        .is_symlink()
+                );
+                assert_eq!(fs::read_to_string(&sentinel).unwrap(), SENTINEL);
+                assert!(tab.reload_from_disk().unwrap());
+                assert_eq!(tab.contents(), edited);
+            }
+            if attack {
+                assert!(
+                    fs::symlink_metadata(old_temporary)
+                        .unwrap()
+                        .file_type()
+                        .is_symlink()
+                );
+            }
+        }
+
+        #[test_case(Swap::SourceSymlink ; "source_symlink")]
+        #[test_case(Swap::SourceReplacement ; "source_replacement")]
+        #[test_case(Swap::AncestorSymlink ; "ancestor_symlink")]
+        #[test_case(Swap::AncestorAlias ; "ancestor_symlink_to_retained_directory")]
+        #[test_case(Swap::AncestorReplacement ; "ancestor_replacement")]
+        fn swapped_source_identity_refuses_save_and_discard_without_losing_work(swap: Swap) {
+            let (dir, path, mut tab) = fixture();
+            let draft = edit(&mut tab);
+            let outside = dir.path().join(OUTSIDE);
+            let moved = dir.path().join(MOVED);
+            fs::create_dir(&outside).unwrap();
+            fs::write(outside.join(FILE), ORIGINAL).unwrap();
+            let original = match swap {
+                Swap::SourceSymlink | Swap::SourceReplacement => {
+                    fs::rename(&path, &moved).unwrap();
+                    if matches!(swap, Swap::SourceSymlink) {
+                        symlink(outside.join(FILE), &path).unwrap();
+                    } else {
+                        fs::write(&path, ORIGINAL).unwrap();
+                    }
+                    moved
+                }
+                Swap::AncestorSymlink | Swap::AncestorAlias | Swap::AncestorReplacement => {
+                    let parent = path.parent().unwrap();
+                    fs::rename(parent, &moved).unwrap();
+                    if matches!(swap, Swap::AncestorAlias) {
+                        symlink(&moved, parent).unwrap();
+                    } else if matches!(swap, Swap::AncestorSymlink) {
+                        symlink(&outside, parent).unwrap();
+                    } else {
+                        fs::create_dir(parent).unwrap();
+                        fs::write(&path, ORIGINAL).unwrap();
+                    }
+                    moved.join(FILE)
+                }
+            };
+            assert!(matches!(tab.save(), Err(SaveError::Stale(_))));
+            assert!(tab.is_dirty(), "{DIRTY}");
+            assert_eq!(tab.contents(), draft, "{DIRTY}");
+            assert!(matches!(
+                tab.discard_and_reload(),
+                Err(LoadError::StaleSource(_))
+            ));
+            assert!(tab.is_dirty(), "{DIRTY}");
+            assert_eq!(tab.contents(), draft, "{DIRTY}");
+            assert_eq!(fs::read_to_string(original).unwrap(), ORIGINAL);
+            assert_eq!(fs::read_to_string(outside.join(FILE)).unwrap(), ORIGINAL);
+            assert!(tab.undo(), "{DIRTY}");
+            assert_eq!(tab.contents(), ORIGINAL, "{DIRTY}");
+        }
+
+        #[test]
+        fn source_save_detects_content_changes_even_with_restored_mtime() {
+            let (_dir, path, mut tab) = fixture();
+            let stamp = fs::metadata(&path).unwrap().modified().unwrap();
+            let draft = edit(&mut tab);
+            fs::write(&path, EXTERNAL).unwrap();
+            File::open(&path).unwrap().set_modified(stamp).unwrap();
+            assert!(matches!(tab.save(), Err(SaveError::Stale(_))));
+            assert_eq!(fs::read_to_string(&path).unwrap(), EXTERNAL);
+            assert_eq!(tab.contents(), draft, "{DIRTY}");
+            assert!(tab.is_dirty(), "{DIRTY}");
+        }
+
+        #[test]
+        fn a_clean_source_tab_does_not_adopt_unverified_disk_changes() {
+            let (_dir, path, mut tab) = fixture();
+            fs::write(&path, EXTERNAL).unwrap();
+            assert!(matches!(
+                tab.reload_from_disk(),
+                Err(LoadError::StaleSource(_))
+            ));
+            assert_eq!(tab.contents(), ORIGINAL);
+            assert!(tab.conflict);
+        }
+    }
 
     fn fixture() -> (TempDir, std::path::PathBuf) {
         let tmp = TempDir::new().unwrap();

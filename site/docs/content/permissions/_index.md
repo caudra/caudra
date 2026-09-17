@@ -30,7 +30,7 @@ Allows can combine across resources. A shell chain can use separate grants for `
 
 ## Lifetimes and authorities
 
-Authority controls what a rule covers. Lifetime controls how long the rule remains active. The prompt selects them independently.
+Authority controls what a rule covers. Lifetime controls how long the rule remains active. The prompt and permission manager select them independently.
 
 The default authority is narrow: an exact call, exact paths for eligible reads, or an exact shell command in its reviewed working directory. Trusted tool profiles can also offer names-only browsing, a filesystem subtree, URL prefix, command pattern, shell workdir, search provider, or whole MCP tool. Caudra does not infer these choices from names in an external tool schema.
 
@@ -154,16 +154,19 @@ Grading is structural. It checks the shape of the pattern and that it matches th
 
 Caudra learns permission suggestions from tool use. Suggestions are never automatic grants or the default future scope. Live recognition needs at least three eligible command observations and can propose a pattern within one session. A compound request can supply several observations. Counts do not establish successful execution.
 
-Suggestions come only from eligible live observations or imported session history. A command without enough evidence has no suggested argument template. The executable, workdir, and argument structure stay bound, and every template requires explicit approval.
+Automatic suggestions come only from eligible live observations or imported session history. A command without enough evidence has no suggested argument template. You can also [create a template from explicit command text](#command-templates) without history. The executable, workdir, and argument structure stay bound, and every template requires explicit approval.
 
 Recognition compares individual commands with fixed argument structure and observed literal values. It can handle unfamiliar CLI names without a read-only executable allowlist. Payload and sensitivity guards still exclude interpreted code, unsafe expressions, and suspicious literals. It does not learn whole command sequences or generate scripts. Basic chains and pipelines are analyzed per command only where control flow and working-directory context can be established.
 
 The local TUI loads bounded historical proposals in the background at startup, for the current tab, and after `/cd`. Loading is cached per canonical project and cancellable, and stale results are discarded. Remote and ephemeral sessions do not run history discovery. Approval and Suggested inspectors label imported history as unverified, with unknown outcomes and historical execution context. Analysis assumes standard Bash startup and uses the session's current stored cwd as an approximation. Loading these proposals does not make them verified live evidence.
 
-Open `/permissions discover` for the Discover tab. The Rules tab contains stored grants and policy; Discover lists only proposals, which are not active permissions. Click either tab or press `Ctrl-G` to switch. Opening Discover does not force a new scan.
+Open `/permissions discover` for the Discover tab. The Rules tab contains stored rules and policy. Discover lists only proposals, which are not active permissions. Click either tab or press `Ctrl-G` to switch. Opening Discover does not force a new scan.
 
 | Key | Discovery action |
 |---|---|
+| `Enter` | Inspect the selected proposal in the detail pane |
+| `Ctrl-I` | Open the proposal evidence inspector |
+| `Ctrl-E` | Create permission from the selected proposal |
 | `Ctrl-G` | Switch between Rules and Discover |
 | `Ctrl-O` | Show the discovery overview and scan diagnostics |
 | `Ctrl-R` | Scan or refresh, bypassing an older cached result. An active scan is not restarted |
@@ -173,7 +176,9 @@ The overview reports `Not scanned`, `Loading`, `Ready`, `Partial`, `Unavailable`
 
 Imported proposals need at least two observations from two independent parent sessions. Repeated commands in one session are insufficient. An empty list can also reflect unsupported or sensitive commands, sample limits, or dismissed and snoozed definitions.
 
-In Discover, select a proposal to read its command shape, constraints, evidence, and examples in the detail pane. With the list focused, `Enter` opens a read-only inspector. Its details wrap to the available width. Use `Up` / `Down`, `PageUp` / `PageDown`, or the mouse wheel to scroll the inspector. A suggestion can be approved only from a matching live permission prompt.
+In Discover, select a proposal to read its command shape, constraints, evidence, and examples. `Enter` focuses its details without granting it. The separate evidence inspector wraps text and supports `Up` / `Down`, `PageUp` / `PageDown`, and mouse-wheel scrolling.
+
+Create permission opens an editable draft. Select the currently registered local shell target and supply concrete command text and an absolute workdir for fresh host analysis. Historical tool identity and context do not authorize the new rule. Configure its input constraints and lifetime, then review and Save as described under [Stored rules](#stored-rules). A matching live prompt is not required. Opening the draft or analyzing its source grants nothing.
 
 `Ctrl-D` dismisses the selected definition for the project, and `Ctrl-S` snoozes it for 24 hours. These preferences persist as bounded project and definition digests and leave active rules unchanged. Renaming a display label does not change the definition's identity.
 
@@ -187,13 +192,83 @@ A conversation grant made while planning does apply for the rest of the plan. Ap
 
 ## Stored rules
 
-Use `/permissions` to inspect and revoke active conversation, project, and global rules. The picker shows human-readable review descriptions for the selected rule, with named inputs, resource scopes, and authority constraints. It distinguishes exact, selected-input, filesystem subtree, URL subtree, URL origin, and unrestricted authority without displaying hashes by default. Missing descriptions are marked unavailable. It also shows active legacy denies and builtin, configured, or trusted-plugin policy. Read-only policy must be changed at its source.
+Use `/permissions` to manage stored conversation, project, and global rules and inspect policy. On a rule, `Enter` focuses its scope details without editing or revoking it. Details show named inputs, typed targets, context, and authority constraints. Missing values are marked unavailable or opaque. Builtin, configured, and trusted-plugin policy appears alongside stored rules. Project-config trust rows open a separate confirmation.
 
-The list and selected detail occupy separate panes, so long descriptions do not resize the list. Wide terminals show them side by side, narrow terminals stack them, and small terminals show the focused pane. `Tab` / `Shift-Tab` switches focus. `Up` / `Down` and `PageUp` / `PageDown` act on the focused pane. The mouse wheel scrolls the pane under the pointer.
+| Key | Manager action |
+|---|---|
+| `Ctrl-N` | New rule |
+| `Ctrl-E` | Edit the selected stored rule, or Edit source when a verified local source is available |
+| `Ctrl-U` | Duplicate the selected stored rule |
+| `Ctrl-B` | Copy the selected stored rule, leaving its source unchanged |
+| `Ctrl-K` | Start a separate Revoke review |
+| `Ctrl-F` | Cycle All, Here, Other, and History filters. History shows revoked records |
+
+The toolbar also supports mouse input. Wide terminals show the list and details side by side. Narrow terminals show the focused pane. `Tab` / `Shift-Tab` switches focus, and arrows or `PageUp` / `PageDown` navigate the focused pane. The mouse wheel scrolls the pane under the pointer.
+
+Edit replaces the stored rule and retires its previous record when saved. Duplicate creates another rule without retiring the source. If a lifetime change crosses separate conversation and persistent databases, use explicit Copy instead of replacement. Copy and a later Revoke are separate reviewed writes, not an atomic move. Copy leaves every source rule active, including deny and ask rules.
+
+### Editing saved authority
+
+The editor has Rule, Targets, Arguments, Template, Changes, Scope, and Test sections. Use `Tab` or arrows to focus controls and `Enter` or Space to activate them. `Enter` while editing a field accepts that field only.
+
+In Rule, choose a registered target, effect, lifetime, and project binding. Capability families are available only where offered by the target. Effects are Allow, Deny, and Ask. Saved lifetimes are Conversation, Project, and Global. Once belongs to a live prompt. Only Project lifetime takes a project binding, either the current project or an explicit absolute path. Workdir and template context are separate constraints. Changing lifetime or project binding does not rewrite them.
+
+Authoring uses the current host catalog, not tool names or arbitrary identity text. The implemented provider supports audited local Workcell registrations, subject to the current tool filter, agent mode, and host availability. Remote, MCP, and plugin tool authority authoring is unavailable. Existing active rules remain inspectable and revocable. Label-only edits preserve their authority. Revoked records are inspection-only.
+
+Targets offers only the selected registration's resource kinds, access types, guards, and match modes:
+
+| Resource | Offered match modes |
+|---|---|
+| File or directory | Exact path, filesystem subtree, Any |
+| Shell command | Exact command, token prefix, command template, Any |
+| URL | Exact URL, URL origin, URL subtree, Any |
+| Search query | Exact query, Any |
+| Isolated Python or environment-inspection custom resource | Exact value, Any |
+
+Shell targets can have an exact, subtree, or Any workdir guard. Directory targets offer an exact recursion guard. Glob and Regex are command-slot modes, not general resource match modes. Target alternatives are `ANY OF`, while access, protection, and attribute guards within one alternative are `ALL OF`. Removing the last target leaves an invalid blank. Unrestricted resources and wildcard guards require explicit choices.
+
+Arguments constrains the whole tool input independently of targets. Choose exact JSON input, selected JSON pointers, or explicitly unconstrained input. Missing input is distinct from JSON `null`. Changing a target does not remove an existing input constraint. Supply replacement input or explicitly choose Keep old input pin when retaining that constraint is intended.
+
+Stored hashes and sanitized review labels do not recover editable values. Opaque constraints remain preserved until you choose a replacement mode and enter a value. Label-only changes can keep them unchanged. New rules, copies, and authority expansions require reviewable values. A display label cannot substitute for a missing target or input.
+
+Choose Preview (`Ctrl-P`), inspect the before/after Changes and resulting Scope, and confirm the listed authority changes when required. Save (`Ctrl-S`) is a separate action and waits for durable acknowledgment. Background validation never saves. Draft or context changes invalidate the reviewed preview and require fresh review. Saving a grant or relaxing a restriction can release pending requests after policy rechecks.
+
+### Command templates
+
+To create a template without a live request or historical proposal:
+
+1. Choose New and select the registered local shell target. In Targets, add a Command target and configure its access and protection guards.
+2. Open Template. Enter a concrete Source for analysis, an absolute Analysis workdir, and a template name. Choose Create template.
+3. The host derives the argument list, roles, and execution context through nonexecuting analysis. The initial template has only fixed literal arguments and no slots.
+4. Select an eligible data or unknown-role argument and use Add/unlink slot to make it variable. Configure the remaining Rule and Arguments fields, then Preview, review, and Save.
+
+Analysis requires one complete, static, reviewable shell command. It checks current binding and eligibility without executing the source. Creating a template does not add historical observations or prove that the command is safe.
+
+Typed slot controls edit labels, allowed values, Exact, Glob, Regex, Any, and tuple or independent combinations. Their matching rules are described in the [argument pattern inspector](#argument-pattern-inspector). Manually added values and tuples are constraints, not observed evidence. Link to selected slot requires equal source arguments. Removing a slot requires an explicit fixed replacement for every occurrence. Adding, unlinking, linking, or removing slots requires fresh host analysis before the structural change is applied.
+
+Discover activation and duplicated or copied templates also require fresh source analysis against the current registration. Historical context is not reused as current execution authority. Lifetime remains independent of the template's workdir and project context.
+
+### Testing a draft
+
+After a valid preview, open Test, enter example JSON input for the registered target, and choose Test, never execute. Analysis uses the current session binding and accepts a workdir in input only when the host supports it. No sample command or tool call is executed.
+
+Matches this rule reports whether the draft covers that example. Effective policy separately reports Allowed by policy, Prompt, or Denied with the draft included. Other rules and execution restrictions can change that outcome. Allowed by policy is not a promise of execution. Dispatch gates are checked again when a real call runs.
+
+### Editing policy sources
+
+Edit source opens a verified local policy file or loaded plugin entrypoint in the local workbench. The host checks its path and loaded content before opening it. This edits local text, even from a remote workspace. Saving the file does not reload policy or grant fresh project-config trust. Reload and trust review are separate steps.
+
+Verified-source editing currently requires Unix. Saves check the retained file identity and contents and refuse changed sources or symlink substitutions. Existing dirty remote tabs remain separate and are restored when you return.
+
+Builtin policy, remote policy, and entries without a verified local source or supported editing API remain read-only in the manager. A navigable local plugin entrypoint enables text editing, not typed plugin authority authoring. Editing source policy never creates a stored override.
+
+### Storage and recovery
 
 Project and global prompt decisions are stored in the `permission.rules` row of Caudra's owner-only SQLite state database. Authorization uses SHA-256 digests for exact input and resource constraints. Selected-input authorities use JSON pointers and a digest. Host-derived command patterns are clear-text policy, such as `git diff *`.
 
 Argument patterns and names-only browse grants use new durable selector or capability tags. Older binaries cannot open permission state containing those grants. There is no backward-compatibility layer. Update every Caudra process sharing the database before using these scopes, including sessions in other projects.
+
+The permission manager also upgrades the database schema to fence delayed session saves. The upgrade requires other database users to close and creates a backup before changing the schema. It preserves existing rules without rebinding their authority. Older binaries cannot reopen the upgraded database.
 
 Separate typed review metadata stores meaningful sanitized paths, command patterns, and recognized first-party input names and values. Likely secrets are redacted, bulk content and unrecognized fields are omitted, and descriptions are bounded. These descriptions can contain private project information even after sanitization. The database is owner-only, not encrypted. Review provenance is approved, recovered, or unavailable. Review metadata never grants authority or relaxes a stored constraint. Displayed omitted fields remain constrained for exact-input rules.
 
@@ -224,7 +299,7 @@ An unreadable or malformed permissions file fails closed. Caudra disables inheri
 
 A project `prompt` default cannot weaken a global `deny` default, including per-tool and MCP defaults.
 
-`/permissions` lists inactive entries as `needs review`, shows trusted config policy, and can revoke remembered prompt decisions. Configured, builtin, and plugin policy appears read-only, because it is changed at its source.
+`/permissions` lists inactive entries as `needs review` and shows trusted config policy. Source-backed policy is separate from stored rules. Use [Edit source](#editing-policy-sources) when a verified local source is available, then reload and review any required trust separately.
 
 ```toml
 default = "prompt"

@@ -13,6 +13,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
 use serde_json::{Map, Value};
 
+use crate::components::permission_scope::view::{ScopeControl, ScopeView};
 use crate::components::scrollbar::{Scrollbar, ScrollbarMouse};
 use crate::components::{
     ModalScroll, Overlay, escape_terminal_controls, hover_style, is_ctrl, visual_rows,
@@ -28,6 +29,7 @@ mod scope;
 mod view;
 
 use decision::{Confirmation, command_ladders};
+pub(crate) use details::{likely_secret_key, sensitive_text};
 use input::{InputFreshness, hint_key};
 use inspector::{EditedPattern, InspectorControl, PatternInspector};
 
@@ -153,6 +155,8 @@ pub struct PermissionPrompt {
     focus: Option<PromptTarget>,
     awaiting_review: bool,
     input_freshness: InputFreshness,
+    scope_view: ScopeView,
+    scope_authority: usize,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -161,6 +165,7 @@ enum PromptTarget {
     Authority(String),
     Hint(KeyEvent),
     Inspector(InspectorControl),
+    VisualScope(usize, ScopeControl),
 }
 
 struct PromptHit {
@@ -214,6 +219,8 @@ impl PermissionPrompt {
             focus: None,
             awaiting_review: false,
             input_freshness: InputFreshness::default(),
+            scope_view: ScopeView::default(),
+            scope_authority: 0,
         }
     }
 
@@ -312,6 +319,7 @@ impl PermissionPrompt {
     }
 
     fn reset_view(&mut self) {
+        self.scope_view = ScopeView::default();
         self.input_freshness.barrier();
         self.state = PromptState::Normal;
         self.panel = Panel::Main;

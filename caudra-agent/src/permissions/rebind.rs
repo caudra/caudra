@@ -827,6 +827,8 @@ mod tests {
                 family: None,
             },
             review: None,
+            label: None,
+            replaces: None,
             created_at: 1,
             revoked_at: None,
         }

@@ -29,7 +29,8 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
 use crate::permission_state::{
-    PermissionHistoryScan, RawPermissionSession, RawPermissionSnapshot, validate_review_only_change,
+    PermissionHistoryScan, RawPermissionSession, RawPermissionSnapshot,
+    validate_conversation_record, validate_review_only_change,
 };
 use caudra_workspace::WorkspacePath;
 use rusqlite::backup::Backup;
@@ -47,7 +48,7 @@ use tracing::warn;
 
 use super::lease::SessionLease;
 use super::{
-    ProjectUsageRelocation, SESSION_VERSION, Session, SessionError, SessionLocation,
+    ProjectUsageRelocation, SESSION_VERSION, Session, SessionError, SessionLocation, SessionMeta,
     SessionRelocation, SessionRelocationResult, SessionSummary, StoredSubagent,
     StoredSubagentOutcome, StoredSubagentTaskSpec, StoredTokenUsage, next_epoch,
 };
@@ -71,7 +72,7 @@ use crate::{
 pub const SESSIONS_DB_FILE: &str = "caudra.sqlite";
 pub const SESSIONS_DB_LOCK_FILE: &str = "caudra.sqlite.lock";
 
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 const APPLICATION_ID: i64 = i32::from_be_bytes(*b"CAUD") as i64;
 /// Pages copied per step of the pre-migration backup. The whole file is copied
 /// under the initialization lock, so this only bounds how long the backup holds
@@ -110,6 +111,8 @@ const PERMISSION_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
 const PERMISSION_SNAPSHOT_SESSIONS: usize = 10_000;
 const INVALID_PERMISSION_REPAIR: &str =
     "invalid or stale permission review repair; refresh the preview";
+const PERMISSION_CUTOVER_BUSY: &str =
+    "close all storage readers and older Caudra processes before upgrading permission storage";
 const MAX_BASE58_UUID_BYTES: usize = 22;
 const UUID_VERSION_BYTE: usize = 6;
 const UUID_VARIANT_BYTE: usize = 8;
@@ -381,7 +384,66 @@ const MIGRATIONS: &[Migration] = &[
         to: 7,
         sql: SESSION_WORKSPACE_BINDING_COLUMNS,
     },
+    Migration {
+        from: 7,
+        to: 8,
+        sql: PERMISSION_REVISION_SCHEMA,
+    },
 ];
+
+const PERMISSION_REVISION_SCHEMA: &str = r#"
+ALTER TABLE sessions ADD COLUMN permission_generation INTEGER NOT NULL DEFAULT 0 CHECK(permission_generation >= 0);
+ALTER TABLE sessions ADD COLUMN permission_lineage TEXT NOT NULL DEFAULT '';
+UPDATE sessions SET permission_lineage = lower(hex(randomblob(16)));
+
+CREATE TABLE permission_clock (
+    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+    store_id TEXT NOT NULL,
+    generation INTEGER NOT NULL CHECK(generation >= 0),
+    persistent_generation INTEGER NOT NULL CHECK(persistent_generation >= 0)
+) STRICT;
+INSERT INTO permission_clock VALUES (1, lower(hex(randomblob(16))), 0, 0);
+
+CREATE TABLE permission_receipts (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    operation_id BLOB NOT NULL UNIQUE CHECK(length(operation_id) = 16),
+    fingerprint TEXT NOT NULL,
+    receipt TEXT NOT NULL CHECK(json_valid(receipt))
+) STRICT;
+
+CREATE TRIGGER permission_state_insert AFTER INSERT ON state
+WHEN NEW.scope = 'global' AND NEW.key = 'permission.rules'
+BEGIN
+    UPDATE permission_clock SET generation = generation + 1, persistent_generation = persistent_generation + 1;
+END;
+CREATE TRIGGER permission_state_update AFTER UPDATE OF value ON state
+WHEN NEW.scope = 'global' AND NEW.key = 'permission.rules' AND OLD.value IS NOT NEW.value
+BEGIN
+    UPDATE permission_clock SET generation = generation + 1, persistent_generation = persistent_generation + 1;
+END;
+CREATE TRIGGER permission_state_delete AFTER DELETE ON state
+WHEN OLD.scope = 'global' AND OLD.key = 'permission.rules'
+BEGIN
+    UPDATE permission_clock SET generation = generation + 1, persistent_generation = persistent_generation + 1;
+END;
+CREATE TRIGGER permission_session_insert AFTER INSERT ON sessions
+BEGIN
+    UPDATE sessions SET permission_lineage = lower(hex(randomblob(16))) WHERE id = NEW.id;
+    UPDATE permission_clock SET generation = generation + 1;
+END;
+CREATE TRIGGER permission_session_update AFTER UPDATE OF metadata, cwd, workspace_binding ON sessions
+WHEN coalesce(OLD.metadata -> '$.structured_permission_rules', '[]')
+        IS NOT coalesce(NEW.metadata -> '$.structured_permission_rules', '[]')
+    OR OLD.cwd IS NOT NEW.cwd OR OLD.workspace_binding IS NOT NEW.workspace_binding
+BEGIN
+    UPDATE sessions SET permission_generation = permission_generation + 1 WHERE id = NEW.id;
+    UPDATE permission_clock SET generation = generation + 1;
+END;
+CREATE TRIGGER permission_session_delete AFTER DELETE ON sessions
+BEGIN
+    UPDATE permission_clock SET generation = generation + 1;
+END;
+"#;
 
 const SESSION_WORKSPACE_BINDING_COLUMNS: &str = r#"
 ALTER TABLE sessions ADD COLUMN workspace_binding TEXT NOT NULL DEFAULT '{}' CHECK(json_valid(workspace_binding));
@@ -531,7 +593,9 @@ CREATE TABLE pending_archives (
 
 /// What a fresh database gets: every migration already folded in.
 fn full_schema() -> String {
-    format!("{SCHEMA}{USAGE_LEDGER_TABLE}{WORKFLOW_TABLES}{WORKFLOW_EVENTS_TABLE}")
+    format!(
+        "{SCHEMA}{USAGE_LEDGER_TABLE}{WORKFLOW_TABLES}{WORKFLOW_EVENTS_TABLE}{PERMISSION_REVISION_SCHEMA}"
+    )
 }
 
 /// One turn on its way into [`usage_ledger`](USAGE_LEDGER_TABLE). Borrowed
@@ -631,6 +695,8 @@ pub struct SessionRecreation {
     session_id: CaudraId,
     deleted_write_version: i64,
     removed_existing: bool,
+    permissions: Option<String>,
+    permission_generation: u64,
 }
 
 impl SessionRecreation {
@@ -762,7 +828,7 @@ impl SessionDatabase {
             &state_dir.path().join(SESSIONS_DB_LOCK_FILE),
             OWNER_FILE_MODE,
         )?;
-        let connection = open_writable_connection(state_dir)?;
+        let connection = open_writable_connection(state_dir, &migration_lock)?;
         let mut database = Self {
             connection,
             state_dir: state_dir.clone(),
@@ -786,7 +852,7 @@ impl SessionDatabase {
             &state_dir.path().join(SESSIONS_DB_LOCK_FILE),
             OWNER_FILE_MODE,
         )?;
-        let connection = open_writable_connection(state_dir)?;
+        let connection = open_writable_connection(state_dir, &migration_lock)?;
         Ok(Self {
             connection,
             state_dir: state_dir.clone(),
@@ -1542,6 +1608,10 @@ impl SessionDatabase {
         &self.connection
     }
 
+    pub(crate) fn state_directory(&self) -> &StateDir {
+        &self.state_dir
+    }
+
     /// Payload bounds shared with the workflow repository, which lives outside
     /// this module: byte size against the canonical payload limit, then
     /// nesting depth.
@@ -1834,7 +1904,7 @@ impl SessionDatabase {
         }
         let deleted_write_version = recreation.deleted_write_version;
         validate_scalars(session)?;
-        let serialized = SerializedSession::new(session)?;
+        let mut serialized = SerializedSession::new(session)?;
         // Cleanup performs slow filesystem work outside SQLite. This lock
         // closes the gap between its tombstone check and deletion so a new
         // canonical generation cannot commit until old cleanup has finished.
@@ -1847,6 +1917,12 @@ impl SessionDatabase {
             Err(SessionError::Storage(StorageError::NotFound(_))) => {}
             Err(error) => return Err(error),
         }
+        let previous_root_bytes = serialized.root.bytes();
+        serialized
+            .root
+            .replace_permissions(&transaction, recreation.permissions.as_deref())?;
+        serialized.logical_bytes =
+            serialized.logical_bytes - previous_root_bytes + serialized.root.bytes();
         // Ordinary saves may never cross a tombstone. Only the writer that
         // completed the ordered delete receives the recreation token; advancing
         // its version prevents an old generation from matching a new one.
@@ -1869,8 +1945,17 @@ impl SessionDatabase {
         })?;
         insert_root(&transaction, session, &serialized)?;
         transaction.execute(
-            "UPDATE sessions SET write_version = ?2 WHERE id = ?1",
-            params![session.id.as_bytes().as_slice(), write_version],
+            "UPDATE sessions SET write_version = ?2, permission_generation = ?3 WHERE id = ?1",
+            params![
+                session.id.as_bytes().as_slice(),
+                write_version,
+                to_i64(recreation.permission_generation, "permission generation")?
+                    .checked_add(1)
+                    .ok_or_else(|| SessionError::CorruptDatabaseValue {
+                        field: "permission generation",
+                        reason: "generation overflow".into()
+                    })?
+            ],
         )?;
         insert_children(&transaction, session, &serialized)?;
         transaction.execute(
@@ -2219,13 +2304,19 @@ impl SessionDatabase {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let actual = transaction
+        let stored = transaction
             .query_row(
-                "SELECT write_version FROM sessions WHERE id = ?1",
+                "SELECT write_version, metadata -> '$.structured_permission_rules', permission_generation FROM sessions WHERE id = ?1",
                 params![id.as_bytes().as_slice()],
-                |row| row.get::<_, i64>(0),
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, i64>(2)?)),
             )
             .optional()?;
+        let actual = stored.as_ref().map(|(version, _, _)| *version);
+        let permission_generation = from_i64(
+            stored.as_ref().map_or(0, |(_, _, generation)| *generation),
+            "sessions.permission_generation",
+        )?;
+        let permissions = stored.and_then(|(_, permissions, _)| permissions);
         if let (Some(expected), Some(actual)) = (expected_write_version, actual)
             && expected != actual
         {
@@ -2259,6 +2350,8 @@ impl SessionDatabase {
             session_id: id,
             deleted_write_version,
             removed_existing,
+            permissions,
+            permission_generation,
         })
     }
 
@@ -2460,7 +2553,7 @@ impl SessionDatabase {
         T: Serialize,
     {
         validate_scalars(session)?;
-        let serialized = SerializedSession::new(session)?;
+        let mut serialized = SerializedSession::new(session)?;
         let base_write_version = session.base_write_version.load(Ordering::Acquire);
         let expected = expected_write_version
             .or_else(|| (base_write_version >= 0).then_some(base_write_version));
@@ -2471,6 +2564,12 @@ impl SessionDatabase {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let previous_root_bytes = serialized.root.bytes();
+        serialized
+            .root
+            .fence_permissions(&transaction, session.id)?;
+        serialized.logical_bytes =
+            serialized.logical_bytes - previous_root_bytes + serialized.root.bytes();
         let write_version = match expected {
             Some(expected) => {
                 ensure_write_version(&transaction, session.id, expected)?;
@@ -2548,7 +2647,7 @@ impl SessionDatabase {
         T: Serialize,
     {
         validate_scalars(session)?;
-        let root = SerializedRoot::new(session)?;
+        let mut root = SerializedRoot::new(session)?;
         let messages = serialize_values(
             &session.messages[cursor.saved_history_count..],
             "history item",
@@ -2581,6 +2680,10 @@ impl SessionDatabase {
                 .flat_map(|(_, _, values)| values)
                 .map(String::len)
                 .sum::<usize>();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        root.fence_permissions(&transaction, session.id)?;
         let logical_bytes = cursor
             .logical_bytes
             .checked_sub(cursor.root_bytes + cursor.task_spec_bytes)
@@ -2591,9 +2694,6 @@ impl SessionDatabase {
                 field: "sessions.logical_bytes",
                 reason: "logical byte accounting overflow".into(),
             })?;
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         update_root_values(
             &transaction,
             session,
@@ -3142,7 +3242,13 @@ where
         }
     }
     let token_usage = deserialize_json(&root.token_usage, "token usage")?;
-    let meta = deserialize_json(&root.metadata, "session metadata")?;
+    let mut meta: SessionMeta = deserialize_json(&root.metadata, "session metadata")?;
+    let permission_generation = connection.query_row(
+        "SELECT permission_generation FROM sessions WHERE id = ?1",
+        params![id.as_bytes().as_slice()],
+        |row| row.get::<_, i64>(0),
+    )?;
+    meta.permission_generation = from_i64(permission_generation, "sessions.permission_generation")?;
     let workspace_binding: StoredWorkspaceBinding =
         deserialize_json(&root.workspace_binding, "sessions.workspace_binding")?;
     if workspace_binding.trust_anchor().as_str() != root.workspace_source
@@ -3332,6 +3438,63 @@ impl SessionCursor {
 }
 
 impl SerializedRoot {
+    fn replace_permissions(
+        &mut self,
+        connection: &Connection,
+        permissions: Option<&str>,
+    ) -> Result<(), SessionError> {
+        self.metadata = match permissions {
+            Some(permissions) => connection.query_row(
+                "SELECT json_set(?1, '$.structured_permission_rules', json(?2))",
+                params![self.metadata, permissions],
+                |row| row.get(0),
+            )?,
+            None => connection.query_row(
+                "SELECT json_remove(?1, '$.structured_permission_rules')",
+                params![self.metadata],
+                |row| row.get(0),
+            )?,
+        };
+        validate_len("session metadata", self.metadata.len(), MAX_METADATA_BYTES)?;
+        Ok(())
+    }
+
+    fn fence_permissions(
+        &mut self,
+        connection: &Connection,
+        id: CaudraId,
+    ) -> Result<(), SessionError> {
+        let stored: Option<Option<String>> = connection
+            .query_row(
+                "SELECT metadata -> '$.structured_permission_rules' FROM sessions WHERE id = ?1",
+                params![id.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match stored {
+            Some(stored) => self.replace_permissions(connection, stored.as_deref()),
+            None => {
+                let metadata: SessionMeta = deserialize_json(&self.metadata, "session metadata")?;
+                let mut ids = HashSet::new();
+                for record in &metadata.structured_permission_rules {
+                    validate_conversation_record(record).map_err(|error| {
+                        SessionError::CorruptDatabaseValue {
+                            field: "permission rules",
+                            reason: error.to_string(),
+                        }
+                    })?;
+                    if !ids.insert(&record.id) {
+                        return Err(SessionError::CorruptDatabaseValue {
+                            field: "permission rules",
+                            reason: "duplicate record ID".into(),
+                        });
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
     fn new<M, U, T>(session: &Session<M, U, T>) -> Result<Self, SessionError>
     where
         U: Serialize,
@@ -3499,7 +3662,10 @@ fn validate_existing_database_sidecars(path: &Path) -> Result<(), SessionError> 
     Ok(())
 }
 
-fn open_writable_connection(state_dir: &StateDir) -> Result<Connection, SessionError> {
+fn open_writable_connection(
+    state_dir: &StateDir,
+    migration_lock: &File,
+) -> Result<Connection, SessionError> {
     fs::create_dir_all(state_dir.path()).map_err(StorageError::from)?;
     ensure_real_directory(state_dir.path(), false).map_err(StorageError::from)?;
     let path = state_dir.path().join(SESSIONS_DB_FILE);
@@ -3511,10 +3677,23 @@ fn open_writable_connection(state_dir: &StateDir) -> Result<Connection, SessionE
             | OpenFlags::SQLITE_OPEN_NO_MUTEX
             | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )?;
+    let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    let cutover = version > 0 && version < SCHEMA_VERSION;
+    if cutover {
+        migration_lock.try_lock().map_err(|_| {
+            StorageError::Io(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                PERMISSION_CUTOVER_BUSY,
+            ))
+        })?;
+    }
     configure_wal_retention(&connection, true)?;
     connection.busy_timeout(BUSY_TIMEOUT)?;
     connection.set_limit(Limit::SQLITE_LIMIT_LENGTH, MAX_SQLITE_VALUE_BYTES)?;
     initialize(&mut connection, state_dir)?;
+    if cutover {
+        migration_lock.lock_shared().map_err(StorageError::from)?;
+    }
     configure(&connection)?;
     Ok(connection)
 }
@@ -4581,7 +4760,7 @@ fn id_from_bytes(bytes: &[u8], field: &'static str) -> Result<CaudraId, SessionE
     Ok(CaudraId::from_bytes(bytes))
 }
 
-fn to_i64(value: impl TryInto<i64>, field: &'static str) -> Result<i64, SessionError> {
+pub(crate) fn to_i64(value: impl TryInto<i64>, field: &'static str) -> Result<i64, SessionError> {
     value
         .try_into()
         .map_err(|_| SessionError::CorruptDatabaseValue {
@@ -4590,7 +4769,7 @@ fn to_i64(value: impl TryInto<i64>, field: &'static str) -> Result<i64, SessionE
         })
 }
 
-fn from_i64(value: i64, field: &'static str) -> Result<u64, SessionError> {
+pub(crate) fn from_i64(value: i64, field: &'static str) -> Result<u64, SessionError> {
     u64::try_from(value).map_err(|_| SessionError::CorruptDatabaseValue {
         field,
         reason: value.to_string(),
@@ -4690,6 +4869,7 @@ mod tests {
     use std::sync::Barrier;
 
     use super::*;
+    use crate::permission_state::StructuredPermissionEffect;
     use crate::sessions::{Session, StoredSubagentOutcome, TitleSource};
     use crate::state::{WorkspaceTabs, project_scope, read_workspace_tabs, write_workspace_tabs};
     use crate::usage_ledger::BUCKET_SECONDS;
@@ -4713,6 +4893,7 @@ mod tests {
     const LARGE_OUTPUT_ID: &str = "large";
     const FOREIGN_APPLICATION_ID: i64 = 1;
     const INITIALIZER_COUNT: usize = 2;
+    const PERMISSION_PREVIOUS_SCHEMA: i64 = 7;
     const SMALL_OUTPUT_ID: &str = "small";
     const TOMBSTONES_TABLE: &str = "session_tombstones";
     const LEDGER_TABLE: &str = "usage_ledger";
@@ -7523,6 +7704,84 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
             .unwrap();
         drop(connection);
         id
+    }
+
+    #[test_case(false; "exclusive_cutover")]
+    #[test_case(true; "older_writer_must_close")]
+    fn permission_cutover_backs_up_and_excludes_older_writers(hold_reader: bool) {
+        let (_temp, dir) = state_dir();
+        let path = dir.path().join(SESSIONS_DB_FILE);
+        create_owner_only(&path).unwrap();
+        let mut old = Connection::open(&path).unwrap();
+        old.pragma_update(None, "auto_vacuum", "INCREMENTAL")
+            .unwrap();
+        old.execute_batch("VACUUM").unwrap();
+        old.execute_batch(&format!(
+            "{SCHEMA}{USAGE_LEDGER_TABLE}{WORKFLOW_TABLES}{WORKFLOW_EVENTS_TABLE}"
+        ))
+        .unwrap();
+        old.pragma_update(None, "application_id", APPLICATION_ID)
+            .unwrap();
+        old.pragma_update(None, "user_version", PERMISSION_PREVIOUS_SCHEMA)
+            .unwrap();
+        let mut session = TestSession::new(MODEL, CWD);
+        session.meta.structured_permission_rules = serde_json::from_value(json!([{
+            "id": CaudraId::generate().to_string(), "created_at": 1,
+            "rule": {"subject": {"kind": "native", "owner": "workcell", "contract": "file.read.v1"},
+                "executor": "native", "resources": [], "arguments": {"constraint": "unconstrained"},
+                "lifetime": "conversation", "effect": "deny"}
+        }]))
+        .unwrap();
+        let serialized = SerializedSession::new(&session).unwrap();
+        let transaction = old.transaction().unwrap();
+        insert_root(&transaction, &session, &serialized).unwrap();
+        transaction.commit().unwrap();
+        let mut before = raw_permission_snapshot_on(&old).unwrap();
+        let backup_path = dir.path().join(format!(
+            "{SESSIONS_DB_FILE}.v{PERMISSION_PREVIOUS_SCHEMA}.bak"
+        ));
+        if hold_reader {
+            let reader =
+                shared_state_lock(&dir.path().join(SESSIONS_DB_LOCK_FILE), OWNER_FILE_MODE)
+                    .unwrap();
+            let error = SessionDatabase::open_state(&dir).err().unwrap();
+            assert!(error.to_string().contains(PERMISSION_CUTOVER_BUSY));
+            assert!(!backup_path.exists());
+            assert_eq!(raw_permission_snapshot_on(&old).unwrap(), before);
+            assert_eq!(
+                old.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                PERMISSION_PREVIOUS_SCHEMA
+            );
+            session.meta.structured_permission_rules[0].rule.effect =
+                StructuredPermissionEffect::Ask;
+            let serialized = SerializedSession::new(&session).unwrap();
+            let transaction = old.transaction().unwrap();
+            update_root(&transaction, &session, &serialized, 0).unwrap();
+            transaction.commit().unwrap();
+            before = raw_permission_snapshot_on(&old).unwrap();
+            drop(reader);
+        }
+        drop(old);
+        let database = SessionDatabase::open_state(&dir).unwrap();
+        assert_eq!(database.stats().unwrap().schema_version, SCHEMA_VERSION);
+        assert_eq!(database.raw_permission_snapshot().unwrap(), before);
+        let loaded = database
+            .load::<TestMessage, Value, Value>(session.id)
+            .unwrap();
+        assert_eq!(
+            loaded.meta.structured_permission_rules,
+            session.meta.structured_permission_rules
+        );
+        assert_eq!(loaded.meta.permission_generation, 0);
+        let backup = Connection::open(&backup_path).unwrap();
+        assert_eq!(
+            backup
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            PERMISSION_PREVIOUS_SCHEMA
+        );
+        assert_eq!(raw_permission_snapshot_on(&backup).unwrap(), before);
     }
 
     #[test]

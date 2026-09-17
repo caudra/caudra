@@ -17,7 +17,9 @@ use std::time::{Duration, Instant};
 use event_listener::Event;
 
 use caudra_agent::cancel::CancelToken;
-use caudra_agent::permissions::{PluginRuleStore, canonical_json_sha256};
+use caudra_agent::permissions::{
+    PluginRuleStore, VerifiedLocalSourceLocator, canonical_json_sha256,
+};
 use caudra_agent::prompt::{PromptId, ResolvedSlots, Slot, SlotEntry};
 use caudra_agent::tools::{
     DOOM_LOOP_MESSAGE, HeaderResult, PLAN_WRITE_RESTRICTED, PermissionScopes,
@@ -181,6 +183,7 @@ pub enum Request {
         permissions: PluginPermissions,
         rule_policy: PermissionRulePolicy,
         opts: PluginOpts,
+        local_source: Option<VerifiedLocalSourceLocator>,
         reply: flume::Sender<LoadResult>,
     },
     CallTool {
@@ -216,6 +219,7 @@ pub enum Request {
         source_name: String,
         plugin_dir: Option<PathBuf>,
         rule_policy: PermissionRulePolicy,
+        local_source: Option<VerifiedLocalSourceLocator>,
         reply: flume::Sender<Result<Option<RawConfig>, PluginError>>,
     },
     RunCommand {
@@ -1840,6 +1844,7 @@ impl LuaRuntime {
         rule_policy: PermissionRulePolicy,
         opts: PluginOpts,
         config_store: Option<&ConfigStore>,
+        local_source: Option<VerifiedLocalSourceLocator>,
     ) -> LoadResult {
         let map_err = |e: mlua::Error| PluginError::Lua {
             plugin: name.to_string(),
@@ -1997,7 +2002,8 @@ impl LuaRuntime {
             })
             .collect();
         let rules = std::mem::take(&mut *pending_rules.lock().unwrap_or_else(|e| e.into_inner()));
-        self.plugin_rules.replace(&name, rules);
+        self.plugin_rules
+            .replace_with_source(&name, rules, local_source);
         self.plugins.borrow_mut().insert(name, keys);
 
         Ok(())
@@ -2094,6 +2100,7 @@ impl LuaRuntime {
         source_name: &str,
         plugin_dir: Option<PathBuf>,
         rule_policy: PermissionRulePolicy,
+        local_source: Option<VerifiedLocalSourceLocator>,
     ) -> Result<Option<RawConfig>, PluginError> {
         let config_store: ConfigStore = Arc::new(Mutex::new(None));
         let (perms, trusted) = load_plugin_permissions_with_trust(plugin_dir.as_deref());
@@ -2111,6 +2118,7 @@ impl LuaRuntime {
             rule_policy,
             PluginOpts::default(),
             Some(&config_store),
+            local_source,
         )
         .await?;
         Ok(config_store.lock().unwrap().take())
@@ -2902,10 +2910,11 @@ pub fn spawn(
                             permissions,
                             rule_policy,
                             opts,
+                            local_source,
                             reply,
                         } => {
                             drain_barrier(&rt.lua, &ex, &gate, &spawn_rx).await;
-                            let res = rt.load_source(Arc::clone(&name), &source, plugin_dir, bundled, &permissions, rule_policy, opts, None).await;
+                            let res = rt.load_source(Arc::clone(&name), &source, plugin_dir, bundled, &permissions, rule_policy, opts, None, local_source).await;
                             let _ = reply.send(res);
                         }
                         Request::CallTool {
@@ -3016,10 +3025,11 @@ pub fn spawn(
                             source_name,
                             plugin_dir,
                             rule_policy,
+                            local_source,
                             reply,
                         } => {
                             drain_barrier(&rt.lua, &ex, &gate, &spawn_rx).await;
-                            let res = rt.run_init_lua(&source, &source_name, plugin_dir, rule_policy).await;
+                            let res = rt.run_init_lua(&source, &source_name, plugin_dir, rule_policy, local_source).await;
                             let _ = reply.send(res);
                         }
                         Request::CollectPromptSlots { config, reply } => {
