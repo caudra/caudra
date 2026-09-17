@@ -28,11 +28,12 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget, Wrap};
 use unicode_width::UnicodeWidthChar;
 
+use super::keybindings::key;
 use super::messages::{ASSISTANT_LABEL, ReviewTarget};
 use super::modal::Modal;
 use super::scrollbar::{Scrollbar, ScrollbarMouse};
 use super::text_editor::{EditorKey, EditorMouse, TextEditor};
-use super::{DisplaySource, Overlay, hint_line};
+use super::{DisplaySource, Hint, HintBar, Overlay};
 use crate::markdown;
 use crate::provenance::{LineProvenance, Provenance};
 use crate::selection::{self, LineBreaks, ScreenSelection, line_chars, wrap_breaks};
@@ -123,6 +124,7 @@ pub(crate) struct ReviewModal {
     width: u16,
     content: Rect,
     popup: Rect,
+    hints: HintBar,
 }
 
 impl ReviewModal {
@@ -142,6 +144,7 @@ impl ReviewModal {
             width: 0,
             content: Rect::default(),
             popup: Rect::default(),
+            hints: HintBar::default(),
         }
     }
 
@@ -205,6 +208,11 @@ impl ReviewModal {
     pub fn handle_mouse(&mut self, event: MouseEvent) -> ReviewAction {
         if self.target.is_none() {
             return ReviewAction::Passthrough;
+        }
+        // The hint row sits outside both the passage and the note editor, so
+        // it is asked before either claims the pointer.
+        if let Some(key) = self.hints.handle_mouse(event) {
+            return self.handle_key(key);
         }
         // The note editor owns the whole pointer while it is up, bar and wheel
         // included: the passage behind it is not what the pointer is on.
@@ -763,16 +771,17 @@ impl ReviewModal {
         self.render_meta(frame, meta_area);
         self.render_gutter(frame, gutter);
         self.render_passage(frame, text);
-        frame.render_widget(
-            Paragraph::new(hint_line(&[
-                ("Shift+↑↓", "select"),
-                ("Enter", "note"),
-                ("e/d", "edit/delete"),
-                ("n/p", "jump"),
-                ("Ctrl+S", "send"),
-                ("Esc", "close"),
-            ])),
+        self.hints.draw(
+            frame,
             hint_area,
+            vec![
+                Hint::inert("Shift+↑↓", "select"),
+                Hint::bind(key::ENTER, "note"),
+                Hint::inert("e/d", "edit/delete"),
+                Hint::inert("n/p", "jump"),
+                Hint::bind(key::SAVE, "send"),
+                Hint::bind(key::ESC, "close"),
+            ],
         );
         popup
     }
@@ -880,14 +889,15 @@ impl ReviewModal {
             quote_area,
         );
         self.note.view(frame, editor_area);
-        frame.render_widget(
-            Paragraph::new(hint_line(&[
-                ("Ctrl+S", "save"),
-                ("Ctrl+A", "select all"),
-                ("Ctrl+Z", "undo"),
-                ("Esc", "back"),
-            ])),
+        self.hints.draw(
+            frame,
             hint_area,
+            vec![
+                Hint::bind(key::SAVE, "save"),
+                Hint::bind(key::SELECT_ALL, "select all"),
+                Hint::bind(key::UNDO, "undo"),
+                Hint::bind(key::ESC, "back"),
+            ],
         );
         popup
     }
@@ -927,6 +937,7 @@ impl Overlay for ReviewModal {
         self.rows_total = 0;
         self.content = Rect::default();
         self.popup = Rect::default();
+        self.hints.reset();
     }
 }
 

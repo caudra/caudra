@@ -5,14 +5,15 @@
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
-use ratatui::text::Line;
 use ratatui::widgets::{Paragraph, Wrap};
 
 use crate::components::command::{CommandRow, ParsedCommand};
 use crate::components::keybindings::key;
 use crate::components::list_picker::{ListPicker, PickerAction};
 use crate::components::modal::Modal;
-use crate::components::{CHEVRON, Overlay, hint_line, input_line_with_cursor, visual_line_count};
+use crate::components::{
+    CHEVRON, Hint, HintBar, Overlay, input_line_with_cursor, visual_line_count,
+};
 use crate::repaint::Cadence;
 use crate::text_buffer::TextBuffer;
 use crate::theme;
@@ -33,7 +34,11 @@ pub enum CommandModalAction {
 enum Stage {
     Closed,
     Pick(Box<ListPicker<CommandRow>>),
-    Args { input: TextBuffer, row: CommandRow },
+    Args {
+        input: TextBuffer,
+        row: CommandRow,
+        footer: HintBar,
+    },
 }
 
 /// Describes a stage change without touching `self`, so `handle_key` can
@@ -99,7 +104,7 @@ impl CommandModal {
                 let query = picker.search_text();
                 Self::map_pick_action(picker.handle_key(key_event), query)
             }
-            Stage::Args { input, row } => match key_event.code {
+            Stage::Args { input, row, .. } => match key_event.code {
                 KeyCode::Enter => StageAction::Run(ParsedCommand {
                     name: row.name.clone(),
                     args: input.value().trim().to_string(),
@@ -116,13 +121,24 @@ impl CommandModal {
         self.transition(action)
     }
 
+    /// A footer click in either stage is the key it names, so it takes the
+    /// key path and the two can never disagree.
     pub fn handle_mouse(&mut self, event: MouseEvent) -> CommandModalAction {
         let action = match &mut self.stage {
             Stage::Pick(picker) => {
                 let query = picker.search_text();
-                Self::map_pick_action(picker.handle_mouse(event), query)
+                match picker.handle_mouse(event) {
+                    PickerAction::Key(key) => return self.handle_key(key),
+                    action => Self::map_pick_action(action, query),
+                }
             }
-            Stage::Closed | Stage::Args { .. } => return CommandModalAction::Consumed,
+            Stage::Args { footer, .. } => {
+                return match footer.handle_mouse(event) {
+                    Some(key) => self.handle_key(key),
+                    None => CommandModalAction::Consumed,
+                };
+            }
+            Stage::Closed => return CommandModalAction::Consumed,
         };
 
         self.transition(action)
@@ -166,7 +182,9 @@ impl CommandModal {
                 args: String::new(),
             }),
             PickerAction::Close => StageAction::Close,
-            PickerAction::Consumed | PickerAction::Toggle(..) => StageAction::None,
+            PickerAction::Consumed | PickerAction::Toggle(..) | PickerAction::Key(_) => {
+                StageAction::None
+            }
         }
     }
 
@@ -178,6 +196,7 @@ impl CommandModal {
                 self.stage = Stage::Args {
                     input: TextBuffer::new(String::new()),
                     row: *row,
+                    footer: HintBar::default(),
                 };
                 CommandModalAction::Consumed
             }
@@ -202,7 +221,7 @@ impl CommandModal {
         let popup = match &mut self.stage {
             Stage::Closed => Rect::default(),
             Stage::Pick(picker) => picker.view(frame, area),
-            Stage::Args { input, row } => {
+            Stage::Args { input, row, footer } => {
                 let t = theme::current();
                 let title = format!(" {} ", row.name);
                 let modal = Modal {
@@ -238,7 +257,10 @@ impl CommandModal {
                         .wrap(Wrap { trim: false }),
                     input_area,
                 );
-                frame.render_widget(Paragraph::new(args_footer()).style(bg), footer_area);
+                frame.render_widget(
+                    Paragraph::new(footer.line(footer_area, args_footer())).style(bg),
+                    footer_area,
+                );
                 popup
             }
         };
@@ -278,12 +300,12 @@ fn wrapped_rows(text: &str, width: u16) -> u16 {
     visual_line_count(text.width(), width.max(1) as usize) as u16
 }
 
-fn footer() -> Line<'static> {
-    hint_line(&[("Enter", "Run"), ("Esc", "Close")])
+fn footer() -> Vec<Hint> {
+    vec![Hint::bind(key::ENTER, "Run"), Hint::bind(key::ESC, "Close")]
 }
 
-fn args_footer() -> Line<'static> {
-    hint_line(&[("Enter", "Run"), ("Esc", "Back")])
+fn args_footer() -> Vec<Hint> {
+    vec![Hint::bind(key::ENTER, "Run"), Hint::bind(key::ESC, "Back")]
 }
 
 #[cfg(test)]

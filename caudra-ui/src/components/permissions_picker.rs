@@ -22,6 +22,7 @@ use std::sync::Arc;
 use unicode_width::UnicodeWidthStr;
 
 use crate::PatternDiscoveryOutcome;
+use crate::components::keybindings::Bind;
 use crate::components::keybindings::key;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
 use crate::components::modal::{CHROME_LINES, FooterHits, FooterLine, Modal};
@@ -31,10 +32,26 @@ use crate::components::permission_scope::{
     view::ScopeView,
 };
 use crate::components::scrollbar::{Scrollbar, ScrollbarMouse};
-use crate::components::{ModalScroll, Overlay, escape_terminal_controls, hint_line};
+use crate::components::{Hint, HintBar, ModalScroll, Overlay, escape_terminal_controls, hint_line};
 use crate::theme;
 
 const TITLE: &str = " Permissions ";
+/// The picker's own chords, spelled the way its toolbar already spells them.
+const DISMISS_SUGGESTION: Bind = Bind {
+    code: KeyCode::Char('d'),
+    modifiers: KeyModifiers::CONTROL,
+    label: "^D",
+};
+const SNOOZE_SUGGESTION: Bind = Bind {
+    code: KeyCode::Char('s'),
+    modifiers: KeyModifiers::CONTROL,
+    label: "^S",
+};
+const REFRESH_DISCOVERY: Bind = Bind {
+    code: KeyCode::Char('r'),
+    modifiers: KeyModifiers::CONTROL,
+    label: "^R",
+};
 const EMPTY: &str = "No grants or policies. Use Discover to scan saved history.";
 const EMPTY_DISCOVERY: &str = "No visible proposals. See the scan overview.";
 const RULES_TITLE: &str = " Rules · grants & policies ";
@@ -228,6 +245,7 @@ pub(crate) struct PermissionsPicker {
     popup: Rect,
     toolbar_hits: FooterHits,
     tabs_hits: FooterHits,
+    footer: HintBar,
     scope_view: ScopeView,
     editor: Option<ScopeEditor>,
     current_project: Option<PathBuf>,
@@ -326,6 +344,7 @@ impl PermissionsPicker {
             popup: Rect::default(),
             toolbar_hits: FooterHits::default(),
             tabs_hits: FooterHits::default(),
+            footer: HintBar::default(),
             scope_view: ScopeView::default(),
             editor: None,
             current_project: None,
@@ -692,6 +711,11 @@ impl PermissionsPicker {
             inspector.handle_mouse(event);
             return PermissionsPickerAction::Consumed;
         }
+        // Ahead of the confirmation gate: the hint is a key press, and the
+        // key path already knows what Esc means while a confirmation is up.
+        if let Some(key) = self.footer.handle_mouse(event) {
+            return self.handle_key(key);
+        }
         if self.has_pending_confirmation() {
             return PermissionsPickerAction::Consumed;
         }
@@ -1032,13 +1056,14 @@ impl PermissionsPicker {
         } else {
             self.view_detail(frame, detail);
         }
-        frame.render_widget(
-            Paragraph::new(hint_line(&[
-                ("Tab", "List/Detail"),
-                ("PgUp/Dn", "Scroll"),
-                ("Esc", "Back"),
-            ])),
+        self.footer.draw(
+            frame,
             footer,
+            vec![
+                Hint::bind(key::TAB, "List/Detail"),
+                Hint::inert("PgUp/Dn", "Scroll"),
+                Hint::bind(key::ESC, "Back"),
+            ],
         );
         popup
     }
@@ -1259,6 +1284,7 @@ impl PermissionsPicker {
                 PermissionsPickerAction::Consumed
             }
             PickerAction::Close => PermissionsPickerAction::Close,
+            PickerAction::Key(key) => self.handle_key(key),
         }
     }
 
@@ -1929,36 +1955,46 @@ fn lifetime_name(lifetime: &PermissionLifetime) -> &'static str {
     }
 }
 
-fn footer() -> Line<'static> {
-    hint_line(&[
-        ("Enter", "Inspect"),
-        ("Tab", "List/Detail"),
-        ("Esc", "Close"),
-    ])
+fn footer() -> Vec<Hint> {
+    vec![
+        Hint::bind(key::ENTER, "Inspect"),
+        Hint::bind(key::TAB, "List/Detail"),
+        Hint::bind(key::ESC, "Close"),
+    ]
 }
 
-fn trust_footer() -> Line<'static> {
-    hint_line(&[
-        ("Enter", "Trust or revoke"),
-        ("Tab", "Details"),
-        ("Esc", "Close"),
-    ])
+fn trust_footer() -> Vec<Hint> {
+    vec![
+        Hint::bind(key::ENTER, "Trust or revoke"),
+        Hint::bind(key::TAB, "Details"),
+        Hint::bind(key::ESC, "Close"),
+    ]
 }
 
-fn suggestion_footer() -> Line<'static> {
-    hint_line(&[("Enter", "View"), ("^D", "Dismiss"), ("^S", "Snooze")])
+fn suggestion_footer() -> Vec<Hint> {
+    vec![
+        Hint::bind(key::ENTER, "View"),
+        Hint::bind(DISMISS_SUGGESTION, "Dismiss"),
+        Hint::bind(SNOOZE_SUGGESTION, "Snooze"),
+    ]
 }
 
-fn discovery_footer() -> Line<'static> {
-    hint_line(&[("^R", "Refresh"), ("Tab", "Details"), ("Esc", "Back")])
+fn discovery_footer() -> Vec<Hint> {
+    vec![
+        Hint::bind(REFRESH_DISCOVERY, "Refresh"),
+        Hint::bind(key::TAB, "Details"),
+        Hint::bind(key::ESC, "Back"),
+    ]
 }
 
+/// Drawn inside the inspector's wrapped, scrolling paragraph, where no row
+/// is fixed enough to hold a hit rect, so it is text alone.
 fn suggestion_inspector_footer() -> Line<'static> {
     hint_line(&[
-        ("PgUp/PgDn", "Scroll"),
-        ("Ctrl+d", "Dismiss"),
-        ("Ctrl+s", "Snooze 24h"),
-        ("Esc", "Back"),
+        Hint::inert("PgUp/PgDn", "Scroll"),
+        Hint::bind(DISMISS_SUGGESTION, "Dismiss"),
+        Hint::bind(SNOOZE_SUGGESTION, "Snooze 24h"),
+        Hint::bind(key::ESC, "Back"),
     ])
 }
 

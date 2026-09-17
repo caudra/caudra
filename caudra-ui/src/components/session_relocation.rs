@@ -9,10 +9,8 @@ use caudra_storage::sessions::{SessionLocation, SessionRelocation};
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
-use ratatui::text::Line;
 
-use super::Overlay;
-use crate::components::hint_line;
+use super::{Hint, Overlay};
 use crate::components::keybindings::key;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
 use crate::repaint::Cadence;
@@ -274,12 +272,17 @@ impl SessionRelocationPicker {
         }
     }
 
+    /// The custom stage is a text field, so the only thing its picker can
+    /// answer the pointer with is a footer click.
     pub fn handle_mouse(&mut self, event: MouseEvent) -> SessionRelocationAction {
         if matches!(
             self.flow.as_ref().map(|flow| &flow.stage),
             Some(Stage::Custom(_))
         ) {
-            return SessionRelocationAction::Consumed;
+            return match self.picker.handle_footer_mouse(event) {
+                Some(key) => self.handle_key(key),
+                None => SessionRelocationAction::Consumed,
+            };
         }
         let action = self.picker.handle_mouse(event);
         let result = self.map_action(action);
@@ -566,6 +569,7 @@ impl SessionRelocationPicker {
                 EntryKind::ProjectUsage => self.toggle_project_usage(),
                 EntryKind::Confirm => return self.confirm(),
             },
+            PickerAction::Key(key) => return self.handle_key(key),
             PickerAction::Consumed | PickerAction::Toggle(..) => {}
         }
         SessionRelocationAction::Consumed
@@ -621,36 +625,39 @@ fn same_directory(source: &str, destination: &str) -> bool {
         || fs::canonicalize(source).ok().as_deref() == Some(Path::new(destination))
 }
 
-fn source_footer() -> Line<'static> {
-    hint_line(&[("Enter", "choose source"), ("Esc", "cancel")])
+fn source_footer() -> Vec<Hint> {
+    vec![
+        Hint::bind(key::ENTER, "choose source"),
+        Hint::bind(key::ESC, "cancel"),
+    ]
 }
 
-fn destination_footer() -> Line<'static> {
-    hint_line(&[
-        ("Enter", "choose"),
-        (key::RELOCATION_CUSTOM.label, "Custom directory"),
-        ("Esc", "cancel"),
-    ])
+fn destination_footer() -> Vec<Hint> {
+    vec![
+        Hint::bind(key::ENTER, "choose"),
+        Hint::bind(key::RELOCATION_CUSTOM, "Custom directory"),
+        Hint::bind(key::ESC, "cancel"),
+    ]
 }
 
-fn custom_footer() -> Line<'static> {
-    hint_line(&[
-        ("Enter", "preview"),
-        (key::RENAME_SESSION.label, "change selection"),
-        ("Tab", DESTINATIONS_LABEL),
-        ("Esc", "cancel"),
-    ])
+fn custom_footer() -> Vec<Hint> {
+    vec![
+        Hint::bind(key::ENTER, "preview"),
+        Hint::bind(key::RENAME_SESSION, "change selection"),
+        Hint::bind(key::TAB, DESTINATIONS_LABEL),
+        Hint::bind(key::ESC, "cancel"),
+    ]
 }
 
-fn confirm_footer() -> Line<'static> {
-    hint_line(&[
-        ("↑↓", "select"),
-        ("Enter", "activate"),
-        (key::RENAME_SESSION.label, "selection"),
-        ("Tab", DESTINATIONS_LABEL),
-        (key::RELOCATION_CUSTOM.label, "directory"),
-        ("Esc", "cancel"),
-    ])
+fn confirm_footer() -> Vec<Hint> {
+    vec![
+        Hint::inert("↑↓", "select"),
+        Hint::bind(key::ENTER, "activate"),
+        Hint::bind(key::RENAME_SESSION, "selection"),
+        Hint::bind(key::TAB, DESTINATIONS_LABEL),
+        Hint::bind(key::RELOCATION_CUSTOM, "directory"),
+        Hint::bind(key::ESC, "cancel"),
+    ]
 }
 
 #[cfg(test)]

@@ -9,11 +9,10 @@ use caudra_providers::token_label;
 use crossterm::event::{KeyEvent, MouseEvent};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
-use ratatui::text::Line;
 
 use crate::components::keybindings::key;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
-use crate::components::{Overlay, hint_line};
+use crate::components::{Hint, Overlay};
 use crate::repaint::Cadence;
 
 const TITLE: &str = " Memory Files ";
@@ -122,9 +121,11 @@ impl MemoryPicker {
         self.map_action(action)
     }
 
+    /// A footer click is the key it names and takes the key path whole, so a
+    /// second click on the delete hint confirms rather than re-arms.
     pub fn handle_mouse(&mut self, event: MouseEvent) -> MemoryPickerAction {
         let action = self.picker.handle_mouse(event);
-        if !matches!(action, PickerAction::Consumed) {
+        if !matches!(action, PickerAction::Consumed | PickerAction::Key(_)) {
             self.clear_pending();
         }
         self.map_action(action)
@@ -180,6 +181,7 @@ impl MemoryPicker {
                 self.pending_delete = None;
                 MemoryPickerAction::Closed
             }
+            PickerAction::Key(key) => self.handle_key(key),
         }
     }
 }
@@ -198,12 +200,12 @@ impl Overlay for MemoryPicker {
     }
 }
 
-fn footer() -> Line<'static> {
-    hint_line(&[
-        ("Enter", "open"),
-        (key::DELETE.label, "delete"),
-        ("Esc", "close"),
-    ])
+fn footer() -> Vec<Hint> {
+    vec![
+        Hint::bind(key::ENTER, "open"),
+        Hint::bind(key::DELETE, "delete"),
+        Hint::bind(key::ESC, "close"),
+    ]
 }
 
 fn confirm_hint() -> String {

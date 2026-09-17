@@ -91,7 +91,7 @@ impl ThemePicker {
                 self.original_theme_name = None;
                 ThemePickerAction::Closed
             }
-            PickerAction::Toggle(..) => ThemePickerAction::Consumed,
+            PickerAction::Toggle(..) | PickerAction::Key(_) => ThemePickerAction::Consumed,
         }
     }
 

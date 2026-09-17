@@ -5,10 +5,10 @@ use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 
 use crate::animation::{animation_elapsed_ms, spinner_str};
-use crate::components::Overlay;
 use crate::components::keybindings::key;
 use crate::components::modal::Modal;
 use crate::components::scrollbar::{Scrollbar, ScrollbarMouse};
+use crate::components::{Hint, HintBar, Overlay};
 use crate::repaint::Cadence;
 use crate::text_buffer::{EditResult, TextBuffer};
 use crate::theme;
@@ -66,13 +66,20 @@ pub enum PickerAction<T> {
     Select(T),
     Toggle(usize, bool),
     Close,
+    /// A footer hint was clicked. The picker does not know what its owner's
+    /// keys mean, so the owner feeds this back into its own `handle_key`.
+    Key(KeyEvent),
 }
+
+/// The footer a picker draws under its search row. Built on every frame
+/// because its owner's binds are consts and its hits are placed at draw time.
+pub type FooterBuilder = fn() -> Vec<Hint>;
 
 pub struct ListPicker<T> {
     state: Option<State<T>>,
     title: String,
     max_visible: Option<u16>,
-    footer: Option<fn() -> Line<'static>>,
+    footer: Option<FooterBuilder>,
     error_text: Option<String>,
     info_text: Option<String>,
     empty_text: &'static str,
@@ -91,6 +98,7 @@ struct State<T> {
     row_hits: Vec<PickerRowHit>,
     mouse_down: Option<usize>,
     scrollbar: Scrollbar,
+    footer: HintBar,
     enabled: Option<Vec<bool>>,
     toggleable: Option<Vec<bool>>,
     matcher: Matcher,
@@ -113,7 +121,7 @@ struct RenderOptions<'a> {
 
 #[derive(Clone, Copy)]
 struct RenderContent<'a> {
-    footer: Option<fn() -> Line<'static>>,
+    footer: Option<FooterBuilder>,
     error_text: Option<&'a str>,
     info_text: Option<&'a str>,
 }
@@ -132,6 +140,7 @@ impl<T: PickerItem> State<T> {
             row_hits: Vec::new(),
             mouse_down: None,
             scrollbar: Scrollbar::default(),
+            footer: HintBar::default(),
             enabled: None,
             toggleable: None,
             matcher: Matcher::new(Config::DEFAULT),
@@ -344,12 +353,12 @@ impl<T: PickerItem> ListPicker<T> {
         self
     }
 
-    pub fn with_footer_builder(mut self, builder: fn() -> Line<'static>) -> Self {
+    pub fn with_footer_builder(mut self, builder: FooterBuilder) -> Self {
         self.footer = Some(builder);
         self
     }
 
-    pub fn set_footer_builder(&mut self, builder: fn() -> Line<'static>) {
+    pub fn set_footer_builder(&mut self, builder: FooterBuilder) {
         self.footer = Some(builder);
     }
 
@@ -518,6 +527,23 @@ impl<T: PickerItem> ListPicker<T> {
                 return PickerAction::Consumed;
             }
         }
+        if let Some(key) = state.footer.handle_mouse(event) {
+            return PickerAction::Key(key);
+        }
+        self.handle_list_mouse(event)
+    }
+
+    /// The footer alone. For an owner whose list is deaf for the moment, such
+    /// as a rename in progress, but whose footer still names the keys that
+    /// end it.
+    pub fn handle_footer_mouse(&mut self, event: MouseEvent) -> Option<KeyEvent> {
+        self.state.as_mut()?.footer.handle_mouse(event)
+    }
+
+    fn handle_list_mouse(&mut self, event: MouseEvent) -> PickerAction<T> {
+        let Some(state) = self.state.as_mut() else {
+            return PickerAction::Close;
+        };
         let position = Position::new(event.column, event.row);
         match event.kind {
             MouseEventKind::Down(MouseButton::Left) => {
@@ -850,7 +876,7 @@ fn render_ready<T: PickerItem>(
     render_search(frame, search_area, &s.search);
 
     if let Some(build) = footer {
-        frame.render_widget(Paragraph::new(build()), areas[area_idx]);
+        s.footer.draw(frame, areas[area_idx], build());
     }
 
     let total_visual = visual_rows_in_range(&s.filtered, &s.items, 0, s.filtered.len());

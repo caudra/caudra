@@ -7,6 +7,7 @@ use crate::components::context_modal::{
     EXPANDED_TITLE as CONTEXT_EXPANDED_TITLE, TITLE as CONTEXT_TITLE,
 };
 use crate::components::file_walk::UNREADABLE_DIR_MSG;
+use crate::components::goal_modal::GoalTarget;
 use crate::components::keybindings::{Bind, KeybindContext, key as kb, leader as chord};
 use crate::components::messages::{ASSISTANT_LABEL, ReviewTarget};
 use crate::components::queue_actions::QueueActionKind;
@@ -8732,9 +8733,9 @@ fn context_footer_click_switches_views() {
 const GOAL_MODEL_COMMAND: &str = "/goal-model";
 const GOAL_CLEAR_COMMAND: &str = "/goal-clear";
 
-fn click_goal_footer(app: &mut App, command: &str) -> Vec<Action> {
+fn click_goal_footer(app: &mut App, command: &'static str) -> Vec<Action> {
     let _ = rendered(app);
-    let hit = app.goal_modal.footer_hit(command);
+    let hit = app.goal_modal.footer_hit(GoalTarget::Command(command));
     assert!(!hit.is_empty(), "command={command}");
     app.update(mouse_event(
         MouseEventKind::Down(MouseButton::Left),
@@ -8788,8 +8789,16 @@ fn a_finished_goal_footer_has_no_clear() {
     app.goal_modal.open();
     let _ = rendered(&mut app);
 
-    assert!(app.goal_modal.footer_hit(GOAL_CLEAR_COMMAND).is_empty());
-    assert!(!app.goal_modal.footer_hit(GOAL_MODEL_COMMAND).is_empty());
+    assert!(
+        app.goal_modal
+            .footer_hit(GoalTarget::Command(GOAL_CLEAR_COMMAND))
+            .is_empty()
+    );
+    assert!(
+        !app.goal_modal
+            .footer_hit(GoalTarget::Command(GOAL_MODEL_COMMAND))
+            .is_empty()
+    );
 }
 
 const LUA_COMMAND_RAN: &str = "lua command with args must reach the plugin";
@@ -12303,19 +12312,21 @@ fn btw_marks_the_cutoff_and_clears_it_when_the_modal_closes() {
     );
 }
 
-/// A follow-up typed into the modal extends the same thread: the answered
-/// question is filed, the new one is pending, and a fresh exchange opens.
-#[test]
-fn a_btw_follow_up_extends_the_thread_over_the_same_snapshot() {
-    let mut app = btw_ready_app();
-    app.start_btw("why sqlite?".into());
+const BTW_QUESTION: &str = "why sqlite?";
+const BTW_HEADER: &str = "Q: why sqlite?";
+const BTW_FOLLOW_UP: &str = "and postgres?";
+const BTW_FOLLOW_UP_HEADER: &str = "Q: and postgres?";
 
-    // Stand in for the request the stub never answers.
+/// A btw whose first answer has landed, with the follow-up typed but not yet
+/// sent. The request the stub never answers is stood in for by a channel.
+fn btw_awaiting_follow_up() -> App {
+    let mut app = btw_ready_app();
+    app.start_btw(BTW_QUESTION.into());
     let (tx, rx) = flume::bounded(1);
     let (trigger, _cancel) = caudra_agent::CancelToken::new();
     app.stream_modal.open(
         " /btw ",
-        "Q: why sqlite?".into(),
+        BTW_HEADER.into(),
         StreamFooter::FollowUp,
         rx,
         trigger,
@@ -12338,23 +12349,59 @@ fn a_btw_follow_up_extends_the_thread_over_the_same_snapshot() {
         "a settled answer keeps the modal's thread"
     );
     assert_eq!(app.btw_thread.as_ref().unwrap().exchange_count(), 1);
-
-    for c in "and postgres?".chars() {
+    for c in BTW_FOLLOW_UP.chars() {
         app.update(Msg::Key(key(KeyCode::Char(c))));
     }
-    app.update(Msg::Key(key(KeyCode::Enter)));
+    app
+}
 
+fn assert_btw_follow_up_in_flight(app: &App) {
     let thread = app.btw_thread.as_ref().unwrap();
     assert_eq!(thread.exchange_count(), 1);
-    assert_eq!(thread.pending(), Some("and postgres?"));
+    assert_eq!(thread.pending(), Some(BTW_FOLLOW_UP));
     assert!(
         app.stream_modal.is_streaming(),
         "the follow-up is in flight"
     );
     assert_eq!(
         app.stream_modal.headers(),
-        ["Q: why sqlite?", "Q: and postgres?"]
+        [BTW_HEADER, BTW_FOLLOW_UP_HEADER]
     );
+    assert_eq!(app.stream_modal.input_text(), "");
+}
+
+/// A follow-up typed into the modal extends the same thread: the answered
+/// question is filed, the new one is pending, and a fresh exchange opens.
+#[test]
+fn a_btw_follow_up_extends_the_thread_over_the_same_snapshot() {
+    let mut app = btw_awaiting_follow_up();
+
+    app.update(Msg::Key(key(KeyCode::Enter)));
+
+    assert_btw_follow_up_in_flight(&app);
+}
+
+/// A click on the footer's send control takes the same route as Enter.
+#[test]
+fn a_btw_follow_up_is_sent_by_clicking_the_footer() {
+    const SEND: usize = 0;
+    let mut app = btw_awaiting_follow_up();
+    let _ = rendered(&mut app);
+    let send = app.stream_modal.footer_hit(SEND);
+    assert!(!send.is_empty());
+
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        send.x,
+        send.y,
+    ));
+    app.update(mouse_event(
+        MouseEventKind::Up(MouseButton::Left),
+        send.x,
+        send.y,
+    ));
+
+    assert_btw_follow_up_in_flight(&app);
 }
 
 #[test]

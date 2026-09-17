@@ -10,7 +10,7 @@ use ratatui::widgets::{Paragraph, Wrap};
 
 use super::ModalScroll;
 use super::Overlay;
-use super::modal::{FooterHits, FooterLine, Modal};
+use super::modal::{CLOSE_HINT, ESC_LABEL, FooterHits, FooterLine, Modal, SEPARATOR};
 use super::scrollbar::{Scrollbar, ScrollbarMouse};
 use crate::theme;
 
@@ -20,9 +20,22 @@ const H_PAD: u16 = 2;
 const GOAL_CLEAR: &str = "/goal-clear";
 const GOAL_MODEL: &str = "/goal-model";
 const GOAL_START: &str = "/goal <condition>";
-const SEPARATOR: &str = " · ";
-const CLOSE_HINT: &str = " · Esc close";
 const UNBOUND_EVALUATOR: &str = "default (fast, then chat)";
+const ACTIVE_TARGETS: [GoalTarget; 3] = [
+    GoalTarget::Command(GOAL_CLEAR),
+    GoalTarget::Command(GOAL_MODEL),
+    GoalTarget::Close,
+];
+const FINISHED_TARGETS: [GoalTarget; 2] = [GoalTarget::Command(GOAL_MODEL), GoalTarget::Close];
+
+/// What a footer control does when pressed, indexed the way [`FooterLine`]
+/// targets are.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GoalTarget {
+    /// A session command line, left to the host to run.
+    Command(&'static str),
+    Close,
+}
 
 pub struct GoalModal {
     open: bool,
@@ -83,16 +96,17 @@ impl GoalModal {
     }
 
     #[cfg(test)]
-    pub(crate) fn footer_hit(&self, command: &str) -> Rect {
-        footer_commands(self.active)
+    pub(crate) fn footer_hit(&self, target: GoalTarget) -> Rect {
+        footer_targets(self.active)
             .iter()
-            .position(|name| *name == command)
+            .position(|candidate| *candidate == target)
             .map(|index| self.footer.hit(index))
             .unwrap_or_default()
     }
 
     /// The command line a footer click asked for, left to the host to run: the
-    /// footer names session commands, not modal state.
+    /// footer names session commands, not modal state. The close control is
+    /// the one exception, and it is answered here.
     pub fn handle_mouse(&mut self, event: MouseEvent) -> Option<&'static str> {
         match self.scrollbar.handle(&event) {
             ScrollbarMouse::Ignored => {}
@@ -102,9 +116,18 @@ impl GoalModal {
                 return None;
             }
         }
-        self.footer
+        let target = self
+            .footer
             .handle_mouse(event)
-            .and_then(|index| footer_commands(self.active).get(index).copied())
+            .and_then(|index| footer_targets(self.active).get(index).copied());
+        match target {
+            Some(GoalTarget::Command(cmdline)) => Some(cmdline),
+            Some(GoalTarget::Close) => {
+                self.close();
+                None
+            }
+            None => None,
+        }
     }
 
     pub fn view(
@@ -173,12 +196,11 @@ fn is_active(status: Option<&GoalStatus>) -> bool {
     matches!(status, Some(GoalStatus::Active(_)))
 }
 
-/// The commands the footer offers, indexed the way [`FooterLine`] targets are.
-fn footer_commands(active: bool) -> &'static [&'static str] {
+fn footer_targets(active: bool) -> &'static [GoalTarget] {
     if active {
-        &[GOAL_CLEAR, GOAL_MODEL]
+        &ACTIVE_TARGETS
     } else {
-        &[GOAL_MODEL]
+        &FINISHED_TARGETS
     }
 }
 
@@ -196,7 +218,9 @@ fn footer(active: bool) -> FooterLine {
     }
     footer.text(SEPARATOR, theme.tool_dim);
     footer.command(GOAL_MODEL, theme.keybind_key);
-    footer.text(CLOSE_HINT, theme.tool_dim);
+    footer.text(SEPARATOR, theme.tool_dim);
+    footer.command(ESC_LABEL, theme.keybind_key);
+    footer.describe(CLOSE_HINT, theme.tool_dim);
     footer
 }
 
@@ -402,7 +426,7 @@ mod tests {
         modal.open();
         let _ = drawn(&mut modal, Some(&status));
 
-        let hit = modal.footer_hit(GOAL_MODEL);
+        let hit = modal.footer_hit(GoalTarget::Command(GOAL_MODEL));
         assert!(!hit.is_empty());
 
         modal.handle_mouse(mouse(MouseEventKind::Moved, hit));
@@ -428,6 +452,44 @@ mod tests {
             modal.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), hit)),
             Some(GOAL_MODEL)
         );
+    }
+
+    #[test]
+    fn the_close_control_hovers_as_a_phrase_and_closes() {
+        let status = finished();
+        let mut modal = GoalModal::default();
+        modal.open();
+        let _ = drawn(&mut modal, Some(&status));
+
+        let hit = modal.footer_hit(GoalTarget::Close);
+        assert_eq!(
+            usize::from(hit.width),
+            ESC_LABEL.len() + CLOSE_HINT.len(),
+            "the hit spans the key and its gloss"
+        );
+
+        modal.handle_mouse(mouse(MouseEventKind::Moved, hit));
+        let terminal = drawn(&mut modal, Some(&status));
+        let reversed = (0..HEIGHT)
+            .flat_map(|y| (0..WIDTH).map(move |x| Position::new(x, y)))
+            .filter(|position| {
+                terminal.backend().buffer()[(position.x, position.y)]
+                    .modifier
+                    .contains(Modifier::REVERSED)
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            reversed.len() == usize::from(hit.width)
+                && reversed.iter().all(|position| hit.contains(*position)),
+            "{HOVER_MISSED}: hit={hit:?} reversed={reversed:?}"
+        );
+
+        modal.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), hit));
+        assert_eq!(
+            modal.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), hit)),
+            None
+        );
+        assert!(!modal.open);
     }
 
     #[test]
@@ -469,7 +531,7 @@ mod tests {
         modal.open();
         let _ = drawn(&mut modal, Some(&status));
 
-        let off = Rect::new(modal.footer_hit(GOAL_MODEL).x, 0, 1, 1);
+        let off = Rect::new(modal.footer_hit(GoalTarget::Command(GOAL_MODEL)).x, 0, 1, 1);
         modal.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), off));
         assert_eq!(
             modal.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), off)),
@@ -481,7 +543,7 @@ mod tests {
     /// is not on screen and its index is not reachable.
     #[test]
     fn a_finished_goal_offers_no_clear() {
-        assert_eq!(footer_commands(false), [GOAL_MODEL]);
-        assert_eq!(footer_commands(true), [GOAL_CLEAR, GOAL_MODEL]);
+        assert_eq!(footer_targets(false), FINISHED_TARGETS);
+        assert_eq!(footer_targets(true), ACTIVE_TARGETS);
     }
 }

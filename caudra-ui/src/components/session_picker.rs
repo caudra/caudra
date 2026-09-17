@@ -11,10 +11,8 @@ use caudra_storage::id::CaudraId;
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
-use ratatui::text::Line;
 
-use super::Overlay;
-use crate::components::hint_line;
+use super::{Hint, Overlay};
 use crate::components::keybindings::key;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
 use crate::repaint::Cadence;
@@ -248,12 +246,18 @@ impl SessionPicker {
         self.map_action(action)
     }
 
+    /// A footer click is the key it names and takes the key path whole: a
+    /// second click on the delete hint confirms rather than re-arms, and the
+    /// rename footer still answers while the list itself is deaf.
     pub fn handle_mouse(&mut self, event: MouseEvent) -> SessionPickerAction {
         if self.rename.is_some() {
-            return SessionPickerAction::Consumed;
+            return match self.picker.handle_footer_mouse(event) {
+                Some(key) => self.handle_key(key),
+                None => SessionPickerAction::Consumed,
+            };
         }
         let action = self.picker.handle_mouse(event);
-        if !matches!(action, PickerAction::Consumed) {
+        if !matches!(action, PickerAction::Consumed | PickerAction::Key(_)) {
             self.clear_pending();
         }
         self.map_action(action)
@@ -378,6 +382,7 @@ impl SessionPicker {
                 self.close();
                 SessionPickerAction::Closed
             }
+            PickerAction::Key(key) => self.handle_key(key),
         }
     }
 }
@@ -396,12 +401,12 @@ impl Overlay for SessionPicker {
     }
 }
 
-fn footer() -> Line<'static> {
-    hint_line(&[
-        ("Enter", "open"),
-        (key::MOVE_SESSION.label, "Move current session"),
-        (key::MIGRATE_SESSIONS.label, "Migrate directory sessions"),
-    ])
+fn footer() -> Vec<Hint> {
+    vec![
+        Hint::bind(key::ENTER, "open"),
+        Hint::bind(key::MOVE_SESSION, "Move current session"),
+        Hint::bind(key::MIGRATE_SESSIONS, "Migrate directory sessions"),
+    ]
 }
 
 fn editing_hints() -> String {
@@ -414,8 +419,11 @@ fn editing_hints() -> String {
     )
 }
 
-fn rename_footer() -> Line<'static> {
-    hint_line(&[("Enter", "save"), ("Esc", "cancel")])
+fn rename_footer() -> Vec<Hint> {
+    vec![
+        Hint::bind(key::ENTER, "save"),
+        Hint::bind(key::ESC, "cancel"),
+    ]
 }
 
 fn confirm_hint() -> String {

@@ -11,7 +11,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 
 use crate::components::keybindings::key;
-use crate::components::modal::{CHROME_LINES, FooterHits, FooterLine, Modal};
+use crate::components::modal::{
+    CHROME_LINES, CLOSE_HINT, ESC_LABEL, FooterHits, FooterLine, Modal, SEPARATOR,
+};
 use crate::components::scrollbar::{Scrollbar, ScrollbarMouse};
 use crate::components::{
     ModalScroll, Overlay, apportion, escape_terminal_controls, format_integer, format_usize,
@@ -28,7 +30,10 @@ const GRID_CELL_COUNT: usize = 100;
 const CATEGORY_COUNT: usize = 7;
 const PERCENT_TENTHS_SCALE: u64 = 1_000;
 const LEGEND_GAP: &str = "   ";
-const CLOSE_HINT: &str = " · Esc close";
+/// The footer's targets in the order [`footer`] lays them out: the view
+/// switch, then the close control.
+const SWITCH_TARGET: usize = 0;
+const CLOSE_TARGET: usize = 1;
 
 pub struct ContextModal {
     open: bool,
@@ -95,14 +100,21 @@ impl ContextModal {
                 return;
             }
         }
-        if self.footer.handle_mouse(event).is_some() {
-            self.open(!self.expanded);
+        match self.footer.handle_mouse(event) {
+            Some(SWITCH_TARGET) => self.open(!self.expanded),
+            Some(CLOSE_TARGET) => self.close(),
+            _ => {}
         }
     }
 
     #[cfg(test)]
     pub(crate) fn footer_hit(&self) -> Rect {
-        self.footer.hit(0)
+        self.footer.hit(SWITCH_TARGET)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn close_hit(&self) -> Rect {
+        self.footer.hit(CLOSE_TARGET)
     }
 
     pub fn view(
@@ -397,7 +409,7 @@ fn footer_command(expanded: bool) -> &'static str {
 fn footer(expanded: bool, theme: &Theme) -> FooterLine {
     let mut footer = FooterLine::default();
     footer.command(footer_command(expanded), theme.keybind_key);
-    footer.text(
+    footer.describe(
         if expanded {
             " summary"
         } else {
@@ -405,7 +417,9 @@ fn footer(expanded: bool, theme: &Theme) -> FooterLine {
         },
         theme.tool_dim,
     );
-    footer.text(CLOSE_HINT, theme.tool_dim);
+    footer.text(SEPARATOR, theme.tool_dim);
+    footer.command(ESC_LABEL, theme.keybind_key);
+    footer.describe(CLOSE_HINT, theme.tool_dim);
     footer
 }
 
@@ -1204,7 +1218,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert!(
-            !reversed.is_empty()
+            reversed.len() == usize::from(summary_hit.width)
                 && reversed
                     .iter()
                     .all(|position| summary_hit.contains(*position)),
@@ -1231,6 +1245,21 @@ mod tests {
         modal.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), expanded_hit));
         modal.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), expanded_hit));
         assert!(!modal.expanded);
+
+        terminal
+            .draw(|frame| {
+                modal.view(frame, frame.area(), Some(&snapshot));
+            })
+            .unwrap();
+        let close_hit = modal.close_hit();
+        assert_eq!(
+            usize::from(close_hit.width),
+            ESC_LABEL.len() + CLOSE_HINT.len(),
+            "the close control spans the key and its gloss"
+        );
+        modal.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), close_hit));
+        modal.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), close_hit));
+        assert!(!modal.is_open());
     }
 
     #[test]

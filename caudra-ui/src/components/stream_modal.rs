@@ -1,6 +1,6 @@
 use crate::components::ModalScroll;
 use crate::components::Overlay;
-use crate::components::modal::{FooterHits, FooterLine, Modal};
+use crate::components::modal::{ESC_LABEL, FooterHits, FooterLine, Modal};
 use crate::components::scrollbar::{Scrollbar, ScrollbarMouse};
 use crate::components::streaming_content::StreamingContent;
 use crate::text_buffer::TextBuffer;
@@ -22,13 +22,37 @@ const WIDTH_PERCENT: u16 = 65;
 const MAX_HEIGHT_PERCENT: u16 = 80;
 pub(crate) const COPY_LABEL: &str = "y";
 const COPY_HINT: &str = " Copy";
-const CLOSE_HINT: &str = "   Esc Close";
+const CLOSE_HINT: &str = " Close";
+const FOOTER_GAP: &str = "   ";
 const INPUT_PREFIX: &str = "> ";
 const SEND_LABEL: &str = "Enter";
 const SEND_HINT: &str = " Send a follow-up";
 /// The input line and the hint under it, kept out of the scroll region so a
 /// long thread never scrolls the prompt away.
 const INPUT_ROWS: u16 = 2;
+
+const CLOSE_CONTROL: StreamControl = StreamControl {
+    label: ESC_LABEL,
+    hint: CLOSE_HINT,
+    command: StreamCommand::Close,
+};
+const CLOSE_FOOTER: [StreamControl; 1] = [CLOSE_CONTROL];
+const COPY_FOOTER: [StreamControl; 2] = [
+    StreamControl {
+        label: COPY_LABEL,
+        hint: COPY_HINT,
+        command: StreamCommand::Copy,
+    },
+    CLOSE_CONTROL,
+];
+const FOLLOW_UP_FOOTER: [StreamControl; 2] = [
+    StreamControl {
+        label: SEND_LABEL,
+        hint: SEND_HINT,
+        command: StreamCommand::Send,
+    },
+    CLOSE_CONTROL,
+];
 
 /// What a finished side request cost. It reaches the session ledger through
 /// [`StreamModal::take_done`] rather than the agent event channel, because a
@@ -59,30 +83,43 @@ pub enum StreamEvent {
     Error(String),
 }
 
-/// What sits under the answer, and so what the keys do.
+/// What sits under the answer, and so what the keys do. Every footer's
+/// controls answer a click as they answer their key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StreamFooter {
     /// Enter, Space, or Esc dismisses.
     Close,
-    /// `y` or a click on the footer copies the text; Enter, Space, or Esc dismisses.
+    /// `y` copies the text; Enter, Space, or Esc dismisses.
     Copy,
     /// A single-line input takes the keys: Enter sends what was typed as the
-    /// next question in the same thread, Esc closes, an empty Enter closes.
+    /// next question in the same thread, Esc closes, an empty Enter closes. A
+    /// click on `Send` with nothing typed does nothing: a control that says
+    /// send must not dismiss.
     FollowUp,
 }
 
-/// What the pointer did to the modal. `Copy` carries the text the footer
-/// control asked the host to hand to the clipboard.
-pub enum StreamMouse {
-    Ignored,
-    Consumed,
-    Copy(String),
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StreamCommand {
+    Copy,
+    Send,
+    Close,
 }
 
-/// What a key asked of the host. `Copy` carries the text for the clipboard,
-/// `Submit` the follow-up the input held.
-pub enum StreamKey {
-    Handled,
+/// One footer control: the key it names, the words that gloss it, and what it
+/// does. The footer is built from these and a click resolves through them, so
+/// a control's index is never magic.
+struct StreamControl {
+    label: &'static str,
+    hint: &'static str,
+    command: StreamCommand,
+}
+
+/// What a key or the pointer asked of the host. `Copy` carries the text for
+/// the clipboard, `Submit` the follow-up the input held. A key is never
+/// `Ignored`: the modal owns the keyboard while it is up.
+pub enum StreamAction {
+    Ignored,
+    Consumed,
     Copy(String),
     Submit(String),
 }
@@ -120,7 +157,7 @@ pub struct StreamModal {
     input: TextBuffer,
     scroll: ModalScroll,
     scrollbar: Scrollbar,
-    copy_hits: FooterHits,
+    footer_hits: FooterHits,
     rx: Option<flume::Receiver<StreamEvent>>,
     /// Dropping this cancels the in-flight request, so every teardown path that
     /// already funnels through [`StreamModal::close`] cancels for free.
@@ -140,7 +177,7 @@ impl StreamModal {
             input: TextBuffer::new(String::new()),
             scroll: ModalScroll::new(),
             scrollbar: Scrollbar::default(),
-            copy_hits: FooterHits::default(),
+            footer_hits: FooterHits::default(),
             rx: None,
             cancel: None,
             pending_done: None,
@@ -185,7 +222,7 @@ impl StreamModal {
         self.exchanges.clear();
         self.input.clear();
         self.scroll.reset();
-        self.copy_hits.reset();
+        self.footer_hits.reset();
         self.rx = None;
         self.cancel = None;
     }
@@ -266,56 +303,57 @@ impl StreamModal {
         self.scroll.scroll(delta);
     }
 
-    /// The bar and the copy footer are all the modal reads from the pointer.
-    pub fn handle_mouse(&mut self, event: &MouseEvent) -> StreamMouse {
+    /// The bar and the footer controls are all the modal reads from the pointer.
+    pub fn handle_mouse(&mut self, event: &MouseEvent) -> StreamAction {
         match self.scrollbar.handle(event) {
             ScrollbarMouse::Ignored => {}
-            ScrollbarMouse::Consumed => return StreamMouse::Consumed,
+            ScrollbarMouse::Consumed => return StreamAction::Consumed,
             ScrollbarMouse::ScrollTo(top) => {
                 self.scroll.scroll_to(top as u16);
-                return StreamMouse::Consumed;
+                return StreamAction::Consumed;
             }
         }
-        if self.footer != StreamFooter::Copy {
-            return StreamMouse::Ignored;
-        }
-        match self.copy_hits.handle_mouse(*event) {
-            Some(_) => StreamMouse::Copy(self.text().to_owned()),
-            None => StreamMouse::Ignored,
+        let Some(index) = self.footer_hits.handle_mouse(*event) else {
+            return StreamAction::Ignored;
+        };
+        match self.controls()[index].command {
+            StreamCommand::Copy => StreamAction::Copy(self.text().to_owned()),
+            StreamCommand::Send => self
+                .take_question()
+                .map_or(StreamAction::Consumed, StreamAction::Submit),
+            StreamCommand::Close => {
+                self.close();
+                StreamAction::Consumed
+            }
         }
     }
 
-    pub fn handle_key(&mut self, key_event: KeyEvent) -> StreamKey {
+    pub fn handle_key(&mut self, key_event: KeyEvent) -> StreamAction {
         if self.footer == StreamFooter::FollowUp {
             return self.handle_follow_up_key(key_event);
         }
         match key_event.code {
             KeyCode::Esc | KeyCode::Enter | KeyCode::Char(' ') => self.close(),
             KeyCode::Char('y') if self.footer == StreamFooter::Copy => {
-                return StreamKey::Copy(self.text().to_owned());
+                return StreamAction::Copy(self.text().to_owned());
             }
             _ => {
                 self.scroll.handle_key(key_event);
             }
         }
-        StreamKey::Handled
+        StreamAction::Consumed
     }
 
     /// The input owns every key but the four that move the thread: `y` and
-    /// Space are text here. Enter is ignored while an answer is still
-    /// streaming, so a follow-up cannot cancel the answer it is following up.
-    fn handle_follow_up_key(&mut self, key_event: KeyEvent) -> StreamKey {
+    /// Space are text here.
+    fn handle_follow_up_key(&mut self, key_event: KeyEvent) -> StreamAction {
         match key_event.code {
             KeyCode::Esc => self.close(),
-            KeyCode::Enter => {
-                let question = self.input.value().trim().to_owned();
-                if question.is_empty() {
-                    self.close();
-                } else if !self.is_streaming() {
-                    self.input.clear();
-                    return StreamKey::Submit(question);
-                }
-            }
+            KeyCode::Enter => match self.take_question() {
+                Some(question) => return StreamAction::Submit(question),
+                None if self.input.value().trim().is_empty() => self.close(),
+                None => {}
+            },
             KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown => {
                 self.scroll.handle_key(key_event);
             }
@@ -323,7 +361,27 @@ impl StreamModal {
                 self.input.handle_key(key_event);
             }
         }
-        StreamKey::Handled
+        StreamAction::Consumed
+    }
+
+    /// The typed follow-up, cleared from the input once taken. Nothing is
+    /// taken while an answer is still streaming, so a follow-up cannot cancel
+    /// the answer it is following up.
+    fn take_question(&mut self) -> Option<String> {
+        let question = self.input.value().trim().to_owned();
+        if question.is_empty() || self.is_streaming() {
+            return None;
+        }
+        self.input.clear();
+        Some(question)
+    }
+
+    fn controls(&self) -> &'static [StreamControl] {
+        match self.footer {
+            StreamFooter::Close => &CLOSE_FOOTER,
+            StreamFooter::Copy => &COPY_FOOTER,
+            StreamFooter::FollowUp => &FOLLOW_UP_FOOTER,
+        }
     }
 
     /// A paste lands in the input, flattened to the one line it has.
@@ -356,14 +414,12 @@ impl StreamModal {
             lines.push(Line::default());
             lines.extend_from_slice(exchange.body.render_lines(padded_width));
         }
-        let copy_footer = (self.footer == StreamFooter::Copy).then(copy_footer);
-        if let Some(footer) = &copy_footer {
-            lines.push(Line::default());
-            lines.push(footer.line(self.copy_hits.hovered()));
-        }
+        let footer = footer_line(self.controls());
         let input_rows = if self.footer == StreamFooter::FollowUp {
             INPUT_ROWS
         } else {
+            lines.push(Line::default());
+            lines.push(footer.line(self.footer_hits.hovered()));
             0
         };
 
@@ -387,8 +443,8 @@ impl StreamModal {
         };
         self.scroll.update_dimensions(total, viewport.height);
         let scroll = self.scroll.offset();
-        if let Some(footer) = &copy_footer {
-            self.copy_hits.set(footer.hits(viewport, scroll, total));
+        if input_rows == 0 {
+            self.footer_hits.set(footer.hits(viewport, scroll, total));
         }
 
         let paragraph = Paragraph::new(lines)
@@ -407,19 +463,29 @@ impl StreamModal {
         );
 
         if input_rows > 0 {
-            let input_area = Rect {
+            let prompt_row = Rect {
                 y: viewport.y + viewport.height,
-                height: padded.height - viewport.height,
+                height: (padded.height - viewport.height).min(1),
                 ..padded
             };
-            frame.render_widget(Paragraph::new(self.input_lines()), input_area);
+            let hint_row = Rect {
+                y: prompt_row.bottom(),
+                height: padded.bottom().saturating_sub(prompt_row.bottom()),
+                ..padded
+            };
+            frame.render_widget(Paragraph::new(self.input_line()), prompt_row);
+            self.footer_hits.set(footer.hits(hint_row, 0, 1));
+            frame.render_widget(
+                Paragraph::new(footer.line(self.footer_hits.hovered())),
+                hint_row,
+            );
         }
 
         self.popup = popup;
         popup
     }
 
-    fn input_lines(&self) -> Vec<Line<'static>> {
+    fn input_line(&self) -> Line<'static> {
         let theme = theme::current();
         let text = self.input.value();
         let cursor_byte = TextBuffer::char_to_byte(&text, self.input.x());
@@ -428,17 +494,12 @@ impl StreamModal {
         let cursor_char = chars.next().unwrap_or(' ');
         let after = chars.as_str();
         let style = super::input_text_style();
-        let prompt = Line::from(vec![
+        Line::from(vec![
             Span::styled(INPUT_PREFIX, theme.tool_dim),
             Span::styled(before.to_owned(), style),
             Span::styled(cursor_char.to_string(), theme.cursor),
             Span::styled(after.to_owned(), style),
-        ]);
-        let mut hint = FooterLine::default();
-        hint.text(SEND_LABEL, theme.keybind_key);
-        hint.text(SEND_HINT, theme.tool_dim);
-        hint.text(CLOSE_HINT, theme.tool_dim);
-        vec![prompt, hint.line(None)]
+        ])
     }
 
     #[cfg(test)]
@@ -447,8 +508,8 @@ impl StreamModal {
     }
 
     #[cfg(test)]
-    pub(crate) fn footer_hit(&self) -> Rect {
-        self.copy_hits.hit(0)
+    pub(crate) fn footer_hit(&self, index: usize) -> Rect {
+        self.footer_hits.hit(index)
     }
 
     #[cfg(test)]
@@ -462,12 +523,18 @@ impl StreamModal {
     }
 }
 
-fn copy_footer() -> FooterLine {
+/// Each control is one phrase, key and gloss together, so the pointer marks
+/// and presses the whole of what it reads.
+fn footer_line(controls: &[StreamControl]) -> FooterLine {
     let theme = theme::current();
     let mut footer = FooterLine::default();
-    footer.command(COPY_LABEL, theme.keybind_key);
-    footer.text(COPY_HINT, theme.tool_dim);
-    footer.text(CLOSE_HINT, theme.tool_dim);
+    for (index, control) in controls.iter().enumerate() {
+        if index > 0 {
+            footer.text(FOOTER_GAP, theme.tool_dim);
+        }
+        footer.command(control.label, theme.keybind_key);
+        footer.describe(control.hint, theme.tool_dim);
+    }
     footer
 }
 
@@ -490,11 +557,16 @@ mod tests {
     use super::*;
     use crate::components::key as key_ev;
     use caudra_agent::CancelToken;
-    use crossterm::event::{KeyCode, MouseButton, MouseEventKind};
+    use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEventKind};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::style::Modifier;
     use test_case::test_case;
 
+    const COPY: usize = 0;
+    const SEND: usize = 0;
+    const CLOSE: usize = 1;
+    const HOVER_MISSED: &str = "the footer control must reverse under the pointer as one phrase";
     const MODEL: &str = "test-model";
     const PROVIDER: &str = "anthropic";
     const TITLE: &str = " /btw ";
@@ -542,6 +614,41 @@ mod tests {
         for c in text.chars() {
             m.handle_key(key_ev(KeyCode::Char(c)));
         }
+    }
+
+    fn draw(m: &mut StreamModal, terminal: &mut Terminal<TestBackend>) {
+        terminal
+            .draw(|frame| {
+                m.view(frame, frame.area());
+            })
+            .unwrap();
+    }
+
+    fn mouse(kind: MouseEventKind, at: Rect) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: at.x,
+            row: at.y,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn click(m: &mut StreamModal, at: Rect) -> StreamAction {
+        m.handle_mouse(&mouse(MouseEventKind::Down(MouseButton::Left), at));
+        m.handle_mouse(&mouse(MouseEventKind::Up(MouseButton::Left), at))
+    }
+
+    fn reversed_cells(terminal: &Terminal<TestBackend>) -> Vec<Position> {
+        let buffer = terminal.backend().buffer();
+        buffer
+            .area
+            .positions()
+            .filter(|position| {
+                buffer[(position.x, position.y)]
+                    .modifier
+                    .contains(Modifier::REVERSED)
+            })
+            .collect()
     }
 
     #[test]
@@ -658,7 +765,7 @@ mod tests {
     fn dismiss_keys_close(code: KeyCode) {
         let mut m = StreamModal::new(0);
         let (_tx, cancel) = open_modal(&mut m, "q", StreamFooter::Close);
-        assert!(matches!(m.handle_key(key_ev(code)), StreamKey::Handled));
+        assert!(matches!(m.handle_key(key_ev(code)), StreamAction::Consumed));
         assert!(!m.is_open());
         assert!(!m.is_streaming());
         assert!(cancel.is_cancelled(), "dismissing stops the request");
@@ -670,7 +777,7 @@ mod tests {
         let (_tx, _cancel) = open_modal(&mut m, "q", StreamFooter::Close);
         assert!(matches!(
             m.handle_key(key_ev(KeyCode::Char('a'))),
-            StreamKey::Handled
+            StreamAction::Consumed
         ));
         assert!(m.is_open());
     }
@@ -686,7 +793,7 @@ mod tests {
         let _ = m.poll();
 
         let copied = match m.handle_key(key_ev(KeyCode::Char('y'))) {
-            StreamKey::Copy(text) => Some(text),
+            StreamAction::Copy(text) => Some(text),
             _ => None,
         };
 
@@ -695,34 +802,72 @@ mod tests {
     }
 
     #[test]
-    fn the_footer_copy_answers_a_click() {
+    fn the_copy_footer_hovers_and_answers_clicks_as_whole_phrases() {
         let mut m = StreamModal::new(0);
-        let (tx, _cancel) = open_modal(&mut m, "q", StreamFooter::Copy);
+        let (tx, cancel) = open_modal(&mut m, "q", StreamFooter::Copy);
         tx.send(StreamEvent::TextDelta("list".into())).unwrap();
         let _ = m.poll();
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        terminal
-            .draw(|frame| {
-                m.view(frame, frame.area());
-            })
-            .unwrap();
-        let hit = m.footer_hit();
-        assert!(hit.width > 0, "the copy control is drawn");
-        let at = |kind| MouseEvent {
-            kind,
-            column: hit.x,
-            row: hit.y,
-            modifiers: crossterm::event::KeyModifiers::NONE,
-        };
+        draw(&mut m, &mut terminal);
+        let copy = m.footer_hit(COPY);
+        assert_eq!(
+            usize::from(copy.width),
+            COPY_LABEL.len() + COPY_HINT.len(),
+            "the hit spans the key and its gloss"
+        );
 
         assert!(matches!(
-            m.handle_mouse(&at(MouseEventKind::Down(MouseButton::Left))),
-            StreamMouse::Ignored
+            m.handle_mouse(&mouse(MouseEventKind::Moved, copy)),
+            StreamAction::Ignored
         ));
+        draw(&mut m, &mut terminal);
+        let reversed = reversed_cells(&terminal);
+        assert!(
+            reversed.len() == usize::from(copy.width)
+                && reversed.iter().all(|position| copy.contains(*position)),
+            "{HOVER_MISSED}: hit={copy:?} reversed={reversed:?}"
+        );
+
+        assert!(matches!(click(&mut m, copy), StreamAction::Copy(text) if text == "list"));
+        assert!(m.is_open(), "copying leaves the modal up");
+
+        let close = m.footer_hit(CLOSE);
+        assert!(matches!(click(&mut m, close), StreamAction::Consumed));
+        assert!(!m.is_open());
+        assert!(cancel.is_cancelled(), "closing stops the request");
+    }
+
+    #[test]
+    fn the_follow_up_footer_sends_and_closes_by_click() {
+        let mut m = StreamModal::new(0);
+        let (tx, _cancel) = open_modal(&mut m, HEADER, StreamFooter::FollowUp);
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        draw(&mut m, &mut terminal);
+        let send = m.footer_hit(SEND);
+        assert!(send.width > 0, "the send control is drawn");
+
+        assert!(matches!(click(&mut m, send), StreamAction::Consumed));
+        assert!(m.is_open(), "a control that says send never dismisses");
+
+        type_text(&mut m, "and y?");
+        assert!(
+            matches!(click(&mut m, send), StreamAction::Consumed),
+            "a follow-up waits for the answer it follows up"
+        );
+        assert_eq!(m.input_text(), "and y?", "the draft survives the wait");
+
+        tx.send(done()).unwrap();
+        let _ = m.poll();
         assert!(matches!(
-            m.handle_mouse(&at(MouseEventKind::Up(MouseButton::Left))),
-            StreamMouse::Copy(text) if text == "list"
+            click(&mut m, send),
+            StreamAction::Submit(question) if question == "and y?"
         ));
+        assert_eq!(m.input_text(), "", "a sent question leaves the input");
+        assert!(m.is_open());
+
+        let close = m.footer_hit(CLOSE);
+        assert!(matches!(click(&mut m, close), StreamAction::Consumed));
+        assert!(!m.is_open());
     }
 
     #[test]
@@ -802,7 +947,7 @@ mod tests {
         let (tx, _cancel) = open_modal(&mut m, HEADER, StreamFooter::FollowUp);
         type_text(&mut m, "and y? ");
         assert!(
-            matches!(m.handle_key(key_ev(KeyCode::Enter)), StreamKey::Handled),
+            matches!(m.handle_key(key_ev(KeyCode::Enter)), StreamAction::Consumed),
             "a follow-up waits for the answer it follows up"
         );
         assert_eq!(m.input_text(), "and y? ", "the draft survives the wait");
@@ -811,7 +956,7 @@ mod tests {
         let _ = m.poll();
         assert!(matches!(
             m.handle_key(key_ev(KeyCode::Enter)),
-            StreamKey::Submit(question) if question == "and y?"
+            StreamAction::Submit(question) if question == "and y?"
         ));
         assert_eq!(m.input_text(), "", "a sent question leaves the input");
         assert!(m.is_open());
@@ -831,7 +976,7 @@ mod tests {
     fn follow_up_dismissal(code: KeyCode) {
         let mut m = StreamModal::new(0);
         let (_tx, cancel) = open_modal(&mut m, HEADER, StreamFooter::FollowUp);
-        assert!(matches!(m.handle_key(key_ev(code)), StreamKey::Handled));
+        assert!(matches!(m.handle_key(key_ev(code)), StreamAction::Consumed));
         assert!(!m.is_open());
         assert!(cancel.is_cancelled());
     }

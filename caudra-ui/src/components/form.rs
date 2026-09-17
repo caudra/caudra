@@ -32,7 +32,7 @@ pub(crate) fn render_form(
     frame.render_widget(block, area);
 
     let reserved = if footer.is_some() { FOOTER_ROWS } else { 0 };
-    let [body, footer_area] = Layout::vertical([
+    let [body, _] = Layout::vertical([
         Constraint::Min(0),
         Constraint::Length(reserved.min(inner.height)),
     ])
@@ -44,15 +44,26 @@ pub(crate) fn render_form(
         .scroll(scroll);
     frame.render_widget(paragraph, body);
 
-    let line = Rect {
-        y: footer_area.bottom().saturating_sub(1),
-        height: footer_area.height.min(1),
-        ..footer_area
+    let line = if footer.is_some() {
+        footer_row(area)
+    } else {
+        Rect::default()
     };
     if let Some(footer) = footer {
         frame.render_widget(Paragraph::new(footer), line);
     }
     line
+}
+
+/// The row [`render_form`] draws a footer on, known before drawing so a footer
+/// that records its own geometry can be built for the row it will land on.
+pub(crate) fn footer_row(area: Rect) -> Rect {
+    let inner = Block::bordered().inner(area);
+    Rect {
+        y: inner.bottom().saturating_sub(1),
+        height: inner.height.min(1),
+        ..inner
+    }
 }
 
 pub(crate) fn selected_prefix(t: &Theme, is_selected: bool) -> (&'static str, Style) {

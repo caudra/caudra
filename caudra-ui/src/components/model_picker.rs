@@ -4,7 +4,6 @@ use arc_swap::ArcSwapOption;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
-use ratatui::text::{Line, Span};
 
 use caudra_config::ModelPolicy;
 use caudra_providers::dynamic;
@@ -12,10 +11,10 @@ use caudra_providers::model_registry::{self, Binding};
 use caudra_providers::provider::ProviderKind;
 use caudra_providers::{Model, ModelPurpose};
 
-use crate::components::Overlay;
+use crate::components::keybindings::key;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
+use crate::components::{Hint, Overlay};
 use crate::repaint::{Cadence, Dirty, Watch};
-use crate::theme;
 
 const HOME_TITLE: &str = " Models ";
 const JOBS_SECTION: &str = "Jobs";
@@ -35,27 +34,21 @@ const PINNED_BINDING: &str = "pinned";
 const UNAVAILABLE_PREFIX: &str = "Unavailable: ";
 const JOB_KEY_PREFIX: &str = "@job:";
 const PICKER_WIDTH_PERCENT: u16 = 90;
+const UNBIND_LABEL: &str = "R";
 
-fn home_footer_line() -> Line<'static> {
-    let t = theme::current();
-    Line::from(vec![
-        Span::styled("  Enter", t.keybind_key),
-        Span::styled(" select/open", t.tool_dim),
-        Span::styled("  Esc", t.keybind_key),
-        Span::styled(" close", t.tool_dim),
-    ])
+fn home_footer_line() -> Vec<Hint> {
+    vec![
+        Hint::bind(key::ENTER, "select/open"),
+        Hint::bind(key::ESC, "close"),
+    ]
 }
 
-fn assignment_footer_line() -> Line<'static> {
-    let t = theme::current();
-    Line::from(vec![
-        Span::styled("  Enter", t.keybind_key),
-        Span::styled(" assign", t.tool_dim),
-        Span::styled("  R", t.keybind_key),
-        Span::styled(" unbind", t.tool_dim),
-        Span::styled("  Esc", t.keybind_key),
-        Span::styled(" back", t.tool_dim),
-    ])
+fn assignment_footer_line() -> Vec<Hint> {
+    vec![
+        Hint::bind(key::ENTER, "assign"),
+        Hint::char(UNBIND_LABEL, "unbind"),
+        Hint::bind(key::ESC, "back"),
+    ]
 }
 
 fn is_reset_key(key: KeyEvent) -> bool {
@@ -517,6 +510,7 @@ impl ModelPicker {
             },
             PickerAction::Close => ModelPickerAction::Close,
             PickerAction::Toggle(..) => ModelPickerAction::Consumed,
+            PickerAction::Key(key) => self.handle_key_inner(key),
         }
     }
 

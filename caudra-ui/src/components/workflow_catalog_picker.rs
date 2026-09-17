@@ -10,10 +10,10 @@ use caudra_workflow::WorkflowCatalog;
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
-use ratatui::text::Line;
 
+use crate::components::keybindings::key;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
-use crate::components::{Overlay, escape_terminal_controls, hint_line};
+use crate::components::{Hint, Overlay, escape_terminal_controls};
 use crate::repaint::Cadence;
 
 const TITLE: &str = " Workflows ";
@@ -215,6 +215,7 @@ impl WorkflowCatalogPicker {
                 self.close();
                 WorkflowCatalogAction::Close
             }
+            PickerAction::Key(key) => self.handle_key(key),
         }
     }
 
@@ -242,8 +243,11 @@ impl Overlay for WorkflowCatalogPicker {
     }
 }
 
-fn footer() -> Line<'static> {
-    hint_line(&[("Enter", "Launch or trust"), ("Esc", "Close")])
+fn footer() -> Vec<Hint> {
+    vec![
+        Hint::bind(key::ENTER, "Launch or trust"),
+        Hint::bind(key::ESC, "Close"),
+    ]
 }
 
 fn build_rows(catalog: &WorkflowCatalog) -> Vec<CatalogRow> {

@@ -70,7 +70,8 @@ use caudra_agent::{BufferSnapshot, ImageSource, SubagentProgress, ToolInput, Too
 use caudra_providers::model_registry::Binding;
 use caudra_providers::{CaudraId, HistoryItem, ModelPurpose};
 use caudra_storage::sessions::SessionRelocation;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
+use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
@@ -78,6 +79,8 @@ use ratatui::widgets::{Paragraph, Wrap};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::selection::wrap_breaks;
+use keybindings::Bind;
+use modal::FooterHits;
 
 pub(crate) const CHEVRON: &str = "❯ ";
 const DIGIT_GROUP: usize = 3;
@@ -176,29 +179,90 @@ pub(crate) trait Overlay {
 const HINT_GAP: &str = "  ";
 const HINT_KEY_GAP: &str = " ";
 
+/// One entry of a hint bar: what it says, and the key a click on it presses.
+/// The key travels with the label, so a bar can never advertise a control
+/// that does something other than what it says, or nothing at all.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Hint {
+    label: &'static str,
+    description: &'static str,
+    /// `None` is a group hint such as `↑↓ select`: drawn, never hovered,
+    /// never pressed.
+    press: Option<KeyEvent>,
+}
+
+impl Hint {
+    pub(crate) const fn bind(bind: Bind, description: &'static str) -> Self {
+        Self {
+            label: bind.label,
+            description,
+            press: Some(bind.to_key_event()),
+        }
+    }
+
+    pub(crate) const fn key(label: &'static str, code: KeyCode, description: &'static str) -> Self {
+        Self {
+            label,
+            description,
+            press: Some(KeyEvent::new(code, KeyModifiers::NONE)),
+        }
+    }
+
+    /// A single printable glyph that is its own key, like `y` or `/`.
+    pub(crate) const fn char(label: &'static str, description: &'static str) -> Self {
+        Self::key(
+            label,
+            KeyCode::Char(label.as_bytes()[0] as char),
+            description,
+        )
+    }
+
+    pub(crate) const fn inert(label: &'static str, description: &'static str) -> Self {
+        Self {
+            label,
+            description,
+            press: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn label(&self) -> &'static str {
+        self.label
+    }
+
+    #[cfg(test)]
+    pub(crate) fn description(&self) -> &'static str {
+        self.description
+    }
+
+    pub(crate) fn press(&self) -> Option<KeyEvent> {
+        self.press
+    }
+}
+
 /// One hint's spans and the cells they occupy, the gap before it excluded.
 /// Drawing, hit testing and hover all read this, so a hint cannot be styled in
 /// one place and measured in another, and a hit rect cannot drift off the
 /// glyphs it claims to cover.
-fn hint_parts<K: AsRef<str>, V: AsRef<str>>(pairs: &[(K, V)]) -> Vec<(Vec<Span<'static>>, u16)> {
+fn hint_parts(hints: &[Hint]) -> Vec<(Vec<Span<'static>>, u16)> {
     let t = crate::theme::current();
-    pairs
+    hints
         .iter()
-        .map(|(key, desc)| {
+        .map(|hint| {
             let mut spans = Vec::new();
-            for (i, part) in key.as_ref().split('/').enumerate() {
+            for (i, part) in hint.label.split('/').enumerate() {
                 if i > 0 {
                     spans.push(Span::styled("/", t.tool_dim));
                 }
                 spans.push(Span::styled(part.to_string(), t.keybind_key));
             }
             spans.push(Span::styled(
-                format!("{HINT_KEY_GAP}{}", desc.as_ref()),
+                format!("{HINT_KEY_GAP}{}", hint.description),
                 t.tool_dim,
             ));
-            let width = UnicodeWidthStr::width(key.as_ref())
+            let width = UnicodeWidthStr::width(hint.label)
                 + UnicodeWidthStr::width(HINT_KEY_GAP)
-                + UnicodeWidthStr::width(desc.as_ref());
+                + UnicodeWidthStr::width(hint.description);
             (spans, width as u16)
         })
         .collect()
@@ -208,19 +272,16 @@ fn hint_gap_width() -> u16 {
     UnicodeWidthStr::width(HINT_GAP) as u16
 }
 
-pub(crate) fn hint_line<K: AsRef<str>, V: AsRef<str>>(pairs: &[(K, V)]) -> Line<'static> {
-    hint_line_hovered(pairs, None)
+pub(crate) fn hint_line(hints: &[Hint]) -> Line<'static> {
+    hint_line_hovered(hints, None)
 }
 
-/// The hint bar with one pair marked. A hovered hint reverses whole, key and
+/// The hint bar with one hint marked. A hovered hint reverses whole, key and
 /// description together, so the pointer marks the control rather than half of
 /// it. The gap before a hint separates two controls and belongs to neither, so
 /// it is drawn plain however the pointer moves.
-pub(crate) fn hint_line_hovered<K: AsRef<str>, V: AsRef<str>>(
-    pairs: &[(K, V)],
-    hovered: Option<usize>,
-) -> Line<'static> {
-    let spans = hint_parts(pairs)
+pub(crate) fn hint_line_hovered(hints: &[Hint], hovered: Option<usize>) -> Line<'static> {
+    let spans = hint_parts(hints)
         .into_iter()
         .enumerate()
         .flat_map(|(index, (spans, _))| {
@@ -234,15 +295,15 @@ pub(crate) fn hint_line_hovered<K: AsRef<str>, V: AsRef<str>>(
     Line::from(spans)
 }
 
-/// Where each hint pair landed inside `area`, so a click can name the one it
-/// hit. The rect covers the hint's own glyphs and not the gap that precedes
-/// it, so the pointer acts on a control only once it is over one. Pairs that
-/// run past the right edge are dropped rather than clipped: a hint the reader
+/// Where each hint landed inside `area`, so a click can name the one it hit.
+/// The rect covers the hint's own glyphs and not the gap that precedes it, so
+/// the pointer acts on a control only once it is over one. Hints that run
+/// past the right edge are dropped rather than clipped: a hint the reader
 /// cannot fully see is not one they can knowingly press.
-pub(crate) fn hint_hits<K: AsRef<str>, V: AsRef<str>>(pairs: &[(K, V)], area: Rect) -> Vec<Rect> {
+pub(crate) fn hint_hits(hints: &[Hint], area: Rect) -> Vec<Rect> {
     let mut x = area.x;
-    let mut hits = Vec::with_capacity(pairs.len());
-    for (_, width) in hint_parts(pairs) {
+    let mut hits = Vec::with_capacity(hints.len());
+    for (_, width) in hint_parts(hints) {
         x = x.saturating_add(hint_gap_width());
         if x.saturating_add(width) > area.right() {
             break;
@@ -256,6 +317,53 @@ pub(crate) fn hint_hits<K: AsRef<str>, V: AsRef<str>>(pairs: &[(K, V)], area: Re
         x += width;
     }
     hits
+}
+
+/// A hint bar that answers the pointer: the hints it drew, where each landed,
+/// and which one a press is committed to. A click stands in for the key the
+/// hint names, so the bar's owner feeds it to its own key handler and the two
+/// paths can never drift.
+#[derive(Default)]
+pub(crate) struct HintBar {
+    hints: Vec<Hint>,
+    hits: FooterHits,
+}
+
+impl HintBar {
+    /// The bar as it should be drawn in `area`, with the hint under the
+    /// pointer marked. Recording the geometry here is what makes the next
+    /// click land on what was drawn rather than on what was drawn before.
+    pub(crate) fn line(&mut self, area: Rect, hints: Vec<Hint>) -> Line<'static> {
+        self.hints = hints;
+        self.hits.set(hint_hits(&self.hints, area));
+        hint_line_hovered(&self.hints, self.hovered())
+    }
+
+    pub(crate) fn draw(&mut self, frame: &mut Frame, area: Rect, hints: Vec<Hint>) {
+        let line = self.line(area, hints);
+        frame.render_widget(Paragraph::new(line), area);
+    }
+
+    /// The key of the hint a press and release both landed on. A group hint
+    /// yields nothing, however precisely it was clicked.
+    pub(crate) fn handle_mouse(&mut self, event: MouseEvent) -> Option<KeyEvent> {
+        self.hits
+            .handle_mouse(event)
+            .and_then(|index| self.hints.get(index)?.press)
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.hints.clear();
+        self.hits.reset();
+    }
+
+    /// The pressable hint under the pointer. A docked owner asks this to keep
+    /// a press on its bar from falling through to whatever is drawn behind.
+    pub(crate) fn hovered(&self) -> Option<usize> {
+        self.hits
+            .hovered()
+            .filter(|&index| self.hints[index].press.is_some())
+    }
 }
 
 /// The area a modal's horizontal bar is handed: its body plus the border row
@@ -1089,6 +1197,7 @@ pub(crate) fn key(code: crossterm::event::KeyCode) -> crossterm::event::KeyEvent
 
 #[cfg(test)]
 mod tests {
+    use super::keybindings::key;
     use super::*;
     use caudra_agent::{SnapshotLine, SnapshotSpan, SpanStyle};
     use ratatui::style::Modifier;
@@ -1325,13 +1434,17 @@ mod tests {
         );
     }
 
-    const HINTS: [(&str, &str); 2] = [("Enter", "submit"), ("Esc", "close")];
+    const HINTS: [Hint; 2] = [
+        Hint::bind(key::ENTER, "submit"),
+        Hint::bind(key::ESC, "close"),
+    ];
     const HINT_ROW: Rect = Rect::new(4, 9, 40, 1);
+    const GROUP_HINT_ACTED: &str = "a group hint names no key, so a click on it must do nothing";
 
-    /// The cells one hint occupies, gap excluded. Every pair here is ASCII,
+    /// The cells one hint occupies, gap excluded. Every hint here is ASCII,
     /// so a byte is a column.
-    fn control_width((key, desc): (&str, &str)) -> u16 {
-        (key.len() + HINT_KEY_GAP.len() + desc.len()) as u16
+    fn control_width(hint: Hint) -> u16 {
+        (hint.label.len() + HINT_KEY_GAP.len() + hint.description.len()) as u16
     }
 
     /// The gap before a hint separates two controls and belongs to neither, so
@@ -1372,7 +1485,44 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect();
 
-        let description = format!("{HINT_KEY_GAP}{}", HINTS[1].1);
-        assert_eq!(marked, [HINTS[1].0, description.as_str()]);
+        let description = format!("{HINT_KEY_GAP}{}", HINTS[1].description);
+        assert_eq!(marked, [HINTS[1].label, description.as_str()]);
+    }
+
+    fn bar_mouse(kind: crossterm::event::MouseEventKind, at: Rect) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: at.x,
+            row: at.y,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    /// A click on a hint is the key it names, and a group hint is only text:
+    /// it neither marks itself under the pointer nor answers a press.
+    #[test]
+    fn a_hint_bar_click_presses_the_key_and_a_group_hint_is_text() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let mut bar = HintBar::default();
+        let hints = vec![Hint::inert("↑↓", "select"), HINTS[1]];
+        bar.line(HINT_ROW, hints.clone());
+        let [group, close] = [bar.hits.hit(0), bar.hits.hit(1)];
+
+        bar.handle_mouse(bar_mouse(MouseEventKind::Moved, group));
+        assert_eq!(bar.hovered(), None, "{GROUP_HINT_ACTED}");
+        bar.handle_mouse(bar_mouse(MouseEventKind::Down(MouseButton::Left), group));
+        assert_eq!(
+            bar.handle_mouse(bar_mouse(MouseEventKind::Up(MouseButton::Left), group)),
+            None,
+            "{GROUP_HINT_ACTED}"
+        );
+
+        bar.handle_mouse(bar_mouse(MouseEventKind::Moved, close));
+        assert_eq!(bar.hovered(), Some(1));
+        bar.handle_mouse(bar_mouse(MouseEventKind::Down(MouseButton::Left), close));
+        assert_eq!(
+            bar.handle_mouse(bar_mouse(MouseEventKind::Up(MouseButton::Left), close)),
+            Some(key::ESC.to_key_event())
+        );
     }
 }

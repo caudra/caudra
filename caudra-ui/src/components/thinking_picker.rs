@@ -196,7 +196,9 @@ impl ThinkingPicker {
 
     fn map_action(action: PickerAction<ThinkingItem>) -> ThinkingPickerAction {
         match action {
-            PickerAction::Consumed | PickerAction::Toggle(..) => ThinkingPickerAction::Consumed,
+            PickerAction::Consumed | PickerAction::Toggle(..) | PickerAction::Key(_) => {
+                ThinkingPickerAction::Consumed
+            }
             PickerAction::Select(item) => ThinkingPickerAction::Select(item.config),
             PickerAction::Close => ThinkingPickerAction::Closed,
         }

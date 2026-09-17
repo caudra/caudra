@@ -108,7 +108,9 @@ impl MessageActions {
         action: PickerAction<MessageActionKind>,
     ) -> MessageActionsAction {
         match action {
-            PickerAction::Consumed | PickerAction::Toggle(..) => MessageActionsAction::Consumed,
+            PickerAction::Consumed | PickerAction::Toggle(..) | PickerAction::Key(_) => {
+                MessageActionsAction::Consumed
+            }
             PickerAction::Select(kind) => match self.source.take() {
                 Some(source) => MessageActionsAction::Select { source, kind },
                 None => MessageActionsAction::Close,

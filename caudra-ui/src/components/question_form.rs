@@ -15,7 +15,8 @@ use unicode_width::UnicodeWidthStr;
 use caudra_agent::types::AskedQuestion;
 
 use super::form::render_form;
-use super::{Overlay, VisualRows, hanging_lines, visual_rows};
+use super::keybindings::{Bind, key};
+use super::{Hint, Overlay, VisualRows, hanging_lines, visual_rows};
 use crate::repaint::Cadence;
 use crate::text_buffer::TextBuffer;
 use crate::theme;
@@ -37,15 +38,36 @@ const CUSTOM_PROMPT: &str = "  ❯ ";
 const CHROME_ROWS: u16 = 4;
 const MAX_HEIGHT_PERCENT: u16 = 75;
 
-/// Hint labels, shared by the bar the form draws and the key a click on one
-/// stands in for. One table, so a clicked hint can never do something other
-/// than what it says.
-const HINT_ENTER: &str = "Enter";
-const HINT_SHIFT_ENTER: &str = "Shift+Enter";
-const HINT_TAB: &str = "Tab";
-const HINT_SHIFT_TAB: &str = "Shift+Tab";
-const HINT_ESC: &str = "Esc";
-const HINT_CTRL_C: &str = "Ctrl+C";
+const SHIFT_ENTER: Bind = Bind {
+    code: KeyCode::Enter,
+    modifiers: KeyModifiers::SHIFT,
+    label: "Shift+Enter",
+};
+
+const EDITING_HINTS: [Hint; 4] = [
+    Hint::bind(key::ENTER, "submit"),
+    Hint::bind(SHIFT_ENTER, "newline"),
+    Hint::bind(key::ESC, "back"),
+    Hint::bind(key::QUIT, "cancel"),
+];
+const CONFIRMING_HINTS: [Hint; 4] = [
+    Hint::bind(key::ENTER, "submit"),
+    Hint::bind(key::SHIFT_TAB, "back"),
+    Hint::bind(key::ESC, "dismiss"),
+    Hint::bind(key::QUIT, "cancel"),
+];
+const MULTI_SELECT_HINTS: [Hint; 4] = [
+    Hint::bind(key::ENTER, "toggle"),
+    Hint::bind(key::TAB, "next"),
+    Hint::bind(key::ESC, "dismiss"),
+    Hint::bind(key::QUIT, "cancel"),
+];
+const SINGLE_SELECT_HINTS: [Hint; 4] = [
+    Hint::bind(key::ENTER, "submit"),
+    Hint::bind(key::TAB, "next"),
+    Hint::bind(key::ESC, "dismiss"),
+    Hint::bind(key::QUIT, "cancel"),
+];
 
 pub enum QuestionFormAction {
     Consumed,
@@ -442,11 +464,7 @@ impl QuestionForm {
     /// A hint stands in for the key it advertises, so the two can never come
     /// to mean different things.
     fn activate_hint(&mut self, index: usize) -> QuestionFormAction {
-        let Some(key) = self
-            .hint_pairs()
-            .get(index)
-            .and_then(|(label, _)| hint_key(label))
-        else {
+        let Some(key) = self.hint_pairs().get(index).and_then(Hint::press) else {
             return QuestionFormAction::Consumed;
         };
         self.handle_key(key)
@@ -643,32 +661,12 @@ impl QuestionForm {
 
     /// The hint bar's contents, which a click on one of them turns back into
     /// the key it names.
-    fn hint_pairs(&self) -> &'static [(&'static str, &'static str)] {
+    fn hint_pairs(&self) -> &'static [Hint] {
         match self.mode {
-            Mode::EditingCustom => &[
-                (HINT_ENTER, "submit"),
-                (HINT_SHIFT_ENTER, "newline"),
-                (HINT_ESC, "back"),
-                (HINT_CTRL_C, "cancel"),
-            ],
-            Mode::Confirming => &[
-                (HINT_ENTER, "submit"),
-                (HINT_SHIFT_TAB, "back"),
-                (HINT_ESC, "dismiss"),
-                (HINT_CTRL_C, "cancel"),
-            ],
-            Mode::Selecting if self.is_multi() => &[
-                (HINT_ENTER, "toggle"),
-                (HINT_TAB, "next"),
-                (HINT_ESC, "dismiss"),
-                (HINT_CTRL_C, "cancel"),
-            ],
-            Mode::Selecting => &[
-                (HINT_ENTER, "submit"),
-                (HINT_TAB, "next"),
-                (HINT_ESC, "dismiss"),
-                (HINT_CTRL_C, "cancel"),
-            ],
+            Mode::EditingCustom => &EDITING_HINTS,
+            Mode::Confirming => &CONFIRMING_HINTS,
+            Mode::Selecting if self.is_multi() => &MULTI_SELECT_HINTS,
+            Mode::Selecting => &SINGLE_SELECT_HINTS,
         }
     }
 
@@ -927,21 +925,6 @@ fn caret_spans(line: &str, caret: usize) -> [Span<'static>; 3] {
         Span::styled(under.to_string(), Style::new().reversed()),
         Span::raw(rest.collect::<String>()),
     ]
-}
-
-/// The key a hint label names. Every label `hint_pairs` offers has to resolve
-/// here, or the form draws a control that does nothing when pressed.
-fn hint_key(label: &str) -> Option<KeyEvent> {
-    let (code, modifiers) = match label {
-        HINT_ENTER => (KeyCode::Enter, KeyModifiers::NONE),
-        HINT_SHIFT_ENTER => (KeyCode::Enter, KeyModifiers::SHIFT),
-        HINT_TAB => (KeyCode::Tab, KeyModifiers::NONE),
-        HINT_SHIFT_TAB => (KeyCode::BackTab, KeyModifiers::SHIFT),
-        HINT_ESC => (KeyCode::Esc, KeyModifiers::NONE),
-        HINT_CTRL_C => (KeyCode::Char('c'), KeyModifiers::CONTROL),
-        _ => return None,
-    };
-    Some(KeyEvent::new(code, modifiers))
 }
 
 fn tab_label(index: usize, question: &AskedQuestion) -> String {
@@ -1750,10 +1733,10 @@ mod tests {
         );
     }
 
-    fn hint_index(form: &QuestionForm, label: &str) -> usize {
+    fn hint_index(form: &QuestionForm, bind: Bind) -> usize {
         form.hint_pairs()
             .iter()
-            .position(|(name, _)| *name == label)
+            .position(|hint| hint.label() == bind.label)
             .expect("the bar offers the hint")
     }
 
@@ -1761,7 +1744,7 @@ mod tests {
     fn the_dismiss_hint_dismisses() {
         let mut form = opened(vec![question(HEADER, false)]);
         render(&mut form);
-        let index = hint_index(&form, HINT_ESC);
+        let index = hint_index(&form, key::ESC);
         let action = click_target(&mut form, FormTarget::Hint(index));
         assert!(matches!(action, QuestionFormAction::Dismiss));
     }
@@ -1770,7 +1753,7 @@ mod tests {
     fn the_cancel_hint_cancels() {
         let mut form = opened(vec![question(HEADER, false)]);
         render(&mut form);
-        let index = hint_index(&form, HINT_CTRL_C);
+        let index = hint_index(&form, key::QUIT);
         let action = click_target(&mut form, FormTarget::Hint(index));
         assert!(matches!(action, QuestionFormAction::Cancel));
     }
@@ -1783,11 +1766,9 @@ mod tests {
         for mode in [Mode::Selecting, Mode::EditingCustom, Mode::Confirming] {
             form.mode = mode;
             render(&mut form);
-            for (index, (label, _)) in form.hint_pairs().iter().enumerate() {
-                assert!(
-                    hint_key(label).is_some(),
-                    "{label:?} in {mode:?} names no key"
-                );
+            for (index, hint) in form.hint_pairs().iter().enumerate() {
+                let label = hint.label();
+                assert!(hint.press().is_some(), "{label:?} in {mode:?} names no key");
                 let drawn = form
                     .row_hits
                     .iter()

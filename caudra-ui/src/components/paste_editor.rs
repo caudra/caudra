@@ -4,9 +4,10 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use super::Overlay;
+use super::keybindings::key;
 use super::modal::Modal;
 use super::text_editor::{EditorKey, EditorMouse, TextEditor};
+use super::{Hint, HintBar, Overlay};
 use crate::input_document::{PasteId, paste_summary_label};
 use crate::theme;
 
@@ -42,6 +43,7 @@ pub(crate) struct PasteEditor {
     target: Option<PasteEditorTarget>,
     id: Option<PasteId>,
     editor: TextEditor,
+    hints: HintBar,
 }
 
 impl PasteEditor {
@@ -50,6 +52,7 @@ impl PasteEditor {
             target: None,
             id: None,
             editor: TextEditor::new(),
+            hints: HintBar::default(),
         }
     }
 
@@ -93,6 +96,9 @@ impl PasteEditor {
         if self.id.is_none() {
             return PasteEditorAction::Passthrough;
         }
+        if let Some(key) = self.hints.handle_mouse(*event) {
+            return self.handle_key(key);
+        }
         match self.editor.handle_mouse(event) {
             EditorMouse::Consumed => PasteEditorAction::Consumed,
             EditorMouse::Copy(text) => PasteEditorAction::Copy(text),
@@ -130,7 +136,16 @@ impl PasteEditor {
 
         self.render_meta(frame, meta_area);
         self.editor.view(frame, editor_area);
-        self.render_hint(frame, hint_area);
+        self.hints.draw(
+            frame,
+            hint_area,
+            vec![
+                Hint::bind(key::SAVE, "save"),
+                Hint::bind(key::SELECT_ALL, "select all"),
+                Hint::bind(key::UNDO, "undo"),
+                Hint::bind(key::ESC, "cancel"),
+            ],
+        );
         popup
     }
 
@@ -148,18 +163,6 @@ impl PasteEditor {
         ]);
         frame.render_widget(Paragraph::new(line), area);
     }
-
-    fn render_hint(&self, frame: &mut Frame, area: Rect) {
-        frame.render_widget(
-            Paragraph::new(super::hint_line(&[
-                ("Ctrl+S", "save"),
-                ("Ctrl+A", "select all"),
-                ("Ctrl+Z", "undo"),
-                ("Esc", "cancel"),
-            ])),
-            area,
-        );
-    }
 }
 
 impl Overlay for PasteEditor {
@@ -171,6 +174,7 @@ impl Overlay for PasteEditor {
         self.target = None;
         self.id = None;
         self.editor = TextEditor::new();
+        self.hints.reset();
     }
 }
 

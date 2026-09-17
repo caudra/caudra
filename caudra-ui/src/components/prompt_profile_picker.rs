@@ -97,7 +97,7 @@ impl PromptProfilePicker {
 
     fn map_action(action: PickerAction<ProfileItem>) -> PromptProfilePickerAction {
         match action {
-            PickerAction::Consumed | PickerAction::Toggle(..) => {
+            PickerAction::Consumed | PickerAction::Toggle(..) | PickerAction::Key(_) => {
                 PromptProfilePickerAction::Consumed
             }
             PickerAction::Select(item) => PromptProfilePickerAction::Select(item.name),

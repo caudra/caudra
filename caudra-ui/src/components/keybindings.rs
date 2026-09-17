@@ -133,11 +133,20 @@ pub struct Bind {
 }
 
 impl Bind {
+    /// A workbench chord in this module's own type, so the app can match it
+    /// with the `key::` it already imports and a hint bar can quote it.
+    pub const fn from_workbench(bind: wb::Bind) -> Self {
+        Self {
+            code: bind.code,
+            modifiers: bind.modifiers,
+            label: bind.label,
+        }
+    }
+
     pub fn matches(&self, key: KeyEvent) -> bool {
         key.code == self.code && key.modifiers == self.modifiers
     }
 
-    #[cfg(test)]
     pub const fn to_key_event(self) -> KeyEvent {
         KeyEvent {
             code: self.code,
@@ -183,6 +192,35 @@ pub mod key {
     pub const SCROLL_LINE_DOWN: Bind = ctrl_bind!('e');
     pub const SCROLL_TOP: Bind = ctrl_bind!('g');
     pub const SCROLL_BOTTOM: Bind = ctrl_bind!('b');
+
+    /// The plain keys every overlay's hint bar names. They carry no chord of
+    /// their own; they exist so a hint can quote the same spelling a click
+    /// resolves.
+    pub const ENTER: Bind = Bind {
+        code: KeyCode::Enter,
+        modifiers: KeyModifiers::NONE,
+        label: "Enter",
+    };
+    pub const ESC: Bind = Bind {
+        code: KeyCode::Esc,
+        modifiers: KeyModifiers::NONE,
+        label: "Esc",
+    };
+    pub const TAB: Bind = Bind {
+        code: KeyCode::Tab,
+        modifiers: KeyModifiers::NONE,
+        label: "Tab",
+    };
+    pub const SHIFT_TAB: Bind = Bind {
+        code: KeyCode::BackTab,
+        modifiers: KeyModifiers::SHIFT,
+        label: super::SHIFT_TAB_LABEL,
+    };
+    pub const SPACE: Bind = Bind {
+        code: KeyCode::Char(' '),
+        modifiers: KeyModifiers::NONE,
+        label: "Space",
+    };
 
     /// The four keys whose target is whatever holds the keyboard: the composer
     /// while it is being typed in, the transcript once it has taken focus, and
@@ -240,13 +278,12 @@ pub mod key {
     pub const DELETE: Bind = ctrl_bind!('d');
     pub const KILL_LINE: Bind = ctrl_bind!('k');
     pub const LINE_END: Bind = ctrl_bind!('e');
-    /// The composer cuts on the workbench's chord, restated in this module's
-    /// own `Bind` so the app can match it with the `key::` it already imports.
-    pub const CUT: Bind = Bind {
-        code: wb::CUT.code,
-        modifiers: wb::CUT.modifiers,
-        label: wb::CUT.label,
-    };
+    /// The editor chords the composer, the paste editor and the review note
+    /// share with the workbench.
+    pub const CUT: Bind = Bind::from_workbench(wb::CUT);
+    pub const SAVE: Bind = Bind::from_workbench(wb::SAVE);
+    pub const SELECT_ALL: Bind = Bind::from_workbench(wb::SELECT_ALL);
+    pub const UNDO: Bind = Bind::from_workbench(wb::UNDO);
 }
 
 /// Second keys of the `Ctrl+X` chords. They are a namespace of their own:

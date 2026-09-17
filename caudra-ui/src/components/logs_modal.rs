@@ -24,8 +24,8 @@ use crate::components::keybindings::key;
 use crate::components::modal::Modal;
 use crate::components::scrollbar::{Scrollbar, ScrollbarMouse};
 use crate::components::{
-    Overlay, bar_area, escape_terminal_controls, hint_line, hover_style, input_line_with_cursor,
-    is_ctrl,
+    Hint, HintBar, Overlay, bar_area, escape_terminal_controls, hover_style,
+    input_line_with_cursor, is_ctrl,
 };
 use crate::repaint::{Cadence, Dirty};
 use crate::selection::wrap_breaks;
@@ -72,30 +72,22 @@ const FOCUS_FIELDS: &[&str] = &["tool_use_id", "request_id", "session_id"];
 /// The search row and the hint row, which are always drawn. The status row is
 /// part of the footer that reports the file.
 const CHROME_ROWS: u16 = 2;
-const HINT_KEY_MOVE: &str = "\u{2191}\u{2193}";
 const HINT_KEY_ENTER: &str = "enter";
 const HINT_KEY_ESC: &str = "esc";
-const HINT_MOVE: &str = "select";
-const HINT_EXPAND: &str = "expand";
-const HINT_FOCUS: &str = "only this id";
-const HINT_FILTER: &str = "filter";
-const HINT_LEVEL: &str = "level";
-const HINT_COPY: &str = "copy / raw";
-const HINT_CLOSE: &str = "close";
-const HINT_APPLY: &str = "done";
-const HINT_CLEAR: &str = "clear";
-const HINT_KEY_PAN: &str = "\u{2190}\u{2192}";
-const HINT_KEY_FOCUS: &str = "tab";
-const HINT_KEY_FILTER: &str = "/";
-const HINT_PAN: &str = "pan";
-const HINT_WRAP: &str = "wrap";
-const HINT_COLLAPSE: &str = "collapse";
-const HINT_MOVE_KEYS: (&str, &str) = (HINT_KEY_MOVE, HINT_MOVE);
-const HINT_TAIL: [(&str, &str); 4] = [
-    ("l", HINT_LEVEL),
-    ("w", HINT_WRAP),
-    ("y/Y", HINT_COPY),
-    (HINT_KEY_ESC, HINT_CLOSE),
+const HINT_MOVE: Hint = Hint::inert("\u{2191}\u{2193}", "select");
+const HINT_PAN: Hint = Hint::inert("\u{2190}\u{2192}", "pan");
+const HINT_EXPAND: Hint = Hint::key(HINT_KEY_ENTER, KeyCode::Enter, "expand");
+const HINT_COLLAPSE: Hint = Hint::key(HINT_KEY_ENTER, KeyCode::Enter, "collapse");
+const HINT_FOCUS: Hint = Hint::key("tab", KeyCode::Tab, "only this id");
+const HINT_FILTER: Hint = Hint::char("/", "filter");
+const HINT_APPLY: Hint = Hint::key(HINT_KEY_ENTER, KeyCode::Enter, "done");
+const HINT_CLEAR: Hint = Hint::key(HINT_KEY_ESC, KeyCode::Esc, "clear");
+/// `y/Y` names two keys; a click takes the first, the copy as shown.
+const HINT_TAIL: [Hint; 4] = [
+    Hint::char("l", "level"),
+    Hint::char("w", "wrap"),
+    Hint::char("y/Y", "copy / raw"),
+    Hint::key(HINT_KEY_ESC, KeyCode::Esc, "close"),
 ];
 
 const NO_FOCUS: &str = "That record carries no id to filter on";
@@ -139,6 +131,7 @@ pub struct LogsModal {
     /// it up. Recomputed each frame because the footer reflows with the path.
     level_hit: Rect,
     level_hovered: bool,
+    hints: HintBar,
     scrollbar: Scrollbar,
     pan_bar: Scrollbar,
 }
@@ -167,6 +160,7 @@ impl LogsModal {
             rows: Vec::new(),
             level_hit: Rect::default(),
             level_hovered: false,
+            hints: HintBar::default(),
             scrollbar: Scrollbar::default(),
             pan_bar: Scrollbar::horizontal(),
         }
@@ -208,6 +202,7 @@ impl LogsModal {
         self.rows = Vec::new();
         self.level_hit = Rect::default();
         self.level_hovered = false;
+        self.hints.reset();
     }
 
     pub fn is_open(&self) -> bool {
@@ -522,6 +517,9 @@ impl LogsModal {
                 return LogsAction::Consumed;
             }
         }
+        if let Some(key) = self.hints.handle_mouse(event) {
+            return self.handle_key(key);
+        }
         let pos = Position::new(event.column, event.row);
         // Under touch the bar's hit margin reaches up off its border row and over
         // the footer, so the level chip is asked first for the cells it drew on.
@@ -609,7 +607,8 @@ impl LogsModal {
                 next_row(),
             );
         }
-        frame.render_widget(Paragraph::new(hint_line(&self.hints())), next_row());
+        let hints = self.hints();
+        self.hints.draw(frame, next_row(), hints);
         let footer = next_row();
         let (line, level) = self.footer_line(theme);
         self.level_hit = hit_rect(footer, level);
@@ -773,25 +772,22 @@ impl LogsModal {
     /// The actions a reader can reach from here. Without this row the only way
     /// to learn that a record expands or that a turn can be isolated is to open
     /// the keybinding reference.
-    fn hints(&self) -> Vec<(&'static str, &'static str)> {
+    fn hints(&self) -> Vec<Hint> {
         if self.query_focused {
-            return vec![(HINT_KEY_ENTER, HINT_APPLY), (HINT_KEY_ESC, HINT_CLEAR)];
+            return vec![HINT_APPLY, HINT_CLEAR];
         }
-        let mut out = vec![HINT_MOVE_KEYS];
+        let mut out = vec![HINT_MOVE];
         // Panning is offered only where it can do something, so a wrapped or a
         // narrow pane does not advertise a key that would be ignored.
         if self.max_pan > 0 && !self.wrap {
-            out.push((HINT_KEY_PAN, HINT_PAN));
+            out.push(HINT_PAN);
         }
-        out.push((
-            HINT_KEY_ENTER,
-            match self.expanded {
-                true => HINT_COLLAPSE,
-                false => HINT_EXPAND,
-            },
-        ));
-        out.push((HINT_KEY_FOCUS, HINT_FOCUS));
-        out.push((HINT_KEY_FILTER, HINT_FILTER));
+        out.push(match self.expanded {
+            true => HINT_COLLAPSE,
+            false => HINT_EXPAND,
+        });
+        out.push(HINT_FOCUS);
+        out.push(HINT_FILTER);
         out.extend(HINT_TAIL);
         out
     }
@@ -1504,7 +1500,8 @@ mod tests {
         let mut modal = seeded_modal(tmp.path());
         let out = drawn(&mut modal);
 
-        for (_, action) in modal.hints() {
+        for hint in modal.hints() {
+            let action = hint.description();
             assert!(out.contains(action), "{action} missing from {out}");
         }
     }
@@ -1513,10 +1510,10 @@ mod tests {
     fn the_hint_row_follows_what_the_key_will_do_next() {
         let tmp = tempfile::tempdir().unwrap();
         let mut modal = seeded_modal(tmp.path());
-        assert!(drawn(&mut modal).contains(HINT_EXPAND));
+        assert!(drawn(&mut modal).contains(HINT_EXPAND.description()));
 
         modal.handle_key(key(KeyCode::Enter));
-        assert!(drawn(&mut modal).contains(HINT_COLLAPSE));
+        assert!(drawn(&mut modal).contains(HINT_COLLAPSE.description()));
     }
 
     #[test]
@@ -1524,15 +1521,15 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut modal = seeded_modal(tmp.path());
         let before = drawn(&mut modal);
-        assert!(!before.contains(HINT_APPLY));
+        assert!(!before.contains(HINT_APPLY.description()));
 
         modal.handle_key(key(KeyCode::Char('/')));
         modal.handle_key(key(KeyCode::Char('l')));
         modal.handle_key(key(KeyCode::Char('n')));
         let out = drawn(&mut modal);
 
-        assert!(out.contains(HINT_APPLY), "{NOT_DRAWN}: {out}");
-        assert!(out.contains(HINT_CLEAR), "{NOT_DRAWN}: {out}");
+        assert!(out.contains(HINT_APPLY.description()), "{NOT_DRAWN}: {out}");
+        assert!(out.contains(HINT_CLEAR.description()), "{NOT_DRAWN}: {out}");
         assert!(out.contains("ln"), "typed text never appeared: {out}");
     }
 

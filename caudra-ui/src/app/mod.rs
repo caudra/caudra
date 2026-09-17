@@ -74,7 +74,7 @@ use crate::components::skills_modal::SkillsModal;
 use crate::components::stash_picker::StashPicker;
 use crate::components::status_bar::{StatusBar, StatusBarHit, StatusBarHitTarget};
 use crate::components::storage_modal::{StorageFetchState, StorageModal};
-use crate::components::stream_modal::{StreamKey, StreamModal};
+use crate::components::stream_modal::{StreamAction, StreamModal};
 use crate::components::task_picker::TaskPicker;
 use crate::components::theme_picker::{ThemePicker, ThemePickerAction};
 use crate::components::thinking_picker::{ThinkingPicker, ThinkingPickerAction};
@@ -1812,9 +1812,9 @@ impl App {
         if self.stream_modal.is_open() {
             guard_repeat!(false);
             match self.stream_modal.handle_key(key) {
-                StreamKey::Handled => {}
-                StreamKey::Copy(text) => self.copy_to_clipboard(&text),
-                StreamKey::Submit(question) => self.continue_btw(question),
+                StreamAction::Ignored | StreamAction::Consumed => {}
+                StreamAction::Copy(text) => self.copy_to_clipboard(&text),
+                StreamAction::Submit(question) => self.continue_btw(question),
             }
             return Some(vec![]);
         }

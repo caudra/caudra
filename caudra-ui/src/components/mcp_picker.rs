@@ -1,15 +1,15 @@
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
-use ratatui::text::Line;
 
 use caudra_agent::mcp::config::McpConfigSource;
 use caudra_agent::{
     McpConfigErrors, McpServerInfo, McpServerStatus, McpSnapshot, McpSnapshotReader,
 };
 
+use crate::components::keybindings::key;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
-use crate::components::{Overlay, escape_terminal_controls, hint_line};
+use crate::components::{Hint, Overlay, escape_terminal_controls};
 use crate::repaint::{Cadence, Dirty, Watch};
 
 const TITLE: &str = " MCP Servers ";
@@ -231,6 +231,9 @@ impl McpPicker {
             return McpPickerAction::Consumed;
         }
         let action = self.picker.handle_mouse(event);
+        if let PickerAction::Key(key) = action {
+            return self.handle_key(key);
+        }
         self.sync_review();
         self.map_picker_action(action)
     }
@@ -264,6 +267,7 @@ impl McpPicker {
                 }
             }
             PickerAction::Select(..) | PickerAction::Close => McpPickerAction::Close,
+            PickerAction::Key(_) => McpPickerAction::Consumed,
         }
     }
 
@@ -293,14 +297,14 @@ impl McpPicker {
     }
 }
 
-fn footer() -> Line<'static> {
-    hint_line(&[
-        ("o", "Trust for process"),
-        ("p", "Trust exact config for project"),
-        ("r", "Reject and disable"),
-        ("Enter", "Toggle other rows"),
-        ("Esc", "Close"),
-    ])
+fn footer() -> Vec<Hint> {
+    vec![
+        Hint::char("o", "Trust for process"),
+        Hint::char("p", "Trust exact config for project"),
+        Hint::char("r", "Reject and disable"),
+        Hint::bind(key::ENTER, "Toggle other rows"),
+        Hint::bind(key::ESC, "Close"),
+    ]
 }
 
 fn review_text(info: &McpServerInfo) -> String {

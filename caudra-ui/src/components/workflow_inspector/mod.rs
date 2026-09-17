@@ -1895,7 +1895,7 @@ impl WorkflowInspector {
                 false => t.tool_dim,
             };
             footer.command(key, key_style);
-            footer.text(format!(" {description}"), t.tool_dim);
+            footer.describe(format!(" {description}"), t.tool_dim);
         }
         footer
     }
@@ -2217,6 +2217,7 @@ mod tests {
     const ROW_MARKS_THE_POINTER: &str = "a run row marks itself while the pointer is on it";
     const ROW_RELEASES_THE_POINTER: &str = "a run row drops its mark when the pointer leaves";
     const HOVER_IS_NOT_A_CLICK: &str = "hovering must not act, only mark";
+    const HOVER_MARKS_THE_PHRASE: &str = "a footer control reverses whole under the pointer";
     const TAB_MARKS_THE_POINTER: &str = "a section tab marks itself while the pointer is on it";
     const CLICK_STILL_SWITCHES: &str = "pressing a tab still switches to it";
     const ONE_CLICK_OPENS: &str = "a click opens the row the pointer already put the cursor on";
@@ -2463,6 +2464,56 @@ mod tests {
         draw(&mut inspector, &mut terminal);
 
         assert!(!reversed_at(&terminal, row), "{ROW_RELEASES_THE_POINTER}");
+    }
+
+    #[test]
+    fn a_footer_control_hovers_as_one_phrase_and_answers_a_click() {
+        const CLOSE: usize = FOOTER.len() - 1;
+        // Wide enough for every control: a footer that wraps offers no hits.
+        const WIDE: u16 = 160;
+        let mut terminal = Terminal::new(TestBackend::new(WIDE, FRAME_HEIGHT)).unwrap();
+        let mut inspector = open_with(vec![run(RUN_ID, RunStatus::Active, Vec::new())]);
+        draw(&mut inspector, &mut terminal);
+        let hit = inspector.footer_hits.hit(CLOSE);
+        let (label, description, _) = FOOTER[CLOSE];
+        assert_eq!(
+            usize::from(hit.width),
+            label.len() + " ".len() + description.len(),
+            "the hit spans the key and its gloss"
+        );
+
+        let _ = inspector.handle_mouse(mouse_at(MouseEventKind::Moved, hit.x, hit.y));
+        draw(&mut inspector, &mut terminal);
+        let buffer = terminal.backend().buffer();
+        let reversed = buffer
+            .area
+            .positions()
+            .filter(|position| {
+                buffer[(position.x, position.y)]
+                    .style()
+                    .add_modifier
+                    .contains(Modifier::REVERSED)
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            reversed.len() == usize::from(hit.width)
+                && reversed.iter().all(|position| hit.contains(*position)),
+            "{HOVER_MARKS_THE_PHRASE}: hit={hit:?} reversed={reversed:?}"
+        );
+
+        let _ = inspector.handle_mouse(mouse_at(
+            MouseEventKind::Down(MouseButton::Left),
+            hit.x,
+            hit.y,
+        ));
+        assert_eq!(
+            inspector.handle_mouse(mouse_at(
+                MouseEventKind::Up(MouseButton::Left),
+                hit.x,
+                hit.y
+            )),
+            InspectorAction::Close
+        );
     }
 
     #[test]

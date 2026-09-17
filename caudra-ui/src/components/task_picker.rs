@@ -7,11 +7,11 @@
 use crossterm::event::{KeyEvent, MouseEvent};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
-use ratatui::text::Line;
 
 use crate::app::tasks::{TaskInfo, TaskStatus};
+use crate::components::keybindings::key;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
-use crate::components::{Overlay, hint_line};
+use crate::components::{Hint, Overlay};
 use crate::repaint::Cadence;
 
 const TITLE: &str = " Tasks ";
@@ -185,6 +185,7 @@ impl TaskPicker {
                 self.close();
                 TaskPickerAction::Closed(origin)
             }
+            PickerAction::Key(key) => self.handle_key(key),
         }
     }
 }
@@ -203,8 +204,11 @@ impl Overlay for TaskPicker {
     }
 }
 
-fn footer() -> Line<'static> {
-    hint_line(&[("Enter", "open"), ("Esc", "cancel")])
+fn footer() -> Vec<Hint> {
+    vec![
+        Hint::bind(key::ENTER, "open"),
+        Hint::bind(key::ESC, "cancel"),
+    ]
 }
 
 /// The main chat comes first and has no status. The subagents follow, running

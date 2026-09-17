@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::ops::Range;
 
 use crate::components::hover_style;
 use crate::theme;
@@ -12,6 +13,11 @@ use ratatui::widgets::{Block, BorderType, Clear};
 
 pub const CHROME_LINES: u16 = 2;
 const FOOTER_HIT_ROWS: u16 = 1;
+/// The close control every modal footer ends with, spelled once so the label a
+/// click resolves and the glyphs it reverses cannot drift apart.
+pub(crate) const ESC_LABEL: &str = "Esc";
+pub(crate) const CLOSE_HINT: &str = " close";
+pub(crate) const SEPARATOR: &str = " · ";
 /// The narrowest a modal may be drawn, clamped to the terminal so the popup can
 /// only ever grow towards the edge and never past it. A percentage alone spends
 /// a small screen's columns on margin and then cuts the content it was making
@@ -77,24 +83,37 @@ impl Modal<'_> {
 #[derive(Default)]
 pub(crate) struct FooterLine {
     spans: Vec<Span<'static>>,
-    targets: Vec<usize>,
+    targets: Vec<Range<usize>>,
 }
 
 impl FooterLine {
     /// A clickable token. Its index among the targets is what a click reports.
     pub(crate) fn command(&mut self, text: &'static str, style: Style) {
-        self.targets.push(self.spans.len());
+        let index = self.spans.len();
+        self.targets.push(index..index + 1);
         self.spans.push(Span::styled(text, style));
     }
 
-    /// Inert text: a description, a separator, a key hint. Never hit, never
-    /// hovered, even when it sits inside a control's phrase.
+    /// The words that gloss the command just before it. They join its target,
+    /// so the pointer marks the whole phrase rather than the key alone. After a
+    /// separator, or with no command to gloss, the text is inert like [`text`].
+    ///
+    /// [`text`]: Self::text
+    pub(crate) fn describe(&mut self, text: impl Into<Cow<'static, str>>, style: Style) {
+        let index = self.spans.len();
+        if let Some(target) = self.targets.last_mut().filter(|target| target.end == index) {
+            target.end = index + 1;
+        }
+        self.spans.push(Span::styled(text, style));
+    }
+
+    /// Inert text: a separator, a group hint. Never hit, never hovered.
     pub(crate) fn text(&mut self, text: impl Into<Cow<'static, str>>, style: Style) {
         self.spans.push(Span::styled(text, style));
     }
 
     pub(crate) fn line(&self, hovered: Option<usize>) -> Line<'static> {
-        let on = hovered.and_then(|index| self.targets.get(index)).copied();
+        let on = hovered.and_then(|index| self.targets.get(index));
         Line::from(
             self.spans
                 .iter()
@@ -102,7 +121,7 @@ impl FooterLine {
                 .map(|(index, span)| {
                     Span::styled(
                         span.content.clone(),
-                        hover_style(span.style, on == Some(index)),
+                        hover_style(span.style, on.is_some_and(|on| on.contains(&index))),
                     )
                 })
                 .collect::<Vec<_>>(),
@@ -135,12 +154,12 @@ impl FooterLine {
         let y = area.y.saturating_add(row);
         self.targets
             .iter()
-            .map(|&target| {
-                let start = self.width_before(target);
+            .map(|target| {
+                let start = self.width_of(0..target.start);
                 Rect::new(
                     left.saturating_add(u16::try_from(start).unwrap_or(u16::MAX)),
                     y,
-                    u16::try_from(self.spans[target].width()).unwrap_or(u16::MAX),
+                    u16::try_from(self.width_of(target.clone())).unwrap_or(u16::MAX),
                     FOOTER_HIT_ROWS,
                 )
             })
@@ -148,11 +167,11 @@ impl FooterLine {
     }
 
     fn width(&self) -> usize {
-        self.spans.iter().map(|span| span.width()).sum()
+        self.width_of(0..self.spans.len())
     }
 
-    fn width_before(&self, index: usize) -> usize {
-        self.spans[..index].iter().map(|span| span.width()).sum()
+    fn width_of(&self, range: Range<usize>) -> usize {
+        self.spans[range].iter().map(|span| span.width()).sum()
     }
 }
 
@@ -221,6 +240,7 @@ impl FooterHits {
 #[cfg(test)]
 mod tests {
     use crossterm::event::KeyModifiers;
+    use ratatui::style::Modifier;
     use test_case::test_case;
     use unicode_width::UnicodeWidthStr;
 
@@ -229,10 +249,13 @@ mod tests {
     const FIRST: &str = "/context";
     const SECOND: &str = "/context all";
     const GAP: &str = " · ";
+    const GLOSS: &str = " item details";
     const AREA: Rect = Rect::new(10, 4, 40, 6);
     const TOTAL: u16 = 6;
     const HALF: u16 = 50;
     const WRONG_WIDTH: &str = "the popup is not the width the terminal allows it";
+    const PHRASE_SPLIT: &str = "a description must belong to the command it glosses";
+    const ORPHAN_CLAIMED: &str = "a description with no command before it must stay inert";
 
     /// A percentage alone leaves a small terminal drawing a sliver and then
     /// cutting the content it made room for, and a large one is still handed its
@@ -298,6 +321,48 @@ mod tests {
                 1,
             )
         );
+    }
+
+    /// The reader sees `/context all item details` as one control, so the rect
+    /// and the reversed cells both cover the gloss, and the separator after it
+    /// belongs to nobody.
+    #[test]
+    fn a_described_command_is_one_phrase() {
+        let mut footer = FooterLine::default();
+        footer.command(FIRST, Style::new());
+        footer.describe(GLOSS, Style::new());
+        footer.text(GAP, Style::new());
+        footer.command(SECOND, Style::new());
+        let hits = footer.hits(AREA, 0, TOTAL);
+        let phrase = (FIRST.width() + GLOSS.width()) as u16;
+
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].width, phrase, "{PHRASE_SPLIT}");
+        assert_eq!(
+            hits[1].x,
+            hits[0].x + phrase + GAP.width() as u16,
+            "{PHRASE_SPLIT}"
+        );
+        let reversed: Vec<bool> = footer
+            .line(Some(0))
+            .spans
+            .iter()
+            .map(|span| span.style.add_modifier.contains(Modifier::REVERSED))
+            .collect();
+        assert_eq!(reversed, [true, true, false, false], "{PHRASE_SPLIT}");
+    }
+
+    #[test]
+    fn a_description_after_a_separator_is_inert() {
+        let mut footer = FooterLine::default();
+        footer.describe(GLOSS, Style::new());
+        footer.command(FIRST, Style::new());
+        footer.text(GAP, Style::new());
+        footer.describe(GLOSS, Style::new());
+        let hits = footer.hits(AREA, 0, TOTAL);
+
+        assert_eq!(hits.len(), 1, "{ORPHAN_CLAIMED}");
+        assert_eq!(hits[0].width, FIRST.width() as u16, "{ORPHAN_CLAIMED}");
     }
 
     #[test]

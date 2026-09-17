@@ -9,7 +9,7 @@ use crate::components::paste_editor::PasteEditorAction;
 use crate::components::permission_prompt::PromptMouse;
 use crate::components::queue_panel::{QueueAction, QueueHit, QueueHitTarget};
 use crate::components::status_bar::{StatusBarHit, StatusBarHitTarget};
-use crate::components::stream_modal::StreamMouse;
+use crate::components::stream_modal::StreamAction;
 use crate::components::workflow_card::CardHit;
 use crate::selection::{self, ContentRegion, EdgeScroll, Selection, SelectionState, SelectionZone};
 use caudra_agent::Mention;
@@ -165,10 +165,14 @@ impl App {
         if self.stream_modal.is_open() && !self.permission_prompt.is_open() {
             self.clear_control_hovers();
             match self.stream_modal.handle_mouse(&event) {
-                StreamMouse::Ignored => {}
-                StreamMouse::Consumed => return Vec::new(),
-                StreamMouse::Copy(text) => {
+                StreamAction::Ignored => {}
+                StreamAction::Consumed => return Vec::new(),
+                StreamAction::Copy(text) => {
                     self.copy_to_clipboard(&text);
+                    return Vec::new();
+                }
+                StreamAction::Submit(question) => {
+                    self.continue_btw(question);
                     return Vec::new();
                 }
             }

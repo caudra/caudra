@@ -1,6 +1,6 @@
-use crate::components::form::{render_form, selected_prefix};
-use crate::components::hint_line;
+use crate::components::form::{footer_row, render_form, selected_prefix};
 use crate::components::keybindings::{key, leader};
+use crate::components::{Hint, HintBar};
 use crate::theme;
 
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
@@ -16,12 +16,12 @@ const DISMISS_KEYS: &str = if cfg!(target_os = "macos") {
 } else {
     "Ctrl+T/Esc"
 };
-const HINT_PAIRS: &[(&str, &str)] = &[
-    ("↑↓", "select"),
-    ("Space", "toggle parallel"),
-    ("Enter", "confirm"),
-    (key::OPEN_EDITOR.label, "edit plan"),
-    (DISMISS_KEYS, "dismiss"),
+const HINTS: [Hint; 5] = [
+    Hint::inert("↑↓", "select"),
+    Hint::bind(key::SPACE, "toggle parallel"),
+    Hint::bind(key::ENTER, "confirm"),
+    Hint::bind(key::OPEN_EDITOR, "edit plan"),
+    Hint::key(DISMISS_KEYS, KeyCode::Esc, "dismiss"),
 ];
 
 struct MenuItem {
@@ -81,6 +81,7 @@ pub struct PlanForm {
     parallel: bool,
     row_hits: Vec<PlanRowHit>,
     mouse_down: Option<usize>,
+    hints: HintBar,
 }
 
 impl PlanForm {
@@ -91,6 +92,7 @@ impl PlanForm {
             parallel: false,
             row_hits: Vec::new(),
             mouse_down: None,
+            hints: HintBar::default(),
         }
     }
 
@@ -189,6 +191,21 @@ impl PlanForm {
     }
 
     pub fn handle_mouse(&mut self, event: MouseEvent) -> PlanFormAction {
+        if let Some(key_event) = self.hints.handle_mouse(event) {
+            return self.handle_key(key_event);
+        }
+        if self.hints.hovered().is_some()
+            && matches!(
+                event.kind,
+                MouseEventKind::Down(MouseButton::Left)
+                    | MouseEventKind::Drag(MouseButton::Left)
+                    | MouseEventKind::Up(MouseButton::Left)
+                    | MouseEventKind::Moved
+            )
+        {
+            self.mouse_down = None;
+            return PlanFormAction::Consumed;
+        }
         let position = Position::new(event.column, event.row);
         let hit = self
             .row_hits
@@ -257,10 +274,9 @@ impl PlanForm {
             }
             lines.push(Line::from(spans));
         }
-        lines.push(Line::default());
-        lines.push(hint_line(HINT_PAIRS));
+        let footer = self.hints.line(footer_row(area), HINTS.to_vec());
 
-        render_form(&t, FORM_LABEL, frame, area, lines, (0, 0), None);
+        render_form(&t, FORM_LABEL, frame, area, lines, (0, 0), Some(footer));
 
         self.row_hits.clear();
         let content_bottom = area.bottom().saturating_sub(1);
@@ -279,6 +295,7 @@ impl PlanForm {
     fn invalidate_mouse_geometry(&mut self) {
         self.row_hits.clear();
         self.mouse_down = None;
+        self.hints.reset();
     }
 }
 
@@ -290,6 +307,7 @@ mod tests {
     use test_case::test_case;
 
     const LAST: usize = MENU.len() - 1;
+    const FORM_AREA: Rect = Rect::new(2, 2, 76, FORM_HEIGHT);
 
     fn mouse(kind: MouseEventKind, area: Rect) -> MouseEvent {
         MouseEvent {
@@ -305,7 +323,7 @@ mod tests {
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| {
-                form.view(frame, Rect::new(2, 2, 76, FORM_HEIGHT));
+                form.view(frame, FORM_AREA);
             })
             .unwrap();
     }
@@ -527,20 +545,29 @@ mod tests {
     }
 
     #[test]
-    fn plan_hint_line_is_passive() {
+    fn a_group_hint_is_passive_and_a_command_hint_presses_its_key() {
         let mut form = PlanForm::new();
         form.on_plan_ready();
+        form.selected = 1;
         render(&mut form);
-        let last_row = form.row_hits[LAST].area;
-        let hint = Rect::new(last_row.x, last_row.y + 2, last_row.width, 1);
+        let hits = crate::components::hint_hits(&HINTS, footer_row(FORM_AREA));
+        let (group, confirm) = (hits[0], hits[2]);
 
         assert_eq!(
-            form.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), hint)),
+            form.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), group)),
             PlanFormAction::Passthrough
         );
         assert_eq!(
-            form.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), hint)),
+            form.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), group)),
             PlanFormAction::Passthrough
+        );
+        assert_eq!(
+            form.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), confirm)),
+            PlanFormAction::Consumed
+        );
+        assert_eq!(
+            form.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), confirm)),
+            PlanFormAction::ClearAndImplement
         );
     }
 

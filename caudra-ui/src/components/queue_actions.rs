@@ -128,7 +128,9 @@ impl QueueActions {
 
     fn map_picker_action(&mut self, action: PickerAction<QueueActionKind>) -> QueueActionsAction {
         match action {
-            PickerAction::Consumed | PickerAction::Toggle(..) => QueueActionsAction::Consumed,
+            PickerAction::Consumed | PickerAction::Toggle(..) | PickerAction::Key(_) => {
+                QueueActionsAction::Consumed
+            }
             PickerAction::Select(kind) => match self.id.take() {
                 Some(id) => QueueActionsAction::Select { id, kind },
                 None => QueueActionsAction::Close,

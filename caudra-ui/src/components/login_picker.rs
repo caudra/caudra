@@ -622,7 +622,9 @@ impl LoginPicker {
                 }
             }
             PickerAction::Close => StepAction::Close,
-            PickerAction::Consumed | PickerAction::Toggle(..) => StepAction::None,
+            PickerAction::Consumed | PickerAction::Toggle(..) | PickerAction::Key(_) => {
+                StepAction::None
+            }
         }
     }
 
@@ -643,7 +645,9 @@ impl LoginPicker {
                 },
             },
             PickerAction::Close => StepAction::Back,
-            PickerAction::Consumed | PickerAction::Toggle(..) => StepAction::None,
+            PickerAction::Consumed | PickerAction::Toggle(..) | PickerAction::Key(_) => {
+                StepAction::None
+            }
         }
     }
 
@@ -661,7 +665,9 @@ impl LoginPicker {
                 }
             }
             PickerAction::Close => StepAction::Back,
-            PickerAction::Consumed | PickerAction::Toggle(..) => StepAction::None,
+            PickerAction::Consumed | PickerAction::Toggle(..) | PickerAction::Key(_) => {
+                StepAction::None
+            }
         }
     }
 
@@ -672,7 +678,9 @@ impl LoginPicker {
                 protocol: item.0.to_string(),
             },
             PickerAction::Close => StepAction::Back,
-            PickerAction::Consumed | PickerAction::Toggle(..) => StepAction::None,
+            PickerAction::Consumed | PickerAction::Toggle(..) | PickerAction::Key(_) => {
+                StepAction::None
+            }
         }
     }
 
