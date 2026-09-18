@@ -47,7 +47,7 @@ use serde_json::Value;
 use tempfile::NamedTempFile;
 use tracing::warn;
 
-use super::lease::SessionLease;
+use super::lease::{SessionLease, held_session_ids};
 use super::migration::{MigrationEvent, report as report_migration};
 use super::{
     ProjectUsageRelocation, SESSION_VERSION, Session, SessionError, SessionLocation, SessionMeta,
@@ -122,8 +122,12 @@ const PERMISSION_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
 const PERMISSION_SNAPSHOT_SESSIONS: usize = 10_000;
 const INVALID_PERMISSION_REPAIR: &str =
     "invalid or stale permission review repair; refresh the preview";
-const PERMISSION_CUTOVER_BUSY: &str =
-    "close all storage readers and older Caudra processes before upgrading permission storage";
+const NO_NAMED_HOLDERS: &str =
+    "another Caudra process, a storage command, or a reader has it open; close it and start again";
+const NAMED_HOLDERS: &str = "close these open sessions and start again:";
+const UNKNOWN_SESSION_TITLE: &str = "<untitled>";
+const MAX_HOLDER_TITLE_BYTES: usize = 60;
+const TITLE_ELLIPSIS: &str = "...";
 const MAX_BASE58_UUID_BYTES: usize = 22;
 const UUID_VERSION_BYTE: usize = 6;
 const UUID_VARIANT_BYTE: usize = 8;
@@ -3945,12 +3949,13 @@ fn open_writable_connection(
     let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
     let cutover = version > 0 && version < SCHEMA_VERSION;
     if cutover {
-        migration_lock.try_lock().map_err(|_| {
-            StorageError::Io(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                PERMISSION_CUTOVER_BUSY,
-            ))
-        })?;
+        migration_lock
+            .try_lock()
+            .map_err(|_| SessionError::MigrationBlocked {
+                found: version,
+                supported: SCHEMA_VERSION,
+                holders: describe_migration_holders(state_dir, &path),
+            })?;
     }
     configure_wal_retention(&connection, true)?;
     connection.busy_timeout(BUSY_TIMEOUT)?;
@@ -4183,6 +4188,69 @@ fn reject_unmigratable(version: i64) -> Result<(), SessionError> {
         });
     }
     Ok(())
+}
+
+/// Names the sessions standing in the way of a migration, so the answer to
+/// "close them and start again" is not a search of every open terminal.
+///
+/// Lease files identify sessions only. A `caudra storage` command, a read-only
+/// inspector, or an older binary holds the same lock without ever taking one, so
+/// an empty list is reported as exactly that rather than as nothing being open.
+fn describe_migration_holders(state_dir: &StateDir, path: &Path) -> String {
+    let ids = held_session_ids(state_dir);
+    if ids.is_empty() {
+        return NO_NAMED_HOLDERS.to_owned();
+    }
+    let titles = session_titles(path);
+    let mut described = String::from(NAMED_HOLDERS);
+    for id in ids {
+        let title = titles
+            .get(&id)
+            .map_or(UNKNOWN_SESSION_TITLE, String::as_str);
+        described.push_str(&format!("\n  {id}  {title}"));
+    }
+    described
+}
+
+/// Reads titles straight from the old schema. Every version of `sessions` has
+/// carried `id` and `title`, so this works without the migration that is being
+/// blocked, and a failure to read simply leaves the ids unadorned.
+fn session_titles(path: &Path) -> HashMap<CaudraId, String> {
+    let Ok(connection) = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    ) else {
+        return HashMap::new();
+    };
+    let Ok(mut statement) = connection.prepare("SELECT id, title FROM sessions") else {
+        return HashMap::new();
+    };
+    let Ok(rows) = statement.query_map([], |row| {
+        Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
+    }) else {
+        return HashMap::new();
+    };
+    rows.flatten()
+        .filter_map(|(id, title)| {
+            let id = id_from_bytes(&id, "session id").ok()?;
+            Some((id, truncate_title(title)))
+        })
+        .collect()
+}
+
+fn truncate_title(mut title: String) -> String {
+    if title.len() <= MAX_HOLDER_TITLE_BYTES {
+        return title;
+    }
+    let cut = (0..=MAX_HOLDER_TITLE_BYTES)
+        .rev()
+        .find(|index| title.is_char_boundary(*index))
+        .unwrap_or_default();
+    title.truncate(cut);
+    title.push_str(TITLE_ELLIPSIS);
+    title
 }
 
 /// `run_to_completion` takes a bare function pointer, so what this forwards to
@@ -8438,7 +8506,7 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
 
     #[test_case(false; "exclusive_cutover")]
     #[test_case(true; "older_writer_must_close")]
-    fn permission_cutover_backs_up_and_excludes_older_writers(hold_reader: bool) {
+    fn a_migration_backs_up_and_excludes_older_writers(hold_reader: bool) {
         let (_temp, dir) = state_dir();
         let path = dir.path().join(SESSIONS_DB_FILE);
         create_owner_only(&path).unwrap();
@@ -8475,7 +8543,18 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
                 shared_state_lock(&dir.path().join(SESSIONS_DB_LOCK_FILE), OWNER_FILE_MODE)
                     .unwrap();
             let error = SessionDatabase::open_state(&dir).err().unwrap();
-            assert!(error.to_string().contains(PERMISSION_CUTOVER_BUSY));
+            // A bare shared lock is a reader, not a session, so nothing can be
+            // named and the message has to say which it is.
+            assert!(
+                matches!(
+                    &error,
+                    SessionError::MigrationBlocked { found, supported, holders }
+                        if *found == PERMISSION_PREVIOUS_SCHEMA
+                            && *supported == SCHEMA_VERSION
+                            && holders == NO_NAMED_HOLDERS
+                ),
+                "{error}"
+            );
             assert!(!backup_path.exists());
             assert_eq!(raw_permission_snapshot_on(&old).unwrap(), before);
             assert_eq!(
@@ -8894,6 +8973,50 @@ CREATE TABLE subagent_history_items (
                     if reason.contains(PAYLOAD_DECOMPRESSION_FAILED)
             ),
             "{error}"
+        );
+    }
+
+    const BLOCKED_NAMES_SESSIONS: &str =
+        "a blocked migration must name the open sessions holding it up";
+
+    #[test]
+    fn a_blocked_migration_names_the_open_sessions_by_id_and_title() {
+        let (_temp, state) = state_dir();
+        let title = "x".repeat(MAX_HOLDER_TITLE_BYTES * 2);
+        let id = {
+            let mut database = SessionDatabase::open(&state).unwrap();
+            let mut session = TestSession::new(MODEL, CWD);
+            session.title = title.clone();
+            database.save(&session, None).unwrap();
+            session.id
+        };
+        // Only the version decides whether an open is a cutover, so winding it
+        // back is enough to make the next one try to migrate.
+        let stale = Connection::open(state.path().join(SESSIONS_DB_FILE)).unwrap();
+        stale
+            .pragma_update(None, "user_version", COMPRESSION_PREVIOUS_SCHEMA)
+            .unwrap();
+        drop(stale);
+        // The lease is what an open session holds; the shared migration lock it
+        // takes alongside is what the upgrade then cannot convert.
+        let _lease = SessionLease::acquire(&state, id).unwrap();
+
+        let error = SessionDatabase::open_state(&state).err().unwrap();
+
+        let SessionError::MigrationBlocked {
+            found,
+            supported,
+            holders,
+        } = &error
+        else {
+            panic!("{BLOCKED_NAMES_SESSIONS}: {error}");
+        };
+        assert_eq!(*found, COMPRESSION_PREVIOUS_SCHEMA);
+        assert_eq!(*supported, SCHEMA_VERSION);
+        assert!(holders.contains(&id.to_string()), "{BLOCKED_NAMES_SESSIONS}");
+        assert!(
+            holders.contains(&format!("{}{TITLE_ELLIPSIS}", &title[..MAX_HOLDER_TITLE_BYTES])),
+            "{BLOCKED_NAMES_SESSIONS}: {holders}"
         );
     }
 

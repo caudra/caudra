@@ -101,6 +101,18 @@ pub enum SessionError {
     },
     #[error("database schema version {found} is unsupported; expected version {supported}")]
     UnsupportedSchemaVersion { found: i64, supported: i64 },
+    /// `holders` names the open sessions when lease files identify them, and
+    /// says so plainly when they do not: a storage command, a reader, or an
+    /// older binary holds the same lock without ever taking a session lease.
+    #[error(
+        "session database is at schema {found} and must be upgraded to {supported}, \
+         which needs exclusive access; {holders}"
+    )]
+    MigrationBlocked {
+        found: i64,
+        supported: i64,
+        holders: String,
+    },
     #[error("invalid database value in {field}: {reason}")]
     CorruptDatabaseValue { field: &'static str, reason: String },
     #[error("{kind} is {actual}, maximum is {maximum}")]

@@ -129,6 +129,36 @@ fn process_leases() -> std::sync::MutexGuard<'static, HashSet<LeaseKey>> {
         .unwrap_or_else(|error| error.into_inner())
 }
 
+/// Session ids whose lease is held right now, by this process or any other.
+///
+/// A lease file that still accepts an exclusive lock was left by a process that
+/// has since gone, so it names nothing that is open. Best effort throughout:
+/// this only ever explains a failure that already happened, and must not
+/// replace it with one of its own.
+pub(crate) fn held_session_ids(state_dir: &StateDir) -> Vec<CaudraId> {
+    let Ok(entries) = fs::read_dir(state_dir.path()) else {
+        return Vec::new();
+    };
+    let mut ids = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(id) = name.to_str().and_then(lease_session_id) else {
+            continue;
+        };
+        if let Ok(None) = try_exclusive_state_lock(&entry.path(), OWNER_FILE_MODE) {
+            ids.push(id);
+        }
+    }
+    ids.sort_by_key(CaudraId::to_string);
+    ids
+}
+
+fn lease_session_id(name: &str) -> Option<CaudraId> {
+    name.strip_prefix(ACTIVE_LEASE_PREFIX)
+        .and_then(|name| name.strip_suffix(ACTIVE_LEASE_SUFFIX))
+        .and_then(|raw| raw.parse().ok())
+}
+
 fn cleanup_inactive_leases(
     state_dir: &StateDir,
     canonical_state_path: &std::path::Path,
