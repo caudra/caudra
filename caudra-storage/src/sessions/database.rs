@@ -48,7 +48,7 @@ use tempfile::NamedTempFile;
 use tracing::warn;
 
 use super::lease::{SessionLease, held_session_ids};
-use super::migration::{MigrationEvent, report as report_migration};
+use super::progress::{MIGRATION, MigrationEvent, PRUNE, PruneEvent};
 use super::{
     ProjectUsageRelocation, SESSION_VERSION, Session, SessionError, SessionLocation, SessionMeta,
     SessionRelocation, SessionRelocationResult, SessionSummary, StoredSubagent,
@@ -107,6 +107,8 @@ const PAYLOAD_COMPRESSION_LEVEL: i32 = 3;
 const PAYLOAD_DECOMPRESSION_FAILED: &str = "payload could not be decompressed";
 /// Rows between progress reports during a payload rewrite.
 const PAYLOAD_PROGRESS_INTERVAL: u64 = 512;
+/// Pages between progress reports while a freelist is being reclaimed.
+const RECLAIM_PROGRESS_INTERVAL: u64 = 1024;
 const OWNER_FILE_MODE: u32 = 0o600;
 const OTHER_USER_PERMISSIONS: u32 = 0o077;
 const DATABASE_SIDECAR_SUFFIXES: [&str; 3] = ["-wal", "-shm", "-journal"];
@@ -2028,10 +2030,17 @@ impl SessionDatabase {
             .connection
             .prepare(&format!("PRAGMA incremental_vacuum({pages})"))?;
         let mut rows = statement.query([])?;
-        let mut freed = 0;
+        let mut freed: u64 = 0;
         while rows.next()?.is_some() {
             freed += 1;
+            if freed.is_multiple_of(RECLAIM_PROGRESS_INTERVAL) {
+                PRUNE.report(PruneEvent::Reclaiming {
+                    done: freed,
+                    total: u64::from(pages),
+                });
+            }
         }
+        PRUNE.report(PruneEvent::Reclaimed { pages: freed });
         Ok(freed)
     }
 
@@ -4258,7 +4267,7 @@ fn truncate_title(mut title: String) -> String {
 fn report_backup_progress(progress: BackupProgress) {
     let total = progress.pagecount.max(0) as u64;
     let remaining = progress.remaining.max(0) as u64;
-    report_migration(MigrationEvent::Backup {
+    MIGRATION.report(MigrationEvent::Backup {
         done: total.saturating_sub(remaining),
         total,
     });
@@ -4297,7 +4306,7 @@ fn migrate_to_current(
     version: i64,
 ) -> Result<(), SessionError> {
     verify_application_id(connection)?;
-    report_migration(MigrationEvent::Started {
+    MIGRATION.report(MigrationEvent::Started {
         from: version,
         to: SCHEMA_VERSION,
     });
@@ -4310,7 +4319,7 @@ fn migrate_to_current(
                 supported: SCHEMA_VERSION,
             });
         };
-        report_migration(MigrationEvent::Step {
+        MIGRATION.report(MigrationEvent::Step {
             from: step.from,
             to: step.to,
         });
@@ -4332,7 +4341,7 @@ fn migrate_to_current(
         backup = %backup.display(),
         "migrated session database schema"
     );
-    report_migration(MigrationEvent::Finished {
+    MIGRATION.report(MigrationEvent::Finished {
         from: version,
         to: SCHEMA_VERSION,
     });
@@ -4368,7 +4377,7 @@ fn compress_existing_payloads(transaction: &Transaction<'_>) -> Result<(), Sessi
         let mut rows = select.query([])?;
         let mut moved: u64 = 0;
         let mut stored: u64 = 0;
-        report_migration(MigrationEvent::Rewrite {
+        MIGRATION.report(MigrationEvent::Rewrite {
             table,
             done: 0,
             total,
@@ -4388,14 +4397,14 @@ fn compress_existing_payloads(transaction: &Transaction<'_>) -> Result<(), Sessi
             // Reporting every row would cost more than the rewrite on a large
             // transcript, and no reader can see that resolution anyway.
             if moved.is_multiple_of(PAYLOAD_PROGRESS_INTERVAL) {
-                report_migration(MigrationEvent::Rewrite {
+                MIGRATION.report(MigrationEvent::Rewrite {
                     table,
                     done: moved,
                     total,
                 });
             }
         }
-        report_migration(MigrationEvent::Rewrite {
+        MIGRATION.report(MigrationEvent::Rewrite {
             table,
             done: moved,
             total,

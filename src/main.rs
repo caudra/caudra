@@ -4,8 +4,8 @@
 
 mod cli;
 mod cmd;
-mod migration;
 mod print;
+mod progress;
 mod sdk_mode;
 mod setup;
 mod update;
@@ -37,7 +37,7 @@ fn main() -> ExitCode {
         Ok(cli) => cli,
         Err(err) => return report_parse_error(&err),
     };
-    migration::install_progress();
+    progress::install();
     let result = cmd::dispatch(cli);
     // Detached export tasks die with the process, so drain them once every
     // command has released its resources.

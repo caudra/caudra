@@ -12,6 +12,7 @@ use tracing::{info, warn};
 
 use super::database::SESSION_SNAPSHOT_DIR;
 use super::lease::SessionLease;
+use super::progress::{PRUNE, PruneEvent};
 use super::{
     ARCHIVE_DIR, CheckpointResult, SESSIONS_DIR, SessionDatabase, SessionError, TrimReport,
 };
@@ -22,6 +23,10 @@ use crate::{StateDir, StorageError, lock_session_artifacts, try_exclusive_state_
 
 const SWEEP_LOCK_FILE: &str = "caudra.sqlite.sweep.lock";
 const LAST_SWEEP_KEY: &str = "retention.last_sweep_at";
+const CLEANUP_JOBS_PHASE: &str = "completing cleanup jobs";
+const ORPHAN_SCAN_PHASE: &str = "scanning orphaned artifacts";
+const TOOL_OUTPUT_PHASE: &str = "cleaning orphaned tool output";
+const CHECKPOINT_PHASE: &str = "checkpointing the WAL";
 const OWNER_FILE_MODE: u32 = 0o600;
 /// Orphaned artifact directories younger than this may belong to a session
 /// whose first save has not committed yet.
@@ -355,8 +360,14 @@ pub fn prune(
         ..PruneReport::default()
     };
     if !dry_run {
+        PRUNE.report(PruneEvent::Phase {
+            label: CLEANUP_JOBS_PHASE,
+        });
         report.cleanup_jobs_completed = database.process_cleanup_jobs()?;
     }
+    PRUNE.report(PruneEvent::Phase {
+        label: ORPHAN_SCAN_PHASE,
+    });
     let known = database.persisted_session_ids()?;
     let now = SystemTime::now();
     for components in [
@@ -370,6 +381,9 @@ pub fn prune(
         report.orphan_directories += directories;
         report.orphan_bytes += bytes;
     }
+    PRUNE.report(PruneEvent::Phase {
+        label: TOOL_OUTPUT_PHASE,
+    });
     let store = ToolOutputStore::new(state_dir.clone());
     let orphan_outputs = if dry_run {
         store.count_orphans(&known)
@@ -381,6 +395,9 @@ pub fn prune(
     report.orphan_tool_output_entries =
         orphan_outputs.map_err(|error| SessionError::ToolOutputCleanup(Box::new(error)))?;
     if !dry_run {
+        PRUNE.report(PruneEvent::Phase {
+            label: CHECKPOINT_PHASE,
+        });
         report.checkpoint = Some(database.checkpoint(true)?);
         let pages = u32::try_from(report.freelist_pages_before).unwrap_or(u32::MAX);
         database.incremental_vacuum(pages)?;
