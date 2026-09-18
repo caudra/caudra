@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::iter;
 use std::path::{Path, PathBuf};
@@ -53,6 +53,9 @@ use crate::{AcpParams, elicitation, methods, permissions, translate};
 
 const FIRST_OUTGOING_REQUEST_ID: i64 = 1000;
 const SESSION_IN_USE_ERROR_CODE: i32 = -32001;
+/// Client that asks questions through `session/request_permission` instead of
+/// form elicitation. Its convention is not ACP, so it is matched by name.
+const PERMISSION_QUESTION_CLIENT: &str = "openmausbot";
 /// ACP has no fast-mode toggle, so a restored total is priced at standard rates.
 const RESTORED_FAST: bool = false;
 
@@ -103,6 +106,7 @@ struct Server {
     model_policy: Arc<ModelPolicy>,
     thinking: caudra_providers::ThinkingConfig,
     client_elicits_form: bool,
+    client_asks_via_permission: bool,
     session: Option<SessionState>,
 }
 
@@ -137,6 +141,7 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
         model_policy: Arc::clone(&params.model_policy),
         thinking: params.thinking.clone(),
         client_elicits_form: false,
+        client_asks_via_permission: false,
         session: None,
     };
 
@@ -259,8 +264,12 @@ async fn handle_request(
 ) {
     let result = match method {
         "initialize" => {
-            srv.client_elicits_form = parse_params::<InitializeRequest>(raw)
-                .is_ok_and(|req| elicitation::supports_form(&req.client_capabilities));
+            if let Ok(req) = parse_params::<InitializeRequest>(raw) {
+                srv.client_elicits_form = elicitation::supports_form(&req.client_capabilities);
+                srv.client_asks_via_permission = req
+                    .client_info
+                    .is_some_and(|info| info.name == PERMISSION_QUESTION_CLIENT);
+            }
             Ok(AgentResponse::InitializeResponse(
                 methods::initialize_response(),
             ))
@@ -528,11 +537,16 @@ async fn prepare_session(
     start: SessionStart,
 ) -> Result<(headless::PreparedInteractive, PendingState), AcpError> {
     let pending = PendingState::default();
-    // Without form elicitation the question tool would spin forever waiting
-    // for a TUI that does not exist, so it is dropped and the model asks in
-    // plain text instead.
-    let (excluded_tools, local_tools) = if srv.client_elicits_form {
-        let tool = question_tool(srv.out_tx.clone(), Arc::clone(&pending));
+    // With neither transport the question tool would spin forever waiting for a
+    // TUI that does not exist, so it is dropped and the model asks in plain text
+    // instead. A form renders the whole thing, so it wins when both are offered.
+    let (excluded_tools, local_tools) = if srv.client_elicits_form || srv.client_asks_via_permission
+    {
+        let tool = question_tool(
+            srv.out_tx.clone(),
+            Arc::clone(&pending),
+            !srv.client_elicits_form,
+        );
         let map: LocalTools = Arc::new(HashMap::from([(QUESTION_TOOL_NAME.to_owned(), tool)]));
         (Vec::new(), map)
     } else {
@@ -619,10 +633,15 @@ fn ask_client(
     id
 }
 
-/// Shadows the Lua `question` tool: sends `elicitation/create` to the client
-/// and blocks the tool call until the form comes back. Elicitations serialize
-/// on the interactive answer channel; permission requests use their broker.
-fn question_tool(out_tx: Sender<Value>, pending: PendingState) -> LocalToolFn {
+/// Shadows the Lua `question` tool: asks the client and blocks the tool call
+/// until the answer comes back. Both transports settle on the interactive
+/// answer channel, so they share `AskKind::Elicitation`; permission requests
+/// proper use their broker.
+fn question_tool(
+    out_tx: Sender<Value>,
+    pending: PendingState,
+    via_permission: bool,
+) -> LocalToolFn {
     local_tool(move |input, ctx| {
         let out_tx = out_tx.clone();
         let pending = Arc::clone(&pending);
@@ -636,11 +655,22 @@ fn question_tool(out_tx: Sender<Value>, pending: PendingState) -> LocalToolFn {
             // scope pointing at a tool call the client never saw would get
             // the elicitation rejected or dropped.
             let tool_call_id = ctx.tool_use_id.filter(|id| !id.is_empty());
-            let request = elicitation::form_request(&session_id, tool_call_id, &input)?;
+            let request = if via_permission {
+                AgentRequest::RequestPermissionRequest(elicitation::question_permission_request(
+                    &session_id,
+                    tool_call_id,
+                    &input,
+                )?)
+            } else {
+                AgentRequest::CreateElicitationRequest(elicitation::form_request(
+                    &session_id,
+                    tool_call_id,
+                    &input,
+                )?)
+            };
             let rx = ctx.user_response_rx.as_ref().ok_or("no answer channel")?;
 
             let guard = rx.lock().await;
-            let request = AgentRequest::CreateElicitationRequest(request);
             let id = ask_client(&out_tx, &pending, AskKind::Elicitation, request);
             let response = ctx.cancel.race(guard.recv_async()).await;
             // Cleared while still holding the channel, so a stale id cannot
@@ -648,9 +678,13 @@ fn question_tool(out_tx: Sender<Value>, pending: PendingState) -> LocalToolFn {
             let _ = pending.lock().unwrap().asks.remove(&id);
             drop(guard);
 
-            Ok(match response {
-                Ok(Ok(raw)) => elicitation::format_response(&input, &raw),
-                _ => elicitation::DISMISSED.to_owned(),
+            let Ok(Ok(raw)) = response else {
+                return Ok(elicitation::DISMISSED.to_owned());
+            };
+            Ok(if via_permission {
+                elicitation::format_permission_answer(&input, &raw)
+            } else {
+                elicitation::format_response(&input, &raw)
             })
         })
     })
@@ -1176,6 +1210,10 @@ fn start_event_pump(
     smol::spawn(async move {
         let sid = SessionId::from(session_id.to_string());
         let mut cost_total = initial_cost;
+        let mut turn_spend = translate::TurnSpend::default();
+        // Tool calls whose `tool_call` creation has been sent. An id leaves the
+        // set when the call finishes, so this tracks only calls in flight.
+        let mut announced: HashSet<String> = HashSet::new();
 
         while let Ok(Envelope {
             event, subagent, ..
@@ -1185,6 +1223,7 @@ fn start_event_pump(
             // turns still spend session money.
             if let AgentEvent::TurnComplete(tc) = &event {
                 add_cost(&mut cost_total, tc.cost);
+                turn_spend.add(tc);
             }
             if subagent.is_some()
                 && !matches!(
@@ -1198,18 +1237,33 @@ fn start_event_pump(
             let update = match event {
                 AgentEvent::TextDelta { text } => translate::text_delta(&text),
                 AgentEvent::ThinkingDelta { text } => translate::thinking_delta(&text),
-                AgentEvent::ToolPending { id, name } => translate::tool_pending(&id, &name),
+                // The call is announced once its arguments name it, so a bare
+                // `ToolPending` has nothing to say yet.
+                AgentEvent::ToolPending { .. } => continue,
                 AgentEvent::ToolInputDelta {
                     id,
+                    name,
                     preview: Some(preview),
                     ..
-                } => translate::tool_input_preview(&id, preview),
+                } => {
+                    let first = announced.insert(id.clone());
+                    translate::tool_preview(&id, &name, preview, first)
+                }
                 AgentEvent::ToolInputDelta { .. } => continue,
                 AgentEvent::ToolStart(event) => {
-                    translate::tool_start(&event, &cwd, home.as_deref())
+                    let first = announced.insert(event.id.clone());
+                    translate::tool_start(&event, &cwd, home.as_deref(), first)
                 }
                 AgentEvent::ToolOutput { id, content } => translate::tool_output(&id, &content),
-                AgentEvent::ToolDone(event) => translate::tool_done(&event, &cwd, home.as_deref()),
+                AgentEvent::ToolDone(event) => {
+                    announced.remove(&event.id);
+                    // A finished todo_write is the agent's plan changing, which
+                    // ACP reports separately from the call that caused it.
+                    if let Some(plan) = translate::plan_update(&event.output) {
+                        session_update(&out_tx, &sid, plan);
+                    }
+                    translate::tool_done(&event, &cwd, home.as_deref())
+                }
                 AgentEvent::TurnComplete(event) => translate::usage_update(&event, cost_total),
                 AgentEvent::PermissionRequest(request) => {
                     request_permission(&out_tx, &pending, &sid, *request);
@@ -1220,11 +1274,14 @@ fn start_event_pump(
                     continue;
                 }
                 AgentEvent::Done { reason, .. } => {
+                    let spend = std::mem::take(&mut turn_spend);
                     if let Some(id) = pending.lock().unwrap().prompt.take() {
-                        let resp = PromptResponse::new(translate::map_done_reason(reason));
                         send(
                             &out_tx,
-                            Response::new(id, Ok(AgentResponse::PromptResponse(resp))),
+                            Response::new(
+                                id,
+                                Ok(AgentResponse::PromptResponse(spend.into_response(reason))),
+                            ),
                         );
                     }
                     continue;
@@ -1393,6 +1450,7 @@ mod tests {
             model_policy: Arc::new(ModelPolicy::default()),
             thinking: Default::default(),
             client_elicits_form: false,
+            client_asks_via_permission: false,
             session: Some(SessionState {
                 handle,
                 mcp: None,

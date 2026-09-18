@@ -1,18 +1,32 @@
 use std::path::{Path, PathBuf};
 
 use agent_client_protocol_schema::v1::{
-    Content, ContentBlock, ContentChunk, Cost, Diff, ImageContent, SessionUpdate, StopReason,
-    TextContent, ToolCall, ToolCallContent, ToolCallId, ToolCallLocation, ToolCallStatus,
-    ToolCallUpdate, ToolCallUpdateFields, ToolKind, UsageUpdate,
+    Content, ContentBlock, ContentChunk, Cost, Diff, ImageContent, Meta, Plan, PlanEntry,
+    PlanEntryPriority, PlanEntryStatus, PromptResponse, SessionUpdate, StopReason, TextContent,
+    ToolCall, ToolCallContent, ToolCallId, ToolCallLocation, ToolCallStatus, ToolCallUpdate,
+    ToolCallUpdateFields, ToolKind, Usage, UsageUpdate,
 };
 use caudra_agent::DoneReason;
 use caudra_agent::tools::ToolRegistry;
-use caudra_agent::types::{ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCompleteEvent};
-use caudra_providers::{ContentBlock as MsgBlock, ImageMediaType, Message, Role as MsgRole};
+use caudra_agent::types::{
+    TodoPriority, TodoStatus, ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCompleteEvent,
+};
+use caudra_providers::{
+    ContentBlock as MsgBlock, ImageMediaType, Message, Role as MsgRole, TokenUsage, add_cost,
+};
 
 const MIN_FENCE_LEN: usize = 3;
 /// Model pricing is quoted in US dollars, so that is the reported currency.
 const CURRENCY: &str = "USD";
+/// `_meta` keys mirroring the ACP `Usage` field names, so a client reading
+/// either source sees the same spelling and the same numbers.
+const META_INPUT_TOKENS: &str = "inputTokens";
+const META_OUTPUT_TOKENS: &str = "outputTokens";
+const META_TOTAL_TOKENS: &str = "totalTokens";
+const META_CACHED_READ_TOKENS: &str = "cachedReadTokens";
+const META_CACHED_WRITE_TOKENS: &str = "cachedWriteTokens";
+/// Cost has no home in ACP's `Usage`, and it is the number a spend cap needs.
+const META_COST_USD: &str = "costUsd";
 
 /// File-level tools report a location so the client can follow along. Directory
 /// scoped tools (glob, grep, list) and commands (bash) target no single file.
@@ -82,42 +96,57 @@ pub fn thinking_delta(text: &str) -> SessionUpdate {
     ))))
 }
 
-pub fn tool_pending(id: &str, name: &str) -> SessionUpdate {
-    let kind = tool_kind(name);
+/// ACP treats `tool_call` as the creation and `tool_call_update` as a change to
+/// one that exists, so a call is announced exactly once. Announcement waits for
+/// the arguments to reveal a title, because a card labelled with the bare tool
+/// name tells the user nothing, and clients that read the creation alone would
+/// never learn what the call actually does.
+///
+/// The call is still `Pending`: only its title has firmed up.
+pub fn tool_preview(id: &str, name: &str, preview: String, first: bool) -> SessionUpdate {
+    if !first {
+        return SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+            ToolCallId::from(id.to_string()),
+            ToolCallUpdateFields::new().title(preview),
+        ));
+    }
     SessionUpdate::ToolCall(
-        ToolCall::new(ToolCallId::from(id.to_string()), name.to_string())
-            .kind(kind)
+        ToolCall::new(ToolCallId::from(id.to_string()), preview)
+            .kind(tool_kind(name))
             .status(ToolCallStatus::Pending),
     )
 }
 
-/// The call is still `Pending`: only its title has firmed up. `tool_pending`
-/// already created the call, so every preview is an update.
-pub fn tool_input_preview(id: &str, preview: String) -> SessionUpdate {
-    SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
-        ToolCallId::from(id.to_string()),
-        ToolCallUpdateFields::new().title(preview),
-    ))
-}
+pub fn tool_start(
+    event: &ToolStartEvent,
+    cwd: &Path,
+    home: Option<&Path>,
+    first: bool,
+) -> SessionUpdate {
+    let locations = tool_locations(&event.tool, event.raw_input.as_ref(), cwd, home);
+    let id = ToolCallId::from(event.id.clone());
 
-pub fn tool_start(event: &ToolStartEvent, cwd: &Path, home: Option<&Path>) -> SessionUpdate {
+    if first {
+        let mut call = ToolCall::new(id, event.summary.clone())
+            .kind(tool_kind(&event.tool))
+            .status(ToolCallStatus::InProgress)
+            .locations(locations);
+        if let Some(raw) = &event.raw_input {
+            call = call.raw_input(raw.clone());
+        }
+        return SessionUpdate::ToolCall(call);
+    }
+
     let mut fields = ToolCallUpdateFields::new()
         .status(ToolCallStatus::InProgress)
         .title(event.summary.clone());
-
     if let Some(raw) = &event.raw_input {
         fields = fields.raw_input(raw.clone());
     }
-
-    let locations = tool_locations(&event.tool, event.raw_input.as_ref(), cwd, home);
     if !locations.is_empty() {
         fields = fields.locations(locations);
     }
-
-    SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
-        ToolCallId::from(event.id.clone()),
-        fields,
-    ))
+    SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(id, fields))
 }
 
 /// File locations the tool call touches, per ACP "Following the Agent". The
@@ -292,6 +321,78 @@ pub fn map_done_reason(reason: DoneReason) -> StopReason {
     }
 }
 
+/// One prompt spans however many provider calls the agent loop needs, and each
+/// reports its own `TurnComplete`. The client bills the prompt, so the shares
+/// accumulate here until the turn ends.
+#[derive(Default)]
+pub struct TurnSpend {
+    usage: TokenUsage,
+    cost: Option<f64>,
+}
+
+impl TurnSpend {
+    pub fn add(&mut self, event: &TurnCompleteEvent) {
+        self.usage += event.usage;
+        add_cost(&mut self.cost, event.cost);
+    }
+
+    /// Reports the turn both ways on purpose: `usage` is the ACP field, but it
+    /// rides an unstable feature the spec may change or drop, while `_meta` is
+    /// stable extensibility any client can read. Both carry the same numbers.
+    pub fn into_response(self, reason: DoneReason) -> PromptResponse {
+        let input = u64::from(self.usage.input);
+        let output = u64::from(self.usage.output);
+        let cached_read = u64::from(self.usage.cache_read);
+        let cached_write = u64::from(self.usage.cache_creation);
+        let total = input + output + cached_read + cached_write;
+
+        let mut meta = Meta::new();
+        meta.insert(META_INPUT_TOKENS.to_string(), input.into());
+        meta.insert(META_OUTPUT_TOKENS.to_string(), output.into());
+        meta.insert(META_TOTAL_TOKENS.to_string(), total.into());
+        meta.insert(META_CACHED_READ_TOKENS.to_string(), cached_read.into());
+        meta.insert(META_CACHED_WRITE_TOKENS.to_string(), cached_write.into());
+        if let Some(cost) = self.cost {
+            meta.insert(META_COST_USD.to_string(), cost.into());
+        }
+
+        let usage = Usage::new(total, input, output)
+            .cached_read_tokens(cached_read)
+            .cached_write_tokens(cached_write);
+
+        PromptResponse::new(map_done_reason(reason))
+            .usage(usage)
+            .meta(meta)
+    }
+}
+
+/// The agent's todo list is what ACP calls a plan. `Cancelled` has no ACP
+/// spelling, and reporting it as completed would claim work that never
+/// happened, so those entries are dropped rather than misreported.
+pub fn plan_update(output: &ToolOutput) -> Option<SessionUpdate> {
+    let ToolOutput::TodoList(items) = output else {
+        return None;
+    };
+    let entries = items
+        .iter()
+        .filter_map(|item| {
+            let status = match item.status {
+                TodoStatus::Pending => PlanEntryStatus::Pending,
+                TodoStatus::InProgress => PlanEntryStatus::InProgress,
+                TodoStatus::Completed => PlanEntryStatus::Completed,
+                TodoStatus::Cancelled => return None,
+            };
+            let priority = match item.priority {
+                TodoPriority::High => PlanEntryPriority::High,
+                TodoPriority::Medium => PlanEntryPriority::Medium,
+                TodoPriority::Low => PlanEntryPriority::Low,
+            };
+            Some(PlanEntry::new(item.content.clone(), priority, status))
+        })
+        .collect();
+    Some(SessionUpdate::Plan(Plan::new(entries)))
+}
+
 /// Per ACP "Session Usage Updates": the current context gauge plus the
 /// session's cumulative cost. Each turn's event only carries its own turn's
 /// share, so the caller tracks the running total across turns.
@@ -413,6 +514,7 @@ fn mime_type(media: &ImageMediaType) -> &'static str {
 mod tests {
     use std::sync::Arc;
 
+    use caudra_agent::types::TodoItem;
     use caudra_providers::ImageSource;
     use caudra_storage::usage_ledger::LedgerPurpose;
     use serde_json::json;
@@ -422,6 +524,7 @@ mod tests {
 
     const CWD: &str = "/home/user/project";
     const HOME: &str = "/home/user";
+    const OMITTED_STATUS_IS_PENDING: &str = "a created call must be pending, which the wire omits";
 
     #[test_case("1: mod render\n2: mod segment", "```\n1: mod render\n2: mod segment\n```" ; "plain_text_gets_default_fence")]
     #[test_case("has ```rust\ncode\n``` inside", "````\nhas ```rust\ncode\n``` inside\n````" ; "fence_longer_than_inner_backticks")]
@@ -601,6 +704,7 @@ mod tests {
             &start_event(tool, raw_input),
             Path::new(CWD),
             Some(Path::new(HOME)),
+            false,
         );
         serde_json::to_value(update)
             .unwrap()
@@ -641,18 +745,103 @@ mod tests {
         assert_eq!(start_locations(tool, input), expected);
     }
 
-    #[test]
-    fn tool_start_with_no_raw_input_has_no_locations_field() {
+    #[test_case(true ; "on_creation")]
+    #[test_case(false ; "on_update")]
+    fn tool_start_with_no_raw_input_has_no_locations_field(first: bool) {
         let update = tool_start(
             &start_event("read", None),
             Path::new(CWD),
             Some(Path::new(HOME)),
+            first,
         );
         let json = serde_json::to_value(update).unwrap();
         assert!(
             json.get("locations").is_none(),
             "empty locations must be omitted: {json}"
         );
+    }
+
+    /// A client that reads only the creation notification still learns what the
+    /// call does, which is the whole point of holding the announcement back.
+    #[test]
+    fn first_tool_start_creates_the_call_with_title_and_raw_input() {
+        let mut event = start_event("bash", Some(json!({"command": "ls -la"})));
+        event.summary = "ls -la".into();
+        let json = serde_json::to_value(tool_start(
+            &event,
+            Path::new(CWD),
+            Some(Path::new(HOME)),
+            true,
+        ))
+        .unwrap();
+
+        assert_eq!(json["sessionUpdate"], json!("tool_call"));
+        assert_eq!(json["title"], json!("ls -la"));
+        assert_eq!(json["rawInput"], json!({"command": "ls -la"}));
+        assert_eq!(json["status"], json!("in_progress"));
+    }
+
+    #[test]
+    fn later_tool_start_updates_the_existing_call() {
+        let json = serde_json::to_value(tool_start(
+            &start_event("bash", None),
+            Path::new(CWD),
+            Some(Path::new(HOME)),
+            false,
+        ))
+        .unwrap();
+
+        assert_eq!(json["sessionUpdate"], json!("tool_call_update"));
+    }
+
+    #[test]
+    fn first_preview_creates_a_pending_call_titled_by_the_preview() {
+        let json =
+            serde_json::to_value(tool_preview("t-1", "bash", "cargo test".into(), true)).unwrap();
+
+        assert_eq!(json["sessionUpdate"], json!("tool_call"));
+        assert_eq!(json["title"], json!("cargo test"));
+        // `pending` is the schema default, so the wire omits it.
+        assert!(json.get("status").is_none(), "{OMITTED_STATUS_IS_PENDING}");
+    }
+
+    #[test]
+    fn todo_list_becomes_a_plan_without_the_cancelled_entries() {
+        let todo = |content: &str, status, priority| TodoItem {
+            content: content.into(),
+            status,
+            priority,
+        };
+        let output = ToolOutput::TodoList(vec![
+            todo("ship it", TodoStatus::InProgress, TodoPriority::High),
+            todo("drop it", TodoStatus::Cancelled, TodoPriority::Low),
+            todo("done it", TodoStatus::Completed, TodoPriority::Medium),
+        ]);
+
+        let json = serde_json::to_value(plan_update(&output).unwrap()).unwrap();
+
+        assert_eq!(json["sessionUpdate"], json!("plan"));
+        assert_eq!(
+            json["entries"],
+            json!([
+                {"content": "ship it", "priority": "high", "status": "in_progress"},
+                {"content": "done it", "priority": "medium", "status": "completed"},
+            ])
+        );
+    }
+
+    #[test]
+    fn non_todo_output_is_not_a_plan() {
+        assert!(plan_update(&ToolOutput::Plain("hello".into())).is_none());
+    }
+
+    #[test]
+    fn later_preview_only_retitles() {
+        let json =
+            serde_json::to_value(tool_preview("t-1", "bash", "cargo test".into(), false)).unwrap();
+
+        assert_eq!(json["sessionUpdate"], json!("tool_call_update"));
+        assert_eq!(json["title"], json!("cargo test"));
     }
 
     fn done_event(

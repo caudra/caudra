@@ -224,7 +224,7 @@ get-size2 = "=0.10.1"
 notify = { version = "9.0.0-rc.2", default-features = false, features = ["flume", "macos_fsevent"] }
 serde_yaml = "0.9"
 shell-words = "1"
-agent-client-protocol-schema = "1"
+agent-client-protocol-schema = { version = "1", features = ["unstable_end_turn_token_usage"] }
 async-trait = "0.1"
 tokio = { version = "1.52.3", features = ["fs", "io-util", "net", "process", "rt-multi-thread", "sync", "time"] }
 tokio-util = "0.7"

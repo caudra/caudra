@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod conformance;
 pub mod elicitation;
 pub mod methods;
 pub mod permissions;
