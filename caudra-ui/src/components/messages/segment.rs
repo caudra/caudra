@@ -832,9 +832,9 @@ pub(super) fn wrapped_line_count(lines: &[Line<'_>], width: u16) -> u16 {
     if width == 0 {
         return lines.len() as u16;
     }
-    lines
-        .iter()
-        .fold(0, |rows, line| rows.saturating_add(wrapped_rows(line, width)))
+    lines.iter().fold(0, |rows, line| {
+        rows.saturating_add(wrapped_rows(line, width))
+    })
 }
 
 /// A line no wider than the box takes exactly one row, and once the renderer

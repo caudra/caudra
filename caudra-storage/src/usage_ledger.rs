@@ -795,7 +795,8 @@ mod tests {
                 .unwrap(),
             ProjectUsageRelocation {
                 buckets_moved: 3,
-                buckets_merged: 1
+                buckets_merged: 1,
+                ..ProjectUsageRelocation::default()
             }
         );
         let mut after = persistent.lifetime().unwrap();

@@ -9,8 +9,8 @@ use std::os::unix::process::CommandExt;
 
 use async_process::{Command, Stdio};
 use caudra_agent::{
-    AgentConfig, BaselineOutcome, CancelToken, CancelTrigger, ToolDoneEvent, ToolInput, ToolOutput,
-    ToolStartEvent, WorkspaceBaseline,
+    AgentConfig, BaselineOutcome, CancelToken, CancelTrigger, ToolAccounting, ToolDoneEvent,
+    ToolInput, ToolOutput, ToolStartEvent, WorkspaceBaseline,
 };
 use caudra_providers::Message;
 use caudra_workspace::{
@@ -208,6 +208,7 @@ impl App {
                     model_suffix: None,
                     model_output: None,
                     model_output_from_ref: false,
+                    accounting: ToolAccounting::default(),
                 });
                 if let Some(msg) = result_msg {
                     self.shell.push_result(msg);

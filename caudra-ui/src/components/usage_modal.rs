@@ -10,7 +10,7 @@ use caudra_providers::{
 };
 use caudra_storage::sessions::StoredTokenUsage;
 use caudra_storage::usage_ledger::{LifetimeUsage, UsageSlice};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
+use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
 use ratatui::Frame;
@@ -32,12 +32,7 @@ const SLICE_LIMIT: usize = 8;
 const NO_LEDGER: &str = "no spend recorded yet";
 const LEDGER_UNAVAILABLE: &str = "lifetime spend unavailable";
 /// Switches the modal between this session and everything ever recorded.
-/// Bare, since `Ctrl+g` already scrolls to the top.
-pub(crate) const SCOPE_KEY: Bind = Bind {
-    code: KeyCode::Char('g'),
-    modifiers: KeyModifiers::NONE,
-    label: "g",
-};
+pub(crate) const SCOPE_KEY: Bind = key::SCOPE;
 const PREFIX: &str = "  ";
 const MODEL_COL_MIN: usize = 16;
 const NUM_COL: usize = 7;

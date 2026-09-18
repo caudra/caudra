@@ -50,13 +50,14 @@ use super::lease::SessionLease;
 use super::{
     ProjectUsageRelocation, SESSION_VERSION, Session, SessionError, SessionLocation, SessionMeta,
     SessionRelocation, SessionRelocationResult, SessionSummary, StoredSubagent,
-    StoredSubagentOutcome, StoredSubagentTaskSpec, StoredTokenUsage, next_epoch,
+    StoredSubagentOutcome, StoredSubagentTaskSpec, StoredTokenUsage, StoredToolUsage, next_epoch,
 };
 use crate::id::CaudraId;
 use crate::retention::SessionFacts;
 use crate::state::{
     WorkspaceTabs, remove_relocated_workspace_tabs, write_relocated_workspace_tabs,
 };
+use crate::tool_ledger::{Latency, ToolOutcome};
 use crate::tool_outputs::{TOOL_OUTPUT_DIR, delete_session_outputs};
 use crate::usage_ledger::LedgerPurpose;
 use crate::workflow::{
@@ -72,7 +73,7 @@ use crate::{
 pub const SESSIONS_DB_FILE: &str = "caudra.sqlite";
 pub const SESSIONS_DB_LOCK_FILE: &str = "caudra.sqlite.lock";
 
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 const APPLICATION_ID: i64 = i32::from_be_bytes(*b"CAUD") as i64;
 /// Pages copied per step of the pre-migration backup. The whole file is copied
 /// under the initialization lock, so this only bounds how long the backup holds
@@ -259,6 +260,57 @@ DROP TABLE usage_ledger_v3;
 ALTER TABLE model_usage ADD COLUMN subscription_cost REAL;
 "#;
 
+/// What tools did, in the same two shapes spend is kept in: a per-session
+/// breakdown that dies with its transcript, and an hourly ledger that outlives
+/// it. A forgotten session must not take the project's tool history with it,
+/// for the same reason it must not take what it cost.
+///
+/// `outcome` joins both primary keys rather than sitting beside a plain error
+/// counter. It holds `ok` or one of the agent's low-cardinality failure
+/// classes, so the grain is bounded at seven rows per key and an error rate can
+/// say why it is what it is. Errors are `calls` summed where `outcome` is not
+/// `ok`.
+///
+/// `duration_ms` is a sum, and `latency` a log-scale histogram of the same
+/// durations. A sum survives being merged across buckets and a percentile does
+/// not, so the distribution is stored rather than the answer taken from it.
+///
+/// `tokens` is the estimated size of the model-facing result, which is what a
+/// tool actually costs the context window.
+const TOOL_USAGE_TABLES: &str = r#"
+CREATE TABLE session_tool_usage (
+    session_id      BLOB NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    tool            TEXT NOT NULL,
+    source          TEXT NOT NULL,
+    outcome         TEXT NOT NULL,
+    calls           INTEGER NOT NULL,
+    duration_ms     INTEGER NOT NULL,
+    tokens          INTEGER NOT NULL,
+    latency         BLOB NOT NULL,
+    PRIMARY KEY(session_id, tool, source, outcome)
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE tool_ledger (
+    bucket_start    INTEGER NOT NULL,
+    tool            TEXT NOT NULL,
+    source          TEXT NOT NULL,
+    cwd             TEXT NOT NULL,
+    outcome         TEXT NOT NULL,
+    calls           INTEGER NOT NULL,
+    duration_ms     INTEGER NOT NULL,
+    tokens          INTEGER NOT NULL,
+    latency         BLOB NOT NULL,
+    PRIMARY KEY(bucket_start, tool, source, cwd, outcome)
+) STRICT, WITHOUT ROWID;
+"#;
+
+/// Shared so the reader and the project move cannot drift into different column
+/// orders behind the same row mapper.
+const TOOL_BUCKET_COLUMNS: &str =
+    "bucket_start, tool, source, cwd, outcome, calls, duration_ms, tokens, latency";
+const TOOL_LEDGER_LATENCY: &str = "tool_ledger.latency";
+const SESSION_TOOL_LATENCY: &str = "session_tool_usage.latency";
+
 /// Durable workflow runs and the journal of host calls each one made. Runs
 /// belong to a session and go with it; calls belong to a run. `bytes` is
 /// generated so the accounting can never drift from the row it describes.
@@ -388,6 +440,11 @@ const MIGRATIONS: &[Migration] = &[
         from: 7,
         to: 8,
         sql: PERMISSION_REVISION_SCHEMA,
+    },
+    Migration {
+        from: 8,
+        to: 9,
+        sql: TOOL_USAGE_TABLES,
     },
 ];
 
@@ -594,7 +651,7 @@ CREATE TABLE pending_archives (
 /// What a fresh database gets: every migration already folded in.
 fn full_schema() -> String {
     format!(
-        "{SCHEMA}{USAGE_LEDGER_TABLE}{WORKFLOW_TABLES}{WORKFLOW_EVENTS_TABLE}{PERMISSION_REVISION_SCHEMA}"
+        "{SCHEMA}{USAGE_LEDGER_TABLE}{WORKFLOW_TABLES}{WORKFLOW_EVENTS_TABLE}{PERMISSION_REVISION_SCHEMA}{TOOL_USAGE_TABLES}"
     )
 }
 
@@ -610,6 +667,36 @@ pub struct LedgerEntry<'a> {
     pub subscription: bool,
     pub usage: StoredTokenUsage,
     pub cost: Option<f64>,
+}
+
+/// Tool activity on its way into [`tool_ledger`](TOOL_USAGE_TABLES), either one
+/// finished call or a whole bucket being moved between projects. Borrowed for
+/// the same reason [`LedgerEntry`] is: this runs per call.
+pub struct ToolLedgerEntry<'a> {
+    pub bucket_start: i64,
+    pub tool: &'a str,
+    pub source: &'a str,
+    pub cwd: &'a str,
+    pub outcome: ToolOutcome,
+    pub calls: u64,
+    pub duration_ms: u64,
+    pub tokens: u64,
+    pub latency: &'a Latency,
+}
+
+/// One accumulated hour of one tool's calls that ended one way. Counters are
+/// `u64` for the same reason [`UsageBucket`]'s are.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolBucket {
+    pub bucket_start: i64,
+    pub tool: String,
+    pub source: String,
+    pub cwd: String,
+    pub outcome: ToolOutcome,
+    pub calls: u64,
+    pub duration_ms: u64,
+    pub tokens: u64,
+    pub latency: Latency,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1483,6 +1570,42 @@ impl SessionDatabase {
     pub fn prune_usage_before(&self, bucket_start: i64) -> Result<usize, SessionError> {
         Ok(self.connection.execute(
             "DELETE FROM usage_ledger WHERE bucket_start < ?1",
+            params![bucket_start],
+        )?)
+    }
+
+    /// Folds one call into its hourly bucket, the way [`Self::record_usage`]
+    /// folds one turn.
+    pub fn record_tool_call(&self, entry: &ToolLedgerEntry) -> Result<(), SessionError> {
+        let transaction = self.connection.unchecked_transaction()?;
+        merge_tool_bucket(&transaction, entry)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Recorded calls, optionally from `since` and optionally for one exact
+    /// `cwd`, which is what separates the project answer from the global one.
+    pub fn tool_buckets(
+        &self,
+        since: Option<i64>,
+        cwd: Option<&str>,
+    ) -> Result<Vec<ToolBucket>, SessionError> {
+        let mut statement = self.connection.prepare(&format!(
+            "SELECT {TOOL_BUCKET_COLUMNS} FROM tool_ledger \
+             WHERE (?1 IS NULL OR bucket_start >= ?1) AND (?2 IS NULL OR cwd = ?2) \
+             ORDER BY bucket_start DESC, tool ASC, source ASC, cwd ASC, outcome ASC"
+        ))?;
+        let mut rows = statement.query(params![since, cwd])?;
+        let mut buckets = Vec::new();
+        while let Some(row) = rows.next()? {
+            buckets.push(tool_bucket_from_row(row)?);
+        }
+        Ok(buckets)
+    }
+
+    pub fn prune_tool_calls_before(&self, bucket_start: i64) -> Result<usize, SessionError> {
+        Ok(self.connection.execute(
+            "DELETE FROM tool_ledger WHERE bucket_start < ?1",
             params![bucket_start],
         )?)
     }
@@ -3122,9 +3245,53 @@ fn relocate_project_usage_on(
         params![source, destination],
     )?;
     transaction.execute("DELETE FROM usage_ledger WHERE cwd = ?1", params![source])?;
+    // Tool history is keyed by the same cwd, so leaving it behind would move a
+    // project's spend while its activity stayed with the old path.
+    let tool_buckets_merged: i64 = transaction.query_row(
+        // Aliased `from`/`into` rather than `source`/`destination`, because
+        // `source` is also one of the joined columns.
+        "SELECT count(*) FROM tool_ledger AS from_cwd JOIN tool_ledger AS into_cwd \
+         USING (bucket_start, tool, source, outcome) \
+         WHERE from_cwd.cwd = ?1 AND into_cwd.cwd = ?2",
+        params![source, destination],
+        |row| row.get(0),
+    )?;
+    // Read, clear, then merge back under the new path. A histogram cannot be
+    // folded in SQL, and clearing first keeps a move onto the same path from
+    // counting its own rows twice.
+    let mut moving = Vec::new();
+    {
+        let mut statement = transaction.prepare(&format!(
+            "SELECT {TOOL_BUCKET_COLUMNS} FROM tool_ledger WHERE cwd = ?1"
+        ))?;
+        let mut rows = statement.query(params![source])?;
+        while let Some(row) = rows.next()? {
+            moving.push(tool_bucket_from_row(row)?);
+        }
+    }
+    transaction.execute("DELETE FROM tool_ledger WHERE cwd = ?1", params![source])?;
+    for bucket in &moving {
+        merge_tool_bucket(
+            transaction,
+            &ToolLedgerEntry {
+                bucket_start: bucket.bucket_start,
+                tool: &bucket.tool,
+                source: &bucket.source,
+                cwd: destination,
+                outcome: bucket.outcome,
+                calls: bucket.calls,
+                duration_ms: bucket.duration_ms,
+                tokens: bucket.tokens,
+                latency: &bucket.latency,
+            },
+        )?;
+    }
+    let tool_buckets_moved = moving.len();
     Ok(ProjectUsageRelocation {
         buckets_moved,
         buckets_merged: from_i64_usize(buckets_merged, "usage_ledger collisions")?,
+        tool_buckets_moved,
+        tool_buckets_merged: from_i64_usize(tool_buckets_merged, "tool_ledger collisions")?,
     })
 }
 
@@ -3216,6 +3383,7 @@ where
     }
     let subagents = query_subagents(connection, id)?;
     let usage_by_model = query_model_usage(connection, id)?;
+    let tool_usage = query_tool_usage(connection, id)?;
     let subagent_item_count = subagent_messages.values().map(|items| items.len()).sum();
     for (field, actual, expected) in [
         (
@@ -3278,6 +3446,7 @@ where
         subagent_task_specs,
         subagents,
         usage_by_model,
+        tool_usage,
         meta,
         created_at: root.created_at,
         updated_at: root.updated_at,
@@ -4633,6 +4802,27 @@ fn replace_auxiliary<M, U, T>(
             ],
         )?;
     }
+    transaction.execute(
+        "DELETE FROM session_tool_usage WHERE session_id = ?1",
+        params![session.id.as_bytes().as_slice()],
+    )?;
+    for usage in &session.tool_usage {
+        transaction.execute(
+            "INSERT INTO session_tool_usage (\
+                 session_id, tool, source, outcome, calls, duration_ms, tokens, latency\
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                session.id.as_bytes().as_slice(),
+                usage.tool,
+                usage.source,
+                usage.outcome.storage_name(),
+                to_i64(usage.calls, "session_tool_usage.calls")?,
+                to_i64(usage.duration_ms, "session_tool_usage.duration_ms")?,
+                to_i64(usage.tokens, "session_tool_usage.tokens")?,
+                usage.latency.encode(),
+            ],
+        )?;
+    }
     Ok(())
 }
 
@@ -4741,6 +4931,106 @@ fn query_model_usage(
                 subscription_cost: row.get(6)?,
             },
         );
+    }
+    Ok(values)
+}
+
+fn tool_bucket_from_row(row: &rusqlite::Row<'_>) -> Result<ToolBucket, SessionError> {
+    let outcome: String = row.get(4)?;
+    Ok(ToolBucket {
+        bucket_start: row.get(0)?,
+        tool: row.get(1)?,
+        source: row.get(2)?,
+        cwd: row.get(3)?,
+        outcome: ToolOutcome::from_storage_name(&outcome).ok_or(
+            SessionError::CorruptDatabaseValue {
+                field: "tool_ledger.outcome",
+                reason: outcome,
+            },
+        )?,
+        calls: from_i64(row.get(5)?, "tool_ledger.calls")?,
+        duration_ms: from_i64(row.get(6)?, "tool_ledger.duration_ms")?,
+        tokens: from_i64(row.get(7)?, "tool_ledger.tokens")?,
+        latency: Latency::decode(&row.get::<_, Vec<u8>>(8)?, TOOL_LEDGER_LATENCY)?,
+    })
+}
+
+/// Adds one entry to whatever the bucket already holds. SQLite can sum the
+/// counters on conflict but cannot add two histograms, so the existing one is
+/// read and merged here, and the caller supplies the transaction that makes the
+/// pair atomic.
+fn merge_tool_bucket(connection: &Connection, entry: &ToolLedgerEntry) -> Result<(), SessionError> {
+    let outcome = entry.outcome.storage_name();
+    let stored: Option<Vec<u8>> = connection
+        .query_row(
+            "SELECT latency FROM tool_ledger \
+             WHERE bucket_start = ?1 AND tool = ?2 AND source = ?3 AND cwd = ?4 AND outcome = ?5",
+            params![
+                entry.bucket_start,
+                entry.tool,
+                entry.source,
+                entry.cwd,
+                outcome
+            ],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let mut latency = match stored {
+        Some(bytes) => Latency::decode(&bytes, TOOL_LEDGER_LATENCY)?,
+        None => Latency::default(),
+    };
+    latency.merge(entry.latency);
+    connection.execute(
+        "INSERT INTO tool_ledger (bucket_start, tool, source, cwd, outcome, calls, \
+             duration_ms, tokens, latency) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+         ON CONFLICT(bucket_start, tool, source, cwd, outcome) \
+         DO UPDATE SET \
+             calls = calls + excluded.calls, \
+             duration_ms = duration_ms + excluded.duration_ms, \
+             tokens = tokens + excluded.tokens, \
+             latency = excluded.latency",
+        params![
+            entry.bucket_start,
+            entry.tool,
+            entry.source,
+            entry.cwd,
+            outcome,
+            to_i64(entry.calls, "tool_ledger.calls")?,
+            to_i64(entry.duration_ms, "tool_ledger.duration_ms")?,
+            to_i64(entry.tokens, "tool_ledger.tokens")?,
+            latency.encode(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn query_tool_usage(
+    connection: &Connection,
+    id: CaudraId,
+) -> Result<Vec<StoredToolUsage>, SessionError> {
+    let mut statement = connection.prepare(
+        "SELECT tool, source, outcome, calls, duration_ms, tokens, latency \
+         FROM session_tool_usage WHERE session_id = ?1 ORDER BY tool, source, outcome",
+    )?;
+    let mut rows = statement.query(params![id.as_bytes().as_slice()])?;
+    let mut values = Vec::new();
+    while let Some(row) = rows.next()? {
+        let outcome: String = row.get(2)?;
+        values.push(StoredToolUsage {
+            tool: row.get(0)?,
+            source: row.get(1)?,
+            outcome: ToolOutcome::from_storage_name(&outcome).ok_or(
+                SessionError::CorruptDatabaseValue {
+                    field: "session_tool_usage.outcome",
+                    reason: outcome,
+                },
+            )?,
+            calls: from_i64(row.get(3)?, "session_tool_usage.calls")?,
+            duration_ms: from_i64(row.get(4)?, "session_tool_usage.duration_ms")?,
+            tokens: from_i64(row.get(5)?, "session_tool_usage.tokens")?,
+            latency: Latency::decode(&row.get::<_, Vec<u8>>(6)?, SESSION_TOOL_LATENCY)?,
+        });
     }
     Ok(values)
 }
@@ -4899,6 +5189,13 @@ mod tests {
     const LEDGER_TABLE: &str = "usage_ledger";
     const WORKFLOW_RUNS_TABLE: &str = "workflow_runs";
     const WORKFLOW_EVENTS_TABLE_NAME: &str = "workflow_run_events";
+    const TOOL_LEDGER_TABLE_NAME: &str = "tool_ledger";
+    const TOOL_NAME: &str = "file_read";
+    const TOOL_SOURCE: &str = "native";
+    const TOOL_TOKENS: u32 = 120;
+    const OUTCOME_SPLITS_ROWS: &str = "each outcome keeps a row of its own";
+    const TOOL_HISTORY_OUTLIVES_SESSION: &str =
+        "forgetting a transcript must not erase what the project did";
     const MIGRATED_MATCHES_FRESH: &str =
         "a migrated database must end with exactly the schema a fresh one gets";
     const BACKUP_KEEPS_ORIGIN: &str =
@@ -5610,6 +5907,166 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         database.usage_buckets(None).unwrap()
     }
 
+    /// A percentile reports the top of the bucket the call landed in, so the
+    /// expected value is the ceiling of a duration rather than the duration.
+    const P95_OF_30_MS: u64 = 31;
+    const P95_OF_40_MS: u64 = 43;
+    const P95_OF_60_MS: u64 = 63;
+    const P95_OF_90_MS: u64 = 95;
+
+    fn record_tool_at(
+        database: &SessionDatabase,
+        bucket_start: i64,
+        cwd: &str,
+        outcome: ToolOutcome,
+        duration_ms: u64,
+    ) {
+        database
+            .record_tool_call(&ToolLedgerEntry {
+                bucket_start,
+                tool: TOOL_NAME,
+                source: TOOL_SOURCE,
+                cwd,
+                outcome,
+                calls: 1,
+                duration_ms,
+                tokens: u64::from(TOOL_TOKENS),
+                latency: &Latency::of(duration_ms),
+            })
+            .unwrap();
+    }
+
+    fn record_tool(database: &SessionDatabase, cwd: &str, outcome: ToolOutcome, duration_ms: u64) {
+        record_tool_at(database, 0, cwd, outcome, duration_ms);
+    }
+
+    #[test]
+    fn recorded_tool_calls_accumulate_and_keep_the_distribution() {
+        let (_temp, state_dir) = state_dir();
+        let database = SessionDatabase::open(&state_dir).unwrap();
+        record_tool(&database, CWD, ToolOutcome::Ok, 90);
+        record_tool(&database, CWD, ToolOutcome::Ok, 10);
+        record_tool(&database, CWD, ToolOutcome::Timeout, 5);
+
+        let buckets = database.tool_buckets(None, None).unwrap();
+        assert_eq!(buckets.len(), 2, "{OUTCOME_SPLITS_ROWS}");
+        let ok = buckets
+            .iter()
+            .find(|bucket| bucket.outcome == ToolOutcome::Ok)
+            .unwrap();
+        assert_eq!(ok.calls, 2);
+        assert_eq!(ok.duration_ms, 100);
+        assert_eq!(ok.tokens, u64::from(TOOL_TOKENS) * 2);
+        assert_eq!(ok.latency.percentile(1.0), Some(P95_OF_90_MS));
+    }
+
+    #[test]
+    fn tool_buckets_filter_to_one_project() {
+        let (_temp, state_dir) = state_dir();
+        let database = SessionDatabase::open(&state_dir).unwrap();
+        for cwd in [CWD, RELOCATION_DESTINATION] {
+            record_tool(&database, cwd, ToolOutcome::Ok, 1);
+        }
+
+        assert_eq!(database.tool_buckets(None, Some(CWD)).unwrap().len(), 1);
+        assert_eq!(database.tool_buckets(None, None).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn pruning_tool_calls_keeps_buckets_at_the_cutoff() {
+        let (_temp, state_dir) = state_dir();
+        let database = SessionDatabase::open(&state_dir).unwrap();
+        record_tool(&database, CWD, ToolOutcome::Ok, 1);
+        record_tool_at(&database, BUCKET_SECONDS as i64, CWD, ToolOutcome::Ok, 1);
+
+        assert_eq!(
+            database
+                .prune_tool_calls_before(BUCKET_SECONDS as i64)
+                .unwrap(),
+            1
+        );
+        assert_eq!(database.tool_buckets(None, None).unwrap().len(), 1);
+    }
+
+    #[test_case(false; "disjoint")]
+    #[test_case(true; "colliding")]
+    fn relocation_moves_tool_activity_with_the_spend(collision: bool) {
+        let (_temp, state_dir) = state_dir();
+        let mut database = SessionDatabase::open(&state_dir).unwrap();
+        record_tool(&database, CWD, ToolOutcome::Ok, 40);
+        record_tool(&database, CWD, ToolOutcome::Denied, 4);
+        if collision {
+            record_tool(&database, RELOCATION_DESTINATION, ToolOutcome::Ok, 60);
+        }
+
+        let result = database
+            .relocate_project_usage(CWD, RELOCATION_DESTINATION)
+            .unwrap();
+
+        assert_eq!(result.tool_buckets_moved, 2);
+        assert_eq!(result.tool_buckets_merged, usize::from(collision));
+        assert!(database.tool_buckets(None, Some(CWD)).unwrap().is_empty());
+        let moved = database
+            .tool_buckets(None, Some(RELOCATION_DESTINATION))
+            .unwrap();
+        let ok = moved
+            .iter()
+            .find(|bucket| bucket.outcome == ToolOutcome::Ok)
+            .unwrap();
+        assert_eq!(ok.calls, 1 + u64::from(collision));
+        assert_eq!(
+            ok.latency.percentile(1.0),
+            Some(if collision {
+                P95_OF_60_MS
+            } else {
+                P95_OF_40_MS
+            })
+        );
+    }
+
+    #[test]
+    fn a_sessions_tool_usage_survives_a_save_and_load() {
+        let (_temp, state_dir) = state_dir();
+        let mut database = SessionDatabase::open(&state_dir).unwrap();
+        let mut session = TestSession::new(MODEL, CWD);
+        session.add_tool_usage(TOOL_NAME, TOOL_SOURCE, ToolOutcome::Ok, 30, TOOL_TOKENS);
+        session.add_tool_usage(TOOL_NAME, TOOL_SOURCE, ToolOutcome::Ok, 10, TOOL_TOKENS);
+        session.add_tool_usage(TOOL_NAME, TOOL_SOURCE, ToolOutcome::Denied, 2, 0);
+        let id = session.id;
+        database.save(&session, None).unwrap();
+
+        let loaded: TestSession = database.load(id).unwrap();
+        let usage = loaded.tool_usage();
+        assert_eq!(usage.len(), 2, "{OUTCOME_SPLITS_ROWS}");
+        let ok = usage
+            .iter()
+            .find(|row| row.outcome == ToolOutcome::Ok)
+            .unwrap();
+        assert_eq!(ok.calls, 2);
+        assert_eq!(ok.duration_ms, 40);
+        assert_eq!(ok.tokens, u64::from(TOOL_TOKENS) * 2);
+        assert_eq!(ok.latency.percentile(1.0), Some(P95_OF_30_MS));
+    }
+
+    #[test]
+    fn forgetting_a_session_keeps_the_project_tool_history() {
+        let (_temp, state_dir) = state_dir();
+        let mut database = SessionDatabase::open(&state_dir).unwrap();
+        let mut session = TestSession::new(MODEL, CWD);
+        session.add_tool_usage(TOOL_NAME, TOOL_SOURCE, ToolOutcome::Ok, 1, TOOL_TOKENS);
+        let id = session.id;
+        database.save(&session, None).unwrap();
+        record_tool(&database, CWD, ToolOutcome::Ok, 1);
+
+        database.delete(id, None).unwrap();
+
+        assert_eq!(
+            database.tool_buckets(None, None).unwrap().len(),
+            1,
+            "{TOOL_HISTORY_OUTLIVES_SESSION}"
+        );
+    }
+
     #[test_case(false; "disjoint")]
     #[test_case(true; "colliding")]
     fn project_usage_relocation_preserves_full_key_and_every_measure(collision: bool) {
@@ -5665,7 +6122,8 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
             result,
             ProjectUsageRelocation {
                 buckets_moved: 7,
-                buckets_merged: usize::from(collision)
+                buckets_merged: usize::from(collision),
+                ..ProjectUsageRelocation::default()
             }
         );
         let after = database.usage_buckets(None).unwrap();
@@ -5763,6 +6221,7 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
                 Some(ProjectUsageRelocation {
                     buckets_moved: usize::from(has_usage),
                     buckets_merged: usize::from(has_usage),
+                    ..ProjectUsageRelocation::default()
                 })
             );
             assert!(
@@ -5894,7 +6353,8 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
                 .unwrap(),
             ProjectUsageRelocation {
                 buckets_moved: 1,
-                buckets_merged: 1
+                buckets_merged: 1,
+                ..ProjectUsageRelocation::default()
             }
         );
     }
@@ -7999,6 +8459,12 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
             schema_objects(&fresh)
                 .iter()
                 .any(|(_, name, _)| name == WORKFLOW_EVENTS_TABLE_NAME)
+        );
+        assert!(
+            schema_objects(&migrated)
+                .iter()
+                .any(|(_, name, _)| name == TOOL_LEDGER_TABLE_NAME),
+            "{MIGRATED_MATCHES_FRESH}"
         );
     }
 

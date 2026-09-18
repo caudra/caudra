@@ -20,8 +20,13 @@ use crate::tools::{
     TOOL_SEARCH_TOOL_NAME, ToolContext, ToolEffect, ToolSource,
 };
 use crate::workspace_baseline::BaselineOutcome;
-use crate::{AgentError, AgentEvent, LuaToolProvenance, ToolDoneEvent, ToolOutput, ToolStartEvent};
+use crate::{
+    AgentError, AgentEvent, LuaToolProvenance, ToolAccounting, ToolDoneEvent, ToolOutput,
+    ToolStartEvent,
+};
 use caudra_config::ToolKey;
+use caudra_providers::estimate_tokens_cached;
+use caudra_storage::tool_ledger::ToolOutcome as LedgerOutcome;
 
 /// Where a tool's start presentation goes: the transcript, the caller that
 /// asked for it, or nowhere.
@@ -440,7 +445,9 @@ pub async fn run(
     } else {
         input
     };
-    report(&done, canonical, &source, logged_input, started.elapsed());
+    let took = started.elapsed();
+    account(&mut done, &source, took);
+    report(&done, canonical, &source, logged_input, took);
     done
 }
 
@@ -533,6 +540,7 @@ async fn run_inner(
             model_suffix: None,
             model_output: None,
             model_output_from_ref: false,
+            accounting: ToolAccounting::default(),
         }
     };
 
@@ -762,6 +770,7 @@ async fn run_inner(
                     model_suffix: result.model_suffix,
                     model_output: result.model_output,
                     model_output_from_ref: result.model_output_from_ref,
+                    accounting: ToolAccounting::default(),
                 }
             }
             Err(message) => {
@@ -937,6 +946,7 @@ fn run_tool_search(
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        accounting: ToolAccounting::default(),
     }
 }
 
@@ -992,6 +1002,7 @@ async fn run_local_tool(
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        accounting: ToolAccounting::default(),
     }
 }
 
@@ -1131,6 +1142,7 @@ async fn execute_mcp_tool(
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        accounting: ToolAccounting::default(),
     };
 
     if ctx.policy().is_read_only() {
@@ -1339,21 +1351,37 @@ fn tool_source(registry: &ToolRegistry, ctx: &ToolContext, name: &str) -> Cow<'s
 }
 
 /// Low-cardinality buckets, because a raw error message would give the
-/// collector a new attribute value on every call.
-fn classify_error(text: &str) -> &'static str {
+/// collector a new attribute value on every call, and because the ledger keeps
+/// one row per class.
+fn classify_error(text: &str) -> LedgerOutcome {
     let text = text.to_ascii_lowercase();
     if text.contains("cancel") {
-        ERROR_CANCELLED
+        LedgerOutcome::Cancelled
     } else if text.contains("timed out") || text.contains("timeout") {
-        ERROR_TIMEOUT
+        LedgerOutcome::Timeout
     } else if text.contains("permission denied") || text.contains("not allowed") {
-        ERROR_DENIED
+        LedgerOutcome::Denied
     } else if text.contains("no such file") || text.contains("not found") {
-        ERROR_NOT_FOUND
+        LedgerOutcome::NotFound
     } else if text.contains("invalid") || text.contains("expected") {
-        ERROR_INVALID_INPUT
+        LedgerOutcome::InvalidInput
     } else {
-        ERROR_OTHER
+        LedgerOutcome::Other
+    }
+}
+
+/// The attribute value collectors already index on. Kept apart from
+/// [`LedgerOutcome::storage_name`] so renaming a storage value can never
+/// silently rewrite a dashboard's history.
+fn error_type(outcome: LedgerOutcome) -> Option<&'static str> {
+    match outcome {
+        LedgerOutcome::Ok => None,
+        LedgerOutcome::Cancelled => Some(ERROR_CANCELLED),
+        LedgerOutcome::Timeout => Some(ERROR_TIMEOUT),
+        LedgerOutcome::Denied => Some(ERROR_DENIED),
+        LedgerOutcome::NotFound => Some(ERROR_NOT_FOUND),
+        LedgerOutcome::InvalidInput => Some(ERROR_INVALID_INPUT),
+        LedgerOutcome::Other => Some(ERROR_OTHER),
     }
 }
 
@@ -1407,15 +1435,33 @@ fn git_activity(name: &str, input: &Value) {
     }
 }
 
+/// Fills in what only the dispatch site knows, once, so the telemetry event and
+/// the durable ledger describe the same call with the same numbers.
+///
+/// The token estimate runs on `composed_model_output`, which is the exact text
+/// the model will read and which [`crate::tool_output::limit`] has already
+/// bounded, so this counts what the context window is actually charged.
+fn account(done: &mut ToolDoneEvent, source: &str, took: Duration) {
+    let outcome = match done.is_error {
+        true => classify_error(&done.output.as_text()),
+        false => LedgerOutcome::Ok,
+    };
+    done.accounting = ToolAccounting {
+        duration_ms: took.as_millis() as u64,
+        source: Some(Arc::from(source)),
+        outcome: Some(outcome),
+        model_tokens: estimate_tokens_cached(&done.composed_model_output()),
+    };
+}
+
 fn report(done: &ToolDoneEvent, name: &str, source: &str, input: &Value, took: Duration) {
-    let error_text = done.is_error.then(|| done.output.as_text());
     let tool_input = caudra_otel::logs_tool_details().then(|| input.to_string());
     caudra_otel::emit::tool_result(&caudra_otel::emit::ToolResult {
         tool_name: name,
         tool_source: source,
         success: !done.is_error,
         duration: took,
-        error_type: error_text.as_deref().map(classify_error),
+        error_type: done.accounting.outcome.and_then(error_type),
         tool_input: tool_input.as_deref(),
     });
     if !done.is_error {
@@ -3686,15 +3732,47 @@ mod telemetry_tests {
 
     const BEFORE: &str = "a\nb\nc\n";
     const AFTER: &str = "a\nB\nc\nd\n";
+    const CALL_ID: &str = "call-1";
 
-    #[test_case("operation was cancelled", ERROR_CANCELLED; "cancelled")]
-    #[test_case("command timed out after 120s", ERROR_TIMEOUT; "timed_out")]
-    #[test_case("permission denied: bash", ERROR_DENIED; "denied")]
-    #[test_case("no such file or directory", ERROR_NOT_FOUND; "missing_file")]
-    #[test_case("invalid input: expected a string", ERROR_INVALID_INPUT; "invalid")]
-    #[test_case("boom", ERROR_OTHER; "fallback")]
-    fn errors_bucket_into_low_cardinality_types(text: &str, expected: &str) {
-        assert_eq!(classify_error(text), expected);
+    #[test_case("operation was cancelled", LedgerOutcome::Cancelled, ERROR_CANCELLED; "cancelled")]
+    #[test_case("command timed out after 120s", LedgerOutcome::Timeout, ERROR_TIMEOUT; "timed_out")]
+    #[test_case("permission denied: bash", LedgerOutcome::Denied, ERROR_DENIED; "denied")]
+    #[test_case("no such file or directory", LedgerOutcome::NotFound, ERROR_NOT_FOUND; "missing_file")]
+    #[test_case("invalid input: expected a string", LedgerOutcome::InvalidInput, ERROR_INVALID_INPUT; "invalid")]
+    #[test_case("boom", LedgerOutcome::Other, ERROR_OTHER; "fallback")]
+    fn errors_bucket_into_low_cardinality_types(
+        text: &str,
+        outcome: LedgerOutcome,
+        attribute: &str,
+    ) {
+        assert_eq!(classify_error(text), outcome);
+        assert_eq!(error_type(outcome), Some(attribute));
+    }
+
+    #[test]
+    fn a_successful_call_reports_no_error_type() {
+        assert_eq!(error_type(LedgerOutcome::Ok), None);
+    }
+
+    #[test]
+    fn accounting_records_the_outcome_and_what_the_result_costs_the_window() {
+        let mut done = ToolDoneEvent::error(CALL_ID.into(), "no such file or directory");
+        account(&mut done, SOURCE_NATIVE, Duration::from_millis(42));
+
+        assert_eq!(done.accounting.duration_ms, 42);
+        assert_eq!(done.accounting.outcome, Some(LedgerOutcome::NotFound));
+        assert_eq!(done.accounting.source.as_deref(), Some(SOURCE_NATIVE));
+        assert!(done.accounting.model_tokens > 0);
+    }
+
+    #[test]
+    fn a_call_that_succeeded_is_accounted_as_such() {
+        let mut done = ToolDoneEvent::error(CALL_ID.into(), "");
+        done.is_error = false;
+        account(&mut done, SOURCE_NATIVE, Duration::ZERO);
+
+        assert_eq!(done.accounting.outcome, Some(LedgerOutcome::Ok));
+        assert_eq!(done.accounting.model_tokens, 0);
     }
 
     #[test]

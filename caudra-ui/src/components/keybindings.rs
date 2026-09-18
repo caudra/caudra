@@ -193,6 +193,15 @@ pub mod key {
     pub const SCROLL_TOP: Bind = ctrl_bind!('g');
     pub const SCROLL_BOTTOM: Bind = ctrl_bind!('b');
 
+    /// Moves a reporting overlay between the answers it can give: this session,
+    /// this project, everything. Bare, since `Ctrl+G` already scrolls to the
+    /// top, and shared so `/usage` and `/tools` cannot drift apart.
+    pub const SCOPE: Bind = Bind {
+        code: KeyCode::Char('g'),
+        modifiers: KeyModifiers::NONE,
+        label: "g",
+    };
+
     /// The plain keys every overlay's hint bar names. They carry no chord of
     /// their own; they exist so a hint can quote the same spelling a click
     /// resolves.

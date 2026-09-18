@@ -864,6 +864,7 @@ mod tests {
             model_suffix: None,
             model_output: None,
             model_output_from_ref: false,
+            accounting: caudra_agent::types::ToolAccounting::default(),
         }
     }
 

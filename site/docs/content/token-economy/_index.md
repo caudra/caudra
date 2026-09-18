@@ -155,3 +155,40 @@ Two things worth knowing about the numbers:
 - A model with no published price contributes tokens but no cost. Caudra reports how many turns those were rather than counting them as free, so the total is a floor.
 
 The ledger holds one row per hour, model, project, and purpose, so it stays small on its own. [Retention](/docs/sessions/#retention) never touches it, and `--prune-older-than` is how you trim it.
+
+## What the tools cost
+
+Spend answers which models you paid for. `/tools` answers which tools filled the window they were paid for. It opens on the inventory, and `g` cycles through three recorded views before returning there.
+
+| Scope | What it counts |
+| --- | --- |
+| Session | Calls made in the open transcript |
+| Project | Calls made from this directory, across every session |
+| Global | Every call Caudra has recorded |
+
+Each view starts with a totals line and then one row per tool, ordered by call count.
+
+| Column | Meaning |
+| --- | --- |
+| `Calls` | How many times the tool ran |
+| `Err` | Share of those calls that failed |
+| `Share` | The tool's share of every call in the scope |
+| `Tokens` | Estimated tokens the results added to the context |
+| `Tok%` | The tool's share of those tokens |
+| `Time` | Wall clock spent inside the tool |
+| `Time%` | The tool's share of tool time |
+| `Avg` | Mean call |
+| `p50` | The typical call, which the mean overstates once a few are slow |
+| `p95` | The duration 95 calls in 100 finished within |
+
+The table is wider than the modal, so a sideways scroll pans it.
+
+Token figures carry a `~` because they are estimates. Caudra measures them with the o200k tokenizer, which is exact only for OpenAI models, and it measures the result the model actually received, after [result limits](#smaller-results) trimmed it. A tool with a small share of calls and a large share of tokens is the one to configure differently.
+
+The percentiles are approximate for a different reason. A sum survives being merged across hours and projects while a percentile does not, so Caudra records the shape of each tool's durations as a small log-scale histogram rather than keeping every sample. Each figure names the top of the bucket a call landed in, which makes it an upper bound within roughly 12% of the real duration.
+
+Tools that failed get a `Failures` block under the table naming the classes behind the rate: `cancelled`, `timed out`, `denied`, `not found`, `bad input`, and `failed` for the rest. A rate of 40% reads differently once you know it was `denied` every time.
+
+Recorded activity lives in its own ledger, the same way spend does. Session counters go when the session goes. The project and global ledger holds one row per hour, tool, source, outcome, and project, so deleting a transcript leaves the record of what ran behind, and `caudra storage usage --prune-older-than` trims both ledgers in one pass.
+
+Recording starts with this release. Earlier work is absent rather than counted as zero.

@@ -16,7 +16,7 @@ use caudra_agent::tools::{
 use caudra_agent::{
     CodeGraphRow, GrepFileEntry, GrepMatchGroup, NO_FILES_FOUND, SearchCap, ShellFilterInfo,
     ShellOutput, SnapshotLine, SnapshotSpan, SpanStyle, SubagentActivity, SubagentProgress,
-    ToolInput, ToolOutput,
+    ToolAccounting, ToolInput, ToolOutput,
 };
 use caudra_workbench::scroll::SCROLLBAR_THUMB;
 use ratatui::backend::TestBackend;
@@ -329,6 +329,7 @@ fn done(id: &str) -> ToolDoneEvent {
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        accounting: ToolAccounting::default(),
     }
 }
 
@@ -379,6 +380,7 @@ fn shell_done(id: &str, filtered: bool) -> ToolDoneEvent {
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        accounting: ToolAccounting::default(),
     }
 }
 
@@ -420,6 +422,7 @@ fn tool_done_updates_start_status(is_error: bool, expected: ToolStatus) {
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        accounting: ToolAccounting::default(),
     });
 
     assert_eq!(panel.messages.len(), 1);
@@ -456,6 +459,7 @@ fn tool_done_sets_annotation(tool: &'static str, output: ToolOutput, expected: O
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        accounting: ToolAccounting::default(),
     });
     assert_eq!(panel.messages[0].annotation.as_deref(), expected);
 }
@@ -481,6 +485,7 @@ fn tool_done_annotation_merge(output: &str, expected: Option<&str>) {
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        accounting: ToolAccounting::default(),
     });
     assert_eq!(panel.messages[0].annotation.as_deref(), expected);
 }
@@ -515,6 +520,7 @@ fn tool_done_grep_shows_matches() {
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        accounting: ToolAccounting::default(),
     });
     let text = &panel.messages[0].text;
     assert!(!text.contains('\n'), "grep body should not be in msg.text");
@@ -555,6 +561,7 @@ fn a_capped_grep_that_matched_nothing_qualifies_the_absence() {
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        accounting: ToolAccounting::default(),
     });
     render(&mut panel, 80, 24);
     let collapsed = seg_text(&panel, "t1");
@@ -786,6 +793,7 @@ fn unknown_tool_id_is_noop() {
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        accounting: ToolAccounting::default(),
     });
     assert!(panel.messages.is_empty());
 }
@@ -822,6 +830,7 @@ fn in_progress_tracking() {
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        accounting: ToolAccounting::default(),
     });
     assert_eq!(panel.in_progress_count(), 1);
 
@@ -839,6 +848,7 @@ fn in_progress_tracking() {
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        accounting: ToolAccounting::default(),
     });
     assert_eq!(panel.in_progress_count(), 0);
 }
@@ -913,6 +923,7 @@ fn events_before_cache_built_render_correctly() {
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        accounting: ToolAccounting::default(),
     });
     rebuild(&mut panel);
     assert!(seg_text(&panel, "t1").contains("early output"));
@@ -963,6 +974,7 @@ fn bash_live_output_with_code_input() {
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        accounting: ToolAccounting::default(),
     });
     let text = seg_text(&panel, "t1");
     assert!(text.contains("echo hello") && text.contains("done"));
@@ -987,6 +999,7 @@ fn cancel_in_progress_marks_pending_as_error(cache_built: bool) {
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        accounting: ToolAccounting::default(),
     });
     if cache_built {
         rebuild(&mut panel);
@@ -1090,6 +1103,7 @@ fn tick_drains_the_highlight_worker() {
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        accounting: ToolAccounting::default(),
     });
     rebuild(&mut panel);
 
@@ -1141,6 +1155,7 @@ fn tool_done_after_cancel_in_progress_does_not_underflow() {
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        accounting: ToolAccounting::default(),
     });
     assert_eq!(panel.in_progress_count(), 0);
     assert_eq!(msg_status(&panel, "t1"), ToolStatus::Success);
@@ -1194,6 +1209,7 @@ fn search_text_grep_result_includes_structured_output() {
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        accounting: ToolAccounting::default(),
     });
     rebuild(&mut panel);
     let text = seg_search(&panel, "t1");
@@ -1223,6 +1239,7 @@ fn search_text_diff_output_includes_hunks() {
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        accounting: ToolAccounting::default(),
     });
     rebuild(&mut panel);
     let text = seg_search(&panel, "t1");
@@ -1247,6 +1264,7 @@ fn search_text_bash_with_code_input() {
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        accounting: ToolAccounting::default(),
     });
     rebuild(&mut panel);
     let text = seg_search(&panel, "t1");
@@ -2114,6 +2132,7 @@ fn compact_instruction_copy_keeps_its_semantic_label() {
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        accounting: ToolAccounting::default(),
     });
     panel.push(DisplayMessage::new(
         DisplayRole::Assistant,
@@ -2940,6 +2959,7 @@ fn search_text_includes_truncated_bash_output() {
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        accounting: ToolAccounting::default(),
     });
     rebuild(&mut panel);
     assert!(seg_search(&panel, "t1").contains(&full_output));
@@ -2992,6 +3012,7 @@ fn instruction_segment_has_margin_but_no_own_action_handle() {
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        accounting: ToolAccounting::default(),
     });
     rebuild(&mut panel);
 
@@ -3048,6 +3069,7 @@ fn toggle_instruction_segment_expands_and_collapses() {
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        accounting: ToolAccounting::default(),
     });
     rebuild(&mut panel);
 
@@ -3087,6 +3109,7 @@ fn handle_click_on_done_tool_records_click_row() {
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        accounting: ToolAccounting::default(),
     });
     panel.tool_snapshot(
         "t1",
@@ -3155,6 +3178,7 @@ fn tool_done_removes_live_buf_and_snapshots_dirty() {
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        accounting: ToolAccounting::default(),
     });
 
     let msg = panel.find_tool_msg_mut("t1").unwrap();
@@ -3448,6 +3472,7 @@ fn tool_done_without_live_buf_preserves_existing_snapshot() {
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        accounting: ToolAccounting::default(),
     });
 
     let msg = panel.find_tool_msg_mut("t1").unwrap();
@@ -3478,6 +3503,7 @@ fn tool_done_clean_live_buf_does_not_snapshot() {
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        accounting: ToolAccounting::default(),
     });
 
     let msg = panel.find_tool_msg_mut("t1").unwrap();
@@ -3511,6 +3537,7 @@ fn bash_tool_with_snapshot(id: &str) -> MessagesPanel {
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        accounting: ToolAccounting::default(),
     });
     panel.tool_snapshot(
         id,
@@ -4270,6 +4297,7 @@ fn resize_reflows_tool_segment_and_keeps_instruction_segment() {
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        accounting: ToolAccounting::default(),
     });
     render(&mut panel, 80, 10);
 
@@ -4469,6 +4497,7 @@ fn theme_switch_repaints_highlighted_code() {
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        accounting: ToolAccounting::default(),
     });
     render(&mut panel, 80, 20);
     drain_highlight_worker(&mut panel);
@@ -8964,6 +8993,7 @@ fn copying_a_read_body_omits_the_line_number_gutter() {
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        accounting: ToolAccounting::default(),
     });
     let area = Rect::new(0, 0, COPY_WIDTH, COPY_HEIGHT);
     render(&mut panel, COPY_WIDTH, COPY_HEIGHT);

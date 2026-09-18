@@ -726,6 +726,8 @@ impl App {
     fn pan_modal(&mut self, delta: i32) {
         if self.usage_modal.is_open() {
             self.usage_modal.pan(delta);
+        } else if self.tools_modal.is_open() {
+            self.tools_modal.pan(delta);
         } else if self.help_modal.is_open() {
             self.help_modal.pan(delta);
         }

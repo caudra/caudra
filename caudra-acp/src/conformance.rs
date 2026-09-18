@@ -77,7 +77,10 @@ fn prompt_response_reports_usage_in_both_places() {
     for source in [&json["usage"], &json["_meta"]] {
         assert!(source.is_object(), "missing usage source in {json}");
         assert!(source["inputTokens"].is_number(), "no inputTokens: {json}");
-        assert!(source["outputTokens"].is_number(), "no outputTokens: {json}");
+        assert!(
+            source["outputTokens"].is_number(),
+            "no outputTokens: {json}"
+        );
     }
 }
 

@@ -18,6 +18,7 @@ use tracing::warn;
 use crate::id::CaudraId;
 use crate::permission_state::PermissionRuleRecord;
 use crate::thinking::StoredThinking;
+use crate::tool_ledger::{Latency, ToolOutcome};
 use crate::workspace_binding::StoredWorkspaceBinding;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -35,8 +36,8 @@ pub mod sweep;
 pub use database::{
     CheckpointResult, HistoryReadLimits, HistoryReadReport, HistoryRecord,
     HistorySessionReadReport, LedgerEntry, SESSIONS_DB_FILE, SESSIONS_DB_LOCK_FILE, SessionCursor,
-    SessionDatabase, SessionRecreation, SessionStorageStats, TrimReport, UsageBucket,
-    WAL_RETENTION_LIMIT_BYTES,
+    SessionDatabase, SessionRecreation, SessionStorageStats, ToolBucket, ToolLedgerEntry,
+    TrimReport, UsageBucket, WAL_RETENTION_LIMIT_BYTES,
 };
 pub(crate) use database::{from_i64, to_i64};
 pub use lease::SessionLease;
@@ -157,6 +158,20 @@ pub struct StoredTokenUsage {
     /// because no one is invoiced for it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subscription_cost: Option<f64>,
+}
+
+/// One tool's calls within a session that ended one way. The session-scoped
+/// half of the pair `tool_ledger` keeps globally, and the reason `/tools` can
+/// still answer for a session after it is resumed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredToolUsage {
+    pub tool: String,
+    pub source: String,
+    pub outcome: ToolOutcome,
+    pub calls: u64,
+    pub duration_ms: u64,
+    pub tokens: u64,
+    pub latency: Latency,
 }
 
 impl StoredTokenUsage {
@@ -455,6 +470,10 @@ pub struct Session<M, U, T> {
     subagents: Vec<StoredSubagent>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     usage_by_model: HashMap<String, StoredTokenUsage>,
+    /// A list rather than a map because the key is a triple, and because this
+    /// is rewritten whole on every save anyway.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    tool_usage: Vec<StoredToolUsage>,
     #[serde(flatten)]
     pub meta: SessionMeta,
     pub created_at: u64,
@@ -507,6 +526,7 @@ impl<M: Clone, U: Clone, T: Clone> Clone for Session<M, U, T> {
             subagent_task_specs: self.subagent_task_specs.clone(),
             subagents: self.subagents.clone(),
             usage_by_model: self.usage_by_model.clone(),
+            tool_usage: self.tool_usage.clone(),
             meta: self.meta.clone(),
             created_at: self.created_at,
             updated_at: self.updated_at,
@@ -556,6 +576,8 @@ pub struct SessionRelocation {
 pub struct ProjectUsageRelocation {
     pub buckets_moved: usize,
     pub buckets_merged: usize,
+    pub tool_buckets_moved: usize,
+    pub tool_buckets_merged: usize,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -946,6 +968,7 @@ where
             subagent_task_specs: HashMap::new(),
             subagents: Vec::new(),
             usage_by_model: HashMap::new(),
+            tool_usage: Vec::new(),
             meta: SessionMeta::default(),
             created_at: now,
             updated_at: now,
@@ -1285,6 +1308,46 @@ where
 
     pub fn add_model_usage(&mut self, model: &str, usage: StoredTokenUsage) {
         *self.usage_by_model.entry(model.to_owned()).or_default() += usage;
+        self.touch();
+    }
+
+    pub fn tool_usage(&self) -> &[StoredToolUsage] {
+        &self.tool_usage
+    }
+
+    /// Folds one finished call into the row for its tool, source and outcome.
+    /// Linear over a list that holds one entry per tool per outcome, which is
+    /// tens of entries in a long session and cheaper than hashing a triple.
+    pub fn add_tool_usage(
+        &mut self,
+        tool: &str,
+        source: &str,
+        outcome: ToolOutcome,
+        duration_ms: u64,
+        tokens: u32,
+    ) {
+        let tokens = u64::from(tokens);
+        match self
+            .tool_usage
+            .iter_mut()
+            .find(|entry| entry.tool == tool && entry.source == source && entry.outcome == outcome)
+        {
+            Some(entry) => {
+                entry.calls = entry.calls.saturating_add(1);
+                entry.duration_ms = entry.duration_ms.saturating_add(duration_ms);
+                entry.tokens = entry.tokens.saturating_add(tokens);
+                entry.latency.record(duration_ms);
+            }
+            None => self.tool_usage.push(StoredToolUsage {
+                tool: tool.to_owned(),
+                source: source.to_owned(),
+                outcome,
+                calls: 1,
+                duration_ms,
+                tokens,
+                latency: Latency::of(duration_ms),
+            }),
+        }
         self.touch();
     }
 

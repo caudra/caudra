@@ -79,7 +79,7 @@ use crate::components::task_picker::TaskPicker;
 use crate::components::theme_picker::{ThemePicker, ThemePickerAction};
 use crate::components::thinking_picker::{ThinkingPicker, ThinkingPickerAction};
 use crate::components::todo_panel::TodoPanel;
-use crate::components::tools_modal::ToolsModal;
+use crate::components::tools_modal::{ToolsModal, ToolsScope};
 use crate::components::usage_modal::{UsageFetchState, UsageModal, UsageScope};
 use crate::components::which_key::WhichKey;
 use crate::components::workbench::styles as workbench_styles;
@@ -122,6 +122,7 @@ use caudra_storage::id::CaudraId;
 use caudra_storage::input_history::InputHistory;
 use caudra_storage::model::persist_model;
 use caudra_storage::permission_state::mutation::PermissionSnapshot;
+use caudra_storage::tool_ledger::{ToolCall, ToolLedger, ToolStats};
 use caudra_storage::usage_ledger::{LedgerPurpose, LifetimeUsage, TurnUsage, UsageLedger};
 use caudra_storage::view::ViewMode;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent};
@@ -336,6 +337,9 @@ pub struct App {
     /// Read from the ledger when the modal asks for it, not on every frame:
     /// the table outlives sessions and only grows.
     pub(super) lifetime_usage: Option<LifetimeUsage>,
+    /// Recorded tool activity for the scope `/tools` is showing. `None` means
+    /// not loaded yet or unreadable; the modal tells those apart by scope.
+    pub(super) tool_stats: Option<ToolStats>,
     pub(super) goal_modal: GoalModal,
     pub(super) stream_modal: StreamModal,
     pub(super) float_mgr: FloatManager,
@@ -566,6 +570,7 @@ impl App {
             storage_modal: StorageModal::new(),
             context_snapshot: Watch::default(),
             lifetime_usage: None,
+            tool_stats: None,
             goal_modal: GoalModal::default(),
             stream_modal: StreamModal::new(typewriter),
             float_mgr: FloatManager::new(),
@@ -1786,7 +1791,11 @@ impl App {
 
         if self.tools_modal.is_open() {
             guard_repeat!(false);
+            let scope = self.tools_modal.scope();
             self.tools_modal.handle_key(key);
+            if self.tools_modal.scope() != scope {
+                self.load_tool_stats();
+            }
             return Some(vec![]);
         }
 
@@ -3096,6 +3105,7 @@ impl App {
     fn execute_tools(&mut self) {
         self.context_snapshot = Watch::seeded(self.active_context_snapshot());
         self.tools_modal.open();
+        self.load_tool_stats();
     }
 
     fn execute_skills(&mut self) {
@@ -3705,6 +3715,7 @@ impl App {
         }
 
         if let AgentEvent::ToolDone(ref e) = envelope.event {
+            self.record_tool_call(e);
             // Whatever the call opened and never claimed was a prediction the
             // call disagreed with: bad arguments, or a child `batch` refused.
             if subagent_id.is_none() {
@@ -5032,6 +5043,59 @@ impl App {
             Ok(lifetime) => self.lifetime_usage = Some(lifetime),
             Err(error) => tracing::warn!(%error, "lifetime usage unavailable"),
         }
+    }
+
+    /// Reads the ledger for the scope `/tools` is showing, which is a snapshot
+    /// of when it was asked for rather than a live view: re-querying per tool
+    /// call would put a synchronous read on the event loop for a panel nobody
+    /// is usually watching. Called on open and on every scope change, so an
+    /// answer is never older than the panel showing it.
+    ///
+    /// A failure leaves `None`, which the modal renders as unavailable rather
+    /// than as no activity.
+    fn load_tool_stats(&mut self) {
+        self.tool_stats = None;
+        let cwd = match self.tools_modal.scope() {
+            ToolsScope::Project => Some(self.state.session.cwd.clone()),
+            ToolsScope::Global => None,
+            ToolsScope::Inventory | ToolsScope::Session => return,
+        };
+        let stats = ToolLedger::open(&self.storage).and_then(|ledger| match &cwd {
+            Some(cwd) => ledger.project(cwd),
+            None => ledger.lifetime(),
+        });
+        match stats {
+            Ok(stats) => self.tool_stats = Some(stats),
+            Err(error) => tracing::warn!(%error, "tool activity unavailable"),
+        }
+    }
+
+    /// The one place a finished call is recorded. The session keeps its own
+    /// breakdown so `/tools` can still answer for it after a resume, and the
+    /// ledger keeps the project's history: a forgotten session must not take
+    /// what it did with it.
+    ///
+    /// A call with no accounting never reached the dispatch site that fills it
+    /// in — a synthetic cancellation, say — and recording a zero for it would
+    /// invent activity.
+    fn record_tool_call(&mut self, done: &caudra_agent::ToolDoneEvent) {
+        let (Some(outcome), Some(source)) = (done.accounting.outcome, &done.accounting.source)
+        else {
+            return;
+        };
+        let duration_ms = done.accounting.duration_ms;
+        let tokens = done.accounting.model_tokens;
+        self.state
+            .session_mut()
+            .add_tool_usage(&done.tool, source, outcome, duration_ms, tokens);
+        self.storage_writer.record_tool_call(ToolCall {
+            tool: done.tool.to_string(),
+            source: source.to_string(),
+            cwd: self.state.session.cwd.clone(),
+            outcome,
+            duration_ms,
+            tokens,
+        });
     }
 
     /// The one place a turn's spend is recorded. The session keeps its own

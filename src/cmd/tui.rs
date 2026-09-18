@@ -884,10 +884,15 @@ fn relocate_stopped_sessions(
         ));
     }
     let usage = match result.project_usage {
-        Some(usage) if usage.buckets_moved == 0 => RELOCATION_USAGE_EMPTY.into(),
+        Some(usage) if usage.buckets_moved == 0 && usage.tool_buckets_moved == 0 => {
+            RELOCATION_USAGE_EMPTY.into()
+        }
         Some(usage) => format!(
-            "Historical project usage migrated: {} bucket(s) moved ({} merged into existing destination buckets)",
-            usage.buckets_moved, usage.buckets_merged
+            "Historical project usage migrated: {} spend bucket(s) and {} tool bucket(s) moved ({} and {} merged into existing destination buckets)",
+            usage.buckets_moved,
+            usage.tool_buckets_moved,
+            usage.buckets_merged,
+            usage.tool_buckets_merged
         ),
         None => RELOCATION_USAGE_UNCHANGED.into(),
     };
@@ -1640,7 +1645,7 @@ mod tests {
     const INJECTED_CWD_FAILURE: &str = "injected working directory failure";
     const INJECTED_CONFIG_FAILURE: &str = "injected destination config failure";
     const RELOCATION_COMMITTED: &str = "Relocation committed";
-    const RELOCATION_USAGE_MIGRATED: &str = "Historical project usage migrated: 2 bucket(s) moved (1 merged into existing destination buckets)";
+    const RELOCATION_USAGE_MIGRATED: &str = "Historical project usage migrated: 2 spend bucket(s) and 0 tool bucket(s) moved (1 and 0 merged into existing destination buckets)";
     const RELOCATION_TEST_USAGE: StoredTokenUsage = StoredTokenUsage {
         input: 11,
         output: 7,

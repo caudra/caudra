@@ -41,7 +41,7 @@ use caudra_agent::workspace_baseline::BaselineOutcome;
 use caudra_agent::{
     DoneReason, GoalResult, GoalStatus, GoalVerdict, HistorySnapshot, ImageMediaType,
     McpConfigErrors, McpServerInfo, McpServerStatus, McpSnapshot, McpSnapshotReader,
-    SubagentActivity, SubagentProgress, ToolDoneEvent, ToolOutput, ToolStartEvent,
+    SubagentActivity, SubagentProgress, ToolAccounting, ToolDoneEvent, ToolOutput, ToolStartEvent,
     TurnCompleteEvent,
 };
 use caudra_config::{
@@ -897,6 +897,7 @@ fn fresh_session_uses_local_plan_until_matching_tool_completion() {
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        accounting: ToolAccounting::default(),
     }))));
 
     assert_eq!(
@@ -957,6 +958,7 @@ fn tool_done_transitions_plan_to_ready(
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        accounting: ToolAccounting::default(),
     }))));
 
     assert_eq!(app.state.plan.is_ready(), expect_ready);
@@ -993,6 +995,7 @@ fn tool_done_completes_only_the_matching_remote_plan() {
             model_suffix: None,
             model_output: None,
             model_output_from_ref: false,
+            accounting: ToolAccounting::default(),
         })))
     };
 
@@ -1684,6 +1687,7 @@ fn tool_lifecycle_events_name_the_session_and_tool() {
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        accounting: ToolAccounting::default(),
     }))));
 
     let (event, data) = probe.try_recv_autocmd().expect("ToolDone fired");
@@ -1823,6 +1827,7 @@ fn tool_done_msg(id: &str) -> Msg {
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        accounting: ToolAccounting::default(),
     })))
 }
 
@@ -2920,6 +2925,7 @@ pub(crate) fn finish_subagent(app: &mut App, id: &str, is_error: bool) {
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        accounting: ToolAccounting::default(),
     }))));
 }
 
@@ -13305,6 +13311,7 @@ fn plan_app() -> App {
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        accounting: ToolAccounting::default(),
     }))));
     app
 }
@@ -13331,6 +13338,7 @@ fn tool_done_write_opens_plan_form(mode: Mode, expect_form: bool) {
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        accounting: ToolAccounting::default(),
     }))));
     assert_eq!(app.plan_form.is_visible(), expect_form);
     if expect_form {
@@ -13370,6 +13378,7 @@ fn re_edit_keeps_plan_form_visible() {
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        accounting: ToolAccounting::default(),
     }))));
     assert!(matches!(app.state.plan, PlanState::Ready(_)));
     assert!(app.plan_form.is_visible());
@@ -13447,6 +13456,7 @@ fn rewrite_plan(app: &mut App) {
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
+        accounting: ToolAccounting::default(),
     }))));
 }
 
@@ -16197,6 +16207,7 @@ fn two_tool_results_checkpointed_separately_both_reach_disk() {
             model_suffix: None,
             model_output: None,
             model_output_from_ref: false,
+            accounting: ToolAccounting::default(),
         }))));
         app.checkpoint();
     }

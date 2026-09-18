@@ -367,9 +367,12 @@ mod tests {
 
     #[test]
     fn question_permission_request_marks_the_call_as_an_interaction() {
-        let req =
-            question_permission_request("sess_1", Some("toolu_9".to_owned()), &single_choice_input())
-                .unwrap();
+        let req = question_permission_request(
+            "sess_1",
+            Some("toolu_9".to_owned()),
+            &single_choice_input(),
+        )
+        .unwrap();
         let json = serde_json::to_value(&req).unwrap();
 
         assert_eq!(json["toolCall"]["toolCallId"], "interaction_toolu_9");

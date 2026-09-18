@@ -18,6 +18,7 @@ use caudra_storage::sessions::sweep::{
     self, Action, ExecuteReport, OutcomeKind, Plan, PruneReport,
 };
 use caudra_storage::sessions::{SESSIONS_DB_FILE, SessionDatabase, UsageBucket, cache_hit_rate};
+use caudra_storage::tool_ledger::ToolLedger;
 use caudra_storage::usage_ledger::UsageLedger;
 use color_eyre::Result;
 use color_eyre::eyre::{Context, bail, eyre};
@@ -278,10 +279,17 @@ pub fn run(action: StorageAction, no_plugins: bool, no_jit: bool) -> Result<()> 
         } => {
             let ledger = UsageLedger::open(&state_dir).context("open usage ledger")?;
             if let Some(duration) = prune_older_than {
+                // Tool activity is pruned with spend: a user who asks to forget
+                // one does not expect the other to survive.
+                let cutoff = epoch_cutoff(duration)?;
                 let removed = ledger
-                    .prune_before(epoch_cutoff(duration)?)
+                    .prune_before(cutoff)
                     .context("prune recorded spend")?;
+                let tools = ToolLedger::open(&state_dir)
+                    .and_then(|tools| tools.prune_before(cutoff))
+                    .context("prune recorded tool activity")?;
                 println!("pruned_buckets: {removed}");
+                println!("pruned_tool_buckets: {tools}");
                 return Ok(());
             }
             let since = since.map(epoch_cutoff).transpose()?;

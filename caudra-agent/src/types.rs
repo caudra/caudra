@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use caudra_providers::{AgentError, Billing, ContentBlock, Message, Role, StopReason, TokenUsage};
+use caudra_storage::tool_ledger::ToolOutcome;
 use caudra_storage::tool_outputs::ToolOutputRef;
 use caudra_storage::usage_ledger::LedgerPurpose;
 use caudra_workflow::{
@@ -1222,6 +1223,21 @@ pub struct ToolDoneEvent {
     pub model_output: Option<String>,
     #[serde(skip)]
     pub model_output_from_ref: bool,
+    /// What the call cost in wall clock, how it ended, where the tool came
+    /// from, and how much of the context window its result took. Filled once,
+    /// after bounding, so telemetry and the durable ledger cannot disagree.
+    /// Skipped by serde: this is host accounting, not part of any transcript or
+    /// protocol.
+    #[serde(skip)]
+    pub accounting: ToolAccounting,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ToolAccounting {
+    pub duration_ms: u64,
+    pub source: Option<Arc<str>>,
+    pub outcome: Option<ToolOutcome>,
+    pub model_tokens: u32,
 }
 
 const UNKNOWN_TOOL: &str = "unknown";
@@ -1244,6 +1260,7 @@ impl ToolDoneEvent {
             model_suffix: None,
             model_output: None,
             model_output_from_ref: false,
+            accounting: ToolAccounting::default(),
         }
     }
 
@@ -2562,6 +2579,7 @@ mod tests {
                 model_suffix: None,
                 model_output: None,
                 model_output_from_ref: false,
+                accounting: ToolAccounting::default(),
             },
             ToolDoneEvent {
                 id: "t2".into(),
@@ -2577,6 +2595,7 @@ mod tests {
                 model_suffix: None,
                 model_output: None,
                 model_output_from_ref: false,
+                accounting: ToolAccounting::default(),
             },
         ]);
         assert!(matches!(msg.role, Role::User));
@@ -2606,6 +2625,7 @@ mod tests {
                 model_suffix: None,
                 model_output: None,
                 model_output_from_ref: false,
+                accounting: ToolAccounting::default(),
             }
             .with_model_suffix(Some(suffix.into()))
         };
@@ -2646,6 +2666,7 @@ mod tests {
             model_suffix: Some("model context".into()),
             model_output: Some("bounded preview\n\nmodel context".into()),
             model_output_from_ref: false,
+            accounting: ToolAccounting::default(),
         };
 
         let serialized = serde_json::to_value(&done).unwrap();
@@ -2685,6 +2706,7 @@ mod tests {
             model_suffix: None,
             model_output: None,
             model_output_from_ref: false,
+            accounting: ToolAccounting::default(),
         }
         .with_model_suffix(Some(MODEL_SUFFIX.into()));
 
@@ -2722,6 +2744,7 @@ mod tests {
             model_suffix: None,
             model_output: None,
             model_output_from_ref: false,
+            accounting: ToolAccounting::default(),
         };
 
         let msg = tool_results(vec![
@@ -2818,6 +2841,7 @@ mod tests {
             model_suffix: None,
             model_output: None,
             model_output_from_ref: false,
+            accounting: ToolAccounting::default(),
         };
         assert!(ok_event.wrote_to(Path::new("/plans/slug.md")));
         assert!(!ok_event.wrote_to(Path::new("/plans/other.md")));
@@ -2845,6 +2869,7 @@ mod tests {
             model_suffix: None,
             model_output: None,
             model_output_from_ref: false,
+            accounting: ToolAccounting::default(),
         };
 
         assert_eq!(event.written_path(), Some("/project/first.rs"));
@@ -2878,6 +2903,7 @@ mod tests {
             model_suffix: None,
             model_output: None,
             model_output_from_ref: false,
+            accounting: ToolAccounting::default(),
         };
         assert_eq!(event.written_path(), Some(plan));
         assert!(!event.wrote_to(Path::new(plan)));
@@ -3123,6 +3149,7 @@ mod tests {
             model_suffix: None,
             model_output: None,
             model_output_from_ref: false,
+            accounting: ToolAccounting::default(),
         };
         assert_eq!(event.written_path(), expected);
     }

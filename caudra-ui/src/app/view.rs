@@ -9,6 +9,7 @@ use crate::components::keybindings::KeybindContext;
 use crate::components::queue_panel;
 use crate::components::split_layout::{MIN_CHAT_ROWS, SplitLayout, carve};
 use crate::components::status_bar::{StatusBarContext, UsageStats, workflow_chip};
+use crate::components::tools_modal::ToolsModalContext;
 use crate::components::usage_modal::UsageModalContext;
 use crate::selection::{self, SelectableZone, SelectionZone, ZoneRegistry};
 use crate::theme;
@@ -527,8 +528,12 @@ impl App {
             }
         }
         if self.tools_modal.is_open() {
-            let snapshot = self.context_snapshot.get();
-            let r = self.tools_modal.view(frame, full, snapshot);
+            let ctx = ToolsModalContext {
+                snapshot: self.context_snapshot.get(),
+                session: self.state.session.tool_usage(),
+                recorded: self.tool_stats.as_ref(),
+            };
+            let r = self.tools_modal.view(frame, full, &ctx);
             if r.width > 0 {
                 overlay_rect = r;
             }
