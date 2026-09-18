@@ -30,6 +30,8 @@ use crate::{StateDir, StorageError, now_epoch};
 mod database;
 #[path = "sessions/lease.rs"]
 mod lease;
+#[path = "sessions/migration.rs"]
+pub mod migration;
 #[path = "sessions/sweep.rs"]
 pub mod sweep;
 

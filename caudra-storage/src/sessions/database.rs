@@ -33,7 +33,7 @@ use crate::permission_state::{
     validate_conversation_record, validate_review_only_change,
 };
 use caudra_workspace::WorkspacePath;
-use rusqlite::backup::Backup;
+use rusqlite::backup::{Backup, Progress as BackupProgress};
 use rusqlite::ffi::{self, Error as SqliteErrorCode};
 use rusqlite::limits::Limit;
 use rusqlite::types::Value as SqlValue;
@@ -48,6 +48,7 @@ use tempfile::NamedTempFile;
 use tracing::warn;
 
 use super::lease::SessionLease;
+use super::migration::{MigrationEvent, report as report_migration};
 use super::{
     ProjectUsageRelocation, SESSION_VERSION, Session, SessionError, SessionLocation, SessionMeta,
     SessionRelocation, SessionRelocationResult, SessionSummary, StoredSubagent,
@@ -104,6 +105,8 @@ const MAX_EAGER_LOAD_BYTES: usize = 512 * 1024 * 1024;
 /// buys under 0.4x more ratio for a 30x slower compress.
 const PAYLOAD_COMPRESSION_LEVEL: i32 = 3;
 const PAYLOAD_DECOMPRESSION_FAILED: &str = "payload could not be decompressed";
+/// Rows between progress reports during a payload rewrite.
+const PAYLOAD_PROGRESS_INTERVAL: u64 = 512;
 const OWNER_FILE_MODE: u32 = 0o600;
 const OTHER_USER_PERMISSIONS: u32 = 0o077;
 const DATABASE_SIDECAR_SUFFIXES: [&str; 3] = ["-wal", "-shm", "-journal"];
@@ -4182,6 +4185,17 @@ fn reject_unmigratable(version: i64) -> Result<(), SessionError> {
     Ok(())
 }
 
+/// `run_to_completion` takes a bare function pointer, so what this forwards to
+/// has to be reachable without a capture.
+fn report_backup_progress(progress: BackupProgress) {
+    let total = progress.pagecount.max(0) as u64;
+    let remaining = progress.remaining.max(0) as u64;
+    report_migration(MigrationEvent::Backup {
+        done: total.saturating_sub(remaining),
+        total,
+    });
+}
+
 /// Copies the database beside itself before the first migration step, so a
 /// failed upgrade leaves the original readable by the version that wrote it.
 fn back_up_before_migration(
@@ -4196,7 +4210,7 @@ fn back_up_before_migration(
     Backup::new(connection, &mut destination)?.run_to_completion(
         BACKUP_PAGES_PER_STEP,
         Duration::ZERO,
-        None,
+        Some(report_backup_progress),
     )?;
     destination.close().map_err(|(_, error)| error)?;
     #[cfg(unix)]
@@ -4215,6 +4229,10 @@ fn migrate_to_current(
     version: i64,
 ) -> Result<(), SessionError> {
     verify_application_id(connection)?;
+    report_migration(MigrationEvent::Started {
+        from: version,
+        to: SCHEMA_VERSION,
+    });
     let backup = back_up_before_migration(connection, state_dir, version)?;
     let mut current = version;
     while current < SCHEMA_VERSION {
@@ -4224,6 +4242,10 @@ fn migrate_to_current(
                 supported: SCHEMA_VERSION,
             });
         };
+        report_migration(MigrationEvent::Step {
+            from: step.from,
+            to: step.to,
+        });
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Exclusive)?;
         transaction.execute_batch(step.sql)?;
         if step.to == 7 {
@@ -4242,6 +4264,10 @@ fn migrate_to_current(
         backup = %backup.display(),
         "migrated session database schema"
     );
+    report_migration(MigrationEvent::Finished {
+        from: version,
+        to: SCHEMA_VERSION,
+    });
     Ok(())
 }
 
@@ -4265,9 +4291,20 @@ fn compress_existing_payloads(transaction: &Transaction<'_>) -> Result<(), Sessi
             key_count + 1,
             key_count + 2
         ))?;
+        let counted: i64 = transaction.query_row(
+            &format!("SELECT count(*) FROM {legacy}"),
+            [],
+            |row| row.get(0),
+        )?;
+        let total = from_i64(counted, "legacy payload rows")?;
         let mut rows = select.query([])?;
         let mut moved: u64 = 0;
         let mut stored: u64 = 0;
+        report_migration(MigrationEvent::Rewrite {
+            table,
+            done: 0,
+            total,
+        });
         while let Some(row) = rows.next()? {
             let mut values = Vec::with_capacity(key_count + 2);
             for index in 0..key_count {
@@ -4280,7 +4317,21 @@ fn compress_existing_payloads(transaction: &Transaction<'_>) -> Result<(), Sessi
             values.push(SqlValue::Integer(to_i64(payload.len(), "payload bytes")?));
             insert.execute(params_from_iter(values))?;
             moved += 1;
+            // Reporting every row would cost more than the rewrite on a large
+            // transcript, and no reader can see that resolution anyway.
+            if moved.is_multiple_of(PAYLOAD_PROGRESS_INTERVAL) {
+                report_migration(MigrationEvent::Rewrite {
+                    table,
+                    done: moved,
+                    total,
+                });
+            }
         }
+        report_migration(MigrationEvent::Rewrite {
+            table,
+            done: moved,
+            total,
+        });
         tracing::info!(table, rows = moved, stored_bytes = stored, "compressed payloads");
     }
     for rewrite in &COMPRESSED_PAYLOAD_TABLES {
