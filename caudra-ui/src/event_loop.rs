@@ -1070,7 +1070,9 @@ impl SpawnCtx {
                 Vec::new()
             }
         };
+        let active_history_ms = lap();
         let archived_history = crate::archived_session_history(&session);
+        let archived_history_ms = lap();
         let restore_session = !initial_history.is_empty() || session_has_content(&session);
         let (system_prompt_profile_name, system_prompt_profile, profile_warning) =
             self.resolve_prompt_profile(&session);
@@ -1086,7 +1088,9 @@ impl SpawnCtx {
         if let Some(limit) = session.meta.goal_continuation_limit {
             goal.set_continuation_limit(limit);
         }
+        let permissions_ms = lap();
         let subagent_history = crate::agent::stored_subagent_history(&session);
+        let subagent_history_ms = lap();
         let handles = AgentHandles::spawn(
             &self.model_slot,
             initial_history,
@@ -1196,6 +1200,10 @@ impl SpawnCtx {
         info!(
             session_id = %session_id,
             prepare_ms,
+            active_history_ms,
+            archived_history_ms,
+            permissions_ms,
+            subagent_history_ms,
             agent_spawn_ms,
             app_new_ms,
             restore_ms = lap(),
