@@ -954,9 +954,9 @@ pub fn persisted_session_ids(dir: &StateDir) -> Result<Vec<CaudraId>, SessionErr
 
 impl<M, U, T> Session<M, U, T>
 where
-    M: Serialize + DeserializeOwned + TitleSource + Clone,
-    U: Serialize + DeserializeOwned + Default,
-    T: Serialize + DeserializeOwned,
+    M: Serialize + DeserializeOwned + TitleSource + Clone + Send,
+    U: Serialize + DeserializeOwned + Default + Send,
+    T: Serialize + DeserializeOwned + Send,
 {
     pub fn new(model: &str, cwd: &str) -> Self {
         Self::new_with_workspace(model, cwd, StoredWorkspaceBinding::local_from_cwd(cwd))

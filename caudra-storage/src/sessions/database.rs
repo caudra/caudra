@@ -20,12 +20,14 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, c_int};
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io;
+use std::num::NonZeroUsize;
 use std::ops::ControlFlow;
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf, absolute};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::thread::{self, available_parallelism};
 use std::time::Duration;
 
 use crate::permission_state::{
@@ -110,6 +112,9 @@ const PAYLOAD_PROGRESS_INTERVAL: u64 = 512;
 /// Pages between progress reports while a freelist is being reclaimed.
 const RECLAIM_PROGRESS_INTERVAL: u64 = 1024;
 const WAL_JOURNAL_MODE: &str = "wal";
+/// Rows one decode worker must have before a second one is worth starting.
+const PARALLEL_DECODE_MIN_ROWS: usize = 256;
+const DECODE_WORKER_PANICKED: &str = "a payload decode worker panicked";
 const OWNER_FILE_MODE: u32 = 0o600;
 const OTHER_USER_PERMISSIONS: u32 = 0o077;
 const DATABASE_SIDECAR_SUFFIXES: [&str; 3] = ["-wal", "-shm", "-journal"];
@@ -2188,9 +2193,9 @@ impl SessionDatabase {
 
     pub fn load<M, U, T>(&self, id: CaudraId) -> Result<Session<M, U, T>, SessionError>
     where
-        M: DeserializeOwned,
-        U: DeserializeOwned + Default,
-        T: DeserializeOwned,
+        M: DeserializeOwned + Send,
+        U: DeserializeOwned + Default + Send,
+        T: DeserializeOwned + Send,
     {
         self.load_with_cursor(id).map(|(session, _)| session)
     }
@@ -2200,9 +2205,9 @@ impl SessionDatabase {
         id: CaudraId,
     ) -> Result<(Session<M, U, T>, SessionCursor), SessionError>
     where
-        M: DeserializeOwned,
-        U: DeserializeOwned + Default,
-        T: DeserializeOwned,
+        M: DeserializeOwned + Send,
+        U: DeserializeOwned + Default + Send,
+        T: DeserializeOwned + Send,
     {
         // Root counters, payload rows, and the resulting cursor must describe
         // one snapshot; mixing autocommit reads can lose references.
@@ -3405,9 +3410,9 @@ fn load_on<M, U, T>(
     id: CaudraId,
 ) -> Result<(Session<M, U, T>, SessionCursor), SessionError>
 where
-    M: DeserializeOwned,
-    U: DeserializeOwned + Default,
-    T: DeserializeOwned,
+    M: DeserializeOwned + Send,
+    U: DeserializeOwned + Default + Send,
+    T: DeserializeOwned + Send,
 {
     let root = root_on(connection, id)?;
     if root.format_version != SESSION_VERSION {
@@ -4730,6 +4735,67 @@ fn decompress_payload(stored: &[u8], field: &'static str) -> Result<String, Sess
     })
 }
 
+/// Decompresses and parses stored payloads, spreading the work across cores
+/// once there is enough of it to pay for the threads.
+///
+/// Reading rows stays on the connection's thread, because a SQLite connection
+/// is not shareable, but everything after the read is per-row and independent.
+/// This is where loading a large session spends its time: one real session
+/// holds 317 MB of JSON across 43,889 rows, and decompressing it costs about
+/// 0.3 s against seconds of parsing.
+fn decode_payloads<T: DeserializeOwned + Send>(
+    stored: Vec<Vec<u8>>,
+    field: &'static str,
+) -> Result<Vec<T>, SessionError> {
+    let workers = decode_workers(stored.len());
+    if workers == 1 {
+        return stored
+            .iter()
+            .map(|payload| decode_payload(payload, field))
+            .collect();
+    }
+    let chunk = stored.len().div_ceil(workers);
+    thread::scope(|scope| {
+        let handles: Vec<_> = stored
+            .chunks(chunk)
+            .map(|rows| {
+                scope.spawn(move || {
+                    rows.iter()
+                        .map(|payload| decode_payload(payload, field))
+                        .collect::<Result<Vec<T>, SessionError>>()
+                })
+            })
+            .collect();
+        let mut values = Vec::with_capacity(stored.len());
+        for handle in handles {
+            values.extend(handle.join().map_err(|_| SessionError::CorruptDatabaseValue {
+                field,
+                reason: DECODE_WORKER_PANICKED.to_owned(),
+            })??);
+        }
+        Ok(values)
+    })
+}
+
+/// One worker below the threshold, so a small session never pays for a thread
+/// it cannot keep busy.
+fn decode_workers(rows: usize) -> usize {
+    if rows < PARALLEL_DECODE_MIN_ROWS {
+        return 1;
+    }
+    available_parallelism()
+        .map(NonZeroUsize::get)
+        .unwrap_or(1)
+        .min(rows.div_ceil(PARALLEL_DECODE_MIN_ROWS))
+}
+
+fn decode_payload<T: DeserializeOwned>(
+    stored: &[u8],
+    field: &'static str,
+) -> Result<T, SessionError> {
+    deserialize_json(&decompress_payload(stored, field)?, field)
+}
+
 /// Reads one stored payload column and returns the JSON text it holds.
 fn payload_from_row(
     row: &rusqlite::Row<'_>,
@@ -5170,38 +5236,40 @@ fn replace_auxiliary<M, U, T>(
     Ok(())
 }
 
-fn query_json_rows<T: DeserializeOwned>(
+fn query_json_rows<T: DeserializeOwned + Send>(
     connection: &Connection,
     sql: &str,
     id: CaudraId,
 ) -> Result<Vec<T>, SessionError> {
     let mut statement = connection.prepare(sql)?;
     let mut rows = statement.query(params![id.as_bytes().as_slice()])?;
-    let mut values = Vec::new();
+    let mut stored = Vec::new();
     while let Some(row) = rows.next()? {
-        let payload = payload_from_row(row, 0, "payload")?;
-        values.push(deserialize_json(&payload, "payload")?);
+        stored.push(row.get::<_, Vec<u8>>(0)?);
     }
-    Ok(values)
+    decode_payloads(stored, "payload")
 }
 
-fn query_keyed_json_rows<T: DeserializeOwned>(
+fn query_keyed_json_rows<T: DeserializeOwned + Send>(
     connection: &Connection,
     sql: &str,
     id: CaudraId,
 ) -> Result<Vec<(String, T)>, SessionError> {
     let mut statement = connection.prepare(sql)?;
     let mut rows = statement.query(params![id.as_bytes().as_slice()])?;
-    let mut values = Vec::new();
+    let mut keys = Vec::new();
+    let mut stored = Vec::new();
     while let Some(row) = rows.next()? {
-        let key: String = row.get(0)?;
-        let payload = payload_from_row(row, 1, "payload")?;
-        values.push((key, deserialize_json(&payload, "payload")?));
+        keys.push(row.get::<_, String>(0)?);
+        stored.push(row.get::<_, Vec<u8>>(1)?);
     }
-    Ok(values)
+    Ok(keys
+        .into_iter()
+        .zip(decode_payloads(stored, "payload")?)
+        .collect())
 }
 
-fn query_subagent_rows<T: DeserializeOwned>(
+fn query_subagent_rows<T: DeserializeOwned + Send>(
     connection: &Connection,
     session_id: CaudraId,
     subagent_id: &str,
@@ -5211,12 +5279,11 @@ fn query_subagent_rows<T: DeserializeOwned>(
          WHERE session_id = ?1 AND subagent_id = ?2 ORDER BY ordinal",
     )?;
     let mut rows = statement.query(params![session_id.as_bytes().as_slice(), subagent_id])?;
-    let mut values = Vec::new();
+    let mut stored = Vec::new();
     while let Some(row) = rows.next()? {
-        let payload = payload_from_row(row, 0, "subagent history payload")?;
-        values.push(deserialize_json(&payload, "subagent history payload")?);
+        stored.push(row.get::<_, Vec<u8>>(0)?);
     }
-    Ok(values)
+    decode_payloads(stored, "subagent history payload")
 }
 
 fn query_subagents(
