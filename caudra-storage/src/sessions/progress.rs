@@ -27,6 +27,8 @@ pub enum MigrationEvent {
         done: u64,
         total: u64,
     },
+    /// The pages the rewrite freed are being returned to the filesystem.
+    Reclaiming { done: u64, total: u64 },
     /// The chain finished and the database is at `to`.
     Finished { from: i64, to: i64 },
 }

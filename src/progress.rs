@@ -60,6 +60,9 @@ fn render_migration(bar: &mut Option<ProgressBar>, event: MigrationEvent) {
         MigrationEvent::Rewrite { table, done, total } => {
             advance(bar.as_ref(), &format!("rewriting {table}"), done, total);
         }
+        MigrationEvent::Reclaiming { done, total } => {
+            advance(bar.as_ref(), RECLAIM_MESSAGE, done, total);
+        }
         MigrationEvent::Finished { from, to } => {
             if let Some(bar) = bar.take() {
                 bar.finish_and_clear();

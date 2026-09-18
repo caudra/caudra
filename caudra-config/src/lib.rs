@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use caudra_config_macro::ConfigSection;
 use caudra_storage::paths;
-use caudra_storage::retention::{Duration as RetentionDuration, GroupBy, KeepPolicy};
+use caudra_storage::retention::{GroupBy, KeepPolicy};
 use caudra_storage::thinking::{StoredThinking, ThinkingParseError};
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use serde::{Deserialize, Serialize};
@@ -74,8 +74,6 @@ pub const DEFAULT_LOG_LEVEL: LogLevel = LogLevel::Info;
 pub const DEFAULT_INPUT_HISTORY_SIZE: usize = 100;
 pub const DEFAULT_EPHEMERAL: bool = false;
 pub const DEFAULT_RETENTION_SWEEP_INTERVAL_HOURS: u64 = 24;
-pub const DEFAULT_RETENTION_TRIM_KEEP_LAST: u32 = 20;
-pub const DEFAULT_RETENTION_TRIM_KEEP_WITHIN_DAYS: u32 = 90;
 pub const DEFAULT_SNAPSHOTS_ENABLED: bool = true;
 pub const DEFAULT_SNAPSHOT_MAX_BYTES_MB: u64 = 512;
 pub const DEFAULT_SNAPSHOT_MAX_FILES: u64 = 50_000;
@@ -2238,15 +2236,15 @@ impl RetentionConfig {
             default: ConfigValue::U64(DEFAULT_RETENTION_SWEEP_INTERVAL_HOURS),
             min: None,
             env: None,
-            description: "Hours between background sweeps. `0` disables the sweep; `caudra storage` commands still work",
+            description: "Hours between background sweeps. A sweep reclaims freed space, and applies `trim` and `forget` when they are set. `0` disables the sweep; `caudra storage` commands still work",
         },
         ConfigField {
             name: "trim",
             ty: "table",
-            default: ConfigValue::Str("{ keep_last = 20, keep_within = \"90d\" }"),
+            default: ConfigValue::Str("{}"),
             min: None,
             env: None,
-            description: "Sessions outside this policy lose snapshots, tool output files, archives, and large rich outputs but stay resumable",
+            description: "Sessions outside this policy lose snapshots, tool output files, archives, and large rich outputs but stay resumable. Empty means never trim automatically",
         },
         ConfigField {
             name: "forget",
@@ -2258,24 +2256,13 @@ impl RetentionConfig {
         },
     ];
 
-    pub fn default_trim() -> KeepPolicy {
-        KeepPolicy {
-            keep_last: Some(DEFAULT_RETENTION_TRIM_KEEP_LAST),
-            keep_within: Some(RetentionDuration {
-                days: DEFAULT_RETENTION_TRIM_KEEP_WITHIN_DAYS,
-                ..RetentionDuration::default()
-            }),
-            ..KeepPolicy::default()
-        }
-    }
-
     fn from_file(f: RetentionFileConfig) -> Self {
         Self {
             group_by: f.group_by.unwrap_or_default(),
             sweep_interval_hours: f
                 .sweep_interval_hours
                 .unwrap_or(DEFAULT_RETENTION_SWEEP_INTERVAL_HOURS),
-            trim: f.trim.unwrap_or_else(Self::default_trim),
+            trim: f.trim.unwrap_or_default(),
             forget: f.forget.unwrap_or_default(),
         }
     }
@@ -3111,6 +3098,7 @@ mod tests {
     use tempfile::TempDir;
     use test_case::test_case;
 
+    const NO_DEFAULT_DELETION: &str = "retention must delete nothing until a user opts in";
     const EMPTY_SOURCE_DIGEST: &str =
         "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
     const ABC_SOURCE_DIGEST: &str =
@@ -4439,7 +4427,7 @@ mod tests {
     }
 
     #[test]
-    fn retention_defaults_trim_only() {
+    fn retention_defaults_to_reclaiming_only() {
         let config = RawConfig::default().into_config(false).unwrap();
         let retention = config.storage.retention;
         assert_eq!(retention.group_by, GroupBy::Directory);
@@ -4447,8 +4435,8 @@ mod tests {
             retention.sweep_interval_hours,
             DEFAULT_RETENTION_SWEEP_INTERVAL_HOURS
         );
-        assert_eq!(retention.trim, RetentionConfig::default_trim());
-        assert!(retention.forget.is_empty());
+        assert!(retention.trim.is_empty(), "{NO_DEFAULT_DELETION}");
+        assert!(retention.forget.is_empty(), "{NO_DEFAULT_DELETION}");
     }
 
     #[test]

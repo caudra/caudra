@@ -110,7 +110,7 @@ Activity is the later of the last write and the last open. Calendar rules use na
 
 The policy is evaluated per working directory by default, so one busy project cannot starve another project of its kept sessions. Pinned sessions, sessions open in any Caudra process, sessions with a pending revert, and sessions with activity in the future are always kept.
 
-The default keeps the twenty most recently active sessions of every directory in full, trims anything older than ninety days, and never forgets:
+Both policies start empty, so Caudra keeps every session until you ask it to do otherwise:
 
 ```lua
 caudra.setup({
@@ -118,16 +118,18 @@ caudra.setup({
         retention = {
             group_by = "directory",
             sweep_interval_hours = 24,
-            trim = { keep_last = 20, keep_within = "90d" },
+            trim = {},
             forget = {},
         },
     },
 })
 ```
 
-An empty `forget` policy disables automatic deletion. To delete sessions after two years, set `forget = { keep_within = "2y" }`. Set `sweep_interval_hours = 0` to run retention only through the CLI.
+To keep the twenty most recently active sessions of every directory in full and strip the artifacts of anything older than ninety days, set `trim = { keep_last = 20, keep_within = "90d" }`. To delete sessions after two years, set `forget = { keep_within = "2y" }`. Set `sweep_interval_hours = 0` to run retention only through the CLI.
 
-The sweep runs on a background thread once per interval while the TUI is open. It trims, forgets, and then prunes: due cleanup jobs run, orphaned artifact directories older than seven days are removed, the write-ahead log is checkpointed, and free pages are returned to the filesystem. Every step is transactional or idempotent, so an interrupted sweep leaves nothing inconsistent.
+The sweep runs on a background thread once per interval while the TUI is open. It trims, forgets, and then prunes: due cleanup jobs run, orphaned artifact directories older than seven days are removed, the write-ahead log is checkpointed, and free pages are returned to the filesystem. With the policies left empty the sweep only prunes, which reclaims space and leaves session data alone. Every step is transactional or idempotent, so an interrupted sweep leaves nothing inconsistent.
+
+A schema migration prunes as its last step. Rewriting rows puts the pages they occupied on the free list, so an upgrade that skipped this could leave the file larger than the data it holds until the next sweep came due.
 
 `caudra storage trim --dry-run` and `caudra storage forget --dry-run` print the plan with the reason each session is kept. `caudra storage sessions` lists sessions with their tier. `caudra storage pin <ID>` keeps a session regardless of policy. See [CLI](/docs/cli/#caudra-storage) for every flag.
 

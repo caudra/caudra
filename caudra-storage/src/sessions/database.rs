@@ -109,6 +109,7 @@ const PAYLOAD_DECOMPRESSION_FAILED: &str = "payload could not be decompressed";
 const PAYLOAD_PROGRESS_INTERVAL: u64 = 512;
 /// Pages between progress reports while a freelist is being reclaimed.
 const RECLAIM_PROGRESS_INTERVAL: u64 = 1024;
+const WAL_JOURNAL_MODE: &str = "wal";
 const OWNER_FILE_MODE: u32 = 0o600;
 const OTHER_USER_PERMISSIONS: u32 = 0o077;
 const DATABASE_SIDECAR_SUFFIXES: [&str; 3] = ["-wal", "-shm", "-journal"];
@@ -2002,44 +2003,15 @@ impl SessionDatabase {
     }
 
     pub fn checkpoint(&self, truncate: bool) -> Result<CheckpointResult, SessionError> {
-        // PASSIVE is normal maintenance. TRUNCATE is explicit idle maintenance
-        // because long readers, not the size setting, determine active WAL size.
-        let mode = if truncate { "TRUNCATE" } else { "PASSIVE" };
-        let sql = format!("PRAGMA wal_checkpoint({mode})");
-        let (busy, log_frames, checkpointed_frames) =
-            self.connection.query_row(&sql, [], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, i64>(2)?,
-                ))
-            })?;
-        Ok(CheckpointResult {
-            busy: from_i64(busy, "checkpoint busy")?,
-            log_frames: from_i64(log_frames, "checkpoint log frames")?,
-            checkpointed_frames: from_i64(checkpointed_frames, "checkpoint completed frames")?,
-        })
+        checkpoint_on(&self.connection, truncate)
     }
 
     /// Reclaims up to `pages` freelist pages. Full VACUUM is never an
     /// automatic startup or write-path operation. Returns the pages freed.
     pub fn incremental_vacuum(&self, pages: u32) -> Result<u64, SessionError> {
-        // The pragma yields one row per freed page, so it must be stepped to
-        // completion; a single step frees exactly one page.
-        let mut statement = self
-            .connection
-            .prepare(&format!("PRAGMA incremental_vacuum({pages})"))?;
-        let mut rows = statement.query([])?;
-        let mut freed: u64 = 0;
-        while rows.next()?.is_some() {
-            freed += 1;
-            if freed.is_multiple_of(RECLAIM_PROGRESS_INTERVAL) {
-                PRUNE.report(PruneEvent::Reclaiming {
-                    done: freed,
-                    total: u64::from(pages),
-                });
-            }
-        }
+        let freed = vacuum_pages(&self.connection, pages, |done, total| {
+            PRUNE.report(PruneEvent::Reclaiming { done, total });
+        })?;
         PRUNE.report(PruneEvent::Reclaimed { pages: freed });
         Ok(freed)
     }
@@ -4296,6 +4268,71 @@ fn back_up_before_migration(
     Ok(path)
 }
 
+fn checkpoint_on(
+    connection: &Connection,
+    truncate: bool,
+) -> Result<CheckpointResult, SessionError> {
+    // PASSIVE is normal maintenance. TRUNCATE is explicit idle maintenance
+    // because long readers, not the size setting, determine active WAL size.
+    let mode = if truncate { "TRUNCATE" } else { "PASSIVE" };
+    let sql = format!("PRAGMA wal_checkpoint({mode})");
+    let (busy, log_frames, checkpointed_frames) = connection.query_row(&sql, [], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, i64>(2)?,
+        ))
+    })?;
+    Ok(CheckpointResult {
+        busy: from_i64(busy, "checkpoint busy")?,
+        log_frames: from_i64(log_frames, "checkpoint log frames")?,
+        checkpointed_frames: from_i64(checkpointed_frames, "checkpoint completed frames")?,
+    })
+}
+
+/// Steps `PRAGMA incremental_vacuum`, handing each interval of freed pages to
+/// `progress`. Callers differ in what they are reporting, an upgrade or a
+/// prune, so the vocabulary belongs to them rather than to the loop.
+fn vacuum_pages(
+    connection: &Connection,
+    pages: u32,
+    mut progress: impl FnMut(u64, u64),
+) -> Result<u64, SessionError> {
+    // The pragma yields one row per freed page, so it must be stepped to
+    // completion; a single step frees exactly one page.
+    let mut statement = connection.prepare(&format!("PRAGMA incremental_vacuum({pages})"))?;
+    let mut rows = statement.query([])?;
+    let mut freed: u64 = 0;
+    while rows.next()?.is_some() {
+        freed += 1;
+        if freed.is_multiple_of(RECLAIM_PROGRESS_INTERVAL) {
+            progress(freed, u64::from(pages));
+        }
+    }
+    Ok(freed)
+}
+
+/// Returns the pages a migration freed to the filesystem.
+///
+/// Rebuilding a `WITHOUT ROWID` table puts every original page on the freelist,
+/// so an upgrade that rewrites rows leaves the file larger than it found it: on
+/// a 1.9 GB database the schema 10 rewrite grew it to 2.7 GB holding 785 MB of
+/// data. Leaving that to the next retention sweep meant the upgrade could look
+/// like it had permanently doubled the database for up to a day.
+fn reclaim_migration_freelist(connection: &Connection) -> Result<u64, SessionError> {
+    // A migration runs before the WAL is configured, and on a database that is
+    // not in WAL mode wal_checkpoint reports -1 frames rather than failing.
+    let journal: String = connection.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
+    if journal.eq_ignore_ascii_case(WAL_JOURNAL_MODE) {
+        checkpoint_on(connection, true)?;
+    }
+    let freelist = pragma_u64(connection, "freelist_count")?;
+    let pages = u32::try_from(freelist).unwrap_or(u32::MAX);
+    vacuum_pages(connection, pages, |done, total| {
+        MIGRATION.report(MigrationEvent::Reclaiming { done, total });
+    })
+}
+
 /// Replays [`MIGRATIONS`] from `version` up to [`SCHEMA_VERSION`]. Each step
 /// bumps `user_version` inside its own transaction, so an interrupted upgrade
 /// leaves the database at a version some binary can open rather than between
@@ -4335,10 +4372,12 @@ fn migrate_to_current(
         transaction.commit()?;
         current = step.to;
     }
+    let reclaimed = reclaim_migration_freelist(connection)?;
     tracing::info!(
         from = version,
         to = SCHEMA_VERSION,
         backup = %backup.display(),
+        reclaimed_pages = reclaimed,
         "migrated session database schema"
     );
     MIGRATION.report(MigrationEvent::Finished {
@@ -5505,6 +5544,8 @@ mod tests {
         "a migrated database must end with exactly the schema a fresh one gets";
     const MIGRATION_KEEPS_TRANSCRIPTS: &str =
         "compressing the payload columns must carry every row across unchanged";
+    const MIGRATION_RECLAIMS_FREELIST: &str =
+        "a migration must return the pages its rewrite freed, not leave them in the file";
     const PAYLOAD_STORED_COMPRESSED: &str =
         "a stored payload must not be the plaintext it was written from";
     const BYTE_COUNT_IS_UNCOMPRESSED: &str =
@@ -8926,6 +8967,20 @@ CREATE TABLE subagent_history_items (
             payload_rows,
             COMPRESSED_PAYLOAD_TABLES.len(),
             "{MIGRATION_KEEPS_TRANSCRIPTS}"
+        );
+    }
+
+    #[test]
+    fn a_migration_reclaims_the_pages_its_rewrite_freed() {
+        let (_temp, state) = state_dir();
+        seed_v9_database(&state);
+
+        let migrated = SessionDatabase::open(&state).unwrap();
+
+        assert_eq!(
+            migrated.freelist_pages().unwrap(),
+            0,
+            "{MIGRATION_RECLAIMS_FREELIST}"
         );
     }
 
