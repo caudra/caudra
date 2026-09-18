@@ -54,6 +54,9 @@ const PERMISSION_QUEUE_CAPACITY: usize = 16;
 const PERMISSION_QUEUE_FULL: &str = "permission mutation queue is full; nothing was enqueued";
 
 type Pending = Arc<Mutex<HashMap<CaudraId, Entry>>>;
+/// Cursors handed to the writer outside the coalescing queue, which keeps one
+/// entry per session and would drop a cursor the next save superseded.
+type SeededCursors = Arc<Mutex<HashMap<CaudraId, SessionCursor>>>;
 type PendingWorkspaceTabs = Arc<Mutex<Option<WorkspaceTabsRequest>>>;
 /// Turns accumulate rather than coalescing: the ledger sums spend, so a
 /// dropped turn is money the lifetime total never learns about.
@@ -131,6 +134,7 @@ struct QueuedToolCall {
 
 pub struct StorageWriter {
     pending: Pending,
+    seeded_cursors: SeededCursors,
     wake: Arc<flume::Sender<()>>,
     workspace_tabs: PendingWorkspaceTabs,
     usage: PendingUsage,
@@ -144,6 +148,8 @@ pub struct StorageWriter {
 impl StorageWriter {
     pub fn new(dir: StateDir, warn_tx: flume::Sender<String>) -> Self {
         let pending: Pending = Arc::default();
+        let seeded_cursors: SeededCursors = Arc::default();
+        let writer_seeded_cursors = Arc::clone(&seeded_cursors);
         let writer_pending = Arc::clone(&pending);
         let workspace_tabs: PendingWorkspaceTabs = Arc::default();
         let writer_workspace_tabs = Arc::clone(&workspace_tabs);
@@ -169,6 +175,7 @@ impl StorageWriter {
                     ledger: None,
                     tool_ledger: None,
                     cursors: HashMap::new(),
+                    seeded_cursors: writer_seeded_cursors,
                     deleted_sessions: HashMap::new(),
                     failing: HashSet::new(),
                     workspace_tabs_errors: HashMap::new(),
@@ -200,6 +207,7 @@ impl StorageWriter {
 
         Self {
             pending,
+            seeded_cursors,
             wake,
             workspace_tabs,
             usage,
@@ -259,6 +267,16 @@ impl StorageWriter {
 
     pub fn send(&self, session: Arc<AppSession>) {
         self.enqueue(session.id, Entry::Save(session));
+    }
+
+    /// Hands over the cursor a load produced, so the first save of a resumed
+    /// session is a delta. Without it that save rewrites every payload the
+    /// session holds, which on a large transcript costs seconds of startup.
+    pub fn adopt_cursor(&self, cursor: SessionCursor) {
+        self.seeded_cursors
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(cursor.session_id(), cursor);
     }
 
     pub fn save_sync(&self, session: Arc<AppSession>) -> Result<(), SessionError> {
@@ -403,6 +421,7 @@ struct Writer {
     ledger: Option<UsageLedger>,
     tool_ledger: Option<ToolLedger>,
     cursors: HashMap<CaudraId, SessionCursor>,
+    seeded_cursors: SeededCursors,
     /// Explicit recreation capability retained only by the writer that
     /// completed an ordered delete; ordinary stale saves cannot cross tombstones.
     deleted_sessions: HashMap<CaudraId, SessionRecreation>,
@@ -687,7 +706,25 @@ impl Writer {
         Ok(())
     }
 
+    /// Takes the cursor a load handed over when this writer has none of its
+    /// own. Without it the first save of a resumed session finds no cursor and
+    /// falls back to rewriting every payload the session holds.
+    fn adopt_seeded_cursor(&mut self, id: CaudraId) {
+        if self.cursors.contains_key(&id) {
+            return;
+        }
+        let seeded = self
+            .seeded_cursors
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&id);
+        if let Some(cursor) = seeded {
+            self.cursors.insert(id, cursor);
+        }
+    }
+
     fn write(&mut self, session: &AppSession) -> Result<(), SessionError> {
+        self.adopt_seeded_cursor(session.id);
         if self.database.is_none() {
             self.database = Some(SessionDatabase::open(&self.dir)?);
         }
@@ -1231,6 +1268,7 @@ mod tests {
             ledger: None,
             tool_ledger: None,
             cursors: HashMap::new(),
+            seeded_cursors: Arc::default(),
             deleted_sessions: HashMap::new(),
             failing: HashSet::new(),
             workspace_tabs_errors: HashMap::new(),

@@ -683,25 +683,33 @@ fn resolve_session(
             .parse()
             .map_err(|e| color_eyre::eyre::eyre!("invalid session id {raw:?}: {e}"))?;
         let lease = Arc::new(SessionLease::acquire(storage, id)?);
-        let session = setup::load_session(id, storage)?;
+        let (session, cursor) = setup::load_session_with_cursor(id, storage)?;
         StoredWorkspaceBinding::validate_resume(session.workspace_binding(), None)?;
         setup::report_session_start(caudra_otel::emit::START_RESUME, Some(session.id));
-        return Ok(SessionTab { session, lease });
+        return Ok(SessionTab {
+            session,
+            lease,
+            cursor: Some(cursor),
+        });
     }
     if continue_session {
         if let Some(summary) = AppSession::list(cwd, storage)?.into_iter().next() {
             let lease = Arc::new(SessionLease::acquire(storage, summary.id)?);
-            let session = setup::load_session(summary.id, storage)?;
+            let (session, cursor) = setup::load_session_with_cursor(summary.id, storage)?;
             StoredWorkspaceBinding::validate_resume(session.workspace_binding(), None)?;
             setup::report_session_start(caudra_otel::emit::START_CONTINUE, Some(session.id));
-            return Ok(SessionTab { session, lease });
+            return Ok(SessionTab {
+                session,
+                lease,
+                cursor: Some(cursor),
+            });
         }
         tracing::info!("no previous session found for this directory, starting new");
     }
     let session = AppSession::new(model, cwd);
     let lease = Arc::new(SessionLease::acquire(storage, session.id)?);
     setup::report_session_start(caudra_otel::emit::START_FRESH, Some(session.id));
-    Ok(SessionTab { session, lease })
+    Ok(SessionTab { session, lease, cursor: None })
 }
 
 struct ResolvedSessions {
@@ -912,6 +920,7 @@ fn relocate_stopped_sessions(
             retained.push(SessionTab {
                 session,
                 lease: tab.lease,
+                cursor: None,
             });
         } else if !installed_cwd {
             retained.push(tab);
@@ -984,7 +993,7 @@ fn restore_workspace_tabs(
             let lease = Arc::new(SessionLease::acquire(storage, id)?);
             let session = caudra_agent::load_stored_session(id, storage)?;
             StoredWorkspaceBinding::validate_resume(session.workspace_binding(), None)?;
-            Ok(SessionTab { session, lease })
+            Ok(SessionTab { session, lease, cursor: None })
         })();
         let tab = match opened {
             Ok(tab) => tab,
@@ -1132,12 +1141,12 @@ fn resolve_remote_sessions(
             Some(binding),
         )?;
         setup::report_session_start(caudra_otel::emit::START_RESUME, Some(session.id));
-        SessionTab { session, lease }
+        SessionTab { session, lease, cursor: None }
     } else {
         let session = AppSession::new_with_workspace(model, cwd, binding.clone());
         let lease = Arc::new(SessionLease::acquire(storage, session.id)?);
         setup::report_session_start(caudra_otel::emit::START_FRESH, Some(session.id));
-        SessionTab { session, lease }
+        SessionTab { session, lease, cursor: None }
     };
     Ok(ResolvedSessions {
         tabs: vec![tab],
@@ -1578,7 +1587,7 @@ pub fn run(mut cli: Cli) -> Result<ExitCode> {
             let session = AppSession::new(&new_stack.model.spec(), &reload_cwd.to_string_lossy());
             let lease = Arc::new(SessionLease::acquire(&storage, session.id)?);
             setup::report_session_start(caudra_otel::emit::START_FRESH, Some(session.id));
-            tabs.push(SessionTab { session, lease });
+            tabs.push(SessionTab { session, lease, cursor: None });
         }
         sweeper = RetentionSweeper::spawn(storage.clone(), new_stack.config.storage.retention);
         stack = new_stack;
@@ -2198,7 +2207,7 @@ mod tests {
         let mut session = AppSession::new(TEST_MODEL, &cwd.to_string_lossy());
         session.save(storage).unwrap();
         let lease = Arc::new(SessionLease::acquire(storage, session.id).unwrap());
-        SessionTab { session, lease }
+        SessionTab { session, lease, cursor: None }
     }
 
     fn relocation_handoff(

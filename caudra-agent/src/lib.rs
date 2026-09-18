@@ -49,6 +49,7 @@ pub mod workflow;
 pub mod workspace_baseline;
 pub use stored_session::{
     StoredSession, latest_stored_session, load_stored_session, open_stored_session,
+    open_stored_session_with_cursor,
     resolve_resume_workspace, resume_workspace_session, workspace_logical_cwd,
 };
 pub use subagent_history::{

@@ -53,6 +53,15 @@ pub fn load_session(id: CaudraId, storage: &StateDir) -> Result<StoredSession> {
     caudra_agent::open_stored_session(id, storage).context("load persisted session")
 }
 
+/// The resume paths, which hand the cursor to the storage writer so the first
+/// save of the session is a delta rather than a rewrite of every payload.
+pub fn load_session_with_cursor(
+    id: CaudraId,
+    storage: &StateDir,
+) -> Result<(StoredSession, caudra_storage::sessions::SessionCursor)> {
+    caudra_agent::open_stored_session_with_cursor(id, storage).context("load persisted session")
+}
+
 /// The model a run opens on. `mode` picks which remembered choice answers, since
 /// plan and build each keep their own.
 pub fn resolve_model(

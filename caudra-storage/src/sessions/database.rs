@@ -3654,6 +3654,10 @@ fn root_on(connection: &Connection, id: CaudraId) -> Result<RootRow, SessionErro
 }
 
 impl SessionCursor {
+    pub fn session_id(&self) -> CaudraId {
+        self.session_id
+    }
+
     pub fn write_version(&self) -> i64 {
         self.write_version
     }

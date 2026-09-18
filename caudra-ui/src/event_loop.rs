@@ -81,7 +81,7 @@ use crate::{
     AppSession, PatternSuggestionLoader, PermissionAuthorityFactory, SessionRelocationHandoff,
     SessionTab,
 };
-use crate::{load_app_session, open_app_session};
+use crate::{load_app_session, open_app_session_with_cursor};
 
 use crate::storage_writer::StorageWriter;
 use crate::terminal;
@@ -987,7 +987,16 @@ impl SpawnCtx {
             phase_start = Instant::now();
             elapsed
         };
-        let SessionTab { mut session, lease } = tab;
+        let SessionTab {
+            mut session,
+            lease,
+            cursor,
+        } = tab;
+        // Before anything writes this session back. The first save otherwise
+        // finds no cursor and rewrites every payload the session holds.
+        if let Some(cursor) = cursor {
+            self.storage_writer.adopt_cursor(cursor);
+        }
         lease
             .validate(&self.storage, session.id)
             .map_err(|error| error.to_string())?;
@@ -2343,7 +2352,7 @@ impl<'t> EventLoop<'t> {
                         return;
                     }
                 };
-                let runtime = match self.ctx.spawn_runtime(SessionTab { session, lease }) {
+                let runtime = match self.ctx.spawn_runtime(SessionTab { session, lease, cursor: None }) {
                     Ok(runtime) => runtime,
                     Err(error) => {
                         let _ = reply_tx.send(Err(error));
@@ -2590,8 +2599,10 @@ impl<'t> EventLoop<'t> {
             SessionLease::acquire(&self.ctx.storage, id)
                 .map_err(|error| format!("Failed to open session: {error}"))?,
         );
-        let session = open_app_session(id, &self.ctx.storage)
+        let (session, cursor) = open_app_session_with_cursor(id, &self.ctx.storage)
             .map_err(|e| format!("Failed to load session: {e}"))?;
+        // Both branches below end with this session in a tab the writer saves.
+        self.ctx.storage_writer.adopt_cursor(cursor);
         if self.ctx.workspace_session.is_none() {
             validate_session_focus(&session, None)?;
         }
@@ -2613,7 +2624,7 @@ impl<'t> EventLoop<'t> {
             drop(old_lease);
             return Ok(());
         }
-        let runtime = self.ctx.spawn_runtime(SessionTab { session, lease })?;
+        let runtime = self.ctx.spawn_runtime(SessionTab { session, lease, cursor: None })?;
         let idx = self.push_runtime(runtime);
         self.focused = idx;
         Ok(())
@@ -2780,7 +2791,7 @@ impl<'t> EventLoop<'t> {
                     return false;
                 }
             };
-            let runtime = match self.ctx.spawn_runtime(SessionTab { session, lease }) {
+            let runtime = match self.ctx.spawn_runtime(SessionTab { session, lease, cursor: None }) {
                 Ok(runtime) => runtime,
                 Err(error) => {
                     self.sessions[idx].app.flash(error);
@@ -3186,7 +3197,7 @@ impl<'t> EventLoop<'t> {
                 if let Some(draft) = draft {
                     install_fork_draft(&mut session, draft);
                 }
-                let runtime = match self.ctx.spawn_runtime(SessionTab { session, lease }) {
+                let runtime = match self.ctx.spawn_runtime(SessionTab { session, lease, cursor: None }) {
                     Ok(runtime) => runtime,
                     Err(error) => {
                         self.sessions[idx].app.flash(error);
@@ -3742,6 +3753,7 @@ impl<'t> EventLoop<'t> {
             tabs.push(SessionTab {
                 session: Arc::unwrap_or_clone(app.state.session),
                 lease,
+                cursor: None,
             });
             session_clone_ms += step_ms();
         }

@@ -2,7 +2,7 @@ use caudra_providers::{HistoryItem, TokenUsage};
 use caudra_storage::StateDir;
 use caudra_storage::id::CaudraId;
 use caudra_storage::remote_snapshots::RemoteSnapshotMetadataStore;
-use caudra_storage::sessions::{Session, SessionError, mark_opened};
+use caudra_storage::sessions::{Session, SessionCursor, SessionDatabase, SessionError, mark_opened};
 use caudra_storage::workspace_binding::StoredWorkspaceBinding;
 use caudra_workspace::{WorkspacePath, WorkspaceSession};
 
@@ -171,6 +171,18 @@ pub fn load_stored_session(
     storage: &StateDir,
 ) -> Result<StoredSession, SessionError> {
     StoredSession::load(id, storage)
+}
+
+/// The same open, keeping the cursor the load produced. A caller that will
+/// write the session back should hand this to its writer: without it the first
+/// save has no cursor to diff against and rewrites every payload.
+pub fn open_stored_session_with_cursor(
+    id: CaudraId,
+    storage: &StateDir,
+) -> Result<(StoredSession, SessionCursor), SessionError> {
+    let loaded = SessionDatabase::open(storage)?.load_with_cursor(id)?;
+    mark_opened(id, storage)?;
+    Ok(loaded)
 }
 
 /// A load that is the user opening the session: resume, `--continue`, the

@@ -149,9 +149,13 @@ pub(crate) fn load_app_session(id: CaudraId, storage: &StateDir) -> Result<AppSe
     caudra_agent::load_stored_session(id, storage).context("load persisted session")
 }
 
-/// The picker path: the user chose this session, so it counts as opened.
-pub(crate) fn open_app_session(id: CaudraId, storage: &StateDir) -> Result<AppSession> {
-    caudra_agent::open_stored_session(id, storage).context("load persisted session")
+/// The picker path: the user chose this session, so it counts as opened. The
+/// cursor comes back too, so the first save stays a delta.
+pub(crate) fn open_app_session_with_cursor(
+    id: CaudraId,
+    storage: &StateDir,
+) -> Result<(AppSession, caudra_storage::sessions::SessionCursor)> {
+    caudra_agent::open_stored_session_with_cursor(id, storage).context("load persisted session")
 }
 
 pub(crate) fn session_history_head(session: &AppSession) -> Option<CaudraId> {
@@ -213,6 +217,9 @@ pub use event_loop::EventLoopParams;
 pub struct SessionTab {
     pub session: AppSession,
     pub lease: Arc<caudra_storage::sessions::SessionLease>,
+    /// The cursor the load produced, when this tab came from storage. The
+    /// writer needs it to make the first save a delta instead of a rewrite.
+    pub cursor: Option<caudra_storage::sessions::SessionCursor>,
 }
 
 pub struct SessionRelocationHandoff {
