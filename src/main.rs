@@ -66,13 +66,46 @@ fn print_error(e: &color_eyre::Report) {
     const DIM: &str = "\x1b[2m";
     const RESET: &str = "\x1b[0m";
 
+    let chain: Vec<String> = e.chain().map(ToString::to_string).collect();
+    let causes = visible_causes(&chain);
+
     eprintln!();
     eprintln!("{BOLD_RED}✖ {e}{RESET}");
-    let causes: Vec<_> = e.chain().skip(1).collect();
     let last = causes.len().saturating_sub(1);
     for (i, cause) in causes.iter().enumerate() {
         let branch = if i == last { "└─" } else { "├─" };
         eprintln!("{DIM}{branch}{RESET} {RED}{cause}{RESET}");
     }
     eprintln!();
+}
+
+/// Drops causes whose parent already ends with their message, which is what a
+/// `#[error("context: {0}")]` variant over a `#[source]` field produces.
+fn visible_causes(chain: &[String]) -> Vec<&str> {
+    chain
+        .windows(2)
+        .filter(|pair| !pair[0].ends_with(&pair[1]))
+        .map(|pair| pair[1].as_str())
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::visible_causes;
+    use test_case::test_case;
+
+    const ROOT: &str = "session database is at schema 8";
+    const STATE: &str = "state database: session database is at schema 8";
+    const PURPOSE: &str = "model purpose storage: state database: session database is at schema 8";
+    const CONTEXT: &str = "load model purpose bindings";
+
+    #[test_case(&[CONTEXT, PURPOSE, STATE], &[PURPOSE]; "embedded causes collapse to one line")]
+    #[test_case(&[CONTEXT, PURPOSE, STATE, ROOT], &[PURPOSE]; "a whole embedded chain collapses")]
+    #[test_case(&[CONTEXT, ROOT], &[ROOT]; "a cause that adds text is kept")]
+    #[test_case(&[CONTEXT, CONTEXT], &[]; "a transparent wrapper is dropped")]
+    #[test_case(&[CONTEXT], &[]; "a lone error has no causes")]
+    fn visible_causes_drops_repeated_text(chain: &[&str], expected: &[&str]) {
+        let chain: Vec<String> = chain.iter().map(ToString::to_string).collect();
+        assert_eq!(visible_causes(&chain), expected);
+    }
 }
