@@ -36,9 +36,10 @@ use caudra_workspace::WorkspacePath;
 use rusqlite::backup::Backup;
 use rusqlite::ffi::{self, Error as SqliteErrorCode};
 use rusqlite::limits::Limit;
+use rusqlite::types::Value as SqlValue;
 use rusqlite::{
     Connection, Error as SqliteError, MAIN_DB, OpenFlags, OptionalExtension, Transaction,
-    TransactionBehavior, params,
+    TransactionBehavior, params, params_from_iter,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -73,7 +74,7 @@ use crate::{
 pub const SESSIONS_DB_FILE: &str = "caudra.sqlite";
 pub const SESSIONS_DB_LOCK_FILE: &str = "caudra.sqlite.lock";
 
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 const APPLICATION_ID: i64 = i32::from_be_bytes(*b"CAUD") as i64;
 /// Pages copied per step of the pre-migration backup. The whole file is copied
 /// under the initialization lock, so this only bounds how long the backup holds
@@ -97,6 +98,12 @@ const MAX_IMAGES_PER_ITEM: usize = 16;
 const MAX_DECODED_IMAGE_BYTES: usize = 24 * 1024 * 1024;
 const MAX_SQLITE_VALUE_BYTES: i32 = 40 * 1024 * 1024;
 const MAX_EAGER_LOAD_BYTES: usize = 512 * 1024 * 1024;
+/// Level 3 won the codec gate in `benches/payload_codecs.rs`: its ratio ties
+/// gzip-6 to within a few percent on every size band, while decompressing 2.4x
+/// to 3.2x faster, and decompression is what a session load waits on. Level 9
+/// buys under 0.4x more ratio for a 30x slower compress.
+const PAYLOAD_COMPRESSION_LEVEL: i32 = 3;
+const PAYLOAD_DECOMPRESSION_FAILED: &str = "payload could not be decompressed";
 const OWNER_FILE_MODE: u32 = 0o600;
 const OTHER_USER_PERMISSIONS: u32 = 0o077;
 const DATABASE_SIDECAR_SUFFIXES: [&str; 3] = ["-wal", "-shm", "-journal"];
@@ -397,6 +404,87 @@ CREATE TABLE workflow_run_events (
 ) STRICT;
 "#;
 
+/// Payload columns become compressed blobs. The three tables are `WITHOUT
+/// ROWID`, so each is rebuilt rather than altered, and the rows are copied by
+/// [`compress_existing_payloads`] rather than by SQL: SQLite cannot compress,
+/// and a SQL copy would write the uncompressed bytes a second time before the
+/// rewrite replaced them.
+///
+/// `byte_count` keeps meaning the uncompressed length, so its two CHECK
+/// constraints go with the column type. `json_valid` goes for the same reason;
+/// [`SessionDatabase::validate_payload_json`] already enforces it on write.
+///
+/// Rebuilding leaves every original page on the freelist, so the file grows
+/// before it shrinks: a 1.9 GB database measured 2.7 GB immediately after this
+/// step and 781 MB once the pages came back. Reclaiming them takes far longer
+/// than the rewrite itself, so it is left to `sweep::prune`, which already
+/// vacuums the whole freelist on the background sweep rather than at startup.
+const PAYLOAD_COMPRESSION_SCHEMA: &str = r#"
+ALTER TABLE main_history_items RENAME TO main_history_items_v9;
+ALTER TABLE tool_outputs RENAME TO tool_outputs_v9;
+ALTER TABLE subagent_history_items RENAME TO subagent_history_items_v9;
+
+CREATE TABLE main_history_items (
+    session_id BLOB NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    ordinal    INTEGER NOT NULL,
+    payload    BLOB NOT NULL,
+    byte_count INTEGER NOT NULL,
+    PRIMARY KEY(session_id, ordinal)
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE tool_outputs (
+    session_id BLOB NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    tool_id    TEXT NOT NULL,
+    payload    BLOB NOT NULL,
+    byte_count INTEGER NOT NULL,
+    PRIMARY KEY(session_id, tool_id)
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE subagent_history_items (
+    session_id  BLOB NOT NULL,
+    subagent_id TEXT NOT NULL,
+    ordinal     INTEGER NOT NULL,
+    payload     BLOB NOT NULL,
+    byte_count  INTEGER NOT NULL,
+    PRIMARY KEY(session_id, subagent_id, ordinal),
+    FOREIGN KEY(session_id, subagent_id)
+        REFERENCES subagent_streams(session_id, subagent_id)
+        ON DELETE CASCADE
+) STRICT, WITHOUT ROWID;
+"#;
+
+/// The renamed tables [`PAYLOAD_COMPRESSION_SCHEMA`] leaves behind, paired with
+/// the key columns that accompany each payload through the rewrite.
+const COMPRESSED_PAYLOAD_TABLES: [PayloadRewrite; 3] = [
+    PayloadRewrite {
+        table: "main_history_items",
+        legacy: "main_history_items_v9",
+        keys: "session_id, ordinal",
+        placeholders: "?1, ?2",
+    },
+    PayloadRewrite {
+        table: "tool_outputs",
+        legacy: "tool_outputs_v9",
+        keys: "session_id, tool_id",
+        placeholders: "?1, ?2",
+    },
+    PayloadRewrite {
+        table: "subagent_history_items",
+        legacy: "subagent_history_items_v9",
+        keys: "session_id, subagent_id, ordinal",
+        placeholders: "?1, ?2, ?3",
+    },
+];
+
+/// One table's move from [`PAYLOAD_COMPRESSION_SCHEMA`]'s renamed original into
+/// its compressed replacement.
+struct PayloadRewrite {
+    table: &'static str,
+    legacy: &'static str,
+    keys: &'static str,
+    placeholders: &'static str,
+}
+
 /// One step of the schema chain. A fresh database gets [`SCHEMA`] at
 /// [`SCHEMA_VERSION`] directly; only an existing database replays these.
 struct Migration {
@@ -445,6 +533,11 @@ const MIGRATIONS: &[Migration] = &[
         from: 8,
         to: 9,
         sql: TOOL_USAGE_TABLES,
+    },
+    Migration {
+        from: 9,
+        to: 10,
+        sql: PAYLOAD_COMPRESSION_SCHEMA,
     },
 ];
 
@@ -567,16 +660,16 @@ CREATE TABLE state (
 CREATE TABLE main_history_items (
     session_id BLOB NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
     ordinal    INTEGER NOT NULL,
-    payload    TEXT NOT NULL CHECK(json_valid(payload)),
-    byte_count INTEGER NOT NULL CHECK(byte_count = length(CAST(payload AS BLOB))),
+    payload    BLOB NOT NULL,
+    byte_count INTEGER NOT NULL,
     PRIMARY KEY(session_id, ordinal)
 ) STRICT, WITHOUT ROWID;
 
 CREATE TABLE tool_outputs (
     session_id BLOB NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
     tool_id    TEXT NOT NULL,
-    payload    TEXT NOT NULL CHECK(json_valid(payload)),
-    byte_count INTEGER NOT NULL CHECK(byte_count = length(CAST(payload AS BLOB))),
+    payload    BLOB NOT NULL,
+    byte_count INTEGER NOT NULL,
     PRIMARY KEY(session_id, tool_id)
 ) STRICT, WITHOUT ROWID;
 
@@ -591,8 +684,8 @@ CREATE TABLE subagent_history_items (
     session_id  BLOB NOT NULL,
     subagent_id TEXT NOT NULL,
     ordinal     INTEGER NOT NULL,
-    payload     TEXT NOT NULL CHECK(json_valid(payload)),
-    byte_count  INTEGER NOT NULL CHECK(byte_count = length(CAST(payload AS BLOB))),
+    payload     BLOB NOT NULL,
+    byte_count  INTEGER NOT NULL,
     PRIMARY KEY(session_id, subagent_id, ordinal),
     FOREIGN KEY(session_id, subagent_id)
         REFERENCES subagent_streams(session_id, subagent_id)
@@ -1099,7 +1192,7 @@ impl SessionDatabase {
         let mut report = PermissionHistoryScan::default();
         for table in ["main_history_items", "subagent_history_items"] {
             let mut statement = transaction.prepare(&format!(
-                "SELECT s.cwd, length(CAST(h.payload AS BLOB)), CASE WHEN length(CAST(h.payload AS BLOB)) <= ?1 THEN h.payload END FROM {table} h JOIN sessions s ON s.id = h.session_id ORDER BY h.session_id, {}h.ordinal",
+                "SELECT s.cwd, h.byte_count, CASE WHEN h.byte_count <= ?1 THEN h.payload END FROM {table} h JOIN sessions s ON s.id = h.session_id ORDER BY h.session_id, {}h.ordinal",
                 if table == "subagent_history_items" { "h.subagent_id, " } else { "" }
             ))?;
             let mut rows = statement.query([to_i64(max_row_bytes, "history row limit")?])?;
@@ -1116,7 +1209,7 @@ impl SessionDatabase {
                     continue;
                 }
                 let cwd: String = row.get(0)?;
-                let payload: String = row.get(2)?;
+                let payload = payload_from_row(row, 2, "history payload")?;
                 visit(&cwd, &payload);
             }
             if report.truncated {
@@ -1222,8 +1315,8 @@ impl SessionDatabase {
                 }
                 let mut statement = transaction.prepare(&format!(
                     "SELECT CASE WHEN length(CAST({stream} AS BLOB)) <= {MAX_IDENTIFIER_BYTES} THEN {stream} END, \
-                     ordinal, length(CAST(payload AS BLOB)), \
-                     CASE WHEN length(CAST(payload AS BLOB)) <= ?2 THEN payload END \
+                     ordinal, byte_count, \
+                     CASE WHEN byte_count <= ?2 THEN payload END \
                      FROM {table} WHERE session_id = ?1 ORDER BY {order} LIMIT ?3"
                 ))?;
                 let mut rows = statement.query(params![
@@ -1268,7 +1361,7 @@ impl SessionDatabase {
                         report.oversized_rows += 1;
                         continue;
                     }
-                    let text: String = row.get(3)?;
+                    let text = payload_from_row(row, 3, "history payload")?;
                     let Ok(payload) = serde_json::from_str::<Value>(&text) else {
                         report.invalid_records += 1;
                         continue;
@@ -2526,7 +2619,7 @@ impl SessionDatabase {
             let mut statement = transaction.prepare(sql)?;
             let mut rows = statement.query(params![id.as_bytes().as_slice()])?;
             while let Some(row) = rows.next()? {
-                let payload: String = row.get(0)?;
+                let payload = payload_from_row(row, 0, "payload")?;
                 visit(&payload);
             }
         }
@@ -4136,6 +4229,9 @@ fn migrate_to_current(
         if step.to == 7 {
             backfill_workspace_bindings(&transaction)?;
         }
+        if step.to == 10 {
+            compress_existing_payloads(&transaction)?;
+        }
         transaction.pragma_update(None, "user_version", step.to)?;
         transaction.commit()?;
         current = step.to;
@@ -4146,6 +4242,50 @@ fn migrate_to_current(
         backup = %backup.display(),
         "migrated session database schema"
     );
+    Ok(())
+}
+
+/// Moves every payload from the tables [`PAYLOAD_COMPRESSION_SCHEMA`] renamed
+/// into their compressed replacements. Rows stream one at a time: this visits
+/// every payload in the database, so collecting them first would make peak
+/// memory scale with the transcript history.
+fn compress_existing_payloads(transaction: &Transaction<'_>) -> Result<(), SessionError> {
+    for rewrite in &COMPRESSED_PAYLOAD_TABLES {
+        let PayloadRewrite {
+            table,
+            legacy,
+            keys,
+            placeholders,
+        } = rewrite;
+        let key_count = placeholders.matches('?').count();
+        let mut select = transaction.prepare(&format!("SELECT {keys}, payload FROM {legacy}"))?;
+        let mut insert = transaction.prepare(&format!(
+            "INSERT INTO {table} ({keys}, payload, byte_count) \
+             VALUES ({placeholders}, ?{}, ?{})",
+            key_count + 1,
+            key_count + 2
+        ))?;
+        let mut rows = select.query([])?;
+        let mut moved: u64 = 0;
+        let mut stored: u64 = 0;
+        while let Some(row) = rows.next()? {
+            let mut values = Vec::with_capacity(key_count + 2);
+            for index in 0..key_count {
+                values.push(row.get::<_, SqlValue>(index)?);
+            }
+            let payload: String = row.get(key_count)?;
+            let compressed = compress_payload(&payload)?;
+            stored += compressed.len() as u64;
+            values.push(SqlValue::Blob(compressed));
+            values.push(SqlValue::Integer(to_i64(payload.len(), "payload bytes")?));
+            insert.execute(params_from_iter(values))?;
+            moved += 1;
+        }
+        tracing::info!(table, rows = moved, stored_bytes = stored, "compressed payloads");
+    }
+    for rewrite in &COMPRESSED_PAYLOAD_TABLES {
+        transaction.execute_batch(&format!("DROP TABLE {};", rewrite.legacy))?;
+    }
     Ok(())
 }
 
@@ -4394,6 +4534,43 @@ fn deserialize_json<T: DeserializeOwned>(
         field,
         reason: error.to_string(),
     })
+}
+
+/// The single point where a payload becomes stored bytes. Callers keep the
+/// uncompressed length for `byte_count`, which `logical_bytes`, the trim
+/// threshold and the history-discovery bounds all read.
+fn compress_payload(payload: &str) -> Result<Vec<u8>, SessionError> {
+    zstd::bulk::compress(payload.as_bytes(), PAYLOAD_COMPRESSION_LEVEL).map_err(|error| {
+        SessionError::CorruptDatabaseValue {
+            field: "payload",
+            reason: error.to_string(),
+        }
+    })
+}
+
+/// A payload that fails to decode is a named error rather than a panic: before
+/// compression a damaged row still parsed as text, and afterwards it fails at
+/// the frame instead.
+fn decompress_payload(stored: &[u8], field: &'static str) -> Result<String, SessionError> {
+    let decoded =
+        zstd::decode_all(stored).map_err(|error| SessionError::CorruptDatabaseValue {
+            field,
+            reason: format!("{PAYLOAD_DECOMPRESSION_FAILED}: {error}"),
+        })?;
+    String::from_utf8(decoded).map_err(|error| SessionError::CorruptDatabaseValue {
+        field,
+        reason: error.to_string(),
+    })
+}
+
+/// Reads one stored payload column and returns the JSON text it holds.
+fn payload_from_row(
+    row: &rusqlite::Row<'_>,
+    index: usize,
+    field: &'static str,
+) -> Result<String, SessionError> {
+    let stored: Vec<u8> = row.get(index)?;
+    decompress_payload(&stored, field)
 }
 
 fn validate_len(kind: &'static str, actual: usize, maximum: usize) -> Result<(), SessionError> {
@@ -4685,7 +4862,7 @@ fn insert_history(
         params![
             session_id.as_bytes().as_slice(),
             to_i64(ordinal, "history ordinal")?,
-            payload,
+            compress_payload(payload)?,
             to_i64(payload.len(), "history payload bytes")?
         ],
     )?;
@@ -4704,7 +4881,7 @@ fn insert_tool_output(
         params![
             session_id.as_bytes().as_slice(),
             id,
-            payload,
+            compress_payload(payload)?,
             to_i64(payload.len(), "tool output payload bytes")?
         ],
     )?;
@@ -4745,7 +4922,7 @@ fn insert_subagent_history(
             session_id.as_bytes().as_slice(),
             subagent_id,
             to_i64(ordinal, "subagent history ordinal")?,
-            payload,
+            compress_payload(payload)?,
             to_i64(payload.len(), "subagent payload bytes")?
         ],
     )?;
@@ -4835,7 +5012,7 @@ fn query_json_rows<T: DeserializeOwned>(
     let mut rows = statement.query(params![id.as_bytes().as_slice()])?;
     let mut values = Vec::new();
     while let Some(row) = rows.next()? {
-        let payload: String = row.get(0)?;
+        let payload = payload_from_row(row, 0, "payload")?;
         values.push(deserialize_json(&payload, "payload")?);
     }
     Ok(values)
@@ -4851,7 +5028,7 @@ fn query_keyed_json_rows<T: DeserializeOwned>(
     let mut values = Vec::new();
     while let Some(row) = rows.next()? {
         let key: String = row.get(0)?;
-        let payload: String = row.get(1)?;
+        let payload = payload_from_row(row, 1, "payload")?;
         values.push((key, deserialize_json(&payload, "payload")?));
     }
     Ok(values)
@@ -4869,7 +5046,7 @@ fn query_subagent_rows<T: DeserializeOwned>(
     let mut rows = statement.query(params![session_id.as_bytes().as_slice(), subagent_id])?;
     let mut values = Vec::new();
     while let Some(row) = rows.next()? {
-        let payload: String = row.get(0)?;
+        let payload = payload_from_row(row, 0, "subagent history payload")?;
         values.push(deserialize_json(&payload, "subagent history payload")?);
     }
     Ok(values)
@@ -5198,6 +5375,13 @@ mod tests {
         "forgetting a transcript must not erase what the project did";
     const MIGRATED_MATCHES_FRESH: &str =
         "a migrated database must end with exactly the schema a fresh one gets";
+    const MIGRATION_KEEPS_TRANSCRIPTS: &str =
+        "compressing the payload columns must carry every row across unchanged";
+    const PAYLOAD_STORED_COMPRESSED: &str =
+        "a stored payload must not be the plaintext it was written from";
+    const BYTE_COUNT_IS_UNCOMPRESSED: &str =
+        "byte_count must stay the uncompressed length that trim and the history bounds read";
+    const COMPRESSION_PREVIOUS_SCHEMA: i64 = 9;
     const BACKUP_KEEPS_ORIGIN: &str =
         "the pre-migration backup must stay readable by the version that wrote it";
     const PARTIAL_MIGRATION: &str = "a failed step must leave a version some binary can open";
@@ -5308,7 +5492,7 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         let mut database = SessionDatabase::open(&state).unwrap();
         let (before, after) = permission_repair_fixture(&mut database);
         let stats = database.stats().unwrap();
-        let protected = |connection: &Connection| -> (String, String, i64, i64) {
+        let protected = |connection: &Connection| -> (String, Vec<u8>, i64, i64) {
             connection.query_row("SELECT token_usage, (SELECT payload FROM main_history_items LIMIT 1), updated_at, history_item_count FROM sessions", [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))).unwrap()
         };
         let original = protected(&database.connection);
@@ -5464,8 +5648,8 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         database
             .connection
             .execute(
-                "UPDATE main_history_items SET payload = ?1, byte_count = length(CAST(?1 AS BLOB))",
-                [&payload],
+                "UPDATE main_history_items SET payload = ?1, byte_count = ?2",
+                params![compress_payload(&payload).unwrap(), payload.len() as i64],
             )
             .unwrap();
         if corrupt {
@@ -5527,8 +5711,12 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         let payload = json!({"id": session.id, "type": "tool_call"}).to_string();
         for table in ["main_history_items", "subagent_history_items"] {
             database.connection.execute(
-                &format!("UPDATE {table} SET payload = ?1, byte_count = length(CAST(?1 AS BLOB)) WHERE session_id = ?2"),
-                params![payload, session.id.as_bytes().as_slice()],
+                &format!("UPDATE {table} SET payload = ?1, byte_count = ?2 WHERE session_id = ?3"),
+                params![
+                    compress_payload(&payload).unwrap(),
+                    payload.len() as i64,
+                    session.id.as_bytes().as_slice()
+                ],
             ).unwrap();
         }
         session.id
@@ -5671,8 +5859,12 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         };
         if let Some(payload) = payload {
             database.connection.execute(
-                "UPDATE main_history_items SET payload = ?1, byte_count = length(CAST(?1 AS BLOB)) WHERE session_id = ?2",
-                params![payload, newest.as_bytes().as_slice()],
+                "UPDATE main_history_items SET payload = ?1, byte_count = ?2 WHERE session_id = ?3",
+                params![
+                    compress_payload(&payload).unwrap(),
+                    payload.len() as i64,
+                    newest.as_bytes().as_slice()
+                ],
             ).unwrap();
         }
         let mut report = HistoryReadReport::default();
@@ -5778,8 +5970,12 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
                 if row.session_id == newest {
                     let payload = json!({"id": older, "type": "tool_call"}).to_string();
                     database.connection.execute(
-                        "INSERT INTO main_history_items (session_id, ordinal, payload, byte_count) VALUES (?1, 1, ?2, length(CAST(?2 AS BLOB)))",
-                        params![older.as_bytes().as_slice(), payload],
+                        "INSERT INTO main_history_items (session_id, ordinal, payload, byte_count) VALUES (?1, 1, ?2, ?3)",
+                        params![
+                            older.as_bytes().as_slice(),
+                            compress_payload(&payload).unwrap(),
+                            payload.len() as i64
+                        ],
                     ).unwrap();
                 }
                 ControlFlow::Continue(())
@@ -7592,14 +7788,37 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         database.quick_check().unwrap();
     }
 
+    const LCG_MULTIPLIER: u64 = 6364136223846793005;
+    const LCG_INCREMENT: u64 = 1442695040888963407;
+    const VACUUM_ROWS: u64 = 64;
+    const VACUUM_ROW_BYTES: usize = 8192;
+
+    /// Hex drawn from an LCG, so a stored row still costs pages after
+    /// compression. A repeated character would collapse to a few bytes and the
+    /// freelist this test measures would never grow.
+    fn high_entropy_text(seed: u64, bytes: usize) -> String {
+        let mut state = seed | 1;
+        let mut text = String::with_capacity(bytes + size_of::<u64>() * 2);
+        while text.len() < bytes {
+            state = state
+                .wrapping_mul(LCG_MULTIPLIER)
+                .wrapping_add(LCG_INCREMENT);
+            text.push_str(&format!("{state:016x}"));
+        }
+        text.truncate(bytes);
+        text
+    }
+
     #[test]
     fn incremental_vacuum_frees_every_requested_page() {
         let (_temp, state_dir) = state_dir();
         let mut database = SessionDatabase::open(&state_dir).unwrap();
         let mut session = TestSession::new(MODEL, CWD);
-        for index in 0..64 {
-            session
-                .insert_tool_output(format!("output-{index}"), json!({"text": "x".repeat(8192)}));
+        for index in 0..VACUUM_ROWS {
+            session.insert_tool_output(
+                format!("output-{index}"),
+                json!({"text": high_entropy_text(index, VACUUM_ROW_BYTES)}),
+            );
         }
         database.save(&session, None).unwrap();
         database.delete(session.id, None).unwrap();
@@ -8392,6 +8611,239 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
             .unwrap();
         connection.pragma_update(None, "user_version", 5).unwrap();
         drop(connection);
+    }
+
+    /// The three payload tables as schema 9 left them: plain JSON text, with the
+    /// two CHECK constraints the compressed shape cannot carry.
+    const HISTORY_TABLES_BEFORE_COMPRESSION: &str = r#"
+DROP TABLE subagent_history_items;
+DROP TABLE tool_outputs;
+DROP TABLE main_history_items;
+
+CREATE TABLE main_history_items (
+    session_id BLOB NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    ordinal    INTEGER NOT NULL,
+    payload    TEXT NOT NULL CHECK(json_valid(payload)),
+    byte_count INTEGER NOT NULL CHECK(byte_count = length(CAST(payload AS BLOB))),
+    PRIMARY KEY(session_id, ordinal)
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE tool_outputs (
+    session_id BLOB NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    tool_id    TEXT NOT NULL,
+    payload    TEXT NOT NULL CHECK(json_valid(payload)),
+    byte_count INTEGER NOT NULL CHECK(byte_count = length(CAST(payload AS BLOB))),
+    PRIMARY KEY(session_id, tool_id)
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE subagent_history_items (
+    session_id  BLOB NOT NULL,
+    subagent_id TEXT NOT NULL,
+    ordinal     INTEGER NOT NULL,
+    payload     TEXT NOT NULL CHECK(json_valid(payload)),
+    byte_count  INTEGER NOT NULL CHECK(byte_count = length(CAST(payload AS BLOB))),
+    PRIMARY KEY(session_id, subagent_id, ordinal),
+    FOREIGN KEY(session_id, subagent_id)
+        REFERENCES subagent_streams(session_id, subagent_id)
+        ON DELETE CASCADE
+) STRICT, WITHOUT ROWID;
+"#;
+
+    /// A database as the release before payload compression left it: schema 9,
+    /// carrying one session whose transcript, tool output and subagent stream
+    /// are all stored as text.
+    fn seed_v9_database(state_dir: &StateDir) -> (CaudraId, String) {
+        let path = state_dir.path().join(SESSIONS_DB_FILE);
+        create_owner_only(&path).unwrap();
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .pragma_update(None, "page_size", PAGE_SIZE)
+            .unwrap();
+        connection
+            .pragma_update(None, "auto_vacuum", "INCREMENTAL")
+            .unwrap();
+        connection.execute_batch("VACUUM").unwrap();
+        connection.execute_batch(&full_schema()).unwrap();
+        connection
+            .execute_batch(HISTORY_TABLES_BEFORE_COMPRESSION)
+            .unwrap();
+
+        let mut session = TestSession::new(MODEL, CWD);
+        session.push_message(TestMessage(ARTIFACT_NAME.into()));
+        session.insert_tool_output(SMALL_OUTPUT_ID.into(), json!(ARTIFACT_NAME));
+        session.set_subagent_messages(
+            HISTORY_STREAM.into(),
+            vec![TestMessage(ARTIFACT_NAME.into())],
+        );
+        let serialized = SerializedSession::new(&session).unwrap();
+        let transaction = connection.unchecked_transaction().unwrap();
+        insert_root(&transaction, &session, &serialized).unwrap();
+        transaction.commit().unwrap();
+
+        let payload = serde_json::to_string(&TestMessage(ARTIFACT_NAME.into())).unwrap();
+        let id = session.id.as_bytes();
+        connection
+            .execute(
+                "INSERT INTO main_history_items (session_id, ordinal, payload, byte_count) \
+                 VALUES (?1, 0, ?2, length(CAST(?2 AS BLOB)))",
+                params![id.as_slice(), payload],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO tool_outputs (session_id, tool_id, payload, byte_count) \
+                 VALUES (?1, ?2, ?3, length(CAST(?3 AS BLOB)))",
+                params![id.as_slice(), SMALL_OUTPUT_ID, payload],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO subagent_streams (session_id, subagent_id, task_spec) \
+                 VALUES (?1, ?2, NULL)",
+                params![id.as_slice(), HISTORY_STREAM],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO subagent_history_items \
+                 (session_id, subagent_id, ordinal, payload, byte_count) \
+                 VALUES (?1, ?2, 0, ?3, length(CAST(?3 AS BLOB)))",
+                params![id.as_slice(), HISTORY_STREAM, payload],
+            )
+            .unwrap();
+        connection
+            .pragma_update(None, "application_id", APPLICATION_ID)
+            .unwrap();
+        connection
+            .pragma_update(None, "user_version", COMPRESSION_PREVIOUS_SCHEMA)
+            .unwrap();
+        drop(connection);
+        (session.id, payload)
+    }
+
+    fn stored_payload(database: &SessionDatabase, sql: &str) -> Vec<u8> {
+        database
+            .connection
+            .query_row(sql, [], |row| row.get::<_, Vec<u8>>(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn migrating_a_v9_database_compresses_its_payloads() {
+        let (_migrated_temp, migrated_dir) = state_dir();
+        let (_fresh_temp, fresh_dir) = state_dir();
+        let (id, payload) = seed_v9_database(&migrated_dir);
+
+        let migrated = SessionDatabase::open(&migrated_dir).unwrap();
+        let fresh = SessionDatabase::open(&fresh_dir).unwrap();
+
+        assert_eq!(migrated.stats().unwrap().schema_version, SCHEMA_VERSION);
+        assert_eq!(
+            schema_objects(&migrated),
+            schema_objects(&fresh),
+            "{MIGRATED_MATCHES_FRESH}"
+        );
+        for sql in [
+            "SELECT payload FROM main_history_items",
+            "SELECT payload FROM tool_outputs",
+            "SELECT payload FROM subagent_history_items",
+        ] {
+            let stored = stored_payload(&migrated, sql);
+            assert_ne!(stored, payload.as_bytes(), "{PAYLOAD_STORED_COMPRESSED}");
+            assert_eq!(
+                decompress_payload(&stored, "payload").unwrap(),
+                payload,
+                "{MIGRATION_KEEPS_TRANSCRIPTS}"
+            );
+        }
+        let byte_count: i64 = migrated
+            .connection
+            .query_row("SELECT byte_count FROM main_history_items", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            byte_count,
+            payload.len() as i64,
+            "{BYTE_COUNT_IS_UNCOMPRESSED}"
+        );
+        let loaded = migrated.load::<TestMessage, Value, Value>(id).unwrap();
+        assert_eq!(
+            loaded.messages(),
+            &[TestMessage(ARTIFACT_NAME.into())],
+            "{MIGRATION_KEEPS_TRANSCRIPTS}"
+        );
+        // The visitor opens with the session metadata, so only the rows equal to
+        // the seeded payload are the transcript ones this migration moved.
+        let mut payload_rows = 0;
+        migrated
+            .visit_payload_json(id, |text| {
+                if text == payload {
+                    payload_rows += 1;
+                }
+            })
+            .unwrap();
+        assert_eq!(
+            payload_rows,
+            COMPRESSED_PAYLOAD_TABLES.len(),
+            "{MIGRATION_KEEPS_TRANSCRIPTS}"
+        );
+    }
+
+    #[test]
+    fn a_saved_payload_is_stored_compressed_with_its_uncompressed_byte_count() {
+        let (_temp, state) = state_dir();
+        let mut database = SessionDatabase::open(&state).unwrap();
+        let mut session = TestSession::new(MODEL, CWD);
+        let text = high_entropy_text(1, VACUUM_ROW_BYTES);
+        session.insert_tool_output(SMALL_OUTPUT_ID.into(), json!({"text": text}));
+        database.save(&session, None).unwrap();
+
+        let (stored, byte_count): (Vec<u8>, i64) = database
+            .connection
+            .query_row("SELECT payload, byte_count FROM tool_outputs", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+
+        let decoded = decompress_payload(&stored, "payload").unwrap();
+        assert!(stored.len() < decoded.len(), "{PAYLOAD_STORED_COMPRESSED}");
+        assert_eq!(
+            byte_count,
+            decoded.len() as i64,
+            "{BYTE_COUNT_IS_UNCOMPRESSED}"
+        );
+        let loaded = database.load::<TestMessage, Value, Value>(session.id).unwrap();
+        assert_eq!(loaded.tool_outputs(), session.tool_outputs());
+    }
+
+    #[test]
+    fn a_corrupt_compressed_payload_is_a_named_error() {
+        let (_temp, state) = state_dir();
+        let mut database = SessionDatabase::open(&state).unwrap();
+        let mut session = TestSession::new(MODEL, CWD);
+        session.push_message(TestMessage(ARTIFACT_NAME.into()));
+        database.save(&session, None).unwrap();
+        database
+            .connection
+            .execute(
+                "UPDATE main_history_items SET payload = ?1",
+                params![vec![0_u8; size_of::<u64>()]],
+            )
+            .unwrap();
+
+        let error = database
+            .load::<TestMessage, Value, Value>(session.id)
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                &error,
+                SessionError::CorruptDatabaseValue { reason, .. }
+                    if reason.contains(PAYLOAD_DECOMPRESSION_FAILED)
+            ),
+            "{error}"
+        );
     }
 
     fn schema_objects(database: &SessionDatabase) -> Vec<(String, String, Option<String>)> {
