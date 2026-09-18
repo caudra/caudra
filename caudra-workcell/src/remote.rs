@@ -326,9 +326,11 @@ impl RemoteTransport {
         if endpoint.is_loopback() && !numeric_loopback(endpoint_url) {
             return Err(RemoteWorkcellError::InsecureTransport);
         }
-        if endpoint_url.scheme() == "http" && bearer.is_some() {
-            return Err(RemoteWorkcellError::InsecureTransport);
-        }
+        // A bearer may ride plaintext only to a numeric loopback literal. That
+        // request never reaches a network interface, and the proxy is bypassed
+        // below, which closes the one path that could divert it off the host. A
+        // name like `localhost` does not qualify, because resolution can point
+        // it somewhere else.
         if endpoint_url.scheme() == "http" && !numeric_loopback(endpoint_url) {
             return Err(RemoteWorkcellError::InsecureTransport);
         }
@@ -5086,14 +5088,22 @@ fn validate_credential_selection(
     selection: &RemoteWorkcellSelection,
     credential: Option<&NamedBearerCredential>,
 ) -> Result<(), RemoteWorkcellError> {
+    // Matches `RemoteTransport::new`: plaintext is confined to a numeric
+    // loopback literal, and a bearer is permitted there because the request
+    // never leaves the host.
     if selection.endpoint.as_url().scheme() == "http"
-        && (!numeric_loopback(selection.endpoint.as_url()) || credential.is_some())
+        && !numeric_loopback(selection.endpoint.as_url())
     {
         return Err(RemoteWorkcellError::InsecureTransport);
     }
     match (&selection.credential_ref, credential) {
         (None, None) => Ok(()),
         (Some(reference), Some(credential)) if reference.name() == credential.name() => Ok(()),
+        // A process-scoped bearer names no stored credential, so there is no
+        // reference for it to agree with. Selection already refuses to omit the
+        // reference for anything but a numeric loopback literal, and that is
+        // re-established here rather than assumed.
+        (None, Some(_)) if numeric_loopback(selection.endpoint.as_url()) => Ok(()),
         _ => Err(RemoteWorkcellError::Authentication),
     }
 }
@@ -7249,6 +7259,8 @@ mod tests {
     };
     use workcell::host_contract as contract;
 
+    const PLAINTEXT_BEARER_BOUNDARY: &str =
+        "a bearer may ride plaintext only to a numeric loopback literal";
     const TEST_REQUEST_DIGEST: &str =
         "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -7686,14 +7698,30 @@ mod tests {
         .unwrap()
     }
 
-    #[test]
-    fn plaintext_bearer_is_refused() {
-        let endpoint = WorkcellEndpoint::parse("http://127.0.0.1:1234/mcp").unwrap();
+    /// A sandbox manager on the same host mints a bearer per sandbox and serves
+    /// it over plaintext loopback. That request never reaches an interface, so
+    /// the bearer is allowed; anything the host cannot vouch for is not.
+    #[test_case("http://127.0.0.1:1234/mcp" ; "numeric_ipv4_loopback")]
+    #[test_case("http://[::1]:1234/mcp" ; "numeric_ipv6_loopback")]
+    #[test_case("https://workcell.example/mcp" ; "tls_anywhere")]
+    fn bearer_is_carried_to_every_endpoint_selection_allows(endpoint: &str) {
+        let endpoint = WorkcellEndpoint::parse(endpoint).unwrap();
+
         let result = RemoteTransport::new(&endpoint, Some(Arc::from("secret")));
-        assert!(matches!(
-            result,
-            Err(RemoteWorkcellError::InsecureTransport)
-        ));
+
+        assert!(result.is_ok(), "{PLAINTEXT_BEARER_BOUNDARY}");
+    }
+
+    /// Plaintext off the host is refused a layer earlier, so the transport is
+    /// never the only thing standing between a bearer and the network.
+    #[test_case("http://10.0.2.100:1234/mcp" ; "plaintext_private_address")]
+    #[test_case("http://workcell.example/mcp" ; "plaintext_public_name")]
+    #[test_case("http://localhost:1234/mcp" ; "plaintext_resolvable_name")]
+    fn plaintext_off_host_never_parses(endpoint: &str) {
+        assert!(
+            WorkcellEndpoint::parse(endpoint).is_err(),
+            "{PLAINTEXT_BEARER_BOUNDARY}"
+        );
     }
 
     #[test_case(contract::ProjectAssetKind::Instructions, ProjectAssetKind::Instructions ; "instructions")]

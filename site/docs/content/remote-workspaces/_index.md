@@ -81,6 +81,21 @@ expected_workspace_id = "dev-workspace"
 
 Endpoints must use HTTPS, except HTTP on numeric loopback addresses such as `127.0.0.1` or `[::1]`. `http://localhost` is rejected. User information, query strings, and fragments are forbidden. Non-loopback endpoints require a saved `credential:NAME` reference. Raw tokens, `env:` references, and file references are not accepted selectors.
 
+## Tokens that live and die with a sandbox
+
+A local sandbox manager that mints a fresh bearer token per sandbox has nothing worth saving. Set `CAUDRA_WORKCELL_TOKEN` in the environment of the Caudra process instead:
+
+```bash
+CAUDRA_WORKCELL_TOKEN="$token" caudra \
+  --workcell-endpoint http://127.0.0.1:49983/sandboxes/"$id"/mcp \
+  --workcell-cwd projects/app \
+  acp
+```
+
+The token is read once at startup and never written to the credential store. A saved `--workcell-credential-ref` takes precedence, so an inherited variable cannot override an explicit selector. Because selection already refuses a non-loopback endpoint without a saved reference, this variable reaches numeric loopback endpoints only.
+
+Prefer a saved credential for anything long-lived. This path exists for tokens whose lifetime is shorter than the machine they authenticate to.
+
 Direct numeric-loopback selection can omit the credential reference at the CLI parser level. The Workcell remote discovery extension still requires an authenticated server, so use a credential for a working connection. Profiles always require `credential_ref`, including loopback profiles.
 
 ## Connect

@@ -1,3 +1,4 @@
+use std::env;
 use std::path::{Path, PathBuf};
 
 use caudra_agent::mcp::config::{http_endpoints, load_global_config};
@@ -9,7 +10,10 @@ use caudra_config::{
         WorkcellSourceRef, load_workcell_profiles, select_workcell,
     },
 };
-use caudra_storage::auth::load_workcell_credential;
+use caudra_storage::auth::{
+    WorkcellCredential, WorkcellCredentialName, WorkcellCredentialNameError,
+    load_workcell_credential,
+};
 use caudra_storage::id::CaudraId;
 use caudra_storage::local_documents::LocalDocumentStore;
 use caudra_storage::remote_operation_journal::{
@@ -68,6 +72,11 @@ pub enum WorkcellRuntimeError {
     },
     #[error("Workcell credential '{name}' is not stored")]
     MissingCredential { name: String },
+    #[error("the reserved ephemeral Workcell credential name is not usable")]
+    EphemeralCredentialName {
+        #[source]
+        source: WorkcellCredentialNameError,
+    },
     #[error("failed to mint a Workcell session binding")]
     SessionBinding(#[source] IdentifierError),
     #[error("failed to connect to the selected remote Workcell")]
@@ -289,28 +298,60 @@ fn resolve_selection(
     .map_err(WorkcellRuntimeError::Selection)
 }
 
+/// A bearer supplied by the process that launched us, for endpoints whose token
+/// is minted per sandbox and dies with it. Saving such a token would leave the
+/// auth store full of credentials for machines that no longer exist.
+const EPHEMERAL_TOKEN_ENV: &str = "CAUDRA_WORKCELL_TOKEN";
+/// Names the ephemeral credential in diagnostics. It is never written to the
+/// auth store, so it cannot collide with a saved credential.
+const EPHEMERAL_CREDENTIAL_NAME: &str = "ephemeral";
+
+/// The saved reference wins when both are present: an explicit selector should
+/// never be silently overridden by an inherited environment variable.
+fn resolve_credential(
+    selection: &RemoteWorkcellSelection,
+    storage: &StateDir,
+) -> Result<Option<NamedBearerCredential>, WorkcellRuntimeError> {
+    if let Some(reference) = selection.credential_ref.as_ref() {
+        let name = reference.name();
+        let credential = load_workcell_credential(storage, name)
+            .map_err(|source| WorkcellRuntimeError::Credential {
+                name: name.to_string(),
+                source,
+            })?
+            .ok_or_else(|| WorkcellRuntimeError::MissingCredential {
+                name: name.to_string(),
+            })?;
+        return Ok(Some(NamedBearerCredential::new(name.clone(), credential)));
+    }
+
+    // Selection already refused a non-loopback endpoint without a saved
+    // reference, so an inherited variable can only ever reach a local sandbox.
+    env::var(EPHEMERAL_TOKEN_ENV)
+        .ok()
+        .filter(|token| !token.is_empty())
+        .map(ephemeral_credential)
+        .transpose()
+}
+
+fn ephemeral_credential(token: String) -> Result<NamedBearerCredential, WorkcellRuntimeError> {
+    let name = WorkcellCredentialName::new(EPHEMERAL_CREDENTIAL_NAME)
+        .map_err(|source| WorkcellRuntimeError::EphemeralCredentialName { source })?;
+    let credential =
+        WorkcellCredential::new(token).map_err(|source| WorkcellRuntimeError::Credential {
+            name: EPHEMERAL_TOKEN_ENV.to_string(),
+            source,
+        })?;
+    Ok(NamedBearerCredential::new(name, credential))
+}
+
 fn connect_remote(
     selection: &RemoteWorkcellSelection,
     storage: &StateDir,
 ) -> Result<RemoteWorkcellClient, WorkcellRuntimeError> {
     let journal =
         RemoteOperationJournal::open(storage).map_err(WorkcellRuntimeError::RemoteJournal)?;
-    let credential = selection
-        .credential_ref
-        .as_ref()
-        .map(|reference| {
-            let name = reference.name();
-            load_workcell_credential(storage, name)
-                .map_err(|source| WorkcellRuntimeError::Credential {
-                    name: name.to_string(),
-                    source,
-                })?
-                .ok_or_else(|| WorkcellRuntimeError::MissingCredential {
-                    name: name.to_string(),
-                })
-                .map(|credential| NamedBearerCredential::new(name.clone(), credential))
-        })
-        .transpose()?;
+    let credential = resolve_credential(selection, storage)?;
     let binding_id = SessionBindingId::new(format!("caudra-{}", CaudraId::generate()))
         .map_err(WorkcellRuntimeError::SessionBinding)?;
     smol::block_on(RemoteWorkcellClient::connect(
@@ -374,13 +415,34 @@ mod tests {
     use caudra_config::workcell::{WorkcellProfiles, select_workcell};
     use caudra_storage::StateDir;
 
-    use super::{WorkcellOrigin, WorkcellRuntime, WorkcellRuntimeError};
+    use super::{
+        EPHEMERAL_CREDENTIAL_NAME, WorkcellOrigin, WorkcellRuntime, WorkcellRuntimeError,
+        ephemeral_credential,
+    };
 
     const EMBEDDED_SOURCE: &str = "default Workcell runtime must register embedded canonical tools";
     const CREDENTIAL_NAME: &str = "missing-test-credential";
+    const REJECTS_UNUSABLE_TOKEN: &str = "a token the transport cannot send must fail loudly";
     const SECRET_ENDPOINT: &str = "https://workcell.example/private/tenant";
     const INVALID_DISCOVER_RESPONSE: &str = "{}";
     const MAX_TEST_REQUEST_BYTES: usize = 4096;
+
+    #[test]
+    fn ephemeral_credential_uses_the_reserved_name() {
+        let credential = ephemeral_credential("sandbox-token".to_owned()).unwrap();
+
+        assert_eq!(credential.name().as_str(), EPHEMERAL_CREDENTIAL_NAME);
+    }
+
+    #[test_case::test_case("" ; "empty")]
+    #[test_case::test_case("has space" ; "embedded_whitespace")]
+    #[test_case::test_case("trailing\n" ; "trailing_newline")]
+    fn ephemeral_credential_rejects_an_unusable_token(token: &str) {
+        assert!(
+            ephemeral_credential(token.to_owned()).is_err(),
+            "{REJECTS_UNUSABLE_TOKEN}"
+        );
+    }
 
     #[test]
     fn embedded_default_preserves_registration_and_context() {
