@@ -591,10 +591,9 @@ impl PermissionPrompt {
                 .front()
                 .and_then(|queued| queued.requester.as_deref())
             {
-                current.context.insert(
-                    1,
-                    ReviewField::new("Requester", format!("subtask {requester}")),
-                );
+                current
+                    .context
+                    .insert(1, ReviewField::new("Requester", requester));
             }
             current.bound();
             &current
@@ -634,7 +633,7 @@ impl PermissionPrompt {
             .and_then(|queued| queued.requester.as_deref())
         {
             lifetime_lines.push(Line::styled(
-                format!("Requester: subtask {}", review_text(requester)),
+                format!("Requester: {}", review_text(requester)),
                 t.tool_dim,
             ));
         }

@@ -1913,6 +1913,7 @@ mod tests {
     #[test_case("/project/.git/HEAD", PermissionResourceAccess::Read => (false, false) ; "head_read")]
     #[test_case("/project/.git/refs/heads/main", PermissionResourceAccess::Read => (false, false) ; "refs_read")]
     #[test_case("/project/.git/logs/HEAD", PermissionResourceAccess::Read => (false, false) ; "reflog_read")]
+    #[test_case("/project/.git/index", PermissionResourceAccess::Read => (false, false) ; "index_read")]
     #[test_case("/project/.git/objects/ab/cdef", PermissionResourceAccess::Search => (false, false) ; "objects_search")]
     #[test_case("/project/.git/config", PermissionResourceAccess::Read => (true, true) ; "config_stays_guarded")]
     #[test_case("/project/.git/hooks/pre-commit", PermissionResourceAccess::Read => (true, true) ; "hooks_stay_guarded")]

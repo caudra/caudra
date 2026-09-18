@@ -908,7 +908,7 @@ mod tests {
 
     #[test_case(ToolAudience::MAIN, true; "main")]
     #[test_case(ToolAudience::GENERAL_SUB, true; "general_subagent")]
-    #[test_case(ToolAudience::RESEARCH_SUB, false; "research_subagent")]
+    #[test_case(ToolAudience::RESEARCH_SUB, true; "research_subagent")]
     #[test_case(ToolAudience::INTERPRETER, false; "interpreter")]
     #[test_case(ToolAudience::all(), false; "all_is_not_one_agent_audience")]
     fn shell_analysis_preserves_dispatch_audience_restrictions(

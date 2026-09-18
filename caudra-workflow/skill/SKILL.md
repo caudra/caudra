@@ -135,7 +135,7 @@ Options, all optional:
 | Option | Meaning |
 |--------|---------|
 | `label` | name shown in the roster and the run log. Default `agent <n>`. Give every agent one. |
-| `capability_mode` | `"read-only"` (default) runs a plan task: read, search, and fetch only. `"read-write"`, `"execute"`, `"all"`, or `"build"` run a build task that may edit files and run commands, still capped by the user's current permission mode and the normal permission prompts. |
+| `capability_mode` | `"read-only"` (default) runs a plan task: read, search, fetch, and run a shell command that changes nothing and touches no path outside the project, so `git diff` and `rg` work while a build is refused per call. `"read-write"`, `"execute"`, `"all"`, or `"build"` run a build task that may edit files and run commands, still capped by the user's current permission mode and the normal permission prompts. |
 | `output_schema` | a map holding a JSON Schema with `type: "object"` at the root. The agent must answer through `structured_output` and the result is validated before the script sees it. On success `output` is the object. |
 | `phase` | tags the agent with a phase title for the roster. |
 | `profile` | a Caudra system prompt profile name for the task. Omit it unless the user has profiles. |

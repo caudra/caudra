@@ -165,13 +165,14 @@ mod tests {
         ));
     }
 
-    /// Agents answer `{}` on the smoke path, so this pins the degraded route:
-    /// an empty survey and no findings still reach a written artifact.
+    /// Agents answer `{}` on the smoke path, so `readable` reads as false and
+    /// this pins the earliest exit: a survey that read nothing still reaches a
+    /// written artifact instead of dispatching reviewers over it.
     #[test]
     fn review_changes_validates_on_the_inert_path() {
         let report = validate(REVIEW_CHANGES_SOURCE).expect("review-changes validates");
         assert_eq!(report.meta.name, REVIEW_CHANGES_NAME);
-        assert_eq!(report.smoke.phases_seen, ["Survey", "Review"]);
+        assert_eq!(report.smoke.phases_seen, ["Survey"]);
         assert!(matches!(
             report.smoke.outcome,
             WorkflowOutcome::Completed(_)

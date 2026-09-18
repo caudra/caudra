@@ -24,7 +24,7 @@ pub(super) const INERT_GIT_METADATA: &[&str] = &[
     "MERGE_HEAD",
     "MERGE_MSG",
     "ORIG_HEAD",
-    "file_index",
+    "index",
     "logs",
     "objects",
     "packed-refs",

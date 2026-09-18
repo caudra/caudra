@@ -16,8 +16,8 @@ use crate::tools::registry::{
     PlanModeAccess, RegisteredTool, ToolInvocation, ToolRegistry, TrustedToolSource,
 };
 use crate::tools::{
-    DOOM_LOOP_GUIDANCE, LocalToolEntry, READ_ONLY_TOOL_RESTRICTED, TOOL_SEARCH_TOOL_NAME,
-    ToolContext, ToolEffect, ToolSource,
+    DOOM_LOOP_GUIDANCE, LocalToolEntry, READ_ONLY_CALL_GUIDANCE, READ_ONLY_TOOL_RESTRICTED,
+    TOOL_SEARCH_TOOL_NAME, ToolContext, ToolEffect, ToolSource,
 };
 use crate::workspace_baseline::BaselineOutcome;
 use crate::{AgentError, AgentEvent, LuaToolProvenance, ToolDoneEvent, ToolOutput, ToolStartEvent};
@@ -593,16 +593,23 @@ async fn run_inner(
             }
         };
 
-        let call_effect = entry.effect_for(invocation.as_ref());
-        if ctx.policy().is_read_only() && !entry.is_safe_in_read_only_with(call_effect) {
-            warn!(tool = %name, effect = call_effect.as_str(), "blocked tool in strict read-only mode");
-            return done_error(format!("{READ_ONLY_TOOL_RESTRICTED}: {name}"));
-        }
-
         let mut prepared_intent = match invocation.preflight(ctx).await {
             Ok(intent) => intent,
             Err(error) => return done_error(error),
         };
+
+        // Judged after preflight, beside the plan gate below: an invocation
+        // that can only narrow its effect once its input is parsed gets to
+        // answer, which is what lets a read-only agent run a confined read.
+        let call_effect = entry.effect_for(invocation.as_ref());
+        if ctx.policy().is_read_only() && !entry.is_safe_in_read_only_with(call_effect) {
+            warn!(tool = %name, effect = call_effect.as_str(), "blocked tool in strict read-only mode");
+            invocation.abandon(ctx).await;
+            return done_error(format!(
+                "{READ_ONLY_TOOL_RESTRICTED}: {name}. This call is {}, and {READ_ONLY_CALL_GUIDANCE}.",
+                call_effect.as_str()
+            ));
+        }
 
         let planning = ctx.mode.is_planning();
         let plan_access = invocation.plan_mode_access();
@@ -1460,7 +1467,7 @@ mod tests {
     use crate::snapshots::{SnapshotLimits, SnapshotStore};
     use crate::tools::BATCH_TOOL_NAME;
     use crate::tools::native::batch::BatchTool;
-    use crate::tools::registry::ToolSource;
+    use crate::tools::registry::{PermissionIntent, ToolSource};
     use crate::tools::test_support::{GUARDED_TOOL_NAME, GuardedMock};
     use crate::{AgentMode, EventSender};
 
@@ -2680,17 +2687,30 @@ mod tests {
 
     const EFFECT_PROBE_NAME: &str = "effect_probe";
     const PLAN_PATH: &str = "/tmp/plan.md";
+    const REFUSAL_RELEASES_PREFLIGHT: &str =
+        "a refused call must release the state its preflight took";
+    const REFUSAL_NAMES_THE_CALL: &str =
+        "a tool that stays listed must say which call was refused and why";
 
     /// Registered mutating while each call declares its own effect, the way
-    /// `memory` browses and writes through a single registration.
+    /// `memory` browses and writes through a single registration. Like a shell
+    /// line it can only name its effect once `preflight` has parsed it, so it
+    /// answers with the registered worst case until then.
     struct EffectProbe {
         call_effect: ToolEffect,
-        executed: Arc<AtomicBool>,
+        trace: Arc<ProbeTrace>,
+    }
+
+    #[derive(Default)]
+    struct ProbeTrace {
+        executed: AtomicBool,
+        abandoned: AtomicBool,
     }
 
     struct EffectProbeInvocation {
         call_effect: ToolEffect,
-        executed: Arc<AtomicBool>,
+        preflighted: AtomicBool,
+        trace: Arc<ProbeTrace>,
     }
 
     impl ToolInvocation for EffectProbeInvocation {
@@ -2698,12 +2718,29 @@ mod tests {
             HeaderFuture::Ready(HeaderResult::plain("effect probe".into()))
         }
 
-        fn call_effect(&self, _registered: ToolEffect) -> ToolEffect {
-            self.call_effect
+        fn call_effect(&self, registered: ToolEffect) -> ToolEffect {
+            if self.preflighted.load(Ordering::SeqCst) {
+                self.call_effect
+            } else {
+                registered
+            }
+        }
+
+        fn preflight<'a>(
+            &'a self,
+            _ctx: &'a ToolContext,
+        ) -> BoxFuture<'a, Result<Option<PermissionIntent>, String>> {
+            self.preflighted.store(true, Ordering::SeqCst);
+            Box::pin(std::future::ready(Ok(None)))
+        }
+
+        fn abandon<'a>(&'a self, _ctx: &'a ToolContext) -> BoxFuture<'a, ()> {
+            self.trace.abandoned.store(true, Ordering::SeqCst);
+            Box::pin(std::future::ready(()))
         }
 
         fn execute<'a>(self: Box<Self>, _ctx: &'a ToolContext) -> ExecFuture<'a> {
-            self.executed.store(true, Ordering::SeqCst);
+            self.trace.executed.store(true, Ordering::SeqCst);
             Box::pin(async {
                 ToolExecResult::from(Ok::<_, String>(ToolOutput::Plain("ok".into())))
             })
@@ -2730,7 +2767,8 @@ mod tests {
         fn parse(&self, _input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
             Ok(Box::new(EffectProbeInvocation {
                 call_effect: self.call_effect,
-                executed: Arc::clone(&self.executed),
+                preflighted: AtomicBool::new(false),
+                trace: Arc::clone(&self.trace),
             }))
         }
     }
@@ -2743,19 +2781,19 @@ mod tests {
         }
     }
 
-    /// Reports the outcome alongside whether the call reached `execute`.
+    /// Reports the outcome alongside what the call reached.
     async fn run_effect_probe(
         mode: &AgentMode,
         call_effect: ToolEffect,
         source: ToolSource,
-    ) -> (ToolDoneEvent, bool) {
-        let executed = Arc::new(AtomicBool::new(false));
+    ) -> (ToolDoneEvent, Arc<ProbeTrace>) {
+        let trace = Arc::new(ProbeTrace::default());
         let registry = ToolRegistry::new();
         registry
             .register_audited(
                 Arc::new(EffectProbe {
                     call_effect,
-                    executed: Arc::clone(&executed),
+                    trace: Arc::clone(&trace),
                 }),
                 source,
                 ToolEffect::Mutating,
@@ -2771,18 +2809,18 @@ mod tests {
             Emit::Silent,
         )
         .await;
-        (done, executed.load(Ordering::SeqCst))
+        (done, trace)
     }
 
     #[test_case(AgentMode::Plan(PLAN_PATH.into()) ; "plan_mode")]
     #[test_case(AgentMode::ReadOnly ; "read_only_mode")]
     fn a_read_only_call_of_a_mutating_tool_runs(mode: AgentMode) {
         smol::block_on(async {
-            let (done, executed) =
+            let (done, trace) =
                 run_effect_probe(&mode, ToolEffect::ReadOnly, trusted_native_source()).await;
 
             assert!(!done.is_error, "{}", done.output.as_text());
-            assert!(executed);
+            assert!(trace.executed.load(Ordering::SeqCst));
         });
     }
 
@@ -2790,7 +2828,7 @@ mod tests {
     #[test_case(AgentMode::ReadOnly, READ_ONLY_TOOL_RESTRICTED ; "read_only_mode")]
     fn a_mutating_call_of_the_same_tool_is_refused(mode: AgentMode, expected: &str) {
         smol::block_on(async {
-            let (done, executed) =
+            let (done, trace) =
                 run_effect_probe(&mode, ToolEffect::Mutating, trusted_native_source()).await;
 
             assert!(done.is_error);
@@ -2799,7 +2837,19 @@ mod tests {
                 "{}",
                 done.output.as_text()
             );
-            assert!(!executed);
+            assert!(!trace.executed.load(Ordering::SeqCst));
+            assert!(
+                trace.abandoned.load(Ordering::SeqCst),
+                "{REFUSAL_RELEASES_PREFLIGHT}"
+            );
+            if matches!(mode, AgentMode::ReadOnly) {
+                let text = done.output.as_text();
+                assert!(
+                    text.contains(ToolEffect::Mutating.as_str())
+                        && text.contains(READ_ONLY_CALL_GUIDANCE),
+                    "{REFUSAL_NAMES_THE_CALL}"
+                );
+            }
         });
     }
 
@@ -2807,7 +2857,7 @@ mod tests {
     #[test_case(AgentMode::ReadOnly, READ_ONLY_TOOL_RESTRICTED ; "read_only_mode")]
     fn an_unbundled_plugin_cannot_downgrade_its_own_call_effect(mode: AgentMode, expected: &str) {
         smol::block_on(async {
-            let (done, executed) = run_effect_probe(
+            let (done, trace) = run_effect_probe(
                 &mode,
                 ToolEffect::ReadOnly,
                 ToolSource::Lua {
@@ -2824,7 +2874,7 @@ mod tests {
                 "{}",
                 done.output.as_text()
             );
-            assert!(!executed);
+            assert!(!trace.executed.load(Ordering::SeqCst));
         });
     }
 

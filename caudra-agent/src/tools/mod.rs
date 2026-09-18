@@ -351,6 +351,11 @@ pub fn is_container_tool(name: &str) -> bool {
 
 pub const PLAN_WRITE_RESTRICTED: &str = "write restricted to plan file in plan mode";
 pub const READ_ONLY_TOOL_RESTRICTED: &str = "tool is not available in strict read-only mode";
+/// Appended when the tool is listed but this one call is refused, so the model
+/// narrows the call instead of concluding the tool is gone. The prefix above
+/// stays first: the Lua runtime and telemetry both match on it.
+pub const READ_ONLY_CALL_GUIDANCE: &str =
+    "this agent may only make calls that change nothing and read nothing outside the project";
 pub const DOOM_LOOP_MESSAGE: &str = "You have called this tool with identical input 3 times in a row. You are stuck in a loop. Break out and try a different approach.";
 pub(crate) const DOOM_LOOP_GUIDANCE: &str =
     "You are stuck in a loop. Break out and try a different approach.";

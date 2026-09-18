@@ -285,6 +285,13 @@ impl PermissionPrompt {
         self.current().map(|request| request.id.as_str())
     }
 
+    #[cfg(test)]
+    pub(crate) fn requester(&self) -> Option<&str> {
+        self.requests
+            .front()
+            .and_then(|queued| queued.requester.as_deref())
+    }
+
     pub fn resolve(&mut self, request_id: &str) -> bool {
         let Some(request) = self.requests.front() else {
             return false;
@@ -391,15 +398,20 @@ mod tests {
     use super::view::tests::{key, render, request};
     use crossterm::event::KeyCode;
     use serde_json::json;
+
+    /// Whoever enqueues a request owns the wording, so the prompt renders this
+    /// verbatim rather than describing the asker itself.
+    const REQUESTER: &str = "subtask task-1";
+
     #[test]
     fn queue_is_fifo_and_deduplicated_by_request_id() {
         let mut prompt = PermissionPrompt::new();
-        assert!(prompt.enqueue(request("first", json!({"n": 1})), Some("task-1".into())));
+        assert!(prompt.enqueue(request("first", json!({"n": 1})), Some(REQUESTER.into())));
         assert!(prompt.enqueue(request("second", json!({"n": 2})), None));
         assert!(!prompt.enqueue(request("first", json!({"n": 3})), None));
         assert_eq!(prompt.pending_count(), 2);
         assert_eq!(prompt.request_id(), Some("first"));
-        assert!(render(&mut prompt, 100, 24).contains("subtask task-1"));
+        assert!(render(&mut prompt, 100, 24).contains(REQUESTER));
 
         let first = prompt.handle_key(key(KeyCode::Char('y'))).unwrap();
         assert_eq!(first.request_id, "first");

@@ -190,6 +190,14 @@ While plan mode is active, Caudra withholds the authority that would outlive the
 
 A conversation grant made while planning does apply for the rest of the plan. Approving broad shell authority for the conversation lets the agent keep exploring with scripts and searches instead of asking about each command. The grant stays with the conversation after you leave plan mode. Allow once covers only the current call.
 
+## Read-only agents
+
+A read-only agent is a subagent that may not change anything: research tasks, `task` calls in plan mode, and every agent a workflow starts in `read-only` capability mode. It sees `shell`, and Caudra judges each command line it runs rather than the tool as a whole.
+
+A line is admitted when the classifier rules every command in it read-only and every path it touches resolves inside the project. `git diff`, `git log`, `rg`, and `wc -l` pass. Anything that writes, anything the parser could not read, and anything reaching outside the project is refused with a message naming the call and the reason, and the agent can retry with a narrower line. The same classifier answers here and in plan mode, so a command plan mode would refuse is refused here too.
+
+The confinement check resolves symlinks before it answers, so a link checked into the repository cannot carry a read out of the project. It says nothing about what an admitted command reads inside the project: a read-only agent can still read any file you have.
+
 ## Stored rules
 
 Use `/permissions` to manage stored conversation, project, and global rules and inspect policy. On a rule, `Enter` focuses its scope details without editing or revoking it. Details show named inputs, typed targets, context, and authority constraints. Missing values are marked unavailable or opaque. Builtin, configured, and trusted-plugin policy appears alongside stored rules. Project-config trust rows open a separate confirmation.

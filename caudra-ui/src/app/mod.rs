@@ -102,6 +102,7 @@ use caudra_agent::prompt::profile::PromptProfileCatalog;
 use caudra_agent::snapshots::{
     SESSION_SNAPSHOTS_DIR, SnapshotError, SnapshotLimits, SnapshotStore, workspace_key,
 };
+use caudra_agent::types::WorkflowProvenance;
 use caudra_agent::workspace_baseline::WorkspaceBaseline;
 use caudra_agent::{
     AgentEvent, AgentInput, AgentMode, Envelope, GoalVerdict, ImageSource, McpConfigErrors,
@@ -157,6 +158,9 @@ const STORAGE_USAGE: &str = "Usage: /storage [all]";
 const TOOLS_USAGE: &str = "Usage: /tools";
 const SKILLS_USAGE: &str = "Usage: /skills";
 const AUTH_EXPIRED_MSG: &str = "Authentication failed. Run `caudra auth login` in another terminal; Caudra will resume automatically, or press Enter to retry now.";
+const WORKFLOW_AUTH_REQUIRED: &str =
+    "A workflow agent needs authentication. Run `caudra auth login` in another terminal.";
+const WORKFLOW_REQUESTER_PREFIX: &str = "workflow";
 const COPY_FAILED: &str = "Copy failed: ";
 const FLASH_NO_PLAN: &str = "No plan file";
 const NO_FILE_REVERT_MSG: &str = "No file revert for this workspace";
@@ -3425,6 +3429,34 @@ impl App {
             );
             return vec![];
         }
+        // A workflow run outlives the turn that launched it, so its agents
+        // report under the run's own id and the stale-run filter below would
+        // drop them. An interaction nobody can answer is a run that hangs
+        // forever, so these are hoisted like the workflow events above. They
+        // deliberately do not resolve a chat: a workflow agent has no task
+        // card, and the inspector's roster row is where it is read.
+        if let Some(workflow) = envelope.workflow.clone() {
+            match envelope.event {
+                AgentEvent::PermissionRequest(request) => {
+                    let requester = workflow_requester(&workflow, envelope.subagent.as_ref());
+                    self.permission_prompt.enqueue(request, Some(requester));
+                    return vec![];
+                }
+                AgentEvent::PermissionRequestUpdated(request) => {
+                    self.permission_prompt.update(request);
+                    return vec![];
+                }
+                AgentEvent::PermissionRequestResolved { request_id, .. } => {
+                    self.permission_prompt.resolve_pending(&request_id);
+                    return vec![];
+                }
+                AgentEvent::AuthRequired => {
+                    self.flash(WORKFLOW_AUTH_REQUIRED.into());
+                    return vec![];
+                }
+                other => envelope.event = other,
+            }
+        }
         if envelope.run_id == RESTORE_RUN_ID {
             let (id, snapshot, theme_gen, is_header) = match envelope.event {
                 AgentEvent::ToolSnapshot {
@@ -3966,7 +3998,8 @@ impl App {
                 self.permission_config_trust_deferred =
                     self.permissions.needs_project_permission_config_trust();
             }
-            self.permission_prompt.enqueue(request, subagent_id);
+            self.permission_prompt
+                .enqueue(request, subagent_id.map(|id| format!("subtask {id}")));
             return vec![];
         }
 
@@ -5367,6 +5400,21 @@ fn remote_workbench_gate(baseline: Arc<WorkspaceBaseline>) -> MutationGate {
 /// common case still reads as the model alone.
 fn session_usage_model(provider: &str, model: &str) -> String {
     format!("{provider}/{model}")
+}
+
+/// Names a workflow agent the way the inspector does, by phase and label,
+/// rather than by the opaque `<run>:<key>` task id a subtask prompt carries.
+fn workflow_requester(workflow: &WorkflowProvenance, subagent: Option<&SubagentInfo>) -> String {
+    let mut requester = String::from(WORKFLOW_REQUESTER_PREFIX);
+    if let Some(phase) = &workflow.phase {
+        requester.push_str(" · ");
+        requester.push_str(phase);
+    }
+    if let Some(label) = subagent.map(|subagent| subagent.name.as_str()) {
+        requester.push_str(" · ");
+        requester.push_str(label);
+    }
+    requester
 }
 
 /// A chat's running spend, filed under whoever pays for it. Free of `&self` so

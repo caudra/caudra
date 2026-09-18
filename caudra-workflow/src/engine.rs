@@ -697,6 +697,18 @@ mod tests {
     const REFUTED_ARE_DROPPED: &str = "a finding a refuter ruled refuted never reaches the report";
     const UNCHALLENGED_ARE_KEPT: &str =
         "a budget too small to refute keeps every finding and says they went unchallenged";
+    const UNREADABLE_SUMMARY: &str = "git reported no change to review.";
+    const UNREVIEWED_STATUS: &str = "unreviewed";
+    const NOTHING_READ_DISPATCHES_NOBODY: &str =
+        "a surveyor that could read nothing must stop the run before any reviewer is paid for";
+    const NOTHING_READ_IS_NOT_A_PASS: &str =
+        "a run that reviewed nothing must not read as a change that passed review";
+    const CLEAN_VERDICT: &str = "**Verdict: no findings**";
+    const GAPS_VERDICT: &str = "**Verdict: reviewed with gaps**";
+    const PARTIAL_VERDICT_MARKER: &str = "(partial review)";
+    const PARTIAL_EVIDENCE_MARKER: &str = "(partial evidence)";
+    const PARTIAL_IS_SAID_UP_FRONT: &str =
+        "a review with a hole in its coverage must say so in the verdict, not only in a footnote";
     const EVIDENCE_PREFIX: &str = "evidence-";
     const HYPOTHESIS_PREFIX: &str = "hypothesis-";
     const DIAGNOSIS_WRITER: &str = "diagnosis-writer";
@@ -1302,6 +1314,7 @@ mod tests {
             let label = request.label.clone().unwrap_or_default();
             let output = if label == SURVEYOR {
                 json!({
+                    "readable": true,
                     "summary": CHANGE_SUMMARY,
                     "files": [{ "path": "src/a.rs", "change": "rewrote it", "risk": "high" }],
                 })
@@ -1398,6 +1411,39 @@ mod tests {
         assert_eq!(host.scratch().len(), 1);
     }
 
+    /// Every reviewer is an agent the user pays for, and every one of them would
+    /// have reviewed the same nothing. The report has to say so too: a run that
+    /// read no change is the one most likely to be mistaken for a clean one.
+    #[test]
+    fn review_changes_stops_when_the_survey_could_read_nothing() {
+        let host = FakeHost::new(Box::new(|key, request| {
+            let label = request.label.clone().unwrap_or_default();
+            if label != SURVEYOR {
+                return Err(HostError::Failed(format!("unexpected label {label}")));
+            }
+            let output = json!({
+                "readable": false,
+                "summary": UNREADABLE_SUMMARY,
+                "files": [],
+            });
+            Ok(agent_result(format!("agent-{key}"), true, output))
+        }));
+
+        let result = run_review_changes(&host, TEST_AGENT_BUDGET);
+
+        assert_eq!(result["status"], UNREVIEWED_STATUS, "{result}");
+        assert_eq!(
+            host.phases(),
+            ["Survey"],
+            "{NOTHING_READ_DISPATCHES_NOBODY}"
+        );
+        let report = result["report"].as_str().expect("report");
+        assert!(
+            report.contains(UNREADABLE_SUMMARY) && !report.contains(CLEAN_VERDICT),
+            "{NOTHING_READ_IS_NOT_A_PASS}"
+        );
+    }
+
     /// A run with no room left for refuters must still deliver a review, and
     /// must say the findings in it went unchallenged.
     #[test]
@@ -1413,13 +1459,44 @@ mod tests {
             "{UNCHALLENGED_ARE_KEPT}"
         );
         assert_eq!(host.phases(), ["Survey", "Review", "Refute", "Report"]);
+        let report = result["report"].as_str().expect("report");
         assert!(
-            result["report"]
-                .as_str()
-                .expect("report")
-                .contains(UNCHALLENGED_NOTE),
+            report.contains(UNCHALLENGED_NOTE),
             "{UNCHALLENGED_ARE_KEPT}"
         );
+        assert!(
+            report.contains(PARTIAL_VERDICT_MARKER),
+            "{PARTIAL_IS_SAID_UP_FRONT}"
+        );
+    }
+
+    /// Five reviewers that all failed found nothing because none of them ever
+    /// looked. Calling that "no findings" reports a clean bill of health for a
+    /// change nobody read.
+    #[test]
+    fn review_changes_does_not_call_a_degraded_run_clean() {
+        let host = FakeHost::new(Box::new(|key, request| {
+            let label = request.label.clone().unwrap_or_default();
+            if label != SURVEYOR {
+                return Ok(agent_result(format!("agent-{key}"), false, Value::Null));
+            }
+            let output = json!({
+                "readable": true,
+                "summary": CHANGE_SUMMARY,
+                "files": [{ "path": "src/a.rs", "change": "rewrote it", "risk": "high" }],
+            });
+            Ok(agent_result(format!("agent-{key}"), true, output))
+        }));
+
+        let result = run_review_changes(&host, TEST_AGENT_BUDGET);
+
+        assert_eq!(result["status"], "partial", "{result}");
+        let report = result["report"].as_str().expect("report");
+        assert!(
+            !report.contains(CLEAN_VERDICT),
+            "{NOTHING_READ_IS_NOT_A_PASS}"
+        );
+        assert!(report.contains(GAPS_VERDICT), "{report}");
     }
 
     /// Every refuter rules the `the-boundary` cause out and every other cause
@@ -1532,12 +1609,11 @@ mod tests {
             Some(STANCE_COUNT),
             "{UNREFUTED_ARE_KEPT}"
         );
+        let report = result["report"].as_str().expect("report");
+        assert!(report.contains(UNREFUTED_NOTE), "{UNREFUTED_ARE_KEPT}");
         assert!(
-            result["report"]
-                .as_str()
-                .expect("report")
-                .contains(UNREFUTED_NOTE),
-            "{UNREFUTED_ARE_KEPT}"
+            report.contains(PARTIAL_EVIDENCE_MARKER),
+            "{PARTIAL_IS_SAID_UP_FRONT}"
         );
     }
 

@@ -52,7 +52,7 @@ A launch draws a card in the transcript, whether you typed the command or the mo
 
 The status bar keeps a chip while any run is going. One active run shows as `[wf: deep-research · Research 2/4]`, with its phase and where that phase sits among the ones the script declared. Several runs, or runs parked waiting on someone, show as `[wf:2+1 · Research]` with the newest run's phase. A narrow bar drops the phase before it drops the chip. Click the chip to open the inspector.
 
-Workflow agents are ordinary subagents. They ask for permission through the normal prompts, respect the current permission mode as a ceiling, share `task_max_concurrent` with `task` calls, and open in the same transcript viewer. They do not appear as task cards in the main transcript.
+Workflow agents are ordinary subagents. They ask for permission through the normal prompts, respect the current permission mode as a ceiling, share `task_max_concurrent` with `task` calls, and open in the same transcript viewer. They do not appear as task cards in the main transcript. A prompt raised by a workflow agent names the run, the phase, and the agent label, because a run outlives the turn that started it and the task id alone identifies nothing you can see.
 
 Pressing Esc cancels the main turn and leaves workflow runs alone. Stop them from the inspector.
 
@@ -171,6 +171,8 @@ Agent options:
 | `model_job` | The kind of work this call is: `chat`, `plan`, `subagent`, `fast`, or `best` |
 
 An unknown option is an error. A build agent is still capped by your current permission mode.
+
+A `read-only` agent reads, searches, and fetches, and it may also run a shell command when the command changes nothing and every path it touches stays inside the project. `git diff` and `rg` work. A build or an edit is refused per call, with a message saying which call and why. See [read-only agents](/docs/permissions/#read-only-agents).
 
 ### Choosing a model
 

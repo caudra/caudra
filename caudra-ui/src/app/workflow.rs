@@ -723,7 +723,7 @@ mod tests {
     use std::time::Duration;
 
     use caudra_agent::types::{WORKFLOW_EVENT_RUN_ID, WorkflowProvenance};
-    use caudra_agent::{AgentEvent, Envelope, SubagentActivity, SubagentProgress};
+    use caudra_agent::{AgentEvent, Envelope, SubagentActivity, SubagentInfo, SubagentProgress};
     use caudra_workflow::{
         CatalogEntry, RunDetail, RunHistoryEntry, RunUsage, SourceKind, WorkflowCatalog,
     };
@@ -739,7 +739,7 @@ mod tests {
     use crate::components::key;
     use crate::components::keybindings::{key as kb, leader};
     use crate::components::status_bar::StatusBarHitTarget;
-    use crate::components::{DisplayMessage, DisplayRole, ToolStatus, workflow_card};
+    use crate::components::{DisplayMessage, DisplayRole, Overlay, ToolStatus, workflow_card};
     use caudra_agent::ToolOutput;
 
     const RUN_ID: &str = "run-1";
@@ -752,6 +752,13 @@ mod tests {
     const ACK_AT_READ_REVISION: &str = "the ack must name the revision the notice was read at";
     const LOG_MESSAGE: &str = "searching the docs";
     const BUILTIN_SUBJECT: &str = "why is the sky blue";
+    const AGENT_LABEL: &str = "change-surveyor";
+    const AGENT_PHASE: &str = "Survey";
+    const PERMISSION_ID: &str = "perm-1";
+    const PERMISSION_COMMAND: &str = "git diff";
+    const PROMPT_IS_ANSWERABLE: &str = "a workflow agent's permission request must reach the prompt, or the run hangs unanswerably";
+    const AUTH_IS_REPORTED: &str =
+        "a workflow agent's auth failure must be reported, not dropped with the run still waiting";
     const LAUNCHES_ITS_OWN: &str =
         "a built-in slash command launches the workflow it is named after, with its free text";
     const CARD_DRAWN: &str = "a slash launch draws the run's card in the transcript";
@@ -1016,6 +1023,72 @@ mod tests {
                 phase: None,
             }),
         }))
+    }
+
+    /// A workflow agent reports under the run's id rather than the turn's, so
+    /// the stale-run filter used to drop everything it sent. An interaction
+    /// nobody can answer is a run that hangs until it is stopped.
+    fn workflow_agent_envelope(event: AgentEvent) -> Msg {
+        Msg::Agent(Box::new(Envelope {
+            event,
+            subagent: Some(SubagentInfo {
+                parent_tool_use_id: TASK_ID.into(),
+                task_id: TASK_ID.into(),
+                name: AGENT_LABEL.into(),
+                prompt: None,
+                model: None,
+                answer_tx: None,
+                steer_tx: None,
+            }),
+            run_id: WORKFLOW_EVENT_RUN_ID,
+            workflow: Some(WorkflowProvenance {
+                run_id: RUN_ID.into(),
+                epoch: 0,
+                call_key: 1,
+                phase: Some(AGENT_PHASE.into()),
+            }),
+        }))
+    }
+
+    #[test]
+    fn a_workflow_agents_permission_request_reaches_the_prompt() {
+        let mut app = scripted_app();
+
+        app.update(workflow_agent_envelope(
+            crate::app::tests::permission_event(PERMISSION_ID, PERMISSION_COMMAND),
+        ));
+
+        assert!(app.permission_prompt.is_open(), "{PROMPT_IS_ANSWERABLE}");
+        assert_eq!(app.main_chat().message_count(), 0, "{NO_CARD_CHURN}");
+    }
+
+    /// The task id a subtask prompt shows is `<run>:<key>`, which names nothing
+    /// a reader recognises. The phase and the label are what the inspector uses.
+    #[test]
+    fn the_prompt_names_the_phase_and_the_agent() {
+        let mut app = scripted_app();
+
+        app.update(workflow_agent_envelope(
+            crate::app::tests::permission_event(PERMISSION_ID, PERMISSION_COMMAND),
+        ));
+
+        let requester = app.permission_prompt.requester().expect("a requester");
+        assert!(requester.contains(AGENT_PHASE), "{requester}");
+        assert!(requester.contains(AGENT_LABEL), "{requester}");
+        assert!(!requester.contains(TASK_ID), "{requester}");
+    }
+
+    #[test]
+    fn a_workflow_agents_auth_failure_is_not_swallowed() {
+        let mut app = scripted_app();
+
+        app.update(workflow_agent_envelope(AgentEvent::AuthRequired));
+
+        assert_eq!(
+            app.status_bar.flash_text(),
+            Some(crate::app::WORKFLOW_AUTH_REQUIRED),
+            "{AUTH_IS_REPORTED}"
+        );
     }
 
     /// A workflow agent has no task header, so its digest is addressed to the

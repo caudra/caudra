@@ -410,7 +410,7 @@ fn agent_msg_with_run_id(event: AgentEvent, run_id: u64) -> Msg {
     }))
 }
 
-fn permission_event(id: &str, command: &str) -> AgentEvent {
+pub(crate) fn permission_event(id: &str, command: &str) -> AgentEvent {
     AgentEvent::PermissionRequest(Box::new(PermissionRequest::from_legacy(
         id.into(),
         ToolKey::native("bash"),

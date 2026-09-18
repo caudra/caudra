@@ -723,9 +723,12 @@ impl ToolKind {
             Self::CodeMap | Self::CodeContext | Self::CodeRefs | Self::CodeImpact => {
                 ToolAudience::all()
             }
-            Self::FileWrite | Self::FileEdit | Self::FileApplyPatch | Self::Shell => {
+            Self::FileWrite | Self::FileEdit | Self::FileApplyPatch => {
                 ToolAudience::MAIN | ToolAudience::GENERAL_SUB
             }
+            // Shell reaches a read-only agent too: dispatch refuses every call
+            // that is not a confined read, and without it such an agent cannot
+            // run `git diff`, which is most of what a reviewer needs to read.
             _ => read,
         }
     }
@@ -794,6 +797,10 @@ impl Tool for WorkcellTool {
 
     fn tool_kind(&self) -> Option<&str> {
         Some(self.kind.presentation_kind())
+    }
+
+    fn has_read_only_calls(&self) -> bool {
+        self.kind == ToolKind::Shell
     }
 
     fn parse(&self, input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
@@ -2280,6 +2287,35 @@ impl ToolInvocation for WorkcellInvocation {
         {
             Some(PreparedExecution::Shell(_, shell)) => editor_adapter::shell_plan_access(shell),
             _ => PlanModeAccess::Refused,
+        }
+    }
+
+    /// A shell line counts as read-only only when preflight proved every one of
+    /// its commands both harmless and confined to the project. An unparsed line
+    /// contributes one opaque resource without the attribute, so a line nobody
+    /// could read keeps the registered effect.
+    fn call_effect(&self, registered: ToolEffect) -> ToolEffect {
+        if !matches!(self.input, Input::Shell(_)) {
+            return registered;
+        }
+        let prepared = self
+            .prepared
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let Some(resources) = prepared
+            .as_ref()
+            .map(|prepared| &prepared.intent.resources)
+            .filter(|resources| !resources.is_empty())
+        else {
+            return registered;
+        };
+        if resources
+            .iter()
+            .all(|resource| resource.attributes.contains_key(CONFINED_READ_ATTRIBUTE))
+        {
+            ToolEffect::ReadOnly
+        } else {
+            registered
         }
     }
 
@@ -4990,6 +5026,38 @@ mod tests {
         smol::block_on(invocation.preflight(&ctx))
             .expect("shell preflight")
             .expect("shell permission intent")
+    }
+
+    /// The effect a read-only agent is judged on. It exists only once preflight
+    /// has parsed the line: before that the invocation cannot tell a confined
+    /// read from a build, so it keeps the registered worst case.
+    fn shell_call_effect(root: &Path, command: &str, preflight: bool) -> ToolEffect {
+        let (_host, registry) = host_and_registry(root);
+        let ctx = context(root, Arc::clone(&registry), CancelToken::none());
+        let invocation = registry
+            .get("shell")
+            .expect("registered shell")
+            .tool
+            .parse(&json!({"command": command}))
+            .expect("valid shell input");
+        if preflight {
+            smol::block_on(invocation.preflight(&ctx)).expect("shell preflight");
+        }
+        invocation.call_effect(ToolEffect::Mutating)
+    }
+
+    #[test_case("rg needle src", true => ToolEffect::ReadOnly ; "a confined read")]
+    #[test_case("cargo build", true => ToolEffect::Mutating ; "a command that executes")]
+    #[test_case("cat /etc/passwd", true => ToolEffect::Mutating ; "a read outside the project")]
+    #[test_case("rg needle src && cargo build", true => ToolEffect::Mutating ; "one command short")]
+    #[test_case("$UNREADABLE", true => ToolEffect::Mutating ; "a line nobody could parse")]
+    #[test_case("rg needle src", false => ToolEffect::Mutating ; "a line nobody has parsed")]
+    fn a_shell_line_is_read_only_only_when_every_command_is_a_confined_read(
+        command: &str,
+        preflight: bool,
+    ) -> ToolEffect {
+        let root = TempDir::new().expect("tempdir");
+        shell_call_effect(root.path(), command, preflight)
     }
 
     fn confined_read_preflight_rows(root: &Path, command: &str) -> Vec<bool> {

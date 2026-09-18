@@ -99,10 +99,56 @@ const RG_DENIED_FLAGS: &[&str] = &[
     "-z",
 ];
 const GREP: &str = "grep";
-/// grep has no flag that runs a program or unpacks an archive, unlike ripgrep.
-/// The one that leaves the project follows every symlink it finds rather than
-/// only the ones named on the command line, which no textual check can see.
-const GREP_DENIED_FLAGS: &[&str] = &["--dereference-recursive", "-R"];
+/// grep's flag set is small and settled, so it is read as an allow-list: a flag
+/// a future release adds costs a prompt instead of quietly widening what a
+/// read-only agent may run. `--file` and `--exclude-from` read a path nobody
+/// reviewed, and `-R` follows every symlink it meets rather than only the ones
+/// named on the command line, which no textual check can see. All three are
+/// absent below rather than denied.
+const GREP_READ_FLAGS: &[&str] = &[
+    "--after-context",
+    "--basic-regexp",
+    "--before-context",
+    "--binary",
+    "--binary-files",
+    "--byte-offset",
+    "--color",
+    "--colour",
+    "--context",
+    "--count",
+    "--exclude",
+    "--exclude-dir",
+    "--extended-regexp",
+    "--files-with-matches",
+    "--files-without-match",
+    "--fixed-strings",
+    "--group-separator",
+    "--ignore-case",
+    "--include",
+    "--initial-tab",
+    "--invert-match",
+    "--label",
+    "--line-buffered",
+    "--line-number",
+    "--line-regexp",
+    "--max-count",
+    "--no-filename",
+    "--no-group-separator",
+    "--no-ignore-case",
+    "--no-messages",
+    "--null",
+    "--null-data",
+    "--only-matching",
+    "--perl-regexp",
+    "--quiet",
+    "--recursive",
+    "--regexp",
+    "--silent",
+    "--text",
+    "--with-filename",
+    "--word-regexp",
+];
+const GREP_READ_SHORT_FLAGS: &str = "ABCEFGHIPTUabcehilmnoqrsvwxyzZ";
 const FIND: &str = "find";
 const FIND_DENIED_FLAGS: &[&str] = &[
     "-delete",
@@ -137,6 +183,7 @@ const SORT_READ_FLAGS: &[&str] = &[
 ];
 const SORT_READ_SHORT_FLAGS: &str = "urnhgfbdiMsVcCz";
 const SED: &str = "sed";
+const END_OF_FLAGS: &str = "--";
 const CD: &str = "cd";
 /// `awk` is absent on purpose rather than deny-listed: `system()` and `print >`
 /// are reached from inside the script, so no flag list can exclude them. The
@@ -146,7 +193,40 @@ const READ_ONLY_COMMANDS: &[&str] = &[
     "basename", "cat", "cd", "df", "dirname", "echo", "head", "ls", "ps", "pwd", "readlink",
     "realpath", "stat", "tail", "uname", "which",
 ];
-const INDIRECT_FILE_FLAGS: &[&str] = &["--files0-from"];
+/// `du` and `wc` write nothing, so the allow-list is about what they read:
+/// `--files0-from` takes its operands from a file nobody reviewed, and the
+/// dereference flags walk out of the project through a symlink. Both are absent
+/// rather than denied, so a new flag has to be added here to be allowed.
+const DU_READ_FLAGS: &[&str] = &[
+    "--all",
+    "--apparent-size",
+    "--block-size",
+    "--bytes",
+    "--count-links",
+    "--exclude",
+    "--human-readable",
+    "--inodes",
+    "--max-depth",
+    "--null",
+    "--one-file-system",
+    "--separate-dirs",
+    "--si",
+    "--summarize",
+    "--threshold",
+    "--time",
+    "--time-style",
+    "--total",
+];
+const DU_READ_SHORT_FLAGS: &str = "0BPabcdhklmstx";
+const WC_READ_FLAGS: &[&str] = &[
+    "--bytes",
+    "--chars",
+    "--lines",
+    "--max-line-length",
+    "--total",
+    "--words",
+];
+const WC_READ_SHORT_FLAGS: &str = "Lclmw";
 const FILE_READ_FLAGS: &[&str] = &[
     "-b",
     "--brief",
@@ -192,25 +272,20 @@ pub(crate) fn scope_is_read_only(scope: &ShellCommandScope) -> bool {
     match scope.executable.as_str() {
         GIT => git_is_read_only(&arguments),
         RG => !denies(&arguments, RG_DENIED_FLAGS) && no_attached_pattern_file(&arguments),
-        GREP => !denies(&arguments, GREP_DENIED_FLAGS) && no_attached_pattern_file(&arguments),
+        GREP => {
+            only_read_flags(&arguments, GREP_READ_FLAGS, GREP_READ_SHORT_FLAGS)
+                && no_attached_pattern_file(&arguments)
+        }
         FIND => !denies(&arguments, FIND_DENIED_FLAGS),
-        SORT => arguments.iter().all(|argument| {
-            !argument.starts_with('-')
-                || SORT_READ_FLAGS.contains(argument)
-                || argument.strip_prefix('-').is_some_and(|flags| {
-                    !flags.is_empty()
-                        && flags
-                            .chars()
-                            .all(|flag| SORT_READ_SHORT_FLAGS.contains(flag))
-                })
-        }),
+        SORT => only_read_flags(&arguments, SORT_READ_FLAGS, SORT_READ_SHORT_FLAGS),
         SED => sed_only_prints(&arguments),
         "date" => arguments.iter().all(|argument| {
             matches!(*argument, "-u" | "--utc" | "--universal") || argument.starts_with('+')
         }),
-        "file" => only_flags_and_operands(&arguments, FILE_READ_FLAGS),
-        "tree" => only_flags_and_operands(&arguments, TREE_READ_FLAGS),
-        "du" | "wc" => !denies(&arguments, INDIRECT_FILE_FLAGS),
+        "file" => only_read_flags(&arguments, FILE_READ_FLAGS, ""),
+        "tree" => only_read_flags(&arguments, TREE_READ_FLAGS, ""),
+        "du" => only_read_flags(&arguments, DU_READ_FLAGS, DU_READ_SHORT_FLAGS),
+        "wc" => only_read_flags(&arguments, WC_READ_FLAGS, WC_READ_SHORT_FLAGS),
         "printf" => arguments
             .first()
             .is_some_and(|format| !format.starts_with('-') || *format == "--"),
@@ -276,10 +351,31 @@ fn decimal(value: &str) -> bool {
     !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
 }
 
-fn only_flags_and_operands(arguments: &[&str], flags: &[&str]) -> bool {
+/// Reads a flag list as an allow-list, the inverse of `denies`. A long flag may
+/// carry its value attached, and a one-letter flag may travel inside a cluster,
+/// so `--context=3` and `-in` are recognized without listing every spelling.
+///
+/// Abbreviations are deliberately not resolved: `--cont` costs a prompt rather
+/// than an allowance, which is the safe direction for an allow-list and the
+/// unsafe one for a deny-list. Everything past `--` is an operand by
+/// definition, and operands are the confinement check's question, not this one's.
+fn only_read_flags(arguments: &[&str], long: &[&str], short: &str) -> bool {
     arguments
         .iter()
-        .all(|argument| !argument.starts_with('-') || flags.contains(argument))
+        .take_while(|argument| **argument != END_OF_FLAGS)
+        .all(|argument| {
+            let Some(rest) = argument.strip_prefix('-').filter(|rest| !rest.is_empty()) else {
+                return true;
+            };
+            if long.contains(argument)
+                || argument
+                    .split_once('=')
+                    .is_some_and(|(name, _)| long.contains(&name))
+            {
+                return true;
+            }
+            !rest.starts_with('-') && rest.chars().all(|flag| short.contains(flag))
+        })
 }
 
 fn no_attached_pattern_file(arguments: &[&str]) -> bool {
@@ -438,6 +534,7 @@ mod tests {
     use workcell::shell::{ShellCommandAnalysis, ShellCommandScope, ShellWord};
 
     const PROJECT: &str = "/home/dev/project";
+    const DENIAL_IS_LOAD_BEARING: &str = "a denied flag must keep disqualifying its command";
     const COMMAND_SEPARATOR: &str = " && ";
 
     fn confined_reads(
@@ -542,16 +639,12 @@ mod tests {
     #[test_case("git --git-dir=/elsewhere/.git log" => false ; "attached_value_form_is_denied")]
     #[test_case("git" => false ; "git_with_no_subcommand")]
     #[test_case("rg pattern src" => true ; "ripgrep")]
-    #[test_case("rg --pre ./run.sh pattern" => false ; "ripgrep_pre_runs_a_program")]
-    #[test_case("rg -z pattern" => false ; "ripgrep_search_zip")]
     #[test_case("rg -iz pattern" => false ; "ripgrep_search_zip_inside_a_cluster")]
     #[test_case("git --no-pager diff" => true ; "a_long_flag_is_not_a_cluster")]
     #[test_case("grep -rn needle src" => true ; "grep_recursively")]
     #[test_case("grep -R needle src" => false ; "grep_dereferencing_every_symlink")]
     #[test_case("grep -Rn needle src" => false ; "grep_dereferencing_from_inside_a_cluster")]
     #[test_case("find . -name *.rs" => true ; "find_by_name")]
-    #[test_case("find . -delete" => false ; "find_delete")]
-    #[test_case("find . -exec rm x ;" => false ; "find_exec")]
     #[test_case("ls -la" => true ; "ls")]
     #[test_case("cat Cargo.toml" => true ; "cat")]
     #[test_case("cd crates" => true ; "cd_moves_nothing_on_disk")]
@@ -586,9 +679,48 @@ mod tests {
     #[test_case("printf -v PATH value" => false ; "printf_assignment")]
     #[test_case("sort --out=output input" => false ; "sort_abbreviated_output")]
     #[test_case("grep --dereference-r needle ." => false ; "grep_abbreviated_follow")]
-    #[test_case("find . -fprint0 output" => false ; "find_null_output")]
+    #[test_case("grep --context=3 needle src" => true ; "grep_attached_context")]
+    #[test_case("grep -- -needle src" => true ; "grep_end_of_options")]
+    #[test_case("grep --devices=read needle src" => false ; "grep_reading_devices")]
+    #[test_case("grep --exclude-from=list needle src" => false ; "grep_unreviewed_exclusions")]
+    #[test_case("grep --file patterns needle" => false ; "grep_unreviewed_pattern_file")]
+    #[test_case("wc -l Cargo.toml" => true ; "wc_counting_lines")]
+    #[test_case("wc --files0-from=paths" => false ; "wc_indirect_operands")]
+    #[test_case("du -sh ." => true ; "du_summarizing")]
+    #[test_case("du -L ." => false ; "du_following_every_symlink")]
+    #[test_case("du --exclude-from=list ." => false ; "du_unreviewed_exclusions")]
     fn single_commands_are_classified(command: &str) -> bool {
         is_read_only(&analysis(&[command]), false)
+    }
+
+    /// `find` and `rg` keep deny-lists because their expression grammars are
+    /// too large to enumerate, which makes every entry load-bearing on its own.
+    /// A loop over the list would pin nothing, since dropping an entry drops
+    /// its case with it, so each flag is named here as a command of its own.
+    #[test_case("find . -delete" ; "find_delete")]
+    #[test_case("find . -exec rm x ;" ; "find_exec")]
+    #[test_case("find . -execdir rm x ;" ; "find_execdir")]
+    #[test_case("find . -fls listing" ; "find_file_listing")]
+    #[test_case("find . -fprint listing" ; "find_file_print")]
+    #[test_case("find . -fprint0 listing" ; "find_null_file_print")]
+    #[test_case("find . -fprintf listing %p" ; "find_formatted_file_print")]
+    #[test_case("find . -ok rm x ;" ; "find_confirmed_exec")]
+    #[test_case("find . -okdir rm x ;" ; "find_confirmed_execdir")]
+    #[test_case("find -L . -name x" ; "find_follow_links")]
+    #[test_case("find -H . -name x" ; "find_follow_argument_links")]
+    #[test_case("find . -files0-from paths" ; "find_indirect_operands")]
+    #[test_case("rg --hostname-bin ./host needle" ; "ripgrep_hostname_program")]
+    #[test_case("rg --pre ./run.sh needle" ; "ripgrep_preprocessor")]
+    #[test_case("rg --pre-glob *.gz needle" ; "ripgrep_preprocessor_glob")]
+    #[test_case("rg --search-zip needle" ; "ripgrep_search_zip")]
+    #[test_case("rg --follow needle" ; "ripgrep_follow_links")]
+    #[test_case("rg -L needle" ; "ripgrep_short_follow_links")]
+    #[test_case("rg -z needle" ; "ripgrep_short_search_zip")]
+    fn a_denied_flag_disqualifies_its_command(command: &str) {
+        assert!(
+            !is_read_only(&analysis(&[command]), false),
+            "{DENIAL_IS_LOAD_BEARING}"
+        );
     }
 
     #[test_case("./cat", "cat"; "relative_reader")]
