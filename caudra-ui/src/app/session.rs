@@ -2387,34 +2387,44 @@ pub(crate) fn reachable_subagent_ids(
 ) -> HashSet<String> {
     let mut reachable = tool_call_ids(items);
     let mut active_calls = caudra_agent::history_tool_call_ids(items);
-    let mut visited = HashSet::new();
+    // A worklist rather than a rescan: choosing the next id by walking
+    // `reachable` for an unvisited one costs a pass over the whole set per
+    // step, so a transcript with thousands of tool calls spends most of a
+    // resume here. An id joins `pending` exactly when it joins `reachable`,
+    // which visits each one once and needs no visited set.
+    let mut pending: Vec<String> = reachable.iter().cloned().collect();
     loop {
         for subagent in subagents {
-            if subagent
+            let linked = subagent
                 .parent_tool_use_id
                 .as_ref()
                 .is_some_and(|parent| reachable.contains(parent) || active_calls.contains(parent))
                 || subagent
                     .root_tool_use_id
                     .as_ref()
-                    .is_some_and(|root| active_calls.contains(root))
-            {
-                reachable.insert(subagent.tool_use_id.clone());
+                    .is_some_and(|root| active_calls.contains(root));
+            if linked && reachable.insert(subagent.tool_use_id.clone()) {
+                pending.push(subagent.tool_use_id.clone());
             }
         }
-        let Some(task_id) = reachable
-            .iter()
-            .find(|task_id| !visited.contains(*task_id))
-            .cloned()
-        else {
+        let Some(task_id) = pending.pop() else {
             break;
         };
-        visited.insert(task_id.clone());
         if let Some(state) = tool_outputs.get(&task_id).and_then(|output| output.state()) {
-            collect_task_metadata_from_value(state, &mut reachable);
+            let mut discovered = HashSet::new();
+            collect_task_metadata_from_value(state, &mut discovered);
+            for id in discovered {
+                if reachable.insert(id.clone()) {
+                    pending.push(id);
+                }
+            }
         }
         if let Some(history) = histories.get(&task_id) {
-            reachable.extend(tool_call_ids(history));
+            for id in tool_call_ids(history) {
+                if reachable.insert(id.clone()) {
+                    pending.push(id);
+                }
+            }
             active_calls.extend(caudra_agent::history_tool_call_ids(history));
         }
     }
